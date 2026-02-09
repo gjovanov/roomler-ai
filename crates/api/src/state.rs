@@ -1,7 +1,7 @@
 use mongodb::Database;
 use roomler2_config::Settings;
 use roomler2_services::{
-    AuthService, RecognitionService, TaskService,
+    AuthService, OAuthService, RecognitionService, TaskService,
     dao::{
         channel::ChannelDao, conference::ConferenceDao, file::FileDao,
         message::MessageDao, reaction::ReactionDao, recording::RecordingDao,
@@ -31,6 +31,7 @@ pub struct AppState {
     pub room_manager: Arc<RoomManager>,
     pub ws_storage: Arc<WsStorage>,
     pub recognition: RecognitionService,
+    pub oauth: Option<Arc<OAuthService>>,
 }
 
 impl AppState {
@@ -57,6 +58,17 @@ impl AppState {
             settings.claude.max_tokens,
         );
 
+        let oauth = if !settings.oauth.google.client_id.is_empty()
+            || !settings.oauth.facebook.client_id.is_empty()
+            || !settings.oauth.github.client_id.is_empty()
+            || !settings.oauth.linkedin.client_id.is_empty()
+            || !settings.oauth.microsoft.client_id.is_empty()
+        {
+            Some(Arc::new(OAuthService::new(settings.oauth.clone())))
+        } else {
+            None
+        };
+
         Ok(Self {
             db,
             settings,
@@ -74,6 +86,7 @@ impl AppState {
             room_manager,
             ws_storage,
             recognition,
+            oauth,
         })
     }
 }

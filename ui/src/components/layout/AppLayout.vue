@@ -100,6 +100,7 @@ const navItems = computed(() => {
   return [
     { icon: 'mdi-view-dashboard', title: 'Dashboard', to: base },
     { icon: 'mdi-pound', title: 'Channels', to: `${base}/channels` },
+    { icon: 'mdi-video', title: 'Conferences', to: `${base}/conferences` },
     { icon: 'mdi-compass', title: 'Explore', to: `${base}/explore` },
     { icon: 'mdi-folder', title: 'Files', to: `${base}/files` },
   ]

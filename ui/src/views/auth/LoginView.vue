@@ -39,6 +39,24 @@
             </v-btn>
           </v-form>
 
+          <v-divider class="my-4" />
+          <v-card-text class="text-center pb-2">
+            {{ $t('auth.orLoginWith') || 'Or login with' }}
+          </v-card-text>
+          <div class="d-flex flex-wrap justify-center ga-2 px-4 pb-4">
+            <v-btn
+              v-for="p in oauthProviders"
+              :key="p.name"
+              @click="oauthLogin(p.name)"
+              :color="p.color"
+              variant="outlined"
+              size="small"
+            >
+              <v-icon start>{{ p.icon }}</v-icon>
+              {{ p.label }}
+            </v-btn>
+          </div>
+
           <v-card-text class="text-center">
             {{ $t('auth.noAccount') }}
             <router-link to="/register">{{ $t('auth.register') }}</router-link>
@@ -61,6 +79,18 @@ const router = useRouter()
 
 const username = ref('')
 const password = ref('')
+
+const oauthProviders = [
+  { name: 'google', label: 'Google', icon: 'mdi-google', color: '#DB4437' },
+  { name: 'facebook', label: 'Facebook', icon: 'mdi-facebook', color: '#4267B2' },
+  { name: 'github', label: 'GitHub', icon: 'mdi-github', color: '#333' },
+  { name: 'linkedin', label: 'LinkedIn', icon: 'mdi-linkedin', color: '#0077B5' },
+  { name: 'microsoft', label: 'Microsoft', icon: 'mdi-microsoft', color: '#00A4EF' },
+]
+
+function oauthLogin(provider: string) {
+  window.location.href = `/api/oauth/${provider}`
+}
 
 async function handleLogin() {
   try {

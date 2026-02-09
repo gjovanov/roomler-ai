@@ -13,9 +13,9 @@ Located in `crates/tests/src/`. These tests spin up the full Axum server and int
 | `auth_tests.rs` | Registration, login, logout, refresh, /me |
 | `channel_tests.rs` | Channel join, leave, list, explore |
 | `channel_crud_tests.rs` | Channel create, update, delete |
-| `message_tests.rs` | Send, edit, delete, list, pin, threads |
+| `message_tests.rs` | Send, edit, delete, list, pin, threads + WS broadcast sender exclusion |
 | `reaction_tests.rs` | Add and remove reactions |
-| `conference_tests.rs` | Create, start, join, leave, end conferences + mediasoup signaling (WS media:join, transport creation, peer_left broadcast) |
+| `conference_tests.rs` | Create, start, join, leave, end conferences + mediasoup signaling (WS media:join, transport creation, peer_left broadcast) + connection_id isolation (two users get independent transports, same user multi-tab, WS disconnect notifies peers) |
 | `recording_tests.rs` | Create, list, delete recordings |
 | `transcription_tests.rs` | Create, list, get transcriptions |
 | `file_tests.rs` | Upload, get, download, delete, list files |
@@ -63,12 +63,15 @@ Located in `ui/e2e/`. Playwright tests that run against the full stack (backend 
 | `conference.spec.ts` | Conference view, join/leave, local video, mute/camera toggles |
 | `websocket.spec.ts` | WebSocket connection, typing indicators |
 | `files.spec.ts` | File upload, browsing |
+| `chat-multi.spec.ts` | Multi-participant chat: 4 users, message dedup (no duplicates from WS broadcast) |
+| `conference-list.spec.ts` | Conference listing page, create dialog, navigation, sidebar link |
+| `conference-multi.spec.ts` | Multi-participant conference: 2 users in separate browser contexts join same conference, screen share button, leave navigation |
 
 ### Test Helpers
 
 | File | Purpose |
 |------|---------|
-| `fixtures/test-helpers.ts` | Login helper, page setup, API utilities |
+| `fixtures/test-helpers.ts` | Login helper, page setup, API utilities (register, createTenant, createChannel, joinChannel, sendMessage, createConference, startConference, addTenantMember) |
 
 ### Running E2E Tests
 
@@ -76,10 +79,10 @@ Located in `ui/e2e/`. Playwright tests that run against the full stack (backend 
 cd ui
 
 # Run all E2E tests
-npm run e2e
+bun run e2e
 
 # Run with Playwright UI
-npm run e2e:ui
+bun run e2e:ui
 
 # Run a specific spec
 npx playwright test e2e/auth.spec.ts
@@ -88,7 +91,7 @@ npx playwright test e2e/auth.spec.ts
 npx playwright test --headed
 ```
 
-E2E tests require both the backend (`cargo run`) and frontend (`npm run dev`) to be running.
+E2E tests require both the backend (`cargo run`) and frontend (`bun run dev`) to be running.
 
 ## Test Architecture
 
@@ -98,10 +101,10 @@ Integration Tests (Rust)              E2E Tests (Playwright)
 │ reqwest HTTP Client  │              │ Chromium Browser     │
 │         │            │              │        │             │
 │         ▼            │              │        ▼             │
-│  Axum Test Server    │              │  Vue 3 SPA (:5173)  │
+│  Axum Test Server    │              │  Vue 3 SPA (:5000)  │
 │  (random port)       │              │        │             │
 │         │            │              │        ▼             │
-│         ▼            │              │  Axum API (:3000)    │
+│         ▼            │              │  Axum API (:5001)    │
 │  MongoDB (test DB)   │              │        │             │
 │                      │              │        ▼             │
 └─────────────────────┘              │  MongoDB + Redis +   │

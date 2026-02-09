@@ -120,10 +120,9 @@ function getDisplayName(userId: string): string {
 async function handleJoin() {
   joining.value = true
   try {
-    // Start conference if not already in progress (creates mediasoup room)
-    if (conferenceStore.current?.status !== 'InProgress') {
-      await conferenceStore.startConference(tenantId.value, conferenceId.value)
-    }
+    // Always call start to ensure the in-memory mediasoup room exists
+    // (it may have been lost on server restart even if DB status is InProgress)
+    await conferenceStore.startConference(tenantId.value, conferenceId.value)
 
     // REST join (adds participant to DB)
     await conferenceStore.joinConference(tenantId.value, conferenceId.value)

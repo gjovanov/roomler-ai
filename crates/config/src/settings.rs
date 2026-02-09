@@ -11,6 +11,23 @@ pub struct Settings {
     pub mediasoup: MediasoupSettings,
     pub turn: TurnSettings,
     pub claude: ClaudeSettings,
+    pub oauth: OAuthSettings,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct OAuthSettings {
+    pub base_url: String,
+    pub google: OAuthProviderSettings,
+    pub facebook: OAuthProviderSettings,
+    pub github: OAuthProviderSettings,
+    pub linkedin: OAuthProviderSettings,
+    pub microsoft: OAuthProviderSettings,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct OAuthProviderSettings {
+    pub client_id: String,
+    pub client_secret: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -104,8 +121,22 @@ impl Settings {
             .set_default("mediasoup.announced_ip", "127.0.0.1")?
             .set_default("mediasoup.rtc_min_port", 40000)?
             .set_default("mediasoup.rtc_max_port", 49999)?
+            .set_default("turn.url", None::<String>)?
+            .set_default("turn.username", None::<String>)?
+            .set_default("turn.password", None::<String>)?
             .set_default("claude.model", "claude-sonnet-4-5-20250929")?
             .set_default("claude.max_tokens", 4096)?
+            .set_default("oauth.base_url", "http://localhost:5001")?
+            .set_default("oauth.google.client_id", "")?
+            .set_default("oauth.google.client_secret", "")?
+            .set_default("oauth.facebook.client_id", "")?
+            .set_default("oauth.facebook.client_secret", "")?
+            .set_default("oauth.github.client_id", "")?
+            .set_default("oauth.github.client_secret", "")?
+            .set_default("oauth.linkedin.client_id", "")?
+            .set_default("oauth.linkedin.client_secret", "")?
+            .set_default("oauth.microsoft.client_id", "")?
+            .set_default("oauth.microsoft.client_secret", "")?
             .build()?;
 
         config.try_deserialize()

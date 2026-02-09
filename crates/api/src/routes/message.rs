@@ -113,9 +113,15 @@ pub async fn create(
         )
         .await?;
 
-    // Broadcast via WebSocket to channel members
+    // Broadcast via WebSocket to channel members (exclude sender to avoid duplicates)
     let response = to_response(message);
-    let member_ids = state.channels.find_member_user_ids(cid).await?;
+    let member_ids: Vec<ObjectId> = state
+        .channels
+        .find_member_user_ids(cid)
+        .await?
+        .into_iter()
+        .filter(|id| *id != auth.user_id)
+        .collect();
     let event = serde_json::json!({
         "type": "message:create",
         "data": &response,

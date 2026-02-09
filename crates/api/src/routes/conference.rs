@@ -196,8 +196,8 @@ pub async fn leave(
         return Err(ApiError::Forbidden("Not a member".to_string()));
     }
 
-    // Clean up media before DB leave
-    state.room_manager.close_participant(&confid, &auth.user_id);
+    // Clean up media before DB leave (removes all connections for this user)
+    state.room_manager.close_participant_by_user(&confid, &auth.user_id);
 
     // Broadcast peer_left to remaining participants
     let remaining = state.room_manager.get_participant_user_ids(&confid);

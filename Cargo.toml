@@ -81,8 +81,12 @@ tokio-test = "0.4"
 thiserror = "2"
 anyhow = "1"
 
+# Env
+dotenvy = "0.15"
+
 # Misc
 rand = "0.9"
 base64 = "0.22"
 futures = "0.3"
 async-trait = "0.1"
+urlencoding = "2"

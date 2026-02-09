@@ -24,3 +24,5 @@ mod recording_tests;
 mod transcription_tests;
 #[cfg(test)]
 mod pdf_export_tests;
+#[cfg(test)]
+mod oauth_tests;

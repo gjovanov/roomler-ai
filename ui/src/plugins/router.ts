@@ -15,6 +15,12 @@ const routes: RouteRecordRaw[] = [
     meta: { guest: true },
   },
   {
+    path: '/oauth/callback',
+    name: 'oauth-callback',
+    component: () => import('@/views/auth/OAuthCallbackView.vue'),
+    meta: { guest: true },
+  },
+  {
     path: '/',
     component: () => import('@/components/layout/AppLayout.vue'),
     meta: { auth: true },
@@ -46,6 +52,11 @@ const routes: RouteRecordRaw[] = [
             path: 'explore',
             name: 'explore',
             component: () => import('@/views/channels/ExploreView.vue'),
+          },
+          {
+            path: 'conferences',
+            name: 'conferences',
+            component: () => import('@/views/conference/ConferenceList.vue'),
           },
           {
             path: 'conference/:conferenceId',

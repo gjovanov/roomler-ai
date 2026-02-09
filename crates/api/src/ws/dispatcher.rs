@@ -35,3 +35,19 @@ pub async fn send_to_user(
 ) {
     broadcast(ws_storage, &[*user_id], message).await;
 }
+
+/// Sends a JSON message to a specific connection by connection_id.
+/// Used for media signaling responses that should target a single tab/device.
+pub async fn send_to_connection(
+    ws_storage: &WsStorage,
+    connection_id: &str,
+    message: &serde_json::Value,
+) {
+    if let Some(sender) = ws_storage.get_sender_by_connection(connection_id) {
+        let text = serde_json::to_string(message).unwrap_or_default();
+        let mut guard = sender.lock().await;
+        if let Err(e) = guard.send(Message::text(text)).await {
+            warn!(%connection_id, %e, "Failed to send WS message to connection");
+        }
+    }
+}

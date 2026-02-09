@@ -1,5 +1,7 @@
 use crate::fixtures::test_app::TestApp;
+use futures::{SinkExt, StreamExt};
 use serde_json::Value;
+use tokio_tungstenite::tungstenite::Message;
 
 #[tokio::test]
 async fn create_conference() {
@@ -749,4 +751,201 @@ async fn conference_leave_cleans_up_participant_media() {
     assert_eq!(parsed["type"], "media:transport_created", "Should get new transports after re-join");
 
     ws.close(None).await.ok();
+}
+
+// --- Connection-ID isolation tests ---
+
+/// Helper: connect WS, read "connected" message, send media:join, read router_capabilities + transport_created.
+/// Returns the WS stream and the transport_created data.
+async fn ws_join_media(
+    addr: &std::net::SocketAddr,
+    token: &str,
+    conf_id: &str,
+) -> (
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    Value,
+) {
+    let ws_url = format!("ws://{}/ws?token={}", addr, token);
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("WS connect failed");
+
+    // Read "connected"
+    ws.next().await;
+
+    // Send media:join
+    ws.send(Message::Text(
+        serde_json::to_string(&serde_json::json!({
+            "type": "media:join",
+            "data": { "conference_id": conf_id }
+        }))
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+
+    // Read router_capabilities
+    let msg = ws.next().await.unwrap().unwrap();
+    let parsed: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+    assert_eq!(parsed["type"], "media:router_capabilities");
+
+    // Read transport_created
+    let msg = ws.next().await.unwrap().unwrap();
+    let transport: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+    assert_eq!(transport["type"], "media:transport_created");
+
+    (ws, transport)
+}
+
+/// Helper: create + start a conference, return conf_id.
+async fn create_and_start_conference(app: &TestApp, tenant_id: &str, token: &str, subject: &str) -> String {
+    let resp = app
+        .auth_post(
+            &format!("/api/tenant/{}/conference", tenant_id),
+            token,
+        )
+        .json(&serde_json::json!({ "subject": subject }))
+        .send()
+        .await
+        .unwrap();
+    let conf: Value = resp.json().await.unwrap();
+    let conf_id = conf["id"].as_str().unwrap().to_string();
+
+    app.auth_post(
+        &format!("/api/tenant/{}/conference/{}/start", tenant_id, conf_id),
+        token,
+    )
+    .send()
+    .await
+    .unwrap();
+
+    conf_id
+}
+
+#[tokio::test]
+async fn two_different_users_get_independent_transports() {
+    let app = TestApp::spawn().await;
+    let tenant = app.seed_tenant("connid1").await;
+    let conf_id = create_and_start_conference(&app, &tenant.tenant_id, &tenant.admin.access_token, "ConnID Test").await;
+
+    // Both users REST-join
+    app.auth_post(
+        &format!("/api/tenant/{}/conference/{}/join", tenant.tenant_id, conf_id),
+        &tenant.admin.access_token,
+    ).send().await.unwrap();
+
+    app.auth_post(
+        &format!("/api/tenant/{}/conference/{}/join", tenant.tenant_id, conf_id),
+        &tenant.member.access_token,
+    ).send().await.unwrap();
+
+    // Both users WS media:join — each gets their own transports
+    let (mut ws1, t1) = ws_join_media(&app.addr, &tenant.admin.access_token, &conf_id).await;
+    let (mut ws2, t2) = ws_join_media(&app.addr, &tenant.member.access_token, &conf_id).await;
+
+    // Verify different transport IDs (proves separate connection_ids)
+    let send1_id = t1["data"]["send_transport"]["id"].as_str().unwrap();
+    let send2_id = t2["data"]["send_transport"]["id"].as_str().unwrap();
+    assert_ne!(send1_id, send2_id, "Different users should get different transport IDs");
+
+    let recv1_id = t1["data"]["recv_transport"]["id"].as_str().unwrap();
+    let recv2_id = t2["data"]["recv_transport"]["id"].as_str().unwrap();
+    assert_ne!(recv1_id, recv2_id, "Different users should get different recv transport IDs");
+
+    ws1.close(None).await.ok();
+    ws2.close(None).await.ok();
+}
+
+#[tokio::test]
+async fn same_user_two_connections_get_independent_transports() {
+    let app = TestApp::spawn().await;
+    let tenant = app.seed_tenant("connid2").await;
+    let conf_id = create_and_start_conference(&app, &tenant.tenant_id, &tenant.admin.access_token, "Same User Multi-Tab").await;
+
+    // REST join once
+    app.auth_post(
+        &format!("/api/tenant/{}/conference/{}/join", tenant.tenant_id, conf_id),
+        &tenant.admin.access_token,
+    ).send().await.unwrap();
+
+    // Same user, two WS connections, each sends media:join
+    let (mut ws1, t1) = ws_join_media(&app.addr, &tenant.admin.access_token, &conf_id).await;
+    let (mut ws2, t2) = ws_join_media(&app.addr, &tenant.admin.access_token, &conf_id).await;
+
+    // Both should get unique transport IDs (keyed by connection_id, not user_id)
+    let send1_id = t1["data"]["send_transport"]["id"].as_str().unwrap();
+    let send2_id = t2["data"]["send_transport"]["id"].as_str().unwrap();
+    assert_ne!(
+        send1_id, send2_id,
+        "Same user from two connections must get different transport IDs (connection_id isolation)"
+    );
+
+    // Closing ws2 should NOT destroy ws1's transports.
+    // ws1 should still be able to communicate.
+    ws2.close(None).await.ok();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // ws1 may receive media:peer_left (ws2 left the conference) — that's expected
+    // Then send a ping to verify ws1 is still alive
+    ws1.send(Message::Text(
+        serde_json::to_string(&serde_json::json!({ "type": "ping" }))
+            .unwrap()
+            .into(),
+    ))
+    .await
+    .unwrap();
+
+    // Read messages until we get pong (there may be a peer_left first)
+    let mut got_pong = false;
+    for _ in 0..5 {
+        match tokio::time::timeout(std::time::Duration::from_secs(2), ws1.next()).await {
+            Ok(Some(Ok(msg))) => {
+                let parsed: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+                if parsed["type"] == "pong" {
+                    got_pong = true;
+                    break;
+                }
+                // media:peer_left is expected, skip it
+            }
+            _ => break,
+        }
+    }
+    assert!(got_pong, "ws1 should still be alive after ws2 closes (got pong)");
+
+    ws1.close(None).await.ok();
+}
+
+#[tokio::test]
+async fn ws_disconnect_notifies_peers_with_peer_left() {
+    let app = TestApp::spawn().await;
+    let tenant = app.seed_tenant("connid3").await;
+    let conf_id = create_and_start_conference(&app, &tenant.tenant_id, &tenant.admin.access_token, "Disconnect Notify").await;
+
+    // Both users REST-join
+    app.auth_post(
+        &format!("/api/tenant/{}/conference/{}/join", tenant.tenant_id, conf_id),
+        &tenant.admin.access_token,
+    ).send().await.unwrap();
+
+    app.auth_post(
+        &format!("/api/tenant/{}/conference/{}/join", tenant.tenant_id, conf_id),
+        &tenant.member.access_token,
+    ).send().await.unwrap();
+
+    // Both users WS media:join
+    let (mut ws1, _) = ws_join_media(&app.addr, &tenant.admin.access_token, &conf_id).await;
+    let (ws2, _) = ws_join_media(&app.addr, &tenant.member.access_token, &conf_id).await;
+
+    // User 2 disconnects (drops WS)
+    drop(ws2);
+
+    // User 1 should receive peer_left
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let msg = ws1.next().await.unwrap().unwrap();
+    let parsed: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+    assert_eq!(parsed["type"], "media:peer_left");
+    assert_eq!(parsed["data"]["user_id"], tenant.member.id);
+
+    ws1.close(None).await.ok();
 }

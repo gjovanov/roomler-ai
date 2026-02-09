@@ -29,6 +29,13 @@ export function useMediasoup() {
   async function joinRoom(confId: string) {
     conferenceId.value = confId
 
+    // Register handlers FIRST so no messages are dropped while awaiting transports.
+    // Buffer any new_producer messages that arrive before transports are ready.
+    const pendingProducers: Array<{ producer_id: string; user_id: string; kind: string }> = []
+    ws.onMediaMessage('media:new_producer', (data) => pendingProducers.push(data))
+    ws.onMediaMessage('media:peer_left', handlePeerLeft)
+    ws.onMediaMessage('media:producer_closed', handleProducerClosed)
+
     // Send media:join and wait for router_capabilities + transport_created
     const capabilitiesPromise = ws.waitForMessage('media:router_capabilities')
     const transportPromise = ws.waitForMessage('media:transport_created')
@@ -99,10 +106,13 @@ export function useMediasoup() {
 
     recvTransport.value = rt
 
-    // Listen for new producers from other peers
+    // Replace the buffering handler with the real one now that transports are ready
     ws.onMediaMessage('media:new_producer', handleNewProducer)
-    ws.onMediaMessage('media:peer_left', handlePeerLeft)
-    ws.onMediaMessage('media:producer_closed', handleProducerClosed)
+
+    // Process any producers that arrived while we were setting up transports
+    for (const p of pendingProducers) {
+      handleNewProducer(p)
+    }
   }
 
   /** Produce local audio + video tracks */

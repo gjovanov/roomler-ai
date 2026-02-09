@@ -18,7 +18,7 @@
         </v-card>
       </v-col>
       <v-col cols="12" sm="6" md="3">
-        <v-card>
+        <v-card :to="`/tenant/${tenantId}/conferences`" hover>
           <v-card-text class="text-center">
             <v-icon size="48" color="secondary">mdi-video</v-icon>
             <div class="text-h4 mt-2">{{ conferenceStore.conferences.length }}</div>

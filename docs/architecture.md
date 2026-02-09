@@ -4,9 +4,9 @@
 
 ```
 ┌──────────────┐         ┌───────────────────────────────────┐
-│  Browser SPA │  HTTP   │         Axum API :3000             │
+│  Browser SPA │  HTTP   │         Axum API :5001             │
 │  Vue 3       ├────────►│                                   │
-│  :5173       │  WS     │  ┌─────────┐  ┌───────────────┐  │
+│  :5000       │  WS     │  ┌─────────┐  ┌───────────────┐  │
 │              ◄────────►│  │ REST    │  │  WebSocket    │  │
 └──────────────┘         │  │ Routes  │  │  Handler      │  │
                          │  └────┬────┘  └───────┬───────┘  │
@@ -144,7 +144,7 @@ Composables (useAuth, useWebSocket)
 API Client (REST + WebSocket)
   │
   ▼
-Axum Backend (HTTP :3000 / WS :3000)
+Axum Backend (HTTP :5001 / WS :5001)
 ```
 
 ### Frontend Stack

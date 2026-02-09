@@ -8,6 +8,7 @@ pub mod file;
 pub mod integration;
 pub mod invite;
 pub mod message;
+pub mod oauth;
 pub mod reaction;
 pub mod recording;
 pub mod tenant;

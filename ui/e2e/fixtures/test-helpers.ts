@@ -74,6 +74,77 @@ export async function loginViaUi(page: Page, username: string, password: string)
   await expect(page).toHaveURL(/\/$/, { timeout: 5000 })
 }
 
+/** Join a channel via the API */
+export async function joinChannelViaApi(token: string, tenantId: string, channelId: string) {
+  const resp = await fetch(`${API_URL}/api/tenant/${tenantId}/channel/${channelId}/join`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+  })
+  if (!resp.ok) throw new Error(`Join channel failed: ${resp.status}`)
+  return resp.json()
+}
+
+/** Create a conference via the API */
+export async function createConferenceViaApi(token: string, tenantId: string, subject: string) {
+  const resp = await fetch(`${API_URL}/api/tenant/${tenantId}/conference`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ subject }),
+  })
+  if (!resp.ok) throw new Error(`Create conference failed: ${resp.status}`)
+  return (await resp.json()) as { id: string; subject: string; status: string }
+}
+
+/** Start a conference via the API */
+export async function startConferenceViaApi(token: string, tenantId: string, conferenceId: string) {
+  const resp = await fetch(`${API_URL}/api/tenant/${tenantId}/conference/${conferenceId}/start`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+  })
+  if (!resp.ok) throw new Error(`Start conference failed: ${resp.status}`)
+  return resp.json()
+}
+
+/** Send a message via the API */
+export async function sendMessageViaApi(
+  token: string,
+  tenantId: string,
+  channelId: string,
+  content: string,
+) {
+  const resp = await fetch(`${API_URL}/api/tenant/${tenantId}/channel/${channelId}/message`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ content }),
+  })
+  if (!resp.ok) throw new Error(`Send message failed: ${resp.status}`)
+  return (await resp.json()) as { id: string; content: string; author_id: string }
+}
+
+/** Add a user to a tenant via the API */
+export async function addTenantMemberViaApi(
+  token: string,
+  tenantId: string,
+  userId: string,
+) {
+  const resp = await fetch(`${API_URL}/api/tenant/${tenantId}/member`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ user_id: userId }),
+  })
+  if (!resp.ok) throw new Error(`Add tenant member failed: ${resp.status}`)
+  return resp.json()
+}
+
 /** Register through the UI */
 export async function registerViaUi(
   page: Page,

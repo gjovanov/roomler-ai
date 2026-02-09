@@ -1,6 +1,6 @@
 use bson::{doc, oid::ObjectId, DateTime};
 use mongodb::Database;
-use roomler2_db::models::{NotificationPrefs, Presence, User, UserStatusInfo};
+use roomler2_db::models::{NotificationPrefs, OAuthProvider, Presence, User, UserStatusInfo};
 
 use super::base::{BaseDao, DaoError, DaoResult};
 
@@ -78,6 +78,82 @@ impl UserDao {
                 },
             )
             .await
+    }
+
+    pub async fn find_or_create_by_oauth(
+        &self,
+        provider: &str,
+        provider_id: &str,
+        email: &str,
+        display_name: &str,
+        avatar_url: Option<&str>,
+    ) -> DaoResult<User> {
+        // Try to find user by email first
+        if let Ok(mut user) = self.find_by_email(email).await {
+            // Link OAuth provider if not already linked
+            let already_linked = user
+                .oauth_providers
+                .iter()
+                .any(|p| p.provider == provider && p.provider_id == provider_id);
+            if !already_linked {
+                let oauth = OAuthProvider {
+                    provider: provider.to_string(),
+                    provider_id: provider_id.to_string(),
+                    access_token: None,
+                    refresh_token: None,
+                };
+                let oauth_bson =
+                    bson::to_bson(&oauth).map_err(bson::ser::Error::from)?;
+                self.base
+                    .update_by_id(
+                        user.id.unwrap(),
+                        doc! { "$push": { "oauth_providers": oauth_bson } },
+                    )
+                    .await?;
+                user.oauth_providers.push(oauth);
+            }
+            return Ok(user);
+        }
+
+        // Create new user from OAuth
+        let now = DateTime::now();
+        // Generate a username from the display name
+        let username = display_name
+            .to_lowercase()
+            .replace(' ', "_")
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '_')
+            .collect::<String>();
+        let username = format!("{}_{}", username, &ObjectId::new().to_hex()[..6]);
+
+        let user = User {
+            id: None,
+            email: email.to_string(),
+            username,
+            display_name: display_name.to_string(),
+            avatar: avatar_url.map(|s| s.to_string()),
+            password_hash: None,
+            status: UserStatusInfo::default(),
+            presence: Presence::Offline,
+            locale: "en-US".to_string(),
+            timezone: "UTC".to_string(),
+            is_verified: true, // OAuth email is pre-verified
+            is_mfa_enabled: false,
+            last_active_at: None,
+            oauth_providers: vec![OAuthProvider {
+                provider: provider.to_string(),
+                provider_id: provider_id.to_string(),
+                access_token: None,
+                refresh_token: None,
+            }],
+            notification_preferences: NotificationPrefs::default(),
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+        };
+
+        let id = self.base.insert_one(&user).await?;
+        self.base.find_by_id(id).await
     }
 
     pub async fn update_profile(

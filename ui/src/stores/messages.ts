@@ -85,9 +85,13 @@ export const useMessageStore = defineStore('messages', () => {
 
   function addMessageFromWs(msg: Message) {
     if (msg.thread_id) {
-      threadMessages.value.push(msg)
+      if (!threadMessages.value.some((m) => m.id === msg.id)) {
+        threadMessages.value.push(msg)
+      }
     } else {
-      messages.value.push(msg)
+      if (!messages.value.some((m) => m.id === msg.id)) {
+        messages.value.push(msg)
+      }
     }
   }
 

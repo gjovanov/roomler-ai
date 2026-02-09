@@ -119,9 +119,15 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::integration::export_conversation_pdf),
         );
 
+    // OAuth routes (no auth required)
+    let oauth_routes = Router::new()
+        .route("/{provider}", get(routes::oauth::oauth_redirect))
+        .route("/callback/{provider}", get(routes::oauth::oauth_callback));
+
     // Compose API
     let api = Router::new()
         .nest("/auth", auth_routes)
+        .nest("/oauth", oauth_routes)
         .nest("/tenant", tenant_routes)
         .nest("/tenant/{tenant_id}/member", member_routes)
         .nest("/tenant/{tenant_id}/channel", channel_routes)

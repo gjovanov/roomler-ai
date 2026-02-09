@@ -26,7 +26,9 @@ export const useWsStore = defineStore('ws', () => {
 
     status.value = 'connecting'
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
-    socket = new WebSocket(`${protocol}//${location.host}/ws?token=${token}`)
+    // In dev mode, connect directly to the API server to bypass Vite proxy (which doesn't relay WS frames)
+    const wsHost = import.meta.env.DEV ? 'localhost:5001' : location.host
+    socket = new WebSocket(`${protocol}//${wsHost}/ws?token=${token}`)
 
     socket.onopen = () => {
       status.value = 'connected'
@@ -40,6 +42,7 @@ export const useWsStore = defineStore('ws', () => {
     socket.onmessage = (event) => {
       try {
         const msg = JSON.parse(event.data)
+        console.debug('[WS] received:', msg.type)
         handleMessage(msg)
       } catch {
         // ignore malformed messages
@@ -88,7 +91,11 @@ export const useWsStore = defineStore('ws', () => {
 
   function send(type: string, data: unknown) {
     if (socket?.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify({ type, data }))
+      const payload = JSON.stringify({ type, data })
+      console.debug('[WS] sending:', type, 'readyState:', socket.readyState)
+      socket.send(payload)
+    } else {
+      console.warn('[WS] cannot send, socket not open:', type, 'readyState:', socket?.readyState)
     }
   }
 
