@@ -23,12 +23,18 @@ pub struct MediaRoom {
     pub participants: DashMap<String, ParticipantMedia>,
 }
 
+/// A producer with its source label (e.g. "camera", "screen", "audio").
+pub struct ProducerEntry {
+    pub producer: Producer,
+    pub source: String,
+}
+
 /// Media state for a single participant (one WebSocket connection).
 pub struct ParticipantMedia {
     pub user_id: ObjectId,
     pub send_transport: WebRtcTransport,
     pub recv_transport: WebRtcTransport,
-    pub producers: Vec<Producer>,
+    pub producers: Vec<ProducerEntry>,
     pub consumers: Vec<Consumer>,
 }
 
@@ -246,6 +252,7 @@ impl RoomManager {
         connection_id: &str,
         kind: MediaKind,
         rtp_parameters: RtpParameters,
+        source: String,
     ) -> anyhow::Result<ProducerId> {
         let room = self
             .rooms
@@ -265,9 +272,9 @@ impl RoomManager {
             .map_err(|e| anyhow::anyhow!("Failed to produce: {}", e))?;
 
         let producer_id = producer.id();
-        participant.producers.push(producer);
+        participant.producers.push(ProducerEntry { producer, source: source.clone() });
 
-        debug!(?conference_id, %connection_id, %producer_id, ?kind, "producer created");
+        debug!(?conference_id, %connection_id, %producer_id, ?kind, %source, "producer created");
         Ok(producer_id)
     }
 
@@ -335,7 +342,7 @@ impl RoomManager {
                 let before = participant.producers.len();
                 participant
                     .producers
-                    .retain(|p| &p.id() != producer_id);
+                    .retain(|pe| &pe.producer.id() != producer_id);
                 return participant.producers.len() < before;
             }
         }
@@ -375,14 +382,15 @@ impl RoomManager {
         &self,
         conference_id: &ObjectId,
         exclude_connection_id: &str,
-    ) -> Vec<(ObjectId, ProducerId, MediaKind)> {
+    ) -> Vec<(ObjectId, String, ProducerId, MediaKind, String)> {
         let mut result = Vec::new();
         if let Some(room) = self.rooms.get(conference_id) {
             for entry in room.participants.iter() {
                 if entry.key() != exclude_connection_id {
                     let uid = entry.value().user_id;
-                    for producer in &entry.value().producers {
-                        result.push((uid, producer.id(), producer.kind()));
+                    let conn_id = entry.key().clone();
+                    for pe in &entry.value().producers {
+                        result.push((uid, conn_id.clone(), pe.producer.id(), pe.producer.kind(), pe.source.clone()));
                     }
                 }
             }
@@ -425,6 +433,26 @@ impl RoomManager {
                 ids.sort();
                 ids.dedup();
                 ids
+            })
+            .unwrap_or_default()
+    }
+
+    /// Returns connection IDs of all participants except the given connection_id.
+    /// Unlike get_other_participant_user_ids, this returns connection-level granularity
+    /// so broadcasts don't leak to same-user connections in the same room.
+    pub fn get_other_connection_ids(
+        &self,
+        conference_id: &ObjectId,
+        exclude_connection_id: &str,
+    ) -> Vec<String> {
+        self.rooms
+            .get(conference_id)
+            .map(|room| {
+                room.participants
+                    .iter()
+                    .filter(|e| e.key() != exclude_connection_id)
+                    .map(|e| e.key().clone())
+                    .collect()
             })
             .unwrap_or_default()
     }

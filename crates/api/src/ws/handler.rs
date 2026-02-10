@@ -93,25 +93,28 @@ async fn handle_socket(socket: WebSocket, state: AppState, user_id: ObjectId) {
 
     // Cleanup: if this connection was in a media room, close their participant and notify peers
     if let Some(conference_id) = state.room_manager.get_connection_conference(&connection_id) {
-        // Get remaining participant user_ids before closing
-        let remaining: Vec<ObjectId> = state
+        // Get remaining connection IDs before closing
+        let remaining_conns = state
             .room_manager
-            .get_other_participant_user_ids(&conference_id, &connection_id);
+            .get_other_connection_ids(&conference_id, &connection_id);
 
         state
             .room_manager
             .close_participant(&conference_id, &connection_id);
 
-        // Broadcast peer_left to remaining participants
-        if !remaining.is_empty() {
+        // Broadcast peer_left to remaining connections
+        if !remaining_conns.is_empty() {
             let event = serde_json::json!({
                 "type": "media:peer_left",
                 "data": {
                     "user_id": user_id.to_hex(),
+                    "connection_id": connection_id,
                     "conference_id": conference_id.to_hex(),
                 }
             });
-            super::dispatcher::broadcast(&state.ws_storage, &remaining, &event).await;
+            for conn_id in &remaining_conns {
+                super::dispatcher::send_to_connection(&state.ws_storage, conn_id, &event).await;
+            }
         }
     }
 
@@ -268,6 +271,24 @@ async fn handle_media_join(
 
     let force_relay = state.settings.turn.force_relay.unwrap_or(false);
 
+    if force_relay {
+        warn!(
+            "force_relay=true with mediasoup — TURN relay won't work because mediasoup \
+             doesn't create server-side relay candidates. Set ROOMLER__TURN__FORCE_RELAY=false"
+        );
+    }
+
+    // Log ICE diagnostics
+    info!(
+        %connection_id,
+        force_relay,
+        announced_ip = %state.settings.mediasoup.announced_ip,
+        turn_url = ?state.settings.turn.url,
+        send_ice_candidates = %transport_pair.send_transport.ice_candidates,
+        recv_ice_candidates = %transport_pair.recv_transport.ice_candidates,
+        "media:join transport_created ICE diagnostics"
+    );
+
     // Send transport options (targeted to this connection only)
     let msg = serde_json::json!({
         "type": "media:transport_created",
@@ -282,13 +303,15 @@ async fn handle_media_join(
 
     // Send list of existing producers to the new peer (excludes this connection's own producers)
     let producers = state.room_manager.get_producer_ids(&confid, connection_id);
-    for (uid, pid, kind) in producers {
+    for (uid, conn_id, pid, kind, source) in producers {
         let msg = serde_json::json!({
             "type": "media:new_producer",
             "data": {
                 "producer_id": pid.to_string(),
                 "user_id": uid.to_hex(),
+                "connection_id": conn_id,
                 "kind": match kind { MediaKind::Audio => "audio", MediaKind::Video => "video" },
+                "source": source,
             }
         });
         super::dispatcher::send_to_connection(&state.ws_storage, connection_id, &msg).await;
@@ -380,6 +403,14 @@ async fn handle_media_produce(
             return;
         }
     };
+    let source = data
+        .get("source")
+        .and_then(|v| v.as_str())
+        .unwrap_or(match kind {
+            MediaKind::Audio => "audio",
+            MediaKind::Video => "camera",
+        })
+        .to_string();
 
     let confid = match ObjectId::parse_str(conference_id_str) {
         Ok(id) => id,
@@ -391,7 +422,7 @@ async fn handle_media_produce(
 
     match state
         .room_manager
-        .produce(&confid, connection_id, kind, rtp_parameters)
+        .produce(&confid, connection_id, kind, rtp_parameters, source.clone())
         .await
     {
         Ok(producer_id) => {
@@ -402,21 +433,26 @@ async fn handle_media_produce(
             });
             super::dispatcher::send_to_connection(&state.ws_storage, connection_id, &result_msg).await;
 
-            // Broadcast new_producer to all other participants (excluding this connection)
-            let others: Vec<ObjectId> = state
+            // Broadcast new_producer to all other connections (not user_ids, to avoid
+            // same-user multi-tab leaking producers back to the producing connection)
+            let other_conns = state
                 .room_manager
-                .get_other_participant_user_ids(&confid, connection_id);
+                .get_other_connection_ids(&confid, connection_id);
 
-            if !others.is_empty() {
+            if !other_conns.is_empty() {
                 let event = serde_json::json!({
                     "type": "media:new_producer",
                     "data": {
                         "producer_id": producer_id.to_string(),
                         "user_id": user_id.to_hex(),
+                        "connection_id": connection_id,
                         "kind": match kind { MediaKind::Audio => "audio", MediaKind::Video => "video" },
+                        "source": source,
                     }
                 });
-                super::dispatcher::broadcast(&state.ws_storage, &others, &event).await;
+                for conn_id in &other_conns {
+                    super::dispatcher::send_to_connection(&state.ws_storage, conn_id, &event).await;
+                }
             }
         }
         Err(e) => {
@@ -539,12 +575,12 @@ async fn handle_media_producer_close(
         .room_manager
         .close_producer(&confid, connection_id, &producer_id)
     {
-        // Notify other participants (excluding this connection)
-        let others: Vec<ObjectId> = state
+        // Notify other connections (excluding this connection)
+        let other_conns = state
             .room_manager
-            .get_other_participant_user_ids(&confid, connection_id);
+            .get_other_connection_ids(&confid, connection_id);
 
-        if !others.is_empty() {
+        if !other_conns.is_empty() {
             let event = serde_json::json!({
                 "type": "media:producer_closed",
                 "data": {
@@ -552,7 +588,9 @@ async fn handle_media_producer_close(
                     "user_id": user_id.to_hex(),
                 }
             });
-            super::dispatcher::broadcast(&state.ws_storage, &others, &event).await;
+            for conn_id in &other_conns {
+                super::dispatcher::send_to_connection(&state.ws_storage, conn_id, &event).await;
+            }
         }
     }
 }
@@ -574,24 +612,27 @@ async fn handle_media_leave(
         Err(_) => return,
     };
 
-    // Get remaining participants before closing (excluding this connection)
-    let others: Vec<ObjectId> = state
+    // Get remaining connections before closing (excluding this connection)
+    let other_conns = state
         .room_manager
-        .get_other_participant_user_ids(&confid, connection_id);
+        .get_other_connection_ids(&confid, connection_id);
 
     state
         .room_manager
         .close_participant(&confid, connection_id);
 
-    // Broadcast peer_left
-    if !others.is_empty() {
+    // Broadcast peer_left to remaining connections
+    if !other_conns.is_empty() {
         let event = serde_json::json!({
             "type": "media:peer_left",
             "data": {
                 "user_id": user_id.to_hex(),
+                "connection_id": connection_id,
                 "conference_id": confid.to_hex(),
             }
         });
-        super::dispatcher::broadcast(&state.ws_storage, &others, &event).await;
+        for conn_id in &other_conns {
+            super::dispatcher::send_to_connection(&state.ws_storage, conn_id, &event).await;
+        }
     }
 }

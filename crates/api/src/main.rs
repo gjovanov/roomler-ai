@@ -21,6 +21,14 @@ async fn main() -> anyhow::Result<()> {
     // Load config
     let settings = Settings::load()?;
     info!("Starting Roomler2 API on {}:{}", settings.app.host, settings.app.port);
+    info!(
+        listen_ip = %settings.mediasoup.listen_ip,
+        announced_ip = %settings.mediasoup.announced_ip,
+        rtc_ports = %format!("{}-{}", settings.mediasoup.rtc_min_port, settings.mediasoup.rtc_max_port),
+        turn_url = ?settings.turn.url,
+        force_relay = ?settings.turn.force_relay,
+        "Mediasoup/TURN config"
+    );
 
     // Connect to MongoDB
     let db = connect(&settings).await?;

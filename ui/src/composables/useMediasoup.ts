@@ -4,8 +4,10 @@ import { useWsStore } from '@/stores/ws'
 
 interface RemoteStream {
   userId: string
+  connectionId: string
   stream: MediaStream
   kind: string
+  source: string
 }
 
 export function useMediasoup() {
@@ -25,6 +27,8 @@ export function useMediasoup() {
   // Serialize consumeProducer calls — pendingWaiters only holds one waiter per message type,
   // so concurrent consume requests cause the earlier waiter to be overwritten and timeout.
   let consumeChain = Promise.resolve()
+  // Track consumer → stream key for cleanup on producer_closed
+  const consumerStreamKey = new Map<string, string>()
 
   const ws = useWsStore()
 
@@ -35,7 +39,7 @@ export function useMediasoup() {
 
     // Register handlers FIRST so no messages are dropped while awaiting transports.
     // Buffer any new_producer messages that arrive before transports are ready.
-    const pendingProducers: Array<{ producer_id: string; user_id: string; kind: string }> = []
+    const pendingProducers: Array<{ producer_id: string; user_id: string; connection_id?: string; kind: string; source?: string }> = []
     ws.onMediaMessage('media:new_producer', (data) => {
       console.log('[mediasoup] buffering new_producer:', data)
       pendingProducers.push(data)
@@ -69,7 +73,23 @@ export function useMediasoup() {
         }))
       : undefined
     const iceTransportPolicy = transportMsg.force_relay ? 'relay' : 'all'
-    console.log('[mediasoup] ICE config:', { iceServers, iceTransportPolicy })
+    console.log('[mediasoup] ICE config:', { iceServers, iceTransportPolicy, force_relay: transportMsg.force_relay })
+
+    // Log ICE candidate details from server
+    for (const label of ['send_transport', 'recv_transport'] as const) {
+      const tp = transportMsg[label]
+      if (tp?.ice_candidates) {
+        for (const c of tp.ice_candidates) {
+          console.log(`[mediasoup] ${label} ICE candidate:`, {
+            protocol: c.protocol,
+            address: c.address ?? c.ip,
+            port: c.port,
+            tcpType: c.tcpType ?? 'n/a',
+            type: c.type,
+          })
+        }
+      }
+    }
 
     // Create send transport
     const sendParams = transportMsg.send_transport
@@ -82,8 +102,18 @@ export function useMediasoup() {
       iceTransportPolicy,
     })
 
-    st.on('connectionstatechange', (state: string) => {
+    st.on('connectionstatechange', async (state: string) => {
       console.log('[mediasoup] sendTransport connectionState:', state)
+      if (state === 'failed') {
+        try {
+          const stats = await st.getStats()
+          stats.forEach((report: Record<string, unknown>) => {
+            if (report.type === 'candidate-pair' || report.type === 'local-candidate' || report.type === 'remote-candidate') {
+              console.log('[mediasoup] sendTransport stats:', report)
+            }
+          })
+        } catch { /* stats not available */ }
+      }
     })
 
     st.on('connect', ({ dtlsParameters }, callback, errback) => {
@@ -96,13 +126,14 @@ export function useMediasoup() {
       callback()
     })
 
-    st.on('produce', async ({ kind, rtpParameters }, callback, errback) => {
+    st.on('produce', async ({ kind, rtpParameters, appData }, callback, errback) => {
       try {
         const resultPromise = ws.waitForMessage('media:produce_result')
         ws.send('media:produce', {
           conference_id: confId,
           kind,
           rtp_parameters: rtpParameters,
+          source: appData?.source || (kind === 'audio' ? 'audio' : 'camera'),
         })
         const result = await resultPromise
         callback({ id: result.id })
@@ -124,8 +155,18 @@ export function useMediasoup() {
       iceTransportPolicy,
     })
 
-    rt.on('connectionstatechange', (state: string) => {
+    rt.on('connectionstatechange', async (state: string) => {
       console.log('[mediasoup] recvTransport connectionState:', state)
+      if (state === 'failed') {
+        try {
+          const stats = await rt.getStats()
+          stats.forEach((report: Record<string, unknown>) => {
+            if (report.type === 'candidate-pair' || report.type === 'local-candidate' || report.type === 'remote-candidate') {
+              console.log('[mediasoup] recvTransport stats:', report)
+            }
+          })
+        } catch { /* stats not available */ }
+      }
     })
 
     rt.on('connect', ({ dtlsParameters }, callback, errback) => {
@@ -167,7 +208,7 @@ export function useMediasoup() {
     // Produce audio
     const audioTrack = stream.getAudioTracks()[0]
     if (audioTrack) {
-      const audioProducer = await sendTransport.value.produce({ track: audioTrack })
+      const audioProducer = await sendTransport.value.produce({ track: audioTrack, appData: { source: 'audio' } })
       producers.set('audio', audioProducer)
       console.log('[mediasoup] audio producer created:', audioProducer.id)
     }
@@ -175,7 +216,7 @@ export function useMediasoup() {
     // Produce video
     const videoTrack = stream.getVideoTracks()[0]
     if (videoTrack) {
-      const videoProducer = await sendTransport.value.produce({ track: videoTrack })
+      const videoProducer = await sendTransport.value.produce({ track: videoTrack, appData: { source: 'camera' } })
       producers.set('video', videoProducer)
       console.log('[mediasoup] video producer created:', videoProducer.id)
     }
@@ -184,13 +225,13 @@ export function useMediasoup() {
   }
 
   /** Consume a remote producer */
-  async function consumeProducer(producerId: string, userId: string) {
+  async function consumeProducer(producerId: string, userId: string, connectionId: string, source: string) {
     if (!recvTransport.value || !device.value) {
       console.warn('[mediasoup] consumeProducer: missing recvTransport or device')
       return
     }
 
-    console.log('[mediasoup] consumeProducer:', producerId, 'from user:', userId)
+    console.log('[mediasoup] consumeProducer:', producerId, 'from user:', userId, 'conn:', connectionId, 'source:', source)
     const resultPromise = ws.waitForMessage('media:consumer_created')
     ws.send('media:consume', {
       conference_id: conferenceId.value,
@@ -199,7 +240,7 @@ export function useMediasoup() {
     })
 
     const result = await resultPromise
-    console.log('[mediasoup] consumer_created response:', result.id, result.kind)
+    console.log('[mediasoup] consumer_created response:', result.id, result.kind, 'source:', source)
 
     const consumer = await recvTransport.value.consume({
       id: result.id,
@@ -211,37 +252,53 @@ export function useMediasoup() {
     consumers.set(consumer.id, consumer)
     console.log('[mediasoup] consumer track:', consumer.track.kind, 'readyState:', consumer.track.readyState, 'enabled:', consumer.track.enabled, 'muted:', consumer.track.muted)
 
+    // Key by connectionId so same user from multiple tabs gets separate streams.
+    // Screen shares get their own key: `${connectionId}:screen`.
+    const streamKey = source === 'screen' ? `${connectionId}:screen` : connectionId
+
+    // Track consumer → stream key for cleanup
+    consumerStreamKey.set(consumer.id, streamKey)
+
     // Attach consumer track to remote stream.
     // Always create a new MediaStream so that Vue reactivity picks up the change
     // (addTrack on an existing stream is a DOM mutation invisible to Vue).
-    const existing = remoteStreams.get(userId)
+    const existing = remoteStreams.get(streamKey)
     const tracks = existing ? [...existing.stream.getTracks(), consumer.track] : [consumer.track]
     const newStream = new MediaStream(tracks)
-    remoteStreams.set(userId, {
+    remoteStreams.set(streamKey, {
       userId,
+      connectionId,
       stream: newStream,
       kind: result.kind,
+      source,
     })
-    console.log('[mediasoup] remoteStreams updated for', userId, '— total tracks:', newStream.getTracks().length, 'video:', newStream.getVideoTracks().length)
+    console.log('[mediasoup] remoteStreams updated for', streamKey, '— total tracks:', newStream.getTracks().length, 'video:', newStream.getVideoTracks().length)
   }
 
   /** Handle new_producer from WS — queued to avoid concurrent waitForMessage collisions */
-  function handleNewProducer(data: { producer_id: string; user_id: string; kind: string }) {
-    console.log('[mediasoup] handleNewProducer:', data.kind, 'from', data.user_id, 'producer:', data.producer_id)
+  function handleNewProducer(data: { producer_id: string; user_id: string; connection_id?: string; kind: string; source?: string }) {
+    const source = data.source || (data.kind === 'audio' ? 'audio' : 'camera')
+    const connectionId = data.connection_id || data.user_id // fallback for backwards compat
+    console.log('[mediasoup] handleNewProducer:', data.kind, 'source:', source, 'from', data.user_id, 'conn:', connectionId, 'producer:', data.producer_id)
     consumeChain = consumeChain
-      .then(() => consumeProducer(data.producer_id, data.user_id))
+      .then(() => consumeProducer(data.producer_id, data.user_id, connectionId, source))
       .catch((err) => console.error('[mediasoup] consumeProducer failed:', err))
   }
 
   /** Handle peer_left from WS */
-  function handlePeerLeft(data: { user_id: string }) {
-    // Remove remote stream
-    remoteStreams.delete(data.user_id)
-    // Close associated consumers
+  function handlePeerLeft(data: { user_id: string; connection_id?: string }) {
+    const connectionId = data.connection_id || data.user_id
+    console.log('[mediasoup] handlePeerLeft: user:', data.user_id, 'conn:', connectionId)
+    // Remove remote streams keyed by this connectionId (camera + screen)
+    remoteStreams.delete(connectionId)
+    remoteStreams.delete(`${connectionId}:screen`)
+    // Close associated consumers whose stream key matches this connection
     for (const [id, consumer] of consumers) {
-      // Consumer doesn't directly expose userId, so we clean up by checking closed state
-      if (consumer.closed) {
+      const key = consumerStreamKey.get(id)
+      if (key === connectionId || key === `${connectionId}:screen`) {
+        consumer.close()
         consumers.delete(id)
+        consumerStreamKey.delete(id)
       }
     }
   }
@@ -252,6 +309,12 @@ export function useMediasoup() {
       if (consumer.producerId === data.producer_id) {
         consumer.close()
         consumers.delete(id)
+        // Clean up the stream entry if it was a screen share (single-track stream)
+        const key = consumerStreamKey.get(id)
+        consumerStreamKey.delete(id)
+        if (key && key.endsWith(':screen')) {
+          remoteStreams.delete(key)
+        }
         break
       }
     }
@@ -304,7 +367,10 @@ export function useMediasoup() {
     const screenTrack = screenStream.getVideoTracks()[0]
     if (!screenTrack) return
 
-    const screenProducer = await sendTransport.value.produce({ track: screenTrack })
+    const screenProducer = await sendTransport.value.produce({
+      track: screenTrack,
+      appData: { source: 'screen' },
+    })
     screenProducerId = screenProducer.id
     producers.set('screen', screenProducer)
     isScreenSharing.value = true
@@ -351,6 +417,7 @@ export function useMediasoup() {
       consumer.close()
     }
     consumers.clear()
+    consumerStreamKey.clear()
 
     // Close transports
     sendTransport.value?.close()

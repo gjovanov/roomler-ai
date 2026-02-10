@@ -46,13 +46,13 @@
 
             <!-- Remote participants -->
             <v-col
-              v-for="[userId, remote] in mediasoup.remoteStreams"
-              :key="userId"
+              v-for="[streamKey, remote] in mediasoup.remoteStreams"
+              :key="streamKey"
               cols="12" sm="6" md="4" lg="3"
             >
               <VideoTile
                 :stream="remote.stream"
-                :display-name="getDisplayName(userId)"
+                :display-name="remote.source === 'screen' ? getDisplayName(remote.userId) + ' (Screen)' : getDisplayName(remote.userId)"
                 :is-muted="false"
                 :is-local="false"
               />

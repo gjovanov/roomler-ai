@@ -14,7 +14,7 @@
 
       <!-- Avatar overlay when video is off (positioned on top of video) -->
       <div
-        v-show="!hasVideoTrack"
+        v-if="!hasVideoTrack"
         class="d-flex align-center justify-center w-100 h-100 bg-grey-darken-4"
         style="position: absolute; top: 0; left: 0; z-index: 1"
       >
@@ -52,6 +52,7 @@ const props = defineProps<{
 }>()
 
 const videoRef = ref<HTMLVideoElement | null>(null)
+let recheckTimer: ReturnType<typeof setTimeout> | null = null
 
 const initial = computed(() =>
   props.displayName ? props.displayName.charAt(0).toUpperCase() : '?',
@@ -66,9 +67,13 @@ function checkVideoTrack() {
     hasVideoTrack.value = false
     return
   }
-  hasVideoTrack.value = props.stream
+  // Primary check: track metadata
+  const hasLiveTrack = props.stream
     .getVideoTracks()
     .some((t) => t.enabled && t.readyState === 'live')
+  // Fallback: video element is actually rendering frames (videoWidth > 0)
+  const isRendering = (videoRef.value?.videoWidth ?? 0) > 0
+  hasVideoTrack.value = hasLiveTrack || isRendering
 }
 
 function setupTrackListeners(stream: MediaStream) {
@@ -88,14 +93,30 @@ function cleanupTrackListeners(stream: MediaStream) {
 }
 
 function attachStream() {
-  if (videoRef.value && props.stream) {
-    videoRef.value.srcObject = props.stream
-    videoRef.value.play().catch(() => {})
+  if (recheckTimer) {
+    clearTimeout(recheckTimer)
+    recheckTimer = null
+  }
+
+  const el = videoRef.value
+  if (el && props.stream) {
+    // Set event listeners BEFORE srcObject/play so events aren't missed
+    el.onplaying = () => checkVideoTrack()
+    el.onloadedmetadata = () => checkVideoTrack()
+    el.onresize = () => checkVideoTrack()
+    el.srcObject = props.stream
+    el.play().catch(() => {})
   }
   if (props.stream) {
     setupTrackListeners(props.stream)
   }
   checkVideoTrack()
+
+  // Delayed fallback: re-check after 500ms in case all events fired
+  // before listeners were attached (race condition)
+  if (props.stream) {
+    recheckTimer = setTimeout(() => checkVideoTrack(), 500)
+  }
 }
 
 watch(
@@ -140,12 +161,19 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  if (recheckTimer) {
+    clearTimeout(recheckTimer)
+    recheckTimer = null
+  }
   if (props.stream) {
     cleanupTrackListeners(props.stream)
     props.stream.onaddtrack = null
     props.stream.onremovetrack = null
   }
   if (videoRef.value) {
+    videoRef.value.onplaying = null
+    videoRef.value.onloadedmetadata = null
+    videoRef.value.onresize = null
     videoRef.value.srcObject = null
   }
 })
