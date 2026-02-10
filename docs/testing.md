@@ -105,9 +105,9 @@ Integration Tests (Rust)              E2E Tests (Playwright)
 │  (random port)       │              │        │             │
 │         │            │              │        ▼             │
 │         ▼            │              │  Axum API (:5001)    │
-│  MongoDB (test DB)   │              │        │             │
+│  Mongo (test DB)     │              │        │             │
 │                      │              │        ▼             │
-└─────────────────────┘              │  MongoDB + Redis +   │
+└─────────────────────┘              │  Mongo   + Redis +   │
                                      │  MinIO               │
                                      └─────────────────────┘
 ```
@@ -134,7 +134,7 @@ Participants are added in configurable batches (default: 10 per batch) with late
 ### Running
 
 ```bash
-# Prerequisites: API server running on :5001, MongoDB on :27017
+# Prerequisites: API server running on :5001, MongoDB on :27019
 npm install ws mongodb   # one-time, from project root
 
 # Run with defaults (500 max, batches of 10)
@@ -151,7 +151,7 @@ Environment variables:
 |----------|---------|-------------|
 | `API_URL` | `http://localhost:5001` | API base URL |
 | `WS_URL` | `ws://localhost:5001/ws` | WebSocket base URL |
-| `MONGO_URL` | `mongodb://localhost:27017` | MongoDB connection |
+| `MONGO_URL` | `mongodb://localhost:27019` | MongoDB connection |
 | `DB_NAME` | `roomler2` | Database name |
 | `RESULTS_FILE` | `stress-test-results.txt` | Output file path |
 

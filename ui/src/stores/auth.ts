@@ -38,19 +38,33 @@ export const useAuthStore = defineStore('auth', () => {
     }
   }
 
-  async function register(email: string, username: string, password: string, displayName: string) {
+  async function register(
+    email: string,
+    username: string,
+    password: string,
+    displayName: string,
+    inviteCode?: string,
+  ) {
     loading.value = true
     error.value = null
     try {
-      const data = await api.post<{ access_token: string; user: User }>('/auth/register', {
+      const body: Record<string, unknown> = {
         email,
         username,
         password,
         display_name: displayName,
-      })
+      }
+      if (inviteCode) body.invite_code = inviteCode
+
+      const data = await api.post<{
+        access_token: string
+        user: User
+        invite_tenant?: { tenant_id: string; tenant_name: string; tenant_slug: string }
+      }>('/auth/register', body)
       token.value = data.access_token
       user.value = data.user
       localStorage.setItem('access_token', data.access_token)
+      return data
     } catch (e) {
       error.value = (e as Error).message
       throw e

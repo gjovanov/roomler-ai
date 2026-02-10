@@ -145,6 +145,44 @@ export async function addTenantMemberViaApi(
   return resp.json()
 }
 
+/** Create an invite via the API */
+export async function createInviteViaApi(
+  token: string,
+  tenantId: string,
+  options: { target_email?: string; max_uses?: number; expires_in_hours?: number } = {},
+) {
+  const resp = await fetch(`${API_URL}/api/tenant/${tenantId}/invite`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify(options),
+  })
+  if (!resp.ok) throw new Error(`Create invite failed: ${resp.status}`)
+  return (await resp.json()) as { id: string; code: string; status: string }
+}
+
+/** Accept an invite via the API */
+export async function acceptInviteViaApi(token: string, code: string) {
+  const resp = await fetch(`${API_URL}/api/invite/${code}/accept`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+  })
+  if (!resp.ok) throw new Error(`Accept invite failed: ${resp.status}`)
+  return (await resp.json()) as { tenant_id: string; tenant_name: string; tenant_slug: string }
+}
+
+/** Revoke an invite via the API */
+export async function revokeInviteViaApi(token: string, tenantId: string, inviteId: string) {
+  const resp = await fetch(`${API_URL}/api/tenant/${tenantId}/invite/${inviteId}`, {
+    method: 'DELETE',
+    headers: { Authorization: `Bearer ${token}` },
+  })
+  if (!resp.ok) throw new Error(`Revoke invite failed: ${resp.status}`)
+  return resp.json()
+}
+
 /** Register through the UI */
 export async function registerViaUi(
   page: Page,

@@ -20,7 +20,7 @@ import { writeFileSync } from 'fs';
 
 const API = process.env.API_URL || 'http://localhost:5001';
 const WS_BASE = process.env.WS_URL || 'ws://localhost:5001/ws';
-const MONGO_URL = process.env.MONGO_URL || 'mongodb://localhost:27017';
+const MONGO_URL = process.env.MONGO_URL || 'mongodb://localhost:27019';
 const DB_NAME = process.env.DB_NAME || 'roomler2';
 const RESULTS_FILE = process.env.RESULTS_FILE || '/home/gjovanov/gjovanov/roomler2/stress-test-results.txt';
 

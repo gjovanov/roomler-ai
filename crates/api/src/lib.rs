@@ -38,7 +38,7 @@ pub fn build_router(state: AppState) -> Router {
 
     // Member routes (under tenant)
     let member_routes = Router::new()
-        .route("/", get(routes::user::list_members));
+        .route("/", get(routes::user::list_members).post(routes::invite::add_member));
 
     // Channel routes (under tenant)
     let channel_routes = Router::new()
@@ -119,6 +119,17 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::integration::export_conversation_pdf),
         );
 
+    // Public invite routes (no auth required for info, auth required for accept)
+    let public_invite_routes = Router::new()
+        .route("/{code}", get(routes::invite::get_invite_info))
+        .route("/{code}/accept", post(routes::invite::accept_invite));
+
+    // Tenant-scoped invite routes (require INVITE_MEMBERS permission)
+    let tenant_invite_routes = Router::new()
+        .route("/", get(routes::invite::list_invites))
+        .route("/", post(routes::invite::create_invite))
+        .route("/{invite_id}", delete(routes::invite::revoke_invite));
+
     // OAuth routes (no auth required)
     let oauth_routes = Router::new()
         .route("/{provider}", get(routes::oauth::oauth_redirect))
@@ -128,8 +139,10 @@ pub fn build_router(state: AppState) -> Router {
     let api = Router::new()
         .nest("/auth", auth_routes)
         .nest("/oauth", oauth_routes)
+        .nest("/invite", public_invite_routes)
         .nest("/tenant", tenant_routes)
         .nest("/tenant/{tenant_id}/member", member_routes)
+        .nest("/tenant/{tenant_id}/invite", tenant_invite_routes)
         .nest("/tenant/{tenant_id}/channel", channel_routes)
         .nest(
             "/tenant/{tenant_id}/channel/{channel_id}/message",

@@ -65,6 +65,24 @@ where
     }
 }
 
+/// Optional auth extractor — returns `Option<AuthUser>`, never rejects.
+/// Use for endpoints that behave differently for authenticated vs unauthenticated users.
+pub struct OptionalAuthUser(pub Option<AuthUser>);
+
+impl<S> FromRequestParts<S> for OptionalAuthUser
+where
+    AppState: FromRef<S>,
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        Ok(OptionalAuthUser(
+            AuthUser::from_request_parts(parts, state).await.ok(),
+        ))
+    }
+}
+
 /// Helper trait for extracting AppState from composite state types
 pub trait FromRef<T> {
     fn from_ref(input: &T) -> Self;

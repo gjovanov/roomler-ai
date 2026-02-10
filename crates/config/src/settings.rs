@@ -104,7 +104,7 @@ impl Settings {
             .set_default("app.host", "0.0.0.0")?
             .set_default("app.port", 3000)?
             .set_default("app.cors_origins", Vec::<String>::new())?
-            .set_default("database.url", "mongodb://localhost:27017")?
+            .set_default("database.url", "mongodb://localhost:27019")?
             .set_default("database.name", "roomler2")?
             .set_default("jwt.secret", "change-me-in-production")?
             .set_default("jwt.access_token_ttl_secs", 3600)?

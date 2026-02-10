@@ -4,8 +4,9 @@ use roomler2_services::{
     AuthService, OAuthService, RecognitionService, TaskService,
     dao::{
         channel::ChannelDao, conference::ConferenceDao, file::FileDao,
-        message::MessageDao, reaction::ReactionDao, recording::RecordingDao,
-        tenant::TenantDao, transcription::TranscriptionDao, user::UserDao,
+        invite::InviteDao, message::MessageDao, reaction::ReactionDao,
+        recording::RecordingDao, tenant::TenantDao, transcription::TranscriptionDao,
+        user::UserDao,
     },
     media::{room_manager::RoomManager, worker_pool::WorkerPool},
 };
@@ -21,6 +22,7 @@ pub struct AppState {
     pub users: Arc<UserDao>,
     pub tenants: Arc<TenantDao>,
     pub channels: Arc<ChannelDao>,
+    pub invites: Arc<InviteDao>,
     pub messages: Arc<MessageDao>,
     pub reactions: Arc<ReactionDao>,
     pub conferences: Arc<ConferenceDao>,
@@ -40,6 +42,7 @@ impl AppState {
         let users = Arc::new(UserDao::new(&db));
         let tenants = Arc::new(TenantDao::new(&db));
         let channels = Arc::new(ChannelDao::new(&db));
+        let invites = Arc::new(InviteDao::new(&db));
         let messages = Arc::new(MessageDao::new(&db));
         let reactions = Arc::new(ReactionDao::new(&db));
         let conferences = Arc::new(ConferenceDao::new(&db));
@@ -76,6 +79,7 @@ impl AppState {
             users,
             tenants,
             channels,
+            invites,
             messages,
             reactions,
             conferences,

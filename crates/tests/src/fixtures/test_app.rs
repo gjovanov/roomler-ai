@@ -17,7 +17,7 @@ pub struct TestApp {
 impl TestApp {
     /// Spawn a new test server connected to the test MongoDB.
     ///
-    /// Requires a running MongoDB at localhost:27017.
+    /// Requires a running MongoDB at localhost:27019.
     /// Set ROOMLER__DATABASE__URL env var to override the connection string.
     /// Each test gets a unique database name for isolation.
     pub async fn spawn() -> Self {
@@ -159,7 +159,7 @@ fn test_settings() -> Settings {
             cors_origins: vec![],
         },
         database: roomler2_config::DatabaseSettings {
-            url: "mongodb://localhost:27017".to_string(),
+            url: "mongodb://localhost:27019".to_string(),
             name: "roomler2_test".to_string(),
             max_pool_size: Some(5),
             min_pool_size: Some(1),

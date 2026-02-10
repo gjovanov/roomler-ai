@@ -6,7 +6,7 @@ The `docker-compose.yml` provides all infrastructure dependencies:
 
 | Service | Image | Ports | Purpose |
 |---------|-------|-------|---------|
-| MongoDB | `mongo:7` | 27017 | Primary database |
+| Mongo | `mongo:7` | 27019 | Primary database |
 | Redis | `redis:7-alpine` | 6379 | Cache and pub/sub |
 | MinIO | `minio/minio:latest` | 9000 (API), 9001 (Console) | S3-compatible object storage |
 | Coturn | `coturn/coturn:latest` | host network | TURN server for NAT traversal |
@@ -21,7 +21,7 @@ docker-compose up -d
 
 | Service | Username | Password |
 |---------|----------|----------|
-| MongoDB | `roomler` | `roomler_pass` |
+| Mongo | `roomler` | `roomler_pass` |
 | MinIO | `minioadmin` | `minioadmin` |
 
 ## Environment Variables
@@ -39,7 +39,7 @@ All configuration is via environment variables prefixed with `ROOMLER__` using `
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ROOMLER__DATABASE__URL` | `mongodb://localhost:27017` | MongoDB connection string |
+| `ROOMLER__DATABASE__URL` | `mongodb://localhost:27019` | MongoDB connection string |
 | `ROOMLER__DATABASE__NAME` | `roomler2` | Database name |
 
 ### JWT

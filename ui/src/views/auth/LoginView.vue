@@ -69,13 +69,14 @@
 
 <script setup lang="ts">
 import { ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { useWsStore } from '@/stores/ws'
 
 const auth = useAuthStore()
 const ws = useWsStore()
 const router = useRouter()
+const route = useRoute()
 
 const username = ref('')
 const password = ref('')
@@ -96,7 +97,14 @@ async function handleLogin() {
   try {
     await auth.login(username.value, password.value)
     ws.connect(auth.token!)
-    router.push({ name: 'dashboard' })
+    // Check for pending invite code
+    const pendingInvite = (route.query.invite as string) || sessionStorage.getItem('pending_invite_code')
+    if (pendingInvite) {
+      sessionStorage.removeItem('pending_invite_code')
+      router.push({ name: 'invite', params: { code: pendingInvite } })
+    } else {
+      router.push({ name: 'dashboard' })
+    }
   } catch {
     // error handled by store
   }

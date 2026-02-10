@@ -22,6 +22,9 @@ export function useMediasoup() {
   const conferenceId = ref<string | null>(null)
 
   let screenProducerId: string | null = null
+  // Serialize consumeProducer calls — pendingWaiters only holds one waiter per message type,
+  // so concurrent consume requests cause the earlier waiter to be overwritten and timeout.
+  let consumeChain = Promise.resolve()
 
   const ws = useWsStore()
 
@@ -164,23 +167,21 @@ export function useMediasoup() {
 
     consumers.set(consumer.id, consumer)
 
-    // Attach consumer track to remote stream
+    // Attach consumer track to remote stream.
+    // Always create a new MediaStream so that Vue reactivity picks up the change
+    // (addTrack on an existing stream is a DOM mutation invisible to Vue).
     const existing = remoteStreams.get(userId)
-    if (existing) {
-      existing.stream.addTrack(consumer.track)
-    } else {
-      const stream = new MediaStream([consumer.track])
-      remoteStreams.set(userId, {
-        userId,
-        stream,
-        kind: result.kind,
-      })
-    }
+    const tracks = existing ? [...existing.stream.getTracks(), consumer.track] : [consumer.track]
+    remoteStreams.set(userId, {
+      userId,
+      stream: new MediaStream(tracks),
+      kind: result.kind,
+    })
   }
 
-  /** Handle new_producer from WS */
+  /** Handle new_producer from WS — queued to avoid concurrent waitForMessage collisions */
   function handleNewProducer(data: { producer_id: string; user_id: string; kind: string }) {
-    consumeProducer(data.producer_id, data.user_id)
+    consumeChain = consumeChain.then(() => consumeProducer(data.producer_id, data.user_id))
   }
 
   /** Handle peer_left from WS */
@@ -320,6 +321,7 @@ export function useMediasoup() {
     isMuted.value = false
     isVideoOn.value = true
     isScreenSharing.value = false
+    consumeChain = Promise.resolve()
 
     // Remove WS listeners
     ws.offMediaMessage('media:new_producer')

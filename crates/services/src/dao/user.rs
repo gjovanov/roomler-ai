@@ -88,9 +88,21 @@ impl UserDao {
         display_name: &str,
         avatar_url: Option<&str>,
     ) -> DaoResult<User> {
-        // Try to find user by email first
+        // 1. Try to find user by OAuth provider + provider_id
+        if let Some(user) = self
+            .base
+            .find_one(doc! {
+                "oauth_providers.provider": provider,
+                "oauth_providers.provider_id": provider_id,
+                "deleted_at": null,
+            })
+            .await?
+        {
+            return Ok(user);
+        }
+
+        // 2. Try to find user by email and link the OAuth provider
         if let Ok(mut user) = self.find_by_email(email).await {
-            // Link OAuth provider if not already linked
             let already_linked = user
                 .oauth_providers
                 .iter()
@@ -115,21 +127,19 @@ impl UserDao {
             return Ok(user);
         }
 
-        // Create new user from OAuth
+        // 3. Create new user — generate unique username with retry on collision
         let now = DateTime::now();
-        // Generate a username from the display name
-        let username = display_name
+        let base_username: String = display_name
             .to_lowercase()
             .replace(' ', "_")
             .chars()
             .filter(|c| c.is_alphanumeric() || *c == '_')
-            .collect::<String>();
-        let username = format!("{}_{}", username, &ObjectId::new().to_hex()[..6]);
+            .collect();
 
-        let user = User {
+        let user_template = |uname: String| User {
             id: None,
             email: email.to_string(),
-            username,
+            username: uname,
             display_name: display_name.to_string(),
             avatar: avatar_url.map(|s| s.to_string()),
             password_hash: None,
@@ -137,7 +147,7 @@ impl UserDao {
             presence: Presence::Offline,
             locale: "en-US".to_string(),
             timezone: "UTC".to_string(),
-            is_verified: true, // OAuth email is pre-verified
+            is_verified: true,
             is_mfa_enabled: false,
             last_active_at: None,
             oauth_providers: vec![OAuthProvider {
@@ -152,8 +162,20 @@ impl UserDao {
             deleted_at: None,
         };
 
-        let id = self.base.insert_one(&user).await?;
-        self.base.find_by_id(id).await
+        // Retry up to 5 times with different suffixes on username collision
+        for _ in 0..5 {
+            let username = format!("{}_{}", base_username, &ObjectId::new().to_hex()[..6]);
+            let user = user_template(username);
+            match self.base.insert_one(&user).await {
+                Ok(id) => return self.base.find_by_id(id).await,
+                Err(DaoError::DuplicateKey(_)) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(DaoError::DuplicateKey(
+            "Failed to generate unique username after retries".to_string(),
+        ))
     }
 
     pub async fn update_profile(

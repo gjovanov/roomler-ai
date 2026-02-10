@@ -21,6 +21,11 @@ const routes: RouteRecordRaw[] = [
     meta: { guest: true },
   },
   {
+    path: '/invite/:code',
+    name: 'invite',
+    component: () => import('@/views/invite/InviteLandingView.vue'),
+  },
+  {
     path: '/',
     component: () => import('@/components/layout/AppLayout.vue'),
     meta: { auth: true },
@@ -69,6 +74,11 @@ const routes: RouteRecordRaw[] = [
             component: () => import('@/views/files/FilesBrowser.vue'),
           },
           {
+            path: 'invites',
+            name: 'invites',
+            component: () => import('@/views/invite/InviteManageView.vue'),
+          },
+          {
             path: 'admin',
             name: 'admin',
             component: () => import('@/views/admin/AdminPanel.vue'),
@@ -89,7 +99,14 @@ router.beforeEach((to, _from, next) => {
   if (to.meta.auth && !token) {
     next({ name: 'login' })
   } else if (to.meta.guest && token) {
-    next({ name: 'dashboard' })
+    // After login/register, check for pending invite
+    const pendingInvite = sessionStorage.getItem('pending_invite_code')
+    if (pendingInvite) {
+      sessionStorage.removeItem('pending_invite_code')
+      next({ name: 'invite', params: { code: pendingInvite } })
+    } else {
+      next({ name: 'dashboard' })
+    }
   } else {
     next()
   }

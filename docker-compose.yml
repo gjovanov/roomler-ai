@@ -1,13 +1,13 @@
 services:
-  mongodb:
+  mongo:
     image: mongo:7
     ports:
-      - "27017:27017"
+      - "27019:27017"
     volumes:
-      - mongo_data:/data/db
+      - roomler2_mongo_data:/data/db
     environment:
       MONGO_INITDB_ROOT_USERNAME: roomler
-      MONGO_INITDB_ROOT_PASSWORD: roomler_pass
+      MONGO_INITDB_ROOT_PASSWORD: R00m1eR_5uper5ecretPa55word
 
   redis:
     image: redis:7-alpine
@@ -33,5 +33,9 @@ services:
       - ./turnserver.conf:/etc/turnserver.conf:ro
 
 volumes:
-  mongo_data:
+  roomler2_mongo_data:
   minio_data:
+
+networks:
+  roomler2-network:
+    name: roomler2-network
