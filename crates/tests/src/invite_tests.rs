@@ -104,10 +104,10 @@ async fn test_accept_shareable_invite() {
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["tenant_id"].as_str().unwrap(), tenant_id);
 
-    // Verify they're now a member (can list channels)
+    // Verify they're now a member (can list rooms)
     let resp = app
         .auth_get(
-            &format!("/api/tenant/{}/channel", tenant_id),
+            &format!("/api/tenant/{}/room", tenant_id),
             &new_user.access_token,
         )
         .send()
@@ -292,9 +292,9 @@ async fn test_get_invite_info_public() {
     let app = TestApp::spawn().await;
     let (_admin, _tenant_id, code) = setup_with_invite(&app, "inv8").await;
 
-    // Unauthenticated request
-    let resp = app
-        .client
+    // Unauthenticated request — use a fresh client without cookies
+    // (app.client has cookie_store enabled and carries auth cookies from setup)
+    let resp = reqwest::Client::new()
         .get(app.url(&format!("/api/invite/{}", code)))
         .send()
         .await
@@ -353,10 +353,10 @@ async fn test_direct_add_member() {
 
     assert_eq!(resp.status().as_u16(), 201);
 
-    // Verify they can access channels
+    // Verify they can access rooms
     let resp = app
         .auth_get(
-            &format!("/api/tenant/{}/channel", seeded.tenant_id),
+            &format!("/api/tenant/{}/room", seeded.tenant_id),
             &outsider.access_token,
         )
         .send()

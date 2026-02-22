@@ -75,7 +75,7 @@ pub struct ConsumerInfo {
 /// Manages mediasoup rooms and their media state.
 pub struct RoomManager {
     rooms: DashMap<ObjectId, MediaRoom>,
-    /// Tracks which conference each connection is in (connection_id -> conference_id).
+    /// Tracks which room each connection is in (connection_id -> room_id).
     connection_rooms: DashMap<String, ObjectId>,
     worker_pool: Arc<WorkerPool>,
     listen_ip: IpAddr,
@@ -104,14 +104,14 @@ impl RoomManager {
         }
     }
 
-    /// Creates a mediasoup Router for a conference and stores it.
+    /// Creates a mediasoup Router for a room and stores it.
     /// Returns the router's RTP capabilities (serialized).
     pub async fn create_room(
         &self,
-        conference_id: ObjectId,
+        room_id: ObjectId,
     ) -> anyhow::Result<serde_json::Value> {
-        if self.rooms.contains_key(&conference_id) {
-            let room = self.rooms.get(&conference_id).unwrap();
+        if self.rooms.contains_key(&room_id) {
+            let room = self.rooms.get(&room_id).unwrap();
             let caps = room.router.rtp_capabilities().clone();
             return Ok(serde_json::to_value(caps)?);
         }
@@ -126,10 +126,10 @@ impl RoomManager {
             .map_err(|e| anyhow::anyhow!("Failed to create router: {}", e))?;
 
         let caps = router.rtp_capabilities().clone();
-        info!(?conference_id, "mediasoup room created");
+        info!(?room_id, "mediasoup room created");
 
         self.rooms.insert(
-            conference_id,
+            room_id,
             MediaRoom {
                 router,
                 participants: DashMap::new(),
@@ -141,8 +141,8 @@ impl RoomManager {
     }
 
     /// Removes a room and all its media state.
-    pub fn remove_room(&self, conference_id: &ObjectId) -> bool {
-        if let Some((_, room)) = self.rooms.remove(conference_id) {
+    pub fn remove_room(&self, room_id: &ObjectId) -> bool {
+        if let Some((_, room)) = self.rooms.remove(room_id) {
             // Clean up connection_rooms mappings
             let conn_ids: Vec<String> = room
                 .participants
@@ -153,15 +153,15 @@ impl RoomManager {
                 self.connection_rooms.remove(&cid);
             }
             // Dropping the room closes the router and all transports/producers/consumers
-            info!(?conference_id, "mediasoup room removed");
+            info!(?room_id, "mediasoup room removed");
             true
         } else {
             false
         }
     }
 
-    pub fn has_room(&self, conference_id: &ObjectId) -> bool {
-        self.rooms.contains_key(conference_id)
+    pub fn has_room(&self, room_id: &ObjectId) -> bool {
+        self.rooms.contains_key(room_id)
     }
 
     pub fn room_count(&self) -> usize {
@@ -176,13 +176,13 @@ impl RoomManager {
     /// Creates send + recv WebRtcTransport pair for a participant.
     pub async fn create_transports(
         &self,
-        conference_id: ObjectId,
+        room_id: ObjectId,
         user_id: ObjectId,
         connection_id: String,
     ) -> anyhow::Result<TransportPair> {
         let room = self
             .rooms
-            .get(&conference_id)
+            .get(&room_id)
             .ok_or_else(|| anyhow::anyhow!("Room not found"))?;
 
         let send_transport = self.create_webrtc_transport(&room.router).await?;
@@ -202,9 +202,9 @@ impl RoomManager {
             },
         );
 
-        self.connection_rooms.insert(connection_id.clone(), conference_id);
+        self.connection_rooms.insert(connection_id.clone(), room_id);
 
-        debug!(?conference_id, ?user_id, %connection_id, "transports created");
+        debug!(?room_id, ?user_id, %connection_id, "transports created");
 
         Ok(TransportPair {
             send_transport: send_opts,
@@ -215,14 +215,14 @@ impl RoomManager {
     /// Connects a transport with remote DTLS parameters.
     pub async fn connect_transport(
         &self,
-        conference_id: &ObjectId,
+        room_id: &ObjectId,
         connection_id: &str,
         transport_id: &str,
         dtls_parameters: DtlsParameters,
     ) -> anyhow::Result<()> {
         let room = self
             .rooms
-            .get(conference_id)
+            .get(room_id)
             .ok_or_else(|| anyhow::anyhow!("Room not found"))?;
 
         let participant = room
@@ -251,14 +251,14 @@ impl RoomManager {
             return Err(anyhow::anyhow!("Transport not found for this participant"));
         }
 
-        debug!(?conference_id, %connection_id, transport_id, "transport connected");
+        debug!(?room_id, %connection_id, transport_id, "transport connected");
         Ok(())
     }
 
     /// Creates a Producer on the participant's send transport.
     pub async fn produce(
         &self,
-        conference_id: &ObjectId,
+        room_id: &ObjectId,
         connection_id: &str,
         kind: MediaKind,
         rtp_parameters: RtpParameters,
@@ -266,7 +266,7 @@ impl RoomManager {
     ) -> anyhow::Result<ProducerId> {
         let room = self
             .rooms
-            .get(conference_id)
+            .get(room_id)
             .ok_or_else(|| anyhow::anyhow!("Room not found"))?;
 
         let mut participant = room
@@ -284,21 +284,21 @@ impl RoomManager {
         let producer_id = producer.id();
         participant.producers.push(ProducerEntry { producer, source: source.clone() });
 
-        debug!(?conference_id, %connection_id, %producer_id, ?kind, %source, "producer created");
+        debug!(?room_id, %connection_id, %producer_id, ?kind, %source, "producer created");
         Ok(producer_id)
     }
 
     /// Creates a Consumer on the participant's recv transport for a given producer.
     pub async fn consume(
         &self,
-        conference_id: &ObjectId,
+        room_id: &ObjectId,
         connection_id: &str,
         producer_id: ProducerId,
         rtp_capabilities: &RtpCapabilities,
     ) -> anyhow::Result<ConsumerInfo> {
         let room = self
             .rooms
-            .get(conference_id)
+            .get(room_id)
             .ok_or_else(|| anyhow::anyhow!("Room not found"))?;
 
         // Check if the router can consume this producer
@@ -318,6 +318,12 @@ impl RoomManager {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to consume: {}", e))?;
 
+        // mediasoup consumers are created paused — must resume to deliver RTP
+        consumer
+            .resume()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to resume consumer: {}", e))?;
+
         let info = ConsumerInfo {
             id: consumer.id().to_string(),
             producer_id: consumer.producer_id().to_string(),
@@ -331,7 +337,7 @@ impl RoomManager {
         participant.consumers.push(consumer);
 
         debug!(
-            ?conference_id,
+            ?room_id,
             %connection_id,
             consumer_id = %info.id,
             %producer_id,
@@ -343,36 +349,36 @@ impl RoomManager {
     /// Closes a specific producer by ID.
     pub fn close_producer(
         &self,
-        conference_id: &ObjectId,
+        room_id: &ObjectId,
         connection_id: &str,
         producer_id: &ProducerId,
     ) -> bool {
-        if let Some(room) = self.rooms.get(conference_id) {
-            if let Some(mut participant) = room.participants.get_mut(connection_id) {
-                let before = participant.producers.len();
-                participant
-                    .producers
-                    .retain(|pe| &pe.producer.id() != producer_id);
-                return participant.producers.len() < before;
-            }
+        if let Some(room) = self.rooms.get(room_id)
+            && let Some(mut participant) = room.participants.get_mut(connection_id)
+        {
+            let before = participant.producers.len();
+            participant
+                .producers
+                .retain(|pe| &pe.producer.id() != producer_id);
+            return participant.producers.len() < before;
         }
         false
     }
 
     /// Removes a participant's media state from a room.
-    pub fn close_participant(&self, conference_id: &ObjectId, connection_id: &str) {
-        if let Some(room) = self.rooms.get(conference_id) {
+    pub fn close_participant(&self, room_id: &ObjectId, connection_id: &str) {
+        if let Some(room) = self.rooms.get(room_id) {
             // Dropping the ParticipantMedia closes transports/producers/consumers
             room.participants.remove(connection_id);
         }
         self.connection_rooms.remove(connection_id);
-        debug!(?conference_id, %connection_id, "participant media closed");
+        debug!(?room_id, %connection_id, "participant media closed");
     }
 
     /// Removes ALL participant entries for a given user_id from a room.
     /// Used by HTTP leave endpoint which doesn't have a connection_id.
-    pub fn close_participant_by_user(&self, conference_id: &ObjectId, user_id: &ObjectId) {
-        if let Some(room) = self.rooms.get(conference_id) {
+    pub fn close_participant_by_user(&self, room_id: &ObjectId, user_id: &ObjectId) {
+        if let Some(room) = self.rooms.get(room_id) {
             let conn_ids: Vec<String> = room
                 .participants
                 .iter()
@@ -384,17 +390,17 @@ impl RoomManager {
                 self.connection_rooms.remove(&cid);
             }
         }
-        debug!(?conference_id, ?user_id, "participant media closed (by user_id)");
+        debug!(?room_id, ?user_id, "participant media closed (by user_id)");
     }
 
     /// Returns all producer IDs in a room except those belonging to the given connection.
     pub fn get_producer_ids(
         &self,
-        conference_id: &ObjectId,
+        room_id: &ObjectId,
         exclude_connection_id: &str,
     ) -> Vec<(ObjectId, String, ProducerId, MediaKind, String)> {
         let mut result = Vec::new();
-        if let Some(room) = self.rooms.get(conference_id) {
+        if let Some(room) = self.rooms.get(room_id) {
             for entry in room.participants.iter() {
                 if entry.key() != exclude_connection_id {
                     let uid = entry.value().user_id;
@@ -409,9 +415,9 @@ impl RoomManager {
     }
 
     /// Returns unique participant user IDs in a room.
-    pub fn get_participant_user_ids(&self, conference_id: &ObjectId) -> Vec<ObjectId> {
+    pub fn get_participant_user_ids(&self, room_id: &ObjectId) -> Vec<ObjectId> {
         self.rooms
-            .get(conference_id)
+            .get(room_id)
             .map(|room| {
                 let mut ids: Vec<ObjectId> = room
                     .participants
@@ -428,11 +434,11 @@ impl RoomManager {
     /// Returns user IDs of all participants except those with the given connection_id.
     pub fn get_other_participant_user_ids(
         &self,
-        conference_id: &ObjectId,
+        room_id: &ObjectId,
         exclude_connection_id: &str,
     ) -> Vec<ObjectId> {
         self.rooms
-            .get(conference_id)
+            .get(room_id)
             .map(|room| {
                 let mut ids: Vec<ObjectId> = room
                     .participants
@@ -452,11 +458,11 @@ impl RoomManager {
     /// so broadcasts don't leak to same-user connections in the same room.
     pub fn get_other_connection_ids(
         &self,
-        conference_id: &ObjectId,
+        room_id: &ObjectId,
         exclude_connection_id: &str,
     ) -> Vec<String> {
         self.rooms
-            .get(conference_id)
+            .get(room_id)
             .map(|room| {
                 room.participants
                     .iter()
@@ -467,8 +473,8 @@ impl RoomManager {
             .unwrap_or_default()
     }
 
-    /// Returns the conference ID that a connection is currently in, if any.
-    pub fn get_connection_conference(&self, connection_id: &str) -> Option<ObjectId> {
+    /// Returns the room ID that a connection is currently in, if any.
+    pub fn get_connection_room(&self, connection_id: &str) -> Option<ObjectId> {
         self.connection_rooms.get(connection_id).map(|v| *v)
     }
 
@@ -478,12 +484,12 @@ impl RoomManager {
     /// and Consumer are stored internally and cleaned up when the tap is removed.
     pub async fn create_rtp_tap(
         &self,
-        conference_id: &ObjectId,
+        room_id: &ObjectId,
         producer_id: ProducerId,
     ) -> anyhow::Result<mpsc::Receiver<Vec<u8>>> {
         let room = self
             .rooms
-            .get(conference_id)
+            .get(room_id)
             .ok_or_else(|| anyhow::anyhow!("Room not found"))?;
 
         let direct_transport = room
@@ -506,6 +512,12 @@ impl RoomManager {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to consume on DirectTransport: {}", e))?;
 
+        // mediasoup consumers are created paused — must resume to receive RTP
+        consumer
+            .resume()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to resume DirectTransport consumer: {}", e))?;
+
         let (tx, rx) = mpsc::channel(512);
 
         // Register RTP callback; detach so it lives as long as the Consumer
@@ -524,16 +536,16 @@ impl RoomManager {
             },
         );
 
-        debug!(?conference_id, %producer_id, "RTP tap created");
+        debug!(?room_id, %producer_id, "RTP tap created and resumed");
         Ok(rx)
     }
 
     /// Removes an RTP tap for a producer (stops the DirectTransport consumer).
-    pub fn remove_rtp_tap(&self, conference_id: &ObjectId, producer_id: &str) {
-        if let Some(room) = self.rooms.get(conference_id) {
-            if room.rtp_taps.remove(producer_id).is_some() {
-                debug!(?conference_id, %producer_id, "RTP tap removed");
-            }
+    pub fn remove_rtp_tap(&self, room_id: &ObjectId, producer_id: &str) {
+        if let Some(room) = self.rooms.get(room_id)
+            && room.rtp_taps.remove(producer_id).is_some()
+        {
+            debug!(?room_id, %producer_id, "RTP tap removed");
         }
     }
 
@@ -554,6 +566,8 @@ impl RoomManager {
             expose_internal_ip: false,
         };
 
+        // TCP fallback — essential when wsl-vpnkit or similar networking
+        // intercepts UDP but TCP localhost forwarding still works.
         let tcp_info = ListenInfo {
             protocol: Protocol::Tcp,
             ip: self.listen_ip,

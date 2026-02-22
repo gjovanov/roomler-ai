@@ -124,12 +124,12 @@ pub async fn accept_invite(
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     // Check target_email constraint
-    if let Some(ref target_email) = invite.target_email {
-        if target_email != &auth.email {
-            return Err(ApiError::Forbidden(
-                "This invite is for a different email address".to_string(),
-            ));
-        }
+    if let Some(ref target_email) = invite.target_email
+        && target_email != &auth.email
+    {
+        return Err(ApiError::Forbidden(
+            "This invite is for a different email address".to_string(),
+        ));
     }
 
     // Check not already a member

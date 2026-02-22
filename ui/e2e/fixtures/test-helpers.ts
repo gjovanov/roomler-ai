@@ -46,23 +46,34 @@ export async function createTenantViaApi(token: string, name: string, slug: stri
   return (await resp.json()) as { id: string; name: string; slug: string }
 }
 
-/** Create a channel via the API */
-export async function createChannelViaApi(
+/** Create a room via the API */
+export async function createRoomViaApi(
   token: string,
   tenantId: string,
   name: string,
-  channelType = 'text',
+  isOpen = true,
+  options: { media_settings?: Record<string, unknown>; parent_id?: string } = {},
 ) {
-  const resp = await fetch(`${API_URL}/api/tenant/${tenantId}/channel`, {
+  const resp = await fetch(`${API_URL}/api/tenant/${tenantId}/room`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${token}`,
     },
-    body: JSON.stringify({ name, channel_type: channelType }),
+    body: JSON.stringify({ name, is_open: isOpen, ...options }),
   })
-  if (!resp.ok) throw new Error(`Create channel failed: ${resp.status}`)
-  return (await resp.json()) as { id: string; name: string; path: string }
+  if (!resp.ok) throw new Error(`Create room failed: ${resp.status}`)
+  return (await resp.json()) as { id: string; name: string; path: string; has_media: boolean; parent_id?: string }
+}
+
+/** End a call in a room via the API */
+export async function endCallViaApi(token: string, tenantId: string, roomId: string) {
+  const resp = await fetch(`${API_URL}/api/tenant/${tenantId}/room/${roomId}/call/end`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+  })
+  if (!resp.ok) throw new Error(`End call failed: ${resp.status}`)
+  return resp.json()
 }
 
 /** Login through the UI */
@@ -74,48 +85,44 @@ export async function loginViaUi(page: Page, username: string, password: string)
   await expect(page).toHaveURL(/\/$/, { timeout: 5000 })
 }
 
-/** Join a channel via the API */
-export async function joinChannelViaApi(token: string, tenantId: string, channelId: string) {
-  const resp = await fetch(`${API_URL}/api/tenant/${tenantId}/channel/${channelId}/join`, {
+/** Join a room via the API */
+export async function joinRoomViaApi(token: string, tenantId: string, roomId: string) {
+  const resp = await fetch(`${API_URL}/api/tenant/${tenantId}/room/${roomId}/join`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}` },
   })
-  if (!resp.ok) throw new Error(`Join channel failed: ${resp.status}`)
+  if (!resp.ok) throw new Error(`Join room failed: ${resp.status}`)
   return resp.json()
 }
 
-/** Create a conference via the API */
-export async function createConferenceViaApi(token: string, tenantId: string, subject: string) {
-  const resp = await fetch(`${API_URL}/api/tenant/${tenantId}/conference`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${token}`,
-    },
-    body: JSON.stringify({ subject }),
-  })
-  if (!resp.ok) throw new Error(`Create conference failed: ${resp.status}`)
-  return (await resp.json()) as { id: string; subject: string; status: string }
-}
-
-/** Start a conference via the API */
-export async function startConferenceViaApi(token: string, tenantId: string, conferenceId: string) {
-  const resp = await fetch(`${API_URL}/api/tenant/${tenantId}/conference/${conferenceId}/start`, {
+/** Start a call in a room via the API */
+export async function startCallViaApi(token: string, tenantId: string, roomId: string) {
+  const resp = await fetch(`${API_URL}/api/tenant/${tenantId}/room/${roomId}/call/start`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}` },
   })
-  if (!resp.ok) throw new Error(`Start conference failed: ${resp.status}`)
+  if (!resp.ok) throw new Error(`Start call failed: ${resp.status}`)
   return resp.json()
+}
+
+/** Join a call in a room via the API */
+export async function joinCallViaApi(token: string, tenantId: string, roomId: string) {
+  const resp = await fetch(`${API_URL}/api/tenant/${tenantId}/room/${roomId}/call/join`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+  })
+  if (!resp.ok) throw new Error(`Join call failed: ${resp.status}`)
+  return (await resp.json()) as { member_id: string; joined: boolean }
 }
 
 /** Send a message via the API */
 export async function sendMessageViaApi(
   token: string,
   tenantId: string,
-  channelId: string,
+  roomId: string,
   content: string,
 ) {
-  const resp = await fetch(`${API_URL}/api/tenant/${tenantId}/channel/${channelId}/message`, {
+  const resp = await fetch(`${API_URL}/api/tenant/${tenantId}/room/${roomId}/message`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -181,52 +188,6 @@ export async function revokeInviteViaApi(token: string, tenantId: string, invite
   })
   if (!resp.ok) throw new Error(`Revoke invite failed: ${resp.status}`)
   return resp.json()
-}
-
-/** Send a conference chat message via the API */
-export async function sendConferenceChatViaApi(
-  token: string,
-  tenantId: string,
-  conferenceId: string,
-  content: string,
-) {
-  const resp = await fetch(
-    `${API_URL}/api/tenant/${tenantId}/conference/${conferenceId}/message`,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify({ content }),
-    },
-  )
-  if (!resp.ok) throw new Error(`Send conference chat failed: ${resp.status}`)
-  return (await resp.json()) as {
-    id: string
-    conference_id: string
-    author_id: string
-    display_name: string
-    content: string
-    created_at: string
-  }
-}
-
-/** Join a conference via the API */
-export async function joinConferenceViaApi(
-  token: string,
-  tenantId: string,
-  conferenceId: string,
-) {
-  const resp = await fetch(
-    `${API_URL}/api/tenant/${tenantId}/conference/${conferenceId}/join`,
-    {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}` },
-    },
-  )
-  if (!resp.ok) throw new Error(`Join conference failed: ${resp.status}`)
-  return (await resp.json()) as { participant_id: string; joined: boolean }
 }
 
 /** Register through the UI */

@@ -1,6 +1,6 @@
 # Testing
 
-Roomler2 has two test layers: Rust integration tests and Playwright E2E tests.
+Roomler2 has two test layers: Rust integration tests (114 tests) and Playwright E2E tests.
 
 ## Integration Tests
 
@@ -11,39 +11,42 @@ Located in `crates/tests/src/`. These tests spin up the full Axum server and int
 | File | Coverage Area |
 |------|--------------|
 | `auth_tests.rs` | Registration, login, logout, refresh, /me |
-| `channel_tests.rs` | Channel join, leave, list, explore |
-| `channel_crud_tests.rs` | Channel create, update, delete |
+| `channel_tests.rs` | Room join, leave, list, explore |
+| `channel_crud_tests.rs` | Room create, update, delete |
 | `message_tests.rs` | Send, edit, delete, list, pin, threads + WS broadcast sender exclusion |
 | `reaction_tests.rs` | Add and remove reactions |
-| `conference_tests.rs` | Create, start, join, leave, end conferences + mediasoup signaling (WS media:join, transport creation, peer_left broadcast) + connection_id isolation (two users get independent transports, same user multi-tab, WS disconnect notifies peers) |
+| `conference_tests.rs` | Room calls: start, join, leave, end + mediasoup signaling (WS media:join, transport creation, peer_left broadcast) + connection_id isolation |
+| `conference_message_tests.rs` | In-call chat messages: create, list, WS broadcast |
 | `recording_tests.rs` | Create, list, delete recordings |
 | `transcription_tests.rs` | Create, list, get transcriptions |
 | `file_tests.rs` | Upload, get, download, delete, list files |
 | `export_tests.rs` | Conversation export to XLSX |
 | `pdf_export_tests.rs` | Conversation export to PDF |
 | `multi_tenancy_tests.rs` | Cross-tenant data isolation |
+| `invite_tests.rs` | Invite creation, acceptance, listing, revocation |
+| `oauth_tests.rs` | OAuth provider linking |
 
 ### Test Fixtures
 
 | File | Purpose |
 |------|---------|
 | `fixtures/test_app.rs` | Starts a test server on a random port, provides a configured `reqwest::Client` |
-| `fixtures/seed.rs` | Creates test users, tenants, channels, and messages for test setup |
+| `fixtures/seed.rs` | Creates test users, tenants, rooms, and messages for test setup |
 
 ### Running Integration Tests
 
 ```bash
 # Run all integration tests
-cargo test -p tests
+cargo test -p roomler2-tests
 
 # Run with race detection (recommended)
-cargo test -p tests -- --test-threads=1
+cargo test -p roomler2-tests -- --test-threads=1
 
 # Run a specific test module
-cargo test -p tests auth_tests
+cargo test -p roomler2-tests auth_tests
 
 # Run with output
-cargo test -p tests -- --nocapture
+cargo test -p roomler2-tests -- --nocapture
 ```
 
 Integration tests require a running MongoDB instance (see `docker-compose.yml`).
@@ -58,20 +61,25 @@ Located in `ui/e2e/`. Playwright tests that run against the full stack (backend 
 |------|--------------|
 | `auth.spec.ts` | Login and registration flows |
 | `dashboard.spec.ts` | Dashboard rendering, tenant cards |
-| `channels.spec.ts` | Channel creation, browsing |
+| `channels.spec.ts` | Room creation, browsing |
 | `chat.spec.ts` | Message sending, display |
-| `conference.spec.ts` | Conference view, join/leave, local video, mute/camera toggles |
-| `websocket.spec.ts` | WebSocket connection, typing indicators |
-| `files.spec.ts` | File upload, browsing |
 | `chat-multi.spec.ts` | Multi-participant chat: 4 users, message dedup (no duplicates from WS broadcast) |
-| `conference-list.spec.ts` | Conference listing page, create dialog, navigation, sidebar link |
-| `conference-multi.spec.ts` | Multi-participant conference: 2 users in separate browser contexts join same conference, screen share button, leave navigation |
+| `conference.spec.ts` | Call view, join/leave, local video, mute/camera toggles |
+| `conference-chat.spec.ts` | In-call chat functionality |
+| `conference-list.spec.ts` | Room listing page, create dialog, navigation |
+| `conference-multi.spec.ts` | Multi-participant calls: 2 users in separate browser contexts |
+| `files.spec.ts` | File upload, browsing |
+| `invite.spec.ts` | Invite creation, acceptance flows |
+| `oauth.spec.ts` | OAuth redirect and callback |
+| `room-fixes.spec.ts` | Dashboard Start Call, Chat View call button, child rooms, call notifications |
+| `transcription.spec.ts` | Transcription display and controls |
+| `websocket.spec.ts` | WebSocket connection, typing indicators |
 
 ### Test Helpers
 
 | File | Purpose |
 |------|---------|
-| `fixtures/test-helpers.ts` | Login helper, page setup, API utilities (register, createTenant, createChannel, joinChannel, sendMessage, createConference, startConference, addTenantMember) |
+| `fixtures/test-helpers.ts` | Login helper, page setup, API utilities (register, createTenant, createRoom, joinRoom, sendMessage, startCall, endCall, addTenantMember) |
 
 ### Running E2E Tests
 

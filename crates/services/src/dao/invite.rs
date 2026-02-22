@@ -45,7 +45,7 @@ impl InviteDao {
         let invite = Invite {
             id: None,
             tenant_id,
-            channel_id: None,
+            room_id: None,
             code,
             inviter_id,
             target_email: params.target_email,
@@ -115,22 +115,22 @@ impl InviteDao {
             .find_one_and_update(filter, update)
             .with_options(options)
             .await
-            .map_err(|e| DaoError::Mongo(e))?
+            .map_err(DaoError::Mongo)?
             .ok_or_else(|| {
                 DaoError::Validation("Invite cannot be used (exhausted, expired, or revoked)".to_string())
             })?;
 
         // Auto-set status to Exhausted when use_count >= max_uses
-        if let Some(max) = invite.max_uses {
-            if invite.use_count >= max {
-                let _ = self
-                    .base
-                    .update_by_id(
-                        invite_id,
-                        doc! { "$set": { "status": "exhausted" } },
-                    )
-                    .await;
-            }
+        if let Some(max) = invite.max_uses
+            && invite.use_count >= max
+        {
+            let _ = self
+                .base
+                .update_by_id(
+                    invite_id,
+                    doc! { "$set": { "status": "exhausted" } },
+                )
+                .await;
         }
 
         Ok(invite)
@@ -161,17 +161,17 @@ impl InviteDao {
         }
 
         // Check expiry
-        if let Some(expires_at) = invite.expires_at {
-            if DateTime::now().timestamp_millis() > expires_at.timestamp_millis() {
-                return Err(DaoError::Validation("Invite has expired".to_string()));
-            }
+        if let Some(expires_at) = invite.expires_at
+            && DateTime::now().timestamp_millis() > expires_at.timestamp_millis()
+        {
+            return Err(DaoError::Validation("Invite has expired".to_string()));
         }
 
         // Check use count
-        if let Some(max) = invite.max_uses {
-            if invite.use_count >= max {
-                return Err(DaoError::Validation("Invite has been fully used".to_string()));
-            }
+        if let Some(max) = invite.max_uses
+            && invite.use_count >= max
+        {
+            return Err(DaoError::Validation("Invite has been fully used".to_string()));
         }
 
         Ok(())

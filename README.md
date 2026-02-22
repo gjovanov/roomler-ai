@@ -1,6 +1,6 @@
 # Roomler2
 
-Real-time communication and collaboration platform with multi-tenancy, channels, chat, video conferencing (mediasoup WebRTC SFU), file sharing, cloud storage integrations, and AI-powered document recognition.
+Real-time communication and collaboration platform with multi-tenancy, hierarchical rooms (text + voice/video), chat, video conferencing (mediasoup WebRTC SFU), file sharing, cloud storage integrations, and AI-powered document recognition.
 
 ## Features
 
@@ -10,17 +10,17 @@ Real-time communication and collaboration platform with multi-tenancy, channels,
 | | Roles & permissions (Owner, Admin, Moderator, Member) | :white_check_mark: |
 | | Invite system (shareable links, email invites) | :white_check_mark: |
 | | OAuth login (Google, Facebook, GitHub, LinkedIn, Microsoft) | :white_check_mark: |
-| **Channels** | Hierarchical channel tree (8 types) | :white_check_mark: |
-| | Category, Text, Voice, Announcement, Forum, Stage, DM, GroupDM | :white_check_mark: |
-| | Channel explore & member management | :white_check_mark: |
+| **Rooms** | Unified rooms with hierarchy (text + voice/video) | :white_check_mark: |
+| | Parent/child room tree, explore & member management | :white_check_mark: |
+| | In-room call start/join with real-time notifications | :white_check_mark: |
 | **Real-Time Chat** | Threaded messages with replies | :white_check_mark: |
 | | Reactions (unicode + custom emoji) | :white_check_mark: |
 | | Mentions, embeds, attachments, pinning | :white_check_mark: |
 | | Typing indicators & presence | :white_check_mark: |
-| **Video Conferencing** | mediasoup WebRTC SFU | :white_check_mark: |
-| | Instant / Scheduled / Recurring / Persistent meetings | :white_check_mark: |
+| **Video Conferencing** | mediasoup WebRTC SFU (per-room calls) | :white_check_mark: |
+| | Start/join calls from room chat or dashboard | :white_check_mark: |
 | | Multiple producers/consumers per participant | :white_check_mark: |
-| | Recordings & transcriptions | :white_check_mark: |
+| | Recordings, transcriptions & in-call chat | :white_check_mark: |
 | **File Management** | Versioned uploads, multipart upload | :white_check_mark: |
 | | Cloud sync (Google Drive, OneDrive, Dropbox) | :white_check_mark: |
 | | AI document recognition (Claude API) | :white_check_mark: |
@@ -31,7 +31,7 @@ Real-time communication and collaboration platform with multi-tenancy, channels,
 | | Real-time message delivery | :white_check_mark: |
 | | Media signaling (join/produce/consume) | :white_check_mark: |
 | **Frontend** | Vue 3 + Vuetify 3 SPA | :white_check_mark: |
-| | 8 Pinia stores, 10 views | :white_check_mark: |
+| | 8 Pinia stores, 15 views | :white_check_mark: |
 | | Dark/Light theme, i18n | :white_check_mark: |
 | | mediasoup-client composable + VideoTile | :white_check_mark: |
 
@@ -46,7 +46,7 @@ Real-time communication and collaboration platform with multi-tenancy, channels,
 | **Auth** | JWT (argon2 hashing), httpOnly cookies, OAuth 2.0 |
 | **AI** | Claude API (document recognition) |
 | **Cloud** | Google Drive, OneDrive, Dropbox (OAuth2 + async_trait) |
-| **Testing** | 77 Rust integration tests, 24 Playwright E2E tests |
+| **Testing** | 114 Rust integration tests, 15 Playwright E2E specs |
 | **Infrastructure** | Docker Compose (MongoDB, Redis, MinIO, Coturn) |
 
 ## Architecture
@@ -54,11 +54,11 @@ Real-time communication and collaboration platform with multi-tenancy, channels,
 ```mermaid
 graph TB
     subgraph Client["Browser"]
-        UI["Vue 3 + Vuetify 3 SPA<br/>Pinia (9 stores) · mediasoup-client 3.7<br/>:5000"]
+        UI["Vue 3 + Vuetify 3 SPA<br/>Pinia (8 stores) · mediasoup-client 3.7<br/>:5000"]
     end
 
     subgraph Server["Rust / Axum 0.8"]
-        REST["REST Routes<br/>17 modules"]
+        REST["REST Routes<br/>18 modules"]
         WS["WebSocket Handler<br/>Presence · Typing · Signaling"]
         AUTH["Auth Middleware<br/>JWT · OAuth 2.0 · argon2"]
         SVC["Services Layer<br/>DAOs · Auth · Export · Background Tasks"]
@@ -111,7 +111,7 @@ cp .env.example .env    # Edit with your settings
 cargo build && cargo run   # API at http://localhost:3000
 
 # 4. Run frontend
-cd ui && npm install && npm run dev   # UI at http://localhost:5173
+cd ui && bun install && bun run dev   # UI at http://localhost:5173
 ```
 
 ## Documentation
@@ -123,7 +123,7 @@ cd ui && npm install && npm run dev   # UI at http://localhost:5173
 | [API Reference](docs/api.md) | REST endpoints, request/response schemas |
 | [Frontend](docs/ui.md) | Routes, components, Pinia stores |
 | [Real-Time](docs/real-time.md) | WebSocket protocol, presence, media signaling |
-| [Testing](docs/testing.md) | 77 integration tests, 24 E2E tests |
+| [Testing](docs/testing.md) | 114 integration tests, 15 E2E specs |
 | [Deployment](docs/deployment.md) | Docker Compose, environment variables |
 
 ## License

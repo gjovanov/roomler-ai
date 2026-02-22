@@ -15,10 +15,11 @@ impl MessageDao {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn create(
         &self,
         tenant_id: ObjectId,
-        channel_id: ObjectId,
+        room_id: ObjectId,
         author_id: ObjectId,
         content: String,
         thread_id: Option<ObjectId>,
@@ -35,7 +36,7 @@ impl MessageDao {
         let message = Message {
             id: None,
             tenant_id,
-            channel_id,
+            room_id,
             thread_id,
             is_thread_root: false,
             thread_metadata: None,
@@ -62,14 +63,14 @@ impl MessageDao {
         self.base.find_by_id(id).await
     }
 
-    pub async fn find_in_channel(
+    pub async fn find_in_room(
         &self,
-        channel_id: ObjectId,
+        room_id: ObjectId,
         params: &PaginationParams,
     ) -> DaoResult<PaginatedResult<Message>> {
         self.base
             .find_paginated(
-                doc! { "channel_id": channel_id, "deleted_at": null, "thread_id": null },
+                doc! { "room_id": room_id, "deleted_at": null, "thread_id": null },
                 Some(doc! { "created_at": -1 }),
                 params,
             )
@@ -92,11 +93,11 @@ impl MessageDao {
 
     pub async fn find_pinned(
         &self,
-        channel_id: ObjectId,
+        room_id: ObjectId,
     ) -> DaoResult<Vec<Message>> {
         self.base
             .find_many(
-                doc! { "channel_id": channel_id, "is_pinned": true, "deleted_at": null },
+                doc! { "room_id": room_id, "is_pinned": true, "deleted_at": null },
                 Some(doc! { "created_at": -1 }),
             )
             .await

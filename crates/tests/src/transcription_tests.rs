@@ -2,29 +2,29 @@ use crate::fixtures::test_app::TestApp;
 use serde_json::Value;
 
 #[tokio::test]
-async fn create_transcription_for_conference() {
+async fn create_transcription_for_room() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("trans1").await;
 
-    // Create conference
+    // Create room
     let resp = app
         .auth_post(
-            &format!("/api/tenant/{}/conference", tenant.tenant_id),
+            &format!("/api/tenant/{}/room", tenant.tenant_id),
             &tenant.admin.access_token,
         )
-        .json(&serde_json::json!({ "subject": "Transcription Test" }))
+        .json(&serde_json::json!({ "name": "Transcription Test" }))
         .send()
         .await
         .unwrap();
-    let conf: Value = resp.json().await.unwrap();
-    let conf_id = conf["id"].as_str().unwrap();
+    let room: Value = resp.json().await.unwrap();
+    let room_id = room["id"].as_str().unwrap();
 
     // Create transcription
     let resp = app
         .auth_post(
             &format!(
-                "/api/tenant/{}/conference/{}/transcript",
-                tenant.tenant_id, conf_id
+                "/api/tenant/{}/room/{}/transcript",
+                tenant.tenant_id, room_id
             ),
             &tenant.admin.access_token,
         )
@@ -35,35 +35,35 @@ async fn create_transcription_for_conference() {
 
     assert_eq!(resp.status().as_u16(), 200);
     let json: Value = resp.json().await.unwrap();
-    assert_eq!(json["conference_id"], conf_id);
+    assert_eq!(json["room_id"], room_id);
     assert_eq!(json["language"], "en-US");
     assert_eq!(json["status"], "Processing");
     assert_eq!(json["format"], "Json");
 }
 
 #[tokio::test]
-async fn list_transcriptions_for_conference() {
+async fn list_transcriptions_for_room() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("trans2").await;
 
     let resp = app
         .auth_post(
-            &format!("/api/tenant/{}/conference", tenant.tenant_id),
+            &format!("/api/tenant/{}/room", tenant.tenant_id),
             &tenant.admin.access_token,
         )
-        .json(&serde_json::json!({ "subject": "Trans List" }))
+        .json(&serde_json::json!({ "name": "Trans List" }))
         .send()
         .await
         .unwrap();
-    let conf: Value = resp.json().await.unwrap();
-    let conf_id = conf["id"].as_str().unwrap();
+    let room: Value = resp.json().await.unwrap();
+    let room_id = room["id"].as_str().unwrap();
 
     // Create 2 transcriptions
     for lang in &["en-US", "de-DE"] {
         app.auth_post(
             &format!(
-                "/api/tenant/{}/conference/{}/transcript",
-                tenant.tenant_id, conf_id
+                "/api/tenant/{}/room/{}/transcript",
+                tenant.tenant_id, room_id
             ),
             &tenant.admin.access_token,
         )
@@ -76,8 +76,8 @@ async fn list_transcriptions_for_conference() {
     let resp = app
         .auth_get(
             &format!(
-                "/api/tenant/{}/conference/{}/transcript",
-                tenant.tenant_id, conf_id
+                "/api/tenant/{}/room/{}/transcript",
+                tenant.tenant_id, room_id
             ),
             &tenant.admin.access_token,
         )
@@ -97,21 +97,21 @@ async fn get_transcription_detail() {
 
     let resp = app
         .auth_post(
-            &format!("/api/tenant/{}/conference", tenant.tenant_id),
+            &format!("/api/tenant/{}/room", tenant.tenant_id),
             &tenant.admin.access_token,
         )
-        .json(&serde_json::json!({ "subject": "Trans Detail" }))
+        .json(&serde_json::json!({ "name": "Trans Detail" }))
         .send()
         .await
         .unwrap();
-    let conf: Value = resp.json().await.unwrap();
-    let conf_id = conf["id"].as_str().unwrap();
+    let room: Value = resp.json().await.unwrap();
+    let room_id = room["id"].as_str().unwrap();
 
     let resp = app
         .auth_post(
             &format!(
-                "/api/tenant/{}/conference/{}/transcript",
-                tenant.tenant_id, conf_id
+                "/api/tenant/{}/room/{}/transcript",
+                tenant.tenant_id, room_id
             ),
             &tenant.admin.access_token,
         )
@@ -126,8 +126,8 @@ async fn get_transcription_detail() {
     let resp = app
         .auth_get(
             &format!(
-                "/api/tenant/{}/conference/{}/transcript/{}",
-                tenant.tenant_id, conf_id, trans_id
+                "/api/tenant/{}/room/{}/transcript/{}",
+                tenant.tenant_id, room_id, trans_id
             ),
             &tenant.admin.access_token,
         )

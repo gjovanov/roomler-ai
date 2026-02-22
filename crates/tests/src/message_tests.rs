@@ -7,13 +7,13 @@ use tokio_tungstenite::tungstenite::Message;
 async fn create_and_list_messages() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("msgtest").await;
-    let channel_id = &tenant.channels[0].id;
+    let room_id = &tenant.rooms[0].id;
 
-    // Admin joins the channel first
+    // Admin joins the room first
     app.auth_post(
         &format!(
-            "/api/tenant/{}/channel/{}/join",
-            tenant.tenant_id, channel_id
+            "/api/tenant/{}/room/{}/join",
+            tenant.tenant_id, room_id
         ),
         &tenant.admin.access_token,
     )
@@ -26,8 +26,8 @@ async fn create_and_list_messages() {
         let resp = app
             .auth_post(
                 &format!(
-                    "/api/tenant/{}/channel/{}/message",
-                    tenant.tenant_id, channel_id
+                    "/api/tenant/{}/room/{}/message",
+                    tenant.tenant_id, room_id
                 ),
                 &tenant.admin.access_token,
             )
@@ -45,8 +45,8 @@ async fn create_and_list_messages() {
     let resp = app
         .auth_get(
             &format!(
-                "/api/tenant/{}/channel/{}/message",
-                tenant.tenant_id, channel_id
+                "/api/tenant/{}/room/{}/message",
+                tenant.tenant_id, room_id
             ),
             &tenant.admin.access_token,
         )
@@ -65,13 +65,13 @@ async fn create_and_list_messages() {
 async fn update_message() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("msgedit").await;
-    let channel_id = &tenant.channels[0].id;
+    let room_id = &tenant.rooms[0].id;
 
-    // Join channel
+    // Join room
     app.auth_post(
         &format!(
-            "/api/tenant/{}/channel/{}/join",
-            tenant.tenant_id, channel_id
+            "/api/tenant/{}/room/{}/join",
+            tenant.tenant_id, room_id
         ),
         &tenant.admin.access_token,
     )
@@ -83,8 +83,8 @@ async fn update_message() {
     let resp = app
         .auth_post(
             &format!(
-                "/api/tenant/{}/channel/{}/message",
-                tenant.tenant_id, channel_id
+                "/api/tenant/{}/room/{}/message",
+                tenant.tenant_id, room_id
             ),
             &tenant.admin.access_token,
         )
@@ -102,8 +102,8 @@ async fn update_message() {
     let resp = app
         .auth_put(
             &format!(
-                "/api/tenant/{}/channel/{}/message/{}",
-                tenant.tenant_id, channel_id, message_id
+                "/api/tenant/{}/room/{}/message/{}",
+                tenant.tenant_id, room_id, message_id
             ),
             &tenant.admin.access_token,
         )
@@ -123,13 +123,13 @@ async fn update_message() {
 async fn delete_message_soft_deletes() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("msgdel").await;
-    let channel_id = &tenant.channels[0].id;
+    let room_id = &tenant.rooms[0].id;
 
-    // Join channel
+    // Join room
     app.auth_post(
         &format!(
-            "/api/tenant/{}/channel/{}/join",
-            tenant.tenant_id, channel_id
+            "/api/tenant/{}/room/{}/join",
+            tenant.tenant_id, room_id
         ),
         &tenant.admin.access_token,
     )
@@ -141,8 +141,8 @@ async fn delete_message_soft_deletes() {
     let resp = app
         .auth_post(
             &format!(
-                "/api/tenant/{}/channel/{}/message",
-                tenant.tenant_id, channel_id
+                "/api/tenant/{}/room/{}/message",
+                tenant.tenant_id, room_id
             ),
             &tenant.admin.access_token,
         )
@@ -160,8 +160,8 @@ async fn delete_message_soft_deletes() {
     let resp = app
         .auth_delete(
             &format!(
-                "/api/tenant/{}/channel/{}/message/{}",
-                tenant.tenant_id, channel_id, message_id
+                "/api/tenant/{}/room/{}/message/{}",
+                tenant.tenant_id, room_id, message_id
             ),
             &tenant.admin.access_token,
         )
@@ -175,8 +175,8 @@ async fn delete_message_soft_deletes() {
     let resp = app
         .auth_get(
             &format!(
-                "/api/tenant/{}/channel/{}/message",
-                tenant.tenant_id, channel_id
+                "/api/tenant/{}/room/{}/message",
+                tenant.tenant_id, room_id
             ),
             &tenant.admin.access_token,
         )
@@ -193,16 +193,16 @@ async fn delete_message_soft_deletes() {
 async fn message_broadcast_excludes_sender_reaches_member() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("msgws").await;
-    let channel_id = &tenant.channels[0].id;
+    let room_id = &tenant.rooms[0].id;
 
-    // Both users join the channel
+    // Both users join the room
     app.auth_post(
-        &format!("/api/tenant/{}/channel/{}/join", tenant.tenant_id, channel_id),
+        &format!("/api/tenant/{}/room/{}/join", tenant.tenant_id, room_id),
         &tenant.admin.access_token,
     ).send().await.unwrap();
 
     app.auth_post(
-        &format!("/api/tenant/{}/channel/{}/join", tenant.tenant_id, channel_id),
+        &format!("/api/tenant/{}/room/{}/join", tenant.tenant_id, room_id),
         &tenant.member.access_token,
     ).send().await.unwrap();
 
@@ -220,7 +220,7 @@ async fn message_broadcast_excludes_sender_reaches_member() {
     // Admin sends a message via HTTP
     let resp = app
         .auth_post(
-            &format!("/api/tenant/{}/channel/{}/message", tenant.tenant_id, channel_id),
+            &format!("/api/tenant/{}/room/{}/message", tenant.tenant_id, room_id),
             &tenant.admin.access_token,
         )
         .json(&serde_json::json!({ "content": "Hello from admin" }))

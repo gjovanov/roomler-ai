@@ -3,10 +3,9 @@ use roomler2_config::Settings;
 use roomler2_services::{
     AuthService, GiphyService, OAuthService, RecognitionService, TaskService,
     dao::{
-        channel::ChannelDao, conference::ConferenceDao, file::FileDao,
-        invite::InviteDao, message::MessageDao, reaction::ReactionDao,
-        recording::RecordingDao, tenant::TenantDao, transcription::TranscriptionDao,
-        user::UserDao,
+        file::FileDao, invite::InviteDao, message::MessageDao, reaction::ReactionDao,
+        recording::RecordingDao, room::RoomDao, tenant::TenantDao,
+        transcription::TranscriptionDao, user::UserDao,
     },
     media::{room_manager::RoomManager, worker_pool::WorkerPool},
 };
@@ -22,11 +21,10 @@ pub struct AppState {
     pub auth: Arc<AuthService>,
     pub users: Arc<UserDao>,
     pub tenants: Arc<TenantDao>,
-    pub channels: Arc<ChannelDao>,
+    pub rooms: Arc<RoomDao>,
     pub invites: Arc<InviteDao>,
     pub messages: Arc<MessageDao>,
     pub reactions: Arc<ReactionDao>,
-    pub conferences: Arc<ConferenceDao>,
     pub files: Arc<FileDao>,
     pub recordings: Arc<RecordingDao>,
     pub transcriptions: Arc<TranscriptionDao>,
@@ -44,11 +42,10 @@ impl AppState {
         let auth = Arc::new(AuthService::new(settings.jwt.clone()));
         let users = Arc::new(UserDao::new(&db));
         let tenants = Arc::new(TenantDao::new(&db));
-        let channels = Arc::new(ChannelDao::new(&db));
+        let rooms = Arc::new(RoomDao::new(&db));
         let invites = Arc::new(InviteDao::new(&db));
         let messages = Arc::new(MessageDao::new(&db));
         let reactions = Arc::new(ReactionDao::new(&db));
-        let conferences = Arc::new(ConferenceDao::new(&db));
         let files = Arc::new(FileDao::new(&db));
         let recordings = Arc::new(RecordingDao::new(&db));
         let transcriptions = Arc::new(TranscriptionDao::new(&db));
@@ -108,11 +105,10 @@ impl AppState {
             auth,
             users,
             tenants,
-            channels,
+            rooms,
             invites,
             messages,
             reactions,
-            conferences,
             files,
             recordings,
             transcriptions,
@@ -127,9 +123,6 @@ impl AppState {
     }
 
     /// Creates the transcription engine based on settings.
-    ///
-    /// Discovers available ASR backends based on compiled features and model file presence.
-    /// Returns the engine and a broadcast receiver for transcript events.
     fn create_transcription_engine(
         settings: &Settings,
     ) -> anyhow::Result<(
@@ -154,6 +147,8 @@ impl AppState {
             max_speech_duration_secs: settings.transcription.max_speech_duration_secs,
             nim_endpoint: settings.transcription.nim_endpoint.clone(),
             onnx_model_path: settings.transcription.onnx_model_path.clone(),
+            nim_model: settings.transcription.nim_model.clone(),
+            streaming_partial_interval_ms: settings.transcription.streaming_partial_interval_ms,
         };
 
         let mut backends: HashMap<String, Arc<dyn roomler2_transcription::AsrBackend>> =
@@ -196,6 +191,21 @@ impl AppState {
             }
         }
 
+        // Remote NIM backend
+        #[cfg(feature = "remote-nim")]
+        if let Some(ref endpoint) = settings.transcription.nim_endpoint {
+            let model_name = settings.transcription.nim_model.as_deref();
+            match roomler2_transcription::asr::remote_nim::RemoteNimBackend::new(endpoint, model_name) {
+                Ok(backend) => {
+                    tracing::info!(endpoint, ?model_name, "NIM backend configured");
+                    backends.insert("nim".into(), Arc::new(backend));
+                }
+                Err(e) => {
+                    tracing::warn!(endpoint, %e, "Failed to create NIM backend");
+                }
+            }
+        }
+
         if backends.is_empty() {
             anyhow::bail!("No ASR backends available — check model paths and feature flags");
         }
@@ -204,6 +214,7 @@ impl AppState {
         let default_backend = match settings.transcription.backend.as_str() {
             "local_whisper" => "whisper",
             "local_onnx" => "canary",
+            "remote_nim" => "nim",
             other => other,
         }
         .to_string();

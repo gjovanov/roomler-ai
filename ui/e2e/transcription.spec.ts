@@ -3,9 +3,9 @@ import {
   uniqueUser,
   registerUserViaApi,
   createTenantViaApi,
-  createConferenceViaApi,
-  startConferenceViaApi,
-  joinConferenceViaApi,
+  createRoomViaApi,
+  startCallViaApi,
+  joinCallViaApi,
   loginViaUi,
 } from './fixtures/test-helpers'
 
@@ -13,7 +13,7 @@ test.describe('Transcription UI', () => {
   let user: ReturnType<typeof uniqueUser>
   let token: string
   let tenantId: string
-  let conferenceId: string
+  let roomId: string
 
   test.beforeEach(async ({ page }) => {
     user = uniqueUser()
@@ -22,20 +22,20 @@ test.describe('Transcription UI', () => {
     const tenant = await createTenantViaApi(token, 'Transcribe Org', `transcribe-${Date.now()}`)
     tenantId = tenant.id
 
-    const conf = await createConferenceViaApi(token, tenantId, 'Transcription Meeting')
-    conferenceId = conf.id
+    const room = await createRoomViaApi(token, tenantId, 'Transcription Meeting')
+    roomId = room.id
 
-    await startConferenceViaApi(token, tenantId, conferenceId)
-    await joinConferenceViaApi(token, tenantId, conferenceId)
+    await startCallViaApi(token, tenantId, roomId)
+    await joinCallViaApi(token, tenantId, roomId)
 
     await loginViaUi(page, user.username, user.password)
   })
 
   test('transcription menu opens with model options', async ({ page, context }) => {
     await context.grantPermissions(['camera', 'microphone'])
-    await page.goto(`/tenant/${tenantId}/conference/${conferenceId}`)
+    await page.goto(`/tenant/${tenantId}/room/${roomId}/call`)
 
-    // Join the conference
+    // Join the call
     await page.getByRole('button', { name: /join/i }).click()
     await expect(page.getByText('Chat')).toBeVisible({ timeout: 15000 })
 
@@ -50,7 +50,7 @@ test.describe('Transcription UI', () => {
 
   test('model selection persists across menu open/close', async ({ page, context }) => {
     await context.grantPermissions(['camera', 'microphone'])
-    await page.goto(`/tenant/${tenantId}/conference/${conferenceId}`)
+    await page.goto(`/tenant/${tenantId}/room/${roomId}/call`)
 
     await page.getByRole('button', { name: /join/i }).click()
     await expect(page.getByText('Chat')).toBeVisible({ timeout: 15000 })
@@ -71,7 +71,7 @@ test.describe('Transcription UI', () => {
 
   test('enable transcription changes icon color and shows panel button', async ({ page, context }) => {
     await context.grantPermissions(['camera', 'microphone'])
-    await page.goto(`/tenant/${tenantId}/conference/${conferenceId}`)
+    await page.goto(`/tenant/${tenantId}/room/${roomId}/call`)
 
     await page.getByRole('button', { name: /join/i }).click()
     await expect(page.getByText('Chat')).toBeVisible({ timeout: 15000 })
@@ -92,7 +92,7 @@ test.describe('Transcription UI', () => {
 
   test('transcript panel shows empty state', async ({ page, context }) => {
     await context.grantPermissions(['camera', 'microphone'])
-    await page.goto(`/tenant/${tenantId}/conference/${conferenceId}`)
+    await page.goto(`/tenant/${tenantId}/room/${roomId}/call`)
 
     await page.getByRole('button', { name: /join/i }).click()
     await expect(page.getByText('Chat')).toBeVisible({ timeout: 15000 })
@@ -110,7 +110,7 @@ test.describe('Transcription UI', () => {
 
   test('disable transcription hides panel and overlay', async ({ page, context }) => {
     await context.grantPermissions(['camera', 'microphone'])
-    await page.goto(`/tenant/${tenantId}/conference/${conferenceId}`)
+    await page.goto(`/tenant/${tenantId}/room/${roomId}/call`)
 
     await page.getByRole('button', { name: /join/i }).click()
     await expect(page.getByText('Chat')).toBeVisible({ timeout: 15000 })
@@ -134,12 +134,12 @@ test.describe('Transcription UI', () => {
 
   test('display name shows actual name with (You) suffix', async ({ page, context }) => {
     await context.grantPermissions(['camera', 'microphone'])
-    await page.goto(`/tenant/${tenantId}/conference/${conferenceId}`)
+    await page.goto(`/tenant/${tenantId}/room/${roomId}/call`)
 
     await page.getByRole('button', { name: /join/i }).click()
     await expect(page.getByText('Chat')).toBeVisible({ timeout: 15000 })
 
-    // Should show "E2E User N (You)" — not "You (You)"
+    // Should show "E2E User N (You)" -- not "You (You)"
     await expect(page.getByText(`${user.displayName} (You)`)).toBeVisible({ timeout: 5000 })
     await expect(page.getByText('You (You)')).not.toBeVisible()
   })

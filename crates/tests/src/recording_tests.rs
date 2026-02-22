@@ -2,27 +2,27 @@ use crate::fixtures::test_app::TestApp;
 use serde_json::Value;
 
 #[tokio::test]
-async fn create_recording_for_conference() {
+async fn create_recording_for_room() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("rec1").await;
 
-    // Create and start conference
+    // Create room and start call
     let resp = app
         .auth_post(
-            &format!("/api/tenant/{}/conference", tenant.tenant_id),
+            &format!("/api/tenant/{}/room", tenant.tenant_id),
             &tenant.admin.access_token,
         )
-        .json(&serde_json::json!({ "subject": "Recording Test" }))
+        .json(&serde_json::json!({ "name": "Recording Test" }))
         .send()
         .await
         .unwrap();
-    let conf: Value = resp.json().await.unwrap();
-    let conf_id = conf["id"].as_str().unwrap();
+    let room: Value = resp.json().await.unwrap();
+    let room_id = room["id"].as_str().unwrap();
 
     app.auth_post(
         &format!(
-            "/api/tenant/{}/conference/{}/start",
-            tenant.tenant_id, conf_id
+            "/api/tenant/{}/room/{}/call/start",
+            tenant.tenant_id, room_id
         ),
         &tenant.admin.access_token,
     )
@@ -34,8 +34,8 @@ async fn create_recording_for_conference() {
     let resp = app
         .auth_post(
             &format!(
-                "/api/tenant/{}/conference/{}/recording",
-                tenant.tenant_id, conf_id
+                "/api/tenant/{}/room/{}/recording",
+                tenant.tenant_id, room_id
             ),
             &tenant.admin.access_token,
         )
@@ -46,34 +46,34 @@ async fn create_recording_for_conference() {
 
     assert_eq!(resp.status().as_u16(), 200);
     let json: Value = resp.json().await.unwrap();
-    assert_eq!(json["conference_id"], conf_id);
+    assert_eq!(json["room_id"], room_id);
     assert_eq!(json["recording_type"], "Video");
     assert_eq!(json["status"], "Processing");
 }
 
 #[tokio::test]
-async fn list_recordings_for_conference() {
+async fn list_recordings_for_room() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("rec2").await;
 
     let resp = app
         .auth_post(
-            &format!("/api/tenant/{}/conference", tenant.tenant_id),
+            &format!("/api/tenant/{}/room", tenant.tenant_id),
             &tenant.admin.access_token,
         )
-        .json(&serde_json::json!({ "subject": "Recording List" }))
+        .json(&serde_json::json!({ "name": "Recording List" }))
         .send()
         .await
         .unwrap();
-    let conf: Value = resp.json().await.unwrap();
-    let conf_id = conf["id"].as_str().unwrap();
+    let room: Value = resp.json().await.unwrap();
+    let room_id = room["id"].as_str().unwrap();
 
     // Create 2 recordings
     for rec_type in &["video", "audio"] {
         app.auth_post(
             &format!(
-                "/api/tenant/{}/conference/{}/recording",
-                tenant.tenant_id, conf_id
+                "/api/tenant/{}/room/{}/recording",
+                tenant.tenant_id, room_id
             ),
             &tenant.admin.access_token,
         )
@@ -87,8 +87,8 @@ async fn list_recordings_for_conference() {
     let resp = app
         .auth_get(
             &format!(
-                "/api/tenant/{}/conference/{}/recording",
-                tenant.tenant_id, conf_id
+                "/api/tenant/{}/room/{}/recording",
+                tenant.tenant_id, room_id
             ),
             &tenant.admin.access_token,
         )
@@ -108,22 +108,22 @@ async fn delete_recording() {
 
     let resp = app
         .auth_post(
-            &format!("/api/tenant/{}/conference", tenant.tenant_id),
+            &format!("/api/tenant/{}/room", tenant.tenant_id),
             &tenant.admin.access_token,
         )
-        .json(&serde_json::json!({ "subject": "Delete Rec" }))
+        .json(&serde_json::json!({ "name": "Delete Rec" }))
         .send()
         .await
         .unwrap();
-    let conf: Value = resp.json().await.unwrap();
-    let conf_id = conf["id"].as_str().unwrap();
+    let room: Value = resp.json().await.unwrap();
+    let room_id = room["id"].as_str().unwrap();
 
     // Create recording
     let resp = app
         .auth_post(
             &format!(
-                "/api/tenant/{}/conference/{}/recording",
-                tenant.tenant_id, conf_id
+                "/api/tenant/{}/room/{}/recording",
+                tenant.tenant_id, room_id
             ),
             &tenant.admin.access_token,
         )
@@ -138,8 +138,8 @@ async fn delete_recording() {
     let resp = app
         .auth_delete(
             &format!(
-                "/api/tenant/{}/conference/{}/recording/{}",
-                tenant.tenant_id, conf_id, rec_id
+                "/api/tenant/{}/room/{}/recording/{}",
+                tenant.tenant_id, room_id, rec_id
             ),
             &tenant.admin.access_token,
         )

@@ -19,7 +19,7 @@
         <v-row align="center" justify="center">
           <v-col cols="12" md="8" class="text-center">
             <h1 class="text-h2 font-weight-bold mb-4">Where teams connect, collaborate,<br/>and create — <span class="text-primary">in real time</span></h1>
-            <p class="text-h6 landing-muted mb-8">Channels, threaded chat, HD video conferencing, file sharing, and AI-powered document recognition — all in one platform.</p>
+            <p class="text-h6 landing-muted mb-8">Rooms for chat and calls, threaded messaging, HD video conferencing, file sharing, and AI-powered document recognition — all in one platform.</p>
             <v-btn color="primary" size="x-large" :to="{ name: 'register' }" class="mr-4 px-8">Start Free</v-btn>
             <v-btn variant="outlined" size="x-large" href="#pricing" class="px-8">View Plans</v-btn>
           </v-col>
@@ -156,39 +156,39 @@ const stats = [
 const features = [
   {
     icon: 'mdi-pound',
-    title: 'Organized Channels',
-    description: 'Create channels for every team, project, or topic. Keep conversations organized with 8 channel types.',
-    color: '#1565C0',
+    title: 'Organized Rooms',
+    description: 'Create rooms for every team, project, or topic. Chat and call in the same space with flexible room settings.',
+    color: '#009688',
   },
   {
     icon: 'mdi-message-text-outline',
     title: 'Threaded Chat',
     description: 'Rich messaging with threads, reactions, mentions, pins, and file attachments — nothing gets lost.',
-    color: '#7C4DFF',
+    color: '#ef5350',
   },
   {
     icon: 'mdi-video-outline',
     title: 'HD Video Conferencing',
     description: 'Built-in WebRTC SFU for crystal-clear video meetings with screen sharing and recording.',
-    color: '#1565C0',
+    color: '#009688',
   },
   {
     icon: 'mdi-file-document-outline',
     title: 'File Sharing & AI',
     description: 'Upload files, sync with cloud storage, and let AI recognize and categorize your documents.',
-    color: '#7C4DFF',
+    color: '#ef5350',
   },
   {
     icon: 'mdi-account-group-outline',
     title: 'Multi-Tenant Workspaces',
     description: 'Isolated workspaces with roles, permissions, and invite links for secure collaboration.',
-    color: '#1565C0',
+    color: '#009688',
   },
   {
     icon: 'mdi-cloud-outline',
     title: 'Cloud Integrations',
     description: 'Connect Google Drive, OneDrive, and Dropbox. Export conversations to Excel and PDF.',
-    color: '#7C4DFF',
+    color: '#ef5350',
   },
 ]
 
@@ -199,7 +199,7 @@ const plans = [
     popular: false,
     features: [
       '10 members',
-      '5 channels',
+      '5 rooms',
       '5K message history',
       '100 MB storage',
       'Basic chat & DMs',
@@ -211,7 +211,7 @@ const plans = [
     popular: true,
     features: [
       'Unlimited members',
-      'Unlimited channels',
+      'Unlimited rooms',
       'Full message history',
       '10 GB storage',
       'Video conferencing (10)',
@@ -236,7 +236,7 @@ const plans = [
 
 <style scoped>
 .landing-page {
-  background: linear-gradient(180deg, #f8faff 0%, #ffffff 40%);
+  background: linear-gradient(180deg, #f5faf9 0%, #ffffff 40%);
   color: #1a1a2e;
 }
 
@@ -245,14 +245,14 @@ const plans = [
   z-index: 100;
   backdrop-filter: blur(12px);
   background: rgba(255, 255, 255, 0.92) !important;
-  border-bottom: 1px solid rgba(21, 101, 192, 0.1);
+  border-bottom: 1px solid rgba(0, 150, 136, 0.1);
   color: #1a1a2e !important;
 }
 
 .hero-section {
   padding-top: 140px;
   padding-bottom: 80px;
-  background: linear-gradient(135deg, #e3f2fd 0%, #ede7f6 50%, #e8eaf6 100%);
+  background: linear-gradient(135deg, #e0f2f1 0%, #e8f5e9 50%, #e0f7fa 100%);
   position: relative;
   overflow: hidden;
 }
@@ -264,8 +264,8 @@ const plans = [
   left: -50%;
   width: 200%;
   height: 200%;
-  background: radial-gradient(circle at 30% 70%, rgba(21, 101, 192, 0.06) 0%, transparent 50%),
-              radial-gradient(circle at 70% 30%, rgba(124, 77, 255, 0.06) 0%, transparent 50%);
+  background: radial-gradient(circle at 30% 70%, rgba(0, 150, 136, 0.06) 0%, transparent 50%),
+              radial-gradient(circle at 70% 30%, rgba(239, 83, 80, 0.06) 0%, transparent 50%);
   animation: float 20s ease-in-out infinite;
 }
 
@@ -291,7 +291,7 @@ const plans = [
 
 .feature-card:hover {
   transform: translateY(-4px);
-  box-shadow: 0 12px 40px rgba(21, 101, 192, 0.12) !important;
+  box-shadow: 0 12px 40px rgba(0, 150, 136, 0.12) !important;
 }
 
 .pricing-section {
@@ -299,11 +299,11 @@ const plans = [
 }
 
 .border-primary {
-  border: 2px solid #1565C0 !important;
+  border: 2px solid #009688 !important;
 }
 
 .cta-section {
-  background: linear-gradient(135deg, #1565C0 0%, #7C4DFF 100%);
+  background: linear-gradient(135deg, #009688 0%, #00796B 100%);
   position: relative;
   overflow: hidden;
 }

@@ -223,11 +223,11 @@ impl CanaryTokenizer {
                 }
 
                 // SentencePiece ▁ = word boundary (3 bytes in UTF-8)
-                if token.starts_with('▁') {
+                if let Some(stripped) = token.strip_prefix('▁') {
                     if !result.is_empty() {
                         result.push(' ');
                     }
-                    result.push_str(&token[3..]);
+                    result.push_str(stripped);
                 } else {
                     result.push_str(token);
                 }

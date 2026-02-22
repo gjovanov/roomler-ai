@@ -83,7 +83,7 @@ impl SimplePdf {
         let mut buf = Vec::new();
 
         // PDF header
-        write!(buf, "%PDF-1.4\n").unwrap();
+        writeln!(buf, "%PDF-1.4").unwrap();
         // Binary comment to mark as binary PDF
         buf.extend_from_slice(&[b'%', 0xE2, 0xE3, 0xCF, 0xD3, b'\n']);
 
@@ -183,9 +183,9 @@ impl SimplePdf {
         // Cross-reference table
         let xref_start = buf.len();
         write!(buf, "xref\n0 {}\n", offsets.len() + 1).unwrap();
-        write!(buf, "0000000000 65535 f \n").unwrap();
+        writeln!(buf, "0000000000 65535 f ").unwrap();
         for offset in &offsets {
-            write!(buf, "{:010} 00000 n \n", offset).unwrap();
+            writeln!(buf, "{:010} 00000 n ", offset).unwrap();
         }
 
         // Trailer

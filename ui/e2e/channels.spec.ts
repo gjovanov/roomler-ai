@@ -3,11 +3,11 @@ import {
   uniqueUser,
   registerUserViaApi,
   createTenantViaApi,
-  createChannelViaApi,
+  createRoomViaApi,
   loginViaUi,
 } from './fixtures/test-helpers'
 
-test.describe('Channels', () => {
+test.describe('Rooms', () => {
   let user: ReturnType<typeof uniqueUser>
   let token: string
   let tenantId: string
@@ -21,66 +21,66 @@ test.describe('Channels', () => {
     await loginViaUi(page, user.username, user.password)
   })
 
-  test('channel list page loads', async ({ page }) => {
-    await page.goto(`/tenant/${tenantId}/channels`)
-    await expect(page.getByText(/channels/i).first()).toBeVisible()
+  test('room list page loads', async ({ page }) => {
+    await page.goto(`/tenant/${tenantId}/rooms`)
+    await expect(page.getByText(/rooms/i).first()).toBeVisible()
   })
 
-  test('create channel dialog opens and closes', async ({ page }) => {
-    await page.goto(`/tenant/${tenantId}/channels`)
-    await page.getByRole('button', { name: /create channel/i }).click()
+  test('create room dialog opens and closes', async ({ page }) => {
+    await page.goto(`/tenant/${tenantId}/rooms`)
+    await page.getByRole('button', { name: /create room/i }).click()
     // Dialog should be visible
-    await expect(page.getByText(/channel name/i).first()).toBeVisible()
+    await expect(page.getByText(/room name/i).first()).toBeVisible()
 
     // Cancel
     await page.getByRole('button', { name: /cancel/i }).click()
   })
 
-  test('create channel via UI and see it in channel list', async ({ page }) => {
-    await page.goto(`/tenant/${tenantId}/channels`)
+  test('create room via UI and see it in room list', async ({ page }) => {
+    await page.goto(`/tenant/${tenantId}/rooms`)
 
     // Open create dialog
-    await page.getByRole('button', { name: /create channel/i }).click()
-    await expect(page.getByText(/channel name/i).first()).toBeVisible()
+    await page.getByRole('button', { name: /create room/i }).click()
+    await expect(page.getByText(/room name/i).first()).toBeVisible()
 
-    // Fill in channel name and save
+    // Fill in room name and save
     const nameInput = page.locator('.v-dialog input').first()
-    await nameInput.fill('my-test-channel')
+    await nameInput.fill('my-test-room')
     await page.getByRole('button', { name: /save/i }).click()
 
-    // Verify the new channel appears in the list
-    await expect(page.getByText('my-test-channel')).toBeVisible({ timeout: 5000 })
+    // Verify the new room appears in the list
+    await expect(page.getByText('my-test-room')).toBeVisible({ timeout: 5000 })
   })
 
-  test('create duplicate channel shows error alert', async ({ page }) => {
-    // Pre-create a channel via API so we have a duplicate name to test against
-    await createChannelViaApi(token, tenantId, 'duplicate-ch')
+  test('create duplicate room shows error alert', async ({ page }) => {
+    // Pre-create a room via API so we have a duplicate name to test against
+    await createRoomViaApi(token, tenantId, 'duplicate-rm')
 
-    await page.goto(`/tenant/${tenantId}/channels`)
+    await page.goto(`/tenant/${tenantId}/rooms`)
 
     // Open create dialog
-    await page.getByRole('button', { name: /create channel/i }).click()
-    await expect(page.getByText(/channel name/i).first()).toBeVisible()
+    await page.getByRole('button', { name: /create room/i }).click()
+    await expect(page.getByText(/room name/i).first()).toBeVisible()
 
-    // Try to create a channel with the same name
+    // Try to create a room with the same name
     const nameInput = page.locator('.v-dialog input').first()
-    await nameInput.fill('duplicate-ch')
+    await nameInput.fill('duplicate-rm')
     await page.getByRole('button', { name: /save/i }).click()
 
     // The error alert should be displayed inside the dialog
     await expect(page.locator('.v-dialog .v-alert')).toBeVisible({ timeout: 5000 })
   })
 
-  test('channel list displays channels created via API', async ({ page }) => {
-    // Create channels via API
-    await createChannelViaApi(token, tenantId, 'api-channel-1')
-    await createChannelViaApi(token, tenantId, 'api-channel-2')
+  test('room list displays rooms created via API', async ({ page }) => {
+    // Create rooms via API
+    await createRoomViaApi(token, tenantId, 'api-room-1')
+    await createRoomViaApi(token, tenantId, 'api-room-2')
 
-    await page.goto(`/tenant/${tenantId}/channels`)
+    await page.goto(`/tenant/${tenantId}/rooms`)
 
-    // Both channels should appear in the list (validates store parses plain array)
-    await expect(page.getByText('api-channel-1')).toBeVisible({ timeout: 10000 })
-    await expect(page.getByText('api-channel-2')).toBeVisible()
+    // Both rooms should appear in the list (validates store parses plain array)
+    await expect(page.getByText('api-room-1')).toBeVisible({ timeout: 10000 })
+    await expect(page.getByText('api-room-2')).toBeVisible()
   })
 
   test('explore page loads with search', async ({ page }) => {

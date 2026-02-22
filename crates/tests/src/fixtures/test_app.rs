@@ -245,6 +245,7 @@ fn test_settings() -> Settings {
             url: None,
             username: None,
             password: None,
+            shared_secret: None,
             force_relay: None,
         },
         claude: roomler2_config::ClaudeSettings {
@@ -299,6 +300,8 @@ fn test_settings() -> Settings {
             max_speech_duration_secs: 30.0,
             nim_endpoint: None,
             onnx_model_path: None,
+            nim_model: None,
+            streaming_partial_interval_ms: 500,
         },
     }
 }

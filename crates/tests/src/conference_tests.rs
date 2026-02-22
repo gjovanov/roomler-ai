@@ -3,18 +3,34 @@ use futures::{SinkExt, StreamExt};
 use serde_json::Value;
 use tokio_tungstenite::tungstenite::Message;
 
+/// Read the next WS message, skipping room:call_* notification messages.
+async fn next_media_msg(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> Value {
+    loop {
+        let msg = ws.next().await.unwrap().unwrap();
+        let parsed: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+        let msg_type = parsed["type"].as_str().unwrap_or("");
+        if !msg_type.starts_with("room:") {
+            return parsed;
+        }
+    }
+}
+
 #[tokio::test]
-async fn create_conference() {
+async fn create_room_for_call() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("conf1").await;
 
     let resp = app
         .auth_post(
-            &format!("/api/tenant/{}/conference", tenant.tenant_id),
+            &format!("/api/tenant/{}/room", tenant.tenant_id),
             &tenant.admin.access_token,
         )
         .json(&serde_json::json!({
-            "subject": "Team Standup",
+            "name": "Team Standup",
         }))
         .send()
         .await
@@ -22,39 +38,37 @@ async fn create_conference() {
 
     assert_eq!(resp.status().as_u16(), 200);
     let json: Value = resp.json().await.unwrap();
-    assert_eq!(json["subject"], "Team Standup");
-    assert_eq!(json["status"], "Scheduled");
-    assert!(json["meeting_code"].as_str().unwrap().len() > 0);
-    assert_eq!(json["participant_count"], 0);
+    assert_eq!(json["name"], "Team Standup");
+    assert!(json["id"].as_str().unwrap().len() > 0);
 }
 
 #[tokio::test]
-async fn conference_lifecycle_start_join_leave_end() {
+async fn room_call_lifecycle_start_join_leave_end() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("conflife").await;
 
-    // Create conference
+    // Create room
     let resp = app
         .auth_post(
-            &format!("/api/tenant/{}/conference", tenant.tenant_id),
+            &format!("/api/tenant/{}/room", tenant.tenant_id),
             &tenant.admin.access_token,
         )
         .json(&serde_json::json!({
-            "subject": "Sprint Planning",
+            "name": "Sprint Planning",
         }))
         .send()
         .await
         .unwrap();
 
-    let conf: Value = resp.json().await.unwrap();
-    let conf_id = conf["id"].as_str().unwrap();
+    let room: Value = resp.json().await.unwrap();
+    let room_id = room["id"].as_str().unwrap();
 
-    // Start conference
+    // Start call
     let resp = app
         .auth_post(
             &format!(
-                "/api/tenant/{}/conference/{}/start",
-                tenant.tenant_id, conf_id
+                "/api/tenant/{}/room/{}/call/start",
+                tenant.tenant_id, room_id
             ),
             &tenant.admin.access_token,
         )
@@ -65,12 +79,12 @@ async fn conference_lifecycle_start_join_leave_end() {
     let json: Value = resp.json().await.unwrap();
     assert_eq!(json["started"], true);
 
-    // Get conference - check status is InProgress
+    // Get room - check call status is InProgress
     let resp = app
         .auth_get(
             &format!(
-                "/api/tenant/{}/conference/{}",
-                tenant.tenant_id, conf_id
+                "/api/tenant/{}/room/{}",
+                tenant.tenant_id, room_id
             ),
             &tenant.admin.access_token,
         )
@@ -78,14 +92,14 @@ async fn conference_lifecycle_start_join_leave_end() {
         .await
         .unwrap();
     let json: Value = resp.json().await.unwrap();
-    assert_eq!(json["status"], "InProgress");
+    assert_eq!(json["conference_status"], "InProgress");
 
-    // Join conference
+    // Join call
     let resp = app
         .auth_post(
             &format!(
-                "/api/tenant/{}/conference/{}/join",
-                tenant.tenant_id, conf_id
+                "/api/tenant/{}/room/{}/call/join",
+                tenant.tenant_id, room_id
             ),
             &tenant.admin.access_token,
         )
@@ -100,8 +114,8 @@ async fn conference_lifecycle_start_join_leave_end() {
     let resp = app
         .auth_get(
             &format!(
-                "/api/tenant/{}/conference/{}/participant",
-                tenant.tenant_id, conf_id
+                "/api/tenant/{}/room/{}/call/participant",
+                tenant.tenant_id, room_id
             ),
             &tenant.admin.access_token,
         )
@@ -113,12 +127,12 @@ async fn conference_lifecycle_start_join_leave_end() {
     assert_eq!(parts.len(), 1);
     assert_eq!(parts[0]["user_id"], tenant.admin.id);
 
-    // Leave conference
+    // Leave call
     let resp = app
         .auth_post(
             &format!(
-                "/api/tenant/{}/conference/{}/leave",
-                tenant.tenant_id, conf_id
+                "/api/tenant/{}/room/{}/call/leave",
+                tenant.tenant_id, room_id
             ),
             &tenant.admin.access_token,
         )
@@ -127,12 +141,12 @@ async fn conference_lifecycle_start_join_leave_end() {
         .unwrap();
     assert_eq!(resp.status().as_u16(), 200);
 
-    // End conference
+    // End call
     let resp = app
         .auth_post(
             &format!(
-                "/api/tenant/{}/conference/{}/end",
-                tenant.tenant_id, conf_id
+                "/api/tenant/{}/room/{}/call/end",
+                tenant.tenant_id, room_id
             ),
             &tenant.admin.access_token,
         )
@@ -143,12 +157,12 @@ async fn conference_lifecycle_start_join_leave_end() {
     let json: Value = resp.json().await.unwrap();
     assert_eq!(json["ended"], true);
 
-    // Get conference - check status is Ended
+    // Get room - check call status is Ended
     let resp = app
         .auth_get(
             &format!(
-                "/api/tenant/{}/conference/{}",
-                tenant.tenant_id, conf_id
+                "/api/tenant/{}/room/{}",
+                tenant.tenant_id, room_id
             ),
             &tenant.admin.access_token,
         )
@@ -156,21 +170,21 @@ async fn conference_lifecycle_start_join_leave_end() {
         .await
         .unwrap();
     let json: Value = resp.json().await.unwrap();
-    assert_eq!(json["status"], "Ended");
+    assert_eq!(json["conference_status"], "Ended");
 }
 
 #[tokio::test]
-async fn list_conferences() {
+async fn list_rooms() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("conflist").await;
 
-    // Create 2 conferences
-    for subject in &["Standup", "Retro"] {
+    // Create 2 additional rooms (3 seeded + 2 = 5)
+    for name in &["Standup Room", "Retro Room"] {
         app.auth_post(
-            &format!("/api/tenant/{}/conference", tenant.tenant_id),
+            &format!("/api/tenant/{}/room", tenant.tenant_id),
             &tenant.admin.access_token,
         )
-        .json(&serde_json::json!({ "subject": subject }))
+        .json(&serde_json::json!({ "name": name }))
         .send()
         .await
         .unwrap();
@@ -178,7 +192,7 @@ async fn list_conferences() {
 
     let resp = app
         .auth_get(
-            &format!("/api/tenant/{}/conference", tenant.tenant_id),
+            &format!("/api/tenant/{}/room", tenant.tenant_id),
             &tenant.admin.access_token,
         )
         .send()
@@ -186,36 +200,36 @@ async fn list_conferences() {
         .unwrap();
 
     assert_eq!(resp.status().as_u16(), 200);
-    let json: Value = resp.json().await.unwrap();
-    assert_eq!(json["total"], 2);
+    let rooms: Vec<Value> = resp.json().await.unwrap();
+    assert_eq!(rooms.len(), 5);
 }
 
 // --- Phase 6 mediasoup integration tests ---
 
 #[tokio::test]
-async fn conference_start_creates_mediasoup_room() {
+async fn call_start_creates_mediasoup_room() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("msoup1").await;
 
-    // Create conference
+    // Create room
     let resp = app
         .auth_post(
-            &format!("/api/tenant/{}/conference", tenant.tenant_id),
+            &format!("/api/tenant/{}/room", tenant.tenant_id),
             &tenant.admin.access_token,
         )
-        .json(&serde_json::json!({ "subject": "Media Test" }))
+        .json(&serde_json::json!({ "name": "Media Test" }))
         .send()
         .await
         .unwrap();
-    let conf: Value = resp.json().await.unwrap();
-    let conf_id = conf["id"].as_str().unwrap();
+    let room: Value = resp.json().await.unwrap();
+    let room_id = room["id"].as_str().unwrap();
 
-    // Start conference — should create mediasoup room and return rtp_capabilities
+    // Start call — should create mediasoup room and return rtp_capabilities
     let resp = app
         .auth_post(
             &format!(
-                "/api/tenant/{}/conference/{}/start",
-                tenant.tenant_id, conf_id
+                "/api/tenant/{}/room/{}/call/start",
+                tenant.tenant_id, room_id
             ),
             &tenant.admin.access_token,
         )
@@ -239,27 +253,27 @@ async fn conference_start_creates_mediasoup_room() {
 }
 
 #[tokio::test]
-async fn conference_join_returns_transport_options() {
+async fn call_join_returns_transport_options() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("msoup2").await;
 
-    // Create + start conference
+    // Create + start call
     let resp = app
         .auth_post(
-            &format!("/api/tenant/{}/conference", tenant.tenant_id),
+            &format!("/api/tenant/{}/room", tenant.tenant_id),
             &tenant.admin.access_token,
         )
-        .json(&serde_json::json!({ "subject": "Transport Test" }))
+        .json(&serde_json::json!({ "name": "Transport Test" }))
         .send()
         .await
         .unwrap();
-    let conf: Value = resp.json().await.unwrap();
-    let conf_id = conf["id"].as_str().unwrap();
+    let room: Value = resp.json().await.unwrap();
+    let room_id = room["id"].as_str().unwrap();
 
     app.auth_post(
         &format!(
-            "/api/tenant/{}/conference/{}/start",
-            tenant.tenant_id, conf_id
+            "/api/tenant/{}/room/{}/call/start",
+            tenant.tenant_id, room_id
         ),
         &tenant.admin.access_token,
     )
@@ -271,8 +285,8 @@ async fn conference_join_returns_transport_options() {
     let resp = app
         .auth_post(
             &format!(
-                "/api/tenant/{}/conference/{}/join",
-                tenant.tenant_id, conf_id
+                "/api/tenant/{}/room/{}/call/join",
+                tenant.tenant_id, room_id
             ),
             &tenant.admin.access_token,
         )
@@ -303,7 +317,7 @@ async fn conference_join_returns_transport_options() {
     ws.send(Message::Text(
         serde_json::to_string(&serde_json::json!({
             "type": "media:join",
-            "data": { "conference_id": conf_id }
+            "data": { "room_id": room_id }
         }))
         .unwrap()
         .into(),
@@ -347,27 +361,27 @@ async fn conference_join_returns_transport_options() {
 }
 
 #[tokio::test]
-async fn conference_end_cleans_up_room() {
+async fn call_end_cleans_up_room() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("msoup3").await;
 
     // Create + start + end
     let resp = app
         .auth_post(
-            &format!("/api/tenant/{}/conference", tenant.tenant_id),
+            &format!("/api/tenant/{}/room", tenant.tenant_id),
             &tenant.admin.access_token,
         )
-        .json(&serde_json::json!({ "subject": "Cleanup Test" }))
+        .json(&serde_json::json!({ "name": "Cleanup Test" }))
         .send()
         .await
         .unwrap();
-    let conf: Value = resp.json().await.unwrap();
-    let conf_id = conf["id"].as_str().unwrap();
+    let room: Value = resp.json().await.unwrap();
+    let room_id = room["id"].as_str().unwrap();
 
     app.auth_post(
         &format!(
-            "/api/tenant/{}/conference/{}/start",
-            tenant.tenant_id, conf_id
+            "/api/tenant/{}/room/{}/call/start",
+            tenant.tenant_id, room_id
         ),
         &tenant.admin.access_token,
     )
@@ -378,8 +392,8 @@ async fn conference_end_cleans_up_room() {
     let resp = app
         .auth_post(
             &format!(
-                "/api/tenant/{}/conference/{}/end",
-                tenant.tenant_id, conf_id
+                "/api/tenant/{}/room/{}/call/end",
+                tenant.tenant_id, room_id
             ),
             &tenant.admin.access_token,
         )
@@ -391,12 +405,12 @@ async fn conference_end_cleans_up_room() {
     let json: Value = resp.json().await.unwrap();
     assert_eq!(json["ended"], true);
 
-    // Verify status is Ended
+    // Verify call status is Ended
     let resp = app
         .auth_get(
             &format!(
-                "/api/tenant/{}/conference/{}",
-                tenant.tenant_id, conf_id
+                "/api/tenant/{}/room/{}",
+                tenant.tenant_id, room_id
             ),
             &tenant.admin.access_token,
         )
@@ -404,7 +418,7 @@ async fn conference_end_cleans_up_room() {
         .await
         .unwrap();
     let json: Value = resp.json().await.unwrap();
-    assert_eq!(json["status"], "Ended");
+    assert_eq!(json["conference_status"], "Ended");
 }
 
 #[tokio::test]
@@ -415,23 +429,23 @@ async fn ws_media_join_signaling() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("msoup4").await;
 
-    // Create + start conference
+    // Create + start call
     let resp = app
         .auth_post(
-            &format!("/api/tenant/{}/conference", tenant.tenant_id),
+            &format!("/api/tenant/{}/room", tenant.tenant_id),
             &tenant.admin.access_token,
         )
-        .json(&serde_json::json!({ "subject": "WS Test" }))
+        .json(&serde_json::json!({ "name": "WS Test" }))
         .send()
         .await
         .unwrap();
-    let conf: Value = resp.json().await.unwrap();
-    let conf_id = conf["id"].as_str().unwrap();
+    let room: Value = resp.json().await.unwrap();
+    let room_id = room["id"].as_str().unwrap();
 
     app.auth_post(
         &format!(
-            "/api/tenant/{}/conference/{}/start",
-            tenant.tenant_id, conf_id
+            "/api/tenant/{}/room/{}/call/start",
+            tenant.tenant_id, room_id
         ),
         &tenant.admin.access_token,
     )
@@ -456,8 +470,8 @@ async fn ws_media_join_signaling() {
     // REST join first (creates transports)
     app.auth_post(
         &format!(
-            "/api/tenant/{}/conference/{}/join",
-            tenant.tenant_id, conf_id
+            "/api/tenant/{}/room/{}/call/join",
+            tenant.tenant_id, room_id
         ),
         &tenant.admin.access_token,
     )
@@ -468,15 +482,14 @@ async fn ws_media_join_signaling() {
     // Send media:join
     let join_msg = serde_json::json!({
         "type": "media:join",
-        "data": { "conference_id": conf_id }
+        "data": { "room_id": room_id }
     });
     ws.send(Message::Text(serde_json::to_string(&join_msg).unwrap().into()))
         .await
         .unwrap();
 
-    // Should receive media:router_capabilities
-    let msg = ws.next().await.unwrap().unwrap();
-    let parsed: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+    // Should receive media:router_capabilities (skip room:call_* notifications)
+    let parsed = next_media_msg(&mut ws).await;
     assert_eq!(parsed["type"], "media:router_capabilities");
     assert!(parsed["data"]["rtp_capabilities"]["codecs"].is_array());
 
@@ -491,23 +504,23 @@ async fn ws_media_leave_broadcasts_peer_left() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("msoup5").await;
 
-    // Create + start conference
+    // Create + start call
     let resp = app
         .auth_post(
-            &format!("/api/tenant/{}/conference", tenant.tenant_id),
+            &format!("/api/tenant/{}/room", tenant.tenant_id),
             &tenant.admin.access_token,
         )
-        .json(&serde_json::json!({ "subject": "Leave Test" }))
+        .json(&serde_json::json!({ "name": "Leave Test" }))
         .send()
         .await
         .unwrap();
-    let conf: Value = resp.json().await.unwrap();
-    let conf_id = conf["id"].as_str().unwrap();
+    let room: Value = resp.json().await.unwrap();
+    let room_id = room["id"].as_str().unwrap();
 
     app.auth_post(
         &format!(
-            "/api/tenant/{}/conference/{}/start",
-            tenant.tenant_id, conf_id
+            "/api/tenant/{}/room/{}/call/start",
+            tenant.tenant_id, room_id
         ),
         &tenant.admin.access_token,
     )
@@ -527,8 +540,8 @@ async fn ws_media_leave_broadcasts_peer_left() {
 
     app.auth_post(
         &format!(
-            "/api/tenant/{}/conference/{}/join",
-            tenant.tenant_id, conf_id
+            "/api/tenant/{}/room/{}/call/join",
+            tenant.tenant_id, room_id
         ),
         &tenant.admin.access_token,
     )
@@ -539,21 +552,19 @@ async fn ws_media_leave_broadcasts_peer_left() {
     ws1.send(Message::Text(
         serde_json::to_string(&serde_json::json!({
             "type": "media:join",
-            "data": { "conference_id": conf_id }
+            "data": { "room_id": room_id }
         }))
         .unwrap().into(),
     ))
     .await
     .unwrap();
 
-    // Read router_capabilities for user 1
-    let msg = ws1.next().await.unwrap().unwrap();
-    let parsed: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+    // Read router_capabilities for user 1 (skip room:call_* notifications)
+    let parsed = next_media_msg(&mut ws1).await;
     assert_eq!(parsed["type"], "media:router_capabilities");
 
     // Read transport_created for user 1
-    let msg = ws1.next().await.unwrap().unwrap();
-    let parsed: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+    let parsed = next_media_msg(&mut ws1).await;
     assert_eq!(parsed["type"], "media:transport_created");
 
     // User 2 (member) connects WS and joins
@@ -568,8 +579,8 @@ async fn ws_media_leave_broadcasts_peer_left() {
 
     app.auth_post(
         &format!(
-            "/api/tenant/{}/conference/{}/join",
-            tenant.tenant_id, conf_id
+            "/api/tenant/{}/room/{}/call/join",
+            tenant.tenant_id, room_id
         ),
         &tenant.member.access_token,
     )
@@ -580,28 +591,26 @@ async fn ws_media_leave_broadcasts_peer_left() {
     ws2.send(Message::Text(
         serde_json::to_string(&serde_json::json!({
             "type": "media:join",
-            "data": { "conference_id": conf_id }
+            "data": { "room_id": room_id }
         }))
         .unwrap().into(),
     ))
     .await
     .unwrap();
 
-    // Read router_capabilities for user 2
-    let msg = ws2.next().await.unwrap().unwrap();
-    let parsed: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+    // Read router_capabilities for user 2 (skip room:call_* notifications)
+    let parsed = next_media_msg(&mut ws2).await;
     assert_eq!(parsed["type"], "media:router_capabilities");
 
     // Read transport_created for user 2
-    let msg = ws2.next().await.unwrap().unwrap();
-    let parsed: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+    let parsed = next_media_msg(&mut ws2).await;
     assert_eq!(parsed["type"], "media:transport_created");
 
     // User 2 sends media:leave
     ws2.send(Message::Text(
         serde_json::to_string(&serde_json::json!({
             "type": "media:leave",
-            "data": { "conference_id": conf_id }
+            "data": { "room_id": room_id }
         }))
         .unwrap().into(),
     ))
@@ -611,9 +620,8 @@ async fn ws_media_leave_broadcasts_peer_left() {
     // Give a moment for the broadcast to propagate
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    // User 1 should receive peer_left
-    let msg = ws1.next().await.unwrap().unwrap();
-    let parsed: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+    // User 1 should receive peer_left (skip room:call_* notifications)
+    let parsed = next_media_msg(&mut ws1).await;
     assert_eq!(parsed["type"], "media:peer_left");
     assert_eq!(parsed["data"]["user_id"], tenant.member.id);
 
@@ -622,27 +630,27 @@ async fn ws_media_leave_broadcasts_peer_left() {
 }
 
 #[tokio::test]
-async fn conference_leave_cleans_up_participant_media() {
+async fn call_leave_cleans_up_participant_media() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("msoup6").await;
 
     // Create + start
     let resp = app
         .auth_post(
-            &format!("/api/tenant/{}/conference", tenant.tenant_id),
+            &format!("/api/tenant/{}/room", tenant.tenant_id),
             &tenant.admin.access_token,
         )
-        .json(&serde_json::json!({ "subject": "Leave Cleanup" }))
+        .json(&serde_json::json!({ "name": "Leave Cleanup" }))
         .send()
         .await
         .unwrap();
-    let conf: Value = resp.json().await.unwrap();
-    let conf_id = conf["id"].as_str().unwrap();
+    let room: Value = resp.json().await.unwrap();
+    let room_id = room["id"].as_str().unwrap();
 
     app.auth_post(
         &format!(
-            "/api/tenant/{}/conference/{}/start",
-            tenant.tenant_id, conf_id
+            "/api/tenant/{}/room/{}/call/start",
+            tenant.tenant_id, room_id
         ),
         &tenant.admin.access_token,
     )
@@ -654,8 +662,8 @@ async fn conference_leave_cleans_up_participant_media() {
     let resp = app
         .auth_post(
             &format!(
-                "/api/tenant/{}/conference/{}/join",
-                tenant.tenant_id, conf_id
+                "/api/tenant/{}/room/{}/call/join",
+                tenant.tenant_id, room_id
             ),
             &tenant.admin.access_token,
         )
@@ -683,7 +691,7 @@ async fn conference_leave_cleans_up_participant_media() {
     ws.send(Message::Text(
         serde_json::to_string(&serde_json::json!({
             "type": "media:join",
-            "data": { "conference_id": conf_id }
+            "data": { "room_id": room_id }
         }))
         .unwrap()
         .into(),
@@ -691,21 +699,19 @@ async fn conference_leave_cleans_up_participant_media() {
     .await
     .unwrap();
 
-    // Drain router_capabilities + transport_created
-    let msg = ws.next().await.unwrap().unwrap();
-    let parsed: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+    // Drain router_capabilities + transport_created (skip room:call_* notifications)
+    let parsed = next_media_msg(&mut ws).await;
     assert_eq!(parsed["type"], "media:router_capabilities");
 
-    let msg = ws.next().await.unwrap().unwrap();
-    let parsed: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+    let parsed = next_media_msg(&mut ws).await;
     assert_eq!(parsed["type"], "media:transport_created");
 
     // Leave — should clean up transports
     let resp = app
         .auth_post(
             &format!(
-                "/api/tenant/{}/conference/{}/leave",
-                tenant.tenant_id, conf_id
+                "/api/tenant/{}/room/{}/call/leave",
+                tenant.tenant_id, room_id
             ),
             &tenant.admin.access_token,
         )
@@ -718,8 +724,8 @@ async fn conference_leave_cleans_up_participant_media() {
     let resp = app
         .auth_post(
             &format!(
-                "/api/tenant/{}/conference/{}/join",
-                tenant.tenant_id, conf_id
+                "/api/tenant/{}/room/{}/call/join",
+                tenant.tenant_id, room_id
             ),
             &tenant.admin.access_token,
         )
@@ -734,7 +740,7 @@ async fn conference_leave_cleans_up_participant_media() {
     ws.send(Message::Text(
         serde_json::to_string(&serde_json::json!({
             "type": "media:join",
-            "data": { "conference_id": conf_id }
+            "data": { "room_id": room_id }
         }))
         .unwrap()
         .into(),
@@ -742,12 +748,10 @@ async fn conference_leave_cleans_up_participant_media() {
     .await
     .unwrap();
 
-    let msg = ws.next().await.unwrap().unwrap();
-    let parsed: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+    let parsed = next_media_msg(&mut ws).await;
     assert_eq!(parsed["type"], "media:router_capabilities");
 
-    let msg = ws.next().await.unwrap().unwrap();
-    let parsed: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+    let parsed = next_media_msg(&mut ws).await;
     assert_eq!(parsed["type"], "media:transport_created", "Should get new transports after re-join");
 
     ws.close(None).await.ok();
@@ -759,18 +763,18 @@ async fn conference_leave_cleans_up_participant_media() {
 async fn transport_created_contains_udp_and_tcp_candidates() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("tcp1").await;
-    let conf_id =
-        create_and_start_conference(&app, &tenant.tenant_id, &tenant.admin.access_token, "TCP Transport Test").await;
+    let room_id =
+        create_room_and_start_call(&app, &tenant.tenant_id, &tenant.admin.access_token, "TCP Transport Test").await;
 
     app.auth_post(
-        &format!("/api/tenant/{}/conference/{}/join", tenant.tenant_id, conf_id),
+        &format!("/api/tenant/{}/room/{}/call/join", tenant.tenant_id, room_id),
         &tenant.admin.access_token,
     )
     .send()
     .await
     .unwrap();
 
-    let (mut ws, transport) = ws_join_media(&app.addr, &tenant.admin.access_token, &conf_id).await;
+    let (mut ws, transport) = ws_join_media(&app.addr, &tenant.admin.access_token, &room_id).await;
 
     // Check both send_transport and recv_transport ICE candidates
     for transport_key in &["send_transport", "recv_transport"] {
@@ -807,22 +811,23 @@ async fn transport_created_includes_turn_config() {
         s.turn.url = Some("turn:turn.example.com:3478".to_string());
         s.turn.username = Some("testuser".to_string());
         s.turn.password = Some("testpass".to_string());
+        s.turn.shared_secret = None;
         s.turn.force_relay = Some(true);
     })
     .await;
     let tenant = app.seed_tenant("turn1").await;
-    let conf_id =
-        create_and_start_conference(&app, &tenant.tenant_id, &tenant.admin.access_token, "TURN Config Test").await;
+    let room_id =
+        create_room_and_start_call(&app, &tenant.tenant_id, &tenant.admin.access_token, "TURN Config Test").await;
 
     app.auth_post(
-        &format!("/api/tenant/{}/conference/{}/join", tenant.tenant_id, conf_id),
+        &format!("/api/tenant/{}/room/{}/call/join", tenant.tenant_id, room_id),
         &tenant.admin.access_token,
     )
     .send()
     .await
     .unwrap();
 
-    let (mut ws, transport) = ws_join_media(&app.addr, &tenant.admin.access_token, &conf_id).await;
+    let (mut ws, transport) = ws_join_media(&app.addr, &tenant.admin.access_token, &room_id).await;
 
     // Verify ice_servers contains our TURN config
     let ice_servers = transport["data"]["ice_servers"]
@@ -856,18 +861,18 @@ async fn transport_created_no_turn_by_default() {
     })
     .await;
     let tenant = app.seed_tenant("noturn1").await;
-    let conf_id =
-        create_and_start_conference(&app, &tenant.tenant_id, &tenant.admin.access_token, "No TURN Test").await;
+    let room_id =
+        create_room_and_start_call(&app, &tenant.tenant_id, &tenant.admin.access_token, "No TURN Test").await;
 
     app.auth_post(
-        &format!("/api/tenant/{}/conference/{}/join", tenant.tenant_id, conf_id),
+        &format!("/api/tenant/{}/room/{}/call/join", tenant.tenant_id, room_id),
         &tenant.admin.access_token,
     )
     .send()
     .await
     .unwrap();
 
-    let (mut ws, transport) = ws_join_media(&app.addr, &tenant.admin.access_token, &conf_id).await;
+    let (mut ws, transport) = ws_join_media(&app.addr, &tenant.admin.access_token, &room_id).await;
 
     // Verify ice_servers is empty
     let ice_servers = transport["data"]["ice_servers"]
@@ -895,7 +900,7 @@ async fn transport_created_no_turn_by_default() {
 async fn ws_join_media(
     addr: &std::net::SocketAddr,
     token: &str,
-    conf_id: &str,
+    room_id: &str,
 ) -> (
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     Value,
@@ -912,7 +917,7 @@ async fn ws_join_media(
     ws.send(Message::Text(
         serde_json::to_string(&serde_json::json!({
             "type": "media:join",
-            "data": { "conference_id": conf_id }
+            "data": { "room_id": room_id }
         }))
         .unwrap()
         .into(),
@@ -920,64 +925,62 @@ async fn ws_join_media(
     .await
     .unwrap();
 
-    // Read router_capabilities
-    let msg = ws.next().await.unwrap().unwrap();
-    let parsed: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+    // Read router_capabilities (skip room:call_* notifications)
+    let parsed = next_media_msg(&mut ws).await;
     assert_eq!(parsed["type"], "media:router_capabilities");
 
     // Read transport_created
-    let msg = ws.next().await.unwrap().unwrap();
-    let transport: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+    let transport = next_media_msg(&mut ws).await;
     assert_eq!(transport["type"], "media:transport_created");
 
     (ws, transport)
 }
 
-/// Helper: create + start a conference, return conf_id.
-async fn create_and_start_conference(app: &TestApp, tenant_id: &str, token: &str, subject: &str) -> String {
+/// Helper: create a room + start a call, return room_id.
+async fn create_room_and_start_call(app: &TestApp, tenant_id: &str, token: &str, name: &str) -> String {
     let resp = app
         .auth_post(
-            &format!("/api/tenant/{}/conference", tenant_id),
+            &format!("/api/tenant/{}/room", tenant_id),
             token,
         )
-        .json(&serde_json::json!({ "subject": subject }))
+        .json(&serde_json::json!({ "name": name }))
         .send()
         .await
         .unwrap();
-    let conf: Value = resp.json().await.unwrap();
-    let conf_id = conf["id"].as_str().unwrap().to_string();
+    let room: Value = resp.json().await.unwrap();
+    let room_id = room["id"].as_str().unwrap().to_string();
 
     app.auth_post(
-        &format!("/api/tenant/{}/conference/{}/start", tenant_id, conf_id),
+        &format!("/api/tenant/{}/room/{}/call/start", tenant_id, room_id),
         token,
     )
     .send()
     .await
     .unwrap();
 
-    conf_id
+    room_id
 }
 
 #[tokio::test]
 async fn two_different_users_get_independent_transports() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("connid1").await;
-    let conf_id = create_and_start_conference(&app, &tenant.tenant_id, &tenant.admin.access_token, "ConnID Test").await;
+    let room_id = create_room_and_start_call(&app, &tenant.tenant_id, &tenant.admin.access_token, "ConnID Test").await;
 
     // Both users REST-join
     app.auth_post(
-        &format!("/api/tenant/{}/conference/{}/join", tenant.tenant_id, conf_id),
+        &format!("/api/tenant/{}/room/{}/call/join", tenant.tenant_id, room_id),
         &tenant.admin.access_token,
     ).send().await.unwrap();
 
     app.auth_post(
-        &format!("/api/tenant/{}/conference/{}/join", tenant.tenant_id, conf_id),
+        &format!("/api/tenant/{}/room/{}/call/join", tenant.tenant_id, room_id),
         &tenant.member.access_token,
     ).send().await.unwrap();
 
     // Both users WS media:join — each gets their own transports
-    let (mut ws1, t1) = ws_join_media(&app.addr, &tenant.admin.access_token, &conf_id).await;
-    let (mut ws2, t2) = ws_join_media(&app.addr, &tenant.member.access_token, &conf_id).await;
+    let (mut ws1, t1) = ws_join_media(&app.addr, &tenant.admin.access_token, &room_id).await;
+    let (mut ws2, t2) = ws_join_media(&app.addr, &tenant.member.access_token, &room_id).await;
 
     // Verify different transport IDs (proves separate connection_ids)
     let send1_id = t1["data"]["send_transport"]["id"].as_str().unwrap();
@@ -996,17 +999,17 @@ async fn two_different_users_get_independent_transports() {
 async fn same_user_two_connections_get_independent_transports() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("connid2").await;
-    let conf_id = create_and_start_conference(&app, &tenant.tenant_id, &tenant.admin.access_token, "Same User Multi-Tab").await;
+    let room_id = create_room_and_start_call(&app, &tenant.tenant_id, &tenant.admin.access_token, "Same User Multi-Tab").await;
 
     // REST join once
     app.auth_post(
-        &format!("/api/tenant/{}/conference/{}/join", tenant.tenant_id, conf_id),
+        &format!("/api/tenant/{}/room/{}/call/join", tenant.tenant_id, room_id),
         &tenant.admin.access_token,
     ).send().await.unwrap();
 
     // Same user, two WS connections, each sends media:join
-    let (mut ws1, t1) = ws_join_media(&app.addr, &tenant.admin.access_token, &conf_id).await;
-    let (mut ws2, t2) = ws_join_media(&app.addr, &tenant.admin.access_token, &conf_id).await;
+    let (mut ws1, t1) = ws_join_media(&app.addr, &tenant.admin.access_token, &room_id).await;
+    let (mut ws2, t2) = ws_join_media(&app.addr, &tenant.admin.access_token, &room_id).await;
 
     // Both should get unique transport IDs (keyed by connection_id, not user_id)
     let send1_id = t1["data"]["send_transport"]["id"].as_str().unwrap();
@@ -1021,7 +1024,7 @@ async fn same_user_two_connections_get_independent_transports() {
     ws2.close(None).await.ok();
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-    // ws1 may receive media:peer_left (ws2 left the conference) — that's expected
+    // ws1 may receive media:peer_left (ws2 left the call) — that's expected
     // Then send a ping to verify ws1 is still alive
     ws1.send(Message::Text(
         serde_json::to_string(&serde_json::json!({ "type": "ping" }))
@@ -1051,7 +1054,7 @@ async fn same_user_two_connections_get_independent_transports() {
     ws1.close(None).await.ok();
 }
 
-/// Same user, two connections in the same conference. When one sends media:leave,
+/// Same user, two connections in the same room call. When one sends media:leave,
 /// only the OTHER connection should receive peer_left — never the leaving connection.
 /// This catches the broadcast-by-user_id bug where same-user connections echo events
 /// back to themselves.
@@ -1059,7 +1062,7 @@ async fn same_user_two_connections_get_independent_transports() {
 async fn same_user_media_leave_no_self_notification() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("echo1").await;
-    let conf_id = create_and_start_conference(
+    let room_id = create_room_and_start_call(
         &app,
         &tenant.tenant_id,
         &tenant.admin.access_token,
@@ -1070,8 +1073,8 @@ async fn same_user_media_leave_no_self_notification() {
     // REST join once
     app.auth_post(
         &format!(
-            "/api/tenant/{}/conference/{}/join",
-            tenant.tenant_id, conf_id
+            "/api/tenant/{}/room/{}/call/join",
+            tenant.tenant_id, room_id
         ),
         &tenant.admin.access_token,
     )
@@ -1081,15 +1084,15 @@ async fn same_user_media_leave_no_self_notification() {
 
     // Same user, two WS connections
     let (mut ws1, _) =
-        ws_join_media(&app.addr, &tenant.admin.access_token, &conf_id).await;
+        ws_join_media(&app.addr, &tenant.admin.access_token, &room_id).await;
     let (mut ws2, _) =
-        ws_join_media(&app.addr, &tenant.admin.access_token, &conf_id).await;
+        ws_join_media(&app.addr, &tenant.admin.access_token, &room_id).await;
 
     // ws2 sends media:leave
     ws2.send(Message::Text(
         serde_json::to_string(&serde_json::json!({
             "type": "media:leave",
-            "data": { "conference_id": conf_id }
+            "data": { "room_id": room_id }
         }))
         .unwrap()
         .into(),
@@ -1137,7 +1140,7 @@ async fn same_user_media_leave_no_self_notification() {
 async fn same_user_disconnect_notifies_only_other_connections() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("echo2").await;
-    let conf_id = create_and_start_conference(
+    let room_id = create_room_and_start_call(
         &app,
         &tenant.tenant_id,
         &tenant.admin.access_token,
@@ -1147,8 +1150,8 @@ async fn same_user_disconnect_notifies_only_other_connections() {
 
     app.auth_post(
         &format!(
-            "/api/tenant/{}/conference/{}/join",
-            tenant.tenant_id, conf_id
+            "/api/tenant/{}/room/{}/call/join",
+            tenant.tenant_id, room_id
         ),
         &tenant.admin.access_token,
     )
@@ -1158,11 +1161,11 @@ async fn same_user_disconnect_notifies_only_other_connections() {
 
     // Same user, three WS connections
     let (mut ws1, _) =
-        ws_join_media(&app.addr, &tenant.admin.access_token, &conf_id).await;
+        ws_join_media(&app.addr, &tenant.admin.access_token, &room_id).await;
     let (mut ws2, _) =
-        ws_join_media(&app.addr, &tenant.admin.access_token, &conf_id).await;
+        ws_join_media(&app.addr, &tenant.admin.access_token, &room_id).await;
     let (ws3, _) =
-        ws_join_media(&app.addr, &tenant.admin.access_token, &conf_id).await;
+        ws_join_media(&app.addr, &tenant.admin.access_token, &room_id).await;
 
     // ws3 disconnects
     drop(ws3);
@@ -1217,7 +1220,7 @@ async fn same_user_disconnect_notifies_only_other_connections() {
 async fn same_user_second_connection_receives_existing_producers_with_connection_id() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("echo3").await;
-    let conf_id = create_and_start_conference(
+    let room_id = create_room_and_start_call(
         &app,
         &tenant.tenant_id,
         &tenant.admin.access_token,
@@ -1227,8 +1230,8 @@ async fn same_user_second_connection_receives_existing_producers_with_connection
 
     app.auth_post(
         &format!(
-            "/api/tenant/{}/conference/{}/join",
-            tenant.tenant_id, conf_id
+            "/api/tenant/{}/room/{}/call/join",
+            tenant.tenant_id, room_id
         ),
         &tenant.admin.access_token,
     )
@@ -1238,14 +1241,14 @@ async fn same_user_second_connection_receives_existing_producers_with_connection
 
     // ws1 joins first (no existing producers yet)
     let (mut ws1, _) =
-        ws_join_media(&app.addr, &tenant.admin.access_token, &conf_id).await;
+        ws_join_media(&app.addr, &tenant.admin.access_token, &room_id).await;
 
     // Now have a second different user join and produce (to create some producers).
     // We use the member user so there's a real producer in the room.
     app.auth_post(
         &format!(
-            "/api/tenant/{}/conference/{}/join",
-            tenant.tenant_id, conf_id
+            "/api/tenant/{}/room/{}/call/join",
+            tenant.tenant_id, room_id
         ),
         &tenant.member.access_token,
     )
@@ -1254,7 +1257,7 @@ async fn same_user_second_connection_receives_existing_producers_with_connection
     .unwrap();
 
     let (mut ws_member, _) =
-        ws_join_media(&app.addr, &tenant.member.access_token, &conf_id).await;
+        ws_join_media(&app.addr, &tenant.member.access_token, &room_id).await;
 
     // Now the admin opens a second connection (ws2). On join it should receive
     // the member's existing producers, each with a connection_id field.
@@ -1273,7 +1276,7 @@ async fn same_user_second_connection_receives_existing_producers_with_connection
     ws2.send(Message::Text(
         serde_json::to_string(&serde_json::json!({
             "type": "media:join",
-            "data": { "conference_id": conf_id }
+            "data": { "room_id": room_id }
         }))
         .unwrap()
         .into(),
@@ -1322,20 +1325,20 @@ async fn produce_with_source_field_is_accepted() {
 
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("src1").await;
-    let conf_id =
-        create_and_start_conference(&app, &tenant.tenant_id, &tenant.admin.access_token, "Source Field Test").await;
+    let room_id =
+        create_room_and_start_call(&app, &tenant.tenant_id, &tenant.admin.access_token, "Source Field Test").await;
 
     // REST join
     app.auth_post(
-        &format!("/api/tenant/{}/conference/{}/join", tenant.tenant_id, conf_id),
+        &format!("/api/tenant/{}/room/{}/call/join", tenant.tenant_id, room_id),
         &tenant.admin.access_token,
     )
     .send()
     .await
     .unwrap();
 
-    // WS join → creates transports
-    let (mut ws, _transport) = ws_join_media(&app.addr, &tenant.admin.access_token, &conf_id).await;
+    // WS join -> creates transports
+    let (mut ws, _transport) = ws_join_media(&app.addr, &tenant.admin.access_token, &room_id).await;
 
     // Send media:produce with source="screen" (will fail because transport not connected, but
     // proves the source field is accepted by the handler without parse errors)
@@ -1343,7 +1346,7 @@ async fn produce_with_source_field_is_accepted() {
         serde_json::to_string(&serde_json::json!({
             "type": "media:produce",
             "data": {
-                "conference_id": conf_id,
+                "room_id": room_id,
                 "kind": "video",
                 "rtp_parameters": {
                     "codecs": [{
@@ -1383,7 +1386,7 @@ async fn produce_with_source_field_is_accepted() {
 }
 
 /// Verify that media:produce without a source field defaults correctly
-/// (audio → "audio", video → "camera").
+/// (audio -> "audio", video -> "camera").
 #[tokio::test]
 async fn produce_without_source_field_defaults_correctly() {
     use futures::{SinkExt, StreamExt};
@@ -1391,25 +1394,25 @@ async fn produce_without_source_field_defaults_correctly() {
 
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("src2").await;
-    let conf_id =
-        create_and_start_conference(&app, &tenant.tenant_id, &tenant.admin.access_token, "Source Default Test").await;
+    let room_id =
+        create_room_and_start_call(&app, &tenant.tenant_id, &tenant.admin.access_token, "Source Default Test").await;
 
     app.auth_post(
-        &format!("/api/tenant/{}/conference/{}/join", tenant.tenant_id, conf_id),
+        &format!("/api/tenant/{}/room/{}/call/join", tenant.tenant_id, room_id),
         &tenant.admin.access_token,
     )
     .send()
     .await
     .unwrap();
 
-    let (mut ws, _) = ws_join_media(&app.addr, &tenant.admin.access_token, &conf_id).await;
+    let (mut ws, _) = ws_join_media(&app.addr, &tenant.admin.access_token, &room_id).await;
 
     // Send media:produce WITHOUT source field — should not cause any errors in parsing
     ws.send(Message::Text(
         serde_json::to_string(&serde_json::json!({
             "type": "media:produce",
             "data": {
-                "conference_id": conf_id,
+                "room_id": room_id,
                 "kind": "video",
                 "rtp_parameters": {
                     "codecs": [{
@@ -1451,18 +1454,18 @@ async fn produce_without_source_field_defaults_correctly() {
 async fn transport_created_force_relay_false_by_default_disables_relay() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("fr1").await;
-    let conf_id =
-        create_and_start_conference(&app, &tenant.tenant_id, &tenant.admin.access_token, "Force Relay Default").await;
+    let room_id =
+        create_room_and_start_call(&app, &tenant.tenant_id, &tenant.admin.access_token, "Force Relay Default").await;
 
     app.auth_post(
-        &format!("/api/tenant/{}/conference/{}/join", tenant.tenant_id, conf_id),
+        &format!("/api/tenant/{}/room/{}/call/join", tenant.tenant_id, room_id),
         &tenant.admin.access_token,
     )
     .send()
     .await
     .unwrap();
 
-    let (mut ws, transport) = ws_join_media(&app.addr, &tenant.admin.access_token, &conf_id).await;
+    let (mut ws, transport) = ws_join_media(&app.addr, &tenant.admin.access_token, &room_id).await;
 
     // Default: force_relay should be false
     assert_eq!(
@@ -1478,22 +1481,22 @@ async fn transport_created_force_relay_false_by_default_disables_relay() {
 async fn ws_disconnect_notifies_peers_with_peer_left() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("connid3").await;
-    let conf_id = create_and_start_conference(&app, &tenant.tenant_id, &tenant.admin.access_token, "Disconnect Notify").await;
+    let room_id = create_room_and_start_call(&app, &tenant.tenant_id, &tenant.admin.access_token, "Disconnect Notify").await;
 
     // Both users REST-join
     app.auth_post(
-        &format!("/api/tenant/{}/conference/{}/join", tenant.tenant_id, conf_id),
+        &format!("/api/tenant/{}/room/{}/call/join", tenant.tenant_id, room_id),
         &tenant.admin.access_token,
     ).send().await.unwrap();
 
     app.auth_post(
-        &format!("/api/tenant/{}/conference/{}/join", tenant.tenant_id, conf_id),
+        &format!("/api/tenant/{}/room/{}/call/join", tenant.tenant_id, room_id),
         &tenant.member.access_token,
     ).send().await.unwrap();
 
     // Both users WS media:join
-    let (mut ws1, _) = ws_join_media(&app.addr, &tenant.admin.access_token, &conf_id).await;
-    let (ws2, _) = ws_join_media(&app.addr, &tenant.member.access_token, &conf_id).await;
+    let (mut ws1, _) = ws_join_media(&app.addr, &tenant.admin.access_token, &room_id).await;
+    let (ws2, _) = ws_join_media(&app.addr, &tenant.member.access_token, &room_id).await;
 
     // User 2 disconnects (drops WS)
     drop(ws2);

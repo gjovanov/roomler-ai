@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
-import { useConferenceStore } from './conference'
+import { useRoomStore } from './rooms'
 import { useMessageStore } from './messages'
 import { useTaskStore } from './tasks'
 
@@ -64,7 +64,7 @@ export const useWsStore = defineStore('ws', () => {
   }
 
   function handleMessage(msg: { type: string; data?: unknown }) {
-    const conferenceStore = useConferenceStore()
+    const roomStore = useRoomStore()
     const messageStore = useMessageStore()
     const taskStore = useTaskStore()
 
@@ -90,25 +90,38 @@ export const useWsStore = defineStore('ws', () => {
       case 'message:reaction':
         messageStore.handleReactionFromWs(msg.data as never)
         break
-      case 'conference:message:create':
-        conferenceStore.addChatMessageFromWs(msg.data as never)
-        break
       case 'media:transcript':
-        conferenceStore.addTranscriptFromWs(msg.data as never)
+        roomStore.addTranscriptFromWs(msg.data as never)
         break
       case 'media:transcript_status': {
         const tsData = msg.data as { enabled?: boolean; model?: string } | undefined
         if (tsData && typeof tsData.enabled === 'boolean') {
-          conferenceStore.setTranscriptionEnabled(tsData.enabled)
+          roomStore.setTranscriptionEnabled(tsData.enabled)
         }
         if (tsData?.model === 'whisper' || tsData?.model === 'canary') {
-          conferenceStore.setSelectedTranscriptionModel(tsData.model)
+          roomStore.setSelectedTranscriptionModel(tsData.model)
         }
         break
       }
       case 'task:update':
         taskStore.updateFromWs(msg.data as never)
         break
+      case 'room:call_started': {
+        const csData = msg.data as { room_id: string; room_name: string; started_by: string }
+        roomStore.updateRoomCallStatus(csData.room_id, 'InProgress')
+        window.dispatchEvent(new CustomEvent('room:call_started', { detail: csData }))
+        break
+      }
+      case 'room:call_ended': {
+        const ceData = msg.data as { room_id: string }
+        roomStore.updateRoomCallStatus(ceData.room_id, null, 0)
+        break
+      }
+      case 'room:call_updated': {
+        const cuData = msg.data as { room_id: string; participant_count: number; conference_status: string }
+        roomStore.updateRoomCallStatus(cuData.room_id, cuData.conference_status, cuData.participant_count)
+        break
+      }
     }
   }
 
@@ -124,8 +137,8 @@ export const useWsStore = defineStore('ws', () => {
     }
   }
 
-  function sendTyping(channelId: string) {
-    send('typing:start', { channel_id: channelId })
+  function sendTyping(roomId: string) {
+    send('typing:start', { room_id: roomId })
   }
 
   /** Wait for a specific message type (one-shot). Returns the data payload. */

@@ -10,7 +10,7 @@ use roomler2_services::dao::base::PaginationParams;
 
 #[derive(Debug, Deserialize)]
 pub struct ExportConversationRequest {
-    pub channel_id: String,
+    pub room_id: String,
 }
 
 pub async fn export_conversation(
@@ -21,8 +21,8 @@ pub async fn export_conversation(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
-    let cid = ObjectId::parse_str(&body.channel_id)
-        .map_err(|_| ApiError::BadRequest("Invalid channel_id".to_string()))?;
+    let rid = ObjectId::parse_str(&body.room_id)
+        .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
     if !state.tenants.is_member(tid, auth.user_id).await? {
         return Err(ApiError::Forbidden("Not a member".to_string()));
@@ -36,7 +36,7 @@ pub async fn export_conversation(
             auth.user_id,
             "export_conversation".to_string(),
             TaskCategory::Export,
-            serde_json::json!({ "channel_id": body.channel_id }),
+            serde_json::json!({ "room_id": body.room_id }),
         )
         .await?;
 
@@ -48,10 +48,10 @@ pub async fn export_conversation(
     let task_store = Arc::clone(state.tasks.store());
 
     state.tasks.spawn_task(task_id, async move {
-        // Fetch all messages in channel (up to 10000)
+        // Fetch all messages in room (up to 10000)
         let params = PaginationParams { page: 1, per_page: 10000 };
         let result = messages_dao
-            .find_in_channel(cid, &params)
+            .find_in_room(rid, &params)
             .await
             .map_err(|e| format!("Failed to fetch messages: {}", e))?;
 

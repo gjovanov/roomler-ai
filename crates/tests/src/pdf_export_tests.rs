@@ -5,13 +5,13 @@ use serde_json::Value;
 async fn export_conversation_as_pdf() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("pdfexp").await;
-    let channel_id = tenant.channels[0].id.clone();
+    let room_id = tenant.rooms[0].id.clone();
 
-    // Admin joins channel and creates messages
+    // Admin joins room and creates messages
     app.auth_post(
         &format!(
-            "/api/tenant/{}/channel/{}/join",
-            tenant.tenant_id, channel_id
+            "/api/tenant/{}/room/{}/join",
+            tenant.tenant_id, room_id
         ),
         &tenant.admin.access_token,
     )
@@ -22,8 +22,8 @@ async fn export_conversation_as_pdf() {
     for i in 1..=2 {
         app.auth_post(
             &format!(
-                "/api/tenant/{}/channel/{}/message",
-                tenant.tenant_id, channel_id
+                "/api/tenant/{}/room/{}/message",
+                tenant.tenant_id, room_id
             ),
             &tenant.admin.access_token,
         )
@@ -41,7 +41,7 @@ async fn export_conversation_as_pdf() {
             &format!("/api/tenant/{}/export/conversation-pdf", tenant.tenant_id),
             &tenant.admin.access_token,
         )
-        .json(&serde_json::json!({ "channel_id": channel_id }))
+        .json(&serde_json::json!({ "room_id": room_id }))
         .send()
         .await
         .unwrap();
@@ -107,15 +107,18 @@ async fn export_conversation_as_pdf() {
 
 #[tokio::test]
 async fn recognize_file_returns_error_without_api_key() {
-    let app = TestApp::spawn().await;
+    let app = TestApp::spawn_with_settings(|s| {
+        s.claude.api_key = None;
+    })
+    .await;
     let tenant = app.seed_tenant("recog1").await;
-    let channel_id = tenant.channels[0].id.clone();
+    let room_id = tenant.rooms[0].id.clone();
 
-    // Admin joins channel
+    // Admin joins room
     app.auth_post(
         &format!(
-            "/api/tenant/{}/channel/{}/join",
-            tenant.tenant_id, channel_id
+            "/api/tenant/{}/room/{}/join",
+            tenant.tenant_id, room_id
         ),
         &tenant.admin.access_token,
     )
@@ -131,12 +134,12 @@ async fn recognize_file_returns_error_without_api_key() {
 
     let form = reqwest::multipart::Form::new()
         .part("file", file_part)
-        .text("channel_id", channel_id.clone());
+        .text("room_id", room_id.clone());
 
     let resp = app
         .client
         .post(app.url(&format!(
-            "/api/tenant/{}/channel/file/upload",
+            "/api/tenant/{}/file/upload",
             tenant.tenant_id
         )))
         .header(
@@ -155,7 +158,7 @@ async fn recognize_file_returns_error_without_api_key() {
     let resp = app
         .auth_post(
             &format!(
-                "/api/tenant/{}/channel/file/{}/recognize",
+                "/api/tenant/{}/file/{}/recognize",
                 tenant.tenant_id, file_id
             ),
             &tenant.admin.access_token,

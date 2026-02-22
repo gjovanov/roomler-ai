@@ -6,49 +6,66 @@ The frontend is a Vue 3 single-page application using Vuetify 3, Pinia, and Vue 
 
 ```mermaid
 graph TD
+    Landing["/landing — LandingView"]
     Login["/login — LoginView"]
     Register["/register — RegisterView"]
+    OAuthCb["/oauth/callback — OAuthCallbackView"]
+    InviteLand["/invite/:code — InviteLandingView"]
     Dashboard["/ — DashboardView"]
     TenantDash["/tenant/:tenantId — TenantDashboard"]
-    Chat["/tenant/:tenantId/channel/:channelId — ChatView"]
-    Channels["/tenant/:tenantId/channels — ChannelList"]
+    Chat["/tenant/:tenantId/room/:roomId — ChatView"]
+    Call["/tenant/:tenantId/room/:roomId/call — ConferenceView"]
+    Rooms["/tenant/:tenantId/rooms — RoomList"]
     Explore["/tenant/:tenantId/explore — ExploreView"]
-    Conference["/tenant/:tenantId/conference/:conferenceId — ConferenceView"]
     Files["/tenant/:tenantId/files — FilesBrowser"]
+    Invites["/tenant/:tenantId/invites — InviteManageView"]
     Admin["/tenant/:tenantId/admin — AdminPanel"]
+    Billing["/tenant/:tenantId/billing — BillingView"]
 
+    Landing --> Login
+    Landing --> Register
     Login --> Dashboard
     Register --> Dashboard
+    OAuthCb --> Dashboard
+    InviteLand --> Dashboard
     Dashboard --> TenantDash
     TenantDash --> Chat
-    TenantDash --> Channels
+    TenantDash --> Rooms
     TenantDash --> Explore
-    TenantDash --> Conference
     TenantDash --> Files
+    Chat --> Call
+    TenantDash --> Invites
     TenantDash --> Admin
+    TenantDash --> Billing
 ```
 
 ## Routes
 
 | Path | Name | Component | Auth | Description |
 |------|------|-----------|------|-------------|
+| `/landing` | `landing` | `LandingView` | Guest | Landing page |
+| `/pricing` | `pricing` | `LandingView` | Guest | Pricing (same component) |
 | `/login` | `login` | `LoginView` | Guest | Login page |
 | `/register` | `register` | `RegisterView` | Guest | Registration page |
+| `/oauth/callback` | `oauth-callback` | `OAuthCallbackView` | Guest | OAuth callback handler |
+| `/invite/:code` | `invite` | `InviteLandingView` | — | Invite landing page |
 | `/` | `dashboard` | `DashboardView` | Yes | Global dashboard (tenant list) |
 | `/tenant/:tenantId` | `tenant-dashboard` | `TenantDashboard` | Yes | Tenant-specific dashboard |
-| `/tenant/:tenantId/channel/:channelId` | `channel-chat` | `ChatView` | Yes | Channel chat view |
-| `/tenant/:tenantId/channels` | `channels` | `ChannelList` | Yes | Channel browser |
-| `/tenant/:tenantId/explore` | `explore` | `ExploreView` | Yes | Explore public channels |
-| `/tenant/:tenantId/conference/:conferenceId` | `conference` | `ConferenceView` | Yes | Video conference |
+| `/tenant/:tenantId/room/:roomId` | `room-chat` | `ChatView` | Yes | Room chat view |
+| `/tenant/:tenantId/room/:roomId/call` | `room-call` | `ConferenceView` | Yes | Video call in room |
+| `/tenant/:tenantId/rooms` | `rooms` | `RoomList` | Yes | Room browser |
+| `/tenant/:tenantId/explore` | `explore` | `ExploreView` | Yes | Explore public rooms |
 | `/tenant/:tenantId/files` | `files` | `FilesBrowser` | Yes | File manager |
+| `/tenant/:tenantId/invites` | `invites` | `InviteManageView` | Yes | Manage invites |
 | `/tenant/:tenantId/admin` | `admin` | `AdminPanel` | Yes | Tenant admin panel |
+| `/tenant/:tenantId/billing` | `billing` | `BillingView` | Yes | Billing & subscription |
 
-Auth guard: authenticated routes redirect to `/login` if no `access_token` in localStorage. Guest routes redirect to `/` if token exists.
+Auth guard: authenticated routes redirect to `/landing` if no `access_token` in localStorage. Guest routes redirect to `/` if token exists.
 
 ## Layout
 
 All authenticated routes are wrapped in `AppLayout.vue`, which provides:
-- Navigation sidebar (channel tree, tenant selector)
+- Navigation sidebar (room tree, tenant selector)
 - Top toolbar
 - Main content area
 
@@ -72,26 +89,39 @@ All authenticated routes are wrapped in `AppLayout.vue`, which provides:
 
 | View | File | Description |
 |------|------|-------------|
-| ChatView | `views/chat/ChatView.vue` | Message list, input, threads |
+| ChatView | `views/chat/ChatView.vue` | Message list, input, threads, Start Call / Join Call button |
 
-### Channels
+### Rooms
 
 | View | File | Description |
 |------|------|-------------|
-| ChannelList | `views/channels/ChannelList.vue` | Browse joined channels |
-| ExploreView | `views/channels/ExploreView.vue` | Discover and join public channels |
+| RoomList | `views/rooms/RoomList.vue` | Browse joined rooms, create rooms with parent selector |
+| ExploreView | `views/rooms/ExploreView.vue` | Discover and join public rooms |
 
 ### Conference
 
 | View | File | Description |
 |------|------|-------------|
-| ConferenceView | `views/conference/ConferenceView.vue` | Video conference room |
+| ConferenceView | `views/conference/ConferenceView.vue` | Video call in a room (start/join from chat or dashboard) |
 
 ### Files
 
 | View | File | Description |
 |------|------|-------------|
 | FilesBrowser | `views/files/FilesBrowser.vue` | Upload, browse, download files |
+
+### Invites
+
+| View | File | Description |
+|------|------|-------------|
+| InviteLandingView | `views/invite/InviteLandingView.vue` | Public invite acceptance page |
+| InviteManageView | `views/invite/InviteManageView.vue` | Manage tenant invites |
+
+### Billing
+
+| View | File | Description |
+|------|------|-------------|
+| BillingView | `views/billing/BillingView.vue` | Stripe billing & subscription management |
 
 ### Admin
 
@@ -103,9 +133,16 @@ All authenticated routes are wrapped in `AppLayout.vue`, which provides:
 
 | Component | File | Description |
 |-----------|------|-------------|
-| AppLayout | `components/layout/AppLayout.vue` | Main layout wrapper (sidebar + toolbar) |
+| AppLayout | `components/layout/AppLayout.vue` | Main layout wrapper (sidebar + toolbar + call notification snackbar) |
 | MessageBubble | `components/chat/MessageBubble.vue` | Single message display with reactions, attachments |
-| ChannelTreeItem | `components/channels/ChannelTreeItem.vue` | Recursive tree node for channel hierarchy |
+| MessageEditor | `components/chat/MessageEditor.vue` | Rich message input with emoji/GIF pickers |
+| EmojiPicker | `components/chat/EmojiPicker.vue` | Emoji picker component |
+| GiphyPicker | `components/chat/GiphyPicker.vue` | GIF picker (Giphy integration) |
+| RoomTreeItem | `components/rooms/RoomTreeItem.vue` | Recursive tree node for room hierarchy with context menu and call indicator |
+| VideoTile | `components/conference/VideoTile.vue` | Video participant tile in call view |
+| LayoutSwitcher | `components/conference/LayoutSwitcher.vue` | Conference layout mode switcher |
+| TranscriptPanel | `components/conference/TranscriptPanel.vue` | Live transcription panel |
+| ConferenceFilesPanel | `components/conference/ConferenceFilesPanel.vue` | File sharing panel in calls |
 | ConfirmDialog | `components/common/ConfirmDialog.vue` | Reusable confirmation dialog |
 
 ## Pinia Stores
@@ -116,12 +153,12 @@ All authenticated routes are wrapped in `AppLayout.vue`, which provides:
 |-------|------|-------|-------------|
 | `auth` | `stores/auth.ts` | User profile, tokens | `login`, `register`, `logout`, `refresh`, `fetchMe` |
 | `tenant` | `stores/tenant.ts` | Tenant list, current tenant | `fetchTenants`, `createTenant`, `setCurrentTenant` |
-| `channels` | `stores/channels.ts` | Channel list, current channel | `fetchChannels`, `createChannel`, `joinChannel`, `leaveChannel` |
+| `rooms` | `stores/rooms.ts` | Room list, current room | `fetchRooms`, `createRoom`, `joinRoom`, `leaveRoom`, `updateRoomCallStatus` |
 | `messages` | `stores/messages.ts` | Message list, threads | `fetchMessages`, `sendMessage`, `editMessage`, `deleteMessage`, `togglePin` |
-| `conference` | `stores/conference.ts` | Conference state, participants | `createConference`, `startConference`, `joinConference`, `leaveConference` |
 | `files` | `stores/files.ts` | File list | `uploadFile`, `fetchFiles`, `deleteFile`, `recognizeFile` |
+| `invite` | `stores/invite.ts` | Invite list | `fetchInvites`, `createInvite`, `revokeInvite`, `acceptInvite` |
 | `tasks` | `stores/tasks.ts` | Background task list | `fetchTasks`, `pollTask`, `downloadTaskOutput` |
-| `ws` | `stores/ws.ts` | WebSocket connection state | `connect`, `disconnect`, `send`, message handlers |
+| `ws` | `stores/ws.ts` | WebSocket connection state | `connect`, `disconnect`, `send`, message handlers for room:call_* events |
 
 ## Composables
 
@@ -129,13 +166,19 @@ All authenticated routes are wrapped in `AppLayout.vue`, which provides:
 |------------|------|-------------|
 | `useAuth` | `composables/useAuth.ts` | Auth state and guards for components |
 | `useWebSocket` | `composables/useWebSocket.ts` | WebSocket lifecycle management |
+| `useMediasoup` | `composables/useMediasoup.ts` | mediasoup-client WebRTC device management |
+| `useConferenceLayout` | `composables/useConferenceLayout.ts` | Conference view layout modes |
+| `useActiveSpeaker` | `composables/useActiveSpeaker.ts` | Active speaker detection |
+| `usePictureInPicture` | `composables/usePictureInPicture.ts` | Picture-in-picture video support |
+| `useMarkdown` | `composables/useMarkdown.ts` | Markdown rendering |
+| `useAudioPlayback` | `composables/useAudioPlayback.ts` | Audio playback for recordings |
 
 ## Build
 
 ```bash
 cd ui
-npm install
-npm run dev       # Development server (Vite)
-npm run build     # Production build (vue-tsc + vite build)
-npm run preview   # Preview production build
+bun install
+bun run dev       # Development server (Vite)
+bun run build     # Production build (vue-tsc + vite build)
+bun run preview   # Preview production build
 ```

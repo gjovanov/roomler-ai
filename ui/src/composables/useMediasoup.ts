@@ -21,7 +21,7 @@ export function useMediasoup() {
   const isMuted = ref(false)
   const isVideoOn = ref(true)
   const isScreenSharing = ref(false)
-  const conferenceId = ref<string | null>(null)
+  const currentRoomId = ref<string | null>(null)
 
   let screenProducerId: string | null = null
   // Serialize consumeProducer calls — pendingWaiters only holds one waiter per message type,
@@ -33,9 +33,9 @@ export function useMediasoup() {
   const ws = useWsStore()
 
   /** Join a mediasoup room: loads device, creates transports */
-  async function joinRoom(confId: string) {
-    conferenceId.value = confId
-    console.log('[mediasoup] joinRoom:', confId)
+  async function joinRoom(roomId: string) {
+    currentRoomId.value = roomId
+    console.log('[mediasoup] joinRoom:', roomId)
 
     // Register handlers FIRST so no messages are dropped while awaiting transports.
     // Buffer any new_producer messages that arrive before transports are ready.
@@ -51,7 +51,7 @@ export function useMediasoup() {
     const capabilitiesPromise = ws.waitForMessage('media:router_capabilities')
     const transportPromise = ws.waitForMessage('media:transport_created')
 
-    ws.send('media:join', { conference_id: confId })
+    ws.send('media:join', { room_id: roomId })
 
     const capsMsg = await capabilitiesPromise
     console.log('[mediasoup] got router_capabilities')
@@ -64,16 +64,19 @@ export function useMediasoup() {
     device.value = dev
     console.log('[mediasoup] device loaded')
 
-    // Build iceServers from TURN config (if provided by server)
-    const iceServers = transportMsg.ice_servers?.length
+    // Build iceServers from TURN config — only when force_relay is true.
+    // With force_relay=false, direct host candidates are used and adding a remote
+    // TURN server can interfere with ICE gathering (unreachable relay allocation).
+    const forceRelay = !!transportMsg.force_relay
+    const iceServers = forceRelay && transportMsg.ice_servers?.length
       ? transportMsg.ice_servers.map((s: { urls: string[]; username: string; credential: string }) => ({
           urls: s.urls,
           username: s.username,
           credential: s.credential,
         }))
       : undefined
-    const iceTransportPolicy = transportMsg.force_relay ? 'relay' : 'all'
-    console.log('[mediasoup] ICE config:', { iceServers, iceTransportPolicy, force_relay: transportMsg.force_relay })
+    const iceTransportPolicy = forceRelay ? 'relay' : 'all'
+    console.log('[mediasoup] ICE config:', { iceServers, iceTransportPolicy, force_relay: forceRelay })
 
     // Log ICE candidate details from server
     for (const label of ['send_transport', 'recv_transport'] as const) {
@@ -118,7 +121,7 @@ export function useMediasoup() {
 
     st.on('connect', ({ dtlsParameters }, callback, errback) => {
       ws.send('media:connect_transport', {
-        conference_id: confId,
+        room_id: roomId,
         transport_id: st.id,
         dtls_parameters: dtlsParameters,
       })
@@ -130,7 +133,7 @@ export function useMediasoup() {
       try {
         const resultPromise = ws.waitForMessage('media:produce_result')
         ws.send('media:produce', {
-          conference_id: confId,
+          room_id: roomId,
           kind,
           rtp_parameters: rtpParameters,
           source: appData?.source || (kind === 'audio' ? 'audio' : 'camera'),
@@ -171,7 +174,7 @@ export function useMediasoup() {
 
     rt.on('connect', ({ dtlsParameters }, callback, errback) => {
       ws.send('media:connect_transport', {
-        conference_id: confId,
+        room_id: roomId,
         transport_id: rt.id,
         dtls_parameters: dtlsParameters,
       })
@@ -234,7 +237,7 @@ export function useMediasoup() {
     console.log('[mediasoup] consumeProducer:', producerId, 'from user:', userId, 'conn:', connectionId, 'source:', source)
     const resultPromise = ws.waitForMessage('media:consumer_created')
     ws.send('media:consume', {
-      conference_id: conferenceId.value,
+      room_id: currentRoomId.value,
       producer_id: producerId,
       rtp_capabilities: device.value.rtpCapabilities,
     })
@@ -389,9 +392,9 @@ export function useMediasoup() {
       producers.delete('screen')
 
       // Notify server
-      if (conferenceId.value && screenProducerId) {
+      if (currentRoomId.value && screenProducerId) {
         ws.send('media:producer_close', {
-          conference_id: conferenceId.value,
+          room_id: currentRoomId.value,
           producer_id: screenProducerId,
         })
       }
@@ -402,8 +405,8 @@ export function useMediasoup() {
 
   /** Leave the mediasoup room */
   function leaveRoom() {
-    if (conferenceId.value) {
-      ws.send('media:leave', { conference_id: conferenceId.value })
+    if (currentRoomId.value) {
+      ws.send('media:leave', { room_id: currentRoomId.value })
     }
 
     // Close all producers
@@ -433,7 +436,7 @@ export function useMediasoup() {
 
     remoteStreams.clear()
     device.value = null
-    conferenceId.value = null
+    currentRoomId.value = null
     isMuted.value = false
     isVideoOn.value = true
     isScreenSharing.value = false
@@ -458,7 +461,7 @@ export function useMediasoup() {
     isMuted,
     isVideoOn,
     isScreenSharing,
-    conferenceId,
+    roomId: currentRoomId,
     joinRoom,
     produceLocalMedia,
     leaveRoom,

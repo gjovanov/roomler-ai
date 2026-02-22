@@ -76,21 +76,50 @@
     <v-main>
       <router-view />
     </v-main>
+
+    <!-- Call started notification -->
+    <v-snackbar v-model="callSnackbar" :timeout="8000" color="success" location="top right">
+      {{ callSnackbarText }}
+      <template #actions>
+        <v-btn variant="text" @click="joinCallFromSnackbar">Join</v-btn>
+        <v-btn variant="text" icon="mdi-close" @click="callSnackbar = false" />
+      </template>
+    </v-snackbar>
   </v-app>
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
-import { useRoute } from 'vue-router'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { useAuth } from '@/composables/useAuth'
 import { useTenantStore } from '@/stores/tenant'
 
 const { auth, logout: handleLogout } = useAuth()
 const tenantStore = useTenantStore()
 const route = useRoute()
+const router = useRouter()
 
 const drawer = ref(true)
 const rail = ref(false)
+
+// Call notification snackbar
+const callSnackbar = ref(false)
+const callSnackbarText = ref('')
+const callSnackbarRoomId = ref('')
+
+function onCallStarted(e: Event) {
+  const detail = (e as CustomEvent).detail as { room_id: string; room_name: string }
+  callSnackbarText.value = `Call started in ${detail.room_name}`
+  callSnackbarRoomId.value = detail.room_id
+  callSnackbar.value = true
+}
+
+function joinCallFromSnackbar() {
+  callSnackbar.value = false
+  if (tenantId.value && callSnackbarRoomId.value) {
+    router.push({ name: 'room-call', params: { tenantId: tenantId.value, roomId: callSnackbarRoomId.value } })
+  }
+}
 
 const tenantId = computed(() => tenantStore.current?.id || '')
 
@@ -99,8 +128,7 @@ const navItems = computed(() => {
   const base = `/tenant/${tenantId.value}`
   return [
     { icon: 'mdi-view-dashboard', title: 'Dashboard', to: base },
-    { icon: 'mdi-pound', title: 'Channels', to: `${base}/channels` },
-    { icon: 'mdi-video', title: 'Conferences', to: `${base}/conferences` },
+    { icon: 'mdi-pound', title: 'Rooms', to: `${base}/rooms` },
     { icon: 'mdi-compass', title: 'Explore', to: `${base}/explore` },
     { icon: 'mdi-folder', title: 'Files', to: `${base}/files` },
     { icon: 'mdi-account-plus', title: 'Invites', to: `${base}/invites` },
@@ -114,8 +142,8 @@ const settingsRoute = computed(() =>
 
 const pageTitle = computed(() => {
   const name = route.name as string
-  if (name === 'channel-chat') return 'Chat'
-  if (name === 'conference') return 'Meeting'
+  if (name === 'room-chat') return 'Chat'
+  if (name === 'room-call') return 'Call'
   return (route.meta.title as string) || 'Roomler'
 })
 
@@ -136,5 +164,10 @@ function selectTenant(t: Tenant) {
 
 onMounted(() => {
   tenantStore.fetchTenants()
+  window.addEventListener('room:call_started', onCallStarted)
+})
+
+onUnmounted(() => {
+  window.removeEventListener('room:call_started', onCallStarted)
 })
 </script>

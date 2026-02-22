@@ -37,17 +37,21 @@ Browser                                     Axum Server
 |------|---------|-------------|
 | `connected` | `{ user_id }` | Connection established confirmation |
 | `pong` | `{}` | Response to client ping |
-| `typing:start` | `{ channel_id, user_id }` | User started typing in channel |
-| `typing:stop` | `{ channel_id, user_id }` | User stopped typing in channel |
+| `typing:start` | `{ room_id, user_id }` | User started typing in room |
+| `typing:stop` | `{ room_id, user_id }` | User stopped typing in room |
 | `presence:update` | `{ user_id, presence }` | User presence changed |
+| `room:call_started` | `{ room_id, room_name, started_by }` | A call was started in a room |
+| `room:call_updated` | `{ room_id, participant_count, conference_status }` | Call participant count changed |
+| `room:call_ended` | `{ room_id }` | Call ended in a room |
+| `call:message:create` | `{ room_id, message }` | New in-call chat message |
 
 ### Client → Server
 
 | Type | Payload | Description |
 |------|---------|-------------|
 | `ping` | `{}` | Application-level keepalive |
-| `typing:start` | `{ channel_id }` | Notify channel members of typing |
-| `typing:stop` | `{ channel_id }` | Notify channel members typing stopped |
+| `typing:start` | `{ room_id }` | Notify room members of typing |
+| `typing:stop` | `{ room_id }` | Notify room members typing stopped |
 | `presence:update` | `{ presence }` | Update own presence status |
 
 All messages are JSON:
@@ -56,7 +60,7 @@ All messages are JSON:
 {
   "type": "typing:start",
   "data": {
-    "channel_id": "6..."
+    "room_id": "6..."
   }
 }
 ```
@@ -97,10 +101,14 @@ The dispatcher sends messages at three levels:
 
 | Event | Recipients | Targeting |
 |-------|-----------|-----------|
-| `typing:start` / `typing:stop` | All members of the channel **except** the sender | User-level |
+| `typing:start` / `typing:stop` | All members of the room **except** the sender | User-level |
 | `presence:update` | All connected users | User-level |
 | `pong` | Only the sender | User-level |
-| `message:create` | All members of the channel **except** the sender | User-level |
+| `message:create` | All members of the room **except** the sender | User-level |
+| `room:call_started` | All members of the room | User-level |
+| `room:call_updated` | All members of the room | User-level |
+| `room:call_ended` | All members of the room | User-level |
+| `call:message:create` | All members of the room | User-level |
 | `media:router_capabilities` | Only the requesting connection | Connection-level |
 | `media:transport_created` | Only the requesting connection | Connection-level |
 | `media:produce_result` | Only the producing connection | Connection-level |
@@ -109,7 +117,7 @@ The dispatcher sends messages at three levels:
 | `media:peer_left` | All remaining participants | User-level |
 | `media:producer_closed` | All participants except the producer | User-level |
 
-For typing indicators, the server looks up channel member IDs and broadcasts to all members except the typing user. For presence, the update goes to all connected users. For message creation, the sender is excluded from broadcast to prevent duplicate display (the sender already has the message from the HTTP response).
+For typing indicators, the server looks up room member IDs and broadcasts to all room members except the typing user. For presence, the update goes to all connected users. For message creation, the sender is excluded from broadcast to prevent duplicate display (the sender already has the message from the HTTP response).
 
 ## Presence
 
@@ -176,12 +184,12 @@ The server generates a unique `connection_id` for each WebSocket connection at c
 ```
 Browser                             Server (Axum + mediasoup)
   │                                       │
-  │  HTTP POST /conference/{id}/start     │  (creates Router)
-  │  HTTP POST /conference/{id}/join      │  (DB participant record)
+  │  HTTP POST /room/{id}/call/start      │  (creates Router)
+  │  HTTP POST /room/{id}/call/join       │  (DB participant record)
   │                                       │
-  │  WS: media:join {conference_id}       │
+  │  WS: media:join {room_id}             │
   ├──────────────────────────────────────►│
-  │                                       │  create_transports(conf, user, connection_id)
+  │                                       │  create_transports(room, user, connection_id)
   │  WS: media:router_capabilities        │  (connection-targeted)
   │◄──────────────────────────────────────┤
   │  WS: media:transport_created          │  (connection-targeted)
@@ -204,7 +212,7 @@ Browser                             Server (Axum + mediasoup)
   │◄──────────────────────────────────────┤
   │                                       │
   │  WS: media:leave                      │
-  ├──────────────────────────────────────►│  close_participant(conf, connection_id)
+  ├──────────────────────────────────────►│  close_participant(room, connection_id)
   │                                       │  broadcast media:peer_left to peers
 ```
 

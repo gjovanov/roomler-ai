@@ -85,6 +85,7 @@ pub struct TurnSettings {
     pub url: Option<String>,
     pub username: Option<String>,
     pub password: Option<String>,
+    pub shared_secret: Option<String>,
     pub force_relay: Option<bool>,
 }
 
@@ -124,6 +125,8 @@ pub struct TranscriptionSettings {
     pub max_speech_duration_secs: f64,
     pub nim_endpoint: Option<String>,
     pub onnx_model_path: Option<String>,
+    pub nim_model: Option<String>,
+    pub streaming_partial_interval_ms: u64,
 }
 
 impl Settings {
@@ -180,8 +183,8 @@ impl Settings {
             .set_default("stripe.price_business", "")?
             .set_default("giphy.api_key", "")?
             .set_default("transcription.enabled", false)?
-            .set_default("transcription.backend", "local_whisper")?
-            .set_default("transcription.whisper_model_path", "models/ggml-base.en.bin")?
+            .set_default("transcription.backend", "local_onnx")?
+            .set_default("transcription.whisper_model_path", "models/ggml-small.bin")?
             .set_default("transcription.onnx_model_path", "models/canary-1b-v2")?
             .set_default("transcription.vad_model_path", "models/silero_vad.onnx")?
             .set_default("transcription.vad_start_threshold", 0.5)?
@@ -190,6 +193,7 @@ impl Settings {
             .set_default("transcription.vad_min_silence_frames", 15)?
             .set_default("transcription.vad_pre_speech_pad_frames", 10)?
             .set_default("transcription.max_speech_duration_secs", 30.0)?
+            .set_default("transcription.streaming_partial_interval_ms", 500)?
             .build()?;
 
         config.try_deserialize()

@@ -18,7 +18,7 @@ impl TranscriptionDao {
     pub async fn create(
         &self,
         tenant_id: ObjectId,
-        conference_id: ObjectId,
+        room_id: ObjectId,
         recording_id: Option<ObjectId>,
         language: String,
     ) -> DaoResult<models::Transcription> {
@@ -26,7 +26,7 @@ impl TranscriptionDao {
         let transcription = models::Transcription {
             id: None,
             tenant_id,
-            conference_id,
+            room_id,
             recording_id,
             status: TranscriptionStatus::Processing,
             language,
@@ -43,14 +43,14 @@ impl TranscriptionDao {
         self.base.find_by_id(id).await
     }
 
-    pub async fn find_by_conference(
+    pub async fn find_by_room(
         &self,
-        conference_id: ObjectId,
+        room_id: ObjectId,
         params: &PaginationParams,
     ) -> DaoResult<PaginatedResult<models::Transcription>> {
         self.base
             .find_paginated(
-                doc! { "conference_id": conference_id },
+                doc! { "room_id": room_id },
                 Some(doc! { "created_at": -1 }),
                 params,
             )

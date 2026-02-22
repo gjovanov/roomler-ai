@@ -6,7 +6,7 @@ pub struct Message {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
     pub id: Option<ObjectId>,
     pub tenant_id: ObjectId,
-    pub channel_id: ObjectId,
+    pub room_id: ObjectId,
     pub thread_id: Option<ObjectId>,
     #[serde(default)]
     pub is_thread_root: bool,
@@ -115,7 +115,7 @@ pub struct Mentions {
     #[serde(default)]
     pub roles: Vec<ObjectId>,
     #[serde(default)]
-    pub channels: Vec<ObjectId>,
+    pub rooms: Vec<ObjectId>,
     #[serde(default)]
     pub everyone: bool,
     #[serde(default)]

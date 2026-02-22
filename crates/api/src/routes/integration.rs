@@ -115,7 +115,7 @@ pub async fn recognize_file(
 /// Export conversation as PDF (background task).
 #[derive(Debug, Deserialize)]
 pub struct ExportPdfRequest {
-    pub channel_id: String,
+    pub room_id: String,
 }
 
 pub async fn export_conversation_pdf(
@@ -126,8 +126,8 @@ pub async fn export_conversation_pdf(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
-    let cid = ObjectId::parse_str(&body.channel_id)
-        .map_err(|_| ApiError::BadRequest("Invalid channel_id".to_string()))?;
+    let rid = ObjectId::parse_str(&body.room_id)
+        .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
     if !state.tenants.is_member(tid, auth.user_id).await? {
         return Err(ApiError::Forbidden("Not a member".to_string()));
@@ -140,7 +140,7 @@ pub async fn export_conversation_pdf(
             auth.user_id,
             "export_conversation_pdf".to_string(),
             TaskCategory::Export,
-            serde_json::json!({ "channel_id": body.channel_id, "format": "pdf" }),
+            serde_json::json!({ "room_id": body.room_id, "format": "pdf" }),
         )
         .await?;
 
@@ -155,7 +155,7 @@ pub async fn export_conversation_pdf(
             per_page: 10000,
         };
         let result = messages_dao
-            .find_in_channel(cid, &params)
+            .find_in_room(rid, &params)
             .await
             .map_err(|e| format!("Failed to fetch messages: {}", e))?;
 

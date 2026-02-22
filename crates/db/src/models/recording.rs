@@ -6,7 +6,7 @@ pub struct Recording {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
     pub id: Option<ObjectId>,
     pub tenant_id: ObjectId,
-    pub conference_id: ObjectId,
+    pub room_id: ObjectId,
     pub recording_type: RecordingType,
     pub status: RecordingStatus,
     pub file: StorageFile,

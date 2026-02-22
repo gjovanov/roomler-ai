@@ -12,7 +12,7 @@ test.describe('Chat', () => {
   let user: ReturnType<typeof uniqueUser>
   let token: string
   let tenantId: string
-  let channelId: string
+  let roomId: string
 
   test.beforeEach(async ({ page }) => {
     user = uniqueUser()
@@ -21,20 +21,20 @@ test.describe('Chat', () => {
     const tenant = await createTenantViaApi(token, 'Chat Org', `chat-${Date.now()}`)
     tenantId = tenant.id
 
-    // Create a channel via API
-    const resp = await fetch(`${API_URL}/api/tenant/${tenantId}/channel`, {
+    // Create a room via API
+    const resp = await fetch(`${API_URL}/api/tenant/${tenantId}/room`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${token}`,
       },
-      body: JSON.stringify({ name: 'general', channel_type: 'text' }),
+      body: JSON.stringify({ name: 'general', is_open: true }),
     })
-    const channel = (await resp.json()) as { id: string }
-    channelId = channel.id
+    const room = (await resp.json()) as { id: string }
+    roomId = room.id
 
-    // Join channel
-    await fetch(`${API_URL}/api/tenant/${tenantId}/channel/${channelId}/join`, {
+    // Join room
+    await fetch(`${API_URL}/api/tenant/${tenantId}/room/${roomId}/join`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${token}` },
     })
@@ -43,12 +43,12 @@ test.describe('Chat', () => {
   })
 
   test('chat view loads with empty state', async ({ page }) => {
-    await page.goto(`/tenant/${tenantId}/channel/${channelId}`)
+    await page.goto(`/tenant/${tenantId}/room/${roomId}`)
     await expect(page.getByText(/no messages/i)).toBeVisible({ timeout: 10000 })
   })
 
   test('message input is visible and functional', async ({ page }) => {
-    await page.goto(`/tenant/${tenantId}/channel/${channelId}`)
+    await page.goto(`/tenant/${tenantId}/room/${roomId}`)
     const input = page.getByPlaceholder(/type a message/i)
     await expect(input).toBeVisible({ timeout: 10000 })
     await input.fill('Hello from E2E!')

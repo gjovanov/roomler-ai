@@ -3,16 +3,16 @@ import {
   uniqueUser,
   registerUserViaApi,
   createTenantViaApi,
+  createRoomViaApi,
+  startCallViaApi,
   loginViaUi,
 } from './fixtures/test-helpers'
 
-const API_URL = process.env.E2E_API_URL || 'http://localhost:5001'
-
-test.describe('Conference', () => {
+test.describe('Room Call', () => {
   let user: ReturnType<typeof uniqueUser>
   let token: string
   let tenantId: string
-  let conferenceId: string
+  let roomId: string
 
   test.beforeEach(async ({ page }) => {
     user = uniqueUser()
@@ -21,44 +21,33 @@ test.describe('Conference', () => {
     const tenant = await createTenantViaApi(token, 'Conf Org', `conf-${Date.now()}`)
     tenantId = tenant.id
 
-    // Create a conference via API
-    const resp = await fetch(`${API_URL}/api/tenant/${tenantId}/conference`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify({ subject: 'E2E Meeting' }),
-    })
-    const conf = (await resp.json()) as { id: string }
-    conferenceId = conf.id
+    // Create a room via API
+    const room = await createRoomViaApi(token, tenantId, 'E2E Meeting')
+    roomId = room.id
 
     await loginViaUi(page, user.username, user.password)
   })
 
-  test('conference view loads with join button', async ({ page }) => {
-    await page.goto(`/tenant/${tenantId}/conference/${conferenceId}`)
+  test('room call view loads with join button', async ({ page }) => {
+    await page.goto(`/tenant/${tenantId}/room/${roomId}/call`)
     await expect(page.getByText(/ready to join/i)).toBeVisible({ timeout: 10000 })
     await expect(page.getByRole('button', { name: /join/i })).toBeVisible()
   })
 
-  test('conference view shows meeting subject', async ({ page }) => {
-    await page.goto(`/tenant/${tenantId}/conference/${conferenceId}`)
+  test('room call view shows meeting subject', async ({ page }) => {
+    await page.goto(`/tenant/${tenantId}/room/${roomId}/call`)
     // The toolbar should show the subject once loaded
     await expect(page.getByText(/meeting/i).first()).toBeVisible({ timeout: 10000 })
   })
 
-  test('join conference shows local video', async ({ page, context }) => {
+  test('join call shows local video', async ({ page, context }) => {
     // Grant camera/mic permissions
     await context.grantPermissions(['camera', 'microphone'])
 
-    // Start conference via API first
-    await fetch(`${API_URL}/api/tenant/${tenantId}/conference/${conferenceId}/start`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}` },
-    })
+    // Start call via API first
+    await startCallViaApi(token, tenantId, roomId)
 
-    await page.goto(`/tenant/${tenantId}/conference/${conferenceId}`)
+    await page.goto(`/tenant/${tenantId}/room/${roomId}/call`)
     await expect(page.getByRole('button', { name: /join/i })).toBeVisible({ timeout: 10000 })
 
     // Click join
@@ -71,12 +60,9 @@ test.describe('Conference', () => {
   test('mute/unmute toggles audio icon', async ({ page, context }) => {
     await context.grantPermissions(['camera', 'microphone'])
 
-    await fetch(`${API_URL}/api/tenant/${tenantId}/conference/${conferenceId}/start`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}` },
-    })
+    await startCallViaApi(token, tenantId, roomId)
 
-    await page.goto(`/tenant/${tenantId}/conference/${conferenceId}`)
+    await page.goto(`/tenant/${tenantId}/room/${roomId}/call`)
     await page.getByRole('button', { name: /join/i }).click()
     await expect(page.getByText('You')).toBeVisible({ timeout: 15000 })
 
@@ -91,12 +77,9 @@ test.describe('Conference', () => {
   test('camera toggle changes icon', async ({ page, context }) => {
     await context.grantPermissions(['camera', 'microphone'])
 
-    await fetch(`${API_URL}/api/tenant/${tenantId}/conference/${conferenceId}/start`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}` },
-    })
+    await startCallViaApi(token, tenantId, roomId)
 
-    await page.goto(`/tenant/${tenantId}/conference/${conferenceId}`)
+    await page.goto(`/tenant/${tenantId}/room/${roomId}/call`)
     await page.getByRole('button', { name: /join/i }).click()
     await expect(page.getByText('You')).toBeVisible({ timeout: 15000 })
 
@@ -108,15 +91,12 @@ test.describe('Conference', () => {
     await expect(page.locator('.mdi-video-off').first()).toBeVisible({ timeout: 5000 })
   })
 
-  test('leave conference returns to dashboard', async ({ page, context }) => {
+  test('leave call returns to dashboard', async ({ page, context }) => {
     await context.grantPermissions(['camera', 'microphone'])
 
-    await fetch(`${API_URL}/api/tenant/${tenantId}/conference/${conferenceId}/start`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}` },
-    })
+    await startCallViaApi(token, tenantId, roomId)
 
-    await page.goto(`/tenant/${tenantId}/conference/${conferenceId}`)
+    await page.goto(`/tenant/${tenantId}/room/${roomId}/call`)
     await page.getByRole('button', { name: /join/i }).click()
     await expect(page.getByText('You')).toBeVisible({ timeout: 15000 })
 

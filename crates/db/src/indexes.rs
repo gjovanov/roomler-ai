@@ -46,25 +46,26 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> 
     )
     .await?;
 
-    // Channels
+    // Rooms
     create_indexes(
         db,
-        "channels",
+        "rooms",
         vec![
             index(bson::doc! { "tenant_id": 1, "parent_id": 1, "position": 1 }),
             index_unique(bson::doc! { "tenant_id": 1, "path": 1 }),
-            index(bson::doc! { "tenant_id": 1, "name": 1, "channel_type": 1 }),
+            index(bson::doc! { "tenant_id": 1, "name": 1 }),
             index(bson::doc! { "tenant_id": 1, "is_default": 1 }),
+            index_unique_sparse(bson::doc! { "meeting_code": 1 }),
         ],
     )
     .await?;
 
-    // Channel Members
+    // Room Members
     create_indexes(
         db,
-        "channel_members",
+        "room_members",
         vec![
-            index_unique(bson::doc! { "channel_id": 1, "user_id": 1 }),
+            index_unique(bson::doc! { "room_id": 1, "user_id": 1 }),
             index(bson::doc! { "user_id": 1, "tenant_id": 1 }),
         ],
     )
@@ -75,10 +76,10 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> 
         db,
         "messages",
         vec![
-            index(bson::doc! { "channel_id": 1, "created_at": -1 }),
+            index(bson::doc! { "room_id": 1, "created_at": -1 }),
             index(bson::doc! { "thread_id": 1, "created_at": 1 }),
             index(bson::doc! { "tenant_id": 1, "author_id": 1, "created_at": -1 }),
-            index(bson::doc! { "channel_id": 1, "is_pinned": 1 }),
+            index(bson::doc! { "room_id": 1, "is_pinned": 1 }),
             index(bson::doc! { "mentions.users": 1 }),
         ],
     )
@@ -94,35 +95,12 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> 
     )
     .await?;
 
-    // Conferences
-    create_indexes(
-        db,
-        "conferences",
-        vec![
-            index(bson::doc! { "tenant_id": 1, "status": 1, "start_time": -1 }),
-            index(bson::doc! { "organizer_id": 1, "start_time": -1 }),
-            index_unique(bson::doc! { "meeting_code": 1 }),
-        ],
-    )
-    .await?;
-
-    // Conference Participants
-    create_indexes(
-        db,
-        "conference_participants",
-        vec![
-            index(bson::doc! { "conference_id": 1, "user_id": 1 }),
-            index(bson::doc! { "user_id": 1, "tenant_id": 1 }),
-        ],
-    )
-    .await?;
-
     // Recordings
     create_indexes(
         db,
         "recordings",
         vec![
-            index(bson::doc! { "conference_id": 1, "recording_type": 1 }),
+            index(bson::doc! { "room_id": 1, "recording_type": 1 }),
             index(bson::doc! { "tenant_id": 1, "status": 1 }),
         ],
     )
@@ -133,7 +111,7 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> 
         db,
         "transcriptions",
         vec![
-            index(bson::doc! { "conference_id": 1 }),
+            index(bson::doc! { "room_id": 1 }),
             index(bson::doc! { "tenant_id": 1, "status": 1 }),
         ],
     )
@@ -146,7 +124,7 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> 
         vec![
             index(bson::doc! { "tenant_id": 1, "context.context_type": 1, "context.entity_id": 1 }),
             index(bson::doc! { "tenant_id": 1, "uploaded_by": 1, "created_at": -1 }),
-            index(bson::doc! { "tenant_id": 1, "context.channel_id": 1, "created_at": -1 }),
+            index(bson::doc! { "tenant_id": 1, "context.room_id": 1, "created_at": -1 }),
             index(bson::doc! { "external_source.provider": 1, "external_source.external_id": 1 }),
         ],
     )
@@ -219,14 +197,42 @@ fn index_unique(keys: bson::Document) -> IndexModel {
         .build()
 }
 
+fn index_unique_sparse(keys: bson::Document) -> IndexModel {
+    IndexModel::builder()
+        .keys(keys)
+        .options(IndexOptions::builder().unique(true).sparse(true).build())
+        .build()
+}
+
 async fn create_indexes(
     db: &Database,
     collection: &str,
     indexes: Vec<IndexModel>,
 ) -> Result<(), mongodb::error::Error> {
-    db.collection::<bson::Document>(collection)
-        .create_indexes(indexes)
-        .await?;
-    info!(collection, "Indexes created");
-    Ok(())
+    let coll = db.collection::<bson::Document>(collection);
+    match coll.create_indexes(indexes.clone()).await {
+        Ok(_) => {
+            info!(collection, "Indexes created");
+            Ok(())
+        }
+        Err(e) => {
+            // IndexKeySpecsConflict (code 86): an existing index has the same name
+            // but different options (e.g. non-sparse vs sparse). Drop the conflicting
+            // index and retry.
+            if let mongodb::error::ErrorKind::Command(ref cmd_err) = *e.kind {
+                if cmd_err.code == 86 {
+                    tracing::warn!(
+                        collection,
+                        "Index conflict detected, dropping conflicting indexes and retrying"
+                    );
+                    // Drop all non-_id indexes and recreate
+                    coll.drop_indexes().await?;
+                    coll.create_indexes(indexes).await?;
+                    info!(collection, "Indexes recreated after conflict resolution");
+                    return Ok(());
+                }
+            }
+            Err(e)
+        }
+    }
 }

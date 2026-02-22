@@ -9,7 +9,7 @@ interface Reaction {
 
 interface Message {
   id: string
-  channel_id: string
+  room_id: string
   author_id: string
   author_name?: string
   content: string
@@ -28,11 +28,11 @@ export const useMessageStore = defineStore('messages', () => {
   // Track which emojis the current user has reacted with per message: { message_id: Set<emoji> }
   const userReactions = ref<Record<string, Set<string>>>({})
 
-  async function fetchMessages(tenantId: string, channelId: string) {
+  async function fetchMessages(tenantId: string, roomId: string) {
     loading.value = true
     try {
       const data = await api.get<{ items: Message[] }>(
-        `/tenant/${tenantId}/channel/${channelId}/message`,
+        `/tenant/${tenantId}/room/${roomId}/message`,
       )
       messages.value = data.items
     } finally {
@@ -40,9 +40,9 @@ export const useMessageStore = defineStore('messages', () => {
     }
   }
 
-  async function sendMessage(tenantId: string, channelId: string, content: string, threadId?: string) {
+  async function sendMessage(tenantId: string, roomId: string, content: string, threadId?: string) {
     const msg = await api.post<Message>(
-      `/tenant/${tenantId}/channel/${channelId}/message`,
+      `/tenant/${tenantId}/room/${roomId}/message`,
       { content, thread_id: threadId },
     )
     if (threadId) {
@@ -53,9 +53,9 @@ export const useMessageStore = defineStore('messages', () => {
     return msg
   }
 
-  async function editMessage(tenantId: string, channelId: string, messageId: string, content: string) {
+  async function editMessage(tenantId: string, roomId: string, messageId: string, content: string) {
     const msg = await api.put<Message>(
-      `/tenant/${tenantId}/channel/${channelId}/message/${messageId}`,
+      `/tenant/${tenantId}/room/${roomId}/message/${messageId}`,
       { content },
     )
     const idx = messages.value.findIndex((m) => m.id === messageId)
@@ -63,13 +63,13 @@ export const useMessageStore = defineStore('messages', () => {
     return msg
   }
 
-  async function deleteMessage(tenantId: string, channelId: string, messageId: string) {
-    await api.delete(`/tenant/${tenantId}/channel/${channelId}/message/${messageId}`)
+  async function deleteMessage(tenantId: string, roomId: string, messageId: string) {
+    await api.delete(`/tenant/${tenantId}/room/${roomId}/message/${messageId}`)
     messages.value = messages.value.filter((m) => m.id !== messageId)
   }
 
-  async function addReaction(tenantId: string, channelId: string, messageId: string, emoji: string) {
-    await api.post(`/tenant/${tenantId}/channel/${channelId}/message/${messageId}/reaction`, {
+  async function addReaction(tenantId: string, roomId: string, messageId: string, emoji: string) {
+    await api.post(`/tenant/${tenantId}/room/${roomId}/message/${messageId}/reaction`, {
       emoji,
     })
     // Track locally
@@ -79,8 +79,8 @@ export const useMessageStore = defineStore('messages', () => {
     userReactions.value[messageId].add(emoji)
   }
 
-  async function removeReaction(tenantId: string, channelId: string, messageId: string, emoji: string) {
-    await api.delete(`/tenant/${tenantId}/channel/${channelId}/message/${messageId}/reaction/${encodeURIComponent(emoji)}`)
+  async function removeReaction(tenantId: string, roomId: string, messageId: string, emoji: string) {
+    await api.delete(`/tenant/${tenantId}/room/${roomId}/message/${messageId}/reaction/${encodeURIComponent(emoji)}`)
     userReactions.value[messageId]?.delete(emoji)
   }
 
@@ -88,11 +88,11 @@ export const useMessageStore = defineStore('messages', () => {
     return userReactions.value[messageId]?.has(emoji) ?? false
   }
 
-  async function toggleReaction(tenantId: string, channelId: string, messageId: string, emoji: string) {
+  async function toggleReaction(tenantId: string, roomId: string, messageId: string, emoji: string) {
     if (hasUserReacted(messageId, emoji)) {
-      await removeReaction(tenantId, channelId, messageId, emoji)
+      await removeReaction(tenantId, roomId, messageId, emoji)
     } else {
-      await addReaction(tenantId, channelId, messageId, emoji)
+      await addReaction(tenantId, roomId, messageId, emoji)
     }
   }
 
@@ -121,13 +121,13 @@ export const useMessageStore = defineStore('messages', () => {
     updateList(threadMessages.value)
   }
 
-  async function togglePin(tenantId: string, channelId: string, messageId: string) {
-    await api.put(`/tenant/${tenantId}/channel/${channelId}/message/${messageId}/pin`)
+  async function togglePin(tenantId: string, roomId: string, messageId: string) {
+    await api.put(`/tenant/${tenantId}/room/${roomId}/message/${messageId}/pin`)
   }
 
-  async function fetchThread(tenantId: string, channelId: string, messageId: string) {
+  async function fetchThread(tenantId: string, roomId: string, messageId: string) {
     const data = await api.get<{ items: Message[] }>(
-      `/tenant/${tenantId}/channel/${channelId}/message/${messageId}/thread`,
+      `/tenant/${tenantId}/room/${roomId}/message/${messageId}/thread`,
     )
     threadMessages.value = data.items
   }

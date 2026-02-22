@@ -14,18 +14,18 @@
     </v-row>
 
     <v-row>
-      <v-col v-for="ch in results" :key="ch.id" cols="12" sm="6" md="4">
+      <v-col v-for="room in results" :key="room.id" cols="12" sm="6" md="4">
         <v-card>
           <v-card-title>
             <v-icon class="mr-2" size="small">
-              {{ ch.is_private ? 'mdi-lock' : 'mdi-pound' }}
+              {{ room.is_open ? 'mdi-pound' : 'mdi-lock' }}
             </v-icon>
-            {{ ch.name }}
+            {{ room.name }}
           </v-card-title>
-          <v-card-subtitle>{{ ch.member_count }} members</v-card-subtitle>
-          <v-card-text v-if="ch.topic?.value">{{ ch.topic.value }}</v-card-text>
+          <v-card-subtitle>{{ room.member_count }} members</v-card-subtitle>
+          <v-card-text v-if="room.topic?.value">{{ room.topic.value }}</v-card-text>
           <v-card-actions>
-            <v-btn color="primary" @click="join(ch.id)">{{ $t('channel.join') }}</v-btn>
+            <v-btn color="primary" @click="join(room.id)">{{ $t('room.join') }}</v-btn>
           </v-card-actions>
         </v-card>
       </v-col>
@@ -33,7 +33,7 @@
 
     <v-row v-if="results.length === 0 && query">
       <v-col cols="12" class="text-center text-medium-emphasis pa-8">
-        No channels found matching "{{ query }}"
+        No rooms found matching "{{ query }}"
       </v-col>
     </v-row>
   </v-container>
@@ -42,40 +42,31 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { useChannelStore } from '@/stores/channels'
+import { useRoomStore, type Room } from '@/stores/rooms'
 
 const route = useRoute()
 const router = useRouter()
-const channelStore = useChannelStore()
+const roomStore = useRoomStore()
 
 const tenantId = computed(() => route.params.tenantId as string)
 const query = ref('')
 
-interface Channel {
-  id: string
-  name: string
-  is_private: boolean
-  member_count: number
-  topic?: { value?: string }
-}
-
-const results = ref<Channel[]>([])
+const results = ref<Room[]>([])
 let searchTimeout: ReturnType<typeof setTimeout> | null = null
 
 function debounceSearch() {
   if (searchTimeout) clearTimeout(searchTimeout)
   searchTimeout = setTimeout(async () => {
     if (query.value.trim()) {
-      const data = await channelStore.explore(tenantId.value, query.value)
-      results.value = data.items
+      results.value = await roomStore.explore(tenantId.value, query.value)
     } else {
       results.value = []
     }
   }, 300)
 }
 
-async function join(channelId: string) {
-  await channelStore.joinChannel(tenantId.value, channelId)
-  router.push(`/tenant/${tenantId.value}/channel/${channelId}`)
+async function join(roomId: string) {
+  await roomStore.joinRoom(tenantId.value, roomId)
+  router.push({ name: 'room-chat', params: { tenantId: tenantId.value, roomId } })
 }
 </script>

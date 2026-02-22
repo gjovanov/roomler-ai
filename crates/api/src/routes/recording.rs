@@ -8,7 +8,7 @@ use roomler2_services::dao::base::PaginationParams;
 #[derive(Debug, Serialize)]
 pub struct RecordingResponse {
     pub id: String,
-    pub conference_id: String,
+    pub room_id: String,
     pub recording_type: String,
     pub status: String,
     pub content_type: String,
@@ -20,19 +20,19 @@ pub struct RecordingResponse {
 pub async fn list(
     State(state): State<AppState>,
     auth: AuthUser,
-    Path((tenant_id, conference_id)): Path<(String, String)>,
+    Path((tenant_id, room_id)): Path<(String, String)>,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
-    let confid = ObjectId::parse_str(&conference_id)
-        .map_err(|_| ApiError::BadRequest("Invalid conference_id".to_string()))?;
+    let rid = ObjectId::parse_str(&room_id)
+        .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
     if !state.tenants.is_member(tid, auth.user_id).await? {
         return Err(ApiError::Forbidden("Not a member".to_string()));
     }
 
-    let result = state.recordings.find_by_conference(confid, &params).await?;
+    let result = state.recordings.find_by_room(rid, &params).await?;
     let items: Vec<RecordingResponse> = result.items.into_iter().map(to_response).collect();
 
     Ok(Json(serde_json::json!({
@@ -52,13 +52,13 @@ pub struct CreateRecordingRequest {
 pub async fn create(
     State(state): State<AppState>,
     auth: AuthUser,
-    Path((tenant_id, conference_id)): Path<(String, String)>,
+    Path((tenant_id, room_id)): Path<(String, String)>,
     Json(body): Json<CreateRecordingRequest>,
 ) -> Result<Json<RecordingResponse>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
-    let confid = ObjectId::parse_str(&conference_id)
-        .map_err(|_| ApiError::BadRequest("Invalid conference_id".to_string()))?;
+    let rid = ObjectId::parse_str(&room_id)
+        .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
     if !state.tenants.is_member(tid, auth.user_id).await? {
         return Err(ApiError::Forbidden("Not a member".to_string()));
@@ -74,7 +74,7 @@ pub async fn create(
     let storage_file = roomler2_db::models::recording::StorageFile {
         storage_provider: roomler2_db::models::recording::StorageProvider::Local,
         bucket: "recordings".to_string(),
-        key: format!("{}/{}/{}", tid.to_hex(), confid.to_hex(), uuid::Uuid::new_v4()),
+        key: format!("{}/{}/{}", tid.to_hex(), rid.to_hex(), uuid::Uuid::new_v4()),
         url: String::new(),
         content_type: "video/webm".to_string(),
         size: 0,
@@ -84,7 +84,7 @@ pub async fn create(
 
     let recording = state
         .recordings
-        .create(tid, confid, recording_type, storage_file, now, now)
+        .create(tid, rid, recording_type, storage_file, now, now)
         .await?;
 
     Ok(Json(to_response(recording)))
@@ -93,25 +93,25 @@ pub async fn create(
 pub async fn delete(
     State(state): State<AppState>,
     auth: AuthUser,
-    Path((tenant_id, _conference_id, recording_id)): Path<(String, String, String)>,
+    Path((tenant_id, _room_id, recording_id)): Path<(String, String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
-    let rid = ObjectId::parse_str(&recording_id)
+    let rec_id = ObjectId::parse_str(&recording_id)
         .map_err(|_| ApiError::BadRequest("Invalid recording_id".to_string()))?;
 
     if !state.tenants.is_member(tid, auth.user_id).await? {
         return Err(ApiError::Forbidden("Not a member".to_string()));
     }
 
-    state.recordings.soft_delete(tid, rid).await?;
+    state.recordings.soft_delete(tid, rec_id).await?;
     Ok(Json(serde_json::json!({ "deleted": true })))
 }
 
 fn to_response(r: roomler2_db::models::Recording) -> RecordingResponse {
     RecordingResponse {
         id: r.id.unwrap().to_hex(),
-        conference_id: r.conference_id.to_hex(),
+        room_id: r.room_id.to_hex(),
         recording_type: format!("{:?}", r.recording_type),
         status: format!("{:?}", r.status),
         content_type: r.file.content_type,

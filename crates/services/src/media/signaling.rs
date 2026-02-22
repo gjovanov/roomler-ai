@@ -68,8 +68,8 @@ pub enum ServerSignal {
     /// Send + recv transport pair created
     #[serde(rename = "media:transport_created")]
     TransportCreated {
-        send_transport: super::room_manager::TransportOptions,
-        recv_transport: super::room_manager::TransportOptions,
+        send_transport: Box<super::room_manager::TransportOptions>,
+        recv_transport: Box<super::room_manager::TransportOptions>,
     },
 
     /// Producer creation result

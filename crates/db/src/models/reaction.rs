@@ -6,7 +6,7 @@ pub struct Reaction {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
     pub id: Option<ObjectId>,
     pub tenant_id: ObjectId,
-    pub channel_id: ObjectId,
+    pub room_id: ObjectId,
     pub message_id: ObjectId,
     pub user_id: ObjectId,
     pub emoji: EmojiRef,

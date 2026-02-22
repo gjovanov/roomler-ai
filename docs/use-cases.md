@@ -8,8 +8,8 @@ Roomler2 uses a **u64 bitfield** for permissions. Each bit represents one permis
 
 | Bit | Flag | Description |
 |-----|------|-------------|
-| 0 | `VIEW_CHANNELS` | See channels |
-| 1 | `MANAGE_CHANNELS` | Create, edit, delete channels |
+| 0 | `VIEW_ROOMS` | See rooms |
+| 1 | `MANAGE_ROOMS` | Create, edit, delete rooms |
 | 2 | `MANAGE_ROLES` | Create, edit, delete roles |
 | 3 | `MANAGE_TENANT` | Edit tenant settings |
 | 4 | `KICK_MEMBERS` | Remove members |
@@ -23,12 +23,12 @@ Roomler2 uses a **u64 bitfield** for permissions. Each bit represents one permis
 | 12 | `MENTION_EVERYONE` | Use @everyone and @here |
 | 13 | `MANAGE_MESSAGES` | Delete/pin others' messages |
 | 14 | `ADD_REACTIONS` | Add emoji reactions |
-| 15 | `CONNECT_VOICE` | Join voice channels |
-| 16 | `SPEAK` | Speak in voice channels |
+| 15 | `CONNECT_VOICE` | Join voice rooms |
+| 16 | `SPEAK` | Speak in voice rooms |
 | 17 | `STREAM_VIDEO` | Share video/screen |
 | 18 | `MUTE_MEMBERS` | Server-mute others |
 | 19 | `DEAFEN_MEMBERS` | Server-deafen others |
-| 20 | `MOVE_MEMBERS` | Move members between voice channels |
+| 20 | `MOVE_MEMBERS` | Move members between voice rooms |
 | 21 | `MANAGE_MEETINGS` | Create, start, end conferences |
 | 22 | `MANAGE_DOCUMENTS` | Manage files and documents |
 | 23 | `ADMINISTRATOR` | Bypasses all permission checks |
@@ -37,8 +37,8 @@ Roomler2 uses a **u64 bitfield** for permissions. Each bit represents one permis
 
 | Role | Flags Included |
 |------|---------------|
-| **DEFAULT_MEMBER** | VIEW_CHANNELS, SEND_MESSAGES, SEND_THREADS, EMBED_LINKS, ATTACH_FILES, READ_HISTORY, ADD_REACTIONS, CONNECT_VOICE, SPEAK, STREAM_VIDEO |
-| **DEFAULT_ADMIN** | DEFAULT_MEMBER + MANAGE_CHANNELS, MANAGE_ROLES, KICK_MEMBERS, BAN_MEMBERS, INVITE_MEMBERS, MENTION_EVERYONE, MANAGE_MESSAGES, MUTE_MEMBERS, DEAFEN_MEMBERS, MOVE_MEMBERS, MANAGE_MEETINGS, MANAGE_DOCUMENTS |
+| **DEFAULT_MEMBER** | VIEW_ROOMS, SEND_MESSAGES, SEND_THREADS, EMBED_LINKS, ATTACH_FILES, READ_HISTORY, ADD_REACTIONS, CONNECT_VOICE, SPEAK, STREAM_VIDEO |
+| **DEFAULT_ADMIN** | DEFAULT_MEMBER + MANAGE_ROOMS, MANAGE_ROLES, KICK_MEMBERS, BAN_MEMBERS, INVITE_MEMBERS, MENTION_EVERYONE, MANAGE_MESSAGES, MUTE_MEMBERS, DEAFEN_MEMBERS, MOVE_MEMBERS, MANAGE_MEETINGS, MANAGE_DOCUMENTS |
 | **ALL (Owner)** | All 24 bits set (includes ADMINISTRATOR) |
 
 ### Permission Check Logic
@@ -49,9 +49,9 @@ has(permissions, flag) = (permissions & ADMINISTRATOR != 0) || (permissions & fl
 
 The `ADMINISTRATOR` flag bypasses all other checks.
 
-### Channel Permission Overwrites
+### Room Permission Overwrites
 
-Channels can override base permissions per-role or per-user:
+Rooms can override base permissions per-role or per-user:
 
 ```
 effective = (base_permissions & ~deny) | allow
@@ -83,90 +83,72 @@ Each `PermissionOverwrite` specifies a `target_id` (role or user), an `allow` ma
 4. **Protected requests** -- access token read from cookie or `Authorization: Bearer` header.
 5. **Token refresh** -- POST refresh_token to get new access + refresh tokens.
 
-## Channel Lifecycle
+## Room Lifecycle
 
 ```
-Create Channel              Join Channel
-     │                           │
-     ▼                           ▼
-  Channel exists ──────► ChannelMember created
-     │                           │
-     ▼                           ▼
+Create Room
+     |
+     v
+  Room exists -------> RoomMember created
+     |                           |
+     v                           v
   Send messages             Read messages
-     │                           │
-     ├── Start thread            ├── Unread tracking
-     ├── Add reactions           ├── Mention tracking
-     ├── Pin messages            ├── Notification prefs
-     └── Upload files            └── Mute channel
-                                     │
-                                     ▼
-                               Leave Channel
-                                     │
-                                     ▼
-                             ChannelMember deleted
+     |                           |
+     |-- Start thread            |-- Unread tracking
+     |-- Add reactions           |-- Mention tracking
+     |-- Pin messages            |-- Notification prefs
+     |-- Upload files            |-- Mute room
+     |-- Start call              |
+     |                           v
+     |                      Leave Room
+     |                           |
+     v                           v
+  Call lifecycle           RoomMember deleted
 ```
 
-### Channel Types
+### Room Types
 
-| Type | Description |
-|------|-------------|
-| `category` | Grouping container, no messages, acts as parent |
-| `text` | Standard text messaging channel |
-| `voice` | Voice/video channel with media settings |
-| `announcement` | Restricted posting (admins/mods only) |
-| `forum` | Thread-based discussion |
-| `stage` | Presentation mode with speakers/audience |
-| `dm` | Direct message (2 users) |
-| `group_dm` | Group direct message (multiple users) |
+Rooms are polymorphic — a room's capabilities are determined by its fields:
 
-Channels support hierarchy via `parent_id` -- a `category` channel can contain `text`, `voice`, and other channel types.
+| Configuration | Behavior |
+|--------------|----------|
+| `media_settings: None` | Text-only room (chat, threads, files) |
+| `media_settings: Some(...)` | Voice/video capable (can start calls) |
+| `conference_settings: Some(...)` | Scheduled/recurring call settings |
+| `parent_id: Some(...)` | Child room (nested hierarchy) |
+| `is_open: true` | Publicly joinable |
+| `is_read_only: true` | Announcement-style (restricted posting) |
 
-## Conference Lifecycle
+## Call Lifecycle
+
+Calls happen inside media-enabled rooms (rooms with `media_settings` set).
 
 ```
-Create Conference
-     │
-     ▼
-  Status: Scheduled
-     │
-     ▼
-  Start Conference
-     │
-     ▼
-  Status: In Progress
-     │
-     ├── Participants join/leave
-     ├── Screen sharing
-     ├── Recording starts
-     └── Transcription runs
-     │
-     ▼
-  End Conference
-     │
-     ▼
-  Status: Ended
-     │
-     ├── Recordings processed (BackgroundTask)
-     └── Transcriptions generated (BackgroundTask)
+Room (media_settings present)
+     |
+     v
+  Start Call (POST /room/{id}/call/start)
+     |
+     v
+  conference_status: InProgress
+     |
+     |-- WS broadcast: room:call_started to all room members
+     |-- Participants join via WS media:join
+     |-- Screen sharing
+     |-- In-call chat messages
+     |-- Recording starts
+     |-- Transcription runs
+     |
+     v
+  End Call (POST /room/{id}/call/end)
+     |
+     v
+  conference_status: Ended
+     |
+     |-- WS broadcast: room:call_ended to all room members
+     |-- Recordings processed (BackgroundTask)
+     |-- Transcriptions generated (BackgroundTask)
 ```
-
-### Conference Types
-
-| Type | Description |
-|------|-------------|
-| `instant` | Start immediately |
-| `scheduled` | Planned for a future time |
-| `recurring` | Repeats daily/weekly/monthly |
-| `persistent` | Always-available room |
-
-### Participant Roles
-
-| Role | Description |
-|------|-------------|
-| `organizer` | Created the conference, full control |
-| `co_organizer` | Delegated control |
-| `presenter` | Can share screen/present |
-| `attendee` | Default role, can view and speak |
 
 ## File Lifecycle
 
@@ -207,11 +189,11 @@ Upload File
 All data is scoped to a tenant via `tenant_id`. The API URL structure enforces this:
 
 ```
-/api/tenant/{tenant_id}/channel/{channel_id}/message
+/api/tenant/{tenant_id}/room/{room_id}/message
 ```
 
 - Users can belong to multiple tenants (via `TenantMember`)
-- Each tenant has its own roles, channels, conferences, and files
+- Each tenant has its own roles, rooms, and files
 - A user's permissions differ per tenant (based on assigned roles in that tenant)
 - Cross-tenant data access is prevented at the DAO layer
 

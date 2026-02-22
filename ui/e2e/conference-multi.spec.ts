@@ -3,13 +3,13 @@ import {
   uniqueUser,
   registerUserViaApi,
   createTenantViaApi,
-  createConferenceViaApi,
-  startConferenceViaApi,
+  createRoomViaApi,
+  startCallViaApi,
   addTenantMemberViaApi,
   loginViaUi,
 } from './fixtures/test-helpers'
 
-test.describe('Multi-Participant Conference', () => {
+test.describe('Multi-Participant Room Call', () => {
   let ownerUser: ReturnType<typeof uniqueUser>
   let peerUser: ReturnType<typeof uniqueUser>
   let ownerToken: string
@@ -17,7 +17,7 @@ test.describe('Multi-Participant Conference', () => {
   let ownerId: string
   let peerId: string
   let tenantId: string
-  let conferenceId: string
+  let roomId: string
 
   test.beforeEach(async () => {
     // Register two users
@@ -37,13 +37,13 @@ test.describe('Multi-Participant Conference', () => {
     tenantId = tenant.id
     await addTenantMemberViaApi(ownerToken, tenantId, peerId)
 
-    // Create and start conference
-    const conf = await createConferenceViaApi(ownerToken, tenantId, 'Multi-Participant Test')
-    conferenceId = conf.id
-    await startConferenceViaApi(ownerToken, tenantId, conferenceId)
+    // Create room and start call
+    const room = await createRoomViaApi(ownerToken, tenantId, 'Multi-Participant Test')
+    roomId = room.id
+    await startCallViaApi(ownerToken, tenantId, roomId)
   })
 
-  test('two participants can join the same conference', async ({ browser }) => {
+  test('two participants can join the same call', async ({ browser }) => {
     // Create two independent browser contexts (simulates two users)
     const ctx1 = await browser.newContext({
       permissions: ['camera', 'microphone'],
@@ -60,9 +60,9 @@ test.describe('Multi-Participant Conference', () => {
       await loginViaUi(page1, ownerUser.username, ownerUser.password)
       await loginViaUi(page2, peerUser.username, peerUser.password)
 
-      // Both navigate to the conference
-      await page1.goto(`/tenant/${tenantId}/conference/${conferenceId}`)
-      await page2.goto(`/tenant/${tenantId}/conference/${conferenceId}`)
+      // Both navigate to the room call
+      await page1.goto(`/tenant/${tenantId}/room/${roomId}/call`)
+      await page2.goto(`/tenant/${tenantId}/room/${roomId}/call`)
 
       // Owner joins first
       await expect(page1.getByRole('button', { name: /join/i })).toBeVisible({ timeout: 10000 })
@@ -78,16 +78,16 @@ test.describe('Multi-Participant Conference', () => {
       // In headless mode without real media, we verify that remote participant tiles appear.
       // The owner should see the peer's tile (by display name or user ID prefix).
       // Wait for remote stream tiles to appear (they render as VideoTile components).
-      // The video grid has multiple v-col elements — at least 2 when both are connected.
+      // The video grid has multiple v-col elements -- at least 2 when both are connected.
       const ownerVideoTiles = page1.locator('.video-grid .v-col')
       await expect(ownerVideoTiles).toHaveCount(2, { timeout: 20000 }).catch(() => {
         // In headless environments without real WebRTC, remote tiles may not render.
-        // This is expected — the join flow itself completing without errors is the main assertion.
+        // This is expected -- the join flow itself completing without errors is the main assertion.
       })
 
       const peerVideoTiles = page2.locator('.video-grid .v-col')
       await expect(peerVideoTiles).toHaveCount(2, { timeout: 20000 }).catch(() => {
-        // Same — graceful fallback for headless environments.
+        // Same -- graceful fallback for headless environments.
       })
     } finally {
       await page1.close()
@@ -105,7 +105,7 @@ test.describe('Multi-Participant Conference', () => {
 
     try {
       await loginViaUi(page, ownerUser.username, ownerUser.password)
-      await page.goto(`/tenant/${tenantId}/conference/${conferenceId}`)
+      await page.goto(`/tenant/${tenantId}/room/${roomId}/call`)
 
       await expect(page.getByRole('button', { name: /join/i })).toBeVisible({ timeout: 10000 })
       await page.getByRole('button', { name: /join/i }).click()
@@ -136,7 +136,7 @@ test.describe('Multi-Participant Conference', () => {
     const page2 = await ctx2.newPage()
 
     try {
-      // Mock getDisplayMedia on page1 before navigation — returns a fake video stream
+      // Mock getDisplayMedia on page1 before navigation -- returns a fake video stream
       await page1.addInitScript(() => {
         // Override getDisplayMedia to return a fake canvas-based stream
         navigator.mediaDevices.getDisplayMedia = async () => {
@@ -154,9 +154,9 @@ test.describe('Multi-Participant Conference', () => {
       await loginViaUi(page1, ownerUser.username, ownerUser.password)
       await loginViaUi(page2, peerUser.username, peerUser.password)
 
-      // Both navigate to the conference
-      await page1.goto(`/tenant/${tenantId}/conference/${conferenceId}`)
-      await page2.goto(`/tenant/${tenantId}/conference/${conferenceId}`)
+      // Both navigate to the room call
+      await page1.goto(`/tenant/${tenantId}/room/${roomId}/call`)
+      await page2.goto(`/tenant/${tenantId}/room/${roomId}/call`)
 
       // Owner joins
       await expect(page1.getByRole('button', { name: /join/i })).toBeVisible({ timeout: 10000 })
@@ -243,9 +243,9 @@ test.describe('Multi-Participant Conference', () => {
       await loginViaUi(page1, ownerUser.username, ownerUser.password)
       await loginViaUi(page2, ownerUser.username, ownerUser.password)
 
-      // Both navigate to the conference
-      await page1.goto(`/tenant/${tenantId}/conference/${conferenceId}`)
-      await page2.goto(`/tenant/${tenantId}/conference/${conferenceId}`)
+      // Both navigate to the room call
+      await page1.goto(`/tenant/${tenantId}/room/${roomId}/call`)
+      await page2.goto(`/tenant/${tenantId}/room/${roomId}/call`)
 
       // Tab 1 joins
       await expect(page1.getByRole('button', { name: /join/i })).toBeVisible({ timeout: 10000 })
@@ -267,7 +267,7 @@ test.describe('Multi-Participant Conference', () => {
       const tiles2 = await page2.locator('.video-grid .v-col').count()
 
       // In headless mode, remote tiles may not render (no real WebRTC media),
-      // so we assert <= 2 (not exactly 2) — the key assertion is NOT more than 2.
+      // so we assert <= 2 (not exactly 2) -- the key assertion is NOT more than 2.
       expect(tiles1).toBeLessThanOrEqual(2)
       expect(tiles2).toBeLessThanOrEqual(2)
 
@@ -311,7 +311,7 @@ test.describe('Multi-Participant Conference', () => {
     }
   })
 
-  test('leaving conference navigates back to dashboard', async ({ browser }) => {
+  test('leaving call navigates back to dashboard', async ({ browser }) => {
     const ctx = await browser.newContext({
       permissions: ['camera', 'microphone'],
     })
@@ -319,7 +319,7 @@ test.describe('Multi-Participant Conference', () => {
 
     try {
       await loginViaUi(page, ownerUser.username, ownerUser.password)
-      await page.goto(`/tenant/${tenantId}/conference/${conferenceId}`)
+      await page.goto(`/tenant/${tenantId}/room/${roomId}/call`)
 
       await page.getByRole('button', { name: /join/i }).click()
       await expect(page.getByText('You')).toBeVisible({ timeout: 15000 })

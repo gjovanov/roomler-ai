@@ -3,13 +3,30 @@
     <v-row no-gutters class="fill-height">
       <!-- Message list -->
       <v-col class="d-flex flex-column fill-height">
-        <!-- Channel header -->
+        <!-- Room header -->
         <v-toolbar density="compact" flat>
           <v-toolbar-title>
             <v-icon class="mr-1" size="small">mdi-pound</v-icon>
-            {{ channelStore.current?.name }}
+            {{ roomStore.current?.name }}
           </v-toolbar-title>
           <v-spacer />
+          <v-btn
+            v-if="roomStore.current?.has_media"
+            :color="isCallActive ? 'success' : undefined"
+            :prepend-icon="isCallActive ? 'mdi-phone' : 'mdi-video-plus'"
+            size="small"
+            variant="tonal"
+            class="mr-2"
+            @click="goToCall"
+          >
+            {{ isCallActive ? 'Join Call' : 'Start Call' }}
+            <v-badge
+              v-if="isCallActive && (roomStore.current?.participant_count ?? 0) > 0"
+              :content="roomStore.current?.participant_count"
+              color="success"
+              inline
+            />
+          </v-btn>
           <v-btn icon="mdi-pin" size="small" @click="showPinned = !showPinned" />
           <v-btn icon="mdi-account-group" size="small" @click="showMembers = !showMembers" />
         </v-toolbar>
@@ -22,7 +39,7 @@
             <v-progress-circular indeterminate />
           </div>
           <div v-else-if="messageStore.messages.length === 0" class="text-center pa-8 text-medium-emphasis">
-            {{ $t('channel.noMessages') }}
+            {{ $t('room.noMessages') }}
           </div>
           <div v-else>
             <div v-for="msg in messageStore.messages" :key="msg.id" class="mb-3">
@@ -112,9 +129,9 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, nextTick, watch } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
-import { useChannelStore } from '@/stores/channels'
+import { useRoomStore } from '@/stores/rooms'
 import { useMessageStore } from '@/stores/messages'
 import { useWsStore } from '@/stores/ws'
 import MessageBubble from '@/components/chat/MessageBubble.vue'
@@ -123,15 +140,22 @@ import EmojiPicker from '@/components/chat/EmojiPicker.vue'
 import GiphyPicker from '@/components/chat/GiphyPicker.vue'
 
 const route = useRoute()
+const router = useRouter()
 const authStore = useAuthStore()
-const channelStore = useChannelStore()
+const roomStore = useRoomStore()
 const messageStore = useMessageStore()
 const wsStore = useWsStore()
 
 const currentUserId = computed(() => authStore.user?.id)
 
 const tenantId = computed(() => route.params.tenantId as string)
-const channelId = computed(() => route.params.channelId as string)
+const roomId = computed(() => route.params.roomId as string)
+
+const isCallActive = computed(() => roomStore.current?.conference_status === 'InProgress')
+
+function goToCall() {
+  router.push({ name: 'room-call', params: { tenantId: tenantId.value, roomId: roomId.value } })
+}
 
 const activeThread = ref<{ id: string } | null>(null)
 const showPinned = ref(false)
@@ -145,31 +169,31 @@ const threadEditorRef = ref<InstanceType<typeof MessageEditor> | null>(null)
 
 async function sendMessage(content: string) {
   if (!content) return
-  await messageStore.sendMessage(tenantId.value, channelId.value, content)
+  await messageStore.sendMessage(tenantId.value, roomId.value, content)
   await nextTick()
   scrollToBottom()
 }
 
 async function sendThreadReply(content: string) {
   if (!content || !activeThread.value) return
-  await messageStore.sendMessage(tenantId.value, channelId.value, content, activeThread.value.id)
+  await messageStore.sendMessage(tenantId.value, roomId.value, content, activeThread.value.id)
 }
 
 function openThread(msg: { id: string }) {
   activeThread.value = msg
-  messageStore.fetchThread(tenantId.value, channelId.value, msg.id)
+  messageStore.fetchThread(tenantId.value, roomId.value, msg.id)
 }
 
 async function handleReact(messageId: string, emoji: string) {
-  await messageStore.toggleReaction(tenantId.value, channelId.value, messageId, emoji)
+  await messageStore.toggleReaction(tenantId.value, roomId.value, messageId, emoji)
 }
 
 async function handlePin(messageId: string) {
-  await messageStore.togglePin(tenantId.value, channelId.value, messageId)
+  await messageStore.togglePin(tenantId.value, roomId.value, messageId)
 }
 
 async function handleEdit(messageId: string, content: string) {
-  await messageStore.editMessage(tenantId.value, channelId.value, messageId, content)
+  await messageStore.editMessage(tenantId.value, roomId.value, messageId, content)
 }
 
 function handleEmojiSelect(emoji: string) {
@@ -190,7 +214,7 @@ function scrollToBottom() {
   }
 }
 
-watch(channelId, async (id) => {
+watch(roomId, async (id) => {
   if (id) {
     await messageStore.fetchMessages(tenantId.value, id)
     await nextTick()
@@ -199,8 +223,9 @@ watch(channelId, async (id) => {
 })
 
 onMounted(async () => {
-  if (channelId.value) {
-    await messageStore.fetchMessages(tenantId.value, channelId.value)
+  if (roomId.value) {
+    roomStore.fetchRoom(tenantId.value, roomId.value)
+    await messageStore.fetchMessages(tenantId.value, roomId.value)
     await nextTick()
     scrollToBottom()
   }

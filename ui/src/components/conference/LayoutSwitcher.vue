@@ -5,7 +5,7 @@
     </template>
 
     <v-card min-width="280" class="pa-3">
-      <v-card-subtitle class="px-0 pb-2">{{ $t('conference.layout') }}</v-card-subtitle>
+      <v-card-subtitle class="px-0 pb-2">{{ $t('call.layout') }}</v-card-subtitle>
 
       <!-- Layout mode -->
       <v-radio-group
@@ -17,25 +17,25 @@
         <v-radio value="auto" density="compact">
           <template #label>
             <v-icon size="18" class="mr-1">mdi-auto-fix</v-icon>
-            {{ $t('conference.layoutAuto') }}
+            {{ $t('call.layoutAuto') }}
           </template>
         </v-radio>
         <v-radio value="tiled" density="compact">
           <template #label>
             <v-icon size="18" class="mr-1">mdi-view-grid</v-icon>
-            {{ $t('conference.layoutTiled') }}
+            {{ $t('call.layoutTiled') }}
           </template>
         </v-radio>
         <v-radio value="spotlight" density="compact">
           <template #label>
             <v-icon size="18" class="mr-1">mdi-spotlight-beam</v-icon>
-            {{ $t('conference.layoutSpotlight') }}
+            {{ $t('call.layoutSpotlight') }}
           </template>
         </v-radio>
         <v-radio value="sidebar" density="compact">
           <template #label>
             <v-icon size="18" class="mr-1">mdi-page-layout-sidebar-right</v-icon>
-            {{ $t('conference.layoutSidebar') }}
+            {{ $t('call.layoutSidebar') }}
           </template>
         </v-radio>
       </v-radio-group>
@@ -45,7 +45,7 @@
       <!-- Tile count slider (shown for tiled/auto modes) -->
       <div v-if="prefs.mode === 'tiled' || prefs.mode === 'auto'">
         <div class="text-caption text-medium-emphasis mb-1">
-          {{ $t('conference.tileCount') }}: {{ prefs.tiledMaxTiles }}
+          {{ $t('call.tileCount') }}: {{ prefs.tiledMaxTiles }}
         </div>
         <v-slider
           :model-value="prefs.tiledMaxTiles"
@@ -65,7 +65,7 @@
       <v-switch
         :model-value="prefs.hideNonVideo"
         @update:model-value="$emit('update:hideNonVideo', $event)"
-        :label="$t('conference.hideNonVideo')"
+        :label="$t('call.hideNonVideo')"
         density="compact"
         hide-details
         color="primary"
@@ -74,7 +74,7 @@
       <v-divider class="my-2" />
 
       <!-- Self-view mode -->
-      <v-card-subtitle class="px-0 pb-1">{{ $t('conference.selfView') }}</v-card-subtitle>
+      <v-card-subtitle class="px-0 pb-1">{{ $t('call.selfView') }}</v-card-subtitle>
       <v-radio-group
         :model-value="prefs.selfViewMode"
         @update:model-value="$emit('update:selfViewMode', $event)"
@@ -82,13 +82,13 @@
         hide-details
       >
         <v-radio value="in-grid-cropped" density="compact">
-          <template #label>{{ $t('conference.selfViewCropped') }}</template>
+          <template #label>{{ $t('call.selfViewCropped') }}</template>
         </v-radio>
         <v-radio value="in-grid-uncropped" density="compact">
-          <template #label>{{ $t('conference.selfViewUncropped') }}</template>
+          <template #label>{{ $t('call.selfViewUncropped') }}</template>
         </v-radio>
         <v-radio value="floating-uncropped" density="compact">
-          <template #label>{{ $t('conference.selfViewFloating') }}</template>
+          <template #label>{{ $t('call.selfViewFloating') }}</template>
         </v-radio>
       </v-radio-group>
     </v-card>

@@ -21,7 +21,7 @@ pub struct UpdateMessageRequest {
 #[derive(Debug, Serialize)]
 pub struct MessageResponse {
     pub id: String,
-    pub channel_id: String,
+    pub room_id: String,
     pub author_id: String,
     pub content: String,
     pub message_type: String,
@@ -42,19 +42,19 @@ pub struct ReactionSummaryResponse {
 pub async fn list(
     State(state): State<AppState>,
     auth: AuthUser,
-    Path((tenant_id, channel_id)): Path<(String, String)>,
+    Path((tenant_id, room_id)): Path<(String, String)>,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
-    let cid = ObjectId::parse_str(&channel_id)
-        .map_err(|_| ApiError::BadRequest("Invalid channel_id".to_string()))?;
+    let rid = ObjectId::parse_str(&room_id)
+        .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
     if !state.tenants.is_member(tid, auth.user_id).await? {
         return Err(ApiError::Forbidden("Not a member".to_string()));
     }
 
-    let result = state.messages.find_in_channel(cid, &params).await?;
+    let result = state.messages.find_in_room(rid, &params).await?;
 
     let items: Vec<MessageResponse> = result
         .items
@@ -74,13 +74,13 @@ pub async fn list(
 pub async fn create(
     State(state): State<AppState>,
     auth: AuthUser,
-    Path((tenant_id, channel_id)): Path<(String, String)>,
+    Path((tenant_id, room_id)): Path<(String, String)>,
     Json(body): Json<CreateMessageRequest>,
 ) -> Result<Json<MessageResponse>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
-    let cid = ObjectId::parse_str(&channel_id)
-        .map_err(|_| ApiError::BadRequest("Invalid channel_id".to_string()))?;
+    let rid = ObjectId::parse_str(&room_id)
+        .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
     if !state.tenants.is_member(tid, auth.user_id).await? {
         return Err(ApiError::Forbidden("Not a member".to_string()));
@@ -89,14 +89,14 @@ pub async fn create(
     let thread_id = body
         .thread_id
         .as_ref()
-        .map(|t| ObjectId::parse_str(t))
+        .map(ObjectId::parse_str)
         .transpose()
         .map_err(|_| ApiError::BadRequest("Invalid thread_id".to_string()))?;
 
     let ref_msg_id = body
         .referenced_message_id
         .as_ref()
-        .map(|r| ObjectId::parse_str(r))
+        .map(ObjectId::parse_str)
         .transpose()
         .map_err(|_| ApiError::BadRequest("Invalid referenced_message_id".to_string()))?;
 
@@ -104,7 +104,7 @@ pub async fn create(
         .messages
         .create(
             tid,
-            cid,
+            rid,
             auth.user_id,
             body.content,
             thread_id,
@@ -113,11 +113,11 @@ pub async fn create(
         )
         .await?;
 
-    // Broadcast via WebSocket to channel members (exclude sender to avoid duplicates)
+    // Broadcast via WebSocket to room members (exclude sender)
     let response = to_response(message);
     let member_ids: Vec<ObjectId> = state
-        .channels
-        .find_member_user_ids(cid)
+        .rooms
+        .find_member_user_ids(rid)
         .await?
         .into_iter()
         .filter(|id| *id != auth.user_id)
@@ -134,13 +134,13 @@ pub async fn create(
 pub async fn update(
     State(state): State<AppState>,
     auth: AuthUser,
-    Path((tenant_id, channel_id, message_id)): Path<(String, String, String)>,
+    Path((tenant_id, room_id, message_id)): Path<(String, String, String)>,
     Json(body): Json<UpdateMessageRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
-    let cid = ObjectId::parse_str(&channel_id)
-        .map_err(|_| ApiError::BadRequest("Invalid channel_id".to_string()))?;
+    let rid = ObjectId::parse_str(&room_id)
+        .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
     let mid = ObjectId::parse_str(&message_id)
         .map_err(|_| ApiError::BadRequest("Invalid message_id".to_string()))?;
 
@@ -149,13 +149,12 @@ pub async fn update(
         .update_content(tid, mid, auth.user_id, body.content.clone())
         .await?;
 
-    // Broadcast update to channel members
-    let member_ids = state.channels.find_member_user_ids(cid).await?;
+    let member_ids = state.rooms.find_member_user_ids(rid).await?;
     let event = serde_json::json!({
         "type": "message:update",
         "data": {
             "message_id": message_id,
-            "channel_id": channel_id,
+            "room_id": room_id,
             "content": body.content,
             "user_id": auth.user_id.to_hex(),
         }
@@ -168,12 +167,12 @@ pub async fn update(
 pub async fn delete(
     State(state): State<AppState>,
     _auth: AuthUser,
-    Path((tenant_id, channel_id, message_id)): Path<(String, String, String)>,
+    Path((tenant_id, room_id, message_id)): Path<(String, String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
-    let cid = ObjectId::parse_str(&channel_id)
-        .map_err(|_| ApiError::BadRequest("Invalid channel_id".to_string()))?;
+    let rid = ObjectId::parse_str(&room_id)
+        .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
     let mid = ObjectId::parse_str(&message_id)
         .map_err(|_| ApiError::BadRequest("Invalid message_id".to_string()))?;
 
@@ -183,13 +182,12 @@ pub async fn delete(
         .soft_delete_in_tenant(tid, mid)
         .await?;
 
-    // Broadcast delete to channel members
-    let member_ids = state.channels.find_member_user_ids(cid).await?;
+    let member_ids = state.rooms.find_member_user_ids(rid).await?;
     let event = serde_json::json!({
         "type": "message:delete",
         "data": {
             "message_id": message_id,
-            "channel_id": channel_id,
+            "room_id": room_id,
         }
     });
     crate::ws::dispatcher::broadcast(&state.ws_storage, &member_ids, &event).await;
@@ -200,18 +198,18 @@ pub async fn delete(
 pub async fn pinned(
     State(state): State<AppState>,
     auth: AuthUser,
-    Path((tenant_id, channel_id)): Path<(String, String)>,
+    Path((tenant_id, room_id)): Path<(String, String)>,
 ) -> Result<Json<Vec<MessageResponse>>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
-    let cid = ObjectId::parse_str(&channel_id)
-        .map_err(|_| ApiError::BadRequest("Invalid channel_id".to_string()))?;
+    let rid = ObjectId::parse_str(&room_id)
+        .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
     if !state.tenants.is_member(tid, auth.user_id).await? {
         return Err(ApiError::Forbidden("Not a member".to_string()));
     }
 
-    let messages = state.messages.find_pinned(cid).await?;
+    let messages = state.messages.find_pinned(rid).await?;
     let response: Vec<MessageResponse> = messages.into_iter().map(to_response).collect();
 
     Ok(Json(response))
@@ -225,13 +223,13 @@ pub struct TogglePinRequest {
 pub async fn toggle_pin(
     State(state): State<AppState>,
     auth: AuthUser,
-    Path((tenant_id, channel_id, message_id)): Path<(String, String, String)>,
+    Path((tenant_id, room_id, message_id)): Path<(String, String, String)>,
     Json(body): Json<TogglePinRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
-    let cid = ObjectId::parse_str(&channel_id)
-        .map_err(|_| ApiError::BadRequest("Invalid channel_id".to_string()))?;
+    let rid = ObjectId::parse_str(&room_id)
+        .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
     let mid = ObjectId::parse_str(&message_id)
         .map_err(|_| ApiError::BadRequest("Invalid message_id".to_string()))?;
 
@@ -241,13 +239,12 @@ pub async fn toggle_pin(
 
     state.messages.toggle_pin(tid, mid, body.pinned).await?;
 
-    // Broadcast pin event to channel members
-    let member_ids = state.channels.find_member_user_ids(cid).await?;
+    let member_ids = state.rooms.find_member_user_ids(rid).await?;
     let event = serde_json::json!({
         "type": if body.pinned { "message:pin" } else { "message:unpin" },
         "data": {
             "message_id": message_id,
-            "channel_id": channel_id,
+            "room_id": room_id,
             "pinned": body.pinned,
         }
     });
@@ -259,7 +256,7 @@ pub async fn toggle_pin(
 pub async fn thread_replies(
     State(state): State<AppState>,
     auth: AuthUser,
-    Path((tenant_id, _channel_id, message_id)): Path<(String, String, String)>,
+    Path((tenant_id, _room_id, message_id)): Path<(String, String, String)>,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
@@ -291,7 +288,7 @@ pub async fn thread_replies(
 fn to_response(m: roomler2_db::models::Message) -> MessageResponse {
     MessageResponse {
         id: m.id.unwrap().to_hex(),
-        channel_id: m.channel_id.to_hex(),
+        room_id: m.room_id.to_hex(),
         author_id: m.author_id.to_hex(),
         content: m.content,
         message_type: format!("{:?}", m.message_type),

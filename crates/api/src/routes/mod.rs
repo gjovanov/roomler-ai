@@ -1,9 +1,6 @@
 pub mod admin;
 pub mod auth;
 pub mod background_task;
-pub mod channel;
-pub mod conference;
-pub mod conference_message;
 pub mod export;
 pub mod file;
 pub mod giphy;
@@ -13,6 +10,7 @@ pub mod message;
 pub mod oauth;
 pub mod reaction;
 pub mod recording;
+pub mod room;
 pub mod stripe;
 pub mod tenant;
 pub mod transcription;

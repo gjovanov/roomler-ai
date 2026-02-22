@@ -72,7 +72,7 @@ impl UserDao {
                 user_id,
                 doc! {
                     "$set": {
-                        "presence": bson::to_bson(&presence).map_err(bson::ser::Error::from)?,
+                        "presence": bson::to_bson(&presence)?,
                         "last_active_at": DateTime::now(),
                     }
                 },
@@ -115,7 +115,7 @@ impl UserDao {
                     refresh_token: None,
                 };
                 let oauth_bson =
-                    bson::to_bson(&oauth).map_err(bson::ser::Error::from)?;
+                    bson::to_bson(&oauth)?;
                 self.base
                     .update_by_id(
                         user.id.unwrap(),

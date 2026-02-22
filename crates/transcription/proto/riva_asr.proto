@@ -1,0 +1,112 @@
+// Simplified NVIDIA Riva ASR proto definitions for streaming recognition.
+// Based on the Riva ASR API (compatible with NIM containers).
+syntax = "proto3";
+
+package nvidia.riva.asr;
+
+// Streaming speech recognition service.
+service RivaSpeechRecognition {
+    // Performs bidirectional streaming speech recognition.
+    rpc StreamingRecognize(stream StreamingRecognizeRequest) returns (stream StreamingRecognizeResponse);
+
+    // Performs non-streaming (batch) speech recognition.
+    rpc Recognize(RecognizeRequest) returns (RecognizeResponse);
+}
+
+// Configuration for streaming recognition requests.
+message RecognitionConfig {
+    // Audio encoding (LINEAR16 = 1, FLAC = 2, etc.)
+    AudioEncoding encoding = 1;
+
+    // Sample rate in Hz (e.g. 16000).
+    int32 sample_rate_hertz = 2;
+
+    // BCP-47 language code (e.g. "en-US", "de-DE").
+    string language_code = 3;
+
+    // Maximum number of recognition hypotheses to return.
+    int32 max_alternatives = 4;
+
+    // Model name to use (e.g. "canary-1b", "parakeet-ctc-1.1b").
+    string model = 6;
+
+    // Whether to include interim (partial) results.
+    bool enable_automatic_punctuation = 11;
+}
+
+// Streaming recognition configuration.
+message StreamingRecognitionConfig {
+    // Recognition configuration.
+    RecognitionConfig config = 1;
+
+    // Whether interim (partial) results should be returned.
+    bool interim_results = 2;
+}
+
+// A streaming recognition request (config or audio).
+message StreamingRecognizeRequest {
+    oneof streaming_request {
+        // Configuration for the stream (must be first message).
+        StreamingRecognitionConfig streaming_config = 1;
+
+        // Audio content (subsequent messages).
+        bytes audio_content = 2;
+    }
+}
+
+// A streaming recognition response.
+message StreamingRecognizeResponse {
+    // Sequential list of transcription results.
+    repeated StreamingRecognitionResult results = 2;
+}
+
+// A streaming recognition result.
+message StreamingRecognitionResult {
+    // Recognition hypotheses (best first).
+    repeated SpeechRecognitionAlternative alternatives = 1;
+
+    // Whether this is a final (vs partial/interim) result.
+    bool is_final = 2;
+
+    // Stability of the result (0.0 to 1.0).
+    float stability = 3;
+}
+
+// A single recognition hypothesis.
+message SpeechRecognitionAlternative {
+    // Transcript text.
+    string transcript = 1;
+
+    // Confidence score (0.0 to 1.0).
+    float confidence = 2;
+}
+
+// Batch recognition request.
+message RecognizeRequest {
+    // Recognition configuration.
+    RecognitionConfig config = 1;
+
+    // Audio content.
+    bytes audio = 2;
+}
+
+// Batch recognition response.
+message RecognizeResponse {
+    // Recognition results.
+    repeated SpeechRecognitionResult results = 2;
+}
+
+// Batch recognition result.
+message SpeechRecognitionResult {
+    // Recognition hypotheses (best first).
+    repeated SpeechRecognitionAlternative alternatives = 1;
+}
+
+// Audio encoding types.
+enum AudioEncoding {
+    ENCODING_UNSPECIFIED = 0;
+    LINEAR16 = 1;
+    FLAC = 2;
+    MULAW = 3;
+    ALAW = 20;
+}

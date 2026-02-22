@@ -2,7 +2,7 @@
   <div class="transcript-panel d-flex flex-column">
     <v-toolbar density="compact" flat>
       <v-toolbar-title class="text-body-1">
-        {{ $t('conference.transcript') }}
+        {{ $t('call.transcript') }}
       </v-toolbar-title>
       <v-spacer />
       <v-menu>
@@ -11,10 +11,10 @@
         </template>
         <v-list density="compact">
           <v-list-item @click="downloadVtt">
-            <v-list-item-title>{{ $t('conference.downloadVtt') }}</v-list-item-title>
+            <v-list-item-title>{{ $t('call.downloadVtt') }}</v-list-item-title>
           </v-list-item>
           <v-list-item @click="downloadSrt">
-            <v-list-item-title>{{ $t('conference.downloadSrt') }}</v-list-item-title>
+            <v-list-item-title>{{ $t('call.downloadSrt') }}</v-list-item-title>
           </v-list-item>
         </v-list>
       </v-menu>
@@ -27,7 +27,7 @@
         v-if="segments.length === 0"
         class="text-center text-medium-emphasis mt-4"
       >
-        {{ $t('conference.noTranscript') }}
+        {{ $t('call.noTranscript') }}
       </div>
       <div
         v-for="seg in segments"
@@ -72,7 +72,7 @@
 
 <script setup lang="ts">
 import { ref, watch, nextTick } from 'vue'
-import type { TranscriptSegment } from './TranscriptOverlay.vue'
+import type { TranscriptSegment } from '@/stores/rooms'
 
 const props = defineProps<{
   segments: TranscriptSegment[]

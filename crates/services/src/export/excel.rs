@@ -40,7 +40,7 @@ pub fn export_conversation(
         worksheet.write_string(row, 0, &timestamp)?;
         worksheet.write_string(row, 1, author)?;
         worksheet.write_string(row, 2, &msg.content)?;
-        worksheet.write_string(row, 3, &format!("{:?}", msg.message_type))?;
+        worksheet.write_string(row, 3, format!("{:?}", msg.message_type))?;
 
         let reactions: String = msg
             .reaction_summary

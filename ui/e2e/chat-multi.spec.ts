@@ -3,8 +3,8 @@ import {
   uniqueUser,
   registerUserViaApi,
   createTenantViaApi,
-  createChannelViaApi,
-  joinChannelViaApi,
+  createRoomViaApi,
+  joinRoomViaApi,
   sendMessageViaApi,
   addTenantMemberViaApi,
   loginViaUi,
@@ -13,7 +13,7 @@ import {
 test.describe('Multi-Participant Chat (dedup)', () => {
   const users: Array<{ user: ReturnType<typeof uniqueUser>; token: string; userId: string }> = []
   let tenantId: string
-  let channelId: string
+  let roomId: string
   let ownerToken: string
 
   test.beforeEach(async () => {
@@ -37,13 +37,13 @@ test.describe('Multi-Participant Chat (dedup)', () => {
       await addTenantMemberViaApi(ownerToken, tenantId, users[i].userId)
     }
 
-    // Create a channel
-    const channel = await createChannelViaApi(ownerToken, tenantId, `general-${Date.now()}`)
-    channelId = channel.id
+    // Create a room
+    const room = await createRoomViaApi(ownerToken, tenantId, `general-${Date.now()}`)
+    roomId = room.id
 
-    // All users join the channel
+    // All users join the room
     for (const u of users) {
-      await joinChannelViaApi(u.token, tenantId, channelId)
+      await joinRoomViaApi(u.token, tenantId, roomId)
     }
   })
 
@@ -52,13 +52,13 @@ test.describe('Multi-Participant Chat (dedup)', () => {
     const expectedMessages: string[] = []
     for (let i = 0; i < users.length; i++) {
       const content = `Message from user ${i + 1} - ${Date.now()}`
-      await sendMessageViaApi(users[i].token, tenantId, channelId, content)
+      await sendMessageViaApi(users[i].token, tenantId, roomId, content)
       expectedMessages.push(content)
     }
 
     // Login as first user and navigate to chat
     await loginViaUi(page, users[0].user.username, users[0].user.password)
-    await page.goto(`/tenant/${tenantId}/channel/${channelId}`)
+    await page.goto(`/tenant/${tenantId}/room/${roomId}`)
 
     // Wait for messages to load
     await expect(page.getByText(expectedMessages[0])).toBeVisible({ timeout: 10000 })
@@ -78,7 +78,7 @@ test.describe('Multi-Participant Chat (dedup)', () => {
   test('sending a message does not produce a duplicate', async ({ page, context }) => {
     // Login as first user
     await loginViaUi(page, users[0].user.username, users[0].user.password)
-    await page.goto(`/tenant/${tenantId}/channel/${channelId}`)
+    await page.goto(`/tenant/${tenantId}/room/${roomId}`)
 
     // Wait for chat view to load
     const input = page.getByPlaceholder(/type a message/i)

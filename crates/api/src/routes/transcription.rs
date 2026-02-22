@@ -8,7 +8,7 @@ use roomler2_services::dao::base::PaginationParams;
 #[derive(Debug, Serialize)]
 pub struct TranscriptionResponse {
     pub id: String,
-    pub conference_id: String,
+    pub room_id: String,
     pub status: String,
     pub language: String,
     pub format: String,
@@ -20,13 +20,13 @@ pub struct TranscriptionResponse {
 pub async fn list(
     State(state): State<AppState>,
     auth: AuthUser,
-    Path((tenant_id, conference_id)): Path<(String, String)>,
+    Path((tenant_id, room_id)): Path<(String, String)>,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
-    let confid = ObjectId::parse_str(&conference_id)
-        .map_err(|_| ApiError::BadRequest("Invalid conference_id".to_string()))?;
+    let rid = ObjectId::parse_str(&room_id)
+        .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
     if !state.tenants.is_member(tid, auth.user_id).await? {
         return Err(ApiError::Forbidden("Not a member".to_string()));
@@ -34,7 +34,7 @@ pub async fn list(
 
     let result = state
         .transcriptions
-        .find_by_conference(confid, &params)
+        .find_by_room(rid, &params)
         .await?;
     let items: Vec<TranscriptionResponse> = result.items.into_iter().map(to_response).collect();
 
@@ -56,13 +56,13 @@ pub struct CreateTranscriptionRequest {
 pub async fn create(
     State(state): State<AppState>,
     auth: AuthUser,
-    Path((tenant_id, conference_id)): Path<(String, String)>,
+    Path((tenant_id, room_id)): Path<(String, String)>,
     Json(body): Json<CreateTranscriptionRequest>,
 ) -> Result<Json<TranscriptionResponse>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
-    let confid = ObjectId::parse_str(&conference_id)
-        .map_err(|_| ApiError::BadRequest("Invalid conference_id".to_string()))?;
+    let rid = ObjectId::parse_str(&room_id)
+        .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
     if !state.tenants.is_member(tid, auth.user_id).await? {
         return Err(ApiError::Forbidden("Not a member".to_string()));
@@ -71,7 +71,7 @@ pub async fn create(
     let recording_id = body
         .recording_id
         .as_ref()
-        .map(|r| ObjectId::parse_str(r))
+        .map(ObjectId::parse_str)
         .transpose()
         .map_err(|_| ApiError::BadRequest("Invalid recording_id".to_string()))?;
 
@@ -79,7 +79,7 @@ pub async fn create(
 
     let transcription = state
         .transcriptions
-        .create(tid, confid, recording_id, language)
+        .create(tid, rid, recording_id, language)
         .await?;
 
     Ok(Json(to_response(transcription)))
@@ -88,7 +88,7 @@ pub async fn create(
 pub async fn get(
     State(state): State<AppState>,
     auth: AuthUser,
-    Path((tenant_id, _conference_id, transcription_id)): Path<(String, String, String)>,
+    Path((tenant_id, _room_id, transcription_id)): Path<(String, String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
@@ -116,7 +116,7 @@ pub async fn get(
 
     Ok(Json(serde_json::json!({
         "id": t.id.unwrap().to_hex(),
-        "conference_id": t.conference_id.to_hex(),
+        "room_id": t.room_id.to_hex(),
         "status": format!("{:?}", t.status),
         "language": t.language,
         "format": format!("{:?}", t.format),
@@ -135,7 +135,7 @@ pub async fn get(
 fn to_response(t: roomler2_db::models::Transcription) -> TranscriptionResponse {
     TranscriptionResponse {
         id: t.id.unwrap().to_hex(),
-        conference_id: t.conference_id.to_hex(),
+        room_id: t.room_id.to_hex(),
         status: format!("{:?}", t.status),
         language: t.language,
         format: format!("{:?}", t.format),

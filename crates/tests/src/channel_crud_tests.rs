@@ -2,16 +2,16 @@ use crate::fixtures::test_app::TestApp;
 use serde_json::Value;
 
 #[tokio::test]
-async fn get_channel_by_id() {
+async fn get_room_by_id() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("chget").await;
-    let channel = &tenant.channels[0];
+    let room = &tenant.rooms[0];
 
     let resp = app
         .auth_get(
             &format!(
-                "/api/tenant/{}/channel/{}",
-                tenant.tenant_id, channel.id
+                "/api/tenant/{}/room/{}",
+                tenant.tenant_id, room.id
             ),
             &tenant.admin.access_token,
         )
@@ -21,22 +21,22 @@ async fn get_channel_by_id() {
 
     assert_eq!(resp.status().as_u16(), 200);
     let json: Value = resp.json().await.unwrap();
-    assert_eq!(json["id"], channel.id);
-    assert_eq!(json["name"], channel.name);
-    assert_eq!(json["path"], channel.path);
+    assert_eq!(json["id"], room.id);
+    assert_eq!(json["name"], room.name);
+    assert_eq!(json["path"], room.path);
 }
 
 #[tokio::test]
-async fn update_channel() {
+async fn update_room() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("chupd").await;
-    let channel = &tenant.channels[0];
+    let room = &tenant.rooms[0];
 
     let resp = app
         .auth_put(
             &format!(
-                "/api/tenant/{}/channel/{}",
-                tenant.tenant_id, channel.id
+                "/api/tenant/{}/room/{}",
+                tenant.tenant_id, room.id
             ),
             &tenant.admin.access_token,
         )
@@ -57,8 +57,8 @@ async fn update_channel() {
     let resp = app
         .auth_get(
             &format!(
-                "/api/tenant/{}/channel/{}",
-                tenant.tenant_id, channel.id
+                "/api/tenant/{}/room/{}",
+                tenant.tenant_id, room.id
             ),
             &tenant.admin.access_token,
         )
@@ -71,16 +71,16 @@ async fn update_channel() {
 }
 
 #[tokio::test]
-async fn delete_channel_soft_deletes() {
+async fn delete_room_soft_deletes() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("chdel").await;
-    let channel = &tenant.channels[2]; // delete "random"
+    let room = &tenant.rooms[2]; // delete "random"
 
     let resp = app
         .auth_delete(
             &format!(
-                "/api/tenant/{}/channel/{}",
-                tenant.tenant_id, channel.id
+                "/api/tenant/{}/room/{}",
+                tenant.tenant_id, room.id
             ),
             &tenant.admin.access_token,
         )
@@ -92,32 +92,32 @@ async fn delete_channel_soft_deletes() {
     let json: Value = resp.json().await.unwrap();
     assert_eq!(json["deleted"], true);
 
-    // List channels - should now show 2 instead of 3
+    // List rooms - should now show 2 instead of 3
     let resp = app
         .auth_get(
-            &format!("/api/tenant/{}/channel", tenant.tenant_id),
+            &format!("/api/tenant/{}/room", tenant.tenant_id),
             &tenant.admin.access_token,
         )
         .send()
         .await
         .unwrap();
 
-    let channels: Vec<Value> = resp.json().await.unwrap();
-    assert_eq!(channels.len(), 2);
+    let rooms: Vec<Value> = resp.json().await.unwrap();
+    assert_eq!(rooms.len(), 2);
 }
 
 #[tokio::test]
-async fn list_channel_members() {
+async fn list_room_members() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("chmem").await;
-    let channel = &tenant.channels[0];
+    let room = &tenant.rooms[0];
 
-    // Admin is already a member from channel creation.
-    // Member joins channel.
+    // Admin is already a member from room creation.
+    // Member joins room.
     app.auth_post(
         &format!(
-            "/api/tenant/{}/channel/{}/join",
-            tenant.tenant_id, channel.id
+            "/api/tenant/{}/room/{}/join",
+            tenant.tenant_id, room.id
         ),
         &tenant.member.access_token,
     )
@@ -128,8 +128,8 @@ async fn list_channel_members() {
     let resp = app
         .auth_get(
             &format!(
-                "/api/tenant/{}/channel/{}/member",
-                tenant.tenant_id, channel.id
+                "/api/tenant/{}/room/{}/member",
+                tenant.tenant_id, room.id
             ),
             &tenant.admin.access_token,
         )
@@ -146,7 +146,7 @@ async fn list_channel_members() {
 }
 
 #[tokio::test]
-async fn explore_channels() {
+async fn explore_rooms() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("chexpl").await;
 
@@ -154,7 +154,7 @@ async fn explore_channels() {
     let resp = app
         .auth_get(
             &format!(
-                "/api/tenant/{}/channel/explore?q=engineer",
+                "/api/tenant/{}/room/explore?q=engineer",
                 tenant.tenant_id
             ),
             &tenant.admin.access_token,
@@ -164,20 +164,20 @@ async fn explore_channels() {
         .unwrap();
 
     assert_eq!(resp.status().as_u16(), 200);
-    let channels: Vec<Value> = resp.json().await.unwrap();
-    assert_eq!(channels.len(), 1);
-    assert_eq!(channels[0]["name"], "engineering");
+    let rooms: Vec<Value> = resp.json().await.unwrap();
+    assert_eq!(rooms.len(), 1);
+    assert_eq!(rooms[0]["name"], "engineering");
 }
 
 #[tokio::test]
-async fn explore_channels_no_match() {
+async fn explore_rooms_no_match() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("chexpl2").await;
 
     let resp = app
         .auth_get(
             &format!(
-                "/api/tenant/{}/channel/explore?q=nonexistent",
+                "/api/tenant/{}/room/explore?q=nonexistent",
                 tenant.tenant_id
             ),
             &tenant.admin.access_token,
@@ -187,22 +187,22 @@ async fn explore_channels_no_match() {
         .unwrap();
 
     assert_eq!(resp.status().as_u16(), 200);
-    let channels: Vec<Value> = resp.json().await.unwrap();
-    assert!(channels.is_empty());
+    let rooms: Vec<Value> = resp.json().await.unwrap();
+    assert!(rooms.is_empty());
 }
 
 #[tokio::test]
-async fn cross_tenant_channel_get_forbidden() {
+async fn cross_tenant_room_get_forbidden() {
     let app = TestApp::spawn().await;
     let tenant_a = app.seed_tenant("chisoa").await;
     let tenant_b = app.seed_tenant("chisob").await;
 
-    // Try to get tenant_a's channel using tenant_b's member token
+    // Try to get tenant_a's room using tenant_b's member token
     let resp = app
         .auth_get(
             &format!(
-                "/api/tenant/{}/channel/{}",
-                tenant_a.tenant_id, tenant_a.channels[0].id
+                "/api/tenant/{}/room/{}",
+                tenant_a.tenant_id, tenant_a.rooms[0].id
             ),
             &tenant_b.admin.access_token,
         )

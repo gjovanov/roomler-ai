@@ -2,11 +2,15 @@ use axum::{
     extract::{Query, State, WebSocketUpgrade, ws::{Message, WebSocket}},
     response::Response,
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use bson::oid::ObjectId;
 use futures::{SinkExt, StreamExt};
+use hmac::{Hmac, Mac};
 use mediasoup::prelude::*;
 use serde::Deserialize;
+use sha1::Sha1;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -23,7 +27,6 @@ pub async fn ws_upgrade(
     Query(params): Query<WsParams>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    // Verify JWT before accepting the WebSocket
     let claims = match state.auth.verify_access_token(&params.token) {
         Ok(c) => c,
         Err(_) => {
@@ -54,10 +57,8 @@ async fn handle_socket(socket: WebSocket, state: AppState, user_id: ObjectId) {
     let (sender, mut receiver) = socket.split();
     let sender = Arc::new(Mutex::new(sender));
 
-    // Register connection
     state.ws_storage.add(user_id, connection_id.clone(), sender.clone());
 
-    // Send connected message
     {
         let msg = serde_json::json!({
             "type": "connected",
@@ -67,7 +68,6 @@ async fn handle_socket(socket: WebSocket, state: AppState, user_id: ObjectId) {
         let _ = guard.send(Message::text(serde_json::to_string(&msg).unwrap())).await;
     }
 
-    // Message loop
     while let Some(msg) = receiver.next().await {
         match msg {
             Ok(Message::Text(text)) => {
@@ -88,28 +88,29 @@ async fn handle_socket(socket: WebSocket, state: AppState, user_id: ObjectId) {
         }
     }
 
-    // Cleanup: remove WS connection
+    // Cleanup
     state.ws_storage.remove(&user_id, &connection_id, &sender);
 
-    // Cleanup: if this connection was in a media room, close their participant and notify peers
-    if let Some(conference_id) = state.room_manager.get_connection_conference(&connection_id) {
-        // Get remaining connection IDs before closing
+    if let Some(engine) = &state.transcription_engine {
+        engine.stop_connection_playbacks(&connection_id);
+    }
+
+    if let Some(room_id) = state.room_manager.get_connection_room(&connection_id) {
         let remaining_conns = state
             .room_manager
-            .get_other_connection_ids(&conference_id, &connection_id);
+            .get_other_connection_ids(&room_id, &connection_id);
 
         state
             .room_manager
-            .close_participant(&conference_id, &connection_id);
+            .close_participant(&room_id, &connection_id);
 
-        // Broadcast peer_left to remaining connections
         if !remaining_conns.is_empty() {
             let event = serde_json::json!({
                 "type": "media:peer_left",
                 "data": {
                     "user_id": user_id.to_hex(),
                     "connection_id": connection_id,
-                    "conference_id": conference_id.to_hex(),
+                    "room_id": room_id.to_hex(),
                 }
             });
             for conn_id in &remaining_conns {
@@ -138,23 +139,22 @@ async fn handle_client_message(state: &AppState, user_id: &ObjectId, connection_
             super::dispatcher::send_to_user(&state.ws_storage, user_id, &pong).await;
         }
         "typing:start" | "typing:stop" => {
-            if let Some(channel_id_str) = data.and_then(|d| d.get("channel_id")).and_then(|c| c.as_str()) {
-                if let Ok(cid) = ObjectId::parse_str(channel_id_str) {
-                    if let Ok(member_ids) = state.channels.find_member_user_ids(cid).await {
-                        let recipients: Vec<ObjectId> = member_ids
-                            .into_iter()
-                            .filter(|id| id != user_id)
-                            .collect();
-                        let event = serde_json::json!({
-                            "type": msg_type,
-                            "data": {
-                                "channel_id": channel_id_str,
-                                "user_id": user_id.to_hex(),
-                            }
-                        });
-                        super::dispatcher::broadcast(&state.ws_storage, &recipients, &event).await;
+            if let Some(room_id_str) = data.and_then(|d| d.get("room_id")).and_then(|c| c.as_str())
+                && let Ok(rid) = ObjectId::parse_str(room_id_str)
+                && let Ok(member_ids) = state.rooms.find_member_user_ids(rid).await
+            {
+                let recipients: Vec<ObjectId> = member_ids
+                    .into_iter()
+                    .filter(|id| id != user_id)
+                    .collect();
+                let event = serde_json::json!({
+                    "type": msg_type,
+                    "data": {
+                        "room_id": room_id_str,
+                        "user_id": user_id.to_hex(),
                     }
-                }
+                });
+                super::dispatcher::broadcast(&state.ws_storage, &recipients, &event).await;
             }
         }
         "presence:update" => {
@@ -170,7 +170,6 @@ async fn handle_client_message(state: &AppState, user_id: &ObjectId, connection_
                 super::dispatcher::broadcast(&state.ws_storage, &all_users, &event).await;
             }
         }
-        // --- Media signaling handlers ---
         "media:join" => {
             handle_media_join(state, user_id, connection_id, data).await;
         }
@@ -192,13 +191,18 @@ async fn handle_client_message(state: &AppState, user_id: &ObjectId, connection_
         "media:transcript_toggle" => {
             handle_transcript_toggle(state, user_id, connection_id, data).await;
         }
+        "media:play_audio" => {
+            handle_play_audio(state, user_id, connection_id, data).await;
+        }
+        "media:stop_audio" => {
+            handle_stop_audio(state, user_id, connection_id, data).await;
+        }
         _ => {
             debug!(?user_id, msg_type, "Unknown WS message type");
         }
     }
 }
 
-/// Send a media error message to the user.
 async fn send_media_error(state: &AppState, user_id: &ObjectId, message: &str) {
     let msg = serde_json::json!({
         "type": "media:error",
@@ -207,41 +211,38 @@ async fn send_media_error(state: &AppState, user_id: &ObjectId, message: &str) {
     super::dispatcher::send_to_user(&state.ws_storage, user_id, &msg).await;
 }
 
-/// Handle media:join — verify room exists, create transports, send capabilities + transports + existing producers
 async fn handle_media_join(
     state: &AppState,
     user_id: &ObjectId,
     connection_id: &str,
     data: Option<&serde_json::Value>,
 ) {
-    let conference_id_str = match data.and_then(|d| d.get("conference_id")).and_then(|c| c.as_str()) {
+    let room_id_str = match data.and_then(|d| d.get("room_id")).and_then(|c| c.as_str()) {
         Some(s) => s,
         None => {
-            send_media_error(state, user_id, "Missing conference_id").await;
+            send_media_error(state, user_id, "Missing room_id").await;
             return;
         }
     };
 
-    let confid = match ObjectId::parse_str(conference_id_str) {
+    let rid = match ObjectId::parse_str(room_id_str) {
         Ok(id) => id,
         Err(_) => {
-            send_media_error(state, user_id, "Invalid conference_id").await;
+            send_media_error(state, user_id, "Invalid room_id").await;
             return;
         }
     };
 
-    let room_exists = state.room_manager.has_room(&confid);
-    debug!(?user_id, %connection_id, ?confid, room_exists, "media:join room check");
+    let room_exists = state.room_manager.has_room(&rid);
+    debug!(?user_id, %connection_id, ?rid, room_exists, "media:join room check");
     if !room_exists {
         send_media_error(state, user_id, "Room does not exist").await;
         return;
     }
 
-    // Create transports for this participant (keyed by connection_id so same user
-    // can join from multiple tabs without overwriting state)
     let transport_pair = match state
         .room_manager
-        .create_transports(confid, *user_id, connection_id.to_string())
+        .create_transports(rid, *user_id, connection_id.to_string())
         .await
     {
         Ok(tp) => tp,
@@ -251,8 +252,7 @@ async fn handle_media_join(
         }
     };
 
-    // Send router capabilities (targeted to this connection only)
-    if let Some(room) = state.room_manager.rooms_ref().get(&confid) {
+    if let Some(room) = state.room_manager.rooms_ref().get(&rid) {
         let caps = serde_json::to_value(room.router.rtp_capabilities()).unwrap_or_default();
         let msg = serde_json::json!({
             "type": "media:router_capabilities",
@@ -261,12 +261,30 @@ async fn handle_media_join(
         super::dispatcher::send_to_connection(&state.ws_storage, connection_id, &msg).await;
     }
 
-    // Build ICE servers list (TURN) if configured
     let ice_servers: Vec<serde_json::Value> = if let Some(ref url) = state.settings.turn.url {
+        let (turn_username, turn_credential) = if let Some(ref secret) = state.settings.turn.shared_secret {
+            let expiry = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 86400;
+            let username = format!("{}:{}", expiry, user_id.to_hex());
+            let mut mac = Hmac::<Sha1>::new_from_slice(secret.as_bytes())
+                .expect("HMAC key length is valid");
+            mac.update(username.as_bytes());
+            let credential = BASE64.encode(mac.finalize().into_bytes());
+            debug!(%username, "Generated TURN ephemeral credentials");
+            (username, credential)
+        } else {
+            (
+                state.settings.turn.username.as_deref().unwrap_or("").to_string(),
+                state.settings.turn.password.as_deref().unwrap_or("").to_string(),
+            )
+        };
         vec![serde_json::json!({
             "urls": [url],
-            "username": state.settings.turn.username.as_deref().unwrap_or(""),
-            "credential": state.settings.turn.password.as_deref().unwrap_or(""),
+            "username": turn_username,
+            "credential": turn_credential,
         })]
     } else {
         vec![]
@@ -275,13 +293,11 @@ async fn handle_media_join(
     let force_relay = state.settings.turn.force_relay.unwrap_or(false);
 
     if force_relay {
-        warn!(
-            "force_relay=true with mediasoup — TURN relay won't work because mediasoup \
-             doesn't create server-side relay candidates. Set ROOMLER__TURN__FORCE_RELAY=false"
+        info!(
+            "force_relay=true — clients will use iceTransportPolicy='relay' via TURN server"
         );
     }
 
-    // Log ICE diagnostics
     info!(
         %connection_id,
         force_relay,
@@ -292,7 +308,6 @@ async fn handle_media_join(
         "media:join transport_created ICE diagnostics"
     );
 
-    // Send transport options (targeted to this connection only)
     let msg = serde_json::json!({
         "type": "media:transport_created",
         "data": {
@@ -304,8 +319,7 @@ async fn handle_media_join(
     });
     super::dispatcher::send_to_connection(&state.ws_storage, connection_id, &msg).await;
 
-    // Send list of existing producers to the new peer (excludes this connection's own producers)
-    let producers = state.room_manager.get_producer_ids(&confid, connection_id);
+    let producers = state.room_manager.get_producer_ids(&rid, connection_id);
     for (uid, conn_id, pid, kind, source) in producers {
         let msg = serde_json::json!({
             "type": "media:new_producer",
@@ -321,20 +335,17 @@ async fn handle_media_join(
     }
 }
 
-/// Handle media:connect_transport — connect a transport with DTLS parameters
 async fn handle_media_connect_transport(
     state: &AppState,
     connection_id: &str,
     data: Option<&serde_json::Value>,
 ) {
-    // We don't need user_id here — the room_manager looks up by connection_id.
-    // Errors are logged server-side; no user-facing error for connect_transport.
     let data = match data {
         Some(d) => d,
         None => return,
     };
 
-    let conference_id_str = match data.get("conference_id").and_then(|v| v.as_str()) {
+    let room_id_str = match data.get("room_id").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => return,
     };
@@ -350,21 +361,20 @@ async fn handle_media_connect_transport(
         None => return,
     };
 
-    let confid = match ObjectId::parse_str(conference_id_str) {
+    let rid = match ObjectId::parse_str(room_id_str) {
         Ok(id) => id,
         Err(_) => return,
     };
 
     if let Err(e) = state
         .room_manager
-        .connect_transport(&confid, connection_id, transport_id, dtls_parameters)
+        .connect_transport(&rid, connection_id, transport_id, dtls_parameters)
         .await
     {
         warn!(%connection_id, %e, "connect_transport failed");
     }
 }
 
-/// Handle media:produce — create a producer and broadcast new_producer to peers
 async fn handle_media_produce(
     state: &AppState,
     user_id: &ObjectId,
@@ -379,10 +389,10 @@ async fn handle_media_produce(
         }
     };
 
-    let conference_id_str = match data.get("conference_id").and_then(|v| v.as_str()) {
+    let room_id_str = match data.get("room_id").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => {
-            send_media_error(state, user_id, "Missing conference_id").await;
+            send_media_error(state, user_id, "Missing room_id").await;
             return;
         }
     };
@@ -415,32 +425,29 @@ async fn handle_media_produce(
         })
         .to_string();
 
-    let confid = match ObjectId::parse_str(conference_id_str) {
+    let rid = match ObjectId::parse_str(room_id_str) {
         Ok(id) => id,
         Err(_) => {
-            send_media_error(state, user_id, "Invalid conference_id").await;
+            send_media_error(state, user_id, "Invalid room_id").await;
             return;
         }
     };
 
     match state
         .room_manager
-        .produce(&confid, connection_id, kind, rtp_parameters, source.clone())
+        .produce(&rid, connection_id, kind, rtp_parameters, source.clone())
         .await
     {
         Ok(producer_id) => {
-            // Send produce_result to the producing connection only
             let result_msg = serde_json::json!({
                 "type": "media:produce_result",
                 "data": { "id": producer_id.to_string() }
             });
             super::dispatcher::send_to_connection(&state.ws_storage, connection_id, &result_msg).await;
 
-            // Broadcast new_producer to all other connections (not user_ids, to avoid
-            // same-user multi-tab leaking producers back to the producing connection)
             let other_conns = state
                 .room_manager
-                .get_other_connection_ids(&confid, connection_id);
+                .get_other_connection_ids(&rid, connection_id);
 
             if !other_conns.is_empty() {
                 let event = serde_json::json!({
@@ -458,13 +465,12 @@ async fn handle_media_produce(
                 }
             }
 
-            // Auto-start transcription pipeline if transcription is enabled for this conference
-            if matches!(kind, MediaKind::Audio) {
-                if let Some(engine) = &state.transcription_engine {
-                    if engine.is_enabled(&confid).await {
-                        start_transcription_pipeline(state, &confid, producer_id, *user_id, connection_id).await;
-                    }
-                }
+            if matches!(kind, MediaKind::Audio)
+                && let Some(engine) = &state.transcription_engine
+                && engine.is_enabled(&rid).await
+            {
+                start_transcription_pipeline(state, &rid, producer_id, *user_id, connection_id).await;
+                spawn_transcript_broadcast(engine.clone(), state.ws_storage.clone(), state.room_manager.clone(), rid);
             }
         }
         Err(e) => {
@@ -473,7 +479,6 @@ async fn handle_media_produce(
     }
 }
 
-/// Handle media:consume — create a consumer for a remote producer
 async fn handle_media_consume(
     state: &AppState,
     user_id: &ObjectId,
@@ -488,10 +493,10 @@ async fn handle_media_consume(
         }
     };
 
-    let conference_id_str = match data.get("conference_id").and_then(|v| v.as_str()) {
+    let room_id_str = match data.get("room_id").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => {
-            send_media_error(state, user_id, "Missing conference_id").await;
+            send_media_error(state, user_id, "Missing room_id").await;
             return;
         }
     };
@@ -513,10 +518,10 @@ async fn handle_media_consume(
         }
     };
 
-    let confid = match ObjectId::parse_str(conference_id_str) {
+    let rid = match ObjectId::parse_str(room_id_str) {
         Ok(id) => id,
         Err(_) => {
-            send_media_error(state, user_id, "Invalid conference_id").await;
+            send_media_error(state, user_id, "Invalid room_id").await;
             return;
         }
     };
@@ -531,7 +536,7 @@ async fn handle_media_consume(
 
     match state
         .room_manager
-        .consume(&confid, connection_id, producer_id, &rtp_capabilities)
+        .consume(&rid, connection_id, producer_id, &rtp_capabilities)
         .await
     {
         Ok(consumer_info) => {
@@ -552,7 +557,6 @@ async fn handle_media_consume(
     }
 }
 
-/// Handle media:producer_close — close a specific producer, notify peers
 async fn handle_media_producer_close(
     state: &AppState,
     user_id: &ObjectId,
@@ -564,7 +568,7 @@ async fn handle_media_producer_close(
         None => return,
     };
 
-    let conference_id_str = match data.get("conference_id").and_then(|v| v.as_str()) {
+    let room_id_str = match data.get("room_id").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => return,
     };
@@ -573,7 +577,7 @@ async fn handle_media_producer_close(
         None => return,
     };
 
-    let confid = match ObjectId::parse_str(conference_id_str) {
+    let rid = match ObjectId::parse_str(room_id_str) {
         Ok(id) => id,
         Err(_) => return,
     };
@@ -585,18 +589,16 @@ async fn handle_media_producer_close(
 
     if state
         .room_manager
-        .close_producer(&confid, connection_id, &producer_id)
+        .close_producer(&rid, connection_id, &producer_id)
     {
-        // Stop transcription pipeline for this producer
         if let Some(engine) = &state.transcription_engine {
-            engine.stop_producer(&confid, &producer_id.to_string());
+            engine.stop_producer(&rid, &producer_id.to_string());
         }
-        state.room_manager.remove_rtp_tap(&confid, &producer_id.to_string());
+        state.room_manager.remove_rtp_tap(&rid, &producer_id.to_string());
 
-        // Notify other connections (excluding this connection)
         let other_conns = state
             .room_manager
-            .get_other_connection_ids(&confid, connection_id);
+            .get_other_connection_ids(&rid, connection_id);
 
         if !other_conns.is_empty() {
             let event = serde_json::json!({
@@ -613,7 +615,6 @@ async fn handle_media_producer_close(
     }
 }
 
-/// Handle media:transcript_toggle — enable/disable transcription for a conference
 async fn handle_transcript_toggle(
     state: &AppState,
     _user_id: &ObjectId,
@@ -625,7 +626,7 @@ async fn handle_transcript_toggle(
         None => return,
     };
 
-    let conference_id_str = match data.get("conference_id").and_then(|v| v.as_str()) {
+    let room_id_str = match data.get("room_id").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => return,
     };
@@ -641,81 +642,34 @@ async fn handle_transcript_toggle(
         info!(%connection_id, %m, "transcript_toggle model requested");
     }
 
-    let confid = match ObjectId::parse_str(conference_id_str) {
+    let rid = match ObjectId::parse_str(room_id_str) {
         Ok(id) => id,
         Err(_) => return,
     };
 
-    // Start/stop transcription pipelines if engine is available
     if let Some(engine) = &state.transcription_engine {
         if enabled {
-            let model_name = model.as_deref().unwrap_or("whisper").to_string();
-            engine.enable_conference(confid, model_name).await;
+            let model_name = model.as_deref().unwrap_or(engine.default_backend_name()).to_string();
+            engine.enable_room(rid, model_name).await;
 
-            // Start pipelines for all existing audio producers in the room
-            let all_producers = state.room_manager.get_producer_ids(&confid, "");
+            let all_producers = state.room_manager.get_producer_ids(&rid, "");
             for (uid, conn_id, pid, kind, _source) in all_producers {
                 if matches!(kind, MediaKind::Audio) {
-                    start_transcription_pipeline(state, &confid, pid, uid, &conn_id).await;
+                    start_transcription_pipeline(state, &rid, pid, uid, &conn_id).await;
                 }
             }
 
-            // Spawn transcript broadcast task for this conference
-            let engine_clone = engine.clone();
-            let ws_storage = state.ws_storage.clone();
-            let room_manager = state.room_manager.clone();
-            let conf_id = confid;
-            tokio::spawn(async move {
-                let mut rx = engine_clone.subscribe();
-                info!(%conf_id, "Transcript broadcast task started");
-                while let Ok(event) = rx.recv().await {
-                    if event.conference_id != conf_id {
-                        continue;
-                    }
-                    // Check if still enabled
-                    if !engine_clone.is_enabled(&conf_id).await {
-                        break;
-                    }
-
-                    info!(
-                        text = %event.text,
-                        speaker = %event.speaker_name,
-                        "Broadcasting transcript to WS clients"
-                    );
-
-                    let msg = serde_json::json!({
-                        "type": "media:transcript",
-                        "data": {
-                            "user_id": event.user_id.to_hex(),
-                            "speaker_name": event.speaker_name,
-                            "text": event.text,
-                            "language": event.language,
-                            "confidence": event.confidence,
-                            "start_time": event.start_time,
-                            "end_time": event.end_time,
-                            "inference_duration_ms": event.inference_duration_ms,
-                        }
-                    });
-
-                    // Broadcast to all connections in the conference
-                    let conn_ids = room_manager.get_other_connection_ids(&conf_id, "");
-                    info!(count = conn_ids.len(), "Transcript target connections");
-                    for cid in &conn_ids {
-                        super::dispatcher::send_to_connection(&ws_storage, cid, &msg).await;
-                    }
-                }
-            });
+            spawn_transcript_broadcast(engine.clone(), state.ws_storage.clone(), state.room_manager.clone(), rid);
         } else {
-            engine.disable_conference(confid).await;
+            engine.disable_room(rid).await;
         }
     } else {
         warn!("Transcription engine not available — toggling UI state only (no ASR pipeline)");
     }
 
-    // Notify all connections about the status change
-    let all_conns = state.room_manager.get_other_connection_ids(&confid, "");
+    let all_conns = state.room_manager.get_other_connection_ids(&rid, connection_id);
     let mut status_data = serde_json::json!({
-        "conference_id": conference_id_str,
+        "room_id": room_id_str,
         "enabled": enabled,
     });
     if let Some(ref m) = model {
@@ -725,17 +679,15 @@ async fn handle_transcript_toggle(
         "type": "media:transcript_status",
         "data": status_data,
     });
-    // Also send to the toggling connection
     super::dispatcher::send_to_connection(&state.ws_storage, connection_id, &status_msg).await;
     for cid in &all_conns {
         super::dispatcher::send_to_connection(&state.ws_storage, cid, &status_msg).await;
     }
 }
 
-/// Starts a transcription pipeline for an audio producer.
 async fn start_transcription_pipeline(
     state: &AppState,
-    conference_id: &ObjectId,
+    room_id: &ObjectId,
     producer_id: ProducerId,
     user_id: ObjectId,
     _connection_id: &str,
@@ -745,20 +697,18 @@ async fn start_transcription_pipeline(
         None => return,
     };
 
-    // Get speaker name from participants
     let speaker_name = match state
-        .conferences
-        .find_participant_name(*conference_id, user_id)
+        .rooms
+        .find_participant_name(*room_id, user_id)
         .await
     {
         Ok(name) => name,
         Err(_) => user_id.to_hex()[..8].to_string(),
     };
 
-    // Create RTP tap
     let rtp_rx = match state
         .room_manager
-        .create_rtp_tap(conference_id, producer_id)
+        .create_rtp_tap(room_id, producer_id)
         .await
     {
         Ok(rx) => rx,
@@ -769,7 +719,7 @@ async fn start_transcription_pipeline(
     };
 
     engine.start_pipeline(
-        *conference_id,
+        *room_id,
         producer_id.to_string(),
         user_id,
         speaker_name,
@@ -777,44 +727,250 @@ async fn start_transcription_pipeline(
     );
 }
 
-/// Handle media:leave — close participant media and notify peers
+fn spawn_transcript_broadcast(
+    engine: Arc<roomler2_transcription::TranscriptionEngine>,
+    ws_storage: Arc<super::storage::WsStorage>,
+    room_manager: Arc<roomler2_services::media::room_manager::RoomManager>,
+    room_id: ObjectId,
+) {
+    if !engine.try_start_broadcast(room_id) {
+        debug!(%room_id, "Broadcast task already active, skipping spawn");
+        return;
+    }
+
+    let mut rx = engine.subscribe();
+    tokio::spawn(async move {
+        info!(%room_id, "Transcript broadcast task started");
+        while let Ok(event) = rx.recv().await {
+            if event.room_id != room_id {
+                continue;
+            }
+            if !engine.is_enabled(&room_id).await {
+                break;
+            }
+
+            info!(
+                text = %event.text,
+                speaker = %event.speaker_name,
+                "Broadcasting transcript to WS clients"
+            );
+
+            let msg = serde_json::json!({
+                "type": "media:transcript",
+                "data": {
+                    "user_id": event.user_id.to_hex(),
+                    "speaker_name": event.speaker_name,
+                    "text": event.text,
+                    "language": event.language,
+                    "confidence": event.confidence,
+                    "start_time": event.start_time,
+                    "end_time": event.end_time,
+                    "inference_duration_ms": event.inference_duration_ms,
+                    "is_final": event.is_final,
+                    "segment_id": event.segment_id,
+                }
+            });
+
+            let conn_ids = room_manager.get_other_connection_ids(&room_id, "");
+            info!(count = conn_ids.len(), "Transcript target connections");
+            for cid in &conn_ids {
+                super::dispatcher::send_to_connection(&ws_storage, cid, &msg).await;
+            }
+        }
+        engine.clear_broadcast(&room_id);
+        info!(%room_id, "Transcript broadcast task exited");
+    });
+}
+
 async fn handle_media_leave(
     state: &AppState,
     user_id: &ObjectId,
     connection_id: &str,
     data: Option<&serde_json::Value>,
 ) {
-    let conference_id_str = match data.and_then(|d| d.get("conference_id")).and_then(|c| c.as_str()) {
+    let room_id_str = match data.and_then(|d| d.get("room_id")).and_then(|c| c.as_str()) {
         Some(s) => s,
         None => return,
     };
 
-    let confid = match ObjectId::parse_str(conference_id_str) {
+    let rid = match ObjectId::parse_str(room_id_str) {
         Ok(id) => id,
         Err(_) => return,
     };
 
-    // Get remaining connections before closing (excluding this connection)
     let other_conns = state
         .room_manager
-        .get_other_connection_ids(&confid, connection_id);
+        .get_other_connection_ids(&rid, connection_id);
 
     state
         .room_manager
-        .close_participant(&confid, connection_id);
+        .close_participant(&rid, connection_id);
 
-    // Broadcast peer_left to remaining connections
     if !other_conns.is_empty() {
         let event = serde_json::json!({
             "type": "media:peer_left",
             "data": {
                 "user_id": user_id.to_hex(),
                 "connection_id": connection_id,
-                "conference_id": confid.to_hex(),
+                "room_id": rid.to_hex(),
             }
         });
         for conn_id in &other_conns {
             super::dispatcher::send_to_connection(&state.ws_storage, conn_id, &event).await;
         }
     }
+}
+
+async fn handle_play_audio(
+    state: &AppState,
+    user_id: &ObjectId,
+    connection_id: &str,
+    data: Option<&serde_json::Value>,
+) {
+    let data = match data {
+        Some(d) => d,
+        None => return,
+    };
+
+    let room_id_str = match data.get("room_id").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => return,
+    };
+    let file_id = match data.get("file_id").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => return,
+    };
+
+    let rid = match ObjectId::parse_str(room_id_str) {
+        Ok(id) => id,
+        Err(_) => return,
+    };
+    let fid = match ObjectId::parse_str(file_id) {
+        Ok(id) => id,
+        Err(_) => return,
+    };
+
+    // Look up the room to get tenant_id
+    let room = match state.rooms.base.find_by_id(rid).await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(%e, "Failed to find room for file playback");
+            return;
+        }
+    };
+
+    let file = match state.files.base.find_by_id_in_tenant(room.tenant_id, fid).await {
+        Ok(f) => f,
+        Err(e) => {
+            warn!(%e, "Failed to find file for playback");
+            return;
+        }
+    };
+
+    let mut playback_id = String::new();
+    if let Some(engine) = &state.transcription_engine {
+        if !engine.is_enabled(&rid).await {
+            engine.enable_room(rid, engine.default_backend_name().to_string()).await;
+        }
+
+        let upload_dir = std::env::var("ROOMLER_UPLOAD_DIR")
+            .unwrap_or_else(|_| "/tmp/roomler2-uploads".to_string());
+        let file_path = format!("{}/{}", upload_dir, file.storage_key);
+
+        let speaker_name = match state
+            .rooms
+            .find_participant_name(rid, *user_id)
+            .await
+        {
+            Ok(name) => name,
+            Err(_) => user_id.to_hex()[..8].to_string(),
+        };
+
+        if let Some(pid) = engine
+            .start_file_playback(rid, file_path.clone(), *user_id, speaker_name)
+            .await
+        {
+            playback_id = pid.clone();
+            engine.track_playback(connection_id, &pid);
+            info!(%pid, %file_path, "File playback pipeline started");
+        } else {
+            warn!(%file_path, "start_file_playback returned None — no ASR backend?");
+        }
+
+        spawn_transcript_broadcast(engine.clone(), state.ws_storage.clone(), state.room_manager.clone(), rid);
+    } else {
+        warn!("Transcription engine unavailable — file plays audio-only, no transcript");
+    }
+
+    let file_url = format!(
+        "/api/tenant/{}/file/{}/download",
+        room.tenant_id.to_hex(),
+        fid.to_hex(),
+    );
+    let msg = serde_json::json!({
+        "type": "media:audio_playback",
+        "data": {
+            "action": "start",
+            "file_url": file_url,
+            "file_id": file_id,
+            "filename": file.filename,
+            "playback_id": playback_id,
+            "room_id": room_id_str,
+        }
+    });
+
+    super::dispatcher::send_to_connection(&state.ws_storage, connection_id, &msg).await;
+    let other_conns = state.room_manager.get_other_connection_ids(&rid, connection_id);
+    for cid in &other_conns {
+        super::dispatcher::send_to_connection(&state.ws_storage, cid, &msg).await;
+    }
+
+    info!(%rid, %file_id, %playback_id, "Audio playback started");
+}
+
+async fn handle_stop_audio(
+    state: &AppState,
+    _user_id: &ObjectId,
+    connection_id: &str,
+    data: Option<&serde_json::Value>,
+) {
+    let data = match data {
+        Some(d) => d,
+        None => return,
+    };
+
+    let room_id_str = match data.get("room_id").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => return,
+    };
+    let playback_id = match data.get("playback_id").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => return,
+    };
+
+    let rid = match ObjectId::parse_str(room_id_str) {
+        Ok(id) => id,
+        Err(_) => return,
+    };
+
+    if let Some(engine) = &state.transcription_engine {
+        engine.stop_pipeline(playback_id);
+    }
+
+    let msg = serde_json::json!({
+        "type": "media:audio_playback",
+        "data": {
+            "action": "stop",
+            "playback_id": playback_id,
+            "room_id": room_id_str,
+        }
+    });
+
+    super::dispatcher::send_to_connection(&state.ws_storage, connection_id, &msg).await;
+    let other_conns = state.room_manager.get_other_connection_ids(&rid, connection_id);
+    for cid in &other_conns {
+        super::dispatcher::send_to_connection(&state.ws_storage, cid, &msg).await;
+    }
+
+    info!(%rid, %playback_id, "Audio playback stopped");
 }

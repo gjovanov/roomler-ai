@@ -6,7 +6,7 @@ pub struct Invite {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
     pub id: Option<ObjectId>,
     pub tenant_id: ObjectId,
-    pub channel_id: Option<ObjectId>,
+    pub room_id: Option<ObjectId>,
     pub code: String,
     pub inviter_id: ObjectId,
     pub target_email: Option<String>,

@@ -12,13 +12,13 @@ pub struct AddReactionRequest {
 pub async fn add(
     State(state): State<AppState>,
     auth: AuthUser,
-    Path((tenant_id, channel_id, message_id)): Path<(String, String, String)>,
+    Path((tenant_id, room_id, message_id)): Path<(String, String, String)>,
     Json(body): Json<AddReactionRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
-    let cid = ObjectId::parse_str(&channel_id)
-        .map_err(|_| ApiError::BadRequest("Invalid channel_id".to_string()))?;
+    let rid = ObjectId::parse_str(&room_id)
+        .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
     let mid = ObjectId::parse_str(&message_id)
         .map_err(|_| ApiError::BadRequest("Invalid message_id".to_string()))?;
 
@@ -28,17 +28,16 @@ pub async fn add(
 
     let reaction = state
         .reactions
-        .add_and_update_summary(&state.messages, tid, cid, mid, auth.user_id, body.emoji)
+        .add_and_update_summary(&state.messages, tid, rid, mid, auth.user_id, body.emoji)
         .await?;
 
-    // Broadcast reaction event to channel members
-    let member_ids = state.channels.find_member_user_ids(cid).await?;
+    let member_ids = state.rooms.find_member_user_ids(rid).await?;
     let event = serde_json::json!({
         "type": "message:reaction",
         "data": {
             "action": "add",
             "message_id": message_id,
-            "channel_id": channel_id,
+            "room_id": room_id,
             "user_id": auth.user_id.to_hex(),
             "emoji": reaction.emoji.value,
         }
@@ -51,7 +50,7 @@ pub async fn add(
 pub async fn remove(
     State(state): State<AppState>,
     auth: AuthUser,
-    Path((tenant_id, _channel_id, message_id, emoji)): Path<(String, String, String, String)>,
+    Path((tenant_id, room_id, message_id, emoji)): Path<(String, String, String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
@@ -68,15 +67,15 @@ pub async fn remove(
         .await?;
 
     if removed {
-        let cid = ObjectId::parse_str(&_channel_id)
-            .map_err(|_| ApiError::BadRequest("Invalid channel_id".to_string()))?;
-        let member_ids = state.channels.find_member_user_ids(cid).await?;
+        let rid = ObjectId::parse_str(&room_id)
+            .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
+        let member_ids = state.rooms.find_member_user_ids(rid).await?;
         let event = serde_json::json!({
             "type": "message:reaction",
             "data": {
                 "action": "remove",
                 "message_id": message_id,
-                "channel_id": _channel_id,
+                "room_id": room_id,
                 "user_id": auth.user_id.to_hex(),
                 "emoji": emoji,
             }

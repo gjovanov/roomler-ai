@@ -72,7 +72,7 @@ test.describe('WebSocket', () => {
 
     // Navigate to tenant page — WS should remain connected (SPA navigation)
     await page.goto(`/tenant/${tenant.id}`)
-    await expect(page.getByText(/channels/i).first()).toBeVisible({ timeout: 10000 })
+    await expect(page.getByText(/rooms/i).first()).toBeVisible({ timeout: 10000 })
 
     await page.waitForTimeout(2000)
     expect(wsErrors).toEqual([])

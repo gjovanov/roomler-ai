@@ -88,6 +88,7 @@ dotenvy = "0.15"
 # Transcription
 audiopus = "0.3.0-rc.0"
 rubato = "1"
+hound = "3.5"
 
 # Misc
 rand = "0.9"
@@ -97,5 +98,6 @@ async-trait = "0.1"
 urlencoding = "2"
 nanoid = "0.4"
 hmac = "0.12"
+sha1 = "0.10"
 sha2 = "0.10"
 hex = "0.4"

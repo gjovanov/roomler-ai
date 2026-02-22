@@ -75,7 +75,7 @@ const recentSegments = computed(() => {
 .speaker-label {
   font-weight: 600;
   margin-right: 8px;
-  color: #90caf9;
+  color: #80cbc4;
   font-size: 13px;
 }
 

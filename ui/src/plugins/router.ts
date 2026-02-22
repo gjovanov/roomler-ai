@@ -56,29 +56,24 @@ const routes: RouteRecordRaw[] = [
             component: () => import('@/views/dashboard/TenantDashboard.vue'),
           },
           {
-            path: 'channel/:channelId',
-            name: 'channel-chat',
+            path: 'room/:roomId',
+            name: 'room-chat',
             component: () => import('@/views/chat/ChatView.vue'),
           },
           {
-            path: 'channels',
-            name: 'channels',
-            component: () => import('@/views/channels/ChannelList.vue'),
+            path: 'room/:roomId/call',
+            name: 'room-call',
+            component: () => import('@/views/conference/ConferenceView.vue'),
+          },
+          {
+            path: 'rooms',
+            name: 'rooms',
+            component: () => import('@/views/rooms/RoomList.vue'),
           },
           {
             path: 'explore',
             name: 'explore',
-            component: () => import('@/views/channels/ExploreView.vue'),
-          },
-          {
-            path: 'conferences',
-            name: 'conferences',
-            component: () => import('@/views/conference/ConferenceList.vue'),
-          },
-          {
-            path: 'conference/:conferenceId',
-            name: 'conference',
-            component: () => import('@/views/conference/ConferenceView.vue'),
+            component: () => import('@/views/rooms/ExploreView.vue'),
           },
           {
             path: 'files',

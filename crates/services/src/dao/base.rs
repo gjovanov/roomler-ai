@@ -145,7 +145,7 @@ where
             items.push(doc);
         }
 
-        let total_pages = (total + params.per_page - 1) / params.per_page;
+        let total_pages = total.div_ceil(params.per_page);
 
         Ok(PaginatedResult {
             items,
@@ -161,10 +161,9 @@ where
             if let mongodb::error::ErrorKind::Write(mongodb::error::WriteFailure::WriteError(
                 ref write_error,
             )) = *e.kind
+                && write_error.code == 11000
             {
-                if write_error.code == 11000 {
-                    return DaoError::DuplicateKey(write_error.message.clone());
-                }
+                return DaoError::DuplicateKey(write_error.message.clone());
             }
             DaoError::Mongo(e)
         })?;
@@ -191,17 +190,17 @@ where
 
         // Merge update into the $set
         let mut final_update = update;
-        if let Some(set_doc) = final_update.get_document_mut("$set").ok() {
+        if let Ok(set_doc) = final_update.get_document_mut("$set") {
             set_doc.insert("updated_at", bson::DateTime::now());
         } else {
             let mut merged = update_with_timestamp;
             for (key, value) in final_update.iter() {
                 if key == "$set" {
-                    if let Some(existing_set) = merged.get_document_mut("$set").ok() {
-                        if let Some(new_set) = value.as_document() {
-                            for (k, v) in new_set.iter() {
-                                existing_set.insert(k, v.clone());
-                            }
+                    if let Ok(existing_set) = merged.get_document_mut("$set")
+                        && let Some(new_set) = value.as_document()
+                    {
+                        for (k, v) in new_set.iter() {
+                            existing_set.insert(k, v.clone());
                         }
                     }
                 } else {

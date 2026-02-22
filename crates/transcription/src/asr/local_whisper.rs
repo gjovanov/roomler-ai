@@ -4,6 +4,11 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 
 use super::{AsrBackend, AsrRequest, TranscriptionResult};
 
+/// Get the language string for a whisper language ID.
+fn whisper_lang_str(lang_id: i32) -> Option<String> {
+    whisper_rs::get_lang_str(lang_id).map(|s| s.to_string())
+}
+
 /// Local Whisper ASR backend using whisper.cpp via whisper-rs.
 pub struct LocalWhisperBackend {
     ctx: WhisperContext,
@@ -44,11 +49,20 @@ impl AsrBackend for LocalWhisperBackend {
                 .create_state()
                 .map_err(|e| anyhow::anyhow!("Failed to create Whisper state: {}", e))?;
 
-            let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+            let mut params = FullParams::new(SamplingStrategy::BeamSearch {
+                beam_size: 5,
+                patience: 1.0,
+            });
 
             if let Some(ref lang) = lang {
                 params.set_language(Some(lang));
+            } else {
+                // Enable auto language detection when no hint is provided
+                params.set_detect_language(true);
             }
+
+            // Always transcribe in the source language (never translate to English)
+            params.set_translate(false);
 
             // Suppress non-speech output
             params.set_print_progress(false);
@@ -56,8 +70,10 @@ impl AsrBackend for LocalWhisperBackend {
             params.set_print_realtime(false);
             params.set_print_timestamps(false);
 
-            // Single-segment mode for short utterances
-            params.set_single_segment(true);
+            // Allow multi-segment for better accuracy
+            params.set_single_segment(false);
+            params.set_no_speech_thold(0.6);
+            params.set_suppress_blank(true);
 
             state
                 .full(params, &audio)
@@ -67,19 +83,24 @@ impl AsrBackend for LocalWhisperBackend {
 
             let mut text = String::new();
             for i in 0..n_segments {
-                if let Some(segment) = state.get_segment(i) {
-                    if let Ok(seg_text) = segment.to_str() {
-                        text.push_str(seg_text);
-                    }
+                if let Some(segment) = state.get_segment(i)
+                    && let Ok(seg_text) = segment.to_str()
+                {
+                    text.push_str(seg_text);
                 }
             }
 
             let text = text.trim().to_string();
-            debug!(text_len = text.len(), "Whisper transcription complete");
+
+            // Detect language from whisper state (auto-detected by the model)
+            let detected_lang = whisper_lang_str(state.full_lang_id_from_state())
+                .or(lang);
+
+            debug!(text_len = text.len(), ?detected_lang, "Whisper transcription complete");
 
             Ok(TranscriptionResult {
                 text,
-                language: lang,
+                language: detected_lang,
                 confidence: None,
             })
         })

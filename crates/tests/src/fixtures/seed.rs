@@ -3,13 +3,13 @@ use serde_json::Value;
 
 use super::test_app::TestApp;
 
-/// Result of seeding a test tenant with users and channels.
+/// Result of seeding a test tenant with users and rooms.
 pub struct SeededTenant {
     pub tenant_id: String,
     pub tenant_slug: String,
     pub admin: SeededUser,
     pub member: SeededUser,
-    pub channels: Vec<SeededChannel>,
+    pub rooms: Vec<SeededRoom>,
 }
 
 pub struct SeededUser {
@@ -20,7 +20,7 @@ pub struct SeededUser {
     pub refresh_token: String,
 }
 
-pub struct SeededChannel {
+pub struct SeededRoom {
     pub id: String,
     pub name: String,
     pub path: String,
@@ -142,7 +142,7 @@ impl TestApp {
             .header("Authorization", format!("Bearer {}", token))
     }
 
-    /// Seed a full tenant with admin + member users, and 3 channels.
+    /// Seed a full tenant with admin + member users, and 3 rooms.
     pub async fn seed_tenant(&self, slug: &str) -> SeededTenant {
         let tenant_name = format!("{} Corp", slug);
 
@@ -185,7 +185,7 @@ impl TestApp {
             )
             .await;
 
-        // Add member to tenant (via direct DB for simplicity, since invite route isn't implemented yet)
+        // Add member to tenant (via direct DB for simplicity)
         {
             use bson::doc;
             let tid = ObjectId::parse_str(&tenant_id).unwrap();
@@ -223,35 +223,35 @@ impl TestApp {
                 .expect("Failed to add member to tenant");
         }
 
-        // Create channels
-        let channel_names = ["general", "engineering", "random"];
-        let mut channels = Vec::new();
+        // Create rooms
+        let room_names = ["general", "engineering", "random"];
+        let mut rooms = Vec::new();
 
-        for name in &channel_names {
+        for name in &room_names {
             let resp = self
                 .auth_post(
-                    &format!("/api/tenant/{}/channel", tenant_id),
+                    &format!("/api/tenant/{}/room", tenant_id),
                     &admin.access_token,
                 )
                 .json(&serde_json::json!({
                     "name": name,
-                    "channel_type": "text",
+                    "is_open": true,
                 }))
                 .send()
                 .await
-                .expect("Create channel failed");
+                .expect("Create room failed");
 
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             assert!(
                 status.is_success(),
-                "Create channel '{}' failed (status {}): {}",
+                "Create room '{}' failed (status {}): {}",
                 name, status, body
             );
 
             let json: Value = serde_json::from_str(&body)
-                .unwrap_or_else(|e| panic!("Failed to parse channel response for '{}': {} body='{}'", name, e, body));
-            channels.push(SeededChannel {
+                .unwrap_or_else(|e| panic!("Failed to parse room response for '{}': {} body='{}'", name, e, body));
+            rooms.push(SeededRoom {
                 id: json["id"].as_str().unwrap().to_string(),
                 name: name.to_string(),
                 path: json["path"].as_str().unwrap().to_string(),
@@ -263,7 +263,7 @@ impl TestApp {
             tenant_slug: slug.to_string(),
             admin,
             member,
-            channels,
+            rooms,
         }
     }
 }

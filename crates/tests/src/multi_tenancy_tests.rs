@@ -2,41 +2,41 @@ use crate::fixtures::test_app::TestApp;
 use serde_json::Value;
 
 #[tokio::test]
-async fn tenant_isolation_channels_not_visible_cross_tenant() {
+async fn tenant_isolation_rooms_not_visible_cross_tenant() {
     let app = TestApp::spawn().await;
 
     // Seed two tenants
     let acme = app.seed_tenant("acme").await;
     let beta = app.seed_tenant("beta").await;
 
-    // Acme admin lists channels - sees 3 acme channels
+    // Acme admin lists rooms - sees 3 acme rooms
     let resp = app
         .auth_get(
-            &format!("/api/tenant/{}/channel", acme.tenant_id),
+            &format!("/api/tenant/{}/room", acme.tenant_id),
             &acme.admin.access_token,
         )
         .send()
         .await
         .unwrap();
-    let acme_channels: Vec<Value> = resp.json().await.unwrap();
-    assert_eq!(acme_channels.len(), 3);
+    let acme_rooms: Vec<Value> = resp.json().await.unwrap();
+    assert_eq!(acme_rooms.len(), 3);
 
-    // Beta admin lists beta channels - sees 3 beta channels
+    // Beta admin lists beta rooms - sees 3 beta rooms
     let resp = app
         .auth_get(
-            &format!("/api/tenant/{}/channel", beta.tenant_id),
+            &format!("/api/tenant/{}/room", beta.tenant_id),
             &beta.admin.access_token,
         )
         .send()
         .await
         .unwrap();
-    let beta_channels: Vec<Value> = resp.json().await.unwrap();
-    assert_eq!(beta_channels.len(), 3);
+    let beta_rooms: Vec<Value> = resp.json().await.unwrap();
+    assert_eq!(beta_rooms.len(), 3);
 
     // Beta admin tries to access acme tenant - should be forbidden
     let resp = app
         .auth_get(
-            &format!("/api/tenant/{}/channel", acme.tenant_id),
+            &format!("/api/tenant/{}/room", acme.tenant_id),
             &beta.admin.access_token,
         )
         .send()
@@ -56,13 +56,13 @@ async fn tenant_isolation_messages_not_visible_cross_tenant() {
     let acme = app.seed_tenant("acme2").await;
     let beta = app.seed_tenant("beta2").await;
 
-    let acme_channel_id = &acme.channels[0].id;
+    let acme_room_id = &acme.rooms[0].id;
 
-    // Acme admin joins channel and posts a message
+    // Acme admin joins room and posts a message
     app.auth_post(
         &format!(
-            "/api/tenant/{}/channel/{}/join",
-            acme.tenant_id, acme_channel_id
+            "/api/tenant/{}/room/{}/join",
+            acme.tenant_id, acme_room_id
         ),
         &acme.admin.access_token,
     )
@@ -72,8 +72,8 @@ async fn tenant_isolation_messages_not_visible_cross_tenant() {
 
     app.auth_post(
         &format!(
-            "/api/tenant/{}/channel/{}/message",
-            acme.tenant_id, acme_channel_id
+            "/api/tenant/{}/room/{}/message",
+            acme.tenant_id, acme_room_id
         ),
         &acme.admin.access_token,
     )
@@ -88,8 +88,8 @@ async fn tenant_isolation_messages_not_visible_cross_tenant() {
     let resp = app
         .auth_get(
             &format!(
-                "/api/tenant/{}/channel/{}/message",
-                acme.tenant_id, acme_channel_id
+                "/api/tenant/{}/room/{}/message",
+                acme.tenant_id, acme_room_id
             ),
             &beta.admin.access_token,
         )
@@ -172,21 +172,20 @@ async fn unauthenticated_request_gets_401() {
 }
 
 #[tokio::test]
-async fn cannot_create_channel_in_foreign_tenant() {
+async fn cannot_create_room_in_foreign_tenant() {
     let app = TestApp::spawn().await;
 
     let acme = app.seed_tenant("acme5").await;
     let beta = app.seed_tenant("beta5").await;
 
-    // Beta admin tries to create channel in acme's tenant
+    // Beta admin tries to create room in acme's tenant
     let resp = app
         .auth_post(
-            &format!("/api/tenant/{}/channel", acme.tenant_id),
+            &format!("/api/tenant/{}/room", acme.tenant_id),
             &beta.admin.access_token,
         )
         .json(&serde_json::json!({
             "name": "infiltrator",
-            "channel_type": "text",
         }))
         .send()
         .await
@@ -195,6 +194,6 @@ async fn cannot_create_channel_in_foreign_tenant() {
     assert_eq!(
         resp.status().as_u16(),
         403,
-        "Creating channel in foreign tenant should be forbidden"
+        "Creating room in foreign tenant should be forbidden"
     );
 }

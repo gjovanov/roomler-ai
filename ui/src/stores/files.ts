@@ -16,11 +16,11 @@ export const useFileStore = defineStore('files', () => {
   const files = ref<FileEntry[]>([])
   const loading = ref(false)
 
-  async function fetchFiles(tenantId: string, channelId: string) {
+  async function fetchFiles(tenantId: string, roomId: string) {
     loading.value = true
     try {
       const data = await api.get<{ items: FileEntry[] }>(
-        `/tenant/${tenantId}/channel/${channelId}/file`,
+        `/tenant/${tenantId}/room/${roomId}/file`,
       )
       files.value = data.items
     } finally {
@@ -28,12 +28,12 @@ export const useFileStore = defineStore('files', () => {
     }
   }
 
-  async function uploadFile(tenantId: string, channelId: string, file: File) {
+  async function uploadFile(tenantId: string, roomId: string, file: File) {
     const form = new FormData()
     form.append('file', file)
-    form.append('channel_id', channelId)
+    form.append('room_id', roomId)
     const entry = await api.upload<FileEntry>(
-      `/tenant/${tenantId}/channel/file/upload`,
+      `/tenant/${tenantId}/file/upload`,
       form,
     )
     files.value.push(entry)
@@ -41,12 +41,12 @@ export const useFileStore = defineStore('files', () => {
   }
 
   async function deleteFile(tenantId: string, fileId: string) {
-    await api.delete(`/tenant/${tenantId}/channel/file/${fileId}`)
+    await api.delete(`/tenant/${tenantId}/file/${fileId}`)
     files.value = files.value.filter((f) => f.id !== fileId)
   }
 
   function downloadUrl(tenantId: string, fileId: string): string {
-    return `/api/tenant/${tenantId}/channel/file/${fileId}/download`
+    return `/api/tenant/${tenantId}/file/${fileId}/download`
   }
 
   return { files, loading, fetchFiles, uploadFile, deleteFile, downloadUrl }

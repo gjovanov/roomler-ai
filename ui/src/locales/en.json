@@ -16,22 +16,28 @@
   },
   "nav": {
     "dashboard": "Dashboard",
-    "channels": "Channels",
+    "rooms": "Rooms",
     "explore": "Explore",
-    "conferences": "Conferences",
     "files": "Files",
     "admin": "Admin",
     "settings": "Settings"
   },
-  "channel": {
-    "create": "Create Channel",
-    "name": "Channel Name",
-    "type": "Channel Type",
+  "room": {
+    "create": "Create Room",
+    "name": "Room Name",
     "private": "Private",
+    "open": "Open (public)",
+    "hasMedia": "Enable calls",
     "join": "Join",
     "leave": "Leave",
     "members": "Members",
-    "noMessages": "No messages yet. Start the conversation!"
+    "noMessages": "No messages yet. Start the conversation!",
+    "parent": "Parent Room (optional)",
+    "none": "None (root room)",
+    "createChild": "Create Sub-Room",
+    "startCall": "Start Call",
+    "callStarted": "Call started in {room}",
+    "joinCall": "Join"
   },
   "message": {
     "placeholder": "Type a message...",
@@ -42,7 +48,7 @@
     "reply": "Reply",
     "thread": "Thread"
   },
-  "conference": {
+  "call": {
     "start": "Start Meeting",
     "join": "Join Meeting",
     "leave": "Leave",
@@ -79,7 +85,10 @@
     "transcriptionOff": "Transcription disabled",
     "transcriptionModel": "Transcription Model",
     "modelWhisper": "Whisper",
-    "modelCanary": "Canary"
+    "modelCanary": "Canary",
+    "files": "Files",
+    "noFiles": "No files uploaded yet",
+    "uploadFile": "Upload File"
   },
   "files": {
     "upload": "Upload",

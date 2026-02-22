@@ -119,28 +119,36 @@ impl SileroVad {
 
         while self.pending_samples.len() >= CHUNK_SIZE {
             let chunk: Vec<f32> = self.pending_samples.drain(..CHUNK_SIZE).collect();
-            if let Some(event) = self.process_chunk(&chunk) {
-                events.push(event);
-            }
+            events.extend(self.process_chunk(&chunk));
         }
 
         events
     }
 
+    /// Returns true if speech is currently in progress.
+    pub fn is_speech_active(&self) -> bool {
+        self.state == VadState::Speech
+    }
+
+    /// Returns a clone of the current speech buffer (accumulated audio since SpeechStart).
+    pub fn speech_buffer(&self) -> &[f32] {
+        &self.speech_buffer
+    }
+
     /// Processes a single 512-sample chunk through the VAD model.
-    fn process_chunk(&mut self, chunk: &[f32]) -> Option<VadEvent> {
+    fn process_chunk(&mut self, chunk: &[f32]) -> Vec<VadEvent> {
         self.chunk_count += 1;
 
         let speech_prob = match self.run_inference(chunk) {
             Ok(prob) => prob,
             Err(e) => {
                 warn!("VAD inference error: {}", e);
-                return None;
+                return vec![];
             }
         };
 
         // Log periodically so we can see if VAD is working
-        if self.chunk_count % 100 == 0 {
+        if self.chunk_count.is_multiple_of(100) {
             let rms: f32 = (chunk.iter().map(|&x| x * x).sum::<f32>() / chunk.len() as f32).sqrt();
             debug!(
                 self.chunk_count,
@@ -163,6 +171,7 @@ impl SileroVad {
                         self.speech_buffer.extend_from_slice(chunk);
                         self.speech_sample_count += chunk.len();
                         debug!(speech_prob, "VAD: speech started");
+                        return vec![VadEvent::SpeechStart];
                     } else {
                         self.pre_speech_buffer.push(chunk.to_vec());
                     }
@@ -170,7 +179,7 @@ impl SileroVad {
                     self.speech_frames = 0;
                     self.pre_speech_buffer.push(chunk.to_vec());
                 }
-                None
+                vec![]
             }
             VadState::Speech => {
                 self.speech_buffer.extend_from_slice(chunk);
@@ -178,19 +187,19 @@ impl SileroVad {
 
                 if self.speech_sample_count >= self.max_speech_samples {
                     debug!("VAD: speech force-ended (max duration)");
-                    return Some(self.emit_speech_end());
+                    return vec![self.emit_speech_end()];
                 }
 
                 if speech_prob < self.end_threshold {
                     self.silence_frames += 1;
                     if self.silence_frames >= self.min_silence_frames {
                         debug!(speech_prob, "VAD: speech ended");
-                        return Some(self.emit_speech_end());
+                        return vec![self.emit_speech_end()];
                     }
                 } else {
                     self.silence_frames = 0;
                 }
-                None
+                vec![]
             }
         }
     }
@@ -245,13 +254,13 @@ impl SileroVad {
         let speech_prob = output_data.first().copied().unwrap_or(0.0);
 
         // Output 1: updated state [2, 1, 128]
-        let expected = 2 * 1 * V5_HIDDEN_SIZE;
-        if let Ok((_shape, state_data)) = outputs[1].try_extract_tensor::<f32>() {
-            if state_data.len() == expected {
-                self.combined_state =
-                    Array3::from_shape_vec((2, 1, V5_HIDDEN_SIZE), state_data.to_vec())
-                        .unwrap_or_else(|_| Array3::zeros((2, 1, V5_HIDDEN_SIZE)));
-            }
+        let expected = 2 * V5_HIDDEN_SIZE;
+        if let Ok((_shape, state_data)) = outputs[1].try_extract_tensor::<f32>()
+            && state_data.len() == expected
+        {
+            self.combined_state =
+                Array3::from_shape_vec((2, 1, V5_HIDDEN_SIZE), state_data.to_vec())
+                    .unwrap_or_else(|_| Array3::zeros((2, 1, V5_HIDDEN_SIZE)));
         }
 
         Ok(speech_prob)
@@ -277,18 +286,18 @@ impl SileroVad {
             .map_err(|e| anyhow::anyhow!("Output extraction error: {}", e))?;
         let speech_prob = output_data.first().copied().unwrap_or(0.0);
 
-        let expected = 2 * 1 * V4_HIDDEN_SIZE;
-        if let Ok((_shape, hn_data)) = outputs[1].try_extract_tensor::<f32>() {
-            if hn_data.len() == expected {
-                self.h = Array3::from_shape_vec((2, 1, V4_HIDDEN_SIZE), hn_data.to_vec())
-                    .unwrap_or_else(|_| Array3::zeros((2, 1, V4_HIDDEN_SIZE)));
-            }
+        let expected = 2 * V4_HIDDEN_SIZE;
+        if let Ok((_shape, hn_data)) = outputs[1].try_extract_tensor::<f32>()
+            && hn_data.len() == expected
+        {
+            self.h = Array3::from_shape_vec((2, 1, V4_HIDDEN_SIZE), hn_data.to_vec())
+                .unwrap_or_else(|_| Array3::zeros((2, 1, V4_HIDDEN_SIZE)));
         }
-        if let Ok((_shape, cn_data)) = outputs[2].try_extract_tensor::<f32>() {
-            if cn_data.len() == expected {
-                self.c = Array3::from_shape_vec((2, 1, V4_HIDDEN_SIZE), cn_data.to_vec())
-                    .unwrap_or_else(|_| Array3::zeros((2, 1, V4_HIDDEN_SIZE)));
-            }
+        if let Ok((_shape, cn_data)) = outputs[2].try_extract_tensor::<f32>()
+            && cn_data.len() == expected
+        {
+            self.c = Array3::from_shape_vec((2, 1, V4_HIDDEN_SIZE), cn_data.to_vec())
+                .unwrap_or_else(|_| Array3::zeros((2, 1, V4_HIDDEN_SIZE)));
         }
 
         Ok(speech_prob)

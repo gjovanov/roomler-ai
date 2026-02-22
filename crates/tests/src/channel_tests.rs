@@ -2,14 +2,14 @@ use crate::fixtures::test_app::TestApp;
 use serde_json::Value;
 
 #[tokio::test]
-async fn create_channel_and_list() {
+async fn create_room_and_list() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("chantest").await;
 
-    // List channels (admin sees all 3 seeded channels)
+    // List rooms (admin sees all 3 seeded rooms)
     let resp = app
         .auth_get(
-            &format!("/api/tenant/{}/channel", tenant.tenant_id),
+            &format!("/api/tenant/{}/room", tenant.tenant_id),
             &tenant.admin.access_token,
         )
         .send()
@@ -18,29 +18,29 @@ async fn create_channel_and_list() {
 
     assert_eq!(resp.status().as_u16(), 200);
 
-    let channels: Vec<Value> = resp.json().await.unwrap();
-    assert_eq!(channels.len(), 3);
+    let rooms: Vec<Value> = resp.json().await.unwrap();
+    assert_eq!(rooms.len(), 3);
 
-    let names: Vec<&str> = channels.iter().map(|c| c["name"].as_str().unwrap()).collect();
+    let names: Vec<&str> = rooms.iter().map(|c| c["name"].as_str().unwrap()).collect();
     assert!(names.contains(&"general"));
     assert!(names.contains(&"engineering"));
     assert!(names.contains(&"random"));
 }
 
 #[tokio::test]
-async fn create_channel_with_hierarchy() {
+async fn create_room_with_hierarchy() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("hierarchy").await;
 
     // Create a category
     let resp = app
         .auth_post(
-            &format!("/api/tenant/{}/channel", tenant.tenant_id),
+            &format!("/api/tenant/{}/room", tenant.tenant_id),
             &tenant.admin.access_token,
         )
         .json(&serde_json::json!({
             "name": "development",
-            "channel_type": "category",
+            "room_type": "category",
         }))
         .send()
         .await
@@ -50,15 +50,14 @@ async fn create_channel_with_hierarchy() {
     let category: Value = resp.json().await.unwrap();
     let category_id = category["id"].as_str().unwrap();
 
-    // Create a child channel
+    // Create a child room
     let resp = app
         .auth_post(
-            &format!("/api/tenant/{}/channel", tenant.tenant_id),
+            &format!("/api/tenant/{}/room", tenant.tenant_id),
             &tenant.admin.access_token,
         )
         .json(&serde_json::json!({
             "name": "frontend",
-            "channel_type": "text",
             "parent_id": category_id,
         }))
         .send()
@@ -73,17 +72,17 @@ async fn create_channel_with_hierarchy() {
 }
 
 #[tokio::test]
-async fn join_and_leave_channel() {
+async fn join_and_leave_room() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("joinleave").await;
-    let channel_id = &tenant.channels[0].id;
+    let room_id = &tenant.rooms[0].id;
 
-    // Member joins channel
+    // Member joins room
     let resp = app
         .auth_post(
             &format!(
-                "/api/tenant/{}/channel/{}/join",
-                tenant.tenant_id, channel_id
+                "/api/tenant/{}/room/{}/join",
+                tenant.tenant_id, room_id
             ),
             &tenant.member.access_token,
         )
@@ -95,12 +94,12 @@ async fn join_and_leave_channel() {
     let json: Value = resp.json().await.unwrap();
     assert_eq!(json["joined"], true);
 
-    // Member leaves channel
+    // Member leaves room
     let resp = app
         .auth_post(
             &format!(
-                "/api/tenant/{}/channel/{}/leave",
-                tenant.tenant_id, channel_id
+                "/api/tenant/{}/room/{}/leave",
+                tenant.tenant_id, room_id
             ),
             &tenant.member.access_token,
         )
@@ -114,19 +113,18 @@ async fn join_and_leave_channel() {
 }
 
 #[tokio::test]
-async fn create_duplicate_channel_returns_409() {
+async fn create_duplicate_room_returns_409() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("dupch").await;
 
-    // Create a channel
+    // Create a room
     let resp = app
         .auth_post(
-            &format!("/api/tenant/{}/channel", tenant.tenant_id),
+            &format!("/api/tenant/{}/room", tenant.tenant_id),
             &tenant.admin.access_token,
         )
         .json(&serde_json::json!({
-            "name": "unique-channel",
-            "channel_type": "text",
+            "name": "unique-room",
         }))
         .send()
         .await
@@ -134,15 +132,14 @@ async fn create_duplicate_channel_returns_409() {
 
     assert_eq!(resp.status().as_u16(), 200);
 
-    // Try to create a channel with the same name — should return 409 Conflict
+    // Try to create a room with the same name — should return 409 Conflict
     let resp = app
         .auth_post(
-            &format!("/api/tenant/{}/channel", tenant.tenant_id),
+            &format!("/api/tenant/{}/room", tenant.tenant_id),
             &tenant.admin.access_token,
         )
         .json(&serde_json::json!({
-            "name": "unique-channel",
-            "channel_type": "text",
+            "name": "unique-room",
         }))
         .send()
         .await
@@ -152,13 +149,13 @@ async fn create_duplicate_channel_returns_409() {
 }
 
 #[tokio::test]
-async fn channel_list_returns_plain_array() {
+async fn room_list_returns_plain_array() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("arrfmt").await;
 
     let resp = app
         .auth_get(
-            &format!("/api/tenant/{}/channel", tenant.tenant_id),
+            &format!("/api/tenant/{}/room", tenant.tenant_id),
             &tenant.admin.access_token,
         )
         .send()
@@ -179,14 +176,14 @@ async fn channel_list_returns_plain_array() {
 }
 
 #[tokio::test]
-async fn explore_channels_returns_plain_array() {
+async fn explore_rooms_returns_plain_array() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("explarr").await;
 
     let resp = app
         .auth_get(
             &format!(
-                "/api/tenant/{}/channel/explore?q=general",
+                "/api/tenant/{}/room/explore?q=general",
                 tenant.tenant_id
             ),
             &tenant.admin.access_token,
@@ -209,14 +206,14 @@ async fn explore_channels_returns_plain_array() {
 }
 
 #[tokio::test]
-async fn member_can_list_channels() {
+async fn member_can_list_rooms() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("memlist").await;
 
-    // Member lists channels
+    // Member lists rooms
     let resp = app
         .auth_get(
-            &format!("/api/tenant/{}/channel", tenant.tenant_id),
+            &format!("/api/tenant/{}/room", tenant.tenant_id),
             &tenant.member.access_token,
         )
         .send()
@@ -224,6 +221,6 @@ async fn member_can_list_channels() {
         .unwrap();
 
     assert_eq!(resp.status().as_u16(), 200);
-    let channels: Vec<Value> = resp.json().await.unwrap();
-    assert_eq!(channels.len(), 3);
+    let rooms: Vec<Value> = resp.json().await.unwrap();
+    assert_eq!(rooms.len(), 3);
 }

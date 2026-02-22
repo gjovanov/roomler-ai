@@ -83,11 +83,11 @@
 import { ref, computed, onMounted } from 'vue'
 import { useRoute } from 'vue-router'
 import { useFileStore } from '@/stores/files'
-import { useChannelStore } from '@/stores/channels'
+import { useRoomStore } from '@/stores/rooms'
 
 const route = useRoute()
 const fileStore = useFileStore()
-const channelStore = useChannelStore()
+const roomStore = useRoomStore()
 
 const tenantId = computed(() => route.params.tenantId as string)
 const fileInputRef = ref<HTMLInputElement | null>(null)
@@ -103,11 +103,11 @@ async function handleFileSelect(event: Event) {
   if (!files?.length) return
 
   uploading.value = true
-  const channelId = channelStore.current?.id || channelStore.channels[0]?.id
-  if (!channelId) return
+  const roomId = roomStore.current?.id || roomStore.rooms[0]?.id
+  if (!roomId) return
 
   for (const file of files) {
-    await fileStore.uploadFile(tenantId.value, channelId, file)
+    await fileStore.uploadFile(tenantId.value, roomId, file)
   }
   uploading.value = false
   input.value = ''
@@ -134,9 +134,9 @@ function formatSize(bytes: number): string {
 }
 
 onMounted(() => {
-  const channelId = channelStore.current?.id || channelStore.channels[0]?.id
-  if (channelId) {
-    fileStore.fetchFiles(tenantId.value, channelId)
+  const roomId = roomStore.current?.id || roomStore.rooms[0]?.id
+  if (roomId) {
+    fileStore.fetchFiles(tenantId.value, roomId)
   }
 })
 </script>

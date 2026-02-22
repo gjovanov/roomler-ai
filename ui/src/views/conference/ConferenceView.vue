@@ -2,10 +2,10 @@
   <v-container fluid class="fill-height pa-0">
     <v-row no-gutters class="fill-height">
       <v-col class="d-flex flex-column fill-height">
-        <!-- Conference header -->
+        <!-- Call header -->
         <v-toolbar density="compact" flat>
           <v-toolbar-title>
-            {{ conferenceStore.current?.subject || 'Meeting' }}
+            {{ roomStore.current?.name || 'Call' }}
           </v-toolbar-title>
           <v-spacer />
           <LayoutSwitcher
@@ -18,17 +18,24 @@
           />
           <TranscriptionSwitcher
             v-if="joined"
-            :enabled="conferenceStore.transcriptionEnabled"
-            :selected-model="conferenceStore.selectedTranscriptionModel"
-            @update:model="conferenceStore.setSelectedTranscriptionModel"
+            :enabled="roomStore.transcriptionEnabled"
+            :selected-model="roomStore.selectedTranscriptionModel"
+            @update:model="roomStore.setSelectedTranscriptionModel"
             @toggle="toggleTranscription"
           />
           <v-btn
-            v-if="joined && conferenceStore.transcriptionEnabled"
+            v-if="joined && roomStore.transcriptionEnabled"
             :icon="showTranscriptPanel ? 'mdi-text-box' : 'mdi-text-box-outline'"
             variant="text"
             :color="showTranscriptPanel ? 'primary' : undefined"
             @click="showTranscriptPanel = !showTranscriptPanel"
+          />
+          <v-btn
+            v-if="joined"
+            :icon="showFiles ? 'mdi-folder' : 'mdi-folder-outline'"
+            variant="text"
+            :color="showFiles ? 'primary' : undefined"
+            @click="toggleFiles"
           />
           <v-btn
             v-if="joined"
@@ -38,7 +45,7 @@
             @click="showChat = !showChat"
           />
           <v-chip size="small" :color="statusColor">
-            {{ conferenceStore.current?.status }}
+            {{ roomStore.current?.conference_status }}
           </v-chip>
         </v-toolbar>
 
@@ -59,11 +66,11 @@
                 :loading="joining"
                 @click="handleJoin"
               >
-                {{ $t('conference.join') }}
+                {{ $t('call.join') }}
               </v-btn>
             </div>
 
-            <!-- Active conference: dynamic layout -->
+            <!-- Active call: dynamic layout -->
             <component
               v-else
               :is="layoutComponent"
@@ -74,15 +81,23 @@
 
             <!-- Transcript subtitle overlay -->
             <TranscriptOverlay
-              v-if="joined && conferenceStore.transcriptionEnabled"
-              :segments="conferenceStore.transcriptSegments"
+              v-if="joined && roomStore.transcriptionEnabled"
+              :segments="roomStore.transcriptSegments"
             />
           </div>
 
           <!-- Transcript panel -->
           <TranscriptPanel
-            v-if="joined && showTranscriptPanel && conferenceStore.transcriptionEnabled"
-            :segments="conferenceStore.transcriptSegments"
+            v-if="joined && showTranscriptPanel && roomStore.transcriptionEnabled"
+            :segments="roomStore.transcriptSegments"
+          />
+
+          <!-- Files panel -->
+          <ConferenceFilesPanel
+            v-if="joined && showFiles"
+            :tenant-id="tenantId"
+            :room-id="roomId"
+            @play="handlePlayFile"
           />
 
           <!-- Chat panel -->
@@ -92,7 +107,7 @@
           >
             <v-toolbar density="compact" flat>
               <v-toolbar-title class="text-body-1">
-                {{ $t('conference.chat') }}
+                {{ $t('call.chat') }}
               </v-toolbar-title>
             </v-toolbar>
             <v-divider />
@@ -100,13 +115,13 @@
             <!-- Messages list -->
             <div ref="chatListRef" class="flex-grow-1 overflow-y-auto pa-3">
               <div
-                v-if="conferenceStore.chatMessages.length === 0"
+                v-if="roomStore.chatMessages.length === 0"
                 class="text-center text-medium-emphasis mt-4"
               >
-                {{ $t('conference.noChatMessages') }}
+                {{ $t('call.noChatMessages') }}
               </div>
               <div
-                v-for="msg in conferenceStore.chatMessages"
+                v-for="msg in roomStore.chatMessages"
                 :key="msg.id"
                 class="mb-3"
               >
@@ -135,7 +150,7 @@
             <div class="pa-2">
               <v-text-field
                 v-model="chatInput"
-                :placeholder="$t('conference.chatPlaceholder')"
+                :placeholder="$t('call.chatPlaceholder')"
                 variant="outlined"
                 density="compact"
                 hide-details
@@ -183,9 +198,10 @@
 import { ref, computed, onMounted, watch, nextTick, type Component } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
-import { useConferenceStore } from '@/stores/conference'
+import { useRoomStore } from '@/stores/rooms'
 import { useWsStore } from '@/stores/ws'
 import { useMediasoup } from '@/composables/useMediasoup'
+import { useAudioPlayback } from '@/composables/useAudioPlayback'
 import { useActiveSpeaker } from '@/composables/useActiveSpeaker'
 import { useConferenceLayout } from '@/composables/useConferenceLayout'
 import { usePictureInPicture } from '@/composables/usePictureInPicture'
@@ -193,6 +209,7 @@ import LayoutSwitcher from '@/components/conference/LayoutSwitcher.vue'
 import TranscriptionSwitcher from '@/components/conference/TranscriptionSwitcher.vue'
 import TranscriptOverlay from '@/components/conference/TranscriptOverlay.vue'
 import TranscriptPanel from '@/components/conference/TranscriptPanel.vue'
+import ConferenceFilesPanel from '@/components/conference/ConferenceFilesPanel.vue'
 import TiledLayout from '@/components/conference/layouts/TiledLayout.vue'
 import SpotlightLayout from '@/components/conference/layouts/SpotlightLayout.vue'
 import SidebarLayout from '@/components/conference/layouts/SidebarLayout.vue'
@@ -200,25 +217,27 @@ import SidebarLayout from '@/components/conference/layouts/SidebarLayout.vue'
 const route = useRoute()
 const router = useRouter()
 const authStore = useAuthStore()
-const conferenceStore = useConferenceStore()
+const roomStore = useRoomStore()
 const wsStore = useWsStore()
 const mediasoup = useMediasoup()
 const activeSpeaker = useActiveSpeaker(mediasoup.remoteStreams)
 const pip = usePictureInPicture()
+const audioPlayback = useAudioPlayback()
 
 const tenantId = computed(() => route.params.tenantId as string)
-const conferenceId = computed(() => route.params.conferenceId as string)
+const roomId = computed(() => route.params.roomId as string)
 const joined = ref(false)
 const joining = ref(false)
 const showChat = ref(false)
 const showTranscriptPanel = ref(false)
+const showFiles = ref(false)
 const chatInput = ref('')
 const chatListRef = ref<HTMLElement | null>(null)
 
 const localDisplayName = computed(() => authStore.user?.display_name ?? 'You')
 
 function getDisplayName(userId: string): string {
-  const participant = conferenceStore.participants.find((p) => p.user_id === userId)
+  const participant = roomStore.participants.find((p) => p.user_id === userId)
   return participant?.display_name || userId.slice(0, 8)
 }
 
@@ -291,7 +310,7 @@ function togglePiP() {
 }
 
 const statusColor = computed(() => {
-  switch (conferenceStore.current?.status) {
+  switch (roomStore.current?.conference_status) {
     case 'InProgress': return 'success'
     case 'Scheduled': return 'info'
     case 'Ended': return 'grey'
@@ -312,7 +331,7 @@ function scrollChatToBottom() {
 
 // Auto-scroll when new messages arrive
 watch(
-  () => conferenceStore.chatMessages.length,
+  () => roomStore.chatMessages.length,
   async () => {
     await nextTick()
     scrollChatToBottom()
@@ -324,7 +343,7 @@ async function handleSendChat() {
   if (!content) return
   chatInput.value = ''
   try {
-    await conferenceStore.sendChatMessage(tenantId.value, conferenceId.value, content)
+    await roomStore.sendChatMessage(tenantId.value, roomId.value, content)
   } catch (err) {
     console.error('Failed to send chat message:', err)
   }
@@ -336,33 +355,36 @@ async function handleJoin() {
   try {
     // Always call start to ensure the in-memory mediasoup room exists
     // (it may have been lost on server restart even if DB status is InProgress)
-    await conferenceStore.startConference(tenantId.value, conferenceId.value)
+    await roomStore.startCall(tenantId.value, roomId.value)
 
     // REST join (adds participant to DB)
-    await conferenceStore.joinConference(tenantId.value, conferenceId.value)
+    await roomStore.joinCall(tenantId.value, roomId.value)
 
-    // Fetch conference details
-    await conferenceStore.fetchConference(tenantId.value, conferenceId.value)
+    // Fetch room details
+    await roomStore.fetchRoom(tenantId.value, roomId.value)
 
     // mediasoup signaling join (loads device, connects transports)
-    await mediasoup.joinRoom(conferenceId.value)
+    await mediasoup.joinRoom(roomId.value)
 
     // Produce local audio + video
     await mediasoup.produceLocalMedia()
 
     // Fetch participants for display names
-    await conferenceStore.fetchParticipants(tenantId.value, conferenceId.value)
+    await roomStore.fetchParticipants(tenantId.value, roomId.value)
 
-    // Fetch existing chat messages
-    await conferenceStore.fetchChatMessages(tenantId.value, conferenceId.value)
+    // Fetch existing chat messages (non-blocking — don't break join if endpoint missing)
+    roomStore.fetchChatMessages(tenantId.value, roomId.value).catch(() => {})
 
     joined.value = true
     showChat.value = true
 
     // Start active speaker detection
     activeSpeaker.start()
+
+    // Register audio playback handler
+    wsStore.onMediaMessage('media:audio_playback', audioPlayback.handlePlaybackMessage)
   } catch (err) {
-    console.error('Failed to join conference:', err)
+    console.error('Failed to join call:', err)
   } finally {
     joining.value = false
   }
@@ -377,25 +399,46 @@ async function handleLeave() {
     await pip.exitPiP()
   }
 
+  // Clean up audio playback
+  audioPlayback.stopCurrentPlayback()
+  wsStore.offMediaMessage('media:audio_playback')
+
   mediasoup.leaveRoom()
-  conferenceStore.clearChatMessages()
-  conferenceStore.clearTranscript()
-  conferenceStore.setTranscriptionEnabled(false)
-  await conferenceStore.leaveConference(tenantId.value, conferenceId.value)
+  roomStore.clearChatMessages()
+  roomStore.clearTranscript()
+  roomStore.setTranscriptionEnabled(false)
+  roomStore.clearRoomFiles()
+  await roomStore.leaveCall(tenantId.value, roomId.value)
   joined.value = false
   showChat.value = false
   showTranscriptPanel.value = false
+  showFiles.value = false
   router.push(`/tenant/${tenantId.value}`)
+}
+
+function toggleFiles() {
+  showFiles.value = !showFiles.value
+  if (showFiles.value) {
+    roomStore.fetchRoomFiles(tenantId.value, roomId.value)
+  }
+}
+
+function handlePlayFile(file: { id: string; url: string; filename: string }) {
+  // Phase 4: will send WS message to broadcast audio to all participants
+  wsStore.send('media:play_audio', {
+    room_id: roomId.value,
+    file_id: file.id,
+  })
 }
 
 function toggleTranscription(newState: boolean) {
   wsStore.send('media:transcript_toggle', {
-    conference_id: conferenceId.value,
+    room_id: roomId.value,
     enabled: newState,
-    model: conferenceStore.selectedTranscriptionModel,
+    model: roomStore.selectedTranscriptionModel,
   })
   // Optimistic update; server will confirm via media:transcript_status
-  conferenceStore.setTranscriptionEnabled(newState)
+  roomStore.setTranscriptionEnabled(newState)
   if (newState) {
     showTranscriptPanel.value = true
   }
@@ -410,11 +453,11 @@ function handleScreenShare() {
 }
 
 onMounted(async () => {
-  // Load conference info on mount
+  // Load room info on mount
   try {
-    await conferenceStore.fetchConference(tenantId.value, conferenceId.value)
+    await roomStore.fetchRoom(tenantId.value, roomId.value)
   } catch {
-    // Conference not found
+    // Room not found
   }
 })
 </script>

@@ -13,11 +13,25 @@ use crate::TranscriptEvent;
 #[cfg(feature = "vad")]
 use crate::vad::{SileroVad, VadEvent};
 
+/// Guard that aborts a spawned task when dropped.
+///
+/// `tokio::spawn` returns a `JoinHandle` whose `Drop` impl detaches (does NOT abort)
+/// the task. This wrapper ensures the task is cancelled if the owning future is cancelled.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// A speech segment produced by the ingestion loop for the ASR loop.
 struct SpeechSegment {
     audio: Vec<f32>,
     start_time: f64,
     end_time: f64,
+    is_final: bool,
+    segment_id: String,
 }
 
 /// Per-producer async pipeline task.
@@ -30,7 +44,7 @@ struct SpeechSegment {
 #[allow(dead_code)]
 pub struct TranscriptionWorker {
     user_id: ObjectId,
-    conference_id: ObjectId,
+    room_id: ObjectId,
     speaker_name: String,
     asr: Arc<dyn AsrBackend>,
     config: TranscriptionConfig,
@@ -41,7 +55,7 @@ pub struct TranscriptionWorker {
 impl TranscriptionWorker {
     pub fn new(
         user_id: ObjectId,
-        conference_id: ObjectId,
+        room_id: ObjectId,
         speaker_name: String,
         asr: Arc<dyn AsrBackend>,
         config: TranscriptionConfig,
@@ -50,7 +64,7 @@ impl TranscriptionWorker {
     ) -> Self {
         Self {
             user_id,
-            conference_id,
+            room_id,
             speaker_name,
             asr,
             config,
@@ -66,7 +80,7 @@ impl TranscriptionWorker {
     pub async fn run(self) {
         info!(
             user_id = %self.user_id,
-            conference_id = %self.conference_id,
+            room_id = %self.room_id,
             speaker = %self.speaker_name,
             backend = %self.asr.name(),
             "Transcription worker started"
@@ -76,20 +90,25 @@ impl TranscriptionWorker {
 
         let config_clone = self.config.clone();
         let rtp_rx = self.rtp_rx;
-        let ingestion = tokio::spawn(Self::ingestion_loop(rtp_rx, config_clone, segment_tx));
+        let rid = self.room_id;
+        let uid = self.user_id;
+        let ingestion = tokio::spawn(Self::ingestion_loop(rtp_rx, config_clone, segment_tx, rid, uid));
+
+        // Guard ensures ingestion task is aborted even if this future is cancelled
+        // (e.g., by AbortHandle). Dropping a JoinHandle does NOT abort the task,
+        // so we must abort explicitly.
+        let _ingestion_guard = AbortOnDrop(ingestion);
 
         Self::asr_loop(
             segment_rx,
             self.asr,
             self.config,
             self.user_id,
-            self.conference_id,
+            self.room_id,
             self.speaker_name,
             self.transcript_tx,
         )
         .await;
-
-        ingestion.abort();
 
         debug!("Transcription worker stopped");
     }
@@ -102,6 +121,8 @@ impl TranscriptionWorker {
         mut rtp_rx: mpsc::Receiver<Vec<u8>>,
         config: TranscriptionConfig,
         segment_tx: mpsc::Sender<SpeechSegment>,
+        room_id: ObjectId,
+        user_id: ObjectId,
     ) {
         let mut opus_decoder = match OpusDecoder::new() {
             Ok(d) => d,
@@ -138,10 +159,51 @@ impl TranscriptionWorker {
         let mut rtp_count: u64 = 0;
         #[cfg(feature = "vad")]
         let start_time = std::time::Instant::now();
+        let mut rtp_timeout_warned = false;
 
-        while let Some(rtp_data) = rtp_rx.recv().await {
+        // Sliding window state for partial results
+        #[cfg(feature = "vad")]
+        let partial_interval = std::time::Duration::from_millis(
+            config.streaming_partial_interval_ms,
+        );
+        #[cfg(feature = "vad")]
+        let mut last_partial_at = std::time::Instant::now();
+        #[cfg(feature = "vad")]
+        let mut segment_start_time: f64 = 0.0;
+        // Minimum accumulated audio samples before emitting a partial (0.5s @ 16kHz)
+        #[cfg(feature = "vad")]
+        const MIN_PARTIAL_SAMPLES: usize = 8000;
+
+        loop {
+            let rtp_data = if !rtp_timeout_warned && rtp_count == 0 {
+                // On first iteration, use a 5-second timeout to detect ICE connectivity issues.
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    rtp_rx.recv(),
+                ).await {
+                    Ok(Some(data)) => data,
+                    Ok(None) => break,    // channel closed
+                    Err(_) => {
+                        warn!(
+                            "No RTP packets received within 5 seconds — \
+                             WebRTC ICE connectivity may have failed. \
+                             Check browser console and chrome://webrtc-internals/"
+                        );
+                        rtp_timeout_warned = true;
+                        match rtp_rx.recv().await {
+                            Some(data) => data,
+                            None => break,
+                        }
+                    }
+                }
+            } else {
+                match rtp_rx.recv().await {
+                    Some(data) => data,
+                    None => break,
+                }
+            };
             rtp_count += 1;
-            if rtp_count == 1 || rtp_count % 500 == 0 {
+            if rtp_count == 1 || rtp_count.is_multiple_of(500) {
                 info!(rtp_count, bytes = rtp_data.len(), "RTP packets received");
             }
 
@@ -170,15 +232,15 @@ impl TranscriptionWorker {
                         .wrapping_sub(1);
                     debug!(gap, "RTP packet loss detected, running PLC");
                     for _ in 0..gap.min(3) {
-                        if let Ok(pcm) = opus_decoder.decode_plc() {
-                            if let Ok(resampled) = resampler.process(&pcm) {
-                                #[cfg(feature = "vad")]
-                                {
-                                    let _ = vad.process(&resampled);
-                                }
-                                #[cfg(not(feature = "vad"))]
-                                let _ = resampled;
+                        if let Ok(pcm) = opus_decoder.decode_plc()
+                            && let Ok(resampled) = resampler.process(&pcm)
+                        {
+                            #[cfg(feature = "vad")]
+                            {
+                                let _ = vad.process(&resampled);
                             }
+                            #[cfg(not(feature = "vad"))]
+                            let _ = resampled;
                         }
                     }
                 }
@@ -210,24 +272,38 @@ impl TranscriptionWorker {
             // 4. Feed to VAD
             #[cfg(feature = "vad")]
             {
+                let conf_hex = room_id.to_hex();
+                let user_hex = user_id.to_hex();
                 let events = vad.process(&pcm_16k);
                 for event in events {
                     match event {
+                        VadEvent::SpeechStart => {
+                            let elapsed = start_time.elapsed().as_secs_f64();
+                            segment_start_time = elapsed;
+                            last_partial_at = std::time::Instant::now();
+                            debug!("Speech started at {:.3}s", elapsed);
+                        }
                         VadEvent::SpeechEnd {
                             audio,
                             duration_secs,
                         } => {
+                            let elapsed = start_time.elapsed().as_secs_f64();
+                            let seg_start = elapsed - duration_secs;
                             info!(
                                 duration_secs,
                                 samples = audio.len(),
-                                "Speech segment ended, sending to ASR"
+                                "Speech segment ended, sending FINAL to ASR"
                             );
 
-                            let elapsed = start_time.elapsed().as_secs_f64();
                             let segment = SpeechSegment {
                                 audio,
-                                start_time: elapsed - duration_secs,
+                                start_time: seg_start,
                                 end_time: elapsed,
+                                is_final: true,
+                                segment_id: format!(
+                                    "{}:{}:{:.3}",
+                                    conf_hex, user_hex, segment_start_time,
+                                ),
                             };
 
                             if segment_tx.send(segment).await.is_err() {
@@ -236,6 +312,36 @@ impl TranscriptionWorker {
                             }
                         }
                     }
+                }
+
+                // Emit PARTIAL result if speech is active and enough time/audio has accumulated
+                if vad.is_speech_active()
+                    && last_partial_at.elapsed() >= partial_interval
+                    && vad.speech_buffer().len() >= MIN_PARTIAL_SAMPLES
+                {
+                    let elapsed = start_time.elapsed().as_secs_f64();
+                    let partial_audio = vad.speech_buffer().to_vec();
+                    debug!(
+                        samples = partial_audio.len(),
+                        "Emitting PARTIAL segment for sliding window ASR"
+                    );
+
+                    let segment = SpeechSegment {
+                        audio: partial_audio,
+                        start_time: segment_start_time,
+                        end_time: elapsed,
+                        is_final: false,
+                        segment_id: format!(
+                            "{}:{}:{:.3}",
+                            conf_hex, user_hex, segment_start_time,
+                        ),
+                    };
+
+                    if segment_tx.send(segment).await.is_err() {
+                        debug!("ASR loop closed, stopping ingestion");
+                        return;
+                    }
+                    last_partial_at = std::time::Instant::now();
                 }
             }
 
@@ -254,7 +360,7 @@ impl TranscriptionWorker {
         asr: Arc<dyn AsrBackend>,
         config: TranscriptionConfig,
         user_id: ObjectId,
-        conference_id: ObjectId,
+        room_id: ObjectId,
         speaker_name: String,
         transcript_tx: broadcast::Sender<TranscriptEvent>,
     ) {
@@ -270,13 +376,13 @@ impl TranscriptionWorker {
                 Ok(result) => {
                     let inference_duration_ms = start.elapsed().as_millis() as u64;
                     let text = result.text.trim().to_string();
-                    if text.is_empty() {
-                        debug!("ASR returned empty text, skipping");
+                    if text.is_empty() || is_hallucination(&text) {
+                        debug!("ASR returned empty/hallucinated text: '{}', skipping", text);
                         continue;
                     }
 
                     let event = TranscriptEvent {
-                        conference_id,
+                        room_id,
                         user_id,
                         speaker_name: speaker_name.clone(),
                         text,
@@ -285,6 +391,8 @@ impl TranscriptionWorker {
                         start_time: segment.start_time,
                         end_time: segment.end_time,
                         inference_duration_ms,
+                        is_final: segment.is_final,
+                        segment_id: segment.segment_id.clone(),
                     };
 
                     if let Err(e) = transcript_tx.send(event) {
@@ -297,4 +405,17 @@ impl TranscriptionWorker {
             }
         }
     }
+}
+
+/// Returns true if the text is a known Whisper hallucination/placeholder.
+fn is_hallucination(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains("[blank_audio]")
+        || lower.contains("[silence]")
+        || lower.contains("[music]")
+        || lower.contains("(silence)")
+        || lower.contains("(music)")
+        || lower == "you"
+        || lower == "thank you."
+        || lower == "thanks for watching!"
 }

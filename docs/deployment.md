@@ -119,7 +119,7 @@ cargo build --release
 
 ```bash
 cd ui
-npm run build
+bun run build
 # Output in ui/dist/
 ```
 
@@ -145,5 +145,5 @@ curl http://localhost:3000/health
 
 ## Future Infrastructure
 
-- **mediasoup workers** -- SFU for WebRTC audio/video (Phase 5, dependency currently commented out)
 - **Horizontal scaling** -- Redis pub/sub for cross-instance WebSocket broadcasting
+- **Kubernetes** -- Container orchestration for production deployments

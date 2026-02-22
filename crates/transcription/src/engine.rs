@@ -2,19 +2,20 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use bson::oid::ObjectId;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tracing::{debug, info, warn};
 
 use crate::asr::AsrBackend;
 use crate::config::TranscriptionConfig;
+use crate::file_playback::FilePlaybackWorker;
 use crate::worker::TranscriptionWorker;
 use crate::TranscriptEvent;
 
 /// Manages per-producer transcription pipelines with multi-backend support.
 ///
 /// The engine is created once at startup and shared via `Arc`. It supports
-/// multiple named ASR backends and per-conference model selection.
+/// multiple named ASR backends and per-room model selection.
 pub struct TranscriptionEngine {
     /// Named ASR backends (e.g. "whisper" -> LocalWhisperBackend, "canary" -> LocalOnnxBackend).
     backends: HashMap<String, Arc<dyn AsrBackend>>,
@@ -25,8 +26,12 @@ pub struct TranscriptionEngine {
     workers: DashMap<String, WorkerHandle>,
     /// Broadcast channel for transcript events.
     transcript_tx: broadcast::Sender<TranscriptEvent>,
-    /// Per-conference model selection: conference_id -> backend name.
-    conference_models: Mutex<HashMap<ObjectId, String>>,
+    /// Per-room model selection: room_id -> backend name.
+    room_models: Mutex<HashMap<ObjectId, String>>,
+    /// Conferences with an active broadcast task (prevents spawning duplicates).
+    broadcast_active: DashSet<ObjectId>,
+    /// Tracks which WS connection started which playback IDs (for cleanup on disconnect).
+    connection_playbacks: DashMap<String, Vec<String>>,
 }
 
 struct WorkerHandle {
@@ -57,7 +62,9 @@ impl TranscriptionEngine {
             config,
             workers: DashMap::new(),
             transcript_tx,
-            conference_models: Mutex::new(HashMap::new()),
+            room_models: Mutex::new(HashMap::new()),
+            broadcast_active: DashSet::new(),
+            connection_playbacks: DashMap::new(),
         });
 
         (engine, transcript_rx)
@@ -68,25 +75,49 @@ impl TranscriptionEngine {
         self.transcript_tx.subscribe()
     }
 
-    /// Enables transcription for a conference with a specific model.
-    pub async fn enable_conference(&self, conference_id: ObjectId, model_name: String) {
-        let mut models = self.conference_models.lock().await;
-        models.insert(conference_id, model_name.clone());
-        info!(%conference_id, model = %model_name, "Transcription enabled for conference");
+    /// Returns the default backend name.
+    pub fn default_backend_name(&self) -> &str {
+        &self.default_backend
     }
 
-    /// Disables transcription for a conference and stops all its workers.
-    pub async fn disable_conference(&self, conference_id: ObjectId) {
+    /// Attempts to mark a room as having an active broadcast task.
+    ///
+    /// Returns `true` if the conference was NOT already tracked (caller should
+    /// spawn the task). Returns `false` if a broadcast task already exists
+    /// (caller should skip).
+    pub fn try_start_broadcast(&self, room_id: ObjectId) -> bool {
+        self.broadcast_active.insert(room_id)
+    }
+
+    /// Removes the broadcast-active flag for a room (called when the
+    /// broadcast task exits).
+    pub fn clear_broadcast(&self, room_id: &ObjectId) {
+        self.broadcast_active.remove(room_id);
+    }
+
+    /// Enables transcription for a room with a specific model.
+    pub async fn enable_room(&self, room_id: ObjectId, model_name: String) {
+        let mut models = self.room_models.lock().await;
+        models.insert(room_id, model_name.clone());
+        info!(%room_id, model = %model_name, "Transcription enabled for room");
+    }
+
+    /// Disables transcription for a room and stops all its workers.
+    pub async fn disable_room(&self, room_id: ObjectId) {
         {
-            let mut models = self.conference_models.lock().await;
-            models.remove(&conference_id);
+            let mut models = self.room_models.lock().await;
+            models.remove(&room_id);
         }
 
-        // Stop all workers for this conference
+        // Stop all workers for this room (live producers and file playbacks)
+        let hex = room_id.to_hex();
         let to_remove: Vec<String> = self
             .workers
             .iter()
-            .filter(|entry| entry.key().starts_with(&conference_id.to_hex()))
+            .filter(|entry| {
+                let key = entry.key();
+                key.starts_with(&hex) || key.starts_with(&format!("file:{}", hex))
+            })
             .map(|entry| entry.key().clone())
             .collect();
 
@@ -94,19 +125,22 @@ impl TranscriptionEngine {
             self.stop_pipeline(&key);
         }
 
-        info!(%conference_id, "Transcription disabled for conference");
+        // Clear broadcast flag so the task exits on next recv() check
+        self.clear_broadcast(&room_id);
+
+        info!(%room_id, "Transcription disabled for room");
     }
 
-    /// Checks if transcription is enabled for a conference.
-    pub async fn is_enabled(&self, conference_id: &ObjectId) -> bool {
-        let models = self.conference_models.lock().await;
-        models.contains_key(conference_id)
+    /// Checks if transcription is enabled for a room.
+    pub async fn is_enabled(&self, room_id: &ObjectId) -> bool {
+        let models = self.room_models.lock().await;
+        models.contains_key(room_id)
     }
 
-    /// Gets the ASR backend for a conference, falling back to default.
-    fn get_backend(&self, conference_id: &ObjectId, models: &HashMap<ObjectId, String>) -> Option<Arc<dyn AsrBackend>> {
+    /// Gets the ASR backend for a room, falling back to default.
+    fn get_backend(&self, room_id: &ObjectId, models: &HashMap<ObjectId, String>) -> Option<Arc<dyn AsrBackend>> {
         let model_name = models
-            .get(conference_id)
+            .get(room_id)
             .unwrap_or(&self.default_backend);
 
         if let Some(backend) = self.backends.get(model_name) {
@@ -138,13 +172,13 @@ impl TranscriptionEngine {
     /// (handles model switching).
     pub fn start_pipeline(
         self: &Arc<Self>,
-        conference_id: ObjectId,
+        room_id: ObjectId,
         producer_id: String,
         user_id: ObjectId,
         speaker_name: String,
         rtp_rx: mpsc::Receiver<Vec<u8>>,
     ) {
-        let key = format!("{}:{}", conference_id.to_hex(), producer_id);
+        let key = format!("{}:{}", room_id.to_hex(), producer_id);
 
         // Stop any existing pipeline for this producer (e.g. model switch)
         if self.workers.contains_key(&key) {
@@ -154,7 +188,7 @@ impl TranscriptionEngine {
 
         // Resolve backend synchronously using try_lock
         let asr = {
-            let models = match self.conference_models.try_lock() {
+            let models = match self.room_models.try_lock() {
                 Ok(guard) => guard,
                 Err(_) => {
                     // If we can't lock, use default backend directly
@@ -163,7 +197,7 @@ impl TranscriptionEngine {
                         .cloned()
                     {
                         Some(backend) => {
-                            self.spawn_worker(key, conference_id, producer_id, user_id, speaker_name, backend, rtp_rx);
+                            self.spawn_worker(key, room_id, producer_id, user_id, speaker_name, backend, rtp_rx);
                             return;
                         }
                         None => {
@@ -173,22 +207,23 @@ impl TranscriptionEngine {
                     }
                 }
             };
-            match self.get_backend(&conference_id, &models) {
+            match self.get_backend(&room_id, &models) {
                 Some(b) => b,
                 None => {
-                    warn!("No ASR backends available for conference {}", conference_id);
+                    warn!("No ASR backends available for room {}", room_id);
                     return;
                 }
             }
         };
 
-        self.spawn_worker(key, conference_id, producer_id, user_id, speaker_name, asr, rtp_rx);
+        self.spawn_worker(key, room_id, producer_id, user_id, speaker_name, asr, rtp_rx);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_worker(
         self: &Arc<Self>,
         key: String,
-        conference_id: ObjectId,
+        room_id: ObjectId,
         _producer_id: String,
         user_id: ObjectId,
         speaker_name: String,
@@ -199,7 +234,7 @@ impl TranscriptionEngine {
 
         let worker = TranscriptionWorker::new(
             user_id,
-            conference_id,
+            room_id,
             speaker_name.clone(),
             asr,
             self.config.clone(),
@@ -227,7 +262,7 @@ impl TranscriptionEngine {
         debug!(%key, %speaker_name, "Transcription pipeline started");
     }
 
-    /// Stops a transcription pipeline by its key (conference_id:producer_id).
+    /// Stops a transcription pipeline by its key (room_id:producer_id).
     pub fn stop_pipeline(&self, key: &str) {
         if let Some((_, handle)) = self.workers.remove(key) {
             handle.abort_handle.abort();
@@ -236,8 +271,8 @@ impl TranscriptionEngine {
     }
 
     /// Stops the pipeline for a specific producer.
-    pub fn stop_producer(&self, conference_id: &ObjectId, producer_id: &str) {
-        let key = format!("{}:{}", conference_id.to_hex(), producer_id);
+    pub fn stop_producer(&self, room_id: &ObjectId, producer_id: &str) {
+        let key = format!("{}:{}", room_id.to_hex(), producer_id);
         self.stop_pipeline(&key);
     }
 
@@ -249,5 +284,75 @@ impl TranscriptionEngine {
     /// Returns the list of available backend names.
     pub fn available_backends(&self) -> Vec<String> {
         self.backends.keys().cloned().collect()
+    }
+
+    /// Tracks a playback ID as belonging to a WS connection (for cleanup on disconnect).
+    pub fn track_playback(&self, connection_id: &str, playback_id: &str) {
+        self.connection_playbacks
+            .entry(connection_id.to_string())
+            .or_default()
+            .push(playback_id.to_string());
+    }
+
+    /// Stops all playback workers started by a given WS connection.
+    pub fn stop_connection_playbacks(&self, connection_id: &str) {
+        if let Some((_, playback_ids)) = self.connection_playbacks.remove(connection_id) {
+            for pid in &playback_ids {
+                self.stop_pipeline(pid);
+            }
+            if !playback_ids.is_empty() {
+                info!(%connection_id, count = playback_ids.len(), "Stopped playbacks on disconnect");
+            }
+        }
+    }
+
+    /// Starts a file playback pipeline that reads a WAV file through VAD → ASR.
+    ///
+    /// Returns a playback ID (used to stop it later) or None if no backend is available.
+    pub async fn start_file_playback(
+        self: &Arc<Self>,
+        room_id: ObjectId,
+        file_path: String,
+        user_id: ObjectId,
+        speaker_name: String,
+    ) -> Option<String> {
+        let asr = {
+            let models = self.room_models.lock().await;
+            self.get_backend(&room_id, &models)?
+        };
+
+        let playback_id = format!(
+            "file:{}:{}",
+            room_id.to_hex(),
+            bson::Uuid::new()
+        );
+        let key = playback_id.clone();
+
+        let worker = FilePlaybackWorker::new(
+            room_id,
+            user_id,
+            speaker_name,
+            file_path,
+            asr,
+            self.config.clone(),
+            self.transcript_tx.clone(),
+        );
+
+        let cleanup_key = key.clone();
+        let engine = Arc::clone(self);
+        let handle = tokio::spawn(async move {
+            worker.run().await;
+            engine.workers.remove(&cleanup_key);
+            debug!(%cleanup_key, "File playback worker cleaned up");
+        });
+
+        self.workers.insert(
+            key,
+            WorkerHandle {
+                abort_handle: handle.abort_handle(),
+            },
+        );
+
+        Some(playback_id)
     }
 }

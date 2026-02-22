@@ -44,7 +44,7 @@ pub struct File {
 pub struct FileContext {
     pub context_type: FileContextType,
     pub entity_id: ObjectId,
-    pub channel_id: Option<ObjectId>,
+    pub room_id: Option<ObjectId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,8 +53,7 @@ pub enum FileContextType {
     Message,
     Document,
     Profile,
-    Channel,
-    Conference,
+    Room,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

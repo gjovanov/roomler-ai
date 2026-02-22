@@ -11,6 +11,10 @@ path = "src/lib.rs"
 name = "roomler2-api"
 path = "src/main.rs"
 
+[features]
+default = []
+remote-nim = ["roomler2-transcription/remote-nim"]
+
 [dependencies]
 roomler2-config = { path = "../config" }
 roomler2-db = { path = "../db" }
@@ -39,6 +43,8 @@ tempfile.workspace = true
 mediasoup.workspace = true
 dotenvy.workspace = true
 hmac.workspace = true
+sha1.workspace = true
 sha2.workspace = true
 hex.workspace = true
+base64.workspace = true
 async-trait.workspace = true

@@ -3,18 +3,18 @@ import {
   uniqueUser,
   registerUserViaApi,
   createTenantViaApi,
-  createConferenceViaApi,
-  startConferenceViaApi,
-  joinConferenceViaApi,
-  sendConferenceChatViaApi,
+  createRoomViaApi,
+  startCallViaApi,
+  joinCallViaApi,
+  sendMessageViaApi,
   loginViaUi,
 } from './fixtures/test-helpers'
 
-test.describe('Conference Chat', () => {
+test.describe('Room Call Chat', () => {
   let user: ReturnType<typeof uniqueUser>
   let token: string
   let tenantId: string
-  let conferenceId: string
+  let roomId: string
 
   test.beforeEach(async ({ page }) => {
     user = uniqueUser()
@@ -23,23 +23,23 @@ test.describe('Conference Chat', () => {
     const tenant = await createTenantViaApi(token, 'Chat Org', `chat-${Date.now()}`)
     tenantId = tenant.id
 
-    const conf = await createConferenceViaApi(token, tenantId, 'Chat Meeting')
-    conferenceId = conf.id
+    const room = await createRoomViaApi(token, tenantId, 'Chat Meeting')
+    roomId = room.id
 
-    await startConferenceViaApi(token, tenantId, conferenceId)
-    await joinConferenceViaApi(token, tenantId, conferenceId)
+    await startCallViaApi(token, tenantId, roomId)
+    await joinCallViaApi(token, tenantId, roomId)
 
     await loginViaUi(page, user.username, user.password)
   })
 
-  test('conference chat panel toggles visibility', async ({ page, context }) => {
+  test('room call chat panel toggles visibility', async ({ page, context }) => {
     await context.grantPermissions(['camera', 'microphone'])
-    await page.goto(`/tenant/${tenantId}/conference/${conferenceId}`)
+    await page.goto(`/tenant/${tenantId}/room/${roomId}/call`)
 
     // Before joining, chat toggle should not be visible
     await expect(page.locator('[class*="mdi-message-text"]')).not.toBeVisible()
 
-    // Join the conference
+    // Join the call
     await page.getByRole('button', { name: /join/i }).click()
 
     // After joining, chat panel should be visible (auto-opens)
@@ -54,11 +54,11 @@ test.describe('Conference Chat', () => {
     await expect(page.getByText('No messages yet')).toBeVisible()
   })
 
-  test('send and receive conference chat message', async ({ page, context }) => {
+  test('send and receive room call chat message', async ({ page, context }) => {
     await context.grantPermissions(['camera', 'microphone'])
-    await page.goto(`/tenant/${tenantId}/conference/${conferenceId}`)
+    await page.goto(`/tenant/${tenantId}/room/${roomId}/call`)
 
-    // Join the conference
+    // Join the call
     await page.getByRole('button', { name: /join/i }).click()
     await expect(page.getByText('Chat')).toBeVisible({ timeout: 15000 })
 

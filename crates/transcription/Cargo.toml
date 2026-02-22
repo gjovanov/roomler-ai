@@ -8,7 +8,7 @@ default = ["vad"]
 vad = ["dep:ort", "dep:ndarray"]
 local-whisper = ["dep:whisper-rs"]
 local-onnx = ["dep:ort", "dep:ndarray"]
-remote-nim = ["dep:tonic", "dep:prost"]
+remote-nim = ["dep:tonic", "dep:prost", "dep:tonic-build", "dep:tokio-stream"]
 
 [dependencies]
 # Audio pipeline (always-on)
@@ -50,9 +50,28 @@ ndarray = { version = "0.17", optional = true }
 # FFT for mel spectrogram (used by Canary ONNX backend)
 rustfft = "6.4"
 
+# WAV file reading
+hound = { workspace = true }
+
 # Local Whisper (optional)
 whisper-rs = { version = "0.15", optional = true }
 
 # Remote NIM gRPC (optional)
 tonic = { version = "0.12", optional = true }
 prost = { version = "0.13", optional = true }
+tokio-stream = { version = "0.1", optional = true }
+
+[build-dependencies]
+tonic-build = { version = "0.12", optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+tempfile = { workspace = true }
+
+[[test]]
+name = "wer_evaluation"
+required-features = ["local-whisper", "local-onnx", "vad"]
+
+[[test]]
+name = "streaming_evaluation"
+required-features = ["vad"]

@@ -5,13 +5,13 @@ use serde_json::Value;
 async fn export_conversation_creates_background_task() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("export1").await;
-    let channel_id = tenant.channels[0].id.clone();
+    let room_id = tenant.rooms[0].id.clone();
 
-    // Admin joins channel and creates messages
+    // Admin joins room and creates messages
     app.auth_post(
         &format!(
-            "/api/tenant/{}/channel/{}/join",
-            tenant.tenant_id, channel_id
+            "/api/tenant/{}/room/{}/join",
+            tenant.tenant_id, room_id
         ),
         &tenant.admin.access_token,
     )
@@ -22,8 +22,8 @@ async fn export_conversation_creates_background_task() {
     for i in 1..=3 {
         app.auth_post(
             &format!(
-                "/api/tenant/{}/channel/{}/message",
-                tenant.tenant_id, channel_id
+                "/api/tenant/{}/room/{}/message",
+                tenant.tenant_id, room_id
             ),
             &tenant.admin.access_token,
         )
@@ -42,7 +42,7 @@ async fn export_conversation_creates_background_task() {
             &tenant.admin.access_token,
         )
         .json(&serde_json::json!({
-            "channel_id": channel_id,
+            "room_id": room_id,
         }))
         .send()
         .await
@@ -58,13 +58,13 @@ async fn export_conversation_creates_background_task() {
 async fn export_task_completes_and_download_works() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("export2").await;
-    let channel_id = tenant.channels[0].id.clone();
+    let room_id = tenant.rooms[0].id.clone();
 
-    // Admin joins channel and creates a message
+    // Admin joins room and creates a message
     app.auth_post(
         &format!(
-            "/api/tenant/{}/channel/{}/join",
-            tenant.tenant_id, channel_id
+            "/api/tenant/{}/room/{}/join",
+            tenant.tenant_id, room_id
         ),
         &tenant.admin.access_token,
     )
@@ -74,8 +74,8 @@ async fn export_task_completes_and_download_works() {
 
     app.auth_post(
         &format!(
-            "/api/tenant/{}/channel/{}/message",
-            tenant.tenant_id, channel_id
+            "/api/tenant/{}/room/{}/message",
+            tenant.tenant_id, room_id
         ),
         &tenant.admin.access_token,
     )
@@ -93,7 +93,7 @@ async fn export_task_completes_and_download_works() {
             &tenant.admin.access_token,
         )
         .json(&serde_json::json!({
-            "channel_id": channel_id,
+            "room_id": room_id,
         }))
         .send()
         .await
@@ -165,13 +165,13 @@ async fn export_task_completes_and_download_works() {
 async fn list_background_tasks() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("tasklist").await;
-    let channel_id = tenant.channels[0].id.clone();
+    let room_id = tenant.rooms[0].id.clone();
 
     // Create a message so export has something
     app.auth_post(
         &format!(
-            "/api/tenant/{}/channel/{}/join",
-            tenant.tenant_id, channel_id
+            "/api/tenant/{}/room/{}/join",
+            tenant.tenant_id, room_id
         ),
         &tenant.admin.access_token,
     )
@@ -181,8 +181,8 @@ async fn list_background_tasks() {
 
     app.auth_post(
         &format!(
-            "/api/tenant/{}/channel/{}/message",
-            tenant.tenant_id, channel_id
+            "/api/tenant/{}/room/{}/message",
+            tenant.tenant_id, room_id
         ),
         &tenant.admin.access_token,
     )
@@ -197,7 +197,7 @@ async fn list_background_tasks() {
             &format!("/api/tenant/{}/export/conversation", tenant.tenant_id),
             &tenant.admin.access_token,
         )
-        .json(&serde_json::json!({ "channel_id": channel_id }))
+        .json(&serde_json::json!({ "room_id": room_id }))
         .send()
         .await
         .unwrap();

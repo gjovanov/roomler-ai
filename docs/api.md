@@ -84,73 +84,73 @@ Sets httpOnly cookie: `access_token=<JWT>; HttpOnly; Path=/; SameSite=Lax`
 |--------|------|------|-------------|
 | GET | `/api/tenant/{tenant_id}/member` | Yes | List members of a tenant |
 
-## Channel Routes
+## Room Routes
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| GET | `/api/tenant/{tenant_id}/channel` | Yes | List channels the user has joined |
-| POST | `/api/tenant/{tenant_id}/channel` | Yes | Create a new channel |
-| GET | `/api/tenant/{tenant_id}/channel/explore` | Yes | Browse all public channels |
-| GET | `/api/tenant/{tenant_id}/channel/{channel_id}` | Yes | Get channel details |
-| PUT | `/api/tenant/{tenant_id}/channel/{channel_id}` | Yes | Update a channel |
-| DELETE | `/api/tenant/{tenant_id}/channel/{channel_id}` | Yes | Delete a channel |
-| POST | `/api/tenant/{tenant_id}/channel/{channel_id}/join` | Yes | Join a channel |
-| POST | `/api/tenant/{tenant_id}/channel/{channel_id}/leave` | Yes | Leave a channel |
-| GET | `/api/tenant/{tenant_id}/channel/{channel_id}/member` | Yes | List channel members |
+| GET | `/api/tenant/{tenant_id}/room` | Yes | List rooms the user has joined |
+| POST | `/api/tenant/{tenant_id}/room` | Yes | Create a new room |
+| GET | `/api/tenant/{tenant_id}/room/explore` | Yes | Browse all public rooms |
+| GET | `/api/tenant/{tenant_id}/room/{room_id}` | Yes | Get room details |
+| PUT | `/api/tenant/{tenant_id}/room/{room_id}` | Yes | Update a room |
+| DELETE | `/api/tenant/{tenant_id}/room/{room_id}` | Yes | Delete a room |
+| POST | `/api/tenant/{tenant_id}/room/{room_id}/join` | Yes | Join a room |
+| POST | `/api/tenant/{tenant_id}/room/{room_id}/leave` | Yes | Leave a room |
+| GET | `/api/tenant/{tenant_id}/room/{room_id}/member` | Yes | List room members |
+
+### Room Call Routes
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| POST | `/api/tenant/{tenant_id}/room/{room_id}/call/start` | Yes | Start a call in a room |
+| POST | `/api/tenant/{tenant_id}/room/{room_id}/call/join` | Yes | Join an active call |
+| POST | `/api/tenant/{tenant_id}/room/{room_id}/call/leave` | Yes | Leave a call |
+| POST | `/api/tenant/{tenant_id}/room/{room_id}/call/end` | Yes | End a call |
+| GET | `/api/tenant/{tenant_id}/room/{room_id}/call/participant` | Yes | List call participants |
+| GET | `/api/tenant/{tenant_id}/room/{room_id}/call/message` | Yes | List in-call chat messages |
+| POST | `/api/tenant/{tenant_id}/room/{room_id}/call/message` | Yes | Send an in-call chat message |
 
 ## Message Routes
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| GET | `/api/tenant/{tenant_id}/channel/{channel_id}/message` | Yes | List messages (paginated) |
-| POST | `/api/tenant/{tenant_id}/channel/{channel_id}/message` | Yes | Send a message |
-| GET | `/api/tenant/{tenant_id}/channel/{channel_id}/message/pin` | Yes | List pinned messages |
-| PUT | `/api/tenant/{tenant_id}/channel/{channel_id}/message/{message_id}` | Yes | Edit a message |
-| DELETE | `/api/tenant/{tenant_id}/channel/{channel_id}/message/{message_id}` | Yes | Delete a message |
-| PUT | `/api/tenant/{tenant_id}/channel/{channel_id}/message/{message_id}/pin` | Yes | Toggle pin on a message |
-| GET | `/api/tenant/{tenant_id}/channel/{channel_id}/message/{message_id}/thread` | Yes | Get thread replies |
-| POST | `/api/tenant/{tenant_id}/channel/{channel_id}/message/{message_id}/reaction` | Yes | Add a reaction |
-| DELETE | `/api/tenant/{tenant_id}/channel/{channel_id}/message/{message_id}/reaction/{emoji}` | Yes | Remove a reaction |
-
-## Conference Routes
-
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| GET | `/api/tenant/{tenant_id}/conference` | Yes | List conferences |
-| POST | `/api/tenant/{tenant_id}/conference` | Yes | Create a conference |
-| GET | `/api/tenant/{tenant_id}/conference/{conference_id}` | Yes | Get conference details |
-| POST | `/api/tenant/{tenant_id}/conference/{conference_id}/start` | Yes | Start a conference |
-| POST | `/api/tenant/{tenant_id}/conference/{conference_id}/join` | Yes | Join a conference |
-| POST | `/api/tenant/{tenant_id}/conference/{conference_id}/leave` | Yes | Leave a conference |
-| POST | `/api/tenant/{tenant_id}/conference/{conference_id}/end` | Yes | End a conference |
-| GET | `/api/tenant/{tenant_id}/conference/{conference_id}/participant` | Yes | List participants |
+| GET | `/api/tenant/{tenant_id}/room/{room_id}/message` | Yes | List messages (paginated) |
+| POST | `/api/tenant/{tenant_id}/room/{room_id}/message` | Yes | Send a message |
+| GET | `/api/tenant/{tenant_id}/room/{room_id}/message/pin` | Yes | List pinned messages |
+| PUT | `/api/tenant/{tenant_id}/room/{room_id}/message/{message_id}` | Yes | Edit a message |
+| DELETE | `/api/tenant/{tenant_id}/room/{room_id}/message/{message_id}` | Yes | Delete a message |
+| PUT | `/api/tenant/{tenant_id}/room/{room_id}/message/{message_id}/pin` | Yes | Toggle pin on a message |
+| GET | `/api/tenant/{tenant_id}/room/{room_id}/message/{message_id}/thread` | Yes | Get thread replies |
+| POST | `/api/tenant/{tenant_id}/room/{room_id}/message/{message_id}/reaction` | Yes | Add a reaction |
+| DELETE | `/api/tenant/{tenant_id}/room/{room_id}/message/{message_id}/reaction/{emoji}` | Yes | Remove a reaction |
 
 ## Recording Routes
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| GET | `/api/tenant/{tenant_id}/conference/{conference_id}/recording` | Yes | List recordings |
-| POST | `/api/tenant/{tenant_id}/conference/{conference_id}/recording` | Yes | Create a recording |
-| DELETE | `/api/tenant/{tenant_id}/conference/{conference_id}/recording/{recording_id}` | Yes | Delete a recording |
+| GET | `/api/tenant/{tenant_id}/room/{room_id}/recording` | Yes | List recordings |
+| POST | `/api/tenant/{tenant_id}/room/{room_id}/recording` | Yes | Create a recording |
+| DELETE | `/api/tenant/{tenant_id}/room/{room_id}/recording/{recording_id}` | Yes | Delete a recording |
 
 ## Transcription Routes
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| GET | `/api/tenant/{tenant_id}/conference/{conference_id}/transcript` | Yes | List transcriptions |
-| POST | `/api/tenant/{tenant_id}/conference/{conference_id}/transcript` | Yes | Create a transcription |
-| GET | `/api/tenant/{tenant_id}/conference/{conference_id}/transcript/{transcription_id}` | Yes | Get transcription details |
+| GET | `/api/tenant/{tenant_id}/room/{room_id}/transcript` | Yes | List transcriptions |
+| POST | `/api/tenant/{tenant_id}/room/{room_id}/transcript` | Yes | Create a transcription |
+| GET | `/api/tenant/{tenant_id}/room/{room_id}/transcript/{transcription_id}` | Yes | Get transcription details |
 
 ## File Routes
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| POST | `/api/tenant/{tenant_id}/channel/file/upload` | Yes | Upload a file |
-| GET | `/api/tenant/{tenant_id}/channel/file/{file_id}` | Yes | Get file metadata |
-| GET | `/api/tenant/{tenant_id}/channel/file/{file_id}/download` | Yes | Download a file |
-| DELETE | `/api/tenant/{tenant_id}/channel/file/{file_id}` | Yes | Delete a file |
-| POST | `/api/tenant/{tenant_id}/channel/file/{file_id}/recognize` | Yes | AI document recognition (Claude API) |
-| GET | `/api/tenant/{tenant_id}/channel/{channel_id}/file` | Yes | List files in a channel |
+| POST | `/api/tenant/{tenant_id}/file/upload` | Yes | Upload a file |
+| GET | `/api/tenant/{tenant_id}/file/{file_id}` | Yes | Get file metadata |
+| GET | `/api/tenant/{tenant_id}/file/{file_id}/download` | Yes | Download a file |
+| DELETE | `/api/tenant/{tenant_id}/file/{file_id}` | Yes | Delete a file |
+| POST | `/api/tenant/{tenant_id}/file/{file_id}/recognize` | Yes | AI document recognition (Claude API) |
+| GET | `/api/tenant/{tenant_id}/room/{room_id}/file` | Yes | List files in a room |
+| POST | `/api/tenant/{tenant_id}/room/{room_id}/file/upload` | Yes | Upload a file to a room |
 
 ## Background Task Routes
 

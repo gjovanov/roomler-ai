@@ -9,21 +9,20 @@ erDiagram
     User ||--o{ TenantMember : "belongs to"
     Tenant ||--o{ TenantMember : "has"
     Tenant ||--o{ Role : "defines"
-    Tenant ||--o{ Channel : "contains"
-    Tenant ||--o{ Conference : "hosts"
+    Tenant ||--o{ Room : "contains"
     Tenant ||--o{ Invite : "issues"
     Tenant ||--o{ AuditLog : "tracks"
     Tenant ||--o{ CustomEmoji : "owns"
     TenantMember }o--o{ Role : "assigned"
-    Channel ||--o{ ChannelMember : "has"
-    Channel ||--o{ Message : "contains"
-    Channel o|--o| Channel : "parent_id"
-    User ||--o{ ChannelMember : "joins"
+    Room ||--o{ RoomMember : "has"
+    Room ||--o{ Message : "contains"
+    Room ||--o{ CallChatMessage : "has in-call chat"
+    Room o|--o| Room : "parent_id"
+    User ||--o{ RoomMember : "joins"
     Message ||--o{ Reaction : "receives"
     Message o|--o| Message : "thread_id"
-    Conference ||--o{ ConferenceParticipant : "has"
-    Conference ||--o{ Recording : "produces"
-    Conference ||--o{ Transcription : "generates"
+    Room ||--o{ Recording : "produces"
+    Room ||--o{ Transcription : "generates"
     Tenant ||--o{ File : "stores"
     Tenant ||--o{ BackgroundTask : "runs"
     User ||--o{ Notification : "receives"
@@ -118,48 +117,63 @@ Collection: `roles`
 | `created_at` | DateTime | |
 | `updated_at` | DateTime | |
 
-### Channel
+### Room
 
-Collection: `channels`
+Collection: `rooms`
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `_id` | ObjectId | Primary key |
 | `tenant_id` | ObjectId | |
-| `parent_id` | Option\<ObjectId\> | Parent channel (for hierarchy) |
-| `channel_type` | ChannelType | `category`, `text`, `voice`, `announcement`, `forum`, `stage`, `dm`, `group_dm` |
+| `parent_id` | Option\<ObjectId\> | Parent room (for hierarchy) |
 | `name` | String | |
-| `path` | String | Unique per tenant (hierarchical path) |
+| `path` | String | Unique per tenant (dot-notation hierarchy path) |
+| `emoji` | Option\<String\> | Room emoji icon |
 | `topic` | Option\<TopicInfo\> | Topic text, set_by, set_at |
 | `purpose` | Option\<String\> | |
 | `icon` | Option\<String\> | |
 | `position` | u32 | Sort order within parent |
-| `is_private` | bool | |
+| `is_open` | bool | Publicly joinable (default false) |
 | `is_archived` | bool | |
 | `is_read_only` | bool | |
 | `is_default` | bool | Auto-join for new members |
 | `permission_overwrites` | Vec\<PermissionOverwrite\> | Per-role or per-user allow/deny overrides |
 | `tags` | Vec\<String\> | |
-| `media_settings` | Option\<MediaSettings\> | bitrate, user_limit, video_quality_mode |
-| `creator_id` | ObjectId | |
+| `media_settings` | Option\<MediaSettings\> | bitrate, user_limit, video_quality -- presence means voice/video capable |
+| `conference_settings` | Option\<ConferenceSettings\> | Call scheduling, passcode, waiting room, recurrence |
+| `conference_status` | Option\<ConferenceStatus\> | `scheduled`, `in_progress`, `ended`, `cancelled` |
+| `meeting_code` | Option\<String\> | |
+| `join_url` | Option\<String\> | |
+| `organizer_id` | Option\<ObjectId\> | Call organizer |
+| `co_organizer_ids` | Vec\<ObjectId\> | |
+| `creator_id` | ObjectId | Room creator |
 | `last_message_id` | Option\<ObjectId\> | |
 | `last_activity_at` | Option\<DateTime\> | |
 | `member_count` | u32 | |
 | `message_count` | u64 | |
+| `participant_count` | u32 | Live call participants |
+| `peak_participant_count` | u32 | |
+| `actual_start_time` | Option\<DateTime\> | |
+| `actual_end_time` | Option\<DateTime\> | |
 | `created_at` | DateTime | |
 | `updated_at` | DateTime | |
 | `deleted_at` | Option\<DateTime\> | Soft delete |
 
-### ChannelMember
+### RoomMember
 
-Collection: `channel_members`
+Collection: `room_members`
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `_id` | ObjectId | Primary key |
 | `tenant_id` | ObjectId | |
-| `channel_id` | ObjectId | |
-| `user_id` | ObjectId | |
+| `room_id` | ObjectId | |
+| `user_id` | Option\<ObjectId\> | None for external guests |
+| `display_name` | Option\<String\> | |
+| `email` | Option\<String\> | |
+| `is_external` | bool | External guest flag |
+| `role` | Option\<ParticipantRole\> | `organizer`, `co_organizer`, `presenter`, `attendee` (only for active call participants) |
+| `sessions` | Vec\<ParticipantSession\> | Call join/leave timestamps per device |
 | `joined_at` | DateTime | |
 | `last_read_message_id` | Option\<ObjectId\> | Last message the user has read |
 | `last_read_at` | Option\<DateTime\> | |
@@ -168,6 +182,10 @@ Collection: `channel_members`
 | `notification_override` | Option\<NotificationLevel\> | |
 | `is_muted` | bool | |
 | `is_pinned` | bool | Pinned in sidebar |
+| `is_video_on` | bool | Live media state |
+| `is_screen_sharing` | bool | |
+| `is_hand_raised` | bool | |
+| `total_duration` | u32 | Seconds in calls |
 | `created_at` | DateTime | |
 | `updated_at` | DateTime | |
 
@@ -179,7 +197,7 @@ Collection: `messages`
 |-------|------|-------------|
 | `_id` | ObjectId | Primary key |
 | `tenant_id` | ObjectId | |
-| `channel_id` | ObjectId | |
+| `room_id` | ObjectId | |
 | `thread_id` | Option\<ObjectId\> | Parent message (if reply in thread) |
 | `is_thread_root` | bool | Whether this message started a thread |
 | `thread_metadata` | Option\<ThreadMetadata\> | reply_count, last_reply_at, participant_ids, is_locked, is_archived |
@@ -209,66 +227,11 @@ Collection: `reactions`
 |-------|------|-------------|
 | `_id` | ObjectId | Primary key |
 | `tenant_id` | ObjectId | |
-| `channel_id` | ObjectId | |
+| `room_id` | ObjectId | |
 | `message_id` | ObjectId | |
 | `user_id` | ObjectId | |
 | `emoji` | EmojiRef | emoji_type (`unicode` / `custom`), value, custom_emoji_id |
 | `created_at` | DateTime | |
-
-### Conference
-
-Collection: `conferences`
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `_id` | ObjectId | Primary key |
-| `tenant_id` | ObjectId | |
-| `channel_id` | Option\<ObjectId\> | Associated channel |
-| `subject` | String | Meeting title |
-| `description` | Option\<String\> | |
-| `conference_type` | ConferenceType | `instant`, `scheduled`, `recurring`, `persistent` |
-| `status` | ConferenceStatus | `scheduled`, `in_progress`, `ended`, `cancelled` |
-| `start_time` | Option\<DateTime\> | Planned start |
-| `end_time` | Option\<DateTime\> | Planned end |
-| `actual_start_time` | Option\<DateTime\> | |
-| `actual_end_time` | Option\<DateTime\> | |
-| `duration` | Option\<u32\> | Minutes |
-| `timezone` | Option\<String\> | |
-| `recurrence` | Option\<Recurrence\> | pattern (daily/weekly/monthly), interval, days_of_week, end_date |
-| `join_url` | String | |
-| `meeting_code` | String | Unique |
-| `passcode` | Option\<String\> | |
-| `waiting_room` | bool | |
-| `organizer_id` | ObjectId | |
-| `co_organizer_ids` | Vec\<ObjectId\> | |
-| `settings` | ConferenceSettings | host_video, participant_video, mute_on_entry, chat, screen_share, auto_recording, auto_transcription, max_participants |
-| `participant_count` | u32 | |
-| `peak_participant_count` | u32 | |
-| `created_at` | DateTime | |
-| `updated_at` | DateTime | |
-
-### ConferenceParticipant
-
-Collection: `conference_participants`
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `_id` | ObjectId | Primary key |
-| `tenant_id` | ObjectId | |
-| `conference_id` | ObjectId | |
-| `user_id` | Option\<ObjectId\> | None for external guests |
-| `display_name` | String | |
-| `email` | Option\<String\> | |
-| `is_external` | bool | |
-| `role` | ParticipantRole | `organizer`, `co_organizer`, `presenter`, `attendee` |
-| `sessions` | Vec\<ParticipantSession\> | joined_at, left_at, duration, device_type |
-| `is_muted` | bool | |
-| `is_video_on` | bool | |
-| `is_screen_sharing` | bool | |
-| `is_hand_raised` | bool | |
-| `total_duration` | u32 | Seconds |
-| `created_at` | DateTime | |
-| `updated_at` | DateTime | |
 
 ### Recording
 
@@ -278,7 +241,7 @@ Collection: `recordings`
 |-------|------|-------------|
 | `_id` | ObjectId | Primary key |
 | `tenant_id` | ObjectId | |
-| `conference_id` | ObjectId | |
+| `room_id` | ObjectId | |
 | `recording_type` | RecordingType | `video`, `audio`, `screen_share`, `chat_log` |
 | `status` | RecordingStatus | `processing`, `available`, `failed`, `deleted` |
 | `file` | StorageFile | provider, bucket, key, url, content_type, size, duration, resolution |
@@ -299,7 +262,7 @@ Collection: `transcriptions`
 |-------|------|-------------|
 | `_id` | ObjectId | Primary key |
 | `tenant_id` | ObjectId | |
-| `conference_id` | ObjectId | |
+| `room_id` | ObjectId | |
 | `recording_id` | Option\<ObjectId\> | |
 | `status` | TranscriptionStatus | `processing`, `available`, `failed` |
 | `language` | String | |
@@ -311,6 +274,20 @@ Collection: `transcriptions`
 | `created_at` | DateTime | |
 | `updated_at` | DateTime | |
 
+### CallChatMessage
+
+Collection: `call_chat_messages`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `_id` | ObjectId | Primary key |
+| `tenant_id` | ObjectId | |
+| `room_id` | ObjectId | |
+| `author_id` | ObjectId | |
+| `display_name` | String | |
+| `content` | String | |
+| `created_at` | DateTime | |
+
 ### File
 
 Collection: `files`
@@ -320,7 +297,7 @@ Collection: `files`
 | `_id` | ObjectId | Primary key |
 | `tenant_id` | ObjectId | |
 | `uploaded_by` | ObjectId | |
-| `context` | FileContext | context_type (message/document/profile/channel/conference), entity_id, channel_id |
+| `context` | FileContext | context_type (message/document/profile/room), entity_id, room_id |
 | `filename` | String | |
 | `display_name` | Option\<String\> | |
 | `description` | Option\<String\> | |
@@ -353,7 +330,7 @@ Collection: `invites`
 |-------|------|-------------|
 | `_id` | ObjectId | Primary key |
 | `tenant_id` | ObjectId | |
-| `channel_id` | Option\<ObjectId\> | Channel-scoped invite |
+| `room_id` | Option\<ObjectId\> | Room-scoped invite |
 | `code` | String | Unique invite code |
 | `inviter_id` | ObjectId | |
 | `target_email` | Option\<String\> | Specific recipient |
@@ -400,8 +377,8 @@ Collection: `audit_logs`
 | `tenant_id` | ObjectId | |
 | `actor_id` | Option\<ObjectId\> | Who performed the action |
 | `actor_type` | ActorType | `user`, `bot`, `system`, `webhook` |
-| `action` | String | e.g. `channel.create`, `message.delete` |
-| `target_type` | String | e.g. `channel`, `message` |
+| `action` | String | e.g. `room.create`, `message.delete` |
+| `target_type` | String | e.g. `room`, `message` |
 | `target_id` | Option\<ObjectId\> | |
 | `changes` | Vec\<AuditChange\> | field, old_value, new_value |
 | `metadata` | AuditMetadata | ip, user_agent, reason |
@@ -453,30 +430,29 @@ Collection: `custom_emojis`
 | `tenant_members` | `{ user_id: 1 }` | No |
 | `roles` | `{ tenant_id: 1, name: 1 }` | Yes |
 | `roles` | `{ tenant_id: 1, position: 1 }` | No |
-| `channels` | `{ tenant_id: 1, parent_id: 1, position: 1 }` | No |
-| `channels` | `{ tenant_id: 1, path: 1 }` | Yes |
-| `channels` | `{ tenant_id: 1, name: 1, channel_type: 1 }` | No |
-| `channels` | `{ tenant_id: 1, is_default: 1 }` | No |
-| `channel_members` | `{ channel_id: 1, user_id: 1 }` | Yes |
-| `channel_members` | `{ user_id: 1, tenant_id: 1 }` | No |
-| `messages` | `{ channel_id: 1, created_at: -1 }` | No |
+| `rooms` | `{ tenant_id: 1, parent_id: 1, position: 1 }` | No |
+| `rooms` | `{ tenant_id: 1, path: 1 }` | Yes |
+| `rooms` | `{ tenant_id: 1, name: 1 }` | No |
+| `rooms` | `{ tenant_id: 1, is_default: 1 }` | No |
+| `rooms` | `{ meeting_code: 1 }` | Yes |
+| `rooms` | `{ tenant_id: 1, conference_status: 1 }` | No |
+| `rooms` | `{ organizer_id: 1 }` | No |
+| `room_members` | `{ room_id: 1, user_id: 1 }` | Yes |
+| `room_members` | `{ user_id: 1, tenant_id: 1 }` | No |
+| `messages` | `{ room_id: 1, created_at: -1 }` | No |
 | `messages` | `{ thread_id: 1, created_at: 1 }` | No |
 | `messages` | `{ tenant_id: 1, author_id: 1, created_at: -1 }` | No |
-| `messages` | `{ channel_id: 1, is_pinned: 1 }` | No |
+| `messages` | `{ room_id: 1, is_pinned: 1 }` | No |
 | `messages` | `{ mentions.users: 1 }` | No |
 | `reactions` | `{ message_id: 1, emoji.value: 1, user_id: 1 }` | Yes |
-| `conferences` | `{ tenant_id: 1, status: 1, start_time: -1 }` | No |
-| `conferences` | `{ organizer_id: 1, start_time: -1 }` | No |
-| `conferences` | `{ meeting_code: 1 }` | Yes |
-| `conference_participants` | `{ conference_id: 1, user_id: 1 }` | No |
-| `conference_participants` | `{ user_id: 1, tenant_id: 1 }` | No |
-| `recordings` | `{ conference_id: 1, recording_type: 1 }` | No |
+| `call_chat_messages` | `{ room_id: 1, created_at: 1 }` | No |
+| `recordings` | `{ room_id: 1, recording_type: 1 }` | No |
 | `recordings` | `{ tenant_id: 1, status: 1 }` | No |
-| `transcriptions` | `{ conference_id: 1 }` | No |
+| `transcriptions` | `{ room_id: 1 }` | No |
 | `transcriptions` | `{ tenant_id: 1, status: 1 }` | No |
 | `files` | `{ tenant_id: 1, context.context_type: 1, context.entity_id: 1 }` | No |
 | `files` | `{ tenant_id: 1, uploaded_by: 1, created_at: -1 }` | No |
-| `files` | `{ tenant_id: 1, context.channel_id: 1, created_at: -1 }` | No |
+| `files` | `{ tenant_id: 1, context.room_id: 1, created_at: -1 }` | No |
 | `files` | `{ external_source.provider: 1, external_source.external_id: 1 }` | No |
 | `invites` | `{ code: 1 }` | Yes |
 | `invites` | `{ tenant_id: 1, status: 1 }` | No |

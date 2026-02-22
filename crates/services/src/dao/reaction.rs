@@ -19,7 +19,7 @@ impl ReactionDao {
     pub async fn add(
         &self,
         tenant_id: ObjectId,
-        channel_id: ObjectId,
+        room_id: ObjectId,
         message_id: ObjectId,
         user_id: ObjectId,
         emoji: String,
@@ -43,7 +43,7 @@ impl ReactionDao {
         let reaction = Reaction {
             id: None,
             tenant_id,
-            channel_id,
+            room_id,
             message_id,
             user_id,
             emoji: EmojiRef {
@@ -92,10 +92,10 @@ impl ReactionDao {
             .collection()
             .aggregate(pipeline)
             .await
-            .map_err(|e| DaoError::Mongo(e))?;
+            .map_err(DaoError::Mongo)?;
 
         let mut summaries = Vec::new();
-        while let Some(doc) = cursor.try_next().await.map_err(|e| DaoError::Mongo(e))? {
+        while let Some(doc) = cursor.try_next().await.map_err(DaoError::Mongo)? {
             let emoji = doc.get_str("_id").unwrap_or_default().to_string();
             let count = doc.get_i32("count").unwrap_or(0) as u32;
             summaries.push(ReactionSummary { emoji, count });
@@ -104,18 +104,17 @@ impl ReactionDao {
         Ok(summaries)
     }
 
-    /// Add a reaction and update the message's reaction_summary.
     pub async fn add_and_update_summary(
         &self,
         messages: &MessageDao,
         tenant_id: ObjectId,
-        channel_id: ObjectId,
+        room_id: ObjectId,
         message_id: ObjectId,
         user_id: ObjectId,
         emoji: String,
     ) -> DaoResult<Reaction> {
         let reaction = self
-            .add(tenant_id, channel_id, message_id, user_id, emoji)
+            .add(tenant_id, room_id, message_id, user_id, emoji)
             .await?;
 
         let summary = self.get_summary(message_id).await?;
@@ -124,7 +123,6 @@ impl ReactionDao {
         Ok(reaction)
     }
 
-    /// Remove a reaction and update the message's reaction_summary.
     pub async fn remove_and_update_summary(
         &self,
         messages: &MessageDao,

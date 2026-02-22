@@ -3,16 +3,16 @@ use reqwest::multipart;
 use serde_json::Value;
 
 #[tokio::test]
-async fn upload_file_to_channel() {
+async fn upload_file_to_room() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("fileup").await;
-    let channel_id = tenant.channels[0].id.clone();
+    let room_id = tenant.rooms[0].id.clone();
 
-    // Admin joins channel
+    // Admin joins room
     app.auth_post(
         &format!(
-            "/api/tenant/{}/channel/{}/join",
-            tenant.tenant_id, channel_id
+            "/api/tenant/{}/room/{}/join",
+            tenant.tenant_id, room_id
         ),
         &tenant.admin.access_token,
     )
@@ -28,12 +28,12 @@ async fn upload_file_to_channel() {
 
     let form = multipart::Form::new()
         .part("file", file_part)
-        .text("channel_id", channel_id.clone());
+        .text("room_id", room_id.clone());
 
     let resp = app
         .client
         .post(app.url(&format!(
-            "/api/tenant/{}/channel/file/upload",
+            "/api/tenant/{}/file/upload",
             tenant.tenant_id
         )))
         .header(
@@ -58,13 +58,13 @@ async fn upload_file_to_channel() {
 async fn get_file_metadata() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("fileget").await;
-    let channel_id = tenant.channels[0].id.clone();
+    let room_id = tenant.rooms[0].id.clone();
 
-    // Admin joins channel
+    // Admin joins room
     app.auth_post(
         &format!(
-            "/api/tenant/{}/channel/{}/join",
-            tenant.tenant_id, channel_id
+            "/api/tenant/{}/room/{}/join",
+            tenant.tenant_id, room_id
         ),
         &tenant.admin.access_token,
     )
@@ -80,12 +80,12 @@ async fn get_file_metadata() {
 
     let form = multipart::Form::new()
         .part("file", file_part)
-        .text("channel_id", channel_id.clone());
+        .text("room_id", room_id.clone());
 
     let resp = app
         .client
         .post(app.url(&format!(
-            "/api/tenant/{}/channel/file/upload",
+            "/api/tenant/{}/file/upload",
             tenant.tenant_id
         )))
         .header(
@@ -104,7 +104,7 @@ async fn get_file_metadata() {
     let resp = app
         .auth_get(
             &format!(
-                "/api/tenant/{}/channel/file/{}",
+                "/api/tenant/{}/file/{}",
                 tenant.tenant_id, file_id
             ),
             &tenant.admin.access_token,
@@ -124,13 +124,13 @@ async fn get_file_metadata() {
 async fn download_uploaded_file() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("filedl").await;
-    let channel_id = tenant.channels[0].id.clone();
+    let room_id = tenant.rooms[0].id.clone();
 
-    // Admin joins channel
+    // Admin joins room
     app.auth_post(
         &format!(
-            "/api/tenant/{}/channel/{}/join",
-            tenant.tenant_id, channel_id
+            "/api/tenant/{}/room/{}/join",
+            tenant.tenant_id, room_id
         ),
         &tenant.admin.access_token,
     )
@@ -148,12 +148,12 @@ async fn download_uploaded_file() {
 
     let form = multipart::Form::new()
         .part("file", file_part)
-        .text("channel_id", channel_id.clone());
+        .text("room_id", room_id.clone());
 
     let resp = app
         .client
         .post(app.url(&format!(
-            "/api/tenant/{}/channel/file/upload",
+            "/api/tenant/{}/file/upload",
             tenant.tenant_id
         )))
         .header(
@@ -172,7 +172,7 @@ async fn download_uploaded_file() {
     let resp = app
         .auth_get(
             &format!(
-                "/api/tenant/{}/channel/file/{}/download",
+                "/api/tenant/{}/file/{}/download",
                 tenant.tenant_id, file_id
             ),
             &tenant.admin.access_token,
@@ -206,13 +206,13 @@ async fn download_uploaded_file() {
 async fn delete_file() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("filedel").await;
-    let channel_id = tenant.channels[0].id.clone();
+    let room_id = tenant.rooms[0].id.clone();
 
-    // Admin joins channel
+    // Admin joins room
     app.auth_post(
         &format!(
-            "/api/tenant/{}/channel/{}/join",
-            tenant.tenant_id, channel_id
+            "/api/tenant/{}/room/{}/join",
+            tenant.tenant_id, room_id
         ),
         &tenant.admin.access_token,
     )
@@ -228,12 +228,12 @@ async fn delete_file() {
 
     let form = multipart::Form::new()
         .part("file", file_part)
-        .text("channel_id", channel_id.clone());
+        .text("room_id", room_id.clone());
 
     let resp = app
         .client
         .post(app.url(&format!(
-            "/api/tenant/{}/channel/file/upload",
+            "/api/tenant/{}/file/upload",
             tenant.tenant_id
         )))
         .header(
@@ -252,7 +252,7 @@ async fn delete_file() {
     let resp = app
         .auth_delete(
             &format!(
-                "/api/tenant/{}/channel/file/{}",
+                "/api/tenant/{}/file/{}",
                 tenant.tenant_id, file_id
             ),
             &tenant.admin.access_token,
@@ -267,16 +267,16 @@ async fn delete_file() {
 }
 
 #[tokio::test]
-async fn list_files_in_channel() {
+async fn list_files_in_room() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("filelist").await;
-    let channel_id = tenant.channels[0].id.clone();
+    let room_id = tenant.rooms[0].id.clone();
 
-    // Admin joins channel
+    // Admin joins room
     app.auth_post(
         &format!(
-            "/api/tenant/{}/channel/{}/join",
-            tenant.tenant_id, channel_id
+            "/api/tenant/{}/room/{}/join",
+            tenant.tenant_id, room_id
         ),
         &tenant.admin.access_token,
     )
@@ -293,11 +293,11 @@ async fn list_files_in_channel() {
 
         let form = multipart::Form::new()
             .part("file", file_part)
-            .text("channel_id", channel_id.clone());
+            .text("room_id", room_id.clone());
 
         app.client
             .post(app.url(&format!(
-                "/api/tenant/{}/channel/file/upload",
+                "/api/tenant/{}/file/upload",
                 tenant.tenant_id
             )))
             .header(
@@ -310,12 +310,12 @@ async fn list_files_in_channel() {
             .unwrap();
     }
 
-    // List files in channel
+    // List files in room
     let resp = app
         .auth_get(
             &format!(
-                "/api/tenant/{}/channel/{}/file",
-                tenant.tenant_id, channel_id
+                "/api/tenant/{}/room/{}/file",
+                tenant.tenant_id, room_id
             ),
             &tenant.admin.access_token,
         )

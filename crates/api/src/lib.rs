@@ -7,6 +7,7 @@ pub mod ws;
 
 use axum::{
     Router,
+    extract::DefaultBodyLimit,
     routing::{delete, get, post, put},
 };
 use state::AppState;
@@ -40,19 +41,29 @@ pub fn build_router(state: AppState) -> Router {
     let member_routes = Router::new()
         .route("/", get(routes::user::list_members).post(routes::invite::add_member));
 
-    // Channel routes (under tenant)
-    let channel_routes = Router::new()
-        .route("/", get(routes::channel::list))
-        .route("/", post(routes::channel::create))
-        .route("/explore", get(routes::channel::explore))
-        .route("/{channel_id}", get(routes::channel::get))
-        .route("/{channel_id}", put(routes::channel::update))
-        .route("/{channel_id}", delete(routes::channel::delete))
-        .route("/{channel_id}/join", post(routes::channel::join))
-        .route("/{channel_id}/leave", post(routes::channel::leave))
-        .route("/{channel_id}/member", get(routes::channel::members));
+    // Room routes (under tenant) — replaces channel + conference
+    let room_routes = Router::new()
+        .route("/", get(routes::room::list))
+        .route("/", post(routes::room::create))
+        .route("/explore", get(routes::room::explore))
+        .route("/{room_id}", get(routes::room::get))
+        .route("/{room_id}", put(routes::room::update))
+        .route("/{room_id}", delete(routes::room::delete))
+        .route("/{room_id}/join", post(routes::room::join))
+        .route("/{room_id}/leave", post(routes::room::leave))
+        .route("/{room_id}/member", get(routes::room::members))
+        // Call endpoints
+        .route("/{room_id}/call/start", post(routes::room::call_start))
+        .route("/{room_id}/call/join", post(routes::room::call_join))
+        .route("/{room_id}/call/leave", post(routes::room::call_leave))
+        .route("/{room_id}/call/end", post(routes::room::call_end))
+        .route("/{room_id}/call/participant", get(routes::room::participants))
+        .route(
+            "/{room_id}/call/message",
+            get(routes::room::call_messages).post(routes::room::create_call_message),
+        );
 
-    // Message routes (under tenant/channel)
+    // Message routes (under tenant/room)
     let message_routes = Router::new()
         .route("/", get(routes::message::list))
         .route("/", post(routes::message::create))
@@ -67,48 +78,35 @@ pub fn build_router(state: AppState) -> Router {
             delete(routes::reaction::remove),
         );
 
-    // Conference routes (under tenant)
-    let conference_routes = Router::new()
-        .route("/", get(routes::conference::list))
-        .route("/", post(routes::conference::create))
-        .route("/{conference_id}", get(routes::conference::get))
-        .route("/{conference_id}/start", post(routes::conference::start))
-        .route("/{conference_id}/join", post(routes::conference::join))
-        .route("/{conference_id}/leave", post(routes::conference::leave))
-        .route("/{conference_id}/end", post(routes::conference::end))
-        .route(
-            "/{conference_id}/participant",
-            get(routes::conference::participants),
-        );
-
-    // Conference message routes (under conference)
-    let conference_message_routes = Router::new()
-        .route("/", get(routes::conference_message::list))
-        .route("/", post(routes::conference_message::create));
-
-    // Recording routes (under conference)
+    // Recording routes (under room)
     let recording_routes = Router::new()
         .route("/", get(routes::recording::list))
         .route("/", post(routes::recording::create))
         .route("/{recording_id}", delete(routes::recording::delete));
 
-    // Transcription routes (under conference)
+    // Transcription routes (under room)
     let transcription_routes = Router::new()
         .route("/", get(routes::transcription::list))
         .route("/", post(routes::transcription::create))
         .route("/{transcription_id}", get(routes::transcription::get));
 
-    // File routes (under tenant)
-    let file_routes = Router::new()
-        .route("/file/upload", post(routes::file::upload))
-        .route("/file/{file_id}", get(routes::file::get))
-        .route("/file/{file_id}/download", get(routes::file::download))
-        .route("/file/{file_id}", delete(routes::file::delete))
+    // Room file routes (100 MB body limit for audio uploads)
+    let room_file_routes = Router::new()
+        .route("/", get(routes::file::list))
+        .route("/upload", post(routes::file::upload_room))
+        .layer(DefaultBodyLimit::max(100 * 1024 * 1024));
+
+    // File-by-ID routes (under tenant — no room prefix needed)
+    let file_by_id_routes = Router::new()
+        .route("/upload", post(routes::file::upload))
+        .route("/{file_id}", get(routes::file::get))
+        .route("/{file_id}/download", get(routes::file::download))
+        .route("/{file_id}", delete(routes::file::delete))
         .route(
-            "/file/{file_id}/recognize",
+            "/{file_id}/recognize",
             post(routes::integration::recognize_file),
         )
-        .route("/{channel_id}/file", get(routes::file::list));
+        .layer(DefaultBodyLimit::max(100 * 1024 * 1024));
 
     // Background task routes (under tenant)
     let task_routes = Router::new()
@@ -129,7 +127,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/{code}", get(routes::invite::get_invite_info))
         .route("/{code}/accept", post(routes::invite::accept_invite));
 
-    // Tenant-scoped invite routes (require INVITE_MEMBERS permission)
+    // Tenant-scoped invite routes
     let tenant_invite_routes = Router::new()
         .route("/", get(routes::invite::list_invites))
         .route("/", post(routes::invite::create_invite))
@@ -140,14 +138,14 @@ pub fn build_router(state: AppState) -> Router {
         .route("/{provider}", get(routes::oauth::oauth_redirect))
         .route("/callback/{provider}", get(routes::oauth::oauth_callback));
 
-    // Stripe routes (mixed auth: plans=public, checkout/portal=auth, webhook=signature)
+    // Stripe routes
     let stripe_routes = Router::new()
         .route("/plans", get(routes::stripe::get_plans))
         .route("/checkout", post(routes::stripe::create_checkout))
         .route("/portal", post(routes::stripe::create_portal))
         .route("/webhook", post(routes::stripe::webhook));
 
-    // Giphy proxy routes (authenticated)
+    // Giphy proxy routes
     let giphy_routes = Router::new()
         .route("/search", get(routes::giphy::search))
         .route("/trending", get(routes::giphy::trending));
@@ -162,25 +160,24 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/tenant", tenant_routes)
         .nest("/tenant/{tenant_id}/member", member_routes)
         .nest("/tenant/{tenant_id}/invite", tenant_invite_routes)
-        .nest("/tenant/{tenant_id}/channel", channel_routes)
+        .nest("/tenant/{tenant_id}/room", room_routes)
         .nest(
-            "/tenant/{tenant_id}/channel/{channel_id}/message",
+            "/tenant/{tenant_id}/room/{room_id}/message",
             message_routes,
         )
-        .nest("/tenant/{tenant_id}/conference", conference_routes)
         .nest(
-            "/tenant/{tenant_id}/conference/{conference_id}/message",
-            conference_message_routes,
-        )
-        .nest(
-            "/tenant/{tenant_id}/conference/{conference_id}/recording",
+            "/tenant/{tenant_id}/room/{room_id}/recording",
             recording_routes,
         )
         .nest(
-            "/tenant/{tenant_id}/conference/{conference_id}/transcript",
+            "/tenant/{tenant_id}/room/{room_id}/transcript",
             transcription_routes,
         )
-        .nest("/tenant/{tenant_id}/channel", file_routes)
+        .nest(
+            "/tenant/{tenant_id}/room/{room_id}/file",
+            room_file_routes,
+        )
+        .nest("/tenant/{tenant_id}/file", file_by_id_routes)
         .nest("/tenant/{tenant_id}/task", task_routes)
         .nest("/tenant/{tenant_id}/export", export_routes);
 

@@ -16,6 +16,7 @@ impl FileDao {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn create(
         &self,
         tenant_id: ObjectId,
@@ -63,17 +64,17 @@ impl FileDao {
         self.base.find_by_id(id).await
     }
 
-    pub async fn find_by_channel(
+    pub async fn find_by_room(
         &self,
         tenant_id: ObjectId,
-        channel_id: ObjectId,
+        room_id: ObjectId,
         params: &PaginationParams,
     ) -> DaoResult<PaginatedResult<models::File>> {
         self.base
             .find_paginated(
                 doc! {
                     "tenant_id": tenant_id,
-                    "context.channel_id": channel_id,
+                    "context.room_id": room_id,
                     "deleted_at": null,
                 },
                 Some(doc! { "created_at": -1 }),

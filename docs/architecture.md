@@ -48,7 +48,7 @@ roomler2/
 | `db` | Define 18 MongoDB models, indexes, base DAO trait | `mongodb`, `bson`, `serde` |
 | `services` | Auth (JWT + argon2), DAOs, export, cloud storage, mediasoup SFU | `jsonwebtoken`, `argon2`, `rust_xlsxwriter`, `mediasoup` |
 | `api` | Axum router, REST routes, WebSocket handler, middleware | `axum`, `tower-http` |
-| `tests` | Integration test suite (12 test modules + fixtures) | `reqwest`, `tokio-test` |
+| `tests` | Integration test suite (15 test modules + fixtures) | `reqwest`, `tokio-test` |
 
 ### Dependency Graph
 
@@ -106,7 +106,7 @@ Browser
 
 ### API Layer (`crates/api`)
 
-- **Routes** -- REST endpoint handlers organized by domain (auth, tenant, channel, message, conference, file, etc.)
+- **Routes** -- REST endpoint handlers organized by domain (auth, tenant, room, message, file, recording, transcription, etc.)
 - **WebSocket** -- Connection management (`WsStorage`), message dispatch, presence and typing indicators
 - **Middleware** -- Authentication via `AuthUser` extractor (JWT from httpOnly cookie or Authorization header)
 - **Error Handling** -- Unified `ApiError` type maps to HTTP status codes
@@ -135,7 +135,7 @@ Views (pages)
 Components (reusable UI)
   │
   ▼
-Pinia Stores (8 stores: auth, tenant, channels, messages, conference, files, tasks, ws)
+Pinia Stores (8 stores: auth, tenant, rooms, messages, files, invite, tasks, ws)
   │
   ▼
 Composables (useAuth, useWebSocket)
