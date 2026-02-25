@@ -29,6 +29,7 @@ impl UserDao {
             username,
             display_name,
             avatar: None,
+            bio: None,
             password_hash: Some(password_hash),
             status: UserStatusInfo::default(),
             presence: Presence::Offline,
@@ -142,6 +143,7 @@ impl UserDao {
             username: uname,
             display_name: display_name.to_string(),
             avatar: avatar_url.map(|s| s.to_string()),
+            bio: None,
             password_hash: None,
             status: UserStatusInfo::default(),
             presence: Presence::Offline,
@@ -182,6 +184,7 @@ impl UserDao {
         &self,
         user_id: ObjectId,
         display_name: Option<String>,
+        bio: Option<String>,
         avatar: Option<String>,
         locale: Option<String>,
         timezone: Option<String>,
@@ -189,6 +192,9 @@ impl UserDao {
         let mut update = bson::Document::new();
         if let Some(name) = display_name {
             update.insert("display_name", name);
+        }
+        if let Some(b) = bio {
+            update.insert("bio", b);
         }
         if let Some(av) = avatar {
             update.insert("avatar", av);
@@ -203,6 +209,8 @@ impl UserDao {
         if update.is_empty() {
             return Ok(false);
         }
+
+        update.insert("updated_at", DateTime::now());
 
         self.base
             .update_by_id(user_id, doc! { "$set": update })

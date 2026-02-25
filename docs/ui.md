@@ -21,6 +21,8 @@ graph TD
     Invites["/tenant/:tenantId/invites — InviteManageView"]
     Admin["/tenant/:tenantId/admin — AdminPanel"]
     Billing["/tenant/:tenantId/billing — BillingView"]
+    ProfileView["/profile/:userId — ProfileView"]
+    ProfileEdit["/profile/edit — ProfileEditView"]
 
     Landing --> Login
     Landing --> Register
@@ -37,6 +39,8 @@ graph TD
     TenantDash --> Invites
     TenantDash --> Admin
     TenantDash --> Billing
+    Dashboard --> ProfileView
+    Dashboard --> ProfileEdit
 ```
 
 ## Routes
@@ -59,6 +63,8 @@ graph TD
 | `/tenant/:tenantId/invites` | `invites` | `InviteManageView` | Yes | Manage invites |
 | `/tenant/:tenantId/admin` | `admin` | `AdminPanel` | Yes | Tenant admin panel |
 | `/tenant/:tenantId/billing` | `billing` | `BillingView` | Yes | Billing & subscription |
+| `/profile/edit` | `profile-edit` | `ProfileEditView` | Yes | Edit own profile |
+| `/profile/:userId` | `profile` | `ProfileView` | Yes | View user profile |
 
 Auth guard: authenticated routes redirect to `/landing` if no `access_token` in localStorage. Guest routes redirect to `/` if token exists.
 
@@ -110,12 +116,19 @@ All authenticated routes are wrapped in `AppLayout.vue`, which provides:
 |------|------|-------------|
 | FilesBrowser | `views/files/FilesBrowser.vue` | Upload, browse, download files |
 
+### Profile
+
+| View | File | Description |
+|------|------|-------------|
+| ProfileView | `views/profile/ProfileView.vue` | View any user's profile (avatar, bio, presence) |
+| ProfileEditView | `views/profile/ProfileEditView.vue` | Edit own profile (display_name, bio, avatar, locale, timezone) |
+
 ### Invites
 
 | View | File | Description |
 |------|------|-------------|
 | InviteLandingView | `views/invite/InviteLandingView.vue` | Public invite acceptance page |
-| InviteManageView | `views/invite/InviteManageView.vue` | Manage tenant invites |
+| InviteManageView | `views/invite/InviteManageView.vue` | Manage tenant invites (single + batch) |
 
 ### Billing
 
@@ -143,22 +156,30 @@ All authenticated routes are wrapped in `AppLayout.vue`, which provides:
 | LayoutSwitcher | `components/conference/LayoutSwitcher.vue` | Conference layout mode switcher |
 | TranscriptPanel | `components/conference/TranscriptPanel.vue` | Live transcription panel |
 | ConferenceFilesPanel | `components/conference/ConferenceFilesPanel.vue` | File sharing panel in calls |
+| MentionList | `components/chat/MentionList.vue` | @mention autocomplete suggestion dropdown |
+| NotificationPanel | `components/layout/NotificationPanel.vue` | Notification dropdown panel in app bar |
+| RoomMemberList | `components/rooms/RoomMemberList.vue` | Room member list with role badges |
+| RoleAssignDialog | `components/rooms/RoleAssignDialog.vue` | Dialog to assign/change roles |
+| BatchInviteDialog | `components/invite/BatchInviteDialog.vue` | Batch invite dialog (multi-email + role) |
 | ConfirmDialog | `components/common/ConfirmDialog.vue` | Reusable confirmation dialog |
 
 ## Pinia Stores
 
-8 stores manage the application state:
+12 stores manage the application state:
 
 | Store | File | State | Key Actions |
 |-------|------|-------|-------------|
 | `auth` | `stores/auth.ts` | User profile, tokens | `login`, `register`, `logout`, `refresh`, `fetchMe` |
 | `tenant` | `stores/tenant.ts` | Tenant list, current tenant | `fetchTenants`, `createTenant`, `setCurrentTenant` |
-| `rooms` | `stores/rooms.ts` | Room list, current room | `fetchRooms`, `createRoom`, `joinRoom`, `leaveRoom`, `updateRoomCallStatus` |
-| `messages` | `stores/messages.ts` | Message list, threads | `fetchMessages`, `sendMessage`, `editMessage`, `deleteMessage`, `togglePin` |
+| `rooms` | `stores/rooms.ts` | Room list, current room | `fetchRooms`, `createRoom`, `joinRoom`, `leaveRoom`, `explore` |
+| `messages` | `stores/messages.ts` | Message list, threads | `fetchMessages`, `sendMessage` (with mentions), `editMessage`, `deleteMessage`, `togglePin` |
 | `files` | `stores/files.ts` | File list | `uploadFile`, `fetchFiles`, `deleteFile`, `recognizeFile` |
-| `invite` | `stores/invite.ts` | Invite list | `fetchInvites`, `createInvite`, `revokeInvite`, `acceptInvite` |
+| `invite` | `stores/invite.ts` | Invite list | `listInvites`, `createInvite`, `batchCreateInvites`, `revokeInvite`, `acceptInvite` |
+| `notification` | `stores/notification.ts` | Notifications, unread count | `fetchNotifications`, `fetchUnreadCount`, `markRead`, `markAllRead` |
+| `role` | `stores/role.ts` | Role list | `fetchRoles`, `createRole`, `updateRole`, `deleteRole`, `assignRole`, `unassignRole` |
+| `user` | `stores/user.ts` | User profile | `fetchProfile`, `updateProfile` |
 | `tasks` | `stores/tasks.ts` | Background task list | `fetchTasks`, `pollTask`, `downloadTaskOutput` |
-| `ws` | `stores/ws.ts` | WebSocket connection state | `connect`, `disconnect`, `send`, message handlers for room:call_* events |
+| `ws` | `stores/ws.ts` | WebSocket connection state | `connect`, `disconnect`, `send`, handlers for room:call_*, notification:* events |
 
 ## Composables
 
@@ -182,3 +203,16 @@ bun run dev       # Development server (Vite)
 bun run build     # Production build (vue-tsc + vite build)
 bun run preview   # Preview production build
 ```
+
+## Testing
+
+```bash
+cd ui
+bun run test:unit          # Vitest unit tests
+bun run test:unit:watch    # Watch mode
+bun run test:unit:coverage # Coverage report (v8)
+bun run e2e                # Playwright E2E tests
+bun run e2e:ui             # Playwright UI mode
+```
+
+Unit test config: `vitest.config.ts` (jsdom environment, @vue/test-utils, `@` alias to `src/`).

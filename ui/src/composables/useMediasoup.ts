@@ -64,11 +64,11 @@ export function useMediasoup() {
     device.value = dev
     console.log('[mediasoup] device loaded')
 
-    // Build iceServers from TURN config — only when force_relay is true.
-    // With force_relay=false, direct host candidates are used and adding a remote
-    // TURN server can interfere with ICE gathering (unreachable relay allocation).
+    // Build iceServers from TURN config.
+    // Always pass iceServers when the server provides them — behind NAT/K8s,
+    // TURN relay is needed even when force_relay is false.
     const forceRelay = !!transportMsg.force_relay
-    const iceServers = forceRelay && transportMsg.ice_servers?.length
+    const iceServers = transportMsg.ice_servers?.length
       ? transportMsg.ice_servers.map((s: { urls: string[]; username: string; credential: string }) => ({
           urls: s.urls,
           username: s.username,

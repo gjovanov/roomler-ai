@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { useRoomStore } from './rooms'
 import { useMessageStore } from './messages'
+import { useNotificationStore } from './notification'
 import { useTaskStore } from './tasks'
 
 type WsStatus = 'disconnected' | 'connecting' | 'connected'
@@ -66,6 +67,7 @@ export const useWsStore = defineStore('ws', () => {
   function handleMessage(msg: { type: string; data?: unknown }) {
     const roomStore = useRoomStore()
     const messageStore = useMessageStore()
+    const notificationStore = useNotificationStore()
     const taskStore = useTaskStore()
 
     // Check pending waiters first
@@ -106,6 +108,14 @@ export const useWsStore = defineStore('ws', () => {
       case 'task:update':
         taskStore.updateFromWs(msg.data as never)
         break
+      case 'notification:new':
+        notificationStore.addFromWs(msg.data as never)
+        break
+      case 'notification:unread_count': {
+        const ncData = msg.data as { count: number }
+        notificationStore.setUnreadCount(ncData.count)
+        break
+      }
       case 'room:call_started': {
         const csData = msg.data as { room_id: string; room_name: string; started_by: string }
         roomStore.updateRoomCallStatus(csData.room_id, 'InProgress')

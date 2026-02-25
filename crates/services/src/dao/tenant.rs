@@ -227,6 +227,34 @@ impl TenantDao {
         Ok(count > 0)
     }
 
+    pub async fn assign_role(
+        &self,
+        tenant_id: ObjectId,
+        user_id: ObjectId,
+        role_id: ObjectId,
+    ) -> DaoResult<bool> {
+        self.members
+            .update_one(
+                doc! { "tenant_id": tenant_id, "user_id": user_id },
+                doc! { "$addToSet": { "role_ids": role_id }, "$set": { "updated_at": DateTime::now() } },
+            )
+            .await
+    }
+
+    pub async fn remove_role(
+        &self,
+        tenant_id: ObjectId,
+        user_id: ObjectId,
+        role_id: ObjectId,
+    ) -> DaoResult<bool> {
+        self.members
+            .update_one(
+                doc! { "tenant_id": tenant_id, "user_id": user_id },
+                doc! { "$pull": { "role_ids": role_id }, "$set": { "updated_at": DateTime::now() } },
+            )
+            .await
+    }
+
     pub async fn get_member_permissions(
         &self,
         tenant_id: ObjectId,

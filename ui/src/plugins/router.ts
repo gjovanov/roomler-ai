@@ -48,6 +48,16 @@ const routes: RouteRecordRaw[] = [
         component: () => import('@/views/dashboard/DashboardView.vue'),
       },
       {
+        path: 'profile/edit',
+        name: 'profile-edit',
+        component: () => import('@/views/profile/ProfileEditView.vue'),
+      },
+      {
+        path: 'profile/:userId',
+        name: 'profile',
+        component: () => import('@/views/profile/ProfileView.vue'),
+      },
+      {
         path: 'tenant/:tenantId',
         children: [
           {

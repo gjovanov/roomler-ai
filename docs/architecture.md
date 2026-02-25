@@ -135,7 +135,7 @@ Views (pages)
 Components (reusable UI)
   │
   ▼
-Pinia Stores (8 stores: auth, tenant, rooms, messages, files, invite, tasks, ws)
+Pinia Stores (12 stores: auth, tenant, rooms, messages, files, invite, notification, role, user, tasks, ws)
   │
   ▼
 Composables (useAuth, useWebSocket)

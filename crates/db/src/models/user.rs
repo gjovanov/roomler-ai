@@ -9,6 +9,7 @@ pub struct User {
     pub username: String,
     pub display_name: String,
     pub avatar: Option<String>,
+    pub bio: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub password_hash: Option<String>,
     #[serde(default)]

@@ -127,10 +127,20 @@ pub fn build_router(state: AppState) -> Router {
         .route("/{code}", get(routes::invite::get_invite_info))
         .route("/{code}/accept", post(routes::invite::accept_invite));
 
+    // Role routes (under tenant)
+    let role_routes = Router::new()
+        .route("/", get(routes::role::list))
+        .route("/", post(routes::role::create))
+        .route("/{role_id}", put(routes::role::update))
+        .route("/{role_id}", delete(routes::role::delete))
+        .route("/{role_id}/assign/{user_id}", post(routes::role::assign))
+        .route("/{role_id}/assign/{user_id}", delete(routes::role::unassign));
+
     // Tenant-scoped invite routes
     let tenant_invite_routes = Router::new()
         .route("/", get(routes::invite::list_invites))
         .route("/", post(routes::invite::create_invite))
+        .route("/batch", post(routes::invite::batch_create_invite))
         .route("/{invite_id}", delete(routes::invite::revoke_invite));
 
     // OAuth routes (no auth required)
@@ -150,15 +160,31 @@ pub fn build_router(state: AppState) -> Router {
         .route("/search", get(routes::giphy::search))
         .route("/trending", get(routes::giphy::trending));
 
+    // Notification routes (user-scoped, no tenant prefix)
+    let notification_routes = Router::new()
+        .route("/", get(routes::notification::list))
+        .route("/unread", get(routes::notification::unread))
+        .route("/unread-count", get(routes::notification::unread_count))
+        .route("/{notification_id}/read", put(routes::notification::mark_read))
+        .route("/read-all", post(routes::notification::mark_all_read));
+
+    // User profile routes
+    let user_routes = Router::new()
+        .route("/me", put(routes::user::update_profile))
+        .route("/{user_id}", get(routes::user::get_profile));
+
     // Compose API
     let api = Router::new()
         .nest("/auth", auth_routes)
+        .nest("/user", user_routes)
         .nest("/oauth", oauth_routes)
         .nest("/stripe", stripe_routes)
         .nest("/invite", public_invite_routes)
         .nest("/giphy", giphy_routes)
+        .nest("/notification", notification_routes)
         .nest("/tenant", tenant_routes)
         .nest("/tenant/{tenant_id}/member", member_routes)
+        .nest("/tenant/{tenant_id}/role", role_routes)
         .nest("/tenant/{tenant_id}/invite", tenant_invite_routes)
         .nest("/tenant/{tenant_id}/room", room_routes)
         .nest(

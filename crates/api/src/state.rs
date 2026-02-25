@@ -3,9 +3,9 @@ use roomler2_config::Settings;
 use roomler2_services::{
     AuthService, GiphyService, OAuthService, RecognitionService, TaskService,
     dao::{
-        file::FileDao, invite::InviteDao, message::MessageDao, reaction::ReactionDao,
-        recording::RecordingDao, room::RoomDao, tenant::TenantDao,
-        transcription::TranscriptionDao, user::UserDao,
+        file::FileDao, invite::InviteDao, message::MessageDao, notification::NotificationDao,
+        reaction::ReactionDao, recording::RecordingDao, role::RoleDao, room::RoomDao,
+        tenant::TenantDao, transcription::TranscriptionDao, user::UserDao,
     },
     media::{room_manager::RoomManager, worker_pool::WorkerPool},
 };
@@ -24,7 +24,9 @@ pub struct AppState {
     pub rooms: Arc<RoomDao>,
     pub invites: Arc<InviteDao>,
     pub messages: Arc<MessageDao>,
+    pub notifications: Arc<NotificationDao>,
     pub reactions: Arc<ReactionDao>,
+    pub roles: Arc<RoleDao>,
     pub files: Arc<FileDao>,
     pub recordings: Arc<RecordingDao>,
     pub transcriptions: Arc<TranscriptionDao>,
@@ -45,7 +47,9 @@ impl AppState {
         let rooms = Arc::new(RoomDao::new(&db));
         let invites = Arc::new(InviteDao::new(&db));
         let messages = Arc::new(MessageDao::new(&db));
+        let notifications = Arc::new(NotificationDao::new(&db));
         let reactions = Arc::new(ReactionDao::new(&db));
+        let roles = Arc::new(RoleDao::new(&db));
         let files = Arc::new(FileDao::new(&db));
         let recordings = Arc::new(RecordingDao::new(&db));
         let transcriptions = Arc::new(TranscriptionDao::new(&db));
@@ -108,7 +112,9 @@ impl AppState {
             rooms,
             invites,
             messages,
+            notifications,
             reactions,
+            roles,
             files,
             recordings,
             transcriptions,

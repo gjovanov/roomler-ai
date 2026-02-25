@@ -56,7 +56,26 @@
 
       <template #append>
         <v-btn icon="mdi-magnify" size="small" />
-        <v-btn icon="mdi-bell-outline" size="small" />
+        <v-btn
+          :icon="isDark ? 'mdi-weather-sunny' : 'mdi-weather-night'"
+          size="small"
+          @click="toggleTheme"
+        />
+        <v-menu v-model="showNotifications" :close-on-content-click="false">
+          <template #activator="{ props: menuProps }">
+            <v-btn icon size="small" v-bind="menuProps">
+              <v-badge
+                :content="notificationStore.unreadCount"
+                :model-value="notificationStore.unreadCount > 0"
+                color="error"
+                overlap
+              >
+                <v-icon>mdi-bell-outline</v-icon>
+              </v-badge>
+            </v-btn>
+          </template>
+          <notification-panel @close="showNotifications = false" />
+        </v-menu>
         <v-menu v-if="auth.isAuthenticated">
           <template #activator="{ props }">
             <v-btn icon v-bind="props" size="small">
@@ -91,16 +110,30 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { useTheme } from 'vuetify'
 import { useAuth } from '@/composables/useAuth'
 import { useTenantStore } from '@/stores/tenant'
+import { useNotificationStore } from '@/stores/notification'
+import NotificationPanel from '@/components/layout/NotificationPanel.vue'
 
 const { auth, logout: handleLogout } = useAuth()
 const tenantStore = useTenantStore()
+const notificationStore = useNotificationStore()
 const route = useRoute()
 const router = useRouter()
+const theme = useTheme()
 
 const drawer = ref(true)
 const rail = ref(false)
+const showNotifications = ref(false)
+
+const isDark = computed(() => theme.global.current.value.dark)
+
+function toggleTheme() {
+  const next = isDark.value ? 'light' : 'dark'
+  theme.global.name.value = next
+  localStorage.setItem('roomler-theme', next)
+}
 
 // Call notification snackbar
 const callSnackbar = ref(false)
@@ -164,6 +197,7 @@ function selectTenant(t: Tenant) {
 
 onMounted(() => {
   tenantStore.fetchTenants()
+  notificationStore.fetchUnreadCount()
   window.addEventListener('room:call_started', onCallStarted)
 })
 

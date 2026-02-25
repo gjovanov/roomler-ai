@@ -25,6 +25,7 @@ impl MessageDao {
         thread_id: Option<ObjectId>,
         referenced_message_id: Option<ObjectId>,
         nonce: Option<String>,
+        mentions: Option<Mentions>,
     ) -> DaoResult<Message> {
         let now = DateTime::now();
         let message_type = if referenced_message_id.is_some() {
@@ -47,7 +48,7 @@ impl MessageDao {
             message_type,
             embeds: Vec::new(),
             attachments: Vec::new(),
-            mentions: Mentions::default(),
+            mentions: mentions.unwrap_or_default(),
             reaction_summary: Vec::new(),
             referenced_message_id,
             is_pinned: false,

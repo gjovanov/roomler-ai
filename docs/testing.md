@@ -1,6 +1,6 @@
 # Testing
 
-Roomler2 has two test layers: Rust integration tests (114 tests) and Playwright E2E tests.
+Roomler2 has three test layers: Rust integration tests (114 tests), Vitest component unit tests, and Playwright E2E tests.
 
 ## Integration Tests
 
@@ -50,6 +50,37 @@ cargo test -p roomler2-tests -- --nocapture
 ```
 
 Integration tests require a running MongoDB instance (see `docker-compose.yml`).
+
+## Vitest Unit Tests
+
+Located in `ui/src/**/__tests__/`. Component and config unit tests using Vitest + @vue/test-utils + jsdom.
+
+### Configuration
+
+- Config file: `ui/vitest.config.ts`
+- Environment: jsdom
+- Coverage: v8
+
+### Test Modules
+
+| File | Coverage Area |
+|------|--------------|
+| `plugins/__tests__/vuetify.spec.ts` | Theme config (light/dark colors, default theme, localStorage) |
+
+### Running Unit Tests
+
+```bash
+cd ui
+
+# Run all unit tests
+bun run test:unit
+
+# Run with watch mode
+bun run test:unit:watch
+
+# Run with coverage report
+bun run test:unit:coverage
+```
 
 ## E2E Tests
 
@@ -104,23 +135,23 @@ E2E tests require both the backend (`cargo run`) and frontend (`bun run dev`) to
 ## Test Architecture
 
 ```
-Integration Tests (Rust)              E2E Tests (Playwright)
-┌─────────────────────┐              ┌─────────────────────┐
-│ reqwest HTTP Client  │              │ Chromium Browser     │
-│         │            │              │        │             │
-│         ▼            │              │        ▼             │
-│  Axum Test Server    │              │  Vue 3 SPA (:5000)  │
-│  (random port)       │              │        │             │
-│         │            │              │        ▼             │
-│         ▼            │              │  Axum API (:5001)    │
-│  Mongo (test DB)     │              │        │             │
-│                      │              │        ▼             │
-└─────────────────────┘              │  Mongo   + Redis +   │
-                                     │  MinIO               │
-                                     └─────────────────────┘
+Integration Tests (Rust)    Unit Tests (Vitest)      E2E Tests (Playwright)
+┌─────────────────────┐    ┌───────────────────┐    ┌─────────────────────┐
+│ reqwest HTTP Client  │    │ jsdom Environment  │    │ Chromium Browser     │
+│         │            │    │        │           │    │        │             │
+│         ▼            │    │        ▼           │    │        ▼             │
+│  Axum Test Server    │    │ Vue Test Utils +   │    │  Vue 3 SPA (:5000)  │
+│  (random port)       │    │ Component Mounts   │    │        │             │
+│         │            │    │                    │    │        ▼             │
+│         ▼            │    └───────────────────┘    │  Axum API (:5001)    │
+│  Mongo (test DB)     │                             │        │             │
+│                      │                             │        ▼             │
+└─────────────────────┘                             │  Mongo + Redis +     │
+                                                     │  MinIO               │
+                                                     └─────────────────────┘
 ```
 
-Integration tests use an isolated test database and server instance per test. E2E tests run against the development stack.
+Integration tests use an isolated test database and server instance per test. Unit tests run in jsdom with mocked dependencies. E2E tests run against the development stack.
 
 ## Conference Stress Test
 

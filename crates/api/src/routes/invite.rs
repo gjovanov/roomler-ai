@@ -71,6 +71,28 @@ pub struct AddMemberRequest {
     pub role_ids: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct BatchCreateInviteRequest {
+    pub invites: Vec<CreateInviteRequest>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BatchInviteResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invite: Option<InviteResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_email: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BatchCreateInviteResponse {
+    pub results: Vec<BatchInviteResult>,
+    pub created: usize,
+    pub failed: usize,
+}
+
 // ─── Public handlers ────────────────────────────────────────────
 
 /// GET /api/invite/{code} — public invite info
@@ -232,6 +254,82 @@ pub async fn create_invite(
         .await?;
 
     Ok((StatusCode::CREATED, Json(invite_to_response(invite))))
+}
+
+/// POST /api/tenant/{tenant_id}/invite/batch — create multiple invites
+pub async fn batch_create_invite(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(tenant_id): Path<String>,
+    Json(body): Json<BatchCreateInviteRequest>,
+) -> Result<(StatusCode, Json<BatchCreateInviteResponse>), ApiError> {
+    let tid = parse_oid(&tenant_id)?;
+    require_invite_permission(&state, tid, auth.user_id).await?;
+
+    if body.invites.is_empty() {
+        return Err(ApiError::BadRequest("No invites provided".to_string()));
+    }
+    if body.invites.len() > 50 {
+        return Err(ApiError::BadRequest("Maximum 50 invites per batch".to_string()));
+    }
+
+    let mut results: Vec<BatchInviteResult> = Vec::with_capacity(body.invites.len());
+
+    for item in body.invites {
+        let assign_role_ids: Result<Vec<ObjectId>, _> = item
+            .assign_role_ids
+            .iter()
+            .map(|s| parse_oid(s))
+            .collect();
+
+        match assign_role_ids {
+            Ok(role_ids) => {
+                let expires_in_hours = item.expires_in_hours.or(Some(168));
+                match state
+                    .invites
+                    .create(
+                        tid,
+                        auth.user_id,
+                        CreateInviteParams {
+                            target_email: item.target_email.clone(),
+                            max_uses: item.max_uses,
+                            expires_in_hours,
+                            assign_role_ids: role_ids,
+                        },
+                    )
+                    .await
+                {
+                    Ok(invite) => results.push(BatchInviteResult {
+                        invite: Some(invite_to_response(invite)),
+                        error: None,
+                        target_email: item.target_email,
+                    }),
+                    Err(e) => results.push(BatchInviteResult {
+                        invite: None,
+                        error: Some(e.to_string()),
+                        target_email: item.target_email,
+                    }),
+                }
+            }
+            Err(e) => results.push(BatchInviteResult {
+                invite: None,
+                error: Some(e.to_string()),
+                target_email: item.target_email,
+            }),
+        }
+    }
+
+    let created = results.iter().filter(|r| r.invite.is_some()).count();
+    let failed = results.iter().filter(|r| r.error.is_some()).count();
+
+    Ok((
+        StatusCode::CREATED,
+        Json(BatchCreateInviteResponse {
+            results,
+            created,
+            failed,
+        }),
+    ))
 }
 
 /// DELETE /api/tenant/{tenant_id}/invite/{invite_id} — revoke invite

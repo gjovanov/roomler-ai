@@ -7,6 +7,12 @@ interface Reaction {
   count: number
 }
 
+export interface MentionData {
+  users: string[]
+  everyone: boolean
+  here: boolean
+}
+
 interface Message {
   id: string
   room_id: string
@@ -17,6 +23,7 @@ interface Message {
   is_thread_root: boolean
   is_pinned: boolean
   reaction_summary: Reaction[]
+  mentions?: MentionData
   created_at: string
   updated_at: string
 }
@@ -40,10 +47,14 @@ export const useMessageStore = defineStore('messages', () => {
     }
   }
 
-  async function sendMessage(tenantId: string, roomId: string, content: string, threadId?: string) {
+  async function sendMessage(tenantId: string, roomId: string, content: string, threadId?: string, mentions?: MentionData) {
+    const body: Record<string, unknown> = { content, thread_id: threadId }
+    if (mentions && (mentions.users.length > 0 || mentions.everyone || mentions.here)) {
+      body.mentions = mentions
+    }
     const msg = await api.post<Message>(
       `/tenant/${tenantId}/room/${roomId}/message`,
-      { content, thread_id: threadId },
+      body,
     )
     if (threadId) {
       threadMessages.value.push(msg)

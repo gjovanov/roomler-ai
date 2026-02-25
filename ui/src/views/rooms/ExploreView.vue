@@ -2,45 +2,81 @@
   <v-container>
     <v-row>
       <v-col cols="12">
-        <h1 class="text-h4 mb-4">{{ $t('nav.explore') }}</h1>
+        <h1 class="text-h4 mb-2">{{ $t('nav.explore') }}</h1>
+        <p class="text-medium-emphasis mb-4">Discover and join open rooms</p>
         <v-text-field
           v-model="query"
           :label="$t('common.search')"
           prepend-inner-icon="mdi-magnify"
           clearable
-          @input="debounceSearch"
+          hide-details
+          @update:model-value="debounceSearch"
         />
       </v-col>
     </v-row>
 
-    <v-row>
+    <v-row v-if="loading" class="mt-4">
+      <v-col cols="12" class="text-center pa-8">
+        <v-progress-circular indeterminate />
+      </v-col>
+    </v-row>
+
+    <v-row v-else class="mt-2">
       <v-col v-for="room in results" :key="room.id" cols="12" sm="6" md="4">
-        <v-card>
-          <v-card-title>
-            <v-icon class="mr-2" size="small">
+        <v-card variant="outlined" class="fill-height d-flex flex-column">
+          <v-card-title class="d-flex align-center">
+            <v-icon class="mr-2" size="small" :color="room.is_open ? 'primary' : undefined">
               {{ room.is_open ? 'mdi-pound' : 'mdi-lock' }}
             </v-icon>
-            {{ room.name }}
+            <span class="text-truncate">{{ room.name }}</span>
           </v-card-title>
-          <v-card-subtitle>{{ room.member_count }} members</v-card-subtitle>
-          <v-card-text v-if="room.topic?.value">{{ room.topic.value }}</v-card-text>
+
+          <v-card-text class="flex-grow-1">
+            <p v-if="room.topic?.value" class="text-body-2 mb-3">
+              {{ room.topic.value }}
+            </p>
+            <p v-else class="text-body-2 text-medium-emphasis mb-3">
+              No topic set
+            </p>
+
+            <div class="d-flex align-center text-caption text-medium-emphasis">
+              <v-icon size="x-small" class="mr-1">mdi-account-group</v-icon>
+              {{ room.member_count }} {{ room.member_count === 1 ? 'member' : 'members' }}
+              <template v-if="room.message_count > 0">
+                <v-icon size="x-small" class="ml-3 mr-1">mdi-message-text</v-icon>
+                {{ room.message_count }} messages
+              </template>
+            </div>
+          </v-card-text>
+
           <v-card-actions>
-            <v-btn color="primary" @click="join(room.id)">{{ $t('room.join') }}</v-btn>
+            <v-spacer />
+            <v-btn
+              color="primary"
+              variant="tonal"
+              size="small"
+              prepend-icon="mdi-login"
+              @click="join(room.id)"
+            >
+              {{ $t('room.join') }}
+            </v-btn>
           </v-card-actions>
         </v-card>
       </v-col>
     </v-row>
 
-    <v-row v-if="results.length === 0 && query">
+    <v-row v-if="results.length === 0 && !loading && searched">
       <v-col cols="12" class="text-center text-medium-emphasis pa-8">
-        No rooms found matching "{{ query }}"
+        <v-icon size="48" class="mb-2">mdi-magnify-close</v-icon>
+        <p v-if="query">No rooms found matching "{{ query }}"</p>
+        <p v-else>No open rooms available. Try creating one!</p>
       </v-col>
     </v-row>
   </v-container>
 </template>
 
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useRoomStore, type Room } from '@/stores/rooms'
 
@@ -50,23 +86,32 @@ const roomStore = useRoomStore()
 
 const tenantId = computed(() => route.params.tenantId as string)
 const query = ref('')
-
 const results = ref<Room[]>([])
+const loading = ref(false)
+const searched = ref(false)
 let searchTimeout: ReturnType<typeof setTimeout> | null = null
 
 function debounceSearch() {
   if (searchTimeout) clearTimeout(searchTimeout)
-  searchTimeout = setTimeout(async () => {
-    if (query.value.trim()) {
-      results.value = await roomStore.explore(tenantId.value, query.value)
-    } else {
-      results.value = []
-    }
-  }, 300)
+  searchTimeout = setTimeout(() => doSearch(), 300)
+}
+
+async function doSearch() {
+  loading.value = true
+  searched.value = true
+  try {
+    results.value = await roomStore.explore(tenantId.value, query.value || '')
+  } finally {
+    loading.value = false
+  }
 }
 
 async function join(roomId: string) {
   await roomStore.joinRoom(tenantId.value, roomId)
   router.push({ name: 'room-chat', params: { tenantId: tenantId.value, roomId } })
 }
+
+onMounted(() => {
+  doSearch()
+})
 </script>

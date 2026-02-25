@@ -5,6 +5,15 @@
         <div class="d-flex align-center mb-4">
           <h2 class="text-h5">Invite Links</h2>
           <v-spacer />
+          <v-btn
+            variant="outlined"
+            color="primary"
+            class="mr-2"
+            @click="showBatchDialog = true"
+          >
+            <v-icon start>mdi-email-multiple</v-icon>
+            Batch Invite
+          </v-btn>
           <v-btn color="primary" @click="showCreateDialog = true">
             <v-icon start>mdi-plus</v-icon>
             Create Invite
@@ -107,6 +116,13 @@
           </v-card>
         </v-dialog>
 
+        <!-- Batch invite dialog -->
+        <batch-invite-dialog
+          v-model="showBatchDialog"
+          :tenant-id="tenantId"
+          :roles="roleStore.roles"
+        />
+
         <!-- Copy success snackbar -->
         <v-snackbar v-model="showCopied" :timeout="2000" color="success">
           Invite link copied to clipboard
@@ -120,12 +136,16 @@
 import { ref, onMounted } from 'vue'
 import { useRoute } from 'vue-router'
 import { useInviteStore } from '@/stores/invite'
+import { useRoleStore } from '@/stores/role'
+import BatchInviteDialog from '@/components/invite/BatchInviteDialog.vue'
 
 const route = useRoute()
 const inviteStore = useInviteStore()
+const roleStore = useRoleStore()
 
 const tenantId = ref(route.params.tenantId as string)
 const showCreateDialog = ref(false)
+const showBatchDialog = ref(false)
 const showCopied = ref(false)
 const creating = ref(false)
 
@@ -187,5 +207,6 @@ async function handleRevoke(inviteId: string) {
 
 onMounted(() => {
   inviteStore.listInvites(tenantId.value)
+  roleStore.fetchRoles(tenantId.value)
 })
 </script>

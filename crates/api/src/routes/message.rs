@@ -3,7 +3,18 @@ use bson::oid::ObjectId;
 use serde::{Deserialize, Serialize};
 
 use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
+use roomler2_db::models::{Mentions, NotificationSource, NotificationType};
 use roomler2_services::dao::base::PaginationParams;
+
+#[derive(Debug, Deserialize)]
+pub struct MentionRequest {
+    #[serde(default)]
+    pub users: Vec<String>,
+    #[serde(default)]
+    pub everyone: bool,
+    #[serde(default)]
+    pub here: bool,
+}
 
 #[derive(Debug, Deserialize)]
 pub struct CreateMessageRequest {
@@ -11,6 +22,7 @@ pub struct CreateMessageRequest {
     pub thread_id: Option<String>,
     pub referenced_message_id: Option<String>,
     pub nonce: Option<String>,
+    pub mentions: Option<MentionRequest>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -100,18 +112,39 @@ pub async fn create(
         .transpose()
         .map_err(|_| ApiError::BadRequest("Invalid referenced_message_id".to_string()))?;
 
+    // Parse mentions from request
+    let mentions = if let Some(ref mention_req) = body.mentions {
+        let user_ids: Vec<ObjectId> = mention_req
+            .users
+            .iter()
+            .filter_map(|s| ObjectId::parse_str(s).ok())
+            .collect();
+        Some(Mentions {
+            users: user_ids,
+            roles: Vec::new(),
+            rooms: Vec::new(),
+            everyone: mention_req.everyone,
+            here: mention_req.here,
+        })
+    } else {
+        None
+    };
+
     let message = state
         .messages
         .create(
             tid,
             rid,
             auth.user_id,
-            body.content,
+            body.content.clone(),
             thread_id,
             ref_msg_id,
             body.nonce,
+            mentions,
         )
         .await?;
+
+    let message_id = message.id.unwrap();
 
     // Broadcast via WebSocket to room members (exclude sender)
     let response = to_response(message);
@@ -127,6 +160,62 @@ pub async fn create(
         "data": &response,
     });
     crate::ws::dispatcher::broadcast(&state.ws_storage, &member_ids, &event).await;
+
+    // Create notifications for mentioned users
+    if let Some(ref mention_req) = body.mentions {
+        let mentioned_user_ids: Vec<ObjectId> = if mention_req.everyone {
+            // @everyone: notify all room members except sender
+            member_ids.clone()
+        } else {
+            mention_req
+                .users
+                .iter()
+                .filter_map(|s| ObjectId::parse_str(s).ok())
+                .filter(|id| *id != auth.user_id)
+                .collect()
+        };
+
+        let room_name = state.rooms.base.find_by_id(rid).await
+            .map(|r| r.name)
+            .unwrap_or_default();
+
+        let source = NotificationSource {
+            entity_type: "message".to_string(),
+            entity_id: message_id,
+            actor_id: Some(auth.user_id),
+        };
+
+        let link = format!(
+            "/tenant/{}/room/{}",
+            tenant_id, room_id
+        );
+
+        for user_id in &mentioned_user_ids {
+            if let Ok(notification) = state.notifications.create(
+                tid,
+                *user_id,
+                NotificationType::Mention,
+                format!("Mentioned in #{}", room_name),
+                body.content.chars().take(200).collect(),
+                Some(link.clone()),
+                source.clone(),
+            ).await {
+                // Send notification via WebSocket
+                let notif_event = serde_json::json!({
+                    "type": "notification:new",
+                    "data": {
+                        "id": notification.id.unwrap().to_hex(),
+                        "title": notification.title,
+                        "body": notification.body,
+                        "link": notification.link,
+                        "notification_type": "mention",
+                        "created_at": notification.created_at.try_to_rfc3339_string().unwrap_or_default(),
+                    }
+                });
+                crate::ws::dispatcher::send_to_user(&state.ws_storage, user_id, &notif_event).await;
+            }
+        }
+    }
 
     Ok(Json(response))
 }

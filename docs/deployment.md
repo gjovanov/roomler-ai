@@ -143,7 +143,16 @@ curl http://localhost:3000/health
 # {"status":"ok","version":"0.1.0"}
 ```
 
+## Kubernetes Deployment
+
+Roomler2 is deployed to Kubernetes at https://roomler.ai using the `roomler-deploy` Ansible project. The K8s cluster consists of:
+
+- 1 master node + 2 worker nodes
+- TURN server (coturn) for WebRTC NAT traversal
+- MongoDB, Redis, MinIO running as K8s services
+
+See the `roomler-deploy` repository for Ansible playbooks and Helm charts.
+
 ## Future Infrastructure
 
 - **Horizontal scaling** -- Redis pub/sub for cross-instance WebSocket broadcasting
-- **Kubernetes** -- Container orchestration for production deployments

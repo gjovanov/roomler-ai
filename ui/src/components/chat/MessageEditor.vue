@@ -102,30 +102,44 @@
 </template>
 
 <script setup lang="ts">
-import { onBeforeUnmount, watch } from 'vue'
-import { useEditor, EditorContent } from '@tiptap/vue-3'
+import { onBeforeUnmount, watch, ref as vueRef } from 'vue'
+import { useEditor, EditorContent, VueRenderer } from '@tiptap/vue-3'
 import StarterKit from '@tiptap/starter-kit'
 import Placeholder from '@tiptap/extension-placeholder'
 import Link from '@tiptap/extension-link'
 import Underline from '@tiptap/extension-underline'
+import Mention from '@tiptap/extension-mention'
 import { Markdown } from 'tiptap-markdown'
+import tippy, { type Instance as TippyInstance } from 'tippy.js'
+import MentionList from './MentionList.vue'
+import type { MentionItem } from './MentionList.vue'
 
 const props = withDefaults(
   defineProps<{
     placeholder?: string
     initialContent?: string
+    members?: MentionItem[]
   }>(),
   {
     placeholder: 'Write a message...',
     initialContent: '',
+    members: () => [],
   },
 )
 
+export interface MentionData {
+  users: string[]
+  everyone: boolean
+  here: boolean
+}
+
 const emit = defineEmits<{
-  send: [content: string]
+  send: [content: string, mentions: MentionData]
   'open-emoji-picker': []
   'open-giphy-picker': []
 }>()
+
+const mentionItems = vueRef<MentionItem[]>([])
 
 const editor = useEditor({
   content: props.initialContent,
@@ -135,6 +149,72 @@ const editor = useEditor({
     Link.configure({ openOnClick: false, autolink: true }),
     Underline,
     Markdown.configure({ html: false, transformPastedText: true }),
+    Mention.configure({
+      HTMLAttributes: {
+        class: 'mention',
+      },
+      suggestion: {
+        items: ({ query }: { query: string }) => {
+          const q = query.toLowerCase()
+          const specialItems: MentionItem[] = [
+            { id: '__everyone__', display_name: 'everyone' },
+            { id: '__here__', display_name: 'here' },
+          ]
+          const all = [...specialItems, ...props.members]
+          if (!q) return all.slice(0, 10)
+          return all
+            .filter((item) =>
+              (item.display_name || '').toLowerCase().includes(q) ||
+              (item.username || '').toLowerCase().includes(q),
+            )
+            .slice(0, 10)
+        },
+        render: () => {
+          let component: VueRenderer
+          let popup: TippyInstance[]
+
+          return {
+            onStart: (renderProps: Record<string, unknown>) => {
+              component = new VueRenderer(MentionList, {
+                props: renderProps,
+                editor: renderProps.editor as never,
+              })
+
+              if (!renderProps.clientRect) return
+
+              popup = tippy('body', {
+                getReferenceClientRect: renderProps.clientRect as () => DOMRect,
+                appendTo: () => document.body,
+                content: component.element,
+                showOnCreate: true,
+                interactive: true,
+                trigger: 'manual',
+                placement: 'bottom-start',
+              })
+            },
+            onUpdate(renderProps: Record<string, unknown>) {
+              component?.updateProps(renderProps)
+              if (renderProps.clientRect) {
+                popup?.[0]?.setProps({
+                  getReferenceClientRect: renderProps.clientRect as () => DOMRect,
+                })
+              }
+            },
+            onKeyDown(renderProps: { event: KeyboardEvent }) {
+              if (renderProps.event.key === 'Escape') {
+                popup?.[0]?.hide()
+                return true
+              }
+              return (component?.ref as unknown as { onKeyDown: (props: { event: KeyboardEvent }) => boolean })?.onKeyDown(renderProps)
+            },
+            onExit() {
+              popup?.[0]?.destroy()
+              component?.destroy()
+            },
+          }
+        },
+      },
+    }),
   ],
   editorProps: {
     handleKeyDown(_view, event) {
@@ -157,15 +237,48 @@ watch(
   },
 )
 
+watch(
+  () => props.members,
+  (val) => { mentionItems.value = val },
+  { immediate: true },
+)
+
 function getMarkdown(): string {
   if (!editor.value) return ''
   return editor.value.storage.markdown.getMarkdown()
 }
 
+function extractMentions(): MentionData {
+  const result: MentionData = { users: [], everyone: false, here: false }
+  if (!editor.value) return result
+
+  const json = editor.value.getJSON()
+  function walk(node: Record<string, unknown>) {
+    if (node.type === 'mention' && node.attrs) {
+      const attrs = node.attrs as { id?: string }
+      if (attrs.id === '__everyone__') {
+        result.everyone = true
+      } else if (attrs.id === '__here__') {
+        result.here = true
+      } else if (attrs.id && !result.users.includes(attrs.id)) {
+        result.users.push(attrs.id)
+      }
+    }
+    if (Array.isArray(node.content)) {
+      for (const child of node.content) {
+        walk(child as Record<string, unknown>)
+      }
+    }
+  }
+  walk(json as Record<string, unknown>)
+  return result
+}
+
 function handleSend() {
   const content = getMarkdown().trim()
   if (!content) return
-  emit('send', content)
+  const mentions = extractMentions()
+  emit('send', content, mentions)
   editor.value?.commands.clearContent(true)
 }
 
@@ -246,5 +359,12 @@ onBeforeUnmount(() => {
   border-left: 3px solid rgba(var(--v-theme-primary), 0.5);
   padding-left: 12px;
   margin: 4px 0;
+}
+.editor-content :deep(.mention) {
+  color: rgb(var(--v-theme-primary));
+  background: rgba(var(--v-theme-primary), 0.1);
+  border-radius: 4px;
+  padding: 1px 4px;
+  font-weight: 500;
 }
 </style>

@@ -61,6 +61,7 @@
           <message-editor
             ref="messageEditorRef"
             :placeholder="$t('message.placeholder')"
+            :members="roomMembers"
             @send="sendMessage"
             @open-emoji-picker="showEmojiPicker = true; emojiTarget = 'editor'"
             @open-giphy-picker="showGiphyPicker = true"
@@ -92,6 +93,7 @@
           <message-editor
             ref="threadEditorRef"
             placeholder="Reply in thread..."
+            :members="roomMembers"
             @send="sendThreadReply"
             @open-emoji-picker="showEmojiPicker = true; emojiTarget = 'thread'"
             @open-giphy-picker="showGiphyPicker = true"
@@ -136,6 +138,8 @@ import { useMessageStore } from '@/stores/messages'
 import { useWsStore } from '@/stores/ws'
 import MessageBubble from '@/components/chat/MessageBubble.vue'
 import MessageEditor from '@/components/chat/MessageEditor.vue'
+import type { MentionData } from '@/components/chat/MessageEditor.vue'
+import type { MentionItem } from '@/components/chat/MentionList.vue'
 import EmojiPicker from '@/components/chat/EmojiPicker.vue'
 import GiphyPicker from '@/components/chat/GiphyPicker.vue'
 
@@ -166,17 +170,32 @@ const emojiTarget = ref<'editor' | 'thread'>('editor')
 const messageListRef = ref<HTMLElement | null>(null)
 const messageEditorRef = ref<InstanceType<typeof MessageEditor> | null>(null)
 const threadEditorRef = ref<InstanceType<typeof MessageEditor> | null>(null)
+const roomMembers = ref<MentionItem[]>([])
 
-async function sendMessage(content: string) {
+async function fetchRoomMembers() {
+  if (!tenantId.value || !roomId.value) return
+  try {
+    const members = await roomStore.fetchMembers(tenantId.value, roomId.value)
+    roomMembers.value = members.map((m) => ({
+      id: m.id,
+      user_id: m.user_id,
+      display_name: m.display_name,
+    }))
+  } catch {
+    // members list not critical
+  }
+}
+
+async function sendMessage(content: string, mentions?: MentionData) {
   if (!content) return
-  await messageStore.sendMessage(tenantId.value, roomId.value, content)
+  await messageStore.sendMessage(tenantId.value, roomId.value, content, undefined, mentions)
   await nextTick()
   scrollToBottom()
 }
 
-async function sendThreadReply(content: string) {
+async function sendThreadReply(content: string, mentions?: MentionData) {
   if (!content || !activeThread.value) return
-  await messageStore.sendMessage(tenantId.value, roomId.value, content, activeThread.value.id)
+  await messageStore.sendMessage(tenantId.value, roomId.value, content, activeThread.value.id, mentions)
 }
 
 function openThread(msg: { id: string }) {
@@ -216,6 +235,7 @@ function scrollToBottom() {
 
 watch(roomId, async (id) => {
   if (id) {
+    fetchRoomMembers()
     await messageStore.fetchMessages(tenantId.value, id)
     await nextTick()
     scrollToBottom()
@@ -225,6 +245,7 @@ watch(roomId, async (id) => {
 onMounted(async () => {
   if (roomId.value) {
     roomStore.fetchRoom(tenantId.value, roomId.value)
+    fetchRoomMembers()
     await messageStore.fetchMessages(tenantId.value, roomId.value)
     await nextTick()
     scrollToBottom()

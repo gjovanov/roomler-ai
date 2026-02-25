@@ -7,16 +7,22 @@ Real-time communication and collaboration platform with multi-tenancy, hierarchi
 | Category | Feature | Status |
 |----------|---------|--------|
 | **Multi-Tenancy** | Organizations with plans (Free/Pro/Business/Enterprise) | :white_check_mark: |
-| | Roles & permissions (Owner, Admin, Moderator, Member) | :white_check_mark: |
-| | Invite system (shareable links, email invites) | :white_check_mark: |
+| | Roles & permissions (Owner, Admin, Moderator, Member) with 24-bit bitfield | :white_check_mark: |
+| | Role CRUD, assignment, default role seeding | :white_check_mark: |
+| | Invite system (shareable links, email invites, batch invites) | :white_check_mark: |
+| | User profiles (bio, avatar, presence, timezone, locale) | :white_check_mark: |
 | | OAuth login (Google, Facebook, GitHub, LinkedIn, Microsoft) | :white_check_mark: |
 | **Rooms** | Unified rooms with hierarchy (text + voice/video) | :white_check_mark: |
 | | Parent/child room tree, explore & member management | :white_check_mark: |
 | | In-room call start/join with real-time notifications | :white_check_mark: |
 | **Real-Time Chat** | Threaded messages with replies | :white_check_mark: |
 | | Reactions (unicode + custom emoji) | :white_check_mark: |
-| | Mentions, embeds, attachments, pinning | :white_check_mark: |
+| | @mentions with autocomplete (TipTap) | :white_check_mark: |
+| | Embeds, attachments, pinning | :white_check_mark: |
 | | Typing indicators & presence | :white_check_mark: |
+| **Notifications** | @mention notifications (real-time via WebSocket) | :white_check_mark: |
+| | Notification bell with unread count badge | :white_check_mark: |
+| | Mark read / mark all read | :white_check_mark: |
 | **Video Conferencing** | mediasoup WebRTC SFU (per-room calls) | :white_check_mark: |
 | | Start/join calls from room chat or dashboard | :white_check_mark: |
 | | Multiple producers/consumers per participant | :white_check_mark: |
@@ -31,9 +37,10 @@ Real-time communication and collaboration platform with multi-tenancy, hierarchi
 | | Real-time message delivery | :white_check_mark: |
 | | Media signaling (join/produce/consume) | :white_check_mark: |
 | **Frontend** | Vue 3 + Vuetify 3 SPA | :white_check_mark: |
-| | 8 Pinia stores, 15 views | :white_check_mark: |
-| | Dark/Light theme, i18n | :white_check_mark: |
+| | 12 Pinia stores, 19 views | :white_check_mark: |
+| | Light/Dark theme toggle with localStorage persistence | :white_check_mark: |
 | | mediasoup-client composable + VideoTile | :white_check_mark: |
+| | Vitest unit tests + Playwright E2E | :white_check_mark: |
 
 ## Tech Stack
 
@@ -46,7 +53,7 @@ Real-time communication and collaboration platform with multi-tenancy, hierarchi
 | **Auth** | JWT (argon2 hashing), httpOnly cookies, OAuth 2.0 |
 | **AI** | Claude API (document recognition) |
 | **Cloud** | Google Drive, OneDrive, Dropbox (OAuth2 + async_trait) |
-| **Testing** | 114 Rust integration tests, 15 Playwright E2E specs |
+| **Testing** | 114 Rust integration tests, 15 Playwright E2E specs, Vitest unit tests |
 | **Infrastructure** | Docker Compose (MongoDB, Redis, MinIO, Coturn) |
 
 ## Architecture
@@ -54,7 +61,7 @@ Real-time communication and collaboration platform with multi-tenancy, hierarchi
 ```mermaid
 graph TB
     subgraph Client["Browser"]
-        UI["Vue 3 + Vuetify 3 SPA<br/>Pinia (8 stores) · mediasoup-client 3.7<br/>:5000"]
+        UI["Vue 3 + Vuetify 3 SPA<br/>Pinia (12 stores) · mediasoup-client 3.7<br/>:5000"]
     end
 
     subgraph Server["Rust / Axum 0.8"]
@@ -121,9 +128,10 @@ cd ui && bun install && bun run dev   # UI at http://localhost:5173
 | [Architecture](docs/architecture.md) | System design, crate graph, request flow |
 | [Data Model](docs/data-model.md) | All 18 entities, ER diagram, indexes |
 | [API Reference](docs/api.md) | REST endpoints, request/response schemas |
+| [Features](docs/FEATURES.md) | Detailed feature descriptions (theming, mentions, roles, profiles, etc.) |
 | [Frontend](docs/ui.md) | Routes, components, Pinia stores |
 | [Real-Time](docs/real-time.md) | WebSocket protocol, presence, media signaling |
-| [Testing](docs/testing.md) | 114 integration tests, 15 E2E specs |
+| [Testing](docs/testing.md) | Integration tests, Vitest unit tests, Playwright E2E specs |
 | [Deployment](docs/deployment.md) | Docker Compose, environment variables |
 
 ## License

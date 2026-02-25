@@ -124,6 +124,90 @@ Sets httpOnly cookie: `access_token=<JWT>; HttpOnly; Path=/; SameSite=Lax`
 | POST | `/api/tenant/{tenant_id}/room/{room_id}/message/{message_id}/reaction` | Yes | Add a reaction |
 | DELETE | `/api/tenant/{tenant_id}/room/{room_id}/message/{message_id}/reaction/{emoji}` | Yes | Remove a reaction |
 
+## Invite Routes
+
+### Public
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| GET | `/api/invite/{code}` | Optional | Get invite info (tenant name, inviter, validity) |
+| POST | `/api/invite/{code}/accept` | Yes | Accept an invite and join the tenant |
+
+### Tenant-Scoped (require INVITE_MEMBERS permission)
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| GET | `/api/tenant/{tenant_id}/invite` | Yes | List tenant invites (paginated) |
+| POST | `/api/tenant/{tenant_id}/invite` | Yes | Create a single invite |
+| POST | `/api/tenant/{tenant_id}/invite/batch` | Yes | Create multiple invites at once (max 50) |
+| DELETE | `/api/tenant/{tenant_id}/invite/{invite_id}` | Yes | Revoke an invite |
+| POST | `/api/tenant/{tenant_id}/member` | Yes | Directly add a user as member |
+
+### POST `/api/tenant/{tenant_id}/invite/batch`
+
+```json
+// Request
+{
+  "invites": [
+    {
+      "target_email": "alice@example.com",
+      "expires_in_hours": 168,
+      "assign_role_ids": ["role_id_1"]
+    },
+    {
+      "target_email": "bob@example.com",
+      "assign_role_ids": ["role_id_2"]
+    }
+  ]
+}
+
+// Response (201 Created)
+{
+  "results": [
+    { "invite": { "id": "...", "code": "...", ... }, "target_email": "alice@example.com" },
+    { "invite": { "id": "...", "code": "...", ... }, "target_email": "bob@example.com" }
+  ],
+  "created": 2,
+  "failed": 0
+}
+```
+
+## Role Routes
+
+Tenant-scoped, require MANAGE_ROLES permission for write operations.
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| GET | `/api/tenant/{tenant_id}/role` | Yes | List all roles for a tenant |
+| POST | `/api/tenant/{tenant_id}/role` | Yes | Create a custom role |
+| PUT | `/api/tenant/{tenant_id}/role/{role_id}` | Yes | Update a role |
+| DELETE | `/api/tenant/{tenant_id}/role/{role_id}` | Yes | Delete a role (not default/managed) |
+| POST | `/api/tenant/{tenant_id}/role/{role_id}/assign/{user_id}` | Yes | Assign role to user |
+| DELETE | `/api/tenant/{tenant_id}/role/{role_id}/assign/{user_id}` | Yes | Remove role from user |
+
+Default roles seeded on tenant creation: Owner, Admin, Moderator, Member. Permissions use a 24-bit bitfield.
+
+## User Profile Routes
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| GET | `/api/user/{user_id}` | Yes | Get user's public profile |
+| PUT | `/api/user/me` | Yes | Update own profile (display_name, bio, avatar, locale, timezone) |
+
+## Notification Routes
+
+User-scoped, no tenant prefix.
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| GET | `/api/notification` | Yes | List notifications (paginated) |
+| GET | `/api/notification/unread` | Yes | List unread notifications |
+| GET | `/api/notification/unread-count` | Yes | Get unread notification count |
+| PUT | `/api/notification/{notification_id}/read` | Yes | Mark a notification as read |
+| POST | `/api/notification/read-all` | Yes | Mark all notifications as read |
+
+Notifications are created automatically when users are @mentioned in messages. They are also delivered in real-time via WebSocket (`notification:new` and `notification:unread_count` message types).
+
 ## Recording Routes
 
 | Method | Path | Auth | Description |

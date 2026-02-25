@@ -47,6 +47,18 @@ interface CreateInviteParams {
   assign_role_ids?: string[]
 }
 
+interface BatchInviteResult {
+  invite?: Invite
+  error?: string
+  target_email?: string
+}
+
+interface BatchCreateResponse {
+  results: BatchInviteResult[]
+  created: number
+  failed: number
+}
+
 export const useInviteStore = defineStore('invite', () => {
   const inviteInfo = ref<InviteInfo | null>(null)
   const invites = ref<Invite[]>([])
@@ -112,6 +124,32 @@ export const useInviteStore = defineStore('invite', () => {
     }
   }
 
+  async function batchCreateInvites(
+    tenantId: string,
+    params: CreateInviteParams[],
+  ): Promise<BatchCreateResponse> {
+    loading.value = true
+    error.value = null
+    try {
+      const result = await api.post<BatchCreateResponse>(
+        `/tenant/${tenantId}/invite/batch`,
+        { invites: params },
+      )
+      // Add successfully created invites to the list
+      for (const r of result.results) {
+        if (r.invite) {
+          invites.value.unshift(r.invite)
+        }
+      }
+      return result
+    } catch (e) {
+      error.value = (e as Error).message
+      throw e
+    } finally {
+      loading.value = false
+    }
+  }
+
   async function revokeInvite(tenantId: string, inviteId: string) {
     loading.value = true
     error.value = null
@@ -137,6 +175,7 @@ export const useInviteStore = defineStore('invite', () => {
     acceptInvite,
     listInvites,
     createInvite,
+    batchCreateInvites,
     revokeInvite,
   }
 })
