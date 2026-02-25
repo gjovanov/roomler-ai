@@ -1,21 +1,26 @@
-FROM rust:1.84-bookworm AS chef
-RUN cargo install cargo-chef
+# --- Stage 1: Rust build ---
+FROM rust:1.88-bookworm AS builder
+RUN apt-get update && apt-get install -y libclang-dev cmake python3-pip && rm -rf /var/lib/apt/lists/*
+RUN rustup component add rustfmt
 WORKDIR /app
-
-FROM chef AS planner
-COPY . .
-RUN cargo chef prepare --recipe-path recipe.json
-
-FROM chef AS builder
-COPY --from=planner /app/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json
 COPY . .
 RUN cargo build --release --bin roomler2-api
 
-FROM debian:bookworm-slim AS runtime
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
-RUN useradd -m -U app
-USER app
+# --- Stage 2: Vue SPA build ---
+FROM oven/bun:1 AS ui-builder
+WORKDIR /app/ui
+COPY ui/package.json ui/bun.lock ./
+RUN bun install --frozen-lockfile
+COPY ui/ .
+RUN bun run build
+
+# --- Stage 3: Runtime (nginx + Rust binary) ---
+FROM debian:trixie-slim AS runtime
+RUN apt-get update && apt-get install -y ca-certificates nginx && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/target/release/roomler2-api /usr/local/bin/
-EXPOSE 3000
-CMD ["roomler2-api"]
+COPY --from=ui-builder /app/ui/dist /var/www/roomler2
+COPY files/nginx-pod.conf /etc/nginx/conf.d/default.conf
+RUN rm -f /etc/nginx/sites-enabled/default
+RUN printf '#!/bin/sh\nnginx\nexec roomler2-api\n' > /entrypoint.sh && chmod +x /entrypoint.sh
+EXPOSE 80
+CMD ["/entrypoint.sh"]
