@@ -1,0 +1,16 @@
+[
+  { "scene": 1,  "text": "Welcome to Roomler — where teams actually talk. Novel concept.",                    "duration": 4000 },
+  { "scene": 2,  "text": "Creating an account. No carrier pigeon required.",                                   "duration": 5000 },
+  { "scene": 3,  "text": "Every empire starts with a workspace. Yours starts here.",                           "duration": 4000 },
+  { "scene": 4,  "text": "Rooms for everything. Except laundry. We're working on that.",                       "duration": 5000 },
+  { "scene": 5,  "text": "Chat like nobody's reading. They are, but still.",                                   "duration": 5000 },
+  { "scene": 6,  "text": "Video calls with no 'you're on mute' moment. Okay, maybe one.",                     "duration": 4000 },
+  { "scene": 7,  "text": "Explore rooms. It's like channel surfing, but productive.",                          "duration": 4000 },
+  { "scene": 8,  "text": "Files. Uploaded, organized, never lost in email again.",                             "duration": 3000 },
+  { "scene": 9,  "text": "Invite your team. Misery loves company. So does collaboration.",                     "duration": 4000 },
+  { "scene": 10, "text": "Admin panel. Because someone has to be the grown-up.",                               "duration": 4000 },
+  { "scene": 11, "text": "Edit your profile. Make yourself look professional. Or don't.",                      "duration": 4000 },
+  { "scene": 12, "text": "Free to start, Pro when you're hooked. We believe in you.",                          "duration": 4000 },
+  { "scene": 13, "text": "Dark mode. Because staring at the sun is overrated.",                                "duration": 4000 },
+  { "scene": 14, "text": "Roomler. Chat. Call. Collaborate. Ship.",                                            "duration": 5000 }
+]

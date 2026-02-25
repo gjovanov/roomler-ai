@@ -2,6 +2,12 @@
 
 Real-time communication and collaboration platform with multi-tenancy, hierarchical rooms (text + voice/video), chat, video conferencing (mediasoup WebRTC SFU), file sharing, cloud storage integrations, and AI-powered document recognition.
 
+<a href="https://www.youtube.com/watch?v=VIDEO_ID">
+  <img src="https://img.shields.io/badge/%E2%96%B6%20Watch-Intro%20Video%20(~3%3A00)-009688?style=for-the-badge" alt="Watch Intro Video" />
+</a>
+
+> **Intro Video**: See the full product walkthrough — registration, workspace creation, chat, video calls, and more in under 3 minutes.
+
 ## Features
 
 | Category | Feature | Status |
