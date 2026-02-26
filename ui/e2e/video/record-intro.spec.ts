@@ -13,7 +13,7 @@
  *   Convert to MP4: ffmpeg -i video.webm -c:v libx264 -crf 18 roomler-intro.mp4
  */
 import { test, type Page } from '@playwright/test'
-import transcriptions from './transcriptions.json'
+import transcriptions from './transcriptions.json' with { type: 'json' }
 
 const API_URL = process.env.E2E_API_URL || 'http://localhost:5001'
 
@@ -217,27 +217,24 @@ test.describe('Roomler Intro Video', () => {
     }
 
     await page.getByRole('button', { name: /save/i }).click()
-    await delay(page, 1000)
+    await delay(page, 1500)
 
-    // Wait for room to appear
-    await page.getByText('general').first().waitFor({ state: 'visible', timeout: 5_000 })
+    // Wait for dialog to close and room to appear
+    await page.locator('.v-dialog').waitFor({ state: 'hidden', timeout: 10_000 }).catch(() => {})
+    await page.getByText('general').first().waitFor({ state: 'visible', timeout: 10_000 })
+    await delay(page, 800)
 
-    // Create "random" room (no media)
-    await page.getByRole('button', { name: /create room/i }).click()
-    await delay(page, 500)
-
-    const roomNameInput2 = page.locator('.v-dialog input').first()
-    await roomNameInput2.waitFor({ state: 'visible', timeout: 5_000 })
-    await roomNameInput2.click()
-    await roomNameInput2.pressSequentially('random', { delay: 60 })
-    await delay(page, 300)
-
-    await page.getByRole('button', { name: /save/i }).click()
-    await delay(page, 1000)
-
-    // Wait for room to appear
-    await page.getByText('random').first().waitFor({ state: 'visible', timeout: 5_000 })
-    await delay(page, 500)
+    // Get API token for later scenes (call start, etc.)
+    const loginResp0 = await fetch(`${API_URL}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        username: `demo${suffix}`,
+        password: 'SecureP@ss123',
+      }),
+    })
+    const loginData0 = (await loginResp0.json()) as { access_token: string }
+    const apiToken = loginData0.access_token
 
     // -----------------------------------------------------------------------
     // Scene 5: Chat — send messages
@@ -276,21 +273,9 @@ test.describe('Roomler Intro Video', () => {
     // -----------------------------------------------------------------------
     // Start call via API to ensure conference is available
     if (roomId) {
-      // Get a fresh token via API login
-      const loginResp = await fetch(`${API_URL}/api/auth/login`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          username: `demo${suffix}`,
-          password: 'SecureP@ss123',
-        }),
-      })
-      const loginData = (await loginResp.json()) as { access_token: string }
-      const token = loginData.access_token
-
       await fetch(`${API_URL}/api/tenant/${tenantId}/room/${roomId}/call/start`, {
         method: 'POST',
-        headers: { Authorization: `Bearer ${token}` },
+        headers: { Authorization: `Bearer ${apiToken}` },
       })
     }
 
