@@ -9,3 +9,7 @@ ui/node_modules
 ui/dist
 models/
 media/
+ui/test-results/
+ui/playwright-report/
+ui/e2e/video/output/*.mp4
+ui/e2e/video/output/*.webm
