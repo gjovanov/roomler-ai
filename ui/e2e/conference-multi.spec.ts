@@ -248,13 +248,13 @@ test.describe('Multi-Participant Room Call', () => {
       await page2.goto(`/tenant/${tenantId}/room/${roomId}/call`)
 
       // Tab 1 joins
-      await expect(page1.getByRole('button', { name: /join/i })).toBeVisible({ timeout: 10000 })
-      await page1.getByRole('button', { name: /join/i }).click()
+      await expect(page1.getByRole('button', { name: 'Join Meeting' })).toBeVisible({ timeout: 10000 })
+      await page1.getByRole('button', { name: 'Join Meeting' }).click()
       await expect(page1.getByText('You')).toBeVisible({ timeout: 15000 })
 
-      // Tab 2 joins
-      await expect(page2.getByRole('button', { name: /join/i })).toBeVisible({ timeout: 10000 })
-      await page2.getByRole('button', { name: /join/i }).click()
+      // Tab 2 joins (use exact name to avoid matching other "Join" buttons)
+      await expect(page2.getByRole('button', { name: 'Join Meeting' })).toBeVisible({ timeout: 10000 })
+      await page2.getByRole('button', { name: 'Join Meeting' }).click()
       await expect(page2.getByText('You')).toBeVisible({ timeout: 15000 })
 
       // Wait for remote streams to propagate
