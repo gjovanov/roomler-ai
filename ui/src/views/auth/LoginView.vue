@@ -8,12 +8,12 @@
             {{ $t('auth.login') }}
           </v-card-title>
 
-          <v-form @submit.prevent="handleLogin">
+          <v-form ref="formRef" @submit.prevent="handleLogin">
             <v-text-field
               v-model="username"
               :label="$t('auth.username')"
               prepend-inner-icon="mdi-account"
-              required
+              :rules="[rules.required]"
               autofocus
             />
             <v-text-field
@@ -21,7 +21,7 @@
               :label="$t('auth.password')"
               prepend-inner-icon="mdi-lock"
               type="password"
-              required
+              :rules="[rules.required]"
             />
 
             <v-alert v-if="auth.error" type="error" density="compact" class="mb-4">
@@ -72,12 +72,15 @@ import { ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { useWsStore } from '@/stores/ws'
+import { useValidation } from '@/composables/useValidation'
 
 const auth = useAuthStore()
 const ws = useWsStore()
 const router = useRouter()
 const route = useRoute()
+const { rules } = useValidation()
 
+const formRef = ref()
 const username = ref('')
 const password = ref('')
 
@@ -94,6 +97,8 @@ function oauthLogin(provider: string) {
 }
 
 async function handleLogin() {
+  const { valid } = await formRef.value.validate()
+  if (!valid) return
   try {
     await auth.login(username.value, password.value)
     ws.connect(auth.token!)

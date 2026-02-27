@@ -11,9 +11,9 @@
         <v-card>
           <v-card-title>Create Your First Workspace</v-card-title>
           <v-card-text>
-            <v-form @submit.prevent="handleCreate">
-              <v-text-field v-model="name" label="Workspace Name" required />
-              <v-text-field v-model="slug" label="Slug" hint="URL-friendly identifier" required />
+            <v-form ref="formRef" @submit.prevent="handleCreate">
+              <v-text-field v-model="name" label="Workspace Name" :rules="[rules.required]" />
+              <v-text-field v-model="slug" label="Slug" hint="URL-friendly identifier" :rules="[rules.required, rules.slug]" />
               <v-btn type="submit" color="primary" class="mt-2">Create</v-btn>
             </v-form>
           </v-card-text>
@@ -40,16 +40,28 @@
 import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { useTenantStore } from '@/stores/tenant'
+import { useSnackbar } from '@/composables/useSnackbar'
+import { useValidation } from '@/composables/useValidation'
 
 const tenantStore = useTenantStore()
 const router = useRouter()
+const { showSuccess, showError } = useSnackbar()
+const { rules } = useValidation()
 
+const formRef = ref()
 const name = ref('')
 const slug = ref('')
 
 async function handleCreate() {
-  const tenant = await tenantStore.createTenant(name.value, slug.value)
-  router.push(`/tenant/${tenant.id}`)
+  const { valid } = await formRef.value.validate()
+  if (!valid) return
+  try {
+    const tenant = await tenantStore.createTenant(name.value, slug.value)
+    showSuccess('Workspace created')
+    router.push(`/tenant/${tenant.id}`)
+  } catch (e) {
+    showError(e instanceof Error ? e.message : 'Failed to create workspace')
+  }
 }
 
 onMounted(() => {

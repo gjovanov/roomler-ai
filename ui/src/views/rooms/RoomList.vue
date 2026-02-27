@@ -31,20 +31,19 @@
       <v-card>
         <v-card-title>{{ $t('room.create') }}</v-card-title>
         <v-card-text>
-          <v-alert v-if="createError" type="error" closable class="mb-4" @click:close="createError = null">
-            {{ createError }}
-          </v-alert>
-          <v-text-field v-model="newRoom.name" :label="$t('room.name')" required />
-          <v-select
-            v-model="newRoom.parent_id"
-            :items="parentOptions"
-            item-title="title"
-            item-value="value"
-            :label="$t('room.parent')"
-            clearable
-          />
-          <v-checkbox v-model="newRoom.is_open" :label="$t('room.open')" />
-          <v-checkbox v-model="newRoom.has_media" :label="$t('room.hasMedia')" />
+          <v-form ref="formRef">
+            <v-text-field v-model="newRoom.name" :label="$t('room.name')" :rules="[rules.required]" />
+            <v-select
+              v-model="newRoom.parent_id"
+              :items="parentOptions"
+              item-title="title"
+              item-value="value"
+              :label="$t('room.parent')"
+              clearable
+            />
+            <v-checkbox v-model="newRoom.is_open" :label="$t('room.open')" />
+            <v-checkbox v-model="newRoom.has_media" :label="$t('room.hasMedia')" />
+          </v-form>
         </v-card-text>
         <v-card-actions>
           <v-spacer />
@@ -61,10 +60,14 @@ import { ref, computed, onMounted, reactive, provide } from 'vue'
 import { useRoute } from 'vue-router'
 import { useRoomStore } from '@/stores/rooms'
 import { ApiError } from '@/api/client'
+import { useSnackbar } from '@/composables/useSnackbar'
+import { useValidation } from '@/composables/useValidation'
 import RoomTreeItem from '@/components/rooms/RoomTreeItem.vue'
 
 const route = useRoute()
 const roomStore = useRoomStore()
+const { showSuccess, showError } = useSnackbar()
+const { rules } = useValidation()
 
 const tenantId = computed(() => route.params.tenantId as string)
 const showCreate = ref(false)
@@ -75,6 +78,7 @@ const newRoom = reactive({
   has_media: false,
   parent_id: null as string | null,
 })
+const formRef = ref()
 const createError = ref<string | null>(null)
 
 const parentOptions = computed(() => [
@@ -90,7 +94,8 @@ function openCreateChild(parentId: string) {
 provide('createChildRoom', openCreateChild)
 
 async function createRoom() {
-  createError.value = null
+  const { valid } = await formRef.value.validate()
+  if (!valid) return
   try {
     await roomStore.createRoom(tenantId.value, {
       name: newRoom.name,
@@ -103,11 +108,12 @@ async function createRoom() {
     newRoom.is_open = true
     newRoom.has_media = false
     newRoom.parent_id = null
+    showSuccess('Room created')
   } catch (e) {
     if (e instanceof ApiError && typeof (e.data as Record<string, unknown>)?.error === 'string') {
-      createError.value = (e.data as Record<string, string>).error
+      showError((e.data as Record<string, string>).error)
     } else {
-      createError.value = (e as Error).message
+      showError((e as Error).message)
     }
   }
 }

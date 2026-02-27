@@ -62,10 +62,12 @@ import { reactive, ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { useUserStore } from '@/stores/user'
+import { useSnackbar } from '@/composables/useSnackbar'
 
 const router = useRouter()
 const authStore = useAuthStore()
 const userStore = useUserStore()
+const { showSuccess, showError } = useSnackbar()
 
 const saving = ref(false)
 const form = reactive({
@@ -93,7 +95,10 @@ async function save() {
       locale: form.locale || undefined,
       timezone: form.timezone || undefined,
     })
+    showSuccess('Profile saved')
     router.back()
+  } catch (e) {
+    showError(e instanceof Error ? e.message : 'Failed to save profile')
   } finally {
     saving.value = false
   }

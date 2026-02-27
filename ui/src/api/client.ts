@@ -1,4 +1,5 @@
 import router from '@/plugins/router'
+import { useSnackbar } from '@/composables/useSnackbar'
 
 const BASE_URL = '/api'
 
@@ -54,6 +55,12 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
     ) {
       localStorage.removeItem('access_token')
       router.push({ name: 'login' })
+    }
+
+    if (resp.status >= 500) {
+      const msg = (data as Record<string, string>)?.error || (data as Record<string, string>)?.message || `Server error (${resp.status})`
+      const { showError } = useSnackbar()
+      showError(msg)
     }
 
     throw new ApiError(resp.status, data)

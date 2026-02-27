@@ -88,6 +88,7 @@
                 v-model="targetEmail"
                 label="Email address"
                 type="email"
+                :rules="[rules.email]"
               />
 
               <v-text-field
@@ -123,10 +124,6 @@
           :roles="roleStore.roles"
         />
 
-        <!-- Copy success snackbar -->
-        <v-snackbar v-model="showCopied" :timeout="2000" color="success">
-          Invite link copied to clipboard
-        </v-snackbar>
       </v-col>
     </v-row>
   </v-container>
@@ -137,16 +134,19 @@ import { ref, onMounted } from 'vue'
 import { useRoute } from 'vue-router'
 import { useInviteStore } from '@/stores/invite'
 import { useRoleStore } from '@/stores/role'
+import { useSnackbar } from '@/composables/useSnackbar'
+import { useValidation } from '@/composables/useValidation'
 import BatchInviteDialog from '@/components/invite/BatchInviteDialog.vue'
 
 const route = useRoute()
 const inviteStore = useInviteStore()
 const roleStore = useRoleStore()
+const { showSuccess, showError } = useSnackbar()
+const { rules } = useValidation()
 
 const tenantId = ref(route.params.tenantId as string)
 const showCreateDialog = ref(false)
 const showBatchDialog = ref(false)
-const showCopied = ref(false)
 const creating = ref(false)
 
 const inviteType = ref<'link' | 'email'>('link')
@@ -181,7 +181,7 @@ function statusColor(status: string) {
 function copyLink(code: string) {
   const url = `${window.location.origin}/invite/${code}`
   navigator.clipboard.writeText(url)
-  showCopied.value = true
+  showSuccess('Invite link copied to clipboard')
 }
 
 async function handleCreate() {
@@ -196,13 +196,21 @@ async function handleCreate() {
     targetEmail.value = ''
     maxUses.value = undefined
     expiresInHours.value = undefined
+    showSuccess('Invite created')
+  } catch (e) {
+    showError(e instanceof Error ? e.message : 'Failed to create invite')
   } finally {
     creating.value = false
   }
 }
 
 async function handleRevoke(inviteId: string) {
-  await inviteStore.revokeInvite(tenantId.value, inviteId)
+  try {
+    await inviteStore.revokeInvite(tenantId.value, inviteId)
+    showSuccess('Invite revoked')
+  } catch (e) {
+    showError(e instanceof Error ? e.message : 'Failed to revoke invite')
+  }
 }
 
 onMounted(() => {

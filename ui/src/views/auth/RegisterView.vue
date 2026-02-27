@@ -8,33 +8,33 @@
             {{ $t('auth.register') }}
           </v-card-title>
 
-          <v-form @submit.prevent="handleRegister">
+          <v-form ref="formRef" @submit.prevent="handleRegister">
             <v-text-field
               v-model="email"
               :label="$t('auth.email')"
               prepend-inner-icon="mdi-email"
               type="email"
-              required
+              :rules="[rules.required, rules.email]"
               autofocus
             />
             <v-text-field
               v-model="username"
               :label="$t('auth.username')"
               prepend-inner-icon="mdi-account"
-              required
+              :rules="[rules.required, rules.minLength(3)]"
             />
             <v-text-field
               v-model="displayName"
               :label="$t('auth.displayName')"
               prepend-inner-icon="mdi-badge-account"
-              required
+              :rules="[rules.required]"
             />
             <v-text-field
               v-model="password"
               :label="$t('auth.password')"
               prepend-inner-icon="mdi-lock"
               type="password"
-              required
+              :rules="[rules.required, rules.minLength(6)]"
             />
 
             <v-alert v-if="auth.error" type="error" density="compact" class="mb-4">
@@ -83,12 +83,15 @@ import { ref, computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { useWsStore } from '@/stores/ws'
+import { useValidation } from '@/composables/useValidation'
 
 const auth = useAuthStore()
 const ws = useWsStore()
 const router = useRouter()
 const route = useRoute()
+const { rules } = useValidation()
 
+const formRef = ref()
 const email = ref('')
 const username = ref('')
 const displayName = ref('')
@@ -109,6 +112,8 @@ function oauthRegister(provider: string) {
 }
 
 async function handleRegister() {
+  const { valid } = await formRef.value.validate()
+  if (!valid) return
   try {
     const result = await auth.register(email.value, username.value, password.value, displayName.value, inviteCode.value)
     ws.connect(auth.token!)

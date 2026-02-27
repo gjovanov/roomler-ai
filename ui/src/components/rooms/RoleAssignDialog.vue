@@ -49,6 +49,7 @@
 <script setup lang="ts">
 import { ref, computed, watch } from 'vue'
 import { useRoleStore } from '@/stores/role'
+import { useSnackbar } from '@/composables/useSnackbar'
 
 const props = defineProps<{
   modelValue: boolean
@@ -64,6 +65,7 @@ const emit = defineEmits<{
 }>()
 
 const roleStore = useRoleStore()
+const { showSuccess, showError } = useSnackbar()
 const selectedRoleId = ref('')
 const saving = ref(false)
 
@@ -96,6 +98,9 @@ async function assign() {
     await roleStore.assignRole(props.tenantId, selectedRoleId.value, props.userId)
     emit('assigned', selectedRoleId.value)
     show.value = false
+    showSuccess('Role assigned')
+  } catch (e) {
+    showError(e instanceof Error ? e.message : 'Failed to assign role')
   } finally {
     saving.value = false
   }

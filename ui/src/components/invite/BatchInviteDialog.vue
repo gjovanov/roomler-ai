@@ -107,6 +107,7 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue'
 import { useInviteStore } from '@/stores/invite'
+import { useSnackbar } from '@/composables/useSnackbar'
 import type { Role } from '@/stores/role'
 
 interface InviteRow {
@@ -130,6 +131,7 @@ const emit = defineEmits<{
 }>()
 
 const inviteStore = useInviteStore()
+const { showSuccess, showError } = useSnackbar()
 
 const rows = ref<InviteRow[]>([{ email: '', role_id: '' }])
 const expiresInHours = ref<number | undefined>(undefined)
@@ -181,9 +183,11 @@ async function send() {
     if (response.failed === 0) {
       resultType.value = 'success'
       resultMessage.value = `All ${response.created} invites created successfully.`
+      showSuccess(`${response.created} invites sent`)
     } else if (response.created === 0) {
       resultType.value = 'error'
       resultMessage.value = `All ${response.failed} invites failed.`
+      showError('All invites failed')
     } else {
       resultType.value = 'warning'
       resultMessage.value = `${response.created} created, ${response.failed} failed.`
@@ -191,6 +195,7 @@ async function send() {
   } catch {
     resultType.value = 'error'
     resultMessage.value = 'Failed to send batch invites.'
+    showError('Failed to send batch invites')
   } finally {
     sending.value = false
   }
