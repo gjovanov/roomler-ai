@@ -281,8 +281,19 @@ async fn handle_media_join(
                 state.settings.turn.password.as_deref().unwrap_or("").to_string(),
             )
         };
+        // Build TURN URLs with multiple transport variants.
+        // UDP TURN often fails behind NAT/firewalls, so include TCP and TLS fallbacks.
+        let mut urls: Vec<String> = vec![url.clone()];
+        if url.starts_with("turn:") && !url.contains("?transport=") {
+            urls.push(format!("{}?transport=tcp", url));
+            // Derive TURNS (TLS) URL on port 5349
+            let turns_url = url
+                .replacen("turn:", "turns:", 1)
+                .replace(":3478", ":5349");
+            urls.push(format!("{}?transport=tcp", turns_url));
+        }
         vec![serde_json::json!({
-            "urls": [url],
+            "urls": urls,
             "username": turn_username,
             "credential": turn_credential,
         })]
