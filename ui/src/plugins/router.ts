@@ -27,6 +27,18 @@ const routes: RouteRecordRaw[] = [
     meta: { guest: true },
   },
   {
+    path: '/privacy',
+    name: 'privacy',
+    component: () => import('@/views/legal/PrivacyPolicyView.vue'),
+    meta: { guest: false },
+  },
+  {
+    path: '/terms',
+    name: 'terms',
+    component: () => import('@/views/legal/TermsView.vue'),
+    meta: { guest: false },
+  },
+  {
     path: '/oauth/callback',
     name: 'oauth-callback',
     component: () => import('@/views/auth/OAuthCallbackView.vue'),

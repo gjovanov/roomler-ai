@@ -133,8 +133,8 @@
           </v-col>
           <v-col cols="12" sm="4">
             <div class="text-subtitle-2 font-weight-bold mb-2">Legal</div>
-            <div class="text-body-2 landing-muted mb-1">Privacy Policy</div>
-            <div class="text-body-2 landing-muted mb-1">Terms of Service</div>
+            <router-link to="/privacy" class="text-body-2 landing-muted mb-1 d-block text-decoration-none">Privacy Policy</router-link>
+            <router-link to="/terms" class="text-body-2 landing-muted mb-1 d-block text-decoration-none">Terms of Service</router-link>
           </v-col>
         </v-row>
         <v-divider class="my-4" />
