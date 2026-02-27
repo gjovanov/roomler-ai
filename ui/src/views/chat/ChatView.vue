@@ -50,6 +50,7 @@
                 @react="(emoji) => handleReact(msg.id, emoji)"
                 @pin="handlePin(msg.id)"
                 @edit="(content) => handleEdit(msg.id, content)"
+                @delete="handleDelete(msg.id)"
               />
             </div>
           </div>
@@ -62,6 +63,8 @@
             ref="messageEditorRef"
             :placeholder="$t('message.placeholder')"
             :members="roomMembers"
+            :tenant-id="tenantId"
+            :room-id="roomId"
             @send="sendMessage"
             @open-emoji-picker="showEmojiPicker = true; emojiTarget = 'editor'"
             @open-giphy-picker="showGiphyPicker = true"
@@ -85,6 +88,7 @@
               compact
               @react="(emoji) => handleReact(msg.id, emoji)"
               @edit="(content) => handleEdit(msg.id, content)"
+              @delete="handleDelete(msg.id)"
             />
           </div>
         </div>
@@ -94,6 +98,8 @@
             ref="threadEditorRef"
             placeholder="Reply in thread..."
             :members="roomMembers"
+            :tenant-id="tenantId"
+            :room-id="roomId"
             @send="sendThreadReply"
             @open-emoji-picker="showEmojiPicker = true; emojiTarget = 'thread'"
             @open-giphy-picker="showGiphyPicker = true"
@@ -102,16 +108,14 @@
       </v-col>
 
       <!-- Members panel -->
-      <v-col v-if="showMembers" cols="3" class="border-s">
+      <v-col v-if="showMembers" cols="3" class="border-s d-flex flex-column fill-height">
         <v-toolbar density="compact" flat>
           <v-toolbar-title class="text-body-1">Members</v-toolbar-title>
           <v-spacer />
           <v-btn icon="mdi-close" size="small" @click="showMembers = false" />
         </v-toolbar>
         <v-divider />
-        <v-list density="compact">
-          <v-list-item prepend-icon="mdi-account" title="Members list coming soon" />
-        </v-list>
+        <member-panel :tenant-id="tenantId" :room-id="roomId" />
       </v-col>
     </v-row>
 
@@ -140,6 +144,7 @@ import MessageBubble from '@/components/chat/MessageBubble.vue'
 import MessageEditor from '@/components/chat/MessageEditor.vue'
 import type { MentionData } from '@/components/chat/MessageEditor.vue'
 import type { MentionItem } from '@/components/chat/MentionList.vue'
+import MemberPanel from '@/components/chat/MemberPanel.vue'
 import EmojiPicker from '@/components/chat/EmojiPicker.vue'
 import GiphyPicker from '@/components/chat/GiphyPicker.vue'
 
@@ -186,16 +191,16 @@ async function fetchRoomMembers() {
   }
 }
 
-async function sendMessage(content: string, mentions?: MentionData) {
-  if (!content) return
-  await messageStore.sendMessage(tenantId.value, roomId.value, content, undefined, mentions)
+async function sendMessage(content: string, mentions?: MentionData, attachmentIds?: string[]) {
+  if (!content && (!attachmentIds || attachmentIds.length === 0)) return
+  await messageStore.sendMessage(tenantId.value, roomId.value, content, undefined, mentions, attachmentIds)
   await nextTick()
   scrollToBottom()
 }
 
-async function sendThreadReply(content: string, mentions?: MentionData) {
-  if (!content || !activeThread.value) return
-  await messageStore.sendMessage(tenantId.value, roomId.value, content, activeThread.value.id, mentions)
+async function sendThreadReply(content: string, mentions?: MentionData, attachmentIds?: string[]) {
+  if ((!content && (!attachmentIds || attachmentIds.length === 0)) || !activeThread.value) return
+  await messageStore.sendMessage(tenantId.value, roomId.value, content, activeThread.value.id, mentions, attachmentIds)
 }
 
 function openThread(msg: { id: string }) {
@@ -213,6 +218,10 @@ async function handlePin(messageId: string) {
 
 async function handleEdit(messageId: string, content: string) {
   await messageStore.editMessage(tenantId.value, roomId.value, messageId, content)
+}
+
+async function handleDelete(messageId: string) {
+  await messageStore.deleteMessage(tenantId.value, roomId.value, messageId)
 }
 
 function handleEmojiSelect(emoji: string) {

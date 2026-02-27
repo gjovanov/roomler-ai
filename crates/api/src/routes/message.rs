@@ -1,9 +1,10 @@
 use axum::{Json, extract::{Path, Query, State}};
 use bson::oid::ObjectId;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
-use roomler2_db::models::{Mentions, NotificationSource, NotificationType};
+use roomler2_db::models::{Mentions, MessageAttachment, NotificationSource, NotificationType};
 use roomler2_services::dao::base::PaginationParams;
 
 #[derive(Debug, Deserialize)]
@@ -23,6 +24,8 @@ pub struct CreateMessageRequest {
     pub referenced_message_id: Option<String>,
     pub nonce: Option<String>,
     pub mentions: Option<MentionRequest>,
+    #[serde(default)]
+    pub attachment_ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -30,22 +33,37 @@ pub struct UpdateMessageRequest {
     pub content: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
+pub struct AttachmentResponse {
+    pub file_id: String,
+    pub filename: String,
+    pub content_type: String,
+    pub size: u64,
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumbnail_url: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
 pub struct MessageResponse {
     pub id: String,
     pub room_id: String,
     pub author_id: String,
+    pub author_name: String,
     pub content: String,
     pub message_type: String,
     pub is_pinned: bool,
     pub is_edited: bool,
+    pub is_thread_root: bool,
     pub thread_id: Option<String>,
     pub referenced_message_id: Option<String>,
     pub reaction_summary: Vec<ReactionSummaryResponse>,
+    pub attachments: Vec<AttachmentResponse>,
     pub created_at: String,
+    pub updated_at: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct ReactionSummaryResponse {
     pub emoji: String,
     pub count: u32,
@@ -68,10 +86,13 @@ pub async fn list(
 
     let result = state.messages.find_in_room(rid, &params).await?;
 
+    let author_ids = collect_author_ids(&result.items);
+    let names = state.users.find_display_names(&author_ids).await.unwrap_or_default();
+
     let items: Vec<MessageResponse> = result
         .items
         .into_iter()
-        .map(to_response)
+        .map(|m| to_response(m, &names))
         .collect();
 
     Ok(Json(serde_json::json!({
@@ -130,9 +151,32 @@ pub async fn create(
         None
     };
 
+    // Fetch file records for attachments (tenant-scoped to prevent cross-tenant access)
+    let attachments = if !body.attachment_ids.is_empty() {
+        let mut att = Vec::new();
+        for file_id_str in &body.attachment_ids {
+            if let Ok(fid) = ObjectId::parse_str(file_id_str) {
+                if let Ok(file) = state.files.base.find_by_id_in_tenant(tid, fid).await {
+                    att.push(MessageAttachment {
+                        file_id: file.id.unwrap(),
+                        filename: file.filename,
+                        content_type: file.content_type,
+                        size: file.size,
+                        url: file.url,
+                        thumbnail_url: file.thumbnails.first().map(|t| t.url.clone()),
+                        is_spoiler: false,
+                    });
+                }
+            }
+        }
+        att
+    } else {
+        Vec::new()
+    };
+
     let message = state
         .messages
-        .create(
+        .create_with_attachments(
             tid,
             rid,
             auth.user_id,
@@ -141,13 +185,17 @@ pub async fn create(
             ref_msg_id,
             body.nonce,
             mentions,
+            attachments,
         )
         .await?;
 
     let message_id = message.id.unwrap();
 
+    // Fetch author display name for the response
+    let names = state.users.find_display_names(&[auth.user_id]).await.unwrap_or_default();
+
     // Broadcast via WebSocket to room members (exclude sender)
-    let response = to_response(message);
+    let response = to_response(message, &names);
     let member_ids: Vec<ObjectId> = state
         .rooms
         .find_member_user_ids(rid)
@@ -225,7 +273,7 @@ pub async fn update(
     auth: AuthUser,
     Path((tenant_id, room_id, message_id)): Path<(String, String, String)>,
     Json(body): Json<UpdateMessageRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<Json<MessageResponse>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
     let rid = ObjectId::parse_str(&room_id)
@@ -233,29 +281,40 @@ pub async fn update(
     let mid = ObjectId::parse_str(&message_id)
         .map_err(|_| ApiError::BadRequest("Invalid message_id".to_string()))?;
 
+    if !state.tenants.is_member(tid, auth.user_id).await? {
+        return Err(ApiError::Forbidden("Not a member".to_string()));
+    }
+
     state
         .messages
         .update_content(tid, mid, auth.user_id, body.content.clone())
         .await?;
 
-    let member_ids = state.rooms.find_member_user_ids(rid).await?;
+    // Re-fetch the updated message for the full response
+    let updated = state.messages.base.find_by_id(mid).await?;
+    let names = state.users.find_display_names(&[updated.author_id]).await.unwrap_or_default();
+    let response = to_response(updated, &names);
+
+    // Broadcast full message to room members (exclude sender)
+    let member_ids: Vec<ObjectId> = state
+        .rooms
+        .find_member_user_ids(rid)
+        .await?
+        .into_iter()
+        .filter(|id| *id != auth.user_id)
+        .collect();
     let event = serde_json::json!({
         "type": "message:update",
-        "data": {
-            "message_id": message_id,
-            "room_id": room_id,
-            "content": body.content,
-            "user_id": auth.user_id.to_hex(),
-        }
+        "data": &response,
     });
     crate::ws::dispatcher::broadcast(&state.ws_storage, &member_ids, &event).await;
 
-    Ok(Json(serde_json::json!({ "updated": true })))
+    Ok(Json(response))
 }
 
 pub async fn delete(
     State(state): State<AppState>,
-    _auth: AuthUser,
+    auth: AuthUser,
     Path((tenant_id, room_id, message_id)): Path<(String, String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
@@ -265,17 +324,33 @@ pub async fn delete(
     let mid = ObjectId::parse_str(&message_id)
         .map_err(|_| ApiError::BadRequest("Invalid message_id".to_string()))?;
 
+    if !state.tenants.is_member(tid, auth.user_id).await? {
+        return Err(ApiError::Forbidden("Not a member".to_string()));
+    }
+
+    // Verify ownership: only the author can delete their message (tenant-scoped)
+    let message = state.messages.base.find_by_id_in_tenant(tid, mid).await?;
+    if message.author_id != auth.user_id {
+        return Err(ApiError::Forbidden("Only the author can delete this message".to_string()));
+    }
+
     state
         .messages
         .base
         .soft_delete_in_tenant(tid, mid)
         .await?;
 
-    let member_ids = state.rooms.find_member_user_ids(rid).await?;
+    let member_ids: Vec<ObjectId> = state
+        .rooms
+        .find_member_user_ids(rid)
+        .await?
+        .into_iter()
+        .filter(|id| *id != auth.user_id)
+        .collect();
     let event = serde_json::json!({
         "type": "message:delete",
         "data": {
-            "message_id": message_id,
+            "id": message_id,
             "room_id": room_id,
         }
     });
@@ -299,7 +374,9 @@ pub async fn pinned(
     }
 
     let messages = state.messages.find_pinned(rid).await?;
-    let response: Vec<MessageResponse> = messages.into_iter().map(to_response).collect();
+    let author_ids = collect_author_ids(&messages);
+    let names = state.users.find_display_names(&author_ids).await.unwrap_or_default();
+    let response: Vec<MessageResponse> = messages.into_iter().map(|m| to_response(m, &names)).collect();
 
     Ok(Json(response))
 }
@@ -359,10 +436,13 @@ pub async fn thread_replies(
 
     let result = state.messages.find_thread_replies(mid, &params).await?;
 
+    let author_ids = collect_author_ids(&result.items);
+    let names = state.users.find_display_names(&author_ids).await.unwrap_or_default();
+
     let items: Vec<MessageResponse> = result
         .items
         .into_iter()
-        .map(to_response)
+        .map(|m| to_response(m, &names))
         .collect();
 
     Ok(Json(serde_json::json!({
@@ -374,15 +454,21 @@ pub async fn thread_replies(
     })))
 }
 
-fn to_response(m: roomler2_db::models::Message) -> MessageResponse {
+fn to_response(m: roomler2_db::models::Message, names: &HashMap<ObjectId, String>) -> MessageResponse {
+    let author_name = names
+        .get(&m.author_id)
+        .cloned()
+        .unwrap_or_else(|| m.author_id.to_hex());
     MessageResponse {
         id: m.id.unwrap().to_hex(),
         room_id: m.room_id.to_hex(),
         author_id: m.author_id.to_hex(),
+        author_name,
         content: m.content,
         message_type: format!("{:?}", m.message_type),
         is_pinned: m.is_pinned,
         is_edited: m.is_edited,
+        is_thread_root: m.is_thread_root,
         thread_id: m.thread_id.map(|t| t.to_hex()),
         referenced_message_id: m.referenced_message_id.map(|r| r.to_hex()),
         reaction_summary: m
@@ -393,6 +479,27 @@ fn to_response(m: roomler2_db::models::Message) -> MessageResponse {
                 count: r.count,
             })
             .collect(),
+        attachments: m
+            .attachments
+            .into_iter()
+            .map(|a| AttachmentResponse {
+                file_id: a.file_id.to_hex(),
+                filename: a.filename,
+                content_type: a.content_type,
+                size: a.size,
+                url: a.url,
+                thumbnail_url: a.thumbnail_url,
+            })
+            .collect(),
         created_at: m.created_at.try_to_rfc3339_string().unwrap_or_default(),
+        updated_at: m.updated_at.try_to_rfc3339_string().unwrap_or_default(),
     }
+}
+
+/// Collect unique author IDs from a slice of messages
+fn collect_author_ids(messages: &[roomler2_db::models::Message]) -> Vec<ObjectId> {
+    let mut ids: Vec<ObjectId> = messages.iter().map(|m| m.author_id).collect();
+    ids.sort();
+    ids.dedup();
+    ids
 }

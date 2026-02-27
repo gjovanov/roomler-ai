@@ -166,18 +166,18 @@
         <v-toolbar v-if="joined" density="compact" color="grey-darken-4">
           <v-spacer />
           <v-btn
-            :icon="mediasoup.isMuted.value ? 'mdi-microphone-off' : 'mdi-microphone'"
-            :color="mediasoup.isMuted.value ? 'error' : undefined"
-            @click="mediasoup.toggleMute()"
+            :icon="conferenceStore.isMuted ? 'mdi-microphone-off' : 'mdi-microphone'"
+            :color="conferenceStore.isMuted ? 'error' : undefined"
+            @click="conferenceStore.toggleMute()"
           />
           <v-btn
-            :icon="mediasoup.isVideoOn.value ? 'mdi-video' : 'mdi-video-off'"
-            :color="!mediasoup.isVideoOn.value ? 'error' : undefined"
-            @click="mediasoup.toggleVideo()"
+            :icon="conferenceStore.isVideoOn ? 'mdi-video' : 'mdi-video-off'"
+            :color="!conferenceStore.isVideoOn ? 'error' : undefined"
+            @click="conferenceStore.toggleVideo()"
           />
           <v-btn
-            :icon="mediasoup.isScreenSharing.value ? 'mdi-monitor-off' : 'mdi-monitor-share'"
-            :color="mediasoup.isScreenSharing.value ? 'success' : undefined"
+            :icon="conferenceStore.isScreenSharing ? 'mdi-monitor-off' : 'mdi-monitor-share'"
+            :color="conferenceStore.isScreenSharing ? 'success' : undefined"
             @click="handleScreenShare"
           />
           <v-btn
@@ -191,6 +191,22 @@
         </v-toolbar>
       </v-col>
     </v-row>
+
+    <!-- Confirmation dialog for switching calls -->
+    <v-dialog v-model="showSwitchDialog" max-width="400">
+      <v-card>
+        <v-card-title class="text-h6">Already in a call</v-card-title>
+        <v-card-text>
+          You are already in a call in "{{ conferenceStore.roomName }}".
+          Leave that call and join this one?
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" @click="showSwitchDialog = false">Cancel</v-btn>
+          <v-btn color="primary" variant="tonal" @click="confirmSwitch">Switch Call</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
   </v-container>
 </template>
 
@@ -200,9 +216,8 @@ import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { useRoomStore } from '@/stores/rooms'
 import { useWsStore } from '@/stores/ws'
-import { useMediasoup } from '@/composables/useMediasoup'
+import { useConferenceStore } from '@/stores/conference'
 import { useAudioPlayback } from '@/composables/useAudioPlayback'
-import { useActiveSpeaker } from '@/composables/useActiveSpeaker'
 import { useConferenceLayout } from '@/composables/useConferenceLayout'
 import { usePictureInPicture } from '@/composables/usePictureInPicture'
 import LayoutSwitcher from '@/components/conference/LayoutSwitcher.vue'
@@ -219,8 +234,7 @@ const router = useRouter()
 const authStore = useAuthStore()
 const roomStore = useRoomStore()
 const wsStore = useWsStore()
-const mediasoup = useMediasoup()
-const activeSpeaker = useActiveSpeaker(mediasoup.remoteStreams)
+const conferenceStore = useConferenceStore()
 const pip = usePictureInPicture()
 const audioPlayback = useAudioPlayback()
 
@@ -231,6 +245,7 @@ const joining = ref(false)
 const showChat = ref(false)
 const showTranscriptPanel = ref(false)
 const showFiles = ref(false)
+const showSwitchDialog = ref(false)
 const chatInput = ref('')
 const chatListRef = ref<HTMLElement | null>(null)
 
@@ -242,11 +257,11 @@ function getDisplayName(userId: string): string {
 }
 
 const layoutCtrl = useConferenceLayout(
-  mediasoup.localStream,
-  mediasoup.remoteStreams,
-  mediasoup.isMuted,
-  activeSpeaker.audioLevels,
-  activeSpeaker.activeSpeakerKey,
+  conferenceStore.localStream,
+  conferenceStore.remoteStreams,
+  conferenceStore.isMuted,
+  conferenceStore.audioLevels,
+  conferenceStore.activeSpeakerKey,
   getDisplayName,
   localDisplayName,
 )
@@ -262,7 +277,7 @@ const layoutComponent = computed<Component>(() => {
 const layoutProps = computed(() => {
   const l = layoutCtrl.layout.value
   const selfP = layoutCtrl.selfParticipant.value
-  const speakerKey = activeSpeaker.activeSpeakerKey.value
+  const speakerKey = conferenceStore.activeSpeakerKey
 
   if (l.effectiveMode === 'tiled') {
     return {
@@ -300,9 +315,8 @@ function togglePiP() {
   if (pip.isPiPActive.value) {
     pip.exitPiP()
   } else {
-    // PiP the active speaker or first remote stream
-    const speakerKey = activeSpeaker.activeSpeakerKey.value
-    const targetKey = speakerKey || (mediasoup.remoteStreams.keys().next().value as string | undefined)
+    const speakerKey = conferenceStore.activeSpeakerKey
+    const targetKey = speakerKey || (conferenceStore.remoteStreams.keys().next().value as string | undefined)
     if (targetKey) {
       handlePiP(targetKey)
     }
@@ -349,39 +363,58 @@ async function handleSendChat() {
   }
 }
 
+async function confirmSwitch() {
+  showSwitchDialog.value = false
+  // Leave the current call first
+  if (conferenceStore.tenantId && conferenceStore.roomId) {
+    await roomStore.leaveCall(conferenceStore.tenantId, conferenceStore.roomId)
+  }
+  conferenceStore.leaveRoom()
+  // Now join the new call
+  await doJoin()
+}
+
 async function handleJoin() {
   if (joined.value || joining.value) return
+
+  // If already in a different call, show confirmation dialog
+  if (conferenceStore.isInCall && conferenceStore.roomId !== roomId.value) {
+    showSwitchDialog.value = true
+    return
+  }
+
+  // If returning to the same call, just show the full UI
+  if (conferenceStore.isInCall && conferenceStore.roomId === roomId.value) {
+    joined.value = true
+    showChat.value = true
+    conferenceStore.startActiveSpeaker()
+    wsStore.onMediaMessage('media:audio_playback', audioPlayback.handlePlaybackMessage)
+    roomStore.fetchChatMessages(tenantId.value, roomId.value).catch(() => {})
+    await roomStore.fetchParticipants(tenantId.value, roomId.value)
+    return
+  }
+
+  await doJoin()
+}
+
+async function doJoin() {
   joining.value = true
   try {
-    // Always call start to ensure the in-memory mediasoup room exists
-    // (it may have been lost on server restart even if DB status is InProgress)
     await roomStore.startCall(tenantId.value, roomId.value)
-
-    // REST join (adds participant to DB)
     await roomStore.joinCall(tenantId.value, roomId.value)
-
-    // Fetch room details
     await roomStore.fetchRoom(tenantId.value, roomId.value)
 
-    // mediasoup signaling join (loads device, connects transports)
-    await mediasoup.joinRoom(roomId.value)
-
-    // Produce local audio + video
-    await mediasoup.produceLocalMedia()
-
-    // Fetch participants for display names
+    // Use conference store instead of composable
+    const rName = roomStore.current?.name || 'Call'
+    await conferenceStore.joinRoom(tenantId.value, roomId.value, rName)
+    await conferenceStore.produceLocalMedia()
     await roomStore.fetchParticipants(tenantId.value, roomId.value)
-
-    // Fetch existing chat messages (non-blocking — don't break join if endpoint missing)
     roomStore.fetchChatMessages(tenantId.value, roomId.value).catch(() => {})
 
     joined.value = true
     showChat.value = true
 
-    // Start active speaker detection
-    activeSpeaker.start()
-
-    // Register audio playback handler
+    conferenceStore.startActiveSpeaker()
     wsStore.onMediaMessage('media:audio_playback', audioPlayback.handlePlaybackMessage)
   } catch (err) {
     console.error('Failed to join call:', err)
@@ -391,8 +424,8 @@ async function handleJoin() {
 }
 
 async function handleLeave() {
-  // Stop active speaker detection
-  activeSpeaker.stop()
+  // Stop active speaker (store-managed)
+  conferenceStore.stopActiveSpeaker()
 
   // Exit PiP if active
   if (pip.isPiPActive.value) {
@@ -403,7 +436,8 @@ async function handleLeave() {
   audioPlayback.stopCurrentPlayback()
   wsStore.offMediaMessage('media:audio_playback')
 
-  mediasoup.leaveRoom()
+  // Leave via conference store (tears down mediasoup)
+  conferenceStore.leaveRoom()
   roomStore.clearChatMessages()
   roomStore.clearTranscript()
   roomStore.setTranscriptionEnabled(false)
@@ -424,7 +458,6 @@ function toggleFiles() {
 }
 
 function handlePlayFile(file: { id: string; url: string; filename: string }) {
-  // Phase 4: will send WS message to broadcast audio to all participants
   wsStore.send('media:play_audio', {
     room_id: roomId.value,
     file_id: file.id,
@@ -437,7 +470,6 @@ function toggleTranscription(newState: boolean) {
     enabled: newState,
     model: roomStore.selectedTranscriptionModel,
   })
-  // Optimistic update; server will confirm via media:transcript_status
   roomStore.setTranscriptionEnabled(newState)
   if (newState) {
     showTranscriptPanel.value = true
@@ -445,19 +477,28 @@ function toggleTranscription(newState: boolean) {
 }
 
 function handleScreenShare() {
-  if (mediasoup.isScreenSharing.value) {
-    mediasoup.stopScreenShare()
+  if (conferenceStore.isScreenSharing) {
+    conferenceStore.stopScreenShare()
   } else {
-    mediasoup.startScreenShare()
+    conferenceStore.startScreenShare()
   }
 }
 
 onMounted(async () => {
-  // Load room info on mount
   try {
     await roomStore.fetchRoom(tenantId.value, roomId.value)
   } catch {
     // Room not found
+  }
+
+  // If already in call for this room (returned from mini-view), restore full view
+  if (conferenceStore.isInCall && conferenceStore.roomId === roomId.value) {
+    joined.value = true
+    showChat.value = true
+    conferenceStore.startActiveSpeaker()
+    wsStore.onMediaMessage('media:audio_playback', audioPlayback.handlePlaybackMessage)
+    roomStore.fetchChatMessages(tenantId.value, roomId.value).catch(() => {})
+    await roomStore.fetchParticipants(tenantId.value, roomId.value)
   }
 })
 </script>

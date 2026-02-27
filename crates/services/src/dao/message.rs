@@ -1,6 +1,6 @@
 use bson::{doc, oid::ObjectId, DateTime};
 use mongodb::Database;
-use roomler2_db::models::{AuthorType, ContentType, Mentions, Message, MessageType, ReactionSummary};
+use roomler2_db::models::{AuthorType, ContentType, Mentions, Message, MessageAttachment, MessageType, ReactionSummary};
 
 use super::base::{BaseDao, DaoResult, PaginatedResult, PaginationParams};
 
@@ -27,6 +27,25 @@ impl MessageDao {
         nonce: Option<String>,
         mentions: Option<Mentions>,
     ) -> DaoResult<Message> {
+        self.create_with_attachments(
+            tenant_id, room_id, author_id, content,
+            thread_id, referenced_message_id, nonce, mentions, Vec::new(),
+        ).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_with_attachments(
+        &self,
+        tenant_id: ObjectId,
+        room_id: ObjectId,
+        author_id: ObjectId,
+        content: String,
+        thread_id: Option<ObjectId>,
+        referenced_message_id: Option<ObjectId>,
+        nonce: Option<String>,
+        mentions: Option<Mentions>,
+        attachments: Vec<MessageAttachment>,
+    ) -> DaoResult<Message> {
         let now = DateTime::now();
         let message_type = if referenced_message_id.is_some() {
             MessageType::Reply
@@ -47,7 +66,7 @@ impl MessageDao {
             content_type: ContentType::Markdown,
             message_type,
             embeds: Vec::new(),
-            attachments: Vec::new(),
+            attachments,
             mentions: mentions.unwrap_or_default(),
             reaction_summary: Vec::new(),
             referenced_message_id,

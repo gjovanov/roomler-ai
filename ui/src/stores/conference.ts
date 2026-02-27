@@ -1,6 +1,7 @@
-import { ref, reactive, onUnmounted } from 'vue'
+import { defineStore } from 'pinia'
+import { shallowRef, ref, reactive } from 'vue'
 import { Device, type types as msTypes } from 'mediasoup-client'
-import { useWsStore } from '@/stores/ws'
+import { useWsStore } from './ws'
 
 interface RemoteStream {
   userId: string
@@ -10,89 +11,96 @@ interface RemoteStream {
   source: string
 }
 
-export function useMediasoup() {
-  const device = ref<Device | null>(null)
-  const sendTransport = ref<msTypes.Transport | null>(null)
-  const recvTransport = ref<msTypes.Transport | null>(null)
+interface AnalyserEntry {
+  analyser: AnalyserNode
+  source: MediaStreamAudioSourceNode
+  dataArray: Uint8Array<ArrayBuffer>
+}
+
+export const useConferenceStore = defineStore('conference', () => {
+  // --- Session metadata ---
+  const isInCall = ref(false)
+  const tenantId = ref<string | null>(null)
+  const roomId = ref<string | null>(null)
+  const roomName = ref<string | null>(null)
+
+  // --- MediaSoup state (shallowRef for non-reactive complex objects) ---
+  const device = shallowRef<Device | null>(null)
+  const sendTransport = shallowRef<msTypes.Transport | null>(null)
+  const recvTransport = shallowRef<msTypes.Transport | null>(null)
   const producers = reactive<Map<string, msTypes.Producer>>(new Map())
   const consumers = reactive<Map<string, msTypes.Consumer>>(new Map())
   const remoteStreams = reactive<Map<string, RemoteStream>>(new Map())
-  const localStream = ref<MediaStream | null>(null)
+  const localStream = shallowRef<MediaStream | null>(null)
   const isMuted = ref(false)
   const isVideoOn = ref(true)
   const isScreenSharing = ref(false)
-  const currentRoomId = ref<string | null>(null)
 
+  // --- Active speaker detection ---
+  const audioLevels = ref<Map<string, number>>(new Map())
+  const activeSpeakerKey = ref<string | null>(null)
+
+  // Private internals
   let screenProducerId: string | null = null
-  // Serialize consumeProducer calls — pendingWaiters only holds one waiter per message type,
-  // so concurrent consume requests cause the earlier waiter to be overwritten and timeout.
   let consumeChain = Promise.resolve()
-  // Track consumer → stream key for cleanup on producer_closed
   const consumerStreamKey = new Map<string, string>()
 
-  const ws = useWsStore()
+  // Active speaker internals
+  let audioContext: AudioContext | null = null
+  let pollInterval: ReturnType<typeof setInterval> | null = null
+  const analysers = new Map<string, AnalyserEntry>()
+  let lastSpeakerKey: string | null = null
+  let lastSpeakerTime = 0
+  const HOLD_MS = 1500
+  const POLL_MS = 200
+  const SPEAK_THRESHOLD = 0.08
 
-  /** Join a mediasoup room: loads device, creates transports */
-  async function joinRoom(roomId: string) {
-    currentRoomId.value = roomId
-    console.log('[mediasoup] joinRoom:', roomId)
+  // ============ MediaSoup Methods ============
 
-    // Register handlers FIRST so no messages are dropped while awaiting transports.
-    // Buffer any new_producer messages that arrive before transports are ready.
-    const pendingProducers: Array<{ producer_id: string; user_id: string; connection_id?: string; kind: string; source?: string }> = []
+  async function joinRoom(tid: string, rid: string, rName: string) {
+    const ws = useWsStore()
+
+    tenantId.value = tid
+    roomId.value = rid
+    roomName.value = rName
+
+    // Register handlers FIRST — buffer new_producer messages
+    const pendingProducers: Array<{
+      producer_id: string
+      user_id: string
+      connection_id?: string
+      kind: string
+      source?: string
+    }> = []
     ws.onMediaMessage('media:new_producer', (data) => {
-      console.log('[mediasoup] buffering new_producer:', data)
       pendingProducers.push(data)
     })
     ws.onMediaMessage('media:peer_left', handlePeerLeft)
     ws.onMediaMessage('media:producer_closed', handleProducerClosed)
 
-    // Send media:join and wait for router_capabilities + transport_created
     const capabilitiesPromise = ws.waitForMessage('media:router_capabilities')
     const transportPromise = ws.waitForMessage('media:transport_created')
 
-    ws.send('media:join', { room_id: roomId })
+    ws.send('media:join', { room_id: rid })
 
     const capsMsg = await capabilitiesPromise
-    console.log('[mediasoup] got router_capabilities')
     const transportMsg = await transportPromise
-    console.log('[mediasoup] got transport_created, send:', transportMsg.send_transport?.id, 'recv:', transportMsg.recv_transport?.id)
 
-    // Load device with router RTP capabilities
     const dev = new Device()
     await dev.load({ routerRtpCapabilities: capsMsg.rtp_capabilities })
     device.value = dev
-    console.log('[mediasoup] device loaded')
 
-    // Build iceServers from TURN config.
-    // Always pass iceServers when the server provides them — behind NAT/K8s,
-    // TURN relay is needed even when force_relay is false.
     const forceRelay = !!transportMsg.force_relay
     const iceServers = transportMsg.ice_servers?.length
-      ? transportMsg.ice_servers.map((s: { urls: string[]; username: string; credential: string }) => ({
-          urls: s.urls,
-          username: s.username,
-          credential: s.credential,
-        }))
+      ? transportMsg.ice_servers.map(
+          (s: { urls: string[]; username: string; credential: string }) => ({
+            urls: s.urls,
+            username: s.username,
+            credential: s.credential,
+          }),
+        )
       : undefined
     const iceTransportPolicy = forceRelay ? 'relay' : 'all'
-    console.log('[mediasoup] ICE config:', { iceServers, iceTransportPolicy, force_relay: forceRelay })
-
-    // Log ICE candidate details from server
-    for (const label of ['send_transport', 'recv_transport'] as const) {
-      const tp = transportMsg[label]
-      if (tp?.ice_candidates) {
-        for (const c of tp.ice_candidates) {
-          console.log(`[mediasoup] ${label} ICE candidate:`, {
-            protocol: c.protocol,
-            address: c.address ?? c.ip,
-            port: c.port,
-            tcpType: c.tcpType ?? 'n/a',
-            type: c.type,
-          })
-        }
-      }
-    }
 
     // Create send transport
     const sendParams = transportMsg.send_transport
@@ -106,26 +114,31 @@ export function useMediasoup() {
     })
 
     st.on('connectionstatechange', async (state: string) => {
-      console.log('[mediasoup] sendTransport connectionState:', state)
+      console.log('[conference] sendTransport connectionState:', state)
       if (state === 'failed') {
         try {
           const stats = await st.getStats()
           stats.forEach((report: Record<string, unknown>) => {
-            if (report.type === 'candidate-pair' || report.type === 'local-candidate' || report.type === 'remote-candidate') {
-              console.log('[mediasoup] sendTransport stats:', report)
+            if (
+              report.type === 'candidate-pair' ||
+              report.type === 'local-candidate' ||
+              report.type === 'remote-candidate'
+            ) {
+              console.log('[conference] sendTransport stats:', report)
             }
           })
-        } catch { /* stats not available */ }
+        } catch {
+          /* stats not available */
+        }
       }
     })
 
-    st.on('connect', ({ dtlsParameters }, callback, errback) => {
+    st.on('connect', ({ dtlsParameters }, callback) => {
       ws.send('media:connect_transport', {
-        room_id: roomId,
+        room_id: rid,
         transport_id: st.id,
         dtls_parameters: dtlsParameters,
       })
-      // Assume success — server will send error if it fails
       callback()
     })
 
@@ -133,7 +146,7 @@ export function useMediasoup() {
       try {
         const resultPromise = ws.waitForMessage('media:produce_result')
         ws.send('media:produce', {
-          room_id: roomId,
+          room_id: rid,
           kind,
           rtp_parameters: rtpParameters,
           source: appData?.source || (kind === 'audio' ? 'audio' : 'camera'),
@@ -159,22 +172,28 @@ export function useMediasoup() {
     })
 
     rt.on('connectionstatechange', async (state: string) => {
-      console.log('[mediasoup] recvTransport connectionState:', state)
+      console.log('[conference] recvTransport connectionState:', state)
       if (state === 'failed') {
         try {
           const stats = await rt.getStats()
           stats.forEach((report: Record<string, unknown>) => {
-            if (report.type === 'candidate-pair' || report.type === 'local-candidate' || report.type === 'remote-candidate') {
-              console.log('[mediasoup] recvTransport stats:', report)
+            if (
+              report.type === 'candidate-pair' ||
+              report.type === 'local-candidate' ||
+              report.type === 'remote-candidate'
+            ) {
+              console.log('[conference] recvTransport stats:', report)
             }
           })
-        } catch { /* stats not available */ }
+        } catch {
+          /* stats not available */
+        }
       }
     })
 
-    rt.on('connect', ({ dtlsParameters }, callback, errback) => {
+    rt.on('connect', ({ dtlsParameters }, callback) => {
       ws.send('media:connect_transport', {
-        room_id: roomId,
+        room_id: rt.id,
         transport_id: rt.id,
         dtls_parameters: dtlsParameters,
       })
@@ -182,68 +201,65 @@ export function useMediasoup() {
     })
 
     recvTransport.value = rt
-    console.log('[mediasoup] transports created, buffered producers:', pendingProducers.length)
 
-    // Replace the buffering handler with the real one now that transports are ready
+    // Replace buffering handler with the real one
     ws.onMediaMessage('media:new_producer', handleNewProducer)
 
-    // Process any producers that arrived while we were setting up transports
+    // Process buffered producers
     for (const p of pendingProducers) {
       handleNewProducer(p)
     }
+
+    isInCall.value = true
   }
 
-  /** Produce local audio + video tracks */
   async function produceLocalMedia() {
-    console.log('[mediasoup] producing local media...')
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: true,
       video: true,
     })
     localStream.value = stream
-    console.log('[mediasoup] getUserMedia OK, audio tracks:', stream.getAudioTracks().length, 'video tracks:', stream.getVideoTracks().length)
 
-    if (!sendTransport.value) {
-      console.warn('[mediasoup] no sendTransport, cannot produce')
-      return
-    }
+    if (!sendTransport.value) return
 
-    // Produce audio
     const audioTrack = stream.getAudioTracks()[0]
     if (audioTrack) {
-      const audioProducer = await sendTransport.value.produce({ track: audioTrack, appData: { source: 'audio' } })
+      const audioProducer = await sendTransport.value.produce({
+        track: audioTrack,
+        appData: { source: 'audio' },
+      })
       producers.set('audio', audioProducer)
-      console.log('[mediasoup] audio producer created:', audioProducer.id)
     }
 
-    // Produce video
     const videoTrack = stream.getVideoTracks()[0]
     if (videoTrack) {
-      const videoProducer = await sendTransport.value.produce({ track: videoTrack, appData: { source: 'camera' } })
+      const videoProducer = await sendTransport.value.produce({
+        track: videoTrack,
+        appData: { source: 'camera' },
+      })
       producers.set('video', videoProducer)
-      console.log('[mediasoup] video producer created:', videoProducer.id)
     }
 
     return stream
   }
 
-  /** Consume a remote producer */
-  async function consumeProducer(producerId: string, userId: string, connectionId: string, source: string) {
-    if (!recvTransport.value || !device.value) {
-      console.warn('[mediasoup] consumeProducer: missing recvTransport or device')
-      return
-    }
+  async function consumeProducer(
+    producerId: string,
+    userId: string,
+    connectionId: string,
+    source: string,
+  ) {
+    if (!recvTransport.value || !device.value) return
 
-    console.log('[mediasoup] consumeProducer:', producerId, 'from user:', userId, 'conn:', connectionId, 'source:', source)
+    const ws = useWsStore()
     const resultPromise = ws.waitForMessage('media:consumer_created')
     ws.send('media:consume', {
-      room_id: currentRoomId.value,
+      room_id: roomId.value,
       producer_id: producerId,
       rtp_capabilities: device.value.rtpCapabilities,
     })
 
     const result = await resultPromise
-    console.log('[mediasoup] consumer_created response:', result.id, result.kind, 'source:', source)
 
     const consumer = await recvTransport.value.consume({
       id: result.id,
@@ -253,18 +269,10 @@ export function useMediasoup() {
     })
 
     consumers.set(consumer.id, consumer)
-    console.log('[mediasoup] consumer track:', consumer.track.kind, 'readyState:', consumer.track.readyState, 'enabled:', consumer.track.enabled, 'muted:', consumer.track.muted)
 
-    // Key by connectionId so same user from multiple tabs gets separate streams.
-    // Screen shares get their own key: `${connectionId}:screen`.
     const streamKey = source === 'screen' ? `${connectionId}:screen` : connectionId
-
-    // Track consumer → stream key for cleanup
     consumerStreamKey.set(consumer.id, streamKey)
 
-    // Attach consumer track to remote stream.
-    // Always create a new MediaStream so that Vue reactivity picks up the change
-    // (addTrack on an existing stream is a DOM mutation invisible to Vue).
     const existing = remoteStreams.get(streamKey)
     const tracks = existing ? [...existing.stream.getTracks(), consumer.track] : [consumer.track]
     const newStream = new MediaStream(tracks)
@@ -275,27 +283,26 @@ export function useMediasoup() {
       kind: result.kind,
       source,
     })
-    console.log('[mediasoup] remoteStreams updated for', streamKey, '— total tracks:', newStream.getTracks().length, 'video:', newStream.getVideoTracks().length)
   }
 
-  /** Handle new_producer from WS — queued to avoid concurrent waitForMessage collisions */
-  function handleNewProducer(data: { producer_id: string; user_id: string; connection_id?: string; kind: string; source?: string }) {
+  function handleNewProducer(data: {
+    producer_id: string
+    user_id: string
+    connection_id?: string
+    kind: string
+    source?: string
+  }) {
     const source = data.source || (data.kind === 'audio' ? 'audio' : 'camera')
-    const connectionId = data.connection_id || data.user_id // fallback for backwards compat
-    console.log('[mediasoup] handleNewProducer:', data.kind, 'source:', source, 'from', data.user_id, 'conn:', connectionId, 'producer:', data.producer_id)
+    const connectionId = data.connection_id || data.user_id
     consumeChain = consumeChain
       .then(() => consumeProducer(data.producer_id, data.user_id, connectionId, source))
-      .catch((err) => console.error('[mediasoup] consumeProducer failed:', err))
+      .catch((err) => console.error('[conference] consumeProducer failed:', err))
   }
 
-  /** Handle peer_left from WS */
   function handlePeerLeft(data: { user_id: string; connection_id?: string }) {
     const connectionId = data.connection_id || data.user_id
-    console.log('[mediasoup] handlePeerLeft: user:', data.user_id, 'conn:', connectionId)
-    // Remove remote streams keyed by this connectionId (camera + screen)
     remoteStreams.delete(connectionId)
     remoteStreams.delete(`${connectionId}:screen`)
-    // Close associated consumers whose stream key matches this connection
     for (const [id, consumer] of consumers) {
       const key = consumerStreamKey.get(id)
       if (key === connectionId || key === `${connectionId}:screen`) {
@@ -306,13 +313,11 @@ export function useMediasoup() {
     }
   }
 
-  /** Handle producer_closed from WS */
   function handleProducerClosed(data: { producer_id: string; user_id: string }) {
     for (const [id, consumer] of consumers) {
       if (consumer.producerId === data.producer_id) {
         consumer.close()
         consumers.delete(id)
-        // Clean up the stream entry if it was a screen share (single-track stream)
         const key = consumerStreamKey.get(id)
         consumerStreamKey.delete(id)
         if (key && key.endsWith(':screen')) {
@@ -323,18 +328,13 @@ export function useMediasoup() {
     }
   }
 
-  /** Toggle audio mute */
   function toggleMute() {
     isMuted.value = !isMuted.value
     const audioProducer = producers.get('audio')
     if (audioProducer) {
-      if (isMuted.value) {
-        audioProducer.pause()
-      } else {
-        audioProducer.resume()
-      }
+      if (isMuted.value) audioProducer.pause()
+      else audioProducer.resume()
     }
-    // Also toggle local stream track
     if (localStream.value) {
       localStream.value.getAudioTracks().forEach((t) => {
         t.enabled = !isMuted.value
@@ -342,16 +342,12 @@ export function useMediasoup() {
     }
   }
 
-  /** Toggle video on/off */
   function toggleVideo() {
     isVideoOn.value = !isVideoOn.value
     const videoProducer = producers.get('video')
     if (videoProducer) {
-      if (!isVideoOn.value) {
-        videoProducer.pause()
-      } else {
-        videoProducer.resume()
-      }
+      if (!isVideoOn.value) videoProducer.pause()
+      else videoProducer.resume()
     }
     if (localStream.value) {
       localStream.value.getVideoTracks().forEach((t) => {
@@ -360,13 +356,10 @@ export function useMediasoup() {
     }
   }
 
-  /** Start screen sharing */
   async function startScreenShare() {
     if (!sendTransport.value) return
 
-    const screenStream = await navigator.mediaDevices.getDisplayMedia({
-      video: true,
-    })
+    const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true })
     const screenTrack = screenStream.getVideoTracks()[0]
     if (!screenTrack) return
 
@@ -378,23 +371,21 @@ export function useMediasoup() {
     producers.set('screen', screenProducer)
     isScreenSharing.value = true
 
-    // When user stops sharing via browser UI
     screenTrack.onended = () => {
       stopScreenShare()
     }
   }
 
-  /** Stop screen sharing */
   function stopScreenShare() {
     const screenProducer = producers.get('screen')
     if (screenProducer) {
       screenProducer.close()
       producers.delete('screen')
 
-      // Notify server
-      if (currentRoomId.value && screenProducerId) {
+      if (roomId.value && screenProducerId) {
+        const ws = useWsStore()
         ws.send('media:producer_close', {
-          room_id: currentRoomId.value,
+          room_id: roomId.value,
           producer_id: screenProducerId,
         })
       }
@@ -403,11 +394,16 @@ export function useMediasoup() {
     isScreenSharing.value = false
   }
 
-  /** Leave the mediasoup room */
+  /** Leave the call — only called on explicit hangup, NOT on unmount */
   function leaveRoom() {
-    if (currentRoomId.value) {
-      ws.send('media:leave', { room_id: currentRoomId.value })
+    const ws = useWsStore()
+
+    if (roomId.value) {
+      ws.send('media:leave', { room_id: roomId.value })
     }
+
+    // Stop active speaker detection
+    stopActiveSpeaker()
 
     // Close all producers
     for (const [, producer] of producers) {
@@ -436,32 +432,157 @@ export function useMediasoup() {
 
     remoteStreams.clear()
     device.value = null
-    currentRoomId.value = null
-    isMuted.value = false
-    isVideoOn.value = true
-    isScreenSharing.value = false
     consumeChain = Promise.resolve()
 
     // Remove WS listeners
     ws.offMediaMessage('media:new_producer')
     ws.offMediaMessage('media:peer_left')
     ws.offMediaMessage('media:producer_closed')
+
+    // Reset state
+    isInCall.value = false
+    isMuted.value = false
+    isVideoOn.value = true
+    isScreenSharing.value = false
+    tenantId.value = null
+    roomId.value = null
+    roomName.value = null
   }
 
-  onUnmounted(() => {
-    leaveRoom()
-  })
+  // ============ Active Speaker Detection ============
+
+  function getOrCreateAudioContext(): AudioContext {
+    if (!audioContext) {
+      audioContext = new AudioContext()
+    }
+    return audioContext
+  }
+
+  function addSpeakerStream(streamKey: string, stream: MediaStream) {
+    if (analysers.has(streamKey)) return
+    const audioTracks = stream.getAudioTracks()
+    if (audioTracks.length === 0) return
+
+    const ctx = getOrCreateAudioContext()
+    const source = ctx.createMediaStreamSource(stream)
+    const analyser = ctx.createAnalyser()
+    analyser.fftSize = 256
+    analyser.smoothingTimeConstant = 0.5
+    source.connect(analyser)
+
+    const dataArray = new Uint8Array(analyser.frequencyBinCount) as Uint8Array<ArrayBuffer>
+    analysers.set(streamKey, { analyser, source, dataArray })
+  }
+
+  function removeSpeakerStream(streamKey: string) {
+    const entry = analysers.get(streamKey)
+    if (entry) {
+      entry.source.disconnect()
+      analysers.delete(streamKey)
+    }
+    audioLevels.value.delete(streamKey)
+  }
+
+  function syncSpeakerStreams() {
+    for (const [key, remote] of remoteStreams) {
+      if (key.endsWith(':screen')) continue
+      if (!analysers.has(key)) {
+        addSpeakerStream(key, remote.stream)
+      }
+    }
+    for (const key of analysers.keys()) {
+      if (!remoteStreams.has(key)) {
+        removeSpeakerStream(key)
+      }
+    }
+  }
+
+  function pollSpeaker() {
+    const now = Date.now()
+    let maxLevel = 0
+    let maxKey: string | null = null
+    const levels = new Map<string, number>()
+
+    for (const [key, entry] of analysers) {
+      entry.analyser.getByteFrequencyData(entry.dataArray)
+      let sum = 0
+      for (let i = 0; i < entry.dataArray.length; i++) {
+        const v = entry.dataArray[i] / 255
+        sum += v * v
+      }
+      const rms = Math.sqrt(sum / entry.dataArray.length)
+      levels.set(key, rms)
+
+      if (rms > maxLevel && rms > SPEAK_THRESHOLD) {
+        maxLevel = rms
+        maxKey = key
+      }
+    }
+
+    audioLevels.value = levels
+
+    if (maxKey) {
+      lastSpeakerKey = maxKey
+      lastSpeakerTime = now
+      activeSpeakerKey.value = maxKey
+    } else if (lastSpeakerKey && now - lastSpeakerTime > HOLD_MS) {
+      activeSpeakerKey.value = null
+      lastSpeakerKey = null
+    }
+  }
+
+  function startActiveSpeaker() {
+    if (pollInterval) return
+    syncSpeakerStreams()
+    pollInterval = setInterval(() => {
+      syncSpeakerStreams()
+      pollSpeaker()
+    }, POLL_MS)
+  }
+
+  function stopActiveSpeaker() {
+    if (pollInterval) {
+      clearInterval(pollInterval)
+      pollInterval = null
+    }
+    for (const [key] of analysers) {
+      removeSpeakerStream(key)
+    }
+    analysers.clear()
+    audioLevels.value = new Map()
+    activeSpeakerKey.value = null
+    lastSpeakerKey = null
+
+    if (audioContext) {
+      audioContext.close().catch(() => {})
+      audioContext = null
+    }
+  }
 
   return {
+    // Session metadata
+    isInCall,
+    tenantId,
+    roomId,
+    roomName,
+
+    // MediaSoup state
     device,
-    localStream,
-    remoteStreams,
+    sendTransport,
+    recvTransport,
     producers,
     consumers,
+    remoteStreams,
+    localStream,
     isMuted,
     isVideoOn,
     isScreenSharing,
-    roomId: currentRoomId,
+
+    // Active speaker
+    audioLevels,
+    activeSpeakerKey,
+
+    // Methods
     joinRoom,
     produceLocalMedia,
     leaveRoom,
@@ -469,5 +590,7 @@ export function useMediasoup() {
     toggleVideo,
     startScreenShare,
     stopScreenShare,
+    startActiveSpeaker,
+    stopActiveSpeaker,
   }
-}
+})

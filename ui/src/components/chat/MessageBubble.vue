@@ -7,13 +7,21 @@
 
       <div class="flex-grow-1">
         <div class="d-flex align-center mb-1">
-          <span class="text-subtitle-2 font-weight-bold mr-2">
+          <router-link
+            v-if="message.author_id"
+            :to="{ name: 'profile', params: { userId: message.author_id } }"
+            class="text-subtitle-2 font-weight-bold mr-2 text-decoration-none"
+            style="color: inherit;"
+          >
+            {{ message.author_name || 'Unknown' }}
+          </router-link>
+          <span v-else class="text-subtitle-2 font-weight-bold mr-2">
             {{ message.author_name || 'Unknown' }}
           </span>
           <span class="text-caption text-medium-emphasis">
             {{ formatTime(message.created_at) }}
           </span>
-          <span v-if="message.updated_at !== message.created_at" class="text-caption text-medium-emphasis ml-1">
+          <span v-if="message.is_edited" class="text-caption text-medium-emphasis ml-1">
             (edited)
           </span>
           <v-spacer />
@@ -27,6 +35,14 @@
               size="x-small"
               variant="text"
               @click="startEditing"
+            />
+            <v-btn
+              v-if="editable"
+              icon="mdi-delete"
+              size="x-small"
+              variant="text"
+              color="error"
+              @click="showDeleteConfirm = true"
             />
             <v-btn
               :icon="message.is_pinned ? 'mdi-pin-off' : 'mdi-pin'"
@@ -54,6 +70,32 @@
 
         <!-- Normal display -->
         <div v-else class="text-body-2 message-content" v-html="renderedContent" />
+
+        <!-- Attachments -->
+        <div v-if="message.attachments && message.attachments.length > 0" class="mt-2 d-flex flex-wrap ga-2">
+          <template v-for="att in message.attachments" :key="att.file_id">
+            <v-img
+              v-if="att.content_type.startsWith('image/')"
+              :src="att.url"
+              :alt="att.filename"
+              max-width="300"
+              max-height="200"
+              rounded
+              class="cursor-pointer"
+              @click="openAttachment(att.url)"
+            />
+            <v-chip
+              v-else
+              variant="tonal"
+              prepend-icon="mdi-file"
+              :href="att.url"
+              target="_blank"
+            >
+              {{ att.filename }}
+              <span class="text-caption ml-1">({{ formatFileSize(att.size) }})</span>
+            </v-chip>
+          </template>
+        </div>
 
         <!-- Reactions -->
         <div v-if="message.reaction_summary.length > 0" class="d-flex flex-wrap ga-1 mt-1">
@@ -84,6 +126,19 @@
       v-model="showEmojiPicker"
       @select="(emoji: string) => { $emit('react', emoji); showEmojiPicker = false }"
     />
+
+    <!-- Delete confirmation dialog -->
+    <v-dialog v-model="showDeleteConfirm" max-width="360">
+      <v-card>
+        <v-card-title class="text-h6">Delete message?</v-card-title>
+        <v-card-text>This action cannot be undone.</v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" @click="showDeleteConfirm = false">Cancel</v-btn>
+          <v-btn color="error" variant="tonal" @click="confirmDelete">Delete</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
   </div>
 </template>
 
@@ -98,14 +153,25 @@ interface Reaction {
   count: number
 }
 
+interface Attachment {
+  file_id: string
+  filename: string
+  content_type: string
+  size: number
+  url: string
+  thumbnail_url?: string
+}
+
 interface Message {
   id: string
   author_id: string
-  author_name?: string
+  author_name: string
   content: string
   is_pinned: boolean
+  is_edited: boolean
   is_thread_root: boolean
   reaction_summary: Reaction[]
+  attachments: Attachment[]
   created_at: string
   updated_at: string
 }
@@ -121,9 +187,11 @@ const emit = defineEmits<{
   react: [emoji: string]
   pin: []
   edit: [content: string]
+  delete: []
 }>()
 
 const showEmojiPicker = ref(false)
+const showDeleteConfirm = ref(false)
 const editing = ref(false)
 const editEditorRef = ref<InstanceType<typeof MessageEditor> | null>(null)
 
@@ -154,6 +222,21 @@ function saveEdit(content: string) {
     emit('edit', content)
   }
   editing.value = false
+}
+
+function openAttachment(url: string) {
+  window.open(url, '_blank')
+}
+
+function confirmDelete() {
+  showDeleteConfirm.value = false
+  emit('delete')
+}
+
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
 }
 
 function handleKeydown(e: KeyboardEvent) {

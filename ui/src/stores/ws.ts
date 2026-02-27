@@ -4,6 +4,7 @@ import { useRoomStore } from './rooms'
 import { useMessageStore } from './messages'
 import { useNotificationStore } from './notification'
 import { useTaskStore } from './tasks'
+import { useConferenceStore } from './conference'
 
 type WsStatus = 'disconnected' | 'connecting' | 'connected'
 
@@ -89,6 +90,12 @@ export const useWsStore = defineStore('ws', () => {
       case 'message:create':
         messageStore.addMessageFromWs(msg.data as never)
         break
+      case 'message:update':
+        messageStore.updateMessageFromWs(msg.data as never)
+        break
+      case 'message:delete':
+        messageStore.removeMessageFromWs(msg.data as never)
+        break
       case 'message:reaction':
         messageStore.handleReactionFromWs(msg.data as never)
         break
@@ -125,6 +132,11 @@ export const useWsStore = defineStore('ws', () => {
       case 'room:call_ended': {
         const ceData = msg.data as { room_id: string }
         roomStore.updateRoomCallStatus(ceData.room_id, null, 0)
+        // Auto-teardown conference if the ended call matches the active one
+        const confStore = useConferenceStore()
+        if (confStore.isInCall && confStore.roomId === ceData.room_id) {
+          confStore.leaveRoom()
+        }
         break
       }
       case 'room:call_updated': {

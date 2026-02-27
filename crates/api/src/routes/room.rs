@@ -211,15 +211,37 @@ pub async fn members(
 
     let result = state.rooms.list_members(rid, &params).await?;
 
+    // Batch-fetch user details (username, avatar) for member user IDs
+    let user_ids: Vec<ObjectId> = result
+        .items
+        .iter()
+        .filter_map(|m| m.user_id)
+        .collect();
+    let user_map = if !user_ids.is_empty() {
+        // Fetch full user records for username + avatar
+        let mut map = std::collections::HashMap::new();
+        for uid in &user_ids {
+            if let Ok(user) = state.users.base.find_by_id(*uid).await {
+                map.insert(*uid, (user.username, user.avatar, user.display_name));
+            }
+        }
+        map
+    } else {
+        std::collections::HashMap::new()
+    };
+
     let items: Vec<serde_json::Value> = result
         .items
         .iter()
         .map(|m| {
+            let user_info = m.user_id.and_then(|uid| user_map.get(&uid));
             serde_json::json!({
                 "id": m.id.unwrap().to_hex(),
                 "user_id": m.user_id.map(|u| u.to_hex()),
                 "room_id": m.room_id.to_hex(),
-                "display_name": m.display_name,
+                "display_name": user_info.map(|u| u.2.clone()).or_else(|| m.display_name.clone()).unwrap_or_default(),
+                "username": user_info.map(|u| u.0.clone()),
+                "avatar": user_info.and_then(|u| u.1.clone()),
                 "joined_at": m.joined_at.try_to_rfc3339_string().unwrap_or_default(),
                 "unread_count": m.unread_count,
                 "is_muted": m.is_muted,

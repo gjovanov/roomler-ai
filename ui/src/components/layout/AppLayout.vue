@@ -39,6 +39,20 @@
       </v-list>
 
       <template #append>
+        <!-- Mini conference widget (visible when in call but navigated away) -->
+        <mini-conference
+          v-if="conferenceStore.isInCall && !isOnCallPage"
+        />
+        <!-- Pulsing phone icon in rail mode when in call -->
+        <v-list v-if="rail && conferenceStore.isInCall" density="compact">
+          <v-list-item
+            prepend-icon="mdi-phone"
+            class="call-indicator"
+            @click="returnToCall"
+          >
+            <v-badge dot color="success" />
+          </v-list-item>
+        </v-list>
         <v-list density="compact">
           <v-list-item
             prepend-icon="mdi-cog"
@@ -114,14 +128,31 @@ import { useTheme } from 'vuetify'
 import { useAuth } from '@/composables/useAuth'
 import { useTenantStore } from '@/stores/tenant'
 import { useNotificationStore } from '@/stores/notification'
+import { useConferenceStore } from '@/stores/conference'
 import NotificationPanel from '@/components/layout/NotificationPanel.vue'
+import MiniConference from '@/components/conference/MiniConference.vue'
 
 const { auth, logout: handleLogout } = useAuth()
 const tenantStore = useTenantStore()
 const notificationStore = useNotificationStore()
+const conferenceStore = useConferenceStore()
 const route = useRoute()
 const router = useRouter()
 const theme = useTheme()
+
+const isOnCallPage = computed(() => route.name === 'room-call')
+
+function returnToCall() {
+  if (conferenceStore.tenantId && conferenceStore.roomId) {
+    router.push({
+      name: 'room-call',
+      params: {
+        tenantId: conferenceStore.tenantId,
+        roomId: conferenceStore.roomId,
+      },
+    })
+  }
+}
 
 const drawer = ref(true)
 const rail = ref(false)

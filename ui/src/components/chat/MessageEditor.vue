@@ -2,87 +2,109 @@
   <div class="message-editor">
     <div class="editor-toolbar d-flex align-center ga-1 px-2 py-1">
       <v-btn
-        icon="mdi-format-bold"
+        :icon="mode === 'rich' ? 'mdi-format-text' : 'mdi-format-text'"
         size="x-small"
         variant="text"
-        :color="editor?.isActive('bold') ? 'primary' : undefined"
-        @click="editor?.chain().focus().toggleBold().run()"
-      />
-      <v-btn
-        icon="mdi-format-italic"
-        size="x-small"
-        variant="text"
-        :color="editor?.isActive('italic') ? 'primary' : undefined"
-        @click="editor?.chain().focus().toggleItalic().run()"
-      />
-      <v-btn
-        icon="mdi-format-underline"
-        size="x-small"
-        variant="text"
-        :color="editor?.isActive('underline') ? 'primary' : undefined"
-        @click="editor?.chain().focus().toggleUnderline().run()"
-      />
-      <v-btn
-        icon="mdi-format-strikethrough"
-        size="x-small"
-        variant="text"
-        :color="editor?.isActive('strike') ? 'primary' : undefined"
-        @click="editor?.chain().focus().toggleStrike().run()"
-      />
+        :color="mode === 'rich' ? 'primary' : undefined"
+        @click="toggleMode"
+      >
+        <v-tooltip activator="parent" location="top">
+          {{ mode === 'minimal' ? 'Rich text mode' : 'Minimal mode' }}
+        </v-tooltip>
+      </v-btn>
 
       <v-divider vertical class="mx-1" />
 
-      <v-btn
-        icon="mdi-code-tags"
-        size="x-small"
-        variant="text"
-        :color="editor?.isActive('code') ? 'primary' : undefined"
-        @click="editor?.chain().focus().toggleCode().run()"
-      />
-      <v-btn
-        icon="mdi-code-braces"
-        size="x-small"
-        variant="text"
-        :color="editor?.isActive('codeBlock') ? 'primary' : undefined"
-        @click="editor?.chain().focus().toggleCodeBlock().run()"
-      />
+      <template v-if="mode === 'rich'">
+        <v-btn
+          icon="mdi-format-bold"
+          size="x-small"
+          variant="text"
+          :color="editor?.isActive('bold') ? 'primary' : undefined"
+          @click="editor?.chain().focus().toggleBold().run()"
+        />
+        <v-btn
+          icon="mdi-format-italic"
+          size="x-small"
+          variant="text"
+          :color="editor?.isActive('italic') ? 'primary' : undefined"
+          @click="editor?.chain().focus().toggleItalic().run()"
+        />
+        <v-btn
+          icon="mdi-format-underline"
+          size="x-small"
+          variant="text"
+          :color="editor?.isActive('underline') ? 'primary' : undefined"
+          @click="editor?.chain().focus().toggleUnderline().run()"
+        />
+        <v-btn
+          icon="mdi-format-strikethrough"
+          size="x-small"
+          variant="text"
+          :color="editor?.isActive('strike') ? 'primary' : undefined"
+          @click="editor?.chain().focus().toggleStrike().run()"
+        />
 
-      <v-divider vertical class="mx-1" />
+        <v-divider vertical class="mx-1" />
 
-      <v-btn
-        icon="mdi-format-list-bulleted"
-        size="x-small"
-        variant="text"
-        :color="editor?.isActive('bulletList') ? 'primary' : undefined"
-        @click="editor?.chain().focus().toggleBulletList().run()"
-      />
-      <v-btn
-        icon="mdi-format-list-numbered"
-        size="x-small"
-        variant="text"
-        :color="editor?.isActive('orderedList') ? 'primary' : undefined"
-        @click="editor?.chain().focus().toggleOrderedList().run()"
-      />
-      <v-btn
-        icon="mdi-format-quote-close"
-        size="x-small"
-        variant="text"
-        :color="editor?.isActive('blockquote') ? 'primary' : undefined"
-        @click="editor?.chain().focus().toggleBlockquote().run()"
-      />
+        <v-btn
+          icon="mdi-code-tags"
+          size="x-small"
+          variant="text"
+          :color="editor?.isActive('code') ? 'primary' : undefined"
+          @click="editor?.chain().focus().toggleCode().run()"
+        />
+        <v-btn
+          icon="mdi-code-braces"
+          size="x-small"
+          variant="text"
+          :color="editor?.isActive('codeBlock') ? 'primary' : undefined"
+          @click="editor?.chain().focus().toggleCodeBlock().run()"
+        />
 
-      <v-divider vertical class="mx-1" />
+        <v-divider vertical class="mx-1" />
 
-      <v-btn
-        icon="mdi-link"
-        size="x-small"
-        variant="text"
-        :color="editor?.isActive('link') ? 'primary' : undefined"
-        @click="toggleLink"
-      />
+        <v-btn
+          icon="mdi-format-list-bulleted"
+          size="x-small"
+          variant="text"
+          :color="editor?.isActive('bulletList') ? 'primary' : undefined"
+          @click="editor?.chain().focus().toggleBulletList().run()"
+        />
+        <v-btn
+          icon="mdi-format-list-numbered"
+          size="x-small"
+          variant="text"
+          :color="editor?.isActive('orderedList') ? 'primary' : undefined"
+          @click="editor?.chain().focus().toggleOrderedList().run()"
+        />
+        <v-btn
+          icon="mdi-format-quote-close"
+          size="x-small"
+          variant="text"
+          :color="editor?.isActive('blockquote') ? 'primary' : undefined"
+          @click="editor?.chain().focus().toggleBlockquote().run()"
+        />
+
+        <v-divider vertical class="mx-1" />
+
+        <v-btn
+          icon="mdi-link"
+          size="x-small"
+          variant="text"
+          :color="editor?.isActive('link') ? 'primary' : undefined"
+          @click="toggleLink"
+        />
+      </template>
 
       <v-spacer />
 
+      <v-btn
+        icon="mdi-paperclip"
+        size="x-small"
+        variant="text"
+        @click="triggerFileInput"
+      />
       <v-btn
         icon="mdi-emoticon-outline"
         size="x-small"
@@ -95,9 +117,26 @@
         variant="text"
         @click="$emit('open-giphy-picker')"
       />
+      <v-btn
+        v-if="mode === 'rich'"
+        icon="mdi-send"
+        size="x-small"
+        variant="text"
+        color="primary"
+        @click="handleSend"
+      />
     </div>
 
     <editor-content :editor="editor" class="editor-content" />
+
+    <!-- Hidden file input for attachments -->
+    <input
+      ref="fileInputRef"
+      type="file"
+      multiple
+      style="display: none"
+      @change="handleFileSelect"
+    />
   </div>
 </template>
 
@@ -113,17 +152,24 @@ import { Markdown } from 'tiptap-markdown'
 import tippy, { type Instance as TippyInstance } from 'tippy.js'
 import MentionList from './MentionList.vue'
 import type { MentionItem } from './MentionList.vue'
+import { api } from '@/api/client'
+
+type EditorMode = 'minimal' | 'rich'
 
 const props = withDefaults(
   defineProps<{
     placeholder?: string
     initialContent?: string
     members?: MentionItem[]
+    tenantId?: string
+    roomId?: string
   }>(),
   {
     placeholder: 'Write a message...',
     initialContent: '',
     members: () => [],
+    tenantId: '',
+    roomId: '',
   },
 )
 
@@ -134,10 +180,57 @@ export interface MentionData {
 }
 
 const emit = defineEmits<{
-  send: [content: string, mentions: MentionData]
+  send: [content: string, mentions: MentionData, attachmentIds: string[]]
   'open-emoji-picker': []
   'open-giphy-picker': []
 }>()
+
+const mode = vueRef<EditorMode>(
+  (localStorage.getItem('roomler-editor-mode') as EditorMode) || 'minimal',
+)
+const pendingAttachmentIds = vueRef<string[]>([])
+const fileInputRef = vueRef<HTMLInputElement | null>(null)
+
+function toggleMode() {
+  mode.value = mode.value === 'minimal' ? 'rich' : 'minimal'
+  localStorage.setItem('roomler-editor-mode', mode.value)
+}
+
+function triggerFileInput() {
+  fileInputRef.value?.click()
+}
+
+async function handleFileSelect(event: Event) {
+  const input = event.target as HTMLInputElement
+  const files = input.files
+  if (!files || !props.tenantId) return
+
+  for (const file of Array.from(files)) {
+    const formData = new FormData()
+    formData.append('file', file)
+    if (props.roomId) formData.append('room_id', props.roomId)
+
+    try {
+      const result = await api.upload<{ id: string; filename: string; url: string }>(
+        `/tenant/${props.tenantId}/file`,
+        formData,
+      )
+      pendingAttachmentIds.value.push(result.id)
+
+      // Insert image or file reference into editor
+      if (file.type.startsWith('image/')) {
+        editor.value?.chain().focus().insertContent(`![${file.name}](${result.url})`).run()
+      } else {
+        editor.value?.chain().focus().insertContent(`[${file.name}](${result.url})`).run()
+      }
+    } catch (err) {
+      console.error('File upload failed:', err)
+    }
+  }
+
+  // Reset input
+  input.value = ''
+}
 
 const mentionItems = vueRef<MentionItem[]>([])
 
@@ -218,7 +311,9 @@ const editor = useEditor({
   ],
   editorProps: {
     handleKeyDown(_view, event) {
-      if (event.key === 'Enter' && !event.shiftKey) {
+      // In minimal mode: Enter sends, Shift+Enter inserts newline
+      // In rich mode: Enter inserts newline (TipTap default), no override
+      if (mode.value === 'minimal' && event.key === 'Enter' && !event.shiftKey) {
         event.preventDefault()
         handleSend()
         return true
@@ -276,9 +371,10 @@ function extractMentions(): MentionData {
 
 function handleSend() {
   const content = getMarkdown().trim()
-  if (!content) return
+  if (!content && pendingAttachmentIds.value.length === 0) return
   const mentions = extractMentions()
-  emit('send', content, mentions)
+  emit('send', content || '', mentions, [...pendingAttachmentIds.value])
+  pendingAttachmentIds.value = []
   editor.value?.commands.clearContent(true)
 }
 

@@ -180,6 +180,40 @@ impl UserDao {
         ))
     }
 
+    /// Batch-fetch display names for a list of user IDs.
+    /// Returns a HashMap mapping ObjectId → display_name.
+    pub async fn find_display_names(
+        &self,
+        user_ids: &[ObjectId],
+    ) -> DaoResult<std::collections::HashMap<ObjectId, String>> {
+        use futures::TryStreamExt;
+        let mut result = std::collections::HashMap::new();
+        if user_ids.is_empty() {
+            return Ok(result);
+        }
+
+        let ids_bson: Vec<bson::Bson> = user_ids.iter().map(|id| bson::Bson::ObjectId(*id)).collect();
+        let filter = doc! {
+            "_id": { "$in": ids_bson },
+            "deleted_at": null,
+        };
+
+        let projection = doc! { "_id": 1, "display_name": 1 };
+        let mut cursor = self
+            .base
+            .collection()
+            .find(filter)
+            .projection(projection)
+            .await?;
+
+        while let Some(user) = cursor.try_next().await? {
+            if let Some(id) = user.id {
+                result.insert(id, user.display_name.clone());
+            }
+        }
+        Ok(result)
+    }
+
     pub async fn update_profile(
         &self,
         user_id: ObjectId,

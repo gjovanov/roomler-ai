@@ -13,16 +13,27 @@ export interface MentionData {
   here: boolean
 }
 
+interface Attachment {
+  file_id: string
+  filename: string
+  content_type: string
+  size: number
+  url: string
+  thumbnail_url?: string
+}
+
 interface Message {
   id: string
   room_id: string
   author_id: string
-  author_name?: string
+  author_name: string
   content: string
   thread_id?: string
   is_thread_root: boolean
   is_pinned: boolean
+  is_edited: boolean
   reaction_summary: Reaction[]
+  attachments: Attachment[]
   mentions?: MentionData
   created_at: string
   updated_at: string
@@ -47,10 +58,13 @@ export const useMessageStore = defineStore('messages', () => {
     }
   }
 
-  async function sendMessage(tenantId: string, roomId: string, content: string, threadId?: string, mentions?: MentionData) {
+  async function sendMessage(tenantId: string, roomId: string, content: string, threadId?: string, mentions?: MentionData, attachmentIds?: string[]) {
     const body: Record<string, unknown> = { content, thread_id: threadId }
     if (mentions && (mentions.users.length > 0 || mentions.everyone || mentions.here)) {
       body.mentions = mentions
+    }
+    if (attachmentIds && attachmentIds.length > 0) {
+      body.attachment_ids = attachmentIds
     }
     const msg = await api.post<Message>(
       `/tenant/${tenantId}/room/${roomId}/message`,
@@ -155,6 +169,18 @@ export const useMessageStore = defineStore('messages', () => {
     }
   }
 
+  function updateMessageFromWs(msg: Message) {
+    const idx = messages.value.findIndex((m) => m.id === msg.id)
+    if (idx !== -1) messages.value[idx] = msg
+    const tidx = threadMessages.value.findIndex((m) => m.id === msg.id)
+    if (tidx !== -1) threadMessages.value[tidx] = msg
+  }
+
+  function removeMessageFromWs(data: { id: string; room_id: string }) {
+    messages.value = messages.value.filter((m) => m.id !== data.id)
+    threadMessages.value = threadMessages.value.filter((m) => m.id !== data.id)
+  }
+
   return {
     messages,
     threadMessages,
@@ -172,5 +198,7 @@ export const useMessageStore = defineStore('messages', () => {
     togglePin,
     fetchThread,
     addMessageFromWs,
+    updateMessageFromWs,
+    removeMessageFromWs,
   }
 })
