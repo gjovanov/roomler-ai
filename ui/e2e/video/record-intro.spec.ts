@@ -458,5 +458,16 @@ test.describe('Roomler Intro Video', () => {
     // Show closing caption with logo visible
     await caption(page, 14)
     await delay(page, 1000)
+
+    // Save the video before Playwright cleans up artifacts
+    const video = page.video()
+    if (video) {
+      const outDir = new URL('./output/', import.meta.url).pathname
+      const { mkdirSync } = await import('fs')
+      mkdirSync(outDir, { recursive: true })
+      await page.close() // flush the video file
+      await video.saveAs(outDir + 'roomler-intro.webm')
+      console.log(`Video saved to: ${outDir}roomler-intro.webm`)
+    }
   })
 })
