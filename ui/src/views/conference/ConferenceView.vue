@@ -212,6 +212,7 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, watch, nextTick, type Component } from 'vue'
+import { storeToRefs } from 'pinia'
 import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { useRoomStore } from '@/stores/rooms'
@@ -235,6 +236,12 @@ const authStore = useAuthStore()
 const roomStore = useRoomStore()
 const wsStore = useWsStore()
 const conferenceStore = useConferenceStore()
+const {
+  localStream,
+  isMuted: isMutedRef,
+  audioLevels: audioLevelsRef,
+  activeSpeakerKey: activeSpeakerKeyRef,
+} = storeToRefs(conferenceStore)
 const pip = usePictureInPicture()
 const audioPlayback = useAudioPlayback()
 
@@ -257,11 +264,11 @@ function getDisplayName(userId: string): string {
 }
 
 const layoutCtrl = useConferenceLayout(
-  conferenceStore.localStream,
+  localStream,
   conferenceStore.remoteStreams,
-  conferenceStore.isMuted,
-  conferenceStore.audioLevels,
-  conferenceStore.activeSpeakerKey,
+  isMutedRef,
+  audioLevelsRef,
+  activeSpeakerKeyRef,
   getDisplayName,
   localDisplayName,
 )
