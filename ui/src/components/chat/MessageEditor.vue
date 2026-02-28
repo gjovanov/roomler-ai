@@ -212,7 +212,7 @@ async function handleFileSelect(event: Event) {
 
     try {
       const result = await api.upload<{ id: string; filename: string; url: string }>(
-        `/tenant/${props.tenantId}/file`,
+        `/tenant/${props.tenantId}/file/upload`,
         formData,
       )
       pendingAttachmentIds.value.push(result.id)

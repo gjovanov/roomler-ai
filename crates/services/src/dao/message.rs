@@ -80,6 +80,15 @@ impl MessageDao {
         };
 
         let id = self.base.insert_one(&message).await?;
+
+        // Mark parent message as thread root when a reply is created
+        if let Some(tid) = thread_id {
+            let _ = self.base.update_one(
+                doc! { "_id": tid, "is_thread_root": false },
+                doc! { "$set": { "is_thread_root": true } },
+            ).await;
+        }
+
         self.base.find_by_id(id).await
     }
 

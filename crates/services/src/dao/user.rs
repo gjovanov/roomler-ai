@@ -181,7 +181,7 @@ impl UserDao {
     }
 
     /// Batch-fetch display names for a list of user IDs.
-    /// Returns a HashMap mapping ObjectId → display_name.
+    /// Returns a HashMap mapping ObjectId → display_name (falls back to username).
     pub async fn find_display_names(
         &self,
         user_ids: &[ObjectId],
@@ -198,17 +198,22 @@ impl UserDao {
             "deleted_at": null,
         };
 
-        let projection = doc! { "_id": 1, "display_name": 1 };
-        let mut cursor = self
-            .base
-            .collection()
+        // Use raw Document to avoid deserialization issues with projection
+        let projection = doc! { "_id": 1, "display_name": 1, "username": 1 };
+        let coll = self.base.collection().clone_with_type::<bson::Document>();
+        let mut cursor = coll
             .find(filter)
             .projection(projection)
             .await?;
 
-        while let Some(user) = cursor.try_next().await? {
-            if let Some(id) = user.id {
-                result.insert(id, user.display_name.clone());
+        while let Some(doc) = cursor.try_next().await? {
+            if let Ok(id) = doc.get_object_id("_id") {
+                let display_name = doc.get_str("display_name").unwrap_or("").to_string();
+                let username = doc.get_str("username").unwrap_or("").to_string();
+                let name = if display_name.is_empty() { username } else { display_name };
+                if !name.is_empty() {
+                    result.insert(id, name);
+                }
             }
         }
         Ok(result)
