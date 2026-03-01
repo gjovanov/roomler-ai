@@ -1,11 +1,13 @@
 use mongodb::Database;
 use roomler2_config::Settings;
 use roomler2_services::{
-    AuthService, GiphyService, OAuthService, RecognitionService, TaskService,
+    AuthService, EmailService, GiphyService, OAuthService, PushService, RecognitionService,
+    TaskService,
     dao::{
         file::FileDao, invite::InviteDao, message::MessageDao, notification::NotificationDao,
-        reaction::ReactionDao, recording::RecordingDao, role::RoleDao, room::RoomDao,
-        tenant::TenantDao, transcription::TranscriptionDao, user::UserDao,
+        push_subscription::PushSubscriptionDao, reaction::ReactionDao, recording::RecordingDao,
+        role::RoleDao, room::RoomDao, tenant::TenantDao, transcription::TranscriptionDao,
+        user::UserDao,
     },
     media::{room_manager::RoomManager, worker_pool::WorkerPool},
 };
@@ -36,6 +38,9 @@ pub struct AppState {
     pub recognition: RecognitionService,
     pub oauth: Option<Arc<OAuthService>>,
     pub giphy: Option<Arc<GiphyService>>,
+    pub email: Option<Arc<EmailService>>,
+    pub push: Option<Arc<PushService>>,
+    pub push_subscriptions: Arc<PushSubscriptionDao>,
     pub transcription_engine: Option<Arc<TranscriptionEngine>>,
 }
 
@@ -72,6 +77,30 @@ impl AppState {
             || !settings.oauth.microsoft.client_id.is_empty()
         {
             Some(Arc::new(OAuthService::new(settings.oauth.clone())))
+        } else {
+            None
+        };
+
+        let email = if !settings.email.api_key.is_empty() {
+            Some(Arc::new(EmailService::new(
+                settings.email.api_key.clone(),
+                settings.email.from_email.clone(),
+                settings.email.from_name.clone(),
+            )))
+        } else {
+            None
+        };
+
+        let push_subscriptions = Arc::new(PushSubscriptionDao::new(&db));
+        let push = if !settings.push.vapid_private_key.is_empty() {
+            match PushService::new(&settings.push.vapid_private_key, settings.push.contact.clone())
+            {
+                Ok(svc) => Some(Arc::new(svc)),
+                Err(e) => {
+                    tracing::warn!("Failed to initialize push service: {}", e);
+                    None
+                }
+            }
         } else {
             None
         };
@@ -124,6 +153,9 @@ impl AppState {
             recognition,
             oauth,
             giphy,
+            email,
+            push,
+            push_subscriptions,
             transcription_engine,
         })
     }

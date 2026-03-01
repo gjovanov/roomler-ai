@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { api } from '@/api/client'
 import router from '@/plugins/router'
+import { subscribePush, unsubscribePush } from '@/composables/usePush'
 
 interface User {
   id: string
@@ -30,6 +31,7 @@ export const useAuthStore = defineStore('auth', () => {
       token.value = data.access_token
       user.value = data.user
       localStorage.setItem('access_token', data.access_token)
+      subscribePush().catch(() => {})
     } catch (e) {
       error.value = (e as Error).message
       throw e
@@ -64,6 +66,7 @@ export const useAuthStore = defineStore('auth', () => {
       token.value = data.access_token
       user.value = data.user
       localStorage.setItem('access_token', data.access_token)
+      subscribePush().catch(() => {})
       return data
     } catch (e) {
       error.value = (e as Error).message
@@ -77,12 +80,14 @@ export const useAuthStore = defineStore('auth', () => {
     if (!token.value) return
     try {
       user.value = await api.get<User>('/auth/me')
+      subscribePush().catch(() => {})
     } catch {
       logout()
     }
   }
 
   function logout() {
+    unsubscribePush().catch(() => {})
     token.value = null
     user.value = null
     localStorage.removeItem('access_token')

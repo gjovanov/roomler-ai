@@ -90,6 +90,9 @@ audiopus = "0.3.0-rc.0"
 rubato = "1"
 hound = "3.5"
 
+# Web Push
+web-push = "0.10"
+
 # Misc
 rand = "0.9"
 base64 = "0.22"

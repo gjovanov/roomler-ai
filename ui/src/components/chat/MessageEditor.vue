@@ -1,5 +1,12 @@
 <template>
-  <div class="message-editor">
+  <div
+    class="message-editor"
+    :class="{ 'message-editor--dragover': isDragging }"
+    @dragover.prevent="isDragging = true"
+    @dragenter.prevent="isDragging = true"
+    @dragleave.prevent="isDragging = false"
+    @drop.prevent="handleDrop"
+  >
     <div class="editor-toolbar d-flex align-center ga-1 px-2 py-1">
       <v-btn
         :icon="mode === 'rich' ? 'mdi-format-text' : 'mdi-format-text'"
@@ -190,6 +197,7 @@ const mode = vueRef<EditorMode>(
 )
 const pendingAttachmentIds = vueRef<string[]>([])
 const fileInputRef = vueRef<HTMLInputElement | null>(null)
+const isDragging = vueRef(false)
 
 function toggleMode() {
   mode.value = mode.value === 'minimal' ? 'rich' : 'minimal'
@@ -230,6 +238,34 @@ async function handleFileSelect(event: Event) {
 
   // Reset input
   input.value = ''
+}
+
+async function handleDrop(event: DragEvent) {
+  isDragging.value = false
+  const files = event.dataTransfer?.files
+  if (!files || files.length === 0 || !props.tenantId) return
+
+  for (const file of Array.from(files)) {
+    const formData = new FormData()
+    formData.append('file', file)
+    if (props.roomId) formData.append('room_id', props.roomId)
+
+    try {
+      const result = await api.upload<{ id: string; filename: string; url: string }>(
+        `/tenant/${props.tenantId}/file/upload`,
+        formData,
+      )
+      pendingAttachmentIds.value.push(result.id)
+
+      if (file.type.startsWith('image/')) {
+        editor.value?.chain().focus().insertContent(`![${file.name}](${result.url})`).run()
+      } else {
+        editor.value?.chain().focus().insertContent(`[${file.name}](${result.url})`).run()
+      }
+    } catch (err) {
+      console.error('File upload failed:', err)
+    }
+  }
 }
 
 const mentionItems = vueRef<MentionItem[]>([])
@@ -414,6 +450,11 @@ onBeforeUnmount(() => {
   border: 1px solid rgba(var(--v-theme-on-surface), 0.2);
   border-radius: 8px;
   overflow: hidden;
+  transition: border-color 0.15s;
+}
+.message-editor--dragover {
+  border-color: rgb(var(--v-theme-primary));
+  background: rgba(var(--v-theme-primary), 0.04);
 }
 .editor-toolbar {
   border-bottom: 1px solid rgba(var(--v-theme-on-surface), 0.08);

@@ -319,6 +319,74 @@ pub async fn call_start(
             }
         });
         crate::ws::dispatcher::broadcast(&state.ws_storage, &member_ids, &event).await;
+
+        // Create persistent call notification for room members (except the starter)
+        let caller_names = state.users.find_display_names(&[auth.user_id]).await.unwrap_or_default();
+        let caller_name = caller_names
+            .get(&auth.user_id)
+            .cloned()
+            .unwrap_or_else(|| auth.user_id.to_hex());
+        let source = roomler2_db::models::NotificationSource {
+            entity_type: "room".to_string(),
+            entity_id: rid,
+            actor_id: Some(auth.user_id),
+        };
+        let link = format!("/tenant/{}/room/{}/call", tenant_id, room_id);
+        for uid in &member_ids {
+            if *uid == auth.user_id { continue; }
+            if let Ok(notification) = state.notifications.create(
+                tid,
+                *uid,
+                roomler2_db::models::NotificationType::Call,
+                format!("Call started in #{}", room_name),
+                format!("{} started a call", caller_name),
+                Some(link.clone()),
+                source.clone(),
+            ).await {
+                let notif_event = serde_json::json!({
+                    "type": "notification:new",
+                    "data": {
+                        "id": notification.id.unwrap().to_hex(),
+                        "title": notification.title,
+                        "body": notification.body,
+                        "link": notification.link,
+                        "notification_type": "call",
+                        "created_at": notification.created_at.try_to_rfc3339_string().unwrap_or_default(),
+                    }
+                });
+                crate::ws::dispatcher::send_to_user(&state.ws_storage, uid, &notif_event).await;
+            }
+        }
+
+        // Send push notifications to offline members
+        if let Some(ref push_svc) = state.push {
+            let offline_ids: Vec<ObjectId> = member_ids
+                .iter()
+                .filter(|uid| **uid != auth.user_id && !state.ws_storage.is_connected(uid))
+                .copied()
+                .collect();
+            if !offline_ids.is_empty() {
+                let push = push_svc.clone();
+                let subs_dao = state.push_subscriptions.clone();
+                let title = format!("Call in #{}", room_name);
+                let body = format!("{} started a call", caller_name);
+                let link = format!("/tenant/{}/room/{}/call", tenant_id, room_id);
+                tokio::spawn(async move {
+                    if let Ok(subs) = subs_dao.find_by_users(&offline_ids).await {
+                        for sub in subs {
+                            let _ = push.send(
+                                &sub.endpoint,
+                                &sub.keys.auth,
+                                &sub.keys.p256dh,
+                                &title,
+                                &body,
+                                Some(&link),
+                            ).await;
+                        }
+                    }
+                });
+            }
+        }
     }
 
     Ok(Json(serde_json::json!({

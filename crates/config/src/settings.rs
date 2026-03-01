@@ -14,6 +14,8 @@ pub struct Settings {
     pub oauth: OAuthSettings,
     pub stripe: StripeSettings,
     pub giphy: GiphySettings,
+    pub email: EmailSettings,
+    pub push: PushSettings,
     pub transcription: TranscriptionSettings,
 }
 
@@ -111,6 +113,20 @@ pub struct GiphySettings {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+pub struct EmailSettings {
+    pub api_key: String,
+    pub from_email: String,
+    pub from_name: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct PushSettings {
+    pub vapid_public_key: String,
+    pub vapid_private_key: String,
+    pub contact: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct TranscriptionSettings {
     pub enabled: bool,
     pub backend: String,
@@ -182,6 +198,12 @@ impl Settings {
             .set_default("stripe.price_pro", "")?
             .set_default("stripe.price_business", "")?
             .set_default("giphy.api_key", "")?
+            .set_default("email.api_key", "")?
+            .set_default("email.from_email", "noreply@roomler.ai")?
+            .set_default("email.from_name", "Roomler")?
+            .set_default("push.vapid_public_key", "")?
+            .set_default("push.vapid_private_key", "")?
+            .set_default("push.contact", "mailto:noreply@roomler.ai")?
             .set_default("transcription.enabled", false)?
             .set_default("transcription.backend", "local_onnx")?
             .set_default("transcription.whisper_model_path", "models/ggml-small.bin")?

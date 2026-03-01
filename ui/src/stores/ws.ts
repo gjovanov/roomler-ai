@@ -99,6 +99,10 @@ export const useWsStore = defineStore('ws', () => {
       case 'message:reaction':
         messageStore.handleReactionFromWs(msg.data as never)
         break
+      case 'call:message:create':
+        // Legacy call chat event — route to message store for backwards compat
+        messageStore.addMessageFromWs(msg.data as never)
+        break
       case 'media:transcript':
         roomStore.addTranscriptFromWs(msg.data as never)
         break

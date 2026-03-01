@@ -134,6 +134,89 @@ export async function sendMessageViaApi(
   return (await resp.json()) as { id: string; content: string; author_id: string }
 }
 
+/** Send a thread reply via the API */
+export async function sendThreadReplyViaApi(
+  token: string,
+  tenantId: string,
+  roomId: string,
+  threadId: string,
+  content: string,
+) {
+  const resp = await fetch(`${API_URL}/api/tenant/${tenantId}/room/${roomId}/message`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ content, thread_id: threadId }),
+  })
+  if (!resp.ok) throw new Error(`Send thread reply failed: ${resp.status}`)
+  return (await resp.json()) as { id: string; content: string; thread_id: string }
+}
+
+/** Add a reaction to a message via the API */
+export async function addReactionViaApi(
+  token: string,
+  tenantId: string,
+  roomId: string,
+  messageId: string,
+  emoji: string,
+) {
+  const resp = await fetch(
+    `${API_URL}/api/tenant/${tenantId}/room/${roomId}/message/${messageId}/reaction`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ emoji }),
+    },
+  )
+  if (!resp.ok) throw new Error(`Add reaction failed: ${resp.status}`)
+  return resp.json()
+}
+
+/** Remove a reaction from a message via the API */
+export async function removeReactionViaApi(
+  token: string,
+  tenantId: string,
+  roomId: string,
+  messageId: string,
+  emoji: string,
+) {
+  const resp = await fetch(
+    `${API_URL}/api/tenant/${tenantId}/room/${roomId}/message/${messageId}/reaction/${encodeURIComponent(emoji)}`,
+    {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${token}` },
+    },
+  )
+  if (!resp.ok) throw new Error(`Remove reaction failed: ${resp.status}`)
+  return resp.json()
+}
+
+/** Fetch messages in a room via the API */
+export async function fetchMessagesViaApi(
+  token: string,
+  tenantId: string,
+  roomId: string,
+) {
+  const resp = await fetch(`${API_URL}/api/tenant/${tenantId}/room/${roomId}/message`, {
+    headers: { Authorization: `Bearer ${token}` },
+  })
+  if (!resp.ok) throw new Error(`Fetch messages failed: ${resp.status}`)
+  return (await resp.json()) as {
+    items: Array<{
+      id: string
+      content: string
+      is_thread_root: boolean
+      reply_count?: number
+      reaction_summary: Array<{ emoji: string; count: number }>
+    }>
+  }
+}
+
 /** Add a user to a tenant via the API */
 export async function addTenantMemberViaApi(
   token: string,

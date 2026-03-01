@@ -286,6 +286,16 @@ fn test_settings() -> Settings {
         giphy: roomler2_config::GiphySettings {
             api_key: String::new(),
         },
+        email: roomler2_config::EmailSettings {
+            api_key: String::new(),
+            from_email: "test@roomler.ai".to_string(),
+            from_name: "Roomler Test".to_string(),
+        },
+        push: roomler2_config::PushSettings {
+            vapid_public_key: String::new(),
+            vapid_private_key: String::new(),
+            contact: "mailto:test@roomler.ai".to_string(),
+        },
         transcription: roomler2_config::TranscriptionSettings {
             enabled: false,
             backend: "local_whisper".to_string(),

@@ -100,7 +100,7 @@
             @play="handlePlayFile"
           />
 
-          <!-- Chat panel -->
+          <!-- Chat panel (unified with room messages) -->
           <div
             v-if="joined && showChat"
             class="chat-panel d-flex flex-column"
@@ -112,51 +112,40 @@
             </v-toolbar>
             <v-divider />
 
-            <!-- Messages list -->
+            <!-- Messages list using shared messageStore -->
             <div ref="chatListRef" class="flex-grow-1 overflow-y-auto pa-3">
               <div
-                v-if="roomStore.chatMessages.length === 0"
+                v-if="messageStore.messages.length === 0"
                 class="text-center text-medium-emphasis mt-4"
               >
                 {{ $t('call.noChatMessages') }}
               </div>
               <div
-                v-for="msg in roomStore.chatMessages"
+                v-for="msg in messageStore.messages"
                 :key="msg.id"
-                class="mb-3"
+                class="mb-2"
               >
-                <div class="d-flex align-start">
-                  <v-avatar size="28" color="primary" class="mr-2 mt-1">
-                    <span class="text-caption">{{ msg.display_name.charAt(0).toUpperCase() }}</span>
-                  </v-avatar>
-                  <div class="flex-grow-1" style="min-width: 0;">
-                    <div class="d-flex align-center ga-2">
-                      <span class="text-subtitle-2 font-weight-bold text-truncate">
-                        {{ msg.display_name }}
-                      </span>
-                      <span class="text-caption text-medium-emphasis flex-shrink-0">
-                        {{ formatTime(msg.created_at) }}
-                      </span>
-                    </div>
-                    <div class="text-body-2" style="word-break: break-word;">{{ msg.content }}</div>
-                  </div>
-                </div>
+                <MessageBubble
+                  :message="msg"
+                  :editable="msg.author_id === currentUserId"
+                  compact
+                  @react="(emoji) => handleReact(msg.id, emoji)"
+                  @edit="(content) => handleEdit(msg.id, content)"
+                  @delete="handleDelete(msg.id)"
+                />
               </div>
             </div>
 
             <v-divider />
 
-            <!-- Chat input -->
+            <!-- Chat input using MessageEditor -->
             <div class="pa-2">
-              <v-text-field
-                v-model="chatInput"
+              <MessageEditor
+                ref="chatEditorRef"
                 :placeholder="$t('call.chatPlaceholder')"
-                variant="outlined"
-                density="compact"
-                hide-details
-                append-inner-icon="mdi-send"
-                @keydown.enter.exact.prevent="handleSendChat"
-                @click:append-inner="handleSendChat"
+                :tenant-id="tenantId"
+                :room-id="roomId"
+                @send="handleSendChat"
               />
             </div>
           </div>
@@ -216,6 +205,7 @@ import { storeToRefs } from 'pinia'
 import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { useRoomStore } from '@/stores/rooms'
+import { useMessageStore } from '@/stores/messages'
 import { useWsStore } from '@/stores/ws'
 import { useConferenceStore } from '@/stores/conference'
 import { useAudioPlayback } from '@/composables/useAudioPlayback'
@@ -226,6 +216,8 @@ import TranscriptionSwitcher from '@/components/conference/TranscriptionSwitcher
 import TranscriptOverlay from '@/components/conference/TranscriptOverlay.vue'
 import TranscriptPanel from '@/components/conference/TranscriptPanel.vue'
 import ConferenceFilesPanel from '@/components/conference/ConferenceFilesPanel.vue'
+import MessageBubble from '@/components/chat/MessageBubble.vue'
+import MessageEditor from '@/components/chat/MessageEditor.vue'
 import TiledLayout from '@/components/conference/layouts/TiledLayout.vue'
 import SpotlightLayout from '@/components/conference/layouts/SpotlightLayout.vue'
 import SidebarLayout from '@/components/conference/layouts/SidebarLayout.vue'
@@ -234,6 +226,7 @@ const route = useRoute()
 const router = useRouter()
 const authStore = useAuthStore()
 const roomStore = useRoomStore()
+const messageStore = useMessageStore()
 const wsStore = useWsStore()
 const conferenceStore = useConferenceStore()
 const {
@@ -253,8 +246,10 @@ const showChat = ref(false)
 const showTranscriptPanel = ref(false)
 const showFiles = ref(false)
 const showSwitchDialog = ref(false)
-const chatInput = ref('')
+const chatEditorRef = ref<InstanceType<typeof MessageEditor> | null>(null)
 const chatListRef = ref<HTMLElement | null>(null)
+
+const currentUserId = computed(() => authStore.user?.id)
 
 const localDisplayName = computed(() => authStore.user?.display_name ?? 'You')
 
@@ -352,22 +347,32 @@ function scrollChatToBottom() {
 
 // Auto-scroll when new messages arrive
 watch(
-  () => roomStore.chatMessages.length,
+  () => messageStore.messages.length,
   async () => {
     await nextTick()
     scrollChatToBottom()
   },
 )
 
-async function handleSendChat() {
-  const content = chatInput.value.trim()
+async function handleSendChat(content: string) {
   if (!content) return
-  chatInput.value = ''
   try {
-    await roomStore.sendChatMessage(tenantId.value, roomId.value, content)
+    await messageStore.sendMessage(tenantId.value, roomId.value, content)
   } catch (err) {
     console.error('Failed to send chat message:', err)
   }
+}
+
+async function handleReact(messageId: string, emoji: string) {
+  await messageStore.toggleReaction(tenantId.value, roomId.value, messageId, emoji)
+}
+
+async function handleEdit(messageId: string, content: string) {
+  await messageStore.editMessage(tenantId.value, roomId.value, messageId, content)
+}
+
+async function handleDelete(messageId: string) {
+  await messageStore.deleteMessage(tenantId.value, roomId.value, messageId)
 }
 
 async function confirmSwitch() {
@@ -396,7 +401,7 @@ async function handleJoin() {
     showChat.value = true
     conferenceStore.startActiveSpeaker()
     wsStore.onMediaMessage('media:audio_playback', audioPlayback.handlePlaybackMessage)
-    roomStore.fetchChatMessages(tenantId.value, roomId.value).catch(() => {})
+    messageStore.fetchMessages(tenantId.value, roomId.value).catch(() => {})
     await roomStore.fetchParticipants(tenantId.value, roomId.value)
     return
   }
@@ -416,7 +421,7 @@ async function doJoin() {
     await conferenceStore.joinRoom(tenantId.value, roomId.value, rName)
     await conferenceStore.produceLocalMedia()
     await roomStore.fetchParticipants(tenantId.value, roomId.value)
-    roomStore.fetchChatMessages(tenantId.value, roomId.value).catch(() => {})
+    messageStore.fetchMessages(tenantId.value, roomId.value).catch(() => {})
 
     joined.value = true
     showChat.value = true
@@ -445,7 +450,6 @@ async function handleLeave() {
 
   // Leave via conference store (tears down mediasoup)
   conferenceStore.leaveRoom()
-  roomStore.clearChatMessages()
   roomStore.clearTranscript()
   roomStore.setTranscriptionEnabled(false)
   roomStore.clearRoomFiles()
@@ -504,7 +508,7 @@ onMounted(async () => {
     showChat.value = true
     conferenceStore.startActiveSpeaker()
     wsStore.onMediaMessage('media:audio_playback', audioPlayback.handlePlaybackMessage)
-    roomStore.fetchChatMessages(tenantId.value, roomId.value).catch(() => {})
+    messageStore.fetchMessages(tenantId.value, roomId.value).catch(() => {})
     await roomStore.fetchParticipants(tenantId.value, roomId.value)
   }
 })

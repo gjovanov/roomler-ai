@@ -36,3 +36,4 @@ nanoid.workspace = true
 hmac.workspace = true
 sha2.workspace = true
 hex.workspace = true
+web-push.workspace = true

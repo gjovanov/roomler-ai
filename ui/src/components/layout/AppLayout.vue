@@ -69,6 +69,32 @@
       </v-app-bar-title>
 
       <template #append>
+        <!-- Active call indicator -->
+        <v-menu v-if="activeCallRooms.length > 0">
+          <template #activator="{ props: callMenuProps }">
+            <v-btn
+              v-bind="callMenuProps"
+              size="small"
+              variant="tonal"
+              color="success"
+              class="call-pulse mr-2"
+            >
+              <v-icon start>mdi-phone-ring</v-icon>
+              {{ activeCallRooms.length }}
+            </v-btn>
+          </template>
+          <v-list density="compact">
+            <v-list-subheader>Active Calls</v-list-subheader>
+            <v-list-item
+              v-for="room in activeCallRooms"
+              :key="room.id"
+              :title="room.name"
+              :subtitle="`${room.participant_count} participant${room.participant_count !== 1 ? 's' : ''}`"
+              prepend-icon="mdi-video"
+              @click="router.push({ name: 'room-call', params: { tenantId: tenantId, roomId: room.id } })"
+            />
+          </v-list>
+        </v-menu>
         <v-btn icon="mdi-magnify" size="small" />
         <v-btn
           :icon="isDark ? 'mdi-weather-sunny' : 'mdi-weather-night'"
@@ -127,6 +153,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { useTheme } from 'vuetify'
 import { useAuth } from '@/composables/useAuth'
 import { useTenantStore } from '@/stores/tenant'
+import { useRoomStore } from '@/stores/rooms'
 import { useNotificationStore } from '@/stores/notification'
 import { useConferenceStore } from '@/stores/conference'
 import NotificationPanel from '@/components/layout/NotificationPanel.vue'
@@ -134,6 +161,7 @@ import MiniConference from '@/components/conference/MiniConference.vue'
 
 const { auth, logout: handleLogout } = useAuth()
 const tenantStore = useTenantStore()
+const roomStore = useRoomStore()
 const notificationStore = useNotificationStore()
 const conferenceStore = useConferenceStore()
 const route = useRoute()
@@ -141,6 +169,13 @@ const router = useRouter()
 const theme = useTheme()
 
 const isOnCallPage = computed(() => route.name === 'room-call')
+
+// Active calls across all rooms (excluding the one the user is currently in)
+const activeCallRooms = computed(() =>
+  roomStore.rooms.filter(
+    (r) => r.conference_status === 'InProgress' && r.id !== conferenceStore.roomId,
+  ),
+)
 
 function returnToCall() {
   if (conferenceStore.tenantId && conferenceStore.roomId) {
@@ -236,3 +271,13 @@ onUnmounted(() => {
   window.removeEventListener('room:call_started', onCallStarted)
 })
 </script>
+
+<style scoped>
+.call-pulse {
+  animation: pulse-green 2s ease-in-out infinite;
+}
+@keyframes pulse-green {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(76, 175, 80, 0.4); }
+  50% { box-shadow: 0 0 0 8px rgba(76, 175, 80, 0); }
+}
+</style>

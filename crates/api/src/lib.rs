@@ -160,6 +160,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/search", get(routes::giphy::search))
         .route("/trending", get(routes::giphy::trending));
 
+    // Push notification routes (user-scoped, no tenant prefix)
+    let push_routes = Router::new()
+        .route("/config", get(routes::push::config))
+        .route("/subscribe", post(routes::push::subscribe))
+        .route("/unsubscribe", post(routes::push::unsubscribe));
+
     // Notification routes (user-scoped, no tenant prefix)
     let notification_routes = Router::new()
         .route("/", get(routes::notification::list))
@@ -181,6 +187,7 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/stripe", stripe_routes)
         .nest("/invite", public_invite_routes)
         .nest("/giphy", giphy_routes)
+        .nest("/push", push_routes)
         .nest("/notification", notification_routes)
         .nest("/tenant", tenant_routes)
         .nest("/tenant/{tenant_id}/member", member_routes)

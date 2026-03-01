@@ -239,6 +239,8 @@ pub async fn create_invite(
 
     let expires_in_hours = body.expires_in_hours.or(Some(168)); // default 7 days
 
+    let target_email = body.target_email.clone();
+
     let invite = state
         .invites
         .create(
@@ -252,6 +254,30 @@ pub async fn create_invite(
             },
         )
         .await?;
+
+    // Send invite email if target_email is set and email service is configured
+    if let (Some(email_addr), Some(email_svc)) = (&target_email, &state.email) {
+        let inviter = state.users.base.find_by_id(auth.user_id).await.ok();
+        let inviter_name = inviter.map(|u| u.display_name).unwrap_or_default();
+        let tenant = state.tenants.base.find_by_id(tid).await.ok();
+        let tenant_name = tenant.map(|t| t.name).unwrap_or_default();
+        let invite_url = format!(
+            "{}/invite/{}",
+            state.settings.oauth.base_url,
+            invite.code,
+        );
+        let email_svc = email_svc.clone();
+        let email_addr = email_addr.clone();
+        // Fire-and-forget — don't block the response on email delivery
+        tokio::spawn(async move {
+            if let Err(e) = email_svc
+                .send_invite(&email_addr, &inviter_name, &tenant_name, &invite_url)
+                .await
+            {
+                tracing::warn!(%e, "Failed to send invite email");
+            }
+        });
+    }
 
     Ok((StatusCode::CREATED, Json(invite_to_response(invite))))
 }

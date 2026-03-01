@@ -9,6 +9,7 @@ pub mod invite;
 pub mod message;
 pub mod notification;
 pub mod oauth;
+pub mod push;
 pub mod reaction;
 pub mod recording;
 pub mod role;

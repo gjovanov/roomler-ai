@@ -101,6 +101,36 @@ export const useConferenceStore = defineStore('conference', () => {
         )
       : undefined
     const iceTransportPolicy = forceRelay ? 'relay' : 'all'
+    console.log('[conference] ICE config:', { iceServers, iceTransportPolicy, forceRelay })
+
+    // Log server-provided ICE candidates
+    for (const label of ['send_transport', 'recv_transport'] as const) {
+      const tp = transportMsg[label]
+      if (tp?.ice_candidates) {
+        for (const c of tp.ice_candidates) {
+          console.log(`[conference] ${label} ICE candidate:`, {
+            protocol: c.protocol, address: c.address ?? c.ip,
+            port: c.port, type: c.type, tcpType: c.tcpType,
+          })
+        }
+      }
+    }
+
+    // Helper to dump ICE stats for a transport
+    async function dumpTransportStats(transport: msTypes.Transport, label: string) {
+      try {
+        const stats = await transport.getStats()
+        stats.forEach((report: Record<string, unknown>) => {
+          if (
+            report.type === 'candidate-pair' ||
+            report.type === 'local-candidate' ||
+            report.type === 'remote-candidate'
+          ) {
+            console.log(`[conference] ${label} stats:`, report)
+          }
+        })
+      } catch { /* stats not available */ }
+    }
 
     // Create send transport
     const sendParams = transportMsg.send_transport
@@ -115,21 +145,9 @@ export const useConferenceStore = defineStore('conference', () => {
 
     st.on('connectionstatechange', async (state: string) => {
       console.log('[conference] sendTransport connectionState:', state)
-      if (state === 'failed') {
-        try {
-          const stats = await st.getStats()
-          stats.forEach((report: Record<string, unknown>) => {
-            if (
-              report.type === 'candidate-pair' ||
-              report.type === 'local-candidate' ||
-              report.type === 'remote-candidate'
-            ) {
-              console.log('[conference] sendTransport stats:', report)
-            }
-          })
-        } catch {
-          /* stats not available */
-        }
+      if (state === 'connecting' || state === 'failed' || state === 'disconnected') {
+        // Dump stats after a brief delay to let candidates gather
+        setTimeout(() => dumpTransportStats(st, 'sendTransport'), state === 'connecting' ? 3000 : 0)
       }
     })
 
@@ -173,27 +191,14 @@ export const useConferenceStore = defineStore('conference', () => {
 
     rt.on('connectionstatechange', async (state: string) => {
       console.log('[conference] recvTransport connectionState:', state)
-      if (state === 'failed') {
-        try {
-          const stats = await rt.getStats()
-          stats.forEach((report: Record<string, unknown>) => {
-            if (
-              report.type === 'candidate-pair' ||
-              report.type === 'local-candidate' ||
-              report.type === 'remote-candidate'
-            ) {
-              console.log('[conference] recvTransport stats:', report)
-            }
-          })
-        } catch {
-          /* stats not available */
-        }
+      if (state === 'connecting' || state === 'failed' || state === 'disconnected') {
+        setTimeout(() => dumpTransportStats(rt, 'recvTransport'), state === 'connecting' ? 3000 : 0)
       }
     })
 
     rt.on('connect', ({ dtlsParameters }, callback) => {
       ws.send('media:connect_transport', {
-        room_id: rt.id,
+        room_id: rid,
         transport_id: rt.id,
         dtls_parameters: dtlsParameters,
       })

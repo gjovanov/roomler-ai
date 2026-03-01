@@ -47,11 +47,11 @@ test.describe('Room Call Chat', () => {
 
     // Click the chat toggle to hide
     await page.locator('button:has(.mdi-message-text)').first().click()
-    await expect(page.getByText('No messages yet')).not.toBeVisible()
+    await expect(page.locator('.tiptap')).not.toBeVisible()
 
     // Click again to show
     await page.locator('button:has(.mdi-message-text-outline)').first().click()
-    await expect(page.getByText('No messages yet')).toBeVisible()
+    await expect(page.locator('.tiptap')).toBeVisible()
   })
 
   test('send and receive room call chat message', async ({ page, context }) => {
@@ -62,10 +62,12 @@ test.describe('Room Call Chat', () => {
     await page.getByRole('button', { name: /join/i }).click()
     await expect(page.getByText('Chat')).toBeVisible({ timeout: 15000 })
 
-    // Type and send a message
-    const chatInput = page.getByPlaceholder('Type a message...')
-    await chatInput.fill('Hello from E2E!')
-    await chatInput.press('Enter')
+    // Type into the TipTap editor (unified chat uses MessageEditor with TipTap)
+    const editor = page.locator('.tiptap').first()
+    await expect(editor).toBeVisible({ timeout: 5000 })
+    await editor.click()
+    await editor.pressSequentially('Hello from E2E!')
+    await editor.press('Enter')
 
     // Verify the message appears in the chat panel
     await expect(page.getByText('Hello from E2E!')).toBeVisible({ timeout: 5000 })

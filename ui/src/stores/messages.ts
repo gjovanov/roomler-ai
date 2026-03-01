@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { api } from '@/api/client'
+import { useAuthStore } from './auth'
 
 interface Reaction {
   emoji: string
@@ -35,6 +36,8 @@ interface Message {
   reaction_summary: Reaction[]
   attachments: Attachment[]
   mentions?: MentionData
+  reply_count?: number
+  last_reply_at?: string
   created_at: string
   updated_at: string
 }
@@ -94,19 +97,50 @@ export const useMessageStore = defineStore('messages', () => {
   }
 
   async function addReaction(tenantId: string, roomId: string, messageId: string, emoji: string) {
-    await api.post(`/tenant/${tenantId}/room/${roomId}/message/${messageId}/reaction`, {
-      emoji,
-    })
+    // Optimistically update reaction_summary on the message
+    const updateSummary = (list: Message[]) => {
+      const msg = list.find((m) => m.id === messageId)
+      if (!msg) return
+      const existing = msg.reaction_summary.find((r) => r.emoji === emoji)
+      if (existing) {
+        existing.count++
+      } else {
+        msg.reaction_summary.push({ emoji, count: 1 })
+      }
+    }
+    updateSummary(messages.value)
+    updateSummary(threadMessages.value)
+
     // Track locally
     if (!userReactions.value[messageId]) {
       userReactions.value[messageId] = new Set()
     }
     userReactions.value[messageId].add(emoji)
+
+    await api.post(`/tenant/${tenantId}/room/${roomId}/message/${messageId}/reaction`, {
+      emoji,
+    })
   }
 
   async function removeReaction(tenantId: string, roomId: string, messageId: string, emoji: string) {
-    await api.delete(`/tenant/${tenantId}/room/${roomId}/message/${messageId}/reaction/${encodeURIComponent(emoji)}`)
+    // Optimistically update reaction_summary
+    const updateSummary = (list: Message[]) => {
+      const msg = list.find((m) => m.id === messageId)
+      if (!msg) return
+      const existing = msg.reaction_summary.find((r) => r.emoji === emoji)
+      if (existing) {
+        existing.count--
+        if (existing.count <= 0) {
+          msg.reaction_summary = msg.reaction_summary.filter((r) => r.emoji !== emoji)
+        }
+      }
+    }
+    updateSummary(messages.value)
+    updateSummary(threadMessages.value)
+
     userReactions.value[messageId]?.delete(emoji)
+
+    await api.delete(`/tenant/${tenantId}/room/${roomId}/message/${messageId}/reaction/${encodeURIComponent(emoji)}`)
   }
 
   function hasUserReacted(messageId: string, emoji: string): boolean {
@@ -122,6 +156,10 @@ export const useMessageStore = defineStore('messages', () => {
   }
 
   function handleReactionFromWs(data: { action: string; message_id: string; emoji: string; user_id: string }) {
+    // Skip if this reaction was from the current user — already optimistically updated
+    const authStore = useAuthStore()
+    if (data.user_id === authStore.user?.id) return
+
     const updateList = (list: Message[]) => {
       const msg = list.find((m) => m.id === data.message_id)
       if (!msg) return

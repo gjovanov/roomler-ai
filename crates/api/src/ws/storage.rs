@@ -58,6 +58,14 @@ impl WsStorage {
             .map(|entry| entry.value().1.clone())
     }
 
+    /// Check if a user has any active WebSocket connections.
+    pub fn is_connected(&self, user_id: &ObjectId) -> bool {
+        self.connections
+            .get(user_id)
+            .map(|s| !s.is_empty())
+            .unwrap_or(false)
+    }
+
     pub fn all_user_ids(&self) -> Vec<ObjectId> {
         self.connections.iter().map(|r| *r.key()).collect()
     }

@@ -81,12 +81,9 @@ impl MessageDao {
 
         let id = self.base.insert_one(&message).await?;
 
-        // Mark parent message as thread root when a reply is created
-        if let Some(tid) = thread_id {
-            let _ = self.base.update_one(
-                doc! { "_id": tid, "is_thread_root": false },
-                doc! { "$set": { "is_thread_root": true } },
-            ).await;
+        // Update thread metadata on parent message when a thread reply is created
+        if let Some(parent_id) = thread_id {
+            let _ = self.update_thread_metadata(parent_id, author_id).await;
         }
 
         self.base.find_by_id(id).await
@@ -168,6 +165,32 @@ impl MessageDao {
             .update_one(
                 doc! { "_id": message_id, "tenant_id": tenant_id },
                 doc! { "$set": { "is_pinned": pinned } },
+            )
+            .await
+    }
+
+    /// Atomically update thread metadata on the parent message when a reply is created.
+    pub async fn update_thread_metadata(
+        &self,
+        parent_id: ObjectId,
+        reply_author_id: ObjectId,
+    ) -> DaoResult<bool> {
+        self.base
+            .update_one(
+                doc! { "_id": parent_id },
+                doc! {
+                    "$set": {
+                        "is_thread_root": true,
+                        "thread_metadata.last_reply_at": DateTime::now(),
+                        "thread_metadata.last_reply_user_id": reply_author_id,
+                    },
+                    "$inc": {
+                        "thread_metadata.reply_count": 1_i32,
+                    },
+                    "$addToSet": {
+                        "thread_metadata.participant_ids": reply_author_id,
+                    },
+                },
             )
             .await
     }
