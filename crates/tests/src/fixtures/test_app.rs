@@ -211,6 +211,7 @@ fn test_settings() -> Settings {
             port: 0,
             static_dir: None,
             cors_origins: vec![],
+            frontend_url: "http://localhost:5173".to_string(),
         },
         database: roomler2_config::DatabaseSettings {
             url: "mongodb://localhost:27019".to_string(),
@@ -290,6 +291,7 @@ fn test_settings() -> Settings {
             api_key: String::new(),
             from_email: "test@roomler.ai".to_string(),
             from_name: "Roomler Test".to_string(),
+            activation_token_ttl_minutes: 5,
         },
         push: roomler2_config::PushSettings {
             vapid_public_key: String::new(),

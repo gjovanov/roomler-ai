@@ -4251,6 +4251,7 @@ dependencies = [
  "jsonwebtoken",
  "mediasoup",
  "mongodb",
+ "nanoid",
  "redis",
  "roomler2-config",
  "roomler2-db",

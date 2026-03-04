@@ -4,6 +4,7 @@ use roomler2_services::{
     AuthService, EmailService, GiphyService, OAuthService, PushService, RecognitionService,
     TaskService,
     dao::{
+        activation_code::ActivationCodeDao,
         file::FileDao, invite::InviteDao, message::MessageDao, notification::NotificationDao,
         push_subscription::PushSubscriptionDao, reaction::ReactionDao, recording::RecordingDao,
         role::RoleDao, room::RoomDao, tenant::TenantDao, transcription::TranscriptionDao,
@@ -22,6 +23,7 @@ pub struct AppState {
     pub settings: Settings,
     pub auth: Arc<AuthService>,
     pub users: Arc<UserDao>,
+    pub activation_codes: Arc<ActivationCodeDao>,
     pub tenants: Arc<TenantDao>,
     pub rooms: Arc<RoomDao>,
     pub invites: Arc<InviteDao>,
@@ -48,6 +50,7 @@ impl AppState {
     pub async fn new(db: Database, settings: Settings) -> anyhow::Result<Self> {
         let auth = Arc::new(AuthService::new(settings.jwt.clone()));
         let users = Arc::new(UserDao::new(&db));
+        let activation_codes = Arc::new(ActivationCodeDao::new(&db));
         let tenants = Arc::new(TenantDao::new(&db));
         let rooms = Arc::new(RoomDao::new(&db));
         let invites = Arc::new(InviteDao::new(&db));
@@ -137,6 +140,7 @@ impl AppState {
             settings,
             auth,
             users,
+            activation_codes,
             tenants,
             rooms,
             invites,

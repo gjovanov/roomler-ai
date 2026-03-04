@@ -41,6 +41,7 @@ pub struct AppSettings {
     pub port: u16,
     pub static_dir: Option<String>,
     pub cors_origins: Vec<String>,
+    pub frontend_url: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -117,6 +118,7 @@ pub struct EmailSettings {
     pub api_key: String,
     pub from_email: String,
     pub from_name: String,
+    pub activation_token_ttl_minutes: u64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -158,6 +160,7 @@ impl Settings {
             .set_default("app.host", "0.0.0.0")?
             .set_default("app.port", 3000)?
             .set_default("app.cors_origins", Vec::<String>::new())?
+            .set_default("app.frontend_url", "http://localhost:5173")?
             .set_default("database.url", "mongodb://localhost:27019")?
             .set_default("database.name", "roomler2")?
             .set_default("jwt.secret", "change-me-in-production")?
@@ -201,6 +204,7 @@ impl Settings {
             .set_default("email.api_key", "")?
             .set_default("email.from_email", "noreply@roomler.ai")?
             .set_default("email.from_name", "Roomler")?
+            .set_default("email.activation_token_ttl_minutes", 5u64)?
             .set_default("push.vapid_public_key", "")?
             .set_default("push.vapid_private_key", "")?
             .set_default("push.contact", "mailto:noreply@roomler.ai")?

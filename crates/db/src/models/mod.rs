@@ -35,3 +35,6 @@ pub use tenant::*;
 pub use tenant_member::*;
 pub use transcription::*;
 pub use user::*;
+
+pub mod activation_code;
+pub use activation_code::*;

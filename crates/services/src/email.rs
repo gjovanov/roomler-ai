@@ -151,6 +151,54 @@ impl EmailService {
         self.send(to_email, &subject, &html).await
     }
 
+    /// Send an account activation email with a verification link.
+    pub async fn send_activation(
+        &self,
+        to_email: &str,
+        display_name: &str,
+        activation_url: &str,
+        ttl_minutes: u64,
+    ) -> anyhow::Result<()> {
+        let subject = "Activate your Roomler account".to_string();
+        let html = format!(
+            r#"<div style="font-family: sans-serif; max-width: 600px; margin: 0 auto;">
+<h2>Welcome, {name}!</h2>
+<p>Please activate your account by clicking the button below. This link expires in {ttl} minutes.</p>
+<p style="margin: 32px 0;">
+  <a href="{url}" style="background: #1976d2; color: #fff; padding: 12px 24px; border-radius: 6px; text-decoration: none; font-weight: bold;">
+    Activate Account
+  </a>
+</p>
+<p style="color: #666; font-size: 13px;">Or copy this link: <a href="{url}">{url}</a></p>
+<p style="color: #999; font-size: 12px; margin-top: 32px;">If you did not create an account, please ignore this email.</p>
+</div>"#,
+            name = display_name,
+            url = activation_url,
+            ttl = ttl_minutes,
+        );
+        self.send(to_email, &subject, &html).await
+    }
+
+    /// Send account activation success email.
+    pub async fn send_activation_success(
+        &self,
+        to_email: &str,
+        display_name: &str,
+        login_url: &str,
+    ) -> anyhow::Result<()> {
+        let subject = "Your Roomler account is active".to_string();
+        let html = format!(
+            r#"<div style="font-family: sans-serif; max-width: 600px; margin: 0 auto;">
+<h2>Account activated, {name}!</h2>
+<p>Your Roomler account is now active. You can <a href="{url}">sign in here</a>.</p>
+<p style="color: #999; font-size: 12px; margin-top: 32px;">— The Roomler Team</p>
+</div>"#,
+            name = display_name,
+            url = login_url,
+        );
+        self.send(to_email, &subject, &html).await
+    }
+
     /// Send a welcome email after registration.
     pub async fn send_welcome(
         &self,

@@ -1,6 +1,7 @@
 use axum::{Json, extract::State, http::{HeaderMap, StatusCode, header}};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
+use nanoid::nanoid;
 
 use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
 
@@ -42,6 +43,17 @@ pub struct UserResponse {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct ActivateRequest {
+    pub user_id: String,
+    pub token: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MessageResponse {
+    pub message: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct LoginRequest {
     #[serde(default)]
     pub username: Option<String>,
@@ -72,6 +84,34 @@ pub async fn register(
         .await?;
 
     let user_id = user.id.unwrap();
+
+    // Generate activation code and send email
+    let token = nanoid!(7);
+    if let Err(e) = state
+        .activation_codes
+        .create(user_id, token.clone(), state.settings.email.activation_token_ttl_minutes)
+        .await
+    {
+        warn!("Failed to create activation code: {:?}", e);
+    } else if let Some(ref email_svc) = state.email {
+        let activation_url = format!(
+            "{}/auth/activate?userId={}&token={}",
+            state.settings.app.frontend_url,
+            user_id.to_hex(),
+            token
+        );
+        if let Err(e) = email_svc
+            .send_activation(
+                &body.email,
+                &body.display_name,
+                &activation_url,
+                state.settings.email.activation_token_ttl_minutes,
+            )
+            .await
+        {
+            warn!("Failed to send activation email: {:?}", e);
+        }
+    }
 
     // Create a default tenant if requested
     if let (Some(tenant_name), Some(tenant_slug)) = (body.tenant_name, body.tenant_slug) {
@@ -233,6 +273,49 @@ pub async fn refresh(
     };
 
     Ok((headers, Json(response)))
+}
+
+pub async fn activate(
+    State(state): State<AppState>,
+    Json(body): Json<ActivateRequest>,
+) -> Result<Json<MessageResponse>, ApiError> {
+    let user_id = bson::oid::ObjectId::parse_str(&body.user_id)
+        .map_err(|_| ApiError::BadRequest("Invalid user ID".to_string()))?;
+
+    let _code = state
+        .activation_codes
+        .find_valid(user_id, &body.token)
+        .await
+        .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::BadRequest("Invalid or expired activation token".to_string()))?;
+
+    // Activate the user
+    state
+        .users
+        .base
+        .update_by_id(user_id, bson::doc! { "$set": { "is_verified": true } })
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to activate user: {}", e)))?;
+
+    // Delete used activation code
+    let _ = state.activation_codes.delete_for_user(user_id).await;
+
+    // Send success email (non-fatal)
+    if let Some(ref email_svc) = state.email {
+        let user = state.users.base.find_by_id(user_id).await
+            .map_err(|e| ApiError::Internal(format!("User not found: {}", e)))?;
+        let login_url = format!("{}/auth/login", state.settings.app.frontend_url);
+        if let Err(e) = email_svc
+            .send_activation_success(&user.email, &user.display_name, &login_url)
+            .await
+        {
+            warn!("Failed to send activation success email: {:?}", e);
+        }
+    }
+
+    Ok(Json(MessageResponse {
+        message: "Account activated successfully. You can now sign in.".to_string(),
+    }))
 }
 
 /// Auto-accept an invite for a newly registered user.

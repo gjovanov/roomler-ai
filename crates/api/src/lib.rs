@@ -28,6 +28,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/login", post(routes::auth::login))
         .route("/logout", post(routes::auth::logout))
         .route("/refresh", post(routes::auth::refresh))
+        .route("/activate", post(routes::auth::activate))
         .route("/me", get(routes::auth::me))
         .route("/me", put(routes::auth::me));
 
