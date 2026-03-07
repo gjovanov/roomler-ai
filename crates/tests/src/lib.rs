@@ -28,4 +28,6 @@ mod pdf_export_tests;
 #[cfg(test)]
 mod invite_tests;
 #[cfg(test)]
+mod member_tests;
+#[cfg(test)]
 mod oauth_tests;

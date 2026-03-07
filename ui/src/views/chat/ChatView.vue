@@ -185,6 +185,7 @@ async function fetchRoomMembers() {
       id: m.id,
       user_id: m.user_id,
       display_name: m.display_name,
+      username: m.username,
     }))
   } catch {
     // members list not critical

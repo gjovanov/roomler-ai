@@ -28,6 +28,8 @@ export interface Participant {
   id: string
   user_id?: string
   display_name: string
+  username?: string
+  avatar?: string
   is_muted: boolean
   is_video_on: boolean
   is_screen_sharing: boolean
@@ -159,7 +161,10 @@ export const useRoomStore = defineStore('rooms', () => {
 
   // --- Members ---
   async function fetchMembers(tenantId: string, roomId: string) {
-    return api.get<Participant[]>(`/tenant/${tenantId}/room/${roomId}/member`)
+    const data = await api.get<{ items: Participant[] }>(
+      `/tenant/${tenantId}/room/${roomId}/member`,
+    )
+    return data.items
   }
 
   // --- In-call chat ---

@@ -116,7 +116,8 @@ async fn update_message() {
 
     assert_eq!(resp.status().as_u16(), 200);
     let json: Value = resp.json().await.unwrap();
-    assert_eq!(json["updated"], true);
+    assert_eq!(json["content"], "Updated message");
+    assert_eq!(json["is_edited"], true);
 }
 
 #[tokio::test]

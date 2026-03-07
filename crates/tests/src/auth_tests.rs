@@ -3,7 +3,7 @@ use jsonwebtoken::{EncodingKey, Header};
 use serde_json::Value;
 
 #[tokio::test]
-async fn register_creates_user_and_returns_tokens() {
+async fn register_creates_user_and_returns_activation_message() {
     let app = TestApp::spawn().await;
 
     let resp = app
@@ -22,11 +22,7 @@ async fn register_creates_user_and_returns_tokens() {
     assert_eq!(resp.status().as_u16(), 201);
 
     let json: Value = resp.json().await.unwrap();
-    assert!(json["access_token"].is_string());
-    assert!(json["refresh_token"].is_string());
-    assert_eq!(json["user"]["email"], "alice@test.com");
-    assert_eq!(json["user"]["username"], "alice");
-    assert_eq!(json["user"]["display_name"], "Alice");
+    assert!(json["message"].is_string(), "Register should return activation message");
 }
 
 #[tokio::test]
@@ -49,7 +45,20 @@ async fn register_with_tenant_creates_tenant() {
         .unwrap();
 
     assert_eq!(resp.status().as_u16(), 201);
-    let auth: Value = resp.json().await.unwrap();
+
+    // Activate and login to get token
+    app.activate_user("bob@test.com").await;
+    let login_resp = app
+        .client
+        .post(app.url("/api/auth/login"))
+        .json(&serde_json::json!({
+            "email": "bob@test.com",
+            "password": "Password123!",
+        }))
+        .send()
+        .await
+        .unwrap();
+    let auth: Value = login_resp.json().await.unwrap();
     let token = auth["access_token"].as_str().unwrap();
 
     // Verify tenant was created
@@ -115,6 +124,9 @@ async fn login_with_valid_credentials_succeeds() {
         .await
         .unwrap();
 
+    // Activate user
+    app.activate_user("login@test.com").await;
+
     // Login
     let resp = app
         .client
@@ -135,6 +147,38 @@ async fn login_with_valid_credentials_succeeds() {
 }
 
 #[tokio::test]
+async fn login_without_activation_fails() {
+    let app = TestApp::spawn().await;
+
+    // Register but do NOT activate
+    app.client
+        .post(app.url("/api/auth/register"))
+        .json(&serde_json::json!({
+            "email": "unactivated@test.com",
+            "username": "unactivated",
+            "display_name": "Unactivated",
+            "password": "Password123!",
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    // Login should fail with 401
+    let resp = app
+        .client
+        .post(app.url("/api/auth/login"))
+        .json(&serde_json::json!({
+            "email": "unactivated@test.com",
+            "password": "Password123!",
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status().as_u16(), 401);
+}
+
+#[tokio::test]
 async fn login_with_wrong_password_fails() {
     let app = TestApp::spawn().await;
 
@@ -150,6 +194,8 @@ async fn login_with_wrong_password_fails() {
         .send()
         .await
         .unwrap();
+
+    app.activate_user("wrongpw@test.com").await;
 
     // Login with wrong password
     let resp = app
@@ -293,8 +339,9 @@ async fn login_with_username_only_succeeds() {
         .unwrap();
     assert_eq!(resp.status().as_u16(), 201, "Registration should succeed");
 
+    app.activate_user("usernameonly@test.com").await;
+
     // Login with username only (no email field in the JSON body).
-    // This validates the #[serde(default)] fix on LoginRequest's Optional fields.
     let resp = app
         .client
         .post(app.url("/api/auth/login"))
@@ -332,8 +379,9 @@ async fn login_with_email_only_no_username_field() {
         .unwrap();
     assert_eq!(resp.status().as_u16(), 201, "Registration should succeed");
 
+    app.activate_user("emailonly@test.com").await;
+
     // Login with email only (no username field in the JSON body).
-    // This also validates the #[serde(default)] fix.
     let resp = app
         .client
         .post(app.url("/api/auth/login"))

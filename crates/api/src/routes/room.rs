@@ -647,7 +647,7 @@ fn to_response(r: roomler2_db::models::Room) -> RoomResponse {
         member_count: r.member_count,
         message_count: r.message_count,
         has_media: r.media_settings.is_some(),
-        conference_status: r.conference_status.map(|s| format!("{:?}", s)),
+        conference_status: r.conference_status,
         meeting_code: r.meeting_code,
         participant_count: r.participant_count,
     }

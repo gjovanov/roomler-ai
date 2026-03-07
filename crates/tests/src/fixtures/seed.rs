@@ -57,14 +57,24 @@ impl TestApp {
             .await
             .expect("Register request failed");
 
-        assert_eq!(
-            resp.status().as_u16(),
-            201,
-            "Register failed: {}",
-            resp.text().await.unwrap_or_default()
-        );
+        let status = resp.status().as_u16();
+        let body_text = resp.text().await.unwrap_or_default();
+        assert_eq!(status, 201, "Register failed: {}", body_text);
 
-        // Re-send to get the parsed response (reqwest consumed the body)
+        // Auto-activate the user (bypass email verification for tests)
+        {
+            use bson::doc;
+            self.db
+                .collection::<bson::Document>("users")
+                .update_one(
+                    doc! { "email": email },
+                    doc! { "$set": { "is_verified": true } },
+                )
+                .await
+                .expect("Failed to activate user");
+        }
+
+        // Login to get tokens
         let resp = self
             .client
             .post(self.url("/api/auth/login"))

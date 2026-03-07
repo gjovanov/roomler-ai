@@ -194,6 +194,21 @@ impl TestApp {
     }
 }
 
+impl TestApp {
+    /// Activate a user by email (bypass email verification for tests).
+    pub async fn activate_user(&self, email: &str) {
+        use bson::doc;
+        self.db
+            .collection::<bson::Document>("users")
+            .update_one(
+                doc! { "email": email },
+                doc! { "$set": { "is_verified": true } },
+            )
+            .await
+            .expect("Failed to activate user");
+    }
+}
+
 impl Drop for TestApp {
     fn drop(&mut self) {
         let db = self.db.clone();

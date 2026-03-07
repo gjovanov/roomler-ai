@@ -273,6 +273,27 @@ export async function revokeInviteViaApi(token: string, tenantId: string, invite
   return resp.json()
 }
 
+/** Fetch room members via the API */
+export async function fetchMembersViaApi(
+  token: string,
+  tenantId: string,
+  roomId: string,
+) {
+  const resp = await fetch(`${API_URL}/api/tenant/${tenantId}/room/${roomId}/member`, {
+    headers: { Authorization: `Bearer ${token}` },
+  })
+  if (!resp.ok) throw new Error(`Fetch members failed: ${resp.status}`)
+  return (await resp.json()) as {
+    items: Array<{
+      id: string
+      user_id: string
+      display_name: string
+      username: string
+    }>
+    total: number
+  }
+}
+
 /** Register through the UI */
 export async function registerViaUi(
   page: Page,

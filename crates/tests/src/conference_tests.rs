@@ -92,7 +92,7 @@ async fn room_call_lifecycle_start_join_leave_end() {
         .await
         .unwrap();
     let json: Value = resp.json().await.unwrap();
-    assert_eq!(json["conference_status"], "InProgress");
+    assert_eq!(json["conference_status"], "in_progress");
 
     // Join call
     let resp = app
@@ -170,7 +170,7 @@ async fn room_call_lifecycle_start_join_leave_end() {
         .await
         .unwrap();
     let json: Value = resp.json().await.unwrap();
-    assert_eq!(json["conference_status"], "Ended");
+    assert_eq!(json["conference_status"], "ended");
 }
 
 #[tokio::test]
@@ -418,7 +418,7 @@ async fn call_end_cleans_up_room() {
         .await
         .unwrap();
     let json: Value = resp.json().await.unwrap();
-    assert_eq!(json["conference_status"], "Ended");
+    assert_eq!(json["conference_status"], "ended");
 }
 
 #[tokio::test]
