@@ -7,12 +7,12 @@ use roomler2_services::{
         activation_code::ActivationCodeDao,
         file::FileDao, invite::InviteDao, message::MessageDao, notification::NotificationDao,
         push_subscription::PushSubscriptionDao, reaction::ReactionDao, recording::RecordingDao,
-        role::RoleDao, room::RoomDao, tenant::TenantDao, transcription::TranscriptionDao,
+        role::RoleDao, room::RoomDao, tenant::TenantDao,
         user::UserDao,
     },
     media::{room_manager::RoomManager, worker_pool::WorkerPool},
 };
-use roomler2_transcription::TranscriptionEngine;
+
 use std::sync::Arc;
 
 use crate::ws::storage::WsStorage;
@@ -33,7 +33,7 @@ pub struct AppState {
     pub roles: Arc<RoleDao>,
     pub files: Arc<FileDao>,
     pub recordings: Arc<RecordingDao>,
-    pub transcriptions: Arc<TranscriptionDao>,
+
     pub tasks: Arc<TaskService>,
     pub room_manager: Arc<RoomManager>,
     pub ws_storage: Arc<WsStorage>,
@@ -43,7 +43,7 @@ pub struct AppState {
     pub email: Option<Arc<EmailService>>,
     pub push: Option<Arc<PushService>>,
     pub push_subscriptions: Arc<PushSubscriptionDao>,
-    pub transcription_engine: Option<Arc<TranscriptionEngine>>,
+
 }
 
 impl AppState {
@@ -60,7 +60,6 @@ impl AppState {
         let roles = Arc::new(RoleDao::new(&db));
         let files = Arc::new(FileDao::new(&db));
         let recordings = Arc::new(RecordingDao::new(&db));
-        let transcriptions = Arc::new(TranscriptionDao::new(&db));
         let tasks = Arc::new(TaskService::new(&db));
 
         let worker_pool = Arc::new(WorkerPool::new(&settings.mediasoup).await?);
@@ -116,25 +115,6 @@ impl AppState {
             None
         };
 
-        // Initialize transcription engine if enabled
-        let transcription_engine = if settings.transcription.enabled {
-            match Self::create_transcription_engine(&settings) {
-                Ok((engine, _rx)) => {
-                    tracing::info!(
-                        backend = %settings.transcription.backend,
-                        "Transcription engine initialized"
-                    );
-                    Some(engine)
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to initialize transcription engine: {}", e);
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
         Ok(Self {
             db,
             settings,
@@ -150,7 +130,7 @@ impl AppState {
             roles,
             files,
             recordings,
-            transcriptions,
+
             tasks,
             room_manager,
             ws_storage,
@@ -160,108 +140,7 @@ impl AppState {
             email,
             push,
             push_subscriptions,
-            transcription_engine,
+
         })
-    }
-
-    /// Creates the transcription engine based on settings.
-    fn create_transcription_engine(
-        settings: &Settings,
-    ) -> anyhow::Result<(
-        Arc<TranscriptionEngine>,
-        tokio::sync::broadcast::Receiver<roomler2_transcription::TranscriptEvent>,
-    )> {
-        use roomler2_transcription::TranscriptionConfig;
-        use std::collections::HashMap;
-        use std::path::Path;
-
-        let config = TranscriptionConfig {
-            enabled: settings.transcription.enabled,
-            backend: settings.transcription.backend.clone(),
-            whisper_model_path: settings.transcription.whisper_model_path.clone(),
-            language: settings.transcription.language.clone(),
-            vad_model_path: settings.transcription.vad_model_path.clone(),
-            vad_start_threshold: settings.transcription.vad_start_threshold,
-            vad_end_threshold: settings.transcription.vad_end_threshold,
-            vad_min_speech_frames: settings.transcription.vad_min_speech_frames,
-            vad_min_silence_frames: settings.transcription.vad_min_silence_frames,
-            vad_pre_speech_pad_frames: settings.transcription.vad_pre_speech_pad_frames,
-            max_speech_duration_secs: settings.transcription.max_speech_duration_secs,
-            nim_endpoint: settings.transcription.nim_endpoint.clone(),
-            onnx_model_path: settings.transcription.onnx_model_path.clone(),
-            nim_model: settings.transcription.nim_model.clone(),
-            streaming_partial_interval_ms: settings.transcription.streaming_partial_interval_ms,
-        };
-
-        let mut backends: HashMap<String, Arc<dyn roomler2_transcription::AsrBackend>> =
-            HashMap::new();
-
-        // Local Whisper backend
-        if let Some(ref path) = settings.transcription.whisper_model_path {
-            if Path::new(path).exists() {
-                match roomler2_transcription::asr::local_whisper::LocalWhisperBackend::new(
-                    path,
-                    settings.transcription.language.clone(),
-                ) {
-                    Ok(backend) => {
-                        tracing::info!(path, "Whisper backend loaded");
-                        backends.insert("whisper".into(), Arc::new(backend));
-                    }
-                    Err(e) => {
-                        tracing::warn!(path, %e, "Failed to load Whisper backend");
-                    }
-                }
-            } else {
-                tracing::info!(path, "Whisper model file not found, skipping");
-            }
-        }
-
-        // Local ONNX (Canary) backend
-        if let Some(ref path) = settings.transcription.onnx_model_path {
-            if Path::new(path).exists() {
-                match roomler2_transcription::asr::local_onnx::LocalOnnxBackend::new(path) {
-                    Ok(backend) => {
-                        tracing::info!(path, "Canary ONNX backend loaded");
-                        backends.insert("canary".into(), Arc::new(backend));
-                    }
-                    Err(e) => {
-                        tracing::warn!(path, %e, "Failed to load Canary ONNX backend");
-                    }
-                }
-            } else {
-                tracing::info!(path, "Canary ONNX model directory not found, skipping");
-            }
-        }
-
-        // Remote NIM backend
-        #[cfg(feature = "remote-nim")]
-        if let Some(ref endpoint) = settings.transcription.nim_endpoint {
-            let model_name = settings.transcription.nim_model.as_deref();
-            match roomler2_transcription::asr::remote_nim::RemoteNimBackend::new(endpoint, model_name) {
-                Ok(backend) => {
-                    tracing::info!(endpoint, ?model_name, "NIM backend configured");
-                    backends.insert("nim".into(), Arc::new(backend));
-                }
-                Err(e) => {
-                    tracing::warn!(endpoint, %e, "Failed to create NIM backend");
-                }
-            }
-        }
-
-        if backends.is_empty() {
-            anyhow::bail!("No ASR backends available — check model paths and feature flags");
-        }
-
-        // Map config backend name to our key
-        let default_backend = match settings.transcription.backend.as_str() {
-            "local_whisper" => "whisper",
-            "local_onnx" => "canary",
-            "remote_nim" => "nim",
-            other => other,
-        }
-        .to_string();
-
-        let (engine, rx) = TranscriptionEngine::new(backends, default_backend, config);
-        Ok((engine, rx))
     }
 }

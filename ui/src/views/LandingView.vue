@@ -227,7 +227,7 @@ const plans = [
       '100 GB storage',
       'Video (100 participants)',
       'AI doc recognition',
-      'Recordings & transcription',
+      'Recordings',
       'Priority support',
     ],
   },

@@ -22,8 +22,7 @@ mod file_tests;
 mod export_tests;
 #[cfg(test)]
 mod recording_tests;
-#[cfg(test)]
-mod transcription_tests;
+
 #[cfg(test)]
 mod pdf_export_tests;
 #[cfg(test)]

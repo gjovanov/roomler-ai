@@ -31,7 +31,6 @@ pub struct BackgroundTask {
 #[serde(rename_all = "snake_case")]
 pub enum TaskCategory {
     Recording,
-    Transcription,
     Export,
     Import,
     Recognition,

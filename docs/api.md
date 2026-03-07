@@ -216,14 +216,6 @@ Notifications are created automatically when users are @mentioned in messages. T
 | POST | `/api/tenant/{tenant_id}/room/{room_id}/recording` | Yes | Create a recording |
 | DELETE | `/api/tenant/{tenant_id}/room/{room_id}/recording/{recording_id}` | Yes | Delete a recording |
 
-## Transcription Routes
-
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| GET | `/api/tenant/{tenant_id}/room/{room_id}/transcript` | Yes | List transcriptions |
-| POST | `/api/tenant/{tenant_id}/room/{room_id}/transcript` | Yes | Create a transcription |
-| GET | `/api/tenant/{tenant_id}/room/{room_id}/transcript/{transcription_id}` | Yes | Get transcription details |
-
 ## File Routes
 
 | Method | Path | Auth | Description |

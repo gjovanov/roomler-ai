@@ -9,7 +9,7 @@ pub mod role;
 pub mod recording;
 pub mod room;
 pub mod tenant;
-pub mod transcription;
+
 pub mod user;
 pub mod activation_code;
 

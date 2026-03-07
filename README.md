@@ -32,7 +32,7 @@ Real-time communication and collaboration platform with multi-tenancy, hierarchi
 | **Video Conferencing** | mediasoup WebRTC SFU (per-room calls) | :white_check_mark: |
 | | Start/join calls from room chat or dashboard | :white_check_mark: |
 | | Multiple producers/consumers per participant | :white_check_mark: |
-| | Recordings, transcriptions & in-call chat | :white_check_mark: |
+| | Recordings & in-call chat | :white_check_mark: |
 | **File Management** | Versioned uploads, multipart upload | :white_check_mark: |
 | | Cloud sync (Google Drive, OneDrive, Dropbox) | :white_check_mark: |
 | | AI document recognition (Claude API) | :white_check_mark: |

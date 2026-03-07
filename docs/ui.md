@@ -154,7 +154,6 @@ All authenticated routes are wrapped in `AppLayout.vue`, which provides:
 | RoomTreeItem | `components/rooms/RoomTreeItem.vue` | Recursive tree node for room hierarchy with context menu and call indicator |
 | VideoTile | `components/conference/VideoTile.vue` | Video participant tile in call view |
 | LayoutSwitcher | `components/conference/LayoutSwitcher.vue` | Conference layout mode switcher |
-| TranscriptPanel | `components/conference/TranscriptPanel.vue` | Live transcription panel |
 | ConferenceFilesPanel | `components/conference/ConferenceFilesPanel.vue` | File sharing panel in calls |
 | MentionList | `components/chat/MentionList.vue` | @mention autocomplete suggestion dropdown |
 | NotificationPanel | `components/layout/NotificationPanel.vue` | Notification dropdown panel in app bar |

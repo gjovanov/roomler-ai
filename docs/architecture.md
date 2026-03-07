@@ -106,7 +106,7 @@ Browser
 
 ### API Layer (`crates/api`)
 
-- **Routes** -- REST endpoint handlers organized by domain (auth, tenant, room, message, file, recording, transcription, etc.)
+- **Routes** -- REST endpoint handlers organized by domain (auth, tenant, room, message, file, recording, etc.)
 - **WebSocket** -- Connection management (`WsStorage`), message dispatch, presence and typing indicators
 - **Middleware** -- Authentication via `AuthUser` extractor (JWT from httpOnly cookie or Authorization header)
 - **Error Handling** -- Unified `ApiError` type maps to HTTP status codes
@@ -117,7 +117,7 @@ Browser
 - **DAOs** -- Data access objects for each model (CRUD + domain queries)
 - **Export** -- Conversation export to XLSX (`rust_xlsxwriter`) and PDF (`genpdf`)
 - **Cloud Storage** -- S3/MinIO file operations
-- **Background Tasks** -- Async processing for recordings, transcriptions, exports
+- **Background Tasks** -- Async processing for recordings, exports
 - **Media** -- mediasoup 0.20 SFU: WorkerPool (round-robin), RoomManager (Router/Transport/Producer/Consumer), WebSocket signaling protocol
 
 ### Data Layer (`crates/db`)

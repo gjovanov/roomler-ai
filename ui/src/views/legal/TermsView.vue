@@ -16,7 +16,7 @@
             These Terms of Service ("Terms") govern your access to and use of Roomler AI ("Roomler," "we," "us,"
             or "our"), a real-time collaboration platform available at
             <a href="https://roomler.ai" class="text-primary">roomler.ai</a>. Roomler provides chat, video
-            conferencing, AI-powered transcription, file sharing, and multi-tenant workspace management. By
+            conferencing, file sharing, and multi-tenant workspace management. By
             creating an account or using our services, you agree to be bound by these Terms. If you do not
             agree, please do not use the platform.
           </p>
@@ -97,17 +97,16 @@
         </section>
 
         <section class="mb-8">
-          <h2 class="text-h5 font-weight-bold mb-3">7. Recording and Transcription Consent</h2>
+          <h2 class="text-h5 font-weight-bold mb-3">7. Recording Consent</h2>
           <p class="text-body-1 legal-muted mb-4">
-            Roomler offers call recording and AI-powered transcription features for video and audio conferences.
+            Roomler offers call recording features for video and audio conferences.
             By using these features, you acknowledge and agree to the following:
           </p>
           <ul class="text-body-1 legal-muted ml-6 mb-2">
             <li class="mb-1">Recording can only be initiated by authorized participants with appropriate workspace permissions</li>
             <li class="mb-1">All participants in a call will be notified when recording begins</li>
             <li class="mb-1">By remaining in a call after recording notification, participants consent to being recorded</li>
-            <li class="mb-1">AI-generated transcriptions are provided as-is and may contain inaccuracies</li>
-            <li class="mb-1">Recordings and transcriptions are stored according to workspace settings and your subscription plan</li>
+            <li class="mb-1">Recordings are stored according to workspace settings and your subscription plan</li>
             <li class="mb-1">You are responsible for complying with all applicable laws regarding recording consent in your jurisdiction</li>
           </ul>
         </section>
@@ -147,8 +146,7 @@
             Roomler is provided on an "AS IS" and "AS AVAILABLE" basis without warranties of any kind, whether
             express or implied, including but not limited to warranties of merchantability, fitness for a
             particular purpose, and non-infringement. We do not warrant that the platform will be uninterrupted,
-            error-free, or secure. AI-generated transcriptions are provided for convenience and may contain
-            errors. WebRTC call quality may vary depending on network conditions beyond our control.
+            error-free, or secure. WebRTC call quality may vary depending on network conditions beyond our control.
           </p>
         </section>
 

@@ -12,7 +12,7 @@ async fn main() -> anyhow::Result<()> {
     // Initialize tracing
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            "roomler2_api=debug,roomler2_services=debug,roomler2_db=debug,roomler2_transcription=debug,tower_http=debug"
+            "roomler2_api=debug,roomler2_services=debug,roomler2_db=debug,tower_http=debug"
                 .into()
         }))
         .with(tracing_subscriber::fmt::layer())

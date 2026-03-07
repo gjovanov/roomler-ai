@@ -22,7 +22,6 @@ erDiagram
     Message ||--o{ Reaction : "receives"
     Message o|--o| Message : "thread_id"
     Room ||--o{ Recording : "produces"
-    Room ||--o{ Transcription : "generates"
     Tenant ||--o{ File : "stores"
     Tenant ||--o{ BackgroundTask : "runs"
     User ||--o{ Notification : "receives"
@@ -254,26 +253,6 @@ Collection: `recordings`
 | `updated_at` | DateTime | |
 | `deleted_at` | Option\<DateTime\> | Soft delete |
 
-### Transcription
-
-Collection: `transcriptions`
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `_id` | ObjectId | Primary key |
-| `tenant_id` | ObjectId | |
-| `room_id` | ObjectId | |
-| `recording_id` | Option\<ObjectId\> | |
-| `status` | TranscriptionStatus | `processing`, `available`, `failed` |
-| `language` | String | |
-| `format` | TranscriptFormat | `vtt`, `srt`, `json` |
-| `content_url` | String | |
-| `segments` | Vec\<TranscriptSegment\> | speaker_id, speaker_name, start_time, end_time, text, confidence |
-| `summary` | Option\<String\> | AI-generated summary |
-| `action_items` | Vec\<ActionItem\> | text, assignee, due_date, completed |
-| `created_at` | DateTime | |
-| `updated_at` | DateTime | |
-
 ### CallChatMessage
 
 Collection: `call_chat_messages`
@@ -353,7 +332,7 @@ Collection: `background_tasks`
 | `tenant_id` | ObjectId | |
 | `user_id` | ObjectId | |
 | `task_type` | String | |
-| `category` | TaskCategory | `recording`, `transcription`, `export`, `import`, `recognition` |
+| `category` | TaskCategory | `recording`, `export`, `import`, `recognition` |
 | `status` | TaskStatus | `pending`, `processing`, `completed`, `failed`, `expired` |
 | `params` | JSON | Task-specific parameters |
 | `logs` | Vec\<String\> | Execution logs |
@@ -448,8 +427,6 @@ Collection: `custom_emojis`
 | `call_chat_messages` | `{ room_id: 1, created_at: 1 }` | No |
 | `recordings` | `{ room_id: 1, recording_type: 1 }` | No |
 | `recordings` | `{ tenant_id: 1, status: 1 }` | No |
-| `transcriptions` | `{ room_id: 1 }` | No |
-| `transcriptions` | `{ tenant_id: 1, status: 1 }` | No |
 | `files` | `{ tenant_id: 1, context.context_type: 1, context.entity_id: 1 }` | No |
 | `files` | `{ tenant_id: 1, uploaded_by: 1, created_at: -1 }` | No |
 | `files` | `{ tenant_id: 1, context.room_id: 1, created_at: -1 }` | No |

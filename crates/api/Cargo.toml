@@ -13,13 +13,13 @@ path = "src/main.rs"
 
 [features]
 default = []
-remote-nim = ["roomler2-transcription/remote-nim"]
+
 
 [dependencies]
 roomler2-config = { path = "../config" }
 roomler2-db = { path = "../db" }
 roomler2-services = { path = "../services" }
-roomler2-transcription = { path = "../transcription", default-features = false, features = ["vad", "local-whisper", "local-onnx"] }
+
 axum.workspace = true
 tokio.workspace = true
 tower.workspace = true

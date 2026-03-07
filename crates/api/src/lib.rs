@@ -85,12 +85,6 @@ pub fn build_router(state: AppState) -> Router {
         .route("/", post(routes::recording::create))
         .route("/{recording_id}", delete(routes::recording::delete));
 
-    // Transcription routes (under room)
-    let transcription_routes = Router::new()
-        .route("/", get(routes::transcription::list))
-        .route("/", post(routes::transcription::create))
-        .route("/{transcription_id}", get(routes::transcription::get));
-
     // Room file routes (100 MB body limit for audio uploads)
     let room_file_routes = Router::new()
         .route("/", get(routes::file::list))
@@ -202,10 +196,6 @@ pub fn build_router(state: AppState) -> Router {
         .nest(
             "/tenant/{tenant_id}/room/{room_id}/recording",
             recording_routes,
-        )
-        .nest(
-            "/tenant/{tenant_id}/room/{room_id}/transcript",
-            transcription_routes,
         )
         .nest(
             "/tenant/{tenant_id}/room/{room_id}/file",

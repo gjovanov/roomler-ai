@@ -34,21 +34,6 @@ export interface Participant {
   is_hand_raised: boolean
 }
 
-export interface TranscriptSegment {
-  id: string
-  segment_id: string
-  user_id: string
-  speaker_name: string
-  text: string
-  language?: string
-  confidence?: number
-  start_time: number
-  end_time: number
-  inference_duration_ms?: number
-  is_final: boolean
-  received_at: number
-}
-
 export interface FileEntry {
   id: string
   filename: string
@@ -74,9 +59,6 @@ export const useRoomStore = defineStore('rooms', () => {
   const participants = ref<Participant[]>([])
   const loading = ref(false)
   const chatMessages = ref<ChatMsg[]>([])
-  const transcriptSegments = ref<TranscriptSegment[]>([])
-  const transcriptionEnabled = ref(false)
-  const selectedTranscriptionModel = ref<'whisper' | 'canary'>('whisper')
   const roomFiles = ref<FileEntry[]>([])
   const filesLoading = ref(false)
 
@@ -207,56 +189,6 @@ export const useRoomStore = defineStore('rooms', () => {
     chatMessages.value = []
   }
 
-  // --- Transcript ---
-  function addTranscriptFromWs(data: {
-    user_id: string
-    speaker_name: string
-    text: string
-    language?: string
-    confidence?: number
-    start_time: number
-    end_time: number
-    inference_duration_ms?: number
-    is_final: boolean
-    segment_id: string
-  }) {
-    const idx = transcriptSegments.value.findIndex((s) => s.segment_id === data.segment_id)
-    if (idx >= 0) {
-      transcriptSegments.value[idx].text = data.text
-      transcriptSegments.value[idx].end_time = data.end_time
-      transcriptSegments.value[idx].confidence = data.confidence
-      transcriptSegments.value[idx].is_final = data.is_final
-      transcriptSegments.value[idx].received_at = Date.now()
-    } else {
-      transcriptSegments.value.push({
-        id: data.segment_id,
-        segment_id: data.segment_id,
-        user_id: data.user_id,
-        speaker_name: data.speaker_name,
-        text: data.text,
-        language: data.language,
-        confidence: data.confidence,
-        start_time: data.start_time,
-        end_time: data.end_time,
-        inference_duration_ms: data.inference_duration_ms,
-        is_final: data.is_final,
-        received_at: Date.now(),
-      })
-    }
-  }
-
-  function setTranscriptionEnabled(enabled: boolean) {
-    transcriptionEnabled.value = enabled
-  }
-
-  function setSelectedTranscriptionModel(model: 'whisper' | 'canary') {
-    selectedTranscriptionModel.value = model
-  }
-
-  function clearTranscript() {
-    transcriptSegments.value = []
-  }
-
   // --- Call status updates (from WS) ---
   function updateRoomCallStatus(roomId: string, conferenceStatus: string | null, participantCount?: number) {
     const room = rooms.value.find(r => r.id === roomId)
@@ -311,9 +243,6 @@ export const useRoomStore = defineStore('rooms', () => {
     loading,
     rootRooms,
     tree,
-    transcriptSegments,
-    transcriptionEnabled,
-    selectedTranscriptionModel,
     roomFiles,
     filesLoading,
     // Room operations
@@ -339,11 +268,6 @@ export const useRoomStore = defineStore('rooms', () => {
     sendChatMessage,
     addChatMessageFromWs,
     clearChatMessages,
-    // Transcript
-    addTranscriptFromWs,
-    setTranscriptionEnabled,
-    setSelectedTranscriptionModel,
-    clearTranscript,
     // Room files
     fetchRoomFiles,
     uploadRoomFile,

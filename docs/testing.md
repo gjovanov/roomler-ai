@@ -18,7 +18,6 @@ Located in `crates/tests/src/`. These tests spin up the full Axum server and int
 | `conference_tests.rs` | Room calls: start, join, leave, end + mediasoup signaling (WS media:join, transport creation, peer_left broadcast) + connection_id isolation |
 | `conference_message_tests.rs` | In-call chat messages: create, list, WS broadcast |
 | `recording_tests.rs` | Create, list, delete recordings |
-| `transcription_tests.rs` | Create, list, get transcriptions |
 | `file_tests.rs` | Upload, get, download, delete, list files |
 | `export_tests.rs` | Conversation export to XLSX |
 | `pdf_export_tests.rs` | Conversation export to PDF |
@@ -103,7 +102,6 @@ Located in `ui/e2e/`. Playwright tests that run against the full stack (backend 
 | `invite.spec.ts` | Invite creation, acceptance flows |
 | `oauth.spec.ts` | OAuth redirect and callback |
 | `room-fixes.spec.ts` | Dashboard Start Call, Chat View call button, child rooms, call notifications |
-| `transcription.spec.ts` | Transcription display and controls |
 | `websocket.spec.ts` | WebSocket connection, typing indicators |
 
 ### Test Helpers

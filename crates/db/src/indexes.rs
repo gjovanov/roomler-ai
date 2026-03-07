@@ -106,17 +106,6 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> 
     )
     .await?;
 
-    // Transcriptions
-    create_indexes(
-        db,
-        "transcriptions",
-        vec![
-            index(bson::doc! { "room_id": 1 }),
-            index(bson::doc! { "tenant_id": 1, "status": 1 }),
-        ],
-    )
-    .await?;
-
     // Files
     create_indexes(
         db,

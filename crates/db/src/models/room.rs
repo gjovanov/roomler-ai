@@ -79,8 +79,6 @@ pub struct MediaSettings {
     pub screen_share_enabled: bool,
     #[serde(default)]
     pub recording_enabled: bool,
-    #[serde(default)]
-    pub transcription_enabled: bool,
     pub max_participants: Option<u32>,
 }
 

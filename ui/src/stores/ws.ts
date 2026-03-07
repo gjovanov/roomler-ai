@@ -103,19 +103,6 @@ export const useWsStore = defineStore('ws', () => {
         // Legacy call chat event — route to message store for backwards compat
         messageStore.addMessageFromWs(msg.data as never)
         break
-      case 'media:transcript':
-        roomStore.addTranscriptFromWs(msg.data as never)
-        break
-      case 'media:transcript_status': {
-        const tsData = msg.data as { enabled?: boolean; model?: string } | undefined
-        if (tsData && typeof tsData.enabled === 'boolean') {
-          roomStore.setTranscriptionEnabled(tsData.enabled)
-        }
-        if (tsData?.model === 'whisper' || tsData?.model === 'canary') {
-          roomStore.setSelectedTranscriptionModel(tsData.model)
-        }
-        break
-      }
       case 'task:update':
         taskStore.updateFromWs(msg.data as never)
         break

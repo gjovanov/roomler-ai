@@ -14,7 +14,7 @@
           <h2 class="text-h5 font-weight-bold mb-3">1. Introduction</h2>
           <p class="text-body-1 legal-muted">
             Welcome to Roomler AI ("Roomler," "we," "us," or "our"). Roomler is a real-time collaboration platform
-            that provides chat, video conferencing powered by WebRTC and mediasoup, AI-powered transcription,
+            that provides chat, video conferencing powered by WebRTC and mediasoup,
             file sharing, and multi-tenant workspace management. This Privacy Policy explains how we collect, use,
             disclose, and safeguard your information when you use our platform at
             <a href="https://roomler.ai" class="text-primary">roomler.ai</a>.
@@ -51,10 +51,10 @@
             with your account and the workspace where they were shared.
           </p>
 
-          <h3 class="text-h6 font-weight-bold mb-2">2.5 Call Recordings and Transcriptions</h3>
+          <h3 class="text-h6 font-weight-bold mb-2">2.5 Call Recordings</h3>
           <p class="text-body-1 legal-muted mb-4">
-            If recording is enabled for a video or audio call, the recording and any AI-generated transcriptions
-            are stored on our servers. Recordings are only created when explicitly initiated by an authorized
+            If recording is enabled for a video or audio call, the recording
+            is stored on our servers. Recordings are only created when explicitly initiated by an authorized
             participant, and all participants are notified when recording begins.
           </p>
 
@@ -99,7 +99,7 @@
             <li class="mb-1">Provide, maintain, and improve the Roomler platform</li>
             <li class="mb-1">Authenticate your identity and manage your account</li>
             <li class="mb-1">Deliver chat messages, files, and video/audio streams to the intended recipients</li>
-            <li class="mb-1">Generate AI-powered transcriptions of calls when recording is enabled</li>
+            <li class="mb-1">Process call recordings when recording is enabled</li>
             <li class="mb-1">Process payments and manage subscription billing</li>
             <li class="mb-1">Send service-related communications (e.g., account verification, security alerts)</li>
             <li class="mb-1">Monitor and improve platform performance and reliability</li>
@@ -125,7 +125,7 @@
           <p class="text-body-1 legal-muted">
             We retain your account data for as long as your account is active. Chat message history is retained
             according to your workspace plan limits. Files are retained until deleted by you or a workspace
-            administrator. Call recordings and transcriptions are retained according to your workspace settings.
+            administrator. Call recordings are retained according to your workspace settings.
             When you delete your account, we will remove your personal data within 30 days, except where retention
             is required by law or for legitimate business purposes (such as billing records).
           </p>

@@ -14,7 +14,7 @@ pub mod room;
 pub mod room_member;
 pub mod tenant;
 pub mod tenant_member;
-pub mod transcription;
+
 pub mod user;
 
 pub use audit_log::*;
@@ -33,7 +33,7 @@ pub use room::*;
 pub use room_member::*;
 pub use tenant::*;
 pub use tenant_member::*;
-pub use transcription::*;
+
 pub use user::*;
 
 pub mod activation_code;

@@ -16,20 +16,6 @@
             @update:hide-non-video="layoutCtrl.setHideNonVideo"
             @update:self-view-mode="layoutCtrl.setSelfViewMode"
           />
-          <TranscriptionSwitcher
-            v-if="joined"
-            :enabled="roomStore.transcriptionEnabled"
-            :selected-model="roomStore.selectedTranscriptionModel"
-            @update:model="roomStore.setSelectedTranscriptionModel"
-            @toggle="toggleTranscription"
-          />
-          <v-btn
-            v-if="joined && roomStore.transcriptionEnabled"
-            :icon="showTranscriptPanel ? 'mdi-text-box' : 'mdi-text-box-outline'"
-            variant="text"
-            :color="showTranscriptPanel ? 'primary' : undefined"
-            @click="showTranscriptPanel = !showTranscriptPanel"
-          />
           <v-btn
             v-if="joined"
             :icon="showFiles ? 'mdi-folder' : 'mdi-folder-outline'"
@@ -79,18 +65,7 @@
               @request-pip="handlePiP"
             />
 
-            <!-- Transcript subtitle overlay -->
-            <TranscriptOverlay
-              v-if="joined && roomStore.transcriptionEnabled"
-              :segments="roomStore.transcriptSegments"
-            />
           </div>
-
-          <!-- Transcript panel -->
-          <TranscriptPanel
-            v-if="joined && showTranscriptPanel && roomStore.transcriptionEnabled"
-            :segments="roomStore.transcriptSegments"
-          />
 
           <!-- Files panel -->
           <ConferenceFilesPanel
@@ -212,9 +187,6 @@ import { useAudioPlayback } from '@/composables/useAudioPlayback'
 import { useConferenceLayout } from '@/composables/useConferenceLayout'
 import { usePictureInPicture } from '@/composables/usePictureInPicture'
 import LayoutSwitcher from '@/components/conference/LayoutSwitcher.vue'
-import TranscriptionSwitcher from '@/components/conference/TranscriptionSwitcher.vue'
-import TranscriptOverlay from '@/components/conference/TranscriptOverlay.vue'
-import TranscriptPanel from '@/components/conference/TranscriptPanel.vue'
 import ConferenceFilesPanel from '@/components/conference/ConferenceFilesPanel.vue'
 import MessageBubble from '@/components/chat/MessageBubble.vue'
 import MessageEditor from '@/components/chat/MessageEditor.vue'
@@ -243,7 +215,6 @@ const roomId = computed(() => route.params.roomId as string)
 const joined = ref(false)
 const joining = ref(false)
 const showChat = ref(false)
-const showTranscriptPanel = ref(false)
 const showFiles = ref(false)
 const showSwitchDialog = ref(false)
 const chatEditorRef = ref<InstanceType<typeof MessageEditor> | null>(null)
@@ -450,13 +421,10 @@ async function handleLeave() {
 
   // Leave via conference store (tears down mediasoup)
   conferenceStore.leaveRoom()
-  roomStore.clearTranscript()
-  roomStore.setTranscriptionEnabled(false)
   roomStore.clearRoomFiles()
   await roomStore.leaveCall(tenantId.value, roomId.value)
   joined.value = false
   showChat.value = false
-  showTranscriptPanel.value = false
   showFiles.value = false
   router.push(`/tenant/${tenantId.value}`)
 }
@@ -473,18 +441,6 @@ function handlePlayFile(file: { id: string; url: string; filename: string }) {
     room_id: roomId.value,
     file_id: file.id,
   })
-}
-
-function toggleTranscription(newState: boolean) {
-  wsStore.send('media:transcript_toggle', {
-    room_id: roomId.value,
-    enabled: newState,
-    model: roomStore.selectedTranscriptionModel,
-  })
-  roomStore.setTranscriptionEnabled(newState)
-  if (newState) {
-    showTranscriptPanel.value = true
-  }
 }
 
 function handleScreenShare() {

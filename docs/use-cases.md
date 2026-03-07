@@ -137,7 +137,6 @@ Room (media_settings present)
      |-- Screen sharing
      |-- In-call chat messages
      |-- Recording starts
-     |-- Transcription runs
      |
      v
   End Call (POST /room/{id}/call/end)
@@ -147,7 +146,6 @@ Room (media_settings present)
      |
      |-- WS broadcast: room:call_ended to all room members
      |-- Recordings processed (BackgroundTask)
-     |-- Transcriptions generated (BackgroundTask)
 ```
 
 ## File Lifecycle

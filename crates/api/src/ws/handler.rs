@@ -91,10 +91,6 @@ async fn handle_socket(socket: WebSocket, state: AppState, user_id: ObjectId) {
     // Cleanup
     state.ws_storage.remove(&user_id, &connection_id, &sender);
 
-    if let Some(engine) = &state.transcription_engine {
-        engine.stop_connection_playbacks(&connection_id);
-    }
-
     if let Some(room_id) = state.room_manager.get_connection_room(&connection_id) {
         let remaining_conns = state
             .room_manager
@@ -187,9 +183,6 @@ async fn handle_client_message(state: &AppState, user_id: &ObjectId, connection_
         }
         "media:leave" => {
             handle_media_leave(state, user_id, connection_id, data).await;
-        }
-        "media:transcript_toggle" => {
-            handle_transcript_toggle(state, user_id, connection_id, data).await;
         }
         "media:play_audio" => {
             handle_play_audio(state, user_id, connection_id, data).await;
@@ -476,13 +469,6 @@ async fn handle_media_produce(
                 }
             }
 
-            if matches!(kind, MediaKind::Audio)
-                && let Some(engine) = &state.transcription_engine
-                && engine.is_enabled(&rid).await
-            {
-                start_transcription_pipeline(state, &rid, producer_id, *user_id, connection_id).await;
-                spawn_transcript_broadcast(engine.clone(), state.ws_storage.clone(), state.room_manager.clone(), rid);
-            }
         }
         Err(e) => {
             send_media_error(state, user_id, &format!("produce failed: {}", e)).await;
@@ -602,9 +588,6 @@ async fn handle_media_producer_close(
         .room_manager
         .close_producer(&rid, connection_id, &producer_id)
     {
-        if let Some(engine) = &state.transcription_engine {
-            engine.stop_producer(&rid, &producer_id.to_string());
-        }
         state.room_manager.remove_rtp_tap(&rid, &producer_id.to_string());
 
         let other_conns = state
@@ -624,173 +607,6 @@ async fn handle_media_producer_close(
             }
         }
     }
-}
-
-async fn handle_transcript_toggle(
-    state: &AppState,
-    _user_id: &ObjectId,
-    connection_id: &str,
-    data: Option<&serde_json::Value>,
-) {
-    let data = match data {
-        Some(d) => d,
-        None => return,
-    };
-
-    let room_id_str = match data.get("room_id").and_then(|v| v.as_str()) {
-        Some(s) => s,
-        None => return,
-    };
-    let enabled = data.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
-    let model = data.get("model")
-        .and_then(|v| v.as_str())
-        .and_then(|s| match s {
-            "whisper" | "canary" => Some(s.to_string()),
-            _ => None,
-        });
-
-    if let Some(ref m) = model {
-        info!(%connection_id, %m, "transcript_toggle model requested");
-    }
-
-    let rid = match ObjectId::parse_str(room_id_str) {
-        Ok(id) => id,
-        Err(_) => return,
-    };
-
-    if let Some(engine) = &state.transcription_engine {
-        if enabled {
-            let model_name = model.as_deref().unwrap_or(engine.default_backend_name()).to_string();
-            engine.enable_room(rid, model_name).await;
-
-            let all_producers = state.room_manager.get_producer_ids(&rid, "");
-            for (uid, conn_id, pid, kind, _source) in all_producers {
-                if matches!(kind, MediaKind::Audio) {
-                    start_transcription_pipeline(state, &rid, pid, uid, &conn_id).await;
-                }
-            }
-
-            spawn_transcript_broadcast(engine.clone(), state.ws_storage.clone(), state.room_manager.clone(), rid);
-        } else {
-            engine.disable_room(rid).await;
-        }
-    } else {
-        warn!("Transcription engine not available — toggling UI state only (no ASR pipeline)");
-    }
-
-    let all_conns = state.room_manager.get_other_connection_ids(&rid, connection_id);
-    let mut status_data = serde_json::json!({
-        "room_id": room_id_str,
-        "enabled": enabled,
-    });
-    if let Some(ref m) = model {
-        status_data["model"] = serde_json::json!(m);
-    }
-    let status_msg = serde_json::json!({
-        "type": "media:transcript_status",
-        "data": status_data,
-    });
-    super::dispatcher::send_to_connection(&state.ws_storage, connection_id, &status_msg).await;
-    for cid in &all_conns {
-        super::dispatcher::send_to_connection(&state.ws_storage, cid, &status_msg).await;
-    }
-}
-
-async fn start_transcription_pipeline(
-    state: &AppState,
-    room_id: &ObjectId,
-    producer_id: ProducerId,
-    user_id: ObjectId,
-    _connection_id: &str,
-) {
-    let engine = match &state.transcription_engine {
-        Some(e) => e,
-        None => return,
-    };
-
-    let speaker_name = match state
-        .rooms
-        .find_participant_name(*room_id, user_id)
-        .await
-    {
-        Ok(name) => name,
-        Err(_) => user_id.to_hex()[..8].to_string(),
-    };
-
-    let rtp_rx = match state
-        .room_manager
-        .create_rtp_tap(room_id, producer_id)
-        .await
-    {
-        Ok(rx) => rx,
-        Err(e) => {
-            warn!(%e, "Failed to create RTP tap for transcription");
-            return;
-        }
-    };
-
-    engine.start_pipeline(
-        *room_id,
-        producer_id.to_string(),
-        user_id,
-        speaker_name,
-        rtp_rx,
-    );
-}
-
-fn spawn_transcript_broadcast(
-    engine: Arc<roomler2_transcription::TranscriptionEngine>,
-    ws_storage: Arc<super::storage::WsStorage>,
-    room_manager: Arc<roomler2_services::media::room_manager::RoomManager>,
-    room_id: ObjectId,
-) {
-    if !engine.try_start_broadcast(room_id) {
-        debug!(%room_id, "Broadcast task already active, skipping spawn");
-        return;
-    }
-
-    let mut rx = engine.subscribe();
-    tokio::spawn(async move {
-        info!(%room_id, "Transcript broadcast task started");
-        while let Ok(event) = rx.recv().await {
-            if event.room_id != room_id {
-                continue;
-            }
-            if !engine.is_enabled(&room_id).await {
-                break;
-            }
-
-            info!(
-                text = %event.text,
-                speaker = %event.speaker_name,
-                "Broadcasting transcript to WS clients"
-            );
-
-            let msg = serde_json::json!({
-                "type": "media:transcript",
-                "data": {
-                    "user_id": event.user_id.to_hex(),
-                    "speaker_name": event.speaker_name,
-                    "text": event.text,
-                    "language": event.language,
-                    "confidence": event.confidence,
-                    "start_time": event.start_time,
-                    "end_time": event.end_time,
-                    "inference_duration_ms": event.inference_duration_ms,
-                    "is_final": event.is_final,
-                    "segment_id": event.segment_id,
-                }
-            });
-
-            let conn_ids = room_manager.get_other_connection_ids(&room_id, "");
-            info!(count = conn_ids.len(), "Transcript target connections");
-            for cid in &conn_ids {
-                super::dispatcher::send_to_connection(&ws_storage, cid, &msg).await;
-            }
-        }
-        engine.clear_broadcast(&room_id);
-        info!(%room_id, "Transcript broadcast task exited");
-    });
 }
 
 async fn handle_media_leave(
@@ -834,7 +650,7 @@ async fn handle_media_leave(
 
 async fn handle_play_audio(
     state: &AppState,
-    user_id: &ObjectId,
+    _user_id: &ObjectId,
     connection_id: &str,
     data: Option<&serde_json::Value>,
 ) {
@@ -878,40 +694,7 @@ async fn handle_play_audio(
         }
     };
 
-    let mut playback_id = String::new();
-    if let Some(engine) = &state.transcription_engine {
-        if !engine.is_enabled(&rid).await {
-            engine.enable_room(rid, engine.default_backend_name().to_string()).await;
-        }
-
-        let upload_dir = std::env::var("ROOMLER_UPLOAD_DIR")
-            .unwrap_or_else(|_| "/tmp/roomler2-uploads".to_string());
-        let file_path = format!("{}/{}", upload_dir, file.storage_key);
-
-        let speaker_name = match state
-            .rooms
-            .find_participant_name(rid, *user_id)
-            .await
-        {
-            Ok(name) => name,
-            Err(_) => user_id.to_hex()[..8].to_string(),
-        };
-
-        if let Some(pid) = engine
-            .start_file_playback(rid, file_path.clone(), *user_id, speaker_name)
-            .await
-        {
-            playback_id = pid.clone();
-            engine.track_playback(connection_id, &pid);
-            info!(%pid, %file_path, "File playback pipeline started");
-        } else {
-            warn!(%file_path, "start_file_playback returned None — no ASR backend?");
-        }
-
-        spawn_transcript_broadcast(engine.clone(), state.ws_storage.clone(), state.room_manager.clone(), rid);
-    } else {
-        warn!("Transcription engine unavailable — file plays audio-only, no transcript");
-    }
+    let playback_id = String::new();
 
     let file_url = format!(
         "/api/tenant/{}/file/{}/download",
@@ -963,10 +746,6 @@ async fn handle_stop_audio(
         Ok(id) => id,
         Err(_) => return,
     };
-
-    if let Some(engine) = &state.transcription_engine {
-        engine.stop_pipeline(playback_id);
-    }
 
     let msg = serde_json::json!({
         "type": "media:audio_playback",
