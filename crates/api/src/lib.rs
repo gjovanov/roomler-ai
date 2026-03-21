@@ -11,7 +11,11 @@ use axum::{
     routing::{delete, get, post, put},
 };
 use state::AppState;
-use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
+use tower_governor::{
+    GovernorLayer,
+    governor::GovernorConfigBuilder,
+    key_extractor::SmartIpKeyExtractor,
+};
 use tower_http::{
     cors::{Any, CorsLayer},
     trace::TraceLayer,
@@ -43,6 +47,7 @@ pub fn build_router(state: AppState) -> Router {
     let governor_conf = GovernorConfigBuilder::default()
         .per_second(1)
         .burst_size(60)
+        .key_extractor(SmartIpKeyExtractor)
         .finish()
         .unwrap();
     let governor_layer = GovernorLayer {
