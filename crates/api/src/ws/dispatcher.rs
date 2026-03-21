@@ -1,8 +1,10 @@
 use bson::oid::ObjectId;
 use futures::SinkExt;
 use axum::extract::ws::Message;
+use std::sync::Arc;
 use tracing::{debug, warn};
 
+use super::redis_pubsub::RedisPubSub;
 use super::storage::WsStorage;
 
 /// Broadcasts a JSON message to all connections of the specified users.
@@ -34,6 +36,40 @@ pub async fn send_to_user(
     message: &serde_json::Value,
 ) {
     broadcast(ws_storage, &[*user_id], message).await;
+}
+
+/// Broadcasts a JSON message locally AND publishes to Redis for cross-instance delivery.
+/// Use this for events that must reach users on any server instance (e.g., message:create,
+/// typing, presence, reactions, call events).
+pub async fn broadcast_with_redis(
+    ws_storage: &WsStorage,
+    redis_pubsub: &Option<Arc<RedisPubSub>>,
+    user_ids: &[ObjectId],
+    message: &serde_json::Value,
+) {
+    // Local broadcast (same instance)
+    broadcast(ws_storage, user_ids, message).await;
+
+    // Cross-instance broadcast via Redis Pub/Sub
+    if let Some(pubsub) = redis_pubsub {
+        let envelope = serde_json::json!({
+            "user_ids": user_ids.iter().map(|id| id.to_hex()).collect::<Vec<_>>(),
+            "message": message,
+        });
+        if let Err(e) = pubsub.publish(&envelope.to_string()).await {
+            tracing::error!("Failed to publish to Redis Pub/Sub: {}", e);
+        }
+    }
+}
+
+/// Sends a JSON message to a specific user locally AND via Redis for cross-instance delivery.
+pub async fn send_to_user_with_redis(
+    ws_storage: &WsStorage,
+    redis_pubsub: &Option<Arc<RedisPubSub>>,
+    user_id: &ObjectId,
+    message: &serde_json::Value,
+) {
+    broadcast_with_redis(ws_storage, redis_pubsub, &[*user_id], message).await;
 }
 
 /// Sends a JSON message to a specific connection by connection_id.

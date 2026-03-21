@@ -1,6 +1,6 @@
 # Testing
 
-Roomler2 has three test layers: Rust integration tests (114 tests), Vitest component unit tests, and Playwright E2E tests.
+Roomler2 has three test layers: Rust integration tests (135 tests), 215 Vitest unit tests, and 24 Playwright E2E spec files.
 
 ## Integration Tests
 
@@ -24,6 +24,11 @@ Located in `crates/tests/src/`. These tests spin up the full Axum server and int
 | `multi_tenancy_tests.rs` | Cross-tenant data isolation |
 | `invite_tests.rs` | Invite creation, acceptance, listing, revocation |
 | `oauth_tests.rs` | OAuth provider linking |
+| `notification_tests.rs` | Mention notifications, unread count, mark read, user scoping |
+| `rate_limit_tests.rs` | Rate limit 429 after burst, recovery |
+| `pagination_tests.rs` | Multi-page, per_page clamp, cursor `before`, total_pages |
+| `role_tests.rs` | Role CRUD, assign/unassign, non-member 403 |
+| `cors_tests.rs` | Preflight OPTIONS, configured origins, rejection |
 
 ### Test Fixtures
 
@@ -65,6 +70,18 @@ Located in `ui/src/**/__tests__/`. Component and config unit tests using Vitest 
 | File | Coverage Area |
 |------|--------------|
 | `plugins/__tests__/vuetify.spec.ts` | Theme config (light/dark colors, default theme, localStorage) |
+| `__tests__/stores/auth.spec.ts` | Login, register, logout, fetchMe, token management |
+| `__tests__/stores/messages.spec.ts` | CRUD, reactions, threads, WS deduplication |
+| `__tests__/stores/rooms.spec.ts` | CRUD, hierarchy, unread counts, call status |
+| `__tests__/stores/ws.spec.ts` | Connection lifecycle, message routing, typing, media handlers |
+| `__tests__/stores/notifications.spec.ts` | CRUD, unread counts, WS integration |
+| `__tests__/stores/conference.spec.ts` | Device selection, mute/video toggles, state reset |
+| `__tests__/stores/tenants.spec.ts` | CRUD, current tenant, auto-selection |
+| `__tests__/stores/files.spec.ts` | Upload, delete, download URL |
+| `__tests__/composables/useValidation.spec.ts` | All validation rules + edge cases |
+| `__tests__/composables/useSnackbar.spec.ts` | showError, showSuccess, shared state |
+| `__tests__/composables/useMarkdown.spec.ts` | Rendering, XSS sanitization, mentions |
+| `__tests__/api/client.spec.ts` | Token injection, HTTP methods, 401/403/500 handling |
 
 ### Running Unit Tests
 
@@ -103,6 +120,12 @@ Located in `ui/e2e/`. Playwright tests that run against the full stack (backend 
 | `oauth.spec.ts` | OAuth redirect and callback |
 | `room-fixes.spec.ts` | Dashboard Start Call, Chat View call button, child rooms, call notifications |
 | `websocket.spec.ts` | WebSocket connection, typing indicators |
+| `404.spec.ts` | 404 page rendering, navigation |
+| `notifications.spec.ts` | Bell icon, panel, mention notification, mark all read |
+| `room-management.spec.ts` | Room CRUD, hierarchy, join from explore |
+| `profile.spec.ts` | View/edit profile, theme toggle |
+| `chat-pagination.spec.ts` | Scroll-to-bottom, pagination, no scroll yank |
+| `connection-status.spec.ts` | WS banner on disconnect/reconnect |
 
 ### Test Helpers
 

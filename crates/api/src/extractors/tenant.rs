@@ -6,7 +6,6 @@ use crate::error::ApiError;
 
 /// Extracts tenant_id from the URL path parameter `:tenant_id`
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct TenantId(pub ObjectId);
 
 impl<S> FromRequestParts<S> for TenantId

@@ -130,7 +130,7 @@
           <v-icon start>mdi-message-badge</v-icon>
           {{ roomStore.totalUnread }}
         </v-btn>
-        <v-btn icon="mdi-magnify" size="small" />
+        <v-btn icon="mdi-magnify" size="small" @click="showSearch = true" />
         <v-btn
           :icon="isDark ? 'mdi-weather-sunny' : 'mdi-weather-night'"
           size="small"
@@ -167,9 +167,33 @@
       </template>
     </v-app-bar>
 
+    <v-alert
+      v-if="wsStore.status === 'connecting'"
+      type="warning"
+      density="compact"
+      variant="tonal"
+      closable
+      class="ws-status-banner"
+    >
+      Connecting...
+    </v-alert>
+    <v-alert
+      v-else-if="wsStore.status === 'disconnected'"
+      type="error"
+      density="compact"
+      variant="tonal"
+      closable
+      class="ws-status-banner"
+    >
+      Disconnected. Reconnecting...
+    </v-alert>
+
     <v-main class="app-main-no-scroll">
       <router-view />
     </v-main>
+
+    <!-- Global search dialog -->
+    <search-dialog v-model="showSearch" />
 
     <!-- Call started notification -->
     <v-snackbar v-model="callSnackbar" :timeout="8000" color="success" location="top right">
@@ -191,14 +215,17 @@ import { useTenantStore } from '@/stores/tenant'
 import { useRoomStore } from '@/stores/rooms'
 import { useNotificationStore } from '@/stores/notification'
 import { useConferenceStore } from '@/stores/conference'
+import { useWsStore } from '@/stores/ws'
 import NotificationPanel from '@/components/layout/NotificationPanel.vue'
 import MiniConference from '@/components/conference/MiniConference.vue'
+import SearchDialog from '@/components/layout/SearchDialog.vue'
 
 const { auth, logout: handleLogout } = useAuth()
 const tenantStore = useTenantStore()
 const roomStore = useRoomStore()
 const notificationStore = useNotificationStore()
 const conferenceStore = useConferenceStore()
+const wsStore = useWsStore()
 const route = useRoute()
 const router = useRouter()
 const theme = useTheme()
@@ -241,6 +268,7 @@ function returnToCall() {
 const drawer = ref(true)
 const rail = ref(false)
 const showNotifications = ref(false)
+const showSearch = ref(false)
 
 const isDark = computed(() => theme.global.current.value.dark)
 
@@ -310,10 +338,18 @@ function selectTenant(t: Tenant) {
   tenantStore.setCurrent(t as never)
 }
 
+function onSearchShortcut(e: KeyboardEvent) {
+  if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
+    e.preventDefault()
+    showSearch.value = true
+  }
+}
+
 onMounted(async () => {
   await tenantStore.fetchTenants()
   notificationStore.fetchUnreadCount()
   window.addEventListener('room:call_started', onCallStarted)
+  window.addEventListener('keydown', onSearchShortcut)
   // Fetch rooms and unread counts for current tenant
   if (tenantId.value) {
     await roomStore.fetchRooms(tenantId.value)
@@ -323,6 +359,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   window.removeEventListener('room:call_started', onCallStarted)
+  window.removeEventListener('keydown', onSearchShortcut)
 })
 </script>
 
@@ -347,6 +384,10 @@ onUnmounted(() => {
   flex-direction: column !important;
 }
 
+.ws-status-banner {
+  flex: 0 0 auto;
+  border-radius: 0;
+}
 .call-pulse {
   animation: pulse-green 2s ease-in-out infinite;
 }

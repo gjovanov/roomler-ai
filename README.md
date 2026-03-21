@@ -39,8 +39,10 @@ Real-time communication and collaboration platform with multi-tenancy, hierarchi
 | **Export** | Conversation export to XLSX | :white_check_mark: |
 | | PDF export (custom raw PDF 1.4 generator) | :white_check_mark: |
 | | Background task processing | :white_check_mark: |
+| **Search** | Global full-text search (Ctrl+K) across messages, rooms, people | :white_check_mark: |
+| | MongoDB text indexes for fast search | :white_check_mark: |
 | **WebSocket** | Live presence & typing indicators | :white_check_mark: |
-| | Real-time message delivery | :white_check_mark: |
+| | Real-time message delivery (Redis Pub/Sub for multi-instance) | :white_check_mark: |
 | | Media signaling (join/produce/consume) | :white_check_mark: |
 | **Frontend** | Vue 3 + Vuetify 3 SPA | :white_check_mark: |
 | | 12 Pinia stores, 19 views | :white_check_mark: |
@@ -59,7 +61,7 @@ Real-time communication and collaboration platform with multi-tenancy, hierarchi
 | **Auth** | JWT (argon2 hashing), httpOnly cookies, OAuth 2.0 |
 | **AI** | Claude API (document recognition) |
 | **Cloud** | Google Drive, OneDrive, Dropbox (OAuth2 + async_trait) |
-| **Testing** | 114 Rust integration tests, 15 Playwright E2E specs, Vitest unit tests |
+| **Testing** | 135 Rust integration tests, 24 Playwright E2E specs, 215 Vitest unit tests |
 | **Infrastructure** | Docker Compose (MongoDB, Redis, MinIO, Coturn) |
 
 ## Architecture

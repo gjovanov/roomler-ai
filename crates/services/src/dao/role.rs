@@ -16,6 +16,7 @@ impl RoleDao {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn create(
         &self,
         tenant_id: ObjectId,
@@ -56,6 +57,7 @@ impl RoleDao {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn update(
         &self,
         role_id: ObjectId,

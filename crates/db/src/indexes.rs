@@ -20,6 +20,7 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> 
         vec![
             index_unique(bson::doc! { "email": 1 }),
             index_unique(bson::doc! { "username": 1 }),
+            index_text(bson::doc! { "display_name": "text", "username": "text" }),
         ],
     )
     .await?;
@@ -56,6 +57,7 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> 
             index(bson::doc! { "tenant_id": 1, "name": 1 }),
             index(bson::doc! { "tenant_id": 1, "is_default": 1 }),
             index_unique_sparse(bson::doc! { "meeting_code": 1 }),
+            index_text(bson::doc! { "name": "text", "purpose": "text", "tags": "text" }),
         ],
     )
     .await?;
@@ -81,6 +83,7 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> 
             index(bson::doc! { "tenant_id": 1, "author_id": 1, "created_at": -1 }),
             index(bson::doc! { "room_id": 1, "is_pinned": 1 }),
             index(bson::doc! { "mentions.users": 1 }),
+            index_text(bson::doc! { "content": "text" }),
         ],
     )
     .await?;
@@ -134,9 +137,10 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> 
     create_indexes(
         db,
         "background_tasks",
-        vec![index(
-            bson::doc! { "tenant_id": 1, "user_id": 1, "status": 1 },
-        )],
+        vec![
+            index(bson::doc! { "tenant_id": 1, "user_id": 1, "status": 1 }),
+            index_ttl(bson::doc! { "expires_at": 1 }, 0),
+        ],
     )
     .await?;
 
@@ -148,6 +152,8 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> 
             index(bson::doc! { "tenant_id": 1, "created_at": -1 }),
             index(bson::doc! { "tenant_id": 1, "action": 1, "created_at": -1 }),
             index(bson::doc! { "tenant_id": 1, "actor_id": 1, "created_at": -1 }),
+            // Auto-expire audit logs after 90 days
+            index_ttl(bson::doc! { "created_at": 1 }, 90 * 24 * 60 * 60),
         ],
     )
     .await?;
@@ -177,7 +183,8 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> 
         "activation_codes",
         vec![
             index(bson::doc! { "user_id": 1 }),
-            index(bson::doc! { "valid_to": 1 }),
+            // TTL: auto-expire when valid_to passes
+            index_ttl(bson::doc! { "valid_to": 1 }, 0),
         ],
     )
     .await?;
@@ -195,6 +202,21 @@ fn index_unique(keys: bson::Document) -> IndexModel {
         .keys(keys)
         .options(IndexOptions::builder().unique(true).build())
         .build()
+}
+
+fn index_ttl(keys: bson::Document, expire_after_secs: u64) -> IndexModel {
+    IndexModel::builder()
+        .keys(keys)
+        .options(
+            IndexOptions::builder()
+                .expire_after(std::time::Duration::from_secs(expire_after_secs))
+                .build(),
+        )
+        .build()
+}
+
+fn index_text(keys: bson::Document) -> IndexModel {
+    IndexModel::builder().keys(keys).build()
 }
 
 fn index_unique_sparse(keys: bson::Document) -> IndexModel {
@@ -219,8 +241,9 @@ async fn create_indexes(
             // IndexKeySpecsConflict (code 86): an existing index has the same name
             // but different options (e.g. non-sparse vs sparse). Drop the conflicting
             // index and retry.
-            if let mongodb::error::ErrorKind::Command(ref cmd_err) = *e.kind {
-                if cmd_err.code == 86 {
+            if let mongodb::error::ErrorKind::Command(ref cmd_err) = *e.kind
+                && cmd_err.code == 86
+            {
                     tracing::warn!(
                         collection,
                         "Index conflict detected, dropping conflicting indexes and retrying"
@@ -230,7 +253,6 @@ async fn create_indexes(
                     coll.create_indexes(indexes).await?;
                     info!(collection, "Indexes recreated after conflict resolution");
                     return Ok(());
-                }
             }
             Err(e)
         }

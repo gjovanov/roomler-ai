@@ -150,7 +150,7 @@ async fn handle_client_message(state: &AppState, user_id: &ObjectId, connection_
                         "user_id": user_id.to_hex(),
                     }
                 });
-                super::dispatcher::broadcast(&state.ws_storage, &recipients, &event).await;
+                super::dispatcher::broadcast_with_redis(&state.ws_storage, &state.redis_pubsub, &recipients, &event).await;
             }
         }
         "presence:update" => {
@@ -163,7 +163,7 @@ async fn handle_client_message(state: &AppState, user_id: &ObjectId, connection_
                         "presence": presence,
                     }
                 });
-                super::dispatcher::broadcast(&state.ws_storage, &all_users, &event).await;
+                super::dispatcher::broadcast_with_redis(&state.ws_storage, &state.redis_pubsub, &all_users, &event).await;
             }
         }
         "media:join" => {

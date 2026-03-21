@@ -98,10 +98,10 @@ impl MessageDao {
         let mut filter = doc! { "room_id": room_id, "deleted_at": null, "thread_id": null };
 
         // Support cursor-based pagination via `before` timestamp
-        if let Some(ref before) = params.before {
-            if let Ok(dt) = bson::DateTime::parse_rfc3339_str(before) {
-                filter.insert("created_at", doc! { "$lt": dt });
-            }
+        if let Some(ref before) = params.before
+            && let Ok(dt) = bson::DateTime::parse_rfc3339_str(before)
+        {
+            filter.insert("created_at", doc! { "$lt": dt });
         }
 
         self.base

@@ -4,6 +4,7 @@ pub mod background_task;
 pub mod export;
 pub mod file;
 pub mod giphy;
+pub(crate) mod helpers;
 pub mod integration;
 pub mod invite;
 pub mod message;
@@ -17,4 +18,5 @@ pub mod room;
 pub mod stripe;
 pub mod tenant;
 
+pub mod search;
 pub mod user;

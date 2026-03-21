@@ -1,5 +1,5 @@
 <template>
-  <div :class="['message-bubble', { 'message-bubble--compact': compact }]">
+  <div :class="['message-bubble', { 'message-bubble--compact': compact, 'message-bubble--unread': unread }]">
     <div class="d-flex align-start">
       <v-avatar size="32" color="primary" class="mr-2 mt-1" v-if="!compact">
         <span class="text-caption">{{ authorInitial }}</span>
@@ -27,13 +27,14 @@
           <v-spacer />
           <!-- Action buttons (shown on hover) -->
           <div v-if="!editing" class="message-actions">
-            <v-btn icon="mdi-emoticon-outline" size="x-small" variant="text" @click="showEmojiPicker = true" />
-            <v-btn icon="mdi-reply" size="x-small" variant="text" @click="$emit('reply')" />
+            <v-btn icon="mdi-emoticon-outline" size="x-small" variant="text" aria-label="React with emoji" @click="showEmojiPicker = true" />
+            <v-btn icon="mdi-reply" size="x-small" variant="text" aria-label="Reply in thread" @click="$emit('reply')" />
             <v-btn
               v-if="editable"
               icon="mdi-pencil"
               size="x-small"
               variant="text"
+              aria-label="Edit message"
               @click="startEditing"
             />
             <v-btn
@@ -42,12 +43,14 @@
               size="x-small"
               variant="text"
               color="error"
+              aria-label="Delete message"
               @click="showDeleteConfirm = true"
             />
             <v-btn
               :icon="message.is_pinned ? 'mdi-pin-off' : 'mdi-pin'"
               size="x-small"
               variant="text"
+              :aria-label="message.is_pinned ? 'Unpin message' : 'Pin message'"
               @click="$emit('pin')"
             />
           </div>
@@ -180,6 +183,7 @@ const props = defineProps<{
   message: Message
   compact?: boolean
   editable?: boolean
+  unread?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -259,6 +263,10 @@ onBeforeUnmount(() => {
   padding: 4px 8px;
   border-radius: 4px;
 }
+.message-bubble--unread {
+  border-left: 3px solid #FF9800;
+  background: rgba(255, 152, 0, 0.05);
+}
 .message-bubble:hover {
   background: rgba(255, 255, 255, 0.04);
 }
@@ -266,7 +274,8 @@ onBeforeUnmount(() => {
   opacity: 0;
   transition: opacity 0.15s;
 }
-.message-bubble:hover .message-actions {
+.message-bubble:hover .message-actions,
+.message-actions:focus-within {
   opacity: 1;
 }
 

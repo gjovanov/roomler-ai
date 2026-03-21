@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
-use roomler2_db::models::{Mentions, MessageAttachment, NotificationSource, NotificationType};
+use roomler2_db::models::{Mentions, MessageAttachment};
 use roomler2_services::dao::base::PaginationParams;
 
 #[derive(Debug, Deserialize)]
@@ -159,8 +159,9 @@ pub async fn create(
     let attachments = if !body.attachment_ids.is_empty() {
         let mut att = Vec::new();
         for file_id_str in &body.attachment_ids {
-            if let Ok(fid) = ObjectId::parse_str(file_id_str) {
-                if let Ok(file) = state.files.base.find_by_id_in_tenant(tid, fid).await {
+            if let Ok(fid) = ObjectId::parse_str(file_id_str)
+                && let Ok(file) = state.files.base.find_by_id_in_tenant(tid, fid).await
+            {
                     att.push(MessageAttachment {
                         file_id: file.id.unwrap(),
                         filename: file.filename,
@@ -170,7 +171,6 @@ pub async fn create(
                         thumbnail_url: file.thumbnails.first().map(|t| t.url.clone()),
                         is_spoiler: false,
                     });
-                }
             }
         }
         att
@@ -198,25 +198,27 @@ pub async fn create(
     // Fetch author display name for the response
     let names = state.users.find_display_names(&[auth.user_id]).await.unwrap_or_default();
 
+    // Fetch room member IDs once and reuse for WS broadcast, thread update, and notifications
+    let all_member_ids = state.rooms.find_member_user_ids(rid).await?;
+    let member_ids_excluding_sender: Vec<ObjectId> = all_member_ids
+        .iter()
+        .filter(|id| **id != auth.user_id)
+        .copied()
+        .collect();
+
     // Broadcast via WebSocket to room members (exclude sender)
     let response = to_response(message, &names);
-    let member_ids: Vec<ObjectId> = state
-        .rooms
-        .find_member_user_ids(rid)
-        .await?
-        .into_iter()
-        .filter(|id| *id != auth.user_id)
-        .collect();
     let event = serde_json::json!({
         "type": "message:create",
         "data": &response,
     });
-    crate::ws::dispatcher::broadcast(&state.ws_storage, &member_ids, &event).await;
+    crate::ws::dispatcher::broadcast_with_redis(&state.ws_storage, &state.redis_pubsub, &member_ids_excluding_sender, &event).await;
 
     // If this was a thread reply, broadcast an update for the parent message
     // so other users see the updated is_thread_root + reply_count
-    if let Some(parent_id) = thread_id {
-        if let Ok(parent_msg) = state.messages.base.find_by_id(parent_id).await {
+    if let Some(parent_id) = thread_id
+        && let Ok(parent_msg) = state.messages.base.find_by_id(parent_id).await
+    {
             let parent_author_ids = vec![parent_msg.author_id];
             let parent_names = state.users.find_display_names(&parent_author_ids).await.unwrap_or_default();
             let parent_response = to_response(parent_msg, &parent_names);
@@ -225,16 +227,14 @@ pub async fn create(
                 "data": &parent_response,
             });
             // Broadcast to ALL members (including sender, so sender's UI also updates)
-            let all_member_ids = state.rooms.find_member_user_ids(rid).await.unwrap_or_default();
-            crate::ws::dispatcher::broadcast(&state.ws_storage, &all_member_ids, &parent_event).await;
-        }
+            crate::ws::dispatcher::broadcast_with_redis(&state.ws_storage, &state.redis_pubsub, &all_member_ids, &parent_event).await;
     }
 
-    // Create notifications for mentioned users
+    // Create notifications for mentioned users via helper
     if let Some(ref mention_req) = body.mentions {
         let mentioned_user_ids: Vec<ObjectId> = if mention_req.everyone {
             // @everyone: notify all room members except sender
-            member_ids.clone()
+            member_ids_excluding_sender.clone()
         } else {
             mention_req
                 .users
@@ -248,99 +248,25 @@ pub async fn create(
             .map(|r| r.name)
             .unwrap_or_default();
 
-        let source = NotificationSource {
-            entity_type: "message".to_string(),
-            entity_id: message_id,
-            actor_id: Some(auth.user_id),
-        };
+        let mentioner_name = names
+            .get(&auth.user_id)
+            .cloned()
+            .unwrap_or_else(|| auth.user_id.to_hex());
 
-        let link = format!(
-            "/tenant/{}/room/{}?msg={}",
-            tenant_id, room_id, message_id.to_hex()
-        );
-
-        for user_id in &mentioned_user_ids {
-            if let Ok(notification) = state.notifications.create(
-                tid,
-                *user_id,
-                NotificationType::Mention,
-                format!("Mentioned in #{}", room_name),
-                body.content.chars().take(200).collect(),
-                Some(link.clone()),
-                source.clone(),
-            ).await {
-                // Send notification via WebSocket
-                let notif_event = serde_json::json!({
-                    "type": "notification:new",
-                    "data": {
-                        "id": notification.id.unwrap().to_hex(),
-                        "title": notification.title,
-                        "body": notification.body,
-                        "link": notification.link,
-                        "notification_type": "mention",
-                        "created_at": notification.created_at.try_to_rfc3339_string().unwrap_or_default(),
-                    }
-                });
-                crate::ws::dispatcher::send_to_user(&state.ws_storage, user_id, &notif_event).await;
-
-                // Send email + push notifications if user is offline
-                if !state.ws_storage.is_connected(user_id) {
-                    if let Some(ref email_svc) = state.email {
-                        if let Ok(user) = state.users.base.find_by_id(*user_id).await {
-                            let email_svc = email_svc.clone();
-                            let mentioner_name = names
-                                .get(&auth.user_id)
-                                .cloned()
-                                .unwrap_or_else(|| auth.user_id.to_hex());
-                            let room_name = room_name.clone();
-                            let preview: String = body.content.chars().take(200).collect();
-                            let link_url = format!(
-                                "{}/tenant/{}/room/{}",
-                                state.settings.oauth.base_url, tenant_id, room_id
-                            );
-                            tokio::spawn(async move {
-                                if let Err(e) = email_svc
-                                    .send_mention_notification(
-                                        &user.email,
-                                        &mentioner_name,
-                                        &room_name,
-                                        &preview,
-                                        &link_url,
-                                    )
-                                    .await
-                                {
-                                    tracing::warn!(%e, "Failed to send mention email");
-                                }
-                            });
-                        }
-                    }
-
-                    // Push notification for offline mentioned user
-                    if let Some(ref push_svc) = state.push {
-                        let push = push_svc.clone();
-                        let subs_dao = state.push_subscriptions.clone();
-                        let uid = *user_id;
-                        let title = format!("Mentioned in #{}", room_name);
-                        let push_body: String = body.content.chars().take(200).collect();
-                        let link = format!("/tenant/{}/room/{}", tenant_id, room_id);
-                        tokio::spawn(async move {
-                            if let Ok(subs) = subs_dao.find_by_user(uid).await {
-                                for sub in subs {
-                                    let _ = push.send(
-                                        &sub.endpoint,
-                                        &sub.keys.auth,
-                                        &sub.keys.p256dh,
-                                        &title,
-                                        &push_body,
-                                        Some(&link),
-                                    ).await;
-                                }
-                            }
-                        });
-                    }
-                }
-            }
-        }
+        super::helpers::notify_mentions(
+            &state,
+            tid,
+            rid,
+            message_id,
+            auth.user_id,
+            &mentioned_user_ids,
+            &room_name,
+            &body.content,
+            &mentioner_name,
+            &tenant_id,
+            &room_id,
+        )
+        .await;
     }
 
     Ok(Json(response))
@@ -385,7 +311,7 @@ pub async fn update(
         "type": "message:update",
         "data": &response,
     });
-    crate::ws::dispatcher::broadcast(&state.ws_storage, &member_ids, &event).await;
+    crate::ws::dispatcher::broadcast_with_redis(&state.ws_storage, &state.redis_pubsub, &member_ids, &event).await;
 
     Ok(Json(response))
 }
@@ -432,7 +358,7 @@ pub async fn delete(
             "room_id": room_id,
         }
     });
-    crate::ws::dispatcher::broadcast(&state.ws_storage, &member_ids, &event).await;
+    crate::ws::dispatcher::broadcast_with_redis(&state.ws_storage, &state.redis_pubsub, &member_ids, &event).await;
 
     Ok(Json(serde_json::json!({ "deleted": true })))
 }
@@ -492,7 +418,7 @@ pub async fn toggle_pin(
             "pinned": body.pinned,
         }
     });
-    crate::ws::dispatcher::broadcast(&state.ws_storage, &member_ids, &event).await;
+    crate::ws::dispatcher::broadcast_with_redis(&state.ws_storage, &state.redis_pubsub, &member_ids, &event).await;
 
     Ok(Json(serde_json::json!({ "pinned": body.pinned })))
 }

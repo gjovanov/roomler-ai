@@ -33,8 +33,10 @@
               v-model="password"
               :label="$t('auth.password')"
               prepend-inner-icon="mdi-lock"
-              type="password"
+              :type="showPassword ? 'text' : 'password'"
+              :append-inner-icon="showPassword ? 'mdi-eye-off' : 'mdi-eye'"
               :rules="[rules.required, rules.minLength(6)]"
+              @click:append-inner="showPassword = !showPassword"
             />
 
             <v-alert v-if="auth.error" type="error" density="compact" class="mb-4">
@@ -96,6 +98,7 @@ const email = ref('')
 const username = ref('')
 const displayName = ref('')
 const password = ref('')
+const showPassword = ref(false)
 
 const inviteCode = computed(() => (route.query.invite as string) || sessionStorage.getItem('pending_invite_code') || undefined)
 

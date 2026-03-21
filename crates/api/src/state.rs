@@ -15,6 +15,7 @@ use roomler2_services::{
 
 use std::sync::Arc;
 
+use crate::ws::redis_pubsub::RedisPubSub;
 use crate::ws::storage::WsStorage;
 
 #[derive(Clone)]
@@ -43,7 +44,7 @@ pub struct AppState {
     pub email: Option<Arc<EmailService>>,
     pub push: Option<Arc<PushService>>,
     pub push_subscriptions: Arc<PushSubscriptionDao>,
-
+    pub redis_pubsub: Option<Arc<RedisPubSub>>,
 }
 
 impl AppState {
@@ -107,6 +108,14 @@ impl AppState {
             None
         };
 
+        let redis_pubsub = match RedisPubSub::new(&settings.redis.url).await {
+            Ok(ps) => Some(Arc::new(ps)),
+            Err(e) => {
+                tracing::warn!("Failed to initialize Redis Pub/Sub: {} — cross-instance WS delivery disabled", e);
+                None
+            }
+        };
+
         let giphy = if !settings.giphy.api_key.is_empty() {
             Some(Arc::new(GiphyService::new(
                 settings.giphy.api_key.clone(),
@@ -140,7 +149,7 @@ impl AppState {
             email,
             push,
             push_subscriptions,
-
+            redis_pubsub,
         })
     }
 }

@@ -53,6 +53,15 @@ fn default_per_page() -> u64 {
     25
 }
 
+const MAX_PER_PAGE: u64 = 100;
+
+impl PaginationParams {
+    /// Clamp per_page to MAX_PER_PAGE to prevent abuse
+    pub fn clamped_per_page(&self) -> u64 {
+        self.per_page.min(MAX_PER_PAGE)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaginatedResult<T> {
     pub items: Vec<T>,
@@ -102,6 +111,11 @@ where
         Ok(self.collection.find_one(filter).await?)
     }
 
+    pub async fn find_by_ids(&self, ids: &[ObjectId]) -> DaoResult<Vec<T>> {
+        let filter = doc! { "_id": { "$in": ids } };
+        self.find_many(filter, None).await
+    }
+
     pub async fn find_many(
         &self,
         filter: Document,
@@ -130,8 +144,9 @@ where
         sort: Option<Document>,
         params: &PaginationParams,
     ) -> DaoResult<PaginatedResult<T>> {
+        let per_page = params.clamped_per_page();
         let total = self.collection.count_documents(filter.clone()).await?;
-        let skip = (params.page - 1) * params.per_page;
+        let skip = (params.page - 1) * per_page;
 
         let sort = sort.unwrap_or_else(|| doc! { "created_at": -1 });
 
@@ -140,7 +155,7 @@ where
             .find(filter)
             .sort(sort)
             .skip(skip)
-            .limit(params.per_page as i64)
+            .limit(per_page as i64)
             .await?;
 
         let mut items = Vec::new();
@@ -149,15 +164,41 @@ where
             items.push(doc);
         }
 
-        let total_pages = total.div_ceil(params.per_page);
+        let total_pages = if per_page > 0 { total.div_ceil(per_page) } else { 0 };
 
         Ok(PaginatedResult {
             items,
             total,
             page: params.page,
-            per_page: params.per_page,
+            per_page,
             total_pages,
         })
+    }
+
+    pub async fn text_search(
+        &self,
+        query: &str,
+        additional_filter: Document,
+        limit: i64,
+    ) -> DaoResult<Vec<T>> {
+        let mut filter = doc! { "$text": { "$search": query } };
+        for (k, v) in additional_filter.iter() {
+            filter.insert(k, v.clone());
+        }
+
+        let mut cursor = self
+            .collection
+            .find(filter)
+            .sort(doc! { "score": { "$meta": "textScore" } })
+            .limit(limit)
+            .await?;
+
+        let mut results = Vec::new();
+        use futures::TryStreamExt;
+        while let Some(doc) = cursor.try_next().await? {
+            results.push(doc);
+        }
+        Ok(results)
     }
 
     pub async fn insert_one(&self, doc: &T) -> DaoResult<ObjectId> {

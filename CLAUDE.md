@@ -91,19 +91,21 @@ Router::new()
     .with_state(state)
 ```
 
-Route groups: auth (7), user (2), oauth (2), stripe (4), invite (2+4), giphy (2), push (3), notification (5), tenant (3), member (2), role (6), room (16), message (11), recording (3), file (7), task (3), export (2), health (1), ws (1).
+Route groups: auth (7), user (2), oauth (2), stripe (4), invite (2+4), giphy (2), push (3), notification (5), tenant (3), member (2), role (6), room (16), message (11), recording (3), file (7), task (3), export (2), search (1), health (1), ws (1).
 
 ## DB Model Pattern
 
 MongoDB native driver (not Mongoose). Models in `crates/db/src/models/`:
 - 15 collections: tenants, users, tenant_members, roles, rooms, room_members, messages, reactions, recordings, files, invites, background_tasks, audit_logs, notifications, custom_emojis, activation_codes
-- Indexes defined in `crates/db/src/indexes.rs` (unique indexes on email, username, slug, code, etc.)
+- Indexes defined in `crates/db/src/indexes.rs` (unique, TTL, text indexes on email, username, slug, code, content, etc.)
+- Text indexes on messages (content), rooms (name, purpose, tags), users (display_name, username) for full-text search
+- TTL indexes on audit_logs (90 days), activation_codes, background_tasks
 - All queries use BSON documents, no ORM
 
 ## Frontend Conventions
 
 - **Plugin order**: i18n -> vuetify -> pinia -> router (in main.ts)
-- **Vuetify**: Light + dark themes, custom primary/secondary colors
+- **Vuetify**: Light + dark themes, auto-import tree-shaking via `vite-plugin-vuetify`
 - **Stores**: Pinia with setup store pattern (`defineStore('name', () => { ... })`)
 - **Rich text**: TipTap v3 with markdown support, mentions, emoji
 - **WebRTC**: Mediasoup client for video conferencing
@@ -116,17 +118,20 @@ MongoDB native driver (not Mongoose). Models in `crates/db/src/models/`:
 - Each test gets a unique UUID-named database, auto-dropped on teardown
 - Tests spawn real Axum servers on random ports
 - Requires MongoDB on `localhost:27019` and Redis on `localhost:6379`
-- Test modules: auth, tenant, room, message, reaction, recording, file, invite, role, notification, push, giphy, oauth, call
+- Test modules: auth, tenant, room, message, reaction, recording, file, invite, role, notification, push, giphy, oauth, call, pagination, rate_limit, cors
 
 **E2E tests** (`ui/e2e/`):
 - Playwright 1.58 with Chromium (fake media stream devices for WebRTC)
-- 18 spec files: auth, channels, chat, chat-multi, chat-reactions, chat-threads, conference (4 specs), dashboard, files, invite, mention, oauth, room-fixes, websocket
+- 24 spec files: auth, channels, chat, chat-multi, chat-pagination, chat-reactions, chat-threads, conference (4 specs), connection-status, dashboard, files, invite, mention, notifications, oauth, profile, room-fixes, room-management, websocket, 404
 - Fixtures in `ui/e2e/fixtures/test-helpers.ts`
 - Base URL: `http://localhost:5000` (or E2E_BASE_URL env var)
 
 **Unit tests** (`ui/src/`):
-- Vitest with jsdom environment
-- 1 spec file: `ui/src/plugins/__tests__/vuetify.spec.ts`
+- Vitest with jsdom environment, 215 tests across 13 files
+- Stores: auth, messages, rooms, ws, notifications, conference, tenants, files
+- Composables: useValidation, useSnackbar, useMarkdown
+- API client: token injection, error handling
+- Plugins: vuetify theme config
 
 ## Environment
 
@@ -158,12 +163,12 @@ Run the **most specific** command first. If a backend change also affects the fr
 
 ## Known Issues
 
-- [CRITICAL] [2026-03-10] CORS is fully permissive (Any origin/method/header) — crates/api/src/lib.rs:20-23 — Status: OPEN
-- [HIGH] [2026-03-10] No rate limiting on any endpoint — Status: OPEN
+- [CRITICAL] [2026-03-10] CORS is fully permissive — Status: FIXED (2026-03-21, uses configured cors_origins)
+- [HIGH] [2026-03-10] No rate limiting — Status: FIXED (2026-03-21, tower_governor 60 req/min per IP)
 - [HIGH] [2026-03-10] JWT default secret is "change-me-in-production" — must be overridden in prod — Status: OPEN
-- [MEDIUM] [2026-03-10] 5 TypeScript type errors in Vue components (vue-tsc --noEmit fails) — Status: OPEN
-- [MEDIUM] [2026-03-10] No linting configured (no ESLint, Prettier, Biome for frontend) — Status: OPEN
-- [MEDIUM] [2026-03-10] No security headers in nginx config (CSP, HSTS, X-Frame-Options, X-Content-Type-Options) — Status: OPEN
+- [MEDIUM] [2026-03-10] TypeScript type errors — Status: FIXED (2026-03-21, vue-tsc --noEmit passes)
+- [MEDIUM] [2026-03-10] No security headers in nginx — Status: FIXED (2026-03-21, X-Frame-Options, X-Content-Type-Options, etc.)
+- [MEDIUM] [2026-03-10] No CI pipeline — Status: FIXED (2026-03-21, GitHub Actions: clippy + build + test)
 - [LOW] [2026-03-10] Deployment strategy is Recreate (no zero-downtime rolling updates) — Status: OPEN
 - [LOW] [2026-03-10] No git hooks configured (no pre-commit, no lint-staged) — Status: OPEN
 

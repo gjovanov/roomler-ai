@@ -31,3 +31,13 @@ mod invite_tests;
 mod member_tests;
 #[cfg(test)]
 mod oauth_tests;
+#[cfg(test)]
+mod notification_tests;
+#[cfg(test)]
+mod rate_limit_tests;
+#[cfg(test)]
+mod pagination_tests;
+#[cfg(test)]
+mod role_tests;
+#[cfg(test)]
+mod cors_tests;

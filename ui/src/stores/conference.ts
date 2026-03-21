@@ -36,6 +36,20 @@ export const useConferenceStore = defineStore('conference', () => {
   const isVideoOn = ref(true)
   const isScreenSharing = ref(false)
 
+  // --- Device selection ---
+  const availableDevices = ref<MediaDeviceInfo[]>([])
+  const selectedAudioDeviceId = ref<string>('')
+  const selectedVideoDeviceId = ref<string>('')
+
+  async function enumerateDevices() {
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices()
+      availableDevices.value = devices
+    } catch (err) {
+      console.error('[conference] Failed to enumerate devices:', err)
+    }
+  }
+
   // --- Active speaker detection ---
   const audioLevels = ref<Map<string, number>>(new Map())
   const activeSpeakerKey = ref<string | null>(null)
@@ -220,8 +234,8 @@ export const useConferenceStore = defineStore('conference', () => {
 
   async function produceLocalMedia() {
     const stream = await navigator.mediaDevices.getUserMedia({
-      audio: true,
-      video: true,
+      audio: selectedAudioDeviceId.value ? { deviceId: { exact: selectedAudioDeviceId.value } } : true,
+      video: selectedVideoDeviceId.value ? { deviceId: { exact: selectedVideoDeviceId.value } } : true,
     })
     localStream.value = stream
 
@@ -583,11 +597,17 @@ export const useConferenceStore = defineStore('conference', () => {
     isVideoOn,
     isScreenSharing,
 
+    // Device selection
+    availableDevices,
+    selectedAudioDeviceId,
+    selectedVideoDeviceId,
+
     // Active speaker
     audioLevels,
     activeSpeakerKey,
 
     // Methods
+    enumerateDevices,
     joinRoom,
     produceLocalMedia,
     leaveRoom,

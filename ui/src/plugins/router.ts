@@ -30,13 +30,11 @@ const routes: RouteRecordRaw[] = [
     path: '/privacy',
     name: 'privacy',
     component: () => import('@/views/legal/PrivacyPolicyView.vue'),
-    meta: { guest: false },
   },
   {
     path: '/terms',
     name: 'terms',
     component: () => import('@/views/legal/TermsView.vue'),
-    meta: { guest: false },
   },
   {
     path: '/oauth/callback',
@@ -120,6 +118,12 @@ const routes: RouteRecordRaw[] = [
         ],
       },
     ],
+  },
+  // 404 catch-all
+  {
+    path: '/:pathMatch(.*)*',
+    name: 'not-found',
+    component: () => import('@/views/NotFoundView.vue'),
   },
 ]
 

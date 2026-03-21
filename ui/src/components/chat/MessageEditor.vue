@@ -154,12 +154,16 @@ import StarterKit from '@tiptap/starter-kit'
 import Placeholder from '@tiptap/extension-placeholder'
 import Link from '@tiptap/extension-link'
 import Underline from '@tiptap/extension-underline'
+import Image from '@tiptap/extension-image'
 import Mention from '@tiptap/extension-mention'
 import { Markdown } from 'tiptap-markdown'
 import tippy, { type Instance as TippyInstance } from 'tippy.js'
 import MentionList from './MentionList.vue'
 import type { MentionItem } from './MentionList.vue'
 import { api } from '@/api/client'
+import { useSnackbar } from '@/composables/useSnackbar'
+
+const { showError } = useSnackbar()
 
 type EditorMode = 'minimal' | 'rich'
 
@@ -231,12 +235,13 @@ async function handleFileSelect(event: Event) {
 
       // Insert image or file reference into editor
       if (file.type.startsWith('image/')) {
-        editor.value?.chain().focus().insertContent(`![${file.name}](${result.url})`).run()
+        editor.value?.chain().focus().setImage({ src: result.url, alt: file.name }).run()
       } else {
         editor.value?.chain().focus().insertContent(`[${file.name}](${result.url})`).run()
       }
     } catch (err) {
       console.error('File upload failed:', err)
+      showError('File upload failed. Please try again.')
     }
   }
 
@@ -262,17 +267,19 @@ async function handleDrop(event: DragEvent) {
       pendingAttachmentIds.value.push(result.id)
 
       if (file.type.startsWith('image/')) {
-        editor.value?.chain().focus().insertContent(`![${file.name}](${result.url})`).run()
+        editor.value?.chain().focus().setImage({ src: result.url, alt: file.name }).run()
       } else {
         editor.value?.chain().focus().insertContent(`[${file.name}](${result.url})`).run()
       }
     } catch (err) {
       console.error('File upload failed:', err)
+      showError('File upload failed. Please try again.')
     }
   }
 }
 
 const mentionItems = vueRef<MentionItem[]>([])
+const isMentionOpen = vueRef(false)
 
 const editor = useEditor({
   content: props.initialContent,
@@ -281,6 +288,7 @@ const editor = useEditor({
     Placeholder.configure({ placeholder: props.placeholder }),
     Link.configure({ openOnClick: false, autolink: true }),
     Underline,
+    Image.configure({ inline: true, allowBase64: false }),
     Markdown.configure({ html: false, transformPastedText: true }),
     Mention.configure({
       HTMLAttributes: {
@@ -308,6 +316,7 @@ const editor = useEditor({
 
           return {
             onStart: (renderProps: Record<string, unknown>) => {
+              isMentionOpen.value = true
               component = new VueRenderer(MentionList, {
                 props: renderProps,
                 editor: renderProps.editor as never,
@@ -341,6 +350,7 @@ const editor = useEditor({
               return (component?.ref as unknown as { onKeyDown: (props: { event: KeyboardEvent }) => boolean })?.onKeyDown(renderProps)
             },
             onExit() {
+              isMentionOpen.value = false
               popup?.[0]?.destroy()
               component?.destroy()
             },
@@ -354,6 +364,8 @@ const editor = useEditor({
       // In minimal mode: Enter sends, Shift+Enter inserts newline
       // In rich mode: Enter inserts newline (TipTap default), no override
       if (mode.value === 'minimal' && event.key === 'Enter' && !event.shiftKey) {
+        // When mention popup is open, let the mention plugin handle Enter
+        if (isMentionOpen.value) return false
         event.preventDefault()
         handleSend()
         return true

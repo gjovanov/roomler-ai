@@ -331,11 +331,20 @@ impl RoomDao {
     }
 
     pub async fn find_member_user_ids(&self, room_id: ObjectId) -> DaoResult<Vec<ObjectId>> {
-        let members = self
-            .members
-            .find_many(doc! { "room_id": room_id }, None)
-            .await?;
-        Ok(members.into_iter().filter_map(|m| m.user_id).collect())
+        use futures::TryStreamExt;
+
+        let filter = doc! { "room_id": room_id };
+        let projection = doc! { "user_id": 1, "_id": 0 };
+        let coll = self.members.collection().clone_with_type::<bson::Document>();
+        let mut cursor = coll.find(filter).projection(projection).await?;
+
+        let mut user_ids = Vec::new();
+        while let Some(doc) = cursor.try_next().await? {
+            if let Ok(uid) = doc.get_object_id("user_id") {
+                user_ids.push(uid);
+            }
+        }
+        Ok(user_ids)
     }
 
     // ── Conference / Call operations ────────────────────────────

@@ -34,7 +34,7 @@
         <v-divider />
 
         <!-- Messages -->
-        <div ref="messageListRef" class="flex-grow-1 overflow-y-auto pa-4" style="min-height: 0;" @scroll="handleScroll">
+        <div ref="messageListRef" class="flex-grow-1 overflow-y-auto pa-4" style="min-height: 0; position: relative;" @scroll="handleScroll">
           <div v-if="messageStore.loadingMore" class="text-center pa-2">
             <v-progress-circular size="20" indeterminate />
           </div>
@@ -49,6 +49,7 @@
               <message-bubble
                 :message="msg"
                 :editable="msg.author_id === currentUserId"
+                :unread="!readMessageIds.has(msg.id) && msg.author_id !== currentUserId"
                 @reply="openThread(msg)"
                 @react="(emoji) => handleReact(msg.id, emoji)"
                 @pin="handlePin(msg.id)"
@@ -57,6 +58,23 @@
               />
             </div>
           </div>
+          <!-- Scroll to bottom button -->
+          <v-btn
+            v-if="!isNearBottom"
+            icon
+            size="small"
+            color="primary"
+            style="position: sticky; bottom: 8px; float: right; z-index: 1;"
+            @click="scrollToBottom(); newMessageCount = 0"
+          >
+            <v-icon>mdi-chevron-double-down</v-icon>
+            <v-badge
+              v-if="newMessageCount > 0"
+              :content="newMessageCount"
+              color="error"
+              floating
+            />
+          </v-btn>
         </div>
 
         <!-- Message input -->
@@ -137,7 +155,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, nextTick, watch } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount, nextTick, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { useRoomStore } from '@/stores/rooms'
@@ -179,6 +197,14 @@ const messageListRef = ref<HTMLElement | null>(null)
 const messageEditorRef = ref<InstanceType<typeof MessageEditor> | null>(null)
 const threadEditorRef = ref<InstanceType<typeof MessageEditor> | null>(null)
 const roomMembers = ref<MentionItem[]>([])
+const isNearBottom = ref(true)
+const newMessageCount = ref(0)
+
+function checkIfNearBottom() {
+  if (!messageListRef.value) return
+  const { scrollTop, scrollHeight, clientHeight } = messageListRef.value
+  isNearBottom.value = scrollHeight - scrollTop - clientHeight < 150
+}
 
 async function fetchRoomMembers() {
   if (!tenantId.value || !roomId.value) return
@@ -248,6 +274,10 @@ function scrollToBottom() {
 
 async function handleScroll() {
   if (!messageListRef.value) return
+  checkIfNearBottom()
+  if (isNearBottom.value) {
+    newMessageCount.value = 0
+  }
   // Load older messages when scrolled to top
   if (messageListRef.value.scrollTop === 0 && messageStore.hasMore && !messageStore.loadingMore) {
     const prevHeight = messageListRef.value.scrollHeight
@@ -271,32 +301,92 @@ function scrollToMessage(messageId: string) {
   })
 }
 
-// Auto-scroll when new messages arrive
+// Auto-scroll when new messages arrive (only if near bottom)
 watch(
   () => messageStore.messages.length,
-  async () => {
-    await nextTick()
-    scrollToBottom()
+  async (newLen, oldLen) => {
+    if (isNearBottom.value) {
+      await nextTick()
+      scrollToBottom()
+    } else if (newLen > oldLen) {
+      newMessageCount.value += newLen - oldLen
+    }
   },
 )
 
 watch(roomId, async (id) => {
   if (id) {
+    readMessageIds.value.clear()
+    pendingReadIds.value.clear()
     fetchRoomMembers()
     await messageStore.fetchMessages(tenantId.value, id)
     await nextTick()
     scrollToBottom()
+    setupReadObserver()
   }
 })
 
-function markVisibleAsRead() {
-  if (!roomId.value || !tenantId.value) return
-  const unreadIds = messageStore.messages
-    .filter((m) => m.author_id !== currentUserId.value)
-    .map((m) => m.id)
-  if (unreadIds.length > 0) {
-    roomStore.markMessagesRead(tenantId.value, roomId.value, unreadIds)
+// Re-observe when new messages are added
+watch(() => messageStore.messages.length, () => {
+  nextTick(() => observeAllMessages())
+})
+
+onBeforeUnmount(() => {
+  if (observer) {
+    observer.disconnect()
+    observer = null
   }
+  if (readDebounceTimer) {
+    clearTimeout(readDebounceTimer)
+    readDebounceTimer = null
+  }
+})
+
+// --- IntersectionObserver-based auto-read on scroll ---
+const pendingReadIds = ref<Set<string>>(new Set())
+const readMessageIds = ref<Set<string>>(new Set())
+let readDebounceTimer: ReturnType<typeof setTimeout> | null = null
+let observer: IntersectionObserver | null = null
+
+function setupReadObserver() {
+  if (observer) observer.disconnect()
+  observer = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      if (entry.isIntersecting) {
+        const msgId = (entry.target as HTMLElement).id.replace('msg-', '')
+        const msg = messageStore.messages.find(m => m.id === msgId)
+        if (msg && msg.author_id !== currentUserId.value && !readMessageIds.value.has(msgId)) {
+          pendingReadIds.value.add(msgId)
+        }
+      }
+    }
+    flushPendingReads()
+  }, { root: messageListRef.value, threshold: 0.5 })
+
+  // Observe all message elements
+  observeAllMessages()
+}
+
+function observeAllMessages() {
+  if (!observer || !messageListRef.value) return
+  const els = messageListRef.value.querySelectorAll('[id^="msg-"]')
+  els.forEach(el => observer!.observe(el))
+}
+
+function flushPendingReads() {
+  if (readDebounceTimer) clearTimeout(readDebounceTimer)
+  readDebounceTimer = setTimeout(async () => {
+    const ids = Array.from(pendingReadIds.value)
+    if (ids.length === 0) return
+    pendingReadIds.value.clear()
+    await roomStore.markMessagesRead(tenantId.value, roomId.value, ids)
+    // Add to readMessageIds set for visual tracking
+    for (const id of ids) {
+      readMessageIds.value.add(id)
+    }
+    // Refresh actual count from server instead of optimistic decrement
+    await roomStore.fetchUnreadCount(tenantId.value, roomId.value)
+  }, 300)
 }
 
 onMounted(async () => {
@@ -311,10 +401,8 @@ onMounted(async () => {
     } else {
       scrollToBottom()
     }
-    // Mark messages as read
-    markVisibleAsRead()
-    // Reset unread count for this room
-    roomStore.unreadCounts[roomId.value] = 0
+    // Setup IntersectionObserver to auto-mark messages as read on scroll
+    setupReadObserver()
   }
 })
 </script>

@@ -42,7 +42,7 @@ pub async fn add(
             "emoji": reaction.emoji.value,
         }
     });
-    crate::ws::dispatcher::broadcast(&state.ws_storage, &member_ids, &event).await;
+    crate::ws::dispatcher::broadcast_with_redis(&state.ws_storage, &state.redis_pubsub, &member_ids, &event).await;
 
     Ok(Json(serde_json::json!({ "added": true })))
 }
@@ -80,7 +80,7 @@ pub async fn remove(
                 "emoji": emoji,
             }
         });
-        crate::ws::dispatcher::broadcast(&state.ws_storage, &member_ids, &event).await;
+        crate::ws::dispatcher::broadcast_with_redis(&state.ws_storage, &state.redis_pubsub, &member_ids, &event).await;
     }
 
     Ok(Json(serde_json::json!({ "removed": removed })))

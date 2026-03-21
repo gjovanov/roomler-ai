@@ -20,8 +20,10 @@
               v-model="password"
               :label="$t('auth.password')"
               prepend-inner-icon="mdi-lock"
-              type="password"
+              :type="showPassword ? 'text' : 'password'"
+              :append-inner-icon="showPassword ? 'mdi-eye-off' : 'mdi-eye'"
               :rules="[rules.required]"
+              @click:append-inner="showPassword = !showPassword"
             />
 
             <v-alert v-if="auth.error" type="error" density="compact" class="mb-4">
@@ -83,6 +85,7 @@ const { rules } = useValidation()
 const formRef = ref()
 const username = ref('')
 const password = ref('')
+const showPassword = ref(false)
 
 const oauthProviders = [
   { name: 'google', label: 'Google', icon: 'mdi-google', color: '#DB4437' },

@@ -11,16 +11,43 @@ use axum::{
     routing::{delete, get, post, put},
 };
 use state::AppState;
+use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
 use tower_http::{
     cors::{Any, CorsLayer},
     trace::TraceLayer,
 };
 
+fn build_cors_layer(origins: &[String]) -> CorsLayer {
+    if origins.is_empty() || origins.iter().any(|o| o == "*") {
+        CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(Any)
+            .allow_headers(Any)
+    } else {
+        let allowed: Vec<_> = origins
+            .iter()
+            .filter_map(|o| o.parse().ok())
+            .collect();
+        CorsLayer::new()
+            .allow_origin(allowed)
+            .allow_methods(Any)
+            .allow_headers(Any)
+            .allow_credentials(true)
+    }
+}
+
 pub fn build_router(state: AppState) -> Router {
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+    let cors = build_cors_layer(&state.settings.app.cors_origins);
+
+    // Rate limiting: 60 requests per minute per IP (1 token/sec, burst up to 60)
+    let governor_conf = GovernorConfigBuilder::default()
+        .per_second(1)
+        .burst_size(60)
+        .finish()
+        .unwrap();
+    let governor_layer = GovernorLayer {
+        config: governor_conf.into(),
+    };
 
     // Auth routes (no tenant prefix)
     let auth_routes = Router::new()
@@ -176,6 +203,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/me", put(routes::user::update_profile))
         .route("/{user_id}", get(routes::user::get_profile));
 
+    // Search routes (under tenant)
+    let search_routes = Router::new()
+        .route("/", get(routes::search::search));
+
     // Compose API
     let api = Router::new()
         .nest("/auth", auth_routes)
@@ -190,6 +221,7 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/tenant/{tenant_id}/member", member_routes)
         .nest("/tenant/{tenant_id}/role", role_routes)
         .nest("/tenant/{tenant_id}/invite", tenant_invite_routes)
+        .nest("/tenant/{tenant_id}/search", search_routes)
         .nest("/tenant/{tenant_id}/room", room_routes)
         .nest(
             "/tenant/{tenant_id}/room/{room_id}/message",
@@ -215,6 +247,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(health)
         .route("/ws", get(ws::handler::ws_upgrade))
         .layer(TraceLayer::new_for_http())
+        .layer(governor_layer)
         .layer(cors)
         .with_state(state)
 }

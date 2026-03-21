@@ -270,9 +270,7 @@ export const useRoomStore = defineStore('rooms', () => {
       await api.post(`/tenant/${tenantId}/room/${roomId}/message/read`, {
         message_ids: messageIds,
       })
-      // Decrement unread count
-      const prev = unreadCounts.value[roomId] || 0
-      unreadCounts.value[roomId] = Math.max(0, prev - messageIds.length)
+      // Do not optimistically decrement — caller should fetchUnreadCount for accuracy
     } catch {
       // non-critical
     }

@@ -45,6 +45,32 @@
             <div v-if="!joined" class="text-center text-white">
               <v-icon size="64" class="mb-4">mdi-video</v-icon>
               <div class="text-h5">Ready to join?</div>
+              <div class="mt-4" style="width: 300px; margin: 0 auto;">
+                <v-select
+                  v-model="conferenceStore.selectedAudioDeviceId"
+                  :items="audioInputs"
+                  item-title="label"
+                  item-value="deviceId"
+                  label="Microphone"
+                  density="compact"
+                  variant="outlined"
+                  class="mb-2"
+                  hide-details
+                  theme="dark"
+                />
+                <v-select
+                  v-model="conferenceStore.selectedVideoDeviceId"
+                  :items="videoInputs"
+                  item-title="label"
+                  item-value="deviceId"
+                  label="Camera"
+                  density="compact"
+                  variant="outlined"
+                  class="mb-2"
+                  hide-details
+                  theme="dark"
+                />
+              </div>
               <v-btn
                 color="primary"
                 size="large"
@@ -177,7 +203,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, watch, nextTick, type Component } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch, nextTick, type Component } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
@@ -185,6 +211,7 @@ import { useRoomStore } from '@/stores/rooms'
 import { useMessageStore } from '@/stores/messages'
 import { useWsStore } from '@/stores/ws'
 import { useConferenceStore } from '@/stores/conference'
+import { useSnackbar } from '@/composables/useSnackbar'
 import { useAudioPlayback } from '@/composables/useAudioPlayback'
 import { useConferenceLayout } from '@/composables/useConferenceLayout'
 import { usePictureInPicture } from '@/composables/usePictureInPicture'
@@ -213,6 +240,18 @@ const {
 } = storeToRefs(conferenceStore)
 const pip = usePictureInPicture()
 const audioPlayback = useAudioPlayback()
+const snackbar = useSnackbar()
+
+const audioInputs = computed(() =>
+  conferenceStore.availableDevices
+    .filter((d) => d.kind === 'audioinput')
+    .map((d, i) => ({ label: d.label || 'Device ' + i, deviceId: d.deviceId }))
+)
+const videoInputs = computed(() =>
+  conferenceStore.availableDevices
+    .filter((d) => d.kind === 'videoinput')
+    .map((d, i) => ({ label: d.label || 'Device ' + i, deviceId: d.deviceId }))
+)
 
 const tenantId = computed(() => route.params.tenantId as string)
 const roomId = computed(() => route.params.roomId as string)
@@ -398,6 +437,7 @@ async function handleJoin() {
   if (conferenceStore.isInCall && conferenceStore.roomId === roomId.value) {
     joined.value = true
     showChat.value = true
+    window.addEventListener('beforeunload', warnBeforeLeave)
     conferenceStore.startActiveSpeaker()
     wsStore.onMediaMessage('media:audio_playback', audioPlayback.handlePlaybackMessage)
     messageStore.fetchMessages(tenantId.value, roomId.value).catch(() => {})
@@ -425,17 +465,28 @@ async function doJoin() {
 
     joined.value = true
     showChat.value = true
+    window.addEventListener('beforeunload', warnBeforeLeave)
 
     conferenceStore.startActiveSpeaker()
     wsStore.onMediaMessage('media:audio_playback', audioPlayback.handlePlaybackMessage)
-  } catch (err) {
-    console.error('Failed to join call:', err)
+  } catch (err: unknown) {
+    const error = err as Error
+    if (error.name === 'NotAllowedError') {
+      snackbar.showError('Camera/microphone access denied. Please allow permissions in your browser settings.')
+    } else if (error.name === 'NotFoundError') {
+      snackbar.showError('No camera or microphone found. Please connect a device and try again.')
+    } else {
+      snackbar.showError('Failed to join call: ' + error.message)
+    }
   } finally {
     joining.value = false
   }
 }
 
 async function handleLeave() {
+  // Remove beforeunload warning
+  window.removeEventListener('beforeunload', warnBeforeLeave)
+
   // Stop active speaker (store-managed)
   conferenceStore.stopActiveSpeaker()
 
@@ -472,15 +523,31 @@ function handlePlayFile(file: { id: string; url: string; filename: string }) {
   })
 }
 
-function handleScreenShare() {
+async function handleScreenShare() {
   if (conferenceStore.isScreenSharing) {
     conferenceStore.stopScreenShare()
   } else {
-    conferenceStore.startScreenShare()
+    try {
+      await conferenceStore.startScreenShare()
+    } catch (err: unknown) {
+      const error = err as Error
+      if (error.name === 'AbortError' || error.name === 'NotAllowedError') {
+        // User cancelled the screen share picker — do nothing
+      } else {
+        snackbar.showError('Screen share failed: ' + error.message)
+      }
+    }
   }
 }
 
+const warnBeforeLeave = (e: BeforeUnloadEvent) => {
+  e.preventDefault()
+}
+
 onMounted(async () => {
+  // Enumerate devices for pre-join selection
+  conferenceStore.enumerateDevices()
+
   try {
     await roomStore.fetchRoom(tenantId.value, roomId.value)
   } catch {
@@ -491,12 +558,17 @@ onMounted(async () => {
   if (conferenceStore.isInCall && conferenceStore.roomId === roomId.value) {
     joined.value = true
     showChat.value = true
+    window.addEventListener('beforeunload', warnBeforeLeave)
     conferenceStore.startActiveSpeaker()
     wsStore.onMediaMessage('media:audio_playback', audioPlayback.handlePlaybackMessage)
     fetchRoomMembers()
     messageStore.fetchMessages(tenantId.value, roomId.value).catch(() => {})
     await roomStore.fetchParticipants(tenantId.value, roomId.value)
   }
+})
+
+onUnmounted(() => {
+  window.removeEventListener('beforeunload', warnBeforeLeave)
 })
 </script>
 

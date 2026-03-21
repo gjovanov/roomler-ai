@@ -218,11 +218,12 @@ pub async fn members(
         .filter_map(|m| m.user_id)
         .collect();
     let user_map = if !user_ids.is_empty() {
-        // Fetch full user records for username + avatar
+        // Batch-fetch user records for username + avatar (avoids N+1)
+        let users = state.users.base.find_by_ids(&user_ids).await.unwrap_or_default();
         let mut map = std::collections::HashMap::new();
-        for uid in &user_ids {
-            if let Ok(user) = state.users.base.find_by_id(*uid).await {
-                map.insert(*uid, (user.username, user.avatar, user.display_name));
+        for user in users {
+            if let Some(uid) = user.id {
+                map.insert(uid, (user.username, user.avatar, user.display_name));
             }
         }
         map
@@ -318,75 +319,27 @@ pub async fn call_start(
                 "started_by": auth.user_id.to_hex(),
             }
         });
-        crate::ws::dispatcher::broadcast(&state.ws_storage, &member_ids, &event).await;
+        crate::ws::dispatcher::broadcast_with_redis(&state.ws_storage, &state.redis_pubsub, &member_ids, &event).await;
 
-        // Create persistent call notification for room members (except the starter)
+        // Create persistent call notifications + push for offline members via helper
         let caller_names = state.users.find_display_names(&[auth.user_id]).await.unwrap_or_default();
         let caller_name = caller_names
             .get(&auth.user_id)
             .cloned()
             .unwrap_or_else(|| auth.user_id.to_hex());
-        let source = roomler2_db::models::NotificationSource {
-            entity_type: "room".to_string(),
-            entity_id: rid,
-            actor_id: Some(auth.user_id),
-        };
-        let link = format!("/tenant/{}/room/{}/call", tenant_id, room_id);
-        for uid in &member_ids {
-            if *uid == auth.user_id { continue; }
-            if let Ok(notification) = state.notifications.create(
-                tid,
-                *uid,
-                roomler2_db::models::NotificationType::Call,
-                format!("Call started in #{}", room_name),
-                format!("{} started a call", caller_name),
-                Some(link.clone()),
-                source.clone(),
-            ).await {
-                let notif_event = serde_json::json!({
-                    "type": "notification:new",
-                    "data": {
-                        "id": notification.id.unwrap().to_hex(),
-                        "title": notification.title,
-                        "body": notification.body,
-                        "link": notification.link,
-                        "notification_type": "call",
-                        "created_at": notification.created_at.try_to_rfc3339_string().unwrap_or_default(),
-                    }
-                });
-                crate::ws::dispatcher::send_to_user(&state.ws_storage, uid, &notif_event).await;
-            }
-        }
 
-        // Send push notifications to offline members
-        if let Some(ref push_svc) = state.push {
-            let offline_ids: Vec<ObjectId> = member_ids
-                .iter()
-                .filter(|uid| **uid != auth.user_id && !state.ws_storage.is_connected(uid))
-                .copied()
-                .collect();
-            if !offline_ids.is_empty() {
-                let push = push_svc.clone();
-                let subs_dao = state.push_subscriptions.clone();
-                let title = format!("Call in #{}", room_name);
-                let body = format!("{} started a call", caller_name);
-                let link = format!("/tenant/{}/room/{}/call", tenant_id, room_id);
-                tokio::spawn(async move {
-                    if let Ok(subs) = subs_dao.find_by_users(&offline_ids).await {
-                        for sub in subs {
-                            let _ = push.send(
-                                &sub.endpoint,
-                                &sub.keys.auth,
-                                &sub.keys.p256dh,
-                                &title,
-                                &body,
-                                Some(&link),
-                            ).await;
-                        }
-                    }
-                });
-            }
-        }
+        super::helpers::notify_call_started(
+            &state,
+            tid,
+            rid,
+            auth.user_id,
+            &member_ids,
+            &room_name,
+            &caller_name,
+            &tenant_id,
+            &room_id,
+        )
+        .await;
     }
 
     Ok(Json(serde_json::json!({
@@ -429,7 +382,7 @@ pub async fn call_join(
                 "conference_status": "in_progress",
             }
         });
-        crate::ws::dispatcher::broadcast(&state.ws_storage, &member_ids, &event).await;
+        crate::ws::dispatcher::broadcast_with_redis(&state.ws_storage, &state.redis_pubsub, &member_ids, &event).await;
     }
 
     Ok(Json(serde_json::json!({
@@ -465,10 +418,33 @@ pub async fn call_leave(
                 "user_id": auth.user_id.to_hex(),
             }
         });
-        crate::ws::dispatcher::broadcast(&state.ws_storage, &remaining, &event).await;
+        crate::ws::dispatcher::broadcast_with_redis(&state.ws_storage, &state.redis_pubsub, &remaining, &event).await;
     }
 
     state.rooms.leave_participant(rid, auth.user_id).await?;
+
+    // Check if this was the last participant — if so, auto-end the call
+    let room = state.rooms.base.find_by_id_in_tenant(tid, rid).await.ok();
+    if let Some(ref room) = room
+        && room.participant_count == 0
+        && room.conference_status.as_deref() == Some("in_progress")
+    {
+            state.rooms.end_call(rid).await?;
+            state.room_manager.remove_room(&rid);
+
+            // Notify all room members that the call has ended
+            let member_ids = state.rooms.find_member_user_ids(rid).await.unwrap_or_default();
+            if !member_ids.is_empty() {
+                let event = serde_json::json!({
+                    "type": "room:call_ended",
+                    "data": {
+                        "room_id": rid.to_hex(),
+                    }
+                });
+                crate::ws::dispatcher::broadcast_with_redis(&state.ws_storage, &state.redis_pubsub, &member_ids, &event).await;
+            }
+    }
+
     Ok(Json(serde_json::json!({ "left": true })))
 }
 
@@ -495,7 +471,7 @@ pub async fn call_end(
             "type": "media:room_closed",
             "data": { "room_id": rid.to_hex() }
         });
-        crate::ws::dispatcher::broadcast(&state.ws_storage, &remaining, &event).await;
+        crate::ws::dispatcher::broadcast_with_redis(&state.ws_storage, &state.redis_pubsub, &remaining, &event).await;
     }
 
     // Notify all room members that the call has ended
@@ -507,7 +483,7 @@ pub async fn call_end(
                 "room_id": rid.to_hex(),
             }
         });
-        crate::ws::dispatcher::broadcast(&state.ws_storage, &member_ids, &event).await;
+        crate::ws::dispatcher::broadcast_with_redis(&state.ws_storage, &state.redis_pubsub, &member_ids, &event).await;
     }
 
     Ok(Json(serde_json::json!({ "ended": true })))
@@ -631,7 +607,7 @@ pub async fn create_call_message(
             "type": "call:message:create",
             "data": &response,
         });
-        crate::ws::dispatcher::broadcast(&state.ws_storage, &member_ids, &event).await;
+        crate::ws::dispatcher::broadcast_with_redis(&state.ws_storage, &state.redis_pubsub, &member_ids, &event).await;
     }
 
     Ok(Json(response))
