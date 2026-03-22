@@ -40,6 +40,9 @@
             <v-list-item v-if="room.has_media" prepend-icon="mdi-video" @click="handleStartCall">
               {{ $t('room.startCall') }}
             </v-list-item>
+            <v-list-item prepend-icon="mdi-delete" class="text-error" @click="showDeleteConfirm = true">
+              Delete
+            </v-list-item>
           </v-list>
         </v-menu>
       </template>
@@ -55,13 +58,26 @@
         :depth="depth + 1"
       />
     </template>
+    <!-- Delete confirmation -->
+    <v-dialog v-model="showDeleteConfirm" max-width="400">
+      <v-card>
+        <v-card-title class="text-h6">Delete "{{ room.name }}"?</v-card-title>
+        <v-card-text>This will permanently delete the room and all its messages, files, and members. This cannot be undone.</v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" @click="showDeleteConfirm = false">Cancel</v-btn>
+          <v-btn color="error" variant="tonal" :loading="deleting" @click="handleDelete">Delete</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, inject } from 'vue'
+import { ref, computed, inject } from 'vue'
 import { useRouter } from 'vue-router'
 import { useRoomStore, type Room } from '@/stores/rooms'
+import { useSnackbar } from '@/composables/useSnackbar'
 
 const props = defineProps<{
   room: Room
@@ -71,7 +87,11 @@ const props = defineProps<{
 
 const router = useRouter()
 const roomStore = useRoomStore()
+const { showSuccess, showError } = useSnackbar()
 const createChildRoom = inject<(parentId: string) => void>('createChildRoom')
+
+const showDeleteConfirm = ref(false)
+const deleting = ref(false)
 
 const children = computed(() => roomStore.childrenOf(props.room.id))
 
@@ -88,5 +108,18 @@ function handleCreateChild() {
 
 function handleStartCall() {
   router.push({ name: 'room-call', params: { tenantId: props.tenantId, roomId: props.room.id } })
+}
+
+async function handleDelete() {
+  deleting.value = true
+  try {
+    await roomStore.deleteRoom(props.tenantId, props.room.id)
+    showDeleteConfirm.value = false
+    showSuccess(`Room "${props.room.name}" deleted`)
+  } catch (e) {
+    showError((e as Error).message)
+  } finally {
+    deleting.value = false
+  }
 }
 </script>

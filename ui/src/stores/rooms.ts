@@ -102,6 +102,15 @@ export const useRoomStore = defineStore('rooms', () => {
     return room
   }
 
+  async function deleteRoom(tenantId: string, roomId: string) {
+    await api.delete(`/tenant/${tenantId}/room/${roomId}`)
+    rooms.value = rooms.value.filter((r) => r.id !== roomId)
+    if (current.value?.id === roomId) {
+      current.value = null
+    }
+    delete unreadCounts.value[roomId]
+  }
+
   async function joinRoom(tenantId: string, roomId: string) {
     await api.post(`/tenant/${tenantId}/room/${roomId}/join`)
   }
@@ -294,6 +303,7 @@ export const useRoomStore = defineStore('rooms', () => {
     childrenOf,
     fetchRooms,
     createRoom,
+    deleteRoom,
     joinRoom,
     leaveRoom,
     fetchRoom,
