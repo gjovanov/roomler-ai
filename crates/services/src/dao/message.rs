@@ -185,13 +185,27 @@ impl MessageDao {
         parent_id: ObjectId,
         reply_author_id: ObjectId,
     ) -> DaoResult<bool> {
+        let now = DateTime::now();
+        // First, ensure thread_metadata is not null (MongoDB $inc/$addToSet fail on null subdocs)
+        let _ = self.base.collection().update_one(
+            doc! { "_id": parent_id, "thread_metadata": null },
+            doc! { "$set": {
+                "thread_metadata": {
+                    "reply_count": 0_i32,
+                    "last_reply_at": null,
+                    "last_reply_user_id": null,
+                    "participant_ids": [],
+                },
+            }},
+        ).await;
+        // Now safely increment/update the nested fields
         self.base
             .update_one(
                 doc! { "_id": parent_id },
                 doc! {
                     "$set": {
                         "is_thread_root": true,
-                        "thread_metadata.last_reply_at": DateTime::now(),
+                        "thread_metadata.last_reply_at": now,
                         "thread_metadata.last_reply_user_id": reply_author_id,
                     },
                     "$inc": {
