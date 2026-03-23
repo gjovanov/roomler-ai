@@ -120,6 +120,125 @@ describe('useConferenceStore', () => {
       expect(store.availableDevices).toEqual([])
       consoleSpy.mockRestore()
     })
+
+    it('should auto-select first audio device when none selected', async () => {
+      const mockDevices = [
+        { deviceId: 'audio1', kind: 'audioinput', label: 'Mic 1' },
+        { deviceId: 'audio2', kind: 'audioinput', label: 'Mic 2' },
+        { deviceId: 'video1', kind: 'videoinput', label: 'Camera 1' },
+      ] as MediaDeviceInfo[]
+
+      Object.defineProperty(navigator, 'mediaDevices', {
+        value: { enumerateDevices: vi.fn().mockResolvedValue(mockDevices) },
+        writable: true,
+        configurable: true,
+      })
+
+      const store = useConferenceStore()
+      expect(store.selectedAudioDeviceId).toBe('')
+
+      await store.enumerateDevices()
+
+      expect(store.selectedAudioDeviceId).toBe('audio1')
+    })
+
+    it('should auto-select first video device when none selected', async () => {
+      const mockDevices = [
+        { deviceId: 'audio1', kind: 'audioinput', label: 'Mic 1' },
+        { deviceId: 'video1', kind: 'videoinput', label: 'Camera 1' },
+        { deviceId: 'video2', kind: 'videoinput', label: 'Camera 2' },
+      ] as MediaDeviceInfo[]
+
+      Object.defineProperty(navigator, 'mediaDevices', {
+        value: { enumerateDevices: vi.fn().mockResolvedValue(mockDevices) },
+        writable: true,
+        configurable: true,
+      })
+
+      const store = useConferenceStore()
+      expect(store.selectedVideoDeviceId).toBe('')
+
+      await store.enumerateDevices()
+
+      expect(store.selectedVideoDeviceId).toBe('video1')
+    })
+
+    it('should NOT override existing audio device selection', async () => {
+      const mockDevices = [
+        { deviceId: 'audio1', kind: 'audioinput', label: 'Mic 1' },
+        { deviceId: 'audio2', kind: 'audioinput', label: 'Mic 2' },
+      ] as MediaDeviceInfo[]
+
+      Object.defineProperty(navigator, 'mediaDevices', {
+        value: { enumerateDevices: vi.fn().mockResolvedValue(mockDevices) },
+        writable: true,
+        configurable: true,
+      })
+
+      const store = useConferenceStore()
+      store.selectedAudioDeviceId = 'audio2'
+
+      await store.enumerateDevices()
+
+      expect(store.selectedAudioDeviceId).toBe('audio2')
+    })
+
+    it('should NOT override existing video device selection', async () => {
+      const mockDevices = [
+        { deviceId: 'video1', kind: 'videoinput', label: 'Camera 1' },
+        { deviceId: 'video2', kind: 'videoinput', label: 'Camera 2' },
+      ] as MediaDeviceInfo[]
+
+      Object.defineProperty(navigator, 'mediaDevices', {
+        value: { enumerateDevices: vi.fn().mockResolvedValue(mockDevices) },
+        writable: true,
+        configurable: true,
+      })
+
+      const store = useConferenceStore()
+      store.selectedVideoDeviceId = 'video2'
+
+      await store.enumerateDevices()
+
+      expect(store.selectedVideoDeviceId).toBe('video2')
+    })
+
+    it('should handle empty device list gracefully', async () => {
+      Object.defineProperty(navigator, 'mediaDevices', {
+        value: { enumerateDevices: vi.fn().mockResolvedValue([]) },
+        writable: true,
+        configurable: true,
+      })
+
+      const store = useConferenceStore()
+      await store.enumerateDevices()
+
+      expect(store.availableDevices).toEqual([])
+      expect(store.selectedAudioDeviceId).toBe('')
+      expect(store.selectedVideoDeviceId).toBe('')
+    })
+
+    it('should skip devices with empty deviceId', async () => {
+      const mockDevices = [
+        { deviceId: '', kind: 'audioinput', label: '' },
+        { deviceId: '', kind: 'videoinput', label: '' },
+        { deviceId: 'audio-real', kind: 'audioinput', label: 'Real Mic' },
+        { deviceId: 'video-real', kind: 'videoinput', label: 'Real Camera' },
+      ] as MediaDeviceInfo[]
+
+      Object.defineProperty(navigator, 'mediaDevices', {
+        value: { enumerateDevices: vi.fn().mockResolvedValue(mockDevices) },
+        writable: true,
+        configurable: true,
+      })
+
+      const store = useConferenceStore()
+      await store.enumerateDevices()
+
+      // Should skip empty deviceId and select the real devices
+      expect(store.selectedAudioDeviceId).toBe('audio-real')
+      expect(store.selectedVideoDeviceId).toBe('video-real')
+    })
   })
 
   describe('device selection', () => {
