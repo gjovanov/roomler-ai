@@ -46,7 +46,7 @@ async fn main() -> anyhow::Result<()> {
         let result = rooms_coll
             .update_many(
                 bson::doc! { "conference_status": "in_progress" },
-                bson::doc! { "$set": { "conference_status": "ended", "participant_count": 0 } },
+                bson::doc! { "$set": { "conference_status": "ended", "participant_count": 0_i32 } },
             )
             .await
             .ok();
