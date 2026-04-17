@@ -213,11 +213,15 @@ export function useRemoteControl() {
     }
 
     pc.onconnectionstatechange = () => {
-      if (!pc) return
-      if (pc.connectionState === 'connected') phase.value = 'connected'
-      if (pc.connectionState === 'failed') failWith('peer connection failed')
-      if (pc.connectionState === 'closed') {
-        if (phase.value !== 'error') phase.value = 'closed'
+      // Snapshot the state up front: failWith() below nulls `pc` as part
+      // of teardown, so re-reading `pc.connectionState` on the next branch
+      // would throw TypeError.
+      const state = pc?.connectionState
+      if (!state) return
+      if (state === 'connected') phase.value = 'connected'
+      else if (state === 'failed') failWith('peer connection failed')
+      else if (state === 'closed' && phase.value !== 'error') {
+        phase.value = 'closed'
       }
     }
 
