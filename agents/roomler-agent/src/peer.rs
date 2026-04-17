@@ -76,12 +76,22 @@ impl AgentPeer {
         );
 
         // Add a sendonly H.264 video track up front so the SDP answer
-        // advertises it. webrtc-rs picks compatible H.264 params from the
-        // MediaEngine's default codec list.
+        // advertises it. Match one of webrtc-rs's default H.264 codec
+        // registrations exactly (clock_rate + fmtp line), otherwise the
+        // packetizer can't resolve a payload type for the outgoing RTP
+        // and the browser receives the track slot but no decodable frames
+        // (video element stays black). Chosen: Constrained Baseline,
+        // packetization-mode=1, profile-level-id=42e01f — matches payload
+        // type 125 in webrtc-rs's default MediaEngine.
         let video_track = Arc::new(TrackLocalStaticSample::new(
             RTCRtpCodecCapability {
                 mime_type: "video/H264".to_string(),
-                ..Default::default()
+                clock_rate: 90000,
+                channels: 0,
+                sdp_fmtp_line:
+                    "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
+                        .to_string(),
+                rtcp_feedback: vec![],
             },
             "video".to_string(),
             "roomler-agent".to_string(),
