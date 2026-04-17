@@ -4,21 +4,28 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**Roomler AI** is a real-time collaboration platform with chat, video conferencing, file sharing, and room management. Stack: Rust (Axum) + MongoDB + Vue 3/Vuetify 3 + Pinia + Mediasoup (WebRTC SFU).
+**Roomler AI** is a real-time collaboration platform with chat, video conferencing, file sharing, room management, and a TeamViewer-style remote desktop subsystem. Stack: Rust (Axum) + MongoDB + Vue 3/Vuetify 3 + Pinia + Mediasoup (WebRTC SFU) + webrtc-rs (P2P remote-control). The remote-control subsystem ships as a separate native agent binary (`roomler-agent`) that runs on controlled hosts — see `docs/remote-control.md` and `HANDOVER2.md`.
 
 ## Commands
 
 ```bash
 # Development
-cargo run --bin roomler-ai-api           # Start backend (port 3000)
+cargo run --bin roomler-ai-api         # Start backend (port 3000)
 cd ui && bun run dev                   # Vite dev server (port 5000, proxies to 5001)
 cd ui && bun run build                 # Production UI build (includes vue-tsc --noEmit)
 
+# Remote-control agent (native binary — runs on the controlled host)
+cargo build -p roomler-agent --release --features full   # full pipeline: capture + encode + input
+cargo build -p roomler-agent --release                   # signalling-only (no media, no input)
+./target/release/roomler-agent enroll --server <url> --token <enrollment-jwt> --name <label>
+./target/release/roomler-agent run
+./scripts/dev-xvfb.sh                  # capture smoke test via a virtual framebuffer
+
 # Testing
-cargo test -p roomler-ai-tests           # All integration tests (114 tests, requires MongoDB+Redis)
-cd ui && bun run test:unit             # Vitest unit tests
+cargo test -p roomler-ai-tests           # All integration tests (163+ tests, requires MongoDB+Redis)
+cd ui && bun run test:unit             # Vitest unit tests (259 tests)
 cd ui && bun run test:unit:coverage    # Vitest with coverage
-cd ui && bun run e2e                   # Playwright E2E tests (18 spec files)
+cd ui && bun run e2e                   # Playwright E2E tests (24 spec files)
 
 # Static Analysis
 cargo clippy --workspace -- -D warnings   # Rust lint
@@ -35,28 +42,46 @@ cd ui && bun outdated                  # JS/TS outdated deps
 docker compose up -d                   # Start MongoDB (27019), Redis (6379), MinIO (9000), coturn
 ```
 
+### Agent build requirements
+
+`--features full` (or the individual `scrap-capture` / `openh264-encoder` / `enigo-input` flags) pulls in system deps:
+
+```bash
+# Linux (for the scrap-capture feature)
+sudo apt install -y libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev
+
+# OpenH264 is compiled from C source on first build — slow but no runtime lib needed.
+```
+
+Default build (no features) compiles on any rust:bookworm image and produces a signalling-only agent useful for CI / integration tests, but not usable in production (no capture, no input).
+
 ## Architecture
 
 ```
 crates/
-  config/    → Settings (env vars via ROOMLER__ prefix, config crate)
-  db/        → MongoDB models (19 models) + indexes (15 collections) + native driver v3.2
-  services/  → Business logic: auth, DAOs, media (mediasoup), export, background tasks, OAuth, push, email, Stripe, Giphy, Claude AI
-  api/       → Axum HTTP/WS server: ~75 API routes + /ws + /health
-  tests/     → Integration tests (14 test modules, 114 tests)
+  config/           → Settings (env vars via ROOMLER__ prefix, config crate)
+  db/               → MongoDB models (19 models) + indexes (18 collections) + native driver v3.2
+  services/         → Business logic: auth, DAOs, media (mediasoup), export, background tasks, OAuth, push, email, Stripe, Giphy, Claude AI
+  remote_control/   → TeamViewer-style remote-desktop subsystem: Hub, signalling, consent, audit, TURN creds
+  api/              → Axum HTTP/WS server: ~85 API routes + /ws + /health
+  tests/            → Integration tests (24 test modules, 163+ tests)
+agents/
+  roomler-agent/    → Native remote-control agent binary (CLI + lib): webrtc-rs peer, scrap capture, openh264 encode, enigo input injection
 ui/
   src/
-    api/           → HTTP client (client.ts)
-    components/    → Vue components (20 files in 6 categories)
-    composables/   → 10 custom hooks (useAuth, useWebSocket, useMarkdown, etc.)
-    stores/        → 12 Pinia stores (setup store pattern)
-    views/         → 13 view modules (auth, chat, conference, dashboard, files, rooms, etc.)
-    plugins/       → router, pinia, vuetify, i18n
+    api/            → HTTP client (client.ts)
+    components/     → Vue components (20+ files in 7 categories — includes admin/AgentsSection)
+    composables/    → 11 custom hooks (useAuth, useWebSocket, useMarkdown, useRemoteControl, etc.)
+    stores/         → 13 Pinia stores (setup store pattern — includes agents.ts)
+    views/          → 14 view modules (auth, chat, conference, dashboard, files, rooms, remote, etc.)
+    plugins/        → router, pinia, vuetify, i18n
+scripts/
+  dev-xvfb.sh       → Run the agent's capture path against a virtual X framebuffer (headless smoke test)
 ```
 
 ### Crate dependency flow
-`config` <- `db` <- `services` <- `api`
-`tests` depends on `api` + `config` + `db` (spawns real servers with random ports and test databases)
+`config` <- `db` <- `remote_control` <- `services` <- `api`
+`tests` depends on `api` + `config` + `db` + `roomler-agent` (spawns real servers with random ports and test databases; drives the agent library in-process for end-to-end signalling tests)
 
 ## Multi-Tenancy
 
@@ -69,6 +94,13 @@ JWT-based auth (jsonwebtoken 9 crate) with Argon2 password hashing:
 - Refresh token: configurable TTL (default 604800s)
 - Auth middleware extracts user from `Authorization: Bearer` header
 - OAuth: Google, Facebook, GitHub, LinkedIn, Microsoft
+
+Four `TokenType` variants, all signed with the same JWT secret:
+- `Access` / `Refresh` — standard user flow
+- `Enrollment` — single-use, 10 min, issued by an admin to bootstrap a new agent
+- `Agent` — long-lived (1 y), carried by an enrolled agent on its WS connection
+
+Audience checks: `verify_agent_token` rejects a user JWT and vice-versa. Tests in `crates/services/src/auth/mod.rs::tests` lock this.
 
 JWT settings in `crates/config/src/settings.rs`:
 - Secret: `ROOMLER__JWT__SECRET` (default: "change-me-in-production")
@@ -91,15 +123,16 @@ Router::new()
     .with_state(state)
 ```
 
-Route groups: auth (7), user (2), oauth (2), stripe (4), invite (2+4), giphy (2), push (3), notification (5), tenant (3), member (2), role (6), room (16), message (11), recording (3), file (7), task (3), export (2), search (1), health (1), ws (1).
+Route groups: auth (7), user (2), oauth (2), stripe (4), invite (2+4), giphy (2), push (3), notification (5), tenant (3), member (2), role (6), room (16), message (11), recording (3), file (7), task (3), export (2), search (1), health (1), ws (1), agent (4 tenant-scoped + 1 public enroll), session (3), turn (1).
 
 ## DB Model Pattern
 
-MongoDB native driver (not Mongoose). Models in `crates/db/src/models/`:
-- 15 collections: tenants, users, tenant_members, roles, rooms, room_members, messages, reactions, recordings, files, invites, background_tasks, audit_logs, notifications, custom_emojis, activation_codes
+MongoDB native driver (not Mongoose). Models live in `crates/db/src/models/` except the three remote-control entities, which live in `crates/remote_control/src/models.rs` to keep the subsystem self-contained:
+- 18 collections: tenants, users, tenant_members, roles, rooms, room_members, messages, reactions, recordings, files, invites, background_tasks, audit_logs, notifications, custom_emojis, activation_codes, **agents, remote_sessions, remote_audit**
 - Indexes defined in `crates/db/src/indexes.rs` (unique, TTL, text indexes on email, username, slug, code, content, etc.)
 - Text indexes on messages (content), rooms (name, purpose, tags), users (display_name, username) for full-text search
-- TTL indexes on audit_logs (90 days), activation_codes, background_tasks
+- TTL indexes on audit_logs (90 days), activation_codes, background_tasks, **remote_audit (90 days)**
+- Unique composite index on `agents.{tenant_id, machine_id}` so re-enrolling a known machine reuses its row
 - All queries use BSON documents, no ORM
 
 ## Frontend Conventions
@@ -118,7 +151,8 @@ MongoDB native driver (not Mongoose). Models in `crates/db/src/models/`:
 - Each test gets a unique UUID-named database, auto-dropped on teardown
 - Tests spawn real Axum servers on random ports
 - Requires MongoDB on `localhost:27019` and Redis on `localhost:6379`
-- Test modules: auth, tenant, room, message, reaction, recording, file, invite, role, notification, push, giphy, oauth, call, pagination, rate_limit, cors
+- 163+ tests across 24 modules: auth, tenant, room, message, reaction, recording, file, invite, role, notification, push, giphy, oauth, call, pagination, rate_limit, cors, billing, multi_tenancy, channel_crud, pdf_export, conference_message, **remote_control, agent** (full rc:* round-trip drives the agent library in-process against a TestApp)
+- 5 known pre-existing failures (CORS tower-http upgrade, role dedup, rate-limit timing) — reproducible on pristine master and unrelated to recent work
 
 **E2E tests** (`ui/e2e/`):
 - Playwright 1.58 with Chromium (fake media stream devices for WebRTC)
@@ -127,11 +161,19 @@ MongoDB native driver (not Mongoose). Models in `crates/db/src/models/`:
 - Base URL: `http://localhost:5000` (or E2E_BASE_URL env var)
 
 **Unit tests** (`ui/src/`):
-- Vitest with jsdom environment, 215 tests across 13 files
-- Stores: auth, messages, rooms, ws, notifications, conference, tenants, files
-- Composables: useValidation, useSnackbar, useMarkdown
+- Vitest with jsdom environment, 259 tests across 16 files
+- Stores: auth, messages, rooms, ws (incl. rc:* channel), notifications, conference, tenants, files, agents
+- Composables: useValidation, useSnackbar, useMarkdown, useRemoteControl (HID + button mapping locks)
 - API client: token injection, error handling
 - Plugins: vuetify theme config
+
+**Rust unit tests** (in-crate `#[cfg(test)] mod tests`):
+- `remote_control` crate: 20 tests (consent, session state machine, signalling, serde wire-format locks, permissions, TURN creds)
+- `roomler-agent` lib (default features): 5 tests; plus 4 openh264, 3 enigo, 1 scrap under the matching feature flags
+- `services::auth`: 5 tests (token roundtrip + cross-audience rejection)
+
+**Capture smoke test** (no desktop required):
+- `./scripts/dev-xvfb.sh` spins up Xvfb, paints an xterm on it, runs the scrap-capture smoke test against that virtual display. See docs in the script header for subcommands (`run`, `shell`, arbitrary pass-through).
 
 ## Environment
 
@@ -148,6 +190,7 @@ MongoDB native driver (not Mongoose). Models in `crates/db/src/models/`:
 - **K8s**: Namespace `roomler-ai`, deployment `roomler-ai`, Recreate strategy, hostNetwork
 - **Health probes**: startup/readiness/liveness all on `/health` (port 80 via nginx -> :3000 backend)
 - **nginx**: Pod-internal reverse proxy (`files/nginx-pod.conf`) — SPA fallback + API proxy + WS proxy
+- **Agent binary**: built separately (`cargo build -p roomler-agent --release --features full`) and distributed to controlled hosts out-of-band. Not part of the API Docker image. Per-OS installers (MSI / signed .pkg / .deb + systemd-user unit) are still TODO — see HANDOVER2.md.
 
 ## Post-Implementation Testing
 
@@ -156,21 +199,49 @@ After every feature or fix, verify your changes:
 | Change type | Command | What it checks |
 |-------------|---------|----------------|
 | Backend (models, services, routes) | `cargo test -p roomler-ai-tests` | Integration tests (real MongoDB) |
+| Remote-control crate (Hub, signalling, wire format) | `cargo test -p roomler-ai-remote-control --lib` | Unit tests (no MongoDB required) |
+| Agent library | `cargo test -p roomler-agent --lib` | Default-feature unit tests |
+| Agent with media / input backends | `cargo test -p roomler-agent --lib --features full` | Needs libxcb*-dev on Linux |
+| Agent capture against a headless display | `./scripts/dev-xvfb.sh` | Xvfb + xterm + capture smoke test |
 | Frontend (views, stores, composables) | `cd ui && bun run build` | TypeScript + Vite build |
+| Frontend unit tests | `cd ui && bun run test:unit` | Vitest (259 tests) |
 | Full-flow (auth, routes, UI+API) | `cd ui && bun run e2e` | Playwright E2E tests |
 
 Run the **most specific** command first. If a backend change also affects the frontend, run both.
+
+## Remote Control Subsystem
+
+TeamViewer-style remote desktop. One native agent per controlled host, Roomler API as signalling-only relay, browser as controller. All media + input flows over direct WebRTC P2P (TURN-relayed if needed) — the server never sees raw pixels or keystrokes.
+
+**Design + architecture**: `docs/remote-control.md` (16 sections covering goals, topology, protocol, data model, security, latency budget).
+
+**Resumption note after a session break**: `HANDOVER2.md` at the repo root. Lists the 10-commit chain that built the subsystem, the test matrix, the deploy-server demo recipe, and the priority-ordered backlog.
+
+**Wire protocol**: `rc:*` JSON messages over the existing `/ws` endpoint. `ClientMsg` / `ServerMsg` in `crates/remote_control/src/signaling.rs`. ObjectIds are raw hex strings (locked by tests); `Permissions` serialises as pipe-separated names (bitflags 2.x convention, also locked).
+
+**WebSocket role multiplexing**: `/ws?token=<jwt>&role=agent` uses the agent JWT audience; no `role` param (or `role=user`) uses the existing user flow. Same WS endpoint, same handshake, different claim validator.
+
+**Status at time of writing** (commits `43f0c5b..a3ac8f3`):
+- Server side: REST + WS signalling + Hub + DAOs + audit + TURN creds — complete, 10 integration tests green
+- Agent binary: enrollment + signalling + real webrtc-rs peer + scrap capture + openh264 encoder + enigo input — complete, 4 integration tests green (drives the agent lib in-process)
+- Browser viewer: RemoteControl.vue + useRemoteControl composable + AgentsSection admin UI — complete, 259/259 UI unit tests green
+- **Not yet verified**: end-to-end live run (agent on a real desktop + browser controller seeing live video + typing landing on the remote OS). This is what HANDOVER2.md tells the next session to do first.
 
 ## Known Issues
 
 - [CRITICAL] [2026-03-10] CORS is fully permissive — Status: FIXED (2026-03-21, uses configured cors_origins)
 - [HIGH] [2026-03-10] No rate limiting — Status: FIXED (2026-03-21, tower_governor 60 req/min per IP)
 - [HIGH] [2026-03-10] JWT default secret is "change-me-in-production" — must be overridden in prod — Status: OPEN
+- [HIGH] [2026-04-17] Remote-control subsystem not yet live-tested end-to-end (agent → browser on a real display) — Status: OPEN, see HANDOVER2.md §"Contact-with-reality plan"
 - [MEDIUM] [2026-03-10] TypeScript type errors — Status: FIXED (2026-03-21, vue-tsc --noEmit passes)
 - [MEDIUM] [2026-03-10] No security headers in nginx — Status: FIXED (2026-03-21, X-Frame-Options, X-Content-Type-Options, etc.)
 - [MEDIUM] [2026-03-10] No CI pipeline — Status: FIXED (2026-03-21, GitHub Actions: clippy + build + test)
+- [MEDIUM] [2026-04-17] Remote-control: clipboard + file-transfer data channels accepted on both sides but still log-only (no real handler) — Status: OPEN
+- [MEDIUM] [2026-04-17] Remote-control: consent auto-granted on agent (no tray UI yet); fine for self-controlled hosts, needs UI for org-controlled devices per docs §11.2 — Status: OPEN
 - [LOW] [2026-03-10] Deployment strategy is Recreate (no zero-downtime rolling updates) — Status: OPEN
 - [LOW] [2026-03-10] No git hooks configured (no pre-commit, no lint-staged) — Status: OPEN
+- [LOW] [2026-04-17] Remote-control: encoder bitrate is fixed at 3 Mbps (TWCC/REMB adaptive bitrate is a no-op) — Status: OPEN
+- [LOW] [2026-04-17] Remote-control: agent captures primary display only; multi-monitor plumbing stops at the `mon` field in the wire protocol — Status: OPEN
 
 ## Last Health Check
 
