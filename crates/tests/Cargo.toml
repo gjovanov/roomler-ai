@@ -13,6 +13,7 @@ roomler-ai-db = { path = "../db" }
 roomler-ai-services = { path = "../services" }
 roomler-ai-api = { path = "../api" }
 roomler-agent = { path = "../../agents/roomler-agent" }
+webrtc.workspace = true
 tokio.workspace = true
 mongodb.workspace = true
 bson.workspace = true

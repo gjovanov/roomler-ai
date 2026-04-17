@@ -43,8 +43,14 @@ thiserror = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 
+# ObjectId for session keys (mirrors the shared protocol)
+bson = { workspace = true }
+
 # Trait helpers
 async-trait = { workspace = true }
+
+# WebRTC peer
+webrtc = { workspace = true }
 
 # Random fallback for machine_id
 rand = { workspace = true }

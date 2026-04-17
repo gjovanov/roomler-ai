@@ -112,3 +112,4 @@ clap = { version = "4", features = ["derive"] }
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 directories = "6"
 toml = "0.9"
+webrtc = "0.12"

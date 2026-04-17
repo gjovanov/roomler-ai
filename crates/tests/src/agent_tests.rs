@@ -136,27 +136,35 @@ async fn agent_library_rejects_bogus_enrollment_token() {
 }
 
 #[tokio::test]
-async fn agent_library_auto_grants_consent_and_declines_media() {
-    // Exercises the full rc:* handshake end-to-end:
+async fn agent_answers_sdp_offer_with_real_webrtc_peer() {
+    // Exercises the full rc:* handshake end-to-end with a real webrtc-rs
+    // peer on each side:
     //   - agent sends rc:agent.hello
-    //   - controller (simulated by a raw tokio-tungstenite client) requests
-    //     a session
+    //   - "browser" (a second webrtc-rs PC) is opened in this test,
+    //     creates an offer with a data channel
+    //   - controller sends rc:session.request
     //   - server routes rc:request to the agent
     //   - agent auto-grants consent
-    //   - controller receives rc:ready and sends an offer
-    //   - agent replies with rc:terminate(Error) since media is not wired
-    //   - server relays the terminate back to the controller
+    //   - controller receives rc:ready and sends the real offer
+    //   - agent creates its PC, replies with rc:sdp.answer carrying a
+    //     valid answer SDP
+    //   - both sides trickle ICE through the signalling relay
     //
-    // This is the smoke test that locks in the signaling-only contract
-    // until the real WebRTC peer lands.
+    // Asserts the answer is a well-formed SDP (agent's PC accepted the
+    // offer and produced an answer the browser side would apply).
     use futures::{SinkExt, StreamExt};
     use tokio_tungstenite::{connect_async, tungstenite::Message};
+    use webrtc::api::APIBuilder;
+    use webrtc::api::media_engine::MediaEngine;
+    use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
+    use webrtc::peer_connection::configuration::RTCConfiguration;
+    use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 
     let app = TestApp::spawn().await;
     let seeded = app.seed_tenant("agentlib3").await;
-    let cfg = enrol_via_agent_lib(&app, &seeded, "mach-agentlib-3", "Auto consent").await;
+    let cfg = enrol_via_agent_lib(&app, &seeded, "mach-agentlib-3", "Real peer").await;
 
-    // Spin up the agent library against the test server.
+    // Spin up the agent library.
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let sig_task = tokio::spawn({
         let cfg = cfg.clone();
@@ -165,8 +173,7 @@ async fn agent_library_auto_grants_consent_and_declines_media() {
         }
     });
 
-    // Wait for the agent to go online before starting the controller side,
-    // otherwise the session.request would fail with AgentOffline.
+    // Wait for the agent to go online.
     for _ in 0..60 {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let row: Value = app
@@ -185,37 +192,56 @@ async fn agent_library_auto_grants_consent_and_declines_media() {
         }
     }
 
-    // Controller opens a user-role WS and sends rc:session.request.
+    // Build a browser-side PC and a data channel (so the offer has media).
+    let mut me = MediaEngine::default();
+    me.register_default_codecs().unwrap();
+    let api = APIBuilder::new().with_media_engine(me).build();
+    let browser_pc = api
+        .new_peer_connection(RTCConfiguration::default())
+        .await
+        .unwrap();
+    let _dc = browser_pc
+        .create_data_channel("control", Some(RTCDataChannelInit::default()))
+        .await
+        .unwrap();
+    let browser_offer = browser_pc.create_offer(None).await.unwrap();
+    browser_pc
+        .set_local_description(browser_offer.clone())
+        .await
+        .unwrap();
+
+    // Controller WS.
     let ctrl_url = format!(
         "ws://{}/ws?token={}",
         app.addr,
         urlencode(&seeded.admin.access_token)
     );
     let (mut ctrl_ws, _) = connect_async(&ctrl_url).await.expect("controller ws");
-
-    // Drain the initial "connected" event the server pushes.
     let _ = tokio::time::timeout(Duration::from_secs(2), ctrl_ws.next()).await;
 
-    let session_request = json!({
-        "t": "rc:session.request",
-        "agent_id": cfg.agent_id,
-        // bitflags serialises as pipe-separated names — see
-        // remote_control::permissions::tests for the lock-in test.
-        "permissions": "VIEW | INPUT",
-    });
+    // Kick off the session.
     ctrl_ws
-        .send(Message::Text(session_request.to_string().into()))
+        .send(Message::Text(
+            json!({
+                "t": "rc:session.request",
+                "agent_id": cfg.agent_id,
+                "permissions": "VIEW | INPUT",
+            })
+            .to_string()
+            .into(),
+        ))
         .await
         .unwrap();
 
-    // Collect messages until we see rc:terminate (end of the handshake).
     let mut saw_created = false;
     let mut saw_ready = false;
-    let mut saw_terminate = false;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let mut saw_answer = false;
+    let mut saw_agent_ice = false;
+    let mut answer_sdp: Option<String> = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     let mut session_id: Option<String> = None;
-    let mut seen: Vec<String> = Vec::new();
-    while tokio::time::Instant::now() < deadline && !saw_terminate {
+
+    while tokio::time::Instant::now() < deadline && !saw_answer {
         let msg = match tokio::time::timeout(Duration::from_millis(500), ctrl_ws.next()).await {
             Ok(Some(Ok(m))) => m,
             _ => continue,
@@ -224,50 +250,63 @@ async fn agent_library_auto_grants_consent_and_declines_media() {
             Message::Text(t) => t.to_string(),
             _ => continue,
         };
-        seen.push(text.clone());
-        let v: Value = match serde_json::from_str(&text) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let t = v.get("t").and_then(|x| x.as_str()).unwrap_or("");
-        match t {
+        let Ok(v) = serde_json::from_str::<Value>(&text) else { continue };
+        match v.get("t").and_then(|x| x.as_str()).unwrap_or("") {
             "rc:session.created" => {
                 saw_created = true;
                 session_id = extract_oid(&v["session_id"]);
             }
             "rc:ready" => {
                 saw_ready = true;
-                // Send a stub SDP offer so the agent replies with terminate.
-                if let Some(sid) = session_id.as_deref() {
-                    let offer = json!({
-                        "t": "rc:sdp.offer",
-                        "session_id": sid,
-                        "sdp": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n",
-                    });
-                    ctrl_ws.send(Message::Text(offer.to_string().into())).await.unwrap();
-                }
+                let sid = session_id.clone().expect("session_id from earlier");
+                ctrl_ws
+                    .send(Message::Text(
+                        json!({
+                            "t": "rc:sdp.offer",
+                            "session_id": sid,
+                            "sdp": browser_offer.sdp,
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
             }
-            "rc:terminate" => {
-                saw_terminate = true;
+            "rc:sdp.answer" => {
+                saw_answer = true;
+                answer_sdp = v["sdp"].as_str().map(|s| s.to_owned());
+            }
+            "rc:ice" => {
+                // At least one ICE candidate trickled back from the agent's
+                // gather phase means the PC is actually running.
+                saw_agent_ice = true;
             }
             _ => {}
         }
     }
-    assert!(
-        saw_created,
-        "controller never received rc:session.created. seen={seen:#?}"
-    );
-    assert!(
-        saw_ready,
-        "controller never received rc:ready. seen={seen:#?}"
-    );
-    assert!(
-        saw_terminate,
-        "agent never terminated the session after rc:sdp.offer. seen={seen:#?}"
-    );
+
+    assert!(saw_created, "rc:session.created missing");
+    assert!(saw_ready, "rc:ready missing");
+    assert!(saw_answer, "rc:sdp.answer missing — agent PC failed to build one");
+
+    // Apply the answer on the browser side — proves it's a valid SDP.
+    let sdp = answer_sdp.expect("answer SDP");
+    assert!(sdp.contains("v=0"), "answer SDP looks malformed: {sdp:.200}");
+    let answer = RTCSessionDescription::answer(sdp).expect("parse answer");
+    browser_pc
+        .set_remote_description(answer)
+        .await
+        .expect("browser accepts agent's answer");
+
+    // ICE trickle is best-effort in this environment (localhost only, tight
+    // ports); we log whether we saw any but don't fail on it.
+    if !saw_agent_ice {
+        eprintln!("note: no rc:ice from agent within window — acceptable for CI");
+    }
 
     let _ = stop_tx.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(2), sig_task).await;
+    let _ = browser_pc.close().await;
 }
 
 fn urlencode(s: &str) -> String {

@@ -1,14 +1,10 @@
 //! WebSocket signaling loop against `/ws?role=agent&token=...`.
 //!
-//! This is deliberately media-free for v1: we speak the `rc:*` protocol from
-//! `roomler-ai-remote-control::signaling`, send `rc:agent.hello` on connect,
-//! auto-grant consent (per AccessPolicy default for self-controlled hosts),
-//! and reply to an `rc:sdp.offer` by terminating the session with
-//! `EndReason::Error` until the WebRTC PeerConnection is wired in a later
-//! commit.
+//! Handles the full rc:* handshake and owns a map of per-session
+//! [`AgentPeer`] values that back each live WebRTC PeerConnection.
 //!
-//! Reconnect strategy: exponential backoff capped at 60 s. The tokio-level
-//! loop never panics on network errors — it logs and retries.
+//! Reconnect strategy: exponential backoff capped at 60 s. Fatal auth errors
+//! (HTTP 401 on upgrade) exit the loop so the user can re-enroll.
 
 use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
@@ -16,11 +12,18 @@ use roomler_ai_remote_control::{
     models::{AgentCaps, DisplayInfo, EndReason, OsKind},
     signaling::{ClientMsg, ServerMsg},
 };
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
+use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 
 use crate::config::AgentConfig;
+use crate::peer::AgentPeer;
+
+/// Capacity of the outbound channel peers use to push `ClientMsg` back into
+/// the signaling loop (ICE trickles, terminate signals). 64 is generous for
+/// one session's ICE gather phase.
+const PEER_OUTBOUND_CAP: usize = 64;
 
 /// Drive the signaling loop forever. Returns only on fatal error (e.g.
 /// auth rejection) or shutdown signal.
@@ -38,8 +41,6 @@ pub async fn run(cfg: AgentConfig, shutdown: tokio::sync::watch::Receiver<bool>)
                 backoff = Duration::from_secs(1);
             }
             Err(ConnectError::AuthRejected) => {
-                // Server refused our agent token. Nothing we can do here — the
-                // user needs to re-enroll.
                 error!("agent token rejected; re-enrollment required");
                 return Err(anyhow::anyhow!("agent token rejected by server"));
             }
@@ -72,8 +73,6 @@ async fn connect_once(
     info!(%url, "connecting to signaling server");
 
     let (mut ws, response) = connect_async(&url).await.map_err(|e| {
-        // tungstenite returns a specific Http error when the server rejects
-        // the upgrade with a 4xx (our path returns 401 for a bad token).
         if let tokio_tungstenite::tungstenite::Error::Http(ref resp) = e
             && resp.status().as_u16() == 401
         {
@@ -94,21 +93,39 @@ async fn connect_once(
     send_msg(&mut ws, &hello).await.context("sending hello")?;
     info!("rc:agent.hello sent");
 
-    // Main loop: read inbound messages + react. Shutdown is checked every
-    // tick so Ctrl-C exits promptly.
+    // Outbound channel shared by all per-session peers. Peers push their
+    // locally-gathered ICE candidates and state-change terminates here;
+    // the main loop flushes them to the WS.
+    let (outbound_tx, mut outbound_rx) = mpsc::channel::<ClientMsg>(PEER_OUTBOUND_CAP);
+    let mut peers: HashMap<bson::oid::ObjectId, AgentPeer> = HashMap::new();
+
     loop {
         tokio::select! {
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
                     info!("shutdown signalled; closing ws");
+                    close_all_peers(&mut peers).await;
                     let _ = ws.send(Message::Close(None)).await;
                     return Ok(());
+                }
+            }
+            Some(outbound_msg) = outbound_rx.recv() => {
+                if let Err(e) = send_msg(&mut ws, &outbound_msg).await {
+                    warn!(%e, "failed to flush peer-originated message");
                 }
             }
             maybe_msg = ws.next() => match maybe_msg {
                 Some(Ok(Message::Text(text))) => {
                     match serde_json::from_str::<ServerMsg>(&text) {
-                        Ok(parsed) => handle_server_msg(&mut ws, parsed).await?,
+                        Ok(parsed) => {
+                            handle_server_msg(
+                                &mut ws,
+                                parsed,
+                                &mut peers,
+                                &outbound_tx,
+                            )
+                            .await?;
+                        }
                         Err(e) => debug!(%e, text = %text.as_str(), "ignoring non-rc:* frame"),
                     }
                 }
@@ -117,9 +134,11 @@ async fn connect_once(
                 }
                 Some(Ok(Message::Close(_))) | None => {
                     info!("ws closed by peer");
+                    close_all_peers(&mut peers).await;
                     return Ok(());
                 }
                 Some(Err(e)) => {
+                    close_all_peers(&mut peers).await;
                     return Err(ConnectError::Transient(anyhow::Error::new(e).context("ws read")));
                 }
                 _ => {}
@@ -133,6 +152,8 @@ async fn handle_server_msg(
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
     msg: ServerMsg,
+    peers: &mut HashMap<bson::oid::ObjectId, AgentPeer>,
+    outbound_tx: &mpsc::Sender<ClientMsg>,
 ) -> Result<(), ConnectError> {
     match msg {
         ServerMsg::Request {
@@ -145,57 +166,106 @@ async fn handle_server_msg(
             info!(
                 %session_id, %controller_user_id, %controller_name,
                 ?permissions, consent_timeout_secs,
-                "incoming session request — auto-granting for MVP"
+                "incoming session request — auto-granting (see docs §11.2)"
             );
-            // TODO: run consent UI. For now, auto-grant (matches the doc's
-            // "self-controlling-self" default at §11.2).
+            // TODO: real consent UI. Self-host default is "no prompt".
             send_msg(ws, &ClientMsg::Consent { session_id, granted: true })
                 .await
                 .map_err(|e| ConnectError::Transient(e.context("sending consent")))?;
         }
-        ServerMsg::SdpOffer { session_id, sdp, ice_servers: _ } => {
-            // Media isn't wired yet. Cleanly decline with a terminate +
-            // Error reason so the controller sees a clear failure instead
-            // of hanging on the negotiating phase.
-            warn!(
-                %session_id, sdp_len = sdp.len(),
-                "rc:sdp.offer received but WebRTC peer is not yet implemented in this agent build"
-            );
+
+        ServerMsg::SdpOffer { session_id, sdp, ice_servers } => {
+            info!(%session_id, sdp_len = sdp.len(), "rc:sdp.offer — creating peer");
+
+            // Build a fresh peer for this session. If an old one somehow
+            // exists (controller retry?), close it first so the browser sees
+            // a clean answer.
+            if let Some(old) = peers.remove(&session_id) {
+                old.close().await;
+            }
+
+            let peer = match AgentPeer::new(session_id, &ice_servers, outbound_tx.clone()).await {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(%session_id, %e, "AgentPeer::new failed; terminating");
+                    let _ = send_msg(
+                        ws,
+                        &ClientMsg::Terminate {
+                            session_id,
+                            reason: EndReason::Error,
+                        },
+                    )
+                    .await;
+                    return Ok(());
+                }
+            };
+
+            let answer_sdp = match peer.handle_offer(sdp).await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(%session_id, %e, "handle_offer failed; terminating");
+                    peer.close().await;
+                    let _ = send_msg(
+                        ws,
+                        &ClientMsg::Terminate {
+                            session_id,
+                            reason: EndReason::Error,
+                        },
+                    )
+                    .await;
+                    return Ok(());
+                }
+            };
+
             send_msg(
                 ws,
-                &ClientMsg::Terminate {
+                &ClientMsg::SdpAnswer {
                     session_id,
-                    reason: EndReason::Error,
+                    sdp: answer_sdp,
                 },
             )
             .await
-            .map_err(|e| ConnectError::Transient(e.context("sending terminate")))?;
+            .map_err(|e| ConnectError::Transient(e.context("sending answer")))?;
+            peers.insert(session_id, peer);
+            info!(%session_id, "rc:sdp.answer sent; peer is live");
         }
+
         ServerMsg::Ice { session_id, candidate } => {
-            // We'd feed this to the PeerConnection once it exists. For now,
-            // log it at debug so the reader of this log knows signaling is
-            // flowing end to end.
-            debug!(%session_id, ?candidate, "rc:ice received (no-op until peer is wired)");
+            if let Some(peer) = peers.get(&session_id) {
+                if let Err(e) = peer.add_remote_candidate(candidate).await {
+                    debug!(%session_id, %e, "add_remote_candidate failed");
+                }
+            } else {
+                debug!(%session_id, "ICE for unknown session; buffering not yet supported");
+            }
         }
+
         ServerMsg::Terminate { session_id, reason } => {
             info!(%session_id, ?reason, "session terminated by server");
+            if let Some(peer) = peers.remove(&session_id) {
+                peer.close().await;
+            }
         }
+
         ServerMsg::Error { session_id, code, message } => {
             warn!(?session_id, %code, %message, "server-side rc error");
         }
-        ServerMsg::Ready { session_id, ice_servers: _ }
-        | ServerMsg::SessionCreated { session_id, .. } => {
-            // These are controller-oriented messages and shouldn't normally
-            // reach an agent. Log at debug in case the server routing is
-            // ever extended.
-            debug!(%session_id, ?msg, "unexpected controller-side msg on agent socket");
-        }
-        ServerMsg::SdpAnswer { .. } => {
-            debug!("unexpected rc:sdp.answer on agent socket");
+
+        // Controller-oriented messages shouldn't reach us.
+        ServerMsg::Ready { session_id, .. }
+        | ServerMsg::SessionCreated { session_id, .. }
+        | ServerMsg::SdpAnswer { session_id, .. } => {
+            debug!(%session_id, "unexpected controller-side msg on agent socket");
         }
         ServerMsg::Pong { .. } => {}
     }
     Ok(())
+}
+
+async fn close_all_peers(peers: &mut HashMap<bson::oid::ObjectId, AgentPeer>) {
+    for (_, peer) in peers.drain() {
+        peer.close().await;
+    }
 }
 
 async fn send_msg(
@@ -219,7 +289,6 @@ fn detect_os() -> OsKind {
 }
 
 fn stub_displays() -> Vec<DisplayInfo> {
-    // Real implementation will query the capture backend once it exists.
     vec![DisplayInfo {
         index: 0,
         name: "primary".into(),
@@ -234,7 +303,7 @@ fn stub_caps() -> AgentCaps {
     AgentCaps {
         hw_encoders: vec![],
         codecs: vec!["h264".into()],
-        has_input_permission: false, // stub: we don't actually inject yet
+        has_input_permission: false,
         supports_clipboard: false,
         supports_file_transfer: false,
         max_simultaneous_sessions: 1,
@@ -242,7 +311,5 @@ fn stub_caps() -> AgentCaps {
 }
 
 fn urlencode(s: &str) -> String {
-    // JWTs may include `+`, `/`, `=` — those three must be percent-escaped
-    // in a query string. No need to pull in a url crate for this.
     s.replace('+', "%2B").replace('/', "%2F").replace('=', "%3D")
 }
