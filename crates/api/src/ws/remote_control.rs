@@ -182,6 +182,33 @@ pub fn dispatch_controller_rc(
     };
     if let Err(e) = hub.dispatch(&ctx, parsed) {
         warn!(%user_id, %e, "rc:* dispatch failed (controller)");
+        // Surface the failure to the controller so the UI can exit its
+        // "Requesting session…" spinner instead of hanging. `code` is the
+        // Error variant name, `message` is Display. Silently best-effort —
+        // the controller may already be closing.
+        let code = error_code(&e);
+        let _ = controller_tx.try_send(ServerMsg::Error {
+            session_id: None,
+            code: code.to_string(),
+            message: e.to_string(),
+        });
     }
     true
+}
+
+fn error_code(e: &roomler_ai_remote_control::Error) -> &'static str {
+    use roomler_ai_remote_control::Error::*;
+    match e {
+        AgentOffline(_)     => "agent_offline",
+        AgentNotFound(_)    => "agent_not_found",
+        AgentBusy           => "agent_busy",
+        SessionNotFound(_)  => "session_not_found",
+        BadPhase(_, _)      => "bad_phase",
+        ConsentDenied       => "consent_denied",
+        ConsentTimeout      => "consent_timeout",
+        PermissionDenied(_) => "permission_denied",
+        BadMessage(_)       => "bad_message",
+        SendFailed          => "send_failed",
+        _                   => "internal",
+    }
 }

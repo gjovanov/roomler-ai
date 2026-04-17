@@ -99,6 +99,13 @@ async fn connect_once(
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<ClientMsg>(PEER_OUTBOUND_CAP);
     let mut peers: HashMap<bson::oid::ObjectId, AgentPeer> = HashMap::new();
 
+    // Keepalive. nginx + K8s ingress commonly idle-close WSes at 60-120s of
+    // silence; send an application-level Ping every 25s so the connection
+    // survives quiet periods between sessions.
+    let mut keepalive = tokio::time::interval(Duration::from_secs(25));
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    keepalive.tick().await; // Swallow the immediate first tick.
+
     loop {
         tokio::select! {
             _ = shutdown.changed() => {
@@ -107,6 +114,13 @@ async fn connect_once(
                     close_all_peers(&mut peers).await;
                     let _ = ws.send(Message::Close(None)).await;
                     return Ok(());
+                }
+            }
+            _ = keepalive.tick() => {
+                if let Err(e) = ws.send(Message::Ping(Vec::new().into())).await {
+                    warn!(%e, "keepalive ping failed — will reconnect");
+                    close_all_peers(&mut peers).await;
+                    return Err(ConnectError::Transient(anyhow::Error::new(e).context("ws ping")));
                 }
             }
             Some(outbound_msg) = outbound_rx.recv() => {
