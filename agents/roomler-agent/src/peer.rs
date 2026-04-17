@@ -1,43 +1,56 @@
 //! Thin wrapper around a `webrtc-rs` `RTCPeerConnection`.
 //!
-//! Scope for this commit is *signaling-complete, media-empty*: the peer can
-//! answer an SDP offer, trickle ICE in both directions, and accept data
-//! channels opened by the browser controller (they're logged but not yet
-//! used). No video/audio track is produced — screen capture and H.264
-//! encoding land in a follow-up.
+//! Owns the per-session WebRTC state: codecs, ICE, data channels, and (when
+//! a capture/encoder backend is compiled in) a video track that's fed from
+//! a spawned media pump task.
 //!
-//! Why that split: getting SDP + ICE correct is half the WebRTC battle and
-//! is testable against a browser immediately. Adding a real video track
-//! requires picking an encoder (openh264 / nvenc / vaapi) and feeding raw
-//! NALUs into a `TrackLocalStaticSample`, which has its own debugging arc.
+//! Media pump lifecycle:
+//!   1. On new(): add an `H264` track and spawn the pump.
+//!   2. The pump asks `capture::open_default` for frames; if the build
+//!      doesn't include `scrap-capture`, it gets a NoopCapture and never
+//!      emits anything — track is added but carries no samples. The
+//!      browser still negotiates the m=video section.
+//!   3. On each frame, `encode::open_default` produces H.264 NALUs that
+//!      become a `webrtc::media::Sample`. Sample duration is derived from
+//!      the capture rate.
+//!   4. On close(): cancels the pump, closes the PC.
 
 use anyhow::{Context, Result, anyhow};
+use bytes::Bytes;
 use roomler_ai_remote_control::signaling::{ClientMsg, IceServer};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use webrtc::api::APIBuilder;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit};
 use webrtc::ice_transport::ice_server::RTCIceServer;
+use webrtc::media::Sample;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
+use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
+use webrtc::track::track_local::TrackLocal;
+use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
-/// A single remote-control session's peer. One of these exists per live
-/// [`roomler_ai_remote_control::models::RemoteSession`] on the agent side.
+use crate::capture;
+use crate::encode;
+
+/// Target capture rate. Aligns the sample pacing sent to the browser with
+/// how fast the capturer emits frames.
+const TARGET_FPS: u32 = 30;
+
 pub struct AgentPeer {
     pc: Arc<RTCPeerConnection>,
     session_id: bson::oid::ObjectId,
+    media_pump: Option<JoinHandle<()>>,
 }
 
 impl AgentPeer {
-    /// Build a new PC, register ICE + state callbacks that forward events
-    /// through `outbound` as `ClientMsg` values (ICE candidates, terminate
-    /// on fatal state). The caller is expected to pump `outbound` into the
-    /// WebSocket.
     pub async fn new(
         session_id: bson::oid::ObjectId,
         ice_servers: &[IceServer],
@@ -61,8 +74,22 @@ impl AgentPeer {
                 .context("new_peer_connection")?,
         );
 
-        // Forward locally-gathered ICE candidates back through the signaling
-        // channel so the browser can trickle them into its remote description.
+        // Add a sendonly H.264 video track up front so the SDP answer
+        // advertises it. webrtc-rs picks compatible H.264 params from the
+        // MediaEngine's default codec list.
+        let video_track = Arc::new(TrackLocalStaticSample::new(
+            RTCRtpCodecCapability {
+                mime_type: "video/H264".to_string(),
+                ..Default::default()
+            },
+            "video".to_string(),
+            "roomler-agent".to_string(),
+        ));
+        pc.add_track(video_track.clone() as Arc<dyn TrackLocal + Send + Sync>)
+            .await
+            .context("add_track(video)")?;
+
+        // Forward locally-gathered ICE candidates.
         {
             let tx = outbound.clone();
             pc.on_ice_candidate(Box::new(move |c: Option<RTCIceCandidate>| {
@@ -87,10 +114,7 @@ impl AgentPeer {
             }));
         }
 
-        // Log connection state transitions so operators can see what's
-        // happening during a session. On `Failed` / `Disconnected` we ask
-        // the server to tear the session down; `Closed` is terminal and
-        // driven by either side.
+        // PC state → logs + fatal Terminate on Failed.
         {
             let tx = outbound.clone();
             pc.on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
@@ -109,12 +133,6 @@ impl AgentPeer {
             }));
         }
 
-        // Accept data channels opened by the controller. For now we just
-        // log what comes in; future commits will attach:
-        //   - "input"     → InputInjector
-        //   - "control"   → cursor overlay, keyframe requests
-        //   - "clipboard" → clipboard sync
-        //   - "files"     → chunked file transfer
         pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
             let label = dc.label().to_string();
             info!(session = %session_id, %label, "data channel opened (not yet wired)");
@@ -126,11 +144,18 @@ impl AgentPeer {
             })
         }));
 
-        Ok(Self { pc, session_id })
+        // Start the capture→encode→track pump. The pump is self-regulating:
+        // with no capture backend compiled in, open_default returns a Noop
+        // that parks forever, producing no samples.
+        let pump = tokio::spawn(media_pump(session_id, video_track));
+
+        Ok(Self {
+            pc,
+            session_id,
+            media_pump: Some(pump),
+        })
     }
 
-    /// Set the remote offer and produce our answer SDP. Local description
-    /// gets set too so `on_ice_candidate` starts firing immediately.
     pub async fn handle_offer(&self, offer_sdp: String) -> Result<String> {
         let offer = RTCSessionDescription::offer(offer_sdp).context("parse offer")?;
         self.pc
@@ -148,17 +173,10 @@ impl AgentPeer {
             .await
             .context("set_local_description")?;
 
-        // The caller sends this over the signaling channel as `rc:sdp.answer`.
         Ok(answer.sdp)
     }
 
-    /// Feed a remote ICE candidate. Safe to call before `handle_offer`
-    /// completes — webrtc-rs buffers these until the remote description
-    /// is set.
     pub async fn add_remote_candidate(&self, candidate: serde_json::Value) -> Result<()> {
-        // The browser sends either the `RTCIceCandidateInit` object shape
-        // (`{candidate, sdpMid, sdpMLineIndex, usernameFragment}`) or a
-        // bare string. Normalise.
         let init: RTCIceCandidateInit = match candidate {
             serde_json::Value::String(s) => RTCIceCandidateInit {
                 candidate: s,
@@ -174,8 +192,71 @@ impl AgentPeer {
     }
 
     pub async fn close(&self) {
+        if let Some(pump) = &self.media_pump {
+            pump.abort();
+        }
         if let Err(e) = self.pc.close().await {
             warn!(session = %self.session_id, %e, "PC close failed");
+        }
+    }
+}
+
+/// Per-session media pump. Captures frames, encodes to H.264, writes
+/// Samples into the WebRTC track. Rebuilds the encoder if the capture
+/// resolution changes mid-session (e.g. dock/undock).
+async fn media_pump(session_id: bson::oid::ObjectId, track: Arc<TrackLocalStaticSample>) {
+    let mut capturer = capture::open_default(TARGET_FPS);
+    let mut encoder: Option<Box<dyn encode::VideoEncoder>> = None;
+    let mut encoder_dims: Option<(u32, u32)> = None;
+    let frame_duration = Duration::from_micros(1_000_000 / TARGET_FPS as u64);
+
+    loop {
+        let frame = match capturer.next_frame().await {
+            Ok(Some(f)) => f,
+            Ok(None) => {
+                // No frame produced within the backend's internal budget;
+                // keep looping so shutdown via task abort() lands quickly.
+                continue;
+            }
+            Err(e) => {
+                warn!(%session_id, %e, "capture error — stopping media pump");
+                return;
+            }
+        };
+
+        // (Re)build the encoder if the frame dimensions change.
+        if encoder_dims != Some((frame.width, frame.height)) {
+            info!(
+                %session_id,
+                w = frame.width, h = frame.height,
+                "initialising encoder for frame dims"
+            );
+            encoder = Some(encode::open_default(frame.width, frame.height));
+            encoder_dims = Some((frame.width, frame.height));
+        }
+
+        let enc = encoder.as_mut().unwrap();
+        let packets = match enc.encode(frame).await {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(%session_id, %e, "encode error — stopping media pump");
+                return;
+            }
+        };
+
+        for p in packets {
+            let sample = Sample {
+                data: Bytes::from(p.data),
+                timestamp: SystemTime::now(),
+                duration: frame_duration,
+                packet_timestamp: 0,
+                prev_dropped_packets: 0,
+                prev_padding_packets: 0,
+            };
+            if let Err(e) = track.write_sample(&sample).await {
+                // Benign when the PC hasn't finished ICE yet — drop and carry on.
+                debug!(%session_id, %e, "write_sample");
+            }
         }
     }
 }

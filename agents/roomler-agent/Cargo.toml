@@ -59,6 +59,12 @@ webrtc = { workspace = true }
 #   cargo build --release --features scrap-capture
 scrap = { workspace = true, optional = true }
 
+# Software H.264 encoder (OpenH264).
+openh264 = { workspace = true, optional = true }
+
+# Used by the media pump to wrap encoded NALUs in webrtc Sample.data.
+bytes = "1"
+
 # Random fallback for machine_id
 rand = { workspace = true }
 
@@ -66,6 +72,11 @@ rand = { workspace = true }
 default = []
 # Enables the scrap-backed screen capture on Linux/Windows/macOS.
 scrap-capture = ["dep:scrap"]
+# Enables the OpenH264 software video encoder.
+openh264-encoder = ["dep:openh264"]
+# Convenience: full media pipeline (capture + encode). What production
+# agent binaries should build with.
+media = ["scrap-capture", "openh264-encoder"]
 
 [dev-dependencies]
 tokio-test = { workspace = true }

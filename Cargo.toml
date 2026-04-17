@@ -117,3 +117,7 @@ webrtc = "0.12"
 # build dep that xcap / screenshots would pull in. Cross-platform: XShm on
 # Linux, DXGI Desktop Duplication on Windows, CoreGraphics on macOS.
 scrap = "0.5"
+# Software H.264 encoder. `source` feature compiles OpenH264 from C — slow
+# first build but no runtime lib needed. Alternatives (nvenc/qsv/vaapi)
+# come behind other feature flags in a later phase.
+openh264 = { version = "0.9", default-features = false, features = ["source"] }
