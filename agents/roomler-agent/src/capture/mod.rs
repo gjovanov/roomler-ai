@@ -1,11 +1,17 @@
 //! Screen capture abstraction.
 //!
-//! One-trait-per-platform model: each backend impls `ScreenCapture` and is
-//! behind its own Cargo feature (future work). For now we ship the trait
-//! plus a stub that yields no frames — enough for the signaling-only build
-//! to compile and for higher layers to be written against it.
+//! Trait + concrete backends. `scrap_backend::ScrapCapture` is the default
+//! for any OS scrap supports (Linux/X11 via XShm, Windows via DXGI,
+//! macOS via CGDisplayStream); `NoopCapture` is a fallback that never
+//! yields frames, used when a display is not available.
+//!
+//! Higher layers pick via `capture::open_default()`; individual backends
+//! can also be constructed directly for tests.
 
 use anyhow::Result;
+
+#[cfg(feature = "scrap-capture")]
+pub mod scrap_backend;
 
 /// A captured frame, in an encoder-agnostic representation.
 ///
@@ -37,8 +43,9 @@ pub trait ScreenCapture: Send {
     fn monitor_count(&self) -> u8;
 }
 
-/// A capture backend that never produces frames. Used by the signaling-only
-/// build so the agent compiles on any host without pulling platform deps.
+/// A capture backend that never produces frames. Used when no display is
+/// available (headless host, CI with no $DISPLAY) so higher layers can keep
+/// ticking without panicking.
 pub struct NoopCapture;
 
 #[async_trait::async_trait]
@@ -50,4 +57,27 @@ impl ScreenCapture for NoopCapture {
         Ok(None)
     }
     fn monitor_count(&self) -> u8 { 0 }
+}
+
+/// Open the best-available capture backend for the current host. Falls
+/// back to [`NoopCapture`] if no display is reachable or the crate was
+/// built without a capture backend feature.
+pub fn open_default(_target_fps: u32) -> Box<dyn ScreenCapture> {
+    #[cfg(feature = "scrap-capture")]
+    {
+        match scrap_backend::ScrapCapture::primary(_target_fps) {
+            Ok(c) => return Box::new(c),
+            Err(e) => {
+                tracing::warn!(%e, "scrap capture unavailable — falling back to NoopCapture");
+            }
+        }
+    }
+    #[cfg(not(feature = "scrap-capture"))]
+    {
+        tracing::info!(
+            "built without scrap-capture feature — using NoopCapture. \
+             Rebuild with `--features scrap-capture` for real screen capture."
+        );
+    }
+    Box::new(NoopCapture)
 }

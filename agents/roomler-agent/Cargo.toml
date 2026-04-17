@@ -52,8 +52,20 @@ async-trait = { workspace = true }
 # WebRTC peer
 webrtc = { workspace = true }
 
+# Screen capture (X11 on Linux, DXGI on Windows, CoreGraphics on macOS).
+# Gated behind a feature because the transitive system deps (libxcb,
+# libxcb-shm, libxcb-randr on Linux) aren't available on every dev box
+# and we want `cargo check`/CI green without them. Production builds:
+#   cargo build --release --features scrap-capture
+scrap = { workspace = true, optional = true }
+
 # Random fallback for machine_id
 rand = { workspace = true }
+
+[features]
+default = []
+# Enables the scrap-backed screen capture on Linux/Windows/macOS.
+scrap-capture = ["dep:scrap"]
 
 [dev-dependencies]
 tokio-test = { workspace = true }

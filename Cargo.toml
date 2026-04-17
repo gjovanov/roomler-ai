@@ -113,3 +113,7 @@ tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 directories = "6"
 toml = "0.9"
 webrtc = "0.12"
+# Screen capture. `scrap` is pure-X11 on Linux and avoids the libwayland-dev
+# build dep that xcap / screenshots would pull in. Cross-platform: XShm on
+# Linux, DXGI Desktop Duplication on Windows, CoreGraphics on macOS.
+scrap = "0.5"
