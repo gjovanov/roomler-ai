@@ -31,3 +31,37 @@ impl Permissions {
         self.intersects(Self::INPUT | Self::FILES | Self::AUDIO | Self::RECORD)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // These lock in the wire format used by `rc:*` messages.
+    //
+    // bitflags 2.x with its `serde` feature serializes flag sets as a
+    // pipe-separated string like `"VIEW | INPUT"` — the struct-level
+    // `#[serde(transparent)]` attribute is *ignored* by bitflags' own
+    // Serialize/Deserialize impl, so changing it has no effect.
+    //
+    // If this test starts failing because bitflags changed its default,
+    // update the TS-side agent store (and any manual JSON in tests)
+    // accordingly. Numeric-form payloads will NOT deserialise.
+
+    #[test]
+    fn serialises_as_pipe_separated_string() {
+        let p = Permissions::VIEW | Permissions::INPUT;
+        assert_eq!(serde_json::to_string(&p).unwrap(), "\"VIEW | INPUT\"");
+    }
+
+    #[test]
+    fn deserialises_string_names() {
+        let p: Permissions = serde_json::from_str("\"VIEW | INPUT\"").unwrap();
+        assert_eq!(p, Permissions::VIEW | Permissions::INPUT);
+    }
+
+    #[test]
+    fn deserialise_numeric_is_rejected() {
+        let r: Result<Permissions, _> = serde_json::from_str("3");
+        assert!(r.is_err(), "numeric form must not be accepted");
+    }
+}
