@@ -155,11 +155,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install LLVM (provides libclang for bindgen)
+      - name: Locate LLVM (provides libclang for bindgen)
         shell: pwsh
         run: |
-          choco install -y llvm --version 18.1.8
-          echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
+          # windows-latest ships LLVM (v20+) pre-installed under
+          # C:\Program Files\LLVM. Just point bindgen at it — don't try to
+          # downgrade via chocolatey (choco refuses without --allow-downgrade).
+          $llvm = "C:\Program Files\LLVM"
+          if (-not (Test-Path $llvm)) {
+            choco install -y llvm
+            $llvm = "C:\Program Files\LLVM"
+          }
+          "LIBCLANG_PATH=$llvm\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$llvm\bin"              | Out-File -FilePath $env:GITHUB_PATH -Append
+          & "$llvm\bin\clang.exe" --version
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

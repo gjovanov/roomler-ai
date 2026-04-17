@@ -184,6 +184,11 @@ fn hid_to_key(code: u32) -> Option<Key> {
         0x4d => Some(Key::End),
         0x4b => Some(Key::PageUp),
         0x4e => Some(Key::PageDown),
+        // `Key::Insert` only exists on Linux + Windows builds of enigo;
+        // macOS keyboards have no Insert key, so enigo omits the variant.
+        // Fall through to None on macOS — the browser-side composable can
+        // retry via InputMsg::KeyText for the rare caller that needs it.
+        #[cfg(not(target_os = "macos"))]
         0x49 => Some(Key::Insert),
         0x4c => Some(Key::Delete),
         0x3a => Some(Key::F1),
