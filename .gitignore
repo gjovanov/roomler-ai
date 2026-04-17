@@ -19,3 +19,4 @@ ui/test-results/
 ui/playwright-report/
 ui/e2e/video/output/
 .claude/
+dist/
