@@ -115,6 +115,11 @@ const routes: RouteRecordRaw[] = [
             name: 'billing',
             component: () => import('@/views/billing/BillingView.vue'),
           },
+          {
+            path: 'agent/:agentId/remote',
+            name: 'agent-remote',
+            component: () => import('@/views/remote/RemoteControl.vue'),
+          },
         ],
       },
     ],
