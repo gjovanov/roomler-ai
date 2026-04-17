@@ -274,12 +274,10 @@ fn urlencode(s: &str) -> String {
     s.replace('+', "%2B").replace('/', "%2F").replace('=', "%3D")
 }
 
-/// Extract a hex ObjectId from either `"hexstring"` (raw) or
-/// `{"$oid":"hexstring"}` (bson extended JSON). The server currently emits
-/// the extended form on the WS signaling path but accepts either on input;
-/// REST routes emit raw hex. Worth reconciling in a follow-up.
+/// Extract a hex ObjectId. The wire format is raw hex on both REST and WS
+/// paths — see `signaling::tests::object_ids_serialise_as_raw_hex_on_wire`.
+/// If a regression ever reverts to bson-extended JSON we want this helper
+/// to fail loudly, not paper over it.
 fn extract_oid(v: &Value) -> Option<String> {
-    v.as_str()
-        .map(str::to_owned)
-        .or_else(|| v.get("$oid").and_then(|o| o.as_str()).map(str::to_owned))
+    v.as_str().map(str::to_owned)
 }

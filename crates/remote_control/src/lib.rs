@@ -26,6 +26,7 @@ pub mod error;
 pub mod hub;
 pub mod models;
 pub mod permissions;
+pub mod serde_helpers;
 pub mod session;
 pub mod signaling;
 pub mod turn_creds;
