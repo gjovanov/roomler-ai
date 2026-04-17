@@ -108,6 +108,9 @@
           </v-card-text>
         </v-card>
 
+        <!-- Remote-control agents -->
+        <AgentsSection v-if="activeSection === 'agents'" :tenant-id="tenantId" />
+
         <!-- Audit log -->
         <v-card v-if="activeSection === 'audit'">
           <v-card-title>Audit Log</v-card-title>
@@ -131,6 +134,7 @@ import { ref, computed, onMounted } from 'vue'
 import { useRoute } from 'vue-router'
 import { useTenantStore } from '@/stores/tenant'
 import { useTaskStore } from '@/stores/tasks'
+import AgentsSection from '@/components/admin/AgentsSection.vue'
 
 const route = useRoute()
 const tenantStore = useTenantStore()
@@ -143,6 +147,7 @@ const adminSections = [
   { id: 'settings', icon: 'mdi-cog', title: 'Settings' },
   { id: 'members', icon: 'mdi-account-group', title: 'Members' },
   { id: 'roles', icon: 'mdi-shield-account', title: 'Roles' },
+  { id: 'agents', icon: 'mdi-desktop-classic', title: 'Agents' },
   { id: 'tasks', icon: 'mdi-progress-clock', title: 'Tasks' },
   { id: 'audit', icon: 'mdi-clipboard-text-clock', title: 'Audit Log' },
 ]

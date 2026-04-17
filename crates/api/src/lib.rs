@@ -223,7 +223,7 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/{agent_id}",
             get(routes::remote_control::get_agent)
-                .patch(routes::remote_control::update_agent)
+                .put(routes::remote_control::update_agent)
                 .delete(routes::remote_control::delete_agent),
         );
 
