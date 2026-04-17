@@ -1,6 +1,6 @@
 use bson::{doc, oid::ObjectId, DateTime};
 use mongodb::Database;
-use roomler2_db::models::{NotificationPrefs, OAuthProvider, Presence, User, UserStatusInfo};
+use roomler_ai_db::models::{NotificationPrefs, OAuthProvider, Presence, User, UserStatusInfo};
 
 use super::base::{BaseDao, DaoError, DaoResult};
 

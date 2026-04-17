@@ -3,7 +3,7 @@ use bson::oid::ObjectId;
 use serde::Serialize;
 
 use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
-use roomler2_services::dao::base::PaginationParams;
+use roomler_ai_services::dao::base::PaginationParams;
 
 #[derive(Debug, Serialize)]
 pub struct NotificationResponse {
@@ -89,7 +89,7 @@ pub async fn mark_all_read(
     Ok(Json(serde_json::json!({ "marked": count })))
 }
 
-fn to_response(n: roomler2_db::models::Notification) -> NotificationResponse {
+fn to_response(n: roomler_ai_db::models::Notification) -> NotificationResponse {
     NotificationResponse {
         id: n.id.unwrap().to_hex(),
         notification_type: format!("{:?}", n.notification_type).to_lowercase(),

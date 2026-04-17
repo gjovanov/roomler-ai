@@ -41,16 +41,16 @@ Located in `crates/tests/src/`. These tests spin up the full Axum server and int
 
 ```bash
 # Run all integration tests
-cargo test -p roomler2-tests
+cargo test -p roomler-ai-tests
 
 # Run with race detection (recommended)
-cargo test -p roomler2-tests -- --test-threads=1
+cargo test -p roomler-ai-tests -- --test-threads=1
 
 # Run a specific test module
-cargo test -p roomler2-tests auth_tests
+cargo test -p roomler-ai-tests auth_tests
 
 # Run with output
-cargo test -p roomler2-tests -- --nocapture
+cargo test -p roomler-ai-tests -- --nocapture
 ```
 
 Integration tests require a running MongoDB instance (see `docker-compose.yml`).
@@ -212,7 +212,7 @@ Environment variables:
 | `API_URL` | `http://localhost:5001` | API base URL |
 | `WS_URL` | `ws://localhost:5001/ws` | WebSocket base URL |
 | `MONGO_URL` | `mongodb://localhost:27019` | MongoDB connection |
-| `DB_NAME` | `roomler2` | Database name |
+| `DB_NAME` | `roomler-ai` | Database name |
 | `RESULTS_FILE` | `stress-test-results.txt` | Output file path |
 
 Script constants (edit in file):

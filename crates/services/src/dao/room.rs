@@ -1,7 +1,7 @@
 use bson::{doc, oid::ObjectId, DateTime};
 use mongodb::Database;
 use rand::Rng;
-use roomler2_db::models::{
+use roomler_ai_db::models::{
     CallChatMessage, ConferenceSettings, MediaSettings, ParticipantRole, ParticipantSession,
     Room, RoomMember,
 };

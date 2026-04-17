@@ -1,14 +1,14 @@
 [package]
-name = "roomler2-api"
+name = "roomler-ai-api"
 version.workspace = true
 edition.workspace = true
 
 [lib]
-name = "roomler2_api"
+name = "roomler_ai_api"
 path = "src/lib.rs"
 
 [[bin]]
-name = "roomler2-api"
+name = "roomler-ai-api"
 path = "src/main.rs"
 
 [features]
@@ -16,9 +16,10 @@ default = []
 
 
 [dependencies]
-roomler2-config = { path = "../config" }
-roomler2-db = { path = "../db" }
-roomler2-services = { path = "../services" }
+roomler-ai-config = { path = "../config" }
+roomler-ai-db = { path = "../db" }
+roomler-ai-services = { path = "../services" }
+roomler-ai-remote-control = { path = "../remote_control" }
 
 axum.workspace = true
 tokio.workspace = true

@@ -20,6 +20,10 @@ use crate::state::AppState;
 #[derive(Debug, Deserialize)]
 pub struct WsParams {
     pub token: String,
+    /// Optional connection role. Defaults to `"user"` to preserve existing
+    /// browser behaviour. Set to `"agent"` by the native remote-control agent.
+    #[serde(default)]
+    pub role: Option<String>,
 }
 
 pub async fn ws_upgrade(
@@ -27,7 +31,14 @@ pub async fn ws_upgrade(
     Query(params): Query<WsParams>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let claims = match state.auth.verify_access_token(&params.token) {
+    match params.role.as_deref() {
+        Some("agent") => ws_upgrade_agent(state, params.token, ws),
+        _ => ws_upgrade_user(state, params.token, ws),
+    }
+}
+
+fn ws_upgrade_user(state: AppState, token: String, ws: WebSocketUpgrade) -> Response {
+    let claims = match state.auth.verify_access_token(&token) {
         Ok(c) => c,
         Err(_) => {
             return Response::builder()
@@ -46,11 +57,73 @@ pub async fn ws_upgrade(
                 .unwrap();
         }
     };
+    let username = claims.username.clone();
 
-    ws.on_upgrade(move |socket| handle_socket(socket, state, user_id))
+    ws.on_upgrade(move |socket| handle_socket(socket, state, user_id, username))
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState, user_id: ObjectId) {
+fn ws_upgrade_agent(state: AppState, token: String, ws: WebSocketUpgrade) -> Response {
+    let claims = match state.auth.verify_agent_token(&token) {
+        Ok(c) => c,
+        Err(_) => {
+            return Response::builder()
+                .status(401)
+                .body("Unauthorized (agent)".into())
+                .unwrap();
+        }
+    };
+
+    let agent_id = match ObjectId::parse_str(&claims.sub) {
+        Ok(id) => id,
+        Err(_) => {
+            return Response::builder()
+                .status(400)
+                .body("Invalid agent ID".into())
+                .unwrap();
+        }
+    };
+    let tenant_id = match ObjectId::parse_str(&claims.tenant_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return Response::builder()
+                .status(400)
+                .body("Invalid tenant ID".into())
+                .unwrap();
+        }
+    };
+
+    ws.on_upgrade(move |socket| async move {
+        // Verify the agent still exists and isn't quarantined/deleted before
+        // we pump any signalling. One Mongo read per connect is cheap and
+        // gives us a clean revocation story without needing a token blacklist.
+        let agent = match state.agents.find_in_tenant(tenant_id, agent_id).await {
+            Ok(a) => a,
+            Err(e) => {
+                warn!(%agent_id, %e, "agent lookup failed on WS connect");
+                return;
+            }
+        };
+        if agent.deleted_at.is_some()
+            || matches!(
+                agent.status,
+                roomler_ai_remote_control::models::AgentStatus::Quarantined
+            )
+        {
+            info!(%agent_id, "agent is quarantined or deleted; refusing WS");
+            return;
+        }
+        crate::ws::remote_control::handle_agent_socket(
+            state,
+            socket,
+            agent_id,
+            tenant_id,
+            agent.owner_user_id,
+        )
+        .await;
+    })
+}
+
+async fn handle_socket(socket: WebSocket, state: AppState, user_id: ObjectId, username: String) {
     let connection_id = Uuid::new_v4().to_string();
     info!(?user_id, %connection_id, "WebSocket connected");
 
@@ -58,6 +131,15 @@ async fn handle_socket(socket: WebSocket, state: AppState, user_id: ObjectId) {
     let sender = Arc::new(Mutex::new(sender));
 
     state.ws_storage.add(user_id, connection_id.clone(), sender.clone());
+
+    // Register this tab with the remote-control Hub so `rc:*` replies find us.
+    // Each browser tab gets its own controller tx; the Hub routes by tx, not
+    // by user id, so multiple tabs don't cross signals.
+    let (rc_controller_tx, rc_controller_rx) = state.rc_hub.register_controller(user_id);
+    let rc_pump = tokio::spawn(crate::ws::remote_control::pump_server_messages(
+        rc_controller_rx,
+        sender.clone(),
+    ));
 
     {
         let msg = serde_json::json!({
@@ -71,7 +153,15 @@ async fn handle_socket(socket: WebSocket, state: AppState, user_id: ObjectId) {
     while let Some(msg) = receiver.next().await {
         match msg {
             Ok(Message::Text(text)) => {
-                handle_client_message(&state, &user_id, &connection_id, &text).await;
+                handle_client_message(
+                    &state,
+                    &user_id,
+                    &connection_id,
+                    &username,
+                    &rc_controller_tx,
+                    &text,
+                )
+                .await;
             }
             Ok(Message::Ping(data)) => {
                 let mut guard = sender.lock().await;
@@ -89,6 +179,8 @@ async fn handle_socket(socket: WebSocket, state: AppState, user_id: ObjectId) {
     }
 
     // Cleanup
+    state.rc_hub.unregister_controller(user_id, &rc_controller_tx);
+    rc_pump.abort();
     state.ws_storage.remove(&user_id, &connection_id, &sender);
 
     if let Some(room_id) = state.room_manager.get_connection_room(&connection_id) {
@@ -118,7 +210,30 @@ async fn handle_socket(socket: WebSocket, state: AppState, user_id: ObjectId) {
     info!(?user_id, %connection_id, "WebSocket disconnected");
 }
 
-async fn handle_client_message(state: &AppState, user_id: &ObjectId, connection_id: &str, text: &str) {
+async fn handle_client_message(
+    state: &AppState,
+    user_id: &ObjectId,
+    connection_id: &str,
+    username: &str,
+    rc_controller_tx: &roomler_ai_remote_control::session::ClientTx,
+    text: &str,
+) {
+    // Remote-control messages use a `t` discriminator prefixed with "rc:".
+    // Peek at the raw JSON before full parse so we don't pay the cost on
+    // every media/presence message.
+    if text.contains("\"rc:") {
+        let handled = crate::ws::remote_control::dispatch_controller_rc(
+            &state.rc_hub,
+            *user_id,
+            username,
+            rc_controller_tx,
+            text,
+        );
+        if handled {
+            return;
+        }
+    }
+
     let parsed: serde_json::Value = match serde_json::from_str(text) {
         Ok(v) => v,
         Err(_) => return,

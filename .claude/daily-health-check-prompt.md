@@ -140,7 +140,7 @@ STEP 3A — Ensure test services are running
     timeout 30 bash -c 'until mongosh --host localhost --port 27019 --eval "db.runCommand({ping:1})" --quiet 2>/dev/null; do sleep 2; done'
 
 STEP 3B — Run backend integration tests
-  cargo test -p roomler2-tests 2>&1 | tee /tmp/roomler-test-results.txt
+  cargo test -p roomler-ai-tests 2>&1 | tee /tmp/roomler-test-results.txt
 
   Collect:
   - Total tests: passed / failed / ignored
@@ -168,10 +168,10 @@ STEP 3E — Coverage gap analysis
 # =============================================================================
 
 STEP 4A — Rust release build
-  cargo build --release --bin roomler2-api 2>&1
+  cargo build --release --bin roomler-ai-api 2>&1
   Record:
   - Build success/failure
-  - Binary size: ls -lh target/release/roomler2-api
+  - Binary size: ls -lh target/release/roomler-ai-api
 
 STEP 4B — Frontend production build
   cd ui && bun run build 2>&1
@@ -240,7 +240,7 @@ STEP 6A — Verify deploy repo
   Check /home/gjovanov/roomler-ai-deploy/ exists and is accessible:
   - ls /home/gjovanov/roomler-ai-deploy/
   - Read playbooks/deploy.yml
-  - Read roles/roomler-ai-deploy/templates/roomler2-deployment.yml.j2
+  - Read roles/roomler-ai-deploy/templates/roomler-ai-deployment.yml.j2
 
 STEP 6B — K8s manifest audit
   - Check deployment strategy (currently Recreate)

@@ -4,6 +4,7 @@ members = [
     "crates/config",
     "crates/db",
     "crates/services",
+    "crates/remote_control",
 
     "crates/api",
     "crates/tests",
@@ -59,6 +60,8 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # Concurrency
 dashmap = "6"
+parking_lot = "0.12"
+bitflags = "2"
 
 # Background tasks
 tokio-cron-scheduler = "0.13"

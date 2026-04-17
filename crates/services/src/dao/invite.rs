@@ -1,6 +1,6 @@
 use bson::{doc, oid::ObjectId, DateTime};
 use mongodb::Database;
-use roomler2_db::models::{Invite, InviteStatus};
+use roomler_ai_db::models::{Invite, InviteStatus};
 
 use super::base::{BaseDao, DaoError, DaoResult, PaginatedResult, PaginationParams};
 

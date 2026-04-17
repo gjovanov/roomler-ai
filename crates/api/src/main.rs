@@ -1,7 +1,7 @@
 use bson::oid::ObjectId;
-use roomler2_api::{build_router, state::AppState, ws::{dispatcher, redis_pubsub::RedisPubSub}};
-use roomler2_config::Settings;
-use roomler2_db::{connect, indexes::ensure_indexes};
+use roomler_ai_api::{build_router, state::AppState, ws::{dispatcher, redis_pubsub::RedisPubSub}};
+use roomler_ai_config::Settings;
+use roomler_ai_db::{connect, indexes::ensure_indexes};
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -13,7 +13,7 @@ async fn main() -> anyhow::Result<()> {
     // Initialize tracing
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            "roomler2_api=debug,roomler2_services=debug,roomler2_db=debug,tower_http=debug"
+            "roomler_ai_api=debug,roomler_ai_services=debug,roomler_ai_db=debug,tower_http=debug"
                 .into()
         }))
         .with(tracing_subscriber::fmt::layer())

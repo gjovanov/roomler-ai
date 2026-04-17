@@ -10,12 +10,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 # Development
-cargo run --bin roomler2-api           # Start backend (port 3000)
+cargo run --bin roomler-ai-api           # Start backend (port 3000)
 cd ui && bun run dev                   # Vite dev server (port 5000, proxies to 5001)
 cd ui && bun run build                 # Production UI build (includes vue-tsc --noEmit)
 
 # Testing
-cargo test -p roomler2-tests           # All integration tests (114 tests, requires MongoDB+Redis)
+cargo test -p roomler-ai-tests           # All integration tests (114 tests, requires MongoDB+Redis)
 cd ui && bun run test:unit             # Vitest unit tests
 cd ui && bun run test:unit:coverage    # Vitest with coverage
 cd ui && bun run e2e                   # Playwright E2E tests (18 spec files)
@@ -72,7 +72,7 @@ JWT-based auth (jsonwebtoken 9 crate) with Argon2 password hashing:
 
 JWT settings in `crates/config/src/settings.rs`:
 - Secret: `ROOMLER__JWT__SECRET` (default: "change-me-in-production")
-- Issuer: `ROOMLER__JWT__ISSUER` (default: "roomler2")
+- Issuer: `ROOMLER__JWT__ISSUER` (default: "roomler-ai")
 
 ## Route Pattern
 
@@ -145,7 +145,7 @@ MongoDB native driver (not Mongoose). Models in `crates/db/src/models/`:
 - **Docker**: Multi-stage build (rust:1.88-bookworm -> oven/bun:1 -> debian:trixie-slim + nginx)
 - **Deploy repo**: `/home/gjovanov/roomler-ai-deploy/` (Ansible + K8s)
 - **Pipeline**: `docker build` -> `docker save` -> `scp` to k8s-worker-3 -> `ctr import` -> Ansible playbook
-- **K8s**: Namespace `roomler-ai`, deployment `roomler2`, Recreate strategy, hostNetwork
+- **K8s**: Namespace `roomler-ai`, deployment `roomler-ai`, Recreate strategy, hostNetwork
 - **Health probes**: startup/readiness/liveness all on `/health` (port 80 via nginx -> :3000 backend)
 - **nginx**: Pod-internal reverse proxy (`files/nginx-pod.conf`) — SPA fallback + API proxy + WS proxy
 
@@ -155,7 +155,7 @@ After every feature or fix, verify your changes:
 
 | Change type | Command | What it checks |
 |-------------|---------|----------------|
-| Backend (models, services, routes) | `cargo test -p roomler2-tests` | Integration tests (real MongoDB) |
+| Backend (models, services, routes) | `cargo test -p roomler-ai-tests` | Integration tests (real MongoDB) |
 | Frontend (views, stores, composables) | `cd ui && bun run build` | TypeScript + Vite build |
 | Full-flow (auth, routes, UI+API) | `cd ui && bun run e2e` | Playwright E2E tests |
 

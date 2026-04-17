@@ -1,7 +1,7 @@
 use bson::{doc, oid::ObjectId, DateTime};
 use mongodb::Database;
-use roomler2_db::models::Role;
-use roomler2_db::models::role::permissions;
+use roomler_ai_db::models::Role;
+use roomler_ai_db::models::role::permissions;
 
 use super::base::{BaseDao, DaoError, DaoResult};
 

@@ -9,7 +9,7 @@ use serde::Serialize;
 use tokio::io::AsyncReadExt;
 
 use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
-use roomler2_services::dao::base::PaginationParams;
+use roomler_ai_services::dao::base::PaginationParams;
 
 #[derive(Debug, Serialize)]
 pub struct TaskResponse {

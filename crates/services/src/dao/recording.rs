@@ -1,6 +1,6 @@
 use bson::{doc, oid::ObjectId, DateTime};
 use mongodb::Database;
-use roomler2_db::models::{self, recording::*};
+use roomler_ai_db::models::{self, recording::*};
 
 use super::base::{BaseDao, DaoResult, PaginatedResult, PaginationParams};
 

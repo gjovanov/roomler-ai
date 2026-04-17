@@ -1,5 +1,5 @@
 use bson::oid::ObjectId;
-use roomler2_db::models::{NotificationSource, NotificationType};
+use roomler_ai_db::models::{NotificationSource, NotificationType};
 
 use crate::state::AppState;
 use crate::ws;

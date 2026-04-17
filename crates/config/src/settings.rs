@@ -142,16 +142,16 @@ impl Settings {
             .set_default("app.cors_origins", Vec::<String>::new())?
             .set_default("app.frontend_url", "http://localhost:5173")?
             .set_default("database.url", "mongodb://localhost:27019")?
-            .set_default("database.name", "roomler2")?
+            .set_default("database.name", "roomler-ai")?
             .set_default("jwt.secret", "change-me-in-production")?
             .set_default("jwt.access_token_ttl_secs", 3600)?
             .set_default("jwt.refresh_token_ttl_secs", 604800)?
-            .set_default("jwt.issuer", "roomler2")?
+            .set_default("jwt.issuer", "roomler-ai")?
             .set_default("redis.url", "redis://127.0.0.1:6379")?
             .set_default("s3.endpoint", "http://localhost:9000")?
             .set_default("s3.access_key", "minioadmin")?
             .set_default("s3.secret_key", "minioadmin")?
-            .set_default("s3.bucket", "roomler2")?
+            .set_default("s3.bucket", "roomler-ai")?
             .set_default("s3.region", "us-east-1")?
             .set_default("mediasoup.num_workers", 2)?
             .set_default("mediasoup.listen_ip", "0.0.0.0")?

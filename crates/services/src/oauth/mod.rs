@@ -1,4 +1,4 @@
-use roomler2_config::OAuthSettings;
+use roomler_ai_config::OAuthSettings;
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -296,7 +296,7 @@ impl OAuthService {
             "github" => {
                 let user: GitHubUser = self.client
                     .get("https://api.github.com/user")
-                    .header("User-Agent", "roomler2")
+                    .header("User-Agent", "roomler-ai")
                     .bearer_auth(access_token)
                     .send()
                     .await
@@ -311,7 +311,7 @@ impl OAuthService {
                     // Fallback: fetch emails endpoint
                     let emails: Vec<GitHubEmail> = self.client
                         .get("https://api.github.com/user/emails")
-                        .header("User-Agent", "roomler2")
+                        .header("User-Agent", "roomler-ai")
                         .bearer_auth(access_token)
                         .send()
                         .await

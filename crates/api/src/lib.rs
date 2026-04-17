@@ -213,6 +213,43 @@ pub fn build_router(state: AppState) -> Router {
     let search_routes = Router::new()
         .route("/", get(routes::search::search));
 
+    // Remote-control agent routes (tenant-scoped)
+    let agent_routes = Router::new()
+        .route("/", get(routes::remote_control::list_agents))
+        .route(
+            "/enroll-token",
+            post(routes::remote_control::issue_enrollment_token),
+        )
+        .route(
+            "/{agent_id}",
+            get(routes::remote_control::get_agent)
+                .patch(routes::remote_control::update_agent)
+                .delete(routes::remote_control::delete_agent),
+        );
+
+    // Remote-control session routes (tenant-scoped)
+    let remote_session_routes = Router::new()
+        .route("/{session_id}", get(routes::remote_control::get_session))
+        .route(
+            "/{session_id}/terminate",
+            post(routes::remote_control::terminate_session),
+        )
+        .route(
+            "/{session_id}/audit",
+            get(routes::remote_control::session_audit),
+        );
+
+    // Public agent enrollment exchange (uses enrollment token, not user JWT)
+    let public_agent_routes = Router::new()
+        .route("/enroll", post(routes::remote_control::enroll_agent));
+
+    // TURN credentials (user-scoped, no tenant prefix)
+    let turn_routes = Router::new()
+        .route(
+            "/credentials",
+            get(routes::remote_control::turn_credentials),
+        );
+
     // Compose API
     let api = Router::new()
         .nest("/auth", auth_routes)
@@ -223,6 +260,8 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/giphy", giphy_routes)
         .nest("/push", push_routes)
         .nest("/notification", notification_routes)
+        .nest("/agent", public_agent_routes)
+        .nest("/turn", turn_routes)
         .nest("/tenant", tenant_routes)
         .nest("/tenant/{tenant_id}/member", member_routes)
         .nest("/tenant/{tenant_id}/role", role_routes)
@@ -243,7 +282,9 @@ pub fn build_router(state: AppState) -> Router {
         )
         .nest("/tenant/{tenant_id}/file", file_by_id_routes)
         .nest("/tenant/{tenant_id}/task", task_routes)
-        .nest("/tenant/{tenant_id}/export", export_routes);
+        .nest("/tenant/{tenant_id}/export", export_routes)
+        .nest("/tenant/{tenant_id}/agent", agent_routes)
+        .nest("/tenant/{tenant_id}/session", remote_session_routes);
 
     // Health check
     let health = Router::new().route("/health", get(health_check));

@@ -32,7 +32,7 @@
 The project is organized as a Rust workspace with 5 crates:
 
 ```
-roomler2/
+roomler-ai/
 ├── crates/config     # Configuration loading
 ├── crates/db         # Models, DAOs, indexes
 ├── crates/services   # Business logic

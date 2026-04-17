@@ -1,7 +1,7 @@
 use bson::{doc, oid::ObjectId, DateTime};
 use mongodb::Database;
-use roomler2_db::models::{self, FileContext, ScanStatus};
-use roomler2_db::models::recording::{StorageProvider, Visibility};
+use roomler_ai_db::models::{self, FileContext, ScanStatus};
+use roomler_ai_db::models::recording::{StorageProvider, Visibility};
 
 use super::base::{BaseDao, DaoResult, PaginatedResult, PaginationParams};
 

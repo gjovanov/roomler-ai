@@ -43,3 +43,5 @@ mod role_tests;
 mod cors_tests;
 #[cfg(test)]
 mod billing_tests;
+#[cfg(test)]
+mod remote_control_tests;

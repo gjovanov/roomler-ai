@@ -4,7 +4,7 @@ use serde::Deserialize;
 use std::sync::Arc;
 
 use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
-use roomler2_db::models::TaskCategory;
+use roomler_ai_db::models::TaskCategory;
 
 /// POST /api/tenant/:tid/file/:fid/recognize
 /// Trigger AI document recognition for an uploaded file.
@@ -48,7 +48,7 @@ pub async fn recognize_file(
     let task_store = Arc::clone(state.tasks.store());
 
     let upload_dir = std::env::var("ROOMLER_UPLOAD_DIR")
-        .unwrap_or_else(|_| "/tmp/roomler2-uploads".to_string());
+        .unwrap_or_else(|_| "/tmp/roomler-ai-uploads".to_string());
     let file_path = std::path::PathBuf::from(upload_dir).join(&file.storage_key);
     let content_type = file.content_type.clone();
 
@@ -77,7 +77,7 @@ pub async fn recognize_file(
             .map_err(|e| format!("{}", e))?;
 
         // Update file with recognized content
-        let recognized = roomler2_db::models::RecognizedContent {
+        let recognized = roomler_ai_db::models::RecognizedContent {
             raw_text: result.raw_text,
             structured_data: result.structured_data,
             document_type: result.document_type,
@@ -150,7 +150,7 @@ pub async fn export_conversation_pdf(
     let task_store = Arc::clone(state.tasks.store());
 
     state.tasks.spawn_task(task_id, async move {
-        let params = roomler2_services::dao::base::PaginationParams {
+        let params = roomler_ai_services::dao::base::PaginationParams {
             page: 1,
             per_page: 10000,
             before: None,
@@ -185,10 +185,10 @@ pub async fn export_conversation_pdf(
             .await
             .map_err(|e| format!("{}", e))?;
 
-        let bytes = roomler2_services::export::pdf::export_conversation(&result.items, &user_map)?;
+        let bytes = roomler_ai_services::export::pdf::export_conversation(&result.items, &user_map)?;
 
         let export_dir = std::env::var("ROOMLER_UPLOAD_DIR")
-            .unwrap_or_else(|_| "/tmp/roomler2-uploads".to_string());
+            .unwrap_or_else(|_| "/tmp/roomler-ai-uploads".to_string());
         let export_dir = std::path::PathBuf::from(export_dir).join("exports");
         tokio::fs::create_dir_all(&export_dir)
             .await

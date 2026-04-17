@@ -1,5 +1,5 @@
 [package]
-name = "roomler2-config"
+name = "roomler-ai-config"
 version.workspace = true
 edition.workspace = true
 

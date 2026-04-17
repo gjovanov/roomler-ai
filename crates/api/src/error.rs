@@ -4,8 +4,8 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
-use roomler2_services::dao::base::DaoError;
-use roomler2_services::auth::AuthError;
+use roomler_ai_services::dao::base::DaoError;
+use roomler_ai_services::auth::AuthError;
 
 #[derive(Debug)]
 pub enum ApiError {
@@ -86,16 +86,16 @@ impl From<AuthError> for ApiError {
     }
 }
 
-impl From<roomler2_services::oauth::OAuthError> for ApiError {
-    fn from(err: roomler2_services::oauth::OAuthError) -> Self {
+impl From<roomler_ai_services::oauth::OAuthError> for ApiError {
+    fn from(err: roomler_ai_services::oauth::OAuthError) -> Self {
         match err {
-            roomler2_services::oauth::OAuthError::ProviderNotConfigured(msg) => {
+            roomler_ai_services::oauth::OAuthError::ProviderNotConfigured(msg) => {
                 ApiError::BadRequest(format!("Provider not configured: {msg}"))
             }
-            roomler2_services::oauth::OAuthError::UnknownProvider(msg) => {
+            roomler_ai_services::oauth::OAuthError::UnknownProvider(msg) => {
                 ApiError::BadRequest(format!("Unknown provider: {msg}"))
             }
-            roomler2_services::oauth::OAuthError::InvalidState => {
+            roomler_ai_services::oauth::OAuthError::InvalidState => {
                 ApiError::BadRequest("Invalid OAuth state".to_string())
             }
             other => ApiError::Internal(other.to_string()),

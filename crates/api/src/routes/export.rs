@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
-use roomler2_db::models::TaskCategory;
-use roomler2_services::dao::base::PaginationParams;
+use roomler_ai_db::models::TaskCategory;
+use roomler_ai_services::dao::base::PaginationParams;
 
 #[derive(Debug, Deserialize)]
 pub struct ExportConversationRequest {
@@ -82,7 +82,7 @@ pub async fn export_conversation(
             .map_err(|e| format!("Failed to update progress: {}", e))?;
 
         // Generate Excel
-        let bytes = roomler2_services::export::excel::export_conversation(
+        let bytes = roomler_ai_services::export::excel::export_conversation(
             &result.items,
             &user_map,
         )
@@ -90,7 +90,7 @@ pub async fn export_conversation(
 
         // Write to temp file
         let export_dir = std::env::var("ROOMLER_UPLOAD_DIR")
-            .unwrap_or_else(|_| "/tmp/roomler2-uploads".to_string());
+            .unwrap_or_else(|_| "/tmp/roomler-ai-uploads".to_string());
         let export_dir = std::path::PathBuf::from(export_dir).join("exports");
         tokio::fs::create_dir_all(&export_dir)
             .await

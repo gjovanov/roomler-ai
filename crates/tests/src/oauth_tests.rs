@@ -128,7 +128,7 @@ async fn oauth_user_dao_find_or_create_new_user() {
     assert_eq!(user, 0);
 
     // Create user via OAuth DAO
-    let dao = roomler2_services::dao::user::UserDao::new(&app.db);
+    let dao = roomler_ai_services::dao::user::UserDao::new(&app.db);
     let user = dao
         .find_or_create_by_oauth(
             "google",
@@ -170,7 +170,7 @@ async fn oauth_user_dao_links_existing_user() {
     assert_eq!(resp.status().as_u16(), 201);
 
     // Now use OAuth with the same email
-    let dao = roomler2_services::dao::user::UserDao::new(&app.db);
+    let dao = roomler_ai_services::dao::user::UserDao::new(&app.db);
     let user = dao
         .find_or_create_by_oauth(
             "github",
@@ -194,7 +194,7 @@ async fn oauth_user_dao_links_existing_user() {
 async fn oauth_user_dao_does_not_duplicate_provider() {
     let app = TestApp::spawn().await;
 
-    let dao = roomler2_services::dao::user::UserDao::new(&app.db);
+    let dao = roomler_ai_services::dao::user::UserDao::new(&app.db);
 
     // Create via OAuth
     dao.find_or_create_by_oauth("google", "g-789", "nodupe@test.com", "No Dupe", None)

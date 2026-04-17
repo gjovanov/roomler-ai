@@ -1,6 +1,6 @@
 use bson::{doc, oid::ObjectId, DateTime};
 use mongodb::Database;
-use roomler2_db::models::PushSubscription;
+use roomler_ai_db::models::PushSubscription;
 
 use super::base::{BaseDao, DaoResult};
 
@@ -35,7 +35,7 @@ impl PushSubscriptionDao {
             id: None,
             user_id,
             endpoint,
-            keys: roomler2_db::models::PushKeys { auth, p256dh },
+            keys: roomler_ai_db::models::PushKeys { auth, p256dh },
             created_at: DateTime::now(),
         };
 

@@ -1,12 +1,15 @@
 use mongodb::Database;
-use roomler2_config::Settings;
-use roomler2_services::{
+use roomler_ai_config::Settings;
+use roomler_ai_remote_control::{Hub, audit::AuditSink, turn_creds::TurnConfig};
+use roomler_ai_services::{
     AuthService, EmailService, GiphyService, OAuthService, PushService, RecognitionService,
     TaskService,
     dao::{
         activation_code::ActivationCodeDao,
+        agent::AgentDao,
         file::FileDao, invite::InviteDao, message::MessageDao, notification::NotificationDao,
         push_subscription::PushSubscriptionDao, reaction::ReactionDao, recording::RecordingDao,
+        remote_audit::RemoteAuditDao, remote_session::RemoteSessionDao,
         role::RoleDao, room::RoomDao, tenant::TenantDao,
         user::UserDao,
     },
@@ -45,6 +48,12 @@ pub struct AppState {
     pub push: Option<Arc<PushService>>,
     pub push_subscriptions: Arc<PushSubscriptionDao>,
     pub redis_pubsub: Option<Arc<RedisPubSub>>,
+
+    // Remote-control subsystem
+    pub agents: Arc<AgentDao>,
+    pub remote_sessions: Arc<RemoteSessionDao>,
+    pub remote_audit: Arc<RemoteAuditDao>,
+    pub rc_hub: Arc<Hub>,
 }
 
 impl AppState {
@@ -124,6 +133,15 @@ impl AppState {
             None
         };
 
+        // Remote-control subsystem
+        let agents = Arc::new(AgentDao::new(&db));
+        let remote_sessions = Arc::new(RemoteSessionDao::new(&db));
+        let remote_audit = Arc::new(RemoteAuditDao::new(&db));
+
+        let turn_cfg = build_turn_config(&settings.turn);
+        let (audit_sink, _audit_handle) = AuditSink::spawn(db.clone());
+        let rc_hub = Arc::new(Hub::new(audit_sink, turn_cfg));
+
         Ok(Self {
             db,
             settings,
@@ -150,6 +168,33 @@ impl AppState {
             push,
             push_subscriptions,
             redis_pubsub,
+            agents,
+            remote_sessions,
+            remote_audit,
+            rc_hub,
         })
     }
+}
+
+/// Build a [`TurnConfig`] from settings. Returns `None` when `shared_secret` is
+/// absent (e.g. dev environments using static username/password instead).
+fn build_turn_config(turn: &roomler_ai_config::TurnSettings) -> Option<TurnConfig> {
+    let secret = turn.shared_secret.as_ref()?.clone();
+    let base = turn.url.as_deref()?;
+
+    // Expand a single `turn:host:port` into UDP/TCP/TLS variants the same way
+    // `ws/handler.rs::handle_media_join` already does for the media path, so
+    // the remote-control path behaves consistently behind NAT.
+    let mut urls = vec![base.to_string()];
+    if base.starts_with("turn:") && !base.contains("?transport=") {
+        urls.push(format!("{}?transport=tcp", base));
+        let turns = base.replacen("turn:", "turns:", 1).replace(":3478", ":5349");
+        urls.push(format!("{}?transport=tcp", turns));
+    }
+
+    Some(TurnConfig {
+        urls,
+        shared_secret: secret,
+        ttl_secs: 600, // 10 minutes
+    })
 }

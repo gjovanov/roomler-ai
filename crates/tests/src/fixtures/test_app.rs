@@ -1,7 +1,7 @@
 use mongodb::{Client, Database, options::ClientOptions};
-use roomler2_api::{build_router, state::AppState};
-use roomler2_config::Settings;
-use roomler2_db::indexes::ensure_indexes;
+use roomler_ai_api::{build_router, state::AppState};
+use roomler_ai_config::Settings;
+use roomler_ai_db::indexes::ensure_indexes;
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
 
@@ -21,7 +21,7 @@ impl TestApp {
     /// Set ROOMLER__DATABASE__URL env var to override the connection string.
     /// Each test gets a unique database name for isolation.
     pub async fn spawn() -> Self {
-        let db_name = format!("roomler2_test_{}", uuid::Uuid::new_v4().simple());
+        let db_name = format!("roomler_ai_test_{}", uuid::Uuid::new_v4().simple());
 
         let mut settings = Settings::load().unwrap_or_else(|_| {
             // Fallback to minimal settings for tests
@@ -80,7 +80,7 @@ impl TestApp {
     /// The `mutator` closure receives a `&mut Settings` after defaults are applied,
     /// allowing tests to tweak specific fields (e.g., TURN config).
     pub async fn spawn_with_settings(mutator: impl FnOnce(&mut Settings)) -> Self {
-        let db_name = format!("roomler2_test_{}", uuid::Uuid::new_v4().simple());
+        let db_name = format!("roomler_ai_test_{}", uuid::Uuid::new_v4().simple());
 
         let mut settings = Settings::load().unwrap_or_else(|_| test_settings());
         if let Ok(url) = std::env::var("ROOMLER__DATABASE__URL") {
@@ -132,7 +132,7 @@ impl TestApp {
     /// Spawn a test server with OAuth providers configured (fake client IDs).
     /// Uses a no-redirect reqwest client so we can inspect the 302/307 Location header.
     pub async fn spawn_with_oauth() -> Self {
-        let db_name = format!("roomler2_test_{}", uuid::Uuid::new_v4().simple());
+        let db_name = format!("roomler_ai_test_{}", uuid::Uuid::new_v4().simple());
 
         let mut settings = Settings::load().unwrap_or_else(|_| test_settings());
         if let Ok(url) = std::env::var("ROOMLER__DATABASE__URL") {
@@ -221,94 +221,94 @@ impl Drop for TestApp {
 
 fn test_settings() -> Settings {
     Settings {
-        app: roomler2_config::AppSettings {
+        app: roomler_ai_config::AppSettings {
             host: "127.0.0.1".to_string(),
             port: 0,
             static_dir: None,
             cors_origins: vec![],
             frontend_url: "http://localhost:5173".to_string(),
         },
-        database: roomler2_config::DatabaseSettings {
+        database: roomler_ai_config::DatabaseSettings {
             url: "mongodb://localhost:27019".to_string(),
-            name: "roomler2_test".to_string(),
+            name: "roomler_ai_test".to_string(),
             max_pool_size: Some(5),
             min_pool_size: Some(1),
         },
-        jwt: roomler2_config::JwtSettings {
+        jwt: roomler_ai_config::JwtSettings {
             secret: "test-secret-key-for-jwt-signing-minimum-32-chars".to_string(),
             access_token_ttl_secs: 3600,
             refresh_token_ttl_secs: 604800,
-            issuer: "roomler2".to_string(),
+            issuer: "roomler-ai".to_string(),
         },
-        redis: roomler2_config::RedisSettings {
+        redis: roomler_ai_config::RedisSettings {
             url: "redis://127.0.0.1:6379".to_string(),
         },
-        s3: roomler2_config::S3Settings {
+        s3: roomler_ai_config::S3Settings {
             endpoint: "http://localhost:9000".to_string(),
             access_key: "minioadmin".to_string(),
             secret_key: "minioadmin".to_string(),
-            bucket: "roomler2-test".to_string(),
+            bucket: "roomler-ai-test".to_string(),
             region: "us-east-1".to_string(),
         },
-        mediasoup: roomler2_config::MediasoupSettings {
+        mediasoup: roomler_ai_config::MediasoupSettings {
             num_workers: 1,
             listen_ip: "0.0.0.0".to_string(),
             announced_ip: "127.0.0.1".to_string(),
             rtc_min_port: 40000,
             rtc_max_port: 40100,
         },
-        turn: roomler2_config::TurnSettings {
+        turn: roomler_ai_config::TurnSettings {
             url: None,
             username: None,
             password: None,
             shared_secret: None,
             force_relay: None,
         },
-        claude: roomler2_config::ClaudeSettings {
+        claude: roomler_ai_config::ClaudeSettings {
             api_key: None,
             model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 4096,
         },
-        oauth: roomler2_config::OAuthSettings {
+        oauth: roomler_ai_config::OAuthSettings {
             base_url: "http://localhost:5001".to_string(),
-            google: roomler2_config::OAuthProviderSettings {
+            google: roomler_ai_config::OAuthProviderSettings {
                 client_id: String::new(),
                 client_secret: String::new(),
             },
-            facebook: roomler2_config::OAuthProviderSettings {
+            facebook: roomler_ai_config::OAuthProviderSettings {
                 client_id: String::new(),
                 client_secret: String::new(),
             },
-            github: roomler2_config::OAuthProviderSettings {
+            github: roomler_ai_config::OAuthProviderSettings {
                 client_id: String::new(),
                 client_secret: String::new(),
             },
-            linkedin: roomler2_config::OAuthProviderSettings {
+            linkedin: roomler_ai_config::OAuthProviderSettings {
                 client_id: String::new(),
                 client_secret: String::new(),
             },
-            microsoft: roomler2_config::OAuthProviderSettings {
+            microsoft: roomler_ai_config::OAuthProviderSettings {
                 client_id: String::new(),
                 client_secret: String::new(),
             },
         },
-        stripe: roomler2_config::StripeSettings {
+        stripe: roomler_ai_config::StripeSettings {
             secret_key: String::new(),
             publishable_key: String::new(),
             webhook_secret: String::new(),
             price_pro: String::new(),
             price_business: String::new(),
         },
-        giphy: roomler2_config::GiphySettings {
+        giphy: roomler_ai_config::GiphySettings {
             api_key: String::new(),
         },
-        email: roomler2_config::EmailSettings {
+        email: roomler_ai_config::EmailSettings {
             api_key: String::new(),
             from_email: "test@roomler.ai".to_string(),
             from_name: "Roomler Test".to_string(),
             activation_token_ttl_minutes: 5,
         },
-        push: roomler2_config::PushSettings {
+        push: roomler_ai_config::PushSettings {
             vapid_public_key: String::new(),
             vapid_private_key: String::new(),
             contact: "mailto:test@roomler.ai".to_string(),
