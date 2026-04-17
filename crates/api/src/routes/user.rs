@@ -3,7 +3,7 @@ use bson::{doc, oid::ObjectId};
 use serde::{Deserialize, Serialize};
 
 use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
-use roomler2_services::dao::base::PaginationParams;
+use roomler_ai_services::dao::base::PaginationParams;
 
 #[derive(Debug, Serialize)]
 pub struct MemberResponse {

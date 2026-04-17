@@ -11,8 +11,8 @@ use std::path::PathBuf;
 use tokio::io::AsyncReadExt;
 
 use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
-use roomler2_db::models::{FileContext, FileContextType};
-use roomler2_services::dao::base::PaginationParams;
+use roomler_ai_db::models::{FileContext, FileContextType};
+use roomler_ai_services::dao::base::PaginationParams;
 
 #[derive(Debug, Serialize)]
 pub struct FileResponse {
@@ -29,7 +29,7 @@ pub struct FileResponse {
     pub room_name: Option<String>,
 }
 
-fn to_response(f: roomler2_db::models::File) -> FileResponse {
+fn to_response(f: roomler_ai_db::models::File) -> FileResponse {
     let room_id = f.context.room_id.map(|rid| rid.to_hex());
     FileResponse {
         id: f.id.unwrap().to_hex(),
@@ -377,6 +377,6 @@ pub async fn upload_room(
 }
 
 fn upload_dir() -> PathBuf {
-    let dir = std::env::var("ROOMLER_UPLOAD_DIR").unwrap_or_else(|_| "/tmp/roomler2-uploads".to_string());
+    let dir = std::env::var("ROOMLER_UPLOAD_DIR").unwrap_or_else(|_| "/tmp/roomler-ai-uploads".to_string());
     PathBuf::from(dir)
 }

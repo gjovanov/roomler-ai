@@ -1,3 +1,9 @@
+target/
+*.rs.bk
+Cargo.lock
+!crates/remote_control/Cargo.lock
+.idea/
+.vscode/
 /target
 .env
 *.swp

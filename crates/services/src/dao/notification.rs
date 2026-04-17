@@ -1,6 +1,6 @@
 use bson::{doc, oid::ObjectId, DateTime};
 use mongodb::Database;
-use roomler2_db::models::{Notification, NotificationSource, NotificationType};
+use roomler_ai_db::models::{Notification, NotificationSource, NotificationType};
 
 use super::base::{BaseDao, DaoResult, PaginatedResult, PaginationParams};
 

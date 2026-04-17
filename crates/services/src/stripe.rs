@@ -1,6 +1,6 @@
 use mongodb::bson::{doc, oid::ObjectId, DateTime};
-use roomler2_config::StripeSettings;
-use roomler2_db::models::tenant::{BillingInfo, Plan, PlanLimits, SubscriptionStatus, Tenant};
+use roomler_ai_config::StripeSettings;
+use roomler_ai_db::models::tenant::{BillingInfo, Plan, PlanLimits, SubscriptionStatus, Tenant};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 

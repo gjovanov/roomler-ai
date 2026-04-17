@@ -1,6 +1,6 @@
 use bson::{doc, oid::ObjectId, DateTime};
 use mongodb::Database;
-use roomler2_db::models::{
+use roomler_ai_db::models::{
     Plan, Role, Tenant, TenantMember, TenantSettings,
     role::permissions,
 };

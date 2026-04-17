@@ -1,5 +1,5 @@
 use mongodb::{Client, Database, options::ClientOptions};
-use roomler2_config::Settings;
+use roomler_ai_config::Settings;
 use tracing::info;
 
 pub async fn connect(settings: &Settings) -> Result<Database, mongodb::error::Error> {

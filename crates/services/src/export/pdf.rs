@@ -1,5 +1,5 @@
 use bson::oid::ObjectId;
-use roomler2_db::models::{Message, User};
+use roomler_ai_db::models::{Message, User};
 use std::collections::HashMap;
 use std::io::Write;
 

@@ -1,6 +1,6 @@
 use bson::{doc, oid::ObjectId, DateTime};
 use mongodb::Database;
-use roomler2_db::models::{AuthorType, ContentType, Mentions, Message, MessageAttachment, MessageType, ReactionSummary};
+use roomler_ai_db::models::{AuthorType, ContentType, Mentions, Message, MessageAttachment, MessageType, ReactionSummary};
 
 use super::base::{BaseDao, DaoResult, PaginatedResult, PaginationParams};
 

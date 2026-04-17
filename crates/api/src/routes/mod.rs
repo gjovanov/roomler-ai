@@ -13,6 +13,7 @@ pub mod oauth;
 pub mod push;
 pub mod reaction;
 pub mod recording;
+pub mod remote_control;
 pub mod role;
 pub mod room;
 pub mod stripe;

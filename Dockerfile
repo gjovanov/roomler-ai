@@ -4,7 +4,7 @@ RUN apt-get update && apt-get install -y libclang-dev cmake python3-pip && rm -r
 RUN rustup component add rustfmt
 WORKDIR /app
 COPY . .
-RUN cargo build --release --bin roomler2-api
+RUN cargo build --release --bin roomler-ai-api
 
 # --- Stage 2: Vue SPA build ---
 FROM oven/bun:1 AS ui-builder
@@ -17,10 +17,10 @@ RUN bun run build
 # --- Stage 3: Runtime (nginx + Rust binary) ---
 FROM debian:trixie-slim AS runtime
 RUN apt-get update && apt-get install -y ca-certificates nginx && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /app/target/release/roomler2-api /usr/local/bin/
-COPY --from=ui-builder /app/ui/dist /var/www/roomler2
+COPY --from=builder /app/target/release/roomler-ai-api /usr/local/bin/
+COPY --from=ui-builder /app/ui/dist /var/www/roomler-ai
 COPY files/nginx-pod.conf /etc/nginx/conf.d/default.conf
 RUN rm -f /etc/nginx/sites-enabled/default
-RUN printf '#!/bin/sh\nnginx\nexec roomler2-api\n' > /entrypoint.sh && chmod +x /entrypoint.sh
+RUN printf '#!/bin/sh\nnginx\nexec roomler-ai-api\n' > /entrypoint.sh && chmod +x /entrypoint.sh
 EXPOSE 80
 CMD ["/entrypoint.sh"]

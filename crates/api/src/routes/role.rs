@@ -168,7 +168,7 @@ pub async fn unassign(
     Ok(Json(serde_json::json!({ "removed": true })))
 }
 
-fn to_response(r: roomler2_db::models::Role) -> RoleResponse {
+fn to_response(r: roomler_ai_db::models::Role) -> RoleResponse {
     RoleResponse {
         id: r.id.unwrap().to_hex(),
         tenant_id: r.tenant_id.to_hex(),

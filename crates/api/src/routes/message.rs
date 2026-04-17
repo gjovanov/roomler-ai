@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
-use roomler2_db::models::{Mentions, MessageAttachment};
-use roomler2_services::dao::base::PaginationParams;
+use roomler_ai_db::models::{Mentions, MessageAttachment};
+use roomler_ai_services::dao::base::PaginationParams;
 
 #[derive(Debug, Deserialize)]
 pub struct MentionRequest {
@@ -463,7 +463,7 @@ pub async fn thread_replies(
     })))
 }
 
-fn to_response(m: roomler2_db::models::Message, names: &HashMap<ObjectId, String>, viewer_id: Option<ObjectId>) -> MessageResponse {
+fn to_response(m: roomler_ai_db::models::Message, names: &HashMap<ObjectId, String>, viewer_id: Option<ObjectId>) -> MessageResponse {
     let author_name = names
         .get(&m.author_id)
         .cloned()
@@ -521,7 +521,7 @@ fn to_response(m: roomler2_db::models::Message, names: &HashMap<ObjectId, String
 }
 
 /// Collect unique author IDs from a slice of messages
-fn collect_author_ids(messages: &[roomler2_db::models::Message]) -> Vec<ObjectId> {
+fn collect_author_ids(messages: &[roomler_ai_db::models::Message]) -> Vec<ObjectId> {
     let mut ids: Vec<ObjectId> = messages.iter().map(|m| m.author_id).collect();
     ids.sort();
     ids.dedup();

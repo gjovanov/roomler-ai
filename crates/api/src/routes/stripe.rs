@@ -12,8 +12,8 @@ use crate::{
     extractors::auth::AuthUser,
     state::AppState,
 };
-use roomler2_db::models::role::permissions;
-use roomler2_services::stripe::{StripeEvent, StripeService};
+use roomler_ai_db::models::role::permissions;
+use roomler_ai_services::stripe::{StripeEvent, StripeService};
 
 // ---- Request types -------------------------------------------------------
 
@@ -33,7 +33,7 @@ pub struct PortalRequest {
 
 // ---- GET /api/stripe/plans (public) --------------------------------------
 
-pub async fn get_plans() -> Json<Vec<roomler2_services::stripe::PlanInfo>> {
+pub async fn get_plans() -> Json<Vec<roomler_ai_services::stripe::PlanInfo>> {
     Json(StripeService::get_plans())
 }
 
@@ -43,7 +43,7 @@ pub async fn create_checkout(
     State(state): State<AppState>,
     auth: AuthUser,
     Json(body): Json<CheckoutRequest>,
-) -> Result<Json<roomler2_services::stripe::CheckoutResponse>, ApiError> {
+) -> Result<Json<roomler_ai_services::stripe::CheckoutResponse>, ApiError> {
     let tenant_id = parse_oid(&body.tenant_id)?;
     require_manage_tenant(&state, tenant_id, auth.user_id).await?;
 
@@ -69,7 +69,7 @@ pub async fn create_portal(
     State(state): State<AppState>,
     auth: AuthUser,
     Json(body): Json<PortalRequest>,
-) -> Result<Json<roomler2_services::stripe::PortalResponse>, ApiError> {
+) -> Result<Json<roomler_ai_services::stripe::PortalResponse>, ApiError> {
     let tenant_id = parse_oid(&body.tenant_id)?;
     require_manage_tenant(&state, tenant_id, auth.user_id).await?;
 
@@ -142,8 +142,8 @@ async fn require_manage_tenant(
     Ok(())
 }
 
-fn stripe_err(e: roomler2_services::stripe::StripeError) -> ApiError {
-    use roomler2_services::stripe::StripeError;
+fn stripe_err(e: roomler_ai_services::stripe::StripeError) -> ApiError {
+    use roomler_ai_services::stripe::StripeError;
     match e {
         StripeError::TenantNotFound => ApiError::NotFound("Tenant not found".to_string()),
         StripeError::NoBillingAccount => {

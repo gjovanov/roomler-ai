@@ -189,6 +189,42 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> 
     )
     .await?;
 
+    // Remote-control agents
+    create_indexes(
+        db,
+        "agents",
+        vec![
+            index_unique(bson::doc! { "tenant_id": 1, "machine_id": 1 }),
+            index(bson::doc! { "tenant_id": 1, "status": 1 }),
+            index(bson::doc! { "owner_user_id": 1 }),
+        ],
+    )
+    .await?;
+
+    // Remote-control sessions
+    create_indexes(
+        db,
+        "remote_sessions",
+        vec![
+            index(bson::doc! { "agent_id": 1, "created_at": -1 }),
+            index(bson::doc! { "controller_user_id": 1, "created_at": -1 }),
+            index(bson::doc! { "tenant_id": 1, "phase": 1 }),
+        ],
+    )
+    .await?;
+
+    // Remote-control audit log — 90-day retention
+    create_indexes(
+        db,
+        "remote_audit",
+        vec![
+            index(bson::doc! { "session_id": 1, "at": 1 }),
+            index(bson::doc! { "tenant_id": 1, "at": -1 }),
+            index_ttl(bson::doc! { "at": 1 }, 90 * 24 * 60 * 60),
+        ],
+    )
+    .await?;
+
     info!("All indexes ensured");
     Ok(())
 }

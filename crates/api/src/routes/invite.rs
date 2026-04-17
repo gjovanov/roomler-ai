@@ -11,8 +11,8 @@ use crate::{
     extractors::auth::{AuthUser, OptionalAuthUser},
     state::AppState,
 };
-use roomler2_db::models::role::permissions;
-use roomler2_services::dao::{
+use roomler_ai_db::models::role::permissions;
+use roomler_ai_services::dao::{
     base::PaginationParams,
     invite::CreateInviteParams,
 };
@@ -438,7 +438,7 @@ async fn require_invite_permission(
     Ok(())
 }
 
-fn invite_to_response(invite: roomler2_db::models::Invite) -> InviteResponse {
+fn invite_to_response(invite: roomler_ai_db::models::Invite) -> InviteResponse {
     InviteResponse {
         id: invite.id.unwrap().to_hex(),
         code: invite.code,

@@ -1,0 +1,26 @@
+[package]
+name = "roomler-ai-remote-control"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "roomler_ai_remote_control"
+path = "src/lib.rs"
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+dashmap.workspace = true
+parking_lot.workspace = true
+hmac.workspace = true
+sha1.workspace = true
+base64.workspace = true
+mongodb.workspace = true
+bson.workspace = true
+bitflags = { workspace = true, features = ["serde"] }
+
+[dev-dependencies]
+tokio-test.workspace = true

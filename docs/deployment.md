@@ -40,7 +40,7 @@ All configuration is via environment variables prefixed with `ROOMLER__` using `
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `ROOMLER__DATABASE__URL` | `mongodb://localhost:27019` | MongoDB connection string |
-| `ROOMLER__DATABASE__NAME` | `roomler2` | Database name |
+| `ROOMLER__DATABASE__NAME` | `roomler-ai` | Database name |
 
 ### JWT
 
@@ -49,7 +49,7 @@ All configuration is via environment variables prefixed with `ROOMLER__` using `
 | `ROOMLER__JWT__SECRET` | `change-me-in-production` | JWT signing secret |
 | `ROOMLER__JWT__ACCESS_TOKEN_TTL_SECS` | `3600` | Access token TTL (1 hour) |
 | `ROOMLER__JWT__REFRESH_TOKEN_TTL_SECS` | `604800` | Refresh token TTL (7 days) |
-| `ROOMLER__JWT__ISSUER` | `roomler2` | JWT issuer claim |
+| `ROOMLER__JWT__ISSUER` | `roomler-ai` | JWT issuer claim |
 
 ### Redis
 
@@ -64,7 +64,7 @@ All configuration is via environment variables prefixed with `ROOMLER__` using `
 | `ROOMLER__S3__ENDPOINT` | `http://localhost:9000` | S3 endpoint |
 | `ROOMLER__S3__ACCESS_KEY` | `minioadmin` | Access key |
 | `ROOMLER__S3__SECRET_KEY` | `minioadmin` | Secret key |
-| `ROOMLER__S3__BUCKET` | `roomler2` | Bucket name |
+| `ROOMLER__S3__BUCKET` | `roomler-ai` | Bucket name |
 | `ROOMLER__S3__REGION` | `us-east-1` | Region |
 
 ### mediasoup (Phase 5)
@@ -112,7 +112,7 @@ The `config` crate handles merging. The separator `__` maps to nested config key
 
 ```bash
 cargo build --release
-# Binary at target/release/roomler2
+# Binary at target/release/roomler-ai
 ```
 
 ### Frontend

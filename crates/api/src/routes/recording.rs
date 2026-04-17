@@ -3,7 +3,7 @@ use bson::oid::ObjectId;
 use serde::{Deserialize, Serialize};
 
 use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
-use roomler2_services::dao::base::PaginationParams;
+use roomler_ai_services::dao::base::PaginationParams;
 
 #[derive(Debug, Serialize)]
 pub struct RecordingResponse {
@@ -65,14 +65,14 @@ pub async fn create(
     }
 
     let recording_type = match body.recording_type.as_deref() {
-        Some("audio") => roomler2_db::models::recording::RecordingType::Audio,
-        Some("screen_share") => roomler2_db::models::recording::RecordingType::ScreenShare,
-        _ => roomler2_db::models::recording::RecordingType::Video,
+        Some("audio") => roomler_ai_db::models::recording::RecordingType::Audio,
+        Some("screen_share") => roomler_ai_db::models::recording::RecordingType::ScreenShare,
+        _ => roomler_ai_db::models::recording::RecordingType::Video,
     };
 
     let now = bson::DateTime::now();
-    let storage_file = roomler2_db::models::recording::StorageFile {
-        storage_provider: roomler2_db::models::recording::StorageProvider::Local,
+    let storage_file = roomler_ai_db::models::recording::StorageFile {
+        storage_provider: roomler_ai_db::models::recording::StorageProvider::Local,
         bucket: "recordings".to_string(),
         key: format!("{}/{}/{}", tid.to_hex(), rid.to_hex(), uuid::Uuid::new_v4()),
         url: String::new(),
@@ -108,7 +108,7 @@ pub async fn delete(
     Ok(Json(serde_json::json!({ "deleted": true })))
 }
 
-fn to_response(r: roomler2_db::models::Recording) -> RecordingResponse {
+fn to_response(r: roomler_ai_db::models::Recording) -> RecordingResponse {
     RecordingResponse {
         id: r.id.unwrap().to_hex(),
         room_id: r.room_id.to_hex(),

@@ -1,6 +1,6 @@
 use bson::{doc, oid::ObjectId, DateTime};
 use mongodb::Database;
-use roomler2_db::models::{EmojiRef, EmojiType, Reaction, ReactionSummary};
+use roomler_ai_db::models::{EmojiRef, EmojiType, Reaction, ReactionSummary};
 
 use super::base::{BaseDao, DaoError, DaoResult};
 use super::message::MessageDao;

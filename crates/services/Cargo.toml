@@ -1,11 +1,12 @@
 [package]
-name = "roomler2-services"
+name = "roomler-ai-services"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-roomler2-config = { path = "../config" }
-roomler2-db = { path = "../db" }
+roomler-ai-config = { path = "../config" }
+roomler-ai-db = { path = "../db" }
+roomler-ai-remote-control = { path = "../remote_control" }
 mongodb.workspace = true
 bson.workspace = true
 serde.workspace = true

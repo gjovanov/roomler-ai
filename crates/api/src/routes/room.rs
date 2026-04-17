@@ -3,8 +3,8 @@ use bson::oid::ObjectId;
 use serde::{Deserialize, Serialize};
 
 use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
-use roomler2_db::models::MediaSettings;
-use roomler2_services::dao::base::PaginationParams;
+use roomler_ai_db::models::MediaSettings;
+use roomler_ai_services::dao::base::PaginationParams;
 
 #[derive(Debug, Deserialize)]
 pub struct CreateRoomRequest {
@@ -613,7 +613,7 @@ pub async fn create_call_message(
     Ok(Json(response))
 }
 
-fn to_response(r: roomler2_db::models::Room) -> RoomResponse {
+fn to_response(r: roomler_ai_db::models::Room) -> RoomResponse {
     RoomResponse {
         id: r.id.unwrap().to_hex(),
         name: r.name,

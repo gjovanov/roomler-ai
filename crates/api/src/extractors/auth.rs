@@ -3,7 +3,7 @@ use axum::{
     http::{header, request::Parts},
 };
 use bson::oid::ObjectId;
-use roomler2_services::auth::Claims;
+use roomler_ai_services::auth::Claims;
 
 use crate::{error::ApiError, state::AppState};
 

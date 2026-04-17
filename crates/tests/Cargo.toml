@@ -1,17 +1,17 @@
 [package]
-name = "roomler2-tests"
+name = "roomler-ai-tests"
 version.workspace = true
 edition.workspace = true
 
 [lib]
-name = "roomler2_tests"
+name = "roomler_ai_tests"
 path = "src/lib.rs"
 
 [dependencies]
-roomler2-config = { path = "../config" }
-roomler2-db = { path = "../db" }
-roomler2-services = { path = "../services" }
-roomler2-api = { path = "../api" }
+roomler-ai-config = { path = "../config" }
+roomler-ai-db = { path = "../db" }
+roomler-ai-services = { path = "../services" }
+roomler-ai-api = { path = "../api" }
 tokio.workspace = true
 mongodb.workspace = true
 bson.workspace = true
