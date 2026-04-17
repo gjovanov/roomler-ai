@@ -6,12 +6,19 @@
 //!
 //! Every message is a JSON object with a `t` discriminator. We use serde's
 //! `tag = "t"` adjacent encoding so the wire is small and stable.
+//!
+//! **ObjectId fields are serialised as raw hex strings, not bson-extended
+//! JSON (`{"$oid":"…"}`).** This matches the REST responses and is what
+//! the browser / native agent clients actually produce. See
+//! [`serde_helpers`] for the pinning shims; a regression test in that
+//! module locks the format.
 
 use bson::oid::ObjectId;
 use serde::{Deserialize, Serialize};
 
 use crate::models::{AgentCaps, DisplayInfo, EndReason, OsKind};
 use crate::permissions::Permissions;
+use crate::serde_helpers::{oid_hex, option_oid_hex};
 
 /// Which side of the connection sent / receives a message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +57,7 @@ pub enum ClientMsg {
     /// Agent answers a controller's offer.
     #[serde(rename = "rc:sdp.answer")]
     SdpAnswer {
+        #[serde(with = "oid_hex")]
         session_id: ObjectId,
         sdp: String,
     },
@@ -57,6 +65,7 @@ pub enum ClientMsg {
     /// Agent decision on a control request.
     #[serde(rename = "rc:consent")]
     Consent {
+        #[serde(with = "oid_hex")]
         session_id: ObjectId,
         granted: bool,
     },
@@ -66,6 +75,7 @@ pub enum ClientMsg {
     /// notifies the agent, and waits for consent.
     #[serde(rename = "rc:session.request")]
     SessionRequest {
+        #[serde(with = "oid_hex")]
         agent_id: ObjectId,
         permissions: Permissions,
     },
@@ -73,6 +83,7 @@ pub enum ClientMsg {
     /// Controller sends an SDP offer (after consent granted).
     #[serde(rename = "rc:sdp.offer")]
     SdpOffer {
+        #[serde(with = "oid_hex")]
         session_id: ObjectId,
         sdp: String,
     },
@@ -81,6 +92,7 @@ pub enum ClientMsg {
     /// Trickle ICE candidate. Server forwards to the peer.
     #[serde(rename = "rc:ice")]
     Ice {
+        #[serde(with = "oid_hex")]
         session_id: ObjectId,
         candidate: serde_json::Value, // { candidate, sdpMid, sdpMLineIndex, ... }
     },
@@ -88,6 +100,7 @@ pub enum ClientMsg {
     /// Either side hangs up.
     #[serde(rename = "rc:terminate")]
     Terminate {
+        #[serde(with = "oid_hex")]
         session_id: ObjectId,
         reason: EndReason,
     },
@@ -108,7 +121,9 @@ pub enum ServerMsg {
     /// Sent to the controller right after `SessionRequest` so it knows the id.
     #[serde(rename = "rc:session.created")]
     SessionCreated {
+        #[serde(with = "oid_hex")]
         session_id: ObjectId,
+        #[serde(with = "oid_hex")]
         agent_id: ObjectId,
     },
 
@@ -116,7 +131,9 @@ pub enum ServerMsg {
     /// the user (or auto-grants per AccessPolicy) and replies with `Consent`.
     #[serde(rename = "rc:request")]
     Request {
+        #[serde(with = "oid_hex")]
         session_id: ObjectId,
+        #[serde(with = "oid_hex")]
         controller_user_id: ObjectId,
         controller_name: String,
         permissions: Permissions,
@@ -126,6 +143,7 @@ pub enum ServerMsg {
     /// Server forwards SDP offer from controller → agent.
     #[serde(rename = "rc:sdp.offer")]
     SdpOffer {
+        #[serde(with = "oid_hex")]
         session_id: ObjectId,
         sdp: String,
         ice_servers: Vec<IceServer>,
@@ -134,6 +152,7 @@ pub enum ServerMsg {
     /// Server forwards SDP answer from agent → controller.
     #[serde(rename = "rc:sdp.answer")]
     SdpAnswer {
+        #[serde(with = "oid_hex")]
         session_id: ObjectId,
         sdp: String,
         ice_servers: Vec<IceServer>,
@@ -142,6 +161,7 @@ pub enum ServerMsg {
     /// Forward ICE candidate to the peer.
     #[serde(rename = "rc:ice")]
     Ice {
+        #[serde(with = "oid_hex")]
         session_id: ObjectId,
         candidate: serde_json::Value,
     },
@@ -150,6 +170,7 @@ pub enum ServerMsg {
     /// the SDP offer. Controller now creates its PeerConnection.
     #[serde(rename = "rc:ready")]
     Ready {
+        #[serde(with = "oid_hex")]
         session_id: ObjectId,
         ice_servers: Vec<IceServer>,
     },
@@ -157,6 +178,7 @@ pub enum ServerMsg {
     /// Either peer is gone, or admin terminated, or consent denied.
     #[serde(rename = "rc:terminate")]
     Terminate {
+        #[serde(with = "oid_hex")]
         session_id: ObjectId,
         reason: EndReason,
     },
@@ -168,6 +190,7 @@ pub enum ServerMsg {
     /// Generic error pushed to the client.
     #[serde(rename = "rc:error")]
     Error {
+        #[serde(with = "option_oid_hex")]
         session_id: Option<ObjectId>,
         code: String,
         message: String,
@@ -205,5 +228,49 @@ mod tests {
         };
         let j = serde_json::to_string(&s).unwrap();
         assert!(!j.contains("username"));
+    }
+
+    #[test]
+    fn object_ids_serialise_as_raw_hex_on_wire() {
+        // Lock-in: no `$oid` wrapping anywhere in the WS protocol envelope.
+        let session_id = ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap();
+        let agent_id = ObjectId::parse_str("507f1f77bcf86cd799439012").unwrap();
+
+        let created = ServerMsg::SessionCreated { session_id, agent_id };
+        let s = serde_json::to_string(&created).unwrap();
+        assert!(
+            !s.contains("$oid"),
+            "extended JSON leaked into wire format: {s}"
+        );
+        assert!(s.contains("\"session_id\":\"507f1f77bcf86cd799439011\""));
+        assert!(s.contains("\"agent_id\":\"507f1f77bcf86cd799439012\""));
+
+        let req = ClientMsg::SessionRequest {
+            agent_id,
+            permissions: Permissions::VIEW | Permissions::INPUT,
+        };
+        let s = serde_json::to_string(&req).unwrap();
+        assert!(!s.contains("$oid"));
+        assert!(s.contains("\"agent_id\":\"507f1f77bcf86cd799439012\""));
+    }
+
+    #[test]
+    fn accepts_extended_json_for_backward_compat() {
+        // A client still sending extended JSON parses fine — eases rollout.
+        let json = r#"{"t":"rc:session.request","agent_id":{"$oid":"507f1f77bcf86cd799439012"},"permissions":"VIEW | INPUT"}"#;
+        let m: ClientMsg = serde_json::from_str(json).unwrap();
+        assert!(matches!(m, ClientMsg::SessionRequest { .. }));
+    }
+
+    #[test]
+    fn error_msg_omits_null_session_id_is_ok() {
+        let e = ServerMsg::Error {
+            session_id: None,
+            code: "x".into(),
+            message: "y".into(),
+        };
+        let s = serde_json::to_string(&e).unwrap();
+        // None → null, not omitted.
+        assert!(s.contains("\"session_id\":null"));
     }
 }
