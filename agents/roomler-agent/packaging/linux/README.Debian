@@ -1,0 +1,40 @@
+roomler-agent for Debian/Ubuntu
+===============================
+
+First-time setup
+----------------
+
+  # 1. Generate an enrollment JWT at http://roomler.ai/ (Admin -> Agents).
+  # 2. Enroll this machine (as your normal user, NOT root):
+  roomler-agent enroll --server http://roomler.ai/ \
+                       --token <paste-enrollment-jwt> \
+                       --name "$(hostname)"
+
+  # 3. Run once in the foreground to confirm capture + signalling work.
+  #    You need an active X11 session — tty login won't capture anything.
+  RUST_LOG=roomler_agent=debug,webrtc=info roomler-agent run
+
+Autostart (systemd --user)
+--------------------------
+
+The package ships a systemd user unit at
+/usr/lib/systemd/user/roomler-agent.service. Enable it as your own user:
+
+  systemctl --user daemon-reload
+  systemctl --user enable --now roomler-agent.service
+  systemctl --user status roomler-agent.service
+
+Logs:
+  journalctl --user -u roomler-agent.service -f
+
+Disable:
+  systemctl --user disable --now roomler-agent.service
+
+Wayland note
+------------
+
+The current capture backend (scrap) is X11-only. Under Wayland the agent
+will fail at session start. Either log in to an X11 session, or wait for
+the PipeWire portal backend (see docs/remote-control.md).
+
+-- Goran Jovanov <gjovanov@gmail.com>  2026

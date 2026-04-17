@@ -1,0 +1,36 @@
+#!/bin/bash
+#
+# pkg postinstall — runs as root after the payload is copied to
+# /Applications/roomler-agent.app. We drop the LaunchAgent plist into the
+# current console user's ~/Library/LaunchAgents/ and launchctl bootstrap it
+# into their gui/<uid> domain so the agent starts immediately.
+#
+# We avoid `sudo -u` here because Apple's installer sanitises the env; we
+# resolve the console user via stat on /dev/console which is the reliable
+# idiom on macOS installers.
+
+set -euo pipefail
+
+CONSOLE_USER=$(stat -f "%Su" /dev/console)
+CONSOLE_UID=$(id -u "$CONSOLE_USER")
+CONSOLE_HOME=$(dscl . -read /Users/"$CONSOLE_USER" NFSHomeDirectory | awk '{print $2}')
+
+LAUNCH_AGENTS_DIR="$CONSOLE_HOME/Library/LaunchAgents"
+PLIST_SOURCE="/Applications/roomler-agent.app/Contents/Resources/com.roomler.agent.plist"
+PLIST_TARGET="$LAUNCH_AGENTS_DIR/com.roomler.agent.plist"
+
+mkdir -p "$LAUNCH_AGENTS_DIR"
+cp "$PLIST_SOURCE" "$PLIST_TARGET"
+chown "$CONSOLE_USER":staff "$PLIST_TARGET"
+chmod 644 "$PLIST_TARGET"
+
+# Load the agent into the user's launchd domain. `bootstrap` is idempotent
+# only if the agent isn't already loaded; we unload first to handle upgrades.
+launchctl bootout "gui/$CONSOLE_UID/com.roomler.agent" 2>/dev/null || true
+launchctl bootstrap "gui/$CONSOLE_UID" "$PLIST_TARGET"
+
+echo "roomler-agent installed for user $CONSOLE_USER (uid=$CONSOLE_UID)"
+echo "Grant Screen Recording + Accessibility permissions in System Settings, then:"
+echo "  launchctl kickstart -k gui/$CONSOLE_UID/com.roomler.agent"
+
+exit 0

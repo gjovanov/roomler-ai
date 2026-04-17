@@ -184,6 +184,7 @@ MongoDB native driver (not Mongoose). Models live in `crates/db/src/models/` exc
 
 ## Deployment
 
+- **Production URL**: `http://roomler.ai/` — the live deployment. Use this as the `--server` argument when enrolling agents and as the origin the browser controller loads.
 - **Docker**: Multi-stage build (rust:1.88-bookworm -> oven/bun:1 -> debian:trixie-slim + nginx)
 - **Deploy repo**: `/home/gjovanov/roomler-ai-deploy/` (Ansible + K8s)
 - **Pipeline**: `docker build` -> `docker save` -> `scp` to k8s-worker-3 -> `ctr import` -> Ansible playbook

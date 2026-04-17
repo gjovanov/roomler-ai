@@ -1,0 +1,123 @@
+<?xml version="1.0" encoding="windows-1252"?>
+<!--
+  WiX v3 source for roomler-agent MSI.
+
+  Build with: `cargo wix -p roomler-agent --nocapture`
+  which calls candle + light against this file.
+
+  Install scope: per-user (InstallScope="perUser"). No UAC prompt, no admin
+  rights required. Files land under %LOCALAPPDATA%\Programs\roomler-agent\
+  and config/state stays under %APPDATA%\roomler-agent\ (written by the
+  `directories` crate at runtime).
+
+  Autostart: a Task Scheduler "At logon" task is registered by a post-install
+  step rather than here — WiX's ScheduledTask element requires admin. For v1
+  we document the `schtasks` command the user runs once.
+-->
+<Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'>
+    <Product
+        Id='*'
+        Name='Roomler Agent'
+        UpgradeCode='1F2D7B1C-8B2F-4D2E-B1A3-6B1E2C7E4D91'
+        Manufacturer='Goran Jovanov'
+        Language='1033'
+        Codepage='1252'
+        Version='$(var.Version)'>
+
+        <Package
+            Id='*'
+            Keywords='Installer'
+            Description='Roomler AI remote-control agent'
+            Manufacturer='Goran Jovanov'
+            InstallerVersion='450'
+            Languages='1033'
+            Compressed='yes'
+            InstallScope='perUser'
+            SummaryCodepage='1252' />
+
+        <MajorUpgrade
+            Schedule='afterInstallInitialize'
+            DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.' />
+
+        <Media Id='1' Cabinet='media1.cab' EmbedCab='yes' />
+        <Property Id='DiskPrompt' Value='Roomler Agent Installation' />
+
+        <Directory Id='TARGETDIR' Name='SourceDir'>
+            <!-- Per-user install under %LOCALAPPDATA%\Programs\roomler-agent -->
+            <Directory Id='LocalAppDataFolder'>
+                <Directory Id='ProgramsFolder' Name='Programs'>
+                    <Directory Id='APPLICATIONFOLDER' Name='roomler-agent'>
+                        <!-- Source paths are relative to the CWD where cargo-wix
+                             was invoked (the workspace root in our workflow). -->
+                        <Component Id='AgentExe' Guid='3A8C9F21-4E7D-4A8E-9F3B-8D1C2E7F5A62'>
+                            <File
+                                Id='roomler_agent_exe'
+                                Name='roomler-agent.exe'
+                                DiskId='1'
+                                Source='target\release\roomler-agent.exe'
+                                KeyPath='yes' />
+                        </Component>
+                        <Component Id='LicenseTxt' Guid='4B1D2E80-6F3C-4B2A-9E1D-7A2B3C4D5E6F'>
+                            <File
+                                Id='license_txt'
+                                Name='LICENSE.txt'
+                                DiskId='1'
+                                Source='LICENSE'
+                                KeyPath='yes' />
+                        </Component>
+                        <Component Id='ReadmeTxt' Guid='5C2E3F91-7A4D-4C3B-AF2E-8B3C4D5E6F70'>
+                            <File
+                                Id='readme_txt'
+                                Name='README.txt'
+                                DiskId='1'
+                                Source='agents\roomler-agent\packaging\windows\README.txt'
+                                KeyPath='yes' />
+                        </Component>
+                    </Directory>
+                </Directory>
+            </Directory>
+
+            <!-- Start Menu shortcut -->
+            <Directory Id='ProgramMenuFolder'>
+                <Directory Id='ProgramMenuSubfolder' Name='Roomler'>
+                    <Component Id='ApplicationShortcut' Guid='6D3F4A02-8B5E-4D4C-B03F-9C4D5E6F7081'>
+                        <Shortcut
+                            Id='AgentShortcut'
+                            Name='Roomler Agent'
+                            Description='Roomler AI remote-control agent (signalling)'
+                            Target='[APPLICATIONFOLDER]roomler-agent.exe'
+                            Arguments='run'
+                            WorkingDirectory='APPLICATIONFOLDER' />
+                        <RemoveFolder Id='CleanupProgramMenuSubfolder' On='uninstall' />
+                        <RegistryValue
+                            Root='HKCU'
+                            Key='Software\Roomler\Agent'
+                            Name='installed'
+                            Type='integer'
+                            Value='1'
+                            KeyPath='yes' />
+                    </Component>
+                </Directory>
+            </Directory>
+        </Directory>
+
+        <Feature
+            Id='Complete'
+            Title='Roomler Agent'
+            Description='The Roomler AI remote-control agent.'
+            Display='expand'
+            Level='1'
+            ConfigurableDirectory='APPLICATIONFOLDER'
+            AllowAdvertise='no'
+            InstallDefault='local'
+            Absent='disallow'>
+            <ComponentRef Id='AgentExe' />
+            <ComponentRef Id='LicenseTxt' />
+            <ComponentRef Id='ReadmeTxt' />
+            <ComponentRef Id='ApplicationShortcut' />
+        </Feature>
+
+        <Property Id='ARPHELPLINK' Value='https://roomler.ai/' />
+        <Property Id='ARPURLINFOABOUT' Value='https://roomler.ai/' />
+    </Product>
+</Wix>

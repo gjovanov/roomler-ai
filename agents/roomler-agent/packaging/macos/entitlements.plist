@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Hardened-runtime entitlements for the signed agent binary. Required so
+  the binary can be notarised by Apple's notary service.
+-->
+<plist version="1.0">
+<dict>
+    <!-- Needed because openh264 + webrtc-rs JIT nothing but may allocate
+         executable memory; keep this false unless notarisation complains. -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <false/>
+
+    <!-- Allow unsigned loaded libraries? No — keep hardened runtime strict. -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <false/>
+
+    <!-- Needed if we ever bundle a JIT'd Python / Node runtime. Not today. -->
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <false/>
+</dict>
+</plist>

@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent for roomler-agent. Installed to ~/Library/LaunchAgents/ by
+  the .pkg's post-install script. Runs in the user's session (required for
+  ScreenCaptureKit / CoreGraphics capture and for CGEvent input injection;
+  neither works in a LaunchDaemon running as _root in session 0).
+
+  First run will trigger two permission prompts:
+   - Screen Recording (System Settings -> Privacy & Security)
+   - Accessibility       (System Settings -> Privacy & Security)
+  Grant both, then `launchctl kickstart -k gui/$UID/com.roomler.agent`.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.roomler.agent</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Applications/roomler-agent.app/Contents/MacOS/roomler-agent</string>
+        <string>run</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/roomler-agent.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/roomler-agent.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key>
+        <string>roomler_agent=info,warn</string>
+    </dict>
+</dict>
+</plist>

@@ -1,0 +1,24 @@
+[Unit]
+Description=Roomler AI remote-control agent
+Documentation=https://roomler.ai/
+# An interactive user session is required for scrap capture (XShm needs a
+# display) and enigo input injection (both run on the user's X server).
+# This is a systemd *user* unit, not a system unit, for that reason.
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/roomler-agent run
+Restart=on-failure
+RestartSec=5
+Environment=RUST_LOG=roomler_agent=info,warn
+
+# Sandboxing — conservative defaults appropriate for a user unit.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.config/roomler-agent %h/.local/share/roomler-agent
+
+[Install]
+WantedBy=default.target

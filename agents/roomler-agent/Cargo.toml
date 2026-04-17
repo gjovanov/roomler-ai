@@ -87,3 +87,39 @@ full = ["media", "enigo-input"]
 
 [dev-dependencies]
 tokio-test = { workspace = true }
+
+# ---------------------------------------------------------------------------
+# Packaging metadata
+# ---------------------------------------------------------------------------
+
+# cargo-deb (Linux .deb)
+#   cargo deb -p roomler-agent --no-build
+# Produces target/debian/roomler-agent_<version>_amd64.deb
+[package.metadata.deb]
+maintainer = "Goran Jovanov <gjovanov@gmail.com>"
+copyright = "2026, Goran Jovanov <gjovanov@gmail.com>"
+license-file = ["../../LICENSE", "0"]
+extended-description = """\
+Native remote-control agent for the Roomler AI platform. Runs on the \
+controlled host, maintains an outbound WebSocket connection to the \
+Roomler API for signalling, and serves a WebRTC peer directly to the \
+browser controller (video + input over P2P — the server never sees \
+raw pixels or keystrokes)."""
+depends = "libc6, libxcb1, libxcb-shm0, libxcb-randr0"
+section = "net"
+priority = "optional"
+assets = [
+    ["target/release/roomler-agent", "usr/bin/", "755"],
+    ["packaging/linux/roomler-agent.service", "usr/lib/systemd/user/roomler-agent.service", "644"],
+    ["packaging/linux/README.Debian", "usr/share/doc/roomler-agent/README.Debian", "644"],
+]
+
+# cargo-wix (Windows .msi)
+#   cargo wix -p roomler-agent --nocapture
+# Produces target/wix/roomler-agent-<version>-x86_64.msi
+# Source lives at agents/roomler-agent/wix/main.wxs.
+[package.metadata.wix]
+upgrade-guid = "1F2D7B1C-8B2F-4D2E-B1A3-6B1E2C7E4D91"
+path-guid    = "3A8C9F21-4E7D-4A8E-9F3B-8D1C2E7F5A62"
+license      = false
+eula         = false

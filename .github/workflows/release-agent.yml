@@ -1,0 +1,472 @@
+name: Release roomler-agent
+
+# Builds per-OS installers for the roomler-agent binary (MSI on Windows,
+# notarised .pkg on macOS, .deb on Linux). Triggered either by pushing a
+# tag matching `agent-v*` (publishes a GitHub Release) or manually via
+# workflow_dispatch (uploads workflow artifacts for 30-day retention).
+#
+# Signing is *opt-in via secrets* — if the relevant secret is missing, the
+# job emits an `-unsigned` artifact and a ::warning:: annotation, but does
+# not fail. This lets us iterate on packaging before certs are in place.
+
+on:
+  push:
+    tags:
+      - 'agent-v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Agent version (e.g. 0.1.0) — must match workspace Cargo.toml'
+        required: true
+      publish_release:
+        description: 'Create a GitHub Release with the artifacts'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 0. Validate that the requested version matches Cargo.toml.
+  # ---------------------------------------------------------------------------
+  validate-version:
+    name: Validate version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      is_release: ${{ steps.resolve.outputs.is_release }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version + tag
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            tag="${GITHUB_REF_NAME}"
+            version="${tag#agent-v}"
+            is_release=true
+          else
+            version="${{ github.event.inputs.version }}"
+            tag="agent-v${version}"
+            if [[ "${{ github.event.inputs.publish_release }}" == "true" ]]; then
+              is_release=true
+            else
+              is_release=false
+            fi
+          fi
+
+          echo "Resolved: version=${version} tag=${tag} is_release=${is_release}"
+
+          # Grep the [workspace.package] table for the declared version.
+          cargo_version=$(awk '
+            /^\[workspace\.package\]/ {in_section=1; next}
+            /^\[/ {in_section=0}
+            in_section && /^version[[:space:]]*=/ {
+              gsub(/"/, "", $3)
+              print $3
+              exit
+            }
+          ' Cargo.toml)
+
+          echo "Cargo.toml workspace version: ${cargo_version}"
+
+          if [[ "${cargo_version}" != "${version}" ]]; then
+            echo "::error::Version mismatch: requested ${version} but Cargo.toml has ${cargo_version}"
+            exit 1
+          fi
+
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}"         >> "$GITHUB_OUTPUT"
+          echo "is_release=${is_release}" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # 1. Linux — .deb via cargo-deb, bundles the systemd-user unit.
+  # ---------------------------------------------------------------------------
+  build-linux:
+    name: Build .deb (Linux x86_64)
+    needs: validate-version
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev \
+            cmake libclang-dev pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+          shared-key: agent-linux
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+
+      - name: Build agent (release, full features)
+        run: cargo build -p roomler-agent --release --features full
+
+      - name: Build .deb
+        working-directory: agents/roomler-agent
+        run: cargo deb --no-build --no-strip
+
+      - name: Rename + checksum
+        id: pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.validate-version.outputs.version }}"
+          src=$(ls target/debian/roomler-agent_*_amd64.deb | head -n1)
+          dst="roomler-agent-${version}-x86_64-unknown-linux-gnu.deb"
+          mv "$src" "$dst"
+          sha256sum "$dst" | awk '{print $1"  "$2}' > "${dst}.sha256"
+          echo "artifact=${dst}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-deb
+          path: |
+            ${{ steps.pack.outputs.artifact }}
+            ${{ steps.pack.outputs.artifact }}.sha256
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # 2. Windows — MSI via cargo-wix. Unsigned unless WIN_CODESIGN_PFX_BASE64
+  #    secret is present.
+  # ---------------------------------------------------------------------------
+  build-windows:
+    name: Build .msi (Windows x86_64)
+    needs: validate-version
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      VERSION: ${{ needs.validate-version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM (provides libclang for bindgen)
+        shell: pwsh
+        run: |
+          choco install -y llvm --version 18.1.8
+          echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+          shared-key: agent-windows
+
+      - name: Install WiX Toolset v3
+        shell: pwsh
+        run: |
+          choco install -y wixtoolset
+          # WiX v3 installs to C:\Program Files (x86)\WiX Toolset v3.14\bin by
+          # default — add to PATH for this and subsequent steps.
+          $wixBin = Get-ChildItem "C:\Program Files (x86)\WiX Toolset v*\bin" | Select-Object -First 1
+          "$($wixBin.FullName)" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Install cargo-wix
+        run: cargo install cargo-wix --locked
+
+      - name: Build agent (release, full features)
+        shell: pwsh
+        run: cargo build -p roomler-agent --release --features full
+
+      - name: Build MSI
+        shell: pwsh
+        run: |
+          # cargo-wix reads agents/roomler-agent/wix/main.wxs and sets the
+          # Version preprocessor variable from --install-version.
+          cargo wix -p roomler-agent --nocapture --no-build --install-version $env:VERSION
+
+      - name: Locate + rename MSI
+        id: locate
+        shell: pwsh
+        run: |
+          $msi = Get-ChildItem "target/wix/*.msi" | Select-Object -First 1
+          if (-not $msi) { throw "MSI not produced" }
+          $suffix = "-unsigned"
+          $signed = $env:WIN_CODESIGN_PFX_BASE64
+          if ($signed -and $signed.Length -gt 0) { $suffix = "" }
+          $dst = "roomler-agent-$env:VERSION-x86_64-pc-windows-msvc$suffix.msi"
+          Move-Item $msi.FullName $dst
+          "artifact=$dst" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+        env:
+          WIN_CODESIGN_PFX_BASE64: ${{ secrets.WIN_CODESIGN_PFX_BASE64 }}
+
+      - name: Authenticode sign
+        if: env.WIN_CODESIGN_PFX_BASE64 != ''
+        shell: pwsh
+        env:
+          WIN_CODESIGN_PFX_BASE64: ${{ secrets.WIN_CODESIGN_PFX_BASE64 }}
+          WIN_CODESIGN_PASSWORD:   ${{ secrets.WIN_CODESIGN_PASSWORD }}
+        run: |
+          $pfxPath = Join-Path $env:RUNNER_TEMP "codesign.pfx"
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WIN_CODESIGN_PFX_BASE64))
+
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" |
+                      Sort-Object FullName -Descending | Select-Object -First 1
+          & $signtool.FullName sign `
+              /f $pfxPath `
+              /p $env:WIN_CODESIGN_PASSWORD `
+              /fd SHA256 `
+              /tr http://timestamp.digicert.com `
+              /td SHA256 `
+              "${{ steps.locate.outputs.artifact }}"
+
+          Remove-Item $pfxPath -Force
+
+      - name: Warn on unsigned build
+        if: env.WIN_CODESIGN_PFX_BASE64 == ''
+        shell: bash
+        run: echo "::warning::WIN_CODESIGN_PFX_BASE64 not set — MSI is unsigned. SmartScreen will flag 'Unknown publisher'."
+        env:
+          WIN_CODESIGN_PFX_BASE64: ${{ secrets.WIN_CODESIGN_PFX_BASE64 }}
+
+      - name: SHA256 checksum
+        shell: pwsh
+        run: |
+          $f = "${{ steps.locate.outputs.artifact }}"
+          $hash = (Get-FileHash -Algorithm SHA256 $f).Hash.ToLower()
+          "$hash  $f" | Out-File -Encoding ascii "$f.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-msi
+          path: |
+            ${{ steps.locate.outputs.artifact }}
+            ${{ steps.locate.outputs.artifact }}.sha256
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # 3. macOS — signed + notarised .pkg. Unsigned unless Apple secrets present.
+  # ---------------------------------------------------------------------------
+  build-macos:
+    name: Build .pkg (macOS arm64)
+    needs: validate-version
+    runs-on: macos-14
+    timeout-minutes: 90
+    env:
+      VERSION: ${{ needs.validate-version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (aarch64-apple-darwin)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+          shared-key: agent-macos
+
+      - name: Install system deps
+        run: brew install cmake
+
+      - name: Build agent (release, full features)
+        run: cargo build -p roomler-agent --release --features full --target aarch64-apple-darwin
+
+      - name: Stage .app bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN=target/aarch64-apple-darwin/release/roomler-agent
+          APP=stage/roomler-agent.app
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp "$BIN" "$APP/Contents/MacOS/roomler-agent"
+          cp agents/roomler-agent/packaging/macos/com.roomler.agent.plist "$APP/Contents/Resources/"
+          cat > "$APP/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleExecutable</key>          <string>roomler-agent</string>
+              <key>CFBundleIdentifier</key>          <string>com.roomler.agent</string>
+              <key>CFBundleName</key>                <string>Roomler Agent</string>
+              <key>CFBundleShortVersionString</key>  <string>${VERSION}</string>
+              <key>CFBundleVersion</key>             <string>${VERSION}</string>
+              <key>CFBundlePackageType</key>         <string>APPL</string>
+              <key>LSMinimumSystemVersion</key>      <string>12.0</string>
+              <key>LSUIElement</key>                 <true/>
+              <key>NSPrincipalClass</key>            <string>NSApplication</string>
+              <key>NSScreenCaptureUsageDescription</key>
+                  <string>Roomler Agent captures the screen to stream it to an authorised remote controller.</string>
+              <key>NSAppleEventsUsageDescription</key>
+                  <string>Roomler Agent injects input events on behalf of an authorised remote controller.</string>
+          </dict>
+          </plist>
+          PLIST
+
+      - name: Import signing certs
+        if: ${{ secrets.APPLE_DEVELOPER_ID_APP_P12_BASE64 != '' }}
+        env:
+          APP_P12_BASE64:       ${{ secrets.APPLE_DEVELOPER_ID_APP_P12_BASE64 }}
+          INSTALLER_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_INSTALLER_P12_BASE64 }}
+          CERT_PASSWORD:        ${{ secrets.APPLE_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN=build.keychain
+          KEYCHAIN_PASSWORD=$(openssl rand -hex 24)
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+          echo "$APP_P12_BASE64" | base64 -d > /tmp/app.p12
+          security import /tmp/app.p12 -k "$KEYCHAIN" -P "$CERT_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+
+          echo "$INSTALLER_P12_BASE64" | base64 -d > /tmp/installer.p12
+          security import /tmp/installer.p12 -k "$KEYCHAIN" -P "$CERT_PASSWORD" \
+            -T /usr/bin/productbuild -T /usr/bin/security
+
+          security list-keychain -d user -s "$KEYCHAIN" login.keychain
+          security set-key-partition-list -S apple-tool:,apple: \
+            -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+          rm /tmp/app.p12 /tmp/installer.p12
+
+          # Print identities (harmless — just the CN, not the cert itself)
+          security find-identity -v -p codesigning "$KEYCHAIN"
+
+      - name: Codesign binary
+        if: ${{ secrets.APPLE_DEVELOPER_ID_APP_P12_BASE64 != '' }}
+        run: |
+          set -euo pipefail
+          codesign --sign "Developer ID Application" \
+                   --options runtime --timestamp \
+                   --entitlements agents/roomler-agent/packaging/macos/entitlements.plist \
+                   "stage/roomler-agent.app/Contents/MacOS/roomler-agent"
+
+          codesign --sign "Developer ID Application" \
+                   --options runtime --timestamp \
+                   "stage/roomler-agent.app"
+
+      - name: Build component + product pkg
+        id: pkg
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p payload/Applications scripts dist
+          cp -R stage/roomler-agent.app payload/Applications/
+          cp agents/roomler-agent/packaging/macos/postinstall scripts/postinstall
+          chmod 755 scripts/postinstall
+
+          signed=""
+          if [[ -n "${{ secrets.APPLE_DEVELOPER_ID_INSTALLER_P12_BASE64 }}" ]]; then
+            signed="yes"
+          fi
+
+          pkgbuild \
+            --root payload \
+            --scripts scripts \
+            --identifier com.roomler.agent \
+            --version "$VERSION" \
+            --install-location / \
+            component.pkg
+
+          if [[ -n "$signed" ]]; then
+            productbuild \
+              --package component.pkg \
+              --sign "Developer ID Installer" \
+              "dist/roomler-agent-$VERSION-aarch64-apple-darwin.pkg"
+            suffix=""
+          else
+            productbuild \
+              --package component.pkg \
+              "dist/roomler-agent-$VERSION-aarch64-apple-darwin-unsigned.pkg"
+            suffix="-unsigned"
+          fi
+
+          artifact=$(ls dist/*.pkg | head -n1)
+          echo "artifact=$artifact" >> "$GITHUB_OUTPUT"
+          echo "signed=$signed"     >> "$GITHUB_OUTPUT"
+
+      - name: Notarise
+        if: steps.pkg.outputs.signed == 'yes' && secrets.APPLE_API_KEY_P8_BASE64 != ''
+        env:
+          APPLE_API_KEY_ID:        ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID:     ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.appstoreconnect/private_keys
+          echo "$APPLE_API_KEY_P8_BASE64" | base64 -d \
+            > "$HOME/.appstoreconnect/private_keys/AuthKey_${APPLE_API_KEY_ID}.p8"
+
+          xcrun notarytool submit "${{ steps.pkg.outputs.artifact }}" \
+            --key "$HOME/.appstoreconnect/private_keys/AuthKey_${APPLE_API_KEY_ID}.p8" \
+            --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER_ID" \
+            --wait
+
+          xcrun stapler staple "${{ steps.pkg.outputs.artifact }}"
+
+      - name: Warn on unsigned / unnotarised build
+        if: steps.pkg.outputs.signed != 'yes'
+        run: echo "::warning::Apple signing secrets missing — .pkg is unsigned and will be blocked by Gatekeeper on end-user machines."
+
+      - name: SHA256 checksum
+        run: shasum -a 256 "${{ steps.pkg.outputs.artifact }}" > "${{ steps.pkg.outputs.artifact }}.sha256"
+
+      - name: Cleanup keychain
+        if: always()
+        run: security delete-keychain build.keychain || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-pkg
+          path: |
+            ${{ steps.pkg.outputs.artifact }}
+            ${{ steps.pkg.outputs.artifact }}.sha256
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # 4. Publish — only on tag push (or dispatch with publish_release=true).
+  # ---------------------------------------------------------------------------
+  release:
+    name: Publish GitHub Release
+    if: needs.validate-version.outputs.is_release == 'true'
+    needs: [validate-version, build-linux, build-windows, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Flatten artifact tree
+        run: |
+          mkdir -p release
+          find dist -type f \( -name '*.msi' -o -name '*.pkg' -o -name '*.deb' -o -name '*.sha256' \) \
+            -exec mv {} release/ \;
+          ls -la release/
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.validate-version.outputs.tag }}
+          name: roomler-agent ${{ needs.validate-version.outputs.version }}
+          prerelease: ${{ startsWith(needs.validate-version.outputs.version, '0.') }}
+          generate_release_notes: true
+          files: release/*
