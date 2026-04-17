@@ -221,6 +221,12 @@ export function useRemoteControl() {
       }
     }
 
+    // Declare we want to *receive* video from the agent. Without this line
+    // the offer has no m=video section, so the agent's answer can't include
+    // one either — ontrack never fires and hasMedia stays false. See the
+    // peer-side mirror in agents/roomler-agent/src/peer.rs (add_track).
+    pc.addTransceiver('video', { direction: 'recvonly' })
+
     // Create the four data channels up front per architecture doc §5.
     // Reliability profiles match the doc: unreliable+unordered for input,
     // reliable+ordered for everything else.
