@@ -2,17 +2,18 @@
 <!--
   WiX v3 source for roomler-agent MSI.
 
-  Build with: `cargo wix -p roomler-agent --nocapture`
-  which calls candle + light against this file.
+  Build with `cargo wix -p roomler-agent` which invokes candle + light
+  against this file.
 
-  Install scope: per-user (InstallScope="perUser"). No UAC prompt, no admin
-  rights required. Files land under %LOCALAPPDATA%\Programs\roomler-agent\
-  and config/state stays under %APPDATA%\roomler-agent\ (written by the
-  `directories` crate at runtime).
+  Install scope: per-user (InstallScope="perUser"). No UAC prompt and no
+  admin rights required. Files land under
+  %LOCALAPPDATA%\Programs\roomler-agent\ and config / state stays under
+  %APPDATA%\roomler-agent\ (written by the `directories` crate at runtime).
 
-  Autostart: a Task Scheduler "At logon" task is registered by a post-install
-  step rather than here — WiX's ScheduledTask element requires admin. For v1
-  we document the `schtasks` command the user runs once.
+  Autostart: a Task Scheduler "At logon" task is registered by a post
+  install step rather than here. WiX's ScheduledTask element requires
+  admin, which breaks the no-UAC story; for v1 we document the schtasks
+  command the user runs once after install.
 -->
 <Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'>
     <Product
