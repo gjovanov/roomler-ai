@@ -224,12 +224,29 @@ async fn media_pump(session_id: bson::oid::ObjectId, track: Arc<TrackLocalStatic
     let mut encoder_dims: Option<(u32, u32)> = None;
     let frame_duration = Duration::from_micros(1_000_000 / TARGET_FPS as u64);
 
+    // Observability: count frames in/out and bytes written, log every 30
+    // encoded frames (~once per second at 30fps). Without this a silent
+    // stall in capture or encode is indistinguishable from a working pump.
+    let mut frames_captured: u64 = 0;
+    let mut frames_empty: u64 = 0;
+    let mut frames_encoded: u64 = 0;
+    let mut bytes_written: u64 = 0;
+    let mut write_errors: u64 = 0;
+
     loop {
         let frame = match capturer.next_frame().await {
-            Ok(Some(f)) => f,
+            Ok(Some(f)) => {
+                frames_captured += 1;
+                f
+            }
             Ok(None) => {
-                // No frame produced within the backend's internal budget;
-                // keep looping so shutdown via task abort() lands quickly.
+                frames_empty += 1;
+                // Log every ~5s worth of empty polls so an idle desktop is
+                // visible without flooding. DXGI only fires on screen change,
+                // so this can spike briefly then settle.
+                if frames_empty % 150 == 0 {
+                    info!(%session_id, frames_empty, "capture produced no frame (idle screen)");
+                }
                 continue;
             }
             Err(e) => {
@@ -258,7 +275,9 @@ async fn media_pump(session_id: bson::oid::ObjectId, track: Arc<TrackLocalStatic
             }
         };
 
+        let mut packet_bytes: u64 = 0;
         for p in packets {
+            packet_bytes += p.data.len() as u64;
             let sample = Sample {
                 data: Bytes::from(p.data),
                 timestamp: SystemTime::now(),
@@ -268,9 +287,26 @@ async fn media_pump(session_id: bson::oid::ObjectId, track: Arc<TrackLocalStatic
                 prev_padding_packets: 0,
             };
             if let Err(e) = track.write_sample(&sample).await {
-                // Benign when the PC hasn't finished ICE yet — drop and carry on.
-                debug!(%session_id, %e, "write_sample");
+                write_errors += 1;
+                // Elevated from debug — silent drops were hiding the real
+                // problem during first-bringup on Windows.
+                warn!(%session_id, %e, write_errors, "write_sample failed");
             }
+        }
+
+        frames_encoded += 1;
+        bytes_written += packet_bytes;
+
+        if frames_encoded == 1 {
+            info!(%session_id, first_frame_bytes = packet_bytes, "first encoded frame written to track");
+        }
+        if frames_encoded.is_multiple_of(30) {
+            info!(
+                %session_id,
+                frames_captured, frames_empty, frames_encoded,
+                bytes_written, write_errors,
+                "media pump heartbeat (≈1s window)"
+            );
         }
     }
 }

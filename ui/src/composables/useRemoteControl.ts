@@ -57,7 +57,7 @@ export function useRemoteControl() {
   function flushPendingMove() {
     rafHandle = null
     if (!pendingMove || !channels.input || channels.input.readyState !== 'open') return
-    sendInput({ t: 'MouseMove', ...pendingMove })
+    sendInput({ t: 'mouse_move', ...pendingMove })
     pendingMove = null
   }
 
@@ -299,20 +299,20 @@ export function useRemoteControl() {
       ev.preventDefault()
       surface.setPointerCapture(ev.pointerId)
       const { x, y } = normalisedXY(ev)
-      sendInput({ t: 'MouseButton', btn: browserButton(ev.button), down: true, x, y, mon: 0 })
+      sendInput({ t: 'mouse_button', btn: browserButton(ev.button), down: true, x, y, mon: 0 })
     }
 
     function onPointerUp(ev: PointerEvent) {
       try { surface.releasePointerCapture(ev.pointerId) } catch { /* noop */ }
       const { x, y } = normalisedXY(ev)
-      sendInput({ t: 'MouseButton', btn: browserButton(ev.button), down: false, x, y, mon: 0 })
+      sendInput({ t: 'mouse_button', btn: browserButton(ev.button), down: false, x, y, mon: 0 })
     }
 
     function onWheel(ev: WheelEvent) {
       ev.preventDefault()
       // Browser uses positive Y for down; agent does the same.
       sendInput({
-        t: 'MouseWheel',
+        t: 'mouse_wheel',
         dx: ev.deltaX,
         dy: ev.deltaY,
         mode: ev.deltaMode === 0 ? 'Pixel' : ev.deltaMode === 1 ? 'Line' : 'Page',
@@ -326,7 +326,7 @@ export function useRemoteControl() {
       if (code === null) return
       const mods =
         (ev.ctrlKey ? 1 : 0) | (ev.shiftKey ? 2 : 0) | (ev.altKey ? 4 : 0) | (ev.metaKey ? 8 : 0)
-      sendInput({ t: 'Key', code, down, mods })
+      sendInput({ t: 'key', code, down, mods })
     }
     const onKeyDown = (e: KeyboardEvent) => onKey(e, true)
     const onKeyUp = (e: KeyboardEvent) => onKey(e, false)
