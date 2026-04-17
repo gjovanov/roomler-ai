@@ -364,4 +364,85 @@ describe('useWsStore', () => {
       expect(ping).toEqual({ type: 'ping' })
     })
   })
+
+  describe('rc:* signalling channel', () => {
+    it('routes rc:* messages to onRcMessage handlers, not handleMessage', () => {
+      const store = useWsStore()
+      store.connect('tok')
+      mockWsInstance.simulateOpen()
+
+      const handler = vi.fn()
+      store.onRcMessage('rc:sdp.answer', handler)
+
+      mockWsInstance.simulateMessage({
+        t: 'rc:sdp.answer',
+        session_id: 'abc',
+        sdp: 'v=0...',
+      })
+
+      expect(handler).toHaveBeenCalledTimes(1)
+      expect(handler).toHaveBeenCalledWith(
+        expect.objectContaining({ t: 'rc:sdp.answer', session_id: 'abc' }),
+      )
+    })
+
+    it('ignores rc:* messages with no registered handler', () => {
+      const store = useWsStore()
+      store.connect('tok')
+      mockWsInstance.simulateOpen()
+
+      // Should not throw / not dispatch through handleMessage.
+      expect(() =>
+        mockWsInstance.simulateMessage({ t: 'rc:unknown', foo: 1 }),
+      ).not.toThrow()
+    })
+
+    it('offRcMessage removes the handler', () => {
+      const store = useWsStore()
+      store.connect('tok')
+      mockWsInstance.simulateOpen()
+
+      const handler = vi.fn()
+      store.onRcMessage('rc:terminate', handler)
+      store.offRcMessage('rc:terminate')
+
+      mockWsInstance.simulateMessage({ t: 'rc:terminate', session_id: 'x' })
+      expect(handler).not.toHaveBeenCalled()
+    })
+
+    it('sendRaw sends the object without a {type,data} envelope', () => {
+      const store = useWsStore()
+      store.connect('tok')
+      mockWsInstance.simulateOpen()
+
+      store.sendRaw({ t: 'rc:session.request', agent_id: 'aid', permissions: 'VIEW | INPUT' })
+      expect(mockWsInstance.sentMessages).toHaveLength(1)
+      const sent = JSON.parse(mockWsInstance.sentMessages[0]!)
+      expect(sent).toEqual({
+        t: 'rc:session.request',
+        agent_id: 'aid',
+        permissions: 'VIEW | INPUT',
+      })
+      // No accidental wrapping.
+      expect(sent.type).toBeUndefined()
+      expect(sent.data).toBeUndefined()
+    })
+
+    it('rcHandlers are cleared on disconnect', () => {
+      const store = useWsStore()
+      store.connect('tok')
+      mockWsInstance.simulateOpen()
+
+      const handler = vi.fn()
+      store.onRcMessage('rc:ice', handler)
+      store.disconnect()
+
+      // Reconnect and send — handler from the prior session must not fire.
+      store.connect('tok2')
+      mockWsInstance.simulateOpen()
+      mockWsInstance.simulateMessage({ t: 'rc:ice', session_id: 'x', candidate: {} })
+
+      expect(handler).not.toHaveBeenCalled()
+    })
+  })
 })

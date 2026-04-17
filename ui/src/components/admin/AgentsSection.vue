@@ -75,6 +75,15 @@
             <td class="text-caption">{{ fmtDate(a.last_seen_at) }}</td>
             <td class="text-right">
               <v-btn
+                icon="mdi-remote-desktop"
+                size="small"
+                variant="text"
+                color="primary"
+                :disabled="!a.is_online"
+                :to="{ name: 'agent-remote', params: { tenantId, agentId: a.id } }"
+                :aria-label="`Connect to agent ${a.name}`"
+              />
+              <v-btn
                 icon="mdi-delete"
                 size="small"
                 variant="text"

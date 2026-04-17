@@ -24,6 +24,12 @@ export const useWsStore = defineStore('ws', () => {
   // Persistent media message handlers
   const mediaHandlers = new Map<string, MediaMessageHandler>()
 
+  // Remote-control message handlers — rc:* messages use a `t` discriminator
+  // instead of the `{type, data}` envelope, so they get their own channel.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  type RcHandler = (msg: any) => void
+  const rcHandlers = new Map<string, RcHandler>()
+
   function connect(token: string) {
     if (socket && socket.readyState <= WebSocket.OPEN) return
 
@@ -47,6 +53,13 @@ export const useWsStore = defineStore('ws', () => {
         const msg = JSON.parse(event.data)
         if (msg.type?.startsWith('media:') || msg.type === 'connected') {
           console.log('[WS] received:', msg.type)
+        }
+        // rc:* messages use the flat `{t, ...}` shape from the signalling
+        // protocol and don't go through the main dispatch.
+        if (typeof msg.t === 'string' && msg.t.startsWith('rc:')) {
+          const h = rcHandlers.get(msg.t)
+          if (h) h(msg)
+          return
         }
         handleMessage(msg)
       } catch {
@@ -195,6 +208,24 @@ export const useWsStore = defineStore('ws', () => {
     mediaHandlers.delete(type)
   }
 
+  /** Send a raw object as-is (no `{type, data}` envelope). Used by the
+   *  remote-control signalling protocol which has its own `{t, ...}` shape. */
+  function sendRaw(msg: unknown) {
+    if (socket?.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify(msg))
+    } else {
+      console.warn('[WS] cannot sendRaw, socket not open')
+    }
+  }
+
+  /** Register a handler for an rc:* message type (e.g. `rc:sdp.answer`). */
+  function onRcMessage(t: string, handler: RcHandler) {
+    rcHandlers.set(t, handler)
+  }
+  function offRcMessage(t: string) {
+    rcHandlers.delete(t)
+  }
+
   function cleanup() {
     if (pingInterval) {
       clearInterval(pingInterval)
@@ -213,7 +244,20 @@ export const useWsStore = defineStore('ws', () => {
     status.value = 'disconnected'
     pendingWaiters.clear()
     mediaHandlers.clear()
+    rcHandlers.clear()
   }
 
-  return { status, connect, disconnect, send, sendTyping, waitForMessage, onMediaMessage, offMediaMessage }
+  return {
+    status,
+    connect,
+    disconnect,
+    send,
+    sendRaw,
+    sendTyping,
+    waitForMessage,
+    onMediaMessage,
+    offMediaMessage,
+    onRcMessage,
+    offRcMessage,
+  }
 })
