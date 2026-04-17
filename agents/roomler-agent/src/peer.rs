@@ -63,7 +63,21 @@ impl AgentPeer {
             .register_default_codecs()
             .context("register default codecs")?;
 
-        let api = APIBuilder::new().with_media_engine(engine).build();
+        // Install NACK responder + TWCC + RTCP reports. Without these
+        // interceptors the sender silently drops NACK retransmit requests,
+        // so any lost RTP packet becomes a frozen decoder until the next
+        // IDR. Browser observed 293 NACKs per minute with 0.1.4 going
+        // nowhere — this is the missing piece.
+        let mut registry = webrtc::interceptor::registry::Registry::new();
+        registry = webrtc::api::interceptor_registry::register_default_interceptors(
+            registry, &mut engine,
+        )
+        .context("register default interceptors")?;
+
+        let api = APIBuilder::new()
+            .with_media_engine(engine)
+            .with_interceptor_registry(registry)
+            .build();
 
         let config = RTCConfiguration {
             ice_servers: map_ice_servers(ice_servers),
