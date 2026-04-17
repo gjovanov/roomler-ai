@@ -2,12 +2,19 @@
 //!
 //! The browser controller emits `InputMsg` values (mouse move / click /
 //! wheel / key / touch — see docs/remote-control.md §6); the agent maps
-//! them to OS-native input events via this trait. As with capture/encode,
-//! we ship the trait + a no-op here and fill in `enigo`/platform backends
-//! in follow-up work.
+//! them to OS-native input events via this trait.
+//!
+//! Backends:
+//! - [`enigo_backend::EnigoInjector`] (feature `enigo-input`) — uses
+//!   enigo which dispatches to XTest/uinput on Linux, SendInput on
+//!   Windows, CGEventPost on macOS.
+//! - [`NoopInjector`] — fallback when no backend feature is enabled.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+
+#[cfg(feature = "enigo-input")]
+pub mod enigo_backend;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -51,4 +58,26 @@ impl InputInjector for NoopInjector {
         Ok(())
     }
     fn has_permission(&self) -> bool { false }
+}
+
+/// Open the best-available input backend for the current host. Falls
+/// back to [`NoopInjector`] when enigo-input is off or init fails.
+pub fn open_default() -> Box<dyn InputInjector + Send> {
+    #[cfg(feature = "enigo-input")]
+    {
+        match enigo_backend::EnigoInjector::new() {
+            Ok(e) => return Box::new(e),
+            Err(e) => {
+                tracing::warn!(%e, "enigo init failed — input injection disabled");
+            }
+        }
+    }
+    #[cfg(not(feature = "enigo-input"))]
+    {
+        tracing::info!(
+            "built without enigo-input feature — input events will be dropped. \
+             Rebuild with `--features enigo-input` (or `--features full`)."
+        );
+    }
+    Box::new(NoopInjector)
 }

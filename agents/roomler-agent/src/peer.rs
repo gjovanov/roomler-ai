@@ -39,6 +39,7 @@ use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSampl
 
 use crate::capture;
 use crate::encode;
+use crate::input;
 
 /// Target capture rate. Aligns the sample pacing sent to the browser with
 /// how fast the capturer emits frames.
@@ -133,14 +134,17 @@ impl AgentPeer {
             }));
         }
 
+        // Route data channels by label. `input` goes to the OS injector;
+        // the others (control/clipboard/files) are accepted but not yet
+        // wired — they'll get their own handlers in follow-up phases.
         pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
             let label = dc.label().to_string();
-            info!(session = %session_id, %label, "data channel opened (not yet wired)");
+            info!(session = %session_id, %label, "data channel opened");
             Box::pin(async move {
-                dc.on_message(Box::new(move |msg| {
-                    debug!(bytes = msg.data.len(), "data channel message (dropped)");
-                    Box::pin(async {})
-                }));
+                match label.as_str() {
+                    "input" => attach_input_handler(dc),
+                    _ => attach_log_only(dc, session_id),
+                }
             })
         }));
 
@@ -259,6 +263,53 @@ async fn media_pump(session_id: bson::oid::ObjectId, track: Arc<TrackLocalStatic
             }
         }
     }
+}
+
+/// Attach the `input` data-channel message handler. Each inbound payload
+/// is parsed as [`input::InputMsg`] and injected via the thread-pinned
+/// OS backend. The injector is built once per channel (the first frame
+/// may race with initialisation, but `open_default` is synchronous so
+/// it's ready before the first real keystroke).
+///
+/// Unparseable payloads are dropped with a debug log — we don't want a
+/// flood of warnings if the controller sends an unknown event type.
+fn attach_input_handler(dc: Arc<RTCDataChannel>) {
+    // Injector is wrapped in `parking_lot::Mutex`-equivalent-style — we
+    // don't have parking_lot imported here, so fall back to tokio's
+    // Mutex. The inject() call is fast (just a channel send), so lock
+    // contention is not a concern.
+    let injector = std::sync::Arc::new(tokio::sync::Mutex::new(input::open_default()));
+    dc.on_message(Box::new(move |msg| {
+        let injector = injector.clone();
+        Box::pin(async move {
+            let Ok(text) = std::str::from_utf8(&msg.data) else {
+                debug!("input: non-utf8 payload dropped");
+                return;
+            };
+            let parsed: input::InputMsg = match serde_json::from_str(text) {
+                Ok(v) => v,
+                Err(e) => {
+                    debug!(%e, "input: parse failed");
+                    return;
+                }
+            };
+            let mut guard = injector.lock().await;
+            if let Err(e) = guard.inject(parsed) {
+                debug!(%e, "input: inject failed");
+            }
+        })
+    }));
+}
+
+/// Placeholder handler for data channels that aren't wired to OS output
+/// yet (`control`, `clipboard`, `files`). Logs message sizes so we can
+/// see activity without spamming the log with contents.
+fn attach_log_only(dc: Arc<RTCDataChannel>, session_id: bson::oid::ObjectId) {
+    let label = dc.label().to_string();
+    dc.on_message(Box::new(move |msg| {
+        debug!(%session_id, %label, bytes = msg.data.len(), "DC msg (unhandled)");
+        Box::pin(async {})
+    }));
 }
 
 fn map_ice_servers(servers: &[IceServer]) -> Vec<RTCIceServer> {

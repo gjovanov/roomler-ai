@@ -121,3 +121,7 @@ scrap = "0.5"
 # first build but no runtime lib needed. Alternatives (nvenc/qsv/vaapi)
 # come behind other feature flags in a later phase.
 openh264 = { version = "0.9", default-features = false, features = ["source"] }
+# Cross-platform input injection. Default features pull x11rb which is
+# pure-Rust (no libxcb system dep) so we can ship the agent binary from
+# any host without X11 dev packages installed.
+enigo = "0.6"

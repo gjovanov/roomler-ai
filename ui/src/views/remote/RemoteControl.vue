@@ -80,14 +80,20 @@
         <p class="text-body-1 mt-4">{{ phaseLabel }}</p>
       </div>
 
-      <div v-else-if="rc.phase.value === 'connected'" class="video-frame">
+      <div
+        v-else-if="rc.phase.value === 'connected'"
+        ref="stageEl"
+        class="video-frame"
+        tabindex="0"
+      >
         <video ref="videoEl" autoplay playsinline muted class="remote-video" />
         <div v-if="!rc.hasMedia.value" class="no-media-overlay">
           <v-icon size="72" color="grey-lighten-1">mdi-video-off</v-icon>
           <p class="text-body-1 mt-3">Connected — waiting for agent to publish a video track.</p>
           <p class="text-caption text-medium-emphasis mt-1">
-            Screen capture + encoder is a follow-up milestone in the agent.
-            Data channels are live; the PeerConnection is healthy.
+            The agent needs to be built with the media feature
+            (<code>--features media</code>) to send video.
+            Input events flow as soon as the input channel is open.
           </p>
         </div>
       </div>
@@ -110,6 +116,8 @@ const agent = ref<Agent | null>(null)
 const rc = useRemoteControl()
 
 const videoEl = ref<HTMLVideoElement | null>(null)
+const stageEl = ref<HTMLElement | null>(null)
+let detachInput: (() => void) | null = null
 
 const canConnect = computed(() => !!agent.value)
 const statusColor = computed(() => (agent.value?.is_online ? 'success' : 'grey'))
@@ -152,8 +160,25 @@ watch(
   },
 )
 
+// Once the connected stage mounts, wire input listeners to it. Detach
+// when we leave the "connected" phase so keystrokes don't escape after
+// a disconnect.
+watch(
+  () => [rc.phase.value, stageEl.value] as const,
+  ([phase, el]) => {
+    if (phase === 'connected' && el && !detachInput) {
+      detachInput = rc.attachInput(el as HTMLElement)
+      ;(el as HTMLElement).focus()
+    } else if (phase !== 'connected' && detachInput) {
+      detachInput()
+      detachInput = null
+    }
+  },
+)
+
 onMounted(loadAgent)
 onBeforeUnmount(() => {
+  if (detachInput) detachInput()
   rc.disconnect()
 })
 </script>

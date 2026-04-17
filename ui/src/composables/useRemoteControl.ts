@@ -47,6 +47,29 @@ export function useRemoteControl() {
   /** Data channels we open proactively (per docs §5). Labels match the
    *  agent's expected routing: input/control/clipboard/files. */
   const channels: Record<string, RTCDataChannel> = {}
+  const inputChannelOpen = ref(false)
+
+  // Coalesce rapid mouse moves to one per animation frame (~60 Hz). Keys
+  // and clicks are NOT coalesced — they're too meaningful to drop.
+  let pendingMove: { x: number; y: number; mon: number } | null = null
+  let rafHandle: number | null = null
+
+  function flushPendingMove() {
+    rafHandle = null
+    if (!pendingMove || !channels.input || channels.input.readyState !== 'open') return
+    sendInput({ t: 'MouseMove', ...pendingMove })
+    pendingMove = null
+  }
+
+  function sendInput(msg: Record<string, unknown>) {
+    const ch = channels.input
+    if (!ch || ch.readyState !== 'open') return
+    try {
+      ch.send(JSON.stringify(msg))
+    } catch {
+      /* channel may have closed between the check and send — drop */
+    }
+  }
 
   /** Buffer ICE candidates that arrive before we've set a remote
    *  description, otherwise addIceCandidate throws. */
@@ -211,6 +234,10 @@ export function useRemoteControl() {
 
     installRcHandlers()
 
+    // Flag the first open so the input pump can start queuing.
+    channels.input.onopen = () => { inputChannelOpen.value = true }
+    channels.input.onclose = () => { inputChannelOpen.value = false }
+
     // Kick off the rc:* handshake.
     ws.sendRaw({
       t: 'rc:session.request',
@@ -236,13 +263,164 @@ export function useRemoteControl() {
     disconnect()
   })
 
+  /**
+   * Attach mouse/keyboard/wheel listeners to a surface element (typically
+   * the video container). Coordinates sent to the agent are normalised in
+   * `[0,1]` per the architecture doc §6, so the agent can resolve them
+   * against its current resolution.
+   *
+   * Returns a detach function the caller should invoke before unmounting.
+   */
+  function attachInput(surface: HTMLElement): () => void {
+    function normalisedXY(ev: PointerEvent | MouseEvent | WheelEvent): { x: number; y: number } {
+      const rect = surface.getBoundingClientRect()
+      const x = (ev.clientX - rect.left) / Math.max(rect.width, 1)
+      const y = (ev.clientY - rect.top) / Math.max(rect.height, 1)
+      return { x: Math.min(Math.max(x, 0), 1), y: Math.min(Math.max(y, 0), 1) }
+    }
+
+    function onPointerMove(ev: PointerEvent) {
+      const { x, y } = normalisedXY(ev)
+      pendingMove = { x, y, mon: 0 }
+      if (rafHandle === null) rafHandle = requestAnimationFrame(flushPendingMove)
+    }
+
+    function onPointerDown(ev: PointerEvent) {
+      ev.preventDefault()
+      surface.setPointerCapture(ev.pointerId)
+      const { x, y } = normalisedXY(ev)
+      sendInput({ t: 'MouseButton', btn: browserButton(ev.button), down: true, x, y, mon: 0 })
+    }
+
+    function onPointerUp(ev: PointerEvent) {
+      try { surface.releasePointerCapture(ev.pointerId) } catch { /* noop */ }
+      const { x, y } = normalisedXY(ev)
+      sendInput({ t: 'MouseButton', btn: browserButton(ev.button), down: false, x, y, mon: 0 })
+    }
+
+    function onWheel(ev: WheelEvent) {
+      ev.preventDefault()
+      // Browser uses positive Y for down; agent does the same.
+      sendInput({
+        t: 'MouseWheel',
+        dx: ev.deltaX,
+        dy: ev.deltaY,
+        mode: ev.deltaMode === 0 ? 'Pixel' : ev.deltaMode === 1 ? 'Line' : 'Page',
+      })
+    }
+
+    function onKey(ev: KeyboardEvent, down: boolean) {
+      // Trap reserved combos so the browser doesn't navigate away.
+      ev.preventDefault()
+      const code = kbdCodeToHid(ev.code)
+      if (code === null) return
+      const mods =
+        (ev.ctrlKey ? 1 : 0) | (ev.shiftKey ? 2 : 0) | (ev.altKey ? 4 : 0) | (ev.metaKey ? 8 : 0)
+      sendInput({ t: 'Key', code, down, mods })
+    }
+    const onKeyDown = (e: KeyboardEvent) => onKey(e, true)
+    const onKeyUp = (e: KeyboardEvent) => onKey(e, false)
+
+    // Disable the OS-native context menu so right-click forwards cleanly.
+    function onContextMenu(ev: MouseEvent) { ev.preventDefault() }
+
+    surface.addEventListener('pointermove', onPointerMove)
+    surface.addEventListener('pointerdown', onPointerDown)
+    surface.addEventListener('pointerup', onPointerUp)
+    surface.addEventListener('wheel', onWheel, { passive: false })
+    surface.addEventListener('contextmenu', onContextMenu)
+    // Keys are captured on window so they fire even if the video loses focus.
+    window.addEventListener('keydown', onKeyDown)
+    window.addEventListener('keyup', onKeyUp)
+
+    return () => {
+      surface.removeEventListener('pointermove', onPointerMove)
+      surface.removeEventListener('pointerdown', onPointerDown)
+      surface.removeEventListener('pointerup', onPointerUp)
+      surface.removeEventListener('wheel', onWheel)
+      surface.removeEventListener('contextmenu', onContextMenu)
+      window.removeEventListener('keydown', onKeyDown)
+      window.removeEventListener('keyup', onKeyUp)
+      if (rafHandle !== null) cancelAnimationFrame(rafHandle)
+    }
+  }
+
   return {
     phase,
     error,
     sessionId,
     remoteStream,
     hasMedia,
+    inputChannelOpen,
     connect,
     disconnect,
+    attachInput,
   }
 }
+
+/**
+ * Map a browser `MouseEvent.button` (0/1/2/3/4) to the agent's enum.
+ */
+function browserButton(n: number): string {
+  switch (n) {
+    case 0: return 'Left'
+    case 1: return 'Middle'
+    case 2: return 'Right'
+    case 3: return 'Back'
+    case 4: return 'Forward'
+    default: return 'Left'
+  }
+}
+
+/**
+ * Translate `KeyboardEvent.code` (physical-key string, e.g. "KeyA",
+ * "ArrowLeft") to a USB HID usage code on the Keyboard/Keypad page.
+ *
+ * The agent's enigo backend maps these back to OS-native scan codes,
+ * which is what makes remote typing layout-independent.
+ */
+function kbdCodeToHid(code: string): number | null {
+  // Letter row.
+  if (code.startsWith('Key') && code.length === 4) {
+    const ch = code.charCodeAt(3) - 'A'.charCodeAt(0)
+    if (ch >= 0 && ch <= 25) return 0x04 + ch // a..z → 0x04..0x1d
+  }
+  // Digit row.
+  if (code.startsWith('Digit') && code.length === 6) {
+    const d = code.charCodeAt(5) - '0'.charCodeAt(0)
+    // HID: 1..9 → 0x1e..0x26, 0 → 0x27
+    if (d === 0) return 0x27
+    if (d >= 1 && d <= 9) return 0x1e + d - 1
+  }
+  if (code === 'Enter') return 0x28
+  if (code === 'Escape') return 0x29
+  if (code === 'Backspace') return 0x2a
+  if (code === 'Tab') return 0x2b
+  if (code === 'Space') return 0x2c
+  if (code === 'ArrowRight') return 0x4f
+  if (code === 'ArrowLeft') return 0x50
+  if (code === 'ArrowDown') return 0x51
+  if (code === 'ArrowUp') return 0x52
+  if (code === 'Home') return 0x4a
+  if (code === 'End') return 0x4d
+  if (code === 'PageUp') return 0x4b
+  if (code === 'PageDown') return 0x4e
+  if (code === 'Insert') return 0x49
+  if (code === 'Delete') return 0x4c
+  if (code === 'ControlLeft') return 0xe0
+  if (code === 'ShiftLeft') return 0xe1
+  if (code === 'AltLeft') return 0xe2
+  if (code === 'MetaLeft') return 0xe3
+  if (code === 'ControlRight') return 0xe4
+  if (code === 'ShiftRight') return 0xe5
+  if (code === 'AltRight') return 0xe6
+  if (code === 'MetaRight') return 0xe7
+  // F1..F12
+  if (code.startsWith('F') && code.length >= 2 && code.length <= 3) {
+    const n = parseInt(code.slice(1), 10)
+    if (n >= 1 && n <= 12) return 0x3a + n - 1
+  }
+  return null
+}
+
+export { browserButton, kbdCodeToHid }
