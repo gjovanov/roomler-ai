@@ -13,7 +13,7 @@
 //! [OpenH264]: https://www.openh264.org/
 
 use anyhow::{Context, Result, anyhow};
-use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameType};
+use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameType, IntraFramePeriod};
 use openh264::formats::YUVBuffer;
 use std::sync::mpsc as std_mpsc;
 use std::thread;
@@ -54,8 +54,15 @@ impl Openh264Encoder {
             .spawn(move || {
                 let init = || -> Result<Encoder> {
                     let api = openh264::OpenH264API::from_source();
+                    // Force an IDR every 60 frames (≈2 s @ 30 fps). Without a
+                    // bounded IDR interval, openh264 can go 300+ frames
+                    // between keyframes on a static desktop, which means a
+                    // single lost packet freezes the browser's decoder for
+                    // up to ~10 s. 60 gives <2 s recovery floor even if the
+                    // RTCP-PLI round-trip drops.
                     let cfg = EncoderConfig::new()
-                        .bitrate(BitRate::from_bps(DEFAULT_BITRATE_BPS as u32));
+                        .bitrate(BitRate::from_bps(DEFAULT_BITRATE_BPS as u32))
+                        .intra_frame_period(IntraFramePeriod::from_num_frames(60));
                     Encoder::with_api_config(api, cfg).map_err(|e| anyhow!("encoder init: {e}"))
                 };
 

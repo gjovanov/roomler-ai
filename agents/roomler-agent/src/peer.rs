@@ -33,6 +33,7 @@ use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
+use webrtc::rtp_transceiver::RTCPFeedback;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::track::track_local::TrackLocal;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
@@ -77,10 +78,12 @@ impl AgentPeer {
 
         // Add a sendonly H.264 video track up front so the SDP answer
         // advertises it. Match one of webrtc-rs's default H.264 codec
-        // registrations exactly (clock_rate + fmtp line), otherwise the
-        // packetizer can't resolve a payload type for the outgoing RTP
-        // and the browser receives the track slot but no decodable frames
-        // (video element stays black). Chosen: Constrained Baseline,
+        // registrations exactly (clock_rate + fmtp line + rtcp_feedback),
+        // otherwise the packetizer can't resolve a payload type for the
+        // outgoing RTP and (even worse) NACK/PLI aren't negotiated so the
+        // browser's retransmit requests and keyframe asks are ignored —
+        // the stream freezes on every lost packet for ~10 s until openh264
+        // emits its next natural IDR. Chosen: Constrained Baseline,
         // packetization-mode=1, profile-level-id=42e01f — matches payload
         // type 125 in webrtc-rs's default MediaEngine.
         let video_track = Arc::new(TrackLocalStaticSample::new(
@@ -91,14 +94,54 @@ impl AgentPeer {
                 sdp_fmtp_line:
                     "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
                         .to_string(),
-                rtcp_feedback: vec![],
+                rtcp_feedback: vec![
+                    RTCPFeedback { typ: "goog-remb".to_string(),    parameter: String::new() },
+                    RTCPFeedback { typ: "ccm".to_string(),          parameter: "fir".to_string() },
+                    RTCPFeedback { typ: "nack".to_string(),         parameter: String::new() },
+                    RTCPFeedback { typ: "nack".to_string(),         parameter: "pli".to_string() },
+                    RTCPFeedback { typ: "transport-cc".to_string(), parameter: String::new() },
+                ],
             },
             "video".to_string(),
             "roomler-agent".to_string(),
         ));
-        pc.add_track(video_track.clone() as Arc<dyn TrackLocal + Send + Sync>)
+        let video_sender = pc
+            .add_track(video_track.clone() as Arc<dyn TrackLocal + Send + Sync>)
             .await
             .context("add_track(video)")?;
+
+        // Shared keyframe-request flag. The RTCP reader task flips it on
+        // PLI / FIR; media_pump consumes it before each encode and calls
+        // force_intra_frame() on the openh264 encoder. Without this, lost
+        // packets freeze the decoder until the next periodic IDR.
+        let keyframe_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let flag = keyframe_requested.clone();
+            let sid = session_id;
+            tokio::spawn(async move {
+                use webrtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
+                use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
+                loop {
+                    match video_sender.read_rtcp().await {
+                        Ok((pkts, _)) => {
+                            for p in pkts {
+                                let p_any = p.as_any();
+                                if p_any.downcast_ref::<PictureLossIndication>().is_some()
+                                    || p_any.downcast_ref::<FullIntraRequest>().is_some()
+                                {
+                                    info!(session = %sid, "PLI/FIR received → forcing keyframe");
+                                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
+                        }
+                        Err(_e) => {
+                            // Sender closed; exit the reader.
+                            return;
+                        }
+                    }
+                }
+            });
+        }
 
         // Forward locally-gathered ICE candidates.
         {
@@ -161,7 +204,7 @@ impl AgentPeer {
         // Start the capture→encode→track pump. The pump is self-regulating:
         // with no capture backend compiled in, open_default returns a Noop
         // that parks forever, producing no samples.
-        let pump = tokio::spawn(media_pump(session_id, video_track));
+        let pump = tokio::spawn(media_pump(session_id, video_track, keyframe_requested));
 
         Ok(Self {
             pc,
@@ -218,7 +261,11 @@ impl AgentPeer {
 /// Per-session media pump. Captures frames, encodes to H.264, writes
 /// Samples into the WebRTC track. Rebuilds the encoder if the capture
 /// resolution changes mid-session (e.g. dock/undock).
-async fn media_pump(session_id: bson::oid::ObjectId, track: Arc<TrackLocalStaticSample>) {
+async fn media_pump(
+    session_id: bson::oid::ObjectId,
+    track: Arc<TrackLocalStaticSample>,
+    keyframe_requested: Arc<std::sync::atomic::AtomicBool>,
+) {
     let mut capturer = capture::open_default(TARGET_FPS);
     let mut encoder: Option<Box<dyn encode::VideoEncoder>> = None;
     let mut encoder_dims: Option<(u32, u32)> = None;
@@ -267,6 +314,9 @@ async fn media_pump(session_id: bson::oid::ObjectId, track: Arc<TrackLocalStatic
         }
 
         let enc = encoder.as_mut().unwrap();
+        if keyframe_requested.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            enc.request_keyframe();
+        }
         let packets = match enc.encode(frame).await {
             Ok(p) => p,
             Err(e) => {
