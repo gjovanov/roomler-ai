@@ -77,7 +77,7 @@ use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
     CoTaskMemFree,
 };
-use windows::core::{GUID, Interface, PWSTR};
+use windows::core::{GUID, Interface};
 
 use super::{EncodedPacket, VideoEncoder};
 use crate::capture::{Frame, PixelFormat};
@@ -556,8 +556,11 @@ unsafe fn activate_h264_encoder() -> Result<(IMFTransform, &'static str)> {
 
         // Hardware MFTs first. `SORTANDFILTER` asks MF to order results
         // by merit so the best-scoring hardware encoder is index 0.
-        let flags =
-            MFT_ENUM_FLAG_HARDWARE.0 | MFT_ENUM_FLAG_SORTANDFILTER.0 | MFT_ENUM_FLAG_SYNCMFT.0;
+        // MFT_ENUM_FLAG is a newtype over i32; OR the inner values, then
+        // rewrap so MFTEnumEx gets its expected parameter type.
+        let flags = windows::Win32::Media::MediaFoundation::MFT_ENUM_FLAG(
+            MFT_ENUM_FLAG_HARDWARE.0 | MFT_ENUM_FLAG_SORTANDFILTER.0 | MFT_ENUM_FLAG_SYNCMFT.0,
+        );
         let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
         let mut count: u32 = 0;
         let enum_rc = MFTEnumEx(
