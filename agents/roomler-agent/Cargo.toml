@@ -82,8 +82,10 @@ optional = true
 features = [
     "Win32_Foundation",
     "Win32_Media_MediaFoundation",
+    "Win32_Graphics_Direct3D",          # D3D_DRIVER_TYPE + D3D_FEATURE_LEVEL constants
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",       # DXGI_FORMAT etc.
     "Win32_System_Com",
     "Win32_System_Variant",
 ]
