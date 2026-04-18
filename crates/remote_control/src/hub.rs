@@ -146,6 +146,21 @@ impl Hub {
         if let Some(mut list) = self.inner.controllers.get_mut(&user_id) {
             list.retain(|t| !ptr_eq(t, tx));
         }
+
+        // Terminate any sessions this controller still owns. Without this
+        // the agent's active_sessions counter never drops when a browser
+        // tab closes mid-session, and subsequent Connect attempts fail
+        // with AgentBusy until the agent itself disconnects.
+        let orphaned: Vec<ObjectId> = self
+            .inner
+            .sessions
+            .iter()
+            .filter(|e| e.value().lock().controller_user_id == user_id)
+            .map(|e| *e.key())
+            .collect();
+        for session_id in orphaned {
+            let _ = self.terminate(session_id, EndReason::ControllerHangup);
+        }
     }
 
     // ─── session lifecycle ────────────────────────────────────────────
