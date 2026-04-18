@@ -320,8 +320,25 @@ async fn media_pump(
                 continue;
             }
             Err(e) => {
-                warn!(%session_id, %e, "capture error — stopping media pump");
-                return;
+                // DXGI Desktop Duplication is fragile — it returns
+                // transient errors on display-mode changes, DPI switches,
+                // UAC dimmer entry/exit, lock screen transitions, RDP
+                // takeover, fullscreen toggles, GPU driver recycles, etc.
+                // These used to kill the pump, leaving the data channels
+                // alive (mouse/keyboard still worked) but video frozen
+                // forever until session reconnect. Rebuild the capturer
+                // and the encoder, keep the pump running. 500ms backoff
+                // so a genuine infinite error loop doesn't spin a core.
+                warn!(%session_id, %e, "capture error — rebuilding capturer");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                capturer = capture::open_default(TARGET_FPS);
+                // Force the encoder to rebuild on the next frame — new
+                // capturer may come back at a different resolution (e.g.
+                // after a DPI change) and openh264 can't be resized
+                // mid-stream without re-init.
+                encoder = None;
+                encoder_dims = None;
+                continue;
             }
         };
 
