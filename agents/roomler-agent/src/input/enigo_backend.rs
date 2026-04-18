@@ -171,6 +171,26 @@ fn hid_to_key(code: u32) -> Option<Key> {
     // function keys here and round-trip printable keys as text in the
     // future via InputMsg::KeyText.
     match code {
+        // Letters: HID 0x04..=0x1d → 'a'..='z'. enigo's Key::Unicode press
+        // types the character honouring any Shift modifier currently held
+        // by enigo, which is how the browser's Shift+KeyA path ends up as
+        // an uppercase 'A' on the remote.
+        0x04..=0x1d => char::from_u32(u32::from(b'a') + (code - 0x04)).map(Key::Unicode),
+        // Digits: HID 0x1e..=0x26 → '1'..='9', 0x27 → '0'.
+        0x1e..=0x26 => char::from_u32(u32::from(b'1') + (code - 0x1e)).map(Key::Unicode),
+        0x27 => Some(Key::Unicode('0')),
+        // Common punctuation (US layout HID usages).
+        0x2d => Some(Key::Unicode('-')),
+        0x2e => Some(Key::Unicode('=')),
+        0x2f => Some(Key::Unicode('[')),
+        0x30 => Some(Key::Unicode(']')),
+        0x31 => Some(Key::Unicode('\\')),
+        0x33 => Some(Key::Unicode(';')),
+        0x34 => Some(Key::Unicode('\'')),
+        0x35 => Some(Key::Unicode('`')),
+        0x36 => Some(Key::Unicode(',')),
+        0x37 => Some(Key::Unicode('.')),
+        0x38 => Some(Key::Unicode('/')),
         0x28 => Some(Key::Return),
         0x29 => Some(Key::Escape),
         0x2a => Some(Key::Backspace),
