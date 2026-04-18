@@ -22,7 +22,7 @@ pub mod color;
 pub mod openh264_backend;
 
 #[cfg(all(target_os = "windows", feature = "mf-encoder"))]
-pub mod mf_backend;
+pub mod mf;
 
 // ---------------------------------------------------------------------
 // Shared helpers usable by every backend.
@@ -141,7 +141,7 @@ pub fn open_default(
     if preference == EncoderPreference::Hardware {
         #[cfg(all(target_os = "windows", feature = "mf-encoder"))]
         {
-            match mf_backend::MfEncoder::new(width, height) {
+            match mf::MfEncoder::new(width, height) {
                 Ok(e) => {
                     tracing::info!(
                         width,
