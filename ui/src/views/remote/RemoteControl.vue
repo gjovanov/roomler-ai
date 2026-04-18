@@ -151,13 +151,20 @@ function startSession() {
 }
 
 // When the remote stream becomes available, attach it to the video element.
+// Race to watch out for: ontrack can fire during `phase === 'negotiating'`
+// (before the <video> element is even mounted, since it lives inside a
+// v-else-if="phase === 'connected'"). A single watcher on the stream would
+// see videoEl.value = null at that moment and silently skip the assignment;
+// when the element mounts later no watcher re-fires. Watch both refs and
+// attach whenever both are present.
 watch(
-  () => rc.remoteStream.value,
-  (stream) => {
-    if (videoEl.value && stream) {
-      videoEl.value.srcObject = stream
+  () => [rc.remoteStream.value, videoEl.value] as const,
+  ([stream, el]) => {
+    if (stream && el && el.srcObject !== stream) {
+      el.srcObject = stream
     }
   },
+  { immediate: true },
 )
 
 // Once the connected stage mounts, wire input listeners to it. Detach
