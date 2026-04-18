@@ -116,11 +116,20 @@ impl std::str::FromStr for EncoderPreference {
 ///
 /// Selection cascade:
 ///
-/// | Preference | Order tried                                    |
-/// |------------|------------------------------------------------|
-/// | Auto       | mf (Windows, feature gate) → openh264 → Noop   |
-/// | Hardware   | mf (required on Windows) → openh264 → Noop     |
-/// | Software   | openh264 → Noop                                |
+/// | Preference | Order tried                                              |
+/// |------------|----------------------------------------------------------|
+/// | Auto       | openh264 → Noop   (MF is opt-in until phase 3 lands)     |
+/// | Hardware   | mf (required on Windows) → openh264 → Noop               |
+/// | Software   | openh264 → Noop                                          |
+///
+/// MF is demoted from the Auto path because on mixed-GPU systems
+/// (NVIDIA + Intel iGPU) the MS SW MFT produces catastrophic frame
+/// sizes (20+ Mbps where 4 Mbps was requested — rate-control config
+/// is silently ignored) and the HW MFT path needs adapter-matching
+/// and an async event loop (phase 3). openh264 with LowDelay /
+/// max_frame_rate=30 has worked consistently across every host
+/// we've tested. Users who want to experiment with the MF path can
+/// set `encoder_preference=hardware` via CLI/env/config.
 ///
 /// Each fallback is logged; the picked backend reports via
 /// `.name()` so pump-level observability can attribute.
@@ -129,7 +138,7 @@ pub fn open_default(
     height: u32,
     preference: EncoderPreference,
 ) -> Box<dyn VideoEncoder> {
-    if preference != EncoderPreference::Software {
+    if preference == EncoderPreference::Hardware {
         #[cfg(all(target_os = "windows", feature = "mf-encoder"))]
         {
             match mf_backend::MfEncoder::new(width, height) {
@@ -137,7 +146,7 @@ pub fn open_default(
                     tracing::info!(
                         width,
                         height,
-                        "encoder selected: mf-h264 (hardware)"
+                        "encoder selected: mf-h264 (hardware — experimental)"
                     );
                     return Box::new(e);
                 }
@@ -151,13 +160,11 @@ pub fn open_default(
         }
         #[cfg(not(all(target_os = "windows", feature = "mf-encoder")))]
         {
-            if preference == EncoderPreference::Hardware {
-                tracing::warn!(
-                    "Hardware encoder requested but this build has no HW backend \
-                     compiled in (rebuild with --features mf-encoder on Windows); \
-                     falling back to software"
-                );
-            }
+            tracing::warn!(
+                "Hardware encoder requested but this build has no HW backend \
+                 compiled in (rebuild with --features mf-encoder on Windows); \
+                 falling back to software"
+            );
         }
     }
 
