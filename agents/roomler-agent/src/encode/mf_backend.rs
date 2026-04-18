@@ -63,9 +63,10 @@ use windows::Win32::Media::MediaFoundation::{
     IMFMediaType, IMFSample, IMFTransform, MF_E_NOTACCEPTING, MF_E_TRANSFORM_NEED_MORE_INPUT,
     MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
     MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
-    MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFStartup, MFSTARTUP_FULL, MFShutdown,
-    MFMediaType_Video, MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
-    MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
+    MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK, MFCreateMediaType, MFCreateMemoryBuffer,
+    MFCreateSample, MFStartup, MFSTARTUP_FULL, MFShutdown, MFMediaType_Video, MFVideoFormat_H264,
+    MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFT_MESSAGE_COMMAND_FLUSH,
+    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
     MFT_MESSAGE_NOTIFY_END_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
     MFT_OUTPUT_STREAM_INFO, eAVEncCommonRateControlMode_CBR,
 };
@@ -257,6 +258,34 @@ impl MfPipeline {
                 CoCreateInstance(&CLSID_MSH264EncoderMFT, None, CLSCTX_INPROC_SERVER)
                     .map_err(|e| anyhow!("CoCreateInstance MSH264Encoder: {e:?}"))?;
 
+            // Detect + tame async mode. On systems with hardware H.264
+            // acceleration (NVIDIA, Intel QSV, AMD AMF), the MS encoder
+            // MFT can switch itself into async mode, where it silently
+            // buffers every ProcessInput and never returns output to a
+            // caller using the sync ProcessOutput loop. The fix is to
+            // set MF_TRANSFORM_ASYNC_UNLOCK=1, which makes the MFT
+            // honour sync semantics even when its internal worker is
+            // async. On MFTs that are already sync-only (WARP fallback,
+            // pure-SW Windows), the attribute set is a no-op.
+            if let Ok(attrs) = transform.GetAttributes() {
+                let is_async = attrs
+                    .GetUINT32(&MF_TRANSFORM_ASYNC)
+                    .map(|v| v != 0)
+                    .unwrap_or(false);
+                tracing::info!(is_async, "mf-encoder: MFT async-mode probe");
+                if is_async
+                    && let Err(e) = attrs.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1)
+                {
+                    tracing::warn!(
+                        %e,
+                        "mf-encoder: async unlock failed — MFT will stay in async mode; \
+                         sync ProcessOutput will buffer forever. Expect zero output."
+                    );
+                }
+            } else {
+                tracing::debug!("mf-encoder: MFT has no attribute store");
+            }
+
             // Set output type first (required by the MFT contract).
             let out_type = build_output_media_type(width, height)?;
             transform
@@ -325,14 +354,23 @@ impl MfPipeline {
         loop {
             let rc = unsafe { self.transform.ProcessInput(0, &sample, 0) };
             match rc {
-                Ok(()) => break,
+                Ok(()) => {
+                    tracing::debug!(
+                        frame = self.frame_count.saturating_sub(1),
+                        "mf ProcessInput: OK"
+                    );
+                    break;
+                }
                 Err(e) if e.code() == MF_E_NOTACCEPTING => {
+                    tracing::debug!(
+                        frame = self.frame_count.saturating_sub(1),
+                        "mf ProcessInput: NOTACCEPTING — draining first"
+                    );
                     if drained_first {
                         return Err(anyhow!(
                             "mf-encoder: MFT would not accept input after drain"
                         ));
                     }
-                    // Drain before retrying.
                     let _ = self.drain_output(Vec::new())?;
                     drained_first = true;
                 }
@@ -412,7 +450,11 @@ impl MfPipeline {
                     }
                 }
                 Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => {
-                    tracing::trace!(iter, "mf ProcessOutput: NEED_MORE_INPUT (drain done)");
+                    tracing::debug!(
+                        iter,
+                        produced = acc.len(),
+                        "mf ProcessOutput: NEED_MORE_INPUT (drain done)"
+                    );
                     return Ok(acc);
                 }
                 Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
