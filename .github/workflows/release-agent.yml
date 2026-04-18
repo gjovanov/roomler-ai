@@ -197,14 +197,15 @@ jobs:
 
       - name: Encoder smoke test (MF cascade → openh264 fallback)
         shell: pwsh
+        env:
+          RUST_LOG: roomler_agent=debug,info
         run: |
           # Probe the hardware encoder path. On windows-latest the runner
           # exposes a WARP software D3D11 device; the MS H264 Encoder MFT
           # falls back to its SW path there, which is enough for "it loads,
-          # negotiates types, produces an IDR, no SEH crash". If MF fails
-          # to init at all, the cascade falls back to openh264 and the
-          # smoke still passes — we only fail on NoopEncoder (both paths
-          # broken) or zero keyframes (bitstream empty).
+          # negotiates types, produces an IDR, no SEH crash". Debug logging
+          # surfaces STREAM_CHANGE notifications and per-frame byte counts
+          # so regressions in the MF drain path are visible in CI output.
           & "target\release\roomler-agent.exe" encoder-smoke --encoder hardware
 
       - name: Build MSI
