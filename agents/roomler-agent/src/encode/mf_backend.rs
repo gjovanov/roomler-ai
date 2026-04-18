@@ -258,14 +258,25 @@ impl MfPipeline {
             // one is available. There's no separate "HW only" CLSID
             // in v1 — MFTEnumEx with MFT_ENUM_FLAG_HARDWARE is the
             // path to vendor-specific MFTs (phase 3).
-            // Prefer a vendor hardware H.264 MFT (NVENC / QuickSync /
-            // AMF) enumerated via MFTEnumEx. CoCreateInstance on the
-            // plain CLSID always returns Microsoft's *software* MFT,
-            // which on a desktop CPU caps out at ~10 fps at 4K and
-            // defeats the whole point of this backend. Fall back to the
-            // SW MFT only if HW enumeration finds nothing.
-            let (transform, backend_kind) = activate_h264_encoder()?;
-            tracing::info!(backend = backend_kind, "mf-encoder: activated MFT");
+            // SW-only for now. Phase-2 work will wire HW MFTs via
+            // `activate_h264_encoder()` which already enumerates them
+            // via MFTEnumEx — the enumeration is correct, but the
+            // activation of vendor HW MFTs requires:
+            //   - NVIDIA: IMFDXGIDeviceManager set on the MFT before
+            //     activation (ActivateObject returns 0x8000FFFF
+            //     without it)
+            //   - Intel QSV / AMD AMF: full async event loop
+            //     (METransformNeedInput / METransformHaveOutput) —
+            //     the MFTs self-configure as async regardless of
+            //     the SYNCMFT enumeration flag
+            // Both are follow-up phases. Until then we use the MS SW
+            // MFT which is sync and works out of the box; we rely on
+            // the capture-layer 2× downscale to hit 30 fps at 1080p.
+            let transform: IMFTransform =
+                CoCreateInstance(&CLSID_MSH264EncoderMFT, None, CLSCTX_INPROC_SERVER)
+                    .map_err(|e| anyhow!("CoCreateInstance MSH264Encoder: {e:?}"))?;
+            let backend_kind = "sw";
+            tracing::info!(backend = backend_kind, "mf-encoder: activated MFT (sw, phase 1)");
 
             // Detect + tame async mode. On systems with hardware H.264
             // acceleration (NVIDIA, Intel QSV, AMD AMF), the MS encoder
