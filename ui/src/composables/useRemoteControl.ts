@@ -199,6 +199,18 @@ export function useRemoteControl() {
       if (!remoteStream.value) remoteStream.value = new MediaStream()
       remoteStream.value.addTrack(ev.track)
       hasMedia.value = true
+      // Tell the browser we care about latency, not playback smoothness.
+      // Default jitterBufferTarget is adaptive (100-500 ms); for remote
+      // control 50 ms is the right trade: cut perceived click-to-pixel
+      // delay to the wire at the cost of occasional stutter under loss.
+      // NB: setter is relatively new (Chromium 116+, Firefox 123+), so
+      // feature-detect rather than crash on older browsers.
+      try {
+        const r = ev.receiver as RTCRtpReceiver & { jitterBufferTarget?: number | null }
+        if ('jitterBufferTarget' in r) r.jitterBufferTarget = 50
+      } catch {
+        // Best-effort — browser will use its own adaptive default.
+      }
     }
 
     pc.onicecandidate = (ev) => {

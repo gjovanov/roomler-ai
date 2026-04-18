@@ -18,6 +18,7 @@ pub mod scrap_backend;
 /// We don't commit to a specific colour space in the trait — backends can
 /// emit BGRA (WGC/XShm default) and the encoder converts. Width/height may
 /// change mid-session (e.g. laptop dock) which is why they're per-frame.
+#[derive(Clone)]
 pub struct Frame {
     pub width: u32,
     pub height: u32,

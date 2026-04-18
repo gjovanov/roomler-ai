@@ -311,12 +311,27 @@ async fn media_pump(
     let frame_duration_floor = Duration::from_micros(1_000_000 / TARGET_FPS as u64);
     let mut last_sample_at: Option<std::time::Instant> = None;
 
+    // Keep the most recent captured frame around so we can re-feed it to
+    // the encoder during idle periods. DXGI Desktop Duplication only
+    // signals when the screen changes — on an idle desktop the agent can
+    // go seconds without producing a frame, which makes the browser's
+    // decoder enter a pause state. The user then perceives several
+    // seconds of lag when they finally do something, because the stream
+    // has to resume from the pause. Re-encoding the last frame at ~2 fps
+    // during idle keeps the RTP stream flowing and the decoder unpaused.
+    let mut last_good_frame: Option<crate::capture::Frame> = None;
+    // How long of a DXGI-silent gap we're willing to tolerate before
+    // injecting a keepalive. 500 ms = 2 fps idle floor.
+    const IDLE_KEEPALIVE: Duration = Duration::from_millis(500);
+    let mut last_capture_at = std::time::Instant::now();
+
     // Observability: count frames in/out and bytes written, log every 30
     // encoded frames (~once per second at 30fps). Without this a silent
     // stall in capture or encode is indistinguishable from a working pump.
     let mut frames_captured: u64 = 0;
     let mut frames_empty: u64 = 0;
     let mut frames_encoded: u64 = 0;
+    let mut frames_keepalive: u64 = 0;
     let mut bytes_written: u64 = 0;
     let mut write_errors: u64 = 0;
 
@@ -324,6 +339,8 @@ async fn media_pump(
         let frame = match capturer.next_frame().await {
             Ok(Some(f)) => {
                 frames_captured += 1;
+                last_capture_at = std::time::Instant::now();
+                last_good_frame = Some(f.clone());
                 f
             }
             Ok(None) => {
@@ -334,7 +351,21 @@ async fn media_pump(
                 if frames_empty % 150 == 0 {
                     info!(%session_id, frames_empty, "capture produced no frame (idle screen)");
                 }
-                continue;
+                // If the screen has been idle for IDLE_KEEPALIVE and we
+                // have a cached frame, re-encode it. openh264 will emit
+                // a tiny (~tens of bytes) P-frame since nothing changed,
+                // which keeps the browser's decoder unpaused.
+                if last_capture_at.elapsed() >= IDLE_KEEPALIVE {
+                    if let Some(ref f) = last_good_frame {
+                        frames_keepalive += 1;
+                        last_capture_at = std::time::Instant::now();
+                        f.clone()
+                    } else {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
             }
             Err(e) => {
                 // DXGI Desktop Duplication is fragile — it returns
@@ -424,7 +455,7 @@ async fn media_pump(
         if frames_encoded.is_multiple_of(30) {
             info!(
                 %session_id,
-                frames_captured, frames_empty, frames_encoded,
+                frames_captured, frames_empty, frames_encoded, frames_keepalive,
                 bytes_written, write_errors,
                 "media pump heartbeat (≈1s window)"
             );
