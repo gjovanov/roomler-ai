@@ -554,40 +554,35 @@ fn nalu_contains_idr(buf: &[u8]) -> bool {
     false
 }
 
+/// Set a boolean codec-api property. `windows` 0.58 exposes a
+/// high-level `VARIANT` from `windows::core` with `From<bool>`, so we
+/// skip the union-field dance of the raw Win32 VARIANT. An `E_FAIL`
+/// from the MFT is interpreted as "key not supported" — non-fatal,
+/// since we try to set a superset of knobs that any given driver may
+/// or may not recognise.
 fn set_codec_bool(codec: &ICodecAPI, key: &GUID, value: bool) -> Result<()> {
-    use windows::Win32::System::Variant::{VARIANT, VariantInit};
-    unsafe {
-        let mut var = VariantInit();
-        var.Anonymous.Anonymous.vt = windows::Win32::System::Variant::VT_BOOL;
-        var.Anonymous.Anonymous.Anonymous.boolVal = if value { -1i16 } else { 0 };
-        let hr = codec.SetValue(key, &var);
-        // The MFT may return S_FALSE for unsupported keys — not fatal.
-        match hr {
-            Ok(()) => Ok(()),
-            Err(e) if e.code() == E_FAIL => {
-                tracing::debug!(?key, "codec-api key not supported by MFT");
-                Ok(())
-            }
-            Err(e) => Err(anyhow!("codec SetValue bool: {e:?}")),
+    let var: windows::core::VARIANT = value.into();
+    let hr = unsafe { codec.SetValue(key, &var) };
+    match hr {
+        Ok(()) => Ok(()),
+        Err(e) if e.code() == E_FAIL => {
+            tracing::debug!(?key, "codec-api key not supported by MFT");
+            Ok(())
         }
+        Err(e) => Err(anyhow!("codec SetValue bool: {e:?}")),
     }
 }
 
 fn set_codec_u32(codec: &ICodecAPI, key: &GUID, value: u32) -> Result<()> {
-    use windows::Win32::System::Variant::{VARIANT, VariantInit};
-    unsafe {
-        let mut var = VariantInit();
-        var.Anonymous.Anonymous.vt = windows::Win32::System::Variant::VT_UI4;
-        var.Anonymous.Anonymous.Anonymous.ulVal = value;
-        let hr = codec.SetValue(key, &var);
-        match hr {
-            Ok(()) => Ok(()),
-            Err(e) if e.code() == E_FAIL => {
-                tracing::debug!(?key, value, "codec-api key not supported by MFT");
-                Ok(())
-            }
-            Err(e) => Err(anyhow!("codec SetValue u32: {e:?}")),
+    let var: windows::core::VARIANT = value.into();
+    let hr = unsafe { codec.SetValue(key, &var) };
+    match hr {
+        Ok(()) => Ok(()),
+        Err(e) if e.code() == E_FAIL => {
+            tracing::debug!(?key, value, "codec-api key not supported by MFT");
+            Ok(())
         }
+        Err(e) => Err(anyhow!("codec SetValue u32: {e:?}")),
     }
 }
 
