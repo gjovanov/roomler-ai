@@ -61,13 +61,13 @@ use windows::Win32::Media::MediaFoundation::{
     CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncH264CABACEnable, CODECAPI_AVEncMPVGOPSize,
     CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode, ICodecAPI, IMFMediaBuffer,
     IMFMediaType, IMFSample, IMFTransform, MF_E_NOTACCEPTING, MF_E_TRANSFORM_NEED_MORE_INPUT,
-    MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
-    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MFCreateMediaType, MFCreateMemoryBuffer,
-    MFCreateSample, MFStartup, MFSTARTUP_FULL, MFShutdown, MFMediaType_Video, MFVideoFormat_H264,
-    MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFT_MESSAGE_COMMAND_FLUSH,
-    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
+    MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
+    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
+    MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFStartup, MFSTARTUP_FULL, MFShutdown,
+    MFMediaType_Video, MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
+    MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
     MFT_MESSAGE_NOTIFY_END_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
-    eAVEncCommonRateControlMode_CBR,
+    MFT_OUTPUT_STREAM_INFO, eAVEncCommonRateControlMode_CBR,
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
@@ -348,15 +348,17 @@ impl MfPipeline {
     /// Drain `ProcessOutput` until it signals `NEED_MORE_INPUT`.
     /// Collects NALU bytes from each output sample into `EncodedPacket`s.
     fn drain_output(&mut self, mut acc: Vec<EncodedPacket>) -> Result<Vec<EncodedPacket>> {
-        loop {
-            // Ask the MFT for an output buffer — we let the MFT provide
-            // its own memory buffer (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES
-            // path). For the MS H264 encoder this is always the case.
-            let output_info = unsafe { self.transform.GetOutputStreamInfo(0)? };
+        // Safety valve: the MS H.264 Encoder MFT can, in rare cases, keep
+        // emitting STREAM_CHANGE notifications if we negotiate the output
+        // type wrong. Cap the drain loop so a pathological MFT can't spin
+        // forever.
+        const MAX_ITERATIONS: u32 = 64;
+        for iter in 0..MAX_ITERATIONS {
+            let output_info: MFT_OUTPUT_STREAM_INFO =
+                unsafe { self.transform.GetOutputStreamInfo(0)? };
 
             let needs_sample = (output_info.dwFlags & 0x100) == 0; // MFT_OUTPUT_STREAM_PROVIDES_SAMPLES
             let sample_slot = if needs_sample {
-                // Allocate our own output sample + buffer.
                 let sample = unsafe { MFCreateSample()? };
                 let buffer =
                     unsafe { MFCreateMemoryBuffer(output_info.cbSize.max(1_048_576))? };
@@ -378,7 +380,6 @@ impl MfPipeline {
                 self.transform
                     .ProcessOutput(0, std::slice::from_mut(&mut output_buffer), &mut status)
             };
-            // Recover the sample the MFT produced (or the one we passed in).
             let produced: Option<IMFSample> =
                 unsafe { std::mem::ManuallyDrop::take(&mut output_buffer.pSample) };
             let _events = unsafe { std::mem::ManuallyDrop::take(&mut output_buffer.pEvents) };
@@ -386,17 +387,59 @@ impl MfPipeline {
             match rc {
                 Ok(()) => {
                     if let Some(s) = produced {
-                        if let Some(pkt) = read_packet_from_sample(&s)? {
-                            acc.push(pkt);
+                        match read_packet_from_sample(&s)? {
+                            Some(pkt) => {
+                                tracing::debug!(
+                                    bytes = pkt.data.len(),
+                                    is_keyframe = pkt.is_keyframe,
+                                    dw_status = status,
+                                    "mf ProcessOutput produced"
+                                );
+                                acc.push(pkt);
+                            }
+                            None => {
+                                tracing::debug!(
+                                    dw_status = status,
+                                    "mf ProcessOutput returned zero-byte sample"
+                                );
+                            }
                         }
+                    } else {
+                        tracing::debug!(
+                            dw_status = status,
+                            "mf ProcessOutput Ok but no sample produced"
+                        );
                     }
                 }
                 Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => {
+                    tracing::trace!(iter, "mf ProcessOutput: NEED_MORE_INPUT (drain done)");
                     return Ok(acc);
+                }
+                Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
+                    // The MFT changed its output media type (common on
+                    // the first ProcessOutput — MS H.264 Encoder MFT
+                    // renegotiates the exact profile/level once it sees
+                    // the first input). Re-query + re-apply and retry
+                    // the drain loop. Without this, every subsequent
+                    // ProcessOutput buffers input but produces zero
+                    // output — the symptom observed in 0.1.15 smoke.
+                    tracing::info!(iter, "mf ProcessOutput: STREAM_CHANGE — renegotiating output type");
+                    unsafe {
+                        let new_type = self.transform.GetOutputAvailableType(0, 0)?;
+                        self.transform.SetOutputType(0, &new_type, 0)?;
+                    }
+                    // Loop continues, retry ProcessOutput with the new
+                    // type. The MFT will now accept / produce output.
                 }
                 Err(e) => bail!("ProcessOutput: {e:?}"),
             }
+            let _ = iter; // unused in non-trace builds
         }
+        tracing::warn!(
+            iterations = MAX_ITERATIONS,
+            "mf drain_output hit iteration cap — suspect stream-change loop"
+        );
+        Ok(acc)
     }
 
     fn force_keyframe(&self) -> Result<()> {
