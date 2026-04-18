@@ -55,7 +55,7 @@ use std::thread;
 use anyhow::{Result, anyhow, bail};
 use tokio::sync::oneshot;
 
-use windows::Win32::Foundation::E_FAIL;
+use windows::Win32::Foundation::{E_FAIL, E_INVALIDARG};
 use windows::Win32::Media::MediaFoundation::{
     CLSID_MSH264EncoderMFT, CODECAPI_AVEncCommonMaxBitRate, CODECAPI_AVEncCommonMeanBitRate,
     CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncH264CABACEnable, CODECAPI_AVEncMPVGOPSize,
@@ -782,13 +782,23 @@ fn nalu_contains_idr(buf: &[u8]) -> bool {
 /// from the MFT is interpreted as "key not supported" — non-fatal,
 /// since we try to set a superset of knobs that any given driver may
 /// or may not recognise.
+/// MFT quirk: different vendors reject "unsupported codec knob"
+/// differently. MS SW MFT returns E_FAIL. Intel QSV / NVIDIA / some
+/// older Windows builds return E_INVALIDARG. Either way we don't
+/// want a single unsupported tuning knob to fail the whole init —
+/// downgrade both to a debug log.
+fn is_unsupported_codec_key_error(e: &windows::core::Error) -> bool {
+    let code = e.code();
+    code == E_FAIL || code == E_INVALIDARG
+}
+
 fn set_codec_bool(codec: &ICodecAPI, key: &GUID, value: bool) -> Result<()> {
     let var: windows::core::VARIANT = value.into();
     let hr = unsafe { codec.SetValue(key, &var) };
     match hr {
         Ok(()) => Ok(()),
-        Err(e) if e.code() == E_FAIL => {
-            tracing::debug!(?key, "codec-api key not supported by MFT");
+        Err(e) if is_unsupported_codec_key_error(&e) => {
+            tracing::debug!(?key, code = %e.code().0, "codec-api key not supported by MFT");
             Ok(())
         }
         Err(e) => Err(anyhow!("codec SetValue bool: {e:?}")),
@@ -800,8 +810,8 @@ fn set_codec_u32(codec: &ICodecAPI, key: &GUID, value: u32) -> Result<()> {
     let hr = unsafe { codec.SetValue(key, &var) };
     match hr {
         Ok(()) => Ok(()),
-        Err(e) if e.code() == E_FAIL => {
-            tracing::debug!(?key, value, "codec-api key not supported by MFT");
+        Err(e) if is_unsupported_codec_key_error(&e) => {
+            tracing::debug!(?key, value, code = %e.code().0, "codec-api key not supported by MFT");
             Ok(())
         }
         Err(e) => Err(anyhow!("codec SetValue u32: {e:?}")),
