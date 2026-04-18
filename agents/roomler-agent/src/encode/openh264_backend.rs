@@ -22,11 +22,23 @@ use tokio::sync::oneshot;
 use super::{EncodedPacket, VideoEncoder};
 use crate::capture::{Frame, PixelFormat};
 
-/// Starting bitrate target. Adaptive bitrate based on TWCC/REMB comes in a
-/// follow-up; for now the encoder runs at a fixed rate. 8 Mbps is a
-/// reasonable headroom for desktop streaming up to 1440p; at 4K SW encode
-/// we still cap at this until the downscale path lands.
-const DEFAULT_BITRATE_BPS: u32 = 8_000_000;
+/// Bitrate floor / ceiling clamps for the resolution-scaled starting rate.
+/// A fixed bitrate across all sizes (which 0.1.10 used at 8 Mbps) is either
+/// overkill or underkill at any resolution other than the one it was tuned
+/// for; we now derive from dims. Adaptive bitrate based on TWCC/REMB
+/// remains future work — this just picks a better *starting point*.
+const MIN_BITRATE_BPS: u32 = 1_000_000;
+const MAX_BITRATE_BPS: u32 = 12_000_000;
+/// Bits per pixel per second. A rough target for desktop content at 30 fps:
+/// 0.07 bpp/s gives ~6 Mbps at 1080p and ~10 Mbps at 1440p.
+const DESKTOP_BPP_PER_SECOND: f32 = 0.07;
+const TARGET_FPS: u32 = 30;
+
+fn initial_bitrate_for(width: u32, height: u32) -> u32 {
+    let pixels = width as f64 * height as f64;
+    let raw = (pixels * TARGET_FPS as f64 * DESKTOP_BPP_PER_SECOND as f64) as u32;
+    raw.clamp(MIN_BITRATE_BPS, MAX_BITRATE_BPS)
+}
 
 pub struct Openh264Encoder {
     /// Worker thread; commands go in, packets come out.
@@ -35,7 +47,7 @@ pub struct Openh264Encoder {
 
 enum Cmd {
     Encode {
-        frame: Frame,
+        frame: std::sync::Arc<Frame>,
         reply: oneshot::Sender<Result<Vec<EncodedPacket>>>,
     },
     RequestKeyframe,
@@ -54,24 +66,22 @@ impl Openh264Encoder {
         thread::Builder::new()
             .name("roomler-agent-encoder".into())
             .spawn(move || {
+                let bitrate_bps = initial_bitrate_for(width, height);
                 let init = || -> Result<Encoder> {
                     let api = openh264::OpenH264API::from_source();
-                    // Force an IDR every 60 frames (≈2 s @ 30 fps). Without a
-                    // bounded IDR interval, openh264 can go 300+ frames
-                    // between keyframes on a static desktop, which means a
-                    // single lost packet freezes the browser's decoder for
-                    // up to ~10 s. 60 gives <2 s recovery floor even if the
-                    // RTCP-PLI round-trip drops.
                     let cfg = EncoderConfig::new()
-                        .bitrate(BitRate::from_bps(DEFAULT_BITRATE_BPS as u32))
-                        // Tell openh264 the target rate so rate-control
-                        // budgets per-frame bits correctly; without this
-                        // the default fMaxFrameRate=0 makes the encoder
-                        // produce bursty, over-budget frames.
-                        .max_frame_rate(FrameRate::from_hz(30.0))
+                        .bitrate(BitRate::from_bps(bitrate_bps))
+                        .max_frame_rate(FrameRate::from_hz(TARGET_FPS as f32))
+                        // Force an IDR every 60 frames (≈2 s @ 30 fps).
+                        // Without a bounded IDR interval, openh264 can go
+                        // 300+ frames between keyframes on a static
+                        // desktop; a single lost packet then freezes the
+                        // decoder for ~10 s. 60 gives <2 s recovery floor
+                        // even if the RTCP-PLI round-trip drops.
                         .intra_frame_period(IntraFramePeriod::from_num_frames(60));
                     Encoder::with_api_config(api, cfg).map_err(|e| anyhow!("encoder init: {e}"))
                 };
+                tracing::info!(bitrate_bps, width, height, "openh264 encoder init");
 
                 let mut enc = match init() {
                     Ok(e) => {
@@ -129,7 +139,7 @@ fn encode_one(
     enc: &mut Encoder,
     width: u32,
     height: u32,
-    frame: Frame,
+    frame: std::sync::Arc<Frame>,
 ) -> Result<Vec<EncodedPacket>> {
     if frame.pixel_format != PixelFormat::Bgra {
         return Err(anyhow!(
@@ -178,7 +188,7 @@ fn encode_one(
 
 #[async_trait::async_trait]
 impl VideoEncoder for Openh264Encoder {
-    async fn encode(&mut self, frame: Frame) -> Result<Vec<EncodedPacket>> {
+    async fn encode(&mut self, frame: std::sync::Arc<Frame>) -> Result<Vec<EncodedPacket>> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.cmd_tx
             .send(Cmd::Encode { frame, reply: reply_tx })
@@ -285,12 +295,10 @@ mod tests {
     #[tokio::test]
     async fn encodes_first_frame_as_keyframe() {
         let mut enc = Openh264Encoder::new(320, 240).expect("encoder");
-        let frame = make_bgra_frame(320, 240, 100, 150, 200);
+        let frame = std::sync::Arc::new(make_bgra_frame(320, 240, 100, 150, 200));
         let packets = enc.encode(frame).await.expect("encode");
         assert!(!packets.is_empty(), "no packets produced");
-        // The first encoded frame should be a keyframe (SPS+PPS+IDR).
         assert!(packets.iter().any(|p| p.is_keyframe));
-        // Total NAL bytes should be non-trivial.
         let total: usize = packets.iter().map(|p| p.data.len()).sum();
         assert!(total > 10, "unexpectedly small bitstream: {total} bytes");
     }
@@ -300,26 +308,22 @@ mod tests {
         let mut enc = Openh264Encoder::new(64, 64).expect("encoder");
         let mut frame = make_bgra_frame(64, 64, 0, 0, 0);
         frame.pixel_format = PixelFormat::Nv12;
-        assert!(enc.encode(frame).await.is_err());
+        assert!(enc.encode(std::sync::Arc::new(frame)).await.is_err());
     }
 
     #[tokio::test]
     async fn rejects_size_mismatch() {
         let mut enc = Openh264Encoder::new(320, 240).expect("encoder");
-        let frame = make_bgra_frame(640, 480, 0, 0, 0);
+        let frame = std::sync::Arc::new(make_bgra_frame(640, 480, 0, 0, 0));
         assert!(enc.encode(frame).await.is_err());
     }
 
     #[tokio::test]
     async fn request_keyframe_is_noisy_next_frame() {
-        // Encode two frames, request a keyframe between them, assert the
-        // second frame is a keyframe. Both are actually keyframes anyway
-        // in our short stream, so we mainly want to confirm the call path
-        // is non-panicking.
         let mut enc = Openh264Encoder::new(64, 64).expect("encoder");
-        let _ = enc.encode(make_bgra_frame(64, 64, 0, 0, 0)).await.unwrap();
+        let _ = enc.encode(std::sync::Arc::new(make_bgra_frame(64, 64, 0, 0, 0))).await.unwrap();
         enc.request_keyframe();
-        let out = enc.encode(make_bgra_frame(64, 64, 255, 255, 255)).await.unwrap();
+        let out = enc.encode(std::sync::Arc::new(make_bgra_frame(64, 64, 255, 255, 255))).await.unwrap();
         assert!(!out.is_empty());
     }
 }

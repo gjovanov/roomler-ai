@@ -10,6 +10,8 @@
 //!
 //! Future backends: `nvenc` / `qsv` / `vaapi` / `videotoolbox` / `mf`.
 
+use std::sync::Arc;
+
 use anyhow::Result;
 
 use crate::capture::Frame;
@@ -26,7 +28,11 @@ pub struct EncodedPacket {
 
 #[async_trait::async_trait]
 pub trait VideoEncoder: Send {
-    async fn encode(&mut self, frame: Frame) -> Result<Vec<EncodedPacket>>;
+    /// Takes `Arc<Frame>` so the media_pump's last-good-frame cache can
+    /// share ownership with the encode call without cloning the BGRA
+    /// buffer (up to 33 MB at 4K, 8 MB at 1080p). The backend reads the
+    /// frame and doesn't need to mutate it.
+    async fn encode(&mut self, frame: Arc<Frame>) -> Result<Vec<EncodedPacket>>;
     /// Force the next frame to be a keyframe (IDR).
     fn request_keyframe(&mut self);
     /// Dynamically adjust bitrate in response to TWCC/REMB feedback.
@@ -39,7 +45,7 @@ pub struct NoopEncoder;
 
 #[async_trait::async_trait]
 impl VideoEncoder for NoopEncoder {
-    async fn encode(&mut self, _frame: Frame) -> Result<Vec<EncodedPacket>> {
+    async fn encode(&mut self, _frame: Arc<Frame>) -> Result<Vec<EncodedPacket>> {
         Ok(Vec::new())
     }
     fn request_keyframe(&mut self) {}

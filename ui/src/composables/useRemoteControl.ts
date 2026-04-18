@@ -196,18 +196,23 @@ export function useRemoteControl() {
     })
 
     pc.ontrack = (ev) => {
-      if (!remoteStream.value) remoteStream.value = new MediaStream()
-      remoteStream.value.addTrack(ev.track)
+      // Replace rather than append. addTrack accumulates across ICE
+      // restarts / renegotiations, leaving dead tracks attached to the
+      // MediaStream; the <video> element would render the wrong one.
+      // Current agent doesn't renegotiate, but if it ever does this
+      // would regress silently — replacement is idempotent for the
+      // single-track case we have today.
+      remoteStream.value = new MediaStream([ev.track])
       hasMedia.value = true
       // Tell the browser we care about latency, not playback smoothness.
       // Default jitterBufferTarget is adaptive (100-500 ms); for remote
       // control 50 ms is the right trade: cut perceived click-to-pixel
       // delay to the wire at the cost of occasional stutter under loss.
-      // NB: setter is relatively new (Chromium 116+, Firefox 123+), so
-      // feature-detect rather than crash on older browsers.
+      // Setter is Chromium 116+ / Firefox 123+ — the try/catch is the
+      // actual guard against older browsers; `in`-check was cosmetic.
       try {
-        const r = ev.receiver as RTCRtpReceiver & { jitterBufferTarget?: number | null }
-        if ('jitterBufferTarget' in r) r.jitterBufferTarget = 50
+        (ev.receiver as RTCRtpReceiver & { jitterBufferTarget?: number | null })
+          .jitterBufferTarget = 50
       } catch {
         // Best-effort — browser will use its own adaptive default.
       }
@@ -232,8 +237,12 @@ export function useRemoteControl() {
       if (!state) return
       if (state === 'connected') phase.value = 'connected'
       else if (state === 'failed') failWith('peer connection failed')
-      else if (state === 'closed' && phase.value !== 'error') {
+      else if (state === 'closed' && phase.value !== 'error' && phase.value !== 'closed') {
+        // Clean up the data channels + stream too; otherwise they leak
+        // when the PC closes without a prior disconnect() (e.g. the
+        // server-side session terminates first).
         phase.value = 'closed'
+        teardown()
       }
     }
 
@@ -314,44 +323,11 @@ export function useRemoteControl() {
     ): { x: number; y: number; insideVideo: boolean } {
       const frameRect = surface.getBoundingClientRect()
       const video = findVideo()
-      const vw = video?.videoWidth ?? 0
-      const vh = video?.videoHeight ?? 0
-
-      // Before the first decoded frame we can't know the aspect ratio —
-      // fall back to frame-relative coordinates so tests still function.
-      if (!vw || !vh) {
-        const x = (ev.clientX - frameRect.left) / Math.max(frameRect.width, 1)
-        const y = (ev.clientY - frameRect.top) / Math.max(frameRect.height, 1)
-        return { x: clamp01(x), y: clamp01(y), insideVideo: true }
-      }
-
-      // Compute the letterboxed region `object-fit: contain` produces.
-      const videoAR = vw / vh
-      const frameAR = frameRect.width / Math.max(frameRect.height, 1)
-      let visibleW: number, visibleH: number, offsetX: number, offsetY: number
-      if (videoAR > frameAR) {
-        // Wider than the frame — black bars top/bottom.
-        visibleW = frameRect.width
-        visibleH = frameRect.width / videoAR
-        offsetX = 0
-        offsetY = (frameRect.height - visibleH) / 2
-      } else {
-        // Taller than the frame — black bars left/right.
-        visibleW = frameRect.height * videoAR
-        visibleH = frameRect.height
-        offsetX = (frameRect.width - visibleW) / 2
-        offsetY = 0
-      }
-
-      const localX = ev.clientX - frameRect.left - offsetX
-      const localY = ev.clientY - frameRect.top - offsetY
-      const insideVideo =
-        localX >= 0 && localX <= visibleW && localY >= 0 && localY <= visibleH
-      return {
-        x: clamp01(localX / Math.max(visibleW, 1)),
-        y: clamp01(localY / Math.max(visibleH, 1)),
-        insideVideo,
-      }
+      return letterboxedNormalise(
+        ev.clientX, ev.clientY,
+        { left: frameRect.left, top: frameRect.top, width: frameRect.width, height: frameRect.height },
+        video?.videoWidth ?? 0, video?.videoHeight ?? 0,
+      )
     }
 
     function onPointerMove(ev: PointerEvent) {
@@ -361,10 +337,23 @@ export function useRemoteControl() {
       if (rafHandle === null) rafHandle = requestAnimationFrame(flushPendingMove)
     }
 
+    // Cancel any RAF-queued mouse_move so it can't fire *after* a click
+    // and overwrite whatever move the user does next. Without this, a
+    // fast click-then-drag can register a stale mouse_move at the click
+    // coords between the button event and the subsequent moves.
+    function cancelPendingMove() {
+      if (rafHandle !== null) {
+        cancelAnimationFrame(rafHandle)
+        rafHandle = null
+      }
+      pendingMove = null
+    }
+
     function onPointerDown(ev: PointerEvent) {
       ev.preventDefault()
       const { x, y, insideVideo } = normalisedXY(ev)
       if (!insideVideo) return
+      cancelPendingMove()
       surface.setPointerCapture(ev.pointerId)
       sendInput({ t: 'mouse_button', btn: browserButton(ev.button), down: true, x, y, mon: 0 })
     }
@@ -373,6 +362,7 @@ export function useRemoteControl() {
       try { surface.releasePointerCapture(ev.pointerId) } catch { /* noop */ }
       const { x, y, insideVideo } = normalisedXY(ev)
       if (!insideVideo) return
+      cancelPendingMove()
       sendInput({ t: 'mouse_button', btn: browserButton(ev.button), down: false, x, y, mon: 0 })
     }
 
@@ -388,13 +378,30 @@ export function useRemoteControl() {
     }
 
     function onKey(ev: KeyboardEvent, down: boolean) {
-      // Trap reserved combos so the browser doesn't navigate away.
-      ev.preventDefault()
       const code = kbdCodeToHid(ev.code)
       if (code === null) return
       const mods =
         (ev.ctrlKey ? 1 : 0) | (ev.shiftKey ? 2 : 0) | (ev.altKey ? 4 : 0) | (ev.metaKey ? 8 : 0)
+      // Whitelist-only preventDefault. The previous blanket
+      // ev.preventDefault() here swallowed Cmd+Q, Ctrl+T, Ctrl+W, F5,
+      // etc. — a real annoyance for controllers who want to e.g. quit
+      // their own browser. We only suppress defaults for keys that
+      // would otherwise navigate away from the viewer page.
+      if (shouldPreventDefault(ev)) ev.preventDefault()
       sendInput({ t: 'key', code, down, mods })
+    }
+
+    function shouldPreventDefault(ev: KeyboardEvent): boolean {
+      // Browser back/forward by default on Backspace (some browsers);
+      // Ctrl+F triggers browser find; Tab would move focus out of the
+      // viewer. These must be forwarded rather than consumed by Chrome.
+      if (ev.code === 'Tab') return true
+      if (ev.code === 'Backspace' && !ev.ctrlKey && !ev.altKey && !ev.metaKey) return true
+      // Ctrl+F (find), Ctrl+R (reload), Ctrl+W (close tab) — swallow
+      // only if the controller intends that keystroke to reach the
+      // remote; for now we don't forward them at all so leave defaults
+      // alone (user gets the browser behaviour).
+      return false
     }
     const onKeyDown = (e: KeyboardEvent) => onKey(e, true)
     const onKeyUp = (e: KeyboardEvent) => onKey(e, false)
@@ -499,6 +506,58 @@ function kbdCodeToHid(code: string): number | null {
     if (n >= 1 && n <= 12) return 0x3a + n - 1
   }
   return null
+}
+
+/**
+ * Pure helper: given a pointer clientX/clientY, the .video-frame bounding
+ * rect, and the `<video>` element's intrinsic videoWidth/videoHeight,
+ * return [0,1]-normalised coordinates relative to the *visible video
+ * content* (accounting for the letterbox that `object-fit: contain`
+ * produces when viewer and agent aspect ratios differ) plus a boolean
+ * indicating whether the pointer is inside the visible region.
+ *
+ * Extracted so the math is unit-testable without a DOM.
+ */
+export function letterboxedNormalise(
+  clientX: number,
+  clientY: number,
+  frame: { left: number; top: number; width: number; height: number },
+  videoWidth: number,
+  videoHeight: number,
+): { x: number; y: number; insideVideo: boolean } {
+  const clamp01 = (n: number) => Math.min(Math.max(n, 0), 1)
+
+  if (!videoWidth || !videoHeight || !frame.width || !frame.height) {
+    // No aspect ratio yet — fall back to frame-relative coords.
+    const x = (clientX - frame.left) / Math.max(frame.width, 1)
+    const y = (clientY - frame.top) / Math.max(frame.height, 1)
+    return { x: clamp01(x), y: clamp01(y), insideVideo: true }
+  }
+
+  const videoAR = videoWidth / videoHeight
+  const frameAR = frame.width / frame.height
+  let visibleW: number, visibleH: number, offsetX: number, offsetY: number
+  if (videoAR > frameAR) {
+    visibleW = frame.width
+    visibleH = frame.width / videoAR
+    offsetX = 0
+    offsetY = (frame.height - visibleH) / 2
+  } else {
+    visibleW = frame.height * videoAR
+    visibleH = frame.height
+    offsetX = (frame.width - visibleW) / 2
+    offsetY = 0
+  }
+
+  const localX = clientX - frame.left - offsetX
+  const localY = clientY - frame.top - offsetY
+  const insideVideo =
+    localX >= 0 && localX <= visibleW && localY >= 0 && localY <= visibleH
+  return {
+    x: clamp01(localX / Math.max(visibleW, 1)),
+    y: clamp01(localY / Math.max(visibleH, 1)),
+    insideVideo,
+  }
 }
 
 export { browserButton, kbdCodeToHid }

@@ -183,19 +183,20 @@ pub fn dispatch_controller_rc(
     if let Err(e) = hub.dispatch(&ctx, parsed) {
         warn!(%user_id, %e, "rc:* dispatch failed (controller)");
         // Surface the failure to the controller so the UI can exit its
-        // "Requesting session…" spinner instead of hanging. `code` is the
-        // Error variant name, `message` is Display. Silently best-effort —
+        // "Requesting session…" spinner instead of hanging. Best-effort —
         // the controller may already be closing.
-        let code = error_code(&e);
         let _ = controller_tx.try_send(ServerMsg::Error {
-            session_id: None,
-            code: code.to_string(),
+            session_id: error_session_id(&e),
+            code: error_code(&e).to_string(),
             message: e.to_string(),
         });
     }
     true
 }
 
+/// Stable short code for the wire. Exhaustive match so a new
+/// `remote_control::Error` variant triggers a compile error here rather
+/// than silently being reported as "internal".
 fn error_code(e: &roomler_ai_remote_control::Error) -> &'static str {
     use roomler_ai_remote_control::Error::*;
     match e {
@@ -209,6 +210,20 @@ fn error_code(e: &roomler_ai_remote_control::Error) -> &'static str {
         PermissionDenied(_) => "permission_denied",
         BadMessage(_)       => "bad_message",
         SendFailed          => "send_failed",
-        _                   => "internal",
+        Mongo(_)            => "internal",
+        Bson(_)             => "internal",
+        Json(_)             => "internal",
+    }
+}
+
+/// If the underlying error references a specific session, extract its id
+/// so the controller UI can route the error to the right spinner instead
+/// of assuming it's about the most recently attempted session.
+fn error_session_id(e: &roomler_ai_remote_control::Error) -> Option<bson::oid::ObjectId> {
+    use roomler_ai_remote_control::Error::*;
+    match e {
+        SessionNotFound(hex) => bson::oid::ObjectId::parse_str(hex).ok(),
+        BadPhase(hex, _)     => bson::oid::ObjectId::parse_str(hex).ok(),
+        _                    => None,
     }
 }

@@ -94,12 +94,16 @@ impl ScrapCapture {
     pub fn height(&self) -> u32 { self.height }
 }
 
-/// When the source is this wide or wider, downsample 2× before handing
-/// the frame to the encoder. Software openh264 at 4K SW encode caps out
-/// around 6–12 fps on a typical desktop CPU; halving each dimension cuts
-/// pixel work by 4× and typically brings us back to 25–30 fps, which
-/// matters far more for perceived smoothness than the extra detail.
-const DOWNSCALE_TRIGGER_WIDTH: u32 = 2561;
+/// Downsample 2× when the source has more pixels than this threshold.
+/// Software openh264 at 4K SW encode caps out around 6–12 fps on a
+/// typical desktop CPU; halving each dimension cuts pixel work by 4×
+/// and typically brings us back to 25–30 fps, which matters far more
+/// for perceived smoothness than the extra detail.
+///
+/// Measured in pixels (not width) so QHD 2560×1440 panels (3.7 Mpx)
+/// trigger the downscale as well — an earlier width-only threshold
+/// missed them because QHD width=2560 fell under the 2561 cutoff.
+const DOWNSCALE_TRIGGER_PIXELS: u64 = 3_500_000;
 
 fn capture_one_blocking(
     cap: &mut Capturer,
@@ -115,8 +119,9 @@ fn capture_one_blocking(
             Ok(buf) => {
                 let stride = (buf.len() as u32) / height.max(1);
                 let monotonic_us = start.elapsed().as_micros() as u64;
+                let pixel_count = u64::from(width) * u64::from(height);
                 let (data, out_w, out_h, out_stride) =
-                    if width >= DOWNSCALE_TRIGGER_WIDTH && height >= 2 && width >= 2 {
+                    if pixel_count >= DOWNSCALE_TRIGGER_PIXELS && width >= 2 && height >= 2 {
                         let (dst, dw, dh) = downscale_bgra_2x(&buf, width, height, stride);
                         (dst, dw, dh, dw * 4)
                     } else {
