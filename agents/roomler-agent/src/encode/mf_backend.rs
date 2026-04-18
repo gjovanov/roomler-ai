@@ -298,14 +298,21 @@ impl MfPipeline {
 
             // Hand the DXGI manager to the MFT. ulparam is the raw
             // IUnknown pointer cast to usize per the MF contract.
-            // Hardware MFTs require this BEFORE any SetInputType /
-            // SetOutputType; sync SW MFTs accept it as a no-op.
-            let manager_ptr: usize =
-                d3d_manager.as_raw() as usize;
-            transform
-                .ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager_ptr)
-                .map_err(|e| anyhow!("SET_D3D_MANAGER: {e:?}"))?;
-            tracing::info!("mf-encoder: D3D manager handed to MFT");
+            // Hardware MFTs (NVENC, Intel QSV, AMF) REQUIRE this
+            // handoff before they produce output. Pure-SW MFTs and
+            // the WARP-path variant on CI return E_NOTIMPL; that's
+            // fine — they simply don't use D3D at all. Non-fatal
+            // either way.
+            let manager_ptr: usize = d3d_manager.as_raw() as usize;
+            match transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager_ptr) {
+                Ok(()) => tracing::info!("mf-encoder: D3D manager handed to MFT"),
+                Err(e) => {
+                    tracing::info!(
+                        code = %e.code().0,
+                        "mf-encoder: MFT rejected D3D manager (likely a pure-SW path) — continuing without it"
+                    );
+                }
+            }
 
             // Detect + tame async mode. On systems with hardware H.264
             // acceleration (NVIDIA, Intel QSV, AMD AMF), the MS encoder
