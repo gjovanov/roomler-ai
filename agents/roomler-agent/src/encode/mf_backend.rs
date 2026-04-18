@@ -56,6 +56,14 @@ use anyhow::{Result, anyhow, bail};
 use tokio::sync::oneshot;
 
 use windows::Win32::Foundation::{E_FAIL, E_INVALIDARG};
+use windows::Win32::Graphics::Direct3D::{
+    D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_10_1,
+    D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
+};
+use windows::Win32::Graphics::Direct3D11::{
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION,
+    D3D11CreateDevice, ID3D11Device, ID3D11Multithread,
+};
 use windows::Win32::Media::MediaFoundation::{
     CLSID_MSH264EncoderMFT, CODECAPI_AVEncCommonMaxBitRate, CODECAPI_AVEncCommonMeanBitRate,
     CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncH264CABACEnable, CODECAPI_AVEncMPVGOPSize,
@@ -64,14 +72,15 @@ use windows::Win32::Media::MediaFoundation::{
     MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_AVG_BITRATE,
     MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
     MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK,
-    MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFStartup, MFSTARTUP_FULL, MFShutdown,
-    MFMediaType_Video, MFTEnumEx, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE,
-    MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT, MFT_FRIENDLY_NAME_Attribute,
-    MFT_REGISTER_TYPE_INFO, MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
-    MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
-    MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_END_STREAMING,
-    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_INFO,
-    eAVEncCommonRateControlMode_CBR, eAVEncCommonRateControlMode_LowDelayVBR,
+    MFCreateDXGIDeviceManager, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFStartup,
+    MFSTARTUP_FULL, MFShutdown, MFMediaType_Video, MFTEnumEx, MFT_CATEGORY_VIDEO_ENCODER,
+    MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT,
+    MFT_FRIENDLY_NAME_Attribute, MFT_REGISTER_TYPE_INFO, MFVideoFormat_H264, MFVideoFormat_NV12,
+    MFVideoInterlace_Progressive, IMFDXGIDeviceManager, MFT_MESSAGE_COMMAND_FLUSH,
+    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
+    MFT_MESSAGE_NOTIFY_END_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER,
+    MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_INFO, eAVEncCommonRateControlMode_CBR,
+    eAVEncCommonRateControlMode_LowDelayVBR,
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
@@ -105,6 +114,16 @@ enum Cmd {
 struct MfPipeline {
     transform: IMFTransform,
     codec_api: ICodecAPI,
+    /// D3D11 device + DXGI manager kept alive for the MFT's lifetime.
+    /// Hardware MFTs (NVIDIA NVENC, Intel QSV, AMD AMF) and
+    /// CLSID_MSH264EncoderMFT on a box with HW acceleration drivers
+    /// installed require this handoff before they'll produce output.
+    /// Without it NVENC ActivateObject returns 0x8000FFFF and the MS
+    /// MFT silently returns NEED_MORE_INPUT forever. The device must
+    /// outlive the transform — dropping it early would leave the MFT
+    /// holding a dangling manager reference.
+    _d3d_device: Option<ID3D11Device>,
+    _d3d_manager: Option<IMFDXGIDeviceManager>,
     width: u32,
     height: u32,
     frame_count: u64,
@@ -258,25 +277,35 @@ impl MfPipeline {
             // one is available. There's no separate "HW only" CLSID
             // in v1 — MFTEnumEx with MFT_ENUM_FLAG_HARDWARE is the
             // path to vendor-specific MFTs (phase 3).
-            // SW-only for now. Phase-2 work will wire HW MFTs via
-            // `activate_h264_encoder()` which already enumerates them
-            // via MFTEnumEx — the enumeration is correct, but the
-            // activation of vendor HW MFTs requires:
-            //   - NVIDIA: IMFDXGIDeviceManager set on the MFT before
-            //     activation (ActivateObject returns 0x8000FFFF
-            //     without it)
-            //   - Intel QSV / AMD AMF: full async event loop
-            //     (METransformNeedInput / METransformHaveOutput) —
-            //     the MFTs self-configure as async regardless of
-            //     the SYNCMFT enumeration flag
-            // Both are follow-up phases. Until then we use the MS SW
-            // MFT which is sync and works out of the box; we rely on
-            // the capture-layer 2× downscale to hit 30 fps at 1080p.
-            let transform: IMFTransform =
-                CoCreateInstance(&CLSID_MSH264EncoderMFT, None, CLSCTX_INPROC_SERVER)
-                    .map_err(|e| anyhow!("CoCreateInstance MSH264Encoder: {e:?}"))?;
-            let backend_kind = "sw";
-            tracing::info!(backend = backend_kind, "mf-encoder: activated MFT (sw, phase 1)");
+            // Phase 2: create a D3D11 device + DXGI manager first so
+            // the subsequent MFT activation has something to bind to.
+            // Required by NVIDIA H.264 Encoder MFT (without it
+            // ActivateObject returns 0x8000FFFF), and also by the MS
+            // MFT when it routes through a vendor HW driver — the
+            // user's box (NVIDIA + Intel installed) silently refuses
+            // to produce output from the "SW" MFT because it's
+            // actually routing to HW internally and needs D3D11.
+            let (d3d_device, d3d_manager) =
+                create_d3d11_device_and_manager().map_err(|e| {
+                    anyhow!("mf-encoder: D3D11 + DXGI manager init failed: {e:?}")
+                })?;
+
+            // Try hardware-enumerated MFT first, fall back to SW MFT.
+            // With D3D11 bound, NVIDIA / Intel QSV / AMD AMF should
+            // now activate cleanly.
+            let (transform, backend_kind) = activate_h264_encoder()?;
+            tracing::info!(backend = backend_kind, "mf-encoder: activated MFT");
+
+            // Hand the DXGI manager to the MFT. ulparam is the raw
+            // IUnknown pointer cast to usize per the MF contract.
+            // Hardware MFTs require this BEFORE any SetInputType /
+            // SetOutputType; sync SW MFTs accept it as a no-op.
+            let manager_ptr: usize =
+                d3d_manager.as_raw() as usize;
+            transform
+                .ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager_ptr)
+                .map_err(|e| anyhow!("SET_D3D_MANAGER: {e:?}"))?;
+            tracing::info!("mf-encoder: D3D manager handed to MFT");
 
             // Detect + tame async mode. On systems with hardware H.264
             // acceleration (NVIDIA, Intel QSV, AMD AMF), the MS encoder
@@ -366,6 +395,8 @@ impl MfPipeline {
             Ok(Self {
                 transform,
                 codec_api,
+                _d3d_device: Some(d3d_device),
+                _d3d_manager: Some(d3d_manager),
                 width,
                 height,
                 frame_count: 0,
@@ -546,6 +577,64 @@ impl MfPipeline {
 // ---------------------------------------------------------------------
 // Helpers (all unsafe-COM, kept in one place for easier auditing).
 // ---------------------------------------------------------------------
+
+/// Create a D3D11 device suitable for MF hardware-accelerated video
+/// encoding, wrap it in an IMFDXGIDeviceManager, return both. The
+/// device needs BGRA_SUPPORT (our input) + VIDEO_SUPPORT (HW video
+/// codec access) + multithread protection (MF worker threads call
+/// into the device outside our control).
+///
+/// Feature-level list starts at 11_1 and falls back through 11_0,
+/// 10_1, 10_0. Anything below 10_0 can't run MF video encoders.
+fn create_d3d11_device_and_manager() -> Result<(ID3D11Device, IMFDXGIDeviceManager)> {
+    unsafe {
+        let feature_levels = [
+            D3D_FEATURE_LEVEL_11_1,
+            D3D_FEATURE_LEVEL_11_0,
+            D3D_FEATURE_LEVEL_10_1,
+            D3D_FEATURE_LEVEL_10_0,
+        ];
+        let mut device: Option<ID3D11Device> = None;
+        let mut actual_level = D3D_FEATURE_LEVEL_11_0;
+        D3D11CreateDevice(
+            None, // default adapter
+            D3D_DRIVER_TYPE_HARDWARE,
+            windows::Win32::Foundation::HMODULE::default(),
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+            Some(&feature_levels),
+            D3D11_SDK_VERSION,
+            Some(&mut device),
+            Some(&mut actual_level),
+            None, // no immediate context needed here
+        )
+        .map_err(|e| anyhow!("D3D11CreateDevice: {e:?}"))?;
+        let device = device.ok_or_else(|| anyhow!("D3D11CreateDevice: null device"))?;
+
+        // Make the device multithread-protected: MF spins its own
+        // worker threads that call methods on the D3D device
+        // concurrently with ours; without this MF will hit undefined
+        // behaviour under contention.
+        let mt: ID3D11Multithread = device.cast().map_err(|e| {
+            anyhow!("ID3D11Multithread cast: {e:?}")
+        })?;
+        mt.SetMultithreadProtected(true);
+
+        let mut reset_token: u32 = 0;
+        let mut mgr: Option<IMFDXGIDeviceManager> = None;
+        MFCreateDXGIDeviceManager(&mut reset_token, &mut mgr)
+            .map_err(|e| anyhow!("MFCreateDXGIDeviceManager: {e:?}"))?;
+        let mgr = mgr.ok_or_else(|| anyhow!("MFCreateDXGIDeviceManager: null"))?;
+        mgr.ResetDevice(&device, reset_token)
+            .map_err(|e| anyhow!("IMFDXGIDeviceManager::ResetDevice: {e:?}"))?;
+
+        tracing::info!(
+            level = actual_level.0,
+            reset_token,
+            "mf-encoder: D3D11 device + DXGI manager created"
+        );
+        Ok((device, mgr))
+    }
+}
 
 /// Activate the best-available H.264 encoder MFT. Tries hardware first
 /// (MFTEnumEx with MFT_ENUM_FLAG_HARDWARE — finds NVENC on NVIDIA,

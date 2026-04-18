@@ -55,13 +55,18 @@ fn downscale_for(pref: encode::EncoderPreference) -> capture::DownscalePolicy {
         encode::EncoderPreference::Software => capture::DownscalePolicy::Auto,
         encode::EncoderPreference::Hardware => capture::DownscalePolicy::Never,
         encode::EncoderPreference::Auto => {
-            // TODO: when true HW encoder activation lands (NVENC via
-            // D3D11, Intel QSV via async event loop), flip this back
-            // to Never so the HW encoder sees native 4K. For now even
-            // the mf-encoder path falls back to the MS SW MFT, which
-            // at 4K maxes out around 10 fps — the 2× downsample is
-            // the only way to hit 30 fps.
-            capture::DownscalePolicy::Auto
+            // With the D3D11+DXGI manager wired in (phase 2), the MF
+            // backend can drive hardware encoders at native 4K. On
+            // Windows with mf-encoder compiled in we trust the HW
+            // path and skip the 2× downsample. If init bails all the
+            // way back to openh264, capture will be native-res going
+            // into SW encode — slower, but the session still works
+            // and the user gets a visible warning they can react to.
+            if cfg!(all(target_os = "windows", feature = "mf-encoder")) {
+                capture::DownscalePolicy::Never
+            } else {
+                capture::DownscalePolicy::Auto
+            }
         }
     }
 }
