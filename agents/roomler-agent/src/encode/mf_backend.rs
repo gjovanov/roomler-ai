@@ -55,19 +55,19 @@ use std::thread;
 use anyhow::{Result, anyhow, bail};
 use tokio::sync::oneshot;
 
-use windows::Win32::Foundation::{E_FAIL, S_OK};
+use windows::Win32::Foundation::E_FAIL;
 use windows::Win32::Media::MediaFoundation::{
-    CLSID_CMSH264EncoderMFT, CODECAPI_AVEncCommonMeanBitRate,
+    CLSID_MSH264EncoderMFT, CODECAPI_AVEncCommonMeanBitRate,
     CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncH264CABACEnable, CODECAPI_AVEncMPVGOPSize,
     CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode, ICodecAPI, IMFMediaBuffer,
-    IMFMediaType, IMFSample, IMFTransform, MF_E_INVALIDMEDIATYPE, MF_E_NOTACCEPTING,
-    MF_E_TRANSFORM_NEED_MORE_INPUT, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
-    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
-    MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFStartup, MFSTARTUP_FULL, MFShutdown,
-    MFMediaType_Video, MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
-    MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
+    IMFMediaType, IMFSample, IMFTransform, MF_E_NOTACCEPTING, MF_E_TRANSFORM_NEED_MORE_INPUT,
+    MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
+    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MFCreateMediaType, MFCreateMemoryBuffer,
+    MFCreateSample, MFStartup, MFSTARTUP_FULL, MFShutdown, MFMediaType_Video, MFVideoFormat_H264,
+    MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFT_MESSAGE_COMMAND_FLUSH,
+    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
     MFT_MESSAGE_NOTIFY_END_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
-    MFT_OUTPUT_STREAM_INFO, eAVEncCommonRateControlMode_CBR,
+    eAVEncCommonRateControlMode_CBR,
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
@@ -254,7 +254,7 @@ impl MfPipeline {
             // in v1 — MFTEnumEx with MFT_ENUM_FLAG_HARDWARE is the
             // path to vendor-specific MFTs (phase 3).
             let transform: IMFTransform =
-                CoCreateInstance(&CLSID_CMSH264EncoderMFT, None, CLSCTX_INPROC_SERVER)
+                CoCreateInstance(&CLSID_MSH264EncoderMFT, None, CLSCTX_INPROC_SERVER)
                     .map_err(|e| anyhow!("CoCreateInstance MSH264Encoder: {e:?}"))?;
 
             // Set output type first (required by the MFT contract).
@@ -352,8 +352,7 @@ impl MfPipeline {
             // Ask the MFT for an output buffer — we let the MFT provide
             // its own memory buffer (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES
             // path). For the MS H264 encoder this is always the case.
-            let mut output_info = MFT_OUTPUT_STREAM_INFO::default();
-            unsafe { self.transform.GetOutputStreamInfo(0, &mut output_info)? };
+            let output_info = unsafe { self.transform.GetOutputStreamInfo(0)? };
 
             let needs_sample = (output_info.dwFlags & 0x100) == 0; // MFT_OUTPUT_STREAM_PROVIDES_SAMPLES
             let sample_slot = if needs_sample {
@@ -504,8 +503,7 @@ unsafe fn build_input_sample(nv12: &[u8], frame_index: u64) -> Result<IMFSample>
 /// MFT handed us a format-change notification).
 fn read_packet_from_sample(sample: &IMFSample) -> Result<Option<EncodedPacket>> {
     unsafe {
-        let mut total_len: u32 = 0;
-        sample.GetTotalLength(&mut total_len)?;
+        let total_len: u32 = sample.GetTotalLength()?;
         if total_len == 0 {
             return Ok(None);
         }
