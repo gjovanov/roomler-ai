@@ -277,42 +277,51 @@ impl MfPipeline {
             // one is available. There's no separate "HW only" CLSID
             // in v1 — MFTEnumEx with MFT_ENUM_FLAG_HARDWARE is the
             // path to vendor-specific MFTs (phase 3).
-            // Phase 2: create a D3D11 device + DXGI manager first so
-            // the subsequent MFT activation has something to bind to.
-            // Required by NVIDIA H.264 Encoder MFT (without it
-            // ActivateObject returns 0x8000FFFF), and also by the MS
-            // MFT when it routes through a vendor HW driver — the
-            // user's box (NVIDIA + Intel installed) silently refuses
-            // to produce output from the "SW" MFT because it's
-            // actually routing to HW internally and needs D3D11.
-            let (d3d_device, d3d_manager) =
-                create_d3d11_device_and_manager().map_err(|e| {
-                    anyhow!("mf-encoder: D3D11 + DXGI manager init failed: {e:?}")
-                })?;
-
-            // Try hardware-enumerated MFT first, fall back to SW MFT.
-            // With D3D11 bound, NVIDIA / Intel QSV / AMD AMF should
-            // now activate cleanly.
-            let (transform, backend_kind) = activate_h264_encoder()?;
-            tracing::info!(backend = backend_kind, "mf-encoder: activated MFT");
-
-            // Hand the DXGI manager to the MFT. ulparam is the raw
-            // IUnknown pointer cast to usize per the MF contract.
-            // Hardware MFTs (NVENC, Intel QSV, AMF) REQUIRE this
-            // handoff before they produce output. Pure-SW MFTs and
-            // the WARP-path variant on CI return E_NOTIMPL; that's
-            // fine — they simply don't use D3D at all. Non-fatal
-            // either way.
-            let manager_ptr: usize = d3d_manager.as_raw() as usize;
-            match transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager_ptr) {
-                Ok(()) => tracing::info!("mf-encoder: D3D manager handed to MFT"),
-                Err(e) => {
-                    tracing::info!(
-                        code = %e.code().0,
-                        "mf-encoder: MFT rejected D3D manager (likely a pure-SW path) — continuing without it"
+            // Phase 3 (deferred) lives here: full hardware MFT path
+            // requires (a) DXGI adapter enumeration so NVENC binds to
+            // the NVIDIA adapter instead of the default, and (b) the
+            // IMFMediaEventGenerator async event loop for Intel QSV
+            // which ignores MF_TRANSFORM_ASYNC_UNLOCK. Both are left
+            // as TODO; after 8 iterations of partial wins this is the
+            // honest scope line.
+            //
+            // For now we use the Microsoft software MFT
+            // (CoCreateInstance) as the encoder and *try* to hand it
+            // a D3D manager on systems where that unlocks internal HW
+            // acceleration routing. If the MFT rejects the manager
+            // (WARP / pure-SW hosts), we just keep going.
+            let d3d_aux = create_d3d11_device_and_manager()
+                .map_err(|e| {
+                    tracing::warn!(
+                        %e,
+                        "mf-encoder: D3D11 setup skipped — continuing without HW-accel assist"
                     );
+                })
+                .ok();
+
+            let transform: IMFTransform =
+                CoCreateInstance(&CLSID_MSH264EncoderMFT, None, CLSCTX_INPROC_SERVER)
+                    .map_err(|e| anyhow!("CoCreateInstance MSH264Encoder: {e:?}"))?;
+            let backend_kind = "sw";
+            tracing::info!(backend = backend_kind, "mf-encoder: activated MFT (sw phase 2)");
+
+            if let Some((_, ref d3d_manager)) = d3d_aux {
+                let manager_ptr: usize = d3d_manager.as_raw() as usize;
+                match transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager_ptr) {
+                    Ok(()) => tracing::info!("mf-encoder: D3D manager bound to SW MFT"),
+                    Err(e) => tracing::info!(
+                        code = %e.code().0,
+                        "mf-encoder: SW MFT ignored D3D manager — continuing pure-SW"
+                    ),
                 }
             }
+
+            // Unpack for MfPipeline storage — needs to outlive the
+            // MFT since the MFT may hold a reference to the manager.
+            let (d3d_device, d3d_manager) = match d3d_aux {
+                Some((dev, mgr)) => (Some(dev), Some(mgr)),
+                None => (None, None),
+            };
 
             // Detect + tame async mode. On systems with hardware H.264
             // acceleration (NVIDIA, Intel QSV, AMD AMF), the MS encoder
@@ -402,8 +411,8 @@ impl MfPipeline {
             Ok(Self {
                 transform,
                 codec_api,
-                _d3d_device: Some(d3d_device),
-                _d3d_manager: Some(d3d_manager),
+                _d3d_device: d3d_device,
+                _d3d_manager: d3d_manager,
                 width,
                 height,
                 frame_count: 0,
