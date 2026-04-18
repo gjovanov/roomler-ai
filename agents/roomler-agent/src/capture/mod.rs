@@ -38,6 +38,25 @@ pub enum PixelFormat {
     I420,
 }
 
+/// Whether the capture layer should downscale high-resolution sources
+/// before handing frames to the encoder.
+///
+/// - `Auto`: the backend picks — scrap currently triggers a 2× box
+///   downsample above ~3.5 Mpx because software openh264 can't keep up
+///   at native 4K.
+/// - `Always`: force the 2× downsample regardless of source size
+///   (reserved for debugging / low-bandwidth modes).
+/// - `Never`: always send native resolution. Use this only when the
+///   chosen encoder can sustain the source rate — MF / NVENC / VAAPI
+///   handle 4K fine; openh264 software does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DownscalePolicy {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
 #[async_trait::async_trait]
 pub trait ScreenCapture: Send {
     async fn next_frame(&mut self) -> Result<Option<Frame>>;
@@ -63,10 +82,18 @@ impl ScreenCapture for NoopCapture {
 /// Open the best-available capture backend for the current host. Falls
 /// back to [`NoopCapture`] if no display is reachable or the crate was
 /// built without a capture backend feature.
-pub fn open_default(_target_fps: u32) -> Box<dyn ScreenCapture> {
+///
+/// `downscale` controls whether the backend runs its 2× box filter on
+/// high-resolution sources. Pass `DownscalePolicy::Never` when a
+/// hardware encoder is handling the frame; pass `Auto` (the default)
+/// when the encoder is software openh264.
+pub fn open_default(
+    _target_fps: u32,
+    _downscale: DownscalePolicy,
+) -> Box<dyn ScreenCapture> {
     #[cfg(feature = "scrap-capture")]
     {
-        match scrap_backend::ScrapCapture::primary(_target_fps) {
+        match scrap_backend::ScrapCapture::primary(_target_fps, _downscale) {
             Ok(c) => return Box::new(c),
             Err(e) => {
                 tracing::warn!(%e, "scrap capture unavailable — falling back to NoopCapture");

@@ -503,3 +503,97 @@ That's ~16 weeks for a properly hardened v1, which is in the right ballpark for 
 2. Should an in-progress remote control session be **shareable into a roomler call** as a screen share automatically? The plumbing supports it; it's a UX call.
 3. **Recording storage**: piggyback on the existing MinIO setup, or push to S3-compatible per-org bucket? Existing MinIO is fine for v1.
 4. **Mobile controller** keyboard UX is genuinely hard (no physical keys, lots of host-OS shortcuts to send). v1 should be view + tap-to-click only on mobile, full input on desktop browsers.
+
+## 17. Hardware encoder backends
+
+### Backend cascade
+
+The agent's `encode::open_default(width, height, preference)` picks a
+video encoder backend in this order:
+
+| `preference` | Order tried |
+|---|---|
+| `Auto` (default) | Windows MF → openh264 → Noop |
+| `Hardware` | Windows MF (required) → openh264 (fallback) → Noop |
+| `Software` | openh264 → Noop |
+
+On non-Windows hosts, `Auto` and `Hardware` both fall straight through
+to openh264 until we add VideoToolbox / VAAPI / NVENC backends in a
+later phase.
+
+The *first* backend that successfully initialises wins. Selection is
+logged at INFO on startup:
+
+    INFO encoder selected: mf-h264 (hardware) width=1920 height=1080
+
+The chosen backend also appears on every `media pump heartbeat` line
+so it's visible in production logs without grepping startup alone.
+
+### Per-session downscale behaviour
+
+The capture layer runs a 2× box downsample on sources above ~3.5 Mpx
+when (and only when) openh264 is the active encoder — at native 4K
+the SW encoder caps out around 6-12 fps. Hardware encoders eat 4K
+frames fine, so the capture layer skips the downsample when MF / a
+future HW backend is selected. Logged at pump start:
+
+    INFO media pump starting encoder_preference=Auto downscale=Never
+
+### Configuration
+
+Three places, in decreasing priority:
+
+1. **CLI flag**: `roomler-agent run --encoder hardware` (also accepts
+   `auto`, `software`, `hw`, `sw`, `mf`, `openh264`).
+2. **Env var**: `ROOMLER_AGENT_ENCODER=hardware`. Mostly for
+   systemd-user / Task Scheduler entries where editing the TOML is
+   less convenient.
+3. **Config file** (`config.toml`): `encoder_preference = "hardware"`.
+
+Invalid values fall through to `Auto` with a warning — a typo can
+never prevent the agent from starting.
+
+### Operator escape hatch
+
+If a specific driver produces visibly worse output at our
+resolution-scaled bitrate target (observed so far on some older Intel
+iGPUs at 1440p), set `encoder_preference = "software"` and the
+cascade skips MF entirely. This is reversible without re-enrolling.
+
+### Known-bad driver notes (seed list, contributions welcome)
+
+Verification priority order: NVIDIA first, Intel iGPU second, AMD third.
+
+| Vendor | Driver | Symptom | Workaround |
+|---|---|---|---|
+| NVIDIA | *(placeholder — no issues seen yet)* | | |
+| Intel iGPU | *(placeholder — HD Graphics 630 and older have been flaky at low bitrates in the wider MF community; we have not yet reproduced)* | | `encoder_preference = "software"` |
+| AMD | *(placeholder — no issues seen yet)* | | |
+
+Each entry should link to a heartbeat-log snippet + reproduction steps
+when filed.
+
+### Smoke test
+
+Release builds run `roomler-agent encoder-smoke --encoder hardware`
+as part of the Windows CI job. The test opens the preferred encoder at
+640×480, feeds ten synthetic frames, and fails the build if no
+keyframe comes out or the cascade bottoms out at `NoopEncoder`.
+
+To reproduce locally:
+
+    cargo build -p roomler-agent --release --features full-hw
+    target\release\roomler-agent.exe encoder-smoke --encoder hardware
+
+### Future phases
+
+Documented only, not yet implemented:
+
+- **Phase 2**: Chain `CLSID_VideoProcessorMFT` upstream so BGRA→NV12
+  happens on the GPU (eliminates the remaining CPU colour-conversion
+  tax at 4K).
+- **Phase 2**: DXGI Desktop Duplication capture backend that keeps
+  frames as D3D11 textures end-to-end — removes the 900 MB/s of
+  memory bandwidth we currently push at native 4K.
+- **Phase 3**: NVENC (NVIDIA-specific fast path, better quality per
+  bit), AMF (AMD-specific), VideoToolbox (macOS), VAAPI (Linux).

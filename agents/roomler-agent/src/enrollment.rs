@@ -70,6 +70,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         tenant_id: body.tenant_id,
         machine_id: inputs.machine_id.to_string(),
         machine_name: inputs.machine_name.to_string(),
+        encoder_preference: crate::config::EncoderPreferenceChoice::default(),
     })
 }
 

@@ -46,6 +46,30 @@ use crate::input;
 /// how fast the capturer emits frames.
 const TARGET_FPS: u32 = 30;
 
+/// Pick the capture downscale policy consistent with an encoder
+/// preference. HW encoders can eat 4K frames without breaking a sweat;
+/// SW openh264 needs the 2× downsample to stay above ~30 fps at 1080p,
+/// and can barely do 10 fps at native 4K without it.
+fn downscale_for(pref: encode::EncoderPreference) -> capture::DownscalePolicy {
+    match pref {
+        encode::EncoderPreference::Software => capture::DownscalePolicy::Auto,
+        encode::EncoderPreference::Hardware => capture::DownscalePolicy::Never,
+        encode::EncoderPreference::Auto => {
+            // If a HW backend is compiled in on this platform we optimistically
+            // bet on it. When Auto + HW probe fails at runtime the encoder
+            // cascade falls back to openh264 — which then has to swallow
+            // native-resolution frames. Acceptable in a debug/fallback
+            // scenario; operators who know their driver is bad should set
+            // `encoder_preference = software` explicitly.
+            if cfg!(all(target_os = "windows", feature = "mf-encoder")) {
+                capture::DownscalePolicy::Never
+            } else {
+                capture::DownscalePolicy::Auto
+            }
+        }
+    }
+}
+
 pub struct AgentPeer {
     pc: Arc<RTCPeerConnection>,
     session_id: bson::oid::ObjectId,
@@ -62,6 +86,7 @@ impl AgentPeer {
         session_id: bson::oid::ObjectId,
         ice_servers: &[IceServer],
         outbound: mpsc::Sender<ClientMsg>,
+        encoder_preference: encode::EncoderPreference,
     ) -> Result<Self> {
         let mut engine = MediaEngine::default();
         engine
@@ -240,7 +265,12 @@ impl AgentPeer {
         // Start the capture→encode→track pump. The pump is self-regulating:
         // with no capture backend compiled in, open_default returns a Noop
         // that parks forever, producing no samples.
-        let pump = tokio::spawn(media_pump(session_id, video_track, keyframe_requested));
+        let pump = tokio::spawn(media_pump(
+            session_id,
+            video_track,
+            keyframe_requested,
+            encoder_preference,
+        ));
 
         Ok(Self {
             pc,
@@ -305,8 +335,23 @@ async fn media_pump(
     session_id: bson::oid::ObjectId,
     track: Arc<TrackLocalStaticSample>,
     keyframe_requested: Arc<std::sync::atomic::AtomicBool>,
+    encoder_preference: encode::EncoderPreference,
 ) {
-    let mut capturer = capture::open_default(TARGET_FPS);
+    // Capture downscale policy mirrors the encoder preference. When the
+    // HW encoder is in play (or will be, on Auto + Windows), we want
+    // native-resolution frames; the HW path handles 4K fine and any
+    // downscale here would discard detail for no gain. When the encoder
+    // is software openh264, we keep the Auto policy so high-res sources
+    // still get the 2× downsample to hit the encoder's throughput
+    // ceiling.
+    let downscale = downscale_for(encoder_preference);
+    tracing::info!(
+        %session_id,
+        ?encoder_preference,
+        ?downscale,
+        "media pump starting"
+    );
+    let mut capturer = capture::open_default(TARGET_FPS, downscale);
     let mut encoder: Option<Box<dyn encode::VideoEncoder>> = None;
     let mut encoder_dims: Option<(u32, u32)> = None;
     // Floor on the `duration` field of each Sample. DXGI Desktop Duplication
@@ -393,7 +438,7 @@ async fn media_pump(
                 // so a genuine infinite error loop doesn't spin a core.
                 warn!(%session_id, %e, "capture error — rebuilding capturer");
                 tokio::time::sleep(Duration::from_millis(500)).await;
-                capturer = capture::open_default(TARGET_FPS);
+                capturer = capture::open_default(TARGET_FPS, downscale);
                 // Force the encoder to rebuild on the next frame — new
                 // capturer may come back at a different resolution (e.g.
                 // after a DPI change) and openh264 can't be resized
@@ -411,7 +456,11 @@ async fn media_pump(
                 w = frame.width, h = frame.height,
                 "initialising encoder for frame dims"
             );
-            encoder = Some(encode::open_default(frame.width, frame.height));
+            encoder = Some(encode::open_default(
+                frame.width,
+                frame.height,
+                encoder_preference,
+            ));
             encoder_dims = Some((frame.width, frame.height));
         }
 
@@ -464,11 +513,19 @@ async fn media_pump(
         bytes_written += packet_bytes;
 
         if frames_encoded == 1 {
-            info!(%session_id, first_frame_bytes = packet_bytes, "first encoded frame written to track");
-        }
-        if frames_encoded.is_multiple_of(30) {
+            let backend = encoder.as_ref().map(|e| e.name()).unwrap_or("none");
             info!(
                 %session_id,
+                backend,
+                first_frame_bytes = packet_bytes,
+                "first encoded frame written to track"
+            );
+        }
+        if frames_encoded.is_multiple_of(30) {
+            let backend = encoder.as_ref().map(|e| e.name()).unwrap_or("none");
+            info!(
+                %session_id,
+                backend,
                 frames_captured, frames_empty, frames_encoded, frames_keepalive,
                 bytes_written, write_errors,
                 "media pump heartbeat (≈1s window)"

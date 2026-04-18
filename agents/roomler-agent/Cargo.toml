@@ -71,19 +71,46 @@ bytes = "1"
 # Random fallback for machine_id
 rand = { workspace = true }
 
+# Windows Media Foundation H.264 encoder (hardware-accelerated).
+# Gated behind target_os and an explicit feature; non-Windows builds
+# never touch the `windows` crate. Feature list scoped to the MF, D3D11,
+# DXGI, and COM interfaces the encoder actually needs — full-crate
+# features blow up compile time without any benefit.
+[target.'cfg(target_os = "windows")'.dependencies.windows]
+version = "0.58"
+optional = true
+features = [
+    "Win32_Foundation",
+    "Win32_Media_MediaFoundation",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_System_Com",
+]
+
 [features]
 default = []
 # Enables the scrap-backed screen capture on Linux/Windows/macOS.
 scrap-capture = ["dep:scrap"]
 # Enables the OpenH264 software video encoder.
 openh264-encoder = ["dep:openh264"]
+# Enables the Windows Media Foundation hardware H.264 encoder. Windows-
+# only by construction (the `windows` crate has no non-Windows target).
+# If selected on other platforms, code remains dormant — open_default
+# cascade falls through to openh264.
+mf-encoder = ["dep:windows"]
 # Enables the enigo-based input injection backend.
 enigo-input = ["dep:enigo"]
-# Convenience: full media pipeline (capture + encode). What production
-# agent binaries should build with.
+# Convenience: full media pipeline (capture + software encode).
 media = ["scrap-capture", "openh264-encoder"]
-# Everything needed for a full remote-control session.
+# Full media pipeline including the MF hardware encoder. Production
+# Windows builds should use this so the open_default cascade can pick
+# MF when available and fall back to openh264 when not.
+media-hw = ["media", "mf-encoder"]
+# Everything needed for a full remote-control session, software only.
 full = ["media", "enigo-input"]
+# Everything needed including the MF hardware encoder. Production
+# Windows MSI builds with this.
+full-hw = ["full", "mf-encoder"]
 
 [dev-dependencies]
 tokio-test = { workspace = true }

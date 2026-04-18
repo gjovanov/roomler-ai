@@ -27,7 +27,11 @@ const PEER_OUTBOUND_CAP: usize = 64;
 
 /// Drive the signaling loop forever. Returns only on fatal error (e.g.
 /// auth rejection) or shutdown signal.
-pub async fn run(cfg: AgentConfig, shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
+pub async fn run(
+    cfg: AgentConfig,
+    encoder_preference: crate::encode::EncoderPreference,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
     let mut backoff = Duration::from_secs(1);
     loop {
         if *shutdown.borrow() {
@@ -35,7 +39,7 @@ pub async fn run(cfg: AgentConfig, shutdown: tokio::sync::watch::Receiver<bool>)
             return Ok(());
         }
 
-        match connect_once(&cfg, shutdown.clone()).await {
+        match connect_once(&cfg, encoder_preference, shutdown.clone()).await {
             Ok(()) => {
                 info!("signaling connection closed cleanly, reconnecting");
                 backoff = Duration::from_secs(1);
@@ -63,6 +67,7 @@ enum ConnectError {
 
 async fn connect_once(
     cfg: &AgentConfig,
+    encoder_preference: crate::encode::EncoderPreference,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), ConnectError> {
     let url = format!(
@@ -137,6 +142,7 @@ async fn connect_once(
                                 parsed,
                                 &mut peers,
                                 &outbound_tx,
+                                encoder_preference,
                             )
                             .await?;
                         }
@@ -168,6 +174,7 @@ async fn handle_server_msg(
     msg: ServerMsg,
     peers: &mut HashMap<bson::oid::ObjectId, AgentPeer>,
     outbound_tx: &mpsc::Sender<ClientMsg>,
+    encoder_preference: crate::encode::EncoderPreference,
 ) -> Result<(), ConnectError> {
     match msg {
         ServerMsg::Request {
@@ -198,7 +205,14 @@ async fn handle_server_msg(
                 old.close().await;
             }
 
-            let peer = match AgentPeer::new(session_id, &ice_servers, outbound_tx.clone()).await {
+            let peer = match AgentPeer::new(
+                session_id,
+                &ice_servers,
+                outbound_tx.clone(),
+                encoder_preference,
+            )
+            .await
+            {
                 Ok(p) => p,
                 Err(e) => {
                     warn!(%session_id, %e, "AgentPeer::new failed; terminating");

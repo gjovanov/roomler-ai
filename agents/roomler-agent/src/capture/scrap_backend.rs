@@ -22,7 +22,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
-use super::{Frame, PixelFormat, ScreenCapture};
+use super::{DownscalePolicy, Frame, PixelFormat, ScreenCapture};
 
 pub const DEFAULT_TARGET_FPS: u32 = 30;
 
@@ -39,7 +39,7 @@ pub struct ScrapCapture {
 }
 
 impl ScrapCapture {
-    pub fn primary(target_fps: u32) -> Result<Self> {
+    pub fn primary(target_fps: u32, downscale: DownscalePolicy) -> Result<Self> {
         // Build the Capturer on the worker thread so it never crosses
         // thread boundaries; use a ready-ack channel to surface any
         // init failure back to the caller synchronously.
@@ -70,7 +70,7 @@ impl ScrapCapture {
 
                 // Wait for capture requests.
                 while let Ok(res_tx) = cmd_rx.recv() {
-                    let reply = capture_one_blocking(&mut cap, w, h, start);
+                    let reply = capture_one_blocking(&mut cap, w, h, start, downscale);
                     let _ = res_tx.send(reply);
                 }
             })
@@ -110,6 +110,7 @@ fn capture_one_blocking(
     width: u32,
     height: u32,
     start: Instant,
+    downscale: DownscalePolicy,
 ) -> CaptureReply {
     // Give the compositor a budget — if nothing is ready within ~100 ms we
     // return None and let the async side decide whether to retry.
@@ -120,13 +121,19 @@ fn capture_one_blocking(
                 let stride = (buf.len() as u32) / height.max(1);
                 let monotonic_us = start.elapsed().as_micros() as u64;
                 let pixel_count = u64::from(width) * u64::from(height);
-                let (data, out_w, out_h, out_stride) =
-                    if pixel_count >= DOWNSCALE_TRIGGER_PIXELS && width >= 2 && height >= 2 {
-                        let (dst, dw, dh) = downscale_bgra_2x(&buf, width, height, stride);
-                        (dst, dw, dh, dw * 4)
-                    } else {
-                        (buf.to_vec(), width, height, stride)
-                    };
+                let should_downscale = match downscale {
+                    DownscalePolicy::Never => false,
+                    DownscalePolicy::Always => width >= 2 && height >= 2,
+                    DownscalePolicy::Auto => {
+                        pixel_count >= DOWNSCALE_TRIGGER_PIXELS && width >= 2 && height >= 2
+                    }
+                };
+                let (data, out_w, out_h, out_stride) = if should_downscale {
+                    let (dst, dw, dh) = downscale_bgra_2x(&buf, width, height, stride);
+                    (dst, dw, dh, dw * 4)
+                } else {
+                    (buf.to_vec(), width, height, stride)
+                };
                 return Ok(Some(Frame {
                     width: out_w,
                     height: out_h,
@@ -215,7 +222,7 @@ mod tests {
     /// looks wrong.
     #[tokio::test]
     async fn captures_one_frame_if_display_is_available() {
-        let Ok(mut cap) = ScrapCapture::primary(30) else {
+        let Ok(mut cap) = ScrapCapture::primary(30, DownscalePolicy::Auto) else {
             eprintln!("no display available — skipping");
             return;
         };

@@ -22,23 +22,9 @@ use tokio::sync::oneshot;
 use super::{EncodedPacket, VideoEncoder};
 use crate::capture::{Frame, PixelFormat};
 
-/// Bitrate floor / ceiling clamps for the resolution-scaled starting rate.
-/// A fixed bitrate across all sizes (which 0.1.10 used at 8 Mbps) is either
-/// overkill or underkill at any resolution other than the one it was tuned
-/// for; we now derive from dims. Adaptive bitrate based on TWCC/REMB
-/// remains future work — this just picks a better *starting point*.
-const MIN_BITRATE_BPS: u32 = 1_000_000;
-const MAX_BITRATE_BPS: u32 = 12_000_000;
-/// Bits per pixel per second. A rough target for desktop content at 30 fps:
-/// 0.07 bpp/s gives ~6 Mbps at 1080p and ~10 Mbps at 1440p.
-const DESKTOP_BPP_PER_SECOND: f32 = 0.07;
-const TARGET_FPS: u32 = 30;
+use super::initial_bitrate_for;
 
-fn initial_bitrate_for(width: u32, height: u32) -> u32 {
-    let pixels = width as f64 * height as f64;
-    let raw = (pixels * TARGET_FPS as f64 * DESKTOP_BPP_PER_SECOND as f64) as u32;
-    raw.clamp(MIN_BITRATE_BPS, MAX_BITRATE_BPS)
-}
+const TARGET_FPS: u32 = 30;
 
 pub struct Openh264Encoder {
     /// Worker thread; commands go in, packets come out.

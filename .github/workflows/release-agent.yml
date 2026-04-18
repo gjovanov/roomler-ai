@@ -191,9 +191,21 @@ jobs:
       - name: Install cargo-wix
         run: cargo install cargo-wix --locked
 
-      - name: Build agent (release, full features)
+      - name: Build agent (release, full-hw features)
         shell: pwsh
-        run: cargo build -p roomler-agent --release --features full
+        run: cargo build -p roomler-agent --release --features full-hw
+
+      - name: Encoder smoke test (MF cascade → openh264 fallback)
+        shell: pwsh
+        run: |
+          # Probe the hardware encoder path. On windows-latest the runner
+          # exposes a WARP software D3D11 device; the MS H264 Encoder MFT
+          # falls back to its SW path there, which is enough for "it loads,
+          # negotiates types, produces an IDR, no SEH crash". If MF fails
+          # to init at all, the cascade falls back to openh264 and the
+          # smoke still passes — we only fail on NoopEncoder (both paths
+          # broken) or zero keyframes (bitstream empty).
+          & "target\release\roomler-agent.exe" encoder-smoke --encoder hardware
 
       - name: Build MSI
         shell: pwsh

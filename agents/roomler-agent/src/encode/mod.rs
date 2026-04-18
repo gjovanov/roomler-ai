@@ -16,8 +16,42 @@ use anyhow::Result;
 
 use crate::capture::Frame;
 
+pub mod color;
+
 #[cfg(feature = "openh264-encoder")]
 pub mod openh264_backend;
+
+#[cfg(all(target_os = "windows", feature = "mf-encoder"))]
+pub mod mf_backend;
+
+// ---------------------------------------------------------------------
+// Shared helpers usable by every backend.
+// ---------------------------------------------------------------------
+
+/// Resolution-scaled initial bitrate target.
+///
+/// A fixed bitrate across all sizes (which 0.1.10 used at 8 Mbps) is
+/// either overkill or underkill at any resolution other than the one it
+/// was tuned for; we derive from dims. Adaptive bitrate based on
+/// TWCC/REMB remains future work — this just picks a better *starting
+/// point*. Desktop-content target = 0.07 bpp/s gives ≈6 Mbps at 1080p
+/// and ≈10 Mbps at 1440p; 4K clamps to MAX.
+#[cfg_attr(
+    not(any(
+        feature = "openh264-encoder",
+        all(target_os = "windows", feature = "mf-encoder")
+    )),
+    allow(dead_code)
+)]
+pub(crate) fn initial_bitrate_for(width: u32, height: u32) -> u32 {
+    const MIN_BITRATE_BPS: u32 = 1_000_000;
+    const MAX_BITRATE_BPS: u32 = 12_000_000;
+    const DESKTOP_BPP_PER_SECOND: f64 = 0.07;
+    const FPS: f64 = 30.0;
+    let pixels = width as f64 * height as f64;
+    let raw = (pixels * FPS * DESKTOP_BPP_PER_SECOND) as u32;
+    raw.clamp(MIN_BITRATE_BPS, MAX_BITRATE_BPS)
+}
 
 #[derive(Debug, Clone)]
 pub struct EncodedPacket {
@@ -53,19 +87,93 @@ impl VideoEncoder for NoopEncoder {
     fn name(&self) -> &'static str { "noop" }
 }
 
-/// Open the best-available encoder for the given input size. Falls back
-/// to [`NoopEncoder`] if no encoder feature is enabled or construction
-/// fails — higher layers remain functional, the PC just won't carry media.
-pub fn open_default(_width: u32, _height: u32) -> Box<dyn VideoEncoder> {
+/// Operator preference for encoder selection. Defaults to `Auto` which
+/// picks the fastest working backend: MF on Windows when available, else
+/// openh264, else Noop. `Hardware` forces HW first and falls back to SW;
+/// `Software` forces openh264 and never tries HW. Mostly a debug/escape-
+/// hatch for drivers with known artefacts at our target bitrates.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EncoderPreference {
+    #[default]
+    Auto,
+    Hardware,
+    Software,
+}
+
+impl std::str::FromStr for EncoderPreference {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "auto" | "" => Ok(Self::Auto),
+            "hardware" | "hw" | "mf" => Ok(Self::Hardware),
+            "software" | "sw" | "openh264" => Ok(Self::Software),
+            other => Err(format!("unknown encoder preference: {other:?}")),
+        }
+    }
+}
+
+/// Open the best-available encoder for the given input size.
+///
+/// Selection cascade:
+///
+/// | Preference | Order tried                                    |
+/// |------------|------------------------------------------------|
+/// | Auto       | mf (Windows, feature gate) → openh264 → Noop   |
+/// | Hardware   | mf (required on Windows) → openh264 → Noop     |
+/// | Software   | openh264 → Noop                                |
+///
+/// Each fallback is logged; the picked backend reports via
+/// `.name()` so pump-level observability can attribute.
+pub fn open_default(
+    width: u32,
+    height: u32,
+    preference: EncoderPreference,
+) -> Box<dyn VideoEncoder> {
+    if preference != EncoderPreference::Software {
+        #[cfg(all(target_os = "windows", feature = "mf-encoder"))]
+        {
+            match mf_backend::MfEncoder::new(width, height) {
+                Ok(e) => {
+                    tracing::info!(
+                        width,
+                        height,
+                        "encoder selected: mf-h264 (hardware)"
+                    );
+                    return Box::new(e);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        %e,
+                        "mf-encoder init failed — falling back to openh264"
+                    );
+                }
+            }
+        }
+        #[cfg(not(all(target_os = "windows", feature = "mf-encoder")))]
+        {
+            if preference == EncoderPreference::Hardware {
+                tracing::warn!(
+                    "Hardware encoder requested but this build has no HW backend \
+                     compiled in (rebuild with --features mf-encoder on Windows); \
+                     falling back to software"
+                );
+            }
+        }
+    }
+
     #[cfg(feature = "openh264-encoder")]
     {
-        match openh264_backend::Openh264Encoder::new(_width, _height) {
-            Ok(e) => return Box::new(e),
+        match openh264_backend::Openh264Encoder::new(width, height) {
+            Ok(e) => {
+                tracing::info!(width, height, "encoder selected: openh264 (software)");
+                return Box::new(e);
+            }
             Err(e) => tracing::warn!(%e, "openh264 init failed — falling back to NoopEncoder"),
         }
     }
     #[cfg(not(feature = "openh264-encoder"))]
     {
+        let _ = (width, height);
         tracing::info!(
             "built without openh264-encoder feature — using NoopEncoder. \
              Rebuild with `--features openh264-encoder` (or `--features media`)."

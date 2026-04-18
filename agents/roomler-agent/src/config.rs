@@ -30,6 +30,24 @@ pub struct AgentConfig {
     pub machine_id: String,
     /// User-friendly name shown in the admin UI.
     pub machine_name: String,
+    /// Encoder preference: `auto` (default), `hardware`, or `software`.
+    /// Can be overridden at launch by `ROOMLER_AGENT_ENCODER` env var or
+    /// `--encoder` CLI flag.
+    #[serde(default)]
+    pub encoder_preference: EncoderPreferenceChoice,
+}
+
+/// TOML-friendly mirror of `encode::EncoderPreference`. Kept separate so
+/// the `encode` module stays CLI-independent and the config file survives
+/// feature gating without needing the `mf-encoder` feature enabled to
+/// parse.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EncoderPreferenceChoice {
+    #[default]
+    Auto,
+    Hardware,
+    Software,
 }
 
 impl AgentConfig {
