@@ -4,7 +4,7 @@ import { describe, it, expect } from 'vitest'
 // here without mocking the WS store; the helpers below are self-contained
 // pure functions and are what actually determine the wire format, so they
 // carry the important invariants.
-import { browserButton, kbdCodeToHid } from '@/composables/useRemoteControl'
+import { browserButton, kbdCodeToHid, letterboxedNormalise } from '@/composables/useRemoteControl'
 
 describe('browserButton', () => {
   it.each([
@@ -81,5 +81,61 @@ describe('kbdCodeToHid', () => {
     // Look-alikes that used to break naive startsWith checks.
     expect(kbdCodeToHid('Keyboard')).toBeNull() // too long for "Key_"
     expect(kbdCodeToHid('Digit10')).toBeNull() // digit out of single-char range
+  })
+})
+
+describe('letterboxedNormalise', () => {
+  // Frame is the outer .video-frame rect; video*  are the <video>'s
+  // intrinsic dimensions. object-fit: contain letterboxes the content.
+  const frame = { left: 0, top: 0, width: 2560, height: 1600 }
+
+  it('center click at frame center is the video center when aspect matches', () => {
+    // 2560×1600 video in 2560×1600 frame: no letterbox, center is 0.5/0.5.
+    const r = letterboxedNormalise(1280, 800, frame, 2560, 1600)
+    expect(r.x).toBeCloseTo(0.5, 6)
+    expect(r.y).toBeCloseTo(0.5, 6)
+    expect(r.insideVideo).toBe(true)
+  })
+
+  it('ignores clicks in top letterbox when video is wider than frame', () => {
+    // 3840×2160 (16:9) in 2560×1600 (16:10) → 80 px black bar top + bottom.
+    // A click at y=40 is inside the top letterbox.
+    const r = letterboxedNormalise(100, 40, frame, 3840, 2160)
+    expect(r.insideVideo).toBe(false)
+  })
+
+  it('clicks inside visible region of 16:9 → 16:10 letterbox normalise correctly', () => {
+    // 3840×2160 video in 2560×1600 frame: visibleH = 2560/(16/9) = 1440;
+    // top offset = (1600-1440)/2 = 80. Click at frame (1280, 800) is the
+    // center: localY = 800-80 = 720, y = 720/1440 = 0.5. Good.
+    const r = letterboxedNormalise(1280, 800, frame, 3840, 2160)
+    expect(r.x).toBeCloseTo(0.5, 6)
+    expect(r.y).toBeCloseTo(0.5, 6)
+    expect(r.insideVideo).toBe(true)
+  })
+
+  it('clicks inside visible region of taller-than-wide video normalise correctly', () => {
+    // 1080×1920 portrait video in 2560×1600 frame: visibleW = 1600*(1080/1920) = 900;
+    // left offset = (2560-900)/2 = 830. Click at (830+450, 800) is center of content.
+    const r = letterboxedNormalise(830 + 450, 800, frame, 1080, 1920)
+    expect(r.x).toBeCloseTo(0.5, 6)
+    expect(r.y).toBeCloseTo(0.5, 6)
+    expect(r.insideVideo).toBe(true)
+  })
+
+  it('falls back to frame-relative coords before first decoded frame', () => {
+    // videoWidth=0 means no stream intrinsic yet — normalise against frame.
+    const r = letterboxedNormalise(640, 400, frame, 0, 0)
+    expect(r.x).toBeCloseTo(0.25, 6)
+    expect(r.y).toBeCloseTo(0.25, 6)
+    expect(r.insideVideo).toBe(true)
+  })
+
+  it('clamps out-of-frame clicks to [0,1]', () => {
+    const r = letterboxedNormalise(-100, 5000, frame, 2560, 1600)
+    expect(r.x).toBeGreaterThanOrEqual(0)
+    expect(r.x).toBeLessThanOrEqual(1)
+    expect(r.y).toBeGreaterThanOrEqual(0)
+    expect(r.y).toBeLessThanOrEqual(1)
   })
 })

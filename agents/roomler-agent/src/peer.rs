@@ -50,6 +50,11 @@ pub struct AgentPeer {
     pc: Arc<RTCPeerConnection>,
     session_id: bson::oid::ObjectId,
     media_pump: Option<JoinHandle<()>>,
+    /// Reads RTCP from the video sender to handle PLI/FIR. Held so that
+    /// `close()` can abort it — otherwise it outlives the AgentPeer and
+    /// leaks under session churn until `video_sender.read_rtcp()` errors
+    /// on its own, which isn't guaranteed to happen promptly.
+    rtcp_reader: Option<JoinHandle<()>>,
 }
 
 impl AgentPeer {
@@ -134,7 +139,7 @@ impl AgentPeer {
         // IDRs spike bandwidth → more loss → more PLI → collapse. Cap
         // keyframe responses to at most one per MIN_KEYFRAME_GAP.
         let keyframe_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        {
+        let rtcp_reader = {
             let flag = keyframe_requested.clone();
             let sid = session_id;
             tokio::spawn(async move {
@@ -171,8 +176,8 @@ impl AgentPeer {
                         }
                     }
                 }
-            });
-        }
+            })
+        };
 
         // Forward locally-gathered ICE candidates.
         {
@@ -241,6 +246,7 @@ impl AgentPeer {
             pc,
             session_id,
             media_pump: Some(pump),
+            rtcp_reader: Some(rtcp_reader),
         })
     }
 
@@ -283,6 +289,9 @@ impl AgentPeer {
         if let Some(pump) = &self.media_pump {
             pump.abort();
         }
+        if let Some(reader) = &self.rtcp_reader {
+            reader.abort();
+        }
         if let Err(e) = self.pc.close().await {
             warn!(session = %self.session_id, %e, "PC close failed");
         }
@@ -319,7 +328,11 @@ async fn media_pump(
     // seconds of lag when they finally do something, because the stream
     // has to resume from the pause. Re-encoding the last frame at ~2 fps
     // during idle keeps the RTP stream flowing and the decoder unpaused.
-    let mut last_good_frame: Option<crate::capture::Frame> = None;
+    // Arc<Frame> so repeated idle keepalives share the big BGRA buffer
+    // with the encoder (which only reads). Without Arc, each keepalive
+    // cloned the entire frame — up to 33 MB at 4K, 8 MB at 1080p —
+    // every 500 ms of idle.
+    let mut last_good_frame: Option<std::sync::Arc<crate::capture::Frame>> = None;
     // How long of a DXGI-silent gap we're willing to tolerate before
     // injecting a keepalive. 500 ms = 2 fps idle floor.
     const IDLE_KEEPALIVE: Duration = Duration::from_millis(500);
@@ -336,12 +349,13 @@ async fn media_pump(
     let mut write_errors: u64 = 0;
 
     loop {
-        let frame = match capturer.next_frame().await {
+        let frame: std::sync::Arc<crate::capture::Frame> = match capturer.next_frame().await {
             Ok(Some(f)) => {
                 frames_captured += 1;
                 last_capture_at = std::time::Instant::now();
-                last_good_frame = Some(f.clone());
-                f
+                let arc = std::sync::Arc::new(f);
+                last_good_frame = Some(arc.clone());
+                arc
             }
             Ok(None) => {
                 frames_empty += 1;
