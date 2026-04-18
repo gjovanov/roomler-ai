@@ -283,7 +283,16 @@ async fn media_pump(
     let mut capturer = capture::open_default(TARGET_FPS);
     let mut encoder: Option<Box<dyn encode::VideoEncoder>> = None;
     let mut encoder_dims: Option<(u32, u32)> = None;
-    let frame_duration = Duration::from_micros(1_000_000 / TARGET_FPS as u64);
+    // Floor on the `duration` field of each Sample. DXGI Desktop Duplication
+    // only emits a frame when the screen changes, so on an idle desktop the
+    // real gap between two write_sample calls can be seconds. RTP timestamp
+    // increments are `duration * clock_rate`; if duration stays at 33 ms
+    // (30 fps nominal) while wallclock advances by 1 s, the browser's
+    // playout clock starves and the video element goes black. Measure the
+    // wallclock gap per frame and use that as the duration — the first
+    // sample uses the nominal floor.
+    let frame_duration_floor = Duration::from_micros(1_000_000 / TARGET_FPS as u64);
+    let mut last_sample_at: Option<std::time::Instant> = None;
 
     // Observability: count frames in/out and bytes written, log every 30
     // encoded frames (~once per second at 30fps). Without this a silent
@@ -339,13 +348,27 @@ async fn media_pump(
             }
         };
 
+        // Wallclock-based duration so RTP timestamps advance at real time,
+        // not at an assumed 30 fps. First sample falls back to the nominal
+        // floor (the track has nothing to reference from).
+        let now = std::time::Instant::now();
+        // Clamp: floor at the nominal frame duration, cap at 1 s so a
+        // multi-second idle doesn't cause an enormous RTP timestamp jump.
+        let wallclock_gap = match last_sample_at {
+            Some(t) => now
+                .duration_since(t)
+                .clamp(frame_duration_floor, Duration::from_secs(1)),
+            None => frame_duration_floor,
+        };
+        last_sample_at = Some(now);
+
         let mut packet_bytes: u64 = 0;
         for p in packets {
             packet_bytes += p.data.len() as u64;
             let sample = Sample {
                 data: Bytes::from(p.data),
                 timestamp: SystemTime::now(),
-                duration: frame_duration,
+                duration: wallclock_gap,
                 packet_timestamp: 0,
                 prev_dropped_packets: 0,
                 prev_padding_packets: 0,
