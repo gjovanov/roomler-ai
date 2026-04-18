@@ -77,6 +77,7 @@ use windows::core::Interface;
 use super::{EncodedPacket, VideoEncoder};
 use crate::capture::{Frame, PixelFormat};
 
+mod adapter;
 mod sync_pipeline;
 
 use sync_pipeline::MfPipeline;
