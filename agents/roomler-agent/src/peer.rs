@@ -128,6 +128,11 @@ impl AgentPeer {
         // PLI / FIR; media_pump consumes it before each encode and calls
         // force_intra_frame() on the openh264 encoder. Without this, lost
         // packets freeze the decoder until the next periodic IDR.
+        //
+        // Rate-limited: a browser under load can spam PLIs (we saw 43 in
+        // a few seconds). Each keyframe at 4K is ~350 KB. Back-to-back
+        // IDRs spike bandwidth → more loss → more PLI → collapse. Cap
+        // keyframe responses to at most one per MIN_KEYFRAME_GAP.
         let keyframe_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
         {
             let flag = keyframe_requested.clone();
@@ -135,17 +140,29 @@ impl AgentPeer {
             tokio::spawn(async move {
                 use webrtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
                 use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
+                const MIN_KEYFRAME_GAP: Duration = Duration::from_millis(500);
+                let mut last_keyframe = std::time::Instant::now() - MIN_KEYFRAME_GAP;
                 loop {
                     match video_sender.read_rtcp().await {
                         Ok((pkts, _)) => {
+                            let mut asks_keyframe = false;
                             for p in pkts {
                                 let p_any = p.as_any();
                                 if p_any.downcast_ref::<PictureLossIndication>().is_some()
                                     || p_any.downcast_ref::<FullIntraRequest>().is_some()
                                 {
-                                    info!(session = %sid, "PLI/FIR received → forcing keyframe");
-                                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    asks_keyframe = true;
                                 }
+                            }
+                            if asks_keyframe {
+                                let now = std::time::Instant::now();
+                                if now.duration_since(last_keyframe) >= MIN_KEYFRAME_GAP {
+                                    info!(session = %sid, "PLI/FIR → forcing keyframe");
+                                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    last_keyframe = now;
+                                }
+                                // else: silently drop — we already sent
+                                // an IDR within the last 500ms.
                             }
                         }
                         Err(_e) => {

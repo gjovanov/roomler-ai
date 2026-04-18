@@ -13,7 +13,7 @@
 //! [OpenH264]: https://www.openh264.org/
 
 use anyhow::{Context, Result, anyhow};
-use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameType, IntraFramePeriod};
+use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate, FrameType, IntraFramePeriod};
 use openh264::formats::YUVBuffer;
 use std::sync::mpsc as std_mpsc;
 use std::thread;
@@ -23,8 +23,10 @@ use super::{EncodedPacket, VideoEncoder};
 use crate::capture::{Frame, PixelFormat};
 
 /// Starting bitrate target. Adaptive bitrate based on TWCC/REMB comes in a
-/// follow-up; for now the encoder runs at a fixed rate.
-const DEFAULT_BITRATE_BPS: u32 = 3_000_000;
+/// follow-up; for now the encoder runs at a fixed rate. 8 Mbps is a
+/// reasonable headroom for desktop streaming up to 1440p; at 4K SW encode
+/// we still cap at this until the downscale path lands.
+const DEFAULT_BITRATE_BPS: u32 = 8_000_000;
 
 pub struct Openh264Encoder {
     /// Worker thread; commands go in, packets come out.
@@ -62,6 +64,11 @@ impl Openh264Encoder {
                     // RTCP-PLI round-trip drops.
                     let cfg = EncoderConfig::new()
                         .bitrate(BitRate::from_bps(DEFAULT_BITRATE_BPS as u32))
+                        // Tell openh264 the target rate so rate-control
+                        // budgets per-frame bits correctly; without this
+                        // the default fMaxFrameRate=0 makes the encoder
+                        // produce bursty, over-budget frames.
+                        .max_frame_rate(FrameRate::from_hz(30.0))
                         .intra_frame_period(IntraFramePeriod::from_num_frames(60));
                     Encoder::with_api_config(api, cfg).map_err(|e| anyhow!("encoder init: {e}"))
                 };

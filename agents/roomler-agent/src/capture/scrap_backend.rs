@@ -94,6 +94,13 @@ impl ScrapCapture {
     pub fn height(&self) -> u32 { self.height }
 }
 
+/// When the source is this wide or wider, downsample 2× before handing
+/// the frame to the encoder. Software openh264 at 4K SW encode caps out
+/// around 6–12 fps on a typical desktop CPU; halving each dimension cuts
+/// pixel work by 4× and typically brings us back to 25–30 fps, which
+/// matters far more for perceived smoothness than the extra detail.
+const DOWNSCALE_TRIGGER_WIDTH: u32 = 2561;
+
 fn capture_one_blocking(
     cap: &mut Capturer,
     width: u32,
@@ -107,14 +114,20 @@ fn capture_one_blocking(
         match cap.frame() {
             Ok(buf) => {
                 let stride = (buf.len() as u32) / height.max(1);
-                let owned: Vec<u8> = buf.to_vec();
                 let monotonic_us = start.elapsed().as_micros() as u64;
+                let (data, out_w, out_h, out_stride) =
+                    if width >= DOWNSCALE_TRIGGER_WIDTH && height >= 2 && width >= 2 {
+                        let (dst, dw, dh) = downscale_bgra_2x(&buf, width, height, stride);
+                        (dst, dw, dh, dw * 4)
+                    } else {
+                        (buf.to_vec(), width, height, stride)
+                    };
                 return Ok(Some(Frame {
-                    width,
-                    height,
-                    stride,
+                    width: out_w,
+                    height: out_h,
+                    stride: out_stride,
                     pixel_format: PixelFormat::Bgra,
-                    data: owned,
+                    data,
                     monotonic_us,
                     monitor: 0,
                 }));
@@ -128,6 +141,35 @@ fn capture_one_blocking(
             Err(e) => return Err(anyhow!("scrap frame error: {e}")),
         }
     }
+}
+
+/// 2×2 box downsample over BGRA. Output dimensions are floor(w/2), floor(h/2).
+/// Averages each 2×2 block per channel with a +2/4 round. Naive scalar
+/// loop — at 4K (8.3 Mpx in, 2.1 Mpx out) this runs in ~15 ms in release
+/// mode on a desktop CPU, well under the ~30 ms budget per frame at 30 fps
+/// and comfortably less than openh264 would have spent encoding the full
+/// 4K frame it replaces.
+fn downscale_bgra_2x(src: &[u8], src_w: u32, src_h: u32, src_stride: u32) -> (Vec<u8>, u32, u32) {
+    let dw = src_w / 2;
+    let dh = src_h / 2;
+    let sw = src_stride as usize;
+    let mut dst = vec![0u8; (dw * dh * 4) as usize];
+    for y in 0..dh as usize {
+        let row0 = 2 * y * sw;
+        let row1 = (2 * y + 1) * sw;
+        for x in 0..dw as usize {
+            let sx = 2 * x * 4;
+            let dx = (y * dw as usize + x) * 4;
+            for c in 0..4 {
+                let p00 = src[row0 + sx + c] as u32;
+                let p10 = src[row0 + sx + 4 + c] as u32;
+                let p01 = src[row1 + sx + c] as u32;
+                let p11 = src[row1 + sx + 4 + c] as u32;
+                dst[dx + c] = ((p00 + p10 + p01 + p11 + 2) / 4) as u8;
+            }
+        }
+    }
+    (dst, dw, dh)
 }
 
 #[async_trait::async_trait]
