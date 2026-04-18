@@ -282,29 +282,85 @@ export function useRemoteControl() {
    * Returns a detach function the caller should invoke before unmounting.
    */
   function attachInput(surface: HTMLElement): () => void {
-    function normalisedXY(ev: PointerEvent | MouseEvent | WheelEvent): { x: number; y: number } {
-      const rect = surface.getBoundingClientRect()
-      const x = (ev.clientX - rect.left) / Math.max(rect.width, 1)
-      const y = (ev.clientY - rect.top) / Math.max(rect.height, 1)
-      return { x: Math.min(Math.max(x, 0), 1), y: Math.min(Math.max(y, 0), 1) }
+    // Locate the <video> once, fall back gracefully if the layout changes.
+    const findVideo = () =>
+      (surface.querySelector('video') as HTMLVideoElement | null) ??
+      (surface.firstElementChild as HTMLVideoElement | null)
+    const clamp01 = (n: number) => Math.min(Math.max(n, 0), 1)
+
+    /**
+     * Returns [0,1]-normalised coordinates relative to the *visible video
+     * content* — not the outer .video-frame. The `<video>` uses
+     * `object-fit: contain`, which letterboxes the stream when the display
+     * aspect ratio differs from the source (e.g. 2560x1600 viewport showing
+     * a 3840x2160 agent). Without this correction, clicks land at the wrong
+     * pixel on the remote, and clicks in the letterbox bars get clamped to
+     * the edge instead of being ignored.
+     */
+    function normalisedXY(
+      ev: PointerEvent | MouseEvent | WheelEvent,
+    ): { x: number; y: number; insideVideo: boolean } {
+      const frameRect = surface.getBoundingClientRect()
+      const video = findVideo()
+      const vw = video?.videoWidth ?? 0
+      const vh = video?.videoHeight ?? 0
+
+      // Before the first decoded frame we can't know the aspect ratio —
+      // fall back to frame-relative coordinates so tests still function.
+      if (!vw || !vh) {
+        const x = (ev.clientX - frameRect.left) / Math.max(frameRect.width, 1)
+        const y = (ev.clientY - frameRect.top) / Math.max(frameRect.height, 1)
+        return { x: clamp01(x), y: clamp01(y), insideVideo: true }
+      }
+
+      // Compute the letterboxed region `object-fit: contain` produces.
+      const videoAR = vw / vh
+      const frameAR = frameRect.width / Math.max(frameRect.height, 1)
+      let visibleW: number, visibleH: number, offsetX: number, offsetY: number
+      if (videoAR > frameAR) {
+        // Wider than the frame — black bars top/bottom.
+        visibleW = frameRect.width
+        visibleH = frameRect.width / videoAR
+        offsetX = 0
+        offsetY = (frameRect.height - visibleH) / 2
+      } else {
+        // Taller than the frame — black bars left/right.
+        visibleW = frameRect.height * videoAR
+        visibleH = frameRect.height
+        offsetX = (frameRect.width - visibleW) / 2
+        offsetY = 0
+      }
+
+      const localX = ev.clientX - frameRect.left - offsetX
+      const localY = ev.clientY - frameRect.top - offsetY
+      const insideVideo =
+        localX >= 0 && localX <= visibleW && localY >= 0 && localY <= visibleH
+      return {
+        x: clamp01(localX / Math.max(visibleW, 1)),
+        y: clamp01(localY / Math.max(visibleH, 1)),
+        insideVideo,
+      }
     }
 
     function onPointerMove(ev: PointerEvent) {
-      const { x, y } = normalisedXY(ev)
+      const { x, y, insideVideo } = normalisedXY(ev)
+      if (!insideVideo) return
       pendingMove = { x, y, mon: 0 }
       if (rafHandle === null) rafHandle = requestAnimationFrame(flushPendingMove)
     }
 
     function onPointerDown(ev: PointerEvent) {
       ev.preventDefault()
+      const { x, y, insideVideo } = normalisedXY(ev)
+      if (!insideVideo) return
       surface.setPointerCapture(ev.pointerId)
-      const { x, y } = normalisedXY(ev)
       sendInput({ t: 'mouse_button', btn: browserButton(ev.button), down: true, x, y, mon: 0 })
     }
 
     function onPointerUp(ev: PointerEvent) {
       try { surface.releasePointerCapture(ev.pointerId) } catch { /* noop */ }
-      const { x, y } = normalisedXY(ev)
+      const { x, y, insideVideo } = normalisedXY(ev)
+      if (!insideVideo) return
       sendInput({ t: 'mouse_button', btn: browserButton(ev.button), down: false, x, y, mon: 0 })
     }
 
