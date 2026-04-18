@@ -166,6 +166,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     let cfg = config::load(config_path).context("loading config")?;
     let encoder_preference = resolve_encoder_preference(cli_encoder, cfg.encoder_preference);
     tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
         path = %config_path.display(),
         server = %cfg.server_url,
         agent_id = %cfg.agent_id,
