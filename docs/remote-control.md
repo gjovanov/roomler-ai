@@ -506,45 +506,62 @@ That's ~16 weeks for a properly hardened v1, which is in the right ballpark for 
 
 ## 17. Hardware encoder backends
 
+### Current state (0.1.25)
+
+On Windows, the default `Auto` cascade picks **openh264** — the
+software H.264 encoder we've trusted since day one. The Windows
+Media Foundation backend (`mf-h264`) is compiled in and functional
+but **opt-in only** via `encoder_preference=hardware`, because on
+mixed-GPU hosts (e.g. NVIDIA GeForce + Intel iGPU) it hits two
+blockers that phase 3 will resolve:
+
+1. **NVIDIA H.264 Encoder MFT** `ActivateObject` returns
+   `0x8000FFFF` when the D3D11 device is bound to the default DXGI
+   adapter (usually the Intel iGPU on hybrid laptops / desktops
+   with both). NVENC MFT requires its D3D device to be created on
+   NVIDIA's adapter specifically.
+2. **Intel Quick Sync Video H.264 Encoder MFT** activates OK but
+   is async-only. It ignores `MF_TRANSFORM_ASYNC_UNLOCK` and
+   rejects `SET_D3D_MANAGER` with `MF_E_ATTRIBUTENOTFOUND`. Sync
+   `ProcessOutput` returns `0x8000FFFF` on the first drain.
+
+Phase 3 (DXGI adapter enumeration + `IMFMediaEventGenerator`
+event loop + per-MFT probe-and-rollback) is a separate focused
+work package. Until it lands, Auto → openh264 is the right call.
+
 ### Backend cascade
 
-The agent's `encode::open_default(width, height, preference)` picks a
-video encoder backend in this order:
+`encode::open_default(width, height, preference)` picks as follows:
 
 | `preference` | Order tried |
 |---|---|
-| `Auto` (default) | Windows MF → openh264 → Noop |
-| `Hardware` | Windows MF (required) → openh264 (fallback) → Noop |
+| `Auto` (default) | **openh264** → Noop   (MF is opt-in until phase 3) |
+| `Hardware` | Windows MF (experimental) → openh264 → Noop |
 | `Software` | openh264 → Noop |
 
-On non-Windows hosts, `Auto` and `Hardware` both fall straight through
-to openh264 until we add VideoToolbox / VAAPI / NVENC backends in a
-later phase.
+Selection is logged at INFO:
 
-The *first* backend that successfully initialises wins. Selection is
-logged at INFO on startup:
+    INFO encoder selected: openh264 (software) width=1920 height=1080
 
-    INFO encoder selected: mf-h264 (hardware) width=1920 height=1080
+and on every `media pump heartbeat`:
 
-The chosen backend also appears on every `media pump heartbeat` line
-so it's visible in production logs without grepping startup alone.
+    INFO media pump heartbeat backend="openh264" frames_encoded=30 ...
 
 ### Per-session downscale behaviour
 
-The capture layer runs a 2× box downsample on sources above ~3.5 Mpx
-when (and only when) openh264 is the active encoder — at native 4K
-the SW encoder caps out around 6-12 fps. Hardware encoders eat 4K
-frames fine, so the capture layer skips the downsample when MF / a
-future HW backend is selected. Logged at pump start:
+The capture layer runs a 2× box downsample on sources above
+~3.5 Mpx when the active encoder is software (openh264 or MF SW).
+Hardware encoders (when phase 3 lands) will skip the downsample so
+they see native resolution. Logged at pump start:
 
-    INFO media pump starting encoder_preference=Auto downscale=Never
+    INFO media pump starting encoder_preference=Auto downscale=Auto
 
 ### Configuration
 
 Three places, in decreasing priority:
 
-1. **CLI flag**: `roomler-agent run --encoder hardware` (also accepts
-   `auto`, `software`, `hw`, `sw`, `mf`, `openh264`).
+1. **CLI flag**: `roomler-agent run --encoder hardware` (also
+   accepts `auto`, `software`, `hw`, `sw`, `mf`, `openh264`).
 2. **Env var**: `ROOMLER_AGENT_ENCODER=hardware`. Mostly for
    systemd-user / Task Scheduler entries where editing the TOML is
    less convenient.
@@ -553,47 +570,87 @@ Three places, in decreasing priority:
 Invalid values fall through to `Auto` with a warning — a typo can
 never prevent the agent from starting.
 
-### Operator escape hatch
+### Known hardware issues (to fix in phase 3)
 
-If a specific driver produces visibly worse output at our
-resolution-scaled bitrate target (observed so far on some older Intel
-iGPUs at 1440p), set `encoder_preference = "software"` and the
-cascade skips MF entirely. This is reversible without re-enrolling.
-
-### Known-bad driver notes (seed list, contributions welcome)
-
-Verification priority order: NVIDIA first, Intel iGPU second, AMD third.
+Verification priority: NVIDIA → Intel iGPU → AMD.
 
 | Vendor | Driver | Symptom | Workaround |
 |---|---|---|---|
-| NVIDIA | *(placeholder — no issues seen yet)* | | |
-| Intel iGPU | *(placeholder — HD Graphics 630 and older have been flaky at low bitrates in the wider MF community; we have not yet reproduced)* | | `encoder_preference = "software"` |
-| AMD | *(placeholder — no issues seen yet)* | | |
+| NVIDIA (GTX 1650 + Intel UHD 630 mixed) | 560.x series | `NVIDIA H.264 Encoder MFT` `ActivateObject` returns `0x8000FFFF` (E_UNEXPECTED) because D3D11 device was created on the default adapter (Intel). Fix requires DXGI adapter enumeration + VendorId=0x10DE match. | Use `encoder_preference=software` (default) |
+| Intel UHD 630 iGPU (Quick Sync) | same | `Intel® Quick Sync Video H.264 Encoder MFT` is async-only; ignores `ASYNC_UNLOCK`; first sync `ProcessOutput` returns `0x8000FFFF`. Fix requires `IMFMediaEventGenerator` event loop. | Use `encoder_preference=software` (default) |
+| AMD | *(not yet tested)* | expected to behave like Intel QSV (async) | |
 
-Each entry should link to a heartbeat-log snippet + reproduction steps
-when filed.
-
-### Smoke test
+### Encoder smoke test
 
 Release builds run `roomler-agent encoder-smoke --encoder hardware`
-as part of the Windows CI job. The test opens the preferred encoder at
-640×480, feeds ten synthetic frames, and fails the build if no
-keyframe comes out or the cascade bottoms out at `NoopEncoder`.
+as part of the Windows CI job. It opens the preferred encoder at
+640×480, feeds 10 synthetic frames, and fails the build if no
+keyframe comes out or the cascade bottoms at `NoopEncoder`.
 
 To reproduce locally:
 
     cargo build -p roomler-agent --release --features full-hw
     target\release\roomler-agent.exe encoder-smoke --encoder hardware
 
-### Future phases
+With the `full-hw` build, the MF backend code is present but only
+engaged when `--encoder hardware` is passed explicitly.
 
-Documented only, not yet implemented:
+### Scaffolding already in place
 
-- **Phase 2**: Chain `CLSID_VideoProcessorMFT` upstream so BGRA→NV12
-  happens on the GPU (eliminates the remaining CPU colour-conversion
-  tax at 4K).
-- **Phase 2**: DXGI Desktop Duplication capture backend that keeps
-  frames as D3D11 textures end-to-end — removes the 900 MB/s of
-  memory bandwidth we currently push at native 4K.
-- **Phase 3**: NVENC (NVIDIA-specific fast path, better quality per
-  bit), AMF (AMD-specific), VideoToolbox (macOS), VAAPI (Linux).
+The following phase-1-and-2 plumbing stays in the codebase ready
+to be re-engaged once phase 3 adds the missing pieces:
+
+- `create_d3d11_device_and_manager()` — builds a multithread-
+  protected D3D11 device + `IMFDXGIDeviceManager`. Works but binds
+  to default adapter.
+- `activate_h264_encoder()` — `MFTEnumEx` with
+  `MFT_ENUM_FLAG_HARDWARE | SORTANDFILTER | SYNCMFT`. Returns
+  first-activating vendor MFT, falls back to MS SW.
+- Async-mode probe via `GetAttributes().GetUINT32(MF_TRANSFORM_ASYNC)`
+  + `MF_TRANSFORM_ASYNC_UNLOCK` attempt. Works for MFTs that honour
+  unlock; doesn't for those that don't.
+- `MFT_MESSAGE_SET_D3D_MANAGER` handoff, tolerant of rejection.
+- `MF_E_TRANSFORM_STREAM_CHANGE` handling in the drain loop.
+- Debug tracing at every `ProcessInput`/`ProcessOutput`.
+
+### Phase 3 scope
+
+Three pieces, each tractable on its own:
+
+1. **DXGI adapter enumeration**. `CreateDXGIFactory1` →
+   `EnumAdapters1` → match VendorId (NVIDIA 0x10DE, Intel 0x8086,
+   AMD 0x1002) → `D3D11CreateDevice` on that adapter. Retry
+   NVENC MFT `ActivateObject` with the adapter-specific device.
+
+2. **Async event loop**. For MFTs that report
+   `MF_TRANSFORM_ASYNC=true` and don't honour `ASYNC_UNLOCK`:
+   `QueryInterface` for `IMFMediaEventGenerator`. Dedicated
+   worker-thread event loop: `GetEvent` (blocking) →
+   `METransformNeedInput` → pull next input from an mpsc queue and
+   `ProcessInput` → `METransformHaveOutput` → `ProcessOutput` and
+   push output to another mpsc queue. Existing
+   `VideoEncoder::encode()` becomes a non-blocking pusher that
+   drains available outputs.
+
+3. **Per-MFT probe-and-rollback**. After full init, run a test
+   encode of 5-10 synthetic frames on the pipeline. If no output,
+   release the MFT and try the next candidate. Falls back to MS SW
+   → openh264 only when all HW MFTs fail.
+
+Estimated effort: 300-500 lines, 1-2 focused days.
+
+### Future phases beyond Windows
+
+Deferred per platform:
+
+- **macOS**: VideoToolbox `VTCompressionSession`. Sync-ish API,
+  per-user `com.apple.security.device.audio-input` entitlement
+  should already be covered by the existing signed .pkg build.
+- **Linux**: VAAPI via `libva`. Intel + AMD on kernel drivers;
+  separate NVENC path for NVIDIA.
+- **GPU-side capture → encoder pipeline** (all platforms).
+  `CLSID_VideoProcessorMFT` upstream of the encoder MFT on
+  Windows so BGRA→NV12 never touches the CPU. A DXGI Desktop
+  Duplication capture backend keeps frames as D3D11 textures
+  end-to-end — removes the 900 MB/s of memory bandwidth we push
+  at native 4K today.

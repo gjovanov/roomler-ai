@@ -15,10 +15,14 @@ cd ui && bun run dev                   # Vite dev server (port 5000, proxies to 
 cd ui && bun run build                 # Production UI build (includes vue-tsc --noEmit)
 
 # Remote-control agent (native binary — runs on the controlled host)
-cargo build -p roomler-agent --release --features full   # full pipeline: capture + encode + input
-cargo build -p roomler-agent --release                   # signalling-only (no media, no input)
+cargo build -p roomler-agent --release --features full      # full pipeline: capture + encode + input (SW encoder)
+cargo build -p roomler-agent --release --features full-hw   # Windows + Media Foundation HW encoder scaffolding (opt-in)
+cargo build -p roomler-agent --release                      # signalling-only (no media, no input)
 ./target/release/roomler-agent enroll --server <url> --token <enrollment-jwt> --name <label>
 ./target/release/roomler-agent run
+./target/release/roomler-agent run --encoder software       # force openh264 (default on Windows today)
+./target/release/roomler-agent run --encoder hardware       # try MF-HW → MF-SW → openh264 (experimental)
+./target/release/roomler-agent encoder-smoke --encoder hardware   # offline: feed 10 synthetic frames, diagnose MFT init
 ./scripts/dev-xvfb.sh                  # capture smoke test via a virtual framebuffer
 
 # Testing
@@ -54,6 +58,14 @@ sudo apt install -y libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev
 ```
 
 Default build (no features) compiles on any rust:bookworm image and produces a signalling-only agent useful for CI / integration tests, but not usable in production (no capture, no input).
+
+### Encoder selection (Windows)
+
+The agent picks an encoder at startup via a three-way preference: **CLI `--encoder` > env `ROOMLER_AGENT_ENCODER` > `encoder_preference` in the agent config TOML > `Auto` default**. Values: `auto` | `hardware` (aliases: `hw`, `mf`) | `software` (aliases: `sw`, `openh264`).
+
+- `Auto` (current default on all OSes): openh264 → Noop. Proven stable at 1080p; capture downscales 1440p/4K with a 2× box filter before encode.
+- `Hardware` (Windows only, requires `--features mf-encoder` / `full-hw`): MF H.264 → openh264 → Noop. **Opt-in**: the MF path is wired (D3D11 device + IMFDXGIDeviceManager + codec-API latency knobs) but NVENC async-init and Intel QSV async event loop are not yet solved — see Phase 3 note in `docs/remote-control.md §17` and the Known Issues below.
+- `Software`: openh264 → Noop. Forces the SW path even on Windows with `mf-encoder` compiled in — useful as a quick comparison escape hatch.
 
 ## Architecture
 
@@ -222,18 +234,20 @@ TeamViewer-style remote desktop. One native agent per controlled host, Roomler A
 
 **WebSocket role multiplexing**: `/ws?token=<jwt>&role=agent` uses the agent JWT audience; no `role` param (or `role=user`) uses the existing user flow. Same WS endpoint, same handshake, different claim validator.
 
-**Status at time of writing** (commits `43f0c5b..a3ac8f3`):
+**Status at 0.1.25**:
 - Server side: REST + WS signalling + Hub + DAOs + audit + TURN creds — complete, 10 integration tests green
-- Agent binary: enrollment + signalling + real webrtc-rs peer + scrap capture + openh264 encoder + enigo input — complete, 4 integration tests green (drives the agent lib in-process)
-- Browser viewer: RemoteControl.vue + useRemoteControl composable + AgentsSection admin UI — complete, 259/259 UI unit tests green
-- **Not yet verified**: end-to-end live run (agent on a real desktop + browser controller seeing live video + typing landing on the remote OS). This is what HANDOVER2.md tells the next session to do first.
+- Agent binary: enrollment + signalling + real webrtc-rs peer + scrap capture + openh264 encoder + enigo input — **live-verified** on Win11 against the production deployment (2026-04-18)
+- Browser viewer: RemoteControl.vue + useRemoteControl composable + AgentsSection admin UI — complete, letterbox-corrected coordinates, wallclock sample durations, idle-keepalive, PLI rate-limiting
+- Windows Media Foundation HW encoder (`--features mf-encoder` / `full-hw`): backend scaffolding complete — D3D11 device binding, latency knobs, probe-and-log on failure — but **opt-in** because NVENC needs DXGI adapter enumeration and Intel QSV needs the async event loop (Phase 3, scoped in `docs/remote-control.md §17`).
+- Release pipeline: `.github/workflows/release-agent.yml` builds signed MSI (cargo-wix), .deb (cargo-deb), and .pkg scaffolding on tag push; runs `encoder-smoke` on windows-latest as a smoke-test gate.
 
 ## Known Issues
 
 - [CRITICAL] [2026-03-10] CORS is fully permissive — Status: FIXED (2026-03-21, uses configured cors_origins)
 - [HIGH] [2026-03-10] No rate limiting — Status: FIXED (2026-03-21, tower_governor 60 req/min per IP)
 - [HIGH] [2026-03-10] JWT default secret is "change-me-in-production" — must be overridden in prod — Status: OPEN
-- [HIGH] [2026-04-17] Remote-control subsystem not yet live-tested end-to-end (agent → browser on a real display) — Status: OPEN, see HANDOVER2.md §"Contact-with-reality plan"
+- [HIGH] [2026-04-17] Remote-control subsystem not yet live-tested end-to-end (agent → browser on a real display) — Status: FIXED (2026-04-18, verified on Win11 + openh264 against roomler.ai)
+- [HIGH] [2026-04-18] Windows MF hardware encoder (NVENC / Intel QSV) is scaffolded but not yet functional — NVENC `ActivateObject` returns `0x8000FFFF` without a matching DXGI adapter; Intel QSV is async-only and ignores `MF_TRANSFORM_ASYNC_UNLOCK`; SW MFT fallback rejects LowDelayVBR and overshoots ~5× the target bitrate. Status: OPEN — scoped as Phase 3 (adapter enum + `IMFMediaEventGenerator` event loop + per-MFT probe-and-rollback), see `docs/remote-control.md §17`.
 - [MEDIUM] [2026-03-10] TypeScript type errors — Status: FIXED (2026-03-21, vue-tsc --noEmit passes)
 - [MEDIUM] [2026-03-10] No security headers in nginx — Status: FIXED (2026-03-21, X-Frame-Options, X-Content-Type-Options, etc.)
 - [MEDIUM] [2026-03-10] No CI pipeline — Status: FIXED (2026-03-21, GitHub Actions: clippy + build + test)
@@ -241,7 +255,7 @@ TeamViewer-style remote desktop. One native agent per controlled host, Roomler A
 - [MEDIUM] [2026-04-17] Remote-control: consent auto-granted on agent (no tray UI yet); fine for self-controlled hosts, needs UI for org-controlled devices per docs §11.2 — Status: OPEN
 - [LOW] [2026-03-10] Deployment strategy is Recreate (no zero-downtime rolling updates) — Status: OPEN
 - [LOW] [2026-03-10] No git hooks configured (no pre-commit, no lint-staged) — Status: OPEN
-- [LOW] [2026-04-17] Remote-control: encoder bitrate is fixed at 3 Mbps (TWCC/REMB adaptive bitrate is a no-op) — Status: OPEN
+- [LOW] [2026-04-17] Remote-control: encoder bitrate is fixed at 3 Mbps (TWCC/REMB adaptive bitrate is a no-op) — Status: OPEN (openh264 path now uses `initial_bitrate_for(w,h)` but is still not adaptive mid-stream)
 - [LOW] [2026-04-17] Remote-control: agent captures primary display only; multi-monitor plumbing stops at the `mon` field in the wire protocol — Status: OPEN
 
 ## Last Health Check
