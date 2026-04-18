@@ -315,7 +315,7 @@ export function useRemoteControl() {
         t: 'mouse_wheel',
         dx: ev.deltaX,
         dy: ev.deltaY,
-        mode: ev.deltaMode === 0 ? 'Pixel' : ev.deltaMode === 1 ? 'Line' : 'Page',
+        mode: ev.deltaMode === 0 ? 'pixel' : ev.deltaMode === 1 ? 'line' : 'page',
       })
     }
 
@@ -371,14 +371,14 @@ export function useRemoteControl() {
 /**
  * Map a browser `MouseEvent.button` (0/1/2/3/4) to the agent's enum.
  */
-function browserButton(n: number): string {
+function browserButton(n: number): 'left' | 'right' | 'middle' | 'back' | 'forward' {
   switch (n) {
-    case 0: return 'Left'
-    case 1: return 'Middle'
-    case 2: return 'Right'
-    case 3: return 'Back'
-    case 4: return 'Forward'
-    default: return 'Left'
+    case 0: return 'left'
+    case 1: return 'middle'
+    case 2: return 'right'
+    case 3: return 'back'
+    case 4: return 'forward'
+    default: return 'left'
   }
 }
 

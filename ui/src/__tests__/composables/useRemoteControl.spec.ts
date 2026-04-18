@@ -8,17 +8,17 @@ import { browserButton, kbdCodeToHid } from '@/composables/useRemoteControl'
 
 describe('browserButton', () => {
   it.each([
-    [0, 'Left'],
-    [1, 'Middle'],
-    [2, 'Right'],
-    [3, 'Back'],
-    [4, 'Forward'],
+    [0, 'left'],
+    [1, 'middle'],
+    [2, 'right'],
+    [3, 'back'],
+    [4, 'forward'],
   ])('maps button %i → %s', (n, expected) => {
     expect(browserButton(n)).toBe(expected)
   })
 
-  it('falls back to Left for unknown button indices', () => {
-    expect(browserButton(99)).toBe('Left')
+  it('falls back to left for unknown button indices', () => {
+    expect(browserButton(99)).toBe('left')
   })
 })
 
