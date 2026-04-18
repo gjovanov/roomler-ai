@@ -57,23 +57,27 @@ use tokio::sync::oneshot;
 
 use windows::Win32::Foundation::E_FAIL;
 use windows::Win32::Media::MediaFoundation::{
-    CLSID_MSH264EncoderMFT, CODECAPI_AVEncCommonMeanBitRate,
+    CLSID_MSH264EncoderMFT, CODECAPI_AVEncCommonMaxBitRate, CODECAPI_AVEncCommonMeanBitRate,
     CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncH264CABACEnable, CODECAPI_AVEncMPVGOPSize,
-    CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode, ICodecAPI, IMFMediaBuffer,
-    IMFMediaType, IMFSample, IMFTransform, MF_E_NOTACCEPTING, MF_E_TRANSFORM_NEED_MORE_INPUT,
-    MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
-    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
-    MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK, MFCreateMediaType, MFCreateMemoryBuffer,
-    MFCreateSample, MFStartup, MFSTARTUP_FULL, MFShutdown, MFMediaType_Video, MFVideoFormat_H264,
-    MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFT_MESSAGE_COMMAND_FLUSH,
-    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
-    MFT_MESSAGE_NOTIFY_END_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
-    MFT_OUTPUT_STREAM_INFO, eAVEncCommonRateControlMode_CBR,
+    CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode, IMFActivate, ICodecAPI,
+    IMFMediaBuffer, IMFMediaType, IMFSample, IMFTransform, MF_E_NOTACCEPTING,
+    MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_AVG_BITRATE,
+    MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
+    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK,
+    MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFStartup, MFSTARTUP_FULL, MFShutdown,
+    MFMediaType_Video, MFTEnumEx, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE,
+    MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT, MFT_FRIENDLY_NAME_Attribute,
+    MFT_REGISTER_TYPE_INFO, MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
+    MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+    MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_END_STREAMING,
+    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_INFO,
+    eAVEncCommonRateControlMode_CBR, eAVEncCommonRateControlMode_LowDelayVBR,
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
+    CoTaskMemFree,
 };
-use windows::core::{GUID, Interface};
+use windows::core::{GUID, Interface, PWSTR};
 
 use super::{EncodedPacket, VideoEncoder};
 use crate::capture::{Frame, PixelFormat};
@@ -254,9 +258,14 @@ impl MfPipeline {
             // one is available. There's no separate "HW only" CLSID
             // in v1 — MFTEnumEx with MFT_ENUM_FLAG_HARDWARE is the
             // path to vendor-specific MFTs (phase 3).
-            let transform: IMFTransform =
-                CoCreateInstance(&CLSID_MSH264EncoderMFT, None, CLSCTX_INPROC_SERVER)
-                    .map_err(|e| anyhow!("CoCreateInstance MSH264Encoder: {e:?}"))?;
+            // Prefer a vendor hardware H.264 MFT (NVENC / QuickSync /
+            // AMF) enumerated via MFTEnumEx. CoCreateInstance on the
+            // plain CLSID always returns Microsoft's *software* MFT,
+            // which on a desktop CPU caps out at ~10 fps at 4K and
+            // defeats the whole point of this backend. Fall back to the
+            // SW MFT only if HW enumeration finds nothing.
+            let (transform, backend_kind) = activate_h264_encoder()?;
+            tracing::info!(backend = backend_kind, "mf-encoder: activated MFT");
 
             // Detect + tame async mode. On systems with hardware H.264
             // acceleration (NVIDIA, Intel QSV, AMD AMF), the MS encoder
@@ -303,15 +312,30 @@ impl MfPipeline {
                 .map_err(|e| anyhow!("MFT does not expose ICodecAPI: {e:?}"))?;
             set_codec_bool(&codec_api, &CODECAPI_AVLowLatencyMode, true)?;
             set_codec_bool(&codec_api, &CODECAPI_AVEncH264CABACEnable, true)?;
-            set_codec_u32(
-                &codec_api,
-                &CODECAPI_AVEncCommonRateControlMode,
-                eAVEncCommonRateControlMode_CBR.0 as u32,
-            )?;
+            // Rate-control mode: prefer CBR on hardware MFTs (NVENC,
+            // QuickSync, AMF all honour it); fall back to LowDelayVBR
+            // on the Microsoft software MFT, which silently ignores
+            // CBR and then defaults to quality-based VBR producing
+            // 200-700 KB frames at 4K instead of respecting a 12 Mbps
+            // target. LowDelayVBR IS supported by the SW MFT.
+            let rc_mode = if backend_kind == "hw" {
+                eAVEncCommonRateControlMode_CBR.0 as u32
+            } else {
+                eAVEncCommonRateControlMode_LowDelayVBR.0 as u32
+            };
+            set_codec_u32(&codec_api, &CODECAPI_AVEncCommonRateControlMode, rc_mode)?;
             set_codec_u32(&codec_api, &CODECAPI_AVEncMPVGOPSize, 60)?;
             let initial_bps =
                 crate::encode::initial_bitrate_for(width, height);
             set_codec_u32(&codec_api, &CODECAPI_AVEncCommonMeanBitRate, initial_bps)?;
+            // Max bitrate cap for VBR modes — prevents the encoder
+            // from bursting way over target on complex frames. We use
+            // 1.5× the mean as a reasonable ceiling.
+            set_codec_u32(
+                &codec_api,
+                &CODECAPI_AVEncCommonMaxBitRate,
+                initial_bps.saturating_mul(3) / 2,
+            )?;
 
             // Start streaming.
             transform
@@ -511,6 +535,105 @@ impl MfPipeline {
 // ---------------------------------------------------------------------
 // Helpers (all unsafe-COM, kept in one place for easier auditing).
 // ---------------------------------------------------------------------
+
+/// Activate the best-available H.264 encoder MFT. Tries hardware first
+/// (MFTEnumEx with MFT_ENUM_FLAG_HARDWARE — finds NVENC on NVIDIA,
+/// QuickSync on Intel, AMF on AMD), falls back to the Microsoft
+/// software MFT (CLSID_MSH264EncoderMFT) if no HW MFT is installed.
+///
+/// Returns the activated transform plus a short tag describing what
+/// we got, used only for logging ("hw: NVIDIA NVENC ..." vs "sw: MS").
+unsafe fn activate_h264_encoder() -> Result<(IMFTransform, &'static str)> {
+    unsafe {
+        let input_info = MFT_REGISTER_TYPE_INFO {
+            guidMajorType: MFMediaType_Video,
+            guidSubtype: MFVideoFormat_NV12,
+        };
+        let output_info = MFT_REGISTER_TYPE_INFO {
+            guidMajorType: MFMediaType_Video,
+            guidSubtype: MFVideoFormat_H264,
+        };
+
+        // Hardware MFTs first. `SORTANDFILTER` asks MF to order results
+        // by merit so the best-scoring hardware encoder is index 0.
+        let flags =
+            MFT_ENUM_FLAG_HARDWARE.0 | MFT_ENUM_FLAG_SORTANDFILTER.0 | MFT_ENUM_FLAG_SYNCMFT.0;
+        let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
+        let mut count: u32 = 0;
+        let enum_rc = MFTEnumEx(
+            MFT_CATEGORY_VIDEO_ENCODER,
+            flags,
+            Some(&input_info),
+            Some(&output_info),
+            &mut activates,
+            &mut count,
+        );
+
+        if enum_rc.is_ok() && count > 0 && !activates.is_null() {
+            // Walk the returned IMFActivate array, try each one. The MF
+            // idiom is: activate to IMFTransform, release the activate.
+            let slice = std::slice::from_raw_parts(activates, count as usize);
+            let mut last_err: Option<windows::core::Error> = None;
+            for (i, maybe_act) in slice.iter().enumerate() {
+                let Some(act) = maybe_act else { continue };
+                // Best-effort friendly-name log for diagnostics — it's
+                // how we'll know "oh yeah NVENC" vs "Intel Quick Sync".
+                let mut name_buf: [u16; 256] = [0; 256];
+                let mut name_len: u32 = 0;
+                let _ = act.GetString(
+                    &MFT_FRIENDLY_NAME_Attribute,
+                    &mut name_buf,
+                    Some(&mut name_len),
+                );
+                let name = String::from_utf16_lossy(&name_buf[..name_len as usize]);
+                match act.ActivateObject::<IMFTransform>() {
+                    Ok(transform) => {
+                        tracing::info!(
+                            index = i,
+                            name = %name,
+                            total = count,
+                            "mf-encoder: activated hardware MFT"
+                        );
+                        // Free the remaining IMFActivate references and the array.
+                        for other in &slice[i + 1..] {
+                            if let Some(a) = other {
+                                drop(a.clone()); // release our clone
+                            }
+                        }
+                        CoTaskMemFree(Some(activates as *const _));
+                        return Ok((transform, "hw"));
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            index = i,
+                            name = %name,
+                            %e,
+                            "mf-encoder: ActivateObject on hardware MFT failed — trying next"
+                        );
+                        last_err = Some(e);
+                    }
+                }
+            }
+            CoTaskMemFree(Some(activates as *const _));
+            if let Some(e) = last_err {
+                tracing::warn!(%e, "mf-encoder: all hardware MFTs failed to activate — falling back to SW");
+            }
+        } else {
+            tracing::info!(
+                count,
+                "mf-encoder: no hardware H.264 MFT enumerated — falling back to SW"
+            );
+        }
+
+        // SW fallback — CLSID_MSH264EncoderMFT is always present on
+        // Windows 8+ and is sync-only, producing ~10 fps at 4K on a
+        // desktop CPU. Good for low-res screens and pure-SW VMs.
+        let transform: IMFTransform =
+            CoCreateInstance(&CLSID_MSH264EncoderMFT, None, CLSCTX_INPROC_SERVER)
+                .map_err(|e| anyhow!("CoCreateInstance MSH264Encoder (SW fallback): {e:?}"))?;
+        Ok((transform, "sw"))
+    }
+}
 
 unsafe fn build_output_media_type(width: u32, height: u32) -> Result<IMFMediaType> {
     unsafe {
