@@ -46,6 +46,50 @@ use crate::input;
 /// how fast the capturer emits frames.
 const TARGET_FPS: u32 = 30;
 
+/// Quality preference advertised by the controller over the `control`
+/// data channel. Encoded as `AtomicU8` so the media pump can poll it
+/// per-frame without locking. Translated to a bitrate clamp on the
+/// active encoder; future revisions may also clamp fps and downscale
+/// when capture-side knobs (1F.1) are wired through.
+mod quality {
+    pub(super) const AUTO: u8 = 0;
+    pub(super) const LOW: u8 = 1;
+    pub(super) const HIGH: u8 = 2;
+
+    /// Parse the wire-format string into the atomic value. Anything
+    /// unrecognised maps to `AUTO` and is logged by the caller.
+    pub(super) fn from_wire(s: &str) -> Option<u8> {
+        match s.to_ascii_lowercase().as_str() {
+            "low" => Some(LOW),
+            "auto" => Some(AUTO),
+            "high" => Some(HIGH),
+            _ => None,
+        }
+    }
+
+    pub(super) fn label(v: u8) -> &'static str {
+        match v {
+            LOW => "low",
+            HIGH => "high",
+            _ => "auto",
+        }
+    }
+
+    /// Map a quality preference to the bitrate target, scaled off the
+    /// resolution-derived baseline. Low halves it (better fit for
+    /// metered uplinks), High adds 50% (capped at 20 Mbps to keep the
+    /// VBV buffer math reasonable on 4K).
+    pub(super) fn target_bitrate(quality: u8, base_bps: u32) -> u32 {
+        const MAX_HIGH_BPS: u32 = 20_000_000;
+        match quality {
+            LOW => (base_bps / 2).max(500_000),
+            HIGH => base_bps.saturating_mul(3) / 2,
+            _ => base_bps,
+        }
+        .min(MAX_HIGH_BPS)
+    }
+}
+
 /// Pick the capture downscale policy consistent with an encoder
 /// preference. HW encoders can eat 4K frames without breaking a sweat;
 /// SW openh264 needs the 2× downsample to stay above ~30 fps at 1080p,
@@ -160,6 +204,10 @@ impl AgentPeer {
         // IDRs spike bandwidth → more loss → more PLI → collapse. Cap
         // keyframe responses to at most one per MIN_KEYFRAME_GAP.
         let keyframe_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Controller's quality preference, mutated by the `control`
+        // data channel handler and polled by the media pump. AUTO is
+        // the safe default until the controller advertises otherwise.
+        let quality_state = Arc::new(std::sync::atomic::AtomicU8::new(quality::AUTO));
         let rtcp_reader = {
             let flag = keyframe_requested.clone();
             let sid = session_id;
@@ -245,14 +293,17 @@ impl AgentPeer {
         }
 
         // Route data channels by label. `input` goes to the OS injector;
-        // the others (control/clipboard/files) are accepted but not yet
-        // wired — they'll get their own handlers in follow-up phases.
+        // `control` parses rc:* JSON (quality preference, etc.); the
+        // others (clipboard/files) are accepted but not yet wired.
+        let quality_for_dc = quality_state.clone();
         pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
             let label = dc.label().to_string();
             info!(session = %session_id, %label, "data channel opened");
+            let quality_for_dc = quality_for_dc.clone();
             Box::pin(async move {
                 match label.as_str() {
                     "input" => attach_input_handler(dc),
+                    "control" => attach_control_handler(dc, session_id, quality_for_dc),
                     _ => attach_log_only(dc, session_id),
                 }
             })
@@ -265,6 +316,7 @@ impl AgentPeer {
             session_id,
             video_track,
             keyframe_requested,
+            quality_state.clone(),
             encoder_preference,
         ));
 
@@ -331,6 +383,7 @@ async fn media_pump(
     session_id: bson::oid::ObjectId,
     track: Arc<TrackLocalStaticSample>,
     keyframe_requested: Arc<std::sync::atomic::AtomicBool>,
+    quality_state: Arc<std::sync::atomic::AtomicU8>,
     encoder_preference: encode::EncoderPreference,
 ) {
     // Capture downscale policy mirrors the encoder preference. When the
@@ -388,6 +441,13 @@ async fn media_pump(
     let mut frames_keepalive: u64 = 0;
     let mut bytes_written: u64 = 0;
     let mut write_errors: u64 = 0;
+
+    // Last applied quality preference. Initialised to a sentinel
+    // (0xFF) so the first loop iteration unconditionally pushes the
+    // current AUTO/Low/High choice into the encoder, even when no
+    // controller message has arrived yet (covers the case where the
+    // encoder is rebuilt mid-session and needs the bitrate re-applied).
+    let mut last_applied_quality: u8 = 0xFF;
 
     loop {
         let frame: std::sync::Arc<crate::capture::Frame> = match capturer.next_frame().await {
@@ -458,11 +518,40 @@ async fn media_pump(
                 encoder_preference,
             ));
             encoder_dims = Some((frame.width, frame.height));
+            // Force the quality preference back through the new
+            // encoder — set_bitrate state lives on the encoder
+            // instance, so a rebuild starts from the resolution-
+            // derived default until we re-apply.
+            last_applied_quality = 0xFF;
         }
 
         let enc = encoder.as_mut().unwrap();
         if keyframe_requested.swap(false, std::sync::atomic::Ordering::Relaxed) {
             enc.request_keyframe();
+        }
+
+        // Quality preference application. Cheap atomic load on every
+        // frame; bitrate push only when the controller actually
+        // changed it OR the encoder was just rebuilt (sentinel
+        // 0xFF on first iteration). MF honours set_bitrate via
+        // ICodecAPI; openh264 logs-and-drops today (1F.2 wires that
+        // properly). Either way the atomic load + comparison is
+        // sub-microsecond, never blocks the pump.
+        let q_now = quality_state.load(std::sync::atomic::Ordering::Relaxed);
+        if q_now != last_applied_quality {
+            if let Some((w, h)) = encoder_dims {
+                let base = encode::initial_bitrate_for(w, h);
+                let target = quality::target_bitrate(q_now, base);
+                enc.set_bitrate(target);
+                info!(
+                    %session_id,
+                    quality = quality::label(q_now),
+                    base_bps = base,
+                    target_bps = target,
+                    "applying quality preference"
+                );
+            }
+            last_applied_quality = q_now;
         }
         let packets = match enc.encode(frame).await {
             Ok(p) => p,
@@ -566,9 +655,72 @@ fn attach_input_handler(dc: Arc<RTCDataChannel>) {
     }));
 }
 
+/// `control` data-channel handler. Parses JSON `rc:*` envelopes and
+/// applies them. Today the only message is `rc:quality` (mutating the
+/// shared atomic that the media pump polls before each encode); future
+/// types (rc:cursor-shape from agent → controller, rc:bitrate-hint,
+/// rc:dpi-change) layer on the same parse-by-`t` switch.
+fn attach_control_handler(
+    dc: Arc<RTCDataChannel>,
+    session_id: bson::oid::ObjectId,
+    quality_state: Arc<std::sync::atomic::AtomicU8>,
+) {
+    dc.on_message(Box::new(move |msg| {
+        let quality_state = quality_state.clone();
+        Box::pin(async move {
+            // Trust-but-verify: a malformed message must never crash
+            // the data-channel callback (it'd kill the channel for
+            // the rest of the session). Every parse path silently
+            // logs and returns on failure.
+            let text = match std::str::from_utf8(&msg.data) {
+                Ok(t) => t,
+                Err(_) => {
+                    debug!(%session_id, bytes = msg.data.len(), "control: non-UTF8 payload, dropped");
+                    return;
+                }
+            };
+            let val: serde_json::Value = match serde_json::from_str(text) {
+                Ok(v) => v,
+                Err(e) => {
+                    debug!(%session_id, %e, "control: malformed JSON, dropped");
+                    return;
+                }
+            };
+            let Some(t) = val.get("t").and_then(|v| v.as_str()) else {
+                debug!(%session_id, "control: message missing 't' tag, dropped");
+                return;
+            };
+            match t {
+                "rc:quality" => {
+                    let Some(q_str) = val.get("quality").and_then(|v| v.as_str()) else {
+                        debug!(%session_id, "control: rc:quality missing quality field");
+                        return;
+                    };
+                    let Some(q_val) = quality::from_wire(q_str) else {
+                        debug!(%session_id, q = q_str, "control: rc:quality unknown value");
+                        return;
+                    };
+                    let prev = quality_state.swap(q_val, std::sync::atomic::Ordering::Relaxed);
+                    if prev != q_val {
+                        info!(
+                            %session_id,
+                            prev = quality::label(prev),
+                            new = quality::label(q_val),
+                            "control: rc:quality updated"
+                        );
+                    }
+                }
+                other => {
+                    debug!(%session_id, t = other, "control: unknown message type");
+                }
+            }
+        })
+    }));
+}
+
 /// Placeholder handler for data channels that aren't wired to OS output
-/// yet (`control`, `clipboard`, `files`). Logs message sizes so we can
-/// see activity without spamming the log with contents.
+/// yet (`clipboard`, `files`). Logs message sizes so we can see
+/// activity without spamming the log with contents.
 fn attach_log_only(dc: Arc<RTCDataChannel>, session_id: bson::oid::ObjectId) {
     let label = dc.label().to_string();
     dc.on_message(Box::new(move |msg| {
@@ -586,4 +738,65 @@ fn map_ice_servers(servers: &[IceServer]) -> Vec<RTCIceServer> {
             credential: s.credential.clone().unwrap_or_default(),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::quality::*;
+
+    #[test]
+    fn from_wire_accepts_known_values_case_insensitively() {
+        assert_eq!(from_wire("low"), Some(LOW));
+        assert_eq!(from_wire("LOW"), Some(LOW));
+        assert_eq!(from_wire("Low"), Some(LOW));
+        assert_eq!(from_wire("auto"), Some(AUTO));
+        assert_eq!(from_wire("Auto"), Some(AUTO));
+        assert_eq!(from_wire("high"), Some(HIGH));
+        assert_eq!(from_wire("HIGH"), Some(HIGH));
+    }
+
+    #[test]
+    fn from_wire_rejects_unknown_values() {
+        assert_eq!(from_wire(""), None);
+        assert_eq!(from_wire("medium"), None);
+        assert_eq!(from_wire("ultra"), None);
+        assert_eq!(from_wire("0"), None);
+    }
+
+    #[test]
+    fn label_round_trips_known_values() {
+        assert_eq!(label(LOW), "low");
+        assert_eq!(label(AUTO), "auto");
+        assert_eq!(label(HIGH), "high");
+        // Sentinel + unknown values fall back to "auto" so logs stay
+        // useful even when the atomic gets corrupted.
+        assert_eq!(label(0xFF), "auto");
+        assert_eq!(label(42), "auto");
+    }
+
+    #[test]
+    fn target_bitrate_scales_per_quality() {
+        // Base = 6 Mbps (rough 1080p target).
+        let base = 6_000_000;
+        assert_eq!(target_bitrate(LOW, base), 3_000_000);
+        assert_eq!(target_bitrate(AUTO, base), 6_000_000);
+        assert_eq!(target_bitrate(HIGH, base), 9_000_000);
+    }
+
+    #[test]
+    fn target_bitrate_low_floors_at_500_kbps() {
+        // Even on tiny resolutions Low must produce a usable stream.
+        assert_eq!(target_bitrate(LOW, 100_000), 500_000);
+        assert_eq!(target_bitrate(LOW, 1_000_000), 500_000);
+        assert_eq!(target_bitrate(LOW, 1_500_000), 750_000);
+    }
+
+    #[test]
+    fn target_bitrate_high_caps_at_20_mbps() {
+        // 4K base is 12 Mbps clamped; High should add 50% capped at 20.
+        assert_eq!(target_bitrate(HIGH, 12_000_000), 18_000_000);
+        // Very high base: cap engages.
+        assert_eq!(target_bitrate(HIGH, 20_000_000), 20_000_000);
+        assert_eq!(target_bitrate(HIGH, 50_000_000), 20_000_000);
+    }
 }
