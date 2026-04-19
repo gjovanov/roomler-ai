@@ -328,14 +328,11 @@ fn stub_displays() -> Vec<DisplayInfo> {
 }
 
 fn stub_caps() -> AgentCaps {
-    AgentCaps {
-        hw_encoders: vec![],
-        codecs: vec!["h264".into()],
-        has_input_permission: false,
-        supports_clipboard: false,
-        supports_file_transfer: false,
-        max_simultaneous_sessions: 1,
-    }
+    // Real probe via encode::caps; replaces the empty-vec stub. The
+    // resulting AgentCaps populates the rc:agent.hello payload, which
+    // the server persists into the agents collection and surfaces in
+    // the admin UI (2A.2).
+    crate::encode::caps::detect()
 }
 
 fn urlencode(s: &str) -> String {

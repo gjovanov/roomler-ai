@@ -12,6 +12,24 @@ export interface AccessPolicy {
   auto_terminate_idle_minutes: number | null
 }
 
+/** Codec + HW backend availability advertised by the agent in its
+ *  rc:agent.hello payload. AgentsSection renders these as chips so
+ *  operators can spot which agents support H.265 / AV1 etc. without
+ *  starting a session. Phase 2 codec negotiation uses the union with
+ *  the controller browser's capabilities to pick the best codec.
+ *  Defaults to empty arrays for agents that haven't reconnected since
+ *  the 2A.1 schema landed (server back-fills `Default::default()`). */
+export interface AgentCapabilities {
+  /** mime-style codec names: 'h264', 'h265', 'av1'. */
+  codecs: string[]
+  /** Descriptive backend labels: 'openh264-sw', 'mf-h264-hw', 'mf-h265-hw'. */
+  hw_encoders: string[]
+  has_input_permission: boolean
+  supports_clipboard: boolean
+  supports_file_transfer: boolean
+  max_simultaneous_sessions: number
+}
+
 export interface Agent {
   id: string
   tenant_id: string
@@ -24,6 +42,8 @@ export interface Agent {
   is_online: boolean
   last_seen_at: string
   access_policy: AccessPolicy
+  /** Optional because pre-2A.1 agents (and tests) may not include it. */
+  capabilities?: AgentCapabilities
 }
 
 export interface EnrollmentToken {

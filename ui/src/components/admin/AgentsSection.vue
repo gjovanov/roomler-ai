@@ -39,6 +39,7 @@
             <th>Name</th>
             <th>OS</th>
             <th>Version</th>
+            <th>Codecs</th>
             <th>Status</th>
             <th>Last seen</th>
             <th class="text-right">Actions</th>
@@ -67,6 +68,24 @@
               </v-chip>
             </td>
             <td class="text-caption">{{ a.agent_version || '—' }}</td>
+            <td>
+              <div class="d-flex flex-wrap gap-1">
+                <v-chip
+                  v-for="codec in codecChips(a)"
+                  :key="codec.label"
+                  size="x-small"
+                  :color="codec.color"
+                  variant="tonal"
+                  :title="codec.tooltip"
+                >
+                  {{ codec.label }}
+                </v-chip>
+                <span
+                  v-if="codecChips(a).length === 0"
+                  class="text-caption text-medium-emphasis"
+                >—</span>
+              </div>
+            </td>
             <td>
               <v-chip size="small" :color="statusColor(a)" variant="flat">
                 {{ a.is_online ? 'Online' : a.status }}
@@ -175,6 +194,7 @@
 <script setup lang="ts">
 import { ref, onMounted, watch } from 'vue'
 import { useAgentStore, type Agent, type EnrollmentToken } from '@/stores/agents'
+import { codecChips } from './agentCodecChips'
 
 const props = defineProps<{ tenantId: string }>()
 
