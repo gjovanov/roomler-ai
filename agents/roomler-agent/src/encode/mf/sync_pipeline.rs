@@ -13,25 +13,22 @@ use anyhow::{Result, anyhow, bail};
 use windows::Win32::Foundation::{E_FAIL, E_INVALIDARG};
 use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 use windows::Win32::Media::MediaFoundation::{
-    CLSID_MSH264EncoderMFT, CODECAPI_AVEncCommonMaxBitRate, CODECAPI_AVEncCommonMeanBitRate,
+    CODECAPI_AVEncCommonMaxBitRate, CODECAPI_AVEncCommonMeanBitRate,
     CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncH264CABACEnable, CODECAPI_AVEncMPVGOPSize,
     CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode, ICodecAPI, IMFDXGIDeviceManager,
     IMFMediaBuffer, IMFMediaType, IMFSample, IMFTransform, MF_E_NOTACCEPTING,
     MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_AVG_BITRATE,
     MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
-    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK,
-    MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video,
-    MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
-    MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_END_STREAMING,
-    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
+    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MFCreateMediaType, MFCreateMemoryBuffer,
+    MFCreateSample, MFMediaType_Video, MFT_MESSAGE_COMMAND_FLUSH,
+    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
+    MFT_MESSAGE_NOTIFY_END_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
     MFT_OUTPUT_STREAM_INFO, MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
     eAVEncCommonRateControlMode_CBR, eAVEncCommonRateControlMode_LowDelayVBR,
 };
-use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
 use windows::core::{GUID, Interface};
 
 use super::super::EncodedPacket;
-use super::create_d3d11_device_and_manager;
 use crate::capture::Frame;
 use crate::encode::color;
 
@@ -55,81 +52,34 @@ pub(super) struct MfPipeline {
 }
 
 impl MfPipeline {
-    pub(super) fn new(width: u32, height: u32) -> Result<Self> {
+    /// Build a pipeline from an already-activated [`IMFTransform`].
+    ///
+    /// Caller contract (satisfied by the cascade in [`super::activate`]):
+    /// - transform has been activated via `IMFActivate::ActivateObject`
+    ///   (HW path) or `CoCreateInstance(CLSID_MSH264EncoderMFT)` (SW).
+    /// - D3D manager, if any, has already been bound via
+    ///   `MFT_MESSAGE_SET_D3D_MANAGER`.
+    /// - `MF_TRANSFORM_ASYNC_UNLOCK` has already been applied if the MFT
+    ///   reports async. Async-only MFTs should never reach this path;
+    ///   they get routed to the async pipeline instead.
+    ///
+    /// `backend_kind` selects rate-control mode: `"hw"` → CBR (NVENC,
+    /// QSV, AMF all honour it), `"sw"` → LowDelayVBR (MS SW MFT rejects
+    /// CBR + LowLatency combo and silently falls back to quality-VBR,
+    /// overshooting target bitrate ~5×). Either value is shared with
+    /// the cascade logger via the returned pipeline's name.
+    ///
+    /// `_d3d_device` and `_d3d_manager` are kept as fields so the MFT's
+    /// weak references remain valid for the pipeline's lifetime.
+    pub(super) fn new(
+        transform: IMFTransform,
+        d3d_device: Option<ID3D11Device>,
+        d3d_manager: Option<IMFDXGIDeviceManager>,
+        backend_kind: &'static str,
+        width: u32,
+        height: u32,
+    ) -> Result<Self> {
         unsafe {
-            // Activate the H.264 Encoder MFT. The CLSID covers the
-            // Microsoft-shipped encoder which, on any recent Windows,
-            // delegates to the IHV driver's hardware encoder MFT when
-            // one is available. There's no separate "HW only" CLSID
-            // in v1 — MFTEnumEx with MFT_ENUM_FLAG_HARDWARE is the
-            // path to vendor-specific MFTs (Phase 3 commit 2+).
-            //
-            // For now we use the Microsoft software MFT
-            // (CoCreateInstance) as the encoder and *try* to hand it
-            // a D3D manager on systems where that unlocks internal HW
-            // acceleration routing. If the MFT rejects the manager
-            // (WARP / pure-SW hosts), we just keep going.
-            let d3d_aux = create_d3d11_device_and_manager()
-                .map_err(|e| {
-                    tracing::warn!(
-                        %e,
-                        "mf-encoder: D3D11 setup skipped — continuing without HW-accel assist"
-                    );
-                })
-                .ok();
-
-            let transform: IMFTransform =
-                CoCreateInstance(&CLSID_MSH264EncoderMFT, None, CLSCTX_INPROC_SERVER)
-                    .map_err(|e| anyhow!("CoCreateInstance MSH264Encoder: {e:?}"))?;
-            let backend_kind = "sw";
-            tracing::info!(backend = backend_kind, "mf-encoder: activated MFT (sw phase 2)");
-
-            if let Some((_, ref d3d_manager)) = d3d_aux {
-                let manager_ptr: usize = d3d_manager.as_raw() as usize;
-                match transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager_ptr) {
-                    Ok(()) => tracing::info!("mf-encoder: D3D manager bound to SW MFT"),
-                    Err(e) => tracing::info!(
-                        code = %e.code().0,
-                        "mf-encoder: SW MFT ignored D3D manager — continuing pure-SW"
-                    ),
-                }
-            }
-
-            // Unpack for MfPipeline storage — needs to outlive the
-            // MFT since the MFT may hold a reference to the manager.
-            let (d3d_device, d3d_manager) = match d3d_aux {
-                Some((dev, mgr)) => (Some(dev), Some(mgr)),
-                None => (None, None),
-            };
-
-            // Detect + tame async mode. On systems with hardware H.264
-            // acceleration (NVIDIA, Intel QSV, AMD AMF), the MS encoder
-            // MFT can switch itself into async mode, where it silently
-            // buffers every ProcessInput and never returns output to a
-            // caller using the sync ProcessOutput loop. The fix is to
-            // set MF_TRANSFORM_ASYNC_UNLOCK=1, which makes the MFT
-            // honour sync semantics even when its internal worker is
-            // async. On MFTs that are already sync-only (WARP fallback,
-            // pure-SW Windows), the attribute set is a no-op.
-            if let Ok(attrs) = transform.GetAttributes() {
-                let is_async = attrs
-                    .GetUINT32(&MF_TRANSFORM_ASYNC)
-                    .map(|v| v != 0)
-                    .unwrap_or(false);
-                tracing::info!(is_async, "mf-encoder: MFT async-mode probe");
-                if is_async
-                    && let Err(e) = attrs.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1)
-                {
-                    tracing::warn!(
-                        %e,
-                        "mf-encoder: async unlock failed — MFT will stay in async mode; \
-                         sync ProcessOutput will buffer forever. Expect zero output."
-                    );
-                }
-            } else {
-                tracing::debug!("mf-encoder: MFT has no attribute store");
-            }
-
             // Set output type first (required by the MFT contract).
             let out_type = build_output_media_type(width, height)?;
             transform
@@ -147,12 +97,6 @@ impl MfPipeline {
                 .map_err(|e| anyhow!("MFT does not expose ICodecAPI: {e:?}"))?;
             set_codec_bool(&codec_api, &CODECAPI_AVLowLatencyMode, true)?;
             set_codec_bool(&codec_api, &CODECAPI_AVEncH264CABACEnable, true)?;
-            // Rate-control mode: prefer CBR on hardware MFTs (NVENC,
-            // QuickSync, AMF all honour it); fall back to LowDelayVBR
-            // on the Microsoft software MFT, which silently ignores
-            // CBR and then defaults to quality-based VBR producing
-            // 200-700 KB frames at 4K instead of respecting a 12 Mbps
-            // target. LowDelayVBR IS supported by the SW MFT.
             let rc_mode = if backend_kind == "hw" {
                 eAVEncCommonRateControlMode_CBR.0 as u32
             } else {
@@ -163,8 +107,8 @@ impl MfPipeline {
             let initial_bps = crate::encode::initial_bitrate_for(width, height);
             set_codec_u32(&codec_api, &CODECAPI_AVEncCommonMeanBitRate, initial_bps)?;
             // Max bitrate cap for VBR modes — prevents the encoder
-            // from bursting way over target on complex frames. We use
-            // 1.5× the mean as a reasonable ceiling.
+            // from bursting way over target on complex frames. 1.5×
+            // the mean as a reasonable ceiling.
             set_codec_u32(
                 &codec_api,
                 &CODECAPI_AVEncCommonMaxBitRate,
@@ -180,6 +124,7 @@ impl MfPipeline {
                 .map_err(|e| anyhow!("START_OF_STREAM: {e:?}"))?;
 
             tracing::info!(
+                backend = backend_kind,
                 width,
                 height,
                 initial_bps,
@@ -198,45 +143,32 @@ impl MfPipeline {
         }
     }
 
-    pub(super) fn encode(&mut self, frame: &Frame) -> Result<Vec<EncodedPacket>> {
-        // Defensive check — the MfEncoder handle also validates, but
-        // a direct caller to MfPipeline (future probe harness) can
-        // skip that layer.
-        if frame.width != self.width || frame.height != self.height {
-            bail!(
-                "mf-pipeline: frame dim mismatch: configured {}x{}, got {}x{}",
-                self.width,
-                self.height,
-                frame.width,
-                frame.height
-            );
-        }
+    /// Pipeline dimensions. Used by the probe harness to shape its
+    /// synthetic NV12 payload.
+    pub(super) fn dims(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
 
-        // 1. Convert BGRA → NV12 on the CPU. Phase 2 replaces this with
-        //    VideoProcessorMFT chained upstream.
-        let nv12 = color::bgra_to_nv12(&frame.data, frame.width, frame.height, frame.stride)
-            .map_err(|e| anyhow!("bgra_to_nv12: {e}"))?;
-
-        // 2. Wrap the NV12 payload in an IMFSample.
-        let sample = unsafe { build_input_sample(&nv12, self.frame_count)? };
-        self.frame_count = self.frame_count.wrapping_add(1);
-
-        // 3. ProcessInput. If the MFT refuses, we drain its output first
-        //    and retry — required by the trait-like MFT contract.
+    /// Encode a pre-converted NV12 payload. Shared path used by both
+    /// the regular [`Self::encode`] (which does BGRA→NV12 upstream)
+    /// and the cascade probe in [`super::probe`].
+    pub(super) fn encode_nv12(
+        &mut self,
+        nv12: &[u8],
+        frame_index: u64,
+    ) -> Result<Vec<EncodedPacket>> {
+        let sample = unsafe { build_input_sample(nv12, frame_index)? };
         let mut drained_first = false;
         loop {
             let rc = unsafe { self.transform.ProcessInput(0, &sample, 0) };
             match rc {
                 Ok(()) => {
-                    tracing::debug!(
-                        frame = self.frame_count.saturating_sub(1),
-                        "mf ProcessInput: OK"
-                    );
+                    tracing::debug!(frame = frame_index, "mf ProcessInput: OK");
                     break;
                 }
                 Err(e) if e.code() == MF_E_NOTACCEPTING => {
                     tracing::debug!(
-                        frame = self.frame_count.saturating_sub(1),
+                        frame = frame_index,
                         "mf ProcessInput: NOTACCEPTING — draining first"
                     );
                     if drained_first {
@@ -250,10 +182,32 @@ impl MfPipeline {
                 Err(e) => bail!("ProcessInput: {e:?}"),
             }
         }
-
-        // 4. Drain output. Returns any encoded packets.
+        self.frame_count = self.frame_count.wrapping_add(1);
         let packets = self.drain_output(Vec::new())?;
         Ok(packets)
+    }
+
+    pub(super) fn encode(&mut self, frame: &Frame) -> Result<Vec<EncodedPacket>> {
+        // Defensive check — the MfEncoder handle also validates, but
+        // a direct caller to MfPipeline (probe harness) can skip that
+        // layer.
+        if frame.width != self.width || frame.height != self.height {
+            bail!(
+                "mf-pipeline: frame dim mismatch: configured {}x{}, got {}x{}",
+                self.width,
+                self.height,
+                frame.width,
+                frame.height
+            );
+        }
+
+        // BGRA → NV12 on the CPU. Phase 2 replaces this with
+        // VideoProcessorMFT chained upstream (per-plan 1C.3).
+        let nv12 = color::bgra_to_nv12(&frame.data, frame.width, frame.height, frame.stride)
+            .map_err(|e| anyhow!("bgra_to_nv12: {e}"))?;
+
+        let frame_index = self.frame_count;
+        self.encode_nv12(&nv12, frame_index)
     }
 
     /// Drain `ProcessOutput` until it signals `NEED_MORE_INPUT`.

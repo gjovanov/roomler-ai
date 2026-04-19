@@ -3,9 +3,9 @@
 //! Stored at `<user config dir>/roomler-agent/config.toml`. On Linux that
 //! resolves to `$XDG_CONFIG_HOME/roomler-agent/` or `~/.config/roomler-agent/`.
 //!
-//! The file holds the enrolled agent's identity + its long-lived agent token
-//! + the server URL. It is the user's responsibility to keep the file mode
-//! 0600 — on Linux/macOS we set that on write.
+//! The file holds the enrolled agent's identity, its long-lived agent
+//! token, and the server URL. It is the user's responsibility to keep
+//! the file at mode 0600; on Linux/macOS we set that permission on write.
 
 use anyhow::{Context, Result};
 use directories::ProjectDirs;

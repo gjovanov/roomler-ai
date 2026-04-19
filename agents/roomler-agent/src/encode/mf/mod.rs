@@ -24,16 +24,21 @@
 //!       ▼  Vec<EncodedPacket>
 //! ```
 //!
-//! Module layout (post-split, Phase 3 commit 1):
+//! Module layout (Phase 3 commit 3 — probe-and-rollback cascade):
 //!
-//! - `mod.rs` — the thread-pinned `MfEncoder` handle + Cmd loop; COM/MF
-//!   lifecycle (CoInitializeEx/MFStartup/MFShutdown/CoUninitialize);
-//!   shared D3D11 helpers (`create_d3d11_device_and_manager`,
-//!   `activate_h264_encoder`). The latter two are kept here for now;
-//!   Phase 3 commit 2 replaces them with adapter-aware variants.
-//! - `sync_pipeline.rs` — `MfPipeline`: the synchronous MFT pipeline
-//!   (input/output media types, ProcessInput + drain loop, codec-api
-//!   tuning knobs, Annex-B NALU extraction).
+//! - `mod.rs` — thread-pinned `MfEncoder` handle + Cmd loop; COM/MF
+//!   lifecycle (CoInitializeEx / MFStartup / MFShutdown /
+//!   CoUninitialize); shared `create_d3d11_device_and_manager`
+//!   helper (default-adapter path).
+//! - `adapter.rs` — DXGI adapter enumeration + adapter-scoped D3D11
+//!   device creation (Phase 3 commit 2).
+//! - `activate.rs` — adapter × MFT cascade with probe-and-rollback.
+//!   Replaces the monolithic `activate_h264_encoder` helper.
+//! - `probe.rs` — single-frame probe harness used by the cascade to
+//!   verify an activated MFT actually emits bytes.
+//! - `sync_pipeline.rs` — `MfPipeline`: synchronous MFT pipeline
+//!   (media-type setup, ProcessInput + drain loop, codec-api tuning
+//!   knobs, Annex-B NALU extraction). Assumes pre-activated MFT.
 //!
 //! Latency knobs applied via `ICodecAPI` (all off by default,
 //! every one a must-set for sub-100 ms interactive streaming):
@@ -62,22 +67,19 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11Multithread,
 };
 use windows::Win32::Media::MediaFoundation::{
-    CLSID_MSH264EncoderMFT, IMFActivate, IMFDXGIDeviceManager, IMFTransform,
-    MFCreateDXGIDeviceManager, MFMediaType_Video, MFShutdown, MFStartup, MFSTARTUP_FULL,
-    MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER,
-    MFT_ENUM_FLAG_SYNCMFT, MFT_FRIENDLY_NAME_Attribute, MFT_REGISTER_TYPE_INFO, MFTEnumEx,
-    MFVideoFormat_H264, MFVideoFormat_NV12,
+    IMFDXGIDeviceManager, MFCreateDXGIDeviceManager, MFShutdown, MFStartup, MFSTARTUP_FULL,
 };
 use windows::Win32::System::Com::{
-    CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
-    CoUninitialize,
+    COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize,
 };
 use windows::core::Interface;
 
 use super::{EncodedPacket, VideoEncoder};
 use crate::capture::{Frame, PixelFormat};
 
+mod activate;
 mod adapter;
+mod probe;
 mod sync_pipeline;
 
 use sync_pipeline::MfPipeline;
@@ -107,7 +109,7 @@ impl MfEncoder {
     /// so the cascade in `open_default` can fall back to openh264 cleanly
     /// rather than hitting the error later on the first encode call.
     pub fn new(width: u32, height: u32) -> Result<Self> {
-        if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
+        if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
             bail!("mf-encoder: require non-zero, even dimensions, got {width}x{height}");
         }
 
@@ -133,8 +135,10 @@ impl MfEncoder {
                     return;
                 }
 
-                // 3. Build the pipeline.
-                let pipeline = match MfPipeline::new(width, height) {
+                // 3. Run the cascade: adapter × HW MFT probe-and-
+                //    rollback, with SW-MFT fallback on the default
+                //    adapter if no HW candidate succeeded.
+                let pipeline = match activate::activate_and_probe_pipeline(width, height) {
                     Ok(p) => p,
                     Err(e) => {
                         unsafe { MFShutdown().ok() };
@@ -284,7 +288,8 @@ pub(super) fn create_d3d11_device_and_manager() -> Result<(ID3D11Device, IMFDXGI
         let mt: ID3D11Multithread = device.cast().map_err(|e| {
             anyhow!("ID3D11Multithread cast: {e:?}")
         })?;
-        mt.SetMultithreadProtected(true);
+        // Returns the previous protection state as BOOL; we don't care.
+        let _ = mt.SetMultithreadProtected(true);
 
         let mut reset_token: u32 = 0;
         let mut mgr: Option<IMFDXGIDeviceManager> = None;
@@ -300,113 +305,6 @@ pub(super) fn create_d3d11_device_and_manager() -> Result<(ID3D11Device, IMFDXGI
             "mf-encoder: D3D11 device + DXGI manager created"
         );
         Ok((device, mgr))
-    }
-}
-
-/// Activate the best-available H.264 encoder MFT. Tries hardware first
-/// (MFTEnumEx with MFT_ENUM_FLAG_HARDWARE — finds NVENC on NVIDIA,
-/// QuickSync on Intel, AMF on AMD), falls back to the Microsoft
-/// software MFT (CLSID_MSH264EncoderMFT) if no HW MFT is installed.
-///
-/// Returns the activated transform plus a short tag describing what
-/// we got, used only for logging ("hw: NVIDIA NVENC ..." vs "sw: MS").
-///
-/// Currently unused — `MfPipeline::new` goes straight to the SW MFT.
-/// Kept around because Phase 3 commit 2 builds on this enumeration
-/// path (adapter-matched activation).
-#[allow(dead_code)]
-pub(super) unsafe fn activate_h264_encoder() -> Result<(IMFTransform, &'static str)> {
-    unsafe {
-        let input_info = MFT_REGISTER_TYPE_INFO {
-            guidMajorType: MFMediaType_Video,
-            guidSubtype: MFVideoFormat_NV12,
-        };
-        let output_info = MFT_REGISTER_TYPE_INFO {
-            guidMajorType: MFMediaType_Video,
-            guidSubtype: MFVideoFormat_H264,
-        };
-
-        // Hardware MFTs first. `SORTANDFILTER` asks MF to order results
-        // by merit so the best-scoring hardware encoder is index 0.
-        // MFT_ENUM_FLAG is a newtype over i32; OR the inner values, then
-        // rewrap so MFTEnumEx gets its expected parameter type.
-        let flags = windows::Win32::Media::MediaFoundation::MFT_ENUM_FLAG(
-            MFT_ENUM_FLAG_HARDWARE.0 | MFT_ENUM_FLAG_SORTANDFILTER.0 | MFT_ENUM_FLAG_SYNCMFT.0,
-        );
-        let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
-        let mut count: u32 = 0;
-        let enum_rc = MFTEnumEx(
-            MFT_CATEGORY_VIDEO_ENCODER,
-            flags,
-            Some(&input_info),
-            Some(&output_info),
-            &mut activates,
-            &mut count,
-        );
-
-        if enum_rc.is_ok() && count > 0 && !activates.is_null() {
-            // Walk the returned IMFActivate array, try each one. The MF
-            // idiom is: activate to IMFTransform, release the activate.
-            let slice = std::slice::from_raw_parts(activates, count as usize);
-            let mut last_err: Option<windows::core::Error> = None;
-            for (i, maybe_act) in slice.iter().enumerate() {
-                let Some(act) = maybe_act else { continue };
-                // Best-effort friendly-name log for diagnostics — it's
-                // how we'll know "oh yeah NVENC" vs "Intel Quick Sync".
-                let mut name_buf: [u16; 256] = [0; 256];
-                let mut name_len: u32 = 0;
-                let _ = act.GetString(
-                    &MFT_FRIENDLY_NAME_Attribute,
-                    &mut name_buf,
-                    Some(&mut name_len),
-                );
-                let name = String::from_utf16_lossy(&name_buf[..name_len as usize]);
-                match act.ActivateObject::<IMFTransform>() {
-                    Ok(transform) => {
-                        tracing::info!(
-                            index = i,
-                            name = %name,
-                            total = count,
-                            "mf-encoder: activated hardware MFT"
-                        );
-                        // Free the remaining IMFActivate references and the array.
-                        for other in &slice[i + 1..] {
-                            if let Some(a) = other {
-                                drop(a.clone()); // release our clone
-                            }
-                        }
-                        CoTaskMemFree(Some(activates as *const _));
-                        return Ok((transform, "hw"));
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            index = i,
-                            name = %name,
-                            %e,
-                            "mf-encoder: ActivateObject on hardware MFT failed — trying next"
-                        );
-                        last_err = Some(e);
-                    }
-                }
-            }
-            CoTaskMemFree(Some(activates as *const _));
-            if let Some(e) = last_err {
-                tracing::warn!(%e, "mf-encoder: all hardware MFTs failed to activate — falling back to SW");
-            }
-        } else {
-            tracing::info!(
-                count,
-                "mf-encoder: no hardware H.264 MFT enumerated — falling back to SW"
-            );
-        }
-
-        // SW fallback — CLSID_MSH264EncoderMFT is always present on
-        // Windows 8+ and is sync-only, producing ~10 fps at 4K on a
-        // desktop CPU. Good for low-res screens and pure-SW VMs.
-        let transform: IMFTransform =
-            CoCreateInstance(&CLSID_MSH264EncoderMFT, None, CLSCTX_INPROC_SERVER)
-                .map_err(|e| anyhow!("CoCreateInstance MSH264Encoder (SW fallback): {e:?}"))?;
-        Ok((transform, "sw"))
     }
 }
 

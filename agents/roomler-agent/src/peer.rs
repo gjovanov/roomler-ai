@@ -403,7 +403,7 @@ async fn media_pump(
                 // Log every ~5s worth of empty polls so an idle desktop is
                 // visible without flooding. DXGI only fires on screen change,
                 // so this can spike briefly then settle.
-                if frames_empty % 150 == 0 {
+                if frames_empty.is_multiple_of(150) {
                     info!(%session_id, frames_empty, "capture produced no frame (idle screen)");
                 }
                 // If the screen has been idle for IDLE_KEEPALIVE and we

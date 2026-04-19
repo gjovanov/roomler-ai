@@ -41,7 +41,7 @@ pub fn bgra_to_nv12(src: &[u8], width: u32, height: u32, src_stride: u32) -> Res
     if width == 0 || height == 0 {
         return Err(anyhow!("bgra_to_nv12: zero-sized frame {width}x{height}"));
     }
-    if width % 2 != 0 || height % 2 != 0 {
+    if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
         return Err(anyhow!(
             "bgra_to_nv12: NV12 requires even dimensions, got {width}x{height}"
         ));
