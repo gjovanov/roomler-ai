@@ -23,6 +23,24 @@ export type RcPhase =
   | 'closed'
   | 'error'
 
+/** Controller's quality preference. `auto` lets the agent follow TWCC; `low`
+ *  clamps for bandwidth-constrained WAN; `high` asks for the best codec the
+ *  agent can offer (HEVC/AV1 when negotiated in Phase 2). Persisted to
+ *  `localStorage` so it survives a page reload. */
+export type RcQuality = 'auto' | 'low' | 'high'
+
+/** Live readout of the inbound video stream derived from
+ *  `RTCPeerConnection.getStats()`. Updated every 500 ms while connected. */
+export interface RcStats {
+  /** Decoded inbound bitrate in bits per second. 0 until two polls land. */
+  bitrate_bps: number
+  /** Decoded framerate reported by the browser. */
+  fps: number
+  /** Codec short name ("H264", "H265", "AV1", "VP9", "VP8"). Empty string
+   *  until the browser reports one. Phase 2 uses this for the UI badge. */
+  codec: string
+}
+
 interface IceServer {
   urls: string[]
   username?: string
@@ -31,6 +49,28 @@ interface IceServer {
 
 interface TurnCredsResponse {
   ice_servers: IceServer[]
+}
+
+const EMPTY_STATS: RcStats = { bitrate_bps: 0, fps: 0, codec: '' }
+const QUALITY_STORAGE_KEY = 'rc:quality'
+const STATS_POLL_MS = 500
+
+function readStoredQuality(): RcQuality {
+  try {
+    const v = globalThis.localStorage?.getItem(QUALITY_STORAGE_KEY)
+    if (v === 'low' || v === 'high' || v === 'auto') return v
+  } catch {
+    /* localStorage may be disabled or unavailable (SSR). */
+  }
+  return 'auto'
+}
+
+function persistQuality(q: RcQuality) {
+  try {
+    globalThis.localStorage?.setItem(QUALITY_STORAGE_KEY, q)
+  } catch {
+    /* best-effort — swallow quota / privacy-mode errors */
+  }
 }
 
 export function useRemoteControl() {
@@ -42,12 +82,26 @@ export function useRemoteControl() {
   /** Set once we've received at least one video/audio track. False until
    *  the agent attaches media (the native agent currently does not). */
   const hasMedia = ref(false)
+  /** Live inbound-RTP stats: bitrate, fps, codec. Zero until the first
+   *  two polls land (we need two snapshots to derive bitrate). */
+  const stats = ref<RcStats>({ ...EMPTY_STATS })
+  /** Controller's quality preference, persisted in localStorage. Sent to
+   *  the agent over the `control` data channel whenever the user changes
+   *  it *or* the channel first opens. */
+  const quality = ref<RcQuality>(readStoredQuality())
 
   let pc: RTCPeerConnection | null = null
   /** Data channels we open proactively (per docs §5). Labels match the
    *  agent's expected routing: input/control/clipboard/files. */
   const channels: Record<string, RTCDataChannel> = {}
   const inputChannelOpen = ref(false)
+
+  // Stats polling: interval handle + last snapshot so each poll can
+  // derive a delta bitrate. Reset in teardown() so a fresh connection
+  // doesn't see a stale byte counter.
+  let statsTimer: ReturnType<typeof setInterval> | null = null
+  let statsPrevBytes = 0
+  let statsPrevTsMs = 0
 
   // Coalesce rapid mouse moves to one per animation frame (~60 Hz). Keys
   // and clicks are NOT coalesced — they're too meaningful to drop.
@@ -69,6 +123,55 @@ export function useRemoteControl() {
     } catch {
       /* channel may have closed between the check and send — drop */
     }
+  }
+
+  /** Send a `rc:quality` preference over the control channel. Safe to
+   *  call while the channel is closed — it's a no-op until open. Also
+   *  sent automatically when the channel first opens so the agent
+   *  learns the restored preference without user interaction. */
+  function sendQualityPreference() {
+    const ch = channels.control
+    if (!ch || ch.readyState !== 'open') return
+    try {
+      ch.send(JSON.stringify({ t: 'rc:quality', quality: quality.value }))
+    } catch {
+      /* channel closed between check and send — drop */
+    }
+  }
+
+  /** Update the controller's quality preference, persist it, and push
+   *  the new value to the agent. No-ops (other than the persist) if the
+   *  control channel isn't open yet — the onopen handler will re-send. */
+  function setQuality(q: RcQuality) {
+    quality.value = q
+    persistQuality(q)
+    sendQualityPreference()
+  }
+
+  function startStatsPoll() {
+    if (statsTimer !== null) return
+    statsTimer = setInterval(async () => {
+      if (!pc) return
+      try {
+        const report = await pc.getStats()
+        const snap = extractStatsSnapshot(report, statsPrevBytes, statsPrevTsMs)
+        stats.value = snap.next
+        statsPrevBytes = snap.bytes
+        statsPrevTsMs = snap.tsMs
+      } catch {
+        /* getStats() can reject during teardown — just wait for next tick */
+      }
+    }, STATS_POLL_MS)
+  }
+
+  function stopStatsPoll() {
+    if (statsTimer !== null) {
+      clearInterval(statsTimer)
+      statsTimer = null
+    }
+    statsPrevBytes = 0
+    statsPrevTsMs = 0
+    stats.value = { ...EMPTY_STATS }
   }
 
   /** Buffer ICE candidates that arrive before we've set a remote
@@ -158,6 +261,7 @@ export function useRemoteControl() {
   }
 
   function teardown() {
+    stopStatsPoll()
     for (const ch of Object.values(channels)) {
       try { ch.close() } catch { /* ignore */ }
     }
@@ -268,6 +372,16 @@ export function useRemoteControl() {
     // Flag the first open so the input pump can start queuing.
     channels.input.onopen = () => { inputChannelOpen.value = true }
     channels.input.onclose = () => { inputChannelOpen.value = false }
+
+    // Re-send the restored quality preference as soon as the control
+    // channel opens — otherwise the agent would stay at its default
+    // after a page reload that had set a non-default preference.
+    channels.control.onopen = () => { sendQualityPreference() }
+
+    // Begin polling getStats() on a 500 ms cadence so the UI can show
+    // live bitrate/fps/codec. Runs unconditionally while `pc` exists;
+    // teardown() stops + clears it.
+    startStatsPoll()
 
     // Kick off the rc:* handshake.
     ws.sendRaw({
@@ -437,9 +551,68 @@ export function useRemoteControl() {
     remoteStream,
     hasMedia,
     inputChannelOpen,
+    stats,
+    quality,
+    setQuality,
     connect,
     disconnect,
     attachInput,
+  }
+}
+
+/**
+ * Pure helper: extract a live-stats snapshot from an `RTCStatsReport`.
+ *
+ * Given the previous `bytesReceived` total and its wall-clock timestamp,
+ * computes the delta bitrate over the interval and returns it along with
+ * the new cumulative counters so the caller can feed them back on the
+ * next poll. Extracted as a pure function so the bitrate/fps/codec
+ * derivation can be unit-tested without a real PeerConnection.
+ *
+ * Bitrate is 0 on the first call (prevTsMs === 0): we need two
+ * snapshots to derive a rate. `codec` comes from matching the
+ * `inbound-rtp.codecId` against a `codec.id` in the same report.
+ */
+export function extractStatsSnapshot(
+  report: RTCStatsReport,
+  prevBytes: number,
+  prevTsMs: number,
+): { next: RcStats; bytes: number; tsMs: number } {
+  let bytes = 0
+  let tsMs = 0
+  let fps = 0
+  let codecId = ''
+  const codecMap = new Map<string, string>()
+
+  report.forEach((raw) => {
+    // RTCStatsReport is typed loosely — narrow via `type`.
+    const s = raw as { type?: string } & Record<string, unknown>
+    if (s.type === 'inbound-rtp' && (s as { kind?: string }).kind === 'video') {
+      bytes = typeof s.bytesReceived === 'number' ? s.bytesReceived : 0
+      tsMs = typeof s.timestamp === 'number' ? s.timestamp : 0
+      fps = typeof s.framesPerSecond === 'number' ? s.framesPerSecond : 0
+      codecId = typeof s.codecId === 'string' ? s.codecId : ''
+    } else if (s.type === 'codec') {
+      const id = typeof s.id === 'string' ? s.id : ''
+      const mime = typeof s.mimeType === 'string' ? s.mimeType : ''
+      if (id) codecMap.set(id, mime)
+    }
+  })
+
+  // mimeType shape: "video/H264" → strip the prefix for display.
+  const mime = codecMap.get(codecId) || ''
+  const codec = mime.replace(/^video\//i, '')
+
+  let bitrate_bps = 0
+  if (prevTsMs > 0 && tsMs > prevTsMs) {
+    const dtSec = (tsMs - prevTsMs) / 1000
+    bitrate_bps = Math.max(0, Math.round(((bytes - prevBytes) * 8) / dtSec))
+  }
+
+  return {
+    next: { bitrate_bps, fps: Math.round(fps * 10) / 10, codec },
+    bytes,
+    tsMs,
   }
 }
 
