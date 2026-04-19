@@ -82,6 +82,15 @@ mod adapter;
 mod probe;
 mod sync_pipeline;
 
+/// Cheap availability check used by capability detection (2A.1).
+/// Returns the number of HW H.264 MFTs installed on this host as
+/// reported by MFTEnumEx. Doesn't activate them or run the cascade
+/// — that's the heavy operation kept inside MfEncoder::new. 0 means
+/// no HW encoder; capability reporting falls back to SW only.
+pub(crate) fn probe_adapter_count() -> Result<usize> {
+    activate::enumerate_hw_h264_mfts().map(|v| v.len())
+}
+
 use sync_pipeline::MfPipeline;
 
 /// Public-facing handle. Owns only the command channel; the IMFTransform

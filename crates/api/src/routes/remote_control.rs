@@ -144,6 +144,10 @@ pub struct AgentResponse {
     pub is_online: bool,
     pub last_seen_at: String,
     pub access_policy: AccessPolicy,
+    /// Codec + HW backend availability advertised by the agent in its
+    /// most recent rc:agent.hello. Default empty for pre-2A.1 agents
+    /// that haven't reconnected since the schema change.
+    pub capabilities: roomler_ai_remote_control::models::AgentCaps,
 }
 
 pub async fn list_agents(
@@ -404,6 +408,7 @@ fn to_agent_response(
         is_online,
         last_seen_at: fmt_dt(a.last_seen_at),
         access_policy: a.access_policy,
+        capabilities: a.capabilities,
     }
 }
 

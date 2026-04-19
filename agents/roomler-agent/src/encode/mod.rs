@@ -16,6 +16,7 @@ use anyhow::Result;
 
 use crate::capture::{DirtyRect, Frame};
 
+pub mod caps;
 pub mod color;
 
 #[cfg(feature = "openh264-encoder")]
