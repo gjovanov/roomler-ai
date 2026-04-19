@@ -4,7 +4,12 @@ import { describe, it, expect } from 'vitest'
 // here without mocking the WS store; the helpers below are self-contained
 // pure functions and are what actually determine the wire format, so they
 // carry the important invariants.
-import { browserButton, kbdCodeToHid, letterboxedNormalise } from '@/composables/useRemoteControl'
+import {
+  browserButton,
+  kbdCodeToHid,
+  letterboxedNormalise,
+  extractStatsSnapshot,
+} from '@/composables/useRemoteControl'
 
 describe('browserButton', () => {
   it.each([
@@ -137,5 +142,123 @@ describe('letterboxedNormalise', () => {
     expect(r.x).toBeLessThanOrEqual(1)
     expect(r.y).toBeGreaterThanOrEqual(0)
     expect(r.y).toBeLessThanOrEqual(1)
+  })
+})
+
+describe('extractStatsSnapshot', () => {
+  /**
+   * Build a fake `RTCStatsReport`: a `Map<string, RTCStats>` with the
+   * shape the browser emits. Only the fields the helper reads are
+   * populated; missing fields exercise the helper's fallback paths.
+   */
+  function makeReport(
+    entries: Array<[string, Record<string, unknown>]>,
+  ): RTCStatsReport {
+    const map = new Map<string, Record<string, unknown>>()
+    for (const [id, stats] of entries) map.set(id, { id, ...stats })
+    return map as unknown as RTCStatsReport
+  }
+
+  it('returns bitrate=0 on first call (no previous snapshot)', () => {
+    const report = makeReport([
+      ['RTCInboundVideo_0', {
+        type: 'inbound-rtp', kind: 'video',
+        bytesReceived: 100_000, timestamp: 1_000, framesPerSecond: 30,
+        codecId: 'Codec_H264',
+      }],
+      ['Codec_H264', { type: 'codec', mimeType: 'video/H264' }],
+    ])
+    const snap = extractStatsSnapshot(report, 0, 0)
+    expect(snap.next.bitrate_bps).toBe(0)
+    expect(snap.next.fps).toBe(30)
+    expect(snap.next.codec).toBe('H264')
+    expect(snap.bytes).toBe(100_000)
+    expect(snap.tsMs).toBe(1_000)
+  })
+
+  it('computes bitrate from byte/timestamp delta on second call', () => {
+    // 100 KB new bytes over 500 ms = 100_000 bytes × 8 / 0.5 s = 1_600_000 bps
+    const report = makeReport([
+      ['RTCInboundVideo_0', {
+        type: 'inbound-rtp', kind: 'video',
+        bytesReceived: 200_000, timestamp: 1_500, framesPerSecond: 59.9,
+        codecId: 'Codec_H265',
+      }],
+      ['Codec_H265', { type: 'codec', mimeType: 'video/H265' }],
+    ])
+    const snap = extractStatsSnapshot(report, 100_000, 1_000)
+    expect(snap.next.bitrate_bps).toBe(1_600_000)
+    expect(snap.next.fps).toBe(59.9)
+    expect(snap.next.codec).toBe('H265')
+  })
+
+  it('rounds fps to one decimal', () => {
+    const report = makeReport([
+      ['RTCInboundVideo_0', {
+        type: 'inbound-rtp', kind: 'video',
+        bytesReceived: 0, timestamp: 0, framesPerSecond: 29.876,
+        codecId: 'Codec_X',
+      }],
+      ['Codec_X', { type: 'codec', mimeType: 'video/AV1' }],
+    ])
+    const snap = extractStatsSnapshot(report, 0, 0)
+    expect(snap.next.fps).toBe(29.9)
+    expect(snap.next.codec).toBe('AV1')
+  })
+
+  it('treats missing codec entry as empty string', () => {
+    const report = makeReport([
+      ['RTCInboundVideo_0', {
+        type: 'inbound-rtp', kind: 'video',
+        bytesReceived: 0, timestamp: 1_000, framesPerSecond: 0,
+        codecId: 'Codec_Unmatched',
+      }],
+      // no `Codec_Unmatched` entry
+    ])
+    const snap = extractStatsSnapshot(report, 0, 0)
+    expect(snap.next.codec).toBe('')
+  })
+
+  it('ignores non-video inbound-rtp (audio) and non-inbound streams', () => {
+    const report = makeReport([
+      ['RTCInboundAudio_0', {
+        type: 'inbound-rtp', kind: 'audio',
+        bytesReceived: 99_999, timestamp: 1_000,
+      }],
+      ['RTCOutboundVideo_0', {
+        type: 'outbound-rtp', kind: 'video',
+        bytesSent: 12_345, timestamp: 1_000,
+      }],
+    ])
+    const snap = extractStatsSnapshot(report, 0, 0)
+    expect(snap.bytes).toBe(0)
+    expect(snap.tsMs).toBe(0)
+    expect(snap.next).toEqual({ bitrate_bps: 0, fps: 0, codec: '' })
+  })
+
+  it('clamps negative byte deltas to 0 (e.g. counter reset on renegotiation)', () => {
+    const report = makeReport([
+      ['RTCInboundVideo_0', {
+        type: 'inbound-rtp', kind: 'video',
+        bytesReceived: 500, timestamp: 2_000, framesPerSecond: 30,
+        codecId: 'Codec_H264',
+      }],
+      ['Codec_H264', { type: 'codec', mimeType: 'video/H264' }],
+    ])
+    const snap = extractStatsSnapshot(report, 1_000_000, 1_000)
+    expect(snap.next.bitrate_bps).toBe(0)
+  })
+
+  it('strips the "video/" prefix case-insensitively', () => {
+    const report = makeReport([
+      ['RTCInboundVideo_0', {
+        type: 'inbound-rtp', kind: 'video',
+        bytesReceived: 0, timestamp: 0, framesPerSecond: 0,
+        codecId: 'C',
+      }],
+      ['C', { type: 'codec', mimeType: 'VIDEO/VP9' }],
+    ])
+    const snap = extractStatsSnapshot(report, 0, 0)
+    expect(snap.next.codec).toBe('VP9')
   })
 })

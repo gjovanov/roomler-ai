@@ -27,6 +27,22 @@
       >
         {{ rc.phase.value }}
       </v-chip>
+      <!-- Quality preference: persisted to localStorage; sent to the
+           agent over the control data channel on change and on channel
+           open. Low / Auto / High map to bitrate clamp and codec
+           preference (agent side interprets; H.265/AV1 negotiation
+           lands in Phase 2). -->
+      <v-select
+        v-model="quality"
+        :items="qualityOptions"
+        density="compact"
+        hide-details
+        variant="outlined"
+        style="max-width: 140px;"
+        class="mr-2"
+        prepend-inner-icon="mdi-quality-high"
+        aria-label="Quality preference"
+      />
       <v-btn
         v-if="rc.phase.value === 'idle' || rc.phase.value === 'closed' || rc.phase.value === 'error'"
         color="primary"
@@ -90,6 +106,20 @@
         @pointerenter="cursorVisible = true"
       >
         <video ref="videoEl" autoplay playsinline muted class="remote-video" />
+        <!-- Live stats readout: codec + bitrate + fps. Populated from
+             RTCPeerConnection.getStats() every 500 ms inside the
+             composable. Pill format keeps it unobtrusive over the
+             video content. Hidden until at least the codec is known. -->
+        <div
+          v-if="rc.hasMedia.value && statsCodecLabel"
+          class="stats-readout"
+          role="status"
+          aria-live="polite"
+        >
+          <span class="stats-pill">{{ statsCodecLabel }}</span>
+          <span class="stats-pill">{{ statsBitrateLabel }}</span>
+          <span class="stats-pill">{{ statsFpsLabel }}</span>
+        </div>
         <div v-if="!rc.hasMedia.value" class="no-media-overlay">
           <v-icon size="72" color="grey-lighten-1">mdi-video-off</v-icon>
           <p class="text-body-1 mt-3">Connected — waiting for agent to publish a video track.</p>
@@ -120,7 +150,7 @@ import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { useAgentStore, type Agent } from '@/stores/agents'
 import { useAuthStore } from '@/stores/auth'
-import { useRemoteControl } from '@/composables/useRemoteControl'
+import { useRemoteControl, type RcQuality } from '@/composables/useRemoteControl'
 
 const route = useRoute()
 const tenantId = computed(() => route.params.tenantId as string)
@@ -130,6 +160,36 @@ const agentStore = useAgentStore()
 const authStore = useAuthStore()
 const agent = ref<Agent | null>(null)
 const rc = useRemoteControl()
+
+// Quality preference: v-select emits immediately on change. We proxy
+// through a computed so the composable stays the source of truth
+// (persists + pushes to agent). The v-select's inner value is
+// whatever the composable already holds, so reloads show the
+// restored preference without an extra effect.
+const qualityOptions = [
+  { title: 'Auto', value: 'auto' },
+  { title: 'Low', value: 'low' },
+  { title: 'High', value: 'high' },
+] as const
+const quality = computed<RcQuality>({
+  get: () => rc.quality.value,
+  set: (v: RcQuality) => rc.setQuality(v),
+})
+
+// Stats readout formatters. Pure computeds — the composable already
+// polls getStats() every 500 ms and updates rc.stats.value.
+const statsCodecLabel = computed(() => rc.stats.value.codec || '')
+const statsBitrateLabel = computed(() => {
+  const bps = rc.stats.value.bitrate_bps
+  if (bps <= 0) return '— bps'
+  if (bps >= 1_000_000) return `${(bps / 1_000_000).toFixed(1)} Mbps`
+  return `${Math.round(bps / 1_000)} kbps`
+})
+const statsFpsLabel = computed(() => {
+  const fps = rc.stats.value.fps
+  if (fps <= 0) return '— fps'
+  return `${Math.round(fps)} fps`
+})
 
 const videoEl = ref<HTMLVideoElement | null>(null)
 const stageEl = ref<HTMLElement | null>(null)
@@ -308,5 +368,23 @@ onBeforeUnmount(() => {
   color: #fff;
   text-align: center;
   padding: 24px;
+}
+.stats-readout {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  display: flex;
+  gap: 6px;
+  pointer-events: none;
+  z-index: 3;
+}
+.stats-pill {
+  background: rgba(0, 0, 0, 0.55);
+  color: rgba(255, 255, 255, 0.9);
+  font: 500 11px/1 ui-monospace, "SF Mono", Menlo, monospace;
+  padding: 4px 8px;
+  border-radius: 999px;
+  letter-spacing: 0.3px;
+  backdrop-filter: blur(4px);
 }
 </style>
