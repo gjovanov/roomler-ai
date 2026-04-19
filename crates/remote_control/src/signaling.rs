@@ -73,11 +73,21 @@ pub enum ClientMsg {
     // ─── controller → server ─────────────────────────────────────────
     /// Controller initiates a session. Server creates the RemoteSession,
     /// notifies the agent, and waits for consent.
+    ///
+    /// `browser_caps` is the controller's `RTCRtpReceiver.
+    /// getCapabilities('video').codecs` filtered to the codecs the
+    /// agent's negotiation logic cares about (h264 / h265 / av1 / vp9).
+    /// Phase 2 commit 2B.2 uses the intersection of this list with the
+    /// agent's `AgentCaps.codecs` to pick the best codec for the
+    /// session. Optional + default-empty so older controllers that
+    /// don't include it still get an h264 session.
     #[serde(rename = "rc:session.request")]
     SessionRequest {
         #[serde(with = "oid_hex")]
         agent_id: ObjectId,
         permissions: Permissions,
+        #[serde(default)]
+        browser_caps: Vec<String>,
     },
 
     /// Controller sends an SDP offer (after consent granted).
@@ -248,10 +258,27 @@ mod tests {
         let req = ClientMsg::SessionRequest {
             agent_id,
             permissions: Permissions::VIEW | Permissions::INPUT,
+            browser_caps: vec!["h264".into(), "h265".into()],
         };
         let s = serde_json::to_string(&req).unwrap();
         assert!(!s.contains("$oid"));
         assert!(s.contains("\"agent_id\":\"507f1f77bcf86cd799439012\""));
+        assert!(s.contains("\"browser_caps\":[\"h264\",\"h265\"]"));
+    }
+
+    #[test]
+    fn session_request_browser_caps_default_empty_for_back_compat() {
+        // A pre-2B.1 controller that doesn't include browser_caps
+        // must still parse — the agent will fall back to h264-only
+        // negotiation in that case.
+        let json = r#"{"t":"rc:session.request","agent_id":"507f1f77bcf86cd799439012","permissions":"VIEW"}"#;
+        let m: ClientMsg = serde_json::from_str(json).unwrap();
+        match m {
+            ClientMsg::SessionRequest { browser_caps, .. } => {
+                assert!(browser_caps.is_empty(), "missing field must default to empty");
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 
     #[test]

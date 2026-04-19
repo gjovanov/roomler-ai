@@ -461,7 +461,18 @@ pub struct DispatchCtx {
 impl Hub {
     pub fn dispatch(&self, ctx: &DispatchCtx, msg: ClientMsg) -> Result<()> {
         match (ctx.role, msg) {
-            (Role::Controller, ClientMsg::SessionRequest { agent_id, permissions }) => {
+            (
+                Role::Controller,
+                ClientMsg::SessionRequest {
+                    agent_id,
+                    permissions,
+                    browser_caps: _,
+                },
+            ) => {
+                // browser_caps reserved for codec negotiation (2B.2);
+                // ignored at the Hub today. Once SDP munging lands the
+                // Hub can forward the list to the agent in the
+                // Request-to-agent envelope.
                 let user_id = ctx.user_id.ok_or(Error::PermissionDenied("no user"))?;
                 let name = ctx.controller_name.clone().unwrap_or_default();
                 let tx = ctx.controller_tx.clone().ok_or(Error::SendFailed)?;

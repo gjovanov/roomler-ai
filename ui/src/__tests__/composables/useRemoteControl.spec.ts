@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, beforeEach, afterAll } from 'vitest'
 
 // Pure helpers exported for testing. We can't import the full composable
 // here without mocking the WS store; the helpers below are self-contained
@@ -9,6 +9,7 @@ import {
   kbdCodeToHid,
   letterboxedNormalise,
   extractStatsSnapshot,
+  inspectBrowserVideoCodecs,
 } from '@/composables/useRemoteControl'
 
 describe('browserButton', () => {
@@ -260,5 +261,91 @@ describe('extractStatsSnapshot', () => {
     ])
     const snap = extractStatsSnapshot(report, 0, 0)
     expect(snap.next.codec).toBe('VP9')
+  })
+})
+
+describe('inspectBrowserVideoCodecs', () => {
+  // Stub `RTCRtpReceiver.getCapabilities` for each test case. jsdom
+  // (vitest's default DOM) doesn't ship a real WebRTC API.
+  const realRTC = (globalThis as unknown as { RTCRtpReceiver?: unknown }).RTCRtpReceiver
+
+  function stubCapabilities(codecs: Array<{ mimeType: string }>) {
+    ;(globalThis as unknown as { RTCRtpReceiver: unknown }).RTCRtpReceiver = {
+      getCapabilities: (kind: string) => {
+        if (kind !== 'video') return null
+        return { codecs }
+      },
+    }
+  }
+
+  function unsetCapabilities() {
+    delete (globalThis as unknown as { RTCRtpReceiver?: unknown }).RTCRtpReceiver
+  }
+
+  beforeEach(() => {
+    unsetCapabilities()
+  })
+
+  afterAll(() => {
+    if (realRTC) {
+      ;(globalThis as unknown as { RTCRtpReceiver: unknown }).RTCRtpReceiver = realRTC
+    } else {
+      unsetCapabilities()
+    }
+  })
+
+  it('returns empty array when getCapabilities is unavailable', () => {
+    expect(inspectBrowserVideoCodecs()).toEqual([])
+  })
+
+  it('returns empty array when getCapabilities returns no codecs', () => {
+    stubCapabilities([])
+    expect(inspectBrowserVideoCodecs()).toEqual([])
+  })
+
+  it('extracts known codecs and strips the video/ prefix', () => {
+    stubCapabilities([
+      { mimeType: 'video/H264' },
+      { mimeType: 'video/VP8' },
+    ])
+    const out = inspectBrowserVideoCodecs()
+    expect(out.sort()).toEqual(['h264', 'vp8'])
+  })
+
+  it('deduplicates multiple profile-level-id variants of the same codec', () => {
+    stubCapabilities([
+      { mimeType: 'video/H264' },
+      { mimeType: 'video/H264' },
+      { mimeType: 'video/H264' },
+    ])
+    expect(inspectBrowserVideoCodecs()).toEqual(['h264'])
+  })
+
+  it('filters out RTP mechanism codecs (rtx, red, ulpfec)', () => {
+    stubCapabilities([
+      { mimeType: 'video/H264' },
+      { mimeType: 'video/rtx' },
+      { mimeType: 'video/red' },
+      { mimeType: 'video/ulpfec' },
+      { mimeType: 'video/flexfec-03' },
+    ])
+    expect(inspectBrowserVideoCodecs()).toEqual(['h264'])
+  })
+
+  it('handles all five negotiable codecs', () => {
+    stubCapabilities([
+      { mimeType: 'video/H264' },
+      { mimeType: 'video/H265' },
+      { mimeType: 'video/AV1' },
+      { mimeType: 'video/VP9' },
+      { mimeType: 'video/VP8' },
+    ])
+    expect(inspectBrowserVideoCodecs().sort()).toEqual([
+      'av1',
+      'h264',
+      'h265',
+      'vp8',
+      'vp9',
+    ])
   })
 })

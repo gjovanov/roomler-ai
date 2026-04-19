@@ -284,6 +284,21 @@ export function useRemoteControl() {
     sessionId.value = null
     phase.value = 'requesting'
 
+    // Inspect what video codecs this browser can decode so the agent
+    // can pick the best intersection with its own AgentCaps.codecs
+    // (Phase 2 negotiation, 2B.2). Filtered to the codecs we'd ever
+    // negotiate: H.264 universal, H.265 + AV1 = bandwidth wins,
+    // VP9 = WebRTC-mandatory, VP8 = legacy. Browsers without
+    // RTCRtpReceiver.getCapabilities (older Safari/Firefox) get an
+    // empty list and the agent falls back to H.264-only.
+    const browserCaps = inspectBrowserVideoCodecs()
+    if (browserCaps.length > 0) {
+      // Surface in the UI / logs so the operator can see what was
+      // advertised — useful when debugging "why didn't H.265
+      // negotiate" on a session.
+      console.info('[rc] browser video codecs:', browserCaps.join(', '))
+    }
+
     // Pull TURN creds before creating the PC so the first gather uses them.
     let iceServers: IceServer[] = []
     try {
@@ -383,11 +398,14 @@ export function useRemoteControl() {
     // teardown() stops + clears it.
     startStatsPoll()
 
-    // Kick off the rc:* handshake.
+    // Kick off the rc:* handshake. browser_caps lets the agent pick
+    // the best codec on its end (Phase 2 commit 2B.2 wires the
+    // intersection logic + SDP munging on the agent side).
     ws.sendRaw({
       t: 'rc:session.request',
       agent_id: agentId,
       permissions,
+      browser_caps: browserCaps,
     })
   }
 
@@ -558,6 +576,44 @@ export function useRemoteControl() {
     disconnect,
     attachInput,
   }
+}
+
+/**
+ * Inspect the browser's `RTCRtpReceiver.getCapabilities('video')` and
+ * return the subset of codec mime types we care about for negotiation,
+ * stripped to short names ("h264", "h265", "av1", "vp9", "vp8").
+ *
+ * Returns an empty array on browsers that don't expose
+ * `getCapabilities` (older Safari/iOS) — the agent then falls back to
+ * H.264-only. Each codec is reported once even if the browser
+ * advertises multiple profile-level-id variants of it.
+ *
+ * Exported standalone so vitest can verify the filter without standing
+ * up the full composable + WS store.
+ */
+export function inspectBrowserVideoCodecs(): string[] {
+  // Static method. Older Safari may not have it.
+  const getCaps = (
+    globalThis as unknown as { RTCRtpReceiver?: { getCapabilities?: (k: string) => { codecs?: Array<{ mimeType?: string }> } | null } }
+  ).RTCRtpReceiver?.getCapabilities
+  if (typeof getCaps !== 'function') return []
+  const caps = getCaps('video')
+  if (!caps || !Array.isArray(caps.codecs)) return []
+  // Codec mime types are case-insensitive per RFC 6381 ("video/H264").
+  const seen = new Set<string>()
+  for (const c of caps.codecs) {
+    const mime = (c.mimeType || '').toLowerCase()
+    if (!mime.startsWith('video/')) continue
+    const name = mime.slice('video/'.length)
+    // Filter to the codecs the agent's negotiation cares about.
+    // RTX (retransmission), red (FEC), ulpfec, flexfec are RTP
+    // mechanism codecs — not what we'd negotiate as the primary
+    // video codec.
+    if (['h264', 'h265', 'av1', 'vp9', 'vp8'].includes(name)) {
+      seen.add(name)
+    }
+  }
+  return Array.from(seen)
 }
 
 /**
