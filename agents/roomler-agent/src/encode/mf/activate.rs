@@ -39,7 +39,7 @@ use windows::Win32::Media::MediaFoundation::{
     MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG, MFT_ENUM_FLAG_ASYNCMFT, MFT_ENUM_FLAG_HARDWARE,
     MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT, MFT_FRIENDLY_NAME_Attribute,
     MFT_MESSAGE_SET_D3D_MANAGER, MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoFormat_H264,
-    MFVideoFormat_NV12, MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK,
+    MFVideoFormat_HEVC, MFVideoFormat_NV12, MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK,
 };
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
 use windows::core::Interface;
@@ -76,6 +76,15 @@ pub(super) struct HwMftCandidate {
     pub(super) activate: IMFActivate,
 }
 
+/// Enumerate hardware H.265/HEVC encoder MFTs on this host. Same
+/// semantics as [`enumerate_hw_h264_mfts`] but for HEVC. Used by
+/// capability detection (2A.1) to advertise `mf-h265-hw` in
+/// AgentCaps.hw_encoders. Doesn't activate or probe — that's a
+/// separate concern (the HEVC pipeline itself lands in 2C.1).
+pub(super) fn enumerate_hw_hevc_mfts() -> Result<Vec<HwMftCandidate>> {
+    enumerate_hw_video_mfts(MFVideoFormat_HEVC)
+}
+
 /// Enumerate hardware H.264 encoder MFTs on this host.
 ///
 /// Returns the empty vec on boxes with no HW encoder — caller then
@@ -83,13 +92,22 @@ pub(super) struct HwMftCandidate {
 /// sync (`NVENC`, `AMF`) and async (`Intel QSV`) HW MFTs; the async
 /// ones route to [`MfInitError::AsyncRequired`] during probe.
 pub(super) fn enumerate_hw_h264_mfts() -> Result<Vec<HwMftCandidate>> {
+    enumerate_hw_video_mfts(MFVideoFormat_H264)
+}
+
+/// Inner helper: enumerate hardware encoder MFTs for a given output
+/// codec subtype GUID. Factored out so H.264 / H.265 / AV1 share a
+/// single MFTEnumEx invocation; only the output media subtype differs.
+fn enumerate_hw_video_mfts(
+    output_subtype: windows::core::GUID,
+) -> Result<Vec<HwMftCandidate>> {
     let input_info = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
         guidSubtype: MFVideoFormat_NV12,
     };
     let output_info = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
-        guidSubtype: MFVideoFormat_H264,
+        guidSubtype: output_subtype,
     };
     // Union of HW + sync + async + sort-and-filter. Without `SYNCMFT`
     // the default excludes all sync MFTs; without `ASYNCMFT` QSV is

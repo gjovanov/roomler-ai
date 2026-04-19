@@ -178,7 +178,28 @@ const quality = computed<RcQuality>({
 
 // Stats readout formatters. Pure computeds — the composable already
 // polls getStats() every 500 ms and updates rc.stats.value.
-const statsCodecLabel = computed(() => rc.stats.value.codec || '')
+//
+// The codec label is enriched with HW/SW based on the agent's
+// advertised AgentCaps.hw_encoders (2A.2 wired). This makes the
+// pill informative ("H.265 HW") rather than ambiguous ("H265").
+const statsCodecLabel = computed(() => {
+  const raw = rc.stats.value.codec
+  if (!raw) return ''
+  const lower = raw.toLowerCase()
+  // Prettify well-known names. H264 → H.264, H265 → H.265; others
+  // pass through uppercased.
+  const display = lower
+    .replace(/^h(\d{3})$/, (_m, n) => `H.${n}`)
+    .toUpperCase()
+  // Guess HW/SW from the agent's caps if available; default to SW
+  // (the safe assumption — reporting HW when uncertain would
+  // mislead the operator about latency expectations).
+  const enc = agent.value?.capabilities?.hw_encoders ?? []
+  const hasHw = enc.some(
+    (e) => e.toLowerCase().includes(lower) && e.toLowerCase().includes('-hw'),
+  )
+  return `${display} ${hasHw ? 'HW' : 'SW'}`
+})
 const statsBitrateLabel = computed(() => {
   const bps = rc.stats.value.bitrate_bps
   if (bps <= 0) return '— bps'

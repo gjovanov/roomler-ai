@@ -40,9 +40,24 @@ pub fn detect() -> AgentCaps {
             // h264 is already in `codecs` from openh264 above; the
             // hw_encoders list is what flags HW availability.
         }
-        // HEVC / AV1 codec detection lands with the corresponding
-        // backend (2C.1 / 2C.3). Today both probe-and-fail cleanly so
-        // no stub entries here.
+        // HEVC enumeration. The full HEVC encode pipeline lands in
+        // 2C.1 (parallel to mf/sync_pipeline.rs); for capability
+        // reporting we just need to know whether the HW MFT exists.
+        // Modern Windows + recent IHV drivers ship HEVC encoder MFTs
+        // even on iGPUs; this lights up the "H.265 HW" chip in the
+        // admin UI today, and the actual encode lights up once 2C.1
+        // is wired through encoder selection.
+        if let Ok(adapters) = super::mf::probe_hevc_adapter_count()
+            && adapters > 0
+        {
+            codecs.push("h265".into());
+            hw_encoders.push("mf-h265-hw".into());
+        }
+        // AV1 detection lands with 2C.3 (CLSID_MSAV1EncoderMFT,
+        // ships on Windows 11 24H2+ with recent NVENC/AMF drivers).
+        // Best-effort enumeration via MFTEnumEx with MFVideoFormat_AV1
+        // requires a windows-rs constant we don't currently import;
+        // wiring deferred until 2C.3 lands the encoder backend.
     }
 
     AgentCaps {

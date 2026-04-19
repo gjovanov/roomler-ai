@@ -91,6 +91,12 @@ pub(crate) fn probe_adapter_count() -> Result<usize> {
     activate::enumerate_hw_h264_mfts().map(|v| v.len())
 }
 
+/// Same as [`probe_adapter_count`] but for HEVC encoders. Lights up
+/// the H.265 chip in AgentsSection when HW HEVC is available.
+pub(crate) fn probe_hevc_adapter_count() -> Result<usize> {
+    activate::enumerate_hw_hevc_mfts().map(|v| v.len())
+}
+
 use sync_pipeline::MfPipeline;
 
 /// Public-facing handle. Owns only the command channel; the IMFTransform
