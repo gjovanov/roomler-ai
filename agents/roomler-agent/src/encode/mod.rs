@@ -71,6 +71,22 @@ pub trait VideoEncoder: Send {
     fn request_keyframe(&mut self);
     /// Dynamically adjust bitrate in response to TWCC/REMB feedback.
     fn set_bitrate(&mut self, bps: u32);
+    /// Recover from packet loss by invalidating the previous frame as
+    /// a reference and forcing the next frame to be intra-coded
+    /// (without necessarily being a full IDR). Default impl falls
+    /// back to `request_keyframe`, which is correct but heavier
+    /// (an IDR at 1080p is 60-100 KB vs an intra-refresh slice at
+    /// ~5-15 KB). Backends that expose intra-only / non-IDR controls
+    /// (NVENC's reference-frame invalidation, openh264's slice-level
+    /// intra) can override to send a smaller recovery frame and
+    /// avoid the bitrate spike that plays badly with congestion
+    /// control. `lost_frame_number` is the RTP sequence number that
+    /// was reported lost, for backends that want to invalidate a
+    /// specific past frame as the reference.
+    fn request_reference_invalidation(&mut self, lost_frame_number: u32) {
+        let _ = lost_frame_number;
+        self.request_keyframe();
+    }
     /// Stable name for logging, e.g. `"openh264"`, `"nvenc-h264"`.
     fn name(&self) -> &'static str;
 }
@@ -84,6 +100,7 @@ impl VideoEncoder for NoopEncoder {
     }
     fn request_keyframe(&mut self) {}
     fn set_bitrate(&mut self, _bps: u32) {}
+    fn request_reference_invalidation(&mut self, _lost_frame_number: u32) {}
     fn name(&self) -> &'static str { "noop" }
 }
 

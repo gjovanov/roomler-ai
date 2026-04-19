@@ -216,16 +216,39 @@ impl AgentPeer {
         // can't decode the bandwidth estimate (webrtc-rs 0.12 doesn't
         // expose its TWCC sender's BWE) and fall back to baseline.
         let remb_bps = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        // Reference-frame invalidation: set when the rtcp reader sees a
+        // burst of NACK packets above a threshold within a short
+        // window, indicating that the interceptor's retransmission
+        // didn't recover the loss. Cheaper than a full IDR (which
+        // adds 60-100 KB at 1080p and triggers TWCC throttling).
+        // Default trait impl falls back to keyframe; backends that
+        // expose proper intra-refresh override.
+        let invalidation_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let rtcp_reader = {
             let flag = keyframe_requested.clone();
             let remb = remb_bps.clone();
+            let invalidate = invalidation_requested.clone();
             let sid = session_id;
             tokio::spawn(async move {
                 use webrtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
                 use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
                 use webrtc::rtcp::payload_feedbacks::receiver_estimated_maximum_bitrate::ReceiverEstimatedMaximumBitrate;
+                use webrtc::rtcp::transport_feedbacks::transport_layer_nack::TransportLayerNack;
                 const MIN_KEYFRAME_GAP: Duration = Duration::from_millis(500);
+                const MIN_INVALIDATION_GAP: Duration = Duration::from_millis(200);
+                // NACK burst detector: trip invalidation when ≥ this
+                // many NACKed sequence numbers arrive within the
+                // window. Single-NACK is normal background loss the
+                // interceptor handles via retransmission; bursts mean
+                // the retransmission didn't recover and we need to
+                // resync the decoder. Conservative threshold — too
+                // sensitive triggers thrashing on edge networks.
+                const NACK_BURST_THRESHOLD: u32 = 8;
+                const NACK_WINDOW: Duration = Duration::from_secs(1);
                 let mut last_keyframe = std::time::Instant::now() - MIN_KEYFRAME_GAP;
+                let mut last_invalidation = std::time::Instant::now() - MIN_INVALIDATION_GAP;
+                let mut nack_count_in_window: u32 = 0;
+                let mut nack_window_started = std::time::Instant::now();
                 loop {
                     match video_sender.read_rtcp().await {
                         Ok((pkts, _)) => {
@@ -248,6 +271,44 @@ impl AgentPeer {
                                     if bps > 0 {
                                         debug!(session = %sid, remb_bps = bps, "REMB received");
                                         remb.store(bps, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                }
+                                if let Some(nack) =
+                                    p_any.downcast_ref::<TransportLayerNack>()
+                                {
+                                    // Reset the window if it's lapsed,
+                                    // otherwise add to the count. Each
+                                    // NACK packet contains nack_pairs
+                                    // covering 1+ packet IDs; sum the
+                                    // population count of each loss
+                                    // bitmap as the actual loss count.
+                                    let now = std::time::Instant::now();
+                                    if now.duration_since(nack_window_started) > NACK_WINDOW {
+                                        nack_window_started = now;
+                                        nack_count_in_window = 0;
+                                    }
+                                    let lost: u32 = nack
+                                        .nacks
+                                        .iter()
+                                        .map(|np| 1 + (np.lost_packets as u32).count_ones())
+                                        .sum();
+                                    nack_count_in_window =
+                                        nack_count_in_window.saturating_add(lost);
+                                    if nack_count_in_window >= NACK_BURST_THRESHOLD
+                                        && now.duration_since(last_invalidation)
+                                            >= MIN_INVALIDATION_GAP
+                                    {
+                                        info!(
+                                            session = %sid,
+                                            nack_count_in_window,
+                                            "NACK burst → requesting reference invalidation"
+                                        );
+                                        invalidate.store(true, std::sync::atomic::Ordering::Relaxed);
+                                        last_invalidation = now;
+                                        // Reset the window so a single
+                                        // burst doesn't keep firing.
+                                        nack_window_started = now;
+                                        nack_count_in_window = 0;
                                     }
                                 }
                             }
@@ -339,6 +400,7 @@ impl AgentPeer {
             session_id,
             video_track,
             keyframe_requested,
+            invalidation_requested.clone(),
             quality_state.clone(),
             remb_bps.clone(),
             encoder_preference,
@@ -407,6 +469,7 @@ async fn media_pump(
     session_id: bson::oid::ObjectId,
     track: Arc<TrackLocalStaticSample>,
     keyframe_requested: Arc<std::sync::atomic::AtomicBool>,
+    invalidation_requested: Arc<std::sync::atomic::AtomicBool>,
     quality_state: Arc<std::sync::atomic::AtomicU8>,
     remb_bps: Arc<std::sync::atomic::AtomicU32>,
     encoder_preference: encode::EncoderPreference,
@@ -566,6 +629,12 @@ async fn media_pump(
         let enc = encoder.as_mut().unwrap();
         if keyframe_requested.swap(false, std::sync::atomic::Ordering::Relaxed) {
             enc.request_keyframe();
+        }
+        if invalidation_requested.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            // 0 = "we don't know which frame was lost; just give us
+            // an intra recovery". Backends with ref-tracking can use
+            // a meaningful value once peer.rs surfaces it.
+            enc.request_reference_invalidation(0);
         }
 
         // Adaptive bitrate: combine quality preference (controller
