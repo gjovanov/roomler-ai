@@ -617,27 +617,48 @@ to be re-engaged once phase 3 adds the missing pieces:
 
 Three pieces, each tractable on its own:
 
-1. **DXGI adapter enumeration**. `CreateDXGIFactory1` →
-   `EnumAdapters1` → match VendorId (NVIDIA 0x10DE, Intel 0x8086,
-   AMD 0x1002) → `D3D11CreateDevice` on that adapter. Retry
-   NVENC MFT `ActivateObject` with the adapter-specific device.
+1. **DXGI adapter enumeration** — ✅ landed in 0.1.26 commit 2
+   (`encode/mf/adapter.rs`). `CreateDXGIFactory1` →
+   `EnumAdapters1` → vendor priority rank → `D3D11CreateDevice` on
+   that specific adapter. The cascade then feeds the adapter-bound
+   device to each enumerated H.264 MFT.
 
-2. **Async event loop**. For MFTs that report
-   `MF_TRANSFORM_ASYNC=true` and don't honour `ASYNC_UNLOCK`:
-   `QueryInterface` for `IMFMediaEventGenerator`. Dedicated
-   worker-thread event loop: `GetEvent` (blocking) →
-   `METransformNeedInput` → pull next input from an mpsc queue and
-   `ProcessInput` → `METransformHaveOutput` → `ProcessOutput` and
-   push output to another mpsc queue. Existing
-   `VideoEncoder::encode()` becomes a non-blocking pusher that
-   drains available outputs.
+2. **Async event loop** — ⏳ commit 1A.2 (tracked; not yet needed
+   on the RTX 5090 Laptop + AMD box since both vendors' MFTs
+   honour `MF_TRANSFORM_ASYNC_UNLOCK`). Design: `QueryInterface`
+   for `IMFMediaEventGenerator`, dedicated worker thread running
+   `GetEvent` (blocking) → `METransformNeedInput` pulls the next
+   input from an mpsc queue and calls `ProcessInput` →
+   `METransformHaveOutput` calls `ProcessOutput` and pushes to
+   another mpsc. `VideoEncoder::encode()` becomes a non-blocking
+   pusher that drains available outputs. Intel QSV is the main
+   target; cascade routes candidates that ignore `ASYNC_UNLOCK`
+   to `MfInitError::AsyncRequired` today and logs them.
 
-3. **Per-MFT probe-and-rollback**. After full init, run a test
-   encode of 5-10 synthetic frames on the pipeline. If no output,
-   release the MFT and try the next candidate. Falls back to MS SW
-   → openh264 only when all HW MFTs fail.
+3. **Per-MFT probe-and-rollback** — ✅ landed in 0.1.26 commit
+   1A.1 (`encode/mf/activate.rs` + `encode/mf/probe.rs`). Full
+   pipeline init + one 480×270 NV12 black-frame probe per
+   candidate; non-zero output within the existing 64-iteration
+   drain cap is required. Additional hardening beyond the
+   original scope: blanket `MF_TRANSFORM_ASYNC_UNLOCK` regardless
+   of the reported flag (the MS SW MFT silently delegates to
+   async HW and reports `is_async=false`), and tolerance for
+   `SET_D3D_MANAGER E_NOTIMPL` (treats the candidate as a sync
+   CPU MFT with no D3D binding — matches the "H264 Encoder MFT"
+   entry that `MFTEnumEx` returns for the MS SW MFT).
 
-Estimated effort: 300-500 lines, 1-2 focused days.
+Status: **Phase 3 commits 1 + 2 + 3 landed**. Auto cascade on
+Windows now prefers MF-HW (commit 1A.3, 0.1.26) with
+`ROOMLER_AGENT_HW_AUTO=0` escape hatch. Async pipeline (commit
+1A.2) remains tracked for Intel QSV boxes.
+
+Live verification (2026-04-20, Win11 + RTX 5090 Laptop + AMD
+Radeon 610M): cascade enumerates 2 adapters + 5 H.264 MFTs, winner
+is AMD Radeon 610M + H264 Encoder MFT, `encoder-smoke --encoder
+hardware` produces 1 keyframe + 9 P-frames, total 4212 bytes over
+10 frames. `encoder-smoke --encoder auto` picks `mf-h264` unless
+`ROOMLER_AGENT_HW_AUTO=0` is set, in which case it picks
+`openh264`.
 
 ### Future phases beyond Windows
 

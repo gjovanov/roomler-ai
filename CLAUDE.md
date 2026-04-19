@@ -63,9 +63,13 @@ Default build (no features) compiles on any rust:bookworm image and produces a s
 
 The agent picks an encoder at startup via a three-way preference: **CLI `--encoder` > env `ROOMLER_AGENT_ENCODER` > `encoder_preference` in the agent config TOML > `Auto` default**. Values: `auto` | `hardware` (aliases: `hw`, `mf`) | `software` (aliases: `sw`, `openh264`).
 
-- `Auto` (current default on all OSes): openh264 → Noop. Proven stable at 1080p; capture downscales 1440p/4K with a 2× box filter before encode.
-- `Hardware` (Windows only, requires `--features mf-encoder` / `full-hw`): MF H.264 → openh264 → Noop. **Opt-in**: the MF path is wired (D3D11 device + IMFDXGIDeviceManager + codec-API latency knobs) but NVENC async-init and Intel QSV async event loop are not yet solved — see Phase 3 note in `docs/remote-control.md §17` and the Known Issues below.
+- `Auto` (default): on Windows with `mf-encoder` feature, `MF H.264 (probe-and-rollback cascade) → openh264 → Noop`. Everywhere else, `openh264 → Noop`. Capture downscales 1440p/4K with a 2× box filter before encode.
+- `Hardware` (Windows only, requires `--features mf-encoder` / `full-hw`): MF H.264 → openh264 → Noop. Same cascade as Auto, just ignores the `ROOMLER_AGENT_HW_AUTO=0` escape hatch.
 - `Software`: openh264 → Noop. Forces the SW path even on Windows with `mf-encoder` compiled in — useful as a quick comparison escape hatch.
+
+**Escape hatch**: `ROOMLER_AGENT_HW_AUTO=0` (or `false` / `no` / `off`) reverts Auto to openh264-first on Windows without a rebuild. Intended for diagnosing regressions in the field; no effect on `Hardware` or `Software` preferences.
+
+The MF cascade (landed in 0.1.26) walks DXGI adapters × enumerated H.264 MFTs, applies `MF_TRANSFORM_ASYNC_UNLOCK` unconditionally (the MS SW MFT silently delegates to async HW on systems with installed drivers), tolerates `SET_D3D_MANAGER` returning `E_NOTIMPL` (treats the candidate as a sync CPU MFT), and runs a 480×270 NV12 probe frame per candidate. Async-only MFTs that ignore the unlock (Intel QSV) route to `MfInitError::AsyncRequired` and will be picked up by the async pipeline (Phase 3 commit 1A.2) once it lands. The final fallback inside the cascade is still the default-adapter SW MFT, so any working `CLSID_MSH264EncoderMFT` produces output.
 
 ## Architecture
 
@@ -238,7 +242,7 @@ TeamViewer-style remote desktop. One native agent per controlled host, Roomler A
 - Server side: REST + WS signalling + Hub + DAOs + audit + TURN creds — complete, 10 integration tests green
 - Agent binary: enrollment + signalling + real webrtc-rs peer + scrap capture + openh264 encoder + enigo input — **live-verified** on Win11 against the production deployment (2026-04-18)
 - Browser viewer: RemoteControl.vue + useRemoteControl composable + AgentsSection admin UI — complete, letterbox-corrected coordinates, wallclock sample durations, idle-keepalive, PLI rate-limiting
-- Windows Media Foundation HW encoder (`--features mf-encoder` / `full-hw`): backend scaffolding complete — D3D11 device binding, latency knobs, probe-and-log on failure — but **opt-in** because NVENC needs DXGI adapter enumeration and Intel QSV needs the async event loop (Phase 3, scoped in `docs/remote-control.md §17`).
+- Windows Media Foundation HW encoder (`--features mf-encoder` / `full-hw`): probe-and-rollback cascade complete (0.1.26). Adapter enumeration + per-MFT probe with blanket async-unlock and `SET_D3D_MANAGER E_NOTIMPL` tolerance. Auto prefers MF-HW on Windows. Async-only MFTs (Intel QSV) route to `AsyncRequired` for the upcoming async pipeline; today they fall through to the SW MFT final fallback cleanly.
 - Release pipeline: `.github/workflows/release-agent.yml` builds signed MSI (cargo-wix), .deb (cargo-deb), and .pkg scaffolding on tag push; runs `encoder-smoke` on windows-latest as a smoke-test gate.
 
 ## Known Issues
@@ -247,7 +251,7 @@ TeamViewer-style remote desktop. One native agent per controlled host, Roomler A
 - [HIGH] [2026-03-10] No rate limiting — Status: FIXED (2026-03-21, tower_governor 60 req/min per IP)
 - [HIGH] [2026-03-10] JWT default secret is "change-me-in-production" — must be overridden in prod — Status: OPEN
 - [HIGH] [2026-04-17] Remote-control subsystem not yet live-tested end-to-end (agent → browser on a real display) — Status: FIXED (2026-04-18, verified on Win11 + openh264 against roomler.ai)
-- [HIGH] [2026-04-18] Windows MF hardware encoder (NVENC / Intel QSV) is scaffolded but not yet functional — NVENC `ActivateObject` returns `0x8000FFFF` without a matching DXGI adapter; Intel QSV is async-only and ignores `MF_TRANSFORM_ASYNC_UNLOCK`; SW MFT fallback rejects LowDelayVBR and overshoots ~5× the target bitrate. Status: OPEN — scoped as Phase 3 (adapter enum + `IMFMediaEventGenerator` event loop + per-MFT probe-and-rollback), see `docs/remote-control.md §17`.
+- [HIGH] [2026-04-18] Windows MF hardware encoder (NVENC / Intel QSV) is scaffolded but not yet functional — NVENC `ActivateObject` returns `0x8000FFFF` without a matching DXGI adapter; Intel QSV is async-only and ignores `MF_TRANSFORM_ASYNC_UNLOCK`; SW MFT fallback rejects LowDelayVBR and overshoots ~5× the target bitrate. Status: FIXED (2026-04-20, 0.1.26) — probe-and-rollback cascade lands the sync HW path; Auto prefers MF-HW on Windows with `ROOMLER_AGENT_HW_AUTO=0` escape hatch; Intel QSV async path still gated on commit 1A.2. Live-verified on RTX 5090 Laptop + AMD Radeon 610M.
 - [MEDIUM] [2026-03-10] TypeScript type errors — Status: FIXED (2026-03-21, vue-tsc --noEmit passes)
 - [MEDIUM] [2026-03-10] No security headers in nginx — Status: FIXED (2026-03-21, X-Frame-Options, X-Content-Type-Options, etc.)
 - [MEDIUM] [2026-03-10] No CI pipeline — Status: FIXED (2026-03-21, GitHub Actions: clippy + build + test)

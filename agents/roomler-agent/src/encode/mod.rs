@@ -116,20 +116,28 @@ impl std::str::FromStr for EncoderPreference {
 ///
 /// Selection cascade:
 ///
-/// | Preference | Order tried                                              |
-/// |------------|----------------------------------------------------------|
-/// | Auto       | openh264 → Noop   (MF is opt-in until phase 3 lands)     |
-/// | Hardware   | mf (required on Windows) → openh264 → Noop               |
-/// | Software   | openh264 → Noop                                          |
+/// | Preference | Order tried                                                 |
+/// |------------|-------------------------------------------------------------|
+/// | Auto       | mf (Windows with mf-encoder feature) → openh264 → Noop      |
+/// | Hardware   | mf (required on Windows) → openh264 → Noop                  |
+/// | Software   | openh264 → Noop                                             |
 ///
-/// MF is demoted from the Auto path because on mixed-GPU systems
-/// (NVIDIA + Intel iGPU) the MS SW MFT produces catastrophic frame
-/// sizes (20+ Mbps where 4 Mbps was requested — rate-control config
-/// is silently ignored) and the HW MFT path needs adapter-matching
-/// and an async event loop (phase 3). openh264 with LowDelay /
-/// max_frame_rate=30 has worked consistently across every host
-/// we've tested. Users who want to experiment with the MF path can
-/// set `encoder_preference=hardware` via CLI/env/config.
+/// Auto now prefers MF-HW on Windows thanks to the probe-and-rollback
+/// cascade in commit 1A.1 (adapter × MFT enumeration + single-frame
+/// probe) — the failure modes that demoted MF from Auto in 0.1.25
+/// (rate-control overshoot on the SW MFT, NVENC activation without
+/// adapter matching, QSV async-only starvation) are all handled:
+/// the SW MFT's async delegation is caught by blanket
+/// MF_TRANSFORM_ASYNC_UNLOCK, adapter-bound D3D devices let NVENC
+/// bind to the right GPU, and async-only MFTs route to the async
+/// pipeline (commit 1A.2) or get skipped cleanly. The final fallback
+/// inside the cascade is still the default-adapter SW MFT, so any
+/// box with a working CLSID_MSH264EncoderMFT produces output.
+///
+/// Escape hatch: setting `ROOMLER_AGENT_HW_AUTO=0` reverts Auto to
+/// openh264-first (for diagnosing regressions in the field without
+/// a rebuild). `--encoder software` and `encoder_preference=software`
+/// still force openh264 unconditionally.
 ///
 /// Each fallback is logged; the picked backend reports via
 /// `.name()` so pump-level observability can attribute.
@@ -138,7 +146,16 @@ pub fn open_default(
     height: u32,
     preference: EncoderPreference,
 ) -> Box<dyn VideoEncoder> {
-    if preference == EncoderPreference::Hardware {
+    // Auto prefers MF-HW on Windows unless the operator flips the
+    // escape hatch. Hardware always tries MF first regardless. Software
+    // skips MF entirely.
+    let try_mf_first = match preference {
+        EncoderPreference::Hardware => true,
+        EncoderPreference::Auto => !hw_auto_disabled(),
+        EncoderPreference::Software => false,
+    };
+
+    if try_mf_first {
         #[cfg(all(target_os = "windows", feature = "mf-encoder"))]
         {
             match mf::MfEncoder::new(width, height) {
@@ -146,7 +163,8 @@ pub fn open_default(
                     tracing::info!(
                         width,
                         height,
-                        "encoder selected: mf-h264 (hardware — experimental)"
+                        preference = ?preference,
+                        "encoder selected: mf-h264 (hardware)"
                     );
                     return Box::new(e);
                 }
@@ -160,12 +178,21 @@ pub fn open_default(
         }
         #[cfg(not(all(target_os = "windows", feature = "mf-encoder")))]
         {
-            tracing::warn!(
-                "Hardware encoder requested but this build has no HW backend \
-                 compiled in (rebuild with --features mf-encoder on Windows); \
-                 falling back to software"
-            );
+            if preference == EncoderPreference::Hardware {
+                tracing::warn!(
+                    "Hardware encoder requested but this build has no HW backend \
+                     compiled in (rebuild with --features mf-encoder on Windows); \
+                     falling back to software"
+                );
+            }
+            // On Auto with no mf-encoder feature, fall through silently —
+            // openh264 is the expected default for Linux/macOS and for
+            // Windows builds that didn't opt into MF.
         }
+    } else if preference == EncoderPreference::Auto {
+        tracing::info!(
+            "ROOMLER_AGENT_HW_AUTO=0 — skipping MF-HW on Auto, going straight to openh264"
+        );
     }
 
     #[cfg(feature = "openh264-encoder")]
@@ -187,4 +214,48 @@ pub fn open_default(
         );
     }
     Box::new(NoopEncoder)
+}
+
+/// Check the `ROOMLER_AGENT_HW_AUTO` escape hatch. Any value equal to
+/// `"0"`, `"false"`, `"no"`, or `"off"` (case-insensitive) disables the
+/// MF-HW-first branch of the Auto cascade. Unset or any other value
+/// leaves the default (MF-HW first) in place.
+fn hw_auto_disabled() -> bool {
+    std::env::var("ROOMLER_AGENT_HW_AUTO")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"))
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hw_auto_disabled_reads_env() {
+        // Race-free: set → read → unset. Tests share the process env,
+        // so avoid overlapping with other tests that touch the same
+        // var (none today).
+        // SAFETY: set_var/remove_var are unsafe in Rust 2024 because
+        // concurrent reads from other threads can race. Our test suite
+        // is single-threaded in practice (cargo test default is
+        // parallel but this module has one test) and no other code in
+        // this crate touches ROOMLER_AGENT_HW_AUTO at test time.
+        unsafe { std::env::remove_var("ROOMLER_AGENT_HW_AUTO") };
+        assert!(!hw_auto_disabled(), "unset defaults to MF-first");
+        for truthy in ["0", "false", "FALSE", "No", "off"] {
+            unsafe { std::env::set_var("ROOMLER_AGENT_HW_AUTO", truthy) };
+            assert!(
+                hw_auto_disabled(),
+                "value {truthy:?} should disable the MF-first branch"
+            );
+        }
+        for enabled in ["1", "true", "yes", "on", ""] {
+            unsafe { std::env::set_var("ROOMLER_AGENT_HW_AUTO", enabled) };
+            assert!(
+                !hw_auto_disabled(),
+                "value {enabled:?} should leave MF-first active"
+            );
+        }
+        unsafe { std::env::remove_var("ROOMLER_AGENT_HW_AUTO") };
+    }
 }
