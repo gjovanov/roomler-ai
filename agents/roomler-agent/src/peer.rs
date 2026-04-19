@@ -508,16 +508,23 @@ async fn media_pump(
     // go seconds without producing a frame, which makes the browser's
     // decoder enter a pause state. The user then perceives several
     // seconds of lag when they finally do something, because the stream
-    // has to resume from the pause. Re-encoding the last frame at ~2 fps
-    // during idle keeps the RTP stream flowing and the decoder unpaused.
+    // has to resume from the pause. Re-encoding the last frame at the
+    // idle floor keeps the RTP stream flowing and the decoder unpaused.
     // Arc<Frame> so repeated idle keepalives share the big BGRA buffer
     // with the encoder (which only reads). Without Arc, each keepalive
     // cloned the entire frame — up to 33 MB at 4K, 8 MB at 1080p —
-    // every 500 ms of idle.
+    // every keepalive tick.
     let mut last_good_frame: Option<std::sync::Arc<crate::capture::Frame>> = None;
-    // How long of a DXGI-silent gap we're willing to tolerate before
-    // injecting a keepalive. 500 ms = 2 fps idle floor.
-    const IDLE_KEEPALIVE: Duration = Duration::from_millis(500);
+    // VFR (1F.1): idle floor at 1 fps. Was 500 ms (≈2 fps). The
+    // browser's jitter buffer + the encoder's intra-refresh
+    // (1B.1) tolerate the longer gap, and on a static desktop
+    // there is nothing for the controller to react to anyway —
+    // the only thing this duty cycle preserves is the RTP clock
+    // and the decoder unpause. Once dirty-rect metadata lands
+    // (1C.2 / WGC backend), this can drop further: re-encode
+    // only when dirty_rects.is_empty() == false; otherwise emit
+    // a NAL-free heartbeat tied to the wallclock.
+    const IDLE_KEEPALIVE: Duration = Duration::from_millis(1_000);
     let mut last_capture_at = std::time::Instant::now();
 
     // Observability: count frames in/out and bytes written, log every 30
