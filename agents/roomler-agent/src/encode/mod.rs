@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::capture::Frame;
+use crate::capture::{DirtyRect, Frame};
 
 pub mod color;
 
@@ -87,6 +87,26 @@ pub trait VideoEncoder: Send {
         let _ = lost_frame_number;
         self.request_keyframe();
     }
+    /// Hint at per-region encoding priority for the next encoded
+    /// frame. `rects` are the regions that changed since the previous
+    /// frame; backends that expose ROI delta-QP (NVENC ROI maps,
+    /// VideoToolbox attachments) should give those regions a low
+    /// (high-quality) QP and the unchanged macroblocks a high
+    /// (low-bitrate) QP. The single biggest efficiency lever for
+    /// desktop content per `docs/streaming-options.md` §5.1 — typical
+    /// idle desktops drop 5-10× in bandwidth at the same perceived
+    /// quality. `frame_dims` is the encode resolution (post-downscale)
+    /// so backends can clip rects to the encoder grid.
+    ///
+    /// Default impl is a no-op. openh264 0.9.3 has no public ROI hook;
+    /// MF + windows 0.58 only exposes `AVEncVideoROIEnabled` boolean
+    /// (the per-frame map setter sits behind a non-exported GUID),
+    /// so MF override today is also no-op-with-debug-log. Real ROI
+    /// landed in HW backends will plug in here without touching the
+    /// caller.
+    fn set_roi_hints(&mut self, rects: &[DirtyRect], frame_dims: (u32, u32)) {
+        let _ = (rects, frame_dims);
+    }
     /// Stable name for logging, e.g. `"openh264"`, `"nvenc-h264"`.
     fn name(&self) -> &'static str;
 }
@@ -101,6 +121,7 @@ impl VideoEncoder for NoopEncoder {
     fn request_keyframe(&mut self) {}
     fn set_bitrate(&mut self, _bps: u32) {}
     fn request_reference_invalidation(&mut self, _lost_frame_number: u32) {}
+    fn set_roi_hints(&mut self, _rects: &[DirtyRect], _frame_dims: (u32, u32)) {}
     fn name(&self) -> &'static str { "noop" }
 }
 

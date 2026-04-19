@@ -239,6 +239,7 @@ async fn encoder_smoke_cmd(pref_raw: &str) -> Result<()> {
             data,
             monotonic_us: (i as u64) * 33_333,
             monitor: 0,
+            dirty_rects: Vec::new(),
         });
         if i == 5 {
             enc.request_keyframe();

@@ -29,6 +29,25 @@ pub struct Frame {
     /// Screen index that produced this frame. Matches `DisplayInfo::index`
     /// in the `rc:agent.hello` message.
     pub monitor: u8,
+    /// Per-frame dirty regions. Empty = unknown / full-frame; the
+    /// encoder treats every macroblock as potentially dirty in that
+    /// case (matches scrap behaviour today). Backends that expose a
+    /// dirty-rect API (Windows.Graphics.Capture, PipeWire damage
+    /// events) populate this so the encoder can apply ROI delta-QP
+    /// or skip encode entirely on idle frames (1F.1 / 1D.1).
+    pub dirty_rects: Vec<DirtyRect>,
+}
+
+/// A rectangular region of a frame that changed since the previous
+/// frame. Coordinates are in source pixels (post-downscale if the
+/// capture backend downscales). Width/height are exclusive — the
+/// rect covers `[x, x+w)` × `[y, y+h)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirtyRect {
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

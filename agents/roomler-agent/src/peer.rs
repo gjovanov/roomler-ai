@@ -643,6 +643,14 @@ async fn media_pump(
             // a meaningful value once peer.rs surfaces it.
             enc.request_reference_invalidation(0);
         }
+        // ROI hints from per-frame dirty rects. Empty for scrap
+        // captures (no dirty-rect API); WGC backend (1C.1) will
+        // populate these so MF/NVENC overrides can spend bits on
+        // changed regions. Default trait impl is a no-op so this is
+        // free for SW encoders.
+        if !frame.dirty_rects.is_empty() {
+            enc.set_roi_hints(&frame.dirty_rects, (frame.width, frame.height));
+        }
 
         // Adaptive bitrate: combine quality preference (controller
         // intent) with REMB (network capacity) and apply on change

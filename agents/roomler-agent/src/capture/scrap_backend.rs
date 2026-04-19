@@ -142,6 +142,12 @@ fn capture_one_blocking(
                     data,
                     monotonic_us,
                     monitor: 0,
+                    // scrap doesn't expose a dirty-rect API on any
+                    // platform; encoder treats empty as "full-frame
+                    // dirty" / no ROI hints. WGC backend (1C.1) will
+                    // populate this from Direct3D11CaptureFrame::
+                    // DirtyRegion() once it lands.
+                    dirty_rects: Vec::new(),
                 }));
             }
             Err(e) if e.kind() == WouldBlock => {
