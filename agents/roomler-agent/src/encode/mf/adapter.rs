@@ -18,14 +18,10 @@
 //! - [`priority_rank`] — the pure sort key; exposed for testability
 //!   so vendor ordering can be verified without real DXGI handles.
 //!
-//! Commit 2 of the Phase 3 plan: the cascade that actually *uses* this
-//! (try each adapter × each HW MFT, probe, roll back on failure) lands
-//! in commit 3. Until then these helpers are callable but unused —
-//! marked `#[allow(dead_code)]` on the item definitions so the build
-//! stays clean.
+//! Used by the cascade in [`super::activate`] to build an
+//! adapter-bound D3D11 device for each candidate MFT before probing.
 
 #![cfg(all(target_os = "windows", feature = "mf-encoder"))]
-#![allow(dead_code)]
 
 use anyhow::{Result, anyhow, bail};
 
@@ -95,6 +91,9 @@ pub(super) fn priority_rank(vendor_id: u32) -> VendorPriority {
 pub(super) struct AdapterInfo {
     pub(super) description: String,
     pub(super) vendor_id: u32,
+    /// PCI device ID. Surfaced via the enumerate_adapters log line so
+    /// the CI log pins exactly which SKU probed pass/fail (e.g. NVIDIA
+    /// device=2187 = GTX 1650). Not otherwise consumed by the cascade.
     pub(super) device_id: u32,
     pub(super) priority: VendorPriority,
     pub(super) adapter: IDXGIAdapter1,
@@ -162,7 +161,10 @@ pub(super) fn enumerate_adapters() -> Result<Vec<AdapterInfo>> {
             count = out.len(),
             adapters = ?out
                 .iter()
-                .map(|a| format!("{} ({:?}, vendor={:#x})", a.description, a.priority, a.vendor_id))
+                .map(|a| format!(
+                    "{} ({:?}, vendor={:#x}, device={:#x})",
+                    a.description, a.priority, a.vendor_id, a.device_id,
+                ))
                 .collect::<Vec<_>>(),
             "mf-encoder: enumerated DXGI adapters"
         );
@@ -222,7 +224,8 @@ pub(super) fn create_d3d11_device_on(
         let mt: ID3D11Multithread = device
             .cast()
             .map_err(|e| anyhow!("ID3D11Multithread cast: {e:?}"))?;
-        mt.SetMultithreadProtected(true);
+        // Returns the previous protection state as BOOL; we don't care.
+        let _ = mt.SetMultithreadProtected(true);
 
         let mut reset_token: u32 = 0;
         let mut mgr: Option<IMFDXGIDeviceManager> = None;

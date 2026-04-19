@@ -242,8 +242,16 @@ mod tests {
             eprintln!("no frame within budget — compositor may be idle, skipping assertions");
             return;
         };
-        assert_eq!(frame.width, cap.width());
-        assert_eq!(frame.height, cap.height());
+        // `cap.width()` is the source dim; Frame.width is the output
+        // dim, which is floor(source/2) when DownscalePolicy::Auto
+        // kicks in on displays ≥ 3.5 Mpx (QHD / 4K). Accept either.
+        let src_w = cap.width();
+        let src_h = cap.height();
+        let down = (u64::from(src_w) * u64::from(src_h)) >= 3_500_000;
+        let expected_w = if down { src_w / 2 } else { src_w };
+        let expected_h = if down { src_h / 2 } else { src_h };
+        assert_eq!(frame.width, expected_w);
+        assert_eq!(frame.height, expected_h);
         assert_eq!(frame.pixel_format, PixelFormat::Bgra);
         assert!(
             frame.data.len() >= (frame.width * frame.height * 3) as usize,
