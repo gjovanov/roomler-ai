@@ -13,17 +13,18 @@ use anyhow::{Result, anyhow, bail};
 use windows::Win32::Foundation::{E_FAIL, E_INVALIDARG};
 use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 use windows::Win32::Media::MediaFoundation::{
-    CODECAPI_AVEncCommonMaxBitRate, CODECAPI_AVEncCommonMeanBitRate,
+    CODECAPI_AVEncCommonBufferSize, CODECAPI_AVEncCommonMaxBitRate, CODECAPI_AVEncCommonMeanBitRate,
     CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncH264CABACEnable, CODECAPI_AVEncMPVGOPSize,
-    CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode, ICodecAPI, IMFDXGIDeviceManager,
-    IMFMediaBuffer, IMFMediaType, IMFSample, IMFTransform, MF_E_NOTACCEPTING,
-    MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_AVG_BITRATE,
-    MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
-    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MFCreateMediaType, MFCreateMemoryBuffer,
-    MFCreateSample, MFMediaType_Video, MFT_MESSAGE_COMMAND_FLUSH,
-    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
-    MFT_MESSAGE_NOTIFY_END_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
-    MFT_OUTPUT_STREAM_INFO, MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
+    CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVEncVideoGradualIntraRefresh,
+    CODECAPI_AVLowLatencyMode, ICodecAPI, IMFDXGIDeviceManager, IMFMediaBuffer, IMFMediaType,
+    IMFSample, IMFTransform, MF_E_NOTACCEPTING, MF_E_TRANSFORM_NEED_MORE_INPUT,
+    MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
+    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
+    MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video,
+    MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+    MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_END_STREAMING,
+    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_INFO,
+    MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
     eAVEncCommonRateControlMode_CBR, eAVEncCommonRateControlMode_LowDelayVBR,
 };
 use windows::core::{GUID, Interface};
@@ -31,6 +32,16 @@ use windows::core::{GUID, Interface};
 use super::super::EncodedPacket;
 use crate::capture::Frame;
 use crate::encode::color;
+
+/// Frame-rate the MFT is told about. Has to match the
+/// `MF_MT_FRAME_RATE` we set on input/output media types so the VBV
+/// buffer math (one frame's worth of bits) stays consistent with the
+/// MFT's internal pacer. Currently a constant; once 1F.1 lands the
+/// agent's media pump can pick this dynamically and re-init the
+/// pipeline on a resolution/fps change.
+const TARGET_FPS_NUM: u32 = 30;
+const TARGET_FPS_DEN: u32 = 1;
+const TARGET_FPS: u32 = TARGET_FPS_NUM / TARGET_FPS_DEN;
 
 /// MF pipeline owner. Everything COM-touching lives in here, on the worker.
 pub(super) struct MfPipeline {
@@ -114,6 +125,32 @@ impl MfPipeline {
                 &CODECAPI_AVEncCommonMaxBitRate,
                 initial_bps.saturating_mul(3) / 2,
             )?;
+
+            // VBV buffer = one frame's worth of bits (≈ initial_bps /
+            // fps). Tight buffers cap per-frame burst at ~1× the
+            // average frame size, so a 6 Mbps stream emits roughly
+            // 25 KB max per frame at 30 fps instead of letting the
+            // encoder spend a 200 KB budget at the start of a GOP.
+            // This is the single biggest knob for cutting glass-to-
+            // glass latency under WAN — without it WebRTC's pacer
+            // queues bursty frames and adds 30-80 ms RTT.
+            set_codec_u32(
+                &codec_api,
+                &CODECAPI_AVEncCommonBufferSize,
+                initial_bps / TARGET_FPS.max(1),
+            )?;
+
+            // Gradual intra refresh: spread the I-coding across N
+            // frames instead of emitting a full IDR keyframe every
+            // GOP. An IDR at 1080p is typically 60-100 KB which
+            // overshoots the VBV buffer for a single frame and
+            // pushes 200-500 ms of pacer queue. With gradual
+            // refresh, the cost is ~3 KB extra per frame for the
+            // refresh window. Boolean enable here; the MFT picks
+            // its own refresh period (typically equal to the GOP).
+            // Some MFTs ignore this knob — set_codec_bool's blanket
+            // E_FAIL/E_INVALIDARG swallow keeps that benign.
+            set_codec_bool(&codec_api, &CODECAPI_AVEncVideoGradualIntraRefresh, true)?;
 
             // Start streaming.
             transform
@@ -349,7 +386,7 @@ unsafe fn build_output_media_type(width: u32, height: u32) -> Result<IMFMediaTyp
             crate::encode::initial_bitrate_for(width, height),
         )?;
         set_ratio(&t, &MF_MT_FRAME_SIZE, width, height)?;
-        set_ratio(&t, &MF_MT_FRAME_RATE, 30, 1)?;
+        set_ratio(&t, &MF_MT_FRAME_RATE, TARGET_FPS_NUM, TARGET_FPS_DEN)?;
         set_ratio(&t, &MF_MT_PIXEL_ASPECT_RATIO, 1, 1)?;
         t.SetUINT32(
             &MF_MT_INTERLACE_MODE,
@@ -365,7 +402,7 @@ unsafe fn build_input_media_type(width: u32, height: u32) -> Result<IMFMediaType
         t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
         t.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12)?;
         set_ratio(&t, &MF_MT_FRAME_SIZE, width, height)?;
-        set_ratio(&t, &MF_MT_FRAME_RATE, 30, 1)?;
+        set_ratio(&t, &MF_MT_FRAME_RATE, TARGET_FPS_NUM, TARGET_FPS_DEN)?;
         set_ratio(&t, &MF_MT_PIXEL_ASPECT_RATIO, 1, 1)?;
         t.SetUINT32(
             &MF_MT_INTERLACE_MODE,
@@ -402,10 +439,14 @@ unsafe fn build_input_sample(nv12: &[u8], frame_index: u64) -> Result<IMFSample>
         buffer.Unlock()?;
 
         sample.AddBuffer(&buffer)?;
-        // MF timestamps are 100-ns units. At 30 fps we advance by 333_333.
-        let ts_100ns: i64 = frame_index as i64 * 333_333;
+        // MF timestamps are 100-ns units. At fps=N each frame is
+        // 10_000_000 / N units long. Computed from TARGET_FPS so a
+        // future fps bump (1F.1 / Phase 2 Option B 60 fps) keeps the
+        // PTS axis correct without a second source of truth.
+        let ts_per_frame_100ns: i64 = 10_000_000 / TARGET_FPS.max(1) as i64;
+        let ts_100ns: i64 = frame_index as i64 * ts_per_frame_100ns;
         sample.SetSampleTime(ts_100ns)?;
-        sample.SetSampleDuration(333_333)?;
+        sample.SetSampleDuration(ts_per_frame_100ns)?;
         Ok(sample)
     }
 }
@@ -434,7 +475,7 @@ fn read_packet_from_sample(sample: &IMFSample) -> Result<Option<EncodedPacket>> 
         Ok(Some(EncodedPacket {
             data,
             is_keyframe,
-            duration_us: 33_333,
+            duration_us: 1_000_000 / TARGET_FPS.max(1) as u64,
         }))
     }
 }

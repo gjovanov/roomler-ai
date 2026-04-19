@@ -10,6 +10,18 @@
 //! That's good enough for a v1 software path; a follow-up can plug in
 //! libyuv / an NV12-producing capture path to skip the conversion cost.
 //!
+//! 1B.1 note: the MF backend gained tight-VBV + gradual-intra-refresh
+//! tunings in 0.1.27. The openh264 crate at v0.9.3 doesn't expose
+//! either knob — `EncoderConfig::max_slice_len` only sets
+//! `SM_SIZELIMITED_SLICE` (size-bounded slices, not a fixed count),
+//! and there is no public hook for `iIntraRefresh` /
+//! `bUseRefFrame`-style controls. The SW path therefore still emits
+//! a full IDR every 60 frames with single-slice frames. That's an
+//! ~80 KB spike on 1080p that WebRTC's pacer absorbs in ~10 ms; not
+//! a big deal for the SW fallback case (1080p SW already maxes a
+//! desktop CPU at 30 fps), but worth revisiting if openh264 0.10+
+//! exposes the SVC parameters directly.
+//!
 //! [OpenH264]: https://www.openh264.org/
 
 use anyhow::{Context, Result, anyhow};
