@@ -61,6 +61,12 @@ scrap = { workspace = true, optional = true }
 
 # Software H.264 encoder (OpenH264).
 openh264 = { workspace = true, optional = true }
+# Raw OpenH264 C-API constants + structs needed for runtime bitrate
+# control (the openh264 crate's `bitrate()` is builder-only; runtime
+# changes require SetOption(ENCODER_OPTION_BITRATE, &SBitrateInfo)).
+# Pinned to the same minor as the openh264 crate's transitive dep so
+# the constants point at the same encoder ABI.
+openh264-sys2 = { version = "0.9", optional = true, default-features = false }
 
 # Cross-platform input injection (mouse / keyboard).
 enigo = { workspace = true, optional = true }
@@ -95,7 +101,7 @@ default = []
 # Enables the scrap-backed screen capture on Linux/Windows/macOS.
 scrap-capture = ["dep:scrap"]
 # Enables the OpenH264 software video encoder.
-openh264-encoder = ["dep:openh264"]
+openh264-encoder = ["dep:openh264", "dep:openh264-sys2"]
 # Enables the Windows Media Foundation hardware H.264 encoder. Windows-
 # only by construction (the `windows` crate has no non-Windows target).
 # If selected on other platforms, code remains dormant — open_default

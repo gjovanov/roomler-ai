@@ -208,12 +208,22 @@ impl AgentPeer {
         // data channel handler and polled by the media pump. AUTO is
         // the safe default until the controller advertises otherwise.
         let quality_state = Arc::new(std::sync::atomic::AtomicU8::new(quality::AUTO));
+        // Latest receiver-estimated bitrate (REMB) in bps. 0 means no
+        // hint yet; media_pump treats that as "use the resolution-
+        // derived baseline + quality clamp". Modern Chromium often
+        // sends TWCC instead of REMB, but advertises both — when REMB
+        // arrives we honour it, when only TWCC arrives we currently
+        // can't decode the bandwidth estimate (webrtc-rs 0.12 doesn't
+        // expose its TWCC sender's BWE) and fall back to baseline.
+        let remb_bps = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let rtcp_reader = {
             let flag = keyframe_requested.clone();
+            let remb = remb_bps.clone();
             let sid = session_id;
             tokio::spawn(async move {
                 use webrtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
                 use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
+                use webrtc::rtcp::payload_feedbacks::receiver_estimated_maximum_bitrate::ReceiverEstimatedMaximumBitrate;
                 const MIN_KEYFRAME_GAP: Duration = Duration::from_millis(500);
                 let mut last_keyframe = std::time::Instant::now() - MIN_KEYFRAME_GAP;
                 loop {
@@ -226,6 +236,19 @@ impl AgentPeer {
                                     || p_any.downcast_ref::<FullIntraRequest>().is_some()
                                 {
                                     asks_keyframe = true;
+                                }
+                                if let Some(remb_pkt) =
+                                    p_any.downcast_ref::<ReceiverEstimatedMaximumBitrate>()
+                                {
+                                    // REMB carries the receiver's
+                                    // bandwidth estimate in bps. Surface
+                                    // verbatim; media_pump applies its
+                                    // own safety factor + hysteresis.
+                                    let bps = remb_pkt.bitrate as u32;
+                                    if bps > 0 {
+                                        debug!(session = %sid, remb_bps = bps, "REMB received");
+                                        remb.store(bps, std::sync::atomic::Ordering::Relaxed);
+                                    }
                                 }
                             }
                             if asks_keyframe {
@@ -317,6 +340,7 @@ impl AgentPeer {
             video_track,
             keyframe_requested,
             quality_state.clone(),
+            remb_bps.clone(),
             encoder_preference,
         ));
 
@@ -384,6 +408,7 @@ async fn media_pump(
     track: Arc<TrackLocalStaticSample>,
     keyframe_requested: Arc<std::sync::atomic::AtomicBool>,
     quality_state: Arc<std::sync::atomic::AtomicU8>,
+    remb_bps: Arc<std::sync::atomic::AtomicU32>,
     encoder_preference: encode::EncoderPreference,
 ) {
     // Capture downscale policy mirrors the encoder preference. When the
@@ -448,6 +473,19 @@ async fn media_pump(
     // controller message has arrived yet (covers the case where the
     // encoder is rebuilt mid-session and needs the bitrate re-applied).
     let mut last_applied_quality: u8 = 0xFF;
+    // Last bitrate we pushed into the encoder. Used for hysteresis on
+    // REMB-driven changes — reapply only if the new target moves
+    // outside ±15% of the current one. Without hysteresis, REMB
+    // wobble (every ~2 s) thrashes set_bitrate even on a stable link.
+    let mut last_applied_bitrate: u32 = 0;
+    // 0.85 safety factor against REMB so we don't drive right up to
+    // the bandwidth ceiling — one congestion-control cycle later we'd
+    // overshoot, packet loss spikes, REMB drops, oscillation.
+    const REMB_SAFETY_FACTOR_NUM: u32 = 85;
+    const REMB_SAFETY_FACTOR_DEN: u32 = 100;
+    // Hysteresis band: only push a new bitrate if it differs from the
+    // current applied one by more than this fraction.
+    const HYSTERESIS_PCT: u32 = 15;
 
     loop {
         let frame: std::sync::Arc<crate::capture::Frame> = match capturer.next_frame().await {
@@ -530,28 +568,51 @@ async fn media_pump(
             enc.request_keyframe();
         }
 
-        // Quality preference application. Cheap atomic load on every
-        // frame; bitrate push only when the controller actually
-        // changed it OR the encoder was just rebuilt (sentinel
-        // 0xFF on first iteration). MF honours set_bitrate via
-        // ICodecAPI; openh264 logs-and-drops today (1F.2 wires that
-        // properly). Either way the atomic load + comparison is
-        // sub-microsecond, never blocks the pump.
+        // Adaptive bitrate: combine quality preference (controller
+        // intent) with REMB (network capacity) and apply on change
+        // or out-of-hysteresis movement. MF + openh264 both honour
+        // set_bitrate now (1F.2). Cheap on every frame: two atomic
+        // loads + integer math + a single comparison.
         let q_now = quality_state.load(std::sync::atomic::Ordering::Relaxed);
-        if q_now != last_applied_quality {
-            if let Some((w, h)) = encoder_dims {
-                let base = encode::initial_bitrate_for(w, h);
-                let target = quality::target_bitrate(q_now, base);
+        let remb_now = remb_bps.load(std::sync::atomic::Ordering::Relaxed);
+        if let Some((w, h)) = encoder_dims {
+            let base = encode::initial_bitrate_for(w, h);
+            let quality_target = quality::target_bitrate(q_now, base);
+            // If REMB hasn't reported, defer to the quality-derived
+            // target. Once it does, take min(quality, remb*safety) so
+            // the controller can ratchet down further on a metered
+            // link but never push past what the receiver thinks the
+            // path can carry.
+            let target = if remb_now == 0 {
+                quality_target
+            } else {
+                let remb_safe = (remb_now / REMB_SAFETY_FACTOR_DEN)
+                    .saturating_mul(REMB_SAFETY_FACTOR_NUM);
+                quality_target.min(remb_safe.max(500_000))
+            };
+            // Hysteresis: only push when quality changed (operator
+            // input always wins immediately) OR target moves outside
+            // ±HYSTERESIS_PCT of last applied.
+            let quality_changed = q_now != last_applied_quality;
+            let drift_too_big = if last_applied_bitrate == 0 {
+                true // first apply: always push
+            } else {
+                let band = (last_applied_bitrate / 100).saturating_mul(HYSTERESIS_PCT);
+                target.abs_diff(last_applied_bitrate) > band
+            };
+            if quality_changed || drift_too_big {
                 enc.set_bitrate(target);
                 info!(
                     %session_id,
                     quality = quality::label(q_now),
                     base_bps = base,
+                    remb_bps = remb_now,
                     target_bps = target,
-                    "applying quality preference"
+                    "applying adaptive bitrate"
                 );
+                last_applied_quality = q_now;
+                last_applied_bitrate = target;
             }
-            last_applied_quality = q_now;
         }
         let packets = match enc.encode(frame).await {
             Ok(p) => p,

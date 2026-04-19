@@ -31,6 +31,12 @@ use std::sync::mpsc as std_mpsc;
 use std::thread;
 use tokio::sync::oneshot;
 
+// Raw FFI handles needed for runtime bitrate control. The openh264
+// crate exposes a builder-style `bitrate()` only at construction;
+// changing it on a live Encoder requires the C-API SetOption with
+// ENCODER_OPTION_BITRATE + an SBitrateInfo struct.
+use openh264_sys2::{ENCODER_OPTION_BITRATE, SBitrateInfo, SPATIAL_LAYER_0};
+
 use super::{EncodedPacket, VideoEncoder};
 use crate::capture::{Frame, PixelFormat};
 
@@ -106,6 +112,38 @@ impl Drop for Openh264Encoder {
     }
 }
 
+/// Apply a runtime bitrate change to a live OpenH264 encoder via raw
+/// FFI. Sets ENCODER_OPTION_BITRATE on layer 0 (we only use a single
+/// spatial layer). C-API returns 0 on success, non-zero on error.
+fn apply_runtime_bitrate(enc: &mut Encoder, bps: u32) -> Result<()> {
+    let mut info = SBitrateInfo {
+        iLayer: SPATIAL_LAYER_0,
+        // OpenH264's iBitrate is signed 32-bit; clamp at 2 Gbps to
+        // avoid wraparound on absurd inputs (TWCC values shouldn't
+        // exceed 50 Mbps but defensive).
+        iBitrate: bps.min(i32::MAX as u32) as i32,
+    };
+    // SAFETY: raw_api gives us &mut EncoderRawAPI; set_option is a C
+    // function pointer accepting (encoder*, option_id, *mut c_void).
+    // SBitrateInfo is repr(C) and `info` lives for the duration of
+    // this call. The encoder is initialised (we've encoded frames
+    // before) so the option is valid at this point.
+    let rc = unsafe {
+        let raw = enc.raw_api();
+        raw.set_option(
+            ENCODER_OPTION_BITRATE,
+            (&raw mut info) as *mut openh264_sys2::SBitrateInfo as *mut std::ffi::c_void,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "openh264 SetOption(ENCODER_OPTION_BITRATE, {bps}) returned {rc}"
+        ))
+    }
+}
+
 fn run_worker(
     enc: &mut Encoder,
     width: u32,
@@ -122,11 +160,11 @@ fn run_worker(
                 enc.force_intra_frame();
             }
             Cmd::SetBitrate(bps) => {
-                // Best-effort — the openh264 crate exposes a getter but
-                // mid-stream bitrate control depends on crate version.
-                // Logged for now; a follow-up can plumb this when we
-                // add TWCC handling.
-                tracing::debug!(bps, "openh264 set_bitrate (ignored in this version)");
+                if let Err(e) = apply_runtime_bitrate(enc, bps) {
+                    tracing::warn!(bps, %e, "openh264 set_bitrate failed");
+                } else {
+                    tracing::debug!(bps, "openh264 set_bitrate applied");
+                }
             }
             Cmd::Shutdown => break,
         }
