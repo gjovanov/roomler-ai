@@ -71,37 +71,47 @@ jobs:
         run: cd ui && bun install --frozen-lockfile
 
       - name: Build (includes vue-tsc --noEmit)
-        # Disable the runner's default `-e` / pipefail so we can capture
-        # PIPESTATUS and decide the exit code ourselves. With -e active
-        # the tee-pipe's non-zero would kill the shell before we even
-        # got to write the captured output to $GITHUB_STEP_SUMMARY —
-        # which is what happened on the previous attempt (step ran for
-        # 19s and produced no summary).
+        # Override the default runner shell to drop -e/pipefail so we
+        # can capture exit codes and always flush output, and emit the
+        # last 30 lines as ::error:: annotations so the failure mode
+        # is visible via the anonymous GitHub API (annotations endpoint
+        # is publicly readable for public repos; step summaries and
+        # raw logs are not without auth).
         shell: bash --noprofile --norc {0}
         run: |
           cd ui
-          {
-            echo "### bun version"
-            bun --version
-          } >> "$GITHUB_STEP_SUMMARY"
+          echo "bun $(bun --version)"
 
-          echo "### vue-tsc --noEmit" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          bun x vue-tsc --noEmit 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "::group::vue-tsc --noEmit"
+          bun x vue-tsc --noEmit 2>&1 | tee /tmp/vue-tsc.log
           tsc_rc=${PIPESTATUS[0]}
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "::endgroup::"
           if [ "$tsc_rc" != 0 ]; then
-            echo "vue-tsc failed with exit $tsc_rc" >> "$GITHUB_STEP_SUMMARY"
+            {
+              echo "### vue-tsc --noEmit (exit $tsc_rc)"
+              echo '```'
+              cat /tmp/vue-tsc.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            # Emit last 30 lines of tsc output as a single error
+            # annotation. %0A escapes newlines per GHA workflow command
+            # grammar so the annotation preserves multi-line output.
+            tail -30 /tmp/vue-tsc.log | awk 'BEGIN{ORS="%0A"}{print}' | sed 's/^/::error::vue-tsc: /'
             exit "$tsc_rc"
           fi
 
-          echo "### vite build" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          bun x vite build 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "::group::vite build"
+          bun x vite build 2>&1 | tee /tmp/vite.log
           vite_rc=${PIPESTATUS[0]}
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "::endgroup::"
           if [ "$vite_rc" != 0 ]; then
-            echo "vite build failed with exit $vite_rc" >> "$GITHUB_STEP_SUMMARY"
+            {
+              echo "### vite build (exit $vite_rc)"
+              echo '```'
+              cat /tmp/vite.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            tail -30 /tmp/vite.log | awk 'BEGIN{ORS="%0A"}{print}' | sed 's/^/::error::vite: /'
           fi
           exit "$vite_rc"
 
