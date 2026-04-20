@@ -71,7 +71,31 @@ jobs:
         run: cd ui && bun install --frozen-lockfile
 
       - name: Build (includes vue-tsc --noEmit)
-        run: cd ui && bun run build
+        # Split build into vue-tsc and vite build stages + mirror
+        # output to the job summary so anonymous API consumers (and
+        # future-us without a gh auth token handy) can see which of
+        # the two failed and why, without needing to pull the raw
+        # log archive.
+        run: |
+          set -o pipefail
+          cd ui
+          echo "### bun version" >> "$GITHUB_STEP_SUMMARY"
+          bun --version >> "$GITHUB_STEP_SUMMARY"
+          echo "### vue-tsc --noEmit" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          bun x vue-tsc --noEmit 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+          tsc_rc=${PIPESTATUS[0]}
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          if [ "$tsc_rc" != 0 ]; then
+            echo "vue-tsc failed with exit $tsc_rc" >> "$GITHUB_STEP_SUMMARY"
+            exit "$tsc_rc"
+          fi
+          echo "### vite build" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          bun x vite build 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+          vite_rc=${PIPESTATUS[0]}
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          exit "$vite_rc"
 
       - name: Run unit tests
         run: cd ui && bun run test:unit
