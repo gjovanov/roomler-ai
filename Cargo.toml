@@ -11,6 +11,21 @@ members = [
 
     "agents/roomler-agent",
 ]
+exclude = [
+    # Vendored upstream (kept verbatim except the H265 payloader fix);
+    # referenced via `[patch.crates-io]` below, not a workspace member.
+    "crates/vendored/rtp",
+]
+
+# Patch webrtc-rs's rtp-0.12.0 dependency with our local vendored copy
+# that carries the H265 payloader fix — upstream drops the current
+# NAL after emitting a VPS/SPS/PPS aggregation packet, and also drops
+# any NAL whose type isn't in a hardcoded list (IDR_N_LP, CRA, TRAIL_R,
+# ...). Symptom in Chrome: framesAssembledFromMultiplePackets stays 0
+# and the decoder PLI-storms despite packets flowing. See
+# crates/vendored/rtp/src/codecs/h265/mod.rs for the patch notes.
+[patch.crates-io]
+rtp = { path = "crates/vendored/rtp" }
 
 [workspace.package]
 version = "0.1.31"
