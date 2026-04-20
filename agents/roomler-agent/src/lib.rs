@@ -9,6 +9,7 @@ pub mod config;
 pub mod displays;
 pub mod encode;
 pub mod enrollment;
+pub mod files;
 pub mod indicator;
 pub mod input;
 pub mod machine;

@@ -82,13 +82,35 @@
         icon
         variant="text"
         size="small"
-        class="mr-2"
+        class="mr-1"
         aria-label="Send Ctrl+Alt+Del to remote"
         title="Send Ctrl+Alt+Del"
         @click="rc.sendCtrlAltDel()"
       >
         <v-icon>mdi-keyboard-outline</v-icon>
       </v-btn>
+      <!-- File upload: open a native file picker and stream whatever
+           the user selects to the controlled host's Downloads folder
+           via the `files` DC. -->
+      <v-btn
+        v-if="rc.phase.value === 'connected'"
+        icon
+        variant="text"
+        size="small"
+        class="mr-2"
+        :loading="uploadBusy"
+        aria-label="Upload a file to the remote host"
+        title="Upload file → remote"
+        @click="fileInput?.click()"
+      >
+        <v-icon>mdi-upload</v-icon>
+      </v-btn>
+      <input
+        ref="fileInput"
+        type="file"
+        style="display: none"
+        @change="onFilePicked"
+      />
       <v-btn
         v-if="rc.phase.value === 'idle' || rc.phase.value === 'closed' || rc.phase.value === 'error'"
         color="primary"
@@ -281,6 +303,27 @@ async function onGetClipboard() {
 const videoEl = ref<HTMLVideoElement | null>(null)
 const stageEl = ref<HTMLElement | null>(null)
 const cursorCanvas = ref<HTMLCanvasElement | null>(null)
+const fileInput = ref<HTMLInputElement | null>(null)
+const uploadBusy = ref(false)
+
+// Stream the user-picked file to the remote's Downloads folder via
+// the `files` DC. 64 KiB chunks with backpressure on
+// `RTCDataChannel.bufferedAmount` so large files don't OOM the tab.
+async function onFilePicked(ev: Event) {
+  const input = ev.target as HTMLInputElement | null
+  const f = input?.files?.[0]
+  if (!f) return
+  uploadBusy.value = true
+  try {
+    const res = await rc.uploadFile(f)
+    showSuccess(`Uploaded ${f.name} → ${res.path}`)
+  } catch (e) {
+    showError(`Upload failed: ${(e as Error).message}`)
+  } finally {
+    uploadBusy.value = false
+    if (input) input.value = '' // allow re-selecting the same file
+  }
+}
 
 // Quality preference: v-select emits immediately on change. We proxy
 // through a computed so the composable stays the source of truth

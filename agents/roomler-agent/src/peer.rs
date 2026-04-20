@@ -401,7 +401,8 @@ impl AgentPeer {
         // `cursor` receives an agent-driven stream of position / shape
         // messages pumped from CursorTracker; `clipboard` round-trips
         // text between the agent's OS clipboard and the browser;
-        // `files` is still log-only (Known Issue MEDIUM).
+        // `files` accepts uploads that land in the controlled host's
+        // Downloads folder.
         let quality_for_dc = quality_state.clone();
         pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
             let label = dc.label().to_string();
@@ -414,6 +415,7 @@ impl AgentPeer {
                     "cursor" => attach_cursor_handler(dc, session_id),
                     #[cfg(feature = "clipboard")]
                     "clipboard" => attach_clipboard_handler(dc, session_id),
+                    "files" => attach_files_handler(dc, session_id),
                     _ => attach_log_only(dc, session_id),
                 }
             })
@@ -1099,6 +1101,159 @@ fn attach_clipboard_handler(dc: Arc<RTCDataChannel>, session_id: bson::oid::Obje
             }
         })
     }));
+}
+
+/// Wire the `files` DC to a per-session file-transfer handler. Strings
+/// carry control frames (`files:begin`/`files:end` + agent replies);
+/// binary frames are chunk payloads appended to the current in-flight
+/// transfer. The handler enforces one active transfer at a time and
+/// replies with `files:accepted` / `files:progress` / `files:complete`
+/// / `files:error` over the same channel.
+fn attach_files_handler(dc: Arc<RTCDataChannel>, session_id: bson::oid::ObjectId) {
+    let handler = crate::files::FilesHandler::new();
+    let dc_for_handler = dc.clone();
+    let handler_for_close = handler.clone();
+    dc.on_close(Box::new(move || {
+        let h = handler_for_close.clone();
+        Box::pin(async move {
+            h.abort().await;
+        })
+    }));
+    dc.on_message(Box::new(move |msg| {
+        let dc = dc_for_handler.clone();
+        let handler = handler.clone();
+        Box::pin(async move {
+            if msg.is_string {
+                handle_files_control(dc, handler, session_id, &msg.data).await;
+            } else {
+                handle_files_chunk(dc, handler, session_id, &msg.data).await;
+            }
+        })
+    }));
+}
+
+async fn handle_files_control(
+    dc: Arc<RTCDataChannel>,
+    handler: crate::files::FilesHandler,
+    session_id: bson::oid::ObjectId,
+    data: &[u8],
+) {
+    let Ok(text) = std::str::from_utf8(data) else {
+        debug!(%session_id, bytes = data.len(), "files: non-UTF8 control ignored");
+        return;
+    };
+    let parsed: Result<crate::files::FilesIncoming, _> = serde_json::from_str(text);
+    let parsed = match parsed {
+        Ok(p) => p,
+        Err(e) => {
+            debug!(%session_id, %e, "files: unparseable control JSON");
+            return;
+        }
+    };
+    match parsed {
+        crate::files::FilesIncoming::Begin {
+            id,
+            name,
+            size,
+            mime,
+        } => {
+            info!(%session_id, %id, %name, size, ?mime, "files: begin");
+            match handler.begin(id.clone(), name, size).await {
+                Ok(path) => {
+                    let path_str = path.to_string_lossy();
+                    send_files_json(
+                        &dc,
+                        &crate::files::FilesOutgoing::Accepted {
+                            id: &id,
+                            path: &path_str,
+                        },
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    warn!(%session_id, %id, %e, "files: begin failed");
+                    let msg = format!("{e}");
+                    send_files_json(
+                        &dc,
+                        &crate::files::FilesOutgoing::Error {
+                            id: &id,
+                            message: &msg,
+                        },
+                    )
+                    .await;
+                }
+            }
+        }
+        crate::files::FilesIncoming::End { id } => match handler.end(&id).await {
+            Ok((path, bytes)) => {
+                info!(%session_id, %id, bytes, path = %path.display(), "files: complete");
+                let path_str = path.to_string_lossy();
+                send_files_json(
+                    &dc,
+                    &crate::files::FilesOutgoing::Complete {
+                        id: &id,
+                        path: &path_str,
+                        bytes,
+                    },
+                )
+                .await;
+            }
+            Err(e) => {
+                warn!(%session_id, %id, %e, "files: end failed");
+                let msg = format!("{e}");
+                send_files_json(
+                    &dc,
+                    &crate::files::FilesOutgoing::Error {
+                        id: &id,
+                        message: &msg,
+                    },
+                )
+                .await;
+            }
+        },
+    }
+}
+
+async fn handle_files_chunk(
+    dc: Arc<RTCDataChannel>,
+    handler: crate::files::FilesHandler,
+    session_id: bson::oid::ObjectId,
+    data: &[u8],
+) {
+    match handler.chunk(data).await {
+        Ok(Some(progress)) => {
+            send_files_json(
+                &dc,
+                &crate::files::FilesOutgoing::Progress {
+                    id: &progress.id,
+                    bytes: progress.bytes,
+                },
+            )
+            .await;
+        }
+        Ok(None) => {
+            // Below the progress-report threshold; nothing to send.
+        }
+        Err(e) => {
+            warn!(%session_id, %e, "files: chunk failed");
+            let msg = format!("{e}");
+            send_files_json(
+                &dc,
+                &crate::files::FilesOutgoing::Error {
+                    id: "",
+                    message: &msg,
+                },
+            )
+            .await;
+            handler.abort().await;
+        }
+    }
+}
+
+async fn send_files_json(dc: &Arc<RTCDataChannel>, msg: &crate::files::FilesOutgoing<'_>) {
+    if let Ok(s) = serde_json::to_string(msg) {
+        let _ = dc.send_text(s).await;
+    }
 }
 
 fn map_ice_servers(servers: &[IceServer]) -> Vec<RTCIceServer> {

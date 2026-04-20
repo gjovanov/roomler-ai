@@ -751,6 +751,77 @@ export function useRemoteControl() {
     })
   }
 
+  /** Upload a `File` to the remote host's Downloads folder via the
+   *  `files` data channel. Chunks at 64 KiB, yielding between sends so
+   *  the DC's sctp send buffer doesn't blow out on large files.
+   *  Resolves with the final path + byte count reported by the agent.
+   *  Rejects on agent error or if the channel isn't open. */
+  function uploadFile(file: File): Promise<{ path: string; bytes: number }> {
+    const ch = channels.files
+    if (!ch || ch.readyState !== 'open') {
+      return Promise.reject(new Error('files channel not open'))
+    }
+    const id = `up-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+
+    return new Promise((resolve, reject) => {
+      // Per-upload listener: the `files` DC is multiplexed in theory
+      // but today we serialize, so matching on id is enough.
+      const onMessage = (ev: MessageEvent) => {
+        if (typeof ev.data !== 'string') return
+        let msg: { t?: string; id?: string; path?: string; bytes?: number; message?: string }
+        try { msg = JSON.parse(ev.data) } catch { return }
+        if (msg.id !== id) return
+        if (msg.t === 'files:complete') {
+          ch.removeEventListener('message', onMessage)
+          resolve({ path: String(msg.path ?? ''), bytes: Number(msg.bytes ?? 0) })
+        } else if (msg.t === 'files:error') {
+          ch.removeEventListener('message', onMessage)
+          reject(new Error(msg.message || 'agent rejected upload'))
+        }
+        // files:accepted / files:progress — pure observations, no-op.
+      }
+      ch.addEventListener('message', onMessage)
+
+      try {
+        ch.send(JSON.stringify({
+          t: 'files:begin',
+          id,
+          name: file.name,
+          size: file.size,
+          mime: file.type || undefined,
+        }))
+      } catch (e) {
+        ch.removeEventListener('message', onMessage)
+        reject(e instanceof Error ? e : new Error(String(e)))
+        return
+      }
+
+      const CHUNK = 64 * 1024
+      let offset = 0
+      const pump = async () => {
+        try {
+          while (offset < file.size) {
+            // Back off when the sctp buffer starts filling up so the
+            // browser doesn't OOM on huge files.
+            while (ch.bufferedAmount > 4 * 1024 * 1024) {
+              await new Promise((r) => setTimeout(r, 20))
+            }
+            const end = Math.min(offset + CHUNK, file.size)
+            const slice = file.slice(offset, end)
+            const buf = await slice.arrayBuffer()
+            ch.send(buf)
+            offset = end
+          }
+          ch.send(JSON.stringify({ t: 'files:end', id }))
+        } catch (e) {
+          ch.removeEventListener('message', onMessage)
+          reject(e instanceof Error ? e : new Error(String(e)))
+        }
+      }
+      void pump()
+    })
+  }
+
   /** Send Ctrl+Alt+Del to the remote. The browser can't capture this
    *  key combo (the OS intercepts first), so callers typically wire
    *  this to a dedicated toolbar button. Emits the three down events
@@ -789,6 +860,7 @@ export function useRemoteControl() {
     sendClipboardToAgent,
     getAgentClipboard,
     sendCtrlAltDel,
+    uploadFile,
   }
 }
 

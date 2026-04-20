@@ -279,7 +279,7 @@ TeamViewer-style remote desktop. One native agent per controlled host, Roomler A
 - [MEDIUM] [2026-03-10] TypeScript type errors — Status: FIXED (2026-03-21, vue-tsc --noEmit passes)
 - [MEDIUM] [2026-03-10] No security headers in nginx — Status: FIXED (2026-03-21, X-Frame-Options, X-Content-Type-Options, etc.)
 - [MEDIUM] [2026-03-10] No CI pipeline — Status: FIXED (2026-03-21, GitHub Actions: clippy + build + test)
-- [MEDIUM] [2026-04-17] Remote-control: clipboard + file-transfer data channels accepted on both sides but still log-only (no real handler) — Status: OPEN
+- [MEDIUM] [2026-04-17] Remote-control: clipboard + file-transfer data channels accepted on both sides but still log-only (no real handler) — Status: FIXED (2026-04-21, clipboard round-trip shipped in 0.1.32; file-transfer shipped in 0.1.33 — browser drag/pick → chunked upload over `files` DC with backpressure → write into host's Downloads folder, filename sanitization + collision-safe rename)
 - [MEDIUM] [2026-04-17] Remote-control: consent auto-granted on agent (no tray UI yet); fine for self-controlled hosts, needs UI for org-controlled devices per docs §11.2 — Status: OPEN
 - [LOW] [2026-03-10] Deployment strategy is Recreate (no zero-downtime rolling updates) — Status: OPEN
 - [LOW] [2026-03-10] No git hooks configured (no pre-commit, no lint-staged) — Status: OPEN
