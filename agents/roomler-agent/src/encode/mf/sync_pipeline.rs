@@ -10,7 +10,7 @@
 
 use anyhow::{Result, anyhow, bail};
 
-use windows::Win32::Foundation::{E_FAIL, E_INVALIDARG};
+use windows::Win32::Foundation::{E_FAIL, E_INVALIDARG, E_NOTIMPL};
 use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 use windows::Win32::Media::MediaFoundation::{
     CODECAPI_AVEncCommonBufferSize, CODECAPI_AVEncCommonMaxBitRate, CODECAPI_AVEncCommonMeanBitRate,
@@ -24,10 +24,40 @@ use windows::Win32::Media::MediaFoundation::{
     MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
     MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_END_STREAMING,
     MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_INFO,
-    MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
+    MFVideoFormat_H264, MFVideoFormat_HEVC, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
     eAVEncCommonRateControlMode_CBR, eAVEncCommonRateControlMode_LowDelayVBR,
 };
 use windows::core::{GUID, Interface};
+
+/// Output codec selector for the shared sync pipeline. H.264 and HEVC
+/// share 95% of the MF wiring (input = NV12, same latency knobs, same
+/// rate control, same GOP size, same IDR-on-demand behaviour); only
+/// the output subtype GUID and a couple of codec-specific tuning knobs
+/// differ (HEVC always uses CABAC, so `AVEncH264CABACEnable` is a no-op
+/// and we skip it). Exposed pub(crate) so `encode::mod` can pick the
+/// codec without reaching into this module's privates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutputCodec {
+    H264,
+    Hevc,
+}
+
+impl OutputCodec {
+    /// Stable name for logging + `VideoEncoder::name()`.
+    pub(crate) fn backend_name(&self) -> &'static str {
+        match self {
+            Self::H264 => "mf-h264",
+            Self::Hevc => "mf-h265",
+        }
+    }
+
+    fn subtype_guid(&self) -> GUID {
+        match self {
+            Self::H264 => MFVideoFormat_H264,
+            Self::Hevc => MFVideoFormat_HEVC,
+        }
+    }
+}
 
 use super::super::EncodedPacket;
 use crate::capture::Frame;
@@ -60,6 +90,7 @@ pub(super) struct MfPipeline {
     width: u32,
     height: u32,
     frame_count: u64,
+    codec: OutputCodec,
 }
 
 impl MfPipeline {
@@ -89,10 +120,11 @@ impl MfPipeline {
         backend_kind: &'static str,
         width: u32,
         height: u32,
+        codec: OutputCodec,
     ) -> Result<Self> {
         unsafe {
             // Set output type first (required by the MFT contract).
-            let out_type = build_output_media_type(width, height)?;
+            let out_type = build_output_media_type(width, height, codec)?;
             transform
                 .SetOutputType(0, &out_type, 0)
                 .map_err(|e| anyhow!("SetOutputType: {e:?}"))?;
@@ -107,7 +139,15 @@ impl MfPipeline {
                 .cast()
                 .map_err(|e| anyhow!("MFT does not expose ICodecAPI: {e:?}"))?;
             set_codec_bool(&codec_api, &CODECAPI_AVLowLatencyMode, true)?;
-            set_codec_bool(&codec_api, &CODECAPI_AVEncH264CABACEnable, true)?;
+            // H.264: CABAC is an off-by-default knob the encoder picks
+            // up at init; enable for better compression at our bitrate.
+            // HEVC: CABAC is mandatory in the spec (no CAVLC alternative),
+            // so the knob is irrelevant — skip to avoid logging every
+            // session about an "unsupported codec key" that's not
+            // actually a problem.
+            if matches!(codec, OutputCodec::H264) {
+                set_codec_bool(&codec_api, &CODECAPI_AVEncH264CABACEnable, true)?;
+            }
             let rc_mode = if backend_kind == "hw" {
                 eAVEncCommonRateControlMode_CBR.0 as u32
             } else {
@@ -162,6 +202,7 @@ impl MfPipeline {
 
             tracing::info!(
                 backend = backend_kind,
+                codec = codec.backend_name(),
                 width,
                 height,
                 initial_bps,
@@ -176,6 +217,7 @@ impl MfPipeline {
                 width,
                 height,
                 frame_count: 0,
+                codec,
             })
         }
     }
@@ -289,7 +331,7 @@ impl MfPipeline {
             match rc {
                 Ok(()) => {
                     if let Some(s) = produced {
-                        match read_packet_from_sample(&s)? {
+                        match read_packet_from_sample(&s, self.codec)? {
                             Some(pkt) => {
                                 tracing::debug!(
                                     bytes = pkt.data.len(),
@@ -376,11 +418,12 @@ impl MfPipeline {
 // Helpers (all unsafe-COM, kept in one place for easier auditing).
 // ---------------------------------------------------------------------
 
-unsafe fn build_output_media_type(width: u32, height: u32) -> Result<IMFMediaType> {
+unsafe fn build_output_media_type(width: u32, height: u32, codec: OutputCodec) -> Result<IMFMediaType> {
     unsafe {
         let t: IMFMediaType = MFCreateMediaType()?;
         t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
-        t.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
+        let subtype = codec.subtype_guid();
+        t.SetGUID(&MF_MT_SUBTYPE, &subtype)?;
         t.SetUINT32(
             &MF_MT_AVG_BITRATE,
             crate::encode::initial_bitrate_for(width, height),
@@ -454,7 +497,7 @@ unsafe fn build_input_sample(nv12: &[u8], frame_index: u64) -> Result<IMFSample>
 /// Read the NALU run out of an output IMFSample and wrap it in an
 /// `EncodedPacket`. Returns `None` if the sample is empty (e.g. the
 /// MFT handed us a format-change notification).
-fn read_packet_from_sample(sample: &IMFSample) -> Result<Option<EncodedPacket>> {
+fn read_packet_from_sample(sample: &IMFSample, codec: OutputCodec) -> Result<Option<EncodedPacket>> {
     unsafe {
         let total_len: u32 = sample.GetTotalLength()?;
         if total_len == 0 {
@@ -468,10 +511,10 @@ fn read_packet_from_sample(sample: &IMFSample) -> Result<Option<EncodedPacket>> 
         let data = std::slice::from_raw_parts(ptr, cur_len as usize).to_vec();
         buffer.Unlock()?;
 
-        // MF emits Annex-B NALUs by default (same as openh264). The H264
-        // payloader on the webrtc side looks for [0 0 0 1] start codes to
-        // split into RTP packets, so we can pass the bitstream through.
-        let is_keyframe = nalu_contains_idr(&data);
+        // MF emits Annex-B NALUs for both H.264 and HEVC by default.
+        // webrtc-rs's H264Payloader + HevcPayloader both split on
+        // start codes, so the bitstream passes through unchanged.
+        let is_keyframe = nalu_contains_idr(&data, codec);
         Ok(Some(EncodedPacket {
             data,
             is_keyframe,
@@ -480,10 +523,16 @@ fn read_packet_from_sample(sample: &IMFSample) -> Result<Option<EncodedPacket>> 
     }
 }
 
-/// Scan an Annex-B bitstream for an IDR NAL (nal_unit_type == 5).
-/// Good-enough heuristic for the `is_keyframe` flag — the RTP layer
-/// doesn't actually use this, it's just observability.
-fn nalu_contains_idr(buf: &[u8]) -> bool {
+/// Scan an Annex-B bitstream for an IDR NAL. Good-enough heuristic for
+/// the `is_keyframe` observability flag — the RTP layer doesn't use
+/// this for packetization.
+///
+/// H.264 (RFC 6184): nal_unit_type = first byte & 0x1F; IDR = 5.
+/// HEVC (RFC 7798): nal_unit_type = (first byte >> 1) & 0x3F; keyframes
+/// are IDR_W_RADL (19), IDR_N_LP (20), or CRA_NUT (21). The HEVC NAL
+/// header is 2 bytes total but only the first carries the type; the
+/// second byte is layer/temporal IDs we don't need here.
+fn nalu_contains_idr(buf: &[u8], codec: OutputCodec) -> bool {
     let mut i = 0;
     while i + 4 < buf.len() {
         // Annex-B start code: 00 00 00 01 or 00 00 01.
@@ -497,14 +546,67 @@ fn nalu_contains_idr(buf: &[u8]) -> bool {
             continue;
         };
         if nal_off < buf.len() {
-            let nal_type = buf[nal_off] & 0x1f;
-            if nal_type == 5 {
+            let head = buf[nal_off];
+            let is_idr = match codec {
+                OutputCodec::H264 => (head & 0x1f) == 5,
+                OutputCodec::Hevc => {
+                    let nt = (head >> 1) & 0x3f;
+                    matches!(nt, 19..=21)
+                }
+            };
+            if is_idr {
                 return true;
             }
         }
         i = next + 1;
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn h264_idr_detected() {
+        // [0 0 0 1] start + NAL header 0x65 → type 5 (IDR slice)
+        let buf = [0, 0, 0, 1, 0x65, 0x88];
+        assert!(nalu_contains_idr(&buf, OutputCodec::H264));
+        // Non-IDR slice (type 1)
+        let buf = [0, 0, 0, 1, 0x41, 0x88];
+        assert!(!nalu_contains_idr(&buf, OutputCodec::H264));
+    }
+
+    #[test]
+    fn hevc_idr_detected() {
+        // HEVC NAL header: first byte is (nt << 1) with the high bit
+        // as forbidden_zero. IDR_W_RADL (19) => 0x26. IDR_N_LP (20)
+        // => 0x28. CRA_NUT (21) => 0x2A. TRAIL_R (1) => 0x02 (not IDR).
+        let idr_w_radl = [0, 0, 0, 1, 0x26, 0x01];
+        let idr_n_lp = [0, 0, 0, 1, 0x28, 0x01];
+        let cra = [0, 0, 0, 1, 0x2A, 0x01];
+        let non_idr = [0, 0, 0, 1, 0x02, 0x01];
+        assert!(nalu_contains_idr(&idr_w_radl, OutputCodec::Hevc));
+        assert!(nalu_contains_idr(&idr_n_lp, OutputCodec::Hevc));
+        assert!(nalu_contains_idr(&cra, OutputCodec::Hevc));
+        assert!(!nalu_contains_idr(&non_idr, OutputCodec::Hevc));
+    }
+
+    #[test]
+    fn hevc_codec_names() {
+        assert_eq!(OutputCodec::H264.backend_name(), "mf-h264");
+        assert_eq!(OutputCodec::Hevc.backend_name(), "mf-h265");
+    }
+
+    #[test]
+    fn hevc_idr_bytes_not_mistaken_for_h264_idr() {
+        // An HEVC IDR_W_RADL byte (0x26 → nt=19) is NOT an H.264 IDR
+        // under the H.264 mask (0x26 & 0x1F = 6, a type-6 SEI).
+        // Cross-check the guard: the right mask is applied per codec.
+        let hevc_idr = [0, 0, 0, 1, 0x26, 0x01];
+        assert!(nalu_contains_idr(&hevc_idr, OutputCodec::Hevc));
+        assert!(!nalu_contains_idr(&hevc_idr, OutputCodec::H264));
+    }
 }
 
 /// Set a boolean codec-api property. `windows` 0.58 exposes a
@@ -515,12 +617,14 @@ fn nalu_contains_idr(buf: &[u8]) -> bool {
 /// or may not recognise.
 /// MFT quirk: different vendors reject "unsupported codec knob"
 /// differently. MS SW MFT returns E_FAIL. Intel QSV / NVIDIA / some
-/// older Windows builds return E_INVALIDARG. Either way we don't
-/// want a single unsupported tuning knob to fail the whole init —
-/// downgrade both to a debug log.
+/// older Windows builds return E_INVALIDARG. HEVCVideoExtensionEncoder
+/// (shipped via the Microsoft HEVC Video Extension in Store) returns
+/// E_NOTIMPL for knobs it doesn't expose. None of these should fail
+/// init — unsupported knobs are observability noise, the MFT still
+/// works for actual encode. Downgrade all three to a debug log.
 fn is_unsupported_codec_key_error(e: &windows::core::Error) -> bool {
     let code = e.code();
-    code == E_FAIL || code == E_INVALIDARG
+    code == E_FAIL || code == E_INVALIDARG || code == E_NOTIMPL
 }
 
 fn set_codec_bool(codec: &ICodecAPI, key: &GUID, value: bool) -> Result<()> {

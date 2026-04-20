@@ -47,7 +47,7 @@ use windows::core::Interface;
 use super::adapter::{create_d3d11_device_on, enumerate_adapters};
 use super::create_d3d11_device_and_manager;
 use super::probe::probe_pipeline;
-use super::sync_pipeline::MfPipeline;
+use super::sync_pipeline::{MfPipeline, OutputCodec};
 
 /// Cascade error classifier. Each variant maps to a specific caller
 /// action: `AsyncRequired` routes to the async pipeline (1A.2),
@@ -169,22 +169,38 @@ fn read_friendly_name(act: &IMFActivate) -> String {
     }
 }
 
-/// Adapter × MFT cascade. Returns a fully-assembled [`MfPipeline`]
-/// bound to whichever HW (or SW fallback) combination probes cleanly.
+/// Codec-parametric adapter × MFT cascade. Returns a fully-assembled
+/// [`MfPipeline`] bound to whichever HW (or, for H.264, SW fallback)
+/// combination probes cleanly.
 ///
-/// Never returns `Err` unless every HW candidate AND the SW fallback
-/// failed — a box with no HW encoder will still produce a working
-/// SW pipeline as long as COM / MF are functional.
-pub(super) fn activate_and_probe_pipeline(width: u32, height: u32) -> Result<MfPipeline> {
+/// H.264: never returns `Err` unless every HW candidate AND the
+/// `CLSID_MSH264EncoderMFT` default-adapter SW MFT failed — a box with
+/// no HW encoder still produces a working pipeline so long as COM /
+/// MF are functional.
+///
+/// HEVC: Windows does NOT ship a software HEVC encoder CLSID. When the
+/// HW cascade fails for HEVC the function returns Err — the caller
+/// (currently `encode::open_for_codec`) demotes to H.264 rather than
+/// expecting a SW MFT fallback.
+pub(super) fn activate_and_probe_pipeline_for_codec(
+    codec: OutputCodec,
+    width: u32,
+    height: u32,
+) -> Result<MfPipeline> {
     let adapters = enumerate_adapters().unwrap_or_else(|e| {
-        tracing::warn!(%e, "mf-encoder: enumerate_adapters failed — cascade skips HW path");
+        tracing::warn!(%e, codec = codec.backend_name(), "mf-encoder: enumerate_adapters failed — cascade skips HW path");
         Vec::new()
     });
-    let candidates = enumerate_hw_h264_mfts().unwrap_or_else(|e| {
-        tracing::warn!(%e, "mf-encoder: enumerate_hw_h264_mfts failed — cascade skips HW path");
+    let candidates = match codec {
+        OutputCodec::H264 => enumerate_hw_h264_mfts(),
+        OutputCodec::Hevc => enumerate_hw_hevc_mfts(),
+    }
+    .unwrap_or_else(|e| {
+        tracing::warn!(%e, codec = codec.backend_name(), "mf-encoder: enumerate_hw_*_mfts failed — cascade skips HW path");
         Vec::new()
     });
     tracing::info!(
+        codec = codec.backend_name(),
         adapter_count = adapters.len(),
         mft_count = candidates.len(),
         "mf-encoder: starting probe-and-rollback cascade"
@@ -206,9 +222,10 @@ pub(super) fn activate_and_probe_pipeline(width: u32, height: u32) -> Result<MfP
             }
         };
         for candidate in &candidates {
-            match try_activate_and_probe(candidate, &device, &manager, width, height) {
+            match try_activate_and_probe(candidate, &device, &manager, width, height, codec) {
                 Ok(pipeline) => {
                     tracing::info!(
+                        codec = codec.backend_name(),
                         adapter = %adapter_info.description,
                         mft = %candidate.friendly_name,
                         "mf-encoder: cascade winner — HW pipeline active"
@@ -216,9 +233,6 @@ pub(super) fn activate_and_probe_pipeline(width: u32, height: u32) -> Result<MfP
                     return Ok(pipeline);
                 }
                 Err(MfInitError::AsyncRequired) => {
-                    // Commit 1A.2 wires an async pipeline here. Until
-                    // then we skip async MFTs, which on a pure-QSV box
-                    // means falling through to the SW fallback.
                     tracing::info!(
                         adapter = %adapter_info.description,
                         mft = %candidate.friendly_name,
@@ -239,8 +253,20 @@ pub(super) fn activate_and_probe_pipeline(width: u32, height: u32) -> Result<MfP
         }
     }
 
-    tracing::info!("mf-encoder: no HW candidate succeeded — falling back to SW MFT on default adapter");
-    build_sw_fallback(width, height)
+    match codec {
+        OutputCodec::H264 => {
+            tracing::info!("mf-encoder: no HW candidate succeeded — falling back to SW MFT on default adapter");
+            build_sw_fallback(width, height)
+        }
+        OutputCodec::Hevc => {
+            // No CLSID_MSH265EncoderMFT on stock Windows — fail here so
+            // the caller can demote to H.264 cleanly rather than
+            // pretending a non-existent SW path succeeded.
+            Err(anyhow!(
+                "mf-encoder: HEVC cascade exhausted all HW candidates and no SW HEVC encoder is available"
+            ))
+        }
+    }
 }
 
 /// Activate one HW candidate against a specific D3D11 device, build
@@ -252,6 +278,7 @@ fn try_activate_and_probe(
     manager: &IMFDXGIDeviceManager,
     width: u32,
     height: u32,
+    codec: OutputCodec,
 ) -> std::result::Result<MfPipeline, MfInitError> {
     unsafe {
         let transform: IMFTransform = candidate
@@ -314,9 +341,16 @@ fn try_activate_and_probe(
         }
 
         let backend_kind = if d3d_device.is_some() { "hw" } else { "sw" };
-        let mut pipeline =
-            MfPipeline::new(transform, d3d_device, d3d_manager, backend_kind, width, height)
-                .map_err(MfInitError::ProbeFailed)?;
+        let mut pipeline = MfPipeline::new(
+            transform,
+            d3d_device,
+            d3d_manager,
+            backend_kind,
+            width,
+            height,
+            codec,
+        )
+        .map_err(MfInitError::ProbeFailed)?;
         probe_pipeline(&mut pipeline).map_err(MfInitError::ProbeFailed)?;
         Ok(pipeline)
     }
@@ -373,6 +407,14 @@ fn build_sw_fallback(width: u32, height: u32) -> Result<MfPipeline> {
             None => (None, None),
         };
 
-        MfPipeline::new(transform, d3d_device, d3d_manager, "sw", width, height)
+        MfPipeline::new(
+            transform,
+            d3d_device,
+            d3d_manager,
+            "sw",
+            width,
+            height,
+            OutputCodec::H264,
+        )
     }
 }

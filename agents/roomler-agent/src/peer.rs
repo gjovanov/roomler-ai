@@ -127,6 +127,7 @@ impl AgentPeer {
         ice_servers: &[IceServer],
         outbound: mpsc::Sender<ClientMsg>,
         encoder_preference: encode::EncoderPreference,
+        chosen_codec: String,
     ) -> Result<Self> {
         let mut engine = MediaEngine::default();
         engine
@@ -160,32 +161,20 @@ impl AgentPeer {
                 .context("new_peer_connection")?,
         );
 
-        // Add a sendonly H.264 video track up front so the SDP answer
-        // advertises it. Match one of webrtc-rs's default H.264 codec
-        // registrations exactly (clock_rate + fmtp line + rtcp_feedback),
-        // otherwise the packetizer can't resolve a payload type for the
-        // outgoing RTP and (even worse) NACK/PLI aren't negotiated so the
-        // browser's retransmit requests and keyframe asks are ignored —
-        // the stream freezes on every lost packet for ~10 s until openh264
-        // emits its next natural IDR. Chosen: Constrained Baseline,
-        // packetization-mode=1, profile-level-id=42e01f — matches payload
-        // type 125 in webrtc-rs's default MediaEngine.
+        // Add a sendonly video track up front so the SDP answer
+        // advertises it. The `chosen_codec` (`"h264"` / `"h265"`) is the
+        // intersection result from `caps::pick_best_codec(browser,
+        // agent)` computed in signaling. The capability selected here
+        // must match one of webrtc-rs's `register_default_codecs`
+        // entries byte-for-byte on clock_rate + fmtp line +
+        // rtcp_feedback, otherwise the SDP negotiation fails to resolve
+        // a payload type and the packetizer has nothing to emit.
+        //
+        // webrtc-rs's default H.265 registration is PT 126, no fmtp
+        // line, same rtcp feedback as H.264 — matches Chrome
+        // Canary/Beta/Stable 127+ which accept the same shape.
         let video_track = Arc::new(TrackLocalStaticSample::new(
-            RTCRtpCodecCapability {
-                mime_type: "video/H264".to_string(),
-                clock_rate: 90000,
-                channels: 0,
-                sdp_fmtp_line:
-                    "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
-                        .to_string(),
-                rtcp_feedback: vec![
-                    RTCPFeedback { typ: "goog-remb".to_string(),    parameter: String::new() },
-                    RTCPFeedback { typ: "ccm".to_string(),          parameter: "fir".to_string() },
-                    RTCPFeedback { typ: "nack".to_string(),         parameter: String::new() },
-                    RTCPFeedback { typ: "nack".to_string(),         parameter: "pli".to_string() },
-                    RTCPFeedback { typ: "transport-cc".to_string(), parameter: String::new() },
-                ],
-            },
+            build_video_codec_cap(&chosen_codec),
             "video".to_string(),
             "roomler-agent".to_string(),
         ));
@@ -193,6 +182,37 @@ impl AgentPeer {
             .add_track(video_track.clone() as Arc<dyn TrackLocal + Send + Sync>)
             .await
             .context("add_track(video)")?;
+
+        // Pin the SDP answer's m=video codec list to the chosen codec.
+        // Without this, webrtc-rs offers H.264 + H.265 + AV1 + VP8 + VP9
+        // in one m-section, and a browser free to pick its first
+        // preference may negotiate a codec our encoder doesn't emit
+        // (e.g. VP9 from Firefox). set_codec_preferences on the
+        // transceiver filters the offered codec list in the SDP.
+        // Find the transceiver that owns the sender we just created.
+        // `t.sender()` returns a Future<Output = Arc<RTCRtpSender>>, so
+        // the candidates have to be awaited one at a time inside the
+        // loop. There's typically only one transceiver at this point
+        // (we just added the single video track), so this is cheap.
+        let mut matched_transceiver = None;
+        for t in pc.get_transceivers().await {
+            let sender = t.sender().await;
+            if std::sync::Arc::ptr_eq(&sender, &video_sender) {
+                matched_transceiver = Some(t);
+                break;
+            }
+        }
+        if let Some(transceiver) = matched_transceiver {
+            let codec_params = codec_params_for(&chosen_codec);
+            if let Err(e) = transceiver.set_codec_preferences(vec![codec_params]).await {
+                // Not fatal — transceiver still works, SDP just offers
+                // the default union. Log as warning so a field incident
+                // is diagnosable.
+                warn!(%session_id, %e, codec = %chosen_codec, "set_codec_preferences failed — SDP will carry default codec union");
+            } else {
+                info!(%session_id, codec = %chosen_codec, "SDP codec preferences pinned");
+            }
+        }
 
         // Shared keyframe-request flag. The RTCP reader task flips it on
         // PLI / FIR; media_pump consumes it before each encode and calls
@@ -407,6 +427,7 @@ impl AgentPeer {
             quality_state.clone(),
             remb_bps.clone(),
             encoder_preference,
+            chosen_codec,
         ));
 
         Ok(Self {
@@ -465,9 +486,10 @@ impl AgentPeer {
     }
 }
 
-/// Per-session media pump. Captures frames, encodes to H.264, writes
-/// Samples into the WebRTC track. Rebuilds the encoder if the capture
-/// resolution changes mid-session (e.g. dock/undock).
+/// Per-session media pump. Captures frames, encodes to the negotiated
+/// codec, writes Samples into the WebRTC track. Rebuilds the encoder
+/// if the capture resolution changes mid-session (e.g. dock/undock).
+#[allow(clippy::too_many_arguments)]
 async fn media_pump(
     session_id: bson::oid::ObjectId,
     track: Arc<TrackLocalStaticSample>,
@@ -476,6 +498,7 @@ async fn media_pump(
     quality_state: Arc<std::sync::atomic::AtomicU8>,
     remb_bps: Arc<std::sync::atomic::AtomicU32>,
     encoder_preference: encode::EncoderPreference,
+    chosen_codec: String,
 ) {
     // Capture downscale policy mirrors the encoder preference. When the
     // HW encoder is in play (or will be, on Auto + Windows), we want
@@ -621,13 +644,32 @@ async fn media_pump(
             info!(
                 %session_id,
                 w = frame.width, h = frame.height,
+                codec = %chosen_codec,
                 "initialising encoder for frame dims"
             );
-            encoder = Some(encode::open_default(
+            let (enc, actual) = encode::open_for_codec(
+                &chosen_codec,
                 frame.width,
                 frame.height,
                 encoder_preference,
-            ));
+            );
+            if actual != chosen_codec {
+                // Runtime demotion (e.g. HEVC cascade failed at actual
+                // dims despite enumeration passing). The track was
+                // already bound to the negotiated codec's mime type
+                // and the SDP answer sent — we can't switch mid-session.
+                // Log loudly so a field incident is diagnosable, then
+                // keep going: the browser will receive bytes it can't
+                // decode and show a black frame. The controller can
+                // reconnect or toggle Quality to re-negotiate.
+                warn!(
+                    %session_id,
+                    requested = %chosen_codec,
+                    actual = %actual,
+                    "encoder demotion — browser will see undecodable stream until renegotiation"
+                );
+            }
+            encoder = Some(enc);
             encoder_dims = Some((frame.width, frame.height));
             // Force the quality preference back through the new
             // encoder — set_bitrate state lives on the encoder
@@ -962,6 +1004,63 @@ fn map_ice_servers(servers: &[IceServer]) -> Vec<RTCIceServer> {
             credential: s.credential.clone().unwrap_or_default(),
         })
         .collect()
+}
+
+/// Build the `RTCRtpCodecCapability` for the negotiated codec. Matches
+/// webrtc-rs's `register_default_codecs` entries byte-for-byte so the
+/// internal `payloader_for_codec` lookup resolves and the SDP answer
+/// carries the expected payload type.
+///
+/// H.264: Constrained Baseline + packetization-mode=1 +
+/// profile-level-id=42e01f → PT 125 in the default MediaEngine.
+/// HEVC: empty fmtp line (Chrome/Safari don't require profile-id in
+/// the offer for receive-only) → PT 126.
+///
+/// Unknown codec → H.264 default (paranoia: should never hit because
+/// `pick_best_codec` only returns codecs both sides advertise).
+fn build_video_codec_cap(codec: &str) -> RTCRtpCodecCapability {
+    let feedback = vec![
+        RTCPFeedback { typ: "goog-remb".to_string(),    parameter: String::new() },
+        RTCPFeedback { typ: "ccm".to_string(),          parameter: "fir".to_string() },
+        RTCPFeedback { typ: "nack".to_string(),         parameter: String::new() },
+        RTCPFeedback { typ: "nack".to_string(),         parameter: "pli".to_string() },
+        RTCPFeedback { typ: "transport-cc".to_string(), parameter: String::new() },
+    ];
+    match codec.to_ascii_lowercase().as_str() {
+        "h265" | "hevc" => RTCRtpCodecCapability {
+            mime_type: "video/H265".to_string(),
+            clock_rate: 90000,
+            channels: 0,
+            sdp_fmtp_line: String::new(),
+            rtcp_feedback: feedback,
+        },
+        _ => RTCRtpCodecCapability {
+            mime_type: "video/H264".to_string(),
+            clock_rate: 90000,
+            channels: 0,
+            sdp_fmtp_line:
+                "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
+                    .to_string(),
+            rtcp_feedback: feedback,
+        },
+    }
+}
+
+/// Build the `RTCRtpCodecParameters` pinned into the transceiver's
+/// codec preferences. Same capability as the track carries; payload
+/// type matches the default MediaEngine's PT for that codec.
+fn codec_params_for(codec: &str) -> webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecParameters {
+    use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecParameters;
+    let capability = build_video_codec_cap(codec);
+    let payload_type = match codec.to_ascii_lowercase().as_str() {
+        "h265" | "hevc" => 126,
+        _ => 125,
+    };
+    RTCRtpCodecParameters {
+        capability,
+        payload_type,
+        ..Default::default()
+    }
 }
 
 #[cfg(test)]

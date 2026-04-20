@@ -255,6 +255,64 @@ pub fn open_default(
     Box::new(NoopEncoder)
 }
 
+/// Open a codec-specific encoder, falling back to H.264 if the
+/// requested codec has no compiled-in backend on this host.
+///
+/// `codec` is the MIME-style short name from
+/// `caps::pick_best_codec` (`"h264"`, `"h265"`, `"av1"`, etc.).
+/// Today only `"h264"` and `"h265"` have encoder backends; anything
+/// else demotes to H.264 with a warning so the session still works
+/// (the browser negotiated H.264 too, that's the universal default).
+///
+/// H.265 path: gated on `target_os = "windows"` + `mf-encoder` feature.
+/// The HEVC cascade is HW-only (Windows ships no software HEVC encoder
+/// CLSID); on failure we fall back to `open_default` which still walks
+/// the H.264 cascade + openh264 fallback. The browser is already told
+/// (via `set_codec_preferences`) which codec to expect — demotion at
+/// this layer means the peer must re-advertise H.264 in the SDP
+/// answer, which the caller in `peer.rs` handles.
+pub fn open_for_codec(
+    codec: &str,
+    width: u32,
+    height: u32,
+    preference: EncoderPreference,
+) -> (Box<dyn VideoEncoder>, &'static str) {
+    let normalised = codec.to_ascii_lowercase();
+    match normalised.as_str() {
+        "h265" | "hevc" => {
+            #[cfg(all(target_os = "windows", feature = "mf-encoder"))]
+            {
+                match mf::MfEncoder::new_hevc(width, height) {
+                    Ok(e) => {
+                        tracing::info!(width, height, "encoder selected: mf-h265 (hardware)");
+                        return (Box::new(e), "h265");
+                    }
+                    Err(e) => {
+                        tracing::warn!(%e, "mf-h265 init failed — demoting to H.264");
+                    }
+                }
+            }
+            #[cfg(not(all(target_os = "windows", feature = "mf-encoder")))]
+            {
+                let _ = (width, height);
+                tracing::warn!(
+                    "HEVC requested but this build has no MF HEVC backend — demoting to H.264"
+                );
+            }
+            (open_default(width, height, preference), "h264")
+        }
+        _ => {
+            if normalised != "h264" {
+                tracing::warn!(
+                    codec = %normalised,
+                    "encoder: no backend for requested codec — demoting to H.264"
+                );
+            }
+            (open_default(width, height, preference), "h264")
+        }
+    }
+}
+
 /// Check the `ROOMLER_AGENT_HW_AUTO` escape hatch. Any value equal to
 /// `"0"`, `"false"`, `"no"`, or `"off"` (case-insensitive) disables the
 /// MF-HW-first branch of the Auto cascade. Unset or any other value

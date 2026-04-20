@@ -97,7 +97,7 @@ pub(crate) fn probe_hevc_adapter_count() -> Result<usize> {
     activate::enumerate_hw_hevc_mfts().map(|v| v.len())
 }
 
-use sync_pipeline::MfPipeline;
+use sync_pipeline::{MfPipeline, OutputCodec};
 
 /// Public-facing handle. Owns only the command channel; the IMFTransform
 /// and every other COM interface live on the pinned worker thread.
@@ -105,6 +105,7 @@ pub struct MfEncoder {
     cmd_tx: std_mpsc::Sender<Cmd>,
     width: u32,
     height: u32,
+    codec: OutputCodec,
 }
 
 enum Cmd {
@@ -118,12 +119,29 @@ enum Cmd {
 }
 
 impl MfEncoder {
-    /// Build the MF encoder for a given output resolution.
-    ///
-    /// NV12 requires even dimensions. We reject the construction up-front
-    /// so the cascade in `open_default` can fall back to openh264 cleanly
-    /// rather than hitting the error later on the first encode call.
+    /// Build an MF H.264 encoder for a given output resolution.
+    /// Convenience wrapper around [`MfEncoder::new_h264`]; pre-existing
+    /// call sites in the agent use this.
     pub fn new(width: u32, height: u32) -> Result<Self> {
+        Self::new_h264(width, height)
+    }
+
+    /// H.264 entry point. Preserves the original probe-and-rollback
+    /// cascade behaviour; falls back to the SW `CLSID_MSH264EncoderMFT`
+    /// when every HW candidate fails.
+    pub fn new_h264(width: u32, height: u32) -> Result<Self> {
+        Self::new_internal(width, height, OutputCodec::H264)
+    }
+
+    /// HEVC entry point. Walks the same DXGI adapter × HW MFT cascade
+    /// but filters for `CLSID_MSH265EncoderMFT` / IHV HEVC encoders.
+    /// Returns Err when no HW HEVC path succeeds — Windows ships no
+    /// software HEVC encoder so the caller must demote to H.264.
+    pub fn new_hevc(width: u32, height: u32) -> Result<Self> {
+        Self::new_internal(width, height, OutputCodec::Hevc)
+    }
+
+    fn new_internal(width: u32, height: u32, codec: OutputCodec) -> Result<Self> {
         if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
             bail!("mf-encoder: require non-zero, even dimensions, got {width}x{height}");
         }
@@ -132,7 +150,7 @@ impl MfEncoder {
         let (cmd_tx, cmd_rx) = std_mpsc::channel::<Cmd>();
 
         thread::Builder::new()
-            .name("roomler-agent-mf-encoder".into())
+            .name(format!("roomler-agent-mf-encoder-{}", codec.backend_name()))
             .spawn(move || {
                 // 1. Initialise COM for this thread. MTA because MF is
                 //    happy with it and we never touch UI.
@@ -150,10 +168,10 @@ impl MfEncoder {
                     return;
                 }
 
-                // 3. Run the cascade: adapter × HW MFT probe-and-
-                //    rollback, with SW-MFT fallback on the default
-                //    adapter if no HW candidate succeeded.
-                let pipeline = match activate::activate_and_probe_pipeline(width, height) {
+                // 3. Run the codec-parametric cascade.
+                let pipeline = match activate::activate_and_probe_pipeline_for_codec(
+                    codec, width, height,
+                ) {
                     Ok(p) => p,
                     Err(e) => {
                         unsafe { MFShutdown().ok() };
@@ -177,6 +195,7 @@ impl MfEncoder {
             cmd_tx,
             width,
             height,
+            codec,
         })
     }
 }
@@ -226,7 +245,7 @@ impl VideoEncoder for MfEncoder {
     }
 
     fn name(&self) -> &'static str {
-        "mf-h264"
+        self.codec.backend_name()
     }
 }
 

@@ -65,6 +65,11 @@ enum Command {
         /// the CI exercise actually verifies the MF path.
         #[arg(long, default_value = "hardware")]
         encoder: String,
+        /// Codec to smoke-test. `h264` (default) or `h265` — HEVC
+        /// goes through `open_for_codec` and the MF HEVC cascade.
+        /// Accepts `hevc` as an alias.
+        #[arg(long, default_value = "h264")]
+        codec: String,
     },
 }
 
@@ -83,7 +88,7 @@ async fn main() -> Result<()> {
             enroll_cmd(&config_path, &server, &token, &name).await
         }
         Command::Run { encoder } => run_cmd(&config_path, encoder.as_deref()).await,
-        Command::EncoderSmoke { encoder } => encoder_smoke_cmd(&encoder).await,
+        Command::EncoderSmoke { encoder, codec } => encoder_smoke_cmd(&encoder, &codec).await,
     }
 }
 
@@ -203,17 +208,34 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
 /// assert at least one keyframe comes out. Used in CI to catch MF init
 /// regressions before shipping an MSI. Exits with a non-zero code on
 /// any failure so a failed smoke check fails the release build.
-async fn encoder_smoke_cmd(pref_raw: &str) -> Result<()> {
-    use roomler_agent::encode::open_default;
+async fn encoder_smoke_cmd(pref_raw: &str, codec_raw: &str) -> Result<()> {
+    use roomler_agent::encode::{open_default, open_for_codec};
     let pref = encode::EncoderPreference::from_str(pref_raw)
         .map_err(|e| anyhow::anyhow!("bad encoder preference {pref_raw:?}: {e}"))?;
     let w = 640u32;
     let h = 480u32;
-    tracing::info!(width = w, height = h, ?pref, "encoder smoke: opening encoder");
+    let codec = codec_raw.to_ascii_lowercase();
+    tracing::info!(width = w, height = h, ?pref, codec = %codec, "encoder smoke: opening encoder");
 
-    let mut enc = open_default(w, h, pref);
+    // For H.264 keep the historical `open_default` path (preserves
+    // logging + behaviour that CI smoke output is pinned to). For any
+    // other codec, go through `open_for_codec` which runs the codec-
+    // specific cascade and reports whether a demotion happened.
+    let (mut enc, actual_codec) = if codec == "h264" {
+        (open_default(w, h, pref), "h264".to_string())
+    } else {
+        let (e, actual) = open_for_codec(&codec, w, h, pref);
+        (e, actual.to_string())
+    };
     let backend = enc.name();
-    tracing::info!(backend, "encoder smoke: backend selected");
+    tracing::info!(backend, actual_codec = %actual_codec, "encoder smoke: backend selected");
+    if codec != "h264" && actual_codec != codec {
+        tracing::warn!(
+            requested = %codec,
+            actual = %actual_codec,
+            "encoder smoke: demoted from requested codec"
+        );
+    }
 
     let mut keyframes = 0usize;
     let mut total_bytes = 0usize;

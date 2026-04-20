@@ -103,6 +103,12 @@ async fn connect_once(
     // the main loop flushes them to the WS.
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<ClientMsg>(PEER_OUTBOUND_CAP);
     let mut peers: HashMap<bson::oid::ObjectId, AgentPeer> = HashMap::new();
+    // Codec selected for each pending session (computed from the
+    // browser∩agent intersection when `rc:session.request` arrives, read
+    // at `rc:sdp.offer` time to drive the track + encoder). Entries are
+    // removed when the peer is built; orphaned entries (session
+    // cancelled before SDP) get cleaned when the session is terminated.
+    let mut pending_codecs: HashMap<bson::oid::ObjectId, String> = HashMap::new();
 
     // Keepalive. nginx + K8s ingress commonly idle-close WSes at 60-120s of
     // silence; send an application-level Ping every 25s so the connection
@@ -141,6 +147,7 @@ async fn connect_once(
                                 &mut ws,
                                 parsed,
                                 &mut peers,
+                                &mut pending_codecs,
                                 &outbound_tx,
                                 encoder_preference,
                             )
@@ -173,6 +180,7 @@ async fn handle_server_msg(
     >,
     msg: ServerMsg,
     peers: &mut HashMap<bson::oid::ObjectId, AgentPeer>,
+    pending_codecs: &mut HashMap<bson::oid::ObjectId, String>,
     outbound_tx: &mpsc::Sender<ClientMsg>,
     encoder_preference: crate::encode::EncoderPreference,
 ) -> Result<(), ConnectError> {
@@ -187,13 +195,12 @@ async fn handle_server_msg(
         } => {
             // Pick the best codec for this session from the
             // intersection of (browser-advertised, agent-supported).
-            // Today this is observational only — the encoder cascade
-            // in open_default is still hard-wired to H.264. When
-            // 2B.2 finishes (pre-encoded RTP track + SDP munging for
-            // HEVC/AV1), this `chosen` selection drives the encoder
-            // + track type the peer builds.
+            // Stashed per session_id so the rc:sdp.offer handler can
+            // read it back when building the peer: that's where the
+            // track codec + encoder backend are actually bound.
             let our_caps = crate::encode::caps::detect();
             let chosen = crate::encode::caps::pick_best_codec(&browser_caps, &our_caps.codecs);
+            pending_codecs.insert(session_id, chosen.clone());
             info!(
                 %session_id, %controller_user_id, %controller_name,
                 ?permissions, consent_timeout_secs,
@@ -217,11 +224,21 @@ async fn handle_server_msg(
                 old.close().await;
             }
 
+            // Read back the codec picked by `rc:session.request`. If
+            // the session skipped request (some test harnesses do) or
+            // the message order is broken, default to "h264" so the
+            // peer still works — that's the universal fallback the
+            // browser understands.
+            let chosen_codec = pending_codecs
+                .remove(&session_id)
+                .unwrap_or_else(|| "h264".to_string());
+
             let peer = match AgentPeer::new(
                 session_id,
                 &ice_servers,
                 outbound_tx.clone(),
                 encoder_preference,
+                chosen_codec,
             )
             .await
             {
@@ -285,6 +302,10 @@ async fn handle_server_msg(
             if let Some(peer) = peers.remove(&session_id) {
                 peer.close().await;
             }
+            // Drop any orphaned pending-codec entry for this session so
+            // the map doesn't accumulate under long-running agents
+            // (e.g. sessions cancelled before SDP is exchanged).
+            pending_codecs.remove(&session_id);
         }
 
         ServerMsg::Error { session_id, code, message } => {
