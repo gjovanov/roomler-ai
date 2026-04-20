@@ -13,6 +13,9 @@ use anyhow::Result;
 #[cfg(feature = "scrap-capture")]
 pub mod scrap_backend;
 
+#[cfg(all(target_os = "windows", feature = "wgc-capture"))]
+pub mod wgc_backend;
+
 pub mod cursor;
 
 /// A captured frame, in an encoder-agnostic representation.
@@ -127,10 +130,44 @@ pub fn open_default(
     _target_fps: u32,
     _downscale: DownscalePolicy,
 ) -> Box<dyn ScreenCapture> {
+    // Windows: prefer WGC (captures HW cursors + supports dirty rects
+    // on Win 11 22000+). Fall back to scrap (DXGI) if WGC init fails
+    // — e.g. on Windows versions without the Graphics.Capture runtime
+    // or broken WinRT. Escape hatch: `ROOMLER_AGENT_CAPTURE=scrap` forces
+    // the DXGI path without a rebuild.
+    #[cfg(all(target_os = "windows", feature = "wgc-capture"))]
+    {
+        if !capture_env_prefers_scrap() {
+            match wgc_backend::WgcCapture::primary(_target_fps, _downscale) {
+                Ok(c) => {
+                    tracing::info!(
+                        width = c.width(),
+                        height = c.height(),
+                        "capture: backend=wgc (Windows.Graphics.Capture)"
+                    );
+                    return Box::new(c);
+                }
+                Err(e) => {
+                    tracing::warn!(%e, "wgc capture unavailable — falling back to scrap (DXGI)");
+                }
+            }
+        } else {
+            tracing::info!(
+                "ROOMLER_AGENT_CAPTURE=scrap — skipping WGC, using DXGI via scrap"
+            );
+        }
+    }
     #[cfg(feature = "scrap-capture")]
     {
         match scrap_backend::ScrapCapture::primary(_target_fps, _downscale) {
-            Ok(c) => return Box::new(c),
+            Ok(c) => {
+                tracing::info!(
+                    width = c.width(),
+                    height = c.height(),
+                    "capture: backend=scrap (DXGI/XShm/CoreGraphics)"
+                );
+                return Box::new(c);
+            }
             Err(e) => {
                 tracing::warn!(%e, "scrap capture unavailable — falling back to NoopCapture");
             }
@@ -144,4 +181,14 @@ pub fn open_default(
         );
     }
     Box::new(NoopCapture)
+}
+
+/// Escape hatch: `ROOMLER_AGENT_CAPTURE=scrap` (case-insensitive) forces
+/// the DXGI path even on builds that include WGC. Useful for diagnosing
+/// WGC-specific regressions in the field without a rebuild.
+#[cfg(all(target_os = "windows", feature = "wgc-capture"))]
+fn capture_env_prefers_scrap() -> bool {
+    std::env::var("ROOMLER_AGENT_CAPTURE")
+        .map(|v| v.trim().eq_ignore_ascii_case("scrap"))
+        .unwrap_or(false)
 }
