@@ -261,7 +261,7 @@ TeamViewer-style remote desktop. One native agent per controlled host, Roomler A
 - [LOW] [2026-03-10] Deployment strategy is Recreate (no zero-downtime rolling updates) — Status: OPEN
 - [LOW] [2026-03-10] No git hooks configured (no pre-commit, no lint-staged) — Status: OPEN
 - [LOW] [2026-04-17] Remote-control: encoder bitrate is fixed at 3 Mbps (TWCC/REMB adaptive bitrate is a no-op) — Status: FIXED (2026-04-20, 0.1.26 REMB-driven adaptive bitrate; openh264 set_bitrate via raw FFI; hysteresis ±15% prevents wobble)
-- [LOW] [2026-04-17] Remote-control: agent captures primary display only; multi-monitor plumbing stops at the `mon` field in the wire protocol — Status: OPEN
+- [LOW] [2026-04-17] Remote-control: agent captures primary display only; multi-monitor plumbing stops at the `mon` field in the wire protocol — Status: PARTIAL (2026-04-20, 0.1.31 — display enumeration now reports all attached monitors via `scrap::Display::all()`; capture backend still hardcodes `Display::primary()`, multi-monitor capture selection deferred)
 - [LOW] [2026-04-20] Remote-control: NVIDIA NVENC `ActivateObject` returns 0x8000FFFF on RTX 5090 Blackwell for H.264, HEVC, and AV1 MFTs regardless of adapter binding. Cascade routes around it (H.264+HEVC land on alternative MFTs; AV1 has no alternative and fails cleanly, filtered from advertised caps by the probe-at-startup check). Worth a fresh investigation with driver updates or `CODECAPI_AVEncAdapterLUID` experiments. Status: OPEN (workaround shipped)
 
 ## Last Health Check
