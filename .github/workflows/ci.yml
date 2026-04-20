@@ -71,16 +71,20 @@ jobs:
         run: cd ui && bun install --frozen-lockfile
 
       - name: Build (includes vue-tsc --noEmit)
-        # Split build into vue-tsc and vite build stages + mirror
-        # output to the job summary so anonymous API consumers (and
-        # future-us without a gh auth token handy) can see which of
-        # the two failed and why, without needing to pull the raw
-        # log archive.
+        # Disable the runner's default `-e` / pipefail so we can capture
+        # PIPESTATUS and decide the exit code ourselves. With -e active
+        # the tee-pipe's non-zero would kill the shell before we even
+        # got to write the captured output to $GITHUB_STEP_SUMMARY —
+        # which is what happened on the previous attempt (step ran for
+        # 19s and produced no summary).
+        shell: bash --noprofile --norc {0}
         run: |
-          set -o pipefail
           cd ui
-          echo "### bun version" >> "$GITHUB_STEP_SUMMARY"
-          bun --version >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### bun version"
+            bun --version
+          } >> "$GITHUB_STEP_SUMMARY"
+
           echo "### vue-tsc --noEmit" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           bun x vue-tsc --noEmit 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
@@ -90,11 +94,15 @@ jobs:
             echo "vue-tsc failed with exit $tsc_rc" >> "$GITHUB_STEP_SUMMARY"
             exit "$tsc_rc"
           fi
+
           echo "### vite build" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           bun x vite build 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
           vite_rc=${PIPESTATUS[0]}
           echo '```' >> "$GITHUB_STEP_SUMMARY"
+          if [ "$vite_rc" != 0 ]; then
+            echo "vite build failed with exit $vite_rc" >> "$GITHUB_STEP_SUMMARY"
+          fi
           exit "$vite_rc"
 
       - name: Run unit tests
