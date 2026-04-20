@@ -116,6 +116,16 @@ export function useRemoteControl() {
   const channels: Record<string, RTCDataChannel> = {}
   const inputChannelOpen = ref(false)
 
+  // Pending clipboard:read requests. Keyed by `req_id` so interleaved
+  // reads can resolve independently. The agent echoes the req_id back
+  // on `clipboard:content` / `clipboard:error`; a 5 s timeout rejects
+  // stale requests so the UI toast doesn't spin forever.
+  const pendingClipboardReads = new Map<
+    number,
+    { resolve: (text: string) => void; reject: (err: Error) => void; timer: ReturnType<typeof setTimeout> }
+  >()
+  let nextClipboardReqId = 1
+
   // Stats polling: interval handle + last snapshot so each poll can
   // derive a delta bitrate. Reset in teardown() so a fresh connection
   // doesn't see a stale byte counter.
@@ -455,6 +465,38 @@ export function useRemoteControl() {
     channels.clipboard = pc.createDataChannel('clipboard', { ordered: true })
     channels.files = pc.createDataChannel('files', { ordered: true })
 
+    // Subscribe to the clipboard DC. Agent -> browser messages are
+    // `clipboard:content` (reply to a read) and `clipboard:error`
+    // (read or write failure). Pending-read promises are keyed by the
+    // req_id we stamp on outbound `clipboard:read` messages so
+    // interleaved reads resolve independently.
+    channels.clipboard.onmessage = (ev) => {
+      if (typeof ev.data !== 'string') return
+      let msg: { t?: string; req_id?: number | null; text?: string; message?: string }
+      try {
+        msg = JSON.parse(ev.data)
+      } catch {
+        return
+      }
+      if (msg.t === 'clipboard:content') {
+        const reqId = typeof msg.req_id === 'number' ? msg.req_id : null
+        if (reqId == null) return
+        const pending = pendingClipboardReads.get(reqId)
+        if (!pending) return
+        clearTimeout(pending.timer)
+        pendingClipboardReads.delete(reqId)
+        pending.resolve(typeof msg.text === 'string' ? msg.text : '')
+      } else if (msg.t === 'clipboard:error') {
+        const reqId = typeof msg.req_id === 'number' ? msg.req_id : null
+        if (reqId == null) return
+        const pending = pendingClipboardReads.get(reqId)
+        if (!pending) return
+        clearTimeout(pending.timer)
+        pendingClipboardReads.delete(reqId)
+        pending.reject(new Error(msg.message || 'agent clipboard error'))
+      }
+    }
+
     // Subscribe to the cursor DC. The agent pumps `cursor:pos` /
     // `cursor:shape` / `cursor:hide` at ~30 Hz; decode shape bitmaps
     // eagerly so the paint loop is a zero-copy `drawImage`.
@@ -660,6 +702,59 @@ export function useRemoteControl() {
     }
   }
 
+  /** Send the browser's clipboard text to the agent's OS clipboard.
+   *  Fire-and-forget. Requires user gesture — `navigator.clipboard.
+   *  readText()` throws in non-gesture contexts. Call from a button
+   *  click handler. Resolves to `true` on best-effort send, `false`
+   *  if the clipboard DC isn't open or reading the browser clipboard
+   *  was blocked (e.g. permissions denied). */
+  async function sendClipboardToAgent(): Promise<boolean> {
+    const ch = channels.clipboard
+    if (!ch || ch.readyState !== 'open') return false
+    let text: string
+    try {
+      text = await globalThis.navigator.clipboard.readText()
+    } catch {
+      return false
+    }
+    try {
+      ch.send(JSON.stringify({ t: 'clipboard:write', text }))
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  /** Request the agent's current clipboard text. Rejects with a
+   *  timeout after 5 seconds if the agent doesn't reply. Call from a
+   *  button click handler so the subsequent `navigator.clipboard.
+   *  writeText()` has user-gesture permission. Resolves with the
+   *  text; the caller is responsible for writing it to the browser
+   *  clipboard (this lets the caller show a preview / paste into a
+   *  specific field instead of always overwriting). */
+  function getAgentClipboard(): Promise<string> {
+    const ch = channels.clipboard
+    if (!ch || ch.readyState !== 'open') {
+      return Promise.reject(new Error('clipboard channel not open'))
+    }
+    const reqId = nextClipboardReqId++
+    const msg = JSON.stringify({ t: 'clipboard:read', req_id: reqId })
+    return new Promise<string>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pendingClipboardReads.delete(reqId)
+        reject(new Error('agent did not respond to clipboard:read within 5s'))
+      }, 5000)
+      pendingClipboardReads.set(reqId, { resolve, reject, timer })
+      try {
+        ch.send(msg)
+      } catch (e) {
+        clearTimeout(timer)
+        pendingClipboardReads.delete(reqId)
+        reject(e instanceof Error ? e : new Error(String(e)))
+      }
+    })
+  }
+
   return {
     phase,
     error,
@@ -674,6 +769,8 @@ export function useRemoteControl() {
     connect,
     disconnect,
     attachInput,
+    sendClipboardToAgent,
+    getAgentClipboard,
   }
 }
 

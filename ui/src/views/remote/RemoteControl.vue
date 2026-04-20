@@ -43,6 +43,37 @@
         prepend-inner-icon="mdi-quality-high"
         aria-label="Quality preference"
       />
+      <!-- Clipboard sync buttons. Visible only during a live session
+           because the DC is only open then. Both sides require a user
+           gesture — navigator.clipboard.{readText,writeText} throw
+           otherwise, so they live on explicit button clicks rather
+           than a background poller. -->
+      <v-btn
+        v-if="rc.phase.value === 'connected'"
+        icon
+        variant="text"
+        size="small"
+        class="mr-1"
+        :loading="clipboardBusy"
+        aria-label="Send my clipboard to the remote host"
+        title="Send my clipboard → remote"
+        @click="onSendClipboard"
+      >
+        <v-icon>mdi-content-paste</v-icon>
+      </v-btn>
+      <v-btn
+        v-if="rc.phase.value === 'connected'"
+        icon
+        variant="text"
+        size="small"
+        class="mr-2"
+        :loading="clipboardBusy"
+        aria-label="Get the remote host's clipboard"
+        title="Get remote clipboard → me"
+        @click="onGetClipboard"
+      >
+        <v-icon>mdi-content-copy</v-icon>
+      </v-btn>
       <v-btn
         v-if="rc.phase.value === 'idle' || rc.phase.value === 'closed' || rc.phase.value === 'error'"
         color="primary"
@@ -168,6 +199,7 @@ import { useRoute } from 'vue-router'
 import { useAgentStore, type Agent } from '@/stores/agents'
 import { useAuthStore } from '@/stores/auth'
 import { useRemoteControl, type RcQuality } from '@/composables/useRemoteControl'
+import { useSnackbar } from '@/composables/useSnackbar'
 
 const route = useRoute()
 const tenantId = computed(() => route.params.tenantId as string)
@@ -177,6 +209,51 @@ const agentStore = useAgentStore()
 const authStore = useAuthStore()
 const agent = ref<Agent | null>(null)
 const rc = useRemoteControl()
+const { showSuccess, showError } = useSnackbar()
+const clipboardBusy = ref(false)
+
+// Push the controller's local clipboard to the agent's OS clipboard.
+// Driven by a toolbar button so the `navigator.clipboard.readText()`
+// call happens in a user-gesture context (Chrome throws otherwise).
+// Short-lived busy spinner during the round-trip; toast on
+// success/failure. Fire-and-forget — the agent doesn't ack writes.
+async function onSendClipboard() {
+  if (clipboardBusy.value) return
+  clipboardBusy.value = true
+  try {
+    const ok = await rc.sendClipboardToAgent()
+    if (ok) {
+      showSuccess('Clipboard sent to remote')
+    } else {
+      showError('Could not read your clipboard (permission denied?)')
+    }
+  } finally {
+    clipboardBusy.value = false
+  }
+}
+
+// Pull the agent's clipboard text and copy it into the controller's
+// local clipboard. The round-trip goes: button click → send
+// `clipboard:read` on the DC → await `clipboard:content` → paste
+// into `navigator.clipboard.writeText`. 5 s timeout inside the
+// composable; we render the error as a snackbar.
+async function onGetClipboard() {
+  if (clipboardBusy.value) return
+  clipboardBusy.value = true
+  try {
+    const text = await rc.getAgentClipboard()
+    try {
+      await globalThis.navigator.clipboard.writeText(text)
+      showSuccess(`Copied remote clipboard (${text.length} chars)`)
+    } catch (e) {
+      showError(`Could not write to your clipboard: ${(e as Error).message}`)
+    }
+  } catch (e) {
+    showError(`Remote clipboard read failed: ${(e as Error).message}`)
+  } finally {
+    clipboardBusy.value = false
+  }
+}
 
 // Template refs. Declared before the computeds / watches below that
 // reference them — Vue 3 <script setup> executes top-to-bottom, and

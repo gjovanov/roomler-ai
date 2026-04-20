@@ -399,8 +399,9 @@ impl AgentPeer {
         // Route data channels by label. `input` goes to the OS injector;
         // `control` parses rc:* JSON (quality preference, etc.);
         // `cursor` receives an agent-driven stream of position / shape
-        // messages pumped from CursorTracker; clipboard/files are
-        // accepted but not yet wired.
+        // messages pumped from CursorTracker; `clipboard` round-trips
+        // text between the agent's OS clipboard and the browser;
+        // `files` is still log-only (Known Issue MEDIUM).
         let quality_for_dc = quality_state.clone();
         pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
             let label = dc.label().to_string();
@@ -411,6 +412,8 @@ impl AgentPeer {
                     "input" => attach_input_handler(dc),
                     "control" => attach_control_handler(dc, session_id, quality_for_dc),
                     "cursor" => attach_cursor_handler(dc, session_id),
+                    #[cfg(feature = "clipboard")]
+                    "clipboard" => attach_clipboard_handler(dc, session_id),
                     _ => attach_log_only(dc, session_id),
                 }
             })
@@ -1001,13 +1004,100 @@ fn attach_cursor_handler(dc: Arc<RTCDataChannel>, session_id: bson::oid::ObjectI
 }
 
 /// Placeholder handler for data channels that aren't wired to OS output
-/// yet (`clipboard`, `files`). Logs message sizes so we can see
-/// activity without spamming the log with contents.
+/// yet (`files`). Logs message sizes so we can see activity without
+/// spamming the log with contents.
 fn attach_log_only(dc: Arc<RTCDataChannel>, session_id: bson::oid::ObjectId) {
     let label = dc.label().to_string();
     dc.on_message(Box::new(move |msg| {
         debug!(%session_id, %label, bytes = msg.data.len(), "DC msg (unhandled)");
         Box::pin(async {})
+    }));
+}
+
+/// Wire the `clipboard` DC to the agent's OS clipboard. Parses
+/// inbound JSON as [`clipboard::ClipboardIncoming`] and dispatches:
+///
+/// - `clipboard:write { text }` — replace the OS clipboard with the
+///   payload; no response (fire-and-forget).
+/// - `clipboard:read { req_id? }` — read current OS clipboard text and
+///   reply with `clipboard:content { text, req_id }`. Errors reply
+///   with `clipboard:error { message }` so the browser can surface
+///   the failure in a toast.
+///
+/// A single [`crate::clipboard::Clipboard`] is created per session; it
+/// owns a thread-pinned `arboard::Clipboard`. On init failure we log
+/// and leave the DC as a no-op (browser reads time out, writes are
+/// silently dropped — no worse than pre-0.1.33).
+#[cfg(feature = "clipboard")]
+fn attach_clipboard_handler(dc: Arc<RTCDataChannel>, session_id: bson::oid::ObjectId) {
+    let cb = match crate::clipboard::Clipboard::new() {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(%session_id, %e, "clipboard: init failed — DC will no-op");
+            return;
+        }
+    };
+    let dc_for_handler = dc.clone();
+    dc.on_message(Box::new(move |msg| {
+        let dc = dc_for_handler.clone();
+        let cb = cb.clone();
+        Box::pin(async move {
+            let Ok(text) = std::str::from_utf8(&msg.data) else {
+                debug!(%session_id, bytes = msg.data.len(), "clipboard: non-UTF8 payload ignored");
+                return;
+            };
+            let parsed: Result<crate::clipboard::ClipboardIncoming, _> = serde_json::from_str(text);
+            let parsed = match parsed {
+                Ok(p) => p,
+                Err(e) => {
+                    debug!(%session_id, %e, "clipboard: unparseable JSON");
+                    return;
+                }
+            };
+            match parsed {
+                crate::clipboard::ClipboardIncoming::Write { text } => {
+                    let bytes = text.len();
+                    match cb.write(text).await {
+                        Ok(()) => info!(%session_id, bytes, "clipboard: wrote to host"),
+                        Err(e) => {
+                            warn!(%session_id, %e, "clipboard: write failed");
+                            let reply = serde_json::json!({
+                                "t": "clipboard:error",
+                                "message": format!("{e}"),
+                            });
+                            if let Ok(s) = serde_json::to_string(&reply) {
+                                let _ = dc.send_text(s).await;
+                            }
+                        }
+                    }
+                }
+                crate::clipboard::ClipboardIncoming::Read { req_id } => match cb.read().await {
+                    Ok(text) => {
+                        let bytes = text.len();
+                        info!(%session_id, bytes, "clipboard: read from host");
+                        let reply = serde_json::json!({
+                            "t": "clipboard:content",
+                            "text": text,
+                            "req_id": req_id,
+                        });
+                        if let Ok(s) = serde_json::to_string(&reply) {
+                            let _ = dc.send_text(s).await;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(%session_id, %e, "clipboard: read failed");
+                        let reply = serde_json::json!({
+                            "t": "clipboard:error",
+                            "message": format!("{e}"),
+                            "req_id": req_id,
+                        });
+                        if let Ok(s) = serde_json::to_string(&reply) {
+                            let _ = dc.send_text(s).await;
+                        }
+                    }
+                },
+            }
+        })
     }));
 }
 
