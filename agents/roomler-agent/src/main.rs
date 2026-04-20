@@ -77,6 +77,9 @@ enum Command {
     /// run real MfEncoder activations, so this exits with roughly
     /// the same logs an operator would see in the first session).
     Caps,
+    /// Enumerate attached displays and print what the agent will
+    /// report in `rc:agent.hello`. Cross-platform via `scrap`.
+    Displays,
 }
 
 #[tokio::main]
@@ -96,6 +99,7 @@ async fn main() -> Result<()> {
         Command::Run { encoder } => run_cmd(&config_path, encoder.as_deref()).await,
         Command::EncoderSmoke { encoder, codec } => encoder_smoke_cmd(&encoder, &codec).await,
         Command::Caps => caps_cmd().await,
+        Command::Displays => displays_cmd().await,
     }
 }
 
@@ -300,5 +304,22 @@ async fn caps_cmd() -> Result<()> {
     println!("supports_clipboard: {}", caps.supports_clipboard);
     println!("supports_file_transfer: {}", caps.supports_file_transfer);
     println!("max_simultaneous_sessions: {}", caps.max_simultaneous_sessions);
+    Ok(())
+}
+
+async fn displays_cmd() -> Result<()> {
+    let list = roomler_agent::displays::enumerate();
+    println!("displays ({}):", list.len());
+    for d in &list {
+        println!(
+            "  index={} name={:?} {}x{} scale={:.2}{}",
+            d.index,
+            d.name,
+            d.width_px,
+            d.height_px,
+            d.scale,
+            if d.primary { " (primary)" } else { "" }
+        );
+    }
     Ok(())
 }

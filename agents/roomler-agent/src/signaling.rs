@@ -350,14 +350,13 @@ fn detect_os() -> OsKind {
 }
 
 fn stub_displays() -> Vec<DisplayInfo> {
-    vec![DisplayInfo {
-        index: 0,
-        name: "primary".into(),
-        width_px: 1920,
-        height_px: 1080,
-        scale: 1.0,
-        primary: true,
-    }]
+    // Real enumeration via `crate::displays::enumerate` (scrap-backed on
+    // Windows / Linux / macOS). Falls back to a single 1920×1080 entry
+    // on builds without `scrap-capture` or hosts where enumeration
+    // fails. Kept named `stub_displays` for continuity with the
+    // pre-0.1.31 call site; can be renamed once the rest of the
+    // hello-preamble stubs are audited.
+    crate::displays::enumerate()
 }
 
 fn stub_caps() -> AgentCaps {
