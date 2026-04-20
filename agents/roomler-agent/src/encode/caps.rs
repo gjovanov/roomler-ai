@@ -9,13 +9,42 @@
 //! Used by Phase 2 codec negotiation: the controller's browser
 //! advertises its `RTCRtpReceiver.getCapabilities('video').codecs`
 //! and the agent picks the best intersection.
+//!
+//! Detection is **probe-gated** for codecs without a safe demotion
+//! path (HEVC, AV1): we actually run a tiny MfEncoder::new at startup
+//! and only advertise codecs that successfully activate. This closes
+//! the "enumerates but won't activate" false-advertising gap (e.g.
+//! NVIDIA RTX 5090 Blackwell where the AV1 MFT enumerates but every
+//! `ActivateObject` returns 0x8000FFFF). Without this guard a browser
+//! session could negotiate AV1, the pump's runtime cascade would fail,
+//! and the fail-closed NoopEncoder would leave the browser with a
+//! black screen. The probe result is cached behind a `OnceLock` so
+//! the ~300ms / codec init cost runs once per agent process, not per
+//! `rc:agent.hello`.
 
 use roomler_ai_remote_control::models::AgentCaps;
+use std::sync::OnceLock;
+
+static CACHED_CAPS: OnceLock<AgentCaps> = OnceLock::new();
+
+/// Probe dimensions for the HEVC + AV1 activation check. Even number,
+/// small enough that any HW encoder accepts it, matching what the
+/// internal `probe_pipeline` uses for MFT output verification.
+#[cfg(all(target_os = "windows", feature = "mf-encoder"))]
+const PROBE_WIDTH: u32 = 480;
+#[cfg(all(target_os = "windows", feature = "mf-encoder"))]
+const PROBE_HEIGHT: u32 = 270;
 
 /// Detect the codecs and HW backends compiled into this agent build
-/// and currently functional on this host. Cheap one-shot probe; safe
-/// to call from `signaling::stub_caps`.
+/// and currently functional on this host. First call runs the
+/// activation probes (~300ms per codec on HEVC/AV1-capable boxes,
+/// <10ms on boxes with no HW encoder); subsequent calls return the
+/// cached result.
 pub fn detect() -> AgentCaps {
+    CACHED_CAPS.get_or_init(compute_caps).clone()
+}
+
+fn compute_caps() -> AgentCaps {
     let mut codecs: Vec<String> = Vec::new();
     let mut hw_encoders: Vec<String> = Vec::new();
 
@@ -27,44 +56,40 @@ pub fn detect() -> AgentCaps {
 
     #[cfg(all(target_os = "windows", feature = "mf-encoder"))]
     {
-        // Probe HW H.264 MFTs via the same MFTEnumEx path the cascade
-        // uses. We don't activate them here (that's the cascade's job
-        // and doing it twice doubles the COM lifecycle cost); just
-        // enumeration is enough to know whether HW H.264 is even
-        // installed. Failures (broken MF, no driver) silently return
-        // an empty list — the agent still ships SW codec capability.
+        // H.264: enumeration is sufficient. If any H.264 MFT
+        // enumerates the cascade always succeeds (at worst it falls
+        // through to the default-adapter SW MFT via
+        // CLSID_MSH264EncoderMFT); runtime activation failure would
+        // be caught by open_default's triple-fallback (MF → openh264
+        // → Noop). No probe needed.
         if let Ok(adapters) = super::mf::probe_adapter_count()
             && adapters > 0
         {
             hw_encoders.push("mf-h264-hw".into());
-            // h264 is already in `codecs` from openh264 above; the
-            // hw_encoders list is what flags HW availability.
         }
-        // HEVC enumeration. The full HEVC encode pipeline lands in
-        // 2C.1 (parallel to mf/sync_pipeline.rs); for capability
-        // reporting we just need to know whether the HW MFT exists.
-        // Modern Windows + recent IHV drivers ship HEVC encoder MFTs
-        // even on iGPUs; this lights up the "H.265 HW" chip in the
-        // admin UI today, and the actual encode lights up once 2C.1
-        // is wired through encoder selection.
+
+        // HEVC: enumeration + real activation probe. MFTs that
+        // enumerate but fail ActivateObject (driver/adapter
+        // mismatches, missing HEVC Video Extension) would poison a
+        // negotiated session — the track is bound to video/H265
+        // before the encoder opens, so failure means black video not
+        // fallback-decode. Gate advertising on a successful probe.
         if let Ok(adapters) = super::mf::probe_hevc_adapter_count()
             && adapters > 0
+            && activates(CodecProbe::Hevc)
         {
             codecs.push("h265".into());
             hw_encoders.push("mf-h265-hw".into());
         }
-        // AV1 enumeration: MFTEnumEx with MFVideoFormat_AV1. Windows
-        // 11 24H2+ with recent NVIDIA / Intel / AMD drivers exposes
-        // HW AV1 MFTs. Enumeration surfacing a candidate doesn't
-        // guarantee the cascade will succeed (IHV activation bugs,
-        // driver-adapter mismatches) — the encoder opener demotes to
-        // HEVC or H.264 if the runtime cascade fails. Advertising AV1
-        // here drives the browser's codec preference; if negotiation
-        // lands on AV1 and the cascade demotes at runtime the browser
-        // sees undecodable bytes, so conservative: advertise only
-        // when at least one AV1 MFT enumerates.
+
+        // AV1: same reasoning as HEVC, with sharper impact — the
+        // RTX 5090 Blackwell regression causes the NVIDIA AV1 MFT to
+        // enumerate-and-fail on every activation on this dev box
+        // (HANDOVER7 §1). Probe-at-startup filters this out so the
+        // agent doesn't advertise a codec it can't actually produce.
         if let Ok(adapters) = super::mf::probe_av1_adapter_count()
             && adapters > 0
+            && activates(CodecProbe::Av1)
         {
             codecs.push("av1".into());
             hw_encoders.push("mf-av1-hw".into());
@@ -78,6 +103,55 @@ pub fn detect() -> AgentCaps {
         supports_clipboard: false,
         supports_file_transfer: false,
         max_simultaneous_sessions: 1,
+    }
+}
+
+/// Codec to probe. We only probe codecs that fail closed on activation
+/// error (HEVC + AV1 today); H.264 has a working triple-fallback path
+/// and is not gated.
+#[cfg(all(target_os = "windows", feature = "mf-encoder"))]
+#[derive(Debug, Clone, Copy)]
+enum CodecProbe {
+    Hevc,
+    Av1,
+}
+
+/// Spin up the real MF encoder for `codec` at a tiny probe resolution,
+/// then drop it. Returns `true` iff the cascade found a working HW
+/// MFT and emitted a probe frame. Logs at info level on success, warn
+/// on failure — either way the caller sees the cost in startup logs.
+#[cfg(all(target_os = "windows", feature = "mf-encoder"))]
+fn activates(codec: CodecProbe) -> bool {
+    let start = std::time::Instant::now();
+    let result = match codec {
+        CodecProbe::Hevc => super::mf::MfEncoder::new_hevc(PROBE_WIDTH, PROBE_HEIGHT),
+        CodecProbe::Av1 => super::mf::MfEncoder::new_av1(PROBE_WIDTH, PROBE_HEIGHT),
+    };
+    let elapsed_ms = start.elapsed().as_millis();
+    match result {
+        Ok(enc) => {
+            tracing::info!(
+                codec = ?codec,
+                elapsed_ms,
+                "caps probe: codec activates — advertising"
+            );
+            // Dropping `enc` triggers the worker's Shutdown cmd which
+            // in turn runs MFShutdown + CoUninitialize on its thread.
+            // Explicit drop + small sleep would serialise that more
+            // cleanly if we started seeing handle leaks, but today the
+            // Drop impl is reliable.
+            drop(enc);
+            true
+        }
+        Err(e) => {
+            tracing::warn!(
+                codec = ?codec,
+                %e,
+                elapsed_ms,
+                "caps probe: codec enumerates but does NOT activate — NOT advertising"
+            );
+            false
+        }
     }
 }
 
