@@ -202,12 +202,35 @@ MongoDB native driver (not Mongoose). Models live in `crates/db/src/models/` exc
 
 - **Production URL**: `http://roomler.ai/` — the live deployment. Use this as the `--server` argument when enrolling agents and as the origin the browser controller loads.
 - **Docker**: Multi-stage build (rust:1.88-bookworm -> oven/bun:1 -> debian:trixie-slim + nginx)
-- **Deploy repo**: `/home/gjovanov/roomler-ai-deploy/` (Ansible + K8s)
-- **Pipeline**: `docker build` -> `docker save` -> `scp` to k8s-worker-3 -> `ctr import` -> Ansible playbook
-- **K8s**: Namespace `roomler-ai`, deployment `roomler-ai`, Recreate strategy, hostNetwork
+- **Deploy repo**: `/home/gjovanov/roomler-ai-deploy/` on mars (Ansible + K8s). Kubeconfig path in `.env` → `KUBECONFIG_PATH`.
+- **Build + deploy server**: `ssh mars && cd /home/gjovanov/roomler-ai && git pull && scripts/deploy-to-k8s.sh` (promoted from `/tmp/post-build-deploy.sh`, lives in the deploy repo at `roomler-ai-deploy/scripts/build-and-push-image.sh` — see §K8s Deploy Pipeline below).
+- **K8s cluster**: 3 control-plane + 3 worker nodes (Ubuntu 22.04, containerd 1.7.29, v1.31.14). Pods run on `k8s-worker-3` (10.10.30.11). Namespace `roomler-ai`, deployment `roomler2` (note: name is `roomler2` not `roomler-ai`), Recreate strategy, hostNetwork, `imagePullPolicy: Never` + `:latest` tag (so the image must be pre-loaded on the worker node before rollout).
 - **Health probes**: startup/readiness/liveness all on `/health` (port 80 via nginx -> :3000 backend)
 - **nginx**: Pod-internal reverse proxy (`files/nginx-pod.conf`) — SPA fallback + API proxy + WS proxy
-- **Agent binary**: built separately (`cargo build -p roomler-agent --release --features full`) and distributed to controlled hosts out-of-band. Not part of the API Docker image. Per-OS installers (MSI / signed .pkg / .deb + systemd-user unit) are still TODO — see HANDOVER2.md.
+- **Agent binary**: built separately (`cargo build -p roomler-agent --release --features full`) and distributed to controlled hosts via GitHub Releases (MSI / .pkg / .deb auto-built by `.github/workflows/release-agent.yml` on `agent-v*` tag push). Not part of the API Docker image.
+
+### K8s deploy pipeline (step-by-step)
+
+The ansible playbook in `roomler-ai-deploy/playbooks/deploy.yml` **only applies k8s manifests**. It does NOT build or push the Docker image. Since `imagePullPolicy: Never` + `:latest` tag means the node must already have the new image, the image transfer is a hand-rolled pre-step that the playbook depends on. All of this is encoded in `roomler-ai-deploy/scripts/build-and-push-image.sh`:
+
+1. **Build** on mars (mars has docker; workers don't): `docker build -t gjovanov/roomler-ai:latest .` in the src repo (`/home/gjovanov/roomler-ai`). First build ~20 min (mediasoup C++ + full cargo release); incremental ~5 min.
+2. **Save** to tar: `docker save gjovanov/roomler-ai:latest -o /tmp/roomler-ai-<ts>.tar` (~152 MB).
+3. **scp** to worker-3 using ansible's SSH path (ubuntu user, jupiter proxy):
+   - `-i /home/gjovanov/k8s-cluster-multi/files/ssh/jupiter/k8s_ed25519`
+   - `-o ProxyCommand="ssh -W %h:%p -i /home/gjovanov/.ssh/id_secunet gjovanov@5.9.157.221"`
+   - target `ubuntu@10.10.30.11:/tmp/`
+4. **`ctr import`** on worker-3: `sudo ctr -n k8s.io images import /tmp/roomler-ai-<ts>.tar`. Because the tag is `:latest`, containerd replaces the old image; pods reading it don't hot-swap — they pick up the new bytes on next start only.
+5. **`kubectl rollout restart deployment/roomler2 -n roomler-ai`** on mars. Recreate strategy takes ~30s (old pod terminates, new pod pulls the already-local image).
+6. **Verify**: `curl -sI https://roomler.ai/health` → `HTTP/2 200`.
+
+**Why not just run the ansible playbook?** `kubectl apply` with an unchanged `:latest` tag is a no-op. Without the image push step, you'd be applying manifests that match what's already deployed and the pod would keep running the old code.
+
+**Full deploy from scratch** (including the code pull):
+```bash
+ssh mars
+cd /home/gjovanov/roomler-ai && git pull
+cd /home/gjovanov/roomler-ai-deploy && scripts/build-and-push-image.sh
+```
 
 ## Post-Implementation Testing
 
