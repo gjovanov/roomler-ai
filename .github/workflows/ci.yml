@@ -48,12 +48,20 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.bun/install/cache
-          key: ${{ runner.os }}-bun-${{ hashFiles('ui/bun.lockb') }}
+          # `ui/bun.lock` is the text-format lockfile bun 1.2+ writes.
+          # The older `bun.lockb` binary format isn't produced by our
+          # installs, so the previous key hashed a non-existent file
+          # (always the empty-string hash) and the cache never varied.
+          key: ${{ runner.os }}-bun-${{ hashFiles('ui/bun.lock') }}
           restore-keys: |
             ${{ runner.os }}-bun-
 
       - name: Install dependencies
-        run: cd ui && bun install
+        # `--frozen-lockfile` fails the build if bun.lock is missing
+        # or stale. Without it the resolver silently up-versions
+        # transitive deps between runs, which is how the CI frontend
+        # build started diverging from local.
+        run: cd ui && bun install --frozen-lockfile
 
       - name: Build (includes vue-tsc --noEmit)
         run: cd ui && bun run build
