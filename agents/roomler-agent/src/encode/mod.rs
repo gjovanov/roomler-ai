@@ -338,7 +338,7 @@ fn open_for_codec_hevc(width: u32, height: u32) -> (Box<dyn VideoEncoder>, &'sta
             Err(e) => {
                 tracing::warn!(
                     %e,
-                    "mf-h265 init failed; track is bound to video/H265 so no bitstream demotion is safe. Session will have no video until reconnect with a lower Quality preference."
+                    "mf-h265 init failed; track is bound to video/HEVC so no bitstream demotion is safe. Session will have no video until reconnect with a lower Quality preference."
                 );
                 (Box::new(NoopEncoder), "h265")
             }

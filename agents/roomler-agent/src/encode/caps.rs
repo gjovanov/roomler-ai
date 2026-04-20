@@ -71,7 +71,7 @@ fn compute_caps() -> AgentCaps {
         // HEVC: enumeration + real activation probe. MFTs that
         // enumerate but fail ActivateObject (driver/adapter
         // mismatches, missing HEVC Video Extension) would poison a
-        // negotiated session — the track is bound to video/H265
+        // negotiated session — the track is bound to video/HEVC
         // before the encoder opens, so failure means black video not
         // fallback-decode. Gate advertising on a successful probe.
         if let Ok(adapters) = super::mf::probe_hevc_adapter_count()
