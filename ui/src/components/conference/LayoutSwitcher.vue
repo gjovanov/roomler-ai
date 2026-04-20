@@ -96,16 +96,16 @@
 </template>
 
 <script setup lang="ts">
-import type { LayoutPreferences, LayoutMode, SelfViewMode } from '@/composables/useConferenceLayout'
+import type { LayoutPreferences, SelfViewMode } from '@/composables/useConferenceLayout'
 
 defineProps<{
   prefs: LayoutPreferences
 }>()
 
-defineEmits<{
-  (e: 'update:mode', mode: LayoutMode): void
-  (e: 'update:maxTiles', n: number): void
-  (e: 'update:hideNonVideo', v: boolean): void
-  (e: 'update:selfViewMode', mode: SelfViewMode): void
-}>()
+// Array-style emits: vue-tsc 2.2.12 has a known issue resolving
+// overloaded call signatures in templates (`$emit('update:mode', ...)`
+// collapses onto the last overload). Falling back to the string-array
+// form keeps template $emit loose while parent-side types remain
+// well-defined via v-model on `mode` / `maxTiles` / etc.
+defineEmits(['update:mode', 'update:maxTiles', 'update:hideNonVideo', 'update:selfViewMode'])
 </script>

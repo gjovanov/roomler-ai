@@ -6,6 +6,7 @@ interface TenantBilling {
   status?: string
   cancel_at_period_end?: boolean
   current_period_end?: string | number | Date
+  customer_id?: string
 }
 
 interface Tenant {
