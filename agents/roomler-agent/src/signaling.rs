@@ -183,10 +183,22 @@ async fn handle_server_msg(
             controller_name,
             permissions,
             consent_timeout_secs,
+            browser_caps,
         } => {
+            // Pick the best codec for this session from the
+            // intersection of (browser-advertised, agent-supported).
+            // Today this is observational only — the encoder cascade
+            // in open_default is still hard-wired to H.264. When
+            // 2B.2 finishes (pre-encoded RTP track + SDP munging for
+            // HEVC/AV1), this `chosen` selection drives the encoder
+            // + track type the peer builds.
+            let our_caps = crate::encode::caps::detect();
+            let chosen = crate::encode::caps::pick_best_codec(&browser_caps, &our_caps.codecs);
             info!(
                 %session_id, %controller_user_id, %controller_name,
                 ?permissions, consent_timeout_secs,
+                browser_caps = ?browser_caps,
+                chosen_codec = %chosen,
                 "incoming session request — auto-granting (see docs §11.2)"
             );
             // TODO: real consent UI. Self-host default is "no prompt".
