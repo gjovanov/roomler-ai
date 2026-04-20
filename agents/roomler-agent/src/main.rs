@@ -71,6 +71,12 @@ enum Command {
         #[arg(long, default_value = "h264")]
         codec: String,
     },
+    /// Run the capability probe that populates `rc:agent.hello` and
+    /// print the result. Useful for verifying what codecs the agent
+    /// will actually advertise on this host (the HEVC + AV1 probes
+    /// run real MfEncoder activations, so this exits with roughly
+    /// the same logs an operator would see in the first session).
+    Caps,
 }
 
 #[tokio::main]
@@ -89,6 +95,7 @@ async fn main() -> Result<()> {
         }
         Command::Run { encoder } => run_cmd(&config_path, encoder.as_deref()).await,
         Command::EncoderSmoke { encoder, codec } => encoder_smoke_cmd(&encoder, &codec).await,
+        Command::Caps => caps_cmd().await,
     }
 }
 
@@ -282,5 +289,16 @@ async fn encoder_smoke_cmd(pref_raw: &str, codec_raw: &str) -> Result<()> {
         bail!("encoder smoke: no keyframes produced (backend={backend})");
     }
     println!("encoder smoke PASSED: backend={backend} keyframes={keyframes} total_bytes={total_bytes}");
+    Ok(())
+}
+
+async fn caps_cmd() -> Result<()> {
+    let caps = roomler_agent::encode::caps::detect();
+    println!("codecs: {:?}", caps.codecs);
+    println!("hw_encoders: {:?}", caps.hw_encoders);
+    println!("has_input_permission: {}", caps.has_input_permission);
+    println!("supports_clipboard: {}", caps.supports_clipboard);
+    println!("supports_file_transfer: {}", caps.supports_file_transfer);
+    println!("max_simultaneous_sessions: {}", caps.max_simultaneous_sessions);
     Ok(())
 }

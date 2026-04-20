@@ -243,6 +243,7 @@ TeamViewer-style remote desktop. One native agent per controlled host, Roomler A
 - Agent binary: enrollment + signalling + real webrtc-rs peer + scrap capture + openh264 encoder + enigo input — **live-verified** on Win11 against the production deployment (2026-04-18)
 - Browser viewer: RemoteControl.vue + useRemoteControl composable + AgentsSection admin UI — complete, letterbox-corrected coordinates, wallclock sample durations, idle-keepalive, PLI rate-limiting
 - Windows Media Foundation HW encoder (`--features mf-encoder` / `full-hw`): probe-and-rollback cascade complete (0.1.26). Adapter enumeration + per-MFT probe with blanket async-unlock and `SET_D3D_MANAGER E_NOTIMPL` tolerance. Auto prefers MF-HW on Windows. Async-only MFTs (Intel QSV) route to `AsyncRequired` for the upcoming async pipeline; today they fall through to the SW MFT final fallback cleanly.
+- Codec negotiation (0.1.28+0.1.29+0.1.30): agent advertises H.264 + HEVC + AV1 caps via `AgentCaps.codecs` at `rc:agent.hello` time; browser advertises its decode caps via `ClientMsg::SessionRequest.browser_caps`; agent picks best intersection (priority: av1 > h265 > vp9 > h264 > vp8) and binds the matching MF encoder + `video/H264|H265|AV1` track + `set_codec_preferences` SDP pin. HEVC/AV1 failures are fail-closed (black video + WARN, not silent bitstream substitution). Caps probe-at-startup (0.1.30) filters codecs that enumerate-but-fail-to-activate (e.g. NVIDIA RTX 5090 Blackwell AV1 MFT).
 - Release pipeline: `.github/workflows/release-agent.yml` builds signed MSI (cargo-wix), .deb (cargo-deb), and .pkg scaffolding on tag push; runs `encoder-smoke` on windows-latest as a smoke-test gate.
 
 ## Known Issues
@@ -259,8 +260,9 @@ TeamViewer-style remote desktop. One native agent per controlled host, Roomler A
 - [MEDIUM] [2026-04-17] Remote-control: consent auto-granted on agent (no tray UI yet); fine for self-controlled hosts, needs UI for org-controlled devices per docs §11.2 — Status: OPEN
 - [LOW] [2026-03-10] Deployment strategy is Recreate (no zero-downtime rolling updates) — Status: OPEN
 - [LOW] [2026-03-10] No git hooks configured (no pre-commit, no lint-staged) — Status: OPEN
-- [LOW] [2026-04-17] Remote-control: encoder bitrate is fixed at 3 Mbps (TWCC/REMB adaptive bitrate is a no-op) — Status: OPEN (openh264 path now uses `initial_bitrate_for(w,h)` but is still not adaptive mid-stream)
+- [LOW] [2026-04-17] Remote-control: encoder bitrate is fixed at 3 Mbps (TWCC/REMB adaptive bitrate is a no-op) — Status: FIXED (2026-04-20, 0.1.26 REMB-driven adaptive bitrate; openh264 set_bitrate via raw FFI; hysteresis ±15% prevents wobble)
 - [LOW] [2026-04-17] Remote-control: agent captures primary display only; multi-monitor plumbing stops at the `mon` field in the wire protocol — Status: OPEN
+- [LOW] [2026-04-20] Remote-control: NVIDIA NVENC `ActivateObject` returns 0x8000FFFF on RTX 5090 Blackwell for H.264, HEVC, and AV1 MFTs regardless of adapter binding. Cascade routes around it (H.264+HEVC land on alternative MFTs; AV1 has no alternative and fails cleanly, filtered from advertised caps by the probe-at-startup check). Worth a fresh investigation with driver updates or `CODECAPI_AVEncAdapterLUID` experiments. Status: OPEN (workaround shipped)
 
 ## Last Health Check
 
