@@ -163,7 +163,19 @@ mod windows_impl {
                     self.shapes.insert(shape_id, info.clone());
                     Some(info)
                 } else {
-                    None
+                    // extract_shape failed for this HCURSOR (I-beam
+                    // variants, custom app cursors, or bitmaps
+                    // GetDIBits can't decode). Without a shape the
+                    // browser hides the canvas overlay and the
+                    // controller sees the cursor "disappear". Fall
+                    // back to a hardcoded white-with-black-outline
+                    // arrow so the position indicator is always
+                    // visible — better UX than a vanishing cursor.
+                    // Cache under this shape_id so we don't rebuild
+                    // the fallback on every poll.
+                    let fallback = synthetic_arrow();
+                    self.shapes.insert(shape_id, fallback.clone());
+                    Some(fallback)
                 };
                 Some(RawCursorTick {
                     x: ci.ptScreenPos.x,
@@ -297,6 +309,74 @@ mod windows_impl {
             if !info.hbmColor.is_invalid() {
                 let _ = DeleteObject(HGDIOBJ(info.hbmColor.0));
             }
+        }
+    }
+
+    /// Fallback cursor bitmap when `extract_shape` can't decode the
+    /// OS cursor (unusual mask bitmaps, some app-custom cursors, or
+    /// any `GetDIBits` failure). A classic 11×17 Windows-style arrow
+    /// with a 1-pixel black outline and white fill — always visible
+    /// on dark and light backgrounds so the controller never "loses"
+    /// the remote pointer.
+    ///
+    /// Pattern characters: `#` = black outline, `.` = white fill,
+    /// space = transparent. Hotspot is (0, 0) — the arrow tip.
+    fn synthetic_arrow() -> CursorInfo {
+        const W: u32 = 11;
+        const H: u32 = 17;
+        // Each row is W chars. Painted top-to-bottom, left-to-right.
+        const PATTERN: &[&[u8]] = &[
+            b"#          ",
+            b"##         ",
+            b"#.#        ",
+            b"#..#       ",
+            b"#...#      ",
+            b"#....#     ",
+            b"#.....#    ",
+            b"#......#   ",
+            b"#.......#  ",
+            b"#........# ",
+            b"#.....#####",
+            b"#..#..#    ",
+            b"#.# #..#   ",
+            b"##  #..#   ",
+            b"#    #..#  ",
+            b"     #..#  ",
+            b"      ##   ",
+        ];
+
+        let mut bgra = vec![0u8; (W * H * 4) as usize];
+        for (y, row) in PATTERN.iter().enumerate() {
+            for (x, ch) in row.iter().enumerate() {
+                let idx = (y * W as usize + x) * 4;
+                match ch {
+                    b'#' => {
+                        // Black outline, fully opaque.
+                        bgra[idx] = 0;
+                        bgra[idx + 1] = 0;
+                        bgra[idx + 2] = 0;
+                        bgra[idx + 3] = 255;
+                    }
+                    b'.' => {
+                        // White fill, fully opaque.
+                        bgra[idx] = 255;
+                        bgra[idx + 1] = 255;
+                        bgra[idx + 2] = 255;
+                        bgra[idx + 3] = 255;
+                    }
+                    _ => {
+                        // Transparent (alpha 0). BGR stays 0.
+                    }
+                }
+            }
+        }
+
+        CursorInfo {
+            width: W,
+            height: H,
+            hotspot_x: 0,
+            hotspot_y: 0,
+            bgra,
         }
     }
 
