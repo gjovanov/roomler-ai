@@ -77,7 +77,7 @@
       <v-card-subtitle class="px-0 pb-1">{{ $t('call.selfView') }}</v-card-subtitle>
       <v-radio-group
         :model-value="prefs.selfViewMode"
-        @update:model-value="$emit('update:selfViewMode', $event)"
+        @update:model-value="(v: SelfViewMode | null) => v && $emit('update:selfViewMode', v)"
         density="compact"
         hide-details
       >
@@ -103,9 +103,9 @@ defineProps<{
 }>()
 
 defineEmits<{
-  'update:mode': [mode: LayoutMode]
-  'update:maxTiles': [n: number]
-  'update:hideNonVideo': [v: boolean]
-  'update:selfViewMode': [mode: SelfViewMode]
+  (e: 'update:mode', mode: LayoutMode): void
+  (e: 'update:maxTiles', n: number): void
+  (e: 'update:hideNonVideo', v: boolean): void
+  (e: 'update:selfViewMode', mode: SelfViewMode): void
 }>()
 </script>

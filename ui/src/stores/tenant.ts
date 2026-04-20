@@ -2,12 +2,20 @@ import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { api } from '@/api/client'
 
+interface TenantBilling {
+  status?: string
+  cancel_at_period_end?: boolean
+  current_period_end?: string | number | Date
+}
+
 interface Tenant {
   id: string
   name: string
   slug: string
   description?: string
   icon?: string
+  plan?: string
+  billing?: TenantBilling
 }
 
 export const useTenantStore = defineStore('tenant', () => {

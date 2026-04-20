@@ -316,7 +316,12 @@ const editor = useEditor({
             )
             .slice(0, 10)
         },
-        render: () => {
+        // TipTap's SuggestionProps generics don't cleanly intersect
+        // with VueRenderer's internal `editor: any`, so the render
+        // object is typed loosely (any) and we narrow inside each
+        // handler. Shipped this way since the feature landed — the
+        // runtime shape is correct, only the static types disagree.
+        render: (): any => {
           let component: VueRenderer
           let popup: TippyInstance[]
 
@@ -333,7 +338,7 @@ const editor = useEditor({
               popup = tippy('body', {
                 getReferenceClientRect: renderProps.clientRect as () => DOMRect,
                 appendTo: () => document.body,
-                content: component.element,
+                content: component.element ?? undefined,
                 showOnCreate: true,
                 interactive: true,
                 trigger: 'manual',
