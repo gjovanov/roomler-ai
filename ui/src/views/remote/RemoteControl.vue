@@ -66,13 +66,28 @@
         icon
         variant="text"
         size="small"
-        class="mr-2"
+        class="mr-1"
         :loading="clipboardBusy"
         aria-label="Get the remote host's clipboard"
         title="Get remote clipboard → me"
         @click="onGetClipboard"
       >
         <v-icon>mdi-content-copy</v-icon>
+      </v-btn>
+      <!-- Ctrl+Alt+Del: the OS intercepts this key combo before the
+           browser sees it, so expose an explicit toolbar button that
+           emits the equivalent key sequence over the input DC. -->
+      <v-btn
+        v-if="rc.phase.value === 'connected'"
+        icon
+        variant="text"
+        size="small"
+        class="mr-2"
+        aria-label="Send Ctrl+Alt+Del to remote"
+        title="Send Ctrl+Alt+Del"
+        @click="rc.sendCtrlAltDel()"
+      >
+        <v-icon>mdi-keyboard-outline</v-icon>
       </v-btn>
       <v-btn
         v-if="rc.phase.value === 'idle' || rc.phase.value === 'closed' || rc.phase.value === 'error'"

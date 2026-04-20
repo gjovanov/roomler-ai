@@ -11,7 +11,18 @@ import {
   extractStatsSnapshot,
   inspectBrowserVideoCodecs,
   base64ToBytes,
+  shouldPreventDefault,
 } from '@/composables/useRemoteControl'
+
+function keyEvent(code: string, mods: Partial<{ ctrl: boolean; alt: boolean; meta: boolean; shift: boolean }> = {}): KeyboardEvent {
+  return {
+    code,
+    ctrlKey: !!mods.ctrl,
+    altKey: !!mods.alt,
+    metaKey: !!mods.meta,
+    shiftKey: !!mods.shift,
+  } as KeyboardEvent
+}
 
 describe('browserButton', () => {
   it.each([
@@ -377,5 +388,45 @@ describe('base64ToBytes', () => {
     const out = base64ToBytes(b64)
     expect(out.length).toBe(raw.length)
     for (let i = 0; i < raw.length; i++) expect(out[i]).toBe(raw[i])
+  })
+})
+
+describe('shouldPreventDefault', () => {
+  it('always intercepts Tab', () => {
+    expect(shouldPreventDefault(keyEvent('Tab'), false)).toBe(true)
+    expect(shouldPreventDefault(keyEvent('Tab'), true)).toBe(true)
+  })
+
+  it('intercepts plain Backspace but not when modifiers are held', () => {
+    expect(shouldPreventDefault(keyEvent('Backspace'), false)).toBe(true)
+    expect(shouldPreventDefault(keyEvent('Backspace', { ctrl: true }), false)).toBe(false)
+    expect(shouldPreventDefault(keyEvent('Backspace', { alt: true }), false)).toBe(false)
+    expect(shouldPreventDefault(keyEvent('Backspace', { meta: true }), false)).toBe(false)
+  })
+
+  it('intercepts browser-eaten shortcuts only when pointer is over video', () => {
+    for (const code of ['KeyA', 'KeyC', 'KeyV', 'KeyX', 'KeyZ', 'KeyY', 'KeyF', 'KeyS', 'KeyP', 'KeyR']) {
+      // Pointer outside the viewer → the controller still gets normal
+      // browser shortcuts (Ctrl+T to open a tab, etc.).
+      expect(shouldPreventDefault(keyEvent(code, { ctrl: true }), false)).toBe(false)
+      // Pointer over the viewer → intercept so the shortcut forwards
+      // to the remote without triggering the local browser UI.
+      expect(shouldPreventDefault(keyEvent(code, { ctrl: true }), true)).toBe(true)
+      // Cmd (meta) is accepted as the same prefix on macOS.
+      expect(shouldPreventDefault(keyEvent(code, { meta: true }), true)).toBe(true)
+    }
+  })
+
+  it('lets untouched Ctrl+T / Ctrl+W through even when pointer inside', () => {
+    // Explicitly NOT in the intercept list — these are still the user's
+    // own browser tab/window controls. Forwarding them to the remote
+    // over the input DC is fine, but we don't want to also preventDefault.
+    expect(shouldPreventDefault(keyEvent('KeyT', { ctrl: true }), true)).toBe(false)
+    expect(shouldPreventDefault(keyEvent('KeyW', { ctrl: true }), true)).toBe(false)
+  })
+
+  it('does not intercept a bare letter keypress without modifiers', () => {
+    expect(shouldPreventDefault(keyEvent('KeyA'), true)).toBe(false)
+    expect(shouldPreventDefault(keyEvent('KeyZ', { shift: true }), true)).toBe(false)
   })
 })
