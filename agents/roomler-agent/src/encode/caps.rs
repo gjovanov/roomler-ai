@@ -53,11 +53,22 @@ pub fn detect() -> AgentCaps {
             codecs.push("h265".into());
             hw_encoders.push("mf-h265-hw".into());
         }
-        // AV1 detection lands with 2C.3 (CLSID_MSAV1EncoderMFT,
-        // ships on Windows 11 24H2+ with recent NVENC/AMF drivers).
-        // Best-effort enumeration via MFTEnumEx with MFVideoFormat_AV1
-        // requires a windows-rs constant we don't currently import;
-        // wiring deferred until 2C.3 lands the encoder backend.
+        // AV1 enumeration: MFTEnumEx with MFVideoFormat_AV1. Windows
+        // 11 24H2+ with recent NVIDIA / Intel / AMD drivers exposes
+        // HW AV1 MFTs. Enumeration surfacing a candidate doesn't
+        // guarantee the cascade will succeed (IHV activation bugs,
+        // driver-adapter mismatches) — the encoder opener demotes to
+        // HEVC or H.264 if the runtime cascade fails. Advertising AV1
+        // here drives the browser's codec preference; if negotiation
+        // lands on AV1 and the cascade demotes at runtime the browser
+        // sees undecodable bytes, so conservative: advertise only
+        // when at least one AV1 MFT enumerates.
+        if let Ok(adapters) = super::mf::probe_av1_adapter_count()
+            && adapters > 0
+        {
+            codecs.push("av1".into());
+            hw_encoders.push("mf-av1-hw".into());
+        }
     }
 
     AgentCaps {

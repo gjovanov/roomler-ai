@@ -38,8 +38,9 @@ use windows::Win32::Media::MediaFoundation::{
     CLSID_MSH264EncoderMFT, IMFActivate, IMFDXGIDeviceManager, IMFTransform, MFMediaType_Video,
     MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG, MFT_ENUM_FLAG_ASYNCMFT, MFT_ENUM_FLAG_HARDWARE,
     MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT, MFT_FRIENDLY_NAME_Attribute,
-    MFT_MESSAGE_SET_D3D_MANAGER, MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoFormat_H264,
-    MFVideoFormat_HEVC, MFVideoFormat_NV12, MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK,
+    MFT_MESSAGE_SET_D3D_MANAGER, MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoFormat_AV1,
+    MFVideoFormat_H264, MFVideoFormat_HEVC, MFVideoFormat_NV12, MF_TRANSFORM_ASYNC,
+    MF_TRANSFORM_ASYNC_UNLOCK,
 };
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
 use windows::core::Interface;
@@ -83,6 +84,15 @@ pub(super) struct HwMftCandidate {
 /// separate concern (the HEVC pipeline itself lands in 2C.1).
 pub(super) fn enumerate_hw_hevc_mfts() -> Result<Vec<HwMftCandidate>> {
     enumerate_hw_video_mfts(MFVideoFormat_HEVC)
+}
+
+/// Enumerate hardware AV1 encoder MFTs on this host. Lights up the
+/// `mf-av1-hw` chip in AgentCaps when the host has an AV1-capable
+/// encoder. Ships on Windows 11 24H2+ with recent IHV drivers —
+/// NVIDIA RTX 40+, Intel Arc, AMD RDNA3+. Returns empty on older
+/// Windows / non-AV1 GPUs; caller then does not advertise AV1.
+pub(super) fn enumerate_hw_av1_mfts() -> Result<Vec<HwMftCandidate>> {
+    enumerate_hw_video_mfts(MFVideoFormat_AV1)
 }
 
 /// Enumerate hardware H.264 encoder MFTs on this host.
@@ -145,9 +155,10 @@ fn enumerate_hw_video_mfts(
             CoTaskMemFree(Some(activates as *const _));
         }
         tracing::info!(
+            subtype = format!("{:?}", output_subtype),
             count = out.len(),
             names = ?out.iter().map(|c| c.friendly_name.clone()).collect::<Vec<_>>(),
-            "mf-encoder: enumerated HW H.264 MFTs"
+            "mf-encoder: enumerated HW video encoder MFTs"
         );
         Ok(out)
     }
@@ -194,6 +205,7 @@ pub(super) fn activate_and_probe_pipeline_for_codec(
     let candidates = match codec {
         OutputCodec::H264 => enumerate_hw_h264_mfts(),
         OutputCodec::Hevc => enumerate_hw_hevc_mfts(),
+        OutputCodec::Av1 => enumerate_hw_av1_mfts(),
     }
     .unwrap_or_else(|e| {
         tracing::warn!(%e, codec = codec.backend_name(), "mf-encoder: enumerate_hw_*_mfts failed — cascade skips HW path");
@@ -264,6 +276,15 @@ pub(super) fn activate_and_probe_pipeline_for_codec(
             // pretending a non-existent SW path succeeded.
             Err(anyhow!(
                 "mf-encoder: HEVC cascade exhausted all HW candidates and no SW HEVC encoder is available"
+            ))
+        }
+        OutputCodec::Av1 => {
+            // Same shape as HEVC: no software AV1 encoder CLSID ships
+            // on stock Windows (libaom's Store-distributed MFT is an
+            // exception but not widely deployed). Err here so the
+            // caller demotes to the next-best codec.
+            Err(anyhow!(
+                "mf-encoder: AV1 cascade exhausted all HW candidates and no SW AV1 encoder is available"
             ))
         }
     }

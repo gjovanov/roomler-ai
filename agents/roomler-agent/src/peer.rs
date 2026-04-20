@@ -1011,10 +1011,11 @@ fn map_ice_servers(servers: &[IceServer]) -> Vec<RTCIceServer> {
 /// internal `payloader_for_codec` lookup resolves and the SDP answer
 /// carries the expected payload type.
 ///
-/// H.264: Constrained Baseline + packetization-mode=1 +
-/// profile-level-id=42e01f → PT 125 in the default MediaEngine.
-/// HEVC: empty fmtp line (Chrome/Safari don't require profile-id in
-/// the offer for receive-only) → PT 126.
+/// Default MediaEngine registrations (webrtc-rs 0.12):
+///   video/H264 Constrained Baseline, packetization-mode=1,
+///       profile-level-id=42e01f → PT 125
+///   video/H265 empty fmtp              → PT 126
+///   video/AV1  profile-id=0            → PT 41
 ///
 /// Unknown codec → H.264 default (paranoia: should never hit because
 /// `pick_best_codec` only returns codecs both sides advertise).
@@ -1027,6 +1028,13 @@ fn build_video_codec_cap(codec: &str) -> RTCRtpCodecCapability {
         RTCPFeedback { typ: "transport-cc".to_string(), parameter: String::new() },
     ];
     match codec.to_ascii_lowercase().as_str() {
+        "av1" => RTCRtpCodecCapability {
+            mime_type: "video/AV1".to_string(),
+            clock_rate: 90000,
+            channels: 0,
+            sdp_fmtp_line: "profile-id=0".to_string(),
+            rtcp_feedback: feedback,
+        },
         "h265" | "hevc" => RTCRtpCodecCapability {
             mime_type: "video/H265".to_string(),
             clock_rate: 90000,
@@ -1053,6 +1061,7 @@ fn codec_params_for(codec: &str) -> webrtc::rtp_transceiver::rtp_codec::RTCRtpCo
     use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecParameters;
     let capability = build_video_codec_cap(codec);
     let payload_type = match codec.to_ascii_lowercase().as_str() {
+        "av1" => 41,
         "h265" | "hevc" => 126,
         _ => 125,
     };
@@ -1060,6 +1069,78 @@ fn codec_params_for(codec: &str) -> webrtc::rtp_transceiver::rtp_codec::RTCRtpCo
         capability,
         payload_type,
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod codec_cap_tests {
+    use super::{build_video_codec_cap, codec_params_for};
+
+    #[test]
+    fn h264_cap_matches_webrtc_default() {
+        let cap = build_video_codec_cap("h264");
+        assert_eq!(cap.mime_type, "video/H264");
+        assert_eq!(cap.clock_rate, 90000);
+        assert!(cap.sdp_fmtp_line.contains("profile-level-id=42e01f"));
+        assert!(cap.sdp_fmtp_line.contains("packetization-mode=1"));
+    }
+
+    #[test]
+    fn hevc_cap_has_no_fmtp_line() {
+        let cap = build_video_codec_cap("h265");
+        assert_eq!(cap.mime_type, "video/H265");
+        assert!(cap.sdp_fmtp_line.is_empty());
+        let alias = build_video_codec_cap("hevc");
+        assert_eq!(alias.mime_type, "video/H265");
+    }
+
+    #[test]
+    fn av1_cap_carries_profile_id() {
+        let cap = build_video_codec_cap("av1");
+        assert_eq!(cap.mime_type, "video/AV1");
+        assert_eq!(cap.sdp_fmtp_line, "profile-id=0");
+    }
+
+    #[test]
+    fn case_insensitive_selection() {
+        assert_eq!(build_video_codec_cap("H264").mime_type, "video/H264");
+        assert_eq!(build_video_codec_cap("AV1").mime_type, "video/AV1");
+        assert_eq!(build_video_codec_cap("HEVC").mime_type, "video/H265");
+    }
+
+    #[test]
+    fn unknown_codec_defaults_to_h264() {
+        // Belt-and-braces: pick_best_codec should never hand us an
+        // unknown codec, but if it does we must not panic.
+        let cap = build_video_codec_cap("vp8");
+        assert_eq!(cap.mime_type, "video/H264");
+    }
+
+    #[test]
+    fn codec_params_payload_types_match_default_media_engine() {
+        // webrtc-rs 0.12 defaults: H.264 PT 125, HEVC PT 126, AV1 PT 41.
+        assert_eq!(codec_params_for("h264").payload_type, 125);
+        assert_eq!(codec_params_for("h265").payload_type, 126);
+        assert_eq!(codec_params_for("hevc").payload_type, 126);
+        assert_eq!(codec_params_for("av1").payload_type, 41);
+    }
+
+    #[test]
+    fn rtcp_feedback_includes_nack_pli() {
+        // All three codecs need NACK+PLI so the browser can request
+        // retransmission and keyframes; drop either one and the
+        // stream freezes on any loss.
+        for codec in ["h264", "h265", "av1"] {
+            let cap = build_video_codec_cap(codec);
+            assert!(
+                cap.rtcp_feedback.iter().any(|f| f.typ == "nack" && f.parameter == "pli"),
+                "codec {codec} missing nack pli"
+            );
+            assert!(
+                cap.rtcp_feedback.iter().any(|f| f.typ == "transport-cc"),
+                "codec {codec} missing transport-cc"
+            );
+        }
     }
 }
 

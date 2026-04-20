@@ -97,6 +97,14 @@ pub(crate) fn probe_hevc_adapter_count() -> Result<usize> {
     activate::enumerate_hw_hevc_mfts().map(|v| v.len())
 }
 
+/// Same as [`probe_adapter_count`] but for AV1 encoders. Lights up
+/// the AV1 chip in AgentsSection when HW AV1 is available. Expected
+/// 0 on most boxes today; AV1 HW encode ships on Windows 11 24H2+ with
+/// RTX 40+ / Intel Arc / RDNA3+ drivers.
+pub(crate) fn probe_av1_adapter_count() -> Result<usize> {
+    activate::enumerate_hw_av1_mfts().map(|v| v.len())
+}
+
 use sync_pipeline::{MfPipeline, OutputCodec};
 
 /// Public-facing handle. Owns only the command channel; the IMFTransform
@@ -139,6 +147,17 @@ impl MfEncoder {
     /// software HEVC encoder so the caller must demote to H.264.
     pub fn new_hevc(width: u32, height: u32) -> Result<Self> {
         Self::new_internal(width, height, OutputCodec::Hevc)
+    }
+
+    /// AV1 entry point. HW-only like HEVC; returns Err on cascade
+    /// exhaustion so the caller demotes. Expected to fail on most
+    /// boxes today — AV1 HW encoders ship on Windows 11 24H2+ with
+    /// RTX 40+ / Intel Arc / RDNA3+. On the RTX 5090 Laptop dev box
+    /// the NVIDIA AV1 MFT is likely to hit the same Blackwell
+    /// `ActivateObject 0x8000FFFF` regression as H.264/HEVC and skip
+    /// through to the next candidate.
+    pub fn new_av1(width: u32, height: u32) -> Result<Self> {
+        Self::new_internal(width, height, OutputCodec::Av1)
     }
 
     fn new_internal(width: u32, height: u32, codec: OutputCodec) -> Result<Self> {

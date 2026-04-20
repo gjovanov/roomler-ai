@@ -24,22 +24,31 @@ use windows::Win32::Media::MediaFoundation::{
     MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
     MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_END_STREAMING,
     MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_INFO,
-    MFVideoFormat_H264, MFVideoFormat_HEVC, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
-    eAVEncCommonRateControlMode_CBR, eAVEncCommonRateControlMode_LowDelayVBR,
+    MFVideoFormat_AV1, MFVideoFormat_H264, MFVideoFormat_HEVC, MFVideoFormat_NV12,
+    MFVideoInterlace_Progressive, eAVEncCommonRateControlMode_CBR,
+    eAVEncCommonRateControlMode_LowDelayVBR,
 };
 use windows::core::{GUID, Interface};
 
-/// Output codec selector for the shared sync pipeline. H.264 and HEVC
-/// share 95% of the MF wiring (input = NV12, same latency knobs, same
-/// rate control, same GOP size, same IDR-on-demand behaviour); only
-/// the output subtype GUID and a couple of codec-specific tuning knobs
-/// differ (HEVC always uses CABAC, so `AVEncH264CABACEnable` is a no-op
-/// and we skip it). Exposed pub(crate) so `encode::mod` can pick the
-/// codec without reaching into this module's privates.
+/// Output codec selector for the shared sync pipeline. H.264, HEVC, and
+/// AV1 share ~90% of the MF wiring (input = NV12, same latency knobs,
+/// same rate control, same GOP size, same force-keyframe behaviour);
+/// what differs per codec:
+///
+/// - Output subtype GUID (`MFVideoFormat_{H264,HEVC,AV1}`)
+/// - H.264 CABAC enable knob: only meaningful for H.264; HEVC always
+///   uses CABAC (spec-mandatory), AV1 doesn't use it (different entropy
+///   coding entirely).
+/// - Keyframe detection heuristic: H.264 and HEVC emit Annex-B-framed
+///   NALUs, AV1 emits raw OBU sequences with length-prefixed elements.
+///
+/// Exposed pub(crate) so `encode::mod` can pick the codec without
+/// reaching into this module's privates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OutputCodec {
     H264,
     Hevc,
+    Av1,
 }
 
 impl OutputCodec {
@@ -48,6 +57,7 @@ impl OutputCodec {
         match self {
             Self::H264 => "mf-h264",
             Self::Hevc => "mf-h265",
+            Self::Av1 => "mf-av1",
         }
     }
 
@@ -55,6 +65,7 @@ impl OutputCodec {
         match self {
             Self::H264 => MFVideoFormat_H264,
             Self::Hevc => MFVideoFormat_HEVC,
+            Self::Av1 => MFVideoFormat_AV1,
         }
     }
 }
@@ -511,10 +522,13 @@ fn read_packet_from_sample(sample: &IMFSample, codec: OutputCodec) -> Result<Opt
         let data = std::slice::from_raw_parts(ptr, cur_len as usize).to_vec();
         buffer.Unlock()?;
 
-        // MF emits Annex-B NALUs for both H.264 and HEVC by default.
-        // webrtc-rs's H264Payloader + HevcPayloader both split on
-        // start codes, so the bitstream passes through unchanged.
-        let is_keyframe = nalu_contains_idr(&data, codec);
+        // H.264/HEVC emit Annex-B NALUs; webrtc-rs's H264Payloader +
+        // HevcPayloader split on start codes. AV1 emits a raw OBU
+        // sequence (length-prefixed elements, no start codes); the
+        // Av1Payloader consumes exactly that shape. Bytes pass through
+        // unchanged for all three. `is_keyframe` uses the per-codec
+        // detector below — observability-only.
+        let is_keyframe = is_keyframe_bitstream(&data, codec);
         Ok(Some(EncodedPacket {
             data,
             is_keyframe,
@@ -523,16 +537,29 @@ fn read_packet_from_sample(sample: &IMFSample, codec: OutputCodec) -> Result<Opt
     }
 }
 
-/// Scan an Annex-B bitstream for an IDR NAL. Good-enough heuristic for
-/// the `is_keyframe` observability flag — the RTP layer doesn't use
-/// this for packetization.
+/// Scan the encoded bitstream for a keyframe marker. Good-enough
+/// heuristic for the `is_keyframe` observability flag — the RTP layer
+/// doesn't use this for packetization.
 ///
-/// H.264 (RFC 6184): nal_unit_type = first byte & 0x1F; IDR = 5.
-/// HEVC (RFC 7798): nal_unit_type = (first byte >> 1) & 0x3F; keyframes
-/// are IDR_W_RADL (19), IDR_N_LP (20), or CRA_NUT (21). The HEVC NAL
-/// header is 2 bytes total but only the first carries the type; the
-/// second byte is layer/temporal IDs we don't need here.
-fn nalu_contains_idr(buf: &[u8], codec: OutputCodec) -> bool {
+/// H.264 (RFC 6184): Annex-B framed; nal_unit_type = first byte after
+/// start code & 0x1F; IDR = 5.
+/// HEVC (RFC 7798): Annex-B framed; nal_unit_type = (first byte >> 1)
+/// & 0x3F; keyframes are IDR_W_RADL (19), IDR_N_LP (20), CRA_NUT (21).
+/// AV1: OBU sequence, no Annex-B; the presence of an
+/// OBU_SEQUENCE_HEADER (obu_type=1) implies the frame is a keyframe
+/// — IHV AV1 encoders emit a fresh sequence header at every forced
+/// IDR + at the start of each GOP but never mid-GOP. Missing that
+/// header on the first frame is an encoder bug (the decoder can't
+/// initialise), so false-negatives here mean something is already
+/// broken upstream.
+fn is_keyframe_bitstream(buf: &[u8], codec: OutputCodec) -> bool {
+    match codec {
+        OutputCodec::H264 | OutputCodec::Hevc => annex_b_contains_idr(buf, codec),
+        OutputCodec::Av1 => av1_contains_sequence_header(buf),
+    }
+}
+
+fn annex_b_contains_idr(buf: &[u8], codec: OutputCodec) -> bool {
     let mut i = 0;
     while i + 4 < buf.len() {
         // Annex-B start code: 00 00 00 01 or 00 00 01.
@@ -553,6 +580,7 @@ fn nalu_contains_idr(buf: &[u8], codec: OutputCodec) -> bool {
                     let nt = (head >> 1) & 0x3f;
                     matches!(nt, 19..=21)
                 }
+                OutputCodec::Av1 => unreachable!("AV1 does not use Annex-B"),
             };
             if is_idr {
                 return true;
@@ -563,6 +591,77 @@ fn nalu_contains_idr(buf: &[u8], codec: OutputCodec) -> bool {
     false
 }
 
+/// Walk an AV1 OBU sequence looking for OBU_SEQUENCE_HEADER
+/// (obu_type=1). Stops at the first OBU that can't be length-decoded
+/// — a cheap safety valve so a malformed buffer doesn't cause an
+/// infinite loop.
+///
+/// OBU header byte layout (AV1 spec §5.3.2):
+///   bit 7: obu_forbidden_bit (must be 0)
+///   bits 6-3: obu_type (4 bits)
+///   bit 2: obu_extension_flag
+///   bit 1: obu_has_size_field
+///   bit 0: obu_reserved_1bit
+fn av1_contains_sequence_header(buf: &[u8]) -> bool {
+    const OBU_SEQUENCE_HEADER: u8 = 1;
+    const MAX_OBUS: usize = 32;
+    let mut i = 0;
+    for _ in 0..MAX_OBUS {
+        if i >= buf.len() {
+            return false;
+        }
+        let head = buf[i];
+        let obu_type = (head >> 3) & 0x0f;
+        let has_extension = (head & 0x04) != 0;
+        let has_size_field = (head & 0x02) != 0;
+        if obu_type == OBU_SEQUENCE_HEADER {
+            return true;
+        }
+        i += 1;
+        if has_extension {
+            i += 1;
+        }
+        if has_size_field {
+            let (payload_size, leb_bytes) = match decode_leb128(&buf[i..]) {
+                Some(v) => v,
+                None => return false,
+            };
+            i += leb_bytes;
+            i = i.saturating_add(payload_size as usize);
+        } else {
+            // No size field means the OBU runs to the end of the
+            // buffer. MF AV1 MFT emits OBUs with size fields — this
+            // branch is a safety valve for spec-compliant-but-unusual
+            // streams. Stop walking here.
+            return false;
+        }
+    }
+    false
+}
+
+/// Decode an unsigned LEB128 integer, returning `(value, bytes_read)`
+/// or `None` if the buffer is exhausted / value overflows u32. AV1
+/// uses at most 8 LEB128 bytes per integer per spec §4.10.5.
+fn decode_leb128(buf: &[u8]) -> Option<(u32, usize)> {
+    const MAX_BYTES: usize = 8;
+    let mut value: u64 = 0;
+    for i in 0..MAX_BYTES {
+        if i >= buf.len() {
+            return None;
+        }
+        let b = buf[i];
+        value |= ((b & 0x7f) as u64) << (i * 7);
+        if (b & 0x80) == 0 {
+            // Cap at u32 to match the OBU length field's range.
+            if value > u32::MAX as u64 {
+                return None;
+            }
+            return Some((value as u32, i + 1));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -571,10 +670,10 @@ mod tests {
     fn h264_idr_detected() {
         // [0 0 0 1] start + NAL header 0x65 → type 5 (IDR slice)
         let buf = [0, 0, 0, 1, 0x65, 0x88];
-        assert!(nalu_contains_idr(&buf, OutputCodec::H264));
+        assert!(is_keyframe_bitstream(&buf, OutputCodec::H264));
         // Non-IDR slice (type 1)
         let buf = [0, 0, 0, 1, 0x41, 0x88];
-        assert!(!nalu_contains_idr(&buf, OutputCodec::H264));
+        assert!(!is_keyframe_bitstream(&buf, OutputCodec::H264));
     }
 
     #[test]
@@ -586,16 +685,54 @@ mod tests {
         let idr_n_lp = [0, 0, 0, 1, 0x28, 0x01];
         let cra = [0, 0, 0, 1, 0x2A, 0x01];
         let non_idr = [0, 0, 0, 1, 0x02, 0x01];
-        assert!(nalu_contains_idr(&idr_w_radl, OutputCodec::Hevc));
-        assert!(nalu_contains_idr(&idr_n_lp, OutputCodec::Hevc));
-        assert!(nalu_contains_idr(&cra, OutputCodec::Hevc));
-        assert!(!nalu_contains_idr(&non_idr, OutputCodec::Hevc));
+        assert!(is_keyframe_bitstream(&idr_w_radl, OutputCodec::Hevc));
+        assert!(is_keyframe_bitstream(&idr_n_lp, OutputCodec::Hevc));
+        assert!(is_keyframe_bitstream(&cra, OutputCodec::Hevc));
+        assert!(!is_keyframe_bitstream(&non_idr, OutputCodec::Hevc));
     }
 
     #[test]
     fn hevc_codec_names() {
         assert_eq!(OutputCodec::H264.backend_name(), "mf-h264");
         assert_eq!(OutputCodec::Hevc.backend_name(), "mf-h265");
+        assert_eq!(OutputCodec::Av1.backend_name(), "mf-av1");
+    }
+
+    #[test]
+    fn av1_sequence_header_detected() {
+        // OBU header: obu_type=1 (SEQUENCE_HEADER) → (1 << 3) = 0x08.
+        // With has_size_field bit (bit 1) set: 0x0A. Size leb128=0x03,
+        // payload = [0xAA, 0xBB, 0xCC].
+        let buf = [0x0A, 0x03, 0xAA, 0xBB, 0xCC];
+        assert!(is_keyframe_bitstream(&buf, OutputCodec::Av1));
+    }
+
+    #[test]
+    fn av1_no_sequence_header() {
+        // obu_type=6 (OBU_FRAME) with size=3.
+        let buf = [0x32, 0x03, 0x11, 0x22, 0x33];
+        assert!(!is_keyframe_bitstream(&buf, OutputCodec::Av1));
+    }
+
+    #[test]
+    fn av1_sequence_header_after_temporal_delimiter() {
+        // Realistic: OBU_TEMPORAL_DELIMITER (type=2, size=0), then
+        // OBU_SEQUENCE_HEADER (type=1, size=3). Both have size bits set.
+        let buf = [
+            0x12, 0x00,             // TD, size=0
+            0x0A, 0x03, 0xAA, 0xBB, 0xCC, // SEQ_HEADER, size=3
+        ];
+        assert!(is_keyframe_bitstream(&buf, OutputCodec::Av1));
+    }
+
+    #[test]
+    fn decode_leb128_handles_multibyte() {
+        // 129 = 0b1000_0001 → LEB128 [0x81, 0x01]
+        assert_eq!(decode_leb128(&[0x81, 0x01]), Some((129, 2)));
+        // Short buffer returns None
+        assert_eq!(decode_leb128(&[0x81]), None);
+        // Single-byte value
+        assert_eq!(decode_leb128(&[0x05]), Some((5, 1)));
     }
 
     #[test]
@@ -604,8 +741,8 @@ mod tests {
         // under the H.264 mask (0x26 & 0x1F = 6, a type-6 SEI).
         // Cross-check the guard: the right mask is applied per codec.
         let hevc_idr = [0, 0, 0, 1, 0x26, 0x01];
-        assert!(nalu_contains_idr(&hevc_idr, OutputCodec::Hevc));
-        assert!(!nalu_contains_idr(&hevc_idr, OutputCodec::H264));
+        assert!(is_keyframe_bitstream(&hevc_idr, OutputCodec::Hevc));
+        assert!(!is_keyframe_bitstream(&hevc_idr, OutputCodec::H264));
     }
 }
 

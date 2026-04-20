@@ -279,37 +279,78 @@ pub fn open_for_codec(
 ) -> (Box<dyn VideoEncoder>, &'static str) {
     let normalised = codec.to_ascii_lowercase();
     match normalised.as_str() {
-        "h265" | "hevc" => {
-            #[cfg(all(target_os = "windows", feature = "mf-encoder"))]
-            {
-                match mf::MfEncoder::new_hevc(width, height) {
-                    Ok(e) => {
-                        tracing::info!(width, height, "encoder selected: mf-h265 (hardware)");
-                        return (Box::new(e), "h265");
-                    }
-                    Err(e) => {
-                        tracing::warn!(%e, "mf-h265 init failed — demoting to H.264");
-                    }
-                }
-            }
-            #[cfg(not(all(target_os = "windows", feature = "mf-encoder")))]
-            {
-                let _ = (width, height);
-                tracing::warn!(
-                    "HEVC requested but this build has no MF HEVC backend — demoting to H.264"
-                );
-            }
-            (open_default(width, height, preference), "h264")
-        }
+        "av1" => open_for_codec_av1(width, height),
+        "h265" | "hevc" => open_for_codec_hevc(width, height),
         _ => {
             if normalised != "h264" {
                 tracing::warn!(
                     codec = %normalised,
-                    "encoder: no backend for requested codec — demoting to H.264"
+                    "encoder: unknown codec — defaulting to H.264 (may not match negotiated track)"
                 );
             }
             (open_default(width, height, preference), "h264")
         }
+    }
+}
+
+/// AV1 opener, factored out so the `#[cfg]` branches don't clutter the
+/// main match. See `open_for_codec` for fail-closed reasoning — when
+/// AV1 init fails we return a `NoopEncoder` rather than demoting to
+/// HEVC/H.264 bytes because the track is already bound to `video/AV1`
+/// in the peer and substituting a different codec's bitstream would
+/// produce decoder garbage on the other end.
+fn open_for_codec_av1(width: u32, height: u32) -> (Box<dyn VideoEncoder>, &'static str) {
+    #[cfg(all(target_os = "windows", feature = "mf-encoder"))]
+    {
+        match mf::MfEncoder::new_av1(width, height) {
+            Ok(e) => {
+                tracing::info!(width, height, "encoder selected: mf-av1 (hardware)");
+                (Box::new(e), "av1")
+            }
+            Err(e) => {
+                tracing::warn!(
+                    %e,
+                    "mf-av1 init failed; track is bound to video/AV1 so no bitstream demotion is safe. Session will have no video until reconnect with a lower Quality preference."
+                );
+                (Box::new(NoopEncoder), "av1")
+            }
+        }
+    }
+    #[cfg(not(all(target_os = "windows", feature = "mf-encoder")))]
+    {
+        let _ = (width, height);
+        tracing::warn!(
+            "AV1 requested but this build has no MF AV1 backend — session will have no video until reconnect with a lower Quality preference."
+        );
+        (Box::new(NoopEncoder), "av1")
+    }
+}
+
+/// HEVC opener — same fail-closed semantics as `open_for_codec_av1`.
+fn open_for_codec_hevc(width: u32, height: u32) -> (Box<dyn VideoEncoder>, &'static str) {
+    #[cfg(all(target_os = "windows", feature = "mf-encoder"))]
+    {
+        match mf::MfEncoder::new_hevc(width, height) {
+            Ok(e) => {
+                tracing::info!(width, height, "encoder selected: mf-h265 (hardware)");
+                (Box::new(e), "h265")
+            }
+            Err(e) => {
+                tracing::warn!(
+                    %e,
+                    "mf-h265 init failed; track is bound to video/H265 so no bitstream demotion is safe. Session will have no video until reconnect with a lower Quality preference."
+                );
+                (Box::new(NoopEncoder), "h265")
+            }
+        }
+    }
+    #[cfg(not(all(target_os = "windows", feature = "mf-encoder")))]
+    {
+        let _ = (width, height);
+        tracing::warn!(
+            "HEVC requested but this build has no MF HEVC backend — session will have no video until reconnect with a lower Quality preference."
+        );
+        (Box::new(NoopEncoder), "h265")
     }
 }
 
