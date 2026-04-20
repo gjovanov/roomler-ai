@@ -100,6 +100,23 @@ features = [
     "Win32_System_Variant",
     "Win32_UI_WindowsAndMessaging",     # GetCursorInfo / GetIconInfo for cursor capture (1E.1)
     "Win32_Graphics_Gdi",               # GetDIBits / GetObject / BITMAPINFOHEADER
+    # WinRT interop for the WGC capture backend (1C.1):
+    # GraphicsCaptureItemInterop::CreateForMonitor(HMONITOR), plus
+    # CreateDirect3D11DeviceFromDXGIDevice to wrap our D3D11 device
+    # as the IDirect3DDevice that Direct3D11CaptureFramePool expects.
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Graphics_Capture",
+    "Win32_System_WinRT_Direct3D11",
+    # WinRT namespaces for the capture session, frame pool, and
+    # IDirect3DSurface / IDirect3DDevice wrappers.
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    "Foundation",                        # EventRegistrationToken, IAsyncAction, TypedEventHandler
+    "Foundation_Collections",            # IVectorView<RectInt32> for DirtyRegions
+    # Multi-monitor enumeration (MonitorFromPoint / EnumDisplayMonitors).
+    "Win32_Graphics_Gdi",
+    "Win32_UI_HiDpi",                    # GetDpiForMonitor (future: scale-aware reporting)
 ]
 
 [features]
@@ -113,6 +130,14 @@ openh264-encoder = ["dep:openh264", "dep:openh264-sys2"]
 # If selected on other platforms, code remains dormant — open_default
 # cascade falls through to openh264.
 mf-encoder = ["dep:windows"]
+# Enables the Windows.Graphics.Capture (WGC) screen-capture backend.
+# Preferred on Windows 10 1803+ because it captures the HW mouse
+# cursor overlay (DXGI Desktop Duplication does not), emits a
+# per-frame DirtyRegion on Win 11 22000+, and plays nicely with
+# multi-monitor + HDR. Falls back to scrap (DXGI) on enumeration or
+# runtime failure. Pulls in the same `windows` crate feature set as
+# `mf-encoder`.
+wgc-capture = ["dep:windows"]
 # Enables the enigo-based input injection backend.
 enigo-input = ["dep:enigo"]
 # Convenience: full media pipeline (capture + software encode).
@@ -125,7 +150,7 @@ media-hw = ["media", "mf-encoder"]
 full = ["media", "enigo-input"]
 # Everything needed including the MF hardware encoder. Production
 # Windows MSI builds with this.
-full-hw = ["full", "mf-encoder"]
+full-hw = ["full", "mf-encoder", "wgc-capture"]
 
 [dev-dependencies]
 tokio-test = { workspace = true }
