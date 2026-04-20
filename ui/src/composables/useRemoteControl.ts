@@ -649,32 +649,24 @@ export function useRemoteControl() {
       })
     }
 
+    // Track whether the pointer is currently over the remote-viewer
+    // surface. When true, browser-eaten shortcuts like Ctrl+A / Ctrl+C
+    // are intercepted locally (preventDefault) and forwarded to the
+    // remote only. When false, the controller keeps normal browser UX
+    // (Ctrl+T opens a new tab, Ctrl+F triggers find, etc.).
+    let pointerInside = false
+    function onPointerEnter() { pointerInside = true }
+    function onPointerLeave() { pointerInside = false }
+
     function onKey(ev: KeyboardEvent, down: boolean) {
       const code = kbdCodeToHid(ev.code)
       if (code === null) return
       const mods =
         (ev.ctrlKey ? 1 : 0) | (ev.shiftKey ? 2 : 0) | (ev.altKey ? 4 : 0) | (ev.metaKey ? 8 : 0)
-      // Whitelist-only preventDefault. The previous blanket
-      // ev.preventDefault() here swallowed Cmd+Q, Ctrl+T, Ctrl+W, F5,
-      // etc. — a real annoyance for controllers who want to e.g. quit
-      // their own browser. We only suppress defaults for keys that
-      // would otherwise navigate away from the viewer page.
-      if (shouldPreventDefault(ev)) ev.preventDefault()
+      if (shouldPreventDefault(ev, pointerInside)) ev.preventDefault()
       sendInput({ t: 'key', code, down, mods })
     }
 
-    function shouldPreventDefault(ev: KeyboardEvent): boolean {
-      // Browser back/forward by default on Backspace (some browsers);
-      // Ctrl+F triggers browser find; Tab would move focus out of the
-      // viewer. These must be forwarded rather than consumed by Chrome.
-      if (ev.code === 'Tab') return true
-      if (ev.code === 'Backspace' && !ev.ctrlKey && !ev.altKey && !ev.metaKey) return true
-      // Ctrl+F (find), Ctrl+R (reload), Ctrl+W (close tab) — swallow
-      // only if the controller intends that keystroke to reach the
-      // remote; for now we don't forward them at all so leave defaults
-      // alone (user gets the browser behaviour).
-      return false
-    }
     const onKeyDown = (e: KeyboardEvent) => onKey(e, true)
     const onKeyUp = (e: KeyboardEvent) => onKey(e, false)
 
@@ -684,6 +676,8 @@ export function useRemoteControl() {
     surface.addEventListener('pointermove', onPointerMove)
     surface.addEventListener('pointerdown', onPointerDown)
     surface.addEventListener('pointerup', onPointerUp)
+    surface.addEventListener('pointerenter', onPointerEnter)
+    surface.addEventListener('pointerleave', onPointerLeave)
     surface.addEventListener('wheel', onWheel, { passive: false })
     surface.addEventListener('contextmenu', onContextMenu)
     // Keys are captured on window so they fire even if the video loses focus.
@@ -694,6 +688,8 @@ export function useRemoteControl() {
       surface.removeEventListener('pointermove', onPointerMove)
       surface.removeEventListener('pointerdown', onPointerDown)
       surface.removeEventListener('pointerup', onPointerUp)
+      surface.removeEventListener('pointerenter', onPointerEnter)
+      surface.removeEventListener('pointerleave', onPointerLeave)
       surface.removeEventListener('wheel', onWheel)
       surface.removeEventListener('contextmenu', onContextMenu)
       window.removeEventListener('keydown', onKeyDown)
@@ -755,6 +751,27 @@ export function useRemoteControl() {
     })
   }
 
+  /** Send Ctrl+Alt+Del to the remote. The browser can't capture this
+   *  key combo (the OS intercepts first), so callers typically wire
+   *  this to a dedicated toolbar button. Emits the three down events
+   *  in the canonical order (Ctrl→Alt→Del) followed by releases in
+   *  reverse, matching the native SAS ordering. */
+  function sendCtrlAltDel() {
+    const ch = channels.input
+    if (!ch || ch.readyState !== 'open') return
+    // HID usage codes: LeftCtrl=0xe0, LeftAlt=0xe2, Delete=0x4c
+    // mods bitfield: ctrl=1, shift=2, alt=4, meta=8
+    const send = (msg: Record<string, unknown>) => {
+      try { ch.send(JSON.stringify(msg)) } catch { /* dropped */ }
+    }
+    send({ t: 'key', code: 0xe0, down: true, mods: 1 })
+    send({ t: 'key', code: 0xe2, down: true, mods: 1 | 4 })
+    send({ t: 'key', code: 0x4c, down: true, mods: 1 | 4 })
+    send({ t: 'key', code: 0x4c, down: false, mods: 1 | 4 })
+    send({ t: 'key', code: 0xe2, down: false, mods: 1 })
+    send({ t: 'key', code: 0xe0, down: false, mods: 0 })
+  }
+
   return {
     phase,
     error,
@@ -771,6 +788,7 @@ export function useRemoteControl() {
     attachInput,
     sendClipboardToAgent,
     getAgentClipboard,
+    sendCtrlAltDel,
   }
 }
 
@@ -889,6 +907,41 @@ function browserButton(n: number): 'left' | 'right' | 'middle' | 'back' | 'forwa
     case 3: return 'back'
     case 4: return 'forward'
     default: return 'left'
+  }
+}
+
+/** Decide whether to `preventDefault` on a keyboard event in the remote
+ *  viewer. Two categories:
+ *
+ *  1. Unconditionally: `Tab` (would otherwise move focus out of the
+ *     video and away from our key listeners) and plain `Backspace`
+ *     (some browsers map to back-navigation on pages without a form).
+ *
+ *  2. Only when the pointer is over the video: common Ctrl/Cmd-shortcuts
+ *     that the local browser would otherwise intercept (Ctrl+A select
+ *     all, Ctrl+C/V/X clipboard, Ctrl+Z/Y undo/redo, Ctrl+F find,
+ *     Ctrl+S save, Ctrl+P print, Ctrl+R reload). Outside the video
+ *     the controller keeps normal browser UX — Ctrl+T to open a tab,
+ *     Ctrl+W to close it, etc.
+ *
+ *  Ctrl+Alt+Del is reserved by the OS and cannot be intercepted by the
+ *  browser — it's exposed via the dedicated toolbar button instead.
+ *  Exported so unit tests can lock the policy. */
+export function shouldPreventDefault(ev: KeyboardEvent, pointerInside: boolean): boolean {
+  if (ev.code === 'Tab') return true
+  if (ev.code === 'Backspace' && !ev.ctrlKey && !ev.altKey && !ev.metaKey) return true
+  if (!pointerInside) return false
+  const cmd = ev.ctrlKey || ev.metaKey
+  if (!cmd) return false
+  // Keys the local browser would intercept; prevent so they only
+  // forward to the remote.
+  switch (ev.code) {
+    case 'KeyA': case 'KeyC': case 'KeyV': case 'KeyX':
+    case 'KeyZ': case 'KeyY':
+    case 'KeyF': case 'KeyS': case 'KeyP': case 'KeyR':
+      return true
+    default:
+      return false
   }
 }
 
