@@ -35,8 +35,12 @@ pub mod mf;
 /// either overkill or underkill at any resolution other than the one it
 /// was tuned for; we derive from dims. Adaptive bitrate based on
 /// TWCC/REMB remains future work — this just picks a better *starting
-/// point*. Desktop-content target = 0.07 bpp/s gives ≈6 Mbps at 1080p
-/// and ≈10 Mbps at 1440p; 4K clamps to MAX.
+/// point*. Desktop-content target = 0.10 bpp/s gives ≈6 Mbps at 720p,
+/// ≈9 Mbps at 1080p, ≈13 Mbps at 1440p; 4K clamps to MAX. Bumped from
+/// 0.07 in 0.1.32 — in-field HEVC streams at 1.8 Mbps (1920×1200 @ 18
+/// fps due to DXGI's change-driven capture) looked visibly pixelated.
+/// Higher bpp target raises the ceiling even when the VFR pacer
+/// undershoots target fps.
 #[cfg_attr(
     not(any(
         feature = "openh264-encoder",
@@ -45,9 +49,9 @@ pub mod mf;
     allow(dead_code)
 )]
 pub(crate) fn initial_bitrate_for(width: u32, height: u32) -> u32 {
-    const MIN_BITRATE_BPS: u32 = 1_000_000;
-    const MAX_BITRATE_BPS: u32 = 12_000_000;
-    const DESKTOP_BPP_PER_SECOND: f64 = 0.07;
+    const MIN_BITRATE_BPS: u32 = 1_500_000;
+    const MAX_BITRATE_BPS: u32 = 15_000_000;
+    const DESKTOP_BPP_PER_SECOND: f64 = 0.10;
     const FPS: f64 = 30.0;
     let pixels = width as f64 * height as f64;
     let raw = (pixels * FPS * DESKTOP_BPP_PER_SECOND) as u32;
