@@ -439,7 +439,24 @@ impl AgentPeer {
     }
 
     pub async fn handle_offer(&self, offer_sdp: String) -> Result<String> {
-        let offer = RTCSessionDescription::offer(offer_sdp).context("parse offer")?;
+        // SDP codec-name normalisation for H.265:
+        // RFC 7798 specifies the SDP rtpmap subtype as `H265` ("H265/90000"),
+        // and every browser (Chrome, Edge, Safari) emits exactly that in its
+        // offer. But webrtc-rs 0.12's `register_default_codecs` keys its
+        // internal HEVC entry on the mime string "video/HEVC" — and its
+        // fuzzy-search is a naive string compare, not alias-aware
+        // (video/H265 vs video/HEVC don't match case-insensitively). So a
+        // raw Chrome H265 offer gets dropped during codec matching and
+        // `create_answer` then fails because no video codec survived.
+        //
+        // Workaround: swap `H265` → `HEVC` in the incoming offer so the
+        // webrtc-rs internal view uses the "video/HEVC" mime consistently,
+        // and reverse the swap on the outgoing answer so the browser sees
+        // spec-compliant rtpmap names. This is lossy only for the `name`
+        // field of the rtpmap line; everything else (PT, clock rate, fmtp)
+        // is untouched.
+        let munged_offer = offer_sdp.replace("H265/90000", "HEVC/90000");
+        let offer = RTCSessionDescription::offer(munged_offer).context("parse offer")?;
         self.pc
             .set_remote_description(offer)
             .await
@@ -455,7 +472,10 @@ impl AgentPeer {
             .await
             .context("set_local_description")?;
 
-        Ok(answer.sdp)
+        // Reverse the HEVC → H265 munge on the outgoing answer so the
+        // browser's SDP parser recognises the rtpmap subtype.
+        let munged_answer = answer.sdp.replace("HEVC/90000", "H265/90000");
+        Ok(munged_answer)
     }
 
     pub async fn add_remote_candidate(&self, candidate: serde_json::Value) -> Result<()> {
@@ -1014,7 +1034,7 @@ fn map_ice_servers(servers: &[IceServer]) -> Vec<RTCIceServer> {
 /// Default MediaEngine registrations (webrtc-rs 0.12):
 ///   video/H264 Constrained Baseline, packetization-mode=1,
 ///       profile-level-id=42e01f → PT 125
-///   video/H265 empty fmtp              → PT 126
+///   video/HEVC empty fmtp              → PT 126
 ///   video/AV1  profile-id=0            → PT 41
 ///
 /// Unknown codec → H.264 default (paranoia: should never hit because
@@ -1036,7 +1056,13 @@ fn build_video_codec_cap(codec: &str) -> RTCRtpCodecCapability {
             rtcp_feedback: feedback,
         },
         "h265" | "hevc" => RTCRtpCodecCapability {
-            mime_type: "video/H265".to_string(),
+            // MIME is "video/HEVC" to match webrtc-rs 0.12's
+            // `MIME_TYPE_HEVC` constant (what `register_default_codecs`
+            // registers and what `payloader_for_codec` looks up).
+            // Using "video/H265" here fails the transceiver's codec
+            // match with "unsupported codec type by this transceiver"
+            // even though HEVC is identical to H.265 in the spec.
+            mime_type: "video/HEVC".to_string(),
             clock_rate: 90000,
             channels: 0,
             sdp_fmtp_line: String::new(),
@@ -1088,10 +1114,10 @@ mod codec_cap_tests {
     #[test]
     fn hevc_cap_has_no_fmtp_line() {
         let cap = build_video_codec_cap("h265");
-        assert_eq!(cap.mime_type, "video/H265");
+        assert_eq!(cap.mime_type, "video/HEVC");
         assert!(cap.sdp_fmtp_line.is_empty());
         let alias = build_video_codec_cap("hevc");
-        assert_eq!(alias.mime_type, "video/H265");
+        assert_eq!(alias.mime_type, "video/HEVC");
     }
 
     #[test]
@@ -1105,7 +1131,7 @@ mod codec_cap_tests {
     fn case_insensitive_selection() {
         assert_eq!(build_video_codec_cap("H264").mime_type, "video/H264");
         assert_eq!(build_video_codec_cap("AV1").mime_type, "video/AV1");
-        assert_eq!(build_video_codec_cap("HEVC").mime_type, "video/H265");
+        assert_eq!(build_video_codec_cap("HEVC").mime_type, "video/HEVC");
     }
 
     #[test]

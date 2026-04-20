@@ -260,7 +260,7 @@ async fn handle_server_msg(
             let answer_sdp = match peer.handle_offer(sdp).await {
                 Ok(s) => s,
                 Err(e) => {
-                    warn!(%session_id, %e, "handle_offer failed; terminating");
+                    warn!(%session_id, chain = ?e, "handle_offer failed; terminating");
                     peer.close().await;
                     let _ = send_msg(
                         ws,

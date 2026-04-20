@@ -178,6 +178,18 @@ const authStore = useAuthStore()
 const agent = ref<Agent | null>(null)
 const rc = useRemoteControl()
 
+// Template refs. Declared before the computeds / watches below that
+// reference them — Vue 3 <script setup> executes top-to-bottom, and
+// `watch` evaluates its source getter eagerly during setup to wire
+// reactivity. Reading `cursorCanvas.value` in a watch source while
+// `cursorCanvas` is still in the temporal dead zone manifests as the
+// minified TDZ crash "Cannot access 'Z' before initialization" at
+// setup time, which kills the whole RemoteControl page before it
+// can paint. Keep template refs at the top of setup to avoid this.
+const videoEl = ref<HTMLVideoElement | null>(null)
+const stageEl = ref<HTMLElement | null>(null)
+const cursorCanvas = ref<HTMLCanvasElement | null>(null)
+
 // Quality preference: v-select emits immediately on change. We proxy
 // through a computed so the composable stays the source of truth
 // (persists + pushes to agent). The v-select's inner value is
@@ -321,9 +333,6 @@ watch(
   { immediate: false },
 )
 
-const videoEl = ref<HTMLVideoElement | null>(null)
-const stageEl = ref<HTMLElement | null>(null)
-const cursorCanvas = ref<HTMLCanvasElement | null>(null)
 let detachInput: (() => void) | null = null
 
 // Synthetic cursor overlay. The native pointer is hidden over the video
