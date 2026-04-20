@@ -36,11 +36,11 @@ use windows::Win32::Foundation::E_NOTIMPL;
 use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 use windows::Win32::Media::MediaFoundation::{
     CLSID_MSH264EncoderMFT, IMFActivate, IMFDXGIDeviceManager, IMFTransform, MFMediaType_Video,
-    MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG, MFT_ENUM_FLAG_ASYNCMFT, MFT_ENUM_FLAG_HARDWARE,
-    MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT, MFT_FRIENDLY_NAME_Attribute,
-    MFT_MESSAGE_SET_D3D_MANAGER, MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoFormat_AV1,
-    MFVideoFormat_H264, MFVideoFormat_HEVC, MFVideoFormat_NV12, MF_TRANSFORM_ASYNC,
-    MF_TRANSFORM_ASYNC_UNLOCK,
+    MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_ADAPTER_LUID, MFT_ENUM_FLAG, MFT_ENUM_FLAG_ASYNCMFT,
+    MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT,
+    MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_SET_D3D_MANAGER, MFT_REGISTER_TYPE_INFO, MFTEnumEx,
+    MFVideoFormat_AV1, MFVideoFormat_H264, MFVideoFormat_HEVC, MFVideoFormat_NV12,
+    MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK,
 };
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
 use windows::core::Interface;
@@ -234,7 +234,15 @@ pub(super) fn activate_and_probe_pipeline_for_codec(
             }
         };
         for candidate in &candidates {
-            match try_activate_and_probe(candidate, &device, &manager, width, height, codec) {
+            match try_activate_and_probe(
+                candidate,
+                &device,
+                &manager,
+                width,
+                height,
+                codec,
+                adapter_info.luid,
+            ) {
                 Ok(pipeline) => {
                     tracing::info!(
                         codec = codec.backend_name(),
@@ -300,8 +308,24 @@ fn try_activate_and_probe(
     width: u32,
     height: u32,
     codec: OutputCodec,
+    adapter_luid: u64,
 ) -> std::result::Result<MfPipeline, MfInitError> {
     unsafe {
+        // Hint the target DXGI adapter via MFT_ENUM_ADAPTER_LUID on the
+        // IMFActivate BEFORE ActivateObject. Some IHV MFTs (notably
+        // NVIDIA NVENC on Blackwell / RTX 5090 Laptop GPUs with current
+        // drivers) inspect this attribute during activation and fall
+        // back to "catastrophic failure" (E_UNEXPECTED / 0x8000FFFF)
+        // when it's absent, even with SET_D3D_MANAGER pointed at a D3D11
+        // device on the right adapter. Setting it is a best-effort hint
+        // — MFTs that don't care will ignore it (SetUINT64 returning
+        // E_FAIL / E_NOTIMPL is swallowed).
+        // IMFActivate derives from IMFAttributes (auto-deref in
+        // windows-rs 0.58), so SetUINT64 is a direct call.
+        let _ = candidate
+            .activate
+            .SetUINT64(&MFT_ENUM_ADAPTER_LUID, adapter_luid);
+
         let transform: IMFTransform = candidate
             .activate
             .ActivateObject()
