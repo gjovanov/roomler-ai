@@ -13,19 +13,19 @@ use anyhow::{Result, anyhow, bail};
 use windows::Win32::Foundation::{E_FAIL, E_INVALIDARG, E_NOTIMPL};
 use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 use windows::Win32::Media::MediaFoundation::{
-    CODECAPI_AVEncCommonBufferSize, CODECAPI_AVEncCommonMaxBitRate, CODECAPI_AVEncCommonMeanBitRate,
-    CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncH264CABACEnable, CODECAPI_AVEncMPVGOPSize,
-    CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVEncVideoGradualIntraRefresh,
-    CODECAPI_AVLowLatencyMode, ICodecAPI, IMFDXGIDeviceManager, IMFMediaBuffer, IMFMediaType,
-    IMFSample, IMFTransform, MF_E_NOTACCEPTING, MF_E_TRANSFORM_NEED_MORE_INPUT,
-    MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
-    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
-    MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video,
-    MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
-    MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_END_STREAMING,
-    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_INFO,
-    MFVideoFormat_AV1, MFVideoFormat_H264, MFVideoFormat_HEVC, MFVideoFormat_NV12,
-    MFVideoInterlace_Progressive, eAVEncCommonRateControlMode_CBR,
+    CODECAPI_AVEncCommonBufferSize, CODECAPI_AVEncCommonMaxBitRate,
+    CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonRateControlMode,
+    CODECAPI_AVEncH264CABACEnable, CODECAPI_AVEncMPVGOPSize, CODECAPI_AVEncVideoForceKeyFrame,
+    CODECAPI_AVEncVideoGradualIntraRefresh, CODECAPI_AVLowLatencyMode, ICodecAPI,
+    IMFDXGIDeviceManager, IMFMediaBuffer, IMFMediaType, IMFSample, IMFTransform, MF_E_NOTACCEPTING,
+    MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_AVG_BITRATE,
+    MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
+    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MFCreateMediaType, MFCreateMemoryBuffer,
+    MFCreateSample, MFMediaType_Video, MFT_MESSAGE_COMMAND_FLUSH,
+    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
+    MFT_MESSAGE_NOTIFY_END_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
+    MFT_OUTPUT_STREAM_INFO, MFVideoFormat_AV1, MFVideoFormat_H264, MFVideoFormat_HEVC,
+    MFVideoFormat_NV12, MFVideoInterlace_Progressive, eAVEncCommonRateControlMode_CBR,
     eAVEncCommonRateControlMode_LowDelayVBR,
 };
 use windows::core::{GUID, Interface};
@@ -315,8 +315,7 @@ impl MfPipeline {
             let needs_sample = (output_info.dwFlags & 0x100) == 0; // MFT_OUTPUT_STREAM_PROVIDES_SAMPLES
             let sample_slot = if needs_sample {
                 let sample = unsafe { MFCreateSample()? };
-                let buffer =
-                    unsafe { MFCreateMemoryBuffer(output_info.cbSize.max(1_048_576))? };
+                let buffer = unsafe { MFCreateMemoryBuffer(output_info.cbSize.max(1_048_576))? };
                 unsafe { sample.AddBuffer(&buffer)? };
                 Some(sample)
             } else {
@@ -332,8 +331,11 @@ impl MfPipeline {
             let mut status = 0u32;
 
             let rc = unsafe {
-                self.transform
-                    .ProcessOutput(0, std::slice::from_mut(&mut output_buffer), &mut status)
+                self.transform.ProcessOutput(
+                    0,
+                    std::slice::from_mut(&mut output_buffer),
+                    &mut status,
+                )
             };
             let produced: Option<IMFSample> =
                 unsafe { std::mem::ManuallyDrop::take(&mut output_buffer.pSample) };
@@ -382,7 +384,10 @@ impl MfPipeline {
                     // the drain loop. Without this, every subsequent
                     // ProcessOutput buffers input but produces zero
                     // output — the symptom observed in 0.1.15 smoke.
-                    tracing::info!(iter, "mf ProcessOutput: STREAM_CHANGE — renegotiating output type");
+                    tracing::info!(
+                        iter,
+                        "mf ProcessOutput: STREAM_CHANGE — renegotiating output type"
+                    );
                     unsafe {
                         let new_type = self.transform.GetOutputAvailableType(0, 0)?;
                         self.transform.SetOutputType(0, &new_type, 0)?;
@@ -429,7 +434,11 @@ impl MfPipeline {
 // Helpers (all unsafe-COM, kept in one place for easier auditing).
 // ---------------------------------------------------------------------
 
-unsafe fn build_output_media_type(width: u32, height: u32, codec: OutputCodec) -> Result<IMFMediaType> {
+unsafe fn build_output_media_type(
+    width: u32,
+    height: u32,
+    codec: OutputCodec,
+) -> Result<IMFMediaType> {
     unsafe {
         let t: IMFMediaType = MFCreateMediaType()?;
         t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
@@ -442,10 +451,7 @@ unsafe fn build_output_media_type(width: u32, height: u32, codec: OutputCodec) -
         set_ratio(&t, &MF_MT_FRAME_SIZE, width, height)?;
         set_ratio(&t, &MF_MT_FRAME_RATE, TARGET_FPS_NUM, TARGET_FPS_DEN)?;
         set_ratio(&t, &MF_MT_PIXEL_ASPECT_RATIO, 1, 1)?;
-        t.SetUINT32(
-            &MF_MT_INTERLACE_MODE,
-            MFVideoInterlace_Progressive.0 as u32,
-        )?;
+        t.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
         Ok(t)
     }
 }
@@ -458,10 +464,7 @@ unsafe fn build_input_media_type(width: u32, height: u32) -> Result<IMFMediaType
         set_ratio(&t, &MF_MT_FRAME_SIZE, width, height)?;
         set_ratio(&t, &MF_MT_FRAME_RATE, TARGET_FPS_NUM, TARGET_FPS_DEN)?;
         set_ratio(&t, &MF_MT_PIXEL_ASPECT_RATIO, 1, 1)?;
-        t.SetUINT32(
-            &MF_MT_INTERLACE_MODE,
-            MFVideoInterlace_Progressive.0 as u32,
-        )?;
+        t.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
         Ok(t)
     }
 }
@@ -508,7 +511,10 @@ unsafe fn build_input_sample(nv12: &[u8], frame_index: u64) -> Result<IMFSample>
 /// Read the NALU run out of an output IMFSample and wrap it in an
 /// `EncodedPacket`. Returns `None` if the sample is empty (e.g. the
 /// MFT handed us a format-change notification).
-fn read_packet_from_sample(sample: &IMFSample, codec: OutputCodec) -> Result<Option<EncodedPacket>> {
+fn read_packet_from_sample(
+    sample: &IMFSample,
+    codec: OutputCodec,
+) -> Result<Option<EncodedPacket>> {
     unsafe {
         let total_len: u32 = sample.GetTotalLength()?;
         if total_len == 0 {
@@ -563,15 +569,15 @@ fn annex_b_contains_idr(buf: &[u8], codec: OutputCodec) -> bool {
     let mut i = 0;
     while i + 4 < buf.len() {
         // Annex-B start code: 00 00 00 01 or 00 00 01.
-        let (nal_off, next) = if buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 0 && buf[i + 3] == 1
-        {
-            (i + 4, i + 4)
-        } else if buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1 {
-            (i + 3, i + 3)
-        } else {
-            i += 1;
-            continue;
-        };
+        let (nal_off, next) =
+            if buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 0 && buf[i + 3] == 1 {
+                (i + 4, i + 4)
+            } else if buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1 {
+                (i + 3, i + 3)
+            } else {
+                i += 1;
+                continue;
+            };
         if nal_off < buf.len() {
             let head = buf[nal_off];
             let is_idr = match codec {
@@ -719,7 +725,7 @@ mod tests {
         // Realistic: OBU_TEMPORAL_DELIMITER (type=2, size=0), then
         // OBU_SEQUENCE_HEADER (type=1, size=3). Both have size bits set.
         let buf = [
-            0x12, 0x00,             // TD, size=0
+            0x12, 0x00, // TD, size=0
             0x0A, 0x03, 0xAA, 0xBB, 0xCC, // SEQ_HEADER, size=3
         ];
         assert!(is_keyframe_bitstream(&buf, OutputCodec::Av1));

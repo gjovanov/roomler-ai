@@ -1,4 +1,4 @@
-use bson::{doc, oid::ObjectId, DateTime};
+use bson::{DateTime, doc, oid::ObjectId};
 use mongodb::Database;
 use roomler_ai_db::models::{NotificationPrefs, OAuthProvider, Presence, User, UserStatusInfo};
 
@@ -63,11 +63,7 @@ impl UserDao {
             .ok_or(DaoError::NotFound)
     }
 
-    pub async fn update_presence(
-        &self,
-        user_id: ObjectId,
-        presence: Presence,
-    ) -> DaoResult<bool> {
+    pub async fn update_presence(&self, user_id: ObjectId, presence: Presence) -> DaoResult<bool> {
         self.base
             .update_by_id(
                 user_id,
@@ -115,8 +111,7 @@ impl UserDao {
                     access_token: None,
                     refresh_token: None,
                 };
-                let oauth_bson =
-                    bson::to_bson(&oauth)?;
+                let oauth_bson = bson::to_bson(&oauth)?;
                 self.base
                     .update_by_id(
                         user.id.unwrap(),
@@ -192,7 +187,10 @@ impl UserDao {
             return Ok(result);
         }
 
-        let ids_bson: Vec<bson::Bson> = user_ids.iter().map(|id| bson::Bson::ObjectId(*id)).collect();
+        let ids_bson: Vec<bson::Bson> = user_ids
+            .iter()
+            .map(|id| bson::Bson::ObjectId(*id))
+            .collect();
         let filter = doc! {
             "_id": { "$in": ids_bson },
             "deleted_at": null,
@@ -201,16 +199,17 @@ impl UserDao {
         // Use raw Document to avoid deserialization issues with projection
         let projection = doc! { "_id": 1, "display_name": 1, "username": 1 };
         let coll = self.base.collection().clone_with_type::<bson::Document>();
-        let mut cursor = coll
-            .find(filter)
-            .projection(projection)
-            .await?;
+        let mut cursor = coll.find(filter).projection(projection).await?;
 
         while let Some(doc) = cursor.try_next().await? {
             if let Ok(id) = doc.get_object_id("_id") {
                 let display_name = doc.get_str("display_name").unwrap_or("").to_string();
                 let username = doc.get_str("username").unwrap_or("").to_string();
-                let name = if display_name.is_empty() { username } else { display_name };
+                let name = if display_name.is_empty() {
+                    username
+                } else {
+                    display_name
+                };
                 if !name.is_empty() {
                     result.insert(id, name);
                 }

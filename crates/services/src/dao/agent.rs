@@ -112,11 +112,7 @@ impl AgentDao {
             .await
     }
 
-    pub async fn mark_status(
-        &self,
-        agent_id: ObjectId,
-        status: AgentStatus,
-    ) -> DaoResult<bool> {
+    pub async fn mark_status(&self, agent_id: ObjectId, status: AgentStatus) -> DaoResult<bool> {
         self.base
             .update_by_id(
                 agent_id,
@@ -159,11 +155,7 @@ impl AgentDao {
             .await
     }
 
-    pub async fn soft_delete(
-        &self,
-        tenant_id: ObjectId,
-        agent_id: ObjectId,
-    ) -> DaoResult<bool> {
+    pub async fn soft_delete(&self, tenant_id: ObjectId, agent_id: ObjectId) -> DaoResult<bool> {
         self.base.soft_delete_in_tenant(tenant_id, agent_id).await
     }
 }

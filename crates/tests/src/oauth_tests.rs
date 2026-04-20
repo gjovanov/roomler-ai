@@ -142,7 +142,10 @@ async fn oauth_user_dao_find_or_create_new_user() {
 
     assert_eq!(user.email, "oauth@test.com");
     assert_eq!(user.display_name, "OAuth User");
-    assert_eq!(user.avatar, Some("https://example.com/avatar.jpg".to_string()));
+    assert_eq!(
+        user.avatar,
+        Some("https://example.com/avatar.jpg".to_string())
+    );
     assert!(user.is_verified);
     assert!(user.password_hash.is_none());
     assert_eq!(user.oauth_providers.len(), 1);
@@ -172,13 +175,7 @@ async fn oauth_user_dao_links_existing_user() {
     // Now use OAuth with the same email
     let dao = roomler_ai_services::dao::user::UserDao::new(&app.db);
     let user = dao
-        .find_or_create_by_oauth(
-            "github",
-            "gh-456",
-            "existing@test.com",
-            "GitHub User",
-            None,
-        )
+        .find_or_create_by_oauth("github", "gh-456", "existing@test.com", "GitHub User", None)
         .await
         .unwrap();
 

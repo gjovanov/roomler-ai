@@ -209,12 +209,22 @@ async fn handle_server_msg(
                 "incoming session request — auto-granting (see docs §11.2)"
             );
             // TODO: real consent UI. Self-host default is "no prompt".
-            send_msg(ws, &ClientMsg::Consent { session_id, granted: true })
-                .await
-                .map_err(|e| ConnectError::Transient(e.context("sending consent")))?;
+            send_msg(
+                ws,
+                &ClientMsg::Consent {
+                    session_id,
+                    granted: true,
+                },
+            )
+            .await
+            .map_err(|e| ConnectError::Transient(e.context("sending consent")))?;
         }
 
-        ServerMsg::SdpOffer { session_id, sdp, ice_servers } => {
+        ServerMsg::SdpOffer {
+            session_id,
+            sdp,
+            ice_servers,
+        } => {
             info!(%session_id, sdp_len = sdp.len(), "rc:sdp.offer — creating peer");
 
             // Build a fresh peer for this session. If an old one somehow
@@ -287,7 +297,10 @@ async fn handle_server_msg(
             info!(%session_id, "rc:sdp.answer sent; peer is live");
         }
 
-        ServerMsg::Ice { session_id, candidate } => {
+        ServerMsg::Ice {
+            session_id,
+            candidate,
+        } => {
             if let Some(peer) = peers.get(&session_id) {
                 if let Err(e) = peer.add_remote_candidate(candidate).await {
                     debug!(%session_id, %e, "add_remote_candidate failed");
@@ -308,7 +321,11 @@ async fn handle_server_msg(
             pending_codecs.remove(&session_id);
         }
 
-        ServerMsg::Error { session_id, code, message } => {
+        ServerMsg::Error {
+            session_id,
+            code,
+            message,
+        } => {
             warn!(?session_id, %code, %message, "server-side rc error");
         }
 
@@ -368,5 +385,7 @@ fn stub_caps() -> AgentCaps {
 }
 
 fn urlencode(s: &str) -> String {
-    s.replace('+', "%2B").replace('/', "%2F").replace('=', "%3D")
+    s.replace('+', "%2B")
+        .replace('/', "%2F")
+        .replace('=', "%3D")
 }

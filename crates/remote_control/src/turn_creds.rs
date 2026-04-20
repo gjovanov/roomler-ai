@@ -80,7 +80,10 @@ mod tests {
         let expiry: u64 = parts.next().unwrap().parse().unwrap();
         let uid = parts.next().unwrap();
         assert_eq!(uid, "user_42");
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         assert!(expiry > now && expiry <= now + 600);
         assert!(cred.credential.unwrap().len() >= 20);
     }

@@ -1,4 +1,7 @@
-use axum::{Json, extract::{Path, Query, State}};
+use axum::{
+    Json,
+    extract::{Path, Query, State},
+};
 use bson::oid::ObjectId;
 use serde::Serialize;
 
@@ -21,13 +24,12 @@ pub async fn list(
     auth: AuthUser,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let result = state.notifications.find_for_user(auth.user_id, &params).await?;
+    let result = state
+        .notifications
+        .find_for_user(auth.user_id, &params)
+        .await?;
 
-    let items: Vec<NotificationResponse> = result
-        .items
-        .into_iter()
-        .map(to_response)
-        .collect();
+    let items: Vec<NotificationResponse> = result.items.into_iter().map(to_response).collect();
 
     Ok(Json(serde_json::json!({
         "items": items,
@@ -43,13 +45,12 @@ pub async fn unread(
     auth: AuthUser,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let result = state.notifications.find_unread_for_user(auth.user_id, &params).await?;
+    let result = state
+        .notifications
+        .find_unread_for_user(auth.user_id, &params)
+        .await?;
 
-    let items: Vec<NotificationResponse> = result
-        .items
-        .into_iter()
-        .map(to_response)
-        .collect();
+    let items: Vec<NotificationResponse> = result.items.into_iter().map(to_response).collect();
 
     Ok(Json(serde_json::json!({
         "items": items,

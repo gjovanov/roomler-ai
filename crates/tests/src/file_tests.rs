@@ -10,10 +10,7 @@ async fn upload_file_to_room() {
 
     // Admin joins room
     app.auth_post(
-        &format!(
-            "/api/tenant/{}/room/{}/join",
-            tenant.tenant_id, room_id
-        ),
+        &format!("/api/tenant/{}/room/{}/join", tenant.tenant_id, room_id),
         &tenant.admin.access_token,
     )
     .send()
@@ -32,10 +29,7 @@ async fn upload_file_to_room() {
 
     let resp = app
         .client
-        .post(app.url(&format!(
-            "/api/tenant/{}/file/upload",
-            tenant.tenant_id
-        )))
+        .post(app.url(&format!("/api/tenant/{}/file/upload", tenant.tenant_id)))
         .header(
             "Authorization",
             format!("Bearer {}", tenant.admin.access_token),
@@ -62,10 +56,7 @@ async fn get_file_metadata() {
 
     // Admin joins room
     app.auth_post(
-        &format!(
-            "/api/tenant/{}/room/{}/join",
-            tenant.tenant_id, room_id
-        ),
+        &format!("/api/tenant/{}/room/{}/join", tenant.tenant_id, room_id),
         &tenant.admin.access_token,
     )
     .send()
@@ -84,10 +75,7 @@ async fn get_file_metadata() {
 
     let resp = app
         .client
-        .post(app.url(&format!(
-            "/api/tenant/{}/file/upload",
-            tenant.tenant_id
-        )))
+        .post(app.url(&format!("/api/tenant/{}/file/upload", tenant.tenant_id)))
         .header(
             "Authorization",
             format!("Bearer {}", tenant.admin.access_token),
@@ -103,10 +91,7 @@ async fn get_file_metadata() {
     // Get file metadata
     let resp = app
         .auth_get(
-            &format!(
-                "/api/tenant/{}/file/{}",
-                tenant.tenant_id, file_id
-            ),
+            &format!("/api/tenant/{}/file/{}", tenant.tenant_id, file_id),
             &tenant.admin.access_token,
         )
         .send()
@@ -128,10 +113,7 @@ async fn download_uploaded_file() {
 
     // Admin joins room
     app.auth_post(
-        &format!(
-            "/api/tenant/{}/room/{}/join",
-            tenant.tenant_id, room_id
-        ),
+        &format!("/api/tenant/{}/room/{}/join", tenant.tenant_id, room_id),
         &tenant.admin.access_token,
     )
     .send()
@@ -152,10 +134,7 @@ async fn download_uploaded_file() {
 
     let resp = app
         .client
-        .post(app.url(&format!(
-            "/api/tenant/{}/file/upload",
-            tenant.tenant_id
-        )))
+        .post(app.url(&format!("/api/tenant/{}/file/upload", tenant.tenant_id)))
         .header(
             "Authorization",
             format!("Bearer {}", tenant.admin.access_token),
@@ -171,10 +150,7 @@ async fn download_uploaded_file() {
     // Download file
     let resp = app
         .auth_get(
-            &format!(
-                "/api/tenant/{}/file/{}/download",
-                tenant.tenant_id, file_id
-            ),
+            &format!("/api/tenant/{}/file/{}/download", tenant.tenant_id, file_id),
             &tenant.admin.access_token,
         )
         .send()
@@ -190,13 +166,14 @@ async fn download_uploaded_file() {
             .unwrap(),
         "text/plain"
     );
-    assert!(resp
-        .headers()
-        .get("content-disposition")
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .contains("download_me.txt"));
+    assert!(
+        resp.headers()
+            .get("content-disposition")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("download_me.txt")
+    );
 
     let body = resp.bytes().await.unwrap();
     assert_eq!(body.as_ref(), content);
@@ -210,10 +187,7 @@ async fn delete_file() {
 
     // Admin joins room
     app.auth_post(
-        &format!(
-            "/api/tenant/{}/room/{}/join",
-            tenant.tenant_id, room_id
-        ),
+        &format!("/api/tenant/{}/room/{}/join", tenant.tenant_id, room_id),
         &tenant.admin.access_token,
     )
     .send()
@@ -232,10 +206,7 @@ async fn delete_file() {
 
     let resp = app
         .client
-        .post(app.url(&format!(
-            "/api/tenant/{}/file/upload",
-            tenant.tenant_id
-        )))
+        .post(app.url(&format!("/api/tenant/{}/file/upload", tenant.tenant_id)))
         .header(
             "Authorization",
             format!("Bearer {}", tenant.admin.access_token),
@@ -251,10 +222,7 @@ async fn delete_file() {
     // Delete file
     let resp = app
         .auth_delete(
-            &format!(
-                "/api/tenant/{}/file/{}",
-                tenant.tenant_id, file_id
-            ),
+            &format!("/api/tenant/{}/file/{}", tenant.tenant_id, file_id),
             &tenant.admin.access_token,
         )
         .send()
@@ -274,10 +242,7 @@ async fn list_files_in_room() {
 
     // Admin joins room
     app.auth_post(
-        &format!(
-            "/api/tenant/{}/room/{}/join",
-            tenant.tenant_id, room_id
-        ),
+        &format!("/api/tenant/{}/room/{}/join", tenant.tenant_id, room_id),
         &tenant.admin.access_token,
     )
     .send()
@@ -296,10 +261,7 @@ async fn list_files_in_room() {
             .text("room_id", room_id.clone());
 
         app.client
-            .post(app.url(&format!(
-                "/api/tenant/{}/file/upload",
-                tenant.tenant_id
-            )))
+            .post(app.url(&format!("/api/tenant/{}/file/upload", tenant.tenant_id)))
             .header(
                 "Authorization",
                 format!("Bearer {}", tenant.admin.access_token),
@@ -313,10 +275,7 @@ async fn list_files_in_room() {
     // List files in room
     let resp = app
         .auth_get(
-            &format!(
-                "/api/tenant/{}/room/{}/file",
-                tenant.tenant_id, room_id
-            ),
+            &format!("/api/tenant/{}/room/{}/file", tenant.tenant_id, room_id),
             &tenant.admin.access_token,
         )
         .send()

@@ -1,4 +1,7 @@
-use axum::{Json, extract::{Path, State}};
+use axum::{
+    Json,
+    extract::{Path, State},
+};
 use bson::oid::ObjectId;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -49,7 +52,11 @@ pub async fn export_conversation(
 
     state.tasks.spawn_task(task_id, async move {
         // Fetch all messages in room (up to 10000)
-        let params = PaginationParams { page: 1, per_page: 10000, before: None };
+        let params = PaginationParams {
+            page: 1,
+            per_page: 10000,
+            before: None,
+        };
         let result = messages_dao
             .find_in_room(rid, &params)
             .await
@@ -82,11 +89,9 @@ pub async fn export_conversation(
             .map_err(|e| format!("Failed to update progress: {}", e))?;
 
         // Generate Excel
-        let bytes = roomler_ai_services::export::excel::export_conversation(
-            &result.items,
-            &user_map,
-        )
-        .map_err(|e| format!("Excel export failed: {}", e))?;
+        let bytes =
+            roomler_ai_services::export::excel::export_conversation(&result.items, &user_map)
+                .map_err(|e| format!("Excel export failed: {}", e))?;
 
         // Write to temp file
         let export_dir = std::env::var("ROOMLER_UPLOAD_DIR")

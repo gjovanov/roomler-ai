@@ -18,15 +18,30 @@ pub mod enigo_backend;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum Button { Left, Right, Middle, Back, Forward }
+pub enum Button {
+    Left,
+    Right,
+    Middle,
+    Back,
+    Forward,
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum WheelMode { Pixel, Line, Page }
+pub enum WheelMode {
+    Pixel,
+    Line,
+    Page,
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum TouchPhase { Start, Move, End, Cancel }
+pub enum TouchPhase {
+    Start,
+    Move,
+    End,
+    Cancel,
+}
 
 /// Input event from the controller. Coordinates are normalised 0..1 per
 /// monitor so the agent's resolution can change mid-session without
@@ -34,13 +49,42 @@ pub enum TouchPhase { Start, Move, End, Cancel }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum InputMsg {
-    MouseMove { x: f32, y: f32, mon: u8 },
-    MouseButton { btn: Button, down: bool, x: f32, y: f32, mon: u8 },
-    MouseWheel { dx: f32, dy: f32, mode: WheelMode },
-    Key { code: u32, down: bool, mods: u8 },
-    KeyText { text: String },
-    Touch { id: u32, phase: TouchPhase, x: f32, y: f32, mon: u8 },
-    Heartbeat { seq: u64, ts_ms: u64 },
+    MouseMove {
+        x: f32,
+        y: f32,
+        mon: u8,
+    },
+    MouseButton {
+        btn: Button,
+        down: bool,
+        x: f32,
+        y: f32,
+        mon: u8,
+    },
+    MouseWheel {
+        dx: f32,
+        dy: f32,
+        mode: WheelMode,
+    },
+    Key {
+        code: u32,
+        down: bool,
+        mods: u8,
+    },
+    KeyText {
+        text: String,
+    },
+    Touch {
+        id: u32,
+        phase: TouchPhase,
+        x: f32,
+        y: f32,
+        mon: u8,
+    },
+    Heartbeat {
+        seq: u64,
+        ts_ms: u64,
+    },
 }
 
 pub trait InputInjector: Send {
@@ -57,7 +101,9 @@ impl InputInjector for NoopInjector {
     fn inject(&mut self, _event: InputMsg) -> Result<()> {
         Ok(())
     }
-    fn has_permission(&self) -> bool { false }
+    fn has_permission(&self) -> bool {
+        false
+    }
 }
 
 /// Open the best-available input backend for the current host. Falls

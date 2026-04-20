@@ -1,4 +1,4 @@
-use bson::{oid::ObjectId, DateTime};
+use bson::{DateTime, oid::ObjectId};
 use serde::{Deserialize, Serialize};
 
 use super::recording::{StorageProvider, Visibility};

@@ -35,7 +35,10 @@ pub struct EnrollInputs<'a> {
 }
 
 pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
-    let url = format!("{}/api/agent/enroll", inputs.server_url.trim_end_matches('/'));
+    let url = format!(
+        "{}/api/agent/enroll",
+        inputs.server_url.trim_end_matches('/')
+    );
     let os = detect_os();
     let agent_version = env!("CARGO_PKG_VERSION");
 

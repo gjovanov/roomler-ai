@@ -1,9 +1,6 @@
-use bson::{doc, oid::ObjectId, DateTime};
+use bson::{DateTime, doc, oid::ObjectId};
 use mongodb::Database;
-use roomler_ai_db::models::{
-    Plan, Role, Tenant, TenantMember, TenantSettings,
-    role::permissions,
-};
+use roomler_ai_db::models::{Plan, Role, Tenant, TenantMember, TenantSettings, role::permissions};
 
 use super::base::{BaseDao, DaoError, DaoResult};
 
@@ -149,11 +146,7 @@ impl TenantDao {
         Ok(())
     }
 
-    pub async fn get_role_by_name(
-        &self,
-        tenant_id: ObjectId,
-        name: &str,
-    ) -> DaoResult<Role> {
+    pub async fn get_role_by_name(&self, tenant_id: ObjectId, name: &str) -> DaoResult<Role> {
         self.roles
             .find_one(doc! { "tenant_id": tenant_id, "name": name })
             .await?
@@ -215,11 +208,7 @@ impl TenantDao {
             .await
     }
 
-    pub async fn is_member(
-        &self,
-        tenant_id: ObjectId,
-        user_id: ObjectId,
-    ) -> DaoResult<bool> {
+    pub async fn is_member(&self, tenant_id: ObjectId, user_id: ObjectId) -> DaoResult<bool> {
         let count = self
             .members
             .count(doc! { "tenant_id": tenant_id, "user_id": user_id })
@@ -268,10 +257,7 @@ impl TenantDao {
 
         let roles = self
             .roles
-            .find_many(
-                doc! { "_id": { "$in": &member.role_ids } },
-                None,
-            )
+            .find_many(doc! { "_id": { "$in": &member.role_ids } }, None)
             .await?;
 
         let combined = roles.iter().fold(0u64, |acc, r| acc | r.permissions);

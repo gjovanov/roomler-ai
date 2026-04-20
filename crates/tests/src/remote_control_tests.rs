@@ -280,8 +280,7 @@ async fn agent_hello_marks_status_online() {
     let app = TestApp::spawn().await;
     let seeded = app.seed_tenant("rcws").await;
 
-    let (agent_id, agent_token) =
-        enroll_helper(&app, &seeded, "mach-rcws-A", "WS laptop").await;
+    let (agent_id, agent_token) = enroll_helper(&app, &seeded, "mach-rcws-A", "WS laptop").await;
 
     // Connect WS as agent.
     let ws_url = format!(
@@ -409,5 +408,7 @@ async fn enroll_helper(
 
 fn urlencode(s: &str) -> String {
     // Minimal URL-encoding for the JWT (only `+`, `/`, `=` need escaping).
-    s.replace('+', "%2B").replace('/', "%2F").replace('=', "%3D")
+    s.replace('+', "%2B")
+        .replace('/', "%2F")
+        .replace('=', "%3D")
 }

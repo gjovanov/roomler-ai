@@ -14,8 +14,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use enigo::{
-    Axis, Button as EnigoButton, Coordinate, Direction, Enigo, Key, Keyboard, Mouse,
-    Settings,
+    Axis, Button as EnigoButton, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings,
 };
 use std::sync::mpsc as std_mpsc;
 use std::thread;
@@ -73,14 +72,24 @@ fn dispatch(enigo: &mut Enigo, msg: InputMsg) -> Result<()> {
                 .move_mouse(px, py, Coordinate::Abs)
                 .map_err(|e| anyhow!("move_mouse: {e}"))?;
         }
-        InputMsg::MouseButton { btn, down, x, y, mon } => {
+        InputMsg::MouseButton {
+            btn,
+            down,
+            x,
+            y,
+            mon,
+        } => {
             // Move first so the click hits the intended target even if
             // earlier MouseMove events were coalesced away.
             let (px, py) = to_pixels(enigo, x, y, mon);
             enigo
                 .move_mouse(px, py, Coordinate::Abs)
                 .map_err(|e| anyhow!("move_mouse: {e}"))?;
-            let direction = if down { Direction::Press } else { Direction::Release };
+            let direction = if down {
+                Direction::Press
+            } else {
+                Direction::Release
+            };
             enigo
                 .button(map_button(btn), direction)
                 .map_err(|e| anyhow!("button: {e}"))?;
@@ -98,8 +107,16 @@ fn dispatch(enigo: &mut Enigo, msg: InputMsg) -> Result<()> {
                     .map_err(|e| anyhow!("scroll x: {e}"))?;
             }
         }
-        InputMsg::Key { code, down, mods: _ } => {
-            let direction = if down { Direction::Press } else { Direction::Release };
+        InputMsg::Key {
+            code,
+            down,
+            mods: _,
+        } => {
+            let direction = if down {
+                Direction::Press
+            } else {
+                Direction::Release
+            };
             if let Some(k) = hid_to_key(code) {
                 enigo.key(k, direction).map_err(|e| anyhow!("key: {e}"))?;
             } else {
@@ -140,7 +157,10 @@ fn to_pixels(enigo: &Enigo, x: f32, y: f32, _mon: u8) -> (i32, i32) {
     let (w, h) = enigo.main_display().unwrap_or((1920, 1080));
     let x = x.clamp(0.0, 1.0);
     let y = y.clamp(0.0, 1.0);
-    ((x * (w - 1) as f32).round() as i32, (y * (h - 1) as f32).round() as i32)
+    (
+        (x * (w - 1) as f32).round() as i32,
+        (y * (h - 1) as f32).round() as i32,
+    )
 }
 
 /// Convert a browser `WheelEvent` delta into enigo scroll "notches".

@@ -61,9 +61,7 @@ pub enum ClientSignal {
 pub enum ServerSignal {
     /// Router RTP capabilities for Device loading
     #[serde(rename = "media:router_capabilities")]
-    RouterCapabilities {
-        rtp_capabilities: serde_json::Value,
-    },
+    RouterCapabilities { rtp_capabilities: serde_json::Value },
 
     /// Send + recv transport pair created
     #[serde(rename = "media:transport_created")]

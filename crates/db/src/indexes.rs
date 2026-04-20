@@ -280,15 +280,15 @@ async fn create_indexes(
             if let mongodb::error::ErrorKind::Command(ref cmd_err) = *e.kind
                 && (cmd_err.code == 85 || cmd_err.code == 86)
             {
-                    tracing::warn!(
-                        collection,
-                        "Index conflict detected, dropping conflicting indexes and retrying"
-                    );
-                    // Drop all non-_id indexes and recreate
-                    coll.drop_indexes().await?;
-                    coll.create_indexes(indexes).await?;
-                    info!(collection, "Indexes recreated after conflict resolution");
-                    return Ok(());
+                tracing::warn!(
+                    collection,
+                    "Index conflict detected, dropping conflicting indexes and retrying"
+                );
+                // Drop all non-_id indexes and recreate
+                coll.drop_indexes().await?;
+                coll.create_indexes(indexes).await?;
+                info!(collection, "Indexes recreated after conflict resolution");
+                return Ok(());
             }
             Err(e)
         }

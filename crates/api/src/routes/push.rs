@@ -40,7 +40,12 @@ pub async fn subscribe(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     state
         .push_subscriptions
-        .subscribe(auth.user_id, body.endpoint, body.keys.auth, body.keys.p256dh)
+        .subscribe(
+            auth.user_id,
+            body.endpoint,
+            body.keys.auth,
+            body.keys.p256dh,
+        )
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 

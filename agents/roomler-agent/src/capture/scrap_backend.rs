@@ -90,8 +90,12 @@ impl ScrapCapture {
         })
     }
 
-    pub fn width(&self) -> u32 { self.width }
-    pub fn height(&self) -> u32 { self.height }
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+    pub fn height(&self) -> u32 {
+        self.height
+    }
 }
 
 /// Downsample 2× when the source has more pixels than this threshold.
@@ -205,7 +209,9 @@ impl ScreenCapture for ScrapCapture {
         self.cmd_tx
             .send(res_tx)
             .map_err(|_| anyhow!("capture worker exited"))?;
-        let reply = res_rx.await.map_err(|_| anyhow!("capture worker dropped reply"))?;
+        let reply = res_rx
+            .await
+            .map_err(|_| anyhow!("capture worker dropped reply"))?;
         self.last_frame_at = Some(Instant::now());
         let _ = self.monitor; // (exercised below by `monitor_count`)
         reply

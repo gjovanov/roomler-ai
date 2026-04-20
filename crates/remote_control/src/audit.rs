@@ -61,7 +61,13 @@ impl AuditSink {
         (Self { tx }, handle)
     }
 
-    pub fn record(&self, session_id: ObjectId, agent_id: ObjectId, tenant_id: ObjectId, event: AuditKind) {
+    pub fn record(
+        &self,
+        session_id: ObjectId,
+        agent_id: ObjectId,
+        tenant_id: ObjectId,
+        event: AuditKind,
+    ) {
         let ev = RemoteAuditEvent {
             id: None,
             session_id,

@@ -22,7 +22,10 @@ async fn register_creates_user_and_returns_activation_message() {
     assert_eq!(resp.status().as_u16(), 201);
 
     let json: Value = resp.json().await.unwrap();
-    assert!(json["message"].is_string(), "Register should return activation message");
+    assert!(
+        json["message"].is_string(),
+        "Register should return activation message"
+    );
 }
 
 #[tokio::test]
@@ -235,7 +238,14 @@ async fn me_endpoint_returns_current_user() {
     let app = TestApp::spawn().await;
 
     let user = app
-        .register_user("me@test.com", "meuser", "Me User", "Password123!", None, None)
+        .register_user(
+            "me@test.com",
+            "meuser",
+            "Me User",
+            "Password123!",
+            None,
+            None,
+        )
         .await;
 
     let resp = app
@@ -404,12 +414,7 @@ async fn login_with_email_only_no_username_field() {
 async fn health_check_returns_ok() {
     let app = TestApp::spawn().await;
 
-    let resp = app
-        .client
-        .get(app.url("/health"))
-        .send()
-        .await
-        .unwrap();
+    let resp = app.client.get(app.url("/health")).send().await.unwrap();
 
     assert_eq!(resp.status().as_u16(), 200);
     let json: Value = resp.json().await.unwrap();

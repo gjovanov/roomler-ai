@@ -1,7 +1,7 @@
-use bson::{doc, oid::ObjectId, DateTime};
+use bson::{DateTime, doc, oid::ObjectId};
 use mongodb::Database;
-use roomler_ai_db::models::{self, FileContext, ScanStatus};
 use roomler_ai_db::models::recording::{StorageProvider, Visibility};
+use roomler_ai_db::models::{self, FileContext, ScanStatus};
 
 use super::base::{BaseDao, DaoResult, PaginatedResult, PaginationParams};
 
@@ -119,11 +119,7 @@ impl FileDao {
             .await
     }
 
-    pub async fn soft_delete(
-        &self,
-        tenant_id: ObjectId,
-        file_id: ObjectId,
-    ) -> DaoResult<bool> {
+    pub async fn soft_delete(&self, tenant_id: ObjectId, file_id: ObjectId) -> DaoResult<bool> {
         self.base.soft_delete_in_tenant(tenant_id, file_id).await
     }
 }

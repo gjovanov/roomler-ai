@@ -1,7 +1,11 @@
-use axum::{Json, extract::State, http::{HeaderMap, StatusCode, header}};
+use axum::{
+    Json,
+    extract::State,
+    http::{HeaderMap, StatusCode, header},
+};
+use nanoid::nanoid;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
-use nanoid::nanoid;
 
 use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
 
@@ -89,7 +93,11 @@ pub async fn register(
     let token = nanoid!(7);
     if let Err(e) = state
         .activation_codes
-        .create(user_id, token.clone(), state.settings.email.activation_token_ttl_minutes)
+        .create(
+            user_id,
+            token.clone(),
+            state.settings.email.activation_token_ttl_minutes,
+        )
         .await
     {
         warn!("Failed to create activation code: {:?}", e);
@@ -134,7 +142,8 @@ pub async fn register(
     Ok((
         StatusCode::CREATED,
         Json(MessageResponse {
-            message: "Registration successful. Please check your email to activate your account.".to_string(),
+            message: "Registration successful. Please check your email to activate your account."
+                .to_string(),
         }),
     ))
 }
@@ -148,7 +157,9 @@ pub async fn login(
     } else if let Some(ref email) = body.email {
         state.users.find_by_email(email).await
     } else {
-        return Err(ApiError::BadRequest("Either username or email is required".to_string()));
+        return Err(ApiError::BadRequest(
+            "Either username or email is required".to_string(),
+        ));
     }
     .map_err(|_| ApiError::Unauthorized("Invalid credentials".to_string()))?;
 
@@ -285,7 +296,11 @@ pub async fn activate(
 
     // Send success email (non-fatal)
     if let Some(ref email_svc) = state.email {
-        let user = state.users.base.find_by_id(user_id).await
+        let user = state
+            .users
+            .base
+            .find_by_id(user_id)
+            .await
             .map_err(|e| ApiError::Internal(format!("User not found: {}", e)))?;
         let login_url = format!("{}/auth/login", state.settings.app.frontend_url);
         if let Err(e) = email_svc

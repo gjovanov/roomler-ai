@@ -1,4 +1,4 @@
-use bson::{doc, oid::ObjectId, DateTime};
+use bson::{DateTime, doc, oid::ObjectId};
 use mongodb::Database;
 use roomler_ai_db::models::PushSubscription;
 
@@ -52,9 +52,7 @@ impl PushSubscriptionDao {
     }
 
     pub async fn find_by_user(&self, user_id: ObjectId) -> DaoResult<Vec<PushSubscription>> {
-        self.base
-            .find_many(doc! { "user_id": user_id }, None)
-            .await
+        self.base.find_many(doc! { "user_id": user_id }, None).await
     }
 
     pub async fn find_by_users(&self, user_ids: &[ObjectId]) -> DaoResult<Vec<PushSubscription>> {

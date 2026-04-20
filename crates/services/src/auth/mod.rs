@@ -1,5 +1,5 @@
-use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_hash::SaltString};
 use argon2::password_hash::rand_core::OsRng;
+use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_hash::SaltString};
 use bson::oid::ObjectId;
 use chrono::{Duration, Utc};
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
@@ -21,7 +21,7 @@ pub enum AuthError {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
-    pub sub: String,        // user_id
+    pub sub: String, // user_id
     pub email: String,
     pub username: String,
     pub iat: i64,
@@ -44,19 +44,19 @@ pub enum TokenType {
 /// Claims carried by a remote-control enrollment token (aud = enroll).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnrollmentClaims {
-    pub sub: String,          // issuer-user id (admin who created the token)
+    pub sub: String, // issuer-user id (admin who created the token)
     pub tenant_id: String,
     pub iat: i64,
     pub exp: i64,
     pub iss: String,
     pub token_type: TokenType,
-    pub jti: String,          // unique id — caller may persist for single-use checks
+    pub jti: String, // unique id — caller may persist for single-use checks
 }
 
 /// Claims carried by a remote-control agent token (aud = agent).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentClaims {
-    pub sub: String,          // agent_id hex
+    pub sub: String, // agent_id hex
     pub tenant_id: String,
     pub iat: i64,
     pub exp: i64,
@@ -98,8 +98,8 @@ impl AuthService {
     }
 
     pub fn verify_password(&self, password: &str, hash: &str) -> Result<bool, AuthError> {
-        let parsed_hash = PasswordHash::new(hash)
-            .map_err(|e| AuthError::HashError(e.to_string()))?;
+        let parsed_hash =
+            PasswordHash::new(hash).map_err(|e| AuthError::HashError(e.to_string()))?;
         Ok(Argon2::default()
             .verify_password(password.as_bytes(), &parsed_hash)
             .is_ok())
@@ -152,11 +152,12 @@ impl AuthService {
         let mut validation = Validation::default();
         validation.set_issuer(&[&self.jwt_settings.issuer]);
 
-        let token_data = decode::<Claims>(token, &self.decoding_key, &validation)
-            .map_err(|e| match e.kind() {
+        let token_data = decode::<Claims>(token, &self.decoding_key, &validation).map_err(|e| {
+            match e.kind() {
                 jsonwebtoken::errors::ErrorKind::ExpiredSignature => AuthError::TokenExpired,
                 _ => AuthError::InvalidToken(e.to_string()),
-            })?;
+            }
+        })?;
 
         Ok(token_data.claims)
     }
@@ -206,13 +207,16 @@ impl AuthService {
     pub fn verify_enrollment_token(&self, token: &str) -> Result<EnrollmentClaims, AuthError> {
         let mut validation = Validation::default();
         validation.set_issuer(&[&self.jwt_settings.issuer]);
-        let data = decode::<EnrollmentClaims>(token, &self.decoding_key, &validation)
-            .map_err(|e| match e.kind() {
+        let data = decode::<EnrollmentClaims>(token, &self.decoding_key, &validation).map_err(
+            |e| match e.kind() {
                 jsonwebtoken::errors::ErrorKind::ExpiredSignature => AuthError::TokenExpired,
                 _ => AuthError::InvalidToken(e.to_string()),
-            })?;
+            },
+        )?;
         if data.claims.token_type != TokenType::Enrollment {
-            return Err(AuthError::InvalidToken("Not an enrollment token".to_string()));
+            return Err(AuthError::InvalidToken(
+                "Not an enrollment token".to_string(),
+            ));
         }
         Ok(data.claims)
     }
@@ -242,11 +246,12 @@ impl AuthService {
     pub fn verify_agent_token(&self, token: &str) -> Result<AgentClaims, AuthError> {
         let mut validation = Validation::default();
         validation.set_issuer(&[&self.jwt_settings.issuer]);
-        let data = decode::<AgentClaims>(token, &self.decoding_key, &validation)
-            .map_err(|e| match e.kind() {
+        let data = decode::<AgentClaims>(token, &self.decoding_key, &validation).map_err(|e| {
+            match e.kind() {
                 jsonwebtoken::errors::ErrorKind::ExpiredSignature => AuthError::TokenExpired,
                 _ => AuthError::InvalidToken(e.to_string()),
-            })?;
+            }
+        })?;
         if data.claims.token_type != TokenType::Agent {
             return Err(AuthError::InvalidToken("Not an agent token".to_string()));
         }

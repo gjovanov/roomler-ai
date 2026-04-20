@@ -84,18 +84,16 @@ pub async fn handle_agent_socket(
     // Read loop.
     while let Some(msg) = socket_rx.next().await {
         match msg {
-            Ok(Message::Text(text)) => {
-                match serde_json::from_str::<ClientMsg>(&text) {
-                    Ok(parsed) => {
-                        if let Err(e) = state.rc_hub.dispatch(&ctx, parsed) {
-                            warn!(%agent_id, %e, "rc:* dispatch failed (agent)");
-                        }
-                    }
-                    Err(e) => {
-                        debug!(%agent_id, %e, "ignoring non-rc:* message on agent socket");
+            Ok(Message::Text(text)) => match serde_json::from_str::<ClientMsg>(&text) {
+                Ok(parsed) => {
+                    if let Err(e) = state.rc_hub.dispatch(&ctx, parsed) {
+                        warn!(%agent_id, %e, "rc:* dispatch failed (agent)");
                     }
                 }
-            }
+                Err(e) => {
+                    debug!(%agent_id, %e, "ignoring non-rc:* message on agent socket");
+                }
+            },
             Ok(Message::Ping(data)) => {
                 let mut guard = socket_tx.lock().await;
                 let _ = guard.send(Message::Pong(data)).await;
@@ -200,19 +198,19 @@ pub fn dispatch_controller_rc(
 fn error_code(e: &roomler_ai_remote_control::Error) -> &'static str {
     use roomler_ai_remote_control::Error::*;
     match e {
-        AgentOffline(_)     => "agent_offline",
-        AgentNotFound(_)    => "agent_not_found",
-        AgentBusy           => "agent_busy",
-        SessionNotFound(_)  => "session_not_found",
-        BadPhase(_, _)      => "bad_phase",
-        ConsentDenied       => "consent_denied",
-        ConsentTimeout      => "consent_timeout",
+        AgentOffline(_) => "agent_offline",
+        AgentNotFound(_) => "agent_not_found",
+        AgentBusy => "agent_busy",
+        SessionNotFound(_) => "session_not_found",
+        BadPhase(_, _) => "bad_phase",
+        ConsentDenied => "consent_denied",
+        ConsentTimeout => "consent_timeout",
         PermissionDenied(_) => "permission_denied",
-        BadMessage(_)       => "bad_message",
-        SendFailed          => "send_failed",
-        Mongo(_)            => "internal",
-        Bson(_)             => "internal",
-        Json(_)             => "internal",
+        BadMessage(_) => "bad_message",
+        SendFailed => "send_failed",
+        Mongo(_) => "internal",
+        Bson(_) => "internal",
+        Json(_) => "internal",
     }
 }
 
@@ -223,7 +221,7 @@ fn error_session_id(e: &roomler_ai_remote_control::Error) -> Option<bson::oid::O
     use roomler_ai_remote_control::Error::*;
     match e {
         SessionNotFound(hex) => bson::oid::ObjectId::parse_str(hex).ok(),
-        BadPhase(hex, _)     => bson::oid::ObjectId::parse_str(hex).ok(),
-        _                    => None,
+        BadPhase(hex, _) => bson::oid::ObjectId::parse_str(hex).ok(),
+        _ => None,
     }
 }

@@ -32,7 +32,12 @@ async fn seed_messages(
             .await
             .unwrap();
 
-        assert_eq!(resp.status().as_u16(), 200, "Failed to create message {}", i);
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "Failed to create message {}",
+            i
+        );
         let json: Value = resp.json().await.unwrap();
         ids.push(json["id"].as_str().unwrap().to_string());
     }

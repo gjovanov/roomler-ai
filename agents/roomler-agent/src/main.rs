@@ -93,9 +93,11 @@ async fn main() -> Result<()> {
     };
 
     match cli.command.unwrap_or(Command::Run { encoder: None }) {
-        Command::Enroll { server, token, name } => {
-            enroll_cmd(&config_path, &server, &token, &name).await
-        }
+        Command::Enroll {
+            server,
+            token,
+            name,
+        } => enroll_cmd(&config_path, &server, &token, &name).await,
         Command::Run { encoder } => run_cmd(&config_path, encoder.as_deref()).await,
         Command::EncoderSmoke { encoder, codec } => encoder_smoke_cmd(&encoder, &codec).await,
         Command::Caps => caps_cmd().await,
@@ -292,7 +294,9 @@ async fn encoder_smoke_cmd(pref_raw: &str, codec_raw: &str) -> Result<()> {
     if keyframes == 0 {
         bail!("encoder smoke: no keyframes produced (backend={backend})");
     }
-    println!("encoder smoke PASSED: backend={backend} keyframes={keyframes} total_bytes={total_bytes}");
+    println!(
+        "encoder smoke PASSED: backend={backend} keyframes={keyframes} total_bytes={total_bytes}"
+    );
     Ok(())
 }
 
@@ -303,7 +307,10 @@ async fn caps_cmd() -> Result<()> {
     println!("has_input_permission: {}", caps.has_input_permission);
     println!("supports_clipboard: {}", caps.supports_clipboard);
     println!("supports_file_transfer: {}", caps.supports_file_transfer);
-    println!("max_simultaneous_sessions: {}", caps.max_simultaneous_sessions);
+    println!(
+        "max_simultaneous_sessions: {}",
+        caps.max_simultaneous_sessions
+    );
     Ok(())
 }
 

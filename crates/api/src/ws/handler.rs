@@ -1,5 +1,8 @@
 use axum::{
-    extract::{Query, State, WebSocketUpgrade, ws::{Message, WebSocket}},
+    extract::{
+        Query, State, WebSocketUpgrade,
+        ws::{Message, WebSocket},
+    },
     response::Response,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -130,7 +133,9 @@ async fn handle_socket(socket: WebSocket, state: AppState, user_id: ObjectId, us
     let (sender, mut receiver) = socket.split();
     let sender = Arc::new(Mutex::new(sender));
 
-    state.ws_storage.add(user_id, connection_id.clone(), sender.clone());
+    state
+        .ws_storage
+        .add(user_id, connection_id.clone(), sender.clone());
 
     // Register this tab with the remote-control Hub so `rc:*` replies find us.
     // Each browser tab gets its own controller tx; the Hub routes by tx, not
@@ -147,7 +152,9 @@ async fn handle_socket(socket: WebSocket, state: AppState, user_id: ObjectId, us
             "user_id": user_id.to_hex(),
         });
         let mut guard = sender.lock().await;
-        let _ = guard.send(Message::text(serde_json::to_string(&msg).unwrap())).await;
+        let _ = guard
+            .send(Message::text(serde_json::to_string(&msg).unwrap()))
+            .await;
     }
 
     while let Some(msg) = receiver.next().await {
@@ -179,7 +186,9 @@ async fn handle_socket(socket: WebSocket, state: AppState, user_id: ObjectId, us
     }
 
     // Cleanup
-    state.rc_hub.unregister_controller(user_id, &rc_controller_tx);
+    state
+        .rc_hub
+        .unregister_controller(user_id, &rc_controller_tx);
     rc_pump.abort();
     state.ws_storage.remove(&user_id, &connection_id, &sender);
 
@@ -254,10 +263,8 @@ async fn handle_client_message(
                 && let Ok(rid) = ObjectId::parse_str(room_id_str)
                 && let Ok(member_ids) = state.rooms.find_member_user_ids(rid).await
             {
-                let recipients: Vec<ObjectId> = member_ids
-                    .into_iter()
-                    .filter(|id| id != user_id)
-                    .collect();
+                let recipients: Vec<ObjectId> =
+                    member_ids.into_iter().filter(|id| id != user_id).collect();
                 let event = serde_json::json!({
                     "type": msg_type,
                     "data": {
@@ -265,11 +272,20 @@ async fn handle_client_message(
                         "user_id": user_id.to_hex(),
                     }
                 });
-                super::dispatcher::broadcast_with_redis(&state.ws_storage, &state.redis_pubsub, &recipients, &event).await;
+                super::dispatcher::broadcast_with_redis(
+                    &state.ws_storage,
+                    &state.redis_pubsub,
+                    &recipients,
+                    &event,
+                )
+                .await;
             }
         }
         "presence:update" => {
-            if let Some(presence) = data.and_then(|d| d.get("presence")).and_then(|p| p.as_str()) {
+            if let Some(presence) = data
+                .and_then(|d| d.get("presence"))
+                .and_then(|p| p.as_str())
+            {
                 let all_users = state.ws_storage.all_user_ids();
                 let event = serde_json::json!({
                     "type": "presence:update",
@@ -278,7 +294,13 @@ async fn handle_client_message(
                         "presence": presence,
                     }
                 });
-                super::dispatcher::broadcast_with_redis(&state.ws_storage, &state.redis_pubsub, &all_users, &event).await;
+                super::dispatcher::broadcast_with_redis(
+                    &state.ws_storage,
+                    &state.redis_pubsub,
+                    &all_users,
+                    &event,
+                )
+                .await;
             }
         }
         "media:join" => {
@@ -355,7 +377,12 @@ async fn handle_media_join(
     {
         Ok(tp) => tp,
         Err(e) => {
-            send_media_error(state, user_id, &format!("Failed to create transports: {}", e)).await;
+            send_media_error(
+                state,
+                user_id,
+                &format!("Failed to create transports: {}", e),
+            )
+            .await;
             return;
         }
     };
@@ -370,34 +397,45 @@ async fn handle_media_join(
     }
 
     let ice_servers: Vec<serde_json::Value> = if let Some(ref url) = state.settings.turn.url {
-        let (turn_username, turn_credential) = if let Some(ref secret) = state.settings.turn.shared_secret {
-            let expiry = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-                + 86400;
-            let username = format!("{}:{}", expiry, user_id.to_hex());
-            let mut mac = Hmac::<Sha1>::new_from_slice(secret.as_bytes())
-                .expect("HMAC key length is valid");
-            mac.update(username.as_bytes());
-            let credential = BASE64.encode(mac.finalize().into_bytes());
-            debug!(%username, "Generated TURN ephemeral credentials");
-            (username, credential)
-        } else {
-            (
-                state.settings.turn.username.as_deref().unwrap_or("").to_string(),
-                state.settings.turn.password.as_deref().unwrap_or("").to_string(),
-            )
-        };
+        let (turn_username, turn_credential) =
+            if let Some(ref secret) = state.settings.turn.shared_secret {
+                let expiry = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    + 86400;
+                let username = format!("{}:{}", expiry, user_id.to_hex());
+                let mut mac = Hmac::<Sha1>::new_from_slice(secret.as_bytes())
+                    .expect("HMAC key length is valid");
+                mac.update(username.as_bytes());
+                let credential = BASE64.encode(mac.finalize().into_bytes());
+                debug!(%username, "Generated TURN ephemeral credentials");
+                (username, credential)
+            } else {
+                (
+                    state
+                        .settings
+                        .turn
+                        .username
+                        .as_deref()
+                        .unwrap_or("")
+                        .to_string(),
+                    state
+                        .settings
+                        .turn
+                        .password
+                        .as_deref()
+                        .unwrap_or("")
+                        .to_string(),
+                )
+            };
         // Build TURN URLs with multiple transport variants.
         // UDP TURN often fails behind NAT/firewalls, so include TCP and TLS fallbacks.
         let mut urls: Vec<String> = vec![url.clone()];
         if url.starts_with("turn:") && !url.contains("?transport=") {
             urls.push(format!("{}?transport=tcp", url));
             // Derive TURNS (TLS) URL on port 5349
-            let turns_url = url
-                .replacen("turn:", "turns:", 1)
-                .replace(":3478", ":5349");
+            let turns_url = url.replacen("turn:", "turns:", 1).replace(":3478", ":5349");
             urls.push(format!("{}?transport=tcp", turns_url));
         }
         vec![serde_json::json!({
@@ -412,9 +450,7 @@ async fn handle_media_join(
     let force_relay = state.settings.turn.force_relay.unwrap_or(false);
 
     if force_relay {
-        info!(
-            "force_relay=true — clients will use iceTransportPolicy='relay' via TURN server"
-        );
+        info!("force_relay=true — clients will use iceTransportPolicy='relay' via TURN server");
     }
 
     info!(
@@ -562,7 +598,8 @@ async fn handle_media_produce(
                 "type": "media:produce_result",
                 "data": { "id": producer_id.to_string() }
             });
-            super::dispatcher::send_to_connection(&state.ws_storage, connection_id, &result_msg).await;
+            super::dispatcher::send_to_connection(&state.ws_storage, connection_id, &result_msg)
+                .await;
 
             let other_conns = state
                 .room_manager
@@ -583,7 +620,6 @@ async fn handle_media_produce(
                     super::dispatcher::send_to_connection(&state.ws_storage, conn_id, &event).await;
                 }
             }
-
         }
         Err(e) => {
             send_media_error(state, user_id, &format!("produce failed: {}", e)).await;
@@ -703,7 +739,9 @@ async fn handle_media_producer_close(
         .room_manager
         .close_producer(&rid, connection_id, &producer_id)
     {
-        state.room_manager.remove_rtp_tap(&rid, &producer_id.to_string());
+        state
+            .room_manager
+            .remove_rtp_tap(&rid, &producer_id.to_string());
 
         let other_conns = state
             .room_manager
@@ -744,9 +782,7 @@ async fn handle_media_leave(
         .room_manager
         .get_other_connection_ids(&rid, connection_id);
 
-    state
-        .room_manager
-        .close_participant(&rid, connection_id);
+    state.room_manager.close_participant(&rid, connection_id);
 
     if !other_conns.is_empty() {
         let event = serde_json::json!({
@@ -801,7 +837,12 @@ async fn handle_play_audio(
         }
     };
 
-    let file = match state.files.base.find_by_id_in_tenant(room.tenant_id, fid).await {
+    let file = match state
+        .files
+        .base
+        .find_by_id_in_tenant(room.tenant_id, fid)
+        .await
+    {
         Ok(f) => f,
         Err(e) => {
             warn!(%e, "Failed to find file for playback");
@@ -829,7 +870,9 @@ async fn handle_play_audio(
     });
 
     super::dispatcher::send_to_connection(&state.ws_storage, connection_id, &msg).await;
-    let other_conns = state.room_manager.get_other_connection_ids(&rid, connection_id);
+    let other_conns = state
+        .room_manager
+        .get_other_connection_ids(&rid, connection_id);
     for cid in &other_conns {
         super::dispatcher::send_to_connection(&state.ws_storage, cid, &msg).await;
     }
@@ -872,7 +915,9 @@ async fn handle_stop_audio(
     });
 
     super::dispatcher::send_to_connection(&state.ws_storage, connection_id, &msg).await;
-    let other_conns = state.room_manager.get_other_connection_ids(&rid, connection_id);
+    let other_conns = state
+        .room_manager
+        .get_other_connection_ids(&rid, connection_id);
     for cid in &other_conns {
         super::dispatcher::send_to_connection(&state.ws_storage, cid, &msg).await;
     }

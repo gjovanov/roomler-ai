@@ -1,4 +1,4 @@
-use mongodb::bson::{doc, oid::ObjectId, DateTime};
+use mongodb::bson::{DateTime, doc, oid::ObjectId};
 use roomler_ai_config::StripeSettings;
 use roomler_ai_db::models::tenant::{BillingInfo, Plan, PlanLimits, SubscriptionStatus, Tenant};
 use serde::{Deserialize, Serialize};
@@ -163,11 +163,7 @@ impl StripeService {
 
     // ---- Customer --------------------------------------------------------
 
-    async fn create_customer(
-        &self,
-        email: &str,
-        tenant_id: &str,
-    ) -> Result<String, StripeError> {
+    async fn create_customer(&self, email: &str, tenant_id: &str) -> Result<String, StripeError> {
         let params = [("email", email), ("metadata[tenant_id]", tenant_id)];
 
         let resp: serde_json::Value = self
@@ -416,8 +412,7 @@ impl StripeService {
                     _ => SubscriptionStatus::Active,
                 };
 
-                let period_end = current_period_end
-                    .map(|ts| DateTime::from_millis(ts * 1000));
+                let period_end = current_period_end.map(|ts| DateTime::from_millis(ts * 1000));
 
                 let collection = db.collection::<Tenant>(Tenant::COLLECTION);
                 let mut update = doc! {

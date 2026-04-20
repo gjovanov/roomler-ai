@@ -105,7 +105,10 @@ impl Hub {
         if let Some(prev) = self.inner.agents.insert(agent_id, entry) {
             // Replace older connection (e.g. agent reconnected on a flap).
             // The old tx is dropped → its rx ends → the old WS task exits.
-            warn!("agent {} reconnected; dropping previous connection", agent_id);
+            warn!(
+                "agent {} reconnected; dropping previous connection",
+                agent_id
+            );
             drop(prev);
         }
         info!("agent {} online", agent_id);
@@ -237,7 +240,9 @@ impl Hub {
 
     fn handle_consent_outcome(&self, session_id: ObjectId, outcome: ConsentOutcome) {
         let (agent_id, tenant_id, controller_tx) = {
-            let Some(arc) = self.inner.sessions.get(&session_id) else { return };
+            let Some(arc) = self.inner.sessions.get(&session_id) else {
+                return;
+            };
             let s = arc.value().lock();
             (s.agent_id, s.tenant_id, s.controller_tx.clone())
         };
@@ -245,9 +250,9 @@ impl Hub {
         match outcome {
             ConsentOutcome::Granted => {
                 self.audit(session_id, agent_id, tenant_id, AuditKind::ConsentGranted);
-                if let Err(e) = self.with_session(session_id, |s| {
-                    s.transition(SessionPhase::Negotiating)
-                }) {
+                if let Err(e) =
+                    self.with_session(session_id, |s| s.transition(SessionPhase::Negotiating))
+                {
                     warn!("post-consent transition failed: {e}");
                     let _ = self.terminate(session_id, EndReason::Error);
                     return;
@@ -328,14 +333,19 @@ impl Hub {
         // Once the answer is in flight, mark the session active.
         // (The peers may still be doing ICE, but signaling is done from our POV.)
         self.with_session(session_id, |s| s.transition(SessionPhase::Active))?;
-        let (sid, aid, oid) = self
-            .with_session(session_id, |s| Ok((s.id, s.agent_id, s.tenant_id)))?;
+        let (sid, aid, oid) =
+            self.with_session(session_id, |s| Ok((s.id, s.agent_id, s.tenant_id)))?;
         self.audit(sid, aid, oid, AuditKind::SessionStarted);
         Ok(())
     }
 
     /// Forward an ICE candidate to whichever side didn't send it.
-    pub fn forward_ice(&self, role: Role, session_id: ObjectId, candidate: serde_json::Value) -> Result<()> {
+    pub fn forward_ice(
+        &self,
+        role: Role,
+        session_id: ObjectId,
+        candidate: serde_json::Value,
+    ) -> Result<()> {
         let (agent_id, controller_tx) = {
             let arc = self
                 .inner
@@ -346,7 +356,7 @@ impl Hub {
             (s.agent_id, s.controller_tx.clone())
         };
         let dest_tx = match role {
-            Role::Controller => self.agent_tx(agent_id)?,        // controller → agent
+            Role::Controller => self.agent_tx(agent_id)?, // controller → agent
             Role::Agent => controller_tx.ok_or(Error::SendFailed)?,
         };
         dest_tx
@@ -454,8 +464,8 @@ fn ptr_eq(a: &ClientTx, b: &ClientTx) -> bool {
 
 pub struct DispatchCtx {
     pub role: Role,
-    pub user_id: Option<ObjectId>,    // Some for Controller
-    pub agent_id: Option<ObjectId>,   // Some for Agent
+    pub user_id: Option<ObjectId>,  // Some for Controller
+    pub agent_id: Option<ObjectId>, // Some for Agent
     pub controller_name: Option<String>,
     pub controller_tx: Option<ClientTx>,
 }
@@ -487,15 +497,21 @@ impl Hub {
             (Role::Agent, ClientMsg::SdpAnswer { session_id, sdp }) => {
                 self.forward_answer(session_id, sdp)
             }
-            (Role::Agent, ClientMsg::Consent { session_id, granted }) => {
-                self.deliver_consent(session_id, granted)
-            }
-            (role, ClientMsg::Ice { session_id, candidate }) => {
-                self.forward_ice(role, session_id, candidate)
-            }
-            (_, ClientMsg::Terminate { session_id, reason }) => {
-                self.terminate(session_id, reason)
-            }
+            (
+                Role::Agent,
+                ClientMsg::Consent {
+                    session_id,
+                    granted,
+                },
+            ) => self.deliver_consent(session_id, granted),
+            (
+                role,
+                ClientMsg::Ice {
+                    session_id,
+                    candidate,
+                },
+            ) => self.forward_ice(role, session_id, candidate),
+            (_, ClientMsg::Terminate { session_id, reason }) => self.terminate(session_id, reason),
             (_, ClientMsg::Ping { id: _ }) => Ok(()), // pong handled by WS layer
             (_, ClientMsg::AgentHello { .. } | ClientMsg::AgentHeartbeat { .. }) => {
                 // Hello is handled at registration time; heartbeat is logged by WS layer.
@@ -551,13 +567,8 @@ mod tests {
     async fn end_to_end_consent_grant() {
         let hub = test_hub().await;
         let agent_id = ObjectId::new();
-        let _agent_rx = hub.register_agent(
-            agent_id,
-            ObjectId::new(),
-            ObjectId::new(),
-            OsKind::Linux,
-            3,
-        );
+        let _agent_rx =
+            hub.register_agent(agent_id, ObjectId::new(), ObjectId::new(), OsKind::Linux, 3);
         let (ctl_tx, mut ctl_rx) = mpsc::channel(8);
         let sid = hub
             .create_session(

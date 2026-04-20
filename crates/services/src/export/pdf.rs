@@ -119,26 +119,14 @@ impl SimplePdf {
             }
 
             let font_ref = if line.bold { "/F2" } else { "/F1" };
-            stream.push_str(&format!(
-                "{} {} Tf\n",
-                font_ref, line.font_size
-            ));
-            stream.push_str(&format!(
-                "{} {} Td\n",
-                margin_left, y
-            ));
-            stream.push_str(&format!(
-                "({}) Tj\n",
-                Self::escape_pdf_string(&line.text)
-            ));
+            stream.push_str(&format!("{} {} Tf\n", font_ref, line.font_size));
+            stream.push_str(&format!("{} {} Td\n", margin_left, y));
+            stream.push_str(&format!("({}) Tj\n", Self::escape_pdf_string(&line.text)));
 
             y -= line.font_size * line_height_factor;
 
             // Reset position for next absolute positioning
-            stream.push_str(&format!(
-                "{} {} Td\n",
-                -margin_left, -y
-            ));
+            stream.push_str(&format!("{} {} Td\n", -margin_left, -y));
         }
 
         stream.push_str("ET\n");

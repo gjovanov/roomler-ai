@@ -1,4 +1,7 @@
-use axum::{Json, extract::{Query, State}};
+use axum::{
+    Json,
+    extract::{Query, State},
+};
 use serde::Deserialize;
 
 use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};

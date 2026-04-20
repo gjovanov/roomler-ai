@@ -1,9 +1,9 @@
-use bson::{doc, oid::ObjectId, DateTime};
+use bson::{DateTime, doc, oid::ObjectId};
 use mongodb::Database;
 use rand::Rng;
 use roomler_ai_db::models::{
-    CallChatMessage, ConferenceSettings, MediaSettings, ParticipantRole, ParticipantSession,
-    Room, RoomMember,
+    CallChatMessage, ConferenceSettings, MediaSettings, ParticipantRole, ParticipantSession, Room,
+    RoomMember,
 };
 
 use super::base::{BaseDao, DaoError, DaoResult, PaginatedResult, PaginationParams};
@@ -117,10 +117,7 @@ impl RoomDao {
     ) -> DaoResult<Vec<Room>> {
         let memberships = self
             .members
-            .find_many(
-                doc! { "tenant_id": tenant_id, "user_id": user_id },
-                None,
-            )
+            .find_many(doc! { "tenant_id": tenant_id, "user_id": user_id }, None)
             .await?;
 
         let room_ids: Vec<ObjectId> = memberships.iter().map(|m| m.room_id).collect();
@@ -182,21 +179,13 @@ impl RoomDao {
             .await
     }
 
-    pub async fn soft_delete(
-        &self,
-        tenant_id: ObjectId,
-        room_id: ObjectId,
-    ) -> DaoResult<bool> {
+    pub async fn soft_delete(&self, tenant_id: ObjectId, room_id: ObjectId) -> DaoResult<bool> {
         self.base.soft_delete_in_tenant(tenant_id, room_id).await
     }
 
     /// Hard-delete a room and cascade to all related resources:
     /// messages, reactions, room_members, call_chat_messages, files (soft), recordings.
-    pub async fn cascade_delete(
-        &self,
-        tenant_id: ObjectId,
-        room_id: ObjectId,
-    ) -> DaoResult<()> {
+    pub async fn cascade_delete(&self, tenant_id: ObjectId, room_id: ObjectId) -> DaoResult<()> {
         // 1. Delete all messages in the room
         let msg_coll = self.db.collection::<bson::Document>("messages");
         msg_coll
@@ -230,9 +219,7 @@ impl RoomDao {
 
         // 6. Delete all recordings
         let rec_coll = self.db.collection::<bson::Document>("recordings");
-        rec_coll
-            .delete_many(doc! { "room_id": room_id })
-            .await?;
+        rec_coll.delete_many(doc! { "room_id": room_id }).await?;
 
         // 7. Hard-delete the room itself
         self.base
@@ -389,7 +376,10 @@ impl RoomDao {
 
         let filter = doc! { "room_id": room_id };
         let projection = doc! { "user_id": 1, "_id": 0 };
-        let coll = self.members.collection().clone_with_type::<bson::Document>();
+        let coll = self
+            .members
+            .collection()
+            .clone_with_type::<bson::Document>();
         let mut cursor = coll.find(filter).projection(projection).await?;
 
         let mut user_ids = Vec::new();
@@ -508,10 +498,7 @@ impl RoomDao {
                 .map_err(DaoError::Mongo)?;
 
             self.base
-                .update_by_id(
-                    room_id,
-                    doc! { "$inc": { "participant_count": 1 } },
-                )
+                .update_by_id(room_id, doc! { "$inc": { "participant_count": 1 } })
                 .await?;
 
             return self.members.find_by_id(rid).await;
@@ -557,11 +544,7 @@ impl RoomDao {
         self.members.find_by_id(id).await
     }
 
-    pub async fn leave_participant(
-        &self,
-        room_id: ObjectId,
-        user_id: ObjectId,
-    ) -> DaoResult<bool> {
+    pub async fn leave_participant(&self, room_id: ObjectId, user_id: ObjectId) -> DaoResult<bool> {
         let now = DateTime::now();
         let filter = doc! {
             "room_id": room_id,
@@ -584,10 +567,7 @@ impl RoomDao {
             .map_err(DaoError::Mongo)?;
 
         self.base
-            .update_by_id(
-                room_id,
-                doc! { "$inc": { "participant_count": -1 } },
-            )
+            .update_by_id(room_id, doc! { "$inc": { "participant_count": -1 } })
             .await?;
 
         Ok(true)
@@ -602,10 +582,7 @@ impl RoomDao {
             .await
     }
 
-    pub async fn find_participant_user_ids(
-        &self,
-        room_id: ObjectId,
-    ) -> DaoResult<Vec<ObjectId>> {
+    pub async fn find_participant_user_ids(&self, room_id: ObjectId) -> DaoResult<Vec<ObjectId>> {
         let participants = self
             .members
             .find_many(doc! { "room_id": room_id }, None)

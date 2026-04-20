@@ -1,5 +1,9 @@
 use bson::oid::ObjectId;
-use roomler_ai_api::{build_router, state::AppState, ws::{dispatcher, redis_pubsub::RedisPubSub}};
+use roomler_ai_api::{
+    build_router,
+    state::AppState,
+    ws::{dispatcher, redis_pubsub::RedisPubSub},
+};
 use roomler_ai_config::Settings;
 use roomler_ai_db::{connect, indexes::ensure_indexes};
 use tracing::{error, info};
@@ -21,7 +25,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Load config
     let settings = Settings::load()?;
-    info!("Starting Roomler2 API on {}:{}", settings.app.host, settings.app.port);
+    info!(
+        "Starting Roomler2 API on {}:{}",
+        settings.app.host, settings.app.port
+    );
     info!(
         listen_ip = %settings.mediasoup.listen_ip,
         announced_ip = %settings.mediasoup.announced_ip,
@@ -53,7 +60,10 @@ async fn main() -> anyhow::Result<()> {
         if let Some(res) = result
             && res.modified_count > 0
         {
-            info!("Cleaned up {} stale calls (all in_progress reset to ended)", res.modified_count);
+            info!(
+                "Cleaned up {} stale calls (all in_progress reset to ended)",
+                res.modified_count
+            );
         }
     }
 
@@ -76,7 +86,10 @@ async fn main() -> anyhow::Result<()> {
         if let Ok(mut cursor) = msgs_coll.aggregate(pipeline).await {
             let mut fixed = 0u64;
             while let Ok(Some(doc)) = cursor.try_next().await {
-                if let (Some(parent_id), Some(count)) = (doc.get_object_id("_id").ok(), doc.get_i32("reply_count").ok()) {
+                if let (Some(parent_id), Some(count)) = (
+                    doc.get_object_id("_id").ok(),
+                    doc.get_i32("reply_count").ok(),
+                ) {
                     let update = bson::doc! {
                         "$set": {
                             "is_thread_root": true,
@@ -88,13 +101,20 @@ async fn main() -> anyhow::Result<()> {
                             },
                         },
                     };
-                    if msgs_coll.update_one(bson::doc! { "_id": parent_id }, update).await.is_ok() {
+                    if msgs_coll
+                        .update_one(bson::doc! { "_id": parent_id }, update)
+                        .await
+                        .is_ok()
+                    {
                         fixed += 1;
                     }
                 }
             }
             if fixed > 0 {
-                info!("Rebuilt thread metadata for {} thread parent messages", fixed);
+                info!(
+                    "Rebuilt thread metadata for {} thread parent messages",
+                    fixed
+                );
             }
         }
     }
@@ -113,10 +133,8 @@ async fn main() -> anyhow::Result<()> {
             tokio::spawn(async move {
                 while let Ok(payload) = redis_rx.recv().await {
                     if let Ok(envelope) = serde_json::from_str::<serde_json::Value>(&payload)
-                        && let (Some(user_ids_val), Some(message)) = (
-                            envelope["user_ids"].as_array(),
-                            envelope.get("message"),
-                        )
+                        && let (Some(user_ids_val), Some(message)) =
+                            (envelope["user_ids"].as_array(), envelope.get("message"))
                     {
                         let ids: Vec<ObjectId> = user_ids_val
                             .iter()

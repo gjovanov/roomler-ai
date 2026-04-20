@@ -1,4 +1,4 @@
-use bson::{doc, oid::ObjectId, Document};
+use bson::{Document, doc, oid::ObjectId};
 use mongodb::{Collection, Database};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -96,11 +96,7 @@ where
             .ok_or(DaoError::NotFound)
     }
 
-    pub async fn find_by_id_in_tenant(
-        &self,
-        tenant_id: ObjectId,
-        id: ObjectId,
-    ) -> DaoResult<T> {
+    pub async fn find_by_id_in_tenant(&self, tenant_id: ObjectId, id: ObjectId) -> DaoResult<T> {
         self.collection
             .find_one(doc! { "_id": id, "tenant_id": tenant_id })
             .await?
@@ -116,16 +112,9 @@ where
         self.find_many(filter, None).await
     }
 
-    pub async fn find_many(
-        &self,
-        filter: Document,
-        sort: Option<Document>,
-    ) -> DaoResult<Vec<T>> {
+    pub async fn find_many(&self, filter: Document, sort: Option<Document>) -> DaoResult<Vec<T>> {
         let mut cursor = if let Some(sort) = sort {
-            self.collection
-                .find(filter)
-                .sort(sort)
-                .await?
+            self.collection.find(filter).sort(sort).await?
         } else {
             self.collection.find(filter).await?
         };
@@ -164,7 +153,11 @@ where
             items.push(doc);
         }
 
-        let total_pages = if per_page > 0 { total.div_ceil(per_page) } else { 0 };
+        let total_pages = if per_page > 0 {
+            total.div_ceil(per_page)
+        } else {
+            0
+        };
 
         Ok(PaginatedResult {
             items,
@@ -221,11 +214,7 @@ where
         Ok(id)
     }
 
-    pub async fn update_one(
-        &self,
-        filter: Document,
-        update: Document,
-    ) -> DaoResult<bool> {
+    pub async fn update_one(&self, filter: Document, update: Document) -> DaoResult<bool> {
         let update_with_timestamp = doc! {
             "$set": {
                 "updated_at": bson::DateTime::now(),

@@ -1,6 +1,6 @@
+use axum::extract::ws::Message;
 use bson::oid::ObjectId;
 use futures::SinkExt;
-use axum::extract::ws::Message;
 use std::sync::Arc;
 use tracing::{debug, warn};
 
@@ -8,11 +8,7 @@ use super::redis_pubsub::RedisPubSub;
 use super::storage::WsStorage;
 
 /// Broadcasts a JSON message to all connections of the specified users.
-pub async fn broadcast(
-    ws_storage: &WsStorage,
-    user_ids: &[ObjectId],
-    message: &serde_json::Value,
-) {
+pub async fn broadcast(ws_storage: &WsStorage, user_ids: &[ObjectId], message: &serde_json::Value) {
     let text = serde_json::to_string(message).unwrap_or_default();
 
     for user_id in user_ids {
@@ -30,11 +26,7 @@ pub async fn broadcast(
 }
 
 /// Sends a JSON message to a specific user's connections.
-pub async fn send_to_user(
-    ws_storage: &WsStorage,
-    user_id: &ObjectId,
-    message: &serde_json::Value,
-) {
+pub async fn send_to_user(ws_storage: &WsStorage, user_id: &ObjectId, message: &serde_json::Value) {
     broadcast(ws_storage, &[*user_id], message).await;
 }
 

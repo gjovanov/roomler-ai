@@ -38,7 +38,10 @@ async fn list_room_members_returns_paginated_items_with_user_details() {
     let json: Value = resp.json().await.unwrap();
 
     // Response must be paginated with items array
-    assert!(json["items"].is_array(), "Response must contain 'items' array");
+    assert!(
+        json["items"].is_array(),
+        "Response must contain 'items' array"
+    );
     assert!(json["total"].is_number(), "Response must contain 'total'");
 
     let items = json["items"].as_array().unwrap();
@@ -48,9 +51,15 @@ async fn list_room_members_returns_paginated_items_with_user_details() {
     for item in items {
         assert!(item["id"].is_string(), "Member must have 'id'");
         assert!(item["user_id"].is_string(), "Member must have 'user_id'");
-        assert!(item["display_name"].is_string(), "Member must have 'display_name'");
+        assert!(
+            item["display_name"].is_string(),
+            "Member must have 'display_name'"
+        );
         assert!(item["username"].is_string(), "Member must have 'username'");
-        assert!(item["joined_at"].is_string(), "Member must have 'joined_at'");
+        assert!(
+            item["joined_at"].is_string(),
+            "Member must have 'joined_at'"
+        );
 
         let display_name = item["display_name"].as_str().unwrap();
         assert!(!display_name.is_empty(), "display_name must not be empty");
@@ -139,10 +148,7 @@ async fn create_message_with_mentions() {
     // Admin sends a message mentioning the member
     let resp = app
         .auth_post(
-            &format!(
-                "/api/tenant/{}/room/{}/message",
-                tenant.tenant_id, room_id
-            ),
+            &format!("/api/tenant/{}/room/{}/message", tenant.tenant_id, room_id),
             &tenant.admin.access_token,
         )
         .json(&serde_json::json!({
@@ -159,8 +165,14 @@ async fn create_message_with_mentions() {
 
     assert_eq!(resp.status().as_u16(), 200);
     let msg: Value = resp.json().await.unwrap();
-    assert!(msg["id"].is_string(), "Message should be created with an ID");
-    assert_eq!(msg["content"].as_str().unwrap(), format!("Hey @{} check this out", tenant.member.username));
+    assert!(
+        msg["id"].is_string(),
+        "Message should be created with an ID"
+    );
+    assert_eq!(
+        msg["content"].as_str().unwrap(),
+        format!("Hey @{} check this out", tenant.member.username)
+    );
 }
 
 #[tokio::test]
@@ -181,10 +193,7 @@ async fn create_message_with_everyone_mention() {
     // Send message with @everyone
     let resp = app
         .auth_post(
-            &format!(
-                "/api/tenant/{}/room/{}/message",
-                tenant.tenant_id, room_id
-            ),
+            &format!("/api/tenant/{}/room/{}/message", tenant.tenant_id, room_id),
             &tenant.admin.access_token,
         )
         .json(&serde_json::json!({
@@ -201,6 +210,9 @@ async fn create_message_with_everyone_mention() {
 
     assert_eq!(resp.status().as_u16(), 200);
     let msg: Value = resp.json().await.unwrap();
-    assert!(msg["id"].is_string(), "Message with @everyone should be created");
+    assert!(
+        msg["id"].is_string(),
+        "Message with @everyone should be created"
+    );
     assert_eq!(msg["content"].as_str().unwrap(), "Attention @everyone!");
 }

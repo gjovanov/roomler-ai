@@ -7,11 +7,7 @@ use axum::{
 use bson::oid::ObjectId;
 use serde::Deserialize;
 
-use crate::{
-    error::ApiError,
-    extractors::auth::AuthUser,
-    state::AppState,
-};
+use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
 use roomler_ai_db::models::role::permissions;
 use roomler_ai_services::stripe::{StripeEvent, StripeService};
 

@@ -47,7 +47,11 @@ pub struct CursorTracker {
     #[cfg(all(target_os = "windows", feature = "mf-encoder"))]
     inner: windows_impl::WindowsCursorTracker,
     /// Whether the caller has already received a `shape` payload for
-    /// the current `shape_id`. Resets when the handle changes.
+    /// the current `shape_id`. Resets when the handle changes. Only
+    /// consulted on Windows with the mf-encoder feature; non-Windows
+    /// and signalling-only builds keep the field but never read it
+    /// (the windows_impl `poll()` is cfg-gated). Allowed dead.
+    #[allow(dead_code)]
     last_advertised_shape: Option<u64>,
 }
 
@@ -113,7 +117,7 @@ mod windows_impl {
         GetDIBits, GetObjectW, HBITMAP, HGDIOBJ, ReleaseDC,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        CURSORINFO, CURSOR_SHOWING, CURSORINFO_FLAGS, GetCursorInfo, GetIconInfo, HCURSOR, HICON,
+        CURSOR_SHOWING, CURSORINFO, CURSORINFO_FLAGS, GetCursorInfo, GetIconInfo, HCURSOR, HICON,
         ICONINFO,
     };
 

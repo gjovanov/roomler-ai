@@ -250,7 +250,9 @@ async fn agent_answers_sdp_offer_with_real_webrtc_peer() {
             Message::Text(t) => t.to_string(),
             _ => continue,
         };
-        let Ok(v) = serde_json::from_str::<Value>(&text) else { continue };
+        let Ok(v) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
         match v.get("t").and_then(|x| x.as_str()).unwrap_or("") {
             "rc:session.created" => {
                 saw_created = true;
@@ -287,11 +289,17 @@ async fn agent_answers_sdp_offer_with_real_webrtc_peer() {
 
     assert!(saw_created, "rc:session.created missing");
     assert!(saw_ready, "rc:ready missing");
-    assert!(saw_answer, "rc:sdp.answer missing — agent PC failed to build one");
+    assert!(
+        saw_answer,
+        "rc:sdp.answer missing — agent PC failed to build one"
+    );
 
     // Apply the answer on the browser side — proves it's a valid SDP.
     let sdp = answer_sdp.expect("answer SDP");
-    assert!(sdp.contains("v=0"), "answer SDP looks malformed: {sdp:.200}");
+    assert!(
+        sdp.contains("v=0"),
+        "answer SDP looks malformed: {sdp:.200}"
+    );
     let answer = RTCSessionDescription::answer(sdp).expect("parse answer");
     browser_pc
         .set_remote_description(answer)
@@ -310,7 +318,9 @@ async fn agent_answers_sdp_offer_with_real_webrtc_peer() {
 }
 
 fn urlencode(s: &str) -> String {
-    s.replace('+', "%2B").replace('/', "%2F").replace('=', "%3D")
+    s.replace('+', "%2B")
+        .replace('/', "%2F")
+        .replace('=', "%3D")
 }
 
 /// Extract a hex ObjectId. The wire format is raw hex on both REST and WS

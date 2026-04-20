@@ -1,4 +1,4 @@
-use bson::{oid::ObjectId, DateTime};
+use bson::{DateTime, oid::ObjectId};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

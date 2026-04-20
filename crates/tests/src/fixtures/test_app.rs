@@ -53,7 +53,12 @@ impl TestApp {
         let addr = listener.local_addr().unwrap();
 
         tokio::spawn(async move {
-            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
 
         let base_url = format!("http://{}", addr);
@@ -111,7 +116,12 @@ impl TestApp {
         let addr = listener.local_addr().unwrap();
 
         tokio::spawn(async move {
-            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
 
         let base_url = format!("http://{}", addr);
@@ -173,7 +183,12 @@ impl TestApp {
         let addr = listener.local_addr().unwrap();
 
         tokio::spawn(async move {
-            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
 
         let base_url = format!("http://{}", addr);

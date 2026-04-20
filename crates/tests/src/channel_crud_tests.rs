@@ -9,10 +9,7 @@ async fn get_room_by_id() {
 
     let resp = app
         .auth_get(
-            &format!(
-                "/api/tenant/{}/room/{}",
-                tenant.tenant_id, room.id
-            ),
+            &format!("/api/tenant/{}/room/{}", tenant.tenant_id, room.id),
             &tenant.admin.access_token,
         )
         .send()
@@ -34,10 +31,7 @@ async fn update_room() {
 
     let resp = app
         .auth_put(
-            &format!(
-                "/api/tenant/{}/room/{}",
-                tenant.tenant_id, room.id
-            ),
+            &format!("/api/tenant/{}/room/{}", tenant.tenant_id, room.id),
             &tenant.admin.access_token,
         )
         .json(&serde_json::json!({
@@ -56,10 +50,7 @@ async fn update_room() {
     // Verify the update
     let resp = app
         .auth_get(
-            &format!(
-                "/api/tenant/{}/room/{}",
-                tenant.tenant_id, room.id
-            ),
+            &format!("/api/tenant/{}/room/{}", tenant.tenant_id, room.id),
             &tenant.admin.access_token,
         )
         .send()
@@ -78,10 +69,7 @@ async fn delete_room_soft_deletes() {
 
     let resp = app
         .auth_delete(
-            &format!(
-                "/api/tenant/{}/room/{}",
-                tenant.tenant_id, room.id
-            ),
+            &format!("/api/tenant/{}/room/{}", tenant.tenant_id, room.id),
             &tenant.admin.access_token,
         )
         .send()
@@ -115,10 +103,7 @@ async fn list_room_members() {
     // Admin is already a member from room creation.
     // Member joins room.
     app.auth_post(
-        &format!(
-            "/api/tenant/{}/room/{}/join",
-            tenant.tenant_id, room.id
-        ),
+        &format!("/api/tenant/{}/room/{}/join", tenant.tenant_id, room.id),
         &tenant.member.access_token,
     )
     .send()
@@ -127,10 +112,7 @@ async fn list_room_members() {
 
     let resp = app
         .auth_get(
-            &format!(
-                "/api/tenant/{}/room/{}/member",
-                tenant.tenant_id, room.id
-            ),
+            &format!("/api/tenant/{}/room/{}/member", tenant.tenant_id, room.id),
             &tenant.admin.access_token,
         )
         .send()
@@ -153,10 +135,7 @@ async fn explore_rooms() {
     // Search for "engineer" - should match "engineering"
     let resp = app
         .auth_get(
-            &format!(
-                "/api/tenant/{}/room/explore?q=engineer",
-                tenant.tenant_id
-            ),
+            &format!("/api/tenant/{}/room/explore?q=engineer", tenant.tenant_id),
             &tenant.admin.access_token,
         )
         .send()

@@ -1,7 +1,7 @@
+use bson::oid::ObjectId;
 use roomler_ai_db::models::{Message, User};
 use rust_xlsxwriter::{Format, Workbook};
 use std::collections::HashMap;
-use bson::oid::ObjectId;
 
 /// Export conversation messages to an Excel file.
 /// Full implementation in Phase 9.
@@ -31,7 +31,11 @@ pub fn export_conversation(
 
     for (i, msg) in messages.iter().enumerate() {
         let row = (i + 1) as u32;
-        let timestamp = msg.created_at.to_chrono().format("%Y-%m-%d %H:%M:%S").to_string();
+        let timestamp = msg
+            .created_at
+            .to_chrono()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
         let author = users
             .get(&msg.author_id)
             .map(|u| u.display_name.as_str())

@@ -12,9 +12,7 @@ use axum::{
 };
 use state::AppState;
 use tower_governor::{
-    GovernorLayer,
-    governor::GovernorConfigBuilder,
-    key_extractor::SmartIpKeyExtractor,
+    GovernorLayer, governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor,
 };
 use tower_http::{
     cors::{Any, CorsLayer},
@@ -28,10 +26,7 @@ fn build_cors_layer(origins: &[String]) -> CorsLayer {
             .allow_methods(Any)
             .allow_headers(Any)
     } else {
-        let allowed: Vec<_> = origins
-            .iter()
-            .filter_map(|o| o.parse().ok())
-            .collect();
+        let allowed: Vec<_> = origins.iter().filter_map(|o| o.parse().ok()).collect();
         CorsLayer::new()
             .allow_origin(allowed)
             .allow_methods(Any)
@@ -71,8 +66,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/{tenant_id}", get(routes::tenant::get));
 
     // Member routes (under tenant)
-    let member_routes = Router::new()
-        .route("/", get(routes::user::list_members).post(routes::invite::add_member));
+    let member_routes = Router::new().route(
+        "/",
+        get(routes::user::list_members).post(routes::invite::add_member),
+    );
 
     // Room routes (under tenant) — replaces channel + conference
     let room_routes = Router::new()
@@ -90,7 +87,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/{room_id}/call/join", post(routes::room::call_join))
         .route("/{room_id}/call/leave", post(routes::room::call_leave))
         .route("/{room_id}/call/end", post(routes::room::call_end))
-        .route("/{room_id}/call/participant", get(routes::room::participants))
+        .route(
+            "/{room_id}/call/participant",
+            get(routes::room::participants),
+        )
         .route(
             "/{room_id}/call/message",
             get(routes::room::call_messages).post(routes::room::create_call_message),
@@ -142,7 +142,10 @@ pub fn build_router(state: AppState) -> Router {
     let task_routes = Router::new()
         .route("/", get(routes::background_task::list))
         .route("/{task_id}", get(routes::background_task::get))
-        .route("/{task_id}/download", get(routes::background_task::download));
+        .route(
+            "/{task_id}/download",
+            get(routes::background_task::download),
+        );
 
     // Export routes (under tenant)
     let export_routes = Router::new()
@@ -164,7 +167,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/{role_id}", put(routes::role::update))
         .route("/{role_id}", delete(routes::role::delete))
         .route("/{role_id}/assign/{user_id}", post(routes::role::assign))
-        .route("/{role_id}/assign/{user_id}", delete(routes::role::unassign));
+        .route(
+            "/{role_id}/assign/{user_id}",
+            delete(routes::role::unassign),
+        );
 
     // Tenant-scoped invite routes
     let tenant_invite_routes = Router::new()
@@ -201,7 +207,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/", get(routes::notification::list))
         .route("/unread", get(routes::notification::unread))
         .route("/unread-count", get(routes::notification::unread_count))
-        .route("/{notification_id}/read", put(routes::notification::mark_read))
+        .route(
+            "/{notification_id}/read",
+            put(routes::notification::mark_read),
+        )
         .route("/read-all", post(routes::notification::mark_all_read));
 
     // User profile routes
@@ -210,8 +219,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/{user_id}", get(routes::user::get_profile));
 
     // Search routes (under tenant)
-    let search_routes = Router::new()
-        .route("/", get(routes::search::search));
+    let search_routes = Router::new().route("/", get(routes::search::search));
 
     // Remote-control agent routes (tenant-scoped)
     let agent_routes = Router::new()
@@ -240,15 +248,14 @@ pub fn build_router(state: AppState) -> Router {
         );
 
     // Public agent enrollment exchange (uses enrollment token, not user JWT)
-    let public_agent_routes = Router::new()
-        .route("/enroll", post(routes::remote_control::enroll_agent));
+    let public_agent_routes =
+        Router::new().route("/enroll", post(routes::remote_control::enroll_agent));
 
     // TURN credentials (user-scoped, no tenant prefix)
-    let turn_routes = Router::new()
-        .route(
-            "/credentials",
-            get(routes::remote_control::turn_credentials),
-        );
+    let turn_routes = Router::new().route(
+        "/credentials",
+        get(routes::remote_control::turn_credentials),
+    );
 
     // Compose API
     let api = Router::new()
@@ -268,18 +275,12 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/tenant/{tenant_id}/invite", tenant_invite_routes)
         .nest("/tenant/{tenant_id}/search", search_routes)
         .nest("/tenant/{tenant_id}/room", room_routes)
-        .nest(
-            "/tenant/{tenant_id}/room/{room_id}/message",
-            message_routes,
-        )
+        .nest("/tenant/{tenant_id}/room/{room_id}/message", message_routes)
         .nest(
             "/tenant/{tenant_id}/room/{room_id}/recording",
             recording_routes,
         )
-        .nest(
-            "/tenant/{tenant_id}/room/{room_id}/file",
-            room_file_routes,
-        )
+        .nest("/tenant/{tenant_id}/room/{room_id}/file", room_file_routes)
         .nest("/tenant/{tenant_id}/file", file_by_id_routes)
         .nest("/tenant/{tenant_id}/task", task_routes)
         .nest("/tenant/{tenant_id}/export", export_routes)
@@ -290,9 +291,7 @@ pub fn build_router(state: AppState) -> Router {
     let health = Router::new().route("/health", get(health_check));
 
     // Apply rate limiting only to API routes (not health/ws which need unrestricted access)
-    let rate_limited_api = Router::new()
-        .nest("/api", api)
-        .layer(governor_layer);
+    let rate_limited_api = Router::new().nest("/api", api).layer(governor_layer);
 
     Router::new()
         .merge(rate_limited_api)

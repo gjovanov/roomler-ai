@@ -3,7 +3,10 @@ use serde_json::Value;
 
 // ─── Helper ─────────────────────────────────────────────────────
 
-async fn setup_with_invite(app: &TestApp, slug: &str) -> (
+async fn setup_with_invite(
+    app: &TestApp,
+    slug: &str,
+) -> (
     /* admin */ crate::fixtures::seed::SeededUser,
     /* tenant_id */ String,
     /* invite_code */ String,
@@ -87,7 +90,14 @@ async fn test_accept_shareable_invite() {
 
     // Register a new user
     let new_user = app
-        .register_user("newuser@inv3.test", "inv3_new", "New User", "Pass123!", None, None)
+        .register_user(
+            "newuser@inv3.test",
+            "inv3_new",
+            "New User",
+            "Pass123!",
+            None,
+            None,
+        )
         .await;
 
     // Accept the invite
@@ -138,7 +148,14 @@ async fn test_accept_targeted_invite() {
 
     // Register the target user
     let target = app
-        .register_user("target@inv4.test", "inv4_target", "Target User", "Pass123!", None, None)
+        .register_user(
+            "target@inv4.test",
+            "inv4_target",
+            "Target User",
+            "Pass123!",
+            None,
+            None,
+        )
         .await;
 
     // Accept
@@ -188,7 +205,14 @@ async fn test_accept_invite_with_custom_role() {
 
     // Register and accept
     let new_user = app
-        .register_user("admin2@inv5.test", "inv5_admin2", "Admin 2", "Pass123!", None, None)
+        .register_user(
+            "admin2@inv5.test",
+            "inv5_admin2",
+            "Admin 2",
+            "Pass123!",
+            None,
+            None,
+        )
         .await;
 
     let resp = app
@@ -315,10 +339,7 @@ async fn test_get_invite_info_authenticated() {
 
     // Authenticated request (admin IS a member)
     let resp = app
-        .auth_get(
-            &format!("/api/invite/{}", code),
-            &admin.access_token,
-        )
+        .auth_get(&format!("/api/invite/{}", code), &admin.access_token)
         .send()
         .await
         .unwrap();
@@ -335,7 +356,14 @@ async fn test_direct_add_member() {
 
     // Register a user NOT in the tenant
     let outsider = app
-        .register_user("outsider@inv10.test", "inv10_out", "Outsider", "Pass123!", None, None)
+        .register_user(
+            "outsider@inv10.test",
+            "inv10_out",
+            "Outsider",
+            "Pass123!",
+            None,
+            None,
+        )
         .await;
 
     // Admin directly adds them
@@ -388,7 +416,14 @@ async fn test_accept_expired_invite() {
     let code = invite["code"].as_str().unwrap();
 
     let new_user = app
-        .register_user("exp@inv11.test", "inv11_exp", "Expired User", "Pass123!", None, None)
+        .register_user(
+            "exp@inv11.test",
+            "inv11_exp",
+            "Expired User",
+            "Pass123!",
+            None,
+            None,
+        )
         .await;
 
     // Small delay to ensure expiry
@@ -432,7 +467,14 @@ async fn test_accept_revoked_invite() {
 
     // Try to accept
     let new_user = app
-        .register_user("rev@inv12.test", "inv12_rev", "Rev User", "Pass123!", None, None)
+        .register_user(
+            "rev@inv12.test",
+            "inv12_rev",
+            "Rev User",
+            "Pass123!",
+            None,
+            None,
+        )
         .await;
 
     let resp = app
@@ -466,13 +508,17 @@ async fn test_accept_exhausted_invite() {
 
     // First user accepts
     let user1 = app
-        .register_user("u1@inv13.test", "inv13_u1", "User 1", "Pass123!", None, None)
+        .register_user(
+            "u1@inv13.test",
+            "inv13_u1",
+            "User 1",
+            "Pass123!",
+            None,
+            None,
+        )
         .await;
     let resp = app
-        .auth_post(
-            &format!("/api/invite/{}/accept", code),
-            &user1.access_token,
-        )
+        .auth_post(&format!("/api/invite/{}/accept", code), &user1.access_token)
         .send()
         .await
         .unwrap();
@@ -480,13 +526,17 @@ async fn test_accept_exhausted_invite() {
 
     // Second user tries to accept → exhausted
     let user2 = app
-        .register_user("u2@inv13.test", "inv13_u2", "User 2", "Pass123!", None, None)
+        .register_user(
+            "u2@inv13.test",
+            "inv13_u2",
+            "User 2",
+            "Pass123!",
+            None,
+            None,
+        )
         .await;
     let resp = app
-        .auth_post(
-            &format!("/api/invite/{}/accept", code),
-            &user2.access_token,
-        )
+        .auth_post(&format!("/api/invite/{}/accept", code), &user2.access_token)
         .send()
         .await
         .unwrap();
@@ -500,10 +550,7 @@ async fn test_accept_already_member() {
 
     // Admin is already a member, try to accept
     let resp = app
-        .auth_post(
-            &format!("/api/invite/{}/accept", code),
-            &admin.access_token,
-        )
+        .auth_post(&format!("/api/invite/{}/accept", code), &admin.access_token)
         .send()
         .await
         .unwrap();
@@ -532,7 +579,14 @@ async fn test_accept_wrong_target() {
 
     // Wrong email user tries to accept
     let wrong_user = app
-        .register_user("wrong@inv15.test", "inv15_wrong", "Wrong User", "Pass123!", None, None)
+        .register_user(
+            "wrong@inv15.test",
+            "inv15_wrong",
+            "Wrong User",
+            "Pass123!",
+            None,
+            None,
+        )
         .await;
 
     let resp = app
@@ -566,10 +620,24 @@ async fn test_concurrent_accept() {
 
     // Register two users
     let user1 = app
-        .register_user("c1@inv16.test", "inv16_c1", "Concurrent 1", "Pass123!", None, None)
+        .register_user(
+            "c1@inv16.test",
+            "inv16_c1",
+            "Concurrent 1",
+            "Pass123!",
+            None,
+            None,
+        )
         .await;
     let user2 = app
-        .register_user("c2@inv16.test", "inv16_c2", "Concurrent 2", "Pass123!", None, None)
+        .register_user(
+            "c2@inv16.test",
+            "inv16_c2",
+            "Concurrent 2",
+            "Pass123!",
+            None,
+            None,
+        )
         .await;
 
     // Try to accept concurrently
@@ -585,7 +653,11 @@ async fn test_concurrent_accept() {
 
     // Exactly one should succeed (200) and one should fail (400 or 409)
     let successes = [s1, s2].iter().filter(|&&s| s == 200).count();
-    assert_eq!(successes, 1, "Exactly one concurrent accept should succeed, got: {} and {}", s1, s2);
+    assert_eq!(
+        successes, 1,
+        "Exactly one concurrent accept should succeed, got: {} and {}",
+        s1, s2
+    );
 }
 
 // ─── Permission Tests ───────────────────────────────────────────
@@ -627,7 +699,14 @@ async fn test_revoke_invite_no_permission() {
 
     // Register a regular user (no invite permission)
     let regular = app
-        .register_user("regular@inv18.test", "inv18_reg", "Regular", "Pass123!", None, None)
+        .register_user(
+            "regular@inv18.test",
+            "inv18_reg",
+            "Regular",
+            "Pass123!",
+            None,
+            None,
+        )
         .await;
 
     // Try to revoke (should fail — not even a member of the tenant)

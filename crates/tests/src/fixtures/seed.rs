@@ -256,11 +256,17 @@ impl TestApp {
             assert!(
                 status.is_success(),
                 "Create room '{}' failed (status {}): {}",
-                name, status, body
+                name,
+                status,
+                body
             );
 
-            let json: Value = serde_json::from_str(&body)
-                .unwrap_or_else(|e| panic!("Failed to parse room response for '{}': {} body='{}'", name, e, body));
+            let json: Value = serde_json::from_str(&body).unwrap_or_else(|e| {
+                panic!(
+                    "Failed to parse room response for '{}': {} body='{}'",
+                    name, e, body
+                )
+            });
             rooms.push(SeededRoom {
                 id: json["id"].as_str().unwrap().to_string(),
                 name: name.to_string(),

@@ -11,10 +11,7 @@ async fn create_room_and_start_call(
     name: &str,
 ) -> String {
     let resp = app
-        .auth_post(
-            &format!("/api/tenant/{}/room", tenant_id),
-            token,
-        )
+        .auth_post(&format!("/api/tenant/{}/room", tenant_id), token)
         .json(&serde_json::json!({ "name": name }))
         .send()
         .await
@@ -48,10 +45,7 @@ async fn create_and_list_room_messages() {
 
     // Admin joins room
     app.auth_post(
-        &format!(
-            "/api/tenant/{}/room/{}/join",
-            tenant.tenant_id, room_id
-        ),
+        &format!("/api/tenant/{}/room/{}/join", tenant.tenant_id, room_id),
         &tenant.admin.access_token,
     )
     .send()
@@ -62,10 +56,7 @@ async fn create_and_list_room_messages() {
     for i in 1..=3 {
         let resp = app
             .auth_post(
-                &format!(
-                    "/api/tenant/{}/room/{}/message",
-                    tenant.tenant_id, room_id
-                ),
+                &format!("/api/tenant/{}/room/{}/message", tenant.tenant_id, room_id),
                 &tenant.admin.access_token,
             )
             .json(&serde_json::json!({
@@ -75,7 +66,12 @@ async fn create_and_list_room_messages() {
             .await
             .unwrap();
 
-        assert_eq!(resp.status().as_u16(), 200, "Failed to create message {}", i);
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "Failed to create message {}",
+            i
+        );
         let json: Value = resp.json().await.unwrap();
         assert_eq!(json["content"], format!("Chat message {}", i));
         assert!(json["id"].is_string());
@@ -86,10 +82,7 @@ async fn create_and_list_room_messages() {
     // List messages
     let resp = app
         .auth_get(
-            &format!(
-                "/api/tenant/{}/room/{}/message",
-                tenant.tenant_id, room_id
-            ),
+            &format!("/api/tenant/{}/room/{}/message", tenant.tenant_id, room_id),
             &tenant.admin.access_token,
         )
         .send()
@@ -134,10 +127,7 @@ async fn non_participant_cannot_send_message() {
     // Member (not a call participant) tries to send a message
     let resp = app
         .auth_post(
-            &format!(
-                "/api/tenant/{}/room/{}/message",
-                tenant.tenant_id, room_id
-            ),
+            &format!("/api/tenant/{}/room/{}/message", tenant.tenant_id, room_id),
             &tenant.member.access_token,
         )
         .json(&serde_json::json!({
@@ -165,10 +155,7 @@ async fn room_message_ws_broadcast() {
 
     // Both users join the room
     app.auth_post(
-        &format!(
-            "/api/tenant/{}/room/{}/join",
-            tenant.tenant_id, room_id
-        ),
+        &format!("/api/tenant/{}/room/{}/join", tenant.tenant_id, room_id),
         &tenant.admin.access_token,
     )
     .send()
@@ -176,10 +163,7 @@ async fn room_message_ws_broadcast() {
     .unwrap();
 
     app.auth_post(
-        &format!(
-            "/api/tenant/{}/room/{}/join",
-            tenant.tenant_id, room_id
-        ),
+        &format!("/api/tenant/{}/room/{}/join", tenant.tenant_id, room_id),
         &tenant.member.access_token,
     )
     .send()
@@ -187,10 +171,7 @@ async fn room_message_ws_broadcast() {
     .unwrap();
 
     // Member connects WS
-    let ws_url = format!(
-        "ws://{}/ws?token={}",
-        app.addr, tenant.member.access_token
-    );
+    let ws_url = format!("ws://{}/ws?token={}", app.addr, tenant.member.access_token);
     let (mut ws_member, _) = tokio_tungstenite::connect_async(&ws_url)
         .await
         .expect("WS connect failed");
@@ -201,10 +182,7 @@ async fn room_message_ws_broadcast() {
     // Admin sends a message via REST
     let resp = app
         .auth_post(
-            &format!(
-                "/api/tenant/{}/room/{}/message",
-                tenant.tenant_id, room_id
-            ),
+            &format!("/api/tenant/{}/room/{}/message", tenant.tenant_id, room_id),
             &tenant.admin.access_token,
         )
         .json(&serde_json::json!({
@@ -228,10 +206,7 @@ async fn room_message_ws_broadcast() {
     assert_eq!(parsed["data"]["room_id"], room_id);
 
     // Admin connects WS to verify sender exclusion
-    let ws_url_admin = format!(
-        "ws://{}/ws?token={}",
-        app.addr, tenant.admin.access_token
-    );
+    let ws_url_admin = format!("ws://{}/ws?token={}", app.addr, tenant.admin.access_token);
     let (mut ws_admin, _) = tokio_tungstenite::connect_async(&ws_url_admin)
         .await
         .expect("WS connect failed");
@@ -239,10 +214,7 @@ async fn room_message_ws_broadcast() {
 
     // Admin sends another message
     app.auth_post(
-        &format!(
-            "/api/tenant/{}/room/{}/message",
-            tenant.tenant_id, room_id
-        ),
+        &format!("/api/tenant/{}/room/{}/message", tenant.tenant_id, room_id),
         &tenant.admin.access_token,
     )
     .json(&serde_json::json!({
@@ -299,10 +271,7 @@ async fn cannot_chat_in_ended_call() {
 
     // End the call
     app.auth_post(
-        &format!(
-            "/api/tenant/{}/room/{}/call/end",
-            tenant.tenant_id, room_id
-        ),
+        &format!("/api/tenant/{}/room/{}/call/end", tenant.tenant_id, room_id),
         &tenant.admin.access_token,
     )
     .send()
@@ -312,10 +281,7 @@ async fn cannot_chat_in_ended_call() {
     // Try to send a message — should fail
     let resp = app
         .auth_post(
-            &format!(
-                "/api/tenant/{}/room/{}/message",
-                tenant.tenant_id, room_id
-            ),
+            &format!("/api/tenant/{}/room/{}/message", tenant.tenant_id, room_id),
             &tenant.admin.access_token,
         )
         .json(&serde_json::json!({
