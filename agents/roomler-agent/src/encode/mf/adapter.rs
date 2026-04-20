@@ -97,6 +97,15 @@ pub(super) struct AdapterInfo {
     pub(super) device_id: u32,
     pub(super) priority: VendorPriority,
     pub(super) adapter: IDXGIAdapter1,
+    /// DXGI adapter locally-unique ID. Packed into a u64 and set as
+    /// `MFT_ENUM_ADAPTER_LUID` on each candidate `IMFActivate` before
+    /// `ActivateObject` so the MF runtime can bind the resulting
+    /// transform to this adapter. Works around the RTX 5090 Blackwell
+    /// regression where NVENC `ActivateObject` otherwise returns
+    /// 0x8000FFFF even after `SET_D3D_MANAGER` on the right D3D11
+    /// device — the LUID hint is consulted earlier in the activation
+    /// path than `SET_D3D_MANAGER`.
+    pub(super) luid: u64,
 }
 
 /// Enumerate physical DXGI adapters, skipping software / WARP / Basic
@@ -142,12 +151,20 @@ pub(super) fn enumerate_adapters() -> Result<Vec<AdapterInfo>> {
                     };
 
                     let priority = priority_rank(desc.VendorId);
+                    // Pack AdapterLuid {LowPart: u32, HighPart: i32}
+                    // into a u64 for `IMFAttributes::SetUINT64`. The
+                    // MF runtime treats this as an opaque 8-byte
+                    // identifier; the convention is high-order = HighPart.
+                    let luid =
+                        ((desc.AdapterLuid.HighPart as u32 as u64) << 32)
+                            | desc.AdapterLuid.LowPart as u64;
                     out.push(AdapterInfo {
                         description,
                         vendor_id: desc.VendorId,
                         device_id: desc.DeviceId,
                         priority,
                         adapter,
+                        luid,
                     });
                     index += 1;
                 }
