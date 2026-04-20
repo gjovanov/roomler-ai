@@ -140,3 +140,9 @@ openh264 = { version = "0.9", default-features = false, features = ["source"] }
 # pure-Rust (no libxcb system dep) so we can ship the agent binary from
 # any host without X11 dev packages installed.
 enigo = "0.6"
+
+# Cross-platform text clipboard (Win32 OpenClipboard / XClipboard /
+# NSPasteboard). Used by the clipboard data-channel handler on the
+# agent side. No system deps required on Windows/macOS; Linux pulls
+# `x11rb` which we already have from `enigo`.
+arboard = { version = "3", default-features = false }

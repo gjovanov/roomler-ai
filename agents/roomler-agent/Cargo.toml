@@ -71,6 +71,13 @@ openh264-sys2 = { version = "0.9", optional = true, default-features = false }
 # Cross-platform input injection (mouse / keyboard).
 enigo = { workspace = true, optional = true }
 
+# Cross-platform text clipboard (Win32 / X11 / macOS). Feature-gated
+# behind `clipboard` so builds without the clipboard DC handler
+# (signalling-only CI images, future trimmed-down deployments) don't
+# pay for the dep. Pulls x11rb on Linux which we already have from
+# enigo so the transitive dep graph stays small.
+arboard = { workspace = true, optional = true }
+
 # Used by the media pump to wrap encoded NALUs in webrtc Sample.data.
 bytes = "1"
 
@@ -140,6 +147,11 @@ mf-encoder = ["dep:windows"]
 wgc-capture = ["dep:windows"]
 # Enables the enigo-based input injection backend.
 enigo-input = ["dep:enigo"]
+# Enables the clipboard data-channel handler — round-trip text
+# between browser and agent via the `clipboard` DC. Cross-platform
+# via arboard (Win32 / XClipboard / NSPasteboard). No system deps
+# on Windows; Linux pulls x11rb which we already use for enigo.
+clipboard = ["dep:arboard"]
 # Convenience: full media pipeline (capture + software encode).
 media = ["scrap-capture", "openh264-encoder"]
 # Full media pipeline including the MF hardware encoder. Production
@@ -147,7 +159,7 @@ media = ["scrap-capture", "openh264-encoder"]
 # MF when available and fall back to openh264 when not.
 media-hw = ["media", "mf-encoder"]
 # Everything needed for a full remote-control session, software only.
-full = ["media", "enigo-input"]
+full = ["media", "enigo-input", "clipboard"]
 # Everything needed including the MF hardware encoder. Production
 # Windows MSI builds with this.
 full-hw = ["full", "mf-encoder", "wgc-capture"]

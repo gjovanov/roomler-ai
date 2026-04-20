@@ -3,6 +3,8 @@
 //! tests drive the agent in-process against a `TestApp` server.
 
 pub mod capture;
+#[cfg(feature = "clipboard")]
+pub mod clipboard;
 pub mod config;
 pub mod displays;
 pub mod encode;

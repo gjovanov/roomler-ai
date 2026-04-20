@@ -107,7 +107,7 @@ fn compute_caps() -> AgentCaps {
         hw_encoders,
         codecs,
         has_input_permission: cfg!(feature = "enigo-input"),
-        supports_clipboard: false,
+        supports_clipboard: cfg!(feature = "clipboard"),
         supports_file_transfer: false,
         max_simultaneous_sessions: 1,
     }
