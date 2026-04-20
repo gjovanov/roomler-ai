@@ -46,8 +46,8 @@ use tokio::sync::Notify;
 
 use windows::Foundation::TypedEventHandler;
 use windows::Graphics::Capture::{Direct3D11CaptureFramePool, GraphicsCaptureItem};
-use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
+use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Graphics::SizeInt32;
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_11_0,
@@ -55,13 +55,13 @@ use windows::Win32::Graphics::Direct3D::{
 };
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_FLAG, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-    D3D11_CREATE_DEVICE_FLAG, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION,
+    D3D11_CREATE_DEVICE_FLAG, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION,
     D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, D3D11CreateDevice, ID3D11Device,
     ID3D11DeviceContext, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
-use windows::Win32::Graphics::Gdi::{HMONITOR, MonitorFromPoint, MONITOR_DEFAULTTOPRIMARY};
+use windows::Win32::Graphics::Gdi::{HMONITOR, MONITOR_DEFAULTTOPRIMARY, MonitorFromPoint};
 use windows::Win32::System::WinRT::Direct3D11::{
     CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
 };
@@ -142,7 +142,9 @@ impl WgcCapture {
             )
         };
         if hmon.is_invalid() {
-            return Err(anyhow!("MonitorFromPoint returned NULL — no primary display?"));
+            return Err(anyhow!(
+                "MonitorFromPoint returned NULL — no primary display?"
+            ));
         }
         Self::for_monitor(hmon, 0, target_fps, downscale)
     }
@@ -177,9 +179,12 @@ impl WgcCapture {
             .name("roomler-agent-wgc-capture".into())
             .spawn(move || {
                 let hmon = HMONITOR(hmon_value as *mut _);
-                if let Err(e) =
-                    worker_main(hmon, shared_for_worker, shutdown_for_worker, ready_tx.clone())
-                {
+                if let Err(e) = worker_main(
+                    hmon,
+                    shared_for_worker,
+                    shutdown_for_worker,
+                    ready_tx.clone(),
+                ) {
                     tracing::error!(%e, "wgc worker init failed");
                     let _ = ready_tx.send(Err(e));
                 }
@@ -396,8 +401,8 @@ fn worker_main(
     let handler_shared = shared.clone();
     let handler_staging = staging_slot.clone();
 
-    let handler = TypedEventHandler::<Direct3D11CaptureFramePool, IInspectable>::new(
-        move |sender, _args| {
+    let handler =
+        TypedEventHandler::<Direct3D11CaptureFramePool, IInspectable>::new(move |sender, _args| {
             let Some(pool) = sender.as_ref() else {
                 return Ok(());
             };
@@ -460,8 +465,7 @@ fn worker_main(
             }
             handler_shared.notify.notify_waiters();
             Ok(())
-        },
-    );
+        });
     let _token = pool.FrameArrived(&handler)?;
 
     session.StartCapture()?;
@@ -650,12 +654,7 @@ fn collect_dirty_rects(
             let rw = rw.min(w.saturating_sub(x));
             let rh = rh.min(h.saturating_sub(y));
             if rw > 0 && rh > 0 {
-                out.push(DirtyRect {
-                    x,
-                    y,
-                    w: rw,
-                    h: rh,
-                });
+                out.push(DirtyRect { x, y, w: rw, h: rh });
             }
         }
     }

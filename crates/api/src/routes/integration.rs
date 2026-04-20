@@ -1,4 +1,7 @@
-use axum::{Json, extract::{Path, State}};
+use axum::{
+    Json,
+    extract::{Path, State},
+};
 use bson::oid::ObjectId;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -67,9 +70,7 @@ pub async fn recognize_file(
             .await
             .map_err(|e| format!("{}", e))?;
 
-        let result = recognition
-            .recognize(&file_bytes, &content_type)
-            .await?;
+        let result = recognition.recognize(&file_bytes, &content_type).await?;
 
         task_store
             .update_progress(task_id, 80, Some("Updating file record".to_string()))
@@ -185,7 +186,8 @@ pub async fn export_conversation_pdf(
             .await
             .map_err(|e| format!("{}", e))?;
 
-        let bytes = roomler_ai_services::export::pdf::export_conversation(&result.items, &user_map)?;
+        let bytes =
+            roomler_ai_services::export::pdf::export_conversation(&result.items, &user_map)?;
 
         let export_dir = std::env::var("ROOMLER_UPLOAD_DIR")
             .unwrap_or_else(|_| "/tmp/roomler-ai-uploads".to_string());

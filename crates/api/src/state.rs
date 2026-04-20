@@ -5,12 +5,10 @@ use roomler_ai_services::{
     AuthService, EmailService, GiphyService, OAuthService, PushService, RecognitionService,
     TaskService,
     dao::{
-        activation_code::ActivationCodeDao,
-        agent::AgentDao,
-        file::FileDao, invite::InviteDao, message::MessageDao, notification::NotificationDao,
-        push_subscription::PushSubscriptionDao, reaction::ReactionDao, recording::RecordingDao,
-        remote_audit::RemoteAuditDao, remote_session::RemoteSessionDao,
-        role::RoleDao, room::RoomDao, tenant::TenantDao,
+        activation_code::ActivationCodeDao, agent::AgentDao, file::FileDao, invite::InviteDao,
+        message::MessageDao, notification::NotificationDao, push_subscription::PushSubscriptionDao,
+        reaction::ReactionDao, recording::RecordingDao, remote_audit::RemoteAuditDao,
+        remote_session::RemoteSessionDao, role::RoleDao, room::RoomDao, tenant::TenantDao,
         user::UserDao,
     },
     media::{room_manager::RoomManager, worker_pool::WorkerPool},
@@ -105,8 +103,10 @@ impl AppState {
 
         let push_subscriptions = Arc::new(PushSubscriptionDao::new(&db));
         let push = if !settings.push.vapid_private_key.is_empty() {
-            match PushService::new(&settings.push.vapid_private_key, settings.push.contact.clone())
-            {
+            match PushService::new(
+                &settings.push.vapid_private_key,
+                settings.push.contact.clone(),
+            ) {
                 Ok(svc) => Some(Arc::new(svc)),
                 Err(e) => {
                     tracing::warn!("Failed to initialize push service: {}", e);
@@ -120,15 +120,16 @@ impl AppState {
         let redis_pubsub = match RedisPubSub::new(&settings.redis.url).await {
             Ok(ps) => Some(Arc::new(ps)),
             Err(e) => {
-                tracing::warn!("Failed to initialize Redis Pub/Sub: {} — cross-instance WS delivery disabled", e);
+                tracing::warn!(
+                    "Failed to initialize Redis Pub/Sub: {} — cross-instance WS delivery disabled",
+                    e
+                );
                 None
             }
         };
 
         let giphy = if !settings.giphy.api_key.is_empty() {
-            Some(Arc::new(GiphyService::new(
-                settings.giphy.api_key.clone(),
-            )))
+            Some(Arc::new(GiphyService::new(settings.giphy.api_key.clone())))
         } else {
             None
         };
@@ -188,7 +189,9 @@ fn build_turn_config(turn: &roomler_ai_config::TurnSettings) -> Option<TurnConfi
     let mut urls = vec![base.to_string()];
     if base.starts_with("turn:") && !base.contains("?transport=") {
         urls.push(format!("{}?transport=tcp", base));
-        let turns = base.replacen("turn:", "turns:", 1).replace(":3478", ":5349");
+        let turns = base
+            .replacen("turn:", "turns:", 1)
+            .replace(":3478", ":5349");
         urls.push(format!("{}?transport=tcp", turns));
     }
 

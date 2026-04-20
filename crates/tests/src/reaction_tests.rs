@@ -9,10 +9,7 @@ async fn setup_with_message() -> (TestApp, crate::fixtures::seed::SeededTenant, 
 
     // Admin joins room
     app.auth_post(
-        &format!(
-            "/api/tenant/{}/room/{}/join",
-            tenant.tenant_id, room_id
-        ),
+        &format!("/api/tenant/{}/room/{}/join", tenant.tenant_id, room_id),
         &tenant.admin.access_token,
     )
     .send()
@@ -22,10 +19,7 @@ async fn setup_with_message() -> (TestApp, crate::fixtures::seed::SeededTenant, 
     // Create a message
     let resp = app
         .auth_post(
-            &format!(
-                "/api/tenant/{}/room/{}/message",
-                tenant.tenant_id, room_id
-            ),
+            &format!("/api/tenant/{}/room/{}/message", tenant.tenant_id, room_id),
             &tenant.admin.access_token,
         )
         .json(&serde_json::json!({
@@ -65,10 +59,7 @@ async fn add_reaction_to_message() {
     // Verify reaction summary on the message
     let resp = app
         .auth_get(
-            &format!(
-                "/api/tenant/{}/room/{}/message",
-                tenant.tenant_id, room_id
-            ),
+            &format!("/api/tenant/{}/room/{}/message", tenant.tenant_id, room_id),
             &tenant.admin.access_token,
         )
         .send()
@@ -155,10 +146,7 @@ async fn remove_reaction_from_message() {
     // Verify reaction is gone from message
     let resp = app
         .auth_get(
-            &format!(
-                "/api/tenant/{}/room/{}/message",
-                tenant.tenant_id, room_id
-            ),
+            &format!("/api/tenant/{}/room/{}/message", tenant.tenant_id, room_id),
             &tenant.admin.access_token,
         )
         .send()
@@ -178,10 +166,7 @@ async fn multiple_users_react_to_same_message() {
 
     // Member joins room
     app.auth_post(
-        &format!(
-            "/api/tenant/{}/room/{}/join",
-            tenant.tenant_id, room_id
-        ),
+        &format!("/api/tenant/{}/room/{}/join", tenant.tenant_id, room_id),
         &tenant.member.access_token,
     )
     .send()
@@ -230,10 +215,7 @@ async fn multiple_users_react_to_same_message() {
     // Check summary: thumbs_up=2, heart=1
     let resp = app
         .auth_get(
-            &format!(
-                "/api/tenant/{}/room/{}/message",
-                tenant.tenant_id, room_id
-            ),
+            &format!("/api/tenant/{}/room/{}/message", tenant.tenant_id, room_id),
             &tenant.admin.access_token,
         )
         .send()
@@ -333,10 +315,7 @@ async fn thread_replies_are_returned() {
     for i in 1..=3 {
         let resp = app
             .auth_post(
-                &format!(
-                    "/api/tenant/{}/room/{}/message",
-                    tenant.tenant_id, room_id
-                ),
+                &format!("/api/tenant/{}/room/{}/message", tenant.tenant_id, room_id),
                 &tenant.admin.access_token,
             )
             .json(&serde_json::json!({

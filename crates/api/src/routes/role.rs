@@ -1,4 +1,7 @@
-use axum::{Json, extract::{Path, State}};
+use axum::{
+    Json,
+    extract::{Path, State},
+};
 use bson::oid::ObjectId;
 use serde::{Deserialize, Serialize};
 
@@ -101,7 +104,15 @@ pub async fn update(
 
     state
         .roles
-        .update(rid, tid, body.name, body.description, body.color, body.permissions, body.position)
+        .update(
+            rid,
+            tid,
+            body.name,
+            body.description,
+            body.color,
+            body.permissions,
+            body.position,
+        )
         .await?;
 
     Ok(Json(serde_json::json!({ "updated": true })))

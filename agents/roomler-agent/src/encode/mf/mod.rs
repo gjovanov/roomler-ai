@@ -67,11 +67,9 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11Multithread,
 };
 use windows::Win32::Media::MediaFoundation::{
-    IMFDXGIDeviceManager, MFCreateDXGIDeviceManager, MFShutdown, MFStartup, MFSTARTUP_FULL,
+    IMFDXGIDeviceManager, MFCreateDXGIDeviceManager, MFSTARTUP_FULL, MFShutdown, MFStartup,
 };
-use windows::Win32::System::Com::{
-    COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize,
-};
+use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
 use windows::core::Interface;
 
 use super::{EncodedPacket, VideoEncoder};
@@ -175,8 +173,7 @@ impl MfEncoder {
                 //    happy with it and we never touch UI.
                 let coinit = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
                 if coinit.is_err() {
-                    let _ = ready_tx
-                        .send(Err(anyhow!("CoInitializeEx failed: {:?}", coinit)));
+                    let _ = ready_tx.send(Err(anyhow!("CoInitializeEx failed: {:?}", coinit)));
                     return;
                 }
 
@@ -188,17 +185,16 @@ impl MfEncoder {
                 }
 
                 // 3. Run the codec-parametric cascade.
-                let pipeline = match activate::activate_and_probe_pipeline_for_codec(
-                    codec, width, height,
-                ) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        unsafe { MFShutdown().ok() };
-                        unsafe { CoUninitialize() };
-                        let _ = ready_tx.send(Err(e));
-                        return;
-                    }
-                };
+                let pipeline =
+                    match activate::activate_and_probe_pipeline_for_codec(codec, width, height) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            unsafe { MFShutdown().ok() };
+                            unsafe { CoUninitialize() };
+                            let _ = ready_tx.send(Err(e));
+                            return;
+                        }
+                    };
 
                 let _ = ready_tx.send(Ok(()));
                 run_worker(pipeline, cmd_rx);
@@ -208,7 +204,9 @@ impl MfEncoder {
             })
             .map_err(|e| anyhow!("spawning mf worker: {e}"))?;
 
-        ready_rx.recv().map_err(|e| anyhow!("mf worker ack: {e}"))??;
+        ready_rx
+            .recv()
+            .map_err(|e| anyhow!("mf worker ack: {e}"))??;
 
         Ok(Self {
             cmd_tx,
@@ -338,9 +336,9 @@ pub(super) fn create_d3d11_device_and_manager() -> Result<(ID3D11Device, IMFDXGI
         // worker threads that call methods on the D3D device
         // concurrently with ours; without this MF will hit undefined
         // behaviour under contention.
-        let mt: ID3D11Multithread = device.cast().map_err(|e| {
-            anyhow!("ID3D11Multithread cast: {e:?}")
-        })?;
+        let mt: ID3D11Multithread = device
+            .cast()
+            .map_err(|e| anyhow!("ID3D11Multithread cast: {e:?}"))?;
         // Returns the previous protection state as BOOL; we don't care.
         let _ = mt.SetMultithreadProtected(true);
 

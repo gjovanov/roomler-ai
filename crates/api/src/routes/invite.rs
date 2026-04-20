@@ -12,10 +12,7 @@ use crate::{
     state::AppState,
 };
 use roomler_ai_db::models::role::permissions;
-use roomler_ai_services::dao::{
-    base::PaginationParams,
-    invite::CreateInviteParams,
-};
+use roomler_ai_services::dao::{base::PaginationParams, invite::CreateInviteParams};
 
 // ─── Response types ──────────────────────────────────────────────
 
@@ -113,7 +110,12 @@ pub async fn get_invite_info(
     let inviter = state.users.base.find_by_id(invite.inviter_id).await?;
 
     let already_member = if let Some(auth) = &optional_auth.0 {
-        Some(state.tenants.is_member(invite.tenant_id, auth.user_id).await?)
+        Some(
+            state
+                .tenants
+                .is_member(invite.tenant_id, auth.user_id)
+                .await?,
+        )
     } else {
         None
     };
@@ -155,8 +157,14 @@ pub async fn accept_invite(
     }
 
     // Check not already a member
-    if state.tenants.is_member(invite.tenant_id, auth.user_id).await? {
-        return Err(ApiError::Conflict("Already a member of this tenant".to_string()));
+    if state
+        .tenants
+        .is_member(invite.tenant_id, auth.user_id)
+        .await?
+    {
+        return Err(ApiError::Conflict(
+            "Already a member of this tenant".to_string(),
+        ));
     }
 
     // Determine roles to assign (default to "member" role if none specified)
@@ -173,7 +181,12 @@ pub async fn accept_invite(
     // Add the user to the tenant
     state
         .tenants
-        .add_member(invite.tenant_id, auth.user_id, role_ids, Some(invite.inviter_id))
+        .add_member(
+            invite.tenant_id,
+            auth.user_id,
+            role_ids,
+            Some(invite.inviter_id),
+        )
         .await?;
 
     // Atomically increment the use count
@@ -206,11 +219,7 @@ pub async fn list_invites(
 
     let result = state.invites.list_by_tenant(tid, &params).await?;
 
-    let items: Vec<InviteResponse> = result
-        .items
-        .into_iter()
-        .map(invite_to_response)
-        .collect();
+    let items: Vec<InviteResponse> = result.items.into_iter().map(invite_to_response).collect();
 
     Ok(Json(serde_json::json!({
         "items": items,
@@ -261,11 +270,7 @@ pub async fn create_invite(
         let inviter_name = inviter.map(|u| u.display_name).unwrap_or_default();
         let tenant = state.tenants.base.find_by_id(tid).await.ok();
         let tenant_name = tenant.map(|t| t.name).unwrap_or_default();
-        let invite_url = format!(
-            "{}/invite/{}",
-            state.settings.oauth.base_url,
-            invite.code,
-        );
+        let invite_url = format!("{}/invite/{}", state.settings.oauth.base_url, invite.code,);
         let email_svc = email_svc.clone();
         let email_addr = email_addr.clone();
         // Fire-and-forget — don't block the response on email delivery
@@ -296,17 +301,16 @@ pub async fn batch_create_invite(
         return Err(ApiError::BadRequest("No invites provided".to_string()));
     }
     if body.invites.len() > 50 {
-        return Err(ApiError::BadRequest("Maximum 50 invites per batch".to_string()));
+        return Err(ApiError::BadRequest(
+            "Maximum 50 invites per batch".to_string(),
+        ));
     }
 
     let mut results: Vec<BatchInviteResult> = Vec::with_capacity(body.invites.len());
 
     for item in body.invites {
-        let assign_role_ids: Result<Vec<ObjectId>, _> = item
-            .assign_role_ids
-            .iter()
-            .map(|s| parse_oid(s))
-            .collect();
+        let assign_role_ids: Result<Vec<ObjectId>, _> =
+            item.assign_role_ids.iter().map(|s| parse_oid(s)).collect();
 
         match assign_role_ids {
             Ok(role_ids) => {
@@ -448,7 +452,11 @@ fn invite_to_response(invite: roomler_ai_db::models::Invite) -> InviteResponse {
         max_uses: invite.max_uses,
         use_count: invite.use_count,
         status: format!("{:?}", invite.status).to_lowercase(),
-        assign_role_ids: invite.assign_role_ids.iter().map(|id| id.to_hex()).collect(),
+        assign_role_ids: invite
+            .assign_role_ids
+            .iter()
+            .map(|id| id.to_hex())
+            .collect(),
         expires_at: invite
             .expires_at
             .map(|d| d.try_to_rfc3339_string().unwrap_or_default()),

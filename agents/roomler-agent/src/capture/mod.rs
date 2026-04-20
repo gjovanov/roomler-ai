@@ -115,7 +115,9 @@ impl ScreenCapture for NoopCapture {
         tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
         Ok(None)
     }
-    fn monitor_count(&self) -> u8 { 0 }
+    fn monitor_count(&self) -> u8 {
+        0
+    }
 }
 
 /// Open the best-available capture backend for the current host. Falls
@@ -126,10 +128,7 @@ impl ScreenCapture for NoopCapture {
 /// high-resolution sources. Pass `DownscalePolicy::Never` when a
 /// hardware encoder is handling the frame; pass `Auto` (the default)
 /// when the encoder is software openh264.
-pub fn open_default(
-    _target_fps: u32,
-    _downscale: DownscalePolicy,
-) -> Box<dyn ScreenCapture> {
+pub fn open_default(_target_fps: u32, _downscale: DownscalePolicy) -> Box<dyn ScreenCapture> {
     // Windows: prefer WGC (captures HW cursors + supports dirty rects
     // on Win 11 22000+). Fall back to scrap (DXGI) if WGC init fails
     // — e.g. on Windows versions without the Graphics.Capture runtime
@@ -152,9 +151,7 @@ pub fn open_default(
                 }
             }
         } else {
-            tracing::info!(
-                "ROOMLER_AGENT_CAPTURE=scrap — skipping WGC, using DXGI via scrap"
-            );
+            tracing::info!("ROOMLER_AGENT_CAPTURE=scrap — skipping WGC, using DXGI via scrap");
         }
     }
     #[cfg(feature = "scrap-capture")]

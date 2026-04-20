@@ -138,9 +138,9 @@ async fn do_upload(
     let size = bytes.len() as u64;
 
     let upload_dir = upload_dir();
-    tokio::fs::create_dir_all(&upload_dir).await.map_err(|e| {
-        ApiError::Internal(format!("Failed to create upload dir: {}", e))
-    })?;
+    tokio::fs::create_dir_all(&upload_dir)
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to create upload dir: {}", e)))?;
 
     let storage_key = format!(
         "{}/room/{}/{}",
@@ -151,14 +151,14 @@ async fn do_upload(
     let file_path = upload_dir.join(&storage_key);
 
     if let Some(parent) = file_path.parent() {
-        tokio::fs::create_dir_all(parent).await.map_err(|e| {
-            ApiError::Internal(format!("Failed to create dirs: {}", e))
-        })?;
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| ApiError::Internal(format!("Failed to create dirs: {}", e)))?;
     }
 
-    tokio::fs::write(&file_path, &bytes).await.map_err(|e| {
-        ApiError::Internal(format!("Failed to write file: {}", e))
-    })?;
+    tokio::fs::write(&file_path, &bytes)
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to write file: {}", e)))?;
 
     let context = FileContext {
         context_type: FileContextType::Room,
@@ -215,17 +215,16 @@ pub async fn upload(
     let mut file_data: Option<(String, String, Vec<u8>)> = None;
     let mut room_id_str: Option<String> = None;
 
-    while let Some(field) = multipart.next_field().await.map_err(|e| {
-        ApiError::BadRequest(format!("Multipart error: {}", e))
-    })? {
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| ApiError::BadRequest(format!("Multipart error: {}", e)))?
+    {
         let name = field.name().unwrap_or("").to_string();
 
         match name.as_str() {
             "file" => {
-                let filename = field
-                    .file_name()
-                    .unwrap_or("unnamed")
-                    .to_string();
+                let filename = field.file_name().unwrap_or("unnamed").to_string();
                 let content_type = field
                     .content_type()
                     .unwrap_or("application/octet-stream")
@@ -247,10 +246,9 @@ pub async fn upload(
         }
     }
 
-    let data = file_data
-        .ok_or_else(|| ApiError::BadRequest("Missing 'file' field".to_string()))?;
-    let room_id_val = room_id_str
-        .ok_or_else(|| ApiError::BadRequest("Missing 'room_id' field".to_string()))?;
+    let data = file_data.ok_or_else(|| ApiError::BadRequest("Missing 'file' field".to_string()))?;
+    let room_id_val =
+        room_id_str.ok_or_else(|| ApiError::BadRequest("Missing 'room_id' field".to_string()))?;
     let rid = ObjectId::parse_str(&room_id_val)
         .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
@@ -294,12 +292,12 @@ pub async fn download(
     let file_path = upload_dir().join(&file.storage_key);
 
     let mut contents = Vec::new();
-    let mut f = tokio::fs::File::open(&file_path).await.map_err(|_| {
-        ApiError::NotFound("File not found on disk".to_string())
-    })?;
-    f.read_to_end(&mut contents).await.map_err(|e| {
-        ApiError::Internal(format!("Failed to read file: {}", e))
-    })?;
+    let mut f = tokio::fs::File::open(&file_path)
+        .await
+        .map_err(|_| ApiError::NotFound("File not found on disk".to_string()))?;
+    f.read_to_end(&mut contents)
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to read file: {}", e)))?;
 
     Ok(Response::builder()
         .header("Content-Type", &file.content_type)
@@ -347,16 +345,15 @@ pub async fn upload_room(
 
     let mut file_data: Option<(String, String, Vec<u8>)> = None;
 
-    while let Some(field) = multipart.next_field().await.map_err(|e| {
-        ApiError::BadRequest(format!("Multipart error: {}", e))
-    })? {
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| ApiError::BadRequest(format!("Multipart error: {}", e)))?
+    {
         let name = field.name().unwrap_or("").to_string();
 
         if name == "file" {
-            let filename = field
-                .file_name()
-                .unwrap_or("unnamed")
-                .to_string();
+            let filename = field.file_name().unwrap_or("unnamed").to_string();
             let content_type = field
                 .content_type()
                 .unwrap_or("application/octet-stream")
@@ -369,14 +366,14 @@ pub async fn upload_room(
         }
     }
 
-    let data = file_data
-        .ok_or_else(|| ApiError::BadRequest("Missing 'file' field".to_string()))?;
+    let data = file_data.ok_or_else(|| ApiError::BadRequest("Missing 'file' field".to_string()))?;
 
     let resp = do_upload(&state, tid, rid, auth.user_id, data).await?;
     Ok(Json(resp))
 }
 
 fn upload_dir() -> PathBuf {
-    let dir = std::env::var("ROOMLER_UPLOAD_DIR").unwrap_or_else(|_| "/tmp/roomler-ai-uploads".to_string());
+    let dir = std::env::var("ROOMLER_UPLOAD_DIR")
+        .unwrap_or_else(|_| "/tmp/roomler-ai-uploads".to_string());
     PathBuf::from(dir)
 }

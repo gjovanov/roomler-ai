@@ -18,9 +18,10 @@ pub async fn oauth_redirect(
     State(state): State<AppState>,
     Path(provider): Path<String>,
 ) -> Result<Response, ApiError> {
-    let oauth = state.oauth.as_ref().ok_or_else(|| {
-        ApiError::BadRequest("OAuth not configured".to_string())
-    })?;
+    let oauth = state
+        .oauth
+        .as_ref()
+        .ok_or_else(|| ApiError::BadRequest("OAuth not configured".to_string()))?;
 
     let csrf_state = Uuid::new_v4().to_string();
     // In production, store state in a short-lived cache (Redis) for validation.
@@ -38,9 +39,10 @@ pub async fn oauth_callback(
     Path(provider): Path<String>,
     Query(params): Query<CallbackQuery>,
 ) -> Result<Response, ApiError> {
-    let oauth = state.oauth.as_ref().ok_or_else(|| {
-        ApiError::BadRequest("OAuth not configured".to_string())
-    })?;
+    let oauth = state
+        .oauth
+        .as_ref()
+        .ok_or_else(|| ApiError::BadRequest("OAuth not configured".to_string()))?;
 
     // Exchange code and fetch user info
     let user_info = oauth
@@ -79,13 +81,12 @@ pub async fn oauth_callback(
         tokens.access_token, tokens.expires_in
     );
 
-    let frontend_url = state
-        .settings
-        .oauth
-        .base_url
-        .replace(":5001", ":5000"); // API → UI port
+    let frontend_url = state.settings.oauth.base_url.replace(":5001", ":5000"); // API → UI port
 
-    let redirect_url = format!("{}/oauth/callback?token={}", frontend_url, tokens.access_token);
+    let redirect_url = format!(
+        "{}/oauth/callback?token={}",
+        frontend_url, tokens.access_token
+    );
 
     let mut headers = HeaderMap::new();
     headers.insert(header::SET_COOKIE, cookie.parse().unwrap());

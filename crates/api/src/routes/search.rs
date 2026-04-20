@@ -1,4 +1,7 @@
-use axum::{extract::{Query, State, Path}, Json};
+use axum::{
+    Json,
+    extract::{Path, Query, State},
+};
 use bson::{doc, oid::ObjectId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -107,10 +110,7 @@ pub async fn search(
     let message_results: Vec<SearchMessageResult> = messages
         .into_iter()
         .map(|m| {
-            let room_name = room_name_map
-                .get(&m.room_id)
-                .cloned()
-                .unwrap_or_default();
+            let room_name = room_name_map.get(&m.room_id).cloned().unwrap_or_default();
             let author_name = author_names
                 .get(&m.author_id)
                 .cloned()
@@ -186,10 +186,7 @@ pub async fn search(
 }
 
 /// Fetch room names for a list of room IDs and return a map.
-async fn fetch_room_names(
-    state: &AppState,
-    room_ids: &[ObjectId],
-) -> HashMap<ObjectId, String> {
+async fn fetch_room_names(state: &AppState, room_ids: &[ObjectId]) -> HashMap<ObjectId, String> {
     use futures::TryStreamExt;
 
     let mut result = HashMap::new();

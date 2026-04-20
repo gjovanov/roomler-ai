@@ -101,7 +101,9 @@ impl Openh264Encoder {
             })
             .context("spawning encoder thread")?;
 
-        ready_rx.recv().context("encoder thread never signalled")??;
+        ready_rx
+            .recv()
+            .context("encoder thread never signalled")??;
         Ok(Self { cmd_tx })
     }
 }
@@ -144,12 +146,7 @@ fn apply_runtime_bitrate(enc: &mut Encoder, bps: u32) -> Result<()> {
     }
 }
 
-fn run_worker(
-    enc: &mut Encoder,
-    width: u32,
-    height: u32,
-    cmd_rx: std_mpsc::Receiver<Cmd>,
-) {
+fn run_worker(enc: &mut Encoder, width: u32, height: u32, cmd_rx: std_mpsc::Receiver<Cmd>) {
     while let Ok(cmd) = cmd_rx.recv() {
         match cmd {
             Cmd::Encode { frame, reply } => {
@@ -193,7 +190,12 @@ fn encode_one(
         ));
     }
 
-    let yuv = bgra_to_yuv_buffer(&frame.data, frame.width as usize, frame.height as usize, frame.stride as usize);
+    let yuv = bgra_to_yuv_buffer(
+        &frame.data,
+        frame.width as usize,
+        frame.height as usize,
+        frame.stride as usize,
+    );
     let bitstream = enc.encode(&yuv).map_err(|e| anyhow!("encode: {e}"))?;
 
     // Walk the layered bitstream and return one packet per NAL-unit
@@ -227,9 +229,14 @@ impl VideoEncoder for Openh264Encoder {
     async fn encode(&mut self, frame: std::sync::Arc<Frame>) -> Result<Vec<EncodedPacket>> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.cmd_tx
-            .send(Cmd::Encode { frame, reply: reply_tx })
+            .send(Cmd::Encode {
+                frame,
+                reply: reply_tx,
+            })
             .map_err(|_| anyhow!("encoder worker gone"))?;
-        reply_rx.await.map_err(|_| anyhow!("encoder reply dropped"))?
+        reply_rx
+            .await
+            .map_err(|_| anyhow!("encoder reply dropped"))?
     }
 
     fn request_keyframe(&mut self) {
@@ -288,9 +295,20 @@ fn bgra_to_yuv_buffer(bgra: &[u8], width: usize, height: usize, stride: usize) -
             let i2 = (row + 1) * stride + col * 4;
             let i3 = (row + 1) * stride + (col + 1) * 4;
 
-            let b_avg = ((bgra[i0] as i32 + bgra[i1] as i32 + bgra[i2] as i32 + bgra[i3] as i32) + 2) >> 2;
-            let g_avg = ((bgra[i0 + 1] as i32 + bgra[i1 + 1] as i32 + bgra[i2 + 1] as i32 + bgra[i3 + 1] as i32) + 2) >> 2;
-            let r_avg = ((bgra[i0 + 2] as i32 + bgra[i1 + 2] as i32 + bgra[i2 + 2] as i32 + bgra[i3 + 2] as i32) + 2) >> 2;
+            let b_avg =
+                ((bgra[i0] as i32 + bgra[i1] as i32 + bgra[i2] as i32 + bgra[i3] as i32) + 2) >> 2;
+            let g_avg = ((bgra[i0 + 1] as i32
+                + bgra[i1 + 1] as i32
+                + bgra[i2 + 1] as i32
+                + bgra[i3 + 1] as i32)
+                + 2)
+                >> 2;
+            let r_avg = ((bgra[i0 + 2] as i32
+                + bgra[i1 + 2] as i32
+                + bgra[i2 + 2] as i32
+                + bgra[i3 + 2] as i32)
+                + 2)
+                >> 2;
 
             let u_val = ((-38 * r_avg - 74 * g_avg + 112 * b_avg + 128) >> 8) + 128;
             let v_val = ((112 * r_avg - 94 * g_avg - 18 * b_avg + 128) >> 8) + 128;
@@ -358,9 +376,15 @@ mod tests {
     #[tokio::test]
     async fn request_keyframe_is_noisy_next_frame() {
         let mut enc = Openh264Encoder::new(64, 64).expect("encoder");
-        let _ = enc.encode(std::sync::Arc::new(make_bgra_frame(64, 64, 0, 0, 0))).await.unwrap();
+        let _ = enc
+            .encode(std::sync::Arc::new(make_bgra_frame(64, 64, 0, 0, 0)))
+            .await
+            .unwrap();
         enc.request_keyframe();
-        let out = enc.encode(std::sync::Arc::new(make_bgra_frame(64, 64, 255, 255, 255))).await.unwrap();
+        let out = enc
+            .encode(std::sync::Arc::new(make_bgra_frame(64, 64, 255, 255, 255)))
+            .await
+            .unwrap();
         assert!(!out.is_empty());
     }
 }

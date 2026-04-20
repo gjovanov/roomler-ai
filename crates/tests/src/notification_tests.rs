@@ -36,7 +36,11 @@ async fn send_mention_message(
         .await
         .unwrap();
 
-    assert_eq!(resp.status().as_u16(), 200, "Failed to create mention message");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "Failed to create mention message"
+    );
     resp.json().await.unwrap()
 }
 
@@ -48,10 +52,7 @@ async fn mention_creates_notification() {
 
     // Member joins the room so they can be mentioned
     app.auth_post(
-        &format!(
-            "/api/tenant/{}/room/{}/join",
-            tenant.tenant_id, room_id
-        ),
+        &format!("/api/tenant/{}/room/{}/join", tenant.tenant_id, room_id),
         &tenant.member.access_token,
     )
     .send()
@@ -99,10 +100,7 @@ async fn unread_count_reflects_notifications() {
 
     // Member joins room
     app.auth_post(
-        &format!(
-            "/api/tenant/{}/room/{}/join",
-            tenant.tenant_id, room_id
-        ),
+        &format!("/api/tenant/{}/room/{}/join", tenant.tenant_id, room_id),
         &tenant.member.access_token,
     )
     .send()
@@ -160,10 +158,7 @@ async fn mark_single_notification_read() {
 
     // Member joins room
     app.auth_post(
-        &format!(
-            "/api/tenant/{}/room/{}/join",
-            tenant.tenant_id, room_id
-        ),
+        &format!("/api/tenant/{}/room/{}/join", tenant.tenant_id, room_id),
         &tenant.member.access_token,
     )
     .send()
@@ -226,10 +221,7 @@ async fn mark_all_notifications_read() {
 
     // Member joins room
     app.auth_post(
-        &format!(
-            "/api/tenant/{}/room/{}/join",
-            tenant.tenant_id, room_id
-        ),
+        &format!("/api/tenant/{}/room/{}/join", tenant.tenant_id, room_id),
         &tenant.member.access_token,
     )
     .send()
@@ -285,10 +277,7 @@ async fn notifications_are_user_scoped() {
 
     // Member joins room
     app.auth_post(
-        &format!(
-            "/api/tenant/{}/room/{}/join",
-            tenant.tenant_id, room_id
-        ),
+        &format!("/api/tenant/{}/room/{}/join", tenant.tenant_id, room_id),
         &tenant.member.access_token,
     )
     .send()

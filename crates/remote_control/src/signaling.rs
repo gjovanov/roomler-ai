@@ -255,7 +255,10 @@ mod tests {
         let session_id = ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap();
         let agent_id = ObjectId::parse_str("507f1f77bcf86cd799439012").unwrap();
 
-        let created = ServerMsg::SessionCreated { session_id, agent_id };
+        let created = ServerMsg::SessionCreated {
+            session_id,
+            agent_id,
+        };
         let s = serde_json::to_string(&created).unwrap();
         assert!(
             !s.contains("$oid"),
@@ -284,7 +287,10 @@ mod tests {
         let m: ClientMsg = serde_json::from_str(json).unwrap();
         match m {
             ClientMsg::SessionRequest { browser_caps, .. } => {
-                assert!(browser_caps.is_empty(), "missing field must default to empty");
+                assert!(
+                    browser_caps.is_empty(),
+                    "missing field must default to empty"
+                );
             }
             _ => panic!("wrong variant"),
         }

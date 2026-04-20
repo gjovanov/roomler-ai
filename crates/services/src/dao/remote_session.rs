@@ -1,8 +1,6 @@
 use bson::{DateTime, doc, oid::ObjectId};
 use mongodb::Database;
-use roomler_ai_remote_control::models::{
-    EndReason, RemoteSession, SessionPhase, SessionStats,
-};
+use roomler_ai_remote_control::models::{EndReason, RemoteSession, SessionPhase, SessionStats};
 use roomler_ai_remote_control::permissions::Permissions;
 
 use super::base::{BaseDao, DaoResult, PaginatedResult, PaginationParams};
@@ -83,11 +81,7 @@ impl RemoteSessionDao {
             .await
     }
 
-    pub async fn mark_phase(
-        &self,
-        session_id: ObjectId,
-        phase: SessionPhase,
-    ) -> DaoResult<bool> {
+    pub async fn mark_phase(&self, session_id: ObjectId, phase: SessionPhase) -> DaoResult<bool> {
         let mut set = doc! { "phase": bson::to_bson(&phase).unwrap() };
         if phase == SessionPhase::Active {
             set.insert("started_at", DateTime::now());

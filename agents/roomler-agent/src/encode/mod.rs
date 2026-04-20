@@ -127,7 +127,9 @@ impl VideoEncoder for NoopEncoder {
     fn set_bitrate(&mut self, _bps: u32) {}
     fn request_reference_invalidation(&mut self, _lost_frame_number: u32) {}
     fn set_roi_hints(&mut self, _rects: &[DirtyRect], _frame_dims: (u32, u32)) {}
-    fn name(&self) -> &'static str { "noop" }
+    fn name(&self) -> &'static str {
+        "noop"
+    }
 }
 
 /// Operator preference for encoder selection. Defaults to `Auto` which
@@ -364,7 +366,12 @@ fn open_for_codec_hevc(width: u32, height: u32) -> (Box<dyn VideoEncoder>, &'sta
 /// leaves the default (MF-HW first) in place.
 fn hw_auto_disabled() -> bool {
     std::env::var("ROOMLER_AGENT_HW_AUTO")
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"))
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
         .unwrap_or(false)
 }
 

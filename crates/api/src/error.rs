@@ -3,9 +3,9 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use serde::Serialize;
-use roomler_ai_services::dao::base::DaoError;
 use roomler_ai_services::auth::AuthError;
+use roomler_ai_services::dao::base::DaoError;
+use serde::Serialize;
 
 #[derive(Debug)]
 pub enum ApiError {

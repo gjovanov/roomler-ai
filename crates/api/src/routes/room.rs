@@ -1,4 +1,7 @@
-use axum::{Json, extract::{Path, Query, State}};
+use axum::{
+    Json,
+    extract::{Path, Query, State},
+};
 use bson::oid::ObjectId;
 use serde::{Deserialize, Serialize};
 
@@ -212,14 +215,15 @@ pub async fn members(
     let result = state.rooms.list_members(rid, &params).await?;
 
     // Batch-fetch user details (username, avatar) for member user IDs
-    let user_ids: Vec<ObjectId> = result
-        .items
-        .iter()
-        .filter_map(|m| m.user_id)
-        .collect();
+    let user_ids: Vec<ObjectId> = result.items.iter().filter_map(|m| m.user_id).collect();
     let user_map = if !user_ids.is_empty() {
         // Batch-fetch user records for username + avatar (avoids N+1)
-        let users = state.users.base.find_by_ids(&user_ids).await.unwrap_or_default();
+        let users = state
+            .users
+            .base
+            .find_by_ids(&user_ids)
+            .await
+            .unwrap_or_default();
         let mut map = std::collections::HashMap::new();
         for user in users {
             if let Some(uid) = user.id {
@@ -307,7 +311,11 @@ pub async fn call_start(
         .map_err(|e| ApiError::Internal(format!("Failed to create media room: {}", e)))?;
 
     // Notify all room members about the call
-    let member_ids = state.rooms.find_member_user_ids(rid).await.unwrap_or_default();
+    let member_ids = state
+        .rooms
+        .find_member_user_ids(rid)
+        .await
+        .unwrap_or_default();
     if !member_ids.is_empty() {
         let room = state.rooms.base.find_by_id_in_tenant(tid, rid).await.ok();
         let room_name = room.map(|r| r.name).unwrap_or_default();
@@ -319,10 +327,20 @@ pub async fn call_start(
                 "started_by": auth.user_id.to_hex(),
             }
         });
-        crate::ws::dispatcher::broadcast_with_redis(&state.ws_storage, &state.redis_pubsub, &member_ids, &event).await;
+        crate::ws::dispatcher::broadcast_with_redis(
+            &state.ws_storage,
+            &state.redis_pubsub,
+            &member_ids,
+            &event,
+        )
+        .await;
 
         // Create persistent call notifications + push for offline members via helper
-        let caller_names = state.users.find_display_names(&[auth.user_id]).await.unwrap_or_default();
+        let caller_names = state
+            .users
+            .find_display_names(&[auth.user_id])
+            .await
+            .unwrap_or_default();
         let caller_name = caller_names
             .get(&auth.user_id)
             .cloned()
@@ -372,7 +390,11 @@ pub async fn call_join(
     // Notify room members about updated participant count
     let room = state.rooms.base.find_by_id_in_tenant(tid, rid).await.ok();
     let participant_count = room.as_ref().map(|r| r.participant_count).unwrap_or(0);
-    let member_ids = state.rooms.find_member_user_ids(rid).await.unwrap_or_default();
+    let member_ids = state
+        .rooms
+        .find_member_user_ids(rid)
+        .await
+        .unwrap_or_default();
     if !member_ids.is_empty() {
         let event = serde_json::json!({
             "type": "room:call_updated",
@@ -382,7 +404,13 @@ pub async fn call_join(
                 "conference_status": "in_progress",
             }
         });
-        crate::ws::dispatcher::broadcast_with_redis(&state.ws_storage, &state.redis_pubsub, &member_ids, &event).await;
+        crate::ws::dispatcher::broadcast_with_redis(
+            &state.ws_storage,
+            &state.redis_pubsub,
+            &member_ids,
+            &event,
+        )
+        .await;
     }
 
     Ok(Json(serde_json::json!({
@@ -406,7 +434,9 @@ pub async fn call_leave(
     }
 
     // Clean up media before DB leave
-    state.room_manager.close_participant_by_user(&rid, &auth.user_id);
+    state
+        .room_manager
+        .close_participant_by_user(&rid, &auth.user_id);
 
     // Broadcast peer_left to remaining participants
     let remaining = state.room_manager.get_participant_user_ids(&rid);
@@ -418,7 +448,13 @@ pub async fn call_leave(
                 "user_id": auth.user_id.to_hex(),
             }
         });
-        crate::ws::dispatcher::broadcast_with_redis(&state.ws_storage, &state.redis_pubsub, &remaining, &event).await;
+        crate::ws::dispatcher::broadcast_with_redis(
+            &state.ws_storage,
+            &state.redis_pubsub,
+            &remaining,
+            &event,
+        )
+        .await;
     }
 
     state.rooms.leave_participant(rid, auth.user_id).await?;
@@ -429,20 +465,30 @@ pub async fn call_leave(
         && room.participant_count == 0
         && room.conference_status.as_deref() == Some("in_progress")
     {
-            state.rooms.end_call(rid).await?;
-            state.room_manager.remove_room(&rid);
+        state.rooms.end_call(rid).await?;
+        state.room_manager.remove_room(&rid);
 
-            // Notify all room members that the call has ended
-            let member_ids = state.rooms.find_member_user_ids(rid).await.unwrap_or_default();
-            if !member_ids.is_empty() {
-                let event = serde_json::json!({
-                    "type": "room:call_ended",
-                    "data": {
-                        "room_id": rid.to_hex(),
-                    }
-                });
-                crate::ws::dispatcher::broadcast_with_redis(&state.ws_storage, &state.redis_pubsub, &member_ids, &event).await;
-            }
+        // Notify all room members that the call has ended
+        let member_ids = state
+            .rooms
+            .find_member_user_ids(rid)
+            .await
+            .unwrap_or_default();
+        if !member_ids.is_empty() {
+            let event = serde_json::json!({
+                "type": "room:call_ended",
+                "data": {
+                    "room_id": rid.to_hex(),
+                }
+            });
+            crate::ws::dispatcher::broadcast_with_redis(
+                &state.ws_storage,
+                &state.redis_pubsub,
+                &member_ids,
+                &event,
+            )
+            .await;
+        }
     }
 
     Ok(Json(serde_json::json!({ "left": true })))
@@ -471,11 +517,21 @@ pub async fn call_end(
             "type": "media:room_closed",
             "data": { "room_id": rid.to_hex() }
         });
-        crate::ws::dispatcher::broadcast_with_redis(&state.ws_storage, &state.redis_pubsub, &remaining, &event).await;
+        crate::ws::dispatcher::broadcast_with_redis(
+            &state.ws_storage,
+            &state.redis_pubsub,
+            &remaining,
+            &event,
+        )
+        .await;
     }
 
     // Notify all room members that the call has ended
-    let member_ids = state.rooms.find_member_user_ids(rid).await.unwrap_or_default();
+    let member_ids = state
+        .rooms
+        .find_member_user_ids(rid)
+        .await
+        .unwrap_or_default();
     if !member_ids.is_empty() {
         let event = serde_json::json!({
             "type": "room:call_ended",
@@ -483,7 +539,13 @@ pub async fn call_end(
                 "room_id": rid.to_hex(),
             }
         });
-        crate::ws::dispatcher::broadcast_with_redis(&state.ws_storage, &state.redis_pubsub, &member_ids, &event).await;
+        crate::ws::dispatcher::broadcast_with_redis(
+            &state.ws_storage,
+            &state.redis_pubsub,
+            &member_ids,
+            &event,
+        )
+        .await;
     }
 
     Ok(Json(serde_json::json!({ "ended": true })))
@@ -588,7 +650,13 @@ pub async fn create_call_message(
     let user = state.users.base.find_by_id(auth.user_id).await?;
     let msg = state
         .rooms
-        .create_chat_message(tid, rid, auth.user_id, user.display_name.clone(), body.content)
+        .create_chat_message(
+            tid,
+            rid,
+            auth.user_id,
+            user.display_name.clone(),
+            body.content,
+        )
         .await?;
 
     let response = serde_json::json!({
@@ -601,13 +669,23 @@ pub async fn create_call_message(
     });
 
     // Broadcast to other room members via WS
-    let member_ids = state.rooms.find_member_user_ids(rid).await.unwrap_or_default();
+    let member_ids = state
+        .rooms
+        .find_member_user_ids(rid)
+        .await
+        .unwrap_or_default();
     if !member_ids.is_empty() {
         let event = serde_json::json!({
             "type": "call:message:create",
             "data": &response,
         });
-        crate::ws::dispatcher::broadcast_with_redis(&state.ws_storage, &state.redis_pubsub, &member_ids, &event).await;
+        crate::ws::dispatcher::broadcast_with_redis(
+            &state.ws_storage,
+            &state.redis_pubsub,
+            &member_ids,
+            &event,
+        )
+        .await;
     }
 
     Ok(Json(response))

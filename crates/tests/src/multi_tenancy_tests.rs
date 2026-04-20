@@ -60,10 +60,7 @@ async fn tenant_isolation_messages_not_visible_cross_tenant() {
 
     // Acme admin joins room and posts a message
     app.auth_post(
-        &format!(
-            "/api/tenant/{}/room/{}/join",
-            acme.tenant_id, acme_room_id
-        ),
+        &format!("/api/tenant/{}/room/{}/join", acme.tenant_id, acme_room_id),
         &acme.admin.access_token,
     )
     .send()
@@ -161,12 +158,7 @@ async fn tenant_list_only_shows_user_tenants() {
 async fn unauthenticated_request_gets_401() {
     let app = TestApp::spawn().await;
 
-    let resp = app
-        .client
-        .get(app.url("/api/tenant"))
-        .send()
-        .await
-        .unwrap();
+    let resp = app.client.get(app.url("/api/tenant")).send().await.unwrap();
 
     assert_eq!(resp.status().as_u16(), 401);
 }

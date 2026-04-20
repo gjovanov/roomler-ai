@@ -11,10 +11,7 @@ async fn create_and_list_messages() {
 
     // Admin joins the room first
     app.auth_post(
-        &format!(
-            "/api/tenant/{}/room/{}/join",
-            tenant.tenant_id, room_id
-        ),
+        &format!("/api/tenant/{}/room/{}/join", tenant.tenant_id, room_id),
         &tenant.admin.access_token,
     )
     .send()
@@ -25,10 +22,7 @@ async fn create_and_list_messages() {
     for i in 1..=3 {
         let resp = app
             .auth_post(
-                &format!(
-                    "/api/tenant/{}/room/{}/message",
-                    tenant.tenant_id, room_id
-                ),
+                &format!("/api/tenant/{}/room/{}/message", tenant.tenant_id, room_id),
                 &tenant.admin.access_token,
             )
             .json(&serde_json::json!({
@@ -38,16 +32,18 @@ async fn create_and_list_messages() {
             .await
             .unwrap();
 
-        assert_eq!(resp.status().as_u16(), 200, "Failed to create message {}", i);
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "Failed to create message {}",
+            i
+        );
     }
 
     // List messages (paginated response)
     let resp = app
         .auth_get(
-            &format!(
-                "/api/tenant/{}/room/{}/message",
-                tenant.tenant_id, room_id
-            ),
+            &format!("/api/tenant/{}/room/{}/message", tenant.tenant_id, room_id),
             &tenant.admin.access_token,
         )
         .send()
@@ -69,10 +65,7 @@ async fn update_message() {
 
     // Join room
     app.auth_post(
-        &format!(
-            "/api/tenant/{}/room/{}/join",
-            tenant.tenant_id, room_id
-        ),
+        &format!("/api/tenant/{}/room/{}/join", tenant.tenant_id, room_id),
         &tenant.admin.access_token,
     )
     .send()
@@ -82,10 +75,7 @@ async fn update_message() {
     // Create a message
     let resp = app
         .auth_post(
-            &format!(
-                "/api/tenant/{}/room/{}/message",
-                tenant.tenant_id, room_id
-            ),
+            &format!("/api/tenant/{}/room/{}/message", tenant.tenant_id, room_id),
             &tenant.admin.access_token,
         )
         .json(&serde_json::json!({
@@ -128,10 +118,7 @@ async fn delete_message_soft_deletes() {
 
     // Join room
     app.auth_post(
-        &format!(
-            "/api/tenant/{}/room/{}/join",
-            tenant.tenant_id, room_id
-        ),
+        &format!("/api/tenant/{}/room/{}/join", tenant.tenant_id, room_id),
         &tenant.admin.access_token,
     )
     .send()
@@ -141,10 +128,7 @@ async fn delete_message_soft_deletes() {
     // Create a message
     let resp = app
         .auth_post(
-            &format!(
-                "/api/tenant/{}/room/{}/message",
-                tenant.tenant_id, room_id
-            ),
+            &format!("/api/tenant/{}/room/{}/message", tenant.tenant_id, room_id),
             &tenant.admin.access_token,
         )
         .json(&serde_json::json!({
@@ -175,10 +159,7 @@ async fn delete_message_soft_deletes() {
     // List messages - should be empty (soft deleted not returned)
     let resp = app
         .auth_get(
-            &format!(
-                "/api/tenant/{}/room/{}/message",
-                tenant.tenant_id, room_id
-            ),
+            &format!("/api/tenant/{}/room/{}/message", tenant.tenant_id, room_id),
             &tenant.admin.access_token,
         )
         .send()
@@ -200,19 +181,29 @@ async fn message_broadcast_excludes_sender_reaches_member() {
     app.auth_post(
         &format!("/api/tenant/{}/room/{}/join", tenant.tenant_id, room_id),
         &tenant.admin.access_token,
-    ).send().await.unwrap();
+    )
+    .send()
+    .await
+    .unwrap();
 
     app.auth_post(
         &format!("/api/tenant/{}/room/{}/join", tenant.tenant_id, room_id),
         &tenant.member.access_token,
-    ).send().await.unwrap();
+    )
+    .send()
+    .await
+    .unwrap();
 
     // Connect WS for admin (sender) and member (receiver)
     let ws_url_admin = format!("ws://{}/ws?token={}", app.addr, tenant.admin.access_token);
     let ws_url_member = format!("ws://{}/ws?token={}", app.addr, tenant.member.access_token);
 
-    let (mut ws_admin, _) = tokio_tungstenite::connect_async(&ws_url_admin).await.unwrap();
-    let (mut ws_member, _) = tokio_tungstenite::connect_async(&ws_url_member).await.unwrap();
+    let (mut ws_admin, _) = tokio_tungstenite::connect_async(&ws_url_admin)
+        .await
+        .unwrap();
+    let (mut ws_member, _) = tokio_tungstenite::connect_async(&ws_url_member)
+        .await
+        .unwrap();
 
     // Drain "connected" messages
     ws_admin.next().await;
@@ -231,10 +222,11 @@ async fn message_broadcast_excludes_sender_reaches_member() {
     assert_eq!(resp.status().as_u16(), 200);
 
     // Member should receive message:create via WS
-    let msg = tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        ws_member.next(),
-    ).await.expect("Timed out waiting for WS message").unwrap().unwrap();
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(3), ws_member.next())
+        .await
+        .expect("Timed out waiting for WS message")
+        .unwrap()
+        .unwrap();
 
     let parsed: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
     assert_eq!(parsed["type"], "message:create");
@@ -242,17 +234,26 @@ async fn message_broadcast_excludes_sender_reaches_member() {
 
     // Admin should NOT receive message:create (sender excluded from broadcast).
     // Send a ping to flush any pending messages, then check.
-    ws_admin.send(Message::Text(
-        serde_json::to_string(&serde_json::json!({ "type": "ping" })).unwrap().into(),
-    )).await.unwrap();
+    ws_admin
+        .send(Message::Text(
+            serde_json::to_string(&serde_json::json!({ "type": "ping" }))
+                .unwrap()
+                .into(),
+        ))
+        .await
+        .unwrap();
 
-    let msg = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        ws_admin.next(),
-    ).await.expect("Timed out waiting for pong").unwrap().unwrap();
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(2), ws_admin.next())
+        .await
+        .expect("Timed out waiting for pong")
+        .unwrap()
+        .unwrap();
 
     let parsed: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
-    assert_eq!(parsed["type"], "pong", "Admin should receive pong, not message:create (sender excluded)");
+    assert_eq!(
+        parsed["type"], "pong",
+        "Admin should receive pong, not message:create (sender excluded)"
+    );
 
     ws_admin.close(None).await.ok();
     ws_member.close(None).await.ok();

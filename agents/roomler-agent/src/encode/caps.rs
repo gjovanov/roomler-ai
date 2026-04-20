@@ -45,7 +45,14 @@ pub fn detect() -> AgentCaps {
 }
 
 fn compute_caps() -> AgentCaps {
+    // `mut` is only consumed inside the cfg-gated push blocks below
+    // (openh264-encoder / mf-encoder). Default-feature builds skip
+    // both blocks and the vecs stay empty; silence the unused-mut
+    // lint to keep the CI `cargo clippy --workspace -- -D warnings`
+    // build green on Linux.
+    #[allow(unused_mut)]
     let mut codecs: Vec<String> = Vec::new();
+    #[allow(unused_mut)]
     let mut hw_encoders: Vec<String> = Vec::new();
 
     #[cfg(feature = "openh264-encoder")]
@@ -169,16 +176,8 @@ fn activates(codec: CodecProbe) -> bool {
 /// pre-2B.1 browsers that don't advertise anything.
 pub fn pick_best_codec(browser_caps: &[String], agent_caps: &[String]) -> String {
     const PRIORITY: &[&str] = &["av1", "h265", "vp9", "h264", "vp8"];
-    let browser_has = |c: &str| {
-        browser_caps
-            .iter()
-            .any(|b| b.eq_ignore_ascii_case(c))
-    };
-    let agent_has = |c: &str| {
-        agent_caps
-            .iter()
-            .any(|a| a.eq_ignore_ascii_case(c))
-    };
+    let browser_has = |c: &str| browser_caps.iter().any(|b| b.eq_ignore_ascii_case(c));
+    let agent_has = |c: &str| agent_caps.iter().any(|a| a.eq_ignore_ascii_case(c));
     for candidate in PRIORITY {
         if browser_has(candidate) && agent_has(candidate) {
             return (*candidate).to_string();

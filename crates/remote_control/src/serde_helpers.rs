@@ -62,13 +62,13 @@ mod tests {
     #[test]
     fn serialises_as_raw_hex() {
         let id = ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap();
-        let w = Wrap { id, maybe: Some(id) };
+        let w = Wrap {
+            id,
+            maybe: Some(id),
+        };
         let s = serde_json::to_string(&w).unwrap();
         // No `$oid` wrapping on either field.
-        assert!(
-            !s.contains("$oid"),
-            "expected hex strings, got: {s}"
-        );
+        assert!(!s.contains("$oid"), "expected hex strings, got: {s}");
         assert!(s.contains("\"507f1f77bcf86cd799439011\""));
     }
 

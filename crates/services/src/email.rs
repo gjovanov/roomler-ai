@@ -46,12 +46,7 @@ impl EmailService {
         }
     }
 
-    pub async fn send(
-        &self,
-        to_email: &str,
-        subject: &str,
-        html_body: &str,
-    ) -> anyhow::Result<()> {
+    pub async fn send(&self, to_email: &str, subject: &str, html_body: &str) -> anyhow::Result<()> {
         let request = SendGridRequest {
             personalizations: vec![Personalization {
                 to: vec![EmailAddress {

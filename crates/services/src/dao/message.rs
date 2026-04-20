@@ -1,6 +1,8 @@
-use bson::{doc, oid::ObjectId, DateTime};
+use bson::{DateTime, doc, oid::ObjectId};
 use mongodb::Database;
-use roomler_ai_db::models::{AuthorType, ContentType, Mentions, Message, MessageAttachment, MessageType, ReactionSummary};
+use roomler_ai_db::models::{
+    AuthorType, ContentType, Mentions, Message, MessageAttachment, MessageType, ReactionSummary,
+};
 
 use super::base::{BaseDao, DaoResult, PaginatedResult, PaginationParams};
 
@@ -28,9 +30,17 @@ impl MessageDao {
         mentions: Option<Mentions>,
     ) -> DaoResult<Message> {
         self.create_with_attachments(
-            tenant_id, room_id, author_id, content,
-            thread_id, referenced_message_id, nonce, mentions, Vec::new(),
-        ).await
+            tenant_id,
+            room_id,
+            author_id,
+            content,
+            thread_id,
+            referenced_message_id,
+            nonce,
+            mentions,
+            Vec::new(),
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -105,11 +115,7 @@ impl MessageDao {
         }
 
         self.base
-            .find_paginated(
-                filter,
-                Some(doc! { "created_at": -1 }),
-                params,
-            )
+            .find_paginated(filter, Some(doc! { "created_at": -1 }), params)
             .await
     }
 
@@ -127,10 +133,7 @@ impl MessageDao {
             .await
     }
 
-    pub async fn find_pinned(
-        &self,
-        room_id: ObjectId,
-    ) -> DaoResult<Vec<Message>> {
+    pub async fn find_pinned(&self, room_id: ObjectId) -> DaoResult<Vec<Message>> {
         self.base
             .find_many(
                 doc! { "room_id": room_id, "is_pinned": true, "deleted_at": null },
@@ -187,17 +190,21 @@ impl MessageDao {
     ) -> DaoResult<bool> {
         let now = DateTime::now();
         // First, ensure thread_metadata is not null (MongoDB $inc/$addToSet fail on null subdocs)
-        let _ = self.base.collection().update_one(
-            doc! { "_id": parent_id, "thread_metadata": null },
-            doc! { "$set": {
-                "thread_metadata": {
-                    "reply_count": 0_i32,
-                    "last_reply_at": null,
-                    "last_reply_user_id": null,
-                    "participant_ids": [],
-                },
-            }},
-        ).await;
+        let _ = self
+            .base
+            .collection()
+            .update_one(
+                doc! { "_id": parent_id, "thread_metadata": null },
+                doc! { "$set": {
+                    "thread_metadata": {
+                        "reply_count": 0_i32,
+                        "last_reply_at": null,
+                        "last_reply_user_id": null,
+                        "participant_ids": [],
+                    },
+                }},
+            )
+            .await;
         // Now safely increment/update the nested fields
         self.base
             .update_one(
@@ -242,11 +249,7 @@ impl MessageDao {
     }
 
     /// Count unread messages for a user in a room
-    pub async fn unread_count(
-        &self,
-        room_id: ObjectId,
-        user_id: ObjectId,
-    ) -> DaoResult<u64> {
+    pub async fn unread_count(&self, room_id: ObjectId, user_id: ObjectId) -> DaoResult<u64> {
         let count = self
             .base
             .collection()
@@ -285,10 +288,9 @@ impl MessageDao {
         let mut cursor = self.base.collection().aggregate(pipeline).await?;
         let mut results = Vec::new();
         while let Some(doc) = cursor.try_next().await? {
-            if let (Some(room_id), Some(count)) = (
-                doc.get_object_id("_id").ok(),
-                doc.get_i32("count").ok(),
-            ) {
+            if let (Some(room_id), Some(count)) =
+                (doc.get_object_id("_id").ok(), doc.get_i32("count").ok())
+            {
                 results.push((room_id, count as u64));
             }
         }
@@ -302,9 +304,7 @@ impl MessageDao {
     ) -> DaoResult<bool> {
         let summary_bson: Vec<bson::Bson> = summary
             .iter()
-            .map(|s| {
-                bson::to_bson(s).unwrap_or(bson::Bson::Null)
-            })
+            .map(|s| bson::to_bson(s).unwrap_or(bson::Bson::Null))
             .collect();
 
         self.base

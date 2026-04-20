@@ -9,10 +9,7 @@ async fn export_conversation_as_pdf() {
 
     // Admin joins room and creates messages
     app.auth_post(
-        &format!(
-            "/api/tenant/{}/room/{}/join",
-            tenant.tenant_id, room_id
-        ),
+        &format!("/api/tenant/{}/room/{}/join", tenant.tenant_id, room_id),
         &tenant.admin.access_token,
     )
     .send()
@@ -21,10 +18,7 @@ async fn export_conversation_as_pdf() {
 
     for i in 1..=2 {
         app.auth_post(
-            &format!(
-                "/api/tenant/{}/room/{}/message",
-                tenant.tenant_id, room_id
-            ),
+            &format!("/api/tenant/{}/room/{}/message", tenant.tenant_id, room_id),
             &tenant.admin.access_token,
         )
         .json(&serde_json::json!({
@@ -80,10 +74,7 @@ async fn export_conversation_as_pdf() {
     // Download
     let resp = app
         .auth_get(
-            &format!(
-                "/api/tenant/{}/task/{}/download",
-                tenant.tenant_id, task_id
-            ),
+            &format!("/api/tenant/{}/task/{}/download", tenant.tenant_id, task_id),
             &tenant.admin.access_token,
         )
         .send()
@@ -91,13 +82,14 @@ async fn export_conversation_as_pdf() {
         .unwrap();
 
     assert_eq!(resp.status().as_u16(), 200);
-    assert!(resp
-        .headers()
-        .get("content-type")
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .contains("pdf"));
+    assert!(
+        resp.headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("pdf")
+    );
 
     let body = resp.bytes().await.unwrap();
     // PDF files start with %PDF
@@ -116,10 +108,7 @@ async fn recognize_file_returns_error_without_api_key() {
 
     // Admin joins room
     app.auth_post(
-        &format!(
-            "/api/tenant/{}/room/{}/join",
-            tenant.tenant_id, room_id
-        ),
+        &format!("/api/tenant/{}/room/{}/join", tenant.tenant_id, room_id),
         &tenant.admin.access_token,
     )
     .send()
@@ -138,10 +127,7 @@ async fn recognize_file_returns_error_without_api_key() {
 
     let resp = app
         .client
-        .post(app.url(&format!(
-            "/api/tenant/{}/file/upload",
-            tenant.tenant_id
-        )))
+        .post(app.url(&format!("/api/tenant/{}/file/upload", tenant.tenant_id)))
         .header(
             "Authorization",
             format!("Bearer {}", tenant.admin.access_token),
@@ -170,8 +156,5 @@ async fn recognize_file_returns_error_without_api_key() {
     // Should return 400 because Claude API key is not set
     assert_eq!(resp.status().as_u16(), 400);
     let json: Value = resp.json().await.unwrap();
-    assert!(json["message"]
-        .as_str()
-        .unwrap()
-        .contains("not configured"));
+    assert!(json["message"].as_str().unwrap().contains("not configured"));
 }

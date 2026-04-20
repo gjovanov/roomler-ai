@@ -9,10 +9,7 @@ async fn export_conversation_creates_background_task() {
 
     // Admin joins room and creates messages
     app.auth_post(
-        &format!(
-            "/api/tenant/{}/room/{}/join",
-            tenant.tenant_id, room_id
-        ),
+        &format!("/api/tenant/{}/room/{}/join", tenant.tenant_id, room_id),
         &tenant.admin.access_token,
     )
     .send()
@@ -21,10 +18,7 @@ async fn export_conversation_creates_background_task() {
 
     for i in 1..=3 {
         app.auth_post(
-            &format!(
-                "/api/tenant/{}/room/{}/message",
-                tenant.tenant_id, room_id
-            ),
+            &format!("/api/tenant/{}/room/{}/message", tenant.tenant_id, room_id),
             &tenant.admin.access_token,
         )
         .json(&serde_json::json!({
@@ -62,10 +56,7 @@ async fn export_task_completes_and_download_works() {
 
     // Admin joins room and creates a message
     app.auth_post(
-        &format!(
-            "/api/tenant/{}/room/{}/join",
-            tenant.tenant_id, room_id
-        ),
+        &format!("/api/tenant/{}/room/{}/join", tenant.tenant_id, room_id),
         &tenant.admin.access_token,
     )
     .send()
@@ -73,10 +64,7 @@ async fn export_task_completes_and_download_works() {
     .unwrap();
 
     app.auth_post(
-        &format!(
-            "/api/tenant/{}/room/{}/message",
-            tenant.tenant_id, room_id
-        ),
+        &format!("/api/tenant/{}/room/{}/message", tenant.tenant_id, room_id),
         &tenant.admin.access_token,
     )
     .json(&serde_json::json!({
@@ -121,10 +109,7 @@ async fn export_task_completes_and_download_works() {
         if status == "Completed" {
             completed = true;
             assert_eq!(json["progress"], 100);
-            assert!(json["file_name"]
-                .as_str()
-                .unwrap()
-                .ends_with(".xlsx"));
+            assert!(json["file_name"].as_str().unwrap().ends_with(".xlsx"));
             break;
         } else if status == "Failed" {
             panic!("Export task failed: {:?}", json["error"]);
@@ -135,10 +120,7 @@ async fn export_task_completes_and_download_works() {
     // Download the export file
     let resp = app
         .auth_get(
-            &format!(
-                "/api/tenant/{}/task/{}/download",
-                tenant.tenant_id, task_id
-            ),
+            &format!("/api/tenant/{}/task/{}/download", tenant.tenant_id, task_id),
             &tenant.admin.access_token,
         )
         .send()
@@ -146,13 +128,14 @@ async fn export_task_completes_and_download_works() {
         .unwrap();
 
     assert_eq!(resp.status().as_u16(), 200);
-    assert!(resp
-        .headers()
-        .get("content-type")
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .contains("spreadsheetml"));
+    assert!(
+        resp.headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("spreadsheetml")
+    );
 
     let body = resp.bytes().await.unwrap();
     // XLSX files start with PK zip signature
@@ -169,10 +152,7 @@ async fn list_background_tasks() {
 
     // Create a message so export has something
     app.auth_post(
-        &format!(
-            "/api/tenant/{}/room/{}/join",
-            tenant.tenant_id, room_id
-        ),
+        &format!("/api/tenant/{}/room/{}/join", tenant.tenant_id, room_id),
         &tenant.admin.access_token,
     )
     .send()
@@ -180,10 +160,7 @@ async fn list_background_tasks() {
     .unwrap();
 
     app.auth_post(
-        &format!(
-            "/api/tenant/{}/room/{}/message",
-            tenant.tenant_id, room_id
-        ),
+        &format!("/api/tenant/{}/room/{}/message", tenant.tenant_id, room_id),
         &tenant.admin.access_token,
     )
     .json(&serde_json::json!({ "content": "test" }))

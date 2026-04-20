@@ -108,11 +108,26 @@ impl OAuthService {
 
     fn provider_config(&self, provider: &str) -> Result<(&str, &str), OAuthError> {
         let cfg = match provider {
-            "google" => (&self.settings.google.client_id, &self.settings.google.client_secret),
-            "facebook" => (&self.settings.facebook.client_id, &self.settings.facebook.client_secret),
-            "github" => (&self.settings.github.client_id, &self.settings.github.client_secret),
-            "linkedin" => (&self.settings.linkedin.client_id, &self.settings.linkedin.client_secret),
-            "microsoft" => (&self.settings.microsoft.client_id, &self.settings.microsoft.client_secret),
+            "google" => (
+                &self.settings.google.client_id,
+                &self.settings.google.client_secret,
+            ),
+            "facebook" => (
+                &self.settings.facebook.client_id,
+                &self.settings.facebook.client_secret,
+            ),
+            "github" => (
+                &self.settings.github.client_id,
+                &self.settings.github.client_secret,
+            ),
+            "linkedin" => (
+                &self.settings.linkedin.client_id,
+                &self.settings.linkedin.client_secret,
+            ),
+            "microsoft" => (
+                &self.settings.microsoft.client_id,
+                &self.settings.microsoft.client_secret,
+            ),
             _ => return Err(OAuthError::UnknownProvider(provider.to_string())),
         };
         if cfg.0.is_empty() {
@@ -132,23 +147,33 @@ impl OAuthService {
         let url = match provider {
             "google" => format!(
                 "https://accounts.google.com/o/oauth2/v2/auth?client_id={}&redirect_uri={}&response_type=code&scope=email+profile&state={}&access_type=offline",
-                client_id, urlencoding::encode(&redirect_uri), urlencoding::encode(state)
+                client_id,
+                urlencoding::encode(&redirect_uri),
+                urlencoding::encode(state)
             ),
             "facebook" => format!(
                 "https://www.facebook.com/v18.0/dialog/oauth?client_id={}&redirect_uri={}&response_type=code&scope=email&state={}",
-                client_id, urlencoding::encode(&redirect_uri), urlencoding::encode(state)
+                client_id,
+                urlencoding::encode(&redirect_uri),
+                urlencoding::encode(state)
             ),
             "github" => format!(
                 "https://github.com/login/oauth/authorize?client_id={}&redirect_uri={}&scope=user+user:email&state={}",
-                client_id, urlencoding::encode(&redirect_uri), urlencoding::encode(state)
+                client_id,
+                urlencoding::encode(&redirect_uri),
+                urlencoding::encode(state)
             ),
             "linkedin" => format!(
                 "https://www.linkedin.com/oauth/v2/authorization?client_id={}&redirect_uri={}&response_type=code&scope=openid+profile+email&state={}",
-                client_id, urlencoding::encode(&redirect_uri), urlencoding::encode(state)
+                client_id,
+                urlencoding::encode(&redirect_uri),
+                urlencoding::encode(state)
             ),
             "microsoft" => format!(
                 "https://login.microsoftonline.com/common/oauth2/v2.0/authorize?client_id={}&redirect_uri={}&response_type=code&scope=openid+profile+email+User.Read&state={}",
-                client_id, urlencoding::encode(&redirect_uri), urlencoding::encode(state)
+                client_id,
+                urlencoding::encode(&redirect_uri),
+                urlencoding::encode(state)
             ),
             _ => return Err(OAuthError::UnknownProvider(provider.to_string())),
         };
@@ -162,7 +187,8 @@ impl OAuthService {
 
         let access_token = match provider {
             "google" => {
-                let resp = self.client
+                let resp = self
+                    .client
                     .post("https://oauth2.googleapis.com/token")
                     .form(&[
                         ("code", code),
@@ -174,12 +200,15 @@ impl OAuthService {
                     .send()
                     .await
                     .map_err(|e| OAuthError::TokenExchangeFailed(e.to_string()))?;
-                let body: TokenResponse = resp.json().await
+                let body: TokenResponse = resp
+                    .json()
+                    .await
                     .map_err(|e| OAuthError::TokenExchangeFailed(e.to_string()))?;
                 body.access_token
             }
             "facebook" => {
-                let resp = self.client
+                let resp = self
+                    .client
                     .get("https://graph.facebook.com/v18.0/oauth/access_token")
                     .query(&[
                         ("code", code),
@@ -190,12 +219,15 @@ impl OAuthService {
                     .send()
                     .await
                     .map_err(|e| OAuthError::TokenExchangeFailed(e.to_string()))?;
-                let body: TokenResponse = resp.json().await
+                let body: TokenResponse = resp
+                    .json()
+                    .await
                     .map_err(|e| OAuthError::TokenExchangeFailed(e.to_string()))?;
                 body.access_token
             }
             "github" => {
-                let resp = self.client
+                let resp = self
+                    .client
                     .post("https://github.com/login/oauth/access_token")
                     .header("Accept", "application/json")
                     .form(&[
@@ -207,12 +239,15 @@ impl OAuthService {
                     .send()
                     .await
                     .map_err(|e| OAuthError::TokenExchangeFailed(e.to_string()))?;
-                let body: TokenResponse = resp.json().await
+                let body: TokenResponse = resp
+                    .json()
+                    .await
                     .map_err(|e| OAuthError::TokenExchangeFailed(e.to_string()))?;
                 body.access_token
             }
             "linkedin" => {
-                let resp = self.client
+                let resp = self
+                    .client
                     .post("https://www.linkedin.com/oauth/v2/accessToken")
                     .form(&[
                         ("code", code),
@@ -224,12 +259,15 @@ impl OAuthService {
                     .send()
                     .await
                     .map_err(|e| OAuthError::TokenExchangeFailed(e.to_string()))?;
-                let body: TokenResponse = resp.json().await
+                let body: TokenResponse = resp
+                    .json()
+                    .await
                     .map_err(|e| OAuthError::TokenExchangeFailed(e.to_string()))?;
                 body.access_token
             }
             "microsoft" => {
-                let resp = self.client
+                let resp = self
+                    .client
                     .post("https://login.microsoftonline.com/common/oauth2/v2.0/token")
                     .form(&[
                         ("code", code),
@@ -241,7 +279,9 @@ impl OAuthService {
                     .send()
                     .await
                     .map_err(|e| OAuthError::TokenExchangeFailed(e.to_string()))?;
-                let body: TokenResponse = resp.json().await
+                let body: TokenResponse = resp
+                    .json()
+                    .await
                     .map_err(|e| OAuthError::TokenExchangeFailed(e.to_string()))?;
                 body.access_token
             }
@@ -251,10 +291,15 @@ impl OAuthService {
         Ok(access_token)
     }
 
-    async fn fetch_user_info(&self, provider: &str, access_token: &str) -> Result<OAuthUserInfo, OAuthError> {
+    async fn fetch_user_info(
+        &self,
+        provider: &str,
+        access_token: &str,
+    ) -> Result<OAuthUserInfo, OAuthError> {
         match provider {
             "google" => {
-                let user: GoogleUser = self.client
+                let user: GoogleUser = self
+                    .client
                     .get("https://www.googleapis.com/userinfo/v2/me")
                     .bearer_auth(access_token)
                     .send()
@@ -264,7 +309,13 @@ impl OAuthService {
                     .await
                     .map_err(|e| OAuthError::UserInfoFailed(e.to_string()))?;
                 let name = user.name.unwrap_or_else(|| {
-                    format!("{} {}", user.given_name.unwrap_or_default(), user.family_name.unwrap_or_default()).trim().to_string()
+                    format!(
+                        "{} {}",
+                        user.given_name.unwrap_or_default(),
+                        user.family_name.unwrap_or_default()
+                    )
+                    .trim()
+                    .to_string()
                 });
                 Ok(OAuthUserInfo {
                     provider: "google".to_string(),
@@ -275,8 +326,11 @@ impl OAuthService {
                 })
             }
             "facebook" => {
-                let user: FacebookUser = self.client
-                    .get("https://graph.facebook.com/v18.0/me?fields=email,name,picture.type(large)")
+                let user: FacebookUser = self
+                    .client
+                    .get(
+                        "https://graph.facebook.com/v18.0/me?fields=email,name,picture.type(large)",
+                    )
                     .bearer_auth(access_token)
                     .send()
                     .await
@@ -294,7 +348,8 @@ impl OAuthService {
                 })
             }
             "github" => {
-                let user: GitHubUser = self.client
+                let user: GitHubUser = self
+                    .client
                     .get("https://api.github.com/user")
                     .header("User-Agent", "roomler-ai")
                     .bearer_auth(access_token)
@@ -309,7 +364,8 @@ impl OAuthService {
                     email
                 } else {
                     // Fallback: fetch emails endpoint
-                    let emails: Vec<GitHubEmail> = self.client
+                    let emails: Vec<GitHubEmail> = self
+                        .client
                         .get("https://api.github.com/user/emails")
                         .header("User-Agent", "roomler-ai")
                         .bearer_auth(access_token)
@@ -335,7 +391,8 @@ impl OAuthService {
                 })
             }
             "linkedin" => {
-                let user: LinkedInUser = self.client
+                let user: LinkedInUser = self
+                    .client
                     .get("https://api.linkedin.com/v2/userinfo")
                     .bearer_auth(access_token)
                     .send()
@@ -345,7 +402,13 @@ impl OAuthService {
                     .await
                     .map_err(|e| OAuthError::UserInfoFailed(e.to_string()))?;
                 let name = user.name.unwrap_or_else(|| {
-                    format!("{} {}", user.given_name.unwrap_or_default(), user.family_name.unwrap_or_default()).trim().to_string()
+                    format!(
+                        "{} {}",
+                        user.given_name.unwrap_or_default(),
+                        user.family_name.unwrap_or_default()
+                    )
+                    .trim()
+                    .to_string()
                 });
                 Ok(OAuthUserInfo {
                     provider: "linkedin".to_string(),
@@ -356,7 +419,8 @@ impl OAuthService {
                 })
             }
             "microsoft" => {
-                let user: MicrosoftUser = self.client
+                let user: MicrosoftUser = self
+                    .client
                     .get("https://graph.microsoft.com/v1.0/me")
                     .bearer_auth(access_token)
                     .send()
@@ -379,7 +443,11 @@ impl OAuthService {
         }
     }
 
-    pub async fn authenticate(&self, provider: &str, code: &str) -> Result<OAuthUserInfo, OAuthError> {
+    pub async fn authenticate(
+        &self,
+        provider: &str,
+        code: &str,
+    ) -> Result<OAuthUserInfo, OAuthError> {
         let access_token = self.exchange_code(provider, code).await?;
         self.fetch_user_info(provider, &access_token).await
     }

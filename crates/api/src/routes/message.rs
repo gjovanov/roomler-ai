@@ -1,4 +1,7 @@
-use axum::{Json, extract::{Path, Query, State}};
+use axum::{
+    Json,
+    extract::{Path, Query, State},
+};
 use bson::oid::ObjectId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -94,7 +97,11 @@ pub async fn list(
     let result = state.messages.find_in_room(rid, &params).await?;
 
     let author_ids = collect_author_ids(&result.items);
-    let names = state.users.find_display_names(&author_ids).await.unwrap_or_default();
+    let names = state
+        .users
+        .find_display_names(&author_ids)
+        .await
+        .unwrap_or_default();
     let viewer_id = Some(auth.user_id);
 
     let items: Vec<MessageResponse> = result
@@ -166,15 +173,15 @@ pub async fn create(
             if let Ok(fid) = ObjectId::parse_str(file_id_str)
                 && let Ok(file) = state.files.base.find_by_id_in_tenant(tid, fid).await
             {
-                    att.push(MessageAttachment {
-                        file_id: file.id.unwrap(),
-                        filename: file.filename,
-                        content_type: file.content_type,
-                        size: file.size,
-                        url: file.url,
-                        thumbnail_url: file.thumbnails.first().map(|t| t.url.clone()),
-                        is_spoiler: false,
-                    });
+                att.push(MessageAttachment {
+                    file_id: file.id.unwrap(),
+                    filename: file.filename,
+                    content_type: file.content_type,
+                    size: file.size,
+                    url: file.url,
+                    thumbnail_url: file.thumbnails.first().map(|t| t.url.clone()),
+                    is_spoiler: false,
+                });
             }
         }
         att
@@ -200,7 +207,11 @@ pub async fn create(
     let message_id = message.id.unwrap();
 
     // Fetch author display name for the response
-    let names = state.users.find_display_names(&[auth.user_id]).await.unwrap_or_default();
+    let names = state
+        .users
+        .find_display_names(&[auth.user_id])
+        .await
+        .unwrap_or_default();
 
     // Fetch room member IDs once and reuse for WS broadcast, thread update, and notifications
     let all_member_ids = state.rooms.find_member_user_ids(rid).await?;
@@ -216,22 +227,38 @@ pub async fn create(
         "type": "message:create",
         "data": &response,
     });
-    crate::ws::dispatcher::broadcast_with_redis(&state.ws_storage, &state.redis_pubsub, &member_ids_excluding_sender, &event).await;
+    crate::ws::dispatcher::broadcast_with_redis(
+        &state.ws_storage,
+        &state.redis_pubsub,
+        &member_ids_excluding_sender,
+        &event,
+    )
+    .await;
 
     // If this was a thread reply, broadcast an update for the parent message
     // so other users see the updated is_thread_root + reply_count
     if let Some(parent_id) = thread_id
         && let Ok(parent_msg) = state.messages.base.find_by_id(parent_id).await
     {
-            let parent_author_ids = vec![parent_msg.author_id];
-            let parent_names = state.users.find_display_names(&parent_author_ids).await.unwrap_or_default();
-            let parent_response = to_response(parent_msg, &parent_names, None);
-            let parent_event = serde_json::json!({
-                "type": "message:update",
-                "data": &parent_response,
-            });
-            // Broadcast to ALL members (including sender, so sender's UI also updates)
-            crate::ws::dispatcher::broadcast_with_redis(&state.ws_storage, &state.redis_pubsub, &all_member_ids, &parent_event).await;
+        let parent_author_ids = vec![parent_msg.author_id];
+        let parent_names = state
+            .users
+            .find_display_names(&parent_author_ids)
+            .await
+            .unwrap_or_default();
+        let parent_response = to_response(parent_msg, &parent_names, None);
+        let parent_event = serde_json::json!({
+            "type": "message:update",
+            "data": &parent_response,
+        });
+        // Broadcast to ALL members (including sender, so sender's UI also updates)
+        crate::ws::dispatcher::broadcast_with_redis(
+            &state.ws_storage,
+            &state.redis_pubsub,
+            &all_member_ids,
+            &parent_event,
+        )
+        .await;
     }
 
     // Create notifications for mentioned users via helper
@@ -248,7 +275,11 @@ pub async fn create(
                 .collect()
         };
 
-        let room_name = state.rooms.base.find_by_id(rid).await
+        let room_name = state
+            .rooms
+            .base
+            .find_by_id(rid)
+            .await
             .map(|r| r.name)
             .unwrap_or_default();
 
@@ -300,7 +331,11 @@ pub async fn update(
 
     // Re-fetch the updated message for the full response
     let updated = state.messages.base.find_by_id(mid).await?;
-    let names = state.users.find_display_names(&[updated.author_id]).await.unwrap_or_default();
+    let names = state
+        .users
+        .find_display_names(&[updated.author_id])
+        .await
+        .unwrap_or_default();
     let response = to_response(updated, &names, Some(auth.user_id));
 
     // Broadcast full message to room members (exclude sender)
@@ -315,7 +350,13 @@ pub async fn update(
         "type": "message:update",
         "data": &response,
     });
-    crate::ws::dispatcher::broadcast_with_redis(&state.ws_storage, &state.redis_pubsub, &member_ids, &event).await;
+    crate::ws::dispatcher::broadcast_with_redis(
+        &state.ws_storage,
+        &state.redis_pubsub,
+        &member_ids,
+        &event,
+    )
+    .await;
 
     Ok(Json(response))
 }
@@ -339,14 +380,12 @@ pub async fn delete(
     // Verify ownership: only the author can delete their message (tenant-scoped)
     let message = state.messages.base.find_by_id_in_tenant(tid, mid).await?;
     if message.author_id != auth.user_id {
-        return Err(ApiError::Forbidden("Only the author can delete this message".to_string()));
+        return Err(ApiError::Forbidden(
+            "Only the author can delete this message".to_string(),
+        ));
     }
 
-    state
-        .messages
-        .base
-        .soft_delete_in_tenant(tid, mid)
-        .await?;
+    state.messages.base.soft_delete_in_tenant(tid, mid).await?;
 
     let member_ids: Vec<ObjectId> = state
         .rooms
@@ -362,7 +401,13 @@ pub async fn delete(
             "room_id": room_id,
         }
     });
-    crate::ws::dispatcher::broadcast_with_redis(&state.ws_storage, &state.redis_pubsub, &member_ids, &event).await;
+    crate::ws::dispatcher::broadcast_with_redis(
+        &state.ws_storage,
+        &state.redis_pubsub,
+        &member_ids,
+        &event,
+    )
+    .await;
 
     Ok(Json(serde_json::json!({ "deleted": true })))
 }
@@ -383,8 +428,15 @@ pub async fn pinned(
 
     let messages = state.messages.find_pinned(rid).await?;
     let author_ids = collect_author_ids(&messages);
-    let names = state.users.find_display_names(&author_ids).await.unwrap_or_default();
-    let response: Vec<MessageResponse> = messages.into_iter().map(|m| to_response(m, &names, Some(auth.user_id))).collect();
+    let names = state
+        .users
+        .find_display_names(&author_ids)
+        .await
+        .unwrap_or_default();
+    let response: Vec<MessageResponse> = messages
+        .into_iter()
+        .map(|m| to_response(m, &names, Some(auth.user_id)))
+        .collect();
 
     Ok(Json(response))
 }
@@ -422,7 +474,13 @@ pub async fn toggle_pin(
             "pinned": body.pinned,
         }
     });
-    crate::ws::dispatcher::broadcast_with_redis(&state.ws_storage, &state.redis_pubsub, &member_ids, &event).await;
+    crate::ws::dispatcher::broadcast_with_redis(
+        &state.ws_storage,
+        &state.redis_pubsub,
+        &member_ids,
+        &event,
+    )
+    .await;
 
     Ok(Json(serde_json::json!({ "pinned": body.pinned })))
 }
@@ -445,7 +503,11 @@ pub async fn thread_replies(
     let result = state.messages.find_thread_replies(mid, &params).await?;
 
     let author_ids = collect_author_ids(&result.items);
-    let names = state.users.find_display_names(&author_ids).await.unwrap_or_default();
+    let names = state
+        .users
+        .find_display_names(&author_ids)
+        .await
+        .unwrap_or_default();
     let viewer_id = Some(auth.user_id);
 
     let items: Vec<MessageResponse> = result
@@ -463,7 +525,11 @@ pub async fn thread_replies(
     })))
 }
 
-fn to_response(m: roomler_ai_db::models::Message, names: &HashMap<ObjectId, String>, viewer_id: Option<ObjectId>) -> MessageResponse {
+fn to_response(
+    m: roomler_ai_db::models::Message,
+    names: &HashMap<ObjectId, String>,
+    viewer_id: Option<ObjectId>,
+) -> MessageResponse {
     let author_name = names
         .get(&m.author_id)
         .cloned()
@@ -554,7 +620,10 @@ pub async fn mark_read(
         .filter_map(|s| ObjectId::parse_str(s).ok())
         .collect();
 
-    let modified = state.messages.mark_read(rid, auth.user_id, &message_ids).await?;
+    let modified = state
+        .messages
+        .mark_read(rid, auth.user_id, &message_ids)
+        .await?;
 
     Ok(Json(serde_json::json!({ "marked": modified })))
 }

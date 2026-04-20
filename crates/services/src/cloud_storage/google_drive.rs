@@ -53,14 +53,11 @@ impl CloudStorageProvider for GoogleDriveService {
             .map_err(|e| format!("Failed to parse token response: {}", e))?;
 
         Ok(OAuthTokens {
-            access_token: json["access_token"]
-                .as_str()
-                .unwrap_or("")
-                .to_string(),
+            access_token: json["access_token"].as_str().unwrap_or("").to_string(),
             refresh_token: json["refresh_token"].as_str().map(|s| s.to_string()),
-            expires_at: json["expires_in"].as_i64().map(|e| {
-                chrono::Utc::now().timestamp() + e
-            }),
+            expires_at: json["expires_in"]
+                .as_i64()
+                .map(|e| chrono::Utc::now().timestamp() + e),
         })
     }
 
@@ -109,11 +106,7 @@ impl CloudStorageProvider for GoogleDriveService {
         Ok(files)
     }
 
-    async fn download_file(
-        &self,
-        tokens: &OAuthTokens,
-        file_id: &str,
-    ) -> Result<Vec<u8>, String> {
+    async fn download_file(&self, tokens: &OAuthTokens, file_id: &str) -> Result<Vec<u8>, String> {
         let resp = self
             .client
             .get(format!(

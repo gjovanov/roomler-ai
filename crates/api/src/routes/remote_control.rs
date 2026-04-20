@@ -373,7 +373,9 @@ fn build_turn_config(
     let mut urls = vec![base.to_string()];
     if base.starts_with("turn:") && !base.contains("?transport=") {
         urls.push(format!("{}?transport=tcp", base));
-        let turns = base.replacen("turn:", "turns:", 1).replace(":3478", ":5349");
+        let turns = base
+            .replacen("turn:", "turns:", 1)
+            .replace(":3478", ":5349");
         urls.push(format!("{}?transport=tcp", turns));
     }
     Some(roomler_ai_remote_control::turn_creds::TurnConfig {
@@ -392,10 +394,9 @@ fn to_agent_response(
     a: roomler_ai_remote_control::models::Agent,
 ) -> AgentResponse {
     let id = a.id.map(|i| i.to_hex()).unwrap_or_default();
-    let is_online = a
-        .id
-        .map(|i| state.rc_hub.is_agent_online(i))
-        .unwrap_or(false);
+    let is_online =
+        a.id.map(|i| state.rc_hub.is_agent_online(i))
+            .unwrap_or(false);
     AgentResponse {
         id,
         tenant_id: a.tenant_id.to_hex(),

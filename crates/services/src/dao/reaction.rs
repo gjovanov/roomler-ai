@@ -1,4 +1,4 @@
-use bson::{doc, oid::ObjectId, DateTime};
+use bson::{DateTime, doc, oid::ObjectId};
 use mongodb::Database;
 use roomler_ai_db::models::{EmojiRef, EmojiType, Reaction, ReactionSummary};
 
@@ -75,10 +75,7 @@ impl ReactionDao {
         Ok(deleted > 0)
     }
 
-    pub async fn get_summary(
-        &self,
-        message_id: ObjectId,
-    ) -> DaoResult<Vec<ReactionSummary>> {
+    pub async fn get_summary(&self, message_id: ObjectId) -> DaoResult<Vec<ReactionSummary>> {
         use futures::TryStreamExt;
 
         let pipeline = vec![
@@ -118,7 +115,9 @@ impl ReactionDao {
             .await?;
 
         let summary = self.get_summary(message_id).await?;
-        messages.update_reaction_summary(message_id, &summary).await?;
+        messages
+            .update_reaction_summary(message_id, &summary)
+            .await?;
 
         Ok(reaction)
     }
@@ -133,7 +132,9 @@ impl ReactionDao {
         let removed = self.remove(message_id, user_id, emoji).await?;
         if removed {
             let summary = self.get_summary(message_id).await?;
-            messages.update_reaction_summary(message_id, &summary).await?;
+            messages
+                .update_reaction_summary(message_id, &summary)
+                .await?;
         }
         Ok(removed)
     }

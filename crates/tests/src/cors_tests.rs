@@ -10,7 +10,10 @@ async fn preflight_options_returns_cors_headers() {
         .request(reqwest::Method::OPTIONS, app.url("/api/auth/login"))
         .header("Origin", "http://example.com")
         .header("Access-Control-Request-Method", "POST")
-        .header("Access-Control-Request-Headers", "content-type,authorization")
+        .header(
+            "Access-Control-Request-Headers",
+            "content-type,authorization",
+        )
         .send()
         .await
         .unwrap();
@@ -87,9 +90,7 @@ async fn cors_with_specific_origins() {
 
     assert_eq!(resp.status().as_u16(), 200);
 
-    let allow_origin = resp
-        .headers()
-        .get("access-control-allow-origin");
+    let allow_origin = resp.headers().get("access-control-allow-origin");
 
     // When specific origins are configured, the server should echo back the allowed origin
     assert!(

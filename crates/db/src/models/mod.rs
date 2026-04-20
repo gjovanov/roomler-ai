@@ -1,6 +1,6 @@
 pub mod audit_log;
-pub mod call_chat_message;
 pub mod background_task;
+pub mod call_chat_message;
 pub mod custom_emoji;
 pub mod file;
 pub mod invite;
@@ -18,8 +18,8 @@ pub mod tenant_member;
 pub mod user;
 
 pub use audit_log::*;
-pub use call_chat_message::*;
 pub use background_task::*;
+pub use call_chat_message::*;
 pub use custom_emoji::*;
 pub use file::*;
 pub use invite::*;

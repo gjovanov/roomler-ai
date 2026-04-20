@@ -6,14 +6,14 @@ pub mod message;
 pub mod notification;
 pub mod push_subscription;
 pub mod reaction;
+pub mod recording;
 pub mod remote_audit;
 pub mod remote_session;
 pub mod role;
-pub mod recording;
 pub mod room;
 pub mod tenant;
 
-pub mod user;
 pub mod activation_code;
+pub mod user;
 
 pub use base::BaseDao;

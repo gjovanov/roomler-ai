@@ -42,9 +42,5 @@ pub trait CloudStorageProvider: Send + Sync {
         tokens: &OAuthTokens,
         folder_id: Option<&str>,
     ) -> Result<Vec<CloudFile>, String>;
-    async fn download_file(
-        &self,
-        tokens: &OAuthTokens,
-        file_id: &str,
-    ) -> Result<Vec<u8>, String>;
+    async fn download_file(&self, tokens: &OAuthTokens, file_id: &str) -> Result<Vec<u8>, String>;
 }

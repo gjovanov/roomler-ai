@@ -1,4 +1,4 @@
-use bson::{doc, oid::ObjectId, DateTime};
+use bson::{DateTime, doc, oid::ObjectId};
 use mongodb::Database;
 use roomler_ai_db::models::{Invite, InviteStatus};
 
@@ -117,7 +117,9 @@ impl InviteDao {
             .await
             .map_err(DaoError::Mongo)?
             .ok_or_else(|| {
-                DaoError::Validation("Invite cannot be used (exhausted, expired, or revoked)".to_string())
+                DaoError::Validation(
+                    "Invite cannot be used (exhausted, expired, or revoked)".to_string(),
+                )
             })?;
 
         // Auto-set status to Exhausted when use_count >= max_uses
@@ -126,10 +128,7 @@ impl InviteDao {
         {
             let _ = self
                 .base
-                .update_by_id(
-                    invite_id,
-                    doc! { "$set": { "status": "exhausted" } },
-                )
+                .update_by_id(invite_id, doc! { "$set": { "status": "exhausted" } })
                 .await;
         }
 
@@ -153,7 +152,9 @@ impl InviteDao {
                 return Err(DaoError::Validation("Invite has been revoked".to_string()));
             }
             InviteStatus::Exhausted => {
-                return Err(DaoError::Validation("Invite has been fully used".to_string()));
+                return Err(DaoError::Validation(
+                    "Invite has been fully used".to_string(),
+                ));
             }
             InviteStatus::Expired => {
                 return Err(DaoError::Validation("Invite has expired".to_string()));
@@ -171,7 +172,9 @@ impl InviteDao {
         if let Some(max) = invite.max_uses
             && invite.use_count >= max
         {
-            return Err(DaoError::Validation("Invite has been fully used".to_string()));
+            return Err(DaoError::Validation(
+                "Invite has been fully used".to_string(),
+            ));
         }
 
         Ok(())

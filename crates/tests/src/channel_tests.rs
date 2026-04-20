@@ -80,10 +80,7 @@ async fn join_and_leave_room() {
     // Member joins room
     let resp = app
         .auth_post(
-            &format!(
-                "/api/tenant/{}/room/{}/join",
-                tenant.tenant_id, room_id
-            ),
+            &format!("/api/tenant/{}/room/{}/join", tenant.tenant_id, room_id),
             &tenant.member.access_token,
         )
         .send()
@@ -97,10 +94,7 @@ async fn join_and_leave_room() {
     // Member leaves room
     let resp = app
         .auth_post(
-            &format!(
-                "/api/tenant/{}/room/{}/leave",
-                tenant.tenant_id, room_id
-            ),
+            &format!("/api/tenant/{}/room/{}/leave", tenant.tenant_id, room_id),
             &tenant.member.access_token,
         )
         .send()
@@ -182,10 +176,7 @@ async fn explore_rooms_returns_plain_array() {
 
     let resp = app
         .auth_get(
-            &format!(
-                "/api/tenant/{}/room/explore?q=general",
-                tenant.tenant_id
-            ),
+            &format!("/api/tenant/{}/room/explore?q=general", tenant.tenant_id),
             &tenant.admin.access_token,
         )
         .send()

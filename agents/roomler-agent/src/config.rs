@@ -69,8 +69,8 @@ pub fn default_config_path() -> Result<PathBuf> {
 pub fn load(path: &PathBuf) -> Result<AgentConfig> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading config at {}", path.display()))?;
-    let cfg: AgentConfig = toml::from_str(&raw)
-        .with_context(|| format!("parsing config at {}", path.display()))?;
+    let cfg: AgentConfig =
+        toml::from_str(&raw).with_context(|| format!("parsing config at {}", path.display()))?;
     Ok(cfg)
 }
 
@@ -112,7 +112,10 @@ mod tests {
 
     #[test]
     fn ws_url_from_https() {
-        assert_eq!(derive_ws_url("https://roomler.live"), "wss://roomler.live/ws");
+        assert_eq!(
+            derive_ws_url("https://roomler.live"),
+            "wss://roomler.live/ws"
+        );
     }
 
     #[test]

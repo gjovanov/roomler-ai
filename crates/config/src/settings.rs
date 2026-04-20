@@ -132,11 +132,7 @@ impl Settings {
         let config = Config::builder()
             .add_source(File::with_name("config/default").required(false))
             .add_source(File::with_name("config/local").required(false))
-            .add_source(
-                Environment::default()
-                    .separator("__")
-                    .prefix("ROOMLER"),
-            )
+            .add_source(Environment::default().separator("__").prefix("ROOMLER"))
             .set_default("app.host", "0.0.0.0")?
             .set_default("app.port", 3000)?
             .set_default("app.cors_origins", Vec::<String>::new())?

@@ -2,8 +2,7 @@ use bson::oid::ObjectId;
 use dashmap::DashMap;
 use mediasoup::prelude::*;
 use mediasoup::webrtc_transport::{
-    WebRtcTransportListenInfos, WebRtcTransportOptions,
-    WebRtcTransportRemoteParameters,
+    WebRtcTransportListenInfos, WebRtcTransportOptions, WebRtcTransportRemoteParameters,
 };
 use roomler_ai_config::MediasoupSettings;
 use serde::{Deserialize, Serialize};
@@ -106,10 +105,7 @@ impl RoomManager {
 
     /// Creates a mediasoup Router for a room and stores it.
     /// Returns the router's RTP capabilities (serialized).
-    pub async fn create_room(
-        &self,
-        room_id: ObjectId,
-    ) -> anyhow::Result<serde_json::Value> {
+    pub async fn create_room(&self, room_id: ObjectId) -> anyhow::Result<serde_json::Value> {
         if self.rooms.contains_key(&room_id) {
             let room = self.rooms.get(&room_id).unwrap();
             let caps = room.router.rtp_capabilities().clone();
@@ -282,7 +278,10 @@ impl RoomManager {
             .map_err(|e| anyhow::anyhow!("Failed to produce: {}", e))?;
 
         let producer_id = producer.id();
-        participant.producers.push(ProducerEntry { producer, source: source.clone() });
+        participant.producers.push(ProducerEntry {
+            producer,
+            source: source.clone(),
+        });
 
         debug!(?room_id, %connection_id, %producer_id, ?kind, %source, "producer created");
         Ok(producer_id)
@@ -406,7 +405,13 @@ impl RoomManager {
                     let uid = entry.value().user_id;
                     let conn_id = entry.key().clone();
                     for pe in &entry.value().producers {
-                        result.push((uid, conn_id.clone(), pe.producer.id(), pe.producer.kind(), pe.source.clone()));
+                        result.push((
+                            uid,
+                            conn_id.clone(),
+                            pe.producer.id(),
+                            pe.producer.kind(),
+                            pe.source.clone(),
+                        ));
                     }
                 }
             }
@@ -550,10 +555,7 @@ impl RoomManager {
     }
 
     /// Helper: creates a single WebRtcTransport on the given router.
-    async fn create_webrtc_transport(
-        &self,
-        router: &Router,
-    ) -> anyhow::Result<WebRtcTransport> {
+    async fn create_webrtc_transport(&self, router: &Router) -> anyhow::Result<WebRtcTransport> {
         let udp_info = ListenInfo {
             protocol: Protocol::Udp,
             ip: self.listen_ip,

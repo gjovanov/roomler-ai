@@ -88,7 +88,12 @@ impl RecognitionService {
         let media_type = match content_type {
             "image/png" | "image/jpeg" | "image/gif" | "image/webp" => content_type.to_string(),
             "application/pdf" => "application/pdf".to_string(),
-            _ => return Err(format!("Unsupported content type for recognition: {}", content_type)),
+            _ => {
+                return Err(format!(
+                    "Unsupported content type for recognition: {}",
+                    content_type
+                ));
+            }
         };
 
         let request = ClaudeRequest {

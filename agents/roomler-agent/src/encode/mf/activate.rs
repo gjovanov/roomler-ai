@@ -35,12 +35,12 @@ use thiserror::Error;
 use windows::Win32::Foundation::E_NOTIMPL;
 use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 use windows::Win32::Media::MediaFoundation::{
-    CLSID_MSH264EncoderMFT, IMFActivate, IMFDXGIDeviceManager, IMFTransform, MFMediaType_Video,
-    MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_ADAPTER_LUID, MFT_ENUM_FLAG, MFT_ENUM_FLAG_ASYNCMFT,
-    MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT,
-    MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_SET_D3D_MANAGER, MFT_REGISTER_TYPE_INFO, MFTEnumEx,
-    MFVideoFormat_AV1, MFVideoFormat_H264, MFVideoFormat_HEVC, MFVideoFormat_NV12,
-    MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK,
+    CLSID_MSH264EncoderMFT, IMFActivate, IMFDXGIDeviceManager, IMFTransform, MF_TRANSFORM_ASYNC,
+    MF_TRANSFORM_ASYNC_UNLOCK, MFMediaType_Video, MFT_CATEGORY_VIDEO_ENCODER,
+    MFT_ENUM_ADAPTER_LUID, MFT_ENUM_FLAG, MFT_ENUM_FLAG_ASYNCMFT, MFT_ENUM_FLAG_HARDWARE,
+    MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT, MFT_FRIENDLY_NAME_Attribute,
+    MFT_MESSAGE_SET_D3D_MANAGER, MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoFormat_AV1,
+    MFVideoFormat_H264, MFVideoFormat_HEVC, MFVideoFormat_NV12,
 };
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
 use windows::core::Interface;
@@ -108,9 +108,7 @@ pub(super) fn enumerate_hw_h264_mfts() -> Result<Vec<HwMftCandidate>> {
 /// Inner helper: enumerate hardware encoder MFTs for a given output
 /// codec subtype GUID. Factored out so H.264 / H.265 / AV1 share a
 /// single MFTEnumEx invocation; only the output media subtype differs.
-fn enumerate_hw_video_mfts(
-    output_subtype: windows::core::GUID,
-) -> Result<Vec<HwMftCandidate>> {
+fn enumerate_hw_video_mfts(output_subtype: windows::core::GUID) -> Result<Vec<HwMftCandidate>> {
     let input_info = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
         guidSubtype: MFVideoFormat_NV12,
@@ -275,7 +273,9 @@ pub(super) fn activate_and_probe_pipeline_for_codec(
 
     match codec {
         OutputCodec::H264 => {
-            tracing::info!("mf-encoder: no HW candidate succeeded — falling back to SW MFT on default adapter");
+            tracing::info!(
+                "mf-encoder: no HW candidate succeeded — falling back to SW MFT on default adapter"
+            );
             build_sw_fallback(width, height)
         }
         OutputCodec::Hevc => {
@@ -379,9 +379,7 @@ fn try_activate_and_probe(
                 d3d_manager = None;
             }
             Err(e) => {
-                return Err(MfInitError::ProbeFailed(anyhow!(
-                    "SET_D3D_MANAGER: {e:?}"
-                )));
+                return Err(MfInitError::ProbeFailed(anyhow!("SET_D3D_MANAGER: {e:?}")));
             }
         }
 
@@ -433,7 +431,10 @@ fn build_sw_fallback(width: u32, height: u32) -> Result<MfPipeline> {
                 .GetUINT32(&MF_TRANSFORM_ASYNC)
                 .map(|v| v != 0)
                 .unwrap_or(false);
-            tracing::info!(is_async, "mf-encoder: SW fallback async-mode probe (post-unlock)");
+            tracing::info!(
+                is_async,
+                "mf-encoder: SW fallback async-mode probe (post-unlock)"
+            );
         }
 
         if let Some((_, ref d3d_manager)) = d3d_aux {

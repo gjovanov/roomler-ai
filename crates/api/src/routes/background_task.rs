@@ -32,7 +32,10 @@ pub async fn list(
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
 
-    let result = state.tasks.list_user_tasks(tid, auth.user_id, &params).await?;
+    let result = state
+        .tasks
+        .list_user_tasks(tid, auth.user_id, &params)
+        .await?;
 
     let items: Vec<TaskResponse> = result
         .items
@@ -104,12 +107,12 @@ pub async fn download(
     let file_name = task.file_name.unwrap_or_else(|| "download".to_string());
 
     let mut contents = Vec::new();
-    let mut f = tokio::fs::File::open(&file_path).await.map_err(|_| {
-        ApiError::NotFound("File not found on disk".to_string())
-    })?;
-    f.read_to_end(&mut contents).await.map_err(|e| {
-        ApiError::Internal(format!("Failed to read file: {}", e))
-    })?;
+    let mut f = tokio::fs::File::open(&file_path)
+        .await
+        .map_err(|_| ApiError::NotFound("File not found on disk".to_string()))?;
+    f.read_to_end(&mut contents)
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to read file: {}", e)))?;
 
     // Determine content type from file name
     let content_type = if file_name.ends_with(".xlsx") {

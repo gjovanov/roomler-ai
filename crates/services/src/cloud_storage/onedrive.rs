@@ -110,11 +110,7 @@ impl CloudStorageProvider for OneDriveService {
         Ok(files)
     }
 
-    async fn download_file(
-        &self,
-        tokens: &OAuthTokens,
-        file_id: &str,
-    ) -> Result<Vec<u8>, String> {
+    async fn download_file(&self, tokens: &OAuthTokens, file_id: &str) -> Result<Vec<u8>, String> {
         let resp = self
             .client
             .get(format!(

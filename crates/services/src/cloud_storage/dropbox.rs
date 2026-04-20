@@ -103,11 +103,7 @@ impl CloudStorageProvider for DropboxService {
         Ok(files)
     }
 
-    async fn download_file(
-        &self,
-        tokens: &OAuthTokens,
-        file_id: &str,
-    ) -> Result<Vec<u8>, String> {
+    async fn download_file(&self, tokens: &OAuthTokens, file_id: &str) -> Result<Vec<u8>, String> {
         let resp = self
             .client
             .post("https://content.dropboxapi.com/2/files/download")

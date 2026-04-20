@@ -155,9 +155,8 @@ pub(super) fn enumerate_adapters() -> Result<Vec<AdapterInfo>> {
                     // into a u64 for `IMFAttributes::SetUINT64`. The
                     // MF runtime treats this as an opaque 8-byte
                     // identifier; the convention is high-order = HighPart.
-                    let luid =
-                        ((desc.AdapterLuid.HighPart as u32 as u64) << 32)
-                            | desc.AdapterLuid.LowPart as u64;
+                    let luid = ((desc.AdapterLuid.HighPart as u32 as u64) << 32)
+                        | desc.AdapterLuid.LowPart as u64;
                     out.push(AdapterInfo {
                         description,
                         vendor_id: desc.VendorId,

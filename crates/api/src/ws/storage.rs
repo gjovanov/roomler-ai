@@ -1,7 +1,7 @@
+use axum::extract::ws::{Message, WebSocket};
 use bson::oid::ObjectId;
 use dashmap::DashMap;
 use futures::stream::SplitSink;
-use axum::extract::ws::{Message, WebSocket};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -29,8 +29,7 @@ impl WsStorage {
             .entry(user_id)
             .or_default()
             .push(sender.clone());
-        self.connection_map
-            .insert(connection_id, (user_id, sender));
+        self.connection_map.insert(connection_id, (user_id, sender));
     }
 
     pub fn remove(&self, user_id: &ObjectId, connection_id: &str, sender: &WsSender) {
@@ -71,10 +70,7 @@ impl WsStorage {
     }
 
     pub fn connection_count(&self) -> usize {
-        self.connections
-            .iter()
-            .map(|r| r.value().len())
-            .sum()
+        self.connections.iter().map(|r| r.value().len()).sum()
     }
 }
 

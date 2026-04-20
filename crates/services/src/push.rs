@@ -38,10 +38,8 @@ impl PushService {
         });
         let payload_str = serde_json::to_string(&payload)?;
 
-        let mut sig_builder = VapidSignatureBuilder::from_pem(
-            &mut self.vapid_private_key.as_slice(),
-            &subscription,
-        )?;
+        let mut sig_builder =
+            VapidSignatureBuilder::from_pem(&mut self.vapid_private_key.as_slice(), &subscription)?;
         sig_builder.add_claim("sub", serde_json::Value::String(self.contact.clone()));
 
         let signature = sig_builder.build()?;

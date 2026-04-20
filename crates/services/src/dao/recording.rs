@@ -1,4 +1,4 @@
-use bson::{doc, oid::ObjectId, DateTime};
+use bson::{DateTime, doc, oid::ObjectId};
 use mongodb::Database;
 use roomler_ai_db::models::{self, recording::*};
 
@@ -60,11 +60,7 @@ impl RecordingDao {
             .await
     }
 
-    pub async fn update_status(
-        &self,
-        id: ObjectId,
-        status: RecordingStatus,
-    ) -> DaoResult<bool> {
+    pub async fn update_status(&self, id: ObjectId, status: RecordingStatus) -> DaoResult<bool> {
         self.base
             .update_by_id(
                 id,
@@ -73,11 +69,7 @@ impl RecordingDao {
             .await
     }
 
-    pub async fn soft_delete(
-        &self,
-        tenant_id: ObjectId,
-        id: ObjectId,
-    ) -> DaoResult<bool> {
+    pub async fn soft_delete(&self, tenant_id: ObjectId, id: ObjectId) -> DaoResult<bool> {
         self.base.soft_delete_in_tenant(tenant_id, id).await
     }
 }

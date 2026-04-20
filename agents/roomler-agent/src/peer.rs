@@ -140,10 +140,9 @@ impl AgentPeer {
         // IDR. Browser observed 293 NACKs per minute with 0.1.4 going
         // nowhere — this is the missing piece.
         let mut registry = webrtc::interceptor::registry::Registry::new();
-        registry = webrtc::api::interceptor_registry::register_default_interceptors(
-            registry, &mut engine,
-        )
-        .context("register default interceptors")?;
+        registry =
+            webrtc::api::interceptor_registry::register_default_interceptors(registry, &mut engine)
+                .context("register default interceptors")?;
 
         let api = APIBuilder::new()
             .with_media_engine(engine)
@@ -293,9 +292,7 @@ impl AgentPeer {
                                         remb.store(bps, std::sync::atomic::Ordering::Relaxed);
                                     }
                                 }
-                                if let Some(nack) =
-                                    p_any.downcast_ref::<TransportLayerNack>()
-                                {
+                                if let Some(nack) = p_any.downcast_ref::<TransportLayerNack>() {
                                     // Reset the window if it's lapsed,
                                     // otherwise add to the count. Each
                                     // NACK packet contains nack_pairs
@@ -323,7 +320,8 @@ impl AgentPeer {
                                             nack_count_in_window,
                                             "NACK burst → requesting reference invalidation"
                                         );
-                                        invalidate.store(true, std::sync::atomic::Ordering::Relaxed);
+                                        invalidate
+                                            .store(true, std::sync::atomic::Ordering::Relaxed);
                                         last_invalidation = now;
                                         // Reset the window so a single
                                         // burst doesn't keep firing.
@@ -366,7 +364,9 @@ impl AgentPeer {
                             return;
                         }
                     };
-                    let Ok(candidate) = serde_json::to_value(&json) else { return };
+                    let Ok(candidate) = serde_json::to_value(&json) else {
+                        return;
+                    };
                     let _ = tx
                         .send(ClientMsg::Ice {
                             session_id,
@@ -462,11 +462,7 @@ impl AgentPeer {
             .await
             .context("set_remote_description")?;
 
-        let answer = self
-            .pc
-            .create_answer(None)
-            .await
-            .context("create_answer")?;
+        let answer = self.pc.create_answer(None).await.context("create_answer")?;
         self.pc
             .set_local_description(answer.clone())
             .await
@@ -735,8 +731,8 @@ async fn media_pump(
             let target = if remb_now == 0 {
                 quality_target
             } else {
-                let remb_safe = (remb_now / REMB_SAFETY_FACTOR_DEN)
-                    .saturating_mul(REMB_SAFETY_FACTOR_NUM);
+                let remb_safe =
+                    (remb_now / REMB_SAFETY_FACTOR_DEN).saturating_mul(REMB_SAFETY_FACTOR_NUM);
                 quality_target.min(remb_safe.max(500_000))
             };
             // Hysteresis: only push when quality changed (operator
@@ -1041,11 +1037,26 @@ fn map_ice_servers(servers: &[IceServer]) -> Vec<RTCIceServer> {
 /// `pick_best_codec` only returns codecs both sides advertise).
 fn build_video_codec_cap(codec: &str) -> RTCRtpCodecCapability {
     let feedback = vec![
-        RTCPFeedback { typ: "goog-remb".to_string(),    parameter: String::new() },
-        RTCPFeedback { typ: "ccm".to_string(),          parameter: "fir".to_string() },
-        RTCPFeedback { typ: "nack".to_string(),         parameter: String::new() },
-        RTCPFeedback { typ: "nack".to_string(),         parameter: "pli".to_string() },
-        RTCPFeedback { typ: "transport-cc".to_string(), parameter: String::new() },
+        RTCPFeedback {
+            typ: "goog-remb".to_string(),
+            parameter: String::new(),
+        },
+        RTCPFeedback {
+            typ: "ccm".to_string(),
+            parameter: "fir".to_string(),
+        },
+        RTCPFeedback {
+            typ: "nack".to_string(),
+            parameter: String::new(),
+        },
+        RTCPFeedback {
+            typ: "nack".to_string(),
+            parameter: "pli".to_string(),
+        },
+        RTCPFeedback {
+            typ: "transport-cc".to_string(),
+            parameter: String::new(),
+        },
     ];
     match codec.to_ascii_lowercase().as_str() {
         "av1" => RTCRtpCodecCapability {
@@ -1072,9 +1083,8 @@ fn build_video_codec_cap(codec: &str) -> RTCRtpCodecCapability {
             mime_type: "video/H264".to_string(),
             clock_rate: 90000,
             channels: 0,
-            sdp_fmtp_line:
-                "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
-                    .to_string(),
+            sdp_fmtp_line: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
+                .to_string(),
             rtcp_feedback: feedback,
         },
     }
@@ -1159,7 +1169,9 @@ mod codec_cap_tests {
         for codec in ["h264", "h265", "av1"] {
             let cap = build_video_codec_cap(codec);
             assert!(
-                cap.rtcp_feedback.iter().any(|f| f.typ == "nack" && f.parameter == "pli"),
+                cap.rtcp_feedback
+                    .iter()
+                    .any(|f| f.typ == "nack" && f.parameter == "pli"),
                 "codec {codec} missing nack pli"
             );
             assert!(

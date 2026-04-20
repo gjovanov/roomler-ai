@@ -36,7 +36,10 @@ async fn get_plans_free_plan_has_correct_data() {
         .unwrap();
 
     let plans: Vec<Value> = resp.json().await.unwrap();
-    let free = plans.iter().find(|p| p["id"] == "free").expect("Free plan not found");
+    let free = plans
+        .iter()
+        .find(|p| p["id"] == "free")
+        .expect("Free plan not found");
 
     assert_eq!(free["name"], "Free");
     assert_eq!(free["price_cents"], 0);
@@ -60,7 +63,10 @@ async fn get_plans_pro_plan_has_correct_data() {
         .unwrap();
 
     let plans: Vec<Value> = resp.json().await.unwrap();
-    let pro = plans.iter().find(|p| p["id"] == "pro").expect("Pro plan not found");
+    let pro = plans
+        .iter()
+        .find(|p| p["id"] == "pro")
+        .expect("Pro plan not found");
 
     assert_eq!(pro["name"], "Pro");
     assert_eq!(pro["price_cents"], 800);
@@ -82,7 +88,10 @@ async fn get_plans_business_plan_has_correct_data() {
         .unwrap();
 
     let plans: Vec<Value> = resp.json().await.unwrap();
-    let biz = plans.iter().find(|p| p["id"] == "business").expect("Business plan not found");
+    let biz = plans
+        .iter()
+        .find(|p| p["id"] == "business")
+        .expect("Business plan not found");
 
     assert_eq!(biz["name"], "Business");
     assert_eq!(biz["price_cents"], 1600);
@@ -358,7 +367,9 @@ async fn webhook_with_valid_signature_processes_checkout_completed() {
     assert_eq!(tenant.get_str("plan").unwrap(), "pro");
 
     // Verify billing info was set
-    let billing = tenant.get_document("billing").expect("billing should exist");
+    let billing = tenant
+        .get_document("billing")
+        .expect("billing should exist");
     assert_eq!(billing.get_str("customer_id").unwrap(), "cus_test_456");
     assert_eq!(billing.get_str("subscription_id").unwrap(), "sub_test_123");
     assert_eq!(billing.get_str("status").unwrap(), "active");
@@ -447,7 +458,9 @@ async fn webhook_subscription_deleted_reverts_to_free() {
         .expect("Tenant not found in DB");
 
     assert_eq!(tenant.get_str("plan").unwrap(), "free");
-    let billing = tenant.get_document("billing").expect("billing should exist");
+    let billing = tenant
+        .get_document("billing")
+        .expect("billing should exist");
     assert_eq!(billing.get_str("status").unwrap(), "canceled");
 }
 
@@ -535,7 +548,9 @@ async fn webhook_subscription_updated_sets_status() {
         .unwrap()
         .expect("Tenant not found in DB");
 
-    let billing = tenant.get_document("billing").expect("billing should exist");
+    let billing = tenant
+        .get_document("billing")
+        .expect("billing should exist");
     assert_eq!(billing.get_str("status").unwrap(), "active");
     assert_eq!(billing.get_bool("cancel_at_period_end").unwrap(), true);
 }
@@ -621,7 +636,9 @@ async fn webhook_invoice_payment_failed_sets_past_due() {
         .unwrap()
         .expect("Tenant not found in DB");
 
-    let billing = tenant.get_document("billing").expect("billing should exist");
+    let billing = tenant
+        .get_document("billing")
+        .expect("billing should exist");
     assert_eq!(billing.get_str("status").unwrap(), "past_due");
 }
 

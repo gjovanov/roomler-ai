@@ -43,9 +43,7 @@ where
                     .and_then(|cookies| {
                         cookies.split(';').find_map(|cookie| {
                             let cookie = cookie.trim();
-                            cookie
-                                .strip_prefix("access_token=")
-                                .map(|s| s.to_string())
+                            cookie.strip_prefix("access_token=").map(|s| s.to_string())
                         })
                     })
             })

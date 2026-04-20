@@ -1,4 +1,4 @@
-use bson::{doc, oid::ObjectId, DateTime};
+use bson::{DateTime, doc, oid::ObjectId};
 use mongodb::Database;
 use roomler_ai_db::models::ActivationCode;
 
@@ -15,7 +15,12 @@ impl ActivationCodeDao {
         }
     }
 
-    pub async fn create(&self, user_id: ObjectId, token: String, ttl_minutes: u64) -> DaoResult<ActivationCode> {
+    pub async fn create(
+        &self,
+        user_id: ObjectId,
+        token: String,
+        ttl_minutes: u64,
+    ) -> DaoResult<ActivationCode> {
         // Delete any existing codes for this user
         self.base.hard_delete(doc! { "user_id": user_id }).await?;
 
@@ -35,7 +40,11 @@ impl ActivationCodeDao {
         self.base.find_by_id(id).await
     }
 
-    pub async fn find_valid(&self, user_id: ObjectId, token: &str) -> DaoResult<Option<ActivationCode>> {
+    pub async fn find_valid(
+        &self,
+        user_id: ObjectId,
+        token: &str,
+    ) -> DaoResult<Option<ActivationCode>> {
         self.base
             .find_one(doc! {
                 "user_id": user_id,

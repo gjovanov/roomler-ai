@@ -1,4 +1,4 @@
-use bson::{doc, oid::ObjectId, DateTime};
+use bson::{DateTime, doc, oid::ObjectId};
 use mongodb::Database;
 use roomler_ai_db::models::Role;
 use roomler_ai_db::models::role::permissions;
@@ -69,11 +69,21 @@ impl RoleDao {
         position: Option<u32>,
     ) -> DaoResult<bool> {
         let mut set_doc = doc! { "updated_at": DateTime::now() };
-        if let Some(n) = name { set_doc.insert("name", n); }
-        if let Some(d) = description { set_doc.insert("description", d); }
-        if let Some(c) = color { set_doc.insert("color", c as i64); }
-        if let Some(p) = perms { set_doc.insert("permissions", p as i64); }
-        if let Some(pos) = position { set_doc.insert("position", pos as i64); }
+        if let Some(n) = name {
+            set_doc.insert("name", n);
+        }
+        if let Some(d) = description {
+            set_doc.insert("description", d);
+        }
+        if let Some(c) = color {
+            set_doc.insert("color", c as i64);
+        }
+        if let Some(p) = perms {
+            set_doc.insert("permissions", p as i64);
+        }
+        if let Some(pos) = position {
+            set_doc.insert("position", pos as i64);
+        }
 
         self.base
             .update_one(
@@ -83,15 +93,13 @@ impl RoleDao {
             .await
     }
 
-    pub async fn delete(
-        &self,
-        role_id: ObjectId,
-        tenant_id: ObjectId,
-    ) -> DaoResult<bool> {
+    pub async fn delete(&self, role_id: ObjectId, tenant_id: ObjectId) -> DaoResult<bool> {
         // Prevent deleting default/managed roles
         let role = self.base.find_by_id(role_id).await?;
         if role.is_default || role.is_managed {
-            return Err(DaoError::Forbidden("Cannot delete default or managed roles".into()));
+            return Err(DaoError::Forbidden(
+                "Cannot delete default or managed roles".into(),
+            ));
         }
 
         let result = self
@@ -107,21 +115,22 @@ impl RoleDao {
         let defaults = [
             ("Owner", permissions::ALL, 0u32),
             ("Admin", permissions::DEFAULT_ADMIN, 1),
-            ("Moderator",
+            (
+                "Moderator",
                 permissions::VIEW_CHANNELS
-                | permissions::SEND_MESSAGES
-                | permissions::SEND_THREADS
-                | permissions::EMBED_LINKS
-                | permissions::ATTACH_FILES
-                | permissions::READ_HISTORY
-                | permissions::ADD_REACTIONS
-                | permissions::CONNECT_VOICE
-                | permissions::SPEAK
-                | permissions::STREAM_VIDEO
-                | permissions::MANAGE_MESSAGES
-                | permissions::KICK_MEMBERS
-                | permissions::MUTE_MEMBERS
-                | permissions::MANAGE_MEETINGS,
+                    | permissions::SEND_MESSAGES
+                    | permissions::SEND_THREADS
+                    | permissions::EMBED_LINKS
+                    | permissions::ATTACH_FILES
+                    | permissions::READ_HISTORY
+                    | permissions::ADD_REACTIONS
+                    | permissions::CONNECT_VOICE
+                    | permissions::SPEAK
+                    | permissions::STREAM_VIDEO
+                    | permissions::MANAGE_MESSAGES
+                    | permissions::KICK_MEMBERS
+                    | permissions::MUTE_MEMBERS
+                    | permissions::MANAGE_MEETINGS,
                 2,
             ),
             ("Member", permissions::DEFAULT_MEMBER, 3),
