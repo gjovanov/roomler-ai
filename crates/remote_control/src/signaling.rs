@@ -139,6 +139,13 @@ pub enum ServerMsg {
 
     /// Sent to the agent when a controller asks for control. The agent prompts
     /// the user (or auto-grants per AccessPolicy) and replies with `Consent`.
+    ///
+    /// `browser_caps` is forwarded verbatim from the controller's
+    /// `rc:session.request` (codec short names like `"h264"`,
+    /// `"h265"`, etc.). The agent intersects this with its own
+    /// `AgentCaps.codecs` to pick the best codec for the session.
+    /// Empty on controllers that don't advertise — the agent then
+    /// defaults to H.264.
     #[serde(rename = "rc:request")]
     Request {
         #[serde(with = "oid_hex")]
@@ -148,6 +155,8 @@ pub enum ServerMsg {
         controller_name: String,
         permissions: Permissions,
         consent_timeout_secs: u32,
+        #[serde(default)]
+        browser_caps: Vec<String>,
     },
 
     /// Server forwards SDP offer from controller → agent.

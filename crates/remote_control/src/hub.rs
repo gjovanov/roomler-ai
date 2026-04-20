@@ -176,6 +176,7 @@ impl Hub {
         controller_name: String,
         controller_tx: ClientTx,
         permissions: Permissions,
+        browser_caps: Vec<String>,
     ) -> Result<ObjectId> {
         let agent_org = {
             let mut agent = self
@@ -218,6 +219,7 @@ impl Hub {
             controller_name,
             permissions,
             consent_timeout_secs: DEFAULT_CONSENT_TIMEOUT.as_secs() as u32,
+            browser_caps,
         });
 
         self.audit(session_id, agent_id, agent_org, AuditKind::SessionRequested);
@@ -466,17 +468,17 @@ impl Hub {
                 ClientMsg::SessionRequest {
                     agent_id,
                     permissions,
-                    browser_caps: _,
+                    browser_caps,
                 },
             ) => {
-                // browser_caps reserved for codec negotiation (2B.2);
-                // ignored at the Hub today. Once SDP munging lands the
-                // Hub can forward the list to the agent in the
-                // Request-to-agent envelope.
+                // Forward browser codec caps verbatim to the agent in
+                // the ServerMsg::Request envelope. The agent picks the
+                // best intersection with its own AgentCaps and uses it
+                // to choose the encoder + advertise the codec in SDP.
                 let user_id = ctx.user_id.ok_or(Error::PermissionDenied("no user"))?;
                 let name = ctx.controller_name.clone().unwrap_or_default();
                 let tx = ctx.controller_tx.clone().ok_or(Error::SendFailed)?;
-                self.create_session(agent_id, user_id, name, tx, permissions)?;
+                self.create_session(agent_id, user_id, name, tx, permissions, browser_caps)?;
                 Ok(())
             }
             (Role::Controller, ClientMsg::SdpOffer { session_id, sdp }) => {
@@ -540,6 +542,7 @@ mod tests {
             "Goran".into(),
             tx,
             Permissions::default(),
+            Vec::new(),
         );
         assert!(matches!(res, Err(Error::AgentOffline(_))));
     }
@@ -563,6 +566,7 @@ mod tests {
                 "Goran".into(),
                 ctl_tx,
                 Permissions::default(),
+                Vec::new(),
             )
             .unwrap();
 
