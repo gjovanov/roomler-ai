@@ -18,6 +18,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 
 use crate::config::AgentConfig;
+use crate::indicator::ViewerIndicator;
 use crate::peer::AgentPeer;
 
 /// Capacity of the outbound channel peers use to push `ClientMsg` back into
@@ -32,6 +33,16 @@ pub async fn run(
     encoder_preference: crate::encode::EncoderPreference,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
+    // One overlay handle, reused across reconnects. Failing to bring up
+    // the indicator is non-fatal — the session still works, the user
+    // just doesn't get the visual "you're being watched" cue.
+    let indicator = match ViewerIndicator::new() {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(%e, "viewer-indicator init failed; continuing without overlay");
+            ViewerIndicator::disabled()
+        }
+    };
     let mut backoff = Duration::from_secs(1);
     loop {
         if *shutdown.borrow() {
@@ -39,7 +50,14 @@ pub async fn run(
             return Ok(());
         }
 
-        match connect_once(&cfg, encoder_preference, shutdown.clone()).await {
+        match connect_once(
+            &cfg,
+            encoder_preference,
+            shutdown.clone(),
+            indicator.clone(),
+        )
+        .await
+        {
             Ok(()) => {
                 info!("signaling connection closed cleanly, reconnecting");
                 backoff = Duration::from_secs(1);
@@ -69,6 +87,7 @@ async fn connect_once(
     cfg: &AgentConfig,
     encoder_preference: crate::encode::EncoderPreference,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
+    indicator: ViewerIndicator,
 ) -> Result<(), ConnectError> {
     let url = format!(
         "{}?token={}&role=agent",
@@ -150,6 +169,7 @@ async fn connect_once(
                                 &mut pending_codecs,
                                 &outbound_tx,
                                 encoder_preference,
+                                &indicator,
                             )
                             .await?;
                         }
@@ -183,6 +203,7 @@ async fn handle_server_msg(
     pending_codecs: &mut HashMap<bson::oid::ObjectId, String>,
     outbound_tx: &mpsc::Sender<ClientMsg>,
     encoder_preference: crate::encode::EncoderPreference,
+    indicator: &ViewerIndicator,
 ) -> Result<(), ConnectError> {
     match msg {
         ServerMsg::Request {
@@ -208,6 +229,10 @@ async fn handle_server_msg(
                 chosen_codec = %chosen,
                 "incoming session request — auto-granting (see docs §11.2)"
             );
+            // Show the "someone is watching" overlay on the controlled
+            // host. Harmless no-op on non-Windows or when the feature
+            // is disabled.
+            indicator.show_session(session_id.to_hex(), controller_name.clone());
             // TODO: real consent UI. Self-host default is "no prompt".
             send_msg(
                 ws,
@@ -319,6 +344,7 @@ async fn handle_server_msg(
             // the map doesn't accumulate under long-running agents
             // (e.g. sessions cancelled before SDP is exchanged).
             pending_codecs.remove(&session_id);
+            indicator.hide_session(session_id.to_hex());
         }
 
         ServerMsg::Error {
