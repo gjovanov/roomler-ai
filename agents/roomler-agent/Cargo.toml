@@ -107,6 +107,7 @@ features = [
     "Win32_System_Variant",
     "Win32_UI_WindowsAndMessaging",     # GetCursorInfo / GetIconInfo for cursor capture (1E.1)
     "Win32_Graphics_Gdi",               # GetDIBits / GetObject / BITMAPINFOHEADER
+    "Win32_System_LibraryLoader",        # GetModuleHandleW for viewer-indicator window registration
     # WinRT interop for the WGC capture backend (1C.1):
     # GraphicsCaptureItemInterop::CreateForMonitor(HMONITOR), plus
     # CreateDirect3D11DeviceFromDXGIDevice to wrap our D3D11 device
@@ -152,6 +153,11 @@ enigo-input = ["dep:enigo"]
 # via arboard (Win32 / XClipboard / NSPasteboard). No system deps
 # on Windows; Linux pulls x11rb which we already use for enigo.
 clipboard = ["dep:arboard"]
+# Enables the Windows viewer-indicator overlay — topmost layered
+# click-through window drawn on the controlled host to signal "someone
+# is watching". Excluded from screen capture via SetWindowDisplayAffinity
+# so it never makes it into the RTP stream. No-op on non-Windows.
+viewer-indicator = ["dep:windows"]
 # Convenience: full media pipeline (capture + software encode).
 media = ["scrap-capture", "openh264-encoder"]
 # Full media pipeline including the MF hardware encoder. Production
@@ -162,7 +168,7 @@ media-hw = ["media", "mf-encoder"]
 full = ["media", "enigo-input", "clipboard"]
 # Everything needed including the MF hardware encoder. Production
 # Windows MSI builds with this.
-full-hw = ["full", "mf-encoder", "wgc-capture"]
+full-hw = ["full", "mf-encoder", "wgc-capture", "viewer-indicator"]
 
 [dev-dependencies]
 tokio-test = { workspace = true }
