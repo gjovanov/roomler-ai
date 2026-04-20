@@ -13,6 +13,8 @@ use anyhow::Result;
 #[cfg(feature = "scrap-capture")]
 pub mod scrap_backend;
 
+pub mod cursor;
+
 /// A captured frame, in an encoder-agnostic representation.
 ///
 /// We don't commit to a specific colour space in the trait — backends can
@@ -48,6 +50,21 @@ pub struct DirtyRect {
     pub y: u32,
     pub w: u32,
     pub h: u32,
+}
+
+/// Shape + hotspot of an OS cursor. The agent emits this once per
+/// shape change; the browser caches by the `shape_id` in the wire
+/// message so it only decodes the ARGB bitmap once per shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorInfo {
+    pub width: u32,
+    pub height: u32,
+    /// Hotspot offset in pixels relative to the top-left of the bitmap.
+    /// Arrow cursors usually have (0, 0); I-beam is near the centre.
+    pub hotspot_x: i32,
+    pub hotspot_y: i32,
+    /// 32-bit BGRA pixels, top-down (row 0 = top).
+    pub bgra: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

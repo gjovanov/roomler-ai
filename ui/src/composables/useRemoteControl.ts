@@ -41,6 +41,22 @@ export interface RcStats {
   codec: string
 }
 
+/** Remote cursor state: position in source pixels + a cache of shape
+ *  bitmaps keyed by the handle id the agent sent. RemoteControl.vue
+ *  uses this to draw the real OS cursor over the video (replacing the
+ *  synthetic initials badge for single-controller sessions). Undefined
+ *  while the agent hasn't advertised — the view falls back to the
+ *  initials badge. */
+export interface RcCursor {
+  /** Current position in agent-source pixels. Null = hidden
+   *  (fullscreen video, cursor moved off primary display). */
+  pos: { x: number; y: number; id: number } | null
+  /** ImageBitmap cache by shape id. Pure side-effect: decoding a
+   *  shape on receive means the paint loop can hand it straight to
+   *  canvas.drawImage without per-frame decode cost. */
+  shapes: Map<number, { bitmap: ImageBitmap; hotspotX: number; hotspotY: number }>
+}
+
 interface IceServer {
   urls: string[]
   username?: string
@@ -85,6 +101,10 @@ export function useRemoteControl() {
   /** Live inbound-RTP stats: bitrate, fps, codec. Zero until the first
    *  two polls land (we need two snapshots to derive bitrate). */
   const stats = ref<RcStats>({ ...EMPTY_STATS })
+  /** Remote cursor state. `pos` = null → hide the overlay + fall back
+   *  to the initials badge. Shape bitmaps are cached so the canvas
+   *  paint is just a `drawImage`. */
+  const cursor = ref<RcCursor>({ pos: null, shapes: new Map() })
   /** Controller's quality preference, persisted in localStorage. Sent to
    *  the agent over the `control` data channel whenever the user changes
    *  it *or* the channel first opens. */
@@ -162,6 +182,52 @@ export function useRemoteControl() {
         /* getStats() can reject during teardown — just wait for next tick */
       }
     }, STATS_POLL_MS)
+  }
+
+  /**
+   * Decode a `cursor:shape` payload into an `ImageBitmap` and stash
+   * it in the cursor shape cache. Fire-and-forget: a failed decode
+   * leaves the cache unchanged so the paint loop keeps drawing the
+   * previous shape (visually: a brief cursor freeze, not a crash).
+   */
+  async function applyCursorShape(
+    msg: Record<string, unknown>,
+  ): Promise<void> {
+    const id = Number(msg.id)
+    const w = Number(msg.w)
+    const h = Number(msg.h)
+    const hx = Number(msg.hx)
+    const hy = Number(msg.hy)
+    const b64 = msg.bgra
+    if (!Number.isFinite(id) || !Number.isFinite(w) || !Number.isFinite(h) || typeof b64 !== 'string') {
+      return
+    }
+    // Skip if we already have this shape cached — agent should only
+    // send it on change but defensive.
+    if (cursor.value.shapes.has(id)) return
+    try {
+      const bgra = base64ToBytes(b64)
+      if (bgra.length < w * h * 4) return
+      // Swizzle BGRA → RGBA for ImageData. Done in-place on a copy
+      // so the original buffer is reusable.
+      const rgba = new Uint8ClampedArray(w * h * 4)
+      for (let i = 0; i < w * h; i++) {
+        rgba[i * 4 + 0] = bgra[i * 4 + 2]! // R
+        rgba[i * 4 + 1] = bgra[i * 4 + 1]! // G
+        rgba[i * 4 + 2] = bgra[i * 4 + 0]! // B
+        rgba[i * 4 + 3] = bgra[i * 4 + 3]! // A
+      }
+      const imgData = new ImageData(rgba, w, h)
+      const bitmap = await createImageBitmap(imgData)
+      // Mutate the Map in place + replace the ref to trigger Vue
+      // reactivity (shallowRef would be nicer; ref + new object
+      // reference works today).
+      const shapes = new Map(cursor.value.shapes)
+      shapes.set(id, { bitmap, hotspotX: hx, hotspotY: hy })
+      cursor.value = { ...cursor.value, shapes }
+    } catch {
+      /* decode failed — skip this shape update */
+    }
   }
 
   function stopStatsPoll() {
@@ -274,6 +340,7 @@ export function useRemoteControl() {
     hasMedia.value = false
     remoteDescriptionSet = false
     pendingRemoteIce.length = 0
+    cursor.value = { pos: null, shapes: new Map() }
   }
 
   async function connect(agentId: string, permissions = 'VIEW | INPUT | CLIPBOARD') {
@@ -379,8 +446,39 @@ export function useRemoteControl() {
       maxRetransmits: 0,
     })
     channels.control = pc.createDataChannel('control', { ordered: true })
+    // Cursor channel: reliable + ordered because a dropped `cursor:
+    // shape` message would leave the browser unable to render the
+    // current cursor. Position-only updates would also be fine
+    // unordered, but muxing both on one channel means we use the
+    // stricter policy.
+    channels.cursor = pc.createDataChannel('cursor', { ordered: true })
     channels.clipboard = pc.createDataChannel('clipboard', { ordered: true })
     channels.files = pc.createDataChannel('files', { ordered: true })
+
+    // Subscribe to the cursor DC. The agent pumps `cursor:pos` /
+    // `cursor:shape` / `cursor:hide` at ~30 Hz; decode shape bitmaps
+    // eagerly so the paint loop is a zero-copy `drawImage`.
+    channels.cursor.onmessage = (ev) => {
+      if (typeof ev.data !== 'string') return
+      let msg: { t?: string } & Record<string, unknown>
+      try {
+        msg = JSON.parse(ev.data)
+      } catch {
+        return
+      }
+      if (msg.t === 'cursor:pos') {
+        const id = Number(msg.id)
+        const x = Number(msg.x)
+        const y = Number(msg.y)
+        if (Number.isFinite(id) && Number.isFinite(x) && Number.isFinite(y)) {
+          cursor.value = { ...cursor.value, pos: { id, x, y } }
+        }
+      } else if (msg.t === 'cursor:shape') {
+        void applyCursorShape(msg)
+      } else if (msg.t === 'cursor:hide') {
+        cursor.value = { ...cursor.value, pos: null }
+      }
+    }
 
     installRcHandlers()
 
@@ -572,10 +670,21 @@ export function useRemoteControl() {
     stats,
     quality,
     setQuality,
+    cursor,
     connect,
     disconnect,
     attachInput,
   }
+}
+
+/** Small base64 → Uint8Array helper. atob + TextDecoder would work
+ *  but base64 decodes to a binary string that atob(str).charCodeAt(i)
+ *  handles correctly; use the direct loop. Exported for tests. */
+export function base64ToBytes(b64: string): Uint8Array {
+  const bin = atob(b64)
+  const out = new Uint8Array(bin.length)
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i)
+  return out
 }
 
 /**

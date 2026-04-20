@@ -377,8 +377,10 @@ impl AgentPeer {
         }
 
         // Route data channels by label. `input` goes to the OS injector;
-        // `control` parses rc:* JSON (quality preference, etc.); the
-        // others (clipboard/files) are accepted but not yet wired.
+        // `control` parses rc:* JSON (quality preference, etc.);
+        // `cursor` receives an agent-driven stream of position / shape
+        // messages pumped from CursorTracker; clipboard/files are
+        // accepted but not yet wired.
         let quality_for_dc = quality_state.clone();
         pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
             let label = dc.label().to_string();
@@ -388,6 +390,7 @@ impl AgentPeer {
                 match label.as_str() {
                     "input" => attach_input_handler(dc),
                     "control" => attach_control_handler(dc, session_id, quality_for_dc),
+                    "cursor" => attach_cursor_handler(dc, session_id),
                     _ => attach_log_only(dc, session_id),
                 }
             })
@@ -861,6 +864,82 @@ fn attach_control_handler(
             }
         })
     }));
+}
+
+/// `cursor` data-channel handler. Spawns a pumper task that polls
+/// the OS cursor at 30 Hz and sends `cursor:pos` / `cursor:shape` /
+/// `cursor:hide` JSON messages over the DC. Exits when the DC closes
+/// (the `send_text` call returns an error). The tracker caches shape
+/// bitmaps by HCURSOR handle so repeated polls at the same shape only
+/// send position updates — on a static cursor the bitmap pays for
+/// itself once per shape change (arrow → I-beam → hand → etc.).
+fn attach_cursor_handler(dc: Arc<RTCDataChannel>, session_id: bson::oid::ObjectId) {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+
+    tokio::spawn(async move {
+        // Wait for the DC to be open before starting the pump — a
+        // just-constructed RTCDataChannel hasn't completed the SCTP
+        // handshake yet.
+        let mut tracker = crate::capture::cursor::CursorTracker::new();
+        // ~30 Hz matches the capture pacing. Browsers smooth out any
+        // jitter via RAF; tighter intervals would just burn DC
+        // bandwidth for sub-pixel moves.
+        let mut ticker = tokio::time::interval(Duration::from_millis(33));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Emit cursor:hide once when the cursor disappears so the
+        // browser can clear its overlay; don't keep re-emitting.
+        let mut last_hidden = false;
+        loop {
+            ticker.tick().await;
+            if dc.ready_state()
+                == webrtc::data_channel::data_channel_state::RTCDataChannelState::Closed
+            {
+                return;
+            }
+            match tracker.poll() {
+                Some(tick) => {
+                    last_hidden = false;
+                    if let Some(shape) = &tick.shape {
+                        let b64 = BASE64.encode(&shape.bgra);
+                        let msg = serde_json::json!({
+                            "t": "cursor:shape",
+                            "id": tick.shape_id,
+                            "w": shape.width,
+                            "h": shape.height,
+                            "hx": shape.hotspot_x,
+                            "hy": shape.hotspot_y,
+                            "bgra": b64,
+                        });
+                        if let Ok(s) = serde_json::to_string(&msg) {
+                            let _ = dc.send_text(s).await;
+                        }
+                    }
+                    let msg = serde_json::json!({
+                        "t": "cursor:pos",
+                        "id": tick.shape_id,
+                        "x": tick.x,
+                        "y": tick.y,
+                    });
+                    if let Ok(s) = serde_json::to_string(&msg)
+                        && dc.send_text(s).await.is_err()
+                    {
+                        debug!(%session_id, "cursor DC closed — stopping pump");
+                        return;
+                    }
+                }
+                None => {
+                    if !last_hidden {
+                        last_hidden = true;
+                        let msg = serde_json::json!({ "t": "cursor:hide" });
+                        if let Ok(s) = serde_json::to_string(&msg) {
+                            let _ = dc.send_text(s).await;
+                        }
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// Placeholder handler for data channels that aren't wired to OS output

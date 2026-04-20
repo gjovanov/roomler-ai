@@ -129,11 +129,28 @@
             Input events flow as soon as the input channel is open.
           </p>
         </div>
-        <!-- Synthetic cursor with the controller's initials. Hidden native
-             cursor over the surface (cursor: none) so this is the only
-             pointer indicator; floats at the last pointermove position. -->
+        <!-- Remote cursor overlay: canvas painted with the real OS
+             cursor bitmap received over the `cursor` data channel
+             (1E.3). Position is translated from agent-source pixels
+             into viewer-local pixels using the same letterbox
+             correction the input coords use. If no shape bitmap has
+             arrived yet, fall back to the initials badge. -->
+        <canvas
+          v-if="remoteCursorVisible"
+          ref="cursorCanvas"
+          class="remote-cursor-canvas"
+          :width="remoteCursorSize.w"
+          :height="remoteCursorSize.h"
+          :style="{ transform: `translate(${remoteCursorX}px, ${remoteCursorY}px)` }"
+        />
+        <!-- Synthetic cursor with the controller's initials. Hidden
+             native cursor over the surface (cursor: none) so this is
+             the only pointer indicator; floats at the last
+             pointermove position. Shows when the remote cursor
+             hasn't advertised yet or to mark additional controllers
+             in multi-watcher sessions. -->
         <div
-          v-if="cursorVisible && controllerInitials"
+          v-if="!remoteCursorVisible && cursorVisible && controllerInitials"
           class="cursor-badge"
           :style="{ transform: `translate(${cursorX}px, ${cursorY}px)` }"
         >
@@ -212,8 +229,101 @@ const statsFpsLabel = computed(() => {
   return `${Math.round(fps)} fps`
 })
 
+// Remote cursor overlay (1E.3). Requires both a position and a
+// matching shape bitmap; hides during paint if either is missing.
+const remoteCursorVisible = computed(() => {
+  const pos = rc.cursor.value.pos
+  if (!pos) return false
+  return rc.cursor.value.shapes.has(pos.id)
+})
+
+const remoteCursorSize = computed(() => {
+  const pos = rc.cursor.value.pos
+  if (!pos) return { w: 0, h: 0 }
+  const shape = rc.cursor.value.shapes.get(pos.id)
+  if (!shape) return { w: 0, h: 0 }
+  return { w: shape.bitmap.width, h: shape.bitmap.height }
+})
+
+// Translate agent-source pixels → viewer-local pixels using the
+// same letterbox correction the pointer input uses, so the cursor
+// lands at the exact spot on the video. `agent.value` comes from
+// load step below and carries the agent's native resolution via
+// its capability payload (the displays list); we fall back to the
+// video element's intrinsic size otherwise.
+const remoteCursorX = computed(() => {
+  const pos = rc.cursor.value.pos
+  if (!pos) return 0
+  const shape = rc.cursor.value.shapes.get(pos.id)
+  if (!shape) return 0
+  const scale = letterboxScale()
+  return scale.offsetX + pos.x * scale.sx - shape.hotspotX
+})
+const remoteCursorY = computed(() => {
+  const pos = rc.cursor.value.pos
+  if (!pos) return 0
+  const shape = rc.cursor.value.shapes.get(pos.id)
+  if (!shape) return 0
+  const scale = letterboxScale()
+  return scale.offsetY + pos.y * scale.sy - shape.hotspotY
+})
+
+function letterboxScale(): { sx: number; sy: number; offsetX: number; offsetY: number } {
+  const stage = stageEl.value
+  const video = videoEl.value
+  if (!stage || !video || !video.videoWidth || !video.videoHeight) {
+    return { sx: 1, sy: 1, offsetX: 0, offsetY: 0 }
+  }
+  const fw = stage.clientWidth
+  const fh = stage.clientHeight
+  const vAR = video.videoWidth / video.videoHeight
+  const fAR = fw / fh
+  let visibleW: number
+  let visibleH: number
+  let offsetX: number
+  let offsetY: number
+  if (vAR > fAR) {
+    visibleW = fw
+    visibleH = fw / vAR
+    offsetX = 0
+    offsetY = (fh - visibleH) / 2
+  } else {
+    visibleW = fh * vAR
+    visibleH = fh
+    offsetX = (fw - visibleW) / 2
+    offsetY = 0
+  }
+  return {
+    sx: visibleW / video.videoWidth,
+    sy: visibleH / video.videoHeight,
+    offsetX,
+    offsetY,
+  }
+}
+
+// Paint the current cursor shape onto the canvas every time the
+// shape or pos changes. drawImage is cheap (O(cursor pixels), ≤32×32
+// for classic cursors) so we don't need an explicit RAF loop.
+watch(
+  () => {
+    const p = rc.cursor.value.pos
+    return [p?.id ?? null, cursorCanvas.value] as const
+  },
+  ([id, canvas]) => {
+    if (!canvas || id == null) return
+    const shape = rc.cursor.value.shapes.get(id)
+    if (!shape) return
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
+    ctx.clearRect(0, 0, canvas.width, canvas.height)
+    ctx.drawImage(shape.bitmap, 0, 0)
+  },
+  { immediate: false },
+)
+
 const videoEl = ref<HTMLVideoElement | null>(null)
 const stageEl = ref<HTMLElement | null>(null)
+const cursorCanvas = ref<HTMLCanvasElement | null>(null)
 let detachInput: (() => void) | null = null
 
 // Synthetic cursor overlay. The native pointer is hidden over the video
@@ -344,6 +454,15 @@ onBeforeUnmount(() => {
   height: 100%;
   object-fit: contain;
   background: #000;
+}
+.remote-cursor-canvas {
+  position: absolute;
+  top: 0;
+  left: 0;
+  pointer-events: none;
+  z-index: 2;
+  image-rendering: pixelated;
+  will-change: transform;
 }
 .cursor-badge {
   position: absolute;

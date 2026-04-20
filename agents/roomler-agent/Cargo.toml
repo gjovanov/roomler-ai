@@ -74,6 +74,10 @@ enigo = { workspace = true, optional = true }
 # Used by the media pump to wrap encoded NALUs in webrtc Sample.data.
 bytes = "1"
 
+# Cursor-shape encoding for the cursor data channel (1E.2). Small —
+# only used in one place to b64 a 32-pixel BGRA bitmap per shape.
+base64 = { workspace = true }
+
 # Random fallback for machine_id
 rand = { workspace = true }
 
@@ -94,6 +98,8 @@ features = [
     "Win32_Graphics_Dxgi_Common",       # DXGI_FORMAT etc.
     "Win32_System_Com",
     "Win32_System_Variant",
+    "Win32_UI_WindowsAndMessaging",     # GetCursorInfo / GetIconInfo for cursor capture (1E.1)
+    "Win32_Graphics_Gdi",               # GetDIBits / GetObject / BITMAPINFOHEADER
 ]
 
 [features]

@@ -10,6 +10,7 @@ import {
   letterboxedNormalise,
   extractStatsSnapshot,
   inspectBrowserVideoCodecs,
+  base64ToBytes,
 } from '@/composables/useRemoteControl'
 
 describe('browserButton', () => {
@@ -347,5 +348,34 @@ describe('inspectBrowserVideoCodecs', () => {
       'vp8',
       'vp9',
     ])
+  })
+})
+
+describe('base64ToBytes', () => {
+  it('round-trips an all-zero buffer', () => {
+    // 8 zero bytes → base64 "AAAAAAAAAAA="
+    const bytes = base64ToBytes('AAAAAAAAAAA=')
+    expect(bytes.length).toBe(8)
+    for (const b of bytes) expect(b).toBe(0)
+  })
+
+  it('decodes a single-byte buffer', () => {
+    // 0xFF → "/w=="
+    expect(Array.from(base64ToBytes('/w=='))).toEqual([0xff])
+  })
+
+  it('decodes a BGRA cursor-shape-sized buffer', () => {
+    // 32×32 BGRA = 4096 bytes of alternating pattern. Agent encodes
+    // this as base64 over the `cursor` data channel (1E.2); the
+    // decoder must round-trip byte-exactly.
+    const raw = new Uint8Array(4096)
+    for (let i = 0; i < raw.length; i++) raw[i] = (i * 31) & 0xff
+    // encode via btoa
+    let bin = ''
+    for (const b of raw) bin += String.fromCharCode(b)
+    const b64 = btoa(bin)
+    const out = base64ToBytes(b64)
+    expect(out.length).toBe(raw.length)
+    for (let i = 0; i < raw.length; i++) expect(out[i]).toBe(raw[i])
   })
 })
