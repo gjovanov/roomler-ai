@@ -479,16 +479,31 @@ export function useRemoteControl() {
       remoteStream.value = new MediaStream([ev.track])
       hasMedia.value = true
       // Tell the browser we care about latency, not playback smoothness.
-      // Default jitterBufferTarget is adaptive (100-500 ms); for remote
-      // control 50 ms is the right trade: cut perceived click-to-pixel
-      // delay to the wire at the cost of occasional stutter under loss.
-      // Setter is Chromium 116+ / Firefox 123+ — the try/catch is the
-      // actual guard against older browsers; `in`-check was cosmetic.
+      // Chromium enforces a soft ~80 ms floor regardless, but asking
+      // for zero still shaves ~30-50 ms off the previous 50 ms setting
+      // because the jitter-buffer overhead is both the floor AND the
+      // requested target. See
+      // https://www.w3.org/TR/webrtc-extensions/#dom-rtcrtpreceiver-jitterbuffertarget
       try {
-        (ev.receiver as RTCRtpReceiver & { jitterBufferTarget?: number | null })
-          .jitterBufferTarget = 50
+        const receiver = ev.receiver as RTCRtpReceiver & {
+          jitterBufferTarget?: number | null
+          playoutDelayHint?: number | null
+        }
+        receiver.jitterBufferTarget = 0
+        // Firefox + non-standard Chromium hint — belt-and-braces with
+        // jitterBufferTarget. Same intent: "decode + display as fast
+        // as possible; I'd rather see stutter than lag."
+        receiver.playoutDelayHint = 0
       } catch {
         // Best-effort — browser will use its own adaptive default.
+      }
+      // contentHint tells the compositor this is motion (not detail),
+      // which switches Chrome's <video> internal smoothing off and
+      // discourages re-buffering on minor frame timing irregularity.
+      try {
+        (ev.track as MediaStreamTrack & { contentHint?: string }).contentHint = 'motion'
+      } catch {
+        /* ignore */
       }
     }
 

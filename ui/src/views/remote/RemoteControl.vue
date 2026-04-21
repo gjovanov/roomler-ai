@@ -566,11 +566,35 @@ function startSession() {
 // see videoEl.value = null at that moment and silently skip the assignment;
 // when the element mounts later no watcher re-fires. Watch both refs and
 // attach whenever both are present.
+let rvfcHandle: number | null = null
 watch(
   () => [rc.remoteStream.value, videoEl.value] as const,
   ([stream, el]) => {
     if (stream && el && el.srcObject !== stream) {
       el.srcObject = stream
+      // requestVideoFrameCallback keeps the tab "hot" against
+      // Chrome's background throttling AND gives us a cheap hook to
+      // recover from the video element's paused-for-optimization
+      // state that sometimes triggers on identical-frame runs (e.g.
+      // long idle screens).
+      const elWithRvfc = el as HTMLVideoElement & {
+        requestVideoFrameCallback?: (cb: (now: number, metadata: unknown) => void) => number
+      }
+      const rvfc = elWithRvfc.requestVideoFrameCallback
+      if (typeof rvfc === 'function') {
+        const tick = () => {
+          if (!videoEl.value) {
+            rvfcHandle = null
+            return
+          }
+          if (videoEl.value.paused) {
+            videoEl.value.play().catch(() => { /* autoplay gating — ignore */ })
+          }
+          rvfcHandle = (videoEl.value as typeof elWithRvfc)
+            .requestVideoFrameCallback!(tick)
+        }
+        rvfcHandle = rvfc.call(el, tick)
+      }
     }
   },
   { immediate: true },
