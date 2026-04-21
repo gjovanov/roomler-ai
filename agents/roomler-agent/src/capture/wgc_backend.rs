@@ -91,6 +91,18 @@ const NEXT_FRAME_TIMEOUT: Duration = Duration::from_millis(100);
 struct SharedSlot {
     latest: Mutex<Option<FramePayload>>,
     notify: Notify,
+    /// Total `FrameArrived` events the handler processed. Includes
+    /// frames that were later dropped because the slot was occupied.
+    /// Diagnostic: at steady-state this should equal the monitor's
+    /// refresh rate × elapsed seconds; if it's much lower the WGC
+    /// pipeline itself is producing fewer frames (Intel iGPU under
+    /// contention, GPU schedule starvation).
+    arrived_total: std::sync::atomic::AtomicU64,
+    /// Times the handler replaced a still-un-consumed payload in the
+    /// slot. High values mean the encode path can't keep up with
+    /// the capture rate. Ratio against `arrived_total` is the
+    /// interesting number.
+    dropped_stale: std::sync::atomic::AtomicU64,
 }
 
 /// Internal frame representation carried from the event handler to
@@ -161,6 +173,8 @@ impl WgcCapture {
         let shared = Arc::new(SharedSlot {
             latest: Mutex::new(None),
             notify: Notify::new(),
+            arrived_total: std::sync::atomic::AtomicU64::new(0),
+            dropped_stale: std::sync::atomic::AtomicU64::new(0),
         });
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -459,9 +473,34 @@ fn worker_main(
                 captured_at: Instant::now(),
                 dirty_rects,
             };
-            {
+            let arrived = handler_shared
+                .arrived_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            let had_stale = {
                 let mut slot = handler_shared.latest.lock().unwrap();
-                *slot = Some(payload);
+                let prev = slot.replace(payload);
+                prev.is_some()
+            };
+            if had_stale {
+                handler_shared
+                    .dropped_stale
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            // Every 120 arrivals (~2 s at 60 Hz) log the drop ratio so
+            // we can see in the field whether the encode consumer is
+            // keeping up with the capture producer. Silent after the
+            // first log if nothing is dropping.
+            if arrived.is_multiple_of(120) {
+                let drops = handler_shared
+                    .dropped_stale
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                tracing::info!(
+                    arrived,
+                    drops,
+                    drop_ratio_pct = (drops * 100) / arrived.max(1),
+                    "wgc: capture cadence"
+                );
             }
             handler_shared.notify.notify_waiters();
             Ok(())

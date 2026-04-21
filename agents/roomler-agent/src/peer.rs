@@ -618,6 +618,18 @@ async fn media_pump(
     let mut frames_keepalive: u64 = 0;
     let mut bytes_written: u64 = 0;
     let mut write_errors: u64 = 0;
+    // Per-stage wall-time accumulators (microseconds) so the heartbeat
+    // can attribute the per-frame budget. When users report "only 7 fps"
+    // the breakdown makes it obvious whether capture is blocking
+    // (WGC CPU readback on iGPU) or encode is saturated (fallback to
+    // a weak MFT after an adapter cascade demoted to Intel UHD).
+    let mut capture_time_us: u64 = 0;
+    let mut encode_time_us: u64 = 0;
+    // Reset the accumulators at each heartbeat so averages are over
+    // the preceding ~30-frame window, not the entire session.
+    let mut heartbeat_frames_base: u64 = 0;
+    let mut heartbeat_capture_us_base: u64 = 0;
+    let mut heartbeat_encode_us_base: u64 = 0;
 
     // Last applied quality preference. Initialised to a sentinel
     // (0xFF) so the first loop iteration unconditionally pushes the
@@ -640,8 +652,11 @@ async fn media_pump(
     const HYSTERESIS_PCT: u32 = 15;
 
     loop {
+        let capture_started = std::time::Instant::now();
         let frame: std::sync::Arc<crate::capture::Frame> = match capturer.next_frame().await {
             Ok(Some(f)) => {
+                capture_time_us =
+                    capture_time_us.saturating_add(capture_started.elapsed().as_micros() as u64);
                 frames_captured += 1;
                 last_capture_at = std::time::Instant::now();
                 let arc = std::sync::Arc::new(f);
@@ -799,6 +814,7 @@ async fn media_pump(
                 last_applied_bitrate = target;
             }
         }
+        let encode_started = std::time::Instant::now();
         let packets = match enc.encode(frame).await {
             Ok(p) => p,
             Err(e) => {
@@ -806,6 +822,7 @@ async fn media_pump(
                 return;
             }
         };
+        encode_time_us = encode_time_us.saturating_add(encode_started.elapsed().as_micros() as u64);
 
         // Wallclock-based duration so RTP timestamps advance at real time,
         // not at an assumed 30 fps. First sample falls back to the nominal
@@ -854,13 +871,25 @@ async fn media_pump(
         }
         if frames_encoded.is_multiple_of(30) {
             let backend = encoder.as_ref().map(|e| e.name()).unwrap_or("none");
+            // Average per-stage microseconds over the preceding 30-frame
+            // window (not the whole session), so transient stalls
+            // don't get smeared away by hours of steady operation.
+            let frames_in_window = frames_encoded.saturating_sub(heartbeat_frames_base).max(1);
+            let capture_us_window = capture_time_us.saturating_sub(heartbeat_capture_us_base);
+            let encode_us_window = encode_time_us.saturating_sub(heartbeat_encode_us_base);
+            let avg_capture_ms = capture_us_window / (1_000 * frames_in_window);
+            let avg_encode_ms = encode_us_window / (1_000 * frames_in_window);
             info!(
                 %session_id,
                 backend,
                 frames_captured, frames_empty, frames_encoded, frames_keepalive,
                 bytes_written, write_errors,
+                avg_capture_ms, avg_encode_ms,
                 "media pump heartbeat (≈1s window)"
             );
+            heartbeat_frames_base = frames_encoded;
+            heartbeat_capture_us_base = capture_time_us;
+            heartbeat_encode_us_base = encode_time_us;
         }
     }
 }
