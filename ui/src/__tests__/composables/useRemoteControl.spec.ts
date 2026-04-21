@@ -12,6 +12,7 @@ import {
   inspectBrowserVideoCodecs,
   base64ToBytes,
   shouldPreventDefault,
+  filterCapsByPreference,
 } from '@/composables/useRemoteControl'
 
 function keyEvent(code: string, mods: Partial<{ ctrl: boolean; alt: boolean; meta: boolean; shift: boolean }> = {}): KeyboardEvent {
@@ -428,5 +429,38 @@ describe('shouldPreventDefault', () => {
   it('does not intercept a bare letter keypress without modifiers', () => {
     expect(shouldPreventDefault(keyEvent('KeyA'), true)).toBe(false)
     expect(shouldPreventDefault(keyEvent('KeyZ', { shift: true }), true)).toBe(false)
+  })
+})
+
+describe('filterCapsByPreference', () => {
+  const all = ['av1', 'h265', 'vp9', 'h264', 'vp8']
+
+  it('passes the full list through when no override is set', () => {
+    expect(filterCapsByPreference(all, null)).toEqual(all)
+  })
+
+  it('narrows to the preferred codec plus H.264 as a parachute', () => {
+    expect(filterCapsByPreference(all, 'h265')).toEqual(['h265', 'h264'])
+    expect(filterCapsByPreference(all, 'av1')).toEqual(['av1', 'h264'])
+    expect(filterCapsByPreference(all, 'vp9')).toEqual(['vp9', 'h264'])
+  })
+
+  it('omits the H.264 parachute when H.264 is the preference itself', () => {
+    expect(filterCapsByPreference(all, 'h264')).toEqual(['h264'])
+  })
+
+  it('returns just the preferred codec when the browser does not support H.264', () => {
+    expect(filterCapsByPreference(['h265', 'vp9'], 'h265')).toEqual(['h265'])
+  })
+
+  it('falls back to just the H.264 parachute when the preferred codec is absent but H.264 is available', () => {
+    expect(filterCapsByPreference(['h264', 'vp9'], 'av1')).toEqual(['h264'])
+  })
+
+  it('returns empty when neither the preferred codec nor H.264 is advertised', () => {
+    // Forcing AV1 on a Firefox that offers neither AV1 nor H.264 will
+    // fail to negotiate. That's by design — the operator sees the
+    // filtered caps in the console log and can clear the override.
+    expect(filterCapsByPreference(['vp9'], 'av1')).toEqual([])
   })
 })

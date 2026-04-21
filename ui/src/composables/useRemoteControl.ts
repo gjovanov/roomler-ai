@@ -89,6 +89,62 @@ function persistQuality(q: RcQuality) {
   }
 }
 
+/** Persist key for the optional codec override. When the user forces a
+ *  specific codec (H.265 or AV1) for an A/B comparison, we save it so
+ *  the choice survives a page reload. `null` means no override — the
+ *  agent picks from the full browser×agent intersection. */
+const PREFERRED_CODEC_STORAGE_KEY = 'roomler-rc-preferred-codec'
+
+/** Codec names that round-trip between `RTCRtpReceiver.getCapabilities`,
+ *  the agent's advertised caps, and SDP fmtp munging. Keep in sync
+ *  with `encode/caps.rs::pick_best_codec`. */
+export type RcPreferredCodec = 'h264' | 'h265' | 'av1' | 'vp9' | 'vp8'
+
+function readStoredPreferredCodec(): RcPreferredCodec | null {
+  try {
+    const raw = globalThis.localStorage?.getItem(PREFERRED_CODEC_STORAGE_KEY)
+    if (raw === 'h264' || raw === 'h265' || raw === 'av1' || raw === 'vp9' || raw === 'vp8') {
+      return raw
+    }
+  } catch {
+    /* privacy mode → treat as no override */
+  }
+  return null
+}
+
+function persistPreferredCodec(c: RcPreferredCodec | null) {
+  try {
+    if (c == null) {
+      globalThis.localStorage?.removeItem(PREFERRED_CODEC_STORAGE_KEY)
+    } else {
+      globalThis.localStorage?.setItem(PREFERRED_CODEC_STORAGE_KEY, c)
+    }
+  } catch {
+    /* best-effort */
+  }
+}
+
+/** Given the full set of browser-supported codecs and an optional
+ *  override, return the list the agent should see in `browser_caps`.
+ *  When `preferred` is set, only that codec (plus H.264 as a safety
+ *  fallback if the browser has it) is forwarded — so the agent's
+ *  `pick_best_codec` can only land on the preferred one, or fall back
+ *  to H.264 if the agent itself lacks support. Exported for tests. */
+export function filterCapsByPreference(
+  caps: string[],
+  preferred: RcPreferredCodec | null,
+): string[] {
+  if (preferred == null) return caps
+  const out = caps.filter((c) => c === preferred)
+  // Always keep H.264 as a parachute — if the user forces AV1 but the
+  // agent on this host can't encode AV1, we want a working session
+  // rather than a failed one.
+  if (preferred !== 'h264' && caps.includes('h264')) {
+    out.push('h264')
+  }
+  return out
+}
+
 export function useRemoteControl() {
   const ws = useWsStore()
   const phase = ref<RcPhase>('idle')
@@ -109,6 +165,12 @@ export function useRemoteControl() {
    *  the agent over the `control` data channel whenever the user changes
    *  it *or* the channel first opens. */
   const quality = ref<RcQuality>(readStoredQuality())
+  /** Optional codec override. `null` = let the agent pick from the full
+   *  intersection; `'h265'` = only advertise H.265 + H.264 fallback to
+   *  the agent so AV1 can't win. Useful for A/B comparisons
+   *  ("is HEVC actually better than H.264 on this link?"). Persisted
+   *  to localStorage so the choice survives a page reload. */
+  const preferredCodec = ref<RcPreferredCodec | null>(readStoredPreferredCodec())
 
   let pc: RTCPeerConnection | null = null
   /** Data channels we open proactively (per docs §5). Labels match the
@@ -176,6 +238,15 @@ export function useRemoteControl() {
     quality.value = q
     persistQuality(q)
     sendQualityPreference()
+  }
+
+  /** Force a specific codec for the next session. Pass `null` to clear
+   *  the override. Takes effect on the next `connect()` — live sessions
+   *  keep whatever SDP they negotiated at start. Persisted to
+   *  localStorage so the preference survives a reload. */
+  function setPreferredCodec(c: RcPreferredCodec | null) {
+    preferredCodec.value = c
+    persistPreferredCodec(c)
   }
 
   function startStatsPoll() {
@@ -368,12 +439,19 @@ export function useRemoteControl() {
     // VP9 = WebRTC-mandatory, VP8 = legacy. Browsers without
     // RTCRtpReceiver.getCapabilities (older Safari/Firefox) get an
     // empty list and the agent falls back to H.264-only.
-    const browserCaps = inspectBrowserVideoCodecs()
-    if (browserCaps.length > 0) {
-      // Surface in the UI / logs so the operator can see what was
-      // advertised — useful when debugging "why didn't H.265
-      // negotiate" on a session.
-      console.info('[rc] browser video codecs:', browserCaps.join(', '))
+    const allBrowserCaps = inspectBrowserVideoCodecs()
+    const browserCaps = filterCapsByPreference(allBrowserCaps, preferredCodec.value)
+    if (allBrowserCaps.length > 0) {
+      // Surface both lists in the console — useful when debugging
+      // "why didn't H.265 negotiate" on a session. Shown as the raw
+      // browser list ∩ forced preference → sent list.
+      console.info(
+        '[rc] browser codecs:',
+        allBrowserCaps.join(', '),
+        preferredCodec.value ? `(forced ${preferredCodec.value})` : '',
+        '→ sending to agent:',
+        browserCaps.join(', '),
+      )
     }
 
     // Pull TURN creds before creating the PC so the first gather uses them.
@@ -861,6 +939,8 @@ export function useRemoteControl() {
     getAgentClipboard,
     sendCtrlAltDel,
     uploadFile,
+    preferredCodec,
+    setPreferredCodec,
   }
 }
 

@@ -33,14 +33,16 @@ pub mod mf;
 ///
 /// A fixed bitrate across all sizes (which 0.1.10 used at 8 Mbps) is
 /// either overkill or underkill at any resolution other than the one it
-/// was tuned for; we derive from dims. Adaptive bitrate based on
-/// TWCC/REMB remains future work — this just picks a better *starting
-/// point*. Desktop-content target = 0.10 bpp/s gives ≈6 Mbps at 720p,
-/// ≈9 Mbps at 1080p, ≈13 Mbps at 1440p; 4K clamps to MAX. Bumped from
-/// 0.07 in 0.1.32 — in-field HEVC streams at 1.8 Mbps (1920×1200 @ 18
-/// fps due to DXGI's change-driven capture) looked visibly pixelated.
-/// Higher bpp target raises the ceiling even when the VFR pacer
-/// undershoots target fps.
+/// was tuned for; we derive from dims × fps × bpp/s. Desktop-content
+/// bpp/s bumped to 0.15 in the RustDesk-parity sprint: we measured
+/// RustDesk at ~0.14 bpp/s and decided perceptual parity on fine text
+/// trumps a 30% bandwidth save. At 60 fps 1080p that's ≈18.7 Mbps
+/// uncapped, which the 25 Mbps MAX now accommodates.
+///
+/// MAX bumped 15→25 Mbps so 4K60 HEVC isn't permanently clipped on
+/// LAN/gigabit links. Adaptive bitrate driven by REMB still pulls the
+/// effective bitrate down under congestion; this value is a ceiling,
+/// not a target.
 #[cfg_attr(
     not(any(
         feature = "openh264-encoder",
@@ -49,12 +51,26 @@ pub mod mf;
     allow(dead_code)
 )]
 pub(crate) fn initial_bitrate_for(width: u32, height: u32) -> u32 {
+    initial_bitrate_for_fps(width, height, 30)
+}
+
+/// Like `initial_bitrate_for` but parameterised on fps. Backends that
+/// know their target rate (peer.rs sets it per-session via
+/// target_fps_for) pass their real value; the default-30 form above is
+/// kept for call sites that don't have fps in scope.
+#[cfg_attr(
+    not(any(
+        feature = "openh264-encoder",
+        all(target_os = "windows", feature = "mf-encoder")
+    )),
+    allow(dead_code)
+)]
+pub(crate) fn initial_bitrate_for_fps(width: u32, height: u32, fps: u32) -> u32 {
     const MIN_BITRATE_BPS: u32 = 1_500_000;
-    const MAX_BITRATE_BPS: u32 = 15_000_000;
-    const DESKTOP_BPP_PER_SECOND: f64 = 0.10;
-    const FPS: f64 = 30.0;
+    const MAX_BITRATE_BPS: u32 = 25_000_000;
+    const DESKTOP_BPP_PER_SECOND: f64 = 0.15;
     let pixels = width as f64 * height as f64;
-    let raw = (pixels * FPS * DESKTOP_BPP_PER_SECOND) as u32;
+    let raw = (pixels * fps as f64 * DESKTOP_BPP_PER_SECOND) as u32;
     raw.clamp(MIN_BITRATE_BPS, MAX_BITRATE_BPS)
 }
 

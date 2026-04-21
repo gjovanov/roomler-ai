@@ -43,6 +43,24 @@
         prepend-inner-icon="mdi-quality-high"
         aria-label="Quality preference"
       />
+      <!-- Codec override: null = let the agent pick from the full
+           browser∩agent intersection (recommended). Forcing a specific
+           codec is for A/B comparison — "is H.265 really better than
+           H.264 on this link?". Takes effect on the next Connect. -->
+      <v-select
+        v-model="codecOverride"
+        :items="codecOptions"
+        density="compact"
+        hide-details
+        variant="outlined"
+        style="max-width: 140px;"
+        class="mr-2"
+        prepend-inner-icon="mdi-video-outline"
+        aria-label="Codec override"
+        :title="codecOverride == null
+          ? 'Agent picks the best available codec'
+          : `Forcing ${codecOverride.toUpperCase()} — takes effect on next Connect`"
+      />
       <!-- Clipboard sync buttons. Visible only during a live session
            because the DC is only open then. Both sides require a user
            gesture — navigator.clipboard.{readText,writeText} throw
@@ -235,7 +253,7 @@ import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { useAgentStore, type Agent } from '@/stores/agents'
 import { useAuthStore } from '@/stores/auth'
-import { useRemoteControl, type RcQuality } from '@/composables/useRemoteControl'
+import { useRemoteControl, type RcQuality, type RcPreferredCodec } from '@/composables/useRemoteControl'
 import { useSnackbar } from '@/composables/useSnackbar'
 
 const route = useRoute()
@@ -338,6 +356,22 @@ const qualityOptions = [
 const quality = computed<RcQuality>({
   get: () => rc.quality.value,
   set: (v: RcQuality) => rc.setQuality(v),
+})
+
+// Codec override: null = let the agent pick the best available. The
+// value is persisted via the composable (localStorage) so it survives
+// a page reload; it only takes effect on the next connect — live
+// sessions keep whatever SDP they negotiated at start.
+const codecOptions = [
+  { title: 'Codec: Auto', value: null },
+  { title: 'H.264', value: 'h264' },
+  { title: 'H.265 / HEVC', value: 'h265' },
+  { title: 'AV1', value: 'av1' },
+  { title: 'VP9', value: 'vp9' },
+] as const
+const codecOverride = computed<RcPreferredCodec | null>({
+  get: () => rc.preferredCodec.value,
+  set: (v: RcPreferredCodec | null) => rc.setPreferredCodec(v),
 })
 
 // Stats readout formatters. Pure computeds — the composable already

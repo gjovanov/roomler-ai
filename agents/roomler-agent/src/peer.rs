@@ -42,9 +42,30 @@ use crate::capture;
 use crate::encode;
 use crate::input;
 
-/// Target capture rate. Aligns the sample pacing sent to the browser with
-/// how fast the capturer emits frames.
-const TARGET_FPS: u32 = 30;
+/// Target capture rate on the **software** path. openh264 pegs a CPU core
+/// above ~35 fps at 1080p; 30 is the stable ceiling. See `target_fps_for`
+/// for the hardware path which lifts to 60.
+const TARGET_FPS_SW: u32 = 30;
+
+/// Target capture rate on the **hardware** path. MF-HW + WGC handle
+/// 2560×1600 @ 60 and 4K @ 60 comfortably on RTX-class GPUs. Bumping the
+/// capture rate is the single biggest perceptual win against RustDesk's
+/// native 60 fps pipeline — halves motion blur / step latency on pointer
+/// and scroll.
+const TARGET_FPS_HW: u32 = 60;
+
+/// Pick a target capture rate consistent with the chosen encoder. On
+/// Auto with `mf-encoder` compiled in we assume the cascade will land on
+/// MF-HW (probe-gated at startup, falls back cleanly) and bias toward
+/// 60. Everywhere else the 30 fps SW floor stays.
+fn target_fps_for(pref: encode::EncoderPreference) -> u32 {
+    match pref {
+        encode::EncoderPreference::Hardware => TARGET_FPS_HW,
+        #[cfg(all(target_os = "windows", feature = "mf-encoder"))]
+        encode::EncoderPreference::Auto => TARGET_FPS_HW,
+        _ => TARGET_FPS_SW,
+    }
+}
 
 /// Quality preference advertised by the controller over the `control`
 /// data channel. Encoded as `AtomicU8` so the media pump can poll it
@@ -77,10 +98,12 @@ mod quality {
 
     /// Map a quality preference to the bitrate target, scaled off the
     /// resolution-derived baseline. Low halves it (better fit for
-    /// metered uplinks), High adds 50% (capped at 20 Mbps to keep the
-    /// VBV buffer math reasonable on 4K).
+    /// metered uplinks), High adds 50%. Ceiling lifted 20 → 30 Mbps in
+    /// the RustDesk-parity sprint so 4K60 HEVC at High can actually
+    /// hit the 25 Mbps the base provides and still leave headroom
+    /// for burst bits on a GOP boundary.
     pub(super) fn target_bitrate(quality: u8, base_bps: u32) -> u32 {
-        const MAX_HIGH_BPS: u32 = 20_000_000;
+        const MAX_HIGH_BPS: u32 = 30_000_000;
         match quality {
             LOW => (base_bps / 2).max(500_000),
             HIGH => base_bps.saturating_mul(3) / 2,
@@ -99,13 +122,23 @@ fn downscale_for(pref: encode::EncoderPreference) -> capture::DownscalePolicy {
         encode::EncoderPreference::Software => capture::DownscalePolicy::Auto,
         encode::EncoderPreference::Hardware => capture::DownscalePolicy::Never,
         encode::EncoderPreference::Auto => {
-            // Hardware MFT activation on mixed-GPU systems (e.g.
-            // NVIDIA + Intel iGPU) still hits vendor-specific issues
-            // — NVIDIA needs an explicit DXGI adapter match, Intel
-            // QSV needs the async event loop. Both are phase 3 work.
-            // Until then, Auto → Auto-downscale even on Windows, so
-            // the MS SW MFT runs at 1080p where it sustains 30 fps.
-            capture::DownscalePolicy::Auto
+            // On Windows with mf-encoder compiled in, the cascade picks
+            // MF-HW first (probe-gated at startup, falls back to
+            // openh264 cleanly if probe fails). The HW path handles 4K
+            // at native resolution; the 2× CPU box filter is dead
+            // weight that costs perceived resolution. Skip it — if the
+            // cascade falls back to SW, the encoder itself will refuse
+            // 4K@60 and the user still gets a working session at
+            // degraded fps, which is strictly better than losing
+            // native resolution unconditionally.
+            #[cfg(all(target_os = "windows", feature = "mf-encoder"))]
+            {
+                capture::DownscalePolicy::Never
+            }
+            #[cfg(not(all(target_os = "windows", feature = "mf-encoder")))]
+            {
+                capture::DownscalePolicy::Auto
+            }
         }
     }
 }
@@ -529,24 +562,26 @@ async fn media_pump(
     // still get the 2× downsample to hit the encoder's throughput
     // ceiling.
     let downscale = downscale_for(encoder_preference);
+    let target_fps = target_fps_for(encoder_preference);
     tracing::info!(
         %session_id,
         ?encoder_preference,
         ?downscale,
+        target_fps,
         "media pump starting"
     );
-    let mut capturer = capture::open_default(TARGET_FPS, downscale);
+    let mut capturer = capture::open_default(target_fps, downscale);
     let mut encoder: Option<Box<dyn encode::VideoEncoder>> = None;
     let mut encoder_dims: Option<(u32, u32)> = None;
     // Floor on the `duration` field of each Sample. DXGI Desktop Duplication
     // only emits a frame when the screen changes, so on an idle desktop the
     // real gap between two write_sample calls can be seconds. RTP timestamp
-    // increments are `duration * clock_rate`; if duration stays at 33 ms
-    // (30 fps nominal) while wallclock advances by 1 s, the browser's
-    // playout clock starves and the video element goes black. Measure the
-    // wallclock gap per frame and use that as the duration — the first
-    // sample uses the nominal floor.
-    let frame_duration_floor = Duration::from_micros(1_000_000 / TARGET_FPS as u64);
+    // increments are `duration * clock_rate`; if duration stays at target_fps
+    // (16.6 ms at 60 fps, 33 ms at 30 fps) while wallclock advances by 1 s,
+    // the browser's playout clock starves and the video element goes black.
+    // Measure the wallclock gap per frame and use that as the duration — the
+    // first sample uses the nominal floor derived from target_fps.
+    let frame_duration_floor = Duration::from_micros(1_000_000 / target_fps as u64);
     let mut last_sample_at: Option<std::time::Instant> = None;
 
     // Keep the most recent captured frame around so we can re-feed it to
@@ -649,7 +684,7 @@ async fn media_pump(
                 // so a genuine infinite error loop doesn't spin a core.
                 warn!(%session_id, %e, "capture error — rebuilding capturer");
                 tokio::time::sleep(Duration::from_millis(500)).await;
-                capturer = capture::open_default(TARGET_FPS, downscale);
+                capturer = capture::open_default(target_fps, downscale);
                 // Force the encoder to rebuild on the next frame — new
                 // capturer may come back at a different resolution (e.g.
                 // after a DPI change) and openh264 can't be resized
@@ -726,7 +761,7 @@ async fn media_pump(
         let q_now = quality_state.load(std::sync::atomic::Ordering::Relaxed);
         let remb_now = remb_bps.load(std::sync::atomic::Ordering::Relaxed);
         if let Some((w, h)) = encoder_dims {
-            let base = encode::initial_bitrate_for(w, h);
+            let base = encode::initial_bitrate_for_fps(w, h, target_fps);
             let quality_target = quality::target_bitrate(q_now, base);
             // If REMB hasn't reported, defer to the quality-derived
             // target. Once it does, take min(quality, remb*safety) so
@@ -1479,11 +1514,11 @@ mod tests {
     }
 
     #[test]
-    fn target_bitrate_high_caps_at_20_mbps() {
-        // 4K base is 12 Mbps clamped; High should add 50% capped at 20.
+    fn target_bitrate_high_caps_at_30_mbps() {
+        // 4K60 base is 25 Mbps clamped; High should add 50% capped at 30.
         assert_eq!(target_bitrate(HIGH, 12_000_000), 18_000_000);
-        // Very high base: cap engages.
-        assert_eq!(target_bitrate(HIGH, 20_000_000), 20_000_000);
-        assert_eq!(target_bitrate(HIGH, 50_000_000), 20_000_000);
+        // Very high base: cap engages at the new 30M ceiling.
+        assert_eq!(target_bitrate(HIGH, 30_000_000), 30_000_000);
+        assert_eq!(target_bitrate(HIGH, 50_000_000), 30_000_000);
     }
 }
