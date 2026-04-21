@@ -248,10 +248,7 @@ pub fn sanitize_filename(name: &str) -> String {
     // Take the last path component. Browsers normally send just a
     // basename but some send full paths on some platforms (drag-and-
     // drop from Finder, etc.).
-    let base = name
-        .rsplit(|c| c == '/' || c == '\\')
-        .next()
-        .unwrap_or(name);
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
     let cleaned: String = base
         .chars()
         .map(|c| {
@@ -296,19 +293,20 @@ fn unique_path(dir: &std::path::Path, name: &str) -> PathBuf {
 }
 
 fn split_stem_ext(name: &str) -> (&str, &str) {
-    if let Some(idx) = name.rfind('.') {
-        if idx > 0 && idx < name.len() - 1 {
-            return (&name[..idx], &name[idx + 1..]);
-        }
+    if let Some(idx) = name.rfind('.')
+        && idx > 0
+        && idx < name.len() - 1
+    {
+        return (&name[..idx], &name[idx + 1..]);
     }
     (name, "")
 }
 
 fn download_dir() -> Result<PathBuf> {
-    if let Some(dirs) = directories::UserDirs::new() {
-        if let Some(dl) = dirs.download_dir() {
-            return Ok(dl.to_path_buf());
-        }
+    if let Some(dirs) = directories::UserDirs::new()
+        && let Some(dl) = dirs.download_dir()
+    {
+        return Ok(dl.to_path_buf());
     }
     // Fall back to the OS temp dir — acceptable for headless CI /
     // service accounts with no Downloads folder.
