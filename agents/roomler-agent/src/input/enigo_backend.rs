@@ -183,23 +183,46 @@ fn wheel_to_steps(dx: f32, dy: f32, mode: WheelMode) -> (i32, i32) {
 /// Map a USB HID usage code (what the browser emits via the `Key*`
 /// KeyboardEvent.code normalisation) to enigo's `Key` enum.
 ///
-/// Only the keys that don't round-trip as raw Unicode go through this
-/// table. Unknown codes fall back to `Key::Other(code)` in the caller.
+/// On Windows, letters and digits route through `Key::Other(VK_*)`
+/// rather than `Key::Unicode(c)`. Reason: enigo's Unicode path sets
+/// `KEYEVENTF_SCANCODE` on Windows, which makes the OS rely on the
+/// current keyboard layout to map scan → character. On non-US layouts
+/// (German, International) this can drop or reassign control-sequence
+/// characters — user reported `Ctrl+C → ©` and `Backspace → ^H` in
+/// pwsh / Windows Terminal on 0.1.33. The VK path injects the virtual
+/// key directly so modifiers (VK_CONTROL, VK_SHIFT, VK_MENU) combine
+/// with the letter exactly as if typed on a physical keyboard,
+/// regardless of layout.
+///
+/// Unknown codes fall back to `Key::Other(code)` in the caller.
 fn hid_to_key(code: u32) -> Option<Key> {
     // HID usage codes from "Keyboard/Keypad" Page (0x07).
-    // A complete table is ~100 entries; we cover navigation + modifiers +
-    // function keys here and round-trip printable keys as text in the
-    // future via InputMsg::KeyText.
     match code {
-        // Letters: HID 0x04..=0x1d → 'a'..='z'. enigo's Key::Unicode press
-        // types the character honouring any Shift modifier currently held
-        // by enigo, which is how the browser's Shift+KeyA path ends up as
-        // an uppercase 'A' on the remote.
+        // Letters: HID 0x04..=0x1d → 'a'..='z'.
+        // Windows: VK_A..VK_Z = 0x41..0x5A — inject as virtual-key so
+        // Ctrl/Alt/Shift combine correctly regardless of keyboard
+        // layout. Other platforms: Key::Unicode is honoured by
+        // XTest / CGEventPost and combines with modifiers there.
+        #[cfg(target_os = "windows")]
+        0x04..=0x1d => Some(Key::Other(0x41 + (code - 0x04))),
+        #[cfg(not(target_os = "windows"))]
         0x04..=0x1d => char::from_u32(u32::from(b'a') + (code - 0x04)).map(Key::Unicode),
         // Digits: HID 0x1e..=0x26 → '1'..='9', 0x27 → '0'.
+        // Windows VK_0 = 0x30, VK_1..VK_9 = 0x31..0x39.
+        #[cfg(target_os = "windows")]
+        0x1e..=0x26 => Some(Key::Other(0x31 + (code - 0x1e))),
+        #[cfg(target_os = "windows")]
+        0x27 => Some(Key::Other(0x30)),
+        #[cfg(not(target_os = "windows"))]
         0x1e..=0x26 => char::from_u32(u32::from(b'1') + (code - 0x1e)).map(Key::Unicode),
+        #[cfg(not(target_os = "windows"))]
         0x27 => Some(Key::Unicode('0')),
-        // Common punctuation (US layout HID usages).
+        // Common punctuation (US layout HID usages). Keeping Unicode
+        // here even on Windows — the scancode route is layout-dependent
+        // but punctuation is less frequently combined with modifiers
+        // than letters, and the VK codes for these vary dramatically
+        // by layout (VK_OEM_1 etc.). Layouts other than US will be
+        // addressed in a follow-up when we wire a layout-aware mapper.
         0x2d => Some(Key::Unicode('-')),
         0x2e => Some(Key::Unicode('=')),
         0x2f => Some(Key::Unicode('[')),
@@ -298,5 +321,31 @@ mod tests {
         assert!(matches!(hid_to_key(0x3a), Some(Key::F1)));
         assert!(matches!(hid_to_key(0x45), Some(Key::F12)));
         assert_eq!(hid_to_key(0xffff), None);
+    }
+
+    /// On Windows, letters route through Key::Other(VK_*) so Ctrl/Alt
+    /// modifiers combine with them. On other platforms the same input
+    /// routes through Key::Unicode which the XTest / CGEventPost
+    /// backends honour natively.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn hid_letters_map_to_virtual_keycodes_on_windows() {
+        // HID 0x04 = 'a' → VK_A (0x41)
+        assert!(matches!(hid_to_key(0x04), Some(Key::Other(0x41))));
+        // HID 0x06 = 'c' → VK_C (0x43) — Ctrl+C path
+        assert!(matches!(hid_to_key(0x06), Some(Key::Other(0x43))));
+        // HID 0x1d = 'z' → VK_Z (0x5a)
+        assert!(matches!(hid_to_key(0x1d), Some(Key::Other(0x5a))));
+        // HID 0x1e = '1' → VK_1 (0x31)
+        assert!(matches!(hid_to_key(0x1e), Some(Key::Other(0x31))));
+        // HID 0x27 = '0' → VK_0 (0x30)
+        assert!(matches!(hid_to_key(0x27), Some(Key::Other(0x30))));
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn hid_letters_map_to_unicode_on_non_windows() {
+        assert!(matches!(hid_to_key(0x04), Some(Key::Unicode('a'))));
+        assert!(matches!(hid_to_key(0x06), Some(Key::Unicode('c'))));
     }
 }

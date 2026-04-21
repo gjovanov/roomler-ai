@@ -48,6 +48,12 @@ pub(crate) enum ClipboardCmd {
         text: String,
         reply: oneshot::Sender<Result<()>>,
     },
+    /// Kept as an affordance for future deterministic shutdowns (e.g.
+    /// a test harness that wants to join the worker). Today the
+    /// `Clipboard` handle has no Drop impl — dropping the last
+    /// `Sender` returns `Err` from `rx.recv()` which ends the worker
+    /// loop naturally.
+    #[allow(dead_code)]
     Shutdown,
 }
 
@@ -138,11 +144,13 @@ impl Clipboard {
     }
 }
 
-impl Drop for Clipboard {
-    fn drop(&mut self) {
-        let _ = self.tx.send(ClipboardCmd::Shutdown);
-    }
-}
+// No Drop impl. `Clipboard` is `Clone` (the Sender is Arc'd internally);
+// a Drop-sends-Shutdown would fire on every clone drop, including the
+// first, killing the worker prematurely. With no Drop, the worker
+// exits naturally when all Sender clones are dropped and `rx.recv()`
+// returns `Err(RecvError)` — which ends the `while let Ok(cmd) ...`
+// loop. `ClipboardCmd::Shutdown` is still honoured for deterministic
+// shutdowns inside the test suite.
 
 /// Incoming clipboard DC message shape. Parsed from the JSON payload
 /// the browser sends; the handler in `peer.rs` dispatches on the `t`
@@ -201,9 +209,16 @@ mod tests {
 
     /// The clipboard worker init may fail on headless CI runners that
     /// have no X server; accept that as a clean skip. If it does
-    /// construct, a basic write/read round-trip works.
+    /// construct, a basic write/read round-trip works AND — locked in
+    /// the same test because Windows `OpenClipboard` is process-wide
+    /// exclusive and parallel tests would race — dropping a clone must
+    /// NOT shut the worker down. The DC handler in `peer.rs` clones
+    /// the cb into the per-message closure; if the old Drop impl sent
+    /// Shutdown on clone drop, the second clipboard:read on a live
+    /// session would fail with "clipboard worker gone" (user-reported
+    /// on 0.1.33).
     #[tokio::test]
-    async fn write_then_read_round_trip_or_skip() {
+    async fn write_then_read_round_trip_and_survives_clone_drop() {
         let Ok(cb) = Clipboard::new() else {
             eprintln!("arboard not available in this env — skipping");
             return;
@@ -212,5 +227,14 @@ mod tests {
         cb.write(payload.to_string()).await.unwrap();
         let back = cb.read().await.unwrap();
         assert_eq!(back, payload);
+
+        // Now drop a clone and confirm the original still works.
+        {
+            let clone = cb.clone();
+            clone.write("from clone".to_string()).await.unwrap();
+        } // clone drops here; worker MUST stay alive.
+        cb.write("from original".to_string()).await.unwrap();
+        let back = cb.read().await.unwrap();
+        assert_eq!(back, "from original");
     }
 }
