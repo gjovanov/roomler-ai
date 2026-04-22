@@ -37,13 +37,14 @@ pub const MIN_INSTALLER_BYTES: usize = 1_000_000;
 
 /// A parsed release from the GitHub API. Only the fields we need.
 #[derive(Debug, Deserialize)]
-struct GithubRelease {
-    tag_name: String,
-    assets: Vec<GithubAsset>,
+pub struct GithubRelease {
+    pub tag_name: String,
+    pub assets: Vec<GithubAsset>,
     #[serde(default)]
-    draft: bool,
+    pub draft: bool,
     #[serde(default)]
-    prerelease: bool,
+    #[allow(dead_code)]
+    pub prerelease: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -124,9 +125,16 @@ pub fn pick_asset_for_platform(assets: &[GithubAsset]) -> Option<&GithubAsset> {
     None
 }
 
-/// Fetch the latest release JSON from GitHub.
+/// Fetch the list of releases from GitHub and pick the "best" one —
+/// the highest `agent-v*` tag that is published (not draft). We do
+/// NOT use `/releases/latest` because GitHub excludes prereleases
+/// from that endpoint unconditionally, and our history has a mix of
+/// prerelease-flagged and non-flagged releases (the v0.1.x policy
+/// that briefly marked everything as prerelease broke
+/// `/releases/latest` entirely → 404, which is how the auto-updater
+/// shipped with 0.1.36 failed silently in the field).
 async fn fetch_latest_release() -> Result<GithubRelease> {
-    let url = format!("https://api.github.com/repos/{RELEASES_REPO}/releases/latest");
+    let url = format!("https://api.github.com/repos/{RELEASES_REPO}/releases?per_page=30");
     let client = reqwest::Client::builder()
         .user_agent(concat!("roomler-agent/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(30))
@@ -137,15 +145,32 @@ async fn fetch_latest_release() -> Result<GithubRelease> {
         .header("Accept", "application/vnd.github+json")
         .send()
         .await
-        .context("GET latest release")?;
+        .context("GET releases")?;
     if !resp.status().is_success() {
         bail!("GitHub API returned {}", resp.status());
     }
-    let release: GithubRelease = resp
+    let releases: Vec<GithubRelease> = resp
         .json()
         .await
-        .context("parsing GitHub release JSON")?;
-    Ok(release)
+        .context("parsing GitHub releases JSON")?;
+    pick_latest_release(releases).context("no published agent-v* release found")
+}
+
+/// Given a vector of releases from GitHub (newest-first per API
+/// contract), pick the highest-versioned `agent-v*` that isn't a
+/// draft. Prereleases are tolerated because our 0.x history marked
+/// them all that way and we still want those agents to update.
+/// Exported for tests so the selection rule is locked.
+pub fn pick_latest_release(mut releases: Vec<GithubRelease>) -> Option<GithubRelease> {
+    releases.retain(|r| !r.draft && r.tag_name.starts_with("agent-v") && parse_version(&r.tag_name).is_some());
+    if releases.is_empty() {
+        return None;
+    }
+    releases.sort_by(|a, b| {
+        parse_version(&b.tag_name)
+            .cmp(&parse_version(&a.tag_name))
+    });
+    releases.into_iter().next()
 }
 
 /// Download an asset to a temp file and return the path. Verifies the
@@ -194,11 +219,13 @@ pub async fn check_once() -> CheckOutcome {
         Ok(r) => r,
         Err(e) => return CheckOutcome::Skipped(format!("fetch: {e}")),
     };
-    if release.draft || release.prerelease {
-        return CheckOutcome::Skipped(format!(
-            "latest release is draft/prerelease: {}",
-            release.tag_name
-        ));
+    // Drafts are always skipped; prereleases are tolerated because
+    // our 0.x release history marked them all `prerelease: true` and
+    // we want those agents to update even though GitHub's own
+    // /releases/latest endpoint excludes them. pick_latest_release
+    // has already filtered by tag prefix.
+    if release.draft {
+        return CheckOutcome::Skipped(format!("latest release is draft: {}", release.tag_name));
     }
     let latest_parsed = match parse_version(&release.tag_name) {
         Some(_) => release.tag_name.clone(),
@@ -405,6 +432,71 @@ mod tests {
         #[cfg(target_os = "macos")]
         assert!(name.ends_with(".pkg"));
         let _ = name; // silence unused warning on non-matched targets
+    }
+
+    fn mk_release(tag: &str, draft: bool, prerelease: bool) -> GithubRelease {
+        GithubRelease {
+            tag_name: tag.to_string(),
+            assets: vec![],
+            draft,
+            prerelease,
+        }
+    }
+
+    #[test]
+    fn pick_latest_release_picks_highest_agent_tag() {
+        // GitHub returns newest-first but we shouldn't rely on that.
+        // Mix them up on purpose.
+        let releases = vec![
+            mk_release("agent-v0.1.30", false, true),
+            mk_release("agent-v0.1.36", false, true),
+            mk_release("agent-v0.1.35", false, true),
+            mk_release("agent-v0.2.0", false, true),
+        ];
+        let picked = pick_latest_release(releases).expect("should pick one");
+        assert_eq!(picked.tag_name, "agent-v0.2.0");
+    }
+
+    #[test]
+    fn pick_latest_release_skips_drafts() {
+        let releases = vec![
+            mk_release("agent-v0.2.0", true, false),
+            mk_release("agent-v0.1.36", false, true),
+        ];
+        let picked = pick_latest_release(releases).expect("should pick non-draft");
+        assert_eq!(picked.tag_name, "agent-v0.1.36");
+    }
+
+    #[test]
+    fn pick_latest_release_tolerates_prereleases() {
+        // Our 0.x policy marked every release as prerelease. The
+        // picker must NOT filter them out — otherwise auto-update
+        // is stuck at "no release found" for every existing agent.
+        let releases = vec![mk_release("agent-v0.1.37", false, true)];
+        assert_eq!(
+            pick_latest_release(releases).map(|r| r.tag_name),
+            Some("agent-v0.1.37".to_string())
+        );
+    }
+
+    #[test]
+    fn pick_latest_release_ignores_non_agent_tags() {
+        // Stray tags from other subsystems on the same repo must be
+        // ignored — we only consume agent-v* releases.
+        let releases = vec![
+            mk_release("v1.2.3", false, false),
+            mk_release("backend-v9.9.9", false, false),
+            mk_release("agent-v0.1.36", false, true),
+        ];
+        let picked = pick_latest_release(releases).expect("should pick agent tag");
+        assert_eq!(picked.tag_name, "agent-v0.1.36");
+    }
+
+    #[test]
+    fn pick_latest_release_returns_none_when_nothing_matches() {
+        assert!(pick_latest_release(vec![]).is_none());
+        assert!(pick_latest_release(vec![mk_release("random-1.0.0", false, false)]).is_none());
+        assert!(pick_latest_release(vec![mk_release("agent-v0.1.0", true, false)]).is_none());
     }
 
     #[test]

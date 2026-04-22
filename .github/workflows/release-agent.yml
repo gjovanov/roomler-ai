@@ -490,6 +490,12 @@ jobs:
         with:
           tag_name: ${{ needs.validate-version.outputs.tag }}
           name: roomler-agent ${{ needs.validate-version.outputs.version }}
-          prerelease: ${{ startsWith(needs.validate-version.outputs.version, '0.') }}
+          # prerelease must stay false so GitHub's /releases/latest API
+          # returns this release — the agent's built-in auto-updater
+          # polls that endpoint every 6 h. Marking 0.x as prerelease
+          # (the previous policy) caused every release to be invisible
+          # to /releases/latest, which 404'd and broke self-update for
+          # every 0.1.36 agent in the field.
+          prerelease: false
           generate_release_notes: true
           files: release/*
