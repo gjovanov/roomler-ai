@@ -675,3 +675,142 @@ Deferred per platform:
   Duplication capture backend keeps frames as D3D11 textures
   end-to-end — removes the 900 MB/s of memory bandwidth we push
   at native 4K today.
+
+## 18. Viewer controls + codec negotiation + DC handlers (0.1.32 → 0.1.35)
+
+Post-Phase-3 the subsystem grew three feature families, tracked in
+`HANDOVER9.md` with full commit-by-commit detail. Summary:
+
+### 18.1 Codec negotiation (0.1.28 → 0.1.30)
+
+Agent advertises H.264 + HEVC + AV1 capabilities via `AgentCaps.codecs`
+in `rc:agent.hello`. Browser advertises its decode caps in
+`ClientMsg::SessionRequest.browser_caps`. Agent picks the best
+intersection with priority `av1 > h265 > vp9 > h264 > vp8` and binds
+the matching MF encoder + `video/H264|H265|AV1` track +
+`set_codec_preferences` SDP pin. HEVC/AV1 activation failures are
+fail-closed (black video + WARN, not silent bitstream substitution).
+Caps probe-at-startup (0.1.30) filters codecs that enumerate-but-fail-
+to-activate, so the browser never sees a bait-and-switch.
+
+### 18.2 Data-channel handlers (0.1.31 → 0.1.33)
+
+- **Cursor DC** (0.1.31): agent pumps `cursor:pos` + `cursor:shape` at
+  ~30 Hz; browser paints the real OS cursor bitmap on an overlay
+  canvas. Synthetic initials-badge is the fallback when no shape has
+  been cached yet.
+- **Clipboard DC** (0.1.32): thread-pinned `arboard::Clipboard` worker;
+  JSON protocol `clipboard:read` / `clipboard:write` /
+  `clipboard:content` / `clipboard:error` with `req_id` round-trip
+  for interleaved reads. Fixed in 0.1.34: `Clipboard` handle had a
+  `Drop` impl that sent `Shutdown` on every clone drop, killing the
+  worker on the first closure-captured clone release; dropped the
+  `Drop` impl and rely on Sender refcount to end the `rx.recv()`
+  loop naturally.
+- **File DC** (0.1.33): browser drag/pick → `files:begin` →
+  64 KiB ArrayBuffer chunks with `bufferedAmount` back-pressure →
+  `files:end` → agent writes into the controlled host's Downloads
+  folder. Filename sanitization + collision-safe rename + 2 GiB
+  per-transfer cap.
+
+### 18.3 Hotkey + viewer indicator (0.1.33)
+
+- **Hotkey interception** in `useRemoteControl.ts::attachInput`:
+  Ctrl/Cmd + A/C/V/X/Z/Y/F/S/P/R are locally `preventDefault`-ed
+  while the pointer is over the viewer, still forwarded to the
+  remote; outside the video the controller keeps normal browser UX.
+  `Tab` + bare `Backspace` are globally intercepted.
+  Ctrl+Alt+Del is exposed as a dedicated toolbar button — the
+  OS reserves the real chord, the browser can't catch it.
+- **Viewer-indicator overlay** (`viewer-indicator` feature, Windows
+  only): topmost layered click-through window on the controlled
+  host with a 6 px red border + "Being viewed by: …" caption.
+  `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` keeps the
+  overlay out of every screen-capture path (our WGC backend, DXGI
+  Desktop Duplication, BitBlt, third-party tools), so the controller
+  doesn't see a recursive picture-frame in the RTP stream.
+
+### 18.4 Input fix — Windows VK path (0.1.34)
+
+`hid_to_key` previously mapped letters/digits to `Key::Unicode(c)`.
+enigo routes `Key::Unicode` through `KEYEVENTF_SCANCODE` on Windows,
+a layout-sensitive path that drops modifier composition on
+non-US / International layouts — producing `©` for Ctrl+C and
+`^H` for Backspace in pwsh / Windows Terminal. Letters now route
+through `Key::Other(VK_A..VK_Z)` and digits through
+`Key::Other(VK_0..VK_9)` on Windows only; non-Windows continues to
+use `Key::Unicode` because XTest / CGEventPost combine modifiers
+with Unicode fine.
+
+### 18.5 RustDesk-parity Tier A (0.1.33)
+
+Shipped to close the `<video>`-based viewer's smoothness gap vs
+RustDesk's native client on the HW path. Details in
+`~/.claude/plans/floating-splashing-nebula.md`.
+
+- **60 fps + native resolution** on the MF-HW path (`TARGET_FPS_HW=60`,
+  `DownscalePolicy::Never` when `mf-encoder` is compiled in).
+- **Bitrate ceilings lifted**: 0.10 → 0.15 bpp/s baseline, MAX 15 →
+  25 Mbps, High-quality clamp 20 → 30 Mbps.
+- **Codec override dropdown** in the UI; persists per browser;
+  `filterCapsByPreference` narrows `browser_caps` before the
+  `rc:session.request` so the agent can't pick the excluded codec.
+- **Browser buffering to zero**: `jitterBufferTarget = 0`,
+  `playoutDelayHint = 0`, `contentHint = 'motion'`,
+  `requestVideoFrameCallback` keeps the tab hot + `play()` kicker
+  rescues idle-optimizer pauses. Chrome still enforces a soft
+  ~80 ms JB floor regardless — Tier B7 (WebCodecs canvas render)
+  is the deferred structural escape.
+
+### 18.6 Viewer scale + remote resolution (0.1.35)
+
+- **Scale** (`RcScaleMode`): `adaptive` (default, `object-fit:
+  contain` fit-to-stage), `original` (1:1 intrinsic pixels with
+  scrollbars), `custom` (5-1000% CSS scale). Persisted per browser.
+  Input coordinate mapper switches between `letterboxedNormalise`
+  (adaptive) and the new `directVideoNormalise` (original/custom)
+  so clicks land accurately in every mode. Cursor overlays
+  (synthetic badge + real-OS-cursor canvas) are scale-aware via
+  `cursorMapping()`.
+- **Fullscreen** toggle: `requestFullscreen` on the stage element,
+  `fullscreenchange` listener flips the icon, ESC exits natively.
+- **Remote Resolution** (`rc:resolution` control-DC message): tells
+  the agent to capture/encode at a specific size. Modes:
+  `original` (native monitor), `fit` (match local stage ×
+  `devicePixelRatio`, re-emitted on resize via `ResizeObserver`
+  debounced 250 ms), `custom` (preset chips + free-form W×H).
+  Persisted per-agent (keyed on `agentId`) so "Fit to local
+  1920×1080" on my laptop doesn't bleed to my 4K desktop.
+
+**No SDP renegotiation needed for resolution changes** —
+H.264 / H.265 / AV1 all carry resolution in the SPS/VPS NALU;
+browsers handle mid-stream size changes on the existing RTP track.
+The agent's existing `encoder_dims != Some((w, h))` rebuild branch
+already handles dim changes (docking, DPI toggle); `rc:resolution`
+just writes a new target into the shared `TargetResolution` atomic
+and `apply_target_resolution` downscales the captured frame via
+`downscale_bgra_box` (CPU box filter, ~30 ms on 4K→1080p) before
+encode. GPU `VideoProcessorMFT` path stays in the deferred 1C.3
+bucket.
+
+### 18.7 Diagnostics (0.1.34)
+
+Added in response to the field-reported 7-8 fps case on a hybrid
+RTX 5090 + Intel UHD 630 box:
+
+- Media-pump heartbeat log now reports `avg_capture_ms` /
+  `avg_encode_ms` per 30-frame window (reset per window so
+  transient stalls don't smear over a long session).
+- WGC `SharedSlot` tracks `arrived_total` + `dropped_stale` and
+  logs `wgc: capture cadence arrived=N drops=M drop_ratio_pct=P`
+  every ~120 arrivals. Low `arrived_total` means WGC itself is
+  starving (iGPU scheduling); high `drop_ratio_pct` means
+  consumer (encode) can't keep up.
+
+Root cause of that specific 7-fps case: NVENC Blackwell
+`ActivateObject` returns `0x8000FFFF` for H.264/HEVC/AV1 on RTX
+5090 → cascade lands on Intel UHD 630 HEVC MFT → can't sustain
+4K@30. Workaround: operator picks `Remote Resolution = Fit` (or
+`Custom: 1920×1080`), agent CPU-downscales, UHD 630 HEVC holds 30-60
+fps comfortably at that size. Proper fix deferred to Tier 1C.3
+(GPU-side scale via `VideoProcessorMFT`).
