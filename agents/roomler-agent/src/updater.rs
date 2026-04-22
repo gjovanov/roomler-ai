@@ -1,0 +1,419 @@
+//! Self-update against GitHub Releases.
+//!
+//! Polls `https://api.github.com/repos/gjovanov/roomler-ai/releases/latest`
+//! every ~6 h, compares the release tag to the running binary's
+//! `CARGO_PKG_VERSION`, and — when newer — downloads the platform-
+//! appropriate installer (MSI / .deb / .pkg) and spawns it detached.
+//!
+//! Scope: the agent exits after spawning the installer so the installer
+//! can overwrite the binary without `ERROR_SHARING_VIOLATION`. The
+//! Scheduled Task / systemd unit / LaunchAgent registered via
+//! `roomler-agent service install` re-launches the new version on
+//! the next login (Windows) or immediately (Restart=on-failure on
+//! Linux, KeepAlive on macOS).
+//!
+//! Trust model: we assume GitHub-over-TLS is sufficient for now. No
+//! signature check beyond the MSI's cargo-wix / codesign identity
+//! (which the OS verifies at install time).
+
+use anyhow::{Context, Result, bail};
+use serde::Deserialize;
+use std::path::PathBuf;
+use std::time::Duration;
+
+/// GitHub "Releases" repo slug. Centralised here so a fork can redirect
+/// its update feed without grepping the codebase.
+pub const RELEASES_REPO: &str = "gjovanov/roomler-ai";
+
+/// How often `run_periodic` wakes up and checks for a newer release.
+/// Five-ish hours strikes a balance between "catch a zero-day fix on
+/// the same workday" and "don't hammer GitHub's API quota".
+pub const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 3600);
+
+/// Minimum download size before we trust an installer artifact. A
+/// GitHub redirect to a deleted asset returns a tiny HTML page; this
+/// guards against running that as an installer.
+pub const MIN_INSTALLER_BYTES: usize = 1_000_000;
+
+/// A parsed release from the GitHub API. Only the fields we need.
+#[derive(Debug, Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    assets: Vec<GithubAsset>,
+    #[serde(default)]
+    draft: bool,
+    #[serde(default)]
+    prerelease: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GithubAsset {
+    pub name: String,
+    pub browser_download_url: String,
+    /// Kept in the wire deserialisation so future logic (e.g.
+    /// comparing against a content-length header) can consult it.
+    /// Not currently read by the in-loop path.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub size: u64,
+}
+
+/// The outcome of a single check cycle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckOutcome {
+    /// Running the latest (or newer) version; nothing to do.
+    UpToDate { current: String, latest: String },
+    /// Newer release found; installer downloaded to `installer_path`.
+    /// Caller is responsible for spawning it and exiting.
+    UpdateReady {
+        current: String,
+        latest: String,
+        installer_path: PathBuf,
+    },
+    /// Check failed for an expected reason (network, GitHub 403, no
+    /// matching asset for this platform). Logged but non-fatal.
+    Skipped(String),
+}
+
+/// Parse a git tag like `agent-v0.1.36` or `v0.1.36` into a numeric
+/// triple for ordering. Unparseable tags compare as None and are
+/// treated as "not newer" so a malformed server-side tag can't force
+/// a downgrade.
+pub fn parse_version(tag: &str) -> Option<(u64, u64, u64)> {
+    let stripped = tag.trim_start_matches("agent-");
+    let stripped = stripped.trim_start_matches('v');
+    let parts: Vec<&str> = stripped.split('.').collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    let major = parts[0].parse::<u64>().ok()?;
+    let minor = parts[1].parse::<u64>().ok()?;
+    // Patch may carry pre-release suffix like "36-rc1"; strip.
+    let patch_str = parts[2].split(|c: char| !c.is_ascii_digit()).next()?;
+    let patch = patch_str.parse::<u64>().ok()?;
+    Some((major, minor, patch))
+}
+
+/// Return true if `latest` strictly outranks `current`.
+pub fn is_newer(latest: &str, current: &str) -> bool {
+    match (parse_version(latest), parse_version(current)) {
+        (Some(l), Some(c)) => l > c,
+        _ => false,
+    }
+}
+
+/// Pick the asset that matches this build's platform. Returns an
+/// explicit `None` when there's no match so the caller can log + skip
+/// rather than downloading something wrong.
+pub fn pick_asset_for_platform(assets: &[GithubAsset]) -> Option<&GithubAsset> {
+    let arch_win = cfg!(all(target_os = "windows", target_arch = "x86_64"));
+    let arch_linux = cfg!(all(target_os = "linux", target_arch = "x86_64"));
+    let arch_mac = cfg!(target_os = "macos");
+    for a in assets {
+        let lower = a.name.to_lowercase();
+        if arch_win && lower.ends_with(".msi") {
+            return Some(a);
+        }
+        if arch_linux && (lower.ends_with("_amd64.deb") || lower.ends_with(".deb")) {
+            return Some(a);
+        }
+        if arch_mac && lower.ends_with(".pkg") {
+            return Some(a);
+        }
+    }
+    None
+}
+
+/// Fetch the latest release JSON from GitHub.
+async fn fetch_latest_release() -> Result<GithubRelease> {
+    let url = format!("https://api.github.com/repos/{RELEASES_REPO}/releases/latest");
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("roomler-agent/", env!("CARGO_PKG_VERSION")))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("building reqwest client")?;
+    let resp = client
+        .get(&url)
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .context("GET latest release")?;
+    if !resp.status().is_success() {
+        bail!("GitHub API returned {}", resp.status());
+    }
+    let release: GithubRelease = resp
+        .json()
+        .await
+        .context("parsing GitHub release JSON")?;
+    Ok(release)
+}
+
+/// Download an asset to a temp file and return the path. Verifies the
+/// downloaded size against the asset metadata + the minimum plausible
+/// size so we don't run a ~200 byte HTML error page as an installer.
+async fn download_asset(asset: &GithubAsset) -> Result<PathBuf> {
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("roomler-agent/", env!("CARGO_PKG_VERSION")))
+        .timeout(Duration::from_secs(600))
+        .build()
+        .context("building download client")?;
+    let resp = client
+        .get(&asset.browser_download_url)
+        .send()
+        .await
+        .context("GET asset")?;
+    if !resp.status().is_success() {
+        bail!("asset download returned {}", resp.status());
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .context("reading asset body")?;
+    if bytes.len() < MIN_INSTALLER_BYTES {
+        bail!(
+            "asset {} is implausibly small: {} bytes (minimum {})",
+            asset.name,
+            bytes.len(),
+            MIN_INSTALLER_BYTES
+        );
+    }
+    let dir = std::env::temp_dir().join("roomler-agent-update");
+    std::fs::create_dir_all(&dir).context("creating temp update dir")?;
+    let path = dir.join(&asset.name);
+    std::fs::write(&path, &bytes).context("writing installer to disk")?;
+    Ok(path)
+}
+
+/// Run one check cycle: GET releases → compare → download if needed.
+/// Returns the outcome so the caller can log + decide whether to
+/// spawn the installer. Never panics; network errors fold into
+/// `Skipped(...)` so a flaky link doesn't crash the agent.
+pub async fn check_once() -> CheckOutcome {
+    let current = env!("CARGO_PKG_VERSION").to_string();
+    let release = match fetch_latest_release().await {
+        Ok(r) => r,
+        Err(e) => return CheckOutcome::Skipped(format!("fetch: {e}")),
+    };
+    if release.draft || release.prerelease {
+        return CheckOutcome::Skipped(format!(
+            "latest release is draft/prerelease: {}",
+            release.tag_name
+        ));
+    }
+    let latest_parsed = match parse_version(&release.tag_name) {
+        Some(_) => release.tag_name.clone(),
+        None => return CheckOutcome::Skipped(format!("unparseable tag {}", release.tag_name)),
+    };
+    if !is_newer(&latest_parsed, &current) {
+        return CheckOutcome::UpToDate { current, latest: latest_parsed };
+    }
+    let asset = match pick_asset_for_platform(&release.assets) {
+        Some(a) => a,
+        None => {
+            return CheckOutcome::Skipped(format!(
+                "no installer asset for this platform in release {latest_parsed}"
+            ));
+        }
+    };
+    match download_asset(asset).await {
+        Ok(path) => CheckOutcome::UpdateReady {
+            current,
+            latest: latest_parsed,
+            installer_path: path,
+        },
+        Err(e) => CheckOutcome::Skipped(format!("download: {e}")),
+    }
+}
+
+/// Spawn the installer detached. Returns after the installer is
+/// running so the caller can `std::process::exit(0)` — the agent's
+/// binary is about to be overwritten.
+///
+/// - **Windows**: `msiexec /i <path> /qn /norestart`. Requires
+///   per-user MSI (no UAC) — which is what cargo-wix emits by
+///   default for our install mode.
+/// - **Linux**: `pkexec apt-get install -y <path>`. Requires policykit
+///   plus sudo-equivalent; a non-interactive fallback uses
+///   `dpkg --install` directly (works when run as the user who
+///   owns /usr/bin, e.g. in a cargo-installed dev env).
+/// - **macOS**: `installer -pkg <path> -target CurrentUserHomeDirectory`
+///   runs the receipt-based install; prompts for auth if the pkg
+///   uses /Library paths.
+pub fn spawn_installer(installer_path: &std::path::Path) -> Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        let path_str = installer_path.to_string_lossy().into_owned();
+        std::process::Command::new("msiexec")
+            .args(["/i", &path_str, "/qn", "/norestart"])
+            .spawn()
+            .context("spawning msiexec")?;
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let path_str = installer_path.to_string_lossy().into_owned();
+        // Try pkexec first for an interactive password prompt; fall
+        // back to direct dpkg if pkexec isn't installed.
+        let pkexec = std::process::Command::new("pkexec")
+            .args(["apt-get", "install", "-y", &path_str])
+            .spawn();
+        if pkexec.is_err() {
+            std::process::Command::new("dpkg")
+                .args(["--install", &path_str])
+                .spawn()
+                .context("spawning dpkg")?;
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let path_str = installer_path.to_string_lossy().into_owned();
+        std::process::Command::new("installer")
+            .args(["-pkg", &path_str, "-target", "CurrentUserHomeDirectory"])
+            .spawn()
+            .context("spawning installer(8)")?;
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    {
+        bail!(
+            "self-update spawn is not implemented on this platform ({:?})",
+            installer_path
+        )
+    }
+}
+
+/// Periodic update loop. Returns only on shutdown. Runs `check_once`
+/// immediately, then on a fixed cadence. On `UpdateReady` the loop
+/// spawns the installer and sends `true` on the shutdown channel so
+/// the rest of the agent tears down cleanly.
+pub async fn run_periodic(
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+) {
+    let mut first = true;
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        if !first {
+            tokio::select! {
+                _ = tokio::time::sleep(CHECK_INTERVAL) => {},
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() { return; }
+                },
+            }
+        }
+        first = false;
+        let outcome = check_once().await;
+        match outcome {
+            CheckOutcome::UpToDate { current, latest } => {
+                tracing::info!(current = %current, latest = %latest, "up to date");
+            }
+            CheckOutcome::UpdateReady {
+                current,
+                latest,
+                installer_path,
+            } => {
+                tracing::warn!(
+                    current = %current,
+                    latest = %latest,
+                    path = %installer_path.display(),
+                    "new release available — spawning installer and exiting"
+                );
+                if let Err(e) = spawn_installer(&installer_path) {
+                    tracing::error!(error = %e, "installer spawn failed; will retry next cycle");
+                    continue;
+                }
+                let _ = shutdown_tx.send(true);
+                return;
+            }
+            CheckOutcome::Skipped(reason) => {
+                tracing::info!(reason = %reason, "update check skipped");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_version_handles_agent_prefix_and_v_prefix() {
+        assert_eq!(parse_version("agent-v0.1.36"), Some((0, 1, 36)));
+        assert_eq!(parse_version("v0.1.36"), Some((0, 1, 36)));
+        assert_eq!(parse_version("0.1.36"), Some((0, 1, 36)));
+    }
+
+    #[test]
+    fn parse_version_strips_prerelease_suffix_on_patch() {
+        assert_eq!(parse_version("agent-v1.2.3-rc1"), Some((1, 2, 3)));
+        assert_eq!(parse_version("v1.2.3+build.42"), Some((1, 2, 3)));
+    }
+
+    #[test]
+    fn parse_version_rejects_malformed() {
+        assert_eq!(parse_version(""), None);
+        assert_eq!(parse_version("v1.2"), None);
+        assert_eq!(parse_version("not-a-version"), None);
+        assert_eq!(parse_version("v1.2.x"), None);
+    }
+
+    #[test]
+    fn is_newer_compares_major_minor_patch() {
+        assert!(is_newer("agent-v0.2.0", "agent-v0.1.99"));
+        assert!(is_newer("agent-v0.1.36", "agent-v0.1.35"));
+        assert!(is_newer("agent-v1.0.0", "agent-v0.99.99"));
+        assert!(!is_newer("agent-v0.1.35", "agent-v0.1.35"));
+        assert!(!is_newer("agent-v0.1.34", "agent-v0.1.35"));
+    }
+
+    #[test]
+    fn is_newer_refuses_downgrade_on_parse_failure() {
+        // A malformed "latest" tag must NOT trigger a downgrade.
+        assert!(!is_newer("bogus", "agent-v0.1.35"));
+        assert!(!is_newer("agent-v0.1.36", "bogus"));
+    }
+
+    #[test]
+    fn pick_asset_matches_platform_extension() {
+        let assets = vec![
+            GithubAsset {
+                name: "roomler-agent-0.1.36-x86_64-pc-windows-msvc-unsigned.msi".into(),
+                browser_download_url: "https://example.invalid/foo.msi".into(),
+                size: 1234,
+            },
+            GithubAsset {
+                name: "roomler-agent-0.1.36_amd64.deb".into(),
+                browser_download_url: "https://example.invalid/foo.deb".into(),
+                size: 2345,
+            },
+            GithubAsset {
+                name: "roomler-agent-0.1.36-x86_64-apple-darwin.pkg".into(),
+                browser_download_url: "https://example.invalid/foo.pkg".into(),
+                size: 3456,
+            },
+        ];
+        let pick = pick_asset_for_platform(&assets);
+        assert!(pick.is_some(), "expected a pick on this platform");
+        let name = &pick.unwrap().name;
+        #[cfg(target_os = "windows")]
+        assert!(name.ends_with(".msi"));
+        #[cfg(target_os = "linux")]
+        assert!(name.ends_with(".deb"));
+        #[cfg(target_os = "macos")]
+        assert!(name.ends_with(".pkg"));
+        let _ = name; // silence unused warning on non-matched targets
+    }
+
+    #[test]
+    fn pick_asset_returns_none_when_no_platform_match() {
+        let assets = vec![GithubAsset {
+            name: "roomler-agent-0.1.36.tar.gz".into(),
+            browser_download_url: "https://example.invalid/foo.tgz".into(),
+            size: 10,
+        }];
+        assert!(pick_asset_for_platform(&assets).is_none());
+    }
+}

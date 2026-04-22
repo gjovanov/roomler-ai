@@ -13,7 +13,7 @@
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use roomler_agent::{config, encode, enrollment, machine, signaling};
+use roomler_agent::{config, encode, enrollment, machine, service, signaling, updater};
 use std::path::PathBuf;
 use std::str::FromStr;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -80,6 +80,34 @@ enum Command {
     /// Enumerate attached displays and print what the agent will
     /// report in `rc:agent.hello`. Cross-platform via `scrap`.
     Displays,
+    /// Manage the auto-start-on-boot hook (Scheduled Task on Windows,
+    /// systemd user unit on Linux, LaunchAgent on macOS). Subcommand
+    /// is one of `install`, `uninstall`, `status`.
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+    /// Check GitHub Releases for a newer version and — if found —
+    /// download + spawn the installer. The agent exits on successful
+    /// spawn so the installer can overwrite the binary; your service
+    /// hook re-launches it. Safe to run interactively. Pass
+    /// `--check-only` to print the verdict without touching disk.
+    SelfUpdate {
+        /// Don't download or spawn anything; just report whether an
+        /// update is available.
+        #[arg(long)]
+        check_only: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ServiceAction {
+    /// Register the agent for auto-start on the next login.
+    Install,
+    /// Remove the auto-start hook. Idempotent.
+    Uninstall,
+    /// Print the current auto-start status.
+    Status,
 }
 
 #[tokio::main]
@@ -102,6 +130,8 @@ async fn main() -> Result<()> {
         Command::EncoderSmoke { encoder, codec } => encoder_smoke_cmd(&encoder, &codec).await,
         Command::Caps => caps_cmd().await,
         Command::Displays => displays_cmd().await,
+        Command::Service { action } => service_cmd(action).await,
+        Command::SelfUpdate { check_only } => self_update_cmd(check_only).await,
     }
 }
 
@@ -199,6 +229,26 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         async move { signaling::run(cfg, encoder_preference, rx).await }
     });
 
+    // Background auto-updater — checks GitHub Releases on startup and
+    // every 6 h. Writes to `shutdown_tx` when a newer version is
+    // downloaded and the installer is spawned, so the signalling task
+    // tears down cleanly before the running binary gets overwritten.
+    // Disable with `ROOMLER_AGENT_AUTO_UPDATE=0` for air-gapped /
+    // operator-managed deployments.
+    let auto_update_enabled = std::env::var("ROOMLER_AGENT_AUTO_UPDATE")
+        .map(|v| !matches!(v.as_str(), "0" | "false" | "no" | "off"))
+        .unwrap_or(true);
+    let upd_task = if auto_update_enabled {
+        Some(tokio::spawn({
+            let rx = shutdown_rx.clone();
+            let tx = shutdown_tx.clone();
+            async move { updater::run_periodic(rx, tx).await }
+        }))
+    } else {
+        tracing::info!("auto-update disabled via ROOMLER_AGENT_AUTO_UPDATE");
+        None
+    };
+
     // Wait for Ctrl-C / SIGTERM.
     tokio::select! {
         res = sig_task => {
@@ -214,7 +264,61 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
     }
+    if let Some(t) = upd_task {
+        t.abort();
+    }
     Ok(())
+}
+
+async fn service_cmd(action: ServiceAction) -> Result<()> {
+    match action {
+        ServiceAction::Install => {
+            service::install().context("installing auto-start hook")?;
+            println!("Auto-start registered. The agent will launch on next login.");
+            Ok(())
+        }
+        ServiceAction::Uninstall => {
+            service::uninstall().context("removing auto-start hook")?;
+            println!("Auto-start removed.");
+            Ok(())
+        }
+        ServiceAction::Status => {
+            let s = service::status().context("querying auto-start status")?;
+            println!("Auto-start: {s}");
+            Ok(())
+        }
+    }
+}
+
+async fn self_update_cmd(check_only: bool) -> Result<()> {
+    let outcome = updater::check_once().await;
+    match outcome {
+        updater::CheckOutcome::UpToDate { current, latest } => {
+            println!("Up to date (current: {current}, latest: {latest})");
+            Ok(())
+        }
+        updater::CheckOutcome::UpdateReady {
+            current,
+            latest,
+            installer_path,
+        } => {
+            if check_only {
+                println!("Update available: {current} -> {latest}");
+                println!("(skipping install — --check-only)");
+                return Ok(());
+            }
+            println!(
+                "Update available: {current} -> {latest}. Installer at {}. Spawning + exiting.",
+                installer_path.display()
+            );
+            updater::spawn_installer(&installer_path).context("spawning installer")?;
+            std::process::exit(0);
+        }
+        updater::CheckOutcome::Skipped(reason) => {
+            println!("Update check skipped: {reason}");
+            Ok(())
+        }
+    }
 }
 
 /// Open the preferred encoder, feed it 10 synthetic BGRA frames, and

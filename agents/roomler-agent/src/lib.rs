@@ -14,4 +14,6 @@ pub mod indicator;
 pub mod input;
 pub mod machine;
 pub mod peer;
+pub mod service;
 pub mod signaling;
+pub mod updater;
