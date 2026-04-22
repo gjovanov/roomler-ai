@@ -74,6 +74,23 @@
         suffix="%"
         aria-label="Custom scale percent"
       />
+      <!-- Remote resolution selector: what the AGENT captures + encodes.
+           `original` = native monitor; `fit` = match our viewport CSS
+           px × dpr (auto-updates on stage resize); `custom…` opens a
+           dialog. Changing this sends an rc:resolution control-DC
+           message; agent rebuilds its encoder on the next frame. -->
+      <v-select
+        v-model="resolutionPresetValue"
+        :items="resolutionOptions"
+        density="compact"
+        hide-details
+        variant="outlined"
+        style="max-width: 190px;"
+        class="mr-2"
+        prepend-inner-icon="mdi-monitor-screenshot"
+        aria-label="Remote capture resolution"
+        :title="resolutionButtonTitle"
+      />
       <!-- Codec override: null = let the agent pick from the full
            browser∩agent intersection (recommended). Forcing a specific
            codec is for A/B comparison — "is H.265 really better than
@@ -300,6 +317,65 @@
         </div>
       </div>
     </div>
+    <!-- Custom-resolution dialog. Opened when the operator picks the
+         "Custom…" option in the Resolution dropdown; submits an
+         rc:resolution {mode:'custom'} message on confirm. -->
+    <v-dialog v-model="customResolutionDialog" max-width="480">
+      <v-card>
+        <v-card-title>Custom remote resolution</v-card-title>
+        <v-card-text>
+          <div class="d-flex align-center mb-3">
+            <v-text-field
+              v-model.number="customResolutionW"
+              type="number"
+              min="160"
+              max="7680"
+              step="10"
+              density="compact"
+              hide-details
+              variant="outlined"
+              label="Width"
+              class="mr-2"
+            />
+            <span class="text-medium-emphasis mr-2">×</span>
+            <v-text-field
+              v-model.number="customResolutionH"
+              type="number"
+              min="120"
+              max="4320"
+              step="10"
+              density="compact"
+              hide-details
+              variant="outlined"
+              label="Height"
+            />
+          </div>
+          <v-chip-group column>
+            <v-chip
+              v-for="p in customResolutionPresets"
+              :key="`${p.w}x${p.h}`"
+              size="small"
+              variant="outlined"
+              @click="pickCustomResolutionPreset(p.w, p.h)"
+            >
+              {{ p.w }} × {{ p.h }}{{ p.note ? ` — ${p.note}` : '' }}
+            </v-chip>
+          </v-chip-group>
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" @click="customResolutionDialog = false">Cancel</v-btn>
+          <v-btn
+            color="primary"
+            variant="flat"
+            :disabled="!customResolutionValid"
+            @click="confirmCustomResolution"
+          >
+            Apply
+          </v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
   </v-container>
 </template>
 
@@ -308,7 +384,13 @@ import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { useAgentStore, type Agent } from '@/stores/agents'
 import { useAuthStore } from '@/stores/auth'
-import { useRemoteControl, type RcQuality, type RcPreferredCodec, type RcScaleMode } from '@/composables/useRemoteControl'
+import {
+  useRemoteControl,
+  type RcQuality,
+  type RcPreferredCodec,
+  type RcScaleMode,
+  type RcResolutionSetting,
+} from '@/composables/useRemoteControl'
 import { useSnackbar } from '@/composables/useSnackbar'
 
 const route = useRoute()
@@ -481,6 +563,139 @@ const videoScaleStyle = computed<Record<string, string> | undefined>(() => {
   if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return undefined
   return { width: `${w}px`, height: `${h}px` }
 })
+
+// -----------------------------------------------------------------
+// Remote resolution (Phase 2 of the viewer-controls sprint)
+// -----------------------------------------------------------------
+
+// The v-select value is a discriminator string — not the full
+// RcResolutionSetting — because v-select items need primitive values
+// for equality. `original` / `fit` map directly; `custom` maps to
+// `custom:<w>x<h>` for display and opens a dialog when picked so the
+// operator can edit dims.
+const resolutionOptions = computed(() => {
+  const opts: { title: string; value: string }[] = [
+    { title: 'Original resolution', value: 'original' },
+    { title: 'Fit to local viewport', value: 'fit' },
+  ]
+  if (rc.resolution.value.mode === 'custom') {
+    const w = rc.resolution.value.width ?? 0
+    const h = rc.resolution.value.height ?? 0
+    opts.push({ title: `Custom: ${w} × ${h}`, value: 'custom-current' })
+  }
+  opts.push({ title: 'Custom…', value: 'custom-edit' })
+  return opts
+})
+
+const resolutionPresetValue = computed<string>({
+  get: () => {
+    if (rc.resolution.value.mode === 'original') return 'original'
+    if (rc.resolution.value.mode === 'fit') return 'fit'
+    return 'custom-current'
+  },
+  set: (v) => {
+    if (v === 'original') {
+      rc.setResolution({ mode: 'original' })
+    } else if (v === 'fit') {
+      applyFitResolution()
+    } else if (v === 'custom-edit') {
+      // Seed the dialog from the current values (or the stage's
+      // dimensions if we have none yet) so the user isn't starting
+      // from a blank field.
+      const cur = rc.resolution.value
+      customResolutionW.value = cur.width ?? 1920
+      customResolutionH.value = cur.height ?? 1080
+      customResolutionDialog.value = true
+    }
+    // 'custom-current' is a noop — it's only used as the v-select's
+    // "display the existing custom dims" slot.
+  },
+})
+
+const resolutionButtonTitle = computed(() => {
+  const s = rc.resolution.value
+  if (s.mode === 'original') return 'Agent streams at native monitor resolution'
+  if (s.mode === 'fit') {
+    return `Agent downscales to fit local viewport (currently ${s.width ?? '?'} × ${s.height ?? '?'})`
+  }
+  return `Custom: ${s.width ?? '?'} × ${s.height ?? '?'}`
+})
+
+const customResolutionDialog = ref(false)
+const customResolutionW = ref(1920)
+const customResolutionH = ref(1080)
+const customResolutionPresets: Array<{ w: number; h: number; note?: string }> = [
+  { w: 1280, h: 720, note: '720p' },
+  { w: 1920, h: 1080, note: '1080p' },
+  { w: 1920, h: 1200, note: 'WUXGA' },
+  { w: 2560, h: 1440, note: '1440p' },
+  { w: 2560, h: 1600, note: 'WQXGA' },
+  { w: 3840, h: 2160, note: '4K UHD' },
+]
+const customResolutionValid = computed(() => {
+  const w = customResolutionW.value
+  const h = customResolutionH.value
+  return (
+    Number.isFinite(w) && Number.isFinite(h) &&
+    w >= 160 && w <= 7680 &&
+    h >= 120 && h <= 4320
+  )
+})
+function pickCustomResolutionPreset(w: number, h: number) {
+  customResolutionW.value = w
+  customResolutionH.value = h
+}
+function confirmCustomResolution() {
+  if (!customResolutionValid.value) return
+  const setting: RcResolutionSetting = {
+    mode: 'custom',
+    width: Math.round(customResolutionW.value),
+    height: Math.round(customResolutionH.value),
+  }
+  rc.setResolution(setting)
+  customResolutionDialog.value = false
+}
+
+/** Apply Fit mode using the current stage dimensions × devicePixelRatio
+ *  — captures "what fits in my browser right now at its native pixel
+ *  density". Also re-emitted on stage resize via `ResizeObserver`
+ *  below, debounced 250 ms so drag-resize doesn't churn the encoder. */
+function applyFitResolution() {
+  const el = stageEl.value
+  if (!el) return
+  const rect = el.getBoundingClientRect()
+  const dpr = window.devicePixelRatio || 1
+  const w = Math.max(1, Math.round(rect.width * dpr))
+  const h = Math.max(1, Math.round(rect.height * dpr))
+  rc.setResolution({ mode: 'fit', width: w, height: h })
+}
+
+// ResizeObserver on the stage so Fit mode tracks viewport changes.
+// Debounced — drag-resize fires dozens of events per second and each
+// rc:resolution change rebuilds the encoder on the agent side.
+let fitResizeTimer: ReturnType<typeof setTimeout> | null = null
+let fitResizeObserver: ResizeObserver | null = null
+function startFitResizeObserver() {
+  if (fitResizeObserver || !stageEl.value || !('ResizeObserver' in window)) return
+  fitResizeObserver = new ResizeObserver(() => {
+    if (rc.resolution.value.mode !== 'fit') return
+    if (fitResizeTimer) clearTimeout(fitResizeTimer)
+    fitResizeTimer = setTimeout(() => {
+      applyFitResolution()
+    }, 250)
+  })
+  fitResizeObserver.observe(stageEl.value)
+}
+function stopFitResizeObserver() {
+  if (fitResizeTimer) {
+    clearTimeout(fitResizeTimer)
+    fitResizeTimer = null
+  }
+  if (fitResizeObserver) {
+    fitResizeObserver.disconnect()
+    fitResizeObserver = null
+  }
+}
 
 // Stats readout formatters. Pure computeds — the composable already
 // polls getStats() every 500 ms and updates rc.stats.value.
@@ -730,9 +945,17 @@ watch(
     if (phase === 'connected' && el && !detachInput) {
       detachInput = rc.attachInput(el as HTMLElement)
       ;(el as HTMLElement).focus()
+      // Start watching the stage for size changes so Fit mode
+      // auto-updates the agent's target resolution.
+      startFitResizeObserver()
+      // If the restored preference was Fit (from localStorage) the
+      // stored width/height are from the previous session — re-emit
+      // with the current window size so the agent uses today's dims.
+      if (rc.resolution.value.mode === 'fit') applyFitResolution()
     } else if (phase !== 'connected' && detachInput) {
       detachInput()
       detachInput = null
+      stopFitResizeObserver()
     }
   },
 )
@@ -743,6 +966,7 @@ onMounted(() => {
 })
 onBeforeUnmount(() => {
   if (detachInput) detachInput()
+  stopFitResizeObserver()
   document.removeEventListener('fullscreenchange', onFullscreenChange)
   // Exit fullscreen on unmount so navigating away doesn't leave the
   // browser in a weird fullscreen state.

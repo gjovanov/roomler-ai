@@ -14,6 +14,7 @@ import {
   base64ToBytes,
   shouldPreventDefault,
   filterCapsByPreference,
+  resolutionWireMessage,
 } from '@/composables/useRemoteControl'
 
 function keyEvent(code: string, mods: Partial<{ ctrl: boolean; alt: boolean; meta: boolean; shift: boolean }> = {}): KeyboardEvent {
@@ -519,5 +520,54 @@ describe('directVideoNormalise', () => {
     expect(directVideoNormalise(100, 100, zero)).toEqual({
       x: 0, y: 0, insideVideo: false,
     })
+  })
+})
+
+describe('resolutionWireMessage', () => {
+  // Locks the exact JSON shape the agent's control-DC handler parses.
+  // Changing these assertions without changing the agent-side
+  // `rc:resolution` match arms in `peer.rs::attach_control_handler`
+  // will break the feature in the field.
+
+  it('emits original with no dims', () => {
+    expect(resolutionWireMessage({ mode: 'original' })).toEqual({
+      t: 'rc:resolution',
+      mode: 'original',
+    })
+  })
+
+  it('emits fit with width + height', () => {
+    expect(resolutionWireMessage({ mode: 'fit', width: 1920, height: 1080 })).toEqual({
+      t: 'rc:resolution',
+      mode: 'fit',
+      width: 1920,
+      height: 1080,
+    })
+  })
+
+  it('emits custom with width + height', () => {
+    expect(resolutionWireMessage({ mode: 'custom', width: 2560, height: 1440 })).toEqual({
+      t: 'rc:resolution',
+      mode: 'custom',
+      width: 2560,
+      height: 1440,
+    })
+  })
+
+  it('rounds non-integer dims to the nearest pixel', () => {
+    // devicePixelRatio + rect math can produce fractional CSS pixels.
+    // The wire format is u32 — round at the browser boundary.
+    expect(resolutionWireMessage({ mode: 'fit', width: 1920.7, height: 1080.2 })).toEqual({
+      t: 'rc:resolution',
+      mode: 'fit',
+      width: 1921,
+      height: 1080,
+    })
+  })
+
+  it('drops invalid custom/fit with missing or zero dims', () => {
+    expect(resolutionWireMessage({ mode: 'fit' })).toBeNull()
+    expect(resolutionWireMessage({ mode: 'custom', width: 0, height: 100 })).toBeNull()
+    expect(resolutionWireMessage({ mode: 'custom', width: 100, height: 0 })).toBeNull()
   })
 })

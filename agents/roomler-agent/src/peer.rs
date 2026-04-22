@@ -113,6 +113,24 @@ mod quality {
     }
 }
 
+/// Controller-requested encode resolution. `Native` keeps the agent's
+/// monitor resolution; `Fixed` downscales post-capture to the target
+/// dims before the encoder sees the frame. Lives in a shared
+/// `Arc<Mutex<_>>` mutated by the `control` DC handler on `rc:resolution`
+/// and polled by the media pump before each encode. The encoder's
+/// existing dims-change rebuild path handles the teardown / reinit
+/// when the effective frame size shifts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TargetResolution {
+    /// Agent picks — whatever the capture backend produces natively.
+    Native,
+    /// Controller-specified target. Downscale native → (w, h) before
+    /// encode. Upscaling is a no-op: we cap at native so an over-large
+    /// request (Fit mode on a viewport bigger than the source) doesn't
+    /// waste encoder budget on upsampled pixels.
+    Fixed { width: u32, height: u32 },
+}
+
 /// Pick the capture downscale policy consistent with an encoder
 /// preference. HW encoders can eat 4K frames without breaking a sweat;
 /// SW openh264 needs the 2× downsample to stay above ~30 fps at 1080p,
@@ -276,6 +294,13 @@ impl AgentPeer {
         // Default trait impl falls back to keyframe; backends that
         // expose proper intra-refresh override.
         let invalidation_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Controller-chosen encode resolution. Defaults to Native; the
+        // `rc:resolution` control-DC message (Phase 2 of the viewer-
+        // controls sprint) writes this and the media pump applies on
+        // the next frame. Std Mutex (not tokio) because reads from the
+        // sync pump loop and writes from the async DC callback are
+        // both brief.
+        let target_resolution = Arc::new(std::sync::Mutex::new(TargetResolution::Native));
         let rtcp_reader = {
             let flag = keyframe_requested.clone();
             let remb = remb_bps.clone();
@@ -437,14 +462,18 @@ impl AgentPeer {
         // `files` accepts uploads that land in the controlled host's
         // Downloads folder.
         let quality_for_dc = quality_state.clone();
+        let target_res_for_dc = target_resolution.clone();
         pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
             let label = dc.label().to_string();
             info!(session = %session_id, %label, "data channel opened");
             let quality_for_dc = quality_for_dc.clone();
+            let target_res_for_dc = target_res_for_dc.clone();
             Box::pin(async move {
                 match label.as_str() {
                     "input" => attach_input_handler(dc),
-                    "control" => attach_control_handler(dc, session_id, quality_for_dc),
+                    "control" => {
+                        attach_control_handler(dc, session_id, quality_for_dc, target_res_for_dc)
+                    }
                     "cursor" => attach_cursor_handler(dc, session_id),
                     #[cfg(feature = "clipboard")]
                     "clipboard" => attach_clipboard_handler(dc, session_id),
@@ -466,6 +495,7 @@ impl AgentPeer {
             remb_bps.clone(),
             encoder_preference,
             chosen_codec,
+            target_resolution.clone(),
         ));
 
         Ok(Self {
@@ -553,6 +583,7 @@ async fn media_pump(
     remb_bps: Arc<std::sync::atomic::AtomicU32>,
     encoder_preference: encode::EncoderPreference,
     chosen_codec: String,
+    target_resolution: Arc<std::sync::Mutex<TargetResolution>>,
 ) {
     // Capture downscale policy mirrors the encoder preference. When the
     // HW encoder is in play (or will be, on Auto + Windows), we want
@@ -709,6 +740,13 @@ async fn media_pump(
                 continue;
             }
         };
+
+        // Apply the controller-chosen target resolution. Native = no
+        // change. Fixed = downscale (upscaling is refused — we cap at
+        // native since upsampling wastes encoder budget on interpolated
+        // pixels that carry no new information). On resolution change
+        // the `encoder_dims` check below rebuilds the encoder.
+        let frame = apply_target_resolution(frame, *target_resolution.lock().unwrap());
 
         // (Re)build the encoder if the frame dimensions change.
         if encoder_dims != Some((frame.width, frame.height)) {
@@ -939,9 +977,11 @@ fn attach_control_handler(
     dc: Arc<RTCDataChannel>,
     session_id: bson::oid::ObjectId,
     quality_state: Arc<std::sync::atomic::AtomicU8>,
+    target_resolution: Arc<std::sync::Mutex<TargetResolution>>,
 ) {
     dc.on_message(Box::new(move |msg| {
         let quality_state = quality_state.clone();
+        let target_resolution = target_resolution.clone();
         Box::pin(async move {
             // Trust-but-verify: a malformed message must never crash
             // the data-channel callback (it'd kill the channel for
@@ -982,6 +1022,46 @@ fn attach_control_handler(
                             prev = quality::label(prev),
                             new = quality::label(q_val),
                             "control: rc:quality updated"
+                        );
+                    }
+                }
+                "rc:resolution" => {
+                    let mode = val.get("mode").and_then(|v| v.as_str()).unwrap_or("");
+                    let new_target = match mode {
+                        "original" => TargetResolution::Native,
+                        "fit" | "custom" => {
+                            let w = val.get("width").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                            let h = val.get("height").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                            if w == 0 || h == 0 {
+                                debug!(
+                                    %session_id, mode,
+                                    "control: rc:resolution missing/invalid width/height — dropped"
+                                );
+                                return;
+                            }
+                            TargetResolution::Fixed {
+                                width: w,
+                                height: h,
+                            }
+                        }
+                        other => {
+                            debug!(
+                                %session_id, mode = other,
+                                "control: rc:resolution unknown mode — dropped"
+                            );
+                            return;
+                        }
+                    };
+                    let mut slot = target_resolution.lock().unwrap();
+                    let prev = *slot;
+                    if prev != new_target {
+                        *slot = new_target;
+                        info!(
+                            %session_id,
+                            mode,
+                            ?prev,
+                            new_target = ?new_target,
+                            "control: rc:resolution updated"
                         );
                     }
                 }
@@ -1067,6 +1147,104 @@ fn attach_cursor_handler(dc: Arc<RTCDataChannel>, session_id: bson::oid::ObjectI
             }
         }
     });
+}
+
+/// Downscale a captured frame to the controller-chosen target
+/// resolution. `TargetResolution::Native` is a no-op; `Fixed` sizes
+/// larger or equal to the capture are also no-ops (upscaling serves
+/// no purpose — the encoder just gets interpolated pixels). Returns
+/// the same `Arc<Frame>` when no work is needed, so idle sessions
+/// don't pay the allocator cost.
+fn apply_target_resolution(
+    frame: std::sync::Arc<crate::capture::Frame>,
+    target: TargetResolution,
+) -> std::sync::Arc<crate::capture::Frame> {
+    let (tw, th) = match target {
+        TargetResolution::Native => return frame,
+        TargetResolution::Fixed { width, height } => (width, height),
+    };
+    if tw >= frame.width && th >= frame.height {
+        // Cap at native — don't upscale.
+        return frame;
+    }
+    if tw == 0 || th == 0 {
+        return frame;
+    }
+    if frame.pixel_format != crate::capture::PixelFormat::Bgra {
+        // Non-BGRA frames shouldn't reach this point today (both scrap
+        // and WGC emit BGRA), but be defensive — pass through rather
+        // than produce a mis-formatted downscale.
+        return frame;
+    }
+    let downscaled =
+        downscale_bgra_box(&frame.data, frame.width, frame.height, frame.stride, tw, th);
+    std::sync::Arc::new(crate::capture::Frame {
+        width: tw,
+        height: th,
+        stride: tw * 4,
+        pixel_format: crate::capture::PixelFormat::Bgra,
+        data: downscaled,
+        monotonic_us: frame.monotonic_us,
+        monitor: frame.monitor,
+        // Dirty rects at native scale; after downscale they'd need
+        // re-projection. The encoder's ROI hook treats an empty list
+        // as "unknown" which falls back to full-frame encoding — safe
+        // default until we wire per-rect scaling.
+        dirty_rects: Vec::new(),
+    })
+}
+
+/// CPU box-filter downscale for BGRA frames. For each destination
+/// pixel, averages the source pixels inside the mapped rectangle.
+/// Handles non-integer ratios (e.g. 3840×2160 → 1920×1200). ~30 ms
+/// on 4K→1080p on a modern laptop CPU; good enough for 30 fps and
+/// tolerable at 60 fps. GPU path via VideoProcessorMFT is the
+/// follow-up (deferred Tier C/1C.3 in the RustDesk-parity plan).
+fn downscale_bgra_box(
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+    src_stride: u32,
+    dst_w: u32,
+    dst_h: u32,
+) -> Vec<u8> {
+    let mut dst = vec![0u8; (dst_w as usize) * (dst_h as usize) * 4];
+    let src_w_u = src_w as u64;
+    let src_h_u = src_h as u64;
+    for dy in 0..dst_h {
+        let sy_start = (dy as u64 * src_h_u / dst_h as u64) as u32;
+        let sy_end_raw = ((dy as u64 + 1) * src_h_u).div_ceil(dst_h as u64) as u32;
+        let sy_end = sy_end_raw.min(src_h);
+        for dx in 0..dst_w {
+            let sx_start = (dx as u64 * src_w_u / dst_w as u64) as u32;
+            let sx_end_raw = ((dx as u64 + 1) * src_w_u).div_ceil(dst_w as u64) as u32;
+            let sx_end = sx_end_raw.min(src_w);
+            let mut b: u32 = 0;
+            let mut g: u32 = 0;
+            let mut r: u32 = 0;
+            let mut a: u32 = 0;
+            let mut n: u32 = 0;
+            for sy in sy_start..sy_end {
+                let row_base = (sy * src_stride) as usize;
+                for sx in sx_start..sx_end {
+                    let i = row_base + (sx as usize) * 4;
+                    b += src[i] as u32;
+                    g += src[i + 1] as u32;
+                    r += src[i + 2] as u32;
+                    a += src[i + 3] as u32;
+                    n += 1;
+                }
+            }
+            if let Some(divisor) = std::num::NonZeroU32::new(n) {
+                let di = ((dy * dst_w + dx) as usize) * 4;
+                dst[di] = (b / divisor.get()) as u8;
+                dst[di + 1] = (g / divisor.get()) as u8;
+                dst[di + 2] = (r / divisor.get()) as u8;
+                dst[di + 3] = (a / divisor.get()) as u8;
+            }
+        }
+    }
+    dst
 }
 
 /// Placeholder handler for data channels that aren't wired to OS output

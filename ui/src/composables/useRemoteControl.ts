@@ -132,6 +132,26 @@ function persistPreferredCodec(c: RcPreferredCodec | null) {
  *  - `custom`: scaled to `scaleCustomPercent` of intrinsic size. */
 export type RcScaleMode = 'adaptive' | 'original' | 'custom'
 
+/** Which capture/encode resolution the REMOTE agent should use.
+ *  - `original`: the agent's native monitor resolution.
+ *  - `fit`: the agent downscales to match the local viewer's stage
+ *    dimensions × devicePixelRatio (re-emitted on viewport resize).
+ *  - `custom`: an explicit width × height picked from a preset list or
+ *    typed in by the operator. */
+export type RcResolutionMode = 'original' | 'fit' | 'custom'
+
+export interface RcResolutionSetting {
+  mode: RcResolutionMode
+  /** Only meaningful for `fit` + `custom`. */
+  width?: number
+  height?: number
+}
+
+/** Per-agent localStorage prefix — resolution preferences should NOT
+ *  bleed across machines (a "Fit to local at 1920×1080" set for my
+ *  laptop monitor is wrong for my 4K desktop). */
+const RESOLUTION_STORAGE_PREFIX = 'roomler-rc-resolution:'
+
 const SCALE_MODE_STORAGE_KEY = 'roomler-rc-scale-mode'
 const SCALE_CUSTOM_PCT_STORAGE_KEY = 'roomler-rc-scale-pct'
 
@@ -172,6 +192,61 @@ function persistScalePct(n: number) {
   } catch {
     /* best-effort */
   }
+}
+
+function readStoredResolution(agentId: string): RcResolutionSetting {
+  try {
+    const raw = globalThis.localStorage?.getItem(RESOLUTION_STORAGE_PREFIX + agentId)
+    if (raw) {
+      const parsed = JSON.parse(raw)
+      if (
+        parsed &&
+        (parsed.mode === 'original' || parsed.mode === 'fit' || parsed.mode === 'custom')
+      ) {
+        return {
+          mode: parsed.mode,
+          width: typeof parsed.width === 'number' ? parsed.width : undefined,
+          height: typeof parsed.height === 'number' ? parsed.height : undefined,
+        }
+      }
+    }
+  } catch {
+    /* fall through to default */
+  }
+  return { mode: 'original' }
+}
+
+function persistResolution(agentId: string, s: RcResolutionSetting) {
+  try {
+    globalThis.localStorage?.setItem(
+      RESOLUTION_STORAGE_PREFIX + agentId,
+      JSON.stringify(s),
+    )
+  } catch {
+    /* best-effort */
+  }
+}
+
+/** Translate an `RcResolutionSetting` into the exact JSON shape the
+ *  agent's control-DC handler expects. Returns `null` when the
+ *  setting is invalid (fit/custom with no dims) — the caller drops
+ *  the send rather than emitting a half-formed message. Exported
+ *  for tests so the wire format is locked. */
+export function resolutionWireMessage(
+  s: RcResolutionSetting,
+): Record<string, unknown> | null {
+  if (s.mode === 'original') {
+    return { t: 'rc:resolution', mode: 'original' }
+  }
+  // fit + custom both require positive integer dims. Missing or
+  // zero/negative values return null so the caller drops the send
+  // rather than emitting an invalid message.
+  if (s.width == null || s.height == null) return null
+  if (!Number.isFinite(s.width) || !Number.isFinite(s.height)) return null
+  const w = Math.round(s.width)
+  const h = Math.round(s.height)
+  if (w < 1 || h < 1) return null
+  return { t: 'rc:resolution', mode: s.mode, width: w, height: h }
 }
 
 /** Given the full set of browser-supported codecs and an optional
@@ -227,6 +302,12 @@ export function useRemoteControl() {
   /** Percent for `scaleMode === 'custom'`. Range 5-1000, clamped at
    *  read/write time. */
   const scaleCustomPercent = ref<number>(readStoredScalePct())
+  /** Remote capture/encode resolution choice. Persisted per-agent
+   *  (keyed on `agentId` after `connect()`). Starts at `{mode:'original'}`
+   *  and narrows when `connect()` supplies the real agent id. */
+  const resolution = ref<RcResolutionSetting>({ mode: 'original' })
+  // Tracks the last agentId we loaded + persist under. Set in connect().
+  let resolutionAgentId: string | null = null
 
   let pc: RTCPeerConnection | null = null
   /** Data channels we open proactively (per docs §5). Labels match the
@@ -319,6 +400,32 @@ export function useRemoteControl() {
     const clamped = Math.round(Math.max(5, Math.min(1000, n)))
     scaleCustomPercent.value = clamped
     persistScalePct(clamped)
+  }
+
+  /** Send the current resolution preference over the control DC.
+   *  Safe to call while the channel is closed — no-op until open; the
+   *  `channels.control.onopen` handler calls this automatically so a
+   *  page reload re-emits the stored preference without user action. */
+  function sendResolutionPreference() {
+    const ch = channels.control
+    if (!ch || ch.readyState !== 'open') return
+    const msg = resolutionWireMessage(resolution.value)
+    if (!msg) return
+    try {
+      ch.send(JSON.stringify(msg))
+    } catch {
+      /* channel closed between check and send — drop */
+    }
+  }
+
+  /** Update the controller's remote-resolution preference and push to
+   *  the agent. For `fit` + `custom`, `width`/`height` are required;
+   *  for `original`, they're ignored. Persisted per-agent so the
+   *  choice survives reloads without bleeding across machines. */
+  function setResolution(next: RcResolutionSetting) {
+    resolution.value = next
+    if (resolutionAgentId) persistResolution(resolutionAgentId, next)
+    sendResolutionPreference()
   }
 
   function startStatsPoll() {
@@ -503,6 +610,13 @@ export function useRemoteControl() {
     error.value = null
     sessionId.value = null
     phase.value = 'requesting'
+
+    // Restore the per-agent resolution preference. This has to live
+    // here (not at composable-init) because `useRemoteControl()` runs
+    // before the route params resolve on some mount paths, and we
+    // don't want a stale value from a different agent leaking in.
+    resolutionAgentId = agentId
+    resolution.value = readStoredResolution(agentId)
 
     // Inspect what video codecs this browser can decode so the agent
     // can pick the best intersection with its own AgentCaps.codecs
@@ -696,7 +810,10 @@ export function useRemoteControl() {
     // Re-send the restored quality preference as soon as the control
     // channel opens — otherwise the agent would stay at its default
     // after a page reload that had set a non-default preference.
-    channels.control.onopen = () => { sendQualityPreference() }
+    channels.control.onopen = () => {
+      sendQualityPreference()
+      sendResolutionPreference()
+    }
 
     // Begin polling getStats() on a 500 ms cadence so the UI can show
     // live bitrate/fps/codec. Runs unconditionally while `pc` exists;
@@ -1045,6 +1162,8 @@ export function useRemoteControl() {
     scaleCustomPercent,
     setScaleMode,
     setScaleCustomPercent,
+    resolution,
+    setResolution,
   }
 }
 
