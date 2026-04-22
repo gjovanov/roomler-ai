@@ -249,6 +249,79 @@ export function resolutionWireMessage(
   return { t: 'rc:resolution', mode: s.mode, width: w, height: h }
 }
 
+/** Which render path the viewer uses for the inbound video track.
+ *  - `video`: classic `<video>` element bound to a MediaStream. Goes
+ *    through Chrome's built-in jitter buffer (~80 ms soft floor).
+ *  - `webcodecs`: a Web Worker receives encoded RTP frames via
+ *    `RTCRtpScriptTransform`, decodes them with `VideoDecoder`, and
+ *    paints the results to an `OffscreenCanvas`. Bypasses the jitter
+ *    buffer for measurable latency savings. Chrome-only in practice;
+ *    falls back to `video` when `RTCRtpScriptTransform` or
+ *    `VideoDecoder` are unavailable. Takes effect on the next
+ *    `connect()` — live sessions keep whatever path they started
+ *    with, since swapping receiver transforms mid-session tears
+ *    down the decoder. */
+export type RcRenderPath = 'video' | 'webcodecs'
+
+const RENDER_PATH_STORAGE_KEY = 'roomler-rc-render-path'
+
+function readStoredRenderPath(): RcRenderPath {
+  try {
+    const raw = globalThis.localStorage?.getItem(RENDER_PATH_STORAGE_KEY)
+    if (raw === 'webcodecs' || raw === 'video') return raw
+  } catch {
+    /* privacy mode → default */
+  }
+  return 'video'
+}
+
+function persistRenderPath(p: RcRenderPath) {
+  try {
+    globalThis.localStorage?.setItem(RENDER_PATH_STORAGE_KEY, p)
+  } catch {
+    /* best-effort */
+  }
+}
+
+/** Feature-detect WebCodecs + RTCRtpScriptTransform. Returns true only
+ *  when both pieces are present — Firefox has VideoDecoder but exposes
+ *  insertable streams via a different API, so the toggle stays off
+ *  there until we add that path too. Exported for vitest. */
+export function isWebCodecsSupported(): boolean {
+  const g = globalThis as unknown as {
+    RTCRtpScriptTransform?: unknown
+    VideoDecoder?: unknown
+  }
+  return typeof g.RTCRtpScriptTransform === 'function'
+    && typeof g.VideoDecoder === 'function'
+}
+
+/** Short codec name to pass into `new RTCRtpScriptTransform(worker,
+ *  { codec })`. Reads the first negotiated codec off
+ *  `RTCRtpReceiver.getParameters().codecs` and maps it back to our
+ *  protocol's short name. Defaults to 'h264' when nothing has
+ *  negotiated yet or the mime type is unrecognised. Exported for tests. */
+export function shortCodecFromReceiver(
+  receiver: Pick<RTCRtpReceiver, 'getParameters'> | null | undefined,
+): RcPreferredCodec {
+  if (!receiver) return 'h264'
+  let mime = ''
+  try {
+    const params = receiver.getParameters()
+    const codecs = (params as { codecs?: Array<{ mimeType?: string }> }).codecs
+    if (codecs && codecs.length > 0 && codecs[0]?.mimeType) {
+      mime = codecs[0].mimeType.toLowerCase()
+    }
+  } catch {
+    return 'h264'
+  }
+  if (mime.includes('h265') || mime.includes('hevc')) return 'h265'
+  if (mime.includes('av1')) return 'av1'
+  if (mime.includes('vp9')) return 'vp9'
+  if (mime.includes('vp8')) return 'vp8'
+  return 'h264'
+}
+
 /** Given the full set of browser-supported codecs and an optional
  *  override, return the list the agent should see in `browser_caps`.
  *  When `preferred` is set, only that codec (plus H.264 as a safety
@@ -308,6 +381,33 @@ export function useRemoteControl() {
   const resolution = ref<RcResolutionSetting>({ mode: 'original' })
   // Tracks the last agentId we loaded + persist under. Set in connect().
   let resolutionAgentId: string | null = null
+
+  /** Viewer render path. `video` goes through `<video>` + the browser's
+   *  jitter buffer; `webcodecs` uses the Worker + VideoDecoder + canvas
+   *  path that bypasses it. Persisted per-browser; defaults to `video`
+   *  so the feature stays opt-in while we bed it in. */
+  const renderPath = ref<RcRenderPath>(readStoredRenderPath())
+  /** Whether this browser actually supports the WebCodecs path. UI
+   *  reads this to disable the toggle when the APIs aren't present
+   *  (Firefox, Safari < 17, old Chromium). */
+  const webcodecsSupported = ref<boolean>(isWebCodecsSupported())
+  /** The `<canvas>` the view renders into when `renderPath === 'webcodecs'`
+   *  and the session is active. The view writes this ref on mount; the
+   *  composable reads it in `pc.ontrack` to transfer control to the
+   *  worker. Null in `video` mode. */
+  const webcodecsCanvasEl = ref<HTMLCanvasElement | null>(null)
+  /** Unified intrinsic dimensions of the rendered remote frame. Driven
+   *  by `<video>.onresize` in classic mode and by worker `first-frame`
+   *  messages in webcodecs mode. The view reads this for `custom`/`original`
+   *  scale styling + input coord math — one source of truth that works
+   *  across both paths. */
+  const mediaIntrinsicW = ref(0)
+  const mediaIntrinsicH = ref(0)
+  // WebCodecs runtime handles. Created on track-attach, destroyed in
+  // teardown(). Tracked here rather than scoped inside ontrack so
+  // teardown() can reliably stop the worker on disconnect.
+  let webcodecsWorker: Worker | null = null
+  let webcodecsActive = false
 
   let pc: RTCPeerConnection | null = null
   /** Data channels we open proactively (per docs §5). Labels match the
@@ -426,6 +526,94 @@ export function useRemoteControl() {
     resolution.value = next
     if (resolutionAgentId) persistResolution(resolutionAgentId, next)
     sendResolutionPreference()
+  }
+
+  /** Switch render path. Only takes effect on the next `connect()` —
+   *  switching mid-session would require tearing down the receiver
+   *  transform and replacing the DOM element the video paints into,
+   *  which is more disruption than "reconnect to apply". Persisted
+   *  per-browser. If WebCodecs isn't supported on this browser and
+   *  the caller asks for `webcodecs`, we clamp to `video` silently so
+   *  a stored preference from a different browser doesn't brick the
+   *  viewer. */
+  function setRenderPath(p: RcRenderPath) {
+    const next = p === 'webcodecs' && !webcodecsSupported.value ? 'video' : p
+    renderPath.value = next
+    persistRenderPath(next)
+  }
+
+  /** Attach the WebCodecs worker to a receiver. Called from `pc.ontrack`
+   *  when the user has opted into the webcodecs render path AND the
+   *  browser supports it. Returns true if wiring succeeded; false
+   *  means the caller should fall back to the classic `<video>` path
+   *  for this session. Kept separate so a thrown error inside any of
+   *  the worker/transform/canvas steps can't brick the stream — we
+   *  report and bail. */
+  function activateWebCodecsPath(
+    receiver: RTCRtpReceiver,
+    canvasEl: HTMLCanvasElement,
+  ): boolean {
+    const g = globalThis as unknown as {
+      RTCRtpScriptTransform?: new (worker: Worker, opts: unknown) => unknown
+    }
+    const TransformCtor = g.RTCRtpScriptTransform
+    if (typeof TransformCtor !== 'function') return false
+    let offscreen: OffscreenCanvas
+    try {
+      offscreen = canvasEl.transferControlToOffscreen()
+    } catch (err) {
+      console.warn('[rc] transferControlToOffscreen failed', err)
+      return false
+    }
+    let worker: Worker
+    try {
+      worker = new Worker(
+        new URL('../workers/rc-webcodecs-worker.ts', import.meta.url),
+        { type: 'module' },
+      )
+    } catch (err) {
+      console.warn('[rc] worker construction failed', err)
+      return false
+    }
+    worker.onmessage = (ev) => {
+      const msg = ev.data as { type?: string; width?: number; height?: number; error?: string }
+      if (!msg || typeof msg.type !== 'string') return
+      if (msg.type === 'first-frame' && typeof msg.width === 'number' && typeof msg.height === 'number') {
+        mediaIntrinsicW.value = msg.width
+        mediaIntrinsicH.value = msg.height
+      } else if (msg.type === 'decoder-error' || msg.type === 'decoder-configure-error' || msg.type === 'reader-error') {
+        console.warn('[rc] webcodecs worker error', msg)
+      }
+    }
+    try {
+      worker.postMessage({ type: 'init-canvas', canvas: offscreen }, [offscreen])
+    } catch (err) {
+      console.warn('[rc] worker init-canvas post failed', err)
+      worker.terminate()
+      return false
+    }
+    const codec = shortCodecFromReceiver(receiver)
+    try {
+      ;(receiver as unknown as { transform: unknown }).transform = new TransformCtor(
+        worker,
+        { codec },
+      )
+    } catch (err) {
+      console.warn('[rc] setting receiver.transform failed', err)
+      worker.terminate()
+      return false
+    }
+    webcodecsWorker = worker
+    webcodecsActive = true
+    return true
+  }
+
+  function stopWebCodecsPath() {
+    if (!webcodecsWorker) return
+    try { webcodecsWorker.postMessage({ type: 'close' }) } catch { /* ignore */ }
+    try { webcodecsWorker.terminate() } catch { /* ignore */ }
+    webcodecsWorker = null
+    webcodecsActive = false
   }
 
   function startStatsPoll() {
@@ -588,6 +776,7 @@ export function useRemoteControl() {
 
   function teardown() {
     stopStatsPoll()
+    stopWebCodecsPath()
     for (const ch of Object.values(channels)) {
       try { ch.close() } catch { /* ignore */ }
     }
@@ -601,6 +790,8 @@ export function useRemoteControl() {
     remoteDescriptionSet = false
     pendingRemoteIce.length = 0
     cursor.value = { pos: null, shapes: new Map() }
+    mediaIntrinsicW.value = 0
+    mediaIntrinsicH.value = 0
   }
 
   async function connect(agentId: string, permissions = 'VIEW | INPUT | CLIPBOARD') {
@@ -664,6 +855,30 @@ export function useRemoteControl() {
       // single-track case we have today.
       remoteStream.value = new MediaStream([ev.track])
       hasMedia.value = true
+      // Try the WebCodecs bypass first when the user opted in AND the
+      // browser supports it AND the view has mounted the canvas. Any
+      // failure along the way falls back to the classic <video> path
+      // without user-visible error — activateWebCodecsPath returns
+      // false and we fall through to the jitter-buffer tuning below.
+      const wantsWebCodecs =
+        renderPath.value === 'webcodecs'
+        && webcodecsSupported.value
+        && webcodecsCanvasEl.value !== null
+        && ev.track.kind === 'video'
+      if (wantsWebCodecs && activateWebCodecsPath(ev.receiver, webcodecsCanvasEl.value!)) {
+        // Worker owns rendering now. We still hint
+        // jitterBufferTarget=0 in case the transform ever hands a
+        // frame back to the writable side (a no-op today but cheap).
+        try {
+          const receiver = ev.receiver as RTCRtpReceiver & {
+            jitterBufferTarget?: number | null
+            playoutDelayHint?: number | null
+          }
+          receiver.jitterBufferTarget = 0
+          receiver.playoutDelayHint = 0
+        } catch { /* best-effort */ }
+        return
+      }
       // Tell the browser we care about latency, not playback smoothness.
       // Chromium enforces a soft ~80 ms floor regardless, but asking
       // for zero still shaves ~30-50 ms off the previous 50 ms setting
@@ -1164,6 +1379,12 @@ export function useRemoteControl() {
     setScaleCustomPercent,
     resolution,
     setResolution,
+    renderPath,
+    setRenderPath,
+    webcodecsSupported,
+    webcodecsCanvasEl,
+    mediaIntrinsicW,
+    mediaIntrinsicH,
   }
 }
 

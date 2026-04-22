@@ -158,6 +158,23 @@ Issue HIGH on 2026-04-22 with the proper fix deferred to Tier 1C.3
    sessions (`CreateForMonitor(HMONITOR)` is what we already call);
    the control-DC needs an `rc:monitor` message + UI dropdown (the
    agent already advertises all monitors in `AgentHello.displays`).
+7. **Agent auto-start on boot / login**. Windows: register a Scheduled
+   Task at MSI install time ("At log on of any user") that launches
+   `roomler-agent.exe run`. Linux: a systemd user unit in
+   `~/.config/systemd/user/roomler-agent.service` + `loginctl enable-linger`.
+   macOS: `LaunchAgent` plist in `~/Library/LaunchAgents/`. Agent
+   binary should also gain a `service install / uninstall / status`
+   CLI for manual setup.
+8. **Agent version checker + auto-updater**. On startup and every
+   ~6 h: GET `https://api.github.com/repos/gjovanov/roomler-ai/releases/latest`,
+   parse tag, compare to `env!("CARGO_PKG_VERSION")`. If newer,
+   download the platform-appropriate artifact (MSI / .deb / .pkg)
+   to a temp dir, verify size, then spawn the installer detached
+   (`msiexec /i path /qn /norestart` → schedules the replace; agent
+   exits so the MSI can overwrite the binary, Scheduled Task relaunches
+   the new build). Use the `self_update` crate for the cross-platform
+   scaffolding. Surface "update available" in the admin UI via a new
+   `agent_version` field on `AgentHello`.
 
 ## Resumption recipe
 

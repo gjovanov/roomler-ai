@@ -192,6 +192,25 @@
       >
         <v-icon>{{ isFullscreen ? 'mdi-fullscreen-exit' : 'mdi-fullscreen' }}</v-icon>
       </v-btn>
+      <!-- Low-latency (WebCodecs) toggle. When supported + enabled, the
+           viewer uses a Web Worker + VideoDecoder + canvas render path
+           that bypasses Chrome's built-in jitter buffer (~80 ms soft
+           floor on <video>). Takes effect on the next Connect. Disabled
+           and off when the browser lacks RTCRtpScriptTransform /
+           VideoDecoder. -->
+      <v-btn
+        icon
+        variant="text"
+        size="small"
+        class="mr-2"
+        :color="webcodecsOn ? 'primary' : undefined"
+        :disabled="!rc.webcodecsSupported.value"
+        :aria-label="webcodecsOn ? 'Disable low-latency path' : 'Enable low-latency (WebCodecs) path'"
+        :title="webcodecsTooltip"
+        @click="toggleWebCodecs"
+      >
+        <v-icon>{{ webcodecsOn ? 'mdi-flash' : 'mdi-flash-outline' }}</v-icon>
+      </v-btn>
       <v-btn
         v-if="rc.phase.value === 'idle' || rc.phase.value === 'closed' || rc.phase.value === 'error'"
         color="primary"
@@ -255,12 +274,32 @@
         @pointerleave="cursorVisible = false"
         @pointerenter="cursorVisible = true"
       >
+        <!-- Classic render path: <video> bound to the remote MediaStream.
+             Used unless the viewer opted into the WebCodecs path AND
+             the browser supports it. We still render the <video>
+             element in WebCodecs mode but hide it — input + cursor
+             math hang off `rc.mediaIntrinsicW/H` which the composable
+             keeps in sync either way. -->
         <video
+          v-show="!isWebCodecsRender"
           ref="videoEl"
           autoplay
           playsinline
           muted
           class="remote-video"
+          :class="`scale-${rc.scaleMode.value}`"
+          :style="videoScaleStyle"
+        />
+        <!-- Low-latency render path: canvas fed by the Worker-driven
+             VideoDecoder. transferControlToOffscreen() happens once
+             per session in the composable; this element is the main-
+             thread handle we bind the canvas ref on. Same scale
+             classes + style as the video so the existing layout +
+             cursor overlays keep working. -->
+        <canvas
+          v-if="isWebCodecsRender"
+          :ref="bindWebcodecsCanvas"
+          class="remote-video webcodecs-canvas"
           :class="`scale-${rc.scaleMode.value}`"
           :style="videoScaleStyle"
         />
@@ -390,6 +429,7 @@ import {
   type RcPreferredCodec,
   type RcScaleMode,
   type RcResolutionSetting,
+  type RcRenderPath,
 } from '@/composables/useRemoteControl'
 import { useSnackbar } from '@/composables/useSnackbar'
 
@@ -527,12 +567,43 @@ const scalePercent = computed<number>({
   set: (v: number) => rc.setScaleCustomPercent(v),
 })
 
-// Intrinsic video dimensions. Updated by the `loadedmetadata` and
-// `resize` events on the <video> element — the agent can change
-// resolution mid-session (DPI toggle, rc:resolution control message)
-// and the scaled layout needs to track that.
-const videoIntrinsicW = ref(0)
-const videoIntrinsicH = ref(0)
+// Intrinsic remote-frame dimensions. The composable is the source of
+// truth — it's fed by `<video>.onresize` in classic mode and by the
+// WebCodecs worker's `first-frame` message in the low-latency path.
+// That way any consumer downstream (scale style, coord math, cursor
+// overlay) reads one set of refs regardless of render path.
+const videoIntrinsicW = rc.mediaIntrinsicW
+const videoIntrinsicH = rc.mediaIntrinsicH
+
+// Render-path toggle. The composable persists the preference across
+// reloads; `webcodecsSupported` is true only when the browser exposes
+// both RTCRtpScriptTransform + VideoDecoder (Chrome 94+). The
+// `isWebCodecsRender` computed drives template rendering — it's only
+// true when the session is actively using the WebCodecs path (the
+// user opted in AND the browser supports it). We read `rc.renderPath`
+// directly so the UI state matches what the next Connect would do.
+const webcodecsOn = computed<boolean>(() => rc.renderPath.value === 'webcodecs')
+const isWebCodecsRender = computed<boolean>(
+  () => webcodecsOn.value && rc.webcodecsSupported.value,
+)
+const webcodecsTooltip = computed<string>(() => {
+  if (!rc.webcodecsSupported.value) {
+    return 'Low-latency (WebCodecs) path requires Chrome 94+ — not supported in this browser'
+  }
+  return webcodecsOn.value
+    ? 'Low-latency (WebCodecs) ON — bypasses <video> jitter buffer. Takes effect on next Connect.'
+    : 'Low-latency (WebCodecs) OFF — using <video> render path'
+})
+function toggleWebCodecs() {
+  const next: RcRenderPath = webcodecsOn.value ? 'video' : 'webcodecs'
+  rc.setRenderPath(next)
+}
+/** Bind callback for the webcodecs canvas ref. Vue calls this with
+ *  the element (or null on unmount) — we forward to the composable's
+ *  writable canvas ref so `pc.ontrack` can see it. */
+function bindWebcodecsCanvas(el: Element | unknown) {
+  rc.webcodecsCanvasEl.value = (el as HTMLCanvasElement | null) ?? null
+}
 
 // Fullscreen toggle. Drives the stage element into/out of the browser's
 // Fullscreen API. `isFullscreen` tracks the real DOM state via the
@@ -929,8 +1000,14 @@ let rvfcHandle: number | null = null
 // Keep our intrinsic-dimension refs in sync with the actual video
 // element. `resize` fires on every resolution change from the agent
 // (docking, DPI flip, rc:resolution control message in Phase 2);
-// `loadedmetadata` covers the first-frame bootstrap.
+// `loadedmetadata` covers the first-frame bootstrap. In WebCodecs
+// mode the <video> element never receives decoded frames (the
+// receiver transform swallows them), so `videoWidth` stays 0 — we
+// skip writing zeros here to avoid clobbering the worker's first-
+// frame dims. The worker's `first-frame` message is the authoritative
+// source in that mode.
 function refreshVideoDims(el: HTMLVideoElement) {
+  if (isWebCodecsRender.value) return
   videoIntrinsicW.value = el.videoWidth || 0
   videoIntrinsicH.value = el.videoHeight || 0
 }

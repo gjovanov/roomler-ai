@@ -15,7 +15,10 @@ import {
   shouldPreventDefault,
   filterCapsByPreference,
   resolutionWireMessage,
+  isWebCodecsSupported,
+  shortCodecFromReceiver,
 } from '@/composables/useRemoteControl'
+import { codecMimeForShort } from '@/workers/rc-webcodecs-worker'
 
 function keyEvent(code: string, mods: Partial<{ ctrl: boolean; alt: boolean; meta: boolean; shift: boolean }> = {}): KeyboardEvent {
   return {
@@ -569,5 +572,82 @@ describe('resolutionWireMessage', () => {
     expect(resolutionWireMessage({ mode: 'fit' })).toBeNull()
     expect(resolutionWireMessage({ mode: 'custom', width: 0, height: 100 })).toBeNull()
     expect(resolutionWireMessage({ mode: 'custom', width: 100, height: 0 })).toBeNull()
+  })
+})
+
+describe('codecMimeForShort', () => {
+  it('maps the known codec short-names to permissive WebCodecs strings', () => {
+    expect(codecMimeForShort('h264')).toBe('avc1.42E01F')
+    expect(codecMimeForShort('h265')).toBe('hev1.1.6.L93.B0')
+    expect(codecMimeForShort('hevc')).toBe('hev1.1.6.L93.B0')
+    expect(codecMimeForShort('av1')).toBe('av01.0.08M.08')
+    expect(codecMimeForShort('vp9')).toBe('vp09.00.10.08')
+    expect(codecMimeForShort('vp8')).toBe('vp8')
+  })
+
+  it('is case-insensitive', () => {
+    expect(codecMimeForShort('H264')).toBe('avc1.42E01F')
+    expect(codecMimeForShort('HEVC')).toBe('hev1.1.6.L93.B0')
+  })
+
+  it('falls back to H.264 for unknown short-names so a typo or stale wire value still produces a valid decoder config', () => {
+    expect(codecMimeForShort('bogus')).toBe('avc1.42E01F')
+    expect(codecMimeForShort('')).toBe('avc1.42E01F')
+  })
+})
+
+describe('isWebCodecsSupported', () => {
+  const originalTransform = (globalThis as unknown as { RTCRtpScriptTransform?: unknown }).RTCRtpScriptTransform
+  const originalDecoder = (globalThis as unknown as { VideoDecoder?: unknown }).VideoDecoder
+  afterAll(() => {
+    ;(globalThis as unknown as Record<string, unknown>).RTCRtpScriptTransform = originalTransform
+    ;(globalThis as unknown as Record<string, unknown>).VideoDecoder = originalDecoder
+  })
+
+  it('returns false when either API is missing (jsdom baseline)', () => {
+    delete (globalThis as unknown as Record<string, unknown>).RTCRtpScriptTransform
+    delete (globalThis as unknown as Record<string, unknown>).VideoDecoder
+    expect(isWebCodecsSupported()).toBe(false)
+  })
+
+  it('returns false when only one of the two is present — Firefox-like with VideoDecoder but no RTCRtpScriptTransform', () => {
+    ;(globalThis as unknown as Record<string, unknown>).RTCRtpScriptTransform = undefined
+    ;(globalThis as unknown as Record<string, unknown>).VideoDecoder = function VideoDecoder() {}
+    expect(isWebCodecsSupported()).toBe(false)
+  })
+
+  it('returns true when both APIs are constructors — Chrome 94+ surface', () => {
+    ;(globalThis as unknown as Record<string, unknown>).RTCRtpScriptTransform = function RTCRtpScriptTransform() {}
+    ;(globalThis as unknown as Record<string, unknown>).VideoDecoder = function VideoDecoder() {}
+    expect(isWebCodecsSupported()).toBe(true)
+  })
+})
+
+describe('shortCodecFromReceiver', () => {
+  function makeReceiver(mime: string | undefined): Pick<RTCRtpReceiver, 'getParameters'> {
+    return {
+      getParameters: () => ({
+        codecs: mime === undefined ? [] : [{ mimeType: mime }],
+      } as unknown as RTCRtpSendParameters),
+    }
+  }
+
+  it('returns h264 when the receiver is null or has no negotiated codec', () => {
+    expect(shortCodecFromReceiver(null)).toBe('h264')
+    expect(shortCodecFromReceiver(undefined)).toBe('h264')
+    expect(shortCodecFromReceiver(makeReceiver(undefined))).toBe('h264')
+  })
+
+  it('maps common mime types to their short names', () => {
+    expect(shortCodecFromReceiver(makeReceiver('video/H264'))).toBe('h264')
+    expect(shortCodecFromReceiver(makeReceiver('video/H265'))).toBe('h265')
+    expect(shortCodecFromReceiver(makeReceiver('video/hevc'))).toBe('h265')
+    expect(shortCodecFromReceiver(makeReceiver('video/AV1'))).toBe('av1')
+    expect(shortCodecFromReceiver(makeReceiver('video/VP9'))).toBe('vp9')
+    expect(shortCodecFromReceiver(makeReceiver('video/VP8'))).toBe('vp8')
+  })
+
+  it('defaults to h264 when the mime is unrecognised', () => {
+    expect(shortCodecFromReceiver(makeReceiver('video/random-codec'))).toBe('h264')
   })
 })
