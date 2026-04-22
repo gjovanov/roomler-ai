@@ -1,4 +1,4 @@
-import { ref, onBeforeUnmount } from 'vue'
+import { ref, watch, onBeforeUnmount } from 'vue'
 import { useWsStore } from '@/stores/ws'
 import { api } from '@/api/client'
 
@@ -458,6 +458,14 @@ export function useRemoteControl() {
   // teardown() can reliably stop the worker on disconnect.
   let webcodecsWorker: Worker | null = null
   let webcodecsActive = false
+  // Receiver captured in pc.ontrack when the WebCodecs canvas hasn't
+  // mounted yet. `pc.ontrack` fires during the 'negotiating' phase,
+  // but the <canvas> is gated on phase === 'connected' — so on fast
+  // renegotiations the receiver is available before the canvas. We
+  // stash the receiver here and a watcher on webcodecsCanvasEl
+  // activates once both are present. Mirrors the same race handling
+  // the classic path does for [remoteStream, videoEl].
+  let pendingWebcodecsReceiver: RTCRtpReceiver | null = null
 
   let pc: RTCPeerConnection | null = null
   /** Data channels we open proactively (per docs §5). Labels match the
@@ -689,7 +697,25 @@ export function useRemoteControl() {
     try { webcodecsWorker.terminate() } catch { /* ignore */ }
     webcodecsWorker = null
     webcodecsActive = false
+    pendingWebcodecsReceiver = null
   }
+
+  // Late-activation watcher — see pc.ontrack above for why we queue.
+  // When the canvas mounts (phase → 'connected') and a receiver is
+  // waiting, wire up the transform. Chrome will issue a PLI shortly
+  // after the transform is installed so a keyframe shows up without
+  // manual requestKeyFrame() plumbing. Fires once per transition;
+  // re-arms naturally because the pending slot is cleared on
+  // successful activation + on teardown.
+  watch(webcodecsCanvasEl, (el) => {
+    if (!el || !pendingWebcodecsReceiver) return
+    const r = pendingWebcodecsReceiver
+    pendingWebcodecsReceiver = null
+    console.info('[rc] webcodecs: canvas mounted; activating queued receiver')
+    if (!activateWebCodecsPath(r, el)) {
+      console.warn('[rc] webcodecs: late activation failed — stream will stay black until reconnect')
+    }
+  })
 
   function startStatsPoll() {
     if (statsTimer !== null) return
@@ -931,19 +957,18 @@ export function useRemoteControl() {
       remoteStream.value = new MediaStream([ev.track])
       hasMedia.value = true
       // Try the WebCodecs bypass first when the user opted in AND the
-      // browser supports it AND the view has mounted the canvas. Any
-      // failure along the way falls back to the classic <video> path
-      // without user-visible error — activateWebCodecsPath returns
-      // false and we fall through to the jitter-buffer tuning below.
+      // browser supports it. If the canvas hasn't mounted yet (common
+      // — ontrack fires in 'negotiating' while the canvas is gated on
+      // 'connected'), stash the receiver; the watcher on
+      // webcodecsCanvasEl below picks it up as soon as the canvas
+      // mounts.
       const wantsWebCodecs =
         renderPath.value === 'webcodecs'
         && webcodecsSupported.value
-        && webcodecsCanvasEl.value !== null
         && ev.track.kind === 'video'
-      if (wantsWebCodecs && activateWebCodecsPath(ev.receiver, webcodecsCanvasEl.value!)) {
-        // Worker owns rendering now. We still hint
-        // jitterBufferTarget=0 in case the transform ever hands a
-        // frame back to the writable side (a no-op today but cheap).
+      if (wantsWebCodecs) {
+        // Hint the default receiver path toward low-latency so the
+        // brief window before the transform lands doesn't buffer.
         try {
           const receiver = ev.receiver as RTCRtpReceiver & {
             jitterBufferTarget?: number | null
@@ -952,7 +977,18 @@ export function useRemoteControl() {
           receiver.jitterBufferTarget = 0
           receiver.playoutDelayHint = 0
         } catch { /* best-effort */ }
-        return
+        if (webcodecsCanvasEl.value) {
+          if (activateWebCodecsPath(ev.receiver, webcodecsCanvasEl.value)) {
+            return
+          }
+          // Activation failed despite canvas being present — fall
+          // through to the classic <video> path so the user sees
+          // SOMETHING rather than a black canvas.
+        } else {
+          console.info('[rc] webcodecs: canvas not ready at ontrack; queuing receiver for later activation')
+          pendingWebcodecsReceiver = ev.receiver
+          return
+        }
       }
       // Tell the browser we care about latency, not playback smoothness.
       // Chromium enforces a soft ~80 ms floor regardless, but asking
