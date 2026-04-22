@@ -552,16 +552,24 @@ function onFullscreenChange() {
   isFullscreen.value = document.fullscreenElement !== null
 }
 
-// Inline style for the <video> element. In `custom` mode we set an
-// explicit pixel width so the outer `.video-frame` scrolls properly;
-// otherwise leave sizing to the CSS class.
+// Inline style for the <video> element. In `original` and `custom`
+// modes we set explicit pixel dims so the outer `.video-frame` can
+// detect overflow and show scrollbars; the `<video>` element's
+// `width: auto` default is unreliable inside a flex container. In
+// `adaptive` mode the CSS class handles sizing (100%/100% +
+// object-fit: contain).
 const videoScaleStyle = computed<Record<string, string> | undefined>(() => {
-  if (rc.scaleMode.value !== 'custom') return undefined
-  const pct = rc.scaleCustomPercent.value / 100
-  const w = videoIntrinsicW.value * pct
-  const h = videoIntrinsicH.value * pct
+  const w = videoIntrinsicW.value
+  const h = videoIntrinsicH.value
   if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return undefined
-  return { width: `${w}px`, height: `${h}px` }
+  if (rc.scaleMode.value === 'custom') {
+    const pct = rc.scaleCustomPercent.value / 100
+    return { width: `${w * pct}px`, height: `${h * pct}px` }
+  }
+  if (rc.scaleMode.value === 'original') {
+    return { width: `${w}px`, height: `${h}px` }
+  }
+  return undefined
 })
 
 // -----------------------------------------------------------------
@@ -760,7 +768,7 @@ const remoteCursorX = computed(() => {
   if (!pos) return 0
   const shape = rc.cursor.value.shapes.get(pos.id)
   if (!shape) return 0
-  const scale = letterboxScale()
+  const scale = cursorMapping()
   return scale.offsetX + pos.x * scale.sx - shape.hotspotX
 })
 const remoteCursorY = computed(() => {
@@ -768,16 +776,38 @@ const remoteCursorY = computed(() => {
   if (!pos) return 0
   const shape = rc.cursor.value.shapes.get(pos.id)
   if (!shape) return 0
-  const scale = letterboxScale()
+  const scale = cursorMapping()
   return scale.offsetY + pos.y * scale.sy - shape.hotspotY
 })
 
-function letterboxScale(): { sx: number; sy: number; offsetX: number; offsetY: number } {
+/** Map an agent-source pixel coordinate to the logical coordinate
+ *  space of `.video-frame` (which the cursor canvas + synthetic
+ *  badge are positioned inside). Scale-mode aware:
+ *
+ *  - `adaptive`: `<video>` fills the frame with `object-fit: contain`.
+ *    Use the original letterbox math to find the scale factor + any
+ *    letterbox padding.
+ *  - `original`: video at intrinsic 1:1, anchored to the frame's
+ *    top-left (flex: flex-start). Scale = 1, no offsets. If the frame
+ *    is scrolled the transform stays in logical space → visually
+ *    tracks the content.
+ *  - `custom`: scale = `scalePercent / 100`, no offsets (same flex
+ *    anchor). */
+function cursorMapping(): { sx: number; sy: number; offsetX: number; offsetY: number } {
   const stage = stageEl.value
   const video = videoEl.value
   if (!stage || !video || !video.videoWidth || !video.videoHeight) {
     return { sx: 1, sy: 1, offsetX: 0, offsetY: 0 }
   }
+  if (rc.scaleMode.value === 'original') {
+    return { sx: 1, sy: 1, offsetX: 0, offsetY: 0 }
+  }
+  if (rc.scaleMode.value === 'custom') {
+    const pct = rc.scaleCustomPercent.value / 100
+    return { sx: pct, sy: pct, offsetX: 0, offsetY: 0 }
+  }
+  // Adaptive: the video fills the frame with object-fit: contain,
+  // producing letterbox bars on the axis where aspect ratios disagree.
   const fw = stage.clientWidth
   const fh = stage.clientHeight
   const vAR = video.videoWidth / video.videoHeight
@@ -847,8 +877,14 @@ function onStagePointerMove(ev: PointerEvent) {
   const host = stageEl.value
   if (!host) return
   const rect = host.getBoundingClientRect()
-  cursorX.value = ev.clientX - rect.left
-  cursorY.value = ev.clientY - rect.top
+  // `transform: translate()` on the badge/canvas is in the logical
+  // coordinate space of `.video-frame` — the space that includes
+  // scroll offset. `ev.clientX - rect.left` gives viewport-relative
+  // offset from the frame's *visible* left edge; add scrollLeft to
+  // reach logical space so the overlay tracks the pointer after
+  // scrolling in Original / Custom modes.
+  cursorX.value = ev.clientX - rect.left + host.scrollLeft
+  cursorY.value = ev.clientY - rect.top + host.scrollTop
 }
 
 const canConnect = computed(() => !!agent.value)
@@ -999,40 +1035,45 @@ onBeforeUnmount(() => {
   position: relative;
   width: 100%;
   height: 100%;
+  /* `min-height: 0` is required for the flex parent (`.remote-stage`
+     with `align-items: stretch`) to allow this child to actually
+     shrink to the available space. Without it, a large intrinsic
+     child (e.g. a 4K <video> in Original mode) could balloon the
+     frame past the viewport — showing a cropped view instead of
+     scrollbars. `min-width: 0` is the horizontal counterpart. */
+  min-width: 0;
+  min-height: 0;
   /* Hide the native OS pointer so the synthetic cursor below is the only
      thing the controller sees — matches collaborative-tool semantics. */
   cursor: none;
 }
-/* Scrollable frame for the scale modes where the video can overflow the
-   viewport (original = 1:1, custom ≥ 100% or when the remote exceeds
-   the viewer). flex-start anchors the video at the top-left so the
-   controller can scroll from that anchor rather than the middle. */
+/* Scrollable frame for the scale modes where the video can overflow
+   the viewport (original = 1:1 always if source > viewer, custom ≥
+   100%). `block` display is intentional — a flex container would
+   impose item-sizing rules and some browsers shrink the flex item
+   even with `flex: none` when the container's overflow engages.
+   Block + explicit child pixel dims (via :style) is the simplest
+   path that reliably shows scrollbars. */
 .video-frame.scale-original,
 .video-frame.scale-custom {
   overflow: auto;
-  display: flex;
-  align-items: flex-start;
-  justify-content: flex-start;
+  display: block;
 }
 .remote-video {
   background: #000;
+  display: block;
 }
 .remote-video.scale-adaptive {
   width: 100%;
   height: 100%;
   object-fit: contain;
 }
-.remote-video.scale-original {
-  /* Intrinsic 1:1 sizing. `flex: none` prevents the flex parent from
-     compressing the element — we want it at its real pixel size so
-     the parent can scroll. */
-  width: auto;
-  height: auto;
-  flex: none;
-}
+.remote-video.scale-original,
 .remote-video.scale-custom {
-  /* Explicit width/height come from the :style binding. */
-  flex: none;
+  /* Explicit pixel dims come from the :style binding. object-fit:
+     fill stretches to exactly the CSS-declared dimensions with no
+     letterbox, which is what we want for 1:1 Original and the
+     user-driven Custom scale. */
   object-fit: fill;
 }
 .remote-cursor-canvas {
