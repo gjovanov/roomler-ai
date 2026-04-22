@@ -322,6 +322,56 @@ export function shortCodecFromReceiver(
   return 'h264'
 }
 
+/** Inspect the negotiated codec by reading the remote SDP answer.
+ *  More reliable than `RTCRtpReceiver.getParameters()` at
+ *  `pc.ontrack` time — Chrome populates that lazily and it's often
+ *  empty on first read, which silently defaulted us to H.264 even
+ *  when HEVC was negotiated. The SDP, in contrast, is fully settled
+ *  by the time ontrack fires (it fires as a consequence of SRD).
+ *
+ *  Parses the first video m-line's first payload type, then finds
+ *  the matching a=rtpmap entry. Returns `null` when nothing could
+ *  be parsed — the caller falls back to the receiver-based detector.
+ *  Exported for tests so the parse rule is locked. */
+export function codecFromSdp(sdp: string | null | undefined): RcPreferredCodec | null {
+  if (!sdp) return null
+  const lines = sdp.split(/\r?\n/)
+  let videoPt: string | null = null
+  for (const line of lines) {
+    if (line.startsWith('m=video')) {
+      // m=video <port> <proto> <pt1> <pt2> ...
+      const parts = line.split(' ')
+      videoPt = parts[3] ?? null
+      break
+    }
+  }
+  if (!videoPt) return null
+  const rtpmapPrefix = `a=rtpmap:${videoPt} `
+  for (const line of lines) {
+    if (!line.startsWith(rtpmapPrefix)) continue
+    // a=rtpmap:<pt> <codec>/<rate>[/<params>]
+    const rest = line.slice(rtpmapPrefix.length).trim()
+    const codec = (rest.split('/')[0] ?? '').toLowerCase()
+    switch (codec) {
+      case 'h264':
+        return 'h264'
+      case 'h265':
+      case 'hevc':
+        return 'h265'
+      case 'av1':
+      case 'av1x':
+        return 'av1'
+      case 'vp9':
+        return 'vp9'
+      case 'vp8':
+        return 'vp8'
+      default:
+        return null
+    }
+  }
+  return null
+}
+
 /** Given the full set of browser-supported codecs and an optional
  *  override, return the list the agent should see in `browser_caps`.
  *  When `preferred` is set, only that codec (plus H.264 as a safety
@@ -576,12 +626,30 @@ export function useRemoteControl() {
       return false
     }
     worker.onmessage = (ev) => {
-      const msg = ev.data as { type?: string; width?: number; height?: number; error?: string }
+      const msg = ev.data as {
+        type?: string
+        width?: number
+        height?: number
+        error?: string
+        codec?: string
+        codecString?: string
+      }
       if (!msg || typeof msg.type !== 'string') return
       if (msg.type === 'first-frame' && typeof msg.width === 'number' && typeof msg.height === 'number') {
         mediaIntrinsicW.value = msg.width
         mediaIntrinsicH.value = msg.height
-      } else if (msg.type === 'decoder-error' || msg.type === 'decoder-configure-error' || msg.type === 'reader-error') {
+        console.info('[rc] webcodecs first frame', msg.width, 'x', msg.height)
+      } else if (msg.type === 'transform-active') {
+        console.info('[rc] webcodecs transform active', msg)
+      } else if (
+        msg.type === 'decoder-error'
+        || msg.type === 'decoder-configure-error'
+        || msg.type === 'decode-error'
+        || msg.type === 'reader-error'
+      ) {
+        // Surfacing these at warn level so a broken session is
+        // visible in the console, not silently black. Intentional —
+        // we can add an explicit fallback-to-<video> in a follow-up.
         console.warn('[rc] webcodecs worker error', msg)
       }
     }
@@ -592,7 +660,14 @@ export function useRemoteControl() {
       worker.terminate()
       return false
     }
-    const codec = shortCodecFromReceiver(receiver)
+    // Prefer the SDP-based detector — `getParameters()` at ontrack
+    // time often returns an empty codec list in Chrome, which
+    // silently defaulted us to H.264 even when HEVC was negotiated.
+    // SDP is settled by the time ontrack fires.
+    const sdpCodec = codecFromSdp(pc?.currentRemoteDescription?.sdp)
+    const receiverCodec = shortCodecFromReceiver(receiver)
+    const codec = sdpCodec ?? receiverCodec
+    console.info('[rc] webcodecs path activating; codec:', codec, '(sdp:', sdpCodec, ' receiver:', receiverCodec, ')')
     try {
       ;(receiver as unknown as { transform: unknown }).transform = new TransformCtor(
         worker,

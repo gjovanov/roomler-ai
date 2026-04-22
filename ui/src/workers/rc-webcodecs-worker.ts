@@ -79,7 +79,7 @@ workerScope.onmessage = (e) => {
   }
 }
 
-workerScope.onrtctransform = (event) => {
+workerScope.onrtctransform = async (event) => {
   const transformer = event.transformer
   const codec = transformer.options?.codec ?? 'h264'
   const codecString = codecMimeForShort(codec)
@@ -104,11 +104,32 @@ workerScope.onrtctransform = (event) => {
     },
   })
 
+  // Try the "latency-first" config first, then fall back to a plain
+  // config. Some Chrome builds reject `optimizeForLatency: true` for
+  // HEVC specifically (the flag landed after the HEVC decoder did);
+  // the plain config usually works when the codec itself is
+  // supported. If NEITHER works, the worker still stands up but
+  // every decode() call will error — surface `decoder-error` from
+  // main-thread console.
+  const configs: VideoDecoderConfig[] = [
+    { codec: codecString, optimizeForLatency: true } as VideoDecoderConfig,
+    { codec: codecString } as VideoDecoderConfig,
+  ]
+  let picked: VideoDecoderConfig | null = null
+  for (const cfg of configs) {
+    try {
+      const support = await VideoDecoder.isConfigSupported(cfg)
+      if (support.supported) {
+        picked = cfg
+        break
+      }
+    } catch {
+      // isConfigSupported can reject on older Chromes; try configure() below anyway.
+    }
+  }
+  const toUse = picked ?? configs[0]!
   try {
-    decoder.configure({
-      codec: codecString,
-      optimizeForLatency: true,
-    } as VideoDecoderConfig)
+    decoder.configure(toUse)
     configured = true
   } catch (err) {
     workerScope.postMessage({
@@ -118,7 +139,13 @@ workerScope.onrtctransform = (event) => {
     })
   }
 
-  workerScope.postMessage({ type: 'transform-active', codec, codecString })
+  workerScope.postMessage({
+    type: 'transform-active',
+    codec,
+    codecString,
+    configured,
+    pickedConfig: picked ? 'with-optimize-for-latency' : 'fallback',
+  })
 
   const reader = transformer.readable.getReader()
   ;(async () => {

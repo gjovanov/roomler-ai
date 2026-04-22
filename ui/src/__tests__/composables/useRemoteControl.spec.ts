@@ -17,6 +17,7 @@ import {
   resolutionWireMessage,
   isWebCodecsSupported,
   shortCodecFromReceiver,
+  codecFromSdp,
 } from '@/composables/useRemoteControl'
 import { codecMimeForShort } from '@/workers/rc-webcodecs-worker'
 
@@ -649,5 +650,68 @@ describe('shortCodecFromReceiver', () => {
 
   it('defaults to h264 when the mime is unrecognised', () => {
     expect(shortCodecFromReceiver(makeReceiver('video/random-codec'))).toBe('h264')
+  })
+})
+
+describe('codecFromSdp', () => {
+  const hevcAnswer = [
+    'v=0',
+    'o=- 1234 1 IN IP4 127.0.0.1',
+    's=-',
+    't=0 0',
+    'a=group:BUNDLE 0',
+    'm=video 9 UDP/TLS/RTP/SAVPF 101 96',
+    'c=IN IP4 0.0.0.0',
+    'a=rtpmap:101 H265/90000',
+    'a=fmtp:101 profile-id=1',
+    'a=rtpmap:96 H264/90000',
+    'a=sendonly',
+  ].join('\r\n')
+
+  const h264Answer = [
+    'v=0',
+    'm=video 9 UDP/TLS/RTP/SAVPF 96 101',
+    'a=rtpmap:96 H264/90000',
+    'a=rtpmap:101 H265/90000',
+  ].join('\n')
+
+  it('picks the codec matching the first PT on the video m-line', () => {
+    // HEVC answer — first PT on m=video is 101 → H265.
+    expect(codecFromSdp(hevcAnswer)).toBe('h265')
+    // H.264 answer — first PT is 96 → H264.
+    expect(codecFromSdp(h264Answer)).toBe('h264')
+  })
+
+  it('handles LF-only line endings (some SDP mungers strip CRs)', () => {
+    expect(codecFromSdp(h264Answer)).toBe('h264')
+  })
+
+  it('recognises the common short names', () => {
+    const sdp = (codec: string) =>
+      `m=video 9 UDP/TLS/RTP/SAVPF 101\r\na=rtpmap:101 ${codec}/90000\r\n`
+    expect(codecFromSdp(sdp('H264'))).toBe('h264')
+    expect(codecFromSdp(sdp('H265'))).toBe('h265')
+    expect(codecFromSdp(sdp('HEVC'))).toBe('h265')
+    expect(codecFromSdp(sdp('AV1'))).toBe('av1')
+    expect(codecFromSdp(sdp('VP9'))).toBe('vp9')
+    expect(codecFromSdp(sdp('VP8'))).toBe('vp8')
+  })
+
+  it('returns null when no video m-line is present', () => {
+    expect(codecFromSdp('v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n')).toBeNull()
+  })
+
+  it('returns null when the matching rtpmap is missing', () => {
+    expect(codecFromSdp('m=video 9 UDP/TLS/RTP/SAVPF 101\r\n')).toBeNull()
+  })
+
+  it('returns null for null/undefined/empty input', () => {
+    expect(codecFromSdp(null)).toBeNull()
+    expect(codecFromSdp(undefined)).toBeNull()
+    expect(codecFromSdp('')).toBeNull()
+  })
+
+  it('returns null for an unknown codec short name', () => {
+    expect(codecFromSdp('m=video 9 X 101\r\na=rtpmap:101 WEIRD/90000\r\n')).toBeNull()
   })
 })
