@@ -8,6 +8,7 @@ import {
   browserButton,
   kbdCodeToHid,
   letterboxedNormalise,
+  directVideoNormalise,
   extractStatsSnapshot,
   inspectBrowserVideoCodecs,
   base64ToBytes,
@@ -462,5 +463,61 @@ describe('filterCapsByPreference', () => {
     // fail to negotiate. That's by design — the operator sees the
     // filtered caps in the console log and can clear the override.
     expect(filterCapsByPreference(['vp9'], 'av1')).toEqual([])
+  })
+})
+
+describe('directVideoNormalise', () => {
+  // Viewer pixel (clientX, clientY) → [0,1] normalised, mapped against a
+  // video element whose bounding rect is known. This is the mapper used
+  // for `scale-original` and `scale-custom` modes, where no letterbox
+  // math is needed because the <video> is rendered at its intrinsic
+  // (scroll + scale) dimensions.
+
+  const rect = { left: 10, top: 20, width: 1920, height: 1080 }
+
+  it('maps top-left to (0,0)', () => {
+    expect(directVideoNormalise(10, 20, rect)).toEqual({
+      x: 0, y: 0, insideVideo: true,
+    })
+  })
+
+  it('maps bottom-right to (1,1)', () => {
+    const out = directVideoNormalise(1930, 1100, rect)
+    expect(out.x).toBeCloseTo(1, 6)
+    expect(out.y).toBeCloseTo(1, 6)
+    expect(out.insideVideo).toBe(true)
+  })
+
+  it('reports outside when the pointer is before the rect', () => {
+    const out = directVideoNormalise(0, 0, rect)
+    expect(out.insideVideo).toBe(false)
+    // Coordinates clamped to [0,1] regardless.
+    expect(out.x).toBe(0)
+    expect(out.y).toBe(0)
+  })
+
+  it('reports outside when the pointer is past the rect', () => {
+    const out = directVideoNormalise(2500, 2500, rect)
+    expect(out.insideVideo).toBe(false)
+    expect(out.x).toBe(1)
+    expect(out.y).toBe(1)
+  })
+
+  it('works at custom-scale sizes — mapping stays [0,1] vs the rendered rect', () => {
+    // Remote is 1920x1080, custom scale 200% → rendered 3840x2160.
+    // Middle of that rendered rect should still normalise to (0.5, 0.5)
+    // — the agent doesn't care about scale; it gets normalised coords.
+    const scaled = { left: 0, top: 0, width: 3840, height: 2160 }
+    const out = directVideoNormalise(1920, 1080, scaled)
+    expect(out.x).toBeCloseTo(0.5, 6)
+    expect(out.y).toBeCloseTo(0.5, 6)
+    expect(out.insideVideo).toBe(true)
+  })
+
+  it('returns a safe fallback when the rect has zero dimensions', () => {
+    const zero = { left: 0, top: 0, width: 0, height: 0 }
+    expect(directVideoNormalise(100, 100, zero)).toEqual({
+      x: 0, y: 0, insideVideo: false,
+    })
   })
 })
