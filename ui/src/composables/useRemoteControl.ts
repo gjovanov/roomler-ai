@@ -634,14 +634,7 @@ export function useRemoteControl() {
       return false
     }
     worker.onmessage = (ev) => {
-      const msg = ev.data as {
-        type?: string
-        width?: number
-        height?: number
-        error?: string
-        codec?: string
-        codecString?: string
-      }
+      const msg = ev.data as Record<string, unknown>
       if (!msg || typeof msg.type !== 'string') return
       if (msg.type === 'first-frame' && typeof msg.width === 'number' && typeof msg.height === 'number') {
         mediaIntrinsicW.value = msg.width
@@ -649,6 +642,10 @@ export function useRemoteControl() {
         console.info('[rc] webcodecs first frame', msg.width, 'x', msg.height)
       } else if (msg.type === 'transform-active') {
         console.info('[rc] webcodecs transform active', msg)
+      } else if (msg.type === 'first-encoded-frame') {
+        console.info('[rc] webcodecs first encoded frame arrived', msg)
+      } else if (msg.type === 'reader-heartbeat') {
+        console.info('[rc] webcodecs heartbeat', msg)
       } else if (
         msg.type === 'decoder-error'
         || msg.type === 'decoder-configure-error'
