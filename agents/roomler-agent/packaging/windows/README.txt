@@ -47,17 +47,41 @@ At that point this machine appears (online) in the admin UI at
 http://roomler.ai/ under Admin -> Agents. A controller can click
 "Connect" to open a remote desktop session.
 
-Autostart on logon (optional)
------------------------------
-Once the interactive run works, register a Task Scheduler "At logon"
-task so the agent starts automatically:
+Autostart on logon (recommended)
+--------------------------------
+Once the interactive run works, register the agent to start on every
+login:
+
+    & $agent service install
+
+Query the current state with `service status`; remove with
+`service uninstall`. The install subcommand creates a Scheduled Task
+called `RoomlerAgent` with an ONLOGON trigger + LIMITED run level
+(equivalent to the `schtasks /Create /SC ONLOGON` command below but
+with a stable task name the agent can query + remove on its own).
+
+Manual equivalent (if you'd rather drive it yourself):
 
     schtasks /Create /SC ONLOGON /TN "RoomlerAgent" `
              /TR "$agent run" /RL LIMITED
 
-Remove with:
-
     schtasks /Delete /TN "RoomlerAgent" /F
+
+Auto-update
+-----------
+On every start and every 6 hours, the agent checks GitHub Releases
+for a newer version. If one is available, it downloads the MSI and
+spawns `msiexec` to install it, then exits so the installer can
+overwrite the binary. The Scheduled Task registered by
+`service install` relaunches the new version on the next login.
+
+Disable for air-gapped deployments with:
+
+    setx ROOMLER_AGENT_AUTO_UPDATE 0
+
+Manual check without installing:
+
+    & $agent self-update --check-only
 
 Note on privileges
 ------------------
