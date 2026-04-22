@@ -43,6 +43,37 @@
         prepend-inner-icon="mdi-quality-high"
         aria-label="Quality preference"
       />
+      <!-- Scale mode: how the remote video is rendered in the local
+           viewer. "Adaptive" is the prior default (object-fit: contain);
+           "Original" is 1:1 intrinsic pixels with scroll when larger
+           than the viewport; "Custom" lets the user dial 5-1000%. -->
+      <v-select
+        v-model="scaleMode"
+        :items="scaleOptions"
+        density="compact"
+        hide-details
+        variant="outlined"
+        style="max-width: 160px;"
+        class="mr-2"
+        prepend-inner-icon="mdi-image-size-select-actual"
+        aria-label="View scale"
+      />
+      <!-- Only visible in Custom mode — dials the CSS zoom level. -->
+      <v-text-field
+        v-if="scaleMode === 'custom'"
+        v-model.number="scalePercent"
+        type="number"
+        min="5"
+        max="1000"
+        step="5"
+        density="compact"
+        hide-details
+        variant="outlined"
+        style="max-width: 110px;"
+        class="mr-2"
+        suffix="%"
+        aria-label="Custom scale percent"
+      />
       <!-- Codec override: null = let the agent pick from the full
            browser∩agent intersection (recommended). Forcing a specific
            codec is for A/B comparison — "is H.265 really better than
@@ -129,6 +160,21 @@
         style="display: none"
         @change="onFilePicked"
       />
+      <!-- Fullscreen toggle: requests fullscreen on the stage element.
+           ESC exits natively — no custom keybinding needed. Icon flips
+           via the document.fullscreenchange listener. -->
+      <v-btn
+        v-if="rc.phase.value === 'connected'"
+        icon
+        variant="text"
+        size="small"
+        class="mr-2"
+        :aria-label="isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'"
+        :title="isFullscreen ? 'Exit fullscreen (Esc)' : 'Fullscreen'"
+        @click="toggleFullscreen"
+      >
+        <v-icon>{{ isFullscreen ? 'mdi-fullscreen-exit' : 'mdi-fullscreen' }}</v-icon>
+      </v-btn>
       <v-btn
         v-if="rc.phase.value === 'idle' || rc.phase.value === 'closed' || rc.phase.value === 'error'"
         color="primary"
@@ -186,12 +232,21 @@
         v-else-if="rc.phase.value === 'connected'"
         ref="stageEl"
         class="video-frame"
+        :class="`scale-${rc.scaleMode.value}`"
         tabindex="0"
         @pointermove="onStagePointerMove"
         @pointerleave="cursorVisible = false"
         @pointerenter="cursorVisible = true"
       >
-        <video ref="videoEl" autoplay playsinline muted class="remote-video" />
+        <video
+          ref="videoEl"
+          autoplay
+          playsinline
+          muted
+          class="remote-video"
+          :class="`scale-${rc.scaleMode.value}`"
+          :style="videoScaleStyle"
+        />
         <!-- Live stats readout: codec + bitrate + fps. Populated from
              RTCPeerConnection.getStats() every 500 ms inside the
              composable. Pill format keeps it unobtrusive over the
@@ -253,7 +308,7 @@ import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { useAgentStore, type Agent } from '@/stores/agents'
 import { useAuthStore } from '@/stores/auth'
-import { useRemoteControl, type RcQuality, type RcPreferredCodec } from '@/composables/useRemoteControl'
+import { useRemoteControl, type RcQuality, type RcPreferredCodec, type RcScaleMode } from '@/composables/useRemoteControl'
 import { useSnackbar } from '@/composables/useSnackbar'
 
 const route = useRoute()
@@ -372,6 +427,59 @@ const codecOptions = [
 const codecOverride = computed<RcPreferredCodec | null>({
   get: () => rc.preferredCodec.value,
   set: (v: RcPreferredCodec | null) => rc.setPreferredCodec(v),
+})
+
+// Scale mode + custom percent. Proxy through a computed so the
+// composable stays the source of truth (persists across reloads).
+const scaleOptions = [
+  { title: 'Adaptive', value: 'adaptive' },
+  { title: 'Original', value: 'original' },
+  { title: 'Custom…', value: 'custom' },
+] as const
+const scaleMode = computed<RcScaleMode>({
+  get: () => rc.scaleMode.value,
+  set: (v: RcScaleMode) => rc.setScaleMode(v),
+})
+const scalePercent = computed<number>({
+  get: () => rc.scaleCustomPercent.value,
+  set: (v: number) => rc.setScaleCustomPercent(v),
+})
+
+// Intrinsic video dimensions. Updated by the `loadedmetadata` and
+// `resize` events on the <video> element — the agent can change
+// resolution mid-session (DPI toggle, rc:resolution control message)
+// and the scaled layout needs to track that.
+const videoIntrinsicW = ref(0)
+const videoIntrinsicH = ref(0)
+
+// Fullscreen toggle. Drives the stage element into/out of the browser's
+// Fullscreen API. `isFullscreen` tracks the real DOM state via the
+// fullscreenchange event so ESC (which the browser handles natively)
+// updates the icon without us polling.
+const isFullscreen = ref(false)
+function toggleFullscreen() {
+  const el = stageEl.value
+  if (!el) return
+  if (document.fullscreenElement) {
+    void document.exitFullscreen().catch(() => { /* user cancelled; ignore */ })
+  } else {
+    void el.requestFullscreen().catch(() => { /* user gesture / API missing; ignore */ })
+  }
+}
+function onFullscreenChange() {
+  isFullscreen.value = document.fullscreenElement !== null
+}
+
+// Inline style for the <video> element. In `custom` mode we set an
+// explicit pixel width so the outer `.video-frame` scrolls properly;
+// otherwise leave sizing to the CSS class.
+const videoScaleStyle = computed<Record<string, string> | undefined>(() => {
+  if (rc.scaleMode.value !== 'custom') return undefined
+  const pct = rc.scaleCustomPercent.value / 100
+  const w = videoIntrinsicW.value * pct
+  const h = videoIntrinsicH.value * pct
+  if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return undefined
+  return { width: `${w}px`, height: `${h}px` }
 })
 
 // Stats readout formatters. Pure computeds — the composable already
@@ -567,11 +675,24 @@ function startSession() {
 // when the element mounts later no watcher re-fires. Watch both refs and
 // attach whenever both are present.
 let rvfcHandle: number | null = null
+// Keep our intrinsic-dimension refs in sync with the actual video
+// element. `resize` fires on every resolution change from the agent
+// (docking, DPI flip, rc:resolution control message in Phase 2);
+// `loadedmetadata` covers the first-frame bootstrap.
+function refreshVideoDims(el: HTMLVideoElement) {
+  videoIntrinsicW.value = el.videoWidth || 0
+  videoIntrinsicH.value = el.videoHeight || 0
+}
 watch(
   () => [rc.remoteStream.value, videoEl.value] as const,
   ([stream, el]) => {
     if (stream && el && el.srcObject !== stream) {
       el.srcObject = stream
+      // Track intrinsic video size so `custom` scale mode can compute
+      // pixel dimensions + the coordinate mapper can fall back cleanly.
+      el.addEventListener('loadedmetadata', () => refreshVideoDims(el))
+      el.addEventListener('resize', () => refreshVideoDims(el))
+      refreshVideoDims(el)
       // requestVideoFrameCallback keeps the tab "hot" against
       // Chrome's background throttling AND gives us a cheap hook to
       // recover from the video element's paused-for-optimization
@@ -616,9 +737,16 @@ watch(
   },
 )
 
-onMounted(loadAgent)
+onMounted(() => {
+  void loadAgent()
+  document.addEventListener('fullscreenchange', onFullscreenChange)
+})
 onBeforeUnmount(() => {
   if (detachInput) detachInput()
+  document.removeEventListener('fullscreenchange', onFullscreenChange)
+  // Exit fullscreen on unmount so navigating away doesn't leave the
+  // browser in a weird fullscreen state.
+  if (document.fullscreenElement) void document.exitFullscreen().catch(() => {})
   rc.disconnect()
 })
 </script>
@@ -651,11 +779,37 @@ onBeforeUnmount(() => {
      thing the controller sees — matches collaborative-tool semantics. */
   cursor: none;
 }
+/* Scrollable frame for the scale modes where the video can overflow the
+   viewport (original = 1:1, custom ≥ 100% or when the remote exceeds
+   the viewer). flex-start anchors the video at the top-left so the
+   controller can scroll from that anchor rather than the middle. */
+.video-frame.scale-original,
+.video-frame.scale-custom {
+  overflow: auto;
+  display: flex;
+  align-items: flex-start;
+  justify-content: flex-start;
+}
 .remote-video {
+  background: #000;
+}
+.remote-video.scale-adaptive {
   width: 100%;
   height: 100%;
   object-fit: contain;
-  background: #000;
+}
+.remote-video.scale-original {
+  /* Intrinsic 1:1 sizing. `flex: none` prevents the flex parent from
+     compressing the element — we want it at its real pixel size so
+     the parent can scroll. */
+  width: auto;
+  height: auto;
+  flex: none;
+}
+.remote-video.scale-custom {
+  /* Explicit width/height come from the :style binding. */
+  flex: none;
+  object-fit: fill;
 }
 .remote-cursor-canvas {
   position: absolute;

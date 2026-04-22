@@ -124,6 +124,56 @@ function persistPreferredCodec(c: RcPreferredCodec | null) {
   }
 }
 
+/** How the remote video is rendered inside the viewer stage.
+ *  - `adaptive`: fit-to-stage with aspect preserved (default;
+ *    equivalent to `object-fit: contain`).
+ *  - `original`: 1:1 intrinsic pixels; stage shows scrollbars if the
+ *    remote is larger than the viewport.
+ *  - `custom`: scaled to `scaleCustomPercent` of intrinsic size. */
+export type RcScaleMode = 'adaptive' | 'original' | 'custom'
+
+const SCALE_MODE_STORAGE_KEY = 'roomler-rc-scale-mode'
+const SCALE_CUSTOM_PCT_STORAGE_KEY = 'roomler-rc-scale-pct'
+
+function readStoredScaleMode(): RcScaleMode {
+  try {
+    const raw = globalThis.localStorage?.getItem(SCALE_MODE_STORAGE_KEY)
+    if (raw === 'adaptive' || raw === 'original' || raw === 'custom') return raw
+  } catch {
+    /* privacy mode → default */
+  }
+  return 'adaptive'
+}
+
+function persistScaleMode(m: RcScaleMode) {
+  try {
+    globalThis.localStorage?.setItem(SCALE_MODE_STORAGE_KEY, m)
+  } catch {
+    /* best-effort */
+  }
+}
+
+function readStoredScalePct(): number {
+  try {
+    const raw = globalThis.localStorage?.getItem(SCALE_CUSTOM_PCT_STORAGE_KEY)
+    if (raw != null) {
+      const n = Number(raw)
+      if (Number.isFinite(n) && n >= 5 && n <= 1000) return n
+    }
+  } catch {
+    /* privacy mode → default */
+  }
+  return 100
+}
+
+function persistScalePct(n: number) {
+  try {
+    globalThis.localStorage?.setItem(SCALE_CUSTOM_PCT_STORAGE_KEY, String(n))
+  } catch {
+    /* best-effort */
+  }
+}
+
 /** Given the full set of browser-supported codecs and an optional
  *  override, return the list the agent should see in `browser_caps`.
  *  When `preferred` is set, only that codec (plus H.264 as a safety
@@ -171,6 +221,12 @@ export function useRemoteControl() {
    *  ("is HEVC actually better than H.264 on this link?"). Persisted
    *  to localStorage so the choice survives a page reload. */
   const preferredCodec = ref<RcPreferredCodec | null>(readStoredPreferredCodec())
+  /** How the remote video is rendered inside the viewer stage. See
+   *  `RcScaleMode`. Persisted per-browser in localStorage. */
+  const scaleMode = ref<RcScaleMode>(readStoredScaleMode())
+  /** Percent for `scaleMode === 'custom'`. Range 5-1000, clamped at
+   *  read/write time. */
+  const scaleCustomPercent = ref<number>(readStoredScalePct())
 
   let pc: RTCPeerConnection | null = null
   /** Data channels we open proactively (per docs §5). Labels match the
@@ -247,6 +303,22 @@ export function useRemoteControl() {
   function setPreferredCodec(c: RcPreferredCodec | null) {
     preferredCodec.value = c
     persistPreferredCodec(c)
+  }
+
+  /** Update the stage render mode. Takes effect immediately — CSS
+   *  bindings + input coordinate mapping both switch live. */
+  function setScaleMode(m: RcScaleMode) {
+    scaleMode.value = m
+    persistScaleMode(m)
+  }
+
+  /** Update the custom-scale percent (clamped to [5, 1000]). Takes
+   *  effect immediately even when `scaleMode !== 'custom'`; switching
+   *  back to custom picks up the latest value. */
+  function setScaleCustomPercent(n: number) {
+    const clamped = Math.round(Math.max(5, Math.min(1000, n)))
+    scaleCustomPercent.value = clamped
+    persistScalePct(clamped)
   }
 
   function startStatsPoll() {
@@ -686,8 +758,21 @@ export function useRemoteControl() {
     function normalisedXY(
       ev: PointerEvent | MouseEvent | WheelEvent,
     ): { x: number; y: number; insideVideo: boolean } {
-      const frameRect = surface.getBoundingClientRect()
       const video = findVideo()
+      // In `original` / `custom` scale modes the `<video>` element is
+      // sized to its own intrinsic pixels (× custom scale) — there's
+      // no letterboxing inside it, so map directly against its
+      // bounding rect. In `adaptive` mode the element fills the stage
+      // and `object-fit: contain` letterboxes internally, so we need
+      // the stage rect + aspect-ratio math.
+      if (scaleMode.value !== 'adaptive' && video) {
+        const videoRect = video.getBoundingClientRect()
+        return directVideoNormalise(
+          ev.clientX, ev.clientY,
+          { left: videoRect.left, top: videoRect.top, width: videoRect.width, height: videoRect.height },
+        )
+      }
+      const frameRect = surface.getBoundingClientRect()
       return letterboxedNormalise(
         ev.clientX, ev.clientY,
         { left: frameRect.left, top: frameRect.top, width: frameRect.width, height: frameRect.height },
@@ -956,6 +1041,10 @@ export function useRemoteControl() {
     uploadFile,
     preferredCodec,
     setPreferredCodec,
+    scaleMode,
+    scaleCustomPercent,
+    setScaleMode,
+    setScaleCustomPercent,
   }
 }
 
@@ -1211,6 +1300,40 @@ export function letterboxedNormalise(
   return {
     x: clamp01(localX / Math.max(visibleW, 1)),
     y: clamp01(localY / Math.max(visibleH, 1)),
+    insideVideo,
+  }
+}
+
+/**
+ * Pure helper for `original` / `custom` scale modes where the `<video>`
+ * element is rendered without letterboxing — at its intrinsic size or
+ * with a uniform CSS scale. Coordinates map directly against the
+ * video element's bounding rect (which already includes scroll
+ * offset and the custom CSS scale), normalised to `[0,1]` relative to
+ * that rect.
+ *
+ * Unlike `letterboxedNormalise` this doesn't need to know the
+ * intrinsic `videoWidth/videoHeight` — the bounding rect already
+ * reflects the rendered size after scroll + scale, so a point at
+ * normalised `(0.5, 0.5)` is always the middle of the remote frame.
+ */
+export function directVideoNormalise(
+  clientX: number,
+  clientY: number,
+  videoRect: { left: number; top: number; width: number; height: number },
+): { x: number; y: number; insideVideo: boolean } {
+  const clamp01 = (n: number) => Math.min(Math.max(n, 0), 1)
+  if (!videoRect.width || !videoRect.height) {
+    return { x: 0, y: 0, insideVideo: false }
+  }
+  const localX = clientX - videoRect.left
+  const localY = clientY - videoRect.top
+  const insideVideo =
+    localX >= 0 && localX <= videoRect.width &&
+    localY >= 0 && localY <= videoRect.height
+  return {
+    x: clamp01(localX / videoRect.width),
+    y: clamp01(localY / videoRect.height),
     insideVideo,
   }
 }
