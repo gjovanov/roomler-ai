@@ -58,6 +58,8 @@ let ctx: OffscreenCanvasRenderingContext2D | null = null
 let decoder: VideoDecoder | null = null
 let configured = false
 let framesDecoded = 0
+let framesReceived = 0
+let framesFedToDecoder = 0
 
 workerScope.onmessage = (e) => {
   const msg = e.data
@@ -156,6 +158,32 @@ workerScope.onrtctransform = async (event) => {
         if (!value || !decoder) continue
         const encFrame = value as unknown as EncodedFrameLike
         if (!encFrame.data || !(encFrame.data instanceof ArrayBuffer)) continue
+        framesReceived++
+        // Heartbeat: every 30 frames post a status so main-thread
+        // console can distinguish "frames not arriving" from "frames
+        // arriving but decoder silent". Also posts first-frame-received
+        // immediately so we know the pipeline is live even if decoding
+        // fails downstream.
+        if (framesReceived === 1) {
+          const bytes = new Uint8Array(encFrame.data)
+          const firstBytes = Array.from(bytes.slice(0, 8))
+            .map((b) => b.toString(16).padStart(2, '0'))
+            .join(' ')
+          workerScope.postMessage({
+            type: 'first-encoded-frame',
+            byteLength: encFrame.data.byteLength,
+            frameType: encFrame.type ?? 'unknown',
+            firstBytes,
+          })
+        }
+        if (framesReceived % 30 === 0) {
+          workerScope.postMessage({
+            type: 'reader-heartbeat',
+            received: framesReceived,
+            fedToDecoder: framesFedToDecoder,
+            decoded: framesDecoded,
+          })
+        }
         if (!configured) {
           // VideoDecoder.configure() can fail synchronously on an
           // unknown codec string, but a later incoming frame might
@@ -177,6 +205,7 @@ workerScope.onrtctransform = async (event) => {
             data: encFrame.data,
           })
           decoder.decode(chunk)
+          framesFedToDecoder++
         } catch (err) {
           workerScope.postMessage({
             type: 'decode-error',
