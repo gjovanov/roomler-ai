@@ -102,6 +102,20 @@ pub(super) struct MfPipeline {
     height: u32,
     frame_count: u64,
     codec: OutputCodec,
+    /// Reported upward to `MfEncoder::is_hardware()`. Set by
+    /// `build_sync_pipeline` based on whether a D3D manager handoff
+    /// actually stuck (i.e. whether `_d3d_device` is `Some`). The
+    /// `peer` media pump consults this to auto-downscale the capture
+    /// resolution when SW HEVC wins at 4K — the cascade-winner log
+    /// line is "HW pipeline active" regardless of actual backend, so
+    /// log-parsing wouldn't work.
+    backend_kind: &'static str,
+}
+
+impl MfPipeline {
+    pub(super) fn backend_kind(&self) -> &'static str {
+        self.backend_kind
+    }
 }
 
 impl MfPipeline {
@@ -229,6 +243,7 @@ impl MfPipeline {
                 height,
                 frame_count: 0,
                 codec,
+                backend_kind,
             })
         }
     }
