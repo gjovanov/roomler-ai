@@ -130,6 +130,17 @@ pub trait VideoEncoder: Send {
     }
     /// Stable name for logging, e.g. `"openh264"`, `"nvenc-h264"`.
     fn name(&self) -> &'static str;
+
+    /// Whether this backend is running on dedicated video-encode
+    /// hardware (NVENC, QSV, AMF, Apple VideoToolbox). Defaults to
+    /// `false` — only the MF path overrides when the cascade lands
+    /// on a HW MFT. Callers use this to decide whether to apply the
+    /// auto-downscale fallback: a SW HEVC encoder at 4K on an iGPU
+    /// box can't sustain 30 fps, and forcing Fit@1080p is a much
+    /// better default than asking the operator to notice and fix it.
+    fn is_hardware(&self) -> bool {
+        false
+    }
 }
 
 pub struct NoopEncoder;

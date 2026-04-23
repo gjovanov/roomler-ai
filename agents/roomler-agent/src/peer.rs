@@ -604,6 +604,12 @@ async fn media_pump(
     let mut capturer = capture::open_default(target_fps, downscale);
     let mut encoder: Option<Box<dyn encode::VideoEncoder>> = None;
     let mut encoder_dims: Option<(u32, u32)> = None;
+    // One-shot guard for the SW-HEVC-at-high-res auto-downscale
+    // heuristic. Flips to true after the first encoder build so we
+    // evaluate the policy once per session — a mid-session operator
+    // override via `rc:resolution` must not be clobbered by a
+    // re-evaluation on an incidental encoder rebuild (DPI flip, etc.).
+    let mut auto_downscale_evaluated = false;
     // Floor on the `duration` field of each Sample. DXGI Desktop Duplication
     // only emits a frame when the screen changes, so on an idle desktop the
     // real gap between two write_sample calls can be seconds. RTP timestamp
@@ -785,6 +791,46 @@ async fn media_pump(
             // instance, so a rebuild starts from the resolution-
             // derived default until we re-apply.
             last_applied_quality = 0xFF;
+
+            // Auto-downscale heuristic. SW HEVC (MS's
+            // HEVCVideoExtensionEncoder is the only SW HEVC on
+            // Windows) can't sustain 30 fps at 4K on any machine we
+            // have, and the cascade lands there whenever the HW
+            // HEVC MFTs fail — NVENC Blackwell (0x8000FFFF), Intel
+            // QSV async-only (0x80004005), AMD on shared-memory
+            // configurations. We want the operator to see
+            // smooth 30-60 fps out of the box rather than a
+            // 7 fps stream they have to know how to fix. Cap the
+            // CAPTURE resolution at 1920×1080 — that's the breakpoint
+            // where SW HEVC on modern Intel/AMD laptops typically
+            // sustains 30 fps. Only applies on first session start
+            // (per `auto_downscale_evaluated`) and only when the
+            // operator hasn't already set an explicit override
+            // via `rc:resolution`.
+            if !auto_downscale_evaluated {
+                auto_downscale_evaluated = true;
+                let enc_ref = encoder.as_ref().unwrap();
+                let heavy_codec = chosen_codec == "h265" || chosen_codec == "av1";
+                let high_res = (frame.width as u64) * (frame.height as u64)
+                    > (1920u64 * 1080u64);
+                if !enc_ref.is_hardware() && heavy_codec && high_res {
+                    let mut guard = target_resolution.lock().unwrap();
+                    if matches!(*guard, TargetResolution::Native) {
+                        *guard = TargetResolution::Fixed {
+                            width: 1920,
+                            height: 1080,
+                        };
+                        tracing::warn!(
+                            %session_id,
+                            native_w = frame.width,
+                            native_h = frame.height,
+                            codec = %chosen_codec,
+                            encoder = enc_ref.name(),
+                            "auto-downscale: SW heavy codec on high-res source — capping capture at 1920x1080 to preserve fps. Operator can override via rc:resolution."
+                        );
+                    }
+                }
+            }
         }
 
         let enc = encoder.as_mut().unwrap();

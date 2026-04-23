@@ -112,6 +112,13 @@ pub struct MfEncoder {
     width: u32,
     height: u32,
     codec: OutputCodec,
+    /// "hw" when the cascade winner was a dedicated HW MFT with a
+    /// live D3D11 manager, "sw" when it fell through to
+    /// `CLSID_MSH264EncoderMFT` / `HEVCVideoExtensionEncoder`. Sent
+    /// up from the worker through the ready channel at startup.
+    /// Consulted by `VideoEncoder::is_hardware`; the peer media pump
+    /// reads that to trigger auto-downscale on SW HEVC at 4K.
+    backend_kind: &'static str,
 }
 
 enum Cmd {
@@ -163,7 +170,7 @@ impl MfEncoder {
             bail!("mf-encoder: require non-zero, even dimensions, got {width}x{height}");
         }
 
-        let (ready_tx, ready_rx) = std_mpsc::channel::<Result<()>>();
+        let (ready_tx, ready_rx) = std_mpsc::channel::<Result<&'static str>>();
         let (cmd_tx, cmd_rx) = std_mpsc::channel::<Cmd>();
 
         thread::Builder::new()
@@ -196,7 +203,8 @@ impl MfEncoder {
                         }
                     };
 
-                let _ = ready_tx.send(Ok(()));
+                let backend_kind = pipeline.backend_kind();
+                let _ = ready_tx.send(Ok(backend_kind));
                 run_worker(pipeline, cmd_rx);
 
                 unsafe { MFShutdown().ok() };
@@ -204,7 +212,7 @@ impl MfEncoder {
             })
             .map_err(|e| anyhow!("spawning mf worker: {e}"))?;
 
-        ready_rx
+        let backend_kind = ready_rx
             .recv()
             .map_err(|e| anyhow!("mf worker ack: {e}"))??;
 
@@ -213,6 +221,7 @@ impl MfEncoder {
             width,
             height,
             codec,
+            backend_kind,
         })
     }
 }
@@ -263,6 +272,10 @@ impl VideoEncoder for MfEncoder {
 
     fn name(&self) -> &'static str {
         self.codec.backend_name()
+    }
+
+    fn is_hardware(&self) -> bool {
+        self.backend_kind == "hw"
     }
 }
 
