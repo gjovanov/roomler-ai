@@ -189,10 +189,14 @@ fn build_turn_config(turn: &roomler_ai_config::TurnSettings) -> Option<TurnConfi
     let mut urls = vec![base.to_string()];
     if base.starts_with("turn:") && !base.contains("?transport=") {
         urls.push(format!("{}?transport=tcp", base));
-        let turns = base
+        let turns_5349 = base
             .replacen("turn:", "turns:", 1)
             .replace(":3478", ":5349");
-        urls.push(format!("{}?transport=tcp", turns));
+        urls.push(format!("{}?transport=tcp", turns_5349));
+        // Also advertise TURNS-over-:443 for clients behind strict firewalls
+        // (mars :74 DNATs :443 -> coturn pod :5349).
+        let turns_443 = base.replacen("turn:", "turns:", 1).replace(":3478", ":443");
+        urls.push(format!("{}?transport=tcp", turns_443));
     }
 
     Some(TurnConfig {
