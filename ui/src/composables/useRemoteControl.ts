@@ -651,6 +651,7 @@ export function useRemoteControl() {
         || msg.type === 'decoder-configure-error'
         || msg.type === 'decode-error'
         || msg.type === 'reader-error'
+        || msg.type === 'pipe-error'
       ) {
         // Surfacing these at warn level so a broken session is
         // visible in the console, not silently black. Intentional —

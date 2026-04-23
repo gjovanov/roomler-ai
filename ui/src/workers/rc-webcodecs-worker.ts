@@ -149,77 +149,93 @@ workerScope.onrtctransform = async (event) => {
     pickedConfig: picked ? 'with-optimize-for-latency' : 'fallback',
   })
 
-  const reader = transformer.readable.getReader()
-  ;(async () => {
-    try {
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        if (!value || !decoder) continue
-        const encFrame = value as unknown as EncodedFrameLike
-        if (!encFrame.data || !(encFrame.data instanceof ArrayBuffer)) continue
-        framesReceived++
-        // Heartbeat: every 30 frames post a status so main-thread
-        // console can distinguish "frames not arriving" from "frames
-        // arriving but decoder silent". Also posts first-frame-received
-        // immediately so we know the pipeline is live even if decoding
-        // fails downstream.
-        if (framesReceived === 1) {
-          const bytes = new Uint8Array(encFrame.data)
-          const firstBytes = Array.from(bytes.slice(0, 8))
-            .map((b) => b.toString(16).padStart(2, '0'))
-            .join(' ')
-          workerScope.postMessage({
-            type: 'first-encoded-frame',
-            byteLength: encFrame.data.byteLength,
-            frameType: encFrame.type ?? 'unknown',
-            firstBytes,
-          })
-        }
-        if (framesReceived % 30 === 0) {
-          workerScope.postMessage({
-            type: 'reader-heartbeat',
-            received: framesReceived,
-            fedToDecoder: framesFedToDecoder,
-            decoded: framesDecoded,
-          })
-        }
-        if (!configured) {
-          // VideoDecoder.configure() can fail synchronously on an
-          // unknown codec string, but a later incoming frame might
-          // still match a compatible profile. Retry once.
-          try {
-            decoder.configure({
-              codec: codecString,
-              optimizeForLatency: true,
-            } as VideoDecoderConfig)
-            configured = true
-          } catch {
-            continue
+  // Chrome's RTCRtpScriptTransform requires frames to flow through
+  // to the writable side for the internal RTP pipeline to keep
+  // producing them. An unconsumed writable back-pressures the
+  // readable — we were stuck waiting on reads that never resolved
+  // (no `first-encoded-frame` ever logged on the test machines).
+  // The canonical pattern is pipeThrough + pipeTo. We keep our
+  // decode-to-canvas logic inside the transform's `transform`
+  // callback AND enqueue the frame unchanged so the default
+  // decoder path stays fed. The <video> element is hidden (via
+  // v-show) when WebCodecs mode is active, so the default path's
+  // decoded frames have no UI effect; the cost is ~one decode of
+  // duplicate work, which is fine for the latency win.
+  const inFlight = transformer.readable
+    .pipeThrough(
+      new TransformStream<unknown, unknown>({
+        transform: (value, controller) => {
+          if (!value || !decoder) {
+            controller.enqueue(value)
+            return
           }
-        }
-        try {
-          const chunk = new EncodedVideoChunk({
-            type: encFrame.type === 'key' ? 'key' : 'delta',
-            timestamp: encFrame.timestamp,
-            data: encFrame.data,
-          })
-          decoder.decode(chunk)
-          framesFedToDecoder++
-        } catch (err) {
-          workerScope.postMessage({
-            type: 'decode-error',
-            error: extractErrorMessage(err),
-          })
-        }
-      }
-    } catch (err) {
-      workerScope.postMessage({
-        type: 'reader-error',
-        error: extractErrorMessage(err),
-      })
-    }
-  })()
+          const encFrame = value as unknown as EncodedFrameLike
+          if (!encFrame.data || !(encFrame.data instanceof ArrayBuffer)) {
+            controller.enqueue(value)
+            return
+          }
+          framesReceived++
+          if (framesReceived === 1) {
+            const bytes = new Uint8Array(encFrame.data)
+            const firstBytes = Array.from(bytes.slice(0, 8))
+              .map((b) => b.toString(16).padStart(2, '0'))
+              .join(' ')
+            workerScope.postMessage({
+              type: 'first-encoded-frame',
+              byteLength: encFrame.data.byteLength,
+              frameType: encFrame.type ?? 'unknown',
+              firstBytes,
+            })
+          }
+          if (framesReceived % 30 === 0) {
+            workerScope.postMessage({
+              type: 'reader-heartbeat',
+              received: framesReceived,
+              fedToDecoder: framesFedToDecoder,
+              decoded: framesDecoded,
+            })
+          }
+          if (!configured) {
+            try {
+              decoder.configure({
+                codec: codecString,
+                optimizeForLatency: true,
+              } as VideoDecoderConfig)
+              configured = true
+            } catch {
+              controller.enqueue(value)
+              return
+            }
+          }
+          try {
+            const chunk = new EncodedVideoChunk({
+              type: encFrame.type === 'key' ? 'key' : 'delta',
+              timestamp: encFrame.timestamp,
+              data: encFrame.data,
+            })
+            decoder.decode(chunk)
+            framesFedToDecoder++
+          } catch (err) {
+            workerScope.postMessage({
+              type: 'decode-error',
+              error: extractErrorMessage(err),
+            })
+          }
+          // Enqueue unchanged — writable downstream is the default
+          // decoder path, whose output goes to the hidden <video>.
+          // Without this, Chrome back-pressures the readable and no
+          // more frames arrive.
+          controller.enqueue(value)
+        },
+      }),
+    )
+    .pipeTo(transformer.writable)
+  inFlight.catch((err) => {
+    workerScope.postMessage({
+      type: 'pipe-error',
+      error: extractErrorMessage(err),
+    })
+  })
 }
 
 function paintFrame(frame: VideoFrame): void {
