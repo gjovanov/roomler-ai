@@ -583,9 +583,14 @@ const videoIntrinsicH = rc.mediaIntrinsicH
 // user opted in AND the browser supports it). We read `rc.renderPath`
 // directly so the UI state matches what the next Connect would do.
 const webcodecsOn = computed<boolean>(() => rc.renderPath.value === 'webcodecs')
-const isWebCodecsRender = computed<boolean>(
-  () => webcodecsOn.value && rc.webcodecsSupported.value,
-)
+// Which element the viewer actually mounts — driven by the runtime
+// `webcodecsActive` flag that the composable flips to true ONLY when
+// the RTCRtpScriptTransform is successfully installed for this
+// session. A user preference of `renderPath === 'webcodecs'` on a
+// session where we fall back (HEVC, browser without the API,
+// transferControlToOffscreen throwing) flips to `<video>` transparently
+// instead of mounting an empty canvas.
+const isWebCodecsRender = computed<boolean>(() => rc.webcodecsActive.value)
 const webcodecsTooltip = computed<string>(() => {
   if (!rc.webcodecsSupported.value) {
     return 'Low-latency (WebCodecs) path requires Chrome 94+ — not supported in this browser'

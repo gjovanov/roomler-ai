@@ -457,7 +457,15 @@ export function useRemoteControl() {
   // teardown(). Tracked here rather than scoped inside ontrack so
   // teardown() can reliably stop the worker on disconnect.
   let webcodecsWorker: Worker | null = null
-  let webcodecsActive = false
+  /** `true` once the WebCodecs transform is successfully installed
+   *  on the receiver AND we're committed to painting to the canvas.
+   *  Stays `false` when we fall back (HEVC, missing API, worker
+   *  ctor failure, transferControlToOffscreen throw). The VIEW
+   *  reads this (not the `renderPath` preference) to decide which
+   *  element to mount — so an HEVC session under renderPath='webcodecs'
+   *  correctly renders the `<video>` rather than a permanent black
+   *  canvas. */
+  const webcodecsActive = ref(false)
 
   let pc: RTCPeerConnection | null = null
   /** Data channels we open proactively (per docs §5). Labels match the
@@ -672,7 +680,7 @@ export function useRemoteControl() {
       return false
     }
     webcodecsWorker = worker
-    webcodecsActive = true
+    webcodecsActive.value = true
     // If the canvas is already mounted, attach it now; otherwise
     // the watcher picks it up when it lands.
     if (webcodecsCanvasEl.value) {
@@ -713,7 +721,7 @@ export function useRemoteControl() {
     let ticks = 0
     const interval = setInterval(async () => {
       ticks += 1
-      if (ticks > 5 || !webcodecsActive) {
+      if (ticks > 5 || !webcodecsActive.value) {
         clearInterval(interval)
         return
       }
@@ -734,11 +742,11 @@ export function useRemoteControl() {
   }
 
   function stopWebCodecsPath() {
+    webcodecsActive.value = false
     if (!webcodecsWorker) return
     try { webcodecsWorker.postMessage({ type: 'close' }) } catch { /* ignore */ }
     try { webcodecsWorker.terminate() } catch { /* ignore */ }
     webcodecsWorker = null
-    webcodecsActive = false
   }
 
   // Late-canvas watcher. The transform is installed eagerly in
@@ -1526,6 +1534,7 @@ export function useRemoteControl() {
     renderPath,
     setRenderPath,
     webcodecsSupported,
+    webcodecsActive,
     webcodecsCanvasEl,
     mediaIntrinsicW,
     mediaIntrinsicH,
