@@ -13,8 +13,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain
+        # Pinned to the version in rust-toolchain.toml so local dev
+        # and CI reject the same lints. Bump both in one commit
+        # when upgrading.
+        uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: rustfmt, clippy
 
