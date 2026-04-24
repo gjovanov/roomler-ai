@@ -65,9 +65,15 @@ pub(crate) fn initial_bitrate_for(width: u32, height: u32) -> u32 {
     )),
     allow(dead_code)
 )]
+/// Legibility floor — below this bitrate, heavy codecs (HEVC / AV1) at
+/// 1080p produce green chroma artefacts and unreadable terminal text
+/// (2026-04-24 field report). Consulted by peer.rs as the REMB-safety
+/// minimum so a collapsing REMB signal can't drop encode quality into
+/// unusability while the link is still technically up.
+pub const MIN_BITRATE_BPS: u32 = 1_500_000;
+pub const MAX_BITRATE_BPS: u32 = 25_000_000;
+
 pub(crate) fn initial_bitrate_for_fps(width: u32, height: u32, fps: u32) -> u32 {
-    const MIN_BITRATE_BPS: u32 = 1_500_000;
-    const MAX_BITRATE_BPS: u32 = 25_000_000;
     const DESKTOP_BPP_PER_SECOND: f64 = 0.15;
     let pixels = width as f64 * height as f64;
     let raw = (pixels * fps as f64 * DESKTOP_BPP_PER_SECOND) as u32;

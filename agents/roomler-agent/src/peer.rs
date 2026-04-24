@@ -889,7 +889,19 @@ async fn media_pump(
             } else {
                 let remb_safe =
                     (remb_now / REMB_SAFETY_FACTOR_DEN).saturating_mul(REMB_SAFETY_FACTOR_NUM);
-                quality_target.min(remb_safe.max(500_000))
+                // Floor: 500 kbps was unreadable at 1080p HEVC (green
+                // chroma artefacts, blurred PowerShell text — the
+                // 2026-04-24 field report). Use the larger of a flat
+                // MIN_BITRATE_BPS and 25 % of the resolution-derived
+                // target. At 1080p this is ~2.5 Mbps (vs 500 kbps
+                // previously) — still severely degraded on a bad
+                // link but keeps small-font text legible. REMB
+                // reports below this get clamped up; if the link
+                // really can't carry that much we'll see packet loss
+                // escalate which REMB then ratchets further down and
+                // the hysteresis re-applies.
+                let floor = encode::MIN_BITRATE_BPS.max(base / 4);
+                quality_target.min(remb_safe.max(floor))
             };
             // Hysteresis: only push when quality changed (operator
             // input always wins immediately) OR target moves outside
