@@ -189,12 +189,20 @@ fn build_turn_config(turn: &roomler_ai_config::TurnSettings) -> Option<TurnConfi
     let mut urls = vec![base.to_string()];
     if base.starts_with("turn:") && !base.contains("?transport=") {
         urls.push(format!("{}?transport=tcp", base));
+        // Plain UDP + TCP on :443. Enterprise networks frequently
+        // only allow outbound :443 (HTTPS + QUIC); advertising plain
+        // TURN here lets clients bypass without needing TLS when
+        // coturn also listens on :443. Paired with the TURNS-on-:443
+        // entry below so negotiation can pick whichever survives.
+        let plain_443 = base.replace(":3478", ":443");
+        urls.push(plain_443.clone());
+        urls.push(format!("{}?transport=tcp", plain_443));
         let turns_5349 = base
             .replacen("turn:", "turns:", 1)
             .replace(":3478", ":5349");
         urls.push(format!("{}?transport=tcp", turns_5349));
-        // Also advertise TURNS-over-:443 for clients behind strict firewalls
-        // (mars :74 DNATs :443 -> coturn pod :5349).
+        // TURNS-over-:443 for strict firewalls that allow only TLS
+        // on 443 (mars DNAT :443 -> coturn pod :5349).
         let turns_443 = base.replacen("turn:", "turns:", 1).replace(":3478", ":443");
         urls.push(format!("{}?transport=tcp", turns_443));
     }

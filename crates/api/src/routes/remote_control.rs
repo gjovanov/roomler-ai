@@ -373,6 +373,11 @@ fn build_turn_config(
     let mut urls = vec![base.to_string()];
     if base.starts_with("turn:") && !base.contains("?transport=") {
         urls.push(format!("{}?transport=tcp", base));
+        // Plain UDP + TCP on :443 for enterprise networks that only
+        // allow outbound on the standard HTTPS port.
+        let plain_443 = base.replace(":3478", ":443");
+        urls.push(plain_443.clone());
+        urls.push(format!("{}?transport=tcp", plain_443));
         let turns_5349 = base
             .replacen("turn:", "turns:", 1)
             .replace(":3478", ":5349");

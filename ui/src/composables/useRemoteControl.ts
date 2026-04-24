@@ -607,6 +607,24 @@ export function useRemoteControl() {
     }
     const TransformCtor = g.RTCRtpScriptTransform
     if (typeof TransformCtor !== 'function') return false
+    // Chrome (≤ 131 at least) installs RTCRtpScriptTransform on an
+    // HEVC receiver without complaint but bypasses it — frames go
+    // straight to the default decoder and our TransformStream never
+    // sees them. Observed 2026-04-24 on Intel UHD + real HEVC track:
+    // `receiver.getStats()` showed framesReceived + framesDecoded
+    // climbing normally while the worker's `first-encoded-frame`
+    // message never fired. Until Chrome closes that gap, auto-fall-
+    // back to the `<video>` path for HEVC so the user sees video
+    // instead of a black canvas.
+    const sdpCodec = codecFromSdp(pc?.currentRemoteDescription?.sdp)
+    const receiverCodec = shortCodecFromReceiver(receiver)
+    const codec = sdpCodec ?? receiverCodec
+    if (codec === 'h265') {
+      console.warn(
+        '[rc] webcodecs path skipped — Chrome does not forward HEVC frames to RTCRtpScriptTransform. Falling back to <video>. Use the Codec toolbar to force H.264 for a guaranteed WebCodecs path.',
+      )
+      return false
+    }
     let worker: Worker
     try {
       worker = new Worker(
@@ -642,9 +660,6 @@ export function useRemoteControl() {
         console.warn('[rc] webcodecs worker error', msg)
       }
     }
-    const sdpCodec = codecFromSdp(pc?.currentRemoteDescription?.sdp)
-    const receiverCodec = shortCodecFromReceiver(receiver)
-    const codec = sdpCodec ?? receiverCodec
     console.info('[rc] webcodecs path activating; codec:', codec, '(sdp:', sdpCodec, ' receiver:', receiverCodec, ')')
     try {
       ;(receiver as unknown as { transform: unknown }).transform = new TransformCtor(
