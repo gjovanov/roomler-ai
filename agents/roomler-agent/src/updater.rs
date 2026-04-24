@@ -165,7 +165,7 @@ pub fn pick_latest_release(mut releases: Vec<GithubRelease>) -> Option<GithubRel
     if releases.is_empty() {
         return None;
     }
-    releases.sort_by(|a, b| parse_version(&b.tag_name).cmp(&parse_version(&a.tag_name)));
+    releases.sort_by_key(|r| std::cmp::Reverse(parse_version(&r.tag_name)));
     releases.into_iter().next()
 }
 
