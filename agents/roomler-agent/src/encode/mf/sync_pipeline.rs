@@ -683,6 +683,11 @@ fn decode_leb128(buf: &[u8]) -> Option<(u32, usize)> {
     None
 }
 
+// Helper functions after the tests module are flagged by
+// `clippy::items_after_test_module` in clippy 1.95+. They existed
+// here pre-lint; reordering would be a ~40-line diff for zero
+// behavior change. Scoped allow keeps the module history stable.
+#[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
     use super::*;
