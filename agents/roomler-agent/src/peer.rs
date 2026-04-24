@@ -792,6 +792,24 @@ async fn media_pump(
             // derived default until we re-apply.
             last_applied_quality = 0xFF;
 
+            // Loudly surface the Noop case. Previously this only
+            // showed up in the ~1 s heartbeat log as `backend="noop"`,
+            // which looks like normal progress to anyone not
+            // reading carefully. A Noop encoder means the browser
+            // gets only SDP setup bytes and a permanent black
+            // frame — it's the single biggest "session looks alive
+            // but nothing works" footgun in the stack. Shout at
+            // session-build time so field reports land on a log
+            // line that explains the symptom in one read.
+            if encoder.as_ref().map(|e| e.name()) == Some("noop") {
+                warn!(
+                    %session_id,
+                    codec = %chosen_codec,
+                    w = frame.width, h = frame.height,
+                    "encoder resolved to NoopEncoder — NO VIDEO WILL SHIP for this session. Cascade above tells you why. Workarounds: toggle codec override to H.264 + reconnect, or switch Quality to `low` to force a smaller profile."
+                );
+            }
+
             // Auto-downscale heuristic. SW HEVC (MS's
             // HEVCVideoExtensionEncoder is the only SW HEVC on
             // Windows) can't sustain 30 fps at 4K on any machine we
