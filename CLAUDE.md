@@ -32,8 +32,9 @@ cd ui && bun run test:unit:coverage    # Vitest with coverage
 cd ui && bun run e2e                   # Playwright E2E tests (24 spec files)
 
 # Static Analysis
-cargo clippy --workspace -- -D warnings   # Rust lint
-cargo check --workspace                    # Rust compilation check
+cargo fmt --all -- --check                  # Rust fmt (matches CI)
+cargo clippy --workspace --all-targets --all-features -- -D warnings   # Rust lint (matches CI — include --all-targets so test-only lints fire)
+cargo check --workspace                     # Rust compilation check
 cd ui && vue-tsc --noEmit                  # Vue TypeScript check
 
 # Dependency Audit
