@@ -458,14 +458,6 @@ export function useRemoteControl() {
   // teardown() can reliably stop the worker on disconnect.
   let webcodecsWorker: Worker | null = null
   let webcodecsActive = false
-  // Receiver captured in pc.ontrack when the WebCodecs canvas hasn't
-  // mounted yet. `pc.ontrack` fires during the 'negotiating' phase,
-  // but the <canvas> is gated on phase === 'connected' — so on fast
-  // renegotiations the receiver is available before the canvas. We
-  // stash the receiver here and a watcher on webcodecsCanvasEl
-  // activates once both are present. Mirrors the same race handling
-  // the classic path does for [remoteStream, videoEl].
-  let pendingWebcodecsReceiver: RTCRtpReceiver | null = null
 
   let pc: RTCPeerConnection | null = null
   /** Data channels we open proactively (per docs §5). Labels match the
@@ -600,29 +592,21 @@ export function useRemoteControl() {
     persistRenderPath(next)
   }
 
-  /** Attach the WebCodecs worker to a receiver. Called from `pc.ontrack`
-   *  when the user has opted into the webcodecs render path AND the
-   *  browser supports it. Returns true if wiring succeeded; false
-   *  means the caller should fall back to the classic `<video>` path
-   *  for this session. Kept separate so a thrown error inside any of
-   *  the worker/transform/canvas steps can't brick the stream — we
-   *  report and bail. */
-  function activateWebCodecsPath(
-    receiver: RTCRtpReceiver,
-    canvasEl: HTMLCanvasElement,
-  ): boolean {
+  /** Install the receiver transform EAGERLY (at pc.ontrack time) so
+   *  Chrome routes encoded frames to the worker from the very first
+   *  RTP packet. The worker decodes into a null sink until a canvas
+   *  arrives via `attachCanvasToWorker()`; once the canvas lands, it
+   *  transfers control + the worker starts painting. Previously we
+   *  waited for the canvas before installing the transform, which
+   *  looked like a race — some Chrome builds seem to lock frames
+   *  onto the default decoder when the transform is assigned after
+   *  the track has already started producing. */
+  function installWebCodecsTransform(receiver: RTCRtpReceiver): boolean {
     const g = globalThis as unknown as {
       RTCRtpScriptTransform?: new (worker: Worker, opts: unknown) => unknown
     }
     const TransformCtor = g.RTCRtpScriptTransform
     if (typeof TransformCtor !== 'function') return false
-    let offscreen: OffscreenCanvas
-    try {
-      offscreen = canvasEl.transferControlToOffscreen()
-    } catch (err) {
-      console.warn('[rc] transferControlToOffscreen failed', err)
-      return false
-    }
     let worker: Worker
     try {
       worker = new Worker(
@@ -642,10 +626,12 @@ export function useRemoteControl() {
         console.info('[rc] webcodecs first frame', msg.width, 'x', msg.height)
       } else if (msg.type === 'transform-active') {
         console.info('[rc] webcodecs transform active', msg)
-      } else if (msg.type === 'first-encoded-frame') {
-        console.info('[rc] webcodecs first encoded frame arrived', msg)
+      } else if (msg.type === 'first-encoded-frame' || msg.type === 'early-encoded-frame') {
+        console.info('[rc] webcodecs encoded frame', msg)
       } else if (msg.type === 'reader-heartbeat') {
         console.info('[rc] webcodecs heartbeat', msg)
+      } else if (msg.type === 'watchdog') {
+        console.warn('[rc] webcodecs watchdog fired', msg)
       } else if (
         msg.type === 'decoder-error'
         || msg.type === 'decoder-configure-error'
@@ -653,23 +639,9 @@ export function useRemoteControl() {
         || msg.type === 'reader-error'
         || msg.type === 'pipe-error'
       ) {
-        // Surfacing these at warn level so a broken session is
-        // visible in the console, not silently black. Intentional —
-        // we can add an explicit fallback-to-<video> in a follow-up.
         console.warn('[rc] webcodecs worker error', msg)
       }
     }
-    try {
-      worker.postMessage({ type: 'init-canvas', canvas: offscreen }, [offscreen])
-    } catch (err) {
-      console.warn('[rc] worker init-canvas post failed', err)
-      worker.terminate()
-      return false
-    }
-    // Prefer the SDP-based detector — `getParameters()` at ontrack
-    // time often returns an empty codec list in Chrome, which
-    // silently defaulted us to H.264 even when HEVC was negotiated.
-    // SDP is settled by the time ontrack fires.
     const sdpCodec = codecFromSdp(pc?.currentRemoteDescription?.sdp)
     const receiverCodec = shortCodecFromReceiver(receiver)
     const codec = sdpCodec ?? receiverCodec
@@ -686,7 +658,64 @@ export function useRemoteControl() {
     }
     webcodecsWorker = worker
     webcodecsActive = true
+    // If the canvas is already mounted, attach it now; otherwise
+    // the watcher picks it up when it lands.
+    if (webcodecsCanvasEl.value) {
+      attachCanvasToWorker(webcodecsCanvasEl.value)
+    }
+    // Kick a getStats diagnostic to confirm whether RTP is actually
+    // flowing to this receiver — if bytesReceived rises but the
+    // worker never posts `first-encoded-frame`, Chrome is dropping
+    // frames before the transform.
+    scheduleInboundRtpDiagnostic(receiver)
     return true
+  }
+
+  /** Hand an OffscreenCanvas to the worker so it can start painting.
+   *  Returns false on transfer failure. Called immediately from
+   *  `installWebCodecsTransform` when the canvas is already there,
+   *  or later from the `webcodecsCanvasEl` watcher. */
+  function attachCanvasToWorker(canvasEl: HTMLCanvasElement): boolean {
+    if (!webcodecsWorker) return false
+    let offscreen: OffscreenCanvas
+    try {
+      offscreen = canvasEl.transferControlToOffscreen()
+    } catch (err) {
+      console.warn('[rc] transferControlToOffscreen failed', err)
+      return false
+    }
+    try {
+      webcodecsWorker.postMessage({ type: 'init-canvas', canvas: offscreen }, [offscreen])
+      console.info('[rc] webcodecs: canvas attached to worker')
+      return true
+    } catch (err) {
+      console.warn('[rc] worker init-canvas post failed', err)
+      return false
+    }
+  }
+
+  function scheduleInboundRtpDiagnostic(receiver: RTCRtpReceiver) {
+    let ticks = 0
+    const interval = setInterval(async () => {
+      ticks += 1
+      if (ticks > 5 || !webcodecsActive) {
+        clearInterval(interval)
+        return
+      }
+      try {
+        const stats = await receiver.getStats()
+        stats.forEach((r: { type?: string; bytesReceived?: number; framesReceived?: number; framesDecoded?: number }) => {
+          if (r.type === 'inbound-rtp') {
+            console.info('[rc] webcodecs diag inbound-rtp', {
+              tick: ticks,
+              bytesReceived: r.bytesReceived,
+              framesReceived: r.framesReceived,
+              framesDecoded: r.framesDecoded,
+            })
+          }
+        })
+      } catch { /* ignore */ }
+    }, 1000)
   }
 
   function stopWebCodecsPath() {
@@ -695,24 +724,16 @@ export function useRemoteControl() {
     try { webcodecsWorker.terminate() } catch { /* ignore */ }
     webcodecsWorker = null
     webcodecsActive = false
-    pendingWebcodecsReceiver = null
   }
 
-  // Late-activation watcher — see pc.ontrack above for why we queue.
-  // When the canvas mounts (phase → 'connected') and a receiver is
-  // waiting, wire up the transform. Chrome will issue a PLI shortly
-  // after the transform is installed so a keyframe shows up without
-  // manual requestKeyFrame() plumbing. Fires once per transition;
-  // re-arms naturally because the pending slot is cleared on
-  // successful activation + on teardown.
+  // Late-canvas watcher. The transform is installed eagerly in
+  // pc.ontrack, but the canvas is gated on phase === 'connected'
+  // so it mounts after ontrack fires. When it mounts, hand the
+  // OffscreenCanvas to the already-running worker so it can start
+  // painting what it's been decoding.
   watch(webcodecsCanvasEl, (el) => {
-    if (!el || !pendingWebcodecsReceiver) return
-    const r = pendingWebcodecsReceiver
-    pendingWebcodecsReceiver = null
-    console.info('[rc] webcodecs: canvas mounted; activating queued receiver')
-    if (!activateWebCodecsPath(r, el)) {
-      console.warn('[rc] webcodecs: late activation failed — stream will stay black until reconnect')
-    }
+    if (!el || !webcodecsWorker) return
+    attachCanvasToWorker(el)
   })
 
   function startStatsPoll() {
@@ -975,18 +996,17 @@ export function useRemoteControl() {
           receiver.jitterBufferTarget = 0
           receiver.playoutDelayHint = 0
         } catch { /* best-effort */ }
-        if (webcodecsCanvasEl.value) {
-          if (activateWebCodecsPath(ev.receiver, webcodecsCanvasEl.value)) {
-            return
-          }
-          // Activation failed despite canvas being present — fall
-          // through to the classic <video> path so the user sees
-          // SOMETHING rather than a black canvas.
-        } else {
-          console.info('[rc] webcodecs: canvas not ready at ontrack; queuing receiver for later activation')
-          pendingWebcodecsReceiver = ev.receiver
+        // Install the transform EAGERLY — canvas is attached later
+        // when it mounts. This gets Chrome's RTP pipeline routing
+        // frames to our worker from the first packet; waiting for
+        // the canvas mount (phase === 'connected') meant the default
+        // decoder locked in first on some Chrome builds and the
+        // transform stopped receiving anything.
+        if (installWebCodecsTransform(ev.receiver)) {
           return
         }
+        // Install failed (no RTCRtpScriptTransform, worker throw,
+        // etc.) — fall through to classic <video> path.
       }
       // Tell the browser we care about latency, not playback smoothness.
       // Chromium enforces a soft ~80 ms floor regardless, but asking
