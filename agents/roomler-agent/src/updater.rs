@@ -149,10 +149,7 @@ async fn fetch_latest_release() -> Result<GithubRelease> {
     if !resp.status().is_success() {
         bail!("GitHub API returned {}", resp.status());
     }
-    let releases: Vec<GithubRelease> = resp
-        .json()
-        .await
-        .context("parsing GitHub releases JSON")?;
+    let releases: Vec<GithubRelease> = resp.json().await.context("parsing GitHub releases JSON")?;
     pick_latest_release(releases).context("no published agent-v* release found")
 }
 
@@ -162,14 +159,13 @@ async fn fetch_latest_release() -> Result<GithubRelease> {
 /// them all that way and we still want those agents to update.
 /// Exported for tests so the selection rule is locked.
 pub fn pick_latest_release(mut releases: Vec<GithubRelease>) -> Option<GithubRelease> {
-    releases.retain(|r| !r.draft && r.tag_name.starts_with("agent-v") && parse_version(&r.tag_name).is_some());
+    releases.retain(|r| {
+        !r.draft && r.tag_name.starts_with("agent-v") && parse_version(&r.tag_name).is_some()
+    });
     if releases.is_empty() {
         return None;
     }
-    releases.sort_by(|a, b| {
-        parse_version(&b.tag_name)
-            .cmp(&parse_version(&a.tag_name))
-    });
+    releases.sort_by(|a, b| parse_version(&b.tag_name).cmp(&parse_version(&a.tag_name)));
     releases.into_iter().next()
 }
 
@@ -190,10 +186,7 @@ async fn download_asset(asset: &GithubAsset) -> Result<PathBuf> {
     if !resp.status().is_success() {
         bail!("asset download returned {}", resp.status());
     }
-    let bytes = resp
-        .bytes()
-        .await
-        .context("reading asset body")?;
+    let bytes = resp.bytes().await.context("reading asset body")?;
     if bytes.len() < MIN_INSTALLER_BYTES {
         bail!(
             "asset {} is implausibly small: {} bytes (minimum {})",
@@ -232,7 +225,10 @@ pub async fn check_once() -> CheckOutcome {
         None => return CheckOutcome::Skipped(format!("unparseable tag {}", release.tag_name)),
     };
     if !is_newer(&latest_parsed, &current) {
-        return CheckOutcome::UpToDate { current, latest: latest_parsed };
+        return CheckOutcome::UpToDate {
+            current,
+            latest: latest_parsed,
+        };
     }
     let asset = match pick_asset_for_platform(&release.assets) {
         Some(a) => a,

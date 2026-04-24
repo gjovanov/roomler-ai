@@ -128,16 +128,7 @@ mod windows {
         let tr = format!("\"{}\" run", exe_str);
         let output = Command::new("schtasks")
             .args([
-                "/Create",
-                "/SC",
-                "ONLOGON",
-                "/TN",
-                TASK_NAME,
-                "/TR",
-                &tr,
-                "/RL",
-                "LIMITED",
-                "/F",
+                "/Create", "/SC", "ONLOGON", "/TN", TASK_NAME, "/TR", &tr, "/RL", "LIMITED", "/F",
             ])
             .output()
             .context("running schtasks /Create")?;
@@ -318,7 +309,11 @@ mod macos {
             if stderr.contains("already loaded") || stderr.contains("service already loaded") {
                 return Ok(());
             }
-            bail!("launchctl load failed ({}): {}", output.status, stderr.trim());
+            bail!(
+                "launchctl load failed ({}): {}",
+                output.status,
+                stderr.trim()
+            );
         }
         Ok(())
     }
@@ -335,9 +330,7 @@ mod macos {
     }
 
     pub fn status() -> Result<AutostartStatus> {
-        let output = Command::new("launchctl")
-            .args(["list", PLIST])
-            .output();
+        let output = Command::new("launchctl").args(["list", PLIST]).output();
         match output {
             Ok(o) if o.status.success() => Ok(AutostartStatus::Installed),
             Ok(_) => Ok(AutostartStatus::NotInstalled),
@@ -399,7 +392,11 @@ mod tests {
         // that the call path doesn't panic and returns one of the
         // three known variants.
         match status() {
-            Ok(AutostartStatus::Installed | AutostartStatus::NotInstalled | AutostartStatus::Unknown) => {}
+            Ok(
+                AutostartStatus::Installed
+                | AutostartStatus::NotInstalled
+                | AutostartStatus::Unknown,
+            ) => {}
             Err(_) => panic!("status() errored on this platform"),
         }
     }

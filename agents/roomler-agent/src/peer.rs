@@ -829,8 +829,7 @@ async fn media_pump(
                 auto_downscale_evaluated = true;
                 let enc_ref = encoder.as_ref().unwrap();
                 let heavy_codec = chosen_codec == "h265" || chosen_codec == "av1";
-                let high_res = (frame.width as u64) * (frame.height as u64)
-                    > (1920u64 * 1080u64);
+                let high_res = (frame.width as u64) * (frame.height as u64) > (1920u64 * 1080u64);
                 if !enc_ref.is_hardware() && heavy_codec && high_res {
                     let mut guard = target_resolution.lock().unwrap();
                     if matches!(*guard, TargetResolution::Native) {
