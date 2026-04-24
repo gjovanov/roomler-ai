@@ -744,8 +744,13 @@ function applyFitResolution() {
   if (!el) return
   const rect = el.getBoundingClientRect()
   const dpr = window.devicePixelRatio || 1
-  const w = Math.max(1, Math.round(rect.width * dpr))
-  const h = Math.max(1, Math.round(rect.height * dpr))
+  // Floor to even numbers — MF HEVC encoder requires even dims and
+  // fail-closes to NoopEncoder otherwise (permanent black screen
+  // until reconnect). The agent also rounds defensively, but
+  // emitting clean numbers here avoids the log churn. Clamp mins
+  // to 160×90 so weird <= 1 layouts don't flood with tiny requests.
+  const w = Math.max(160, Math.round(rect.width * dpr) & ~1)
+  const h = Math.max(90, Math.round(rect.height * dpr) & ~1)
   rc.setResolution({ mode: 'fit', width: w, height: h })
 }
 

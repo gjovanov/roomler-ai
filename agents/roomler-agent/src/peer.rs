@@ -1094,14 +1094,36 @@ fn attach_control_handler(
                     let new_target = match mode {
                         "original" => TargetResolution::Native,
                         "fit" | "custom" => {
-                            let w = val.get("width").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                            let h = val.get("height").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                            if w == 0 || h == 0 {
+                            let raw_w = val.get("width").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                            let raw_h = val.get("height").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                            if raw_w == 0 || raw_h == 0 {
                                 debug!(
                                     %session_id, mode,
                                     "control: rc:resolution missing/invalid width/height — dropped"
                                 );
                                 return;
+                            }
+                            // MF HEVC encoder requires even-dimensioned
+                            // input. A browser sending Fit dimensions
+                            // derived from a stage element at
+                            // 2154×1077 (the 1077 is odd) would bomb
+                            // `MfEncoder::new_hevc` at session rebuild
+                            // time, which fail-closed demotes to
+                            // NoopEncoder — black screen for the rest
+                            // of the session with no way to recover
+                            // short of reconnect. Floor to the
+                            // nearest-lower even number here so a
+                            // browser that forgot to round can't brick
+                            // the encoder. Clamp minima to 160×90 —
+                            // below that most hardware MFTs reject.
+                            let w = (raw_w & !1).max(160);
+                            let h = (raw_h & !1).max(90);
+                            if (w, h) != (raw_w, raw_h) {
+                                debug!(
+                                    %session_id, mode,
+                                    raw_w, raw_h, w, h,
+                                    "control: rc:resolution rounded to even dims"
+                                );
                             }
                             TargetResolution::Fixed {
                                 width: w,
