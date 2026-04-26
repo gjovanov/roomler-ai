@@ -715,3 +715,61 @@ describe('codecFromSdp', () => {
     expect(codecFromSdp('m=video 9 X 101\r\na=rtpmap:101 WEIRD/90000\r\n')).toBeNull()
   })
 })
+
+describe('rc-vp9-444-worker frame header', () => {
+  // Lock the wire format so any change to the agent-side encoder
+  // emit gets caught here. Schema: u32 size LE + u8 flags + u64 ts LE.
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { parseFrameHeader, isKeyframe } = require('@/workers/rc-vp9-444-worker') as {
+    parseFrameHeader: (buf: Uint8Array) => { payloadSize: number; flags: number; timestampUs: bigint } | null
+    isKeyframe: (flags: number) => boolean
+  }
+
+  function buildHeader(size: number, flags: number, ts: bigint): Uint8Array {
+    const buf = new Uint8Array(13)
+    const view = new DataView(buf.buffer)
+    view.setUint32(0, size, true)
+    view.setUint8(4, flags)
+    view.setUint32(5, Number(ts & 0xffffffffn), true)
+    view.setUint32(9, Number(ts >> 32n), true)
+    return buf
+  }
+
+  it('parses size + flags + timestamp from a 13-byte header', () => {
+    const header = buildHeader(1234, 0x01, 1_700_000_000_000_000n)
+    const parsed = parseFrameHeader(header)
+    expect(parsed).not.toBeNull()
+    expect(parsed!.payloadSize).toBe(1234)
+    expect(parsed!.flags).toBe(0x01)
+    expect(parsed!.timestampUs).toBe(1_700_000_000_000_000n)
+  })
+
+  it('returns null when the input is shorter than the 13-byte header', () => {
+    expect(parseFrameHeader(new Uint8Array(0))).toBeNull()
+    expect(parseFrameHeader(new Uint8Array(12))).toBeNull()
+  })
+
+  it('decodes the keyframe flag bit', () => {
+    expect(isKeyframe(0x00)).toBe(false)
+    expect(isKeyframe(0x01)).toBe(true)
+    // Higher bits reserved — keyframe bit is bit 0 only.
+    expect(isKeyframe(0x02)).toBe(false)
+    expect(isKeyframe(0x03)).toBe(true)
+  })
+
+  it('handles a zero-payload header without throwing', () => {
+    const header = buildHeader(0, 0x00, 0n)
+    const parsed = parseFrameHeader(header)
+    expect(parsed).not.toBeNull()
+    expect(parsed!.payloadSize).toBe(0)
+  })
+
+  it('round-trips a maximum-realistic 4K-keyframe size', () => {
+    // 4K I444 worst-case keyframe is ~6 MB; spec allows up to 16 MB
+    // before the worker rejects. Verify the parser doesn't choke at
+    // that scale.
+    const header = buildHeader(8_000_000, 0x01, 0n)
+    const parsed = parseFrameHeader(header)
+    expect(parsed!.payloadSize).toBe(8_000_000)
+  })
+})
