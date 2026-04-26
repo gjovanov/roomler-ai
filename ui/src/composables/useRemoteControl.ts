@@ -657,7 +657,17 @@ export function useRemoteControl() {
       } else if (msg.type === 'reader-heartbeat') {
         console.info('[rc] webcodecs heartbeat', msg)
       } else if (msg.type === 'watchdog') {
-        console.warn('[rc] webcodecs watchdog fired', msg)
+        // Chrome's RTCRtpScriptTransform silently drops frames for
+        // some codec/version combos (HEVC ≤ Chrome 131, also H.264
+        // in some 2026-04-26 builds). The default decoder still gets
+        // the frames via our pipeThrough → writable, so the
+        // <video> element would render fine — we just need to swap
+        // the DOM. Tear down the worker; webcodecsActive flips to
+        // false; the view's `isWebCodecsRender` computed reverts;
+        // Vue mounts <video> and the existing srcObject watcher
+        // wires the stream. No reconnect needed.
+        console.warn('[rc] webcodecs watchdog fired — auto-fallback to <video>', msg)
+        stopWebCodecsPath()
       } else if (
         msg.type === 'decoder-error'
         || msg.type === 'decoder-configure-error'
