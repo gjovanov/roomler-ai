@@ -68,6 +68,15 @@ openh264 = { workspace = true, optional = true }
 # the constants point at the same encoder ABI.
 openh264-sys2 = { version = "0.9", optional = true, default-features = false }
 
+# VP9 4:4:4 encoder via libvpx. Feature-gated `vp9-444` because the
+# build pulls in C compilation of libvpx (~30 s first build) and a
+# small bindgen layer. See docs/vp9-444-plan.md for why we pick VP9
+# profile 1 over AV1/HEVC for screen-content 4:4:4.
+vpx-encode = { version = "0.6", optional = true }
+# AVX2 BGRA→I444 colour convert for the VP9 4:4:4 encoder input.
+# Pure SIMD, no FFI, ships its own SSE2 fallback.
+dcv-color-primitives = { version = "0.6", optional = true }
+
 # Cross-platform input injection (mouse / keyboard).
 enigo = { workspace = true, optional = true }
 
@@ -146,6 +155,11 @@ mf-encoder = ["dep:windows"]
 # runtime failure. Pulls in the same `windows` crate feature set as
 # `mf-encoder`.
 wgc-capture = ["dep:windows"]
+# Enables the libvpx VP9 4:4:4 software encoder for the
+# DataChannel-bypass video transport (docs/vp9-444-plan.md). Pulls
+# in a C build of libvpx and the dcv_color_primitives SIMD colour
+# converter. ~30 s extra cold build, ~10 s incremental.
+vp9-444 = ["dep:vpx-encode", "dep:dcv-color-primitives"]
 # Enables the enigo-based input injection backend.
 enigo-input = ["dep:enigo"]
 # Enables the clipboard data-channel handler — round-trip text
