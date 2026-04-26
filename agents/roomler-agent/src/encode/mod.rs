@@ -22,6 +22,9 @@ pub mod color;
 #[cfg(feature = "openh264-encoder")]
 pub mod openh264_backend;
 
+#[cfg(feature = "vp9-444")]
+pub mod libvpx;
+
 #[cfg(all(target_os = "windows", feature = "mf-encoder"))]
 pub mod mf;
 
