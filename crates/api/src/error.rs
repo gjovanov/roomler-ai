@@ -40,6 +40,17 @@ struct ErrorResponse {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        // Log the cause of every 5xx into the structured logs so a
+        // production 500 can be diagnosed from `kubectl logs` without
+        // needing the user to capture the response body. tower_http's
+        // trace layer logs `status=500` but discards the body, leaving
+        // a recurring "API error 500" report unfixable until someone
+        // pastes the response payload. Other status classes use
+        // existing tracing of their own (auth middleware logs 401
+        // reasons, validation logs 422 fields, etc.).
+        if let ApiError::Internal(msg) = &self {
+            tracing::error!(message = %msg, "ApiError::Internal -> 500");
+        }
         let (status, error_type, message) = match self {
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, "not_found", msg),
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, "bad_request", msg),

@@ -692,8 +692,18 @@ pub async fn create_call_message(
 }
 
 fn to_response(r: roomler_ai_db::models::Room) -> RoomResponse {
+    // `r.id.unwrap()` previously panicked when a Mongo document
+    // somehow lacked `_id` (or arrived stripped through a custom
+    // projection in the future). Any panic inside Axum's handler
+    // gets caught by tower_http's catch_panic and surfaces as a 500
+    // with no body — exactly the symptom of the recurring 500
+    // reports on /api/tenant/.../room. Fall back to an empty hex
+    // string so the response still serialises; a missing id will
+    // be obvious in the UI / logs without bringing the whole list
+    // endpoint down.
+    let id_hex = r.id.map(|i| i.to_hex()).unwrap_or_default();
     RoomResponse {
-        id: r.id.unwrap().to_hex(),
+        id: id_hex,
         name: r.name,
         path: r.path,
         parent_id: r.parent_id.map(|p| p.to_hex()),

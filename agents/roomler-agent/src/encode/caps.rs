@@ -75,18 +75,28 @@ fn compute_caps() -> AgentCaps {
             hw_encoders.push("mf-h264-hw".into());
         }
 
+        let allow_sw = allow_sw_heavy_override();
+        let advertise = |r: ProbeResult| -> bool {
+            matches!(r, ProbeResult::Hardware)
+                || (allow_sw && matches!(r, ProbeResult::SoftwareOnly))
+        };
+
         // HEVC: enumeration + real activation probe. MFTs that
         // enumerate but fail ActivateObject (driver/adapter
         // mismatches, missing HEVC Video Extension) would poison a
         // negotiated session — the track is bound to video/HEVC
         // before the encoder opens, so failure means black video not
-        // fallback-decode. Gate advertising on a successful probe.
+        // fallback-decode. Gate advertising on a successful HW probe;
+        // SW-only paths are dropped so H.264 wins negotiation
+        // (mediasoup-screenshare-grade quality on iGPU hosts).
         if let Ok(adapters) = super::mf::probe_hevc_adapter_count()
             && adapters > 0
-            && activates(CodecProbe::Hevc)
         {
-            codecs.push("h265".into());
-            hw_encoders.push("mf-h265-hw".into());
+            let probe = activates(CodecProbe::Hevc);
+            if advertise(probe) {
+                codecs.push("h265".into());
+                hw_encoders.push("mf-h265-hw".into());
+            }
         }
 
         // AV1: same reasoning as HEVC, with sharper impact — the
@@ -96,10 +106,12 @@ fn compute_caps() -> AgentCaps {
         // agent doesn't advertise a codec it can't actually produce.
         if let Ok(adapters) = super::mf::probe_av1_adapter_count()
             && adapters > 0
-            && activates(CodecProbe::Av1)
         {
-            codecs.push("av1".into());
-            hw_encoders.push("mf-av1-hw".into());
+            let probe = activates(CodecProbe::Av1);
+            if advertise(probe) {
+                codecs.push("av1".into());
+                hw_encoders.push("mf-av1-hw".into());
+            }
         }
     }
 
@@ -123,12 +135,34 @@ enum CodecProbe {
     Av1,
 }
 
-/// Spin up the real MF encoder for `codec` at a tiny probe resolution,
-/// then drop it. Returns `true` iff the cascade found a working HW
-/// MFT and emitted a probe frame. Logs at info level on success, warn
-/// on failure — either way the caller sees the cost in startup logs.
+/// Outcome of a codec probe. We split SW from HW because shipping
+/// HEVC over the SW MFT (`HEVCVideoExtensionEncoder`) is a UX
+/// regression vs negotiating H.264 with the host's HW H.264 path
+/// (Intel QuickSync, NVENC, AMF). Two reasons: chroma artefacts at
+/// low bitrate, and roughly 3x CPU cost vs HW H.264. Field reports
+/// 2026-04-24 and 2026-04-26 from boxes where the IHV HEVC MFT
+/// (Intel Hardware H265 Encoder MFT) fails ActivateObject 0x80004005
+/// and the cascade falls to SW HEVC. Demoting those hosts out of
+/// HEVC advertising forces the browser to negotiate H.264 where the
+/// cascade lands on real HW.
 #[cfg(all(target_os = "windows", feature = "mf-encoder"))]
-fn activates(codec: CodecProbe) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeResult {
+    /// Cascade landed on dedicated HW MFT — codec is safe to advertise.
+    Hardware,
+    /// Cascade activated, but only on the SW fallback (`backend="sw"`).
+    /// Caller decides whether to advertise; default policy is to drop
+    /// HEVC/AV1 when SW-only and let H.264 win negotiation.
+    SoftwareOnly,
+    /// No working encoder found at all. Caller MUST drop from caps.
+    Failed,
+}
+
+/// Spin up the real MF encoder for `codec` at a tiny probe resolution,
+/// inspect the resulting backend kind, then drop it. Logs the verdict
+/// at info / warn so the cascade outcome is visible in startup logs.
+#[cfg(all(target_os = "windows", feature = "mf-encoder"))]
+fn activates(codec: CodecProbe) -> ProbeResult {
     let start = std::time::Instant::now();
     let result = match codec {
         CodecProbe::Hevc => super::mf::MfEncoder::new_hevc(PROBE_WIDTH, PROBE_HEIGHT),
@@ -137,18 +171,26 @@ fn activates(codec: CodecProbe) -> bool {
     let elapsed_ms = start.elapsed().as_millis();
     match result {
         Ok(enc) => {
-            tracing::info!(
-                codec = ?codec,
-                elapsed_ms,
-                "caps probe: codec activates — advertising"
-            );
+            use super::VideoEncoder;
+            let is_hw = enc.is_hardware();
             // Dropping `enc` triggers the worker's Shutdown cmd which
             // in turn runs MFShutdown + CoUninitialize on its thread.
-            // Explicit drop + small sleep would serialise that more
-            // cleanly if we started seeing handle leaks, but today the
-            // Drop impl is reliable.
             drop(enc);
-            true
+            if is_hw {
+                tracing::info!(
+                    codec = ?codec,
+                    elapsed_ms,
+                    "caps probe: codec activates on HW — advertising"
+                );
+                ProbeResult::Hardware
+            } else {
+                tracing::warn!(
+                    codec = ?codec,
+                    elapsed_ms,
+                    "caps probe: codec activates only on SW — NOT advertising (H.264 HW likely better). Set ROOMLER_AGENT_ALLOW_SW_HEAVY=1 to override."
+                );
+                ProbeResult::SoftwareOnly
+            }
         }
         Err(e) => {
             tracing::warn!(
@@ -157,9 +199,21 @@ fn activates(codec: CodecProbe) -> bool {
                 elapsed_ms,
                 "caps probe: codec enumerates but does NOT activate — NOT advertising"
             );
-            false
+            ProbeResult::Failed
         }
     }
+}
+
+/// Operator escape hatch: advertise HEVC/AV1 even when the cascade
+/// only lands on SW. Off by default. Useful when the host has no
+/// working H.264 HW path and SW HEVC is a strict improvement over
+/// SW H.264 (rare but possible on machines without Intel QSV / NVENC
+/// / AMF).
+#[cfg(all(target_os = "windows", feature = "mf-encoder"))]
+fn allow_sw_heavy_override() -> bool {
+    std::env::var("ROOMLER_AGENT_ALLOW_SW_HEAVY")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
 }
 
 /// Intersection + priority for codec negotiation (Phase 2 2B.2).
