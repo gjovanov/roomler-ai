@@ -26,9 +26,14 @@ use std::time::Duration;
 pub const RELEASES_REPO: &str = "gjovanov/roomler-ai";
 
 /// How often `run_periodic` wakes up and checks for a newer release.
-/// Five-ish hours strikes a balance between "catch a zero-day fix on
-/// the same workday" and "don't hammer GitHub's API quota".
-pub const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 3600);
+/// 24 hours — matches the cadence of "operator deploys a fix and
+/// wants the field to pick it up next day" without burning through
+/// GitHub's 60-req-per-IP-per-hour unauthenticated REST quota when
+/// many agents share a public IP (NAT'd offices, multiple boxes
+/// behind one home router during rapid testing). Field report
+/// 2026-04-27: 8 successive MSI installs across 5 boxes hit
+/// `403 Forbidden` from GitHub before the hour reset.
+pub const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 3600);
 
 /// Minimum download size before we trust an installer artifact. A
 /// GitHub redirect to a deleted asset returns a tiny HTML page; this
@@ -147,7 +152,45 @@ async fn fetch_latest_release() -> Result<GithubRelease> {
         .await
         .context("GET releases")?;
     if !resp.status().is_success() {
-        bail!("GitHub API returned {}", resp.status());
+        // 403 from GitHub's REST API is the unauthenticated 60-req-per-
+        // IP-per-hour quota tripping. Surface the reset window from
+        // the rate-limit headers so the operator can see "wait 47
+        // minutes" instead of just "got 403". Headers may be absent
+        // on edge-network errors; default to a vague message when
+        // they are.
+        let status = resp.status();
+        if status.as_u16() == 403 {
+            let limit = resp
+                .headers()
+                .get("x-ratelimit-limit")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("?")
+                .to_string();
+            let remaining = resp
+                .headers()
+                .get("x-ratelimit-remaining")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("?")
+                .to_string();
+            let reset_unix = resp
+                .headers()
+                .get("x-ratelimit-reset")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok());
+            let resets_in_secs = reset_unix
+                .map(|t| {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    t.saturating_sub(now)
+                })
+                .unwrap_or(0);
+            bail!(
+                "GitHub API returned 403 Forbidden — rate-limited (limit={limit}, remaining={remaining}, resets in {resets_in_secs}s). Multiple agents on one IP share the unauthenticated 60/hr quota; cadence has been bumped to 24h to stay under it."
+            );
+        }
+        bail!("GitHub API returned {}", status);
     }
     let releases: Vec<GithubRelease> = resp.json().await.context("parsing GitHub releases JSON")?;
     pick_latest_release(releases).context("no published agent-v* release found")
