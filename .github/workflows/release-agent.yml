@@ -96,10 +96,17 @@ jobs:
 
       - name: Install system build deps
         run: |
+          # libvpx-dev needed for the `vp9-444` feature (bindgen + link).
+          # Ubuntu 24.04 (ubuntu-latest) ships libvpx 1.14.0 — bindgen
+          # 0.68.1 + libclang handles its `vpx_codec_enc_cfg` struct
+          # correctly; libvpx 1.16.x changes the header-include order
+          # in a way that triggers a known bindgen forward-declaration
+          # bug, so do not bump beyond apt's pinned version here.
           sudo apt-get update
           sudo apt-get install -y \
             libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev \
-            cmake libclang-dev pkg-config
+            cmake libclang-dev pkg-config \
+            libvpx-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
@@ -113,8 +120,17 @@ jobs:
       - name: Install cargo-deb
         run: cargo install cargo-deb --locked
 
-      - name: Build agent (release, full features)
-        run: cargo build -p roomler-agent --release --features full
+      - name: Build agent (release, full + vp9-444 + vp9-444-bindgen)
+        # `vp9-444` adds the libvpx VP9 profile-1 (8-bit 4:4:4) software
+        # encoder for the DataChannel-bypass video transport (Phase Y in
+        # docs/vp9-444-plan.md). Browser viewers that flip the
+        # "Crystal-clear (VP9 4:4:4)" toolbar toggle expect this on the
+        # other end.
+        # `vp9-444-bindgen` enables `env-libvpx-sys/generate` so bindgen
+        # runs against the system libvpx 1.14 headers; without this the
+        # build script panics looking for `vpx-ffi-1.14.0.rs` in the
+        # crate's `generated/` dir (only ships ≤ 1.13.0).
+        run: cargo build -p roomler-agent --release --features "full,vp9-444,vp9-444-bindgen"
 
       - name: Build .deb
         working-directory: agents/roomler-agent
@@ -170,6 +186,63 @@ jobs:
           "$llvm\bin"              | Out-File -FilePath $env:GITHUB_PATH -Append
           & "$llvm\bin\clang.exe" --version
 
+      - name: Install pkg-config (env-libvpx-sys build script needs it)
+        shell: pwsh
+        run: |
+          # `env-libvpx-sys`'s build.rs shells out to pkg-config to find
+          # the libvpx headers + lib paths. windows-latest doesn't ship
+          # one. pkg-config-lite is a single-binary build of pkg-config
+          # without glib deps — exactly what we need.
+          choco install -y pkgconfiglite
+          # The choco package puts pkg-config.exe under
+          # C:\ProgramData\chocolatey\bin which is already on PATH for
+          # subsequent steps. Verify before continuing.
+          pkg-config --version
+
+      - name: Build libvpx 1.12.0 via vcpkg (matches pre-generated bindings)
+        shell: pwsh
+        run: |
+          # We DON'T enable `vp9-444-bindgen` on Windows because bindgen
+          # 0.68.1 + libclang on Windows has a regression that opaques
+          # `vpx_codec_enc_cfg` (forward-declared in vpx_codec.h's union
+          # before its full def in vpx_encoder.h) — every field becomes
+          # `_address: u8` and the build collapses. Local-repro confirms
+          # this on libvpx 1.12 / 1.13 / 1.16 alike, so it's not a
+          # libvpx-version issue, it's a Windows-libclang issue.
+          #
+          # Workaround: skip bindgen entirely. env-libvpx-sys ships
+          # pre-generated FFI for libvpx 1.3.0–1.13.0 (look in
+          # ~/.cargo/registry/src/.../env-libvpx-sys-5.1.3/generated/).
+          # build.rs picks the file matching pkg-config's reported
+          # version EXACTLY. We pin to 1.12.0 because vcpkg has it (the
+          # 1.13.0 entry was bumped to 1.13.1, which env-libvpx-sys
+          # doesn't ship a pre-generated file for).
+          git clone --depth 1 https://github.com/microsoft/vcpkg.git C:\vcpkg
+          C:\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+          # Need full history to resolve the 1.12.0 baseline (the
+          # baseline commit must contain the version-specific git-tree
+          # entry vcpkg looks up).
+          git -C C:\vcpkg fetch --unshallow
+          New-Item -ItemType Directory -Path C:\vpx-pin -Force | Out-Null
+          @'
+          {
+            "name": "roomler-vpx-pin",
+            "version": "0.0.1",
+            "dependencies": [{"name": "libvpx", "version>=": "1.12.0"}],
+            "overrides":    [{"name": "libvpx", "version":   "1.12.0"}],
+            "builtin-baseline": "4d73751b3428ef49a7ac5d5df696b92e302de993"
+          }
+          '@ | Set-Content -Encoding utf8 C:\vpx-pin\vcpkg.json
+          Push-Location C:\vpx-pin
+          C:\vcpkg\vcpkg.exe install --triplet=x64-windows --x-install-root=C:\vpx-pin\installed
+          Pop-Location
+          # Expose the install dir to subsequent steps.
+          "PKG_CONFIG_PATH=C:/vpx-pin/installed/x64-windows/lib/pkgconfig" | Out-File -FilePath $env:GITHUB_ENV -Append
+          # libvpx ships as DLL on x64-windows; copy alongside the agent
+          # binary so encoder-smoke + the MSI bundle find it at runtime.
+          # The MSI will pick up the DLL via the harvested target dir.
+          "VPX_DLL_DIR=C:/vpx-pin/installed/x64-windows/bin" | Out-File -FilePath $env:GITHUB_ENV -Append
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
 
@@ -177,7 +250,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: '. -> target'
-          shared-key: agent-windows
+          shared-key: agent-windows-vp9-444
 
       - name: Install WiX Toolset v3
         shell: pwsh
@@ -191,9 +264,25 @@ jobs:
       - name: Install cargo-wix
         run: cargo install cargo-wix --locked
 
-      - name: Build agent (release, full-hw features)
+      - name: Build agent (release, full-hw + vp9-444)
+        # `vp9-444` (without `-bindgen`) uses env-libvpx-sys's
+        # pre-generated FFI — no libclang invocation, no
+        # forward-decl-opaque issue. pkg-config still has to find
+        # `vpx.pc` (which the vcpkg step exported via PKG_CONFIG_PATH);
+        # the linker resolves vpx.lib from the pkg-config-emitted
+        # `-L`. No INCLUDE / vcvars dance needed.
         shell: pwsh
-        run: cargo build -p roomler-agent --release --features full-hw
+        run: cargo build -p roomler-agent --release --features "full-hw,vp9-444"
+
+      - name: Stage vpx.dll alongside agent binary
+        shell: pwsh
+        run: |
+          # Runtime DLL lookup: libvpx loads from the same dir as the
+          # agent .exe via the standard Windows DLL search order. Copy
+          # vpx.dll next to roomler-agent.exe so encoder-smoke picks it
+          # up below, and so cargo-wix's main.wxs harvest sweeps it into
+          # the MSI alongside the agent binary.
+          Copy-Item "$env:VPX_DLL_DIR\vpx.dll" target\release\
 
       - name: Encoder smoke test (MF cascade → openh264 fallback)
         shell: pwsh
@@ -309,10 +398,15 @@ jobs:
           shared-key: agent-macos
 
       - name: Install system deps
-        run: brew install cmake
+        # libvpx for the `vp9-444` feature; pkg-config for the
+        # env-libvpx-sys build script. brew's libvpx is currently 1.15
+        # which has the same well-formed header layout as 1.14 (the
+        # libvpx 1.16 forward-decl regression that breaks bindgen on
+        # Windows is upstream-only-on-1.16, so brew's 1.15 works).
+        run: brew install cmake libvpx pkg-config
 
-      - name: Build agent (release, full features)
-        run: cargo build -p roomler-agent --release --features full --target aarch64-apple-darwin
+      - name: Build agent (release, full + vp9-444)
+        run: cargo build -p roomler-agent --release --features "full,vp9-444" --target aarch64-apple-darwin
 
       - name: Stage .app bundle
         shell: bash

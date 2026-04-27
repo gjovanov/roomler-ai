@@ -81,13 +81,21 @@ openh264-sys2 = { version = "0.9", optional = true, default-features = false }
 # (~150 LOC of unsafe in encode/libvpx.rs) so we can configure
 # I444 input, profile=1, lag-in-frames=0, and screen-content tuning.
 #
-# `generate` runs bindgen against the system libvpx headers at
-# build time instead of using env-libvpx-sys's pre-generated
-# bindings, which only cover libvpx ≤ 1.13.0. Ubuntu 24.04
-# (ubuntu-latest in CI as of 2026) ships libvpx 1.14.0 and the
-# build script panics when no matching pre-generated file is found.
-# bindgen needs libclang at build time; CI installs libclang-dev.
-env-libvpx-sys = { version = "5.1", optional = true, features = ["generate"] }
+# env-libvpx-sys defaults to its pre-generated FFI bindings
+# (covering libvpx 1.3.0 through 1.13.0). Builds against newer
+# libvpx need the `generate` feature to run bindgen at build time —
+# enable via the `vp9-444-bindgen` feature below.
+#
+# Why two features: bindgen 0.68.1 + libclang on Windows has a
+# regression that opaques `vpx_codec_enc_cfg` (forward-declared via
+# pointer-to-incomplete in a union in vpx_codec.h, then re-declared
+# fully in vpx_encoder.h) regardless of libvpx version, breaking
+# the build. Linux + macOS bindgen handles it correctly. So Linux
+# + macOS release builds (apt's libvpx 1.14, brew's libvpx 1.15) use
+# `vp9-444 + vp9-444-bindgen`; the Windows release build sticks to
+# `vp9-444` alone and pins libvpx to 1.12.0 via vcpkg so the
+# pre-generated bindings match the installed lib.
+env-libvpx-sys = { version = "5.1", optional = true }
 # AVX2 BGRA→I444 colour convert for the VP9 4:4:4 encoder input.
 # Pure SIMD, no FFI, ships its own SSE2 fallback.
 dcv-color-primitives = { version = "0.6", optional = true }
@@ -175,6 +183,12 @@ wgc-capture = ["dep:windows"]
 # in a C build of libvpx and the dcv_color_primitives SIMD colour
 # converter. ~30 s extra cold build, ~10 s incremental.
 vp9-444 = ["dep:env-libvpx-sys", "dep:dcv-color-primitives"]
+# Pair with `vp9-444` when building against a libvpx newer than 1.13.0
+# (Ubuntu 24.04 apt = 1.14, brew = 1.15.x). Skip on Windows — bindgen
+# blows up there regardless of libvpx version (see env-libvpx-sys dep
+# comment above). Pure feature wiring; the C-level work happens at
+# build time inside env-libvpx-sys's build.rs.
+vp9-444-bindgen = ["env-libvpx-sys/generate"]
 # Enables the enigo-based input injection backend.
 enigo-input = ["dep:enigo"]
 # Enables the clipboard data-channel handler — round-trip text
@@ -219,7 +233,7 @@ controlled host, maintains an outbound WebSocket connection to the \
 Roomler API for signalling, and serves a WebRTC peer directly to the \
 browser controller (video + input over P2P — the server never sees \
 raw pixels or keystrokes)."""
-depends = "libc6, libxcb1, libxcb-shm0, libxcb-randr0"
+depends = "libc6, libxcb1, libxcb-shm0, libxcb-randr0, libvpx9 | libvpx7"
 section = "net"
 priority = "optional"
 assets = [
