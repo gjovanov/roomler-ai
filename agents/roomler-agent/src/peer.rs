@@ -301,6 +301,17 @@ impl AgentPeer {
         // sync pump loop and writes from the async DC callback are
         // both brief.
         let target_resolution = Arc::new(std::sync::Mutex::new(TargetResolution::Native));
+        // Phase Y.3 (docs/vp9-444-plan.md). When the browser opens a
+        // `video-bytes` data channel — only happens when both sides
+        // negotiated `data-channel-vp9-444` transport in caps — we
+        // stash the DC handle here so the media pump can write
+        // length-prefixed VP9 frames into it instead of the WebRTC
+        // video track. None until the channel arrives; the pump
+        // checks each iteration. Tokio mutex because the on_data_channel
+        // callback writes from an async context and the pump reads
+        // from its own task — both brief, no contention.
+        let video_bytes_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
         let rtcp_reader = {
             let flag = keyframe_requested.clone();
             let remb = remb_bps.clone();
@@ -463,11 +474,13 @@ impl AgentPeer {
         // Downloads folder.
         let quality_for_dc = quality_state.clone();
         let target_res_for_dc = target_resolution.clone();
+        let video_bytes_dc_for_callback = video_bytes_dc.clone();
         pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
             let label = dc.label().to_string();
             info!(session = %session_id, %label, "data channel opened");
             let quality_for_dc = quality_for_dc.clone();
             let target_res_for_dc = target_res_for_dc.clone();
+            let video_bytes_stash = video_bytes_dc_for_callback.clone();
             Box::pin(async move {
                 match label.as_str() {
                     "input" => attach_input_handler(dc),
@@ -478,6 +491,23 @@ impl AgentPeer {
                     #[cfg(feature = "clipboard")]
                     "clipboard" => attach_clipboard_handler(dc, session_id),
                     "files" => attach_files_handler(dc, session_id),
+                    "video-bytes" => {
+                        // Phase Y.3 stash. The media pump (when caps
+                        // negotiated this transport) consults this
+                        // handle each iteration and routes encoded
+                        // frames here instead of the WebRTC video
+                        // track. No-op today — full pump-side branch
+                        // lands in a follow-up. Logging the open
+                        // event so a future regression where the
+                        // channel arrives but the pump doesn't see it
+                        // is greppable.
+                        info!(
+                            session = %session_id,
+                            "video-bytes DC stashed for Y.3 media-pump branch"
+                        );
+                        *video_bytes_stash.lock().await = Some(dc.clone());
+                        attach_log_only(dc, session_id);
+                    }
                     _ => attach_log_only(dc, session_id),
                 }
             })
