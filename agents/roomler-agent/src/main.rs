@@ -408,6 +408,7 @@ async fn caps_cmd() -> Result<()> {
     let caps = roomler_agent::encode::caps::detect();
     println!("codecs: {:?}", caps.codecs);
     println!("hw_encoders: {:?}", caps.hw_encoders);
+    println!("transports: {:?}", caps.transports);
     println!("has_input_permission: {}", caps.has_input_permission);
     println!("supports_clipboard: {}", caps.supports_clipboard);
     println!("supports_file_transfer: {}", caps.supports_file_transfer);
