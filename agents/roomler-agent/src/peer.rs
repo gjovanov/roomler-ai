@@ -834,9 +834,23 @@ async fn media_pump(
                 auto_downscale_evaluated = true;
                 let enc_ref = encoder.as_ref().unwrap();
                 let backend_is_sw = !enc_ref.is_hardware();
+                // Tier the downscale by codec weight. HEVC + AV1
+                // SW encode is ~3x heavier than H.264, so cap them
+                // hard at 1080p. H.264 SW is faster but 1920x1200
+                // at 30 fps still eats ~21 ms / frame on an Intel
+                // iGPU — close to our 33 ms budget and leaving no
+                // headroom for capture jitter (field log
+                // 2026-04-27 from RoziLaptop -> Schetovodstvo-PZ
+                // showed exactly that pattern: smooth 30 fps math
+                // but visibly sluggish to the operator). Drop H.264
+                // SW above 720p down to 1280x720 where encode is
+                // comfortably under 12 ms / frame.
                 let heavy_codec = chosen_codec == "h265" || chosen_codec == "av1";
-                let high_res = (frame.width as u64) * (frame.height as u64) > (1920u64 * 1080u64);
-                if backend_is_sw && heavy_codec && high_res {
+                let h264 = chosen_codec == "h264";
+                let above_1080p =
+                    (frame.width as u64) * (frame.height as u64) > (1920u64 * 1080u64);
+                let above_720p = (frame.width as u64) * (frame.height as u64) > (1280u64 * 720u64);
+                if backend_is_sw && heavy_codec && above_1080p {
                     let mut guard = target_resolution.lock().unwrap();
                     if matches!(*guard, TargetResolution::Native) {
                         *guard = TargetResolution::Fixed {
@@ -850,6 +864,22 @@ async fn media_pump(
                             codec = %chosen_codec,
                             encoder = enc_ref.name(),
                             "auto-downscale: SW heavy codec on high-res source — capping capture at 1920x1080 to preserve fps. Operator can override via rc:resolution."
+                        );
+                    }
+                } else if backend_is_sw && h264 && above_720p {
+                    let mut guard = target_resolution.lock().unwrap();
+                    if matches!(*guard, TargetResolution::Native) {
+                        *guard = TargetResolution::Fixed {
+                            width: 1280,
+                            height: 720,
+                        };
+                        tracing::warn!(
+                            %session_id,
+                            native_w = frame.width,
+                            native_h = frame.height,
+                            codec = %chosen_codec,
+                            encoder = enc_ref.name(),
+                            "auto-downscale: SW H.264 on high-res source — capping capture at 1280x720 so encode stays under the 33 ms 30-fps budget. Operator can override via rc:resolution."
                         );
                     }
                 }
