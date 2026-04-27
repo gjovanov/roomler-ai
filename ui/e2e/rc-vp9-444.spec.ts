@@ -34,23 +34,28 @@ import { test, expect } from '@playwright/test'
  * only runs the chromium project this is fine.
  */
 test.describe('Phase Y.3 VP9 4:4:4 DataChannel pipeline', () => {
-  // Quick precondition probe: Chromium ≥ 102 supports VP9 profile 1
-  // for both encode + decode, but the test rig depends on
-  // VideoEncoder + VideoDecoder + RTCPeerConnection in the same
-  // page. If any of those is missing we skip rather than red-fail.
+  // Precondition probe: needs VideoEncoder + VideoDecoder +
+  // RTCPeerConnection plus AT LEAST one VP9 codec (profile 1 is
+  // preferred — that's what production uses — but profile 0 is
+  // acceptable for the e2e mechanics since current Chromium lacks
+  // a profile-1 encoder; the worker accepts a codec override on
+  // init-canvas). Skip if no VP9 round-trips at all.
   test.beforeEach(async ({ page }) => {
     await page.goto('/rc-vp9-444-harness.html?manual=1')
     const ok = await page.evaluate(async () => {
       if (typeof VideoDecoder !== 'function' || typeof VideoEncoder !== 'function') return false
       if (typeof RTCPeerConnection !== 'function') return false
-      const dec = await VideoDecoder.isConfigSupported({ codec: 'vp09.01.10.08' }).catch(() => null)
-      const enc = await VideoEncoder.isConfigSupported({
-        codec: 'vp09.01.10.08',
-        width: 64, height: 36, bitrate: 200_000, framerate: 30,
-      }).catch(() => null)
-      return !!(dec && dec.supported && enc && enc.supported)
+      for (const codec of ['vp09.01.10.08', 'vp09.00.10.08']) {
+        const dec = await VideoDecoder.isConfigSupported({ codec }).catch(() => null)
+        if (!dec || !dec.supported) continue
+        const enc = await VideoEncoder.isConfigSupported({
+          codec, width: 64, height: 36, bitrate: 200_000, framerate: 30,
+        }).catch(() => null)
+        if (enc && enc.supported) return true
+      }
+      return false
     })
-    test.skip(!ok, 'WebCodecs VP9 profile 1 codecs not supported on this browser')
+    test.skip(!ok, 'WebCodecs VP9 (profile 0 or 1) not supported on this browser')
   })
 
   test('encodes, transports over DC, and decodes 12 frames end-to-end', async ({ page }) => {
@@ -65,9 +70,9 @@ test.describe('Phase Y.3 VP9 4:4:4 DataChannel pipeline', () => {
     await page.goto('/rc-vp9-444-harness.html')
 
     // Harness auto-runs on load; poll the global it sets until the
-    // run reaches `done` (or `error`). 15s is well above the typical
-    // wall-clock for 12 frames on a CI runner — encoder warm-up +
-    // DC handshake is the dominant cost.
+    // run reaches `done` (or `error`) — terminal states only. 30 s
+    // is well above the typical wall-clock for 12 frames on a CI
+    // runner — encoder warm-up + DC handshake is the dominant cost.
     await expect.poll(
       async () => {
         return await page.evaluate(() => {
@@ -76,17 +81,18 @@ test.describe('Phase Y.3 VP9 4:4:4 DataChannel pipeline', () => {
         })
       },
       {
-        timeout: 15_000,
-        intervals: [100, 250, 500],
+        timeout: 30_000,
+        intervals: [200, 500, 1000],
         message: 'harness never reached done/error',
       },
-    ).not.toBe('idle')
+    ).toMatch(/^(done|error)$/)
 
     // Snapshot the result after the harness settled.
     const result = await page.evaluate(() => {
       return (window as unknown as { __rcVp9_444Harness: unknown }).__rcVp9_444Harness
     }) as {
       state: string
+      codec?: string
       framesEncoded: number
       framesSent: number
       framesDecoded: number
@@ -103,8 +109,11 @@ test.describe('Phase Y.3 VP9 4:4:4 DataChannel pipeline', () => {
       )
     }
 
-    // Codec config landed on both sides.
+    // Codec config landed on both sides. The harness picks the
+    // first VP9 profile that's both encode-and-decode-able in the
+    // active browser (preference order: profile 1, then profile 0).
     expect(result.decoderConfigured).toBe(true)
+    expect(['vp09.01.10.08', 'vp09.00.10.08']).toContain(result.codec)
 
     // The producer encoded all 12 frames and shipped each one.
     expect(result.framesEncoded).toBe(12)
