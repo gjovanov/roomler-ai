@@ -27,16 +27,27 @@
  * declared payload size remain.
  */
 
-type InitCanvasMessage = { type: 'init-canvas'; canvas: OffscreenCanvas }
+type InitCanvasMessage = {
+  type: 'init-canvas'
+  canvas: OffscreenCanvas
+  /** Optional codec override. Production uses VP9 profile 1
+   *  (vp09.01.10.08, 4:4:4 8-bit) — the default below — but the
+   *  e2e harness lacks a 4:4:4 *encoder* in current Chromium
+   *  WebCodecs, so it overrides with VP9 profile 0 (vp09.00.10.08,
+   *  4:2:0) just to exercise the wire+DC+decoder mechanics. */
+  codec?: string
+}
 type ChunkMessage = { type: 'chunk'; bytes: ArrayBuffer }
 type CloseMessage = { type: 'close' }
 type IncomingMessage = InitCanvasMessage | ChunkMessage | CloseMessage
 
 const HEADER_BYTES = 13
 const FLAG_KEYFRAME = 0x01
-/** Codec string for VP9 profile 1 (4:4:4 8-bit). Browsers' WebCodecs
- *  decoders use libvpx and accept this without quibble. */
-const VP9_444_CODEC = 'vp09.01.10.08'
+/** Default codec — VP9 profile 1 (4:4:4 8-bit). Browsers' WebCodecs
+ *  decoders use libvpx and accept this without quibble. Tests can
+ *  override via the `codec` field on `init-canvas`. */
+const DEFAULT_VP9_CODEC = 'vp09.01.10.08'
+let activeCodec: string = DEFAULT_VP9_CODEC
 
 const workerScope = self as unknown as {
   onmessage: ((ev: MessageEvent<IncomingMessage>) => void) | null
@@ -72,6 +83,9 @@ workerScope.onmessage = (e) => {
   if (msg.type === 'init-canvas') {
     canvas = msg.canvas
     ctx = canvas.getContext('2d')
+    if (typeof msg.codec === 'string' && msg.codec.length > 0) {
+      activeCodec = msg.codec
+    }
     initDecoder()
   } else if (msg.type === 'chunk') {
     framesReceived++
@@ -86,13 +100,13 @@ function initDecoder() {
   decoder = new VideoDecoder({
     output: (frame) => {
       framesDecoded++
+      // Snapshot dims BEFORE paintFrame — it calls frame.close() in a
+      // finally block, after which displayWidth/displayHeight return 0.
+      const w = frame.displayWidth
+      const h = frame.displayHeight
       paintFrame(frame)
       if (framesDecoded === 1) {
-        workerScope.postMessage({
-          type: 'first-frame',
-          width: frame.displayWidth,
-          height: frame.displayHeight,
-        })
+        workerScope.postMessage({ type: 'first-frame', width: w, height: h })
       } else {
         // Composable-side counter consumes this for view diagnostics
         // and tests; we deliberately do NOT include the VideoFrame
@@ -108,24 +122,25 @@ function initDecoder() {
       })
     },
   })
-  // Configure now; `vp09.01.10.08` is unconditionally supported by
-  // WebCodecs in Chromium-based browsers (libvpx ships in-tree).
-  // If a future Chrome deprecates profile 1 we'll see the rejection
-  // in the error callback.
+  // Configure now; the default `vp09.01.10.08` is unconditionally
+  // supported by WebCodecs in Chromium-based browsers (libvpx ships
+  // in-tree). If a future Chrome deprecates profile 1 we'll see the
+  // rejection in the error callback. Tests may override via
+  // `init-canvas.codec`.
   try {
     decoder.configure({
-      codec: VP9_444_CODEC,
+      codec: activeCodec,
       optimizeForLatency: true,
     } as VideoDecoderConfig)
     configured = true
     workerScope.postMessage({
       type: 'decoder-configured',
-      codec: VP9_444_CODEC,
+      codec: activeCodec,
     })
   } catch (err) {
     workerScope.postMessage({
       type: 'decoder-configure-error',
-      codec: VP9_444_CODEC,
+      codec: activeCodec,
       error: extractErrorMessage(err),
     })
   }
