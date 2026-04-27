@@ -93,6 +93,12 @@ function initDecoder() {
           width: frame.displayWidth,
           height: frame.displayHeight,
         })
+      } else {
+        // Composable-side counter consumes this for view diagnostics
+        // and tests; we deliberately do NOT include the VideoFrame
+        // itself in the message (already closed by paintFrame, and
+        // it'd serialise as a copy here anyway).
+        workerScope.postMessage({ type: 'frame-decoded', count: framesDecoded })
       }
     },
     error: (err) => {

@@ -353,6 +353,15 @@ export async function isVp9_444DecodeSupported(): Promise<boolean> {
   }
 }
 
+/** Wire-format constants for the `video-bytes` DataChannel. The label
+ *  must match the agent's `on_data_channel` arm at peer.rs:494. The
+ *  channel is reliable + ordered because (a) SCTP is doing the
+ *  reassembly anyway and (b) dropping a P-frame would force the
+ *  worker to wait for the next IDR — far worse than a few ms of
+ *  retransmit latency. */
+export const VP9_444_DC_LABEL = 'video-bytes'
+export const VP9_444_DC_OPTIONS: RTCDataChannelInit = { ordered: true }
+
 /** Short codec name to pass into `new RTCRtpScriptTransform(worker,
  *  { codec })`. Reads the first negotiated codec off
  *  `RTCRtpReceiver.getParameters().codecs` and maps it back to our
@@ -542,6 +551,29 @@ export function useRemoteControl() {
    *  correctly renders the `<video>` rather than a permanent black
    *  canvas. */
   const webcodecsActive = ref(false)
+
+  // Phase Y.3: VP9-444 over DataChannel pipeline. Independent of the
+  // RTCRtpScriptTransform path above — uses its OWN worker
+  // (rc-vp9-444-worker.ts) fed off `video-bytes` DC binary messages.
+  let vp9_444Worker: Worker | null = null
+  /** `true` once the worker has been spun up and the DC opened. The
+   *  view (Y.4) reads this to swap a `<canvas>` in for the `<video>`
+   *  element, mirroring how `webcodecsActive` drives the WebCodecs
+   *  path. Stays `false` when the user didn't opt in OR the agent
+   *  doesn't honour the transport (no DC ever arrives → flag never
+   *  flips). */
+  const vp9_444Active = ref(false)
+  /** Number of decoded VP9-444 frames so far. Surfaced to the view
+   *  for diagnostics and used by tests to assert end-to-end decode
+   *  succeeded. */
+  const vp9_444FramesDecoded = ref(0)
+  /** The visible `<canvas>` the view paints VP9-444 frames into. The
+   *  view writes this on mount; the composable picks it up and
+   *  posts `init-canvas` to the worker. Null until the view
+   *  provides a canvas — Y.3 ships without view-side wiring, so
+   *  bytes flow + decode happens against a synthetic OffscreenCanvas
+   *  instead. */
+  const vp9_444CanvasEl = ref<HTMLCanvasElement | null>(null)
 
   let pc: RTCPeerConnection | null = null
   /** Data channels we open proactively (per docs §5). Labels match the
@@ -847,6 +879,124 @@ export function useRemoteControl() {
     webcodecsWorker = null
   }
 
+  /** Boot the VP9-444 worker, open the `video-bytes` DataChannel, and
+   *  forward incoming binary messages to the worker. Called from
+   *  `connect()` only when the browser opted in to
+   *  `data-channel-vp9-444` AND VP9 profile 1 decode is supported.
+   *  Idempotent — a second call while a worker exists is a no-op
+   *  (wraps the existing channel + worker pair).
+   *
+   *  The worker self-decodes against an `OffscreenCanvas`. For Y.3
+   *  the canvas is synthetic (created here, never displayed); Y.4
+   *  hooks the view's `<canvas>` element via
+   *  `vp9_444CanvasEl` + a `transferControlToOffscreen()` swap.
+   *  Bytes still flow + frames still decode in the synthetic case,
+   *  which is what e2e + integration tests assert against.
+   *
+   *  Returns the worker handle so tests can drive it directly. */
+  function startVp9_444Path(): Worker | null {
+    if (vp9_444Worker) return vp9_444Worker
+    if (!pc) return null
+    let worker: Worker
+    try {
+      worker = new Worker(
+        new URL('../workers/rc-vp9-444-worker.ts', import.meta.url),
+        { type: 'module' },
+      )
+    } catch (err) {
+      console.warn('[rc] vp9-444 worker construction failed', err)
+      return null
+    }
+    worker.onmessage = (ev) => {
+      const msg = ev.data as Record<string, unknown> | undefined
+      if (!msg || typeof msg.type !== 'string') return
+      if (msg.type === 'first-frame'
+        && typeof msg.width === 'number'
+        && typeof msg.height === 'number') {
+        mediaIntrinsicW.value = msg.width
+        mediaIntrinsicH.value = msg.height
+        vp9_444FramesDecoded.value = Math.max(vp9_444FramesDecoded.value, 1)
+        console.info('[rc] vp9-444 first frame', msg.width, 'x', msg.height)
+      } else if (msg.type === 'decoder-configured') {
+        console.info('[rc] vp9-444 decoder configured', msg.codec)
+      } else if (msg.type === 'decoder-error'
+        || msg.type === 'decoder-configure-error'
+        || msg.type === 'decode-error') {
+        console.warn('[rc] vp9-444 worker', msg.type, msg.error)
+      } else if (msg.type === 'frame-rejected') {
+        console.warn('[rc] vp9-444 frame rejected', msg)
+      } else if (msg.type === 'frame-decoded') {
+        // Worker emits this for every decoded frame after the first.
+        // Driven by the worker's `output` callback, used by tests +
+        // view-side diagnostics.
+        vp9_444FramesDecoded.value++
+      }
+    }
+    // Synthetic OffscreenCanvas — keeps the worker fully wired even
+    // without a view-side canvas. Y.4 swaps in the visible canvas
+    // via vp9_444CanvasEl watcher below.
+    try {
+      const synthetic = new OffscreenCanvas(2, 2)
+      worker.postMessage({ type: 'init-canvas', canvas: synthetic }, [synthetic])
+    } catch (err) {
+      console.warn('[rc] vp9-444: synthetic OffscreenCanvas init failed', err)
+      try { worker.terminate() } catch { /* ignore */ }
+      return null
+    }
+    // Open the DC. Forward binary messages straight through to the
+    // worker as ArrayBuffer chunks (transferred, not copied).
+    let dc: RTCDataChannel
+    try {
+      dc = pc.createDataChannel(VP9_444_DC_LABEL, VP9_444_DC_OPTIONS)
+    } catch (err) {
+      console.warn('[rc] vp9-444 DC creation failed', err)
+      try { worker.terminate() } catch { /* ignore */ }
+      return null
+    }
+    dc.binaryType = 'arraybuffer'
+    dc.onmessage = (ev) => {
+      if (!(ev.data instanceof ArrayBuffer)) return
+      try {
+        worker.postMessage({ type: 'chunk', bytes: ev.data }, [ev.data])
+      } catch (err) {
+        console.warn('[rc] vp9-444 worker post failed', err)
+      }
+    }
+    dc.onopen = () => {
+      console.info('[rc] vp9-444 DC opened')
+    }
+    dc.onclose = () => {
+      console.info('[rc] vp9-444 DC closed')
+    }
+    channels.videoBytes = dc
+    vp9_444Worker = worker
+    vp9_444Active.value = true
+    return worker
+  }
+
+  function stopVp9_444Path() {
+    vp9_444Active.value = false
+    vp9_444FramesDecoded.value = 0
+    if (!vp9_444Worker) return
+    try { vp9_444Worker.postMessage({ type: 'close' }) } catch { /* ignore */ }
+    try { vp9_444Worker.terminate() } catch { /* ignore */ }
+    vp9_444Worker = null
+  }
+
+  /** When the view mounts a real `<canvas>`, swap it in for the
+   *  synthetic OffscreenCanvas the worker started with. The worker
+   *  treats `init-canvas` as idempotent — second call replaces the
+   *  paint target. */
+  watch(vp9_444CanvasEl, (el) => {
+    if (!el || !vp9_444Worker) return
+    try {
+      const off = el.transferControlToOffscreen()
+      vp9_444Worker.postMessage({ type: 'init-canvas', canvas: off }, [off])
+    } catch (err) {
+      console.warn('[rc] vp9-444: transferControlToOffscreen failed', err)
+    }
+  })
+
   // Late-canvas watcher. The transform is installed eagerly in
   // pc.ontrack, but the canvas is gated on phase === 'connected'
   // so it mounts after ontrack fires. When it mounts, hand the
@@ -1018,6 +1168,7 @@ export function useRemoteControl() {
   function teardown() {
     stopStatsPoll()
     stopWebCodecsPath()
+    stopVp9_444Path()
     for (const ch of Object.values(channels)) {
       try { ch.close() } catch { /* ignore */ }
     }
@@ -1303,6 +1454,15 @@ export function useRemoteControl() {
           '[rc] preferred_transport=data-channel-vp9-444 dropped — VideoDecoder.isConfigSupported(vp09.01.10.08) returned false. Falling back to webrtc.',
         )
       }
+    }
+
+    // If we're advertising the data-channel transport, open the DC +
+    // worker NOW so the channel lands in the SDP offer. The agent
+    // will only actually pump bytes through it when its caps include
+    // the same transport, so opening it speculatively is harmless on
+    // older agents (they ignore the channel entirely).
+    if (preferredTransport === 'data-channel-vp9-444') {
+      startVp9_444Path()
     }
 
     // Kick off the rc:* handshake. browser_caps lets the agent pick
@@ -1667,6 +1827,9 @@ export function useRemoteControl() {
     videoTransport,
     setVideoTransport,
     vp9_444Supported,
+    vp9_444Active,
+    vp9_444FramesDecoded,
+    vp9_444CanvasEl,
   }
 }
 

@@ -364,6 +364,208 @@ async fn agent_ws_rejects_user_token() {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Phase Y.3: preferred_transport on rc:session.request flows controller → agent
+// ────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn rc_session_request_forwards_preferred_transport_to_agent() {
+    // The browser advertises `preferred_transport: data-channel-vp9-444` on
+    // the rc:session.request payload (Phase Y.3 — see
+    // ui/src/composables/useRemoteControl.ts). The server's Hub forwards
+    // the field verbatim to the agent inside the rc:request envelope so
+    // the agent can intersect it with its own AgentCaps.transports and
+    // pick a video transport. This test locks the relay path: any
+    // future regression that drops the field on the way through will
+    // surface here.
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("rcprefxport").await;
+
+    // Enroll + connect the agent so the Hub knows about it. Caps don't
+    // matter for this test — the relay forwards `preferred_transport`
+    // unconditionally; intersection happens on the agent side.
+    let (agent_id, agent_token) =
+        enroll_helper(&app, &seeded, "mach-rcprefxport-A", "Y.3 agent").await;
+    let agent_ws_url = format!(
+        "ws://{}/ws?token={}&role=agent",
+        app.addr,
+        urlencode(&agent_token)
+    );
+    let (mut agent_ws, _) = connect_async(&agent_ws_url).await.expect("agent ws");
+    let hello = json!({
+        "t": "rc:agent.hello",
+        "machine_name": "Y.3 agent",
+        "os": "linux",
+        "agent_version": "0.1.0",
+        "displays": [{
+            "index": 0, "name": "x", "width_px": 800, "height_px": 600,
+            "scale": 1.0, "primary": true,
+        }],
+        "caps": {
+            "hw_encoders": [],
+            "codecs": ["h264"],
+            "has_input_permission": false,
+            "supports_clipboard": false,
+            "supports_file_transfer": false,
+            "max_simultaneous_sessions": 1,
+            "transports": ["data-channel-vp9-444"],
+        }
+    });
+    agent_ws
+        .send(Message::Text(hello.to_string().into()))
+        .await
+        .unwrap();
+
+    // Controller WS — uses the admin's user JWT (no `role` query param).
+    let ctrl_ws_url = format!(
+        "ws://{}/ws?token={}",
+        app.addr,
+        urlencode(&seeded.admin.access_token)
+    );
+    let (mut ctrl_ws, _) = connect_async(&ctrl_ws_url).await.expect("controller ws");
+
+    // Drain any startup frames the controller WS might emit (e.g.
+    // initial presence). Best-effort timeout — many tenants emit
+    // nothing.
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(200), ctrl_ws.next()).await;
+
+    // Kick off the session with the new field set.
+    let req = json!({
+        "t": "rc:session.request",
+        "agent_id": agent_id,
+        "permissions": "VIEW",
+        "preferred_transport": "data-channel-vp9-444",
+    });
+    ctrl_ws
+        .send(Message::Text(req.to_string().into()))
+        .await
+        .unwrap();
+
+    // Read agent-side messages until we see `rc:request` carrying the
+    // forwarded preferred_transport, or hit the deadline.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut saw_request = false;
+    while tokio::time::Instant::now() < deadline && !saw_request {
+        let msg = match tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            agent_ws.next(),
+        )
+        .await
+        {
+            Ok(Some(Ok(m))) => m,
+            _ => continue,
+        };
+        let Message::Text(text) = msg else { continue };
+        let Ok(v) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        if v.get("t").and_then(|x| x.as_str()) == Some("rc:request") {
+            // Lock the field name + value: a typo or accidental rename
+            // server-side would silently break the agent's negotiation
+            // logic.
+            assert_eq!(
+                v.get("preferred_transport").and_then(|x| x.as_str()),
+                Some("data-channel-vp9-444"),
+                "rc:request must forward preferred_transport verbatim; got {v}"
+            );
+            saw_request = true;
+        }
+    }
+    assert!(
+        saw_request,
+        "agent never received rc:request with preferred_transport"
+    );
+}
+
+#[tokio::test]
+async fn rc_session_request_omits_preferred_transport_when_unset() {
+    // Older browsers (and the default code path) don't include the
+    // `preferred_transport` field. The relay must NOT inject a
+    // default value — the agent's negotiation logic distinguishes
+    // None ("any transport") from Some("webrtc-video") and the wire
+    // format uses serde `skip_serializing_if = "Option::is_none"` to
+    // express that. Lock the absence on the wire so a future
+    // refactor that helpfully fills in defaults regresses here.
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("rcprefxport2").await;
+
+    let (agent_id, agent_token) =
+        enroll_helper(&app, &seeded, "mach-rcprefxport-B", "Y.3 default agent").await;
+    let agent_ws_url = format!(
+        "ws://{}/ws?token={}&role=agent",
+        app.addr,
+        urlencode(&agent_token)
+    );
+    let (mut agent_ws, _) = connect_async(&agent_ws_url).await.expect("agent ws");
+    let hello = json!({
+        "t": "rc:agent.hello",
+        "machine_name": "Y.3 default agent",
+        "os": "linux",
+        "agent_version": "0.1.0",
+        "displays": [{
+            "index": 0, "name": "x", "width_px": 800, "height_px": 600,
+            "scale": 1.0, "primary": true,
+        }],
+        "caps": {
+            "hw_encoders": [], "codecs": ["h264"],
+            "has_input_permission": false, "supports_clipboard": false,
+            "supports_file_transfer": false, "max_simultaneous_sessions": 1,
+        }
+    });
+    agent_ws
+        .send(Message::Text(hello.to_string().into()))
+        .await
+        .unwrap();
+
+    let ctrl_ws_url = format!(
+        "ws://{}/ws?token={}",
+        app.addr,
+        urlencode(&seeded.admin.access_token)
+    );
+    let (mut ctrl_ws, _) = connect_async(&ctrl_ws_url).await.expect("controller ws");
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(200), ctrl_ws.next()).await;
+
+    // Same shape as the previous test, sans preferred_transport.
+    let req = json!({
+        "t": "rc:session.request",
+        "agent_id": agent_id,
+        "permissions": "VIEW",
+    });
+    ctrl_ws
+        .send(Message::Text(req.to_string().into()))
+        .await
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut saw_request = false;
+    while tokio::time::Instant::now() < deadline && !saw_request {
+        let msg = match tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            agent_ws.next(),
+        )
+        .await
+        {
+            Ok(Some(Ok(m))) => m,
+            _ => continue,
+        };
+        let Message::Text(text) = msg else { continue };
+        let Ok(v) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        if v.get("t").and_then(|x| x.as_str()) == Some("rc:request") {
+            assert!(
+                v.get("preferred_transport").is_none(),
+                "rc:request must omit preferred_transport when unset; got {v}"
+            );
+            saw_request = true;
+        }
+    }
+    assert!(
+        saw_request,
+        "agent never received rc:request — server may have rejected the request"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ────────────────────────────────────────────────────────────────────────────
 
