@@ -128,6 +128,12 @@ async fn connect_once(
     // removed when the peer is built; orphaned entries (session
     // cancelled before SDP) get cleaned when the session is terminated.
     let mut pending_codecs: HashMap<bson::oid::ObjectId, String> = HashMap::new();
+    // Y.3: same lifecycle as `pending_codecs` but for the negotiated
+    // video transport. Inserted when `rc:session.request` arrives,
+    // consumed when `rc:sdp.offer` builds the AgentPeer + media pump.
+    // `Some("data-channel-vp9-444")` flips the pump into DC mode;
+    // None is the legacy WebRTC track.
+    let mut pending_transports: HashMap<bson::oid::ObjectId, Option<String>> = HashMap::new();
 
     // Keepalive. nginx + K8s ingress commonly idle-close WSes at 60-120s of
     // silence; send an application-level Ping every 25s so the connection
@@ -167,6 +173,7 @@ async fn connect_once(
                                 parsed,
                                 &mut peers,
                                 &mut pending_codecs,
+                                &mut pending_transports,
                                 &outbound_tx,
                                 encoder_preference,
                                 &indicator,
@@ -194,6 +201,7 @@ async fn connect_once(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_server_msg(
     ws: &mut tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
@@ -201,6 +209,7 @@ async fn handle_server_msg(
     msg: ServerMsg,
     peers: &mut HashMap<bson::oid::ObjectId, AgentPeer>,
     pending_codecs: &mut HashMap<bson::oid::ObjectId, String>,
+    pending_transports: &mut HashMap<bson::oid::ObjectId, Option<String>>,
     outbound_tx: &mpsc::Sender<ClientMsg>,
     encoder_preference: crate::encode::EncoderPreference,
     indicator: &ViewerIndicator,
@@ -237,6 +246,12 @@ async fn handle_server_msg(
                     None
                 }
             });
+            // Stash for the upcoming SdpOffer handler — that's where
+            // AgentPeer::new is called and the media pump is built.
+            // Without this stash the negotiation result was logged but
+            // not actually applied (the bug Y.3's media-pump branch
+            // surfaces).
+            pending_transports.insert(session_id, negotiated_transport.clone());
             info!(
                 %session_id, %controller_user_id, %controller_name,
                 ?permissions, consent_timeout_secs,
@@ -284,6 +299,11 @@ async fn handle_server_msg(
             let chosen_codec = pending_codecs
                 .remove(&session_id)
                 .unwrap_or_else(|| "h264".to_string());
+            // Y.3: pull the transport stashed in the request handler.
+            // `None` (legacy WebRTC track) is the silent default for
+            // older controllers / sessions that arrived without
+            // preferred_transport.
+            let negotiated_transport = pending_transports.remove(&session_id).unwrap_or(None);
 
             let peer = match AgentPeer::new(
                 session_id,
@@ -291,6 +311,7 @@ async fn handle_server_msg(
                 outbound_tx.clone(),
                 encoder_preference,
                 chosen_codec,
+                negotiated_transport,
             )
             .await
             {
@@ -357,10 +378,12 @@ async fn handle_server_msg(
             if let Some(peer) = peers.remove(&session_id) {
                 peer.close().await;
             }
-            // Drop any orphaned pending-codec entry for this session so
-            // the map doesn't accumulate under long-running agents
-            // (e.g. sessions cancelled before SDP is exchanged).
+            // Drop any orphaned pending-codec / transport entry for
+            // this session so the maps don't accumulate under long-
+            // running agents (e.g. sessions cancelled before SDP is
+            // exchanged).
             pending_codecs.remove(&session_id);
+            pending_transports.remove(&session_id);
             indicator.hide_session(session_id.to_hex());
         }
 

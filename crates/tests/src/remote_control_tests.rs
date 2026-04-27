@@ -445,11 +445,8 @@ async fn rc_session_request_forwards_preferred_transport_to_agent() {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     let mut saw_request = false;
     while tokio::time::Instant::now() < deadline && !saw_request {
-        let msg = match tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            agent_ws.next(),
-        )
-        .await
+        let msg = match tokio::time::timeout(std::time::Duration::from_millis(500), agent_ws.next())
+            .await
         {
             Ok(Some(Ok(m))) => m,
             _ => continue,
@@ -538,11 +535,8 @@ async fn rc_session_request_omits_preferred_transport_when_unset() {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     let mut saw_request = false;
     while tokio::time::Instant::now() < deadline && !saw_request {
-        let msg = match tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            agent_ws.next(),
-        )
-        .await
+        let msg = match tokio::time::timeout(std::time::Duration::from_millis(500), agent_ws.next())
+            .await
         {
             Ok(Some(Ok(m))) => m,
             _ => continue,
