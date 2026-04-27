@@ -123,31 +123,31 @@ fn compute_caps() -> AgentCaps {
     let mut transports: Vec<String> = Vec::new();
     #[cfg(feature = "vp9-444")]
     {
-        // Phase Y.4 caps probe (see commit d22b445).
-        //
-        // STATUS: BROKEN — the underlying `Vp9Encoder` produces VP9
-        // profile 0 (4:2:0) bytes despite the codec advertisement
-        // saying profile 1 (4:4:4). Root cause: `vpx-encode 0.6`
-        // hardcodes `VPX_IMG_FMT_I420` in its `encode()` and
-        // exposes no Config field for `g_profile`. The browser
-        // decoder is configured for `vp09.01.10.08` (profile 1)
-        // and will reject the bitstream. Bypass `Vp9Encoder::new`
-        // entirely and never advertise the transport from caps —
-        // that way no session ever negotiates onto this broken
-        // path. The encoder probe + advertisement come back when
-        // the rewrite against `env-libvpx-sys` (issue
-        // Y.runtime-encoder) lands.
-        //
-        // Wire-format + worker + UI + DC plumbing are all live and
-        // unit-tested — they just don't connect to a working
-        // encoder yet.
-        let probe_unused = || -> Result<crate::encode::libvpx::Vp9Encoder, _> {
-            crate::encode::libvpx::Vp9Encoder::new(PROBE_WIDTH, PROBE_HEIGHT)
-        };
-        let _ = probe_unused; // suppress dead-code warning
-        tracing::info!(
-            "vp9-444 transport disabled in caps until libvpx encoder rewrite (see encode/caps.rs comment)"
-        );
+        // Phase Y.4 caps probe (Y.runtime-encoder rewrite landed,
+        // 0.1.47). Try to instantiate the libvpx encoder at a probe
+        // resolution; on success advertise both the transport and
+        // the encoder label, on failure stay silent so no session
+        // ever negotiates onto a broken path. The probe runs once
+        // per agent process via the OnceLock cache.
+        let start = std::time::Instant::now();
+        match crate::encode::libvpx::Vp9Encoder::new(PROBE_WIDTH, PROBE_HEIGHT) {
+            Ok(enc) => {
+                drop(enc);
+                tracing::info!(
+                    elapsed_ms = start.elapsed().as_millis(),
+                    "caps probe: vp9-444 libvpx encoder activates — advertising data-channel-vp9-444 transport"
+                );
+                transports.push("data-channel-vp9-444".into());
+                hw_encoders.push("libvpx-vp9-444-sw".into());
+            }
+            Err(e) => {
+                tracing::warn!(
+                    %e,
+                    elapsed_ms = start.elapsed().as_millis(),
+                    "caps probe: vp9-444 libvpx encoder failed to init — NOT advertising"
+                );
+            }
+        }
     }
 
     AgentCaps {
@@ -357,28 +357,27 @@ mod tests {
         );
     }
 
-    /// Y.4 caps probe is currently disabled in vp9-444 builds: the
-    /// underlying `Vp9Encoder` produces VP9 profile 0 (4:2:0)
-    /// bytes that the browser's profile-1 decoder rejects (see
-    /// `compute_caps` for the root cause — `vpx-encode 0.6`
-    /// hardcodes I420 + offers no profile knob). Until the
-    /// libvpx encoder rewrite (issue Y.runtime-encoder) lands,
-    /// neither the transport nor the encoder label must ship — the
-    /// only honest advertisement is "not yet usable". This test
-    /// fails loudly the moment someone re-enables the probe without
-    /// also rewriting the encoder.
+    /// Y.4 caps probe (post Y.runtime-encoder rewrite, 0.1.47): the
+    /// libvpx encoder at the probe resolution must successfully
+    /// activate, and `compute_caps` must surface both the
+    /// `data-channel-vp9-444` transport and the `libvpx-vp9-444-sw`
+    /// encoder label. CI runs this with `libvpx-dev` apt-installed
+    /// so the link succeeds. If the probe ever regresses (libvpx
+    /// missing on the build host, encoder init failure on the probe
+    /// dimensions), this test catches it before a session ever
+    /// negotiates onto a broken transport.
     #[cfg(feature = "vp9-444")]
     #[test]
-    fn detect_omits_vp9_444_transport_until_encoder_rewrite() {
+    fn detect_advertises_vp9_444_transport_when_encoder_works() {
         let caps = compute_caps();
         assert!(
-            !caps.transports.iter().any(|t| t == "data-channel-vp9-444"),
-            "vp9-444 transport must stay un-advertised until the libvpx encoder rewrite produces real profile-1 bytes; got {:?}",
+            caps.transports.iter().any(|t| t == "data-channel-vp9-444"),
+            "vp9-444 transport must be advertised when libvpx probe succeeds; got {:?}",
             caps.transports
         );
         assert!(
-            !caps.hw_encoders.iter().any(|e| e == "libvpx-vp9-444-sw"),
-            "libvpx encoder label must stay hidden until rewrite; got {:?}",
+            caps.hw_encoders.iter().any(|e| e == "libvpx-vp9-444-sw"),
+            "libvpx encoder label must be advertised when probe succeeds; got {:?}",
             caps.hw_encoders
         );
     }

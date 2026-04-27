@@ -72,13 +72,22 @@ openh264-sys2 = { version = "0.9", optional = true, default-features = false }
 # build pulls in C compilation of libvpx (~30 s first build) and a
 # small bindgen layer. See docs/vp9-444-plan.md for why we pick VP9
 # profile 1 over AV1/HEVC for screen-content 4:4:4.
-# `ffi-generate` runs bindgen against the system libvpx headers at
+#
+# We bind env-libvpx-sys directly rather than going through the
+# `vpx-encode` 0.6 wrapper. `vpx-encode 0.6` hardcodes
+# `VPX_IMG_FMT_I420` in its `encode()` and exposes no Config field
+# for `g_profile` — both blockers for VP9 profile 1 (8-bit 4:4:4).
+# The Y.runtime-encoder rewrite ships `Vp9Encoder` against raw FFI
+# (~150 LOC of unsafe in encode/libvpx.rs) so we can configure
+# I444 input, profile=1, lag-in-frames=0, and screen-content tuning.
+#
+# `generate` runs bindgen against the system libvpx headers at
 # build time instead of using env-libvpx-sys's pre-generated
 # bindings, which only cover libvpx ≤ 1.13.0. Ubuntu 24.04
 # (ubuntu-latest in CI as of 2026) ships libvpx 1.14.0 and the
 # build script panics when no matching pre-generated file is found.
 # bindgen needs libclang at build time; CI installs libclang-dev.
-vpx-encode = { version = "0.6", optional = true, features = ["ffi-generate", "vp9"] }
+env-libvpx-sys = { version = "5.1", optional = true, features = ["generate"] }
 # AVX2 BGRA→I444 colour convert for the VP9 4:4:4 encoder input.
 # Pure SIMD, no FFI, ships its own SSE2 fallback.
 dcv-color-primitives = { version = "0.6", optional = true }
@@ -165,7 +174,7 @@ wgc-capture = ["dep:windows"]
 # DataChannel-bypass video transport (docs/vp9-444-plan.md). Pulls
 # in a C build of libvpx and the dcv_color_primitives SIMD colour
 # converter. ~30 s extra cold build, ~10 s incremental.
-vp9-444 = ["dep:vpx-encode", "dep:dcv-color-primitives"]
+vp9-444 = ["dep:env-libvpx-sys", "dep:dcv-color-primitives"]
 # Enables the enigo-based input injection backend.
 enigo-input = ["dep:enigo"]
 # Enables the clipboard data-channel handler — round-trip text
