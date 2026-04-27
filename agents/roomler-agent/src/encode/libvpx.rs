@@ -409,7 +409,14 @@ impl VideoEncoder for Vp9Encoder {
             // SAFETY: the union variant is `frame` for FRAME_PKT.
             let frame_pkt = unsafe { (*pkt).data.frame };
             let buf = frame_pkt.buf as *const u8;
-            let sz = frame_pkt.sz;
+            // `sz` field width varies across env-libvpx-sys's
+            // pre-generated bindings (u32 on the 1.12 binding used by
+            // the Windows release path; usize on 1.13 + the
+            // bindgen-against-system-headers path used on Linux/macOS).
+            // Cast through usize unconditionally — the value is a byte
+            // count of an encoder packet, no realistic risk of overflow
+            // on 64-bit hosts.
+            let sz = frame_pkt.sz as usize;
             // SAFETY: libvpx guarantees the buffer is at least `sz`
             // bytes long and stays valid until the next encode() call.
             let slice = unsafe { std::slice::from_raw_parts(buf, sz) };
