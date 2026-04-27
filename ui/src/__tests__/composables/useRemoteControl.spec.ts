@@ -17,6 +17,8 @@ import {
   resolutionWireMessage,
   isWebCodecsSupported,
   isVp9_444DecodeSupported,
+  VP9_444_DC_LABEL,
+  VP9_444_DC_OPTIONS,
   shortCodecFromReceiver,
   codecFromSdp,
 } from '@/composables/useRemoteControl'
@@ -669,6 +671,24 @@ describe('isVp9_444DecodeSupported', () => {
       isConfigSupported: async () => { throw new Error('boom') },
     }
     await expect(isVp9_444DecodeSupported()).resolves.toBe(false)
+  })
+})
+
+describe('VP9_444_DC_LABEL + VP9_444_DC_OPTIONS', () => {
+  // The agent's `on_data_channel` arm matches on `"video-bytes"`
+  // exactly (see agents/roomler-agent/src/peer.rs:494). A typo on
+  // either side silently turns the entire VP9-444 path into a
+  // log-only dead end, so lock the value here.
+  it('uses the exact label the agent matches on', () => {
+    expect(VP9_444_DC_LABEL).toBe('video-bytes')
+  })
+
+  // Reliable + ordered: SCTP retransmits dropped chunks (a P-frame
+  // hole would force the decoder to wait for the next IDR), and
+  // libvpx wants frames in encode order. Don't relax these without
+  // also bumping the worker assembler tests.
+  it('uses the reliable + ordered DC profile', () => {
+    expect(VP9_444_DC_OPTIONS).toEqual({ ordered: true })
   })
 })
 
