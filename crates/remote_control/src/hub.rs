@@ -172,6 +172,11 @@ impl Hub {
     /// Creates the session, notifies the agent, returns the new session id.
     /// The caller (WS dispatcher) is expected to follow up by awaiting consent
     /// in a spawned task — see [`Self::run_consent_flow`].
+    // Each new field on `rc:session.request` lands as another arg
+    // here. Clippy's 7-arg threshold is conservative for an internal
+    // helper whose call sites are exhaustive; allowing it is cheaper
+    // than building a builder we'd never use elsewhere.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_session(
         &self,
         agent_id: ObjectId,
@@ -180,6 +185,7 @@ impl Hub {
         controller_tx: ClientTx,
         permissions: Permissions,
         browser_caps: Vec<String>,
+        preferred_transport: Option<String>,
     ) -> Result<ObjectId> {
         let agent_org = {
             let mut agent = self
@@ -223,6 +229,7 @@ impl Hub {
             permissions,
             consent_timeout_secs: DEFAULT_CONSENT_TIMEOUT.as_secs() as u32,
             browser_caps,
+            preferred_transport,
         });
 
         self.audit(session_id, agent_id, agent_org, AuditKind::SessionRequested);
@@ -479,16 +486,29 @@ impl Hub {
                     agent_id,
                     permissions,
                     browser_caps,
+                    preferred_transport,
                 },
             ) => {
                 // Forward browser codec caps verbatim to the agent in
                 // the ServerMsg::Request envelope. The agent picks the
                 // best intersection with its own AgentCaps and uses it
                 // to choose the encoder + advertise the codec in SDP.
+                // `preferred_transport` (Phase Y.3) is forwarded the
+                // same way; the agent matches it against its own
+                // AgentCaps.transports and decides whether to honour
+                // or fall back to the WebRTC video track.
                 let user_id = ctx.user_id.ok_or(Error::PermissionDenied("no user"))?;
                 let name = ctx.controller_name.clone().unwrap_or_default();
                 let tx = ctx.controller_tx.clone().ok_or(Error::SendFailed)?;
-                self.create_session(agent_id, user_id, name, tx, permissions, browser_caps)?;
+                self.create_session(
+                    agent_id,
+                    user_id,
+                    name,
+                    tx,
+                    permissions,
+                    browser_caps,
+                    preferred_transport,
+                )?;
                 Ok(())
             }
             (Role::Controller, ClientMsg::SdpOffer { session_id, sdp }) => {
@@ -559,6 +579,7 @@ mod tests {
             tx,
             Permissions::default(),
             Vec::new(),
+            None,
         );
         assert!(matches!(res, Err(Error::AgentOffline(_))));
     }
@@ -578,6 +599,7 @@ mod tests {
                 ctl_tx,
                 Permissions::default(),
                 Vec::new(),
+                None,
             )
             .unwrap();
 
