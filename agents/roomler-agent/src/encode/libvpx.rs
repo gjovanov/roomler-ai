@@ -133,14 +133,18 @@ impl Vp9Encoder {
         }
         use dcv_color_primitives as dcv;
         // dcv pairs each pixel format with the colour space the
-        // pixels are interpreted in. BGRA samples are linear sRGB
-        // (Lrgb); only the YUV planes get a luma/chroma colour
-        // space (Bt601 here). Pairing BGRA with Bt601 fails
-        // validation with `InvalidValue`. Caught by the libvpx
-        // unit test under CI; see test panic at libvpx.rs:270.
+        // pixels are interpreted in. BGRA samples are gamma-
+        // corrected sRGB (`ColorSpace::Rgb` in dcv's vocabulary —
+        // confusingly named, but it's the gamma-encoded R'G'B'
+        // variant per the doc comment in
+        // dcv-color-primitives/src/color_space.rs). Only the YUV
+        // planes get a luma/chroma colour space (Bt601 here).
+        // Pairing BGRA with Bt601 (or with the non-existent
+        // `Lrgb`) fails validation with `InvalidValue`. Caught by
+        // the libvpx unit test under CI.
         let src_format = dcv::ImageFormat {
             pixel_format: dcv::PixelFormat::Bgra,
-            color_space: dcv::ColorSpace::Lrgb,
+            color_space: dcv::ColorSpace::Rgb,
             num_planes: 1,
         };
         let dst_format = dcv::ImageFormat {
