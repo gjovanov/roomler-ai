@@ -56,18 +56,21 @@ jobs:
       - name: Check agent --features vp9-444
         run: cargo check -p roomler-agent --features vp9-444
 
-      - name: Test agent wire format under vp9-444
-        # Runs the 3 video_bytes wire-format tests (lock byte
-        # layout against the worker parser) under the feature
-        # flag. The libvpx encoder tests are intentionally NOT
-        # exercised here yet — `vpx-encode` 0.6 hardcodes
-        # `VPX_IMG_FMT_I420` in its `encode()` and exposes no way
-        # to set `g_profile=1`, so the current Vp9Encoder produces
-        # VP9 profile 0 (4:2:0) bytes that don't match the
-        # browser decoder's profile-1 (4:4:4) configuration.
-        # Encoder rewrite against `env-libvpx-sys` directly is
-        # tracked as remaining-work item Y.runtime-encoder.
-        run: cargo test -p roomler-agent --features vp9-444 --lib -- video_bytes_wire
+      - name: Test agent under vp9-444
+        # Runs the full `--features vp9-444` lib test suite:
+        #   - 3 video_bytes wire-format tests (byte layout lock
+        #     against the worker parser)
+        #   - libvpx encoder tests: first-frame-keyframe lock +
+        #     odd-dim rejection. These exercise the
+        #     env-libvpx-sys-direct rewrite (Y.runtime-encoder,
+        #     0.1.47) — vpx_codec_enc_init_ver with g_profile=1,
+        #     g_lag_in_frames=0, VPX_IMG_FMT_I444. Without the
+        #     rewrite the keyframe test would fail because
+        #     `vpx-encode 0.6` hardcoded I420 + buffered the first
+        #     ~25 frames behind a non-zero default g_lag_in_frames.
+        #   - caps probe assertions: detect_advertises_vp9_444_*
+        #     locks the rc:agent.hello advertisement contract.
+        run: cargo test -p roomler-agent --features vp9-444 --lib
 
   frontend:
     name: Frontend checks

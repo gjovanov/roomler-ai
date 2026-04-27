@@ -166,56 +166,79 @@ CI release runners (`release-agent.yml`) must add these to their
 install steps before building with `--features vp9-444`. Default
 production builds still target `full-hw` and don't pull libvpx.
 
-## Status (2026-04-27)
+## Status (2026-04-27, post Y.runtime-encoder, 0.1.47)
 
 | Phase | Plumbing | Tested | Field-usable |
 |---|---|---|---|
-| Y.1 — Encoder backend | ✅ scaffold | ✅ build, ❌ runtime | ❌ blocked |
+| Y.1 — Encoder backend | ✅ | ✅ build, ✅ runtime | ✅ |
 | Y.2 — Decoder worker | ✅ | ✅ | ✅ |
 | Y.3 — Transport plumbing | ✅ both ends | ✅ wire, e2e, integration | ✅ |
-| Y.4 — Caps + UI | ✅ | ✅ | ❌ caps-suppressed |
+| Y.4 — Caps + UI | ✅ | ✅ | ✅ caps-advertising |
 | Y.5 — View canvas mount | ✅ | ✅ | ✅ |
 
-**What works**: All wire format, signalling, browser worker, DC
-plumbing, agent media-pump branch, view canvas mount, toolbar
-toggle, e2e harness. 12-frame VP9 round-trip via the e2e harness
-proves the receive side end-to-end (using WebCodecs VP9 profile 0
-since Chromium WebCodecs lacks a profile-1 *encoder* — production
-agent would supply real profile-1 bitstream).
+**What works**: full pipeline. Wire format, signalling, browser
+worker, DC plumbing, agent media-pump branch, view canvas mount,
+toolbar toggle, e2e harness, **and** a working VP9 profile 1
+(8-bit 4:4:4) libvpx encoder bound directly against
+`env-libvpx-sys` (drop-in replacement for the `vpx-encode 0.6`
+wrapper, which couldn't reach profile 1 — see Y.runtime-encoder
+below for the rationale).
 
-**What's blocked**: The `vpx-encode 0.6` wrapper hardcodes
-`VPX_IMG_FMT_I420` in its encode() and exposes no Config field for
-`g_profile`. Result: `Vp9Encoder` produces VP9 profile 0 (4:2:0)
-bytes that the browser's profile-1 decoder rejects. Even the 4:2:0
-fallback never emits packets without explicit flush because
-default `g_lag_in_frames` buffers ~25 frames.
+Caps probe re-enabled: an agent compiled with `--features
+vp9-444` advertises `data-channel-vp9-444` in `rc:agent.hello`
+when the libvpx probe activates at startup; browser unlocks the
+"Crystal-clear (VP9 4:4:4)" toolbar toggle when the negotiated
+session has the transport set.
 
-Caps probe disabled in agent so no session ever negotiates onto
-the broken transport (encode/caps.rs `compute_caps`). Wire format
-+ unit-tested plumbing stays live, just unconnected from a
-working encoder.
+### Y.runtime-encoder (LANDED 0.1.47)
 
-### Y.runtime-encoder — remaining work
+Why it was needed: `vpx-encode 0.6` hardcoded `VPX_IMG_FMT_I420`
+in its `encode()` and exposed no Config field for `g_profile`.
+Result was `Vp9Encoder` would produce VP9 profile 0 (4:2:0) bytes
+that the browser's profile-1 decoder rejects, and even the 4:2:0
+fallback never emitted packets on first encode because the
+default `g_lag_in_frames` buffered ~25 frames silently.
 
-Rewrite `agents/roomler-agent/src/encode/libvpx.rs` against
-`env-libvpx-sys` directly (drop `vpx-encode 0.6` dependency):
+Rewrite shape (~250 LOC of unsafe FFI in
+`agents/roomler-agent/src/encode/libvpx.rs`):
 
-  - `vpx_codec_enc_config_default(vp9_iface, &cfg)` then set
+  - Drop `vpx-encode 0.6` dep, add `env-libvpx-sys = "5.1"` with
+    the `generate` feature (bindgen against system libvpx headers
+    so libvpx 1.14 on Ubuntu 24.04 works without the
+    pre-generated bindings panic)
+  - `vpx_codec_enc_config_default(vp9_iface, &cfg)` then override:
     `cfg.g_profile = 1`, `cfg.g_lag_in_frames = 0`,
-    `cfg.g_bit_depth = VPX_BITS_8`, `cfg.g_input_bit_depth = 8`
-  - `vpx_codec_enc_init_ver(&ctx, vp9_iface, &cfg, 0, ABI)`
-  - `vpx_codec_control(&ctx, VP9E_SET_TUNE_CONTENT, VP9E_CONTENT_SCREEN)`
-  - `vpx_codec_control(&ctx, VP8E_SET_CPUUSED, 8)` (fastest preset)
-  - `vpx_img_wrap(&img, VPX_IMG_FMT_I444, w, h, 1, plane_buf)`
-  - `vpx_codec_encode(&ctx, &img, pts, 1, flags, VPX_DL_REALTIME)`
-  - drain via `vpx_codec_get_cx_data(&ctx, &iter)` until null
+    `cfg.g_bit_depth = VPX_BITS_8`, `cfg.g_input_bit_depth = 8`,
+    `cfg.rc_end_usage = VPX_CBR`, `cfg.kf_max_dist = 240`
+  - `vpx_codec_enc_init_ver(&ctx, iface, &cfg, 0, ABI_VERSION)`
+  - Apply controls: `VP8E_SET_CPUUSED=8`,
+    `VP9E_SET_TUNE_CONTENT=VP9E_CONTENT_SCREEN`,
+    `VP9E_SET_AQ_MODE=0`, `VP9E_SET_TILE_COLUMNS=2`,
+    `VP9E_SET_FRAME_PARALLEL_DECODING=1`,
+    `VP8E_SET_STATIC_THRESHOLD=100`,
+    `VP9E_SET_NOISE_SENSITIVITY=0`
+  - Per-frame: build `vpx_image_t` manually with three plane
+    pointers (`VPX_IMG_FMT_I444`, x_chroma_shift=0,
+    y_chroma_shift=0, bps=24), pass `VPX_EFLAG_FORCE_KF` on first
+    frame + on `request_keyframe`, drain with
+    `vpx_codec_get_cx_data` until null pointer
+  - `vpx_codec_destroy` in Drop
+  - Runtime bitrate: mutate `cfg.rc_target_bitrate`, push back
+    via `vpx_codec_enc_config_set` (the `vpx-encode 0.6` wrapper
+    didn't expose this either — `set_bitrate` was a no-op)
 
-~150 LOC. Once landed:
-  1. Re-enable caps advertisement in `compute_caps`
-  2. Remove `#[ignore]` from `first_frame_is_keyframe`
-  3. Re-add libvpx test pattern to ci.yml's vp9-444 job
-  4. Field test: build with `--features full,vp9-444`, click toggle,
-     verify `VP9-444 DC pump heartbeat … frames_sent=N` log line.
+Verification: lib test `first_frame_is_keyframe` (was
+`#[ignore]`d under the old wrapper) now activates the encoder at
+320×240, encodes one synthetic frame, asserts at least one
+non-empty packet flagged keyframe. CI runs the full
+`--features vp9-444 --lib` pass on Ubuntu with `libvpx-dev` apt-
+installed; `detect_advertises_vp9_444_transport_when_encoder_works`
+locks the agent.hello advertisement contract.
+
+Field test: build with `--features full,vp9-444`, run on
+controlled host, click toolbar toggle in browser, verify
+`VP9-444 DC pump heartbeat … frames_sent=N` heartbeat in agent
+log.
 
 ## Phasing
 
