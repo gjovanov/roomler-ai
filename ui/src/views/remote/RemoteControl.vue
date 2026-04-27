@@ -303,7 +303,7 @@
              math hang off `rc.mediaIntrinsicW/H` which the composable
              keeps in sync either way. -->
         <video
-          v-show="!isWebCodecsRender"
+          v-show="!isWebCodecsRender && !isVp9_444Render"
           ref="videoEl"
           autoplay
           playsinline
@@ -322,6 +322,22 @@
           v-if="isWebCodecsRender"
           :ref="bindWebcodecsCanvas"
           class="remote-video webcodecs-canvas"
+          :class="`scale-${rc.scaleMode.value}`"
+          :style="videoScaleStyle"
+        />
+        <!-- Phase Y.4 render path: canvas fed by the VP9-444 worker
+             over a `video-bytes` DataChannel (no WebRTC video track,
+             no RTCRtpScriptTransform). Mounts when the composable's
+             `vp9_444Active` flag flips true (DC opened + worker
+             initialised). The composable's watcher transfers control
+             of this canvas to the worker via `transferControlToOffscreen`,
+             replacing the synthetic OffscreenCanvas it started with.
+             Same scale classes + style as the video for layout
+             parity. -->
+        <canvas
+          v-if="isVp9_444Render"
+          :ref="bindVp9_444Canvas"
+          class="remote-video vp9-444-canvas"
           :class="`scale-${rc.scaleMode.value}`"
           :style="videoScaleStyle"
         />
@@ -657,6 +673,23 @@ function toggleVp9_444() {
  *  writable canvas ref so `pc.ontrack` can see it. */
 function bindWebcodecsCanvas(el: Element | unknown) {
   rc.webcodecsCanvasEl.value = (el as HTMLCanvasElement | null) ?? null
+}
+
+// Phase Y.4 view-side render gate. Flips true when the composable
+// has opened the `video-bytes` DC AND spun up the VP9-444 worker
+// (Y.3 sets `vp9_444Active` in `startVp9_444Path()`). Drives the
+// template `<canvas>` swap below — the legacy `<video>` element
+// stays hidden in this mode because the agent doesn't ship a
+// WebRTC video track when the negotiated transport is
+// `data-channel-vp9-444`.
+const isVp9_444Render = computed<boolean>(() => rc.vp9_444Active.value)
+/** Bind callback for the VP9-444 canvas. The composable's watcher
+ *  on `vp9_444CanvasEl` transfers OffscreenCanvas control to the
+ *  worker as soon as we set the ref, replacing the synthetic
+ *  OffscreenCanvas the worker started with so decoded frames land
+ *  on the visible element. */
+function bindVp9_444Canvas(el: Element | unknown) {
+  rc.vp9_444CanvasEl.value = (el as HTMLCanvasElement | null) ?? null
 }
 
 // Fullscreen toggle. Drives the stage element into/out of the browser's
