@@ -115,6 +115,14 @@ fn compute_caps() -> AgentCaps {
         }
     }
 
+    let mut transports: Vec<String> = Vec::new();
+    if cfg!(feature = "vp9-444") {
+        // Phase Y plumbing — when the libvpx encoder is compiled in,
+        // we can offer the 4:4:4 transport. The actual session-level
+        // negotiation + media_pump branch lives in Y.3 (peer.rs).
+        transports.push("data-channel-vp9-444".into());
+    }
+
     AgentCaps {
         hw_encoders,
         codecs,
@@ -122,6 +130,7 @@ fn compute_caps() -> AgentCaps {
         supports_clipboard: cfg!(feature = "clipboard"),
         supports_file_transfer: true,
         max_simultaneous_sessions: 1,
+        transports,
     }
 }
 

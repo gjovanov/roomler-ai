@@ -42,6 +42,19 @@ pub struct AgentCaps {
     pub supports_clipboard: bool,
     pub supports_file_transfer: bool,
     pub max_simultaneous_sessions: u8,
+    /// Video transport modes the agent supports beyond the default
+    /// WebRTC video track. Empty / unset means WebRTC video only
+    /// (the legacy default; older agents that don't know about
+    /// this field deserialize that way via serde default).
+    ///
+    /// Known value: `data-channel-vp9-444` — VP9 profile 1
+    /// (8-bit 4:4:4) frames over an RTCDataChannel named
+    /// `video-bytes`. Bypasses the browser's WebRTC video pipeline
+    /// which enforces 4:2:0 across every codec. See
+    /// `docs/vp9-444-plan.md` for the rationale and the wire
+    /// format spec.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transports: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
