@@ -16,6 +16,7 @@ import {
   filterCapsByPreference,
   resolutionWireMessage,
   isWebCodecsSupported,
+  isVp9_444DecodeSupported,
   shortCodecFromReceiver,
   codecFromSdp,
 } from '@/composables/useRemoteControl'
@@ -622,6 +623,52 @@ describe('isWebCodecsSupported', () => {
     ;(globalThis as unknown as Record<string, unknown>).RTCRtpScriptTransform = function RTCRtpScriptTransform() {}
     ;(globalThis as unknown as Record<string, unknown>).VideoDecoder = function VideoDecoder() {}
     expect(isWebCodecsSupported()).toBe(true)
+  })
+})
+
+describe('isVp9_444DecodeSupported', () => {
+  const originalDecoder = (globalThis as unknown as { VideoDecoder?: unknown }).VideoDecoder
+  afterAll(() => {
+    ;(globalThis as unknown as Record<string, unknown>).VideoDecoder = originalDecoder
+  })
+
+  it('returns false when VideoDecoder is missing (Firefox / older Safari)', async () => {
+    delete (globalThis as unknown as Record<string, unknown>).VideoDecoder
+    await expect(isVp9_444DecodeSupported()).resolves.toBe(false)
+  })
+
+  it('returns false when VideoDecoder lacks isConfigSupported', async () => {
+    ;(globalThis as unknown as Record<string, unknown>).VideoDecoder = function VideoDecoder() {}
+    await expect(isVp9_444DecodeSupported()).resolves.toBe(false)
+  })
+
+  it('queries isConfigSupported with the canonical VP9 profile 1 8-bit codec string and returns its supported flag', async () => {
+    let observedCodec = ''
+    ;(globalThis as unknown as Record<string, unknown>).VideoDecoder = {
+      isConfigSupported: async (cfg: { codec: string }) => {
+        observedCodec = cfg.codec
+        return { supported: true }
+      },
+    }
+    await expect(isVp9_444DecodeSupported()).resolves.toBe(true)
+    // vp09.<profile=01>.<level=10>.<bit_depth=08> — Profile 1 is the
+    // 4:4:4 path; locking the exact string keeps the worker's
+    // VideoDecoder.configure call in lockstep with this probe.
+    expect(observedCodec).toBe('vp09.01.10.08')
+  })
+
+  it('returns false when isConfigSupported reports unsupported', async () => {
+    ;(globalThis as unknown as Record<string, unknown>).VideoDecoder = {
+      isConfigSupported: async () => ({ supported: false }),
+    }
+    await expect(isVp9_444DecodeSupported()).resolves.toBe(false)
+  })
+
+  it('swallows isConfigSupported throws and returns false', async () => {
+    ;(globalThis as unknown as Record<string, unknown>).VideoDecoder = {
+      isConfigSupported: async () => { throw new Error('boom') },
+    }
+    await expect(isVp9_444DecodeSupported()).resolves.toBe(false)
   })
 })
 

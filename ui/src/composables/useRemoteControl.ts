@@ -296,6 +296,63 @@ export function isWebCodecsSupported(): boolean {
     && typeof g.VideoDecoder === 'function'
 }
 
+/** Which video transport the viewer prefers for inbound frames.
+ *  - `webrtc`: classic WebRTC video track. The default. Works on
+ *    every browser; pixels go through Chrome's chroma-subsampled
+ *    (4:2:0) decode path for every codec.
+ *  - `data-channel-vp9-444`: VP9 profile 1 (8-bit 4:4:4) frames over
+ *    an RTCDataChannel named `video-bytes`, decoded with WebCodecs
+ *    `VideoDecoder` and painted to a canvas. Bypasses the WebRTC
+ *    pipeline's 4:2:0 enforcement so screen-content text stays
+ *    crisp. Requires `VideoDecoder.isConfigSupported({codec:
+ *    'vp09.01.10.08'})` and an agent that advertises
+ *    `data-channel-vp9-444` in its `AgentCaps.transports`. Falls
+ *    back to `webrtc` silently when either side lacks support.
+ *    Takes effect on the next `connect()`. */
+export type RcVideoTransport = 'webrtc' | 'data-channel-vp9-444'
+
+const VIDEO_TRANSPORT_STORAGE_KEY = 'roomler-rc-video-transport'
+
+function readStoredVideoTransport(): RcVideoTransport {
+  try {
+    const raw = globalThis.localStorage?.getItem(VIDEO_TRANSPORT_STORAGE_KEY)
+    if (raw === 'data-channel-vp9-444' || raw === 'webrtc') return raw
+  } catch {
+    /* privacy mode → default */
+  }
+  return 'webrtc'
+}
+
+function persistVideoTransport(t: RcVideoTransport) {
+  try {
+    globalThis.localStorage?.setItem(VIDEO_TRANSPORT_STORAGE_KEY, t)
+  } catch {
+    /* best-effort */
+  }
+}
+
+/** Feature-detect VP9 profile 1 (8-bit 4:4:4) decode via WebCodecs.
+ *  Returns `false` synchronously when the browser has no
+ *  `VideoDecoder` at all; otherwise calls `isConfigSupported` and
+ *  awaits the answer. Codec string is the WebCodecs canonical form
+ *  for VP9 profile 1, bit depth 8 (`vp09.<profile>.<level>.<bit>`).
+ *
+ *  Exported for tests so the codec string is locked alongside the
+ *  worker's `VideoDecoder.configure` call. */
+export async function isVp9_444DecodeSupported(): Promise<boolean> {
+  const g = globalThis as unknown as {
+    VideoDecoder?: { isConfigSupported?: (cfg: { codec: string }) => Promise<{ supported?: boolean }> }
+  }
+  const isConfigSupported = g.VideoDecoder?.isConfigSupported
+  if (typeof isConfigSupported !== 'function') return false
+  try {
+    const res = await isConfigSupported({ codec: 'vp09.01.10.08' })
+    return res?.supported === true
+  } catch {
+    return false
+  }
+}
+
 /** Short codec name to pass into `new RTCRtpScriptTransform(worker,
  *  { codec })`. Reads the first negotiated codec off
  *  `RTCRtpReceiver.getParameters().codecs` and maps it back to our
@@ -437,6 +494,25 @@ export function useRemoteControl() {
    *  path that bypasses it. Persisted per-browser; defaults to `video`
    *  so the feature stays opt-in while we bed it in. */
   const renderPath = ref<RcRenderPath>(readStoredRenderPath())
+  /** Preferred video transport. `webrtc` is the legacy default; the
+   *  user opts in to `data-channel-vp9-444` when they want crystal-
+   *  clear 4:4:4 text rendering. The actual negotiation is done on
+   *  the agent: this ref is only consulted at `connect()` time, the
+   *  agent reads `preferred_transport` and intersects it with its
+   *  own `AgentCaps.transports`. Persisted per-browser. */
+  const videoTransport = ref<RcVideoTransport>(readStoredVideoTransport())
+  /** Whether VP9 profile 1 (8-bit 4:4:4) decode is supported on this
+   *  browser. Resolved asynchronously by `isVp9_444DecodeSupported()`
+   *  in `connect()` (and re-checked once on first composable use, so
+   *  the UI can disable the toolbar toggle when unsupported). The UI
+   *  reads this; an unset/false value means the data-channel transport
+   *  is unavailable regardless of the user's stored preference. */
+  const vp9_444Supported = ref<boolean>(false)
+  // Kick off the async probe immediately. We only need the answer at
+  // connect() time so the await isn't latency-critical, but resolving
+  // it eagerly lets the UI disable the toolbar toggle on browsers
+  // that lack VP9 profile 1 support.
+  void isVp9_444DecodeSupported().then((ok) => { vp9_444Supported.value = ok })
   /** Whether this browser actually supports the WebCodecs path. UI
    *  reads this to disable the toggle when the APIs aren't present
    *  (Firefox, Safari < 17, old Chromium). */
@@ -598,6 +674,18 @@ export function useRemoteControl() {
     const next = p === 'webcodecs' && !webcodecsSupported.value ? 'video' : p
     renderPath.value = next
     persistRenderPath(next)
+  }
+
+  /** Switch video transport. Only takes effect on the next `connect()`
+   *  — the choice is baked into the rc:session.request payload. If the
+   *  caller asks for `data-channel-vp9-444` but `vp9_444Supported` is
+   *  false (older browser, or the async probe hasn't resolved yet),
+   *  we still persist the preference so the toggle reflects the user
+   *  intent; the actual transport negotiation falls back to webrtc
+   *  on the agent side when its caps don't include the field. */
+  function setVideoTransport(t: RcVideoTransport) {
+    videoTransport.value = t
+    persistVideoTransport(t)
   }
 
   /** Install the receiver transform EAGERLY (at pc.ontrack time) so
@@ -1197,15 +1285,43 @@ export function useRemoteControl() {
     // teardown() stops + clears it.
     startStatsPoll()
 
+    // Resolve VP9-444 decode support before sending the request so
+    // we only advertise `data-channel-vp9-444` when the browser can
+    // actually decode it. The eager probe in the composable ctor
+    // has likely already resolved by now, but await once more in
+    // case `connect()` runs on first paint. Falling back silently
+    // to webrtc when the user opted in but the browser lacks
+    // support keeps the UX boring rather than broken.
+    let preferredTransport: RcVideoTransport | null = null
+    if (videoTransport.value === 'data-channel-vp9-444') {
+      const supported = vp9_444Supported.value || (await isVp9_444DecodeSupported())
+      vp9_444Supported.value = supported
+      if (supported) {
+        preferredTransport = 'data-channel-vp9-444'
+      } else {
+        console.info(
+          '[rc] preferred_transport=data-channel-vp9-444 dropped — VideoDecoder.isConfigSupported(vp09.01.10.08) returned false. Falling back to webrtc.',
+        )
+      }
+    }
+
     // Kick off the rc:* handshake. browser_caps lets the agent pick
     // the best codec on its end (Phase 2 commit 2B.2 wires the
     // intersection logic + SDP munging on the agent side).
-    ws.sendRaw({
+    // preferred_transport (Phase Y.3) hints which transport the
+    // browser would like to use; the agent honours it only if its
+    // own AgentCaps.transports contains the same entry, otherwise
+    // falls back to the legacy WebRTC video track silently.
+    const requestPayload: Record<string, unknown> = {
       t: 'rc:session.request',
       agent_id: agentId,
       permissions,
       browser_caps: browserCaps,
-    })
+    }
+    if (preferredTransport) {
+      requestPayload.preferred_transport = preferredTransport
+    }
+    ws.sendRaw(requestPayload)
   }
 
   function disconnect() {
@@ -1548,6 +1664,9 @@ export function useRemoteControl() {
     webcodecsCanvasEl,
     mediaIntrinsicW,
     mediaIntrinsicH,
+    videoTransport,
+    setVideoTransport,
+    vp9_444Supported,
   }
 }
 
