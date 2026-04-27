@@ -405,8 +405,14 @@ jobs:
         # Windows is upstream-only-on-1.16, so brew's 1.15 works).
         run: brew install cmake libvpx pkg-config
 
-      - name: Build agent (release, full + vp9-444)
-        run: cargo build -p roomler-agent --release --features "full,vp9-444" --target aarch64-apple-darwin
+      - name: Build agent (release, full + vp9-444 + vp9-444-bindgen)
+        # `vp9-444-bindgen` runs bindgen against brew's libvpx 1.16
+        # headers — env-libvpx-sys's pre-generated bindings only cover
+        # 1.13.0, so without bindgen the build script panics looking
+        # for `generated/vpx-ffi-1.16.0.rs`. macOS bindgen + libclang
+        # has none of the Windows opaque-struct issue, so this just
+        # works.
+        run: cargo build -p roomler-agent --release --features "full,vp9-444,vp9-444-bindgen" --target aarch64-apple-darwin
 
       - name: Stage .app bundle
         shell: bash
