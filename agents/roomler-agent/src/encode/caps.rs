@@ -27,12 +27,16 @@ use std::sync::OnceLock;
 
 static CACHED_CAPS: OnceLock<AgentCaps> = OnceLock::new();
 
-/// Probe dimensions for the HEVC + AV1 activation check. Even number,
-/// small enough that any HW encoder accepts it, matching what the
-/// internal `probe_pipeline` uses for MFT output verification.
-#[cfg(all(target_os = "windows", feature = "mf-encoder"))]
+/// Probe dimensions for codec activation checks (HEVC, AV1, VP9-444).
+/// Even number, small enough that any encoder accepts it, matching
+/// what the internal `probe_pipeline` uses for MFT output
+/// verification. Used by the MF cascade probes (Windows-only,
+/// `mf-encoder` feature) and the libvpx VP9-444 probe (any platform
+/// with `vp9-444` feature). The `dead_code` allowance covers builds
+/// that compile in neither feature group.
+#[allow(dead_code)]
 const PROBE_WIDTH: u32 = 480;
-#[cfg(all(target_os = "windows", feature = "mf-encoder"))]
+#[allow(dead_code)]
 const PROBE_HEIGHT: u32 = 270;
 
 /// Detect the codecs and HW backends compiled into this agent build
@@ -115,12 +119,35 @@ fn compute_caps() -> AgentCaps {
         }
     }
 
+    #[allow(unused_mut)]
     let mut transports: Vec<String> = Vec::new();
-    if cfg!(feature = "vp9-444") {
-        // Phase Y plumbing — when the libvpx encoder is compiled in,
-        // we can offer the 4:4:4 transport. The actual session-level
-        // negotiation + media_pump branch lives in Y.3 (peer.rs).
-        transports.push("data-channel-vp9-444".into());
+    #[cfg(feature = "vp9-444")]
+    {
+        // Phase Y.4: probe libvpx at startup. The `vp9-444` feature
+        // being COMPILED IN doesn't guarantee runtime success — the
+        // host might lack the linker-resolved libvpx (uncommon since
+        // we vendor + statically link, but possible on stripped
+        // Docker builds), or `vpx-encode` could fail to init at
+        // these dims (older libvpx versions reject some configs).
+        // Mirror the HEVC/AV1 probe-at-startup pattern: instantiate
+        // a tiny encoder, drop it, and only advertise the transport
+        // when init succeeded. Without this guard a browser session
+        // negotiates `data-channel-vp9-444`, the agent's pump
+        // crashes on `Vp9Encoder::new`, and the controller sees a
+        // permanently black canvas.
+        match crate::encode::libvpx::Vp9Encoder::new(PROBE_WIDTH, PROBE_HEIGHT) {
+            Ok(enc) => {
+                drop(enc);
+                transports.push("data-channel-vp9-444".into());
+                hw_encoders.push("libvpx-vp9-444-sw".into());
+                tracing::info!(
+                    "vp9-444 probe: libvpx Vp9Encoder activated; advertising data-channel-vp9-444"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(%e, "vp9-444 probe: Vp9Encoder init failed; not advertising data-channel-vp9-444 transport");
+            }
+        }
     }
 
     AgentCaps {
@@ -307,5 +334,52 @@ mod tests {
             &["h264".into(), "vp9".into()],
         );
         assert_eq!(chosen, "vp9");
+    }
+
+    /// Y.4: in default-feature (no `vp9-444`) builds, the transports
+    /// list must NOT advertise `data-channel-vp9-444`. The browser
+    /// reads this list to decide whether to even open the DC; an
+    /// agent that lies about transport support would crash the
+    /// session at media-pump time.
+    #[cfg(not(feature = "vp9-444"))]
+    #[test]
+    fn detect_omits_vp9_444_transport_when_feature_disabled() {
+        let caps = compute_caps();
+        assert!(
+            !caps.transports.iter().any(|t| t == "data-channel-vp9-444"),
+            "default-feature build advertised vp9-444 transport: {:?}",
+            caps.transports
+        );
+        assert!(
+            !caps.hw_encoders.iter().any(|e| e == "libvpx-vp9-444-sw"),
+            "default-feature build advertised libvpx encoder: {:?}",
+            caps.hw_encoders
+        );
+    }
+
+    /// Y.4: in `vp9-444`-feature builds, the transport advertisement
+    /// is gated on a successful `Vp9Encoder::new` activation —
+    /// mirrors the HEVC/AV1 probe-at-startup pattern. The probe runs
+    /// at 480×270; if libvpx links cleanly, it activates and the
+    /// transport ships. The unit test uses the public `detect()`
+    /// entry point so the OnceLock cache + advertise logic both
+    /// participate.
+    #[cfg(feature = "vp9-444")]
+    #[test]
+    fn detect_advertises_vp9_444_when_libvpx_activates() {
+        let caps = compute_caps();
+        // We can't be 100% sure libvpx links on every CI lane (e.g.
+        // a stripped Docker image with no libvpx system lib). What
+        // we CAN assert is that the advertisement is NOT
+        // unconditional: either the transport AND the encoder label
+        // both ship, or neither ships. A half-advertised state
+        // would mean the advertise side disagreed with the probe.
+        let transport_advertised = caps.transports.iter().any(|t| t == "data-channel-vp9-444");
+        let encoder_advertised = caps.hw_encoders.iter().any(|e| e == "libvpx-vp9-444-sw");
+        assert_eq!(
+            transport_advertised, encoder_advertised,
+            "transport vs encoder advertisement out of sync — caps: {:?}",
+            caps
+        );
     }
 }

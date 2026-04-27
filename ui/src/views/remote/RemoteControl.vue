@@ -192,6 +192,28 @@
       >
         <v-icon>{{ isFullscreen ? 'mdi-fullscreen-exit' : 'mdi-fullscreen' }}</v-icon>
       </v-btn>
+      <!-- Crystal-clear (VP9 4:4:4) toggle. When the agent advertises
+           the `data-channel-vp9-444` transport AND the browser can
+           decode VP9 profile 1, this routes encoded frames over an
+           RTCDataChannel + WebCodecs canvas instead of the WebRTC
+           video track. Bypasses Chrome's 4:2:0 chroma subsampling so
+           text stays crisp. Takes effect on the next Connect.
+           Disabled when the browser lacks VP9-444 decode (older
+           Chrome / non-Chromium browsers). -->
+      <v-btn
+        icon
+        variant="text"
+        size="small"
+        class="mr-2"
+        :color="vp9_444On ? 'primary' : undefined"
+        :disabled="!rc.vp9_444Supported.value"
+        :aria-label="vp9_444On ? 'Disable crystal-clear (VP9 4:4:4) path' : 'Enable crystal-clear (VP9 4:4:4) path'"
+        :title="vp9_444Tooltip"
+        @click="toggleVp9_444"
+      >
+        <v-icon>{{ vp9_444On ? 'mdi-format-color-fill' : 'mdi-format-color-marker-cancel' }}</v-icon>
+      </v-btn>
+
       <!-- Low-latency (WebCodecs) toggle. When supported + enabled, the
            viewer uses a Web Worker + VideoDecoder + canvas render path
            that bypasses Chrome's built-in jitter buffer (~80 ms soft
@@ -430,6 +452,7 @@ import {
   type RcScaleMode,
   type RcResolutionSetting,
   type RcRenderPath,
+  type RcVideoTransport,
 } from '@/composables/useRemoteControl'
 import { useSnackbar } from '@/composables/useSnackbar'
 
@@ -602,6 +625,32 @@ const webcodecsTooltip = computed<string>(() => {
 function toggleWebCodecs() {
   const next: RcRenderPath = webcodecsOn.value ? 'video' : 'webcodecs'
   rc.setRenderPath(next)
+}
+
+// Phase Y.4: VP9 4:4:4 over DataChannel toggle. The composable's
+// `videoTransport` ref persists the choice across reloads;
+// `vp9_444Supported` is true only when the browser exposes
+// `VideoDecoder.isConfigSupported({codec:'vp09.01.10.08'})`. The
+// agent honours the preference only when its caps probe passed
+// (libvpx Vp9Encoder activated successfully at startup); otherwise
+// the session silently falls back to the legacy WebRTC video
+// transport. Takes effect on the next Connect — switching mid-
+// session would require tearing down + rebuilding the entire
+// PC, which is more disruptive than "reconnect to apply".
+const vp9_444On = computed<boolean>(
+  () => rc.videoTransport.value === 'data-channel-vp9-444',
+)
+const vp9_444Tooltip = computed<string>(() => {
+  if (!rc.vp9_444Supported.value) {
+    return 'Crystal-clear (VP9 4:4:4) requires WebCodecs VideoDecoder vp09.01.10.08 — not supported in this browser'
+  }
+  return vp9_444On.value
+    ? 'Crystal-clear (VP9 4:4:4) ON — bypasses Chrome\'s 4:2:0 video pipeline. Takes effect on next Connect.'
+    : 'Crystal-clear (VP9 4:4:4) OFF — using standard WebRTC video transport'
+})
+function toggleVp9_444() {
+  const next: RcVideoTransport = vp9_444On.value ? 'webrtc' : 'data-channel-vp9-444'
+  rc.setVideoTransport(next)
 }
 /** Bind callback for the webcodecs canvas ref. Vue calls this with
  *  the element (or null on unmount) — we forward to the composable's
