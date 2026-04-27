@@ -78,7 +78,7 @@ openh264-sys2 = { version = "0.9", optional = true, default-features = false }
 # (ubuntu-latest in CI as of 2026) ships libvpx 1.14.0 and the
 # build script panics when no matching pre-generated file is found.
 # bindgen needs libclang at build time; CI installs libclang-dev.
-vpx-encode = { version = "0.6", optional = true, features = ["ffi-generate"] }
+vpx-encode = { version = "0.6", optional = true, features = ["ffi-generate", "vp9"] }
 # AVX2 BGRA→I444 colour convert for the VP9 4:4:4 encoder input.
 # Pure SIMD, no FFI, ships its own SSE2 fallback.
 dcv-color-primitives = { version = "0.6", optional = true }

@@ -1219,6 +1219,7 @@ async fn media_pump_vp9_444_dc(
     keyframe_requested: Arc<std::sync::atomic::AtomicBool>,
     target_resolution: Arc<std::sync::Mutex<TargetResolution>>,
 ) {
+    use crate::encode::VideoEncoder; // brings encode/request_keyframe into scope
     use crate::encode::libvpx::Vp9Encoder;
 
     // VP9 4:4:4 is heavy CPU; we cap fps to 30 right out of the gate.
