@@ -20,6 +20,7 @@ import {
   codecFromSdp,
 } from '@/composables/useRemoteControl'
 import { codecMimeForShort } from '@/workers/rc-webcodecs-worker'
+import { parseFrameHeader, isKeyframe } from '@/workers/rc-vp9-444-worker'
 
 function keyEvent(code: string, mods: Partial<{ ctrl: boolean; alt: boolean; meta: boolean; shift: boolean }> = {}): KeyboardEvent {
   return {
@@ -719,11 +720,6 @@ describe('codecFromSdp', () => {
 describe('rc-vp9-444-worker frame header', () => {
   // Lock the wire format so any change to the agent-side encoder
   // emit gets caught here. Schema: u32 size LE + u8 flags + u64 ts LE.
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const { parseFrameHeader, isKeyframe } = require('@/workers/rc-vp9-444-worker') as {
-    parseFrameHeader: (buf: Uint8Array) => { payloadSize: number; flags: number; timestampUs: bigint } | null
-    isKeyframe: (flags: number) => boolean
-  }
 
   function buildHeader(size: number, flags: number, ts: bigint): Uint8Array {
     const buf = new Uint8Array(13)
