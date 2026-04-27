@@ -213,6 +213,7 @@ async fn handle_server_msg(
             permissions,
             consent_timeout_secs,
             browser_caps,
+            preferred_transport,
         } => {
             // Pick the best codec for this session from the
             // intersection of (browser-advertised, agent-supported).
@@ -222,11 +223,27 @@ async fn handle_server_msg(
             let our_caps = crate::encode::caps::detect();
             let chosen = crate::encode::caps::pick_best_codec(&browser_caps, &our_caps.codecs);
             pending_codecs.insert(session_id, chosen.clone());
+
+            // Phase Y.3: figure out which video transport this
+            // session will use. Honour `preferred_transport` only if
+            // the agent's own AgentCaps.transports advertises it
+            // (browser × agent intersection). Otherwise fall back to
+            // the WebRTC video track silently — older agents had no
+            // transports field at all.
+            let negotiated_transport = preferred_transport.as_deref().and_then(|t| {
+                if our_caps.transports.iter().any(|s| s == t) {
+                    Some(t.to_string())
+                } else {
+                    None
+                }
+            });
             info!(
                 %session_id, %controller_user_id, %controller_name,
                 ?permissions, consent_timeout_secs,
                 browser_caps = ?browser_caps,
                 chosen_codec = %chosen,
+                requested_transport = ?preferred_transport,
+                negotiated_transport = ?negotiated_transport,
                 "incoming session request — auto-granting (see docs §11.2)"
             );
             // Show the "someone is watching" overlay on the controlled

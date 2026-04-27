@@ -81,6 +81,15 @@ pub enum ClientMsg {
     /// agent's `AgentCaps.codecs` to pick the best codec for the
     /// session. Optional + default-empty so older controllers that
     /// don't include it still get an h264 session.
+    ///
+    /// `preferred_transport` (Phase Y.3) tells the agent which video
+    /// transport the controller wants to use. Recognised values match
+    /// `AgentCaps.transports`: today only `data-channel-vp9-444` is
+    /// defined. `None` / unset means "use the WebRTC video track" —
+    /// the legacy default that all in-flight controllers default to.
+    /// The agent only honours the request when its own caps advertise
+    /// the same transport (browser × agent intersection); otherwise
+    /// it ignores the field and falls back to the WebRTC track.
     #[serde(rename = "rc:session.request")]
     SessionRequest {
         #[serde(with = "oid_hex")]
@@ -88,6 +97,8 @@ pub enum ClientMsg {
         permissions: Permissions,
         #[serde(default)]
         browser_caps: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preferred_transport: Option<String>,
     },
 
     /// Controller sends an SDP offer (after consent granted).
@@ -146,6 +157,13 @@ pub enum ServerMsg {
     /// `AgentCaps.codecs` to pick the best codec for the session.
     /// Empty on controllers that don't advertise — the agent then
     /// defaults to H.264.
+    ///
+    /// `preferred_transport` (Phase Y.3) is also forwarded verbatim.
+    /// `None` / unset means "use the WebRTC video track" (legacy
+    /// default). Recognised values match `AgentCaps.transports` —
+    /// today only `data-channel-vp9-444`. The agent honours the
+    /// request when its caps advertise the same transport, else
+    /// falls back to the WebRTC track silently.
     #[serde(rename = "rc:request")]
     Request {
         #[serde(with = "oid_hex")]
@@ -157,6 +175,8 @@ pub enum ServerMsg {
         consent_timeout_secs: u32,
         #[serde(default)]
         browser_caps: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preferred_transport: Option<String>,
     },
 
     /// Server forwards SDP offer from controller → agent.
@@ -271,11 +291,28 @@ mod tests {
             agent_id,
             permissions: Permissions::VIEW | Permissions::INPUT,
             browser_caps: vec!["h264".into(), "h265".into()],
+            preferred_transport: None,
         };
         let s = serde_json::to_string(&req).unwrap();
         assert!(!s.contains("$oid"));
         assert!(s.contains("\"agent_id\":\"507f1f77bcf86cd799439012\""));
         assert!(s.contains("\"browser_caps\":[\"h264\",\"h265\"]"));
+        // Default None must NOT serialise — keeps the wire compatible
+        // with controllers that don't know about the field at all.
+        assert!(
+            !s.contains("preferred_transport"),
+            "None should be skipped via skip_serializing_if"
+        );
+
+        // With a value set, the field appears
+        let req_with_t = ClientMsg::SessionRequest {
+            agent_id,
+            permissions: Permissions::VIEW,
+            browser_caps: vec![],
+            preferred_transport: Some("data-channel-vp9-444".into()),
+        };
+        let s = serde_json::to_string(&req_with_t).unwrap();
+        assert!(s.contains("\"preferred_transport\":\"data-channel-vp9-444\""));
     }
 
     #[test]
