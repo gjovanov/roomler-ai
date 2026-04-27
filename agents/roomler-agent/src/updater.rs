@@ -25,6 +25,14 @@ use std::time::Duration;
 /// its update feed without grepping the codebase.
 pub const RELEASES_REPO: &str = "gjovanov/roomler-ai";
 
+/// Default proxy endpoint that caches GitHub's releases response on
+/// the roomler-ai API server. Eliminates the per-IP GitHub rate
+/// limit (60 req/hr unauth) that bites fleets of agents behind one
+/// NAT. Override via `ROOMLER_AGENT_UPDATE_URL` env var for self-
+/// hosted deployments or to bypass the proxy in dev. When the proxy
+/// is unreachable we fall back to direct GitHub.
+pub const DEFAULT_PROXY_URL: &str = "https://roomler.ai/api/agent/latest-release";
+
 /// How often `run_periodic` wakes up and checks for a newer release.
 /// 24 hours — matches the cadence of "operator deploys a fix and
 /// wants the field to pick it up next day" without burning through
@@ -130,23 +138,47 @@ pub fn pick_asset_for_platform(assets: &[GithubAsset]) -> Option<&GithubAsset> {
     None
 }
 
-/// Fetch the list of releases from GitHub and pick the "best" one —
-/// the highest `agent-v*` tag that is published (not draft). We do
-/// NOT use `/releases/latest` because GitHub excludes prereleases
-/// from that endpoint unconditionally, and our history has a mix of
-/// prerelease-flagged and non-flagged releases (the v0.1.x policy
-/// that briefly marked everything as prerelease broke
-/// `/releases/latest` entirely → 404, which is how the auto-updater
-/// shipped with 0.1.36 failed silently in the field).
+/// Fetch the list of releases. Uses the roomler-ai backend proxy by
+/// default (caches GitHub's response for 1h on the API server, so a
+/// fleet of agents shares a single upstream call), falls back to
+/// direct GitHub when the proxy is unreachable. Override via
+/// `ROOMLER_AGENT_UPDATE_URL` env var for self-hosted deployments.
+///
+/// We do NOT use GitHub's `/releases/latest` because that endpoint
+/// excludes prereleases unconditionally, and our v0.x policy briefly
+/// marked everything as prerelease — agents shipped with 0.1.36
+/// silently 404'd on every check until the proxy + workflow fix
+/// landed. Always pull the full list and let `pick_latest_release`
+/// apply our own filter (draft=false + tag prefix + parseable).
 async fn fetch_latest_release() -> Result<GithubRelease> {
-    let url = format!("https://api.github.com/repos/{RELEASES_REPO}/releases?per_page=30");
+    let proxy_url =
+        std::env::var("ROOMLER_AGENT_UPDATE_URL").unwrap_or_else(|_| DEFAULT_PROXY_URL.to_string());
+    // Proxy first — handles rate limiting, returns the same JSON shape
+    // as GitHub's /releases endpoint (slimmed to fields we read).
+    match fetch_releases_from(&proxy_url).await {
+        Ok(release) => return Ok(release),
+        Err(e) => {
+            tracing::info!(
+                proxy = %proxy_url,
+                error = %e,
+                "update proxy unreachable; trying direct GitHub"
+            );
+        }
+    }
+    // Fallback — direct GitHub. Subject to the 60/hr unauth quota
+    // but fine for occasional use when the proxy is offline.
+    let github_url = format!("https://api.github.com/repos/{RELEASES_REPO}/releases?per_page=30");
+    fetch_releases_from(&github_url).await
+}
+
+async fn fetch_releases_from(url: &str) -> Result<GithubRelease> {
     let client = reqwest::Client::builder()
         .user_agent(concat!("roomler-agent/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(30))
         .build()
         .context("building reqwest client")?;
     let resp = client
-        .get(&url)
+        .get(url)
         .header("Accept", "application/vnd.github+json")
         .send()
         .await

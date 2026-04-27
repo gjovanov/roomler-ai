@@ -52,6 +52,12 @@ pub struct AppState {
     pub remote_sessions: Arc<RemoteSessionDao>,
     pub remote_audit: Arc<RemoteAuditDao>,
     pub rc_hub: Arc<Hub>,
+
+    /// 1h-TTL in-memory cache backing `/api/agent/latest-release`.
+    /// All agents share this single cache; one upstream GitHub fetch
+    /// per hour vs N-agents-each-once-per-cycle. See
+    /// `routes::agent_release` for the lifecycle.
+    pub latest_release_cache: Arc<crate::routes::agent_release::LatestReleaseCache>,
 }
 
 impl AppState {
@@ -173,6 +179,7 @@ impl AppState {
             remote_sessions,
             remote_audit,
             rc_hub,
+            latest_release_cache: crate::routes::agent_release::LatestReleaseCache::new(),
         })
     }
 }

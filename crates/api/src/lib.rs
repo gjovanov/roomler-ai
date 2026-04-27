@@ -247,9 +247,18 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::remote_control::session_audit),
         );
 
-    // Public agent enrollment exchange (uses enrollment token, not user JWT)
-    let public_agent_routes =
-        Router::new().route("/enroll", post(routes::remote_control::enroll_agent));
+    // Public agent endpoints: enrollment uses an admin-issued enrollment
+    // token (no user JWT); /latest-release is unauthenticated because
+    // the agent's auto-updater calls it before any session and the
+    // payload is already public via github.com/.../releases — we just
+    // proxy + cache so a fleet of agents behind one IP doesn't blow
+    // past GitHub's 60-req/hr unauth quota.
+    let public_agent_routes = Router::new()
+        .route("/enroll", post(routes::remote_control::enroll_agent))
+        .route(
+            "/latest-release",
+            get(routes::agent_release::latest_release),
+        );
 
     // TURN credentials (user-scoped, no tenant prefix)
     let turn_routes = Router::new().route(
