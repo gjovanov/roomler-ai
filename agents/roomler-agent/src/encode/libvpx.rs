@@ -102,15 +102,25 @@ impl Vp9Encoder {
         // the cfg / ctx during these calls, the iface pointer is
         // returned by libvpx and lives for the process lifetime, and
         // we check every return code.
-        let mut cfg: vpx::vpx_codec_enc_cfg_t = unsafe { std::mem::zeroed() };
+        //
+        // `vpx_codec_enc_cfg_t` contains `g_bit_depth: vpx_bit_depth_t`
+        // which is an enum with no 0 variant (starts at VPX_BITS_8 = 8),
+        // so `mem::zeroed()` would produce an invalid niche and panic
+        // under the rustc 1.95 invalid-value-in-niche check. Use
+        // MaybeUninit and let `vpx_codec_enc_config_default` write the
+        // whole struct before we treat any fields as initialised.
         let iface = unsafe { vpx::vpx_codec_vp9_cx() };
         if iface.is_null() {
             bail!("vp9-444: vpx_codec_vp9_cx() returned null — libvpx VP9 codec not linked");
         }
-        let err = unsafe { vpx::vpx_codec_enc_config_default(iface, &mut cfg, 0) };
+        let mut cfg_uninit = std::mem::MaybeUninit::<vpx::vpx_codec_enc_cfg_t>::uninit();
+        let err = unsafe { vpx::vpx_codec_enc_config_default(iface, cfg_uninit.as_mut_ptr(), 0) };
         if err != vpx::VPX_CODEC_OK {
             bail!("vp9-444: vpx_codec_enc_config_default failed: {err:?}");
         }
+        // SAFETY: vpx_codec_enc_config_default returned OK, which by
+        // libvpx's contract means it fully initialised the cfg struct.
+        let mut cfg: vpx::vpx_codec_enc_cfg_t = unsafe { cfg_uninit.assume_init() };
 
         // Profile 1 = 8-bit 4:4:4. Browser's WebCodecs `VideoDecoder`
         // is configured with `vp09.01.10.08` which decodes only this
