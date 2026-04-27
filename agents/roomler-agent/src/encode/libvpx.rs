@@ -61,6 +61,26 @@ pub struct Vp9Encoder {
     target_bitrate: u32,
 }
 
+// `vpx_encode::Encoder` wraps a libvpx `vpx_codec_ctx` whose
+// bindgen-generated layout contains raw `*const`/`*mut` pointers
+// into C-allocated state. Those don't auto-impl Send, so the
+// derived implementation for `Vp9Encoder` doesn't either, which
+// breaks the `VideoEncoder: Send` bound the trait imposes
+// (encode/mod.rs line 94).
+//
+// libvpx is documented as not internally thread-safe for shared
+// access, but a single encoder context owned + driven by a single
+// thread is fully supported — the entire RustDesk + WebRTC stack
+// uses it that way, and our media_pump task is the sole owner of
+// the `Vp9Encoder` instance from `encoder_dims` rebuild to drop.
+// Safe to assert Send under that ownership invariant.
+//
+// Sync is intentionally NOT impl'd — libvpx mutates internal state
+// on every encode() call, so concurrent shared-reference access
+// would race. The pump's exclusive `&mut self` access prevents
+// that automatically.
+unsafe impl Send for Vp9Encoder {}
+
 impl Vp9Encoder {
     pub fn new(width: u32, height: u32) -> Result<Self> {
         if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
