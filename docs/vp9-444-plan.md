@@ -166,6 +166,57 @@ CI release runners (`release-agent.yml`) must add these to their
 install steps before building with `--features vp9-444`. Default
 production builds still target `full-hw` and don't pull libvpx.
 
+## Status (2026-04-27)
+
+| Phase | Plumbing | Tested | Field-usable |
+|---|---|---|---|
+| Y.1 — Encoder backend | ✅ scaffold | ✅ build, ❌ runtime | ❌ blocked |
+| Y.2 — Decoder worker | ✅ | ✅ | ✅ |
+| Y.3 — Transport plumbing | ✅ both ends | ✅ wire, e2e, integration | ✅ |
+| Y.4 — Caps + UI | ✅ | ✅ | ❌ caps-suppressed |
+| Y.5 — View canvas mount | ✅ | ✅ | ✅ |
+
+**What works**: All wire format, signalling, browser worker, DC
+plumbing, agent media-pump branch, view canvas mount, toolbar
+toggle, e2e harness. 12-frame VP9 round-trip via the e2e harness
+proves the receive side end-to-end (using WebCodecs VP9 profile 0
+since Chromium WebCodecs lacks a profile-1 *encoder* — production
+agent would supply real profile-1 bitstream).
+
+**What's blocked**: The `vpx-encode 0.6` wrapper hardcodes
+`VPX_IMG_FMT_I420` in its encode() and exposes no Config field for
+`g_profile`. Result: `Vp9Encoder` produces VP9 profile 0 (4:2:0)
+bytes that the browser's profile-1 decoder rejects. Even the 4:2:0
+fallback never emits packets without explicit flush because
+default `g_lag_in_frames` buffers ~25 frames.
+
+Caps probe disabled in agent so no session ever negotiates onto
+the broken transport (encode/caps.rs `compute_caps`). Wire format
++ unit-tested plumbing stays live, just unconnected from a
+working encoder.
+
+### Y.runtime-encoder — remaining work
+
+Rewrite `agents/roomler-agent/src/encode/libvpx.rs` against
+`env-libvpx-sys` directly (drop `vpx-encode 0.6` dependency):
+
+  - `vpx_codec_enc_config_default(vp9_iface, &cfg)` then set
+    `cfg.g_profile = 1`, `cfg.g_lag_in_frames = 0`,
+    `cfg.g_bit_depth = VPX_BITS_8`, `cfg.g_input_bit_depth = 8`
+  - `vpx_codec_enc_init_ver(&ctx, vp9_iface, &cfg, 0, ABI)`
+  - `vpx_codec_control(&ctx, VP9E_SET_TUNE_CONTENT, VP9E_CONTENT_SCREEN)`
+  - `vpx_codec_control(&ctx, VP8E_SET_CPUUSED, 8)` (fastest preset)
+  - `vpx_img_wrap(&img, VPX_IMG_FMT_I444, w, h, 1, plane_buf)`
+  - `vpx_codec_encode(&ctx, &img, pts, 1, flags, VPX_DL_REALTIME)`
+  - drain via `vpx_codec_get_cx_data(&ctx, &iter)` until null
+
+~150 LOC. Once landed:
+  1. Re-enable caps advertisement in `compute_caps`
+  2. Remove `#[ignore]` from `first_frame_is_keyframe`
+  3. Re-add libvpx test pattern to ci.yml's vp9-444 job
+  4. Field test: build with `--features full,vp9-444`, click toggle,
+     verify `VP9-444 DC pump heartbeat … frames_sent=N` log line.
+
 ## Phasing
 
 ### Phase Y.1 — Encoder backend (1 week, task #73)
