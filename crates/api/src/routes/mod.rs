@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod agent_release;
 pub mod auth;
 pub mod background_task;
 pub mod export;
