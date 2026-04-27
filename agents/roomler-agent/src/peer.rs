@@ -593,7 +593,12 @@ async fn media_pump(
     // still get the 2× downsample to hit the encoder's throughput
     // ceiling.
     let downscale = downscale_for(encoder_preference);
-    let target_fps = target_fps_for(encoder_preference);
+    // `target_fps` becomes mut because the auto-fps-cap heuristic (see
+    // the auto_downscale_evaluated block below) may drop it from the
+    // optimistic Auto-on-Windows 60 to 30 if the encoder cascade ends
+    // up on a SW MFT. Keep it as the single source of truth so
+    // `frame_duration_floor` stays consistent.
+    let mut target_fps = target_fps_for(encoder_preference);
     tracing::info!(
         %session_id,
         ?encoder_preference,
@@ -618,7 +623,7 @@ async fn media_pump(
     // the browser's playout clock starves and the video element goes black.
     // Measure the wallclock gap per frame and use that as the duration — the
     // first sample uses the nominal floor derived from target_fps.
-    let frame_duration_floor = Duration::from_micros(1_000_000 / target_fps as u64);
+    let mut frame_duration_floor = Duration::from_micros(1_000_000 / target_fps as u64);
     let mut last_sample_at: Option<std::time::Instant> = None;
 
     // Keep the most recent captured frame around so we can re-feed it to
@@ -828,9 +833,10 @@ async fn media_pump(
             if !auto_downscale_evaluated {
                 auto_downscale_evaluated = true;
                 let enc_ref = encoder.as_ref().unwrap();
+                let backend_is_sw = !enc_ref.is_hardware();
                 let heavy_codec = chosen_codec == "h265" || chosen_codec == "av1";
                 let high_res = (frame.width as u64) * (frame.height as u64) > (1920u64 * 1080u64);
-                if !enc_ref.is_hardware() && heavy_codec && high_res {
+                if backend_is_sw && heavy_codec && high_res {
                     let mut guard = target_resolution.lock().unwrap();
                     if matches!(*guard, TargetResolution::Native) {
                         *guard = TargetResolution::Fixed {
@@ -846,6 +852,37 @@ async fn media_pump(
                             "auto-downscale: SW heavy codec on high-res source — capping capture at 1920x1080 to preserve fps. Operator can override via rc:resolution."
                         );
                     }
+                }
+
+                // Auto-fps-cap. When the H.264 cascade lands on a SW
+                // MFT (Intel QSV defers to the as-yet-unbuilt async
+                // pipeline, MS SW MFT wins by default), capture
+                // becomes the bottleneck — the BGRA readback alone
+                // is ~20 ms on Intel UHD-class iGPUs, against a
+                // 16.6 ms budget at 60 fps. WGC then drops 35-45 %
+                // of frames and the resulting jitter triggers
+                // browser NACK bursts. Drop the rate to 30 fps
+                // (33 ms budget) which absorbs the readback cost
+                // and produces an even cadence. Field log
+                // 2026-04-27 from RoziLaptop -> Schetovodstvo-PZ
+                // (Intel UHD 730) — the same heuristic as the
+                // resolution cap, just for the time axis. Skipped
+                // when target_fps was already <= 30 (operator
+                // chose Software preference, or capture-side
+                // downcap from a future tier).
+                if backend_is_sw && target_fps > 30 {
+                    let new_fps: u32 = 30;
+                    tracing::warn!(
+                        %session_id,
+                        old_fps = target_fps,
+                        new_fps,
+                        codec = %chosen_codec,
+                        encoder = enc_ref.name(),
+                        "auto-fps-cap: SW backend at >30 fps target — rebuilding capturer at 30 fps to clear the capture-bottleneck drop rate"
+                    );
+                    target_fps = new_fps;
+                    frame_duration_floor = Duration::from_micros(1_000_000 / target_fps as u64);
+                    capturer = capture::open_default(target_fps, downscale);
                 }
             }
         }
