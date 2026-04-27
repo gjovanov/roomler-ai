@@ -173,12 +173,22 @@ pub struct AgentPeer {
 }
 
 impl AgentPeer {
+    /// Phase Y.3: `negotiated_transport` is the video transport
+    /// chosen by signalling (`AgentCaps.transports` ∩ browser
+    /// `preferred_transport`). `None` → legacy WebRTC video track.
+    /// `Some("data-channel-vp9-444")` → media pump bypasses the
+    /// track and writes length-prefixed VP9 frames into the
+    /// `video-bytes` DC opened by the controller. See the
+    /// `on_data_channel` branch in `new()` for where the DC
+    /// handle is stashed.
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         session_id: bson::oid::ObjectId,
         ice_servers: &[IceServer],
         outbound: mpsc::Sender<ClientMsg>,
         encoder_preference: encode::EncoderPreference,
         chosen_codec: String,
+        negotiated_transport: Option<String>,
     ) -> Result<Self> {
         let mut engine = MediaEngine::default();
         engine
@@ -515,7 +525,10 @@ impl AgentPeer {
 
         // Start the capture→encode→track pump. The pump is self-regulating:
         // with no capture backend compiled in, open_default returns a Noop
-        // that parks forever, producing no samples.
+        // that parks forever, producing no samples. Phase Y.3:
+        // `negotiated_transport` + `video_bytes_dc` let the pump route
+        // VP9 4:4:4 frames over the DC instead of the track when the
+        // session negotiated `data-channel-vp9-444`.
         let pump = tokio::spawn(media_pump(
             session_id,
             video_track,
@@ -526,6 +539,8 @@ impl AgentPeer {
             encoder_preference,
             chosen_codec,
             target_resolution.clone(),
+            negotiated_transport,
+            video_bytes_dc.clone(),
         ));
 
         Ok(Self {
@@ -603,6 +618,16 @@ impl AgentPeer {
 /// Per-session media pump. Captures frames, encodes to the negotiated
 /// codec, writes Samples into the WebRTC track. Rebuilds the encoder
 /// if the capture resolution changes mid-session (e.g. dock/undock).
+///
+/// Phase Y.3: when `negotiated_transport == Some("data-channel-vp9-444")`
+/// AND the `vp9-444` Cargo feature is compiled in, the pump runs an
+/// alternate fast-path that builds a libvpx Vp9Encoder, length-prefixes
+/// each encoded frame, and writes them into the `video-bytes`
+/// RTCDataChannel that the controller opened (see peer.rs line ~494
+/// `on_data_channel` arm and `docs/vp9-444-plan.md` for the wire
+/// format). The webrtc track stays bound but receives no samples in
+/// that mode — the browser side renders from the worker-decoded
+/// canvas instead of `<video>`.
 #[allow(clippy::too_many_arguments)]
 async fn media_pump(
     session_id: bson::oid::ObjectId,
@@ -614,7 +639,46 @@ async fn media_pump(
     encoder_preference: encode::EncoderPreference,
     chosen_codec: String,
     target_resolution: Arc<std::sync::Mutex<TargetResolution>>,
+    negotiated_transport: Option<String>,
+    video_bytes_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
 ) {
+    // Y.3 fork: route to the DC pump when the session negotiated VP9
+    // 4:4:4 over the `video-bytes` channel. Falls through to the
+    // legacy track-based pump otherwise — including when the feature
+    // is compiled in but the negotiation didn't pick VP9 (mismatched
+    // browser / older controller / operator override).
+    if matches!(
+        negotiated_transport.as_deref(),
+        Some("data-channel-vp9-444")
+    ) {
+        #[cfg(feature = "vp9-444")]
+        {
+            tracing::info!(
+                %session_id,
+                "media pump: VP9-444 over DataChannel (Phase Y.3)"
+            );
+            return media_pump_vp9_444_dc(
+                session_id,
+                video_bytes_dc,
+                keyframe_requested,
+                target_resolution,
+            )
+            .await;
+        }
+        #[cfg(not(feature = "vp9-444"))]
+        {
+            tracing::warn!(
+                %session_id,
+                "negotiated_transport=data-channel-vp9-444 but agent was built without `vp9-444` feature — falling back to WebRTC video track"
+            );
+        }
+    }
+    // Suppress the "field never read" warning when the legacy path
+    // ignores video_bytes_dc (no vp9-444 feature, or webrtc track
+    // mode). The handle is still created in peer.rs because the
+    // on_data_channel callback unconditionally stashes any DC named
+    // `video-bytes` for forward-compat with future agent builds.
+    let _ = &video_bytes_dc;
     // Capture downscale policy mirrors the encoder preference. When the
     // HW encoder is in play (or will be, on Auto + Windows), we want
     // native-resolution frames; the HW path handles 4K fine and any
@@ -1100,6 +1164,207 @@ async fn media_pump(
             heartbeat_frames_base = frames_encoded;
             heartbeat_capture_us_base = capture_time_us;
             heartbeat_encode_us_base = encode_time_us;
+        }
+    }
+}
+
+/// Length-prefix an encoded VP9 frame for the `video-bytes` DC. The
+/// header layout matches `ui/src/workers/rc-vp9-444-worker.ts`
+/// (lines 16-23 of that file):
+///
+/// ```text
+/// u32 size_le;       // payload length, little-endian
+/// u8  flags;         // bit 0 = keyframe
+/// u64 timestamp_us;  // monotonic capture timestamp
+/// [u8] payload;      // raw VP9 frame
+/// ```
+///
+/// Exported `pub(crate)` so the unit tests can lock the wire format.
+/// `dead_code` allowance is for builds without the `vp9-444` feature
+/// where the function has no caller — the tests still exercise it
+/// under either feature flag setting.
+#[allow(dead_code)]
+pub(crate) fn frame_video_bytes(payload: &[u8], is_keyframe: bool, timestamp_us: u64) -> Vec<u8> {
+    const HEADER_BYTES: usize = 13;
+    let mut out = Vec::with_capacity(HEADER_BYTES + payload.len());
+    let size = payload.len() as u32;
+    out.extend_from_slice(&size.to_le_bytes());
+    out.push(if is_keyframe { 0x01 } else { 0x00 });
+    out.extend_from_slice(&timestamp_us.to_le_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+/// Phase Y.3 alternate media pump: capture → libvpx VP9 4:4:4 encode
+/// → length-prefixed `video-bytes` DC. No webrtc track involvement.
+///
+/// Behaviour parity with the legacy pump where it matters:
+/// - Resolution-change rebuild (encoder is keyed on (w, h))
+/// - Keyframe-on-request (browser PLI / fresh-DC equivalent)
+/// - Heartbeat log every ~30 frames so a stalled pump is greppable
+/// - Idle keepalive at 1 fps so the decoder doesn't pause
+///
+/// What's intentionally absent:
+/// - REMB-driven adaptive bitrate: REMB is a WebRTC-RTP feedback
+///   mechanism. The DC has no equivalent; we'd need a back-channel
+///   `rc:vp9.bandwidth` message from the controller (next sprint).
+///   Today the encoder runs at its `DEFAULT_BITRATE_BPS` ceiling.
+/// - SDP renegotiation: there's no track to renegotiate; the worker
+///   reconfigures its `VideoDecoder` on each keyframe-with-new-dims
+///   automatically.
+#[cfg(feature = "vp9-444")]
+async fn media_pump_vp9_444_dc(
+    session_id: bson::oid::ObjectId,
+    video_bytes_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
+    keyframe_requested: Arc<std::sync::atomic::AtomicBool>,
+    target_resolution: Arc<std::sync::Mutex<TargetResolution>>,
+) {
+    use crate::encode::libvpx::Vp9Encoder;
+
+    // VP9 4:4:4 is heavy CPU; we cap fps to 30 right out of the gate.
+    // The `vp9-444` path is always SW (libvpx); no HW VP9 4:4:4
+    // encoder is available cross-platform today.
+    let target_fps: u32 = 30;
+    let frame_duration_floor = Duration::from_micros(1_000_000 / target_fps as u64);
+    // BGRA capture; never downscale (libvpx + dcv_color_primitives
+    // BGRA→I444 is fast enough at 1080p without the 2× capture
+    // downsample). Operator-controlled `rc:resolution` still applies
+    // via target_resolution on the post-capture path.
+    let downscale = crate::capture::DownscalePolicy::Never;
+    info!(
+        %session_id,
+        target_fps,
+        "VP9-444 DC pump starting"
+    );
+    let mut capturer = capture::open_default(target_fps, downscale);
+    let mut encoder: Option<Vp9Encoder> = None;
+    let mut encoder_dims: Option<(u32, u32)> = None;
+    let mut last_capture_at = std::time::Instant::now();
+    let mut last_good_frame: Option<std::sync::Arc<crate::capture::Frame>> = None;
+    const IDLE_KEEPALIVE: Duration = Duration::from_millis(1_000);
+    let start = std::time::Instant::now();
+
+    let mut frames_captured: u64 = 0;
+    let mut frames_encoded: u64 = 0;
+    let mut frames_sent: u64 = 0;
+    let mut bytes_written: u64 = 0;
+    let mut send_errors: u64 = 0;
+    let mut dc_unopen_drops: u64 = 0;
+
+    loop {
+        let frame: std::sync::Arc<crate::capture::Frame> = match capturer.next_frame().await {
+            Ok(Some(f)) => {
+                frames_captured += 1;
+                last_capture_at = std::time::Instant::now();
+                let arc = std::sync::Arc::new(f);
+                last_good_frame = Some(arc.clone());
+                arc
+            }
+            Ok(None) => {
+                if last_capture_at.elapsed() >= IDLE_KEEPALIVE {
+                    if let Some(ref f) = last_good_frame {
+                        last_capture_at = std::time::Instant::now();
+                        f.clone()
+                    } else {
+                        tokio::time::sleep(frame_duration_floor).await;
+                        continue;
+                    }
+                } else {
+                    tokio::time::sleep(frame_duration_floor / 2).await;
+                    continue;
+                }
+            }
+            Err(e) => {
+                warn!(%session_id, %e, "VP9-444 capture error — rebuilding capturer");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                capturer = capture::open_default(target_fps, downscale);
+                encoder = None;
+                encoder_dims = None;
+                continue;
+            }
+        };
+
+        // Apply controller-chosen resolution + the libvpx even-dim
+        // requirement. The encoder rejects odd dims — round down by 1
+        // to cover the rare case where the resolution control message
+        // landed an odd value.
+        let frame = apply_target_resolution(frame, *target_resolution.lock().unwrap());
+        let w = frame.width & !1;
+        let h = frame.height & !1;
+        if w != frame.width || h != frame.height {
+            // Drop this frame; the next one will arrive at-or-near the
+            // same dims and we'll handle the rebuild then. Safer than
+            // shrinking the buffer in-place and risking off-by-one.
+            continue;
+        }
+
+        if encoder_dims != Some((w, h)) {
+            info!(%session_id, w, h, "VP9-444 encoder rebuild for dims");
+            match Vp9Encoder::new(w, h) {
+                Ok(e) => {
+                    encoder = Some(e);
+                    encoder_dims = Some((w, h));
+                }
+                Err(e) => {
+                    warn!(%session_id, %e, "Vp9Encoder::new failed — pump exits");
+                    return;
+                }
+            }
+        }
+        let enc = encoder.as_mut().unwrap();
+        if keyframe_requested.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            enc.request_keyframe();
+        }
+
+        let packets = match enc.encode(frame).await {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(%session_id, %e, "VP9-444 encode error — pump exits");
+                return;
+            }
+        };
+        frames_encoded += packets.len() as u64;
+
+        // Pull the DC handle once per frame. `try_lock` would race
+        // with the on_data_channel callback that stashes it; the
+        // contention here is microseconds.
+        let dc_opt = video_bytes_dc.lock().await.clone();
+        let Some(dc) = dc_opt else {
+            // DC not yet open — drop frames until the controller
+            // opens it. Common during the first ~100 ms of a session
+            // (offer/answer + ICE + SCTP handshake). Counted so a
+            // controller that never opens the DC is greppable.
+            dc_unopen_drops += packets.len() as u64;
+            continue;
+        };
+        if dc.ready_state() != webrtc::data_channel::data_channel_state::RTCDataChannelState::Open {
+            dc_unopen_drops += packets.len() as u64;
+            continue;
+        }
+
+        for p in packets {
+            let ts_us = start.elapsed().as_micros() as u64;
+            let wire = frame_video_bytes(&p.data, p.is_keyframe, ts_us);
+            let wire_len = wire.len() as u64;
+            match dc.send(&Bytes::from(wire)).await {
+                Ok(_) => {
+                    frames_sent += 1;
+                    bytes_written += wire_len;
+                }
+                Err(e) => {
+                    send_errors += 1;
+                    warn!(%session_id, %e, send_errors, "VP9-444 DC send failed");
+                }
+            }
+        }
+
+        if frames_encoded.is_multiple_of(30) {
+            info!(
+                %session_id,
+                frames_captured, frames_encoded, frames_sent, bytes_written,
+                send_errors, dc_unopen_drops,
+                "VP9-444 DC pump heartbeat (≈1s window)"
+            );
         }
     }
 }
@@ -1921,5 +2186,54 @@ mod tests {
         // Very high base: cap engages at the new 30M ceiling.
         assert_eq!(target_bitrate(HIGH, 30_000_000), 30_000_000);
         assert_eq!(target_bitrate(HIGH, 50_000_000), 30_000_000);
+    }
+}
+
+#[cfg(test)]
+mod video_bytes_wire_tests {
+    use super::frame_video_bytes;
+
+    /// Lock the exact byte layout that `rc-vp9-444-worker.ts`'s
+    /// `parseFrameHeader` (lines 260-273 of that file) reads. A typo
+    /// or endian flip on either side silently breaks decode; this
+    /// test surfaces the mismatch in CI before the field does.
+    ///
+    /// Layout:
+    ///   bytes [0..4)  payload-size, u32 little-endian
+    ///   byte  [4]     flags (bit 0 = keyframe)
+    ///   bytes [5..13) timestamp_us, u64 little-endian
+    ///   bytes [13..)  payload
+    #[test]
+    fn header_layout_matches_worker_parser() {
+        let payload = b"abcdef";
+        let out = frame_video_bytes(payload, true, 0xDEAD_BEEF_CAFE_BABE);
+        assert_eq!(out.len(), 13 + payload.len(), "header is 13 bytes");
+        // size = 6, little-endian
+        assert_eq!(&out[0..4], &[0x06, 0x00, 0x00, 0x00]);
+        // flags = 0x01 (keyframe)
+        assert_eq!(out[4], 0x01);
+        // timestamp = 0xDEADBEEFCAFEBABE little-endian
+        assert_eq!(
+            &out[5..13],
+            &[0xBE, 0xBA, 0xFE, 0xCA, 0xEF, 0xBE, 0xAD, 0xDE],
+        );
+        // payload follows verbatim
+        assert_eq!(&out[13..], payload);
+    }
+
+    #[test]
+    fn delta_frames_clear_keyframe_flag() {
+        let out = frame_video_bytes(b"x", false, 0);
+        assert_eq!(out[4], 0x00, "delta frame must not set the keyframe bit");
+    }
+
+    #[test]
+    fn empty_payload_still_emits_full_13_byte_header() {
+        // Edge case: libvpx can emit zero-byte show=0 hidden frames.
+        // We pass them through; the worker drops them via the
+        // `size === 0` branch.
+        let out = frame_video_bytes(&[], true, 1);
+        assert_eq!(out.len(), 13);
+        assert_eq!(&out[0..4], &[0, 0, 0, 0]);
     }
 }
