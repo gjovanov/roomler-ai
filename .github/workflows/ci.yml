@@ -38,6 +38,33 @@ jobs:
       - name: Run clippy
         run: cargo clippy --workspace -- -D warnings
 
+      # Phase Y feature gate. The `vp9-444` feature compiles libvpx
+      # via `env-libvpx-sys` (needs pkg-config + libvpx system lib),
+      # plus `dcv-color-primitives`. Default workspace clippy never
+      # exercises this path because the feature is opt-in. Catch
+      # breakage here so the standard release lane (which is still
+      # `--features full`, no vp9-444 yet) doesn't ship a regression
+      # latent under the feature flag — and so the `bun run e2e`
+      # VP9-444 spec doesn't drift away from the agent it's testing.
+      - name: Install libvpx (apt)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvpx-dev pkg-config \
+            libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev \
+            cmake libclang-dev
+
+      - name: Check agent --features vp9-444
+        run: cargo check -p roomler-agent --features vp9-444
+
+      - name: Test agent wire format + libvpx round-trip under vp9-444
+        # Runs the 3 video_bytes wire-format tests (lock byte
+        # layout against the worker parser) plus the libvpx encoder
+        # tests (first_frame_is_keyframe + rejects_odd_dims) which
+        # only compile under this feature. Together: end-to-end
+        # confidence that bytes encoded on the agent will parse
+        # correctly on the browser.
+        run: cargo test -p roomler-agent --features vp9-444 --lib -- video_bytes_wire libvpx
+
   frontend:
     name: Frontend checks
     runs-on: ubuntu-latest
