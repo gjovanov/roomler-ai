@@ -21,6 +21,8 @@ import {
   VP9_444_DC_OPTIONS,
   shortCodecFromReceiver,
   codecFromSdp,
+  decideKeyAction,
+  type KeyDecision,
 } from '@/composables/useRemoteControl'
 import { codecMimeForShort } from '@/workers/rc-webcodecs-worker'
 import { parseFrameHeader, isKeyframe } from '@/workers/rc-vp9-444-worker'
@@ -110,6 +112,251 @@ describe('kbdCodeToHid', () => {
     // Look-alikes that used to break naive startsWith checks.
     expect(kbdCodeToHid('Keyboard')).toBeNull() // too long for "Key_"
     expect(kbdCodeToHid('Digit10')).toBeNull() // digit out of single-char range
+  })
+
+  it('maps the punctuation row to HID usages 0x2d–0x38, 0x35', () => {
+    expect(kbdCodeToHid('Backquote')).toBe(0x35)
+    expect(kbdCodeToHid('Minus')).toBe(0x2d)
+    expect(kbdCodeToHid('Equal')).toBe(0x2e)
+    expect(kbdCodeToHid('BracketLeft')).toBe(0x2f)
+    expect(kbdCodeToHid('BracketRight')).toBe(0x30)
+    expect(kbdCodeToHid('Backslash')).toBe(0x31)
+    expect(kbdCodeToHid('Semicolon')).toBe(0x33)
+    expect(kbdCodeToHid('Quote')).toBe(0x34)
+    expect(kbdCodeToHid('Comma')).toBe(0x36)
+    expect(kbdCodeToHid('Period')).toBe(0x37)
+    expect(kbdCodeToHid('Slash')).toBe(0x38)
+    expect(kbdCodeToHid('IntlBackslash')).toBe(0x64)
+  })
+
+  it('maps lock + system keys', () => {
+    expect(kbdCodeToHid('CapsLock')).toBe(0x39)
+    expect(kbdCodeToHid('NumLock')).toBe(0x53)
+    expect(kbdCodeToHid('ScrollLock')).toBe(0x47)
+    expect(kbdCodeToHid('PrintScreen')).toBe(0x46)
+    expect(kbdCodeToHid('Pause')).toBe(0x48)
+    expect(kbdCodeToHid('ContextMenu')).toBe(0x65)
+  })
+
+  it('maps the numeric keypad', () => {
+    expect(kbdCodeToHid('NumpadDivide')).toBe(0x54)
+    expect(kbdCodeToHid('NumpadMultiply')).toBe(0x55)
+    expect(kbdCodeToHid('NumpadSubtract')).toBe(0x56)
+    expect(kbdCodeToHid('NumpadAdd')).toBe(0x57)
+    expect(kbdCodeToHid('NumpadEnter')).toBe(0x58)
+    expect(kbdCodeToHid('NumpadDecimal')).toBe(0x63)
+    expect(kbdCodeToHid('Numpad1')).toBe(0x59)
+    expect(kbdCodeToHid('Numpad9')).toBe(0x61)
+    expect(kbdCodeToHid('Numpad0')).toBe(0x62)
+  })
+})
+
+/**
+ * Decision tree that routes a `KeyboardEvent` to either the
+ * layout-agnostic KeyText path or the existing HID Key path. Lock the
+ * specific routing rules (AltGr, IME, chord-vs-printable, Tab carve-
+ * out, keyup suppression) so future regressions in the rule set fail
+ * loudly here rather than silently in the field.
+ */
+describe('decideKeyAction', () => {
+  type EvShape = {
+    key: string
+    code: string
+    ctrlKey?: boolean
+    altKey?: boolean
+    metaKey?: boolean
+    shiftKey?: boolean
+    isComposing?: boolean
+    keyCode?: number
+  }
+  function ev(shape: EvShape) {
+    return {
+      key: shape.key,
+      code: shape.code,
+      ctrlKey: !!shape.ctrlKey,
+      altKey: !!shape.altKey,
+      metaKey: !!shape.metaKey,
+      shiftKey: !!shape.shiftKey,
+      isComposing: !!shape.isComposing,
+      keyCode: shape.keyCode ?? 0,
+    }
+  }
+  const altGr = (on: boolean) => (k: string) => k === 'AltGraph' && on
+
+  it('US Shift+@ routes via KeyText (no real chord, just Shift)', () => {
+    const r = decideKeyAction(
+      ev({ key: '@', code: 'Digit2', shiftKey: true }),
+      true,
+      altGr(false),
+    )
+    expect(r).toEqual<KeyDecision>({ kind: 'text', text: '@' })
+  })
+
+  it('Shift+A (capital letter) routes via KeyText', () => {
+    const r = decideKeyAction(
+      ev({ key: 'A', code: 'KeyA', shiftKey: true }),
+      true,
+      altGr(false),
+    )
+    expect(r).toEqual<KeyDecision>({ kind: 'text', text: 'A' })
+  })
+
+  it('DEU/AT AltGr+Q (= "@") routes via KeyText — AltGraph carve-out', () => {
+    // Browsers report AltGr as ctrlKey + altKey. Without the
+    // AltGraph signal, this would mis-classify as a Ctrl+Alt+Q chord.
+    const r = decideKeyAction(
+      ev({ key: '@', code: 'KeyQ', ctrlKey: true, altKey: true }),
+      true,
+      altGr(true),
+    )
+    expect(r).toEqual<KeyDecision>({ kind: 'text', text: '@' })
+  })
+
+  it('Ctrl+C preserves the chord on the HID path (0.1.34 fix lives here)', () => {
+    const r = decideKeyAction(
+      ev({ key: 'c', code: 'KeyC', ctrlKey: true }),
+      true,
+      altGr(false),
+    )
+    expect(r).toEqual<KeyDecision>({
+      kind: 'key',
+      code: 0x06,
+      down: true,
+      mods: 0x01,
+    })
+  })
+
+  it('US-layout intentional Ctrl+Alt+Q stays on the HID path', () => {
+    // Real chord: no AltGraph modifier, ev.key reflects the chord
+    // (browsers leave it as 'q' for letter chords).
+    const r = decideKeyAction(
+      ev({ key: 'q', code: 'KeyQ', ctrlKey: true, altKey: true }),
+      true,
+      altGr(false),
+    )
+    expect(r).toEqual<KeyDecision>({
+      kind: 'key',
+      code: 0x14,
+      down: true,
+      mods: 0x05, // Ctrl | Alt
+    })
+  })
+
+  it('keyup of a printable+nochord key emits no message', () => {
+    const r = decideKeyAction(
+      ev({ key: '@', code: 'Digit2', shiftKey: true }),
+      false,
+      altGr(false),
+    )
+    expect(r).toEqual<KeyDecision>({ kind: 'drop' })
+  })
+
+  it('Enter routes via HID', () => {
+    const r = decideKeyAction(
+      ev({ key: 'Enter', code: 'Enter' }),
+      true,
+      altGr(false),
+    )
+    expect(r).toEqual<KeyDecision>({ kind: 'key', code: 0x28, down: true, mods: 0 })
+  })
+
+  it('Tab routes via HID even though ev.key is single-char "\\t"', () => {
+    // Tab needs a real WM_KEYDOWN(VK_TAB) on the remote so apps that
+    // gate focus traversal on it pick it up. KeyText would inject U+0009
+    // which doesn't trigger focus change in many forms / IDEs.
+    const r = decideKeyAction(
+      ev({ key: '\t', code: 'Tab' }),
+      true,
+      altGr(false),
+    )
+    expect(r).toEqual<KeyDecision>({ kind: 'key', code: 0x2b, down: true, mods: 0 })
+  })
+
+  it('Space routes via KeyText (length-1 printable)', () => {
+    // Pin the choice: if we want Space on the HID path later, this
+    // test fails and forces an explicit decision.
+    const r = decideKeyAction(
+      ev({ key: ' ', code: 'Space' }),
+      true,
+      altGr(false),
+    )
+    expect(r).toEqual<KeyDecision>({ kind: 'text', text: ' ' })
+  })
+
+  it('IME composition (isComposing=true) drops without emitting', () => {
+    const r = decideKeyAction(
+      ev({ key: 'a', code: 'KeyA', isComposing: true }),
+      true,
+      altGr(false),
+    )
+    expect(r).toEqual<KeyDecision>({ kind: 'drop' })
+  })
+
+  it('Chromium IME placeholder (key="Process", keyCode=229) drops', () => {
+    const r = decideKeyAction(
+      ev({ key: 'Process', code: 'KeyA', keyCode: 229 }),
+      true,
+      altGr(false),
+    )
+    expect(r).toEqual<KeyDecision>({ kind: 'drop' })
+  })
+
+  it('Auto-repeat: each repeated keydown emits its own KeyText', () => {
+    // Browsers fire keydown repeatedly while held. Emit one KeyText
+    // per fire — matches local typing behaviour.
+    const e = ev({ key: 'a', code: 'KeyA' })
+    const r1 = decideKeyAction(e, true, altGr(false))
+    const r2 = decideKeyAction(e, true, altGr(false))
+    expect(r1).toEqual<KeyDecision>({ kind: 'text', text: 'a' })
+    expect(r2).toEqual<KeyDecision>({ kind: 'text', text: 'a' })
+  })
+
+  it('Dead-key first stroke (key="Dead") falls to HID via Backquote', () => {
+    // Pressing the dead-tilde on a US-International layout. Browsers
+    // emit key="Dead" then later emit key="ñ" once the combine fires.
+    // The first stroke isn't printable; it should hit the HID path,
+    // which only works because Backquote is now in kbdCodeToHid.
+    const r = decideKeyAction(
+      ev({ key: 'Dead', code: 'Backquote' }),
+      true,
+      altGr(false),
+    )
+    expect(r).toEqual<KeyDecision>({ kind: 'key', code: 0x35, down: true, mods: 0 })
+  })
+
+  it('Combined dead-key result (key="ñ") routes via KeyText', () => {
+    const r = decideKeyAction(
+      ev({ key: 'ñ', code: 'KeyN' }),
+      true,
+      altGr(false),
+    )
+    expect(r).toEqual<KeyDecision>({ kind: 'text', text: 'ñ' })
+  })
+
+  it('Unmapped non-printable keys drop without error', () => {
+    // BrowserBack has no HID mapping; nothing to send.
+    const r = decideKeyAction(
+      ev({ key: 'BrowserBack', code: 'BrowserBack' }),
+      true,
+      altGr(false),
+    )
+    expect(r).toEqual<KeyDecision>({ kind: 'drop' })
+  })
+
+  it('Cmd+C on macOS (metaKey) is a real chord', () => {
+    // Browsers report Cmd as metaKey. Even with no Ctrl/Alt, metaKey
+    // alone counts as a chord — Cmd+C must round-trip as a chord.
+    const r = decideKeyAction(
+      ev({ key: 'c', code: 'KeyC', metaKey: true }),
+      true,
+      altGr(false),
+    )
+    expect(r).toEqual<KeyDecision>({
+      kind: 'key',
+      code: 0x06,
+      down: true,
+      mods: 0x08, // Meta
+    })
   })
 })
 
