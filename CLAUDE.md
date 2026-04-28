@@ -204,7 +204,7 @@ MongoDB native driver (not Mongoose). Models live in `crates/db/src/models/` exc
 - **Production URL**: `https://roomler.ai/` — the live deployment. Use this as the `--server` argument when enrolling agents and as the origin the browser controller loads.
 - **Docker**: Multi-stage build (rust:1.88-bookworm -> oven/bun:1 -> debian:trixie-slim + nginx)
 - **Deploy repo**: `/home/gjovanov/roomler-ai-deploy/` on mars. Kustomize manifests live under `k8s/base/` + `k8s/overlays/prod/`. Ansible playbooks retained for host-level tasks only (HAProxy, WireGuard, iptables).
-- **GitOps**: ArgoCD at [argocd.roomler.ai](https://argocd.roomler.ai) reconciles the `roomler-ai` Application from `github.com/gjovanov/roomler-ai-deploy @ gitops-pilot` path `k8s/overlays/prod`. Sync policy is **Manual** — a `git push` won't auto-deploy; run `argocd app sync roomler-ai` (or click Sync in the UI) when ready.
+- **GitOps**: ArgoCD at [argocd.roomler.ai](https://argocd.roomler.ai) reconciles the `roomler-ai` Application from `github.com/gjovanov/roomler-ai-deploy @ master` path `k8s/overlays/prod`. Sync policy is **Manual** — a `git push` won't auto-deploy; run `argocd app sync roomler-ai --grpc-web` (or click Sync in the UI) when ready. Verify the live targetRevision with `argocd app get roomler-ai --grpc-web | grep -E "Target|Sync Status"`.
 - **Image registry**: `registry.roomler.ai` (self-hosted Docker Registry v2 on mars, basic auth, cert auto-renewed via acme.sh). Pull secret `regcred` lives in the `roomler-ai` namespace.
 - **K8s cluster**: 3 control-plane + 3 worker nodes (Ubuntu 22.04, containerd 1.7.29, v1.31.14). Pods run on `k8s-worker-3` (10.10.30.11). Namespace `roomler-ai`, deployment `roomler2` (note: name is `roomler2` not `roomler-ai`), Recreate strategy, hostNetwork, `imagePullPolicy: IfNotPresent`.
 - **Health probes**: startup/readiness/liveness all on `/health` (port 80 via nginx -> :3000 backend)
@@ -226,7 +226,7 @@ docker push registry.roomler.ai/roomler-ai:$TAG
 docker push registry.roomler.ai/roomler-ai:latest
 
 cd /home/gjovanov/roomler-ai-deploy
-git checkout gitops-pilot
+git checkout master && git pull
 sed -i "s|newTag:.*|newTag: $TAG|" k8s/overlays/prod/kustomization.yaml
 git commit -am "chore(k8s): bump roomler-ai to $TAG"
 git push
