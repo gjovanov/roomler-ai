@@ -1347,15 +1347,30 @@ async fn media_pump_vp9_444_dc(
             let ts_us = start.elapsed().as_micros() as u64;
             let wire = frame_video_bytes(&p.data, p.is_keyframe, ts_us);
             let wire_len = wire.len() as u64;
-            match dc.send(&Bytes::from(wire)).await {
-                Ok(_) => {
-                    frames_sent += 1;
-                    bytes_written += wire_len;
-                }
-                Err(e) => {
+            // SCTP DataChannels cap individual `dc.send()` payloads at
+            // ~64 KiB (Chrome's RTCDataChannel default; some configs
+            // negotiate higher but 16 KiB is the safe cross-browser
+            // floor). VP9 4:4:4 keyframes at 2560×1600 are ~150–300 KB
+            // and would be rejected wholesale ("outbound packet larger
+            // than maximum message size"). Split into ≤ 16 KiB chunks
+            // and rely on the browser worker's byte-stream assembler
+            // (`consumeBytes` in rc-vp9-444-worker.ts) to glue them
+            // back together — it tracks header + payload progress
+            // across `dc.onmessage` calls without caring about message
+            // boundaries.
+            const SCTP_CHUNK_SIZE: usize = 16 * 1024;
+            let mut frame_failed = false;
+            for chunk in wire.chunks(SCTP_CHUNK_SIZE) {
+                if let Err(e) = dc.send(&Bytes::copy_from_slice(chunk)).await {
                     send_errors += 1;
                     warn!(%session_id, %e, send_errors, "VP9-444 DC send failed");
+                    frame_failed = true;
+                    break;
                 }
+            }
+            if !frame_failed {
+                frames_sent += 1;
+                bytes_written += wire_len;
             }
         }
 
