@@ -1335,11 +1335,23 @@ async fn media_pump_vp9_444_dc(
             // opens it. Common during the first ~100 ms of a session
             // (offer/answer + ICE + SCTP handshake). Counted so a
             // controller that never opens the DC is greppable.
+            //
+            // CRITICAL: also re-request a keyframe so the FIRST frame
+            // the browser worker actually receives (whenever the DC
+            // finally opens) is a keyframe. Without this, the encoder
+            // proceeds along its 240-frame keyframe interval, so the
+            // first delivered frame is a delta and the browser's
+            // VideoDecoder rejects it with
+            // "A key frame is required after configure() or flush()"
+            // — every subsequent delta also fails since the decoder
+            // never advanced past the configured-but-unfed state.
             dc_unopen_drops += packets.len() as u64;
+            keyframe_requested.store(true, std::sync::atomic::Ordering::Relaxed);
             continue;
         };
         if dc.ready_state() != webrtc::data_channel::data_channel_state::RTCDataChannelState::Open {
             dc_unopen_drops += packets.len() as u64;
+            keyframe_requested.store(true, std::sync::atomic::Ordering::Relaxed);
             continue;
         }
 
