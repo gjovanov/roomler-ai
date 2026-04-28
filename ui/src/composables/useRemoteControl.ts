@@ -1635,12 +1635,14 @@ export function useRemoteControl() {
     function onPointerLeave() { pointerInside = false }
 
     function onKey(ev: KeyboardEvent, down: boolean) {
-      const code = kbdCodeToHid(ev.code)
-      if (code === null) return
-      const mods =
-        (ev.ctrlKey ? 1 : 0) | (ev.shiftKey ? 2 : 0) | (ev.altKey ? 4 : 0) | (ev.metaKey ? 8 : 0)
+      const action = decideKeyAction(ev, down, (k) => ev.getModifierState(k))
+      if (action.kind === 'drop') return
       if (shouldPreventDefault(ev, pointerInside)) ev.preventDefault()
-      sendInput({ t: 'key', code, down, mods })
+      if (action.kind === 'text') {
+        sendInput({ t: 'key_text', text: action.text })
+      } else {
+        sendInput({ t: 'key', code: action.code, down: action.down, mods: action.mods })
+      }
     }
 
     const onKeyDown = (e: KeyboardEvent) => onKey(e, true)
@@ -2057,6 +2059,47 @@ function kbdCodeToHid(code: string): number | null {
   if (code === 'ShiftRight') return 0xe5
   if (code === 'AltRight') return 0xe6
   if (code === 'MetaRight') return 0xe7
+  // Punctuation row. HID usages from "Keyboard/Keypad" Page (0x07).
+  // These mostly reach the agent via KeyText now (printable + no
+  // chord — see onKey), but we still need HID codes for the chord
+  // path: e.g. Ctrl+, in some IDEs binds to "settings", which only
+  // works if we forward the keypress with the chord modifier rather
+  // than typing a literal ','. Without these mappings, those chords
+  // were silently dropped pre-fix.
+  if (code === 'Backquote') return 0x35
+  if (code === 'Minus') return 0x2d
+  if (code === 'Equal') return 0x2e
+  if (code === 'BracketLeft') return 0x2f
+  if (code === 'BracketRight') return 0x30
+  if (code === 'Backslash') return 0x31
+  if (code === 'Semicolon') return 0x33
+  if (code === 'Quote') return 0x34
+  if (code === 'Comma') return 0x36
+  if (code === 'Period') return 0x37
+  if (code === 'Slash') return 0x38
+  if (code === 'IntlBackslash') return 0x64
+  // Lock + system keys.
+  if (code === 'CapsLock') return 0x39
+  if (code === 'NumLock') return 0x53
+  if (code === 'ScrollLock') return 0x47
+  if (code === 'PrintScreen') return 0x46
+  if (code === 'Pause') return 0x48
+  if (code === 'ContextMenu') return 0x65
+  // Numeric keypad (HID 0x53..0x63). agent's hid_to_key currently
+  // falls through to Key::Other(code) for these; works enough that
+  // chords with NumLock-off arrows make it through.
+  if (code === 'NumpadDivide') return 0x54
+  if (code === 'NumpadMultiply') return 0x55
+  if (code === 'NumpadSubtract') return 0x56
+  if (code === 'NumpadAdd') return 0x57
+  if (code === 'NumpadEnter') return 0x58
+  if (code === 'NumpadDecimal') return 0x63
+  if (code.startsWith('Numpad') && code.length === 7) {
+    const d = code.charCodeAt(6) - '0'.charCodeAt(0)
+    // HID Numpad 1..9 → 0x59..0x61, Numpad 0 → 0x62.
+    if (d === 0) return 0x62
+    if (d >= 1 && d <= 9) return 0x59 + d - 1
+  }
   // F1..F12
   if (code.startsWith('F') && code.length >= 2 && code.length <= 3) {
     const n = parseInt(code.slice(1), 10)
@@ -2149,6 +2192,78 @@ export function directVideoNormalise(
     y: clamp01(localY / videoRect.height),
     insideVideo,
   }
+}
+
+/**
+ * Outcome of routing a `KeyboardEvent` to either the layout-agnostic
+ * `KeyText` path or the existing HID `Key` path. Pure function so the
+ * decision tree is unit-testable without standing up the full
+ * composable.
+ *
+ * `text`  — printable single character with no real-chord modifiers
+ *           active. Forwarded to the agent as
+ *           `InputMsg::KeyText { text }` → `enigo.text` → VK_PACKET on
+ *           Windows. Layout-agnostic on the remote.
+ * `key`   — chord, named key (Enter/F1/ArrowUp), Tab, or any printable
+ *           release that already had its keydown emitted as `text`.
+ *           Forwarded as `InputMsg::Key { code, down, mods }`.
+ * `drop`  — IME composition events, printable keyup whose keydown was
+ *           already a `text` (the agent press+releases atomically),
+ *           and unmapped codes.
+ */
+export type KeyDecision =
+  | { kind: 'text'; text: string }
+  | { kind: 'key'; code: number; down: boolean; mods: number }
+  | { kind: 'drop' }
+
+/**
+ * Decide which wire-format message (if any) to emit for a browser
+ * `KeyboardEvent`. Encapsulates:
+ *   - IME composition guard (drop)
+ *   - AltGr-aware "real chord" classification
+ *   - Printable single-char → `KeyText` (layout-agnostic)
+ *   - Tab carve-out (stays HID for focus traversal)
+ *   - Suppress keyup for printable+nochord (matched keydown was atomic)
+ *   - Fallback to HID via `kbdCodeToHid`
+ *
+ * Exported for vitest. The `getModifierState` parameter is split out
+ * so tests can drive `AltGraph` without needing a real DOM event
+ * (KeyboardEventInit doesn't accept getModifierState in jsdom).
+ */
+export function decideKeyAction(
+  ev: Pick<
+    KeyboardEvent,
+    'key' | 'code' | 'ctrlKey' | 'altKey' | 'metaKey' | 'shiftKey' | 'isComposing' | 'keyCode'
+  >,
+  down: boolean,
+  getModifierState: (key: string) => boolean = () => false,
+): KeyDecision {
+  // IME composition: drop. Forwarding would double-type when the
+  // matching `compositionend` text flows through.
+  if (ev.isComposing || ev.keyCode === 229) return { kind: 'drop' }
+
+  const altGr = getModifierState('AltGraph')
+  const realChord =
+    (ev.ctrlKey && !altGr) || (ev.altKey && !altGr) || ev.metaKey
+  // Tab is excluded from the printable path on purpose: many remote
+  // apps gate focus traversal on WM_KEYDOWN(VK_TAB) and wouldn't pick
+  // up a U+0009 typed via VK_PACKET.
+  const isPrintableSingleChar =
+    !realChord && ev.key.length === 1 && ev.key !== '\t'
+
+  if (down && isPrintableSingleChar) {
+    return { kind: 'text', text: ev.key }
+  }
+  if (!down && isPrintableSingleChar) {
+    // KeyText is press+release atomic on the agent — no release event.
+    return { kind: 'drop' }
+  }
+
+  const code = kbdCodeToHid(ev.code)
+  if (code === null) return { kind: 'drop' }
+  const mods =
+    (ev.ctrlKey ? 1 : 0) | (ev.shiftKey ? 2 : 0) | (ev.altKey ? 4 : 0) | (ev.metaKey ? 8 : 0)
+  return { kind: 'key', code, down, mods }
 }
 
 export { browserButton, kbdCodeToHid }
