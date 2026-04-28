@@ -217,12 +217,23 @@ jobs:
           # version EXACTLY. We pin to 1.12.0 because vcpkg has it (the
           # 1.13.0 entry was bumped to 1.13.1, which env-libvpx-sys
           # doesn't ship a pre-generated file for).
-          git clone --depth 1 https://github.com/microsoft/vcpkg.git C:\vcpkg
-          C:\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+          # windows-latest pre-installs vcpkg at C:\vcpkg. Reuse it if
+          # present (skip clone + bootstrap), otherwise install fresh.
+          if (-not (Test-Path 'C:\vcpkg\vcpkg.exe')) {
+            git clone https://github.com/microsoft/vcpkg.git C:\vcpkg
+            C:\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+          } else {
+            Write-Host "Using pre-installed vcpkg at C:\vcpkg"
+          }
           # Need full history to resolve the 1.12.0 baseline (the
           # baseline commit must contain the version-specific git-tree
-          # entry vcpkg looks up).
-          git -C C:\vcpkg fetch --unshallow
+          # entry vcpkg looks up). `git fetch --unshallow` errors on
+          # already-complete repos, so probe first.
+          if ((git -C C:\vcpkg rev-parse --is-shallow-repository) -eq 'true') {
+            git -C C:\vcpkg fetch --unshallow
+          } else {
+            git -C C:\vcpkg fetch --tags
+          }
           New-Item -ItemType Directory -Path C:\vpx-pin -Force | Out-Null
           @'
           {
@@ -274,15 +285,22 @@ jobs:
         shell: pwsh
         run: cargo build -p roomler-agent --release --features "full-hw,vp9-444"
 
-      - name: Stage vpx.dll alongside agent binary
+      - name: Stage vpx.dll alongside agent binary (if not statically linked)
         shell: pwsh
         run: |
-          # Runtime DLL lookup: libvpx loads from the same dir as the
-          # agent .exe via the standard Windows DLL search order. Copy
-          # vpx.dll next to roomler-agent.exe so encoder-smoke picks it
-          # up below, and so cargo-wix's main.wxs harvest sweeps it into
-          # the MSI alongside the agent binary.
-          Copy-Item "$env:VPX_DLL_DIR\vpx.dll" target\release\
+          # vcpkg's `x64-windows` triplet for libvpx produces a static
+          # .lib + .pdb only — no .dll. The agent binary links libvpx
+          # statically and runs without a separate DLL. If a future
+          # vcpkg port (or a triplet swap) produces a vpx.dll, copy it
+          # next to roomler-agent.exe so cargo-wix harvests it. No-op
+          # when the DLL isn't there.
+          $dll = Join-Path $env:VPX_DLL_DIR "vpx.dll"
+          if (Test-Path $dll) {
+            Copy-Item $dll target\release\
+            Write-Host "Staged vpx.dll for MSI harvest"
+          } else {
+            Write-Host "No vpx.dll under $env:VPX_DLL_DIR — static linkage, nothing to stage"
+          }
 
       - name: Encoder smoke test (MF cascade → openh264 fallback)
         shell: pwsh
