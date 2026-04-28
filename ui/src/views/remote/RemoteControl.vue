@@ -959,7 +959,18 @@ const remoteCursorY = computed(() => {
 function cursorMapping(): { sx: number; sy: number; offsetX: number; offsetY: number } {
   const stage = stageEl.value
   const video = videoEl.value
-  if (!stage || !video || !video.videoWidth || !video.videoHeight) {
+  // Source dimensions: in VP9-444 / WebCodecs render modes the
+  // `<video>` is hidden + unfed (videoWidth=0), so the agent's encode
+  // resolution we cached from the worker's `first-frame` message is
+  // the only ground truth for source pixel size.
+  const useIntrinsic = rc.vp9_444Active.value || rc.webcodecsActive.value
+  const srcW = useIntrinsic
+    ? rc.mediaIntrinsicW.value
+    : (video?.videoWidth ?? 0)
+  const srcH = useIntrinsic
+    ? rc.mediaIntrinsicH.value
+    : (video?.videoHeight ?? 0)
+  if (!stage || !srcW || !srcH) {
     return { sx: 1, sy: 1, offsetX: 0, offsetY: 0 }
   }
   if (rc.scaleMode.value === 'original') {
@@ -973,7 +984,7 @@ function cursorMapping(): { sx: number; sy: number; offsetX: number; offsetY: nu
   // producing letterbox bars on the axis where aspect ratios disagree.
   const fw = stage.clientWidth
   const fh = stage.clientHeight
-  const vAR = video.videoWidth / video.videoHeight
+  const vAR = srcW / srcH
   const fAR = fw / fh
   let visibleW: number
   let visibleH: number
@@ -991,8 +1002,8 @@ function cursorMapping(): { sx: number; sy: number; offsetX: number; offsetY: nu
     offsetY = 0
   }
   return {
-    sx: visibleW / video.videoWidth,
-    sy: visibleH / video.videoHeight,
+    sx: visibleW / srcW,
+    sy: visibleH / srcH,
     offsetX,
     offsetY,
   }

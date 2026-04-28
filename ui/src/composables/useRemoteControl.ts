@@ -1529,24 +1529,52 @@ export function useRemoteControl() {
       ev: PointerEvent | MouseEvent | WheelEvent,
     ): { x: number; y: number; insideVideo: boolean } {
       const video = findVideo()
-      // In `original` / `custom` scale modes the `<video>` element is
+      // VP9-444 mode: the `<video>` is hidden + unfed (the agent's
+      // pump routed encoded frames to the `video-bytes` DC instead of
+      // the WebRTC track), so `video.videoWidth` is 0. The visible
+      // surface is the `<canvas>` painted by rc-vp9-444-worker, and
+      // its intrinsic dimensions (the agent's encode resolution) are
+      // already cached in `mediaIntrinsicW/H` from the worker's
+      // `first-frame` message. Use that instead — without it the
+      // letterbox math hits divide-by-zero and every pointer event
+      // gets mapped to NaN, dropping all clicks/moves silently.
+      // Same shape applies to the WebCodecs render path (the canvas
+      // there also reports via `first-frame`), but in that path the
+      // `<video>` is also fed the RTP track so videoWidth is non-zero
+      // anyway — falling through to the canvas path is harmless.
+      const useCanvasDims = vp9_444Active.value || webcodecsActive.value
+      const intrinsicW = useCanvasDims
+        ? mediaIntrinsicW.value
+        : (video?.videoWidth ?? 0)
+      const intrinsicH = useCanvasDims
+        ? mediaIntrinsicH.value
+        : (video?.videoHeight ?? 0)
+      // In `original` / `custom` scale modes the surface element is
       // sized to its own intrinsic pixels (× custom scale) — there's
       // no letterboxing inside it, so map directly against its
       // bounding rect. In `adaptive` mode the element fills the stage
       // and `object-fit: contain` letterboxes internally, so we need
       // the stage rect + aspect-ratio math.
-      if (scaleMode.value !== 'adaptive' && video) {
-        const videoRect = video.getBoundingClientRect()
+      //
+      // Pick the live render surface for the direct-bounding-rect
+      // path: video in legacy mode, canvas in VP9-444 / WebCodecs
+      // modes. (The `<video>` is `display: none` in the latter two,
+      // so getBoundingClientRect() would report a zero rect.)
+      const renderEl: HTMLElement | null = useCanvasDims
+        ? (surface.querySelector('canvas.remote-video') as HTMLElement | null)
+        : video
+      if (scaleMode.value !== 'adaptive' && renderEl) {
+        const r = renderEl.getBoundingClientRect()
         return directVideoNormalise(
           ev.clientX, ev.clientY,
-          { left: videoRect.left, top: videoRect.top, width: videoRect.width, height: videoRect.height },
+          { left: r.left, top: r.top, width: r.width, height: r.height },
         )
       }
       const frameRect = surface.getBoundingClientRect()
       return letterboxedNormalise(
         ev.clientX, ev.clientY,
         { left: frameRect.left, top: frameRect.top, width: frameRect.width, height: frameRect.height },
-        video?.videoWidth ?? 0, video?.videoHeight ?? 0,
+        intrinsicW, intrinsicH,
       )
     }
 
