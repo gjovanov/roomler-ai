@@ -205,6 +205,29 @@ async fn post_install_watch_cmd(
 /// `ROOMLER_AGENT_ENCODER` → config file field → default (Auto).
 /// Invalid values fall through to Auto with a warning, so a typo can't
 /// prevent the agent from starting.
+fn rollback_attention_msg(
+    current: &str,
+    target: &str,
+    crash_count: u32,
+    failure_reason: Option<&str>,
+) -> String {
+    let mut msg = format!(
+        "Roomler agent: crash loop detected (auto-rollback failed).\n\n\
+         Version {current} has crashed {crash_count} times within \
+         {win_min} min. Last known good version: {target}.\n",
+        win_min = config::CRASH_WINDOW_SECS / 60,
+    );
+    if let Some(why) = failure_reason {
+        msg.push_str(&format!("\nAutomatic rollback could not run: {why}\n"));
+    }
+    msg.push_str(
+        "\nRecommended action: download the previous installer from\n\
+         https://github.com/gjovanov/roomler-ai/releases\n\
+         and reinstall manually.",
+    );
+    msg
+}
+
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -370,32 +393,71 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     if config::should_rollback(&cfg, current_pkg, now_unix)
         && let Some(target) = cfg.last_known_good_version.clone()
     {
-        {
-            let msg = format!(
-                "Roomler agent: crash loop detected.\n\n\
-                 Version {current_pkg} has crashed {n} times within the last \
-                 {win_min} min. Last known good version: {target}.\n\n\
-                 Recommended action: downgrade to {target} until the issue\n\
-                 in {current_pkg} is investigated.",
-                n = cfg.crash_count,
-                win_min = config::CRASH_WINDOW_SECS / 60,
-            );
-            match notify::raise_attention(&msg) {
-                Ok(p) => tracing::error!(
-                    path = %p.display(),
-                    target = %target,
-                    "rollback recommended; sentinel raised"
-                ),
-                Err(e) => tracing::error!(
-                    error = %e,
-                    target = %target,
-                    "rollback recommended but could not raise sentinel"
-                ),
+        let target_tag = format!("agent-v{target}");
+        tracing::error!(
+            current = %current_pkg,
+            target = %target_tag,
+            crash_count = cfg.crash_count,
+            "crash loop detected; attempting automatic rollback"
+        );
+        // Mark attempted FIRST so a crash during the rollback
+        // itself doesn't loop us back into another rollback. If the
+        // rollback fetch / install fails, the operator still gets
+        // the attention sentinel below and can act manually.
+        config::mark_rollback_attempted(&mut cfg);
+        let _ = config::save(config_path, &cfg);
+
+        let outcome = updater::pin_version(&target_tag).await;
+        match outcome {
+            updater::CheckOutcome::UpdateReady {
+                latest,
+                installer_path,
+                ..
+            } => {
+                tracing::warn!(
+                    target = %latest,
+                    path = %installer_path.display(),
+                    "rollback installer downloaded — spawning + exiting"
+                );
+                if let Err(e) =
+                    updater::spawn_installer_with_watch(&installer_path, Some(&latest))
+                {
+                    tracing::error!(error = %e, "rollback installer spawn failed");
+                    let _ = notify::raise_attention(&rollback_attention_msg(
+                        current_pkg,
+                        &target,
+                        cfg.crash_count,
+                        Some(&format!("automatic install failed: {e}")),
+                    ));
+                } else {
+                    // Installer is running, agent is about to exit.
+                    // The post-install watcher (spawned by
+                    // spawn_installer_with_watch) will record the
+                    // verdict in last-install.json; the new binary
+                    // can surface it on next start.
+                    return Ok(());
+                }
             }
-            // Mark attempted so we don't re-spam the sentinel every
-            // time the agent restarts inside the same crash window.
-            config::mark_rollback_attempted(&mut cfg);
-            let _ = config::save(config_path, &cfg);
+            updater::CheckOutcome::Skipped(reason) => {
+                tracing::error!(%reason, "rollback fetch skipped — operator action required");
+                let _ = notify::raise_attention(&rollback_attention_msg(
+                    current_pkg,
+                    &target,
+                    cfg.crash_count,
+                    Some(&reason),
+                ));
+            }
+            updater::CheckOutcome::UpToDate { .. } => {
+                tracing::warn!(
+                    "rollback target reports as up-to-date — odd state, raising sentinel"
+                );
+                let _ = notify::raise_attention(&rollback_attention_msg(
+                    current_pkg,
+                    &target,
+                    cfg.crash_count,
+                    Some("target version reports as up-to-date — manual investigation needed"),
+                ));
+            }
         }
     }
 
