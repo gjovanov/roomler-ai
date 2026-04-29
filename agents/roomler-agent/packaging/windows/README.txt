@@ -47,25 +47,34 @@ At that point this machine appears (online) in the admin UI at
 http://roomler.ai/ under Admin -> Agents. A controller can click
 "Connect" to open a remote desktop session.
 
-Autostart on logon (recommended)
---------------------------------
-Once the interactive run works, register the agent to start on every
-login:
+Autostart on logon (registered automatically since 0.1.54)
+----------------------------------------------------------
+The MSI registers the auto-start hook automatically on install + on
+every upgrade. After running the MSI you should already have a
+Scheduled Task called `RoomlerAgent` with the resilience XML
+(restart-on-failure, battery-defeat, single-instance belt). Confirm
+with:
 
-    & $agent service install
+    schtasks /Query /TN RoomlerAgent
 
-Query the current state with `service status`; remove with
-`service uninstall`. The install subcommand creates a Scheduled Task
-called `RoomlerAgent` with an ONLOGON trigger + LIMITED run level
-(equivalent to the `schtasks /Create /SC ONLOGON` command below but
-with a stable task name the agent can query + remove on its own).
+If you ever need to manage the hook manually (e.g. after restoring a
+backup or recovering from the rare Win11 ACL-locked-task scenario):
 
-Manual equivalent (if you'd rather drive it yourself):
+    & $agent service install     # register / re-register
+    & $agent service uninstall   # tear down
+    & $agent service status      # query state
 
-    schtasks /Create /SC ONLOGON /TN "RoomlerAgent" `
-             /TR "$agent run" /RL LIMITED
+Earlier versions (0.1.49 and below) used a simpler `schtasks /Create
+/SC ONLOGON` registration without the resilience settings — those
+upgrade automatically once the new MSI lands. If your existing task
+has an ACL tightened so even the owner can't overwrite it (rare
+Win11 quirk), the MSI's RegisterAutostart custom action will silently
+skip (Return="ignore" so install completes), and the operator can
+delete the locked task from an elevated PowerShell once with:
 
-    schtasks /Delete /TN "RoomlerAgent" /F
+    schtasks /Delete /TN RoomlerAgent /F
+
+then re-run `service install` from a normal shell.
 
 Auto-update
 -----------
