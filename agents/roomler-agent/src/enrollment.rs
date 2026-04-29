@@ -74,6 +74,12 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         machine_id: inputs.machine_id.to_string(),
         machine_name: inputs.machine_name.to_string(),
         encoder_preference: crate::config::EncoderPreferenceChoice::default(),
+        update_check_interval_h: None,
+        last_known_good_version: None,
+        crash_count: 0,
+        last_crash_unix: 0,
+        rollback_attempted: false,
+        last_run_unhealthy: false,
     })
 }
 

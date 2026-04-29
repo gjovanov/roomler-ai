@@ -338,39 +338,76 @@ pub async fn check_once() -> CheckOutcome {
 ///   runs the receipt-based install; prompts for auth if the pkg
 ///   uses /Library paths.
 pub fn spawn_installer(installer_path: &std::path::Path) -> Result<()> {
+    spawn_installer_with_watch(installer_path, None)
+}
+
+/// Spawn the installer for `installer_path` AND, when an
+/// `expected_version` tag is provided, spawn a sibling
+/// `roomler-agent post-install-watch` process that captures the
+/// installer's exit code + verifies the new binary's `--version`.
+///
+/// The watcher must be spawned *before* this function returns so the
+/// installer's PID is still in the process table; once the parent
+/// agent exits the installer is reparented to init/explorer and the
+/// watcher polls it from there.
+///
+/// `expected_version=None` keeps the legacy "fire and forget" path —
+/// useful for tests and the manual `self-update` CLI where the
+/// outcome JSON adds nothing the operator can't see directly.
+pub fn spawn_installer_with_watch(
+    installer_path: &std::path::Path,
+    expected_version: Option<&str>,
+) -> Result<()> {
+    let installer_pid = spawn_installer_inner(installer_path)?;
+    if let Some(tag) = expected_version
+        && let Err(e) = spawn_watcher(installer_pid, installer_path, tag)
+    {
+        // Don't fail the whole self-update flow on a watcher spawn
+        // failure — the installer is already running and the agent
+        // is about to exit; we lose the outcome JSON but the user
+        // still gets the upgrade.
+        tracing::warn!(error = %e, "post-install watcher spawn failed");
+    }
+    Ok(())
+}
+
+fn spawn_installer_inner(installer_path: &std::path::Path) -> Result<u32> {
     #[cfg(target_os = "windows")]
     {
         let path_str = installer_path.to_string_lossy().into_owned();
-        std::process::Command::new("msiexec")
+        let child = std::process::Command::new("msiexec")
             .args(["/i", &path_str, "/qn", "/norestart"])
             .spawn()
             .context("spawning msiexec")?;
-        Ok(())
+        Ok(child.id())
     }
     #[cfg(target_os = "linux")]
     {
         let path_str = installer_path.to_string_lossy().into_owned();
         // Try pkexec first for an interactive password prompt; fall
         // back to direct dpkg if pkexec isn't installed.
-        let pkexec = std::process::Command::new("pkexec")
+        match std::process::Command::new("pkexec")
             .args(["apt-get", "install", "-y", &path_str])
-            .spawn();
-        if pkexec.is_err() {
-            std::process::Command::new("dpkg")
-                .args(["--install", &path_str])
-                .spawn()
-                .context("spawning dpkg")?;
+            .spawn()
+        {
+            Ok(child) => Ok(child.id()),
+            Err(_) => {
+                let child = std::process::Command::new("dpkg")
+                    .args(["--install", &path_str])
+                    .spawn()
+                    .context("spawning dpkg")?;
+                Ok(child.id())
+            }
         }
-        Ok(())
     }
     #[cfg(target_os = "macos")]
     {
         let path_str = installer_path.to_string_lossy().into_owned();
-        std::process::Command::new("installer")
+        let child = std::process::Command::new("installer")
             .args(["-pkg", &path_str, "-target", "CurrentUserHomeDirectory"])
             .spawn()
             .context("spawning installer(8)")?;
-        Ok(())
+        Ok(child.id())
     }
     #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
     {
@@ -381,6 +418,68 @@ pub fn spawn_installer(installer_path: &std::path::Path) -> Result<()> {
     }
 }
 
+fn spawn_watcher(
+    installer_pid: u32,
+    installer_path: &std::path::Path,
+    expected_version: &str,
+) -> Result<()> {
+    let exe = std::env::current_exe().context("locating own exe for watcher spawn")?;
+    let _child = std::process::Command::new(&exe)
+        .arg("post-install-watch")
+        .arg("--installer-pid")
+        .arg(installer_pid.to_string())
+        .arg("--installer-path")
+        .arg(installer_path)
+        .arg("--expected-version")
+        .arg(expected_version)
+        .spawn()
+        .context("spawning post-install-watch subprocess")?;
+    // We deliberately don't capture the Child — when the parent
+    // agent exits, the watcher is reparented to init/explorer
+    // (Unix) / orphaned (Windows, where there's no init). Either
+    // way it runs to completion on its own.
+    Ok(())
+}
+
+/// Resolve the effective update-check cadence for this run. Order:
+///
+/// 1. `ROOMLER_AGENT_UPDATE_INTERVAL_H` env var (parses an unsigned
+///    integer count of hours; non-positive or non-numeric is ignored
+///    so a typo can't accidentally disable updates).
+/// 2. `update_check_interval_h` field on `AgentConfig`, if set.
+/// 3. Built-in [`CHECK_INTERVAL`] (24 h).
+///
+/// Logged at startup for operator transparency. Pure resolver lives
+/// in [`resolve_check_interval_with`] so tests don't have to mutate
+/// process env (which races between parallel test runs).
+pub fn resolve_check_interval(cfg: &crate::config::AgentConfig) -> Duration {
+    let env_val = std::env::var("ROOMLER_AGENT_UPDATE_INTERVAL_H").ok();
+    resolve_check_interval_with(env_val.as_deref(), cfg.update_check_interval_h)
+}
+
+/// Pure cadence resolver. Mirrors the precedence documented on
+/// [`resolve_check_interval`]; `env_value` is whatever the env var
+/// would have parsed to (caller's responsibility), `cfg_value` is
+/// the config-file field. Both default-to-fall-through on invalid
+/// input so a typo in either layer can't disable updates.
+pub(crate) fn resolve_check_interval_with(
+    env_value: Option<&str>,
+    cfg_value: Option<u32>,
+) -> Duration {
+    if let Some(s) = env_value
+        && let Ok(h) = s.trim().parse::<u32>()
+        && h > 0
+    {
+        return Duration::from_secs(u64::from(h) * 3600);
+    }
+    if let Some(h) = cfg_value
+        && h > 0
+    {
+        return Duration::from_secs(u64::from(h) * 3600);
+    }
+    CHECK_INTERVAL
+}
+
 /// Periodic update loop. Returns only on shutdown. Runs `check_once`
 /// immediately, then on a fixed cadence. On `UpdateReady` the loop
 /// spawns the installer and sends `true` on the shutdown channel so
@@ -388,6 +487,7 @@ pub fn spawn_installer(installer_path: &std::path::Path) -> Result<()> {
 pub async fn run_periodic(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
+    interval: Duration,
 ) {
     let mut first = true;
     loop {
@@ -396,7 +496,7 @@ pub async fn run_periodic(
         }
         if !first {
             tokio::select! {
-                _ = tokio::time::sleep(CHECK_INTERVAL) => {},
+                _ = tokio::time::sleep(interval) => {},
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() { return; }
                 },
@@ -419,7 +519,7 @@ pub async fn run_periodic(
                     path = %installer_path.display(),
                     "new release available — spawning installer and exiting"
                 );
-                if let Err(e) = spawn_installer(&installer_path) {
+                if let Err(e) = spawn_installer_with_watch(&installer_path, Some(&latest)) {
                     tracing::error!(error = %e, "installer spawn failed; will retry next cycle");
                     continue;
                 }
@@ -436,6 +536,67 @@ pub async fn run_periodic(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_check_interval_default_is_24h() {
+        assert_eq!(
+            resolve_check_interval_with(None, None),
+            CHECK_INTERVAL,
+            "no env, no config → built-in default"
+        );
+    }
+
+    #[test]
+    fn resolve_check_interval_uses_config_field_when_no_env() {
+        assert_eq!(
+            resolve_check_interval_with(None, Some(168)),
+            Duration::from_secs(168 * 3600),
+            "weekly via config field"
+        );
+    }
+
+    #[test]
+    fn resolve_check_interval_env_overrides_config() {
+        assert_eq!(
+            resolve_check_interval_with(Some("6"), Some(168)),
+            Duration::from_secs(6 * 3600),
+            "env must win over config when both set"
+        );
+    }
+
+    #[test]
+    fn resolve_check_interval_ignores_invalid_env() {
+        // A typo in the env var must NOT silently fall back to "no
+        // updates" — it falls through to the config / default layers.
+        assert_eq!(
+            resolve_check_interval_with(Some("not-a-number"), Some(48)),
+            Duration::from_secs(48 * 3600)
+        );
+    }
+
+    #[test]
+    fn resolve_check_interval_ignores_zero_env_and_zero_config() {
+        // Zero is ambiguous ("disable?" vs "tight loop?"). Both
+        // layers fall through; the built-in default ultimately wins.
+        assert_eq!(
+            resolve_check_interval_with(Some("0"), Some(48)),
+            Duration::from_secs(48 * 3600),
+            "zero env → fall through to config"
+        );
+        assert_eq!(
+            resolve_check_interval_with(None, Some(0)),
+            CHECK_INTERVAL,
+            "zero config → fall through to default"
+        );
+    }
+
+    #[test]
+    fn resolve_check_interval_trims_env_whitespace() {
+        assert_eq!(
+            resolve_check_interval_with(Some(" 12 "), None),
+            Duration::from_secs(12 * 3600)
+        );
+    }
 
     #[test]
     fn parse_version_handles_agent_prefix_and_v_prefix() {

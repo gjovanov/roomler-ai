@@ -14,8 +14,8 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use roomler_agent::{
-    config, encode, enrollment, instance_lock, logging, machine, notify, service, signaling,
-    updater, watchdog,
+    config, encode, enrollment, instance_lock, logging, machine, notify, post_install, service,
+    signaling, updater, watchdog,
 };
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -110,6 +110,27 @@ enum Command {
         #[arg(long)]
         check_only: bool,
     },
+    /// (internal) Watch a running installer process and record its
+    /// exit code + the new binary's version to `last-install.json`.
+    /// Spawned automatically by the updater immediately before the
+    /// agent exits to make room for the installer; not intended for
+    /// interactive use. Hidden from `--help` to avoid confusion.
+    #[command(hide = true)]
+    PostInstallWatch {
+        /// PID of the installer (msiexec / dpkg / installer(8))
+        /// the parent agent just spawned.
+        #[arg(long)]
+        installer_pid: u32,
+        /// Path of the installer artifact (only logged for the
+        /// outcome JSON; not opened).
+        #[arg(long)]
+        installer_path: PathBuf,
+        /// Tag of the release being installed (e.g. `agent-v0.1.51`).
+        /// Used to verify the new binary's `--version` output after
+        /// install completes.
+        #[arg(long)]
+        expected_version: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -148,13 +169,49 @@ async fn main() -> Result<()> {
         Command::Displays => displays_cmd().await,
         Command::Service { action } => service_cmd(action).await,
         Command::SelfUpdate { check_only } => self_update_cmd(check_only).await,
+        Command::PostInstallWatch {
+            installer_pid,
+            installer_path,
+            expected_version,
+        } => post_install_watch_cmd(installer_pid, installer_path, expected_version).await,
     }
+}
+
+async fn post_install_watch_cmd(
+    installer_pid: u32,
+    installer_path: PathBuf,
+    expected_version: String,
+) -> Result<()> {
+    tracing::info!(
+        installer_pid,
+        path = %installer_path.display(),
+        expected = %expected_version,
+        "post-install watcher started"
+    );
+    // `watch` is blocking — spin a blocking task so we don't hold
+    // the tokio runtime busy-waiting on a sync OS sleep loop.
+    let outcome =
+        tokio::task::spawn_blocking(move || post_install::watch(installer_pid, installer_path, expected_version))
+            .await
+            .context("post-install watcher join")??;
+    println!(
+        "post-install verdict: {:?} ({})",
+        outcome.status, outcome.note
+    );
+    Ok(())
 }
 
 /// Resolution order for `encoder_preference`: CLI flag → env var
 /// `ROOMLER_AGENT_ENCODER` → config file field → default (Auto).
 /// Invalid values fall through to Auto with a warning, so a typo can't
 /// prevent the agent from starting.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 fn resolve_encoder_preference(
     cli: Option<&str>,
     cfg_field: config::EncoderPreferenceChoice,
@@ -270,7 +327,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
             return Ok(());
         }
     };
-    let cfg = config::load(config_path).context("loading config")?;
+    let mut cfg = config::load(config_path).context("loading config")?;
     let encoder_preference = resolve_encoder_preference(cli_encoder, cfg.encoder_preference);
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -281,7 +338,77 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         "agent starting"
     );
 
+    // Crash-loop bookkeeping: if the previous run was marked
+    // `last_run_unhealthy=true` (started, never reached the clean
+    // threshold, never exited gracefully) → count it as a crash. Then
+    // mark THIS run as tentatively unhealthy; either the 5-min healthy
+    // task or the Ctrl-C handler will flip the flag back to false.
+    // Save before checking for rollback so the worst-case state is
+    // durable on disk if we then crash again.
+    let now_unix = unix_now();
+    let current_pkg = env!("CARGO_PKG_VERSION");
+    if cfg.last_run_unhealthy {
+        config::record_crash_at(&mut cfg, now_unix);
+        tracing::warn!(
+            crash_count = cfg.crash_count,
+            "previous run did not reach clean-run threshold — counting as crash"
+        );
+    }
+    config::mark_run_starting(&mut cfg);
+    if let Err(e) = config::save(config_path, &cfg) {
+        tracing::warn!(error = %e, "could not persist crash-tracking state");
+    }
+
+    // If the crash counter has tripped the rollback threshold AND we
+    // have a known-good fallback to roll back TO that isn't this same
+    // version, raise an attention sentinel. v1 does NOT auto-execute
+    // the rollback install — that requires fetching a specific tag's
+    // installer and ships in 0.1.52 alongside the SHA256 / HMAC
+    // manifest work. The operator can downgrade manually via
+    // `roomler-agent self-update --pin <version>` (also 0.1.52) or
+    // by reinstalling the previous MSI by hand.
+    if config::should_rollback(&cfg, current_pkg, now_unix)
+        && let Some(target) = cfg.last_known_good_version.clone()
+    {
+        {
+            let msg = format!(
+                "Roomler agent: crash loop detected.\n\n\
+                 Version {current_pkg} has crashed {n} times within the last \
+                 {win_min} min. Last known good version: {target}.\n\n\
+                 Recommended action: downgrade to {target} until the issue\n\
+                 in {current_pkg} is investigated.",
+                n = cfg.crash_count,
+                win_min = config::CRASH_WINDOW_SECS / 60,
+            );
+            match notify::raise_attention(&msg) {
+                Ok(p) => tracing::error!(
+                    path = %p.display(),
+                    target = %target,
+                    "rollback recommended; sentinel raised"
+                ),
+                Err(e) => tracing::error!(
+                    error = %e,
+                    target = %target,
+                    "rollback recommended but could not raise sentinel"
+                ),
+            }
+            // Mark attempted so we don't re-spam the sentinel every
+            // time the agent restarts inside the same crash window.
+            config::mark_rollback_attempted(&mut cfg);
+            let _ = config::save(config_path, &cfg);
+        }
+    }
+
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    // Resolve runtime knobs that depend on `cfg` BEFORE the signaling
+    // task moves cfg out of scope. (Moving cfg lets signaling::run own
+    // it for the lifetime of the loop without us having to clone the
+    // tokens + URLs that the signaling code rewrites in place.)
+    let auto_update_enabled = std::env::var("ROOMLER_AGENT_AUTO_UPDATE")
+        .map(|v| !matches!(v.as_str(), "0" | "false" | "no" | "off"))
+        .unwrap_or(true);
+    let update_interval = updater::resolve_check_interval(&cfg);
 
     // Install the liveness watchdog. Pumps tick after every iteration;
     // the scan loop force-exits via std::process::exit(STALL_EXIT_CODE)
@@ -308,20 +435,58 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         async move { signaling::run(cfg, encoder_preference, rx).await }
     });
 
+    // Clean-run promotion task: after the agent has been alive for
+    // CLEAN_RUN_THRESHOLD_SECS, reload + update + save the config
+    // to mark this version as last-known-good and reset the crash
+    // counter. Reload-then-save (rather than holding cfg) avoids
+    // clobbering any concurrent writes from `re-enroll` or the
+    // updater path. Aborts cleanly on shutdown.
+    let clean_run_task = tokio::spawn({
+        let path = config_path.clone();
+        let mut shutdown = shutdown_rx.clone();
+        let pkg = current_pkg.to_string();
+        async move {
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(
+                    config::CLEAN_RUN_THRESHOLD_SECS,
+                )) => {
+                    match config::load(&path) {
+                        Ok(mut current) => {
+                            config::record_clean_run_at(&mut current, &pkg);
+                            if let Err(e) = config::save(&path, &current) {
+                                tracing::warn!(error = %e, "could not persist clean-run promotion");
+                            } else {
+                                tracing::info!(
+                                    last_known_good = %pkg,
+                                    "clean-run threshold reached; promoted to last-known-good"
+                                );
+                            }
+                        }
+                        Err(e) => tracing::warn!(error = %e, "could not reload config for clean-run promotion"),
+                    }
+                }
+                _ = shutdown.changed() => {}
+            }
+        }
+    });
+
     // Background auto-updater — checks GitHub Releases on startup and
-    // every 6 h. Writes to `shutdown_tx` when a newer version is
+    // every `update_check_interval_h` hours (default 24, configurable
+    // via the AgentConfig field or `ROOMLER_AGENT_UPDATE_INTERVAL_H`
+    // env var). Writes to `shutdown_tx` when a newer version is
     // downloaded and the installer is spawned, so the signalling task
     // tears down cleanly before the running binary gets overwritten.
-    // Disable with `ROOMLER_AGENT_AUTO_UPDATE=0` for air-gapped /
-    // operator-managed deployments.
-    let auto_update_enabled = std::env::var("ROOMLER_AGENT_AUTO_UPDATE")
-        .map(|v| !matches!(v.as_str(), "0" | "false" | "no" | "off"))
-        .unwrap_or(true);
+    // Disable entirely with `ROOMLER_AGENT_AUTO_UPDATE=0` for air-
+    // gapped / operator-managed deployments.
     let upd_task = if auto_update_enabled {
+        tracing::info!(
+            interval_h = update_interval.as_secs() / 3600,
+            "auto-updater armed"
+        );
         Some(tokio::spawn({
             let rx = shutdown_rx.clone();
             let tx = shutdown_tx.clone();
-            async move { updater::run_periodic(rx, tx).await }
+            async move { updater::run_periodic(rx, tx, update_interval).await }
         }))
     } else {
         tracing::info!("auto-update disabled via ROOMLER_AGENT_AUTO_UPDATE");
@@ -329,6 +494,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     };
 
     // Wait for Ctrl-C / SIGTERM.
+    let mut graceful_shutdown = false;
     tokio::select! {
         res = sig_task => {
             if let Ok(Err(e)) = res {
@@ -338,14 +504,29 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         }
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("shutdown requested");
+            graceful_shutdown = true;
             let _ = shutdown_tx.send(true);
             // Give the signaling task a short window to flush.
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
     }
     wd_task.abort();
+    clean_run_task.abort();
     if let Some(t) = upd_task {
         t.abort();
+    }
+    // On graceful shutdown, mark the config so the next startup
+    // doesn't count this run as a crash. Reload-then-save again to
+    // avoid clobbering any concurrent writes (clean_run_task may
+    // have just promoted the version, in which case the unhealthy
+    // flag is already false — load+save is a no-op).
+    if graceful_shutdown
+        && let Ok(mut current) = config::load(config_path)
+    {
+        config::mark_clean_shutdown(&mut current);
+        if let Err(e) = config::save(config_path, &current) {
+            tracing::warn!(error = %e, "could not mark clean shutdown");
+        }
     }
     Ok(())
 }
