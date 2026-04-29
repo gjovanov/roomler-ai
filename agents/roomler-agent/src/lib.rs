@@ -17,6 +17,7 @@ pub mod logging;
 pub mod machine;
 pub mod notify;
 pub mod peer;
+pub mod post_install;
 pub mod service;
 pub mod signaling;
 pub mod updater;
