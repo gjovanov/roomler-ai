@@ -34,6 +34,11 @@ serde_json = { workspace = true }
 # Tracing
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# Daily-rolling file appender for the persistent logs that survive a
+# Scheduled-Task / systemd / launchd run where stdout is /dev/null.
+# Pinned to the same minor as tracing-subscriber 0.3 so the
+# `MakeWriter` plumbing aligns.
+tracing-appender = "0.2"
 
 # Errors
 anyhow = { workspace = true }
@@ -125,6 +130,10 @@ rand = { workspace = true }
 # never touch the `windows` crate. Feature list scoped to the MF, D3D11,
 # DXGI, and COM interfaces the encoder actually needs — full-crate
 # features blow up compile time without any benefit.
+[target.'cfg(unix)'.dependencies]
+# Used for `flock` in the single-instance lock. Tiny crate, ubiquitous.
+libc = "0.2"
+
 [target.'cfg(target_os = "windows")'.dependencies.windows]
 version = "0.58"
 optional = true
@@ -215,6 +224,7 @@ full-hw = ["full", "mf-encoder", "wgc-capture", "viewer-indicator"]
 
 [dev-dependencies]
 tokio-test = { workspace = true }
+tempfile = { workspace = true }
 
 # ---------------------------------------------------------------------------
 # Packaging metadata
