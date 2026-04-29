@@ -814,3 +814,269 @@ Root cause of that specific 7-fps case: NVENC Blackwell
 `Custom: 1920×1080`), agent CPU-downscales, UHD 630 HEVC holds 30-60
 fps comfortably at that size. Proper fix deferred to Tier 1C.3
 (GPU-side scale via `VideoProcessorMFT`).
+
+## 19. Resilience cycle (0.1.50 → 0.1.54)
+
+Multi-release hardening of the agent's lifecycle: persistent
+diagnostics, OS-supervisor parity across Win/Linux/macOS, integrity-
+verified updates, automatic rollback, and turn-key install. Five
+patch releases shipped 2026-04-29 in a single push. Total of ~3700
+LOC added, ~150 unit tests; 0 deferred to next cycle from the
+P0 cut.
+
+### 19.1 Failure-resilience P0 (0.1.50)
+
+The five P0 phases that made the agent stop dying silently.
+
+**Persistent file logging + panic hook** (`agents/roomler-agent/src/
+logging.rs`): daily-rolling appender via `tracing-appender` at the
+platform data-local dir (`%LOCALAPPDATA%\roomler\roomler-agent\
+data\logs\` on Win; `~/.local/share/roomler-agent/logs/` on Linux;
+`~/Library/Application Support/live.roomler.roomler-agent/logs/`
+on macOS). 14-day retention via prune-on-startup. `WorkerGuard`
+held in a `OnceLock<WorkerGuard>` so the writer thread survives
+process lifetime. Process-wide `std::panic::set_hook` writes a
+sync `panic-<pid>-<unix>.log` with `Backtrace::force_capture()`
+output BEFORE delegating to the previous hook — the sync write
+is the belt-and-braces against the non-blocking appender's worker
+not draining the queue before the OS reaps a panicking process.
+
+**Windows Scheduled Task XML rewrite** (`agents/roomler-agent/src/
+service.rs::render_task_xml`): replaced `schtasks /Create /SC
+ONLOGON ...` with `schtasks /Create /XML <utf-16-le-bom-tempfile>`.
+Schema 1.2 (broadest universally-supported version, Win 7+).
+Settings that were previously missing or wrong:
+- `<RestartOnFailure><Interval>PT1M</Interval><Count>10</Count></RestartOnFailure>`
+- `<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>`
+- `<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>` (default
+  is `true` — silently kills agent on laptop unplug)
+- `<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>`
+- `<StartWhenAvailable>true</StartWhenAvailable>`
+- Belt-and-braces `<EventTrigger>` on EventID 12 (Microsoft-Windows-
+  Kernel-General "operating system started") for kiosk auto-logon
+  hosts where the LogonTrigger may fire before user session is
+  fully ready
+
+Brings Windows to parity with systemd `Restart=on-failure` (already
+in `packaging/linux/roomler-agent.service`) and macOS launchd
+`KeepAlive` (already in `packaging/macos/com.roomler.agent.plist`).
+
+**Single-instance lock** (`agents/roomler-agent/src/instance_lock.rs`):
+prevents an interactive `roomler-agent run` from racing the
+Scheduled-Task / systemd-launched copy in the same user session.
+Win: `CreateMutexW` named `Local\RoomlerAgent-<sha-prefix12-of-
+config-path>` (`Local\` namespace = per-session scope; SHA disambig
+covers two enrolments on the same machine for the same user). Unix:
+`flock(LOCK_EX | LOCK_NB)` on `$XDG_RUNTIME_DIR/roomler-agent-<id>.
+lock` (or `~/.cache/...` fallback) with PID written for diagnostics.
+Both kernel-released on process death, no stale-lock cleanup needed
+after `kill -9`. Only `run` gates on the lock — `enroll`,
+`service install/uninstall`, `caps`, `displays`, `encoder-smoke`,
+`self-update` stay runnable alongside a live agent.
+
+**Internal liveness watchdog** (`agents/roomler-agent/src/watchdog.
+rs`): process-singleton via `OnceLock<Arc<Watchdog>>`; pumps tick
+via global `watchdog::tick("name")` free helpers (no parameter
+threading). Per-pump thresholds — signaling: 90s (keepalive cadence
+25s × 3 grace); encoder + capture: 30s (gated on session-active so
+they ignore quiet idle periods between sessions). Async `run()`
+loop wakes every 5s, scans, force-exits via `std::process::exit(2)`
+(sentinel code distinct from 0 + 1) on stall — relies on the OS
+supervisor to relaunch a healthy copy. Suspend handling: if a loop
+iteration takes more than `SCAN_INTERVAL + 60s`, treat as wall-clock
+jump (laptop close-lid → resume) and reset all pump heartbeats
+instead of declaring a stall. **Watchdog-of-watchdog** runs on a
+dedicated `std::thread` (the only `std::thread` in the codebase),
+wakes every 30s, force-exits if the async watchdog hasn't bumped
+its `AtomicU64` heartbeat in 60s — catches a fully-deadlocked
+tokio runtime.
+
+**Token revocation grace** (`agents/roomler-agent/src/signaling.rs`):
+replaced the `AuthRejected → hard exit` branch with a backoff ladder
+(`auth_backoff_for`): 30s → 60s → 5min → 1h capped. Server-side
+JWT cache flushes during a deploy used to permanently break every
+agent in the field; now they back off and rejoin within seconds.
+After 3 consecutive 401s, raises `<config-dir>/needs-attention.txt`
+sentinel via `notify::raise_attention` describing the situation +
+recommending `roomler-agent re-enroll --token <jwt>` (new CLI
+that preserves `machine_id` + `machine_name` from the existing
+config). Sentinel auto-cleared on auth recovery.
+
+### 19.2 Update-path hardening (0.1.51)
+
+**Configurable update cadence**: `update_check_interval_h: Option<u32>`
+config field + `ROOMLER_AGENT_UPDATE_INTERVAL_H` env var override.
+Pure resolver `resolve_check_interval_with(env_value, cfg_value)`
+extracted so tests don't race on process env. Defaults to the
+existing 24 h built-in.
+
+**Post-install watcher** (`agents/roomler-agent/src/post_install.rs`):
+new hidden CLI subcommand `roomler-agent post-install-watch
+--installer-pid <pid> --installer-path <path> --expected-version
+<tag>`. Spawned by `updater::spawn_installer_with_watch` as a
+sibling of msiexec / dpkg / installer(8) just before the parent
+agent exits to make room for the installer. Watcher polls the
+installer PID (Win `OpenProcess` + `WaitForSingleObject`; Unix
+`kill(pid, 0)` loop), captures the exit code, sleeps 2s for FS
+settle, runs the new binary's `--version`, writes a typed JSON
+outcome to `<log_dir>/last-install.json` with status
+`InProgress` / `SucceededVerified` / `SucceededUnverified` /
+`InstallerFailed` / `Timeout`. Operators + future agent startups
+read the file to surface what actually happened to the upgrade.
+
+**AgentConfig crash-tracking fields** (all `#[serde(default)]` for
+back-compat — pre-0.1.51 configs continue to load, locked by
+`old_config_without_new_fields_loads_with_defaults`): `last_known_
+good_version: Option<String>`; `crash_count: u32`; `last_crash_unix:
+u64`; `rollback_attempted: bool`; `last_run_unhealthy: bool`.
+
+**Crash-loop detection**: at `run_cmd` startup, if
+`last_run_unhealthy=true` (previous run started but never reached
+`CLEAN_RUN_THRESHOLD_SECS=300` and didn't exit gracefully via
+Ctrl-C), `record_crash_at` bumps the in-window counter
+(`CRASH_WINDOW_SECS=600`). After 5 min of healthy signaling, a
+background tokio task promotes the running version to
+`last_known_good_version` and resets the counter via
+`record_clean_run_at`. Ctrl-C handler also clears the unhealthy
+flag (`mark_clean_shutdown`). When `should_rollback` returns true
+(3 crashes within 10 min, target != current, !rollback_attempted),
+the agent raises an operator-attention sentinel.
+
+### 19.3 SHA256 verification + automatic rollback (0.1.52)
+
+**SHA256 asset verification** (`updater::verify_sha256`): GitHub
+Releases API exposes a `digest` field per asset of the form
+`"sha256:<hex>"` (added late 2024). Forwarded by the proxy via
+`AgentReleaseAsset.digest`. Agent computes SHA256 of downloaded
+bytes via `sha2`, compares case-insensitive against the digest;
+mismatched downloads NEVER touch disk. Refuses unsupported
+algorithms loud (`sha512:...` etc) so a future GitHub format
+change fails-loud rather than silently disabling verification.
+Falls through to the existing `MIN_INSTALLER_BYTES` size floor
+when digest is absent (pre-2024 releases or proxy that doesn't
+yet forward the field).
+
+**`updater::pin_version(tag)`**: fetches a specific release from
+`https://api.github.com/repos/.../releases/tags/<tag>` directly
+(bypasses the roomler-ai proxy because pinning is rare per-agent
+crash-loop recovery, not a fleet-wide poll). Returns the same
+`CheckOutcome::UpdateReady` shape as the regular update path so
+the rest of the install flow composes.
+
+**Automatic rollback execution**: when `should_rollback` fires AND
+`last_known_good_version` is set AND it's different from current:
+mark `rollback_attempted=true` FIRST (so a crash during the
+rollback fetch can't loop us into another rollback) → save → call
+`pin_version(format!("agent-v{target}"))` → on `UpdateReady`,
+spawn the installer with the post-install watcher, exit so the
+installer can overwrite the binary. Failure modes (Skipped,
+UpToDate, spawn error) raise the operator-attention sentinel
+with a remediation link to the GitHub releases page so the
+operator can downgrade manually.
+
+### 19.4 Schema 1.3+ regression fix (0.1.53)
+
+0.1.50's `service install` shipped `<DisallowStartOnRemoteAppSession>`
+and `<UseUnifiedSchedulingEngine>` inside a `<Task version="1.2">`
+document — both are Schema 1.3+ Settings.* children. schtasks /XML
+on Win10/11 correctly rejected the document with
+`(39,7):DisallowStartOnRemoteAppSession: ERROR: The task XML
+contains an unexpected node`. Field impact: anyone who tried
+`roomler-agent service install` after 0.1.50–0.1.52 saw the error
+and kept their pre-0.1.50 ONLOGON task. Their *binary* had all the
+in-process resilience features but their *Scheduled Task* still had
+the bad battery defaults.
+
+Fix: removed both elements (neither was load-bearing — the
+resilience-critical settings are all Schema 1.2 native). Locked by
+`xml_template_excludes_schema_1_3_only_elements` regression test
+so a future "let me bump these back in" diff fails CI.
+
+### 19.5 MSI auto-registers Scheduled Task (0.1.54)
+
+WiX custom actions in `agents/roomler-agent/wix/main.wxs`:
+
+- `RegisterAutostart`: `FileKey='roomler_agent_exe'
+  ExeCommand='service install' Execute='deferred' Impersonate='yes'
+  Return='ignore'`. Sequenced `After='InstallFiles'` with condition
+  `NOT (REMOVE="ALL")` so it runs on fresh install + repair +
+  MajorUpgrade but skips during full uninstall.
+- `UnregisterAutostart`: same shape with `service uninstall`.
+  Sequenced `Before='RemoveFiles'` (the action shells out to the
+  EXE so it must still be on disk) with condition `REMOVE="ALL"`
+  so it only fires during full uninstall, not modify/repair.
+
+perUser MSI runs in the user's token (no UAC, no SYSTEM
+impersonation complications). `Return="ignore"` so an existing-
+task ACL conflict (the rare Win11 quirk that bit the field on
+2026-04-29 — see §19.7) doesn't sink the install.
+
+Closes the UX gap that bit operators upgrading from 0.1.49 → 0.1.5x:
+the new task XML shipped inside `service::install()` but the MSI
+never ran it. From 0.1.54 onwards every install + upgrade refreshes
+the task definition automatically.
+
+### 19.6 CI hardening (during 0.1.54 cycle)
+
+`continue-on-error: true` on the three `Cache cargo` steps in
+`.github/workflows/release-agent.yml`. agent-v0.1.53 attempt 1
+failed despite every build / smoke / artifact-upload step
+succeeding — the post-job tar/zstd cache write returned non-zero,
+which marked the whole job as failure and caused
+`Publish GitHub Release` to skip. Attempt 2 (manual rerun) was
+green. Cache is an optimisation, not a correctness gate.
+
+### 19.7 Field gotcha: Win11 ACL-locked Scheduled Tasks
+
+Discovered while validating 0.1.52 → 0.1.53: existing tasks
+created via `schtasks /Create /SC ONLOGON` (the pre-0.1.50 path)
+can develop a tightened ACL that denies even the owner Modify and
+Delete rights without elevation. Symptom on neo16:
+`Unregister-ScheduledTask` returns `HRESULT 0x80070005`
+(E_ACCESSDENIED), and `schtasks /Create /XML /F` fails with
+`Access is denied` even though the existing task's `Author` field
+matches the current user. UAC token-filtering on Win11 is the
+likely root cause (admin users run with a filtered non-admin token
+by default; modifying certain scheduled-task properties requires
+the unfiltered token).
+
+**Recovery** (one-time, per machine that hits this):
+```powershell
+# Elevated PowerShell:
+schtasks /Delete /TN RoomlerAgent /F
+
+# Normal PowerShell (post-0.1.54):
+& "$env:LOCALAPPDATA\Programs\roomler-agent\roomler-agent.exe" service install
+```
+
+After this, the freshly-created task has a normal ACL and future
+upgrades can self-manage. From 0.1.54 onwards new installs never
+hit this — only pre-existing locked tasks.
+
+### 19.8 Pending — picked up in next session
+
+- **Phase 7 (heartbeat telemetry)**: server-side `/api/agent/heartbeat`
+  route + DAO writes `agents.last_seen_at` + a small payload
+  (`uptime_s`, `version`, `encoder_status`, `last_error`,
+  `sessions_active`). Wire-format `ClientMsg::AgentHeartbeat` over
+  the existing `/ws` (no separate REST). Closes the "agent shows
+  online forever after silent disconnect" issue.
+- **Phase 8 (pre-flight checks)**: clock-skew (HEAD `Date:` vs.
+  local), DNS, TCP probe at startup. Non-blocking 15s budget;
+  signaling loop runs unconditionally afterward. Friendlier
+  error messages for the common deployment blunders ("clock skew
+  47 min — check time sync (w32time / ntpd)", "TCP probe failed
+  — check firewall outbound 443").
+- **Effort 2 (Windows Service deployment mode)**: opt-in alternative
+  to the Scheduled Task model for fleet/unattended deployments.
+  Hybrid `roomler-agent-svc.exe` (SYSTEM, session 0) + the existing
+  worker (per-user session). Service spawns the worker via
+  `WTSQueryUserToken` + `CreateProcessAsUserW`. v1 includes pre-
+  logon scope (driving the lock screen for remote login) per the
+  2026-04-29 directive — the `WTSQueryUserToken` path doesn't
+  reach a never-logged-in winlogon session, so a SYSTEM-impersonating
+  worker variant is part of v1 with a tightened capability surface
+  (capture + input only, no clipboard / file-transfer / audio).
+
+These are independent of one another; recommended sequence is
+Phase 7 → Phase 8 → Effort 2.
