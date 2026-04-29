@@ -13,10 +13,12 @@
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use roomler_agent::{config, encode, enrollment, machine, service, signaling, updater};
+use roomler_agent::{
+    config, encode, enrollment, instance_lock, logging, machine, notify, service, signaling,
+    updater, watchdog,
+};
 use std::path::PathBuf;
 use std::str::FromStr;
-use tracing_subscriber::{EnvFilter, fmt};
 
 #[derive(Debug, Parser)]
 #[command(name = "roomler-agent", version, about, long_about = None)]
@@ -43,6 +45,16 @@ enum Command {
         /// Friendly name shown in the admin agents list.
         #[arg(long)]
         name: String,
+    },
+    /// Refresh this machine's agent token using a fresh enrollment JWT.
+    /// Preserves `server_url` and `machine_name` from the existing
+    /// config, so the operator only needs the new token. Used after
+    /// an admin revokes the prior token (the `re-enrollment required`
+    /// attention sentinel surfaces this case).
+    ReEnroll {
+        /// Fresh enrollment JWT from the admin UI.
+        #[arg(long)]
+        token: String,
     },
     /// Connect to the server and sit in the signaling loop (default command
     /// if none is given).
@@ -112,7 +124,10 @@ enum ServiceAction {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    init_tracing();
+    logging::init();
+    if let Some(dir) = logging::log_dir() {
+        tracing::debug!(log_dir = %dir.display(), "persistent file logging active");
+    }
 
     let cli = Cli::parse();
     let config_path = match cli.config.clone() {
@@ -126,6 +141,7 @@ async fn main() -> Result<()> {
             token,
             name,
         } => enroll_cmd(&config_path, &server, &token, &name).await,
+        Command::ReEnroll { token } => re_enroll_cmd(&config_path, &token).await,
         Command::Run { encoder } => run_cmd(&config_path, encoder.as_deref()).await,
         Command::EncoderSmoke { encoder, codec } => encoder_smoke_cmd(&encoder, &codec).await,
         Command::Caps => caps_cmd().await,
@@ -165,16 +181,6 @@ fn resolve_encoder_preference(
     }
 }
 
-fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("roomler_agent=info,warn"));
-    fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .compact()
-        .init();
-}
-
 async fn enroll_cmd(
     config_path: &PathBuf,
     server: &str,
@@ -204,6 +210,38 @@ async fn enroll_cmd(
     Ok(())
 }
 
+async fn re_enroll_cmd(config_path: &PathBuf, enrollment_token: &str) -> Result<()> {
+    if !config_path.exists() {
+        bail!(
+            "no existing config at {}; use `enroll` for first-time setup",
+            config_path.display()
+        );
+    }
+    let existing = config::load(config_path).context("loading existing config")?;
+    let machine_id = machine::derive_machine_id(config_path);
+    tracing::info!(
+        %machine_id,
+        agent_id = %existing.agent_id,
+        machine_name = %existing.machine_name,
+        "re-enrolling against existing config"
+    );
+
+    let new_cfg = enrollment::enroll(enrollment::EnrollInputs {
+        server_url: &existing.server_url,
+        enrollment_token,
+        machine_id: &machine_id,
+        machine_name: &existing.machine_name,
+    })
+    .await
+    .context("re-enrollment failed")?;
+
+    config::save(config_path, &new_cfg).context("saving updated config")?;
+    notify::clear_attention();
+    println!("Re-enrollment successful. Agent id: {}", new_cfg.agent_id);
+    println!("Run `roomler-agent run` (or wait for the supervisor to relaunch) to reconnect.");
+    Ok(())
+}
+
 async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()> {
     if !config_path.exists() {
         bail!(
@@ -211,6 +249,27 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
             config_path.display()
         );
     }
+    // Take the single-instance lock before doing anything else. If
+    // another agent is already attached to this config (typically the
+    // Scheduled Task / systemd unit launched at logon), exit cleanly
+    // instead of fighting it for the WS connection. Only `run` gates
+    // on the lock — `enroll`, `service install`, `caps`, `displays`,
+    // `encoder-smoke`, `self-update` are intentionally runnable
+    // alongside an active agent.
+    let _instance_lock = match instance_lock::acquire(config_path)
+        .context("acquiring single-instance lock")?
+    {
+        instance_lock::AcquireOutcome::Acquired(g) => g,
+        instance_lock::AcquireOutcome::AlreadyRunning => {
+            eprintln!(
+                "Another roomler-agent is already running for this config; exiting.\n\
+                 (use `roomler-agent service status` to check the auto-start hook,\n\
+                 or stop the running instance before starting a new one.)"
+            );
+            tracing::warn!("single-instance lock held by another process; exiting");
+            return Ok(());
+        }
+    };
     let cfg = config::load(config_path).context("loading config")?;
     let encoder_preference = resolve_encoder_preference(cli_encoder, cfg.encoder_preference);
     tracing::info!(
@@ -223,6 +282,26 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     );
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    // Install the liveness watchdog. Pumps tick after every iteration;
+    // the scan loop force-exits via std::process::exit(STALL_EXIT_CODE)
+    // when any pump silently stalls past its threshold, relying on
+    // the OS supervisor (Win Scheduled Task with RestartOnFailure /
+    // systemd Restart=on-failure / launchd KeepAlive) to relaunch.
+    // Encoder + capture are registered but gated off until a session
+    // attaches — those pumps can legitimately go idle for hours when
+    // no controller is connected.
+    let wd = watchdog::Watchdog::new();
+    wd.register("signaling", std::time::Duration::from_secs(90), true);
+    wd.register("encoder", std::time::Duration::from_secs(30), false);
+    wd.register("capture", std::time::Duration::from_secs(30), false);
+    let _ = watchdog::install(wd.clone());
+    watchdog::spawn_thread_watchdog(wd.clone());
+    let wd_task = tokio::spawn({
+        let wd = wd.clone();
+        let rx = shutdown_rx.clone();
+        async move { watchdog::run(wd, rx, watchdog::force_exit_on_stall).await }
+    });
 
     let sig_task = tokio::spawn({
         let rx = shutdown_rx.clone();
@@ -264,6 +343,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
     }
+    wd_task.abort();
     if let Some(t) = upd_task {
         t.abort();
     }

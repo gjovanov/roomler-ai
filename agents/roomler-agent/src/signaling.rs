@@ -15,11 +15,13 @@ use roomler_ai_remote_control::{
 use std::{collections::HashMap, time::Duration};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::AgentConfig;
 use crate::indicator::ViewerIndicator;
+use crate::notify;
 use crate::peer::AgentPeer;
+use crate::watchdog;
 
 /// Capacity of the outbound channel peers use to push `ClientMsg` back into
 /// the signaling loop (ICE trickles, terminate signals). 64 is generous for
@@ -31,7 +33,7 @@ const PEER_OUTBOUND_CAP: usize = 64;
 pub async fn run(
     cfg: AgentConfig,
     encoder_preference: crate::encode::EncoderPreference,
-    shutdown: tokio::sync::watch::Receiver<bool>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     // One overlay handle, reused across reconnects. Failing to bring up
     // the indicator is non-fatal — the session still works, the user
@@ -44,6 +46,7 @@ pub async fn run(
         }
     };
     let mut backoff = Duration::from_secs(1);
+    let mut auth_failures: u32 = 0;
     loop {
         if *shutdown.borrow() {
             info!("shutdown signalled; exiting signaling loop");
@@ -61,17 +64,78 @@ pub async fn run(
             Ok(()) => {
                 info!("signaling connection closed cleanly, reconnecting");
                 backoff = Duration::from_secs(1);
+                if auth_failures > 0 {
+                    info!(
+                        prior_auth_failures = auth_failures,
+                        "auth recovered; clearing attention sentinel"
+                    );
+                    notify::clear_attention();
+                    auth_failures = 0;
+                }
             }
             Err(ConnectError::AuthRejected) => {
-                error!("agent token rejected; re-enrollment required");
-                return Err(anyhow::anyhow!("agent token rejected by server"));
+                auth_failures = auth_failures.saturating_add(1);
+                let auth_backoff = auth_backoff_for(auth_failures);
+                warn!(
+                    consecutive = auth_failures,
+                    retry_in_secs = auth_backoff.as_secs(),
+                    "agent token rejected; will retry — re-enrollment may be required"
+                );
+                // Raise the attention sentinel after the third
+                // consecutive 401 — by then a transient server-side
+                // JWT-cache miss has had time to recover and the
+                // operator genuinely needs to act.
+                if auth_failures == 3 {
+                    let msg = "Roomler agent: re-enrollment required.\n\n\
+                              The server is rejecting this agent's token. \
+                              Either the token expired (default 1 year) or an \
+                              admin revoked it. Run:\n\n\
+                              \troomler-agent re-enroll --token <new-jwt>\n\n\
+                              with a fresh enrollment JWT from the admin UI \
+                              to restore service.";
+                    match notify::raise_attention(msg) {
+                        Ok(path) => warn!(
+                            path = %path.display(),
+                            "wrote needs-attention sentinel"
+                        ),
+                        Err(e) => warn!(error = %e, "failed to write needs-attention sentinel"),
+                    }
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(auth_backoff) => {},
+                    _ = shutdown.changed() => {
+                        if *shutdown.borrow() { return Ok(()); }
+                    },
+                }
             }
             Err(ConnectError::Transient(e)) => {
                 warn!(error = %e, "signaling connect failed; backing off");
-                tokio::time::sleep(backoff).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(backoff) => {},
+                    _ = shutdown.changed() => {
+                        if *shutdown.borrow() { return Ok(()); }
+                    },
+                }
                 backoff = (backoff * 2).min(Duration::from_secs(60));
             }
         }
+    }
+}
+
+/// Auth-rejection backoff ladder. Tuned for "transient server JWT
+/// cache miss recovers fast; persistent revocation gets surfaced to
+/// the operator without burning CPU on retry storms."
+///
+/// 1st failure → 30 s (server might just be deploying)
+/// 2nd → 60 s
+/// 3rd → 5 min (sentinel raises here too)
+/// 4th and beyond → 1 hour (stable steady-state)
+pub(crate) fn auth_backoff_for(consecutive_failures: u32) -> Duration {
+    match consecutive_failures {
+        0 | 1 => Duration::from_secs(30),
+        2 => Duration::from_secs(60),
+        3 => Duration::from_secs(5 * 60),
+        _ => Duration::from_secs(60 * 60),
     }
 }
 
@@ -158,14 +222,21 @@ async fn connect_once(
                     close_all_peers(&mut peers).await;
                     return Err(ConnectError::Transient(anyhow::Error::new(e).context("ws ping")));
                 }
+                // Liveness: a successful keepalive proves the WS pump
+                // is healthy even during long quiet periods between
+                // sessions. Without this tick the watchdog would flag
+                // a stall after 90 s of no inbound traffic.
+                watchdog::tick("signaling");
             }
             Some(outbound_msg) = outbound_rx.recv() => {
                 if let Err(e) = send_msg(&mut ws, &outbound_msg).await {
                     warn!(%e, "failed to flush peer-originated message");
                 }
+                watchdog::tick("signaling");
             }
             maybe_msg = ws.next() => match maybe_msg {
                 Some(Ok(Message::Text(text))) => {
+                    watchdog::tick("signaling");
                     match serde_json::from_str::<ServerMsg>(&text) {
                         Ok(parsed) => {
                             handle_server_msg(
@@ -185,6 +256,7 @@ async fn connect_once(
                 }
                 Some(Ok(Message::Ping(data))) => {
                     let _ = ws.send(Message::Pong(data)).await;
+                    watchdog::tick("signaling");
                 }
                 Some(Ok(Message::Close(_))) | None => {
                     info!("ws closed by peer");
@@ -454,4 +526,36 @@ fn urlencode(s: &str) -> String {
     s.replace('+', "%2B")
         .replace('/', "%2F")
         .replace('=', "%3D")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auth_backoff_ladder_pins_each_step() {
+        // Step 1 covers both 0 and 1 because the counter is bumped
+        // *before* the lookup; first failure passes 1 in.
+        assert_eq!(auth_backoff_for(0), Duration::from_secs(30));
+        assert_eq!(auth_backoff_for(1), Duration::from_secs(30));
+        assert_eq!(auth_backoff_for(2), Duration::from_secs(60));
+        assert_eq!(auth_backoff_for(3), Duration::from_secs(5 * 60));
+        assert_eq!(auth_backoff_for(4), Duration::from_secs(60 * 60));
+        assert_eq!(auth_backoff_for(99), Duration::from_secs(60 * 60));
+    }
+
+    #[test]
+    fn auth_backoff_is_monotonic_non_decreasing() {
+        // Fleet stability: a regression that swapped two ladder
+        // entries (e.g. 5min + 1h) would silently flap agents.
+        let mut last = Duration::ZERO;
+        for n in 1..=10u32 {
+            let d = auth_backoff_for(n);
+            assert!(
+                d >= last,
+                "ladder must be monotonic non-decreasing; failed at n={n}"
+            );
+            last = d;
+        }
+    }
 }
