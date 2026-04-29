@@ -284,8 +284,6 @@ mod windows {
     <Enabled>true</Enabled>
     <Hidden>false</Hidden>
     <RunOnlyIfIdle>false</RunOnlyIfIdle>
-    <DisallowStartOnRemoteAppSession>false</DisallowStartOnRemoteAppSession>
-    <UseUnifiedSchedulingEngine>true</UseUnifiedSchedulingEngine>
     <WakeToRun>false</WakeToRun>
     <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
     <Priority>7</Priority>
@@ -356,6 +354,27 @@ mod windows {
             assert!(xml.contains(r#"version="1.2""#));
             assert!(xml.contains("C:\\path\\agent.exe"));
             assert!(xml.contains("DOMAIN\\user"));
+        }
+
+        #[test]
+        fn xml_template_excludes_schema_1_3_only_elements() {
+            // 0.1.52 shipped these in a Schema 1.2 document and
+            // schtasks /XML rejected the whole task with
+            // `(39,7):DisallowStartOnRemoteAppSession: ERROR: The
+            // task XML contains an unexpected node`. Both elements
+            // are Schema 1.3+ only. Document stays at 1.2 (broadest
+            // Win-version compat), so these are out — the resilience-
+            // critical settings (RestartOnFailure, battery, etc.)
+            // are all Schema 1.2 native and survive.
+            let xml = render_task_xml("C:\\path\\agent.exe", "DOMAIN\\user");
+            assert!(
+                !xml.contains("DisallowStartOnRemoteAppSession"),
+                "DisallowStartOnRemoteAppSession is Schema 1.3+; must not appear in a 1.2 document"
+            );
+            assert!(
+                !xml.contains("UseUnifiedSchedulingEngine"),
+                "UseUnifiedSchedulingEngine is Schema 1.3+; must not appear in a 1.2 document"
+            );
         }
 
         #[test]
