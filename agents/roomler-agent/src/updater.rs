@@ -70,6 +70,15 @@ pub struct GithubAsset {
     #[serde(default)]
     #[allow(dead_code)]
     pub size: u64,
+    /// GitHub Releases API exposes a `digest` field per asset of
+    /// the form `"sha256:<hex>"` (added late 2024). When present,
+    /// [`download_asset`] verifies the bytes' SHA256 against this
+    /// hash and rejects mismatches. Absent on pre-2024 releases or
+    /// when the proxy isn't forwarding it (older API server) — in
+    /// that case we fall through to the [`MIN_INSTALLER_BYTES`]
+    /// size floor as the only integrity gate.
+    #[serde(default)]
+    pub digest: Option<String>,
 }
 
 /// The outcome of a single check cycle.
@@ -270,11 +279,119 @@ async fn download_asset(asset: &GithubAsset) -> Result<PathBuf> {
             MIN_INSTALLER_BYTES
         );
     }
+    // Integrity check: when GitHub / our proxy gave us a digest,
+    // verify the downloaded bytes match. This catches both
+    // corruption mid-flight (rare with TLS but possible with broken
+    // middleboxes) and tampering by anyone who can serve responses
+    // on the asset URL. Mismatched downloads do NOT touch disk —
+    // we'd rather skip an update than run a wrong installer.
+    if let Some(digest) = asset.digest.as_deref() {
+        verify_sha256(&bytes, digest)
+            .with_context(|| format!("verifying digest for {}", asset.name))?;
+    } else {
+        tracing::warn!(
+            asset = %asset.name,
+            "no digest field on asset; falling through to size floor only"
+        );
+    }
     let dir = std::env::temp_dir().join("roomler-agent-update");
     std::fs::create_dir_all(&dir).context("creating temp update dir")?;
     let path = dir.join(&asset.name);
     std::fs::write(&path, &bytes).context("writing installer to disk")?;
     Ok(path)
+}
+
+/// Verify a payload's SHA256 against a `"<algo>:<hex>"` formatted
+/// digest string (GitHub's convention as of late 2024). Returns
+/// `Err` on mismatch, unsupported algorithm, or malformed digest.
+/// Pure function — no I/O — so the test suite can drive it without
+/// network or filesystem.
+pub(crate) fn verify_sha256(bytes: &[u8], digest: &str) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    // Today only sha256 is in scope. Reject anything else explicitly
+    // so a future GitHub change to e.g. `"sha512:..."` doesn't
+    // silently disable verification — we'd rather fail loud and
+    // ship a fix.
+    let Some(expected_hex) = digest.strip_prefix("sha256:") else {
+        bail!("unsupported digest algorithm in {digest:?}; expected sha256:<hex>");
+    };
+    if expected_hex.len() != 64 {
+        bail!(
+            "malformed sha256 digest length: got {} hex chars, want 64",
+            expected_hex.len()
+        );
+    }
+    let mut h = Sha256::new();
+    h.update(bytes);
+    let computed_hex = hex::encode(h.finalize());
+    if !computed_hex.eq_ignore_ascii_case(expected_hex) {
+        bail!(
+            "sha256 mismatch: computed {computed_hex}, expected {expected_hex}",
+        );
+    }
+    Ok(())
+}
+
+/// Fetch a specific release by tag from GitHub. Bypasses the
+/// roomler-ai proxy because pinning is rare (per-agent crash-loop
+/// recovery, not a fleet-wide poll), so the proxy's per-IP rate-
+/// limit insulation isn't needed and the round-trip via our backend
+/// would just add latency to a path that's already on the slow side
+/// of the agent's failure recovery.
+async fn fetch_release_by_tag(tag: &str) -> Result<GithubRelease> {
+    let url = format!("https://api.github.com/repos/{RELEASES_REPO}/releases/tags/{tag}");
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("roomler-agent/", env!("CARGO_PKG_VERSION")))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("building reqwest client")?;
+    let resp = client
+        .get(&url)
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .context("GET release by tag")?;
+    if !resp.status().is_success() {
+        bail!("GitHub returned {} for tag {tag}", resp.status());
+    }
+    let release: GithubRelease = resp.json().await.context("parsing release JSON")?;
+    Ok(release)
+}
+
+/// Pin to a specific release tag. Used by the rollback path when
+/// the crash-loop detector decides the current version is broken
+/// and the last known-good version should be reinstalled.
+///
+/// Returns `CheckOutcome::UpdateReady` with an installer path on
+/// success — caller spawns the installer. Returns `Skipped` on any
+/// fetch / asset-pick / download failure so the agent can keep
+/// running (broken rollback is better than a hard exit because
+/// "the rollback recovery itself failed").
+///
+/// Network errors fold into `Skipped` like the rest of the
+/// updater paths so a flaky link can't crash the agent.
+pub async fn pin_version(tag: &str) -> CheckOutcome {
+    let current = env!("CARGO_PKG_VERSION").to_string();
+    let release = match fetch_release_by_tag(tag).await {
+        Ok(r) => r,
+        Err(e) => return CheckOutcome::Skipped(format!("pin fetch {tag}: {e}")),
+    };
+    let asset = match pick_asset_for_platform(&release.assets) {
+        Some(a) => a,
+        None => {
+            return CheckOutcome::Skipped(format!(
+                "no platform installer in release {tag}"
+            ));
+        }
+    };
+    match download_asset(asset).await {
+        Ok(path) => CheckOutcome::UpdateReady {
+            current,
+            latest: release.tag_name,
+            installer_path: path,
+        },
+        Err(e) => CheckOutcome::Skipped(format!("pin download {tag}: {e}")),
+    }
 }
 
 /// Run one check cycle: GET releases → compare → download if needed.
@@ -599,6 +716,58 @@ mod tests {
     }
 
     #[test]
+    fn verify_sha256_accepts_matching_digest() {
+        // Known SHA256 of "hello" (sha256sum gives this).
+        let bytes = b"hello";
+        let digest = "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+        assert!(verify_sha256(bytes, digest).is_ok());
+    }
+
+    #[test]
+    fn verify_sha256_is_case_insensitive_on_hex() {
+        let bytes = b"hello";
+        let digest = "sha256:2CF24DBA5FB0A30E26E83B2AC5B9E29E1B161E5C1FA7425E73043362938B9824";
+        assert!(verify_sha256(bytes, digest).is_ok());
+    }
+
+    #[test]
+    fn verify_sha256_rejects_mismatch() {
+        let bytes = b"hello";
+        let digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        let err = verify_sha256(bytes, digest).unwrap_err();
+        assert!(err.to_string().contains("sha256 mismatch"));
+    }
+
+    #[test]
+    fn verify_sha256_rejects_wrong_algorithm() {
+        let bytes = b"hello";
+        // sha512 of "hello" is *much* longer than 64 hex chars but
+        // we don't even reach that check — the prefix mismatch
+        // fires first.
+        let digest = "sha512:abc";
+        let err = verify_sha256(bytes, digest).unwrap_err();
+        assert!(err.to_string().contains("unsupported digest algorithm"));
+    }
+
+    #[test]
+    fn verify_sha256_rejects_malformed_length() {
+        let bytes = b"hello";
+        let digest = "sha256:abc"; // far too short
+        let err = verify_sha256(bytes, digest).unwrap_err();
+        assert!(err.to_string().contains("malformed sha256 digest length"));
+    }
+
+    #[test]
+    fn verify_sha256_rejects_missing_prefix() {
+        // A bare hex string without the `sha256:` prefix would slip
+        // past a naive `strip_prefix`. Reject explicitly.
+        let bytes = b"hello";
+        let digest = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+        let err = verify_sha256(bytes, digest).unwrap_err();
+        assert!(err.to_string().contains("unsupported digest algorithm"));
+    }
+
+    #[test]
     fn parse_version_handles_agent_prefix_and_v_prefix() {
         assert_eq!(parse_version("agent-v0.1.36"), Some((0, 1, 36)));
         assert_eq!(parse_version("v0.1.36"), Some((0, 1, 36)));
@@ -642,16 +811,19 @@ mod tests {
                 name: "roomler-agent-0.1.36-x86_64-pc-windows-msvc-unsigned.msi".into(),
                 browser_download_url: "https://example.invalid/foo.msi".into(),
                 size: 1234,
+                digest: None,
             },
             GithubAsset {
                 name: "roomler-agent-0.1.36_amd64.deb".into(),
                 browser_download_url: "https://example.invalid/foo.deb".into(),
                 size: 2345,
+                digest: None,
             },
             GithubAsset {
                 name: "roomler-agent-0.1.36-x86_64-apple-darwin.pkg".into(),
                 browser_download_url: "https://example.invalid/foo.pkg".into(),
                 size: 3456,
+                digest: None,
             },
         ];
         let pick = pick_asset_for_platform(&assets);
@@ -737,6 +909,7 @@ mod tests {
             name: "roomler-agent-0.1.36.tar.gz".into(),
             browser_download_url: "https://example.invalid/foo.tgz".into(),
             size: 10,
+            digest: None,
         }];
         assert!(pick_asset_for_platform(&assets).is_none());
     }

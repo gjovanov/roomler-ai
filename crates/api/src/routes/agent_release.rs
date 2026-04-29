@@ -56,6 +56,15 @@ pub struct AgentReleaseAsset {
     pub browser_download_url: String,
     #[serde(default)]
     pub size: u64,
+    /// GitHub Releases API exposes a `digest` field per asset of
+    /// the form `"sha256:<hex>"` (added late 2024). Forwarded so
+    /// the agent can verify the downloaded MSI / .deb / .pkg
+    /// against this hash and reject corrupt or tampered files.
+    /// Absent on releases that pre-date GitHub adding the field;
+    /// the agent falls through to the size-floor check in that
+    /// case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
