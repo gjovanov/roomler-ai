@@ -10,10 +10,23 @@
   %LOCALAPPDATA%\Programs\roomler-agent\ and config / state stays under
   %APPDATA%\roomler-agent\ (written by the `directories` crate at runtime).
 
-  Autostart: a Task Scheduler "At logon" task is registered by a post
-  install step rather than here. WiX's ScheduledTask element requires
-  admin, which breaks the no-UAC story; for v1 we document the schtasks
-  command the user runs once after install.
+  Autostart: registered automatically on every install + upgrade via the
+  RegisterAutostart custom action below. The action shells out to
+  `roomler-agent service install` which writes a Schema 1.2 Task
+  Scheduler XML with restart-on-failure + battery-defeat settings (see
+  agents/roomler-agent/src/service.rs::render_task_xml). Symmetric
+  UnregisterAutostart hook runs `service uninstall` before the EXE is
+  removed during uninstall. Both actions Return="ignore" so an
+  individual machine where the existing task has a tightened ACL (rare
+  Win11 quirk that bit us 2026-04-29) doesn't sink the whole MSI —
+  operator can still recover via the manual schtasks delete + service
+  install path documented in packaging/windows/README.txt.
+
+  Why this works without UAC: perUser MSIs run in the user's token
+  context. Custom actions with Execute="deferred" Impersonate="yes"
+  (which is the default in perUser mode) inherit that token. schtasks
+  /Create /XML /F against a non-elevated task succeeds for the user
+  who owns it.
 -->
 <Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'>
     <Product
@@ -147,5 +160,60 @@
 
         <Property Id='ARPHELPLINK' Value='https://roomler.ai/' />
         <Property Id='ARPURLINFOABOUT' Value='https://roomler.ai/' />
+
+        <!--
+          Postinstall hook: register the Scheduled Task auto-start
+          immediately after the EXE lands on disk. Runs deferred +
+          impersonated as the installing user (default for perUser
+          MSIs) so the task is registered against their account.
+          Return="ignore" so a registration failure (e.g. existing
+          task with a tightened ACL) doesn't fail the install — the
+          operator can recover with manual schtasks /Delete and
+          re-run `service install`.
+        -->
+        <CustomAction
+            Id='RegisterAutostart'
+            FileKey='roomler_agent_exe'
+            ExeCommand='service install'
+            Execute='deferred'
+            Impersonate='yes'
+            Return='ignore' />
+
+        <!--
+          Symmetric uninstall hook: tear down the Scheduled Task
+          BEFORE the EXE is removed from disk (the action shells
+          out to the EXE itself, so it must still be present).
+          Only fires during full uninstall (REMOVE="ALL"); a
+          maintenance/repair leaves the task alone.
+        -->
+        <CustomAction
+            Id='UnregisterAutostart'
+            FileKey='roomler_agent_exe'
+            ExeCommand='service uninstall'
+            Execute='deferred'
+            Impersonate='yes'
+            Return='ignore' />
+
+        <InstallExecuteSequence>
+            <!--
+              Run RegisterAutostart on every fresh install, repair,
+              and MajorUpgrade. Skip during full uninstall — there's
+              nothing to register and the EXE is about to be deleted
+              anyway. The condition leaves it active for upgrade
+              installs (which are technically "REMOVE=ALL" of the
+              old + install of the new, scheduled separately).
+            -->
+            <Custom Action='RegisterAutostart' After='InstallFiles'>
+                NOT (REMOVE="ALL")
+            </Custom>
+            <!--
+              Run UnregisterAutostart only during full uninstall,
+              and BEFORE RemoveFiles so the EXE we shell out to is
+              still on disk.
+            -->
+            <Custom Action='UnregisterAutostart' Before='RemoveFiles'>
+                REMOVE="ALL"
+            </Custom>
+        </InstallExecuteSequence>
     </Product>
 </Wix>
