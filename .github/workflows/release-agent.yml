@@ -112,6 +112,14 @@ jobs:
         uses: dtolnay/rust-toolchain@1.95.0
 
       - name: Cache cargo
+        # `continue-on-error: true` so a flaky cache *save* (which
+        # runs as a post-job step) can't sink an otherwise-green
+        # build. Symptom from agent-v0.1.53 attempt 1: every build
+        # step + smoke + artifact-upload succeeded but the post-job
+        # tar/zstd write returned non-zero → job marked failure →
+        # `Publish GitHub Release` skipped. The cache is an
+        # optimisation, not a correctness gate.
+        continue-on-error: true
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: '. -> target'
@@ -258,6 +266,14 @@ jobs:
         uses: dtolnay/rust-toolchain@1.95.0
 
       - name: Cache cargo
+        # `continue-on-error: true` so a flaky cache *save* (which
+        # runs as a post-job step) can't sink an otherwise-green
+        # build. Symptom from agent-v0.1.53 attempt 1: every build
+        # step + smoke + artifact-upload succeeded but the post-job
+        # tar/zstd write returned non-zero → job marked failure →
+        # `Publish GitHub Release` skipped. The cache is an
+        # optimisation, not a correctness gate.
+        continue-on-error: true
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: '. -> target'
@@ -410,6 +426,14 @@ jobs:
           targets: aarch64-apple-darwin
 
       - name: Cache cargo
+        # `continue-on-error: true` so a flaky cache *save* (which
+        # runs as a post-job step) can't sink an otherwise-green
+        # build. Symptom from agent-v0.1.53 attempt 1: every build
+        # step + smoke + artifact-upload succeeded but the post-job
+        # tar/zstd write returned non-zero → job marked failure →
+        # `Publish GitHub Release` skipped. The cache is an
+        # optimisation, not a correctness gate.
+        continue-on-error: true
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: '. -> target'
