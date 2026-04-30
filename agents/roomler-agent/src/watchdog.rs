@@ -353,7 +353,11 @@ mod tests {
         std::thread::sleep(Duration::from_millis(80));
         wd.gate("test", true); // already active
         let stalled = wd.scan_at(Instant::now());
-        assert_eq!(stalled.len(), 1, "redundant gate(true) must not mask a stall");
+        assert_eq!(
+            stalled.len(),
+            1,
+            "redundant gate(true) must not mask a stall"
+        );
     }
 
     #[test]

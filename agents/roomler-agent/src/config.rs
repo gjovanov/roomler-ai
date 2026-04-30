@@ -178,8 +178,7 @@ pub fn should_rollback(cfg: &AgentConfig, current_version: &str, now_unix: u64) 
     if cfg.crash_count < ROLLBACK_THRESHOLD_CRASHES {
         return false;
     }
-    cfg.last_crash_unix > 0
-        && now_unix.saturating_sub(cfg.last_crash_unix) <= CRASH_WINDOW_SECS
+    cfg.last_crash_unix > 0 && now_unix.saturating_sub(cfg.last_crash_unix) <= CRASH_WINDOW_SECS
 }
 
 /// Mark that we just spawned a rollback installer. Sets
