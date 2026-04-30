@@ -267,6 +267,10 @@ pub(crate) fn version_matches(version_output: &str, expected_tag: &str) -> bool 
 enum WaitOutcome {
     Exited(i32),
     Timeout,
+    // Constructed only in `wait_pid_windows` and the
+    // non-windows-non-unix fallback; the unix wait path
+    // never produces an error today.
+    #[allow(dead_code)]
     Error(anyhow::Error),
 }
 
