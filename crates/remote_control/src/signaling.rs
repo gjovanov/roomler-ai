@@ -316,6 +316,39 @@ mod tests {
     }
 
     #[test]
+    fn agent_heartbeat_round_trips_with_stable_field_names() {
+        // Wire-format lock for Phase 7 (heartbeat telemetry). The agent
+        // emits this every 30 s and the server uses it to refresh
+        // `agents.last_seen_at`. Field names match the JS controllers'
+        // expectations; renaming any of them is a wire break that needs
+        // a coordinated agent + server release.
+        let m = ClientMsg::AgentHeartbeat {
+            rss_mb: 142,
+            cpu_pct: 3.25,
+            active_sessions: 2,
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(r#""t":"rc:agent.heartbeat""#));
+        assert!(s.contains(r#""rss_mb":142"#));
+        assert!(s.contains(r#""cpu_pct":3.25"#));
+        assert!(s.contains(r#""active_sessions":2"#));
+
+        let back: ClientMsg = serde_json::from_str(&s).unwrap();
+        match back {
+            ClientMsg::AgentHeartbeat {
+                rss_mb,
+                cpu_pct,
+                active_sessions,
+            } => {
+                assert_eq!(rss_mb, 142);
+                assert!((cpu_pct - 3.25).abs() < f32::EPSILON);
+                assert_eq!(active_sessions, 2);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
     fn session_request_browser_caps_default_empty_for_back_compat() {
         // A pre-2B.1 controller that doesn't include browser_caps
         // must still parse — the agent will fall back to h264-only
