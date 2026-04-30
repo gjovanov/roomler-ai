@@ -4768,7 +4768,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-agent"
-version = "0.1.56"
+version = "0.1.57"
 dependencies = [
  "anyhow",
  "arboard",
@@ -4776,6 +4776,7 @@ dependencies = [
  "base64 0.22.1",
  "bson",
  "bytes",
+ "chrono",
  "clap",
  "dcv-color-primitives",
  "directories",
@@ -4808,7 +4809,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-api"
-version = "0.1.56"
+version = "0.1.57"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4849,7 +4850,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-config"
-version = "0.1.56"
+version = "0.1.57"
 dependencies = [
  "config",
  "serde",
@@ -4858,7 +4859,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-db"
-version = "0.1.56"
+version = "0.1.57"
 dependencies = [
  "bson",
  "chrono",
@@ -4873,7 +4874,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-remote-control"
-version = "0.1.56"
+version = "0.1.57"
 dependencies = [
  "base64 0.22.1",
  "bitflags 2.10.0",
@@ -4893,7 +4894,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-services"
-version = "0.1.56"
+version = "0.1.57"
 dependencies = [
  "anyhow",
  "argon2",
@@ -4933,7 +4934,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-tests"
-version = "0.1.56"
+version = "0.1.57"
 dependencies = [
  "anyhow",
  "axum",
