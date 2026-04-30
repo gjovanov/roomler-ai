@@ -23,3 +23,5 @@ pub mod service;
 pub mod signaling;
 pub mod updater;
 pub mod watchdog;
+#[cfg(target_os = "windows")]
+pub mod win_service;

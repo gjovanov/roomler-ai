@@ -13,6 +13,8 @@
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+#[cfg(target_os = "windows")]
+use roomler_agent::win_service;
 use roomler_agent::{
     config, encode, enrollment, instance_lock, logging, machine, notify, post_install, preflight,
     service, signaling, updater, watchdog,
@@ -110,6 +112,15 @@ enum Command {
         #[arg(long)]
         check_only: bool,
     },
+    /// (internal) Entry point invoked by the Windows Service Control
+    /// Manager when `RoomlerAgentService` starts. Hands the process
+    /// over to `windows-service`'s dispatcher; the agent main loop
+    /// runs inside the SCM thread until Stop is signalled. Hidden
+    /// from `--help` because operators never invoke this directly —
+    /// `service install --as-service` registers it as the service's
+    /// `ImagePath` argv.
+    #[command(hide = true, name = "service-run")]
+    ServiceRun,
     /// (internal) Watch a running installer process and record its
     /// exit code + the new binary's version to `last-install.json`.
     /// Spawned automatically by the updater immediately before the
@@ -136,11 +147,31 @@ enum Command {
 #[derive(Debug, Subcommand)]
 enum ServiceAction {
     /// Register the agent for auto-start on the next login.
-    Install,
+    Install {
+        /// Windows-only opt-in: register `RoomlerAgentService` with
+        /// the Service Control Manager (LocalSystem, AutoStart) instead
+        /// of the default per-user Scheduled Task. Use for fleet /
+        /// unattended deployments or when the host needs to be
+        /// reachable before any user logs in. Requires elevation.
+        #[arg(long)]
+        as_service: bool,
+    },
     /// Remove the auto-start hook. Idempotent.
-    Uninstall,
+    Uninstall {
+        /// Mirror of `install --as-service`: removes the
+        /// `RoomlerAgentService` SCM entry rather than the Scheduled
+        /// Task. Idempotent. Requires elevation.
+        #[arg(long)]
+        as_service: bool,
+    },
     /// Print the current auto-start status.
-    Status,
+    Status {
+        /// Report the SCM-registered `RoomlerAgentService` state
+        /// (Running / Stopped / NotInstalled) instead of the
+        /// Scheduled Task.
+        #[arg(long)]
+        as_service: bool,
+    },
 }
 
 #[tokio::main]
@@ -168,6 +199,7 @@ async fn main() -> Result<()> {
         Command::Caps => caps_cmd().await,
         Command::Displays => displays_cmd().await,
         Command::Service { action } => service_cmd(action).await,
+        Command::ServiceRun => service_run_cmd().await,
         Command::SelfUpdate { check_only } => self_update_cmd(check_only).await,
         Command::PostInstallWatch {
             installer_pid,
@@ -600,22 +632,90 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
 
 async fn service_cmd(action: ServiceAction) -> Result<()> {
     match action {
-        ServiceAction::Install => {
+        ServiceAction::Install { as_service: false } => {
             service::install().context("installing auto-start hook")?;
             println!("Auto-start registered. The agent will launch on next login.");
             Ok(())
         }
-        ServiceAction::Uninstall => {
+        ServiceAction::Uninstall { as_service: false } => {
             service::uninstall().context("removing auto-start hook")?;
             println!("Auto-start removed.");
             Ok(())
         }
-        ServiceAction::Status => {
+        ServiceAction::Status { as_service: false } => {
             let s = service::status().context("querying auto-start status")?;
             println!("Auto-start: {s}");
             Ok(())
         }
+        ServiceAction::Install { as_service: true } => service_install_as_service(),
+        ServiceAction::Uninstall { as_service: true } => service_uninstall_as_service(),
+        ServiceAction::Status { as_service: true } => service_status_as_service(),
     }
+}
+
+#[cfg(target_os = "windows")]
+fn service_install_as_service() -> Result<()> {
+    let exe = std::env::current_exe().context("locating current_exe for service install")?;
+    win_service::install(&exe).context("registering RoomlerAgentService with the SCM")?;
+    println!(
+        "Service registered: {} ({}). Launching `sc start {}` will run the service \
+         under LocalSystem; AutoStart fires on next boot.",
+        win_service::SERVICE_NAME,
+        win_service::SERVICE_DISPLAY_NAME,
+        win_service::SERVICE_NAME
+    );
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn service_install_as_service() -> Result<()> {
+    bail!(
+        "`service install --as-service` is Windows-only. \
+         Use the default `service install` for systemd / launchd auto-start on this platform."
+    );
+}
+
+#[cfg(target_os = "windows")]
+fn service_uninstall_as_service() -> Result<()> {
+    win_service::uninstall().context("deregistering RoomlerAgentService")?;
+    println!("Service deregistered ({}).", win_service::SERVICE_NAME);
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn service_uninstall_as_service() -> Result<()> {
+    bail!("`service uninstall --as-service` is Windows-only.");
+}
+
+#[cfg(target_os = "windows")]
+fn service_status_as_service() -> Result<()> {
+    let status = win_service::status().context("querying SCM service status")?;
+    println!("{}: {:?}", win_service::SERVICE_NAME, status);
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn service_status_as_service() -> Result<()> {
+    bail!("`service status --as-service` is Windows-only.");
+}
+
+#[cfg(target_os = "windows")]
+async fn service_run_cmd() -> Result<()> {
+    // Hand control to the SCM dispatcher. Blocks until SCM signals
+    // Stop. NOTE: this MUST run on the main OS thread (not inside a
+    // tokio worker), because `service_dispatcher::start` calls
+    // `StartServiceCtrlDispatcherW` which expects to take over the
+    // calling thread. We achieve "main thread" here by running before
+    // any other work in the binary's CLI dispatch — the
+    // `#[tokio::main]` runtime is already alive but we never await
+    // anything before this call, so the OS thread is still
+    // effectively the binary's main thread for SCM purposes.
+    win_service::run_in_dispatcher().context("running service dispatcher")
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn service_run_cmd() -> Result<()> {
+    bail!("`service-run` is Windows-only — invoked by the SCM, not directly by operators.");
 }
 
 async fn self_update_cmd(check_only: bool) -> Result<()> {

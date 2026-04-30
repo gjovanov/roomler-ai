@@ -138,6 +138,14 @@ chrono = { workspace = true }
 # Used for `flock` in the single-instance lock. Tiny crate, ubiquitous.
 libc = "0.2"
 
+[target.'cfg(target_os = "windows")'.dependencies]
+# Effort 2 (Windows Service deployment mode). Optional opt-in alternative
+# to the Scheduled Task default. windows-service 0.7 owns the SCM lifecycle
+# (service_dispatcher, control handler, status updates) and the manager
+# API (CreateService / DeleteService / QueryServiceStatus). Compatible
+# with the `windows = "0.58"` crate already pulled in by mf-encoder etc.
+windows-service = "0.7"
+
 [target.'cfg(target_os = "windows")'.dependencies.windows]
 version = "0.58"
 optional = true
