@@ -146,6 +146,21 @@ libc = "0.2"
 # with the `windows = "0.58"` crate already pulled in by mf-encoder etc.
 windows-service = "0.7"
 
+# Raw Win32 FFI for the M2 worker-supervisor: WTSGetActiveConsoleSessionId,
+# WTSQueryUserToken, CreateProcessAsUserW, CreateEnvironmentBlock. Going
+# through `windows-sys` (rather than the higher-level `windows` crate) keeps
+# this path independent of the feature-gated `windows` we use for MF /
+# WGC / viewer-indicator — the service-mode supervisor always wants these
+# bindings on Windows builds, regardless of the encoder feature mix.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_RemoteDesktop",        # WTS* APIs
+    "Win32_System_Threading",            # CreateProcessAsUserW, STARTUPINFO
+    "Win32_System_Environment",          # CreateEnvironmentBlock
+    "Win32_System_StationsAndDesktops",  # winsta0\default desktop attach
+] }
+
 [target.'cfg(target_os = "windows")'.dependencies.windows]
 version = "0.58"
 optional = true
