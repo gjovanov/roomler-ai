@@ -125,6 +125,10 @@ base64 = { workspace = true }
 # Random fallback for machine_id
 rand = { workspace = true }
 
+# RFC2822 date parsing for the Phase 8 pre-flight clock-skew check
+# (parses the server's HTTP Date: header). Already a workspace dep.
+chrono = { workspace = true }
+
 # Windows Media Foundation H.264 encoder (hardware-accelerated).
 # Gated behind target_os and an explicit feature; non-Windows builds
 # never touch the `windows` crate. Feature list scoped to the MF, D3D11,
