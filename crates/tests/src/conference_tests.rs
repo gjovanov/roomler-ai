@@ -164,6 +164,91 @@ async fn room_call_lifecycle_start_join_leave_end() {
     assert_eq!(json["conference_status"], "ended");
 }
 
+/// Regression: a duplicate /call/leave (e.g. browser retry, double-click) must not
+/// underflow participant_count. Before the fix, the second leave issued an
+/// unconditional `$inc:-1` which sent the BSON value to -1, then any subsequent
+/// GET /room failed with `expected u32, got -1` → 500.
+#[tokio::test]
+async fn duplicate_call_leave_does_not_underflow_participant_count() {
+    let app = TestApp::spawn().await;
+    let tenant = app.seed_tenant("leaveunder").await;
+
+    let resp = app
+        .auth_post(
+            &format!("/api/tenant/{}/room", tenant.tenant_id),
+            &tenant.admin.access_token,
+        )
+        .json(&serde_json::json!({ "name": "Underflow Repro" }))
+        .send()
+        .await
+        .unwrap();
+    let room: Value = resp.json().await.unwrap();
+    let room_id = room["id"].as_str().unwrap();
+
+    let path_start = format!(
+        "/api/tenant/{}/room/{}/call/start",
+        tenant.tenant_id, room_id
+    );
+    let path_join = format!(
+        "/api/tenant/{}/room/{}/call/join",
+        tenant.tenant_id, room_id
+    );
+    let path_leave = format!(
+        "/api/tenant/{}/room/{}/call/leave",
+        tenant.tenant_id, room_id
+    );
+    let path_get = format!("/api/tenant/{}/room/{}", tenant.tenant_id, room_id);
+    let path_list = format!("/api/tenant/{}/room", tenant.tenant_id);
+
+    app.auth_post(&path_start, &tenant.admin.access_token)
+        .send()
+        .await
+        .unwrap();
+    app.auth_post(&path_join, &tenant.admin.access_token)
+        .send()
+        .await
+        .unwrap();
+
+    // First leave — legitimate.
+    let resp = app
+        .auth_post(&path_leave, &tenant.admin.access_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+
+    // Second leave — duplicate (no active session). Must not underflow.
+    let resp = app
+        .auth_post(&path_leave, &tenant.admin.access_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+
+    // The smoking-gun: deserializing the room must succeed (the bug surfaced as
+    // a 500 on this exact call when participant_count was -1).
+    let resp = app
+        .auth_get(&path_get, &tenant.admin.access_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let json: Value = resp.json().await.unwrap();
+    assert!(
+        json["participant_count"].as_i64().unwrap() >= 0,
+        "participant_count went negative: {:?}",
+        json["participant_count"]
+    );
+
+    // GET /room (list) is the actual UI call that broke in prod.
+    let resp = app
+        .auth_get(&path_list, &tenant.admin.access_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+}
+
 #[tokio::test]
 async fn list_rooms() {
     let app = TestApp::spawn().await;

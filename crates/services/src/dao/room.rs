@@ -566,9 +566,20 @@ impl RoomDao {
             .await
             .map_err(DaoError::Mongo)?;
 
+        // Guarded decrement: only when participant_count > 0, so a stray /call/leave
+        // (duplicate, or after the join was never recorded) can't underflow the u32
+        // and break subsequent GET /room with a "expected u32, got -1" deserialize 500.
         self.base
-            .update_by_id(room_id, doc! { "$inc": { "participant_count": -1 } })
-            .await?;
+            .collection()
+            .update_one(
+                doc! { "_id": room_id, "participant_count": { "$gt": 0 } },
+                doc! {
+                    "$inc": { "participant_count": -1 },
+                    "$set": { "updated_at": now },
+                },
+            )
+            .await
+            .map_err(DaoError::Mongo)?;
 
         Ok(true)
     }
