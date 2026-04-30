@@ -206,6 +206,18 @@ async fn connect_once(
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     keepalive.tick().await; // Swallow the immediate first tick.
 
+    // Phase 7: heartbeat telemetry. The server uses this to refresh
+    // `agents.last_seen_at` so a quiet but connected agent doesn't
+    // appear "online forever" if its WS dies silently. 30 s cadence
+    // pairs with a "online if last_seen_at > now - 90 s" rule on the
+    // server side. rss_mb / cpu_pct are 0 for v1 — populating them
+    // needs a process-self metrics crate (sysinfo) that we'd rather
+    // ship in a follow-up. active_sessions comes straight from the
+    // peer map.
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    heartbeat.tick().await; // Swallow the immediate first tick.
+
     loop {
         tokio::select! {
             _ = shutdown.changed() => {
@@ -226,6 +238,19 @@ async fn connect_once(
                 // is healthy even during long quiet periods between
                 // sessions. Without this tick the watchdog would flag
                 // a stall after 90 s of no inbound traffic.
+                watchdog::tick("signaling");
+            }
+            _ = heartbeat.tick() => {
+                let hb = ClientMsg::AgentHeartbeat {
+                    rss_mb: 0,
+                    cpu_pct: 0.0,
+                    active_sessions: peers.len().min(u8::MAX as usize) as u8,
+                };
+                if let Err(e) = send_msg(&mut ws, &hb).await {
+                    warn!(%e, "heartbeat send failed — will reconnect");
+                    close_all_peers(&mut peers).await;
+                    return Err(ConnectError::Transient(e.context("heartbeat send")));
+                }
                 watchdog::tick("signaling");
             }
             Some(outbound_msg) = outbound_rx.recv() => {
