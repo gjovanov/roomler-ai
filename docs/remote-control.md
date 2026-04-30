@@ -1053,30 +1053,143 @@ After this, the freshly-created task has a normal ACL and future
 upgrades can self-manage. From 0.1.54 onwards new installs never
 hit this — only pre-existing locked tasks.
 
-### 19.8 Pending — picked up in next session
+### 19.8 Phase 7 / 8 / Effort 2 cycle — shipped 0.1.55 → 0.1.58
 
-- **Phase 7 (heartbeat telemetry)**: server-side `/api/agent/heartbeat`
-  route + DAO writes `agents.last_seen_at` + a small payload
-  (`uptime_s`, `version`, `encoder_status`, `last_error`,
-  `sessions_active`). Wire-format `ClientMsg::AgentHeartbeat` over
-  the existing `/ws` (no separate REST). Closes the "agent shows
-  online forever after silent disconnect" issue.
-- **Phase 8 (pre-flight checks)**: clock-skew (HEAD `Date:` vs.
-  local), DNS, TCP probe at startup. Non-blocking 15s budget;
-  signaling loop runs unconditionally afterward. Friendlier
-  error messages for the common deployment blunders ("clock skew
-  47 min — check time sync (w32time / ntpd)", "TCP probe failed
-  — check firewall outbound 443").
-- **Effort 2 (Windows Service deployment mode)**: opt-in alternative
-  to the Scheduled Task model for fleet/unattended deployments.
-  Hybrid `roomler-agent-svc.exe` (SYSTEM, session 0) + the existing
-  worker (per-user session). Service spawns the worker via
-  `WTSQueryUserToken` + `CreateProcessAsUserW`. v1 includes pre-
-  logon scope (driving the lock screen for remote login) per the
-  2026-04-29 directive — the `WTSQueryUserToken` path doesn't
-  reach a never-logged-in winlogon session, so a SYSTEM-impersonating
-  worker variant is part of v1 with a tightened capability surface
-  (capture + input only, no clipboard / file-transfer / audio).
+The "next session" plan from §19.8's prior revision shipped on
+2026-04-30 across four patch releases. Three closed cleanly; M3 + M5
+of Effort 2 are queued for follow-up.
 
-These are independent of one another; recommended sequence is
-Phase 7 → Phase 8 → Effort 2.
+#### 19.8.1 agent-v0.1.55 — enrollment http→https normalization
+
+Field bug: `roomler-agent enroll --server http://roomler.ai ...` failed
+with `enrollment rejected (status 405 Method Not Allowed)`. Cause: the
+production ingress 301-redirects plaintext to TLS; reqwest follows the
+redirect but converts POST→GET (RFC 7231 historical behaviour for
+301/302), and a GET on `/api/agent/enroll` is unmatched.
+
+`enrollment::normalize_server_url` upgrades `http://` → `https://`
+upfront with a warn log and stores the normalized form in the agent
+config so `derive_ws_url()` also yields wss:// for the long-lived
+signaling connection. Bonus security win: enrollment tokens never
+leave the wire in cleartext.
+
+#### 19.8.2 agent-v0.1.56 — Phase 7 heartbeat telemetry
+
+Closes the "agent shows online forever after silent disconnect" gap.
+Agents emit `ClientMsg::AgentHeartbeat { rss_mb, cpu_pct,
+active_sessions }` every 30 s on the existing `/ws` connection; the
+wire format already existed but neither side was using it.
+
+Server (`crates/api/src/ws/remote_control.rs`) checks for the
+heartbeat variant in the read loop and calls the new
+`agents.touch_heartbeat(agent_id)` DAO method, which writes
+`last_seen_at = now()`. Best-effort: a Mongo lag warns rather than
+dropping the WS. With this in place, "agent online" can be defined as
+`last_seen_at > now − 90 s` (3× cadence tolerance for one missed
+tick).
+
+Agent (`agents/roomler-agent/src/signaling.rs`) adds a 30 s
+`tokio::time::interval` arm to the connect_once `select!`. v1 sends
+`rss_mb=0`, `cpu_pct=0.0` (process-self metrics deferred to a follow-
+up that adds the `sysinfo` crate); `active_sessions = peers.len()`
+straight off the per-connection peer map.
+
+Backend deployed via mars rebuild → ArgoCD GitOps in the same cycle.
+
+#### 19.8.3 agent-v0.1.57 — Phase 8 pre-flight checks
+
+New `preflight` module runs three parallel probes right after config
+load, before the signaling loop kicks in:
+
+  - DNS via `tokio::net::lookup_host`. Hint: "check /etc/hosts, the
+    system DNS resolver, or whether VPN is required".
+  - TCP via `tokio::net::TcpStream::connect`. Hint: "check firewall
+    outbound rules, corporate proxy / captive portal".
+  - Clock skew via HEAD `<server>/health` + RFC2822 Date: parse.
+    Warns past ±60 s. Hint: "JWT validation will fail past ±60 s;
+    sync time (w32time / chronyd / ntpd)".
+
+Non-blocking — each finding is a `warn!` with `hint=` field. Total
+budget ~5 s wall (parallel join); 5 s per probe individually. Bad
+URL surfaces a `BadServerUrl` finding rather than silently no-oping.
+
+#### 19.8.4 agent-v0.1.58 — Effort 2 M1+M2 (Windows Service mode)
+
+Optional opt-in alternative to the Scheduled Task auto-start, for
+fleet / unattended deployments. Two milestones landed; M3 + M4 + M5
+are deferred (see §19.8.5).
+
+**M1 — service host skeleton** (`agents/roomler-agent/src/win_service/
+mod.rs`):
+
+  - `install(exe_path)` registers `RoomlerAgentService` with the SCM
+    (LocalSystem, AutoStart, OWN_PROCESS), launches via the agent's
+    own hidden `service-run` subcommand on start.
+  - `uninstall()` stops (best-effort 5 s) + deletes; tolerates
+    ERROR_SERVICE_DOES_NOT_EXIST (1060) for idempotent rollback.
+  - `status()` returns `InstalledStatus` enum.
+  - `run_in_dispatcher()` is the SCM entry point. Hands the OS thread
+    to `windows_service::service_dispatcher::start`.
+  - SCM control handler accepts STOP + PRESHUTDOWN + SESSION_CHANGE.
+
+CLI: `service install --as-service` / `service uninstall --as-service`
+/ `service status --as-service`. Hidden top-level `service-run`
+invoked by the SCM's StartService.
+
+Crate: `windows-service = "0.7"` for the SCM lifecycle.
+
+**M2 — session-aware worker supervisor** (`win_service/supervisor.rs`):
+
+  - `active_console_session_id()` wraps `WTSGetActiveConsoleSessionId`;
+    None for the 0xFFFFFFFF "no active session" sentinel.
+  - `query_user_token(session_id)` wraps `WTSQueryUserToken`; tolerates
+    ERROR_NO_TOKEN and returns None for the M3 SYSTEM-context case.
+  - `unsafe spawn_in_session(token, exe, args)` calls
+    `CreateEnvironmentBlock` + `CreateProcessAsUserW` with
+    CREATE_UNICODE_ENVIRONMENT + CREATE_NEW_CONSOLE; attaches to
+    `winsta0\default` desktop. Returns `OwnedProcess`.
+  - `OwnedHandle` / `OwnedProcess` / `EnvBlock` RAII wrappers — no
+    handle leaks even on `?` early returns.
+  - `decide_spawn(active, current_worker_session) →
+    {SpawnIn|KeepCurrent|Idle}` — pure state machine, exhaustively
+    unit-tested without FFI.
+  - `next_backoff(consecutive_failures)` — 2 s × 2^(n−1) capped at
+    60 s, saturating against runaway counters; mirrors the
+    Scheduled Task `RestartOnFailure` PT1M cap.
+  - `run(exe, args, rx)` is the supervisor main loop on a dedicated
+    OS thread. SCM session-change notifications swap the worker to
+    the new active console user; worker crash respawns under backoff.
+
+Crate: `windows-sys = "0.59"` for the raw Win32 FFI (
+Win32_System_RemoteDesktop, _Threading, _Environment,
+_StationsAndDesktops). Going through windows-sys (not the higher-
+level `windows` crate) keeps service-mode independent of the
+feature-gated MF / WGC compilation paths.
+
+**M4 (MSI integration) deferred-by-design**: the agent MSI is
+`InstallScope='perUser'` (no UAC), but `CreateService` requires admin
+elevation. Auto-registering `RoomlerAgentService` from a perUser MSI
+is impossible. Operators install the MSI normally, then run
+`roomler-agent service install --as-service` from an elevated
+PowerShell. Future per-machine MSI flavour can revisit.
+
+### 19.8.5 Pending — picked up in next session
+
+- **M3 (pre-logon SYSTEM-context capture)**: when no console session
+  has a logged-in user yet, the service itself runs capture + input
+  inline under SYSTEM rather than spawning a worker. Tightened
+  capability surface: capture + input only, no clipboard / file-
+  transfer / audio. Hand-off when a user logs in: tear down the
+  SYSTEM-context capture, spawn a user-context worker via the M2
+  supervisor path. Risky — needs hands-on Win11 testing of WGC
+  capture from session 0 against the lock screen.
+- **M5 (verification on a real Win11 install)**: test M1 + M2 on
+  goran-xmg-neo16: `service install --as-service` from elevated
+  PowerShell, observe the `roomler-svc-supervisor` thread spawning
+  a worker in the active session, lock screen + verify the worker
+  is gone, unlock + verify it respawns.
+- **Per-machine MSI flavour** (the M4-fix-up): a separate WiX file
+  `wix/main-permachine.wxs` with `InstallScope='perMachine'`,
+  RegisterService deferred-non-impersonated custom action. Builds a
+  separate `.msi` artifact in the release workflow alongside the
+  perUser one.
