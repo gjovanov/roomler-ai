@@ -92,6 +92,44 @@ Manual check without installing:
 
     & $agent self-update --check-only
 
+Optional: Windows Service mode (since 0.1.58)
+---------------------------------------------
+For fleet / unattended deployments where the host needs to be reachable
+*before* anyone logs in (e.g. driving the lock screen for remote
+login), the agent ships an opt-in alternative to the per-user
+Scheduled Task: it can register itself with the Service Control
+Manager as `RoomlerAgentService`, running under LocalSystem with
+AutoStart at boot.
+
+This MSI installs **per-user** without UAC, so the service mode is NOT
+auto-registered. Operators wanting service mode should run the MSI as
+usual, then open an elevated PowerShell ("Terminal (Admin)") and:
+
+    & "$env:LOCALAPPDATA\Programs\roomler-agent\roomler-agent.exe" `
+        service install --as-service
+
+The SCM service supervises a per-session worker via WTSQueryUserToken
++ CreateProcessAsUserW: when a user logs in, the service spawns
+`roomler-agent run` in their session; on logoff / fast-user-switch
+the worker is replaced; on Stop the worker is terminated.
+
+Service-mode and Scheduled-Task-mode are independent — installing the
+service does not remove the Scheduled Task. To avoid both auto-launching
+the same agent, uninstall the Scheduled Task first:
+
+    & $agent service uninstall                # remove Scheduled Task
+    & $agent service install --as-service     # register SCM service
+
+Inspect / manage:
+
+    & $agent service status --as-service      # NotInstalled / Stopped / Running
+    Get-Service RoomlerAgentService           # PowerShell native
+    sc.exe stop RoomlerAgentService           # explicit stop
+
+Pre-logon SYSTEM-context capture (the agent itself running capture +
+input under SYSTEM when no user is logged in) is planned for a future
+release; today, service mode idles until the first user login.
+
 Note on privileges
 ------------------
 The agent intentionally runs un-elevated:
