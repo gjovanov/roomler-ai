@@ -14,8 +14,8 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use roomler_agent::{
-    config, encode, enrollment, instance_lock, logging, machine, notify, post_install, service,
-    signaling, updater, watchdog,
+    config, encode, enrollment, instance_lock, logging, machine, notify, post_install, preflight,
+    service, signaling, updater, watchdog,
 };
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -360,6 +360,14 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         ?encoder_preference,
         "agent starting"
     );
+
+    // Phase 8: pre-flight diagnostics (DNS / TCP / clock-skew). Non-
+    // blocking — the signaling loop runs unconditionally afterward —
+    // but logs an actionable hint up front so the operator doesn't
+    // chase the wrong rabbit hole when the WS reconnect ladder kicks
+    // in. 15 s overall budget, 5 s per probe in parallel.
+    let preflight_report = preflight::run_checks(&cfg.server_url).await;
+    preflight_report.log();
 
     // Crash-loop bookkeeping: if the previous run was marked
     // `last_run_unhealthy=true` (started, never reached the clean
