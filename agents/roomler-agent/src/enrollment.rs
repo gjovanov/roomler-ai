@@ -35,10 +35,15 @@ pub struct EnrollInputs<'a> {
 }
 
 pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
-    let url = format!(
-        "{}/api/agent/enroll",
-        inputs.server_url.trim_end_matches('/')
-    );
+    // Promote http:// to https://. The production ingress 301-redirects
+    // plaintext to TLS; reqwest then downgrades the POST to a GET (RFC
+    // 7231 historical behavior for 301/302) so the second hop hits a
+    // route that exists for POST but not GET, producing a 405. Doing the
+    // upgrade upfront also keeps the enrollment token off the wire in
+    // cleartext, and ensures the stored server_url derives wss:// (not
+    // ws://) for the long-lived signaling connection.
+    let server_url = normalize_server_url(inputs.server_url);
+    let url = format!("{server_url}/api/agent/enroll");
     let os = detect_os();
     let agent_version = env!("CARGO_PKG_VERSION");
 
@@ -66,7 +71,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
     let body: EnrollResponse = resp.json().await.context("parsing enroll response")?;
 
     Ok(AgentConfig {
-        server_url: inputs.server_url.trim_end_matches('/').to_string(),
+        server_url,
         ws_url: None,
         agent_token: body.agent_token,
         agent_id: body.agent_id,
@@ -83,6 +88,23 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
     })
 }
 
+/// Strip the trailing slash and force the scheme to `https://` if the
+/// caller supplied `http://`. Any other scheme (or a bare host) is
+/// returned trimmed but otherwise untouched — `https://` URLs stay
+/// `https://`, and a malformed input is left to fail at the reqwest
+/// layer with a clearer diagnostic than we'd produce here.
+fn normalize_server_url(raw: &str) -> String {
+    let trimmed = raw.trim_end_matches('/');
+    if let Some(rest) = trimmed.strip_prefix("http://") {
+        tracing::warn!(
+            original = trimmed,
+            "upgrading http:// to https:// — enrollment tokens must travel over TLS"
+        );
+        return format!("https://{rest}");
+    }
+    trimmed.to_string()
+}
+
 fn detect_os() -> OsKind {
     match std::env::consts::OS {
         "linux" => OsKind::Linux,
@@ -92,5 +114,47 @@ fn detect_os() -> OsKind {
             tracing::warn!(%other, "unknown OS, defaulting to Linux");
             OsKind::Linux
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn http_is_promoted_to_https() {
+        assert_eq!(
+            normalize_server_url("http://roomler.ai"),
+            "https://roomler.ai"
+        );
+        assert_eq!(
+            normalize_server_url("http://roomler.ai/"),
+            "https://roomler.ai"
+        );
+        assert_eq!(
+            normalize_server_url("http://10.0.0.5:3000"),
+            "https://10.0.0.5:3000"
+        );
+    }
+
+    #[test]
+    fn https_is_left_alone() {
+        assert_eq!(
+            normalize_server_url("https://roomler.ai"),
+            "https://roomler.ai"
+        );
+        assert_eq!(
+            normalize_server_url("https://roomler.ai/"),
+            "https://roomler.ai"
+        );
+    }
+
+    #[test]
+    fn does_not_upgrade_unrelated_schemes_or_bare_hosts() {
+        // We don't validate — the reqwest call will fail with a clearer
+        // error than we could produce here. Just confirm we don't
+        // accidentally rewrite these.
+        assert_eq!(normalize_server_url("roomler.ai"), "roomler.ai");
+        assert_eq!(normalize_server_url("file:///tmp/foo"), "file:///tmp/foo");
     }
 }
