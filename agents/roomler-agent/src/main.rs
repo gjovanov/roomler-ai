@@ -190,10 +190,11 @@ async fn post_install_watch_cmd(
     );
     // `watch` is blocking — spin a blocking task so we don't hold
     // the tokio runtime busy-waiting on a sync OS sleep loop.
-    let outcome =
-        tokio::task::spawn_blocking(move || post_install::watch(installer_pid, installer_path, expected_version))
-            .await
-            .context("post-install watcher join")??;
+    let outcome = tokio::task::spawn_blocking(move || {
+        post_install::watch(installer_pid, installer_path, expected_version)
+    })
+    .await
+    .context("post-install watcher join")??;
     println!(
         "post-install verdict: {:?} ({})",
         outcome.status, outcome.note
@@ -336,20 +337,19 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     // on the lock — `enroll`, `service install`, `caps`, `displays`,
     // `encoder-smoke`, `self-update` are intentionally runnable
     // alongside an active agent.
-    let _instance_lock = match instance_lock::acquire(config_path)
-        .context("acquiring single-instance lock")?
-    {
-        instance_lock::AcquireOutcome::Acquired(g) => g,
-        instance_lock::AcquireOutcome::AlreadyRunning => {
-            eprintln!(
-                "Another roomler-agent is already running for this config; exiting.\n\
+    let _instance_lock =
+        match instance_lock::acquire(config_path).context("acquiring single-instance lock")? {
+            instance_lock::AcquireOutcome::Acquired(g) => g,
+            instance_lock::AcquireOutcome::AlreadyRunning => {
+                eprintln!(
+                    "Another roomler-agent is already running for this config; exiting.\n\
                  (use `roomler-agent service status` to check the auto-start hook,\n\
                  or stop the running instance before starting a new one.)"
-            );
-            tracing::warn!("single-instance lock held by another process; exiting");
-            return Ok(());
-        }
-    };
+                );
+                tracing::warn!("single-instance lock held by another process; exiting");
+                return Ok(());
+            }
+        };
     let mut cfg = config::load(config_path).context("loading config")?;
     let encoder_preference = resolve_encoder_preference(cli_encoder, cfg.encoder_preference);
     tracing::info!(
@@ -419,8 +419,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
                     path = %installer_path.display(),
                     "rollback installer downloaded — spawning + exiting"
                 );
-                if let Err(e) =
-                    updater::spawn_installer_with_watch(&installer_path, Some(&latest))
+                if let Err(e) = updater::spawn_installer_with_watch(&installer_path, Some(&latest))
                 {
                     tracing::error!(error = %e, "rollback installer spawn failed");
                     let _ = notify::raise_attention(&rollback_attention_msg(
@@ -582,9 +581,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     // avoid clobbering any concurrent writes (clean_run_task may
     // have just promoted the version, in which case the unhealthy
     // flag is already false — load+save is a no-op).
-    if graceful_shutdown
-        && let Ok(mut current) = config::load(config_path)
-    {
+    if graceful_shutdown && let Ok(mut current) = config::load(config_path) {
         config::mark_clean_shutdown(&mut current);
         if let Err(e) = config::save(config_path, &current) {
             tracing::warn!(error = %e, "could not mark clean shutdown");

@@ -127,10 +127,8 @@ pub fn write_outcome(outcome: &InstallOutcome) -> Result<PathBuf> {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let json = serde_json::to_string_pretty(outcome)
-        .context("serialising install outcome")?;
-    std::fs::write(&path, json)
-        .with_context(|| format!("writing {}", path.display()))?;
+    let json = serde_json::to_string_pretty(outcome).context("serialising install outcome")?;
+    std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))?;
     Ok(path)
 }
 
@@ -139,14 +137,16 @@ pub fn write_outcome(outcome: &InstallOutcome) -> Result<PathBuf> {
 /// install where the operator manually deleted it). Errors are
 /// surfaced — a corrupt file is operator-actionable.
 pub fn read_outcome() -> Result<Option<InstallOutcome>> {
-    let Some(path) = outcome_path() else { return Ok(None) };
+    let Some(path) = outcome_path() else {
+        return Ok(None);
+    };
     if !path.exists() {
         return Ok(None);
     }
-    let raw = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))?;
-    let parsed = serde_json::from_str(&raw)
-        .with_context(|| format!("parsing {}", path.display()))?;
+    let raw =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let parsed =
+        serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
     Ok(Some(parsed))
 }
 
@@ -222,8 +222,7 @@ pub fn watch(
                 outcome.new_binary_version = Some(version.clone());
                 if version_matches(&version, &expected_version) {
                     outcome.status = InstallStatus::SucceededVerified;
-                    outcome.note =
-                        format!("new binary at {} reports {version}", p.display());
+                    outcome.note = format!("new binary at {} reports {version}", p.display());
                 } else {
                     outcome.status = InstallStatus::SucceededUnverified;
                     outcome.note = format!(
@@ -354,9 +353,7 @@ fn wait_pid_unix(pid: u32, budget: Duration) -> WaitOutcome {
         // permission + existence checks.
         let r = unsafe { libc::kill(pid_i, 0) };
         if r != 0 {
-            let errno = std::io::Error::last_os_error()
-                .raw_os_error()
-                .unwrap_or(0);
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
             if errno == libc::ESRCH {
                 // Process is gone. We can't recover the exit code
                 // because we weren't the parent (waitpid would need
@@ -389,14 +386,20 @@ mod tests {
         assert!(version_matches("roomler-agent 0.1.50", "agent-v0.1.50"));
         assert!(version_matches("roomler-agent 0.1.50", "0.1.50"));
         assert!(version_matches("roomler-agent 0.1.50", "v0.1.50"));
-        assert!(version_matches("roomler-agent 1.2.3 (some-build-id)", "v1.2.3"));
+        assert!(version_matches(
+            "roomler-agent 1.2.3 (some-build-id)",
+            "v1.2.3"
+        ));
     }
 
     #[test]
     fn version_does_not_match_different_triple() {
         assert!(!version_matches("roomler-agent 0.1.49", "agent-v0.1.50"));
         assert!(!version_matches("roomler-agent 1.0.0", "agent-v0.0.1"));
-        assert!(!version_matches("totally unrelated string", "agent-v0.1.50"));
+        assert!(!version_matches(
+            "totally unrelated string",
+            "agent-v0.1.50"
+        ));
     }
 
     #[test]
@@ -458,7 +461,10 @@ mod tests {
         let cases = [
             (InstallStatus::InProgress, "\"InProgress\""),
             (InstallStatus::SucceededVerified, "\"SucceededVerified\""),
-            (InstallStatus::SucceededUnverified, "\"SucceededUnverified\""),
+            (
+                InstallStatus::SucceededUnverified,
+                "\"SucceededUnverified\"",
+            ),
             (InstallStatus::InstallerFailed, "\"InstallerFailed\""),
             (InstallStatus::Timeout, "\"Timeout\""),
         ];
