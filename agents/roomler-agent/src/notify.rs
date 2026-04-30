@@ -69,9 +69,7 @@ pub fn clear_attention() {
 /// Whether an attention sentinel currently exists. Cheap stat call,
 /// safe to poll.
 pub fn has_attention() -> bool {
-    attention_path()
-        .map(|p| p.exists())
-        .unwrap_or(false)
+    attention_path().map(|p| p.exists()).unwrap_or(false)
 }
 
 #[cfg(test)]

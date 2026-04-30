@@ -325,9 +325,7 @@ pub(crate) fn verify_sha256(bytes: &[u8], digest: &str) -> Result<()> {
     h.update(bytes);
     let computed_hex = hex::encode(h.finalize());
     if !computed_hex.eq_ignore_ascii_case(expected_hex) {
-        bail!(
-            "sha256 mismatch: computed {computed_hex}, expected {expected_hex}",
-        );
+        bail!("sha256 mismatch: computed {computed_hex}, expected {expected_hex}",);
     }
     Ok(())
 }
@@ -379,9 +377,7 @@ pub async fn pin_version(tag: &str) -> CheckOutcome {
     let asset = match pick_asset_for_platform(&release.assets) {
         Some(a) => a,
         None => {
-            return CheckOutcome::Skipped(format!(
-                "no platform installer in release {tag}"
-            ));
+            return CheckOutcome::Skipped(format!("no platform installer in release {tag}"));
         }
     };
     match download_asset(asset).await {

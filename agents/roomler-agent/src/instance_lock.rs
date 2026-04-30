@@ -24,9 +24,9 @@
 //! stay runnable alongside a live agent — they're either short-lived
 //! diagnostics or modify external state, never the WS connection.
 
-use anyhow::Result;
 #[cfg(unix)]
 use anyhow::Context;
+use anyhow::Result;
 use std::path::Path;
 
 /// Outcome of an acquire attempt. The lock is released when the
@@ -147,9 +147,7 @@ fn win_acquire(id: &str) -> Result<AcquireOutcome> {
         }
         return Ok(AcquireOutcome::AlreadyRunning);
     }
-    Ok(AcquireOutcome::Acquired(InstanceLock {
-        _win: WinMutex(h),
-    }))
+    Ok(AcquireOutcome::Acquired(InstanceLock { _win: WinMutex(h) }))
 }
 
 // ---------------------------------------------------------------------------
@@ -178,9 +176,7 @@ fn unix_acquire(id: &str) -> Result<AcquireOutcome> {
     // flock with LOCK_NB returns immediately rather than blocking.
     let r = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
     if r != 0 {
-        let errno = std::io::Error::last_os_error()
-            .raw_os_error()
-            .unwrap_or(0);
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
         if errno == libc::EWOULDBLOCK || errno == libc::EAGAIN {
             return Ok(AcquireOutcome::AlreadyRunning);
         }
