@@ -86,8 +86,16 @@ pub async fn handle_agent_socket(
         match msg {
             Ok(Message::Text(text)) => match serde_json::from_str::<ClientMsg>(&text) {
                 Ok(parsed) => {
+                    // Phase 7: refresh last_seen_at on every heartbeat. Hub
+                    // dispatch is a no-op for AgentHeartbeat (handled here);
+                    // we still call dispatch so any future routing logic
+                    // (e.g. metrics fan-out) only needs one entry point.
+                    let is_heartbeat = matches!(&parsed, ClientMsg::AgentHeartbeat { .. });
                     if let Err(e) = state.rc_hub.dispatch(&ctx, parsed) {
                         warn!(%agent_id, %e, "rc:* dispatch failed (agent)");
+                    }
+                    if is_heartbeat && let Err(e) = state.agents.touch_heartbeat(agent_id).await {
+                        warn!(%agent_id, %e, "agent touch_heartbeat failed");
                     }
                 }
                 Err(e) => {

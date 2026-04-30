@@ -126,6 +126,21 @@ impl AgentDao {
             .await
     }
 
+    /// Refresh `last_seen_at` from a periodic agent heartbeat. Hello +
+    /// mark_status touch the same field, but they only fire at session
+    /// boundaries (connect / disconnect); without this method a long-
+    /// lived but quiet agent stays at "last_seen = hello time" forever.
+    /// 30 s heartbeat cadence on the agent keeps the field fresh enough
+    /// that "agent online" can be defined as `last_seen_at > now - 90 s`.
+    pub async fn touch_heartbeat(&self, agent_id: ObjectId) -> DaoResult<bool> {
+        self.base
+            .update_by_id(
+                agent_id,
+                doc! { "$set": { "last_seen_at": DateTime::now() } },
+            )
+            .await
+    }
+
     pub async fn update_access_policy(
         &self,
         tenant_id: ObjectId,
