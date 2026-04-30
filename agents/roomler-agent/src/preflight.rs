@@ -238,15 +238,9 @@ async fn check_clock(scheme: &str, host: String, port: u16) -> Option<Finding> {
             });
         }
     };
-    let Some(date_header) = resp.headers().get(reqwest::header::DATE) else {
-        return None;
-    };
-    let Ok(s) = date_header.to_str() else {
-        return None;
-    };
-    let Ok(server_dt) = chrono::DateTime::parse_from_rfc2822(s) else {
-        return None;
-    };
+    let date_header = resp.headers().get(reqwest::header::DATE)?;
+    let s = date_header.to_str().ok()?;
+    let server_dt = chrono::DateTime::parse_from_rfc2822(s).ok()?;
     let server_unix = server_dt.timestamp();
     let local_unix = chrono::Utc::now().timestamp();
     let offset = local_unix - server_unix;

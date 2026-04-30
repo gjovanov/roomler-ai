@@ -28,10 +28,13 @@
 
 #![cfg(target_os = "windows")]
 
+pub mod supervisor;
+
 use anyhow::{Context, Result, bail};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 
 use windows_service::service::{
@@ -246,18 +249,24 @@ fn service_main_inner() -> Result<()> {
     // file in the configured log dir.
     crate::logging::init();
 
-    let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
+    // Channel out to the worker supervisor. The SCM control handler
+    // posts SessionChanged / Shutdown events here and the supervisor
+    // (running on its own OS thread) reacts.
+    let (sup_tx, sup_rx) = mpsc::channel::<supervisor::SupervisorEvent>();
+    let sup_tx_for_handler = sup_tx.clone();
+
     let event_handler = move |control_event| -> ServiceControlHandlerResult {
         match control_event {
             ServiceControl::Stop | ServiceControl::Preshutdown => {
                 tracing::info!(?control_event, "service stop requested");
-                let _ = shutdown_tx.send(());
+                let _ = sup_tx_for_handler.send(supervisor::SupervisorEvent::Shutdown);
                 ServiceControlHandlerResult::NoError
             }
             ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
-            // M2 will handle SessionChange here to swap the active
-            // worker process when a user logs in / out.
-            ServiceControl::SessionChange(_) => ServiceControlHandlerResult::NoError,
+            ServiceControl::SessionChange(_) => {
+                let _ = sup_tx_for_handler.send(supervisor::SupervisorEvent::SessionChanged);
+                ServiceControlHandlerResult::NoError
+            }
             _ => ServiceControlHandlerResult::NotImplemented,
         }
     };
@@ -268,23 +277,34 @@ fn service_main_inner() -> Result<()> {
         .set_service_status(running_status())
         .context("set_service_status(Running)")?;
 
+    // Resolve the worker binary path once. `current_exe` is the same
+    // EXE the SCM launched (the service host); we relaunch it with
+    // a `run` subcommand to drive the existing user-mode signaling /
+    // capture pipeline in the active session's context.
+    let worker_exe = std::env::current_exe().context("resolving current_exe for worker spawn")?;
+    let worker_args = vec!["run".to_string()];
+
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         service = SERVICE_NAME,
-        "service started; main loop is M1 stub (sleeps until Stop)"
+        worker_exe = %worker_exe.display(),
+        "service started; spawning worker supervisor"
     );
 
-    // M1: idle until Stop. M2 will spawn + supervise the worker here.
-    // The recv blocks the SCM dispatcher thread, which is correct —
-    // dispatcher needs us to stay alive until the controls are done.
-    // 1 s wake-up gives M2 a place to plug periodic worker-health
-    // checks without restructuring this loop.
-    loop {
-        match shutdown_rx.recv_timeout(Duration::from_secs(1)) {
-            Ok(()) => break,
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        }
+    // The supervisor blocks the calling thread, so we hand it to a
+    // dedicated OS thread and wait on the join handle. Returning the
+    // dispatcher thread to the SCM is the responsibility of the
+    // caller; we only need to keep this thread alive long enough to
+    // observe the supervisor's exit.
+    let sup_handle = thread::Builder::new()
+        .name("roomler-svc-supervisor".into())
+        .spawn(move || supervisor::run(worker_exe, worker_args, sup_rx))
+        .context("spawning supervisor thread")?;
+
+    match sup_handle.join() {
+        Ok(Ok(())) => tracing::info!("supervisor exited cleanly"),
+        Ok(Err(e)) => tracing::error!(error = %e, "supervisor returned error"),
+        Err(_) => tracing::error!("supervisor thread panicked"),
     }
 
     tracing::info!("service stopping");
