@@ -378,10 +378,15 @@ onUnmounted(() => {
 }
 
 /* Make v-main a flex column container so router-view children can fill it,
-   and prevent it from growing beyond available space.
+   and prevent it from growing beyond available space. Use overflow-y: auto
+   (rather than hidden) so list-style views — admin / rooms / files / invites
+   / billing — get a natural page scrollbar when their content exceeds the
+   viewport. Chat / conference views set their own `overflow: hidden` on the
+   inner root so their internal scroll containers (`flex-grow-1
+   overflow-y-auto` on the message list) keep working unchanged.
    Note: Vuetify 3 does NOT render .v-main__wrap — slot content goes directly in <main>. */
 .app-main-no-scroll {
-  overflow: hidden !important;
+  overflow-y: auto !important;
   flex: 1 1 0 !important;
   min-height: 0 !important;
   display: flex !important;

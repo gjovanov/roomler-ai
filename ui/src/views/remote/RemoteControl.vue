@@ -1197,6 +1197,16 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
 }
+/* On narrow viewports the toolbar's many controls (back button, title,
+   phase chip, quality / scale / scale-percent / resolution / codec
+   selects, clipboard / Ctrl-Alt-Del / fullscreen / WebCodecs / file-
+   upload / disconnect buttons) don't fit; without horizontal scroll
+   the rightmost ones (notably Disconnect) sit past the viewport edge
+   and are unreachable. v-toolbar otherwise hides overflow. Field bug
+   PC50045 mobile 2026-05-01. */
+.remote-control-wrapper :deep(.v-toolbar__content) {
+  overflow-x: auto;
+}
 .remote-stage {
   flex: 1;
   display: flex;

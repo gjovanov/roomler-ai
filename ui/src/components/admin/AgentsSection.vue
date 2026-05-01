@@ -33,7 +33,14 @@
         <v-progress-circular indeterminate />
       </div>
 
-      <v-table v-else-if="agentStore.agents.length > 0" density="comfortable">
+      <!-- Desktop / tablet: full table. Vuetify's v-table wrapper already
+           handles horizontal overflow scroll, but on real-narrow screens
+           the row gets cramped and the Actions column hides past the
+           viewport edge — hence the dedicated mobile list below. -->
+      <v-table
+        v-else-if="agentStore.agents.length > 0 && !mobile"
+        density="comfortable"
+      >
         <thead>
           <tr>
             <th>Name</th>
@@ -115,6 +122,97 @@
         </tbody>
       </v-table>
 
+      <!-- Mobile: stacked card list. Each card is a tappable target;
+           Connect / Delete actions are full-width buttons at the bottom
+           of the card so the rightmost item is reachable on a narrow
+           viewport (the field bug from PC50045 2026-05-01: "cannot
+           select the last Laptop in the list, not possible to scroll").
+           Codecs / version / last-seen drop to small lines so the
+           card stays compact at ~120px tall. -->
+      <v-list
+        v-else-if="agentStore.agents.length > 0 && mobile"
+        density="compact"
+        class="pa-0"
+      >
+        <v-card
+          v-for="a in agentStore.agents"
+          :key="a.id"
+          variant="outlined"
+          class="mb-2"
+        >
+          <v-card-text class="pa-3">
+            <div class="d-flex align-center mb-1">
+              <v-icon
+                :color="a.is_online ? 'success' : 'grey'"
+                size="small"
+                class="mr-2"
+              >
+                {{ a.is_online ? 'mdi-circle' : 'mdi-circle-outline' }}
+              </v-icon>
+              <span class="font-weight-medium">{{ a.name }}</span>
+              <v-spacer />
+              <v-chip size="x-small" :color="statusColor(a)" variant="flat">
+                {{ a.is_online ? 'Online' : a.status }}
+              </v-chip>
+            </div>
+            <div class="text-caption text-medium-emphasis mb-2">
+              {{ a.machine_id }}
+            </div>
+            <div class="d-flex flex-wrap gap-1 mb-2">
+              <v-chip
+                size="x-small"
+                :prepend-icon="osIcon(a.os)"
+                variant="tonal"
+              >
+                {{ a.os }}
+              </v-chip>
+              <v-chip
+                v-if="a.agent_version"
+                size="x-small"
+                variant="tonal"
+              >
+                v{{ a.agent_version }}
+              </v-chip>
+              <v-chip
+                v-for="codec in codecChips(a)"
+                :key="codec.label"
+                size="x-small"
+                :color="codec.color"
+                variant="tonal"
+                :title="codec.tooltip"
+              >
+                {{ codec.label }}
+              </v-chip>
+            </div>
+            <div class="text-caption text-medium-emphasis mb-2">
+              Last seen: {{ fmtDate(a.last_seen_at) }}
+            </div>
+            <div class="d-flex gap-2">
+              <v-btn
+                size="small"
+                variant="tonal"
+                color="primary"
+                prepend-icon="mdi-remote-desktop"
+                :disabled="!a.is_online"
+                :to="{ name: 'agent-remote', params: { tenantId, agentId: a.id } }"
+                :aria-label="`Connect to agent ${a.name}`"
+                class="flex-grow-1"
+              >
+                Connect
+              </v-btn>
+              <v-btn
+                icon="mdi-delete"
+                size="small"
+                variant="text"
+                color="error"
+                @click="confirmDelete(a)"
+                :aria-label="`Delete agent ${a.name}`"
+              />
+            </div>
+          </v-card-text>
+        </v-card>
+      </v-list>
+
       <div v-else class="text-center pa-8 text-medium-emphasis">
         <v-icon size="64" color="grey-lighten-1" class="mb-2">mdi-desktop-classic</v-icon>
         <p class="mb-2">No agents enrolled yet.</p>
@@ -193,12 +291,18 @@
 
 <script setup lang="ts">
 import { ref, onMounted, watch } from 'vue'
+import { useDisplay } from 'vuetify'
 import { useAgentStore, type Agent, type EnrollmentToken } from '@/stores/agents'
 import { codecChips } from './agentCodecChips'
 
 const props = defineProps<{ tenantId: string }>()
 
 const agentStore = useAgentStore()
+
+// `mobile` is reactive: Vuetify's display module flips it on viewports
+// narrower than the `mobile-breakpoint` (default `lg`, but the agent
+// table only really needs the dedicated layout below `sm`).
+const { smAndDown: mobile } = useDisplay()
 
 const enrollDialogOpen = ref(false)
 const enrollLoading = ref(false)
