@@ -159,6 +159,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Threading",            # CreateProcessAsUserW, STARTUPINFO
     "Win32_System_Environment",          # CreateEnvironmentBlock
     "Win32_System_StationsAndDesktops",  # winsta0\default desktop attach
+    "Win32_UI_HiDpi",                    # SetProcessDpiAwarenessContext (mouse offset fix)
 ] }
 
 [target.'cfg(target_os = "windows")'.dependencies.windows]

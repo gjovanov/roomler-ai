@@ -7,6 +7,8 @@ pub mod capture;
 pub mod clipboard;
 pub mod config;
 pub mod displays;
+#[cfg(target_os = "windows")]
+pub mod dpi;
 pub mod encode;
 pub mod enrollment;
 pub mod files;
