@@ -53,8 +53,17 @@ jobs:
             libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev \
             cmake libclang-dev
 
+      # Pair `vp9-444` with `vp9-444-bindgen` on Linux so env-libvpx-sys
+      # regenerates its FFI bindings via bindgen against the installed
+      # libvpx headers. The apt package on Ubuntu 24.04 (the GH-hosted
+      # runner image since 2026-04) ships libvpx 1.14+, but env-libvpx-sys
+      # 5.1.3's pre-generated bindings cap at 1.13.0. Without the
+      # bindgen feature the build script panics with "Expected file
+      # generated/vpx-ffi-1.14.0.rs not found but 'generate' cargo
+      # feature not used." `libclang-dev` (installed above) is the
+      # bindgen runtime requirement.
       - name: Check agent --features vp9-444
-        run: cargo check -p roomler-agent --features vp9-444
+        run: cargo check -p roomler-agent --features vp9-444,vp9-444-bindgen
 
       - name: Test agent under vp9-444
         # Runs the full `--features vp9-444` lib test suite:
@@ -70,7 +79,7 @@ jobs:
         #     ~25 frames behind a non-zero default g_lag_in_frames.
         #   - caps probe assertions: detect_advertises_vp9_444_*
         #     locks the rc:agent.hello advertisement contract.
-        run: cargo test -p roomler-agent --features vp9-444 --lib
+        run: cargo test -p roomler-agent --features vp9-444,vp9-444-bindgen --lib
 
   frontend:
     name: Frontend checks
