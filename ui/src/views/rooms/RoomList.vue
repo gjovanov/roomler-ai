@@ -1,5 +1,5 @@
 <template>
-  <v-container>
+  <v-container fluid>
     <v-row>
       <v-col cols="12" class="d-flex align-center">
         <h1 class="text-h4">{{ $t('nav.rooms') }}</h1>

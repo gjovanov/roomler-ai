@@ -1,5 +1,5 @@
 <template>
-  <v-container>
+  <v-container fluid>
     <v-row>
       <v-col cols="12">
         <h1 class="text-h4 mb-2">{{ tenantStore.current?.name }}</h1>

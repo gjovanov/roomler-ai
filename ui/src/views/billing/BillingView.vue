@@ -1,5 +1,5 @@
 <template>
-  <v-container class="py-8">
+  <v-container fluid class="py-8">
     <h1 class="text-h4 font-weight-bold mb-2">Billing & Subscription</h1>
     <p class="text-body-1 text-medium-emphasis mb-8">Manage your workspace's plan and billing</p>
 
