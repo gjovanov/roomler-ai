@@ -29,13 +29,15 @@
   who owns it.
 
   Effort 2 note (Windows Service deployment mode, 0.1.58):
-  This MSI does **not** auto-register the alternative SCM service —
+  This MSI does NOT auto-register the alternative SCM service.
   CreateService requires admin elevation, which conflicts with the
   perUser install scope. Operators who want the service-mode autostart
   (fleet / pre-logon scenarios) install the MSI normally, then run
-  `roomler-agent service install --as-service` from an elevated
-  shell. A future per-machine MSI flavour can revisit auto-registering
-  the SCM service via a deferred non-impersonated custom action.
+  `roomler-agent service install` with the `as-service` flag from an
+  elevated shell. A future per-machine MSI flavour can revisit
+  auto-registering the SCM service via a deferred non-impersonated
+  custom action.
+  (XML comment rule: no consecutive dashes, hence the awkward phrasing.)
 -->
 <Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'>
     <Product
