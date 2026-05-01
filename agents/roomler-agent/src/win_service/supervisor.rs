@@ -508,6 +508,29 @@ pub fn run(
                 }
                 current_session = None;
             }
+            (SpawnDecision::Idle, _) if current_worker.is_some() => {
+                // Active console session disappeared (user logged out;
+                // host returned to the welcome / lock screen with no
+                // logged-in user). The worker is still running but in
+                // a now-dead session: every input event it tries to
+                // inject returns ERROR_ACCESS_DENIED, every capture
+                // call returns a stale frame. Field reproducer at
+                // 2026-05-01 (PC50045): logout → flood of "Zugriff
+                // verweigert (os error 5)" with the worker still
+                // visible to the controller. Terminate eagerly so the
+                // controller sees the agent go offline cleanly; M3
+                // will fold in SYSTEM-context capture+input here so
+                // the lock screen itself becomes controllable.
+                if let Some(old) = current_worker.take() {
+                    tracing::info!(
+                        pid = old.pid,
+                        old_session = ?current_session,
+                        "supervisor: console session went idle (logout / lock screen); terminating worker"
+                    );
+                    old.terminate();
+                }
+                current_session = None;
+            }
             _ => {}
         }
 
@@ -540,6 +563,16 @@ mod tests {
         // Worker is for session 2 but the active console moved to 5
         // (the previous user logged out, a new one logged in).
         assert_eq!(decide_spawn(Some(5), Some(2)), SpawnDecision::SpawnIn(5));
+    }
+
+    #[test]
+    fn decide_spawn_idles_when_session_disappears_with_worker_alive() {
+        // Field bug PC50045 2026-05-01: user logs out; active session
+        // becomes None; the worker is still alive but in a dead
+        // session and floods Access Denied. decide_spawn must report
+        // Idle so the supervisor's "idle && current_worker.is_some()"
+        // arm tears the worker down.
+        assert_eq!(decide_spawn(None, Some(2)), SpawnDecision::Idle);
     }
 
     #[test]

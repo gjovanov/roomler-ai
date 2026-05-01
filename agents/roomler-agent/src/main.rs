@@ -14,6 +14,8 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 #[cfg(target_os = "windows")]
+use roomler_agent::dpi;
+#[cfg(target_os = "windows")]
 use roomler_agent::win_service;
 use roomler_agent::{
     config, encode, enrollment, instance_lock, logging, machine, notify, post_install, preflight,
@@ -176,6 +178,20 @@ enum ServiceAction {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Set per-monitor-V2 DPI awareness as the very first thing on
+    // Windows. Capture frames (WGC / DXGI / scrap) are always physical
+    // pixels regardless of awareness, but enigo's mouse-position APIs
+    // work in *logical* pixels under the legacy "system DPI aware"
+    // default — a 1920×1200 panel at 125% scale reports as 1536×960
+    // and `SetCursorPos` interprets coordinates against that, so a
+    // browser-side normalised click maps left+above of where the user
+    // clicked. Field bug PC50045 2026-05-01. Idempotent — a noop once
+    // some other subsystem has already set DPI for the process.
+    #[cfg(target_os = "windows")]
+    {
+        let _ = dpi::set_per_monitor_aware();
+    }
+
     logging::init();
     if let Some(dir) = logging::log_dir() {
         tracing::debug!(log_dir = %dir.display(), "persistent file logging active");
