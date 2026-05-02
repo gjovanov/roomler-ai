@@ -48,6 +48,70 @@ pub const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 3600);
 /// guards against running that as an installer.
 pub const MIN_INSTALLER_BYTES: usize = 1_000_000;
 
+/// At-startup update-check cooldown. If we last spawned an installer
+/// within this window, skip the immediate `check_once` and proceed
+/// straight to the periodic interval. Prevents the install-storm
+/// failure mode found on host `e069019l` (2026-05-02): SCM service
+/// supervisor + auto-updater + freshly-downloaded MSI = each newly
+/// spawned worker re-detects the same pending update, fires another
+/// installer, exits clean (code=0), supervisor respawns, repeat. The
+/// 0.1.61 supervisor patch (code=0 -> immediate respawn, no backoff)
+/// makes the cycle tighter (~1.5 s per turn). 5 minutes is more than
+/// enough headroom for a Win11 MSI to land + the new binary to start
+/// up + reach the clean-run threshold.
+pub const STARTUP_UPDATE_COOLDOWN: Duration = Duration::from_secs(300);
+
+/// Marker file the agent touches *before* spawning the installer.
+/// Path lives next to `last-install.json` so all update-related
+/// state is in one directory and gets cleaned up by the same log-
+/// retention policy. Returns `None` only when the platform doesn't
+/// expose a data dir (very-stripped-down environments + tests
+/// without `init()`).
+pub fn update_attempt_marker_path() -> Option<PathBuf> {
+    crate::logging::log_dir().map(|d| d.join("update-attempt"))
+}
+
+/// Touch the update-attempt marker. Call right before
+/// `spawn_installer_inner` so the cooldown starts ticking from the
+/// moment the installer process is launched. Best-effort: any I/O
+/// failure is logged but does not block the update path (we'd
+/// rather have a working install with a noisy crash counter than
+/// no install at all).
+fn record_update_attempt() {
+    let Some(p) = update_attempt_marker_path() else {
+        return;
+    };
+    if let Some(parent) = p.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::write(&p, format!("{}\n", chrono::Utc::now().to_rfc3339())) {
+        tracing::warn!(error = %e, path = %p.display(), "could not write update-attempt marker");
+    }
+}
+
+/// Whether an update was attempted within the last `cooldown` seconds.
+/// Read by `run_periodic` on its first iteration to suppress the
+/// at-startup check when an install is already in flight.
+fn recent_update_attempt(cooldown: Duration) -> bool {
+    update_attempt_marker_path().is_some_and(|p| recent_update_attempt_at(&p, cooldown))
+}
+
+/// Inner pure-fn variant of `recent_update_attempt`. Takes the marker
+/// path as an explicit argument so unit tests can drive it against a
+/// `tempfile::TempDir` without depending on `logging::init()`.
+fn recent_update_attempt_at(marker_path: &std::path::Path, cooldown: Duration) -> bool {
+    let Ok(meta) = std::fs::metadata(marker_path) else {
+        return false;
+    };
+    let Ok(mtime) = meta.modified() else {
+        return false;
+    };
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(mtime)
+        .unwrap_or_default();
+    elapsed < cooldown
+}
+
 /// A parsed release from the GitHub API. Only the fields we need.
 #[derive(Debug, Deserialize)]
 pub struct GithubRelease {
@@ -471,6 +535,13 @@ pub fn spawn_installer_with_watch(
     installer_path: &std::path::Path,
     expected_version: Option<&str>,
 ) -> Result<()> {
+    // Touch the cooldown marker BEFORE spawning the installer. The
+    // run_periodic loop in any newly-spawned sibling worker (typical
+    // under SCM supervision) reads this marker on its first iteration
+    // to skip the immediate update check. Without this, the worker
+    // detects the same pending update, spawns another installer, and
+    // we get an install-storm. Field repro: e069019l 2026-05-02.
+    record_update_attempt();
     let installer_pid = spawn_installer_inner(installer_path)?;
     if let Some(tag) = expected_version
         && let Err(e) = spawn_watcher(installer_pid, installer_path, tag)
@@ -607,7 +678,13 @@ pub async fn run_periodic(
         if *shutdown.borrow() {
             return;
         }
-        if !first {
+        // Cooldown carve-out: if this worker started inside the
+        // recent-install window (a previous instance just spawned an
+        // installer), skip the immediate check and treat the loop as
+        // if the periodic interval had already elapsed once. Prevents
+        // the install-storm — see STARTUP_UPDATE_COOLDOWN doc.
+        let skip_first_check = first && recent_update_attempt(STARTUP_UPDATE_COOLDOWN);
+        if !first || skip_first_check {
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {},
                 _ = shutdown.changed() => {
@@ -616,6 +693,13 @@ pub async fn run_periodic(
             }
         }
         first = false;
+        if skip_first_check {
+            tracing::info!(
+                cooldown_secs = STARTUP_UPDATE_COOLDOWN.as_secs(),
+                "auto-updater: at-startup check suppressed by recent-install cooldown"
+            );
+            continue;
+        }
         let outcome = check_once().await;
         match outcome {
             CheckOutcome::UpToDate { current, latest } => {
@@ -709,6 +793,52 @@ mod tests {
             resolve_check_interval_with(Some(" 12 "), None),
             Duration::from_secs(12 * 3600)
         );
+    }
+
+    #[test]
+    fn recent_update_attempt_at_returns_false_when_marker_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("update-attempt");
+        // No file at `p`: the OS returns ENOENT, function returns false.
+        assert!(!recent_update_attempt_at(&p, Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn recent_update_attempt_at_returns_true_when_marker_fresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("update-attempt");
+        std::fs::write(&p, b"now").expect("write marker");
+        // File just written: mtime is roughly Instant::now(); a 5-min
+        // cooldown definitely covers a sub-millisecond elapsed.
+        assert!(recent_update_attempt_at(&p, Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn recent_update_attempt_at_returns_false_when_cooldown_too_short() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("update-attempt");
+        std::fs::write(&p, b"now").expect("write marker");
+        // Cooldown == 0: no window can be fresh enough. Locks the
+        // boundary: a pathological zero must not bypass the gate.
+        assert!(!recent_update_attempt_at(&p, Duration::ZERO));
+    }
+
+    #[test]
+    fn recent_update_attempt_at_returns_false_when_marker_old() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("update-attempt");
+        std::fs::write(&p, b"now").expect("write marker");
+        // Sleep past the (tiny) cooldown so elapsed > cooldown.
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(!recent_update_attempt_at(&p, Duration::from_millis(20)));
+    }
+
+    #[test]
+    fn startup_update_cooldown_is_five_minutes() {
+        // Lock the value: any future "make it shorter to retry faster"
+        // change should require an explicit reason to land. A too-short
+        // cooldown re-opens the install-storm window from e069019l.
+        assert_eq!(STARTUP_UPDATE_COOLDOWN, Duration::from_secs(300));
     }
 
     #[test]
