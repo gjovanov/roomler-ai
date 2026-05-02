@@ -101,9 +101,27 @@ Scheduled Task: it can register itself with the Service Control
 Manager as `RoomlerAgentService`, running under LocalSystem with
 AutoStart at boot.
 
-This MSI installs **per-user** without UAC, so the service mode is NOT
-auto-registered. Operators wanting service mode should run the MSI as
-usual, then open an elevated PowerShell ("Terminal (Admin)") and:
+Two ways to get there:
+
+  Option A: download the **per-Machine MSI** (since 0.2.x). The
+  release page on GitHub publishes two MSIs side-by-side:
+      roomler-agent-<version>-x86_64-pc-windows-msvc.msi
+      roomler-agent-<version>-perMachine-x86_64-pc-windows-msvc.msi
+  The per-Machine MSI installs files under %ProgramFiles%
+  \roomler-agent and auto-registers the SCM service via a deferred
+  custom action. UAC fires once during install. Single
+  msiexec invocation, no elevated-PS follow-up. Recommended for
+  managed-fleet deployments via group policy / Intune.
+
+  The two MSI flavours are mutually exclusive: each refuses to
+  install if the other is already present. Uninstall one before
+  switching. The per-User MSI never auto-registers the SCM service
+  because perUser installs run in a filtered token that lacks
+  CreateService rights.
+
+  Option B: install the **per-User MSI** (this one), then manually
+  promote to service mode. Open an elevated PowerShell ("Terminal
+  (Admin)"):
 
     & "$env:LOCALAPPDATA\Programs\roomler-agent\roomler-agent.exe" `
         service install --as-service
