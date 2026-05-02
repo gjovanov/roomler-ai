@@ -505,6 +505,20 @@ export function useRemoteControl() {
   let lastConnectArgs: { agentId: string; permissions: string } | null = null
   const reconnectAttempt = ref(0)
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+  /**
+   * Whether the agent has signalled (over the `control` data channel)
+   * that the host's input desktop has transitioned to `winsta0\Winlogon`
+   * (lock screen / UAC consent / secure attention sequence). The
+   * lock-overlay frame on the video track already shows the visual
+   * state; this flag is a separate machine-readable signal so the
+   * viewer can render a toolbar badge that's visible even when the
+   * video element is scrolled out of view.
+   *
+   * Stays false on agents older than 0.2.2 (which never emit the
+   * message); the flag remains coherent because falling back to
+   * always-false matches the pre-overlay behaviour for those agents.
+   */
+  const hostLocked = ref(false)
   const remoteStream = ref<MediaStream | null>(null)
   /** Set once we've received at least one video/audio track. False until
    *  the agent attaches media (the native agent currently does not). */
@@ -1290,6 +1304,7 @@ export function useRemoteControl() {
     cursor.value = { pos: null, shapes: new Map() }
     mediaIntrinsicW.value = 0
     mediaIntrinsicH.value = 0
+    hostLocked.value = false
   }
 
   async function connect(
@@ -1569,6 +1584,23 @@ export function useRemoteControl() {
     channels.control.onopen = () => {
       sendQualityPreference()
       sendResolutionPreference()
+    }
+    // Agent → browser control messages. Today: `rc:host_locked`
+    // (boolean) — the agent flips this on/off as `lock_state.rs`
+    // observes desktop transitions. Other variants (rc:dpi-change,
+    // rc:cursor-shape) layer on the same parse-by-`t` switch.
+    // Unknown `t` values are dropped silently; older agents emitted
+    // nothing here, so backward-compat is automatic.
+    channels.control.onmessage = (ev) => {
+      if (typeof ev.data !== 'string') return
+      try {
+        const msg = JSON.parse(ev.data) as { t?: string; locked?: boolean }
+        if (msg.t === 'rc:host_locked' && typeof msg.locked === 'boolean') {
+          hostLocked.value = msg.locked
+        }
+      } catch {
+        // Non-JSON or malformed — ignore.
+      }
     }
 
     // Begin polling getStats() on a 500 ms cadence so the UI can show
@@ -1988,6 +2020,14 @@ export function useRemoteControl() {
      * `phase === 'reconnecting'`.
      */
     reconnectAttempt,
+    /**
+     * Whether the host has signalled (via the `rc:host_locked`
+     * control-DC message) that its input desktop has transitioned
+     * to `winsta0\Winlogon`. Used by the viewer to render an
+     * explicit "Host locked" badge alongside the video stream's
+     * padlock overlay frame.
+     */
+    hostLocked,
     attachInput,
     sendClipboardToAgent,
     getAgentClipboard,
