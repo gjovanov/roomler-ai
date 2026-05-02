@@ -25,7 +25,10 @@
         variant="flat"
         class="mr-2"
       >
-        {{ rc.phase.value }}
+        <template v-if="rc.phase.value === 'reconnecting'">
+          Reconnecting ({{ rc.reconnectAttempt.value }}/{{ RC_RECONNECT_LADDER_MS.length }})…
+        </template>
+        <template v-else>{{ rc.phase.value }}</template>
       </v-chip>
       <!-- Quality preference: persisted to localStorage; sent to the
            agent over the control data channel on change and on channel
@@ -463,6 +466,7 @@ import { useAgentStore, type Agent } from '@/stores/agents'
 import { useAuthStore } from '@/stores/auth'
 import {
   useRemoteControl,
+  RC_RECONNECT_LADDER_MS,
   type RcQuality,
   type RcPreferredCodec,
   type RcScaleMode,
@@ -1066,6 +1070,7 @@ const statusColor = computed(() => (agent.value?.is_online ? 'success' : 'grey')
 const phaseColor = computed(() => {
   switch (rc.phase.value) {
     case 'connected': return 'success'
+    case 'reconnecting': return 'warning'
     case 'error': return 'error'
     case 'closed': return 'grey'
     default: return 'info'
