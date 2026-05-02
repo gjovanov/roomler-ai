@@ -87,6 +87,29 @@ enum Command {
         #[arg(long, default_value = "h264")]
         codec: String,
     },
+    /// M3 derisking spike: probe Windows.Graphics.Capture init from
+    /// the requested desktop. Three modes — `default` (no swap, sanity
+    /// baseline; should always pass in a user session), `input`
+    /// (reproduces the M3 supervisor's poll-loop swap), `winlogon`
+    /// (explicitly opens `winsta0\Winlogon` — requires SYSTEM context
+    /// via `psexec -s -i 1 ...` from elevated PowerShell). Reports
+    /// first frame size + frame-arrived count + structured errors on
+    /// every init step. The 2026-05-02 critic review (item D) flagged
+    /// that `psexec -s -i 0` lands on session 0's *visible* desktop,
+    /// not Winlogon, so this binary explicitly attaches to the
+    /// secure desktop before init. Windows-only, requires
+    /// `--features wgc-capture` (or `full-hw`).
+    SystemCaptureSmoke {
+        /// Which desktop to bind to before the WGC probe.
+        #[arg(long, default_value = "default")]
+        desktop: String,
+        /// How many frames to wait for before declaring success.
+        #[arg(long, default_value_t = 3)]
+        frames: u32,
+        /// Wall-clock cap on the frame wait, in milliseconds.
+        #[arg(long, default_value_t = 5000)]
+        timeout_ms: u32,
+    },
     /// Run the capability probe that populates `rc:agent.hello` and
     /// print the result. Useful for verifying what codecs the agent
     /// will actually advertise on this host (the HEVC + AV1 probes
@@ -212,6 +235,11 @@ async fn main() -> Result<()> {
         Command::ReEnroll { token } => re_enroll_cmd(&config_path, &token).await,
         Command::Run { encoder } => run_cmd(&config_path, encoder.as_deref()).await,
         Command::EncoderSmoke { encoder, codec } => encoder_smoke_cmd(&encoder, &codec).await,
+        Command::SystemCaptureSmoke {
+            desktop,
+            frames,
+            timeout_ms,
+        } => system_capture_smoke_cmd(&desktop, frames, timeout_ms),
         Command::Caps => caps_cmd().await,
         Command::Displays => displays_cmd().await,
         Command::Service { action } => service_cmd(action).await,
@@ -858,6 +886,28 @@ async fn encoder_smoke_cmd(pref_raw: &str, codec_raw: &str) -> Result<()> {
         "encoder smoke PASSED: backend={backend} keyframes={keyframes} total_bytes={total_bytes}"
     );
     Ok(())
+}
+
+/// `system-capture-smoke` CLI dispatch. Synchronous (no .await) — the
+/// WGC probe runs on the calling thread which carries the desktop
+/// attachment from `SetThreadDesktop`. A tokio runtime would defeat
+/// the purpose: tasks would be moved to worker threads that have
+/// their own (default) desktop attachment.
+#[cfg(all(target_os = "windows", feature = "wgc-capture"))]
+fn system_capture_smoke_cmd(desktop_raw: &str, frames: u32, timeout_ms: u32) -> Result<()> {
+    use roomler_agent::win_service::capture_smoke::{self, DesktopTarget};
+    use std::str::FromStr;
+    let target = DesktopTarget::from_str(desktop_raw)
+        .map_err(|e| anyhow::anyhow!("bad --desktop {desktop_raw:?}: {e}"))?;
+    capture_smoke::run(target, frames, timeout_ms)
+}
+
+#[cfg(not(all(target_os = "windows", feature = "wgc-capture")))]
+fn system_capture_smoke_cmd(_desktop_raw: &str, _frames: u32, _timeout_ms: u32) -> Result<()> {
+    bail!(
+        "`system-capture-smoke` requires Windows + the `wgc-capture` feature. \
+         Rebuild with `cargo build -p roomler-agent --release --features full-hw`."
+    );
 }
 
 async fn caps_cmd() -> Result<()> {
