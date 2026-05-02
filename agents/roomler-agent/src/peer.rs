@@ -477,6 +477,19 @@ impl AgentPeer {
             }));
         }
 
+        // Spawn the lock-screen monitor BEFORE wiring the data-channel
+        // callback so the input handler can subscribe to LockState
+        // transitions and drop input events early when the host is
+        // locked. Without this the events would be dispatched to
+        // SendInput which silently routes them to the wrong desktop
+        // (the user-context worker is on `winsta0\Default`, but the
+        // input desktop is `winsta0\Winlogon`) — they appear to "work"
+        // from the WS side but achieve nothing on the host. Dropping
+        // them in user-space avoids polluting `enigo` logs and lets
+        // a future browser-side hint surface "input suppressed" to
+        // the operator.
+        let (lock_state_rx, _lock_state_handle) = lock_state::spawn_monitor();
+
         // Route data channels by label. `input` goes to the OS injector;
         // `control` parses rc:* JSON (quality preference, etc.);
         // `cursor` receives an agent-driven stream of position / shape
@@ -487,15 +500,17 @@ impl AgentPeer {
         let quality_for_dc = quality_state.clone();
         let target_res_for_dc = target_resolution.clone();
         let video_bytes_dc_for_callback = video_bytes_dc.clone();
+        let lock_state_rx_for_dc = lock_state_rx.clone();
         pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
             let label = dc.label().to_string();
             info!(session = %session_id, %label, "data channel opened");
             let quality_for_dc = quality_for_dc.clone();
             let target_res_for_dc = target_res_for_dc.clone();
             let video_bytes_stash = video_bytes_dc_for_callback.clone();
+            let lock_state_rx_for_input = lock_state_rx_for_dc.clone();
             Box::pin(async move {
                 match label.as_str() {
-                    "input" => attach_input_handler(dc),
+                    "input" => attach_input_handler(dc, lock_state_rx_for_input),
                     "control" => {
                         attach_control_handler(dc, session_id, quality_for_dc, target_res_for_dc)
                     }
@@ -524,15 +539,6 @@ impl AgentPeer {
                 }
             })
         }));
-
-        // Spawn the lock-screen monitor. One per session is fine —
-        // the poll cost is ~0.001 % CPU, and the watch channel's
-        // `is_closed()` lets the monitor task self-terminate when
-        // the pump exits. Multiple concurrent sessions stack
-        // monitors, which is wasteful but correct. M3 phase 4
-        // could hoist this to one-per-worker if profiling shows
-        // it matters.
-        let (lock_state_rx, _lock_state_handle) = lock_state::spawn_monitor();
 
         // Start the capture→encode→track pump. The pump is self-regulating:
         // with no capture backend compiled in, open_default returns a Noop
@@ -1474,16 +1480,36 @@ async fn media_pump_vp9_444_dc(
 /// may race with initialisation, but `open_default` is synchronous so
 /// it's ready before the first real keystroke).
 ///
+/// `lock_state_rx` lets the handler short-circuit injection when the
+/// host's input desktop has transitioned to `winsta0\Winlogon` (Win+L
+/// lock, UAC, etc.). On those transitions the user-context worker is
+/// still attached to `winsta0\Default` and SendInput would silently
+/// dispatch to the wrong desktop — events appear to be delivered from
+/// the WS side but achieve nothing on the host. Dropping them at this
+/// layer keeps the audit trail honest and avoids polluting `enigo`
+/// internal state.
+///
 /// Unparseable payloads are dropped with a debug log — we don't want a
 /// flood of warnings if the controller sends an unknown event type.
-fn attach_input_handler(dc: Arc<RTCDataChannel>) {
+fn attach_input_handler(
+    dc: Arc<RTCDataChannel>,
+    lock_state_rx: tokio::sync::watch::Receiver<lock_state::LockState>,
+) {
     // Injector is wrapped in `parking_lot::Mutex`-equivalent-style — we
     // don't have parking_lot imported here, so fall back to tokio's
     // Mutex. The inject() call is fast (just a channel send), so lock
     // contention is not a concern.
     let injector = std::sync::Arc::new(tokio::sync::Mutex::new(input::open_default()));
+    // Counter for batched suppression logging. Without this, a busy
+    // session with the host locked would spam one debug line per
+    // mouse-move (~60 Hz when the operator is jiggling). Log every
+    // 60th drop so the field gets a steady "yes, the suppression is
+    // working" signal without filling the log file.
+    let suppressed_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     dc.on_message(Box::new(move |msg| {
         let injector = injector.clone();
+        let lock_state_rx = lock_state_rx.clone();
+        let suppressed_count = suppressed_count.clone();
         Box::pin(async move {
             let Ok(text) = std::str::from_utf8(&msg.data) else {
                 debug!("input: non-utf8 payload dropped");
@@ -1496,6 +1522,23 @@ fn attach_input_handler(dc: Arc<RTCDataChannel>) {
                     return;
                 }
             };
+            // M3 Z-path: drop input early when the host is locked.
+            // The browser's auto-reconnect ladder will keep the peer
+            // alive across short lock screens; the operator just
+            // can't drive the lock UI itself (that's the A1-path
+            // future work).
+            if matches!(*lock_state_rx.borrow(), lock_state::LockState::Locked) {
+                let n = suppressed_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    .wrapping_add(1);
+                if n.is_multiple_of(60) {
+                    debug!(
+                        suppressed_total = n,
+                        "input: host locked — suppressing input events"
+                    );
+                }
+                return;
+            }
             let mut guard = injector.lock().await;
             if let Err(e) = guard.inject(parsed) {
                 debug!(%e, "input: inject failed");
