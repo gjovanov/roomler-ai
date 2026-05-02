@@ -15,6 +15,7 @@ pub mod files;
 pub mod indicator;
 pub mod input;
 pub mod instance_lock;
+pub mod lock_overlay;
 pub mod lock_state;
 pub mod logging;
 pub mod machine;
