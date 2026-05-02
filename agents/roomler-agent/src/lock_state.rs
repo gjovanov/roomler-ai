@@ -171,6 +171,17 @@ pub fn spawn_monitor() -> (
         let mut last = initial;
         loop {
             tokio::time::sleep(POLL_INTERVAL).await;
+            // Receiver-gone-shutdown: when every receiver has been
+            // dropped (the owning media pump exited), the watch
+            // sender's `is_closed()` flips. Without this check the
+            // monitor task can outlive its consumers indefinitely
+            // because `tx.send()` only fires on state *change* —
+            // a steady-Unlocked session never tries to send, never
+            // notices the receivers are gone, and leaks the task
+            // until runtime shutdown.
+            if tx.is_closed() {
+                return;
+            }
             let current = probe_lock_state();
             if current != last {
                 tracing::info!(
@@ -178,12 +189,10 @@ pub fn spawn_monitor() -> (
                     to = ?current,
                     "lock_state: transition observed"
                 );
-                // `send` only fails when all receivers have been
-                // dropped — at which point our task is unobserved
-                // and we should exit.
-                if tx.send(current).is_err() {
-                    return;
-                }
+                // We just confirmed the channel is open one tick
+                // ago; if a race made it close between then and
+                // now, the next tick's `is_closed` catches it.
+                let _ = tx.send(current);
                 last = current;
             }
         }
