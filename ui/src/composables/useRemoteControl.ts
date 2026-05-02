@@ -37,6 +37,35 @@ export type RcPhase =
 export const RC_RECONNECT_LADDER_MS = [250, 500, 1000, 2000, 4000, 8000] as const
 
 /**
+ * Parse an inbound `control` data-channel message into a typed
+ * value. Returns `null` for any non-JSON, non-string, or unknown
+ * envelope shape so the caller can no-op silently. Today only the
+ * `rc:host_locked` variant is recognised; future agent → browser
+ * control messages (rc:cursor-shape, rc:dpi-change, ...) layer on
+ * the same parse-by-`t` switch.
+ *
+ * Exported for unit testing. Production code should consume the
+ * already-applied `hostLocked` ref from the composable.
+ */
+export type RcControlInbound = { kind: 'host_locked'; locked: boolean } | null
+
+export function parseControlInbound(data: unknown): RcControlInbound {
+  if (typeof data !== 'string') return null
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(data)
+  } catch {
+    return null
+  }
+  if (parsed === null || typeof parsed !== 'object') return null
+  const obj = parsed as Record<string, unknown>
+  if (obj.t === 'rc:host_locked' && typeof obj.locked === 'boolean') {
+    return { kind: 'host_locked', locked: obj.locked }
+  }
+  return null
+}
+
+/**
  * Pure helper: given the number of attempts already made (0-indexed
  * — i.e. `0` means the first retry hasn't fired yet), return the
  * delay before the next attempt, or `null` if we've exhausted the
@@ -1592,14 +1621,9 @@ export function useRemoteControl() {
     // Unknown `t` values are dropped silently; older agents emitted
     // nothing here, so backward-compat is automatic.
     channels.control.onmessage = (ev) => {
-      if (typeof ev.data !== 'string') return
-      try {
-        const msg = JSON.parse(ev.data) as { t?: string; locked?: boolean }
-        if (msg.t === 'rc:host_locked' && typeof msg.locked === 'boolean') {
-          hostLocked.value = msg.locked
-        }
-      } catch {
-        // Non-JSON or malformed — ignore.
+      const parsed = parseControlInbound(ev.data)
+      if (parsed?.kind === 'host_locked') {
+        hostLocked.value = parsed.locked
       }
     }
 
