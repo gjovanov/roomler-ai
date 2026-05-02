@@ -313,7 +313,31 @@ impl OwnedProcess {
             TerminateProcess(self.process.raw(), 1);
         }
     }
+
+    /// Block (with timeout) until the OS has actually reaped the
+    /// process. `terminate()` only queues a kill — without a
+    /// follow-up wait, the process can outlive its caller by tens
+    /// to hundreds of milliseconds, which is enough for the named
+    /// instance lock to still be held when the next worker is
+    /// spawned. M5 finding #8 (PC50045 2026-05-02): a 145 ms gap
+    /// between SCM Stop+Start was short enough that the new
+    /// supervisor's first spawn lost the lock race and exited
+    /// with code=0. Returns true if the process exited within the
+    /// timeout, false otherwise.
+    pub fn wait_for_exit(&self, timeout: Duration) -> bool {
+        let timeout_ms = timeout.as_millis().min(u32::MAX as u128) as u32;
+        // SAFETY: process handle is valid for SYNCHRONIZE; timeout
+        // is a documented argument; return values are checked.
+        let r = unsafe { WaitForSingleObject(self.process.raw(), timeout_ms) };
+        r == WAIT_OBJECT_0
+    }
 }
+
+/// How long to wait after `terminate()` for the OS to actually
+/// reap the worker. 1.5 s is comfortably more than the observed
+/// 145 ms gap on PC50045 and well under any human-perceptible
+/// service-stop delay (services have 30 s before SCM force-kills).
+const TERMINATE_WAIT: Duration = Duration::from_millis(1500);
 
 /// Decide whether to (re)spawn the worker, and what session it
 /// should attach to. Pure: no side effects, no FFI, easy to unit-
@@ -337,6 +361,33 @@ pub fn decide_spawn(
         (None, _) => SpawnDecision::Idle,
         (Some(active), Some(current)) if active == current => SpawnDecision::KeepCurrent,
         (Some(active), _) => SpawnDecision::SpawnIn(active),
+    }
+}
+
+/// What the supervisor should do after observing a worker exit.
+/// Pure function — no FFI, no logging — so the contract is easy to
+/// pin with unit tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitReaction {
+    /// Worker exited cleanly (code=0). Respawn immediately and reset
+    /// the consecutive-failure counter. Sources of clean exits we
+    /// honour: auto-update self-shutdown (M5 #6), instance-lock race
+    /// after an SCM restart (M5 #8). Differentiating by exit code
+    /// keeps real crashes (non-zero) on the existing backoff ladder.
+    Respawn,
+    /// Worker exited with a non-zero code. Increment the counter and
+    /// wait `Duration` before respawning (exponential backoff).
+    Backoff(Duration),
+}
+
+/// Decide how to react to a worker exit. Returns the reaction plus
+/// the new value for `consecutive_failures`.
+pub fn decide_exit_reaction(code: u32, consecutive_failures: u32) -> (ExitReaction, u32) {
+    if code == 0 {
+        (ExitReaction::Respawn, 0)
+    } else {
+        let next = consecutive_failures.saturating_add(1);
+        (ExitReaction::Backoff(next_backoff(next)), next)
     }
 }
 
@@ -407,6 +458,15 @@ pub fn run(
             if let Some(w) = current_worker.take() {
                 tracing::info!(pid = w.pid, "supervisor: terminating worker on shutdown");
                 w.terminate();
+                // Wait for the OS to actually reap it before
+                // returning — see TERMINATE_WAIT for rationale.
+                if !w.wait_for_exit(TERMINATE_WAIT) {
+                    tracing::warn!(
+                        pid = w.pid,
+                        "supervisor: worker did not exit within {}ms after terminate",
+                        TERMINATE_WAIT.as_millis()
+                    );
+                }
             }
             return Ok(());
         }
@@ -415,16 +475,28 @@ pub fn run(
         if let Some(w) = current_worker.as_ref() {
             match w.try_wait() {
                 Ok(Some(code)) => {
-                    consecutive_failures = consecutive_failures.saturating_add(1);
-                    let backoff = next_backoff(consecutive_failures);
-                    tracing::warn!(
-                        pid = w.pid,
-                        code,
-                        consecutive_failures,
-                        backoff_secs = backoff.as_secs(),
-                        "supervisor: worker exited; backing off before respawn"
-                    );
-                    respawn_at = Some(Instant::now() + backoff);
+                    let (reaction, next_failures) =
+                        decide_exit_reaction(code, consecutive_failures);
+                    consecutive_failures = next_failures;
+                    match reaction {
+                        ExitReaction::Respawn => {
+                            tracing::info!(
+                                pid = w.pid,
+                                "supervisor: worker exited cleanly (code=0); respawning without backoff"
+                            );
+                            respawn_at = None;
+                        }
+                        ExitReaction::Backoff(backoff) => {
+                            tracing::warn!(
+                                pid = w.pid,
+                                code,
+                                consecutive_failures,
+                                backoff_secs = backoff.as_secs(),
+                                "supervisor: worker exited with non-zero code; backing off before respawn"
+                            );
+                            respawn_at = Some(Instant::now() + backoff);
+                        }
+                    }
                     current_worker = None;
                     current_session = None;
                 }
@@ -505,6 +577,10 @@ pub fn run(
                         "supervisor: active session changed; terminating old worker"
                     );
                     old.terminate();
+                    // Wait for reap so the next-iteration spawn doesn't
+                    // race the instance lock — same rationale as the
+                    // shutdown-path wait above.
+                    let _ = old.wait_for_exit(TERMINATE_WAIT);
                 }
                 current_session = None;
             }
@@ -528,6 +604,7 @@ pub fn run(
                         "supervisor: console session went idle (logout / lock screen); terminating worker"
                     );
                     old.terminate();
+                    let _ = old.wait_for_exit(TERMINATE_WAIT);
                 }
                 current_session = None;
             }
@@ -573,6 +650,47 @@ mod tests {
         // Idle so the supervisor's "idle && current_worker.is_some()"
         // arm tears the worker down.
         assert_eq!(decide_spawn(None, Some(2)), SpawnDecision::Idle);
+    }
+
+    #[test]
+    fn decide_exit_reaction_zero_code_resets_counter_and_respawns_now() {
+        // Auto-update self-exit (M5 finding #6) and SCM-restart
+        // instance-lock race (M5 finding #8) both surface as code=0.
+        // Neither is a real failure; the counter must reset to 0 so a
+        // legitimate later crash starts the backoff ladder fresh.
+        assert_eq!(decide_exit_reaction(0, 0), (ExitReaction::Respawn, 0));
+        assert_eq!(
+            decide_exit_reaction(0, 5),
+            (ExitReaction::Respawn, 0),
+            "code=0 must reset the counter even mid-ladder"
+        );
+    }
+
+    #[test]
+    fn decide_exit_reaction_non_zero_code_increments_and_backs_off() {
+        // Real crash on a fresh ladder: counter=0 → 1, backoff=2 s.
+        assert_eq!(
+            decide_exit_reaction(1, 0),
+            (ExitReaction::Backoff(Duration::from_secs(2)), 1)
+        );
+        // Mid-ladder: counter=3 → 4, backoff=16 s.
+        assert_eq!(
+            decide_exit_reaction(0xC0000005, 3),
+            (ExitReaction::Backoff(Duration::from_secs(16)), 4),
+            "ACCESS_VIOLATION should keep climbing the ladder"
+        );
+        // Cap holds: counter=10 → 11, but backoff caps at RESPAWN_BACKOFF_CAP.
+        assert_eq!(
+            decide_exit_reaction(1, 10),
+            (ExitReaction::Backoff(RESPAWN_BACKOFF_CAP), 11)
+        );
+    }
+
+    #[test]
+    fn decide_exit_reaction_saturates_counter() {
+        // Runaway counter must not panic on overflow.
+        let (_, next) = decide_exit_reaction(1, u32::MAX);
+        assert_eq!(next, u32::MAX);
     }
 
     #[test]

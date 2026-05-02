@@ -618,6 +618,18 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
                 tracing::error!(error = %e, "signaling task exited with error");
                 return Err(e);
             }
+            // sig_task exited successfully. The only way that happens
+            // is via `shutdown_tx.send(true)` from inside the agent
+            // (auto-updater spawning the installer, or rollback path
+            // pinning a previous version). Treat that as graceful so
+            // the next startup doesn't false-positive a crash counter
+            // increment. M5 finding #2 (PC50045 2026-05-02): every
+            // auto-update bumped `crash_count` by 1; three rapid
+            // updates would have tripped the rollback threshold.
+            if *shutdown_rx.borrow() {
+                tracing::info!("signaling task exited via internal shutdown signal; marking graceful");
+                graceful_shutdown = true;
+            }
         }
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("shutdown requested");
