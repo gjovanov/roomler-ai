@@ -189,18 +189,123 @@ pub fn is_newer(latest: &str, current: &str) -> bool {
     }
 }
 
+/// Which Windows MSI flavour the running agent was installed with.
+/// Used by [`pick_asset_for_platform`] to download the matching MSI
+/// for in-place upgrade — installing the wrong flavour silently fails
+/// the launch-condition check shipped in 0.2.5 and the auto-update
+/// loop never makes forward progress (field repro: PC50045
+/// 2026-05-02, perUser agent on 0.2.0 picked the perMachine 0.2.5 MSI
+/// alphabetically; UAC-elevated install rejected by the cross-flavour
+/// guard; agent restarted at 0.2.0 forever).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowsInstallFlavour {
+    PerUser,
+    PerMachine,
+}
+
+/// Discover this agent's install flavour from the running exe path.
+/// Heuristic: anything under `\Program Files` (with or without ` (x86)`)
+/// is perMachine; everything else (including `%LOCALAPPDATA%\Programs\`)
+/// is perUser. Defaults to perUser on lookup failure — that matches the
+/// historical install mode shipped before 0.2.1, and is the safe-side
+/// guess because the perUser MSI installs without UAC and works against
+/// any account.
+#[cfg(target_os = "windows")]
+pub fn current_install_flavour() -> WindowsInstallFlavour {
+    let Ok(exe) = std::env::current_exe() else {
+        return WindowsInstallFlavour::PerUser;
+    };
+    classify_install_flavour_from_path(&exe)
+}
+
+/// Pure-fn variant of [`current_install_flavour`] so unit tests can
+/// drive it without a real filesystem. Lowercases for case-insensitive
+/// match against the Windows convention `C:\Program Files\…`.
+#[cfg(target_os = "windows")]
+pub(crate) fn classify_install_flavour_from_path(p: &std::path::Path) -> WindowsInstallFlavour {
+    let lower = p.to_string_lossy().to_lowercase();
+    // Match both `\program files\` and `\program files (x86)\`. Use
+    // path-separator-bracketed substring so a project literally named
+    // "ProgramFiles" elsewhere on disk doesn't trip the check.
+    if lower.contains("\\program files (x86)\\") || lower.contains("\\program files\\") {
+        WindowsInstallFlavour::PerMachine
+    } else {
+        WindowsInstallFlavour::PerUser
+    }
+}
+
 /// Pick the asset that matches this build's platform. Returns an
 /// explicit `None` when there's no match so the caller can log + skip
 /// rather than downloading something wrong.
+///
+/// On Windows the GitHub Release ships two MSI flavours per tag
+/// (perUser + perMachine); pick the one matching the running install
+/// so the in-place upgrade actually lands. See
+/// [`WindowsInstallFlavour`] for the why.
 pub fn pick_asset_for_platform(assets: &[GithubAsset]) -> Option<&GithubAsset> {
-    let arch_win = cfg!(all(target_os = "windows", target_arch = "x86_64"));
+    #[cfg(target_os = "windows")]
+    {
+        return pick_asset_for_windows(assets, current_install_flavour());
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        pick_asset_for_unix(assets)
+    }
+}
+
+/// Pure Windows asset picker. Filters by the `-perMachine-` infix in
+/// the asset filename (cargo-wix names them
+/// `roomler-agent-<v>-perMachine-x86_64-…msi`; the perUser MSI uses
+/// `roomler-agent-<v>-x86_64-…msi` with no infix). Falls back to "any
+/// MSI" only if the matching flavour is missing — better to attempt a
+/// cross-flavour install (which will silently no-op) than to skip the
+/// update entirely on a release that, for whatever reason, only shipped
+/// one flavour.
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn pick_asset_for_windows(
+    assets: &[GithubAsset],
+    flavour: WindowsInstallFlavour,
+) -> Option<&GithubAsset> {
+    let want_per_machine = matches!(flavour, WindowsInstallFlavour::PerMachine);
+    // First pass: prefer the matching flavour.
+    for a in assets {
+        let lower = a.name.to_lowercase();
+        if !lower.ends_with(".msi") {
+            continue;
+        }
+        let is_per_machine = lower.contains("-permachine-");
+        if is_per_machine == want_per_machine {
+            return Some(a);
+        }
+    }
+    // Fallback: any MSI. Logged at warn so the field can see when the
+    // release is missing the matching flavour.
+    for a in assets {
+        if a.name.to_lowercase().ends_with(".msi") {
+            tracing::warn!(
+                asset = %a.name,
+                flavour = ?flavour,
+                "no MSI matching install flavour; falling back to any MSI"
+            );
+            return Some(a);
+        }
+    }
+    None
+}
+
+/// Pure non-Windows asset picker. .deb on Linux, .pkg on macOS. Kept
+/// separate from the Windows path so the flavour-discovery branch
+/// doesn't compile on platforms that don't need it. `allow(dead_code)`
+/// because Windows test builds compile this for symmetry but don't
+/// call it (`pick_asset_for_platform` short-circuits to the Windows
+/// path on Windows).
+#[cfg(any(not(target_os = "windows"), test))]
+#[cfg_attr(target_os = "windows", allow(dead_code))]
+pub(crate) fn pick_asset_for_unix(assets: &[GithubAsset]) -> Option<&GithubAsset> {
     let arch_linux = cfg!(all(target_os = "linux", target_arch = "x86_64"));
     let arch_mac = cfg!(target_os = "macos");
     for a in assets {
         let lower = a.name.to_lowercase();
-        if arch_win && lower.ends_with(".msi") {
-            return Some(a);
-        }
         if arch_linux && (lower.ends_with("_amd64.deb") || lower.ends_with(".deb")) {
             return Some(a);
         }
@@ -1046,5 +1151,140 @@ mod tests {
             digest: None,
         }];
         assert!(pick_asset_for_platform(&assets).is_none());
+    }
+
+    fn mk_msi(name: &str) -> GithubAsset {
+        GithubAsset {
+            name: name.into(),
+            browser_download_url: format!("https://example.invalid/{name}"),
+            size: 2_000_000,
+            digest: None,
+        }
+    }
+
+    /// Field repro: the GitHub release listing returns assets in
+    /// alphabetical order, which puts `…-perMachine-…msi` ahead of
+    /// the plain `…-x86_64-…msi`. A perUser agent calling the OLD
+    /// (pre-0.2.6) picker happily returned the perMachine MSI as the
+    /// "first .msi" and the cross-flavour launch condition silently
+    /// rejected the install. Lock the new behaviour: perUser flavour
+    /// picks the perUser MSI even when perMachine is alphabetically
+    /// first.
+    #[test]
+    fn pick_asset_per_user_skips_per_machine_msi() {
+        let assets = vec![
+            mk_msi("roomler-agent-0.2.5-perMachine-x86_64-pc-windows-msvc-unsigned.msi"),
+            mk_msi("roomler-agent-0.2.5-x86_64-pc-windows-msvc-unsigned.msi"),
+        ];
+        let pick = pick_asset_for_windows(&assets, WindowsInstallFlavour::PerUser)
+            .expect("perUser must find its MSI");
+        assert!(
+            !pick.name.to_lowercase().contains("-permachine-"),
+            "perUser picked {}",
+            pick.name
+        );
+    }
+
+    #[test]
+    fn pick_asset_per_machine_picks_per_machine_msi() {
+        let assets = vec![
+            mk_msi("roomler-agent-0.2.5-x86_64-pc-windows-msvc-unsigned.msi"),
+            mk_msi("roomler-agent-0.2.5-perMachine-x86_64-pc-windows-msvc-unsigned.msi"),
+        ];
+        let pick = pick_asset_for_windows(&assets, WindowsInstallFlavour::PerMachine)
+            .expect("perMachine must find its MSI");
+        assert!(
+            pick.name.to_lowercase().contains("-permachine-"),
+            "perMachine picked {}",
+            pick.name
+        );
+    }
+
+    /// Defensive fallback: if the release ships only one MSI flavour
+    /// (e.g. an old 0.2.0 tag that predates the perMachine MSI), the
+    /// agent should still self-update against the available MSI rather
+    /// than skip the release entirely. The cross-flavour install will
+    /// silently no-op against the launch condition; that's strictly
+    /// better than agents stuck on an old version forever.
+    #[test]
+    fn pick_asset_per_machine_falls_back_when_only_per_user_present() {
+        let assets = vec![mk_msi(
+            "roomler-agent-0.2.0-x86_64-pc-windows-msvc-unsigned.msi",
+        )];
+        let pick = pick_asset_for_windows(&assets, WindowsInstallFlavour::PerMachine)
+            .expect("fallback must produce something");
+        assert!(pick.name.to_lowercase().ends_with(".msi"));
+    }
+
+    #[test]
+    fn pick_asset_per_user_falls_back_when_only_per_machine_present() {
+        let assets = vec![mk_msi(
+            "roomler-agent-0.2.5-perMachine-x86_64-pc-windows-msvc-unsigned.msi",
+        )];
+        let pick = pick_asset_for_windows(&assets, WindowsInstallFlavour::PerUser)
+            .expect("fallback must produce something");
+        assert!(pick.name.to_lowercase().ends_with(".msi"));
+    }
+
+    #[test]
+    fn pick_asset_per_user_returns_none_when_no_msi_at_all() {
+        let assets = vec![GithubAsset {
+            name: "roomler-agent-0.2.5_amd64.deb".into(),
+            browser_download_url: "https://example.invalid/foo.deb".into(),
+            size: 2_000_000,
+            digest: None,
+        }];
+        assert!(pick_asset_for_windows(&assets, WindowsInstallFlavour::PerUser).is_none());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn classify_install_flavour_recognises_program_files() {
+        assert_eq!(
+            classify_install_flavour_from_path(std::path::Path::new(
+                r"C:\Program Files\roomler-agent\roomler-agent.exe"
+            )),
+            WindowsInstallFlavour::PerMachine
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn classify_install_flavour_recognises_program_files_x86() {
+        // 32-bit installer on a 64-bit host lands here. We don't
+        // ship one today but the path matcher must cover it so a
+        // future 32-bit MSI doesn't get mis-classified as perUser.
+        assert_eq!(
+            classify_install_flavour_from_path(std::path::Path::new(
+                r"C:\Program Files (x86)\roomler-agent\roomler-agent.exe"
+            )),
+            WindowsInstallFlavour::PerMachine
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn classify_install_flavour_recognises_localappdata() {
+        // Default cargo-wix perUser destination on Win11.
+        assert_eq!(
+            classify_install_flavour_from_path(std::path::Path::new(
+                r"C:\Users\e069019l\AppData\Local\Programs\roomler-agent\roomler-agent.exe"
+            )),
+            WindowsInstallFlavour::PerUser
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn classify_install_flavour_is_case_insensitive() {
+        // Win32 paths are case-insensitive; a `PROGRAM FILES` spelling
+        // (rare but possible from a misbehaving installer or
+        // GetModuleFileName quirk) must still classify as perMachine.
+        assert_eq!(
+            classify_install_flavour_from_path(std::path::Path::new(
+                r"C:\PROGRAM FILES\roomler-agent\roomler-agent.exe"
+            )),
+            WindowsInstallFlavour::PerMachine
+        );
     }
 }
