@@ -20,8 +20,36 @@ export type RcPhase =
   | 'awaiting_consent'
   | 'negotiating'
   | 'connected'
+  | 'reconnecting'
   | 'closed'
   | 'error'
+
+/**
+ * Backoff ladder for the auto-reconnect path. The first three steps
+ * (250 ms / 500 ms / 1 s) are tuned for desktop-transition recovery —
+ * a Win+L lock or a M3 SYSTEM-context capture handoff usually
+ * resolves in well under a second, and a 2 s first-retry would leave
+ * a visible black-frame window every time the user touches the lock
+ * screen. The last three (2 s / 4 s / 8 s) cover real network drops.
+ * 6 attempts caps the worst case at ~16 s before we give up and
+ * surface an error to the operator.
+ */
+export const RC_RECONNECT_LADDER_MS = [250, 500, 1000, 2000, 4000, 8000] as const
+
+/**
+ * Pure helper: given the number of attempts already made (0-indexed
+ * — i.e. `0` means the first retry hasn't fired yet), return the
+ * delay before the next attempt, or `null` if we've exhausted the
+ * ladder and should give up.
+ *
+ * Exported for unit testing. Called by `scheduleReconnect()` inside
+ * the composable; production code should not need this directly.
+ */
+export function nextReconnectDelayMs(attempt: number): number | null {
+  if (attempt < 0) return null
+  if (attempt >= RC_RECONNECT_LADDER_MS.length) return null
+  return RC_RECONNECT_LADDER_MS[attempt]
+}
 
 /** Controller's quality preference. `auto` lets the agent follow TWCC; `low`
  *  clamps for bandwidth-constrained WAN; `high` asks for the best codec the
@@ -464,6 +492,19 @@ export function useRemoteControl() {
   const phase = ref<RcPhase>('idle')
   const error = ref<string | null>(null)
   const sessionId = ref<string | null>(null)
+  /**
+   * Auto-reconnect state. `lastConnectArgs` remembers the user's
+   * original `connect(agentId, permissions)` call so a reconnect can
+   * re-establish the same session against the same agent without
+   * the operator hitting Connect again. `reconnectAttempt` is exposed
+   * so the viewer can render "Reconnecting (3/6)..." in the toolbar
+   * — silent retries are confusing when an operator is watching the
+   * stream go dark. `reconnectTimer` is private; managed by
+   * scheduleReconnect / cancelReconnect.
+   */
+  let lastConnectArgs: { agentId: string; permissions: string } | null = null
+  const reconnectAttempt = ref(0)
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null
   const remoteStream = ref<MediaStream | null>(null)
   /** Set once we've received at least one video/audio track. False until
    *  the agent attaches media (the native agent currently does not). */
@@ -1162,7 +1203,72 @@ export function useRemoteControl() {
   function failWith(message: string) {
     error.value = message
     phase.value = 'error'
+    cancelReconnect()
+    lastConnectArgs = null
     teardown()
+  }
+
+  /**
+   * Cancel any pending reconnect timer and reset the attempt counter.
+   * Called from `failWith` (terminal error), `disconnect` (user-
+   * initiated teardown), and on every successful 'connected'
+   * transition (so a stable session that later fails starts the
+   * ladder from 250 ms again, not from where it left off).
+   */
+  function cancelReconnect() {
+    if (reconnectTimer !== null) {
+      clearTimeout(reconnectTimer)
+      reconnectTimer = null
+    }
+    reconnectAttempt.value = 0
+  }
+
+  /**
+   * Schedule the next reconnect attempt according to
+   * `RC_RECONNECT_LADDER_MS`. Cancels any prior schedule (no
+   * stacking). After `RC_RECONNECT_LADDER_MS.length` attempts have
+   * elapsed without a 'connected' transition resetting the counter,
+   * gives up and calls `failWith` so the operator sees the failure
+   * instead of a hung "reconnecting" UI.
+   *
+   * The PC is torn down at schedule time (not retry time) so any
+   * lingering ICE / track listeners don't fire on the dead PC while
+   * the timer is pending.
+   */
+  function scheduleReconnect() {
+    // Replace any prior schedule.
+    if (reconnectTimer !== null) {
+      clearTimeout(reconnectTimer)
+      reconnectTimer = null
+    }
+    // Without the original connect args we can't retry.
+    if (!lastConnectArgs) {
+      failWith('peer connection failed')
+      return
+    }
+    const attemptIdx = reconnectAttempt.value
+    const delay = nextReconnectDelayMs(attemptIdx)
+    if (delay === null) {
+      failWith(`peer connection failed — gave up after ${attemptIdx} reconnect attempts`)
+      return
+    }
+    reconnectAttempt.value = attemptIdx + 1
+    phase.value = 'reconnecting'
+    teardown()
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null
+      const args = lastConnectArgs
+      if (!args) return
+      // `connect()` resets phase / sessionId on entry; the early-
+      // return guard for non-{idle,closed,error} states is OK
+      // because we set 'reconnecting' which falls outside those.
+      // We `await` via .catch so a synchronous throw inside connect
+      // chains into another reconnect attempt instead of bubbling
+      // unhandled.
+      void connect(args.agentId, args.permissions, /* isReconnect */ true).catch(() => {
+        scheduleReconnect()
+      })
+    }, delay)
   }
 
   function teardown() {
@@ -1186,9 +1292,29 @@ export function useRemoteControl() {
     mediaIntrinsicH.value = 0
   }
 
-  async function connect(agentId: string, permissions = 'VIEW | INPUT | CLIPBOARD') {
-    if (phase.value !== 'idle' && phase.value !== 'closed' && phase.value !== 'error') {
+  async function connect(
+    agentId: string,
+    permissions = 'VIEW | INPUT | CLIPBOARD',
+    isReconnect = false,
+  ) {
+    // The reconnect path is allowed to drive `connect` while phase ==
+    // 'reconnecting'; user-initiated calls must still be blocked from
+    // re-entering an active session.
+    if (
+      phase.value !== 'idle'
+      && phase.value !== 'closed'
+      && phase.value !== 'error'
+      && !(isReconnect && phase.value === 'reconnecting')
+    ) {
       return // already active
+    }
+    // Capture the original call so a later 'failed' can replay it.
+    // Don't clobber on an isReconnect call — that path already has
+    // the right args from the original user click.
+    if (!isReconnect) {
+      lastConnectArgs = { agentId, permissions }
+      // Fresh user-initiated connect → reset reconnect state.
+      cancelReconnect()
     }
     error.value = null
     sessionId.value = null
@@ -1326,9 +1452,23 @@ export function useRemoteControl() {
       // would throw TypeError.
       const state = pc?.connectionState
       if (!state) return
-      if (state === 'connected') phase.value = 'connected'
-      else if (state === 'failed') failWith('peer connection failed')
-      else if (state === 'closed' && phase.value !== 'error' && phase.value !== 'closed') {
+      if (state === 'connected') {
+        phase.value = 'connected'
+        // A successful connection (whether the initial one or a
+        // mid-ladder retry) resets the attempt counter. Without this
+        // a long-lived session that drops once at hour 5 would jump
+        // straight to attempt 4 and use a 4 s first delay instead of
+        // 250 ms.
+        cancelReconnect()
+      } else if (state === 'failed') {
+        // M3 hand-off / desktop transition / network blip. Replace
+        // the previous immediate-failWith with the auto-reconnect
+        // ladder so the operator doesn't have to F5 + reconnect
+        // every time the host briefly goes dark. Only 'failed'
+        // triggers retry; 'disconnected' is transient (ICE
+        // checking) and recovers on its own.
+        scheduleReconnect()
+      } else if (state === 'closed' && phase.value !== 'error' && phase.value !== 'closed' && phase.value !== 'reconnecting') {
         // Clean up the data channels + stream too; otherwise they leak
         // when the PC closes without a prior disconnect() (e.g. the
         // server-side session terminates first).
@@ -1485,6 +1625,12 @@ export function useRemoteControl() {
   }
 
   function disconnect() {
+    // Operator-initiated teardown must override any pending
+    // reconnect timer; otherwise a reconnect could fire after the
+    // user already dismissed the viewer, racing the WS rc:terminate
+    // we just sent.
+    cancelReconnect()
+    lastConnectArgs = null
     if (sessionId.value && pc) {
       ws.sendRaw({
         t: 'rc:terminate',
@@ -1834,6 +1980,14 @@ export function useRemoteControl() {
     cursor,
     connect,
     disconnect,
+    /**
+     * Current auto-reconnect attempt counter. 0 = not reconnecting;
+     * 1..N = pending the Nth attempt's timer (or the Nth retry's
+     * connect() call is in flight). The viewer can render
+     * "Reconnecting (N/{RC_RECONNECT_LADDER_MS.length})..." while
+     * `phase === 'reconnecting'`.
+     */
+    reconnectAttempt,
     attachInput,
     sendClipboardToAgent,
     getAgentClipboard,

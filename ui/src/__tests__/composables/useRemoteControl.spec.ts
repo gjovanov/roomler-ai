@@ -22,6 +22,8 @@ import {
   shortCodecFromReceiver,
   codecFromSdp,
   decideKeyAction,
+  RC_RECONNECT_LADDER_MS,
+  nextReconnectDelayMs,
   type KeyDecision,
 } from '@/composables/useRemoteControl'
 import { codecMimeForShort } from '@/workers/rc-webcodecs-worker'
@@ -1081,5 +1083,60 @@ describe('rc-vp9-444-worker frame header', () => {
     const header = buildHeader(8_000_000, 0x01, 0n)
     const parsed = parseFrameHeader(header)
     expect(parsed!.payloadSize).toBe(8_000_000)
+  })
+})
+
+describe('RC_RECONNECT_LADDER_MS', () => {
+  it('starts at 250 ms so a desktop transition is barely visible', () => {
+    // The first retry must fire fast: a Win+L lock or M3 SYSTEM-
+    // context capture handoff resolves in under a second, and a
+    // 2 s first delay would leave a visible black-frame window
+    // every time. Locking the first entry against accidental
+    // "make it slower to be polite to the server" tweaks.
+    expect(RC_RECONNECT_LADDER_MS[0]).toBe(250)
+  })
+
+  it('ends at 8 s for a real network drop', () => {
+    expect(RC_RECONNECT_LADDER_MS[RC_RECONNECT_LADDER_MS.length - 1]).toBe(8000)
+  })
+
+  it('caps at 6 attempts so the operator sees a real failure within ~16 s', () => {
+    expect(RC_RECONNECT_LADDER_MS.length).toBe(6)
+    // Sum the ladder. Worst case (every attempt fails on its
+    // delay tick) operator sees error after this many ms.
+    const sum = RC_RECONNECT_LADDER_MS.reduce((a, b) => a + b, 0)
+    expect(sum).toBeLessThanOrEqual(20_000)
+  })
+
+  it('is monotonically non-decreasing', () => {
+    for (let i = 1; i < RC_RECONNECT_LADDER_MS.length; i++) {
+      expect(RC_RECONNECT_LADDER_MS[i]).toBeGreaterThanOrEqual(
+        RC_RECONNECT_LADDER_MS[i - 1],
+      )
+    }
+  })
+})
+
+describe('nextReconnectDelayMs', () => {
+  it('returns the ladder value for valid attempt indices', () => {
+    expect(nextReconnectDelayMs(0)).toBe(250)
+    expect(nextReconnectDelayMs(1)).toBe(500)
+    expect(nextReconnectDelayMs(2)).toBe(1000)
+    expect(nextReconnectDelayMs(3)).toBe(2000)
+    expect(nextReconnectDelayMs(4)).toBe(4000)
+    expect(nextReconnectDelayMs(5)).toBe(8000)
+  })
+
+  it('returns null past the cap so callers know to give up', () => {
+    // The 7th attempt and beyond have no entry. Caller's
+    // contract: null = stop retrying, surface error to operator.
+    expect(nextReconnectDelayMs(6)).toBeNull()
+    expect(nextReconnectDelayMs(100)).toBeNull()
+  })
+
+  it('returns null on negative input', () => {
+    // Defensive: a logic bug that decremented the counter past 0
+    // shouldn't accidentally re-enter the ladder.
+    expect(nextReconnectDelayMs(-1)).toBeNull()
   })
 })
