@@ -134,31 +134,17 @@
                 </Directory>
             </Directory>
 
-            <!-- Start Menu shortcut, perMachine (writes under
-                 ProgramData\Microsoft\Windows\Start Menu so all users
-                 see it). Uses HKLM for the KeyPath because ProgramMenuFolder
-                 contents otherwise have nothing else durable. -->
-            <Directory Id='ProgramMenuFolder'>
-                <Directory Id='ProgramMenuSubfolder' Name='Roomler'>
-                    <Component Id='ApplicationShortcut' Guid='91728E56-AD60-7250-B180-C05F60829D37' Win64='yes'>
-                        <Shortcut
-                            Id='AgentShortcut'
-                            Name='Roomler Agent'
-                            Description='Roomler AI remote-control agent (per-Machine)'
-                            Target='[APPLICATIONFOLDER]roomler-agent.exe'
-                            Arguments='run'
-                            WorkingDirectory='APPLICATIONFOLDER' />
-                        <RemoveFolder Id='CleanupProgramMenuSubfolder' On='uninstall' />
-                        <RegistryValue
-                            Root='HKLM'
-                            Key='Software\Roomler\Agent\PerMachine'
-                            Name='installed_shortcut'
-                            Type='integer'
-                            Value='1'
-                            KeyPath='yes' />
-                    </Component>
-                </Directory>
-            </Directory>
+            <!--
+              No Start Menu shortcut on the perMachine flavour. The
+              ProgramMenuFolder + ApplicationShortcut combo trips
+              ICE38 / ICE43 / ICE57 (per-user vs per-machine
+              ambiguity around the Start Menu folder semantics)
+              even with a HKLM KeyPath. Per-Machine deployments are
+              fleet / IT installs where operators reach the agent
+              via Get-Service or sc.exe rather than by clicking a
+              shortcut, so dropping it is a non-loss. The per-User
+              MSI continues to ship a shortcut.
+            -->
         </Directory>
 
         <Feature
@@ -174,7 +160,6 @@
             <ComponentRef Id='AgentExe' />
             <ComponentRef Id='LicenseTxt' />
             <ComponentRef Id='ReadmeTxt' />
-            <ComponentRef Id='ApplicationShortcut' />
         </Feature>
 
         <Property Id='ARPHELPLINK' Value='https://roomler.ai/' />
