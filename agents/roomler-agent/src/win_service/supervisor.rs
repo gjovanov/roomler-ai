@@ -348,16 +348,37 @@ pub enum SpawnDecision {
     SpawnIn(u32),
     /// Worker is already running in the right session — leave it.
     KeepCurrent,
-    /// No active session; idle. (M3 will replace this with a
-    /// SystemContextCapture variant.)
+    /// No active console session AND no need to keep the stream
+    /// alive (no peer connection on this host). Tear down the
+    /// worker fully and idle until LOGON.
     Idle,
+    /// No active console session BUT we want to keep the stream
+    /// alive — e.g. the user signed out / locked the host while a
+    /// browser controller is mid-session. M3's SYSTEM-context
+    /// capture+input thread takes over here, painting either a
+    /// real frame from `winsta0\Winlogon` (path A1, requires WGC
+    /// session-0 capture to work) or a static "host is locked"
+    /// overlay (path Z, always works). The browser's WebRTC peer
+    /// stays connected throughout — only the encoder source
+    /// changes underneath.
+    SystemContextCapture,
 }
 
+/// Decide what the supervisor should do given the current world
+/// state. The third parameter — `keep_stream_alive` — encodes
+/// whether the SCM service has any reason to keep painting frames
+/// while no console session is active. Today this is always
+/// `false` (M3 not yet wired); once `system_worker.rs` lands,
+/// the supervisor will set it to `true` whenever a peer connection
+/// is observed alive on the running worker, then `false` again
+/// once the worker exits / disconnects. Pure: easy to unit-test.
 pub fn decide_spawn(
     active_session: Option<u32>,
     current_worker_session: Option<u32>,
+    keep_stream_alive: bool,
 ) -> SpawnDecision {
     match (active_session, current_worker_session) {
+        (None, _) if keep_stream_alive => SpawnDecision::SystemContextCapture,
         (None, _) => SpawnDecision::Idle,
         (Some(active), Some(current)) if active == current => SpawnDecision::KeepCurrent,
         (Some(active), _) => SpawnDecision::SpawnIn(active),
@@ -509,9 +530,15 @@ pub fn run(
             }
         }
 
-        // Decide whether to spawn.
+        // Decide whether to spawn. M3 (system_worker) is not yet
+        // wired in — until then we always pass `keep_stream_alive=
+        // false` so logout returns `Idle` and tears the worker down,
+        // matching pre-M3 behaviour. Once `system_worker.rs` lands,
+        // this argument becomes `worker_has_active_peer.load()` from
+        // a shared atomic the worker writes when its peer connection
+        // is in `connected` state.
         let active = active_console_session_id();
-        let decision = decide_spawn(active, current_session);
+        let decision = decide_spawn(active, current_session, false);
         let due_for_respawn = respawn_at.is_none_or(|t| Instant::now() >= t);
 
         match (decision, due_for_respawn) {
@@ -620,36 +647,74 @@ mod tests {
     use super::*;
 
     #[test]
-    fn decide_spawn_idles_when_no_active_session() {
-        assert_eq!(decide_spawn(None, None), SpawnDecision::Idle);
-        assert_eq!(decide_spawn(None, Some(2)), SpawnDecision::Idle);
+    fn decide_spawn_idles_when_no_active_session_and_no_stream() {
+        assert_eq!(decide_spawn(None, None, false), SpawnDecision::Idle);
+        assert_eq!(decide_spawn(None, Some(2), false), SpawnDecision::Idle);
     }
 
     #[test]
     fn decide_spawn_keeps_worker_when_session_unchanged() {
-        assert_eq!(decide_spawn(Some(2), Some(2)), SpawnDecision::KeepCurrent);
+        // keep_stream_alive doesn't matter here — the active session
+        // exists and matches. Lock both branches.
+        assert_eq!(
+            decide_spawn(Some(2), Some(2), false),
+            SpawnDecision::KeepCurrent
+        );
+        assert_eq!(
+            decide_spawn(Some(2), Some(2), true),
+            SpawnDecision::KeepCurrent
+        );
     }
 
     #[test]
     fn decide_spawn_targets_active_session_when_no_worker() {
-        assert_eq!(decide_spawn(Some(2), None), SpawnDecision::SpawnIn(2));
+        assert_eq!(
+            decide_spawn(Some(2), None, false),
+            SpawnDecision::SpawnIn(2)
+        );
     }
 
     #[test]
     fn decide_spawn_targets_new_session_when_active_changed() {
         // Worker is for session 2 but the active console moved to 5
         // (the previous user logged out, a new one logged in).
-        assert_eq!(decide_spawn(Some(5), Some(2)), SpawnDecision::SpawnIn(5));
+        assert_eq!(
+            decide_spawn(Some(5), Some(2), false),
+            SpawnDecision::SpawnIn(5)
+        );
     }
 
     #[test]
-    fn decide_spawn_idles_when_session_disappears_with_worker_alive() {
+    fn decide_spawn_idles_when_session_disappears_without_active_peer() {
         // Field bug PC50045 2026-05-01: user logs out; active session
         // becomes None; the worker is still alive but in a dead
-        // session and floods Access Denied. decide_spawn must report
+        // session and floods Access Denied. With no active peer
+        // connection (keep_stream_alive=false), decide_spawn returns
         // Idle so the supervisor's "idle && current_worker.is_some()"
         // arm tears the worker down.
-        assert_eq!(decide_spawn(None, Some(2)), SpawnDecision::Idle);
+        assert_eq!(decide_spawn(None, Some(2), false), SpawnDecision::Idle);
+    }
+
+    #[test]
+    fn decide_spawn_returns_system_context_when_session_disappears_with_active_peer() {
+        // M3: user logs out / locks while a browser controller is
+        // mid-session. Previous behaviour was `Idle`, which tore the
+        // peer connection down. New behaviour: hand off to the
+        // SYSTEM-context capture+input thread so the stream stays
+        // alive (real Winlogon frames if WGC permits, static "host
+        // is locked" overlay otherwise). Both desktop transitions
+        // hit this arm — Win+L lock screen does NOT change
+        // WTSGetActiveConsoleSessionId so it stays as KeepCurrent;
+        // *full* sign-out makes the active session disappear and we
+        // land here.
+        assert_eq!(
+            decide_spawn(None, Some(2), true),
+            SpawnDecision::SystemContextCapture
+        );
+        assert_eq!(
+            decide_spawn(None, None, true),
+            SpawnDecision::SystemContextCapture
+        );
     }
 
     #[test]
