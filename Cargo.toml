@@ -30,7 +30,7 @@ rtp = { path = "crates/vendored/rtp" }
 [workspace.package]
 version = "0.2.5"
 edition = "2024"
-authors = ["Goran Jovanov <gjovanov@gmail.com>"]
+authors = ["Goran Jovanov <goran.jovanov@gmail.com>"]
 license = "MIT"
 
 [workspace.dependencies]
