@@ -64,6 +64,34 @@
             Schedule='afterInstallInitialize'
             DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.' />
 
+        <!--
+          Detect the per-Machine flavour (different UpgradeCode) so we
+          can block dual-install. Two roomler-agent.exe binaries on one
+          host - one under %LOCALAPPDATA%\Programs, one under %ProgramFiles%
+          - is the worst kind of field bug: both work in isolation but
+          clobber each other on update (two updaters polling, two
+          autostart hooks racing for the instance lock). Refuse the
+          install with a clear message so the operator picks one path.
+          Mirror this Upgrade element with the symmetric one in
+          main-perMachine.wxs so EITHER MSI refuses to install over
+          the OTHER.
+          (XML rule: no consecutive dashes inside comments, hence the
+          dual-dash workaround above.)
+        -->
+        <Upgrade Id='2A8E9C2D-3F1A-5E3F-C2B4-7C2F3D8F5E02'>
+            <UpgradeVersion
+                Property='ROOMLER_AGENT_PERMACHINE_DETECTED'
+                Minimum='0.0.0'
+                IncludeMinimum='yes'
+                Maximum='99.99.99'
+                IncludeMaximum='yes'
+                OnlyDetect='yes' />
+        </Upgrade>
+
+        <Condition Message='Roomler Agent is already installed in per-Machine mode (under Program Files). Uninstall that version before installing the per-User version.'>
+            <![CDATA[NOT ROOMLER_AGENT_PERMACHINE_DETECTED OR Installed]]>
+        </Condition>
+
         <Media Id='1' Cabinet='media1.cab' EmbedCab='yes' />
         <Property Id='DiskPrompt' Value='Roomler Agent Installation' />
 

@@ -331,23 +331,56 @@ jobs:
           # so regressions in the MF drain path are visible in CI output.
           & "target\release\roomler-agent.exe" encoder-smoke --encoder hardware
 
-      - name: Build MSI
+      - name: Build MSI (per-User)
         shell: pwsh
         run: |
           # cargo-wix reads agents/roomler-agent/wix/main.wxs and sets the
           # Version preprocessor variable from --install-version.
           cargo wix -p roomler-agent --nocapture --no-build --install-version $env:VERSION
 
-      - name: Locate + rename MSI
+      - name: Locate + rename per-User MSI
         id: locate
         shell: pwsh
         run: |
           $msi = Get-ChildItem "target/wix/*.msi" | Select-Object -First 1
-          if (-not $msi) { throw "MSI not produced" }
+          if (-not $msi) { throw "per-User MSI not produced" }
           $suffix = "-unsigned"
           $signed = $env:WIN_CODESIGN_PFX_BASE64
           if ($signed -and $signed.Length -gt 0) { $suffix = "" }
           $dst = "roomler-agent-$env:VERSION-x86_64-pc-windows-msvc$suffix.msi"
+          Move-Item $msi.FullName $dst
+          "artifact=$dst" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+        env:
+          WIN_CODESIGN_PFX_BASE64: ${{ secrets.WIN_CODESIGN_PFX_BASE64 }}
+
+      - name: Build MSI (per-Machine)
+        shell: pwsh
+        run: |
+          # cargo-wix only knows how to find `wix/main.wxs`; swap the
+          # per-Machine WXS into that path for the second build, then
+          # restore the original. Both MSIs end up in target/wix/ and
+          # we rename to disambiguate. Different UpgradeCode + the
+          # mutually-exclusive LaunchConditions ensure a host can only
+          # ever have one of the two installed at a time.
+          $wixDir = "agents\roomler-agent\wix"
+          Copy-Item "$wixDir\main.wxs" "$wixDir\main.wxs.bak" -Force
+          Copy-Item "$wixDir\main-perMachine.wxs" "$wixDir\main.wxs" -Force
+          try {
+            cargo wix -p roomler-agent --nocapture --no-build --install-version $env:VERSION
+          } finally {
+            Move-Item "$wixDir\main.wxs.bak" "$wixDir\main.wxs" -Force
+          }
+
+      - name: Locate + rename per-Machine MSI
+        id: locate_pm
+        shell: pwsh
+        run: |
+          $msi = Get-ChildItem "target/wix/*.msi" | Select-Object -First 1
+          if (-not $msi) { throw "per-Machine MSI not produced" }
+          $suffix = "-unsigned"
+          $signed = $env:WIN_CODESIGN_PFX_BASE64
+          if ($signed -and $signed.Length -gt 0) { $suffix = "" }
+          $dst = "roomler-agent-$env:VERSION-perMachine-x86_64-pc-windows-msvc$suffix.msi"
           Move-Item $msi.FullName $dst
           "artifact=$dst" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
         env:
@@ -371,7 +404,8 @@ jobs:
               /fd SHA256 `
               /tr http://timestamp.digicert.com `
               /td SHA256 `
-              "${{ steps.locate.outputs.artifact }}"
+              "${{ steps.locate.outputs.artifact }}" `
+              "${{ steps.locate_pm.outputs.artifact }}"
 
           Remove-Item $pfxPath -Force
 
@@ -382,20 +416,23 @@ jobs:
         env:
           WIN_CODESIGN_PFX_BASE64: ${{ secrets.WIN_CODESIGN_PFX_BASE64 }}
 
-      - name: SHA256 checksum
+      - name: SHA256 checksum (both MSIs)
         shell: pwsh
         run: |
-          $f = "${{ steps.locate.outputs.artifact }}"
-          $hash = (Get-FileHash -Algorithm SHA256 $f).Hash.ToLower()
-          "$hash  $f" | Out-File -Encoding ascii "$f.sha256"
+          foreach ($f in @("${{ steps.locate.outputs.artifact }}", "${{ steps.locate_pm.outputs.artifact }}")) {
+            $hash = (Get-FileHash -Algorithm SHA256 $f).Hash.ToLower()
+            "$hash  $f" | Out-File -Encoding ascii "$f.sha256"
+          }
 
-      - name: Upload artifact
+      - name: Upload artifacts (per-User + per-Machine)
         uses: actions/upload-artifact@v4
         with:
           name: windows-msi
           path: |
             ${{ steps.locate.outputs.artifact }}
             ${{ steps.locate.outputs.artifact }}.sha256
+            ${{ steps.locate_pm.outputs.artifact }}
+            ${{ steps.locate_pm.outputs.artifact }}.sha256
           retention-days: 30
 
   # ---------------------------------------------------------------------------

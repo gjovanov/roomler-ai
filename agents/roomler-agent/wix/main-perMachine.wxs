@@ -1,0 +1,221 @@
+<?xml version="1.0" encoding="windows-1252"?>
+<!--
+  WiX v3 source for the PER-MACHINE roomler-agent MSI (M3 phase 4).
+
+  Build with `cargo wix -p roomler-agent --include wix\main-perMachine.wxs`
+  (or whichever invocation the release-agent.yml workflow ends up
+  picking up; both per-user and per-machine MSIs ship from the same
+  agent-v* tag).
+
+  Differences vs the per-user main.wxs:
+
+    1. InstallScope='perMachine'. Files land under %ProgramFiles%
+       \roomler-agent. UAC prompt fires on install + uninstall.
+       Operators on a managed fleet typically install perMachine
+       silently via group policy / Intune so the prompt is invisible
+       to end users.
+
+    2. Different UpgradeCode GUID. The per-user and per-machine MSIs
+       see each other as completely separate products. To prevent
+       the worst kind of field bug (two binaries, two updaters, two
+       autostart hooks fighting for the instance lock), each MSI
+       checks for the OTHER's UpgradeCode at install time and
+       refuses with a clear LaunchCondition message. The operator
+       has to uninstall one before installing the other.
+
+    3. Auto-registers the SCM service via a deferred + non-impersonated
+       custom action (runs as SYSTEM, which has CreateService rights).
+       The per-user MSI cannot do this because perUser installs run in
+       the user's filtered token and CreateService fails with Access
+       Denied; perMachine installs run elevated by definition.
+
+    4. No HKCU registry KeyPaths; perMachine components key off the
+       file itself (allowed because ProgramFiles is a system folder,
+       not a user-profile folder). Drops one ICE38 / ICE64 source of
+       gotchas that bit perUser.
+
+    5. No Scheduled Task auto-registration. The per-machine flavour
+       is service-only; operators who want both autostart paths can
+       run `roomler-agent service install` (no `--as-service`)
+       manually after the MSI install. v1 keeps the default clean:
+       one product, one autostart hook.
+
+  Effort 2 + M3 phase 4 closes the field gap that drove the M5/M3
+  cycle: with the per-machine MSI, IT can deploy roomler-agent across
+  a fleet via standard MSI tooling and get both perMachine file
+  layout AND SCM service auto-registration in one msiexec invocation.
+  No more "install MSI, then run elevated PS service install
+  --as-service" two-step.
+-->
+<Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'>
+    <Product
+        Id='*'
+        Name='Roomler Agent (per-Machine)'
+        UpgradeCode='2A8E9C2D-3F1A-5E3F-C2B4-7C2F3D8F5E02'
+        Manufacturer='Goran Jovanov'
+        Language='1033'
+        Codepage='1252'
+        Version='$(var.Version)'>
+
+        <Package
+            Id='*'
+            Keywords='Installer'
+            Description='Roomler AI remote-control agent (per-Machine)'
+            Manufacturer='Goran Jovanov'
+            InstallerVersion='450'
+            Languages='1033'
+            Compressed='yes'
+            InstallScope='perMachine'
+            Platform='x64'
+            SummaryCodepage='1252' />
+
+        <MajorUpgrade
+            Schedule='afterInstallInitialize'
+            DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.' />
+
+        <!--
+          Detect the per-User flavour (different UpgradeCode) so we
+          refuse to install on a host that already has it. Symmetric
+          with the per-User MSI's check for OUR UpgradeCode. See the
+          comment in main.wxs for rationale.
+          (XML rule: no consecutive dashes inside comments.)
+        -->
+        <Upgrade Id='1F2D7B1C-8B2F-4D2E-B1A3-6B1E2C7E4D91'>
+            <UpgradeVersion
+                Property='ROOMLER_AGENT_PERUSER_DETECTED'
+                Minimum='0.0.0'
+                IncludeMinimum='yes'
+                Maximum='99.99.99'
+                IncludeMaximum='yes'
+                OnlyDetect='yes' />
+        </Upgrade>
+
+        <Condition Message='Roomler Agent is already installed in per-User mode (under %LOCALAPPDATA%). Uninstall that version before installing the per-Machine version.'>
+            <![CDATA[NOT ROOMLER_AGENT_PERUSER_DETECTED OR Installed]]>
+        </Condition>
+
+        <Media Id='1' Cabinet='media1.cab' EmbedCab='yes' />
+        <Property Id='DiskPrompt' Value='Roomler Agent Installation' />
+
+        <Directory Id='TARGETDIR' Name='SourceDir'>
+            <!-- Per-Machine install under %ProgramFiles%\roomler-agent.
+                 Components can use the file itself as KeyPath; no HKCU
+                 dance needed because ProgramFiles is system-scoped. -->
+            <Directory Id='ProgramFiles64Folder'>
+                <Directory Id='APPLICATIONFOLDER' Name='roomler-agent'>
+                    <Component Id='AgentExe' Guid='6E4F5B23-7A3D-4F2C-8E5D-9F2C3E5F7A04' Win64='yes'>
+                        <File
+                            Id='roomler_agent_exe'
+                            Name='roomler-agent.exe'
+                            DiskId='1'
+                            KeyPath='yes'
+                            Source='target\release\roomler-agent.exe' />
+                    </Component>
+                    <Component Id='LicenseTxt' Guid='7F506C34-8B4E-503D-9F6E-AF3D4F607B15' Win64='yes'>
+                        <File
+                            Id='license_txt'
+                            Name='LICENSE.txt'
+                            DiskId='1'
+                            KeyPath='yes'
+                            Source='LICENSE' />
+                    </Component>
+                    <Component Id='ReadmeTxt' Guid='80617D45-9C5F-614E-A07F-BF4E5F718C26' Win64='yes'>
+                        <File
+                            Id='readme_txt'
+                            Name='README.txt'
+                            DiskId='1'
+                            KeyPath='yes'
+                            Source='agents\roomler-agent\packaging\windows\README.txt' />
+                    </Component>
+                </Directory>
+            </Directory>
+
+            <!-- Start Menu shortcut, perMachine (writes under
+                 ProgramData\Microsoft\Windows\Start Menu so all users
+                 see it). Uses HKLM for the KeyPath because ProgramMenuFolder
+                 contents otherwise have nothing else durable. -->
+            <Directory Id='ProgramMenuFolder'>
+                <Directory Id='ProgramMenuSubfolder' Name='Roomler'>
+                    <Component Id='ApplicationShortcut' Guid='91728E56-AD60-7250-B180-C05F60829D37' Win64='yes'>
+                        <Shortcut
+                            Id='AgentShortcut'
+                            Name='Roomler Agent'
+                            Description='Roomler AI remote-control agent (per-Machine)'
+                            Target='[APPLICATIONFOLDER]roomler-agent.exe'
+                            Arguments='run'
+                            WorkingDirectory='APPLICATIONFOLDER' />
+                        <RemoveFolder Id='CleanupProgramMenuSubfolder' On='uninstall' />
+                        <RegistryValue
+                            Root='HKLM'
+                            Key='Software\Roomler\Agent\PerMachine'
+                            Name='installed_shortcut'
+                            Type='integer'
+                            Value='1'
+                            KeyPath='yes' />
+                    </Component>
+                </Directory>
+            </Directory>
+        </Directory>
+
+        <Feature
+            Id='Complete'
+            Title='Roomler Agent (per-Machine)'
+            Description='The Roomler AI remote-control agent, installed for all users with SCM service auto-registration.'
+            Display='expand'
+            Level='1'
+            ConfigurableDirectory='APPLICATIONFOLDER'
+            AllowAdvertise='no'
+            InstallDefault='local'
+            Absent='disallow'>
+            <ComponentRef Id='AgentExe' />
+            <ComponentRef Id='LicenseTxt' />
+            <ComponentRef Id='ReadmeTxt' />
+            <ComponentRef Id='ApplicationShortcut' />
+        </Feature>
+
+        <Property Id='ARPHELPLINK' Value='https://roomler.ai/' />
+        <Property Id='ARPURLINFOABOUT' Value='https://roomler.ai/' />
+
+        <!--
+          Postinstall hook: register the SCM service immediately
+          after the EXE lands on disk. Runs deferred + non-
+          impersonated (i.e. as LocalSystem since this is perMachine)
+          so it has the rights to call CreateService. Return="ignore"
+          so a registration failure (rare service-name collision,
+          weird group policy) doesn't sink the whole install -
+          operator can recover by running `roomler-agent service
+          install --as-service` from elevated PS.
+        -->
+        <CustomAction
+            Id='RegisterService'
+            FileKey='roomler_agent_exe'
+            ExeCommand='service install --as-service'
+            Execute='deferred'
+            Impersonate='no'
+            Return='ignore' />
+
+        <!--
+          Symmetric uninstall hook: tear down the SCM service before
+          the EXE is removed from disk (the action shells out to the
+          EXE itself, so it must still be present). Only fires during
+          full uninstall (REMOVE="ALL"); maintenance / repair leaves
+          the service registration alone.
+        -->
+        <CustomAction
+            Id='UnregisterService'
+            FileKey='roomler_agent_exe'
+            ExeCommand='service uninstall --as-service'
+            Execute='deferred'
+            Impersonate='no'
+            Return='ignore' />
+
+        <InstallExecuteSequence>
+            <Custom Action='RegisterService' After='InstallFiles'>
+                NOT (REMOVE="ALL")
+            </Custom>
+            <Custom Action='UnregisterService' Before='RemoveFiles'>
+                REMOVE="ALL"
+            </Custom>
+        </InstallExecuteSequence>
+    </Product>
+</Wix>
