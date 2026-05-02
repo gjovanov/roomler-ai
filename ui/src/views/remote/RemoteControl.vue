@@ -8,12 +8,16 @@
         :to="{ name: 'admin', params: { tenantId } }"
         aria-label="Back to Agents"
       />
-      <v-toolbar-title class="d-flex align-center">
-        <v-icon :color="statusColor" size="small" class="mr-2">
+      <v-toolbar-title class="d-flex align-center text-truncate">
+        <v-icon :color="statusColor" size="small" class="mr-2 flex-shrink-0">
           mdi-circle
         </v-icon>
-        {{ agent?.name || 'Agent' }}
-        <span v-if="agent" class="text-caption text-medium-emphasis ml-2">
+        <span class="text-truncate">{{ agent?.name || 'Agent' }}</span>
+        <!-- OS + version subtitle hidden on phone-sized viewports;
+             they're useful context on a desktop but on mobile they
+             push Connect/Disconnect off the right edge. The toolbar's
+             status chip carries enough info for an at-a-glance check. -->
+        <span v-if="agent" class="text-caption text-medium-emphasis ml-2 d-none d-sm-inline">
           {{ agent.os }} · {{ agent.agent_version || '—' }}
         </span>
       </v-toolbar-title>
@@ -30,87 +34,91 @@
         </template>
         <template v-else>{{ rc.phase.value }}</template>
       </v-chip>
-      <!-- Quality preference: persisted to localStorage; sent to the
-           agent over the control data channel on change and on channel
-           open. Low / Auto / High map to bitrate clamp and codec
-           preference (agent side interprets; H.265/AV1 negotiation
-           lands in Phase 2). -->
-      <v-select
-        v-model="quality"
-        :items="qualityOptions"
-        density="compact"
-        hide-details
-        variant="outlined"
-        style="max-width: 140px;"
-        class="mr-2"
-        prepend-inner-icon="mdi-quality-high"
-        aria-label="Quality preference"
-      />
-      <!-- Scale mode: how the remote video is rendered in the local
-           viewer. "Adaptive" is the prior default (object-fit: contain);
-           "Original" is 1:1 intrinsic pixels with scroll when larger
-           than the viewport; "Custom" lets the user dial 5-1000%. -->
-      <v-select
-        v-model="scaleMode"
-        :items="scaleOptions"
-        density="compact"
-        hide-details
-        variant="outlined"
-        style="max-width: 160px;"
-        class="mr-2"
-        prepend-inner-icon="mdi-image-size-select-actual"
-        aria-label="View scale"
-      />
-      <!-- Only visible in Custom mode — dials the CSS zoom level. -->
-      <v-text-field
-        v-if="scaleMode === 'custom'"
-        v-model.number="scalePercent"
-        type="number"
-        min="5"
-        max="1000"
-        step="5"
-        density="compact"
-        hide-details
-        variant="outlined"
-        style="max-width: 110px;"
-        class="mr-2"
-        suffix="%"
-        aria-label="Custom scale percent"
-      />
-      <!-- Remote resolution selector: what the AGENT captures + encodes.
-           `original` = native monitor; `fit` = match our viewport CSS
-           px × dpr (auto-updates on stage resize); `custom…` opens a
-           dialog. Changing this sends an rc:resolution control-DC
-           message; agent rebuilds its encoder on the next frame. -->
-      <v-select
-        v-model="resolutionPresetValue"
-        :items="resolutionOptions"
-        density="compact"
-        hide-details
-        variant="outlined"
-        style="max-width: 190px;"
-        class="mr-2"
-        prepend-inner-icon="mdi-monitor-screenshot"
-        aria-label="Remote capture resolution"
-        :title="resolutionButtonTitle"
-      />
-      <!-- Codec override: null = let the agent pick from the full
-           browser∩agent intersection (recommended). Forcing a specific
-           codec is for A/B comparison — "is H.265 really better than
-           H.264 on this link?". Takes effect on the next Connect. -->
-      <v-select
-        v-model="codecOverride"
-        :items="codecOptions"
-        density="compact"
-        hide-details
-        variant="outlined"
-        style="max-width: 140px;"
-        class="mr-2"
-        prepend-inner-icon="mdi-video-outline"
-        aria-label="Codec override"
-        :title="codecOverride == null
-          ? 'Agent picks the best available codec'
-          : `Forcing ${codecOverride.toUpperCase()} — takes effect on next Connect`"
+      <!-- Advanced selects: Quality, Scale (+ optional Custom %),
+           Resolution override, Codec override. Together they consume
+           ~630px of toolbar real estate which doesn't fit on a phone
+           viewport (~320-414px). On `smAndDown` we collapse them
+           into a settings bottom-sheet (mdi-tune-variant button
+           below). On `md` and above the inline row stays — operators
+           on a desktop expect them at hand without a click. -->
+      <div class="d-none d-md-flex align-center">
+        <v-select
+          v-model="quality"
+          :items="qualityOptions"
+          density="compact"
+          hide-details
+          variant="outlined"
+          style="max-width: 140px;"
+          class="mr-2"
+          prepend-inner-icon="mdi-quality-high"
+          aria-label="Quality preference"
+        />
+        <v-select
+          v-model="scaleMode"
+          :items="scaleOptions"
+          density="compact"
+          hide-details
+          variant="outlined"
+          style="max-width: 160px;"
+          class="mr-2"
+          prepend-inner-icon="mdi-image-size-select-actual"
+          aria-label="View scale"
+        />
+        <v-text-field
+          v-if="scaleMode === 'custom'"
+          v-model.number="scalePercent"
+          type="number"
+          min="5"
+          max="1000"
+          step="5"
+          density="compact"
+          hide-details
+          variant="outlined"
+          style="max-width: 110px;"
+          class="mr-2"
+          suffix="%"
+          aria-label="Custom scale percent"
+        />
+        <v-select
+          v-model="resolutionPresetValue"
+          :items="resolutionOptions"
+          density="compact"
+          hide-details
+          variant="outlined"
+          style="max-width: 190px;"
+          class="mr-2"
+          prepend-inner-icon="mdi-monitor-screenshot"
+          aria-label="Remote capture resolution"
+          :title="resolutionButtonTitle"
+        />
+        <v-select
+          v-model="codecOverride"
+          :items="codecOptions"
+          density="compact"
+          hide-details
+          variant="outlined"
+          style="max-width: 140px;"
+          class="mr-2"
+          prepend-inner-icon="mdi-video-outline"
+          aria-label="Codec override"
+          :title="codecOverride == null
+            ? 'Agent picks the best available codec'
+            : `Forcing ${codecOverride.toUpperCase()} — takes effect on next Connect`"
+        />
+      </div>
+      <!-- Mobile-only settings trigger. Opens a bottom-sheet with the
+           same controls so a phone operator can still tweak quality,
+           scale, resolution, codec without losing the rest of the
+           toolbar. Hidden on `md` and above where the inline row
+           already shows them. -->
+      <v-btn
+        icon="mdi-tune-variant"
+        variant="text"
+        size="small"
+        class="d-md-none mr-1"
+        aria-label="Open viewer settings"
+        title="Viewer settings"
+        @click="mobileSettingsOpen = true"
       />
       <!-- Clipboard sync buttons. Visible only during a live session
            because the DC is only open then. Both sides require a user
@@ -456,6 +464,73 @@
         </v-card-actions>
       </v-card>
     </v-dialog>
+
+    <!-- Mobile settings bottom-sheet (hidden on md and above where the
+         inline toolbar row already shows the same controls). -->
+    <v-bottom-sheet v-model="mobileSettingsOpen" inset>
+      <v-card>
+        <v-card-title>Viewer settings</v-card-title>
+        <v-card-text class="d-flex flex-column ga-3">
+          <v-select
+            v-model="quality"
+            :items="qualityOptions"
+            density="compact"
+            hide-details
+            variant="outlined"
+            prepend-inner-icon="mdi-quality-high"
+            label="Quality preference"
+          />
+          <v-select
+            v-model="scaleMode"
+            :items="scaleOptions"
+            density="compact"
+            hide-details
+            variant="outlined"
+            prepend-inner-icon="mdi-image-size-select-actual"
+            label="View scale"
+          />
+          <v-text-field
+            v-if="scaleMode === 'custom'"
+            v-model.number="scalePercent"
+            type="number"
+            min="5"
+            max="1000"
+            step="5"
+            density="compact"
+            hide-details
+            variant="outlined"
+            suffix="%"
+            label="Custom scale"
+          />
+          <v-select
+            v-model="resolutionPresetValue"
+            :items="resolutionOptions"
+            density="compact"
+            hide-details
+            variant="outlined"
+            prepend-inner-icon="mdi-monitor-screenshot"
+            label="Remote capture resolution"
+          />
+          <v-select
+            v-model="codecOverride"
+            :items="codecOptions"
+            density="compact"
+            hide-details
+            variant="outlined"
+            prepend-inner-icon="mdi-video-outline"
+            label="Codec override"
+            :hint="codecOverride == null
+              ? 'Agent picks the best available codec'
+              : `Forcing ${codecOverride.toUpperCase()} - takes effect on next Connect`"
+            persistent-hint
+          />
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" @click="mobileSettingsOpen = false">Close</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-bottom-sheet>
   </v-container>
 </template>
 
@@ -542,6 +617,11 @@ const videoEl = ref<HTMLVideoElement | null>(null)
 const stageEl = ref<HTMLElement | null>(null)
 const cursorCanvas = ref<HTMLCanvasElement | null>(null)
 const fileInput = ref<HTMLInputElement | null>(null)
+// Mobile-only viewer settings bottom-sheet visibility. Wraps the
+// same Quality / Scale / Resolution / Codec selects shown inline on
+// `md and up` so phone operators retain access without losing the
+// rest of the toolbar to a 4-select overflow.
+const mobileSettingsOpen = ref(false)
 const uploadBusy = ref(false)
 
 // Stream the user-picked file to the remote's Downloads folder via
