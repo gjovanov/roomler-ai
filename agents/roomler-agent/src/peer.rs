@@ -41,6 +41,8 @@ use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSampl
 use crate::capture;
 use crate::encode;
 use crate::input;
+use crate::lock_overlay;
+use crate::lock_state;
 
 /// Target capture rate on the **software** path. openh264 pegs a CPU core
 /// above ~35 fps at 1080p; 30 is the stable ceiling. See `target_fps_for`
@@ -523,6 +525,15 @@ impl AgentPeer {
             })
         }));
 
+        // Spawn the lock-screen monitor. One per session is fine —
+        // the poll cost is ~0.001 % CPU, and the watch channel's
+        // `is_closed()` lets the monitor task self-terminate when
+        // the pump exits. Multiple concurrent sessions stack
+        // monitors, which is wasteful but correct. M3 phase 4
+        // could hoist this to one-per-worker if profiling shows
+        // it matters.
+        let (lock_state_rx, _lock_state_handle) = lock_state::spawn_monitor();
+
         // Start the capture→encode→track pump. The pump is self-regulating:
         // with no capture backend compiled in, open_default returns a Noop
         // that parks forever, producing no samples. Phase Y.3:
@@ -541,6 +552,7 @@ impl AgentPeer {
             target_resolution.clone(),
             negotiated_transport,
             video_bytes_dc.clone(),
+            lock_state_rx,
         ));
 
         Ok(Self {
@@ -641,7 +653,15 @@ async fn media_pump(
     target_resolution: Arc<std::sync::Mutex<TargetResolution>>,
     negotiated_transport: Option<String>,
     video_bytes_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
+    lock_state_rx: tokio::sync::watch::Receiver<lock_state::LockState>,
 ) {
+    // Tracks the lock-state value seen on the previous loop iteration
+    // so we can request an encoder keyframe on each transition. The
+    // browser decoder otherwise has to wait for the next periodic
+    // intra-refresh to actually render the overlay (or the resumed
+    // desktop on unlock), which on a live session can be 1-2 seconds
+    // of stale-then-suddenly-correct frames.
+    let mut was_locked_last_iter = matches!(*lock_state_rx.borrow(), lock_state::LockState::Locked);
     // Y.3 fork: route to the DC pump when the session negotiated VP9
     // 4:4:4 over the `video-bytes` channel. Falls through to the
     // legacy track-based pump otherwise — including when the feature
@@ -662,6 +682,7 @@ async fn media_pump(
                 video_bytes_dc,
                 keyframe_requested,
                 target_resolution,
+                lock_state_rx,
             )
             .await;
         }
@@ -852,6 +873,33 @@ async fn media_pump(
         // pixels that carry no new information). On resolution change
         // the `encoder_dims` check below rebuilds the encoder.
         let frame = apply_target_resolution(frame, *target_resolution.lock().unwrap());
+
+        // Lock-screen overlay (M3 phase 3, Z-path). When the user-
+        // context worker can't see the real desktop (input desktop
+        // has transitioned to `winsta0\Winlogon`), the captured
+        // frame is black/stale and useless. Substitute a static
+        // "Host is locked" overlay at the same dimensions so the
+        // operator sees something distinctive instead of frozen
+        // black, and the encoder pump keeps the RTP stream healthy.
+        // Force a keyframe on the transition into Locked so the
+        // browser decoder doesn't need to wait for the next intra-
+        // refresh to render the overlay.
+        let frame = if *lock_state_rx.borrow() == lock_state::LockState::Locked {
+            if !was_locked_last_iter {
+                keyframe_requested.store(true, std::sync::atomic::Ordering::Relaxed);
+                was_locked_last_iter = true;
+            }
+            lock_overlay::produce(frame.width, frame.height, frame.monotonic_us, frame.monitor)
+        } else {
+            if was_locked_last_iter {
+                // Force a keyframe on the unlock transition too so
+                // the resumed real desktop snaps into view at full
+                // quality immediately.
+                keyframe_requested.store(true, std::sync::atomic::Ordering::Relaxed);
+                was_locked_last_iter = false;
+            }
+            frame
+        };
 
         // (Re)build the encoder if the frame dimensions change.
         if encoder_dims != Some((frame.width, frame.height)) {
@@ -1218,7 +1266,11 @@ async fn media_pump_vp9_444_dc(
     video_bytes_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
     keyframe_requested: Arc<std::sync::atomic::AtomicBool>,
     target_resolution: Arc<std::sync::Mutex<TargetResolution>>,
+    lock_state_rx: tokio::sync::watch::Receiver<lock_state::LockState>,
 ) {
+    // See `media_pump`: tracks lock-state transitions so we can
+    // request a keyframe on the lock/unlock boundary.
+    let mut was_locked_last_iter = matches!(*lock_state_rx.borrow(), lock_state::LockState::Locked);
     use crate::encode::VideoEncoder; // brings encode/request_keyframe into scope
     use crate::encode::libvpx::Vp9Encoder;
 
@@ -1290,6 +1342,25 @@ async fn media_pump_vp9_444_dc(
         // to cover the rare case where the resolution control message
         // landed an odd value.
         let frame = apply_target_resolution(frame, *target_resolution.lock().unwrap());
+
+        // Lock-screen overlay (M3 phase 3, Z-path). Same logic as
+        // the legacy track pump — when the user-context worker
+        // can't see the real desktop (input desktop on Winlogon),
+        // substitute a static "Host is locked" overlay frame.
+        let frame = if *lock_state_rx.borrow() == lock_state::LockState::Locked {
+            if !was_locked_last_iter {
+                keyframe_requested.store(true, std::sync::atomic::Ordering::Relaxed);
+                was_locked_last_iter = true;
+            }
+            lock_overlay::produce(frame.width, frame.height, frame.monotonic_us, frame.monitor)
+        } else {
+            if was_locked_last_iter {
+                keyframe_requested.store(true, std::sync::atomic::Ordering::Relaxed);
+                was_locked_last_iter = false;
+            }
+            frame
+        };
+
         let w = frame.width & !1;
         let h = frame.height & !1;
         if w != frame.width || h != frame.height {
