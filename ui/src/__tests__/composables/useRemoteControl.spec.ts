@@ -24,6 +24,7 @@ import {
   decideKeyAction,
   RC_RECONNECT_LADDER_MS,
   nextReconnectDelayMs,
+  parseControlInbound,
   type KeyDecision,
 } from '@/composables/useRemoteControl'
 import { codecMimeForShort } from '@/workers/rc-webcodecs-worker'
@@ -1114,6 +1115,60 @@ describe('RC_RECONNECT_LADDER_MS', () => {
         RC_RECONNECT_LADDER_MS[i - 1],
       )
     }
+  })
+})
+
+describe('parseControlInbound', () => {
+  it('parses a well-formed rc:host_locked locked=true', () => {
+    const r = parseControlInbound('{"t":"rc:host_locked","locked":true}')
+    expect(r).toEqual({ kind: 'host_locked', locked: true })
+  })
+
+  it('parses a well-formed rc:host_locked locked=false', () => {
+    const r = parseControlInbound('{"t":"rc:host_locked","locked":false}')
+    expect(r).toEqual({ kind: 'host_locked', locked: false })
+  })
+
+  it('returns null for non-string input', () => {
+    // Real ondatachannel messages can deliver Blob / ArrayBuffer
+    // when the sender uses binary mode; our agent always sends
+    // text but the type guard must not crash on the alternative.
+    expect(parseControlInbound(null)).toBeNull()
+    expect(parseControlInbound(123)).toBeNull()
+    expect(parseControlInbound(new ArrayBuffer(8))).toBeNull()
+  })
+
+  it('returns null for non-JSON strings', () => {
+    expect(parseControlInbound('not json')).toBeNull()
+    expect(parseControlInbound('')).toBeNull()
+    expect(parseControlInbound('{')).toBeNull()
+  })
+
+  it('returns null for JSON that is not an object', () => {
+    // `JSON.parse` accepts bare values; the wire format requires
+    // an envelope object so anything else is a wire-format bug
+    // the older agent / future agent might emit.
+    expect(parseControlInbound('null')).toBeNull()
+    expect(parseControlInbound('42')).toBeNull()
+    expect(parseControlInbound('"string"')).toBeNull()
+    expect(parseControlInbound('[1,2,3]')).toBeNull()
+  })
+
+  it('returns null for unknown envelope types', () => {
+    // Future agent versions may emit additional `t` values; older
+    // browsers must skip them silently rather than crash.
+    expect(parseControlInbound('{"t":"rc:cursor-shape","data":"..."}')).toBeNull()
+    expect(parseControlInbound('{"t":"unknown"}')).toBeNull()
+    expect(parseControlInbound('{}')).toBeNull()
+  })
+
+  it('returns null when locked is not a boolean', () => {
+    // Defensive: a malformed agent that sends locked="true" or
+    // locked=1 must NOT pass through as truthy. Lock state UI
+    // should never be steered by stringly-typed input.
+    expect(parseControlInbound('{"t":"rc:host_locked","locked":"true"}')).toBeNull()
+    expect(parseControlInbound('{"t":"rc:host_locked","locked":1}')).toBeNull()
+    expect(parseControlInbound('{"t":"rc:host_locked"}')).toBeNull()
   })
 })
 
