@@ -37,4 +37,4 @@ The current capture backend (scrap) is X11-only. Under Wayland the agent
 will fail at session start. Either log in to an X11 session, or wait for
 the PipeWire portal backend (see docs/remote-control.md).
 
--- Goran Jovanov <gjovanov@gmail.com>  2026
+-- Goran Jovanov <goran.jovanov@gmail.com>  2026

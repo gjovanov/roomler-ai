@@ -262,8 +262,8 @@ tempfile = { workspace = true }
 #   cargo deb -p roomler-agent --no-build
 # Produces target/debian/roomler-agent_<version>_amd64.deb
 [package.metadata.deb]
-maintainer = "Goran Jovanov <gjovanov@gmail.com>"
-copyright = "2026, Goran Jovanov <gjovanov@gmail.com>"
+maintainer = "Goran Jovanov <goran.jovanov@gmail.com>"
+copyright = "2026, Goran Jovanov <goran.jovanov@gmail.com>"
 license-file = ["../../LICENSE", "0"]
 extended-description = """\
 Native remote-control agent for the Roomler AI platform. Runs on the \
