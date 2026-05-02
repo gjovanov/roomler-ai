@@ -2,10 +2,14 @@
 <!--
   WiX v3 source for the PER-MACHINE roomler-agent MSI (M3 phase 4).
 
-  Build with `cargo wix -p roomler-agent --include wix\main-perMachine.wxs`
-  (or whichever invocation the release-agent.yml workflow ends up
-  picking up; both per-user and per-machine MSIs ship from the same
-  agent-v* tag).
+  Build by file-swapping into wix/main.wxs (release-agent.yml does
+  this between two `cargo wix` runs). cargo-wix auto-discovers every
+  *.wxs under wix/, so this file lives in a sibling wix-perMachine/
+  directory to avoid the per-User build trying to compile it too.
+  Both per-user and per-machine MSIs ship from the same agent-v* tag.
+  (XML rule: no consecutive dashes in comments, hence the awkward
+  paraphrase of what would otherwise be `cargo wix [hyphen][hyphen]
+  include`.)
 
   Differences vs the per-user main.wxs:
 
@@ -36,16 +40,16 @@
 
     5. No Scheduled Task auto-registration. The per-machine flavour
        is service-only; operators who want both autostart paths can
-       run `roomler-agent service install` (no `--as-service`)
-       manually after the MSI install. v1 keeps the default clean:
-       one product, one autostart hook.
+       run `roomler-agent service install` (no [hyphen][hyphen]
+       as-service flag) manually after the MSI install. v1 keeps
+       the default clean: one product, one autostart hook.
 
   Effort 2 + M3 phase 4 closes the field gap that drove the M5/M3
   cycle: with the per-machine MSI, IT can deploy roomler-agent across
   a fleet via standard MSI tooling and get both perMachine file
   layout AND SCM service auto-registration in one msiexec invocation.
   No more "install MSI, then run elevated PS service install
-  --as-service" two-step.
+  [hyphen][hyphen]as-service" two-step.
 -->
 <Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'>
     <Product
@@ -183,8 +187,8 @@
           so it has the rights to call CreateService. Return="ignore"
           so a registration failure (rare service-name collision,
           weird group policy) doesn't sink the whole install -
-          operator can recover by running `roomler-agent service
-          install --as-service` from elevated PS.
+          operator can recover by running the equivalent
+          `service install` flag combination from elevated PS.
         -->
         <CustomAction
             Id='RegisterService'

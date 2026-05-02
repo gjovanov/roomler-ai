@@ -268,6 +268,9 @@ TeamViewer-style remote desktop. One native agent per controlled host, Roomler A
 
 **WebSocket role multiplexing**: `/ws?token=<jwt>&role=agent` uses the agent JWT audience; no `role` param (or `role=user`) uses the existing user flow. Same WS endpoint, same handshake, different claim validator.
 
+**Status at 0.2.4** (CI-fix shipped 2026-05-02 — 0.2.1 / 0.2.2 / 0.2.3 release builds all failed):
+- **CI fix only** — no behaviour change. The per-Machine MSI work in 0.2.1 placed `main-perMachine.wxs` next to `main.wxs` inside `agents/roomler-agent/wix/`, but cargo-wix auto-discovers every `*.wxs` in that dir so the per-User MSI build also tried to compile the perMachine source. That tripped a separate WiX 1.0 rule (`--` not allowed inside comments) on `--include` and `--as-service` text in the perMachine file's prose, which had been visible since the v3 git mv. **Fix**: relocate the perMachine source to a sibling `agents/roomler-agent/wix-perMachine/main.wxs` directory (outside cargo-wix's scan path), update the release-agent.yml swap step to copy from the new location, paraphrase any `--` runs that survived in comments. 0.2.0 release pipeline was the last green build before 0.2.4.
+
 **Status at 0.2.3** (rc:host_locked control-DC signal + viewer badge shipped 2026-05-02 on top of 0.2.2):
 - **`rc:host_locked` control-DC message**: agent emits a JSON envelope `{"t":"rc:host_locked","locked":true|false}` over the existing `control` data channel on every lock-state transition (and once at session start to seed the initial state). The browser's `useRemoteControl.ts` exposes a `hostLocked` ref that the viewer renders as a yellow `mdi-lock` chip in the toolbar. Supplements the in-stream padlock overlay frame for operators whose video element is scrolled out of view or who are taking screenshots for support. Backward-compatible: older agents never emit the message; the badge stays hidden and the experience falls back to overlay-only.
 

@@ -356,15 +356,19 @@ jobs:
       - name: Build MSI (per-Machine)
         shell: pwsh
         run: |
-          # cargo-wix only knows how to find `wix/main.wxs`; swap the
-          # per-Machine WXS into that path for the second build, then
-          # restore the original. Both MSIs end up in target/wix/ and
-          # we rename to disambiguate. Different UpgradeCode + the
-          # mutually-exclusive LaunchConditions ensure a host can only
-          # ever have one of the two installed at a time.
+          # cargo-wix auto-discovers every *.wxs under wix/, so the
+          # per-Machine source lives in a sibling wix-perMachine/ dir
+          # to keep it OUT of the per-User build's compile set.
+          # For this run we copy that file over wix/main.wxs (after
+          # backing up the original), invoke cargo wix again, and
+          # restore. Both MSIs end up in target/wix/ and we rename
+          # to disambiguate. Different UpgradeCode + the mutually-
+          # exclusive LaunchConditions ensure a host can only ever
+          # have one of the two installed at a time.
           $wixDir = "agents\roomler-agent\wix"
+          $pmSrc  = "agents\roomler-agent\wix-perMachine\main.wxs"
           Copy-Item "$wixDir\main.wxs" "$wixDir\main.wxs.bak" -Force
-          Copy-Item "$wixDir\main-perMachine.wxs" "$wixDir\main.wxs" -Force
+          Copy-Item $pmSrc "$wixDir\main.wxs" -Force
           try {
             cargo wix -p roomler-agent --nocapture --no-build --install-version $env:VERSION
           } finally {
