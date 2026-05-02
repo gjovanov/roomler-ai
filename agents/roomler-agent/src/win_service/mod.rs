@@ -28,6 +28,9 @@
 
 #![cfg(target_os = "windows")]
 
+#[cfg(feature = "wgc-capture")]
+pub mod capture_smoke;
+pub mod desktop;
 pub mod supervisor;
 
 use anyhow::{Context, Result, bail};
