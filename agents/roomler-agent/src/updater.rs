@@ -683,7 +683,22 @@ pub async fn run_periodic(
         // installer), skip the immediate check and treat the loop as
         // if the periodic interval had already elapsed once. Prevents
         // the install-storm — see STARTUP_UPDATE_COOLDOWN doc.
+        //
+        // The log line is intentionally emitted *before* the sleep so
+        // operators verifying the storm fix in the field can grep the
+        // log for "suppressed by recent-install cooldown" within the
+        // 5-min window — the previous (0.1.62) ordering put the log
+        // *after* the 24h sleep, which made the suppression invisible
+        // until the next periodic wake-up. Field repro on e069019l
+        // 2026-05-02: cooldown was working (no storm) but verification
+        // by grep failed because the line hadn't been written yet.
         let skip_first_check = first && recent_update_attempt(STARTUP_UPDATE_COOLDOWN);
+        if skip_first_check {
+            tracing::info!(
+                cooldown_secs = STARTUP_UPDATE_COOLDOWN.as_secs(),
+                "auto-updater: at-startup check suppressed by recent-install cooldown"
+            );
+        }
         if !first || skip_first_check {
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {},
@@ -693,13 +708,6 @@ pub async fn run_periodic(
             }
         }
         first = false;
-        if skip_first_check {
-            tracing::info!(
-                cooldown_secs = STARTUP_UPDATE_COOLDOWN.as_secs(),
-                "auto-updater: at-startup check suppressed by recent-install cooldown"
-            );
-            continue;
-        }
         let outcome = check_once().await;
         match outcome {
             CheckOutcome::UpToDate { current, latest } => {
