@@ -34,6 +34,27 @@
         </template>
         <template v-else>{{ rc.phase.value }}</template>
       </v-chip>
+      <!-- Host-locked indicator. Shown only during a live session
+           when the agent has signalled (via the rc:host_locked
+           control-DC message, agent 0.2.2+) that the input desktop
+           transitioned to winsta0\Winlogon. The video stream's
+           padlock overlay frame is the primary signal; this badge
+           supplements it for operators who scrolled the video out
+           of view or are taking a screenshot for support. Older
+           agents (<0.2.2) never emit the message, so the chip
+           stays hidden and the experience falls back to the
+           overlay-only state. -->
+      <v-chip
+        v-if="rc.phase.value === 'connected' && rc.hostLocked.value"
+        size="small"
+        color="warning"
+        variant="flat"
+        prepend-icon="mdi-lock"
+        class="mr-2"
+        title="The remote host is on the lock screen — input is suppressed."
+      >
+        Host locked
+      </v-chip>
       <!-- Advanced selects: Quality, Scale (+ optional Custom %),
            Resolution override, Codec override. Together they consume
            ~630px of toolbar real estate which doesn't fit on a phone

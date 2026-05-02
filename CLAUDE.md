@@ -268,6 +268,9 @@ TeamViewer-style remote desktop. One native agent per controlled host, Roomler A
 
 **WebSocket role multiplexing**: `/ws?token=<jwt>&role=agent` uses the agent JWT audience; no `role` param (or `role=user`) uses the existing user flow. Same WS endpoint, same handshake, different claim validator.
 
+**Status at 0.2.3** (rc:host_locked control-DC signal + viewer badge shipped 2026-05-02 on top of 0.2.2):
+- **`rc:host_locked` control-DC message**: agent emits a JSON envelope `{"t":"rc:host_locked","locked":true|false}` over the existing `control` data channel on every lock-state transition (and once at session start to seed the initial state). The browser's `useRemoteControl.ts` exposes a `hostLocked` ref that the viewer renders as a yellow `mdi-lock` chip in the toolbar. Supplements the in-stream padlock overlay frame for operators whose video element is scrolled out of view or who are taking screenshots for support. Backward-compatible: older agents never emit the message; the badge stays hidden and the experience falls back to overlay-only.
+
 **Status at 0.2.2** (input suppression on lock shipped 2026-05-02, polish on top of 0.2.1):
 - **Input drop-on-lock**: `attach_input_handler` now consumes the `lock_state` watch receiver and drops InputMsg dispatches early when `LockState::Locked`. Previously the events were JSON-parsed and forwarded to the OS injector, where SendInput silently routed them to `winsta0\Default` while the input desktop was on `winsta0\Winlogon` — appeared to work at the WS layer but achieved nothing on the host. Now the early drop keeps the audit trail honest and avoids polluting `enigo` internal state. Logs every 60th suppressed event at debug level so the field gets a steady "yes, suppression is working" signal without flooding.
 

@@ -324,6 +324,14 @@ impl AgentPeer {
         // from its own task — both brief, no contention.
         let video_bytes_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>> =
             Arc::new(tokio::sync::Mutex::new(None));
+        // Control-DC stash so the lock-state emitter task (spawned
+        // alongside the media pump below) can write `rc:host_locked`
+        // messages without a separate channel lookup. Tokio mutex
+        // mirrors `video_bytes_dc`'s rationale: the on_data_channel
+        // callback writes from an async context, the emitter reads
+        // from its own task, both very briefly.
+        let control_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
         let rtcp_reader = {
             let flag = keyframe_requested.clone();
             let remb = remb_bps.clone();
@@ -500,6 +508,7 @@ impl AgentPeer {
         let quality_for_dc = quality_state.clone();
         let target_res_for_dc = target_resolution.clone();
         let video_bytes_dc_for_callback = video_bytes_dc.clone();
+        let control_dc_for_callback = control_dc.clone();
         let lock_state_rx_for_dc = lock_state_rx.clone();
         pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
             let label = dc.label().to_string();
@@ -507,11 +516,19 @@ impl AgentPeer {
             let quality_for_dc = quality_for_dc.clone();
             let target_res_for_dc = target_res_for_dc.clone();
             let video_bytes_stash = video_bytes_dc_for_callback.clone();
+            let control_stash = control_dc_for_callback.clone();
             let lock_state_rx_for_input = lock_state_rx_for_dc.clone();
             Box::pin(async move {
                 match label.as_str() {
                     "input" => attach_input_handler(dc, lock_state_rx_for_input),
                     "control" => {
+                        // Stash a clone for the lock-state emitter
+                        // BEFORE handing the DC to the inbound handler.
+                        // attach_control_handler consumes the Arc by
+                        // value to install on_message; without the
+                        // pre-clone-and-stash, the emitter task would
+                        // have no way to write outbound messages.
+                        *control_stash.lock().await = Some(dc.clone());
                         attach_control_handler(dc, session_id, quality_for_dc, target_res_for_dc)
                     }
                     "cursor" => attach_cursor_handler(dc, session_id),
@@ -539,6 +556,33 @@ impl AgentPeer {
                 }
             })
         }));
+
+        // Spawn the host-locked emitter: watches the lock_state
+        // monitor's transitions and emits `rc:host_locked` over the
+        // `control` data channel so the viewer can render an explicit
+        // toolbar badge alongside the in-stream padlock overlay.
+        // The task self-terminates when the receiver closes (pump
+        // exit) or when send to the DC fails (peer gone).
+        {
+            let mut rx = lock_state_rx.clone();
+            let stash = control_dc.clone();
+            tokio::spawn(async move {
+                // Send the initial state once the control DC is
+                // available. The first `changed().await` fires only
+                // on subsequent transitions, but the operator's UI
+                // needs to know if the host is *already* locked at
+                // session start.
+                let mut prev = *rx.borrow();
+                emit_host_locked(&stash, prev == lock_state::LockState::Locked).await;
+                while rx.changed().await.is_ok() {
+                    let current = *rx.borrow();
+                    if current != prev {
+                        emit_host_locked(&stash, current == lock_state::LockState::Locked).await;
+                        prev = current;
+                    }
+                }
+            });
+        }
 
         // Start the capture→encode→track pump. The pump is self-regulating:
         // with no capture backend compiled in, open_default returns a Noop
@@ -1545,6 +1589,28 @@ fn attach_input_handler(
             }
         })
     }));
+}
+
+/// Send `rc:host_locked` over the stashed `control` data channel.
+/// No-op when the channel hasn't opened yet (session in negotiation),
+/// when the channel has been torn down, or when the send itself fails
+/// — none of those are recoverable from this task and a missing badge
+/// is a much softer failure than a panicked emitter.
+async fn emit_host_locked(
+    stash: &Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
+    locked: bool,
+) {
+    let dc = {
+        let guard = stash.lock().await;
+        match guard.as_ref() {
+            Some(dc) => dc.clone(),
+            None => return,
+        }
+    };
+    let payload = format!(r#"{{"t":"rc:host_locked","locked":{locked}}}"#);
+    if let Err(e) = dc.send_text(payload).await {
+        debug!(%e, "rc:host_locked send failed (control DC closed?)");
+    }
 }
 
 /// `control` data-channel handler. Parses JSON `rc:*` envelopes and
