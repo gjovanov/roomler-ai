@@ -39,15 +39,25 @@ export const RC_RECONNECT_LADDER_MS = [250, 500, 1000, 2000, 4000, 8000] as cons
 /**
  * Parse an inbound `control` data-channel message into a typed
  * value. Returns `null` for any non-JSON, non-string, or unknown
- * envelope shape so the caller can no-op silently. Today only the
- * `rc:host_locked` variant is recognised; future agent → browser
- * control messages (rc:cursor-shape, rc:dpi-change, ...) layer on
- * the same parse-by-`t` switch.
+ * envelope shape so the caller can no-op silently. Recognised
+ * variants:
+ *   - `rc:host_locked` — boolean lock-state flip (agents 0.2.3+)
+ *   - `rc:desktop_changed` — input desktop name (agents 0.3.0+
+ *     SYSTEM-context worker; emitted on `try_change_desktop`
+ *     Switched). Powers the secondary "On Winlogon" chip.
+ * Future agent → browser control messages (rc:cursor-shape,
+ * rc:dpi-change, ...) layer on the same parse-by-`t` switch.
+ * Unknown `t` values fall through to `null` so older browsers
+ * stay forward-compatible with newer agents.
  *
  * Exported for unit testing. Production code should consume the
- * already-applied `hostLocked` ref from the composable.
+ * already-applied `hostLocked` / `currentDesktop` refs from the
+ * composable.
  */
-export type RcControlInbound = { kind: 'host_locked'; locked: boolean } | null
+export type RcControlInbound =
+  | { kind: 'host_locked'; locked: boolean }
+  | { kind: 'desktop_changed'; name: string }
+  | null
 
 export function parseControlInbound(data: unknown): RcControlInbound {
   if (typeof data !== 'string') return null
@@ -61,6 +71,13 @@ export function parseControlInbound(data: unknown): RcControlInbound {
   const obj = parsed as Record<string, unknown>
   if (obj.t === 'rc:host_locked' && typeof obj.locked === 'boolean') {
     return { kind: 'host_locked', locked: obj.locked }
+  }
+  if (
+    obj.t === 'rc:desktop_changed' &&
+    typeof obj.name === 'string' &&
+    obj.name.length > 0
+  ) {
+    return { kind: 'desktop_changed', name: obj.name }
   }
   return null
 }
@@ -548,6 +565,16 @@ export function useRemoteControl() {
    * always-false matches the pre-overlay behaviour for those agents.
    */
   const hostLocked = ref(false)
+  /**
+   * Current input desktop name reported by the SYSTEM-context
+   * worker (agents 0.3.0+) via the `rc:desktop_changed` control-DC
+   * message. `'Default'` is the normal interactive desktop;
+   * `'Winlogon'` (or `'Screen-saver'`, etc.) means the operator
+   * is on a secure desktop. Older agents never emit the message;
+   * the ref stays at `'Default'` and the viewer renders no
+   * secondary chip.
+   */
+  const currentDesktop = ref<string>('Default')
   const remoteStream = ref<MediaStream | null>(null)
   /** Set once we've received at least one video/audio track. False until
    *  the agent attaches media (the native agent currently does not). */
@@ -1334,6 +1361,7 @@ export function useRemoteControl() {
     mediaIntrinsicW.value = 0
     mediaIntrinsicH.value = 0
     hostLocked.value = false
+    currentDesktop.value = 'Default'
   }
 
   async function connect(
@@ -1614,16 +1642,23 @@ export function useRemoteControl() {
       sendQualityPreference()
       sendResolutionPreference()
     }
-    // Agent → browser control messages. Today: `rc:host_locked`
-    // (boolean) — the agent flips this on/off as `lock_state.rs`
-    // observes desktop transitions. Other variants (rc:dpi-change,
-    // rc:cursor-shape) layer on the same parse-by-`t` switch.
-    // Unknown `t` values are dropped silently; older agents emitted
-    // nothing here, so backward-compat is automatic.
+    // Agent → browser control messages. Recognised:
+    //   - `rc:host_locked` (boolean) — the agent flips this on/off
+    //     as `lock_state.rs` observes desktop transitions (0.2.3+).
+    //   - `rc:desktop_changed` (string name) — the SYSTEM-context
+    //     worker emits this after every `try_change_desktop`
+    //     Switched, so the viewer shows e.g. "On Winlogon" while
+    //     the operator drives the lock screen (0.3.0+).
+    // Other variants (rc:dpi-change, rc:cursor-shape) layer on the
+    // same parse-by-`t` switch. Unknown `t` values are dropped
+    // silently; older agents emitted nothing here, so backward-
+    // compat is automatic.
     channels.control.onmessage = (ev) => {
       const parsed = parseControlInbound(ev.data)
       if (parsed?.kind === 'host_locked') {
         hostLocked.value = parsed.locked
+      } else if (parsed?.kind === 'desktop_changed') {
+        currentDesktop.value = parsed.name
       }
     }
 
@@ -2052,6 +2087,16 @@ export function useRemoteControl() {
      * padlock overlay frame.
      */
     hostLocked,
+    /**
+     * Name of the input desktop the agent is currently bound to,
+     * as reported by the SYSTEM-context worker via the
+     * `rc:desktop_changed` control-DC message. `'Default'` is the
+     * normal interactive desktop; `'Winlogon'` / `'Screen-saver'`
+     * are secure desktops. Older agents never emit the message and
+     * the ref stays at `'Default'`, which keeps the viewer
+     * rendering only the existing `hostLocked` chip.
+     */
+    currentDesktop,
     attachInput,
     sendClipboardToAgent,
     getAgentClipboard,

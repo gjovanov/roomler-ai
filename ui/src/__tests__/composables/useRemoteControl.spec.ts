@@ -1170,6 +1170,38 @@ describe('parseControlInbound', () => {
     expect(parseControlInbound('{"t":"rc:host_locked","locked":1}')).toBeNull()
     expect(parseControlInbound('{"t":"rc:host_locked"}')).toBeNull()
   })
+
+  it('parses a well-formed rc:desktop_changed', () => {
+    // M3 A1 SYSTEM-context worker emits this after every
+    // try_change_desktop Switched. Powers the secondary
+    // "On Winlogon" chip.
+    const r = parseControlInbound('{"t":"rc:desktop_changed","name":"Winlogon"}')
+    expect(r).toEqual({ kind: 'desktop_changed', name: 'Winlogon' })
+  })
+
+  it('parses rc:desktop_changed with arbitrary desktop name', () => {
+    // Default / Winlogon are the common cases but Windows can
+    // present screen-saver / custom desktops too. Don't restrict.
+    const r = parseControlInbound('{"t":"rc:desktop_changed","name":"Default"}')
+    expect(r).toEqual({ kind: 'desktop_changed', name: 'Default' })
+    const r2 = parseControlInbound('{"t":"rc:desktop_changed","name":"Screen-saver"}')
+    expect(r2).toEqual({ kind: 'desktop_changed', name: 'Screen-saver' })
+  })
+
+  it('returns null when desktop_changed name is missing or wrong type', () => {
+    // Defensive: stringly-typed numbers / null / missing field all
+    // get rejected so we can never set currentDesktop to a
+    // non-string runtime value.
+    expect(parseControlInbound('{"t":"rc:desktop_changed"}')).toBeNull()
+    expect(parseControlInbound('{"t":"rc:desktop_changed","name":42}')).toBeNull()
+    expect(parseControlInbound('{"t":"rc:desktop_changed","name":null}')).toBeNull()
+  })
+
+  it('returns null when desktop_changed name is empty string', () => {
+    // Empty name has no semantic meaning + the viewer would render
+    // an empty chip, so reject at the parse layer.
+    expect(parseControlInbound('{"t":"rc:desktop_changed","name":""}')).toBeNull()
+  })
 })
 
 describe('nextReconnectDelayMs', () => {
