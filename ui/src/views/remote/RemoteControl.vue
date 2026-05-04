@@ -55,6 +55,25 @@
       >
         Host locked
       </v-chip>
+      <!-- Secondary chip for the SYSTEM-context worker's input-desktop
+           name (agents 0.3.0+). 'Default' = normal user desktop, no chip
+           shown. 'Winlogon' / 'Screen-saver' / etc. = secure desktop, the
+           operator is driving lock-screen / UAC / SAS UI. The hostLocked
+           chip above and this one render side-by-side: hostLocked is the
+           pre-0.3.0 binary lock signal, currentDesktop is the per-
+           transition name from the SYSTEM-context path. They're not
+           contradictory — on 0.3.0 perMachine MSI both fire. -->
+      <v-chip
+        v-if="rc.phase.value === 'connected' && rc.currentDesktop.value !== 'Default'"
+        size="small"
+        color="info"
+        variant="flat"
+        prepend-icon="mdi-shield-account"
+        class="mr-2"
+        :title="`Agent thread is bound to ${rc.currentDesktop.value} — type the host's password to unlock`"
+      >
+        On {{ rc.currentDesktop.value }}
+      </v-chip>
       <!-- Advanced selects: Quality, Scale (+ optional Custom %),
            Resolution override, Codec override. Together they consume
            ~630px of toolbar real estate which doesn't fit on a phone
