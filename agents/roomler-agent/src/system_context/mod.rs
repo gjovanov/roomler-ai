@@ -58,5 +58,6 @@
 
 #![cfg(all(feature = "system-context", target_os = "windows"))]
 
+pub mod desktop_rebind;
 pub mod winlogon_token;
 pub mod worker_role;
