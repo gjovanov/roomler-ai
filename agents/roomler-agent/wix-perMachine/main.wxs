@@ -131,6 +131,39 @@
                             KeyPath='yes'
                             Source='agents\roomler-agent\packaging\windows\README.txt' />
                     </Component>
+
+                    <!--
+                      M3 A1: enable SendSAS() from LocalSystem services so the
+                      SYSTEM-context worker can deliver Ctrl+Alt+Del to the
+                      controlled host's lock screen. Without this the operator
+                      literally cannot log in via the browser controller because
+                      SendSAS(FALSE) silently fails for non-default principals.
+
+                      HKLM\Software\Microsoft\Windows\CurrentVersion\Policies\
+                          System\SoftwareSASGeneration
+                        0 = None (default; SAS injection blocked)
+                        1 = Services (LocalSystem services may call SendSAS)
+                        2 = Ease of access apps
+                        3 = Both
+
+                      We set 1 — only the LocalSystem service gets the right.
+                      Per-User MSI users never see this; they get the existing
+                      VK_DELETE+VK_CONTROL+VK_MENU path via enigo which works
+                      on the Default desktop but cannot reach Winlogon.
+
+                      Owns its own KeyPath via the registry value; no file
+                      backing needed. Removed cleanly on uninstall (component
+                      reference-count drops to zero, MSI deletes the value).
+                    -->
+                    <Component Id='SoftwareSASRegistry' Guid='9172A3F5-1B4C-4E7A-9D2E-F3A8B5C6D7E8' Win64='yes'>
+                        <RegistryValue
+                            Root='HKLM'
+                            Key='Software\Microsoft\Windows\CurrentVersion\Policies\System'
+                            Name='SoftwareSASGeneration'
+                            Type='integer'
+                            Value='1'
+                            KeyPath='yes' />
+                    </Component>
                 </Directory>
             </Directory>
 
@@ -160,6 +193,7 @@
             <ComponentRef Id='AgentExe' />
             <ComponentRef Id='LicenseTxt' />
             <ComponentRef Id='ReadmeTxt' />
+            <ComponentRef Id='SoftwareSASRegistry' />
         </Feature>
 
         <Property Id='ARPHELPLINK' Value='https://roomler.ai/' />
