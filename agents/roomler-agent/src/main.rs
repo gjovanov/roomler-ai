@@ -446,6 +446,33 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         };
     let mut cfg = config::load(config_path).context("loading config")?;
     let encoder_preference = resolve_encoder_preference(cli_encoder, cfg.encoder_preference);
+
+    // M3 A1 worker-role probe (perMachine MSI builds with the
+    // `system-context` feature only). Reads the worker's own primary
+    // token at startup and decides whether downstream plumbing
+    // should use the User-mode or SystemContext-mode trees. Logged
+    // here so the field can correlate "supervisor said spawn
+    // SystemContext" with "worker actually probed SystemContext"
+    // in a single grep across the persistent log file.
+    //
+    // Failure mode: documented infallible against the calling
+    // process's own token; on impossible-error we default to User
+    // (matches the pre-M3 behaviour). The error is logged at warn
+    // so the next pass through the supervisor flags it.
+    #[cfg(all(feature = "system-context", target_os = "windows"))]
+    let worker_role = match roomler_agent::system_context::worker_role::probe_self() {
+        Ok(role) => {
+            tracing::info!(?role, "worker role probed");
+            role
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "worker role probe failed — defaulting to User");
+            roomler_agent::system_context::worker_role::WorkerRole::User
+        }
+    };
+    #[cfg(all(feature = "system-context", target_os = "windows"))]
+    let _ = worker_role; // M3 A1 follow-up commits wire this into capture/input/lock_state.
+
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         path = %config_path.display(),

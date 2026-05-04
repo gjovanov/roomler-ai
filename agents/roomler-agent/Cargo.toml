@@ -250,6 +250,25 @@ full = ["media", "enigo-input", "clipboard"]
 # Everything needed including the MF hardware encoder. Production
 # Windows MSI builds with this.
 full-hw = ["full", "mf-encoder", "wgc-capture", "viewer-indicator"]
+# M3 A1 — SYSTEM-context capture+input on the secure desktop. Lets
+# the perMachine MSI deployment drive the Windows lock screen / UAC
+# prompt by spawning a worker via stolen winlogon.exe primary-token
+# (see `agents/roomler-agent/src/system_context/`). Off by default.
+# The perMachine MSI build sets `--features full-hw,system-context`;
+# the perUser MSI never compiles any of this.
+#
+# Empirically validated on PC50045 2026-05-04 via the M3 A1 pre-flight
+# probe binary — see HANDOVER12.md and memory
+# `project_m3_a1_preflights_2_3_5.md`. Architecture: DXGI Desktop
+# Duplication + winlogon-token spawn + LocalSystem SCM service +
+# lazy-rebind SetThreadDesktop on input. Replicates RustDesk's
+# pattern; no kernel driver, no undocumented APIs.
+#
+# Windows-only by construction (the underlying FFI is Win32-specific).
+# Selecting this feature on non-Windows leaves all the modules
+# `#[cfg(target_os = "windows")]`-gated so the build stays green;
+# nothing reaches user code.
+system-context = []
 
 [dev-dependencies]
 tokio-test = { workspace = true }
