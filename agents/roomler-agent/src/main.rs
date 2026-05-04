@@ -110,6 +110,23 @@ enum Command {
         #[arg(long, default_value_t = 5000)]
         timeout_ms: u32,
     },
+    /// M3 A1 derisking probes (Pre-flight #2/#3/#5 from
+    /// `docs/plans/m3-a1.md` / memory `project_m3_a1_*.md`). Three
+    /// modes:
+    ///   - `winlogon-token`: confirm OpenProcessToken(winlogon.exe) +
+    ///     CreateProcessAsUserW spawns SYSTEM-in-active-session child.
+    ///     Run via `psexec -s -i 1 ...exe system-context-probe winlogon-token`.
+    ///   - `winsta-attach`: prove SetProcessWindowStation(WinSta0) is
+    ///     required before OpenDesktopW("Winlogon"|"Default") from a
+    ///     SYSTEM service. Run via `psexec -s -i 0 ...`.
+    ///   - `dxgi-cadence`: instrument scrap::Capturer over 30 s on
+    ///     a static desktop; reports outcome distribution. Runs in
+    ///     user context, no psexec needed.
+    SystemContextProbe {
+        /// Which probe to run: `winlogon-token` / `winsta-attach` /
+        /// `dxgi-cadence`.
+        mode: String,
+    },
     /// Run the capability probe that populates `rc:agent.hello` and
     /// print the result. Useful for verifying what codecs the agent
     /// will actually advertise on this host (the HEVC + AV1 probes
@@ -240,6 +257,7 @@ async fn main() -> Result<()> {
             frames,
             timeout_ms,
         } => system_capture_smoke_cmd(&desktop, frames, timeout_ms),
+        Command::SystemContextProbe { mode } => system_context_probe_cmd(&mode),
         Command::Caps => caps_cmd().await,
         Command::Displays => displays_cmd().await,
         Command::Service { action } => service_cmd(action).await,
@@ -908,6 +926,23 @@ fn system_capture_smoke_cmd(_desktop_raw: &str, _frames: u32, _timeout_ms: u32) 
         "`system-capture-smoke` requires Windows + the `wgc-capture` feature. \
          Rebuild with `cargo build -p roomler-agent --release --features full-hw`."
     );
+}
+
+/// `system-context-probe` CLI dispatch (M3 A1 Pre-flight #2/#3/#5).
+/// Synchronous like `system-capture-smoke` because the probes touch
+/// Win32 desktop / token state that is per-thread.
+#[cfg(target_os = "windows")]
+fn system_context_probe_cmd(mode_raw: &str) -> Result<()> {
+    use roomler_agent::win_service::system_context_probe::{self, ProbeMode};
+    use std::str::FromStr;
+    let mode = ProbeMode::from_str(mode_raw)
+        .map_err(|e| anyhow::anyhow!("bad probe mode {mode_raw:?}: {e}"))?;
+    system_context_probe::run(mode)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn system_context_probe_cmd(_mode_raw: &str) -> Result<()> {
+    bail!("`system-context-probe` is Windows-only.");
 }
 
 async fn caps_cmd() -> Result<()> {
