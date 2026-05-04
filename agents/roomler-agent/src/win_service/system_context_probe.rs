@@ -71,9 +71,8 @@ use windows_sys::Win32::System::RemoteDesktop::{
     WTSEnumerateSessionsW, WTSFreeMemory,
 };
 use windows_sys::Win32::System::StationsAndDesktops::{
-    CloseDesktop, CloseWindowStation, DESKTOP_SWITCHDESKTOP, GetProcessWindowStation,
-    GetUserObjectInformationW, HDESK, OpenDesktopW, OpenWindowStationW, SetProcessWindowStation,
-    UOI_NAME,
+    CloseDesktop, CloseWindowStation, GetProcessWindowStation, GetUserObjectInformationW, HDESK,
+    OpenDesktopW, OpenWindowStationW, SetProcessWindowStation, UOI_NAME,
 };
 use windows_sys::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, OpenProcess,
@@ -512,14 +511,13 @@ unsafe fn attach_to_winsta0() -> Result<()> {
 fn open_desktop_w(name: &str) -> Result<HDESK> {
     let mut wide: Vec<u16> = OsStr::new(name).encode_wide().collect();
     wide.push(0);
-    let h = unsafe {
-        OpenDesktopW(
-            wide.as_ptr(),
-            0,
-            FALSE,
-            GENERIC_READ | DESKTOP_SWITCHDESKTOP,
-        )
-    };
+    // GENERIC_READ only — DESKTOP_SWITCHDESKTOP requires SE_TCB_NAME
+    // which non-SYSTEM callers don't have. The probe doesn't switch
+    // desktops, just reads the name and (for the SYSTEM-context path
+    // later) attaches via SetThreadDesktop, both of which fit inside
+    // GENERIC_READ. See desktop.rs::open_desktop_by_name for the
+    // 0.2.0–0.2.6 input-regression rationale.
+    let h = unsafe { OpenDesktopW(wide.as_ptr(), 0, FALSE, GENERIC_READ) };
     if h.is_null() {
         let err = unsafe { GetLastError() };
         bail!("OpenDesktopW({name:?}) win32 error {err}");
