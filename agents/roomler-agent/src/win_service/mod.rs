@@ -32,6 +32,7 @@
 pub mod capture_smoke;
 pub mod desktop;
 pub mod supervisor;
+pub mod system_context_probe;
 
 use anyhow::{Context, Result, bail};
 use std::ffi::OsString;
