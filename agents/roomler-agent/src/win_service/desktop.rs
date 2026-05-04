@@ -31,8 +31,8 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ACCESS_DENIED, FALSE, GENERIC_READ, GetLastError, HANDLE,
 };
 use windows_sys::Win32::System::StationsAndDesktops::{
-    CloseDesktop, DESKTOP_SWITCHDESKTOP, GetThreadDesktop, GetUserObjectInformationW, HDESK,
-    OpenDesktopW, OpenInputDesktop, SetThreadDesktop, UOI_NAME,
+    CloseDesktop, GetThreadDesktop, GetUserObjectInformationW, HDESK, OpenDesktopW,
+    OpenInputDesktop, SetThreadDesktop, UOI_NAME,
 };
 
 /// RAII for `HDESK`. Calls `CloseDesktop` on drop. The handle returned
@@ -68,26 +68,28 @@ impl Drop for OwnedDesktop {
     }
 }
 
-/// `OpenDesktopW("<name>", 0, FALSE, GENERIC_READ | DESKTOP_SWITCHDESKTOP)`.
-/// `name` is the desktop name relative to the calling thread's window
-/// station, e.g. `"Default"` or `"Winlogon"`. Returns `Ok(None)` and a
-/// debug log when access is denied so the caller can decide whether to
-/// fall back to a different strategy (the user-context worker can't
-/// open Winlogon; SYSTEM can).
+/// `OpenDesktopW("<name>", 0, FALSE, GENERIC_READ)`. `name` is the
+/// desktop name relative to the calling thread's window station, e.g.
+/// `"Default"` or `"Winlogon"`. Returns `Ok(None)` and a debug log
+/// when access is denied so the caller can decide whether to fall
+/// back to a different strategy (the user-context worker can't open
+/// Winlogon; SYSTEM can).
+///
+/// Access mask is `GENERIC_READ` only — `DESKTOP_SWITCHDESKTOP`
+/// requires `SE_TCB_NAME` privilege which is reserved for SYSTEM /
+/// LocalService / NetworkService and which non-SYSTEM callers
+/// (including admins) do NOT have. Requesting it false-fails the
+/// open under user context with `ACCESS_DENIED`, which is the bug
+/// that bricked input on agents 0.2.0–0.2.6 (see
+/// `project_input_regression_0_2_x.md`). The codebase never calls
+/// `SwitchDesktop`, so the right was always dead weight.
 pub fn open_desktop_by_name(name: &str) -> Result<Option<OwnedDesktop>> {
     let mut wide: Vec<u16> = name.encode_utf16().collect();
     wide.push(0);
     // SAFETY: `wide` is a NUL-terminated UTF-16 buffer alive for the
     // call. The remaining args are documented constants. Out-error is
     // checked via GetLastError immediately.
-    let h: HDESK = unsafe {
-        OpenDesktopW(
-            wide.as_ptr(),
-            0,
-            FALSE,
-            GENERIC_READ | DESKTOP_SWITCHDESKTOP,
-        )
-    };
+    let h: HDESK = unsafe { OpenDesktopW(wide.as_ptr(), 0, FALSE, GENERIC_READ) };
     if h.is_null() {
         // SAFETY: GetLastError is a thread-local read.
         let err = unsafe { GetLastError() };
@@ -103,15 +105,22 @@ pub fn open_desktop_by_name(name: &str) -> Result<Option<OwnedDesktop>> {
     Ok(OwnedDesktop::new(h))
 }
 
-/// `OpenInputDesktop(0, FALSE, GENERIC_READ | DESKTOP_SWITCHDESKTOP)`.
-/// Returns the desktop currently receiving input (which on a typical
-/// Win11 host swaps between `Default` and `Winlogon` as the user
-/// locks/unlocks, hits Ctrl+Alt+Del, or accepts a UAC prompt).
-/// Returns `Ok(None)` on access denied.
+/// `OpenInputDesktop(0, FALSE, GENERIC_READ)`. Returns the desktop
+/// currently receiving input (which on a typical Win11 host swaps
+/// between `Default` and `Winlogon` as the user locks/unlocks, hits
+/// Ctrl+Alt+Del, or accepts a UAC prompt). Returns `Ok(None)` on
+/// access denied.
+///
+/// Access mask is `GENERIC_READ` only — see `open_desktop_by_name`
+/// for the full rationale (TL;DR: `DESKTOP_SWITCHDESKTOP` requires
+/// `SE_TCB_NAME` which non-SYSTEM callers lack, and we never call
+/// `SwitchDesktop`). This call is the lock-state probe's hot path:
+/// requesting the privileged right made it false-positive `Locked`
+/// for every user-context worker, dropping all input.
 pub fn open_input_desktop() -> Result<Option<OwnedDesktop>> {
     // SAFETY: zero flags is a documented call form; out-error is
     // checked.
-    let h: HDESK = unsafe { OpenInputDesktop(0, FALSE, GENERIC_READ | DESKTOP_SWITCHDESKTOP) };
+    let h: HDESK = unsafe { OpenInputDesktop(0, FALSE, GENERIC_READ) };
     if h.is_null() {
         // SAFETY: GetLastError is a thread-local read.
         let err = unsafe { GetLastError() };
@@ -303,5 +312,67 @@ mod tests {
         // into a faster value that burns CPU or a slower one that
         // makes the black-frame gap user-perceptible.
         assert_eq!(INPUT_DESKTOP_POLL_INTERVAL, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn open_input_desktop_does_not_request_switch_privilege() {
+        // P0 regression guard for 0.2.0–0.2.6.
+        //
+        // The privileged DesktopSwitch right requires SE_TCB_NAME,
+        // reserved for SYSTEM / NetworkService / LocalService. Even
+        // local administrators don't have it. Requesting it from a
+        // user-context caller (the perUser MSI agent) makes
+        // `OpenInputDesktop` fail with ACCESS_DENIED, which the
+        // lock-state monitor translates to `Locked` permanently —
+        // dropping every input event and substituting the lock-overlay
+        // capture frame. The codebase never calls SwitchDesktop, so
+        // the right is dead weight.
+        //
+        // Field repro: PC50045 / e069019l 2026-05-04. Fixed in 0.2.7.
+        // Memory: project_input_regression_0_2_x.md.
+        //
+        // Needle is the bitwise-or call-site fragment (pipe + space +
+        // identifier), built via concat! so this test's own source
+        // doesn't contain the contiguous identifier and trip itself.
+        // Prose mentions of the constant in comments don't have a
+        // leading pipe, so the needle is targeted at the call sites
+        // and imports that actually broke input.
+        let needle = concat!("| ", "DESKTOP_SWITCH", "DESKTOP");
+        let src = include_str!("desktop.rs");
+        assert!(
+            !src.contains(needle),
+            "the privileged DesktopSwitch right is back in desktop.rs \
+             call sites — re-introduces the 0.2.0–0.2.6 input \
+             regression. Use GENERIC_READ alone."
+        );
+        // Also block the import form, e.g. `use ... ::{... DESKTOP_SWITCHDESKTOP, ...};`.
+        let import_needle = concat!(", ", "DESKTOP_SWITCH", "DESKTOP", ",");
+        assert!(
+            !src.contains(import_needle),
+            "import of the privileged DesktopSwitch right is back in \
+             desktop.rs — drop it from the windows-sys import list."
+        );
+    }
+
+    #[test]
+    fn system_context_probe_does_not_request_switch_privilege() {
+        // Sibling lock for the M3 spike binary. Same rationale as
+        // open_input_desktop_does_not_request_switch_privilege above.
+        let needle = concat!("| ", "DESKTOP_SWITCH", "DESKTOP");
+        let src = include_str!("system_context_probe.rs");
+        assert!(
+            !src.contains(needle),
+            "the privileged DesktopSwitch right is back in \
+             system_context_probe.rs call sites — re-introduces the \
+             0.2.0–0.2.6 input regression in code paths derived from \
+             the spike binary"
+        );
+        let import_needle = concat!(", ", "DESKTOP_SWITCH", "DESKTOP", ",");
+        assert!(
+            !src.contains(import_needle),
+            "import of the privileged DesktopSwitch right is back in \
+             system_context_probe.rs — drop it from the windows-sys \
+             import list."
+        );
     }
 }
