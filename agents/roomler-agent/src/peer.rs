@@ -466,13 +466,42 @@ impl AgentPeer {
             }));
         }
 
-        // PC state → logs + fatal Terminate on Failed.
+        // PC state → logs + fatal Terminate on Failed + cross-process
+        // peer-presence marker for the M3 A1 supervisor.
+        //
+        // The marker file (`%PROGRAMDATA%\roomler-agent\
+        // peer-connected.lock`) is the supervisor's signal for
+        // "swap user-context worker for SystemContext worker
+        // because a controller is currently driving this host".
+        // See `system_context::peer_presence` for the contract.
+        // On `Connected` we touch the marker (and the periodic
+        // refresher task below keeps the mtime fresh); on
+        // `Disconnected` / `Closed` / `Failed` we remove it so the
+        // supervisor's next cycle reverts to the user-context arm.
         {
             let tx = outbound.clone();
             pc.on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
                 info!(session = %session_id, state = ?s, "PC state change");
                 let tx = tx.clone();
                 Box::pin(async move {
+                    #[cfg(all(feature = "system-context", target_os = "windows"))]
+                    {
+                        match s {
+                            RTCPeerConnectionState::Connected => {
+                                if let Err(e) = crate::system_context::peer_presence::signal_connected() {
+                                    tracing::warn!(%e, "peer_presence::signal_connected failed — supervisor cannot swap to SystemContext worker");
+                                }
+                            }
+                            RTCPeerConnectionState::Disconnected
+                            | RTCPeerConnectionState::Closed
+                            | RTCPeerConnectionState::Failed => {
+                                if let Err(e) = crate::system_context::peer_presence::signal_disconnected() {
+                                    tracing::debug!(%e, "peer_presence::signal_disconnected — already gone or unreachable");
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                     if matches!(s, RTCPeerConnectionState::Failed) {
                         let _ = tx
                             .send(ClientMsg::Terminate {
@@ -483,6 +512,42 @@ impl AgentPeer {
                     }
                 })
             }));
+        }
+
+        // M3 A1 peer-presence heartbeat. Refreshes the marker file's
+        // mtime every 5 s while the WebRTC peer is in `Connected`
+        // state; the supervisor's `is_signaled` returns false once
+        // the file's mtime is older than `PRESENCE_MAX_AGE` (15 s).
+        // This task is spawned once per session and exits when the
+        // peer connection drops or fails — its `Arc<RTCPeerConnection>`
+        // weak-clone won't keep the connection alive.
+        #[cfg(all(feature = "system-context", target_os = "windows"))]
+        {
+            let pc_for_heartbeat = std::sync::Arc::downgrade(&pc);
+            tokio::spawn(async move {
+                use crate::system_context::peer_presence;
+                let mut tick = tokio::time::interval(peer_presence::HEARTBEAT_INTERVAL);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tick.tick().await;
+                    let Some(pc) = pc_for_heartbeat.upgrade() else {
+                        // Peer connection dropped; remove the marker
+                        // so the supervisor doesn't see a stale
+                        // "connected" signal until PRESENCE_MAX_AGE
+                        // expires.
+                        let _ = peer_presence::signal_disconnected();
+                        return;
+                    };
+                    if matches!(
+                        pc.connection_state(),
+                        RTCPeerConnectionState::Connected
+                    ) {
+                        if let Err(e) = peer_presence::signal_connected() {
+                            tracing::warn!(%e, "peer_presence heartbeat write failed");
+                        }
+                    }
+                }
+            });
         }
 
         // Spawn the lock-screen monitor BEFORE wiring the data-channel
