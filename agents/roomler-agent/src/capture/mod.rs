@@ -129,6 +129,48 @@ impl ScreenCapture for NoopCapture {
 /// hardware encoder is handling the frame; pass `Auto` (the default)
 /// when the encoder is software openh264.
 pub fn open_default(_target_fps: u32, _downscale: DownscalePolicy) -> Box<dyn ScreenCapture> {
+    // M3 A1: when the worker is running as SYSTEM (LocalSystem,
+    // S-1-5-18) — i.e. spawned by the SCM service via
+    // `winlogon_token::spawn_system_in_session` — WGC's WinRT
+    // activation chain returns `0x80070424 (ERROR_SERVICE_DOES_NOT_
+    // EXIST)` because the activation service doesn't exist in
+    // session 0's namespace. Route directly to DXGI Desktop
+    // Duplication (with GDI BitBlt fallback) via the
+    // `system_context::capture_pump` bridge. User-context workers
+    // continue to take the WGC / scrap path below.
+    #[cfg(all(feature = "system-context", target_os = "windows"))]
+    {
+        use crate::system_context::worker_role::{WorkerRole, probe_self};
+        match probe_self() {
+            Ok(WorkerRole::SystemContext) => {
+                match crate::system_context::capture_pump::SystemContextCapture::primary(
+                    _target_fps,
+                    _downscale,
+                ) {
+                    Ok(c) => {
+                        tracing::info!(
+                            width = c.width(),
+                            height = c.height(),
+                            "capture: backend=system-context (DXGI + GDI fallback for SYSTEM-context worker)"
+                        );
+                        return Box::new(c);
+                    }
+                    Err(e) => {
+                        tracing::warn!(%e, "system-context capture init failed — falling back to standard backend cascade");
+                    }
+                }
+            }
+            Ok(WorkerRole::User) => {
+                // Normal path. Fall through to the WGC / scrap cascade
+                // below — same behaviour as a build without the
+                // `system-context` feature.
+            }
+            Err(e) => {
+                tracing::warn!(%e, "worker_role::probe_self failed — assuming user-context, falling through to standard cascade");
+            }
+        }
+    }
+
     // Windows: prefer WGC (captures HW cursors + supports dirty rects
     // on Win 11 22000+). Fall back to scrap (DXGI) if WGC init fails
     // — e.g. on Windows versions without the Graphics.Capture runtime
