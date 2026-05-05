@@ -291,15 +291,25 @@ jobs:
       - name: Install cargo-wix
         run: cargo install cargo-wix --locked
 
-      - name: Build agent (release, full-hw + vp9-444)
+      - name: Build agent (release, full-hw + vp9-444 + system-context)
         # `vp9-444` (without `-bindgen`) uses env-libvpx-sys's
         # pre-generated FFI — no libclang invocation, no
         # forward-decl-opaque issue. pkg-config still has to find
         # `vpx.pc` (which the vcpkg step exported via PKG_CONFIG_PATH);
         # the linker resolves vpx.lib from the pkg-config-emitted
         # `-L`. No INCLUDE / vcvars dance needed.
+        #
+        # `system-context` (added 0.3.0) compiles the M3 A1 SYSTEM-
+        # context worker plumbing: DXGI Desktop Duplication backend,
+        # GDI BitBlt fallback, SetThreadDesktop input rebind, and
+        # winlogon-token spawn. The perMachine MSI's SCM service
+        # exercises this code path to drive the lock screen / UAC.
+        # The perUser MSI gets the same binary but `worker_role::
+        # probe_self()` returns `User` (perUser is never spawned as
+        # LocalSystem) so none of the SystemContext code ever fires
+        # — the perUser path stays exactly as it was in 0.2.7.
         shell: pwsh
-        run: cargo build -p roomler-agent --release --features "full-hw,vp9-444"
+        run: cargo build -p roomler-agent --release --features "full-hw,vp9-444,system-context"
 
       - name: Stage vpx.dll alongside agent binary (if not statically linked)
         shell: pwsh
