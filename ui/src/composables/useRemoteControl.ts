@@ -1998,6 +1998,9 @@ export function useRemoteControl() {
       ch.addEventListener('message', onMessage)
 
       try {
+        if (ch.readyState !== 'open') {
+          throw new Error('files channel closed before files:begin could be sent')
+        }
         ch.send(JSON.stringify({
           t: 'files:begin',
           id,
@@ -2013,19 +2016,50 @@ export function useRemoteControl() {
 
       const CHUNK = 64 * 1024
       let offset = 0
+      // Convert raw browser DOMException ("Failed to execute 'send' on
+      // 'RTCDataChannel': RTCDataChannel.readyState is not 'open'")
+      // into a useful message that names the actual cause: the agent
+      // disconnected mid-upload. Most common for agent-MSI uploads
+      // because the receiving agent self-upgrades, which tears down
+      // the WebRTC peer (and therefore every data channel) before the
+      // upload finishes.
+      const channelClosedError = () => {
+        const pct = file.size === 0 ? 100 : Math.round((offset / file.size) * 100)
+        return new Error(
+          `files channel closed mid-upload at ${pct}% (${offset}/${file.size} bytes). ` +
+            `Most likely the remote agent restarted (auto-update / crash / network drop). ` +
+            `Reconnect and retry.`
+        )
+      }
       const pump = async () => {
         try {
           while (offset < file.size) {
             // Back off when the sctp buffer starts filling up so the
             // browser doesn't OOM on huge files.
             while (ch.bufferedAmount > 4 * 1024 * 1024) {
+              if (ch.readyState !== 'open') {
+                throw channelClosedError()
+              }
               await new Promise((r) => setTimeout(r, 20))
+            }
+            // Recheck readyState before each send: the channel can
+            // transition out of 'open' at any await point above, and
+            // raw `ch.send(buf)` on a closed channel throws a generic
+            // DOMException that obscures the real cause.
+            if (ch.readyState !== 'open') {
+              throw channelClosedError()
             }
             const end = Math.min(offset + CHUNK, file.size)
             const slice = file.slice(offset, end)
             const buf = await slice.arrayBuffer()
+            if (ch.readyState !== 'open') {
+              throw channelClosedError()
+            }
             ch.send(buf)
             offset = end
+          }
+          if (ch.readyState !== 'open') {
+            throw channelClosedError()
           }
           ch.send(JSON.stringify({ t: 'files:end', id }))
         } catch (e) {
