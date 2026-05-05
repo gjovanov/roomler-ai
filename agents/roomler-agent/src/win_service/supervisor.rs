@@ -831,7 +831,9 @@ pub fn run(
                     let child = winlogon_token::spawn_system_in_session(&token, &cmdline)
                         .context("spawn_system_in_session")?;
                     let (process, thread, child_pid, _child_sid) = child.into_raw_parts();
-                    Ok(Some(OwnedProcess::from_raw_parts(process, thread, child_pid)))
+                    Ok(Some(OwnedProcess::from_raw_parts(
+                        process, thread, child_pid,
+                    )))
                 })();
                 match res {
                     Ok(Some(p)) => {

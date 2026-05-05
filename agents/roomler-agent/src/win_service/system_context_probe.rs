@@ -124,7 +124,9 @@ pub fn run(mode: ProbeMode) -> Result<()> {
 
 fn run_winlogon_token() -> Result<()> {
     println!("\n--- winlogon-token probe ---");
-    println!("Goal: confirm OpenProcessToken(winlogon.exe) + DuplicateTokenEx + CreateProcessAsUserW");
+    println!(
+        "Goal: confirm OpenProcessToken(winlogon.exe) + DuplicateTokenEx + CreateProcessAsUserW"
+    );
     println!("      spawns a SYSTEM-in-session-N child without AdjustTokenPrivileges.");
 
     // Step 1: confirm we're SYSTEM. Cheap check via the impersonation
@@ -190,8 +192,8 @@ fn run_winlogon_token() -> Result<()> {
     // Read as bytes + lossy-convert so non-UTF-8 bytes don't bomb the
     // verdict line — the SID hex string we're sniffing for is ASCII
     // either way.
-    let raw = std::fs::read(&probe_out)
-        .with_context(|| format!("reading {}", probe_out.display()))?;
+    let raw =
+        std::fs::read(&probe_out).with_context(|| format!("reading {}", probe_out.display()))?;
     let body = String::from_utf8_lossy(&raw);
     println!("\n--- child whoami output (lossy UTF-8) ---\n{body}---");
 
@@ -224,14 +226,7 @@ fn find_active_session() -> Result<u32> {
     unsafe {
         let mut sessions: *mut WTS_SESSION_INFOW = std::ptr::null_mut();
         let mut count: u32 = 0;
-        if WTSEnumerateSessionsW(
-            WTS_CURRENT_SERVER_HANDLE,
-            0,
-            1,
-            &mut sessions,
-            &mut count,
-        ) == 0
-        {
+        if WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &mut sessions, &mut count) == 0 {
             bail!("WTSEnumerateSessions failed: {}", GetLastError());
         }
         let slice = std::slice::from_raw_parts(sessions, count as usize);
@@ -265,8 +260,7 @@ fn find_winlogon_pid_in_session(target_session: u32) -> Result<Option<u32>> {
             let name_lower = wchar_to_string(&entry.szExeFile).to_lowercase();
             if name_lower == "winlogon.exe" {
                 let mut sid: u32 = 0;
-                if ProcessIdToSessionId(entry.th32ProcessID, &mut sid) != 0
-                    && sid == target_session
+                if ProcessIdToSessionId(entry.th32ProcessID, &mut sid) != 0 && sid == target_session
                 {
                     CloseHandle(snap);
                     return Ok(Some(entry.th32ProcessID));
@@ -409,7 +403,9 @@ unsafe fn spawn_with_token(token: HANDLE, cmdline: &str) -> Result<ChildResult> 
 
 fn run_winsta_attach() -> Result<()> {
     println!("\n--- winsta-attach probe ---");
-    println!("Goal: confirm OpenDesktopW(\"Winlogon\") fails before SetProcessWindowStation(WinSta0)");
+    println!(
+        "Goal: confirm OpenDesktopW(\"Winlogon\") fails before SetProcessWindowStation(WinSta0)"
+    );
     println!("      and succeeds after.");
 
     let initial_winsta = current_window_station_name();
@@ -482,7 +478,9 @@ fn run_winsta_attach() -> Result<()> {
     }
 
     println!("\nVERDICT: PASS — WinSta0 attach gates Winlogon access as expected.");
-    println!("Pre-flight #3 confirmed: SYSTEM-context worker bootstrap MUST attach to WinSta0 before");
+    println!(
+        "Pre-flight #3 confirmed: SYSTEM-context worker bootstrap MUST attach to WinSta0 before"
+    );
     println!("any OpenDesktopW(\"Default\"|\"Winlogon\") call.");
     Ok(())
 }
@@ -533,13 +531,7 @@ fn current_window_station_name() -> String {
         }
         // Query required size.
         let mut needed: u32 = 0;
-        GetUserObjectInformationW(
-            h as *mut _,
-            UOI_NAME,
-            std::ptr::null_mut(),
-            0,
-            &mut needed,
-        );
+        GetUserObjectInformationW(h as *mut _, UOI_NAME, std::ptr::null_mut(), 0, &mut needed);
         if needed == 0 {
             return "<unknown>".into();
         }
@@ -607,9 +599,7 @@ fn run_dxgi_cadence() -> Result<()> {
                 ErrorKind::InvalidData => counts.invalid_call += 1,
                 _ => {
                     counts.other += 1;
-                    counts
-                        .other_samples
-                        .push(format!("{:?}: {}", e.kind(), e));
+                    counts.other_samples.push(format!("{:?}: {}", e.kind(), e));
                 }
             },
         }
@@ -629,14 +619,38 @@ fn run_dxgi_cadence() -> Result<()> {
         avg_per_sec
     );
     println!("  Ok                    = {}", counts.ok);
-    println!("  WouldBlock            = {}  (TimedOut, translated by scrap wrapper)", counts.would_block);
-    println!("  TimedOut (raw)        = {}  (should be 0 on Windows)", counts.timed_out);
-    println!("  ConnectionReset       = {}  (DXGI_ERROR_ACCESS_LOST)", counts.access_lost);
-    println!("  PermissionDenied      = {}  (E_ACCESSDENIED)", counts.access_denied);
-    println!("  ConnectionAborted     = {}  (DXGI_ERROR_SESSION_DISCONNECTED)", counts.session_disconnected);
-    println!("  Interrupted           = {}  (DXGI_ERROR_NOT_CURRENTLY_AVAILABLE)", counts.interrupted);
-    println!("  ConnectionRefused     = {}  (DXGI_ERROR_UNSUPPORTED)", counts.unsupported);
-    println!("  InvalidData           = {}  (DXGI_ERROR_INVALID_CALL)", counts.invalid_call);
+    println!(
+        "  WouldBlock            = {}  (TimedOut, translated by scrap wrapper)",
+        counts.would_block
+    );
+    println!(
+        "  TimedOut (raw)        = {}  (should be 0 on Windows)",
+        counts.timed_out
+    );
+    println!(
+        "  ConnectionReset       = {}  (DXGI_ERROR_ACCESS_LOST)",
+        counts.access_lost
+    );
+    println!(
+        "  PermissionDenied      = {}  (E_ACCESSDENIED)",
+        counts.access_denied
+    );
+    println!(
+        "  ConnectionAborted     = {}  (DXGI_ERROR_SESSION_DISCONNECTED)",
+        counts.session_disconnected
+    );
+    println!(
+        "  Interrupted           = {}  (DXGI_ERROR_NOT_CURRENTLY_AVAILABLE)",
+        counts.interrupted
+    );
+    println!(
+        "  ConnectionRefused     = {}  (DXGI_ERROR_UNSUPPORTED)",
+        counts.unsupported
+    );
+    println!(
+        "  InvalidData           = {}  (DXGI_ERROR_INVALID_CALL)",
+        counts.invalid_call
+    );
     println!("  Other                 = {}", counts.other);
     if !counts.other_samples.is_empty() {
         println!("    other samples (first 5):");

@@ -225,8 +225,7 @@ fn capture_virtual_desktop(width: u32, height: u32) -> io::Result<GdiFrame> {
     // Bitmap compatible with the screen DC, sized to the virtual
     // desktop.
     // SAFETY: src_dc valid; w/h positive (checked above).
-    let bitmap: HBITMAP =
-        unsafe { CreateCompatibleBitmap(src_dc, width as i32, height as i32) };
+    let bitmap: HBITMAP = unsafe { CreateCompatibleBitmap(src_dc, width as i32, height as i32) };
     if bitmap.is_null() {
         return Err(io::Error::other(format!(
             "CreateCompatibleBitmap({width}x{height}) returned null: {}",
