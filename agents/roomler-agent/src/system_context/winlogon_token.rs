@@ -156,6 +156,26 @@ impl ChildHandle {
     pub fn process_handle(&self) -> HANDLE {
         self.process
     }
+
+    /// Disown the handles and return them as a `(process, thread,
+    /// pid, session_id)` tuple. The caller takes responsibility for
+    /// `CloseHandle`-ing both — typically by re-wrapping into a
+    /// different RAII type that owns the lifetime (e.g. the
+    /// supervisor's [`crate::win_service::supervisor::OwnedProcess`]
+    /// for compatibility with the existing user-context worker
+    /// wait/terminate logic).
+    ///
+    /// `mem::forget`'s the `ChildHandle` so its Drop doesn't
+    /// double-close the handles. Safe because the returned tuple
+    /// is a strict transfer of ownership.
+    pub fn into_raw_parts(self) -> (HANDLE, HANDLE, u32, u32) {
+        let process = self.process;
+        let thread = self.thread;
+        let pid = self.pid;
+        let session_id = self.session_id;
+        std::mem::forget(self);
+        (process, thread, pid, session_id)
+    }
 }
 
 impl Drop for ChildHandle {
