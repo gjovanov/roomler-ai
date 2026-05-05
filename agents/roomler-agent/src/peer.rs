@@ -528,6 +528,8 @@ impl AgentPeer {
                 use crate::system_context::peer_presence;
                 let mut tick = tokio::time::interval(peer_presence::HEARTBEAT_INTERVAL);
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let mut ticks: u64 = 0;
+                let mut had_success = false;
                 loop {
                     tick.tick().await;
                     let Some(pc) = pc_for_heartbeat.upgrade() else {
@@ -539,8 +541,35 @@ impl AgentPeer {
                         return;
                     };
                     if matches!(pc.connection_state(), RTCPeerConnectionState::Connected) {
-                        if let Err(e) = peer_presence::signal_connected() {
-                            tracing::warn!(%e, "peer_presence heartbeat write failed");
+                        match peer_presence::signal_connected() {
+                            Ok(()) => {
+                                ticks = ticks.saturating_add(1);
+                                // Log the FIRST successful write loudly
+                                // so a "supervisor never sees marker"
+                                // investigation can immediately rule
+                                // out "worker never wrote it". After
+                                // that, every 12th tick (~60 s) so
+                                // the log stays clean during a long
+                                // session.
+                                if !had_success {
+                                    let path = peer_presence::marker_path().display().to_string();
+                                    tracing::info!(
+                                        marker_path = %path,
+                                        "peer_presence: first heartbeat written successfully"
+                                    );
+                                    had_success = true;
+                                } else if ticks.is_multiple_of(12) {
+                                    tracing::debug!(ticks, "peer_presence: heartbeat still alive");
+                                }
+                            }
+                            Err(e) => {
+                                let path = peer_presence::marker_path().display().to_string();
+                                tracing::warn!(
+                                    %e,
+                                    marker_path = %path,
+                                    "peer_presence heartbeat write failed — supervisor cannot swap to SystemContext worker"
+                                );
+                            }
                         }
                     }
                 }
