@@ -352,16 +352,22 @@ pub enum SpawnDecision {
     /// alive (no peer connection on this host). Tear down the
     /// worker fully and idle until LOGON.
     Idle,
-    /// No active console session BUT we want to keep the stream
-    /// alive — e.g. the user signed out / locked the host while a
-    /// browser controller is mid-session. M3's SYSTEM-context
-    /// capture+input thread takes over here, painting either a
-    /// real frame from `winsta0\Winlogon` (path A1, requires WGC
-    /// session-0 capture to work) or a static "host is locked"
-    /// overlay (path Z, always works). The browser's WebRTC peer
-    /// stays connected throughout — only the encoder source
-    /// changes underneath.
-    SystemContextCapture,
+    /// Spawn a SYSTEM-context worker via the M3 A1 winlogon-token
+    /// pipeline targeting the carried session id. The browser's
+    /// WebRTC peer stays connected throughout the swap — only the
+    /// encoder source + token-identity change underneath.
+    ///
+    /// The carried `u32` is the target interactive session for
+    /// `winlogon.exe` lookup. Today this fires when the active
+    /// session disappears mid-stream (full sign-out / fast-user-
+    /// switch with controller still connected); the carried id is
+    /// the LAST observed active session, which remains the right
+    /// target while the supervisor waits for a new logon. Once the
+    /// worker reports its lock-state via the heartbeat pipe, this
+    /// variant will also fire when the active session is on
+    /// `winsta0\Winlogon` (operator on the lock screen), which is
+    /// the M3 A1 primary use case.
+    SpawnSystemInSession(u32),
 }
 
 /// Decide what the supervisor should do given the current world
@@ -371,14 +377,26 @@ pub enum SpawnDecision {
 /// `false` (M3 not yet wired); once `system_worker.rs` lands,
 /// the supervisor will set it to `true` whenever a peer connection
 /// is observed alive on the running worker, then `false` again
-/// once the worker exits / disconnects. Pure: easy to unit-test.
+/// once the worker exits / disconnects.
+///
+/// The fourth parameter — `last_active_session` — is the most
+/// recent `Some(active)` the supervisor observed. Used only by the
+/// `(None, _) if keep_stream_alive` branch as the target session id
+/// for the SYSTEM-context spawn — without it we have no session
+/// reference at all and the only sane fallback is Idle.
+///
+/// Pure: easy to unit-test.
 pub fn decide_spawn(
     active_session: Option<u32>,
     current_worker_session: Option<u32>,
     keep_stream_alive: bool,
+    last_active_session: Option<u32>,
 ) -> SpawnDecision {
     match (active_session, current_worker_session) {
-        (None, _) if keep_stream_alive => SpawnDecision::SystemContextCapture,
+        (None, _) if keep_stream_alive => match last_active_session {
+            Some(s) => SpawnDecision::SpawnSystemInSession(s),
+            None => SpawnDecision::Idle,
+        },
         (None, _) => SpawnDecision::Idle,
         (Some(active), Some(current)) if active == current => SpawnDecision::KeepCurrent,
         (Some(active), _) => SpawnDecision::SpawnIn(active),
@@ -452,6 +470,15 @@ pub fn run(
     let mut current_session: Option<u32> = None;
     let mut consecutive_failures: u32 = 0;
     let mut respawn_at: Option<Instant> = None;
+    // Most recent active console session id observed. Used by
+    // `decide_spawn`'s SpawnSystemInSession arm when the active
+    // session disappears mid-stream (sign-out / fast-user-switch
+    // with controller still connected). The supervisor's only
+    // session-id memory; current_session can also serve but it's
+    // cleared aggressively on worker termination, whereas
+    // `last_active_session` is a longer memory of "who was here
+    // last".
+    let mut last_active_session: Option<u32> = None;
 
     loop {
         // Drain pending events without blocking, so a flurry of
@@ -530,15 +557,19 @@ pub fn run(
             }
         }
 
-        // Decide whether to spawn. M3 (system_worker) is not yet
-        // wired in — until then we always pass `keep_stream_alive=
-        // false` so logout returns `Idle` and tears the worker down,
-        // matching pre-M3 behaviour. Once `system_worker.rs` lands,
-        // this argument becomes `worker_has_active_peer.load()` from
-        // a shared atomic the worker writes when its peer connection
-        // is in `connected` state.
+        // Decide whether to spawn. M3 A1 system-context worker is not
+        // yet wired at the call site — until then we always pass
+        // `keep_stream_alive=false` so logout returns `Idle` and tears
+        // the worker down, matching pre-M3 behaviour. Once the
+        // worker → supervisor heartbeat pipe lands, this argument
+        // becomes `worker_has_active_peer.load()` from a shared
+        // atomic the worker writes while its peer connection is in
+        // `connected` state.
         let active = active_console_session_id();
-        let decision = decide_spawn(active, current_session, false);
+        if let Some(s) = active {
+            last_active_session = Some(s);
+        }
+        let decision = decide_spawn(active, current_session, false, last_active_session);
         let due_for_respawn = respawn_at.is_none_or(|t| Instant::now() >= t);
 
         match (decision, due_for_respawn) {
@@ -648,8 +679,17 @@ mod tests {
 
     #[test]
     fn decide_spawn_idles_when_no_active_session_and_no_stream() {
-        assert_eq!(decide_spawn(None, None, false), SpawnDecision::Idle);
-        assert_eq!(decide_spawn(None, Some(2), false), SpawnDecision::Idle);
+        // last_active_session doesn't matter when keep_stream_alive=false;
+        // either Some or None must give Idle.
+        assert_eq!(decide_spawn(None, None, false, None), SpawnDecision::Idle);
+        assert_eq!(
+            decide_spawn(None, Some(2), false, None),
+            SpawnDecision::Idle
+        );
+        assert_eq!(
+            decide_spawn(None, Some(2), false, Some(2)),
+            SpawnDecision::Idle
+        );
     }
 
     #[test]
@@ -657,11 +697,11 @@ mod tests {
         // keep_stream_alive doesn't matter here — the active session
         // exists and matches. Lock both branches.
         assert_eq!(
-            decide_spawn(Some(2), Some(2), false),
+            decide_spawn(Some(2), Some(2), false, Some(2)),
             SpawnDecision::KeepCurrent
         );
         assert_eq!(
-            decide_spawn(Some(2), Some(2), true),
+            decide_spawn(Some(2), Some(2), true, Some(2)),
             SpawnDecision::KeepCurrent
         );
     }
@@ -669,7 +709,7 @@ mod tests {
     #[test]
     fn decide_spawn_targets_active_session_when_no_worker() {
         assert_eq!(
-            decide_spawn(Some(2), None, false),
+            decide_spawn(Some(2), None, false, None),
             SpawnDecision::SpawnIn(2)
         );
     }
@@ -679,7 +719,7 @@ mod tests {
         // Worker is for session 2 but the active console moved to 5
         // (the previous user logged out, a new one logged in).
         assert_eq!(
-            decide_spawn(Some(5), Some(2), false),
+            decide_spawn(Some(5), Some(2), false, Some(2)),
             SpawnDecision::SpawnIn(5)
         );
     }
@@ -692,28 +732,44 @@ mod tests {
         // connection (keep_stream_alive=false), decide_spawn returns
         // Idle so the supervisor's "idle && current_worker.is_some()"
         // arm tears the worker down.
-        assert_eq!(decide_spawn(None, Some(2), false), SpawnDecision::Idle);
+        assert_eq!(
+            decide_spawn(None, Some(2), false, Some(2)),
+            SpawnDecision::Idle
+        );
     }
 
     #[test]
     fn decide_spawn_returns_system_context_when_session_disappears_with_active_peer() {
-        // M3: user logs out / locks while a browser controller is
+        // M3 A1: user logs out / locks while a browser controller is
         // mid-session. Previous behaviour was `Idle`, which tore the
         // peer connection down. New behaviour: hand off to the
         // SYSTEM-context capture+input thread so the stream stays
-        // alive (real Winlogon frames if WGC permits, static "host
-        // is locked" overlay otherwise). Both desktop transitions
-        // hit this arm — Win+L lock screen does NOT change
-        // WTSGetActiveConsoleSessionId so it stays as KeepCurrent;
-        // *full* sign-out makes the active session disappear and we
-        // land here.
+        // alive. The carried session id is the LAST observed active
+        // session (sign-out leaves session-2's winlogon.exe alive
+        // through the welcome screen, so spawning into 2 is the
+        // right target).
+        //
+        // Both desktop transitions hit this arm — Win+L lock screen
+        // does NOT change WTSGetActiveConsoleSessionId so it stays as
+        // KeepCurrent; *full* sign-out makes the active session
+        // disappear and we land here.
         assert_eq!(
-            decide_spawn(None, Some(2), true),
-            SpawnDecision::SystemContextCapture
+            decide_spawn(None, Some(2), true, Some(2)),
+            SpawnDecision::SpawnSystemInSession(2)
         );
+        // No prior session memory + active disappeared + stream alive
+        // → Idle (we have no spawn target). Supervisor in this corner
+        // is between SCM start and the first session observation,
+        // which is rare enough that Idle is acceptable.
         assert_eq!(
-            decide_spawn(None, None, true),
-            SpawnDecision::SystemContextCapture
+            decide_spawn(None, None, true, None),
+            SpawnDecision::Idle
+        );
+        // Same active=None + stream alive, but the supervisor remembers
+        // what session it just left → spawn into that.
+        assert_eq!(
+            decide_spawn(None, None, true, Some(7)),
+            SpawnDecision::SpawnSystemInSession(7)
         );
     }
 
