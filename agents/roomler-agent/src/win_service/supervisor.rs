@@ -273,6 +273,44 @@ pub struct OwnedProcess {
 }
 
 impl OwnedProcess {
+    /// Wrap raw process+thread HANDLEs that came from another
+    /// spawn pipeline (e.g. the M3 A1 winlogon-token path's
+    /// `ChildHandle::into_raw_parts`) into an `OwnedProcess` so
+    /// the existing supervisor poll/terminate logic can drive
+    /// either kind of worker uniformly.
+    ///
+    /// Caller transfers ownership: after this call, dropping the
+    /// returned `OwnedProcess` will `CloseHandle` both. Both
+    /// handles must be valid (non-null, non-INVALID_HANDLE_VALUE)
+    /// — Drop assumes ownership unconditionally and the new
+    /// constructor doesn't validate further.
+    ///
+    /// # Safety
+    ///
+    /// The HANDLEs must be:
+    /// 1. Valid Win32 process / thread handles the caller produced
+    ///    via a CreateProcess-family call.
+    /// 2. NOT shared with any other live owner that would also
+    ///    `CloseHandle` them — double-close is undefined behaviour.
+    ///
+    /// In practice the only caller is the M3 A1 spawn arm in
+    /// [`run`], which receives the handles from
+    /// `winlogon_token::ChildHandle::into_raw_parts` (which
+    /// `mem::forget`'s the original wrapper, transferring sole
+    /// ownership to the tuple).
+    ///
+    /// Gated behind `feature = "system-context"` because the only
+    /// caller is the M3 A1 spawn arm; without the feature this
+    /// would surface as a `dead_code` warning under `-D warnings`.
+    #[cfg(feature = "system-context")]
+    pub(crate) fn from_raw_parts(process: HANDLE, thread: HANDLE, pid: u32) -> Self {
+        Self {
+            process: OwnedHandle(process),
+            thread: OwnedHandle(thread),
+            pid,
+        }
+    }
+
     /// Non-blocking exit-code probe. Returns:
     ///   - `Ok(None)` if the process is still running
     ///   - `Ok(Some(code))` once it has exited
@@ -665,6 +703,79 @@ pub fn run(
                     let _ = old.wait_for_exit(TERMINATE_WAIT);
                 }
                 current_session = None;
+            }
+            // M3 A1 SYSTEM-context spawn arm. Fires when decide_spawn
+            // returns SpawnSystemInSession(sid) AND we don't already
+            // have a worker. Uses the winlogon-token pipeline:
+            // find winlogon.exe in `sid`, dup its primary token,
+            // CreateProcessAsUserW the agent EXE with that token.
+            // The spawned worker probes its own SID at startup
+            // (worker_role::probe_self) and selects SystemContext-
+            // mode plumbing.
+            //
+            // Today's runtime trigger: keep_stream_alive is always
+            // false (the heartbeat-pipe wiring isn't in yet), so this
+            // arm is unreachable at runtime. The wiring exists at
+            // the type level so the next commit (the heartbeat pipe)
+            // can flip the bit without another supervisor edit.
+            //
+            // Gated behind `system-context` because the winlogon_
+            // token module + its windows-sys requirements only
+            // compile under that feature. perUser MSI builds (no
+            // system-context feature) keep the existing _ => {}
+            // catch-all behaviour.
+            #[cfg(feature = "system-context")]
+            (SpawnDecision::SpawnSystemInSession(sid), true) if current_worker.is_none() => {
+                use crate::system_context::winlogon_token;
+                let cmdline = winlogon_token::build_cmdline(&worker_exe, &args_borrow);
+                let res = (|| -> anyhow::Result<Option<OwnedProcess>> {
+                    let Some(pid) = winlogon_token::find_winlogon_pid_in_session(sid)
+                        .context("find_winlogon_pid_in_session")?
+                    else {
+                        return Ok(None);
+                    };
+                    let token = winlogon_token::open_winlogon_primary_token(pid, sid)
+                        .context("open_winlogon_primary_token")?;
+                    let child = winlogon_token::spawn_system_in_session(&token, &cmdline)
+                        .context("spawn_system_in_session")?;
+                    let (process, thread, child_pid, _child_sid) = child.into_raw_parts();
+                    Ok(Some(OwnedProcess::from_raw_parts(process, thread, child_pid)))
+                })();
+                match res {
+                    Ok(Some(p)) => {
+                        tracing::info!(
+                            pid = p.pid,
+                            session_id = sid,
+                            "supervisor: spawned SYSTEM-context worker via winlogon-token"
+                        );
+                        current_worker = Some(p);
+                        current_session = Some(sid);
+                        consecutive_failures = 0;
+                        respawn_at = None;
+                    }
+                    Ok(None) => {
+                        // No winlogon.exe found in `sid` — rare
+                        // logon-transition race or Windows Sandbox /
+                        // Hyper-V container. Idle for this iteration;
+                        // the next session-change event will retry.
+                        tracing::debug!(
+                            session_id = sid,
+                            "supervisor: no winlogon.exe in session; idling for SYSTEM-context retry"
+                        );
+                    }
+                    Err(e) => {
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                        let bo = next_backoff(consecutive_failures);
+                        tracing::warn!(
+                            error = %e,
+                            session_id = sid,
+                            consecutive_failures,
+                            backoff_secs = bo.as_secs(),
+                            "supervisor: SYSTEM-context spawn failed; backing off"
+                        );
+                        respawn_at = Some(Instant::now() + bo);
+                    }
+                }
             }
             _ => {}
         }
