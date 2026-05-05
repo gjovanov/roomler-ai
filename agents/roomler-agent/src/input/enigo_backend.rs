@@ -64,6 +64,24 @@ fn run_worker(mut enigo: Enigo, rx: std_mpsc::Receiver<InputMsg>) {
     }
 }
 
+/// Dispatch one [`InputMsg`] through enigo. Public to sibling backends
+/// in the `input/` module (specifically [`super::system_context_backend`])
+/// so the M3 A1 SYSTEM-context worker can reuse the exact same HID-to-
+/// VK mapping + wheel/mouse semantics behind a different per-event
+/// preamble (`SetThreadDesktop` rebind). Not exposed outside `input/`.
+///
+/// Compiled only when both `system-context` and `enigo-input` features
+/// are on AND the target is Windows — i.e. the only configuration
+/// where `system_context_backend` itself compiles.
+#[cfg(all(
+    feature = "system-context",
+    target_os = "windows",
+    feature = "enigo-input"
+))]
+pub(super) fn dispatch_for_external(enigo: &mut Enigo, msg: InputMsg) -> Result<()> {
+    dispatch(enigo, msg)
+}
+
 fn dispatch(enigo: &mut Enigo, msg: InputMsg) -> Result<()> {
     match msg {
         InputMsg::MouseMove { x, y, mon } => {

@@ -16,6 +16,13 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "enigo-input")]
 pub mod enigo_backend;
 
+#[cfg(all(
+    feature = "system-context",
+    target_os = "windows",
+    feature = "enigo-input"
+))]
+pub mod system_context_backend;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Button {
@@ -108,7 +115,52 @@ impl InputInjector for NoopInjector {
 
 /// Open the best-available input backend for the current host. Falls
 /// back to [`NoopInjector`] when enigo-input is off or init fails.
+///
+/// M3 A1: when the agent is built with the `system-context` feature
+/// AND the worker probes as `WorkerRole::SystemContext` at startup
+/// (i.e. it was spawned by the SCM service via
+/// `winlogon_token::spawn_system_in_session`), route to
+/// [`system_context_backend::SystemContextInjector`] which adds a
+/// per-event `SetThreadDesktop` rebind preamble. User-context workers
+/// fall through to [`enigo_backend::EnigoInjector`] with no behaviour
+/// change.
 pub fn open_default() -> Box<dyn InputInjector + Send> {
+    #[cfg(all(
+        feature = "system-context",
+        target_os = "windows",
+        feature = "enigo-input"
+    ))]
+    {
+        use crate::system_context::worker_role::{WorkerRole, probe_self};
+        match probe_self() {
+            Ok(WorkerRole::SystemContext) => {
+                match system_context_backend::SystemContextInjector::new() {
+                    Ok(e) => {
+                        tracing::info!(
+                            "input: backend=system-context (enigo with SetThreadDesktop rebind)"
+                        );
+                        return Box::new(e);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            %e,
+                            "system-context input init failed — falling through to standard enigo backend"
+                        );
+                    }
+                }
+            }
+            Ok(WorkerRole::User) => {
+                // Normal path. Fall through to the user-context
+                // EnigoInjector below.
+            }
+            Err(e) => {
+                tracing::warn!(
+                    %e,
+                    "worker_role::probe_self in input::open_default failed — assuming user-context"
+                );
+            }
+        }
+    }
     #[cfg(feature = "enigo-input")]
     {
         match enigo_backend::EnigoInjector::new() {
