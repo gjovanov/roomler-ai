@@ -102,6 +102,18 @@ pub fn marker_path() -> PathBuf {
 /// Errors are returned for caller logging but never recovered from —
 /// a missing marker just means the supervisor falls back to the
 /// user-context worker, which is the safe degradation.
+///
+/// The body carries the current unix timestamp as decimal text. This
+/// is NOT a no-op: an earlier rc.1/rc.2 implementation wrote `b""`
+/// which Windows NTFS treated as a same-size-no-data-change, so the
+/// `LastWriteTime` was never updated past the first creation. The
+/// supervisor's `is_signaled()` reads that LastWriteTime, so the
+/// marker effectively went stale 15 s after the first heartbeat
+/// regardless of how many subsequent writes happened. Writing varying
+/// bytes (the timestamp differs every second) forces NTFS to advance
+/// the mtime on every call. Field repro: PC50045 0.3.0-rc.2 2026-05-05
+/// — `peer-presence-status` self-write probe showed `signal_connected:
+/// OK; post-write age=2162s` after a successful write.
 pub fn signal_connected() -> std::io::Result<()> {
     let path = marker_path();
     if let Some(parent) = path.parent() {
@@ -110,9 +122,14 @@ pub fn signal_connected() -> std::io::Result<()> {
         // permission-denied surface up — caller logs and moves on.
         fs::create_dir_all(parent)?;
     }
-    // Empty content; mtime is the signal. `write` truncates so the
-    // file's mtime advances on every call.
-    fs::write(&path, b"")?;
+    let now_secs = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Newline-terminated decimal so a human running `Get-Content` sees
+    // a clean unix epoch they can compare against `Get-Date -UFormat %s`.
+    let body = format!("{now_secs}\n");
+    fs::write(&path, body.as_bytes())?;
     Ok(())
 }
 
@@ -247,6 +264,84 @@ mod tests {
         let path = marker_path();
         let _ = fs::remove_file(&path);
         assert!(signal_disconnected().is_ok());
+    }
+
+    #[test]
+    fn signal_connected_writes_non_empty_body() {
+        // Regression test for the rc.1/rc.2 bug. Empty-body writes
+        // get short-circuited by NTFS so LastWriteTime never advances
+        // past the first creation; the supervisor's mtime-based
+        // freshness check then goes stale 15 s later regardless of
+        // how many successful "writes" happened. The body must
+        // genuinely change on every call.
+        if signal_connected().is_err() {
+            eprintln!("skipping — marker dir not writable in this environment");
+            return;
+        }
+        let path = marker_path();
+        let bytes = fs::read(&path).expect("marker readable after write");
+        assert!(
+            !bytes.is_empty(),
+            "marker body must be non-empty so NTFS advances LastWriteTime"
+        );
+        // Body should parse as a positive unix timestamp followed by
+        // a newline — locks the format too so a future refactor that
+        // changes it has to update this test alongside.
+        let s = std::str::from_utf8(&bytes).expect("body is utf-8");
+        assert!(s.ends_with('\n'), "body should end with newline; got {s:?}");
+        let trimmed = s.trim_end();
+        let n: u64 = trimmed
+            .parse()
+            .unwrap_or_else(|_| panic!("body must parse as u64; got {trimmed:?}"));
+        // Sanity: the timestamp should be in [now - 60s, now + 60s].
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(
+            n.abs_diff(now) < 60,
+            "marker timestamp should be near now (n={n}, now={now})"
+        );
+        let _ = signal_disconnected();
+    }
+
+    #[test]
+    fn signal_connected_advances_mtime_across_calls() {
+        // Direct regression for the field bug: two consecutive
+        // signal_connected calls 100ms apart must produce strictly
+        // increasing (or at least non-decreasing) mtimes. The
+        // pre-fix `fs::write(path, b"")` failed this on Windows
+        // NTFS — same content, no mtime advance.
+        if signal_connected().is_err() {
+            eprintln!("skipping — marker dir not writable in this environment");
+            return;
+        }
+        let path = marker_path();
+        let m1 = match fs::metadata(&path).and_then(|m| m.modified()) {
+            Ok(t) => t,
+            Err(_) => {
+                eprintln!("skipping — mtime unreadable on this fs");
+                return;
+            }
+        };
+        // Sleep 1.1s so the seconds field of the body changes — the
+        // body is unix-epoch *seconds*, so a sub-second sleep would
+        // produce identical content and we'd hit the same NTFS
+        // optimization we're guarding against.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        signal_connected().expect("second write");
+        let m2 = match fs::metadata(&path).and_then(|m| m.modified()) {
+            Ok(t) => t,
+            Err(_) => {
+                eprintln!("skipping — mtime unreadable on this fs");
+                return;
+            }
+        };
+        assert!(
+            m2 >= m1,
+            "mtime must advance across heartbeats (m1={m1:?}, m2={m2:?})"
+        );
+        let _ = signal_disconnected();
     }
 
     #[test]
