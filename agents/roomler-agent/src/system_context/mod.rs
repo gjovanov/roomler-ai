@@ -58,6 +58,7 @@
 
 #![cfg(all(feature = "system-context", target_os = "windows"))]
 
+pub mod capture_pump;
 pub mod desktop_rebind;
 pub mod dxgi_dup;
 pub mod gdi_backend;
