@@ -137,22 +137,79 @@ pub fn signal_disconnected() -> std::io::Result<()> {
 /// supervisor's next cycle sees the staleness and falls back to the
 /// user-context spawn arm.
 pub fn is_signaled() -> bool {
+    snapshot().fresh
+}
+
+/// Diagnostic snapshot of the marker file's state. Used by the
+/// `peer-presence-status` CLI command and (via the [`Snapshot::fresh`]
+/// field) by [`is_signaled`].
+#[derive(Debug, Clone)]
+pub struct Snapshot {
+    /// Where the supervisor / worker think the marker should live.
+    pub path: PathBuf,
+    /// Marker file present on disk?
+    pub exists: bool,
+    /// `Some(age)` when the file exists and we could read its mtime.
+    /// `None` when missing or unreadable.
+    pub age: Option<Duration>,
+    /// Final answer used by the supervisor: file exists AND mtime is
+    /// within [`PRESENCE_MAX_AGE`] of `now()`.
+    pub fresh: bool,
+    /// Filesystem error from `fs::metadata` if the file existed but
+    /// metadata access failed (rare — typically permission, locked).
+    pub error: Option<String>,
+}
+
+/// Read the marker without coercing failure modes. Returns the
+/// raw observability data the supervisor + CLI use to differentiate
+/// "no controller connected" from "marker write failed".
+pub fn snapshot() -> Snapshot {
     let path = marker_path();
-    let meta = match fs::metadata(&path) {
-        Ok(m) => m,
-        Err(_) => return false,
-    };
-    let mtime = match meta.modified() {
-        Ok(t) => t,
-        Err(_) => return false,
-    };
-    match SystemTime::now().duration_since(mtime) {
-        Ok(age) => age <= PRESENCE_MAX_AGE,
-        // Mtime is in the future — clock skew. Treat as fresh; the
-        // alternative (treating as stale) would falsely tear down a
-        // legitimately-connected SystemContext worker because of a
-        // host clock adjustment.
-        Err(_) => true,
+    match fs::metadata(&path) {
+        Ok(meta) => match meta.modified() {
+            Ok(mtime) => match SystemTime::now().duration_since(mtime) {
+                Ok(age) => Snapshot {
+                    fresh: age <= PRESENCE_MAX_AGE,
+                    age: Some(age),
+                    exists: true,
+                    error: None,
+                    path,
+                },
+                Err(_) => Snapshot {
+                    // Mtime is in the future — clock skew. Treat as
+                    // fresh; the alternative (treating as stale) would
+                    // falsely tear down a legitimately-connected
+                    // SystemContext worker because of a host clock
+                    // adjustment.
+                    fresh: true,
+                    age: Some(Duration::ZERO),
+                    exists: true,
+                    error: None,
+                    path,
+                },
+            },
+            Err(e) => Snapshot {
+                fresh: false,
+                age: None,
+                exists: true,
+                error: Some(format!("modified() failed: {e}")),
+                path,
+            },
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Snapshot {
+            fresh: false,
+            age: None,
+            exists: false,
+            error: None,
+            path,
+        },
+        Err(e) => Snapshot {
+            fresh: false,
+            age: None,
+            exists: false,
+            error: Some(format!("metadata() failed: {e}")),
+            path,
+        },
     }
 }
 

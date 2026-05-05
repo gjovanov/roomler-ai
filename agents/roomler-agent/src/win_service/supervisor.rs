@@ -562,6 +562,11 @@ pub fn run(
 
     let mut current_worker: Option<OwnedProcess> = None;
     let mut current_session: Option<u32> = None;
+    // Last observed keep_stream_alive value. Used to log only on
+    // transitions instead of every poll iteration — the supervisor
+    // checks the marker every POLL_INTERVAL (500 ms), which would
+    // flood the log with identical "keep_stream_alive=true" lines.
+    let mut last_logged_keep_stream_alive: Option<bool> = None;
     // Whether the current worker (if any) was spawned via the
     // SYSTEM-context arm (`SpawnSystemInSession`). False on cold
     // start and after every user-context spawn. Drives the
@@ -678,6 +683,34 @@ pub fn run(
             last_active_session = Some(s);
         }
         let keep_stream_alive = peer_presence_is_signaled();
+        if last_logged_keep_stream_alive != Some(keep_stream_alive) {
+            // Log on transitions only — at info level so it shows up
+            // in production logs without raising the bar to debug.
+            // Carry the marker snapshot's metadata so a "no swap
+            // happening" investigation lands on a log line that names
+            // exactly why the supervisor thinks the controller is
+            // (not) there.
+            #[cfg(all(feature = "system-context", target_os = "windows"))]
+            {
+                let snap = crate::system_context::peer_presence::snapshot();
+                tracing::info!(
+                    keep_stream_alive,
+                    marker_path = %snap.path.display(),
+                    marker_exists = snap.exists,
+                    marker_age_secs = ?snap.age.map(|d| d.as_secs()),
+                    marker_error = ?snap.error,
+                    "supervisor: peer-presence transition"
+                );
+            }
+            #[cfg(not(all(feature = "system-context", target_os = "windows")))]
+            {
+                tracing::info!(
+                    keep_stream_alive,
+                    "supervisor: peer-presence transition (system-context feature off — always false)"
+                );
+            }
+            last_logged_keep_stream_alive = Some(keep_stream_alive);
+        }
         let decision = decide_spawn(
             active,
             current_session,

@@ -136,6 +136,16 @@ enum Command {
     /// Enumerate attached displays and print what the agent will
     /// report in `rc:agent.hello`. Cross-platform via `scrap`.
     Displays,
+    /// (M3 A1) Print the peer-presence marker file's state. The
+    /// marker is the IPC signal between the user-context worker
+    /// (writes when a controller is connected) and the SCM-supervisor
+    /// (reads to decide whether to swap to a SystemContext worker).
+    /// Use this on the host to diagnose "why isn't the SystemContext
+    /// worker spawning when I'm connected?": run with a controller
+    /// active and check that `fresh = true` and `age <= 5s`.
+    /// Compiled only when the `system-context` feature is on.
+    #[cfg(feature = "system-context")]
+    PeerPresenceStatus,
     /// Manage the auto-start-on-boot hook (Scheduled Task on Windows,
     /// systemd user unit on Linux, LaunchAgent on macOS). Subcommand
     /// is one of `install`, `uninstall`, `status`.
@@ -260,6 +270,8 @@ async fn main() -> Result<()> {
         Command::SystemContextProbe { mode } => system_context_probe_cmd(&mode),
         Command::Caps => caps_cmd().await,
         Command::Displays => displays_cmd().await,
+        #[cfg(feature = "system-context")]
+        Command::PeerPresenceStatus => peer_presence_status_cmd(),
         Command::Service { action } => service_cmd(action).await,
         Command::ServiceRun => service_run_cmd().await,
         Command::SelfUpdate { check_only } => self_update_cmd(check_only).await,
@@ -1000,6 +1012,74 @@ async fn displays_cmd() -> Result<()> {
             d.scale,
             if d.primary { " (primary)" } else { "" }
         );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "system-context")]
+fn peer_presence_status_cmd() -> Result<()> {
+    use roomler_agent::system_context::peer_presence;
+
+    let snap = peer_presence::snapshot();
+    println!("== peer-presence marker status ==========================");
+    println!("path:         {}", snap.path.display());
+    println!("exists:       {}", snap.exists);
+    match snap.age {
+        Some(age) => println!("age:          {:.1}s", age.as_secs_f64()),
+        None => println!("age:          n/a (file missing or mtime unreadable)"),
+    }
+    println!(
+        "fresh:        {}  (must be true for SystemContext spawn)",
+        snap.fresh
+    );
+    if let Some(err) = &snap.error {
+        println!("error:        {err}");
+    }
+    println!();
+    println!("Constants:");
+    println!(
+        "  HEARTBEAT_INTERVAL = {:?}",
+        peer_presence::HEARTBEAT_INTERVAL
+    );
+    println!(
+        "  PRESENCE_MAX_AGE   = {:?}",
+        peer_presence::PRESENCE_MAX_AGE
+    );
+    println!();
+    println!("Diagnostic notes:");
+    println!("  * The user-context worker writes the marker every");
+    println!("    HEARTBEAT_INTERVAL while WebRTC peer is Connected.");
+    println!("  * is_signaled() returns true iff exists AND age <= PRESENCE_MAX_AGE.");
+    println!("  * If `exists=false`: the worker isn't writing it.");
+    println!("    Check the worker's log for `peer_presence: first heartbeat written`");
+    println!("    or `peer_presence heartbeat write failed`.");
+    println!("  * If `exists=true` but `fresh=false`: the worker stopped");
+    println!("    heartbeating (peer disconnected or worker crashed).");
+    println!("  * If `error=Some(...)`: filesystem ACL issue. Verify");
+    println!(
+        "    {} is writable from the calling process.",
+        snap.path.display()
+    );
+
+    // Try a write-then-read round-trip from this process to surface
+    // ACL errors immediately (the calling user may differ from the
+    // user-context worker that the supervisor spawned).
+    println!();
+    println!("== self-write probe (this process) ======================");
+    match peer_presence::signal_connected() {
+        Ok(()) => {
+            println!("signal_connected(): OK");
+            let after = peer_presence::snapshot();
+            println!(
+                "post-write snapshot: exists={} age={:?} fresh={}",
+                after.exists, after.age, after.fresh
+            );
+        }
+        Err(e) => {
+            println!("signal_connected(): FAILED — {e}");
+            println!("This process cannot write the marker. The user-context");
+            println!("worker likely can't either. Check ACL on the parent dir.");
+        }
     }
     Ok(())
 }
