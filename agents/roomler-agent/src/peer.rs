@@ -538,10 +538,7 @@ impl AgentPeer {
                         let _ = peer_presence::signal_disconnected();
                         return;
                     };
-                    if matches!(
-                        pc.connection_state(),
-                        RTCPeerConnectionState::Connected
-                    ) {
+                    if matches!(pc.connection_state(), RTCPeerConnectionState::Connected) {
                         if let Err(e) = peer_presence::signal_connected() {
                             tracing::warn!(%e, "peer_presence heartbeat write failed");
                         }

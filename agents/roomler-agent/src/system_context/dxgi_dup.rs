@@ -193,9 +193,7 @@ impl DxgiDupBackend {
         let height = display.height() as u32;
         let capturer = scrap::Capturer::new(display)
             .with_context(|| "scrap::Capturer::new")
-            .map_err(|e| {
-                BackendBail::HardError(io::Error::other(format!("{e:#}")))
-            })?;
+            .map_err(|e| BackendBail::HardError(io::Error::other(format!("{e:#}"))))?;
         Ok(Self {
             capturer,
             width,
@@ -328,9 +326,7 @@ mod tests {
         assert!(BackendBail::DesktopMismatch.is_retryable_without_reset());
         assert!(!BackendBail::AccessLost.is_retryable_without_reset());
         assert!(!BackendBail::SessionGone.is_retryable_without_reset());
-        assert!(
-            !BackendBail::HardError(io::Error::other("x")).is_retryable_without_reset()
-        );
+        assert!(!BackendBail::HardError(io::Error::other("x")).is_retryable_without_reset());
     }
 
     #[test]

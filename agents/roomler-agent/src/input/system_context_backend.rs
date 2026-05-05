@@ -176,9 +176,7 @@ fn run_worker(mut enigo: Enigo, rx: std_mpsc::Receiver<InputMsg>) {
             tracing::debug!(%e, "system-context input event dropped");
         }
     }
-    tracing::info!(
-        "system-context input worker thread exiting (cmd channel closed)"
-    );
+    tracing::info!("system-context input worker thread exiting (cmd channel closed)");
 }
 
 impl InputInjector for SystemContextInjector {
