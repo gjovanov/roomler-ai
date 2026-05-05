@@ -161,6 +161,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_StationsAndDesktops",  # winsta0\default desktop attach
     "Win32_System_Diagnostics_ToolHelp", # CreateToolhelp32Snapshot (find winlogon.exe pid for M3 A1)
     "Win32_UI_HiDpi",                    # SetProcessDpiAwarenessContext (mouse offset fix)
+    "Win32_UI_WindowsAndMessaging",      # GetDesktopWindow + GetSystemMetrics (M3 A1 GDI fallback)
+    "Win32_Graphics_Gdi",                # GetWindowDC, BitBlt, CreateCompatibleBitmap, GetDIBits (M3 A1 GDI fallback)
 ] }
 
 [target.'cfg(target_os = "windows")'.dependencies.windows]
