@@ -502,14 +502,51 @@ pub enum ExitReaction {
 /// feature — the marker file is never written in that case anyway,
 /// but this helper keeps the supervisor's call site free of
 /// `#[cfg]` arms.
+///
+/// Also gated on the `ROOMLER_AGENT_ENABLE_SYSTEM_SWAP` env var. The
+/// auto-swap from user-context → SystemContext on every controller
+/// connection is more aggressive than the original M3 A1 plan
+/// intended (the plan called for swap on lock screen, not on every
+/// connection) and the SystemContext spawn path has not yet been
+/// field-verified end-to-end. Until both gaps close, the swap is
+/// opt-in. Without the env var, the supervisor behaves like 0.2.7:
+/// user-context worker always, Z-path overlay covers the lock screen,
+/// no SystemContext spawn ever fires.
+///
+/// Set `ROOMLER_AGENT_ENABLE_SYSTEM_SWAP=1` (or `true`/`yes`/`on`) in
+/// the SCM service environment to re-enable. Field bug PC50045
+/// 2026-05-06: the auto-swap caused a crash loop because the
+/// SystemContext spawn fails for an as-yet-unknown reason and the
+/// supervisor's exponential backoff between spawn attempts left the
+/// agent unreachable from the browser.
 fn peer_presence_is_signaled() -> bool {
     #[cfg(all(feature = "system-context", target_os = "windows"))]
     {
+        if !system_swap_enabled() {
+            return false;
+        }
         return crate::system_context::peer_presence::is_signaled();
     }
     #[cfg(not(all(feature = "system-context", target_os = "windows")))]
     {
         false
+    }
+}
+
+/// Read the `ROOMLER_AGENT_ENABLE_SYSTEM_SWAP` env var.
+/// Truthy values: `1` / `true` / `yes` / `on` (case-insensitive).
+/// Anything else (including unset) → false.
+#[cfg(all(feature = "system-context", target_os = "windows"))]
+fn system_swap_enabled() -> bool {
+    match std::env::var("ROOMLER_AGENT_ENABLE_SYSTEM_SWAP") {
+        Ok(v) => {
+            let t = v.trim();
+            t.eq_ignore_ascii_case("1")
+                || t.eq_ignore_ascii_case("true")
+                || t.eq_ignore_ascii_case("yes")
+                || t.eq_ignore_ascii_case("on")
+        }
+        Err(_) => false,
     }
 }
 
@@ -560,6 +597,24 @@ pub fn run(
 ) -> Result<()> {
     let args_borrow: Vec<&str> = worker_args.iter().map(String::as_str).collect();
 
+    // Log the auto-swap kill-switch state at startup so a "no
+    // SystemContext worker ever spawns" investigation lands on the
+    // env var first. The swap defaults OFF as of 0.3.0-rc.4 — see
+    // `peer_presence_is_signaled` for rationale.
+    #[cfg(all(feature = "system-context", target_os = "windows"))]
+    {
+        let enabled = system_swap_enabled();
+        tracing::info!(
+            enabled,
+            env_var = "ROOMLER_AGENT_ENABLE_SYSTEM_SWAP",
+            "supervisor: M3 A1 auto-swap (user-context -> SystemContext) is {}",
+            if enabled {
+                "ENABLED"
+            } else {
+                "DISABLED (default)"
+            }
+        );
+    }
     let mut current_worker: Option<OwnedProcess> = None;
     let mut current_session: Option<u32> = None;
     // Last observed keep_stream_alive value. Used to log only on
