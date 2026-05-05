@@ -409,24 +409,46 @@ pub enum SpawnDecision {
 }
 
 /// Decide what the supervisor should do given the current world
-/// state. The third parameter — `keep_stream_alive` — encodes
-/// whether the SCM service has any reason to keep painting frames
-/// while no console session is active. Today this is always
-/// `false` (M3 not yet wired); once `system_worker.rs` lands,
-/// the supervisor will set it to `true` whenever a peer connection
-/// is observed alive on the running worker, then `false` again
-/// once the worker exits / disconnects.
+/// state. Parameters:
 ///
-/// The fourth parameter — `last_active_session` — is the most
-/// recent `Some(active)` the supervisor observed. Used only by the
-/// `(None, _) if keep_stream_alive` branch as the target session id
-/// for the SYSTEM-context spawn — without it we have no session
-/// reference at all and the only sane fallback is Idle.
+/// * `active_session` — `WTSGetActiveConsoleSessionId`'s current
+///   answer. `None` means no interactive session at all (host on
+///   the welcome screen, no users logged in).
+/// * `current_worker_session` — session id our existing worker is
+///   running in, if any.
+/// * `current_is_system_context` — whether the existing worker (if
+///   any) was spawned via the SYSTEM-context arm
+///   (`SpawnSystemInSession`). False for a normal user-context
+///   worker. Used so the swap-on-controller-connect arm doesn't
+///   keep flapping back and forth: once we're SystemContext, stay
+///   SystemContext while the controller is around.
+/// * `keep_stream_alive` — true iff a controller is currently
+///   connected to *some* worker on this host (signal comes from
+///   `system_context::peer_presence::is_signaled` in the supervisor
+///   loop).
+/// * `last_active_session` — most recent `Some(active)` the
+///   supervisor observed. Used only by the `(None, _) if
+///   keep_stream_alive` branch as the target session id for the
+///   SYSTEM-context spawn (no current session, but we should keep
+///   painting frames anyway because a controller is connected).
+///
+/// Decision matrix:
+///
+/// | active | worker | is_sys | alive | -> | reason |
+/// |---|---|---|---|---|---|
+/// | None | _ | _ | true | SpawnSystemInSession(last) | hold for controller |
+/// | None | _ | _ | false | Idle | nobody home |
+/// | Some(s) | Some(s) | false | true | SpawnSystemInSession(s) | swap up to SYSTEM |
+/// | Some(s) | Some(s) | true | false | SpawnIn(s) | swap back to user |
+/// | Some(s) | Some(s) | _ | _ | KeepCurrent | steady state |
+/// | Some(s) | _ | _ | true | SpawnSystemInSession(s) | bypass user-mode |
+/// | Some(s) | _ | _ | false | SpawnIn(s) | normal cold-start |
 ///
 /// Pure: easy to unit-test.
 pub fn decide_spawn(
     active_session: Option<u32>,
     current_worker_session: Option<u32>,
+    current_is_system_context: bool,
     keep_stream_alive: bool,
     last_active_session: Option<u32>,
 ) -> SpawnDecision {
@@ -436,7 +458,25 @@ pub fn decide_spawn(
             None => SpawnDecision::Idle,
         },
         (None, _) => SpawnDecision::Idle,
-        (Some(active), Some(current)) if active == current => SpawnDecision::KeepCurrent,
+        (Some(active), Some(current)) if active == current => {
+            // Same session — decide on swap. If a controller is
+            // connected and we're still user-context, swap up. If
+            // controller disconnected and we're still SystemContext,
+            // swap back down. Otherwise hold.
+            if keep_stream_alive && !current_is_system_context {
+                SpawnDecision::SpawnSystemInSession(active)
+            } else if !keep_stream_alive && current_is_system_context {
+                SpawnDecision::SpawnIn(active)
+            } else {
+                SpawnDecision::KeepCurrent
+            }
+        }
+        (Some(active), _) if keep_stream_alive => {
+            // No current worker (or wrong session) AND a controller
+            // is connected → bypass the user-context spawn and go
+            // straight to SystemContext.
+            SpawnDecision::SpawnSystemInSession(active)
+        }
         (Some(active), _) => SpawnDecision::SpawnIn(active),
     }
 }
@@ -455,6 +495,22 @@ pub enum ExitReaction {
     /// Worker exited with a non-zero code. Increment the counter and
     /// wait `Duration` before respawning (exponential backoff).
     Backoff(Duration),
+}
+
+/// Cross-feature wrapper for [`crate::system_context::peer_presence::is_signaled`].
+/// Always returns `false` on builds without the `system-context`
+/// feature — the marker file is never written in that case anyway,
+/// but this helper keeps the supervisor's call site free of
+/// `#[cfg]` arms.
+fn peer_presence_is_signaled() -> bool {
+    #[cfg(all(feature = "system-context", target_os = "windows"))]
+    {
+        return crate::system_context::peer_presence::is_signaled();
+    }
+    #[cfg(not(all(feature = "system-context", target_os = "windows")))]
+    {
+        false
+    }
 }
 
 /// Decide how to react to a worker exit. Returns the reaction plus
@@ -506,6 +562,14 @@ pub fn run(
 
     let mut current_worker: Option<OwnedProcess> = None;
     let mut current_session: Option<u32> = None;
+    // Whether the current worker (if any) was spawned via the
+    // SYSTEM-context arm (`SpawnSystemInSession`). False on cold
+    // start and after every user-context spawn. Drives the
+    // `decide_spawn` swap arms — the supervisor needs this state
+    // because the worker process itself looks identical from the
+    // outside (same binary, same PID handle); only the spawn site
+    // knows which token was used.
+    let mut current_is_system_context: bool = false;
     let mut consecutive_failures: u32 = 0;
     let mut respawn_at: Option<Instant> = None;
     // Most recent active console session id observed. Used by
@@ -585,29 +649,42 @@ pub fn run(
                     }
                     current_worker = None;
                     current_session = None;
+                    current_is_system_context = false;
                 }
                 Ok(None) => { /* still running */ }
                 Err(e) => {
                     tracing::warn!(error = %e, "supervisor: try_wait failed; assuming worker is gone");
                     current_worker = None;
                     current_session = None;
+                    current_is_system_context = false;
                 }
             }
         }
 
-        // Decide whether to spawn. M3 A1 system-context worker is not
-        // yet wired at the call site — until then we always pass
-        // `keep_stream_alive=false` so logout returns `Idle` and tears
-        // the worker down, matching pre-M3 behaviour. Once the
-        // worker → supervisor heartbeat pipe lands, this argument
-        // becomes `worker_has_active_peer.load()` from a shared
-        // atomic the worker writes while its peer connection is in
-        // `connected` state.
+        // Decide whether to spawn. The `keep_stream_alive` argument
+        // comes from the `system_context::peer_presence` marker file
+        // — true iff the worker has reported a `Connected` peer in
+        // the last `PRESENCE_MAX_AGE` (15 s). This is the M3 A1
+        // signal that drives the user-context → SYSTEM-context
+        // worker swap.
+        //
+        // Under builds without the `system-context` feature the
+        // marker file is never written (the worker's signal hooks
+        // are gated to the same feature) so `is_signaled` returns
+        // false and `decide_spawn` collapses to its pre-M3
+        // behaviour.
         let active = active_console_session_id();
         if let Some(s) = active {
             last_active_session = Some(s);
         }
-        let decision = decide_spawn(active, current_session, false, last_active_session);
+        let keep_stream_alive = peer_presence_is_signaled();
+        let decision = decide_spawn(
+            active,
+            current_session,
+            current_is_system_context,
+            keep_stream_alive,
+            last_active_session,
+        );
         let due_for_respawn = respawn_at.is_none_or(|t| Instant::now() >= t);
 
         match (decision, due_for_respawn) {
@@ -628,6 +705,7 @@ pub fn run(
                                 );
                                 current_worker = Some(p);
                                 current_session = Some(sid);
+                                current_is_system_context = false;
                                 consecutive_failures = 0;
                                 respawn_at = None;
                             }
@@ -659,8 +737,14 @@ pub fn run(
                     }
                 }
             }
+            // SpawnIn fired but a current worker exists and is in a
+            // different session OR is the wrong context (SystemContext
+            // when we want user-context now that the controller has
+            // disconnected). Either way, kill the existing worker;
+            // the next loop iteration spawns the right one.
             (SpawnDecision::SpawnIn(sid), _)
-                if current_worker.is_some() && current_session != Some(sid) =>
+                if current_worker.is_some()
+                    && (current_session != Some(sid) || current_is_system_context) =>
             {
                 // Active session changed under us — kill the old
                 // worker, the next loop iteration will spawn a new
@@ -669,8 +753,9 @@ pub fn run(
                     tracing::info!(
                         pid = old.pid,
                         old_session = ?current_session,
+                        was_system_context = current_is_system_context,
                         new_session = sid,
-                        "supervisor: active session changed; terminating old worker"
+                        "supervisor: spawn target changed (session/context); terminating old worker"
                     );
                     old.terminate();
                     // Wait for reap so the next-iteration spawn doesn't
@@ -679,6 +764,7 @@ pub fn run(
                     let _ = old.wait_for_exit(TERMINATE_WAIT);
                 }
                 current_session = None;
+                current_is_system_context = false;
             }
             (SpawnDecision::Idle, _) if current_worker.is_some() => {
                 // Active console session disappeared (user logged out;
@@ -703,6 +789,7 @@ pub fn run(
                     let _ = old.wait_for_exit(TERMINATE_WAIT);
                 }
                 current_session = None;
+                current_is_system_context = false;
             }
             // M3 A1 SYSTEM-context spawn arm. Fires when decide_spawn
             // returns SpawnSystemInSession(sid) AND we don't already
@@ -713,11 +800,16 @@ pub fn run(
             // (worker_role::probe_self) and selects SystemContext-
             // mode plumbing.
             //
-            // Today's runtime trigger: keep_stream_alive is always
-            // false (the heartbeat-pipe wiring isn't in yet), so this
-            // arm is unreachable at runtime. The wiring exists at
-            // the type level so the next commit (the heartbeat pipe)
-            // can flip the bit without another supervisor edit.
+            // Runtime trigger as of 0.3.0: `keep_stream_alive` comes
+            // from `peer_presence_is_signaled()` which reads the
+            // `%PROGRAMDATA%\roomler-agent\peer-connected.lock`
+            // marker file. The user-context worker writes to that
+            // file every 5 s while its WebRTC peer is in `Connected`
+            // state and removes it on disconnect. So this arm fires
+            // when the supervisor sees the marker and there's no
+            // current worker (cold start while controller waiting)
+            // or the next iteration after the swap-arm killed a
+            // user-context worker.
             //
             // Gated behind `system-context` because the winlogon_
             // token module + its windows-sys requirements only
@@ -750,6 +842,7 @@ pub fn run(
                         );
                         current_worker = Some(p);
                         current_session = Some(sid);
+                        current_is_system_context = true;
                         consecutive_failures = 0;
                         respawn_at = None;
                     }
@@ -777,6 +870,29 @@ pub fn run(
                     }
                 }
             }
+            // SystemContext spawn fired but a worker exists in the
+            // wrong session OR is the wrong context. Same swap-out
+            // logic as the user-context SpawnIn case — kill it, the
+            // next iteration spawns the right one.
+            #[cfg(feature = "system-context")]
+            (SpawnDecision::SpawnSystemInSession(sid), _)
+                if current_worker.is_some()
+                    && (current_session != Some(sid) || !current_is_system_context) =>
+            {
+                if let Some(old) = current_worker.take() {
+                    tracing::info!(
+                        pid = old.pid,
+                        old_session = ?current_session,
+                        was_system_context = current_is_system_context,
+                        new_session = sid,
+                        "supervisor: swap to SYSTEM-context worker; terminating old worker"
+                    );
+                    old.terminate();
+                    let _ = old.wait_for_exit(TERMINATE_WAIT);
+                }
+                current_session = None;
+                current_is_system_context = false;
+            }
             _ => {}
         }
 
@@ -791,37 +907,81 @@ mod tests {
     #[test]
     fn decide_spawn_idles_when_no_active_session_and_no_stream() {
         // last_active_session doesn't matter when keep_stream_alive=false;
-        // either Some or None must give Idle.
-        assert_eq!(decide_spawn(None, None, false, None), SpawnDecision::Idle);
+        // either Some or None must give Idle. current_is_system_context
+        // also doesn't matter here.
         assert_eq!(
-            decide_spawn(None, Some(2), false, None),
+            decide_spawn(None, None, false, false, None),
             SpawnDecision::Idle
         );
         assert_eq!(
-            decide_spawn(None, Some(2), false, Some(2)),
+            decide_spawn(None, Some(2), false, false, None),
+            SpawnDecision::Idle
+        );
+        assert_eq!(
+            decide_spawn(None, Some(2), false, false, Some(2)),
             SpawnDecision::Idle
         );
     }
 
     #[test]
-    fn decide_spawn_keeps_worker_when_session_unchanged() {
-        // keep_stream_alive doesn't matter here — the active session
-        // exists and matches. Lock both branches.
+    fn decide_spawn_keeps_worker_when_session_unchanged_and_no_swap_needed() {
+        // No controller AND user-context worker → KeepCurrent (steady
+        // state).
         assert_eq!(
-            decide_spawn(Some(2), Some(2), false, Some(2)),
+            decide_spawn(Some(2), Some(2), false, false, Some(2)),
             SpawnDecision::KeepCurrent
         );
+        // Controller connected AND already SystemContext → KeepCurrent
+        // (steady state during active session).
         assert_eq!(
-            decide_spawn(Some(2), Some(2), true, Some(2)),
+            decide_spawn(Some(2), Some(2), true, true, Some(2)),
             SpawnDecision::KeepCurrent
+        );
+    }
+
+    #[test]
+    fn decide_spawn_swaps_user_to_system_when_controller_arrives() {
+        // M3 A1 swap-up: user-context worker is running; controller
+        // connects (peer_presence marker fresh). Supervisor should
+        // hand control to a SystemContext worker so DXGI capture
+        // and SetThreadDesktop input continue working through any
+        // upcoming lock-screen transition.
+        assert_eq!(
+            decide_spawn(Some(2), Some(2), false, true, Some(2)),
+            SpawnDecision::SpawnSystemInSession(2)
+        );
+    }
+
+    #[test]
+    fn decide_spawn_swaps_system_to_user_when_controller_leaves() {
+        // M3 A1 swap-down: SystemContext worker is running; controller
+        // disconnects (marker stale). Supervisor should swap back to
+        // user-context so clipboard / file-transfer / cursor data-
+        // channels work for the NEXT controller without forcing them
+        // to wait for a session change.
+        assert_eq!(
+            decide_spawn(Some(2), Some(2), true, false, Some(2)),
+            SpawnDecision::SpawnIn(2)
         );
     }
 
     #[test]
     fn decide_spawn_targets_active_session_when_no_worker() {
         assert_eq!(
-            decide_spawn(Some(2), None, false, None),
+            decide_spawn(Some(2), None, false, false, None),
             SpawnDecision::SpawnIn(2)
+        );
+    }
+
+    #[test]
+    fn decide_spawn_bypasses_user_mode_when_controller_already_connected() {
+        // Cold start with controller already waiting (e.g. supervisor
+        // restarted while a session was in flight). Skip the user-
+        // context spawn and go straight to SystemContext so the
+        // browser's auto-reconnect ladder lands on a usable worker.
+        assert_eq!(
+            decide_spawn(Some(2), None, false, true, None),
+            SpawnDecision::SpawnSystemInSession(2)
         );
     }
 
@@ -830,7 +990,7 @@ mod tests {
         // Worker is for session 2 but the active console moved to 5
         // (the previous user logged out, a new one logged in).
         assert_eq!(
-            decide_spawn(Some(5), Some(2), false, Some(2)),
+            decide_spawn(Some(5), Some(2), false, false, Some(2)),
             SpawnDecision::SpawnIn(5)
         );
     }
@@ -844,7 +1004,7 @@ mod tests {
         // Idle so the supervisor's "idle && current_worker.is_some()"
         // arm tears the worker down.
         assert_eq!(
-            decide_spawn(None, Some(2), false, Some(2)),
+            decide_spawn(None, Some(2), false, false, Some(2)),
             SpawnDecision::Idle
         );
     }
@@ -859,13 +1019,8 @@ mod tests {
         // session (sign-out leaves session-2's winlogon.exe alive
         // through the welcome screen, so spawning into 2 is the
         // right target).
-        //
-        // Both desktop transitions hit this arm — Win+L lock screen
-        // does NOT change WTSGetActiveConsoleSessionId so it stays as
-        // KeepCurrent; *full* sign-out makes the active session
-        // disappear and we land here.
         assert_eq!(
-            decide_spawn(None, Some(2), true, Some(2)),
+            decide_spawn(None, Some(2), false, true, Some(2)),
             SpawnDecision::SpawnSystemInSession(2)
         );
         // No prior session memory + active disappeared + stream alive
@@ -873,13 +1028,13 @@ mod tests {
         // is between SCM start and the first session observation,
         // which is rare enough that Idle is acceptable.
         assert_eq!(
-            decide_spawn(None, None, true, None),
+            decide_spawn(None, None, false, true, None),
             SpawnDecision::Idle
         );
         // Same active=None + stream alive, but the supervisor remembers
         // what session it just left → spawn into that.
         assert_eq!(
-            decide_spawn(None, None, true, Some(7)),
+            decide_spawn(None, None, false, true, Some(7)),
             SpawnDecision::SpawnSystemInSession(7)
         );
     }
