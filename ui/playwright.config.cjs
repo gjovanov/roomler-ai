@@ -126,6 +126,15 @@ try {
 
 module.exports = defineConfig({
   testDir: './e2e',
+  // Skip the video/ subdirectory — record-intro.spec.ts is a
+  // demo-production script (writes an mp4 of a scripted user
+  // journey via Playwright), not a regression test. It uses ESM
+  // import-attribute syntax (`with { type: 'json' }`) that
+  // Playwright's CJS transformer trips on inside the e2e Job's
+  // bun runtime, and even when grep-filtered the file is parsed
+  // at discovery time. Opt-in via `playwright test e2e/video/...`
+  // when you actually want to run the recorder.
+  testIgnore: ['**/video/**'],
   fullyParallel: false,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,
