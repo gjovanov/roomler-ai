@@ -126,15 +126,32 @@ try {
 
 module.exports = defineConfig({
   testDir: './e2e',
-  // Skip the video/ subdirectory — record-intro.spec.ts is a
-  // demo-production script (writes an mp4 of a scripted user
-  // journey via Playwright), not a regression test. It uses ESM
-  // import-attribute syntax (`with { type: 'json' }`) that
-  // Playwright's CJS transformer trips on inside the e2e Job's
-  // bun runtime, and even when grep-filtered the file is parsed
-  // at discovery time. Opt-in via `playwright test e2e/video/...`
-  // when you actually want to run the recorder.
-  testIgnore: ['**/video/**'],
+  // testIgnore is the only reliable way to exclude SPEC FILES from
+  // discovery — `--grep-invert` only matches test NAMES (the
+  // describe-then-it title), so file-path regexes there silently
+  // match nothing. Two ignore sets:
+  //   - Always: `**/video/**` (record-intro.spec.ts is a demo
+  //     mp4-producer, not a regression test; uses ESM import-
+  //     attribute syntax that Playwright's CJS transformer trips on
+  //     inside the e2e Job's bun runtime)
+  //   - When `E2E_SKIP_PHASE_3=1` (set by the e2e Job manifest in
+  //     first-cut mode): the 4 specs that need infra not yet in
+  //     cluster — oauth (no provider stubs), email-flows (no SMTP
+  //     capture), conference-multi + rc-vp9-444 (mediasoup-in-k8s
+  //     dance). Phase 3 deploys Mailpit + oauth2-mock-server +
+  //     coturn and unsets this env.
+  testIgnore: (() => {
+    const always = ['**/video/**']
+    if (process.env.E2E_SKIP_PHASE_3 === '1') {
+      always.push(
+        '**/oauth.spec.ts',
+        '**/email-flows.spec.ts',
+        '**/conference-multi.spec.ts',
+        '**/rc-vp9-444.spec.ts',
+      )
+    }
+    return always
+  })(),
   fullyParallel: false,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,
