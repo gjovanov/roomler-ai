@@ -1,30 +1,24 @@
 <template>
-  <v-container fluid>
-    <v-row>
-      <v-col cols="12" class="d-flex align-center">
-        <h1 class="text-h4">{{ $t('nav.rooms') }}</h1>
-        <v-spacer />
-        <v-btn color="primary" prepend-icon="mdi-plus" @click="showCreate = true">
-          {{ $t('room.create') }}
-        </v-btn>
-      </v-col>
-    </v-row>
+  <v-container fluid class="pa-2 pa-md-4 pa-xl-6">
+    <div class="d-flex align-center mb-2 mb-md-4">
+      <h1 class="text-h5 text-md-h4">{{ $t('nav.rooms') }}</h1>
+      <v-spacer />
+      <v-btn color="primary" prepend-icon="mdi-plus" @click="showCreate = true">
+        {{ $t('room.create') }}
+      </v-btn>
+    </div>
 
-    <v-row>
-      <v-col cols="12">
-        <v-card v-if="roomStore.loading">
-          <v-card-text class="text-center">
-            <v-progress-circular indeterminate />
-          </v-card-text>
-        </v-card>
+    <v-card v-if="roomStore.loading">
+      <v-card-text class="text-center">
+        <v-progress-circular indeterminate />
+      </v-card-text>
+    </v-card>
 
-        <v-list v-else>
-          <template v-for="room in roomStore.rootRooms" :key="room.id">
-            <room-tree-item :room="room" :tenant-id="tenantId" :depth="0" />
-          </template>
-        </v-list>
-      </v-col>
-    </v-row>
+    <v-list v-else>
+      <template v-for="room in roomStore.rootRooms" :key="room.id">
+        <room-tree-item :room="room" :tenant-id="tenantId" :depth="0" />
+      </template>
+    </v-list>
 
     <!-- Create room dialog -->
     <v-dialog v-model="showCreate" max-width="500">

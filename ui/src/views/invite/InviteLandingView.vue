@@ -1,16 +1,16 @@
 <template>
-  <v-container class="fill-height" fluid>
+  <v-container class="fill-height pa-2 pa-md-4 pa-xl-6" fluid>
     <v-row align="center" justify="center">
       <v-col cols="12" sm="8" md="5">
-        <v-card class="pa-6">
+        <v-card class="pa-4 pa-md-6">
           <!-- Loading -->
-          <div v-if="inviteStore.loading" class="text-center py-8">
+          <div v-if="inviteStore.loading" class="text-center py-4 py-md-8">
             <v-progress-circular indeterminate color="primary" />
             <p class="mt-4 text-body-1">Loading invite...</p>
           </div>
 
           <!-- Error -->
-          <div v-else-if="inviteStore.error" class="text-center py-8">
+          <div v-else-if="inviteStore.error" class="text-center py-4 py-md-8">
             <v-icon size="64" color="error">mdi-alert-circle</v-icon>
             <p class="mt-4 text-h6">Invite not found</p>
             <p class="text-body-2 text-medium-emphasis">

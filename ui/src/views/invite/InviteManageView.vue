@@ -1,31 +1,28 @@
 <template>
-  <v-container fluid>
-    <v-row>
-      <v-col>
-        <div class="d-flex align-center flex-wrap ga-2 mb-4">
-          <h2 class="text-h5">Invite Links</h2>
-          <v-spacer />
-          <v-btn
-            variant="outlined"
-            color="primary"
-            class="mr-2"
-            @click="showBatchDialog = true"
-          >
-            <v-icon start>mdi-email-multiple</v-icon>
-            Batch Invite
-          </v-btn>
-          <v-btn color="primary" @click="showCreateDialog = true">
-            <v-icon start>mdi-plus</v-icon>
-            Create Invite
-          </v-btn>
-        </div>
+  <v-container fluid class="pa-2 pa-md-4 pa-xl-6">
+    <div class="d-flex align-center flex-wrap ga-2 mb-2 mb-md-4">
+      <h2 class="text-h5">Invite Links</h2>
+      <v-spacer />
+      <v-btn
+        variant="outlined"
+        color="primary"
+        @click="showBatchDialog = true"
+      >
+        <v-icon start>mdi-email-multiple</v-icon>
+        Batch Invite
+      </v-btn>
+      <v-btn color="primary" @click="showCreateDialog = true">
+        <v-icon start>mdi-plus</v-icon>
+        Create Invite
+      </v-btn>
+    </div>
 
-        <v-alert v-if="inviteStore.error" type="error" density="compact" class="mb-4">
-          {{ inviteStore.error }}
-        </v-alert>
+    <v-alert v-if="inviteStore.error" type="error" density="compact" class="mb-4">
+      {{ inviteStore.error }}
+    </v-alert>
 
-        <v-card>
-          <v-data-table-virtual
+    <v-card>
+      <v-data-table-virtual
             :headers="headers"
             :items="inviteStore.invites"
             :loading="inviteStore.loading"
@@ -70,11 +67,11 @@
                 <v-icon>mdi-close-circle</v-icon>
               </v-btn>
             </template>
-          </v-data-table-virtual>
-        </v-card>
+      </v-data-table-virtual>
+    </v-card>
 
-        <!-- Create invite dialog -->
-        <v-dialog v-model="showCreateDialog" max-width="500">
+    <!-- Create invite dialog -->
+    <v-dialog v-model="showCreateDialog" max-width="500">
           <v-card>
             <v-card-title>Create Invite</v-card-title>
             <v-card-text>
@@ -117,15 +114,12 @@
           </v-card>
         </v-dialog>
 
-        <!-- Batch invite dialog -->
-        <batch-invite-dialog
-          v-model="showBatchDialog"
-          :tenant-id="tenantId"
-          :roles="roleStore.roles"
-        />
-
-      </v-col>
-    </v-row>
+    <!-- Batch invite dialog -->
+    <batch-invite-dialog
+      v-model="showBatchDialog"
+      :tenant-id="tenantId"
+      :roles="roleStore.roles"
+    />
   </v-container>
 </template>
 

@@ -1,27 +1,24 @@
 <template>
-  <v-container fluid>
-    <v-row>
-      <v-col cols="12">
-        <h1 class="text-h4 mb-2">{{ $t('nav.explore') }}</h1>
-        <p class="text-medium-emphasis mb-4">Discover and join open rooms</p>
-        <v-text-field
-          v-model="query"
-          :label="$t('common.search')"
-          prepend-inner-icon="mdi-magnify"
-          clearable
-          hide-details
-          @update:model-value="debounceSearch"
-        />
-      </v-col>
-    </v-row>
+  <v-container fluid class="pa-2 pa-md-4 pa-xl-6">
+    <h1 class="text-h5 text-md-h4 mb-2">{{ $t('nav.explore') }}</h1>
+    <p class="text-medium-emphasis mb-4">Discover and join open rooms</p>
+    <v-text-field
+      v-model="query"
+      :label="$t('common.search')"
+      prepend-inner-icon="mdi-magnify"
+      clearable
+      hide-details
+      class="mb-4"
+      @update:model-value="debounceSearch"
+    />
 
-    <v-row v-if="loading" class="mt-4">
-      <v-col cols="12" class="text-center pa-8">
+    <v-row v-if="loading">
+      <v-col cols="12" class="text-center pa-4 pa-md-6 pa-lg-8">
         <v-progress-circular indeterminate />
       </v-col>
     </v-row>
 
-    <v-row v-else class="mt-2">
+    <v-row v-else>
       <v-col v-for="room in results" :key="room.id" cols="12" sm="6" md="4">
         <v-card variant="outlined" class="fill-height d-flex flex-column">
           <v-card-title class="d-flex align-center">
@@ -66,7 +63,7 @@
     </v-row>
 
     <v-row v-if="results.length === 0 && !loading && searched">
-      <v-col cols="12" class="text-center text-medium-emphasis pa-8">
+      <v-col cols="12" class="text-center text-medium-emphasis pa-4 pa-md-6 pa-lg-8">
         <v-icon size="48" class="mb-2">mdi-magnify-close</v-icon>
         <p v-if="query">No rooms found matching "{{ query }}"</p>
         <p v-else>No open rooms available. Try creating one!</p>

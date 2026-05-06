@@ -1,5 +1,5 @@
 <template>
-  <v-container class="fill-height" fluid>
+  <v-container class="fill-height pa-2 pa-md-4 pa-xl-6" fluid>
     <v-row align="center" justify="center">
       <v-col cols="12" sm="6" class="text-center">
         <v-progress-circular v-if="!error" indeterminate color="primary" size="64" />

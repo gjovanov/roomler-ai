@@ -107,8 +107,25 @@ const routes: RouteRecordRaw[] = [
           },
           {
             path: 'admin',
-            name: 'admin',
+            // Parent-level redirect: hitting `/tenant/{id}/admin` goes
+            // straight to the Settings child without leaving an
+            // intermediate history entry. Avoids the back-button loop
+            // that an empty-path child redirect would create.
+            redirect: { name: 'admin-settings' },
             component: () => import('@/views/admin/AdminPanel.vue'),
+            // Each section is a child route — URL reflects the active
+            // tab, browser back/forward works, deep links bookmarkable.
+            // `props: true` auto-passes route params (tenantId) as
+            // component props so each section receives `tenantId`
+            // consistently with the existing AgentsSection contract.
+            children: [
+              { path: 'settings',  name: 'admin-settings',  props: true, component: () => import('@/components/admin/SettingsSection.vue') },
+              { path: 'members',   name: 'admin-members',   props: true, component: () => import('@/components/admin/MembersSection.vue') },
+              { path: 'roles',     name: 'admin-roles',     props: true, component: () => import('@/components/admin/RolesSection.vue') },
+              { path: 'agents',    name: 'admin-agents',    props: true, component: () => import('@/components/admin/AgentsSection.vue') },
+              { path: 'tasks',     name: 'admin-tasks',     props: true, component: () => import('@/components/admin/TasksSection.vue') },
+              { path: 'audit-log', name: 'admin-audit-log', props: true, component: () => import('@/components/admin/AuditSection.vue') },
+            ],
           },
           {
             path: 'billing',

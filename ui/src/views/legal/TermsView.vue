@@ -1,7 +1,7 @@
 <template>
   <v-theme-provider theme="light">
     <div class="legal-page">
-      <v-container class="legal-container py-12">
+      <v-container class="legal-container py-6 py-md-12 px-4 px-md-6">
         <router-link to="/landing" class="text-body-2 text-primary text-decoration-none d-inline-flex align-center mb-6">
           <v-icon size="small" class="mr-1">mdi-arrow-left</v-icon>
           Back to home

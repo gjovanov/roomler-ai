@@ -1,41 +1,34 @@
 <template>
-  <v-container fluid>
-    <v-row>
-      <v-col cols="12" class="d-flex align-center flex-wrap ga-2">
-        <h1 class="text-h4">{{ $t('nav.files') }}</h1>
-        <v-spacer />
-        <v-btn-toggle v-model="viewMode" mandatory density="compact" class="mr-4">
-          <v-btn value="all" size="small">All Files</v-btn>
-          <v-btn value="room" size="small" :disabled="!currentRoomId">Room Files</v-btn>
-        </v-btn-toggle>
-        <v-btn color="primary" prepend-icon="mdi-upload" @click="triggerUpload" :disabled="!currentRoomId">
-          {{ $t('files.upload') }}
-        </v-btn>
-        <input
-          ref="fileInputRef"
-          type="file"
-          hidden
-          multiple
-          @change="handleFileSelect"
-        />
-      </v-col>
-    </v-row>
+  <v-container fluid class="pa-2 pa-md-4 pa-xl-6">
+    <div class="d-flex align-center flex-wrap ga-2 mb-2 mb-md-4">
+      <h1 class="text-h5 text-md-h4">{{ $t('nav.files') }}</h1>
+      <v-spacer />
+      <v-btn-toggle v-model="viewMode" mandatory density="compact">
+        <v-btn value="all" size="small">All Files</v-btn>
+        <v-btn value="room" size="small" :disabled="!currentRoomId">Room Files</v-btn>
+      </v-btn-toggle>
+      <v-btn color="primary" prepend-icon="mdi-upload" @click="triggerUpload" :disabled="!currentRoomId">
+        {{ $t('files.upload') }}
+      </v-btn>
+      <input
+        ref="fileInputRef"
+        type="file"
+        hidden
+        multiple
+        @change="handleFileSelect"
+      />
+    </div>
 
-    <v-row v-if="fileStore.loading">
-      <v-col cols="12" class="text-center">
-        <v-progress-circular indeterminate />
-      </v-col>
-    </v-row>
+    <div v-if="fileStore.loading" class="text-center pa-4 pa-md-6">
+      <v-progress-circular indeterminate />
+    </div>
 
-    <v-row v-else-if="fileStore.files.length === 0">
-      <v-col cols="12" class="text-center pa-8 text-medium-emphasis">
-        {{ $t('files.noFiles') }}
-      </v-col>
-    </v-row>
+    <div v-else-if="fileStore.files.length === 0" class="text-center pa-4 pa-md-6 pa-lg-8 text-medium-emphasis">
+      {{ $t('files.noFiles') }}
+    </div>
 
-    <v-row v-else>
-      <v-col cols="12">
-        <v-table>
+    <div v-else class="files-table-wrap">
+      <v-table>
           <thead>
             <tr>
               <th>Name</th>
@@ -83,8 +76,7 @@
             </tr>
           </tbody>
         </v-table>
-      </v-col>
-    </v-row>
+    </div>
 
     <!-- Upload progress -->
     <v-snackbar v-model="uploading" timeout="-1">
