@@ -88,15 +88,25 @@ pub async fn enroll_agent(
     let admin_uid = ObjectId::parse_str(&claims.sub)
         .map_err(|_| ApiError::BadRequest("Invalid admin user id claim".to_string()))?;
 
-    // If a row already exists for (tenant_id, machine_id), re-issue a token
-    // against it — supports reinstall / re-enroll cycles without leaking stale
-    // rows. Machine_id should be a stable HMAC of DMI + MAC.
+    // If a row already exists for (tenant_id, machine_id), rehydrate it —
+    // refresh name / os / agent_version, clear `deleted_at` if soft-deleted,
+    // and re-issue a token against the same _id. The unique index on
+    // (tenant_id, machine_id) covers soft-deleted rows too, so we must look
+    // them up *including* tombstones and revive in place rather than create.
     let existing = state
         .agents
         .find_by_tenant_and_machine(tid, &body.machine_id)
         .await?;
     let agent = match existing {
-        Some(a) => a,
+        Some(a) => {
+            let id = a
+                .id
+                .ok_or_else(|| ApiError::Internal("agent missing _id".to_string()))?;
+            state
+                .agents
+                .rehydrate(id, &body.machine_name, body.os, &body.agent_version)
+                .await?
+        }
         None => {
             state
                 .agents

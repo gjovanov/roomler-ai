@@ -98,6 +98,78 @@ async fn enroll_agent_full_round_trip() {
     assert_eq!(ej2["agent_id"].as_str().unwrap(), agent_id);
 }
 
+/// Regression: soft-deleting an agent and re-enrolling the same `machine_id`
+/// must rehydrate the existing row (clearing `deleted_at`, refreshing name /
+/// os / agent_version) instead of failing with E11000 against the unique
+/// `(tenant_id, machine_id)` index. Pre-fix, the unfiltered index treated the
+/// soft-deleted tombstone as a duplicate and the second enrollment 409'd.
+#[tokio::test]
+async fn enroll_revives_soft_deleted_agent() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("rcrevive").await;
+
+    let (first_agent_id, _) = enroll_helper(&app, &seeded, "mach-rcrevive-A", "orf").await;
+
+    // Admin soft-deletes the agent.
+    app.auth_delete(
+        &format!("/api/tenant/{}/agent/{}", seeded.tenant_id, first_agent_id),
+        &seeded.admin.access_token,
+    )
+    .send()
+    .await
+    .unwrap()
+    .error_for_status()
+    .unwrap();
+
+    // Re-enroll the same machine with a NEW name — must succeed (200) and
+    // return the same _id.
+    let et: Value = app
+        .auth_post(
+            &format!("/api/tenant/{}/agent/enroll-token", seeded.tenant_id),
+            &seeded.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let resp = app
+        .client
+        .post(app.url("/api/agent/enroll"))
+        .json(&json!({
+            "enrollment_token": et["enrollment_token"].as_str().unwrap(),
+            "machine_id": "mach-rcrevive-A",
+            "machine_name": "orf_laptop",
+            "os": "windows",
+            "agent_version": "0.2.7",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let revived: Value = resp.json().await.unwrap();
+    assert_eq!(revived["agent_id"].as_str().unwrap(), first_agent_id);
+
+    // Admin list now shows the revived row with the new name + version.
+    let list: Value = app
+        .auth_get(
+            &format!("/api/tenant/{}/agent", seeded.tenant_id),
+            &seeded.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let items = list["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["id"].as_str().unwrap(), first_agent_id);
+    assert_eq!(items[0]["name"].as_str().unwrap(), "orf_laptop");
+    assert_eq!(items[0]["agent_version"].as_str().unwrap(), "0.2.7");
+}
+
 #[tokio::test]
 async fn enroll_rejects_bogus_token() {
     let app = TestApp::spawn().await;

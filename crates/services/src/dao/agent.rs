@@ -51,6 +51,10 @@ impl AgentDao {
         self.base.find_by_id(id).await
     }
 
+    /// Locate an agent by `(tenant_id, machine_id)` regardless of soft-delete
+    /// state. The unique index on this pair is unconditional, so a soft-deleted
+    /// row still occupies the slot — the enroll path calls this to detect that
+    /// case and rehydrate via [`Self::rehydrate`] rather than failing with E11000.
     pub async fn find_by_tenant_and_machine(
         &self,
         tenant_id: ObjectId,
@@ -60,9 +64,37 @@ impl AgentDao {
             .find_one(doc! {
                 "tenant_id": tenant_id,
                 "machine_id": machine_id,
-                "deleted_at": null,
             })
             .await
+    }
+
+    /// Refresh an existing agent row at re-enrollment time: clear `deleted_at`
+    /// (in case the row was soft-deleted), update name / os / agent_version
+    /// from the new enrollment payload, bump `updated_at`. Returns the updated
+    /// row so the caller can issue a fresh agent token against it.
+    pub async fn rehydrate(
+        &self,
+        agent_id: ObjectId,
+        name: &str,
+        os: OsKind,
+        agent_version: &str,
+    ) -> DaoResult<Agent> {
+        let os_bson = bson::to_bson(&os).unwrap_or(bson::Bson::Null);
+        self.base
+            .update_by_id(
+                agent_id,
+                doc! {
+                    "$set": {
+                        "name": name,
+                        "os": os_bson,
+                        "agent_version": agent_version,
+                        "updated_at": DateTime::now(),
+                        "deleted_at": bson::Bson::Null,
+                    }
+                },
+            )
+            .await?;
+        self.base.find_by_id(agent_id).await
     }
 
     pub async fn list_for_tenant(
