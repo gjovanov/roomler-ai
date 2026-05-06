@@ -328,5 +328,6 @@ fn test_settings() -> Settings {
             vapid_private_key: String::new(),
             contact: "mailto:test@roomler.ai".to_string(),
         },
+        auth: roomler_ai_config::AuthSettings::default(),
     }
 }
