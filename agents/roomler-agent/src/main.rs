@@ -250,7 +250,60 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let config_path = match cli.config.clone() {
         Some(p) => p,
-        None => config::default_config_path().context("resolving default config path")?,
+        None => {
+            let default = config::default_config_path().context("resolving default config path")?;
+            // M3 A1 SystemContext fallback: when the worker is spawned
+            // by the SCM service via winlogon-token, it runs as
+            // LocalSystem (S-1-5-18) and `default` resolves to
+            // `C:\Windows\System32\config\systemprofile\AppData\
+            // Roaming\roomler\...` — NOT the user's profile where the
+            // enrollment config actually lives. Field repro PC50045
+            // 2026-05-06: every SystemContext spawn exited with
+            // code=1 within 500 ms because config::load failed before
+            // logging::init() could surface the real error. Fall back
+            // to the active session user's profile when (a) we're a
+            // SystemContext worker per worker_role probe AND (b) the
+            // SYSTEM-profile config doesn't exist.
+            #[cfg(all(feature = "system-context", target_os = "windows"))]
+            {
+                use roomler_agent::system_context::{user_profile, worker_role};
+                if !default.exists()
+                    && matches!(
+                        worker_role::probe_self(),
+                        Ok(worker_role::WorkerRole::SystemContext)
+                    )
+                {
+                    if let Some(user_path) = user_profile::active_user_config_path() {
+                        if user_path.exists() {
+                            tracing::info!(
+                                fallback_path = %user_path.display(),
+                                default_path = %default.display(),
+                                "config: SystemContext worker — using active-user config (default path is SYSTEM profile)"
+                            );
+                            user_path
+                        } else {
+                            tracing::warn!(
+                                attempted = %user_path.display(),
+                                default_path = %default.display(),
+                                "config: SystemContext fallback path also missing; will try default and likely fail"
+                            );
+                            default
+                        }
+                    } else {
+                        tracing::warn!(
+                            "config: SystemContext worker but couldn't resolve active-user profile; falling back to default"
+                        );
+                        default
+                    }
+                } else {
+                    default
+                }
+            }
+            #[cfg(not(all(feature = "system-context", target_os = "windows")))]
+            {
+                default
+            }
+        }
     };
 
     match cli.command.unwrap_or(Command::Run { encoder: None }) {
