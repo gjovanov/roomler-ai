@@ -1,5 +1,5 @@
 <template>
-  <v-container max-width="600">
+  <v-container max-width="600" class="pa-2 pa-md-4 pa-xl-6">
     <v-card flat>
       <v-card-title>Edit Profile</v-card-title>
       <v-card-text>

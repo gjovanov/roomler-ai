@@ -1,10 +1,10 @@
 <template>
-  <v-container max-width="600">
-    <div v-if="userStore.loading" class="text-center pa-8">
+  <v-container max-width="600" class="pa-2 pa-md-4 pa-xl-6">
+    <div v-if="userStore.loading" class="text-center pa-4 pa-md-6 pa-lg-8">
       <v-progress-circular indeterminate />
     </div>
     <v-card v-else-if="userStore.profile" flat>
-      <div class="d-flex align-center pa-6">
+      <div class="d-flex align-center pa-4 pa-md-6">
         <v-avatar size="80" color="primary" class="mr-4">
           <v-img v-if="userStore.profile.avatar" :src="userStore.profile.avatar" />
           <span v-else class="text-h4">{{ initial }}</span>

@@ -1,11 +1,20 @@
 <template>
   <v-container fluid class="pa-0 remote-control-wrapper">
-    <!-- Toolbar -->
-    <v-toolbar density="compact" color="surface" class="px-2">
+    <!-- ============================================================
+         Toolbar Row 1: primary controls — Back / Title / status /
+         Ctrl-Alt-Del / Connect-Disconnect / Fullscreen. Designed to
+         fit on a single line at every viewport (down to ~320px) so
+         the user never loses access to the primary actions. The
+         five session-time tools that previously crowded this row
+         (Quality / Scale / Resolution / Codec, Crystal-Clear,
+         Low-Latency, clipboard send/get, file upload) moved to
+         Row 2 below; on `<md` Row 2 collapses into the bottom-sheet.
+         ============================================================ -->
+    <v-toolbar density="compact" color="surface" class="px-2 rc-toolbar-primary">
       <v-btn
         icon="mdi-arrow-left"
         variant="text"
-        :to="{ name: 'admin', params: { tenantId } }"
+        :to="{ name: 'admin-agents', params: { tenantId } }"
         aria-label="Back to Agents"
       />
       <v-toolbar-title class="d-flex align-center text-truncate">
@@ -15,8 +24,7 @@
         <span class="text-truncate">{{ agent?.name || 'Agent' }}</span>
         <!-- OS + version subtitle hidden on phone-sized viewports;
              they're useful context on a desktop but on mobile they
-             push Connect/Disconnect off the right edge. The toolbar's
-             status chip carries enough info for an at-a-glance check. -->
+             push Connect/Disconnect off the right edge. -->
         <span v-if="agent" class="text-caption text-medium-emphasis ml-2 d-none d-sm-inline">
           {{ agent.os }} · {{ agent.agent_version || '—' }}
         </span>
@@ -74,83 +82,10 @@
       >
         On {{ rc.currentDesktop.value }}
       </v-chip>
-      <!-- Advanced selects: Quality, Scale (+ optional Custom %),
-           Resolution override, Codec override. Together they consume
-           ~630px of toolbar real estate which doesn't fit on a phone
-           viewport (~320-414px). On `smAndDown` we collapse them
-           into a settings bottom-sheet (mdi-tune-variant button
-           below). On `md` and above the inline row stays — operators
-           on a desktop expect them at hand without a click. -->
-      <div class="d-none d-md-flex align-center">
-        <v-select
-          v-model="quality"
-          :items="qualityOptions"
-          density="compact"
-          hide-details
-          variant="outlined"
-          style="max-width: 140px;"
-          class="mr-2"
-          prepend-inner-icon="mdi-quality-high"
-          aria-label="Quality preference"
-        />
-        <v-select
-          v-model="scaleMode"
-          :items="scaleOptions"
-          density="compact"
-          hide-details
-          variant="outlined"
-          style="max-width: 160px;"
-          class="mr-2"
-          prepend-inner-icon="mdi-image-size-select-actual"
-          aria-label="View scale"
-        />
-        <v-text-field
-          v-if="scaleMode === 'custom'"
-          v-model.number="scalePercent"
-          type="number"
-          min="5"
-          max="1000"
-          step="5"
-          density="compact"
-          hide-details
-          variant="outlined"
-          style="max-width: 110px;"
-          class="mr-2"
-          suffix="%"
-          aria-label="Custom scale percent"
-        />
-        <v-select
-          v-model="resolutionPresetValue"
-          :items="resolutionOptions"
-          density="compact"
-          hide-details
-          variant="outlined"
-          style="max-width: 190px;"
-          class="mr-2"
-          prepend-inner-icon="mdi-monitor-screenshot"
-          aria-label="Remote capture resolution"
-          :title="resolutionButtonTitle"
-        />
-        <v-select
-          v-model="codecOverride"
-          :items="codecOptions"
-          density="compact"
-          hide-details
-          variant="outlined"
-          style="max-width: 140px;"
-          class="mr-2"
-          prepend-inner-icon="mdi-video-outline"
-          aria-label="Codec override"
-          :title="codecOverride == null
-            ? 'Agent picks the best available codec'
-            : `Forcing ${codecOverride.toUpperCase()} — takes effect on next Connect`"
-        />
-      </div>
-      <!-- Mobile-only settings trigger. Opens a bottom-sheet with the
-           same controls so a phone operator can still tweak quality,
-           scale, resolution, codec without losing the rest of the
-           toolbar. Hidden on `md` and above where the inline row
-           already shows them. -->
+      <!-- Mobile-only Row-2 trigger: opens the bottom-sheet that
+           holds Row 2's controls (Quality / Scale / Resolution /
+           Codec / Crystal-Clear / Low-Latency / clipboard / upload).
+           Hidden on `md` and above where Row 2 renders inline. -->
       <v-btn
         icon="mdi-tune-variant"
         variant="text"
@@ -160,40 +95,11 @@
         title="Viewer settings"
         @click="mobileSettingsOpen = true"
       />
-      <!-- Clipboard sync buttons. Visible only during a live session
-           because the DC is only open then. Both sides require a user
-           gesture — navigator.clipboard.{readText,writeText} throw
-           otherwise, so they live on explicit button clicks rather
-           than a background poller. -->
-      <v-btn
-        v-if="rc.phase.value === 'connected'"
-        icon
-        variant="text"
-        size="small"
-        class="mr-1"
-        :loading="clipboardBusy"
-        aria-label="Send my clipboard to the remote host"
-        title="Send my clipboard → remote"
-        @click="onSendClipboard"
-      >
-        <v-icon>mdi-content-paste</v-icon>
-      </v-btn>
-      <v-btn
-        v-if="rc.phase.value === 'connected'"
-        icon
-        variant="text"
-        size="small"
-        class="mr-1"
-        :loading="clipboardBusy"
-        aria-label="Get the remote host's clipboard"
-        title="Get remote clipboard → me"
-        @click="onGetClipboard"
-      >
-        <v-icon>mdi-content-copy</v-icon>
-      </v-btn>
       <!-- Ctrl+Alt+Del: the OS intercepts this key combo before the
            browser sees it, so expose an explicit toolbar button that
-           emits the equivalent key sequence over the input DC. -->
+           emits the equivalent key sequence over the input DC.
+           Visible at every viewport during a session — emergency-
+           recovery action, must not hide behind an extra tap. -->
       <v-btn
         v-if="rc.phase.value === 'connected'"
         icon
@@ -205,84 +111,6 @@
         @click="rc.sendCtrlAltDel()"
       >
         <v-icon>mdi-keyboard-outline</v-icon>
-      </v-btn>
-      <!-- File upload: open a native file picker and stream whatever
-           the user selects to the controlled host's Downloads folder
-           via the `files` DC. -->
-      <v-btn
-        v-if="rc.phase.value === 'connected'"
-        icon
-        variant="text"
-        size="small"
-        class="mr-2"
-        :loading="uploadBusy"
-        aria-label="Upload a file to the remote host"
-        title="Upload file → remote"
-        @click="fileInput?.click()"
-      >
-        <v-icon>mdi-upload</v-icon>
-      </v-btn>
-      <input
-        ref="fileInput"
-        type="file"
-        style="display: none"
-        @change="onFilePicked"
-      />
-      <!-- Fullscreen toggle: requests fullscreen on the stage element.
-           ESC exits natively — no custom keybinding needed. Icon flips
-           via the document.fullscreenchange listener. -->
-      <v-btn
-        v-if="rc.phase.value === 'connected'"
-        icon
-        variant="text"
-        size="small"
-        class="mr-2"
-        :aria-label="isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'"
-        :title="isFullscreen ? 'Exit fullscreen (Esc)' : 'Fullscreen'"
-        @click="toggleFullscreen"
-      >
-        <v-icon>{{ isFullscreen ? 'mdi-fullscreen-exit' : 'mdi-fullscreen' }}</v-icon>
-      </v-btn>
-      <!-- Crystal-clear (VP9 4:4:4) toggle. When the agent advertises
-           the `data-channel-vp9-444` transport AND the browser can
-           decode VP9 profile 1, this routes encoded frames over an
-           RTCDataChannel + WebCodecs canvas instead of the WebRTC
-           video track. Bypasses Chrome's 4:2:0 chroma subsampling so
-           text stays crisp. Takes effect on the next Connect.
-           Disabled when the browser lacks VP9-444 decode (older
-           Chrome / non-Chromium browsers). -->
-      <v-btn
-        icon
-        variant="text"
-        size="small"
-        class="mr-2"
-        :color="vp9_444On ? 'primary' : undefined"
-        :disabled="!rc.vp9_444Supported.value"
-        :aria-label="vp9_444On ? 'Disable crystal-clear (VP9 4:4:4) path' : 'Enable crystal-clear (VP9 4:4:4) path'"
-        :title="vp9_444Tooltip"
-        @click="toggleVp9_444"
-      >
-        <v-icon>{{ vp9_444On ? 'mdi-format-color-fill' : 'mdi-format-color-marker-cancel' }}</v-icon>
-      </v-btn>
-
-      <!-- Low-latency (WebCodecs) toggle. When supported + enabled, the
-           viewer uses a Web Worker + VideoDecoder + canvas render path
-           that bypasses Chrome's built-in jitter buffer (~80 ms soft
-           floor on <video>). Takes effect on the next Connect. Disabled
-           and off when the browser lacks RTCRtpScriptTransform /
-           VideoDecoder. -->
-      <v-btn
-        icon
-        variant="text"
-        size="small"
-        class="mr-2"
-        :color="webcodecsOn ? 'primary' : undefined"
-        :disabled="!rc.webcodecsSupported.value"
-        :aria-label="webcodecsOn ? 'Disable low-latency path' : 'Enable low-latency (WebCodecs) path'"
-        :title="webcodecsTooltip"
-        @click="toggleWebCodecs"
-      >
-        <v-icon>{{ webcodecsOn ? 'mdi-flash' : 'mdi-flash-outline' }}</v-icon>
       </v-btn>
       <v-btn
         v-if="rc.phase.value === 'idle' || rc.phase.value === 'closed' || rc.phase.value === 'error'"
@@ -303,7 +131,169 @@
       >
         Disconnect
       </v-btn>
+      <!-- Fullscreen: gated on (a) connected session AND (b) the
+           document supports the Fullscreen API. iOS Safari only
+           supports `webkitEnterFullscreen` on `<video>` elements,
+           and won't show overlay canvases (cursor / stats), so we
+           hide the button on iOS rather than pretend it works.
+           ESC exits natively. -->
+      <v-btn
+        v-if="rc.phase.value === 'connected' && fullscreenEnabled"
+        icon
+        variant="text"
+        size="small"
+        class="ml-1"
+        :aria-label="isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'"
+        :title="isFullscreen ? 'Exit fullscreen (Esc)' : 'Fullscreen'"
+        @click="toggleFullscreen"
+      >
+        <v-icon>{{ isFullscreen ? 'mdi-fullscreen-exit' : 'mdi-fullscreen' }}</v-icon>
+      </v-btn>
     </v-toolbar>
+
+    <!-- ============================================================
+         Toolbar Row 2: session controls. Visible inline on `md+`,
+         collapsed into the bottom-sheet on `<md`. `flex-wrap: wrap`
+         lets it spill to a second row on borderline viewports
+         (~960-1100px) instead of pushing controls off-screen.
+         ============================================================ -->
+    <div class="rc-tools-row d-none d-md-flex align-center flex-wrap ga-2 px-2 py-1">
+      <v-select
+        v-model="quality"
+        :items="qualityOptions"
+        density="compact"
+        hide-details
+        variant="outlined"
+        style="max-width: 140px;"
+        prepend-inner-icon="mdi-quality-high"
+        aria-label="Quality preference"
+      />
+      <v-select
+        v-model="scaleMode"
+        :items="scaleOptions"
+        density="compact"
+        hide-details
+        variant="outlined"
+        style="max-width: 160px;"
+        prepend-inner-icon="mdi-image-size-select-actual"
+        aria-label="View scale"
+      />
+      <v-text-field
+        v-if="scaleMode === 'custom'"
+        v-model.number="scalePercent"
+        type="number"
+        min="5"
+        max="1000"
+        step="5"
+        density="compact"
+        hide-details
+        variant="outlined"
+        style="max-width: 110px;"
+        suffix="%"
+        aria-label="Custom scale percent"
+      />
+      <v-select
+        v-model="resolutionPresetValue"
+        :items="resolutionOptions"
+        density="compact"
+        hide-details
+        variant="outlined"
+        style="max-width: 190px;"
+        prepend-inner-icon="mdi-monitor-screenshot"
+        aria-label="Remote capture resolution"
+        :title="resolutionButtonTitle"
+      />
+      <v-select
+        v-model="codecOverride"
+        :items="codecOptions"
+        density="compact"
+        hide-details
+        variant="outlined"
+        style="max-width: 160px;"
+        prepend-inner-icon="mdi-video-outline"
+        aria-label="Codec override"
+        :title="codecOverride == null
+          ? 'Agent picks the best available codec'
+          : `Forcing ${codecOverride.toUpperCase()} — takes effect on next Connect`"
+      />
+      <!-- Crystal-clear (VP9 4:4:4) toggle. Persists across reloads;
+           takes effect on next Connect. Disabled when the browser
+           lacks WebCodecs VideoDecoder vp09.01.10.08. -->
+      <v-btn
+        icon
+        variant="text"
+        size="small"
+        :color="vp9_444On ? 'primary' : undefined"
+        :disabled="!rc.vp9_444Supported.value"
+        :aria-label="vp9_444On ? 'Disable crystal-clear (VP9 4:4:4) path' : 'Enable crystal-clear (VP9 4:4:4) path'"
+        :title="vp9_444Tooltip"
+        @click="toggleVp9_444"
+      >
+        <v-icon>{{ vp9_444On ? 'mdi-format-color-fill' : 'mdi-format-color-marker-cancel' }}</v-icon>
+      </v-btn>
+      <!-- Low-latency (WebCodecs) toggle. Bypasses Chrome's <video>
+           jitter-buffer floor (~80ms). Disabled when the browser
+           lacks RTCRtpScriptTransform / VideoDecoder. -->
+      <v-btn
+        icon
+        variant="text"
+        size="small"
+        :color="webcodecsOn ? 'primary' : undefined"
+        :disabled="!rc.webcodecsSupported.value"
+        :aria-label="webcodecsOn ? 'Disable low-latency path' : 'Enable low-latency (WebCodecs) path'"
+        :title="webcodecsTooltip"
+        @click="toggleWebCodecs"
+      >
+        <v-icon>{{ webcodecsOn ? 'mdi-flash' : 'mdi-flash-outline' }}</v-icon>
+      </v-btn>
+      <!-- Connected-only tools: clipboard send/get + file upload.
+           Both DCs only open while connected, so the buttons are
+           hidden otherwise. -->
+      <v-btn
+        v-if="rc.phase.value === 'connected'"
+        icon
+        variant="text"
+        size="small"
+        :loading="clipboardBusy"
+        aria-label="Send my clipboard to the remote host"
+        title="Send my clipboard → remote"
+        @click="onSendClipboard"
+      >
+        <v-icon>mdi-content-paste</v-icon>
+      </v-btn>
+      <v-btn
+        v-if="rc.phase.value === 'connected'"
+        icon
+        variant="text"
+        size="small"
+        :loading="clipboardBusy"
+        aria-label="Get the remote host's clipboard"
+        title="Get remote clipboard → me"
+        @click="onGetClipboard"
+      >
+        <v-icon>mdi-content-copy</v-icon>
+      </v-btn>
+      <v-btn
+        v-if="rc.phase.value === 'connected'"
+        icon
+        variant="text"
+        size="small"
+        :loading="uploadBusy"
+        aria-label="Upload a file to the remote host"
+        title="Upload file → remote"
+        @click="fileInput?.click()"
+      >
+        <v-icon>mdi-upload</v-icon>
+      </v-btn>
+    </div>
+    <!-- File input (hidden); shared between Row 2 inline upload
+         button and the bottom-sheet upload button. -->
+    <input
+      ref="fileInput"
+      type="file"
+      style="display: none"
+      @change="onFilePicked"
+    />
 
     <!-- Viewer -->
     <div class="remote-stage">
@@ -509,8 +499,12 @@
       </v-card>
     </v-dialog>
 
-    <!-- Mobile settings bottom-sheet (hidden on md and above where the
-         inline toolbar row already shows the same controls). -->
+    <!-- Mobile settings bottom-sheet — holds Row 2's controls on `<md`
+         viewports where the inline row is hidden. Includes the
+         session-config toggles (Crystal-Clear, Low-Latency) and
+         the connected-only tools (clipboard send/get, upload) so
+         a phone operator never has to reach for a control that
+         isn't on screen. Ctrl-Alt-Del stays in the toolbar above. -->
     <v-bottom-sheet v-model="mobileSettingsOpen" inset>
       <v-card>
         <v-card-title>Viewer settings</v-card-title>
@@ -568,6 +562,65 @@
               : `Forcing ${codecOverride.toUpperCase()} - takes effect on next Connect`"
             persistent-hint
           />
+          <v-divider />
+          <!-- Session-config toggles. Side-by-side on phone since
+               they're each one tap and the icons make the meaning
+               obvious; the title on each is the full description. -->
+          <div class="d-flex ga-2 align-center">
+            <v-btn
+              variant="tonal"
+              :color="vp9_444On ? 'primary' : undefined"
+              :disabled="!rc.vp9_444Supported.value"
+              prepend-icon="mdi-format-color-fill"
+              :title="vp9_444Tooltip"
+              class="flex-grow-1"
+              @click="toggleVp9_444"
+            >
+              Crystal-Clear {{ vp9_444On ? 'ON' : 'OFF' }}
+            </v-btn>
+            <v-btn
+              variant="tonal"
+              :color="webcodecsOn ? 'primary' : undefined"
+              :disabled="!rc.webcodecsSupported.value"
+              prepend-icon="mdi-flash"
+              :title="webcodecsTooltip"
+              class="flex-grow-1"
+              @click="toggleWebCodecs"
+            >
+              Low-Latency {{ webcodecsOn ? 'ON' : 'OFF' }}
+            </v-btn>
+          </div>
+          <!-- Connected-only tools. Hidden when no session is live —
+               the underlying DCs are closed so the actions would
+               silently fail. Each is a full-width button so it's
+               easy to tap on a phone. -->
+          <template v-if="rc.phase.value === 'connected'">
+            <v-divider />
+            <v-btn
+              variant="tonal"
+              prepend-icon="mdi-content-paste"
+              :loading="clipboardBusy"
+              @click="onSendClipboard"
+            >
+              Send my clipboard → remote
+            </v-btn>
+            <v-btn
+              variant="tonal"
+              prepend-icon="mdi-content-copy"
+              :loading="clipboardBusy"
+              @click="onGetClipboard"
+            >
+              Get remote clipboard → me
+            </v-btn>
+            <v-btn
+              variant="tonal"
+              prepend-icon="mdi-upload"
+              :loading="uploadBusy"
+              @click="fileInput?.click()"
+            >
+              Upload file → remote
+            </v-btn>
+          </template>
         </v-card-text>
         <v-card-actions>
           <v-spacer />
@@ -875,6 +928,19 @@ function bindVp9_444Canvas(el: Element | unknown) {
 // Fullscreen API. `isFullscreen` tracks the real DOM state via the
 // fullscreenchange event so ESC (which the browser handles natively)
 // updates the icon without us polling.
+//
+// `fullscreenEnabled` gates the toolbar button: iOS Safari only supports
+// `webkitEnterFullscreen` on `<video>` elements, NOT on arbitrary divs,
+// and won't show overlay canvases (cursor / stats / no-media-overlay)
+// because they aren't part of the <video>. Rather than render a button
+// that does nothing, we hide it on browsers where the API isn't usable.
+// `document.fullscreenEnabled` is the standard property; reads false on
+// iPhone Safari, true on Chrome/Firefox/Safari desktop, true in Chromium
+// Android (where it works on divs).
+const fullscreenEnabled = computed<boolean>(() => {
+  if (typeof document === 'undefined') return false
+  return document.fullscreenEnabled === true
+})
 const isFullscreen = ref(false)
 function toggleFullscreen() {
   const el = stageEl.value
@@ -1377,15 +1443,36 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
 }
-/* On narrow viewports the toolbar's many controls (back button, title,
-   phase chip, quality / scale / scale-percent / resolution / codec
-   selects, clipboard / Ctrl-Alt-Del / fullscreen / WebCodecs / file-
-   upload / disconnect buttons) don't fit; without horizontal scroll
-   the rightmost ones (notably Disconnect) sit past the viewport edge
-   and are unreachable. v-toolbar otherwise hides overflow. Field bug
-   PC50045 mobile 2026-05-01. */
-.remote-control-wrapper :deep(.v-toolbar__content) {
+/* Row 1 (primary toolbar): keep on a single line at every viewport
+   so Back / title / Connect-Disconnect / Fullscreen never push off-
+   screen. Vuetify's outer wrapper clips overflow by default; the
+   `overflow-x: auto` on `__content` is a defensive fallback for
+   borderline viewports where a long agent name + chips push past
+   320px. The `flex-shrink: 1` on the title lets it ellipsis instead
+   of forcing the end-of-row buttons off-screen. Field bug
+   PC50045 mobile 2026-05-01 ('cannot fullscreen, button is gone'
+   after Connect mounted +5 buttons in the single-row toolbar). */
+.remote-control-wrapper :deep(.rc-toolbar-primary .v-toolbar__content) {
   overflow-x: auto;
+}
+.remote-control-wrapper :deep(.rc-toolbar-primary .v-toolbar-title) {
+  flex-shrink: 1;
+  min-width: 0;
+}
+/* Row 2 (session controls): visible on `md+`, hidden on `<md`.
+   `flex-wrap: wrap` lets controls spill to a second visual line on
+   borderline desktops (~960-1100px) instead of overflowing the
+   toolbar. `border-bottom` separates it from the video stage. */
+.remote-control-wrapper .rc-tools-row {
+  background: rgb(var(--v-theme-surface));
+  border-bottom: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
+  min-height: 44px;
+}
+/* The v-select density="compact" inside the wrap row otherwise
+   forces a 56px tall input on touch devices, which makes the row
+   feel chunky. Trim to match the toolbar density. */
+.remote-control-wrapper .rc-tools-row :deep(.v-field) {
+  --v-field-padding-top: 4px;
 }
 .remote-stage {
   flex: 1;

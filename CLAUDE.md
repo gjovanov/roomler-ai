@@ -161,6 +161,7 @@ MongoDB native driver (not Mongoose). Models live in `crates/db/src/models/` exc
 - **WebRTC**: Mediasoup client for video conferencing
 - **API client**: `ui/src/api/client.ts` with auth token injection
 - **Vite proxy**: `/api` and `/ws` proxied to `http://localhost:5001`
+- **Responsive page padding**: top-level views use `<v-container fluid class="pa-2 pa-md-4 pa-xl-6">` (8px mobile / 16px tablet+ / 24px ≥1920px). Empty-state blocks use `pa-4 pa-md-6 pa-lg-8`. Headings use `text-h5 text-md-h4` so they shrink one step on phone. Section CTAs use `size="large"` (not `x-large`) — the wider button overflows narrow viewports. Marketing/legal sections (`LandingView`, `Terms`, `Privacy`) replace fixed `py-12`/`py-16` with `py-6 py-md-12` / `py-8 py-md-16`. Custom-flex views (`ChatView`, `ConferenceView`) own their own layout and intentionally don't use `<v-container>`. Hide secondary toolbar items on `<sm` with `d-none d-sm-inline-flex`; surface a phone fallback alongside.
 
 ## Test Setup
 

@@ -7,10 +7,11 @@
         <span class="text-primary">Roomler</span>
       </v-toolbar-title>
       <v-spacer />
-      <v-btn variant="text" href="#features">Features</v-btn>
-      <v-btn variant="text" href="#pricing">Pricing</v-btn>
+      <v-btn variant="text" href="#features" class="d-none d-sm-inline-flex">Features</v-btn>
+      <v-btn variant="text" href="#pricing" class="d-none d-sm-inline-flex">Pricing</v-btn>
       <v-btn variant="outlined" color="primary" :to="{ name: 'login' }" class="mx-2">Log In</v-btn>
-      <v-btn color="primary" :to="{ name: 'register' }">Get Started Free</v-btn>
+      <v-btn color="primary" :to="{ name: 'register' }" class="d-none d-sm-inline-flex">Get Started Free</v-btn>
+      <v-btn color="primary" :to="{ name: 'register' }" class="d-sm-none" size="small">Sign Up</v-btn>
     </v-app-bar>
 
     <!-- Hero -->
@@ -18,17 +19,19 @@
       <v-container>
         <v-row align="center" justify="center">
           <v-col cols="12" md="8" class="text-center">
-            <h1 class="text-h2 font-weight-bold mb-4">Where teams connect, collaborate,<br/>and create — <span class="text-primary">in real time</span></h1>
-            <p class="text-h6 landing-muted mb-8">Rooms for chat and calls, threaded messaging, HD video conferencing, file sharing, and AI-powered document recognition — all in one platform.</p>
-            <v-btn color="primary" size="x-large" :to="{ name: 'register' }" class="mr-4 px-8">Start Free</v-btn>
-            <v-btn variant="outlined" size="x-large" href="#pricing" class="px-8">View Plans</v-btn>
+            <h1 class="text-h4 text-md-h2 font-weight-bold mb-4">Where teams connect, collaborate,<br/>and create — <span class="text-primary">in real time</span></h1>
+            <p class="text-body-1 text-md-h6 landing-muted mb-6 mb-md-8">Rooms for chat and calls, threaded messaging, HD video conferencing, file sharing, and AI-powered document recognition — all in one platform.</p>
+            <div class="d-flex flex-wrap justify-center ga-3">
+              <v-btn color="primary" size="large" :to="{ name: 'register' }" class="px-6">Start Free</v-btn>
+              <v-btn variant="outlined" size="large" href="#pricing" class="px-6">View Plans</v-btn>
+            </div>
           </v-col>
         </v-row>
       </v-container>
     </section>
 
     <!-- Trust bar -->
-    <section class="trust-section py-8">
+    <section class="trust-section py-4 py-md-8">
       <v-container>
         <p class="text-center text-body-2 landing-muted mb-4">Trusted by teams who value real-time collaboration</p>
         <v-row justify="center" align="center">
@@ -41,13 +44,13 @@
     </section>
 
     <!-- Features -->
-    <section id="features" class="features-section py-16">
+    <section id="features" class="features-section py-8 py-md-16">
       <v-container>
-        <h2 class="text-h3 text-center font-weight-bold mb-2">Everything your team needs</h2>
-        <p class="text-center text-body-1 landing-muted mb-12">From quick messages to deep collaboration</p>
+        <h2 class="text-h4 text-md-h3 text-center font-weight-bold mb-2">Everything your team needs</h2>
+        <p class="text-center text-body-1 landing-muted mb-6 mb-md-12">From quick messages to deep collaboration</p>
         <v-row>
           <v-col v-for="feature in features" :key="feature.title" cols="12" sm="6" md="4">
-            <v-card variant="outlined" class="feature-card pa-6 h-100" rounded="lg">
+            <v-card variant="outlined" class="feature-card pa-4 pa-md-6 h-100" rounded="lg">
               <v-icon :color="feature.color" size="48" class="mb-4">{{ feature.icon }}</v-icon>
               <h3 class="text-h6 font-weight-bold mb-2">{{ feature.title }}</h3>
               <p class="text-body-2 landing-muted">{{ feature.description }}</p>
@@ -58,16 +61,16 @@
     </section>
 
     <!-- Pricing -->
-    <section id="pricing" class="pricing-section py-16">
+    <section id="pricing" class="pricing-section py-8 py-md-16">
       <v-container>
-        <h2 class="text-h3 text-center font-weight-bold mb-2">Simple, transparent pricing</h2>
-        <p class="text-center text-body-1 landing-muted mb-12">Start free, upgrade when you need more</p>
+        <h2 class="text-h4 text-md-h3 text-center font-weight-bold mb-2">Simple, transparent pricing</h2>
+        <p class="text-center text-body-1 landing-muted mb-6 mb-md-12">Start free, upgrade when you need more</p>
         <v-row justify="center">
           <v-col v-for="plan in plans" :key="plan.name" cols="12" sm="6" md="4">
             <v-card
               :variant="plan.popular ? 'elevated' : 'outlined'"
               :elevation="plan.popular ? 8 : 0"
-              class="pa-6 h-100 d-flex flex-column"
+              class="pa-4 pa-md-6 h-100 d-flex flex-column"
               rounded="lg"
               :class="{ 'border-primary': plan.popular }"
             >
@@ -99,20 +102,20 @@
     </section>
 
     <!-- Final CTA -->
-    <section class="cta-section py-16">
+    <section class="cta-section py-8 py-md-16">
       <v-container>
         <v-row justify="center">
           <v-col cols="12" md="8" class="text-center">
-            <h2 class="text-h3 font-weight-bold mb-4 text-white">Ready to bring your team together?</h2>
-            <p class="text-body-1 cta-subtitle mb-8">Join thousands of teams already collaborating on Roomler.</p>
-            <v-btn color="white" size="x-large" :to="{ name: 'register' }" class="px-8 text-primary">Create Your Workspace — Free</v-btn>
+            <h2 class="text-h4 text-md-h3 font-weight-bold mb-4 text-white">Ready to bring your team together?</h2>
+            <p class="text-body-1 cta-subtitle mb-6 mb-md-8">Join thousands of teams already collaborating on Roomler.</p>
+            <v-btn color="white" size="large" :to="{ name: 'register' }" class="px-6 text-primary">Create Your Workspace — Free</v-btn>
           </v-col>
         </v-row>
       </v-container>
     </section>
 
     <!-- Footer -->
-    <v-footer class="landing-footer py-8">
+    <v-footer class="landing-footer py-4 py-md-8">
       <v-container>
         <v-row>
           <v-col cols="12" sm="4">
@@ -250,11 +253,17 @@ const plans = [
 }
 
 .hero-section {
-  padding-top: 140px;
-  padding-bottom: 80px;
+  padding-top: 96px;
+  padding-bottom: 48px;
   background: linear-gradient(135deg, #e0f2f1 0%, #e8f5e9 50%, #e0f7fa 100%);
   position: relative;
   overflow: hidden;
+}
+@media (min-width: 960px) {
+  .hero-section {
+    padding-top: 140px;
+    padding-bottom: 80px;
+  }
 }
 
 .hero-section::before {

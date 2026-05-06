@@ -33,73 +33,30 @@
         <v-progress-circular indeterminate />
       </div>
 
-      <!-- Desktop / tablet: full table. Vuetify's v-table wrapper already
-           handles horizontal overflow scroll, but on real-narrow screens
-           the row gets cramped and the Actions column hides past the
-           viewport edge — hence the dedicated mobile list below. -->
+      <!-- Desktop / tablet (≥ sm): full table. Action column is leftmost so
+           it never falls off the right edge regardless of overflow; codec
+           chips collapse to "+N" on lgAndDown to reclaim ~200px on mid-width
+           viewports (was the field bug from PC50045 2026-05-01: "cannot
+           select the last Laptop in the list, not possible to scroll").
+           Below sm we render the dedicated card list further down. -->
       <v-table
         v-else-if="agentStore.agents.length > 0 && !mobile"
-        density="comfortable"
+        density="compact"
+        class="agents-table"
       >
         <thead>
           <tr>
+            <th class="agents-actions-col">Actions</th>
             <th>Name</th>
-            <th>OS</th>
-            <th>Version</th>
-            <th>Codecs</th>
             <th>Status</th>
+            <th>OS</th>
+            <th>Codecs</th>
             <th>Last seen</th>
-            <th class="text-right">Actions</th>
           </tr>
         </thead>
         <tbody>
           <tr v-for="a in agentStore.agents" :key="a.id">
-            <td>
-              <div class="d-flex align-center">
-                <v-icon
-                  :color="a.is_online ? 'success' : 'grey'"
-                  size="small"
-                  class="mr-2"
-                >
-                  {{ a.is_online ? 'mdi-circle' : 'mdi-circle-outline' }}
-                </v-icon>
-                <span class="font-weight-medium">{{ a.name }}</span>
-              </div>
-              <div class="text-caption text-medium-emphasis">
-                {{ a.machine_id }}
-              </div>
-            </td>
-            <td>
-              <v-chip size="x-small" :prepend-icon="osIcon(a.os)" variant="tonal">
-                {{ a.os }}
-              </v-chip>
-            </td>
-            <td class="text-caption">{{ a.agent_version || '—' }}</td>
-            <td>
-              <div class="d-flex flex-wrap gap-1">
-                <v-chip
-                  v-for="codec in codecChips(a)"
-                  :key="codec.label"
-                  size="x-small"
-                  :color="codec.color"
-                  variant="tonal"
-                  :title="codec.tooltip"
-                >
-                  {{ codec.label }}
-                </v-chip>
-                <span
-                  v-if="codecChips(a).length === 0"
-                  class="text-caption text-medium-emphasis"
-                >—</span>
-              </div>
-            </td>
-            <td>
-              <v-chip size="small" :color="statusColor(a)" variant="flat">
-                {{ a.is_online ? 'Online' : a.status }}
-              </v-chip>
-            </td>
-            <td class="text-caption">{{ fmtDate(a.last_seen_at) }}</td>
-            <td class="text-right">
+            <td class="agents-actions-col">
               <v-btn
                 icon="mdi-remote-desktop"
                 size="small"
@@ -118,6 +75,65 @@
                 :aria-label="`Delete agent ${a.name}`"
               />
             </td>
+            <td>
+              <div class="d-flex align-center">
+                <v-icon
+                  :color="a.is_online ? 'success' : 'grey'"
+                  size="small"
+                  class="mr-2"
+                >
+                  {{ a.is_online ? 'mdi-circle' : 'mdi-circle-outline' }}
+                </v-icon>
+                <span class="font-weight-medium">{{ a.name }}</span>
+              </div>
+              <div class="text-caption text-medium-emphasis">
+                {{ a.machine_id }}<span v-if="a.agent_version"> · v{{ a.agent_version }}</span>
+              </div>
+            </td>
+            <td>
+              <v-chip size="small" :color="statusColor(a)" variant="flat">
+                {{ a.is_online ? 'Online' : a.status }}
+              </v-chip>
+            </td>
+            <td>
+              <v-chip size="x-small" :prepend-icon="osIcon(a.os)" variant="tonal">
+                {{ a.os }}
+              </v-chip>
+            </td>
+            <td>
+              <div v-if="codecChips(a).length === 0" class="text-caption text-medium-emphasis">—</div>
+              <div v-else-if="lgAndDown" class="d-flex flex-wrap gap-1 align-center">
+                <v-chip
+                  size="x-small"
+                  :color="codecChips(a)[0].color"
+                  variant="tonal"
+                  :title="codecChips(a).map(c => c.tooltip).join(', ')"
+                >
+                  {{ codecChips(a)[0].label }}
+                </v-chip>
+                <v-chip
+                  v-if="codecChips(a).length > 1"
+                  size="x-small"
+                  variant="tonal"
+                  :title="codecChips(a).slice(1).map(c => c.tooltip).join(', ')"
+                >
+                  +{{ codecChips(a).length - 1 }}
+                </v-chip>
+              </div>
+              <div v-else class="d-flex flex-wrap gap-1">
+                <v-chip
+                  v-for="codec in codecChips(a)"
+                  :key="codec.label"
+                  size="x-small"
+                  :color="codec.color"
+                  variant="tonal"
+                  :title="codec.tooltip"
+                >
+                  {{ codec.label }}
+                </v-chip>
+              </div>
+            </td>
+            <td class="text-caption" :title="fmtDate(a.last_seen_at)">{{ fmtRelative(a.last_seen_at) }}</td>
           </tr>
         </tbody>
       </v-table>
@@ -213,7 +229,7 @@
         </v-card>
       </v-list>
 
-      <div v-else class="text-center pa-8 text-medium-emphasis">
+      <div v-else class="text-center pa-4 pa-md-6 pa-lg-8 text-medium-emphasis">
         <v-icon size="64" color="grey-lighten-1" class="mb-2">mdi-desktop-classic</v-icon>
         <p class="mb-2">No agents enrolled yet.</p>
         <p class="text-body-2">
@@ -299,10 +315,10 @@ const props = defineProps<{ tenantId: string }>()
 
 const agentStore = useAgentStore()
 
-// `mobile` is reactive: Vuetify's display module flips it on viewports
-// narrower than the `mobile-breakpoint` (default `lg`, but the agent
-// table only really needs the dedicated layout below `sm`).
-const { smAndDown: mobile } = useDisplay()
+// `mobile` flips below sm (~600px) so the table stays usable on tablets
+// and small laptops; `lgAndDown` (≤1280) drives the codec-chip rollup so
+// mid-width viewports don't blow past the Actions column.
+const { smAndDown: mobile, lgAndDown } = useDisplay()
 
 const enrollDialogOpen = ref(false)
 const enrollLoading = ref(false)
@@ -336,6 +352,24 @@ function fmtDate(iso: string): string {
   } catch {
     return iso
   }
+}
+
+function fmtRelative(iso: string): string {
+  if (!iso) return '—'
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return iso
+  const diff = Date.now() - d.getTime()
+  if (diff < 0) return 'just now'
+  const mins = Math.floor(diff / 60000)
+  if (mins < 1) return 'just now'
+  if (mins < 60) return `${mins}m ago`
+  const hours = Math.floor(mins / 60)
+  if (hours < 24) return `${hours}h ago`
+  const days = Math.floor(hours / 24)
+  if (days < 30) return `${days}d ago`
+  const months = Math.floor(days / 30)
+  if (months < 12) return `${months}mo ago`
+  return `${Math.floor(months / 12)}y ago`
 }
 
 async function openEnrollDialog() {
@@ -394,3 +428,14 @@ watch(() => props.tenantId, (tid) => {
   if (tid) agentStore.fetchAgents(tid)
 })
 </script>
+
+<style scoped>
+/* Action column: keep it leftmost AND narrow so mid-width viewports never
+   push it off-screen. Two icon buttons fit in ~96px. */
+.agents-table :deep(th.agents-actions-col),
+.agents-table :deep(td.agents-actions-col) {
+  width: 96px;
+  min-width: 96px;
+  white-space: nowrap;
+}
+</style>
