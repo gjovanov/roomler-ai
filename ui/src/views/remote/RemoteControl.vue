@@ -295,7 +295,19 @@
       @change="onFilePicked"
     />
 
-    <!-- Viewer -->
+    <!-- Viewer. Wrapped in a Material-elevation v-card so the
+         render pane reads as a window into another machine —
+         distinct from the host UI's toolbar/page chrome. The card
+         is OUTSIDE the fullscreen target (`.video-frame`), so it
+         disappears in fullscreen automatically (operator wants
+         edge-to-edge pixels in that mode). -->
+    <v-card
+      variant="elevated"
+      elevation="2"
+      rounded="lg"
+      border
+      class="ma-2 ma-md-3 remote-stage-card flex-grow-1 d-flex"
+    >
     <div class="remote-stage">
       <v-alert
         v-if="rc.error.value"
@@ -439,6 +451,7 @@
         </div>
       </div>
     </div>
+    </v-card>
     <!-- Custom-resolution dialog. Opened when the operator picks the
          "Custom…" option in the Resolution dropdown; submits an
          rc:resolution {mode:'custom'} message on confirm. -->
@@ -1473,6 +1486,16 @@ onBeforeUnmount(() => {
    feel chunky. Trim to match the toolbar density. */
 .remote-control-wrapper .rc-tools-row :deep(.v-field) {
   --v-field-padding-top: 4px;
+}
+/* The card wrapping `.remote-stage` provides Material elevation +
+   rounded corners + theme-aware border. `overflow: hidden` clips
+   the dark stage at the rounded corners; `min-height: 0` keeps
+   the flex `min-height: 0` chain unbroken so `scale-original` mode
+   at 4K doesn't push past the viewport. */
+.remote-stage-card {
+  overflow: hidden;
+  min-height: 0;
+  background: #0b0b0b;
 }
 .remote-stage {
   flex: 1;
