@@ -514,18 +514,36 @@ pub enum ExitReaction {
 /// no SystemContext spawn ever fires.
 ///
 /// Set `ROOMLER_AGENT_ENABLE_SYSTEM_SWAP=1` (or `true`/`yes`/`on`) in
-/// the SCM service environment to re-enable. Field bug PC50045
-/// 2026-05-06: the auto-swap caused a crash loop because the
-/// SystemContext spawn fails for an as-yet-unknown reason and the
-/// supervisor's exponential backoff between spawn attempts left the
-/// agent unreachable from the browser.
+/// the SCM service environment to re-enable.
+///
+/// **0.3.0-rc.7 semantic change**: when the env var is on, this
+/// function unconditionally returns `true` — i.e. the supervisor
+/// treats every cycle as if a controller is connected, so
+/// `decide_spawn` always picks SystemContext over user-context. The
+/// marker file is now an observability tool only (visible via
+/// `peer-presence-status`), not a swap gate.
+///
+/// Why: rc.4 → rc.6 used the marker as a swap gate so the supervisor
+/// would swap user→SystemContext only when a controller connected.
+/// Field repro PC50045 2026-05-06 showed that the swap window
+/// (terminate user-context → spawn SystemContext → caps probe →
+/// agent.hello, ~13 s) is LONGER than the browser's auto-reconnect
+/// ladder (16 s budget across 6 attempts), so the browser consistently
+/// gave up before the SystemContext worker was ready. Net result:
+/// every controller-connect attempt killed itself.
+///
+/// The new "always SystemContext when env var on" semantic eliminates
+/// the swap-mid-session race. SystemContext starts at supervisor cold-
+/// start (when no worker exists yet), the browser connects to the
+/// already-warm SystemContext WS, no swap, no session tear. Tradeoff:
+/// the user-context-only data channels (clipboard, file-DC, cursor-DC)
+/// don't work in this mode — that's the explicit cost of opting in
+/// for admin/lock-screen control.
 fn peer_presence_is_signaled() -> bool {
     #[cfg(all(feature = "system-context", target_os = "windows"))]
     {
-        if !system_swap_enabled() {
-            return false;
-        }
-        return crate::system_context::peer_presence::is_signaled();
+        // env var on → always treat as connected. No marker check.
+        return system_swap_enabled();
     }
     #[cfg(not(all(feature = "system-context", target_os = "windows")))]
     {
