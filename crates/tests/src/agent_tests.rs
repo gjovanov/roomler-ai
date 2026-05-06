@@ -5,7 +5,7 @@
 //! fails here too.
 
 use crate::fixtures::test_app::TestApp;
-use roomler_agent::{config::AgentConfig, enrollment, signaling};
+use roomler_agent::{config::AgentConfig, encode::EncoderPreference, enrollment, signaling};
 use serde_json::{Value, json};
 use std::time::Duration;
 
@@ -83,7 +83,7 @@ async fn agent_library_connects_and_goes_online() {
     let sig_task = tokio::spawn({
         let cfg = cfg.clone();
         async move {
-            let _ = signaling::run(cfg, stop_rx).await;
+            let _ = signaling::run(cfg, EncoderPreference::Software, stop_rx).await;
         }
     });
 
@@ -169,7 +169,7 @@ async fn agent_answers_sdp_offer_with_real_webrtc_peer() {
     let sig_task = tokio::spawn({
         let cfg = cfg.clone();
         async move {
-            let _ = signaling::run(cfg, stop_rx).await;
+            let _ = signaling::run(cfg, EncoderPreference::Software, stop_rx).await;
         }
     });
 
