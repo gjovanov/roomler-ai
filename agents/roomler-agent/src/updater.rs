@@ -286,7 +286,7 @@ pub(crate) fn classify_install_flavour_from_path(p: &std::path::Path) -> Windows
 pub fn pick_asset_for_platform(assets: &[GithubAsset]) -> Option<&GithubAsset> {
     #[cfg(target_os = "windows")]
     {
-        return pick_asset_for_windows(assets, current_install_flavour());
+        pick_asset_for_windows(assets, current_install_flavour())
     }
     #[cfg(not(target_os = "windows"))]
     {

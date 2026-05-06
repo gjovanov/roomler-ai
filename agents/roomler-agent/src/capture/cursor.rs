@@ -263,33 +263,34 @@ mod windows_impl {
             // when no mask is available — there's nothing to fall
             // back to.
             let any_alpha = bgra.chunks_exact(4).any(|p| p[3] != 0);
-            if !any_alpha && !icon_info.hbmMask.is_invalid() {
-                if let Some(mask_alpha) = read_mask_as_alpha(icon_info.hbmMask, width, height) {
-                    // Apply mask: AND-mask=0 means opaque (cursor
-                    // body), AND-mask≠0 means transparent.
-                    for (i, px) in bgra.chunks_exact_mut(4).enumerate() {
-                        if i < mask_alpha.len() {
-                            px[3] = mask_alpha[i];
-                        }
+            if !any_alpha
+                && !icon_info.hbmMask.is_invalid()
+                && let Some(mask_alpha) = read_mask_as_alpha(icon_info.hbmMask, width, height)
+            {
+                // Apply mask: AND-mask=0 means opaque (cursor
+                // body), AND-mask≠0 means transparent.
+                for (i, px) in bgra.chunks_exact_mut(4).enumerate() {
+                    if i < mask_alpha.len() {
+                        px[3] = mask_alpha[i];
                     }
-                    // If even after mask application every pixel is
-                    // still alpha=0 the cursor would render fully
-                    // transparent. That's a degenerate cursor (e.g.
-                    // an empty bitmap from a buggy app); fall through
-                    // and synthesise an outline so the controller
-                    // still sees a pointer indicator.
-                    let now_visible = bgra.chunks_exact(4).any(|p| p[3] != 0);
-                    if !now_visible {
-                        return None;
-                    }
-                    // Many legacy color+mask cursors paint the cursor
-                    // body in pure black (RGB=0). After applying
-                    // mask alpha, those pixels are opaque-black which
-                    // is invisible on Notepad++ dark theme. Add a
-                    // 1-pixel white outline around the opaque region
-                    // so the cursor stays visible on any background.
-                    add_white_outline_to_opaque_black(&mut bgra, width, height);
                 }
+                // If even after mask application every pixel is
+                // still alpha=0 the cursor would render fully
+                // transparent. That's a degenerate cursor (e.g. an
+                // empty bitmap from a buggy app); fall through and
+                // synthesise an outline so the controller still
+                // sees a pointer indicator.
+                let now_visible = bgra.chunks_exact(4).any(|p| p[3] != 0);
+                if !now_visible {
+                    return None;
+                }
+                // Many legacy color+mask cursors paint the cursor
+                // body in pure black (RGB=0). After applying mask
+                // alpha, those pixels are opaque-black which is
+                // invisible on Notepad++ dark theme. Add a 1-pixel
+                // white outline around the opaque region so the
+                // cursor stays visible on any background.
+                add_white_outline_to_opaque_black(&mut bgra, width, height);
             }
 
             Some(CursorInfo {
