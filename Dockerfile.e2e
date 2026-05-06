@@ -4,19 +4,29 @@
 #
 # Base: Microsoft's Playwright image with Chromium + Firefox + WebKit
 # preinstalled. Same major version (1.58.x) as `ui/package.json` to
-# avoid driver/browser mismatch errors. The image ships Node.js, NOT
-# bun — so we install dependencies via `npm ci` instead of `bun install`.
-# The bun-specific CDP transport patches in `playwright.config.cjs`
-# are wrapped in try/catch and no-op under Node (`globalThis.WebSocket`
-# is undefined; the inner `require` of bun-only paths throws and is
-# swallowed).
+# avoid driver/browser mismatch errors.
+#
+# Dependency install uses bun (matches prod's `bun install
+# --frozen-lockfile` against `bun.lock`) — the package-lock.json in
+# the repo is bun-generated and incomplete for `npm ci` (many
+# transitive deps missing). Installing bun adds ~80MB but keeps a
+# single lockfile source of truth and avoids npm/bun resolution
+# divergence. The bun-specific CDP transport patches in
+# `playwright.config.cjs` ARE relevant under bun (we want them) so
+# this is also functionally correct.
 FROM mcr.microsoft.com/playwright:v1.58.2-jammy
+
+# Install bun. The official install script writes to /root/.bun.
+RUN apt-get update && apt-get install -y --no-install-recommends curl unzip ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -fsSL https://bun.sh/install | bash
+ENV PATH="/root/.bun/bin:$PATH"
 
 WORKDIR /app
 
 # Layer 1: dependencies — cache invalidates only on lockfile change.
-COPY ui/package.json ui/package-lock.json ./
-RUN npm ci --no-audit --no-fund
+COPY ui/package.json ui/bun.lock ./
+RUN bun install --frozen-lockfile
 
 # Layer 2: spec content — invalidates on every e2e change.
 COPY ui/playwright.config.cjs ./
@@ -61,9 +71,14 @@ echo "[run-e2e] E2E_BASE_URL=$E2E_BASE_URL"
 echo "[run-e2e] E2E_API_URL=$E2E_API_URL"
 EXIT_CODE=0
 # `set +e` so a non-zero Playwright exit doesn't trip set -e and
-# skip the artifact-finalize steps.
+# skip the artifact-finalize steps. Use `bunx` (matches prod
+# tooling); falls back to `npx` if bun isn't on PATH.
 set +e
-npx playwright test --config=playwright.config.cjs --reporter=list,html $EXTRA
+if command -v bunx >/dev/null 2>&1; then
+  bunx playwright test --config=playwright.config.cjs --reporter=list,html $EXTRA
+else
+  npx playwright test --config=playwright.config.cjs --reporter=list,html $EXTRA
+fi
 EXIT_CODE=$?
 set -e
 echo "[run-e2e] Playwright exit=$EXIT_CODE"
