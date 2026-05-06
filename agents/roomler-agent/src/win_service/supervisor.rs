@@ -543,7 +543,7 @@ fn peer_presence_is_signaled() -> bool {
     #[cfg(all(feature = "system-context", target_os = "windows"))]
     {
         // env var on → always treat as connected. No marker check.
-        return system_swap_enabled();
+        system_swap_enabled()
     }
     #[cfg(not(all(feature = "system-context", target_os = "windows")))]
     {
