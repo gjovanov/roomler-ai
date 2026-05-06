@@ -716,9 +716,41 @@ export function useRemoteControl() {
   // transition wins, so a `files:cancel` racing a `files:complete` /
   // `files:eof` doesn't double-resolve the Promise.
   type UploadResolve = (result: { path: string; bytes: number }) => void
+  type DownloadResolve = (result: { name: string; bytes: number }) => void
+  // FileSystemWritableFileStream is the showSaveFilePicker writable
+  // (Chrome / Edge / Safari 17+). Older TS lib targets miss the type;
+  // we keep the structural shape we actually use to avoid a lib bump.
+  type SaveWritable = {
+    write: (data: Uint8Array | ArrayBuffer) => Promise<void>
+    close: () => Promise<void>
+    abort: (reason?: unknown) => Promise<void>
+  }
+  type DownloadEntry = {
+    kind: 'download'
+    status: 'pending' | 'settled'
+    resolve: DownloadResolve
+    reject: (err: Error) => void
+    // Sink: either a streaming writable (Chrome) OR a Blob accumulator
+    // (Firefox / Safari < 17). Decided at downloadFile() time and
+    // populated when files:offer arrives.
+    saveMode: 'stream' | 'blob' | 'pending'
+    writable: SaveWritable | null
+    blobs: BlobPart[]
+    name: string
+    suggestedName?: string
+    bytesReceived: number
+    expectedSize: number | null
+    mime?: string
+  }
   type RegistryEntry =
     | { kind: 'upload'; status: 'pending' | 'settled'; resolve: UploadResolve; reject: (err: Error) => void }
+    | DownloadEntry
   const filesRegistry = new Map<string, RegistryEntry>()
+  // The browser-side demux contract: while a download `files:offer` is
+  // active, every binary frame on the DC belongs to that id. There can
+  // only be one active outgoing transfer at a time (server enforces);
+  // we mirror that here so binary chunks find the right writable.
+  let activeDownloadId: string | null = null
   // Settle an entry exactly once. Returns true if THIS call won the
   // transition; false if the entry was already settled. The caller uses
   // the return value to skip duplicate resolve / reject.
@@ -1628,26 +1660,77 @@ export function useRemoteControl() {
     channels.clipboard = pc.createDataChannel('clipboard', { ordered: true })
     channels.files = pc.createDataChannel('files', { ordered: true })
 
-    // Persistent listener on the `files` DC. Demuxes every JSON control
-    // message by id and dispatches to the registry entry that owns the
-    // transfer. Single attach point: replaces the per-call
+    // Persistent listener on the `files` DC. Demuxes every control
+    // message by id and dispatches to the registry entry that owns
+    // the transfer. Single attach point: replaces the per-call
     // addEventListener pattern from 0.2.x. See `filesRegistry` doc
     // comment for the lifecycle contract.
+    //
+    // String frames are JSON control messages (files:offer, eof,
+    // complete, error, progress, accepted, dir-list, dir-error).
+    // Binary frames are download chunks routed to the
+    // `activeDownloadId`'s registry entry per the demux contract
+    // (one active outgoing transfer at a time).
     channels.files.onmessage = (ev) => {
       if (typeof ev.data !== 'string') {
-        // Phase 2 (downloads) will route binary frames here. Today
-        // (uploads only), the agent never sends binary on this DC, so
-        // dropping is fine.
+        // Binary frame — route to the active download's writable
+        // or Blob accumulator. If no active download, drop (would
+        // be a protocol violation; agent shouldn't send binaries
+        // without a preceding files:offer).
+        if (!activeDownloadId) return
+        const entry = filesRegistry.get(activeDownloadId)
+        if (!entry || entry.kind !== 'download' || entry.status === 'settled') return
+        // ev.data may be ArrayBuffer or Blob depending on the DC's
+        // binaryType. webrtc-rs DCs default to ArrayBuffer.
+        const data = ev.data as ArrayBuffer | Blob
+        if (data instanceof ArrayBuffer) {
+          appendDownloadChunk(entry, data)
+        } else if (data instanceof Blob) {
+          // Async path; we don't await — entries are kept in arrival
+          // order via the same await chain.
+          void data.arrayBuffer().then((buf) => appendDownloadChunk(entry, buf))
+        }
         return
       }
-      let msg: { t?: string; id?: string; path?: string; bytes?: number; message?: string }
+      let msg: {
+        t?: string
+        id?: string
+        req_id?: string
+        name?: string
+        size?: number | null
+        mime?: string
+        path?: string
+        parent?: string | null
+        entries?: DirEntry[]
+        bytes?: number
+        message?: string
+      }
       try {
         msg = JSON.parse(ev.data)
       } catch {
         return
       }
       const id = typeof msg.id === 'string' ? msg.id : ''
-      if (!id) return
+      // Directory listing replies are demuxed by req_id, not id.
+      if (msg.t === 'files:dir-list') {
+        const reqId = typeof msg.req_id === 'string' ? msg.req_id : ''
+        const pending = settleDirRequest(reqId)
+        if (pending) {
+          pending.resolve({
+            path: String(msg.path ?? ''),
+            parent: typeof msg.parent === 'string' ? msg.parent : null,
+            entries: Array.isArray(msg.entries) ? msg.entries : [],
+          })
+        }
+        return
+      } else if (msg.t === 'files:dir-error') {
+        const reqId = typeof msg.req_id === 'string' ? msg.req_id : ''
+        const pending = settleDirRequest(reqId)
+        if (pending) {
+          pending.reject(new Error(String(msg.message ?? 'agent dir error')))
+        }
+        return
+      }
       if (msg.t === 'files:complete') {
         const entry = settleEntry(id)
         if (entry?.kind === 'upload') {
@@ -1655,27 +1738,91 @@ export function useRemoteControl() {
           entry.resolve({ path: String(msg.path ?? ''), bytes: Number(msg.bytes ?? 0) })
         }
       } else if (msg.t === 'files:error') {
+        // Errors can land for either an upload OR a download.
         const entry = settleEntry(id)
-        if (entry?.kind === 'upload') {
-          const err = String(msg.message ?? 'agent rejected upload')
-          patchTransfer(id, { status: 'error', error: err })
-          entry.reject(new Error(err))
+        if (!entry) return
+        const errMsg = String(msg.message ?? 'agent error')
+        patchTransfer(id, { status: 'error', error: errMsg })
+        if (entry.kind === 'upload') {
+          entry.reject(new Error(errMsg))
+        } else {
+          // Download error: abort writable so Chrome auto-deletes
+          // any partial file in the user's chosen save location.
+          if (id === activeDownloadId) activeDownloadId = null
+          if (entry.writable) {
+            void entry.writable.abort(errMsg).catch(() => {})
+          }
+          entry.reject(new Error(errMsg))
         }
       } else if (msg.t === 'files:progress') {
         patchTransfer(id, { status: 'running', bytes: Number(msg.bytes ?? 0) })
       } else if (msg.t === 'files:accepted') {
         patchTransfer(id, { status: 'running' })
+      } else if (msg.t === 'files:offer') {
+        const entry = filesRegistry.get(id)
+        if (!entry || entry.kind !== 'download' || entry.status === 'settled') return
+        entry.name = String(msg.name ?? entry.suggestedName ?? 'download.bin')
+        entry.expectedSize = typeof msg.size === 'number' ? msg.size : null
+        entry.mime = typeof msg.mime === 'string' ? msg.mime : undefined
+        activeDownloadId = id
+        patchTransfer(id, {
+          status: 'running',
+          name: entry.name,
+          total: entry.expectedSize,
+        })
+        // Resolve the save-mode: prefer streaming when the browser
+        // supports showSaveFilePicker AND the caller didn't preselect
+        // a Blob path. The picker MUST have been opened by the
+        // caller (a synchronous user gesture is required); by the
+        // time files:offer arrives we already have the writable in
+        // entry.writable if the picker resolved.
+        if (entry.saveMode === 'pending') {
+          // No picker was set up; fall back to Blob accumulator.
+          entry.saveMode = 'blob'
+        }
+      } else if (msg.t === 'files:eof') {
+        const entry = filesRegistry.get(id)
+        if (!entry || entry.kind !== 'download' || entry.status === 'settled') return
+        const totalBytes = Number(msg.bytes ?? entry.bytesReceived)
+        if (id === activeDownloadId) activeDownloadId = null
+        // Finalize: close the writable (Chrome streaming) or trigger
+        // the anchor download (Blob fallback).
+        void finalizeDownload(entry, totalBytes).then(
+          () => {
+            const settled = settleEntry(id)
+            if (settled?.kind === 'download') {
+              patchTransfer(id, { status: 'complete', bytes: totalBytes })
+              settled.resolve({ name: entry.name, bytes: totalBytes })
+            }
+          },
+          (err: unknown) => {
+            const settled = settleEntry(id)
+            if (settled?.kind === 'download') {
+              const errMsg = err instanceof Error ? err.message : String(err)
+              patchTransfer(id, { status: 'error', error: errMsg })
+              settled.reject(new Error(errMsg))
+            }
+          }
+        )
       }
     }
     // DC close: reject every pending transfer with "channel closed".
-    // Otherwise an in-flight upload would hang forever waiting for a
-    // terminal message that will never arrive.
+    // Otherwise an in-flight upload or download would hang forever
+    // waiting for a terminal message that will never arrive.
     channels.files.onclose = () => {
+      activeDownloadId = null
       for (const id of Array.from(filesRegistry.keys())) {
         const entry = settleEntry(id)
-        if (entry?.kind === 'upload') {
-          patchTransfer(id, { status: 'error', error: 'files channel closed' })
-          entry.reject(new Error('files channel closed'))
+        if (!entry) continue
+        const errMsg = 'files channel closed'
+        patchTransfer(id, { status: 'error', error: errMsg })
+        if (entry.kind === 'upload') {
+          entry.reject(new Error(errMsg))
+        } else if (entry.kind === 'download') {
+          if (entry.writable) {
+            void entry.writable.abort(errMsg).catch(() => {})
+          }
+          entry.reject(new Error(errMsg))
         }
       }
     }
@@ -2191,6 +2338,346 @@ export function useRemoteControl() {
     return uploadOne(file)
   }
 
+  // --------------------------------------------------------------
+  // Downloads (host → browser) — Phase 2 of file-DC v2.
+
+  // Hard cap on the Blob fallback path (no showSaveFilePicker) so a
+  // misbehaving server can't OOM the tab by streaming gigabytes of
+  // chunks into memory. Single-file downloads come with size up-front
+  // (in files:offer); we can refuse early. Folder zips (Phase 4) ride
+  // a Chrome-only path that bypasses this entirely.
+  const DOWNLOAD_BLOB_HARD_CAP = 2 * 1024 * 1024 * 1024 // 2 GiB
+
+  /** Append one binary chunk to a download entry's sink. Tracks total
+   *  bytes for the Transfers panel + enforces the Blob-fallback hard
+   *  cap so a wedged stream doesn't OOM the tab. */
+  function appendDownloadChunk(entry: DownloadEntry, buf: ArrayBuffer) {
+    if (entry.status === 'settled') return
+    entry.bytesReceived += buf.byteLength
+    patchTransfer(entry === filesRegistry.get(activeDownloadId ?? '') ? (activeDownloadId as string) : '', {
+      status: 'running',
+      bytes: entry.bytesReceived,
+    })
+    if (entry.saveMode === 'stream' && entry.writable) {
+      // Chrome streaming path: write directly to the user-chosen
+      // file. Errors propagate via files:error from the agent or
+      // via the writable's own promise (handled in finalizeDownload).
+      void entry.writable.write(buf).catch(() => {
+        // Swallow; the writable's close()/abort() in finalize will
+        // surface the underlying error.
+      })
+    } else if (entry.saveMode === 'blob') {
+      if (entry.bytesReceived > DOWNLOAD_BLOB_HARD_CAP) {
+        // Sentinel: settle now with an error and drop the buffer.
+        // Send a cancel to the agent so it stops sending bytes.
+        const id = activeDownloadId
+        if (id) {
+          const ch = channels.files
+          if (ch && ch.readyState === 'open') {
+            try { ch.send(JSON.stringify({ t: 'files:cancel', id })) } catch { /* dropped */ }
+          }
+          const settled = settleEntry(id)
+          if (settled?.kind === 'download') {
+            const msg = `download exceeds ${Math.round(DOWNLOAD_BLOB_HARD_CAP / (1024 * 1024 * 1024))} GiB browser-memory cap (use Chrome for streaming downloads)`
+            patchTransfer(id, { status: 'error', error: msg })
+            settled.reject(new Error(msg))
+          }
+          activeDownloadId = null
+        }
+        return
+      }
+      entry.blobs.push(buf)
+    }
+  }
+
+  /** Close the writable (Chrome streaming) OR concatenate the Blob
+   *  parts and trigger an `<a download>` click (Firefox/Safari
+   *  fallback). Resolves once the bytes are durable. */
+  async function finalizeDownload(entry: DownloadEntry, totalBytes: number): Promise<void> {
+    if (entry.saveMode === 'stream' && entry.writable) {
+      await entry.writable.close()
+      return
+    }
+    if (entry.saveMode === 'blob') {
+      const blob = new Blob(entry.blobs, { type: entry.mime || 'application/octet-stream' })
+      const url = URL.createObjectURL(blob)
+      try {
+        const a = document.createElement('a')
+        a.href = url
+        a.download = entry.suggestedName || entry.name || 'download.bin'
+        a.style.display = 'none'
+        document.body.appendChild(a)
+        a.click()
+        document.body.removeChild(a)
+      } finally {
+        // Schedule the URL revoke after the browser has had a tick
+        // to start the download.
+        setTimeout(() => URL.revokeObjectURL(url), 1_000)
+      }
+      // Free the chunks regardless of success.
+      entry.blobs = []
+      // Sanity: don't surface a totalBytes mismatch as an error here;
+      // the agent already locked the count via files:eof.
+      void totalBytes
+      return
+    }
+    // 'pending' should never reach here (files:offer flips it to
+    // 'blob' as a fallback); guard anyway.
+    throw new Error('download finalised in unexpected save mode')
+  }
+
+  /** Download a single file from the host to the browser's local
+   *  filesystem. `path` is the absolute host path (subject to the
+   *  agent's denylist). `suggestedName` overrides the filename in the
+   *  save dialog / anchor download. Returns the agent-reported byte
+   *  count on success.
+   *
+   *  Implementation strategy:
+   *  - Chrome / Edge / Safari 17+: opens `showSaveFilePicker` BEFORE
+   *    sending the request (browsers require a user-gesture chain),
+   *    streams chunks directly into the chosen file.
+   *  - Firefox / Safari < 17: accumulates chunks in an in-memory
+   *    Blob and triggers an `<a download>` click on completion.
+   *    Capped at 2 GiB to prevent OOM.
+   */
+  async function downloadFile(
+    path: string,
+    suggestedName?: string
+  ): Promise<{ name: string; bytes: number }> {
+    const ch = channels.files
+    if (!ch || ch.readyState !== 'open') {
+      throw new Error('files channel not open')
+    }
+    const id = `dl-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+    const fallbackName = suggestedName ?? path.split(/[\\/]/).pop() ?? 'download.bin'
+
+    // Try to open showSaveFilePicker FIRST (before any await past the
+    // user gesture) — browsers require this. If unavailable, fall
+    // back to the Blob path; if the user cancels the picker, throw.
+    let writable: SaveWritable | null = null
+    let saveMode: DownloadEntry['saveMode'] = 'pending'
+    type ShowSaveFilePicker = (options?: {
+      suggestedName?: string
+      types?: { description?: string; accept: Record<string, string[]> }[]
+    }) => Promise<{
+      createWritable: () => Promise<SaveWritable>
+    }>
+    const showSavePicker = (window as unknown as { showSaveFilePicker?: ShowSaveFilePicker })
+      .showSaveFilePicker
+    if (typeof showSavePicker === 'function') {
+      try {
+        const handle = await showSavePicker({ suggestedName: fallbackName })
+        writable = await handle.createWritable()
+        saveMode = 'stream'
+      } catch (e) {
+        // User cancelled or picker errored — propagate as user-facing
+        // error so the UI can show "Download cancelled".
+        throw e instanceof Error ? e : new Error(String(e))
+      }
+    } else {
+      saveMode = 'blob'
+    }
+
+    return new Promise<{ name: string; bytes: number }>((resolve, reject) => {
+      const entry: DownloadEntry = {
+        kind: 'download',
+        status: 'pending',
+        resolve,
+        reject,
+        saveMode,
+        writable,
+        blobs: [],
+        name: fallbackName,
+        suggestedName: fallbackName,
+        bytesReceived: 0,
+        expectedSize: null,
+      }
+      filesRegistry.set(id, entry)
+      pushTransfer({
+        id,
+        kind: 'download',
+        name: fallbackName,
+        bytes: 0,
+        total: null,
+        status: 'queued',
+      })
+      try {
+        ch.send(JSON.stringify({ t: 'files:get', id, path }))
+      } catch (e) {
+        const settled = settleEntry(id)
+        if (settled?.kind === 'download') {
+          const msg = e instanceof Error ? e.message : String(e)
+          patchTransfer(id, { status: 'error', error: msg })
+          if (writable) void writable.abort(msg).catch(() => {})
+          settled.reject(new Error(msg))
+        }
+      }
+    })
+  }
+
+  /** Download an entire folder from the host as a streaming zip.
+   *  Same `files:offer` → binary chunks → `files:eof` envelope as
+   *  `downloadFile`, but the agent zips on the fly with no temp
+   *  disk and `size` arrives as `null` (unknown until end-of-stream).
+   *
+   *  **Refused on browsers without `showSaveFilePicker`** (Firefox,
+   *  Safari < 17, older mobile). Folder zips don't have an upfront
+   *  size, so the Blob fallback would risk OOMing on a large folder.
+   *  Operators on those browsers see a clear toast asking them to
+   *  use Chrome/Edge; download-individual-files still works. */
+  async function downloadFolder(
+    path: string,
+    suggestedName?: string
+  ): Promise<{ name: string; bytes: number }> {
+    const ch = channels.files
+    if (!ch || ch.readyState !== 'open') {
+      throw new Error('files channel not open')
+    }
+    type ShowSaveFilePicker = (options?: {
+      suggestedName?: string
+      types?: { description?: string; accept: Record<string, string[]> }[]
+    }) => Promise<{
+      createWritable: () => Promise<SaveWritable>
+    }>
+    const showSavePicker = (window as unknown as { showSaveFilePicker?: ShowSaveFilePicker })
+      .showSaveFilePicker
+    if (typeof showSavePicker !== 'function') {
+      throw new Error(
+        'Folder downloads require Chrome / Edge (need streaming disk writes — Firefox / Safari fallback would OOM on large zips)'
+      )
+    }
+    const id = `dlf-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+    const folderBase = path.split(/[\\/]/).filter(Boolean).pop() ?? 'folder'
+    const fallbackName = suggestedName ?? `${folderBase}.zip`
+
+    let writable: SaveWritable | null = null
+    try {
+      const handle = await showSavePicker({
+        suggestedName: fallbackName,
+        types: [
+          {
+            description: 'ZIP archive',
+            accept: { 'application/zip': ['.zip'] },
+          },
+        ],
+      })
+      writable = await handle.createWritable()
+    } catch (e) {
+      throw e instanceof Error ? e : new Error(String(e))
+    }
+
+    return new Promise<{ name: string; bytes: number }>((resolve, reject) => {
+      const entry: DownloadEntry = {
+        kind: 'download',
+        status: 'pending',
+        resolve,
+        reject,
+        saveMode: 'stream',
+        writable,
+        blobs: [],
+        name: fallbackName,
+        suggestedName: fallbackName,
+        bytesReceived: 0,
+        expectedSize: null,
+      }
+      filesRegistry.set(id, entry)
+      pushTransfer({
+        id,
+        kind: 'download',
+        name: fallbackName,
+        bytes: 0,
+        total: null,
+        status: 'queued',
+      })
+      try {
+        ch.send(JSON.stringify({ t: 'files:get-folder', id, path, format: 'zip' }))
+      } catch (e) {
+        const settled = settleEntry(id)
+        if (settled?.kind === 'download') {
+          const msg = e instanceof Error ? e.message : String(e)
+          patchTransfer(id, { status: 'error', error: msg })
+          if (writable) void writable.abort(msg).catch(() => {})
+          settled.reject(new Error(msg))
+        }
+      }
+    })
+  }
+
+  /** Ask the agent to cancel an in-flight download. Best-effort: the
+   *  agent flips its AtomicBool and the next chunk-loop iteration
+   *  exits. The Promise rejects via the resulting `files:error`. */
+  function cancelDownload(id: string): void {
+    const ch = channels.files
+    if (!ch || ch.readyState !== 'open') return
+    try {
+      ch.send(JSON.stringify({ t: 'files:cancel', id }))
+    } catch {
+      /* dropped */
+    }
+  }
+
+  // --------------------------------------------------------------
+  // Directory listing (Phase 3 of file-DC v2).
+  //
+  // Request/response keyed by req_id, like the clipboard:read flow.
+  // 5 s timeout rejects stale requests so the drawer doesn't spin
+  // forever if the host is unreachable or the agent lacks the new
+  // capability (old 0.2.x agents will simply not reply).
+
+  type DirEntry = {
+    name: string
+    is_dir: boolean
+    size: number | null
+    mtime_unix: number | null
+  }
+  type DirListing = {
+    path: string
+    parent: string | null
+    entries: DirEntry[]
+  }
+  const pendingDirRequests = new Map<
+    string,
+    { resolve: (l: DirListing) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }
+  >()
+  function settleDirRequest(reqId: string): {
+    resolve: (l: DirListing) => void
+    reject: (e: Error) => void
+  } | null {
+    const p = pendingDirRequests.get(reqId)
+    if (!p) return null
+    clearTimeout(p.timer)
+    pendingDirRequests.delete(reqId)
+    return { resolve: p.resolve, reject: p.reject }
+  }
+
+  /** List a directory on the host. `path` is the absolute host path;
+   *  empty string / "~" / "/" enumerates roots (logical drives on
+   *  Windows; "/" on Unix). Resolves with the listing or rejects on
+   *  timeout / dir-error. */
+  function listDir(path: string): Promise<DirListing> {
+    const ch = channels.files
+    if (!ch || ch.readyState !== 'open') {
+      return Promise.reject(new Error('files channel not open'))
+    }
+    const reqId = `ls-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+    return new Promise<DirListing>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (pendingDirRequests.has(reqId)) {
+          pendingDirRequests.delete(reqId)
+          reject(new Error('list_dir timed out (5 s) — host may not support remote browse'))
+        }
+      }, 5_000)
+      pendingDirRequests.set(reqId, { resolve, reject, timer })
+      try {
+        ch.send(JSON.stringify({ t: 'files:dir', req_id: reqId, path }))
+      } catch (e) {
+        clearTimeout(timer)
+        pendingDirRequests.delete(reqId)
+        reject(e instanceof Error ? e : new Error(String(e)))
+      }
+    })
+  }
+
   /** Upload multiple files sequentially. Each file is queued through
    *  `uploadOne`; the queue continues on individual failures so a
    *  bad file doesn't sink the rest. Resolves with one result per
@@ -2278,6 +2765,10 @@ export function useRemoteControl() {
     sendCtrlAltDel,
     uploadFile,
     uploadFiles,
+    downloadFile,
+    downloadFolder,
+    cancelDownload,
+    listDir,
     transfers,
     preferredCodec,
     setPreferredCodec,
