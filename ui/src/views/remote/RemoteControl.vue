@@ -890,51 +890,50 @@ function onStageDragLeave(ev: DragEvent) {
   if (stage && next && stage.contains(next)) return
   isDragOver.value = false
 }
-function onStageDrop(ev: DragEvent) {
+async function onStageDrop(ev: DragEvent) {
   isDragOver.value = false
   if (!ev.dataTransfer) return
-  // Iterate `items` (NOT `files`) so we can preflight each entry via
-  // `webkitGetAsEntry()` and skip directories with a clear toast.
-  // Field repro pre-rc.11: dragging a folder onto the viewer uploaded
-  // a 0-byte file named after the folder because Chrome reports the
-  // dropped folder in `dataTransfer.files[0]` as a synthetic File
-  // object that throws on read. webkitGetAsEntry() exposes the real
-  // type so we can refuse cleanly. (Folder upload is on the
-  // post-0.3.0 deferred list.)
-  const files: File[] = []
-  let folderCount = 0
+  // Iterate `items` (NOT `files`) so we can use `webkitGetAsEntry()`
+  // to detect + recursively walk dropped folders. File-DC v2.1
+  // (0.3.0+): folder uploads extend `files:begin` with a `rel_path`
+  // field; the agent recreates the directory structure under
+  // Downloads/<root>. Old agents (<0.3.0) ignore unknown JSON fields
+  // and use the basename — graceful degradation to flat upload.
+  type UploadInput = File | { file: File; relPath: string }
+  const flatFiles: File[] = []
+  const folderWalks: Promise<{ file: File; relPath: string }[]>[] = []
   const items = ev.dataTransfer.items
   if (items && items.length > 0) {
     for (let i = 0; i < items.length; i++) {
       const item = items[i]
       if (item.kind !== 'file') continue
-      // webkitGetAsEntry is the de-facto-standard API across Chrome,
-      // Firefox, Safari, Edge for telling files from directories.
       const entry = (item as DataTransferItem & {
-        webkitGetAsEntry?: () => { isDirectory?: boolean; isFile?: boolean } | null
+        webkitGetAsEntry?: () => FileSystemEntry | null
       }).webkitGetAsEntry?.()
-      if (entry?.isDirectory) {
-        folderCount++
-        continue
+      if (entry && entry.isDirectory) {
+        folderWalks.push(rc.walkFolderEntry(entry, entry.name))
+      } else {
+        const f = item.getAsFile()
+        if (f) flatFiles.push(f)
       }
-      const f = item.getAsFile()
-      if (f) files.push(f)
     }
   } else if (ev.dataTransfer.files) {
-    // Browser without items API — fall back to files but warn that
-    // we can't tell folders from empty files.
+    // Browser without items API (very old, pre-Chrome 21) — flat
+    // upload only. Folder support requires the items API.
     for (let i = 0; i < ev.dataTransfer.files.length; i++) {
-      files.push(ev.dataTransfer.files[i])
+      flatFiles.push(ev.dataTransfer.files[i])
     }
   }
-  if (folderCount > 0) {
-    showError(
-      folderCount === 1
-        ? 'Folder upload not supported yet — drop individual files'
-        : `${folderCount} folders skipped — folder upload not supported yet`
-    )
+  const uploadList: UploadInput[] = [...flatFiles]
+  if (folderWalks.length > 0) {
+    try {
+      const walked = await Promise.all(folderWalks)
+      for (const folder of walked) uploadList.push(...folder)
+    } catch (e) {
+      showError(`Folder walk failed: ${(e as Error).message}`)
+    }
   }
-  if (files.length > 0) void uploadMany(files)
+  if (uploadList.length > 0) void uploadMany(uploadList)
 }
 function hasFileDrag(dt: DataTransfer): boolean {
   // `types` is the only field populated during dragenter / dragover
@@ -1135,11 +1134,11 @@ async function downloadEntries(
   }
 }
 
-async function uploadMany(files: File[]) {
-  if (files.length === 0) return
+async function uploadMany(items: (File | { file: File; relPath: string })[]) {
+  if (items.length === 0) return
   uploadBusy.value = true
   try {
-    const results = await rc.uploadFiles(files)
+    const results = await rc.uploadFiles(items)
     const ok = results.filter((r) => r.ok).length
     const failed = results.filter((r) => !r.ok)
     if (failed.length === 0) {
@@ -1158,7 +1157,7 @@ async function uploadMany(files: File[]) {
     } else {
       const first = failed[0] as { name: string; error: string }
       showError(
-        `Uploaded ${ok}/${files.length} — ${failed.length} failed (e.g. ${first.name}: ${first.error})`
+        `Uploaded ${ok}/${items.length} — ${failed.length} failed (e.g. ${first.name}: ${first.error})`
       )
     }
   } finally {
