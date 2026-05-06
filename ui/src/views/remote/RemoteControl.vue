@@ -986,7 +986,12 @@ watch(filesDrawer, (open) => {
 
 function onEntryClick(
   entry: { name: string; is_dir: boolean },
-  ev: MouseEvent
+  // Vuetify's `<v-list-item @click>` fires BOTH on mouse click and
+  // on keyboard activation (Enter / Space — accessibility), so the
+  // handler receives `MouseEvent | KeyboardEvent`. Both event types
+  // expose `shiftKey` / `ctrlKey` / `metaKey` so the modifier-key
+  // logic below works uniformly.
+  ev: MouseEvent | KeyboardEvent
 ) {
   // Ctrl/Cmd+click toggles selection; Shift+click extends; plain
   // click selects only this entry. Multi-select is what makes
