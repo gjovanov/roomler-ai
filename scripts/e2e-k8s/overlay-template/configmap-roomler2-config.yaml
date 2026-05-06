@@ -6,9 +6,12 @@ data:
   ROOMLER__APP__HOST: "0.0.0.0"
   ROOMLER__APP__PORT: "3000"
   ROOMLER__APP__FRONTEND_URL: "http://roomler2"
-  # Permissive CORS for in-cluster e2e — Playwright runs in a sibling
-  # pod and may resolve via Service DNS or pod IP depending on test.
-  ROOMLER__APP__CORS_ORIGINS: "*"
+  # CORS_ORIGINS deserializes as Vec<String>; the config crate
+  # rejects scalar strings ('*' would crash with `invalid type:
+  # string "*", expected a sequence`). Leaving it unset uses the
+  # default (empty list) — fine because the Playwright test
+  # browser and the API are same-origin (`http://roomler2`)
+  # in-cluster, so the CORS middleware never trips.
 
   ROOMLER__DATABASE__URL: "mongodb://mongodb.roomler-ai-e2e.svc.cluster.local:27017"
   ROOMLER__DATABASE__NAME: "roomler_ai_e2e"
