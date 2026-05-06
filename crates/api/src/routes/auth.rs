@@ -95,18 +95,17 @@ pub async fn register(
     // an SMTP capture in cluster. Default false — production still
     // requires email-link activation. Mirrors the same `$set` the
     // `activate` handler does later in the email-driven flow.
-    if state.settings.auth.auto_verify {
-        if let Err(e) = state
+    if state.settings.auth.auto_verify
+        && let Err(e) = state
             .users
             .base
             .update_by_id(user_id, bson::doc! { "$set": { "is_verified": true } })
             .await
-        {
-            warn!(
-                "auto_verify is set but failed to mark user verified: {:?}",
-                e
-            );
-        }
+    {
+        warn!(
+            "auto_verify is set but failed to mark user verified: {:?}",
+            e
+        );
     }
 
     // Generate activation code and send email
