@@ -102,7 +102,10 @@ pub async fn register(
             .update_by_id(user_id, bson::doc! { "$set": { "is_verified": true } })
             .await
         {
-            warn!("auto_verify is set but failed to mark user verified: {:?}", e);
+            warn!(
+                "auto_verify is set but failed to mark user verified: {:?}",
+                e
+            );
         }
     }
 
