@@ -24,7 +24,16 @@ data:
 
   ROOMLER__JWT__ISSUER: "roomler-ai-e2e"
 
-  # Phase 3 will set these when in-cluster coturn / Mailpit /
+  # E2E ACTIVATION SHORTCUT — Phase 1 unblocker for Cycle 3.
+  # When set, `auth::register` immediately marks the new user
+  # `is_verified: true`, bypassing the email-link flow. Lets
+  # Playwright specs `register → login` without an SMTP capture
+  # in cluster. Cycle 4 swaps this off and replaces with Mailpit
+  # + a helper that pulls the activation token from the inbox so
+  # we exercise the real flow.
+  ROOMLER__AUTH__AUTO_VERIFY: "true"
+
+  # Phase 4 will set these when in-cluster coturn / Mailpit /
   # oauth2-mock-server land. Until then, the specs that depend on
   # them are filtered out by scripts/e2e-skip-list.txt.
   ROOMLER__TURN__URL: ""
