@@ -99,9 +99,8 @@ pub async fn enroll_agent(
         .await?;
     let agent = match existing {
         Some(a) => {
-            let id = a
-                .id
-                .ok_or_else(|| ApiError::Internal("agent missing _id".to_string()))?;
+            let id =
+                a.id.ok_or_else(|| ApiError::Internal("agent missing _id".to_string()))?;
             state
                 .agents
                 .rehydrate(id, &body.machine_name, body.os, &body.agent_version)
