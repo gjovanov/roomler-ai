@@ -24,6 +24,13 @@ data:
 
   ROOMLER__JWT__ISSUER: "roomler-ai-e2e"
 
+  # Rate limit bumped — Playwright Job runs from a single Pod IP and
+  # blasts ~5-10 reqs per spec across ~50 specs, easily blowing past
+  # the prod 60/min default. 1000 tokens/sec + 5000 burst is
+  # effectively "no rate limit" for the duration of an e2e run.
+  ROOMLER__APP__RATE_LIMIT_PER_SEC: "1000"
+  ROOMLER__APP__RATE_LIMIT_BURST: "5000"
+
   # E2E ACTIVATION SHORTCUT — Phase 1 unblocker for Cycle 3.
   # When set, `auth::register` immediately marks the new user
   # `is_verified: true`, bypassing the email-link flow. Lets

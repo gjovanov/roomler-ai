@@ -38,10 +38,14 @@ fn build_cors_layer(origins: &[String]) -> CorsLayer {
 pub fn build_router(state: AppState) -> Router {
     let cors = build_cors_layer(&state.settings.app.cors_origins);
 
-    // Rate limiting: 60 requests per minute per IP (1 token/sec, burst up to 60)
+    // Rate limiting per IP. Defaults to 1 token/sec, burst 60
+    // (sustained 60 req/min) — production. The e2e overlay bumps
+    // both values via ROOMLER__APP__RATE_LIMIT_PER_SEC /
+    // ROOMLER__APP__RATE_LIMIT_BURST so a Playwright Job's single
+    // pod IP doesn't trip 429s during the suite.
     let governor_conf = GovernorConfigBuilder::default()
-        .per_second(1)
-        .burst_size(60)
+        .per_second(state.settings.app.rate_limit_per_sec)
+        .burst_size(state.settings.app.rate_limit_burst)
         .key_extractor(SmartIpKeyExtractor)
         .finish()
         .unwrap();
