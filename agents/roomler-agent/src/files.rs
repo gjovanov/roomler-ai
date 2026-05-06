@@ -100,6 +100,16 @@ pub(crate) enum FilesIncoming {
         size: u64,
         #[serde(default)]
         mime: Option<String>,
+        /// Folder-upload extension (file-DC v2.1). When `Some`, the
+        /// browser is dropping a folder and this is the relative path
+        /// of the file inside that folder, e.g.
+        /// `MyFolder/sub/file.txt`. The agent recreates the directory
+        /// structure under Downloads/<root> with per-component
+        /// sanitisation (reuses the zip walker's safety rules).
+        /// `None` for individual-file uploads (the original behavior;
+        /// `name` is the basename, file lands in Downloads/).
+        #[serde(default)]
+        rel_path: Option<String>,
     },
     #[serde(rename = "files:end")]
     End { id: String },
@@ -252,7 +262,22 @@ impl FilesHandler {
     /// Start a new incoming transfer (browser → host upload). Returns
     /// the absolute destination path so the caller can reply
     /// `files:accepted { id, path }`.
-    pub async fn begin(&self, id: String, name: String, expected: u64) -> Result<PathBuf> {
+    ///
+    /// `rel_path` is the file-DC v2.1 folder-upload extension. When
+    /// `Some(<rel>)`, the browser is uploading a single file from a
+    /// dropped folder and `rel` is its path relative to the folder
+    /// root (e.g. `MyFolder/sub/file.txt`). The agent recreates the
+    /// directory structure under Downloads/ with per-component
+    /// sanitisation. When `None`, behaviour is the file-DC v1 default:
+    /// `name` is the basename and the file lands in Downloads/
+    /// directly (with collision-safe rename).
+    pub async fn begin(
+        &self,
+        id: String,
+        name: String,
+        expected: u64,
+        rel_path: Option<&str>,
+    ) -> Result<PathBuf> {
         if expected > MAX_TRANSFER_BYTES {
             return Err(anyhow!(
                 "transfer size {expected} exceeds the {} B cap",
@@ -260,10 +285,29 @@ impl FilesHandler {
             ));
         }
         let downloads = download_dir().context("resolving Downloads folder")?;
-        let path = unique_path(&downloads, &sanitize_filename(&name));
-        tokio::fs::create_dir_all(&downloads)
-            .await
-            .with_context(|| format!("creating {}", downloads.display()))?;
+        // Folder upload: resolve `rel_path` to a path under
+        // Downloads/, sanitising each component. Falls back to flat
+        // upload when rel_path is empty / missing / refused by
+        // sanitisation.
+        let path = match rel_path.filter(|p| !p.is_empty()) {
+            Some(rel) => resolve_folder_upload_path(&downloads, rel).unwrap_or_else(|| {
+                tracing::warn!(
+                    rel_path = rel,
+                    "files: rel_path rejected; falling back to flat upload"
+                );
+                unique_path(&downloads, &sanitize_filename(&name))
+            }),
+            None => unique_path(&downloads, &sanitize_filename(&name)),
+        };
+        // Create parent dirs (Downloads itself, plus any rel_path
+        // intermediaries). create_dir_all is idempotent so
+        // pre-existing dirs are fine. For flat uploads `parent` IS
+        // Downloads; for folder uploads it's `Downloads/<root>/sub/`.
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
         let file = File::create(&path)
             .await
             .with_context(|| format!("creating {}", path.display()))?;
@@ -934,6 +978,58 @@ pub fn sanitize_filename(name: &str) -> String {
     }
 }
 
+/// Resolve a folder-upload's relative path under Downloads/. Splits on
+/// `/` (the canonical separator the browser sends — Chrome /
+/// Firefox / Safari all return forward-slash relative paths from
+/// `webkitGetAsEntry()`); sanitises each component with the existing
+/// [`sanitize_filename`] rules so a malicious browser can't smuggle
+/// `..` or absolute paths; rejects empty / single-component inputs
+/// (those should use the flat-upload path); and applies
+/// [`unique_path`] to the FILE component so a re-upload gets a
+/// `(2)` rename suffix instead of overwriting.
+///
+/// Returns `None` for inputs that produce no usable path (all
+/// components sanitised to empty, deeper than 32 levels — a sane
+/// nesting cap that catches degenerate inputs while passing every
+/// realistic project tree).
+///
+/// `dir` is the Downloads directory; the returned path lives under
+/// `dir/<root>/<sub...>/<file>` with each segment safe.
+fn resolve_folder_upload_path(dir: &std::path::Path, rel: &str) -> Option<PathBuf> {
+    // Normalise separators: Windows-style backslashes can sneak in
+    // if a buggy browser converts paths.
+    let normalised = rel.replace('\\', "/");
+    let mut components: Vec<String> = normalised
+        .split('/')
+        .filter(|c| !c.is_empty() && *c != "." && *c != "..")
+        .map(sanitize_filename)
+        .filter(|c| !c.is_empty() && c != "_")
+        .collect();
+    if components.len() < 2 {
+        // Need at least <root>/<file>; otherwise the rel_path is
+        // empty or a single basename — caller should fall back to
+        // flat upload.
+        return None;
+    }
+    if components.len() > 32 {
+        return None; // pathological depth
+    }
+    // Last component is the file; everything before is dir hierarchy.
+    let file_name = components.pop()?;
+    let mut path = dir.to_path_buf();
+    for c in &components {
+        path.push(c);
+    }
+    // Apply collision-safe rename to the leaf file. The directory
+    // prefix is shared across all files in a folder upload so we
+    // intentionally do NOT version-suffix it — a re-upload of the
+    // same folder merges files into the same destination directory
+    // (each colliding file picks up its own `(2)` suffix). This
+    // matches the behaviour operators expect from a desktop
+    // file-manager paste-on-existing-folder.
+    Some(unique_path(&path, &file_name))
+}
+
 /// Given a base directory and a desired filename, return a path that
 /// doesn't collide with an existing file — appends `(2)`, `(3)` etc.
 /// before the extension when needed.
@@ -1052,6 +1148,7 @@ mod tests {
                 name,
                 size,
                 mime,
+                ..
             } => {
                 assert_eq!(id, "abc");
                 assert_eq!(name, "x.bin");
@@ -1069,6 +1166,128 @@ mod tests {
             FilesIncoming::End { id } => assert_eq!(id, "abc"),
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_files_begin_with_rel_path() {
+        // Folder-upload extension (file-DC v2.1). When the browser
+        // sends a `rel_path`, the agent recreates the directory
+        // structure under Downloads/.
+        let m: FilesIncoming = serde_json::from_str(
+            r#"{"t":"files:begin","id":"f1","name":"file.txt","size":42,"rel_path":"MyFolder/sub/file.txt"}"#,
+        )
+        .unwrap();
+        match m {
+            FilesIncoming::Begin {
+                id,
+                name,
+                size,
+                rel_path,
+                ..
+            } => {
+                assert_eq!(id, "f1");
+                assert_eq!(name, "file.txt");
+                assert_eq!(size, 42);
+                assert_eq!(rel_path.as_deref(), Some("MyFolder/sub/file.txt"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_files_begin_without_rel_path_back_compat() {
+        // Old browsers (file-DC v1) don't send rel_path; deserialise
+        // as None via #[serde(default)].
+        let m: FilesIncoming =
+            serde_json::from_str(r#"{"t":"files:begin","id":"f1","name":"x.bin","size":100}"#)
+                .unwrap();
+        match m {
+            FilesIncoming::Begin { rel_path, .. } => {
+                assert!(rel_path.is_none(), "old browsers omit rel_path");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_folder_upload_simple_two_component() {
+        let dir = std::env::temp_dir().join("roomler-folder-resolve-test");
+        std::fs::create_dir_all(&dir).ok();
+        let p = resolve_folder_upload_path(&dir, "MyFolder/file.txt").expect("simple");
+        let s = p.to_string_lossy();
+        assert!(s.contains("MyFolder"), "kept root: {s}");
+        assert!(s.ends_with("file.txt"), "kept leaf: {s}");
+    }
+
+    #[test]
+    fn resolve_folder_upload_deep_nesting() {
+        let dir = std::env::temp_dir().join("roomler-folder-deep-test");
+        std::fs::create_dir_all(&dir).ok();
+        let p = resolve_folder_upload_path(&dir, "a/b/c/d/file.txt").expect("deep");
+        let s = p.to_string_lossy();
+        assert!(s.contains("a"));
+        assert!(s.contains("b"));
+        assert!(s.ends_with("file.txt"));
+    }
+
+    #[test]
+    fn resolve_folder_upload_rejects_traversal_components() {
+        // Sanitisation strips `..` and `.` components. Result is
+        // safe even on a malicious browser.
+        let dir = std::env::temp_dir().join("roomler-folder-traversal-test");
+        std::fs::create_dir_all(&dir).ok();
+        let p = resolve_folder_upload_path(&dir, "MyFolder/../../etc/passwd").expect("traversal");
+        let s = p.to_string_lossy();
+        // The `..` segments are filtered; only `MyFolder` + `etc` +
+        // `passwd` survive, and the result lives under `dir`.
+        assert!(
+            s.starts_with(&*dir.to_string_lossy()),
+            "stays under dir: {s}"
+        );
+        assert!(!s.contains(".."), "no traversal sequences: {s}");
+    }
+
+    #[test]
+    fn resolve_folder_upload_rejects_single_component() {
+        let dir = std::env::temp_dir().join("roomler-folder-single-test");
+        std::fs::create_dir_all(&dir).ok();
+        // No "/" → can't be a folder upload; caller should fall back
+        // to flat upload.
+        assert!(resolve_folder_upload_path(&dir, "justafile.txt").is_none());
+    }
+
+    #[test]
+    fn resolve_folder_upload_rejects_empty() {
+        let dir = std::env::temp_dir().join("roomler-folder-empty-test");
+        std::fs::create_dir_all(&dir).ok();
+        assert!(resolve_folder_upload_path(&dir, "").is_none());
+    }
+
+    #[test]
+    fn resolve_folder_upload_normalises_backslash() {
+        // A buggy browser that sends Windows-style separators
+        // shouldn't break; we normalise to forward slashes before
+        // splitting.
+        let dir = std::env::temp_dir().join("roomler-folder-backslash-test");
+        std::fs::create_dir_all(&dir).ok();
+        let p = resolve_folder_upload_path(&dir, "MyFolder\\sub\\file.txt").expect("backslash");
+        let s = p.to_string_lossy();
+        assert!(s.contains("MyFolder"));
+        assert!(s.contains("sub"));
+        assert!(s.ends_with("file.txt"));
+    }
+
+    #[test]
+    fn resolve_folder_upload_caps_extreme_depth() {
+        let dir = std::env::temp_dir().join("roomler-folder-deep-cap-test");
+        std::fs::create_dir_all(&dir).ok();
+        let mut deep = String::from("a");
+        for i in 1..50 {
+            deep.push_str(&format!("/b{i}"));
+        }
+        deep.push_str("/file.txt");
+        // 50 levels exceeds the 32-component cap.
+        assert!(resolve_folder_upload_path(&dir, &deep).is_none());
     }
 
     #[test]
@@ -1346,7 +1565,7 @@ mod tests {
         let h = FilesHandler::new();
         // Start an upload — populates `incoming`.
         let upload_path = h
-            .begin("u1".into(), "upload.txt".into(), 5)
+            .begin("u1".into(), "upload.txt".into(), 5, None)
             .await
             .expect("begin upload");
 
@@ -1435,7 +1654,10 @@ mod tests {
             std::env::set_var("USERPROFILE", &tmp);
         }
 
-        let path = h.begin("t1".into(), "hello.txt".into(), 5).await.unwrap();
+        let path = h
+            .begin("t1".into(), "hello.txt".into(), 5, None)
+            .await
+            .unwrap();
         h.chunk(b"hello").await.unwrap();
         let (final_path, bytes) = h.end("t1").await.unwrap();
         assert_eq!(final_path, path);

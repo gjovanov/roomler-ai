@@ -2156,9 +2156,13 @@ async fn handle_files_control(
             name,
             size,
             mime,
+            rel_path,
         } => {
-            info!(%session_id, %id, %name, size, ?mime, "files: begin");
-            match handler.begin(id.clone(), name, size).await {
+            info!(%session_id, %id, %name, size, ?mime, ?rel_path, "files: begin");
+            match handler
+                .begin(id.clone(), name, size, rel_path.as_deref())
+                .await
+            {
                 Ok(path) => {
                     let path_str = path.to_string_lossy();
                     send_files_json(
