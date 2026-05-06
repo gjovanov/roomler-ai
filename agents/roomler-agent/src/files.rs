@@ -733,7 +733,7 @@ impl FilesHandler {
         let folder_name = resolved
             .file_name()
             .and_then(|s| s.to_str())
-            .map(|s| sanitize_filename(s))
+            .map(sanitize_filename)
             .unwrap_or_else(|| "folder".to_string());
         let zip_name = format!("{folder_name}.zip");
         let cancel = Arc::new(AtomicBool::new(false));
@@ -828,11 +828,12 @@ where
 
             if meta.is_dir() {
                 // Cycle protection: canonical path already visited?
-                if let Ok(canon) = std::fs::canonicalize(&path) {
-                    if visited.insert(canon) {
-                        stack.push(path);
-                    }
-                    // else: symlink loop or hard-linked dir — skip.
+                // (Else branch — already-visited — is a silent skip:
+                // symlink loop or hard-linked dir.)
+                if let Ok(canon) = std::fs::canonicalize(&path)
+                    && visited.insert(canon)
+                {
+                    stack.push(path);
                 }
                 continue;
             }

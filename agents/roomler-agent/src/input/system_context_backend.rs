@@ -205,7 +205,7 @@ fn run_worker(mut enigo: Enigo, rx: std_mpsc::Receiver<InputMsg>) {
                             "system-context input retry-after-rebind also failed"
                         );
                     }
-                } else if consec_dispatch_errors % 32 == 0 {
+                } else if consec_dispatch_errors.is_multiple_of(32) {
                     // Streak of failures; rate-limit logging to once
                     // per 32 consecutive errors so we don't spam.
                     tracing::warn!(

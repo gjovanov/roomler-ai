@@ -145,10 +145,11 @@ pub fn open_input_desktop() -> Result<Option<OwnedDesktop>> {
 /// That regression was the entire 0.2.7 hotfix (see
 /// `project_input_regression_0_2_x.md`). This helper is gated to the
 /// SystemContext path where we ARE SYSTEM and DO have full write
-/// rights to both Default and Winlogon. **Field repro PC50045 rc.7
-/// + rc.8 (2026-05-06)**: `Zugriff verweigert (os error 5)` spam at
-/// ~50/s during lock screen because thread was bound via `GENERIC_
-/// READ` only and `SendInput` lacked DESKTOP_HOOKCONTROL /
+/// rights to both Default and Winlogon. Field repro on PC50045
+/// during 0.3.0-rc.7 and rc.8 testing (2026-05-06): `Zugriff
+/// verweigert (os error 5)` spam at roughly 50/s during the lock
+/// screen because the thread was bound via `GENERIC_READ` only and
+/// `SendInput` lacked the DESKTOP_HOOKCONTROL and
 /// DESKTOP_JOURNALPLAYBACK rights that `GENERIC_WRITE` carries.
 ///
 /// `GENERIC_WRITE` on a desktop maps to (per Win32 generic-mapping
