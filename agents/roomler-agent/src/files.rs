@@ -303,6 +303,33 @@ fn split_stem_ext(name: &str) -> (&str, &str) {
 }
 
 fn download_dir() -> Result<PathBuf> {
+    // M3 A1 SystemContext fallback: when the worker is spawned by the
+    // SCM service via winlogon-token, it runs as LocalSystem
+    // (S-1-5-18) but in the user's interactive session.
+    // `directories::UserDirs::new()` resolves Downloads to the
+    // LocalSystem profile (`C:\Windows\System32\config\systemprofile\
+    // Downloads\`) which usually doesn't exist — uploads fail (or
+    // worse, succeed silently into a directory the user can't see).
+    // Field repro PC50045 rc.7 2026-05-06: file upload via browse-
+    // and-select hung because `create_dir_all` couldn't create the
+    // SYSTEM-profile path. Same fallback shape as the rc.6 config
+    // fix; see `system_context::user_profile`.
+    #[cfg(all(feature = "system-context", target_os = "windows"))]
+    {
+        use crate::system_context::{user_profile, worker_role};
+        if matches!(
+            worker_role::probe_self(),
+            Ok(worker_role::WorkerRole::SystemContext)
+        ) && let Some(dl) = user_profile::active_user_downloads_path()
+        {
+            tracing::debug!(
+                fallback_path = %dl.display(),
+                "files: SystemContext worker — using active-user Downloads (default would be SYSTEM profile)"
+            );
+            return Ok(dl);
+        }
+    }
+
     if let Some(dirs) = directories::UserDirs::new()
         && let Some(dl) = dirs.download_dir()
     {

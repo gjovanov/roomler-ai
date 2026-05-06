@@ -341,11 +341,15 @@
         v-else-if="rc.phase.value === 'connected'"
         ref="stageEl"
         class="video-frame"
-        :class="`scale-${rc.scaleMode.value}`"
+        :class="[`scale-${rc.scaleMode.value}`, { 'drag-over': isDragOver }]"
         tabindex="0"
         @pointermove="onStagePointerMove"
         @pointerleave="cursorVisible = false"
         @pointerenter="cursorVisible = true"
+        @dragenter.prevent.stop="onStageDragEnter"
+        @dragover.prevent.stop="onStageDragOver"
+        @dragleave.prevent.stop="onStageDragLeave"
+        @drop.prevent.stop="onStageDrop"
       >
         <!-- Classic render path: <video> bound to the remote MediaStream.
              Used unless the viewer opted into the WebCodecs path AND
@@ -663,6 +667,50 @@ const fileInput = ref<HTMLInputElement | null>(null)
 // rest of the toolbar to a 4-select overflow.
 const mobileSettingsOpen = ref(false)
 const uploadBusy = ref(false)
+// Visual cue when a draggable item is hovering the stage. Toggled on
+// dragenter/dragover (true) + drop/dragleave (false). The
+// `.prevent.stop` modifiers on the v-on bindings are what actually
+// suppress the browser's default open-image-in-new-tab; the ref
+// just drives the dashed-border CSS state.
+const isDragOver = ref(false)
+
+// Drop a file onto the stage to upload it to the remote host.
+// Browsers default to opening dragged images / files in a new tab —
+// `preventDefault` on every drag event in the chain (enter, over,
+// drop) is what suppresses that.
+function onStageDragEnter(ev: DragEvent) {
+  if (!ev.dataTransfer || !hasFileDrag(ev.dataTransfer)) return
+  isDragOver.value = true
+}
+function onStageDragOver(ev: DragEvent) {
+  if (!ev.dataTransfer || !hasFileDrag(ev.dataTransfer)) return
+  ev.dataTransfer.dropEffect = 'copy'
+  isDragOver.value = true
+}
+function onStageDragLeave(ev: DragEvent) {
+  // `dragleave` fires when crossing into child elements too. Use the
+  // related-target test to ignore child traversals — only flip the
+  // cue off when the pointer leaves the stage entirely.
+  const stage = stageEl.value
+  const next = ev.relatedTarget as Node | null
+  if (stage && next && stage.contains(next)) return
+  isDragOver.value = false
+}
+function onStageDrop(ev: DragEvent) {
+  isDragOver.value = false
+  const f = ev.dataTransfer?.files?.[0]
+  if (!f) return
+  void uploadOne(f)
+}
+function hasFileDrag(dt: DataTransfer): boolean {
+  // `types` is the only field populated during dragenter / dragover
+  // for security reasons (the actual file list isn't readable until
+  // drop). 'Files' is the documented marker for an OS file drag.
+  for (let i = 0; i < dt.types.length; i++) {
+    if (dt.types[i] === 'Files') return true
+  }
+  return false
+}
 
 // Stream the user-picked file to the remote's Downloads folder via
 // the `files` DC. 64 KiB chunks with backpressure on
@@ -671,6 +719,14 @@ async function onFilePicked(ev: Event) {
   const input = ev.target as HTMLInputElement | null
   const f = input?.files?.[0]
   if (!f) return
+  try {
+    await uploadOne(f)
+  } finally {
+    if (input) input.value = '' // allow re-selecting the same file
+  }
+}
+
+async function uploadOne(f: File) {
   uploadBusy.value = true
   try {
     const res = await rc.uploadFile(f)
@@ -679,7 +735,6 @@ async function onFilePicked(ev: Event) {
     showError(`Upload failed: ${(e as Error).message}`)
   } finally {
     uploadBusy.value = false
-    if (input) input.value = '' // allow re-selecting the same file
   }
 }
 
@@ -1361,6 +1416,21 @@ onBeforeUnmount(() => {
   /* Hide the native OS pointer so the synthetic cursor below is the only
      thing the controller sees — matches collaborative-tool semantics. */
   cursor: none;
+}
+.video-frame.drag-over::after {
+  content: 'Drop file to upload';
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.2rem;
+  font-weight: 600;
+  color: #fff;
+  background: rgba(33, 150, 243, 0.25);
+  border: 3px dashed rgba(33, 150, 243, 0.85);
+  pointer-events: none;
+  z-index: 10;
 }
 /* Scrollable frame for the scale modes where the video can overflow
    the viewport (original = 1:1 always if source > viewer, custom ≥

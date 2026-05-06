@@ -57,6 +57,21 @@ use windows_sys::Win32::System::RemoteDesktop::{
 };
 use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 
+/// Resolve the active-session user's profile root (`C:\Users\<name>`).
+/// Returns `None` if any of the discovery steps fail (no logged-in
+/// user, FFI failure).
+///
+/// Used by the various `active_user_*_path()` helpers below; pulled
+/// out so each new feature with a profile-relative path doesn't
+/// re-implement the FFI dance. The lesson from rc.6 (config) and rc.7
+/// (file-DC Downloads): every SystemContext feature that touches a
+/// `%USERPROFILE%`-derived path needs an active-user fallback.
+pub fn active_user_profile_root() -> Option<PathBuf> {
+    let session_id = current_session_id()?;
+    let username = user_name_for_session(session_id)?;
+    Some(PathBuf::from(format!("C:\\Users\\{username}")))
+}
+
 /// Resolve the active-session user's roomler-agent config file path.
 /// Returns `None` if any of the discovery steps fail (no logged-in
 /// user, FFI failure, profile not at standard location).
@@ -65,10 +80,7 @@ use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 /// a fallback when the default `ProjectDirs::config_dir()` lookup
 /// returns a path that doesn't exist.
 pub fn active_user_config_path() -> Option<PathBuf> {
-    let session_id = current_session_id()?;
-    let username = user_name_for_session(session_id)?;
-    let profile_root = format!("C:\\Users\\{username}");
-    let path = PathBuf::from(profile_root)
+    let path = active_user_profile_root()?
         .join("AppData")
         .join("Roaming")
         .join("roomler")
@@ -76,6 +88,26 @@ pub fn active_user_config_path() -> Option<PathBuf> {
         .join("config")
         .join("config.toml");
     Some(path)
+}
+
+/// Resolve the active-session user's Downloads folder path.
+///
+/// Used by the file-DC handler (`files::download_dir`) under
+/// SystemContext to land uploads in the user's actual Downloads
+/// folder, not the LocalSystem profile's
+/// `C:\Windows\System32\config\systemprofile\Downloads\` (which
+/// usually doesn't exist; field repro PC50045 rc.7: the file-DC
+/// `begin()` call hung because `tokio::fs::create_dir_all` failed
+/// silently on a path with no SYSTEM-profile parent ACL grant).
+///
+/// Returns `None` if the user has no logged-in session OR if the
+/// resolved path doesn't exist (don't optimistically point uploads
+/// at a phantom directory). The caller is expected to fall through
+/// to a non-SystemContext resolution (`directories::UserDirs`) or
+/// the temp-dir fallback.
+pub fn active_user_downloads_path() -> Option<PathBuf> {
+    let path = active_user_profile_root()?.join("Downloads");
+    if path.exists() { Some(path) } else { None }
 }
 
 /// `ProcessIdToSessionId(GetCurrentProcessId())`. Returns the session
@@ -189,6 +221,42 @@ mod tests {
             s.ends_with("\\roomler-agent\\config\\config.toml"),
             "path should end with roomler-agent config: {p:?}"
         );
+    }
+
+    #[test]
+    fn active_user_profile_root_under_test_runner_resolves() {
+        let root = active_user_profile_root();
+        assert!(root.is_some(), "should resolve under user context");
+        let p = root.unwrap();
+        let s = p.to_string_lossy().to_lowercase();
+        assert!(
+            s.starts_with("c:\\users\\"),
+            "path should be C:\\Users\\<name>: {p:?}"
+        );
+    }
+
+    #[test]
+    fn active_user_downloads_path_existence_gated() {
+        // Under cargo test runner, our user profile DOES exist and
+        // Downloads usually does too — but not guaranteed (e.g. CI
+        // runners with stripped profiles). The function returns
+        // None when the path doesn't exist; assert only the shape
+        // when Some, and accept None silently otherwise.
+        if let Some(p) = active_user_downloads_path() {
+            let s = p.to_string_lossy().to_lowercase();
+            assert!(
+                s.contains("\\users\\"),
+                "path should be under C:\\Users: {p:?}"
+            );
+            assert!(
+                s.ends_with("\\downloads"),
+                "path should end with \\Downloads: {p:?}"
+            );
+            assert!(
+                p.exists(),
+                "function returned Some(p) but p doesn't exist: {p:?}"
+            );
+        }
     }
 
     #[test]

@@ -244,8 +244,16 @@ mod windows_impl {
                 return None;
             }
 
-            let pixel_count = (width * height) as usize;
-            let mut bgra = vec![0u8; pixel_count * 4];
+            // For monochrome cursors we need BOTH halves of the mask
+            // (AND + XOR) — only the AND mask paints the I-beam as a
+            // pure black silhouette, invisible on dark backgrounds
+            // (field repro PC50045 rc.7: cursor disappears over
+            // Notepad++ text area). The combined mask gives black
+            // outline + white fill, which the GUI Win32 cursors set
+            // expects.
+            let read_height = if is_monochrome { height * 2 } else { height };
+            let read_pixels = (width * read_height) as usize;
+            let mut raw = vec![0u8; read_pixels * 4];
 
             let mut bi = BITMAPINFO::default();
             bi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
@@ -254,7 +262,7 @@ mod windows_impl {
             // bottom-up (matches DIB on-wire convention) which would
             // require us to flip before encoding; asking top-down
             // directly is simpler.
-            bi.bmiHeader.biHeight = -(height as i32);
+            bi.bmiHeader.biHeight = -(read_height as i32);
             bi.bmiHeader.biPlanes = 1;
             bi.bmiHeader.biBitCount = 32;
             bi.bmiHeader.biCompression = BI_RGB.0;
@@ -264,8 +272,8 @@ mod windows_impl {
                 hdc,
                 bmp_handle,
                 0,
-                height,
-                Some(bgra.as_mut_ptr() as *mut _),
+                read_height,
+                Some(raw.as_mut_ptr() as *mut _),
                 &mut bi,
                 DIB_RGB_COLORS,
             );
@@ -276,20 +284,58 @@ mod windows_impl {
                 return None;
             }
 
-            // For monochrome cursors, GetDIBits gave us the mask
-            // (white = transparent, black = opaque). Synthesise a
-            // solid-black foreground with mask-derived alpha so the
-            // browser renders it as a plain outline. This is OK for
-            // the classic arrow; real OEM mono cursors are rare.
-            if is_monochrome {
-                for px in bgra.chunks_exact_mut(4) {
-                    let is_opaque = px[0] == 0 && px[1] == 0 && px[2] == 0;
-                    px[0] = 0;
-                    px[1] = 0;
-                    px[2] = 0;
-                    px[3] = if is_opaque { 255 } else { 0 };
+            // Compose the final BGRA buffer from the raw GetDIBits read.
+            // For colour cursors `raw` already IS the final buffer;
+            // for monochrome we have AND in the top half + XOR in the
+            // bottom half, both as 32-bit white-or-black pixels. Map
+            // each (AND, XOR) pair to the standard semantic:
+            //
+            //   AND=1, XOR=0 → transparent (most pixels)
+            //   AND=0, XOR=0 → opaque black (cursor outline)
+            //   AND=0, XOR=1 → opaque white (cursor fill)
+            //   AND=1, XOR=1 → inverse — approximate as opaque white
+            //                 (proper alpha-blend with screen needs the
+            //                 destination pixel which the browser
+            //                 doesn't have over the WebRTC frame)
+            //
+            // White-fill + black-outline survives both light and dark
+            // backgrounds; the I-beam becomes visible everywhere.
+            let bgra = if is_monochrome {
+                let pixel_count = (width * height) as usize;
+                let mut out = vec![0u8; pixel_count * 4];
+                let xor_offset = pixel_count * 4;
+                for i in 0..pixel_count {
+                    let and_idx = i * 4;
+                    let xor_idx = xor_offset + i * 4;
+                    // GetDIBits gave us 32-bit pixels: 0xFFFFFFFF for
+                    // white, 0x00000000 for black. Sample any channel.
+                    let and_bit = raw[and_idx] != 0;
+                    let xor_bit = raw[xor_idx] != 0;
+                    let out_idx = i * 4;
+                    match (and_bit, xor_bit) {
+                        (true, false) => {
+                            // Transparent. Already zeroed.
+                        }
+                        (false, false) => {
+                            // Black outline.
+                            out[out_idx] = 0;
+                            out[out_idx + 1] = 0;
+                            out[out_idx + 2] = 0;
+                            out[out_idx + 3] = 255;
+                        }
+                        (false, true) | (true, true) => {
+                            // White fill (or invert → approximate white).
+                            out[out_idx] = 255;
+                            out[out_idx + 1] = 255;
+                            out[out_idx + 2] = 255;
+                            out[out_idx + 3] = 255;
+                        }
+                    }
                 }
-            }
+                out
+            } else {
+                raw
+            };
 
             let info = CursorInfo {
                 width,
