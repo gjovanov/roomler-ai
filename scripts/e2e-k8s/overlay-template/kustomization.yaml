@@ -1,0 +1,44 @@
+# roomler-ai-e2e overlay
+# Spins up a parallel stack of the API + MongoDB + Redis + MinIO in
+# the `roomler-ai-e2e` namespace for Playwright e2e runs. Read
+# scripts/e2e-k8s.sh for the orchestration script.
+#
+# Differences from prod overlay:
+#   - separate namespace, ephemeral storage (emptyDir, not PVC)
+#   - no hostNetwork (uses ClusterIP service for the API)
+#   - no nodeSelector pinning to k8s-worker-3 (any tier=high-performance)
+#   - no tier=high-performance affinity (any node)
+#   - plaintext Secrets (sealed-secrets are encrypted per-namespace
+#     and don't decrypt when copied across namespaces)
+#   - NEW Service for roomler2 (prod relies on hostNetwork)
+#   - lowered resource requests/limits
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: roomler-ai-e2e
+
+resources:
+  - namespace.yaml
+  - configmap-roomler2-config.yaml
+  - secret-roomler2.yaml
+  - secret-mongodb.yaml
+  - secret-minio.yaml
+  - service-mongodb.yaml
+  - service-redis.yaml
+  - service-minio.yaml
+  - service-roomler2.yaml
+  - deployment-redis.yaml
+  - deployment-roomler2.yaml
+  - statefulset-mongodb.yaml
+  - statefulset-minio.yaml
+
+# Pin to whichever prod tag is currently live. Bump in lockstep when
+# you want e2e to validate a newer build than what's on roomler.ai.
+images:
+  - name: gjovanov/roomler-ai
+    newName: registry.roomler.ai/roomler-ai
+    newTag: v20260506-c89d55489f21
+
+commonLabels:
+  env: e2e
+  app.kubernetes.io/instance: roomler-ai-e2e

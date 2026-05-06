@@ -1,0 +1,78 @@
+# Playwright e2e runner image. Built and pushed to
+# `registry.roomler.ai/roomler-ai-e2e:<git-sha>` from mars; consumed by
+# the Job in the `roomler-ai-e2e` namespace's e2e overlay.
+#
+# Base: Microsoft's Playwright image with Chromium + Firefox + WebKit
+# preinstalled. Same major version (1.58.x) as `ui/package.json` to
+# avoid driver/browser mismatch errors. The image ships Node.js, NOT
+# bun — so we install dependencies via `npm ci` instead of `bun install`.
+# The bun-specific CDP transport patches in `playwright.config.cjs`
+# are wrapped in try/catch and no-op under Node (`globalThis.WebSocket`
+# is undefined; the inner `require` of bun-only paths throws and is
+# swallowed).
+FROM mcr.microsoft.com/playwright:v1.58.2-jammy
+
+WORKDIR /app
+
+# Layer 1: dependencies — cache invalidates only on lockfile change.
+COPY ui/package.json ui/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+
+# Layer 2: spec content — invalidates on every e2e change.
+COPY ui/playwright.config.cjs ./
+COPY ui/playwright.config.ts ./
+COPY ui/e2e ./e2e
+COPY ui/vite.config.ts ./
+
+# Output dir for the HTML report + screenshots + traces. Mounted
+# emptyDir on the Job so the `kubectl cp` step can grab artifacts.
+ENV PLAYWRIGHT_HTML_REPORT=/results/html
+ENV PLAYWRIGHT_HTML_OPEN=never
+
+# CI=true disables the `webServer.command` (`bun run dev`) in the
+# config — we want the suite to talk to the in-cluster roomler2
+# Service via E2E_BASE_URL / E2E_API_URL env vars instead.
+ENV CI=true
+
+# Wrap Playwright in a small script that touches `/results/.done`
+# after the run finishes, then `tail -f /dev/null` so the pod stays
+# alive long enough for `kubectl cp /results …` to grab artifacts.
+# Without this, the Job pod transitions to `Completed` and Kubernetes
+# may garbage-collect /results before the orchestrator script
+# extracts it. The orchestrator script polls for `.done` then cp's.
+#
+# Filtering is via env vars (PW_GREP, PW_GREP_INVERT) instead of CLI
+# args because passing space-containing strings through Kubernetes
+# Job `args:` array is fiddly. The script translates them to the
+# right Playwright flags.
+COPY <<'EOF' /usr/local/bin/run-e2e.sh
+#!/bin/sh
+set -e
+mkdir -p /results
+EXTRA=""
+[ -n "$PW_GREP" ]        && EXTRA="$EXTRA --grep $PW_GREP"
+[ -n "$PW_GREP_INVERT" ] && EXTRA="$EXTRA --grep-invert $PW_GREP_INVERT"
+[ -n "$PW_PROJECT" ]     && EXTRA="$EXTRA --project $PW_PROJECT"
+[ -n "$PW_WORKERS" ]     && EXTRA="$EXTRA --workers $PW_WORKERS"
+echo "[run-e2e] PW_GREP=$PW_GREP"
+echo "[run-e2e] PW_GREP_INVERT=$PW_GREP_INVERT"
+echo "[run-e2e] EXTRA=$EXTRA"
+echo "[run-e2e] E2E_BASE_URL=$E2E_BASE_URL"
+echo "[run-e2e] E2E_API_URL=$E2E_API_URL"
+EXIT_CODE=0
+# `set +e` so a non-zero Playwright exit doesn't trip set -e and
+# skip the artifact-finalize steps.
+set +e
+npx playwright test --config=playwright.config.cjs --reporter=list,html $EXTRA
+EXIT_CODE=$?
+set -e
+echo "[run-e2e] Playwright exit=$EXIT_CODE"
+echo "$EXIT_CODE" > /results/exit-code
+touch /results/.done
+echo "[run-e2e] sleeping until kubectl cp; SIGTERM to exit"
+exec tail -f /dev/null
+EOF
+RUN chmod +x /usr/local/bin/run-e2e.sh
+
+ENTRYPOINT ["/usr/local/bin/run-e2e.sh"]
+CMD []
