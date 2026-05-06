@@ -1,10 +1,6 @@
 <template>
-  <v-container fluid>
-    <v-row>
-      <v-col cols="12">
-        <h1 class="text-h4 mb-4">{{ $t('nav.dashboard') }}</h1>
-      </v-col>
-    </v-row>
+  <v-container fluid class="pa-2 pa-md-4 pa-xl-6">
+    <h1 class="text-h5 text-md-h4 mb-2 mb-md-4">{{ $t('nav.dashboard') }}</h1>
 
     <v-row v-if="tenantStore.tenants.length === 0">
       <v-col cols="12" md="6">

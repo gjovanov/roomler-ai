@@ -1,8 +1,8 @@
 <template>
-  <v-container class="fill-height" fluid>
+  <v-container class="fill-height pa-2 pa-md-4 pa-xl-6" fluid>
     <v-row align="center" justify="center">
       <v-col cols="12" sm="8" md="4">
-        <v-card class="pa-4">
+        <v-card class="pa-3 pa-md-4">
           <v-card-title class="text-center text-h5 mb-4">
             <v-icon color="primary" class="mr-2">mdi-forum</v-icon>
             {{ $t('auth.register') }}

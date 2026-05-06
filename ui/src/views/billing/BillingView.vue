@@ -1,17 +1,17 @@
 <template>
-  <v-container fluid class="py-8">
-    <h1 class="text-h4 font-weight-bold mb-2">Billing & Subscription</h1>
-    <p class="text-body-1 text-medium-emphasis mb-8">Manage your workspace's plan and billing</p>
+  <v-container fluid class="pa-2 pa-md-4 pa-xl-6">
+    <h1 class="text-h5 text-md-h4 font-weight-bold mb-2">Billing & Subscription</h1>
+    <p class="text-body-1 text-medium-emphasis mb-4 mb-md-6">Manage your workspace's plan and billing</p>
 
-    <v-alert v-if="$route.query.success" type="success" closable class="mb-6">
+    <v-alert v-if="$route.query.success" type="success" closable class="mb-4">
       Subscription updated successfully! Changes may take a moment to reflect.
     </v-alert>
-    <v-alert v-if="$route.query.canceled" type="info" closable class="mb-6">
+    <v-alert v-if="$route.query.canceled" type="info" closable class="mb-4">
       Checkout was canceled. No changes were made.
     </v-alert>
 
     <!-- Current Plan -->
-    <v-card variant="outlined" class="mb-8 pa-6">
+    <v-card variant="outlined" class="mb-4 mb-md-6 pa-4 pa-md-6">
       <div class="d-flex align-center justify-space-between flex-wrap ga-4">
         <div>
           <div class="text-overline text-medium-emphasis">Current Plan</div>
@@ -44,13 +44,13 @@
     </v-card>
 
     <!-- Plans -->
-    <h2 class="text-h5 font-weight-bold mb-4">Available Plans</h2>
+    <h2 class="text-h6 text-md-h5 font-weight-bold mb-2 mb-md-4">Available Plans</h2>
     <v-row>
       <v-col v-for="plan in plans" :key="plan.id" cols="12" sm="6" md="4">
         <v-card
           :variant="plan.id === currentPlan ? 'elevated' : 'outlined'"
           :elevation="plan.id === currentPlan ? 4 : 0"
-          class="pa-6 h-100 d-flex flex-column"
+          class="pa-4 pa-md-6 h-100 d-flex flex-column"
           rounded="lg"
           :class="{ 'border-primary': plan.id === currentPlan }"
         >

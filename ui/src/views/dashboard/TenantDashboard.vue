@@ -1,11 +1,7 @@
 <template>
-  <v-container fluid>
-    <v-row>
-      <v-col cols="12">
-        <h1 class="text-h4 mb-2">{{ tenantStore.current?.name }}</h1>
-        <p class="text-subtitle-1 text-medium-emphasis">Workspace Overview</p>
-      </v-col>
-    </v-row>
+  <v-container fluid class="pa-2 pa-md-4 pa-xl-6">
+    <h1 class="text-h5 text-md-h4 mb-1 mb-md-2">{{ tenantStore.current?.name }}</h1>
+    <p class="text-subtitle-2 text-md-subtitle-1 text-medium-emphasis mb-2 mb-md-4">Workspace Overview</p>
 
     <v-row>
       <v-col cols="12" sm="6" md="3">
@@ -47,10 +43,8 @@
     </v-row>
 
     <!-- Quick actions -->
-    <v-row class="mt-4">
-      <v-col cols="12">
-        <h2 class="text-h6 mb-2">Quick Actions</h2>
-      </v-col>
+    <h2 class="text-h6 mt-4 mb-2">Quick Actions</h2>
+    <v-row>
       <v-col cols="12" sm="6" md="3">
         <v-btn block color="primary" prepend-icon="mdi-plus" :to="`/tenant/${tenantId}/rooms`">
           New Room
