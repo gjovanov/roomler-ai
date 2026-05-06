@@ -16,6 +16,20 @@ pub struct Settings {
     pub giphy: GiphySettings,
     pub email: EmailSettings,
     pub push: PushSettings,
+    pub auth: AuthSettings,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct AuthSettings {
+    /// When true, `register` sets `is_verified: true` on the new user
+    /// directly, bypassing the email activation flow. Default false —
+    /// production keeps the email-link activation as the only path.
+    /// Used only by the e2e overlay (`ROOMLER__AUTH__AUTO_VERIFY=true`)
+    /// so Playwright specs can `register → login` without an SMTP
+    /// capture. Phase 4 of the e2e plan replaces this with Mailpit
+    /// + a helper that pulls the activation token from the inbox.
+    #[serde(default)]
+    pub auto_verify: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -184,6 +198,7 @@ impl Settings {
             .set_default("push.vapid_public_key", "")?
             .set_default("push.vapid_private_key", "")?
             .set_default("push.contact", "mailto:noreply@roomler.ai")?
+            .set_default("auth.auto_verify", false)?
             .build()?;
 
         config.try_deserialize()
