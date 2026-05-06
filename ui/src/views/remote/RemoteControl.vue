@@ -303,6 +303,93 @@
       >
         <v-icon>mdi-folder-open</v-icon>
       </v-btn>
+      <!-- Transfers chip — shows count of in-progress + recently
+           finished uploads / downloads. Click to expand a popover
+           with per-row progress and cancel buttons. Hidden when
+           there are no transfers to keep the toolbar uncluttered. -->
+      <v-menu
+        v-if="rc.phase.value === 'connected' && rc.transfers.value.length > 0"
+        :close-on-content-click="false"
+        location="bottom end"
+      >
+        <template #activator="{ props: menuProps }">
+          <v-btn
+            v-bind="menuProps"
+            icon
+            variant="text"
+            size="small"
+            :aria-label="`${transfersInFlightCount} transfer(s) in progress`"
+            :title="`Transfers (${transfersInFlightCount} active, ${rc.transfers.value.length} total)`"
+          >
+            <v-badge
+              v-if="transfersInFlightCount > 0"
+              :content="transfersInFlightCount"
+              color="primary"
+              floating
+              location="top end"
+              offset-x="-2"
+              offset-y="-2"
+            >
+              <v-icon>mdi-swap-vertical-circle-outline</v-icon>
+            </v-badge>
+            <v-icon v-else>mdi-swap-vertical-circle-outline</v-icon>
+          </v-btn>
+        </template>
+        <v-card min-width="380" max-width="460">
+          <v-toolbar density="compact" color="primary">
+            <v-icon class="ml-3">mdi-swap-vertical-circle-outline</v-icon>
+            <v-toolbar-title>Transfers</v-toolbar-title>
+          </v-toolbar>
+          <v-list density="compact" class="pa-0" max-height="400" style="overflow-y: auto">
+            <v-list-item
+              v-for="t in transfersOrdered"
+              :key="t.id"
+              :class="`transfer-row transfer-${t.status}`"
+            >
+              <template #prepend>
+                <v-icon :color="transferStatusColor(t)">
+                  {{ t.kind === 'upload' ? 'mdi-upload' : 'mdi-download' }}
+                </v-icon>
+              </template>
+              <v-list-item-title class="text-body-2 transfer-name" :title="t.name">
+                {{ t.name }}
+              </v-list-item-title>
+              <v-list-item-subtitle>
+                <span class="text-caption">{{ transferStatusLabel(t) }}</span>
+                <v-progress-linear
+                  v-if="t.status === 'running' || t.status === 'queued'"
+                  :model-value="transferProgressPct(t)"
+                  :indeterminate="t.total === null"
+                  color="primary"
+                  height="4"
+                  class="mt-1"
+                />
+              </v-list-item-subtitle>
+              <template #append>
+                <v-btn
+                  v-if="t.status === 'running' || t.status === 'queued'"
+                  icon
+                  size="x-small"
+                  variant="text"
+                  title="Cancel"
+                  @click="rc.cancelTransfer(t.id)"
+                >
+                  <v-icon>mdi-close-circle-outline</v-icon>
+                </v-btn>
+                <v-icon v-else-if="t.status === 'complete'" color="success">
+                  mdi-check-circle
+                </v-icon>
+                <v-icon v-else-if="t.status === 'error'" color="error" :title="t.error">
+                  mdi-alert-circle
+                </v-icon>
+                <v-icon v-else-if="t.status === 'cancelled'" color="grey">
+                  mdi-cancel
+                </v-icon>
+              </template>
+            </v-list-item>
+          </v-list>
+        </v-card>
+      </v-menu>
     </div>
     <!-- File input (hidden); shared between Row 2 inline upload
          button and the bottom-sheet upload button. `multiple`
@@ -1700,6 +1787,49 @@ const phaseLabel = computed(() => {
   }
 })
 
+// Transfers panel helpers. Surfaces the `rc.transfers` ref that's
+// been exposed since file-DC v2 Phase 1 but never rendered in the UI.
+const transfersInFlightCount = computed(() =>
+  rc.transfers.value.filter((t) => t.status === 'running' || t.status === 'queued').length
+)
+// Show in-flight first, then queued, then terminal (ordered by recency
+// — terminals auto-prune 10 s after they enter the list, so the tail
+// is short by construction).
+const transfersOrdered = computed(() => {
+  const order = (s: string) =>
+    s === 'running' ? 0 : s === 'queued' ? 1 : s === 'cancelled' ? 3 : s === 'error' ? 4 : 2
+  return [...rc.transfers.value].sort((a, b) => order(a.status) - order(b.status))
+})
+function transferStatusColor(t: { status: string }): string {
+  if (t.status === 'running') return 'primary'
+  if (t.status === 'queued') return 'grey'
+  if (t.status === 'complete') return 'success'
+  if (t.status === 'error') return 'error'
+  if (t.status === 'cancelled') return 'grey'
+  return 'grey'
+}
+function transferStatusLabel(t: {
+  status: string
+  bytes: number
+  total: number | null
+  error?: string
+}): string {
+  if (t.status === 'queued') return 'Queued'
+  if (t.status === 'running') {
+    if (t.total === null) return `${formatFileSize(t.bytes)} (streaming)`
+    const pct = t.total > 0 ? Math.round((t.bytes / t.total) * 100) : 0
+    return `${pct}% — ${formatFileSize(t.bytes)} / ${formatFileSize(t.total)}`
+  }
+  if (t.status === 'complete') return `${formatFileSize(t.bytes)} — done`
+  if (t.status === 'cancelled') return 'Cancelled'
+  if (t.status === 'error') return t.error ? `Error: ${t.error}` : 'Error'
+  return ''
+}
+function transferProgressPct(t: { bytes: number; total: number | null }): number {
+  if (t.total === null || t.total <= 0) return 0
+  return Math.min(100, Math.round((t.bytes / t.total) * 100))
+}
+
 // File-DC v2 capability gates (0.3.0+). The agent advertises a
 // per-feature `files: ["upload","download","download-folder","browse"]`
 // list in `rc:agent.hello`. Old agents (<0.3.0) leave the field empty;
@@ -1942,6 +2072,20 @@ onBeforeUnmount(() => {
    (Ctrl+click / Shift+click) feedback is visible at a glance. */
 .files-drawer .files-entry-selected {
   background: rgba(33, 150, 243, 0.18);
+}
+/* Transfers panel: long file names (folder uploads with deep paths)
+   would push the row width and break the popover layout — clamp with
+   ellipsis instead. The full name is in the row's `title` attribute
+   for hover. */
+.transfer-row .transfer-name {
+  text-overflow: ellipsis;
+  overflow: hidden;
+  white-space: nowrap;
+  max-width: 320px;
+}
+.transfer-row.transfer-cancelled .transfer-name,
+.transfer-row.transfer-error .transfer-name {
+  opacity: 0.7;
 }
 /* Scrollable frame for the scale modes where the video can overflow
    the viewport (original = 1:1 always if source > viewer, custom ≥
