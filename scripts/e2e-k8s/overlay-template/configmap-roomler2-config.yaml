@@ -1,0 +1,31 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: roomler2-config
+data:
+  ROOMLER__APP__HOST: "0.0.0.0"
+  ROOMLER__APP__PORT: "3000"
+  ROOMLER__APP__FRONTEND_URL: "http://roomler2"
+  # Permissive CORS for in-cluster e2e — Playwright runs in a sibling
+  # pod and may resolve via Service DNS or pod IP depending on test.
+  ROOMLER__APP__CORS_ORIGINS: "*"
+
+  ROOMLER__DATABASE__URL: "mongodb://mongodb.roomler-ai-e2e.svc.cluster.local:27017"
+  ROOMLER__DATABASE__NAME: "roomler_ai_e2e"
+
+  ROOMLER__REDIS__URL: "redis://redis.roomler-ai-e2e.svc.cluster.local:6379"
+
+  ROOMLER__S3__ENDPOINT: "http://minio.roomler-ai-e2e.svc.cluster.local:9000"
+  ROOMLER__S3__BUCKET: "roomler2-e2e"
+  ROOMLER__S3__REGION: "us-east-1"
+
+  ROOMLER__JWT__ISSUER: "roomler-ai-e2e"
+
+  # Phase 3 will set these when in-cluster coturn / Mailpit /
+  # oauth2-mock-server land. Until then, the specs that depend on
+  # them are filtered out by scripts/e2e-skip-list.txt.
+  ROOMLER__TURN__URL: ""
+
+  ROOMLER__MEDIASOUP__NUM_WORKERS: "1"
+
+  RUST_LOG: "info,roomler_ai=debug"

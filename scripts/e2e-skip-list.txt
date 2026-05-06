@@ -1,0 +1,9 @@
+# Specs deferred to Phase 3 (in-cluster coturn / Mailpit / oauth2-mock-server).
+# Used by `scripts/e2e-k8s.sh` to filter via Playwright's `--grep-invert`
+# until the supporting infra lands. Each entry is a regex matched
+# against the spec file path.
+oauth\.spec\.ts
+email-flows\.spec\.ts
+conference-multi\.spec\.ts
+record-intro\.spec\.ts
+rc-vp9-444\.spec\.ts
