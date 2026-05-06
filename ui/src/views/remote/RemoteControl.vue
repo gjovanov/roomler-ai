@@ -287,10 +287,13 @@
       </v-btn>
     </div>
     <!-- File input (hidden); shared between Row 2 inline upload
-         button and the bottom-sheet upload button. -->
+         button and the bottom-sheet upload button. `multiple`
+         lets the operator queue several files in one picker
+         dialog (Phase 1 of file-DC v2). -->
     <input
       ref="fileInput"
       type="file"
+      multiple
       style="display: none"
       @change="onFilePicked"
     />
@@ -764,9 +767,49 @@ function onStageDragLeave(ev: DragEvent) {
 }
 function onStageDrop(ev: DragEvent) {
   isDragOver.value = false
-  const f = ev.dataTransfer?.files?.[0]
-  if (!f) return
-  void uploadOne(f)
+  if (!ev.dataTransfer) return
+  // Iterate `items` (NOT `files`) so we can preflight each entry via
+  // `webkitGetAsEntry()` and skip directories with a clear toast.
+  // Field repro pre-rc.11: dragging a folder onto the viewer uploaded
+  // a 0-byte file named after the folder because Chrome reports the
+  // dropped folder in `dataTransfer.files[0]` as a synthetic File
+  // object that throws on read. webkitGetAsEntry() exposes the real
+  // type so we can refuse cleanly. (Folder upload is on the
+  // post-0.3.0 deferred list.)
+  const files: File[] = []
+  let folderCount = 0
+  const items = ev.dataTransfer.items
+  if (items && items.length > 0) {
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i]
+      if (item.kind !== 'file') continue
+      // webkitGetAsEntry is the de-facto-standard API across Chrome,
+      // Firefox, Safari, Edge for telling files from directories.
+      const entry = (item as DataTransferItem & {
+        webkitGetAsEntry?: () => { isDirectory?: boolean; isFile?: boolean } | null
+      }).webkitGetAsEntry?.()
+      if (entry?.isDirectory) {
+        folderCount++
+        continue
+      }
+      const f = item.getAsFile()
+      if (f) files.push(f)
+    }
+  } else if (ev.dataTransfer.files) {
+    // Browser without items API — fall back to files but warn that
+    // we can't tell folders from empty files.
+    for (let i = 0; i < ev.dataTransfer.files.length; i++) {
+      files.push(ev.dataTransfer.files[i])
+    }
+  }
+  if (folderCount > 0) {
+    showError(
+      folderCount === 1
+        ? 'Folder upload not supported yet — drop individual files'
+        : `${folderCount} folders skipped — folder upload not supported yet`
+    )
+  }
+  if (files.length > 0) void uploadMany(files)
 }
 function hasFileDrag(dt: DataTransfer): boolean {
   // `types` is the only field populated during dragenter / dragover
@@ -778,27 +821,49 @@ function hasFileDrag(dt: DataTransfer): boolean {
   return false
 }
 
-// Stream the user-picked file to the remote's Downloads folder via
-// the `files` DC. 64 KiB chunks with backpressure on
+// Stream the user-picked file(s) to the remote's Downloads folder
+// via the `files` DC. 64 KiB chunks with backpressure on
 // `RTCDataChannel.bufferedAmount` so large files don't OOM the tab.
+// `multiple` on the input lets the operator queue several at once.
 async function onFilePicked(ev: Event) {
   const input = ev.target as HTMLInputElement | null
-  const f = input?.files?.[0]
-  if (!f) return
+  const list = input?.files
+  if (!list || list.length === 0) return
+  const files: File[] = []
+  for (let i = 0; i < list.length; i++) files.push(list[i])
   try {
-    await uploadOne(f)
+    await uploadMany(files)
   } finally {
-    if (input) input.value = '' // allow re-selecting the same file
+    if (input) input.value = '' // allow re-selecting the same file(s)
   }
 }
 
-async function uploadOne(f: File) {
+async function uploadMany(files: File[]) {
+  if (files.length === 0) return
   uploadBusy.value = true
   try {
-    const res = await rc.uploadFile(f)
-    showSuccess(`Uploaded ${f.name} → ${res.path}`)
-  } catch (e) {
-    showError(`Upload failed: ${(e as Error).message}`)
+    const results = await rc.uploadFiles(files)
+    const ok = results.filter((r) => r.ok).length
+    const failed = results.filter((r) => !r.ok)
+    if (failed.length === 0) {
+      showSuccess(
+        ok === 1
+          ? `Uploaded ${results[0].name}`
+          : `Uploaded ${ok} files`
+      )
+    } else if (ok === 0) {
+      const first = failed[0] as { name: string; error: string }
+      showError(
+        failed.length === 1
+          ? `Upload failed: ${first.error}`
+          : `${failed.length} uploads failed (first: ${first.name} — ${first.error})`
+      )
+    } else {
+      const first = failed[0] as { name: string; error: string }
+      showError(
+        `Uploaded ${ok}/${files.length} — ${failed.length} failed (e.g. ${first.name}: ${first.error})`
+      )
+    }
   } finally {
     uploadBusy.value = false
   }
