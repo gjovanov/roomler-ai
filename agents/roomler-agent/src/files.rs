@@ -1311,6 +1311,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_upload_and_download_do_not_contend() {
+        // Critique #2 in the plan said an in-flight upload should
+        // not block a concurrent download (and vice versa). Locks
+        // the invariant: incoming + outgoing each have their own
+        // mutex; one can be active while the other progresses.
+        let base = std::env::temp_dir().join(format!(
+            "roomler-concurrent-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        tokio::fs::create_dir_all(&base).await.unwrap();
+        let download_src = base.join("source.bin");
+        tokio::fs::write(&download_src, vec![0u8; 1024])
+            .await
+            .unwrap();
+
+        // Point HOME/USERPROFILE at base so begin() picks a Downloads
+        // dir we control. Otherwise begin() would land on the dev's
+        // real Downloads.
+        let prev_home = std::env::var_os("HOME");
+        let prev_userprofile = std::env::var_os("USERPROFILE");
+        unsafe {
+            std::env::set_var("HOME", &base);
+            std::env::set_var("USERPROFILE", &base);
+        }
+        tokio::fs::create_dir_all(base.join("Downloads"))
+            .await
+            .unwrap();
+
+        let h = FilesHandler::new();
+        // Start an upload — populates `incoming`.
+        let upload_path = h
+            .begin("u1".into(), "upload.txt".into(), 5)
+            .await
+            .expect("begin upload");
+
+        // Concurrently start a download — populates `outgoing`. If
+        // the two states shared a mutex this would deadlock or block.
+        let offer = h
+            .begin_outgoing("d1".into(), &download_src.to_string_lossy())
+            .await
+            .expect("begin_outgoing");
+        assert_eq!(offer.size, Some(1024));
+
+        // Both should be reachable simultaneously.
+        let active_id = h.current_id().await;
+        assert_eq!(active_id.as_deref(), Some("u1"));
+        // We can write a chunk to the upload while the download
+        // state is still pinned.
+        h.chunk(b"hello").await.expect("chunk");
+        let (final_path, bytes) = h.end("u1").await.expect("end");
+        assert_eq!(final_path, upload_path);
+        assert_eq!(bytes, 5);
+
+        // The download is still active.
+        let cancelled = h.cancel_outgoing("d1").await;
+        assert!(cancelled);
+        h.finish_outgoing("d1").await;
+
+        // Restore env + cleanup.
+        unsafe {
+            if let Some(v) = prev_home {
+                std::env::set_var("HOME", v);
+            } else {
+                std::env::remove_var("HOME");
+            }
+            if let Some(v) = prev_userprofile {
+                std::env::set_var("USERPROFILE", v);
+            } else {
+                std::env::remove_var("USERPROFILE");
+            }
+        }
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    #[tokio::test]
     async fn cancel_outgoing_flips_flag() {
         let base = std::env::temp_dir().join(format!(
             "roomler-cancel-{}",
