@@ -290,8 +290,15 @@
         icon
         variant="text"
         size="small"
+        :disabled="!agentSupportsBrowse"
         aria-label="Browse files on the remote host"
-        title="Browse remote files (download)"
+        :title="
+          agentSupportsBrowse
+            ? 'Browse remote files (download)'
+            : isLegacyFileDc
+              ? 'Browse needs agent 0.3.0+ — upgrade host agent'
+              : 'Browse disabled by host config'
+        "
         @click="filesDrawer = !filesDrawer"
       >
         <v-icon>mdi-folder-open</v-icon>
@@ -739,7 +746,16 @@
               icon
               size="x-small"
               variant="text"
-              :title="entry.is_dir ? `Download ${entry.name} as zip (Chrome/Edge only)` : `Download ${entry.name}`"
+              :disabled="entry.is_dir ? !agentSupportsFolderDownload : !agentSupportsDownload"
+              :title="
+                entry.is_dir
+                  ? agentSupportsFolderDownload
+                    ? `Download ${entry.name} as zip (Chrome/Edge only)`
+                    : 'Folder download needs agent 0.3.0+'
+                  : agentSupportsDownload
+                    ? `Download ${entry.name}`
+                    : 'Download needs agent 0.3.0+'
+              "
               @click.stop="downloadEntry(entry)"
             >
               <v-icon>{{ entry.is_dir ? 'mdi-folder-zip' : 'mdi-download' }}</v-icon>
@@ -1684,6 +1700,27 @@ const phaseLabel = computed(() => {
     default: return ''
   }
 })
+
+// File-DC v2 capability gates (0.3.0+). The agent advertises a
+// per-feature `files: ["upload","download","download-folder","browse"]`
+// list in `rc:agent.hello`. Old agents (<0.3.0) leave the field empty;
+// browsers fall back to the coarse `supports_file_transfer` bool which
+// only marks upload availability. We grey out toolbar buttons when
+// the capability isn't advertised so operators get instant "feature
+// unavailable" feedback instead of waiting for a 5 s timeout on an
+// unanswered request.
+const agentFilesCaps = computed<string[]>(() => agent.value?.capabilities?.files ?? [])
+const agentSupportsBrowse = computed(() => agentFilesCaps.value.includes('browse'))
+const agentSupportsDownload = computed(() =>
+  agentFilesCaps.value.includes('download') || agentFilesCaps.value.includes('download-folder')
+)
+const agentSupportsFolderDownload = computed(() =>
+  agentFilesCaps.value.includes('download-folder')
+)
+// Old-agent flag: file-DC v1 (only upload) — coarse caps absent. Used
+// to render a "agent doesn't support download — upgrade to 0.3.0+"
+// hint when the operator opens the drawer.
+const isLegacyFileDc = computed(() => agentFilesCaps.value.length === 0)
 
 async function loadAgent() {
   if (!agentStore.agents.length) {

@@ -150,6 +150,21 @@ fn compute_caps() -> AgentCaps {
         }
     }
 
+    // File-DC v2 capability list. Always advertise upload + download
+    // + download-folder (always built in this agent). `browse` is
+    // gated on the runtime `enable_remote_browse` flag so old
+    // browsers that see an empty `files` array fall back to
+    // `supports_file_transfer` (upload-only) and new browsers
+    // grey out the drawer button when the host has browse disabled.
+    let mut files = vec![
+        "upload".to_string(),
+        "download".to_string(),
+        "download-folder".to_string(),
+    ];
+    if crate::files::is_remote_browse_enabled() {
+        files.push("browse".to_string());
+    }
+
     AgentCaps {
         hw_encoders,
         codecs,
@@ -158,6 +173,7 @@ fn compute_caps() -> AgentCaps {
         supports_file_transfer: true,
         max_simultaneous_sessions: 1,
         transports,
+        files,
     }
 }
 

@@ -28,6 +28,11 @@ export interface AgentCapabilities {
   supports_clipboard: boolean
   supports_file_transfer: boolean
   max_simultaneous_sessions: number
+  /** File-DC v2 (0.3.0+) per-feature capability list. Recognised
+   *  values: 'upload', 'download', 'download-folder', 'browse'.
+   *  Empty / unset on older agents — browsers fall back to
+   *  `supports_file_transfer` as the upload-only marker. */
+  files?: string[]
 }
 
 export interface Agent {
