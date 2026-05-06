@@ -2370,7 +2370,10 @@ export function useRemoteControl() {
    *  the back-compat `uploadFile(file)` shim. Reads agent replies via
    *  the persistent `files` DC listener registered at channel-create
    *  time (see `filesRegistry`). */
-  function uploadOne(file: File): Promise<{ path: string; bytes: number }> {
+  function uploadOne(
+    file: File,
+    relPath?: string
+  ): Promise<{ path: string; bytes: number }> {
     const ch = channels.files
     if (!ch || ch.readyState !== 'open') {
       return Promise.reject(new Error('files channel not open'))
@@ -2382,7 +2385,10 @@ export function useRemoteControl() {
       pushTransfer({
         id,
         kind: 'upload',
-        name: file.name,
+        // Show the relative path in the Transfers panel for folder
+        // uploads so the operator can tell `file.txt` (root) apart
+        // from `MyFolder/sub/file.txt` (deep).
+        name: relPath ?? file.name,
         bytes: 0,
         total: file.size,
         status: 'queued',
@@ -2402,13 +2408,20 @@ export function useRemoteControl() {
         if (ch.readyState !== 'open') {
           throw new Error('files channel closed before files:begin could be sent')
         }
-        ch.send(JSON.stringify({
+        // Folder-upload extension (file-DC v2.1): when `relPath` is
+        // set, send it alongside `name`. Old agents (<0.3.0) ignore
+        // unknown JSON fields and use `name` as the basename, so the
+        // folder structure flattens — graceful degradation. New
+        // agents recreate the directory tree under Downloads/.
+        const beginMsg: Record<string, unknown> = {
           t: 'files:begin',
           id,
           name: file.name,
           size: file.size,
           mime: file.type || undefined,
-        }))
+        }
+        if (relPath) beginMsg.rel_path = relPath
+        ch.send(JSON.stringify(beginMsg))
       } catch (e) {
         localFail(e instanceof Error ? e : new Error(String(e)))
         return
@@ -2822,21 +2835,88 @@ export function useRemoteControl() {
    *  `uploadOne`; the queue continues on individual failures so a
    *  bad file doesn't sink the rest. Resolves with one result per
    *  input file (in order) carrying either the agent-reported path +
-   *  bytes (success) or an error message (failure). */
+   *  bytes (success) or an error message (failure).
+   *
+   *  Accepts either bare `File` items (flat upload — file lands in
+   *  Downloads/) or `{ file, relPath }` pairs (folder upload — agent
+   *  recreates the directory structure under Downloads/<root>/).
+   *  Mixing is allowed — useful when a drag&drop event has both
+   *  individual files and one or more folders. */
   type UploadResult =
     | { ok: true; name: string; path: string; bytes: number }
     | { ok: false; name: string; error: string }
-  async function uploadFiles(files: File[]): Promise<UploadResult[]> {
+  type UploadInput = File | { file: File; relPath: string }
+  async function uploadFiles(items: UploadInput[]): Promise<UploadResult[]> {
     const results: UploadResult[] = []
-    for (const f of files) {
+    for (const it of items) {
+      const f: File = it instanceof File ? it : it.file
+      const relPath: string | undefined = it instanceof File ? undefined : it.relPath
+      const reportName = relPath ?? f.name
       try {
-        const r = await uploadOne(f)
-        results.push({ ok: true, name: f.name, path: r.path, bytes: r.bytes })
+        const r = await uploadOne(f, relPath)
+        results.push({ ok: true, name: reportName, path: r.path, bytes: r.bytes })
       } catch (e) {
-        results.push({ ok: false, name: f.name, error: e instanceof Error ? e.message : String(e) })
+        results.push({
+          ok: false,
+          name: reportName,
+          error: e instanceof Error ? e.message : String(e),
+        })
       }
     }
     return results
+  }
+
+  /** Recursively walk a `FileSystemEntry` (from
+   *  `dataTransfer.items[i].webkitGetAsEntry()`) into a flat list of
+   *  `{ file, relPath }` pairs ready for `uploadFiles`. The relative
+   *  path uses forward slashes (matches what the agent expects on
+   *  the wire). Skips dotfiles and symlinks for safety; caps the
+   *  walk at 5000 files / 32 levels of depth to refuse pathological
+   *  inputs (huge `node_modules` etc.) before they swamp the queue.
+   *
+   *  Returns `null` on entries that aren't directories (caller
+   *  should treat as a single file via `entry.file()`). */
+  type FolderWalkEntry = { file: File; relPath: string }
+  async function walkFolderEntry(
+    entry: FileSystemEntry,
+    rootName: string
+  ): Promise<FolderWalkEntry[]> {
+    const out: FolderWalkEntry[] = []
+    const MAX_FILES = 5000
+    const MAX_DEPTH = 32
+    type Pending = { entry: FileSystemEntry; relParent: string; depth: number }
+    const queue: Pending[] = [{ entry, relParent: rootName, depth: 0 }]
+    while (queue.length > 0) {
+      const { entry: cur, relParent, depth } = queue.shift() as Pending
+      if (depth > MAX_DEPTH) continue
+      if (cur.name.startsWith('.')) continue // skip dotfiles / dotdirs
+      if (cur.isFile) {
+        const fileEntry = cur as FileSystemFileEntry
+        const f: File = await new Promise((resolve, reject) =>
+          fileEntry.file(resolve, reject)
+        )
+        out.push({ file: f, relPath: `${relParent}/${cur.name}` })
+        if (out.length >= MAX_FILES) break
+      } else if (cur.isDirectory) {
+        const dirEntry = cur as FileSystemDirectoryEntry
+        const reader = dirEntry.createReader()
+        // readEntries pages — keep calling until it returns an empty array.
+        let batch: FileSystemEntry[] = []
+        do {
+          batch = await new Promise<FileSystemEntry[]>((resolve, reject) =>
+            reader.readEntries(resolve, reject)
+          )
+          for (const child of batch) {
+            queue.push({
+              entry: child,
+              relParent: `${relParent}/${cur.name}`,
+              depth: depth + 1,
+            })
+          }
+        } while (batch.length > 0)
+      }
+    }
+    return out
   }
 
   /** Send Ctrl+Alt+Del to the remote. The browser can't capture this
@@ -2905,6 +2985,7 @@ export function useRemoteControl() {
     sendCtrlAltDel,
     uploadFile,
     uploadFiles,
+    walkFolderEntry,
     downloadFile,
     downloadFolder,
     cancelDownload,
