@@ -2157,10 +2157,17 @@ async fn handle_files_control(
             size,
             mime,
             rel_path,
+            dest_path,
         } => {
-            info!(%session_id, %id, %name, size, ?mime, ?rel_path, "files: begin");
+            info!(%session_id, %id, %name, size, ?mime, ?rel_path, ?dest_path, "files: begin");
             match handler
-                .begin(id.clone(), name, size, rel_path.as_deref())
+                .begin(
+                    id.clone(),
+                    name,
+                    size,
+                    rel_path.as_deref(),
+                    dest_path.as_deref(),
+                )
                 .await
             {
                 Ok(path) => {
