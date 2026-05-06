@@ -89,6 +89,23 @@ pub async fn register(
 
     let user_id = user.id.unwrap();
 
+    // E2E auto-verify shortcut: when `ROOMLER__AUTH__AUTO_VERIFY=true`
+    // (only set in the roomler-ai-e2e overlay), flip is_verified
+    // immediately so Playwright specs can `register → login` without
+    // an SMTP capture in cluster. Default false — production still
+    // requires email-link activation. Mirrors the same `$set` the
+    // `activate` handler does later in the email-driven flow.
+    if state.settings.auth.auto_verify {
+        if let Err(e) = state
+            .users
+            .base
+            .update_by_id(user_id, bson::doc! { "$set": { "is_verified": true } })
+            .await
+        {
+            warn!("auto_verify is set but failed to mark user verified: {:?}", e);
+        }
+    }
+
     // Generate activation code and send email
     let token = nanoid!(7);
     if let Err(e) = state
