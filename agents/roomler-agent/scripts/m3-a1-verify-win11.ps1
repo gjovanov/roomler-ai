@@ -115,26 +115,66 @@ function Get-ServiceState {
     }
 }
 
-# Service-mode supervisor logs go under %PROGRAMDATA%; user-context
-# worker logs go under %LOCALAPPDATA% of whoever was logged in when
-# the worker was spawned. The M3 A1 worker spawned via winlogon-
-# token is S-1-5-18, which writes to %WINDIR%\System32\config\
-# systemprofile\AppData\Local\... — not %LOCALAPPDATA% of the
-# operator. Capture both so the operator doesn't miss either.
-function Get-SupervisorLogDir {
-    return Join-Path $env:PROGRAMDATA 'roomler\roomler-agent\service-logs'
-}
-
+# Under perMachine MSI, BOTH the SCM-service supervisor AND the
+# SystemContext worker run as LocalSystem and write to the SYSTEM
+# profile's local-app-data path. The user-context worker (when it
+# exists) writes to whichever user owns the session. The
+# tracing-appender uses daily rolling files named
+# `roomler-agent.log.YYYY-MM-DD` (NOT `*.log`). Search both
+# directories and pick the most recent file across them so the
+# operator always gets the freshest log.
 function Get-SystemWorkerLogDir {
     return 'C:\Windows\System32\config\systemprofile\AppData\Local\roomler\roomler-agent\data\logs'
+}
+
+function Get-UserWorkerLogDirs {
+    # Enumerate every C:\Users\*\AppData\Local\... candidate and
+    # return only those that exist. Catches sessions where the agent
+    # ran as the logged-in user before the perMachine SCM service
+    # took over.
+    $users = Get-ChildItem -Path 'C:\Users' -Directory -ErrorAction SilentlyContinue
+    $dirs = @()
+    foreach ($u in $users) {
+        $cand = Join-Path $u.FullName 'AppData\Local\roomler\roomler-agent\data\logs'
+        if (Test-Path $cand) { $dirs += $cand }
+    }
+    return $dirs
+}
+
+# Supervisor + SystemContext-worker logs land in the same dir under
+# perMachine (both are LocalSystem). Treat them as one search target.
+function Get-SupervisorLogDir {
+    return Get-SystemWorkerLogDir
 }
 
 function Get-LatestLog {
     param([string]$Dir)
     if (-not (Test-Path $Dir)) { return $null }
-    return Get-ChildItem -Path $Dir -Filter '*.log' -ErrorAction SilentlyContinue |
+    # tracing-appender's daily roller uses `roomler-agent.log.<date>`
+    # so we match both the rolled name AND any `.log` files (in case
+    # a future config writes to the unsuffixed name).
+    return Get-ChildItem -Path $Dir -Filter 'roomler-agent.log*' -ErrorAction SilentlyContinue |
         Sort-Object LastWriteTime -Descending |
         Select-Object -First 1
+}
+
+# Find the freshest agent log across SYSTEM-profile + every user
+# profile. Used by Action-Latency to make sure we read the log the
+# active worker is currently writing to, regardless of which session
+# it's running in.
+function Get-LatestLogAcrossDirs {
+    $dirs = @(Get-SystemWorkerLogDir)
+    $dirs += Get-UserWorkerLogDirs
+    $latest = $null
+    foreach ($d in $dirs) {
+        $cand = Get-LatestLog -Dir $d
+        if ($cand) {
+            if (-not $latest -or $cand.LastWriteTime -gt $latest.LastWriteTime) {
+                $latest = $cand
+            }
+        }
+    }
+    return $latest
 }
 
 # ----- actions ---------------------------------------------------------------
@@ -154,17 +194,23 @@ function Action-Status {
         Write-Host 'Service:   <not registered>' -ForegroundColor Yellow
     }
 
-    $supLog = Get-LatestLog (Get-SupervisorLogDir)
+    $supLog = Get-LatestLogAcrossDirs
     if ($supLog) {
-        Write-Host "Sup log:   $($supLog.FullName) ($([math]::Round($supLog.Length/1KB)) KB, $($supLog.LastWriteTime))"
+        Write-Host "Latest log: $($supLog.FullName) ($([math]::Round($supLog.Length/1KB)) KB, $($supLog.LastWriteTime))"
     } else {
-        Write-Host 'Sup log:   <none>' -ForegroundColor Yellow
+        Write-Host 'Latest log: <none>' -ForegroundColor Yellow
     }
     $sysLog = Get-LatestLog (Get-SystemWorkerLogDir)
     if ($sysLog) {
-        Write-Host "Sys log:   $($sysLog.FullName) ($([math]::Round($sysLog.Length/1KB)) KB, $($sysLog.LastWriteTime))"
+        Write-Host "Sys log:    $($sysLog.FullName) ($([math]::Round($sysLog.Length/1KB)) KB, $($sysLog.LastWriteTime))"
     } else {
-        Write-Host 'Sys log:   <none — no SYSTEM-context spawn observed yet>'
+        Write-Host 'Sys log:    <none — no SYSTEM-context spawn observed yet>'
+    }
+    foreach ($d in (Get-UserWorkerLogDirs)) {
+        $userLog = Get-LatestLog -Dir $d
+        if ($userLog) {
+            Write-Host "User log:   $($userLog.FullName) ($([math]::Round($userLog.Length/1KB)) KB, $($userLog.LastWriteTime))"
+        }
     }
 
     # SoftwareSASGeneration check (Critique #12). The perMachine MSI
@@ -260,9 +306,14 @@ function Action-LockUnlockCycle {
 
 function Action-Latency {
     Write-Host '== Lock-Unlock latency analysis ===========================' -ForegroundColor Cyan
-    $supLog = Get-LatestLog (Get-SupervisorLogDir)
+    $supLog = Get-LatestLogAcrossDirs
     if (-not $supLog) {
-        Write-Host 'No supervisor log found.' -ForegroundColor Yellow
+        Write-Host 'No supervisor log found in any candidate directory.' -ForegroundColor Yellow
+        Write-Host '  Tried:' -ForegroundColor DarkGray
+        Write-Host "    $(Get-SystemWorkerLogDir)" -ForegroundColor DarkGray
+        foreach ($d in (Get-UserWorkerLogDirs)) {
+            Write-Host "    $d" -ForegroundColor DarkGray
+        }
         return
     }
     Write-Host "Reading: $($supLog.FullName)"
@@ -292,13 +343,13 @@ function Action-Latency {
 }
 
 function Action-Logs {
-    Write-Host '== Supervisor log =========================================' -ForegroundColor Cyan
-    $supLog = Get-LatestLog (Get-SupervisorLogDir)
-    if ($supLog) {
-        Write-Host $supLog.FullName
-        Get-Content -Path $supLog.FullName -Tail $LogTail
+    Write-Host '== Latest agent log (any source) ==========================' -ForegroundColor Cyan
+    $latest = Get-LatestLogAcrossDirs
+    if ($latest) {
+        Write-Host $latest.FullName
+        Get-Content -Path $latest.FullName -Tail $LogTail
     } else {
-        Write-Host 'No supervisor log.' -ForegroundColor Yellow
+        Write-Host 'No agent log found.' -ForegroundColor Yellow
     }
     Write-Host "`n== System-context worker log =============================" -ForegroundColor Cyan
     $sysLog = Get-LatestLog (Get-SystemWorkerLogDir)
@@ -307,6 +358,15 @@ function Action-Logs {
         Get-Content -Path $sysLog.FullName -Tail $LogTail
     } else {
         Write-Host 'No SYSTEM-context worker log (worker may not have spawned yet).' -ForegroundColor Yellow
+    }
+    Write-Host "`n== User-context worker logs ==============================" -ForegroundColor Cyan
+    foreach ($d in (Get-UserWorkerLogDirs)) {
+        $userLog = Get-LatestLog -Dir $d
+        if ($userLog) {
+            Write-Host $userLog.FullName
+            Get-Content -Path $userLog.FullName -Tail ([math]::Min($LogTail, 50))
+            Write-Host '---'
+        }
     }
 }
 

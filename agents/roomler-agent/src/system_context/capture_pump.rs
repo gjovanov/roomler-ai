@@ -62,6 +62,18 @@ use super::gdi_backend::{GdiBackend, GdiFrame};
 /// staring at empty frames for long.
 const HARD_ERROR_FALLBACK_THRESHOLD: u32 = 3;
 
+/// After this many consecutive `BackendBail::AccessLost` returns we
+/// also switch to GDI. AccessLost during a Win+L cycle persists for
+/// 3-5 seconds while the OS rebuilds the display compositor; spinning
+/// `b.reset()` 20 times per second over that window is ~30-50ms of
+/// GPU work per cycle, which starves the encoder + send threads and
+/// produces visible blocky motion (field repro PC50045 rc.9 lock/unlock
+/// cycle: ~80 recreate attempts in 4 s, mouse motion not smooth).
+/// 8 consecutive AccessLost ≈ 400 ms — enough to be sure it's not a
+/// single transient blip but fast enough that the operator doesn't
+/// stare at black frames for long.
+const ACCESS_LOST_FALLBACK_THRESHOLD: u32 = 8;
+
 /// Active capture backend. Starts as DXGI; swaps to GDI on persistent
 /// HardError; can climb back to DXGI when it recovers.
 #[cfg(feature = "scrap-capture")]
@@ -196,12 +208,14 @@ fn worker_main(
 
     let start = Instant::now();
     let mut consecutive_hard: u32 = 0;
+    let mut consecutive_access_lost: u32 = 0;
     let mut consecutive_empty: u64 = 0;
 
     while let Ok(res_tx) = cmd_rx.recv() {
         let reply = capture_one_blocking(
             &mut backend,
             &mut consecutive_hard,
+            &mut consecutive_access_lost,
             &mut consecutive_empty,
             start,
         );
@@ -260,6 +274,7 @@ fn backend_dimensions(b: &ActiveBackend) -> (u32, u32) {
 fn capture_one_blocking(
     backend: &mut ActiveBackend,
     consecutive_hard: &mut u32,
+    consecutive_access_lost: &mut u32,
     consecutive_empty: &mut u64,
     start: Instant,
 ) -> CaptureReply {
@@ -268,16 +283,19 @@ fn capture_one_blocking(
         ActiveBackend::Dxgi(b) => match b.frame() {
             Ok(frame) => {
                 *consecutive_hard = 0;
+                *consecutive_access_lost = 0;
                 *consecutive_empty = 0;
                 Ok(Some(dxgi_to_frame(frame, start)))
             }
             Err(BackendBail::Transient) => {
                 *consecutive_hard = 0;
+                *consecutive_access_lost = 0;
                 *consecutive_empty = consecutive_empty.saturating_add(1);
                 Ok(None)
             }
             Err(BackendBail::DesktopMismatch) => {
                 *consecutive_hard = 0;
+                *consecutive_access_lost = 0;
                 *consecutive_empty = consecutive_empty.saturating_add(1);
                 match desktop_rebind::try_change_desktop() {
                     Ok(desktop_rebind::DesktopChange::Switched(name)) => {
@@ -296,16 +314,53 @@ fn capture_one_blocking(
             }
             Err(BackendBail::AccessLost) => {
                 *consecutive_hard = 0;
+                *consecutive_access_lost = consecutive_access_lost.saturating_add(1);
                 *consecutive_empty = consecutive_empty.saturating_add(1);
-                tracing::warn!(
-                    "DXGI AccessLost — recreating capturer (desktop transition or GPU device-lost)"
-                );
+                // Threshold breach → fall back to GDI immediately. A
+                // sustained AccessLost storm during a Win+L cycle is
+                // expensive (each recreate is ~30-50ms of GPU work);
+                // GDI BitBlt is cheaper and works through the
+                // transition. The next Ok(frame) on GDI will reset
+                // the counter; the next time DXGI is rebuilt (via
+                // pump-rebuild or a session restart) it'll be
+                // healthy again.
+                if *consecutive_access_lost >= ACCESS_LOST_FALLBACK_THRESHOLD {
+                    match GdiBackend::primary() {
+                        Ok(g) => {
+                            tracing::warn!(
+                                threshold = ACCESS_LOST_FALLBACK_THRESHOLD,
+                                "DXGI persistent AccessLost — switching to GDI BitBlt fallback (lock-screen / display-compositor transition)"
+                            );
+                            *backend = ActiveBackend::Gdi(g);
+                            *consecutive_access_lost = 0;
+                            return Ok(None);
+                        }
+                        Err(e2) => {
+                            tracing::error!(
+                                %e2,
+                                "GDI fallback init also failed during AccessLost storm; staying on DXGI"
+                            );
+                        }
+                    }
+                }
+                // Below threshold: log at WARN for the first 3, debug
+                // afterwards to keep the log readable. Desktop may
+                // have flipped under us during AccessLost (lock →
+                // unlock typically does), so opportunistically rebind.
+                if *consecutive_access_lost <= 3 {
+                    tracing::warn!(
+                        count = *consecutive_access_lost,
+                        "DXGI AccessLost — recreating capturer (desktop transition or GPU device-lost)"
+                    );
+                } else {
+                    tracing::debug!(
+                        count = *consecutive_access_lost,
+                        "DXGI AccessLost (continuing — fallback at {ACCESS_LOST_FALLBACK_THRESHOLD})"
+                    );
+                }
                 if let Err(e) = b.reset() {
                     tracing::warn!(?e, "DXGI reset after AccessLost failed");
                 }
-                // Desktop may have flipped under us during AccessLost
-                // (lock → unlock typically does), so opportunistically
-                // rebind. Ignored if Unchanged.
                 let _ = desktop_rebind::try_change_desktop();
                 Ok(None)
             }
@@ -317,6 +372,7 @@ fn capture_one_blocking(
             }
             Err(BackendBail::HardError(e)) => {
                 *consecutive_hard = consecutive_hard.saturating_add(1);
+                *consecutive_access_lost = 0;
                 *consecutive_empty = consecutive_empty.saturating_add(1);
                 tracing::warn!(
                     %e,
