@@ -147,6 +147,7 @@ impl SystemContextInjector {
 /// shared enigo dispatcher.
 fn run_worker(mut enigo: Enigo, rx: std_mpsc::Receiver<InputMsg>) {
     let mut events_since_log: u64 = 0;
+    let mut consec_dispatch_errors: u64 = 0;
     while let Ok(msg) = rx.recv() {
         events_since_log = events_since_log.wrapping_add(1);
         match desktop_rebind::try_change_desktop() {
@@ -160,20 +161,60 @@ fn run_worker(mut enigo: Enigo, rx: std_mpsc::Receiver<InputMsg>) {
                     "system-context input: rebound desktop before dispatch"
                 );
                 events_since_log = 0;
+                // Reset Enigo's per-thread state. After SetThreadDesktop
+                // crosses a desktop boundary the previous Enigo's
+                // cached HKL / modifier shadow state is stale; held
+                // modifiers can't be released because their down-
+                // events landed on the OLD desktop. Rebuilding Enigo
+                // is cheap (~ms) and resets cached state cleanly.
+                if let Ok(fresh) = Enigo::new(&Settings::default()) {
+                    enigo = fresh;
+                }
             }
             Err(e) => {
-                // Don't drop the event — the previous binding is
-                // still in effect; the click may land on the wrong
-                // desktop but the operator can recover on the next
-                // successful rebind.
                 tracing::warn!(
                     %e,
                     "try_change_desktop before input dispatch failed; dispatching against last-known binding"
                 );
             }
         }
-        if let Err(e) = enigo_backend::dispatch_for_external(&mut enigo, msg) {
-            tracing::debug!(%e, "system-context input event dropped");
+        match enigo_backend::dispatch_for_external(&mut enigo, msg.clone()) {
+            Ok(_) => {
+                consec_dispatch_errors = 0;
+            }
+            Err(e) => {
+                consec_dispatch_errors = consec_dispatch_errors.saturating_add(1);
+                // First error in a streak: attempt explicit rebind +
+                // single retry. SendInput / SetCursorPos commonly
+                // fail ACCESS_DENIED when the desktop's handle was
+                // recycled mid-session (lock/unlock); a fresh
+                // try_change_desktop + retry recovers without
+                // session restart.
+                if consec_dispatch_errors == 1 {
+                    tracing::warn!(
+                        %e,
+                        "system-context input dispatch error; forcing rebind + retry"
+                    );
+                    let _ = desktop_rebind::try_change_desktop();
+                    if let Ok(fresh) = Enigo::new(&Settings::default()) {
+                        enigo = fresh;
+                    }
+                    if let Err(e2) = enigo_backend::dispatch_for_external(&mut enigo, msg) {
+                        tracing::warn!(
+                            error = %e2,
+                            "system-context input retry-after-rebind also failed"
+                        );
+                    }
+                } else if consec_dispatch_errors % 32 == 0 {
+                    // Streak of failures; rate-limit logging to once
+                    // per 32 consecutive errors so we don't spam.
+                    tracing::warn!(
+                        consec_errors = consec_dispatch_errors,
+                        %e,
+                        "system-context input dispatch failing in a streak"
+                    );
+                }
+            }
         }
     }
     tracing::info!("system-context input worker thread exiting (cmd channel closed)");
