@@ -162,23 +162,64 @@ pub enum CheckOutcome {
     Skipped(String),
 }
 
-/// Parse a git tag like `agent-v0.1.36` or `v0.1.36` into a numeric
-/// triple for ordering. Unparseable tags compare as None and are
-/// treated as "not newer" so a malformed server-side tag can't force
-/// a downgrade.
-pub fn parse_version(tag: &str) -> Option<(u64, u64, u64)> {
+/// Parse a git tag like `agent-v0.1.36`, `v0.1.36`, or
+/// `agent-v0.3.0-rc.4` into a 4-tuple `(major, minor, patch, pre)`
+/// for ordering. The `pre` field is `u64::MAX` for a non-pre-release
+/// (final) version and the rc number for `-rc.N` / `-rcN` /
+/// `-rc-N` pre-releases. This makes the natural tuple ordering match
+/// semver: `0.3.0-rc.1 < 0.3.0-rc.4 < 0.3.0-rc.99 < 0.3.0`.
+///
+/// Unparseable tags compare as None and are treated as "not newer"
+/// so a malformed server-side tag can't force a downgrade.
+///
+/// Field bug 2026-05-06: pre-0.3.0 implementation only returned a
+/// 3-tuple; rc.3 vs rc.4 both parsed to `(0, 3, 0)` and
+/// `is_newer(rc.4, rc.3)` returned false. The auto-updater logged
+/// "up to date current=rc.3 latest=rc.4" indefinitely.
+pub fn parse_version(tag: &str) -> Option<(u64, u64, u64, u64)> {
     let stripped = tag.trim_start_matches("agent-");
     let stripped = stripped.trim_start_matches('v');
-    let parts: Vec<&str> = stripped.split('.').collect();
+
+    // Split on the FIRST '-' so the core (major.minor.patch) and the
+    // pre-release suffix (rc.N / build.42 / etc.) are isolated.
+    let (core, pre) = match stripped.find('-') {
+        Some(i) => (&stripped[..i], Some(&stripped[i + 1..])),
+        None => (stripped, None),
+    };
+
+    let parts: Vec<&str> = core.split('.').collect();
     if parts.len() < 3 {
         return None;
     }
     let major = parts[0].parse::<u64>().ok()?;
     let minor = parts[1].parse::<u64>().ok()?;
-    // Patch may carry pre-release suffix like "36-rc1"; strip.
+    // After the '-' split, the patch is bare digits. If anything
+    // non-digit-trailing snuck through (e.g. a build-metadata "+42"
+    // that the find('-') missed), strip it for tolerance.
     let patch_str = parts[2].split(|c: char| !c.is_ascii_digit()).next()?;
     let patch = patch_str.parse::<u64>().ok()?;
-    Some((major, minor, patch))
+
+    // Pre-release rank. Final (no pre-release) is highest so it
+    // outranks every rc.N. Unknown pre-release labels also rank
+    // u64::MAX so a forward-compat tag like `1.0.0-beta.5` doesn't
+    // accidentally rank below an rc.
+    let pre_rank = match pre {
+        None => u64::MAX,
+        Some(p) => parse_rc_rank(p).unwrap_or(u64::MAX),
+    };
+
+    Some((major, minor, patch, pre_rank))
+}
+
+/// Parse the pre-release suffix portion (after the leading `-`) for
+/// `rc.N` / `rcN` / `rc-N` shapes. Returns `None` for non-rc
+/// pre-releases — caller treats those as final-equivalent.
+fn parse_rc_rank(pre: &str) -> Option<u64> {
+    let after_rc = pre
+        .strip_prefix("rc.")
+        .or_else(|| pre.strip_prefix("rc-"))
+        .or_else(|| pre.strip_prefix("rc"))?;
+    after_rc.parse::<u64>().ok()
 }
 
 /// Return true if `latest` strictly outranks `current`.
@@ -1008,15 +1049,27 @@ mod tests {
 
     #[test]
     fn parse_version_handles_agent_prefix_and_v_prefix() {
-        assert_eq!(parse_version("agent-v0.1.36"), Some((0, 1, 36)));
-        assert_eq!(parse_version("v0.1.36"), Some((0, 1, 36)));
-        assert_eq!(parse_version("0.1.36"), Some((0, 1, 36)));
+        assert_eq!(parse_version("agent-v0.1.36"), Some((0, 1, 36, u64::MAX)));
+        assert_eq!(parse_version("v0.1.36"), Some((0, 1, 36, u64::MAX)));
+        assert_eq!(parse_version("0.1.36"), Some((0, 1, 36, u64::MAX)));
     }
 
     #[test]
-    fn parse_version_strips_prerelease_suffix_on_patch() {
-        assert_eq!(parse_version("agent-v1.2.3-rc1"), Some((1, 2, 3)));
-        assert_eq!(parse_version("v1.2.3+build.42"), Some((1, 2, 3)));
+    fn parse_version_handles_final_and_rc_shapes() {
+        // Final versions: pre rank = u64::MAX so they outrank rc.N.
+        assert_eq!(parse_version("agent-v1.2.3"), Some((1, 2, 3, u64::MAX)));
+        assert_eq!(parse_version("v1.2.3"), Some((1, 2, 3, u64::MAX)));
+        // rc.N with dot separator (current convention as of 0.3.0).
+        assert_eq!(parse_version("agent-v0.3.0-rc.1"), Some((0, 3, 0, 1)));
+        assert_eq!(parse_version("agent-v0.3.0-rc.4"), Some((0, 3, 0, 4)));
+        // rc.N without dot separator (legacy `0.1.36-rc1` shape).
+        assert_eq!(parse_version("v1.2.3-rc1"), Some((1, 2, 3, 1)));
+        // rc.N with hyphen separator (semver-ish).
+        assert_eq!(parse_version("v1.2.3-rc-7"), Some((1, 2, 3, 7)));
+        // Build metadata or other pre-release labels rank as final
+        // so a forward-compat `-beta.5` tag doesn't accidentally
+        // rank below an rc.
+        assert_eq!(parse_version("v1.2.3-beta.5"), Some((1, 2, 3, u64::MAX)));
     }
 
     #[test]
@@ -1034,6 +1087,34 @@ mod tests {
         assert!(is_newer("agent-v1.0.0", "agent-v0.99.99"));
         assert!(!is_newer("agent-v0.1.35", "agent-v0.1.35"));
         assert!(!is_newer("agent-v0.1.34", "agent-v0.1.35"));
+    }
+
+    #[test]
+    fn is_newer_orders_rc_within_same_release() {
+        // Field bug 2026-05-06: rc.3 vs rc.4 both parsed to (0,3,0)
+        // and `is_newer(rc.4, rc.3)` returned false. Lock the contract.
+        assert!(is_newer("agent-v0.3.0-rc.4", "agent-v0.3.0-rc.3"));
+        assert!(is_newer("agent-v0.3.0-rc.10", "agent-v0.3.0-rc.9"));
+        assert!(!is_newer("agent-v0.3.0-rc.3", "agent-v0.3.0-rc.4"));
+        assert!(!is_newer("agent-v0.3.0-rc.4", "agent-v0.3.0-rc.4"));
+    }
+
+    #[test]
+    fn is_newer_ranks_final_above_rc_of_same_release() {
+        // Final 0.3.0 is newer than every 0.3.0-rc.N.
+        assert!(is_newer("agent-v0.3.0", "agent-v0.3.0-rc.4"));
+        assert!(is_newer("agent-v0.3.0", "agent-v0.3.0-rc.99"));
+        // And final does NOT trigger downgrade if the running version
+        // is already final.
+        assert!(!is_newer("agent-v0.3.0-rc.99", "agent-v0.3.0"));
+    }
+
+    #[test]
+    fn is_newer_handles_cross_release_with_rc() {
+        // 0.2.7 (final) < 0.3.0-rc.1 (early rc of next minor).
+        assert!(is_newer("agent-v0.3.0-rc.1", "agent-v0.2.7"));
+        // 0.3.0-rc.99 (very late rc) < 0.3.1 (next patch).
+        assert!(is_newer("agent-v0.3.1", "agent-v0.3.0-rc.99"));
     }
 
     #[test]
