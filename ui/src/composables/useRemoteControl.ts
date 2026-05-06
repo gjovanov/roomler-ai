@@ -702,6 +702,62 @@ export function useRemoteControl() {
   >()
   let nextClipboardReqId = 1
 
+  // ---- File-DC registry (shared across all `files` channel transfers) ----
+  // The `files` DC carries multiple concurrent kinds of work in 0.3.0+:
+  // single-file uploads, multi-file upload queues (Phase 1), single-file
+  // downloads (Phase 2), folder downloads (Phase 4), and dir-list requests
+  // (Phase 3). All of them are demuxed from a single persistent
+  // `onmessage` listener attached at DC creation time (see channels.files
+  // setup further down). Per-call listener-add was the pattern in 0.2.x;
+  // it works for one transfer at a time but doesn't compose with
+  // concurrent up + down or a queued multi-upload.
+  //
+  // Each entry tracks a state (`pending` → `settled`); only the first
+  // transition wins, so a `files:cancel` racing a `files:complete` /
+  // `files:eof` doesn't double-resolve the Promise.
+  type UploadResolve = (result: { path: string; bytes: number }) => void
+  type RegistryEntry =
+    | { kind: 'upload'; status: 'pending' | 'settled'; resolve: UploadResolve; reject: (err: Error) => void }
+  const filesRegistry = new Map<string, RegistryEntry>()
+  // Settle an entry exactly once. Returns true if THIS call won the
+  // transition; false if the entry was already settled. The caller uses
+  // the return value to skip duplicate resolve / reject.
+  function settleEntry(id: string): RegistryEntry | null {
+    const entry = filesRegistry.get(id)
+    if (!entry || entry.status === 'settled') return null
+    entry.status = 'settled'
+    filesRegistry.delete(id)
+    return entry
+  }
+
+  // Reactive list of in-flight + recently-finished file transfers. The
+  // Transfers chip in RemoteControl.vue binds to this. Entries auto-prune
+  // after 10 s in a terminal state so the panel doesn't grow unboundedly
+  // over a long session.
+  type TransferStatus = 'queued' | 'running' | 'complete' | 'error' | 'cancelled'
+  interface Transfer {
+    id: string
+    kind: 'upload' | 'download'
+    name: string
+    bytes: number
+    total: number | null
+    status: TransferStatus
+    error?: string
+  }
+  const transfers = ref<Transfer[]>([])
+  function pushTransfer(t: Transfer) {
+    transfers.value = [...transfers.value, t]
+  }
+  function patchTransfer(id: string, patch: Partial<Transfer>) {
+    transfers.value = transfers.value.map((t) => (t.id === id ? { ...t, ...patch } : t))
+    if (patch.status === 'complete' || patch.status === 'error' || patch.status === 'cancelled') {
+      // Auto-prune after 10 s in a terminal state.
+      setTimeout(() => {
+        transfers.value = transfers.value.filter((t) => t.id !== id)
+      }, 10_000)
+    }
+  }
+
   // Stats polling: interval handle + last snapshot so each poll can
   // derive a delta bitrate. Reset in teardown() so a fresh connection
   // doesn't see a stale byte counter.
@@ -1572,6 +1628,58 @@ export function useRemoteControl() {
     channels.clipboard = pc.createDataChannel('clipboard', { ordered: true })
     channels.files = pc.createDataChannel('files', { ordered: true })
 
+    // Persistent listener on the `files` DC. Demuxes every JSON control
+    // message by id and dispatches to the registry entry that owns the
+    // transfer. Single attach point: replaces the per-call
+    // addEventListener pattern from 0.2.x. See `filesRegistry` doc
+    // comment for the lifecycle contract.
+    channels.files.onmessage = (ev) => {
+      if (typeof ev.data !== 'string') {
+        // Phase 2 (downloads) will route binary frames here. Today
+        // (uploads only), the agent never sends binary on this DC, so
+        // dropping is fine.
+        return
+      }
+      let msg: { t?: string; id?: string; path?: string; bytes?: number; message?: string }
+      try {
+        msg = JSON.parse(ev.data)
+      } catch {
+        return
+      }
+      const id = typeof msg.id === 'string' ? msg.id : ''
+      if (!id) return
+      if (msg.t === 'files:complete') {
+        const entry = settleEntry(id)
+        if (entry?.kind === 'upload') {
+          patchTransfer(id, { status: 'complete', bytes: Number(msg.bytes ?? 0) })
+          entry.resolve({ path: String(msg.path ?? ''), bytes: Number(msg.bytes ?? 0) })
+        }
+      } else if (msg.t === 'files:error') {
+        const entry = settleEntry(id)
+        if (entry?.kind === 'upload') {
+          const err = String(msg.message ?? 'agent rejected upload')
+          patchTransfer(id, { status: 'error', error: err })
+          entry.reject(new Error(err))
+        }
+      } else if (msg.t === 'files:progress') {
+        patchTransfer(id, { status: 'running', bytes: Number(msg.bytes ?? 0) })
+      } else if (msg.t === 'files:accepted') {
+        patchTransfer(id, { status: 'running' })
+      }
+    }
+    // DC close: reject every pending transfer with "channel closed".
+    // Otherwise an in-flight upload would hang forever waiting for a
+    // terminal message that will never arrive.
+    channels.files.onclose = () => {
+      for (const id of Array.from(filesRegistry.keys())) {
+        const entry = settleEntry(id)
+        if (entry?.kind === 'upload') {
+          patchTransfer(id, { status: 'error', error: 'files channel closed' })
+          entry.reject(new Error('files channel closed'))
+        }
+      }
+    }
+
     // Subscribe to the clipboard DC. Agent -> browser messages are
     // `clipboard:content` (reply to a read) and `clipboard:error`
     // (read or write failure). Pending-read promises are keyed by the
@@ -1966,12 +2074,16 @@ export function useRemoteControl() {
     })
   }
 
-  /** Upload a `File` to the remote host's Downloads folder via the
-   *  `files` data channel. Chunks at 64 KiB, yielding between sends so
-   *  the DC's sctp send buffer doesn't blow out on large files.
-   *  Resolves with the final path + byte count reported by the agent.
-   *  Rejects on agent error or if the channel isn't open. */
-  function uploadFile(file: File): Promise<{ path: string; bytes: number }> {
+  /** Upload a single `File` to the remote host's Downloads folder via
+   *  the `files` data channel. Chunks at 64 KiB with backpressure on
+   *  the SCTP buffer. Resolves with the final path + byte count
+   *  reported by the agent. Rejects on agent error or DC close.
+   *
+   *  Internal — the public surface is `uploadFiles(files)` (queue) and
+   *  the back-compat `uploadFile(file)` shim. Reads agent replies via
+   *  the persistent `files` DC listener registered at channel-create
+   *  time (see `filesRegistry`). */
+  function uploadOne(file: File): Promise<{ path: string; bytes: number }> {
     const ch = channels.files
     if (!ch || ch.readyState !== 'open') {
       return Promise.reject(new Error('files channel not open'))
@@ -1979,23 +2091,25 @@ export function useRemoteControl() {
     const id = `up-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
 
     return new Promise((resolve, reject) => {
-      // Per-upload listener: the `files` DC is multiplexed in theory
-      // but today we serialize, so matching on id is enough.
-      const onMessage = (ev: MessageEvent) => {
-        if (typeof ev.data !== 'string') return
-        let msg: { t?: string; id?: string; path?: string; bytes?: number; message?: string }
-        try { msg = JSON.parse(ev.data) } catch { return }
-        if (msg.id !== id) return
-        if (msg.t === 'files:complete') {
-          ch.removeEventListener('message', onMessage)
-          resolve({ path: String(msg.path ?? ''), bytes: Number(msg.bytes ?? 0) })
-        } else if (msg.t === 'files:error') {
-          ch.removeEventListener('message', onMessage)
-          reject(new Error(msg.message || 'agent rejected upload'))
+      filesRegistry.set(id, { kind: 'upload', status: 'pending', resolve, reject })
+      pushTransfer({
+        id,
+        kind: 'upload',
+        name: file.name,
+        bytes: 0,
+        total: file.size,
+        status: 'queued',
+      })
+
+      // Local error → settle the registry entry ourselves and reject.
+      // (Agent-side errors arrive via the persistent listener.)
+      const localFail = (err: Error) => {
+        const entry = settleEntry(id)
+        if (entry) {
+          patchTransfer(id, { status: 'error', error: err.message })
+          entry.reject(err)
         }
-        // files:accepted / files:progress — pure observations, no-op.
       }
-      ch.addEventListener('message', onMessage)
 
       try {
         if (ch.readyState !== 'open') {
@@ -2009,8 +2123,7 @@ export function useRemoteControl() {
           mime: file.type || undefined,
         }))
       } catch (e) {
-        ch.removeEventListener('message', onMessage)
-        reject(e instanceof Error ? e : new Error(String(e)))
+        localFail(e instanceof Error ? e : new Error(String(e)))
         return
       }
 
@@ -2057,18 +2170,46 @@ export function useRemoteControl() {
             }
             ch.send(buf)
             offset = end
+            patchTransfer(id, { status: 'running', bytes: offset })
           }
           if (ch.readyState !== 'open') {
             throw channelClosedError()
           }
           ch.send(JSON.stringify({ t: 'files:end', id }))
         } catch (e) {
-          ch.removeEventListener('message', onMessage)
-          reject(e instanceof Error ? e : new Error(String(e)))
+          localFail(e instanceof Error ? e : new Error(String(e)))
         }
       }
       void pump()
     })
+  }
+
+  /** Public single-file upload — back-compat shim retained so existing
+   *  E2E tests + 0.2.x call sites keep working. New code should call
+   *  `uploadFiles([file])` directly. */
+  function uploadFile(file: File): Promise<{ path: string; bytes: number }> {
+    return uploadOne(file)
+  }
+
+  /** Upload multiple files sequentially. Each file is queued through
+   *  `uploadOne`; the queue continues on individual failures so a
+   *  bad file doesn't sink the rest. Resolves with one result per
+   *  input file (in order) carrying either the agent-reported path +
+   *  bytes (success) or an error message (failure). */
+  type UploadResult =
+    | { ok: true; name: string; path: string; bytes: number }
+    | { ok: false; name: string; error: string }
+  async function uploadFiles(files: File[]): Promise<UploadResult[]> {
+    const results: UploadResult[] = []
+    for (const f of files) {
+      try {
+        const r = await uploadOne(f)
+        results.push({ ok: true, name: f.name, path: r.path, bytes: r.bytes })
+      } catch (e) {
+        results.push({ ok: false, name: f.name, error: e instanceof Error ? e.message : String(e) })
+      }
+    }
+    return results
   }
 
   /** Send Ctrl+Alt+Del to the remote. The browser can't capture this
@@ -2136,6 +2277,8 @@ export function useRemoteControl() {
     getAgentClipboard,
     sendCtrlAltDel,
     uploadFile,
+    uploadFiles,
+    transfers,
     preferredCodec,
     setPreferredCodec,
     scaleMode,
