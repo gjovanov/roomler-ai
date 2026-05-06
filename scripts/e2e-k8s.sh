@@ -181,19 +181,30 @@ kubectl -n "$NAMESPACE" wait --for=condition=ready pod \
 POD=$(kubectl -n "$NAMESPACE" get pod -l "job-name=$JOB_NAME" \
   -o jsonpath='{.items[0].metadata.name}')
 
-echo "[e2e-k8s] streaming logs from $POD"
-kubectl -n "$NAMESPACE" logs -f "$POD" || true
-
-# ──────────────────────────────────────────────────────────────────────
-# 7. Poll for /results/.done
-# ──────────────────────────────────────────────────────────────────────
-echo "[e2e-k8s] waiting for /results/.done in $POD"
-for i in $(seq 1 60); do
+# Poll for /results/.done — set inside the container by run-e2e.sh
+# AFTER Playwright exits. Don't use `kubectl logs -f` here because
+# the container's run-e2e.sh ends with `tail -f /dev/null` (to keep
+# the pod alive long enough for kubectl cp), so logs -f would hang
+# until SIGTERM. Polling the marker file is the explicit completion
+# signal. Cap at 30 min — even the full 29-spec suite shouldn't
+# exceed that.
+echo "[e2e-k8s] waiting for Playwright to finish (/results/.done in $POD)"
+DONE=0
+for i in $(seq 1 360); do
   if kubectl -n "$NAMESPACE" exec "$POD" -- test -f /results/.done 2>/dev/null; then
+    DONE=1
     break
   fi
-  sleep 2
+  sleep 5
 done
+[ "$DONE" = "1" ] || { echo "[e2e-k8s] timeout waiting for /results/.done" >&2; exit 1; }
+
+# ──────────────────────────────────────────────────────────────────────
+# 7. Dump full logs (now that the run is finished)
+# ──────────────────────────────────────────────────────────────────────
+echo "[e2e-k8s] === pod logs ==="
+kubectl -n "$NAMESPACE" logs "$POD" --tail=2000 || true
+echo "[e2e-k8s] === end pod logs ==="
 
 EXIT_CODE=$(kubectl -n "$NAMESPACE" exec "$POD" -- cat /results/exit-code 2>/dev/null || echo "?")
 echo "[e2e-k8s] Playwright exit code: $EXIT_CODE"
