@@ -237,6 +237,8 @@ impl Drop for TestApp {
 fn test_settings() -> Settings {
     Settings {
         app: roomler_ai_config::AppSettings {
+            rate_limit_per_sec: 1,
+            rate_limit_burst: 60,
             host: "127.0.0.1".to_string(),
             port: 0,
             static_dir: None,

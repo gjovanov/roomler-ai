@@ -55,6 +55,23 @@ pub struct AppSettings {
     pub static_dir: Option<String>,
     pub cors_origins: Vec<String>,
     pub frontend_url: String,
+    /// Per-IP rate limit refill rate (tokens/sec). Default 1 — i.e.
+    /// sustained 60 req/min. The e2e overlay bumps this so a
+    /// Playwright Job's single pod IP doesn't trip 429s during
+    /// the suite.
+    #[serde(default = "default_rate_limit_per_sec")]
+    pub rate_limit_per_sec: u64,
+    /// Per-IP rate limit burst cap. Default 60 — sustains the
+    /// per-second refill above. Bumped in e2e for the same reason.
+    #[serde(default = "default_rate_limit_burst")]
+    pub rate_limit_burst: u32,
+}
+
+fn default_rate_limit_per_sec() -> u64 {
+    1
+}
+fn default_rate_limit_burst() -> u32 {
+    60
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -151,6 +168,8 @@ impl Settings {
             .set_default("app.port", 3000)?
             .set_default("app.cors_origins", Vec::<String>::new())?
             .set_default("app.frontend_url", "http://localhost:5173")?
+            .set_default("app.rate_limit_per_sec", 1)?
+            .set_default("app.rate_limit_burst", 60)?
             .set_default("database.url", "mongodb://localhost:27019")?
             .set_default("database.name", "roomler-ai")?
             .set_default("jwt.secret", "change-me-in-production")?
