@@ -2444,15 +2444,26 @@ export function useRemoteControl() {
             `Reconnect and retry.`
         )
       }
+      // Cancellation: `cancelUpload(id)` settles the registry entry
+      // locally; the pump checks `entry.status === 'settled'` between
+      // chunks and exits cleanly. The bytes already sent stay on the
+      // host (half-uploaded file in Downloads/ — the agent's
+      // short-transfer logic on DC close / next files:end handles it).
+      const isCancelled = () => {
+        const e = filesRegistry.get(id)
+        return !e || e.status === 'settled'
+      }
       const pump = async () => {
         try {
           while (offset < file.size) {
+            if (isCancelled()) return // already settled by cancelUpload
             // Back off when the sctp buffer starts filling up so the
             // browser doesn't OOM on huge files.
             while (ch.bufferedAmount > 4 * 1024 * 1024) {
               if (ch.readyState !== 'open') {
                 throw channelClosedError()
               }
+              if (isCancelled()) return
               await new Promise((r) => setTimeout(r, 20))
             }
             // Recheck readyState before each send: the channel can
@@ -2468,6 +2479,7 @@ export function useRemoteControl() {
             if (ch.readyState !== 'open') {
               throw channelClosedError()
             }
+            if (isCancelled()) return
             ch.send(buf)
             offset = end
             patchTransfer(id, { status: 'running', bytes: offset })
@@ -2475,6 +2487,7 @@ export function useRemoteControl() {
           if (ch.readyState !== 'open') {
             throw channelClosedError()
           }
+          if (isCancelled()) return
           ch.send(JSON.stringify({ t: 'files:end', id }))
         } catch (e) {
           localFail(e instanceof Error ? e : new Error(String(e)))
@@ -2769,6 +2782,38 @@ export function useRemoteControl() {
     }
   }
 
+  /** Cancel an in-flight upload. Settles the registry entry locally
+   *  (rejects the Promise + flags the Transfer panel row as
+   *  cancelled). The browser-side `pump()` loop checks `readyState`
+   *  + the entry status before each chunk send, so by settling here
+   *  the next iteration short-circuits and stops sending bytes. The
+   *  agent will see the DC stay open with no more chunks; eventually
+   *  its existing short-transfer-on-end logic / DC-close cleanup
+   *  handles the half-uploaded file (left on disk under Downloads/
+   *  for the operator to delete or resume manually).
+   *
+   *  Symmetric with `cancelDownload` so the Transfers panel can
+   *  render a single "Cancel" affordance regardless of direction. */
+  function cancelUpload(id: string): void {
+    const entry = filesRegistry.get(id)
+    if (!entry || entry.kind !== 'upload' || entry.status === 'settled') return
+    const settled = settleEntry(id)
+    if (settled?.kind === 'upload') {
+      patchTransfer(id, { status: 'cancelled', error: 'cancelled by operator' })
+      settled.reject(new Error('cancelled by operator'))
+    }
+  }
+
+  /** Cancel a transfer regardless of direction. Convenience for the
+   *  Transfers panel UI which doesn't need to know upload vs
+   *  download — it just calls `cancelTransfer(id)` per row. */
+  function cancelTransfer(id: string): void {
+    const entry = filesRegistry.get(id)
+    if (!entry) return
+    if (entry.kind === 'upload') cancelUpload(id)
+    else cancelDownload(id)
+  }
+
   // --------------------------------------------------------------
   // Directory listing (Phase 3 of file-DC v2).
   //
@@ -2989,6 +3034,8 @@ export function useRemoteControl() {
     downloadFile,
     downloadFolder,
     cancelDownload,
+    cancelUpload,
+    cancelTransfer,
     listDir,
     transfers,
     preferredCodec,
