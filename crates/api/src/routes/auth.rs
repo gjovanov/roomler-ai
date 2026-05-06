@@ -57,6 +57,27 @@ pub struct MessageResponse {
     pub message: String,
 }
 
+/// Response shape for `POST /auth/register`. Always carries a
+/// `message`; when `ROOMLER__AUTH__AUTO_VERIFY=true` (e2e overlay)
+/// also returns access/refresh tokens + the user record so test
+/// helpers can chain register → authenticated API calls without
+/// an explicit login step. Production (auto_verify=false) returns
+/// only `message` — clients still call `/auth/login` after the
+/// email-link activation. Token fields skip-serialize when None
+/// so the prod payload stays a single `{ "message": "..." }`.
+#[derive(Debug, Serialize)]
+pub struct RegisterResponse {
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_in: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<UserResponse>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct LoginRequest {
     #[serde(default)]
@@ -74,7 +95,7 @@ pub struct RefreshRequest {
 pub async fn register(
     State(state): State<AppState>,
     Json(body): Json<RegisterRequest>,
-) -> Result<(StatusCode, Json<MessageResponse>), ApiError> {
+) -> Result<(StatusCode, Json<RegisterResponse>), ApiError> {
     let password_hash = state.auth.hash_password(&body.password)?;
 
     let user = state
@@ -158,11 +179,41 @@ pub async fn register(
         }
     }
 
+    // E2E auto-verify path: skip the email-link round-trip by
+    // returning tokens directly. Test helpers (`registerUserViaApi`)
+    // expect `{ access_token, user }` in the body; without this they
+    // call subsequent endpoints with `Bearer undefined` → 401.
+    if state.settings.auth.auto_verify {
+        let tokens = state
+            .auth
+            .generate_tokens(user_id, &user.email, &user.username)?;
+        return Ok((
+            StatusCode::CREATED,
+            Json(RegisterResponse {
+                message: "Registration successful (auto-verified).".to_string(),
+                access_token: Some(tokens.access_token),
+                refresh_token: Some(tokens.refresh_token),
+                expires_in: Some(tokens.expires_in),
+                user: Some(UserResponse {
+                    id: user_id.to_hex(),
+                    email: user.email,
+                    username: user.username,
+                    display_name: user.display_name,
+                    avatar: user.avatar,
+                }),
+            }),
+        ));
+    }
+
     Ok((
         StatusCode::CREATED,
-        Json(MessageResponse {
+        Json(RegisterResponse {
             message: "Registration successful. Please check your email to activate your account."
                 .to_string(),
+            access_token: None,
+            refresh_token: None,
+            expires_in: None,
+            user: None,
         }),
     ))
 }
