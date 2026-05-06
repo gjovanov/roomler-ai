@@ -667,7 +667,9 @@
       width="420"
       temporary
       class="files-drawer"
+      tabindex="0"
       @paste="onDrawerPaste"
+      @keydown="onDrawerKeyDown"
     >
       <v-toolbar density="compact" color="primary">
         <v-icon class="ml-4">mdi-folder-open</v-icon>
@@ -1061,6 +1063,55 @@ function onDrawerPaste(ev: ClipboardEvent) {
   const files: File[] = []
   for (let i = 0; i < dt.files.length; i++) files.push(dt.files[i])
   void uploadMany(files)
+}
+
+// Drawer-scope Ctrl+C / Cmd+C — copy selected entries as downloads.
+// When `selectedDirEntries` is non-empty, queue a `downloadFile` per
+// file entry and `downloadFolder` per directory. Sequential per the
+// single-active-outgoing-transfer invariant; the registry's queue
+// serialises them automatically.
+function onDrawerKeyDown(ev: KeyboardEvent) {
+  if (ev.code !== 'KeyC') return
+  if (!(ev.ctrlKey || ev.metaKey)) return
+  // Skip if focus is in the path-input field — let it copy text
+  // natively instead of intercepting.
+  const target = ev.target as Element | null
+  if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) {
+    return
+  }
+  if (selectedDirEntries.value.size === 0) return
+  ev.preventDefault()
+  ev.stopPropagation()
+  // Snapshot — selectedDirEntries can mutate during the await chain.
+  const entries = Array.from(selectedDirEntries.value)
+    .map((name) => dirEntries.value.find((e) => e.name === name))
+    .filter((e): e is NonNullable<typeof e> => !!e)
+  void downloadEntries(entries)
+}
+
+async function downloadEntries(
+  entries: { name: string; is_dir: boolean }[]
+) {
+  let success = 0
+  let failed = 0
+  for (const entry of entries) {
+    try {
+      await downloadEntry(entry)
+      success++
+    } catch (e) {
+      failed++
+      void e
+    }
+  }
+  if (entries.length > 1) {
+    if (failed === 0) {
+      showSuccess(`Downloaded ${success} entries`)
+    } else if (success === 0) {
+      showError(`All ${failed} downloads failed`)
+    } else {
+      showError(`Downloaded ${success}/${entries.length} — ${failed} failed`)
+    }
+  }
 }
 
 async function uploadMany(files: File[]) {
@@ -1708,7 +1759,21 @@ watch(
   () => [rc.phase.value, stageEl.value] as const,
   ([phase, el]) => {
     if (phase === 'connected' && el && !detachInput) {
-      detachInput = rc.attachInput(el as HTMLElement)
+      detachInput = rc.attachInput(el as HTMLElement, {
+        // Phase 5: when the operator hits Ctrl+V over the viewer
+        // with files in their OS clipboard, route to the upload
+        // pipeline. The composable suppresses the Ctrl+V keystroke
+        // so the remote app doesn't see a stray paste.
+        onFilesPasted: (files) => {
+          if (files.length === 0) return
+          showSuccess(
+            files.length === 1
+              ? `Uploading ${files[0].name}…`
+              : `Uploading ${files.length} files…`
+          )
+          void uploadMany(files)
+        },
+      })
       ;(el as HTMLElement).focus()
       // Start watching the stage for size changes so Fit mode
       // auto-updates the agent's target resolution.

@@ -1999,9 +1999,20 @@ export function useRemoteControl() {
    * `[0,1]` per the architecture doc §6, so the agent can resolve them
    * against its current resolution.
    *
+   * `options.onFilesPasted` is called when the operator hits Ctrl+V over
+   * the viewer with files in their OS clipboard. The composable defers
+   * the Ctrl+V keystroke until the `paste` event fires (a fraction of a
+   * millisecond later) and decides: files → call onFilesPasted, no
+   * keystroke forwarded; text → mirror to host clipboard via existing
+   * `setAgentClipboard` + emit deferred Ctrl+V; empty → emit deferred
+   * Ctrl+V as a fallback.
+   *
    * Returns a detach function the caller should invoke before unmounting.
    */
-  function attachInput(surface: HTMLElement): () => void {
+  function attachInput(
+    surface: HTMLElement,
+    options?: { onFilesPasted?: (files: File[]) => void }
+  ): () => void {
     // Locate the <video> once, fall back gracefully if the layout changes.
     const findVideo = () =>
       (surface.querySelector('video') as HTMLVideoElement | null) ??
@@ -2126,7 +2137,85 @@ export function useRemoteControl() {
     function onPointerEnter() { pointerInside = true }
     function onPointerLeave() { pointerInside = false }
 
+    // Phase 5 (file-DC v2) — deferred Ctrl+V over viewer.
+    //
+    // When the operator hits Ctrl+V with the pointer over the viewer,
+    // we don't immediately forward the keystroke. The browser fires
+    // a `paste` event microseconds later; we use that to decide:
+    //   - Files in clipboard  → upload them; the remote app does
+    //     NOT receive a Ctrl+V keystroke (that wasn't the operator's
+    //     intent — they meant "upload these files").
+    //   - Text in clipboard   → mirror to the host clipboard via
+    //     the existing `clipboard:write` + emit the deferred Ctrl+V
+    //     so the remote app's paste sees the right text.
+    //   - Empty clipboard     → emit the deferred Ctrl+V as a normal
+    //     keystroke (operator intent unclear; preserve current
+    //     behaviour).
+    //
+    // 50 ms timeout fallback: some browsers don't fire `paste` if
+    // the clipboard is empty / denied. After 50 ms with the keystroke
+    // still pending, flush it as a normal Ctrl+V. 50 ms is below the
+    // human keystroke-perception threshold but well above paste-event
+    // scheduling.
+    //
+    // The keyup is also intercepted while a deferral is active so we
+    // don't emit a stray V-up against an un-down'd V on the agent.
+    let pendingCtrlV: { mods: number; timer: ReturnType<typeof setTimeout> | null } | null = null
+    const KEY_V_HID = 0x19
+
+    function flushPendingCtrlV() {
+      if (!pendingCtrlV) return
+      const mods = pendingCtrlV.mods
+      if (pendingCtrlV.timer) clearTimeout(pendingCtrlV.timer)
+      pendingCtrlV = null
+      sendInput({ t: 'key', code: KEY_V_HID, down: true, mods })
+      sendInput({ t: 'key', code: KEY_V_HID, down: false, mods })
+    }
+
+    function isCtrlVOverViewer(ev: KeyboardEvent): boolean {
+      if (!pointerInside) return false
+      if (ev.code !== 'KeyV') return false
+      if (!(ev.ctrlKey || ev.metaKey)) return false
+      // If focus is in an INPUT / TEXTAREA / contenteditable element,
+      // the operator is editing a page text field — let the native
+      // paste flow happen there; don't intercept.
+      const target = ev.target as Element | null
+      if (target) {
+        const tag = target.tagName
+        if (tag === 'INPUT' || tag === 'TEXTAREA') return false
+        const editable = (target as HTMLElement).isContentEditable
+        if (editable) return false
+      }
+      return true
+    }
+
     function onKey(ev: KeyboardEvent, down: boolean) {
+      // Ctrl+V deferral path. Keep preventDefault on keydown so the
+      // subsequent `paste` event fires (and so the browser doesn't
+      // run a default for the V key). Skip the normal sendInput path
+      // — flushPendingCtrlV / paste handler will emit the keystroke
+      // if the clipboard didn't have files.
+      if (isCtrlVOverViewer(ev)) {
+        ev.preventDefault()
+        if (down) {
+          // Replace any prior pending entry (operator chord-spammed).
+          if (pendingCtrlV?.timer) clearTimeout(pendingCtrlV.timer)
+          const mods =
+            (ev.ctrlKey ? 1 : 0) |
+            (ev.shiftKey ? 2 : 0) |
+            (ev.altKey ? 4 : 0) |
+            (ev.metaKey ? 8 : 0)
+          const timer = setTimeout(() => {
+            // Paste didn't fire — flush as a normal Ctrl+V keystroke.
+            flushPendingCtrlV()
+          }, 50)
+          pendingCtrlV = { mods, timer }
+        }
+        // keyup with a pending deferral: don't emit a stray V-up.
+        // The flush path emits both down + up together.
+        return
+      }
+
       const action = decideKeyAction(ev, down, (k) => ev.getModifierState(k))
       if (action.kind === 'drop') return
       if (shouldPreventDefault(ev, pointerInside)) ev.preventDefault()
@@ -2135,6 +2224,46 @@ export function useRemoteControl() {
       } else {
         sendInput({ t: 'key', code: action.code, down: action.down, mods: action.mods })
       }
+    }
+
+    function onPaste(ev: ClipboardEvent) {
+      // Only respond if we deferred a Ctrl+V keystroke. Native paste
+      // events that come from elsewhere (e.g. an editable field
+      // outside the deferral path) keep their default handling.
+      if (!pendingCtrlV) return
+      const dt = ev.clipboardData
+      if (!dt) {
+        flushPendingCtrlV()
+        return
+      }
+
+      // Files take precedence — operator intent is "upload these".
+      if (dt.files && dt.files.length > 0 && options?.onFilesPasted) {
+        ev.preventDefault()
+        if (pendingCtrlV.timer) clearTimeout(pendingCtrlV.timer)
+        pendingCtrlV = null
+        const files: File[] = []
+        for (let i = 0; i < dt.files.length; i++) files.push(dt.files[i])
+        options.onFilesPasted(files)
+        return
+      }
+
+      // Text path: mirror to host clipboard so the remote app's
+      // paste sees the right content, then emit the Ctrl+V keystroke.
+      const text = dt.getData('text') ?? ''
+      if (text) {
+        const ch = channels.clipboard
+        if (ch && ch.readyState === 'open') {
+          try {
+            ch.send(JSON.stringify({ t: 'clipboard:write', text }))
+          } catch {
+            /* dropped — host clipboard stays unchanged but we still
+               forward the keystroke; remote app pastes whatever was
+               there before. */
+          }
+        }
+      }
+      flushPendingCtrlV()
     }
 
     const onKeyDown = (e: KeyboardEvent) => onKey(e, true)
@@ -2150,6 +2279,12 @@ export function useRemoteControl() {
     surface.addEventListener('pointerleave', onPointerLeave)
     surface.addEventListener('wheel', onWheel, { passive: false })
     surface.addEventListener('contextmenu', onContextMenu)
+    // Paste handler must be on `window` (or a focusable surface) —
+    // attaching to `surface` only fires when surface itself is the
+    // event target, which doesn't happen for keyboard-driven paste.
+    // Window-level listener with our own pendingCtrlV gating means
+    // we only intercept paste events that follow a deferred Ctrl+V.
+    window.addEventListener('paste', onPaste)
     // Keys are captured on window so they fire even if the video loses focus.
     window.addEventListener('keydown', onKeyDown)
     window.addEventListener('keyup', onKeyUp)
@@ -2162,8 +2297,13 @@ export function useRemoteControl() {
       surface.removeEventListener('pointerleave', onPointerLeave)
       surface.removeEventListener('wheel', onWheel)
       surface.removeEventListener('contextmenu', onContextMenu)
+      window.removeEventListener('paste', onPaste)
       window.removeEventListener('keydown', onKeyDown)
       window.removeEventListener('keyup', onKeyUp)
+      // Drop any in-flight deferral; otherwise its 50 ms timer would
+      // fire after teardown and call sendInput on a closed channel.
+      if (pendingCtrlV?.timer) clearTimeout(pendingCtrlV.timer)
+      pendingCtrlV = null
       if (rafHandle !== null) cancelAnimationFrame(rafHandle)
     }
   }
