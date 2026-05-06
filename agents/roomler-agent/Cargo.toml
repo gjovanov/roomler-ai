@@ -163,7 +163,23 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_HiDpi",                    # SetProcessDpiAwarenessContext (mouse offset fix)
     "Win32_UI_WindowsAndMessaging",      # GetDesktopWindow + GetSystemMetrics (M3 A1 GDI fallback)
     "Win32_Graphics_Gdi",                # GetWindowDC, BitBlt, CreateCompatibleBitmap, GetDIBits (M3 A1 GDI fallback)
+    "Win32_Storage_FileSystem",          # GetLogicalDrives (file-DC v2 root listing)
 ] }
+
+# Streaming zip writer for folder downloads (file-DC v2 Phase 4).
+# Pinned to an exact version because the pre-1.0 API is volatile;
+# a thin internal wrapper module isolates the surface so an upgrade
+# is a one-file change. `tokio` feature gives us async writers that
+# integrate with the BackpressuredDcWriter adapter; `deflate` is the
+# compression algorithm we use for text-mime entries (binaries land
+# as Stored/no-compression to save CPU).
+async_zip = { package = "async_zip", version = "=0.0.17", features = ["tokio", "deflate"] }
+# tokio-util's `compat` feature provides FuturesAsyncWriteCompatExt /
+# TokioAsyncWriteCompatExt — needed because async_zip exposes its
+# entry writers as `futures::AsyncWrite` (its tokio feature internally
+# wraps the user writer with Compat) but `tokio::io::copy` requires a
+# `tokio::AsyncWrite`. The compat shim resolves the impedance mismatch.
+tokio-util = { version = "0.7", features = ["compat"] }
 
 [target.'cfg(target_os = "windows")'.dependencies.windows]
 version = "0.58"

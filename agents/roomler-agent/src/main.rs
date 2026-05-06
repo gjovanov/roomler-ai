@@ -512,6 +512,19 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     let mut cfg = config::load(config_path).context("loading config")?;
     let encoder_preference = resolve_encoder_preference(cli_encoder, cfg.encoder_preference);
 
+    // Wire the file-DC v2 `files:dir` browse capability. Default
+    // tracks `cfg.enable_remote_browse` (true unless the operator
+    // disabled it in config.toml); env var
+    // `ROOMLER_AGENT_DISABLE_BROWSE=1` is an escape hatch for
+    // emergency in-field disable without a config reload.
+    let browse_enabled = cfg.enable_remote_browse
+        && !matches!(
+            std::env::var("ROOMLER_AGENT_DISABLE_BROWSE").as_deref(),
+            Ok("1") | Ok("true") | Ok("yes")
+        );
+    roomler_agent::files::set_remote_browse_enabled(browse_enabled);
+    tracing::info!(browse_enabled, "file-DC remote browse capability");
+
     // M3 A1 worker-role probe (perMachine MSI builds with the
     // `system-context` feature only). Reads the worker's own primary
     // token at startup and decides whether downstream plumbing

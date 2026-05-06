@@ -2211,7 +2211,388 @@ async fn handle_files_control(
                 .await;
             }
         },
+        crate::files::FilesIncoming::Get { id, path } => {
+            info!(%session_id, %id, path = %path, "files: get (download requested)");
+            spawn_outgoing_pump(dc.clone(), handler, session_id, id, path);
+        }
+        crate::files::FilesIncoming::GetFolder { id, path, format } => {
+            // v1 only honours `format=zip` (or unset, treated as zip).
+            if let Some(f) = format.as_deref()
+                && f != "zip"
+            {
+                warn!(%session_id, %id, format = %f, "files: get-folder unsupported format");
+                send_files_json(
+                    &dc,
+                    &crate::files::FilesOutgoing::Error {
+                        id: &id,
+                        message: "unsupported folder-download format (only 'zip' is supported)",
+                    },
+                )
+                .await;
+                return;
+            }
+            info!(%session_id, %id, path = %path, "files: get-folder (zip) requested");
+            spawn_outgoing_zip_pump(dc.clone(), handler, session_id, id, path);
+        }
+        crate::files::FilesIncoming::Cancel { id } => {
+            let cancelled = handler.cancel_outgoing(&id).await;
+            info!(%session_id, %id, cancelled, "files: cancel requested");
+        }
+        crate::files::FilesIncoming::Dir { req_id, path } => {
+            if !crate::files::is_remote_browse_enabled() {
+                info!(%session_id, %req_id, path = %path, "files: dir refused — remote browse disabled");
+                send_files_json(
+                    &dc,
+                    &crate::files::FilesOutgoing::DirError {
+                        req_id: &req_id,
+                        message: "remote browse disabled by host config",
+                    },
+                )
+                .await;
+                return;
+            }
+            match crate::files::list_dir(&path).await {
+                Ok(listing) => {
+                    info!(
+                        %session_id, %req_id,
+                        path = %listing.path,
+                        entries = listing.entries.len(),
+                        "files: dir listed"
+                    );
+                    let parent_owned = listing.parent.clone();
+                    send_files_json(
+                        &dc,
+                        &crate::files::FilesOutgoing::DirList {
+                            req_id: &req_id,
+                            path: &listing.path,
+                            parent: parent_owned.as_deref(),
+                            entries: &listing.entries,
+                        },
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    warn!(%session_id, %req_id, path = %path, %e, "files: dir failed");
+                    let msg = format!("{e}");
+                    send_files_json(
+                        &dc,
+                        &crate::files::FilesOutgoing::DirError {
+                            req_id: &req_id,
+                            message: &msg,
+                        },
+                    )
+                    .await;
+                }
+            }
+        }
     }
+}
+
+/// Spawn a tokio task that pumps an outgoing single-file download.
+/// The task owns the `Arc<RTCDataChannel>` so the DC outlives the
+/// stream even if the original `attach_files_handler` closure has
+/// returned. Cancellation flows via the AtomicBool on
+/// `OutgoingTransfer`; the caller flips it via `cancel_outgoing`.
+fn spawn_outgoing_pump(
+    dc: Arc<RTCDataChannel>,
+    handler: crate::files::FilesHandler,
+    session_id: bson::oid::ObjectId,
+    id: String,
+    requested_path: String,
+) {
+    tokio::spawn(async move {
+        // begin_outgoing validates the path + denylist, opens the
+        // file, and stashes outgoing state. Success → send `Offer`
+        // and start streaming.
+        let offer = match handler.begin_outgoing(id.clone(), &requested_path).await {
+            Ok(o) => o,
+            Err(e) => {
+                warn!(%session_id, %id, path = %requested_path, %e, "files: begin_outgoing failed");
+                let msg = format!("{e}");
+                send_files_json(
+                    &dc,
+                    &crate::files::FilesOutgoing::Error {
+                        id: &id,
+                        message: &msg,
+                    },
+                )
+                .await;
+                return;
+            }
+        };
+
+        send_files_json(
+            &dc,
+            &crate::files::FilesOutgoing::Offer {
+                id: &offer.id,
+                name: &offer.name,
+                size: offer.size,
+                mime: offer.mime,
+            },
+        )
+        .await;
+
+        let bytes_sent = match pump_outgoing_file(&dc, &handler, &offer).await {
+            Ok(n) => n,
+            Err(e) => {
+                warn!(%session_id, id = %offer.id, %e, "files: pump_outgoing failed");
+                let msg = format!("{e}");
+                send_files_json(
+                    &dc,
+                    &crate::files::FilesOutgoing::Error {
+                        id: &offer.id,
+                        message: &msg,
+                    },
+                )
+                .await;
+                handler.finish_outgoing(&offer.id).await;
+                return;
+            }
+        };
+
+        // Successful end-of-stream: send Eof so browser closes
+        // the writable cleanly, then clear state.
+        info!(
+            %session_id, id = %offer.id, bytes_sent, path = %offer.path.display(),
+            "files: outgoing complete"
+        );
+        send_files_json(
+            &dc,
+            &crate::files::FilesOutgoing::Eof {
+                id: &offer.id,
+                bytes: bytes_sent,
+            },
+        )
+        .await;
+        handler.finish_outgoing(&offer.id).await;
+    });
+}
+
+/// Spawn a tokio task that streams a folder as a zip. The zip is
+/// produced by `async_zip::tokio::write::ZipFileWriter` writing into
+/// the write end of a `tokio::io::duplex` pipe. A second task reads
+/// from the pipe and pushes chunks to the DC with backpressure.
+/// The bounded duplex buffer (256 KiB) is what gives async_zip
+/// natural backpressure: if the DC drains slowly, the pipe fills
+/// and async_zip's writes block.
+fn spawn_outgoing_zip_pump(
+    dc: Arc<RTCDataChannel>,
+    handler: crate::files::FilesHandler,
+    session_id: bson::oid::ObjectId,
+    id: String,
+    requested_path: String,
+) {
+    tokio::spawn(async move {
+        let offer = match handler
+            .begin_outgoing_zip(id.clone(), &requested_path)
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                warn!(%session_id, %id, path = %requested_path, %e, "files: begin_outgoing_zip failed");
+                let msg = format!("{e}");
+                send_files_json(
+                    &dc,
+                    &crate::files::FilesOutgoing::Error {
+                        id: &id,
+                        message: &msg,
+                    },
+                )
+                .await;
+                return;
+            }
+        };
+
+        send_files_json(
+            &dc,
+            &crate::files::FilesOutgoing::Offer {
+                id: &offer.id,
+                name: &offer.name,
+                size: None, // streaming — total unknown
+                mime: offer.mime,
+            },
+        )
+        .await;
+
+        // Bounded duplex pipe: write side fed by async_zip; read
+        // side fed to the DC. 256 KiB buffer = ~4 of our 64 KiB
+        // chunks before async_zip's writes start blocking. Keeps
+        // memory usage low and gives backpressure-free crash
+        // protection if the DC is wedged.
+        const PIPE_BUFFER: usize = 256 * 1024;
+        let (writer_half, reader_half) = tokio::io::duplex(PIPE_BUFFER);
+        let cancel = offer.cancel.clone();
+        let path = offer.path.clone();
+        let walk_cancel = cancel.clone();
+        let walk_handle = tokio::spawn(async move {
+            crate::files::walk_and_zip(writer_half, &path, walk_cancel).await
+        });
+
+        let dc_for_pump = dc.clone();
+        let pump_cancel = cancel.clone();
+        let id_for_pump = offer.id.clone();
+        let pump_handle = tokio::spawn(async move {
+            zip_pump_loop(dc_for_pump, reader_half, pump_cancel, id_for_pump).await
+        });
+
+        // Wait for both sides. The walk task closes the writer
+        // half; the pump task sees EOF and exits.
+        let walk_res = walk_handle.await;
+        let pump_res = pump_handle.await;
+
+        let total_bytes = match (walk_res, pump_res) {
+            (Ok(Ok(_count)), Ok(Ok(bytes_sent))) => bytes_sent,
+            (Ok(Err(e)), _) | (_, Ok(Err(e))) => {
+                warn!(%session_id, id = %offer.id, %e, "files: zip pump failed");
+                let msg = format!("{e}");
+                send_files_json(
+                    &dc,
+                    &crate::files::FilesOutgoing::Error {
+                        id: &offer.id,
+                        message: &msg,
+                    },
+                )
+                .await;
+                handler.finish_outgoing(&offer.id).await;
+                return;
+            }
+            (Err(je), _) | (_, Err(je)) => {
+                warn!(%session_id, id = %offer.id, %je, "files: zip pump task panicked");
+                send_files_json(
+                    &dc,
+                    &crate::files::FilesOutgoing::Error {
+                        id: &offer.id,
+                        message: "zip pump task panicked",
+                    },
+                )
+                .await;
+                handler.finish_outgoing(&offer.id).await;
+                return;
+            }
+        };
+
+        info!(
+            %session_id, id = %offer.id, total_bytes,
+            path = %offer.path.display(),
+            "files: outgoing zip complete"
+        );
+        send_files_json(
+            &dc,
+            &crate::files::FilesOutgoing::Eof {
+                id: &offer.id,
+                bytes: total_bytes,
+            },
+        )
+        .await;
+        handler.finish_outgoing(&offer.id).await;
+    });
+}
+
+/// Pump bytes from the duplex reader to the DC, applying SCTP
+/// backpressure. Returns total bytes sent. Exits on EOF, cancel,
+/// or DC failure.
+async fn zip_pump_loop(
+    dc: Arc<RTCDataChannel>,
+    mut reader: tokio::io::DuplexStream,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    id: String,
+) -> anyhow::Result<u64> {
+    use tokio::io::AsyncReadExt;
+    const CHUNK: usize = 64 * 1024;
+    const BACKPRESSURE_HIGH: usize = 4 * 1024 * 1024;
+
+    let mut buf = vec![0u8; CHUNK];
+    let mut total: u64 = 0;
+    let mut last_progress: u64 = 0;
+    loop {
+        if cancel.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(anyhow::anyhow!("cancelled by browser"));
+        }
+        let n = match reader.read(&mut buf).await {
+            Ok(0) => break, // EOF — zip writer closed
+            Ok(n) => n,
+            Err(e) => return Err(anyhow::anyhow!("duplex read: {e}")),
+        };
+        // Backpressure on SCTP send buffer.
+        while dc.buffered_amount().await > BACKPRESSURE_HIGH {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(anyhow::anyhow!("cancelled by browser"));
+            }
+        }
+        let chunk = bytes::Bytes::copy_from_slice(&buf[..n]);
+        if let Err(e) = dc.send(&chunk).await {
+            return Err(anyhow::anyhow!("dc.send failed: {e}"));
+        }
+        total += n as u64;
+        if total - last_progress >= 256 * 1024 {
+            last_progress = total;
+            send_files_json(
+                &dc,
+                &crate::files::FilesOutgoing::Progress {
+                    id: &id,
+                    bytes: total,
+                },
+            )
+            .await;
+        }
+    }
+    Ok(total)
+}
+
+/// Pump a single open file through the DC in 64 KiB chunks. Backs
+/// off when the SCTP send buffer is over 4 MiB to avoid OOMing on
+/// large files. Checks the cancel flag between chunks. Returns the
+/// total bytes sent on clean stream exit.
+async fn pump_outgoing_file(
+    dc: &Arc<RTCDataChannel>,
+    handler: &crate::files::FilesHandler,
+    offer: &crate::files::OutgoingOffer,
+) -> anyhow::Result<u64> {
+    use tokio::io::AsyncReadExt;
+    const CHUNK: usize = 64 * 1024;
+    const BACKPRESSURE_HIGH: u64 = 4 * 1024 * 1024;
+
+    let mut file = handler.open_outgoing(&offer.id).await?;
+    let mut buf = vec![0u8; CHUNK];
+    let mut total: u64 = 0;
+    let mut last_progress: u64 = 0;
+    loop {
+        if offer.cancel.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(anyhow::anyhow!("cancelled by browser"));
+        }
+        // Backpressure: poll buffered_amount and yield until it
+        // drops below the high-watermark. webrtc-rs's DC reports
+        // bufferedAmount synchronously.
+        while dc.buffered_amount().await > BACKPRESSURE_HIGH as usize {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            if offer.cancel.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(anyhow::anyhow!("cancelled by browser"));
+            }
+        }
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        let chunk = bytes::Bytes::copy_from_slice(&buf[..n]);
+        if let Err(e) = dc.send(&chunk).await {
+            return Err(anyhow::anyhow!("dc.send failed: {e}"));
+        }
+        total += n as u64;
+        // Progress reports every 256 KiB
+        if total - last_progress >= 256 * 1024 {
+            last_progress = total;
+            send_files_json(
+                dc,
+                &crate::files::FilesOutgoing::Progress {
+                    id: &offer.id,
+                    bytes: total,
+                },
+            )
+            .await;
+        }
+    }
+    Ok(total)
 }
 
 async fn handle_files_chunk(

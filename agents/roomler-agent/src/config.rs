@@ -45,6 +45,18 @@ pub struct AgentConfig {
     #[serde(default)]
     pub update_check_interval_h: Option<u32>,
 
+    /// Whether the agent answers `files:dir` (filesystem browse)
+    /// requests from the browser controller. Default `true` to
+    /// preserve self-controlled-host auto-grant semantics
+    /// (`docs/remote-control.md` §11.2). Operators on org-controlled
+    /// fleets can disable per-host via `config.toml`. When `false`,
+    /// `files:dir` returns `dir-error { message: "remote browse
+    /// disabled" }`. Single-file downloads (`files:get`) and uploads
+    /// are NOT gated by this flag — they're consent-bound by the
+    /// session itself.
+    #[serde(default = "default_enable_remote_browse")]
+    pub enable_remote_browse: bool,
+
     /// Most recent version that ran for at least
     /// `CLEAN_RUN_THRESHOLD` seconds before exiting cleanly (or
     /// crashing — the threshold is what gates updates here, not exit
@@ -202,6 +214,15 @@ pub enum EncoderPreferenceChoice {
 }
 
 /// Resolve the default config path. Can be overridden by `--config` on the CLI.
+/// Default for `enable_remote_browse` — `true` so a 0.3.0 install
+/// preserves self-controlled-host auto-grant semantics. Operators on
+/// org-controlled fleets explicitly set `enable_remote_browse = false`
+/// in `config.toml`. Hard-coded helper instead of a `bool::default()`
+/// because that defaults to `false`.
+fn default_enable_remote_browse() -> bool {
+    true
+}
+
 pub fn default_config_path() -> Result<PathBuf> {
     let dirs = ProjectDirs::from("live", "roomler", "roomler-agent")
         .context("could not resolve a platform config directory")?;
@@ -287,6 +308,7 @@ mod tests {
             machine_name: "host".into(),
             encoder_preference: EncoderPreferenceChoice::Auto,
             update_check_interval_h: None,
+            enable_remote_browse: true,
             last_known_good_version: None,
             crash_count: 0,
             last_crash_unix: 0,
