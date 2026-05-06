@@ -285,6 +285,17 @@
       >
         <v-icon>mdi-upload</v-icon>
       </v-btn>
+      <v-btn
+        v-if="rc.phase.value === 'connected'"
+        icon
+        variant="text"
+        size="small"
+        aria-label="Browse files on the remote host"
+        title="Browse remote files (download)"
+        @click="filesDrawer = !filesDrawer"
+      >
+        <v-icon>mdi-folder-open</v-icon>
+      </v-btn>
     </div>
     <!-- File input (hidden); shared between Row 2 inline upload
          button and the bottom-sheet upload button. `multiple`
@@ -644,6 +655,102 @@
         </v-card-actions>
       </v-card>
     </v-bottom-sheet>
+
+    <!-- Files browser drawer (Phase 3 of file-DC v2). Opens via the
+         mdi-folder-open toolbar button. Lets the operator navigate
+         the host's filesystem and download files. Folder download
+         lights up in Phase 4. Multi-select via checkboxes; Ctrl+C
+         to copy-as-download (Phase 5). -->
+    <v-navigation-drawer
+      v-model="filesDrawer"
+      location="right"
+      width="420"
+      temporary
+      class="files-drawer"
+      @paste="onDrawerPaste"
+    >
+      <v-toolbar density="compact" color="primary">
+        <v-icon class="ml-4">mdi-folder-open</v-icon>
+        <v-toolbar-title>Remote files</v-toolbar-title>
+        <v-spacer />
+        <v-btn icon variant="text" :disabled="dirLoading" title="Refresh" @click="navigateTo(currentDirPath)">
+          <v-icon>mdi-refresh</v-icon>
+        </v-btn>
+        <v-btn icon variant="text" title="Close" @click="filesDrawer = false">
+          <v-icon>mdi-close</v-icon>
+        </v-btn>
+      </v-toolbar>
+      <div class="px-3 pt-2 pb-1 d-flex align-center" style="gap: 4px">
+        <v-btn
+          icon
+          variant="text"
+          size="small"
+          :disabled="!currentParent || dirLoading"
+          title="Parent directory"
+          @click="navigateTo(currentParent || '')"
+        >
+          <v-icon>mdi-arrow-up</v-icon>
+        </v-btn>
+        <v-btn
+          icon
+          variant="text"
+          size="small"
+          :disabled="dirLoading"
+          title="Drives / roots"
+          @click="navigateTo('')"
+        >
+          <v-icon>mdi-monitor</v-icon>
+        </v-btn>
+        <v-text-field
+          v-model="dirPathInput"
+          density="compact"
+          hide-details
+          variant="outlined"
+          placeholder="Path (Enter to go)"
+          @keyup.enter="navigateTo(dirPathInput)"
+        />
+      </div>
+      <v-divider />
+      <div v-if="dirError" class="pa-3 text-error text-caption">
+        {{ dirError }}
+      </div>
+      <v-progress-linear v-if="dirLoading" indeterminate />
+      <v-list density="compact" class="pa-0">
+        <v-list-item
+          v-for="entry in dirEntries"
+          :key="entry.name"
+          :class="{ 'files-entry-selected': selectedDirEntries.has(entry.name) }"
+          @click="onEntryClick(entry, $event)"
+          @dblclick="onEntryDblClick(entry)"
+        >
+          <template #prepend>
+            <v-icon :color="entry.is_dir ? 'amber-darken-2' : 'grey-darken-1'">
+              {{ entry.is_dir ? 'mdi-folder' : 'mdi-file-outline' }}
+            </v-icon>
+          </template>
+          <v-list-item-title>{{ entry.name }}</v-list-item-title>
+          <v-list-item-subtitle v-if="!entry.is_dir">
+            {{ formatFileSize(entry.size) }}
+          </v-list-item-subtitle>
+          <template #append>
+            <v-btn
+              icon
+              size="x-small"
+              variant="text"
+              :title="entry.is_dir ? `Download ${entry.name} as zip (Chrome/Edge only)` : `Download ${entry.name}`"
+              @click.stop="downloadEntry(entry)"
+            >
+              <v-icon>{{ entry.is_dir ? 'mdi-folder-zip' : 'mdi-download' }}</v-icon>
+            </v-btn>
+          </template>
+        </v-list-item>
+        <v-list-item v-if="!dirLoading && dirEntries.length === 0 && !dirError">
+          <v-list-item-subtitle class="text-disabled">
+            (empty directory)
+          </v-list-item-subtitle>
+        </v-list-item>
+      </v-list>
+    </v-navigation-drawer>
   </v-container>
 </template>
 
@@ -836,6 +943,124 @@ async function onFilePicked(ev: Event) {
   } finally {
     if (input) input.value = '' // allow re-selecting the same file(s)
   }
+}
+
+// --- Files browser drawer state (Phase 3 of file-DC v2) ---
+const filesDrawer = ref(false)
+const dirLoading = ref(false)
+const dirError = ref<string | null>(null)
+const dirEntries = ref<{ name: string; is_dir: boolean; size: number | null; mtime_unix: number | null }[]>([])
+const currentDirPath = ref('')
+const currentParent = ref<string | null>(null)
+const dirPathInput = ref('')
+const selectedDirEntries = ref<Set<string>>(new Set())
+let lastSelectedDirIndex: number | null = null
+
+async function navigateTo(path: string) {
+  dirLoading.value = true
+  dirError.value = null
+  selectedDirEntries.value = new Set()
+  lastSelectedDirIndex = null
+  try {
+    const listing = await rc.listDir(path)
+    currentDirPath.value = listing.path
+    currentParent.value = listing.parent
+    dirPathInput.value = listing.path
+    dirEntries.value = listing.entries
+  } catch (e) {
+    dirError.value = (e as Error).message
+    dirEntries.value = []
+  } finally {
+    dirLoading.value = false
+  }
+}
+
+// Auto-load roots view the first time the drawer opens.
+watch(filesDrawer, (open) => {
+  if (open && dirEntries.value.length === 0 && !dirLoading.value) {
+    void navigateTo('')
+  }
+})
+
+function onEntryClick(
+  entry: { name: string; is_dir: boolean },
+  ev: MouseEvent
+) {
+  // Ctrl/Cmd+click toggles selection; Shift+click extends; plain
+  // click selects only this entry. Multi-select is what makes
+  // Ctrl+C-as-download work cleanly across multiple entries.
+  const idx = dirEntries.value.findIndex((e) => e.name === entry.name)
+  if (ev.shiftKey && lastSelectedDirIndex !== null) {
+    const lo = Math.min(lastSelectedDirIndex, idx)
+    const hi = Math.max(lastSelectedDirIndex, idx)
+    const range = new Set(selectedDirEntries.value)
+    for (let i = lo; i <= hi; i++) range.add(dirEntries.value[i].name)
+    selectedDirEntries.value = range
+  } else if (ev.ctrlKey || ev.metaKey) {
+    const next = new Set(selectedDirEntries.value)
+    if (next.has(entry.name)) next.delete(entry.name)
+    else next.add(entry.name)
+    selectedDirEntries.value = next
+    lastSelectedDirIndex = idx
+  } else {
+    selectedDirEntries.value = new Set([entry.name])
+    lastSelectedDirIndex = idx
+  }
+}
+
+function onEntryDblClick(entry: { name: string; is_dir: boolean }) {
+  if (entry.is_dir) {
+    const sep = /[\\/]$/.test(currentDirPath.value) ? '' : pathSeparator()
+    void navigateTo(currentDirPath.value + sep + entry.name)
+  }
+}
+
+function pathSeparator(): string {
+  // Heuristic: Windows paths contain a drive letter or `\`. Anything
+  // else is Unix.
+  if (/^[A-Za-z]:[\\\/]/.test(currentDirPath.value) || currentDirPath.value.includes('\\')) {
+    return '\\'
+  }
+  return '/'
+}
+
+function formatFileSize(bytes: number | null): string {
+  if (bytes === null || bytes === undefined) return ''
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`
+}
+
+async function downloadEntry(entry: { name: string; is_dir: boolean }) {
+  const sep = /[\\/]$/.test(currentDirPath.value) ? '' : pathSeparator()
+  const fullPath = currentDirPath.value + sep + entry.name
+  try {
+    if (entry.is_dir) {
+      const r = await rc.downloadFolder(fullPath, `${entry.name}.zip`)
+      showSuccess(`Downloaded ${r.name} (${formatFileSize(r.bytes)})`)
+    } else {
+      const r = await rc.downloadFile(fullPath, entry.name)
+      showSuccess(`Downloaded ${r.name} (${formatFileSize(r.bytes)})`)
+    }
+  } catch (e) {
+    showError(`Download failed: ${(e as Error).message}`)
+  }
+}
+
+// Drawer-scope paste: `paste` event fires when the operator hits
+// Ctrl+V with the drawer focused. If the OS clipboard has files,
+// upload them. Phase 5 of file-DC v2 also wires Ctrl+V over the
+// viewer with deferral; this drawer-scope path is the simpler
+// half (no keystroke-forward conflict).
+function onDrawerPaste(ev: ClipboardEvent) {
+  const dt = ev.clipboardData
+  if (!dt || !dt.files || dt.files.length === 0) return
+  ev.preventDefault()
+  ev.stopPropagation()
+  const files: File[] = []
+  for (let i = 0; i < dt.files.length; i++) files.push(dt.files[i])
+  void uploadMany(files)
 }
 
 async function uploadMany(files: File[]) {
@@ -1606,6 +1831,11 @@ onBeforeUnmount(() => {
   border: 3px dashed rgba(33, 150, 243, 0.85);
   pointer-events: none;
   z-index: 10;
+}
+/* Files browser drawer: selected rows highlight so multi-select
+   (Ctrl+click / Shift+click) feedback is visible at a glance. */
+.files-drawer .files-entry-selected {
+  background: rgba(33, 150, 243, 0.18);
 }
 /* Scrollable frame for the scale modes where the video can overflow
    the viewport (original = 1:1 always if source > viewer, custom ≥
