@@ -63,5 +63,6 @@ pub mod desktop_rebind;
 pub mod dxgi_dup;
 pub mod gdi_backend;
 pub mod peer_presence;
+pub mod user_profile;
 pub mod winlogon_token;
 pub mod worker_role;
