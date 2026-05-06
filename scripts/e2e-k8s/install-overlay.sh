@@ -32,6 +32,23 @@ else
   echo "WARNING: could not auto-detect prod tag; edit $DST/kustomization.yaml manually" >&2
 fi
 
+# Copy regcred from the prod namespace if not already present in
+# roomler-ai-e2e. Without it the roomler2 deployment can't pull from
+# `registry.roomler.ai`. Idempotent — `kubectl apply` is safe to
+# re-run; `2>/dev/null || true` swallows the no-op case.
+if kubectl get namespace roomler-ai-e2e >/dev/null 2>&1; then
+  if ! kubectl -n roomler-ai-e2e get secret regcred >/dev/null 2>&1; then
+    if kubectl -n roomler-ai get secret regcred >/dev/null 2>&1; then
+      echo "Copying regcred secret from roomler-ai to roomler-ai-e2e"
+      kubectl -n roomler-ai get secret regcred -o yaml \
+        | sed 's/namespace: roomler-ai$/namespace: roomler-ai-e2e/' \
+        | kubectl apply -f - >/dev/null
+    else
+      echo "WARNING: regcred missing in roomler-ai too; image pulls will fail" >&2
+    fi
+  fi
+fi
+
 echo
 echo "Installed $DST"
 echo
