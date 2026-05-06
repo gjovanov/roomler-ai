@@ -159,10 +159,16 @@ spec:
               value: "http://roomler2"
             - name: CI
               value: "true"
+            # Single-quoted YAML so backslashes in the regex (e.g.
+            # 'oauth\.spec\.ts') don't trip YAML's double-quote
+            # escape rules ('\.' isn't a valid double-quote escape
+            # sequence, fails parsing). Bash heredoc still expands
+            # the \$VAR inside single quotes (single quotes are
+            # literal YAML chars, not shell quotes here).
             - name: PW_GREP
-              value: "$PW_GREP"
+              value: '$PW_GREP'
             - name: PW_GREP_INVERT
-              value: "$PW_GREP_INVERT"
+              value: '$PW_GREP_INVERT'
           volumeMounts:
             - name: results
               mountPath: /results
