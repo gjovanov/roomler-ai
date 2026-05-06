@@ -227,6 +227,17 @@ impl FilesHandler {
         let mut guard = self.state.lock().await;
         *guard = None;
     }
+
+    /// The id of the currently-active transfer, if any. Used by the
+    /// peer-layer error path: when `chunk()` fails we need to send a
+    /// `files:error` with the matching id so the browser's per-upload
+    /// promise listener fires its reject. Without this the browser
+    /// silently discards the error (its listener filters by id) and
+    /// the upload spinner spins forever.
+    pub async fn current_id(&self) -> Option<String> {
+        let guard = self.state.lock().await;
+        guard.as_ref().map(|s| s.id.clone())
+    }
 }
 
 /// Byte-count snapshot emitted after a chunk that crossed a progress
