@@ -198,154 +198,305 @@ mod windows_impl {
     /// Decode a cursor's shape into an ARGB bitmap + hotspot. Returns
     /// None on any OS error — the caller keeps the cached entry or
     /// skips emitting a shape this poll.
+    ///
+    /// Three cursor flavours we have to handle:
+    /// 1. **Modern alpha cursor** (e.g. Windows 11 desktop arrow):
+    ///    `hbmColor` is 32-bit BGRA with a valid alpha channel; ignore
+    ///    `hbmMask`. ~99% of cursors on modern desktops.
+    /// 2. **Legacy color+mask cursor** (e.g. some app I-beams, the
+    ///    classic Win11 system I-beam): `hbmColor` is 32-bit BGRA with
+    ///    alpha=0 everywhere — the alpha lives in `hbmMask` (1bpp AND
+    ///    mask: 0=opaque cursor body, 1=transparent). The colour
+    ///    bitmap alone renders as fully transparent → invisible
+    ///    cursor. **Field repro PC50045 rc.7+rc.8: I-beam invisible
+    ///    over Notepad++** — both monochrome (rc.7) and color+mask
+    ///    (rc.8) paths have to be right.
+    /// 3. **Pure monochrome cursor** (legacy / classic system I-beam
+    ///    on older Windows): `hbmColor` is null; `hbmMask` holds AND
+    ///    + XOR stacked vertically (height = 2 × cursor_height).
     unsafe fn extract_shape(hcursor: HCURSOR) -> Option<CursorInfo> {
         unsafe {
             let mut icon_info = ICONINFO::default();
-            // HCURSOR and HICON are typedef'd to the same HANDLE in
-            // Win32 headers but windows-rs exposes them as distinct
-            // newtypes; HICON(hcursor.0) re-wraps the raw pointer.
             if GetIconInfo(HICON(hcursor.0), &mut icon_info).is_err() {
                 return None;
             }
-            // Try the colour bitmap first (32-bit cursors) — e.g. the
-            // modern Windows arrow. Fall back to the mask bitmap for
-            // classic monochrome cursors where hbmColor is null.
-            let (bmp_handle, is_monochrome) = if !icon_info.hbmColor.is_invalid() {
-                (icon_info.hbmColor, false)
+            let result = if !icon_info.hbmColor.is_invalid() {
+                extract_color_cursor(&icon_info)
             } else if !icon_info.hbmMask.is_invalid() {
-                (icon_info.hbmMask, true)
+                extract_mono_cursor(&icon_info)
             } else {
-                cleanup_icon_info(&icon_info);
-                return None;
+                None
             };
+            cleanup_icon_info(&icon_info);
+            result
+        }
+    }
 
+    /// Extract a 32-bit colour cursor. Detects the legacy "alpha=0
+    /// everywhere + separate AND mask" variant and applies the mask
+    /// as alpha so cursors like the Win11 system I-beam render
+    /// visibly instead of as a transparent void.
+    unsafe fn extract_color_cursor(icon_info: &ICONINFO) -> Option<CursorInfo> {
+        unsafe {
+            let bmp_handle = icon_info.hbmColor;
             let mut bmp = BITMAP::default();
-            let bmp_size = size_of::<BITMAP>() as i32;
             if GetObjectW(
                 HGDIOBJ(bmp_handle.0),
-                bmp_size,
+                size_of::<BITMAP>() as i32,
                 Some(&mut bmp as *mut BITMAP as *mut _),
             ) == 0
             {
-                cleanup_icon_info(&icon_info);
                 return None;
             }
-
             let width = bmp.bmWidth.max(0) as u32;
-            // Monochrome mask bitmap holds AND+XOR stacked vertically,
-            // so its real cursor height is bmHeight/2.
-            let height = if is_monochrome {
-                (bmp.bmHeight.max(0) as u32) / 2
-            } else {
-                bmp.bmHeight.max(0) as u32
-            };
+            let height = bmp.bmHeight.max(0) as u32;
             if width == 0 || height == 0 {
-                cleanup_icon_info(&icon_info);
                 return None;
             }
+            let mut bgra = read_dib_bgra(bmp_handle, width, height)?;
 
-            // For monochrome cursors we need BOTH halves of the mask
-            // (AND + XOR) — only the AND mask paints the I-beam as a
-            // pure black silhouette, invisible on dark backgrounds
-            // (field repro PC50045 rc.7: cursor disappears over
-            // Notepad++ text area). The combined mask gives black
-            // outline + white fill, which the GUI Win32 cursors set
-            // expects.
-            let read_height = if is_monochrome { height * 2 } else { height };
-            let read_pixels = (width * read_height) as usize;
-            let mut raw = vec![0u8; read_pixels * 4];
-
-            let mut bi = BITMAPINFO::default();
-            bi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
-            bi.bmiHeader.biWidth = width as i32;
-            // Negative height = top-down DIB. GetDIBits default is
-            // bottom-up (matches DIB on-wire convention) which would
-            // require us to flip before encoding; asking top-down
-            // directly is simpler.
-            bi.bmiHeader.biHeight = -(read_height as i32);
-            bi.bmiHeader.biPlanes = 1;
-            bi.bmiHeader.biBitCount = 32;
-            bi.bmiHeader.biCompression = BI_RGB.0;
-
-            let hdc = GetDC(None);
-            let read = GetDIBits(
-                hdc,
-                bmp_handle,
-                0,
-                read_height,
-                Some(raw.as_mut_ptr() as *mut _),
-                &mut bi,
-                DIB_RGB_COLORS,
-            );
-            ReleaseDC(None, hdc);
-
-            if read == 0 {
-                cleanup_icon_info(&icon_info);
-                return None;
-            }
-
-            // Compose the final BGRA buffer from the raw GetDIBits read.
-            // For colour cursors `raw` already IS the final buffer;
-            // for monochrome we have AND in the top half + XOR in the
-            // bottom half, both as 32-bit white-or-black pixels. Map
-            // each (AND, XOR) pair to the standard semantic:
-            //
-            //   AND=1, XOR=0 → transparent (most pixels)
-            //   AND=0, XOR=0 → opaque black (cursor outline)
-            //   AND=0, XOR=1 → opaque white (cursor fill)
-            //   AND=1, XOR=1 → inverse — approximate as opaque white
-            //                 (proper alpha-blend with screen needs the
-            //                 destination pixel which the browser
-            //                 doesn't have over the WebRTC frame)
-            //
-            // White-fill + black-outline survives both light and dark
-            // backgrounds; the I-beam becomes visible everywhere.
-            let bgra = if is_monochrome {
-                let pixel_count = (width * height) as usize;
-                let mut out = vec![0u8; pixel_count * 4];
-                let xor_offset = pixel_count * 4;
-                for i in 0..pixel_count {
-                    let and_idx = i * 4;
-                    let xor_idx = xor_offset + i * 4;
-                    // GetDIBits gave us 32-bit pixels: 0xFFFFFFFF for
-                    // white, 0x00000000 for black. Sample any channel.
-                    let and_bit = raw[and_idx] != 0;
-                    let xor_bit = raw[xor_idx] != 0;
-                    let out_idx = i * 4;
-                    match (and_bit, xor_bit) {
-                        (true, false) => {
-                            // Transparent. Already zeroed.
-                        }
-                        (false, false) => {
-                            // Black outline.
-                            out[out_idx] = 0;
-                            out[out_idx + 1] = 0;
-                            out[out_idx + 2] = 0;
-                            out[out_idx + 3] = 255;
-                        }
-                        (false, true) | (true, true) => {
-                            // White fill (or invert → approximate white).
-                            out[out_idx] = 255;
-                            out[out_idx + 1] = 255;
-                            out[out_idx + 2] = 255;
-                            out[out_idx + 3] = 255;
+            // Detect "all alpha is zero" — the giveaway for a legacy
+            // color+mask cursor. Modern alpha cursors paint at least
+            // a few pixels with non-zero alpha (the body of the
+            // cursor); legacy ones leave alpha=0 and rely on
+            // `hbmMask` to define visibility. Skip the cheap check
+            // when no mask is available — there's nothing to fall
+            // back to.
+            let any_alpha = bgra.chunks_exact(4).any(|p| p[3] != 0);
+            if !any_alpha && !icon_info.hbmMask.is_invalid() {
+                if let Some(mask_alpha) = read_mask_as_alpha(icon_info.hbmMask, width, height) {
+                    // Apply mask: AND-mask=0 means opaque (cursor
+                    // body), AND-mask≠0 means transparent.
+                    for (i, px) in bgra.chunks_exact_mut(4).enumerate() {
+                        if i < mask_alpha.len() {
+                            px[3] = mask_alpha[i];
                         }
                     }
+                    // If even after mask application every pixel is
+                    // still alpha=0 the cursor would render fully
+                    // transparent. That's a degenerate cursor (e.g.
+                    // an empty bitmap from a buggy app); fall through
+                    // and synthesise an outline so the controller
+                    // still sees a pointer indicator.
+                    let now_visible = bgra.chunks_exact(4).any(|p| p[3] != 0);
+                    if !now_visible {
+                        return None;
+                    }
+                    // Many legacy color+mask cursors paint the cursor
+                    // body in pure black (RGB=0). After applying
+                    // mask alpha, those pixels are opaque-black which
+                    // is invisible on Notepad++ dark theme. Add a
+                    // 1-pixel white outline around the opaque region
+                    // so the cursor stays visible on any background.
+                    add_white_outline_to_opaque_black(&mut bgra, width, height);
                 }
-                out
-            } else {
-                raw
-            };
+            }
 
-            let info = CursorInfo {
+            Some(CursorInfo {
                 width,
                 height,
                 hotspot_x: icon_info.xHotspot as i32,
                 hotspot_y: icon_info.yHotspot as i32,
                 bgra,
-            };
-            cleanup_icon_info(&icon_info);
-            Some(info)
+            })
+        }
+    }
+
+    /// Extract a pure-monochrome cursor (no `hbmColor`). The mask
+    /// holds AND + XOR halves stacked vertically; combined they
+    /// give the classic black-outline + white-fill rendering.
+    unsafe fn extract_mono_cursor(icon_info: &ICONINFO) -> Option<CursorInfo> {
+        unsafe {
+            let bmp_handle = icon_info.hbmMask;
+            let mut bmp = BITMAP::default();
+            if GetObjectW(
+                HGDIOBJ(bmp_handle.0),
+                size_of::<BITMAP>() as i32,
+                Some(&mut bmp as *mut BITMAP as *mut _),
+            ) == 0
+            {
+                return None;
+            }
+            let width = bmp.bmWidth.max(0) as u32;
+            // Mono mask is AND on top + XOR on bottom; cursor height
+            // is half the bitmap height.
+            let height = (bmp.bmHeight.max(0) as u32) / 2;
+            if width == 0 || height == 0 {
+                return None;
+            }
+            let raw = read_dib_bgra(bmp_handle, width, height * 2)?;
+
+            // Compose AND + XOR into final BGRA per the standard
+            // monochrome cursor semantic:
+            //   AND=1, XOR=0 → transparent
+            //   AND=0, XOR=0 → opaque black
+            //   AND=0, XOR=1 → opaque white
+            //   AND=1, XOR=1 → invert (approx. opaque white)
+            let pixel_count = (width * height) as usize;
+            let mut out = vec![0u8; pixel_count * 4];
+            let xor_offset = pixel_count * 4;
+            for i in 0..pixel_count {
+                let and_idx = i * 4;
+                let xor_idx = xor_offset + i * 4;
+                let and_bit = raw[and_idx] != 0;
+                let xor_bit = raw[xor_idx] != 0;
+                let out_idx = i * 4;
+                match (and_bit, xor_bit) {
+                    (true, false) => {
+                        // Transparent. Already zeroed.
+                    }
+                    (false, false) => {
+                        // Black outline.
+                        out[out_idx] = 0;
+                        out[out_idx + 1] = 0;
+                        out[out_idx + 2] = 0;
+                        out[out_idx + 3] = 255;
+                    }
+                    (false, true) | (true, true) => {
+                        // White fill / invert.
+                        out[out_idx] = 255;
+                        out[out_idx + 1] = 255;
+                        out[out_idx + 2] = 255;
+                        out[out_idx + 3] = 255;
+                    }
+                }
+            }
+
+            Some(CursorInfo {
+                width,
+                height,
+                hotspot_x: icon_info.xHotspot as i32,
+                hotspot_y: icon_info.yHotspot as i32,
+                bgra: out,
+            })
+        }
+    }
+
+    /// `GetDIBits(hbm, BGR_RGB, 32bpp, top-down)` → owned BGRA buffer
+    /// of `width × height` pixels. Returns `None` on any OS error.
+    unsafe fn read_dib_bgra(
+        bmp_handle: windows::Win32::Graphics::Gdi::HBITMAP,
+        width: u32,
+        height: u32,
+    ) -> Option<Vec<u8>> {
+        unsafe {
+            let pixel_count = (width * height) as usize;
+            let mut buf = vec![0u8; pixel_count * 4];
+            let mut bi = BITMAPINFO::default();
+            bi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
+            bi.bmiHeader.biWidth = width as i32;
+            // Negative height → top-down (matches our row layout).
+            bi.bmiHeader.biHeight = -(height as i32);
+            bi.bmiHeader.biPlanes = 1;
+            bi.bmiHeader.biBitCount = 32;
+            bi.bmiHeader.biCompression = BI_RGB.0;
+            let hdc = GetDC(None);
+            let read = GetDIBits(
+                hdc,
+                bmp_handle,
+                0,
+                height,
+                Some(buf.as_mut_ptr() as *mut _),
+                &mut bi,
+                DIB_RGB_COLORS,
+            );
+            ReleaseDC(None, hdc);
+            if read == 0 { None } else { Some(buf) }
+        }
+    }
+
+    /// Read the AND mask of a color+mask cursor and convert it to a
+    /// per-pixel alpha vector (length = width × height bytes). 0 in
+    /// the mask = opaque (alpha=255), non-zero = transparent (alpha=0).
+    unsafe fn read_mask_as_alpha(
+        mask_handle: windows::Win32::Graphics::Gdi::HBITMAP,
+        width: u32,
+        height: u32,
+    ) -> Option<Vec<u8>> {
+        unsafe {
+            let mut bmp = BITMAP::default();
+            if GetObjectW(
+                HGDIOBJ(mask_handle.0),
+                size_of::<BITMAP>() as i32,
+                Some(&mut bmp as *mut BITMAP as *mut _),
+            ) == 0
+            {
+                return None;
+            }
+            // Color+mask cursors typically have a mask that's the
+            // same dimensions as the color bitmap (no AND+XOR
+            // stacking). But some legacy ones still ship the mask as
+            // 2× height for compatibility with monochrome readers.
+            // We only need the AND portion (top `height` rows).
+            let mask_h = bmp.bmHeight.max(0) as u32;
+            let read_h = mask_h.min(height);
+            let raw = read_dib_bgra(mask_handle, width, read_h)?;
+            let pixel_count = (width * height) as usize;
+            let mut alpha = vec![0u8; pixel_count];
+            // For pixels we couldn't read (read_h < height) fall back
+            // to opaque so we don't accidentally hide cursor body.
+            let read_pixels = (width * read_h) as usize;
+            for i in 0..pixel_count {
+                if i < read_pixels {
+                    let and_pixel = raw[i * 4];
+                    alpha[i] = if and_pixel == 0 { 255 } else { 0 };
+                } else {
+                    alpha[i] = 255;
+                }
+            }
+            Some(alpha)
+        }
+    }
+
+    /// Add a 1-pixel white outline around any opaque-black region in
+    /// `bgra`. Mutates in-place. The outline lands on currently-
+    /// transparent pixels adjacent to opaque-black ones, so it never
+    /// overwrites cursor body pixels.
+    ///
+    /// Used to keep legacy color+mask cursors (which paint the body
+    /// in pure black) visible on dark-themed apps. Without it, the
+    /// I-beam over a Notepad++ dark editor renders as opaque black
+    /// pixels on a near-black background — invisible.
+    fn add_white_outline_to_opaque_black(bgra: &mut [u8], width: u32, height: u32) {
+        let w = width as i32;
+        let h = height as i32;
+        let stride = (width * 4) as usize;
+        // First, snapshot the alpha+RGB so we can read while writing.
+        let snapshot = bgra.to_vec();
+        let is_opaque_black = |x: i32, y: i32| -> bool {
+            if x < 0 || y < 0 || x >= w || y >= h {
+                return false;
+            }
+            let idx = (y as usize) * stride + (x as usize) * 4;
+            // BGRA format. Alpha must be opaque AND BGR all zero.
+            snapshot[idx] == 0
+                && snapshot[idx + 1] == 0
+                && snapshot[idx + 2] == 0
+                && snapshot[idx + 3] >= 200
+        };
+        for y in 0..h {
+            for x in 0..w {
+                let idx = (y as usize) * stride + (x as usize) * 4;
+                // Only paint over currently-transparent pixels.
+                if snapshot[idx + 3] >= 64 {
+                    continue;
+                }
+                // Adjacent to an opaque-black pixel?
+                let adj = is_opaque_black(x - 1, y)
+                    || is_opaque_black(x + 1, y)
+                    || is_opaque_black(x, y - 1)
+                    || is_opaque_black(x, y + 1)
+                    || is_opaque_black(x - 1, y - 1)
+                    || is_opaque_black(x + 1, y - 1)
+                    || is_opaque_black(x - 1, y + 1)
+                    || is_opaque_black(x + 1, y + 1);
+                if adj {
+                    bgra[idx] = 255;
+                    bgra[idx + 1] = 255;
+                    bgra[idx + 2] = 255;
+                    bgra[idx + 3] = 255;
+                }
+            }
         }
     }
 

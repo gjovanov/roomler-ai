@@ -2220,6 +2220,13 @@ async fn handle_files_chunk(
     session_id: bson::oid::ObjectId,
     data: &[u8],
 ) {
+    // Capture the active transfer's id BEFORE we run chunk(); on the
+    // error path we need it to address the `files:error` reply
+    // correctly. Without this the browser's per-upload promise
+    // listener (which filters by id) silently drops the error and
+    // the upload spinner spins forever — field repro PC50045 rc.8
+    // (2026-05-06).
+    let active_id = handler.current_id().await.unwrap_or_default();
     match handler.chunk(data).await {
         Ok(Some(progress)) => {
             send_files_json(
@@ -2235,12 +2242,12 @@ async fn handle_files_chunk(
             // Below the progress-report threshold; nothing to send.
         }
         Err(e) => {
-            warn!(%session_id, %e, "files: chunk failed");
+            warn!(%session_id, id = %active_id, %e, "files: chunk failed");
             let msg = format!("{e}");
             send_files_json(
                 &dc,
                 &crate::files::FilesOutgoing::Error {
-                    id: "",
+                    id: &active_id,
                     message: &msg,
                 },
             )

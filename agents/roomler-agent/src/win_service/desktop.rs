@@ -28,7 +28,7 @@ use std::os::windows::ffi::OsStringExt;
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ACCESS_DENIED, FALSE, GENERIC_READ, GetLastError, HANDLE,
+    CloseHandle, ERROR_ACCESS_DENIED, FALSE, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE,
 };
 use windows_sys::Win32::System::StationsAndDesktops::{
     CloseDesktop, GetThreadDesktop, GetUserObjectInformationW, HDESK, OpenDesktopW,
@@ -129,6 +129,51 @@ pub fn open_input_desktop() -> Result<Option<OwnedDesktop>> {
             return Ok(None);
         }
         bail!("OpenInputDesktop failed (err {err})");
+    }
+    Ok(OwnedDesktop::new(h))
+}
+
+/// `OpenInputDesktop(0, FALSE, GENERIC_READ | GENERIC_WRITE)`. Same as
+/// [`open_input_desktop`] but with the WRITE access mask, which the
+/// SystemContext input thread needs in order for `SendInput` /
+/// `SetCursorPos` to succeed after `SetThreadDesktop` binding.
+///
+/// **Why a separate function**: the user-context lock-state probe
+/// path (`lock_state.rs`) must NOT request `GENERIC_WRITE` — most
+/// users don't have it on Winlogon's DACL even after Win+L, and the
+/// extra ask false-positives `Locked` for every user-context worker.
+/// That regression was the entire 0.2.7 hotfix (see
+/// `project_input_regression_0_2_x.md`). This helper is gated to the
+/// SystemContext path where we ARE SYSTEM and DO have full write
+/// rights to both Default and Winlogon. **Field repro PC50045 rc.7
+/// + rc.8 (2026-05-06)**: `Zugriff verweigert (os error 5)` spam at
+/// ~50/s during lock screen because thread was bound via `GENERIC_
+/// READ` only and `SendInput` lacked DESKTOP_HOOKCONTROL /
+/// DESKTOP_JOURNALPLAYBACK rights that `GENERIC_WRITE` carries.
+///
+/// `GENERIC_WRITE` on a desktop maps to (per Win32 generic-mapping
+/// rules): `DESKTOP_CREATEMENU | DESKTOP_CREATEWINDOW |
+/// DESKTOP_HOOKCONTROL | DESKTOP_JOURNALPLAYBACK |
+/// DESKTOP_JOURNALRECORD | DESKTOP_WRITEOBJECTS |
+/// STANDARD_RIGHTS_WRITE`. The `JOURNALPLAYBACK` / `HOOKCONTROL`
+/// rights are what `SendInput` checks against the thread's bound
+/// desktop access token at inject time.
+pub fn open_input_desktop_for_injection() -> Result<Option<OwnedDesktop>> {
+    // SAFETY: zero flags is a documented call form; out-error is
+    // checked.
+    let h: HDESK = unsafe { OpenInputDesktop(0, FALSE, GENERIC_READ | GENERIC_WRITE) };
+    if h.is_null() {
+        // SAFETY: GetLastError is a thread-local read.
+        let err = unsafe { GetLastError() };
+        if err == ERROR_ACCESS_DENIED {
+            tracing::warn!(
+                "open_input_desktop_for_injection: ACCESS_DENIED — caller likely \
+                 isn't SYSTEM. SystemContext path requires LocalSystem token to \
+                 obtain GENERIC_WRITE on Winlogon."
+            );
+            return Ok(None);
+        }
+        bail!("OpenInputDesktop(GENERIC_READ|GENERIC_WRITE) failed (err {err})");
     }
     Ok(OwnedDesktop::new(h))
 }

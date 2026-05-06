@@ -70,7 +70,7 @@ use windows_sys::Win32::System::StationsAndDesktops::{
 };
 
 use crate::win_service::desktop::{
-    OwnedDesktop, current_thread_desktop_name, desktop_name_of, open_input_desktop,
+    OwnedDesktop, current_thread_desktop_name, desktop_name_of, open_input_desktop_for_injection,
 };
 
 /// `WINSTA_ALL_ACCESS` — full-access mask for `OpenWindowStationW`.
@@ -148,20 +148,32 @@ pub fn attach_to_winsta0() -> Result<()> {
 /// observed desktop name and only retrying after N events / time.
 pub fn try_change_desktop() -> Result<DesktopChange> {
     let current_name = current_thread_desktop_name()?;
-    let input = match open_input_desktop()? {
+    let input = match open_input_desktop_for_injection()? {
         Some(d) => d,
         None => bail!(
-            "OpenInputDesktop returned access-denied — SYSTEM-context worker \
-             cannot reach the input desktop. Either we're not attached to \
-             WinSta0 (call attach_to_winsta0() at startup) or we lost SYSTEM \
-             somewhere upstream"
+            "OpenInputDesktop(GENERIC_READ|GENERIC_WRITE) returned access-denied — \
+             SYSTEM-context worker cannot reach the input desktop. Either we're \
+             not attached to WinSta0 (call attach_to_winsta0() at startup) or we \
+             lost SYSTEM somewhere upstream"
         ),
     };
     let target_name = desktop_name_of(input.raw())?;
+    // Always SetThreadDesktop, even when names match. The desktop
+    // HANDLE may have changed underneath us — `OpenInputDesktop`
+    // returns a fresh handle for the same desktop after Win+L /
+    // unlock cycles, and the thread's previous binding (still on
+    // the OLD handle) loses its WRITE access rights when the OS
+    // recycles the desktop's session_id. Re-binding to the FRESH
+    // handle every time costs one syscall (~µs) but means the
+    // thread's access token is always current. Field repro
+    // PC50045 rc.8 (2026-05-06): try_change_desktop returned
+    // Unchanged across a Win+L cycle (names matched stale handle)
+    // but SendInput failed ACCESS_DENIED because the bound handle
+    // had stale rights.
+    set_thread_desktop(&input)?;
     if current_name == target_name {
         return Ok(DesktopChange::Unchanged);
     }
-    set_thread_desktop(&input)?;
     Ok(DesktopChange::Switched(target_name))
 }
 
