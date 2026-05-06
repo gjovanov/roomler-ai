@@ -112,16 +112,22 @@ kubectl -n "$NAMESPACE" run smoke-probe --rm -i --restart=Never \
 JOB_NAME="e2e-run-$(date +%s)"
 PW_GREP=""
 PW_GREP_INVERT=""
+PW_SKIP_PHASE_3=""
 case "$MODE" in
   smoke)
+    # Tightest filter — auth specs only. Validates pipeline.
     PW_GREP="register|login"
+    PW_SKIP_PHASE_3="1"
     ;;
   first-cut)
-    SKIP=$(grep -v '^#' "$REPO_ROOT/scripts/e2e-skip-list.txt" | grep -v '^$' | paste -sd'|' -)
-    PW_GREP_INVERT="$SKIP"
+    # Excludes the Phase 3-dependent specs via the playwright.config
+    # `testIgnore` (E2E_SKIP_PHASE_3=1 enables it). NOT via grep-
+    # invert — that matches test names, not file paths, so file-
+    # name regexes there silently match nothing.
+    PW_SKIP_PHASE_3="1"
     ;;
   full)
-    : # no filter
+    : # no filter — Phase 3 infra must be in place
     ;;
 esac
 
@@ -169,6 +175,8 @@ spec:
               value: '$PW_GREP'
             - name: PW_GREP_INVERT
               value: '$PW_GREP_INVERT'
+            - name: E2E_SKIP_PHASE_3
+              value: '$PW_SKIP_PHASE_3'
           volumeMounts:
             - name: results
               mountPath: /results
