@@ -761,9 +761,14 @@
       width="420"
       temporary
       class="files-drawer"
+      :class="{ 'drawer-drag-over': isDrawerDragOver }"
       tabindex="0"
       @paste="onDrawerPaste"
       @keydown="onDrawerKeyDown"
+      @dragenter.prevent.stop="onDrawerDragEnter"
+      @dragover.prevent.stop="onDrawerDragOver"
+      @dragleave.prevent.stop="onDrawerDragLeave"
+      @drop.prevent.stop="onDrawerDrop"
     >
       <v-toolbar density="compact" color="primary">
         <v-icon class="ml-4">mdi-folder-open</v-icon>
@@ -1169,7 +1174,84 @@ function onDrawerPaste(ev: ClipboardEvent) {
   ev.stopPropagation()
   const files: File[] = []
   for (let i = 0; i < dt.files.length; i++) files.push(dt.files[i])
-  void uploadMany(files)
+  // Drawer-scope paste honours the current dir as the upload target
+  // (file-DC v2.2 path-targeted upload). When the drawer is at the
+  // roots view (currentDirPath = "Drives" / "/"), we skip dest_path
+  // — those aren't real directories the agent can write into.
+  void uploadMany(files, drawerUploadDestPath())
+}
+
+// File-DC v2.2 path-targeted upload — drop a file/folder onto the
+// drawer to upload INTO the current host directory instead of the
+// default Downloads/. Visual cue (`drawer-drag-over` class on the
+// drawer root) shows the operator they're aiming at the drawer's
+// current dir. Drops on the viewer keep going to Downloads.
+const isDrawerDragOver = ref(false)
+function drawerUploadDestPath(): string | undefined {
+  // Only return a dest_path when the drawer is on a real directory
+  // (not the roots view which shows drive letters). Root labels are
+  // localisation-dependent ("Drives" / "/") so we look for a path
+  // that contains a separator AND isn't one of the known sentinels.
+  const p = currentDirPath.value
+  if (!p || p === 'Drives' || p === '/') return undefined
+  return p
+}
+function onDrawerDragEnter(ev: DragEvent) {
+  if (!ev.dataTransfer || !hasFileDrag(ev.dataTransfer)) return
+  isDrawerDragOver.value = true
+}
+function onDrawerDragOver(ev: DragEvent) {
+  if (!ev.dataTransfer || !hasFileDrag(ev.dataTransfer)) return
+  ev.dataTransfer.dropEffect = 'copy'
+  isDrawerDragOver.value = true
+}
+function onDrawerDragLeave(ev: DragEvent) {
+  // dragleave fires on child traversal too; only flip the cue off
+  // when the pointer leaves the drawer entirely.
+  const drawer = (ev.currentTarget as HTMLElement) ?? null
+  const next = ev.relatedTarget as Node | null
+  if (drawer && next && drawer.contains(next)) return
+  isDrawerDragOver.value = false
+}
+async function onDrawerDrop(ev: DragEvent) {
+  isDrawerDragOver.value = false
+  if (!ev.dataTransfer) return
+  // Mirror the viewer's onStageDrop logic (files + walked folders),
+  // but route through `uploadMany` with the drawer's current dir as
+  // the dest_path option.
+  type UploadInput = File | { file: File; relPath: string }
+  const flatFiles: File[] = []
+  const folderWalks: Promise<{ file: File; relPath: string }[]>[] = []
+  const items = ev.dataTransfer.items
+  if (items && items.length > 0) {
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i]
+      if (item.kind !== 'file') continue
+      const entry = (item as DataTransferItem & {
+        webkitGetAsEntry?: () => FileSystemEntry | null
+      }).webkitGetAsEntry?.()
+      if (entry && entry.isDirectory) {
+        folderWalks.push(rc.walkFolderEntry(entry, entry.name))
+      } else {
+        const f = item.getAsFile()
+        if (f) flatFiles.push(f)
+      }
+    }
+  } else if (ev.dataTransfer.files) {
+    for (let i = 0; i < ev.dataTransfer.files.length; i++) {
+      flatFiles.push(ev.dataTransfer.files[i])
+    }
+  }
+  const uploadList: UploadInput[] = [...flatFiles]
+  if (folderWalks.length > 0) {
+    try {
+      const walked = await Promise.all(folderWalks)
+      for (const folder of walked) uploadList.push(...folder)
+    } catch (e) {
+      showError(`Folder walk failed: ${(e as Error).message}`)
+    }
+  }
+  if (uploadList.length > 0) void uploadMany(uploadList, drawerUploadDestPath())
 }
 
 // Drawer-scope Ctrl+C / Cmd+C — copy selected entries as downloads.
@@ -1221,11 +1303,14 @@ async function downloadEntries(
   }
 }
 
-async function uploadMany(items: (File | { file: File; relPath: string })[]) {
+async function uploadMany(
+  items: (File | { file: File; relPath: string })[],
+  destPath?: string
+) {
   if (items.length === 0) return
   uploadBusy.value = true
   try {
-    const results = await rc.uploadFiles(items)
+    const results = await rc.uploadFiles(items, destPath ? { destPath } : undefined)
     const ok = results.filter((r) => r.ok).length
     const failed = results.filter((r) => !r.ok)
     if (failed.length === 0) {
@@ -2072,6 +2157,25 @@ onBeforeUnmount(() => {
    (Ctrl+click / Shift+click) feedback is visible at a glance. */
 .files-drawer .files-entry-selected {
   background: rgba(33, 150, 243, 0.18);
+}
+/* Drawer drag-over (file-DC v2.2 path-targeted upload): tint the
+   whole drawer when files are being dragged over it so the operator
+   sees the drawer's current dir is the upload target — distinct
+   from a viewer-level drop which goes to Downloads/. */
+.files-drawer.drawer-drag-over::before {
+  content: 'Drop to upload here';
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1rem;
+  font-weight: 600;
+  color: #fff;
+  background: rgba(76, 175, 80, 0.25);
+  border: 3px dashed rgba(76, 175, 80, 0.85);
+  pointer-events: none;
+  z-index: 100;
 }
 /* Transfers panel: long file names (folder uploads with deep paths)
    would push the row width and break the popover layout — clamp with

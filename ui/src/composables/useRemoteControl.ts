@@ -2372,7 +2372,8 @@ export function useRemoteControl() {
    *  time (see `filesRegistry`). */
   function uploadOne(
     file: File,
-    relPath?: string
+    relPath?: string,
+    destPath?: string
   ): Promise<{ path: string; bytes: number }> {
     const ch = channels.files
     if (!ch || ch.readyState !== 'open') {
@@ -2413,6 +2414,11 @@ export function useRemoteControl() {
         // unknown JSON fields and use `name` as the basename, so the
         // folder structure flattens — graceful degradation. New
         // agents recreate the directory tree under Downloads/.
+        //
+        // Path-targeted upload extension (file-DC v2.2): when
+        // `destPath` is set, the file lands under `<destPath>/`
+        // instead of Downloads/. Same graceful-degradation contract
+        // — old agents ignore the field. Stacks with `relPath`.
         const beginMsg: Record<string, unknown> = {
           t: 'files:begin',
           id,
@@ -2421,6 +2427,7 @@ export function useRemoteControl() {
           mime: file.type || undefined,
         }
         if (relPath) beginMsg.rel_path = relPath
+        if (destPath) beginMsg.dest_path = destPath
         ch.send(JSON.stringify(beginMsg))
       } catch (e) {
         localFail(e instanceof Error ? e : new Error(String(e)))
@@ -2890,15 +2897,28 @@ export function useRemoteControl() {
   type UploadResult =
     | { ok: true; name: string; path: string; bytes: number }
     | { ok: false; name: string; error: string }
-  type UploadInput = File | { file: File; relPath: string }
-  async function uploadFiles(items: UploadInput[]): Promise<UploadResult[]> {
+  // `relPath` carries the folder-upload structure (file-DC v2.1).
+  // `destPath` is the path-targeted upload root (file-DC v2.2) — when
+  // set, the file lands under `<destPath>/`. The two stack: a folder
+  // dropped onto a host directory recreates the source structure
+  // under that target dir.
+  type UploadInput =
+    | File
+    | { file: File; relPath?: string; destPath?: string }
+  async function uploadFiles(
+    items: UploadInput[],
+    options?: { destPath?: string }
+  ): Promise<UploadResult[]> {
     const results: UploadResult[] = []
     for (const it of items) {
       const f: File = it instanceof File ? it : it.file
       const relPath: string | undefined = it instanceof File ? undefined : it.relPath
+      // Per-item destPath wins; falls back to the call-level option.
+      const destPath: string | undefined =
+        (it instanceof File ? undefined : it.destPath) ?? options?.destPath
       const reportName = relPath ?? f.name
       try {
-        const r = await uploadOne(f, relPath)
+        const r = await uploadOne(f, relPath, destPath)
         results.push({ ok: true, name: reportName, path: r.path, bytes: r.bytes })
       } catch (e) {
         results.push({

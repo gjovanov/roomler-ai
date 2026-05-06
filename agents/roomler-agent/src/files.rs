@@ -110,6 +110,18 @@ pub(crate) enum FilesIncoming {
         /// `name` is the basename, file lands in Downloads/).
         #[serde(default)]
         rel_path: Option<String>,
+        /// Path-targeted upload extension (file-DC v2.2). When
+        /// `Some(<host_dir>)`, the file lands under `<host_dir>/`
+        /// instead of the default Downloads/. The browser sets this
+        /// when the operator drops a file onto the browse drawer's
+        /// current directory — natural completion of browse +
+        /// upload. Validated via the same denylist as `files:get`
+        /// downloads (rejects `\\?\GLOBALROOT…`, registry hives,
+        /// non-directory paths). When `None` the file lands in
+        /// Downloads/ as before. Stacks with `rel_path` for folder-
+        /// drop-into-arbitrary-dir.
+        #[serde(default)]
+        dest_path: Option<String>,
     },
     #[serde(rename = "files:end")]
     End { id: String },
@@ -271,12 +283,23 @@ impl FilesHandler {
     /// sanitisation. When `None`, behaviour is the file-DC v1 default:
     /// `name` is the basename and the file lands in Downloads/
     /// directly (with collision-safe rename).
+    ///
+    /// `dest_path` is the file-DC v2.2 path-targeted-upload extension.
+    /// When `Some(<host_dir>)`, the file lands under `<host_dir>/`
+    /// instead of Downloads/. Subject to the existing
+    /// [`validate_outgoing_path`] denylist (kernel-namespace prefixes,
+    /// registry-hive container) plus a directory-existence check.
+    /// On validation failure the file falls back to Downloads/ with
+    /// a warning log (operator's intent was clear, refusing entirely
+    /// would be confusing). Stacks with `rel_path` for
+    /// folder-drop-into-arbitrary-dir.
     pub async fn begin(
         &self,
         id: String,
         name: String,
         expected: u64,
         rel_path: Option<&str>,
+        dest_path: Option<&str>,
     ) -> Result<PathBuf> {
         if expected > MAX_TRANSFER_BYTES {
             return Err(anyhow!(
@@ -284,20 +307,38 @@ impl FilesHandler {
                 MAX_TRANSFER_BYTES
             ));
         }
-        let downloads = download_dir().context("resolving Downloads folder")?;
-        // Folder upload: resolve `rel_path` to a path under
-        // Downloads/, sanitising each component. Falls back to flat
+        // Resolve the target directory: dest_path (operator-chosen,
+        // validated) or Downloads (default). When dest_path is set
+        // but invalid (denylist hit / not a directory), fall back to
+        // Downloads with a warning so the upload doesn't silently
+        // drop the operator's data.
+        let target_dir = match dest_path.filter(|p| !p.is_empty()) {
+            Some(dp) => match resolve_dest_path(dp).await {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!(
+                        dest_path = dp,
+                        %e,
+                        "files: dest_path rejected; falling back to Downloads"
+                    );
+                    download_dir().context("resolving Downloads folder")?
+                }
+            },
+            None => download_dir().context("resolving Downloads folder")?,
+        };
+        // Folder upload: resolve `rel_path` to a path under the
+        // target dir, sanitising each component. Falls back to flat
         // upload when rel_path is empty / missing / refused by
         // sanitisation.
         let path = match rel_path.filter(|p| !p.is_empty()) {
-            Some(rel) => resolve_folder_upload_path(&downloads, rel).unwrap_or_else(|| {
+            Some(rel) => resolve_folder_upload_path(&target_dir, rel).unwrap_or_else(|| {
                 tracing::warn!(
                     rel_path = rel,
                     "files: rel_path rejected; falling back to flat upload"
                 );
-                unique_path(&downloads, &sanitize_filename(&name))
+                unique_path(&target_dir, &sanitize_filename(&name))
             }),
-            None => unique_path(&downloads, &sanitize_filename(&name)),
+            None => unique_path(&target_dir, &sanitize_filename(&name)),
         };
         // Create parent dirs (Downloads itself, plus any rel_path
         // intermediaries). create_dir_all is idempotent so
@@ -576,6 +617,30 @@ fn validate_outgoing_path(input: &str) -> Result<PathBuf> {
         ));
     }
 
+    Ok(canonical)
+}
+
+/// Resolve a path-targeted upload's destination directory. Reuses
+/// the same denylist as [`validate_outgoing_path`] (kernel-namespace
+/// prefixes, registry-hive container) but additionally requires the
+/// path to exist AND be a directory (uploads land at `<dir>/<name>`,
+/// so the dir must be writeable on the host).
+///
+/// Used by [`FilesHandler::begin`] when the browser sends a
+/// `dest_path` field on `files:begin`. On error, the caller falls
+/// back to the default Downloads/ target with a warning log so the
+/// upload doesn't silently drop the operator's data.
+async fn resolve_dest_path(input: &str) -> Result<PathBuf> {
+    let canonical = validate_outgoing_path(input).context("validating dest_path")?;
+    let meta = tokio::fs::metadata(&canonical)
+        .await
+        .with_context(|| format!("stat {}", canonical.display()))?;
+    if !meta.is_dir() {
+        return Err(anyhow!(
+            "dest_path is not a directory: {}",
+            canonical.display()
+        ));
+    }
     Ok(canonical)
 }
 
@@ -1169,6 +1234,163 @@ mod tests {
     }
 
     #[test]
+    fn parse_files_begin_with_dest_path() {
+        // Path-targeted upload extension (file-DC v2.2). The browser
+        // sends `dest_path` when the operator drops onto the drawer's
+        // current dir; the agent uses it as the upload target.
+        let m: FilesIncoming = serde_json::from_str(
+            r#"{"t":"files:begin","id":"f1","name":"x.bin","size":42,"dest_path":"C:\\Users\\me\\Documents"}"#,
+        )
+        .unwrap();
+        match m {
+            FilesIncoming::Begin {
+                id,
+                name,
+                size,
+                dest_path,
+                rel_path,
+                ..
+            } => {
+                assert_eq!(id, "f1");
+                assert_eq!(name, "x.bin");
+                assert_eq!(size, 42);
+                assert_eq!(dest_path.as_deref(), Some("C:\\Users\\me\\Documents"));
+                assert!(rel_path.is_none(), "dest_path doesn't imply rel_path");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_files_begin_with_dest_path_and_rel_path() {
+        // The two extensions stack — folder-drop into an arbitrary
+        // host directory.
+        let m: FilesIncoming = serde_json::from_str(
+            r#"{"t":"files:begin","id":"f1","name":"file.txt","size":42,"rel_path":"MyFolder/sub/file.txt","dest_path":"C:\\Projects"}"#,
+        )
+        .unwrap();
+        match m {
+            FilesIncoming::Begin {
+                rel_path,
+                dest_path,
+                ..
+            } => {
+                assert_eq!(rel_path.as_deref(), Some("MyFolder/sub/file.txt"));
+                assert_eq!(dest_path.as_deref(), Some("C:\\Projects"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_dest_path_accepts_existing_dir() {
+        let base = std::env::temp_dir().join(format!(
+            "roomler-dest-ok-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        tokio::fs::create_dir_all(&base).await.unwrap();
+        let resolved = resolve_dest_path(&base.to_string_lossy())
+            .await
+            .expect("dir should be accepted");
+        // Canonicalisation may add a `\\?\` prefix on Windows; just
+        // check the resolved path equals (or canonicalises to) the
+        // input.
+        assert!(resolved.exists());
+        assert!(resolved.is_dir());
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    #[tokio::test]
+    async fn resolve_dest_path_rejects_file() {
+        let base = std::env::temp_dir().join(format!(
+            "roomler-dest-file-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        tokio::fs::create_dir_all(&base).await.unwrap();
+        let f = base.join("not-a-dir.txt");
+        tokio::fs::write(&f, b"hi").await.unwrap();
+        let res = resolve_dest_path(&f.to_string_lossy()).await;
+        assert!(res.is_err(), "regular file should be rejected");
+        assert!(
+            res.unwrap_err().to_string().contains("not a directory"),
+            "error mentions not-a-directory"
+        );
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    #[tokio::test]
+    async fn resolve_dest_path_rejects_globalroot() {
+        // Same denylist as validate_outgoing_path. We never get to
+        // the metadata check.
+        let res = resolve_dest_path(r"\\?\GLOBALROOT\Device\HarddiskVolume2\foo").await;
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn begin_with_dest_path_lands_in_dest() {
+        // End-to-end: a `begin` call with dest_path should produce a
+        // path under the dest dir, not under Downloads.
+        let base = std::env::temp_dir().join(format!(
+            "roomler-dest-e2e-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let dest = base.join("dest");
+        tokio::fs::create_dir_all(&dest).await.unwrap();
+        // Point HOME / USERPROFILE at base so the Downloads fallback
+        // doesn't pollute the dev's actual Downloads dir if dest_path
+        // resolution somehow fell through.
+        let prev_home = std::env::var_os("HOME");
+        let prev_userprofile = std::env::var_os("USERPROFILE");
+        unsafe {
+            std::env::set_var("HOME", &base);
+            std::env::set_var("USERPROFILE", &base);
+        }
+
+        let h = FilesHandler::new();
+        let path = h
+            .begin(
+                "d1".into(),
+                "out.bin".into(),
+                4,
+                None,
+                Some(&dest.to_string_lossy()),
+            )
+            .await
+            .expect("begin");
+        // The destination path's parent should canonicalise-match
+        // dest. (canonicalize() of dest may add long-path prefixes on
+        // Windows.)
+        let dest_canon = std::fs::canonicalize(&dest).unwrap();
+        let parent = path.parent().unwrap();
+        assert_eq!(parent, dest_canon, "lands under dest_path: {path:?}");
+
+        // Cleanup.
+        h.abort().await;
+        unsafe {
+            if let Some(v) = prev_home {
+                std::env::set_var("HOME", v);
+            } else {
+                std::env::remove_var("HOME");
+            }
+            if let Some(v) = prev_userprofile {
+                std::env::set_var("USERPROFILE", v);
+            } else {
+                std::env::remove_var("USERPROFILE");
+            }
+        }
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    #[test]
     fn parse_files_begin_with_rel_path() {
         // Folder-upload extension (file-DC v2.1). When the browser
         // sends a `rel_path`, the agent recreates the directory
@@ -1565,7 +1787,7 @@ mod tests {
         let h = FilesHandler::new();
         // Start an upload — populates `incoming`.
         let upload_path = h
-            .begin("u1".into(), "upload.txt".into(), 5, None)
+            .begin("u1".into(), "upload.txt".into(), 5, None, None)
             .await
             .expect("begin upload");
 
@@ -1655,7 +1877,7 @@ mod tests {
         }
 
         let path = h
-            .begin("t1".into(), "hello.txt".into(), 5, None)
+            .begin("t1".into(), "hello.txt".into(), 5, None, None)
             .await
             .unwrap();
         h.chunk(b"hello").await.unwrap();
