@@ -55,6 +55,26 @@ pub struct AgentCaps {
     /// format spec.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub transports: Vec<String>,
+    /// File-DC v2 (0.3.0+) capability list. Replaces the
+    /// coarse-grained `supports_file_transfer` bool with explicit
+    /// per-feature flags. Recognised values:
+    ///
+    /// * `upload`   — browser → host file uploads (the v1 default).
+    /// * `download` — host → browser single-file downloads.
+    /// * `download-folder` — host → browser folder zip streams.
+    /// * `browse`   — browser can navigate the host's filesystem
+    ///   via `files:dir`. Conditional on the agent's
+    ///   `enable_remote_browse` config flag.
+    ///
+    /// Empty / unset (older agents) deserialises to `[]`; browsers
+    /// that see an empty list fall back to `supports_file_transfer`
+    /// to determine just upload availability. New browsers that need
+    /// download/browse functionality check this list and grey out
+    /// the affected toolbar buttons when the capability is missing,
+    /// instead of waiting for a 5 s timeout on an unanswered
+    /// `files:get` / `files:dir`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
