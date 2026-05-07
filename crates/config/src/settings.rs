@@ -173,8 +173,16 @@ impl Settings {
             .set_default("database.url", "mongodb://localhost:27019")?
             .set_default("database.name", "roomler-ai")?
             .set_default("jwt.secret", "change-me-in-production")?
-            .set_default("jwt.access_token_ttl_secs", 3600)?
-            .set_default("jwt.refresh_token_ttl_secs", 604800)?
+            // Access token: 1 week (was 1 hour). The shorter TTL was
+            // partnered with a much longer refresh, but operators
+            // were getting kicked back to /login mid-session every
+            // hour which the auto-refresh flow doesn't always
+            // recover from cleanly. 1-week access trades off some
+            // exposure on a leaked token for substantially better
+            // session continuity. Refresh extended to 30 days so
+            // the refresh > access invariant still holds.
+            .set_default("jwt.access_token_ttl_secs", 604800)?
+            .set_default("jwt.refresh_token_ttl_secs", 2_592_000)?
             .set_default("jwt.issuer", "roomler-ai")?
             .set_default("redis.url", "redis://127.0.0.1:6379")?
             .set_default("s3.endpoint", "http://localhost:9000")?

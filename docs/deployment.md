@@ -47,8 +47,8 @@ All configuration is via environment variables prefixed with `ROOMLER__` using `
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `ROOMLER__JWT__SECRET` | `change-me-in-production` | JWT signing secret |
-| `ROOMLER__JWT__ACCESS_TOKEN_TTL_SECS` | `3600` | Access token TTL (1 hour) |
-| `ROOMLER__JWT__REFRESH_TOKEN_TTL_SECS` | `604800` | Refresh token TTL (7 days) |
+| `ROOMLER__JWT__ACCESS_TOKEN_TTL_SECS` | `604800` | Access token TTL (7 days) |
+| `ROOMLER__JWT__REFRESH_TOKEN_TTL_SECS` | `2592000` | Refresh token TTL (30 days) |
 | `ROOMLER__JWT__ISSUER` | `roomler-ai` | JWT issuer claim |
 
 ### Redis

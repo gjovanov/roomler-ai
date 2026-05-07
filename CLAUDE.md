@@ -107,8 +107,8 @@ All data is scoped by `tenant_id`. Routes are nested: `/api/tenant/{tenant_id}/r
 ## Auth Pattern
 
 JWT-based auth (jsonwebtoken 9 crate) with Argon2 password hashing:
-- Access token: configurable TTL (default 3600s)
-- Refresh token: configurable TTL (default 604800s)
+- Access token: configurable TTL (default 604800s = 7 days)
+- Refresh token: configurable TTL (default 2592000s = 30 days)
 - Auth middleware extracts user from `Authorization: Bearer` header
 - OAuth: Google, Facebook, GitHub, LinkedIn, Microsoft
 
@@ -385,7 +385,7 @@ Summary: Initial CLAUDE.md setup. First health check pending.
 ## Security Baseline
 
 - Last CVE scan: not yet run
-- JWT expiry: access=3600s, refresh=604800s (configurable via ROOMLER__JWT__*)
+- JWT expiry: access=604800s (7 days), refresh=2592000s (30 days) (configurable via ROOMLER__JWT__*)
 - Rate limit config: NONE
 - CORS: PERMISSIVE (Any/Any/Any)
 - nginx security headers: NONE
