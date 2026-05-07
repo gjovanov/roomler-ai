@@ -763,8 +763,6 @@
       class="files-drawer"
       :class="{ 'drawer-drag-over': isDrawerDragOver }"
       tabindex="0"
-      @paste="onDrawerPaste"
-      @keydown="onDrawerKeyDown"
       @dragenter.prevent.stop="onDrawerDragEnter"
       @dragover.prevent.stop="onDrawerDragOver"
       @dragleave.prevent.stop="onDrawerDragLeave"
@@ -1123,10 +1121,19 @@ function onEntryClick(
 }
 
 function onEntryDblClick(entry: { name: string; is_dir: boolean }) {
-  if (entry.is_dir) {
-    const sep = /[\\/]$/.test(currentDirPath.value) ? '' : pathSeparator()
-    void navigateTo(currentDirPath.value + sep + entry.name)
+  if (!entry.is_dir) return
+  // Roots view (Drives on Windows / "/" on Unix) returns
+  // `currentParent === null` from the agent. Each entry's `name` is
+  // already an absolute path (e.g. `C:\` or `/`) — DO NOT
+  // concatenate with the localised "Drives" label, that produces
+  // bogus paths like "Drives/C:\". Field repro rc.15 2026-05-07:
+  // dbl-click `C:\` → agent canonicalize("Drives/C:\\") fails.
+  if (currentParent.value === null) {
+    void navigateTo(entry.name)
+    return
   }
+  const sep = /[\\/]$/.test(currentDirPath.value) ? '' : pathSeparator()
+  void navigateTo(currentDirPath.value + sep + entry.name)
 }
 
 function pathSeparator(): string {
@@ -1162,14 +1169,27 @@ async function downloadEntry(entry: { name: string; is_dir: boolean }) {
   }
 }
 
-// Drawer-scope paste: `paste` event fires when the operator hits
-// Ctrl+V with the drawer focused. If the OS clipboard has files,
-// upload them. Phase 5 of file-DC v2 also wires Ctrl+V over the
-// viewer with deferral; this drawer-scope path is the simpler
-// half (no keystroke-forward conflict).
-function onDrawerPaste(ev: ClipboardEvent) {
+// Window-level paste handler for the drawer. The original rc.14
+// design used `@paste` on the drawer element, but `paste` events
+// only fire on the focused element — so unless the operator clicked
+// into the drawer first, the handler never ran (Field repro rc.15
+// 2026-05-07). Moving to window scope makes the handler robust to
+// focus state. The viewer's separate composable-side onPaste fires
+// first; it only acts when `pendingCtrlV` is set (Ctrl+V over the
+// viewer specifically), so this drawer handler kicks in for every
+// other paste-with-files when the drawer is open.
+function onWindowPasteForDrawer(ev: ClipboardEvent) {
+  if (!filesDrawer.value) return
   const dt = ev.clipboardData
   if (!dt || !dt.files || dt.files.length === 0) return
+  // Don't intercept paste into form inputs (e.g. the path-input
+  // field at the top of the drawer).
+  const target = ev.target as Element | null
+  if (target) {
+    const tag = target.tagName
+    if (tag === 'INPUT' || tag === 'TEXTAREA') return
+    if ((target as HTMLElement).isContentEditable) return
+  }
   ev.preventDefault()
   ev.stopPropagation()
   const files: File[] = []
@@ -1254,19 +1274,24 @@ async function onDrawerDrop(ev: DragEvent) {
   if (uploadList.length > 0) void uploadMany(uploadList, drawerUploadDestPath())
 }
 
-// Drawer-scope Ctrl+C / Cmd+C — copy selected entries as downloads.
-// When `selectedDirEntries` is non-empty, queue a `downloadFile` per
-// file entry and `downloadFolder` per directory. Sequential per the
-// single-active-outgoing-transfer invariant; the registry's queue
-// serialises them automatically.
-function onDrawerKeyDown(ev: KeyboardEvent) {
+// Window-level Ctrl+C / Cmd+C — copy selected drawer entries as
+// downloads. Same focus-robustness reasoning as the paste handler:
+// rc.14's `@keydown` on the drawer only fired when focus was inside
+// the drawer; field repro rc.15 2026-05-07 confirmed the handler
+// often missed because focus stayed on document.body. Moving to
+// window scope with a drawer-open + selection-non-empty gate makes
+// it work regardless of where focus landed.
+function onWindowKeyDownForDrawer(ev: KeyboardEvent) {
+  if (!filesDrawer.value) return
   if (ev.code !== 'KeyC') return
   if (!(ev.ctrlKey || ev.metaKey)) return
-  // Skip if focus is in the path-input field — let it copy text
-  // natively instead of intercepting.
+  // Skip if focus is in the path-input field or any other text
+  // input — let native copy work there.
   const target = ev.target as Element | null
-  if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) {
-    return
+  if (target) {
+    const tag = target.tagName
+    if (tag === 'INPUT' || tag === 'TEXTAREA') return
+    if ((target as HTMLElement).isContentEditable) return
   }
   if (selectedDirEntries.value.size === 0) return
   ev.preventDefault()
@@ -2049,11 +2074,20 @@ watch(
 onMounted(() => {
   void loadAgent()
   document.addEventListener('fullscreenchange', onFullscreenChange)
+  // Drawer-scope Ctrl+V / Ctrl+C handlers attached at window-level
+  // (not on the drawer element) so they fire regardless of which
+  // element has focus — rc.14 had them on the drawer's @paste /
+  // @keydown which only worked when the operator had clicked into
+  // the drawer first.
+  window.addEventListener('paste', onWindowPasteForDrawer)
+  window.addEventListener('keydown', onWindowKeyDownForDrawer)
 })
 onBeforeUnmount(() => {
   if (detachInput) detachInput()
   stopFitResizeObserver()
   document.removeEventListener('fullscreenchange', onFullscreenChange)
+  window.removeEventListener('paste', onWindowPasteForDrawer)
+  window.removeEventListener('keydown', onWindowKeyDownForDrawer)
   // Exit fullscreen on unmount so navigating away doesn't leave the
   // browser in a weird fullscreen state.
   if (document.fullscreenElement) void document.exitFullscreen().catch(() => {})
