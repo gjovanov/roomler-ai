@@ -2196,9 +2196,24 @@ export function useRemoteControl() {
       // — flushPendingCtrlV / paste handler will emit the keystroke
       // if the clipboard didn't have files.
       if (isCtrlVOverViewer(ev)) {
-        ev.preventDefault()
+        // CRITICAL: do NOT call ev.preventDefault() on this keydown.
+        // Per HTML spec, preventDefault on a keydown that would
+        // trigger paste suppresses the subsequent `paste` event
+        // entirely — `clipboardData` is never delivered to our
+        // listener and the deferred-keystroke design degenerates
+        // into "always flush as plain Ctrl+V" (rc.12-rc.15 bug).
+        // Field repro rc.15 2026-05-07: Ctrl+V never uploads files.
+        //
+        // Instead: stash pendingCtrlV (skip the sendInput keystroke
+        // forwarding) and let the browser's natural paste pipeline
+        // fire. The window-level `paste` listener decides — files →
+        // upload, text → clipboard:write + flush keystroke, empty
+        // clipboard → 50 ms timer flushes as normal Ctrl+V.
+        //
+        // Keystroke forwarding is suppressed by the `return` below
+        // (we exit before `sendInput`); the host won't see Ctrl+V
+        // until the paste handler explicitly flushes it.
         if (down) {
-          // Replace any prior pending entry (operator chord-spammed).
           if (pendingCtrlV?.timer) clearTimeout(pendingCtrlV.timer)
           const mods =
             (ev.ctrlKey ? 1 : 0) |
@@ -2206,7 +2221,9 @@ export function useRemoteControl() {
             (ev.altKey ? 4 : 0) |
             (ev.metaKey ? 8 : 0)
           const timer = setTimeout(() => {
-            // Paste didn't fire — flush as a normal Ctrl+V keystroke.
+            // Paste didn't fire (empty clipboard / browser denied
+            // the read) — flush as a normal Ctrl+V keystroke so
+            // the operator's chord still reaches the remote app.
             flushPendingCtrlV()
           }, 50)
           pendingCtrlV = { mods, timer }
