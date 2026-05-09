@@ -143,6 +143,15 @@ metadata:
 spec:
   backoffLimit: 0
   ttlSecondsAfterFinished: 86400
+  # Hard upper bound on the Job — if the orchestrator script that
+  # normally `kubectl cp`s artifacts and deletes the Job dies (SSH
+  # disconnect, Ctrl+C, host reboot), the run-e2e.sh entrypoint's
+  # \`tail -f /dev/null\` keeps the pod alive forever. Without this,
+  # Prometheus' KubeJobNotCompleted alert fires after 12 h. Force
+  # the Job to fail at 1 h so ttlSecondsAfterFinished kicks in and
+  # the namespace stays clean. Normal runs finish in ~10-15 min so
+  # 3600 s leaves plenty of headroom.
+  activeDeadlineSeconds: 3600
   template:
     metadata:
       labels:
