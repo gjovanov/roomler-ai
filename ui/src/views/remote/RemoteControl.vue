@@ -784,7 +784,7 @@
           icon
           variant="text"
           size="small"
-          :disabled="!currentParent || dirLoading"
+          :disabled="isRootsView || dirLoading"
           title="Parent directory"
           @click="navigateTo(currentParent || '')"
         >
@@ -1059,6 +1059,14 @@ const dirError = ref<string | null>(null)
 const dirEntries = ref<{ name: string; is_dir: boolean; size: number | null; mtime_unix: number | null }[]>([])
 const currentDirPath = ref('')
 const currentParent = ref<string | null>(null)
+// Distinct from `currentParent === null`. The agent's roots listing
+// returns `parent: null`, but so does any *real* path whose
+// `Path::parent()` is None — e.g. on Windows, `canonicalize("C:\\")`
+// returns `\\?\C:\` whose parent is None. Without this flag the
+// drawer treated `\\?\C:\` as a roots view and dbl-clicking `dev`
+// shipped just `"dev"` to the agent, which failed with
+// "canonicalising dev". Field repro 2026-05-09.
+const isRootsView = ref(false)
 const dirPathInput = ref('')
 const selectedDirEntries = ref<Set<string>>(new Set())
 let lastSelectedDirIndex: number | null = null
@@ -1068,10 +1076,12 @@ async function navigateTo(path: string) {
   dirError.value = null
   selectedDirEntries.value = new Set()
   lastSelectedDirIndex = null
+  const requestingRoots = path === '' || path === '~' || path === '/'
   try {
     const listing = await rc.listDir(path)
     currentDirPath.value = listing.path
     currentParent.value = listing.parent
+    isRootsView.value = requestingRoots
     dirPathInput.value = listing.path
     dirEntries.value = listing.entries
   } catch (e) {
@@ -1122,13 +1132,19 @@ function onEntryClick(
 
 function onEntryDblClick(entry: { name: string; is_dir: boolean }) {
   if (!entry.is_dir) return
-  // Roots view (Drives on Windows / "/" on Unix) returns
-  // `currentParent === null` from the agent. Each entry's `name` is
-  // already an absolute path (e.g. `C:\` or `/`) — DO NOT
+  // Roots view (Drives on Windows / "/" on Unix): each entry's
+  // `name` is already an absolute path (e.g. `C:\` or `/`) — DO NOT
   // concatenate with the localised "Drives" label, that produces
-  // bogus paths like "Drives/C:\". Field repro rc.15 2026-05-07:
-  // dbl-click `C:\` → agent canonicalize("Drives/C:\\") fails.
-  if (currentParent.value === null) {
+  // bogus paths like "Drives/C:\". Drive into `entry.name` directly.
+  // Use the explicit `isRootsView` flag rather than
+  // `currentParent === null`: on Windows, canonicalize("C:\\")
+  // returns `\\?\C:\` whose Path::parent() is also None, so the
+  // null-parent proxy mis-classified the verbatim drive root as
+  // roots-view. Field repro 2026-05-09: dbl-click C:\ → drawer
+  // shows \\?\C:\ → dbl-click `dev` → agent gets just "dev" →
+  // "canonicalising dev". The flag below is set by `navigateTo`
+  // only when the requested path was empty/`/`/`~`.
+  if (isRootsView.value) {
     void navigateTo(entry.name)
     return
   }
