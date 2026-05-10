@@ -164,6 +164,26 @@ enum Command {
         #[arg(long)]
         check_only: bool,
     },
+    /// (internal) Remove cross-flavour MSI install leftovers before
+    /// the fresh install lands. Invoked by the MSI's WiX custom action
+    /// just before `InstallFiles`. The `--target-flavour` arg says
+    /// which flavour is being INSTALLED; the helper cleans the OPPOSITE
+    /// flavour's stale Scheduled Task / SCM service / data dirs.
+    /// Same-flavour invocations exit 0 (no-op).
+    ///
+    /// Hidden from `--help` because operators never invoke this
+    /// directly; the WiX CA does.
+    #[command(hide = true, name = "cleanup-legacy-install")]
+    CleanupLegacyInstall {
+        /// Which flavour is being installed: `perUser` or `perMachine`.
+        /// The helper cleans the OTHER flavour's leftovers.
+        #[arg(long, name = "target-flavour")]
+        target_flavour: String,
+        /// Print what WOULD be removed without touching anything.
+        /// Used during MSI build smoke validation.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Approve or deny a pending operator-consent prompt for a remote-
     /// control session. Used when the agent's `auto_grant_session` is
     /// `false` (org-controlled fleets). The agent watches a sentinel
@@ -348,6 +368,10 @@ async fn main() -> Result<()> {
         Command::PeerPresenceStatus => peer_presence_status_cmd(),
         Command::Service { action } => service_cmd(action).await,
         Command::ServiceRun => service_run_cmd().await,
+        Command::CleanupLegacyInstall {
+            target_flavour,
+            dry_run,
+        } => cleanup_legacy_install_cmd(&target_flavour, dry_run),
         Command::Consent {
             session,
             approve,
@@ -360,6 +384,35 @@ async fn main() -> Result<()> {
             expected_version,
         } => post_install_watch_cmd(installer_pid, installer_path, expected_version).await,
     }
+}
+
+/// Remove cross-flavour MSI install leftovers. Invoked by the WiX
+/// custom action immediately before `InstallFiles`. Wraps
+/// `install_cleanup::run_cleanup` with CLI-friendly arg parsing +
+/// summary print. Always exits 0 so the MSI's `Return="ignore"` on
+/// the custom action is belt-and-suspenders, not load-bearing.
+fn cleanup_legacy_install_cmd(target_flavour: &str, dry_run: bool) -> Result<()> {
+    let target = match roomler_agent::install_cleanup::TargetFlavour::parse(target_flavour) {
+        Some(t) => t,
+        None => {
+            eprintln!(
+                "cleanup-legacy-install: unrecognised --target-flavour {target_flavour:?}; \
+                 expected `perUser` or `perMachine` (no-op)"
+            );
+            return Ok(());
+        }
+    };
+    let report = roomler_agent::install_cleanup::run_cleanup(target, dry_run)?;
+    // Always print the one-line summary so the MSI's session log
+    // (msiexec /l*v) shows what happened. Exit 0 even on errors —
+    // a cleanup failure shouldn't sink the install.
+    println!("{}", report.summary());
+    if !report.errors.is_empty() {
+        for e in &report.errors {
+            tracing::warn!(error = %e, "cleanup-legacy-install: partial failure");
+        }
+    }
+    Ok(())
 }
 
 /// Drop a sentinel file under the agent's consent dir so a running
@@ -564,6 +617,24 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
             }
         };
     let mut cfg = config::load(config_path).context("loading config")?;
+
+    // rc.18: run explicit config-schema migration. New fields default
+    // via serde at deserialize time, but the on-disk file isn't
+    // rewritten — operators reading config.toml would see partial
+    // contents. `migrate` stamps `config_schema_version`, trims the
+    // server_url, resets cross-branch crash counters, and signals the
+    // caller (us, here) to persist if anything actually changed.
+    if config::migrate(&mut cfg) {
+        if let Err(e) = config::save(config_path, &cfg) {
+            tracing::warn!(error = %e, "config migration succeeded but persist failed; in-memory config still up-to-date");
+        } else {
+            tracing::info!(
+                schema_version = %config::CURRENT_SCHEMA_VERSION,
+                "config migrated and persisted"
+            );
+        }
+    }
+
     let encoder_preference = resolve_encoder_preference(cli_encoder, cfg.encoder_preference);
 
     // Wire the file-DC v2 `files:dir` browse capability. Default
@@ -972,7 +1043,15 @@ async fn self_update_cmd(check_only: bool) -> Result<()> {
                 "Update available: {current} -> {latest}. Installer at {}. Spawning + exiting.",
                 installer_path.display()
             );
-            updater::spawn_installer(&installer_path).context("spawning installer")?;
+            // rc.18: route through spawn_installer_with_watch so the
+            // manual self-update produces a `last-install.json` trail
+            // (matches the BG auto-update path). The watcher subprocess
+            // outlives this process and records the installer's exit
+            // code + the new binary's --version result. Diagnoses the
+            // perMachine UAC-declined / silent-fail case that bit
+            // PC50045 on 2026-05-10.
+            updater::spawn_installer_with_watch(&installer_path, Some(&latest))
+                .context("spawning installer")?;
             std::process::exit(0);
         }
         updater::CheckOutcome::Skipped(reason) => {

@@ -1,0 +1,42 @@
+[package]
+name = "roomler-agent-tray"
+version.workspace = true
+edition.workspace = true
+description = "System-tray companion for roomler-agent — onboarding + status + service control."
+
+[[bin]]
+name = "roomler-agent-tray"
+path = "src/main.rs"
+
+[dependencies]
+# Lib dep on the agent so the tray can call `enrollment::enroll` and
+# `config::save` directly, without a subprocess. Pulls the agent's
+# config struct shape + enrollment HTTP client transitively.
+roomler-agent = { path = "../roomler-agent" }
+
+# Tauri 2.x runtime + tray + plugins.
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-shell = "2"
+tauri-plugin-single-instance = "2"
+tauri-plugin-dialog = "2"
+
+# Async + error handling — shared workspace versions.
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+gethostname = "0.5"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+# cargo-wix metadata — the tray ships as its own perUser MSI alongside
+# the agent's MSI(s). Operators install both: agent does the work,
+# tray surfaces the onboarding GUI + status.
+[package.metadata.wix]
+upgrade-guid = "C9F3E4A1-7D2B-4C6E-8F3A-1B2C9D4E5F60"
+path-guid = "D8E2F3B0-6C1A-3B5D-7E2A-9A1B8C3D4E5F"
+license = false
+eula = false

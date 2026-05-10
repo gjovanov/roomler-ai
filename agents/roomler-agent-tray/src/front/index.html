@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Roomler Agent</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Roomler Agent</h1>
+      <nav>
+        <a href="#index.html" class="active">Status</a>
+        <a href="#enrollment.html">Onboarding</a>
+        <a href="#settings.html">Settings</a>
+      </nav>
+    </header>
+    <main id="status-view">
+      <section id="status-loading">
+        <p class="muted">Loading status…</p>
+      </section>
+      <section id="status-content" hidden>
+        <!-- enrolled banner -->
+        <div id="enrolled-banner" class="banner banner-ok" hidden>
+          <strong>Enrolled</strong>
+          <span class="muted" id="banner-device-name"></span>
+        </div>
+        <div id="not-enrolled-banner" class="banner banner-warn" hidden>
+          <strong>Not enrolled</strong>
+          <button type="button" class="primary" onclick="window.location.hash = '#enrollment.html'">Onboard this device</button>
+        </div>
+        <div id="attention-banner" class="banner banner-error" hidden>
+          <strong>Attention required</strong>
+          <p class="muted" id="attention-path"></p>
+        </div>
+
+        <!-- status grid -->
+        <dl class="kv">
+          <dt>Agent version</dt>
+          <dd id="kv-version">—</dd>
+          <dt>Service</dt>
+          <dd id="kv-service">—</dd>
+          <dt>Server</dt>
+          <dd id="kv-server">—</dd>
+          <dt>Agent ID</dt>
+          <dd id="kv-agent-id" class="mono">—</dd>
+          <dt>Tenant ID</dt>
+          <dd id="kv-tenant-id" class="mono">—</dd>
+          <dt>Config schema</dt>
+          <dd id="kv-schema">—</dd>
+          <dt>Log directory</dt>
+          <dd id="kv-log-dir" class="mono small">—</dd>
+        </dl>
+
+        <!-- actions -->
+        <div class="actions">
+          <button type="button" id="btn-check-update">Check for Updates</button>
+          <button type="button" id="btn-apply-update" hidden>Install update</button>
+          <button type="button" id="btn-open-logs">Open Logs Folder</button>
+          <button type="button" id="btn-open-config">Open Config Folder</button>
+          <button type="button" id="btn-service-install">Install Service</button>
+        </div>
+        <pre id="action-output" class="output" hidden></pre>
+      </section>
+    </main>
+    <script src="status.js"></script>
+  </body>
+</html>

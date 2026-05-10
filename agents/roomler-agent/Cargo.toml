@@ -182,6 +182,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_WindowsAndMessaging",      # GetDesktopWindow + GetSystemMetrics (M3 A1 GDI fallback)
     "Win32_Graphics_Gdi",                # GetWindowDC, BitBlt, CreateCompatibleBitmap, GetDIBits (M3 A1 GDI fallback)
     "Win32_Storage_FileSystem",          # GetLogicalDrives (file-DC v2 root listing)
+    "Win32_UI_Shell",                    # ShellExecuteExW for UAC-elevated msiexec (rc.18 self-update fix)
+    "Win32_System_Registry",             # SHELLEXECUTEINFOW carries an HKEY field; struct gated on this
 ] }
 
 [target.'cfg(target_os = "windows")'.dependencies.windows]

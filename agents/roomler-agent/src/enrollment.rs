@@ -87,6 +87,9 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         last_crash_unix: 0,
         rollback_attempted: false,
         last_run_unhealthy: false,
+        // Stamp the current schema version directly on enrollment so
+        // a fresh install skips the rc.18 migration on first launch.
+        config_schema_version: Some(crate::config::CURRENT_SCHEMA_VERSION.to_string()),
     })
 }
 

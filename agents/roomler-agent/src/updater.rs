@@ -701,15 +701,62 @@ pub fn spawn_installer_with_watch(
     Ok(())
 }
 
+/// Build the msiexec argv for this MSI flavour. Pure so it's unit-
+/// testable without spawning processes.
+///
+/// - **perUser**: `/qn` (fully silent — no UI, no UAC). The MSI's
+///   `InstallScope='perUser'` doesn't require elevation, so silent
+///   install works from any user-token process (Scheduled Task,
+///   interactive shell).
+/// - **perMachine**: `/qb!` (basic UI, no Cancel). The MSI's
+///   `InstallScope='perMachine'` REQUIRES elevation; `/qn` would
+///   suppress the UAC prompt and the install would silently fail
+///   (the 2026-05-10 PC50045 field repro). `/qb!` shows a minimal
+///   progress dialog while still allowing UAC to prompt when the
+///   caller is non-elevated. Pair with [`spawn_installer_inner`]'s
+///   `ShellExecuteExW`-with-`runas` path so the elevation actually
+///   happens.
+#[cfg(any(target_os = "windows", test))]
+pub fn msiexec_argv(installer: &std::path::Path, flavour: WindowsInstallFlavour) -> Vec<String> {
+    let path = installer.to_string_lossy().into_owned();
+    let ui = match flavour {
+        WindowsInstallFlavour::PerUser => "/qn",
+        WindowsInstallFlavour::PerMachine => "/qb!",
+    };
+    vec![
+        "/i".to_string(),
+        path,
+        ui.to_string(),
+        "/norestart".to_string(),
+    ]
+}
+
 fn spawn_installer_inner(installer_path: &std::path::Path) -> Result<u32> {
     #[cfg(target_os = "windows")]
     {
-        let path_str = installer_path.to_string_lossy().into_owned();
-        let child = std::process::Command::new("msiexec")
-            .args(["/i", &path_str, "/qn", "/norestart"])
-            .spawn()
-            .context("spawning msiexec")?;
-        Ok(child.id())
+        let flavour = current_install_flavour();
+        let argv = msiexec_argv(installer_path, flavour);
+        match flavour {
+            WindowsInstallFlavour::PerUser => {
+                // /qn silent install; non-elevated msiexec inherits
+                // the user token and writes under %LOCALAPPDATA%.
+                let child = std::process::Command::new("msiexec")
+                    .args(argv.iter().map(String::as_str).collect::<Vec<_>>())
+                    .spawn()
+                    .context("spawning msiexec (perUser)")?;
+                Ok(child.id())
+            }
+            WindowsInstallFlavour::PerMachine => {
+                // Elevate via ShellExecuteExW + verb="runas" so UAC
+                // prompts (when caller is non-elevated) AND so msiexec
+                // gets the admin token it needs to write under
+                // %ProgramFiles%. Field bug 2026-05-10 PC50045: plain
+                // `Command::new("msiexec").args(["/i", path, "/qn"])`
+                // silently fails because /qn suppresses the UAC
+                // prompt on a perMachine manifest.
+                spawn_msiexec_elevated(&argv)
+            }
+        }
     }
     #[cfg(target_os = "linux")]
     {
@@ -746,6 +793,100 @@ fn spawn_installer_inner(installer_path: &std::path::Path) -> Result<u32> {
             installer_path
         )
     }
+}
+
+/// Launch msiexec with UAC elevation via `ShellExecuteExW` + verb=
+/// "runas". This is the perMachine path: the MSI's perMachine manifest
+/// requires admin rights, the Scheduled-Task / interactive-shell caller
+/// holds only a Limited token, so the OS must prompt for consent
+/// before msiexec gets a privileged token.
+///
+/// Returns the spawned msiexec's PID for the post-install watcher.
+/// Returns `Err` when UAC was declined OR no interactive session is
+/// present to display the dialog — the caller surfaces this to the
+/// operator (CLI: stderr message; service mode: log + retry next
+/// cycle).
+#[cfg(target_os = "windows")]
+fn spawn_msiexec_elevated(argv: &[String]) -> Result<u32> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
+    use windows_sys::Win32::System::Threading::GetProcessId;
+    use windows_sys::Win32::UI::Shell::{
+        SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
+    };
+
+    // Build wide-string buffers for ShellExecuteExW. The Win32 API
+    // wants null-terminated UTF-16; OsStr::encode_wide returns the
+    // codepoints sans terminator so we append a 0.
+    fn to_wide(s: &str) -> Vec<u16> {
+        std::ffi::OsStr::new(s)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+    // msiexec expects the args concatenated as a single string with
+    // spaces between. Paths are quoted to survive any embedded spaces
+    // in the temp-dir / installer name. Other args are bare.
+    let parameters = argv
+        .iter()
+        .map(|a| {
+            if a.contains(' ') {
+                format!("\"{a}\"")
+            } else {
+                a.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let verb_w = to_wide("runas");
+    let file_w = to_wide("msiexec.exe");
+    let params_w = to_wide(&parameters);
+
+    // SAFETY: SHELLEXECUTEINFOW is a plain POD struct; zero-init is
+    // valid. cbSize must match the struct size. All pointer fields
+    // outlive the call (locals on the stack live until after
+    // ShellExecuteExW returns). hProcess is initialised to NULL and
+    // populated by the API on success because SEE_MASK_NOCLOSEPROCESS
+    // is set.
+    let mut sei: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+    sei.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
+    sei.lpVerb = verb_w.as_ptr();
+    sei.lpFile = file_w.as_ptr();
+    sei.lpParameters = params_w.as_ptr();
+    sei.nShow = 1; // SW_SHOWNORMAL — the /qb! UI is allowed to draw
+
+    // SAFETY: all required fields populated above; passing a valid
+    // pointer to a stack-allocated struct.
+    let ok = unsafe { ShellExecuteExW(&mut sei) };
+    if ok == 0 {
+        let err = unsafe { GetLastError() };
+        // ERROR_CANCELLED = 1223 is the UAC-declined code. Other
+        // errors (file not found, etc.) surface as "elevation
+        // failed (err N)" — operator can paste into the issue.
+        if err == 1223 {
+            bail!("UAC consent declined — install not started");
+        }
+        bail!("ShellExecuteExW(runas) failed (err {err})");
+    }
+    if sei.hProcess.is_null() {
+        // The API returned success but didn't give us a process
+        // handle. Documented behaviour for cases like: no interactive
+        // session, the verb didn't actually launch anything, the
+        // launched program is already running and DDE-merged into
+        // an existing instance. None of those are recoverable here.
+        bail!("ShellExecuteExW returned success but no process handle (no interactive session?)");
+    }
+    // SAFETY: hProcess is a valid HANDLE from a successful
+    // SEE_MASK_NOCLOSEPROCESS call. We MUST CloseHandle after
+    // GetProcessId; the OS would otherwise leak the kernel object
+    // for the elevated process until the agent itself exits.
+    let pid = unsafe { GetProcessId(sei.hProcess) };
+    unsafe { CloseHandle(sei.hProcess) };
+    if pid == 0 {
+        bail!("GetProcessId on elevated msiexec returned 0");
+    }
+    Ok(pid)
 }
 
 fn spawn_watcher(
@@ -1367,5 +1508,67 @@ mod tests {
             )),
             WindowsInstallFlavour::PerMachine
         );
+    }
+
+    // ----- msiexec_argv (Plan rc.18 P1) -------------------------------
+
+    #[test]
+    fn msiexec_argv_per_user_uses_qn() {
+        // perUser MSI installs without UAC; /qn (fully silent) is
+        // correct AND the historical default — must not regress.
+        let argv = msiexec_argv(
+            std::path::Path::new(r"C:\Temp\roomler-agent.msi"),
+            WindowsInstallFlavour::PerUser,
+        );
+        assert_eq!(argv[0], "/i");
+        assert_eq!(argv[1], r"C:\Temp\roomler-agent.msi");
+        assert_eq!(argv[2], "/qn");
+        assert_eq!(argv[3], "/norestart");
+        assert_eq!(argv.len(), 4);
+    }
+
+    #[test]
+    fn msiexec_argv_per_machine_uses_qb_bang() {
+        // perMachine MSI requires UAC; /qn would suppress the UAC
+        // prompt and silently fail (field bug PC50045 2026-05-10).
+        // /qb! shows minimal progress UI but allows UAC to surface.
+        let argv = msiexec_argv(
+            std::path::Path::new(r"C:\Temp\roomler-agent-perMachine.msi"),
+            WindowsInstallFlavour::PerMachine,
+        );
+        assert_eq!(argv[2], "/qb!");
+        // Other args identical to perUser shape.
+        assert_eq!(argv[0], "/i");
+        assert_eq!(argv[3], "/norestart");
+    }
+
+    #[test]
+    fn msiexec_argv_always_includes_norestart() {
+        // Both flavours: /norestart prevents a surprise reboot during
+        // a service-context install. The post-install watcher restarts
+        // the agent itself; the OS reboot is never needed.
+        for flavour in [
+            WindowsInstallFlavour::PerUser,
+            WindowsInstallFlavour::PerMachine,
+        ] {
+            let argv = msiexec_argv(std::path::Path::new(r"C:\x.msi"), flavour);
+            assert!(
+                argv.iter().any(|a| a == "/norestart"),
+                "missing /norestart for {flavour:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn msiexec_argv_path_is_second_arg() {
+        // Argv order matters: msiexec expects `/i <path>` as the
+        // first two tokens. Locks against a future refactor that
+        // accidentally reorders.
+        let argv = msiexec_argv(
+            std::path::Path::new(r"D:\roomler-agent.msi"),
+            WindowsInstallFlavour::PerUser,
+        );
+        assert_eq!(argv[0], "/i");
+        assert_eq!(argv[1], r"D:\roomler-agent.msi");
     }
 }

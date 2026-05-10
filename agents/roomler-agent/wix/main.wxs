@@ -65,32 +65,13 @@
             DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.' />
 
         <!--
-          Detect the per-Machine flavour (different UpgradeCode) so we
-          can block dual-install. Two roomler-agent.exe binaries on one
-          host - one under %LOCALAPPDATA%\Programs, one under %ProgramFiles%
-          - is the worst kind of field bug: both work in isolation but
-          clobber each other on update (two updaters polling, two
-          autostart hooks racing for the instance lock). Refuse the
-          install with a clear message so the operator picks one path.
-          Mirror this Upgrade element with the symmetric one in
-          main-perMachine.wxs so EITHER MSI refuses to install over
-          the OTHER.
-          (XML rule: no consecutive dashes inside comments, hence the
-          dual-dash workaround above.)
+          rc.18: dropped the cross-flavour LaunchCondition refusal that
+          previously blocked install over the OTHER flavour. The
+          CleanupLegacyPerMachine custom action below now scrubs any
+          stale perMachine artefacts (SCM service + service-log dir)
+          before InstallFiles runs, so the operator can switch flavours
+          freely.
         -->
-        <Upgrade Id='2A8E9C2D-3F1A-5E3F-C2B4-7C2F3D8F5E02'>
-            <UpgradeVersion
-                Property='ROOMLER_AGENT_PERMACHINE_DETECTED'
-                Minimum='0.0.0'
-                IncludeMinimum='yes'
-                Maximum='99.99.99'
-                IncludeMaximum='yes'
-                OnlyDetect='yes' />
-        </Upgrade>
-
-        <Condition Message='Roomler Agent is already installed in per-Machine mode (under Program Files). Uninstall that version before installing the per-User version.'>
-            <![CDATA[NOT ROOMLER_AGENT_PERMACHINE_DETECTED OR Installed]]>
-        </Condition>
 
         <Media Id='1' Cabinet='media1.cab' EmbedCab='yes' />
         <Property Id='DiskPrompt' Value='Roomler Agent Installation' />
@@ -233,6 +214,27 @@
             Impersonate='yes'
             Return='ignore' />
 
+        <!--
+          rc.18: cross-flavour cleanup. When the operator installs the
+          perUser MSI over a prior perMachine install, this CA shells
+          out to the freshly-laid EXE to scrub the OTHER flavour's
+          stale artefacts (SCM service, service-log dir under
+          %PROGRAMDATA%). Runs Impersonated as the installing user;
+          service control needs admin so this is best-effort: a
+          non-admin user couldn't have had a live perMachine install
+          anyway. Return="ignore" so a cleanup glitch doesn't sink
+          the install (the on-disk EXE itself takes priority).
+          Same-flavour invocations (perUser over perUser) exit 0 via
+          the helper's fast-path.
+        -->
+        <CustomAction
+            Id='CleanupLegacyPerMachine'
+            FileKey='roomler_agent_exe'
+            ExeCommand='cleanup-legacy-install --target-flavour perUser'
+            Execute='deferred'
+            Impersonate='yes'
+            Return='ignore' />
+
         <InstallExecuteSequence>
             <!--
               Run RegisterAutostart on every fresh install, repair,
@@ -243,6 +245,15 @@
               old + install of the new, scheduled separately).
             -->
             <Custom Action='RegisterAutostart' After='InstallFiles'>
+                NOT (REMOVE="ALL")
+            </Custom>
+            <!--
+              rc.18: scrub the OTHER flavour's artefacts AFTER the
+              new EXE lands (so we can shell out to it) but BEFORE
+              RegisterAutostart (the freshly-registered Scheduled
+              Task is the live one). Skip during uninstall.
+            -->
+            <Custom Action='CleanupLegacyPerMachine' After='InstallFiles'>
                 NOT (REMOVE="ALL")
             </Custom>
             <!--

@@ -2113,6 +2113,25 @@ watch(
           )
           void uploadMany(files)
         },
+        // rc.18: anchor focus on the viewer wrapper itself. The
+        // composable's onPointerEnter blurs whatever was focused
+        // (typically a left-panel nav-drawer item the operator
+        // clicked before connecting) and `.focus()`-es this anchor
+        // so subsequent Enter/Space keypresses don't fire the
+        // nav-drawer item's keyboard activation.
+        focusAnchor: el as HTMLElement,
+        // rc.18: when Ctrl+C-auto-mirror succeeds, no snackbar
+        // (the browser clipboard silently has what the remote
+        // copied). When the browser refuses writeText (no user-
+        // gesture chain), surface the text + a Copy button so the
+        // operator can still get it.
+        onClipboardMirrored: (text, ok) => {
+          if (!ok && text) {
+            showError(
+              `Remote clipboard: "${text.slice(0, 60)}${text.length > 60 ? '…' : ''}" — browser blocked auto-paste`
+            )
+          }
+        },
       })
       ;(el as HTMLElement).focus()
       // Start watching the stage for size changes so Fit mode
