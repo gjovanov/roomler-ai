@@ -41,9 +41,9 @@ test.describe('Multi-Participant Chat (dedup)', () => {
     const room = await createRoomViaApi(ownerToken, tenantId, `general-${Date.now()}`)
     roomId = room.id
 
-    // All users join the room
-    for (const u of users) {
-      await joinRoomViaApi(u.token, tenantId, roomId)
+    // Owner is auto-joined as creator; only peer users need explicit join.
+    for (let i = 1; i < users.length; i++) {
+      await joinRoomViaApi(users[i]!.token, tenantId, roomId)
     }
   })
 
