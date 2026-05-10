@@ -294,6 +294,9 @@ system-context = []
 [dev-dependencies]
 tokio-test = { workspace = true }
 tempfile = { workspace = true }
+# File-DC integration test (tests/file_dc.rs) needs the zip crate
+# to unpack the agent's streaming-zip output and verify content.
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 # ---------------------------------------------------------------------------
 # Packaging metadata

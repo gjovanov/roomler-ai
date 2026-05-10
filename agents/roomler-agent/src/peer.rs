@@ -2109,7 +2109,12 @@ fn attach_clipboard_handler(dc: Arc<RTCDataChannel>, session_id: bson::oid::Obje
 /// transfer. The handler enforces one active transfer at a time and
 /// replies with `files:accepted` / `files:progress` / `files:complete`
 /// / `files:error` over the same channel.
-fn attach_files_handler(dc: Arc<RTCDataChannel>, session_id: bson::oid::ObjectId) {
+///
+/// Public so `crates/tests/src/file_dc_tests.rs` can attach the same
+/// dispatcher to a loopback DC and lock the wire format end-to-end.
+/// The dispatcher itself stays private (free fns below) — only the
+/// wiring entry point is needed across crates.
+pub fn attach_files_handler(dc: Arc<RTCDataChannel>, session_id: bson::oid::ObjectId) {
     let handler = crate::files::FilesHandler::new();
     let dc_for_handler = dc.clone();
     let handler_for_close = handler.clone();
