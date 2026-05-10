@@ -43,9 +43,11 @@ test.describe('Profile', () => {
   test('profile shows initial avatar when no avatar URL set', async ({ page }) => {
     await page.goto(`/profile/${userId}`)
 
-    // The avatar should show the first letter of the display name
+    // The avatar should show the first letter of the display name.
+    // Scope to main — the AppLayout app-bar avatar also renders the
+    // same initial and would trip strict-mode otherwise.
     const initial = user.displayName.charAt(0).toUpperCase()
-    await expect(page.locator('.v-avatar').getByText(initial)).toBeVisible({ timeout: 10000 })
+    await expect(page.locator('main .v-avatar').getByText(initial)).toBeVisible({ timeout: 10000 })
   })
 
   test('navigate to profile edit page', async ({ page }) => {
