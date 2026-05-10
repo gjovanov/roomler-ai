@@ -24,7 +24,7 @@ test.describe('Chat Pagination', () => {
 
     const room = await createRoomViaApi(token, tenantId, 'pagination-room', true)
     roomId = room.id
-    await joinRoomViaApi(token, tenantId, roomId)
+    // Creator auto-joined — explicit joinRoomViaApi(token,...) returns 409.
   })
 
   test('chat loads messages after sending many via API', async ({ page }) => {

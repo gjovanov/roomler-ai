@@ -38,7 +38,7 @@ test.describe('Notifications', () => {
     const room = await createRoomViaApi(adminToken, tenantId, 'notif-room', true)
     roomId = room.id
 
-    await joinRoomViaApi(adminToken, tenantId, roomId)
+    // Admin (creator) is auto-joined; only member needs explicit join.
     await joinRoomViaApi(memberToken, tenantId, roomId)
   })
 

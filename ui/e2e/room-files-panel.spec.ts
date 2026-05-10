@@ -23,7 +23,8 @@ test.describe('Room Files Panel', () => {
 
     const room = await createRoomViaApi(token, tenantId, 'general', true)
     roomId = room.id
-    await joinRoomViaApi(token, tenantId, roomId)
+    // Creator is auto-joined by the API — calling joinRoomViaApi again
+    // returns 409, which throws and skips the test. Drop the redundant call.
 
     await loginViaUi(page, user.username, user.password)
   })
