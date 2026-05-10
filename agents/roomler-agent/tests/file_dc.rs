@@ -82,16 +82,12 @@ impl DcSide {
     }
 
     /// Wait for the next inbound string frame and parse it as JSON.
-    async fn recv_json<T: serde::de::DeserializeOwned>(
-        &mut self,
-        timeout: Duration,
-    ) -> Result<T> {
+    async fn recv_json<T: serde::de::DeserializeOwned>(&mut self, timeout: Duration) -> Result<T> {
         let s = tokio::time::timeout(timeout, self.strings.recv())
             .await
             .map_err(|_| anyhow!("recv_json timed out after {timeout:?}"))?
             .ok_or_else(|| anyhow!("inbound string channel closed"))?;
-        serde_json::from_str(&s)
-            .with_context(|| format!("parse inbound JSON: {s}"))
+        serde_json::from_str(&s).with_context(|| format!("parse inbound JSON: {s}"))
     }
 
     /// Wait for the next inbound string frame and return it raw.
@@ -154,8 +150,7 @@ impl DcSide {
         // Drain remaining chunks. The terminal frame may have arrived
         // before its preceding chunks were polled; brief grace
         // window catches late-arriving frames before we return.
-        let drain_deadline =
-            tokio::time::Instant::now() + Duration::from_millis(250);
+        let drain_deadline = tokio::time::Instant::now() + Duration::from_millis(250);
         loop {
             tokio::select! {
                 biased;
@@ -221,7 +216,10 @@ async fn open_files_dc() -> Result<DcSide> {
     }));
 
     // SDP offer/answer exchange — direct function calls, no network.
-    let offer = browser_pc.create_offer(None).await.context("create_offer")?;
+    let offer = browser_pc
+        .create_offer(None)
+        .await
+        .context("create_offer")?;
     browser_pc
         .set_local_description(offer.clone())
         .await
@@ -230,7 +228,10 @@ async fn open_files_dc() -> Result<DcSide> {
         .set_remote_description(offer)
         .await
         .context("agent set_remote")?;
-    let answer = agent_pc.create_answer(None).await.context("create_answer")?;
+    let answer = agent_pc
+        .create_answer(None)
+        .await
+        .context("create_answer")?;
     agent_pc
         .set_local_description(answer.clone())
         .await
@@ -484,8 +485,8 @@ async fn upload_single_file_round_trip() {
         // canonicalises to `\\?\C:\Users\…\Temp\…`. Strip the
         // verbatim prefix on Windows so the assertion isn't fragile.
         let tmp_canon = std::fs::canonicalize(tmp.path()).unwrap();
-        let accepted_canon = std::fs::canonicalize(&accepted_pb)
-            .unwrap_or_else(|_| accepted_pb.clone());
+        let accepted_canon =
+            std::fs::canonicalize(&accepted_pb).unwrap_or_else(|_| accepted_pb.clone());
         assert!(
             accepted_canon.starts_with(&tmp_canon),
             "accepted path {} should be inside tempdir {}",
@@ -560,10 +561,8 @@ async fn run_upload(
     };
 
     side.send_chunk(payload).await?;
-    side.send_json(&BrowserToAgent::End {
-        id: id.to_string(),
-    })
-    .await?;
+    side.send_json(&BrowserToAgent::End { id: id.to_string() })
+        .await?;
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
     loop {
@@ -762,10 +761,7 @@ async fn download_nonexistent_path_errors() {
         .await
         .expect("send get");
 
-        let resp: AgentToBrowser = side
-            .recv_json(Duration::from_secs(5))
-            .await
-            .expect("recv");
+        let resp: AgentToBrowser = side.recv_json(Duration::from_secs(5)).await.expect("recv");
         match resp {
             AgentToBrowser::Error {
                 id: ack_id,
@@ -909,9 +905,12 @@ async fn folder_zip_round_trip() {
         tokio::fs::write(root.join("sub").join("b.txt"), b"bravo charlie")
             .await
             .expect("write b");
-        tokio::fs::write(root.join("sub").join("deeper").join("c.txt"), b"charlie delta")
-            .await
-            .expect("write c");
+        tokio::fs::write(
+            root.join("sub").join("deeper").join("c.txt"),
+            b"charlie delta",
+        )
+        .await
+        .expect("write c");
 
         let id = "zip-1".to_string();
         side.send_json(&BrowserToAgent::GetFolder {
@@ -935,7 +934,10 @@ async fn folder_zip_round_trip() {
                 mime,
             } => {
                 assert_eq!(ack_id, id);
-                assert!(name.ends_with(".zip"), "offer.name={name} should end with .zip");
+                assert!(
+                    name.ends_with(".zip"),
+                    "offer.name={name} should end with .zip"
+                );
                 assert!(size.is_none(), "streaming zip → size unknown");
                 assert_eq!(mime.as_deref(), Some("application/zip"));
             }
@@ -946,7 +948,10 @@ async fn folder_zip_round_trip() {
             .collect_until_eof(Duration::from_secs(15))
             .await
             .expect("collect zip");
-        assert!(terminal.contains("\"files:eof\""), "expected eof, got {terminal}");
+        assert!(
+            terminal.contains("\"files:eof\""),
+            "expected eof, got {terminal}"
+        );
         assert!(!zip_bytes.is_empty(), "zip bytes received");
 
         // Verify content.
@@ -964,7 +969,10 @@ async fn folder_zip_round_trip() {
             std::io::Read::read_to_end(&mut entry, &mut buf).expect("read entry");
             got.insert(name, buf);
         }
-        assert_eq!(got.get("a.txt").map(|v| v.as_slice()), Some(&b"alpha bravo"[..]));
+        assert_eq!(
+            got.get("a.txt").map(|v| v.as_slice()),
+            Some(&b"alpha bravo"[..])
+        );
         assert_eq!(
             got.get("sub/b.txt").map(|v| v.as_slice()),
             Some(&b"bravo charlie"[..])
@@ -999,10 +1007,7 @@ async fn folder_zip_rejects_file_path() {
         .await
         .expect("send get-folder");
 
-        let resp: AgentToBrowser = side
-            .recv_json(Duration::from_secs(5))
-            .await
-            .expect("recv");
+        let resp: AgentToBrowser = side.recv_json(Duration::from_secs(5)).await.expect("recv");
         match resp {
             AgentToBrowser::Error {
                 id: ack_id,
@@ -1054,10 +1059,7 @@ async fn folder_zip_sanitises_traversal_in_filenames() {
         .await
         .expect("send");
 
-        let _offer: AgentToBrowser = side
-            .recv_json(Duration::from_secs(5))
-            .await
-            .expect("offer");
+        let _offer: AgentToBrowser = side.recv_json(Duration::from_secs(5)).await.expect("offer");
         let (zip_bytes, _terminal) = side
             .collect_until_eof(Duration::from_secs(10))
             .await
@@ -1231,11 +1233,9 @@ async fn cancel_mid_download_releases_outgoing() {
         .expect("send get");
         // Issue cancel as soon as we can. With a small payload the
         // download may complete first — that's OK.
-        side.send_json(&BrowserToAgent::Cancel {
-            id: id.clone(),
-        })
-        .await
-        .expect("send cancel");
+        side.send_json(&BrowserToAgent::Cancel { id: id.clone() })
+            .await
+            .expect("send cancel");
 
         // Drain whatever the agent emits to terminate this transfer.
         // Could be: offer → chunk → eof, OR offer → error.
