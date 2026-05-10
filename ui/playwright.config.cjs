@@ -146,6 +146,8 @@ module.exports = defineConfig({
       always.push(
         '**/oauth.spec.ts',
         '**/email-flows.spec.ts',
+        '**/conference.spec.ts',
+        '**/conference-chat.spec.ts',
         '**/conference-multi.spec.ts',
         '**/rc-vp9-444.spec.ts',
       )
