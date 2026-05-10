@@ -78,25 +78,13 @@
             DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.' />
 
         <!--
-          Detect the per-User flavour (different UpgradeCode) so we
-          refuse to install on a host that already has it. Symmetric
-          with the per-User MSI's check for OUR UpgradeCode. See the
-          comment in main.wxs for rationale.
-          (XML rule: no consecutive dashes inside comments.)
+          rc.18: dropped the cross-flavour LaunchCondition refusal that
+          previously blocked install over the perUser flavour. The
+          CleanupLegacyPerUser custom action below now scrubs any
+          stale perUser artefacts (Scheduled Task + user data dirs
+          reached via the active-session user-profile bridge) before
+          InstallFiles runs.
         -->
-        <Upgrade Id='1F2D7B1C-8B2F-4D2E-B1A3-6B1E2C7E4D91'>
-            <UpgradeVersion
-                Property='ROOMLER_AGENT_PERUSER_DETECTED'
-                Minimum='0.0.0'
-                IncludeMinimum='yes'
-                Maximum='99.99.99'
-                IncludeMaximum='yes'
-                OnlyDetect='yes' />
-        </Upgrade>
-
-        <Condition Message='Roomler Agent is already installed in per-User mode (under %LOCALAPPDATA%). Uninstall that version before installing the per-Machine version.'>
-            <![CDATA[NOT ROOMLER_AGENT_PERUSER_DETECTED OR Installed]]>
-        </Condition>
 
         <Media Id='1' Cabinet='media1.cab' EmbedCab='yes' />
         <Property Id='DiskPrompt' Value='Roomler Agent Installation' />
@@ -232,8 +220,39 @@
             Impersonate='no'
             Return='ignore' />
 
+        <!--
+          rc.18: cross-flavour cleanup. When the operator installs the
+          perMachine MSI over a prior perUser install, this CA shells
+          out to the freshly-laid EXE to scrub the perUser flavour's
+          stale Scheduled Task + user-data dirs. Runs deferred + non-
+          impersonated (SYSTEM) so it can: (a) delete a per-user task
+          via `schtasks /Delete /TN RoomlerAgent /F` (SYSTEM has the
+          rights), (b) reach into the active-session user's
+          %LOCALAPPDATA% / %APPDATA% via the WTSQueryUserToken-backed
+          `active_user_profile_root()` (system-context feature). On
+          headless installs with no logged-in user the helper logs a
+          skip and returns 0. Return="ignore" so a cleanup glitch
+          doesn't sink the install. Same-flavour invocations exit 0
+          via the helper's fast-path.
+        -->
+        <CustomAction
+            Id='CleanupLegacyPerUser'
+            FileKey='roomler_agent_exe'
+            ExeCommand='cleanup-legacy-install --target-flavour perMachine'
+            Execute='deferred'
+            Impersonate='no'
+            Return='ignore' />
+
         <InstallExecuteSequence>
             <Custom Action='RegisterService' After='InstallFiles'>
+                NOT (REMOVE="ALL")
+            </Custom>
+            <!--
+              rc.18: scrub the perUser flavour AFTER the new EXE lands
+              but BEFORE RegisterService (the new SCM service takes
+              over). Skip during uninstall.
+            -->
+            <Custom Action='CleanupLegacyPerUser' After='InstallFiles'>
                 NOT (REMOVE="ALL")
             </Custom>
             <Custom Action='UnregisterService' Before='RemoveFiles'>

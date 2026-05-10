@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Roomler Agent — Settings</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Settings</h1>
+      <nav>
+        <a href="#index.html">Status</a>
+        <a href="#enrollment.html">Onboarding</a>
+        <a href="#settings.html" class="active">Settings</a>
+      </nav>
+    </header>
+    <main>
+      <section>
+        <h2 class="muted small">Device name</h2>
+        <form id="rename-form" autocomplete="off">
+          <input
+            type="text"
+            id="rename-input"
+            placeholder="(loading current name…)"
+            spellcheck="false"
+            autocapitalize="off"
+          />
+          <div class="actions">
+            <button type="submit" class="primary">Rename device</button>
+          </div>
+        </form>
+        <p class="muted small">
+          Takes effect on the next WS reconnect — the agent re-sends
+          <code>rc:agent.hello</code> with the new name and the controller's
+          agents list updates.
+        </p>
+      </section>
+
+      <section style="margin-top:24px">
+        <h2 class="muted small">Re-enrollment</h2>
+        <form id="re-enroll-form" autocomplete="off">
+          <label for="re-token">New enrollment token</label>
+          <textarea
+            id="re-token"
+            rows="4"
+            spellcheck="false"
+            autocapitalize="off"
+            placeholder="eyJ…"
+          ></textarea>
+          <div class="actions">
+            <button type="submit">Re-enrol with new token</button>
+          </div>
+        </form>
+        <p class="muted small">
+          Used when the agent's existing token has been revoked. Server URL
+          and device name from the existing config are preserved.
+        </p>
+      </section>
+
+      <div id="settings-result" hidden></div>
+    </main>
+    <script src="settings.js"></script>
+  </body>
+</html>

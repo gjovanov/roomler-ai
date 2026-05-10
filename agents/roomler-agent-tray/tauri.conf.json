@@ -1,0 +1,53 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Roomler Agent Tray",
+  "version": "0.3.0-rc.18",
+  "identifier": "ai.roomler.agent-tray",
+  "build": {
+    "frontendDist": "../src/front",
+    "devUrl": "http://localhost:1430"
+  },
+  "app": {
+    "trayIcon": {
+      "iconPath": "icons/tray.png",
+      "iconAsTemplate": false
+    },
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Roomler Agent",
+        "width": 480,
+        "height": 560,
+        "resizable": false,
+        "decorations": true,
+        "visible": false,
+        "url": "index.html"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["msi", "dmg", "app"],
+    "icon": [
+      "icons/icon.ico",
+      "icons/icon.png"
+    ],
+    "category": "Productivity",
+    "shortDescription": "Roomler Agent companion tray",
+    "longDescription": "System-tray companion to the Roomler Agent. Provides one-click onboarding (token paste + device name), service status, manual self-update, and consent prompt approval.",
+    "windows": {
+      "wix": {
+        "language": "en-US"
+      }
+    }
+  },
+  "plugins": {
+    "shell": {
+      "open": true
+    }
+  }
+}
