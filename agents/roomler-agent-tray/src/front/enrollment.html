@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Roomler Agent — Onboarding</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Onboarding</h1>
+      <nav>
+        <a href="#index.html">Status</a>
+        <a href="#enrollment.html" class="active">Onboarding</a>
+        <a href="#settings.html">Settings</a>
+      </nav>
+    </header>
+    <main>
+      <p class="muted">
+        Paste an <strong>enrollment token</strong> from a Roomler tenant admin
+        (Admin → Agents → Generate enrollment token). The token is single-use
+        and expires after 10 minutes.
+      </p>
+      <form id="enroll-form" autocomplete="off">
+        <label for="server">Server URL</label>
+        <input
+          type="text"
+          id="server"
+          name="server"
+          value="https://roomler.ai"
+          spellcheck="false"
+          autocapitalize="off"
+          required
+        />
+
+        <label for="device-name">Device name</label>
+        <input
+          type="text"
+          id="device-name"
+          name="device-name"
+          placeholder="will default to this machine's hostname"
+          spellcheck="false"
+          autocapitalize="off"
+          required
+        />
+
+        <label for="token">Enrollment token</label>
+        <textarea
+          id="token"
+          name="token"
+          rows="5"
+          placeholder="eyJ…"
+          spellcheck="false"
+          autocapitalize="off"
+          required
+        ></textarea>
+
+        <div class="actions">
+          <button type="submit" id="btn-enroll" class="primary">Enrol this device</button>
+        </div>
+      </form>
+      <div id="enroll-result" hidden></div>
+    </main>
+    <script src="enrollment.js"></script>
+  </body>
+</html>

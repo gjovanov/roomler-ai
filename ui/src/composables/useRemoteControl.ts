@@ -2081,7 +2081,25 @@ export function useRemoteControl() {
    */
   function attachInput(
     surface: HTMLElement,
-    options?: { onFilesPasted?: (files: File[]) => void }
+    options?: {
+      onFilesPasted?: (files: File[]) => void
+      /** Element to focus on pointerenter to steal focus from left-
+       *  panel nav-drawer items / page buttons. Should have
+       *  `tabindex="-1"` so it doesn't enter the Tab order but
+       *  accepts programmatic `.focus()`. Field bug rc.17: clicking a
+       *  Dashboard / Rooms / Files nav item then connecting to the
+       *  viewer left that `<v-list-item>` focused; the first Enter /
+       *  Space pressed over the viewer fired Vuetify's keyboard-
+       *  activation `@click` and navigated away. */
+      focusAnchor?: HTMLElement
+      /** Called after a Ctrl+C-over-viewer auto-mirror attempt.
+       *  `ok === true`  → text written to `navigator.clipboard` OK.
+       *  `ok === false` → browser refused `writeText` (no permission /
+       *  no user-gesture chain); caller shows a snackbar with the
+       *  text + a manual Copy button so the operator can still get
+       *  the content. */
+      onClipboardMirrored?: (text: string, ok: boolean) => void
+    }
   ): () => void {
     // Locate the <video> once, fall back gracefully if the layout changes.
     const findVideo = () =>
@@ -2204,7 +2222,33 @@ export function useRemoteControl() {
     // remote only. When false, the controller keeps normal browser UX
     // (Ctrl+T opens a new tab, Ctrl+F triggers find, etc.).
     let pointerInside = false
-    function onPointerEnter() { pointerInside = true }
+    function onPointerEnter() {
+      pointerInside = true
+      // rc.18: steal focus from whatever the operator clicked last
+      // (typically a left-panel nav-drawer item) so Enter / Space /
+      // Arrow keys pressed over the viewer DON'T fire the focused
+      // element's `@click` keyboard-activation handler. Two-step:
+      // blur the active element + focus our anchor. Anchor has
+      // tabindex="-1" so it accepts programmatic focus without
+      // entering Tab order.
+      if (options?.focusAnchor) {
+        const active = document.activeElement
+        if (active instanceof HTMLElement && active !== options.focusAnchor) {
+          active.blur()
+        }
+        try {
+          options.focusAnchor.focus({ preventScroll: true })
+        } catch {
+          /* old browsers without `preventScroll`: blurring above is
+             enough to fix the immediate bug; the focus call is
+             defence-in-depth */
+        }
+      } else if (document.activeElement instanceof HTMLElement) {
+        // No anchor given by caller — just blur. Active element ends
+        // up on <body>; harmless.
+        document.activeElement.blur()
+      }
+    }
     function onPointerLeave() { pointerInside = false }
 
     // Phase 5 (file-DC v2) — deferred Ctrl+V over viewer.
@@ -2259,6 +2303,63 @@ export function useRemoteControl() {
       return true
     }
 
+    /** Ctrl+C over viewer (rc.18 P5). Mirrors the Ctrl+V helper's
+     *  carve-out for page-text-field focus so the operator's normal
+     *  copy-from-form-field doesn't get hijacked. */
+    function isCtrlCOverViewer(ev: KeyboardEvent): boolean {
+      if (!pointerInside) return false
+      if (ev.code !== 'KeyC') return false
+      if (!(ev.ctrlKey || ev.metaKey)) return false
+      const target = ev.target as Element | null
+      if (target) {
+        const tag = target.tagName
+        if (tag === 'INPUT' || tag === 'TEXTAREA') return false
+        const editable = (target as HTMLElement).isContentEditable
+        if (editable) return false
+      }
+      return true
+    }
+
+    /** Schedule a 25 ms-delayed read of the host's clipboard + mirror
+     *  to the browser's `navigator.clipboard`. 25 ms is enough for
+     *  the remote app to finish its copy (well under human perception)
+     *  and avoids a race with the agent's Ctrl+C HID handling.
+     *
+     *  On failure (DC closed, agent doesn't reply within 5 s, or
+     *  `writeText` is refused by the browser's user-gesture policy)
+     *  the caller's `onClipboardMirrored(text, false)` fires so the
+     *  parent component can surface a snackbar with a manual Copy
+     *  button — keeps the operator's intent reachable.
+     */
+    function scheduleClipboardMirror() {
+      const delayMs = 25
+      setTimeout(() => {
+        // Fire-and-forget. We deliberately don't await in the
+        // keydown handler — the host needs to process Ctrl+C before
+        // its clipboard reflects the copy.
+        getAgentClipboard()
+          .then(async (text: string) => {
+            if (!text) return // remote clipboard was empty; no-op
+            let ok = false
+            try {
+              await navigator.clipboard.writeText(text)
+              ok = true
+            } catch {
+              // Browser denied (no user-gesture chain, no permission,
+              // or no clipboard-write API in this context). The
+              // callback exposes the text for a fallback path.
+              ok = false
+            }
+            options?.onClipboardMirrored?.(text, ok)
+          })
+          .catch(() => {
+            // Agent didn't respond, DC closed, etc. — silent drop;
+            // the operator's local clipboard stays unchanged, same
+            // as pre-rc.18 behaviour.
+          })
+      }, delayMs)
+    }
+
     function onKey(ev: KeyboardEvent, down: boolean) {
       // Ctrl+V deferral path. Keep preventDefault on keydown so the
       // subsequent `paste` event fires (and so the browser doesn't
@@ -2298,6 +2399,11 @@ export function useRemoteControl() {
           }, 50)
           pendingCtrlV = { mods, timer }
         }
+        // rc.18: stop propagation so a focused nav-drawer item
+        // doesn't ALSO see the Ctrl+V and trigger its own
+        // keyboard-activation. Capture-phase keydown means we run
+        // before the focused element's bubble-phase handlers.
+        if (pointerInside) ev.stopPropagation()
         // keyup with a pending deferral: don't emit a stray V-up.
         // The flush path emits both down + up together.
         return
@@ -2306,10 +2412,25 @@ export function useRemoteControl() {
       const action = decideKeyAction(ev, down, (k) => ev.getModifierState(k))
       if (action.kind === 'drop') return
       if (shouldPreventDefault(ev, pointerInside)) ev.preventDefault()
+      // rc.18: stop propagation when pointer is over viewer so a
+      // focused page button / nav-drawer item doesn't ALSO see this
+      // keystroke and fire its own keyboard-activation `@click`. The
+      // capture-phase registration of this listener (see below) means
+      // stopPropagation here cuts the bubble path before any focused
+      // descendant runs its handler.
+      if (pointerInside) ev.stopPropagation()
       if (action.kind === 'text') {
         sendInput({ t: 'key_text', text: action.text })
       } else {
         sendInput({ t: 'key', code: action.code, down: action.down, mods: action.mods })
+      }
+      // rc.18: after a Ctrl+C-over-viewer is forwarded to the host,
+      // schedule the auto-mirror of the host's clipboard back to the
+      // browser. Only fire on `down` (Ctrl+C produces a down event;
+      // we don't want to fire twice on up). Carve-outs (focus inside
+      // INPUT/TEXTAREA/contenteditable) live in isCtrlCOverViewer.
+      if (down && isCtrlCOverViewer(ev)) {
+        scheduleClipboardMirror()
       }
     }
 
@@ -2372,9 +2493,15 @@ export function useRemoteControl() {
     // Window-level listener with our own pendingCtrlV gating means
     // we only intercept paste events that follow a deferred Ctrl+V.
     window.addEventListener('paste', onPaste)
-    // Keys are captured on window so they fire even if the video loses focus.
-    window.addEventListener('keydown', onKeyDown)
-    window.addEventListener('keyup', onKeyUp)
+    // rc.18: register on CAPTURE phase so we run BEFORE any focused
+    // element's bubble-phase handlers. Combined with the per-handler
+    // `stopPropagation` when pointer is inside, this stops a focused
+    // nav-drawer item from receiving Enter/Space/etc. while the
+    // operator is driving the remote. Outside the viewer the
+    // stopPropagation is gated off, so normal browser shortcuts
+    // (Tab navigation, Esc closing dialogs) still work.
+    window.addEventListener('keydown', onKeyDown, { capture: true })
+    window.addEventListener('keyup', onKeyUp, { capture: true })
 
     return () => {
       surface.removeEventListener('pointermove', onPointerMove)
@@ -2385,8 +2512,9 @@ export function useRemoteControl() {
       surface.removeEventListener('wheel', onWheel)
       surface.removeEventListener('contextmenu', onContextMenu)
       window.removeEventListener('paste', onPaste)
-      window.removeEventListener('keydown', onKeyDown)
-      window.removeEventListener('keyup', onKeyUp)
+      // Same `capture: true` as the add — required for matching.
+      window.removeEventListener('keydown', onKeyDown, { capture: true })
+      window.removeEventListener('keyup', onKeyUp, { capture: true })
       // Drop any in-flight deferral; otherwise its 50 ms timer would
       // fire after teardown and call sendInput on a closed channel.
       if (pendingCtrlV?.timer) clearTimeout(pendingCtrlV.timer)

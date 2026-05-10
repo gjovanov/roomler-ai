@@ -113,6 +113,84 @@ pub struct AgentConfig {
     /// crash on its first run.
     #[serde(default)]
     pub last_run_unhealthy: bool,
+
+    /// Last config-schema version this file was migrated to. Used by
+    /// [`migrate`] to decide which migration steps to apply at startup.
+    /// `None` (or missing in TOML) on pre-rc.18 configs — those run
+    /// through the rc.18 migration set and the field is then persisted.
+    /// Forward-compat: future RCs key migrations off this string
+    /// (e.g. `match version { Some("0.3.0-rc.18") => apply_rc18_to_rc19, … }`).
+    #[serde(default)]
+    pub config_schema_version: Option<String>,
+}
+
+/// Current schema version. Bumped whenever [`migrate`] gains a new
+/// step. Persisted into the config file by the migration so subsequent
+/// runs short-circuit the migration check.
+pub const CURRENT_SCHEMA_VERSION: &str = "0.3.0-rc.18";
+
+/// Apply schema migrations to `cfg` in place. Returns `true` when the
+/// caller should persist the mutated config via [`save`]. Safe to call
+/// on a freshly-loaded config of any age — same-version configs return
+/// `false` after a no-op pass.
+///
+/// Migrations applied (rc.18 set):
+/// 1. Trim trailing slash on `server_url` (older enrollment flows
+///    occasionally left one in; harmless until something concatenates
+///    a path).
+/// 2. If `last_known_good_version` is a pre-rc.18 string (any 0.1.x or
+///    0.2.x), reset `crash_count = 0` so the historical counter
+///    doesn't trip the rc.18 rollback path.
+/// 3. Stamp `config_schema_version = Some(CURRENT_SCHEMA_VERSION)` if
+///    not already current.
+///
+/// Note: defaults for new fields (`enable_remote_browse`,
+/// `auto_grant_session`, etc.) are applied at deserialize time by
+/// `#[serde(default = "fn")]`. The migration's job is to ensure the
+/// on-disk file matches the in-memory shape — so a future operator
+/// reading `config.toml` sees ALL fields the running agent actually
+/// uses, not just the ones they explicitly set when first enrolling.
+pub fn migrate(cfg: &mut AgentConfig) -> bool {
+    if cfg
+        .config_schema_version
+        .as_deref()
+        .is_some_and(|v| v == CURRENT_SCHEMA_VERSION)
+    {
+        // Already on this schema; no-op.
+        return false;
+    }
+
+    let mut changed = false;
+
+    // 1. Trim trailing slash on server_url.
+    let trimmed = cfg.server_url.trim_end_matches('/').to_string();
+    if trimmed != cfg.server_url {
+        cfg.server_url = trimmed;
+        changed = true;
+    }
+
+    // 2. Reset crash_count when last_known_good_version is from a
+    //    pre-rc.18 branch. The rollback heuristic is keyed off this
+    //    counter; carrying it across branches could trip rollback
+    //    against a healthy rc.18 install.
+    if let Some(ref v) = cfg.last_known_good_version
+        && (v.starts_with("0.1.") || v.starts_with("0.2."))
+        && cfg.crash_count > 0
+    {
+        cfg.crash_count = 0;
+        cfg.last_crash_unix = 0;
+        changed = true;
+    }
+
+    // 3. Stamp the new schema version. ALWAYS persist after any
+    //    migration ran, even if no other field changed — that's how
+    //    we mark the file as having been processed.
+    if cfg.config_schema_version.as_deref() != Some(CURRENT_SCHEMA_VERSION) {
+        cfg.config_schema_version = Some(CURRENT_SCHEMA_VERSION.to_string());
+        changed = true;
+    }
+
+    changed
 }
 
 /// How long a fresh run must survive before we promote its version
@@ -338,6 +416,7 @@ mod tests {
             last_crash_unix: 0,
             rollback_attempted: false,
             last_run_unhealthy: false,
+            config_schema_version: None,
         }
     }
 
@@ -474,6 +553,81 @@ mod tests {
         assert!(!cfg.last_run_unhealthy);
         assert_eq!(cfg.crash_count, 2, "clean shutdown preserves crash history");
         assert_eq!(cfg.last_crash_unix, 1_000_000);
+    }
+
+    // ---- Migration tests (rc.18 P4) ---------------------------------
+
+    #[test]
+    fn migrate_pre_rc18_stamps_schema_version() {
+        // Old config has no version field. Migration runs the rc.18
+        // step set and stamps CURRENT_SCHEMA_VERSION so subsequent
+        // launches no-op.
+        let mut cfg = fixture();
+        assert!(cfg.config_schema_version.is_none());
+        let changed = migrate(&mut cfg);
+        assert!(changed, "first migration must rewrite the config");
+        assert_eq!(
+            cfg.config_schema_version.as_deref(),
+            Some(CURRENT_SCHEMA_VERSION)
+        );
+    }
+
+    #[test]
+    fn migrate_same_schema_is_noop() {
+        // Second launch on the same version: migrate returns false,
+        // caller skips the save.
+        let mut cfg = fixture();
+        cfg.config_schema_version = Some(CURRENT_SCHEMA_VERSION.to_string());
+        let changed = migrate(&mut cfg);
+        assert!(!changed, "same-version migration must be a no-op");
+    }
+
+    #[test]
+    fn migrate_trims_trailing_slash_on_server_url() {
+        let mut cfg = fixture();
+        cfg.server_url = "https://example.invalid/".into();
+        let changed = migrate(&mut cfg);
+        assert!(changed);
+        assert_eq!(cfg.server_url, "https://example.invalid");
+    }
+
+    #[test]
+    fn migrate_no_trailing_slash_to_trim() {
+        // server_url already clean; ONLY the schema version stamp
+        // counts as a change.
+        let mut cfg = fixture();
+        cfg.server_url = "https://example.invalid".into();
+        let changed = migrate(&mut cfg);
+        assert!(changed); // schema version stamp
+        assert_eq!(cfg.server_url, "https://example.invalid");
+    }
+
+    #[test]
+    fn migrate_resets_crash_count_from_pre_rc18_branch() {
+        // last_known_good_version from 0.2.x with a live crash counter:
+        // those crashes happened on a different branch, the counter
+        // must not trip rollback against rc.18.
+        let mut cfg = fixture();
+        cfg.last_known_good_version = Some("0.2.7".into());
+        cfg.crash_count = 2;
+        cfg.last_crash_unix = 1_700_000_000;
+        let changed = migrate(&mut cfg);
+        assert!(changed);
+        assert_eq!(cfg.crash_count, 0);
+        assert_eq!(cfg.last_crash_unix, 0);
+    }
+
+    #[test]
+    fn migrate_preserves_crash_count_for_same_branch() {
+        // 0.3.x crash counter is still relevant when running 0.3.x —
+        // don't wipe it.
+        let mut cfg = fixture();
+        cfg.last_known_good_version = Some("0.3.0-rc.16".into());
+        cfg.crash_count = 1;
+        cfg.last_crash_unix = 1_700_000_000;
+        migrate(&mut cfg);
+        assert_eq!(cfg.crash_count, 1, "0.3.x history must be preserved");
+        assert_eq!(cfg.last_crash_unix, 1_700_000_000);
     }
 
     #[test]
