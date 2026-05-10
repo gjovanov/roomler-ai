@@ -865,6 +865,30 @@ export function useRemoteControl() {
     }
   }
 
+  /** Type literal text on the remote host. Used by the on-screen
+   *  mobile keyboard and the IME composition path: the agent's
+   *  `enigo.text()` invokes the OS Unicode-typing API, so emoji /
+   *  CJK / accented Latin all round-trip without any HID-code
+   *  mapping on the browser side. Safe to call when the input
+   *  channel isn't open — silent drop. */
+  function sendKeyText(text: string) {
+    if (!text) return
+    sendInput({ t: 'key_text', text })
+  }
+
+  /** Send a HID key event. Used by the mobile keyboard's special-
+   *  key toolbar (Esc/Tab/Enter/Backspace/arrows + modifier keys).
+   *  Mirrors the wire shape of the regular physical-key path. Pass
+   *  the same `code` / `down` / `mods` triple as `decideKeyAction`
+   *  produces. Safe to call when the input channel isn't open.
+   *
+   *  `mods` bitfield: 0x01 = Ctrl, 0x02 = Shift, 0x04 = Alt,
+   *  0x08 = Meta/Win — matches `kbdCodeToHid` callers throughout
+   *  the codebase. */
+  function sendKey(code: number, down: boolean, mods: number = 0) {
+    sendInput({ t: 'key', code, down, mods })
+  }
+
   /** Send a `rc:quality` preference over the control channel. Safe to
    *  call while the channel is closed — it's a no-op until open. Also
    *  sent automatically when the channel first opens so the agent
@@ -3108,6 +3132,14 @@ export function useRemoteControl() {
      */
     currentDesktop,
     attachInput,
+    /** Wire `key_text` over the input DC (used by mobile keyboard +
+     *  IME composition path). See [`sendKeyText`] for the full
+     *  contract. */
+    sendKeyText,
+    /** Wire a HID `key` event over the input DC (used by mobile
+     *  keyboard's special-key toolbar). See [`sendKey`] for the
+     *  bitfield encoding. */
+    sendKey,
     sendClipboardToAgent,
     getAgentClipboard,
     sendCtrlAltDel,
