@@ -870,6 +870,7 @@ import { useAuthStore } from '@/stores/auth'
 import {
   useRemoteControl,
   RC_RECONNECT_LADDER_MS,
+  nextDirPath,
   type RcQuality,
   type RcPreferredCodec,
   type RcScaleMode,
@@ -1131,34 +1132,15 @@ function onEntryClick(
 }
 
 function onEntryDblClick(entry: { name: string; is_dir: boolean }) {
-  if (!entry.is_dir) return
-  // Roots view (Drives on Windows / "/" on Unix): each entry's
-  // `name` is already an absolute path (e.g. `C:\` or `/`) — DO NOT
-  // concatenate with the localised "Drives" label, that produces
-  // bogus paths like "Drives/C:\". Drive into `entry.name` directly.
-  // Use the explicit `isRootsView` flag rather than
-  // `currentParent === null`: on Windows, canonicalize("C:\\")
-  // returns `\\?\C:\` whose Path::parent() is also None, so the
-  // null-parent proxy mis-classified the verbatim drive root as
-  // roots-view. Field repro 2026-05-09: dbl-click C:\ → drawer
-  // shows \\?\C:\ → dbl-click `dev` → agent gets just "dev" →
-  // "canonicalising dev". The flag below is set by `navigateTo`
-  // only when the requested path was empty/`/`/`~`.
-  if (isRootsView.value) {
-    void navigateTo(entry.name)
-    return
-  }
-  const sep = /[\\/]$/.test(currentDirPath.value) ? '' : pathSeparator()
-  void navigateTo(currentDirPath.value + sep + entry.name)
-}
-
-function pathSeparator(): string {
-  // Heuristic: Windows paths contain a drive letter or `\`. Anything
-  // else is Unix.
-  if (/^[A-Za-z]:[\\\/]/.test(currentDirPath.value) || currentDirPath.value.includes('\\')) {
-    return '\\'
-  }
-  return '/'
+  // Path-construction logic lives in `nextDirPath` (pure helper in
+  // useRemoteControl.ts) so its two regression-prone invariants —
+  // (1) roots-view dispatches `entry.name` directly, (2) inside
+  // `\\?\C:\` whose Path::parent() is None, drive deeper using
+  // explicit `isRootsView` flag not `currentParent === null` proxy
+  // — are locked by Vitest.
+  const target = nextDirPath(entry, currentDirPath.value, isRootsView.value)
+  if (target === null) return
+  void navigateTo(target)
 }
 
 function formatFileSize(bytes: number | null): string {
