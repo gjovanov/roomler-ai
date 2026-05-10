@@ -24,7 +24,7 @@ test.describe('Responsive Layout', () => {
 
     const room = await createRoomViaApi(token, tenantId, 'general', true)
     roomId = room.id
-    await joinRoomViaApi(token, tenantId, roomId)
+    // Creator auto-joined — drop redundant joinRoomViaApi (returns 409).
 
     await loginViaUi(page, user.username, user.password)
   })

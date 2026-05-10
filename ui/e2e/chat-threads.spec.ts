@@ -39,7 +39,7 @@ test.describe('Thread Replies Real-Time Sync', () => {
     const room = await createRoomViaApi(ownerToken, tenantId, `thread-room-${Date.now()}`)
     roomId = room.id
 
-    await joinRoomViaApi(ownerToken, tenantId, roomId)
+    // Owner is auto-joined as creator. Only peer needs explicit join.
     await joinRoomViaApi(peerToken, tenantId, roomId)
   })
 

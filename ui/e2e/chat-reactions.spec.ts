@@ -40,7 +40,7 @@ test.describe('Reactions Real-Time Sync', () => {
     const room = await createRoomViaApi(ownerToken, tenantId, `reaction-room-${Date.now()}`)
     roomId = room.id
 
-    await joinRoomViaApi(ownerToken, tenantId, roomId)
+    // Owner is auto-joined as creator. Only peer needs explicit join.
     await joinRoomViaApi(peerToken, tenantId, roomId)
   })
 

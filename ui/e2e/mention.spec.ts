@@ -32,8 +32,7 @@ test.describe('Mentions', () => {
     const room = await createRoomViaApi(adminToken, tenantId, 'mention-test', true)
     roomId = room.id
 
-    await joinRoomViaApi(adminToken, tenantId, roomId)
-
+    // Admin (creator) is auto-joined as a member.
     const memberAuth = await registerUserViaApi(memberUser)
     memberToken = memberAuth.access_token
     memberUserId = memberAuth.user.id
