@@ -1,5 +1,5 @@
 <template>
-  <div class="file-panel">
+  <div class="file-panel" data-testid="file-panel">
     <v-text-field
       v-model="search"
       placeholder="Search files..."
