@@ -77,8 +77,9 @@ test.describe('Fix 2: Chat View Call Button', () => {
     const room = await createRoomViaApi(token, tenantId, 'text-only-room')
 
     await page.goto(`/tenant/${tenantId}/room/${room.id}`)
-    // Wait for the room header to load
-    await expect(page.getByText('text-only-room')).toBeVisible({ timeout: 10000 })
+    // Wait for the room header to load (scope to main; sidebar's room
+    // list also renders the name and would otherwise trip strict-mode)
+    await expect(page.locator('main').getByText('text-only-room')).toBeVisible({ timeout: 10000 })
     // Call button should not exist
     await expect(page.getByRole('button', { name: /start call/i })).not.toBeVisible()
   })
@@ -129,7 +130,7 @@ test.describe('Fix 3: Child Room Creation', () => {
     await createRoomViaApi(token, tenantId, 'parent-room')
 
     await page.goto(`/tenant/${tenantId}/rooms`)
-    await expect(page.getByText('parent-room')).toBeVisible({ timeout: 10000 })
+    await expect(page.locator('main').getByText('parent-room')).toBeVisible({ timeout: 10000 })
 
     // Open create dialog
     await page.getByRole('button', { name: /create room/i }).click()
@@ -143,7 +144,7 @@ test.describe('Fix 3: Child Room Creation', () => {
     await createRoomViaApi(token, tenantId, 'parent-for-child')
 
     await page.goto(`/tenant/${tenantId}/rooms`)
-    await expect(page.getByText('parent-for-child')).toBeVisible({ timeout: 10000 })
+    await expect(page.locator('main').getByText('parent-for-child')).toBeVisible({ timeout: 10000 })
 
     // Open create dialog
     await page.getByRole('button', { name: /create room/i }).click()
@@ -160,18 +161,19 @@ test.describe('Fix 3: Child Room Creation', () => {
     // Save
     await page.getByRole('button', { name: /save/i }).click()
 
-    // Child room should appear in the list
-    await expect(page.getByText('child-room')).toBeVisible({ timeout: 5000 })
+    // Child room should appear in the list (main, not sidebar)
+    await expect(page.locator('main').getByText('child-room')).toBeVisible({ timeout: 5000 })
   })
 
   test('room tree item has context menu with Create Sub-Room', async ({ page }) => {
     await createRoomViaApi(token, tenantId, 'context-menu-room')
 
     await page.goto(`/tenant/${tenantId}/rooms`)
-    await expect(page.getByText('context-menu-room')).toBeVisible({ timeout: 10000 })
+    await expect(page.locator('main').getByText('context-menu-room')).toBeVisible({ timeout: 10000 })
 
-    // Click the three-dot menu button (last button in the room's list item)
-    const roomItem = page.locator('.v-list-item:has-text("context-menu-room")')
+    // Click the three-dot menu button (last button in the room's list item).
+    // Scope to main; the sidebar's room list would otherwise also match.
+    const roomItem = page.locator('main .v-list-item:has-text("context-menu-room")')
     await roomItem.locator('button').last().click()
 
     // Menu should show "Create Sub-Room"
@@ -183,8 +185,8 @@ test.describe('Fix 3: Child Room Creation', () => {
     await createRoomViaApi(token, tenantId, 'tree-child', true, { parent_id: parent.id })
 
     await page.goto(`/tenant/${tenantId}/rooms`)
-    await expect(page.getByText('tree-parent')).toBeVisible({ timeout: 10000 })
-    await expect(page.getByText('tree-child')).toBeVisible()
+    await expect(page.locator('main').getByText('tree-parent')).toBeVisible({ timeout: 10000 })
+    await expect(page.locator('main').getByText('tree-child')).toBeVisible()
   })
 })
 
@@ -213,10 +215,11 @@ test.describe('Fix 4: Call Notifications', () => {
     await startCallViaApi(token, tenantId, room.id)
 
     await page.goto(`/tenant/${tenantId}/rooms`)
-    await expect(page.getByText('indicator-room')).toBeVisible({ timeout: 10000 })
+    await expect(page.locator('main').getByText('indicator-room')).toBeVisible({ timeout: 10000 })
 
-    // The room item should have a badge (role="status" rendered by Vuetify v-badge)
-    const roomRow = page.locator('.v-list-item:has-text("indicator-room")')
+    // The room item should have a badge (role="status" rendered by Vuetify v-badge).
+    // Scope to main; sidebar copy of the row would otherwise also match.
+    const roomRow = page.locator('main .v-list-item:has-text("indicator-room")')
     await expect(roomRow.getByRole('status')).toBeVisible({ timeout: 5000 })
   })
 
@@ -230,10 +233,10 @@ test.describe('Fix 4: Call Notifications', () => {
     await endCallViaApi(token, tenantId, room.id)
 
     await page.goto(`/tenant/${tenantId}/rooms`)
-    await expect(page.getByText('end-indicator-room')).toBeVisible({ timeout: 10000 })
+    await expect(page.locator('main').getByText('end-indicator-room')).toBeVisible({ timeout: 10000 })
 
-    // Badge should not be visible since call ended
-    const roomRow = page.locator('.v-list-item:has-text("end-indicator-room")')
+    // Badge should not be visible since call ended (scope to main)
+    const roomRow = page.locator('main .v-list-item:has-text("end-indicator-room")')
     await expect(roomRow.getByRole('status')).not.toBeVisible()
   })
 

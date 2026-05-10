@@ -33,7 +33,7 @@ test.describe('Room Management', () => {
     await nameInput.fill('new-test-room')
     await page.getByRole('button', { name: /save/i }).click()
 
-    await expect(page.getByText('new-test-room')).toBeVisible({ timeout: 5000 })
+    await expect(page.locator('main').getByText('new-test-room')).toBeVisible({ timeout: 5000 })
   })
 
   test('create room with open checkbox toggled', async ({ page }) => {
@@ -49,7 +49,7 @@ test.describe('Room Management', () => {
     await expect(page.locator('.v-dialog').getByText(/open/i).first()).toBeVisible()
 
     await page.getByRole('button', { name: /save/i }).click()
-    await expect(page.getByText('open-room')).toBeVisible({ timeout: 5000 })
+    await expect(page.locator('main').getByText('open-room')).toBeVisible({ timeout: 5000 })
   })
 
   test('edit room name by navigating to room and verifying header', async ({ page }) => {
@@ -58,7 +58,7 @@ test.describe('Room Management', () => {
 
     // Navigate to room chat view
     await page.goto(`/tenant/${tenantId}/room/${room.id}`)
-    await expect(page.getByText('original-name')).toBeVisible({ timeout: 10000 })
+    await expect(page.locator('main').getByText('original-name')).toBeVisible({ timeout: 10000 })
   })
 
   test('delete room removes it from the list', async ({ page }) => {
@@ -67,11 +67,12 @@ test.describe('Room Management', () => {
     await createRoomViaApi(token, tenantId, 'delete-room')
 
     await page.goto(`/tenant/${tenantId}/rooms`)
-    await expect(page.getByText('delete-room')).toBeVisible({ timeout: 10000 })
-    await expect(page.getByText('keep-room')).toBeVisible()
+    await expect(page.locator('main').getByText('delete-room')).toBeVisible({ timeout: 10000 })
+    await expect(page.locator('main').getByText('keep-room')).toBeVisible()
 
-    // Click the three-dot menu on the delete-room item
-    const roomItem = page.locator('.v-list-item:has-text("delete-room")')
+    // Click the three-dot menu on the delete-room item — scope to main
+    // so we don't hit the sidebar's room list.
+    const roomItem = page.locator('main .v-list-item:has-text("delete-room")')
     await roomItem.locator('button').last().click()
 
     // The context menu should be visible
@@ -83,15 +84,15 @@ test.describe('Room Management', () => {
     await createRoomViaApi(token, tenantId, 'child-room', true, { parent_id: parent.id })
 
     await page.goto(`/tenant/${tenantId}/rooms`)
-    await expect(page.getByText('parent-room')).toBeVisible({ timeout: 10000 })
-    await expect(page.getByText('child-room')).toBeVisible()
+    await expect(page.locator('main').getByText('parent-room')).toBeVisible({ timeout: 10000 })
+    await expect(page.locator('main').getByText('child-room')).toBeVisible()
   })
 
   test('room hierarchy: create child room via UI dialog', async ({ page }) => {
     await createRoomViaApi(token, tenantId, 'ui-parent')
 
     await page.goto(`/tenant/${tenantId}/rooms`)
-    await expect(page.getByText('ui-parent')).toBeVisible({ timeout: 10000 })
+    await expect(page.locator('main').getByText('ui-parent')).toBeVisible({ timeout: 10000 })
 
     // Open create room dialog
     await page.getByRole('button', { name: /create room/i }).click()
@@ -106,7 +107,7 @@ test.describe('Room Management', () => {
     await page.getByRole('option', { name: 'ui-parent' }).click()
 
     await page.getByRole('button', { name: /save/i }).click()
-    await expect(page.getByText('ui-child')).toBeVisible({ timeout: 5000 })
+    await expect(page.locator('main').getByText('ui-child')).toBeVisible({ timeout: 5000 })
   })
 
   test('join a public room from explore view', async ({ page }) => {
@@ -143,9 +144,9 @@ test.describe('Room Management', () => {
 
     await page.goto(`/tenant/${tenantId}/rooms`)
 
-    await expect(page.getByText('api-room-a')).toBeVisible({ timeout: 10000 })
-    await expect(page.getByText('api-room-b')).toBeVisible()
-    await expect(page.getByText('api-room-c')).toBeVisible()
+    await expect(page.locator('main').getByText('api-room-a')).toBeVisible({ timeout: 10000 })
+    await expect(page.locator('main').getByText('api-room-b')).toBeVisible()
+    await expect(page.locator('main').getByText('api-room-c')).toBeVisible()
   })
 
   test('leave a room via navigating away after joining', async ({ page }) => {
@@ -154,10 +155,10 @@ test.describe('Room Management', () => {
 
     // Navigate to the room
     await page.goto(`/tenant/${tenantId}/room/${room.id}`)
-    await expect(page.getByText('leave-test-room')).toBeVisible({ timeout: 10000 })
+    await expect(page.locator('main').getByText('leave-test-room')).toBeVisible({ timeout: 10000 })
 
     // Navigate back to rooms list
     await page.goto(`/tenant/${tenantId}/rooms`)
-    await expect(page.getByText('leave-test-room')).toBeVisible({ timeout: 10000 })
+    await expect(page.locator('main').getByText('leave-test-room')).toBeVisible({ timeout: 10000 })
   })
 })
