@@ -17,15 +17,15 @@
 
       <template #append>
         <v-badge
-          v-if="room.conference_status === 'in_progress' && (room.participant_count || 0) > 0"
+          v-if="room.conference_status === 'in_progress'"
           dot
           color="success"
+          inline
           class="mr-1"
-        >
-          <v-chip v-if="room.participant_count > 0" size="x-small" color="success" variant="tonal">
-            {{ room.participant_count }}
-          </v-chip>
-        </v-badge>
+        />
+        <v-chip v-if="(room.participant_count || 0) > 0 && room.conference_status === 'in_progress'" size="x-small" color="success" variant="tonal" class="mr-1">
+          {{ room.participant_count }}
+        </v-chip>
         <v-chip v-if="room.member_count > 0" size="x-small" variant="text">
           {{ room.member_count }}
         </v-chip>
