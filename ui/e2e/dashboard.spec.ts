@@ -34,6 +34,7 @@ test.describe('Dashboard', () => {
     await page.goto(`/tenant/${tenant.id}`)
     await expect(page.getByText(/rooms/i).first()).toBeVisible({ timeout: 10000 })
     await expect(page.getByText(/new room/i)).toBeVisible()
-    await expect(page.getByText(/start meeting/i)).toBeVisible()
+    // UI label is "Start Call" (not "Start Meeting" — spec was stale)
+    await expect(page.getByText(/start call/i)).toBeVisible()
   })
 })

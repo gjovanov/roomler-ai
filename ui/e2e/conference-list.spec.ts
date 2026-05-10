@@ -29,19 +29,20 @@ test.describe('Room List', () => {
 
     await page.goto(`/tenant/${tenantId}/rooms`)
 
-    // Both rooms should appear
-    await expect(page.getByText('Weekly Standup')).toBeVisible({ timeout: 10000 })
-    await expect(page.getByText('Design Review')).toBeVisible()
+    // Both rooms should appear in the main RoomList tree (sidebar
+    // also renders room names → strict-mode trip without main scope).
+    await expect(page.locator('main').getByText('Weekly Standup')).toBeVisible({ timeout: 10000 })
+    await expect(page.locator('main').getByText('Design Review')).toBeVisible()
   })
 
   test('clicking a room navigates to room view', async ({ page }) => {
     const room = await createRoomViaApi(token, tenantId, 'Navigate Test')
 
     await page.goto(`/tenant/${tenantId}/rooms`)
-    await expect(page.getByText('Navigate Test')).toBeVisible({ timeout: 10000 })
+    await expect(page.locator('main').getByText('Navigate Test')).toBeVisible({ timeout: 10000 })
 
-    // Click the room item
-    await page.getByText('Navigate Test').click()
+    // Click the room item in main (sidebar also has it)
+    await page.locator('main').getByText('Navigate Test').click()
 
     // Should navigate to room view
     await expect(page).toHaveURL(new RegExp(`/tenant/${tenantId}/room/${room.id}`), {

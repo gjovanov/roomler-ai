@@ -68,8 +68,9 @@ test.describe('Rooms', () => {
     await nameInput.fill('duplicate-rm')
     await page.getByRole('button', { name: /save/i }).click()
 
-    // The error alert should be displayed inside the dialog
-    await expect(page.locator('.v-dialog .v-alert')).toBeVisible({ timeout: 5000 })
+    // The error appears as a global snackbar (RoomList.vue calls
+    // showError → useSnackbar; v-alert in dialog was the old UX).
+    await expect(page.locator('.v-snackbar')).toBeVisible({ timeout: 5000 })
   })
 
   test('room list displays rooms created via API', async ({ page }) => {
