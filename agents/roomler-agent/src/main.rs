@@ -164,6 +164,27 @@ enum Command {
         #[arg(long)]
         check_only: bool,
     },
+    /// Approve or deny a pending operator-consent prompt for a remote-
+    /// control session. Used when the agent's `auto_grant_session` is
+    /// `false` (org-controlled fleets). The agent watches a sentinel
+    /// directory under `<log_dir>/consent/` for `<session>.approve` /
+    /// `.deny` files; this subcommand creates one in the right place.
+    /// 30 s timeout from the agent's POV, after which the broker
+    /// auto-denies. Read the agent's log line to find the session id
+    /// awaiting approval.
+    Consent {
+        /// Hex `session_id` from the agent's log line
+        /// "operator consent required" — typically a 24-character
+        /// MongoDB ObjectId hex string.
+        #[arg(long)]
+        session: String,
+        /// Approve the session.
+        #[arg(long, conflicts_with = "deny")]
+        approve: bool,
+        /// Deny the session.
+        #[arg(long, conflicts_with = "approve")]
+        deny: bool,
+    },
     /// (internal) Entry point invoked by the Windows Service Control
     /// Manager when `RoomlerAgentService` starts. Hands the process
     /// over to `windows-service`'s dispatcher; the agent main loop
@@ -327,6 +348,11 @@ async fn main() -> Result<()> {
         Command::PeerPresenceStatus => peer_presence_status_cmd(),
         Command::Service { action } => service_cmd(action).await,
         Command::ServiceRun => service_run_cmd().await,
+        Command::Consent {
+            session,
+            approve,
+            deny,
+        } => consent_cmd(&session, approve, deny),
         Command::SelfUpdate { check_only } => self_update_cmd(check_only).await,
         Command::PostInstallWatch {
             installer_pid,
@@ -334,6 +360,34 @@ async fn main() -> Result<()> {
             expected_version,
         } => post_install_watch_cmd(installer_pid, installer_path, expected_version).await,
     }
+}
+
+/// Drop a sentinel file under the agent's consent dir so a running
+/// agent's `ConsentBroker::run_prompt` poll resolves on the next
+/// 250ms tick. Pure path-and-write — no IPC with the agent process
+/// is needed because the broker watches the directory.
+fn consent_cmd(session_hex: &str, approve: bool, deny: bool) -> Result<()> {
+    let kind = roomler_agent::consent::SentinelKind::from_flags(approve, deny)?;
+    let dir = roomler_agent::consent::ConsentBroker::default_sentinel_dir()
+        .context("resolving consent sentinel dir")?;
+    // `Mode::AutoGrant` here is irrelevant — we're not running the
+    // broker, just borrowing its sentinel-path layout. Using
+    // AutoGrant skips the directory existence check so the CLI
+    // works even before the agent's first session.
+    let broker =
+        roomler_agent::consent::ConsentBroker::new(roomler_agent::consent::Mode::AutoGrant, dir)
+            .context("opening consent broker for CLI")?;
+    let path = broker.write_sentinel(session_hex, kind)?;
+    println!(
+        "operator consent {} for session {}\n  sentinel: {}",
+        match kind {
+            roomler_agent::consent::SentinelKind::Approve => "APPROVED",
+            roomler_agent::consent::SentinelKind::Deny => "DENIED",
+        },
+        session_hex,
+        path.display()
+    );
+    Ok(())
 }
 
 async fn post_install_watch_cmd(
