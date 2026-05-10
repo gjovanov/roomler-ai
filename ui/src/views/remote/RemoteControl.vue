@@ -95,6 +95,27 @@
         title="Viewer settings"
         @click="mobileSettingsOpen = true"
       />
+      <!-- Soft-keyboard toggle: mounts the MobileKeyboard component
+           which surfaces a hidden textarea so the OS soft keyboard
+           appears. Useful on phones AND on touch-laptops with a
+           stowed physical keyboard. Visible at every viewport
+           during a connected session — the phone use case is the
+           main driver but desktop operators have asked for it too
+           (PC50045 use case where the user types the host's
+           username during an unlock from another PC). -->
+      <v-btn
+        v-if="rc.phase.value === 'connected'"
+        icon
+        variant="text"
+        size="small"
+        class="mr-1"
+        :color="mobileKeyboardOpen ? 'primary' : undefined"
+        :aria-label="mobileKeyboardOpen ? 'Hide soft keyboard' : 'Show soft keyboard'"
+        :title="mobileKeyboardOpen ? 'Hide keyboard' : 'Show keyboard'"
+        @click="mobileKeyboardOpen = !mobileKeyboardOpen"
+      >
+        <v-icon>mdi-keyboard</v-icon>
+      </v-btn>
       <!-- Ctrl+Alt+Del: the OS intercepts this key combo before the
            browser sees it, so expose an explicit toolbar button that
            emits the equivalent key sequence over the input DC.
@@ -859,6 +880,21 @@
         </v-list-item>
       </v-list>
     </v-navigation-drawer>
+    <!-- Mobile virtual keyboard (Plan 4 phase 1). Mounted at the
+         bottom of the page so its `position: fixed` toolbar
+         overlays anything else. The component itself is invisible
+         (1×1 px transparent textarea) when `open=false`, so this
+         render is essentially free in the off state. The `key` /
+         `keyText` events are forwarded to the existing input DC
+         pipeline via the composable's `sendKey` / `sendKeyText`
+         helpers — the agent's enigo backend types Unicode natively
+         (no browser-side HID mapping needed for letter input). -->
+    <MobileKeyboard
+      :open="mobileKeyboardOpen"
+      @close="mobileKeyboardOpen = false"
+      @key-text="rc.sendKeyText"
+      @key="rc.sendKey"
+    />
   </v-container>
 </template>
 
@@ -879,6 +915,7 @@ import {
   type RcVideoTransport,
 } from '@/composables/useRemoteControl'
 import { useSnackbar } from '@/composables/useSnackbar'
+import MobileKeyboard from '@/components/remote/MobileKeyboard.vue'
 
 const route = useRoute()
 const tenantId = computed(() => route.params.tenantId as string)
@@ -951,6 +988,20 @@ const fileInput = ref<HTMLInputElement | null>(null)
 // `md and up` so phone operators retain access without losing the
 // rest of the toolbar to a 4-select overflow.
 const mobileSettingsOpen = ref(false)
+// Whether the on-screen soft keyboard is currently surfaced (Plan 4
+// phase 1). Toggled from the toolbar button; the MobileKeyboard
+// component focuses its hidden textarea on open, which causes iOS /
+// Android to bring up their soft keyboard. Reset on disconnect via
+// the watcher below.
+const mobileKeyboardOpen = ref(false)
+watch(
+  () => rc.phase.value,
+  (phase) => {
+    // Auto-close the keyboard when the session ends so a new
+    // connect attempt doesn't inherit the stale toggle state.
+    if (phase !== 'connected') mobileKeyboardOpen.value = false
+  },
+)
 const uploadBusy = ref(false)
 // Visual cue when a draggable item is hovering the stage. Toggled on
 // dragenter/dragover (true) + drop/dragleave (false). The
