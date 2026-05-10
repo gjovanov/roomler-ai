@@ -24,6 +24,7 @@ import {
   decideKeyAction,
   RC_RECONNECT_LADDER_MS,
   nextReconnectDelayMs,
+  nextDirPath,
   parseControlInbound,
   type KeyDecision,
 } from '@/composables/useRemoteControl'
@@ -1225,5 +1226,88 @@ describe('nextReconnectDelayMs', () => {
     // Defensive: a logic bug that decremented the counter past 0
     // shouldn't accidentally re-enter the ladder.
     expect(nextReconnectDelayMs(-1)).toBeNull()
+  })
+})
+
+describe('nextDirPath', () => {
+  // Returns null when the entry isn't a directory — the drawer's
+  // dbl-click handler short-circuits before navigating.
+  it('returns null for non-directory entries', () => {
+    expect(
+      nextDirPath({ name: 'report.pdf', is_dir: false }, 'C:\\Users', false)
+    ).toBeNull()
+  })
+
+  describe('roots view', () => {
+    // Roots view: drive INTO entry.name directly. Concatenating with
+    // a localised "Drives" label produced bogus paths like
+    // `Drives/C:\` (rc.15 field repro 2026-05-07). The fix uses an
+    // explicit `isRootsView` flag.
+    it('Windows drive: dbl-click "C:\\" lands at C:\\, not Drives/C:\\', () => {
+      // currentDirPath comes from the agent's roots listing as
+      // "Drives" — must be ignored.
+      expect(
+        nextDirPath({ name: 'C:\\', is_dir: true }, 'Drives', true)
+      ).toBe('C:\\')
+    })
+
+    it('Unix root: dbl-click "/" lands at /, not //', () => {
+      expect(
+        nextDirPath({ name: '/', is_dir: true }, '/', true)
+      ).toBe('/')
+    })
+  })
+
+  describe('inside a real directory', () => {
+    it('Windows: appends with backslash, no double-up on trailing sep', () => {
+      // Trailing separator on the parent (after canonicalize) — must
+      // NOT produce `C:\\dev`. This is the literal regression case
+      // for `\\?\C:\` whose canonicalised form ends in `\`.
+      expect(
+        nextDirPath({ name: 'dev', is_dir: true }, '\\\\?\\C:\\', false)
+      ).toBe('\\\\?\\C:\\dev')
+      // No-trailing-sep parent → adds backslash.
+      expect(
+        nextDirPath({ name: 'gjovanov', is_dir: true }, 'C:\\dev', false)
+      ).toBe('C:\\dev\\gjovanov')
+    })
+
+    it('Unix: appends with forward slash, no double-up on trailing sep', () => {
+      expect(
+        nextDirPath({ name: 'home', is_dir: true }, '/', false)
+      ).toBe('/home')
+      expect(
+        nextDirPath({ name: 'goran', is_dir: true }, '/home', false)
+      ).toBe('/home/goran')
+    })
+
+    it('detects Windows separator from drive-letter prefix', () => {
+      // `C:\Users` → Windows backslash heuristic.
+      expect(
+        nextDirPath({ name: 'me', is_dir: true }, 'C:\\Users', false)
+      ).toBe('C:\\Users\\me')
+    })
+
+    it('treats path with no backslashes + no drive letter as Unix', () => {
+      expect(
+        nextDirPath({ name: 'b', is_dir: true }, '/usr/local', false)
+      ).toBe('/usr/local/b')
+    })
+  })
+
+  describe('regression: \\\\?\\C:\\ → dev', () => {
+    // Exact reproduction of the field bug fixed 2026-05-09. The
+    // agent canonicalises `C:\` → `\\?\C:\`. `Path::parent()` of
+    // `\\?\C:\` returns None, so a `currentParent === null` check
+    // mis-classified the verbatim drive root as roots view, and
+    // dbl-click `dev` shipped just `"dev"` to the agent —
+    // "canonicalising dev". The explicit `isRootsView=false` here
+    // is the correct call site signal: the user came in via
+    // navigateTo(C:\\), not navigateTo("").
+    it('produces the agent-acceptable absolute path \\\\?\\C:\\dev', () => {
+      expect(
+        nextDirPath({ name: 'dev', is_dir: true }, '\\\\?\\C:\\', false)
+      ).toBe('\\\\?\\C:\\dev')
+    })
   })
 })

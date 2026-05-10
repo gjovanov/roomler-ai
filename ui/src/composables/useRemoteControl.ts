@@ -97,6 +97,52 @@ export function nextReconnectDelayMs(attempt: number): number | null {
   return RC_RECONNECT_LADDER_MS[attempt]
 }
 
+/** Pure helper: derive the host path to navigate to when the user
+ *  double-clicks an entry in the files-browser drawer. Encodes two
+ *  invariants that have each tripped a field bug:
+ *
+ *  1. **Roots view** (Drives on Windows / `/` on Unix) — `entry.name`
+ *     is already an absolute path (e.g. `C:\` or `/`). The composable
+ *     MUST drive into it directly; concatenating with the localised
+ *     "Drives" label produces bogus paths like `Drives/C:\` (rc.15
+ *     field repro 2026-05-07).
+ *  2. **Inside a verbatim drive root** (`\\?\C:\`) — `Path::parent()`
+ *     in the agent returns `None`, so a `currentParent === null`
+ *     proxy mis-classifies the verbatim drive root as roots-view.
+ *     The drawer must use an EXPLICIT `isRootsView` flag, set only
+ *     when the navigateTo request was for empty/`/`/`~`. This helper
+ *     takes that flag as input rather than re-deriving it
+ *     (regression bug 2026-05-09: dbl-click `dev` after `C:\` shipped
+ *     just `dev` to the agent → "canonicalising dev").
+ *
+ *  Path-separator heuristic: any drive-letter prefix or backslash in
+ *  the current path → Windows; otherwise Unix. Trailing separator on
+ *  the current path is detected so we don't double up.
+ *
+ *  Exported for unit-testing; the caller (RemoteControl.vue's
+ *  `onEntryDblClick`) is a one-line wrapper that forwards `entry`,
+ *  `currentDirPath`, and `isRootsView` directly.
+ */
+export function nextDirPath(
+  entry: { name: string; is_dir: boolean },
+  currentDirPath: string,
+  isRootsView: boolean
+): string | null {
+  if (!entry.is_dir) return null
+  if (isRootsView) {
+    // Roots view: drive directly into the entry's name (already an
+    // absolute path on Win / Unix).
+    return entry.name
+  }
+  const trailingSep = /[\\/]$/.test(currentDirPath)
+  // Win paths contain a drive-letter colon or a backslash. Anything
+  // else is treated as Unix (forward-slash separator).
+  const isWindows =
+    /^[A-Za-z]:[\\\/]/.test(currentDirPath) || currentDirPath.includes('\\')
+  const sep = trailingSep ? '' : isWindows ? '\\' : '/'
+  return currentDirPath + sep + entry.name
+}
+
 /** Controller's quality preference. `auto` lets the agent follow TWCC; `low`
  *  clamps for bandwidth-constrained WAN; `high` asks for the best codec the
  *  agent can offer (HEVC/AV1 when negotiated in Phase 2). Persisted to
