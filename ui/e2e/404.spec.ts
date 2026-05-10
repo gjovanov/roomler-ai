@@ -34,8 +34,10 @@ test.describe('404 Not Found', () => {
 
     await page.getByRole('link', { name: /go to dashboard/i }).click()
 
-    // Should navigate to / (which may redirect to /login or /landing if unauthenticated)
-    await expect(page).toHaveURL(/^\/(login|landing)?$/, { timeout: 5000 })
+    // Navigate to / which redirects unauthenticated users to /landing
+    // (or /login in older auth-guard configs). The regex doesn't anchor
+    // ^ because Playwright matches against the full URL with host.
+    await expect(page).toHaveURL(/\/(login|landing)$|\/$/, { timeout: 5000 })
   })
 
   test('authenticated user clicking "Go to Dashboard" goes to dashboard', async ({ page }) => {

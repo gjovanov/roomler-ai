@@ -32,7 +32,9 @@ test.describe('Authentication', () => {
 
   test('unauthenticated user is redirected to login', async ({ page }) => {
     await page.goto('/')
-    await expect(page).toHaveURL(/\/login/)
+    // Router beforeEach redirects unauthenticated users to /landing
+    // (the marketing/login-prompt page), not directly to /login.
+    await expect(page).toHaveURL(/\/landing/)
   })
 
   test('navigate between login and register', async ({ page }) => {

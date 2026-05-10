@@ -49,9 +49,13 @@ test.describe('Chat', () => {
 
   test('message input is visible and functional', async ({ page }) => {
     await page.goto(`/tenant/${tenantId}/room/${roomId}`)
-    const input = page.getByPlaceholder(/type a message/i)
-    await expect(input).toBeVisible({ timeout: 10000 })
-    await input.fill('Hello from E2E!')
-    await expect(input).toHaveValue('Hello from E2E!')
+    // The message editor is a TipTap contenteditable div, not a plain
+    // input/textarea — getByPlaceholder doesn't match TipTap's
+    // data-placeholder attribute. Target the ProseMirror root instead.
+    const editor = page.locator('.ProseMirror[contenteditable="true"]').first()
+    await expect(editor).toBeVisible({ timeout: 10000 })
+    await editor.click()
+    await page.keyboard.type('Hello from E2E!')
+    await expect(editor).toContainText('Hello from E2E!')
   })
 })
