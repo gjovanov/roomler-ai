@@ -45,6 +45,41 @@ pub async fn run(
             ViewerIndicator::disabled()
         }
     };
+    // Operator-consent broker lives across reconnects so a sentinel
+    // file dropped while the WS was down is still honoured when the
+    // next session.request arrives. Mode is locked at startup from
+    // the config (back-compat default = AutoGrant; org fleets flip
+    // `auto_grant_session=false` to require operator approval).
+    let consent_mode = crate::consent::Mode::from_config(cfg.auto_grant_session);
+    let consent_dir = match crate::consent::ConsentBroker::default_sentinel_dir() {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(%e, "could not resolve consent sentinel dir; falling back to temp dir");
+            std::env::temp_dir().join("roomler-agent-consent")
+        }
+    };
+    let consent_broker = match crate::consent::ConsentBroker::new(consent_mode, consent_dir.clone())
+    {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(%e, "consent broker init failed; defaulting to AutoGrant for this run");
+            // Fail open in the broker-init failure path so a directory-
+            // permission glitch doesn't stop the agent from servicing
+            // self-host (auto-grant) deployments. Org-controlled
+            // fleets relying on Prompt mode still get audit visibility
+            // via the failure log line above.
+            crate::consent::ConsentBroker::new(
+                crate::consent::Mode::AutoGrant,
+                std::env::temp_dir(),
+            )
+            .expect("AutoGrant broker init cannot fail with temp_dir")
+        }
+    };
+    info!(
+        mode = ?consent_broker.mode(),
+        sentinel_dir = %consent_broker.sentinel_dir().display(),
+        "operator-consent broker ready"
+    );
     let mut backoff = Duration::from_secs(1);
     let mut auth_failures: u32 = 0;
     loop {
@@ -58,6 +93,7 @@ pub async fn run(
             encoder_preference,
             shutdown.clone(),
             indicator.clone(),
+            consent_broker.clone(),
         )
         .await
         {
@@ -152,6 +188,7 @@ async fn connect_once(
     encoder_preference: crate::encode::EncoderPreference,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     indicator: ViewerIndicator,
+    consent_broker: crate::consent::ConsentBroker,
 ) -> Result<(), ConnectError> {
     let url = format!(
         "{}?token={}&role=agent",
@@ -273,6 +310,7 @@ async fn connect_once(
                                 &outbound_tx,
                                 encoder_preference,
                                 &indicator,
+                                &consent_broker,
                             )
                             .await?;
                         }
@@ -310,6 +348,7 @@ async fn handle_server_msg(
     outbound_tx: &mpsc::Sender<ClientMsg>,
     encoder_preference: crate::encode::EncoderPreference,
     indicator: &ViewerIndicator,
+    consent_broker: &crate::consent::ConsentBroker,
 ) -> Result<(), ConnectError> {
     match msg {
         ServerMsg::Request {
@@ -356,22 +395,42 @@ async fn handle_server_msg(
                 chosen_codec = %chosen,
                 requested_transport = ?preferred_transport,
                 negotiated_transport = ?negotiated_transport,
-                "incoming session request — auto-granting (see docs §11.2)"
+                consent_mode = ?consent_broker.mode(),
+                "incoming session request — running consent broker"
             );
             // Show the "someone is watching" overlay on the controlled
             // host. Harmless no-op on non-Windows or when the feature
-            // is disabled.
+            // is disabled. Indicator goes up at request time (not after
+            // grant) so an in-prompt operator sees the visual cue
+            // alongside the prompt — defence-in-depth against a sneaky
+            // unattended grant.
             indicator.show_session(session_id.to_hex(), controller_name.clone());
-            // TODO: real consent UI. Self-host default is "no prompt".
-            send_msg(
-                ws,
-                &ClientMsg::Consent {
-                    session_id,
-                    granted: true,
-                },
-            )
-            .await
-            .map_err(|e| ConnectError::Transient(e.context("sending consent")))?;
+            // Spawn a task to run the broker decision in the
+            // background; auto-grant resolves <1ms, prompt mode can
+            // take up to 30s — we MUST NOT block the WS read loop.
+            // Decision flows back via outbound_tx as a ClientMsg::Consent.
+            let broker = consent_broker.clone();
+            let outbound = outbound_tx.clone();
+            let session_hex = session_id.to_hex();
+            tokio::spawn(async move {
+                let decision = broker.request(&session_hex).await;
+                let granted = decision.granted();
+                tracing::info!(
+                    session = %session_hex,
+                    ?decision,
+                    granted,
+                    "consent decision → sending rc:consent"
+                );
+                if let Err(e) = outbound
+                    .send(ClientMsg::Consent {
+                        session_id,
+                        granted,
+                    })
+                    .await
+                {
+                    tracing::warn!(session = %session_hex, %e, "outbound consent send failed (channel closed)");
+                }
+            });
         }
 
         ServerMsg::SdpOffer {

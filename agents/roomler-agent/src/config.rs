@@ -57,6 +57,20 @@ pub struct AgentConfig {
     #[serde(default = "default_enable_remote_browse")]
     pub enable_remote_browse: bool,
 
+    /// Whether incoming `rc:session.request` messages are
+    /// auto-granted without operator interaction. Default `true` to
+    /// match historical self-host behaviour (`docs/remote-control.md`
+    /// §11.2 + signaling.rs's pre-Plan-3 auto-grant). Org-controlled
+    /// fleets set this to `false` so every session start waits for
+    /// an explicit operator decision via the `roomler-agent consent
+    /// --session <hex> --approve|--deny` CLI fallback (or, in a
+    /// future version, a tray prompt). 30 s timeout → auto-deny.
+    /// Has NO effect on the file-DC path — uploads/downloads/dir
+    /// browsing remain gated by `enable_remote_browse` + the
+    /// agent's denylist.
+    #[serde(default = "default_auto_grant_session")]
+    pub auto_grant_session: bool,
+
     /// Most recent version that ran for at least
     /// `CLEAN_RUN_THRESHOLD` seconds before exiting cleanly (or
     /// crashing — the threshold is what gates updates here, not exit
@@ -223,6 +237,15 @@ fn default_enable_remote_browse() -> bool {
     true
 }
 
+/// Default for `auto_grant_session` — `true` for back-compat with
+/// every pre-0.3.x agent which auto-granted unconditionally
+/// (signaling.rs:365 TODO). Org-controlled fleets opt out via
+/// `config.toml`. See [`AgentConfig::auto_grant_session`] for the
+/// security model.
+fn default_auto_grant_session() -> bool {
+    true
+}
+
 pub fn default_config_path() -> Result<PathBuf> {
     let dirs = ProjectDirs::from("live", "roomler", "roomler-agent")
         .context("could not resolve a platform config directory")?;
@@ -309,6 +332,7 @@ mod tests {
             encoder_preference: EncoderPreferenceChoice::Auto,
             update_check_interval_h: None,
             enable_remote_browse: true,
+            auto_grant_session: true,
             last_known_good_version: None,
             crash_count: 0,
             last_crash_unix: 0,
