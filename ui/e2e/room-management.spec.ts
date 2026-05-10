@@ -151,7 +151,7 @@ test.describe('Room Management', () => {
 
   test('leave a room via navigating away after joining', async ({ page }) => {
     const room = await createRoomViaApi(token, tenantId, 'leave-test-room')
-    await joinRoomViaApi(token, tenantId, room.id)
+    // Creator auto-joined — no explicit join needed.
 
     // Navigate to the room
     await page.goto(`/tenant/${tenantId}/room/${room.id}`)
