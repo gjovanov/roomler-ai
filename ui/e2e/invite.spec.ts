@@ -14,7 +14,7 @@ test.describe('Invite functionality', () => {
     // Setup: create tenant + invite via API
     const owner = uniqueUser()
     const ownerAuth = await registerUserViaApi(owner)
-    const tenant = await createTenantViaApi(ownerAuth.access_token, 'Invite Test Org', 'invite-test-org')
+    const tenant = await createTenantViaApi(ownerAuth.access_token, 'Invite Test Org', `invite-test-${Date.now()}`)
     const invite = await createInviteViaApi(ownerAuth.access_token, tenant.id)
 
     // Navigate to invite page (unauthenticated)
@@ -33,7 +33,7 @@ test.describe('Invite functionality', () => {
     // Setup
     const owner = uniqueUser()
     const ownerAuth = await registerUserViaApi(owner)
-    const tenant = await createTenantViaApi(ownerAuth.access_token, 'Register Join Org', 'reg-join-org')
+    const tenant = await createTenantViaApi(ownerAuth.access_token, 'Register Join Org', `reg-join-${Date.now()}`)
     const invite = await createInviteViaApi(ownerAuth.access_token, tenant.id)
 
     // Visit invite page
@@ -61,7 +61,7 @@ test.describe('Invite functionality', () => {
     // Setup: create tenant + invite
     const owner = uniqueUser()
     const ownerAuth = await registerUserViaApi(owner)
-    const tenant = await createTenantViaApi(ownerAuth.access_token, 'Accept Org', 'accept-org')
+    const tenant = await createTenantViaApi(ownerAuth.access_token, 'Accept Org', `accept-${Date.now()}`)
     const invite = await createInviteViaApi(ownerAuth.access_token, tenant.id)
 
     // Register another user and log them in
@@ -86,7 +86,7 @@ test.describe('Invite functionality', () => {
     // Setup
     const owner = uniqueUser()
     const ownerAuth = await registerUserViaApi(owner)
-    const tenant = await createTenantViaApi(ownerAuth.access_token, 'Login Join Org', 'login-join-org')
+    const tenant = await createTenantViaApi(ownerAuth.access_token, 'Login Join Org', `login-join-${Date.now()}`)
     const invite = await createInviteViaApi(ownerAuth.access_token, tenant.id)
 
     // Register a user (via API, not logged in on browser)
@@ -117,7 +117,7 @@ test.describe('Invite functionality', () => {
     // Setup
     const owner = uniqueUser()
     const ownerAuth = await registerUserViaApi(owner)
-    const tenant = await createTenantViaApi(ownerAuth.access_token, 'Revoked Org', 'revoked-org')
+    const tenant = await createTenantViaApi(ownerAuth.access_token, 'Revoked Org', `revoked-${Date.now()}`)
     const invite = await createInviteViaApi(ownerAuth.access_token, tenant.id)
 
     // Revoke the invite
