@@ -1203,8 +1203,18 @@ function formatFileSize(bytes: number | null): string {
 }
 
 async function downloadEntry(entry: { name: string; is_dir: boolean }) {
-  const sep = /[\\/]$/.test(currentDirPath.value) ? '' : pathSeparator()
-  const fullPath = currentDirPath.value + sep + entry.name
+  // Reuse `nextDirPath`'s separator logic via a small wrapper:
+  // for file entries the helper returns null (it's "next dir to
+  // navigate to", not "next host path"), so flip is_dir=true and
+  // remember to use the original is_dir for the download branch.
+  // The roots-view case doesn't apply here — the drawer only shows
+  // a download button on entries below the roots view.
+  const fullPath = nextDirPath(
+    { name: entry.name, is_dir: true },
+    currentDirPath.value,
+    isRootsView.value,
+  )
+  if (fullPath === null) return
   try {
     if (entry.is_dir) {
       const r = await rc.downloadFolder(fullPath, `${entry.name}.zip`)
