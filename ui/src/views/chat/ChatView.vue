@@ -28,7 +28,7 @@
             />
           </v-btn>
           <v-btn icon="mdi-pin" size="small" @click="showPinned = !showPinned" />
-          <v-btn icon="mdi-folder" size="small" @click="showFiles = !showFiles" />
+          <v-btn icon="mdi-folder" size="small" data-testid="files-btn" @click="showFiles = !showFiles" />
           <v-btn icon="mdi-account-group" size="small" @click="showMembers = !showMembers" />
         </v-toolbar>
 
@@ -145,7 +145,7 @@
         <v-toolbar density="compact" flat>
           <v-toolbar-title class="text-body-1">Files</v-toolbar-title>
           <v-spacer />
-          <v-btn icon="mdi-close" size="small" @click="showFiles = false" />
+          <v-btn icon="mdi-close" size="small" data-testid="close-files-panel" @click="showFiles = false" />
         </v-toolbar>
         <v-divider />
         <file-panel :tenant-id="tenantId" :room-id="roomId" />
