@@ -48,8 +48,9 @@ test.describe('Rooms', () => {
     await nameInput.fill('my-test-room')
     await page.getByRole('button', { name: /save/i }).click()
 
-    // Verify the new room appears in the list
-    await expect(page.getByText('my-test-room')).toBeVisible({ timeout: 5000 })
+    // Verify the new room appears in the main list (sidebar also
+    // renders room names → strict-mode without main scope).
+    await expect(page.locator('main').getByText('my-test-room')).toBeVisible({ timeout: 5000 })
   })
 
   test('create duplicate room shows error alert', async ({ page }) => {
@@ -78,9 +79,11 @@ test.describe('Rooms', () => {
 
     await page.goto(`/tenant/${tenantId}/rooms`)
 
-    // Both rooms should appear in the list (validates store parses plain array)
-    await expect(page.getByText('api-room-1')).toBeVisible({ timeout: 10000 })
-    await expect(page.getByText('api-room-2')).toBeVisible()
+    // Both rooms should appear in the list (validates store parses plain array).
+    // Scope to main; sidebar renders the same names and would trip
+    // strict-mode otherwise.
+    await expect(page.locator('main').getByText('api-room-1')).toBeVisible({ timeout: 10000 })
+    await expect(page.locator('main').getByText('api-room-2')).toBeVisible()
   })
 
   test('explore page loads with search', async ({ page }) => {
