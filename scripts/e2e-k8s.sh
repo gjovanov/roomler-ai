@@ -221,11 +221,13 @@ POD=$(kubectl -n "$NAMESPACE" get pod -l "job-name=$JOB_NAME" \
 # the container's run-e2e.sh ends with `tail -f /dev/null` (to keep
 # the pod alive long enough for kubectl cp), so logs -f would hang
 # until SIGTERM. Polling the marker file is the explicit completion
-# signal. Cap at 30 min — even the full 29-spec suite shouldn't
-# exceed that.
+# signal. Cap at 45 min — Cycle 4 Chunk 1 added Mailpit-polling
+# email-flows tests + retries on a flaky mention test pushed
+# wall-clock past the prior 30-min cap (run #1 finished at ~40 min).
+# Pod's `activeDeadlineSeconds: 3600` still caps absolute runtime.
 echo "[e2e-k8s] waiting for Playwright to finish (/results/.done in $POD)"
 DONE=0
-for i in $(seq 1 360); do
+for i in $(seq 1 540); do
   if kubectl -n "$NAMESPACE" exec "$POD" -- test -f /results/.done 2>/dev/null; then
     DONE=1
     break
