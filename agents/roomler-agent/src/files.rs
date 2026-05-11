@@ -174,10 +174,90 @@ pub(crate) const PARTIAL_ORPHAN_TTL_SECS: i64 = 24 * 3600;
 /// See plan B2 fix for the trade-off analysis.
 pub(crate) const FSYNC_THRESHOLD_BYTES: u64 = 1024 * 1024;
 
-/// Compute the canonical staging dir path for an upload `id` under
-/// `dest_dir`. Always `<dest_dir>/.roomler-partial/<id>`.
+/// rc.22 — staging-strategy flag. When `true`, all upload staging on
+/// Windows happens under `%PROGRAMDATA%\roomler\roomler-agent\staging\`
+/// regardless of the upload's `dest_dir`. When `false`, staging lives
+/// under `<dest_dir>/.roomler-partial/` (rc.19–rc.21 legacy layout).
+///
+/// **Why**: PC50045 field repro 2026-05-11 — ESET Security real-time
+/// scanner intercepts per-chunk writes under `C:\Users\<user>\Downloads\`
+/// aggressively enough to push the file-DC's SCTP buffer into overflow
+/// during large uploads, ending in "reconnect budget exhausted after
+/// 6 attempts" with no recoverable state. ESET scans `C:\ProgramData\`
+/// writes less aggressively (service-writable, typical legitimate
+/// staging location), so moving the per-chunk write loop to PROGRAMDATA
+/// and only crossing into the user's Downloads at end-time rename keeps
+/// ESET's hot path narrow.
+///
+/// Hypothesis-driven, not yet confirmed on the field; the env-var
+/// escape hatch `ROOMLER_AGENT_STAGING_LEGACY_PER_DEST=1` reverts the
+/// behavior without a rebuild if Option B turns out wrong. Cycles
+/// back to `Option D` (escalate corporate-AV exclusion request) if
+/// rc.22 still fails.
+///
+/// Defaults: Windows → `true`, other → `false`. Tests force `false`
+/// via `cfg(test)` so the existing per-dest test assertions hold.
+pub(crate) static STAGE_IN_PROGRAMDATA: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| {
+        if cfg!(test) {
+            return false;
+        }
+        if std::env::var_os("ROOMLER_AGENT_STAGING_LEGACY_PER_DEST").is_some() {
+            tracing::info!(
+                "files: ROOMLER_AGENT_STAGING_LEGACY_PER_DEST set; reverting to per-dest staging"
+            );
+            return false;
+        }
+        cfg!(target_os = "windows")
+    });
+
+/// True when the rc.22 always-PROGRAMDATA staging strategy is active.
+pub(crate) fn stage_in_programdata() -> bool {
+    *STAGE_IN_PROGRAMDATA
+}
+
+/// Windows-only staging root: `%PROGRAMDATA%\roomler\roomler-agent\staging\`.
+/// SYSTEM-writable, persistent across reboots, present on every Windows
+/// install. Falls back to `C:\ProgramData` when the env var is unset
+/// (matches the rc.21 download_dir() fallback shape).
+#[cfg(target_os = "windows")]
+pub(crate) fn staging_root_windows() -> PathBuf {
+    let pd = std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("C:\\ProgramData"));
+    pd.join("roomler").join("roomler-agent").join("staging")
+}
+
+/// Compute the canonical staging dir path for an upload `id`. On
+/// Windows in production this is `%PROGRAMDATA%\roomler\roomler-agent\
+/// staging\<id>` (rc.22, ESET fix). On other platforms or when the
+/// legacy-per-dest escape hatch is set, falls back to the rc.19 layout
+/// at `<dest_dir>/.roomler-partial/<id>`.
 pub(crate) fn partial_dir_for(dest_dir: &std::path::Path, id: &str) -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        if stage_in_programdata() {
+            return staging_root_windows().join(id);
+        }
+    }
     dest_dir.join(".roomler-partial").join(id)
+}
+
+/// rc.22 — detect a "rename crosses devices" error from `tokio::fs::rename`.
+/// `io::ErrorKind::CrossesDevices` (stable since Rust 1.85) catches the
+/// portable case. For older toolchains or platforms without the
+/// canonical mapping, fall back to checking the raw OS error code:
+/// `17` on Windows (`ERROR_NOT_SAME_DEVICE`) and `18` on Linux/macOS
+/// (`EXDEV`).
+pub(crate) fn is_cross_volume_error(err: &std::io::Error) -> bool {
+    if err.kind() == std::io::ErrorKind::CrossesDevices {
+        return true;
+    }
+    match err.raw_os_error() {
+        Some(17) if cfg!(target_os = "windows") => true,
+        Some(18) if cfg!(not(target_os = "windows")) => true,
+        _ => false,
+    }
 }
 
 /// Apply the Windows hidden attribute to `path`. Logs + continues on
@@ -224,6 +304,17 @@ fn set_hidden(_path: &std::path::Path) {
 /// with a new id; the orphan dirs are left on disk until the operator
 /// cleans them (no automated cleanup for non-Downloads in v1).
 pub async fn sweep_orphans() -> (usize, usize) {
+    // rc.22 — when always-PROGRAMDATA staging is active, the sweep
+    // scans `staging_root_windows()` DIRECTLY (no `.roomler-partial/`
+    // parent — the staging root IS that parent). Otherwise fall back
+    // to the legacy `<Downloads>/.roomler-partial/` layout.
+    #[cfg(target_os = "windows")]
+    {
+        if stage_in_programdata() {
+            let root = staging_root_windows();
+            return sweep_orphans_root(&root).await;
+        }
+    }
     let root = match download_dir() {
         Ok(d) => d,
         Err(_) => {
@@ -234,6 +325,14 @@ pub async fn sweep_orphans() -> (usize, usize) {
     sweep_orphans_in(&root).await
 }
 
+/// rc.22 — sweep a directory whose CHILDREN are per-id staging dirs.
+/// Used when the staging root is `%PROGRAMDATA%\roomler\roomler-agent\
+/// staging\` (no `.roomler-partial` parent). Mirror of [`sweep_orphans_in`]
+/// minus the parent-join — the contents-of-directory loop is identical.
+pub async fn sweep_orphans_root(dir: &std::path::Path) -> (usize, usize) {
+    sweep_orphans_dir(dir).await
+}
+
 /// Test-friendly variant taking an explicit root. Production code
 /// calls [`sweep_orphans`] which forwards to this with `download_dir()`.
 /// Tests that exercise the sweep logic pass a `tempfile::TempDir`
@@ -242,14 +341,23 @@ pub async fn sweep_orphans() -> (usize, usize) {
 /// `KNOWNFOLDERID`).
 pub async fn sweep_orphans_in(root: &std::path::Path) -> (usize, usize) {
     let dir = root.join(".roomler-partial");
+    sweep_orphans_dir(&dir).await
+}
+
+/// Shared sweep body — reads `dir` as a directory whose children are
+/// `<id>/{meta.json,data}` triples, removes those older than
+/// [`PARTIAL_ORPHAN_TTL_SECS`] and registers survivors. Used by both
+/// the legacy `<Downloads>/.roomler-partial/` layout and the rc.22
+/// `%PROGRAMDATA%\roomler\roomler-agent\staging\` layout.
+async fn sweep_orphans_dir(dir: &std::path::Path) -> (usize, usize) {
     let now = chrono::Utc::now().timestamp();
     let mut kept = 0usize;
     let mut swept = 0usize;
 
-    let mut rd = match tokio::fs::read_dir(&dir).await {
+    let mut rd = match tokio::fs::read_dir(dir).await {
         Ok(rd) => rd,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            tracing::debug!(dir = %dir.display(), "sweep_orphans: no .roomler-partial/ dir");
+            tracing::debug!(dir = %dir.display(), "sweep_orphans: dir absent; nothing to do");
             return (0, 0);
         }
         Err(e) => {
@@ -836,15 +944,43 @@ impl FilesHandler {
         }
 
         let data_path = state.partial_dir.join("data");
-        tokio::fs::rename(&data_path, &actual_final_path)
-            .await
-            .with_context(|| {
-                format!(
+        // rc.22 — the staging dir may now be on a different volume than
+        // the final destination (PROGRAMDATA = C:, dest_path could be
+        // D:\, a network mapped drive, or operator-redirected
+        // Downloads). `tokio::fs::rename` returns
+        // `ErrorKind::CrossesDevices` in that case (Windows
+        // `ERROR_NOT_SAME_DEVICE` / Linux `EXDEV`); fall back to copy +
+        // remove. Cross-volume costs an extra pass through the file
+        // (35 MB ≈ 200 ms on NVMe, single-digit seconds on HDD or
+        // 1 GbE SMB) which is acceptable for a one-shot at end-time —
+        // the per-chunk write loop is what we want to keep on PROGRAMDATA.
+        match tokio::fs::rename(&data_path, &actual_final_path).await {
+            Ok(()) => {}
+            Err(e) if is_cross_volume_error(&e) => {
+                tracing::info!(
+                    from = %data_path.display(),
+                    to = %actual_final_path.display(),
+                    "files: cross-volume staging → final; copy+remove fallback"
+                );
+                tokio::fs::copy(&data_path, &actual_final_path)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "cross-volume copy {} -> {}",
+                            data_path.display(),
+                            actual_final_path.display()
+                        )
+                    })?;
+                tokio::fs::remove_file(&data_path).await.ok();
+            }
+            Err(e) => {
+                return Err(anyhow::Error::from(e).context(format!(
                     "renaming {} -> {}",
                     data_path.display(),
                     actual_final_path.display()
-                )
-            })?;
+                )));
+            }
+        }
 
         // Cleanup: remove the per-id staging dir + registry entry.
         let _ = tokio::fs::remove_dir_all(&state.partial_dir).await;
@@ -947,14 +1083,33 @@ impl FilesHandler {
             Some(p) => p,
             None => {
                 // On-demand fallback (sweep may have raced or the
-                // partial lives under Downloads but registry was
-                // cleared). Synchronous stat under the default
-                // download_dir().
-                let canonical = download_dir()
-                    .context("resolving Downloads for on-demand resume probe")?
-                    .join(".roomler-partial")
-                    .join(id)
-                    .join("meta.json");
+                // partial lives under the staging root but registry
+                // was cleared). rc.22 — the staging root depends on
+                // the strategy: PROGRAMDATA on Windows (always-on by
+                // default), or `<Downloads>/.roomler-partial/` for the
+                // legacy escape-hatch path / non-Windows.
+                let canonical = {
+                    #[cfg(target_os = "windows")]
+                    {
+                        if stage_in_programdata() {
+                            staging_root_windows().join(id).join("meta.json")
+                        } else {
+                            download_dir()
+                                .context("resolving Downloads for on-demand resume probe")?
+                                .join(".roomler-partial")
+                                .join(id)
+                                .join("meta.json")
+                        }
+                    }
+                    #[cfg(not(target_os = "windows"))]
+                    {
+                        download_dir()
+                            .context("resolving Downloads for on-demand resume probe")?
+                            .join(".roomler-partial")
+                            .join(id)
+                            .join("meta.json")
+                    }
+                };
                 if tokio::fs::metadata(&canonical).await.is_err() {
                     return Err(anyhow!("no partial state for id {id}"));
                 }
@@ -3080,5 +3235,152 @@ mod tests {
         );
         drop(g);
         let _ = tokio::fs::remove_dir_all(&dest).await;
+    }
+
+    // ---- rc.22 — always-PROGRAMDATA staging strategy ----
+
+    #[test]
+    fn rc22_stage_in_programdata_is_false_under_cfg_test() {
+        // cfg(test) forces the legacy per-dest layout so the existing
+        // in-crate assertions on `<dest>/.roomler-partial/<id>` still
+        // hold. Production on Windows flips this true; tests stay
+        // false to keep isolation cheap.
+        assert!(
+            !stage_in_programdata(),
+            "tests must use the legacy per-dest staging strategy"
+        );
+    }
+
+    #[test]
+    fn rc22_partial_dir_for_is_legacy_under_cfg_test() {
+        // Pin the contract: in tests, partial_dir_for hands back the
+        // rc.19 per-dest layout regardless of platform. The actual
+        // staging-strategy-flag lock is `STAGE_IN_PROGRAMDATA`.
+        let dest = std::path::Path::new("C:\\some\\dest");
+        let got = partial_dir_for(dest, "abc-123");
+        let want = dest.join(".roomler-partial").join("abc-123");
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn rc22_is_cross_volume_error_recognises_kind() {
+        // The portable case — Rust's ErrorKind::CrossesDevices (stable
+        // 1.85+) directly maps to ERROR_NOT_SAME_DEVICE / EXDEV.
+        let e = std::io::Error::from(std::io::ErrorKind::CrossesDevices);
+        assert!(
+            is_cross_volume_error(&e),
+            "ErrorKind::CrossesDevices must be cross-volume"
+        );
+    }
+
+    #[test]
+    fn rc22_is_cross_volume_error_recognises_raw_os_error() {
+        // Belt-and-suspenders for cases where ErrorKind didn't get
+        // mapped (older runtimes / unusual error sources). Platform-
+        // specific raw codes catch the gap.
+        #[cfg(target_os = "windows")]
+        {
+            let e = std::io::Error::from_raw_os_error(17);
+            assert!(
+                is_cross_volume_error(&e),
+                "Windows raw os error 17 must be cross-volume"
+            );
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let e = std::io::Error::from_raw_os_error(18);
+            assert!(
+                is_cross_volume_error(&e),
+                "Unix raw errno 18 must be cross-volume"
+            );
+        }
+    }
+
+    #[test]
+    fn rc22_is_cross_volume_error_rejects_unrelated() {
+        let e = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert!(
+            !is_cross_volume_error(&e),
+            "NotFound must not be misclassified as cross-volume"
+        );
+        let e = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(
+            !is_cross_volume_error(&e),
+            "PermissionDenied must not be misclassified as cross-volume"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn rc22_staging_root_windows_under_programdata() {
+        // Pin the path shape so an accidental edit (joining the wrong
+        // component, e.g. uploads/ instead of staging/) fails this
+        // test. Both halves matter — the prefix is the PROGRAMDATA
+        // root that ESET is hypothesised to treat differently from
+        // user Downloads; the suffix names what's there.
+        let root = staging_root_windows();
+        let s = root.to_string_lossy().to_lowercase();
+        assert!(
+            s.contains("programdata") || s.contains("c:\\"),
+            "staging root must live under ProgramData: {}",
+            root.display()
+        );
+        assert!(
+            s.ends_with("roomler\\roomler-agent\\staging")
+                || s.ends_with("roomler/roomler-agent/staging"),
+            "staging root must end in roomler\\roomler-agent\\staging: {}",
+            root.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn rc22_sweep_orphans_dir_handles_flat_layout() {
+        // The new sweep_orphans_dir helper scans a directory whose
+        // CHILDREN are per-id staging dirs — used when PROGRAMDATA
+        // staging is active and there's no `.roomler-partial` parent.
+        // This test mirrors `sweep_orphans_deletes_stale_and_keeps_fresh`
+        // but writes the partials directly under the root instead of
+        // under root/.roomler-partial/.
+        let root = std::env::temp_dir().join(format!(
+            "roomler-rc22-flat-{}-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+            std::process::id()
+        ));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let mk = |id: &str, age_secs: i64| {
+            let dir = root.join(id);
+            let meta = PartialMeta {
+                protocol_version: 1,
+                filename: format!("{id}.bin"),
+                expected_size: 100,
+                dest_dir: root.clone(),
+                reserved_final_path: root.join(format!("{id}.bin")),
+                created_at_unix: now - age_secs,
+                rel_path: None,
+            };
+            (dir, meta)
+        };
+        let (stale_dir, stale_meta) = mk("rc22-stale", 25 * 3600);
+        let (fresh_dir, fresh_meta) = mk("rc22-fresh", 3600);
+        for (dir, meta) in [
+            (stale_dir.clone(), stale_meta),
+            (fresh_dir.clone(), fresh_meta),
+        ] {
+            tokio::fs::create_dir_all(&dir).await.unwrap();
+            tokio::fs::write(
+                dir.join("meta.json"),
+                serde_json::to_vec_pretty(&meta).unwrap(),
+            )
+            .await
+            .unwrap();
+            tokio::fs::write(dir.join("data"), b"").await.unwrap();
+        }
+        let (kept, swept) = sweep_orphans_root(&root).await;
+        assert_eq!(swept, 1, "should sweep the 25h-old dir");
+        assert_eq!(kept, 1, "should keep the 1h-old dir");
+        assert!(!stale_dir.exists());
+        assert!(fresh_dir.exists());
+        let _ = tokio::fs::remove_dir_all(&root).await;
     }
 }
