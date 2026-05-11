@@ -53,6 +53,9 @@
 //! before flipping to the live path.
 
 use anyhow::Result;
+// Only the Windows cleanup paths construct PathBuf — gate the import
+// behind cfg so Linux/macOS clippy doesn't flag it as unused.
+#[cfg(target_os = "windows")]
 use std::path::PathBuf;
 
 /// Which MSI flavour is being INSTALLED. The helper cleans the
