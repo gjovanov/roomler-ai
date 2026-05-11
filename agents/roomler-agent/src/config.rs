@@ -127,7 +127,7 @@ pub struct AgentConfig {
 /// Current schema version. Bumped whenever [`migrate`] gains a new
 /// step. Persisted into the config file by the migration so subsequent
 /// runs short-circuit the migration check.
-pub const CURRENT_SCHEMA_VERSION: &str = "0.3.0-rc.20";
+pub const CURRENT_SCHEMA_VERSION: &str = "0.3.0-rc.21";
 
 /// Apply schema migrations to `cfg` in place. Returns `true` when the
 /// caller should persist the mutated config via [`save`]. Safe to call

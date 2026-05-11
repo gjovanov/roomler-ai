@@ -1764,9 +1764,40 @@ fn download_dir() -> Result<PathBuf> {
     {
         return Ok(dl.to_path_buf());
     }
-    // Fall back to the OS temp dir — acceptable for headless CI /
-    // service accounts with no Downloads folder.
-    Ok(std::env::temp_dir())
+    // Windows-specific final fallback (PC50045 2026-05-11 rc.20 field
+    // repro): when the worker is LocalSystem and the user's `Downloads`
+    // is Folder-Redirected to a network share (e.g.
+    // `\\fileserver\UserData$\<user>\Downloads`) that SYSTEM can't
+    // access, `active_user_downloads_path()` returns None AND
+    // `UserDirs::new().download_dir()` returns None. Pre-rc.21 the
+    // code fell back to `std::env::temp_dir()` = `C:\Windows\SystemTemp\`
+    // — which Windows Defender / SmartScreen scan AGGRESSIVELY for
+    // any `.exe`-named write. Defender held the staging `data` file
+    // open during write, `write_all` never landed bytes, browser SCTP
+    // buffer overflowed, retry budget exhausted. Switch the final
+    // fallback to `%PROGRAMDATA%\roomler\roomler-agent\uploads\` —
+    // SYSTEM-writable, persistent across reboots, NOT under
+    // Defender's SystemTemp-scan policy. Operator can find their
+    // landed files there via the `files:complete { path }` reply.
+    #[cfg(target_os = "windows")]
+    {
+        let pd = std::env::var_os("ProgramData")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("C:\\ProgramData"));
+        let staging = pd.join("roomler").join("roomler-agent").join("uploads");
+        tracing::warn!(
+            fallback_path = %staging.display(),
+            "files: no user-accessible Downloads dir (Folder Redirection?); staging in PROGRAMDATA"
+        );
+        Ok(staging)
+    }
+    // Non-Windows: keep the temp-dir final fallback (headless CI,
+    // unusual service accounts on Linux/macOS — those don't have
+    // Defender's SystemTemp-scan problem).
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(std::env::temp_dir())
+    }
 }
 
 #[cfg(test)]
