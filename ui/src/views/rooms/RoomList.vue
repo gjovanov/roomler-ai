@@ -14,6 +14,14 @@
       </v-card-text>
     </v-card>
 
+    <v-card v-else-if="roomStore.rooms.length === 0" variant="outlined" class="text-center pa-4 pa-md-6 pa-lg-8">
+      <v-icon size="48" color="medium-emphasis" class="mb-2">mdi-folder-open-outline</v-icon>
+      <h2 class="text-h6 mb-2">No rooms yet</h2>
+      <p class="text-body-2 text-medium-emphasis mb-4">
+        Create your first room to start chatting, sharing files, or hosting calls with your team.
+      </p>
+    </v-card>
+
     <v-list v-else>
       <template v-for="room in roomStore.rootRooms" :key="room.id">
         <room-tree-item :room="room" :tenant-id="tenantId" :depth="0" />
