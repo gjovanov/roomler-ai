@@ -1,6 +1,7 @@
-import { ref, watch, onBeforeUnmount } from 'vue'
+import { ref, watch, onBeforeUnmount, computed, type Ref, type ComputedRef } from 'vue'
 import { useWsStore } from '@/stores/ws'
 import { api } from '@/api/client'
+import type { Agent } from '@/stores/agents'
 
 /**
  * Remote-control session state machine driven from the controller browser.
@@ -579,9 +580,28 @@ export function filterCapsByPreference(
   return out
 }
 
-export function useRemoteControl() {
+/**
+ * rc.19: optional argument carrying the current agent's reactive
+ * record so the composable can read `capabilities.files` (file-DC
+ * v3 cap list including `"resume"`) without a separate Pinia
+ * dependency. `RemoteControl.vue` passes its `agent: Ref<Agent>`;
+ * tests + older callers can omit it and `supportsResume` falls
+ * back to false (legacy rc.18 fail-fast upload semantics).
+ */
+export function useRemoteControl(agent?: Ref<Agent | null>) {
   const ws = useWsStore()
   const phase = ref<RcPhase>('idle')
+
+  /**
+   * rc.19: resume opt-in gate. True only when the agent has
+   * advertised `"resume"` in `capabilities.files`. Browsers that
+   * see no resume cap (rc.18 agents, or rc.19 agents with browse
+   * disabled) keep the legacy direct-pump-with-fail-fast path.
+   */
+  const supportsResume: ComputedRef<boolean> = computed(() => {
+    const files = agent?.value?.capabilities?.files
+    return Array.isArray(files) && files.includes('resume')
+  })
   const error = ref<string | null>(null)
   const sessionId = ref<string | null>(null)
   /**
@@ -788,10 +808,48 @@ export function useRemoteControl() {
     expectedSize: number | null
     mime?: string
   }
-  type RegistryEntry =
-    | { kind: 'upload'; status: 'pending' | 'settled'; resolve: UploadResolve; reject: (err: Error) => void }
-    | DownloadEntry
+  /**
+   * Upload entry. rc.19 carries enough context to re-pump after a
+   * DC drop:
+   * - `bytesAcked` mirrors the agent's last `files:progress` so
+   *   `files:resume` knows the safest offset to request.
+   * - `file` / `relPath` / `destPath` survive the original
+   *   closure-only state from rc.18's `uploadOne` so the resume
+   *   loop can call `innerPump` again without rebuilding the
+   *   call-site context.
+   * - `status: 'pending-resume'` is the in-between state set by
+   *   the DC-close handler when the agent has the resume cap;
+   *   the wrapper transitions it back to `'pending'` after
+   *   `files:resumed` lands.
+   */
+  type UploadEntry = {
+    kind: 'upload'
+    status: 'pending' | 'pending-resume' | 'settled'
+    resolve: UploadResolve
+    reject: (err: Error) => void
+    bytesAcked: number
+    file: File
+    relPath?: string
+    destPath?: string
+  }
+  type RegistryEntry = UploadEntry | DownloadEntry
   const filesRegistry = new Map<string, RegistryEntry>()
+
+  /**
+   * rc.19: awaiters for `files:resumed { id, accepted_offset }`
+   * replies during the resume handshake window. Separate from
+   * `filesRegistry` because the resume wrapper needs the
+   * resumed reply BEFORE the entry transitions back to `'pending'`
+   * — routing through `filesRegistry.get(id)` would race with the
+   * close-handler's `'pending-resume'` patch. Shape mirrors the
+   * `pendingDirRequests` pattern used for `files:dir-list`.
+   */
+  type ResumeWaiter = {
+    resolve: (acceptedOffset: number) => void
+    reject: (err: Error) => void
+    timer: ReturnType<typeof setTimeout>
+  }
+  const pendingResumePromises = new Map<string, ResumeWaiter>()
   // The browser-side demux contract: while a download `files:offer` is
   // active, every binary frame on the DC belongs to that id. There can
   // only be one active outgoing transfer at a time (server enforces);
@@ -812,7 +870,16 @@ export function useRemoteControl() {
   // Transfers chip in RemoteControl.vue binds to this. Entries auto-prune
   // after 10 s in a terminal state so the panel doesn't grow unboundedly
   // over a long session.
-  type TransferStatus = 'queued' | 'running' | 'complete' | 'error' | 'cancelled'
+  type TransferStatus =
+    | 'queued'
+    | 'running'
+    /** rc.19: DC closed mid-upload but the agent has the resume cap;
+     *  the wrapper is waiting for the WebRTC peer to reconnect so
+     *  it can issue `files:resume`. Operator sees "Reconnecting N/6". */
+    | 'reconnecting'
+    | 'complete'
+    | 'error'
+    | 'cancelled'
   interface Transfer {
     id: string
     kind: 'upload' | 'download'
@@ -829,7 +896,10 @@ export function useRemoteControl() {
   function patchTransfer(id: string, patch: Partial<Transfer>) {
     transfers.value = transfers.value.map((t) => (t.id === id ? { ...t, ...patch } : t))
     if (patch.status === 'complete' || patch.status === 'error' || patch.status === 'cancelled') {
-      // Auto-prune after 10 s in a terminal state.
+      // Auto-prune after 10 s in a terminal state. rc.19 'reconnecting'
+      // is explicitly NOT terminal — the wrapper transitions out of it
+      // either back to 'running' (resume accepted) or to 'error' (6
+      // attempts exhausted), at which point this branch fires again.
       setTimeout(() => {
         transfers.value = transfers.value.filter((t) => t.id !== id)
       }, 10_000)
@@ -1774,6 +1844,9 @@ export function useRemoteControl() {
         entries?: DirEntry[]
         bytes?: number
         message?: string
+        /** rc.19 files:resumed reply — server-authoritative offset
+         *  the browser should re-pump from. */
+        accepted_offset?: number
       }
       try {
         msg = JSON.parse(ev.data)
@@ -1808,10 +1881,22 @@ export function useRemoteControl() {
           entry.resolve({ path: String(msg.path ?? ''), bytes: Number(msg.bytes ?? 0) })
         }
       } else if (msg.t === 'files:error') {
+        const errMsg = String(msg.message ?? 'agent error')
+        // rc.19: if a resume handshake is waiting on this id, route
+        // the error THERE first. The wrapper falls back to a fresh
+        // `files:begin` with a new id (see uploadOneResumable).
+        // The original upload entry stays in `filesRegistry` so the
+        // wrapper can rebind it.
+        const waiter = pendingResumePromises.get(id)
+        if (waiter) {
+          clearTimeout(waiter.timer)
+          pendingResumePromises.delete(id)
+          waiter.reject(new Error(errMsg))
+          return
+        }
         // Errors can land for either an upload OR a download.
         const entry = settleEntry(id)
         if (!entry) return
-        const errMsg = String(msg.message ?? 'agent error')
         patchTransfer(id, { status: 'error', error: errMsg })
         if (entry.kind === 'upload') {
           entry.reject(new Error(errMsg))
@@ -1825,7 +1910,28 @@ export function useRemoteControl() {
           entry.reject(new Error(errMsg))
         }
       } else if (msg.t === 'files:progress') {
-        patchTransfer(id, { status: 'running', bytes: Number(msg.bytes ?? 0) })
+        const bytes = Number(msg.bytes ?? 0)
+        patchTransfer(id, { status: 'running', bytes })
+        // rc.19: each progress envelope is a durable-bytes ack
+        // (agent calls sync_data per 1 MiB before emitting).
+        // Update the upload entry so a future resume request
+        // claims the right offset.
+        const entry = filesRegistry.get(id)
+        if (entry?.kind === 'upload') {
+          entry.bytesAcked = bytes
+        }
+      } else if (msg.t === 'files:resumed') {
+        // rc.19: agent → browser reply confirming the byte offset
+        // from which to re-pump. Routed via pendingResumePromises
+        // (NOT filesRegistry) — the entry is currently in
+        // 'pending-resume' state and we hand control back to the
+        // resume wrapper via this waiter.
+        const waiter = pendingResumePromises.get(id)
+        if (waiter) {
+          clearTimeout(waiter.timer)
+          pendingResumePromises.delete(id)
+          waiter.resolve(Number(msg.accepted_offset ?? 0))
+        }
       } else if (msg.t === 'files:accepted') {
         patchTransfer(id, { status: 'running' })
       } else if (msg.t === 'files:offer') {
@@ -1876,23 +1982,46 @@ export function useRemoteControl() {
         )
       }
     }
-    // DC close: reject every pending transfer with "channel closed".
-    // Otherwise an in-flight upload or download would hang forever
-    // waiting for a terminal message that will never arrive.
+    // DC close handler. Pre-rc.19: every pending transfer is
+    // settled with "channel closed" and the operator has to manually
+    // retry. rc.19: when the agent has the resume cap, UPLOAD
+    // entries are deferred to 'pending-resume' state so the
+    // `uploadOneResumable` wrapper can issue `files:resume` after
+    // the WebRTC peer reconnects (handled by `scheduleReconnect`).
+    // Downloads still fail-fast — host → browser resume is future
+    // work.
     channels.files.onclose = () => {
       activeDownloadId = null
+      // Reject any in-flight resume handshakes — the new DC will
+      // get a fresh waiter.
+      for (const [id, w] of Array.from(pendingResumePromises.entries())) {
+        clearTimeout(w.timer)
+        pendingResumePromises.delete(id)
+        w.reject(new Error('files channel closed mid-resume'))
+      }
+      const errMsg = 'files channel closed'
       for (const id of Array.from(filesRegistry.keys())) {
-        const entry = settleEntry(id)
-        if (!entry) continue
-        const errMsg = 'files channel closed'
+        const entry = filesRegistry.get(id)
+        if (!entry || entry.status === 'settled') continue
+        if (entry.kind === 'upload' && supportsResume.value) {
+          // Defer settle — the uploadOneResumable wrapper is awaiting
+          // the next `phase === 'connected'` and will issue
+          // `files:resume`. Transition to 'pending-resume' so a
+          // late files:complete on a stale DC can't double-settle.
+          entry.status = 'pending-resume'
+          patchTransfer(id, { status: 'reconnecting', error: 'waiting for reconnect' })
+          continue
+        }
+        const settled = settleEntry(id)
+        if (!settled) continue
         patchTransfer(id, { status: 'error', error: errMsg })
-        if (entry.kind === 'upload') {
-          entry.reject(new Error(errMsg))
-        } else if (entry.kind === 'download') {
-          if (entry.writable) {
-            void entry.writable.abort(errMsg).catch(() => {})
+        if (settled.kind === 'upload') {
+          settled.reject(new Error(errMsg))
+        } else if (settled.kind === 'download') {
+          if (settled.writable) {
+            void settled.writable.abort(errMsg).catch(() => {})
           }
-          entry.reject(new Error(errMsg))
+          settled.reject(new Error(errMsg))
         }
       }
     }
@@ -2585,19 +2714,160 @@ export function useRemoteControl() {
    *  the back-compat `uploadFile(file)` shim. Reads agent replies via
    *  the persistent `files` DC listener registered at channel-create
    *  time (see `filesRegistry`). */
+  /**
+   * Sentinel "DC closed mid-upload" error. The resume wrapper
+   * catches THIS specifically and retries; any other Error
+   * propagates straight to the caller.
+   */
+  const CHANNEL_CLOSED_TAG = '__rc19_channel_closed__'
+  function makeChannelClosedError(file: File, offset: number): Error {
+    const pct = file.size === 0 ? 100 : Math.round((offset / file.size) * 100)
+    const err = new Error(
+      `files channel closed mid-upload at ${pct}% (${offset}/${file.size} bytes). ` +
+        `Most likely the remote agent restarted (auto-update / crash / network drop).`
+    )
+    ;(err as Error & { [k: string]: unknown })[CHANNEL_CLOSED_TAG] = true
+    return err
+  }
+  function isChannelClosedError(e: unknown): boolean {
+    return !!(e && typeof e === 'object' && (e as Record<string, unknown>)[CHANNEL_CLOSED_TAG])
+  }
+
+  /**
+   * Inner pump — sends raw chunks from `file.slice(startOffset)` over
+   * the LIVE `channels.files` DC (re-read every invocation, NOT
+   * captured at construction). Throws a channel-closed sentinel when
+   * the DC dies; caller handles retry via `uploadOneResumable`.
+   * Sends the terminal `files:end` envelope on success.
+   *
+   * Used by both the first attempt (after `files:begin`) and every
+   * resume attempt (after `files:resumed`).
+   */
+  async function innerPump(file: File, startOffset: number, id: string): Promise<void> {
+    const CHUNK = 64 * 1024
+    let offset = startOffset
+    // Cancellation: `cancelUpload(id)` settles the registry entry
+    // locally; the pump checks status between chunks and exits.
+    const isCancelled = () => {
+      const e = filesRegistry.get(id)
+      return !e || e.status === 'settled'
+    }
+    while (offset < file.size) {
+      if (isCancelled()) return
+      // P0-3 fix: re-read live channel every loop iteration. After a
+      // DC drop + reconnect, `channels.files` is a NEW
+      // RTCDataChannel; the stale capture would throw "DataChannel
+      // is not opened" indefinitely.
+      const ch = channels.files
+      if (!ch || ch.readyState !== 'open') {
+        throw makeChannelClosedError(file, offset)
+      }
+      // Back off when the sctp buffer fills up so the browser
+      // doesn't OOM on huge files.
+      while (ch.bufferedAmount > 4 * 1024 * 1024) {
+        if (ch.readyState !== 'open') {
+          throw makeChannelClosedError(file, offset)
+        }
+        if (isCancelled()) return
+        await new Promise((r) => setTimeout(r, 20))
+      }
+      const end = Math.min(offset + CHUNK, file.size)
+      const slice = file.slice(offset, end)
+      const buf = await slice.arrayBuffer()
+      // Re-read after the await — readyState can flip during the
+      // ArrayBuffer materialisation.
+      const ch2 = channels.files
+      if (!ch2 || ch2.readyState !== 'open') {
+        throw makeChannelClosedError(file, offset)
+      }
+      if (isCancelled()) return
+      try {
+        ch2.send(buf)
+      } catch {
+        throw makeChannelClosedError(file, offset)
+      }
+      offset = end
+      patchTransfer(id, { status: 'running', bytes: offset })
+    }
+    if (isCancelled()) return
+    const ch = channels.files
+    if (!ch || ch.readyState !== 'open') {
+      throw makeChannelClosedError(file, offset)
+    }
+    try {
+      ch.send(JSON.stringify({ t: 'files:end', id }))
+    } catch {
+      throw makeChannelClosedError(file, offset)
+    }
+  }
+
+  /**
+   * Wait until the WebRTC peer is back in `connected` phase OR the
+   * reconnect ladder gives up (phase transitions to 'error' or
+   * 'closed'). Resolves true on connected, false on terminal.
+   * Cancelled by `onBeforeUnmount` via the same `stop` registry as
+   * the rest of the composable.
+   */
+  function waitForConnected(timeoutMs: number = 30_000): Promise<boolean> {
+    if (phase.value === 'connected') return Promise.resolve(true)
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        stop()
+        resolve(false)
+      }, timeoutMs)
+      const stop = watch(
+        phase,
+        (p) => {
+          if (p === 'connected') {
+            clearTimeout(timer)
+            stop()
+            resolve(true)
+          } else if (p === 'closed' || p === 'error' || p === 'idle') {
+            clearTimeout(timer)
+            stop()
+            resolve(false)
+          }
+        },
+        { immediate: false }
+      )
+    })
+  }
+
+  /**
+   * rc.19 P5: resume-capable wrapper around `innerPump`. First
+   * attempt sends `files:begin`; subsequent attempts send
+   * `files:resume { id, offset: entry.bytesAcked }` and re-pump
+   * from the agent's accepted offset. Up to 6 attempts (matches
+   * RC_RECONNECT_LADDER_MS.length); on exhaustion sends
+   * `files:cancel` so the agent cleans its staging dir immediately.
+   *
+   * Pre-rc.19 behaviour preserved for non-resume agents: the
+   * `supportsResume.value === false` branch falls through to a
+   * single fresh-begin attempt with the original fail-fast error.
+   */
   function uploadOne(
     file: File,
     relPath?: string,
     destPath?: string
   ): Promise<{ path: string; bytes: number }> {
-    const ch = channels.files
-    if (!ch || ch.readyState !== 'open') {
+    const initialCh = channels.files
+    if (!initialCh || initialCh.readyState !== 'open') {
       return Promise.reject(new Error('files channel not open'))
     }
     const id = `up-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
 
     return new Promise((resolve, reject) => {
-      filesRegistry.set(id, { kind: 'upload', status: 'pending', resolve, reject })
+      const entry: UploadEntry = {
+        kind: 'upload',
+        status: 'pending',
+        resolve,
+        reject,
+        bytesAcked: 0,
+        file,
+        relPath,
+        destPath,
+      }
+      filesRegistry.set(id, entry)
       pushTransfer({
         id,
         kind: 'upload',
@@ -2613,109 +2883,155 @@ export function useRemoteControl() {
       // Local error → settle the registry entry ourselves and reject.
       // (Agent-side errors arrive via the persistent listener.)
       const localFail = (err: Error) => {
-        const entry = settleEntry(id)
-        if (entry) {
+        const settled = settleEntry(id)
+        if (settled) {
           patchTransfer(id, { status: 'error', error: err.message })
-          entry.reject(err)
+          settled.reject(err)
         }
       }
 
-      try {
-        if (ch.readyState !== 'open') {
-          throw new Error('files channel closed before files:begin could be sent')
-        }
-        // Folder-upload extension (file-DC v2.1): when `relPath` is
-        // set, send it alongside `name`. Old agents (<0.3.0) ignore
-        // unknown JSON fields and use `name` as the basename, so the
-        // folder structure flattens — graceful degradation. New
-        // agents recreate the directory tree under Downloads/.
-        //
-        // Path-targeted upload extension (file-DC v2.2): when
-        // `destPath` is set, the file lands under `<destPath>/`
-        // instead of Downloads/. Same graceful-degradation contract
-        // — old agents ignore the field. Stacks with `relPath`.
-        const beginMsg: Record<string, unknown> = {
-          t: 'files:begin',
-          id,
-          name: file.name,
-          size: file.size,
-          mime: file.type || undefined,
-        }
-        if (relPath) beginMsg.rel_path = relPath
-        if (destPath) beginMsg.dest_path = destPath
-        ch.send(JSON.stringify(beginMsg))
-      } catch (e) {
-        localFail(e instanceof Error ? e : new Error(String(e)))
-        return
-      }
-
-      const CHUNK = 64 * 1024
-      let offset = 0
-      // Convert raw browser DOMException ("Failed to execute 'send' on
-      // 'RTCDataChannel': RTCDataChannel.readyState is not 'open'")
-      // into a useful message that names the actual cause: the agent
-      // disconnected mid-upload. Most common for agent-MSI uploads
-      // because the receiving agent self-upgrades, which tears down
-      // the WebRTC peer (and therefore every data channel) before the
-      // upload finishes.
-      const channelClosedError = () => {
-        const pct = file.size === 0 ? 100 : Math.round((offset / file.size) * 100)
-        return new Error(
-          `files channel closed mid-upload at ${pct}% (${offset}/${file.size} bytes). ` +
-            `Most likely the remote agent restarted (auto-update / crash / network drop). ` +
-            `Reconnect and retry.`
-        )
-      }
-      // Cancellation: `cancelUpload(id)` settles the registry entry
-      // locally; the pump checks `entry.status === 'settled'` between
-      // chunks and exits cleanly. The bytes already sent stay on the
-      // host (half-uploaded file in Downloads/ — the agent's
-      // short-transfer logic on DC close / next files:end handles it).
-      const isCancelled = () => {
-        const e = filesRegistry.get(id)
-        return !e || e.status === 'settled'
-      }
-      const pump = async () => {
+      function sendBegin(ch: RTCDataChannel): boolean {
         try {
-          while (offset < file.size) {
-            if (isCancelled()) return // already settled by cancelUpload
-            // Back off when the sctp buffer starts filling up so the
-            // browser doesn't OOM on huge files.
-            while (ch.bufferedAmount > 4 * 1024 * 1024) {
-              if (ch.readyState !== 'open') {
-                throw channelClosedError()
-              }
-              if (isCancelled()) return
-              await new Promise((r) => setTimeout(r, 20))
-            }
-            // Recheck readyState before each send: the channel can
-            // transition out of 'open' at any await point above, and
-            // raw `ch.send(buf)` on a closed channel throws a generic
-            // DOMException that obscures the real cause.
-            if (ch.readyState !== 'open') {
-              throw channelClosedError()
-            }
-            const end = Math.min(offset + CHUNK, file.size)
-            const slice = file.slice(offset, end)
-            const buf = await slice.arrayBuffer()
-            if (ch.readyState !== 'open') {
-              throw channelClosedError()
-            }
-            if (isCancelled()) return
-            ch.send(buf)
-            offset = end
-            patchTransfer(id, { status: 'running', bytes: offset })
-          }
           if (ch.readyState !== 'open') {
-            throw channelClosedError()
+            throw new Error('files channel closed before files:begin could be sent')
           }
-          if (isCancelled()) return
-          ch.send(JSON.stringify({ t: 'files:end', id }))
+          // Folder-upload extension (file-DC v2.1) + path-targeted
+          // upload extension (v2.2). Old agents ignore unknown JSON
+          // fields and use `name` as the basename.
+          const beginMsg: Record<string, unknown> = {
+            t: 'files:begin',
+            id,
+            name: file.name,
+            size: file.size,
+            mime: file.type || undefined,
+          }
+          if (relPath) beginMsg.rel_path = relPath
+          if (destPath) beginMsg.dest_path = destPath
+          ch.send(JSON.stringify(beginMsg))
+          return true
         } catch (e) {
           localFail(e instanceof Error ? e : new Error(String(e)))
+          return false
         }
       }
-      void pump()
+
+      // rc.19: send `files:resume { id, offset }` and await the
+      // matching `files:resumed { id, accepted_offset }` (or
+      // `files:error` → reject the waiter, wrapper falls back to a
+      // fresh `files:begin` with a NEW id). 10 s timeout — way more
+      // than the agent's local lookup + truncate + reopen.
+      function sendResume(ch: RTCDataChannel, offset: number): Promise<number> {
+        return new Promise<number>((resolveResume, rejectResume) => {
+          const timer = setTimeout(() => {
+            pendingResumePromises.delete(id)
+            rejectResume(new Error('files:resumed timeout'))
+          }, 10_000)
+          pendingResumePromises.set(id, {
+            resolve: resolveResume,
+            reject: rejectResume,
+            timer,
+          })
+          try {
+            if (ch.readyState !== 'open') {
+              throw new Error('files channel closed before files:resume could be sent')
+            }
+            ch.send(JSON.stringify({ t: 'files:resume', id, offset }))
+          } catch (e) {
+            clearTimeout(timer)
+            pendingResumePromises.delete(id)
+            rejectResume(e instanceof Error ? e : new Error(String(e)))
+          }
+        })
+      }
+
+      function sendCancelBestEffort(): void {
+        const ch = channels.files
+        if (!ch || ch.readyState !== 'open') return
+        try {
+          ch.send(JSON.stringify({ t: 'files:cancel', id }))
+        } catch {
+          /* DC closed between check and send — agent's 24h sweep cleans the partial */
+        }
+      }
+
+      const MAX_ATTEMPTS = RC_RECONNECT_LADDER_MS.length // 6
+      let attempt = 0
+
+      const runOnce = async (): Promise<void> => {
+        // Bail if the operator cancelled or a fatal error already
+        // settled the registry entry.
+        const e = filesRegistry.get(id)
+        if (!e || e.status === 'settled') return
+
+        let startOffset = 0
+        const ch = channels.files
+        if (!ch || ch.readyState !== 'open') {
+          throw makeChannelClosedError(file, e.kind === 'upload' ? e.bytesAcked : 0)
+        }
+
+        if (attempt === 0) {
+          // First attempt — fresh begin.
+          if (!sendBegin(ch)) return
+          // Transition the entry back to 'pending' (it might have been
+          // 'pending-resume' if this is a fresh-id fallback after a
+          // resume error).
+          if (e.kind === 'upload') e.status = 'pending'
+          patchTransfer(id, { status: 'running' })
+        } else {
+          // Resume attempt. supportsResume is already guaranteed
+          // true by the catch-block guard below.
+          patchTransfer(id, {
+            status: 'reconnecting',
+            error: `attempt ${attempt + 1}/${MAX_ATTEMPTS}`,
+          })
+          // Transition back to 'pending' so files:complete settles
+          // through the normal path.
+          if (e.kind === 'upload') e.status = 'pending'
+          const requested = e.kind === 'upload' ? e.bytesAcked : 0
+          const accepted = await sendResume(ch, requested)
+          startOffset = accepted
+          if (e.kind === 'upload') e.bytesAcked = accepted
+          patchTransfer(id, { status: 'running', bytes: startOffset })
+        }
+        await innerPump(file, startOffset, id)
+        // files:end is sent by innerPump on success; the listener
+        // resolves the outer promise on files:complete.
+      }
+
+      const runResumable = async (): Promise<void> => {
+        while (attempt < MAX_ATTEMPTS) {
+          try {
+            await runOnce()
+            return // success — listener resolves via files:complete
+          } catch (err) {
+            const e = filesRegistry.get(id)
+            if (!e || e.status === 'settled') return // settled by listener
+            const canRetry = supportsResume.value && isChannelClosedError(err)
+            if (!canRetry) {
+              localFail(err instanceof Error ? err : new Error(String(err)))
+              return
+            }
+            // Channel closed mid-flight with resume cap — wait for
+            // reconnect and retry.
+            patchTransfer(id, {
+              status: 'reconnecting',
+              error: `attempt ${attempt + 1}/${MAX_ATTEMPTS}`,
+            })
+            const connected = await waitForConnected(30_000)
+            if (!connected) {
+              sendCancelBestEffort()
+              localFail(new Error('reconnect failed; aborting resumable upload'))
+              return
+            }
+            attempt += 1
+          }
+        }
+        // Budget exhausted.
+        sendCancelBestEffort()
+        localFail(new Error(`reconnect budget exhausted after ${MAX_ATTEMPTS} attempts`))
+      }
+
+      void runResumable()
     })
   }
 

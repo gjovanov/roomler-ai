@@ -329,7 +329,10 @@
            with per-row progress and cancel buttons. Hidden when
            there are no transfers to keep the toolbar uncluttered. -->
       <v-menu
-        v-if="rc.phase.value === 'connected' && rc.transfers.value.length > 0"
+        v-if="
+          (rc.phase.value === 'connected' || rc.phase.value === 'reconnecting') &&
+          rc.transfers.value.length > 0
+        "
         :close-on-content-click="false"
         location="bottom end"
       >
@@ -378,7 +381,11 @@
               <v-list-item-subtitle>
                 <span class="text-caption">{{ transferStatusLabel(t) }}</span>
                 <v-progress-linear
-                  v-if="t.status === 'running' || t.status === 'queued'"
+                  v-if="
+                    t.status === 'running' ||
+                    t.status === 'queued' ||
+                    t.status === 'reconnecting'
+                  "
                   :model-value="transferProgressPct(t)"
                   :indeterminate="t.total === null"
                   color="primary"
@@ -388,7 +395,11 @@
               </v-list-item-subtitle>
               <template #append>
                 <v-btn
-                  v-if="t.status === 'running' || t.status === 'queued'"
+                  v-if="
+                    t.status === 'running' ||
+                    t.status === 'queued' ||
+                    t.status === 'reconnecting'
+                  "
                   icon
                   size="x-small"
                   variant="text"
@@ -924,7 +935,12 @@ const agentId = computed(() => route.params.agentId as string)
 const agentStore = useAgentStore()
 const authStore = useAuthStore()
 const agent = ref<Agent | null>(null)
-const rc = useRemoteControl()
+// rc.19: pass the agent ref so useRemoteControl can read
+// `capabilities.files.includes("resume")` and opt into the
+// resumable upload pump. Agent doc is populated on mount;
+// useRemoteControl's `supportsResume` computed reactively
+// flips when the load lands.
+const rc = useRemoteControl(agent)
 const { showSuccess, showError } = useSnackbar()
 const clipboardBusy = ref(false)
 
@@ -1958,19 +1974,35 @@ const phaseLabel = computed(() => {
 
 // Transfers panel helpers. Surfaces the `rc.transfers` ref that's
 // been exposed since file-DC v2 Phase 1 but never rendered in the UI.
-const transfersInFlightCount = computed(() =>
-  rc.transfers.value.filter((t) => t.status === 'running' || t.status === 'queued').length
+const transfersInFlightCount = computed(
+  () =>
+    rc.transfers.value.filter(
+      (t) => t.status === 'running' || t.status === 'queued' || t.status === 'reconnecting'
+    ).length
 )
 // Show in-flight first, then queued, then terminal (ordered by recency
 // — terminals auto-prune 10 s after they enter the list, so the tail
-// is short by construction).
+// is short by construction). rc.19 'reconnecting' ranks between
+// running and queued so the operator's eye finds the in-flight
+// retry quickly.
 const transfersOrdered = computed(() => {
   const order = (s: string) =>
-    s === 'running' ? 0 : s === 'queued' ? 1 : s === 'cancelled' ? 3 : s === 'error' ? 4 : 2
+    s === 'running'
+      ? 0
+      : s === 'reconnecting'
+        ? 1
+        : s === 'queued'
+          ? 2
+          : s === 'cancelled'
+            ? 4
+            : s === 'error'
+              ? 5
+              : 3
   return [...rc.transfers.value].sort((a, b) => order(a.status) - order(b.status))
 })
 function transferStatusColor(t: { status: string }): string {
   if (t.status === 'running') return 'primary'
+  if (t.status === 'reconnecting') return 'warning'
   if (t.status === 'queued') return 'grey'
   if (t.status === 'complete') return 'success'
   if (t.status === 'error') return 'error'
@@ -1984,6 +2016,12 @@ function transferStatusLabel(t: {
   error?: string
 }): string {
   if (t.status === 'queued') return 'Queued'
+  if (t.status === 'reconnecting') {
+    // rc.19: error field carries "attempt N/6" text from the
+    // resume wrapper. Falls back to a generic label if missing.
+    const detail = t.error ?? 'waiting for reconnect'
+    return `Reconnecting — ${detail}`
+  }
   if (t.status === 'running') {
     if (t.total === null) return `${formatFileSize(t.bytes)} (streaming)`
     const pct = t.total > 0 ? Math.round((t.bytes / t.total) * 100) : 0
