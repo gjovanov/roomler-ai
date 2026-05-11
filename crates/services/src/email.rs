@@ -142,7 +142,10 @@ impl EmailService {
                     anyhow::bail!("SendGrid error {}: {}", status, body)
                 }
             }
-            EmailBackend::Smtp { transport, endpoint } => {
+            EmailBackend::Smtp {
+                transport,
+                endpoint,
+            } => {
                 let from_addr: lettre::Address = self.from_email.parse().map_err(|e| {
                     anyhow::anyhow!("Invalid from_email '{}': {}", self.from_email, e)
                 })?;
@@ -318,11 +321,7 @@ impl EmailService {
 mod tests {
     use super::*;
 
-    fn settings(
-        api_key: &str,
-        smtp_host: Option<&str>,
-        smtp_port: Option<u16>,
-    ) -> EmailSettings {
+    fn settings(api_key: &str, smtp_host: Option<&str>, smtp_port: Option<u16>) -> EmailSettings {
         EmailSettings {
             api_key: api_key.to_string(),
             from_email: "noreply@test.local".to_string(),
