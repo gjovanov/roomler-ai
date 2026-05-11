@@ -74,17 +74,18 @@ test.describe('Mentions', () => {
     // doesn't end with /).
     await expect(page).toHaveURL(/\/$|\/[a-z]/, { timeout: 10000 })
 
-    // Navigate to the room
+    // Navigate to the room + wait for network to go idle so all
+    // lazy-loaded chunks (chat view, TipTap editor) have a chance to
+    // hydrate before we target the contenteditable. The 1500ms hard
+    // wait was racy — first-attempt could find the SPA still loading.
     await page.goto(`/tenant/${tenantId}/room/${roomId}`)
-    await page.waitForTimeout(1500)
+    await page.waitForLoadState('networkidle', { timeout: 30000 })
 
-    // Click into the message editor. The compound `.tiptap.ProseMirror`
-    // selector was flaky-passing because Vue's TipTap integration
-    // renders the `tiptap` class on a wrapper and `ProseMirror` on the
-    // contenteditable child — first-attempt could land before the
-    // wrapper class hydrates. Target the contenteditable directly
-    // (same approach as chat.spec.ts:50 + chat-multi.spec.ts:78 fixes).
+    // Click into the message editor (the contenteditable child of the
+    // TipTap wrapper). Wait explicitly for it to be visible so click
+    // doesn't fall into a 30s hard timeout from the implicit retries.
     const editor = page.locator('.ProseMirror[contenteditable="true"]').first()
+    await expect(editor).toBeVisible({ timeout: 30000 })
     await editor.click()
 
     // Type @ to trigger mention autocomplete
