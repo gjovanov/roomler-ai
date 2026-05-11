@@ -134,6 +134,174 @@ pub fn reset_partial_registry() {
     }
 }
 
+/// Per-partial metadata persisted next to the staging `data` file as
+/// `<dest_dir>/.roomler-partial/<id>/meta.json`. Survives agent
+/// restart so [`sweep_orphans`] can rebuild [`PARTIAL_REGISTRY`] from
+/// disk at startup. `protocol_version` is bumped if the on-disk
+/// format ever changes (v2 will add per-chunk SHA roots).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct PartialMeta {
+    pub protocol_version: u32,
+    pub filename: String,
+    pub expected_size: u64,
+    pub dest_dir: PathBuf,
+    /// The begin-time reserved final path. Advisory only — the real
+    /// rename target is recomputed via `unique_path()` at end time
+    /// per M4 fix (operator may have created a file at this path
+    /// while the upload was in flight).
+    pub reserved_final_path: PathBuf,
+    pub created_at_unix: i64,
+    /// Folder-upload context. `Some` when the begin envelope carried
+    /// `rel_path`; needed at end time to recreate the directory tree
+    /// for collision-resolution.
+    #[serde(default)]
+    pub rel_path: Option<String>,
+}
+
+/// Age threshold for [`sweep_orphans`] — partials older than this
+/// get their dir + sidecar deleted at agent startup.
+pub(crate) const PARTIAL_ORPHAN_TTL_SECS: i64 = 24 * 3600;
+
+/// Granularity at which `chunk()` calls `sync_data()` so that the
+/// page cache is flushed to disk at sub-1-MiB intervals. Tuned to
+/// 1 MiB (not 256 KiB) because Windows `FlushFileBuffers` is
+/// 1-30 ms per call under Defender; 35 syscalls for the 35 MB
+/// reference upload keeps overhead < 1% on NVMe and < 10% on HDD.
+/// See plan B2 fix for the trade-off analysis.
+pub(crate) const FSYNC_THRESHOLD_BYTES: u64 = 1024 * 1024;
+
+/// Compute the canonical staging dir path for an upload `id` under
+/// `dest_dir`. Always `<dest_dir>/.roomler-partial/<id>`.
+pub(crate) fn partial_dir_for(dest_dir: &std::path::Path, id: &str) -> PathBuf {
+    dest_dir.join(".roomler-partial").join(id)
+}
+
+/// Apply the Windows hidden attribute to `path`. Logs + continues on
+/// failure (the staging path still works without the hidden bit;
+/// operators on Linux/macOS get the dot-prefix hide instead).
+#[cfg(target_os = "windows")]
+fn set_hidden(path: &std::path::Path) {
+    use std::os::windows::ffi::OsStrExt;
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: wide is a valid null-terminated UTF-16 string from a
+    // PathBuf. FILE_ATTRIBUTE_HIDDEN = 0x2.
+    let ok =
+        unsafe { windows_sys::Win32::Storage::FileSystem::SetFileAttributesW(wide.as_ptr(), 0x2) };
+    if ok == 0 {
+        let err = std::io::Error::last_os_error();
+        tracing::warn!(path = %path.display(), %err, "files: SetFileAttributesW failed; staging dir visible");
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn set_hidden(_path: &std::path::Path) {
+    // Unix relies on the dot-prefix; nothing to do.
+}
+
+/// Walk the Downloads folder's `.roomler-partial/` dir at agent
+/// startup, deleting any per-id subdir whose `meta.json` is older
+/// than [`PARTIAL_ORPHAN_TTL_SECS`] and registering the survivors in
+/// [`PARTIAL_REGISTRY`]. Returns the count of (kept, swept) pairs.
+///
+/// Called synchronously from `main.rs::run_cmd` BEFORE the signaling
+/// task spawns, so no DC can carry a `files:resume` message until
+/// the registry is populated. This closes the B1 race documented in
+/// the plan.
+///
+/// **Coverage limitation**: this v1 sweep only walks Downloads. For
+/// uploads with explicit `dest_path` to arbitrary locations, the
+/// in-memory [`PARTIAL_REGISTRY`] populated at begin time covers
+/// same-process resume. After agent restart those partials are
+/// undiscoverable and the browser falls back to a fresh `files:begin`
+/// with a new id; the orphan dirs are left on disk until the operator
+/// cleans them (no automated cleanup for non-Downloads in v1).
+pub async fn sweep_orphans() -> (usize, usize) {
+    let root = match download_dir() {
+        Ok(d) => d,
+        Err(_) => {
+            tracing::debug!("sweep_orphans: Downloads dir not resolvable; skipping");
+            return (0, 0);
+        }
+    };
+    sweep_orphans_in(&root).await
+}
+
+/// Test-friendly variant taking an explicit root. Production code
+/// calls [`sweep_orphans`] which forwards to this with `download_dir()`.
+/// Tests that exercise the sweep logic pass a `tempfile::TempDir`
+/// root to avoid polluting the user's real Downloads folder on
+/// Windows (where `download_dir()` ignores HOME and resolves via
+/// `KNOWNFOLDERID`).
+pub async fn sweep_orphans_in(root: &std::path::Path) -> (usize, usize) {
+    let dir = root.join(".roomler-partial");
+    let now = chrono::Utc::now().timestamp();
+    let mut kept = 0usize;
+    let mut swept = 0usize;
+
+    let mut rd = match tokio::fs::read_dir(&dir).await {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::debug!(dir = %dir.display(), "sweep_orphans: no .roomler-partial/ dir");
+            return (0, 0);
+        }
+        Err(e) => {
+            tracing::warn!(dir = %dir.display(), %e, "sweep_orphans: read_dir failed");
+            return (0, 0);
+        }
+    };
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        let path = entry.path();
+        if !entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let id = match path.file_name().and_then(|s| s.to_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        let meta_path = path.join("meta.json");
+        let meta_bytes = match tokio::fs::read(&meta_path).await {
+            Ok(b) => b,
+            Err(_) => {
+                // No meta.json — partial state corrupt, prune.
+                let _ = tokio::fs::remove_dir_all(&path).await;
+                swept += 1;
+                continue;
+            }
+        };
+        let meta: PartialMeta = match serde_json::from_slice(&meta_bytes) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(meta = %meta_path.display(), %e, "sweep_orphans: corrupt meta.json; removing");
+                let _ = tokio::fs::remove_dir_all(&path).await;
+                swept += 1;
+                continue;
+            }
+        };
+        if now - meta.created_at_unix > PARTIAL_ORPHAN_TTL_SECS {
+            tracing::info!(
+                id = %id,
+                age_h = (now - meta.created_at_unix) / 3600,
+                "sweep_orphans: removing orphaned partial"
+            );
+            let _ = tokio::fs::remove_dir_all(&path).await;
+            swept += 1;
+            continue;
+        }
+        if let Ok(mut g) = PARTIAL_REGISTRY.lock() {
+            g.insert(id.clone(), meta_path);
+        }
+        kept += 1;
+    }
+    if kept + swept > 0 {
+        tracing::info!(kept, swept, "sweep_orphans: complete");
+    }
+    (kept, swept)
+}
+
 /// Incoming control messages over the `files` DC (string payloads).
 /// Binary payloads are handled separately — they're not JSON.
 ///
@@ -306,13 +474,31 @@ pub struct DirEntryView {
 /// DC closing finishes it.
 pub(crate) struct IncomingTransfer {
     pub id: String,
-    pub path: PathBuf,
     pub expected: u64,
     pub received: u64,
     pub file: File,
     /// Last byte count reported via files:progress. Progress is sent
     /// every ~256 KiB to keep the browser UI lively without flooding.
     pub last_progress: u64,
+    /// rc.19: staging dir `<dest_dir>/.roomler-partial/<id>/`. The
+    /// `data` file is inside; `meta.json` is alongside. `end()`
+    /// renames `<dir>/data` to a fresh unique_path under `dest_dir`
+    /// and removes this dir + the registry entry.
+    pub partial_dir: PathBuf,
+    /// rc.19: target directory captured at begin time so `end()` can
+    /// re-run `unique_path()` against it (M4 fix).
+    pub dest_dir: PathBuf,
+    /// rc.19: sanitized basename captured at begin time for the same
+    /// reason as `dest_dir`.
+    pub filename: String,
+    /// rc.19: byte count at the most recent `sync_data()` call. The
+    /// `chunk()` path advances this every [`FSYNC_THRESHOLD_BYTES`]
+    /// so kernel writeback is durable at the moment we ack progress
+    /// over the wire (B2 fix — survives msiexec TerminateProcess).
+    pub last_synced: u64,
+    /// rc.19: folder-upload context preserved for end-time rename
+    /// (used by `commit_partial` to recreate the directory tree).
+    pub rel_path: Option<String>,
 }
 
 /// Agent → Browser download state. One outgoing transfer is active
@@ -415,8 +601,9 @@ impl FilesHandler {
         // Folder upload: resolve `rel_path` to a path under the
         // target dir, sanitising each component. Falls back to flat
         // upload when rel_path is empty / missing / refused by
-        // sanitisation.
-        let path = match rel_path.filter(|p| !p.is_empty()) {
+        // sanitisation. This is the *reserved* final path; the real
+        // rename target is recomputed at `end()` time per M4 fix.
+        let reserved_final = match rel_path.filter(|p| !p.is_empty()) {
             Some(rel) => resolve_folder_upload_path(&target_dir, rel).unwrap_or_else(|| {
                 tracing::warn!(
                     rel_path = rel,
@@ -426,34 +613,86 @@ impl FilesHandler {
             }),
             None => unique_path(&target_dir, &sanitize_filename(&name)),
         };
-        // Create parent dirs (Downloads itself, plus any rel_path
-        // intermediaries). create_dir_all is idempotent so
-        // pre-existing dirs are fine. For flat uploads `parent` IS
-        // Downloads; for folder uploads it's `Downloads/<root>/sub/`.
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .with_context(|| format!("creating {}", parent.display()))?;
+        let filename = sanitize_filename(&name);
+
+        // rc.19: stage at <dest_dir>/.roomler-partial/<id>/data so a
+        // mid-upload DC drop leaves the partial discoverable (B1 +
+        // B2 fixes). `end()` renames to a freshly-resolved final path.
+        let partial_dir = partial_dir_for(&target_dir, &id);
+
+        // B1 fix — reject if an existing partial dir is on disk for
+        // this id. The browser MUST send `files:resume` instead, or
+        // generate a new UUID. Without this check `File::create(data)`
+        // below would truncate the existing partial. The
+        // `PARTIAL_REGISTRY` lookup is an optimisation — the
+        // authoritative test is the on-disk dir.
+        if tokio::fs::metadata(&partial_dir).await.is_ok() {
+            return Err(anyhow!(
+                "id {id} already has partial state; send files:resume"
+            ));
         }
-        let file = File::create(&path)
+
+        let parent_partial = partial_dir
+            .parent()
+            .expect("partial_dir has a parent by construction");
+        tokio::fs::create_dir_all(parent_partial)
             .await
-            .with_context(|| format!("creating {}", path.display()))?;
+            .with_context(|| format!("creating {}", parent_partial.display()))?;
+        set_hidden(parent_partial);
+        tokio::fs::create_dir_all(&partial_dir)
+            .await
+            .with_context(|| format!("creating {}", partial_dir.display()))?;
+
+        // Write meta.json BEFORE opening the data file. If meta
+        // write fails the staging dir is left empty (cheap to clean).
+        let meta = PartialMeta {
+            protocol_version: 1,
+            filename: filename.clone(),
+            expected_size: expected,
+            dest_dir: target_dir.clone(),
+            reserved_final_path: reserved_final.clone(),
+            created_at_unix: chrono::Utc::now().timestamp(),
+            rel_path: rel_path.map(|s| s.to_string()),
+        };
+        let meta_path = partial_dir.join("meta.json");
+        let meta_bytes =
+            serde_json::to_vec_pretty(&meta).context("serialising partial meta.json")?;
+        tokio::fs::write(&meta_path, &meta_bytes)
+            .await
+            .with_context(|| format!("writing {}", meta_path.display()))?;
+
+        let data_path = partial_dir.join("data");
+        let file = File::create(&data_path)
+            .await
+            .with_context(|| format!("creating {}", data_path.display()))?;
+
+        // Populate the in-memory registry so a same-process resume
+        // request (DC drop without agent restart) can find this
+        // partial without re-running the orphan sweep.
+        if let Ok(mut g) = PARTIAL_REGISTRY.lock() {
+            g.insert(id.clone(), meta_path);
+        }
 
         let mut guard = self.incoming.lock().await;
         if guard.is_some() {
-            // A previous transfer was in-flight and never got files:end
-            // (browser closed or error). Drop it silently — the handler
-            // doesn't persist partial files across DC restarts.
+            // A previous transfer on THIS DC was in-flight and never
+            // got files:end (browser closed or error). Drop it; the
+            // partial dir + meta.json remain on disk for a future
+            // resume attempt (or the orphan sweep after 24h).
         }
         *guard = Some(IncomingTransfer {
             id,
-            path: path.clone(),
             expected,
             received: 0,
             file,
             last_progress: 0,
+            partial_dir,
+            dest_dir: target_dir,
+            filename,
+            last_synced: 0,
+            rel_path: rel_path.map(|s| s.to_string()),
         });
-        Ok(path)
+        Ok(reserved_final)
     }
 
     /// Append binary data to the active incoming transfer. Returns
@@ -476,6 +715,23 @@ impl FilesHandler {
             ));
         }
         state.file.write_all(data).await?;
+        // rc.19 B2 fix — flush the kernel page cache to disk every
+        // FSYNC_THRESHOLD_BYTES so a hard kill (msiexec
+        // TerminateProcess, BSOD, power loss) loses at most one
+        // window of progress, not the entire transfer. Tuned to
+        // 1 MiB; see FSYNC_THRESHOLD_BYTES doc.
+        if state.received - state.last_synced >= FSYNC_THRESHOLD_BYTES {
+            // sync_data flushes file content + metadata required to
+            // read it back, but skips timestamp metadata — faster
+            // than sync_all and sufficient for our durability needs.
+            // Failure is logged but not fatal; the next chunk will
+            // try again. (Disk full / quota errors will surface on
+            // the next write_all anyway.)
+            if let Err(e) = state.file.sync_data().await {
+                tracing::debug!(%e, "files: sync_data failed; will retry next window");
+            }
+            state.last_synced = state.received;
+        }
         let progress = if state.received - state.last_progress >= 256 * 1024 {
             state.last_progress = state.received;
             Some(ChunkProgress {
@@ -488,9 +744,11 @@ impl FilesHandler {
         Ok(progress)
     }
 
-    /// Finalize the active incoming transfer. Flushes the writer and
-    /// clears the state. Returns the final path + total bytes on
-    /// success.
+    /// Finalize the active incoming transfer. Flushes + fsyncs the
+    /// staging `data` file, renames it to a freshly-resolved unique
+    /// final path under `dest_dir`, removes the `.roomler-partial/
+    /// <id>/` dir + registry entry. Returns the *actual* final path
+    /// (may differ from the begin-time reservation per M4 fix).
     pub async fn end(&self, id: &str) -> Result<(PathBuf, u64)> {
         let mut guard = self.incoming.lock().await;
         let Some(mut state) = guard.take() else {
@@ -508,21 +766,115 @@ impl FilesHandler {
         state.file.flush().await?;
         state.file.sync_all().await.ok();
         if state.received != state.expected {
+            // Don't commit the partial — leave the staging dir on disk
+            // so a future files:resume can complete it. Re-insert the
+            // state slot is wrong (we already moved file out of state),
+            // but the partial dir IS the durable state. Browser will
+            // get files:error and may retry via resume.
             return Err(anyhow!(
                 "short transfer: received {} of {} bytes",
                 state.received,
                 state.expected
             ));
         }
-        Ok((state.path, state.received))
+        // Drop the file handle BEFORE the rename — Windows refuses
+        // to rename an open file. tokio::fs::File::drop just queues
+        // close, so we explicitly await... actually drop is fine
+        // because end() returns shortly after; if it ever races, the
+        // commit_partial below would error and the caller surfaces
+        // it. We could `drop(state.file)` explicitly for clarity:
+        drop(state.file);
+
+        // M4 fix: re-run unique_path at rename time so an operator
+        // who created a colliding file mid-upload doesn't make us
+        // overwrite their work.
+        let actual_final_path = match state.rel_path.as_deref().filter(|p| !p.is_empty()) {
+            Some(rel) => resolve_folder_upload_path(&state.dest_dir, rel)
+                .unwrap_or_else(|| unique_path(&state.dest_dir, &state.filename)),
+            None => unique_path(&state.dest_dir, &state.filename),
+        };
+        if let Some(parent) = actual_final_path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("creating final parent {}", parent.display()))?;
+        }
+
+        let data_path = state.partial_dir.join("data");
+        tokio::fs::rename(&data_path, &actual_final_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "renaming {} -> {}",
+                    data_path.display(),
+                    actual_final_path.display()
+                )
+            })?;
+
+        // Cleanup: remove the per-id staging dir + registry entry.
+        let _ = tokio::fs::remove_dir_all(&state.partial_dir).await;
+        if let Ok(mut g) = PARTIAL_REGISTRY.lock() {
+            g.remove(&state.id);
+        }
+        // Best-effort: remove the parent `.roomler-partial/` dir if
+        // it's now empty so the staging convention stays invisible.
+        if let Some(parent) = state.partial_dir.parent() {
+            let _ = tokio::fs::remove_dir(parent).await;
+        }
+
+        Ok((actual_final_path, state.received))
     }
 
     /// Drop any in-flight incoming transfer (DC closed mid-upload).
-    /// The partial file is left on disk; a future version could
-    /// delete it.
+    /// The staging dir is left on disk so a future `files:resume`
+    /// can pick up where it left off. The 24h orphan sweep at the
+    /// next agent startup cleans abandoned partials. Browser-driven
+    /// `files:cancel` (rc.19 P2) deletes the staging dir immediately.
     pub async fn abort(&self) {
         let mut guard = self.incoming.lock().await;
         *guard = None;
+    }
+
+    /// rc.19: cancel an in-flight incoming upload. Removes the per-id
+    /// staging dir + registry entry. Called from the
+    /// `FilesIncoming::Cancel` arm in peer.rs (P2 wiring) when the
+    /// browser's reconnect budget is exhausted. Returns true when an
+    /// upload matched the id (caller logs this for audit clarity).
+    pub async fn cancel_incoming(&self, id: &str) -> bool {
+        // First clear in-flight state if it matches.
+        let mut cleared_state = false;
+        {
+            let mut guard = self.incoming.lock().await;
+            if let Some(state) = guard.as_ref()
+                && state.id == id
+            {
+                *guard = None;
+                cleared_state = true;
+            }
+        }
+        // Remove the staging dir if known via the registry. Even if
+        // in-flight state didn't match, a partial from a previous DC
+        // might still be on disk.
+        let staging = {
+            let g = match PARTIAL_REGISTRY.lock() {
+                Ok(g) => g,
+                Err(_) => return cleared_state,
+            };
+            // meta_path is <dest_dir>/.roomler-partial/<id>/meta.json;
+            // parent is the per-id staging dir.
+            g.get(id).and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        };
+        if let Some(dir) = staging {
+            let _ = tokio::fs::remove_dir_all(&dir).await;
+            if let Some(parent) = dir.parent() {
+                let _ = tokio::fs::remove_dir(parent).await;
+            }
+            if let Ok(mut g) = PARTIAL_REGISTRY.lock() {
+                g.remove(id);
+            }
+            true
+        } else {
+            cleared_state
+        }
     }
 
     /// The id of the currently-active incoming transfer, if any.
@@ -2088,5 +2440,264 @@ mod tests {
         let dl = base.join("Downloads");
         tokio::fs::create_dir_all(&dl).await.unwrap();
         base
+    }
+
+    // ---- rc.19 P1 — staging dir + meta.json + sweep + sync_data ----
+    //
+    // These tests use `dest_path` to override the upload's target
+    // directory because Windows `download_dir()` resolves via
+    // `KNOWNFOLDERID_Downloads`, NOT via HOME/USERPROFILE — so the
+    // existing HOME-redirect pattern other tests use only works on
+    // Linux. `dest_path` is the same operator-chosen-target path
+    // the browser sends when dropping into the drawer's current dir.
+
+    /// Create an isolated `dest_path`-style tempdir for staging tests.
+    /// Use this rather than `tempdir_or_skip` for rc.19 tests so the
+    /// staging dir is fully under our control on every platform.
+    async fn stage_tmpdir() -> PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "roomler-rc19-stage-{}-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+            std::process::id()
+        ));
+        tokio::fs::create_dir_all(&base).await.unwrap();
+        base
+    }
+
+    #[tokio::test]
+    async fn begin_creates_staging_dir_with_meta_json() {
+        reset_partial_registry();
+        let dest = stage_tmpdir().await;
+        let h = FilesHandler::new();
+        let id = format!(
+            "rc19-stage-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        );
+
+        h.begin(
+            id.clone(),
+            "report.pdf".into(),
+            1024,
+            None,
+            Some(dest.to_str().unwrap()),
+        )
+        .await
+        .expect("begin");
+
+        // .roomler-partial/<id>/data + meta.json must exist before
+        // any chunk arrives. `dest_path` is canonicalised by
+        // `validate_outgoing_path` (Win adds `\\?\` UNC prefix), so
+        // compare against the canonicalised root.
+        let canonical_dest = tokio::fs::canonicalize(&dest).await.unwrap();
+        let staging = canonical_dest.join(".roomler-partial").join(&id);
+        assert!(
+            staging.exists(),
+            "staging dir missing: {}",
+            staging.display()
+        );
+        let meta_path = staging.join("meta.json");
+        let data_path = staging.join("data");
+        assert!(meta_path.exists(), "meta.json missing");
+        assert!(data_path.exists(), "data file missing");
+
+        // meta.json round-trips.
+        let bytes = tokio::fs::read(&meta_path).await.unwrap();
+        let meta: PartialMeta = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(meta.protocol_version, 1);
+        assert_eq!(meta.filename, "report.pdf");
+        assert_eq!(meta.expected_size, 1024);
+        assert_eq!(meta.dest_dir, canonical_dest);
+
+        // Registry was populated. Lookup canonicalises to the same
+        // path as what `begin()` stored.
+        let g = PARTIAL_REGISTRY.lock().unwrap();
+        assert_eq!(g.get(&id).map(|p| p.as_path()), Some(meta_path.as_path()));
+        drop(g);
+
+        h.abort().await;
+        let _ = tokio::fs::remove_dir_all(&dest).await;
+    }
+
+    #[tokio::test]
+    async fn end_renames_staging_to_final_and_cleans_dir() {
+        reset_partial_registry();
+        let dest = stage_tmpdir().await;
+        let h = FilesHandler::new();
+        let id = format!(
+            "rc19-end-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        );
+        let reserved = h
+            .begin(
+                id.clone(),
+                "hello.txt".into(),
+                5,
+                None,
+                Some(dest.to_str().unwrap()),
+            )
+            .await
+            .expect("begin");
+        h.chunk(b"hello").await.expect("chunk");
+        let (final_path, bytes) = h.end(&id).await.expect("end");
+        assert_eq!(bytes, 5);
+        // M4 fix: final path matches the begin-time reservation when
+        // there's no operator-induced collision.
+        assert_eq!(final_path, reserved);
+        // File on disk has the payload.
+        let got = tokio::fs::read(&final_path).await.unwrap();
+        assert_eq!(got, b"hello");
+        // Staging dir + per-id dir + parent .roomler-partial/ are
+        // all gone.
+        let staging_parent = dest.join(".roomler-partial");
+        assert!(!staging_parent.join(&id).exists(), "per-id dir leaked");
+        // Registry entry removed.
+        let g = PARTIAL_REGISTRY.lock().unwrap();
+        assert!(g.get(&id).is_none(), "registry entry leaked");
+        drop(g);
+        let _ = tokio::fs::remove_dir_all(&dest).await;
+    }
+
+    #[tokio::test]
+    async fn begin_rejects_existing_partial_dir_for_same_id() {
+        reset_partial_registry();
+        let dest = stage_tmpdir().await;
+        let h = FilesHandler::new();
+        let id = format!(
+            "rc19-collide-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        );
+
+        // First begin → success, staging dir exists.
+        h.begin(
+            id.clone(),
+            "a.txt".into(),
+            4,
+            None,
+            Some(dest.to_str().unwrap()),
+        )
+        .await
+        .expect("first begin");
+        // Drop the in-flight state so the second begin doesn't
+        // collide on the Mutex — only the on-disk dir should block.
+        h.abort().await;
+
+        // Second begin with the SAME id MUST fail — without this
+        // guard, File::create(data) would truncate the partial and
+        // destroy progress (B1 fix).
+        let second = h
+            .begin(
+                id.clone(),
+                "a.txt".into(),
+                4,
+                None,
+                Some(dest.to_str().unwrap()),
+            )
+            .await;
+        assert!(second.is_err(), "second begin should reject");
+        let msg = second.unwrap_err().to_string();
+        assert!(
+            msg.contains("already has partial state") || msg.contains("send files:resume"),
+            "unexpected error message: {msg}"
+        );
+        let _ = tokio::fs::remove_dir_all(&dest).await;
+    }
+
+    #[tokio::test]
+    async fn chunk_syncs_data_at_one_mib_boundary() {
+        reset_partial_registry();
+        let dest = stage_tmpdir().await;
+        let h = FilesHandler::new();
+        let id = format!(
+            "rc19-sync-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        );
+        // 1.5 MiB total — one sync at 1 MiB boundary, none at 1.5.
+        let size = (FSYNC_THRESHOLD_BYTES + 512 * 1024) as usize;
+        h.begin(
+            id.clone(),
+            "big.bin".into(),
+            size as u64,
+            None,
+            Some(dest.to_str().unwrap()),
+        )
+        .await
+        .expect("begin");
+
+        // 6 chunks × 256 KiB = 1.5 MiB.
+        let chunk = vec![0xABu8; 256 * 1024];
+        for _ in 0..6 {
+            h.chunk(&chunk).await.expect("chunk");
+        }
+
+        // On-disk size matches everything we wrote (sync_data is the
+        // observable proxy: page cache flushed at the 1 MiB boundary).
+        let staging = dest.join(".roomler-partial").join(&id);
+        let data_meta = tokio::fs::metadata(staging.join("data")).await.unwrap();
+        assert_eq!(data_meta.len() as usize, 6 * 256 * 1024);
+
+        // Internal state: last_synced advanced past 1 MiB exactly
+        // once. Chunks 1..4 = 1 MiB exactly → first sync there
+        // (received == FSYNC_THRESHOLD_BYTES, delta == threshold).
+        // Chunks 5..6 = 1.5 MiB total → delta = 0.5 MiB < threshold,
+        // no second sync.
+        let guard = h.incoming.lock().await;
+        let state = guard.as_ref().expect("state");
+        assert_eq!(state.last_synced, FSYNC_THRESHOLD_BYTES);
+        drop(guard);
+
+        h.abort().await;
+        let _ = tokio::fs::remove_dir_all(&dest).await;
+    }
+
+    #[tokio::test]
+    async fn sweep_orphans_deletes_stale_and_keeps_fresh() {
+        reset_partial_registry();
+        let dest = stage_tmpdir().await;
+        // Build two fake partial dirs by hand: one 25h old, one 1h old.
+        let root = dest.join(".roomler-partial");
+        let now = chrono::Utc::now().timestamp();
+        let mk = |id: &str, age_secs: i64| {
+            let dir = root.join(id);
+            let meta = PartialMeta {
+                protocol_version: 1,
+                filename: format!("{id}.bin"),
+                expected_size: 100,
+                dest_dir: dest.clone(),
+                reserved_final_path: dest.join(format!("{id}.bin")),
+                created_at_unix: now - age_secs,
+                rel_path: None,
+            };
+            (dir, meta)
+        };
+        let (stale_dir, stale_meta) = mk("rc19-sweep-stale", 25 * 3600);
+        let (fresh_dir, fresh_meta) = mk("rc19-sweep-fresh", 3600);
+        for (dir, meta) in [
+            (stale_dir.clone(), stale_meta),
+            (fresh_dir.clone(), fresh_meta),
+        ] {
+            tokio::fs::create_dir_all(&dir).await.unwrap();
+            tokio::fs::write(
+                dir.join("meta.json"),
+                serde_json::to_vec_pretty(&meta).unwrap(),
+            )
+            .await
+            .unwrap();
+            tokio::fs::write(dir.join("data"), b"").await.unwrap();
+        }
+
+        let (kept, swept) = sweep_orphans_in(&dest).await;
+        assert_eq!(swept, 1, "should sweep the 25h-old dir");
+        assert_eq!(kept, 1, "should keep the 1h-old dir");
+        assert!(!stale_dir.exists(), "stale dir should be removed");
+        assert!(fresh_dir.exists(), "fresh dir should survive");
+        // Fresh entry is in the registry.
+        let g = PARTIAL_REGISTRY.lock().unwrap();
+        assert!(
+            g.contains_key("rc19-sweep-fresh"),
+            "fresh id missing from registry: {:?}",
+            g.keys().collect::<Vec<_>>()
+        );
+        drop(g);
+        let _ = tokio::fs::remove_dir_all(&dest).await;
     }
 }

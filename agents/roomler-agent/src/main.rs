@@ -823,6 +823,19 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         async move { watchdog::run(wd, rx, watchdog::force_exit_on_stall).await }
     });
 
+    // rc.19 B1 fix: rebuild the partial-upload registry from disk
+    // BEFORE the signaling task spawns. The synchronous await
+    // guarantees no DC can carry a `files:resume` message until the
+    // registry knows about every surviving `.roomler-partial/<id>/`
+    // under Downloads. Sweep also deletes >24h-old orphans. Sweep
+    // failure (e.g. Downloads inaccessible under SYSTEM context)
+    // logs a debug message and continues — same-process resume via
+    // `begin()`-time registry writes still works.
+    let (kept, swept) = roomler_agent::files::sweep_orphans().await;
+    if kept + swept > 0 {
+        tracing::info!(kept, swept, "rc19: partial-registry warm-up");
+    }
+
     let sig_task = tokio::spawn({
         let rx = shutdown_rx.clone();
         async move { signaling::run(cfg, encoder_preference, rx).await }
