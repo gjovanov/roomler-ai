@@ -389,6 +389,13 @@ enum BrowserToAgent {
     Cancel { id: String },
     #[serde(rename = "files:dir")]
     Dir { req_id: String, path: String },
+    #[serde(rename = "files:resume")]
+    Resume {
+        id: String,
+        offset: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sha256_prefix: Option<String>,
+    },
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -425,6 +432,8 @@ enum AgentToBrowser {
     },
     #[serde(rename = "files:dir-error")]
     DirError { req_id: String, message: String },
+    #[serde(rename = "files:resumed")]
+    Resumed { id: String, accepted_offset: u64 },
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -595,6 +604,54 @@ async fn run_upload(
             other => return Err(anyhow!("unexpected: {other:?}")),
         }
     }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// rc.19 — files:resume round-trip
+// ────────────────────────────────────────────────────────────────────────────
+//
+// The full begin → close-DC → resume cross-DC round-trip exercises
+// SCTP teardown semantics that webrtc-rs handles inconsistently in
+// the loopback test harness (the second DC's chunk loop races the
+// first DC's close on Windows). The lib tests in `files.rs`
+// (resume_round_trips_after_partial_upload,
+// resume_truncates_when_disk_size_below_requested) cover the same
+// end-to-end mechanics by driving `FilesHandler::resume_incoming`
+// directly. The wire-format integration test below pins the
+// envelope shape — the resume_unknown_id_emits_error path is the
+// fallback the browser's auto-resume wrapper relies on.
+
+/// `files:resume` for an id the agent has never seen → `files:error`.
+/// Browser's fall-through-to-fresh-begin path depends on this.
+#[tokio::test]
+async fn resume_unknown_id_emits_error() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let mut side = open_files_dc().await.expect("open dc");
+        let id = format!("nope-{}", std::process::id());
+        side.send_json(&BrowserToAgent::Resume {
+            id: id.clone(),
+            offset: 4 * 1024 * 1024,
+            sha256_prefix: None,
+        })
+        .await
+        .expect("send resume");
+        let reply: AgentToBrowser = side
+            .recv_json(Duration::from_secs(5))
+            .await
+            .expect("recv error");
+        match reply {
+            AgentToBrowser::Error { id: ei, message } => {
+                assert_eq!(ei, id);
+                assert!(
+                    message.contains("no partial state") || message.contains("Downloads"),
+                    "unexpected error message: {message}"
+                );
+            }
+            other => panic!("expected files:error, got {other:?}"),
+        }
+    })
+    .await
+    .expect("test exceeded 15s timeout");
 }
 
 // ────────────────────────────────────────────────────────────────────────────
