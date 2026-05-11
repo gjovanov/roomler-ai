@@ -121,9 +121,14 @@ test.describe('Email-related flows', () => {
     })
 
     test('sending a mention creates a notification for the mentioned user', async () => {
-      // Admin sends a message mentioning the member
+      // Admin sends a message mentioning the member. Backend doesn't
+      // parse `@username` out of content — the frontend computes
+      // mentions client-side and sends explicit user IDs, so the API
+      // helper must do the same to trigger the notification path.
       const mentionContent = `Hey @${memberUser.username} please review this`
-      await sendMessageViaApi(adminToken, tenantId, roomId, mentionContent)
+      await sendMessageViaApi(adminToken, tenantId, roomId, mentionContent, {
+        users: [memberUserId],
+      })
 
       // Poll unread-count until the notification appears. The mention
       // creation flow detects @username inline, writes the notification
@@ -147,9 +152,12 @@ test.describe('Email-related flows', () => {
     })
 
     test('notifications API returns mention notification details', async () => {
-      // Send mention
+      // Send mention with explicit user IDs — same reason as the
+      // previous test (backend doesn't parse @username from content).
       const mentionContent = `Heads up @${memberUser.username}!`
-      await sendMessageViaApi(adminToken, tenantId, roomId, mentionContent)
+      await sendMessageViaApi(adminToken, tenantId, roomId, mentionContent, {
+        users: [memberUserId],
+      })
 
       // Same poll-until-visible pattern as the test above.
       let notifications: Array<{ id: string; type: string; is_read: boolean }> = []
