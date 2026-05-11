@@ -177,9 +177,11 @@ spec:
               value: "http://roomler2"
             - name: VITE_API_URL
               value: "http://roomler2"
-            # Mailpit HTTP API endpoint used by `fetchActivationEmail`
+            # Mailpit HTTP API endpoint used by fetchActivationEmail
             # in the email-flows spec. Mailpit's web UI / REST API
-            # listens on :8025 inside the cluster.
+            # listens on :8025 inside the cluster. (Backticks in this
+            # comment would be eaten by bash command-substitution in
+            # the heredoc — kept plain for safety.)
             - name: E2E_MAILPIT_URL
               value: "http://mailpit:8025"
             - name: CI
