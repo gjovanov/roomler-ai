@@ -189,6 +189,25 @@ module.exports = defineConfig({
             // a port flag in the final args list, so Chrome itself
             // gets the right transport.
             '--remote-debugging-port=0',
+            // Disable Chromium feature gates that intermittently fire
+            // `net::ERR_ACCESS_DENIED` against `http://roomler2/...`
+            // from inside the e2e cluster:
+            //   - BlockInsecurePrivateNetworkRequests / InsecurePrivate
+            //     NetworkSubresources: Chrome's CORS-RFC1918 gate; a
+            //     page on `roomler2` (cluster-private IP) loading
+            //     subresources from the same private IP can be blocked
+            //     post-redirect once the navigation crosses the
+            //     "treat-as-public" heuristic threshold for any frame.
+            //   - HttpsUpgrades / HttpsFirstBalancedMode: Chrome auto-
+            //     upgrade HTTP→HTTPS for "known typed" hosts; once a
+            //     run has hit a navigation that matches the heuristic,
+            //     subsequent http navigations to the same host fail
+            //     fast with ERR_ACCESS_DENIED because no HTTPS server
+            //     is bound.
+            //   - DnsHttpsSvcb / EncryptedClientHello: peripheral DNS
+            //     features that occasionally interact badly with the
+            //     bun-WebSocket CDP path.
+            '--disable-features=BlockInsecurePrivateNetworkRequests,InsecurePrivateNetworkSubresources,HttpsUpgrades,HttpsFirstBalancedMode,DnsHttpsSvcb,EncryptedClientHello',
           ],
         },
       },
