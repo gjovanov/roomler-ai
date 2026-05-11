@@ -32,7 +32,13 @@ pub async fn list(
             name: t.name,
             slug: t.slug,
             owner_id: t.owner_id.to_hex(),
-            plan: format!("{:?}", t.plan),
+            // Plan enum is `#[serde(rename_all = "snake_case")]` so it
+            // serializes as "free"/"pro"/"business"/"enterprise" via
+            // serde. The frontend's plan cards (and Stripe /plans
+            // response) use lowercase ids — Debug-formatting gives
+            // "Free"/"Pro" which doesn't match, breaking the
+            // currentPlan comparison.
+            plan: format!("{:?}", t.plan).to_lowercase(),
         })
         .collect();
 
@@ -54,7 +60,7 @@ pub async fn create(
         name: tenant.name,
         slug: tenant.slug,
         owner_id: tenant.owner_id.to_hex(),
-        plan: format!("{:?}", tenant.plan),
+        plan: format!("{:?}", tenant.plan).to_lowercase(),
     }))
 }
 
@@ -78,6 +84,6 @@ pub async fn get(
         name: tenant.name,
         slug: tenant.slug,
         owner_id: tenant.owner_id.to_hex(),
-        plan: format!("{:?}", tenant.plan),
+        plan: format!("{:?}", tenant.plan).to_lowercase(),
     }))
 }
