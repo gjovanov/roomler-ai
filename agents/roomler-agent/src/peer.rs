@@ -2301,6 +2301,28 @@ async fn handle_files_control(
                 }
             }
         }
+        crate::files::FilesIncoming::Resume {
+            id,
+            offset,
+            sha256_prefix: _,
+        } => {
+            // P0 wire-format-only stub. P2 (resume handler) replaces
+            // this with a real lookup against PARTIAL_REGISTRY + a
+            // 256 KiB-aligned truncate on the staging `data` file
+            // before replying `files:resumed { id, accepted_offset }`.
+            // For now we always reply `files:error` so the rc.19
+            // browser falls back to a fresh `files:begin` with a new
+            // id — preserves correctness while P1/P2 land.
+            info!(%session_id, %id, %offset, "files: resume (P0 stub — no partial state)");
+            send_files_json(
+                &dc,
+                &crate::files::FilesOutgoing::Error {
+                    id: &id,
+                    message: "resume not yet implemented (P0 stub)",
+                },
+            )
+            .await;
+        }
     }
 }
 
