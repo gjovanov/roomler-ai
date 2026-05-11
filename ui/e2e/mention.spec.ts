@@ -78,8 +78,13 @@ test.describe('Mentions', () => {
     await page.goto(`/tenant/${tenantId}/room/${roomId}`)
     await page.waitForTimeout(1500)
 
-    // Click into the message editor
-    const editor = page.locator('.tiptap.ProseMirror')
+    // Click into the message editor. The compound `.tiptap.ProseMirror`
+    // selector was flaky-passing because Vue's TipTap integration
+    // renders the `tiptap` class on a wrapper and `ProseMirror` on the
+    // contenteditable child — first-attempt could land before the
+    // wrapper class hydrates. Target the contenteditable directly
+    // (same approach as chat.spec.ts:50 + chat-multi.spec.ts:78 fixes).
+    const editor = page.locator('.ProseMirror[contenteditable="true"]').first()
     await editor.click()
 
     // Type @ to trigger mention autocomplete
