@@ -699,7 +699,11 @@ jobs:
       - name: Flatten artifact tree
         run: |
           mkdir -p release
-          find dist -type f \( -name '*.msi' -o -name '*.pkg' -o -name '*.deb' -o -name '*.sha256' \) \
+          # rc.18: include `.exe` so the tray companion EXE makes
+          # the GitHub Release alongside the agent MSI/.pkg/.deb. The
+          # `windows-msi` artifact bundles agent MSIs + tray EXE +
+          # all .sha256 files; flatten preserves them all.
+          find dist -type f \( -name '*.msi' -o -name '*.pkg' -o -name '*.deb' -o -name '*.exe' -o -name '*.sha256' \) \
             -exec mv {} release/ \;
           ls -la release/
 
