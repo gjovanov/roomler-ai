@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Roomler Agent Tray",
-  "version": "0.3.0-rc.18",
+  "version": "0.3.0-rc.19",
   "identifier": "ai.roomler.agent-tray",
   "build": {
     "frontendDist": "../src/front",
