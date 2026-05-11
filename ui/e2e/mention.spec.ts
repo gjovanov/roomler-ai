@@ -7,6 +7,7 @@ import {
   joinRoomViaApi,
   addTenantMemberViaApi,
   fetchMembersViaApi,
+  loginViaUi,
 } from './fixtures/test-helpers'
 
 test.describe('Mentions', () => {
@@ -63,16 +64,13 @@ test.describe('Mentions', () => {
   })
 
   test('mention autocomplete shows room members in chat', async ({ page }) => {
-    // Login as admin — use USERNAME (the login API matches on
-    // username, not email; email-as-username login fails silently
-    // and leaves the page at /login).
-    await page.goto('/login')
-    await page.locator('input').first().fill(adminUser.username)
-    await page.locator('input[type="password"]').fill(adminUser.password)
-    await page.getByRole('button', { name: /login/i }).click()
-    // Post-login URL is "/" (no trailing-slash test — the host part
-    // doesn't end with /).
-    await expect(page).toHaveURL(/\/$|\/[a-z]/, { timeout: 10000 })
+    // Use loginViaUi (same path that chat.spec.ts:50 + chat-multi
+    // .spec.ts:78 use to land on the chat view reliably). The
+    // previous inline form-fill had a permissive URL regex that
+    // would pass even if login silently failed and left the page at
+    // /login, then the subsequent /tenant/.../room goto would
+    // redirect back to /landing and the editor would never mount.
+    await loginViaUi(page, adminUser.username, adminUser.password)
 
     // Navigate to the room + wait for network to go idle so all
     // lazy-loaded chunks (chat view, TipTap editor) have a chance to
