@@ -374,7 +374,7 @@ fn open_path_in_explorer(path: &std::path::Path) -> Result<(), String> {
             .arg(path)
             .spawn()
             .map_err(|e| format!("open: {e}"))?;
-        return Ok(());
+        Ok(())
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
@@ -382,7 +382,7 @@ fn open_path_in_explorer(path: &std::path::Path) -> Result<(), String> {
             .arg(path)
             .spawn()
             .map_err(|e| format!("xdg-open: {e}"))?;
-        return Ok(());
+        Ok(())
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos", unix)))]
     {
