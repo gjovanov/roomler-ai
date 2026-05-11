@@ -27,8 +27,10 @@ resources:
   - service-redis.yaml
   - service-minio.yaml
   - service-roomler2.yaml
+  - service-mailpit.yaml
   - deployment-redis.yaml
   - deployment-roomler2.yaml
+  - deployment-mailpit.yaml
   - statefulset-mongodb.yaml
   - statefulset-minio.yaml
 
