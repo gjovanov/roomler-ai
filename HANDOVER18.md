@@ -25,23 +25,35 @@ For e069019 on PC50045 specifically: `active_user_downloads_path()` resolves to 
 **Confirmed working**: 3 KB .sql, 11 KB .zip.
 **Confirmed failing**: 14 MB .exe.
 
-**Working hypothesis** (untested as of session end): **Windows Defender Real-Time Protection** scans the staging `data` file during write. For small writes Defender completes in microseconds; for large writes Defender holds the file handle, the agent's `chunk()` `write_all` stalls, SCTP receive window fills on the agent side, browser's `bufferedAmount` climbs, eventually WebRTC keepalive times out, DC closes, wrapper retries 6× into the same wall.
+**Working hypothesis** (REVISED 2026-05-12): **ESET Security real-time scanner** intercepts the staging `data` file writes. PC50045 has `C:\Program Files\ESET\ESET Security\ekrn.exe` running — the user's box is an ESET-protected corporate Win11, NOT Defender. Initial Defender-exclusion test was a misfire (`Add-MpPreference` adds Defender exclusion; doesn't affect ESET). User-side test confirmed: large .zip still fails after Defender exclusion was added.
 
-**Quick test for the next session** (could be done immediately):
+PC50045 ESET stack:
+- `ekrn.exe` — ESET kernel service
+- `efwd.exe` — ESET firewall daemon
+- `egui.exe`/`eguiProxy.exe` — ESET GUI
+- `ERAAgent.exe` — ESET Remote Administrator (managed by central console)
 
-```powershell
-# On PC50045 as admin
-Add-MpPreference -ExclusionPath "C:\Users\e069019\Downloads\.roomler-partial"
-Add-MpPreference -ExclusionPath "C:\Program Files\roomler-agent"
-(Get-MpPreference).ExclusionPath
-```
+The box is also heavily managed: SCCM (`C:\Windows\ccm`, `ccmsetup`), Tanium endpoint client (`C:\Program Files (x86)\Tanium\Tanium Client`), Dameware remote support. Multiple users on the same machine (`e069019`, `extjovanov`, `f002459`, `sichern2`, `Werkstatt`). Adding ESET exclusions probably requires the central ESET Remote Admin console; can't be done locally.
 
-Retry the 14 MB upload. If it succeeds → rc.22 should add the exclusion via WiX `<CustomAction>` at MSI install time (one-line PowerShell call from elevated install context).
+**Three options for rc.22**:
 
-If it STILL fails after exclusion → Defender isn't the culprit, and we need deeper diagnostics:
-- SCTP receive-buffer instrumentation
-- Agent log line per chunk arrival (debug-level tracing)
-- WebRTC stats dump from `chrome://webrtc-internals/` during the failure
+**Option A**: **Compress or obfuscate the staging content** so ESET's pattern matchers don't recognize it as a PE binary mid-write. E.g., write the file in chunks XOR'd with a key, then decode at end-time rename. Complex; might trigger different AV heuristics; fragile.
+
+**Option B**: **Stage in a heavily-protected SYSTEM location** ESET likely whitelists. Candidates:
+- `%PROGRAMDATA%\roomler-agent\staging\<id>\` — same place as `peer-connected.lock`; if `ERAAgent.exe` whitelists `ekrn`'s own folder pattern, our PROGRAMDATA might inherit similar leniency. UNTESTED. Cross-volume rename to user Downloads at end-time costs ~200 ms on SSD for 14 MB.
+- `C:\Windows\Temp\<id>\` — system Temp; sometimes excluded for ConfigMgr operations. UNTESTED.
+- The agent's own install dir `C:\Program Files\roomler-agent\staging\` — but installer-folder writes from a service typically trip AV more, not less.
+
+**Option C**: **Throttle chunk writes** to a rate that lets ESET scan each chunk in real time without backing up SCTP. E.g., 1 chunk per 50ms = 1.3 MiB/s sustained. Reasonable for control-plane operations; slow for big uploads. Browser side: clamp pump rate. Tested fix shape only — doesn't guarantee resolution.
+
+**Option D** (the right long-term fix): **Document that operators need an ESET / corporate-AV exclusion for `C:\Program Files\roomler-agent\` + the staging path**, and provide a one-line `eset_admin` request for ops teams to file. Add the request template into the rc.22 release notes.
+
+**For the next session**:
+1. Have user try uploading a 5 MB file (between 11 KB success threshold and 14 MB failure) to identify the exact SIZE threshold. Tells us if it's chunk-count-based or absolute-size-based.
+2. Tail agent log during a failed large upload — look for chunk-callback warnings, write_all error returns, anything ESET-related.
+3. Check ESET log if accessible (typically `C:\ProgramData\ESET\ESET Security\Logs\` — may require admin).
+4. Test Option B with a quick patch: hard-code staging at `%PROGRAMDATA%\roomler\roomler-agent\staging\` ALWAYS (not just on Downloads-redirect fallback). One-line change.
+5. If Option B fails, escalate to Option D — request ESET exclusion via corporate IT.
 
 **Files of interest**:
 - `agents/roomler-agent/src/files.rs::chunk()` — the per-chunk write loop, ~line 460
