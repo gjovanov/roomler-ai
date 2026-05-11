@@ -80,14 +80,17 @@ test.describe('Multi-Participant Chat (dedup)', () => {
     await loginViaUi(page, users[0].user.username, users[0].user.password)
     await page.goto(`/tenant/${tenantId}/room/${roomId}`)
 
-    // Wait for chat view to load
-    const input = page.getByPlaceholder(/type a message/i)
+    // Wait for chat view to load. MessageEditor is TipTap contenteditable,
+    // not <textarea>, so target the ProseMirror root (same approach as
+    // chat.spec.ts:50 fix).
+    const input = page.locator('.ProseMirror[contenteditable="true"]').first()
     await expect(input).toBeVisible({ timeout: 10000 })
 
     // Send a message through the UI
     const uniqueMsg = `No-dup test ${Date.now()}`
-    await input.fill(uniqueMsg)
-    await input.press('Enter')
+    await input.click()
+    await page.keyboard.type(uniqueMsg)
+    await page.keyboard.press('Enter')
 
     // Wait for the message to appear
     await expect(page.getByText(uniqueMsg)).toBeVisible({ timeout: 10000 })
