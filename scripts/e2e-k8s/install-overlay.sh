@@ -48,24 +48,16 @@ if kubectl get namespace roomler-ai-e2e >/dev/null 2>&1; then
     fi
   fi
 
-  # Pull the real email API key from the prod sealed-secret (after
-  # bitnami-sealed-secrets has decrypted it into a regular Secret in
-  # roomler-ai). Lets the e2e roomler2 instance try real email sends
-  # for activation if you turn off ROOMLER__AUTH__AUTO_VERIFY in the
-  # configmap. Currently the configmap pins auto_verify=true so the
-  # email-send path is bypassed; this just keeps the credential up
-  # to date so flipping auto_verify off doesn't crash the API on
-  # missing config.
-  PROD_EMAIL_KEY=$(kubectl -n roomler-ai get secret roomler2-secret \
-    -o jsonpath='{.data.ROOMLER__EMAIL__API_KEY}' 2>/dev/null \
-    | base64 -d 2>/dev/null || true)
-  if [ -n "$PROD_EMAIL_KEY" ]; then
-    echo "Patching e2e roomler2-secret with prod ROOMLER__EMAIL__API_KEY"
-    kubectl -n roomler-ai-e2e patch secret roomler2-secret --type=json -p "$(
-      printf '[{"op":"add","path":"/stringData","value":{"ROOMLER__EMAIL__API_KEY":"%s"}}]' \
-        "$PROD_EMAIL_KEY"
-    )" >/dev/null 2>&1 || true
-  fi
+  # Cycle 4 Chunk 1: we ACTIVELY route outbound mail through Mailpit
+  # via the SMTP backend (configmap sets ROOMLER__EMAIL__SMTP_HOST +
+  # SMTP_PORT). EmailService::from_settings prefers SendGrid when
+  # api_key is non-empty, so we must NOT copy the prod SendGrid key
+  # into the e2e secret — doing so would silently route every send
+  # to the real SendGrid account instead of Mailpit. The patch that
+  # previously copied ROOMLER__EMAIL__API_KEY from prod is removed
+  # here. If you want to test the SendGrid path explicitly, set it
+  # back manually with `kubectl -n roomler-ai-e2e patch secret ...`.
+  :
 fi
 
 echo

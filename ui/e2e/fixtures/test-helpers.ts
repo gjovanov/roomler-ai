@@ -1,6 +1,7 @@
 import { type Page, expect } from '@playwright/test'
 
 const API_URL = process.env.E2E_API_URL || 'http://localhost:5001'
+const MAILPIT_URL = process.env.E2E_MAILPIT_URL || 'http://localhost:8025'
 
 let userCounter = 0
 
@@ -292,6 +293,103 @@ export async function fetchMembersViaApi(
     }>
     total: number
   }
+}
+
+/**
+ * Shape of one entry in Mailpit's `/api/v1/messages` listing —
+ * we destructure just the fields we need. See
+ * https://mailpit.axllent.org/docs/api-v1/ for the full schema.
+ */
+type MailpitListItem = {
+  ID: string
+  To: Array<{ Address: string }>
+  Subject: string
+  Created: string
+}
+
+/**
+ * Poll Mailpit's HTTP API for an email delivered to `recipient`.
+ * Returns the parsed Mailpit message once one arrives; throws if no
+ * matching message lands within `timeoutMs` (default 15 s).
+ *
+ * Mailpit's `/api/v1/search?query=to:<email>` is exact-match on the
+ * recipient address. We use it because the inbox may contain emails
+ * from other concurrent tests in the same run.
+ *
+ * NOTE: requires the e2e overlay's roomler2 to have its EmailService
+ * routed through SMTP → Mailpit (set via `ROOMLER__EMAIL__SMTP_HOST`
+ * + `ROOMLER__EMAIL__SMTP_PORT` in `configmap-roomler2-config.yaml`).
+ * Outside that overlay, this helper will time out.
+ */
+export async function fetchActivationEmail(
+  recipient: string,
+  timeoutMs = 15000,
+): Promise<{ subject: string; html: string; text: string; activationUrl: string | null }> {
+  const start = Date.now()
+  const query = encodeURIComponent(`to:${recipient}`)
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    const list = await fetch(`${MAILPIT_URL}/api/v1/search?query=${query}&limit=10`)
+    if (list.ok) {
+      const data = (await list.json()) as { messages: MailpitListItem[] }
+      const match = data.messages.find(
+        (m) => m.To.some((t) => t.Address.toLowerCase() === recipient.toLowerCase())
+          && /activate/i.test(m.Subject),
+      )
+      if (match) {
+        const full = await fetch(`${MAILPIT_URL}/api/v1/message/${match.ID}`)
+        if (full.ok) {
+          const body = (await full.json()) as { HTML: string; Text: string; Subject: string }
+          // Activation URL lands in the HTML as
+          //   <a href="<frontend_url>/auth/activate?userId=<hex>&token=<7-char-nanoid>">
+          const m = /href="(https?:\/\/[^"]*\/auth\/activate\?userId=[a-f0-9]{24}&token=[^"]+)"/i.exec(
+            body.HTML,
+          )
+          return {
+            subject: body.Subject,
+            html: body.HTML,
+            text: body.Text,
+            activationUrl: m ? m[1] : null,
+          }
+        }
+      }
+    }
+    if (Date.now() - start > timeoutMs) {
+      throw new Error(
+        `Mailpit: no activation email for ${recipient} after ${timeoutMs}ms (last list status ${list.status})`,
+      )
+    }
+    await new Promise((r) => setTimeout(r, 500))
+  }
+}
+
+/**
+ * POST the activation token to `/api/auth/activate` to complete the
+ * email-link round-trip. Returns the success message.
+ */
+export async function activateViaApi(userId: string, token: string) {
+  const resp = await fetch(`${API_URL}/api/auth/activate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ user_id: userId, token }),
+  })
+  if (!resp.ok) throw new Error(`Activate failed: ${resp.status}`)
+  return (await resp.json()) as { message: string }
+}
+
+/**
+ * Parse `userId` and `token` query params out of the activation URL
+ * emitted by `auth::register` (format:
+ * `<frontend>/auth/activate?userId=<oid>&token=<nanoid>`).
+ */
+export function parseActivationUrl(url: string): { userId: string; token: string } {
+  const parsed = new URL(url)
+  const userId = parsed.searchParams.get('userId')
+  const token = parsed.searchParams.get('token')
+  if (!userId || !token) {
+    throw new Error(`Cannot parse activation URL: ${url}`)
+  }
+  return { userId, token }
 }
 
 /** Register through the UI */

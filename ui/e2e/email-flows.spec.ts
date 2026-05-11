@@ -8,59 +8,54 @@ import {
   sendMessageViaApi,
   addTenantMemberViaApi,
   loginViaUi,
+  fetchActivationEmail,
+  activateViaApi,
+  parseActivationUrl,
 } from './fixtures/test-helpers'
 
 const API_URL = process.env.E2E_API_URL || 'http://localhost:5001'
 
 test.describe('Email-related flows', () => {
   test.describe('Registration & Activation', () => {
-    test('registration returns activation message', async () => {
+    test('registration triggers SMTP delivery captured by Mailpit', async () => {
+      // The e2e overlay sets ROOMLER__EMAIL__SMTP_HOST=mailpit so the
+      // EmailService dispatches every send through plaintext SMTP to
+      // the Mailpit pod. AUTO_VERIFY=true still flips is_verified at
+      // register time (so the existing 100+ specs keep working), but
+      // the activation email is sent unconditionally — we poll
+      // Mailpit's HTTP API to verify SMTP arrived end-to-end.
       const user = uniqueUser()
-      const resp = await fetch(`${API_URL}/api/auth/register`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          email: user.email,
-          username: user.username,
-          password: user.password,
-          display_name: user.displayName,
-        }),
-      })
+      const auth = await registerUserViaApi(user)
+      expect(auth.access_token).toBeTruthy()
 
-      expect(resp.status).toBe(201)
-      const json = (await resp.json()) as { message: string }
-      // The backend returns an activation message prompting user to check email
-      expect(json.message).toBeDefined()
-      expect(json.message.toLowerCase()).toContain('activate')
+      const mail = await fetchActivationEmail(user.email)
+      expect(mail.subject.toLowerCase()).toContain('activate')
+      expect(mail.html.length).toBeGreaterThan(0)
+      expect(mail.activationUrl).toBeTruthy()
+      // Activation URL targets the configured FRONTEND_URL (http://roomler2
+      // in cluster) plus the /auth/activate path. It carries a 24-char
+      // hex userId and a 7-char nanoid token.
+      expect(mail.activationUrl).toMatch(
+        /^https?:\/\/[^/]+\/auth\/activate\?userId=[a-f0-9]{24}&token=[A-Za-z0-9_-]{7}$/,
+      )
     })
 
-    test('unactivated user cannot login', async () => {
+    test('activation roundtrip: parse link from Mailpit → POST /activate succeeds', async () => {
+      // End-to-end check that the URL embedded in the email is a real,
+      // accept-able activation. AUTO_VERIFY already set is_verified at
+      // register time, so /activate is idempotent in this overlay —
+      // it still must return 200 (success) for a valid token.
       const user = uniqueUser()
-      // Register but do NOT activate
-      await fetch(`${API_URL}/api/auth/register`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          email: user.email,
-          username: user.username,
-          password: user.password,
-          display_name: user.displayName,
-        }),
-      })
+      await registerUserViaApi(user)
+      const mail = await fetchActivationEmail(user.email)
+      if (!mail.activationUrl) throw new Error('no activation URL in Mailpit email')
 
-      // Attempt login should fail
-      const loginResp = await fetch(`${API_URL}/api/auth/login`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          email: user.email,
-          password: user.password,
-        }),
-      })
-      expect(loginResp.status).toBe(401)
+      const { userId, token } = parseActivationUrl(mail.activationUrl)
+      const result = await activateViaApi(userId, token)
+      expect(result.message.toLowerCase()).toContain('activated')
     })
 
-    test('activation endpoint exists and rejects invalid tokens', async () => {
+    test('activation endpoint rejects invalid tokens', async () => {
       const resp = await fetch(`${API_URL}/api/auth/activate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -69,13 +64,15 @@ test.describe('Email-related flows', () => {
           token: 'invalid-activation-token',
         }),
       })
-
-      // Should be 400 (bad request) for invalid/expired token
+      // 400 = bad request for invalid / expired token (covered by the
+      // backend's `find_valid` returning None for unknown user_id).
       expect(resp.status).toBe(400)
     })
 
     test('activated user can login successfully', async () => {
-      // registerUserViaApi auto-activates and returns tokens
+      // registerUserViaApi already returns tokens via the AUTO_VERIFY
+      // shortcut; this asserts the post-register tokens work for
+      // subsequent authenticated API calls.
       const user = uniqueUser()
       const auth = await registerUserViaApi(user)
       expect(auth.access_token).toBeDefined()
