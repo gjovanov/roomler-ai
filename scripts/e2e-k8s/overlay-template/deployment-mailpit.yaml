@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mailpit
+  namespace: roomler-ai-e2e
+  labels:
+    app: mailpit
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: mailpit
+  template:
+    metadata:
+      labels:
+        app: mailpit
+    spec:
+      containers:
+        - name: mailpit
+          # Lightweight SMTP capture for e2e — listens on 1025 (SMTP)
+          # and 8025 (HTTP API + Web UI). Test helpers GET its API
+          # to fetch the activation link out of the captured message
+          # body. No state persists between Job runs; the deploy is
+          # Recreate so a fresh pod has an empty inbox per run.
+          # Pinned to a known-stable upstream tag (latest is fine for
+          # ephemeral e2e but we want repro).
+          image: axllent/mailpit:v1.21
+          ports:
+            - name: smtp
+              containerPort: 1025
+            - name: http
+              containerPort: 8025
+          env:
+            # API/web UI listen address. Default is :8025; explicit
+            # for clarity.
+            - name: MP_UI_BIND_ADDR
+              value: "0.0.0.0:8025"
+            - name: MP_SMTP_BIND_ADDR
+              value: "0.0.0.0:1025"
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          readinessProbe:
+            httpGet:
+              path: /api/v1/info
+              port: 8025
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /api/v1/info
+              port: 8025
+            initialDelaySeconds: 5
+            periodSeconds: 15
