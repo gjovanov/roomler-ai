@@ -2251,8 +2251,19 @@ async fn handle_files_control(
             spawn_outgoing_zip_pump(dc.clone(), handler, session_id, id, path);
         }
         crate::files::FilesIncoming::Cancel { id } => {
-            let cancelled = handler.cancel_outgoing(&id).await;
-            info!(%session_id, %id, cancelled, "files: cancel requested");
+            // rc.19: try both directions. cancel_outgoing flips a
+            // flag if the id matches an in-flight download.
+            // cancel_incoming clears upload state + removes the
+            // .roomler-partial/<id>/ staging dir + registry entry so
+            // the partial doesn't sit until the 24h orphan sweep.
+            // Browsers send files:cancel on terminal upload failure
+            // (6 reconnect attempts exhausted).
+            let out_cancelled = handler.cancel_outgoing(&id).await;
+            let in_cancelled = handler.cancel_incoming(&id).await;
+            info!(
+                %session_id, %id, out_cancelled, in_cancelled,
+                "files: cancel requested"
+            );
         }
         crate::files::FilesIncoming::Dir { req_id, path } => {
             if !crate::files::is_remote_browse_enabled() {
@@ -2306,22 +2317,40 @@ async fn handle_files_control(
             offset,
             sha256_prefix: _,
         } => {
-            // P0 wire-format-only stub. P2 (resume handler) replaces
-            // this with a real lookup against PARTIAL_REGISTRY + a
-            // 256 KiB-aligned truncate on the staging `data` file
-            // before replying `files:resumed { id, accepted_offset }`.
-            // For now we always reply `files:error` so the rc.19
-            // browser falls back to a fresh `files:begin` with a new
-            // id — preserves correctness while P1/P2 land.
-            info!(%session_id, %id, %offset, "files: resume (P0 stub — no partial state)");
-            send_files_json(
-                &dc,
-                &crate::files::FilesOutgoing::Error {
-                    id: &id,
-                    message: "resume not yet implemented (P0 stub)",
-                },
-            )
-            .await;
+            // rc.19 P2: look up the partial in PARTIAL_REGISTRY (or
+            // on-demand stat under Downloads), truncate the data
+            // file to a 256 KiB-aligned offset, reinstall
+            // IncomingTransfer state in this DC's incoming Mutex,
+            // and reply `files:resumed { id, accepted_offset }`.
+            // sha256_prefix is reserved for v2 — v1 ignores it.
+            match handler.resume_incoming(&id, offset).await {
+                Ok(accepted_offset) => {
+                    info!(
+                        %session_id, %id, requested = %offset,
+                        accepted_offset, "files: resume accepted"
+                    );
+                    send_files_json(
+                        &dc,
+                        &crate::files::FilesOutgoing::Resumed {
+                            id: &id,
+                            accepted_offset,
+                        },
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    warn!(%session_id, %id, %offset, %e, "files: resume rejected");
+                    let msg = format!("{e}");
+                    send_files_json(
+                        &dc,
+                        &crate::files::FilesOutgoing::Error {
+                            id: &id,
+                            message: &msg,
+                        },
+                    )
+                    .await;
+                }
+            }
         }
     }
 }
