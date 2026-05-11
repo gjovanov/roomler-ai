@@ -21,6 +21,7 @@ argon2.workspace = true
 password-hash.workspace = true
 jsonwebtoken.workspace = true
 reqwest.workspace = true
+lettre.workspace = true
 dashmap.workspace = true
 rust_xlsxwriter.workspace = true
 genpdf.workspace = true

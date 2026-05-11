@@ -97,15 +97,10 @@ impl AppState {
             None
         };
 
-        let email = if !settings.email.api_key.is_empty() {
-            Some(Arc::new(EmailService::new(
-                settings.email.api_key.clone(),
-                settings.email.from_email.clone(),
-                settings.email.from_name.clone(),
-            )))
-        } else {
-            None
-        };
+        // `from_settings` picks SendGrid when `email.api_key` is set
+        // (prod), SMTP when `email.smtp_host` + `email.smtp_port` are
+        // set (e2e Mailpit), or returns None otherwise (dev / no email).
+        let email = EmailService::from_settings(&settings.email).map(Arc::new);
 
         let push_subscriptions = Arc::new(PushSubscriptionDao::new(&db));
         let push = if !settings.push.vapid_private_key.is_empty() {
