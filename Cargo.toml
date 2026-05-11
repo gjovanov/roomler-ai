@@ -70,6 +70,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # HTTP client
 reqwest = { version = "0.12", features = ["json", "multipart", "cookies"] }
 
+# SMTP client (used by the EmailService SMTP backend; SendGrid HTTP
+# remains the prod default). `default-features = false` avoids pulling
+# in native-tls / rustls — Mailpit (the e2e capture target) accepts
+# plaintext on :1025, so we go through `builder_dangerous`. When prod
+# wants direct SMTP delivery, flip on `tokio1-rustls-tls` and switch
+# to `starttls_relay`.
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "tokio1", "builder", "hostname"] }
+
 # UUID
 uuid = { version = "1", features = ["v4", "serde"] }
 

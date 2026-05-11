@@ -135,17 +135,16 @@ module.exports = defineConfig({
   //     attribute syntax that Playwright's CJS transformer trips on
   //     inside the e2e Job's bun runtime)
   //   - When `E2E_SKIP_PHASE_3=1` (set by the e2e Job manifest in
-  //     first-cut mode): the 4 specs that need infra not yet in
-  //     cluster — oauth (no provider stubs), email-flows (no SMTP
-  //     capture), conference-multi + rc-vp9-444 (mediasoup-in-k8s
-  //     dance). Phase 3 deploys Mailpit + oauth2-mock-server +
-  //     coturn and unsets this env.
+  //     first-cut mode): the specs that need infra not yet in
+  //     cluster — oauth (no provider stubs), conference-multi +
+  //     rc-vp9-444 (mediasoup-in-k8s dance). Cycle 4 Chunk 1
+  //     landed Mailpit + the SMTP backend so `email-flows.spec.ts`
+  //     no longer needs to be skipped here.
   testIgnore: (() => {
     const always = ['**/video/**']
     if (process.env.E2E_SKIP_PHASE_3 === '1') {
       always.push(
         '**/oauth.spec.ts',
-        '**/email-flows.spec.ts',
         '**/conference.spec.ts',
         '**/conference-chat.spec.ts',
         '**/conference-multi.spec.ts',

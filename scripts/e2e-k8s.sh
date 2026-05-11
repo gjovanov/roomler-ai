@@ -90,7 +90,12 @@ fi
 # 3. Wait for stack ready
 # ──────────────────────────────────────────────────────────────────────
 echo "[e2e-k8s] waiting for stack ready"
-for selector in "app=mongodb" "app=redis" "app=minio" "app=roomler2"; do
+# Mailpit added in Cycle 4 Chunk 1 to capture SMTP for email-flows.spec.ts.
+# It boots in seconds (single container, no persistent state), but include
+# it in the wait so the orchestrator fails fast if the deployment is
+# missing or unhealthy rather than the spec hitting connection-refused
+# 30 s later.
+for selector in "app=mongodb" "app=redis" "app=minio" "app=mailpit" "app=roomler2"; do
   kubectl -n "$NAMESPACE" wait --for=condition=ready pod \
     -l "$selector" --timeout=180s
 done
@@ -172,6 +177,11 @@ spec:
               value: "http://roomler2"
             - name: VITE_API_URL
               value: "http://roomler2"
+            # Mailpit HTTP API endpoint used by `fetchActivationEmail`
+            # in the email-flows spec. Mailpit's web UI / REST API
+            # listens on :8025 inside the cluster.
+            - name: E2E_MAILPIT_URL
+              value: "http://mailpit:8025"
             - name: CI
               value: "true"
             # Single-quoted YAML so backslashes in the regex (e.g.

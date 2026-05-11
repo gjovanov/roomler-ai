@@ -149,6 +149,17 @@ pub struct EmailSettings {
     pub from_email: String,
     pub from_name: String,
     pub activation_token_ttl_minutes: u64,
+    /// SMTP backend host. When set (and `api_key` is empty), the
+    /// EmailService dispatches outbound mail over SMTP instead of
+    /// SendGrid HTTP. Used by the e2e overlay to capture mail in
+    /// Mailpit; not currently used by production.
+    #[serde(default)]
+    pub smtp_host: Option<String>,
+    /// SMTP backend port. Pairs with `smtp_host`. No default — when
+    /// `smtp_host` is set you must also set the port (Mailpit
+    /// listens on 1025).
+    #[serde(default)]
+    pub smtp_port: Option<u16>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -222,6 +233,8 @@ impl Settings {
             .set_default("email.from_email", "noreply@roomler.ai")?
             .set_default("email.from_name", "Roomler")?
             .set_default("email.activation_token_ttl_minutes", 5u64)?
+            .set_default("email.smtp_host", None::<String>)?
+            .set_default("email.smtp_port", None::<u16>)?
             .set_default("push.vapid_public_key", "")?
             .set_default("push.vapid_private_key", "")?
             .set_default("push.contact", "mailto:noreply@roomler.ai")?
