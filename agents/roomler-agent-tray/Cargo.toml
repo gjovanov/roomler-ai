@@ -15,7 +15,18 @@ path = "src/main.rs"
 roomler-agent = { path = "../roomler-agent" }
 
 # Tauri 2.x runtime + tray + plugins.
-tauri = { version = "2", features = ["tray-icon"] }
+#
+# `custom-protocol` is REQUIRED for plain `cargo build --release` to
+# produce a self-contained binary — without it the runtime loads
+# from `devUrl` (localhost:1430) and the user sees ERR_CONNECTION_
+# REFUSED in the webview. `cargo tauri build` enables it automatically,
+# but our release-agent.yml uses `cargo build --release` for the tray
+# EXE artifact (no Tauri toolchain on the runner), so we opt in here
+# unconditionally. We don't have a Vite/Webpack dev-server for the
+# static `src/front/` HTML, so devUrl isn't load-bearing for any
+# workflow — embedding via custom-protocol is the only mode that
+# makes sense.
+tauri = { version = "2", features = ["tray-icon", "custom-protocol"] }
 tauri-plugin-shell = "2"
 tauri-plugin-single-instance = "2"
 tauri-plugin-dialog = "2"
