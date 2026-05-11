@@ -127,11 +127,15 @@ pub static PARTIAL_REGISTRY: std::sync::LazyLock<
 /// Test-only escape hatch — clears the partial registry between
 /// `cargo test` cases that touch the same global. Production code
 /// never calls this.
+///
+/// Recovers from poison: cargo runs tests in parallel and a panic
+/// in one test holding the lock would poison it for all subsequent
+/// readers. The HashMap has no invariants a panic could break, so
+/// recovering the inner value is sound.
 #[cfg(test)]
 pub fn reset_partial_registry() {
-    if let Ok(mut g) = PARTIAL_REGISTRY.lock() {
-        g.clear();
-    }
+    let mut g = PARTIAL_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    g.clear();
 }
 
 /// Per-partial metadata persisted next to the staging `data` file as
@@ -875,6 +879,130 @@ impl FilesHandler {
         } else {
             cleared_state
         }
+    }
+
+    /// rc.19: resume a previously-started upload after a DC drop.
+    /// Looks up the staging dir for `id`, truncates the partial
+    /// `data` file to the largest 256 KiB-aligned offset ≤ both the
+    /// browser's requested offset and the file's on-disk size, opens
+    /// it for append at that offset, and reinstalls the
+    /// `IncomingTransfer` state on THIS DC's `incoming` Mutex.
+    /// Returns the `accepted_offset` the browser should pump from.
+    ///
+    /// Errors when:
+    /// - the registry has no entry for this id AND no canonical
+    ///   `Downloads/.roomler-partial/<id>/meta.json` exists on disk;
+    /// - `meta.json` is corrupt;
+    /// - the `incoming` Mutex on this DC already has another upload
+    ///   in-flight (browser must not interleave begins/resumes).
+    ///
+    /// Truncating to a 256 KiB boundary matches the `files:progress`
+    /// cadence (the browser's `bytesAcked` source) so a same-id
+    /// resume after a transient blip almost always returns the
+    /// browser's requested offset verbatim. The mask only kicks in
+    /// when the agent's on-disk size is smaller than what the
+    /// browser thinks it acked (B3 fix in the rc.19 plan).
+    pub async fn resume_incoming(&self, id: &str, requested_offset: u64) -> Result<u64> {
+        // Locate meta_path: registry first, then on-demand probe at
+        // the canonical Downloads-rooted location for cross-restart
+        // discovery survivors. Poison-tolerant — the HashMap has no
+        // invariants a panicking test/peer could break.
+        let meta_path = {
+            let g = PARTIAL_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+            g.get(id).cloned()
+        };
+        let meta_path = match meta_path {
+            Some(p) => p,
+            None => {
+                // On-demand fallback (sweep may have raced or the
+                // partial lives under Downloads but registry was
+                // cleared). Synchronous stat under the default
+                // download_dir().
+                let canonical = download_dir()
+                    .context("resolving Downloads for on-demand resume probe")?
+                    .join(".roomler-partial")
+                    .join(id)
+                    .join("meta.json");
+                if tokio::fs::metadata(&canonical).await.is_err() {
+                    return Err(anyhow!("no partial state for id {id}"));
+                }
+                canonical
+            }
+        };
+
+        let meta_bytes = tokio::fs::read(&meta_path)
+            .await
+            .with_context(|| format!("reading {}", meta_path.display()))?;
+        let meta: PartialMeta = serde_json::from_slice(&meta_bytes)
+            .with_context(|| format!("parsing {}", meta_path.display()))?;
+        let partial_dir = meta_path
+            .parent()
+            .ok_or_else(|| anyhow!("meta_path has no parent"))?
+            .to_path_buf();
+        let data_path = partial_dir.join("data");
+
+        // disk_size — the source of truth for how much survived. May
+        // be smaller than the browser's requested offset (kill
+        // happened between sync_data calls).
+        let disk_meta = tokio::fs::metadata(&data_path)
+            .await
+            .with_context(|| format!("stat {}", data_path.display()))?;
+        let disk_size = disk_meta.len();
+
+        // B3 truncation: align to 256 KiB so resumes match the
+        // existing files:progress cadence the browser uses for
+        // bytesAcked.
+        const ALIGN_MASK: u64 = !(256 * 1024 - 1);
+        let accepted = requested_offset.min(disk_size) & ALIGN_MASK;
+
+        // Truncate the file in place to accepted, then open for
+        // append. tokio::fs::File doesn't have set_len-and-seek in
+        // one shot; we set_len first, then OpenOptions to append.
+        {
+            let truncate_file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .open(&data_path)
+                .await
+                .with_context(|| format!("opening {} for truncate", data_path.display()))?;
+            truncate_file
+                .set_len(accepted)
+                .await
+                .with_context(|| format!("truncating {} to {accepted}", data_path.display()))?;
+        }
+        let file = tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&data_path)
+            .await
+            .with_context(|| format!("re-opening {} for append", data_path.display()))?;
+
+        // Reinstall state on THIS DC. Refuse if the slot is already
+        // populated — browser is misbehaving if it sends resume
+        // while another transfer is in-flight on the same DC.
+        let mut guard = self.incoming.lock().await;
+        if guard.is_some() {
+            return Err(anyhow!(
+                "files:resume {id} but another transfer is in-flight on this DC"
+            ));
+        }
+        *guard = Some(IncomingTransfer {
+            id: id.to_string(),
+            expected: meta.expected_size,
+            received: accepted,
+            file,
+            last_progress: accepted,
+            partial_dir,
+            dest_dir: meta.dest_dir.clone(),
+            filename: meta.filename.clone(),
+            last_synced: accepted,
+            rel_path: meta.rel_path.clone(),
+        });
+        tracing::info!(
+            id,
+            requested_offset,
+            accepted_offset = accepted,
+            "files: resume accepted"
+        );
+        Ok(accepted)
     }
 
     /// The id of the currently-active incoming transfer, if any.
@@ -2064,15 +2192,6 @@ mod tests {
     }
 
     #[test]
-    fn partial_registry_starts_empty_and_resets() {
-        // Tests share PARTIAL_REGISTRY (process-global LazyLock). The
-        // reset hook clears it; verify the test infrastructure works.
-        reset_partial_registry();
-        let g = PARTIAL_REGISTRY.lock().unwrap();
-        assert!(g.is_empty(), "registry not empty after reset");
-    }
-
-    #[test]
     fn active_transfers_counter_starts_at_zero() {
         // Sanity check: in a fresh test run no transfer guards are
         // alive. Other tests in this file may temporarily increment
@@ -2466,7 +2585,6 @@ mod tests {
 
     #[tokio::test]
     async fn begin_creates_staging_dir_with_meta_json() {
-        reset_partial_registry();
         let dest = stage_tmpdir().await;
         let h = FilesHandler::new();
         let id = format!(
@@ -2510,7 +2628,7 @@ mod tests {
 
         // Registry was populated. Lookup canonicalises to the same
         // path as what `begin()` stored.
-        let g = PARTIAL_REGISTRY.lock().unwrap();
+        let g = PARTIAL_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(g.get(&id).map(|p| p.as_path()), Some(meta_path.as_path()));
         drop(g);
 
@@ -2520,7 +2638,6 @@ mod tests {
 
     #[tokio::test]
     async fn end_renames_staging_to_final_and_cleans_dir() {
-        reset_partial_registry();
         let dest = stage_tmpdir().await;
         let h = FilesHandler::new();
         let id = format!(
@@ -2551,7 +2668,7 @@ mod tests {
         let staging_parent = dest.join(".roomler-partial");
         assert!(!staging_parent.join(&id).exists(), "per-id dir leaked");
         // Registry entry removed.
-        let g = PARTIAL_REGISTRY.lock().unwrap();
+        let g = PARTIAL_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         assert!(g.get(&id).is_none(), "registry entry leaked");
         drop(g);
         let _ = tokio::fs::remove_dir_all(&dest).await;
@@ -2559,7 +2676,6 @@ mod tests {
 
     #[tokio::test]
     async fn begin_rejects_existing_partial_dir_for_same_id() {
-        reset_partial_registry();
         let dest = stage_tmpdir().await;
         let h = FilesHandler::new();
         let id = format!(
@@ -2604,7 +2720,6 @@ mod tests {
 
     #[tokio::test]
     async fn chunk_syncs_data_at_one_mib_boundary() {
-        reset_partial_registry();
         let dest = stage_tmpdir().await;
         let h = FilesHandler::new();
         let id = format!(
@@ -2650,8 +2765,190 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resume_round_trips_after_partial_upload() {
+        let dest = stage_tmpdir().await;
+        let h = FilesHandler::new();
+        let id = format!(
+            "rc19-resume-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        );
+        // Total expected = 2 MiB. Send 1 MiB then abort to simulate
+        // a DC drop. last_synced will be 1 MiB (one sync at the
+        // boundary), disk_size == 1 MiB.
+        h.begin(
+            id.clone(),
+            "big.bin".into(),
+            2 * 1024 * 1024,
+            None,
+            Some(dest.to_str().unwrap()),
+        )
+        .await
+        .expect("begin");
+        let chunk = vec![0xCDu8; 256 * 1024];
+        for _ in 0..4 {
+            h.chunk(&chunk).await.expect("chunk");
+        }
+        // Simulated DC drop — state cleared, partial dir survives.
+        h.abort().await;
+
+        // Browser reconnects, sends files:resume claiming 1 MiB.
+        let accepted = h
+            .resume_incoming(&id, 1024 * 1024)
+            .await
+            .expect("resume_incoming");
+        assert_eq!(accepted, 1024 * 1024);
+
+        // Pump the remaining 1 MiB and finalise.
+        for _ in 0..4 {
+            h.chunk(&chunk).await.expect("post-resume chunk");
+        }
+        let (final_path, bytes) = h.end(&id).await.expect("end");
+        assert_eq!(bytes, 2 * 1024 * 1024);
+        let got_meta = tokio::fs::metadata(&final_path).await.unwrap();
+        assert_eq!(got_meta.len(), 2 * 1024 * 1024);
+        let _ = tokio::fs::remove_dir_all(&dest).await;
+    }
+
+    #[tokio::test]
+    async fn resume_truncates_when_disk_size_below_requested() {
+        let dest = stage_tmpdir().await;
+        let h = FilesHandler::new();
+        let id = format!(
+            "rc19-resume-truncate-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        );
+        // Begin a 2 MiB upload, send 512 KiB only (no sync because
+        // 512 KiB < FSYNC_THRESHOLD_BYTES — that's irrelevant, we
+        // care about disk size). Abort.
+        h.begin(
+            id.clone(),
+            "small.bin".into(),
+            2 * 1024 * 1024,
+            None,
+            Some(dest.to_str().unwrap()),
+        )
+        .await
+        .expect("begin");
+        let chunk = vec![0xEFu8; 256 * 1024];
+        for _ in 0..2 {
+            h.chunk(&chunk).await.expect("chunk");
+        }
+        h.abort().await;
+
+        // Browser THINKS it sent 1 MiB but agent only has 512 KiB
+        // on disk. Resume should accept 512 KiB (already aligned to
+        // 256 KiB boundary; B3 mask is a no-op here).
+        let accepted = h.resume_incoming(&id, 1024 * 1024).await.expect("resume");
+        assert_eq!(accepted, 512 * 1024);
+
+        // Browser pumps from 512 KiB.
+        for _ in 0..6 {
+            h.chunk(&chunk).await.expect("post-resume chunk");
+        }
+        let (_, bytes) = h.end(&id).await.expect("end");
+        assert_eq!(bytes, 2 * 1024 * 1024);
+        let _ = tokio::fs::remove_dir_all(&dest).await;
+    }
+
+    #[tokio::test]
+    async fn resume_unknown_id_errors() {
+        // Use a per-test unique id so a sibling test couldn't have
+        // inserted it. No need to reset the registry (which would
+        // race with parallel tests).
+        let id = format!(
+            "rc19-resume-unknown-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        );
+        let h = FilesHandler::new();
+        let res = h.resume_incoming(&id, 0).await;
+        assert!(res.is_err());
+        let msg = res.unwrap_err().to_string();
+        assert!(
+            msg.contains("no partial state") || msg.contains("Downloads"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn end_recomputes_unique_path_when_collision_appears_mid_upload() {
+        // M4 fix: re-run unique_path at rename time. If the operator
+        // creates a file at the begin-time reservation BETWEEN begin
+        // and end, the rename target shifts to the next unique slot.
+        let dest = stage_tmpdir().await;
+        let h = FilesHandler::new();
+        let id = format!(
+            "rc19-m4-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        );
+        let reserved = h
+            .begin(
+                id.clone(),
+                "doc.txt".into(),
+                4,
+                None,
+                Some(dest.to_str().unwrap()),
+            )
+            .await
+            .expect("begin");
+        // Operator creates a file at the begin-time reservation.
+        tokio::fs::write(&reserved, b"existing").await.unwrap();
+        h.chunk(b"abcd").await.expect("chunk");
+        let (final_path, bytes) = h.end(&id).await.expect("end");
+        assert_eq!(bytes, 4);
+        // The actual final path must NOT be the begin reservation —
+        // unique_path appended a `(1)` suffix.
+        assert_ne!(
+            final_path, reserved,
+            "M4 fix: end() should pick a new unique path"
+        );
+        // Original file content preserved (operator's `existing`
+        // bytes weren't overwritten).
+        let original = tokio::fs::read(&reserved).await.unwrap();
+        assert_eq!(original, b"existing");
+        // New upload landed at the colliding-renamed path.
+        let uploaded = tokio::fs::read(&final_path).await.unwrap();
+        assert_eq!(uploaded, b"abcd");
+        let _ = tokio::fs::remove_dir_all(&dest).await;
+    }
+
+    #[tokio::test]
+    async fn cancel_incoming_removes_staging_dir_and_registry() {
+        let dest = stage_tmpdir().await;
+        let h = FilesHandler::new();
+        let id = format!(
+            "rc19-cancel-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        );
+        h.begin(
+            id.clone(),
+            "doomed.bin".into(),
+            1024,
+            None,
+            Some(dest.to_str().unwrap()),
+        )
+        .await
+        .expect("begin");
+        let canonical_dest = tokio::fs::canonicalize(&dest).await.unwrap();
+        let staging = canonical_dest.join(".roomler-partial").join(&id);
+        assert!(staging.exists(), "staging dir absent pre-cancel");
+        // Confirm registry has the id pre-cancel.
+        {
+            let g = PARTIAL_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(g.contains_key(&id));
+        }
+        let cleared = h.cancel_incoming(&id).await;
+        assert!(cleared, "cancel_incoming should return true");
+        assert!(!staging.exists(), "staging dir leaked after cancel");
+        {
+            let g = PARTIAL_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(!g.contains_key(&id), "registry leaked entry after cancel");
+        }
+        let _ = tokio::fs::remove_dir_all(&dest).await;
+    }
+
+    #[tokio::test]
     async fn sweep_orphans_deletes_stale_and_keeps_fresh() {
-        reset_partial_registry();
         let dest = stage_tmpdir().await;
         // Build two fake partial dirs by hand: one 25h old, one 1h old.
         let root = dest.join(".roomler-partial");
@@ -2691,7 +2988,7 @@ mod tests {
         assert!(!stale_dir.exists(), "stale dir should be removed");
         assert!(fresh_dir.exists(), "fresh dir should survive");
         // Fresh entry is in the registry.
-        let g = PARTIAL_REGISTRY.lock().unwrap();
+        let g = PARTIAL_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         assert!(
             g.contains_key("rc19-sweep-fresh"),
             "fresh id missing from registry: {:?}",
