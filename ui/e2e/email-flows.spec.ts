@@ -159,19 +159,25 @@ test.describe('Email-related flows', () => {
         users: [memberUserId],
       })
 
-      // Same poll-until-visible pattern as the test above.
-      let notifications: Array<{ id: string; type: string; is_read: boolean }> = []
+      // Same poll-until-visible pattern as the test above. The
+      // /api/notification/unread endpoint returns paginated JSON
+      // (`{ items, total, page, per_page, total_pages }`), not a
+      // bare array — destructure `items` so `.length` is defined.
+      let items: Array<{ id: string; type: string; is_read: boolean }> = []
       for (let i = 0; i < 20; i++) {
         await new Promise((r) => setTimeout(r, 250))
         const resp = await fetch(`${API_URL}/api/notification/unread`, {
           headers: { Authorization: `Bearer ${memberToken}` },
         })
         if (!resp.ok) continue
-        notifications = (await resp.json()) as Array<{ id: string; type: string; is_read: boolean }>
-        if (notifications.length > 0) break
+        const data = (await resp.json()) as {
+          items: Array<{ id: string; type: string; is_read: boolean }>
+        }
+        items = data.items
+        if (items.length > 0) break
       }
-      expect(notifications.length).toBeGreaterThanOrEqual(1)
-      expect(notifications.some((n) => !n.is_read)).toBe(true)
+      expect(items.length).toBeGreaterThanOrEqual(1)
+      expect(items.some((n) => !n.is_read)).toBe(true)
     })
 
     test('mark-all-read clears unread notifications', async () => {
