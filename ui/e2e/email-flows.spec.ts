@@ -112,7 +112,11 @@ test.describe('Email-related flows', () => {
       const room = await createRoomViaApi(adminToken, tenantId, 'email-test-room', true)
       roomId = room.id
 
-      await joinRoomViaApi(adminToken, tenantId, roomId)
+      // Drop the admin self-join — the room creator is auto-joined
+      // by the API and re-joining returns 409 Conflict. Same fix
+      // wave Cycle 3 applied to 7 other spec files in ea2a619; this
+      // file was deferred (testIgnored) at the time so it missed the
+      // sweep.
       await joinRoomViaApi(memberToken, tenantId, roomId)
     })
 
