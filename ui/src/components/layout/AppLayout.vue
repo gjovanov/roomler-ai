@@ -269,7 +269,11 @@ function returnToCall() {
   }
 }
 
-const drawer = ref(true)
+// Drawer starts CLOSED on mobile (so the hamburger button is the
+// affordance to open it) and OPEN on desktop (the standard sidebar
+// experience). Without this, mobile users would land with the nav
+// drawer covering the page until they explicitly close it.
+const drawer = ref(!mobile.value)
 const rail = ref(false)
 const showNotifications = ref(false)
 const showSearch = ref(false)
