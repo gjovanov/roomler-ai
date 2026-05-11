@@ -324,6 +324,8 @@ fn test_settings() -> Settings {
             from_email: "test@roomler.ai".to_string(),
             from_name: "Roomler Test".to_string(),
             activation_token_ttl_minutes: 5,
+            smtp_host: None,
+            smtp_port: None,
         },
         push: roomler_ai_config::PushSettings {
             vapid_public_key: String::new(),
