@@ -61,6 +61,47 @@ pub const MIN_INSTALLER_BYTES: usize = 1_000_000;
 /// up + reach the clean-run threshold.
 pub const STARTUP_UPDATE_COOLDOWN: Duration = Duration::from_secs(300);
 
+/// rc.19: short-cycle interval when the auto-updater defers because
+/// file transfers are in flight. Keeps checking every hour so the
+/// install fires shortly after the operator's last upload completes,
+/// without waiting the full 24h CHECK_INTERVAL between checks.
+pub const TRANSFER_DEFER_RECHECK: Duration = Duration::from_secs(3600);
+
+/// rc.19: max number of consecutive defers before the auto-updater
+/// fires anyway. Prevents a power-user who uploads every few hours
+/// from indefinitely delaying security patches. 7 consecutive
+/// defers at 1h cadence = ~7h max delay window (after the original
+/// 24h interval elapsed); 7 at 24h = ~7 days.
+pub const MAX_CONSECUTIVE_DEFERS: u32 = 7;
+
+/// rc.19: gating decision for the periodic loop given the current
+/// active-transfer count and consecutive-defer counter. Pure helper
+/// so the gating logic is unit-testable without spinning the full
+/// loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferDecision {
+    /// Run the update check this cycle.
+    Proceed,
+    /// Skip this cycle; re-check in `TRANSFER_DEFER_RECHECK`.
+    DeferOnce,
+    /// Force the update through (consecutive defer limit reached).
+    /// Logs warn at the call site.
+    ForceAfterDefers,
+}
+
+/// Decide whether to gate the update check this cycle. Returns
+/// `Proceed` when no transfers are active OR the consecutive-defer
+/// limit has been reached. Pure / no I/O — tested directly.
+pub fn decide_defer(active: usize, consecutive_defers: u32) -> DeferDecision {
+    if active == 0 {
+        DeferDecision::Proceed
+    } else if consecutive_defers >= MAX_CONSECUTIVE_DEFERS {
+        DeferDecision::ForceAfterDefers
+    } else {
+        DeferDecision::DeferOnce
+    }
+}
+
 /// Marker file the agent touches *before* spawning the installer.
 /// Path lives next to `last-install.json` so all update-related
 /// state is in one directory and gets cleaned up by the same log-
@@ -961,6 +1002,7 @@ pub async fn run_periodic(
     interval: Duration,
 ) {
     let mut first = true;
+    let mut consecutive_defers: u32 = 0;
     loop {
         if *shutdown.borrow() {
             return;
@@ -986,15 +1028,59 @@ pub async fn run_periodic(
                 "auto-updater: at-startup check suppressed by recent-install cooldown"
             );
         }
+        // Last-iteration's defer (if any) shortens the sleep to
+        // TRANSFER_DEFER_RECHECK so an install fires soon after the
+        // operator's upload completes, instead of waiting the full
+        // 24h again.
+        let next_interval = if consecutive_defers > 0 {
+            TRANSFER_DEFER_RECHECK
+        } else {
+            interval
+        };
         if !first || skip_first_check {
             tokio::select! {
-                _ = tokio::time::sleep(interval) => {},
+                _ = tokio::time::sleep(next_interval) => {},
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() { return; }
                 },
             }
         }
         first = false;
+
+        // rc.19 gate: don't fire an installer while file transfers
+        // are in flight. Pair with resumable transfers — even with
+        // resume the install + restart kills the WebRTC peer for
+        // several seconds, which is a UX nuisance. Skip the cycle
+        // when active > 0 unless we've deferred MAX_CONSECUTIVE_DEFERS
+        // times in a row (security-vs-uptime trade-off documented in
+        // the rc.19 plan M3 fix).
+        let active = crate::files::active_transfer_count();
+        match decide_defer(active, consecutive_defers) {
+            DeferDecision::DeferOnce => {
+                consecutive_defers = consecutive_defers.saturating_add(1);
+                tracing::info!(
+                    active,
+                    consecutive_defers,
+                    next_check_secs = TRANSFER_DEFER_RECHECK.as_secs(),
+                    "auto-updater: deferring — transfers in flight"
+                );
+                continue;
+            }
+            DeferDecision::ForceAfterDefers => {
+                tracing::warn!(
+                    active,
+                    consecutive_defers,
+                    "auto-updater: forcing update after {} consecutive defers",
+                    MAX_CONSECUTIVE_DEFERS
+                );
+                consecutive_defers = 0;
+                // Fall through to check_once.
+            }
+            DeferDecision::Proceed => {
+                consecutive_defers = 0;
+            }
+        }
+
         let outcome = check_once().await;
         match outcome {
             CheckOutcome::UpToDate { current, latest } => {
@@ -1570,5 +1656,46 @@ mod tests {
         );
         assert_eq!(argv[0], "/i");
         assert_eq!(argv[1], r"D:\roomler-agent.msi");
+    }
+
+    // ---- rc.19 P3 — transfer-gated update timing ----
+
+    #[test]
+    fn decide_defer_proceeds_with_no_active_transfers() {
+        assert_eq!(decide_defer(0, 0), DeferDecision::Proceed);
+        // Defers counter is irrelevant when active=0 — the gate
+        // resets at every Proceed.
+        assert_eq!(decide_defer(0, 5), DeferDecision::Proceed);
+    }
+
+    #[test]
+    fn decide_defer_defers_when_active_and_under_limit() {
+        assert_eq!(decide_defer(1, 0), DeferDecision::DeferOnce);
+        assert_eq!(decide_defer(3, 6), DeferDecision::DeferOnce);
+    }
+
+    #[test]
+    fn decide_defer_forces_at_max_defers() {
+        // Exactly at MAX_CONSECUTIVE_DEFERS should force.
+        assert_eq!(
+            decide_defer(1, MAX_CONSECUTIVE_DEFERS),
+            DeferDecision::ForceAfterDefers
+        );
+        // And anything above it.
+        assert_eq!(
+            decide_defer(99, MAX_CONSECUTIVE_DEFERS + 50),
+            DeferDecision::ForceAfterDefers
+        );
+    }
+
+    #[test]
+    fn defer_constants_have_sensible_values() {
+        // TRANSFER_DEFER_RECHECK should be shorter than CHECK_INTERVAL
+        // (the whole point — react faster when uploads finish).
+        assert!(TRANSFER_DEFER_RECHECK < CHECK_INTERVAL);
+        // MAX_CONSECUTIVE_DEFERS at 1h cadence + 24h initial = at
+        // most ~31h between successful update fires for a
+        // chronically-busy host. Bounded.
+        assert!(MAX_CONSECUTIVE_DEFERS >= 3 && MAX_CONSECUTIVE_DEFERS <= 24);
     }
 }

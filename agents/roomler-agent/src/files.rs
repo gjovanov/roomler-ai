@@ -473,6 +473,30 @@ pub struct DirEntryView {
     pub mtime_unix: Option<i64>,
 }
 
+/// RAII guard that increments [`ACTIVE_TRANSFERS`] on creation and
+/// decrements on drop. Embedded in `IncomingTransfer` /
+/// `OutgoingTransfer` so every exit path (success, error, panic,
+/// DC drop, abort) releases the counter automatically.
+///
+/// Pair with `sync_data` per [`FSYNC_THRESHOLD_BYTES`] (B2 fix) so
+/// the counter only decrements after bytes are durable on disk;
+/// otherwise a kill-between-write-and-sync could lose data while
+/// the updater observed `active == 0` and fired an install.
+pub(crate) struct ActiveTransferGuard;
+
+impl ActiveTransferGuard {
+    pub fn new() -> Self {
+        ACTIVE_TRANSFERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for ActiveTransferGuard {
+    fn drop(&mut self) {
+        ACTIVE_TRANSFERS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Browser → Agent upload state. A single incoming transfer is
 /// "active" at any time — files:begin starts one; files:end or the
 /// DC closing finishes it.
@@ -503,6 +527,11 @@ pub(crate) struct IncomingTransfer {
     /// rc.19: folder-upload context preserved for end-time rename
     /// (used by `commit_partial` to recreate the directory tree).
     pub rel_path: Option<String>,
+    /// rc.19: increments [`ACTIVE_TRANSFERS`] on creation, decrements
+    /// on drop. Last field so it drops AFTER `file` — guarantees the
+    /// kernel page cache has reached the disk-flush queue before the
+    /// updater sees `active == 0`.
+    pub _active_guard: ActiveTransferGuard,
 }
 
 /// Agent → Browser download state. One outgoing transfer is active
@@ -517,6 +546,8 @@ pub(crate) struct OutgoingTransfer {
     #[allow(dead_code)]
     pub size: u64,
     pub cancel: Arc<AtomicBool>,
+    /// rc.19: ACTIVE_TRANSFERS counter guard (see IncomingTransfer).
+    pub _active_guard: ActiveTransferGuard,
 }
 
 /// Handle on the file-transfer subsystem for one data channel.
@@ -695,6 +726,7 @@ impl FilesHandler {
             filename,
             last_synced: 0,
             rel_path: rel_path.map(|s| s.to_string()),
+            _active_guard: ActiveTransferGuard::new(),
         });
         Ok(reserved_final)
     }
@@ -995,6 +1027,7 @@ impl FilesHandler {
             filename: meta.filename.clone(),
             last_synced: accepted,
             rel_path: meta.rel_path.clone(),
+            _active_guard: ActiveTransferGuard::new(),
         });
         tracing::info!(
             id,
@@ -1061,6 +1094,7 @@ impl FilesHandler {
             path: resolved.clone(),
             size,
             cancel: cancel.clone(),
+            _active_guard: ActiveTransferGuard::new(),
         });
 
         Ok(OutgoingOffer {
@@ -1424,6 +1458,7 @@ impl FilesHandler {
             path: resolved.clone(),
             size: 0, // unknown for streaming zip
             cancel: cancel.clone(),
+            _active_guard: ActiveTransferGuard::new(),
         });
         Ok(OutgoingOffer {
             id,
@@ -2582,6 +2617,17 @@ mod tests {
         tokio::fs::create_dir_all(&base).await.unwrap();
         base
     }
+
+    // rc.19 counter tests: ActiveTransferGuard wraps a process-
+    // global AtomicUsize. Parallel tests share that global, so
+    // before/after comparisons race fatally. The Drop contract is
+    // structurally enforced by the type system — every transfer
+    // struct owns a `_active_guard` field, every Drop on that field
+    // decrements. No runtime test can cleanly assert "counter went
+    // back down" without serialising every test that touches a
+    // transfer. The updater-side `decide_defer` test in updater.rs
+    // covers the gating logic; the counter mechanics fall out of
+    // the type system.
 
     #[tokio::test]
     async fn begin_creates_staging_dir_with_meta_json() {
