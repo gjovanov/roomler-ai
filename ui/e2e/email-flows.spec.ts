@@ -125,17 +125,25 @@ test.describe('Email-related flows', () => {
       const mentionContent = `Hey @${memberUser.username} please review this`
       await sendMessageViaApi(adminToken, tenantId, roomId, mentionContent)
 
-      // Wait a moment for the notification to be created
-      await new Promise((r) => setTimeout(r, 1000))
-
-      // Check the mentioned user's unread notification count
-      const resp = await fetch(`${API_URL}/api/notification/unread-count`, {
-        headers: { Authorization: `Bearer ${memberToken}` },
-      })
-      expect(resp.ok).toBeTruthy()
-      const countData = (await resp.json()) as { count: number }
-      // Should have at least one notification from the mention
-      expect(countData.count).toBeGreaterThanOrEqual(1)
+      // Poll unread-count until the notification appears. The mention
+      // creation flow detects @username inline, writes the notification
+      // row, then broadcasts WS — there can be 1-3 s of latency in a
+      // freshly-rolled cluster. A fixed 1 s sleep used to be enough but
+      // proved flaky once email-flows.spec.ts started running (Chunk 1).
+      let count = 0
+      for (let i = 0; i < 20; i++) {
+        await new Promise((r) => setTimeout(r, 250))
+        const resp = await fetch(`${API_URL}/api/notification/unread-count`, {
+          headers: { Authorization: `Bearer ${memberToken}` },
+        })
+        if (!resp.ok) continue
+        const data = (await resp.json()) as { count: number }
+        if (data.count >= 1) {
+          count = data.count
+          break
+        }
+      }
+      expect(count).toBeGreaterThanOrEqual(1)
     })
 
     test('notifications API returns mention notification details', async () => {
@@ -143,19 +151,17 @@ test.describe('Email-related flows', () => {
       const mentionContent = `Heads up @${memberUser.username}!`
       await sendMessageViaApi(adminToken, tenantId, roomId, mentionContent)
 
-      await new Promise((r) => setTimeout(r, 1000))
-
-      // Fetch the member's unread notifications
-      const resp = await fetch(`${API_URL}/api/notification/unread`, {
-        headers: { Authorization: `Bearer ${memberToken}` },
-      })
-      expect(resp.ok).toBeTruthy()
-      const notifications = (await resp.json()) as Array<{
-        id: string
-        type: string
-        is_read: boolean
-      }>
-      // Expect at least one unread notification
+      // Same poll-until-visible pattern as the test above.
+      let notifications: Array<{ id: string; type: string; is_read: boolean }> = []
+      for (let i = 0; i < 20; i++) {
+        await new Promise((r) => setTimeout(r, 250))
+        const resp = await fetch(`${API_URL}/api/notification/unread`, {
+          headers: { Authorization: `Bearer ${memberToken}` },
+        })
+        if (!resp.ok) continue
+        notifications = (await resp.json()) as Array<{ id: string; type: string; is_read: boolean }>
+        if (notifications.length > 0) break
+      }
       expect(notifications.length).toBeGreaterThanOrEqual(1)
       expect(notifications.some((n) => !n.is_read)).toBe(true)
     })
