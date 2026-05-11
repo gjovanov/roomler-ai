@@ -4,7 +4,7 @@
   "version": "0.3.0-rc.19",
   "identifier": "ai.roomler.agent-tray",
   "build": {
-    "frontendDist": "../src/front",
+    "frontendDist": "src/front",
     "devUrl": "http://localhost:1430"
   },
   "app": {
