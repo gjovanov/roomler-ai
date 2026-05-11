@@ -129,7 +129,14 @@ pub async fn register(
         );
     }
 
-    // Generate activation code and send email
+    // Generate activation code and send email.
+    //
+    // Email send is fire-and-forget: a fresh SMTP connection (e2e overlay
+    // hits Mailpit on first register) can take 5-6s on the initial
+    // handshake, which would block the register HTTP response past the
+    // frontend's redirect timeout. The activation code is persisted
+    // synchronously above, so the user can still click the email link
+    // when it arrives; the response can return tokens immediately.
     let token = nanoid!(7);
     if let Err(e) = state
         .activation_codes
@@ -141,24 +148,24 @@ pub async fn register(
         .await
     {
         warn!("Failed to create activation code: {:?}", e);
-    } else if let Some(ref email_svc) = state.email {
+    } else if let Some(email_svc) = state.email.clone() {
         let activation_url = format!(
             "{}/auth/activate?userId={}&token={}",
             state.settings.app.frontend_url,
             user_id.to_hex(),
             token
         );
-        if let Err(e) = email_svc
-            .send_activation(
-                &body.email,
-                &body.display_name,
-                &activation_url,
-                state.settings.email.activation_token_ttl_minutes,
-            )
-            .await
-        {
-            warn!("Failed to send activation email: {:?}", e);
-        }
+        let to_email = body.email.clone();
+        let display_name = body.display_name.clone();
+        let ttl = state.settings.email.activation_token_ttl_minutes;
+        tokio::spawn(async move {
+            if let Err(e) = email_svc
+                .send_activation(&to_email, &display_name, &activation_url, ttl)
+                .await
+            {
+                warn!("Failed to send activation email: {:?}", e);
+            }
+        });
     }
 
     // Create a default tenant if requested
@@ -364,8 +371,10 @@ pub async fn activate(
     // Delete used activation code
     let _ = state.activation_codes.delete_for_user(user_id).await;
 
-    // Send success email (non-fatal)
-    if let Some(ref email_svc) = state.email {
+    // Send success email — fire-and-forget so SMTP latency doesn't
+    // block the activate response. Same reasoning as the send_activation
+    // call in register above.
+    if let Some(email_svc) = state.email.clone() {
         let user = state
             .users
             .base
@@ -373,12 +382,16 @@ pub async fn activate(
             .await
             .map_err(|e| ApiError::Internal(format!("User not found: {}", e)))?;
         let login_url = format!("{}/auth/login", state.settings.app.frontend_url);
-        if let Err(e) = email_svc
-            .send_activation_success(&user.email, &user.display_name, &login_url)
-            .await
-        {
-            warn!("Failed to send activation success email: {:?}", e);
-        }
+        let to_email = user.email.clone();
+        let display_name = user.display_name.clone();
+        tokio::spawn(async move {
+            if let Err(e) = email_svc
+                .send_activation_success(&to_email, &display_name, &login_url)
+                .await
+            {
+                warn!("Failed to send activation success email: {:?}", e);
+            }
+        });
     }
 
     Ok(Json(MessageResponse {
