@@ -116,20 +116,26 @@ export async function joinCallViaApi(token: string, tenantId: string, roomId: st
   return (await resp.json()) as { member_id: string; joined: boolean }
 }
 
-/** Send a message via the API */
+/** Send a message via the API. Optional `mentions` triggers the
+ *  backend's notification creation path — without it the API does
+ *  NOT parse `@username` out of `content` (the frontend computes
+ *  mentions client-side and sends explicit user IDs). */
 export async function sendMessageViaApi(
   token: string,
   tenantId: string,
   roomId: string,
   content: string,
+  mentions?: { users?: string[]; everyone?: boolean; here?: boolean },
 ) {
+  const body: Record<string, unknown> = { content }
+  if (mentions) body.mentions = mentions
   const resp = await fetch(`${API_URL}/api/tenant/${tenantId}/room/${roomId}/message`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${token}`,
     },
-    body: JSON.stringify({ content }),
+    body: JSON.stringify(body),
   })
   if (!resp.ok) throw new Error(`Send message failed: ${resp.status}`)
   return (await resp.json()) as { id: string; content: string; author_id: string }
