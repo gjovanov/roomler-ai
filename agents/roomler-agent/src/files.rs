@@ -2790,20 +2790,27 @@ mod tests {
             h.chunk(&chunk).await.expect("chunk");
         }
 
-        // On-disk size matches everything we wrote (sync_data is the
-        // observable proxy: page cache flushed at the 1 MiB boundary).
-        let staging = dest.join(".roomler-partial").join(&id);
-        let data_meta = tokio::fs::metadata(staging.join("data")).await.unwrap();
-        assert_eq!(data_meta.len() as usize, 6 * 256 * 1024);
-
-        // Internal state: last_synced advanced past 1 MiB exactly
-        // once. Chunks 1..4 = 1 MiB exactly → first sync there
+        // Verify the durable-at-sync-boundary contract that B2
+        // actually guarantees: last_synced advanced past 1 MiB
+        // exactly once. Chunks 1..4 = 1 MiB → triggers first sync
         // (received == FSYNC_THRESHOLD_BYTES, delta == threshold).
         // Chunks 5..6 = 1.5 MiB total → delta = 0.5 MiB < threshold,
         // no second sync.
+        //
+        // We do NOT assert on `tokio::fs::metadata(...).len()` here:
+        // `tokio::fs::File` has an internal write buffer that
+        // `write_all().await` populates without forcing an OS-level
+        // write, and Linux + Windows tokio runtimes drain that
+        // buffer at different cadences. The B2 production invariant
+        // is "bytes 0..last_synced are durable", which IS testable
+        // via the in-memory state; "bytes 0..received are visible
+        // to stat()" depends on tokio's buffer state and isn't what
+        // the resume protocol relies on. (Resume's B3 fix protects
+        // the wire against any acked-bytes > disk-size mismatch.)
         let guard = h.incoming.lock().await;
         let state = guard.as_ref().expect("state");
         assert_eq!(state.last_synced, FSYNC_THRESHOLD_BYTES);
+        assert_eq!(state.received, 6 * 256 * 1024);
         drop(guard);
 
         h.abort().await;
