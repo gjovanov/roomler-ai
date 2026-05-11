@@ -83,6 +83,17 @@ impl StripeService {
         success_url: &str,
         cancel_url: &str,
     ) -> Result<CheckoutResponse, StripeError> {
+        // Validate the plan up front, BEFORE touching Stripe — otherwise
+        // an invalid plan return path runs after a Stripe API call that
+        // can fail with its own error and mask the real problem (e2e:
+        // empty STRIPE_SECRET_KEY → customer-create 401 → 500 Internal
+        // instead of 400 Bad Request on `plan: "nonexistent"`).
+        let price_id = match plan {
+            "pro" => self.settings.price_pro.clone(),
+            "business" => self.settings.price_business.clone(),
+            _ => return Err(StripeError::InvalidPlan(plan.to_string())),
+        };
+
         let collection = db.collection::<Tenant>(Tenant::COLLECTION);
         let tenant = collection
             .find_one(doc! { "_id": tenant_id })
@@ -114,12 +125,6 @@ impl StripeService {
                 )
                 .await?;
         }
-
-        let price_id = match plan {
-            "pro" => &self.settings.price_pro,
-            "business" => &self.settings.price_business,
-            _ => return Err(StripeError::InvalidPlan(plan.to_string())),
-        };
 
         let params = [
             ("customer", customer_id.as_str()),
