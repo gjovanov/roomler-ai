@@ -126,11 +126,14 @@ test.describe('Room Management', () => {
     await page.goto(`/tenant/${tenantId}/explore`)
     await expect(page.getByText(/explore/i).first()).toBeVisible({ timeout: 10000 })
 
-    // The public room should appear in results
-    await expect(page.getByText('public-room')).toBeVisible({ timeout: 10000 })
+    // The public room should appear in results. Scope to <main> —
+    // the sidebar may also render the room name (after a soft refresh),
+    // and bare getByText would trip strict-mode with 2 matches.
+    await expect(page.locator('main').getByText('public-room')).toBeVisible({ timeout: 10000 })
 
-    // Click join
-    const roomCard = page.locator('.v-card:has-text("public-room")')
+    // Click join (the card lives inside main; scoping prevents the
+    // sidebar duplicate from being picked when it exists).
+    const roomCard = page.locator('main .v-card:has-text("public-room")')
     await roomCard.getByRole('button', { name: /join/i }).click()
 
     // Should navigate to the room chat view
