@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: mailpit
+  namespace: roomler-ai-e2e
+  labels:
+    app: mailpit
+spec:
+  type: ClusterIP
+  selector:
+    app: mailpit
+  ports:
+    - name: smtp
+      protocol: TCP
+      port: 1025
+      targetPort: smtp
+    - name: http
+      protocol: TCP
+      port: 8025
+      targetPort: http
