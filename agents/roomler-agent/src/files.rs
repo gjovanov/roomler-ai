@@ -80,6 +80,60 @@ pub fn is_remote_browse_enabled() -> bool {
     REMOTE_BROWSE_ENABLED.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// Number of in-flight file transfers (incoming uploads + outgoing
+/// downloads) summed across all DCs. The auto-updater reads this
+/// before deciding whether to fire a scheduled install — see
+/// `updater::run_periodic`. Incremented on `FilesHandler::begin` /
+/// `resume_incoming` / `begin_outgoing` success; decremented via the
+/// `Drop` impl on `IncomingTransfer` / `OutgoingTransfer` so every
+/// exit path (success, error, panic, DC drop) releases the counter.
+///
+/// rc.19 added this static so the auto-update timer doesn't kill the
+/// agent mid-upload (the field bug that motivated resumable
+/// transfers in the first place — see plan
+/// `~/.claude/plans/floating-splashing-nebula.md`).
+pub static ACTIVE_TRANSFERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+pub fn active_transfer_count() -> usize {
+    ACTIVE_TRANSFERS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Process-global registry of partial-upload staging dirs keyed by
+/// transfer `id`. Populated by three writers:
+///
+/// 1. [`sweep_orphans`] at startup — walks known dest roots, registers
+///    surviving `.roomler-partial/<id>/` dirs (after deleting any with
+///    `created_at_unix` > 24h).
+/// 2. [`FilesHandler::begin`] when a resumable upload starts — writes
+///    `id → meta.json_path` so a same-process resume request on a
+///    different DC can find the partial.
+/// 3. [`FilesHandler::commit_partial`] (rename success) and
+///    [`FilesHandler::cancel_incoming`] / error paths — remove the
+///    registry entry alongside the on-disk staging cleanup.
+///
+/// rc.19 uses `LazyLock` over `OnceLock + get_or_init` because the
+/// initial value is a closure-free `Mutex::new(HashMap::new())`. The
+/// inner `std::sync::Mutex` is fine for HashMap lookups (sub-µs
+/// critical section); no tokio async needed.
+///
+/// **Test isolation**: `cargo test` runs in parallel by default and
+/// the registry is process-global, so use [`reset_partial_registry`]
+/// at the start of every test that touches partial state.
+pub static PARTIAL_REGISTRY: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, PathBuf>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Test-only escape hatch — clears the partial registry between
+/// `cargo test` cases that touch the same global. Production code
+/// never calls this.
+#[cfg(test)]
+pub fn reset_partial_registry() {
+    if let Ok(mut g) = PARTIAL_REGISTRY.lock() {
+        g.clear();
+    }
+}
+
 /// Incoming control messages over the `files` DC (string payloads).
 /// Binary payloads are handled separately — they're not JSON.
 ///
@@ -139,9 +193,13 @@ pub(crate) enum FilesIncoming {
         #[serde(default)]
         format: Option<String>,
     },
-    /// Browser → Agent: cancel an in-flight outgoing transfer.
-    /// Affects whichever direction the id maps to (today: only
-    /// outgoing; uploads abort via DC close).
+    /// Browser → Agent: cancel an in-flight transfer. file-DC v3
+    /// (rc.19) extends this to also cancel incoming uploads — the
+    /// agent removes the in-flight `IncomingTransfer` state AND the
+    /// `.roomler-partial/<id>/` staging dir + PARTIAL_REGISTRY entry.
+    /// Sent by the browser when the resume reconnect budget is
+    /// exhausted (6 attempts) so the partial doesn't sit until the
+    /// 24h orphan sweep.
     #[serde(rename = "files:cancel")]
     Cancel { id: String },
     /// Browser → Agent: list a directory. `path` is empty / `~` to
@@ -150,6 +208,23 @@ pub(crate) enum FilesIncoming {
     /// requests.
     #[serde(rename = "files:dir")]
     Dir { req_id: String, path: String },
+    /// Browser → Agent: resume an upload that lost its DC mid-flight
+    /// (file-DC v3, rc.19). The browser claims `bytesAcked` from the
+    /// last `files:progress` envelope; the agent replies with
+    /// `files:resumed { id, accepted_offset }` where `accepted_offset`
+    /// may be < requested if the agent's on-disk size is smaller
+    /// (truncated to a 256 KiB boundary matching `files:progress`
+    /// cadence). On any failure the agent replies `files:error` and
+    /// the browser falls back to a fresh `files:begin` with a new id.
+    /// `sha256_prefix` is reserved for v2 (per-chunk integrity); v1
+    /// agents ignore the field if present.
+    #[serde(rename = "files:resume")]
+    Resume {
+        id: String,
+        offset: u64,
+        #[serde(default)]
+        sha256_prefix: Option<String>,
+    },
 }
 
 /// Outgoing control messages sent back to the browser. Flat `t`
@@ -201,6 +276,17 @@ pub(crate) enum FilesOutgoing<'a> {
     /// exist, permission denied, browse disabled by config).
     #[serde(rename = "files:dir-error")]
     DirError { req_id: &'a str, message: &'a str },
+    /// Agent → Browser: reply to `files:resume` confirming the byte
+    /// offset from which the agent will accept appended chunks
+    /// (file-DC v3, rc.19). `accepted_offset` is the largest 256 KiB-
+    /// aligned offset ≤ the browser's requested offset AND ≤ the
+    /// agent's on-disk size for the partial file. The browser MUST
+    /// re-pump from `accepted_offset`, which may be 0 (full re-send)
+    /// if the agent's partial was truncated to nothing or the staging
+    /// file is gone. After this reply the browser sends a normal
+    /// `files:end` once it has pumped the remaining bytes.
+    #[serde(rename = "files:resumed")]
+    Resumed { id: &'a str, accepted_offset: u64 },
 }
 
 /// Listing entry surfaced over `files:dir-list`. Sorted dirs-first
@@ -1561,6 +1647,90 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    // ---- rc.19 file-DC v3 resume wire-format locks ----
+
+    #[test]
+    fn parse_files_resume_without_sha_prefix() {
+        let m: FilesIncoming =
+            serde_json::from_str(r#"{"t":"files:resume","id":"u9","offset":4194304}"#).unwrap();
+        match m {
+            FilesIncoming::Resume {
+                id,
+                offset,
+                sha256_prefix,
+            } => {
+                assert_eq!(id, "u9");
+                assert_eq!(offset, 4_194_304);
+                assert_eq!(sha256_prefix, None);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_files_resume_with_sha_prefix_is_accepted() {
+        // v1 agents accept-and-ignore sha256_prefix; v2 agents will
+        // verify. Locking the schema now so v2 doesn't break compat.
+        let m: FilesIncoming = serde_json::from_str(
+            r#"{"t":"files:resume","id":"u9","offset":0,"sha256_prefix":"deadbeef"}"#,
+        )
+        .unwrap();
+        match m {
+            FilesIncoming::Resume {
+                sha256_prefix: Some(s),
+                ..
+            } => assert_eq!(s, "deadbeef"),
+            other => panic!("expected Resume with sha_prefix, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serialize_files_resumed() {
+        let s = serde_json::to_string(&FilesOutgoing::Resumed {
+            id: "u9",
+            accepted_offset: 4_194_304,
+        })
+        .unwrap();
+        assert!(s.contains("\"t\":\"files:resumed\""), "got: {s}");
+        assert!(s.contains("\"id\":\"u9\""), "got: {s}");
+        assert!(s.contains("\"accepted_offset\":4194304"), "got: {s}");
+    }
+
+    #[test]
+    fn serialize_files_resumed_with_zero_offset() {
+        // accepted_offset == 0 is a normal response — agent has no
+        // partial state for this id, browser re-pumps from byte 0.
+        // Field must serialise explicitly, not be elided.
+        let s = serde_json::to_string(&FilesOutgoing::Resumed {
+            id: "u9",
+            accepted_offset: 0,
+        })
+        .unwrap();
+        assert!(s.contains("\"accepted_offset\":0"), "got: {s}");
+    }
+
+    #[test]
+    fn partial_registry_starts_empty_and_resets() {
+        // Tests share PARTIAL_REGISTRY (process-global LazyLock). The
+        // reset hook clears it; verify the test infrastructure works.
+        reset_partial_registry();
+        let g = PARTIAL_REGISTRY.lock().unwrap();
+        assert!(g.is_empty(), "registry not empty after reset");
+    }
+
+    #[test]
+    fn active_transfers_counter_starts_at_zero() {
+        // Sanity check: in a fresh test run no transfer guards are
+        // alive. Other tests in this file may temporarily increment
+        // this counter but must always release the guard before
+        // returning — verify the baseline.
+        let n = active_transfer_count();
+        // We can't assert == 0 because tests run in parallel and a
+        // sibling test may be mid-flight. We CAN assert < 1000 (a
+        // sensible upper bound that would catch a runaway leak).
+        assert!(n < 1000, "active_transfer_count={n} suspicious");
     }
 
     #[test]

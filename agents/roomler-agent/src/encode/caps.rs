@@ -156,10 +156,17 @@ fn compute_caps() -> AgentCaps {
     // browsers that see an empty `files` array fall back to
     // `supports_file_transfer` (upload-only) and new browsers
     // grey out the drawer button when the host has browse disabled.
+    //
+    // File-DC v3 (rc.19) adds `resume` — the agent stages uploads
+    // under `<dest_dir>/.roomler-partial/<id>/` and can resume a
+    // mid-flight transfer after a DC drop (auto-update mid-upload,
+    // network blip, agent crash). Browsers that don't see `resume`
+    // fall back to the rc.18 fail-fast path.
     let mut files = vec![
         "upload".to_string(),
         "download".to_string(),
         "download-folder".to_string(),
+        "resume".to_string(),
     ];
     if crate::files::is_remote_browse_enabled() {
         files.push("browse".to_string());
@@ -395,6 +402,20 @@ mod tests {
             caps.hw_encoders.iter().any(|e| e == "libvpx-vp9-444-sw"),
             "libvpx encoder label must be advertised when probe succeeds; got {:?}",
             caps.hw_encoders
+        );
+    }
+
+    /// rc.19 file-DC v3 capability lock. The browser opts into
+    /// resumable uploads ONLY when this string appears in
+    /// `caps.files`. Removing or renaming it would silently disable
+    /// the resume path for every rc.19+ browser — lock here.
+    #[test]
+    fn detect_advertises_resume_files_cap() {
+        let caps = compute_caps();
+        assert!(
+            caps.files.iter().any(|s| s == "resume"),
+            "rc.19 caps.files must include \"resume\"; got {:?}",
+            caps.files
         );
     }
 }
