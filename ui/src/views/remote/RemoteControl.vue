@@ -824,13 +824,15 @@
           <v-spacer />
           <v-select
             v-model="agentLogLines"
-            :items="[200, 500, 1000, 2000, 5000]"
+            :items="[100, 200, 300]"
             density="compact"
             hide-details
             variant="outlined"
             class="ml-2"
             style="max-width: 120px;"
             label="Lines"
+            :hint="'Larger sizes need rc.24 agent streaming'"
+            persistent-hint
             @update:model-value="refreshAgentLog"
           />
           <v-btn
