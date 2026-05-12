@@ -128,9 +128,11 @@ pub async fn read_tail_lines(path: &std::path::Path, count: usize) -> Result<(Ve
         // line separator).
         newlines += chunk.iter().filter(|&&b| b == b'\n').count();
         // Prepend the chunk to the buffer (we read backwards, so
-        // older data goes first).
+        // older data goes first). `append(&mut buf)` is the clippy-
+        // preferred form vs `extend(buf.drain(..))` — same effect
+        // (moves elements, clears buf), one fewer iterator chain.
         let mut new_buf = chunk;
-        new_buf.extend(buf.drain(..));
+        new_buf.append(&mut buf);
         buf = new_buf;
         pos = read_at;
     }
