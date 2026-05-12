@@ -1203,6 +1203,59 @@ describe('parseControlInbound', () => {
     // an empty chip, so reject at the parse layer.
     expect(parseControlInbound('{"t":"rc:desktop_changed","name":""}')).toBeNull()
   })
+
+  // rc.23 — rc:logs-fetch.reply round-trip from the agent's
+  // diagnostic log-tail handler. Browser uses this to surface ESET
+  // / sync_data failures the operator can't see otherwise.
+  it('parses rc:logs-fetch.reply with ok=true and lines array', () => {
+    const r = parseControlInbound(
+      '{"t":"rc:logs-fetch.reply","ok":true,"path":"C:\\\\Users\\\\me\\\\log","lines":["a","b","c"],"truncated":false}'
+    )
+    expect(r).toEqual({
+      kind: 'logs_fetch_reply',
+      reply: {
+        ok: true,
+        path: 'C:\\Users\\me\\log',
+        lines: ['a', 'b', 'c'],
+        truncated: false,
+      },
+    })
+  })
+
+  it('parses rc:logs-fetch.reply ok=false with error message', () => {
+    // Agent's fetch_tail() failed path (e.g. log file rotated mid-
+    // read). Browser surfaces the message in a red caption.
+    const r = parseControlInbound(
+      '{"t":"rc:logs-fetch.reply","ok":false,"error":"no roomler-agent.log* file"}'
+    )
+    expect(r).toEqual({
+      kind: 'logs_fetch_reply',
+      reply: { ok: false, error: 'no roomler-agent.log* file' },
+    })
+  })
+
+  it('rc:logs-fetch.reply filters non-string entries from lines', () => {
+    // Defensive: agent contract requires string lines but a future
+    // wire-format drift shouldn't crash the browser. Filter to
+    // strings before the UI binds.
+    const r = parseControlInbound(
+      '{"t":"rc:logs-fetch.reply","ok":true,"lines":["good",42,null,"also good"]}'
+    )
+    expect(r).toEqual({
+      kind: 'logs_fetch_reply',
+      reply: { ok: true, lines: ['good', 'also good'] },
+    })
+  })
+
+  it('rc:logs-fetch.reply treats truncated as boolean only', () => {
+    // Non-boolean truncated values omit the field entirely; the UI
+    // renders without the "more entries omitted" hint rather than
+    // showing a stringified value.
+    const r = parseControlInbound(
+      '{"t":"rc:logs-fetch.reply","ok":true,"truncated":"yes"}'
+    )
+    expect(r).toEqual({ kind: 'logs_fetch_reply', reply: { ok: true } })
+  })
 })
 
 describe('nextReconnectDelayMs', () => {
