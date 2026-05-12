@@ -1032,7 +1032,12 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    * the message. Newer agents reply within ~50 ms for the default
    * 500-line tail; the 8 s timeout is generous for slow disks.
    */
-  function fetchAgentLogs(lines = 500): Promise<RcLogsFetchReply> {
+  // rc.23 hotfix #4 — default tail reduced 500 → 200 lines. The
+  // reply JSON for 500 lines could reach ~50–60 KB, very close to
+  // webrtc-rs's SCTP `max_message_size` default of 65536. 200 lines
+  // ≈ 25 KB, safe margin. Operator can still ask for up to 5000 via
+  // the UI line-count selector — the agent clamps anyway.
+  function fetchAgentLogs(lines = 200): Promise<RcLogsFetchReply> {
     return new Promise((resolve, reject) => {
       const ch = channels.control
       if (!ch || ch.readyState !== 'open') {
@@ -1081,7 +1086,14 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         resolve(reply)
       }
       try {
-        ch.send(JSON.stringify({ t: 'rc:logs-fetch', lines }))
+        const payload = JSON.stringify({ t: 'rc:logs-fetch', lines })
+        // rc.23 hotfix #4 — outbound trace so DevTools shows the
+        // request actually went out. Paired with the inbound trace
+        // on `channels.control.onmessage`, the field can verify
+        // request-vs-reply round-trip status without an agent log.
+        // eslint-disable-next-line no-console
+        console.log('[rc:control] outbound:', payload)
+        ch.send(payload)
       } catch (e) {
         if (!isActive) return
         isActive = false
@@ -2246,15 +2258,20 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // compat is automatic.
     channels.control.onmessage = (ev) => {
       // rc.23 hotfix — trace every inbound control envelope to the
-      // browser console at debug level so the field can see, via
-      // DevTools, exactly which messages the agent is sending. Helps
-      // diagnose "rc:logs-fetch.reply never arrived" reports without
-      // requiring an agent log fetch (which itself depends on the
-      // round-trip working). Truncated to first 200 chars so a huge
-      // logs payload doesn't blow up the console.
+      // browser console so the field can see, via DevTools, exactly
+      // which messages the agent is sending. Helps diagnose
+      // "rc:logs-fetch.reply never arrived" reports without requiring
+      // an agent log fetch (which itself depends on the round-trip
+      // working). Truncated to first 200 chars so a huge logs
+      // payload doesn't blow up the console.
+      //
+      // Uses `console.log` (not debug) intentionally — Chrome
+      // DevTools' default level filter hides `debug` and the field
+      // report 2026-05-13 was "no console logs at all" because of
+      // that filter, not because the messages were absent.
       if (typeof ev.data === 'string') {
         // eslint-disable-next-line no-console
-        console.debug(
+        console.log(
           '[rc:control] inbound:',
           ev.data.length > 200 ? ev.data.slice(0, 200) + '…' : ev.data
         )
