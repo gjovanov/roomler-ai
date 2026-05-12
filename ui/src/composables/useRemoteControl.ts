@@ -38,6 +38,21 @@ export type RcPhase =
 export const RC_RECONNECT_LADDER_MS = [250, 500, 1000, 2000, 4000, 8000] as const
 
 /**
+ * Steady-state retry delay used AFTER `RC_RECONNECT_LADDER_MS` is
+ * exhausted. rc.23 — the DC stays "open" from the operator's POV by
+ * never surfacing a terminal "budget exhausted" state; the reconnect
+ * loop keeps trying every `RC_RECONNECT_STEADY_MS` until the operator
+ * cancels via the existing Cancel button or the upload completes via
+ * resume. Field repro on PC50045 2026-05-11/12: large file uploads
+ * fail with the legacy 6-attempt cap because ESET intercepts cause
+ * repeated DC drops; an operator who walks away from their machine
+ * came back to a failed upload with no diagnostic context. With the
+ * cap removed, they can leave it retrying and inspect the log
+ * panel (also new in rc.23) at their leisure.
+ */
+export const RC_RECONNECT_STEADY_MS = 8000
+
+/**
  * Parse an inbound `control` data-channel message into a typed
  * value. Returns `null` for any non-JSON, non-string, or unknown
  * envelope shape so the caller can no-op silently. Recognised
@@ -86,15 +101,21 @@ export function parseControlInbound(data: unknown): RcControlInbound {
 /**
  * Pure helper: given the number of attempts already made (0-indexed
  * — i.e. `0` means the first retry hasn't fired yet), return the
- * delay before the next attempt, or `null` if we've exhausted the
- * ladder and should give up.
+ * delay before the next attempt. Always returns a positive delay —
+ * after `RC_RECONNECT_LADDER_MS` is exhausted, falls back to
+ * `RC_RECONNECT_STEADY_MS` (8 s) forever. The operator cancels by
+ * settling the in-flight transfer (Cancel button), tearing down the
+ * session (Disconnect), or closing the page. rc.23 — was previously
+ * `null` after 6 attempts, which surfaced "budget exhausted" to the
+ * field; field repro on PC50045 made it clear that operators on
+ * corporate AV-protected hosts need indefinite retry.
  *
  * Exported for unit testing. Called by `scheduleReconnect()` inside
  * the composable; production code should not need this directly.
  */
-export function nextReconnectDelayMs(attempt: number): number | null {
-  if (attempt < 0) return null
-  if (attempt >= RC_RECONNECT_LADDER_MS.length) return null
+export function nextReconnectDelayMs(attempt: number): number {
+  if (attempt < 0) return RC_RECONNECT_LADDER_MS[0]
+  if (attempt >= RC_RECONNECT_LADDER_MS.length) return RC_RECONNECT_STEADY_MS
   return RC_RECONNECT_LADDER_MS[attempt]
 }
 
@@ -1545,11 +1566,14 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       return
     }
     const attemptIdx = reconnectAttempt.value
+    // rc.23 — nextReconnectDelayMs always returns a positive delay
+    // now; the loop only exits when the operator clicks Disconnect
+    // (which sets lastConnectArgs = null and falls into the failWith
+    // above) or the peer transitions back to 'connected'. Removes
+    // the "budget exhausted" terminal that frustrated operators on
+    // corporate AV-protected hosts where the agent gets killed and
+    // restarted repeatedly during large uploads.
     const delay = nextReconnectDelayMs(attemptIdx)
-    if (delay === null) {
-      failWith(`peer connection failed — gave up after ${attemptIdx} reconnect attempts`)
-      return
-    }
     reconnectAttempt.value = attemptIdx + 1
     phase.value = 'reconnecting'
     teardown()
@@ -2810,20 +2834,29 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    */
   function waitForConnected(timeoutMs: number = 30_000): Promise<boolean> {
     if (phase.value === 'connected') return Promise.resolve(true)
+    // rc.23 — pass `Number.POSITIVE_INFINITY` to wait indefinitely
+    // for the next 'connected' transition. `setTimeout(fn, Infinity)`
+    // is implementation-defined (most engines clamp to ~2^31-1 ms
+    // ≈ 25 days) so we just skip the timer instead. The settle path
+    // is the phase watcher below — phases 'closed' / 'error' / 'idle'
+    // still resolve false so the caller can detect operator-cancel.
     return new Promise((resolve) => {
-      const timer = setTimeout(() => {
-        stop()
-        resolve(false)
-      }, timeoutMs)
+      const wantTimer = Number.isFinite(timeoutMs)
+      const timer = wantTimer
+        ? setTimeout(() => {
+            stop()
+            resolve(false)
+          }, timeoutMs)
+        : null
       const stop = watch(
         phase,
         (p) => {
           if (p === 'connected') {
-            clearTimeout(timer)
+            if (timer !== null) clearTimeout(timer)
             stop()
             resolve(true)
           } else if (p === 'closed' || p === 'error' || p === 'idle') {
-            clearTimeout(timer)
+            if (timer !== null) clearTimeout(timer)
             stop()
             resolve(false)
           }
@@ -2954,7 +2987,18 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         }
       }
 
-      const MAX_ATTEMPTS = RC_RECONNECT_LADDER_MS.length // 6
+      // rc.23 — infinite retry. The DC effectively stays "open" from
+      // the operator's POV: every drop triggers a resume on the next
+      // 'connected' transition; the loop only exits when the operator
+      // cancels via Cancel button (which settles the registry entry)
+      // or files:complete arrives. `MAX_ATTEMPTS` retained as a label
+      // for log lines + UI "attempt N/MAX" rendering, but tied to
+      // `Number.POSITIVE_INFINITY` so the budget check below is a
+      // no-op. Was 6; rolled forward on PC50045 field repro where
+      // ESET caused the agent to be killed repeatedly during 14 MB
+      // uploads and the 6-attempt cap surfaced "exhausted" before
+      // the DC could reconnect.
+      const MAX_ATTEMPTS = Number.POSITIVE_INFINITY
       let attempt = 0
 
       const runOnce = async (): Promise<void> => {
@@ -2982,7 +3026,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
           // true by the catch-block guard below.
           patchTransfer(id, {
             status: 'reconnecting',
-            error: `attempt ${attempt + 1}/${MAX_ATTEMPTS}`,
+            error: `attempt ${attempt + 1}`,
           })
           // Transition back to 'pending' so files:complete settles
           // through the normal path.
@@ -3015,20 +3059,37 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
             // reconnect and retry.
             patchTransfer(id, {
               status: 'reconnecting',
-              error: `attempt ${attempt + 1}/${MAX_ATTEMPTS}`,
+              error: `attempt ${attempt + 1}`,
             })
-            const connected = await waitForConnected(30_000)
+            // rc.23 — wait forever for the peer to come back. The
+            // resume loop is the operator's "DC stays open" promise;
+            // legacy 30 s timeout could fire while the agent was
+            // being installer-restarted by msiexec (5-90 s window
+            // observed during auto-update on PC50045). Outer
+            // settle-check at the top of `runOnce` handles the
+            // operator-cancel path.
+            const e2 = filesRegistry.get(id)
+            if (!e2 || e2.status === 'settled') return
+            // Block until 'connected' fires; the watch handler that
+            // resolves waitForConnected fires unconditionally on the
+            // peer-level 'connected' transition.
+            const connected = await waitForConnected(Number.POSITIVE_INFINITY)
             if (!connected) {
-              sendCancelBestEffort()
-              localFail(new Error('reconnect failed; aborting resumable upload'))
+              // waitForConnected only returns false on timeout. With
+              // an infinite timeout the only way out is the settle
+              // check above; surface a defensive error if we somehow
+              // get here.
+              localFail(new Error('reconnect wait returned without connecting (defensive)'))
               return
             }
             attempt += 1
           }
         }
-        // Budget exhausted.
+        // MAX_ATTEMPTS is Infinity in rc.23 — this is unreachable but
+        // kept as a defensive surface so a future regression flips
+        // MAX_ATTEMPTS without leaving the loop able to silently exit.
         sendCancelBestEffort()
-        localFail(new Error(`reconnect budget exhausted after ${MAX_ATTEMPTS} attempts`))
+        localFail(new Error('resumable upload exited the infinite-retry loop unexpectedly'))
       }
 
       void runResumable()
