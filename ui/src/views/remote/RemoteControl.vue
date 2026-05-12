@@ -324,6 +324,26 @@
       >
         <v-icon>mdi-folder-open</v-icon>
       </v-btn>
+      <!-- rc.23 — open the agent log viewer. Diagnostic feature
+           added so operators can see what's happening on the host
+           (e.g. ESET interrupt logs, sync_data failures) without
+           RDP-ing in. Disabled until the control DC is open. -->
+      <v-btn
+        :disabled="rc.phase.value !== 'connected'"
+        icon
+        variant="text"
+        size="small"
+        class="d-none d-sm-inline-flex"
+        aria-label="Show agent log"
+        :title="
+          rc.phase.value === 'connected'
+            ? 'Show agent log (rc:logs-fetch)'
+            : 'Connect to view agent logs'
+        "
+        @click="openAgentLogDialog"
+      >
+        <v-icon>mdi-file-document-outline</v-icon>
+      </v-btn>
       <!-- Transfers chip — shows count of in-progress + recently
            finished uploads / downloads. Click to expand a popover
            with per-row progress and cancel buttons. Hidden when
@@ -782,6 +802,93 @@
       </v-card>
     </v-bottom-sheet>
 
+    <!-- rc.23 — agent log viewer. Opens via the mdi-file-document-outline
+         toolbar button; shows the tail of the agent's rolling log file
+         in a scrolling pre-block. Refresh button re-fetches. Auto-fetches
+         on open with 500 lines (default) — enough to capture the run-up
+         to a typical upload failure on PC50045 without flooding the DC. -->
+    <v-dialog v-model="agentLogDialog" max-width="980" scrollable>
+      <v-card>
+        <v-toolbar density="compact" color="primary">
+          <v-icon class="ml-4">mdi-file-document-outline</v-icon>
+          <v-toolbar-title>
+            Agent log
+            <span
+              v-if="rc.agentLogs.value?.path"
+              class="ml-2 text-caption text-truncate"
+              :title="rc.agentLogs.value.path"
+            >
+              ({{ rc.agentLogs.value.path }})
+            </span>
+          </v-toolbar-title>
+          <v-spacer />
+          <v-select
+            v-model="agentLogLines"
+            :items="[200, 500, 1000, 2000, 5000]"
+            density="compact"
+            hide-details
+            variant="outlined"
+            class="ml-2"
+            style="max-width: 120px;"
+            label="Lines"
+            @update:model-value="refreshAgentLog"
+          />
+          <v-btn
+            icon
+            variant="text"
+            :loading="rc.agentLogsLoading.value"
+            title="Refresh"
+            @click="refreshAgentLog"
+          >
+            <v-icon>mdi-refresh</v-icon>
+          </v-btn>
+          <v-btn
+            icon
+            variant="text"
+            title="Copy to clipboard"
+            :disabled="!rc.agentLogs.value?.lines?.length"
+            @click="copyAgentLog"
+          >
+            <v-icon>mdi-content-copy</v-icon>
+          </v-btn>
+          <v-btn
+            icon
+            variant="text"
+            title="Close"
+            @click="agentLogDialog = false"
+          >
+            <v-icon>mdi-close</v-icon>
+          </v-btn>
+        </v-toolbar>
+        <v-card-text class="pa-0" style="max-height: 70vh; overflow: auto;">
+          <div
+            v-if="rc.agentLogs.value?.ok === false"
+            class="pa-3 text-error text-caption"
+          >
+            {{ rc.agentLogs.value.error || 'rc:logs-fetch failed' }}
+          </div>
+          <div
+            v-else-if="!rc.agentLogs.value?.lines?.length && !rc.agentLogsLoading.value"
+            class="pa-3 text-medium-emphasis text-caption"
+          >
+            No log lines yet. Click Refresh to fetch.
+          </div>
+          <pre
+            v-else
+            ref="agentLogPreEl"
+            class="agent-log-pre"
+          >{{ (rc.agentLogs.value?.lines || []).join('\n') }}</pre>
+          <div
+            v-if="rc.agentLogs.value?.truncated"
+            class="pa-2 text-caption text-medium-emphasis"
+          >
+            Showing the last {{ rc.agentLogs.value?.lines?.length || 0 }} lines —
+            older entries omitted. Increase line count to see more.
+          </div>
+        </v-card-text>
+      </v-card>
+    </v-dialog>
+
     <!-- Files browser drawer (Phase 3 of file-DC v2). Opens via the
          mdi-folder-open toolbar button. Lets the operator navigate
          the host's filesystem and download files. Folder download
@@ -821,6 +928,16 @@
           @click="navigateTo(currentParent || '')"
         >
           <v-icon>mdi-arrow-up</v-icon>
+        </v-btn>
+        <v-btn
+          icon
+          variant="text"
+          size="small"
+          :disabled="dirLoading"
+          title="Upload staging folder (rc.22 ESET-evasive staging — partials live here mid-upload)"
+          @click="navigateTo('C:\\\\ProgramData\\\\roomler\\\\roomler-agent\\\\staging')"
+        >
+          <v-icon>mdi-package-variant-closed</v-icon>
         </v-btn>
         <v-btn
           icon
@@ -910,7 +1027,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount, watch, nextTick } from 'vue'
 import { useRoute } from 'vue-router'
 import { useAgentStore, type Agent } from '@/stores/agents'
 import { useAuthStore } from '@/stores/auth'
@@ -1116,6 +1233,58 @@ async function onFilePicked(ev: Event) {
     await uploadMany(files)
   } finally {
     if (input) input.value = '' // allow re-selecting the same file(s)
+  }
+}
+
+// --- rc.23 agent log viewer state ---
+//
+// `agentLogDialog` drives the v-dialog open/close binding. `agentLogLines`
+// is the line count to request (operator-tunable from a dropdown in the
+// toolbar). `agentLogPreEl` is the <pre> element ref — we auto-scroll
+// to the bottom on every refresh so the newest entries are visible
+// without manual scrolling.
+const agentLogDialog = ref(false)
+const agentLogLines = ref(500)
+const agentLogPreEl = ref<HTMLElement | null>(null)
+
+async function openAgentLogDialog() {
+  agentLogDialog.value = true
+  // Auto-fetch on open so the operator doesn't have to click Refresh
+  // for the first view. Subsequent dialog re-opens still reuse the
+  // last fetch unless the operator hits Refresh — keeps the surface
+  // calm.
+  if (!rc.agentLogs.value) {
+    await refreshAgentLog()
+  } else {
+    // Scroll to bottom on re-open in case the user resized.
+    await nextTick()
+    scrollAgentLogToBottom()
+  }
+}
+
+async function refreshAgentLog() {
+  try {
+    await rc.fetchAgentLogs(agentLogLines.value)
+    await nextTick()
+    scrollAgentLogToBottom()
+  } catch (e) {
+    showError(`Failed to fetch agent log: ${e instanceof Error ? e.message : String(e)}`)
+  }
+}
+
+function scrollAgentLogToBottom() {
+  const el = agentLogPreEl.value
+  if (el) el.scrollTop = el.scrollHeight
+}
+
+async function copyAgentLog() {
+  const lines = rc.agentLogs.value?.lines
+  if (!lines || lines.length === 0) return
+  try {
+    await navigator.clipboard.writeText(lines.join('\n'))
+    showSuccess('Agent log copied to clipboard')
+  } catch (e) {
+    showError(`Copy failed: ${e instanceof Error ? e.message : String(e)}`)
   }
 }
 
@@ -2440,5 +2609,23 @@ onBeforeUnmount(() => {
   border-radius: 999px;
   letter-spacing: 0.3px;
   backdrop-filter: blur(4px);
+}
+
+/* rc.23 agent log viewer — monospace, dark background so the
+ * tracing levels (INFO/WARN/ERROR) read clearly. Horizontal scroll
+ * for long lines (no wrap so structured log fields stay aligned).
+ * Min height keeps the pre visible even when the fetch returns
+ * fewer lines than the dialog can hold. */
+.agent-log-pre {
+  margin: 0;
+  padding: 12px 16px;
+  background: #1a1a1a;
+  color: rgba(230, 230, 230, 0.95);
+  font: 12px/1.4 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  white-space: pre;
+  overflow-x: auto;
+  overflow-y: auto;
+  max-height: 65vh;
+  min-height: 200px;
 }
 </style>

@@ -43,6 +43,7 @@ use crate::encode;
 use crate::input;
 use crate::lock_overlay;
 use crate::lock_state;
+use crate::logs_fetch;
 
 /// Target capture rate on the **software** path. openh264 pegs a CPU core
 /// above ~35 fps at 1080p; 30 is the stable ceiling. See `target_fps_for`
@@ -1715,9 +1716,14 @@ fn attach_control_handler(
     quality_state: Arc<std::sync::atomic::AtomicU8>,
     target_resolution: Arc<std::sync::Mutex<TargetResolution>>,
 ) {
+    // Clone the Arc so the on_message closure can send replies
+    // (e.g. rc:logs-fetch.reply) back over the same DC. Original
+    // `dc` parameter is kept for the on_message registration below.
+    let dc_for_reply = dc.clone();
     dc.on_message(Box::new(move |msg| {
         let quality_state = quality_state.clone();
         let target_resolution = target_resolution.clone();
+        let dc_for_reply = dc_for_reply.clone();
         Box::pin(async move {
             // Trust-but-verify: a malformed message must never crash
             // the data-channel callback (it'd kill the channel for
@@ -1821,6 +1827,42 @@ fn attach_control_handler(
                             new_target = ?new_target,
                             "control: rc:resolution updated"
                         );
+                    }
+                }
+                "rc:logs-fetch" => {
+                    // rc.23 diagnostic feature. Browser requests the
+                    // tail of the agent's current rolling log file so
+                    // the operator can see what's actually happening
+                    // on the host without RDPing in. Field repro on
+                    // PC50045 2026-05-12: ESET-protected hosts fail
+                    // large uploads with no diagnostic surface in the
+                    // browser; rc:logs-fetch closes that gap. Single
+                    // round-trip — no continuous streaming (would
+                    // complicate ordering across reconnects without
+                    // adding much value for "what happened in the
+                    // last failed upload?" use case).
+                    let lines = val
+                        .get("lines")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(500)
+                        .clamp(1, 5000) as usize;
+                    let reply = match logs_fetch::fetch_tail(lines).await {
+                        Ok(payload) => payload,
+                        Err(e) => serde_json::json!({
+                            "t": "rc:logs-fetch.reply",
+                            "ok": false,
+                            "error": format!("{e:#}"),
+                        }),
+                    };
+                    let text = match serde_json::to_string(&reply) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            debug!(%session_id, %e, "control: rc:logs-fetch.reply serialise failed");
+                            return;
+                        }
+                    };
+                    if let Err(e) = dc_for_reply.send_text(text).await {
+                        debug!(%session_id, %e, "control: rc:logs-fetch.reply send failed");
                     }
                 }
                 other => {
