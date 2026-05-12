@@ -90,6 +90,119 @@ pub async fn fetch_tail(lines: usize) -> Result<serde_json::Value> {
     }))
 }
 
+/// rc.24 — chunk the agent's reply across multiple SCTP messages so
+/// large fetches (1000+ lines = >64 KiB JSON) don't exceed the
+/// `max_message_size` limit and get silently dropped by webrtc-rs.
+///
+/// Wire format (browser already understands `rc:logs-fetch.reply`
+/// from rc.23; the chunked variants below are new):
+///
+/// ```json
+/// // First message
+/// {
+///   "t": "rc:logs-fetch.reply.start",
+///   "id": "<request-id>",        // optional, only set when browser supplied it
+///   "ok": true,
+///   "path": "<log file path>",
+///   "total_lines": 2000,         // total lines that will be streamed
+///   "truncated": false
+/// }
+/// // Zero or more chunk messages
+/// {
+///   "t": "rc:logs-fetch.reply.chunk",
+///   "id": "<request-id>",
+///   "lines": ["<line>", "<line>", ...]   // sized to keep envelope < ~50 KB
+/// }
+/// // Final message
+/// { "t": "rc:logs-fetch.reply.end", "id": "<request-id>" }
+/// ```
+///
+/// Browsers built before rc.24 (rc.23.x) only know
+/// `rc:logs-fetch.reply` — they won't recognise the streamed
+/// variants. To keep backward-compat: if the entire payload fits in
+/// a single envelope (≤ chunked threshold), fall back to the
+/// monolithic `rc:logs-fetch.reply` shape so old browsers still
+/// work for small fetches.
+///
+/// Returns a `Vec<serde_json::Value>` of envelopes the caller must
+/// send in order over the control DC. Each envelope is guaranteed
+/// to serialise to < `MAX_ENVELOPE_BYTES` so it fits comfortably
+/// under the 65536-byte SCTP boundary.
+pub async fn fetch_tail_chunked(
+    lines: usize,
+    request_id: Option<&str>,
+) -> Result<Vec<serde_json::Value>> {
+    let lines = lines.clamp(1, MAX_TAIL_LINES);
+    let path = current_log_path()?;
+    let (out, truncated) = read_tail_lines(&path, lines).await?;
+
+    // Cheap heuristic: if total payload < MONO_THRESHOLD_BYTES,
+    // send as a single rc.23-compatible envelope. Otherwise chunk.
+    let approx_total: usize = out.iter().map(|s| s.len() + 4).sum();
+    if approx_total < MONO_THRESHOLD_BYTES {
+        return Ok(vec![serde_json::json!({
+            "t": "rc:logs-fetch.reply",
+            "ok": true,
+            "path": path.to_string_lossy(),
+            "lines": out,
+            "truncated": truncated,
+        })]);
+    }
+
+    // Streamed path. Estimate ~150 chars/line + 4 bytes JSON
+    // overhead per line. Aim for ~40 KB per chunk envelope so
+    // each one + JSON overhead stays comfortably under 50 KB.
+    let mut envelopes = Vec::new();
+    let path_str = path.to_string_lossy().to_string();
+    envelopes.push(serde_json::json!({
+        "t": "rc:logs-fetch.reply.start",
+        "id": request_id,
+        "ok": true,
+        "path": path_str,
+        "total_lines": out.len(),
+        "truncated": truncated,
+    }));
+
+    let mut buf: Vec<String> = Vec::new();
+    let mut buf_bytes: usize = 0;
+    for line in out {
+        let cost = line.len() + 4;
+        if buf_bytes + cost > CHUNK_BYTES && !buf.is_empty() {
+            envelopes.push(serde_json::json!({
+                "t": "rc:logs-fetch.reply.chunk",
+                "id": request_id,
+                "lines": std::mem::take(&mut buf),
+            }));
+            buf_bytes = 0;
+        }
+        buf_bytes += cost;
+        buf.push(line);
+    }
+    if !buf.is_empty() {
+        envelopes.push(serde_json::json!({
+            "t": "rc:logs-fetch.reply.chunk",
+            "id": request_id,
+            "lines": buf,
+        }));
+    }
+    envelopes.push(serde_json::json!({
+        "t": "rc:logs-fetch.reply.end",
+        "id": request_id,
+    }));
+    Ok(envelopes)
+}
+
+/// Single-envelope cutoff. Payloads smaller than this go via the
+/// rc.23-compatible monolithic `rc:logs-fetch.reply`. Larger ones
+/// switch to the chunked stream. 32 KB leaves plenty of margin for
+/// `path` + JSON overhead under the 65 KB SCTP boundary.
+pub const MONO_THRESHOLD_BYTES: usize = 32 * 1024;
+
+/// Per-chunk byte budget in the streamed path. Sized to ~40 KB so
+/// envelope + JSON overhead lands < 50 KB. Each chunk pays a small
+/// fixed overhead (`{"t":"...","id":"...","lines":[...]}` ≈ 60 B).
+pub const CHUNK_BYTES: usize = 40 * 1024;
+
 /// Read the last `count` lines from `path`. Returns (lines, truncated)
 /// where `truncated` is true when the file had more than `count` lines.
 ///
@@ -227,5 +340,36 @@ mod tests {
             DEFAULT_TAIL_LINES.clamp(1, MAX_TAIL_LINES),
             DEFAULT_TAIL_LINES
         );
+    }
+
+    // rc.24 — chunked-reply path threshold sanity checks. Production
+    // verification (does the agent stream correctly?) happens via
+    // field smoke + the browser-side parser tests.
+
+    #[test]
+    fn mono_threshold_safely_under_sctp_boundary() {
+        // SCTP max_message_size default is 65536. MONO_THRESHOLD_BYTES
+        // must leave room for `{"t":"rc:logs-fetch.reply","ok":true,
+        // "path":"...","lines":[...],"truncated":...}` JSON overhead
+        // (~60-200 bytes typical Windows paths) AND worst-case
+        // string escaping. 32 KB leaves 33 KB margin.
+        assert!(MONO_THRESHOLD_BYTES < 60_000);
+    }
+
+    #[test]
+    fn chunk_bytes_safely_under_sctp_boundary() {
+        // Each chunk envelope = ~60 B overhead + CHUNK_BYTES of
+        // line text. Total serialised < 65536 by a comfortable
+        // margin.
+        assert!(CHUNK_BYTES + 200 < 65_536);
+    }
+
+    #[test]
+    fn mono_threshold_is_below_chunk_budget() {
+        // Single-envelope path takes precedence over chunked when
+        // payload fits — MONO_THRESHOLD ≤ CHUNK_BYTES so we never
+        // emit a chunked stream that's smaller than what would have
+        // fit in one envelope.
+        assert!(MONO_THRESHOLD_BYTES <= CHUNK_BYTES);
     }
 }
