@@ -2901,7 +2901,18 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    * resume attempt (after `files:resumed`).
    */
   async function innerPump(file: File, startOffset: number, id: string): Promise<void> {
-    const CHUNK = 64 * 1024
+    // rc.23 hotfix #3 (PC50045 2026-05-13): 64 KiB sat exactly at
+    // webrtc-rs's SCTP `max_message_size` default (65536), so any
+    // 64-KiB outbound chunk that landed AT the boundary triggered
+    // `failed to handle_inbound: ErrChunk` warnings + silent drop on
+    // the agent side. Sub-32-KiB files succeeded (single chunk fits
+    // comfortably), 1 MiB files failed (16 chunks each at the
+    // boundary). Drop to 16 KiB — 4× margin, well within both SCTP
+    // implementations' guaranteed-unfragmented size + matches what
+    // RustDesk + most browser-based file-transfer libraries use.
+    // The trade-off is ~3× more send() calls per MB, but each
+    // call is sub-microsecond and the SCTP layer pipelines them.
+    const CHUNK = 16 * 1024
     let offset = startOffset
     // Cancellation: `cancelUpload(id)` settles the registry entry
     // locally; the pump checks status between chunks and exits.
