@@ -197,6 +197,13 @@ pub(crate) const FSYNC_THRESHOLD_BYTES: u64 = 1024 * 1024;
 ///
 /// Defaults: Windows → `true`, other → `false`. Tests force `false`
 /// via `cfg(test)` so the existing per-dest test assertions hold.
+///
+/// `dead_code` allow on non-Windows: the static + accessor are only
+/// READ from inside `#[cfg(target_os = "windows")]` blocks elsewhere
+/// in this file; on Linux/macOS the compiler can't see those reads
+/// and would warn. We keep the symbols cross-platform so the
+/// strategy-flag tests stay portable.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub(crate) static STAGE_IN_PROGRAMDATA: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| {
         if cfg!(test) {
@@ -212,6 +219,7 @@ pub(crate) static STAGE_IN_PROGRAMDATA: std::sync::LazyLock<bool> =
     });
 
 /// True when the rc.22 always-PROGRAMDATA staging strategy is active.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub(crate) fn stage_in_programdata() -> bool {
     *STAGE_IN_PROGRAMDATA
 }
