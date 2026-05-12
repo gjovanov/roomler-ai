@@ -38,7 +38,7 @@
         class="mr-2"
       >
         <template v-if="rc.phase.value === 'reconnecting'">
-          Reconnecting ({{ rc.reconnectAttempt.value }}/{{ RC_RECONNECT_LADDER_MS.length }})…
+          Reconnecting (attempt {{ rc.reconnectAttempt.value }})…
         </template>
         <template v-else>{{ rc.phase.value }}</template>
       </v-chip>
@@ -916,7 +916,6 @@ import { useAgentStore, type Agent } from '@/stores/agents'
 import { useAuthStore } from '@/stores/auth'
 import {
   useRemoteControl,
-  RC_RECONNECT_LADDER_MS,
   nextDirPath,
   type RcQuality,
   type RcPreferredCodec,
