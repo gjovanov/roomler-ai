@@ -86,6 +86,9 @@ export type RcControlInbound =
   | { kind: 'host_locked'; locked: boolean }
   | { kind: 'desktop_changed'; name: string }
   | { kind: 'logs_fetch_reply'; reply: RcLogsFetchReply }
+  | { kind: 'logs_fetch_start'; id: string | null; path?: string; totalLines?: number; truncated?: boolean }
+  | { kind: 'logs_fetch_chunk'; id: string | null; lines: string[] }
+  | { kind: 'logs_fetch_end'; id: string | null }
   | null
 
 export function parseControlInbound(data: unknown): RcControlInbound {
@@ -119,6 +122,31 @@ export function parseControlInbound(data: unknown): RcControlInbound {
     if (typeof obj.truncated === 'boolean') reply.truncated = obj.truncated
     if (typeof obj.error === 'string') reply.error = obj.error
     return { kind: 'logs_fetch_reply', reply }
+  }
+  // rc.24 streamed log-fetch reply: start / chunk / end. Browser
+  // accumulates chunks keyed by `id` (or a null sentinel when the
+  // agent didn't echo the request id back).
+  if (obj.t === 'rc:logs-fetch.reply.start') {
+    const id = typeof obj.id === 'string' ? obj.id : null
+    const start: Extract<RcControlInbound, { kind: 'logs_fetch_start' }> = {
+      kind: 'logs_fetch_start',
+      id,
+    }
+    if (typeof obj.path === 'string') start.path = obj.path
+    if (typeof obj.total_lines === 'number') start.totalLines = obj.total_lines
+    if (typeof obj.truncated === 'boolean') start.truncated = obj.truncated
+    return start
+  }
+  if (obj.t === 'rc:logs-fetch.reply.chunk') {
+    const id = typeof obj.id === 'string' ? obj.id : null
+    const lines = Array.isArray(obj.lines)
+      ? obj.lines.filter((s): s is string => typeof s === 'string')
+      : []
+    return { kind: 'logs_fetch_chunk', id, lines }
+  }
+  if (obj.t === 'rc:logs-fetch.reply.end') {
+    const id = typeof obj.id === 'string' ? obj.id : null
+    return { kind: 'logs_fetch_end', id }
   }
   return null
 }
@@ -703,6 +731,15 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    * still arrive and is dropped silently).
    */
   let pendingLogsResolver: ((reply: RcLogsFetchReply) => void) | null = null
+  /**
+   * rc.24 — accumulator for the streamed `rc:logs-fetch.reply.{start,chunk,end}`
+   * envelope sequence. `null` outside of an active stream;
+   * populated by the `start` handler and finalised by `end`. Only
+   * one stream-in-flight at a time (single-flight, matched by
+   * `pendingLogsResolver`); a second `start` mid-stream would
+   * silently clobber the prior accumulator.
+   */
+  let streamingLogsAcc: RcLogsFetchReply | null = null
   const remoteStream = ref<MediaStream | null>(null)
   /** Set once we've received at least one video/audio track. False until
    *  the agent attaches media (the native agent currently does not). */
@@ -2287,6 +2324,28 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         const resolve = pendingLogsResolver
         pendingLogsResolver = null
         if (resolve) resolve(parsed.reply)
+      } else if (parsed?.kind === 'logs_fetch_start') {
+        // rc.24 streamed reply: collect into the accumulator until
+        // the matching `end` envelope arrives. `path` + `truncated`
+        // are carried on `start`; lines accumulate from chunks.
+        streamingLogsAcc = {
+          ok: true,
+          path: parsed.path,
+          lines: [],
+          truncated: parsed.truncated,
+        }
+      } else if (parsed?.kind === 'logs_fetch_chunk') {
+        if (streamingLogsAcc && streamingLogsAcc.lines) {
+          streamingLogsAcc.lines.push(...parsed.lines)
+        }
+      } else if (parsed?.kind === 'logs_fetch_end') {
+        const reply = streamingLogsAcc ?? { ok: false, error: 'no start envelope' }
+        streamingLogsAcc = null
+        agentLogs.value = reply
+        agentLogsLoading.value = false
+        const resolve = pendingLogsResolver
+        pendingLogsResolver = null
+        if (resolve) resolve(reply)
       }
     }
 

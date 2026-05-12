@@ -824,15 +824,13 @@
           <v-spacer />
           <v-select
             v-model="agentLogLines"
-            :items="[100, 200, 300]"
+            :items="[100, 200, 500, 1000, 2000, 5000]"
             density="compact"
             hide-details
             variant="outlined"
             class="ml-2"
             style="max-width: 120px;"
             label="Lines"
-            :hint="'Larger sizes need rc.24 agent streaming'"
-            persistent-hint
             @update:model-value="refreshAgentLog"
           />
           <v-btn
@@ -937,7 +935,7 @@
           size="small"
           :disabled="dirLoading"
           title="Upload staging folder (rc.22 ESET-evasive staging — partials live here mid-upload)"
-          @click="navigateTo('C:\\\\ProgramData\\\\roomler\\\\roomler-agent\\\\staging')"
+          @click="navigateTo(STAGING_PATH)"
         >
           <v-icon>mdi-package-variant-closed</v-icon>
         </v-btn>
@@ -1237,6 +1235,19 @@ async function onFilePicked(ev: Event) {
     if (input) input.value = '' // allow re-selecting the same file(s)
   }
 }
+
+// --- rc.23 hotfix #6: staging quick-access path ---
+//
+// rc.22 always-PROGRAMDATA staging puts in-flight upload partials
+// under this fixed path on every Windows agent. Defining the path
+// as a JS string here (rather than inlining in the @click handler)
+// avoids the Vue-template / HTML-attribute / JS-string escaping
+// stack that produced double-backslashes in the literal sent to
+// the agent ("canonicalising C:\\ProgramData\\..." error). The
+// string below contains exactly one backslash per separator after
+// JS string-literal evaluation; the agent's path resolver handles
+// it natively.
+const STAGING_PATH = 'C:\\ProgramData\\roomler\\roomler-agent\\staging'
 
 // --- rc.23 agent log viewer state ---
 //
