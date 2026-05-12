@@ -70,9 +70,22 @@ export const RC_RECONNECT_STEADY_MS = 8000
  * already-applied `hostLocked` / `currentDesktop` refs from the
  * composable.
  */
+export type RcLogsFetchReply = {
+  ok: boolean
+  /** Absolute path of the file the lines came from (when ok). */
+  path?: string
+  /** One string per line, in file order (oldest first). */
+  lines?: string[]
+  /** True when the file had more lines than were returned. */
+  truncated?: boolean
+  /** Error message when ok = false. */
+  error?: string
+}
+
 export type RcControlInbound =
   | { kind: 'host_locked'; locked: boolean }
   | { kind: 'desktop_changed'; name: string }
+  | { kind: 'logs_fetch_reply'; reply: RcLogsFetchReply }
   | null
 
 export function parseControlInbound(data: unknown): RcControlInbound {
@@ -94,6 +107,18 @@ export function parseControlInbound(data: unknown): RcControlInbound {
     obj.name.length > 0
   ) {
     return { kind: 'desktop_changed', name: obj.name }
+  }
+  if (obj.t === 'rc:logs-fetch.reply') {
+    const reply: RcLogsFetchReply = {
+      ok: obj.ok === true,
+    }
+    if (typeof obj.path === 'string') reply.path = obj.path
+    if (Array.isArray(obj.lines)) {
+      reply.lines = obj.lines.filter((s): s is string => typeof s === 'string')
+    }
+    if (typeof obj.truncated === 'boolean') reply.truncated = obj.truncated
+    if (typeof obj.error === 'string') reply.error = obj.error
+    return { kind: 'logs_fetch_reply', reply }
   }
   return null
 }
@@ -662,6 +687,22 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    * secondary chip.
    */
   const currentDesktop = ref<string>('Default')
+  /**
+   * rc.23 — diagnostic surface for the `rc:logs-fetch` round-trip.
+   * `agentLogs` holds the last reply (or null if no fetch has run);
+   * `agentLogsLoading` flips true while a request is in flight.
+   * Operator drives via `fetchAgentLogs(linesCount)` from the UI.
+   */
+  const agentLogs = ref<RcLogsFetchReply | null>(null)
+  const agentLogsLoading = ref(false)
+  /**
+   * Single-flight promise resolver — when set, the next
+   * `rc:logs-fetch.reply` arriving over the control DC resolves it.
+   * Set inside `fetchAgentLogs()`, cleared in the onmessage handler.
+   * Subsequent rapid calls cancel the pending promise (reply may
+   * still arrive and is dropped silently).
+   */
+  let pendingLogsResolver: ((reply: RcLogsFetchReply) => void) | null = null
   const remoteStream = ref<MediaStream | null>(null)
   /** Set once we've received at least one video/audio track. False until
    *  the agent attaches media (the native agent currently does not). */
@@ -978,6 +1019,57 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    *  the codebase. */
   function sendKey(code: number, down: boolean, mods: number = 0) {
     sendInput({ t: 'key', code, down, mods })
+  }
+
+  /**
+   * rc.23 — request a tail of the agent's log file over the control
+   * DC. Sends `rc:logs-fetch { lines }` and awaits the matching
+   * `rc:logs-fetch.reply`. Single-flight: a second call while one is
+   * pending cancels the prior promise (the late reply is dropped).
+   *
+   * Returns the reply or rejects with a clear error when the control
+   * DC isn't open / the timeout fires / agent is too old to support
+   * the message. Newer agents reply within ~50 ms for the default
+   * 500-line tail; the 8 s timeout is generous for slow disks.
+   */
+  function fetchAgentLogs(lines = 500): Promise<RcLogsFetchReply> {
+    return new Promise((resolve, reject) => {
+      const ch = channels.control
+      if (!ch || ch.readyState !== 'open') {
+        reject(new Error('control DC not open — not connected to agent'))
+        return
+      }
+      // Cancel any prior in-flight request — late reply is dropped.
+      const prevResolver = pendingLogsResolver
+      if (prevResolver !== null) {
+        // Resolve the prior promise with a synthetic error so its
+        // caller doesn't hang forever.
+        prevResolver({ ok: false, error: 'superseded by a newer fetch' })
+      }
+      agentLogsLoading.value = true
+      pendingLogsResolver = resolve
+      const timer = setTimeout(() => {
+        if (pendingLogsResolver === resolve) {
+          pendingLogsResolver = null
+          agentLogsLoading.value = false
+          reject(new Error('rc:logs-fetch timed out (agent too old?)'))
+        }
+      }, 8000)
+      // Wrap the resolver so the timer is cleared on success too.
+      const wrappedResolver = pendingLogsResolver
+      pendingLogsResolver = (reply) => {
+        clearTimeout(timer)
+        wrappedResolver(reply)
+      }
+      try {
+        ch.send(JSON.stringify({ t: 'rc:logs-fetch', lines }))
+      } catch (e) {
+        clearTimeout(timer)
+        pendingLogsResolver = null
+        agentLogsLoading.value = false
+        reject(e instanceof Error ? e : new Error(String(e)))
+      }
+    })
   }
 
   /** Send a `rc:quality` preference over the control channel. Safe to
@@ -2137,6 +2229,12 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         hostLocked.value = parsed.locked
       } else if (parsed?.kind === 'desktop_changed') {
         currentDesktop.value = parsed.name
+      } else if (parsed?.kind === 'logs_fetch_reply') {
+        agentLogs.value = parsed.reply
+        agentLogsLoading.value = false
+        const resolve = pendingLogsResolver
+        pendingLogsResolver = null
+        if (resolve) resolve(parsed.reply)
       }
     }
 
@@ -3636,6 +3734,18 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
      * rendering only the existing `hostLocked` chip.
      */
     currentDesktop,
+    /**
+     * rc.23 — diagnostic surface. `agentLogs` holds the last
+     * `rc:logs-fetch.reply` (null until first fetch); the UI renders
+     * `lines` in a scrolling pre-block. `agentLogsLoading` flips
+     * true while a request is in flight (drives a spinner).
+     * `fetchAgentLogs(linesCount)` triggers a new request — operator
+     * calls this from a toolbar button or auto-fetches when the log
+     * dialog opens.
+     */
+    agentLogs,
+    agentLogsLoading,
+    fetchAgentLogs,
     attachInput,
     /** Wire `key_text` over the input DC (used by mobile keyboard +
      *  IME composition path). See [`sendKeyText`] for the full
