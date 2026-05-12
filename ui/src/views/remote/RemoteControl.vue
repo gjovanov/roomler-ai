@@ -1244,7 +1244,10 @@ async function onFilePicked(ev: Event) {
 // to the bottom on every refresh so the newest entries are visible
 // without manual scrolling.
 const agentLogDialog = ref(false)
-const agentLogLines = ref(500)
+// rc.23 hotfix #4 — default 200 (was 500). Aligns with the
+// composable default; keeps the reply payload well under
+// webrtc-rs's SCTP max_message_size (~64 KiB).
+const agentLogLines = ref(200)
 const agentLogPreEl = ref<HTMLElement | null>(null)
 
 async function openAgentLogDialog() {
