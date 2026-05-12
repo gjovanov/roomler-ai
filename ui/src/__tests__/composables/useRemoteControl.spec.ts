@@ -1215,17 +1215,21 @@ describe('nextReconnectDelayMs', () => {
     expect(nextReconnectDelayMs(5)).toBe(8000)
   })
 
-  it('returns null past the cap so callers know to give up', () => {
-    // The 7th attempt and beyond have no entry. Caller's
-    // contract: null = stop retrying, surface error to operator.
-    expect(nextReconnectDelayMs(6)).toBeNull()
-    expect(nextReconnectDelayMs(100)).toBeNull()
+  it('falls back to steady-state delay past the ladder (rc.23: infinite retry)', () => {
+    // rc.23 — operators on AV-protected hosts need indefinite retry;
+    // returning `null` past the cap surfaced "budget exhausted" in
+    // the field. The 7th attempt and beyond return
+    // `RC_RECONNECT_STEADY_MS` (8 s) — caller keeps retrying.
+    expect(nextReconnectDelayMs(6)).toBe(8000)
+    expect(nextReconnectDelayMs(100)).toBe(8000)
+    expect(nextReconnectDelayMs(10_000)).toBe(8000)
   })
 
-  it('returns null on negative input', () => {
+  it('returns the first-attempt delay on negative input (defensive)', () => {
     // Defensive: a logic bug that decremented the counter past 0
-    // shouldn't accidentally re-enter the ladder.
-    expect(nextReconnectDelayMs(-1)).toBeNull()
+    // shouldn't strand the loop. Returns the first-attempt delay
+    // (250 ms) so the loop continues. rc.23 — was `null` pre-change.
+    expect(nextReconnectDelayMs(-1)).toBe(250)
   })
 })
 
