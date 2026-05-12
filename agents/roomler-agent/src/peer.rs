@@ -1830,39 +1830,70 @@ fn attach_control_handler(
                     }
                 }
                 "rc:logs-fetch" => {
-                    // rc.23 diagnostic feature. Browser requests the
-                    // tail of the agent's current rolling log file so
-                    // the operator can see what's actually happening
-                    // on the host without RDPing in. Field repro on
-                    // PC50045 2026-05-12: ESET-protected hosts fail
-                    // large uploads with no diagnostic surface in the
-                    // browser; rc:logs-fetch closes that gap. Single
-                    // round-trip — no continuous streaming (would
-                    // complicate ordering across reconnects without
-                    // adding much value for "what happened in the
-                    // last failed upload?" use case).
+                    // rc.23 diagnostic feature; rc.24 added reply
+                    // streaming. Browser requests the tail of the
+                    // agent's current rolling log file so the
+                    // operator can see what's actually happening on
+                    // the host without RDPing in. Single round-trip
+                    // for sub-32-KB payloads (rc.23-compatible);
+                    // chunked stream for larger ones because a
+                    // single SCTP message can't exceed the
+                    // negotiated `max_message_size` (65536 default)
+                    // — field repro PC50045 2026-05-13 showed
+                    // 1000-line requests silently dropping.
                     let lines = val
                         .get("lines")
                         .and_then(|v| v.as_u64())
-                        .unwrap_or(500)
+                        .unwrap_or(200)
                         .clamp(1, 5000) as usize;
-                    let reply = match logs_fetch::fetch_tail(lines).await {
-                        Ok(payload) => payload,
-                        Err(e) => serde_json::json!({
-                            "t": "rc:logs-fetch.reply",
-                            "ok": false,
-                            "error": format!("{e:#}"),
-                        }),
-                    };
-                    let text = match serde_json::to_string(&reply) {
-                        Ok(s) => s,
+                    let request_id = val
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    info!(
+                        %session_id,
+                        request_id = ?request_id,
+                        lines,
+                        "control: rc:logs-fetch received"
+                    );
+                    let envelopes = match logs_fetch::fetch_tail_chunked(
+                        lines,
+                        request_id.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(envs) => envs,
                         Err(e) => {
-                            debug!(%session_id, %e, "control: rc:logs-fetch.reply serialise failed");
-                            return;
+                            warn!(%session_id, %e, "control: rc:logs-fetch fetch_tail_chunked failed");
+                            vec![serde_json::json!({
+                                "t": "rc:logs-fetch.reply",
+                                "ok": false,
+                                "error": format!("{e:#}"),
+                            })]
                         }
                     };
-                    if let Err(e) = dc_for_reply.send_text(text).await {
-                        debug!(%session_id, %e, "control: rc:logs-fetch.reply send failed");
+                    let envelope_count = envelopes.len();
+                    info!(
+                        %session_id,
+                        envelopes = envelope_count,
+                        "control: rc:logs-fetch sending reply"
+                    );
+                    for env in envelopes {
+                        let text = match serde_json::to_string(&env) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                debug!(%session_id, %e, "control: rc:logs-fetch.reply serialise failed");
+                                continue;
+                            }
+                        };
+                        if let Err(e) = dc_for_reply.send_text(text).await {
+                            debug!(%session_id, %e, "control: rc:logs-fetch.reply send failed");
+                            // Stop sending the rest of the stream —
+                            // browser will get a partial response and
+                            // can retry. Better than spamming dead
+                            // sends.
+                            break;
+                        }
                     }
                 }
                 other => {

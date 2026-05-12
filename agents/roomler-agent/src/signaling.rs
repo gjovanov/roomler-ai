@@ -260,7 +260,7 @@ async fn connect_once(
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
                     info!("shutdown signalled; closing ws");
-                    close_all_peers(&mut peers).await;
+                    close_all_peers(&mut peers, &indicator).await;
                     let _ = ws.send(Message::Close(None)).await;
                     return Ok(());
                 }
@@ -268,7 +268,7 @@ async fn connect_once(
             _ = keepalive.tick() => {
                 if let Err(e) = ws.send(Message::Ping(Vec::new().into())).await {
                     warn!(%e, "keepalive ping failed — will reconnect");
-                    close_all_peers(&mut peers).await;
+                    close_all_peers(&mut peers, &indicator).await;
                     return Err(ConnectError::Transient(anyhow::Error::new(e).context("ws ping")));
                 }
                 // Liveness: a successful keepalive proves the WS pump
@@ -285,7 +285,7 @@ async fn connect_once(
                 };
                 if let Err(e) = send_msg(&mut ws, &hb).await {
                     warn!(%e, "heartbeat send failed — will reconnect");
-                    close_all_peers(&mut peers).await;
+                    close_all_peers(&mut peers, &indicator).await;
                     return Err(ConnectError::Transient(e.context("heartbeat send")));
                 }
                 watchdog::tick("signaling");
@@ -323,11 +323,11 @@ async fn connect_once(
                 }
                 Some(Ok(Message::Close(_))) | None => {
                     info!("ws closed by peer");
-                    close_all_peers(&mut peers).await;
+                    close_all_peers(&mut peers, &indicator).await;
                     return Ok(());
                 }
                 Some(Err(e)) => {
-                    close_all_peers(&mut peers).await;
+                    close_all_peers(&mut peers, &indicator).await;
                     return Err(ConnectError::Transient(anyhow::Error::new(e).context("ws read")));
                 }
                 _ => {}
@@ -562,10 +562,32 @@ async fn handle_server_msg(
     Ok(())
 }
 
-async fn close_all_peers(peers: &mut HashMap<bson::oid::ObjectId, AgentPeer>) {
-    for (_, peer) in peers.drain() {
+async fn close_all_peers(
+    peers: &mut HashMap<bson::oid::ObjectId, AgentPeer>,
+    indicator: &ViewerIndicator,
+) {
+    // rc.24 — also hide the viewer-indicator overlay for every
+    // session being torn down. Previously the indicator only
+    // hid on receipt of `rc:terminate`, which never fires when
+    // the WS itself drops (e.g. server pod recreate, network
+    // blip). Field repro 2026-05-13 on PC50045: after a roomler.ai
+    // web deploy, the red "Being viewed by gjovanov" frame stayed
+    // painted on the host indefinitely + the operator couldn't
+    // reconnect ("agent capacity exceeded") until the agent
+    // service was restarted manually. By hiding the overlay here
+    // the next session can reconnect with a clean slate.
+    if peers.is_empty() {
+        return;
+    }
+    let count = peers.len();
+    for (session_id, peer) in peers.drain() {
+        indicator.hide_session(session_id.to_hex());
         peer.close().await;
     }
+    info!(
+        count,
+        "torn down peers + hid indicator overlays on ws disconnect"
+    );
 }
 
 async fn send_msg(

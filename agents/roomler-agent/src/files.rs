@@ -167,12 +167,18 @@ pub(crate) struct PartialMeta {
 pub(crate) const PARTIAL_ORPHAN_TTL_SECS: i64 = 24 * 3600;
 
 /// Granularity at which `chunk()` calls `sync_data()` so that the
-/// page cache is flushed to disk at sub-1-MiB intervals. Tuned to
-/// 1 MiB (not 256 KiB) because Windows `FlushFileBuffers` is
-/// 1-30 ms per call under Defender; 35 syscalls for the 35 MB
-/// reference upload keeps overhead < 1% on NVMe and < 10% on HDD.
-/// See plan B2 fix for the trade-off analysis.
-pub(crate) const FSYNC_THRESHOLD_BYTES: u64 = 1024 * 1024;
+/// page cache is flushed to disk at sub-1-MiB intervals.
+///
+/// rc.24 — was 1 MiB. PC50045 field repro showed sub-1-MiB files
+/// never had a sync point mid-upload; if the agent process was
+/// killed before `end()` flushed (e.g. msiexec auto-update,
+/// SCM service restart), the file stayed 0 bytes on disk and
+/// resume couldn't make progress because `bytesAcked` reset to 0
+/// each cycle. Drop to 256 KiB so even small files persist
+/// incrementally. Overhead on Windows: 4× more `FlushFileBuffers`
+/// per MB ≈ 4-120 ms per MB vs the prior 1-30 ms; acceptable
+/// because resume durability is the harder problem to solve.
+pub(crate) const FSYNC_THRESHOLD_BYTES: u64 = 256 * 1024;
 
 /// rc.22 — staging-strategy flag. When `true`, all upload staging on
 /// Windows happens under `%PROGRAMDATA%\roomler\roomler-agent\staging\`
@@ -2959,15 +2965,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chunk_syncs_data_at_one_mib_boundary() {
+    async fn chunk_syncs_data_at_fsync_threshold_boundary() {
+        // rc.24 — was named "..._at_one_mib_boundary" when
+        // FSYNC_THRESHOLD_BYTES was 1 MiB. After lowering to 256 KiB
+        // (so sub-1-MiB uploads can survive a process kill), the
+        // sync cadence changed but the contract is the same:
+        // last_synced advances by exactly one threshold per chunk
+        // that crosses the boundary.
         let dest = stage_tmpdir().await;
         let h = FilesHandler::new();
         let id = format!(
             "rc19-sync-{}",
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
         );
-        // 1.5 MiB total — one sync at 1 MiB boundary, none at 1.5.
-        let size = (FSYNC_THRESHOLD_BYTES + 512 * 1024) as usize;
+        // Send 1.5× threshold total — one sync at threshold, none past.
+        let size = (FSYNC_THRESHOLD_BYTES + FSYNC_THRESHOLD_BYTES / 2) as usize;
         h.begin(
             id.clone(),
             "big.bin".into(),
@@ -2978,18 +2990,21 @@ mod tests {
         .await
         .expect("begin");
 
-        // 6 chunks × 256 KiB = 1.5 MiB.
-        let chunk = vec![0xABu8; 256 * 1024];
+        // 6 chunks × (threshold / 4) so we cross the threshold
+        // exactly once on chunk 4, and stay short of the second
+        // sync after chunk 6 = 1.5 × threshold.
+        let chunk_size = (FSYNC_THRESHOLD_BYTES / 4) as usize;
+        let chunk = vec![0xABu8; chunk_size];
         for _ in 0..6 {
             h.chunk(&chunk).await.expect("chunk");
         }
 
         // Verify the durable-at-sync-boundary contract that B2
-        // actually guarantees: last_synced advanced past 1 MiB
-        // exactly once. Chunks 1..4 = 1 MiB → triggers first sync
-        // (received == FSYNC_THRESHOLD_BYTES, delta == threshold).
-        // Chunks 5..6 = 1.5 MiB total → delta = 0.5 MiB < threshold,
-        // no second sync.
+        // actually guarantees: last_synced advanced past the
+        // threshold exactly once. Chunks 1..4 = threshold → triggers
+        // first sync (received == FSYNC_THRESHOLD_BYTES, delta ==
+        // threshold). Chunks 5..6 = 1.5×threshold total → delta =
+        // 0.5×threshold < threshold, no second sync.
         //
         // We do NOT assert on `tokio::fs::metadata(...).len()` here:
         // `tokio::fs::File` has an internal write buffer that
@@ -3004,7 +3019,7 @@ mod tests {
         let guard = h.incoming.lock().await;
         let state = guard.as_ref().expect("state");
         assert_eq!(state.last_synced, FSYNC_THRESHOLD_BYTES);
-        assert_eq!(state.received, 6 * 256 * 1024);
+        assert_eq!(state.received, (6 * chunk_size) as u64);
         drop(guard);
 
         h.abort().await;
