@@ -1055,13 +1055,23 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       // forever when the agent didn't respond (old agent unaware of
       // `rc:logs-fetch`, or DC half-open after a peer drop).
       let isActive = true
+      // rc.23 hotfix #2 — 30 s timeout (was 8 s). PC50045 field
+      // report: log fetch timing out even on rc.23 agent. Agent's
+      // file read might be ESET-intercepted (the agent's tracing
+      // log is itself a file that ESET scans on read). 8 s gave too
+      // little budget; 30 s matches the "operator clicks Refresh
+      // and waits a beat" experience.
       const timer = setTimeout(() => {
         if (!isActive) return
         isActive = false
         pendingLogsResolver = null
         agentLogsLoading.value = false
-        reject(new Error('rc:logs-fetch timed out (agent too old?)'))
-      }, 8000)
+        reject(
+          new Error(
+            'rc:logs-fetch timed out after 30 s — agent might be on rc.22 or older, or its log read is being held by the AV scanner'
+          )
+        )
+      }, 30000)
       pendingLogsResolver = (reply) => {
         if (!isActive) return
         isActive = false
@@ -2235,6 +2245,20 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // silently; older agents emitted nothing here, so backward-
     // compat is automatic.
     channels.control.onmessage = (ev) => {
+      // rc.23 hotfix — trace every inbound control envelope to the
+      // browser console at debug level so the field can see, via
+      // DevTools, exactly which messages the agent is sending. Helps
+      // diagnose "rc:logs-fetch.reply never arrived" reports without
+      // requiring an agent log fetch (which itself depends on the
+      // round-trip working). Truncated to first 200 chars so a huge
+      // logs payload doesn't blow up the console.
+      if (typeof ev.data === 'string') {
+        // eslint-disable-next-line no-console
+        console.debug(
+          '[rc:control] inbound:',
+          ev.data.length > 200 ? ev.data.slice(0, 200) + '…' : ev.data
+        )
+      }
       const parsed = parseControlInbound(ev.data)
       if (parsed?.kind === 'host_locked') {
         hostLocked.value = parsed.locked
@@ -2976,6 +3000,55 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   }
 
   /**
+   * rc.23 hotfix — wait for `channels.files` to be open. Necessary
+   * companion to {@link waitForConnected} for the resume loop:
+   * `phase = 'connected'` only means the WebRTC PeerConnection is
+   * up, not that the file DC has re-opened. When the agent drops
+   * the file DC mid-transfer but keeps the peer alive (some failure
+   * modes do this), `runOnce` throws "channel closed" synchronously,
+   * `waitForConnected` returns true immediately, the loop re-enters,
+   * throws again — tight async loop that burns CPU and freezes the
+   * tab. Field repro on PC50045 2026-05-12 (CV.pdf upload + rc.23
+   * web on rc.23 agent → tab had to be killed).
+   *
+   * `pollIntervalMs` defaults to 250 — cheap; the DC opens once per
+   * resume cycle so we don't pay a steady cost. `timeoutMs` defaults
+   * to `Number.POSITIVE_INFINITY` so the loop matches the parent
+   * "DC always stays open" contract; finite caps are useful only
+   * when an outer caller wants to bail.
+   */
+  function waitForFilesChannel(
+    timeoutMs: number = Number.POSITIVE_INFINITY,
+    pollIntervalMs: number = 250
+  ): Promise<boolean> {
+    if (channels.files && channels.files.readyState === 'open') {
+      return Promise.resolve(true)
+    }
+    return new Promise((resolve) => {
+      const wantTimer = Number.isFinite(timeoutMs)
+      let settled = false
+      const finish = (ok: boolean) => {
+        if (settled) return
+        settled = true
+        if (timer !== null) clearTimeout(timer)
+        clearInterval(poll)
+        resolve(ok)
+      }
+      const timer = wantTimer ? setTimeout(() => finish(false), timeoutMs) : null
+      const poll = setInterval(() => {
+        if (channels.files && channels.files.readyState === 'open') {
+          finish(true)
+          return
+        }
+        // Operator-disconnect / fatal error terminates the wait.
+        if (phase.value === 'closed' || phase.value === 'error' || phase.value === 'idle') {
+          finish(false)
+        }
+      }, pollIntervalMs)
+    })
+  }
+
+  /**
    * rc.19 P5: resume-capable wrapper around `innerPump`. First
    * attempt sends `files:begin`; subsequent attempts send
    * `files:resume { id, offset: entry.bytesAcked }` and re-pump
@@ -3179,6 +3252,25 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
             // operator-cancel path.
             const e2 = filesRegistry.get(id)
             if (!e2 || e2.status === 'settled') return
+            // rc.23 hotfix — bound the retry rate to prevent a tight
+            // async loop when the file DC is closed but the peer is
+            // still 'connected'. Without this delay, `runOnce` throws
+            // "channel closed" synchronously, `waitForConnected`
+            // returns true immediately (phase already 'connected'),
+            // we retry, throw again — thousands of iterations per
+            // second pin a CPU core and freeze the browser tab. Field
+            // repro on PC50045 2026-05-12 (CV.pdf upload). Backstop
+            // delay also gives the agent breathing room to reopen
+            // the DC before we ping it again.
+            const backoffMs =
+              attempt < RC_RECONNECT_LADDER_MS.length
+                ? RC_RECONNECT_LADDER_MS[attempt]
+                : RC_RECONNECT_STEADY_MS
+            await new Promise((r) => setTimeout(r, backoffMs))
+            // Re-check settled after the sleep — operator may have
+            // cancelled while we were waiting.
+            const e3 = filesRegistry.get(id)
+            if (!e3 || e3.status === 'settled') return
             // Block until 'connected' fires; the watch handler that
             // resolves waitForConnected fires unconditionally on the
             // peer-level 'connected' transition.
@@ -3189,6 +3281,17 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
               // check above; surface a defensive error if we somehow
               // get here.
               localFail(new Error('reconnect wait returned without connecting (defensive)'))
+              return
+            }
+            // rc.23 hotfix — also wait for the file DC to re-open.
+            // `phase === 'connected'` is necessary but not sufficient:
+            // if the agent dropped just the file DC, the peer never
+            // transitions, and `runOnce` would throw on entry without
+            // the DC ready. waitForFilesChannel polls every 250 ms
+            // for `channels.files.readyState === 'open'`.
+            const fileChanOpen = await waitForFilesChannel(Number.POSITIVE_INFINITY)
+            if (!fileChanOpen) {
+              localFail(new Error('file channel did not re-open (operator disconnect?)'))
               return
             }
             attempt += 1
