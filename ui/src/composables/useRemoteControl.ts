@@ -1047,23 +1047,34 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         prevResolver({ ok: false, error: 'superseded by a newer fetch' })
       }
       agentLogsLoading.value = true
-      pendingLogsResolver = resolve
+      // `isActive` is the single source of truth for "this request is
+      // still awaiting a reply." Avoids the rc.23-first-cut bug where
+      // the timer compared `pendingLogsResolver === resolve` but the
+      // pendingLogsResolver had been reassigned to a wrapper closure,
+      // so the timer body's guard always failed and the spinner spun
+      // forever when the agent didn't respond (old agent unaware of
+      // `rc:logs-fetch`, or DC half-open after a peer drop).
+      let isActive = true
       const timer = setTimeout(() => {
-        if (pendingLogsResolver === resolve) {
-          pendingLogsResolver = null
-          agentLogsLoading.value = false
-          reject(new Error('rc:logs-fetch timed out (agent too old?)'))
-        }
+        if (!isActive) return
+        isActive = false
+        pendingLogsResolver = null
+        agentLogsLoading.value = false
+        reject(new Error('rc:logs-fetch timed out (agent too old?)'))
       }, 8000)
-      // Wrap the resolver so the timer is cleared on success too.
-      const wrappedResolver = pendingLogsResolver
       pendingLogsResolver = (reply) => {
+        if (!isActive) return
+        isActive = false
         clearTimeout(timer)
-        wrappedResolver(reply)
+        pendingLogsResolver = null
+        agentLogsLoading.value = false
+        resolve(reply)
       }
       try {
         ch.send(JSON.stringify({ t: 'rc:logs-fetch', lines }))
       } catch (e) {
+        if (!isActive) return
+        isActive = false
         clearTimeout(timer)
         pendingLogsResolver = null
         agentLogsLoading.value = false
