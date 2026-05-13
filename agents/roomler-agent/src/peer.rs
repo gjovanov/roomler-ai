@@ -1667,7 +1667,18 @@ fn attach_input_handler(
                 let n = suppressed_count
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                     .wrapping_add(1);
-                if n.is_multiple_of(60) {
+                // rc.25 — promote the FIRST suppressed event of a
+                // run to INFO so the field gets a clear signal in
+                // the default log level, then drop back to DEBUG
+                // every 60th. Pre-rc.25 this was DEBUG-only, which
+                // was invisible at the default INFO level and made
+                // "input suppressed when admin pwsh hovered"
+                // reports hard to confirm from the log.
+                if n == 1 {
+                    info!(
+                        "input: lock_state=Locked — suppressing input (first event); see `lock_state: transition observed` for the observed desktop name"
+                    );
+                } else if n.is_multiple_of(60) {
                     debug!(
                         suppressed_total = n,
                         "input: host locked — suppressing input events"
