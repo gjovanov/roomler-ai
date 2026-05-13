@@ -45,6 +45,44 @@ use crate::lock_overlay;
 use crate::lock_state;
 use crate::logs_fetch;
 
+/// rc.26 — true when the current process is running as the SystemContext
+/// worker (LocalSystem in the user's interactive session). Captured
+/// once per session; the answer doesn't change at runtime (process
+/// identity is fixed at spawn time). Used to gate two lock-screen
+/// policies that are correct for user-context but wrong for
+/// SystemContext:
+///
+///  - **Capture overlay substitution** (`media_pump` / `media_pump_vp9_444_dc`):
+///    user-context can't see Winlogon → we substitute a "Host is
+///    locked" overlay frame so the operator sees something instead of
+///    a frozen black image. SystemContext capture rebinds to
+///    `winsta0\Winlogon` and produces real lock-screen pixels —
+///    substituting an overlay over those wastes the work and prevents
+///    the operator from seeing the password prompt.
+///
+///  - **Input suppression** (`attach_input_handler`): user-context
+///    `SendInput` can't drive Winlogon (no SE_TCB privilege).
+///    SystemContext (LocalSystem) holds SE_TCB and can. Suppressing
+///    input under SystemContext blocks remote unlock for no security
+///    reason — the operator already has agent access.
+///
+/// Compiled out on non-Windows; the gates collapse to "always false"
+/// (matches the rc.25 behaviour on Linux/macOS, where there is no
+/// lock-screen capture-rebind story).
+#[cfg(all(feature = "system-context", target_os = "windows"))]
+fn is_system_context_worker() -> bool {
+    use crate::system_context::worker_role;
+    matches!(
+        worker_role::probe_self(),
+        Ok(worker_role::WorkerRole::SystemContext)
+    )
+}
+
+#[cfg(not(all(feature = "system-context", target_os = "windows")))]
+fn is_system_context_worker() -> bool {
+    false
+}
+
 /// Target capture rate on the **software** path. openh264 pegs a CPU core
 /// above ~35 fps at 1080p; 30 is the stable ceiling. See `target_fps_for`
 /// for the hardware path which lifts to 60.
@@ -804,6 +842,18 @@ async fn media_pump(
     // desktop on unlock), which on a live session can be 1-2 seconds
     // of stale-then-suddenly-correct frames.
     let mut was_locked_last_iter = matches!(*lock_state_rx.borrow(), lock_state::LockState::Locked);
+    // rc.26 — probe SystemContext once at pump start. Captured into a
+    // local bool so the per-frame check is a single comparison.
+    // SystemContext capture rebinds to winsta0\Winlogon on lock; the
+    // operator should see real lock-screen pixels (and be able to
+    // type the password), NOT the "Host is locked" overlay placeholder.
+    let sys_ctx_worker = is_system_context_worker();
+    if sys_ctx_worker {
+        info!(
+            %session_id,
+            "media_pump: SystemContext worker — lock overlay disabled (real Winlogon frames will stream)"
+        );
+    }
     // Y.3 fork: route to the DC pump when the session negotiated VP9
     // 4:4:4 over the `video-bytes` channel. Falls through to the
     // legacy track-based pump otherwise — including when the feature
@@ -1026,12 +1076,22 @@ async fn media_pump(
         // Force a keyframe on the transition into Locked so the
         // browser decoder doesn't need to wait for the next intra-
         // refresh to render the overlay.
+        //
+        // rc.26 — `sys_ctx_worker` short-circuits the overlay: under
+        // SystemContext the capture has already rebound to Winlogon
+        // and the real lock-screen pixels are in `frame`. Still pulse
+        // a keyframe on each transition so the new captured surface
+        // snaps into view.
         let frame = if *lock_state_rx.borrow() == lock_state::LockState::Locked {
             if !was_locked_last_iter {
                 keyframe_requested.store(true, std::sync::atomic::Ordering::Relaxed);
                 was_locked_last_iter = true;
             }
-            lock_overlay::produce(frame.width, frame.height, frame.monotonic_us, frame.monitor)
+            if sys_ctx_worker {
+                frame
+            } else {
+                lock_overlay::produce(frame.width, frame.height, frame.monotonic_us, frame.monitor)
+            }
         } else {
             if was_locked_last_iter {
                 // Force a keyframe on the unlock transition too so
@@ -1413,6 +1473,17 @@ async fn media_pump_vp9_444_dc(
     // See `media_pump`: tracks lock-state transitions so we can
     // request a keyframe on the lock/unlock boundary.
     let mut was_locked_last_iter = matches!(*lock_state_rx.borrow(), lock_state::LockState::Locked);
+    // rc.26 — same gate as the legacy pump. Under SystemContext the
+    // captured frame IS the real Winlogon screen; substituting an
+    // overlay over it would hide the password prompt and block remote
+    // unlock.
+    let sys_ctx_worker = is_system_context_worker();
+    if sys_ctx_worker {
+        info!(
+            %session_id,
+            "media_pump_vp9_444_dc: SystemContext worker — lock overlay disabled"
+        );
+    }
     use crate::encode::VideoEncoder; // brings encode/request_keyframe into scope
     use crate::encode::libvpx::Vp9Encoder;
 
@@ -1489,12 +1560,17 @@ async fn media_pump_vp9_444_dc(
         // the legacy track pump — when the user-context worker
         // can't see the real desktop (input desktop on Winlogon),
         // substitute a static "Host is locked" overlay frame.
+        // rc.26 — short-circuit when sys_ctx_worker; see media_pump.
         let frame = if *lock_state_rx.borrow() == lock_state::LockState::Locked {
             if !was_locked_last_iter {
                 keyframe_requested.store(true, std::sync::atomic::Ordering::Relaxed);
                 was_locked_last_iter = true;
             }
-            lock_overlay::produce(frame.width, frame.height, frame.monotonic_us, frame.monitor)
+            if sys_ctx_worker {
+                frame
+            } else {
+                lock_overlay::produce(frame.width, frame.height, frame.monotonic_us, frame.monitor)
+            }
         } else {
             if was_locked_last_iter {
                 keyframe_requested.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1642,6 +1718,17 @@ fn attach_input_handler(
     // 60th drop so the field gets a steady "yes, the suppression is
     // working" signal without filling the log file.
     let suppressed_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // rc.26 — gate the Locked-state suppression on worker role.
+    // SystemContext (LocalSystem) can drive Winlogon via `SendInput`
+    // because it holds SE_TCB; suppressing input in that case blocks
+    // remote unlock for no benefit. User-context still suppresses
+    // (its SendInput cannot reach Winlogon and would silently fail).
+    let sys_ctx_worker = is_system_context_worker();
+    if sys_ctx_worker {
+        info!(
+            "input: SystemContext worker — Locked-state suppression disabled (remote unlock enabled)"
+        );
+    }
     dc.on_message(Box::new(move |msg| {
         let injector = injector.clone();
         let lock_state_rx = lock_state_rx.clone();
@@ -1663,7 +1750,18 @@ fn attach_input_handler(
             // alive across short lock screens; the operator just
             // can't drive the lock UI itself (that's the A1-path
             // future work).
-            if matches!(*lock_state_rx.borrow(), lock_state::LockState::Locked) {
+            //
+            // rc.26 — A1-path: under SystemContext, allow input
+            // through. The injector thread runs as LocalSystem with
+            // SE_TCB privilege, so SendInput CAN reach Winlogon's
+            // input desktop. This is the "drive lock screen
+            // remotely" path documented in
+            // `docs/remote-control-m3-elevated-switching.md`
+            // Change C ("refine the suppression policy under
+            // SystemContext").
+            if !sys_ctx_worker
+                && matches!(*lock_state_rx.borrow(), lock_state::LockState::Locked)
+            {
                 let n = suppressed_count
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                     .wrapping_add(1);
