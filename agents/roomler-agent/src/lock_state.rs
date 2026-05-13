@@ -110,29 +110,83 @@ mod win {
     /// `Locked` when `OpenInputDesktop` denies access (the input
     /// desktop has transitioned to `winsta0\Winlogon`) OR when the
     /// returned desktop name isn't `"Default"`.
-    pub fn probe_lock_state() -> LockState {
+    ///
+    /// **rc.24 M3 Change A** — reads the desktop name FROM THE
+    /// INPUT-DESKTOP HANDLE we just opened (`d.raw()`), not from
+    /// `current_thread_desktop_name()`. The prior implementation
+    /// answered "what desktop is this tokio worker thread bound
+    /// to?" — which depends on whichever tokio worker the
+    /// `spawn_monitor` task happened to land on, NOT on the
+    /// actual input-desktop state. Under the SystemContext worker,
+    /// tokio threads have heterogeneous desktop bindings (the
+    /// SystemContext input thread explicitly sets its own to
+    /// `Default`; other tokio workers inherit whatever the process
+    /// started with, which may not be `Default` after a session
+    /// hand-off). A probe landing on the wrong thread → reads
+    /// non-"Default" → classifies as `Locked` → input gets
+    /// suppressed by `attach_input_handler` even though the real
+    /// input desktop IS `Default` and the operator's clicks
+    /// should go through to admin pwsh / elevated apps.
+    ///
+    /// Field repro on PC50045 between rc.7 (verified working) and
+    /// rc.21: mouse stopped responding when the operator hovered
+    /// an elevated pwsh window. See
+    /// `docs/remote-control-m3-elevated-switching.md` for the
+    /// bisect plan + alternatives (Change B = bind every tokio
+    /// worker; Change C = refine suppression policy under
+    /// SystemContext) if this fix alone proves insufficient.
+    ///
+    /// rc.25 — returns `(state, observed_name)` so the spawn_monitor
+    /// transition log can include the actual desktop name the OS
+    /// reported. Diagnostic value: when the field reports "admin
+    /// pwsh input doesn't work", the log shows whether the probe
+    /// is seeing "Default" (Change A is fine, look elsewhere) or
+    /// some other name (the probe IS the bug; identify why the
+    /// input desktop transitioned).
+    pub fn probe_lock_state_detailed() -> (LockState, String) {
         match desktop::open_input_desktop() {
-            Ok(Some(_d)) => {
-                // We have access. Read the *current thread's*
-                // desktop name (not the input desktop's) — the
-                // worker thread is attached to Default and that's
-                // what matters for capture/input. Realistically
-                // the input desktop and our thread's desktop are
-                // the same when access succeeds; the
-                // current_thread_desktop_name read just re-confirms.
-                match desktop::current_thread_desktop_name() {
-                    Ok(name) => classify(true, &name),
-                    Err(_) => classify(true, "Default"), // optimistic
+            Ok(Some(d)) => {
+                // Read the desktop NAME from the handle we have,
+                // not from the calling thread. `desktop_name_of`
+                // calls `GetUserObjectInformationW(h, UOI_NAME,...)`
+                // which queries the OS for the actual desktop
+                // identity behind the handle. (RustDesk's
+                // `inputDesktopSelected` uses the same pattern —
+                // see docs/remote-control-m3-elevated-switching.md.)
+                match desktop::desktop_name_of(d.raw()) {
+                    Ok(name) => {
+                        let state = classify(true, &name);
+                        (state, name)
+                    }
+                    // Fallback: if reading the name from the
+                    // handle fails (very rare — typically a
+                    // permission glitch on a custom Citrix
+                    // desktop), assume Default and let input
+                    // through. False-unlocked is the safer side:
+                    // input goes through to whatever desktop IS
+                    // active. A truly-locked input desktop would
+                    // have failed `open_input_desktop` first.
+                    Err(e) => {
+                        tracing::trace!(error = %e, "lock_state: desktop_name_of failed; defaulting to Unlocked");
+                        (classify(true, "Default"), "Default".to_string())
+                    }
                 }
             }
-            Ok(None) => classify(false, ""),
+            Ok(None) => (classify(false, ""), "<access-denied>".to_string()),
             Err(e) => {
                 // Unexpected — log once at trace level so the field
                 // can spot it, but treat as Locked to be safe.
                 tracing::trace!(error = %e, "lock_state: OpenInputDesktop probe failed unexpectedly");
-                classify(false, "")
+                (classify(false, ""), "<probe-error>".to_string())
             }
         }
+    }
+
+    /// Back-compat wrapper for callers that only need the state.
+    /// Discards the observed name. New diagnostic-aware code paths
+    /// should use [`probe_lock_state_detailed`] directly.
+    pub fn probe_lock_state() -> LockState {
+        probe_lock_state_detailed().0
     }
 }
 
@@ -144,12 +198,15 @@ mod nowin {
     pub fn probe_lock_state() -> LockState {
         LockState::Unlocked
     }
+    pub fn probe_lock_state_detailed() -> (LockState, String) {
+        (LockState::Unlocked, "Default".to_string())
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
-pub use nowin::probe_lock_state;
+pub use nowin::{probe_lock_state, probe_lock_state_detailed};
 #[cfg(target_os = "windows")]
-pub use win::probe_lock_state;
+pub use win::{probe_lock_state, probe_lock_state_detailed};
 
 /// Spawn a tokio task that polls `probe_lock_state` every
 /// `POLL_INTERVAL` and emits transitions on the returned
@@ -165,7 +222,12 @@ pub fn spawn_monitor() -> (
     tokio::sync::watch::Receiver<LockState>,
     tokio::task::JoinHandle<()>,
 ) {
-    let initial = probe_lock_state();
+    let (initial, initial_name) = probe_lock_state_detailed();
+    tracing::info!(
+        state = ?initial,
+        desktop = %initial_name,
+        "lock_state: monitor starting"
+    );
     let (tx, rx) = tokio::sync::watch::channel(initial);
     let handle = tokio::spawn(async move {
         let mut last = initial;
@@ -182,11 +244,18 @@ pub fn spawn_monitor() -> (
             if tx.is_closed() {
                 return;
             }
-            let current = probe_lock_state();
+            // rc.25 — use the detailed probe so the transition log
+            // can carry the observed desktop name. Helps field
+            // diagnose "input dropped while admin pwsh focused"
+            // bugs by showing whether the probe saw "Default" (so
+            // the bug is downstream) or "Winlogon"/other (so the
+            // probe IS the bug).
+            let (current, observed_name) = probe_lock_state_detailed();
             if current != last {
                 tracing::info!(
                     from = ?last,
                     to = ?current,
+                    desktop = %observed_name,
                     "lock_state: transition observed"
                 );
                 // We just confirmed the channel is open one tick
