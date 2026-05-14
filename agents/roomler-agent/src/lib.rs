@@ -16,6 +16,8 @@ pub mod files;
 pub mod indicator;
 pub mod input;
 pub mod install_cleanup;
+pub mod install_detect;
+pub mod jwt_introspect;
 pub mod instance_lock;
 pub mod lock_overlay;
 pub mod lock_state;
