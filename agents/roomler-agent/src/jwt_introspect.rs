@@ -123,9 +123,10 @@ mod tests {
 
     fn forge_token(claims: serde_json::Value) -> String {
         // Header + signature are throwaway — parse_unverified ignores them.
-        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","typ":"JWT"}"#);
-        let payload =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"alg":"HS256","typ":"JWT"}"#);
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&claims).unwrap());
         let signature = "fakesig";
         format!("{header}.{payload}.{signature}")
     }
