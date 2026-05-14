@@ -31,6 +31,7 @@
 #[cfg(feature = "wgc-capture")]
 pub mod capture_smoke;
 pub mod desktop;
+pub mod environment;
 pub mod supervisor;
 pub mod system_context_probe;
 
