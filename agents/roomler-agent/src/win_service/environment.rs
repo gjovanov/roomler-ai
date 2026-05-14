@@ -39,8 +39,8 @@ use windows_service::service::{ServiceAccess, ServiceState};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
 use windows_sys::Win32::System::Registry::{
-    RegCloseKey, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY, HKEY_LOCAL_MACHINE,
-    KEY_QUERY_VALUE, KEY_SET_VALUE, REG_MULTI_SZ,
+    HKEY, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_MULTI_SZ, RegCloseKey,
+    RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
 };
 
 use super::SERVICE_NAME;
@@ -292,13 +292,11 @@ pub fn restart_service(timeout: Duration) -> Result<()> {
         || status.current_state == ServiceState::StartPending
     {
         let _ = service.stop().context("service.stop()")?;
-        wait_for_state(&service, ServiceState::Stopped, timeout)
-            .context("waiting for STOPPED")?;
+        wait_for_state(&service, ServiceState::Stopped, timeout).context("waiting for STOPPED")?;
     }
 
     service.start::<&str>(&[]).context("service.start()")?;
-    wait_for_state(&service, ServiceState::Running, timeout)
-        .context("waiting for RUNNING")?;
+    wait_for_state(&service, ServiceState::Running, timeout).context("waiting for RUNNING")?;
     Ok(())
 }
 
