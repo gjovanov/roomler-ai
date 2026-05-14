@@ -218,10 +218,7 @@ pub async fn installer_health(
     let normalised = normalise_flavour(&flavour)?;
     let releases = ensure_releases_cached(&state).await?;
     let release = pick_release(&releases, &params.version).ok_or_else(|| {
-        ApiError::NotFound(format!(
-            "no release matching version={}",
-            params.version
-        ))
+        ApiError::NotFound(format!("no release matching version={}", params.version))
     })?;
     let asset = pick_installer_asset(&release.assets, normalised).ok_or_else(|| {
         ApiError::NotFound(format!(
@@ -251,10 +248,7 @@ pub async fn installer_proxy(
     let normalised = normalise_flavour(&flavour)?;
     let releases = ensure_releases_cached(&state).await?;
     let release = pick_release(&releases, &params.version).ok_or_else(|| {
-        ApiError::NotFound(format!(
-            "no release matching version={}",
-            params.version
-        ))
+        ApiError::NotFound(format!("no release matching version={}", params.version))
     })?;
     let asset = pick_installer_asset(&release.assets, normalised).ok_or_else(|| {
         ApiError::NotFound(format!(
@@ -322,10 +316,7 @@ fn normalise_flavour(s: &str) -> Result<&'static str, ApiError> {
     }
 }
 
-fn pick_release<'a>(
-    releases: &'a [AgentRelease],
-    version: &str,
-) -> Option<&'a AgentRelease> {
+fn pick_release<'a>(releases: &'a [AgentRelease], version: &str) -> Option<&'a AgentRelease> {
     if version == "latest" {
         releases
             .iter()
@@ -335,9 +326,7 @@ fn pick_release<'a>(
         let target_with_prefix = format!("agent-v{}", version.trim_start_matches("agent-v"));
         let target_bare = version.trim_start_matches("agent-v");
         releases.iter().find(|r| {
-            r.tag_name == target_with_prefix
-                || r.tag_name == target_bare
-                || r.tag_name == version
+            r.tag_name == target_with_prefix || r.tag_name == target_bare || r.tag_name == version
         })
     }
 }
@@ -468,7 +457,9 @@ mod tests {
 
     #[test]
     fn pick_installer_asset_returns_none_when_no_match() {
-        let assets = [asset("roomler-agent-0.3.0-perMachine-x86_64-pc-windows-msvc.msi")];
+        let assets = [asset(
+            "roomler-agent-0.3.0-perMachine-x86_64-pc-windows-msvc.msi",
+        )];
         assert!(pick_installer_asset(&assets, "peruser").is_none());
     }
 

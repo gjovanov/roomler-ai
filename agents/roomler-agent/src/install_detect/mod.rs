@@ -21,7 +21,7 @@ use std::path::PathBuf;
 pub mod msi_guid;
 pub mod upgrade_codes;
 
-pub use msi_guid::{pack_msi_guid, unpack_msi_guid, MsiGuidError};
+pub use msi_guid::{MsiGuidError, pack_msi_guid, unpack_msi_guid};
 pub use upgrade_codes::{PERMACHINE_UPGRADE_CODE, PERUSER_UPGRADE_CODE};
 
 /// Best-effort metadata about a detected install. Fields are
@@ -99,14 +99,14 @@ pub fn detect_existing_install() -> ExistingInstall {
 mod windows {
     use super::{InstallInfo, InstallProbe};
     use crate::install_detect::{
-        pack_msi_guid, unpack_msi_guid, PERMACHINE_UPGRADE_CODE, PERUSER_UPGRADE_CODE,
+        PERMACHINE_UPGRADE_CODE, PERUSER_UPGRADE_CODE, pack_msi_guid, unpack_msi_guid,
     };
     use std::path::PathBuf;
     use std::ptr;
     use windows_sys::Win32::Foundation::ERROR_SUCCESS;
     use windows_sys::Win32::System::Registry::{
-        RegCloseKey, RegEnumValueW, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER,
-        HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY, REG_EXPAND_SZ, REG_SZ,
+        HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY, REG_EXPAND_SZ,
+        REG_SZ, RegCloseKey, RegEnumValueW, RegOpenKeyExW, RegQueryValueExW,
     };
 
     /// Convert a Rust `&str` into a NUL-terminated UTF-16 buffer
@@ -250,7 +250,8 @@ mod windows {
 
         Some(InstallInfo {
             version: read_string_value(&uninstall_key, "DisplayVersion"),
-            install_location: read_string_value(&uninstall_key, "InstallLocation").map(PathBuf::from),
+            install_location: read_string_value(&uninstall_key, "InstallLocation")
+                .map(PathBuf::from),
         })
     }
 
@@ -266,16 +267,21 @@ mod windows {
                 r"Software\Microsoft\Windows\CurrentVersion\Uninstall",
             )
         });
-        let permachine = pack_msi_guid(PERMACHINE_UPGRADE_CODE).ok().and_then(|packed| {
-            probe_one(
-                HKEY_LOCAL_MACHINE,
-                r"SOFTWARE\Classes\Installer\UpgradeCodes",
-                &packed,
-                r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
-            )
-        });
+        let permachine = pack_msi_guid(PERMACHINE_UPGRADE_CODE)
+            .ok()
+            .and_then(|packed| {
+                probe_one(
+                    HKEY_LOCAL_MACHINE,
+                    r"SOFTWARE\Classes\Installer\UpgradeCodes",
+                    &packed,
+                    r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+                )
+            });
 
-        InstallProbe { peruser, permachine }
+        InstallProbe {
+            peruser,
+            permachine,
+        }
     }
 }
 
