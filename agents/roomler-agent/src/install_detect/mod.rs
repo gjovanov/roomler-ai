@@ -59,8 +59,11 @@ pub enum ExistingInstall {
 
 /// Internal probe result: what each hive yielded independently.
 /// Public-in-crate so the pure [`decide_from_probe`] is unit-testable
-/// on any platform by constructing this directly.
+/// on any platform by constructing this directly. Marked
+/// `allow(dead_code)` on non-Windows because the IO path is gated to
+/// Windows; tests still exercise it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub(crate) struct InstallProbe {
     pub peruser: Option<InstallInfo>,
     pub permachine: Option<InstallInfo>,
@@ -68,6 +71,7 @@ pub(crate) struct InstallProbe {
 
 /// Combine the two hive-probe results into the public-facing enum.
 /// Pure function, no IO, runs on any platform.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub(crate) fn decide_from_probe(probe: InstallProbe) -> ExistingInstall {
     match (probe.peruser, probe.permachine) {
         (None, None) => ExistingInstall::Clean,
