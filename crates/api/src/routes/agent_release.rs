@@ -30,7 +30,7 @@ use axum::{
     body::Body,
     extract::{Path, Query, State},
     http::{HeaderValue, StatusCode},
-    response::{IntoResponse, Response},
+    response::Response,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
