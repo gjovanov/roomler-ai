@@ -304,7 +304,7 @@ pub fn current_install_flavour() -> WindowsInstallFlavour {
 /// drive it without a real filesystem. Lowercases for case-insensitive
 /// match against the Windows convention `C:\Program Files\…`.
 #[cfg(target_os = "windows")]
-pub(crate) fn classify_install_flavour_from_path(p: &std::path::Path) -> WindowsInstallFlavour {
+pub fn classify_install_flavour_from_path(p: &std::path::Path) -> WindowsInstallFlavour {
     let lower = p.to_string_lossy().to_lowercase();
     // Match both `\program files\` and `\program files (x86)\`. Use
     // path-separator-bracketed substring so a project literally named
@@ -344,7 +344,7 @@ pub fn pick_asset_for_platform(assets: &[GithubAsset]) -> Option<&GithubAsset> {
 /// update entirely on a release that, for whatever reason, only shipped
 /// one flavour.
 #[cfg(any(target_os = "windows", test))]
-pub(crate) fn pick_asset_for_windows(
+pub fn pick_asset_for_windows(
     assets: &[GithubAsset],
     flavour: WindowsInstallFlavour,
 ) -> Option<&GithubAsset> {
@@ -383,7 +383,7 @@ pub(crate) fn pick_asset_for_windows(
 /// path on Windows).
 #[cfg(any(not(target_os = "windows"), test))]
 #[cfg_attr(target_os = "windows", allow(dead_code))]
-pub(crate) fn pick_asset_for_unix(assets: &[GithubAsset]) -> Option<&GithubAsset> {
+pub fn pick_asset_for_unix(assets: &[GithubAsset]) -> Option<&GithubAsset> {
     let arch_linux = cfg!(all(target_os = "linux", target_arch = "x86_64"));
     let arch_mac = cfg!(target_os = "macos");
     for a in assets {
@@ -772,7 +772,7 @@ pub fn msiexec_argv(installer: &std::path::Path, flavour: WindowsInstallFlavour)
     ]
 }
 
-fn spawn_installer_inner(installer_path: &std::path::Path) -> Result<u32> {
+pub fn spawn_installer_inner(installer_path: &std::path::Path) -> Result<u32> {
     #[cfg(target_os = "windows")]
     {
         let flavour = current_install_flavour();
@@ -848,7 +848,7 @@ fn spawn_installer_inner(installer_path: &std::path::Path) -> Result<u32> {
 /// operator (CLI: stderr message; service mode: log + retry next
 /// cycle).
 #[cfg(target_os = "windows")]
-fn spawn_msiexec_elevated(argv: &[String]) -> Result<u32> {
+pub fn spawn_msiexec_elevated(argv: &[String]) -> Result<u32> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
     use windows_sys::Win32::System::Threading::GetProcessId;
