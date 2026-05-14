@@ -68,7 +68,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # HTTP client
-reqwest = { version = "0.12", features = ["json", "multipart", "cookies"] }
+reqwest = { version = "0.12", features = ["json", "multipart", "cookies", "stream"] }
 
 # SMTP client (used by the EmailService SMTP backend; SendGrid HTTP
 # remains the prod default). `default-features = false` avoids pulling
