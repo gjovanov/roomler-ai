@@ -39,7 +39,10 @@ impl fmt::Display for MsiGuidError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             MsiGuidError::BadLength(n) => {
-                write!(f, "expected 32 hex digits after stripping braces and hyphens, got {n}")
+                write!(
+                    f,
+                    "expected 32 hex digits after stripping braces and hyphens, got {n}"
+                )
             }
             MsiGuidError::NonHex(i, c) => {
                 write!(f, "non-hex character at index {i}: {c:?}")
@@ -292,8 +295,12 @@ mod tests {
         for input in inputs {
             let packed = pack_msi_guid(input).unwrap();
             assert_eq!(packed.len(), 32, "input {input}");
-            assert!(packed.chars().all(|c| c.is_ascii_hexdigit() && c.is_uppercase() || c.is_ascii_digit()),
-                "input {input} produced {packed}");
+            assert!(
+                packed
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() && c.is_uppercase() || c.is_ascii_digit()),
+                "input {input} produced {packed}"
+            );
         }
     }
 }
