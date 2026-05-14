@@ -262,6 +262,14 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/latest-release",
             get(routes::agent_release::latest_release),
+        )
+        .route(
+            "/installer/{flavour}/health",
+            get(routes::agent_release::installer_health),
+        )
+        .route(
+            "/installer/{flavour}",
+            get(routes::agent_release::installer_proxy),
         );
 
     // TURN credentials (user-scoped, no tenant prefix)
