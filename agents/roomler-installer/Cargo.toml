@@ -1,0 +1,84 @@
+[package]
+name = "roomler-installer"
+version.workspace = true
+edition.workspace = true
+description = "Install + onboarding wizard for roomler-agent on Windows."
+
+[[bin]]
+name = "roomler-installer"
+path = "src/main.rs"
+
+[dependencies]
+# Lib dep on the agent — wizard reuses `config::{load, save}`,
+# `enrollment::enroll`, `machine::derive_machine_id`,
+# `install_detect::detect_existing_install`, `jwt_introspect::
+# parse_unverified`, and (Windows-only) `win_service::environment::{
+# set_service_env_var, restart_service}` directly as lib calls.
+#
+# Adding this crate as a workspace member transitively pulls in the
+# agent's heavy deps (webrtc-rs etc.) which is wasteful for a small
+# installer — but matches the tray's pattern, and the alternative
+# (extracting the helpers to a separate `roomler-agent-lib` crate) is
+# scope-creep for rc.28. Revisit in v2 if the installer EXE size is
+# a problem.
+roomler-agent = { path = "../roomler-agent" }
+
+# Tauri 2.x runtime. NO `tray-icon` feature — the wizard is a
+# foreground window, exits on Finish/Cancel. `custom-protocol` is
+# REQUIRED for `cargo build --release` to embed the front-end assets
+# rather than loading from `devUrl` (same lesson as the rc.20 tray
+# hotfix; see `agents/roomler-agent-tray/Cargo.toml` for the full
+# rationale).
+tauri = { version = "2", features = ["custom-protocol"] }
+tauri-plugin-shell = "2"
+tauri-plugin-single-instance = "2"
+tauri-plugin-dialog = "2"
+
+# Async + error handling — shared workspace versions.
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# HTTP client for downloading the MSI through the
+# roomler.ai/api/agent/installer/{flavour} proxy (rc.27 P4). `stream`
+# is enabled at the workspace level for the API crate; same dep here
+# carries the feature into the wizard's `asset_resolver`.
+reqwest = { workspace = true }
+
+# SHA256 verification of the downloaded MSI bytes against the
+# `digest` field returned by `/installer/{flavour}/health`.
+sha2 = "0.10"
+
+# Hex encoding/decoding for the `sha256:<hex>` digest form GitHub
+# advertises and the installer-proxy passes through.
+hex = "0.4"
+
+# Hostname for the default device-name field on the Server step.
+gethostname = "0.5"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# `OpenProcess` + `WaitForSingleObject` + `GetExitCodeProcess` +
+# `TerminateProcess` for the `msi_runner` module's synchronous wait
+# on msiexec (B3 fix from the rc.27/rc.28 plan critique). Reuses the
+# same windows-sys version + feature flags as the agent crate.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+] }
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+# cargo-wix metadata — reserved for v2; rc.28 ships the wizard as a
+# plain `.exe` artifact alongside the agent MSIs. Operators download
+# the EXE, run it once, the EXE handles MSI install + service
+# registration internally. Wizard MSI bundling is future work.
+[package.metadata.wix]
+upgrade-guid = "4A5B6C7D-8E9F-1234-5678-9ABCDEF01234"
+path-guid = "5B6C7D8E-9F12-3456-789A-BCDEF0123456"
+license = false
+eula = false
