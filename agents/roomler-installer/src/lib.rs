@@ -10,6 +10,7 @@
 
 pub mod commands;
 pub mod msi_runner;
+pub mod progress;
 
 use std::sync::atomic::AtomicBool;
 

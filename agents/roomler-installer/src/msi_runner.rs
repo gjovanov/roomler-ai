@@ -282,7 +282,7 @@ mod tests {
         use std::process::Command;
         use std::time::Duration;
 
-        let child = Command::new("cmd")
+        let mut child = Command::new("cmd")
             .args(["/c", "exit 1602"])
             .spawn()
             .expect("spawn cmd /c exit 1602");
@@ -293,5 +293,10 @@ mod tests {
             .await
             .expect("wait for exit");
         assert_eq!(outcome, MsiExitDecoded::UserCancel);
+        // Reap the Child handle so clippy's `zombie-processes` lint
+        // is satisfied. MsiRunner's `OpenProcess`-by-PID handle is
+        // independent of Child's handle, so this wait is a near
+        // no-op (the process has already exited).
+        let _ = child.wait();
     }
 }
