@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Roomler Agent Installer</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <main id="app">
+    <header class="title-bar">
+      <h1>Roomler Agent Installer</h1>
+      <p class="subtitle">5-step setup. No PowerShell required.</p>
+    </header>
+
+    <!-- Placeholder. W8 will replace this with the actual SPA: state
+         machine + 5 wizard steps (Welcome / Server / Token / Install /
+         Done) + recovery panel + ipc::Channel listener for live install
+         progress. For now, the wizard just calls cmd_detect_install
+         on load so we can validate the Tauri runtime + invoke surface
+         end-to-end before laying down the UI. -->
+    <section id="diagnostic" class="card">
+      <h2>Pre-install check</h2>
+      <p id="status">Probing…</p>
+      <p id="hostname"></p>
+      <p id="server"></p>
+    </section>
+
+    <footer class="actions">
+      <button id="continue" disabled>Continue →</button>
+    </footer>
+  </main>
+
+  <script>
+    const invoke = window.__TAURI__.core.invoke
+
+    async function probe() {
+      const status = document.getElementById('status')
+      const hostname = document.getElementById('hostname')
+      const server = document.getElementById('server')
+      try {
+        const [detected, hn, srv] = await Promise.all([
+          invoke('cmd_detect_install'),
+          invoke('cmd_default_device_name'),
+          invoke('cmd_default_server_url'),
+        ])
+        status.textContent = `Detected: ${detected.kind}` + (
+          detected.peruser_version ? ` (perUser ${detected.peruser_version})` : ''
+        ) + (
+          detected.permachine_version ? ` (perMachine ${detected.permachine_version})` : ''
+        )
+        hostname.textContent = `Device name: ${hn}`
+        server.textContent = `Server URL: ${srv}`
+        document.getElementById('continue').disabled = detected.ambiguous
+      } catch (err) {
+        status.textContent = `Probe failed: ${err}`
+      }
+    }
+
+    probe()
+  </script>
+</body>
+</html>
