@@ -40,22 +40,8 @@
     windows_subsystem = "windows"
 )]
 
-mod commands;
-
-use std::sync::atomic::AtomicBool;
 use tauri::{Emitter, Manager};
-
-/// `true` while a `cmd_install` future is in flight. Set by the
-/// command on entry; cleared on success / cancel / error. The
-/// single-instance callback consults this to decide whether to
-/// silently surface a "wizard busy" snackbar (in-progress) or focus
-/// the existing window (idle).
-///
-/// Static-with-atomic rather than `OnceLock<Arc<AtomicBool>>` because
-/// it's referenced from both the Tauri-runtime thread (callback) and
-/// the cmd_install async future (different tokio task) — atomic-only
-/// is the right primitive. No need for the extra Arc layer.
-pub(crate) static INSTALL_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+use wizard_core::{INSTALL_IN_PROGRESS, commands};
 
 fn main() {
     // Stderr-only tracing. The wizard is a foreground EXE the
