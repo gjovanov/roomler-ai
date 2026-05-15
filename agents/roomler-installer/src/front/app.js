@@ -450,13 +450,26 @@ async function runInstall() {
       deviceName: state.device,
       onEvent: channel,
     });
+    console.log("[runInstall] cmd_install returned:", report);
     state.installDone = report;
     state.installInFlight = false;
     // Token cleared from memory now that enrollment succeeded.
     state.token = "";
     document.getElementById("token-input").value = "";
-    await gotoStep("done");
+    // Two-step transition: paint Done step FIRST (so the operator
+    // sees the Finish button immediately), THEN persist state in
+    // the background. If persistState ever hangs or rejects, the
+    // user is already on the Done page and unblocked. Field repro
+    // 2026-05-15 (rc.28): operator hit blank Done page; an `await
+    // persistState()` inside gotoStep was a candidate for the
+    // freeze, so move the await off the rendering path.
+    state.step = "done";
+    render();
+    persistState().catch((err) =>
+      console.warn("[runInstall] persistState failed:", err),
+    );
   } catch (err) {
+    console.error("[runInstall] cmd_install threw:", err);
     state.installError = String(err);
     state.installInFlight = false;
     renderInstall();
@@ -552,15 +565,32 @@ function wireDone() {
 }
 
 function renderDone() {
-  if (!state.installDone) return;
-  document.getElementById("done-agent-id").textContent = state.installDone.agent_id;
-  document.getElementById("done-tenant-id").textContent = state.installDone.tenant_id;
-  document.getElementById("done-flavour").textContent = flavourLabel(state.installDone.flavour);
-  document.getElementById("done-tag").textContent = state.installDone.tag;
-  // SystemContext note: shown only when the operator picked that flavour.
-  // (v1: cmd_install returns plain perMachine; the operator chose SC.)
+  // Defensive: NEVER short-circuit when installDone is missing — the
+  // operator must always see the Finish button + a value (placeholder
+  // is fine) so the Done page can't render blank. Field repro 2026-05-15:
+  // rc.28 blank-page bug surfaced because cmd_install returned a value
+  // the SPA couldn't deserialise + renderDone bailed before populating
+  // anything, leaving the user stuck.
+  const done = state.installDone ?? {};
+  // Accept BOTH snake_case + camelCase return shapes — Tauri 2's
+  // serde-renaming behaviour has changed across point releases and we
+  // shouldn't crash if a future release flips the convention.
+  const agentId = done.agent_id ?? done.agentId ?? "(unknown — install report missing)";
+  const tenantId = done.tenant_id ?? done.tenantId ?? "(unknown)";
+  const tag = done.tag ?? "(unknown)";
+  const flavour = done.flavour ?? state.flavour ?? "(unknown)";
+
+  document.getElementById("done-agent-id").textContent = agentId;
+  document.getElementById("done-tenant-id").textContent = tenantId;
+  document.getElementById("done-flavour").textContent = flavourLabel(flavour);
+  document.getElementById("done-tag").textContent = tag;
   document.getElementById("done-systemcontext-note").hidden =
-    state.flavour !== "permachine-system-context";
+    flavour !== "permachine-system-context";
+
+  // Surface the underlying state for support — operator can copy
+  // from DevTools or paste a screenshot when something looks off.
+  console.log("[renderDone] state.installDone:", state.installDone);
+  console.log("[renderDone] state.flavour:", state.flavour);
 }
 
 // ─── Snackbar ──────────────────────────────────────────────────────────────
@@ -576,9 +606,24 @@ function showSnackbar(message, durationMs = 4000) {
   }, durationMs);
 }
 
+// ─── Global error surfacing ────────────────────────────────────────────────
+
+// Surface any unhandled JS exception or promise rejection in a sticky
+// snackbar so the operator can take a screenshot for support. Without
+// these handlers, a thrown exception mid-render leaves the wizard
+// frozen on the previous step with no visible error.
+window.addEventListener("error", (event) => {
+  console.error("[window.error]", event.message, event.error);
+  showSnackbar(`Wizard error: ${event.message}`, 30_000);
+});
+window.addEventListener("unhandledrejection", (event) => {
+  console.error("[unhandledrejection]", event.reason);
+  showSnackbar(`Wizard error: ${event.reason}`, 30_000);
+});
+
 // ─── Go ────────────────────────────────────────────────────────────────────
 
 init().catch((err) => {
   console.error("init failed:", err);
-  showSnackbar(`Init failed: ${err}`);
+  showSnackbar(`Init failed: ${err}`, 30_000);
 });
