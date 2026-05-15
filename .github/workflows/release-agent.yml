@@ -400,44 +400,6 @@ jobs:
         env:
           WIN_CODESIGN_PFX_BASE64: ${{ secrets.WIN_CODESIGN_PFX_BASE64 }}
 
-      - name: Authenticode sign
-        if: env.WIN_CODESIGN_PFX_BASE64 != ''
-        shell: pwsh
-        env:
-          WIN_CODESIGN_PFX_BASE64: ${{ secrets.WIN_CODESIGN_PFX_BASE64 }}
-          WIN_CODESIGN_PASSWORD:   ${{ secrets.WIN_CODESIGN_PASSWORD }}
-        run: |
-          $pfxPath = Join-Path $env:RUNNER_TEMP "codesign.pfx"
-          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WIN_CODESIGN_PFX_BASE64))
-
-          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" |
-                      Sort-Object FullName -Descending | Select-Object -First 1
-          & $signtool.FullName sign `
-              /f $pfxPath `
-              /p $env:WIN_CODESIGN_PASSWORD `
-              /fd SHA256 `
-              /tr http://timestamp.digicert.com `
-              /td SHA256 `
-              "${{ steps.locate.outputs.artifact }}" `
-              "${{ steps.locate_pm.outputs.artifact }}"
-
-          Remove-Item $pfxPath -Force
-
-      - name: Warn on unsigned build
-        if: env.WIN_CODESIGN_PFX_BASE64 == ''
-        shell: bash
-        run: echo "::warning::WIN_CODESIGN_PFX_BASE64 not set — MSI is unsigned. SmartScreen will flag 'Unknown publisher'."
-        env:
-          WIN_CODESIGN_PFX_BASE64: ${{ secrets.WIN_CODESIGN_PFX_BASE64 }}
-
-      - name: SHA256 checksum (both MSIs)
-        shell: pwsh
-        run: |
-          foreach ($f in @("${{ steps.locate.outputs.artifact }}", "${{ steps.locate_pm.outputs.artifact }}")) {
-            $hash = (Get-FileHash -Algorithm SHA256 $f).Hash.ToLower()
-            "$hash  $f" | Out-File -Encoding ascii "$f.sha256"
-          }
-
       # rc.18: build the Tauri tray companion alongside the agent.
       # Tray's Cargo.toml uses `frontendDist: "../src/front"` pointing
       # at static HTML/CSS/JS — no front-end bundler step needed.
@@ -454,14 +416,93 @@ jobs:
         run: |
           $exe = "target/release/roomler-agent-tray.exe"
           if (-not (Test-Path $exe)) { throw "tray EXE not produced" }
-          $dst = "roomler-agent-tray-$env:VERSION-x86_64-pc-windows-msvc.exe"
+          $suffix = "-unsigned"
+          $signed = $env:WIN_CODESIGN_PFX_BASE64
+          if ($signed -and $signed.Length -gt 0) { $suffix = "" }
+          $dst = "roomler-agent-tray-$env:VERSION-x86_64-pc-windows-msvc$suffix.exe"
           Copy-Item $exe $dst
-          # SHA256 alongside, same convention as the MSIs.
-          $hash = (Get-FileHash -Algorithm SHA256 $dst).Hash.ToLower()
-          "$hash  $dst" | Out-File -Encoding ascii "$dst.sha256"
           "artifact=$dst" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+        env:
+          WIN_CODESIGN_PFX_BASE64: ${{ secrets.WIN_CODESIGN_PFX_BASE64 }}
 
-      - name: Upload artifacts (per-User + per-Machine + tray)
+      # rc.28: build the installer wizard EXE. Like the tray, it ships
+      # as a plain Authenticode-signed `.exe` operators double-click;
+      # MSI bundling deferred. The lib target is named `wizard_core`
+      # (NOT `roomler_installer`) so cargo's test-binary names dodge
+      # Windows UAC's "installer detection" filename heuristic; the
+      # user-facing bin EXE keeps the marketing-friendly name.
+      - name: Build installer wizard EXE (release)
+        shell: pwsh
+        run: cargo build -p roomler-installer --release
+
+      - name: Locate + rename installer wizard EXE
+        id: locate_installer
+        shell: pwsh
+        run: |
+          $exe = "target/release/roomler-installer.exe"
+          if (-not (Test-Path $exe)) { throw "installer EXE not produced" }
+          $suffix = "-unsigned"
+          $signed = $env:WIN_CODESIGN_PFX_BASE64
+          if ($signed -and $signed.Length -gt 0) { $suffix = "" }
+          $dst = "roomler-installer-$env:VERSION-x86_64-pc-windows-msvc$suffix.exe"
+          Copy-Item $exe $dst
+          "artifact=$dst" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+        env:
+          WIN_CODESIGN_PFX_BASE64: ${{ secrets.WIN_CODESIGN_PFX_BASE64 }}
+
+      - name: Authenticode sign (MSIs + tray + installer wizard)
+        if: env.WIN_CODESIGN_PFX_BASE64 != ''
+        shell: pwsh
+        env:
+          WIN_CODESIGN_PFX_BASE64: ${{ secrets.WIN_CODESIGN_PFX_BASE64 }}
+          WIN_CODESIGN_PASSWORD:   ${{ secrets.WIN_CODESIGN_PASSWORD }}
+        run: |
+          $pfxPath = Join-Path $env:RUNNER_TEMP "codesign.pfx"
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WIN_CODESIGN_PFX_BASE64))
+
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" |
+                      Sort-Object FullName -Descending | Select-Object -First 1
+          # rc.28: BLOCKER-10 fix from the plan critique — the installer
+          # wizard EXE MUST be signed so corporate ESET / Defender don't
+          # quarantine it as a "downloader trojan" (the EXE downloads
+          # MSIs + invokes msiexec, which trips every AV heuristic
+          # without a code-signing cert). Tray EXE signing is the
+          # zero-cost bonus.
+          & $signtool.FullName sign `
+              /f $pfxPath `
+              /p $env:WIN_CODESIGN_PASSWORD `
+              /fd SHA256 `
+              /tr http://timestamp.digicert.com `
+              /td SHA256 `
+              "${{ steps.locate.outputs.artifact }}" `
+              "${{ steps.locate_pm.outputs.artifact }}" `
+              "${{ steps.locate_tray.outputs.artifact }}" `
+              "${{ steps.locate_installer.outputs.artifact }}"
+
+          Remove-Item $pfxPath -Force
+
+      - name: Warn on unsigned build
+        if: env.WIN_CODESIGN_PFX_BASE64 == ''
+        shell: bash
+        run: echo "::warning::WIN_CODESIGN_PFX_BASE64 not set — MSIs + tray + installer EXEs are unsigned. SmartScreen will flag 'Unknown publisher' and ESET may quarantine the installer."
+        env:
+          WIN_CODESIGN_PFX_BASE64: ${{ secrets.WIN_CODESIGN_PFX_BASE64 }}
+
+      - name: SHA256 checksum (all 4 artifacts)
+        shell: pwsh
+        run: |
+          $files = @(
+            "${{ steps.locate.outputs.artifact }}",
+            "${{ steps.locate_pm.outputs.artifact }}",
+            "${{ steps.locate_tray.outputs.artifact }}",
+            "${{ steps.locate_installer.outputs.artifact }}"
+          )
+          foreach ($f in $files) {
+            $hash = (Get-FileHash -Algorithm SHA256 $f).Hash.ToLower()
+            "$hash  $f" | Out-File -Encoding ascii "$f.sha256"
+          }
+
+      - name: Upload artifacts (per-User + per-Machine + tray + installer)
         uses: actions/upload-artifact@v4
         with:
           name: windows-msi
@@ -472,6 +513,8 @@ jobs:
             ${{ steps.locate_pm.outputs.artifact }}.sha256
             ${{ steps.locate_tray.outputs.artifact }}
             ${{ steps.locate_tray.outputs.artifact }}.sha256
+            ${{ steps.locate_installer.outputs.artifact }}
+            ${{ steps.locate_installer.outputs.artifact }}.sha256
           retention-days: 30
 
   # ---------------------------------------------------------------------------
