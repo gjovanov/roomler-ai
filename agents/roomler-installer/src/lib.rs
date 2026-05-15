@@ -8,6 +8,7 @@
 
 #![allow(clippy::doc_lazy_continuation, clippy::doc_overindented_list_items)]
 
+pub mod asset_resolver;
 pub mod commands;
 pub mod msi_runner;
 pub mod progress;
