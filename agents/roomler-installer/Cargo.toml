@@ -61,6 +61,12 @@ tracing-subscriber = { workspace = true }
 # carries the feature into the wizard's `asset_resolver`.
 reqwest = { workspace = true }
 
+# `futures::StreamExt::next` is needed for the reqwest bytes_stream
+# loop in `asset_resolver::download`. Workspace pulls the umbrella
+# `futures` crate; pulling it here keeps the dep tree shallow vs.
+# adding `futures-util` separately.
+futures = { workspace = true }
+
 # SHA256 verification of the downloaded MSI bytes against the
 # `digest` field returned by `/installer/{flavour}/health`.
 sha2 = "0.10"
