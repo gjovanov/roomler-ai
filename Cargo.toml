@@ -17,6 +17,9 @@ exclude = [
     # Vendored upstream (kept verbatim except the H265 payloader fix);
     # referenced via `[patch.crates-io]` below, not a workspace member.
     "crates/vendored/rtp",
+    # Vendored upstream (kept verbatim except agent_gather.rs); adds the
+    # TURNS-over-TCP relay code path that upstream marked NOT_PLANNED.
+    "crates/vendored/webrtc-ice",
 ]
 
 # Patch webrtc-rs's rtp-0.12.0 dependency with our local vendored copy
@@ -26,8 +29,18 @@ exclude = [
 # ...). Symptom in Chrome: framesAssembledFromMultiplePackets stays 0
 # and the decoder PLI-storms despite packets flowing. See
 # crates/vendored/rtp/src/codecs/h265/mod.rs for the patch notes.
+#
+# webrtc-ice-0.12.0: upstream `gather_candidates_relay` only implements
+# TURN-over-UDP — TURN/TCP, TURNS/TCP, TURNS/UDP (DTLS) all fall through
+# to a `log::warn!("Unable to handle URL")` and return without creating
+# a candidate. Upstream issue webrtc-rs/webrtc#690 closed NOT_PLANNED
+# 2026-01-31. Our vendored copy adds a TURNS-over-TLS-over-TCP branch
+# so the roomler-agent can establish relay candidates from corporate
+# networks that block UDP entirely. See agent_gather.rs and the new
+# tcp_turn_conn.rs module for the patch notes.
 [patch.crates-io]
 rtp = { path = "crates/vendored/rtp" }
+webrtc-ice = { path = "crates/vendored/webrtc-ice" }
 
 [workspace.package]
 version = "0.3.0-rc.30"
