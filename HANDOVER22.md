@@ -80,6 +80,26 @@ The wizard EXE has NEVER been launched end-to-end. CI tests the lib (42 unit tes
 
 Auto-fail conditions (per the plan): machine_id changes across S3a; token leaked to `wizard-state.json` (grep `cat wizard-state.json | grep "agent-token"` — should match nothing); wizard EXE > 30 MB (currently 14.4 MB — well within); etc.
 
+## ⚠️ BLOCKER for production-target smoke — rc.27 backend NOT deployed to prod
+
+Verified 2026-05-15 by `curl https://roomler.ai/api/agent/installer/peruser/health` → **HTTP 404**. Prod `roomler.ai/health` reports `0.3.0-rc.24`; rc.27 + rc.28 are in master but never tagged/deployed. **The wizard's `cmd_install` will fail in field smoke against the production backend until rc.27 ships to prod.**
+
+Two paths forward — pick one BEFORE running W10:
+
+**Option A — deploy rc.27 backend to prod first** (recommended for honest field smoke):
+1. SSH to mars (existing tmux pattern per `reference_deploy_workflow.md` + `reference_tmux_mars2.md`).
+2. Build + push `registry.roomler.ai/roomler-ai:<new-tag>`.
+3. Bump tag in `/home/gjovanov/roomler-ai-deploy/k8s/overlays/prod/kustomization.yaml`, git push.
+4. ArgoCD webhook auto-reconciles in ~5s.
+5. Verify `curl https://roomler.ai/api/agent/installer/peruser/health` returns valid JSON with `digest: "sha256:..."`.
+6. Then run W10 smoke against prod.
+
+**Option B — run W10 smoke against a staging/local backend first**:
+- Set `ROOMLER_INSTALLER_PROXY_BASE=https://staging.roomler.ai/api/agent/installer` (or your local `cargo run -p roomler-ai-api` instance at `http://localhost:3000/api/agent/installer`) before launching the wizard EXE.
+- This validates the wizard end-to-end without touching prod, but the released installer EXE will still need rc.27 deployed before it works in the field.
+
+Option A is the right ship order. Note that the rc.27 backend changes are backwards-compatible — the new `/installer/{flavour}` route doesn't disturb existing `/latest-release` consumers (the agent's auto-updater still works). So deploying rc.27 to prod is low-risk independent of the wizard cycle.
+
 ## Local release build confirmation
 
 Built locally on Win11 MSVC during the rc.28 W9 cycle: `target/release/roomler-installer.exe` produced, 14.4 MB. Compiles cleanly with the full Tauri 2 runtime + custom-protocol bundled assets. `cargo test -p roomler-installer --lib` → 42 / 42 green (7 msi_runner + 5 progress + 7 wizard_state + 11 asset_resolver + 12 install_orchestrator).
