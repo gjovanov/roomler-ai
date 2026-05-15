@@ -773,9 +773,47 @@ pub fn msiexec_argv(installer: &std::path::Path, flavour: WindowsInstallFlavour)
 }
 
 pub fn spawn_installer_inner(installer_path: &std::path::Path) -> Result<u32> {
+    // Auto-updater entry point: classify the RUNNING agent EXE's
+    // location to decide whether the in-place MSI swap needs UAC
+    // elevation. Correct for self-update because the running EXE
+    // IS the install whose flavour we're matching.
+    //
+    // **DO NOT** call this from the install wizard. The wizard's EXE
+    // runs from wherever the operator double-clicked (`%TEMP%`,
+    // Downloads, Desktop) so [`current_install_flavour`] returns
+    // `PerUser` regardless of the host install state OR the operator-
+    // selected flavour, and a perMachine MSI launched non-elevated
+    // exits with `1625 ERROR_INSTALL_PACKAGE_REJECTED`. Wizard callers
+    // must use [`spawn_installer_for_flavour`] with the SPA-selected
+    // [`WindowsInstallFlavour`]. Field repro 2026-05-15 on
+    // GORAN-XMG-NEO16; see BLOCKER B6 in the rc.27/rc.28 master plan.
     #[cfg(target_os = "windows")]
     {
-        let flavour = current_install_flavour();
+        spawn_installer_for_flavour(installer_path, current_install_flavour())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        spawn_installer_for_flavour_inner(installer_path)
+    }
+}
+
+/// Launch the platform installer for a downloaded artefact, using the
+/// CALLER-SUPPLIED flavour to choose the elevation path on Windows.
+/// Non-Windows ignores the flavour (Linux + macOS don't have perUser /
+/// perMachine MSI variants).
+///
+/// Use this entry point from the install wizard, which already knows
+/// the operator-selected flavour from the SPA's radio cards. The
+/// auto-updater path stays on [`spawn_installer_inner`] which infers
+/// the flavour from the running EXE — correct for self-update because
+/// the running EXE IS the install being replaced.
+pub fn spawn_installer_for_flavour(
+    installer_path: &std::path::Path,
+    #[cfg(target_os = "windows")] flavour: WindowsInstallFlavour,
+    #[cfg(not(target_os = "windows"))] _flavour: WindowsInstallFlavour,
+) -> Result<u32> {
+    #[cfg(target_os = "windows")]
+    {
         let argv = msiexec_argv(installer_path, flavour);
         match flavour {
             WindowsInstallFlavour::PerUser => {
@@ -799,6 +837,17 @@ pub fn spawn_installer_inner(installer_path: &std::path::Path) -> Result<u32> {
             }
         }
     }
+    #[cfg(not(target_os = "windows"))]
+    {
+        spawn_installer_for_flavour_inner(installer_path)
+    }
+}
+
+/// Linux + macOS spawn body shared between
+/// [`spawn_installer_inner`] and [`spawn_installer_for_flavour`].
+/// Flavour is irrelevant outside Windows.
+#[cfg(not(target_os = "windows"))]
+fn spawn_installer_for_flavour_inner(installer_path: &std::path::Path) -> Result<u32> {
     #[cfg(target_os = "linux")]
     {
         let path_str = installer_path.to_string_lossy().into_owned();
@@ -827,7 +876,7 @@ pub fn spawn_installer_inner(installer_path: &std::path::Path) -> Result<u32> {
             .context("spawning installer(8)")?;
         Ok(child.id())
     }
-    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         bail!(
             "self-update spawn is not implemented on this platform ({:?})",
@@ -1594,6 +1643,38 @@ mod tests {
             )),
             WindowsInstallFlavour::PerMachine
         );
+    }
+
+    // ----- B6 regression: wizard-EXE locations are NOT classifiable ---
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn classify_wizard_exe_locations_returns_peruser_not_permachine() {
+        // The install wizard EXE runs from wherever the operator
+        // double-clicked it. Each of these paths classifies as
+        // PerUser — which is wrong for the host's install state when
+        // the operator picked perMachine in the wizard. Locks the
+        // contract that the wizard MUST NOT rely on
+        // `current_install_flavour`/`classify_install_flavour_from_path`
+        // when deciding the spawn elevation path; instead use
+        // `spawn_installer_for_flavour(path, operator_selected_flavour)`.
+        // Field repro 2026-05-15 on GORAN-XMG-NEO16: wizard ran from
+        // %TEMP%, classified as PerUser, spawned msiexec /qn against
+        // a perMachine MSI, Windows Installer returned 1625
+        // ERROR_INSTALL_PACKAGE_REJECTED.
+        let wizard_paths = [
+            r"C:\Users\goran\Downloads\roomler-installer-0.3.0-rc.28-x86_64-pc-windows-msvc.exe",
+            r"C:\Users\goran\Desktop\roomler-installer.exe",
+            r"C:\Users\goran\AppData\Local\Temp\roomler-installer.exe",
+            r"D:\Installers\roomler-installer.exe",
+        ];
+        for p in wizard_paths {
+            assert_eq!(
+                classify_install_flavour_from_path(std::path::Path::new(p)),
+                WindowsInstallFlavour::PerUser,
+                "wizard EXE at {p} unexpectedly classified as PerMachine"
+            );
+        }
     }
 
     // ----- msiexec_argv (Plan rc.18 P1) -------------------------------

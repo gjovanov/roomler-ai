@@ -41,7 +41,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use roomler_agent::install_detect::{ExistingInstall, detect_existing_install};
-use roomler_agent::updater::{WindowsInstallFlavour, spawn_installer_inner};
+use roomler_agent::updater::{WindowsInstallFlavour, spawn_installer_for_flavour};
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
 
@@ -223,8 +223,21 @@ async fn run_install_inner(
     }
 
     // --- Step 5: spawn msiexec ------------------------------------------
+    //
+    // Pass the OPERATOR-SELECTED flavour (parsed from the SPA radio
+    // cards at the top of this function) explicitly. DO NOT delegate
+    // to `spawn_installer_inner` — that classifies the wizard EXE's
+    // own location via `current_install_flavour`, which always
+    // resolves to PerUser inside the wizard (the EXE runs from
+    // wherever the operator double-clicked, never `\Program Files\`).
+    // A perMachine MSI launched on the perUser branch (`/qn`, no
+    // ShellExecuteExW runas) gets rejected by Windows Installer with
+    // exit code 1625 ERROR_INSTALL_PACKAGE_REJECTED. Field repro
+    // 2026-05-15 on GORAN-XMG-NEO16; BLOCKER B6 from the rc.27/rc.28
+    // master plan.
     check_cancel()?;
-    let pid = spawn_installer_inner(&staged).map_err(|e| format!("spawn msiexec: {e}"))?;
+    let pid =
+        spawn_installer_for_flavour(&staged, wfx).map_err(|e| format!("spawn msiexec: {e}"))?;
     ACTIVE_MSI_PID.store(pid, Ordering::SeqCst);
     emit(on_event, ProgressEvent::MsiSpawned { pid });
 
@@ -560,5 +573,24 @@ mod tests {
         let result = force_kill_msi();
         ACTIVE_MSI_PID.store(saved, Ordering::SeqCst);
         assert!(result.is_err());
+    }
+
+    // ----- B6 regression (1625 ERROR_INSTALL_PACKAGE_REJECTED) ---------
+
+    #[test]
+    fn parse_flavour_permachine_resolves_to_permachine_enum() {
+        // Lock the contract that drives B6's fix: the SPA-provided
+        // `permachine` string deterministically becomes
+        // `WindowsInstallFlavour::PerMachine`, which is what the
+        // orchestrator passes to `spawn_installer_for_flavour`. If
+        // this drifts (e.g. someone introduces a new wrapper enum or
+        // adds a fallback to `current_install_flavour`), the wizard's
+        // perMachine spawn breaks again with 1625.
+        let (wfx, sysctx) = parse_flavour("permachine").expect("parse");
+        assert_eq!(wfx, WindowsInstallFlavour::PerMachine);
+        assert!(!sysctx);
+        let (wfx, sysctx) = parse_flavour("permachine-system-context").expect("parse");
+        assert_eq!(wfx, WindowsInstallFlavour::PerMachine);
+        assert!(sysctx);
     }
 }
