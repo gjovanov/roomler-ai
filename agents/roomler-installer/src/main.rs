@@ -91,6 +91,8 @@ fn main() {
             commands::cmd_default_device_name,
             commands::cmd_default_server_url,
             commands::cmd_validate_token,
+            commands::cmd_load_state,
+            commands::cmd_save_state,
         ])
         .run(tauri::generate_context!())
         .expect("error while running roomler-installer");

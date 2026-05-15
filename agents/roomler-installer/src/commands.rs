@@ -131,3 +131,23 @@ pub fn cmd_validate_token(token: String) -> Result<TokenValidation, String> {
         expires_at_unix: view.expires_at_unix,
     })
 }
+
+// ─── Wizard state persistence ────────────────────────────────────────────────
+
+/// Load the wizard's persisted state. Returns `Default` (= Welcome
+/// step, empty fields) when no state file exists or it's corrupt;
+/// the wizard's UI always has SOMETHING to render. Token is never
+/// in the state — see `wizard_state` module docs.
+#[tauri::command]
+pub fn cmd_load_state() -> Result<crate::wizard_state::WizardState, String> {
+    let path = crate::wizard_state::default_state_path().map_err(|e| e.to_string())?;
+    Ok(crate::wizard_state::load(&path))
+}
+
+/// Persist wizard state. Called on every form-blur from the SPA so
+/// a forced kill mid-flow resumes cleanly on the next launch.
+#[tauri::command]
+pub fn cmd_save_state(state: crate::wizard_state::WizardState) -> Result<(), String> {
+    let path = crate::wizard_state::default_state_path().map_err(|e| e.to_string())?;
+    crate::wizard_state::save(&path, &state).map_err(|e| e.to_string())
+}
