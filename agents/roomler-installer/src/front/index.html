@@ -174,12 +174,18 @@
       </div>
 
       <div id="done-systemcontext-note" class="info" hidden>
-        <strong>SystemContext mode (manual follow-up):</strong>
-        <p>The wizard installed the perMachine MSI. To enable remote control of the
-        Windows lock screen + admin apps, open an elevated PowerShell and run:</p>
+        <strong>SystemContext mode — one elevated step left:</strong>
+        <p>The perMachine MSI is installed and the agent is enrolled. To turn on
+        remote control of the Windows lock screen, UAC dialogs, and admin apps,
+        open an <em>elevated</em> PowerShell (right-click → Run as administrator)
+        and run:</p>
         <pre><code>roomler-agent set-service-env-var --name ROOMLER_AGENT_ENABLE_SYSTEM_SWAP --value 1
 roomler-agent restart-service</code></pre>
-        <p class="muted">Full automatic wizard support shipping in rc.29.</p>
+        <p class="muted">The wizard can't write to <code>HKLM\SYSTEM\…\Environment</code>
+        directly because the wizard process inherits a non-elevated token from your
+        double-click. Full automation (a WiX custom action gated on
+        <code>ENABLE_SYSTEM_CONTEXT=1</code> set by the wizard at msiexec time)
+        is the next-cycle slice.</p>
       </div>
 
       <footer class="actions">

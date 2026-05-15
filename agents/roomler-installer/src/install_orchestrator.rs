@@ -142,16 +142,25 @@ async fn run_install_inner(
     // --- Parse flavour into the enum the rest of the pipeline uses -----
     let (wfx, is_system_context) = parse_flavour(&flavour_str)?;
 
-    // SystemContext mode is not yet wired in v1.
+    // SystemContext mode: run plain perMachine install (parse_flavour
+    // already returns WindowsInstallFlavour::PerMachine for the
+    // SystemContext variant). The SPA's Done page shows a manual
+    // PowerShell snippet — `roomler-agent set-service-env-var` +
+    // `restart-service` — that the operator runs from an elevated
+    // shell to flip the SystemContext path on. Full MSI-side
+    // automation (a WiX custom action gated on ENABLE_SYSTEM_CONTEXT=1)
+    // is the next slice but not blocking the v1 ship.
     if is_system_context {
-        return Err("SystemContext mode requires admin-elevated SCM env-var \
-             write that wizard v1 doesn't perform automatically. After the \
-             plain perMachine install completes, run `roomler-agent \
-             set-service-env-var --name ROOMLER_AGENT_ENABLE_SYSTEM_SWAP \
-             --value 1 && roomler-agent restart-service` from elevated \
-             PowerShell to flip the SystemContext path on. Full wizard \
-             support shipping in rc.29."
-            .to_string());
+        emit(
+            on_event,
+            ProgressEvent::PreflightWarning {
+                message: "SystemContext mode: installing plain perMachine MSI now. \
+                          After Done, run the elevated `set-service-env-var` + \
+                          `restart-service` snippet shown on the final step to \
+                          flip the SystemContext path on."
+                    .to_string(),
+            },
+        );
     }
 
     // --- Step 2: resolve installer ---------------------------------------
