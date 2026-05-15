@@ -381,14 +381,16 @@ fn build_turn_config(
     let base = turn.url.as_deref()?;
     let mut urls = vec![base.to_string()];
     if base.starts_with("turn:") && !base.contains("?transport=") {
+        // Plain TURN-over-UDP on :443 (webrtc-rs ICE agent CAN use this; many
+        // corporate firewalls drop UDP/3478 but allow UDP/443). See
+        // `state.rs::build_turn_config` for the full rationale.
+        let turn_443 = base.replace(":3478", ":443");
+        urls.push(format!("{}?transport=udp", turn_443));
         urls.push(format!("{}?transport=tcp", base));
         let turns_5349 = base
             .replacen("turn:", "turns:", 1)
             .replace(":3478", ":5349");
         urls.push(format!("{}?transport=tcp", turns_5349));
-        // TURNS on :443 for enterprise egress — both DTLS/UDP and
-        // TLS/TCP, sharing the same ephemeral secret. See
-        // `state.rs::build_turn_config` for the full rationale.
         let turns_443 = base.replacen("turn:", "turns:", 1).replace(":3478", ":443");
         urls.push(format!("{}?transport=udp", turns_443));
         urls.push(format!("{}?transport=tcp", turns_443));

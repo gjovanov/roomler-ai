@@ -190,18 +190,22 @@ fn build_turn_config(turn: &roomler_ai_config::TurnSettings) -> Option<TurnConfi
     // the remote-control path behaves consistently behind NAT.
     let mut urls = vec![base.to_string()];
     if base.starts_with("turn:") && !base.contains("?transport=") {
+        // Plain TURN-over-UDP on :443 — same code path as the base URL, just
+        // a different port. webrtc-rs's ICE agent IS able to use this; many
+        // corporate firewalls drop UDP/3478 but allow UDP/443 (it looks like
+        // QUIC). Requires coturn `alt-listening-port=443`.
+        let turn_443 = base.replace(":3478", ":443");
+        urls.push(format!("{}?transport=udp", turn_443));
         urls.push(format!("{}?transport=tcp", base));
         let turns_5349 = base
             .replacen("turn:", "turns:", 1)
             .replace(":3478", ":5349");
         urls.push(format!("{}?transport=tcp", turns_5349));
-        // TURNS on :443 — both DTLS-over-UDP and TLS-over-TCP,
-        // sharing the same ephemeral secret. :443 is the only
-        // outbound port many enterprise firewalls allow; advertising
-        // both transports lets the client pick whichever survives
-        // local egress rules. Relies on coturn listening on :443
-        // for both DTLS (UDP) and TLS (TCP) — the tls-listening-port
-        // + alt-tls-listening-port lines in coturn's config.
+        // TURNS on :443 — both DTLS-over-UDP and TLS-over-TCP, sharing the
+        // same ephemeral secret. webrtc-rs's ICE agent silently drops these
+        // (TODO upstream, closed NOT_PLANNED per webrtc-rs/webrtc#690), but
+        // Chrome / Firefox / Safari DO implement them, so we keep emitting
+        // them for the browser-controller path.
         let turns_443 = base.replacen("turn:", "turns:", 1).replace(":3478", ":443");
         urls.push(format!("{}?transport=udp", turns_443));
         urls.push(format!("{}?transport=tcp", turns_443));
