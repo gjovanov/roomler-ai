@@ -10,6 +10,7 @@
 
 pub mod asset_resolver;
 pub mod commands;
+pub mod install_orchestrator;
 pub mod msi_runner;
 pub mod progress;
 pub mod wizard_state;
