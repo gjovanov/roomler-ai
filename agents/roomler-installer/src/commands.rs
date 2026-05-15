@@ -159,7 +159,15 @@ pub fn cmd_save_state(state: crate::wizard_state::WizardState) -> Result<(), Str
 /// streams over the Tauri `ipc::Channel`; every event is also pushed
 /// into the replay log so a late-attaching SPA listener catches up
 /// via [`cmd_install_progress_replay`].
-#[tauri::command]
+///
+/// `rename_all = "camelCase"` because the JS SPA calls this with
+/// `deviceName` / `onEvent` arg keys; Tauri 2's default is
+/// snake_case which would silently leave `device_name` empty + the
+/// channel null. Field repro 2026-05-15 (rc.29): operator's
+/// perMachine install ran end-to-end but the Done page rendered
+/// blank because the Channel was null + the orchestrator received
+/// `device_name = ""`.
+#[tauri::command(rename_all = "camelCase")]
 pub async fn cmd_install(
     flavour: String,
     server: String,
