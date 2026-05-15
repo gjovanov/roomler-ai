@@ -430,9 +430,13 @@ async fn handle_media_join(
                 )
             };
         // Build TURN URLs with multiple transport variants.
-        // UDP TURN often fails behind NAT/firewalls, so include TCP and TLS fallbacks.
+        // UDP TURN often fails behind NAT/firewalls, so include TCP and TLS
+        // fallbacks. Also emit `turn:HOST:443?transport=udp` because many
+        // corporate firewalls allow UDP/443 (QUIC) but block UDP/3478.
         let mut urls: Vec<String> = vec![url.clone()];
         if url.starts_with("turn:") && !url.contains("?transport=") {
+            let turn_443 = url.replace(":3478", ":443");
+            urls.push(format!("{}?transport=udp", turn_443));
             urls.push(format!("{}?transport=tcp", url));
             // Derive TURNS (TLS) URL on port 5349
             let turns_url = url.replacen("turn:", "turns:", 1).replace(":3478", ":5349");
