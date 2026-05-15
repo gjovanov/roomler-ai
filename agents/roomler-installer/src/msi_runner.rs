@@ -116,6 +116,18 @@ mod imp {
         handle: HANDLE,
     }
 
+    // SAFETY: HANDLE is a `*mut c_void` aliasing a kernel object.
+    // Windows kernel handles are not thread-local — they refer to
+    // OS-managed objects and can be passed between threads safely
+    // (the Win32 SDK documents WaitForSingleObject / GetExitCodeProcess
+    // etc. as callable from any thread holding the handle). The
+    // `*mut c_void` Rust representation defaults to `!Send` / `!Sync`
+    // out of conservative caution; we override that here so the
+    // Tauri async command machinery, which requires futures to be
+    // Send, can carry MsiRunner across await points.
+    unsafe impl Send for MsiRunner {}
+    unsafe impl Sync for MsiRunner {}
+
     impl MsiRunner {
         /// Open SYNCHRONIZE | PROCESS_QUERY_INFORMATION |
         /// PROCESS_TERMINATE access to a PID returned by
