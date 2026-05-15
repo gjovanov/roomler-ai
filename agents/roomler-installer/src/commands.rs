@@ -151,3 +151,47 @@ pub fn cmd_save_state(state: crate::wizard_state::WizardState) -> Result<(), Str
     let path = crate::wizard_state::default_state_path().map_err(|e| e.to_string())?;
     crate::wizard_state::save(&path, &state).map_err(|e| e.to_string())
 }
+
+// ─── Install execution (W6b) ─────────────────────────────────────────────────
+
+/// Drive the full install pipeline end-to-end: preflight → resolve →
+/// download → verify → spawn MSI → wait/decode → enroll. Progress
+/// streams over the Tauri `ipc::Channel`; every event is also pushed
+/// into the replay log so a late-attaching SPA listener catches up
+/// via [`cmd_install_progress_replay`].
+#[tauri::command]
+pub async fn cmd_install(
+    flavour: String,
+    server: String,
+    token: String,
+    device_name: String,
+    on_event: tauri::ipc::Channel<crate::progress::ProgressEvent>,
+) -> Result<crate::install_orchestrator::DoneReport, String> {
+    crate::install_orchestrator::run_install(flavour, server, token, device_name, on_event).await
+}
+
+/// Pre-spawn cancel: flips the orchestrator's `CANCEL_REQUESTED`
+/// flag. Subsequent `check_cancel()` calls bail with
+/// "cancelled by operator". No-op once msiexec is spawned —
+/// SPA must surface the "Force-kill" affordance instead.
+#[tauri::command]
+pub fn cmd_cancel_in_progress() -> Result<(), String> {
+    crate::install_orchestrator::request_cancel();
+    Ok(())
+}
+
+/// Force-kill the active msiexec process. May leave Windows
+/// Installer in a partially-rolled-back state; the SPA must show
+/// a confirmation dialog before invoking this.
+#[tauri::command]
+pub fn cmd_force_kill_msi() -> Result<(), String> {
+    crate::install_orchestrator::force_kill_msi()
+}
+
+/// Snapshot of the ProgressEvent replay log. The SPA calls this on
+/// first listener attach to fast-forward through any events emitted
+/// before its `ipc::Channel` listener was wired up (H1 mitigation).
+#[tauri::command]
+pub fn cmd_install_progress_replay() -> Vec<crate::progress::ProgressEvent> {
+    crate::progress::replay_log().snapshot()
+}
