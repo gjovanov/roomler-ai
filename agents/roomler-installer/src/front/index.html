@@ -8,56 +8,198 @@
 </head>
 <body>
   <main id="app">
-    <header class="title-bar">
-      <h1>Roomler Agent Installer</h1>
-      <p class="subtitle">5-step setup. No PowerShell required.</p>
-    </header>
+    <!-- Step indicator (1 of 5) -->
+    <nav class="step-indicator" aria-label="Wizard progress">
+      <ol>
+        <li data-step="welcome">Welcome</li>
+        <li data-step="server">Server</li>
+        <li data-step="token">Token</li>
+        <li data-step="install">Install</li>
+        <li data-step="done">Done</li>
+      </ol>
+    </nav>
 
-    <!-- Placeholder. W8 will replace this with the actual SPA: state
-         machine + 5 wizard steps (Welcome / Server / Token / Install /
-         Done) + recovery panel + ipc::Channel listener for live install
-         progress. For now, the wizard just calls cmd_detect_install
-         on load so we can validate the Tauri runtime + invoke surface
-         end-to-end before laying down the UI. -->
-    <section id="diagnostic" class="card">
-      <h2>Pre-install check</h2>
-      <p id="status">Probing…</p>
-      <p id="hostname"></p>
-      <p id="server"></p>
+    <!-- Step 1: Welcome + detection + flavour pick -->
+    <section id="step-welcome" class="step" hidden>
+      <h1>Install Roomler Agent</h1>
+      <p class="lead">5-step setup. No PowerShell required.</p>
+
+      <div id="detection-card" class="card">
+        <h2>Detected install</h2>
+        <p id="detection-summary" class="muted">Probing…</p>
+        <p id="detection-ambiguous-warning" class="warning" hidden>
+          Both perUser and perMachine installs detected. The MSI's cleanup custom action
+          will remove the one not selected.
+        </p>
+      </div>
+
+      <div class="card">
+        <h2>Deployment mode</h2>
+        <fieldset id="flavour-fieldset">
+          <label class="radio">
+            <input type="radio" name="flavour" value="peruser">
+            <div>
+              <strong>perUser — Just for me</strong>
+              <p class="muted">Installs under my user account. No admin password needed.</p>
+            </div>
+          </label>
+          <label class="radio">
+            <input type="radio" name="flavour" value="permachine">
+            <div>
+              <strong>perMachine — For all users on this PC</strong>
+              <p class="muted">Requires admin password during install (UAC prompt).</p>
+            </div>
+          </label>
+          <label class="radio">
+            <input type="radio" name="flavour" value="permachine-system-context">
+            <div>
+              <strong>perMachine + SystemContext — For lock screen / admin app control</strong>
+              <p class="muted">Like perMachine, but also enables remote control of the
+              Windows lock screen and UAC dialogs. Requires admin and an additional
+              elevated step (v1 wizard limitation — see Done page for instructions).</p>
+            </div>
+          </label>
+        </fieldset>
+
+        <div id="cross-flavour-warning" class="warning" hidden>
+          <p id="cross-flavour-warning-text"></p>
+          <label class="checkbox">
+            <input type="checkbox" id="cross-flavour-ack">
+            I understand my existing enrollment will be lost; I have a fresh enrollment
+            token from my administrator.
+          </label>
+        </div>
+      </div>
+
+      <footer class="actions">
+        <button id="welcome-cancel" class="secondary">Cancel</button>
+        <button id="welcome-continue" disabled>Continue →</button>
+      </footer>
     </section>
 
-    <footer class="actions">
-      <button id="continue" disabled>Continue →</button>
-    </footer>
+    <!-- Step 2: Server URL + device name -->
+    <section id="step-server" class="step" hidden>
+      <h1>Server + device</h1>
+      <p class="lead">Where to enroll this agent and what to call it.</p>
+
+      <div class="card">
+        <label class="field">
+          <span>Server URL</span>
+          <input id="server-url" type="url" required>
+          <small class="muted">Production: <code>https://roomler.ai</code></small>
+        </label>
+
+        <label class="field">
+          <span>Device name</span>
+          <input id="device-name" type="text" required>
+          <small class="muted">Pre-filled from hostname; edit if you want something
+          more memorable (e.g. "PC50045 — Reception").</small>
+        </label>
+      </div>
+
+      <footer class="actions">
+        <button id="server-back" class="secondary">← Back</button>
+        <button id="server-continue" disabled>Continue →</button>
+      </footer>
+    </section>
+
+    <!-- Step 3: Enrollment token -->
+    <section id="step-token" class="step" hidden>
+      <h1>Enrollment token</h1>
+      <p class="lead">Paste a fresh token from the Roomler admin UI.</p>
+
+      <div class="card">
+        <label class="field">
+          <span>Token</span>
+          <input id="token-input" type="password" autocomplete="off"
+                 placeholder="eyJhbGc..." required>
+          <small class="muted">Stored only in memory. Never persisted to disk.</small>
+        </label>
+
+        <div id="token-validation" class="token-validation muted" hidden></div>
+      </div>
+
+      <footer class="actions">
+        <button id="token-back" class="secondary">← Back</button>
+        <button id="token-continue" disabled>Continue →</button>
+      </footer>
+    </section>
+
+    <!-- Step 4: Install in progress -->
+    <section id="step-install" class="step" hidden>
+      <h1>Installing</h1>
+      <p class="lead" id="install-summary"></p>
+
+      <ol class="checklist" id="install-checklist">
+        <!-- Populated dynamically as ProgressEvents arrive. -->
+      </ol>
+
+      <div id="install-progress" hidden>
+        <div class="progress-bar">
+          <div class="progress-bar-fill" id="progress-fill"></div>
+        </div>
+        <p class="muted" id="progress-label"></p>
+      </div>
+
+      <div id="install-error" class="error" hidden>
+        <h3>Install failed</h3>
+        <p id="install-error-message"></p>
+        <footer class="actions">
+          <button id="install-retry" class="secondary">Retry</button>
+          <button id="install-back-to-welcome">← Back to start</button>
+        </footer>
+      </div>
+
+      <footer class="actions">
+        <button id="install-cancel" class="secondary">Cancel</button>
+      </footer>
+    </section>
+
+    <!-- Step 5: Done -->
+    <section id="step-done" class="step" hidden>
+      <h1>Done</h1>
+      <p class="lead">The Roomler Agent is installed and enrolled.</p>
+
+      <div class="card">
+        <dl class="kv">
+          <dt>Agent ID</dt>
+          <dd id="done-agent-id" class="code"></dd>
+          <dt>Tenant ID</dt>
+          <dd id="done-tenant-id" class="code"></dd>
+          <dt>Mode</dt>
+          <dd id="done-flavour"></dd>
+          <dt>Version</dt>
+          <dd id="done-tag" class="code"></dd>
+        </dl>
+      </div>
+
+      <div id="done-systemcontext-note" class="info" hidden>
+        <strong>SystemContext mode (manual follow-up):</strong>
+        <p>The wizard installed the perMachine MSI. To enable remote control of the
+        Windows lock screen + admin apps, open an elevated PowerShell and run:</p>
+        <pre><code>roomler-agent set-service-env-var --name ROOMLER_AGENT_ENABLE_SYSTEM_SWAP --value 1
+roomler-agent restart-service</code></pre>
+        <p class="muted">Full automatic wizard support shipping in rc.29.</p>
+      </div>
+
+      <footer class="actions">
+        <button id="done-finish">Finish</button>
+      </footer>
+    </section>
+
+    <!-- Recovery / diagnostics panel (cog icon top-right of every step) -->
+    <button id="recovery-toggle" class="recovery-toggle" title="Recovery / diagnostics"
+            aria-label="Open recovery panel">⚙</button>
+    <aside id="recovery-panel" class="recovery-panel" hidden>
+      <h2>Recovery</h2>
+      <button id="recovery-reset">Restart wizard from Welcome</button>
+      <button id="recovery-close" class="secondary">Close</button>
+    </aside>
+
+    <!-- Snackbar for transient messages (B9: "installer-already-running") -->
+    <div id="snackbar" class="snackbar" hidden></div>
   </main>
 
-  <script>
-    const invoke = window.__TAURI__.core.invoke
-
-    async function probe() {
-      const status = document.getElementById('status')
-      const hostname = document.getElementById('hostname')
-      const server = document.getElementById('server')
-      try {
-        const [detected, hn, srv] = await Promise.all([
-          invoke('cmd_detect_install'),
-          invoke('cmd_default_device_name'),
-          invoke('cmd_default_server_url'),
-        ])
-        status.textContent = `Detected: ${detected.kind}` + (
-          detected.peruser_version ? ` (perUser ${detected.peruser_version})` : ''
-        ) + (
-          detected.permachine_version ? ` (perMachine ${detected.permachine_version})` : ''
-        )
-        hostname.textContent = `Device name: ${hn}`
-        server.textContent = `Server URL: ${srv}`
-        document.getElementById('continue').disabled = detected.ambiguous
-      } catch (err) {
-        status.textContent = `Probe failed: ${err}`
-      }
-    }
-
-    probe()
-  </script>
+  <script type="module" src="app.js"></script>
 </body>
 </html>
