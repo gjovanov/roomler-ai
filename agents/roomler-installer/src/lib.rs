@@ -11,6 +11,7 @@
 pub mod commands;
 pub mod msi_runner;
 pub mod progress;
+pub mod wizard_state;
 
 use std::sync::atomic::AtomicBool;
 
