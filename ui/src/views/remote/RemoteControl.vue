@@ -224,6 +224,26 @@
         aria-label="Remote capture resolution"
         :title="resolutionButtonTitle"
       />
+      <!-- rc.35 — native source dims chip. Hides until the first frame
+           lands (composable populates mediaIntrinsicW/H + vp9_444Stats).
+           Warning color when the operator's custom target exceeds
+           native — clarifies that the agent will silently cap (no
+           upscale). Click opens the custom dialog so they can adjust. -->
+      <v-chip
+        v-if="nativeSourceLabel"
+        size="small"
+        :color="customTargetExceedsNative ? 'warning' : undefined"
+        :variant="customTargetExceedsNative ? 'tonal' : 'outlined'"
+        :prepend-icon="customTargetExceedsNative ? 'mdi-alert-circle-outline' : 'mdi-monitor'"
+        :title="customTargetExceedsNative
+          ? `Custom target exceeds agent native ${nativeSourceLabel} — agent caps at native (no upscale). Click to edit.`
+          : `Agent native source: ${nativeSourceLabel}`"
+        class="d-none d-md-inline-flex"
+        style="cursor: pointer;"
+        @click="customResolutionDialog = true"
+      >
+        Native {{ nativeSourceLabel }}
+      </v-chip>
       <v-select
         v-model="codecOverride"
         :items="codecOptions"
@@ -620,6 +640,23 @@
       <v-card>
         <v-card-title>Custom remote resolution</v-card-title>
         <v-card-text>
+          <!-- rc.35 — native-source hint. Surfaces the agent's actual
+               panel resolution so the operator knows the upper bound
+               before picking a preset. Empty until the first frame
+               has arrived, in which case we show a placeholder
+               explanation instead. -->
+          <div class="text-caption text-medium-emphasis mb-3">
+            <template v-if="nativeSourceLabel">
+              Agent native source: <strong>{{ nativeSourceLabel }}</strong>.
+              Values above this are capped to native — the capture
+              backend cannot upscale.
+            </template>
+            <template v-else>
+              Agent's native dimensions haven't been observed yet — they
+              show up after the first decoded frame. Values larger than
+              the agent's panel resolution will be silently capped.
+            </template>
+          </div>
           <div class="d-flex align-center mb-3">
             <v-text-field
               v-model.number="customResolutionW"
@@ -646,17 +683,37 @@
               label="Height"
             />
           </div>
+          <!-- rc.35 — presets that exceed the agent native source get
+               a 'warning' color + 'capped' suffix; presets at-or-under
+               render normally. Click still applies (operator might
+               want the preset value committed even if capped). -->
           <v-chip-group column>
             <v-chip
               v-for="p in customResolutionPresets"
               :key="`${p.w}x${p.h}`"
               size="small"
-              variant="outlined"
+              :variant="presetExceedsNative(p.w, p.h) ? 'tonal' : 'outlined'"
+              :color="presetExceedsNative(p.w, p.h) ? 'warning' : undefined"
+              :prepend-icon="presetExceedsNative(p.w, p.h) ? 'mdi-alert-circle-outline' : undefined"
               @click="pickCustomResolutionPreset(p.w, p.h)"
             >
-              {{ p.w }} × {{ p.h }}{{ p.note ? ` — ${p.note}` : '' }}
+              {{ p.w }} × {{ p.h }}{{ p.note ? ` — ${p.note}` : '' }}{{ presetExceedsNative(p.w, p.h) ? ' (capped)' : '' }}
             </v-chip>
           </v-chip-group>
+          <!-- Live warning when the operator types dims exceeding the
+               native source. Read from the form inputs, not the
+               applied rc.resolution, so it updates as the operator
+               types. -->
+          <div
+            v-if="presetExceedsNative(customResolutionW, customResolutionH) && nativeSourceLabel"
+            class="text-caption mt-2"
+            style="color: rgb(var(--v-theme-warning));"
+          >
+            <v-icon size="small" class="mr-1">mdi-alert-circle-outline</v-icon>
+            {{ customResolutionW }} × {{ customResolutionH }} exceeds native
+            {{ nativeSourceLabel }}. The agent will cap at native — applying
+            this value is equivalent to picking "Original resolution".
+          </div>
         </v-card-text>
         <v-card-actions>
           <v-spacer />
@@ -722,6 +779,12 @@
             variant="outlined"
             prepend-inner-icon="mdi-monitor-screenshot"
             label="Remote capture resolution"
+            :hint="nativeSourceLabel
+              ? (customTargetExceedsNative
+                ? `Agent native ${nativeSourceLabel} — custom target exceeds this; capped at native`
+                : `Agent native ${nativeSourceLabel}`)
+              : 'Native dimensions surface after the first decoded frame'"
+            persistent-hint
           />
           <v-select
             v-model="codecOverride"
@@ -1823,7 +1886,11 @@ const resolutionOptions = computed(() => {
   if (rc.resolution.value.mode === 'custom') {
     const w = rc.resolution.value.width ?? 0
     const h = rc.resolution.value.height ?? 0
-    opts.push({ title: `Custom: ${w} × ${h}`, value: 'custom-current' })
+    // rc.35 — annotate when the operator-picked custom dims exceed
+    // the agent's native source (apply_target_resolution refuses to
+    // upscale; would just look the same as 'original').
+    const suffix = presetExceedsNative(w, h) ? ' (capped at native)' : ''
+    opts.push({ title: `Custom: ${w} × ${h}${suffix}`, value: 'custom-current' })
   }
   opts.push({ title: 'Custom…', value: 'custom-edit' })
   return opts
@@ -1856,11 +1923,56 @@ const resolutionPresetValue = computed<string>({
 
 const resolutionButtonTitle = computed(() => {
   const s = rc.resolution.value
-  if (s.mode === 'original') return 'Agent streams at native monitor resolution'
+  const native = nativeSourceLabel.value
+  const nativeHint = native ? ` — agent native ${native}` : ''
+  if (s.mode === 'original') return `Agent streams at native monitor resolution${nativeHint}`
   if (s.mode === 'fit') {
-    return `Agent downscales to fit local viewport (currently ${s.width ?? '?'} × ${s.height ?? '?'})`
+    return `Agent downscales to fit local viewport (currently ${s.width ?? '?'} × ${s.height ?? '?'})${nativeHint}`
   }
-  return `Custom: ${s.width ?? '?'} × ${s.height ?? '?'}`
+  const capped = customTargetExceedsNative.value
+    ? ` — exceeds native ${native}, will be capped at native (no upscale)`
+    : nativeHint
+  return `Custom: ${s.width ?? '?'} × ${s.height ?? '?'}${capped}`
+})
+
+/** rc.35 — agent's native source dims, surfaced for the resolution UI
+ *  so the operator can see why a 4K custom target on a 1080p-panel
+ *  host doesn't change anything. Sourced from the VP9-444 worker's
+ *  rolling stats when that path is active (post-decode VideoFrame
+ *  dims), otherwise from the WebRTC track's `videoWidth/Height`
+ *  carried via `mediaIntrinsicW/H`. Zero before the first frame. */
+const nativeSourceW = computed<number>(() => {
+  if (rc.vp9_444Active.value && rc.vp9_444Stats.value.width > 0) {
+    return rc.vp9_444Stats.value.width
+  }
+  return rc.mediaIntrinsicW.value || 0
+})
+const nativeSourceH = computed<number>(() => {
+  if (rc.vp9_444Active.value && rc.vp9_444Stats.value.height > 0) {
+    return rc.vp9_444Stats.value.height
+  }
+  return rc.mediaIntrinsicH.value || 0
+})
+const nativeSourceLabel = computed<string>(() => {
+  const w = nativeSourceW.value
+  const h = nativeSourceH.value
+  if (!w || !h) return ''
+  return `${w}×${h}`
+})
+/** Returns true iff (w, h) exceeds the agent's native source on
+ *  either axis. Used both by the dropdown's custom-current title
+ *  annotation and the per-preset chip styling inside the custom
+ *  dialog. False until the first frame lands and native is known. */
+function presetExceedsNative(w: number, h: number): boolean {
+  const nw = nativeSourceW.value
+  const nh = nativeSourceH.value
+  if (!nw || !nh) return false
+  return w > nw || h > nh
+}
+const customTargetExceedsNative = computed<boolean>(() => {
+  const r = rc.resolution.value
+  if (r.mode !== 'custom') return false
+  return presetExceedsNative(r.width ?? 0, r.height ?? 0)
 })
 
 const customResolutionDialog = ref(false)
