@@ -290,6 +290,18 @@ pub fn force_exit_on_stall(stalled: &[(&'static str, Duration)]) -> bool {
     let summary = summary.join(", ");
     eprintln!("watchdog: pumps stalled ({summary}); forcing exit({STALL_EXIT_CODE})");
     tracing::error!(stalled = %summary, "watchdog: forcing process exit");
+
+    // Phase 1B (Task 9): emit a crash sidecar BEFORE process-exit
+    // so the next agent startup can upload it to roomler.ai. Worker
+    // context: the watchdog runs inside the worker process; the SCM
+    // supervisor's own crash detection (Phase 1B site 3) excludes
+    // STALL_EXIT_CODE explicitly to avoid double-recording.
+    crate::crash_recorder::record(
+        crate::crash_recorder::Reason::WatchdogStall,
+        &format!("pumps stalled ({summary})"),
+        crate::crash_recorder::WriterContext::Worker,
+    );
+
     std::process::exit(STALL_EXIT_CODE);
 }
 

@@ -228,6 +228,24 @@ fn install_panic_hook(log_dir: PathBuf) {
         // WorkerGuard's Drop, but the sync file above is the source
         // of truth for post-mortem.
         tracing::error!(panic_log = %path.display(), "agent panicked; details written to disk");
+
+        // Phase 1B: emit a JSON crash sidecar for the uploader to
+        // ship to roomler.ai on next agent startup. The sidecar is
+        // INDEPENDENT of the text dump above — even if the recorder
+        // recursively panics inside its catch_unwind, the text dump
+        // has already flushed to disk. Worker context: panic hook
+        // always runs in the worker process.
+        let summary = format!(
+            "{} at {}",
+            payload.unwrap_or("panic"),
+            location.as_deref().unwrap_or("?"),
+        );
+        crate::crash_recorder::record(
+            crate::crash_recorder::Reason::Panic,
+            &summary,
+            crate::crash_recorder::WriterContext::Worker,
+        );
+
         prev(info);
     }));
 }
