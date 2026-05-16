@@ -579,6 +579,16 @@ pub fn decide_exit_reaction(code: u32, consecutive_failures: u32) -> (ExitReacti
     }
 }
 
+/// Should the supervisor write a crash sidecar for this worker exit?
+/// Pure predicate so the call site logic is unit-testable. The
+/// supervisor records `SupervisorDetected` crashes for every non-
+/// zero exit code EXCEPT `STALL_EXIT_CODE` — the watchdog already
+/// recorded that case before forcing exit, and double-recording
+/// inflates fleet crash metrics (B2 from the Task 9 plan critique).
+pub fn should_record_supervisor_crash(code: u32) -> bool {
+    code != 0 && code != crate::watchdog::STALL_EXIT_CODE as u32
+}
+
 /// Compute the next backoff duration given how many consecutive
 /// failures we've seen. Doubles from 2 s to 60 s cap.
 pub fn next_backoff(consecutive_failures: u32) -> Duration {
@@ -723,6 +733,24 @@ pub fn run(
                                 "supervisor: worker exited with non-zero code; backing off before respawn"
                             );
                             respawn_at = Some(Instant::now() + backoff);
+
+                            // Phase 1B (Task 9): record a crash
+                            // sidecar so the next worker uploads it
+                            // to roomler.ai. The predicate explicitly
+                            // excludes STALL_EXIT_CODE — the watchdog
+                            // already recorded that case before
+                            // forcing exit; double-recording would
+                            // inflate fleet crash metrics (B2 from
+                            // the plan critique). Locked by
+                            // `should_record_supervisor_crash_*`
+                            // tests in this module.
+                            if should_record_supervisor_crash(code) {
+                                crate::crash_recorder::record(
+                                    crate::crash_recorder::Reason::SupervisorDetected,
+                                    &format!("worker exit code {code}"),
+                                    crate::crash_recorder::WriterContext::Supervisor,
+                                );
+                            }
                         }
                     }
                     current_worker = None;
@@ -1186,6 +1214,37 @@ mod tests {
         // Runaway counter must not panic on overflow.
         let (_, next) = decide_exit_reaction(1, u32::MAX);
         assert_eq!(next, u32::MAX);
+    }
+
+    // ─── B2 regression: supervisor crash-record exclusion ────────────
+
+    #[test]
+    fn should_record_supervisor_crash_excludes_stall_exit_code() {
+        // The watchdog records WatchdogStall before forcing exit with
+        // this code; the supervisor must NOT double-record. Locks
+        // B2 from the Task 9 plan critique.
+        assert!(!should_record_supervisor_crash(
+            crate::watchdog::STALL_EXIT_CODE as u32
+        ));
+    }
+
+    #[test]
+    fn should_record_supervisor_crash_excludes_clean_exit() {
+        // Code 0 = clean shutdown; the supervisor's Respawn branch
+        // (not Backoff) handles it, but the predicate must still
+        // return false defensively.
+        assert!(!should_record_supervisor_crash(0));
+    }
+
+    #[test]
+    fn should_record_supervisor_crash_records_other_non_zero_exits() {
+        // Real crash codes — segfault on Windows (0xC0000005),
+        // SIGABRT from a panic propagated through tokio runtime (134),
+        // generic 1. All should fire the recorder.
+        assert!(should_record_supervisor_crash(0xC0000005));
+        assert!(should_record_supervisor_crash(134));
+        assert!(should_record_supervisor_crash(1));
+        assert!(should_record_supervisor_crash(255));
     }
 
     #[test]
