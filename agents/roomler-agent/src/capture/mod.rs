@@ -189,7 +189,10 @@ pub fn open_default(_target_fps: u32, _downscale: DownscalePolicy) -> Box<dyn Sc
                     return Box::new(c);
                 }
                 Err(e) => {
-                    tracing::warn!(%e, "wgc capture unavailable — falling back to scrap (DXGI)");
+                    tracing::warn!(
+                        error = %format!("{e:#}"),
+                        "wgc capture unavailable — falling back to scrap (DXGI)"
+                    );
                 }
             }
         } else {
@@ -208,7 +211,10 @@ pub fn open_default(_target_fps: u32, _downscale: DownscalePolicy) -> Box<dyn Sc
                 return Box::new(c);
             }
             Err(e) => {
-                tracing::warn!(%e, "scrap capture unavailable — falling back to NoopCapture");
+                tracing::warn!(
+                    error = %format!("{e:#}"),
+                    "scrap capture unavailable — falling back to NoopCapture"
+                );
             }
         }
     }

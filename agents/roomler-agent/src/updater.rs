@@ -420,7 +420,7 @@ async fn fetch_latest_release() -> Result<GithubRelease> {
         Err(e) => {
             tracing::info!(
                 proxy = %proxy_url,
-                error = %e,
+                error = %format!("{e:#}"),
                 "update proxy unreachable; trying direct GitHub"
             );
         }
@@ -623,7 +623,7 @@ pub async fn pin_version(tag: &str) -> CheckOutcome {
     let current = env!("CARGO_PKG_VERSION").to_string();
     let release = match fetch_release_by_tag(tag).await {
         Ok(r) => r,
-        Err(e) => return CheckOutcome::Skipped(format!("pin fetch {tag}: {e}")),
+        Err(e) => return CheckOutcome::Skipped(format!("pin fetch {tag}: {e:#}")),
     };
     let asset = match pick_asset_for_platform(&release.assets) {
         Some(a) => a,
@@ -637,7 +637,7 @@ pub async fn pin_version(tag: &str) -> CheckOutcome {
             latest: release.tag_name,
             installer_path: path,
         },
-        Err(e) => CheckOutcome::Skipped(format!("pin download {tag}: {e}")),
+        Err(e) => CheckOutcome::Skipped(format!("pin download {tag}: {e:#}")),
     }
 }
 
@@ -649,7 +649,7 @@ pub async fn check_once() -> CheckOutcome {
     let current = env!("CARGO_PKG_VERSION").to_string();
     let release = match fetch_latest_release().await {
         Ok(r) => r,
-        Err(e) => return CheckOutcome::Skipped(format!("fetch: {e}")),
+        Err(e) => return CheckOutcome::Skipped(format!("fetch: {e:#}")),
     };
     // Drafts are always skipped; prereleases are tolerated because
     // our 0.x release history marked them all `prerelease: true` and
@@ -683,7 +683,7 @@ pub async fn check_once() -> CheckOutcome {
             latest: latest_parsed,
             installer_path: path,
         },
-        Err(e) => CheckOutcome::Skipped(format!("download: {e}")),
+        Err(e) => CheckOutcome::Skipped(format!("download: {e:#}")),
     }
 }
 
