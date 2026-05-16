@@ -875,6 +875,7 @@ async fn media_pump(
                 keyframe_requested,
                 target_resolution,
                 lock_state_rx,
+                quality_state,
             )
             .await;
         }
@@ -1454,14 +1455,15 @@ pub(crate) fn frame_video_bytes(payload: &[u8], is_keyframe: bool, timestamp_us:
 /// - Heartbeat log every ~30 frames so a stalled pump is greppable
 /// - Idle keepalive at 1 fps so the decoder doesn't pause
 ///
-/// What's intentionally absent:
-/// - REMB-driven adaptive bitrate: REMB is a WebRTC-RTP feedback
-///   mechanism. The DC has no equivalent; we'd need a back-channel
-///   `rc:vp9.bandwidth` message from the controller (next sprint).
-///   Today the encoder runs at its `DEFAULT_BITRATE_BPS` ceiling.
-/// - SDP renegotiation: there's no track to renegotiate; the worker
-///   reconfigures its `VideoDecoder` on each keyframe-with-new-dims
-///   automatically.
+/// rc.33 additions (RustDesk-parity smoothness sprint):
+/// - Resolution + quality-derived bitrate target (was hard-cap 8 Mbps);
+///   `rc:quality` from the controller now moves this on the fly.
+/// - DC backpressure AIMD: `dc.buffered_amount` over 1 MiB cuts the
+///   target by 20% (MD); under 64 KiB for ≥ 5 s adds 10% (AI). Replaces
+///   the absent REMB feedback path for the DC-transport.
+/// - Optional 60 fps via `ROOMLER_AGENT_VP9_FPS` env var (operator
+///   opt-in escape hatch — full warmup-probe / control-DC plumbing
+///   deferred to a follow-up).
 #[cfg(feature = "vp9-444")]
 async fn media_pump_vp9_444_dc(
     session_id: bson::oid::ObjectId,
@@ -1469,6 +1471,7 @@ async fn media_pump_vp9_444_dc(
     keyframe_requested: Arc<std::sync::atomic::AtomicBool>,
     target_resolution: Arc<std::sync::Mutex<TargetResolution>>,
     lock_state_rx: tokio::sync::watch::Receiver<lock_state::LockState>,
+    quality_state: Arc<std::sync::atomic::AtomicU8>,
 ) {
     // See `media_pump`: tracks lock-state transitions so we can
     // request a keyframe on the lock/unlock boundary.
@@ -1487,10 +1490,14 @@ async fn media_pump_vp9_444_dc(
     use crate::encode::VideoEncoder; // brings encode/request_keyframe into scope
     use crate::encode::libvpx::Vp9Encoder;
 
-    // VP9 4:4:4 is heavy CPU; we cap fps to 30 right out of the gate.
-    // The `vp9-444` path is always SW (libvpx); no HW VP9 4:4:4
-    // encoder is available cross-platform today.
-    let target_fps: u32 = 30;
+    // rc.33: opt-in 60 fps via env var. Default 30 (the pre-rc.33
+    // behaviour). Operators on hosts that can sustain SW VP9 encode at
+    // 4K@60 with cpu-used 6 can flip `ROOMLER_AGENT_VP9_FPS=60` to
+    // halve perceptual motion latency. No warmup probe in rc.33 — the
+    // env var is operator-acknowledged; a CPU-starved host will see
+    // frame drops surface in the heartbeat log (`frames_encoded /
+    // frames_captured` ratio < 0.95).
+    let target_fps: u32 = vp9_444_target_fps_from_env();
     let frame_duration_floor = Duration::from_micros(1_000_000 / target_fps as u64);
     // BGRA capture; never downscale (libvpx + dcv_color_primitives
     // BGRA→I444 is fast enough at 1080p without the 2× capture
@@ -1516,6 +1523,36 @@ async fn media_pump_vp9_444_dc(
     let mut bytes_written: u64 = 0;
     let mut send_errors: u64 = 0;
     let mut dc_unopen_drops: u64 = 0;
+    let mut frames_skipped_backpressure: u64 = 0;
+
+    // rc.33 — bitrate / quality state. Pre-rc.33 the encoder ran at
+    // its `DEFAULT_BITRATE_BPS = 8 Mbps` ceiling regardless of source
+    // resolution; at 4K this is ~1/3 of what RustDesk sends and is the
+    // dominant cause of blocky motion frames. We now drive
+    // `enc.set_bitrate(target)` after each encoder rebuild AND on
+    // `rc:quality` change AND on AIMD watermark crossings.
+    //
+    // Sentinel 0xFF on `last_applied_quality` so the first iteration
+    // unconditionally applies the current preference even when the
+    // controller hasn't yet pushed `rc:quality`.
+    let mut last_applied_quality: u8 = 0xFF;
+    let mut last_applied_bitrate: u32 = 0;
+    // AIMD state for DC backpressure (no REMB on the DC transport).
+    // High watermark: bufferedAmount above this triggers multiplicative
+    // decrease + drops the frame. Low watermark + 5 s settle window
+    // triggers additive increase.
+    const DC_BUFFERED_HIGH_BYTES: u64 = 1_048_576; // 1 MiB
+    const DC_BUFFERED_LOW_BYTES: u64 = 65_536; // 64 KiB
+    const AIMD_INCREASE_INTERVAL: Duration = Duration::from_secs(5);
+    const AIMD_DECREASE_NUM: u32 = 80; // ×0.80 on overflow
+    const AIMD_DECREASE_DEN: u32 = 100;
+    const AIMD_INCREASE_NUM: u32 = 110; // ×1.10 on settle
+    const AIMD_INCREASE_DEN: u32 = 100;
+    let mut last_aimd_event_at = std::time::Instant::now();
+    let mut last_low_water_at: Option<std::time::Instant> = None;
+    // Hysteresis on quality-driven set_bitrate so we don't thrash
+    // libvpx's config across single-bps wobble.
+    const HYSTERESIS_PCT: u32 = 15;
 
     loop {
         let frame: std::sync::Arc<crate::capture::Frame> = match capturer.next_frame().await {
@@ -1589,11 +1626,18 @@ async fn media_pump_vp9_444_dc(
         }
 
         if encoder_dims != Some((w, h)) {
-            info!(%session_id, w, h, "VP9-444 encoder rebuild for dims");
-            match Vp9Encoder::new(w, h) {
+            info!(%session_id, w, h, target_fps, "VP9-444 encoder rebuild for dims");
+            match Vp9Encoder::new_with_fps(w, h, target_fps) {
                 Ok(e) => {
                     encoder = Some(e);
                     encoder_dims = Some((w, h));
+                    // rc.33 — force quality re-apply on the new
+                    // encoder. set_bitrate state lives on the
+                    // encoder instance, so a rebuild reverts to the
+                    // boot-time default bitrate until we push the
+                    // resolution-derived quality target through.
+                    last_applied_quality = 0xFF;
+                    last_applied_bitrate = 0;
                 }
                 Err(e) => {
                     warn!(%session_id, %e, "Vp9Encoder::new failed — pump exits");
@@ -1604,6 +1648,36 @@ async fn media_pump_vp9_444_dc(
         let enc = encoder.as_mut().unwrap();
         if keyframe_requested.swap(false, std::sync::atomic::Ordering::Relaxed) {
             enc.request_keyframe();
+        }
+
+        // rc.33 — apply resolution + quality-derived bitrate target.
+        // Pre-rc.33 the encoder ran at its 8 Mbps boot default; this
+        // block lifts 4K Quality=High to ~25-30 Mbps and is the single
+        // largest motion-smoothness lever. Cheap on every frame: two
+        // atomic loads + integer math + a single comparison.
+        let q_now = quality_state.load(std::sync::atomic::Ordering::Relaxed);
+        if let Some((ew, eh)) = encoder_dims {
+            let base = encode::initial_bitrate_for_fps(ew, eh, target_fps);
+            let target = quality::target_bitrate(q_now, base);
+            let quality_changed = q_now != last_applied_quality;
+            let drift_too_big = if last_applied_bitrate == 0 {
+                true
+            } else {
+                let band = (last_applied_bitrate / 100).saturating_mul(HYSTERESIS_PCT);
+                target.abs_diff(last_applied_bitrate) > band
+            };
+            if quality_changed || drift_too_big {
+                enc.set_bitrate(target);
+                info!(
+                    %session_id,
+                    quality = quality::label(q_now),
+                    base_bps = base,
+                    target_bps = target,
+                    "VP9-444 set_bitrate (quality/resolution-derived)"
+                );
+                last_applied_quality = q_now;
+                last_applied_bitrate = target;
+            }
         }
 
         let packets = match enc.encode(frame).await {
@@ -1644,6 +1718,86 @@ async fn media_pump_vp9_444_dc(
             continue;
         }
 
+        // rc.33 — AIMD backpressure. Substitutes the missing REMB
+        // path on the DC transport. Probe the buffered amount once
+        // per frame and adjust the encoder bitrate accordingly.
+        //
+        // The webrtc-rs API name is `buffered_amount()` returning a
+        // `usize`. On overflow (> 1 MiB) we multiplicatively decrease
+        // the target by 20% and SKIP the frame entirely — that keeps
+        // us from layering more bytes on top of an already-backed-up
+        // SCTP queue, which would compound into seconds of latency.
+        // Under-watermark (< 64 KiB) for 5 s lets the encoder climb
+        // back up by 10% — additive increase. Capped at the
+        // quality-derived ceiling so we never exceed what the
+        // operator's Quality=Low/Auto/High preference allows.
+        let buffered = dc.buffered_amount().await as u64;
+        let now = std::time::Instant::now();
+        if buffered > DC_BUFFERED_HIGH_BYTES {
+            // Multiplicative decrease, applied once per AIMD interval
+            // to avoid free-falling the bitrate on a transient blip.
+            if now.duration_since(last_aimd_event_at) >= Duration::from_millis(500)
+                && last_applied_bitrate > 0
+            {
+                let new_target = (last_applied_bitrate / AIMD_DECREASE_DEN)
+                    .saturating_mul(AIMD_DECREASE_NUM)
+                    .max(encode::MIN_BITRATE_BPS);
+                if new_target < last_applied_bitrate {
+                    enc.set_bitrate(new_target);
+                    info!(
+                        %session_id,
+                        buffered,
+                        old_target = last_applied_bitrate,
+                        new_target,
+                        "VP9-444 AIMD decrease (DC buffer over high watermark)"
+                    );
+                    last_applied_bitrate = new_target;
+                    last_aimd_event_at = now;
+                }
+            }
+            // Skip this frame entirely + ask the controller for a
+            // keyframe on resume so the decoder doesn't choke on a
+            // delta-after-gap. Counted in the heartbeat.
+            frames_skipped_backpressure += packets.len() as u64;
+            keyframe_requested.store(true, std::sync::atomic::Ordering::Relaxed);
+            last_low_water_at = None;
+            continue;
+        } else if buffered < DC_BUFFERED_LOW_BYTES {
+            // Additive increase, but only after the buffer has been
+            // continuously under the low watermark for AIMD_INCREASE_INTERVAL.
+            // Avoids ratcheting up on a single low sample between bursts.
+            let settled_since = *last_low_water_at.get_or_insert(now);
+            if now.duration_since(settled_since) >= AIMD_INCREASE_INTERVAL
+                && now.duration_since(last_aimd_event_at) >= AIMD_INCREASE_INTERVAL
+                && last_applied_bitrate > 0
+            {
+                if let Some((ew, eh)) = encoder_dims {
+                    let base = encode::initial_bitrate_for_fps(ew, eh, target_fps);
+                    let quality_ceiling = quality::target_bitrate(q_now, base);
+                    let new_target = (last_applied_bitrate / AIMD_INCREASE_DEN)
+                        .saturating_mul(AIMD_INCREASE_NUM)
+                        .min(quality_ceiling);
+                    if new_target > last_applied_bitrate {
+                        enc.set_bitrate(new_target);
+                        info!(
+                            %session_id,
+                            buffered,
+                            old_target = last_applied_bitrate,
+                            new_target,
+                            ceiling = quality_ceiling,
+                            "VP9-444 AIMD increase (DC buffer settled under low watermark)"
+                        );
+                        last_applied_bitrate = new_target;
+                    }
+                    last_aimd_event_at = now;
+                    last_low_water_at = Some(now);
+                }
+            }
+        } else {
+            // Between watermarks — reset the low-water settle timer.
+            last_low_water_at = None;
+        }
+
         for p in packets {
             let ts_us = start.elapsed().as_micros() as u64;
             let wire = frame_video_bytes(&p.data, p.is_keyframe, ts_us);
@@ -1680,9 +1834,29 @@ async fn media_pump_vp9_444_dc(
                 %session_id,
                 frames_captured, frames_encoded, frames_sent, bytes_written,
                 send_errors, dc_unopen_drops,
+                frames_skipped_backpressure,
+                target_bps = last_applied_bitrate,
                 "VP9-444 DC pump heartbeat (≈1s window)"
             );
         }
+    }
+}
+
+/// Read the `ROOMLER_AGENT_VP9_FPS` env var. Default 30 (pre-rc.33
+/// behaviour). Accepts 30 or 60 — any other value rounds to the
+/// nearest of those two. Operator-opt-in escape hatch for 4K capable
+/// hosts; default stays at 30 so CPU-starved boxes keep working
+/// without a config touch.
+#[cfg(feature = "vp9-444")]
+fn vp9_444_target_fps_from_env() -> u32 {
+    const DEFAULT_FPS: u32 = 30;
+    match std::env::var("ROOMLER_AGENT_VP9_FPS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+    {
+        Some(fps) if fps >= 45 => 60,
+        Some(_) => 30,
+        None => DEFAULT_FPS,
     }
 }
 
