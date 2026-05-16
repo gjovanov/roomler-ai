@@ -97,6 +97,7 @@ fn main() {
             commands::cmd_cancel_in_progress,
             commands::cmd_force_kill_msi,
             commands::cmd_install_progress_replay,
+            commands::cmd_exit_wizard,
         ])
         .run(tauri::generate_context!())
         .expect("error while running roomler-installer");
