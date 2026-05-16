@@ -273,15 +273,50 @@ impl Conn for TcpTurnConn {
     }
 }
 
-/// Lazily-built shared `tokio_rustls::rustls::ClientConfig` with Mozilla's CA
-/// bundle. Created on first call; subsequent connections reuse the
-/// same `Arc`.
+/// Lazily-built shared `tokio_rustls::rustls::ClientConfig`. Created
+/// on first call; subsequent connections reuse the same `Arc`.
+///
+/// Trust-store strategy: load the **OS-native** cert store first, then
+/// extend with Mozilla's `webpki-roots` bundle. The native step is
+/// load-bearing on corporate Windows endpoints — IT pushes a private
+/// CA into the Windows cert store so all outbound HTTPS gets
+/// intercepted by their TLS-inspection proxy. Browsers + `reqwest`
+/// (Schannel) trust those private CAs because they read the native
+/// store; the prior `webpki-roots`-only build failed with
+/// `UnknownIssuer` on PC55331 because the proxy's cert was signed by
+/// a corporate CA Mozilla doesn't ship. Loading both stores makes the
+/// agent resilient on TLS-intercepted networks AND keeps working on
+/// direct-internet hosts where the native store may be sparse.
 fn tls_client_config() -> Arc<tokio_rustls::rustls::ClientConfig> {
     static CONFIG: OnceLock<Arc<tokio_rustls::rustls::ClientConfig>> = OnceLock::new();
     CONFIG
         .get_or_init(|| {
             let mut root = tokio_rustls::rustls::RootCertStore::empty();
+
+            // (1) Native OS cert store. Failures here are non-fatal —
+            // on locked-down systems where the store API errors out,
+            // we still have Mozilla's bundle below.
+            let native = rustls_native_certs::load_native_certs();
+            if !native.certs.is_empty() {
+                let (added, _ignored) = root.add_parsable_certificates(native.certs);
+                log::debug!(
+                    "tcp-turn TLS: loaded {} native cert(s) (errors: {})",
+                    added,
+                    native.errors.len()
+                );
+            } else {
+                log::warn!(
+                    "tcp-turn TLS: native cert store returned no certs \
+                     (errors: {}) — falling through to webpki-roots only",
+                    native.errors.len()
+                );
+            }
+
+            // (2) Mozilla bundle — keeps direct-internet hosts working
+            // when the native store is sparse (e.g. Linux without
+            // ca-certificates installed).
             root.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
             let cfg = tokio_rustls::rustls::ClientConfig::builder()
                 .with_root_certificates(root)
                 .with_no_client_auth();
