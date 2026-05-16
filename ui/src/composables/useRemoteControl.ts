@@ -843,6 +843,19 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    *  for diagnostics and used by tests to assert end-to-end decode
    *  succeeded. */
   const vp9_444FramesDecoded = ref(0)
+  /** Rolling-window stats from the VP9-444 worker (rc.35). Bitrate is
+   *  delivered-bytes/sec at the SCTP-receive boundary (post-network,
+   *  pre-decode), so it shows the actual link throughput including
+   *  any AIMD-driven adjustments. width/height reflect the latest
+   *  decoded VideoFrame dims. Updated every ~1 s by the worker;
+   *  the view's HUD reads these directly. */
+  const vp9_444Stats = ref<{
+    bitrateBps: number
+    fps: number
+    width: number
+    height: number
+    bytesReceivedTotal: number
+  }>({ bitrateBps: 0, fps: 0, width: 0, height: 0, bytesReceivedTotal: 0 })
   /** The visible `<canvas>` the view paints VP9-444 frames into. The
    *  view writes this on mount; the composable picks it up and
    *  posts `init-canvas` to the worker. Null until the view
@@ -1452,6 +1465,25 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         // Driven by the worker's `output` callback, used by tests +
         // view-side diagnostics.
         vp9_444FramesDecoded.value++
+      } else if (msg.type === 'stats') {
+        // rc.35 — rolling-window bitrate / fps / resolution from the
+        // worker. Surfaces the actual DC-receive throughput so the
+        // operator can confirm rc.33's AIMD-driven bitrate target
+        // is pushing the link as expected.
+        const m = msg as {
+          bitrateBps?: number
+          fps?: number
+          width?: number
+          height?: number
+          bytesReceivedTotal?: number
+        }
+        vp9_444Stats.value = {
+          bitrateBps: typeof m.bitrateBps === 'number' ? m.bitrateBps : 0,
+          fps: typeof m.fps === 'number' ? m.fps : 0,
+          width: typeof m.width === 'number' ? m.width : 0,
+          height: typeof m.height === 'number' ? m.height : 0,
+          bytesReceivedTotal: typeof m.bytesReceivedTotal === 'number' ? m.bytesReceivedTotal : 0,
+        }
       }
     }
     // Synthetic OffscreenCanvas — keeps the worker fully wired even
@@ -3989,6 +4021,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     vp9_444Supported,
     vp9_444Active,
     vp9_444FramesDecoded,
+    vp9_444Stats,
     vp9_444CanvasEl,
   }
 }

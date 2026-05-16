@@ -61,6 +61,40 @@ let configured = false
 let framesDecoded = 0
 let framesReceived = 0
 
+/** Rolling-window stats for the HUD. Computed in the worker so the
+ *  main thread doesn't need to touch the DC traffic. Bitrate is
+ *  delivered-bytes/sec at the SCTP-receive boundary (post-network,
+ *  pre-decode). Latest VideoFrame dims are captured in the decoder's
+ *  output callback. */
+let statsBytesInWindow = 0
+let statsBytesTotal = 0
+let statsFramesInWindow = 0
+let statsLastWidth = 0
+let statsLastHeight = 0
+let statsLastEmitMs: number = (typeof performance !== 'undefined' ? performance.now() : Date.now())
+const STATS_EMIT_INTERVAL_MS = 1000
+
+function maybeEmitStats(): void {
+  const now = (typeof performance !== 'undefined' ? performance.now() : Date.now())
+  const elapsed = now - statsLastEmitMs
+  if (elapsed < STATS_EMIT_INTERVAL_MS) return
+  const elapsedSec = elapsed / 1000
+  const bitrateBps = Math.round((statsBytesInWindow * 8) / elapsedSec)
+  const fps = Math.round(statsFramesInWindow / elapsedSec)
+  workerScope.postMessage({
+    type: 'stats',
+    bitrateBps,
+    fps,
+    width: statsLastWidth,
+    height: statsLastHeight,
+    framesDecodedTotal: framesDecoded,
+    bytesReceivedTotal: statsBytesTotal,
+  })
+  statsBytesInWindow = 0
+  statsFramesInWindow = 0
+  statsLastEmitMs = now
+}
+
 /** Frame assembler state — rolling buffer plus the size we're trying
  *  to fill on the current frame. Fragments concatenate until
  *  `pendingPayloadSize` is satisfied; then we emit the chunk. */
@@ -89,7 +123,11 @@ workerScope.onmessage = (e) => {
     initDecoder()
   } else if (msg.type === 'chunk') {
     framesReceived++
-    consumeBytes(new Uint8Array(msg.bytes))
+    const u8 = new Uint8Array(msg.bytes)
+    statsBytesInWindow += u8.byteLength
+    statsBytesTotal += u8.byteLength
+    consumeBytes(u8)
+    maybeEmitStats()
   } else if (msg.type === 'close') {
     teardown()
   }
@@ -100,10 +138,13 @@ function initDecoder() {
   decoder = new VideoDecoder({
     output: (frame) => {
       framesDecoded++
+      statsFramesInWindow++
       // Snapshot dims BEFORE paintFrame — it calls frame.close() in a
       // finally block, after which displayWidth/displayHeight return 0.
       const w = frame.displayWidth
       const h = frame.displayHeight
+      statsLastWidth = w
+      statsLastHeight = h
       paintFrame(frame)
       if (framesDecoded === 1) {
         workerScope.postMessage({ type: 'first-frame', width: w, height: h })
@@ -114,6 +155,9 @@ function initDecoder() {
         // it'd serialise as a copy here anyway).
         workerScope.postMessage({ type: 'frame-decoded', count: framesDecoded })
       }
+      // Emit on every output too so dims update promptly during
+      // resolution changes (rc:resolution / DPI flip / monitor swap).
+      maybeEmitStats()
     },
     error: (err) => {
       workerScope.postMessage({
