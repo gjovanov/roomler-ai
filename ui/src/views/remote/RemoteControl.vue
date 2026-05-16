@@ -563,7 +563,7 @@
              composable. Pill format keeps it unobtrusive over the
              video content. Hidden until at least the codec is known. -->
         <div
-          v-if="rc.hasMedia.value && statsCodecLabel"
+          v-if="rc.hasMedia.value && (statsCodecLabel || rc.vp9_444Active.value)"
           class="stats-readout"
           role="status"
           aria-live="polite"
@@ -571,6 +571,7 @@
           <span class="stats-pill">{{ statsCodecLabel }}</span>
           <span class="stats-pill">{{ statsBitrateLabel }}</span>
           <span class="stats-pill">{{ statsFpsLabel }}</span>
+          <span v-if="statsResolutionLabel" class="stats-pill">{{ statsResolutionLabel }}</span>
         </div>
         <div v-if="!rc.hasMedia.value" class="no-media-overlay">
           <v-icon size="72" color="grey-lighten-1">mdi-video-off</v-icon>
@@ -1950,6 +1951,9 @@ function stopFitResizeObserver() {
 // advertised AgentCaps.hw_encoders (2A.2 wired). This makes the
 // pill informative ("H.265 HW") rather than ambiguous ("H265").
 const statsCodecLabel = computed(() => {
+  // VP9-444 path bypasses the WebRTC track + getStats(), so report
+  // the known codec directly. SW-only on the agent today (libvpx).
+  if (rc.vp9_444Active.value) return 'VP9 4:4:4 SW'
   const raw = rc.stats.value.codec
   if (!raw) return ''
   const lower = raw.toLowerCase()
@@ -1968,15 +1972,36 @@ const statsCodecLabel = computed(() => {
   return `${display} ${hasHw ? 'HW' : 'SW'}`
 })
 const statsBitrateLabel = computed(() => {
-  const bps = rc.stats.value.bitrate_bps
+  // VP9-444 reads from the worker-emitted stats (rc.35) since no
+  // RTP track means getStats() has nothing for video.
+  const bps = rc.vp9_444Active.value
+    ? rc.vp9_444Stats.value.bitrateBps
+    : rc.stats.value.bitrate_bps
   if (bps <= 0) return '— bps'
   if (bps >= 1_000_000) return `${(bps / 1_000_000).toFixed(1)} Mbps`
   return `${Math.round(bps / 1_000)} kbps`
 })
 const statsFpsLabel = computed(() => {
-  const fps = rc.stats.value.fps
+  const fps = rc.vp9_444Active.value
+    ? rc.vp9_444Stats.value.fps
+    : rc.stats.value.fps
   if (fps <= 0) return '— fps'
   return `${Math.round(fps)} fps`
+})
+/** rc.35 — source resolution pill. Shown on every render path that
+ *  exposes intrinsic dims (VP9-444 worker emits them in `stats`;
+ *  WebRTC/WebCodecs paths set `mediaIntrinsicW/H` from `first-frame`
+ *  or `<video>.onresize`). Useful when verifying that rc:resolution
+ *  / auto-downscale / DPI flips landed at the dims you expect. */
+const statsResolutionLabel = computed(() => {
+  const w = rc.vp9_444Active.value
+    ? rc.vp9_444Stats.value.width
+    : rc.mediaIntrinsicW.value
+  const h = rc.vp9_444Active.value
+    ? rc.vp9_444Stats.value.height
+    : rc.mediaIntrinsicH.value
+  if (!w || !h) return ''
+  return `${w}×${h}`
 })
 
 // Remote cursor overlay (1E.3). Requires both a position and a
@@ -2540,6 +2565,16 @@ onBeforeUnmount(() => {
 .remote-video {
   background: #000;
   display: block;
+}
+/* rc.35 — better-than-bilinear resampling hint for the canvas render
+ * paths when the CSS-displayed size doesn't match the drawing-buffer
+ * size (typical: 4K source on a sub-4K viewport in scale-adaptive).
+ * Chrome 79+ picks a lanczos-like algorithm under `high-quality`;
+ * browsers without the hint fall back silently to `auto` (bilinear).
+ * For pixel-perfect 1:1 viewing, switch the scale mode to Original. */
+.remote-video.webcodecs-canvas,
+.remote-video.vp9-444-canvas {
+  image-rendering: high-quality;
 }
 .remote-video.scale-adaptive {
   width: 100%;
