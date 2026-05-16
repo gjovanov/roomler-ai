@@ -565,7 +565,10 @@ async fn handle_server_msg(
         // doesn't break this match — and add a debug log so we
         // notice if one ever inadvertently routes to the agent.
         other => {
-            debug!(?other, "tunnel-side ServerMsg routed to agent signaling — ignoring");
+            debug!(
+                ?other,
+                "tunnel-side ServerMsg routed to agent signaling — ignoring"
+            );
         }
     }
     Ok(())
