@@ -299,7 +299,11 @@ fn tls_client_config() -> Arc<tokio_rustls::rustls::ClientConfig> {
             let native = rustls_native_certs::load_native_certs();
             if !native.certs.is_empty() {
                 let (added, _ignored) = root.add_parsable_certificates(native.certs);
-                log::debug!(
+                // info! (not debug!) so the count is visible in field logs
+                // without needing RUST_LOG=debug. Helps confirm that the
+                // OS-native store actually contributed CAs when troubleshooting
+                // TLS-inspection scenarios on corporate networks.
+                log::info!(
                     "tcp-turn TLS: loaded {} native cert(s) (errors: {})",
                     added,
                     native.errors.len()

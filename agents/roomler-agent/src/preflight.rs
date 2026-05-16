@@ -16,6 +16,24 @@ use tokio::net::{TcpStream, lookup_host};
 use tokio::time::timeout;
 
 const STEP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Format `err` plus its full `.source()` chain as one colon-joined string.
+/// `std::error::Error::Display` only emits the top-level message; the
+/// underlying cause is hidden behind `source()` and never surfaced unless
+/// the caller walks the chain. reqwest's `error sending request for url`
+/// and io's generic "connection refused" both hide what we actually want
+/// to see (rustls cert errors, EAI_NONAME, ECONNRESET, etc.), so this
+/// helper makes the chain greppable in field logs.
+fn chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = err.to_string();
+    let mut src = err.source();
+    while let Some(cause) = src {
+        out.push_str(": ");
+        out.push_str(&cause.to_string());
+        src = cause.source();
+    }
+    out
+}
 /// Tolerated clock offset before we warn. JWT validation typically allows
 /// 30–60 s of skew either way; 60 s threshold gives us 1 minute of headroom
 /// before the operator's tokens start failing to validate.
@@ -189,7 +207,7 @@ async fn check_dns(host: String, port: u16) -> Option<Finding> {
         }
         Ok(Err(e)) => Some(Finding::DnsFailed {
             host,
-            reason: e.to_string(),
+            reason: chain(&e),
         }),
         Err(_) => Some(Finding::DnsFailed {
             host,
@@ -204,7 +222,7 @@ async fn check_tcp(host: String, port: u16) -> Option<Finding> {
         Ok(Err(e)) => Some(Finding::TcpFailed {
             host,
             port,
-            reason: e.to_string(),
+            reason: chain(&e),
         }),
         Err(_) => Some(Finding::TcpFailed {
             host,
@@ -225,7 +243,7 @@ async fn check_clock(scheme: &str, host: String, port: u16) -> Option<Finding> {
         Err(e) => {
             return Some(Finding::HttpFailed {
                 url,
-                reason: format!("client build: {e}"),
+                reason: format!("client build: {}", chain(&e)),
             });
         }
     };
@@ -234,7 +252,7 @@ async fn check_clock(scheme: &str, host: String, port: u16) -> Option<Finding> {
         Err(e) => {
             return Some(Finding::HttpFailed {
                 url,
-                reason: e.to_string(),
+                reason: chain(&e),
             });
         }
     };

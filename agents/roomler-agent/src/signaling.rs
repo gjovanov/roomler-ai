@@ -145,7 +145,7 @@ pub async fn run(
                 }
             }
             Err(ConnectError::Transient(e)) => {
-                warn!(error = %e, "signaling connect failed; backing off");
+                warn!(error = %format!("{e:#}"), "signaling connect failed; backing off");
                 tokio::select! {
                     _ = tokio::time::sleep(backoff) => {},
                     _ = shutdown.changed() => {
