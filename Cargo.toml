@@ -43,7 +43,7 @@ rtp = { path = "crates/vendored/rtp" }
 webrtc-ice = { path = "crates/vendored/webrtc-ice" }
 
 [workspace.package]
-version = "0.3.0-rc.34"
+version = "0.3.0-rc.35"
 edition = "2024"
 authors = ["Goran Jovanov <goran.jovanov@gmail.com>"]
 license = "MIT"
