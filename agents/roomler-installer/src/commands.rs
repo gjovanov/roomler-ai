@@ -203,3 +203,15 @@ pub fn cmd_force_kill_msi() -> Result<(), String> {
 pub fn cmd_install_progress_replay() -> Vec<crate::progress::ProgressEvent> {
     crate::progress::replay_log().snapshot()
 }
+
+/// Cleanly exit the wizard process. Wired to the Done page's Finish
+/// button. JS `window.close()` in Tauri 2 is unreliable: depending on
+/// the OS-window vs webview lifecycle, it can blank the webview but
+/// leave the wizard process alive (the operator sees a white/gray
+/// window with no controls — field repro 2026-05-16 on
+/// GORAN-XMG-NEO16 post-SystemContext install). `AppHandle::exit(0)`
+/// shuts the runtime down deterministically.
+#[tauri::command]
+pub fn cmd_exit_wizard(app: tauri::AppHandle) {
+    app.exit(0);
+}

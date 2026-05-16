@@ -559,8 +559,21 @@ function flavourLabel(flavour) {
 // ─── Step 5: Done ──────────────────────────────────────────────────────────
 
 function wireDone() {
-  document.getElementById("done-finish").addEventListener("click", () => {
-    window.close();
+  document.getElementById("done-finish").addEventListener("click", async () => {
+    // Tauri 2's JS `window.close()` from a webview can blank the
+    // webview WITHOUT actually exiting the process — operator gets a
+    // white/gray dead window with no controls. Field repro
+    // 2026-05-16 on GORAN-XMG-NEO16 post-SystemContext install.
+    // `cmd_exit_wizard` calls `AppHandle::exit(0)` on the Rust side
+    // which shuts the runtime down deterministically. Defensive
+    // fallback to `window.close()` if the invoke ever rejects (e.g.
+    // a future capability refactor de-permissions the command).
+    try {
+      await invoke("cmd_exit_wizard");
+    } catch (err) {
+      console.warn("[done] cmd_exit_wizard failed, falling back:", err);
+      window.close();
+    }
   });
 }
 
