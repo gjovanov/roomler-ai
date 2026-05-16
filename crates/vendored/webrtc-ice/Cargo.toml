@@ -98,6 +98,17 @@ features = ["logging", "tls12", "ring"]
 [dependencies.webpki-roots]
 version = "0.26"
 
+# Loads the OS-native cert store at runtime. On corporate Windows
+# endpoints with TLS inspection enabled, IT pushes a private CA into
+# the Windows cert store so browsers + reqwest (Schannel) trust the
+# MITM proxy. The Mozilla `webpki-roots` bundle does NOT include
+# those private CAs, so TURNS/TCP would fail with `UnknownIssuer`
+# against an intercepted endpoint. We extend our RootCertStore with
+# native certs first, then add Mozilla's bundle so direct-internet
+# hosts also keep working.
+[dependencies.rustls-native-certs]
+version = "0.8"
+
 [dependencies.url]
 version = "2"
 
