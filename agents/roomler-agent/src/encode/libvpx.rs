@@ -12,11 +12,17 @@
 //! Choices that match RustDesk's production setup:
 //!   - VP9 profile 1, 8-bit 4:4:4 (codec string `vp09.01.10.08`)
 //!   - `tune=screen-content` for desktop content
-//!   - `cpu-used=8` (fastest preset; quality drop is small for screen
-//!     content and we need real-time on iGPU-class hosts)
+//!   - `cpu-used` defaults to 6, env-overridable via
+//!     `ROOMLER_AGENT_VP9_CPU_USED` in 4..=9. Was 8 (fastest) pre-rc.33;
+//!     6 matches RustDesk's default and doubles the per-macroblock
+//!     mode-search budget so motion frames stop falling back to
+//!     SKIP/INTRA at the CBR ceiling.
 //!   - `lag-in-frames=0` — zero look-ahead, real-time priority
-//!   - `kf-max-dist=240` — 8 s keyframe interval; we force IDRs on
-//!     `rc:vp9.request_keyframe` from the viewer
+//!   - `kf-max-dist=∞` — periodic IDR disabled (rc.33). The 8 s
+//!     periodic IDR competed with motion-frame bit budget; we now
+//!     rely on `rc:vp9.request_keyframe` from the viewer + libvpx's
+//!     internal scene-change detection (built into the screen-content
+//!     tune). Matches RustDesk's pattern.
 //!
 //! Bound directly against `env_libvpx_sys` (raw FFI). The `vpx-encode`
 //! 0.6 wrapper hardcoded `VPX_IMG_FMT_I420` in encode() and exposed no
@@ -40,15 +46,22 @@ use std::os::raw::{c_int, c_uint};
 use std::sync::Arc;
 use vpx_sys as vpx;
 
-/// Initial bitrate target before any back-channel feedback. Tuned for
-/// 1080p 30fps screen content with 4:4:4 chroma — RustDesk's default
-/// is in the same ballpark.
+/// Initial bitrate target before any back-channel feedback. The
+/// resolution-aware ceiling now lives in the VP9-444 pump (peer.rs):
+/// it calls `set_bitrate(encode::initial_bitrate_for_fps(w, h, fps) *
+/// quality_factor)` after every encoder rebuild so the encoder runs
+/// at e.g. 25–30 Mbps at 4K Quality=High instead of the legacy 8 Mbps
+/// flat cap. This constant remains as the boot-time default until the
+/// first set_bitrate lands (typically the same loop iteration).
 const DEFAULT_BITRATE_BPS: u32 = 8_000_000;
 
-/// Keyframe interval in frames. 240 frames ≈ 8 s at 30fps. The viewer
-/// requests intermediate IDRs via `rc:vp9.request_keyframe` when the
-/// decoder errors or after a long gap.
-const KEYFRAME_INTERVAL: u32 = 240;
+/// Keyframe interval in frames. Effectively disabled (`u32::MAX`) so
+/// the encoder never emits a periodic IDR. RustDesk-parity: the
+/// browser viewer drives intermediate IDRs via `rc:vp9.request_keyframe`
+/// when the decoder errors, after a long gap, or on lock/unlock
+/// transitions. Removes the 8 s competing-bit-budget glitch on motion
+/// frames that pre-rc.33 builds had right around the IDR boundary.
+const KEYFRAME_INTERVAL: u32 = u32::MAX;
 
 /// Microsecond timebase numerator/denominator. PTS values are passed in
 /// directly as microseconds.
@@ -63,6 +76,11 @@ pub struct Vp9Encoder {
     cfg: vpx::vpx_codec_enc_cfg_t,
     width: u32,
     height: u32,
+    /// Target framerate this encoder was built for. Used to derive
+    /// per-packet `duration_us` (and the synthetic PTS fallback when
+    /// the input frame has no monotonic timestamp). Set at
+    /// construction; the pump rebuilds the encoder on fps changes.
+    target_fps: u32,
     /// Reusable I444 plane buffers — re-allocated on resolution change.
     /// Kept around between frames so steady-state encoding doesn't
     /// pressure the allocator.
@@ -93,10 +111,20 @@ pub struct Vp9Encoder {
 unsafe impl Send for Vp9Encoder {}
 
 impl Vp9Encoder {
+    /// Construct at the default 30 fps target. Kept for tests and any
+    /// caller that doesn't have an fps in scope.
     pub fn new(width: u32, height: u32) -> Result<Self> {
+        Self::new_with_fps(width, height, 30)
+    }
+
+    /// Construct with an explicit target framerate. The fps participates
+    /// in the per-packet `duration_us` and the synthetic-PTS fallback;
+    /// the actual capture rate is enforced by the pump's sleep cadence.
+    pub fn new_with_fps(width: u32, height: u32, target_fps: u32) -> Result<Self> {
         if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
             bail!("vp9-444: require non-zero, even dimensions, got {width}x{height}");
         }
+        let target_fps = target_fps.clamp(1, 240);
 
         // SAFETY: libvpx public API. We hold no aliasing references to
         // the cfg / ctx during these calls, the iface pointer is
@@ -149,10 +177,17 @@ impl Vp9Encoder {
         cfg.rc_buf_initial_sz = 500;
         cfg.rc_buf_optimal_sz = 600;
         cfg.rc_dropframe_thresh = 0;
-        cfg.rc_undershoot_pct = 50;
-        cfg.rc_overshoot_pct = 50;
-        cfg.rc_min_quantizer = 4;
-        cfg.rc_max_quantizer = 56;
+        // RustDesk-aligned (rc.33): permissive undershoot, tight overshoot,
+        // full QP range. Pre-rc.33 the 50/50 + max_q=56 combo forced libvpx
+        // to drop *frames* once it hit the buffer ceiling under motion (it
+        // couldn't raise QP past 56). Allowing the encoder to ride QP up
+        // to 63 trades a momentary text-softness for a continuous frame
+        // cadence — RustDesk's failure mode, materially smoother on
+        // window-drag motion at 4K than our pre-rc.33 stutter mode.
+        cfg.rc_undershoot_pct = 95;
+        cfg.rc_overshoot_pct = 25;
+        cfg.rc_min_quantizer = 0;
+        cfg.rc_max_quantizer = 63;
 
         let mut ctx: vpx::vpx_codec_ctx_t = unsafe { std::mem::zeroed() };
         let init_err = unsafe {
@@ -176,6 +211,7 @@ impl Vp9Encoder {
             cfg,
             width,
             height,
+            target_fps,
             y_plane: vec![0; (width * height) as usize],
             u_plane: vec![0; (width * height) as usize],
             v_plane: vec![0; (width * height) as usize],
@@ -188,11 +224,16 @@ impl Vp9Encoder {
     }
 
     fn apply_screen_content_controls(&mut self) {
-        // CPUUSED 8 = fastest preset. Quality drop is small for screen
-        // content + huge speed win on iGPU-class hosts. RustDesk default.
+        // CPUUSED default 6 (RustDesk-aligned). Doubles the mode-search
+        // budget per macroblock vs the pre-rc.33 default of 8, which
+        // restores motion-frame quality at the cost of ~35-45% more
+        // encode CPU on the encode thread. Operator escape hatch via
+        // `ROOMLER_AGENT_VP9_CPU_USED` (clamped 4..=9) lets a CPU-
+        // starved host roll back to 7 or 8 without a rebuild.
+        let cpu_used = cpu_used_from_env();
         self.set_ctrl(
             vpx::vp8e_enc_control_id::VP8E_SET_CPUUSED as c_int,
-            8 as c_int,
+            cpu_used,
             "VP8E_SET_CPUUSED",
         );
         // SCREEN tune disables psychovisual prep that's tuned for camera
@@ -211,11 +252,31 @@ impl Vp9Encoder {
             0 as c_uint,
             "VP9E_SET_AQ_MODE",
         );
-        // 4 tile columns to parallelise both encode and decode. log2 == 2.
+        // Resolution-adaptive tile-columns (rc.33). At 4K width, fixing
+        // log2=2 (4 tile columns / 960px each) bottlenecked deadline
+        // mode encoding on the slowest tile. log2=4 (16 cols / 240px)
+        // halves the per-tile width and lets encode + decode threads
+        // chew through tiles in parallel. RustDesk uses the same ladder.
+        let tile_cols_log2: c_int = if self.width >= 3840 {
+            4
+        } else if self.width >= 1920 {
+            2
+        } else {
+            1
+        };
         self.set_ctrl(
             vpx::vp8e_enc_control_id::VP9E_SET_TILE_COLUMNS as c_int,
-            2 as c_int,
+            tile_cols_log2,
             "VP9E_SET_TILE_COLUMNS",
+        );
+        // Row-MT (rc.33). Parallelises encode within each tile column;
+        // combined with the wider tile-column count at 4K this gives
+        // ~2x encode-fps headroom on the realtime deadline. Defaulted
+        // off in libvpx pre-1.7, but we ship 1.12 via env-libvpx-sys.
+        self.set_ctrl(
+            vpx::vp8e_enc_control_id::VP9E_SET_ROW_MT as c_int,
+            1 as c_uint,
+            "VP9E_SET_ROW_MT",
         );
         // Frame-parallel decoding lets the browser decoder use its
         // tile-column-level parallelism path.
@@ -356,14 +417,16 @@ impl VideoEncoder for Vp9Encoder {
         img.stride[vpx::VPX_PLANE_V as usize] = self.width as c_int;
 
         let pts = frame.monotonic_us as vpx::vpx_codec_pts_t;
-        // Advance pts by one frame at 30fps when we don't have a real
-        // timestamp; libvpx requires monotonic non-zero progression.
+        // Advance pts by one frame at the configured target fps when we
+        // don't have a real timestamp; libvpx requires monotonic
+        // non-zero progression.
+        let frame_duration_us: i64 = 1_000_000 / (self.target_fps as i64).max(1);
         let pts = if pts <= 0 {
-            (self.frame_idx as i64) * (1_000_000 / 30)
+            (self.frame_idx as i64) * frame_duration_us
         } else {
             pts
         };
-        let duration: u64 = 1_000_000 / 30;
+        let duration: u64 = frame_duration_us as u64;
 
         let force_kf = self.force_keyframe || self.frame_idx == 0;
         let flags: vpx::vpx_enc_frame_flags_t = if force_kf {
@@ -468,14 +531,30 @@ impl VideoEncoder for Vp9Encoder {
     }
 }
 
-/// Pick a sensible thread count for the libvpx encoder. Caps at 4 to
-/// avoid drowning a busy host — VP9 encode parallelism scales
-/// sub-linearly past that, especially on the screen-content path.
+/// Pick a sensible thread count for the libvpx encoder. Cap raised
+/// from 4 → 8 in rc.33: with the resolution-adaptive tile-columns
+/// (log2=4 at 4K → 16 tile columns) plus row-mt, encode now scales
+/// usefully past 4 threads. The 8-thread ceiling still protects
+/// a busy host from drowning under VP9 work — past 8 threads VP9
+/// encode parallelism flatlines on the screen-content path.
 fn num_cpus_for_encode() -> c_uint {
     let logical = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(2);
-    logical.clamp(1, 4) as c_uint
+    logical.clamp(1, 8) as c_uint
+}
+
+/// Read the `ROOMLER_AGENT_VP9_CPU_USED` escape hatch. Default 6
+/// (RustDesk-aligned, motion-quality optimal). Clamp to 4..=9 — values
+/// outside that range are libvpx-internally undefined for VP9. Any
+/// unparseable / unset value falls back to the default.
+fn cpu_used_from_env() -> c_int {
+    const DEFAULT_CPU_USED: i32 = 6;
+    let raw = std::env::var("ROOMLER_AGENT_VP9_CPU_USED")
+        .ok()
+        .and_then(|v| v.trim().parse::<i32>().ok())
+        .unwrap_or(DEFAULT_CPU_USED);
+    raw.clamp(4, 9) as c_int
 }
 
 #[cfg(test)]
