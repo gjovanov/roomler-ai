@@ -215,3 +215,72 @@ pub struct RemoteAuditEvent {
 impl RemoteAuditEvent {
     pub const COLLECTION: &'static str = "remote_audit";
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Agent crash report
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Why the agent considers this a crash. Shared between the agent's
+/// `crash_recorder` writer and the backend's ingest handler so a
+/// future tag rename never silently breaks deserialisation.
+///
+/// Serialised as snake_case strings (`panic` / `watchdog_stall` /
+/// `supervisor_detected`) — admin UI keys its chip-colour map off
+/// these EXACT strings.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CrashReason {
+    /// `std::panic::set_hook` fired in the worker process.
+    Panic,
+    /// `watchdog::force_exit_on_stall` was called — a registered
+    /// pump's heartbeat gap exceeded its threshold (default 90 s).
+    WatchdogStall,
+    /// Windows SCM supervisor detected the worker process exited
+    /// with a non-zero code (and the code wasn't `STALL_EXIT_CODE`,
+    /// which is recorded at the watchdog site instead).
+    SupervisorDetected,
+}
+
+/// Wire shape for the agent → roomler.ai crash-report upload AND the
+/// on-disk sidecar the agent writes between crash + upload. `rename_
+/// all = "camelCase"` so JS clients get `crashedAtUnix` etc. without
+/// a translation step.
+///
+/// Size budget: 64 KiB total when JSON-serialised. The agent's
+/// `crash_recorder::record` enforces this by trimming the
+/// `log_tail` (oldest lines first) before write; the backend's
+/// ingest route enforces it again with an 80 KiB body limit on the
+/// HTTP request (small JSON overhead beyond the payload).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentCrashPayload {
+    /// Unix seconds at the moment the crash was recorded ON THE
+    /// AGENT. The backend stamps its own `reported_at` server-clock
+    /// timestamp on ingest; admin UI shows both so clock-skewed
+    /// hosts are visible.
+    pub crashed_at_unix: i64,
+    pub reason: CrashReason,
+    /// One-line summary suitable for a list-view row (panic
+    /// message, "pumps stalled (signaling=120s)", or "worker exit
+    /// code 134"). May carry a trailing `[scrubbed N tokens]`
+    /// marker if the scrub pipeline redacted credentials from the
+    /// summary.
+    pub summary: String,
+    /// Last ~200 lines of the rolling agent log, after credential
+    /// scrubbing. Truncated with a leading `[…log truncated to fit
+    /// 64 KiB envelope…]\n` marker if the original tail wouldn't
+    /// fit the size budget.
+    pub log_tail: String,
+    /// `env!("CARGO_PKG_VERSION")` at crash time.
+    pub agent_version: String,
+    /// `"windows"` / `"linux"` / `"macos"` — same string surface as
+    /// `OsKind::serialize` would emit but kept as a plain String
+    /// here so the payload doesn't depend on the OsKind enum
+    /// position.
+    pub os: String,
+    /// Hostname at crash time.
+    pub hostname: String,
+    /// OS process id of the crashed worker (or supervisor, for the
+    /// supervisor-detected branch).
+    pub pid: u32,
+}

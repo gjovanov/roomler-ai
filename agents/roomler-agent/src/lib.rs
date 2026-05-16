@@ -7,6 +7,7 @@ pub mod capture;
 pub mod clipboard;
 pub mod config;
 pub mod consent;
+pub mod crash_recorder;
 pub mod displays;
 #[cfg(target_os = "windows")]
 pub mod dpi;
