@@ -98,6 +98,68 @@ pub fn log_dir() -> Option<PathBuf> {
     LOG_DIR.get().cloned().flatten()
 }
 
+/// Path of TODAY's rolling log file, if file logging is active.
+/// Used by `crash_recorder::record` to attach a `log_tail` to crash
+/// sidecars. Returns `None` when `init()` hasn't run yet OR no log
+/// dir resolved (test harness / no-home environment).
+///
+/// The path is computed deterministically from the rolling
+/// appender's daily-rotation convention: `<log_dir>/roomler-agent.
+/// log.YYYY-MM-DD` for archived days; `<log_dir>/roomler-agent.log`
+/// is the symlink-ish "current" name on some platforms but in
+/// practice tracing-appender writes to the dated name from the very
+/// first line. Probe both and return whichever exists.
+pub fn active_log_path() -> Option<PathBuf> {
+    let dir = log_dir()?;
+    let today = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Format unix seconds → YYYY-MM-DD without pulling chrono.
+    // tracing-appender uses UTC by default; mirror that.
+    let date = format_utc_date(today);
+    let dated = dir.join(format!("roomler-agent.log.{date}"));
+    if dated.exists() {
+        return Some(dated);
+    }
+    let plain = dir.join("roomler-agent.log");
+    if plain.exists() {
+        return Some(plain);
+    }
+    None
+}
+
+/// Format a unix-seconds value as `YYYY-MM-DD` in UTC. Pure +
+/// no-dep so the agent build doesn't pull chrono just for this.
+/// Algorithm = days-since-epoch + civil-from-days (Howard Hinnant).
+fn format_utc_date(unix_secs: u64) -> String {
+    let days = unix_secs / 86_400;
+    let (y, m, d) = civil_from_days(days as i64);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    // From Howard Hinnant's "chrono-Compatible Low-Level Date
+    // Algorithms" — converts days-since-1970-01-01 to (year, month,
+    // day). Pure integer arithmetic.
+    let z = z + 719_468;
+    let era = if z >= 0 {
+        z / 146_097
+    } else {
+        (z - 146_096) / 146_097
+    };
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
 fn resolve_log_dir() -> Option<PathBuf> {
     let dirs = ProjectDirs::from("live", "roomler", "roomler-agent")?;
     Some(dirs.data_local_dir().join("logs"))
