@@ -558,18 +558,6 @@ async fn handle_server_msg(
             debug!(%session_id, "unexpected controller-side msg on agent socket");
         }
         ServerMsg::Pong { .. } => {}
-        // rc.32 added tunnel-client-flow `ServerMsg` variants
-        // (TunnelOpened / TcpForward* / etc.) that target the
-        // browser-side tunnel-client, not the agent's signaling
-        // loop. Catch-all here so a future tunnel-message addition
-        // doesn't break this match — and add a debug log so we
-        // notice if one ever inadvertently routes to the agent.
-        other => {
-            debug!(
-                ?other,
-                "tunnel-side ServerMsg routed to agent signaling — ignoring"
-            );
-        }
     }
     Ok(())
 }
