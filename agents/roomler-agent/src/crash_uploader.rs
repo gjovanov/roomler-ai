@@ -44,6 +44,18 @@ use crate::crash_recorder;
 /// + the K8s ingress before reaching the API pod.
 const POST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Minimum delay between consecutive sidecar POSTs. The backend's
+/// `tower_governor` rate-limit is 60 req/min per IP = 1 req/sec
+/// steady-state with a 60-burst budget. Field repro 2026-05-17
+/// PC55331: agent drained 1317 sidecars at ~50/sec, exhausted the
+/// burst budget in ~1.2 sec, then ~1267 of them got 429s. With a
+/// 1.1-sec delay we stay safely under the steady-state limit; the
+/// drain takes longer (1317 × 1.1s = ~24 min worst case) but every
+/// sidecar lands. Backlogs that big are pathological anyway — the
+/// recorder's 30-sec rate-limit prevents accumulation under normal
+/// operation.
+const INTER_REQUEST_DELAY: Duration = Duration::from_millis(1100);
+
 /// Drain every pending crash sidecar to roomler.ai. Best-effort:
 /// any IO / network / parse failure logs `warn!` and continues with
 /// the next sidecar so a single poisoned file doesn't block the
@@ -71,7 +83,15 @@ pub async fn drain_and_upload(cfg: &AgentConfig) {
     let mut ok_count = 0u32;
     let mut keep_count = 0u32;
     let mut drop_count = 0u32;
+    let mut first = true;
     for (path, payload) in pending {
+        // Inter-request delay to stay under the backend's 60-req/min
+        // rate-limit (tower_governor). Skipped for the first upload
+        // so a single-sidecar drain is still instant.
+        if !first {
+            tokio::time::sleep(INTER_REQUEST_DELAY).await;
+        }
+        first = false;
         match upload_one(&client, &url, &cfg.agent_token, &payload).await {
             UploadOutcome::Accepted => {
                 tracing::info!(file = %path.display(), "crash_uploader: uploaded + deleted");
@@ -180,6 +200,19 @@ where
 {
     if status.is_success() {
         UploadOutcome::Accepted
+    } else if status == StatusCode::TOO_MANY_REQUESTS {
+        // 429 is the BACKEND saying "slow down" — NOT permanent. Field
+        // repro 2026-05-17 PC55331: storm of 1317 sidecars hit the
+        // tower_governor 60-req/min IP limit; treating it as 4xx-
+        // Rejected (the previous behaviour) deleted ~1267 of them
+        // permanently. Now classified as Transient so the next agent
+        // startup retries. The inter-request delay (see
+        // INTER_REQUEST_DELAY) in `drain_and_upload` keeps the steady
+        // state under the limit anyway; this is the safety net for
+        // accumulated backlog.
+        UploadOutcome::Transient {
+            reason: format!("HTTP {status} — rate-limited"),
+        }
     } else if status.is_client_error() {
         let body = body_resolver().await;
         UploadOutcome::Rejected { status, body }
@@ -262,6 +295,46 @@ mod tests {
     async fn classify_503_returns_transient_keep() {
         let out = classify_status_for_test(StatusCode::SERVICE_UNAVAILABLE, "ignored").await;
         assert!(matches!(out, UploadOutcome::Transient { .. }));
+    }
+
+    #[tokio::test]
+    async fn classify_429_returns_transient_not_rejected() {
+        // Field bug 2026-05-17 PC55331: 429 was being classified as
+        // 4xx-Rejected → sidecar deleted permanently → ~1267 of 1317
+        // crash reports lost when the backend rate-limited a drain
+        // burst. 429 MUST be Transient so the next agent startup
+        // retries.
+        let out = classify_status_for_test(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too Many Requests! Wait for 0s",
+        )
+        .await;
+        match out {
+            UploadOutcome::Transient { reason } => {
+                assert!(
+                    reason.contains("429"),
+                    "reason should mention 429; got {reason:?}"
+                );
+                assert!(
+                    reason.contains("rate-limited"),
+                    "reason should label as rate-limit; got {reason:?}"
+                );
+            }
+            other => panic!("expected Transient (rate-limit retry), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inter_request_delay_under_steady_state_rate_limit() {
+        // Backend rate-limit is 60 req/min = 1 req/sec steady-state.
+        // INTER_REQUEST_DELAY of 1100ms keeps us comfortably under
+        // the limit even with clock drift / network jitter; a value
+        // below 1000ms would silently trip the limiter once the
+        // burst budget is exhausted.
+        assert!(
+            INTER_REQUEST_DELAY >= Duration::from_millis(1000),
+            "inter-request delay must be >= 1s to stay under the 60 req/min limit"
+        );
     }
 
     #[test]
