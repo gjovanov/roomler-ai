@@ -1593,6 +1593,26 @@ async fn media_pump_vp9_444_dc(
     let mut send_errors: u64 = 0;
     let mut dc_unopen_drops: u64 = 0;
     let mut frames_skipped_backpressure: u64 = 0;
+    let mut scene_change_keyframes: u64 = 0;
+
+    // rc.39 — agent-side scene-change keyframe trigger. PC50045
+    // field test 2026-05-17 (rc.38) reported "3s to crystallize" on
+    // window-uncover events (Outlook open, Notepad++ maximize) because
+    // libvpx's screen-content scene-detect is conservative and our
+    // periodic kf_max_dist at observed actual fps was ~10 s. Heuristic
+    // here: after each encode, if the latest delta packet's size
+    // exceeds 4× the recent average AND a minimum absolute threshold,
+    // we assume a scene-change happened (encoder needed lots of new
+    // bits). Force a keyframe on the NEXT frame so the operator sees
+    // a clean refresh within 2 frames instead of waiting for the
+    // periodic IDR.
+    //
+    // Ring buffer of recent delta-frame sizes (skip the keyframes
+    // themselves, which are naturally large).
+    let mut recent_delta_sizes: std::collections::VecDeque<usize> =
+        std::collections::VecDeque::with_capacity(30);
+    const SCENE_CHANGE_SPIKE_RATIO: usize = 4;
+    const SCENE_CHANGE_MIN_BYTES: usize = 50_000;
 
     // rc.33 — bitrate / quality state. Pre-rc.33 the encoder ran at
     // its `DEFAULT_BITRATE_BPS = 8 Mbps` ceiling regardless of source
@@ -1758,6 +1778,49 @@ async fn media_pump_vp9_444_dc(
         };
         frames_encoded += packets.len() as u64;
 
+        // rc.39 — scene-change detection. Inspect each delta packet's
+        // size against the rolling average; on a sufficient spike,
+        // arm keyframe_requested so the *next* encode emits an IDR.
+        // Recovery becomes 2 frames (1 oversized delta + 1 sharp IDR)
+        // instead of waiting up to kf_max_dist frames.
+        let mut should_force_kf = false;
+        for pkt in &packets {
+            if pkt.is_keyframe {
+                // A keyframe just landed (likely the periodic IDR or
+                // a previous scene-change trigger). Reset the rolling
+                // window — keyframe sizes would skew the average for
+                // many seconds.
+                recent_delta_sizes.clear();
+                continue;
+            }
+            let size = pkt.data.len();
+            if !recent_delta_sizes.is_empty() {
+                let sum: usize = recent_delta_sizes.iter().sum();
+                let avg = sum / recent_delta_sizes.len();
+                if avg > 0
+                    && size >= SCENE_CHANGE_MIN_BYTES
+                    && size > avg * SCENE_CHANGE_SPIKE_RATIO
+                {
+                    should_force_kf = true;
+                    tracing::info!(
+                        %session_id,
+                        size,
+                        avg,
+                        ratio = size as f32 / avg as f32,
+                        "VP9-444 scene-change detected (delta-size spike) — forcing keyframe next frame"
+                    );
+                }
+            }
+            recent_delta_sizes.push_back(size);
+            if recent_delta_sizes.len() > 30 {
+                recent_delta_sizes.pop_front();
+            }
+        }
+        if should_force_kf {
+            keyframe_requested.store(true, std::sync::atomic::Ordering::Relaxed);
+            scene_change_keyframes += 1;
+        }
+
         // Pull the DC handle once per frame. `try_lock` would race
         // with the on_data_channel callback that stashes it; the
         // contention here is microseconds.
@@ -1910,6 +1973,7 @@ async fn media_pump_vp9_444_dc(
                 frames_captured, frames_encoded, frames_sent, bytes_written,
                 send_errors, dc_unopen_drops,
                 frames_skipped_backpressure,
+                scene_change_keyframes,
                 target_bps = last_applied_bitrate,
                 "VP9-444 DC pump heartbeat (≈1s window)"
             );

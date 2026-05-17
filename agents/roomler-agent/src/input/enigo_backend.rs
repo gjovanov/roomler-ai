@@ -171,14 +171,51 @@ fn map_button(b: Button) -> EnigoButton {
 /// agent's primary display. Multi-monitor mapping (`mon` > 0) picks the
 /// monitor from enigo's enumeration; on single-monitor hosts it falls
 /// back to primary. Out-of-range values are clamped.
-fn to_pixels(enigo: &Enigo, x: f32, y: f32, _mon: u8) -> (i32, i32) {
+///
+/// rc.39 — rate-limited diagnostic logging at INFO level for the first
+/// 50 dispatches per process. PC50045 / CLK00017265 field test 2026-05-17
+/// shows mouse positioned wrong even after rc.38's aspect-preserving
+/// downscale + skip-first-frame fixes. Suspect a coord-system mismatch
+/// between enigo.main_display() (returns OS-reported logical pixels,
+/// possibly DPI-virtualised) and the capture surface (device pixels).
+/// The first 50 events surface the actual numbers in agent logs;
+/// remaining events drop to debug level to avoid spam.
+fn to_pixels(enigo: &Enigo, x: f32, y: f32, mon: u8) -> (i32, i32) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static DIAG_COUNT: AtomicU32 = AtomicU32::new(0);
+    const DIAG_INFO_LIMIT: u32 = 50;
+
     let (w, h) = enigo.main_display().unwrap_or((1920, 1080));
-    let x = x.clamp(0.0, 1.0);
-    let y = y.clamp(0.0, 1.0);
-    (
-        (x * (w - 1) as f32).round() as i32,
-        (y * (h - 1) as f32).round() as i32,
-    )
+    let x_clamped = x.clamp(0.0, 1.0);
+    let y_clamped = y.clamp(0.0, 1.0);
+    let px = (x_clamped * (w - 1) as f32).round() as i32;
+    let py = (y_clamped * (h - 1) as f32).round() as i32;
+    let count = DIAG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if count < DIAG_INFO_LIMIT {
+        tracing::info!(
+            norm_x = x_clamped,
+            norm_y = y_clamped,
+            display_w = w,
+            display_h = h,
+            px,
+            py,
+            mon,
+            seq = count,
+            "input dispatch — diagnostic (first 50 events)"
+        );
+    } else {
+        tracing::debug!(
+            norm_x = x_clamped,
+            norm_y = y_clamped,
+            display_w = w,
+            display_h = h,
+            px,
+            py,
+            mon,
+            "input dispatch"
+        );
+    }
+    (px, py)
 }
 
 /// Convert a browser `WheelEvent` delta into enigo scroll "notches".
