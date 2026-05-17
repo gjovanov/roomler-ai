@@ -18,8 +18,8 @@ use roomler_agent::dpi;
 #[cfg(target_os = "windows")]
 use roomler_agent::win_service;
 use roomler_agent::{
-    config, encode, enrollment, instance_lock, logging, machine, notify, post_install, preflight,
-    service, signaling, updater, watchdog,
+    config, crash_uploader, encode, enrollment, instance_lock, logging, machine, notify,
+    post_install, preflight, service, signaling, updater, watchdog,
 };
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -836,6 +836,20 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         tracing::info!(kept, swept, "rc19: partial-registry warm-up");
     }
 
+    // Task 9 Phase 1C: drain any crash sidecars left by previous
+    // crash-loop iterations. Best-effort + sequential so a fleet
+    // reboot doesn't burst the ingest endpoint. Runs in parallel
+    // with the signaling loop (no need to gate on first-WS-OK in
+    // v1; if the network is offline the HTTP POST fails fast +
+    // sidecars stay on disk for the next startup). Snapshots
+    // `cfg` BEFORE `signaling::run` consumes it.
+    let crash_drain_task = tokio::spawn({
+        let cfg = cfg.clone();
+        async move {
+            crash_uploader::drain_and_upload(&cfg).await;
+        }
+    });
+
     let sig_task = tokio::spawn({
         let rx = shutdown_rx.clone();
         async move { signaling::run(cfg, encoder_preference, rx).await }
@@ -930,6 +944,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     }
     wd_task.abort();
     clean_run_task.abort();
+    crash_drain_task.abort();
     if let Some(t) = upd_task {
         t.abort();
     }
