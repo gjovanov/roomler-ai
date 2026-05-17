@@ -137,7 +137,9 @@ impl From<AgentCrashRecord> for AgentCrashView {
 /// malformed.
 fn extract_bearer(headers: &HeaderMap) -> Option<&str> {
     let v = headers.get(AUTHORIZATION)?.to_str().ok()?;
-    let token = v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer "))?;
+    let token = v
+        .strip_prefix("Bearer ")
+        .or_else(|| v.strip_prefix("bearer "))?;
     let trimmed = token.trim();
     if trimmed.is_empty() {
         None
@@ -150,7 +152,9 @@ fn extract_bearer(headers: &HeaderMap) -> Option<&str> {
 /// failure so the response is 422 not 400.
 fn validate_payload(payload: &AgentCrashPayload) -> Result<(), ApiError> {
     if payload.summary.trim().is_empty() {
-        return Err(ApiError::Validation("summary must not be empty".to_string()));
+        return Err(ApiError::Validation(
+            "summary must not be empty".to_string(),
+        ));
     }
     if payload.log_tail.len() > MAX_LOG_TAIL_BYTES {
         return Err(ApiError::Validation(format!(
@@ -225,7 +229,10 @@ mod tests {
     #[test]
     fn extract_bearer_returns_none_on_wrong_scheme() {
         let mut h = HeaderMap::new();
-        h.insert(AUTHORIZATION, HeaderValue::from_static("Basic Zm9vOmJhcg=="));
+        h.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Basic Zm9vOmJhcg=="),
+        );
         assert_eq!(extract_bearer(&h), None);
     }
 
