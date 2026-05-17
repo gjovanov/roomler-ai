@@ -185,7 +185,17 @@ impl Vp9Encoder {
         cfg.g_input_bit_depth = 8;
         cfg.kf_mode = vpx::vpx_kf_mode::VPX_KF_AUTO;
         cfg.kf_min_dist = 0;
-        cfg.kf_max_dist = KEYFRAME_INTERVAL;
+        // rc.38 — scale kf_max_dist with target_fps so time-between-IDRs
+        // stays roughly constant (~3 s) regardless of the actual
+        // encoder frame rate. Field-observed on PC50045 (rc.36): with
+        // target_fps=60 but encoder-bound at 17 actual fps, a 240-frame
+        // kf_max_dist meant ~14 s between IDRs and visible "blur takes
+        // >1s to clear" on window-uncover events. KEYFRAME_INTERVAL
+        // is kept as a sanity floor in case target_fps is somehow zero.
+        let kf_max_dist = (target_fps.saturating_mul(3))
+            .max(60)
+            .min(KEYFRAME_INTERVAL);
+        cfg.kf_max_dist = kf_max_dist;
         // Real-time-friendly buffer sizing: 1s buffer at target bitrate
         // with a 0.5s initial / optimal floor. Matches RustDesk's defaults.
         cfg.rc_buf_sz = 1000;

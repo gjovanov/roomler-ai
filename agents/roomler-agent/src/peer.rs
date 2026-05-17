@@ -1187,50 +1187,85 @@ async fn media_pump(
                 let backend_is_sw = !enc_ref.is_hardware();
                 // Tier the downscale by codec weight. HEVC + AV1
                 // SW encode is ~3x heavier than H.264, so cap them
-                // hard at 1080p. H.264 SW is faster but 1920x1200
+                // hard at 1080p-class. H.264 SW is faster but 1920x1200
                 // at 30 fps still eats ~21 ms / frame on an Intel
                 // iGPU — close to our 33 ms budget and leaving no
-                // headroom for capture jitter (field log
-                // 2026-04-27 from RoziLaptop -> Schetovodstvo-PZ
-                // showed exactly that pattern: smooth 30 fps math
-                // but visibly sluggish to the operator). Drop H.264
-                // SW above 720p down to 1280x720 where encode is
-                // comfortably under 12 ms / frame.
+                // headroom for capture jitter. Drop H.264 SW above
+                // 720p-class down to a 720p-equivalent where encode
+                // is comfortably under 12 ms / frame.
+                //
+                // rc.38 — preserve source aspect when picking the
+                // target. Pre-rc.38 used fixed 1920x1080 / 1280x720
+                // targets which stretch a 16:10 source (1920x1200
+                // panels, common on ThinkPads + ProBooks) into 16:9,
+                // visibly distorting the captured desktop and shifting
+                // the apparent positions of UI elements. Browsers also
+                // get a track-size jolt on the first→second-frame
+                // resolution flip that confuses `<video>.videoWidth`
+                // and lands clicks at the wrong OS coordinate.
+                // Aspect-preserving target eliminates both.
+                fn aspect_preserved_target(
+                    src_w: u32,
+                    src_h: u32,
+                    cap_long_edge: u32,
+                ) -> (u32, u32) {
+                    if src_w == 0 || src_h == 0 {
+                        return (cap_long_edge, cap_long_edge * 9 / 16);
+                    }
+                    let long = src_w.max(src_h);
+                    if long <= cap_long_edge {
+                        return (src_w, src_h);
+                    }
+                    let num = cap_long_edge as u64;
+                    let new_w = ((src_w as u64) * num / long as u64) as u32;
+                    let new_h = ((src_h as u64) * num / long as u64) as u32;
+                    // Encoders require even dims; round DOWN to nearest even.
+                    (new_w & !1, new_h & !1)
+                }
                 let heavy_codec = chosen_codec == "h265" || chosen_codec == "av1";
                 let h264 = chosen_codec == "h264";
                 let above_1080p =
                     (frame.width as u64) * (frame.height as u64) > (1920u64 * 1080u64);
                 let above_720p = (frame.width as u64) * (frame.height as u64) > (1280u64 * 720u64);
+                let mut auto_downscale_just_fired = false;
                 if backend_is_sw && heavy_codec && above_1080p {
+                    let (tw, th) = aspect_preserved_target(frame.width, frame.height, 1920);
                     let mut guard = target_resolution.lock().unwrap();
                     if matches!(*guard, TargetResolution::Native) {
                         *guard = TargetResolution::Fixed {
-                            width: 1920,
-                            height: 1080,
+                            width: tw,
+                            height: th,
                         };
+                        auto_downscale_just_fired = true;
                         tracing::warn!(
                             %session_id,
                             native_w = frame.width,
                             native_h = frame.height,
+                            target_w = tw,
+                            target_h = th,
                             codec = %chosen_codec,
                             encoder = enc_ref.name(),
-                            "auto-downscale: SW heavy codec on high-res source — capping capture at 1920x1080 to preserve fps. Operator can override via rc:resolution."
+                            "auto-downscale: SW heavy codec on high-res source — capping capture at aspect-preserved ≤1920 long-edge to preserve fps. Operator can override via rc:resolution."
                         );
                     }
                 } else if backend_is_sw && h264 && above_720p {
+                    let (tw, th) = aspect_preserved_target(frame.width, frame.height, 1280);
                     let mut guard = target_resolution.lock().unwrap();
                     if matches!(*guard, TargetResolution::Native) {
                         *guard = TargetResolution::Fixed {
-                            width: 1280,
-                            height: 720,
+                            width: tw,
+                            height: th,
                         };
+                        auto_downscale_just_fired = true;
                         tracing::warn!(
                             %session_id,
                             native_w = frame.width,
                             native_h = frame.height,
+                            target_w = tw,
+                            target_h = th,
                             codec = %chosen_codec,
                             encoder = enc_ref.name(),
-                            "auto-downscale: SW H.264 on high-res source — capping capture at 1280x720 so encode stays under the 33 ms 30-fps budget. Operator can override via rc:resolution."
+                            "auto-downscale: SW H.264 on high-res source — capping capture at aspect-preserved ≤1280 long-edge so encode stays under the 33 ms 30-fps budget. Operator can override via rc:resolution."
                         );
                     }
                 }
@@ -1264,6 +1299,34 @@ async fn media_pump(
                     target_fps = new_fps;
                     frame_duration_floor = Duration::from_micros(1_000_000 / target_fps as u64);
                     capturer = capture::open_default(target_fps, downscale);
+                }
+
+                // rc.38 — when auto-downscale changes target_resolution
+                // from Native → Fixed, the encoder we just built is at
+                // the NATIVE dims and would emit a first frame at those
+                // dims. The next loop iteration would then downscale +
+                // rebuild the encoder, causing the WebRTC track to see
+                // a frame-1 → frame-2 resolution flip. Chrome's
+                // `<video>.videoWidth` latches to frame-1 dims and the
+                // browser-side input normalisation (letterboxedNormalise)
+                // then uses a stale aspect ratio against the actual
+                // rendered surface — clicks land at wrong OS pixels
+                // (PC50045 field bug 2026-05-17).
+                //
+                // Fix: drop the native-dim encoder + skip writing this
+                // frame to the track. The next iteration will rebuild
+                // at the downscaled dims and emit frame-1 there. Costs
+                // one captured frame's latency at session start
+                // (~30 ms); track never sees a resize.
+                if auto_downscale_just_fired {
+                    encoder = None;
+                    encoder_dims = None;
+                    keyframe_requested.store(true, std::sync::atomic::Ordering::Relaxed);
+                    tracing::info!(
+                        %session_id,
+                        "auto-downscale fired on first encoder build — dropping native-dim encoder so the track's first frame is at the downscaled dims (avoids browser videoWidth resize race)"
+                    );
+                    continue;
                 }
             }
         }
@@ -2215,10 +2278,22 @@ fn attach_cursor_handler(dc: Arc<RTCDataChannel>, session_id: bson::oid::ObjectI
         // just-constructed RTCDataChannel hasn't completed the SCTP
         // handshake yet.
         let mut tracker = crate::capture::cursor::CursorTracker::new();
-        // ~30 Hz matches the capture pacing. Browsers smooth out any
-        // jitter via RAF; tighter intervals would just burn DC
-        // bandwidth for sub-pixel moves.
-        let mut ticker = tokio::time::interval(Duration::from_millis(33));
+        // rc.38 — bumped 33 ms (30 Hz) → 8 ms (120 Hz) after PC50045
+        // field test 2026-05-17 surfaced sluggish cursor tracking even
+        // when the controller's local pointermove was timely.
+        // Operator perceives "where the cursor is" via:
+        //   (a) the synthetic local cursor at the controller's
+        //       pointermove position (instant), and
+        //   (b) the remote-reported cursor canvas at the agent's
+        //       polled position (this poller's cadence).
+        // The browser hides (a) once (b) reports a shape, so the
+        // poller's cadence dominates "feels-responsive" once the
+        // first cursor shape arrives. 120 Hz matches RustDesk and is
+        // cheap: each tick is one GetCursorInfo + JSON encode + DC
+        // send_text, well under 1 ms even on weak hosts. Idle frames
+        // dedupe via the tracker's per-shape cache so we don't burn
+        // DC bandwidth on a static cursor.
+        let mut ticker = tokio::time::interval(Duration::from_millis(8));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // Emit cursor:hide once when the cursor disappears so the
         // browser can clear its overlay; don't keep re-emitting.
