@@ -214,6 +214,41 @@ enum Command {
     /// `ImagePath` argv.
     #[command(hide = true, name = "service-run")]
     ServiceRun,
+    /// Write a single `name=value` entry into the `RoomlerAgentService`
+    /// SCM `Environment` REG_MULTI_SZ block. Closes the docs gap from
+    /// CLAUDE.md / HANDOVER23 / the wizard's Done-page PowerShell
+    /// snippet that referenced this subcommand before it had a CLI
+    /// surface. Reuses the `win_service::environment` helpers that
+    /// shipped in rc.27. Pair with `restart-service` so the change
+    /// applies on the next process start. Windows-only. Requires
+    /// admin (HKLM write).
+    ///
+    /// Typical use:
+    ///   roomler-agent set-service-env-var --name ROOMLER_AGENT_VP9_FPS --value 60
+    ///   roomler-agent restart-service
+    #[command(name = "set-service-env-var")]
+    SetServiceEnvVar {
+        /// Env var name (e.g. `ROOMLER_AGENT_VP9_FPS`,
+        /// `ROOMLER_AGENT_VP9_CPU_USED`, `ROOMLER_AGENT_ENABLE_SYSTEM_SWAP`).
+        #[arg(long)]
+        name: String,
+        /// Env var value. Empty string is allowed (stored as
+        /// `name=`). To REMOVE an entry, omit `--value`.
+        #[arg(long)]
+        value: Option<String>,
+    },
+    /// Restart the `RoomlerAgentService` via the SCM. Used after
+    /// `set-service-env-var` to apply the new env block. Windows-only;
+    /// requires admin (SCM Stop+Start). Worst-case wall-time is
+    /// `2 × --timeout-secs`.
+    #[command(name = "restart-service")]
+    RestartService {
+        /// Per-transition timeout in seconds (Stop → Stopped, then
+        /// Start → Running). Default 120 s — comfortable for Windows
+        /// Defender real-time-scan-during-fresh-EXE-launch.
+        #[arg(long, default_value_t = 120)]
+        timeout_secs: u64,
+    },
     /// (internal) Watch a running installer process and record its
     /// exit code + the new binary's version to `last-install.json`.
     /// Spawned automatically by the updater immediately before the
@@ -368,6 +403,10 @@ async fn main() -> Result<()> {
         Command::PeerPresenceStatus => peer_presence_status_cmd(),
         Command::Service { action } => service_cmd(action).await,
         Command::ServiceRun => service_run_cmd().await,
+        Command::SetServiceEnvVar { name, value } => {
+            set_service_env_var_cmd(&name, value.as_deref())
+        }
+        Command::RestartService { timeout_secs } => restart_service_cmd(timeout_secs),
         Command::CleanupLegacyInstall {
             target_flavour,
             dry_run,
@@ -1048,6 +1087,47 @@ async fn service_run_cmd() -> Result<()> {
 #[cfg(not(target_os = "windows"))]
 async fn service_run_cmd() -> Result<()> {
     bail!("`service-run` is Windows-only — invoked by the SCM, not directly by operators.");
+}
+
+#[cfg(target_os = "windows")]
+fn set_service_env_var_cmd(name: &str, value: Option<&str>) -> Result<()> {
+    use crate::win_service::environment;
+    match value {
+        Some(v) => {
+            environment::set_service_env_var(name, v)
+                .with_context(|| format!("set-service-env-var: {name}={v}"))?;
+            println!(
+                "{name}={v} written to SCM service env block. Run `roomler-agent restart-service` to apply."
+            );
+        }
+        None => {
+            environment::unset_service_env_var(name)
+                .with_context(|| format!("unset-service-env-var: {name}"))?;
+            println!(
+                "{name} removed from SCM service env block. Run `roomler-agent restart-service` to apply."
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn set_service_env_var_cmd(_name: &str, _value: Option<&str>) -> Result<()> {
+    bail!("`set-service-env-var` is Windows-only.");
+}
+
+#[cfg(target_os = "windows")]
+fn restart_service_cmd(timeout_secs: u64) -> Result<()> {
+    use crate::win_service::environment;
+    environment::restart_service(std::time::Duration::from_secs(timeout_secs))
+        .with_context(|| format!("restart-service (timeout {timeout_secs}s per transition)"))?;
+    println!("RoomlerAgentService restarted; service now inherits the latest env block.");
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn restart_service_cmd(_timeout_secs: u64) -> Result<()> {
+    bail!("`restart-service` is Windows-only.");
 }
 
 async fn self_update_cmd(check_only: bool) -> Result<()> {

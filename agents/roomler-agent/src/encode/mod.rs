@@ -74,10 +74,24 @@ pub(crate) fn initial_bitrate_for(width: u32, height: u32) -> u32 {
 /// minimum so a collapsing REMB signal can't drop encode quality into
 /// unusability while the link is still technically up.
 pub const MIN_BITRATE_BPS: u32 = 1_500_000;
-pub const MAX_BITRATE_BPS: u32 = 25_000_000;
+/// MAX bumped 25→40 Mbps in rc.36. Field-confirmed (PC50045) that
+/// rc.35 at 1920×1200 Quality=High was content-bound around 13 Mbps,
+/// well under the 25 Mbps cap — but `Quality=High × 1.5` math could
+/// land above 25 Mbps at 4K@60 and was getting clipped. Lifting the
+/// MAX gives Quality=High more room before the post-multiply clamp
+/// in `quality::target_bitrate` kicks in, and gives the AIMD's
+/// additive-increase headroom on the DC backpressure controller.
+pub const MAX_BITRATE_BPS: u32 = 40_000_000;
 
 pub(crate) fn initial_bitrate_for_fps(width: u32, height: u32, fps: u32) -> u32 {
-    const DESKTOP_BPP_PER_SECOND: f64 = 0.15;
+    // bpp/s bumped 0.15 → 0.20 in rc.36. RustDesk's published default is
+    // ≈ 0.14–0.18; field reports (PC50045, CLK00017265, 2026-05-17)
+    // showed that 0.15 left desktop content visibly under-bitted at
+    // 1920×1200 — fine text on Outlook / Start menu / Notepad++ took
+    // multiple frames to sharpen after a window-uncover event. 0.20
+    // gives the encoder ~33 % more bits, which combined with the
+    // restored 240-frame keyframe interval lets a refresh land sharp.
+    const DESKTOP_BPP_PER_SECOND: f64 = 0.20;
     let pixels = width as f64 * height as f64;
     let raw = (pixels * fps as f64 * DESKTOP_BPP_PER_SECOND) as u32;
     raw.clamp(MIN_BITRATE_BPS, MAX_BITRATE_BPS)

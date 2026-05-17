@@ -139,12 +139,18 @@ mod quality {
 
     /// Map a quality preference to the bitrate target, scaled off the
     /// resolution-derived baseline. Low halves it (better fit for
-    /// metered uplinks), High adds 50%. Ceiling lifted 20 → 30 Mbps in
-    /// the RustDesk-parity sprint so 4K60 HEVC at High can actually
-    /// hit the 25 Mbps the base provides and still leave headroom
-    /// for burst bits on a GOP boundary.
+    /// metered uplinks), High adds 50%. Ceiling lifted 30 → 50 Mbps in
+    /// rc.36 (PC50045 / CLK00017265 field test 2026-05-17) after the
+    /// rc.33–rc.35 cycles still left fine-text legibility worse than
+    /// RustDesk on common screen-content events (window-uncover,
+    /// Outlook open). At 4K60 + High the resolution-derived base
+    /// (`0.20 bpp × 3840×2160×60 ≈ 99.5 Mbps`) clamps to the
+    /// `MAX_BITRATE_BPS = 40 Mbps` cap on the way in; `× 1.5` for
+    /// High then lands on 50 Mbps after the post-multiply clamp —
+    /// generous enough that scene-change frames can splurge without
+    /// hitting the rate-control ceiling.
     pub(super) fn target_bitrate(quality: u8, base_bps: u32) -> u32 {
-        const MAX_HIGH_BPS: u32 = 30_000_000;
+        const MAX_HIGH_BPS: u32 = 50_000_000;
         match quality {
             LOW => (base_bps / 2).max(500_000),
             HIGH => base_bps.saturating_mul(3) / 2,
@@ -1830,8 +1836,14 @@ async fn media_pump_vp9_444_dc(
         }
 
         if frames_encoded.is_multiple_of(30) {
+            // rc.36 — surface target_fps so field operators can verify
+            // ROOMLER_AGENT_VP9_FPS env-var was honored. If target_fps
+            // shows 30 when the operator set 60, the env var didn't
+            // reach the agent process (wrong service-block scope, or
+            // process wasn't restarted to inherit the new block).
             info!(
                 %session_id,
+                target_fps,
                 frames_captured, frames_encoded, frames_sent, bytes_written,
                 send_errors, dc_unopen_drops,
                 frames_skipped_backpressure,

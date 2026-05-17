@@ -55,13 +55,28 @@ use vpx_sys as vpx;
 /// first set_bitrate lands (typically the same loop iteration).
 const DEFAULT_BITRATE_BPS: u32 = 8_000_000;
 
-/// Keyframe interval in frames. Effectively disabled (`u32::MAX`) so
-/// the encoder never emits a periodic IDR. RustDesk-parity: the
-/// browser viewer drives intermediate IDRs via `rc:vp9.request_keyframe`
-/// when the decoder errors, after a long gap, or on lock/unlock
-/// transitions. Removes the 8 s competing-bit-budget glitch on motion
-/// frames that pre-rc.33 builds had right around the IDR boundary.
-const KEYFRAME_INTERVAL: u32 = u32::MAX;
+/// Keyframe interval in frames. 240 frames ≈ 8 s at 30 fps / 4 s at
+/// 60 fps. Restored in rc.36 after the rc.33 `u32::MAX` value turned
+/// out to produce visible "uncover-then-stabilise" blur on common
+/// screen-content events (window maximize, app launch, Outlook open).
+///
+/// Why u32::MAX wasn't enough on its own (rc.33→rc.35): libvpx's
+/// screen-content tune has internal scene-change detection that *can*
+/// force an IDR on uncovered content, but its threshold is conservative
+/// and we observed it not firing on common cases (window-restore,
+/// notification toast, modal open). The post-event frame budget is
+/// then spread across many deltas — each delta progressively adds
+/// detail, producing the "blurry at first, sharp after a second" UX.
+///
+/// Restoring the periodic IDR every 240 frames is the simplest fix:
+/// trades ~100 kbps of overhead for a hard quality-refresh floor.
+/// Field-confirmed (PC50045 / CLK00017265, 2026-05-17).
+///
+/// Followup if this still leaves visible blur on rapid scene changes:
+/// switch from `VPX_CBR` to `VPX_VBR` so the encoder can burst above
+/// target on scene-change frames + dial in `VP9E_SET_CQ_LEVEL` for
+/// content-aware QP.
+const KEYFRAME_INTERVAL: u32 = 240;
 
 /// Microsecond timebase numerator/denominator. PTS values are passed in
 /// directly as microseconds.
