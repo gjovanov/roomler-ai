@@ -126,4 +126,42 @@ describe('useAgentStore', () => {
     })
     expect(s.agents[0]!.access_policy).toEqual(policy)
   })
+
+  // ─── Task 9 Phase 3: crash-report fetch ────────────────────────
+
+  it('fetchCrashes GETs the tenant-scoped per-agent endpoint and unwraps items', async () => {
+    mockApi.get.mockResolvedValueOnce({
+      items: [
+        {
+          id: 'cr1',
+          reportedAt: '2026-05-17T12:00:00Z',
+          crashedAtUnix: 1779192000,
+          reason: 'panic',
+          summary: 'index out of bounds',
+          logTail: 'line 1\nline 2',
+          agentVersion: '0.3.0-rc.35',
+          os: 'windows',
+          hostname: 'PC50045',
+          pid: 4567,
+        },
+      ],
+    })
+    const s = useAgentStore()
+    const out = await s.fetchCrashes(TENANT_ID, 'a1')
+    expect(mockApi.get).toHaveBeenCalledWith(`/tenant/${TENANT_ID}/agent/a1/crash`)
+    expect(out).toHaveLength(1)
+    expect(out[0]!.reason).toBe('panic')
+    expect(out[0]!.summary).toBe('index out of bounds')
+  })
+
+  it('fetchCrashes propagates errors (callers handle locally, not in store)', async () => {
+    mockApi.get.mockRejectedValueOnce(new Error('403 forbidden'))
+    const s = useAgentStore()
+    await expect(s.fetchCrashes(TENANT_ID, 'a1')).rejects.toThrow('403 forbidden')
+    // Store-level state (agents.error/loading) is NOT mutated by
+    // fetchCrashes; the modal holds its own local loading + error
+    // state.
+    expect(s.error).toBeNull()
+    expect(s.loading).toBe(false)
+  })
 })

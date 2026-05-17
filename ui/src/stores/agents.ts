@@ -65,6 +65,29 @@ interface AgentListResponse {
   total_pages: number
 }
 
+/** One agent-side crash report. Wire shape comes from
+ *  `crates/remote_control/src/models.rs::AgentCrashPayload` (camelCase)
+ *  plus server-attributed `id` + `reportedAt`. Reason values are the
+ *  snake_case Rust enum discriminants (`panic` / `watchdog_stall` /
+ *  `supervisor_detected`) — the chip-colour map in
+ *  AgentCrashesDialog.vue keys off these EXACT strings. */
+export interface AgentCrash {
+  id: string
+  reportedAt: string
+  crashedAtUnix: number
+  reason: 'panic' | 'watchdog_stall' | 'supervisor_detected'
+  summary: string
+  logTail: string
+  agentVersion: string
+  os: string
+  hostname: string
+  pid: number
+}
+
+interface AgentCrashListResponse {
+  items: AgentCrash[]
+}
+
 export const useAgentStore = defineStore('agents', () => {
   const agents = ref<Agent[]>([])
   const total = ref(0)
@@ -113,6 +136,21 @@ export const useAgentStore = defineStore('agents', () => {
     total.value = Math.max(0, total.value - 1)
   }
 
+  /** Fetch the most-recent 50 crash reports for an agent. No store
+   *  caching — callers (AgentCrashesDialog) hold the result locally
+   *  and refresh on demand via the modal's Refresh button. The
+   *  endpoint is tenant-scoped on both sides; a foreign agentId
+   *  returns an empty array, not an error. */
+  async function fetchCrashes(
+    tenantId: string,
+    agentId: string,
+  ): Promise<AgentCrash[]> {
+    const resp = await api.get<AgentCrashListResponse>(
+      `/tenant/${tenantId}/agent/${agentId}/crash`,
+    )
+    return resp.items
+  }
+
   return {
     agents,
     total,
@@ -123,5 +161,6 @@ export const useAgentStore = defineStore('agents', () => {
     rename,
     updateAccessPolicy,
     deleteAgent,
+    fetchCrashes,
   }
 })
