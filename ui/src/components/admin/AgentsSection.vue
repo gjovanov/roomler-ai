@@ -67,6 +67,15 @@
                 :aria-label="`Connect to agent ${a.name}`"
               />
               <v-btn
+                icon="mdi-alert-circle-outline"
+                size="small"
+                variant="text"
+                color="warning"
+                @click="openCrashes(a)"
+                :aria-label="`View crash reports for ${a.name}`"
+                title="Crash reports"
+              />
+              <v-btn
                 icon="mdi-delete"
                 size="small"
                 variant="text"
@@ -217,6 +226,14 @@
                 Connect
               </v-btn>
               <v-btn
+                icon="mdi-alert-circle-outline"
+                size="small"
+                variant="text"
+                color="warning"
+                @click="openCrashes(a)"
+                :aria-label="`View crash reports for ${a.name}`"
+              />
+              <v-btn
                 icon="mdi-delete"
                 size="small"
                 variant="text"
@@ -285,6 +302,14 @@
     </v-card>
   </v-dialog>
 
+  <!-- Crash reports modal -->
+  <AgentCrashesDialog
+    v-model="crashesDialogOpen"
+    :tenant-id="tenantId"
+    :agent-id="crashesTarget?.id ?? ''"
+    :agent-name="crashesTarget?.name ?? ''"
+  />
+
   <!-- Delete confirmation -->
   <v-dialog v-model="deleteDialogOpen" max-width="440">
     <v-card>
@@ -310,6 +335,7 @@ import { ref, onMounted, watch } from 'vue'
 import { useDisplay } from 'vuetify'
 import { useAgentStore, type Agent, type EnrollmentToken } from '@/stores/agents'
 import { codecChips } from './agentCodecChips'
+import AgentCrashesDialog from './AgentCrashesDialog.vue'
 
 const props = defineProps<{ tenantId: string }>()
 
@@ -329,6 +355,16 @@ const copied = ref(false)
 const deleteDialogOpen = ref(false)
 const deleteTarget = ref<Agent | null>(null)
 const deleting = ref(false)
+
+// Crash-reports modal state (Task 9 Phase 3). Re-fetches on open via
+// the dialog's own watcher; no caching here.
+const crashesDialogOpen = ref(false)
+const crashesTarget = ref<Agent | null>(null)
+
+function openCrashes(a: Agent) {
+  crashesTarget.value = a
+  crashesDialogOpen.value = true
+}
 
 function osIcon(os: string) {
   switch (os) {
