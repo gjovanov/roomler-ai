@@ -140,7 +140,9 @@ impl AppState {
         let agents = Arc::new(AgentDao::new(&db));
         let remote_sessions = Arc::new(RemoteSessionDao::new(&db));
         let remote_audit = Arc::new(RemoteAuditDao::new(&db));
-        let agent_crashes = Arc::new(roomler_ai_services::dao::agent_crash::AgentCrashDao::new(&db));
+        let agent_crashes = Arc::new(roomler_ai_services::dao::agent_crash::AgentCrashDao::new(
+            &db,
+        ));
 
         let turn_cfg = build_turn_config(&settings.turn);
         let (audit_sink, _audit_handle) = AuditSink::spawn(db.clone());

@@ -51,7 +51,8 @@ fn fresh_payload() -> AgentCrashPayload {
         crashed_at_unix: chrono::Utc::now().timestamp(),
         reason: CrashReason::Panic,
         summary: "test crash".to_string(),
-        log_tail: "2026-05-17T12:00:00Z INFO line one\n2026-05-17T12:00:01Z WARN line two".to_string(),
+        log_tail: "2026-05-17T12:00:00Z INFO line one\n2026-05-17T12:00:01Z WARN line two"
+            .to_string(),
         agent_version: "0.3.0-rc.35".to_string(),
         os: "linux".to_string(),
         hostname: "ci-host".to_string(),
