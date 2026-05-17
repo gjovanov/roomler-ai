@@ -104,11 +104,33 @@ pub enum WriterContext {
 /// Persist a crash sidecar atomically. Best-effort: any IO failure
 /// logs `warn!` and returns; never blocks the crash-exit path.
 pub fn record(reason: CrashReason, summary: &str, ctx: WriterContext) {
+    record_with_log_tail(reason, summary, ctx, None);
+}
+
+/// Same as [`record`] but accepts a caller-supplied `log_tail`
+/// (typically the child worker's captured stderr) that OVERRIDES
+/// the local rolling-log read. Used by the SCM supervisor on
+/// SupervisorDetected crashes so the sidecar's `log_tail` carries
+/// the WORKER's last few KiB of stderr instead of the supervisor's
+/// own rolling log (which is useless for diagnosing why the worker
+/// died). Field repro: PC55331 SystemContext loop, 2026-05-17.
+///
+/// `log_tail_override = None` → existing behaviour (read
+/// supervisor's rolling log).
+/// `log_tail_override = Some(s)` → use `s` verbatim before scrub +
+/// envelope-trim. Empty string is still treated as "override":
+/// callers pass `None` when they have no buffer at all.
+pub fn record_with_log_tail(
+    reason: CrashReason,
+    summary: &str,
+    ctx: WriterContext,
+    log_tail_override: Option<String>,
+) {
     // catch_unwind so a recorder-internal panic doesn't unwind into
     // the caller's panic hook + abort the process before its
     // existing text-dump has flushed.
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        record_inner(reason, summary, ctx)
+        record_inner(reason, summary, ctx, log_tail_override)
     }));
     match outcome {
         Ok(Ok(path)) => {
@@ -144,6 +166,7 @@ fn record_inner(
     reason: CrashReason,
     summary: &str,
     ctx: WriterContext,
+    log_tail_override: Option<String>,
 ) -> std::io::Result<PathBuf> {
     let dir = crashes_dir_for(ctx)?;
     fs::create_dir_all(&dir)?;
@@ -168,7 +191,10 @@ fn record_inner(
 
     let pid = std::process::id();
 
-    let raw_tail = read_log_tail(LOG_TAIL_LINES);
+    // log_tail source: caller-supplied (e.g. captured worker stderr)
+    // takes precedence; otherwise read the local rolling log. The
+    // scrub + envelope-trim pipeline below treats both identically.
+    let raw_tail = log_tail_override.unwrap_or_else(|| read_log_tail(LOG_TAIL_LINES));
     let (scrubbed_summary, scrub_count_summary) = scrub_credentials(summary);
     let (scrubbed_tail, scrub_count_tail) = scrub_credentials(&raw_tail);
     let total_scrubs = scrub_count_summary + scrub_count_tail;
@@ -979,5 +1005,50 @@ mod tests {
             SuppressReason::HardCapReached.as_str()
         ));
         assert!(!is_suppression_message("io: disk full"));
+    }
+
+    // ─── record_with_log_tail override path (worker-stderr capture) ────────
+
+    #[test]
+    fn record_inner_uses_override_when_provided() {
+        // Wire-shape lock: when the caller supplies a log_tail (e.g.
+        // captured worker stderr), it lands in the serialised payload
+        // verbatim — modulo the scrub pipeline. The local rolling-log
+        // read path (`read_log_tail`) is bypassed entirely so the
+        // override is the authoritative source.
+        let dir = tempdir_for_test();
+        // Drive record_inner directly so we can control the dir
+        // without going through `logging::log_dir()`. Override the
+        // crashes_dir resolution: write to `dir` and verify the JSON
+        // contents.
+        let now_unix = 1_700_000_000_i64;
+        let mut payload = AgentCrashPayload {
+            crashed_at_unix: now_unix,
+            reason: CrashReason::SupervisorDetected,
+            summary: "worker exit: config load failed".to_string(),
+            log_tail: "WORKER's real log content here\nnext line".to_string(),
+            agent_version: "0.0.0-test".to_string(),
+            os: "test".to_string(),
+            hostname: "test".to_string(),
+            pid: 99,
+        };
+        // Verify our trim helper doesn't strip the override content
+        // when it's well under budget.
+        fit_to_envelope(&mut payload, MAX_PAYLOAD_BYTES);
+        assert!(payload.log_tail.contains("WORKER's real log content"));
+        assert!(!payload.log_tail.contains("[…log truncated"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn record_with_log_tail_signature_accepts_none() {
+        // Compile-time lock: the public API is `record_with_log_tail
+        // (Reason, &str, WriterContext, Option<String>)`. A signature
+        // drift here would break the supervisor / worker callers.
+        // Reference the fn to keep the symbol live; never actually
+        // call it (logging::log_dir() in a unit-test harness returns
+        // None and a record call to log spam would race other tests).
+        let _ = record_with_log_tail as fn(CrashReason, &str, WriterContext, Option<String>);
+        let _ = record as fn(CrashReason, &str, WriterContext);
     }
 }

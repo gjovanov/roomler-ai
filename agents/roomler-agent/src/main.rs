@@ -382,7 +382,20 @@ async fn main() -> Result<()> {
         }
     };
 
-    match cli.command.unwrap_or(Command::Run { encoder: None }) {
+    let cmd = cli.command.unwrap_or(Command::Run { encoder: None });
+    // Only the worker subcommand (`Run`) is the one the SCM supervisor
+    // spawns + observes for crashes. On non-zero exit from that path,
+    // record a sidecar with the WORKER's log tail BEFORE returning so
+    // the supervisor's redundant SupervisorDetected sidecar (which
+    // would carry SUPERVISOR-side log noise, useless for diagnosing
+    // the worker failure) is suppressed by `crash_recorder`'s 30 s
+    // rate-limit. Field repro 2026-05-17 PC55331: the SystemContext
+    // worker was exiting code=1 right after the "couldn't resolve
+    // active-user profile" warning, but the admin UI only saw
+    // supervisor-side noise. With this hook the modal surfaces the
+    // worker's actual log tail.
+    let is_worker_run = matches!(cmd, Command::Run { .. });
+    let res = match cmd {
         Command::Enroll {
             server,
             token,
@@ -422,7 +435,52 @@ async fn main() -> Result<()> {
             installer_path,
             expected_version,
         } => post_install_watch_cmd(installer_pid, installer_path, expected_version).await,
+    };
+
+    #[cfg(target_os = "windows")]
+    if is_worker_run && let Err(ref err) = res {
+        record_worker_exit_failure(err);
     }
+    let _ = is_worker_run; // silence unused on non-windows
+    res
+}
+
+/// Record a `SupervisorDetected` crash sidecar when the worker
+/// `Run` subcommand returns Err and main is about to exit non-zero.
+/// Routed through `crash_recorder::record` so:
+///
+///   - Under SystemContext (LocalSystem worker), the sidecar lands in
+///     `%PROGRAMDATA%\roomler\roomler-agent\crashes\` where the
+///     user-context uploader will find it on a later successful start.
+///   - Under user-context worker, the sidecar lands in the worker's
+///     own `%LOCALAPPDATA%\roomler\…\crashes\` for the same uploader
+///     to scan.
+///
+/// The log_tail attached comes from `read_log_tail()` inside the
+/// recorder — that reads the WORKER's rolling log, which is the
+/// useful artifact for diagnosis (vs. the supervisor's later
+/// SupervisorDetected record which carries supervisor noise + is
+/// suppressed by the 30 s rate-limit).
+#[cfg(target_os = "windows")]
+fn record_worker_exit_failure(err: &anyhow::Error) {
+    use roomler_agent::crash_recorder::{self, Reason, WriterContext};
+
+    // Choose the writer context the user-context uploader will scan.
+    // Under LocalSystem (SystemContext worker): use PROGRAMDATA via
+    // WriterContext::Supervisor. Under user-context worker: use the
+    // worker's own LOCALAPPDATA via WriterContext::Worker.
+    #[cfg(feature = "system-context")]
+    let ctx = match roomler_agent::system_context::worker_role::probe_self() {
+        Ok(roomler_agent::system_context::worker_role::WorkerRole::SystemContext) => {
+            WriterContext::Supervisor
+        }
+        _ => WriterContext::Worker,
+    };
+    #[cfg(not(feature = "system-context"))]
+    let ctx = WriterContext::Worker;
+
+    let summary = format!("worker exit: {err:#}");
+    crash_recorder::record(Reason::SupervisorDetected, &summary, ctx);
 }
 
 /// Remove cross-flavour MSI install leftovers. Invoked by the WiX
