@@ -54,7 +54,8 @@
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use roomler_ai_remote_control::models::{AgentCrashPayload, CrashReason};
@@ -69,6 +70,22 @@ pub const MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 /// The tail is trimmed further inside [`record`] if the resulting
 /// JSON would exceed [`MAX_PAYLOAD_BYTES`].
 pub const LOG_TAIL_LINES: usize = 200;
+
+/// Minimum seconds between consecutive sidecar writes in the same
+/// dir. A tight crash-loop (e.g. SystemContext worker dying every
+/// 2s with `code=1`, field repro 2026-05-17 PC55331) would otherwise
+/// fill the dir with ~24 sidecars/minute. With this rate-limit one
+/// crash is recorded every 30s, capturing enough forensics + leaving
+/// the disk + log alone.
+pub const MIN_INTERVAL_SECS: i64 = 30;
+
+/// Hard cap on sidecars in a single dir. If the worker can never
+/// successfully start (and thus never run the uploader to drain),
+/// even the rate-limited writes would accumulate forever. 100 ×
+/// 64 KiB = 6.4 MB max disk impact per dir, which is generous for
+/// forensics but bounded. Beyond the cap, new records are dropped
+/// silently with a once-per-minute throttled WARN.
+pub const HARD_CAP: usize = 100;
 
 /// Where to persist the sidecar. See the module-level docs for the
 /// path resolution + the rationale for splitting.
@@ -95,10 +112,23 @@ pub fn record(reason: CrashReason, summary: &str, ctx: WriterContext) {
     }));
     match outcome {
         Ok(Ok(path)) => {
-            tracing::info!(crash_sidecar = %path.display(), ?reason, "wrote crash sidecar");
+            // Downgraded INFO → DEBUG (2026-05-17 PC55331 storm fix):
+            // a tight crash-loop would otherwise spam this line at INFO
+            // through the rolling log file. The rate-limit kicks in
+            // after the first write, but even those rate-limited
+            // writes are DEBUG so the runtime log stays quiet under
+            // normal operation. Operators looking for "did the
+            // sidecar land" check the dir directly.
+            tracing::debug!(crash_sidecar = %path.display(), ?reason, "wrote crash sidecar");
         }
         Ok(Err(e)) => {
-            tracing::warn!(error = %e, "crash_recorder: write failed");
+            // Suppression returns Err with a constant reason string;
+            // log_suppression_throttled already emitted (or threw the
+            // throttle), so don't double-warn for that path.
+            let msg = e.to_string();
+            if !is_suppression_message(&msg) {
+                tracing::warn!(error = %msg, "crash_recorder: write failed");
+            }
         }
         Err(_) => {
             // The closure panicked. Avoid touching tracing here (its
@@ -122,6 +152,20 @@ fn record_inner(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
+
+    // Crash-loop suppression. Field repro 2026-05-17 on PC55331:
+    // SystemContext worker dies every 2s with code=1 → supervisor
+    // records a SupervisorDetected sidecar per spawn → without
+    // suppression we'd fill PROGRAMDATA with ~24 sidecars/minute
+    // forever (the worker never lives long enough to run the
+    // uploader). See `should_suppress` for the rate-limit + cap
+    // contract; `log_suppression_throttled` keeps the warn from
+    // spamming.
+    if let Some(reason) = should_suppress(&dir, now_unix) {
+        log_suppression_throttled(&dir, reason, now_unix);
+        return Err(std::io::Error::other(reason.as_str()));
+    }
+
     let pid = std::process::id();
 
     let raw_tail = read_log_tail(LOG_TAIL_LINES);
@@ -285,6 +329,105 @@ fn scan_dir(dir: &PathBuf) -> Vec<(PathBuf, AgentCrashPayload)> {
         }
     }
     out
+}
+
+// ─── Crash-loop suppression ────────────────────────────────────────────────
+
+/// Why a record_inner attempt declined to write. Stored in the
+/// returned io::Error string so the outer `record()` can distinguish
+/// "real write failure" (warn) from "rate-limit / cap hit" (already
+/// logged at throttled WARN).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuppressReason {
+    /// Most-recent sidecar in the dir is fresh — write rate-limited.
+    RecentSidecar,
+    /// Dir already has [`HARD_CAP`] sidecars; drop to bound disk.
+    HardCapReached,
+}
+
+impl SuppressReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RecentSidecar => "crash_recorder: recent sidecar; rate-limited",
+            Self::HardCapReached => "crash_recorder: hard cap reached; suppressing",
+        }
+    }
+}
+
+fn is_suppression_message(msg: &str) -> bool {
+    msg == SuppressReason::RecentSidecar.as_str() || msg == SuppressReason::HardCapReached.as_str()
+}
+
+/// Pure: should the next sidecar write to `dir` be suppressed?
+/// `now_unix` is the proposed crashed_at_unix for the new sidecar.
+///
+/// Two suppression rules, in order:
+/// 1. **Hard cap** — if `dir` already contains [`HARD_CAP`] or more
+///    `*.json` sidecars, drop the new write. Bounds worst-case disk.
+/// 2. **Rate limit** — if the most-recent sidecar in `dir` is within
+///    [`MIN_INTERVAL_SECS`] of `now_unix`, drop the new write. The
+///    timestamp is parsed from the filename (`{unix_ts}-{pid}.json`)
+///    so we don't need mtime lookups (which can be unreliable on
+///    filesystems with low granularity).
+///
+/// Pure over dir contents + clock so tests drive every branch
+/// without mocks.
+pub fn should_suppress(dir: &Path, now_unix: i64) -> Option<SuppressReason> {
+    let entries: Vec<i64> = match fs::read_dir(dir) {
+        Ok(rd) => rd
+            .flatten()
+            .filter_map(|e| {
+                let p = e.path();
+                if p.extension().and_then(|s| s.to_str()) != Some("json") {
+                    return None;
+                }
+                let stem = p.file_stem()?.to_str()?;
+                let (ts_str, _) = stem.split_once('-')?;
+                ts_str.parse::<i64>().ok()
+            })
+            .collect(),
+        Err(_) => return None,
+    };
+
+    if entries.len() >= HARD_CAP {
+        return Some(SuppressReason::HardCapReached);
+    }
+
+    let cutoff = now_unix.saturating_sub(MIN_INTERVAL_SECS);
+    if entries.iter().any(|&ts| ts > cutoff) {
+        return Some(SuppressReason::RecentSidecar);
+    }
+
+    None
+}
+
+/// Last unix-second we emitted a suppression warn. Throttled to
+/// one per 60s per process — a tight crash-loop hitting suppression
+/// every 2s would otherwise log the WARN ~30x/min, which is exactly
+/// the spam the suppression is supposed to prevent.
+static SUPPRESSION_LAST_WARN_UNIX: AtomicU64 = AtomicU64::new(0);
+const SUPPRESSION_WARN_THROTTLE_SECS: u64 = 60;
+
+fn log_suppression_throttled(dir: &Path, reason: SuppressReason, now_unix: i64) {
+    let now = now_unix.max(0) as u64;
+    let last = SUPPRESSION_LAST_WARN_UNIX.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < SUPPRESSION_WARN_THROTTLE_SECS {
+        return;
+    }
+    // Best-effort CAS; if another thread already stamped a newer
+    // value we lose the race + skip the log, which is the same
+    // outcome we want.
+    let _ = SUPPRESSION_LAST_WARN_UNIX.compare_exchange(
+        last,
+        now,
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    );
+    tracing::warn!(
+        dir = %dir.display(),
+        ?reason,
+        "crash_recorder: suppressed sidecar write (crash-loop?); throttled to once per 60s"
+    );
 }
 
 // ─── Scrub pipeline ────────────────────────────────────────────────────────
@@ -734,5 +877,107 @@ mod tests {
         assert!(out.contains("[REDACTED]"));
         // 1 Bearer + 1 password = 2 redactions.
         assert_eq!(n, 2);
+    }
+
+    // ─── Crash-loop suppression (2026-05-17 PC55331 storm fix) ─────────────
+
+    fn tempdir_for_test() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "crash_recorder_supp_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create_dir_all");
+        dir
+    }
+
+    /// Drop a fake sidecar named `{ts}-{pid}.json` in `dir`. Used by
+    /// the suppression tests to pre-populate without going through
+    /// the full record_inner path.
+    fn touch_sidecar(dir: &Path, unix_ts: i64, pid: u32) {
+        let path = dir.join(format!("{unix_ts}-{pid}.json"));
+        std::fs::write(&path, b"{}").expect("write fake sidecar");
+    }
+
+    #[test]
+    fn should_suppress_returns_none_for_empty_dir() {
+        let dir = tempdir_for_test();
+        assert!(should_suppress(&dir, 1_700_000_000).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn should_suppress_rate_limits_when_recent_sidecar_exists() {
+        let dir = tempdir_for_test();
+        // Sidecar 5 seconds ago — within the 30s MIN_INTERVAL.
+        touch_sidecar(&dir, 1_700_000_000 - 5, 12345);
+        let now = 1_700_000_000_i64;
+        assert_eq!(
+            should_suppress(&dir, now),
+            Some(SuppressReason::RecentSidecar)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn should_suppress_allows_write_after_min_interval_elapsed() {
+        let dir = tempdir_for_test();
+        // Sidecar 31 seconds ago — past the 30s MIN_INTERVAL.
+        touch_sidecar(&dir, 1_700_000_000 - (MIN_INTERVAL_SECS + 1), 12345);
+        let now = 1_700_000_000_i64;
+        assert!(should_suppress(&dir, now).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn should_suppress_hits_hard_cap_regardless_of_age() {
+        let dir = tempdir_for_test();
+        // Fill the dir with HARD_CAP stale sidecars (all 1 hour ago).
+        // Each gets a unique ts so filenames don't collide.
+        let stale_base = 1_700_000_000_i64 - 3600;
+        for i in 0..HARD_CAP {
+            touch_sidecar(&dir, stale_base + i as i64, 12345);
+        }
+        let now = 1_700_000_000_i64;
+        assert_eq!(
+            should_suppress(&dir, now),
+            Some(SuppressReason::HardCapReached),
+            "hard cap must trip even when all sidecars are old"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn should_suppress_ignores_non_json_files() {
+        let dir = tempdir_for_test();
+        // A *.tmp file (in-progress write) doesn't count toward the
+        // cap and doesn't trigger the rate-limit.
+        std::fs::write(dir.join("1700000000-12345.json.tmp"), b"{}").unwrap();
+        assert!(should_suppress(&dir, 1_700_000_000).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn suppress_reason_strings_are_stable() {
+        // The outer record() matches on these strings to suppress a
+        // duplicate WARN; a rename here would silently re-introduce
+        // the spam.
+        assert_eq!(
+            SuppressReason::RecentSidecar.as_str(),
+            "crash_recorder: recent sidecar; rate-limited"
+        );
+        assert_eq!(
+            SuppressReason::HardCapReached.as_str(),
+            "crash_recorder: hard cap reached; suppressing"
+        );
+        assert!(is_suppression_message(
+            SuppressReason::RecentSidecar.as_str()
+        ));
+        assert!(is_suppression_message(
+            SuppressReason::HardCapReached.as_str()
+        ));
+        assert!(!is_suppression_message("io: disk full"));
     }
 }
