@@ -225,6 +225,23 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> 
     )
     .await?;
 
+    // Remote-control agent crash reports — 90-day TTL on
+    // `reported_at` (server clock). Compound index drives the admin
+    // UI query: "last N crashes for this agent in this tenant",
+    // sorted by client-supplied `crashed_at_unix` desc. See
+    // `roomler_ai_remote_control::models::AgentCrashRecord` for the
+    // shape + the Task 9 plan
+    // (`C:\Users\goran\.claude\plans\lucky-wiggling-marble.md`).
+    create_indexes(
+        db,
+        "agent_crashes",
+        vec![
+            index(bson::doc! { "tenant_id": 1, "agent_id": 1, "crashed_at_unix": -1 }),
+            index_ttl(bson::doc! { "reported_at": 1 }, 90 * 24 * 60 * 60),
+        ],
+    )
+    .await?;
+
     info!("All indexes ensured");
     Ok(())
 }

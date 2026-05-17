@@ -284,3 +284,32 @@ pub struct AgentCrashPayload {
     /// supervisor-detected branch).
     pub pid: u32,
 }
+
+/// Server-side persisted form of an agent crash report. The MongoDB
+/// collection is `agent_crashes`; admin UI fetches via the protected
+/// `GET /api/tenant/{tenant_id}/agent/{agent_id}/crash` endpoint.
+///
+/// Fields:
+/// - `_id` / `tenant_id` / `agent_id` — server-attributed (resolved
+///   from the agent JWT at ingest time).
+/// - `reported_at` — server clock at ingest. Distinct from the
+///   payload's `crashed_at_unix` (agent clock) so clock-skewed hosts
+///   are visible in the admin UI.
+/// - Everything else is flattened from [`AgentCrashPayload`] via
+///   `#[serde(flatten)]`. The MongoDB BSON uses camelCase keys
+///   matching the wire shape — no rename for the DB layer because
+///   the payload's `rename_all = "camelCase"` carries through.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AgentCrashRecord {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub tenant_id: ObjectId,
+    pub agent_id: ObjectId,
+    pub reported_at: DateTime,
+    #[serde(flatten)]
+    pub payload: AgentCrashPayload,
+}
+
+impl AgentCrashRecord {
+    pub const COLLECTION: &'static str = "agent_crashes";
+}
