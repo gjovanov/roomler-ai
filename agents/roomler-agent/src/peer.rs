@@ -3302,12 +3302,16 @@ mod tests {
     }
 
     #[test]
-    fn target_bitrate_high_caps_at_30_mbps() {
-        // 4K60 base is 25 Mbps clamped; High should add 50% capped at 30.
+    fn target_bitrate_high_caps_at_50_mbps() {
+        // 1920×1200 base is 24 Mbps after the rc.36 bpp/cap bump; High
+        // should add 50% giving 36 Mbps (under the 50 Mbps cap).
         assert_eq!(target_bitrate(HIGH, 12_000_000), 18_000_000);
-        // Very high base: cap engages at the new 30M ceiling.
-        assert_eq!(target_bitrate(HIGH, 30_000_000), 30_000_000);
-        assert_eq!(target_bitrate(HIGH, 50_000_000), 30_000_000);
+        // 4K60 base saturates MAX_BITRATE_BPS at 40 Mbps; High then
+        // multiplies × 1.5 → 60 Mbps which the post-multiply cap
+        // clamps back to the rc.36 ceiling of 50 Mbps.
+        assert_eq!(target_bitrate(HIGH, 40_000_000), 50_000_000);
+        // Very high synthetic base: cap engages.
+        assert_eq!(target_bitrate(HIGH, 50_000_000), 50_000_000);
     }
 }
 
