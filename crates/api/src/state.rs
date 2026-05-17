@@ -51,6 +51,7 @@ pub struct AppState {
     pub agents: Arc<AgentDao>,
     pub remote_sessions: Arc<RemoteSessionDao>,
     pub remote_audit: Arc<RemoteAuditDao>,
+    pub agent_crashes: Arc<roomler_ai_services::dao::agent_crash::AgentCrashDao>,
     pub rc_hub: Arc<Hub>,
 
     /// 1h-TTL in-memory cache backing `/api/agent/latest-release`.
@@ -139,6 +140,7 @@ impl AppState {
         let agents = Arc::new(AgentDao::new(&db));
         let remote_sessions = Arc::new(RemoteSessionDao::new(&db));
         let remote_audit = Arc::new(RemoteAuditDao::new(&db));
+        let agent_crashes = Arc::new(roomler_ai_services::dao::agent_crash::AgentCrashDao::new(&db));
 
         let turn_cfg = build_turn_config(&settings.turn);
         let (audit_sink, _audit_handle) = AuditSink::spawn(db.clone());
@@ -173,6 +175,7 @@ impl AppState {
             agents,
             remote_sessions,
             remote_audit,
+            agent_crashes,
             rc_hub,
             latest_release_cache: crate::routes::agent_release::LatestReleaseCache::new(),
         })

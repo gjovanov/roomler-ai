@@ -237,6 +237,10 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::remote_control::get_agent)
                 .put(routes::remote_control::update_agent)
                 .delete(routes::remote_control::delete_agent),
+        )
+        .route(
+            "/{agent_id}/crash",
+            get(routes::agent_crash::list_for_agent),
         );
 
     // Remote-control session routes (tenant-scoped)
@@ -270,7 +274,14 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/installer/{flavour}",
             get(routes::agent_release::installer_proxy),
-        );
+        )
+        // Agent crash-report ingest (Task 9 Phase 2). Public because
+        // the agent authenticates by its own JWT in the Authorization
+        // header — same security posture as the WS `/ws?role=agent`
+        // upgrade, and the user-JWT extractor isn't applicable here.
+        // The route handler calls `state.auth.verify_agent_token`
+        // directly.
+        .route("/crash", post(routes::agent_crash::ingest));
 
     // TURN credentials (user-scoped, no tenant prefix)
     let turn_routes = Router::new().route(
