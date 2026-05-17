@@ -532,11 +532,15 @@ fn detect_hostname() -> String {
     {
         // Read /etc/hostname; on most Linux/macOS this is the same
         // as `hostname(1)`. Falls back to env-var HOSTNAME if not.
+        // `.ok()` collapses the Result so `.filter` (Option) is
+        // applicable; without it CI's Linux clippy step blows up
+        // with E0599 (Result is not an iterator).
         std::fs::read_to_string("/etc/hostname")
             .map(|s| s.trim().to_string())
+            .ok()
             .filter(|s| !s.is_empty())
-            .or_else(|_| std::env::var("HOSTNAME"))
-            .unwrap_or_else(|_| "unknown".to_string())
+            .or_else(|| std::env::var("HOSTNAME").ok())
+            .unwrap_or_else(|| "unknown".to_string())
     }
 }
 
