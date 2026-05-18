@@ -56,13 +56,20 @@ pub const CHUNK_BYTES: usize = 64 * 1024;
 /// max buffered per flow, which matches the rc.19 file-DC behaviour.
 const FLOW_INBOX_CAP: usize = 256;
 
-/// In-band half-close signal: `[flow_id_le | HALF_CLOSE_MAGIC]`.
-/// Non-empty payload because empty-payload (4 byte total) DC
+/// In-band half-close sentinel: `[flow_id_le | HALF_CLOSE_MAGIC]`.
+/// Non-empty payload because empty-payload (4-byte total) DC
 /// messages weren't reliably delivered in the local two-peer
 /// fixture — possibly the DCEP empty-binary PPID path interacting
-/// badly with our pre-negotiated streams. T2.10 replaces this with
-/// the wire-level `rc:tunnel.tcp.half_close` message; until then
-/// this in-band marker keeps the pump self-contained for tests.
+/// badly with our pre-negotiated streams.
+///
+/// **Why in-band, not wire-level**: SCTP guarantees ordered delivery
+/// within a stream, so this byte arrives strictly after every
+/// prior data chunk on the same DC. A wire-level half-close
+/// (`ClientMsg::TcpHalfClose` over WS) is fired in parallel —
+/// useful for audit and bookkeeping — but it can race ahead of or
+/// behind in-flight DC chunks and is therefore NOT used to close
+/// the mailbox. The mailbox close is exclusively driven by this
+/// sentinel inside [`FlowDemux::install`].
 pub(crate) const HALF_CLOSE_MAGIC: &[u8] = &[0xFF];
 
 // Compile-time invariants. Cross-referenced from the audit log
@@ -112,10 +119,14 @@ impl FlowDemux {
                     );
                     return;
                 };
-                // Half-close marker: see `HALF_CLOSE_MAGIC`. Drop
-                // the mailbox so our `pump_dc_to_tcp` sees None on
-                // its next recv() and shuts down the local TCP
-                // write half (sending FIN downstream).
+                // In-band half-close. SCTP ordering guarantees this
+                // byte arrives strictly after every prior chunk on
+                // the same flow, so dropping the sender now means
+                // `pump_dc_to_tcp` sees None on its next recv()
+                // AFTER all data has been drained. Wire-level
+                // `TcpHalfClose` is also emitted by the sender's
+                // pump (for audit), but only this in-band sentinel
+                // closes the mailbox.
                 if payload == HALF_CLOSE_MAGIC {
                     trace!(flow_id, "tunnel flow half-close marker received");
                     flows.lock().await.remove(&flow_id);
@@ -172,21 +183,42 @@ impl FlowDemux {
 // Bidirectional pump — one task per flow, runs until close.
 // ────────────────────────────────────────────────────────────────────────────
 
+/// Callback invoked when [`run_flow`]'s TCP→DC pump observes local
+/// EOF (i.e. the local TCP read half closed cleanly). The caller
+/// uses this to fire a wire-level [`ClientMsg::TcpHalfClose`] /
+/// [`ServerMsg::TcpHalfClose`] for audit + accounting in the
+/// server's `tunnel_audit` collection. **The wire message is not
+/// load-bearing for the data-plane half-close** — the in-band
+/// [`HALF_CLOSE_MAGIC`] sentinel on the DC is what actually closes
+/// the peer's mailbox, because SCTP's per-stream ordering
+/// guarantees the marker arrives strictly after every prior data
+/// chunk.
+///
+/// Decoupled from the wire because tunnel-core has no dependency on
+/// the WebSocket sink. The CLI / agent owns sink-shaped state.
+pub type HalfCloseSink = std::sync::Arc<dyn Fn(u32) + Send + Sync>;
+
 /// Drive a single accepted forward to completion. Returns the
 /// terminating [`CloseReason`] which the caller plumbs into the
-/// `ClientMsg::TcpClosed` audit message.
+/// `rc:tunnel.tcp.closed` audit message.
 ///
 /// Implementation: spawns one inner task for TCP→DC (with
-/// `bufferedAmountLow`-driven backpressure) and one for DC→TCP;
-/// returns as soon as either direction reaches EOF / errors. The
-/// other direction is cancelled by dropping the task handle. The
-/// caller is responsible for sending the `rc:tunnel.tcp.closed` wire
-/// message and audit row.
+/// `bufferedAmountLow`-driven backpressure) and one for DC→TCP.
+/// **Both halves are awaited** so half-close semantics survive an
+/// echo-style flow that writes 1 MiB then needs to read 1 MiB back
+/// from the peer. Outbound EOF triggers `on_local_eof(flow_id)` —
+/// the caller relays a wire-level `TcpHalfClose` so the peer's
+/// dispatch unregisters the flow on its [`FlowDemux`], which causes
+/// THIS side's `pump_dc_to_tcp` to see None on `recv()` and shut
+/// down its local TCP write half. (Previously this used an in-band
+/// `HALF_CLOSE_MAGIC = [0xFF]` sentinel multiplexed through the DC;
+/// T2.10 lifts that into the wire-level message.)
 pub async fn run_flow(
     tcp: TcpStream,
     dc: Arc<RTCDataChannel>,
     flow_id: u32,
     mut from_dc: mpsc::Receiver<Bytes>,
+    on_local_eof: HalfCloseSink,
 ) -> CloseReason {
     // Set the DC's low-water threshold once. `on_buffered_amount_low`
     // fires whenever the SCTP send queue drops back to or below this
@@ -208,20 +240,22 @@ pub async fn run_flow(
     // Spawn TCP → DC.
     let dc_for_send = Arc::clone(&dc);
     let resume_for_send = Arc::clone(&resume);
+    let on_local_eof_for_send = Arc::clone(&on_local_eof);
     let tcp_to_dc = tokio::spawn(async move {
-        pump_tcp_to_dc(read_half, dc_for_send, flow_id, resume_for_send).await
+        pump_tcp_to_dc(
+            read_half,
+            dc_for_send,
+            flow_id,
+            resume_for_send,
+            on_local_eof_for_send,
+        )
+        .await
     });
 
     // Spawn DC → TCP.
     let dc_to_tcp =
         tokio::spawn(async move { pump_dc_to_tcp(write_half, &mut from_dc, flow_id).await });
 
-    // Wait for BOTH directions to finish — half-close semantics.
-    // pump_tcp_to_dc sends an empty-payload marker on EOF so the
-    // peer's FlowDemux drops its sender and the peer's
-    // pump_dc_to_tcp sees None on recv(). Without this, an echo-
-    // style test (write 1 MiB, shutdown writer, read 1 MiB back)
-    // loses in-flight bytes because the early-terminator wins.
     let r1 = tcp_to_dc.await.unwrap_or(CloseReason::IoError);
     let r2 = dc_to_tcp.await.unwrap_or(CloseReason::IoError);
     if matches!(r1, CloseReason::Eof) && matches!(r2, CloseReason::Eof) {
@@ -236,6 +270,7 @@ async fn pump_tcp_to_dc(
     dc: Arc<RTCDataChannel>,
     flow_id: u32,
     resume: Arc<Notify>,
+    on_local_eof: HalfCloseSink,
 ) -> CloseReason {
     let mut buf = vec![0u8; CHUNK_BYTES - mux::FLOW_ID_HEADER_BYTES];
     loop {
@@ -264,14 +299,17 @@ async fn pump_tcp_to_dc(
 
         let n = match read_half.read(&mut buf).await {
             Ok(0) => {
-                // Local TCP read half hit EOF. Signal the peer with
-                // the `HALF_CLOSE_MAGIC` sentinel so its FlowDemux
-                // closes the mailbox and its pump_dc_to_tcp shuts
-                // down cleanly.
+                // Local TCP read half hit EOF. Send the in-band
+                // sentinel on the DC so the peer's FlowDemux closes
+                // the mailbox AFTER it has drained every prior
+                // chunk (SCTP per-stream ordering). Then notify the
+                // caller so it can emit a wire-level
+                // `rc:tunnel.tcp.half_close` for audit.
                 let marker = mux::encode(flow_id, HALF_CLOSE_MAGIC);
                 if let Err(e) = dc.send(&Bytes::from(marker)).await {
                     debug!(flow_id, %e, "tunnel pump half-close marker send failed");
                 }
+                (on_local_eof)(flow_id);
                 return CloseReason::Eof;
             }
             Ok(n) => n,
@@ -279,6 +317,7 @@ async fn pump_tcp_to_dc(
                 debug!(flow_id, %e, "tunnel pump TCP read error");
                 let marker = mux::encode(flow_id, HALF_CLOSE_MAGIC);
                 let _ = dc.send(&Bytes::from(marker)).await;
+                (on_local_eof)(flow_id);
                 return CloseReason::IoError;
             }
         };
@@ -324,16 +363,18 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    /// Stress the [`FlowDemux`] with sustained traffic + the half-
-    /// close marker: send 256 KiB in 4-KiB framed chunks via direct
-    /// `dc.send` (mimicking what `pump_tcp_to_dc` would do), then
-    /// send the `HALF_CLOSE_MAGIC` marker. Verifies (a) framing
-    /// roundtrips at scale, (b) bytes arrive in order, (c) the
-    /// marker closes the mailbox so `recv()` returns `None`. The
-    /// pump's TCP-read interaction is exercised end-to-end via the
-    /// agent + tunnel-client integration in T2.10.
+    /// Stress the [`FlowDemux`] with sustained traffic + the in-band
+    /// half-close marker: send 256 KiB in 4-KiB framed chunks via
+    /// direct `dc.send` (mimicking what `pump_tcp_to_dc` would do),
+    /// then send the [`HALF_CLOSE_MAGIC`] sentinel. Verifies (a)
+    /// framing roundtrips at scale, (b) bytes arrive in order, (c)
+    /// the in-band marker closes the mailbox AFTER all buffered
+    /// chunks have been routed — i.e. zero bytes are lost. SCTP
+    /// per-stream ordering is what makes the in-band approach
+    /// correct; a wire-level half-close would race ahead of /
+    /// behind in-flight DC chunks and lose bytes.
     #[tokio::test(flavor = "multi_thread")]
-    async fn demux_handles_256k_burst_then_half_close() {
+    async fn demux_handles_256k_burst_then_in_band_half_close() {
         let offerer = TunnelPeer::new(vec![]).await.unwrap();
         let answerer = TunnelPeer::new(vec![]).await.unwrap();
 
@@ -390,7 +431,8 @@ mod tests {
                     .await
                     .expect("dc.send failed");
             }
-            // Half-close marker.
+            // In-band half-close marker — SCTP ordering puts this
+            // strictly after every chunk above on the same flow.
             let marker = mux::encode(1, HALF_CLOSE_MAGIC);
             off_dc_for_sender
                 .send(&Bytes::from(marker))
@@ -398,9 +440,6 @@ mod tests {
                 .expect("marker send failed");
         });
 
-        // Drain the answerer's demux mailbox. The marker drops the
-        // sender → recv() returns None once the buffered chunks are
-        // consumed.
         let received = tokio::time::timeout(Duration::from_secs(30), async {
             let mut out = Vec::with_capacity(payload.len());
             while let Some(chunk) = from_dc_answerer.recv().await {

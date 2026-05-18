@@ -1,9 +1,9 @@
 //! `roomler-tunnel` — TeamViewer-style native tunnel client.
 //!
-//! Forwards a local TCP port (or SOCKS5 listener, v1.1) over a
-//! WebRTC P2P data channel to an enrolled `roomler-agent`, which
-//! dials the corresponding intranet destination. The Roomler API
-//! is signalling-only — payload never touches the server.
+//! Forwards a local TCP port over a WebRTC P2P data channel to an
+//! enrolled `roomler-agent`, which dials the corresponding intranet
+//! destination. The Roomler API is signalling-only — payload never
+//! touches the server.
 //!
 //! CLI surface:
 //!
@@ -11,20 +11,20 @@
 //!   roomler-tunnel forward --agent <agent_id> --local <port> --remote <host:port>
 //!   roomler-tunnel run [--config <path>]
 //!   roomler-tunnel diagnose [--agent <agent_id>]
-//!
-//! T1 ships compile-clean scaffolding only — every subcommand returns
-//! `not_yet_implemented` until T2 wires the data plane.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+
+use roomler_tunnel::{config, forward};
 
 #[derive(Debug, Parser)]
 #[command(name = "roomler-tunnel", version, about, long_about = None)]
 struct Cli {
     /// Override config file location. Defaults to the platform config dir
-    /// (`~/.config/roomler-tunnel/config.toml` on Linux, equivalent on
-    /// Windows / macOS via the `directories` crate).
+    /// (`%APPDATA%\roomler\roomler-tunnel\config.toml` on Windows,
+    /// `~/.config/roomler-tunnel/config.toml` on Linux, the equivalent on
+    /// macOS via the `directories` crate).
     #[arg(long, global = true)]
     config: Option<PathBuf>,
 
@@ -35,8 +35,8 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Enroll this laptop against a Roomler server using an admin-issued
-    /// tunnel-enrollment token. Writes the long-lived TunnelClient JWT to
-    /// the config file. Mirrors `roomler-agent enroll`.
+    /// tunnel-enrollment token. Writes the long-lived `TunnelClient` JWT
+    /// to the config file. Mirrors `roomler-agent enroll`.
     Enroll {
         /// Base URL of the Roomler API (e.g. https://roomler.ai).
         #[arg(long)]
@@ -50,7 +50,7 @@ enum Command {
     },
     /// Open one TCP forward: listen on `--local`, accept TCP connections,
     /// dial `--remote` from the named agent's host. Stays in the
-    /// foreground; Ctrl-C tears down. T2 implements the data plane.
+    /// foreground; Ctrl-C tears down.
     Forward {
         /// Hex `agent_id` of the target agent (visible in the admin UI).
         #[arg(long)]
@@ -65,7 +65,7 @@ enum Command {
     },
     /// Read a multi-forward config from disk and run all forwards as
     /// persistent listeners. Auto-reconnects on transient failure.
-    /// T3 implements the operability layer; T1 stub returns an error.
+    /// T3 implements the operability layer; not yet wired.
     Run {},
     /// Probe path-MTU, ICE candidate reachability, and TURN-relay status
     /// against the named agent. Prints a structured diagnostic dump.
@@ -76,7 +76,8 @@ enum Command {
     },
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -85,33 +86,176 @@ fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(async {
+    match cli.command {
+        Command::Enroll {
+            server,
+            token,
+            name,
+        } => enroll_cmd(cli.config, server, token, name).await,
+        Command::Forward {
+            agent,
+            local,
+            remote,
+        } => {
+            let cfg = config::load(cli.config).context("loading tunnel config")?;
+            forward::run(cfg, &agent, local, &remote).await
+        }
+        Command::Run {} => bail!("T3: multi-forward `run` not yet wired"),
+        Command::Diagnose { agent } => {
+            bail!("T3: diagnose not yet wired (agent={:?})", agent);
+        }
+    }
+}
+
+/// `roomler-tunnel enroll` — exchange a tunnel-enrollment JWT for a
+/// long-lived `TunnelClient` JWT via the server, then persist server
+/// URL + token to the local config file.
+async fn enroll_cmd(
+    cfg_path: Option<PathBuf>,
+    server_url: String,
+    enrollment_token: String,
+    machine_name: String,
+) -> Result<()> {
+    let enroll_url = format!(
+        "{}/api/tunnel-client/enroll",
+        server_url.trim_end_matches('/')
+    );
+    let body = serde_json::json!({
+        "enrollment_token": enrollment_token,
+        "machine_name": machine_name,
+        "machine_id": derive_machine_id(&machine_name),
+    });
+    let resp = reqwest::Client::new()
+        .post(&enroll_url)
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("POST {enroll_url}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        bail!("enrollment failed (HTTP {status}): {body}");
+    }
+    #[derive(serde::Deserialize)]
+    struct EnrollResponse {
+        tunnel_client_token: String,
+    }
+    let parsed: EnrollResponse = resp.json().await.context("parsing enrollment response")?;
+
+    let cfg = config::TunnelConfig {
+        server_url,
+        tunnel_client_token: parsed.tunnel_client_token,
+        machine_name,
+    };
+    let path = config::save(&cfg, cfg_path.as_deref()).context("saving tunnel config")?;
+    println!("Enrolled. Config written to {}", path.display());
+    Ok(())
+}
+
+/// Hash `machine_name` + the hostname to a hex-encoded blob the server
+/// uses to dedupe re-enrollments from the same host. Mirrors the
+/// agent's `derive_machine_id` shape (lowercase 16-hex of the SHA-256).
+fn derive_machine_id(machine_name: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let hostname = hostname_lossy();
+    let os = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+    let mut h = Sha256::new();
+    h.update(machine_name.as_bytes());
+    h.update(b"\0");
+    h.update(hostname.as_bytes());
+    h.update(b"\0");
+    h.update(os.as_bytes());
+    h.update(b"\0");
+    h.update(arch.as_bytes());
+    let digest = h.finalize();
+    hex::encode(&digest[..16])
+}
+
+fn hostname_lossy() -> String {
+    #[cfg(unix)]
+    {
+        std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string())
+    }
+    #[cfg(windows)]
+    {
+        std::env::var("COMPUTERNAME").unwrap_or_else(|_| "unknown".to_string())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        "unknown".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parses_forward() {
+        let cli = Cli::try_parse_from([
+            "roomler-tunnel",
+            "forward",
+            "--agent",
+            "507f1f77bcf86cd799439011",
+            "--local",
+            "5432",
+            "--remote",
+            "10.0.0.5:5432",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Forward {
+                agent,
+                local,
+                remote,
+            } => {
+                assert_eq!(agent, "507f1f77bcf86cd799439011");
+                assert_eq!(local, 5432);
+                assert_eq!(remote, "10.0.0.5:5432");
+            }
+            other => panic!("expected Forward, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_enroll() {
+        let cli = Cli::try_parse_from([
+            "roomler-tunnel",
+            "enroll",
+            "--server",
+            "https://roomler.ai",
+            "--token",
+            "eyJhbGciOiJIUzI1NiJ9.payload.sig",
+            "--name",
+            "goran-laptop",
+        ])
+        .unwrap();
         match cli.command {
             Command::Enroll {
                 server,
                 token,
                 name,
             } => {
-                bail!(
-                    "T1: enroll wiring lands in task #5 (HTTP enrollment endpoint). \
-                     server={server} name={name} token=<redacted, {} bytes>",
-                    token.len()
-                );
+                assert_eq!(server, "https://roomler.ai");
+                assert_eq!(token, "eyJhbGciOiJIUzI1NiJ9.payload.sig");
+                assert_eq!(name, "goran-laptop");
             }
-            Command::Forward {
-                agent,
-                local,
-                remote,
-            } => {
-                bail!("T2: TCP forward not yet wired. agent={agent} local={local} remote={remote}");
-            }
-            Command::Run {} => {
-                bail!("T3: multi-forward `run` not yet wired");
-            }
-            Command::Diagnose { agent } => {
-                bail!("T3: diagnose not yet wired (agent={:?})", agent);
-            }
+            other => panic!("expected Enroll, got {other:?}"),
         }
-    })
+    }
+
+    #[test]
+    fn derive_machine_id_is_deterministic() {
+        let a = derive_machine_id("test-name");
+        let b = derive_machine_id("test-name");
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 32); // 16 bytes hex-encoded
+    }
+
+    #[test]
+    fn derive_machine_id_changes_with_name() {
+        assert_ne!(derive_machine_id("a"), derive_machine_id("b"));
+    }
 }
