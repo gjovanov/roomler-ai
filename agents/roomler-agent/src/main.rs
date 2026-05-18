@@ -313,14 +313,26 @@ async fn main() -> Result<()> {
     // browser-side normalised click maps left+above of where the user
     // clicked. Field bug PC50045 2026-05-01. Idempotent — a noop once
     // some other subsystem has already set DPI for the process.
+    // rc.41 — stash the DPI outcome (set + actual) and log it AFTER
+    // logging::init() so the diagnostic line lands in the persistent
+    // log file. The `actual` field is the authoritative source of
+    // truth for "what mode is in force"; `set` distinguishes
+    // "we set it now" from "another caller had already pinned it".
     #[cfg(target_os = "windows")]
-    {
-        let _ = dpi::set_per_monitor_aware();
-    }
+    let dpi_outcome = dpi::set_per_monitor_aware();
 
     logging::init();
     if let Some(dir) = logging::log_dir() {
         tracing::debug!(log_dir = %dir.display(), "persistent file logging active");
+    }
+    #[cfg(target_os = "windows")]
+    {
+        tracing::info!(
+            requested = "per-monitor-v2",
+            set_succeeded = dpi_outcome.set,
+            actual = dpi_outcome.actual.as_str(),
+            "DPI awareness configured at process start (rc.41 diagnostic — surfaces residual PC50045 mouse-misposition cause)"
+        );
     }
 
     let cli = Cli::parse();
