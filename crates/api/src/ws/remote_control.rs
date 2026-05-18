@@ -331,10 +331,35 @@ async fn relay_tunnel_msg_from_agent(state: &AppState, parsed: ClientMsg) -> Opt
             .await;
             None
         }
-        // `TunnelHello` / `TunnelOpen` / `TcpForwardRequest` are
-        // tunnel-client → server messages; agents shouldn't emit
-        // them. Pass through to the Hub so a misbehaving agent gets
-        // a `bad_message` rather than being silently dropped.
+        ClientMsg::TunnelSdpAnswer { session_id, sdp } => {
+            relay_to_client(
+                state,
+                session_id,
+                ServerMsg::TunnelSdpAnswer { session_id, sdp },
+            )
+            .await;
+            None
+        }
+        ClientMsg::TunnelIce {
+            session_id,
+            candidate,
+        } => {
+            relay_to_client(
+                state,
+                session_id,
+                ServerMsg::TunnelIce {
+                    session_id,
+                    candidate,
+                },
+            )
+            .await;
+            None
+        }
+        // `TunnelHello` / `TunnelOpen` / `TcpForwardRequest` /
+        // `TunnelSdpOffer` are tunnel-client → server messages;
+        // agents shouldn't emit them. Pass through to the Hub so a
+        // misbehaving agent gets a `bad_message` rather than being
+        // silently dropped.
         other => Some(other),
     }
 }

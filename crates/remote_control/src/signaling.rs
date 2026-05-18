@@ -316,6 +316,38 @@ pub enum ClientMsg {
         session_id: ObjectId,
         reason: CloseReason,
     },
+
+    /// Tunnel-client → server → agent: SDP offer for the WebRTC peer
+    /// negotiation. Distinct discriminator from the remote-control
+    /// `rc:sdp.offer` so the server's session_id namespaces don't
+    /// have to overlap. Carries no `ice_servers` (already delivered
+    /// in `TunnelOpened`).
+    #[serde(rename = "rc:tunnel.sdp.offer")]
+    TunnelSdpOffer {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        sdp: String,
+    },
+
+    /// Agent → server → tunnel-client: SDP answer for the WebRTC peer
+    /// negotiation. Mirror of `TunnelSdpOffer` on the answerer path.
+    #[serde(rename = "rc:tunnel.sdp.answer")]
+    TunnelSdpAnswer {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        sdp: String,
+    },
+
+    /// Either side trickles an ICE candidate for the tunnel peer.
+    /// Server relays to the other side. Distinct discriminator from
+    /// the remote-control `rc:ice` for the same reason as the SDP
+    /// variants above.
+    #[serde(rename = "rc:tunnel.ice")]
+    TunnelIce {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        candidate: serde_json::Value,
+    },
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -512,6 +544,33 @@ pub enum ServerMsg {
     /// revocation re-check task already emits in `ws/tunnel.rs`.
     #[serde(rename = "rc:tunnel.revoked")]
     TunnelRevoked { reason: String },
+
+    /// Server → agent: relays a tunnel-client's SDP offer. Distinct
+    /// discriminator from `rc:sdp.offer` so the agent doesn't
+    /// confuse this with a remote-control session offer.
+    #[serde(rename = "rc:tunnel.sdp.offer")]
+    TunnelSdpOffer {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        sdp: String,
+    },
+
+    /// Server → tunnel-client: relays the agent's SDP answer.
+    #[serde(rename = "rc:tunnel.sdp.answer")]
+    TunnelSdpAnswer {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        sdp: String,
+    },
+
+    /// Server → either peer: relays a tunnel ICE candidate. Mirror of
+    /// `ClientMsg::TunnelIce`.
+    #[serde(rename = "rc:tunnel.ice")]
+    TunnelIce {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        candidate: serde_json::Value,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -868,5 +927,55 @@ mod tests {
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(r#""reason":"client_shutdown""#));
+    }
+
+    #[test]
+    fn tunnel_sdp_offer_uses_distinct_discriminator() {
+        // `rc:tunnel.sdp.offer` is distinct from the remote-control
+        // `rc:sdp.offer` so the server can route by session-namespace
+        // without ambiguity.
+        let m = ClientMsg::TunnelSdpOffer {
+            session_id: ObjectId::new(),
+            sdp: "v=0\r\n".into(),
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(r#""t":"rc:tunnel.sdp.offer""#));
+        assert!(!s.contains(r#""t":"rc:sdp.offer""#));
+        let back: ClientMsg = serde_json::from_str(&s).unwrap();
+        assert!(matches!(back, ClientMsg::TunnelSdpOffer { .. }));
+    }
+
+    #[test]
+    fn server_tunnel_sdp_answer_round_trips() {
+        let m = ServerMsg::TunnelSdpAnswer {
+            session_id: ObjectId::new(),
+            sdp: "v=0\r\n".into(),
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(r#""t":"rc:tunnel.sdp.answer""#));
+        let back: ServerMsg = serde_json::from_str(&s).unwrap();
+        assert!(matches!(back, ServerMsg::TunnelSdpAnswer { .. }));
+    }
+
+    #[test]
+    fn tunnel_ice_carries_arbitrary_json_candidate() {
+        // Candidates ride as opaque JSON so we don't have to mirror
+        // the webrtc-rs RTCIceCandidateInit shape in this crate.
+        let candidate = serde_json::json!({
+            "candidate": "candidate:1 1 udp 2122252543 192.0.2.1 12345 typ host",
+            "sdpMid": "0",
+            "sdpMLineIndex": 0,
+        });
+        let m = ClientMsg::TunnelIce {
+            session_id: ObjectId::new(),
+            candidate: candidate.clone(),
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(r#""t":"rc:tunnel.ice""#));
+        let back: ClientMsg = serde_json::from_str(&s).unwrap();
+        match back {
+            ClientMsg::TunnelIce { candidate: c2, .. } => assert_eq!(c2, candidate),
+            other => panic!("expected TunnelIce, got {other:?}"),
+        }
     }
 }
