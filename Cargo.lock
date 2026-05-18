@@ -6580,7 +6580,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-tunnel-core"
-version = "0.3.0-rc.39"
+version = "0.3.0-rc.43"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6627,7 +6627,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-tunnel"
-version = "0.3.0-rc.39"
+version = "0.3.0-rc.43"
 dependencies = [
  "anyhow",
  "bson",

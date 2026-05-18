@@ -1,5 +1,11 @@
 #![warn(rust_2018_idioms)]
 #![allow(dead_code)]
+// Vendored upstream — only the SCTP rwnd setter is local-fork
+// territory; keep the rest verbatim. Suppress the cosmetic lints
+// that upstream code triggers on modern clippy so workspace
+// `cargo clippy -- -D warnings` doesn't redden CI.
+#![allow(unused_parens)]
+#![allow(clippy::all)]
 
 pub use {data, dtls, ice, interceptor, mdns, media, rtcp, rtp, sctp, sdp, srtp, stun, turn, util};
 
