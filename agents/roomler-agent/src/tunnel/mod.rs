@@ -26,3 +26,4 @@
 pub mod acceptor;
 pub mod acl;
 pub mod dialer;
+pub mod peer;
