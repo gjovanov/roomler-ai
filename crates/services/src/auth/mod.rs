@@ -39,6 +39,14 @@ pub enum TokenType {
     Enrollment,
     /// Long-lived token carried by an enrolled remote-control agent.
     Agent,
+    /// Single-use, short-lived bootstrap token an admin issues to the
+    /// operator. Exchanged for a long-lived `TunnelClient` token via
+    /// `POST /api/tunnel-client/enroll`.
+    TunnelEnrollment,
+    /// Long-lived token carried by an enrolled `roomler-tunnel` client
+    /// on its WebSocket connection (`role=tunnel-client`). Audience
+    /// distinct from `Agent` — agents serve forwards, clients open them.
+    TunnelClient,
 }
 
 /// Claims carried by a remote-control enrollment token (aud = enroll).
@@ -62,6 +70,41 @@ pub struct AgentClaims {
     pub exp: i64,
     pub iss: String,
     pub token_type: TokenType,
+}
+
+/// Claims carried by a `roomler-tunnel` client token. Long-lived,
+/// one per enrolled laptop. `owner_user_id` lets the WS handler
+/// associate every forward decision with the operating user for
+/// audit + policy evaluation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TunnelClientClaims {
+    /// `tunnel_client._id` hex.
+    pub sub: String,
+    pub tenant_id: String,
+    /// User who installed and runs this CLI. Recorded in
+    /// `tunnel_audit` rows alongside every forward decision.
+    pub owner_user_id: String,
+    pub iat: i64,
+    pub exp: i64,
+    pub iss: String,
+    pub token_type: TokenType,
+}
+
+/// Claims carried by a tunnel-enrollment token. Mirrors
+/// [`EnrollmentClaims`] (single-use via `jti`, short TTL) but its
+/// own audience so a leaked agent-enrollment can't bootstrap a
+/// tunnel client and vice-versa.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TunnelEnrollmentClaims {
+    /// Admin user id (issuer) as hex.
+    pub sub: String,
+    pub tenant_id: String,
+    pub iat: i64,
+    pub exp: i64,
+    pub iss: String,
+    pub token_type: TokenType,
+    /// Unique id — caller may persist for single-use checks.
+    pub jti: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -257,6 +300,94 @@ impl AuthService {
         }
         Ok(data.claims)
     }
+
+    // ─── roomler-tunnel client tokens ─────────────────────────────────
+
+    /// Mint a single-use tunnel-enrollment token. Returned `jti` is
+    /// unique; caller may persist for replay protection. Mirrors
+    /// [`issue_enrollment_token`] but with a distinct audience.
+    pub fn issue_tunnel_enrollment_token(
+        &self,
+        admin_user_id: ObjectId,
+        tenant_id: ObjectId,
+        ttl_secs: u64,
+    ) -> Result<(String, String), AuthError> {
+        let now = Utc::now();
+        let jti = uuid_v4_hex();
+        let claims = TunnelEnrollmentClaims {
+            sub: admin_user_id.to_hex(),
+            tenant_id: tenant_id.to_hex(),
+            iat: now.timestamp(),
+            exp: (now + Duration::seconds(ttl_secs as i64)).timestamp(),
+            iss: self.jwt_settings.issuer.clone(),
+            token_type: TokenType::TunnelEnrollment,
+            jti: jti.clone(),
+        };
+        let token = encode(&Header::default(), &claims, &self.encoding_key)
+            .map_err(|e| AuthError::InvalidToken(e.to_string()))?;
+        Ok((token, jti))
+    }
+
+    pub fn verify_tunnel_enrollment_token(
+        &self,
+        token: &str,
+    ) -> Result<TunnelEnrollmentClaims, AuthError> {
+        let mut validation = Validation::default();
+        validation.set_issuer(&[&self.jwt_settings.issuer]);
+        let data = decode::<TunnelEnrollmentClaims>(token, &self.decoding_key, &validation)
+            .map_err(|e| match e.kind() {
+                jsonwebtoken::errors::ErrorKind::ExpiredSignature => AuthError::TokenExpired,
+                _ => AuthError::InvalidToken(e.to_string()),
+            })?;
+        if data.claims.token_type != TokenType::TunnelEnrollment {
+            return Err(AuthError::InvalidToken(
+                "Not a tunnel-enrollment token".to_string(),
+            ));
+        }
+        Ok(data.claims)
+    }
+
+    /// Mint a long-lived tunnel-client token (default TTL 1 year, override
+    /// via `override_ttl_secs`). Mirrors [`issue_agent_token`].
+    pub fn issue_tunnel_client_token(
+        &self,
+        tunnel_client_id: ObjectId,
+        tenant_id: ObjectId,
+        owner_user_id: ObjectId,
+        override_ttl_secs: Option<u64>,
+    ) -> Result<String, AuthError> {
+        let now = Utc::now();
+        let ttl = override_ttl_secs.unwrap_or(365 * 24 * 60 * 60);
+        let claims = TunnelClientClaims {
+            sub: tunnel_client_id.to_hex(),
+            tenant_id: tenant_id.to_hex(),
+            owner_user_id: owner_user_id.to_hex(),
+            iat: now.timestamp(),
+            exp: (now + Duration::seconds(ttl as i64)).timestamp(),
+            iss: self.jwt_settings.issuer.clone(),
+            token_type: TokenType::TunnelClient,
+        };
+        encode(&Header::default(), &claims, &self.encoding_key)
+            .map_err(|e| AuthError::InvalidToken(e.to_string()))
+    }
+
+    pub fn verify_tunnel_client_token(&self, token: &str) -> Result<TunnelClientClaims, AuthError> {
+        let mut validation = Validation::default();
+        validation.set_issuer(&[&self.jwt_settings.issuer]);
+        let data =
+            decode::<TunnelClientClaims>(token, &self.decoding_key, &validation).map_err(|e| {
+                match e.kind() {
+                    jsonwebtoken::errors::ErrorKind::ExpiredSignature => AuthError::TokenExpired,
+                    _ => AuthError::InvalidToken(e.to_string()),
+                }
+            })?;
+        if data.claims.token_type != TokenType::TunnelClient {
+            return Err(AuthError::InvalidToken(
+                "Not a tunnel-client token".to_string(),
+            ));
+        }
+        Ok(data.claims)
+    }
 }
 
 fn uuid_v4_hex() -> String {
@@ -332,5 +463,187 @@ mod tests {
         let (_, jti1) = s.issue_enrollment_token(admin, tenant, 600).unwrap();
         let (_, jti2) = s.issue_enrollment_token(admin, tenant, 600).unwrap();
         assert_ne!(jti1, jti2);
+    }
+
+    // ─── tunnel-client + tunnel-enrollment audiences ──────────────────
+    //
+    // Plan §"What changed from v1" #6 — these audiences are NOT named
+    // `Client` / `ClientEnrollment` because "Client" is overloaded
+    // across the codebase. The matrix below locks every
+    // verify-rejects-the-wrong-audience pair, in both directions, so a
+    // leaked Agent token can't bootstrap a tunnel and a leaked
+    // TunnelClient token can't drive an agent-side endpoint.
+
+    #[test]
+    fn tunnel_client_token_roundtrip() {
+        let s = svc();
+        let cid = ObjectId::new();
+        let tid = ObjectId::new();
+        let uid = ObjectId::new();
+        let token = s
+            .issue_tunnel_client_token(cid, tid, uid, Some(60))
+            .unwrap();
+        let claims = s.verify_tunnel_client_token(&token).unwrap();
+        assert_eq!(claims.sub, cid.to_hex());
+        assert_eq!(claims.tenant_id, tid.to_hex());
+        assert_eq!(claims.owner_user_id, uid.to_hex());
+        assert_eq!(claims.token_type, TokenType::TunnelClient);
+    }
+
+    #[test]
+    fn tunnel_enrollment_token_roundtrip() {
+        let s = svc();
+        let admin = ObjectId::new();
+        let tenant = ObjectId::new();
+        let (token, jti) = s.issue_tunnel_enrollment_token(admin, tenant, 600).unwrap();
+        let claims = s.verify_tunnel_enrollment_token(&token).unwrap();
+        assert_eq!(claims.sub, admin.to_hex());
+        assert_eq!(claims.tenant_id, tenant.to_hex());
+        assert_eq!(claims.jti, jti);
+        assert_eq!(claims.token_type, TokenType::TunnelEnrollment);
+    }
+
+    #[test]
+    fn tunnel_enrollment_tokens_have_unique_jti() {
+        let s = svc();
+        let admin = ObjectId::new();
+        let tenant = ObjectId::new();
+        let (_, jti1) = s.issue_tunnel_enrollment_token(admin, tenant, 600).unwrap();
+        let (_, jti2) = s.issue_tunnel_enrollment_token(admin, tenant, 600).unwrap();
+        assert_ne!(jti1, jti2);
+    }
+
+    // verify_tunnel_client_token rejects every other audience
+    #[test]
+    fn tunnel_client_verify_rejects_access_token() {
+        let s = svc();
+        let pair = s.generate_tokens(ObjectId::new(), "a@b.c", "u").unwrap();
+        let err = s
+            .verify_tunnel_client_token(&pair.access_token)
+            .unwrap_err();
+        assert!(matches!(err, AuthError::InvalidToken(_)));
+    }
+
+    #[test]
+    fn tunnel_client_verify_rejects_refresh_token() {
+        let s = svc();
+        let pair = s.generate_tokens(ObjectId::new(), "a@b.c", "u").unwrap();
+        let err = s
+            .verify_tunnel_client_token(&pair.refresh_token)
+            .unwrap_err();
+        assert!(matches!(err, AuthError::InvalidToken(_)));
+    }
+
+    #[test]
+    fn tunnel_client_verify_rejects_agent_token() {
+        let s = svc();
+        let t = s
+            .issue_agent_token(ObjectId::new(), ObjectId::new(), Some(60))
+            .unwrap();
+        let err = s.verify_tunnel_client_token(&t).unwrap_err();
+        assert!(matches!(err, AuthError::InvalidToken(_)));
+    }
+
+    #[test]
+    fn tunnel_client_verify_rejects_enrollment_token() {
+        let s = svc();
+        let (t, _) = s
+            .issue_enrollment_token(ObjectId::new(), ObjectId::new(), 60)
+            .unwrap();
+        let err = s.verify_tunnel_client_token(&t).unwrap_err();
+        assert!(matches!(err, AuthError::InvalidToken(_)));
+    }
+
+    #[test]
+    fn tunnel_client_verify_rejects_tunnel_enrollment_token() {
+        let s = svc();
+        let (t, _) = s
+            .issue_tunnel_enrollment_token(ObjectId::new(), ObjectId::new(), 60)
+            .unwrap();
+        let err = s.verify_tunnel_client_token(&t).unwrap_err();
+        assert!(matches!(err, AuthError::InvalidToken(_)));
+    }
+
+    // verify_tunnel_enrollment_token rejects every other audience
+    #[test]
+    fn tunnel_enrollment_verify_rejects_access_token() {
+        let s = svc();
+        let pair = s.generate_tokens(ObjectId::new(), "a@b.c", "u").unwrap();
+        let err = s
+            .verify_tunnel_enrollment_token(&pair.access_token)
+            .unwrap_err();
+        assert!(matches!(err, AuthError::InvalidToken(_)));
+    }
+
+    #[test]
+    fn tunnel_enrollment_verify_rejects_refresh_token() {
+        let s = svc();
+        let pair = s.generate_tokens(ObjectId::new(), "a@b.c", "u").unwrap();
+        let err = s
+            .verify_tunnel_enrollment_token(&pair.refresh_token)
+            .unwrap_err();
+        assert!(matches!(err, AuthError::InvalidToken(_)));
+    }
+
+    #[test]
+    fn tunnel_enrollment_verify_rejects_agent_token() {
+        let s = svc();
+        let t = s
+            .issue_agent_token(ObjectId::new(), ObjectId::new(), Some(60))
+            .unwrap();
+        let err = s.verify_tunnel_enrollment_token(&t).unwrap_err();
+        assert!(matches!(err, AuthError::InvalidToken(_)));
+    }
+
+    #[test]
+    fn tunnel_enrollment_verify_rejects_enrollment_token() {
+        let s = svc();
+        let (t, _) = s
+            .issue_enrollment_token(ObjectId::new(), ObjectId::new(), 60)
+            .unwrap();
+        let err = s.verify_tunnel_enrollment_token(&t).unwrap_err();
+        assert!(matches!(err, AuthError::InvalidToken(_)));
+    }
+
+    #[test]
+    fn tunnel_enrollment_verify_rejects_tunnel_client_token() {
+        let s = svc();
+        let t = s
+            .issue_tunnel_client_token(ObjectId::new(), ObjectId::new(), ObjectId::new(), Some(60))
+            .unwrap();
+        let err = s.verify_tunnel_enrollment_token(&t).unwrap_err();
+        assert!(matches!(err, AuthError::InvalidToken(_)));
+    }
+
+    // Existing verifiers reject the new audiences (defence in depth —
+    // a leaked TunnelClient must not unlock an agent's privileges).
+    #[test]
+    fn agent_verify_rejects_tunnel_client_token() {
+        let s = svc();
+        let t = s
+            .issue_tunnel_client_token(ObjectId::new(), ObjectId::new(), ObjectId::new(), Some(60))
+            .unwrap();
+        let err = s.verify_agent_token(&t).unwrap_err();
+        assert!(matches!(err, AuthError::InvalidToken(_)));
+    }
+
+    #[test]
+    fn enrollment_verify_rejects_tunnel_enrollment_token() {
+        let s = svc();
+        let (t, _) = s
+            .issue_tunnel_enrollment_token(ObjectId::new(), ObjectId::new(), 60)
+            .unwrap();
+        let err = s.verify_enrollment_token(&t).unwrap_err();
+        assert!(matches!(err, AuthError::InvalidToken(_)));
+    }
+
+    #[test]
+    fn access_verify_rejects_tunnel_client_token() {
+        let s = svc();
+        let t = s
+            .issue_tunnel_client_token(ObjectId::new(), ObjectId::new(), ObjectId::new(), Some(60))
+            .unwrap();
+        let err = s.verify_access_token(&t).unwrap_err();
+        assert!(matches!(err, AuthError::InvalidToken(_)));
     }
 }

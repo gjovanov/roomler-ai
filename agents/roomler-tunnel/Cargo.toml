@@ -1,0 +1,91 @@
+[package]
+name = "roomler-tunnel"
+version.workspace = true
+edition.workspace = true
+description = "Roomler AI tunnel client — TeamViewer-style native CLI that forwards local TCP ports to a roomler-agent's intranet via the existing Roomler WebRTC plane."
+
+[lib]
+name = "roomler_tunnel"
+path = "src/lib.rs"
+
+[[bin]]
+name = "roomler-tunnel"
+path = "src/main.rs"
+
+[dependencies]
+# Shared transport, signalling, ACL, forwarding pump
+roomler-ai-tunnel-core = { path = "../../crates/tunnel-core" }
+# Shared wire types (rc:tunnel.* lands here in T2)
+roomler-ai-remote-control = { path = "../../crates/remote_control" }
+
+# Async + networking
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+reqwest = { workspace = true }
+futures = { workspace = true }
+
+# CLI + config
+clap = { workspace = true }
+directories = { workspace = true }
+toml = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Tracing
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Errors
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Hashing (for machine_id derivation — mirrors agent's pattern)
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+# ObjectId for session keys (mirrors the shared protocol)
+bson = { workspace = true }
+
+# WebRTC peer (vendored — SCTP rwnd setter)
+webrtc = { workspace = true }
+
+# Random fallback for machine_id
+rand = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+tempfile = { workspace = true }
+
+# ---------------------------------------------------------------------------
+# Packaging metadata — mirrors roomler-agent. release-tunnel.yml CI lands
+# in T4 (or release-agent.yml extended with a second matrix entry).
+# ---------------------------------------------------------------------------
+
+# cargo-deb (Linux .deb)
+#   cargo deb -p roomler-tunnel --no-build
+[package.metadata.deb]
+maintainer = "Goran Jovanov <goran.jovanov@gmail.com>"
+copyright = "2026, Goran Jovanov <goran.jovanov@gmail.com>"
+license-file = ["../../LICENSE", "0"]
+extended-description = """\
+Native tunnel client for the Roomler AI platform. Runs on the \
+operator's laptop, opens a local TCP listener, and forwards bytes \
+over a WebRTC P2P data channel to an enrolled roomler-agent that \
+dials the corresponding intranet destination. The Roomler API is \
+signalling-only — server never sees the payload."""
+section = "net"
+priority = "optional"
+assets = [
+    ["target/release/roomler-tunnel", "usr/bin/", "755"],
+]
+
+# cargo-wix (Windows .msi)
+#   cargo wix -p roomler-tunnel --nocapture
+# Source lives at agents/roomler-tunnel/wix/main.wxs (T4).
+[package.metadata.wix]
+upgrade-guid = "8A4D2E1B-5C9F-4D7E-A2B3-1F4E6A8B9C2D"
+path-guid    = "4D2C8F12-7E9A-4B6D-8C3F-5A1E9F2D8B47"
+license      = false
+eula         = false

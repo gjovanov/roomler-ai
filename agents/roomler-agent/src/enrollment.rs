@@ -90,6 +90,8 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         // Stamp the current schema version directly on enrollment so
         // a fresh install skips the rc.18 migration on first launch.
         config_schema_version: Some(crate::config::CURRENT_SCHEMA_VERSION.to_string()),
+        // T2.8 default = enabled + empty allowlist (trust server).
+        forward_acl: crate::tunnel::acl::AgentForwardAcl::default(),
     })
 }
 
