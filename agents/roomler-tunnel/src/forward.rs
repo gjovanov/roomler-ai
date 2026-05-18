@@ -222,7 +222,7 @@ pub async fn run(cfg: TunnelConfig, agent_hex: &str, local: u16, remote: &str) -
                     }
                 };
                 if let Err(e) = outbound
-                    .send(ClientMsg::Ice {
+                    .send(ClientMsg::TunnelIce {
                         session_id,
                         candidate,
                     })
@@ -236,12 +236,12 @@ pub async fn run(cfg: TunnelConfig, agent_hex: &str, local: u16, remote: &str) -
 
     let offer = peer.create_offer().await.context("create_offer")?;
     outbound_tx
-        .send(ClientMsg::SdpOffer {
+        .send(ClientMsg::TunnelSdpOffer {
             session_id,
             sdp: offer.sdp.clone(),
         })
         .await
-        .context("send SdpOffer")?;
+        .context("send TunnelSdpOffer")?;
 
     // Spawn the WS dispatcher. It handles every inbound ServerMsg
     // from this point on (SdpAnswer, Ice, TcpForwardAccept/Reject,
@@ -503,16 +503,15 @@ async fn dispatch_loop(
             }
         };
         match parsed {
-            ServerMsg::SdpAnswer {
+            ServerMsg::TunnelSdpAnswer {
                 session_id: sid,
                 sdp,
-                ice_servers: _,
             } if sid == session_id => {
                 if let Err(e) = peer.accept_answer(&sdp).await {
                     error!(%e, "accept_answer failed");
                 }
             }
-            ServerMsg::Ice {
+            ServerMsg::TunnelIce {
                 session_id: sid,
                 candidate,
             } if sid == session_id => {
