@@ -176,7 +176,13 @@ impl Vp9Encoder {
             den: TIMEBASE_DEN,
         };
         cfg.rc_target_bitrate = DEFAULT_BITRATE_BPS / 1000; // libvpx wants kbps
-        cfg.rc_end_usage = vpx::vpx_rc_mode::VPX_CBR;
+        // rc.42 — rate-control mode env-var opt-in. Default stays CBR
+        // (pre-rc.42 behaviour); ROOMLER_AGENT_VP9_RC_MODE=vbr lets the
+        // encoder burst on scene changes at the cost of a spikier
+        // bitrate envelope. Plan rc.43 flips the default after one
+        // cycle of field data. See [[plan]] cycle 1.1.
+        let rc_mode = rc_mode_from_env();
+        cfg.rc_end_usage = rc_mode;
         cfg.g_pass = vpx::vpx_enc_pass::VPX_RC_ONE_PASS;
         cfg.g_lag_in_frames = 0;
         cfg.g_threads = num_cpus_for_encode();
@@ -210,7 +216,15 @@ impl Vp9Encoder {
         // cadence — RustDesk's failure mode, materially smoother on
         // window-drag motion at 4K than our pre-rc.33 stutter mode.
         cfg.rc_undershoot_pct = 95;
-        cfg.rc_overshoot_pct = 25;
+        // rc.42 — VBR mode wants more overshoot headroom so scene-change
+        // frames can splurge. CBR keeps the tight 25 % overshoot from
+        // rc.33. Both modes share the same permissive 95 % undershoot
+        // (idle frames go small no matter what).
+        cfg.rc_overshoot_pct = if rc_mode == vpx::vpx_rc_mode::VPX_VBR {
+            50
+        } else {
+            25
+        };
         cfg.rc_min_quantizer = 0;
         cfg.rc_max_quantizer = 63;
 
@@ -580,6 +594,35 @@ fn cpu_used_from_env() -> c_int {
         .and_then(|v| v.trim().parse::<i32>().ok())
         .unwrap_or(DEFAULT_CPU_USED);
     raw.clamp(4, 9) as c_int
+}
+
+/// Read the `ROOMLER_AGENT_VP9_RC_MODE` env var. Default `cbr` (pre-
+/// rc.42 behaviour). Accepted: `cbr` | `vbr` | `cq`. Any unrecognised
+/// value falls back to `cbr` with a debug-log line.
+///
+/// rc.42 ships this behind an env var (default cbr); rc.43 flips the
+/// default to vbr after one field cycle on PC50045 confirms the
+/// envelope is acceptable.
+fn rc_mode_from_env() -> vpx::vpx_rc_mode {
+    let raw = std::env::var("ROOMLER_AGENT_VP9_RC_MODE").unwrap_or_default();
+    let parsed = match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "cbr" => vpx::vpx_rc_mode::VPX_CBR,
+        "vbr" => vpx::vpx_rc_mode::VPX_VBR,
+        "cq" => vpx::vpx_rc_mode::VPX_CQ,
+        other => {
+            tracing::debug!(
+                value = other,
+                "vp9-444: unrecognised ROOMLER_AGENT_VP9_RC_MODE — falling back to cbr"
+            );
+            vpx::vpx_rc_mode::VPX_CBR
+        }
+    };
+    tracing::info!(
+        mode = ?parsed,
+        env_value = %raw,
+        "vp9-444: rate-control mode selected"
+    );
+    parsed
 }
 
 #[cfg(test)]
