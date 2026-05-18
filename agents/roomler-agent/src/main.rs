@@ -1175,6 +1175,13 @@ fn service_status_as_service() -> Result<()> {
 /// supervisor reads it from `std::env::var("ROOMLER_AGENT_ENABLE_SYSTEM_SWAP")`
 /// in `win_service::supervisor::system_swap_enabled()` and any drift
 /// would silently break the gate.
+///
+/// Windows-only: the `enable-system-context` / `disable-system-context`
+/// CLI commands that reference it are gated on `target_os = "windows"`,
+/// so the constant has no Linux/macOS consumers — cfg-gate the const to
+/// match (else CI's `cargo clippy --workspace -- -D warnings` on the
+/// Ubuntu runner errors with "constant is never used").
+#[cfg(target_os = "windows")]
 const SYSTEM_CONTEXT_ENV_VAR: &str = "ROOMLER_AGENT_ENABLE_SYSTEM_SWAP";
 
 /// Default per-transition timeout for the post-write service restart.

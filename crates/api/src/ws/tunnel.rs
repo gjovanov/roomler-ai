@@ -196,16 +196,16 @@ pub async fn handle_tunnel_client_socket(
                 // Relay the teardown to the agent so it tears down
                 // its peer state too. Best-effort — agent may be
                 // offline.
-                if let Some(s) = session.as_ref() {
-                    if s.tunnel_session_id == session_id {
-                        let _ = state.rc_hub.send_to_agent(
-                            s.agent_id,
-                            ServerMsg::TunnelTerminate {
-                                session_id: s.tunnel_session_id,
-                                reason: reason.clone(),
-                            },
-                        );
-                    }
+                if let Some(s) = session.as_ref()
+                    && s.tunnel_session_id == session_id
+                {
+                    let _ = state.rc_hub.send_to_agent(
+                        s.agent_id,
+                        ServerMsg::TunnelTerminate {
+                            session_id: s.tunnel_session_id,
+                            reason,
+                        },
+                    );
                 }
                 if let Some(s) = session.take() {
                     state.tunnel_clients_by_session.remove(&s.tunnel_session_id);
@@ -861,10 +861,10 @@ async fn relay_half_close_to_agent(
     }
 }
 
-/// Relay a `ClientMsg::TcpClosed` from the tunnel-client to the agent
-/// + append an audit row. The flow is fully closed at this point —
-/// `tunnel_audit` records the close reason so admins can reconstruct
-/// the lifecycle.
+/// Relay a `ClientMsg::TcpClosed` from the tunnel-client to the
+/// agent and append an audit row. The flow is fully closed at this
+/// point; `tunnel_audit` records the close reason so admins can
+/// reconstruct the lifecycle.
 #[allow(clippy::too_many_arguments)]
 async fn relay_tcp_closed_to_agent(
     state: &AppState,
