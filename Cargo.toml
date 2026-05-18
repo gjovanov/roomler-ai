@@ -5,6 +5,7 @@ members = [
     "crates/db",
     "crates/services",
     "crates/remote_control",
+    "crates/tunnel-core",
 
     "crates/api",
     "crates/tests",
@@ -12,6 +13,7 @@ members = [
     "agents/roomler-agent",
     "agents/roomler-agent-tray",
     "agents/roomler-installer",
+    "agents/roomler-tunnel",
 ]
 exclude = [
     # Vendored upstream (kept verbatim except the H265 payloader fix);
@@ -20,6 +22,11 @@ exclude = [
     # Vendored upstream (kept verbatim except agent_gather.rs); adds the
     # TURNS-over-TCP relay code path that upstream marked NOT_PLANNED.
     "crates/vendored/webrtc-ice",
+    # Vendored upstream with a SettingEngine setter that exposes the
+    # SCTP `a_rwnd` (was hardcoded to 0 = 1 MiB upstream default).
+    # Needed for roomler-tunnel native-to-native peers to advertise
+    # 8 MiB so DC throughput stays link-bound at high BDP.
+    "crates/vendored/webrtc",
 ]
 
 # Patch webrtc-rs's rtp-0.12.0 dependency with our local vendored copy
@@ -38,9 +45,20 @@ exclude = [
 # so the roomler-agent can establish relay candidates from corporate
 # networks that block UDP entirely. See agent_gather.rs and the new
 # tcp_turn_conn.rs module for the patch notes.
+#
+# webrtc-0.12.0: upstream SettingEngine has no way to set SCTP
+# `max_receive_buffer_size` — `RTCSctpTransport::start` hardcodes 0
+# which falls back to the 1 MiB INITIAL_RECV_BUF_SIZE constant in
+# webrtc-sctp-0.11.0. At 50-100 ms RTT this caps single-stream DC
+# throughput at ~80-167 Mbps. roomler-tunnel native-to-native peers
+# need 8 MiB rwnd to stay link-bound on home-broadband paths. Our
+# vendored copy adds set_sctp_max_receive_buffer_size to
+# SettingEngine and threads it through the SCTP `Config` constructor.
+# See crates/vendored/webrtc/Cargo.toml for the full patch notes.
 [patch.crates-io]
 rtp = { path = "crates/vendored/rtp" }
 webrtc-ice = { path = "crates/vendored/webrtc-ice" }
+webrtc = { path = "crates/vendored/webrtc" }
 
 [workspace.package]
 version = "0.3.0-rc.39"

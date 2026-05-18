@@ -214,14 +214,39 @@ enum Command {
     /// `ImagePath` argv.
     #[command(hide = true, name = "service-run")]
     ServiceRun,
-    /// Write a single `name=value` entry into the `RoomlerAgentService`
-    /// SCM `Environment` REG_MULTI_SZ block. Closes the docs gap from
-    /// CLAUDE.md / HANDOVER23 / the wizard's Done-page PowerShell
-    /// snippet that referenced this subcommand before it had a CLI
-    /// surface. Reuses the `win_service::environment` helpers that
-    /// shipped in rc.27. Pair with `restart-service` so the change
-    /// applies on the next process start. Windows-only. Requires
-    /// admin (HKLM write).
+    /// Enable SystemContext mode on a perMachine install. Writes
+    /// `ROOMLER_AGENT_ENABLE_SYSTEM_SWAP=1` into the `RoomlerAgentService`
+    /// SCM `Environment` REG_MULTI_SZ block and restarts the service so
+    /// the supervisor picks up the new env on its next worker spawn.
+    /// Requires admin (HKLM write + SCM Stop/Start). Idempotent: re-runs
+    /// are no-ops if the env var is already set and the service is
+    /// running. Used as the operator-facing rescue path AND shelled by
+    /// the rc.37 WiX EXE-deferred custom action that runs inside the
+    /// MSI's existing UAC elevation.
+    EnableSystemContext {
+        /// Skip the post-write service restart. Useful when the operator
+        /// is about to do something else service-affecting and wants to
+        /// batch the restart. Default: restart after writing.
+        #[arg(long)]
+        no_restart: bool,
+    },
+    /// Disable SystemContext mode on a perMachine install. Removes
+    /// `ROOMLER_AGENT_ENABLE_SYSTEM_SWAP` from the `RoomlerAgentService`
+    /// SCM `Environment` block and restarts the service. The supervisor
+    /// reverts to the user-context worker on next spawn. Requires admin.
+    DisableSystemContext {
+        /// Skip the post-write service restart. Mirrors
+        /// `enable-system-context --no-restart`.
+        #[arg(long)]
+        no_restart: bool,
+    },
+    /// Write a single name=value entry into the `RoomlerAgentService`
+    /// SCM `Environment` REG_MULTI_SZ block. Omit `--value` to REMOVE
+    /// the entry. Operators may use this directly, or the higher-level
+    /// `enable-system-context` / `disable-system-context` wrappers.
+    /// The rc.30 Done-page snippet in the installer wizard references
+    /// this subcommand by name, so the surface is load-bearing for
+    /// any rc.28+ wizard EXE in the field. Requires admin (HKLM write).
     ///
     /// Typical use:
     ///   roomler-agent set-service-env-var --name ROOMLER_AGENT_VP9_FPS --value 60
@@ -229,7 +254,7 @@ enum Command {
     #[command(name = "set-service-env-var")]
     SetServiceEnvVar {
         /// Env var name (e.g. `ROOMLER_AGENT_VP9_FPS`,
-        /// `ROOMLER_AGENT_VP9_CPU_USED`, `ROOMLER_AGENT_ENABLE_SYSTEM_SWAP`).
+        /// `ROOMLER_AGENT_ENABLE_SYSTEM_SWAP`).
         #[arg(long)]
         name: String,
         /// Env var value. Empty string is allowed (stored as
@@ -238,14 +263,17 @@ enum Command {
         value: Option<String>,
     },
     /// Restart the `RoomlerAgentService` via the SCM. Used after
-    /// `set-service-env-var` to apply the new env block. Windows-only;
-    /// requires admin (SCM Stop+Start). Worst-case wall-time is
-    /// `2 × --timeout-secs`.
+    /// `set-service-env-var` (or the higher-level
+    /// `enable-system-context` / `disable-system-context`) to apply
+    /// the new env block. Windows-only; requires admin (SCM
+    /// Stop+Start). Worst-case wall-time is `2 × --timeout-secs`.
     #[command(name = "restart-service")]
     RestartService {
         /// Per-transition timeout in seconds (Stop → Stopped, then
-        /// Start → Running). Default 120 s — comfortable for Windows
-        /// Defender real-time-scan-during-fresh-EXE-launch.
+        /// Start → Running). Worst-case wall time is ~2 × this value.
+        /// Default 120 s is comfortable for Windows Defender
+        /// real-time-scan-during-fresh-EXE-launch — drop to 60 s for
+        /// faster CI iteration when Defender isn't in the loop.
         #[arg(long, default_value_t = 120)]
         timeout_secs: u64,
     },
@@ -416,10 +444,6 @@ async fn main() -> Result<()> {
         Command::PeerPresenceStatus => peer_presence_status_cmd(),
         Command::Service { action } => service_cmd(action).await,
         Command::ServiceRun => service_run_cmd().await,
-        Command::SetServiceEnvVar { name, value } => {
-            set_service_env_var_cmd(&name, value.as_deref())
-        }
-        Command::RestartService { timeout_secs } => restart_service_cmd(timeout_secs),
         Command::CleanupLegacyInstall {
             target_flavour,
             dry_run,
@@ -430,6 +454,12 @@ async fn main() -> Result<()> {
             deny,
         } => consent_cmd(&session, approve, deny),
         Command::SelfUpdate { check_only } => self_update_cmd(check_only).await,
+        Command::EnableSystemContext { no_restart } => enable_system_context_cmd(no_restart),
+        Command::DisableSystemContext { no_restart } => disable_system_context_cmd(no_restart),
+        Command::SetServiceEnvVar { name, value } => {
+            set_service_env_var_cmd(&name, value.as_deref())
+        }
+        Command::RestartService { timeout_secs } => restart_service_cmd(timeout_secs),
         Command::PostInstallWatch {
             installer_pid,
             installer_path,
@@ -1128,28 +1158,75 @@ fn service_status_as_service() -> Result<()> {
     bail!("`service status --as-service` is Windows-only.");
 }
 
+/// Env var the supervisor reads to gate the SystemContext worker swap.
+/// Single source of truth; do NOT inline this string elsewhere — the
+/// supervisor reads it from `std::env::var("ROOMLER_AGENT_ENABLE_SYSTEM_SWAP")`
+/// in `win_service::supervisor::system_swap_enabled()` and any drift
+/// would silently break the gate.
+const SYSTEM_CONTEXT_ENV_VAR: &str = "ROOMLER_AGENT_ENABLE_SYSTEM_SWAP";
+
+/// Default per-transition timeout for the post-write service restart.
+/// 120 s covers Windows Defender real-time-scan delay on a fresh EXE
+/// install; cut to 60 s when running in CI without Defender in the
+/// loop.
 #[cfg(target_os = "windows")]
-async fn service_run_cmd() -> Result<()> {
-    // Hand control to the SCM dispatcher. Blocks until SCM signals
-    // Stop. NOTE: this MUST run on the main OS thread (not inside a
-    // tokio worker), because `service_dispatcher::start` calls
-    // `StartServiceCtrlDispatcherW` which expects to take over the
-    // calling thread. We achieve "main thread" here by running before
-    // any other work in the binary's CLI dispatch — the
-    // `#[tokio::main]` runtime is already alive but we never await
-    // anything before this call, so the OS thread is still
-    // effectively the binary's main thread for SCM purposes.
-    win_service::run_in_dispatcher().context("running service dispatcher")
+const DEFAULT_RESTART_TIMEOUT_SECS: u64 = 120;
+
+#[cfg(target_os = "windows")]
+fn enable_system_context_cmd(no_restart: bool) -> Result<()> {
+    use roomler_agent::win_service::environment;
+    use std::time::Duration;
+
+    environment::set_service_env_var(SYSTEM_CONTEXT_ENV_VAR, "1")
+        .with_context(|| format!("setting {SYSTEM_CONTEXT_ENV_VAR}=1"))?;
+    println!("{SYSTEM_CONTEXT_ENV_VAR}=1 written to SCM service env block.");
+
+    if no_restart {
+        println!(
+            "--no-restart: skipping service restart. Run `roomler-agent restart-service` to apply."
+        );
+        return Ok(());
+    }
+    environment::restart_service(Duration::from_secs(DEFAULT_RESTART_TIMEOUT_SECS))
+        .context("restarting RoomlerAgentService")?;
+    println!("RoomlerAgentService restarted. SystemContext mode is active.");
+    Ok(())
 }
 
 #[cfg(not(target_os = "windows"))]
-async fn service_run_cmd() -> Result<()> {
-    bail!("`service-run` is Windows-only — invoked by the SCM, not directly by operators.");
+fn enable_system_context_cmd(_no_restart: bool) -> Result<()> {
+    bail!("`enable-system-context` is Windows-only.")
+}
+
+#[cfg(target_os = "windows")]
+fn disable_system_context_cmd(no_restart: bool) -> Result<()> {
+    use roomler_agent::win_service::environment;
+    use std::time::Duration;
+
+    environment::unset_service_env_var(SYSTEM_CONTEXT_ENV_VAR)
+        .with_context(|| format!("unsetting {SYSTEM_CONTEXT_ENV_VAR}"))?;
+    println!("{SYSTEM_CONTEXT_ENV_VAR} removed from SCM service env block.");
+
+    if no_restart {
+        println!(
+            "--no-restart: skipping service restart. Run `roomler-agent restart-service` to apply."
+        );
+        return Ok(());
+    }
+    environment::restart_service(Duration::from_secs(DEFAULT_RESTART_TIMEOUT_SECS))
+        .context("restarting RoomlerAgentService")?;
+    println!("RoomlerAgentService restarted. SystemContext mode is disabled.");
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn disable_system_context_cmd(_no_restart: bool) -> Result<()> {
+    bail!("`disable-system-context` is Windows-only.")
 }
 
 #[cfg(target_os = "windows")]
 fn set_service_env_var_cmd(name: &str, value: Option<&str>) -> Result<()> {
-    use crate::win_service::environment;
+    use roomler_agent::win_service::environment;
     match value {
         Some(v) => {
             environment::set_service_env_var(name, v)
@@ -1171,21 +1248,41 @@ fn set_service_env_var_cmd(name: &str, value: Option<&str>) -> Result<()> {
 
 #[cfg(not(target_os = "windows"))]
 fn set_service_env_var_cmd(_name: &str, _value: Option<&str>) -> Result<()> {
-    bail!("`set-service-env-var` is Windows-only.");
+    bail!("`set-service-env-var` is Windows-only.")
 }
 
 #[cfg(target_os = "windows")]
 fn restart_service_cmd(timeout_secs: u64) -> Result<()> {
-    use crate::win_service::environment;
-    environment::restart_service(std::time::Duration::from_secs(timeout_secs))
-        .with_context(|| format!("restart-service (timeout {timeout_secs}s per transition)"))?;
-    println!("RoomlerAgentService restarted; service now inherits the latest env block.");
+    use roomler_agent::win_service::environment;
+    use std::time::Duration;
+    environment::restart_service(Duration::from_secs(timeout_secs))
+        .context("restarting RoomlerAgentService")?;
+    println!("RoomlerAgentService restarted.");
     Ok(())
 }
 
 #[cfg(not(target_os = "windows"))]
 fn restart_service_cmd(_timeout_secs: u64) -> Result<()> {
-    bail!("`restart-service` is Windows-only.");
+    bail!("`restart-service` is Windows-only.")
+}
+
+#[cfg(target_os = "windows")]
+async fn service_run_cmd() -> Result<()> {
+    // Hand control to the SCM dispatcher. Blocks until SCM signals
+    // Stop. NOTE: this MUST run on the main OS thread (not inside a
+    // tokio worker), because `service_dispatcher::start` calls
+    // `StartServiceCtrlDispatcherW` which expects to take over the
+    // calling thread. We achieve "main thread" here by running before
+    // any other work in the binary's CLI dispatch — the
+    // `#[tokio::main]` runtime is already alive but we never await
+    // anything before this call, so the OS thread is still
+    // effectively the binary's main thread for SCM purposes.
+    win_service::run_in_dispatcher().context("running service dispatcher")
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn service_run_cmd() -> Result<()> {
+    bail!("`service-run` is Windows-only — invoked by the SCM, not directly by operators.");
 }
 
 async fn self_update_cmd(check_only: bool) -> Result<()> {
@@ -1447,4 +1544,120 @@ fn peer_presence_status_cmd() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! Locks the contract that the rc.30 installer wizard's Done-page
+    //! snippet relies on. If any of these parses break, the snippet at
+    //! `agents/roomler-installer/src/front/index.html:182` becomes a
+    //! dead-code instruction in operator hands.
+
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parses_enable_system_context_default() {
+        let cli = Cli::try_parse_from(["roomler-agent", "enable-system-context"]).unwrap();
+        match cli.command {
+            Some(Command::EnableSystemContext { no_restart }) => assert!(!no_restart),
+            other => panic!("expected EnableSystemContext, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_enable_system_context_no_restart() {
+        let cli = Cli::try_parse_from(["roomler-agent", "enable-system-context", "--no-restart"])
+            .unwrap();
+        match cli.command {
+            Some(Command::EnableSystemContext { no_restart }) => assert!(no_restart),
+            other => panic!("expected EnableSystemContext --no-restart, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_disable_system_context_default() {
+        let cli = Cli::try_parse_from(["roomler-agent", "disable-system-context"]).unwrap();
+        match cli.command {
+            Some(Command::DisableSystemContext { no_restart }) => assert!(!no_restart),
+            other => panic!("expected DisableSystemContext, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_set_service_env_var_long_form() {
+        let cli = Cli::try_parse_from([
+            "roomler-agent",
+            "set-service-env-var",
+            "--name",
+            "ROOMLER_AGENT_ENABLE_SYSTEM_SWAP",
+            "--value",
+            "1",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::SetServiceEnvVar { name, value }) => {
+                assert_eq!(name, "ROOMLER_AGENT_ENABLE_SYSTEM_SWAP");
+                assert_eq!(value.as_deref(), Some("1"));
+            }
+            other => panic!("expected SetServiceEnvVar, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_set_service_env_var_without_value_for_unset() {
+        let cli = Cli::try_parse_from([
+            "roomler-agent",
+            "set-service-env-var",
+            "--name",
+            "ROOMLER_AGENT_ENABLE_SYSTEM_SWAP",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::SetServiceEnvVar { name, value }) => {
+                assert_eq!(name, "ROOMLER_AGENT_ENABLE_SYSTEM_SWAP");
+                assert!(value.is_none(), "expected None (unset), got {value:?}");
+            }
+            other => panic!("expected SetServiceEnvVar, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_restart_service_default_timeout() {
+        let cli = Cli::try_parse_from(["roomler-agent", "restart-service"]).unwrap();
+        match cli.command {
+            Some(Command::RestartService { timeout_secs }) => assert_eq!(timeout_secs, 120),
+            other => panic!("expected RestartService, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_restart_service_custom_timeout() {
+        let cli = Cli::try_parse_from(["roomler-agent", "restart-service", "--timeout-secs", "60"])
+            .unwrap();
+        match cli.command {
+            Some(Command::RestartService { timeout_secs }) => assert_eq!(timeout_secs, 60),
+            other => panic!("expected RestartService --timeout-secs 60, got {other:?}"),
+        }
+    }
+
+    /// The rc.30 Done-page snippet's exact form. If this test parses,
+    /// any operator copy-pasting `front/index.html:182` will get a
+    /// recognised command. If it fails, the snippet is dead-code.
+    #[test]
+    fn rc30_done_page_snippet_parses() {
+        // Line 1: set-service-env-var
+        let cli = Cli::try_parse_from([
+            "roomler-agent",
+            "set-service-env-var",
+            "--name",
+            "ROOMLER_AGENT_ENABLE_SYSTEM_SWAP",
+            "--value",
+            "1",
+        ]);
+        assert!(cli.is_ok(), "rc.30 snippet line 1 must parse: {cli:?}");
+        // Line 2: restart-service
+        let cli = Cli::try_parse_from(["roomler-agent", "restart-service"]);
+        assert!(cli.is_ok(), "rc.30 snippet line 2 must parse: {cli:?}");
+    }
 }

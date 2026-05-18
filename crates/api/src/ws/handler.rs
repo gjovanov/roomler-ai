@@ -36,6 +36,7 @@ pub async fn ws_upgrade(
 ) -> Response {
     match params.role.as_deref() {
         Some("agent") => ws_upgrade_agent(state, params.token, ws),
+        Some("tunnel-client") => ws_upgrade_tunnel_client(state, params.token, ws),
         _ => ws_upgrade_user(state, params.token, ws),
     }
 }
@@ -63,6 +64,79 @@ fn ws_upgrade_user(state: AppState, token: String, ws: WebSocketUpgrade) -> Resp
     let username = claims.username.clone();
 
     ws.on_upgrade(move |socket| handle_socket(socket, state, user_id, username))
+}
+
+fn ws_upgrade_tunnel_client(state: AppState, token: String, ws: WebSocketUpgrade) -> Response {
+    let claims = match state.auth.verify_tunnel_client_token(&token) {
+        Ok(c) => c,
+        Err(_) => {
+            return Response::builder()
+                .status(401)
+                .body("Unauthorized (tunnel-client)".into())
+                .unwrap();
+        }
+    };
+
+    let tunnel_client_id = match ObjectId::parse_str(&claims.sub) {
+        Ok(id) => id,
+        Err(_) => {
+            return Response::builder()
+                .status(400)
+                .body("Invalid tunnel-client ID".into())
+                .unwrap();
+        }
+    };
+    let tenant_id = match ObjectId::parse_str(&claims.tenant_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return Response::builder()
+                .status(400)
+                .body("Invalid tenant ID".into())
+                .unwrap();
+        }
+    };
+    let owner_user_id = match ObjectId::parse_str(&claims.owner_user_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return Response::builder()
+                .status(400)
+                .body("Invalid owner user ID".into())
+                .unwrap();
+        }
+    };
+
+    ws.on_upgrade(move |socket| async move {
+        // Connect-time revocation check. Periodic re-check (every 60 s)
+        // lives in `ws::tunnel::handle_tunnel_client_socket`.
+        let client = match state
+            .tunnel_clients
+            .find_in_tenant(tenant_id, tunnel_client_id)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(%tunnel_client_id, %e, "tunnel-client lookup failed on WS connect");
+                return;
+            }
+        };
+        if client.deleted_at.is_some()
+            || matches!(
+                client.status,
+                roomler_ai_remote_control::models::AgentStatus::Quarantined
+            )
+        {
+            info!(%tunnel_client_id, "tunnel-client is quarantined or deleted; refusing WS");
+            return;
+        }
+        crate::ws::tunnel::handle_tunnel_client_socket(
+            state,
+            socket,
+            tunnel_client_id,
+            tenant_id,
+            owner_user_id,
+        )
+        .await;
+    })
 }
 
 fn ws_upgrade_agent(state: AppState, token: String, ws: WebSocketUpgrade) -> Response {

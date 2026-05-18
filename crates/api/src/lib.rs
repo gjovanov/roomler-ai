@@ -283,6 +283,19 @@ pub fn build_router(state: AppState) -> Router {
         // directly.
         .route("/crash", post(routes::agent_crash::ingest));
 
+    // roomler-tunnel routes — same enrollment two-step shape as the
+    // agent, but a distinct audience (`TunnelClient` JWT) so a leaked
+    // agent token can't impersonate a client and vice-versa. CRUD +
+    // policy + audit endpoints land in T2.
+    let tunnel_client_routes = Router::new()
+        .route("/", get(routes::tunnel::list_tunnel_clients))
+        .route(
+            "/enroll-token",
+            post(routes::tunnel::issue_tunnel_enrollment_token),
+        );
+    let public_tunnel_routes =
+        Router::new().route("/enroll", post(routes::tunnel::enroll_tunnel_client));
+
     // TURN credentials (user-scoped, no tenant prefix)
     let turn_routes = Router::new().route(
         "/credentials",
@@ -300,6 +313,7 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/push", push_routes)
         .nest("/notification", notification_routes)
         .nest("/agent", public_agent_routes)
+        .nest("/tunnel-client", public_tunnel_routes)
         .nest("/turn", turn_routes)
         .nest("/tenant", tenant_routes)
         .nest("/tenant/{tenant_id}/member", member_routes)
@@ -317,6 +331,7 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/tenant/{tenant_id}/task", task_routes)
         .nest("/tenant/{tenant_id}/export", export_routes)
         .nest("/tenant/{tenant_id}/agent", agent_routes)
+        .nest("/tenant/{tenant_id}/tunnel-client", tunnel_client_routes)
         .nest("/tenant/{tenant_id}/session", remote_session_routes);
 
     // Health check

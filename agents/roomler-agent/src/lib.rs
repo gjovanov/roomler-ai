@@ -34,6 +34,7 @@ pub mod service;
 pub mod signaling;
 #[cfg(feature = "system-context")]
 pub mod system_context;
+pub mod tunnel;
 pub mod updater;
 pub mod watchdog;
 #[cfg(target_os = "windows")]

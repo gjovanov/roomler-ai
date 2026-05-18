@@ -242,6 +242,52 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> 
     )
     .await?;
 
+    // roomler-tunnel clients — same uniqueness contract as agents
+    // (re-enroll-on-same-machine rehydrates the soft-deleted row in
+    // place). `owner_user_id` index speeds the "my tunnel clients"
+    // view on the user-facing dashboard.
+    create_indexes(
+        db,
+        "tunnel_clients",
+        vec![
+            index_unique(bson::doc! { "tenant_id": 1, "machine_id": 1 }),
+            index(bson::doc! { "tenant_id": 1, "status": 1 }),
+            index(bson::doc! { "owner_user_id": 1 }),
+        ],
+    )
+    .await?;
+
+    // Tunnel policies — tenant-scoped allowlists. The server-side ACL
+    // gate fetches `list_active_for_tenant(tenant_id)` on every
+    // TcpForwardRequest; the (tenant_id, deleted_at) compound index
+    // covers that query precisely.
+    create_indexes(
+        db,
+        "tunnel_policies",
+        vec![
+            index(bson::doc! { "tenant_id": 1, "deleted_at": 1 }),
+            index(bson::doc! { "tenant_id": 1, "name": 1 }),
+        ],
+    )
+    .await?;
+
+    // Tunnel audit log — 90-day retention mirroring remote_audit.
+    // Compound index on (tenant_id, dst_host, at) backs the admin
+    // "who connected to X in the last 7 days?" query in T4. The
+    // standalone (session_id, at) entry mirrors the remote_audit
+    // pattern for per-session reconstruction.
+    create_indexes(
+        db,
+        "tunnel_audit",
+        vec![
+            index(bson::doc! { "tunnel_session_id": 1, "at": 1 }),
+            index(bson::doc! { "tenant_id": 1, "dst_host": 1, "at": -1 }),
+            index(bson::doc! { "tenant_id": 1, "at": -1 }),
+            index_ttl(bson::doc! { "at": 1 }, 90 * 24 * 60 * 60),
+        ],
+    )
+    .await?;
+
     info!("All indexes ensured");
     Ok(())
 }
