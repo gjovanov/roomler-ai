@@ -144,22 +144,39 @@ data-plane close; emit the wire `TcpHalfClose` purely for the
 `tunnel_audit` accounting in the server. `run_flow` now takes a
 `HalfCloseSink: Arc<dyn Fn(u32)>` the caller wires to the WS sink.
 
-**Still open — T2.10c (server-side relay):**
+**T2.10c (server-side relay) — DONE 2026-05-19:**
 
-Server-side `crates/api/src/ws/tunnel.rs::handle_tcp_forward_request`
-still synthesises an Accept with `dc_index: 0` for now. The real
-implementation needs:
+| Sub-task | Status | Files |
+|---|---|---|
+| T2.10c.1 — `Hub::send_to_agent` + `AppState::tunnel_clients_by_session` | ✅ | `crates/remote_control/src/hub.rs`, `crates/api/src/state.rs` |
+| T2.10c.2 — Tunnel WS refactored to mpsc-based outbound + pump | ✅ | `crates/api/src/ws/tunnel.rs` |
+| T2.10c.3 — Real relay in `handle_tcp_forward_request` | ✅ | same |
+| T2.10c.4 — Agent → tunnel-client relay (`relay_tunnel_msg_from_agent`) | ✅ | `crates/api/src/ws/remote_control.rs` |
+| T2.10c.5 — Tunnel-client → agent relay for HalfClose / Closed / Terminate | ✅ | `crates/api/src/ws/tunnel.rs` |
+| T2.10c.6 — Distinct `rc:tunnel.sdp.{offer,answer}` + `rc:tunnel.ice` wire types | ✅ | `crates/remote_control/src/signaling.rs`, both WS handlers, tunnel-client `forward.rs` |
 
-1. `AppState` to expose `agent_outbound_by_id: Arc<Mutex<HashMap<ObjectId, mpsc::Sender<ServerMsg>>>>` populated by the agent WS handler.
-2. On `ClientMsg::TcpForwardRequest`: after policy gate, build `ServerMsg::TcpForwardForward { session_id, flow_id, dst_host, dst_port, owner_user_id }` and push it to the agent's outbound channel.
-3. On `ClientMsg::TcpForwardAccept/Reject` from the agent: relay back to the tunnel-client WS keyed by `session_id`. Needs a `tunnel_client_outbound_by_session: HashMap<ObjectId, Sender<ServerMsg>>` too.
-4. On `ClientMsg::TcpHalfClose` / `TcpClosed` from either side: append to `tunnel_audit`, relay to the peer.
+The server now actually forwards `ClientMsg::TcpForwardRequest` to the agent as `ServerMsg::TcpForwardForward`, awaits the agent's `ClientMsg::TcpForwardAccept` / `Reject`, and relays it back. SDP/ICE handshake uses dedicated `rc:tunnel.sdp.*` / `rc:tunnel.ice` discriminators so the server can route by `session_id` against `tunnel_clients_by_session` without name-conflicting with the remote-control session namespace.
 
-This is squarely services/api layer work that **cannot be locally tested on this Windows box** (memory `feedback-windows-no-local-backend`). Best done on mars or via a CI dev container.
+**Cannot validate locally** — services/api/tests hit openssl-sys MSVC blocker. Locally green:
+- `roomler-ai-tunnel-core --lib`: 37/37
+- `roomler-ai-remote-control --lib`: 37/37 (3 new wire-format locks)
+- `roomler-tunnel --lib`: 17/17
+- `roomler-agent --lib tunnel::`: 12/12
+- Workspace `cargo check -p {tunnel-core,remote_control,roomler-tunnel,roomler-agent}` clean
+- `cargo fmt --all -- --check` clean
 
-**Still open — T2.10d (end-to-end smoke):**
+**Still open — T2.10d (agent-side TunnelPeer + answerer pipeline):**
 
-Once T2.10c lands, the end-to-end test is:
+For end-to-end smoke through a real agent the agent process needs a complete answerer-side mirror of the tunnel-client's WebRTC handshake:
+
+1. New module `agents/roomler-agent/src/tunnel/peer.rs` — wrap `TunnelPeer` for the answerer side. Construct on `ServerMsg::TunnelSdpOffer`, call `accept_offer` + emit `ClientMsg::TunnelSdpAnswer` + `ClientMsg::TunnelIce` trickle.
+2. Per-tunnel-session state in `agent/src/signaling.rs` — track `tunnel_session_id` → `TunnelPeer` so SDP/ICE/TcpForwardForward route to the right peer.
+3. `tunnel::acceptor::handle_forward_request` upgraded — currently dials dst then drops the stream. T2.10d needs to register the flow on the agent-side `FlowDemux` and spawn `tunnel_core::forward::run_flow` with a `HalfCloseSink` wired to emit `ClientMsg::TcpHalfClose` over the agent's outbound WS.
+4. Agent-side audit row for `TcpClosed` (mirror of `audit_tcp_close` on the server side).
+
+**Still open — T2.10e (end-to-end smoke):**
+
+Once T2.10d lands, the end-to-end test is:
 1. SSH into mars or use a real Linux box as the agent host.
 2. Enroll the agent (`roomler-agent enroll --server https://roomler.ai --token <admin-issued> --name <label>`).
 3. On the operator laptop: `cargo install --path agents/roomler-tunnel` (or download from a future agent-v0.3.0-rc.40 release).
