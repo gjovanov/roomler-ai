@@ -1,24 +1,94 @@
-//! Receives `ServerMsg::TcpForwardForward` from the WS, runs the
-//! agent-side ACL, dials dst, and synthesises a
-//! `ClientMsg::TcpForwardAccept` or `TcpForwardReject` for the
-//! signaling loop to send back.
+//! Agent-side handler for one inbound `ServerMsg::TcpForwardForward`.
 //!
-//! T2.6 ships the request-side roundtrip (ACL → dial → accept/reject
-//! wire reply). The accepted `TcpStream` is dropped immediately —
-//! the DC pump wiring lands in T2.7-9 once the WebRTC peer + DC pool
-//! exist on the agent side.
+//! Splits into two steps so the policy + dial logic stays unit-
+//! testable without spinning up a real `AgentTunnelPeer`:
+//!
+//! 1. [`decide_forward`] applies the agent-local [`AgentForwardAcl`]
+//!    then dials dst with a bounded timeout. Returns either the open
+//!    `TcpStream` (caller pipes it into the DC) or a typed
+//!    `TcpForwardReject` to be shipped over the WS.
+//! 2. [`handle_forward_request`] wires the decision into the data
+//!    plane: registers the flow on the right `FlowDemux`, replies
+//!    `TcpForwardAccept`, spawns `tunnel_core::forward::run_flow`,
+//!    and on close cleans the flow + emits `TcpClosed` for audit.
+
+use std::sync::Arc;
+use std::time::Duration;
 
 use bson::oid::ObjectId;
 use roomler_ai_remote_control::signaling::{ClientMsg, RejectKind};
-use std::time::Duration;
+use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use super::acl::{AclDecision, AgentForwardAcl};
 use super::dialer::{DialError, dial_dst};
+use super::peer::AgentTunnelPeer;
 
-/// Handle one inbound `ServerMsg::TcpForwardForward`. Returns the
-/// `ClientMsg` the signaling loop should send back (Accept or
-/// Reject).
+/// Cap on how long we'll wait for the DC pool to finish opening
+/// before bailing on a forward request. The pool usually opens
+/// within seconds of `TunnelSdpOffer`; this only fires when a
+/// forward arrives suspiciously early or the peer connection
+/// stalled.
+const POOL_READY_WAIT: Duration = Duration::from_secs(10);
+
+/// Policy + dial layer. Pure decision logic, no peer interaction —
+/// keeps the unit tests self-contained.
+pub async fn decide_forward(
+    session_id: ObjectId,
+    flow_id: u32,
+    dst_host: &str,
+    dst_port: u16,
+    acl: &AgentForwardAcl,
+    dial_timeout: Duration,
+) -> Result<TcpStream, ClientMsg> {
+    if let AclDecision::Reject { reason } = acl.check(dst_host, dst_port) {
+        info!(
+            %session_id, %flow_id, %dst_host, %dst_port, %reason,
+            "agent ACL rejected forward"
+        );
+        return Err(ClientMsg::TcpForwardReject {
+            session_id,
+            flow_id,
+            kind: RejectKind::AclDenied,
+            reason: format!("agent: {reason}"),
+        });
+    }
+    match dial_dst(dst_host, dst_port, dial_timeout).await {
+        Ok(stream) => {
+            debug!(
+                %session_id, %flow_id, %dst_host, %dst_port,
+                peer = ?stream.peer_addr().ok(),
+                "agent dialed dst; preparing flow"
+            );
+            Ok(stream)
+        }
+        Err(DialError::Timeout(d)) => {
+            warn!(%session_id, %flow_id, %dst_host, %dst_port, ?d, "dial timeout");
+            Err(ClientMsg::TcpForwardReject {
+                session_id,
+                flow_id,
+                kind: RejectKind::DialFailed,
+                reason: format!("dial timed out after {d:?}"),
+            })
+        }
+        Err(DialError::Io(e)) => {
+            warn!(%session_id, %flow_id, %dst_host, %dst_port, %e, "dial failed");
+            Err(ClientMsg::TcpForwardReject {
+                session_id,
+                flow_id,
+                kind: RejectKind::DialFailed,
+                reason: format!("dial: {e}"),
+            })
+        }
+    }
+}
+
+/// End-to-end driver for one `TcpForwardForward`. Decides, dials,
+/// wires the flow into the DC pool, and runs the bidirectional pump
+/// to completion. Sends `TcpForwardAccept` / `Reject` and the final
+/// `TcpClosed` audit message itself via `outbound`.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_forward_request(
     session_id: ObjectId,
     flow_id: u32,
@@ -26,60 +96,88 @@ pub async fn handle_forward_request(
     dst_port: u16,
     acl: &AgentForwardAcl,
     dial_timeout: Duration,
-) -> ClientMsg {
-    // 1. Local ACL (belt-and-suspenders — server already gated).
-    if let AclDecision::Reject { reason } = acl.check(dst_host, dst_port) {
-        info!(
-            %session_id, %flow_id, %dst_host, %dst_port, %reason,
-            "agent ACL rejected forward"
-        );
-        return ClientMsg::TcpForwardReject {
-            session_id,
-            flow_id,
-            kind: RejectKind::AclDenied,
-            reason: format!("agent: {reason}"),
+    tunnel_peer: &Arc<AgentTunnelPeer>,
+    outbound: mpsc::Sender<ClientMsg>,
+) {
+    let stream =
+        match decide_forward(session_id, flow_id, dst_host, dst_port, acl, dial_timeout).await {
+            Ok(s) => s,
+            Err(reject) => {
+                let _ = outbound.send(reject).await;
+                return;
+            }
         };
+
+    // Make sure the DC pool is fully open before assigning a channel.
+    // Under normal operation the SDP/ICE handshake finishes long
+    // before the first flow request, so this resolves immediately.
+    if !tunnel_peer.wait_pool_ready(POOL_READY_WAIT).await {
+        warn!(%session_id, %flow_id, "DC pool not ready within budget — rejecting");
+        let _ = outbound
+            .send(ClientMsg::TcpForwardReject {
+                session_id,
+                flow_id,
+                kind: RejectKind::AgentError,
+                reason: "DC pool not ready on agent".into(),
+            })
+            .await;
+        return;
     }
 
-    // 2. Dial dst with timeout.
-    match dial_dst(dst_host, dst_port, dial_timeout).await {
-        Ok(stream) => {
-            debug!(
-                %session_id, %flow_id, %dst_host, %dst_port,
-                peer = ?stream.peer_addr().ok(),
-                "agent dialed dst; replying Accept"
-            );
-            // T2.7-9: hand the stream to the DC pump. For now we
-            // drop it — the operator's integration test asserts the
-            // Accept wire roundtrip; data-plane checks come later.
-            drop(stream);
-            ClientMsg::TcpForwardAccept {
+    let pool_size = tunnel_peer.pool_size().await;
+    if pool_size == 0 {
+        let _ = outbound
+            .send(ClientMsg::TcpForwardReject {
                 session_id,
                 flow_id,
-                // dc_index hardcoded to 0 in T2.6 — the actual DC
-                // pool assignment lands when the pool exists.
-                dc_index: 0,
-            }
-        }
-        Err(DialError::Timeout(d)) => {
-            warn!(%session_id, %flow_id, %dst_host, %dst_port, ?d, "dial timeout");
-            ClientMsg::TcpForwardReject {
-                session_id,
-                flow_id,
-                kind: RejectKind::DialFailed,
-                reason: format!("dial timed out after {d:?}"),
-            }
-        }
-        Err(DialError::Io(e)) => {
-            warn!(%session_id, %flow_id, %dst_host, %dst_port, %e, "dial failed");
-            ClientMsg::TcpForwardReject {
-                session_id,
-                flow_id,
-                kind: RejectKind::DialFailed,
-                reason: format!("dial: {e}"),
-            }
-        }
+                kind: RejectKind::AgentError,
+                reason: "empty DC pool on agent".into(),
+            })
+            .await;
+        return;
     }
+    let dc_index = (flow_id % pool_size as u32) as u8;
+    let Some(demux) = tunnel_peer.demux(dc_index).await else {
+        let _ = outbound
+            .send(ClientMsg::TcpForwardReject {
+                session_id,
+                flow_id,
+                kind: RejectKind::AgentError,
+                reason: format!("demux missing for dc_index={dc_index}"),
+            })
+            .await;
+        return;
+    };
+
+    let from_dc = demux.register(flow_id).await;
+    let dc = demux.dc();
+
+    // Accept the flow + start pumping.
+    if let Err(e) = outbound
+        .send(ClientMsg::TcpForwardAccept {
+            session_id,
+            flow_id,
+            dc_index,
+        })
+        .await
+    {
+        debug!(%session_id, %flow_id, %e, "TcpForwardAccept send failed (channel closed)");
+        demux.unregister(flow_id).await;
+        return;
+    }
+
+    let half_close = tunnel_peer.half_close_sink(outbound.clone());
+    let close_reason =
+        tunnel_core::forward::run_flow(stream, dc, flow_id, from_dc, half_close).await;
+    demux.unregister(flow_id).await;
+    info!(%session_id, %flow_id, ?close_reason, "agent flow ended");
+    let _ = outbound
+        .send(ClientMsg::TcpClosed {
+            session_id,
+            flow_id,
+            reason: close_reason,
+        })
+        .await;
 }
 
 #[cfg(test)]
@@ -93,7 +191,7 @@ mod tests {
             enabled: false,
             allowlist: vec![],
         };
-        let reply = handle_forward_request(
+        let reply = decide_forward(
             ObjectId::new(),
             1,
             "127.0.0.1",
@@ -101,7 +199,8 @@ mod tests {
             &acl,
             Duration::from_secs(1),
         )
-        .await;
+        .await
+        .expect_err("expected reject");
         match reply {
             ClientMsg::TcpForwardReject { kind, .. } => {
                 assert_eq!(kind, RejectKind::AclDenied);
@@ -122,7 +221,7 @@ mod tests {
                 },
             }],
         };
-        let reply = handle_forward_request(
+        let reply = decide_forward(
             ObjectId::new(),
             1,
             "ssh.intranet",
@@ -130,7 +229,8 @@ mod tests {
             &acl,
             Duration::from_secs(1),
         )
-        .await;
+        .await
+        .expect_err("expected reject");
         assert!(matches!(
             reply,
             ClientMsg::TcpForwardReject {
@@ -150,7 +250,7 @@ mod tests {
             enabled: true,
             allowlist: vec![],
         };
-        let reply = handle_forward_request(
+        let reply = decide_forward(
             ObjectId::new(),
             1,
             "127.0.0.1",
@@ -158,7 +258,8 @@ mod tests {
             &acl,
             Duration::from_secs(1),
         )
-        .await;
+        .await
+        .expect_err("expected reject");
         match reply {
             ClientMsg::TcpForwardReject { kind, .. } => {
                 assert_eq!(kind, RejectKind::DialFailed);
@@ -168,15 +269,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successful_dial_returns_accept_with_dc_index_zero() {
-        // Spawn a one-shot local TCP listener so the acceptor has
-        // something to connect to. Bind to ephemeral port so the
-        // test never collides.
+    async fn successful_dial_returns_open_tcp_stream() {
+        // Bind a one-shot local listener so the acceptor has
+        // something to connect to.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let port = addr.port();
-        // Accept and immediately drop in the background — we only
-        // care that the agent's connect succeeded.
         tokio::spawn(async move {
             let _ = listener.accept().await;
         });
@@ -185,7 +283,7 @@ mod tests {
             enabled: true,
             allowlist: vec![],
         };
-        let reply = handle_forward_request(
+        let stream = decide_forward(
             ObjectId::new(),
             42,
             "127.0.0.1",
@@ -193,15 +291,10 @@ mod tests {
             &acl,
             Duration::from_secs(2),
         )
-        .await;
-        match reply {
-            ClientMsg::TcpForwardAccept {
-                flow_id, dc_index, ..
-            } => {
-                assert_eq!(flow_id, 42);
-                assert_eq!(dc_index, 0, "T2.6 stub — real pool assignment in T2.7");
-            }
-            _ => panic!("expected accept, got {reply:?}"),
-        }
+        .await
+        .expect("expected open TcpStream");
+        // Just verify the stream is bound to a peer — the post-decide
+        // data-plane (`run_flow`) is exercised by `peer::tests`.
+        assert!(stream.peer_addr().is_ok());
     }
 }
