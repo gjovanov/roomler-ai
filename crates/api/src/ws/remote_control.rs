@@ -86,6 +86,14 @@ pub async fn handle_agent_socket(
         match msg {
             Ok(Message::Text(text)) => match serde_json::from_str::<ClientMsg>(&text) {
                 Ok(parsed) => {
+                    // Tunnel-flow variants intercept first — Hub doesn't
+                    // know about tunnel-clients, so we route directly
+                    // through `AppState::tunnel_clients_by_session`. If
+                    // it's not a tunnel-flow variant the helper returns
+                    // the value unchanged for the Hub to handle.
+                    let Some(parsed) = relay_tunnel_msg_from_agent(&state, parsed).await else {
+                        continue;
+                    };
                     // Phase 7: refresh last_seen_at on every heartbeat. Hub
                     // dispatch is a no-op for AgentHeartbeat (handled here);
                     // we still call dispatch so any future routing logic
@@ -231,5 +239,119 @@ fn error_session_id(e: &roomler_ai_remote_control::Error) -> Option<bson::oid::O
         SessionNotFound(hex) => bson::oid::ObjectId::parse_str(hex).ok(),
         BadPhase(hex, _) => bson::oid::ObjectId::parse_str(hex).ok(),
         _ => None,
+    }
+}
+
+/// Intercept tunnel-flow `ClientMsg` variants from the agent and route
+/// the corresponding `ServerMsg` to the registered tunnel-client (if
+/// any) keyed by `session_id`. Non-tunnel variants are returned
+/// unchanged so the caller can pass them to the Hub.
+///
+/// Returns `None` if the message was consumed by the tunnel relay
+/// (don't dispatch to the Hub afterwards), or `Some(parsed)` if the
+/// caller should continue with Hub dispatch.
+async fn relay_tunnel_msg_from_agent(state: &AppState, parsed: ClientMsg) -> Option<ClientMsg> {
+    match parsed {
+        ClientMsg::TcpForwardAccept {
+            session_id,
+            flow_id,
+            dc_index,
+        } => {
+            relay_to_client(
+                state,
+                session_id,
+                ServerMsg::TcpForwardAccept {
+                    session_id,
+                    flow_id,
+                    dc_index,
+                },
+            )
+            .await;
+            None
+        }
+        ClientMsg::TcpForwardReject {
+            session_id,
+            flow_id,
+            kind,
+            reason,
+        } => {
+            relay_to_client(
+                state,
+                session_id,
+                ServerMsg::TcpForwardReject {
+                    session_id,
+                    flow_id,
+                    kind,
+                    reason,
+                },
+            )
+            .await;
+            None
+        }
+        ClientMsg::TcpHalfClose {
+            session_id,
+            flow_id,
+            direction,
+        } => {
+            relay_to_client(
+                state,
+                session_id,
+                ServerMsg::TcpHalfClose {
+                    session_id,
+                    flow_id,
+                    direction,
+                },
+            )
+            .await;
+            None
+        }
+        ClientMsg::TcpClosed {
+            session_id,
+            flow_id,
+            reason,
+        } => {
+            relay_to_client(
+                state,
+                session_id,
+                ServerMsg::TcpClosed {
+                    session_id,
+                    flow_id,
+                    reason,
+                },
+            )
+            .await;
+            None
+        }
+        ClientMsg::TunnelTerminate { session_id, reason } => {
+            relay_to_client(
+                state,
+                session_id,
+                ServerMsg::TunnelTerminate { session_id, reason },
+            )
+            .await;
+            None
+        }
+        // `TunnelHello` / `TunnelOpen` / `TcpForwardRequest` are
+        // tunnel-client → server messages; agents shouldn't emit
+        // them. Pass through to the Hub so a misbehaving agent gets
+        // a `bad_message` rather than being silently dropped.
+        other => Some(other),
+    }
+}
+
+/// Push a `ServerMsg` to the tunnel-client registered for
+/// `session_id`. No-op when the client has gone away (peer torn
+/// down between agent emit + relay).
+async fn relay_to_client(state: &AppState, session_id: bson::oid::ObjectId, msg: ServerMsg) {
+    let Some(tx) = state
+        .tunnel_clients_by_session
+        .get(&session_id)
+        .map(|entry| entry.value().clone())
+    else {
+        debug!(%session_id, "agent → client relay: no registered tunnel-client; dropping");
+        return;
+    };
+    if let Err(e) = tx.send(msg).await {
+        debug!(%session_id, %e, "agent → client relay: channel closed");
     }
 }

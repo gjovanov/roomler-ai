@@ -421,6 +421,27 @@ impl Hub {
             .ok_or_else(|| Error::AgentOffline(agent_id.to_hex()))
     }
 
+    /// Push a `ServerMsg` straight to a connected agent. Returns
+    /// `AgentOffline` if the agent isn't currently registered,
+    /// `SendFailed` if the channel is full (rare — the agent rx pump
+    /// reads as fast as it can serialise + write to the socket).
+    ///
+    /// Used by the `roomler-tunnel` relay path in
+    /// `crates/api/src/ws/tunnel.rs` to forward
+    /// `ServerMsg::TcpForwardForward` / `TcpHalfClose` /
+    /// `TcpClosed` / `TunnelTerminate` to the agent on behalf of a
+    /// connected tunnel-client. Distinct from the remote-control
+    /// session flow which goes through `dispatch`.
+    pub fn send_to_agent(&self, agent_id: ObjectId, msg: ServerMsg) -> Result<()> {
+        let tx = self.agent_tx(agent_id)?;
+        tx.try_send(msg).map_err(|e| match e {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => Error::SendFailed,
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                Error::AgentOffline(agent_id.to_hex())
+            }
+        })
+    }
+
     fn controller_for(&self, session_id: ObjectId) -> Option<ObjectId> {
         self.inner
             .sessions
