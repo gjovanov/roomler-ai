@@ -15,6 +15,9 @@ path = "src/main.rs"
 [dependencies]
 # Shared protocol types (ClientMsg, ServerMsg, etc.)
 roomler-ai-remote-control = { path = "../../crates/remote_control" }
+# Tunnel ACL types + helpers (DestinationRule / HostPattern / dst_matches).
+# Agent-side allowlist is belt-and-suspenders for the server-side gate.
+roomler-ai-tunnel-core = { path = "../../crates/tunnel-core" }
 
 # Async + networking
 tokio = { workspace = true }

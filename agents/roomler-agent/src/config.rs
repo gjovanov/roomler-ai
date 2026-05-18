@@ -12,6 +12,8 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::tunnel::acl::AgentForwardAcl;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
     /// Base URL of the Roomler API, e.g. `https://roomler.live`. No trailing slash.
@@ -122,6 +124,17 @@ pub struct AgentConfig {
     /// (e.g. `match version { Some("0.3.0-rc.18") => apply_rc18_to_rc19, … }`).
     #[serde(default)]
     pub config_schema_version: Option<String>,
+
+    /// roomler-tunnel agent-side allowlist (T2.6). Default is
+    /// `enabled` with an empty allowlist — meaning "trust the
+    /// server's tenant policy on every `ServerMsg::TcpForwardForward`".
+    /// Operators on org-controlled hosts narrow further by populating
+    /// `forward_acl.allowlist` in the TOML or disable forwards
+    /// entirely with `forward_acl.enabled = false`. See
+    /// `agents/roomler-agent/src/tunnel/acl.rs` for the matching
+    /// semantics.
+    #[serde(default)]
+    pub forward_acl: AgentForwardAcl,
 }
 
 /// Current schema version. Bumped whenever [`migrate`] gains a new
@@ -417,6 +430,7 @@ mod tests {
             rollback_attempted: false,
             last_run_unhealthy: false,
             config_schema_version: None,
+            forward_acl: AgentForwardAcl::default(),
         }
     }
 

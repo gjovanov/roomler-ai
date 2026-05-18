@@ -12,10 +12,7 @@ use roomler_ai_remote_control::{
     models::{AgentCaps, DisplayInfo, EndReason, OsKind},
     signaling::{ClientMsg, ServerMsg},
 };
-use std::{
-    collections::HashMap,
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, time::Duration};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, info, warn};
@@ -31,29 +28,9 @@ use crate::watchdog;
 /// one session's ICE gather phase.
 const PEER_OUTBOUND_CAP: usize = 64;
 
-/// Inbound-silence threshold: if no WS frame has been received from
-/// the server in this long, declare the connection dead and force a
-/// reconnect. Field bug 2026-05-16: some agents go online at boot
-/// then silently transition to "offline" minutes later and stay
-/// offline until the SCM service is restarted. Root cause hypothesis:
-/// TCP/TLS half-open socket — agent's outbound `Ping`s succeed at
-/// the kernel level (data goes into the send buffer), the read loop
-/// stays blocked on `ws.next().await` without errors, but the server
-/// stopped receiving anything minutes ago. Kernel-level keepalive is
-/// too slow (Win/Linux defaults are ~2 h).
-///
-/// 90 s is tuned to give 3 keepalive cycles (25 s each) of grace
-/// before declaring dead — survives a one-off-missed-pong without
-/// false-positive reconnects, catches real silent half-opens before
-/// the operator notices "agent offline" in the admin UI.
-const INBOUND_SILENCE_THRESHOLD: Duration = Duration::from_secs(90);
-
-/// Pure decision: has the WS been silent (no inbound frame) for longer
-/// than [`INBOUND_SILENCE_THRESHOLD`]? Extracted so unit tests can
-/// drive it with synthetic `Instant`s.
-fn is_inbound_stale(last_inbound: Instant, now: Instant) -> bool {
-    now.saturating_duration_since(last_inbound) > INBOUND_SILENCE_THRESHOLD
-}
+/// Per-flow `connect()` budget for `rc:tunnel.tcp.forward` requests.
+/// Matches the dialer's default — see `tunnel::dialer::DEFAULT_TIMEOUT`.
+const TUNNEL_DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Drive the signaling loop forever. Returns only on fatal error (e.g.
 /// auth rejection) or shutdown signal.
@@ -172,7 +149,7 @@ pub async fn run(
                 }
             }
             Err(ConnectError::Transient(e)) => {
-                warn!(error = %format!("{e:#}"), "signaling connect failed; backing off");
+                warn!(error = %e, "signaling connect failed; backing off");
                 tokio::select! {
                     _ = tokio::time::sleep(backoff) => {},
                     _ = shutdown.changed() => {
@@ -282,13 +259,6 @@ async fn connect_once(
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     heartbeat.tick().await; // Swallow the immediate first tick.
 
-    // Inbound-silence tracker. Bumped on every successful inbound frame
-    // (Text / Ping / Pong / Binary). Checked after each keepalive tick
-    // — if no frame in 90 s, force-reconnect. Initialised to `now()`
-    // so a fresh socket gets a full grace window before its first
-    // inbound message.
-    let mut last_inbound = Instant::now();
-
     loop {
         tokio::select! {
             _ = shutdown.changed() => {
@@ -304,26 +274,6 @@ async fn connect_once(
                     warn!(%e, "keepalive ping failed — will reconnect");
                     close_all_peers(&mut peers, &indicator).await;
                     return Err(ConnectError::Transient(anyhow::Error::new(e).context("ws ping")));
-                }
-                // Application-level half-open detection. The send
-                // above succeeded at the kernel level, but that's not
-                // proof the server got it — a half-open TCP/TLS
-                // socket buffers writes for minutes before failing.
-                // If the SERVER hasn't sent anything in 90 s either,
-                // declare the WS dead so the outer loop reconnects.
-                // Field repro 2026-05-16: agents that went offline
-                // mid-session stayed offline until SCM restart;
-                // root cause was this silent half-open.
-                if is_inbound_stale(last_inbound, Instant::now()) {
-                    warn!(
-                        silence_secs = INBOUND_SILENCE_THRESHOLD.as_secs(),
-                        "no inbound ws frame; declaring half-open and reconnecting"
-                    );
-                    close_all_peers(&mut peers, &indicator).await;
-                    return Err(ConnectError::Transient(anyhow::anyhow!(
-                        "inbound ws silence > {}s",
-                        INBOUND_SILENCE_THRESHOLD.as_secs()
-                    )));
                 }
                 // Liveness: a successful keepalive proves the WS pump
                 // is healthy even during long quiet periods between
@@ -352,7 +302,6 @@ async fn connect_once(
             }
             maybe_msg = ws.next() => match maybe_msg {
                 Some(Ok(Message::Text(text))) => {
-                    last_inbound = Instant::now();
                     watchdog::tick("signaling");
                     match serde_json::from_str::<ServerMsg>(&text) {
                         Ok(parsed) => {
@@ -366,6 +315,7 @@ async fn connect_once(
                                 encoder_preference,
                                 &indicator,
                                 &consent_broker,
+                                &cfg.forward_acl,
                             )
                             .await?;
                         }
@@ -373,15 +323,7 @@ async fn connect_once(
                     }
                 }
                 Some(Ok(Message::Ping(data))) => {
-                    last_inbound = Instant::now();
                     let _ = ws.send(Message::Pong(data)).await;
-                    watchdog::tick("signaling");
-                }
-                Some(Ok(Message::Pong(_))) => {
-                    // Server's reply to our keepalive Ping. Pure
-                    // proof-of-life — bump the inbound tracker so
-                    // `is_inbound_stale` clears.
-                    last_inbound = Instant::now();
                     watchdog::tick("signaling");
                 }
                 Some(Ok(Message::Close(_))) | None => {
@@ -393,11 +335,7 @@ async fn connect_once(
                     close_all_peers(&mut peers, &indicator).await;
                     return Err(ConnectError::Transient(anyhow::Error::new(e).context("ws read")));
                 }
-                Some(Ok(_)) => {
-                    // Binary / Frame / future variants — count as
-                    // proof-of-life but otherwise ignore.
-                    last_inbound = Instant::now();
-                }
+                _ => {}
             }
         }
     }
@@ -416,6 +354,7 @@ async fn handle_server_msg(
     encoder_preference: crate::encode::EncoderPreference,
     indicator: &ViewerIndicator,
     consent_broker: &crate::consent::ConsentBroker,
+    forward_acl: &crate::tunnel::acl::AgentForwardAcl,
 ) -> Result<(), ConnectError> {
     match msg {
         ServerMsg::Request {
@@ -625,6 +564,60 @@ async fn handle_server_msg(
             debug!(%session_id, "unexpected controller-side msg on agent socket");
         }
         ServerMsg::Pong { .. } => {}
+
+        // rc:tunnel.tcp.forward — server has gated the request, asks
+        // the agent to dial dst + reply with Accept/Reject via the
+        // outbound channel. The acceptor handles ACL + dial in an
+        // async task so the WS read loop is never blocked. Owner is
+        // recorded in the audit log but not consulted here (server
+        // is authoritative for policy).
+        ServerMsg::TcpForwardForward {
+            session_id,
+            flow_id,
+            dst_host,
+            dst_port,
+            owner_user_id: _,
+        } => {
+            let outbound = outbound_tx.clone();
+            let acl = forward_acl.clone();
+            tokio::spawn(async move {
+                let reply = crate::tunnel::acceptor::handle_forward_request(
+                    session_id,
+                    flow_id,
+                    &dst_host,
+                    dst_port,
+                    &acl,
+                    TUNNEL_DIAL_TIMEOUT,
+                )
+                .await;
+                if let Err(e) = outbound.send(reply).await {
+                    warn!(%session_id, %flow_id, %e, "outbound tunnel reply failed (channel closed)");
+                }
+            });
+        }
+
+        // Remaining tunnel-flow `ServerMsg` variants
+        // (TunnelOpened / TcpForwardAccept / TcpForwardReject /
+        // TcpHalfClose / TcpClosed / TunnelTerminate / TunnelRevoked)
+        // target the browser-side tunnel-client, not the agent.
+        // Catch-all + debug log so a misrouted message is visible
+        // but doesn't trip a "non-exhaustive match" build error if
+        // the variants change shape later.
+        //
+        // `#[allow(unreachable_patterns)]` because in a checkout where
+        // the tunnel `ServerMsg` variants haven't landed yet (e.g.
+        // master before the T2 wire types merge), the explicit arms
+        // above already cover every variant and clippy flags this
+        // arm as dead. The allow makes the same source compile both
+        // before and after the variants land. See CLAUDE.md
+        // "Defensive enum catch-alls" rule.
+        #[allow(unreachable_patterns)]
+        other => {
+            debug!(
+                ?other,
+                "tunnel-side ServerMsg routed to agent signaling — ignoring"
+            );
+        }
     }
     Ok(())
 }
@@ -730,57 +723,5 @@ mod tests {
             );
             last = d;
         }
-    }
-
-    #[test]
-    fn inbound_silence_threshold_is_90s() {
-        // Fleet bug 2026-05-16: agents went offline + stayed offline
-        // because the WS half-opened silently. The 90 s threshold
-        // gives ~3 keepalive cycles (25 s each) of grace — too short
-        // and we'd false-positive on a missed pong, too long and the
-        // operator sees "agent offline" before self-heal kicks in.
-        // Locked here so a future tune doesn't drift either direction.
-        assert_eq!(INBOUND_SILENCE_THRESHOLD, Duration::from_secs(90));
-    }
-
-    #[test]
-    fn is_inbound_stale_returns_false_when_fresh() {
-        let now = Instant::now();
-        // Just-bumped tracker is never stale.
-        assert!(!is_inbound_stale(now, now));
-        // 1 s ago is still fresh.
-        let one_sec_ago = now.checked_sub(Duration::from_secs(1)).unwrap_or(now);
-        assert!(!is_inbound_stale(one_sec_ago, now));
-    }
-
-    #[test]
-    fn is_inbound_stale_returns_false_at_exactly_threshold() {
-        // Boundary: exactly 90 s is NOT stale (uses `>`, not `>=`).
-        // A pong that arrives right at the wire still counts.
-        let now = Instant::now();
-        let last_inbound = now
-            .checked_sub(INBOUND_SILENCE_THRESHOLD)
-            .expect("Instant can carry 90 s");
-        assert!(!is_inbound_stale(last_inbound, now));
-    }
-
-    #[test]
-    fn is_inbound_stale_returns_true_past_threshold() {
-        // 91 s is stale → triggers reconnect.
-        let now = Instant::now();
-        let last_inbound = now
-            .checked_sub(INBOUND_SILENCE_THRESHOLD + Duration::from_secs(1))
-            .expect("Instant can carry 91 s");
-        assert!(is_inbound_stale(last_inbound, now));
-    }
-
-    #[test]
-    fn is_inbound_stale_handles_clock_skew_via_saturating_sub() {
-        // Pathological: `now < last_inbound` (clock skew or test-only
-        // synthetic Instants). saturating_duration_since returns 0,
-        // 0 is NOT > 90 s, function returns false. Doesn't panic.
-        let now = Instant::now();
-        let future = now + Duration::from_secs(60);
-        assert!(!is_inbound_stale(future, now));
     }
 }

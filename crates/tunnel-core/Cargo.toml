@@ -1,0 +1,48 @@
+[package]
+name = "roomler-ai-tunnel-core"
+version.workspace = true
+edition.workspace = true
+description = "Roomler AI tunnel core — shared transport, signalling, ACL, and forwarding pump for the roomler-tunnel client and the agent's tunnel service."
+
+[lib]
+name = "tunnel_core"
+path = "src/lib.rs"
+
+[dependencies]
+# Shared protocol types (rc:tunnel.* will land in remote_control's
+# ClientMsg/ServerMsg enum in T2; tunnel-core re-exports the subset
+# it cares about so callers have one import).
+roomler-ai-remote-control = { path = "../remote_control" }
+
+# Async + concurrency
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Tracing
+tracing = { workspace = true }
+
+# Errors
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# ObjectId for session keys (matches the rc:* wire format)
+bson = { workspace = true }
+
+# WebRTC peer (vendored — gains SettingEngine::set_sctp_max_receive_buffer_size)
+webrtc = { workspace = true }
+
+# Byte buffers for the DC send/recv path. webrtc-rs already pulls
+# `bytes` transitively but listing it here keeps the import surface
+# explicit; the version constraint matches the agent's pin.
+bytes = "1"
+
+# CIDR matching in DestinationRule — tiny, no_std-friendly.
+ipnet = "2"
+
+[dev-dependencies]
+tokio-test = { workspace = true }

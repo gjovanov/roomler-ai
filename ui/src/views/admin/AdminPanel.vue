@@ -39,6 +39,7 @@ const adminSections = [
   { name: 'admin-members',   icon: 'mdi-account-group',        title: 'Members'   },
   { name: 'admin-roles',     icon: 'mdi-shield-account',       title: 'Roles'     },
   { name: 'admin-agents',    icon: 'mdi-desktop-classic',      title: 'Agents'    },
+  { name: 'admin-tunnel-clients', icon: 'mdi-tunnel',            title: 'Tunnels'   },
   { name: 'admin-tasks',     icon: 'mdi-progress-clock',       title: 'Tasks'     },
   { name: 'admin-audit-log', icon: 'mdi-clipboard-text-clock', title: 'Audit Log' },
 ]

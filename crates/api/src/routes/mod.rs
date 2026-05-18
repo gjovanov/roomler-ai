@@ -20,6 +20,7 @@ pub mod role;
 pub mod room;
 pub mod stripe;
 pub mod tenant;
+pub mod tunnel;
 
 pub mod search;
 pub mod user;

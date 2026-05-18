@@ -116,6 +116,246 @@ impl Agent {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Tunnel client (roomler-tunnel)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// A laptop running `roomler-tunnel`. Mirrors [`Agent`] structurally
+/// (same lifecycle, same `AgentStatus`, same `(tenant_id, machine_id)`
+/// uniqueness for rehydrate-on-re-enroll) but slimmer — tunnel clients
+/// don't capture screens or hold capability lists. The `_role_` is
+/// inverted vs an agent: a tunnel client *initiates* forwards; an
+/// agent *serves* them.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TunnelClient {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub tenant_id: ObjectId,
+    /// User who installed + runs the CLI on this laptop. Carried into
+    /// `TunnelClientClaims.owner_user_id` at enrollment time and
+    /// recorded in every `tunnel_audit` row.
+    pub owner_user_id: ObjectId,
+    pub name: String,
+    pub machine_id: String,
+    pub os: OsKind,
+    pub client_version: String,
+    pub status: AgentStatus,
+    pub last_seen_at: DateTime,
+    pub created_at: DateTime,
+    pub updated_at: DateTime,
+    pub deleted_at: Option<DateTime>,
+}
+
+impl TunnelClient {
+    pub const COLLECTION: &'static str = "tunnel_clients";
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Tunnel policy
+// ────────────────────────────────────────────────────────────────────────────
+//
+// Single source of truth for ACL data shapes — DB rows AND the
+// evaluator in `tunnel-core::policy` both consume these types. The
+// evaluator re-exports them so callers have one import path; this
+// keeps the DB schema authoritative without inverting the dep graph
+// (`services` already depends on `remote_control` for `Agent` etc.).
+
+/// Matches a destination hostname. Adjacently tagged so JSON wire
+/// shape is `{"kind":"exact","value":"db.intranet"}` etc.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum HostPattern {
+    /// Literal match — `"db.intranet"`.
+    Exact(String),
+    /// Glob — `"*.intranet"` matches one or more subdomains.
+    Wildcard(String),
+    /// CIDR range — `"10.0.0.0/24"`. Resolves against literal IPs only;
+    /// hostnames must be resolved by the caller first.
+    Cidr(String),
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PortRange {
+    /// Inclusive lower bound.
+    pub low: u16,
+    /// Inclusive upper bound. Equal to `low` for single-port rules.
+    pub high: u16,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct DestinationRule {
+    pub host_pattern: HostPattern,
+    pub port_range: PortRange,
+}
+
+/// Who a policy applies to. `{"kind":"all_users"}` is the catch-all
+/// (default-allow lite — still scoped to the tenant). Externally
+/// tagged would be cleaner but mixes object-vs-string on the wire
+/// when one variant is a unit; `tag = "kind"` keeps everything as
+/// objects.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PolicySubject {
+    UserId {
+        #[serde(rename = "id")]
+        user_id: ObjectId,
+    },
+    RoleId {
+        #[serde(rename = "id")]
+        role_id: ObjectId,
+    },
+    TunnelClientId {
+        #[serde(rename = "id")]
+        tunnel_client_id: ObjectId,
+    },
+    /// Every user in the policy's tenant.
+    AllUsers,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PolicyTarget {
+    AgentId {
+        #[serde(rename = "id")]
+        agent_id: ObjectId,
+    },
+    /// Every agent in the policy's tenant.
+    AllAgents,
+}
+
+/// A tenant-scoped allowlist. Default-deny: a forward is permitted
+/// only if at least one matching policy exists. See plan §"Security
+/// model" + `tunnel-core::policy::evaluate` for the eval semantics.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TunnelPolicy {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub tenant_id: ObjectId,
+    pub name: String,
+    pub subjects: Vec<PolicySubject>,
+    pub targets: Vec<PolicyTarget>,
+    pub allowlist: Vec<DestinationRule>,
+    /// Per-session concurrent-flow ceiling. `None` = unlimited.
+    /// Default 64 in v1 (covers JDBC pools comfortably).
+    pub max_concurrent_flows: Option<u32>,
+    /// Per-session byte ceiling (sum of bytes_in + bytes_out).
+    /// `None` = unlimited.
+    pub max_bytes_per_session: Option<u64>,
+    pub created_at: DateTime,
+    pub updated_at: DateTime,
+    pub deleted_at: Option<DateTime>,
+}
+
+impl TunnelPolicy {
+    pub const COLLECTION: &'static str = "tunnel_policies";
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Tunnel audit
+// ────────────────────────────────────────────────────────────────────────────
+
+/// What happened. Drives the audit-log roll-up + the admin search
+/// view in T4. Wire form is snake_case for consistency with every
+/// other enum in this module. Distinct from the existing
+/// `AuditKind` (remote-control sessions) — different collection,
+/// different concerns, different consumers.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TunnelAuditKind {
+    /// WebRTC peer was opened (one per `tunnel forward` invocation).
+    PeerOpen,
+    /// WebRTC peer was torn down (Ctrl-C, idle-timeout, etc.).
+    PeerClose,
+    /// `TcpForwardRequest` was allowed and the agent dialed dst
+    /// successfully. Has flow_id + dst_host + dst_port set.
+    TcpAccept,
+    /// `TcpForwardRequest` was denied — by the server-side ACL gate
+    /// OR by the agent's belt-and-suspenders allowlist. Reason +
+    /// `RejectKind` carried in the `reason` field.
+    TcpReject,
+    /// Agent tried to dial dst, got a hard failure (timeout / refused
+    /// / dns). Separate from `TcpReject` so the dashboard can
+    /// distinguish "policy denied" from "network broken".
+    TcpDialFailed,
+    /// Flow closed cleanly or via I/O error.
+    TcpClosed,
+    /// Per-policy concurrency or byte ceiling hit.
+    RateLimited,
+    /// WS revocation re-check fired mid-session (admin set
+    /// `Quarantined` or soft-deleted the row).
+    StatusRevoke,
+}
+
+/// Which relay path the peer connection ended up using. Direct =
+/// UDP hole punch worked; TurnUdp/Tcp = went through coturn (counts
+/// against our bandwidth bill). Set on `PeerOpen` once ICE finishes
+/// gathering, repeated on `PeerClose` for easy aggregation.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayMode {
+    Direct,
+    TurnUdp,
+    TurnTcp,
+}
+
+/// Append-only audit event. One row per interesting happening, keyed
+/// by `tunnel_session_id` so a single session reconstruct is
+/// `find({tunnel_session_id: …}).sort({at: 1})`. 90 d TTL — see
+/// `crates/db/src/indexes.rs::tunnel_audit`.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TunnelAuditEvent {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub tenant_id: ObjectId,
+    /// Correlation key — every event for one peer lifetime shares
+    /// this id. New ObjectId per `tunnel forward` invocation.
+    pub tunnel_session_id: ObjectId,
+    pub tunnel_client_id: ObjectId,
+    pub agent_id: ObjectId,
+    pub user_id: ObjectId,
+    pub at: DateTime,
+    pub kind: TunnelAuditKind,
+    /// Set for per-flow events (TcpAccept / TcpReject /
+    /// TcpDialFailed / TcpClosed / RateLimited); None for
+    /// peer-lifetime events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dst_host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dst_port: Option<u16>,
+    #[serde(default)]
+    pub bytes_in: u64,
+    #[serde(default)]
+    pub bytes_out: u64,
+    /// Inferred proxy for "amount of activity" — packet count proxy
+    /// (DC messages received). Helps distinguish bulk transfer from
+    /// interactive sessions in the dashboard.
+    #[serde(default)]
+    pub message_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u32>,
+    pub relay: RelayMode,
+    /// Source IP of the tunnel client's WS connection (from
+    /// X-Forwarded-For on the WS upgrade). Forensic baseline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_src_ip: Option<String>,
+    /// Source port on the agent's outgoing TCP socket — lets the DB's
+    /// own audit log be correlated with this row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_src_port: Option<u16>,
+    pub client_version: String,
+    pub client_os: OsKind,
+    /// Free-form reason field (e.g. `"acl_denied: no matching policy"`,
+    /// `"dial: connection refused"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl TunnelAuditEvent {
+    pub const COLLECTION: &'static str = "tunnel_audit";
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Session
 // ────────────────────────────────────────────────────────────────────────────
 
