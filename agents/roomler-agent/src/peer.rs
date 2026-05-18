@@ -1637,6 +1637,26 @@ async fn media_pump_vp9_444_dc(
     const SCENE_CHANGE_MIN_INTERVAL: Duration = Duration::from_millis(1500);
     let mut last_scene_change_kf_at: Option<std::time::Instant> = None;
 
+    // rc.45 — dynamic cpu-used boost during motion. PC50045 field
+    // test 2026-05-18 (rc.43) confirmed scene-change keyframe cascade
+    // is fixed (5× reduction in forced IDRs) but heavy-motion fps is
+    // still 8-12 because SW VP9 4:4:4 at 1920×1200 + cpu-used=6 on
+    // Iris Xe takes 80-120 ms per motion frame. cpu-used=8 cuts that
+    // ~50 %, recovering 15-25 fps during motion. Quality drop is
+    // ~20 % per-frame; barely visible during motion-blur anyway.
+    //
+    // Heuristic: piggyback on the existing scene-change detector. When
+    // a scene-change spike fires, BOOST cpu-used from base (env or
+    // default 6) to 8 for the next BOOST_DURATION frames. After the
+    // boost expires, drop back to base. Sustained-motion windows
+    // re-trigger the boost as long as motion continues; static
+    // periods restore quality automatically.
+    let base_cpu_used = crate::encode::libvpx::cpu_used_from_env();
+    const MOTION_BOOST_CPU_USED: std::os::raw::c_int = 8;
+    const MOTION_BOOST_DURATION_FRAMES: u64 = 60;
+    let mut motion_boost_until_frame: u64 = 0;
+    let mut current_cpu_used: std::os::raw::c_int = base_cpu_used;
+
     // rc.33 — bitrate / quality state. Pre-rc.33 the encoder ran at
     // its `DEFAULT_BITRATE_BPS = 8 Mbps` ceiling regardless of source
     // resolution; at 4K this is ~1/3 of what RustDesk sends and is the
@@ -1750,6 +1770,12 @@ async fn media_pump_vp9_444_dc(
                     // resolution-derived quality target through.
                     last_applied_quality = 0xFF;
                     last_applied_bitrate = 0;
+                    // rc.45 — encoder rebuild starts at base cpu-used
+                    // (apply_screen_content_controls reads the env
+                    // var). Reset our tracking so the next motion
+                    // boost properly logs the from-value.
+                    current_cpu_used = base_cpu_used;
+                    motion_boost_until_frame = 0;
                 }
                 Err(e) => {
                     warn!(%session_id, %e, "Vp9Encoder::new failed — pump exits");
@@ -1859,7 +1885,46 @@ async fn media_pump_vp9_444_dc(
                 keyframe_requested.store(true, std::sync::atomic::Ordering::Relaxed);
                 scene_change_keyframes += 1;
                 last_scene_change_kf_at = Some(now);
+
+                // rc.45 — piggyback motion-cpu-used boost on every
+                // scene-change firing. The same signal that flags
+                // "this frame needed a lot of new bits" also flags
+                // "we're in a motion window where fps matters more
+                // than per-frame quality". Boost stays armed for
+                // MOTION_BOOST_DURATION_FRAMES; sustained motion
+                // re-arms it; static periods let it expire and
+                // restore base quality.
+                if current_cpu_used != MOTION_BOOST_CPU_USED {
+                    enc.set_speed(MOTION_BOOST_CPU_USED);
+                    tracing::info!(
+                        %session_id,
+                        from = current_cpu_used,
+                        to = MOTION_BOOST_CPU_USED,
+                        "VP9-444 motion boost engaged — cpu-used raised (faster encode, lower per-frame quality)"
+                    );
+                    current_cpu_used = MOTION_BOOST_CPU_USED;
+                }
+                motion_boost_until_frame = frames_encoded + MOTION_BOOST_DURATION_FRAMES;
             }
+        }
+
+        // rc.45 — decay the motion boost when the duration elapses.
+        // After MOTION_BOOST_DURATION_FRAMES frames without a new
+        // scene-change refresh, drop cpu-used back to the base value
+        // so static text snaps back to sharp encoding.
+        if motion_boost_until_frame > 0
+            && frames_encoded >= motion_boost_until_frame
+            && current_cpu_used != base_cpu_used
+        {
+            enc.set_speed(base_cpu_used);
+            tracing::info!(
+                %session_id,
+                from = current_cpu_used,
+                to = base_cpu_used,
+                "VP9-444 motion boost expired — cpu-used restored to base"
+            );
+            current_cpu_used = base_cpu_used;
+            motion_boost_until_frame = 0;
         }
 
         // Pull the DC handle once per frame. `try_lock` would race
@@ -2011,6 +2076,7 @@ async fn media_pump_vp9_444_dc(
             info!(
                 %session_id,
                 target_fps,
+                cpu_used = current_cpu_used,
                 frames_captured, frames_encoded, frames_sent, bytes_written,
                 send_errors, dc_unopen_drops,
                 frames_skipped_backpressure,
