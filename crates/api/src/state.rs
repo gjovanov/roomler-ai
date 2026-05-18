@@ -1,6 +1,10 @@
+use bson::oid::ObjectId;
+use dashmap::DashMap;
 use mongodb::Database;
 use roomler_ai_config::Settings;
-use roomler_ai_remote_control::{Hub, audit::AuditSink, turn_creds::TurnConfig};
+use roomler_ai_remote_control::{
+    Hub, audit::AuditSink, signaling::ServerMsg, turn_creds::TurnConfig,
+};
 use roomler_ai_services::{
     AuthService, EmailService, GiphyService, OAuthService, PushService, RecognitionService,
     TaskService,
@@ -14,11 +18,26 @@ use roomler_ai_services::{
     },
     media::{room_manager::RoomManager, worker_pool::WorkerPool},
 };
+use tokio::sync::mpsc;
 
 use std::sync::Arc;
 
 use crate::ws::redis_pubsub::RedisPubSub;
 use crate::ws::storage::WsStorage;
+
+/// Outbound channel for a connected `roomler-tunnel` client, keyed by
+/// the `tunnel_session_id` issued on `rc:tunnel.open`. The tunnel WS
+/// handler registers its sender on TunnelOpen success and unregisters
+/// on disconnect / TunnelTerminate; the agent WS handler reads this
+/// map to relay `TcpForwardAccept` / `TcpForwardReject` /
+/// `TcpHalfClose` / `TcpClosed` / `TunnelTerminate` from agent →
+/// client.
+///
+/// Mirror of the Hub's per-agent `tx` registry, but kept in `AppState`
+/// rather than in the `remote_control::Hub` because the Hub is the
+/// remote-control session state machine and tunnel-clients are a
+/// distinct lifecycle.
+pub type TunnelClientOutbound = Arc<DashMap<ObjectId, mpsc::Sender<ServerMsg>>>;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -59,6 +78,8 @@ pub struct AppState {
     pub tunnel_clients: Arc<TunnelClientDao>,
     pub tunnel_policies: Arc<TunnelPolicyDao>,
     pub tunnel_audit: Arc<TunnelAuditDao>,
+    /// Per-tunnel-session WS outbound channels. See [`TunnelClientOutbound`].
+    pub tunnel_clients_by_session: TunnelClientOutbound,
 
     /// 1h-TTL in-memory cache backing `/api/agent/latest-release`.
     /// All agents share this single cache; one upstream GitHub fetch
@@ -193,6 +214,7 @@ impl AppState {
             tunnel_clients,
             tunnel_policies,
             tunnel_audit,
+            tunnel_clients_by_session: Arc::new(DashMap::new()),
             latest_release_cache: crate::routes::agent_release::LatestReleaseCache::new(),
         })
     }
