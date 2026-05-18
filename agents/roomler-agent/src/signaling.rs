@@ -12,7 +12,7 @@ use roomler_ai_remote_control::{
     models::{AgentCaps, DisplayInfo, EndReason, OsKind},
     signaling::{ClientMsg, ServerMsg},
 };
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, info, warn};
@@ -239,6 +239,13 @@ async fn connect_once(
     // `Some("data-channel-vp9-444")` flips the pump into DC mode;
     // None is the legacy WebRTC track.
     let mut pending_transports: HashMap<bson::oid::ObjectId, Option<String>> = HashMap::new();
+    // T2.10d: one `AgentTunnelPeer` per active `roomler-tunnel`
+    // session. Distinct map from `peers` (remote-control sessions)
+    // because the namespaces don't overlap and the lifecycles
+    // differ — tunnel peers live until `TunnelTerminate` /
+    // disconnect; rc peers live until session-end.
+    let mut tunnel_peers: HashMap<bson::oid::ObjectId, Arc<crate::tunnel::peer::AgentTunnelPeer>> =
+        HashMap::new();
 
     // Keepalive. nginx + K8s ingress commonly idle-close WSes at 60-120s of
     // silence; send an application-level Ping every 25s so the connection
@@ -265,6 +272,7 @@ async fn connect_once(
                 if *shutdown.borrow() {
                     info!("shutdown signalled; closing ws");
                     close_all_peers(&mut peers, &indicator).await;
+                    close_all_tunnel_peers(&mut tunnel_peers).await;
                     let _ = ws.send(Message::Close(None)).await;
                     return Ok(());
                 }
@@ -273,6 +281,7 @@ async fn connect_once(
                 if let Err(e) = ws.send(Message::Ping(Vec::new().into())).await {
                     warn!(%e, "keepalive ping failed — will reconnect");
                     close_all_peers(&mut peers, &indicator).await;
+                    close_all_tunnel_peers(&mut tunnel_peers).await;
                     return Err(ConnectError::Transient(anyhow::Error::new(e).context("ws ping")));
                 }
                 // Liveness: a successful keepalive proves the WS pump
@@ -290,6 +299,7 @@ async fn connect_once(
                 if let Err(e) = send_msg(&mut ws, &hb).await {
                     warn!(%e, "heartbeat send failed — will reconnect");
                     close_all_peers(&mut peers, &indicator).await;
+                    close_all_tunnel_peers(&mut tunnel_peers).await;
                     return Err(ConnectError::Transient(e.context("heartbeat send")));
                 }
                 watchdog::tick("signaling");
@@ -311,6 +321,7 @@ async fn connect_once(
                                 &mut peers,
                                 &mut pending_codecs,
                                 &mut pending_transports,
+                                &mut tunnel_peers,
                                 &outbound_tx,
                                 encoder_preference,
                                 &indicator,
@@ -329,10 +340,12 @@ async fn connect_once(
                 Some(Ok(Message::Close(_))) | None => {
                     info!("ws closed by peer");
                     close_all_peers(&mut peers, &indicator).await;
+                    close_all_tunnel_peers(&mut tunnel_peers).await;
                     return Ok(());
                 }
                 Some(Err(e)) => {
                     close_all_peers(&mut peers, &indicator).await;
+                    close_all_tunnel_peers(&mut tunnel_peers).await;
                     return Err(ConnectError::Transient(anyhow::Error::new(e).context("ws read")));
                 }
                 _ => {}
@@ -350,6 +363,7 @@ async fn handle_server_msg(
     peers: &mut HashMap<bson::oid::ObjectId, AgentPeer>,
     pending_codecs: &mut HashMap<bson::oid::ObjectId, String>,
     pending_transports: &mut HashMap<bson::oid::ObjectId, Option<String>>,
+    tunnel_peers: &mut HashMap<bson::oid::ObjectId, Arc<crate::tunnel::peer::AgentTunnelPeer>>,
     outbound_tx: &mpsc::Sender<ClientMsg>,
     encoder_preference: crate::encode::EncoderPreference,
     indicator: &ViewerIndicator,
@@ -578,31 +592,99 @@ async fn handle_server_msg(
             dst_port,
             owner_user_id: _,
         } => {
+            // Look up the tunnel peer for this session — must exist
+            // before the server is allowed to relay a forward request
+            // for it. If absent (race / bad server), synthesise an
+            // AgentError reject so the client doesn't hang.
+            let Some(tunnel_peer) = tunnel_peers.get(&session_id).cloned() else {
+                warn!(%session_id, %flow_id, "TcpForwardForward for unknown tunnel session — rejecting");
+                let reply = ClientMsg::TcpForwardReject {
+                    session_id,
+                    flow_id,
+                    kind: roomler_ai_remote_control::signaling::RejectKind::AgentError,
+                    reason: "tunnel session not open on agent".into(),
+                };
+                let _ = outbound_tx.send(reply).await;
+                return Ok(());
+            };
             let outbound = outbound_tx.clone();
             let acl = forward_acl.clone();
             tokio::spawn(async move {
-                let reply = crate::tunnel::acceptor::handle_forward_request(
+                crate::tunnel::acceptor::handle_forward_request(
                     session_id,
                     flow_id,
                     &dst_host,
                     dst_port,
                     &acl,
                     TUNNEL_DIAL_TIMEOUT,
+                    &tunnel_peer,
+                    outbound,
                 )
                 .await;
-                if let Err(e) = outbound.send(reply).await {
-                    warn!(%session_id, %flow_id, %e, "outbound tunnel reply failed (channel closed)");
-                }
             });
+        }
+
+        // rc:tunnel.sdp.offer — controller's offer for the WebRTC
+        // peer. Build an AgentTunnelPeer, accept the offer, ship the
+        // answer back as `rc:tunnel.sdp.answer`. The peer takes care
+        // of its own ICE trickle via the outbound channel.
+        ServerMsg::TunnelSdpOffer { session_id, sdp } => {
+            match crate::tunnel::peer::AgentTunnelPeer::accept_offer(
+                session_id,
+                &sdp,
+                Vec::new(),
+                outbound_tx.clone(),
+            )
+            .await
+            {
+                Ok((peer, answer_sdp)) => {
+                    tunnel_peers.insert(session_id, Arc::new(peer));
+                    let _ = outbound_tx
+                        .send(ClientMsg::TunnelSdpAnswer {
+                            session_id,
+                            sdp: answer_sdp,
+                        })
+                        .await;
+                    info!(%session_id, "agent tunnel peer constructed; SDP answer sent");
+                }
+                Err(e) => {
+                    warn!(%session_id, %e, "tunnel accept_offer failed");
+                }
+            }
+        }
+
+        // rc:tunnel.ice — trickle one ICE candidate into the agent's
+        // tunnel peer. Drop silently if the peer is gone (e.g. peer
+        // already torn down by a `TunnelTerminate`).
+        ServerMsg::TunnelIce {
+            session_id,
+            candidate,
+        } => {
+            if let Some(peer) = tunnel_peers.get(&session_id) {
+                if let Err(e) = peer.add_remote_ice(candidate).await {
+                    debug!(%session_id, %e, "tunnel add_remote_ice failed");
+                }
+            } else {
+                debug!(%session_id, "tunnel ICE for unknown session — dropping");
+            }
+        }
+
+        // rc:tunnel.terminate from the server (relayed from the
+        // client or admin-side teardown). Tear down our peer state.
+        ServerMsg::TunnelTerminate { session_id, reason } => {
+            info!(%session_id, ?reason, "rc:tunnel.terminate — closing peer");
+            if let Some(peer) = tunnel_peers.remove(&session_id) {
+                peer.close().await;
+            }
         }
 
         // Remaining tunnel-flow `ServerMsg` variants
         // (TunnelOpened / TcpForwardAccept / TcpForwardReject /
-        // TcpHalfClose / TcpClosed / TunnelTerminate / TunnelRevoked)
-        // target the browser-side tunnel-client, not the agent.
-        // Catch-all + debug log so a misrouted message is visible
-        // but doesn't trip a "non-exhaustive match" build error if
-        // the variants change shape later.
+        // TcpHalfClose / TcpClosed / TunnelRevoked) target the
+        // browser-side tunnel-client, not the agent. Catch-all +
+        // debug log so a misrouted message is visible but doesn't
+        // trip a "non-exhaustive match" build error if the variants
+        // change shape later.
         //
         // `#[allow(unreachable_patterns)]` because in a checkout where
         // the tunnel `ServerMsg` variants haven't landed yet (e.g.
@@ -648,6 +730,22 @@ async fn close_all_peers(
         count,
         "torn down peers + hid indicator overlays on ws disconnect"
     );
+}
+
+/// T2.10d: tear down every tunnel peer on WS disconnect. Cheap
+/// no-op when the map is empty (normal for agents that never serve
+/// a tunnel).
+async fn close_all_tunnel_peers(
+    tunnel_peers: &mut HashMap<bson::oid::ObjectId, Arc<crate::tunnel::peer::AgentTunnelPeer>>,
+) {
+    if tunnel_peers.is_empty() {
+        return;
+    }
+    let count = tunnel_peers.len();
+    for (_, peer) in tunnel_peers.drain() {
+        peer.close().await;
+    }
+    info!(count, "torn down agent tunnel peers on ws disconnect");
 }
 
 async fn send_msg(
