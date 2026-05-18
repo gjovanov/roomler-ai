@@ -1595,24 +1595,47 @@ async fn media_pump_vp9_444_dc(
     let mut frames_skipped_backpressure: u64 = 0;
     let mut scene_change_keyframes: u64 = 0;
 
-    // rc.39 — agent-side scene-change keyframe trigger. PC50045
-    // field test 2026-05-17 (rc.38) reported "3s to crystallize" on
-    // window-uncover events (Outlook open, Notepad++ maximize) because
-    // libvpx's screen-content scene-detect is conservative and our
-    // periodic kf_max_dist at observed actual fps was ~10 s. Heuristic
-    // here: after each encode, if the latest delta packet's size
-    // exceeds 4× the recent average AND a minimum absolute threshold,
-    // we assume a scene-change happened (encoder needed lots of new
-    // bits). Force a keyframe on the NEXT frame so the operator sees
-    // a clean refresh within 2 frames instead of waiting for the
-    // periodic IDR.
+    // rc.39 — agent-side scene-change keyframe trigger. Heuristic:
+    // after each encode, if the latest delta packet's size exceeds
+    // SCENE_CHANGE_SPIKE_RATIO× the recent average AND >=
+    // SCENE_CHANGE_MIN_BYTES, we assume a scene-change happened.
+    // Force a keyframe on the NEXT frame so the operator sees a clean
+    // refresh within 2 frames instead of waiting for the periodic IDR.
+    //
+    // rc.43 — RETUNED for VBR-mode regression. Field log PC50045
+    // 2026-05-18 (rc.42 + VBR opt-in) showed 33 forced keyframes in
+    // 3.5 minutes — one every 6 seconds — because VBR's natural delta
+    // size variance (3-10× depending on motion) was tripping the
+    // rc.39 ratio=4 + 50 KB thresholds far too often. Each forced
+    // keyframe was 200-900 KB; those big keyframe SCTP chunks shared
+    // the same DC transport as the cursor DC and stalled cursor:pos
+    // updates for 100-200 ms each, producing visibly sluggish mouse.
+    // Three tweaks:
+    //
+    //   (1) rate-limit: at most one forced keyframe per
+    //       SCENE_CHANGE_MIN_INTERVAL (1.5 s). Prevents the keyframe
+    //       cascade where each forced keyframe inflates the bitrate
+    //       envelope and re-triggers the heuristic on the next frame.
+    //
+    //   (2) MIN_BYTES 50 KB → 150 KB. VBR motion deltas routinely
+    //       hit 100 KB even without an actual scene change; require
+    //       a stronger signal to act.
+    //
+    //   (3) SPIKE_RATIO 4× → 8×. Natural VBR variance is ~5×; need
+    //       a steeper spike to count.
+    //
+    // Combined: scene-change still fires reliably on window-uncover
+    // (typical ratio >> 8 + size >> 150 KB) but stops mis-firing on
+    // pure motion frames.
     //
     // Ring buffer of recent delta-frame sizes (skip the keyframes
     // themselves, which are naturally large).
     let mut recent_delta_sizes: std::collections::VecDeque<usize> =
         std::collections::VecDeque::with_capacity(30);
-    const SCENE_CHANGE_SPIKE_RATIO: usize = 4;
-    const SCENE_CHANGE_MIN_BYTES: usize = 50_000;
+    const SCENE_CHANGE_SPIKE_RATIO: usize = 8;
+    const SCENE_CHANGE_MIN_BYTES: usize = 150_000;
+    const SCENE_CHANGE_MIN_INTERVAL: Duration = Duration::from_millis(1500);
+    let mut last_scene_change_kf_at: Option<std::time::Instant> = None;
 
     // rc.33 — bitrate / quality state. Pre-rc.33 the encoder ran at
     // its `DEFAULT_BITRATE_BPS = 8 Mbps` ceiling regardless of source
@@ -1817,8 +1840,26 @@ async fn media_pump_vp9_444_dc(
             }
         }
         if should_force_kf {
-            keyframe_requested.store(true, std::sync::atomic::Ordering::Relaxed);
-            scene_change_keyframes += 1;
+            // rc.43 — rate-limit. The recovery target is ~2 frames after
+            // a real scene change; a 1.5 s cooldown is well past any
+            // realistic single uncover-event recovery while preventing
+            // the cascade where each forced keyframe inflates the
+            // bitrate envelope and re-triggers the heuristic on the
+            // next encode pass.
+            let now = std::time::Instant::now();
+            let within_cooldown = last_scene_change_kf_at
+                .map(|t| now.duration_since(t) < SCENE_CHANGE_MIN_INTERVAL)
+                .unwrap_or(false);
+            if within_cooldown {
+                tracing::debug!(
+                    %session_id,
+                    "VP9-444 scene-change candidate suppressed (rate-limit cooldown active)"
+                );
+            } else {
+                keyframe_requested.store(true, std::sync::atomic::Ordering::Relaxed);
+                scene_change_keyframes += 1;
+                last_scene_change_kf_at = Some(now);
+            }
         }
 
         // Pull the DC handle once per frame. `try_lock` would race

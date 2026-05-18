@@ -852,6 +852,10 @@ impl Agent {
                     }
                 };
 
+                // Snapshot username for the diagnostic log on allocate
+                // failure below — `url.username` is consumed by
+                // `ClientConfig` so we can't reference it later.
+                let username_for_log = url.username.clone();
                 let cfg = turn::client::ClientConfig {
                     stun_serv_addr: String::new(),
                     turn_serv_addr: turn_server_addr.clone(),
@@ -898,10 +902,24 @@ impl Agent {
                     Ok(conn) => Arc::new(conn),
                     Err(err) => {
                         let _ = client.close().await;
+                        // Roomler vendor diagnostic (2026-05-18 PC55331
+                        // / CLK00017265): include the scheme + transport
+                        // so we can correlate which TURN URL flavour
+                        // failed. `err` is typically just "attribute
+                        // not found" — needs investigation downstream of
+                        // this log line via packet capture / coturn
+                        // verbose logs. See `docs/turn-allocate-debug.md`.
                         log::warn!(
-                            "[{}]: Failed to allocate on turn.Client {} {}",
+                            "[{}]: TURN allocate failed addr={} scheme={:?} transport={:?} username={} err={}",
                             agent_internal2.get_name(),
                             turn_server_addr,
+                            transport_scheme,
+                            transport_proto,
+                            // username is the REST-API expiry:user_id
+                            // pair; logging it is fine (it's not a
+                            // secret, and it ties the failure to a
+                            // specific coturn server-side session).
+                            if username_for_log.is_empty() { "<empty>" } else { username_for_log.as_str() },
                             err
                         );
                         return Ok(());
