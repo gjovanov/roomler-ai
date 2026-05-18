@@ -21,29 +21,41 @@
 
 ## Resume in one command
 
+Work is on branch **`feature/roomler-tunnel`** in a sibling worktree:
+**`C:/dev/gjovanov/roomler-ai-tunnel/`**. The main repo at
+`C:/dev/gjovanov/roomler-ai/` stays on clean master so other Claude
+sessions don't conflict. Use `git worktree list` to confirm.
+
 ```bash
-git status --short                                   # confirm tree shape
-cargo test -p roomler-ai-tunnel-core --lib           # 37 tests green
-cargo test -p roomler-ai-remote-control --lib        # 34 tests green
-cargo test -p roomler-agent --lib tunnel::           # 12 tests green
-cargo test -p roomler-agent --bin roomler-agent      # 8 CLI parser tests
-cd ui && bun run build                               # TS clean
+cd C:/dev/gjovanov/roomler-ai-tunnel/
+git status --short                                   # should be clean
+git log --oneline -3                                 # 49ee819 T2.10 client CLI on top
+cargo test -p roomler-ai-tunnel-core --lib           # 37 tests
+cargo test -p roomler-ai-remote-control --lib        # 34 tests
+cargo test -p roomler-agent --lib tunnel::           # 12 tests
+cargo test -p roomler-agent --bin roomler-agent      # 8 CLI parser
+cargo test -p roomler-tunnel                         # 17 lib + 4 bin = 21 tests
 ```
 
-All five pre-flights green as of 2026-05-18.
+All six pre-flights green as of 2026-05-18.
 
-If the working tree is clean (`git status` shows nothing) but the
-tunnel directories are missing, the work was re-stashed between
-sessions. **Don't trust the stash label** — labels like
-"pre-stderr-capture-wip" can wrap the full tunnel arc. Inspect by
-file list:
+If the tunnel worktree is gone but `feature/roomler-tunnel` branch
+still exists in the main repo's `git branch -a`, recreate it:
+
+```bash
+cd C:/dev/gjovanov/roomler-ai/
+git worktree add ../roomler-ai-tunnel feature/roomler-tunnel
+```
+
+If the branch is gone too (catastrophic case), the work is in the
+last `git reflog` entry of the branch ref or possibly back in a
+`git stash` named `pre-stderr-capture-wip` or similar. **Don't trust
+the stash label** — labels like "pre-stderr-capture-wip" can wrap
+the full tunnel arc. Inspect by file list:
 
 ```bash
 git stash list
-git stash show -u stash@{0} --name-only             # look for crates/tunnel-core, agents/roomler-tunnel
-git stash show -u stash@{1} --name-only
-# Pop whichever has the full directory list.
-git stash pop stash@{N}
+git stash show -u stash@{N} --name-only             # look for crates/tunnel-core
 ```
 
 ## What's done
@@ -105,32 +117,63 @@ A second ride-along (`agents/roomler-agent/src/crash_uploader.rs` `INTER_REQUEST
 
 There's also a mystery `files.zip` at the root (16 KB, contains `create-issues.sh` + `mediasoup-scaling-issues.md`, both dated 2026-05-16 22:25) that came along in the stash — safe to delete before committing.
 
-## Next: T2.10 — `roomler-tunnel` CLI + end-to-end smoke
+## T2.10 progress (2026-05-18, on `feature/roomler-tunnel` worktree)
 
-Scope:
-1. `agents/roomler-tunnel/src/main.rs` — clap CLI is scaffolded (enroll / forward / run / diagnose); `forward` is the meaty one:
-   - Read config (TunnelClient JWT + server URL)
-   - Open WS to `wss://<server>/ws?role=tunnel-client&token=<jwt>`
-   - Send `rc:tunnel.hello` → wait for hello back
-   - Send `rc:tunnel.open { agent_id, transport: "webrtc-dc-v1" }` → wait for `rc:tunnel.opened` with `ice_servers`
-   - Create `TunnelPeer::new(ice_servers)`, exchange SDP offer/answer + ICE candidates via WS
-   - Wait for pool open
-   - Install `FlowDemux` on each DC in the pool
-   - Open local TCP listener on `--local`
-   - Per accepted connection: assign `flow_id` (monotonic) + `dc_index` (round-robin), send `rc:tunnel.tcp.request`, wait for accept/reject, on accept call `run_flow(tcp, dc, flow_id, demux.register(flow_id).await)`
-2. Wire-level `rc:tunnel.tcp.half_close` plumbing replaces the `HALF_CLOSE_MAGIC` in-band marker — pump signals half-close via WS, demux closes mailbox on receipt.
-3. Server-side: when receiving `TcpForwardRequest` from a client, the server now needs to FORWARD it to the agent's WS as `TcpForwardForward` (not just synthesize an accept). T2.5 stub replies `dc_index: 0`; real wiring needs the agent's reply to come back via the agent's outbound channel.
-4. End-to-end smoke: enroll a real agent + a real tunnel-client against `https://roomler.ai`, run `roomler-tunnel forward --agent X --local 5432 --remote 10.0.0.5:5432`, `psql` connects through the tunnel.
+**Done in `agents/roomler-tunnel/` and `crates/tunnel-core/`:**
 
-Pump TCP-fixture race (deferred from T2.9) is naturally exercised here — `pump_tcp_to_dc` reads from a real `TcpStream` accepted by `roomler-tunnel`'s listener while `pump_dc_to_tcp` writes to it. Full bidirectional including the now-wire-level half-close.
+| Sub-task | Status | Files |
+|---|---|---|
+| T2.10a — `roomler-tunnel forward` client CLI | ✅ | `agents/roomler-tunnel/src/{config,forward,main,lib}.rs` |
+| Config loader (TOML + env override) | ✅ | `agents/roomler-tunnel/src/config.rs` (7 tests) |
+| WS handshake (hello → open → opened) | ✅ | `agents/roomler-tunnel/src/forward.rs` |
+| SDP offer + ICE trickle + answer | ✅ | same |
+| Listen loop + per-flow oneshot reply registry | ✅ | same |
+| `enroll` command (POST /api/tunnel-client/enroll) | ✅ | `agents/roomler-tunnel/src/main.rs` |
+| T2.10b — `rc:tunnel.tcp.half_close` over WS | ✅ (audit-only) | `crates/tunnel-core/src/forward.rs` |
+| `run_flow` takes `HalfCloseSink` callback | ✅ | same |
+
+**T2.10b design clarification — wire-level half-close is AUDIT ONLY.**
+The original HANDOVER24 plan said "wire-level replaces in-band". An
+attempt to do exactly that broke `demux_handles_256k_burst` at ~40%
+completion because the WS `unregister()` fires asynchronously from
+in-flight DC chunks; SCTP per-stream ordering only guarantees the
+in-band `HALF_CLOSE_MAGIC = [0xFF]` sentinel arrives strictly AFTER
+every prior data byte on the same flow, but the wire message can
+race ahead. **Resolution**: keep the in-band sentinel for the
+data-plane close; emit the wire `TcpHalfClose` purely for the
+`tunnel_audit` accounting in the server. `run_flow` now takes a
+`HalfCloseSink: Arc<dyn Fn(u32)>` the caller wires to the WS sink.
+
+**Still open — T2.10c (server-side relay):**
+
+Server-side `crates/api/src/ws/tunnel.rs::handle_tcp_forward_request`
+still synthesises an Accept with `dc_index: 0` for now. The real
+implementation needs:
+
+1. `AppState` to expose `agent_outbound_by_id: Arc<Mutex<HashMap<ObjectId, mpsc::Sender<ServerMsg>>>>` populated by the agent WS handler.
+2. On `ClientMsg::TcpForwardRequest`: after policy gate, build `ServerMsg::TcpForwardForward { session_id, flow_id, dst_host, dst_port, owner_user_id }` and push it to the agent's outbound channel.
+3. On `ClientMsg::TcpForwardAccept/Reject` from the agent: relay back to the tunnel-client WS keyed by `session_id`. Needs a `tunnel_client_outbound_by_session: HashMap<ObjectId, Sender<ServerMsg>>` too.
+4. On `ClientMsg::TcpHalfClose` / `TcpClosed` from either side: append to `tunnel_audit`, relay to the peer.
+
+This is squarely services/api layer work that **cannot be locally tested on this Windows box** (memory `feedback-windows-no-local-backend`). Best done on mars or via a CI dev container.
+
+**Still open — T2.10d (end-to-end smoke):**
+
+Once T2.10c lands, the end-to-end test is:
+1. SSH into mars or use a real Linux box as the agent host.
+2. Enroll the agent (`roomler-agent enroll --server https://roomler.ai --token <admin-issued> --name <label>`).
+3. On the operator laptop: `cargo install --path agents/roomler-tunnel` (or download from a future agent-v0.3.0-rc.40 release).
+4. `roomler-tunnel enroll --server https://roomler.ai --token <admin-issued-tunnel-enroll> --name <laptop-label>`.
+5. `roomler-tunnel forward --agent <hex> --local 5432 --remote 10.0.0.5:5432`.
+6. From another shell: `psql -h 127.0.0.1 -p 5432 ...` — verify connect succeeds.
 
 ## Known gotchas
 
 1. **Local openssl-sys MSVC blocker** still applies — `services` / `api` / `tests` cannot be locally built or tested on this Windows box (memory `feedback_windows_no_local_backend.md`). Locally verifiable: `roomler-agent`, `roomler-ai-tunnel-core`, `roomler-ai-remote-control`, `roomler-ai-db`, `roomler-ai-config`, vendored crates. Everything else needs mars/CI.
 
-2. **HALF_CLOSE_MAGIC = [0xFF]** is a temporary in-band sentinel in `crates/tunnel-core/src/forward.rs`. T2.10 replaces it with wire-level `rc:tunnel.tcp.half_close`. The empty-payload (4-byte total) approach DIDN'T work in the local two-peer fixture (PPID 57 / DCEP empty-binary delivery flakiness or similar).
+2. **HALF_CLOSE_MAGIC = [0xFF]** is the data-plane close sentinel in `crates/tunnel-core/src/forward.rs`. It is NOT replaceable by a wire-level message — SCTP per-stream ordering makes the in-band byte the only thing that arrives strictly after all data on the same flow. Wire-level `rc:tunnel.tcp.half_close` exists as additive audit only, NOT as a replacement for the in-band sentinel. The earlier HANDOVER24 plan to "replace" was overruled by a 256 KiB burst test that showed ~40% chunk loss when `unregister()` fires asynchronously from the data.
 
-3. **Pump TCP test fixture race** — the `pump_tcp_to_dc` + `pump_dc_to_tcp` code is correct (matches what the working 256 KiB burst test does via direct `dc.send`) but a TCP-integration test against the local two-peer fixture timed out. **Don't waste time on it** — T2.10's end-to-end smoke through a real agent exercises the same path with wire-level half-close and will catch any real bug.
+3. **Pump TCP test fixture race** — the `pump_tcp_to_dc` + `pump_dc_to_tcp` code is correct (matches what the working 256 KiB burst test does via direct `dc.send`) but a TCP-integration test against the local two-peer fixture timed out. **Don't waste time on it** — T2.10d's end-to-end smoke through a real agent exercises the same path and will catch any real bug.
 
 4. **Defensive enum catch-alls** — see CLAUDE.md "Defensive enum catch-alls" subsection. CI 25972574628 hit this; master commit `35aa487` resolved by dropping the catch-all, but the same pattern would recur if you preemptively add a catch-all for variants not in the same commit. **Use explicit `m @ (V1 | V2 | …)` enumeration** like in `agents/roomler-agent/src/signaling.rs:567+` for the tunnel-flow ServerMsg variants.
 
