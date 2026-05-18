@@ -33,15 +33,21 @@ use bson::{DateTime, oid::ObjectId};
 use futures::{SinkExt, StreamExt, stream::SplitSink};
 use roomler_ai_remote_control::{
     models::{AgentStatus, RelayMode, TunnelAuditEvent, TunnelAuditKind},
-    signaling::{ClientMsg, RejectKind, ServerMsg},
+    signaling::{ClientMsg, CloseReason, RejectKind, ServerMsg},
 };
 use roomler_ai_tunnel_core::policy::{GateResult, ResolvedSubject, check_forward_request};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, info, warn};
 
 use crate::state::AppState;
+use crate::ws::remote_control::pump_server_messages;
+
+/// Outbound channel capacity. Per-tunnel-client. Generous because a
+/// single peer multiplexes many flows; the dominant traffic is per-
+/// flow audit relays + ICE trickle, both small and sporadic.
+const OUTBOUND_CAP: usize = 256;
 
 /// Cadence of the revocation re-check. 60 s is the v1 default —
 /// cheap (one Mongo find_by_id per minute per active connection)
@@ -63,6 +69,16 @@ pub async fn handle_tunnel_client_socket(
 
     let (socket_tx, mut socket_rx) = socket.split();
     let socket_tx = Arc::new(Mutex::new(socket_tx));
+
+    // Outbound channel pattern — mirrors the agent WS handler's
+    // Hub-owned mpsc. All `ServerMsg` writes go through `outbound_tx`;
+    // a single pump task drains the receiver onto the socket. Once
+    // the tunnel-session is established we register a clone of
+    // `outbound_tx` in `AppState::tunnel_clients_by_session` so the
+    // agent's WS handler can push relayed `TcpForwardAccept` etc.
+    // back to this client.
+    let (outbound_tx, outbound_rx) = mpsc::channel::<ServerMsg>(OUTBOUND_CAP);
+    let pump = tokio::spawn(pump_server_messages(outbound_rx, socket_tx.clone()));
 
     // Look up tunnel-client metadata once for audit-row enrichment
     // (client_version + client_os). Best-effort — audit rows still
@@ -92,6 +108,7 @@ pub async fn handle_tunnel_client_socket(
     let revocation_handle = spawn_revocation_check(
         state.clone(),
         socket_tx.clone(),
+        outbound_tx.clone(),
         tunnel_client_id,
         tenant_id,
     );
@@ -109,7 +126,7 @@ pub async fn handle_tunnel_client_socket(
             Err(e) => {
                 warn!(%tunnel_client_id, %e, "tunnel-client sent malformed JSON; dropping");
                 send_error(
-                    &socket_tx,
+                    &outbound_tx,
                     None,
                     "bad_request",
                     &format!("malformed JSON: {e}"),
@@ -138,7 +155,7 @@ pub async fn handle_tunnel_client_socket(
             } => {
                 handle_tunnel_open(
                     &state,
-                    &socket_tx,
+                    &outbound_tx,
                     &mut session,
                     tunnel_client_id,
                     tenant_id,
@@ -159,7 +176,7 @@ pub async fn handle_tunnel_client_socket(
             } => {
                 handle_tcp_forward_request(
                     &state,
-                    &socket_tx,
+                    &outbound_tx,
                     session.as_ref(),
                     tunnel_client_id,
                     tenant_id,
@@ -174,10 +191,24 @@ pub async fn handle_tunnel_client_socket(
                 .await;
             }
 
-            // T2.6+ — these need the agent WS bridge.
             ClientMsg::TunnelTerminate { session_id, reason } => {
                 info!(%tunnel_client_id, %session_id, ?reason, "rc:tunnel.terminate");
+                // Relay the teardown to the agent so it tears down
+                // its peer state too. Best-effort — agent may be
+                // offline.
+                if let Some(s) = session.as_ref() {
+                    if s.tunnel_session_id == session_id {
+                        let _ = state.rc_hub.send_to_agent(
+                            s.agent_id,
+                            ServerMsg::TunnelTerminate {
+                                session_id: s.tunnel_session_id,
+                                reason: reason.clone(),
+                            },
+                        );
+                    }
+                }
                 if let Some(s) = session.take() {
+                    state.tunnel_clients_by_session.remove(&s.tunnel_session_id);
                     audit_peer_close(
                         &state,
                         &s,
@@ -189,13 +220,53 @@ pub async fn handle_tunnel_client_socket(
                     .await;
                 }
             }
-            ClientMsg::TcpHalfClose { .. }
-            | ClientMsg::TcpClosed { .. }
-            | ClientMsg::TcpForwardAccept { .. }
-            | ClientMsg::TcpForwardReject { .. } => {
-                // T2.6 will relay these to the agent's WS. For now,
-                // log so we can see the wire is exercised by clients.
-                debug!(%tunnel_client_id, ?parsed, "rc:tunnel.* relay variant — T2.6");
+
+            ClientMsg::TcpHalfClose {
+                session_id,
+                flow_id,
+                direction,
+            } => {
+                // Tunnel-client → server → agent: relay the half-close
+                // for the agent's audit + write-half teardown. The
+                // data-plane FIN itself rides the in-band SCTP
+                // sentinel; this WS message is audit-only.
+                relay_half_close_to_agent(
+                    &state,
+                    session.as_ref(),
+                    tunnel_client_id,
+                    session_id,
+                    flow_id,
+                    direction,
+                )
+                .await;
+            }
+
+            ClientMsg::TcpClosed {
+                session_id,
+                flow_id,
+                reason,
+            } => {
+                // Relay flow-close to agent + append audit row.
+                relay_tcp_closed_to_agent(
+                    &state,
+                    session.as_ref(),
+                    tunnel_client_id,
+                    owner_user_id,
+                    &client_version,
+                    client_os,
+                    session_id,
+                    flow_id,
+                    reason,
+                )
+                .await;
+            }
+
+            ClientMsg::TcpForwardAccept { .. } | ClientMsg::TcpForwardReject { .. } => {
+                // Client → server: clients never originate these
+                // (server-side ACL + agent are the deciders). Tests
+                // exercise the wire; just log so we notice if a
+                // misbehaving client emits one.
+                debug!(%tunnel_client_id, ?parsed, "client emitted server-only tunnel msg — ignoring");
             }
 
             // Non-tunnel rc:* — explicitly ignored on this WS role.
@@ -207,6 +278,16 @@ pub async fn handle_tunnel_client_socket(
 
     revocation_handle.abort();
     if let Some(s) = session {
+        state.tunnel_clients_by_session.remove(&s.tunnel_session_id);
+        // Best-effort: tell the agent the peer is gone so it tears
+        // down its side.
+        let _ = state.rc_hub.send_to_agent(
+            s.agent_id,
+            ServerMsg::TunnelTerminate {
+                session_id: s.tunnel_session_id,
+                reason: CloseReason::ClientShutdown,
+            },
+        );
         audit_peer_close(
             &state,
             &s,
@@ -217,6 +298,13 @@ pub async fn handle_tunnel_client_socket(
         )
         .await;
     }
+    // Drop our outbound_tx so the pump task can exit cleanly. Any
+    // clones in tunnel_clients_by_session were just removed; any
+    // clones the revocation task held are dropped when its handle
+    // aborts. Defensive `pump.abort()` covers the edge case where
+    // some other clone is still alive.
+    drop(outbound_tx);
+    pump.abort();
     info!(%tunnel_client_id, "tunnel-client WS disconnected");
 }
 
@@ -234,7 +322,7 @@ struct TunnelSession {
 #[allow(clippy::too_many_arguments)]
 async fn handle_tunnel_open(
     state: &AppState,
-    socket_tx: &Arc<Mutex<SplitSink<WebSocket, Message>>>,
+    outbound_tx: &mpsc::Sender<ServerMsg>,
     session: &mut Option<TunnelSession>,
     tunnel_client_id: ObjectId,
     client_tenant_id: ObjectId,
@@ -251,9 +339,9 @@ async fn handle_tunnel_open(
     let agent = match state.agents.base.find_by_id(agent_id).await {
         Ok(a) => a,
         Err(_) => {
-            send(
-                socket_tx,
-                &ServerMsg::Error {
+            send_msg(
+                outbound_tx,
+                ServerMsg::Error {
                     session_id: None,
                     code: "agent_not_found".into(),
                     message: format!("agent {agent_id} does not exist"),
@@ -271,9 +359,9 @@ async fn handle_tunnel_open(
             agent_tenant_id = %agent.tenant_id,
             "tunnel-client tried to open peer to a cross-tenant agent"
         );
-        send(
-            socket_tx,
-            &ServerMsg::Error {
+        send_msg(
+            outbound_tx,
+            ServerMsg::Error {
                 session_id: None,
                 code: "cross_tenant".into(),
                 message: "agent belongs to a different tenant".into(),
@@ -286,9 +374,9 @@ async fn handle_tunnel_open(
     // 3. Refuse if agent is soft-deleted or quarantined — early
     // signal beats waiting for the relay step to fail.
     if agent.deleted_at.is_some() || matches!(agent.status, AgentStatus::Quarantined) {
-        send(
-            socket_tx,
-            &ServerMsg::Error {
+        send_msg(
+            outbound_tx,
+            ServerMsg::Error {
                 session_id: None,
                 code: "agent_unavailable".into(),
                 message: "agent is quarantined or deleted".into(),
@@ -298,7 +386,9 @@ async fn handle_tunnel_open(
         return;
     }
 
-    // 4. Create the session id + persist on the connection.
+    // 4. Create the session id + persist on the connection +
+    // register the outbound channel so the agent WS handler can
+    // relay TcpForwardAccept/Reject/HalfClose/Closed back to us.
     let tunnel_session_id = ObjectId::new();
     let new_session = TunnelSession {
         tunnel_session_id,
@@ -307,6 +397,9 @@ async fn handle_tunnel_open(
         transport: transport.clone(),
     };
     *session = Some(new_session.clone());
+    state
+        .tunnel_clients_by_session
+        .insert(tunnel_session_id, outbound_tx.clone());
 
     // 5. Audit the open. RelayMode is "Direct" until ICE finishes —
     // T2.7 updates this after candidate selection.
@@ -342,9 +435,9 @@ async fn handle_tunnel_open(
     // empty ice_servers; the SCTP rwnd value mirrors the vendored
     // webrtc patch's target so the CLI's `diagnose` subcommand can
     // verify the patch took effect.
-    send(
-        socket_tx,
-        &ServerMsg::TunnelOpened {
+    send_msg(
+        outbound_tx,
+        ServerMsg::TunnelOpened {
             session_id: tunnel_session_id,
             transport,
             dc_pool_size: 8,
@@ -358,7 +451,7 @@ async fn handle_tunnel_open(
 #[allow(clippy::too_many_arguments)]
 async fn handle_tcp_forward_request(
     state: &AppState,
-    socket_tx: &Arc<Mutex<SplitSink<WebSocket, Message>>>,
+    outbound_tx: &mpsc::Sender<ServerMsg>,
     session: Option<&TunnelSession>,
     tunnel_client_id: ObjectId,
     client_tenant_id: ObjectId,
@@ -372,9 +465,9 @@ async fn handle_tcp_forward_request(
 ) {
     let Some(s) = session else {
         // No prior TunnelOpen — client is using the wire wrong.
-        send(
-            socket_tx,
-            &ServerMsg::TcpForwardReject {
+        send_msg(
+            outbound_tx,
+            ServerMsg::TcpForwardReject {
                 session_id: request_session_id,
                 flow_id,
                 kind: RejectKind::AgentError,
@@ -385,9 +478,9 @@ async fn handle_tcp_forward_request(
         return;
     };
     if s.tunnel_session_id != request_session_id {
-        send(
-            socket_tx,
-            &ServerMsg::TcpForwardReject {
+        send_msg(
+            outbound_tx,
+            ServerMsg::TcpForwardReject {
                 session_id: request_session_id,
                 flow_id,
                 kind: RejectKind::AgentError,
@@ -417,9 +510,9 @@ async fn handle_tcp_forward_request(
                 "agent row vanished",
             )
             .await;
-            send(
-                socket_tx,
-                &ServerMsg::TcpForwardReject {
+            send_msg(
+                outbound_tx,
+                ServerMsg::TcpForwardReject {
                     session_id: request_session_id,
                     flow_id,
                     kind: RejectKind::AgentError,
@@ -466,32 +559,68 @@ async fn handle_tcp_forward_request(
 
     match result {
         GateResult::Allow { policy_id, .. } => {
-            debug!(%tunnel_client_id, %flow_id, %dst_host, %dst_port, %policy_id, "tcp forward allowed");
-            // T2.5 stub: tell the client the forward is accepted with
-            // dc_index 0. T2.6 will actually relay the
-            // `TcpForwardForward` to the agent + wait for its real
-            // accept reply.
-            audit_tcp_accept(
-                state,
-                s,
-                tunnel_client_id,
-                owner_user_id,
-                client_version,
-                client_os,
-                flow_id,
-                dst_host,
-                dst_port,
-            )
-            .await;
-            send(
-                socket_tx,
-                &ServerMsg::TcpForwardAccept {
+            debug!(%tunnel_client_id, %flow_id, %dst_host, %dst_port, %policy_id, "tcp forward allowed by policy; relaying to agent");
+            // T2.10c: relay to the agent's WS. The agent dials dst,
+            // then replies with `ClientMsg::TcpForwardAccept` (or
+            // Reject) which the agent WS handler routes back to us
+            // via `tunnel_clients_by_session`.
+            let relay = state.rc_hub.send_to_agent(
+                s.agent_id,
+                ServerMsg::TcpForwardForward {
                     session_id: request_session_id,
                     flow_id,
-                    dc_index: 0,
+                    dst_host: dst_host.to_string(),
+                    dst_port,
+                    owner_user_id,
                 },
-            )
-            .await;
+            );
+            match relay {
+                Ok(()) => {
+                    // Server side accepted-relayed; the actual
+                    // accept (or agent-side reject) lands later
+                    // via the agent's WS.
+                    audit_tcp_accept(
+                        state,
+                        s,
+                        tunnel_client_id,
+                        owner_user_id,
+                        client_version,
+                        client_os,
+                        flow_id,
+                        dst_host,
+                        dst_port,
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    // Agent not online or its channel is wedged.
+                    warn!(%tunnel_client_id, %flow_id, agent = %s.agent_id, %e, "agent relay failed");
+                    audit_tcp_reject(
+                        state,
+                        s,
+                        tunnel_client_id,
+                        owner_user_id,
+                        client_version,
+                        client_os,
+                        flow_id,
+                        dst_host,
+                        dst_port,
+                        RejectKind::AgentError,
+                        &format!("agent unreachable: {e}"),
+                    )
+                    .await;
+                    send_msg(
+                        outbound_tx,
+                        ServerMsg::TcpForwardReject {
+                            session_id: request_session_id,
+                            flow_id,
+                            kind: RejectKind::AgentError,
+                            reason: format!("agent unreachable: {e}"),
+                        },
+                    )
+                    .await;
+                }
+            }
         }
         GateResult::Reject { kind, reason } => {
             info!(%tunnel_client_id, %flow_id, %dst_host, %dst_port, ?kind, %reason, "tcp forward rejected");
@@ -509,9 +638,9 @@ async fn handle_tcp_forward_request(
                 &reason,
             )
             .await;
-            send(
-                socket_tx,
-                &ServerMsg::TcpForwardReject {
+            send_msg(
+                outbound_tx,
+                ServerMsg::TcpForwardReject {
                     session_id: request_session_id,
                     flow_id,
                     kind,
@@ -649,27 +778,24 @@ async fn audit_peer_close(
 // Wire helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-async fn send(socket_tx: &Arc<Mutex<SplitSink<WebSocket, Message>>>, msg: &ServerMsg) {
-    let text = match serde_json::to_string(msg) {
-        Ok(t) => t,
-        Err(e) => {
-            warn!(%e, "ServerMsg serialise failed; dropping");
-            return;
-        }
-    };
-    let mut guard = socket_tx.lock().await;
-    let _ = guard.send(Message::text(text)).await;
+/// Push `msg` onto the per-connection outbound channel. The pump task
+/// serialises + writes to the socket. A closed channel means the
+/// socket has gone away or the pump exited — log + drop.
+async fn send_msg(outbound: &mpsc::Sender<ServerMsg>, msg: ServerMsg) {
+    if let Err(e) = outbound.send(msg).await {
+        debug!(%e, "outbound channel closed; dropping ServerMsg");
+    }
 }
 
 async fn send_error(
-    socket_tx: &Arc<Mutex<SplitSink<WebSocket, Message>>>,
+    outbound: &mpsc::Sender<ServerMsg>,
     session_id: Option<ObjectId>,
     code: &str,
     message: &str,
 ) {
-    send(
-        socket_tx,
-        &ServerMsg::Error {
+    send_msg(
+        outbound,
+        ServerMsg::Error {
             session_id,
             code: code.into(),
             message: message.into(),
@@ -679,12 +805,133 @@ async fn send_error(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Client → agent relays for `TcpHalfClose` / `TcpClosed`
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Relay a `ClientMsg::TcpHalfClose` from the tunnel-client to the
+/// connected agent. Audit-only on the data plane (the in-band SCTP
+/// sentinel does the actual mailbox close on the peer); this message
+/// gives the agent's audit path a half-close event to record.
+async fn relay_half_close_to_agent(
+    state: &AppState,
+    session: Option<&TunnelSession>,
+    tunnel_client_id: ObjectId,
+    request_session_id: ObjectId,
+    flow_id: u32,
+    direction: roomler_ai_remote_control::signaling::Direction,
+) {
+    let Some(s) = session else {
+        debug!(%tunnel_client_id, %flow_id, "half-close on dead session — ignoring");
+        return;
+    };
+    if s.tunnel_session_id != request_session_id {
+        debug!(%tunnel_client_id, %flow_id, "half-close with mismatched session_id — ignoring");
+        return;
+    }
+    if let Err(e) = state.rc_hub.send_to_agent(
+        s.agent_id,
+        ServerMsg::TcpHalfClose {
+            session_id: request_session_id,
+            flow_id,
+            direction,
+        },
+    ) {
+        debug!(%tunnel_client_id, %flow_id, %e, "half-close relay to agent failed");
+    }
+}
+
+/// Relay a `ClientMsg::TcpClosed` from the tunnel-client to the agent
+/// + append an audit row. The flow is fully closed at this point —
+/// `tunnel_audit` records the close reason so admins can reconstruct
+/// the lifecycle.
+#[allow(clippy::too_many_arguments)]
+async fn relay_tcp_closed_to_agent(
+    state: &AppState,
+    session: Option<&TunnelSession>,
+    tunnel_client_id: ObjectId,
+    owner_user_id: ObjectId,
+    client_version: &str,
+    client_os: roomler_ai_remote_control::models::OsKind,
+    request_session_id: ObjectId,
+    flow_id: u32,
+    reason: CloseReason,
+) {
+    let Some(s) = session else {
+        return;
+    };
+    if s.tunnel_session_id != request_session_id {
+        return;
+    }
+    if let Err(e) = state.rc_hub.send_to_agent(
+        s.agent_id,
+        ServerMsg::TcpClosed {
+            session_id: request_session_id,
+            flow_id,
+            reason,
+        },
+    ) {
+        debug!(%tunnel_client_id, %flow_id, %e, "tcp-closed relay to agent failed");
+    }
+    audit_tcp_close(
+        state,
+        s,
+        tunnel_client_id,
+        owner_user_id,
+        client_version,
+        client_os,
+        flow_id,
+        reason,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn audit_tcp_close(
+    state: &AppState,
+    session: &TunnelSession,
+    tunnel_client_id: ObjectId,
+    owner_user_id: ObjectId,
+    client_version: &str,
+    client_os: roomler_ai_remote_control::models::OsKind,
+    flow_id: u32,
+    reason: CloseReason,
+) {
+    let _ = state
+        .tunnel_audit
+        .append(&TunnelAuditEvent {
+            id: None,
+            tenant_id: session.agent_tenant_id,
+            tunnel_session_id: session.tunnel_session_id,
+            tunnel_client_id,
+            agent_id: session.agent_id,
+            user_id: owner_user_id,
+            at: DateTime::now(),
+            kind: TunnelAuditKind::TcpClosed,
+            flow_id: Some(flow_id),
+            dst_host: None,
+            dst_port: None,
+            bytes_in: 0,
+            bytes_out: 0,
+            message_count: 0,
+            duration_ms: None,
+            relay: RelayMode::Direct,
+            client_src_ip: None,
+            agent_src_port: None,
+            client_version: client_version.to_string(),
+            client_os,
+            reason: Some(format!("{reason:?}")),
+        })
+        .await;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Revocation re-check (lifted from T1 stub, now sends typed ServerMsg)
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn spawn_revocation_check(
     state: AppState,
     socket_tx: Arc<Mutex<SplitSink<WebSocket, Message>>>,
+    outbound_tx: mpsc::Sender<ServerMsg>,
     tunnel_client_id: ObjectId,
     tenant_id: ObjectId,
 ) -> tokio::task::JoinHandle<()> {
@@ -706,13 +953,16 @@ fn spawn_revocation_check(
                 }
                 Ok(_) => {
                     info!(%tunnel_client_id, "tunnel-client revoked mid-session; closing WS");
-                    send(
-                        &socket_tx,
-                        &ServerMsg::TunnelRevoked {
+                    send_msg(
+                        &outbound_tx,
+                        ServerMsg::TunnelRevoked {
                             reason: "status changed to Quarantined or soft-deleted".into(),
                         },
                     )
                     .await;
+                    // Give the pump a moment to flush the revocation
+                    // message before slamming the socket shut.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
                     let mut guard = socket_tx.lock().await;
                     let _ = guard.close().await;
                     return;
