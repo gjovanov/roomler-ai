@@ -9,7 +9,8 @@ use roomler_ai_services::{
         message::MessageDao, notification::NotificationDao, push_subscription::PushSubscriptionDao,
         reaction::ReactionDao, recording::RecordingDao, remote_audit::RemoteAuditDao,
         remote_session::RemoteSessionDao, role::RoleDao, room::RoomDao, tenant::TenantDao,
-        user::UserDao,
+        tunnel_audit::TunnelAuditDao, tunnel_client::TunnelClientDao,
+        tunnel_policy::TunnelPolicyDao, user::UserDao,
     },
     media::{room_manager::RoomManager, worker_pool::WorkerPool},
 };
@@ -53,6 +54,11 @@ pub struct AppState {
     pub remote_audit: Arc<RemoteAuditDao>,
     pub agent_crashes: Arc<roomler_ai_services::dao::agent_crash::AgentCrashDao>,
     pub rc_hub: Arc<Hub>,
+
+    // roomler-tunnel subsystem
+    pub tunnel_clients: Arc<TunnelClientDao>,
+    pub tunnel_policies: Arc<TunnelPolicyDao>,
+    pub tunnel_audit: Arc<TunnelAuditDao>,
 
     /// 1h-TTL in-memory cache backing `/api/agent/latest-release`.
     /// All agents share this single cache; one upstream GitHub fetch
@@ -148,6 +154,11 @@ impl AppState {
         let (audit_sink, _audit_handle) = AuditSink::spawn(db.clone());
         let rc_hub = Arc::new(Hub::new(audit_sink, turn_cfg));
 
+        // roomler-tunnel subsystem
+        let tunnel_clients = Arc::new(TunnelClientDao::new(&db));
+        let tunnel_policies = Arc::new(TunnelPolicyDao::new(&db));
+        let tunnel_audit = Arc::new(TunnelAuditDao::new(&db));
+
         Ok(Self {
             db,
             settings,
@@ -179,6 +190,9 @@ impl AppState {
             remote_audit,
             agent_crashes,
             rc_hub,
+            tunnel_clients,
+            tunnel_policies,
+            tunnel_audit,
             latest_release_cache: crate::routes::agent_release::LatestReleaseCache::new(),
         })
     }

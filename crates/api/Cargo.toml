@@ -20,6 +20,7 @@ roomler-ai-config = { path = "../config" }
 roomler-ai-db = { path = "../db" }
 roomler-ai-services = { path = "../services" }
 roomler-ai-remote-control = { path = "../remote_control" }
+roomler-ai-tunnel-core = { path = "../tunnel-core" }
 
 axum.workspace = true
 tokio.workspace = true

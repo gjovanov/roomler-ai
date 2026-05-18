@@ -175,6 +175,13 @@ function initDecoder() {
     decoder.configure({
       codec: activeCodec,
       optimizeForLatency: true,
+      // rc.33 — prefer hardware decode where available. Profile-1
+      // (4:4:4) HW decode is rare (Intel Tiger Lake+, some AMD); on
+      // hardware that doesn't expose it (UHD 630, etc.) Chromium
+      // silently falls back to SW decode. When it DOES kick in, it
+      // removes the SW-VP9-decode CPU contention from the controller
+      // process, freeing budget for the render scheduler.
+      hardwareAcceleration: 'prefer-hardware',
     } as VideoDecoderConfig)
     configured = true
     workerScope.postMessage({

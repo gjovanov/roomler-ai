@@ -249,6 +249,14 @@ After every feature or fix, verify your changes:
 
 Run the **most specific** command first. If a backend change also affects the frontend, run both.
 
+### Defensive enum catch-alls
+
+`ClientMsg` / `ServerMsg` in `crates/remote_control/src/signaling.rs` are matched exhaustively from multiple consumer crates (agent, api/ws, hub). When you preemptively add a `_ =>` / `other =>` catch-all arm in a consumer match **without** adding the new variants that would make it reachable in the same commit, `cargo clippy --workspace -- -D warnings` fails with `unreachable_patterns` (the existing arms already cover every known variant). CI run [25972574628](https://github.com/gjovanov/roomler-ai/actions/runs/25972574628) hit this — defensive catch-all landed in `ec61f03` before the corresponding T2 wire variants did. The rule:
+
+- If the new variants are landing in **the same commit**: no allow needed, the catch-all is immediately reachable.
+- If the new variants are landing in **a later commit** (defensive future-proofing): annotate the catch-all with `#[allow(unreachable_patterns)]` and reference this rule in a comment so the next reviewer doesn't strip the allow. Remove the allow when the variants land.
+- `#[non_exhaustive]` on the enum upstream is the structural alternative but forces a catch-all in every consumer everywhere — too invasive for the existing `signaling::*` matches.
+
 ## Remote Control Subsystem
 
 TeamViewer-style remote desktop. One native agent per controlled host, Roomler API as signalling-only relay, browser as controller. All media + input flows over direct WebRTC P2P (TURN-relayed if needed) — the server never sees raw pixels or keystrokes.
