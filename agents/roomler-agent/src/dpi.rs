@@ -42,7 +42,7 @@
 #![cfg(target_os = "windows")]
 
 use windows_sys::Win32::UI::HiDpi::{
-    DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE,
+    AreDpiAwarenessContextsEqual, DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE,
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, DPI_AWARENESS_CONTEXT_SYSTEM_AWARE,
     DPI_AWARENESS_CONTEXT_UNAWARE, DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED,
     GetThreadDpiAwarenessContext, SetProcessDpiAwarenessContext,
@@ -103,13 +103,22 @@ pub fn set_per_monitor_aware() -> DpiOutcome {
     DpiOutcome { set, actual }
 }
 
-/// Read the calling thread's current DPI awareness mode. Compares
-/// against the known `DPI_AWARENESS_CONTEXT_*` sentinels via
-/// `AreDpiAwarenessContextsEqual` — but the sentinels are opaque
-/// pointers, not values, so equality is pointer-identity-ish (Windows
-/// uses a small set of well-known opaque handles and `==` works for
-/// them in practice). The Unknown variant catches any future Windows
-/// release that introduces a new sentinel we haven't enumerated.
+/// Read the calling thread's current DPI awareness mode.
+///
+/// rc.44 — switched from raw `==` pointer comparison to
+/// `AreDpiAwarenessContextsEqual`. The rc.41 implementation used `==`
+/// against sentinel constants from `windows-sys`, which compares the
+/// stored sentinel pointer values directly. PC50045 field test
+/// 2026-05-18 showed `actual=unknown` despite `set_succeeded=true`
+/// — the returned handle from `GetThreadDpiAwarenessContext` is NOT
+/// guaranteed to be one of the sentinel pointer values; Microsoft
+/// returns an opaque internal handle that's only safely compared via
+/// the dedicated API. Per the MSDN documentation:
+///
+/// > To compare two DPI_AWARENESS_CONTEXT values, use
+/// > AreDpiAwarenessContextsEqual.
+///
+/// So we walk the known sentinel set and call the proper API for each.
 fn current_thread_awareness() -> ActualAwareness {
     // SAFETY: GetThreadDpiAwarenessContext returns an opaque handle
     // owned by Windows; we never dereference it. Returns NULL only on
@@ -118,19 +127,21 @@ fn current_thread_awareness() -> ActualAwareness {
     if ctx.is_null() {
         return ActualAwareness::Unknown;
     }
-    // Sentinels are macro-like opaque handles. Equality is pointer
-    // comparison; matches in practice on every Win10+ build we've
-    // tested. If Microsoft changes the representation we fall through
-    // to Unknown — caller logs the bare pointer for debugging.
-    if ctx == DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 {
+    // SAFETY: AreDpiAwarenessContextsEqual is documented thread-safe;
+    // both arguments are opaque handles owned by Windows. Returns
+    // BOOL (0/1). Non-zero == equal.
+    let eq = |a: DPI_AWARENESS_CONTEXT, b: DPI_AWARENESS_CONTEXT| -> bool {
+        unsafe { AreDpiAwarenessContextsEqual(a, b) != 0 }
+    };
+    if eq(ctx, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) {
         ActualAwareness::PerMonitorAwareV2
-    } else if ctx == DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE {
+    } else if eq(ctx, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE) {
         ActualAwareness::PerMonitorAware
-    } else if ctx == DPI_AWARENESS_CONTEXT_SYSTEM_AWARE {
+    } else if eq(ctx, DPI_AWARENESS_CONTEXT_SYSTEM_AWARE) {
         ActualAwareness::SystemAware
-    } else if ctx == DPI_AWARENESS_CONTEXT_UNAWARE {
+    } else if eq(ctx, DPI_AWARENESS_CONTEXT_UNAWARE) {
         ActualAwareness::Unaware
-    } else if ctx == DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED {
+    } else if eq(ctx, DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED) {
         ActualAwareness::UnawareGdiScaled
     } else {
         ActualAwareness::Unknown
