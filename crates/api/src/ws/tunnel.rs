@@ -261,6 +261,27 @@ pub async fn handle_tunnel_client_socket(
                 .await;
             }
 
+            ClientMsg::TunnelSdpOffer { session_id, sdp } => {
+                // Relay SDP offer to the agent so it can build its
+                // answerer-side TunnelPeer. Server-side route is
+                // session-id-gated; cross-tenant + agent-online
+                // checks already happened on TunnelOpen.
+                relay_sdp_offer_to_agent(&state, session.as_ref(), session_id, sdp).await;
+            }
+
+            ClientMsg::TunnelIce {
+                session_id,
+                candidate,
+            } => {
+                relay_ice_to_agent(&state, session.as_ref(), session_id, candidate).await;
+            }
+
+            ClientMsg::TunnelSdpAnswer { .. } => {
+                // Clients only emit offers, agents only emit answers.
+                // A client SDP answer means the wire is being abused.
+                debug!(%tunnel_client_id, "client emitted TunnelSdpAnswer — ignoring");
+            }
+
             ClientMsg::TcpForwardAccept { .. } | ClientMsg::TcpForwardReject { .. } => {
                 // Client → server: clients never originate these
                 // (server-side ACL + agent are the deciders). Tests
@@ -883,6 +904,60 @@ async fn relay_tcp_closed_to_agent(
         reason,
     )
     .await;
+}
+
+/// Relay a tunnel-client SDP offer to the agent. Cheap session_id
+/// validation only — the heavy gates (cross-tenant, agent online)
+/// already fired on TunnelOpen, so reaching here means the session
+/// is sound.
+async fn relay_sdp_offer_to_agent(
+    state: &AppState,
+    session: Option<&TunnelSession>,
+    request_session_id: ObjectId,
+    sdp: String,
+) {
+    let Some(s) = session else {
+        debug!(%request_session_id, "SDP offer on dead session — ignoring");
+        return;
+    };
+    if s.tunnel_session_id != request_session_id {
+        debug!(%request_session_id, "SDP offer session_id mismatch — ignoring");
+        return;
+    }
+    if let Err(e) = state.rc_hub.send_to_agent(
+        s.agent_id,
+        ServerMsg::TunnelSdpOffer {
+            session_id: request_session_id,
+            sdp,
+        },
+    ) {
+        warn!(%request_session_id, %e, "SDP offer relay to agent failed");
+    }
+}
+
+/// Relay a tunnel ICE candidate to the agent. Symmetric to
+/// [`relay_sdp_offer_to_agent`].
+async fn relay_ice_to_agent(
+    state: &AppState,
+    session: Option<&TunnelSession>,
+    request_session_id: ObjectId,
+    candidate: serde_json::Value,
+) {
+    let Some(s) = session else {
+        return;
+    };
+    if s.tunnel_session_id != request_session_id {
+        return;
+    }
+    if let Err(e) = state.rc_hub.send_to_agent(
+        s.agent_id,
+        ServerMsg::TunnelIce {
+            session_id: request_session_id,
+            candidate,
+        },
+    ) {
+        debug!(%request_session_id, %e, "tunnel ICE relay to agent failed");
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
