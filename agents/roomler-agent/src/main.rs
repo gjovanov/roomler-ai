@@ -1175,6 +1175,7 @@ fn service_status_as_service() -> Result<()> {
 /// supervisor reads it from `std::env::var("ROOMLER_AGENT_ENABLE_SYSTEM_SWAP")`
 /// in `win_service::supervisor::system_swap_enabled()` and any drift
 /// would silently break the gate.
+#[cfg(target_os = "windows")]
 const SYSTEM_CONTEXT_ENV_VAR: &str = "ROOMLER_AGENT_ENABLE_SYSTEM_SWAP";
 
 /// Default per-transition timeout for the post-write service restart.
