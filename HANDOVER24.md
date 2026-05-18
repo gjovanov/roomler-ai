@@ -165,24 +165,36 @@ The server now actually forwards `ClientMsg::TcpForwardRequest` to the agent as 
 - Workspace `cargo check -p {tunnel-core,remote_control,roomler-tunnel,roomler-agent}` clean
 - `cargo fmt --all -- --check` clean
 
-**Still open — T2.10d (agent-side TunnelPeer + answerer pipeline):**
+**T2.10d (agent-side TunnelPeer + answerer pipeline) — DONE 2026-05-19:**
 
-For end-to-end smoke through a real agent the agent process needs a complete answerer-side mirror of the tunnel-client's WebRTC handshake:
+| Sub-task | Status | Files |
+|---|---|---|
+| T2.10d.1 — `agents/roomler-agent/src/tunnel/peer.rs` answerer module | ✅ | new file |
+| T2.10d.2 — Wire `TunnelSdpOffer` / `TunnelIce` / `TunnelTerminate` dispatch in agent signaling.rs + `tunnel_peers` registry + `close_all_tunnel_peers` | ✅ | `agents/roomler-agent/src/signaling.rs` |
+| T2.10d.3 — Split acceptor into `decide_forward` (testable) + `handle_forward_request` (data plane); spawn `tunnel_core::forward::run_flow` with the agent peer's `HalfCloseSink` | ✅ | `agents/roomler-agent/src/tunnel/acceptor.rs` |
 
-1. New module `agents/roomler-agent/src/tunnel/peer.rs` — wrap `TunnelPeer` for the answerer side. Construct on `ServerMsg::TunnelSdpOffer`, call `accept_offer` + emit `ClientMsg::TunnelSdpAnswer` + `ClientMsg::TunnelIce` trickle.
-2. Per-tunnel-session state in `agent/src/signaling.rs` — track `tunnel_session_id` → `TunnelPeer` so SDP/ICE/TcpForwardForward route to the right peer.
-3. `tunnel::acceptor::handle_forward_request` upgraded — currently dials dst then drops the stream. T2.10d needs to register the flow on the agent-side `FlowDemux` and spawn `tunnel_core::forward::run_flow` with a `HalfCloseSink` wired to emit `ClientMsg::TcpHalfClose` over the agent's outbound WS.
-4. Agent-side audit row for `TcpClosed` (mirror of `audit_tcp_close` on the server side).
+The agent now:
+1. Receives `ServerMsg::TunnelSdpOffer { session_id, sdp }`, builds an `AgentTunnelPeer`, replies with `ClientMsg::TunnelSdpAnswer`.
+2. Forwards remote ICE candidates from `ServerMsg::TunnelIce` into the peer; trickles its local candidates back via `ClientMsg::TunnelIce`.
+3. Waits in the background for the DC pool to fully open + installs one `FlowDemux` per channel.
+4. On each `ServerMsg::TcpForwardForward`: runs the ACL + dial decide, picks `dc_index = flow_id % pool_size`, registers the flow on the demux, replies `TcpForwardAccept`, spawns `tunnel_core::forward::run_flow`. On flow close: emits `ClientMsg::TcpClosed` for audit.
+5. On `ServerMsg::TunnelTerminate` or WS disconnect: closes every tunnel peer cleanly.
 
-**Still open — T2.10e (end-to-end smoke):**
+End-to-end handshake validated locally with `tunnel::peer::tests::answerer_reaches_pool_ready` — drives a no-signaling-server offerer+answerer setup and asserts the pool opens within 15 s.
 
-Once T2.10d lands, the end-to-end test is:
-1. SSH into mars or use a real Linux box as the agent host.
-2. Enroll the agent (`roomler-agent enroll --server https://roomler.ai --token <admin-issued> --name <label>`).
-3. On the operator laptop: `cargo install --path agents/roomler-tunnel` (or download from a future agent-v0.3.0-rc.40 release).
-4. `roomler-tunnel enroll --server https://roomler.ai --token <admin-issued-tunnel-enroll> --name <laptop-label>`.
-5. `roomler-tunnel forward --agent <hex> --local 5432 --remote 10.0.0.5:5432`.
-6. From another shell: `psql -h 127.0.0.1 -p 5432 ...` — verify connect succeeds.
+**Still open — T2.10e (end-to-end smoke against a real agent + roomler.ai):**
+
+All code-side pieces of T2.10 (a/b/c/d) are now in place. T2.10e is the actual real-world validation:
+
+1. **CI / mars** must first build `roomler-ai-api` + `roomler-ai-tests` with the T2.10c relay code, since locally those crates are blocked by openssl-sys MSVC. Push the branch + open a PR; let CI compile + run the existing test suite. Any wire-mismatch bugs will surface here.
+2. **Deploy** the `feature/roomler-tunnel` build to `https://roomler.ai` (or a staging URL with an alternative `roomler-ai` deployment).
+3. **Enroll a real agent** on a Linux box with intranet access: `roomler-agent enroll --server https://roomler.ai --token <admin-issued-agent-enroll> --name <label>`. Run the agent (it starts the signaling loop).
+4. **Enroll the tunnel-client** on the operator laptop: `roomler-tunnel enroll --server https://roomler.ai --token <admin-issued-tunnel-enroll> --name <laptop-label>` (or set `ROOMLER_TUNNEL_SERVER` + `ROOMLER_TUNNEL_TOKEN` env vars).
+5. **Issue a tunnel policy** in the admin UI allowing the operator → agent → `<dst host>:<dst port>` triple.
+6. **Open the forward**: `roomler-tunnel forward --agent <hex> --local 5432 --remote <intranet-host>:5432`.
+7. **Verify**: from another shell, `psql -h 127.0.0.1 -p 5432 -U <user> -d <db>` connects through the tunnel. Subsequent queries return rows.
+
+Diagnostics tooling for failures: the agent + tunnel-client both log at `RUST_LOG=info` by default; `RUST_LOG=tunnel_core=debug,roomler_tunnel=debug` turns on per-flow / per-chunk visibility. The server's `tunnel_audit` collection records every Accept / Reject / Close with `relay`, `dst_host`, `dst_port`, and `client_version` for the admin to investigate.
 
 ## Known gotchas
 
