@@ -18,6 +18,11 @@ import {
   isWebCodecsSupported,
   isVp9_444DecodeSupported,
   isChromeWithBrokenScriptTransform,
+  chunkClipboardText,
+  sendClipboardWriteOverDc,
+  CLIPBOARD_CHUNK_BYTES,
+  CLIPBOARD_MAX_BYTES,
+  CLIPBOARD_SINGLE_ENVELOPE_THRESHOLD_BYTES,
   VP9_444_DC_LABEL,
   VP9_444_DC_OPTIONS,
   shortCodecFromReceiver,
@@ -982,6 +987,163 @@ describe('isChromeWithBrokenScriptTransform (rc.43)', () => {
   it('returns false when navigator is undefined (worker / SSR)', () => {
     setNav(undefined)
     expect(isChromeWithBrokenScriptTransform()).toBe(false)
+  })
+})
+
+describe('chunkClipboardText (rc.44)', () => {
+  it('returns a single-element array for empty input', () => {
+    expect(chunkClipboardText('')).toEqual([''])
+  })
+
+  it('returns the input as a single chunk when it fits the budget', () => {
+    expect(chunkClipboardText('hello')).toEqual(['hello'])
+  })
+
+  it('splits long ASCII at CLIPBOARD_CHUNK_BYTES boundaries', () => {
+    const text = 'a'.repeat(CLIPBOARD_CHUNK_BYTES * 3 + 7)
+    const chunks = chunkClipboardText(text)
+    expect(chunks.length).toBe(4)
+    // Every chunk except possibly the last is exactly CHUNK_BYTES bytes.
+    const enc = new TextEncoder()
+    for (let i = 0; i < chunks.length - 1; i++) {
+      expect(enc.encode(chunks[i]).byteLength).toBeLessThanOrEqual(CLIPBOARD_CHUNK_BYTES)
+    }
+    // Round-trip: simple concatenation reproduces the input.
+    expect(chunks.join('')).toBe(text)
+  })
+
+  it('preserves UTF-8 codepoint boundaries even when a 4-byte char straddles the split', () => {
+    // Fill to (CHUNK_BYTES - 2) ASCII, then insert a 4-byte codepoint
+    // (🦀). Natural split at CHUNK_BYTES would land inside the crab;
+    // chunker must walk back to keep the codepoint whole.
+    const prefix = 'a'.repeat(CLIPBOARD_CHUNK_BYTES - 2)
+    const text = prefix + '🦀b'
+    const chunks = chunkClipboardText(text)
+    expect(chunks.join('')).toBe(text)
+    // Each chunk must be a valid UTF-8 string (no replacement chars).
+    const dec = new TextDecoder('utf-8', { fatal: true })
+    const enc = new TextEncoder()
+    for (const c of chunks) {
+      // Round-tripping through fatal decoder throws on partial sequences.
+      expect(() => dec.decode(enc.encode(c))).not.toThrow()
+      expect(enc.encode(c).byteLength).toBeLessThanOrEqual(CLIPBOARD_CHUNK_BYTES)
+    }
+  })
+
+  it('handles an entirely multi-byte payload (all-emoji stress test)', () => {
+    // 5000 × 🦀 = 20000 bytes UTF-8 > CHUNK_BYTES (14336)
+    const text = '🦀'.repeat(5000)
+    const chunks = chunkClipboardText(text)
+    expect(chunks.length).toBeGreaterThanOrEqual(2)
+    expect(chunks.join('')).toBe(text)
+    const enc = new TextEncoder()
+    for (const c of chunks) {
+      expect(enc.encode(c).byteLength).toBeLessThanOrEqual(CLIPBOARD_CHUNK_BYTES)
+    }
+  })
+})
+
+describe('sendClipboardWriteOverDc (rc.44)', () => {
+  // Stub DC capturing every `.send()` call so we can assert wire shape
+  // without a real RTCDataChannel. The function under test only reads
+  // `readyState` indirectly (not at all in the body) — caller's
+  // responsibility — so we don't need to stub that.
+  function makeStubDc() {
+    const sent: string[] = []
+    return {
+      sent,
+      ch: {
+        send: (s: string) => {
+          sent.push(s)
+        },
+      } as unknown as RTCDataChannel,
+    }
+  }
+
+  it('uses single-envelope clipboard:write for small ASCII text', () => {
+    const { ch, sent } = makeStubDc()
+    const n = sendClipboardWriteOverDc(ch, 'hello world')
+    expect(n).toBe(1)
+    expect(sent.length).toBe(1)
+    const parsed = JSON.parse(sent[0])
+    expect(parsed.t).toBe('clipboard:write')
+    expect(parsed.text).toBe('hello world')
+    expect(parsed.id).toBeUndefined()
+  })
+
+  it('uses single-envelope clipboard:write right at the threshold', () => {
+    const { ch, sent } = makeStubDc()
+    const text = 'a'.repeat(CLIPBOARD_SINGLE_ENVELOPE_THRESHOLD_BYTES)
+    const n = sendClipboardWriteOverDc(ch, text)
+    expect(n).toBe(1)
+    const parsed = JSON.parse(sent[0])
+    expect(parsed.t).toBe('clipboard:write')
+  })
+
+  it('switches to clipboard:write-chunk when above the threshold', () => {
+    const { ch, sent } = makeStubDc()
+    const text = 'a'.repeat(CLIPBOARD_SINGLE_ENVELOPE_THRESHOLD_BYTES + 1)
+    const n = sendClipboardWriteOverDc(ch, text)
+    expect(n).toBeGreaterThanOrEqual(1)
+    expect(sent.length).toBe(n)
+    const first = JSON.parse(sent[0])
+    expect(first.t).toBe('clipboard:write-chunk')
+    expect(typeof first.id).toBe('string')
+    expect(first.seq).toBe(0)
+    expect(first.last).toBe(n === 1)
+  })
+
+  it('chunked envelopes share an id and have sequential seq + final last=true', () => {
+    const { ch, sent } = makeStubDc()
+    // Force 3+ chunks: 3 × CHUNK_BYTES of ASCII.
+    const text = 'a'.repeat(CLIPBOARD_CHUNK_BYTES * 3)
+    sendClipboardWriteOverDc(ch, text)
+    const envelopes = sent.map((s) => JSON.parse(s))
+    const ids = new Set(envelopes.map((e) => e.id))
+    expect(ids.size).toBe(1)
+    envelopes.forEach((e, i) => {
+      expect(e.t).toBe('clipboard:write-chunk')
+      expect(e.seq).toBe(i)
+      expect(e.last).toBe(i + 1 === envelopes.length)
+    })
+    // Concatenation of `text` across chunks must reproduce the input —
+    // this is the load-bearing invariant for the agent's reassembler.
+    expect(envelopes.map((e) => e.text).join('')).toBe(text)
+  })
+
+  it('truncates and warns when input exceeds the 1 MB hard cap', () => {
+    const { ch, sent } = makeStubDc()
+    const text = 'a'.repeat(CLIPBOARD_MAX_BYTES + 50_000)
+    const warnings: string[] = []
+    const originalWarn = console.warn
+    console.warn = (...args: unknown[]) => {
+      warnings.push(args.join(' '))
+    }
+    try {
+      sendClipboardWriteOverDc(ch, text)
+    } finally {
+      console.warn = originalWarn
+    }
+    expect(warnings.some((w) => w.includes('truncated'))).toBe(true)
+    const envelopes = sent.map((s) => JSON.parse(s))
+    const totalBytes = envelopes
+      .map((e) => new TextEncoder().encode(e.text as string).byteLength)
+      .reduce((a, b) => a + b, 0)
+    expect(totalBytes).toBeLessThanOrEqual(CLIPBOARD_MAX_BYTES)
+  })
+
+  it('every chunked envelope JSON string stays under 16 KB (SCTP ceiling proxy)', () => {
+    const { ch, sent } = makeStubDc()
+    // Mix of multi-byte chars to verify envelope overhead + UTF-8
+    // expansion stays within the budget on a realistic input.
+    const text = ('🦀'.repeat(2000) + 'ASCII filler '.repeat(2000) + '中文测试 '.repeat(1000))
+    sendClipboardWriteOverDc(ch, text)
+    const enc = new TextEncoder()
+    for (const s of sent) {
+      // The agent's webrtc-rs SCTP has max_message_size=65536; we
+      // budget aggressively under that for headroom.
+      expect(enc.encode(s).byteLength).toBeLessThan(16 * 1024)
+    }
   })
 })
 

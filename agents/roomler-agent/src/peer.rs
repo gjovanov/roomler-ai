@@ -2653,10 +2653,23 @@ fn attach_clipboard_handler(dc: Arc<RTCDataChannel>, session_id: bson::oid::Obje
             return;
         }
     };
+    // rc.44 — per-session reassembler for `clipboard:write-chunk`
+    // envelopes. Shared across all on_message callbacks via the Arc.
+    // Browser-side chunker is bounded at 14 KB per envelope; this
+    // reassembler enforces the 1 MB total cap per write transaction
+    // (see [`clipboard::MAX_CLIPBOARD_BYTES`]). `std::sync::Mutex` is
+    // fine here: the lock is held for the duration of one synchronous
+    // `feed()` call (push_str + invariant checks) and dropped before
+    // the awaited `cb.write()`, so we never hold the guard across an
+    // .await point.
+    let reassembler = Arc::new(std::sync::Mutex::new(
+        crate::clipboard::WriteReassembler::new(),
+    ));
     let dc_for_handler = dc.clone();
     dc.on_message(Box::new(move |msg| {
         let dc = dc_for_handler.clone();
         let cb = cb.clone();
+        let reassembler = reassembler.clone();
         Box::pin(async move {
             let Ok(text) = std::str::from_utf8(&msg.data) else {
                 debug!(%session_id, bytes = msg.data.len(), "clipboard: non-UTF8 payload ignored");
@@ -2687,17 +2700,90 @@ fn attach_clipboard_handler(dc: Arc<RTCDataChannel>, session_id: bson::oid::Obje
                         }
                     }
                 }
+                crate::clipboard::ClipboardIncoming::WriteChunk {
+                    id,
+                    seq,
+                    text,
+                    last,
+                } => {
+                    let chunk_bytes = text.len();
+                    let outcome = {
+                        let mut g = reassembler.lock().expect("clipboard reassembler poisoned");
+                        g.feed(id.clone(), seq, text, last)
+                    };
+                    match outcome {
+                        crate::clipboard::WriteChunkOutcome::Pending => {
+                            debug!(%session_id, id=%id, seq, bytes=chunk_bytes, "clipboard: chunk accepted, awaiting more");
+                        }
+                        crate::clipboard::WriteChunkOutcome::Complete(full_text) => {
+                            let bytes = full_text.len();
+                            match cb.write(full_text).await {
+                                Ok(()) => info!(%session_id, id=%id, bytes, chunks=seq + 1, "clipboard: wrote chunked payload to host"),
+                                Err(e) => {
+                                    warn!(%session_id, id=%id, %e, "clipboard: chunked write failed");
+                                    let reply = serde_json::json!({
+                                        "t": "clipboard:error",
+                                        "message": format!("{e}"),
+                                    });
+                                    if let Ok(s) = serde_json::to_string(&reply) {
+                                        let _ = dc.send_text(s).await;
+                                    }
+                                }
+                            }
+                        }
+                        crate::clipboard::WriteChunkOutcome::Rejected(reason) => {
+                            warn!(%session_id, id=%id, %reason, "clipboard: chunk rejected");
+                            let reply = serde_json::json!({
+                                "t": "clipboard:error",
+                                "message": reason,
+                            });
+                            if let Ok(s) = serde_json::to_string(&reply) {
+                                let _ = dc.send_text(s).await;
+                            }
+                        }
+                    }
+                }
                 crate::clipboard::ClipboardIncoming::Read { req_id } => match cb.read().await {
                     Ok(text) => {
                         let bytes = text.len();
-                        info!(%session_id, bytes, "clipboard: read from host");
-                        let reply = serde_json::json!({
-                            "t": "clipboard:content",
-                            "text": text,
-                            "req_id": req_id,
-                        });
-                        if let Ok(s) = serde_json::to_string(&reply) {
-                            let _ = dc.send_text(s).await;
+                        if bytes <= crate::clipboard::CHUNK_BYTES {
+                            // Single envelope — back-compat path for
+                            // browsers that don't yet handle
+                            // `clipboard:content-chunk`. Small payloads
+                            // (most common case) fit inside a single
+                            // SCTP message comfortably.
+                            info!(%session_id, bytes, "clipboard: read from host (single envelope)");
+                            let reply = serde_json::json!({
+                                "t": "clipboard:content",
+                                "text": text,
+                                "req_id": req_id,
+                            });
+                            if let Ok(s) = serde_json::to_string(&reply) {
+                                let _ = dc.send_text(s).await;
+                            }
+                        } else {
+                            // Large payload — chunk it so each
+                            // envelope stays under the SCTP ceiling.
+                            // Browser reassembles by `req_id` until
+                            // `last: true`.
+                            let chunks = crate::clipboard::split_into_chunks(&text);
+                            let total = chunks.len();
+                            info!(%session_id, bytes, chunks = total, "clipboard: read from host (chunked)");
+                            for (i, chunk) in chunks.iter().enumerate() {
+                                let reply = serde_json::json!({
+                                    "t": "clipboard:content-chunk",
+                                    "req_id": req_id,
+                                    "seq": i as u32,
+                                    "text": chunk,
+                                    "last": i + 1 == total,
+                                });
+                                if let Ok(s) = serde_json::to_string(&reply) {
+                                    if dc.send_text(s).await.is_err() {
+                                        debug!(%session_id, "clipboard: DC closed mid-chunk-send; abandoning");
+                                        break;
+                                    }
+                                }
+                            }
                         }
                     }
                     Err(e) => {
