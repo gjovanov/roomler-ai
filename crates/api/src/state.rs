@@ -86,6 +86,11 @@ pub struct AppState {
     /// per hour vs N-agents-each-once-per-cycle. See
     /// `routes::agent_release` for the lifecycle.
     pub latest_release_cache: Arc<crate::routes::agent_release::LatestReleaseCache>,
+    /// 1h-TTL in-memory cache backing `/api/tunnel/latest-release` +
+    /// `/api/tunnel/installer/{platform}`. Same lifecycle as the
+    /// agent cache, separate instance so the two namespaces don't
+    /// share their fetched payload (different tag prefixes).
+    pub tunnel_release_cache: Arc<crate::routes::tunnel_release::LatestTunnelReleaseCache>,
 }
 
 impl AppState {
@@ -216,6 +221,7 @@ impl AppState {
             tunnel_audit,
             tunnel_clients_by_session: Arc::new(DashMap::new()),
             latest_release_cache: crate::routes::agent_release::LatestReleaseCache::new(),
+            tunnel_release_cache: crate::routes::tunnel_release::LatestTunnelReleaseCache::new(),
         })
     }
 }
