@@ -182,19 +182,37 @@ The agent now:
 
 End-to-end handshake validated locally with `tunnel::peer::tests::answerer_reaches_pool_ready` — drives a no-signaling-server offerer+answerer setup and asserts the pool opens within 15 s.
 
-**Still open — T2.10e (end-to-end smoke against a real agent + roomler.ai):**
+**T2.10e (operator-friendliness pack) — SHIPPED 2026-05-19:**
 
-All code-side pieces of T2.10 (a/b/c/d) are now in place. T2.10e is the actual real-world validation:
+Production `https://roomler.ai` deployed with the full tunnel stack. CI for the api crate green; image `v202605191154-tunnel-260ad0e` rolled out to k8s; rollout verified.
 
-1. **CI / mars** must first build `roomler-ai-api` + `roomler-ai-tests` with the T2.10c relay code, since locally those crates are blocked by openssl-sys MSVC. Push the branch + open a PR; let CI compile + run the existing test suite. Any wire-mismatch bugs will surface here.
-2. **Deploy** the `feature/roomler-tunnel` build to `https://roomler.ai` (or a staging URL with an alternative `roomler-ai` deployment).
-3. **Enroll a real agent** on a Linux box with intranet access: `roomler-agent enroll --server https://roomler.ai --token <admin-issued-agent-enroll> --name <label>`. Run the agent (it starts the signaling loop).
-4. **Enroll the tunnel-client** on the operator laptop: `roomler-tunnel enroll --server https://roomler.ai --token <admin-issued-tunnel-enroll> --name <laptop-label>` (or set `ROOMLER_TUNNEL_SERVER` + `ROOMLER_TUNNEL_TOKEN` env vars).
-5. **Issue a tunnel policy** in the admin UI allowing the operator → agent → `<dst host>:<dst port>` triple.
-6. **Open the forward**: `roomler-tunnel forward --agent <hex> --local 5432 --remote <intranet-host>:5432`.
-7. **Verify**: from another shell, `psql -h 127.0.0.1 -p 5432 -U <user> -d <db>` connects through the tunnel. Subsequent queries return rows.
+Production-shipped capabilities:
+- **Admin UI**:
+  - `Admin → Tenant → Tunnels` — tunnel-client enrollment + status (`TunnelClientsSection.vue`)
+  - `Admin → Tenant → Tunnel ACL` — policy CRUD with full form: subjects (UserId/RoleId/TunnelClientId/AllUsers), targets (AgentId/AllAgents), allowlist (Exact/Wildcard/CIDR + port range), optional per-session ceilings (`TunnelPoliciesSection.vue`)
+- **API**:
+  - `POST/GET/PUT/DELETE /api/tenant/{tid}/tunnel-policy` — policy CRUD
+  - `GET /api/tunnel/latest-release` — proxied GitHub Releases list
+  - `GET /api/tunnel/installer/{platform}/health` — manifest with `tag`, `filename`, `size`, `digest`, `uri`
+  - `GET /api/tunnel/installer/{platform}` — streams the archive bytes
+  - Platforms: `linux-x86_64`, `linux-deb`, `macos`, `windows-x86_64`
+- **CI**: `release-tunnel.yml` triggers on `tunnel-v*` tag push; builds Linux tar.gz + .deb, macOS universal tar.gz, Windows .zip; publishes GitHub Release.
+- **Binaries**: `tunnel-v0.3.0-rc.46` published with 4 platform artifacts + SHA-256 sidecars (Win zip 6.5 MB, Linux tar.gz 6.8 MB, Linux .deb 4.4 MB, macOS universal tar.gz 12.6 MB).
+- **Install guide**: `docs/tunnel-install.md` — 9-section corp-env walk-through (prereqs, agent install, agent enroll, tunnel install, tunnel enroll, policy create, forward + test, audit + diagnostics, same-Win11-box smoke, revoke).
 
-Diagnostics tooling for failures: the agent + tunnel-client both log at `RUST_LOG=info` by default; `RUST_LOG=tunnel_core=debug,roomler_tunnel=debug` turns on per-flow / per-chunk visibility. The server's `tunnel_audit` collection records every Accept / Reject / Close with `relay`, `dst_host`, `dst_port`, and `client_version` for the admin to investigate.
+**The operator path is now fully UI-driven** — no mongosh, no cargo build, no manual GitHub download:
+
+```powershell
+# Operator laptop, Win11:
+Invoke-WebRequest "https://roomler.ai/api/tunnel/installer/windows-x86_64?version=latest" -OutFile roomler-tunnel.zip
+Expand-Archive roomler-tunnel.zip -DestinationPath "$env:LOCALAPPDATA\roomler-tunnel"
+roomler-tunnel enroll --server https://roomler.ai --token <jwt from Admin → Tunnels> --name "My laptop"
+# Admin → Tunnel ACL → New policy (UI form)
+roomler-tunnel forward --agent <hex> --local 5432 --remote db.intranet:5432
+# In another shell: psql -h 127.0.0.1 -p 5432 -U user -d db
+```
+
+Diagnostics: the agent + tunnel-client both log at `RUST_LOG=info` by default; `RUST_LOG=tunnel_core=debug,roomler_tunnel=debug` turns on per-flow / per-chunk visibility. The server's `tunnel_audit` collection records every Accept / Reject / Close with `relay`, `dst_host`, `dst_port`, and `client_version` for the admin to investigate. Admin UI for audit-log inspection is a future enhancement; for now `kubectl exec mongodb-0 -- mongosh … --eval "db.tunnel_audit.find().sort({at:-1}).limit(20)"`.
 
 ## Known gotchas
 
