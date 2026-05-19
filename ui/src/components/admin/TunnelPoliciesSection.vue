@@ -175,7 +175,7 @@
             />
             <v-text-field
               v-if="s.kind !== 'all_users'"
-              v-model="(s as { id: string }).id"
+              v-model="s.id"
               :label="subjectIdLabel(s.kind)"
               placeholder="24-hex ObjectId"
               variant="outlined"
@@ -227,7 +227,7 @@
             />
             <v-text-field
               v-if="t.kind === 'agent_id'"
-              v-model="(t as { id: string }).id"
+              v-model="t.id"
               label="Agent ID"
               placeholder="24-hex ObjectId"
               variant="outlined"
