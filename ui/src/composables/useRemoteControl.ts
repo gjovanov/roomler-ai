@@ -548,6 +548,103 @@ export async function isVp9_444DecodeSupported(): Promise<boolean> {
   }
 }
 
+/** rc.44 — clipboard chunking constants. The single-envelope
+ *  `clipboard:write` shape sent a `text` field unbounded by length;
+ *  on payloads >~50 KB this hit webrtc-rs's SCTP `max_message_size=
+ *  65536` default and threw `failed to handle_inbound: ErrChunk`,
+ *  killing the data channel + session (field repro 2026-05-19,
+ *  sessions dying every 1-2 min). The chunked variants cap each
+ *  envelope at [`CLIPBOARD_CHUNK_BYTES`] to stay comfortably under
+ *  the SCTP ceiling. Total payload capped at [`CLIPBOARD_MAX_BYTES`]
+ *  (1 MB) on both sides; the agent rejects oversized writes via
+ *  `clipboard:error`. */
+export const CLIPBOARD_CHUNK_BYTES = 14 * 1024
+export const CLIPBOARD_MAX_BYTES = 1024 * 1024
+/** Below this UTF-8 byte length the single-envelope `clipboard:write`
+ *  shape is used for back-compat with rc.43-and-older agents that
+ *  don't know the chunked variant. Above this, the browser switches
+ *  to `clipboard:write-chunk`. */
+export const CLIPBOARD_SINGLE_ENVELOPE_THRESHOLD_BYTES = 12 * 1024
+
+/** UTF-8-byte-aware chunker for clipboard payloads. Splits `text`
+ *  into substrings each of at most [`CLIPBOARD_CHUNK_BYTES`] when
+ *  encoded as UTF-8, while preserving codepoint boundaries so a
+ *  consumer that simply concatenates the chunks reproduces the
+ *  original text. Mirrors the agent's `clipboard::split_into_chunks`
+ *  in Rust. Exported for tests; the locked invariant is
+ *  `chunks.join('') === text` regardless of input content. */
+export function chunkClipboardText(text: string): string[] {
+  const enc = new TextEncoder()
+  const dec = new TextDecoder('utf-8', { fatal: true })
+  const bytes = enc.encode(text)
+  if (bytes.length === 0) return ['']
+  if (bytes.length <= CLIPBOARD_CHUNK_BYTES) return [text]
+  const out: string[] = []
+  let cursor = 0
+  while (cursor < bytes.length) {
+    let end = Math.min(cursor + CLIPBOARD_CHUNK_BYTES, bytes.length)
+    // UTF-8 continuation bytes match 10xxxxxx (0x80..0xBF). Walk
+    // back past any partial multi-byte sequence so each slice is a
+    // valid standalone UTF-8 string.
+    while (end > cursor && end < bytes.length && (bytes[end] & 0xc0) === 0x80) {
+      end -= 1
+    }
+    out.push(dec.decode(bytes.subarray(cursor, end)))
+    cursor = end
+  }
+  return out
+}
+
+/** Send a clipboard write over the supplied DC. Below
+ *  [`CLIPBOARD_SINGLE_ENVELOPE_THRESHOLD_BYTES`] uses the legacy
+ *  single-envelope `clipboard:write` for back-compat with older
+ *  agents; above, splits into `clipboard:write-chunk` envelopes
+ *  carrying a shared transaction id. Caller owns try/catch — this
+ *  function may throw if the DC closes mid-burst. Returns the
+ *  number of envelopes actually sent (1 for single, ≥1 for chunked). */
+export function sendClipboardWriteOverDc(ch: RTCDataChannel, text: string): number {
+  const enc = new TextEncoder()
+  const byteLen = enc.encode(text).length
+  if (byteLen <= CLIPBOARD_SINGLE_ENVELOPE_THRESHOLD_BYTES) {
+    ch.send(JSON.stringify({ t: 'clipboard:write', text }))
+    return 1
+  }
+  // Truncate at the 1 MB cap; warn so the user knows. The agent
+  // rejects oversized writes anyway via `clipboard:error`, but
+  // truncating browser-side avoids the network round-trip + saves
+  // sending 1 MB+ over the DC just to be told no.
+  let payload = text
+  if (byteLen > CLIPBOARD_MAX_BYTES) {
+    // Walk back from CLIPBOARD_MAX_BYTES to a codepoint boundary.
+    const bytes = enc.encode(text)
+    let end = CLIPBOARD_MAX_BYTES
+    while (end > 0 && (bytes[end] & 0xc0) === 0x80) end -= 1
+    payload = new TextDecoder('utf-8').decode(bytes.subarray(0, end))
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[rc] clipboard:write truncated from ${byteLen}B to ${end}B — agent rejects payloads above ${CLIPBOARD_MAX_BYTES}B`,
+    )
+  }
+  const chunks = chunkClipboardText(payload)
+  const id =
+    'cb-' +
+    Date.now().toString(36) +
+    '-' +
+    Math.random().toString(36).slice(2, 10)
+  chunks.forEach((chunk, i) => {
+    ch.send(
+      JSON.stringify({
+        t: 'clipboard:write-chunk',
+        id,
+        seq: i,
+        text: chunk,
+        last: i + 1 === chunks.length,
+      }),
+    )
+  })
+  return chunks.length
+}
+
 /** Chrome 148+ regressed `RTCRtpScriptTransform`: the transform attaches,
  *  `configure()` reports success, but encoded frames are never delivered
  *  to the transformer's readable AND the default `<video>` path stays
@@ -2311,13 +2408,22 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     }
 
     // Subscribe to the clipboard DC. Agent -> browser messages are
-    // `clipboard:content` (reply to a read) and `clipboard:error`
-    // (read or write failure). Pending-read promises are keyed by the
-    // req_id we stamp on outbound `clipboard:read` messages so
-    // interleaved reads resolve independently.
+    // `clipboard:content` (single-envelope reply to a read),
+    // `clipboard:content-chunk` (rc.44+ chunked reply, multiple
+    // envelopes carrying the same `req_id` until `last: true`), and
+    // `clipboard:error` (read or write failure). Pending-read promises
+    // are keyed by the req_id we stamp on outbound `clipboard:read`
+    // messages so interleaved reads resolve independently.
+    const pendingClipboardReadChunks = new Map<number, string>()
     channels.clipboard.onmessage = (ev) => {
       if (typeof ev.data !== 'string') return
-      let msg: { t?: string; req_id?: number | null; text?: string; message?: string }
+      let msg: {
+        t?: string
+        req_id?: number | null
+        text?: string
+        message?: string
+        last?: boolean
+      }
       try {
         msg = JSON.parse(ev.data)
       } catch {
@@ -2330,7 +2436,38 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         if (!pending) return
         clearTimeout(pending.timer)
         pendingClipboardReads.delete(reqId)
+        pendingClipboardReadChunks.delete(reqId)
         pending.resolve(typeof msg.text === 'string' ? msg.text : '')
+      } else if (msg.t === 'clipboard:content-chunk') {
+        // rc.44 — chunked read reply. The agent splits long clipboard
+        // text into multiple envelopes, each carrying the same
+        // `req_id`. Accumulate by req_id; resolve on `last: true`.
+        const reqId = typeof msg.req_id === 'number' ? msg.req_id : null
+        if (reqId == null) return
+        const pending = pendingClipboardReads.get(reqId)
+        if (!pending) return
+        const chunk = typeof msg.text === 'string' ? msg.text : ''
+        const acc = (pendingClipboardReadChunks.get(reqId) ?? '') + chunk
+        // Defensive cap: don't let a buggy / malicious agent OOM us
+        // by streaming endless chunks. The .length here is UTF-16
+        // code-unit count, which is ≤ the UTF-8 byte length for any
+        // input — so capping at CLIPBOARD_MAX_BYTES is conservative.
+        if (acc.length > CLIPBOARD_MAX_BYTES) {
+          clearTimeout(pending.timer)
+          pendingClipboardReads.delete(reqId)
+          pendingClipboardReadChunks.delete(reqId)
+          pending.reject(
+            new Error(`clipboard:content-chunk stream exceeded ${CLIPBOARD_MAX_BYTES}B cap`),
+          )
+          return
+        }
+        pendingClipboardReadChunks.set(reqId, acc)
+        if (msg.last === true) {
+          clearTimeout(pending.timer)
+          pendingClipboardReads.delete(reqId)
+          pendingClipboardReadChunks.delete(reqId)
+          pending.resolve(acc)
+        }
       } else if (msg.t === 'clipboard:error') {
         const reqId = typeof msg.req_id === 'number' ? msg.req_id : null
         if (reqId == null) return
@@ -2338,6 +2475,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         if (!pending) return
         clearTimeout(pending.timer)
         pendingClipboardReads.delete(reqId)
+        pendingClipboardReadChunks.delete(reqId)
         pending.reject(new Error(msg.message || 'agent clipboard error'))
       }
     }
@@ -2923,7 +3061,12 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         const ch = channels.clipboard
         if (ch && ch.readyState === 'open') {
           try {
-            ch.send(JSON.stringify({ t: 'clipboard:write', text }))
+            // rc.44 — `sendClipboardWriteOverDc` picks the legacy
+            // single-envelope shape for ≤12 KB texts (back-compat
+            // with older agents) or splits into `clipboard:write-chunk`
+            // envelopes for larger texts to stay under the SCTP
+            // `max_message_size` ceiling.
+            sendClipboardWriteOverDc(ch, text)
           } catch {
             /* dropped — host clipboard stays unchanged but we still
                forward the keystroke; remote app pastes whatever was
@@ -2999,7 +3142,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       return false
     }
     try {
-      ch.send(JSON.stringify({ t: 'clipboard:write', text }))
+      // rc.44 — chunks large payloads to avoid SCTP `ErrChunk`.
+      sendClipboardWriteOverDc(ch, text)
       return true
     } catch {
       return false
