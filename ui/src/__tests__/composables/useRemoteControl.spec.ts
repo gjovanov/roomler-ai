@@ -17,6 +17,7 @@ import {
   resolutionWireMessage,
   isWebCodecsSupported,
   isVp9_444DecodeSupported,
+  isChromeWithBrokenScriptTransform,
   VP9_444_DC_LABEL,
   VP9_444_DC_OPTIONS,
   shortCodecFromReceiver,
@@ -922,6 +923,65 @@ describe('isVp9_444DecodeSupported', () => {
       isConfigSupported: async () => { throw new Error('boom') },
     }
     await expect(isVp9_444DecodeSupported()).resolves.toBe(false)
+  })
+})
+
+describe('isChromeWithBrokenScriptTransform (rc.43)', () => {
+  const originalNav = globalThis.navigator
+  function setNav(stub: unknown) {
+    Object.defineProperty(globalThis, 'navigator', {
+      value: stub,
+      configurable: true,
+      writable: true,
+    })
+  }
+  afterAll(() => {
+    Object.defineProperty(globalThis, 'navigator', {
+      value: originalNav,
+      configurable: true,
+      writable: true,
+    })
+  })
+
+  it('returns false when userAgentData brand is Chrome 147', () => {
+    setNav({
+      userAgentData: { brands: [{ brand: 'Google Chrome', version: '147' }] },
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0) Chrome/147.0.0.0',
+    })
+    expect(isChromeWithBrokenScriptTransform()).toBe(false)
+  })
+
+  it('returns true when userAgentData brand is Chromium 148 (field repro)', () => {
+    setNav({
+      userAgentData: {
+        brands: [
+          { brand: 'Chromium', version: '148' },
+          { brand: 'Google Chrome', version: '148' },
+          { brand: 'Not/A)Brand', version: '99' },
+        ],
+      },
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0) Chrome/148.0.0.0',
+    })
+    expect(isChromeWithBrokenScriptTransform()).toBe(true)
+  })
+
+  it('returns true when userAgentData missing but userAgent reports Chrome 149', () => {
+    setNav({
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0) Chrome/149.0.7000.0',
+    })
+    expect(isChromeWithBrokenScriptTransform()).toBe(true)
+  })
+
+  it('returns false when neither brands nor Chrome UA token are present (Firefox/Safari)', () => {
+    setNav({
+      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X) Firefox/130.0',
+    })
+    expect(isChromeWithBrokenScriptTransform()).toBe(false)
+  })
+
+  it('returns false when navigator is undefined (worker / SSR)', () => {
+    setNav(undefined)
+    expect(isChromeWithBrokenScriptTransform()).toBe(false)
   })
 })
 
