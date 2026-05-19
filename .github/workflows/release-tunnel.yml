@@ -1,0 +1,289 @@
+name: Release roomler-tunnel
+
+# Builds the `roomler-tunnel` CLI binary for the three desktop targets the
+# operator might run on — Linux x86_64, macOS (universal — x86_64 + aarch64),
+# and Windows x86_64. Outputs a plain archive (tar.gz / zip) per target, plus
+# a `.deb` for Debian / Ubuntu installs. MSI / .pkg signing land in a follow-
+# up — for v1 we ship usable artifacts every operator can run.
+#
+# Triggered by:
+#  - `git push` of a tag matching `tunnel-v*` → publishes a GitHub Release
+#  - `workflow_dispatch` with `version` + optional `publish_release` →
+#    artifacts only (30-day retention) unless `publish_release=true`.
+#
+# roomler-tunnel has NO native deps beyond what `webrtc-rs` brings (rustls,
+# pure Rust). No libvpx, no scrap, no enigo. Builds compile cleanly on every
+# target's default GitHub runner.
+
+on:
+  push:
+    tags:
+      - 'tunnel-v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Tunnel version (e.g. 0.3.0-rc.46) — must match workspace Cargo.toml'
+        required: true
+      publish_release:
+        description: 'Create a GitHub Release with the artifacts'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 0. Validate version matches Cargo.toml
+  # ---------------------------------------------------------------------------
+  validate-version:
+    name: Validate version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      is_release: ${{ steps.resolve.outputs.is_release }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve version + tag
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            tag="${GITHUB_REF_NAME}"
+            version="${tag#tunnel-v}"
+            is_release=true
+          else
+            version="${{ github.event.inputs.version }}"
+            tag="tunnel-v${version}"
+            if [[ "${{ github.event.inputs.publish_release }}" == "true" ]]; then
+              is_release=true
+            else
+              is_release=false
+            fi
+          fi
+          echo "Resolved: version=${version} tag=${tag} is_release=${is_release}"
+          cargo_version=$(awk '
+            /^\[workspace\.package\]/ {in_section=1; next}
+            /^\[/ {in_section=0}
+            in_section && /^version[[:space:]]*=/ {
+              gsub(/"/, "", $3)
+              print $3
+              exit
+            }
+          ' Cargo.toml)
+          echo "Cargo.toml workspace version: ${cargo_version}"
+          if [[ "${cargo_version}" != "${version}" ]]; then
+            echo "::error::Version mismatch: requested ${version} but Cargo.toml has ${cargo_version}"
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}"         >> "$GITHUB_OUTPUT"
+          echo "is_release=${is_release}" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # 1. Linux x86_64 — tarball + .deb (Debian / Ubuntu)
+  # ---------------------------------------------------------------------------
+  build-linux:
+    name: Build (Linux x86_64)
+    needs: validate-version
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+      - name: Cache cargo
+        continue-on-error: true
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+          shared-key: tunnel-linux
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+      - name: Build roomler-tunnel (release)
+        run: cargo build -p roomler-tunnel --release
+      - name: Strip binary
+        run: strip target/release/roomler-tunnel
+      - name: Pack tarball
+        id: tar
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.validate-version.outputs.version }}"
+          name="roomler-tunnel-${version}-x86_64-unknown-linux-gnu"
+          mkdir -p "/tmp/${name}"
+          cp target/release/roomler-tunnel "/tmp/${name}/"
+          cp LICENSE README.md "/tmp/${name}/" 2>/dev/null || true
+          (cd /tmp && tar czf "${name}.tar.gz" "${name}")
+          sha256sum "/tmp/${name}.tar.gz" | awk '{print $1"  "$2}' > "/tmp/${name}.tar.gz.sha256"
+          mv "/tmp/${name}.tar.gz" "/tmp/${name}.tar.gz.sha256" .
+          echo "artifact=${name}.tar.gz" >> "$GITHUB_OUTPUT"
+      - name: Build .deb
+        working-directory: agents/roomler-tunnel
+        run: cargo deb --no-build --no-strip
+      - name: Rename .deb + checksum
+        id: deb
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.validate-version.outputs.version }}"
+          src=$(ls target/debian/roomler-tunnel_*_amd64.deb | head -n1)
+          dst="roomler-tunnel-${version}-x86_64-unknown-linux-gnu.deb"
+          mv "$src" "$dst"
+          sha256sum "$dst" | awk '{print $1"  "$2}' > "${dst}.sha256"
+          echo "artifact=${dst}" >> "$GITHUB_OUTPUT"
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: |
+            ${{ steps.tar.outputs.artifact }}
+            ${{ steps.tar.outputs.artifact }}.sha256
+            ${{ steps.deb.outputs.artifact }}
+            ${{ steps.deb.outputs.artifact }}.sha256
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # 2. macOS — universal binary (x86_64 + aarch64 lipo'd) + tarball
+  # ---------------------------------------------------------------------------
+  build-macos:
+    name: Build (macOS universal)
+    needs: validate-version
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+      - name: Cache cargo
+        continue-on-error: true
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+          shared-key: tunnel-macos
+      - name: Build roomler-tunnel x86_64
+        run: cargo build -p roomler-tunnel --release --target x86_64-apple-darwin
+      - name: Build roomler-tunnel aarch64
+        run: cargo build -p roomler-tunnel --release --target aarch64-apple-darwin
+      - name: Lipo into universal
+        run: |
+          mkdir -p target/release-universal
+          lipo -create -output target/release-universal/roomler-tunnel \
+            target/x86_64-apple-darwin/release/roomler-tunnel \
+            target/aarch64-apple-darwin/release/roomler-tunnel
+          strip target/release-universal/roomler-tunnel
+          file target/release-universal/roomler-tunnel
+      - name: Pack tarball
+        id: tar
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.validate-version.outputs.version }}"
+          name="roomler-tunnel-${version}-universal-apple-darwin"
+          mkdir -p "/tmp/${name}"
+          cp target/release-universal/roomler-tunnel "/tmp/${name}/"
+          cp LICENSE README.md "/tmp/${name}/" 2>/dev/null || true
+          (cd /tmp && tar czf "${name}.tar.gz" "${name}")
+          shasum -a 256 "/tmp/${name}.tar.gz" | awk '{print $1"  "$2}' > "/tmp/${name}.tar.gz.sha256"
+          mv "/tmp/${name}.tar.gz" "/tmp/${name}.tar.gz.sha256" .
+          echo "artifact=${name}.tar.gz" >> "$GITHUB_OUTPUT"
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-universal
+          path: |
+            ${{ steps.tar.outputs.artifact }}
+            ${{ steps.tar.outputs.artifact }}.sha256
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # 3. Windows x86_64 — zip with .exe
+  # ---------------------------------------------------------------------------
+  build-windows:
+    name: Build (Windows x86_64)
+    needs: validate-version
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+      - name: Cache cargo
+        continue-on-error: true
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+          shared-key: tunnel-windows
+      - name: Build roomler-tunnel (release)
+        shell: pwsh
+        run: cargo build -p roomler-tunnel --release
+      - name: Pack zip
+        id: zip
+        shell: pwsh
+        run: |
+          $version = "${{ needs.validate-version.outputs.version }}"
+          $name = "roomler-tunnel-$version-x86_64-pc-windows-msvc"
+          New-Item -ItemType Directory -Path "$env:RUNNER_TEMP\$name" -Force | Out-Null
+          Copy-Item target\release\roomler-tunnel.exe "$env:RUNNER_TEMP\$name\"
+          if (Test-Path LICENSE) { Copy-Item LICENSE "$env:RUNNER_TEMP\$name\" }
+          if (Test-Path README.md) { Copy-Item README.md "$env:RUNNER_TEMP\$name\" }
+          Compress-Archive -Path "$env:RUNNER_TEMP\$name\*" -DestinationPath "$name.zip"
+          $hash = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name.zip" | Out-File "$name.zip.sha256" -Encoding ascii
+          "artifact=$name.zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: |
+            ${{ steps.zip.outputs.artifact }}
+            ${{ steps.zip.outputs.artifact }}.sha256
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # 4. Publish GitHub Release
+  # ---------------------------------------------------------------------------
+  publish-release:
+    name: Publish GitHub Release
+    needs: [validate-version, build-linux, build-macos, build-windows]
+    if: needs.validate-version.outputs.is_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Flatten + list
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.deb' -o -name '*.sha256' \) -exec cp {} release/ \;
+          ls -la release/
+      - name: Create / update Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.validate-version.outputs.tag }}
+          name: roomler-tunnel ${{ needs.validate-version.outputs.version }}
+          draft: false
+          prerelease: ${{ contains(needs.validate-version.outputs.version, 'rc.') || contains(needs.validate-version.outputs.version, 'alpha') || contains(needs.validate-version.outputs.version, 'beta') }}
+          body: |
+            Automated build of `roomler-tunnel` ${{ needs.validate-version.outputs.version }} via
+            [release-tunnel.yml](.github/workflows/release-tunnel.yml).
+
+            **Install / download:**
+            - Linux x86_64: `.tar.gz` or `.deb`
+            - macOS universal (x86_64 + aarch64): `.tar.gz`
+            - Windows x86_64: `.zip` containing `roomler-tunnel.exe`
+
+            **First-use:**
+            1. Extract the archive.
+            2. From the Roomler admin UI → Tenant → Tunnels, click "Issue enrollment token".
+            3. Run the copied `roomler-tunnel enroll …` command.
+            4. From Admin → Tunnel ACL, create at least one policy authorising your subject + agent + destination.
+            5. Run `roomler-tunnel forward --agent <hex> --local <port> --remote <host:port>`.
+          files: release/*

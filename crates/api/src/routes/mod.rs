@@ -21,6 +21,7 @@ pub mod room;
 pub mod stripe;
 pub mod tenant;
 pub mod tunnel;
+pub mod tunnel_release;
 
 pub mod search;
 pub mod user;
