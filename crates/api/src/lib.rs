@@ -293,8 +293,37 @@ pub fn build_router(state: AppState) -> Router {
             "/enroll-token",
             post(routes::tunnel::issue_tunnel_enrollment_token),
         );
+    let tunnel_policy_routes = Router::new()
+        .route(
+            "/",
+            get(routes::tunnel::list_tunnel_policies).post(routes::tunnel::create_tunnel_policy),
+        )
+        .route(
+            "/{policy_id}",
+            get(routes::tunnel::get_tunnel_policy)
+                .put(routes::tunnel::update_tunnel_policy)
+                .delete(routes::tunnel::delete_tunnel_policy),
+        );
     let public_tunnel_routes =
         Router::new().route("/enroll", post(routes::tunnel::enroll_tunnel_client));
+
+    // `/api/tunnel/{latest-release,installer/{platform}}` — public
+    // GitHub-Releases proxy for the roomler-tunnel binary. Same
+    // shape + lifecycle as `/api/agent/{latest-release,installer/...}`
+    // but a separate namespace so the two artifact sets don't collide.
+    let public_tunnel_release_routes = Router::new()
+        .route(
+            "/latest-release",
+            get(routes::tunnel_release::latest_release),
+        )
+        .route(
+            "/installer/{platform}/health",
+            get(routes::tunnel_release::installer_health),
+        )
+        .route(
+            "/installer/{platform}",
+            get(routes::tunnel_release::installer_proxy),
+        );
 
     // TURN credentials (user-scoped, no tenant prefix)
     let turn_routes = Router::new().route(
@@ -314,6 +343,7 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/notification", notification_routes)
         .nest("/agent", public_agent_routes)
         .nest("/tunnel-client", public_tunnel_routes)
+        .nest("/tunnel", public_tunnel_release_routes)
         .nest("/turn", turn_routes)
         .nest("/tenant", tenant_routes)
         .nest("/tenant/{tenant_id}/member", member_routes)
@@ -332,6 +362,7 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/tenant/{tenant_id}/export", export_routes)
         .nest("/tenant/{tenant_id}/agent", agent_routes)
         .nest("/tenant/{tenant_id}/tunnel-client", tunnel_client_routes)
+        .nest("/tenant/{tenant_id}/tunnel-policy", tunnel_policy_routes)
         .nest("/tenant/{tenant_id}/session", remote_session_routes);
 
     // Health check
