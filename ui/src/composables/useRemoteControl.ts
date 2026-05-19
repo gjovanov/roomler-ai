@@ -548,6 +548,43 @@ export async function isVp9_444DecodeSupported(): Promise<boolean> {
   }
 }
 
+/** Chrome 148+ regressed `RTCRtpScriptTransform`: the transform attaches,
+ *  `configure()` reports success, but encoded frames are never delivered
+ *  to the transformer's readable AND the default `<video>` path stays
+ *  starved too (Chrome holds frames on neither pipe). Field repro on
+ *  Chrome 148 (Chromium 148): worker's 3 s watchdog fires + auto-fallback
+ *  to `<video>` doesn't render either, viewer stays blank 1-2 min.
+ *
+ *  We pre-empt the broken activation: when this returns `true`,
+ *  `installWebCodecsTransform()` returns false immediately and the
+ *  default `<video>` element renders normally.
+ *
+ *  Exported for tests. Tracked upstream — once a Chromium fix lands
+ *  and ships, bump the upper bound or remove the gate entirely. */
+export function isChromeWithBrokenScriptTransform(): boolean {
+  const nav = globalThis.navigator as
+    | (Navigator & { userAgentData?: { brands?: { brand: string; version: string }[] } })
+    | undefined
+  if (!nav) return false
+  const brands = nav.userAgentData?.brands
+  if (brands && brands.length) {
+    for (const b of brands) {
+      if (b.brand === 'Chromium' || b.brand === 'Google Chrome') {
+        const v = parseInt(b.version, 10)
+        if (Number.isFinite(v) && v >= 148) return true
+      }
+    }
+    return false
+  }
+  const ua = nav.userAgent ?? ''
+  const m = /Chrome\/(\d+)/.exec(ua)
+  if (m) {
+    const v = parseInt(m[1], 10)
+    if (Number.isFinite(v) && v >= 148) return true
+  }
+  return false
+}
+
 /** Wire-format constants for the `video-bytes` DataChannel. The label
  *  must match the agent's `on_data_channel` arm at peer.rs:494. The
  *  channel is reliable + ordered because (a) SCTP is doing the
@@ -1288,6 +1325,19 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       )
       return false
     }
+    // rc.43 — Chrome 148+ regression: RTCRtpScriptTransform attaches +
+    // configure() reports success but encoded frames are never delivered
+    // to the transformer's readable; the worker's 3 s watchdog catches it
+    // and tears down, but Chrome also holds frames off the default path
+    // so the <video> fallback renders blank for 1-2 min. Pre-empt the
+    // broken activation so the <video> path stays unobstructed from the
+    // start.
+    if (isChromeWithBrokenScriptTransform()) {
+      console.warn(
+        '[rc] webcodecs path skipped — Chrome 148+ regressed RTCRtpScriptTransform frame delivery. Falling back to <video>. See useRemoteControl.ts::isChromeWithBrokenScriptTransform for details.',
+      )
+      return false
+    }
     let worker: Worker
     try {
       worker = new Worker(
@@ -1330,7 +1380,13 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         || msg.type === 'reader-error'
         || msg.type === 'pipe-error'
       ) {
-        console.warn('[rc] webcodecs worker error', msg)
+        // rc.43 — pre-rc.43 we only logged. Decoder errors after a
+        // successful configure() (Chrome 148 VP9 profile-1 path,
+        // mid-session codec change) would leave the canvas blank with
+        // no recovery. Tear down so the view re-mounts <video> and the
+        // standard RTP path takes over.
+        console.warn('[rc] webcodecs worker error — auto-fallback to <video>', msg)
+        stopWebCodecsPath()
       }
     }
     console.info('[rc] webcodecs path activating; codec:', codec, '(sdp:', sdpCodec, ' receiver:', receiverCodec, ')')
@@ -1457,7 +1513,17 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       } else if (msg.type === 'decoder-error'
         || msg.type === 'decoder-configure-error'
         || msg.type === 'decode-error') {
-        console.warn('[rc] vp9-444 worker', msg.type, msg.error)
+        // rc.43 — Chrome 148 field repro: VideoDecoder.configure() with
+        // vp09.01.10.08 (profile 1, 4:4:4 8-bit) reports success but the
+        // first real frame errors out with "Unsupported configuration"
+        // and the decoder closes; every subsequent frame logs
+        // "Cannot call 'decode' on a closed codec" indefinitely. Pre-
+        // rc.43 just logged the warn — the canvas stayed blank until the
+        // user disconnected. Tear down so the view re-mounts <video> and
+        // the standard RTP H.264 track (which the agent sends in parallel
+        // to the DC path) renders normally.
+        console.warn('[rc] vp9-444 worker', msg.type, msg.error, '— auto-fallback to <video>')
+        stopVp9_444Path()
       } else if (msg.type === 'frame-rejected') {
         console.warn('[rc] vp9-444 frame rejected', msg)
       } else if (msg.type === 'frame-decoded') {
