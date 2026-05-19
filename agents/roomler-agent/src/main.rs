@@ -17,6 +17,8 @@ use clap::{Parser, Subcommand};
 use roomler_agent::dpi;
 #[cfg(target_os = "windows")]
 use roomler_agent::win_service;
+#[cfg(target_os = "windows")]
+use roomler_agent::win32_monitors;
 use roomler_agent::{
     config, crash_uploader, encode, enrollment, instance_lock, logging, machine, notify,
     post_install, preflight, service, signaling, updater, watchdog,
@@ -361,6 +363,14 @@ async fn main() -> Result<()> {
             actual = dpi_outcome.actual.as_str(),
             "DPI awareness configured at process start (rc.41 diagnostic — surfaces residual PC50045 mouse-misposition cause)"
         );
+        // rc.48 — monitor-layout diagnostic. DPI is correctly set per
+        // the rc.41/44 readback, yet PC50045 field reports still show
+        // mouse-offset (per the rc.43-ui commit 79d6dee). Hypothesis:
+        // the virtual-screen origin is non-zero (multi-monitor layout
+        // where primary was repositioned) and our `to_pixels` doesn't
+        // apply the origin offset. This logs the actual layout so we
+        // can confirm or reject before writing a fix.
+        win32_monitors::log_monitor_diagnostic();
     }
 
     let cli = Cli::parse();

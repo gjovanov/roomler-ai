@@ -38,4 +38,6 @@ pub mod tunnel;
 pub mod updater;
 pub mod watchdog;
 #[cfg(target_os = "windows")]
+pub mod win32_monitors;
+#[cfg(target_os = "windows")]
 pub mod win_service;
