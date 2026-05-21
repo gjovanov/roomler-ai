@@ -772,6 +772,26 @@ pub fn msiexec_argv(installer: &std::path::Path, flavour: WindowsInstallFlavour)
     ]
 }
 
+/// rc.44: variant of [`msiexec_argv`] that appends operator-supplied
+/// MSI public properties (`KEY=VALUE`) after the base argv. Used by
+/// the install wizard to flip `ENABLE_SYSTEM_CONTEXT=1` when the
+/// operator picks the `permachine-system-context` flavour.
+///
+/// Properties are appended verbatim — no shell-quoting, no escaping.
+/// Callers must ensure `VALUE` contains no whitespace; msiexec's
+/// public-property grammar is space-separated `KEY=VALUE` tokens.
+pub fn msiexec_argv_with_properties(
+    installer: &std::path::Path,
+    flavour: WindowsInstallFlavour,
+    properties: &[(&str, &str)],
+) -> Vec<String> {
+    let mut argv = msiexec_argv(installer, flavour);
+    for (k, v) in properties {
+        argv.push(format!("{k}={v}"));
+    }
+    argv
+}
+
 pub fn spawn_installer_inner(installer_path: &std::path::Path) -> Result<u32> {
     // Auto-updater entry point: classify the RUNNING agent EXE's
     // location to decide whether the in-place MSI swap needs UAC
@@ -814,7 +834,33 @@ pub fn spawn_installer_for_flavour(
 ) -> Result<u32> {
     #[cfg(target_os = "windows")]
     {
-        let argv = msiexec_argv(installer_path, flavour);
+        spawn_installer_for_flavour_with_properties(installer_path, flavour, &[])
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        spawn_installer_for_flavour_inner(installer_path)
+    }
+}
+
+/// rc.44: variant of [`spawn_installer_for_flavour`] that passes
+/// MSI public properties (e.g. `ENABLE_SYSTEM_CONTEXT=1`) to msiexec.
+/// Used by the install wizard to drive the WiX
+/// `EnableSystemContext` / `DisableSystemContext` deferred custom
+/// actions added in rc.44 P2.
+///
+/// Non-Windows ignores both the flavour and the properties — there's
+/// no msiexec on Linux/macOS, so the properties are not surfaceable
+/// to the platform installer anyway.
+pub fn spawn_installer_for_flavour_with_properties(
+    installer_path: &std::path::Path,
+    #[cfg(target_os = "windows")] flavour: WindowsInstallFlavour,
+    #[cfg(not(target_os = "windows"))] _flavour: WindowsInstallFlavour,
+    #[cfg(target_os = "windows")] properties: &[(&str, &str)],
+    #[cfg(not(target_os = "windows"))] _properties: &[(&str, &str)],
+) -> Result<u32> {
+    #[cfg(target_os = "windows")]
+    {
+        let argv = msiexec_argv_with_properties(installer_path, flavour, properties);
         match flavour {
             WindowsInstallFlavour::PerUser => {
                 // /qn silent install; non-elevated msiexec inherits
@@ -1737,6 +1783,68 @@ mod tests {
         );
         assert_eq!(argv[0], "/i");
         assert_eq!(argv[1], r"D:\roomler-agent.msi");
+    }
+
+    // ----- rc.44 P4: msiexec_argv_with_properties (SystemContext) ----
+
+    #[test]
+    fn msiexec_argv_with_properties_appends_kv() {
+        // Operator-supplied properties land AFTER the base /i path /qb!
+        // /norestart shape. Locks the wire format for the WiX CA's
+        // condition (`ENABLE_SYSTEM_CONTEXT="1"`).
+        let argv = msiexec_argv_with_properties(
+            std::path::Path::new(r"C:\Temp\roomler-agent-perMachine.msi"),
+            WindowsInstallFlavour::PerMachine,
+            &[("ENABLE_SYSTEM_CONTEXT", "1")],
+        );
+        // Base shape preserved.
+        assert_eq!(argv[0], "/i");
+        assert_eq!(argv[2], "/qb!");
+        assert_eq!(argv[3], "/norestart");
+        // Property appended verbatim, no shell-quoting.
+        assert_eq!(argv[4], "ENABLE_SYSTEM_CONTEXT=1");
+        assert_eq!(argv.len(), 5);
+    }
+
+    #[test]
+    fn msiexec_argv_with_properties_explicit_disable_passes_zero() {
+        // Plain perMachine over a SystemContext-on host: wizard passes
+        // =0 explicitly so the WiX DisableSystemContext CA's condition
+        // (`ENABLE_SYSTEM_CONTEXT="0"`) matches. Verifies the explicit
+        // value survives the formatter.
+        let argv = msiexec_argv_with_properties(
+            std::path::Path::new(r"C:\Temp\roomler-agent-perMachine.msi"),
+            WindowsInstallFlavour::PerMachine,
+            &[("ENABLE_SYSTEM_CONTEXT", "0")],
+        );
+        assert!(argv.iter().any(|s| s == "ENABLE_SYSTEM_CONTEXT=0"));
+    }
+
+    #[test]
+    fn msiexec_argv_with_properties_empty_matches_base() {
+        // When the wizard passes no properties (perUser flavour), the
+        // wrapper must produce byte-identical output to the base
+        // msiexec_argv — no trailing whitespace, no extra tokens.
+        let p = std::path::Path::new(r"C:\Temp\roomler-agent.msi");
+        let base = msiexec_argv(p, WindowsInstallFlavour::PerUser);
+        let with_empty = msiexec_argv_with_properties(p, WindowsInstallFlavour::PerUser, &[]);
+        assert_eq!(base, with_empty);
+    }
+
+    #[test]
+    fn msiexec_argv_with_properties_appends_multiple_in_order() {
+        // Forward-compat: WiX may need additional public properties
+        // in a future cycle (e.g. ENABLE_SYSTEM_CONTEXT=1 +
+        // SYSTEM_CONTEXT_TIMEOUT_SECS=180). Order must be preserved.
+        let argv = msiexec_argv_with_properties(
+            std::path::Path::new(r"C:\Temp\roomler-agent-perMachine.msi"),
+            WindowsInstallFlavour::PerMachine,
+            &[("A", "1"), ("B", "two"), ("C", "3")],
+        );
+        let tail: Vec<&String> = argv.iter().skip(4).collect();
+        assert_eq!(tail[0], "A=1");
+        assert_eq!(tail[1], "B=two");
+        assert_eq!(tail[2], "C=3");
     }
 
     // ---- rc.19 P3 — transfer-gated update timing ----
