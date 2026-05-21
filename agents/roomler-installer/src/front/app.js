@@ -526,7 +526,7 @@ function renderInstall() {
 }
 
 function checklistClass(event) {
-  if (event.kind === "error") return "error";
+  if (event.kind === "error" || event.kind === "system_context_error") return "error";
   if (event.kind === "preflight_warning") return "warning";
   if (event.kind === "done" || event.kind === "enroll_ok" || event.kind === "msi_completed"
       || event.kind === "service_restarted" || event.kind === "env_var_set"
@@ -546,6 +546,17 @@ function checklistLabel(event) {
   if (event.kind === "msi_completed") return `MSI installer finished (exit ${event.code}, ${event.decoded})`;
   if (event.kind === "enroll_ok") return `Agent enrolled (agent_id ${event.agent_id})`;
   if (event.kind === "error") return `Error at ${event.step}: ${event.message}`;
+  // rc.44: SystemContext CA failure surfaces the failing stage + hint
+  // on its own checklist line so the operator sees BOTH the generic
+  // MSI failure (line above) AND the actionable stage-scoped advice.
+  if (event.kind === "system_context_error") {
+    const stageLabel = {
+      env_var_write: "Writing service env-var",
+      service_restart: "Restarting service",
+      unknown: "SystemContext step",
+    }[event.stage] ?? `SystemContext (${event.stage})`;
+    return `${stageLabel} failed: ${event.message}${event.hint ? " — " + event.hint : ""}`;
+  }
   return base;
 }
 
