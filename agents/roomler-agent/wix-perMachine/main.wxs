@@ -243,6 +243,78 @@
             Impersonate='no'
             Return='ignore' />
 
+        <!--
+          rc.44: SystemContext automation. The installer wizard sets
+          ENABLE_SYSTEM_CONTEXT=1 on the msiexec command line when the
+          operator picked the `permachine-system-context` flavour. The
+          property must be declared Secure="yes" so it survives the
+          elevation boundary from the immediate (impersonated) into the
+          deferred (LocalSystem) execution sequence; without that
+          attribute msiexec drops public properties at InstallInitialize.
+
+          Default value `0` so the DisableSystemContext CA's condition
+          fires on plain `permachine` installs (the orchestrator passes
+          ENABLE_SYSTEM_CONTEXT=0 explicitly, but a wholly-omitted
+          property would also default to "0" here and still trigger
+          the disable CA — desired behaviour for headless fleet installs
+          that forget the property entirely).
+        -->
+        <Property Id='ENABLE_SYSTEM_CONTEXT' Value='0' Secure='yes' />
+
+        <!--
+          rc.44 forward action: flip the SystemContext gate on. Runs
+          deferred + non-impersonated (LocalSystem) so it has HKLM-write
+          rights + SCM Stop/Start rights. ExeCommand shells the freshly-
+          laid roomler-agent.exe (composite subcommand introduced in
+          rc.44 P1.5; writes %PROGRAMDATA%\roomler\last-system-context-
+          attempt.json on every invocation so the wizard can surface
+          actionable errors). Return="check" so a CA failure surfaces
+          as MSI failure → wizard's MsiExitDecoded::FatalError branch.
+        -->
+        <CustomAction
+            Id='EnableSystemContext'
+            FileKey='roomler_agent_exe'
+            ExeCommand='enable-system-context'
+            Execute='deferred'
+            Impersonate='no'
+            Return='check' />
+
+        <!--
+          rc.44 rollback partner for EnableSystemContext. Per Windows
+          Installer rules, rollback CAs are pushed onto the rollback
+          stack at the SCHEDULING POINT (not the failure point), so this
+          must be scheduled IMMEDIATELY BEFORE the forward action it
+          protects. If anything later in the sequence fails (or the
+          system crashes), this CA runs and reverts the env-var write.
+          Return="ignore" because a rollback failure shouldn't mask the
+          original CA's error.
+        -->
+        <CustomAction
+            Id='RollbackSystemContext'
+            FileKey='roomler_agent_exe'
+            ExeCommand='disable-system-context'
+            Execute='rollback'
+            Impersonate='no'
+            Return='ignore' />
+
+        <!--
+          rc.44 symmetric disable for plain-perMachine installs over
+          a SystemContext-on host (and IT-fleet quiet installs that
+          want SystemContext off). Conditioned on ENABLE_SYSTEM_CONTEXT="0"
+          so it fires on both explicit `=0` and the default value. The
+          underlying `disable-system-context` subcommand is idempotent —
+          unsetting an already-absent env var is a no-op, restart of an
+          already-running service after a no-op env change is a noisy
+          but functionally cheap operation.
+        -->
+        <CustomAction
+            Id='DisableSystemContext'
+            FileKey='roomler_agent_exe'
+            ExeCommand='disable-system-context'
+            Execute='deferred'
+            Impersonate='no'
+            Return='ignore' />
+
         <InstallExecuteSequence>
             <Custom Action='RegisterService' After='InstallFiles'>
                 NOT (REMOVE="ALL")
@@ -254,6 +326,23 @@
             -->
             <Custom Action='CleanupLegacyPerUser' After='InstallFiles'>
                 NOT (REMOVE="ALL")
+            </Custom>
+            <!--
+              rc.44 SystemContext sequencing.
+              Rollback CA MUST be scheduled IMMEDIATELY BEFORE its
+              forward partner (EnableSystemContext) so the rollback
+              stack registers the revert action before any state
+              mutation. Both fire after RegisterService since the
+              service must exist before we can restart it.
+            -->
+            <Custom Action='RollbackSystemContext' After='RegisterService'>
+                ENABLE_SYSTEM_CONTEXT="1" AND NOT (REMOVE="ALL")
+            </Custom>
+            <Custom Action='EnableSystemContext' After='RollbackSystemContext'>
+                ENABLE_SYSTEM_CONTEXT="1" AND NOT (REMOVE="ALL")
+            </Custom>
+            <Custom Action='DisableSystemContext' After='RegisterService'>
+                ENABLE_SYSTEM_CONTEXT="0" AND NOT (REMOVE="ALL")
             </Custom>
             <Custom Action='UnregisterService' Before='RemoveFiles'>
                 REMOVE="ALL"

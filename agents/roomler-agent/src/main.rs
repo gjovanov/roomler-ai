@@ -1203,21 +1203,52 @@ const DEFAULT_RESTART_TIMEOUT_SECS: u64 = 120;
 
 #[cfg(target_os = "windows")]
 fn enable_system_context_cmd(no_restart: bool) -> Result<()> {
-    use roomler_agent::win_service::environment;
+    use roomler_agent::win_service::{environment, system_context_attempt as attempt};
     use std::time::Duration;
 
-    environment::set_service_env_var(SYSTEM_CONTEXT_ENV_VAR, "1")
-        .with_context(|| format!("setting {SYSTEM_CONTEXT_ENV_VAR}=1"))?;
+    const COMMAND: &str = "enable-system-context";
+
+    // Stage 1: env-var write. On failure, record telemetry so the
+    // installer wizard (which reads %PROGRAMDATA%\roomler\
+    // last-system-context-attempt.json after an MSI failure) can
+    // surface an actionable, stage-scoped error to the operator.
+    if let Err(e) = environment::set_service_env_var(SYSTEM_CONTEXT_ENV_VAR, "1") {
+        let hint = "Re-run from an elevated shell. If the failure persists, the SCM \
+                    service may not exist yet — install the perMachine MSI first.";
+        let _ = attempt::record(&attempt::Attempt::failure(
+            COMMAND,
+            attempt::Stage::EnvVarWrite,
+            &e.to_string(),
+            hint,
+        ));
+        return Err(e).with_context(|| format!("setting {SYSTEM_CONTEXT_ENV_VAR}=1"));
+    }
     println!("{SYSTEM_CONTEXT_ENV_VAR}=1 written to SCM service env block.");
 
     if no_restart {
+        let _ = attempt::record(&attempt::Attempt::ok(COMMAND));
         println!(
             "--no-restart: skipping service restart. Run `roomler-agent restart-service` to apply."
         );
         return Ok(());
     }
-    environment::restart_service(Duration::from_secs(DEFAULT_RESTART_TIMEOUT_SECS))
-        .context("restarting RoomlerAgentService")?;
+
+    // Stage 2: service restart.
+    if let Err(e) = environment::restart_service(Duration::from_secs(DEFAULT_RESTART_TIMEOUT_SECS))
+    {
+        let hint = "Env-var write succeeded; service restart failed. Common cause: a \
+                    `services.msc` window holds a handle on RoomlerAgentService. Close \
+                    any open services consoles and run `roomler-agent restart-service` \
+                    again.";
+        let _ = attempt::record(&attempt::Attempt::failure(
+            COMMAND,
+            attempt::Stage::ServiceRestart,
+            &e.to_string(),
+            hint,
+        ));
+        return Err(e).context("restarting RoomlerAgentService");
+    }
+    let _ = attempt::record(&attempt::Attempt::ok(COMMAND));
     println!("RoomlerAgentService restarted. SystemContext mode is active.");
     Ok(())
 }
@@ -1229,21 +1260,44 @@ fn enable_system_context_cmd(_no_restart: bool) -> Result<()> {
 
 #[cfg(target_os = "windows")]
 fn disable_system_context_cmd(no_restart: bool) -> Result<()> {
-    use roomler_agent::win_service::environment;
+    use roomler_agent::win_service::{environment, system_context_attempt as attempt};
     use std::time::Duration;
 
-    environment::unset_service_env_var(SYSTEM_CONTEXT_ENV_VAR)
-        .with_context(|| format!("unsetting {SYSTEM_CONTEXT_ENV_VAR}"))?;
+    const COMMAND: &str = "disable-system-context";
+
+    if let Err(e) = environment::unset_service_env_var(SYSTEM_CONTEXT_ENV_VAR) {
+        let hint = "Re-run from an elevated shell.";
+        let _ = attempt::record(&attempt::Attempt::failure(
+            COMMAND,
+            attempt::Stage::EnvVarWrite,
+            &e.to_string(),
+            hint,
+        ));
+        return Err(e).with_context(|| format!("unsetting {SYSTEM_CONTEXT_ENV_VAR}"));
+    }
     println!("{SYSTEM_CONTEXT_ENV_VAR} removed from SCM service env block.");
 
     if no_restart {
+        let _ = attempt::record(&attempt::Attempt::ok(COMMAND));
         println!(
             "--no-restart: skipping service restart. Run `roomler-agent restart-service` to apply."
         );
         return Ok(());
     }
-    environment::restart_service(Duration::from_secs(DEFAULT_RESTART_TIMEOUT_SECS))
-        .context("restarting RoomlerAgentService")?;
+
+    if let Err(e) = environment::restart_service(Duration::from_secs(DEFAULT_RESTART_TIMEOUT_SECS))
+    {
+        let hint = "Env-var unset succeeded; service restart failed. Close any open \
+                    `services.msc` consoles and run `roomler-agent restart-service` again.";
+        let _ = attempt::record(&attempt::Attempt::failure(
+            COMMAND,
+            attempt::Stage::ServiceRestart,
+            &e.to_string(),
+            hint,
+        ));
+        return Err(e).context("restarting RoomlerAgentService");
+    }
+    let _ = attempt::record(&attempt::Attempt::ok(COMMAND));
     println!("RoomlerAgentService restarted. SystemContext mode is disabled.");
     Ok(())
 }

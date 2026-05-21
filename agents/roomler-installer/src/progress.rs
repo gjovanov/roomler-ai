@@ -109,6 +109,28 @@ pub enum ProgressEvent {
     /// Fatal error at some step. SPA surfaces the recovery panel
     /// scoped to `step` (`download`, `msi`, `service`, `enroll`).
     Error { step: String, message: String },
+
+    /// rc.44: WiX `EnableSystemContext` / `DisableSystemContext`
+    /// custom action failed inside msiexec. The wizard reads
+    /// `%PROGRAMDATA%\roomler\last-system-context-attempt.json`
+    /// (written by the composite subcommands the CA shells out to)
+    /// and surfaces an actionable error scoped to the failing stage.
+    ///
+    /// `stage` is `env_var_write` / `service_restart` / `unknown`
+    /// (snake-case, mirrors the agent's `Stage` enum).
+    /// `message` is the helper's stderr.
+    /// `hint` is an operator-actionable next step (e.g.
+    /// "Close services.msc and rerun `roomler-agent restart-service`.").
+    ///
+    /// SPA renders this distinctly from the generic `Error` event —
+    /// it pairs the `Retry SystemContext step` affordance with an
+    /// `Open log folder` link so the operator can inspect
+    /// `%PROGRAMDATA%\roomler\` directly.
+    SystemContextError {
+        stage: String,
+        message: String,
+        hint: String,
+    },
 }
 
 /// In-Rust replay log. `cmd_install` mirrors every emit here so the

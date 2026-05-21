@@ -41,7 +41,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use roomler_agent::install_detect::{ExistingInstall, detect_existing_install};
-use roomler_agent::updater::{WindowsInstallFlavour, spawn_installer_for_flavour};
+use roomler_agent::updater::{WindowsInstallFlavour, spawn_installer_for_flavour_with_properties};
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
 
@@ -142,26 +142,19 @@ async fn run_install_inner(
     // --- Parse flavour into the enum the rest of the pipeline uses -----
     let (wfx, is_system_context) = parse_flavour(&flavour_str)?;
 
-    // SystemContext mode: run plain perMachine install (parse_flavour
-    // already returns WindowsInstallFlavour::PerMachine for the
-    // SystemContext variant). The SPA's Done page shows a manual
-    // PowerShell snippet — `roomler-agent set-service-env-var` +
-    // `restart-service` — that the operator runs from an elevated
-    // shell to flip the SystemContext path on. Full MSI-side
-    // automation (a WiX custom action gated on ENABLE_SYSTEM_CONTEXT=1)
-    // is the next slice but not blocking the v1 ship.
-    if is_system_context {
-        emit(
-            on_event,
-            ProgressEvent::PreflightWarning {
-                message: "SystemContext mode: installing plain perMachine MSI now. \
-                          After Done, run the elevated `set-service-env-var` + \
-                          `restart-service` snippet shown on the final step to \
-                          flip the SystemContext path on."
-                    .to_string(),
-            },
-        );
-    }
+    // rc.44 SystemContext automation. The wizard now passes the
+    // ENABLE_SYSTEM_CONTEXT public property to msiexec; the WiX CA in
+    // wix-perMachine/main.wxs (rc.44 P2) fires `EnableSystemContext`
+    // when "1" and `DisableSystemContext` when "0". The agent's
+    // composite subcommands (rc.44 P1.5) write a single-entry telemetry
+    // record to %PROGRAMDATA%\roomler\last-system-context-attempt.json
+    // that the wizard reads on MSI failure (rc.44 P3) to surface an
+    // actionable error to the operator.
+    //
+    // perUser flavour: no property — wix/main.wxs doesn't declare it.
+    // perMachine plain: ENABLE_SYSTEM_CONTEXT=0 (explicit) so the
+    //   DisableSystemContext CA fires on a downgrade from SC-on host.
+    // perMachine+SC: ENABLE_SYSTEM_CONTEXT=1.
 
     // --- Step 2: resolve installer ---------------------------------------
     check_cancel()?;
@@ -245,8 +238,23 @@ async fn run_install_inner(
     // 2026-05-15 on GORAN-XMG-NEO16; BLOCKER B6 from the rc.27/rc.28
     // master plan.
     check_cancel()?;
-    let pid =
-        spawn_installer_for_flavour(&staged, wfx).map_err(|e| format!("spawn msiexec: {e}"))?;
+    // rc.44: build the property table from the parsed flavour.
+    //   peruser              → no property (wix/main.wxs doesn't declare it)
+    //   permachine plain     → ENABLE_SYSTEM_CONTEXT=0 (explicit, so the
+    //                          WiX DisableSystemContext CA fires on a
+    //                          downgrade from a SC-on host)
+    //   permachine+SC        → ENABLE_SYSTEM_CONTEXT=1
+    let properties: Vec<(&str, &str)> = match wfx {
+        WindowsInstallFlavour::PerUser => Vec::new(),
+        WindowsInstallFlavour::PerMachine => {
+            vec![(
+                "ENABLE_SYSTEM_CONTEXT",
+                if is_system_context { "1" } else { "0" },
+            )]
+        }
+    };
+    let pid = spawn_installer_for_flavour_with_properties(&staged, wfx, &properties)
+        .map_err(|e| format!("spawn msiexec: {e}"))?;
     ACTIVE_MSI_PID.store(pid, Ordering::SeqCst);
     emit(on_event, ProgressEvent::MsiSpawned { pid });
 
@@ -274,11 +282,23 @@ async fn run_install_inner(
             // that doesn't depend on the agent binary running.
         }
         MsiExitDecoded::UserCancel => {
-            return Err(
+            // rc.44: branch on is_system_context. SystemContext mode
+            // REQUIRES perMachine + admin (SCM Environment write +
+            // service restart), so "pick perUser mode" advice doesn't
+            // apply — the operator must either get admin rights or
+            // back off to plain perMachine.
+            let msg = if is_system_context {
+                "Installation cancelled (you clicked No on the UAC prompt). \
+                 SystemContext mode requires admin rights — it writes to the \
+                 service's Environment block and restarts the service. Try \
+                 again and approve the UAC prompt, or pick plain perMachine \
+                 mode (without SystemContext) if you only need user-context \
+                 remote control."
+            } else {
                 "Installation cancelled (you clicked No on the UAC prompt). \
                  Try again or pick perUser mode if you can't get admin rights."
-                    .to_string(),
-            );
+            };
+            return Err(msg.to_string());
         }
         MsiExitDecoded::AnotherInstall => {
             return Err(
@@ -289,6 +309,22 @@ async fn run_install_inner(
             );
         }
         MsiExitDecoded::FatalError => {
+            // rc.44: on SystemContext flavour, the WiX CA may have
+            // failed inside the env-var write or service-restart
+            // stage. The composite subcommand writes a single-entry
+            // JSON to %PROGRAMDATA%\roomler\last-system-context-attempt.json
+            // on every invocation; read it back to surface an
+            // actionable error scoped to the failing stage.
+            if is_system_context && let Some(attempt) = read_last_system_context_attempt() {
+                emit(
+                    on_event,
+                    ProgressEvent::SystemContextError {
+                        stage: attempt.stage,
+                        message: attempt.message,
+                        hint: attempt.hint,
+                    },
+                );
+            }
             return Err(
                 "MSI installer failed (exit 1603). Check the MSI log at %TEMP%\\MSI*.LOG for details."
                     .to_string(),
@@ -362,6 +398,69 @@ pub fn force_kill_msi() -> Result<(), String> {
 }
 
 // ─── helpers ────────────────────────────────────────────────────────────────
+
+/// Projection of [`roomler_agent::win_service::system_context_attempt::Attempt`]
+/// into the shape `ProgressEvent::SystemContextError` consumes. Kept
+/// local to this module so the orchestrator doesn't leak the agent's
+/// telemetry type into the SPA wire format.
+struct SystemContextAttemptView {
+    stage: String,
+    message: String,
+    hint: String,
+}
+
+/// Read `%PROGRAMDATA%\roomler\last-system-context-attempt.json` and
+/// project it into the wire-shape the SPA receives. Returns `None`
+/// when:
+///   - the file doesn't exist (CA never ran — happens on plain
+///     perMachine installs that go through the `DisableSystemContext`
+///     path with no prior SC enabled);
+///   - the JSON is malformed (best-effort — don't fail the whole
+///     install just because telemetry is corrupt);
+///   - the recorded attempt was a success (Stage::Ok — no error to
+///     surface; whatever caused the MSI 1603 was outside the CA).
+///
+/// Windows-only because the underlying win_service module is
+/// Windows-gated. On non-Windows the function always returns None,
+/// which keeps the install_orchestrator unit tests cross-platform.
+fn read_last_system_context_attempt() -> Option<SystemContextAttemptView> {
+    #[cfg(target_os = "windows")]
+    {
+        use roomler_agent::win_service::system_context_attempt::{Stage, read_last};
+        match read_last() {
+            Ok(Some(attempt)) => {
+                // Surface failures only — a successful prior attempt
+                // (e.g. a prior install that flipped SC on cleanly,
+                // then a later non-SC install failed for an unrelated
+                // reason) shouldn't be surfaced as a SystemContext
+                // error.
+                if matches!(attempt.stage, Stage::Ok) {
+                    return None;
+                }
+                let stage_str = match attempt.stage {
+                    Stage::Ok => "ok",
+                    Stage::EnvVarWrite => "env_var_write",
+                    Stage::ServiceRestart => "service_restart",
+                    Stage::Unknown => "unknown",
+                };
+                Some(SystemContextAttemptView {
+                    stage: stage_str.to_string(),
+                    message: attempt.stderr,
+                    hint: attempt.hint,
+                })
+            }
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to read system-context attempt JSON");
+                None
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        None
+    }
+}
 
 fn emit(channel: &Channel<ProgressEvent>, event: ProgressEvent) {
     // Replay log first so a late-attaching listener can catch up
