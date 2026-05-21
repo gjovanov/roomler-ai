@@ -175,13 +175,18 @@ function initDecoder() {
     decoder.configure({
       codec: activeCodec,
       optimizeForLatency: true,
-      // rc.33 — prefer hardware decode where available. Profile-1
-      // (4:4:4) HW decode is rare (Intel Tiger Lake+, some AMD); on
-      // hardware that doesn't expose it (UHD 630, etc.) Chromium
-      // silently falls back to SW decode. When it DOES kick in, it
-      // removes the SW-VP9-decode CPU contention from the controller
-      // process, freeing budget for the render scheduler.
-      hardwareAcceleration: 'prefer-hardware',
+      // Hardware-decode preference. Profile-1 (4:4:4) HW decode is
+      // rare — Intel Tiger Lake+, some AMD; NVDEC and Intel UHD 630
+      // don't expose it. `'prefer-hardware'` was tried (added in
+      // aac736b) on the theory Chromium would silently fall back to
+      // SW decode on GPUs without 4:4:4 support — but on Chrome 148
+      // it does NOT: `configure()` accepts the hint, then the first
+      // real frame hard-rejects with "Unsupported configuration",
+      // the decoder closes, and the canvas goes black (field repro
+      // 2026-05-21, RTX 5090 + UHD 630). `'no-preference'` lets
+      // Chromium pick HW decode where it genuinely exists and SW
+      // otherwise — the actual silent-fallback behaviour we want.
+      hardwareAcceleration: 'no-preference',
     } as VideoDecoderConfig)
     configured = true
     workerScope.postMessage({
