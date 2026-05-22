@@ -185,6 +185,9 @@ fn record_inner(
     // contract; `log_suppression_throttled` keeps the warn from
     // spamming.
     if let Some(reason) = should_suppress(&dir, now_unix) {
+        // rc.51: tally the suppressed write so the next sidecar that
+        // DOES land carries the count — loop intensity stays visible.
+        SUPPRESSED_SINCE_LAST.fetch_add(1, Ordering::Relaxed);
         log_suppression_throttled(&dir, reason, now_unix);
         return Err(std::io::Error::other(reason.as_str()));
     }
@@ -204,6 +207,11 @@ fn record_inner(
         scrubbed_summary
     };
 
+    // rc.51: drain the suppressed-since-last tally — this sidecar is
+    // about to be written successfully, so it "absorbs" the count of
+    // crashes the 1/60 s throttle dropped since the previous write.
+    let suppressed_since_last = SUPPRESSED_SINCE_LAST.swap(0, Ordering::Relaxed) as u32;
+
     let mut payload = AgentCrashPayload {
         crashed_at_unix: now_unix,
         reason,
@@ -213,6 +221,7 @@ fn record_inner(
         os: std::env::consts::OS.to_string(),
         hostname: detect_hostname(),
         pid,
+        suppressed_since_last,
     };
 
     // Cap JSON at MAX_PAYLOAD_BYTES by progressively trimming the
@@ -432,6 +441,14 @@ pub fn should_suppress(dir: &Path, now_unix: i64) -> Option<SuppressReason> {
 /// every 2s would otherwise log the WARN ~30x/min, which is exactly
 /// the spam the suppression is supposed to prevent.
 static SUPPRESSION_LAST_WARN_UNIX: AtomicU64 = AtomicU64::new(0);
+
+/// rc.51: count of crash sidecars rate-limit-suppressed since the
+/// last sidecar that actually got written. Incremented every time
+/// `should_suppress` blocks a write; drained into the next
+/// successfully-written sidecar's `suppressed_since_last` field so
+/// forensics see loop *intensity* even though only 1/60 s of a tight
+/// loop's crashes land on disk.
+static SUPPRESSED_SINCE_LAST: AtomicU64 = AtomicU64::new(0);
 const SUPPRESSION_WARN_THROTTLE_SECS: u64 = 60;
 
 fn log_suppression_throttled(dir: &Path, reason: SuppressReason, now_unix: i64) {
@@ -745,6 +762,7 @@ mod tests {
             os: "linux".to_string(),
             hostname: "test-host".to_string(),
             pid: 42,
+            suppressed_since_last: 0,
         }
     }
 
@@ -854,6 +872,38 @@ mod tests {
         let before = p.clone();
         fit_to_envelope(&mut p, MAX_PAYLOAD_BYTES);
         assert_eq!(p, before);
+    }
+
+    // ─── rc.51: suppressed_since_last field ────────────────────────────────
+
+    #[test]
+    fn pre_rc51_sidecar_json_without_suppressed_field_deserialises_to_zero() {
+        // A sidecar written by rc.50-and-earlier has no
+        // `suppressedSinceLast` key. `#[serde(default)]` must let it
+        // parse — the uploader reads sidecars left on disk across an
+        // agent upgrade, so an old file must not become unreadable.
+        let legacy = r#"{
+            "crashedAtUnix": 1700000000,
+            "reason": "panic",
+            "summary": "old crash",
+            "logTail": "",
+            "agentVersion": "0.3.0-rc.50",
+            "os": "windows",
+            "hostname": "h",
+            "pid": 7
+        }"#;
+        let p: AgentCrashPayload = serde_json::from_str(legacy).expect("legacy sidecar parses");
+        assert_eq!(p.suppressed_since_last, 0);
+    }
+
+    #[test]
+    fn suppressed_since_last_round_trips() {
+        let mut p = sample_payload();
+        p.suppressed_since_last = 23;
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(json.contains("suppressedSinceLast"));
+        let back: AgentCrashPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.suppressed_since_last, 23);
     }
 
     #[test]
@@ -1031,6 +1081,7 @@ mod tests {
             os: "test".to_string(),
             hostname: "test".to_string(),
             pid: 99,
+            suppressed_since_last: 0,
         };
         // Verify our trim helper doesn't strip the override content
         // when it's well under budget.
