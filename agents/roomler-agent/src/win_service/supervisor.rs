@@ -609,6 +609,58 @@ pub fn next_backoff(consecutive_failures: u32) -> Duration {
     }
 }
 
+/// rc.51: a worker must run at least this long before its exit is
+/// treated as "it was healthy" — i.e. before a non-zero exit resets
+/// the `consecutive_failures` backoff ladder. A doomed worker that
+/// crash-loops dies in ~400 ms, far under this; a worker that ran 30 s+
+/// and then crashed is a genuine isolated failure that should start a
+/// fresh ladder rather than inherit a stale escalated backoff.
+///
+/// 30 s is comfortably above the observed ~400 ms crash-exit and below
+/// `next_backoff`'s 60 s cap, so it gates *backoff escalation* — a
+/// faster concern than version-rollback's longer clean-run threshold.
+pub const HEALTHY_UPTIME_THRESHOLD: Duration = Duration::from_secs(30);
+
+/// rc.51: once `consecutive_failures` reaches this, the supervisor
+/// emits a throttled `error!` so a crash-looping host surfaces in log
+/// aggregation. ~8 failures is roughly where `next_backoff` saturates
+/// at the 60 s cap. The supervisor never *gives up* (infinite respawn
+/// is the M3/M5 resilience design — a give-up would convert a
+/// recoverable loop into a permanently-dark host); this is purely an
+/// observability signal.
+pub const RESPAWN_ALARM_THRESHOLD: u32 = 8;
+
+/// rc.51: should a worker exit reset the `consecutive_failures`
+/// ladder? True only when the worker ran long enough to be considered
+/// healthy. A successful *spawn* is NOT a healthy run — the doomed
+/// crash-loop worker spawns fine then dies in 400 ms — so the reset
+/// must gate on uptime, not on spawn success (the pre-rc.51 bug:
+/// `consecutive_failures = 0` on every spawn pinned the counter at 1).
+pub fn reap_resets_counter(worker_uptime: Duration) -> bool {
+    worker_uptime >= HEALTHY_UPTIME_THRESHOLD
+}
+
+/// rc.51: the supervisor's live worker handle plus the metadata that
+/// must stay in lockstep with it. Pre-rc.51 these were four parallel
+/// locals (`current_worker` / `current_session` /
+/// `current_is_system_context` / a would-be `spawned_at`) cleared at
+/// ~5 separate sites — a desync waiting to happen. Bundling them into
+/// one `Option<ActiveWorker>` makes "worker present" and "its
+/// metadata" structurally inseparable: a single `.take()` / `= None`
+/// clears everything atomically.
+struct ActiveWorker {
+    /// The spawned worker process handle (RAII — drops the OS handle).
+    process: OwnedProcess,
+    /// Console session the worker was spawned into.
+    session: u32,
+    /// `true` iff spawned via the SYSTEM-context winlogon-token arm.
+    /// The worker looks identical from outside (same binary, same PID)
+    /// — only the spawn site knows which token was used.
+    is_system_context: bool,
+    /// When the worker was spawned. Drives [`reap_resets_counter`].
+    spawned_at: Instant,
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Supervisor main loop. Called from `service_main_inner`.
 // ────────────────────────────────────────────────────────────────────────────
@@ -643,23 +695,20 @@ pub fn run(
             }
         );
     }
-    let mut current_worker: Option<OwnedProcess> = None;
-    let mut current_session: Option<u32> = None;
+    // rc.51: the worker handle + its session/context/spawn-time, one
+    // Option so they can never desync (see `ActiveWorker`).
+    let mut current: Option<ActiveWorker> = None;
     // Last observed keep_stream_alive value. Used to log only on
     // transitions instead of every poll iteration — the supervisor
     // checks the marker every POLL_INTERVAL (500 ms), which would
     // flood the log with identical "keep_stream_alive=true" lines.
     let mut last_logged_keep_stream_alive: Option<bool> = None;
-    // Whether the current worker (if any) was spawned via the
-    // SYSTEM-context arm (`SpawnSystemInSession`). False on cold
-    // start and after every user-context spawn. Drives the
-    // `decide_spawn` swap arms — the supervisor needs this state
-    // because the worker process itself looks identical from the
-    // outside (same binary, same PID handle); only the spawn site
-    // knows which token was used.
-    let mut current_is_system_context: bool = false;
     let mut consecutive_failures: u32 = 0;
     let mut respawn_at: Option<Instant> = None;
+    // rc.51: throttle for the crash-loop alarm `error!` — emit at most
+    // once per minute so a looping host surfaces in log aggregation
+    // without flooding it.
+    let mut last_alarm_at: Option<Instant> = None;
     // Most recent active console session id observed. Used by
     // `decide_spawn`'s SpawnSystemInSession arm when the active
     // session disappears mid-stream (sign-out / fast-user-switch
@@ -683,6 +732,13 @@ pub fn run(
                 }
                 Ok(SupervisorEvent::SessionChanged) => {
                     tracing::info!("supervisor: SessionChange received; will resolve");
+                    // rc.51: a session change (logon / unlock /
+                    // fast-user-switch) is exactly the signal that a
+                    // previously-doomed pre-logon spawn may now
+                    // succeed — clear any pending backoff so the next
+                    // loop iteration spawns immediately instead of
+                    // waiting out a stale (up to 60 s) `respawn_at`.
+                    respawn_at = None;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
@@ -693,14 +749,17 @@ pub fn run(
             }
         }
         if shutdown {
-            if let Some(w) = current_worker.take() {
-                tracing::info!(pid = w.pid, "supervisor: terminating worker on shutdown");
-                w.terminate();
+            if let Some(w) = current.take() {
+                tracing::info!(
+                    pid = w.process.pid,
+                    "supervisor: terminating worker on shutdown"
+                );
+                w.process.terminate();
                 // Wait for the OS to actually reap it before
                 // returning — see TERMINATE_WAIT for rationale.
-                if !w.wait_for_exit(TERMINATE_WAIT) {
+                if !w.process.wait_for_exit(TERMINATE_WAIT) {
                     tracing::warn!(
-                        pid = w.pid,
+                        pid = w.process.pid,
                         "supervisor: worker did not exit within {}ms after terminate",
                         TERMINATE_WAIT.as_millis()
                     );
@@ -710,29 +769,66 @@ pub fn run(
         }
 
         // Reap a finished worker.
-        if let Some(w) = current_worker.as_ref() {
-            match w.try_wait() {
+        if let Some(w) = current.as_ref() {
+            match w.process.try_wait() {
                 Ok(Some(code)) => {
-                    let (reaction, next_failures) =
-                        decide_exit_reaction(code, consecutive_failures);
+                    // rc.51: gate the counter reset on worker UPTIME,
+                    // not spawn success. A worker that ran ≥30 s then
+                    // crashed is an isolated failure → fresh ladder
+                    // (pass prior=0); a worker that died in <30 s is a
+                    // crash-loop iteration → keep escalating (pass the
+                    // live counter). `decide_exit_reaction(0, _)`
+                    // always resets, so a clean exit is unaffected.
+                    let uptime = w.spawned_at.elapsed();
+                    let prior = if reap_resets_counter(uptime) {
+                        0
+                    } else {
+                        consecutive_failures
+                    };
+                    let (reaction, next_failures) = decide_exit_reaction(code, prior);
                     consecutive_failures = next_failures;
                     match reaction {
                         ExitReaction::Respawn => {
                             tracing::info!(
-                                pid = w.pid,
+                                pid = w.process.pid,
                                 "supervisor: worker exited cleanly (code=0); respawning without backoff"
                             );
                             respawn_at = None;
                         }
                         ExitReaction::Backoff(backoff) => {
                             tracing::warn!(
-                                pid = w.pid,
+                                pid = w.process.pid,
                                 code,
                                 consecutive_failures,
                                 backoff_secs = backoff.as_secs(),
                                 "supervisor: worker exited with non-zero code; backing off before respawn"
                             );
                             respawn_at = Some(Instant::now() + backoff);
+
+                            // rc.51: crash-loop alarm. Once the worker
+                            // has failed RESPAWN_ALARM_THRESHOLD times
+                            // in a row (≈ where backoff saturates at
+                            // the 60 s cap), emit a throttled `error!`
+                            // so a stuck host surfaces in log
+                            // aggregation. The supervisor never gives
+                            // up — infinite respawn is intentional (a
+                            // logon or auto-update can still recover
+                            // the host); this is purely observability.
+                            if consecutive_failures >= RESPAWN_ALARM_THRESHOLD {
+                                let now = Instant::now();
+                                let due = last_alarm_at.is_none_or(|t| {
+                                    now.duration_since(t) >= Duration::from_secs(60)
+                                });
+                                if due {
+                                    last_alarm_at = Some(now);
+                                    tracing::error!(
+                                        consecutive_failures,
+                                        last_exit_code = code,
+                                        "supervisor: worker has failed {} times in a row — host likely needs operator attention (still respawning)",
+                                        consecutive_failures
+                                    );
+                                }
+                            }
 
                             // Phase 1B (Task 9): record a crash
                             // sidecar so the next worker uploads it
@@ -753,16 +849,12 @@ pub fn run(
                             }
                         }
                     }
-                    current_worker = None;
-                    current_session = None;
-                    current_is_system_context = false;
+                    current = None;
                 }
                 Ok(None) => { /* still running */ }
                 Err(e) => {
                     tracing::warn!(error = %e, "supervisor: try_wait failed; assuming worker is gone");
-                    current_worker = None;
-                    current_session = None;
-                    current_is_system_context = false;
+                    current = None;
                 }
             }
         }
@@ -814,15 +906,15 @@ pub fn run(
         }
         let decision = decide_spawn(
             active,
-            current_session,
-            current_is_system_context,
+            current.as_ref().map(|w| w.session),
+            current.as_ref().is_some_and(|w| w.is_system_context),
             keep_stream_alive,
             last_active_session,
         );
         let due_for_respawn = respawn_at.is_none_or(|t| Instant::now() >= t);
 
         match (decision, due_for_respawn) {
-            (SpawnDecision::SpawnIn(sid), true) if current_worker.is_none() => {
+            (SpawnDecision::SpawnIn(sid), true) if current.is_none() => {
                 match query_user_token(sid) {
                     Ok(Some(token)) => {
                         // SAFETY: `token` is a fresh, owned Win32 user
@@ -837,10 +929,18 @@ pub fn run(
                                     session_id = sid,
                                     "supervisor: spawned worker"
                                 );
-                                current_worker = Some(p);
-                                current_session = Some(sid);
-                                current_is_system_context = false;
-                                consecutive_failures = 0;
+                                current = Some(ActiveWorker {
+                                    process: p,
+                                    session: sid,
+                                    is_system_context: false,
+                                    spawned_at: Instant::now(),
+                                });
+                                // rc.51: do NOT reset consecutive_failures
+                                // here — a successful SPAWN is not a healthy
+                                // RUN. The reset is now uptime-gated in the
+                                // reap path (see reap_resets_counter). The
+                                // pre-rc.51 reset-on-spawn pinned the counter
+                                // at 1 and made backoff never escalate.
                                 respawn_at = None;
                             }
                             Err(e) => {
@@ -877,30 +977,29 @@ pub fn run(
             // disconnected). Either way, kill the existing worker;
             // the next loop iteration spawns the right one.
             (SpawnDecision::SpawnIn(sid), _)
-                if current_worker.is_some()
-                    && (current_session != Some(sid) || current_is_system_context) =>
+                if current
+                    .as_ref()
+                    .is_some_and(|w| w.session != sid || w.is_system_context) =>
             {
                 // Active session changed under us — kill the old
                 // worker, the next loop iteration will spawn a new
                 // one for `sid`.
-                if let Some(old) = current_worker.take() {
+                if let Some(old) = current.take() {
                     tracing::info!(
-                        pid = old.pid,
-                        old_session = ?current_session,
-                        was_system_context = current_is_system_context,
+                        pid = old.process.pid,
+                        old_session = old.session,
+                        was_system_context = old.is_system_context,
                         new_session = sid,
                         "supervisor: spawn target changed (session/context); terminating old worker"
                     );
-                    old.terminate();
+                    old.process.terminate();
                     // Wait for reap so the next-iteration spawn doesn't
                     // race the instance lock — same rationale as the
                     // shutdown-path wait above.
-                    let _ = old.wait_for_exit(TERMINATE_WAIT);
+                    let _ = old.process.wait_for_exit(TERMINATE_WAIT);
                 }
-                current_session = None;
-                current_is_system_context = false;
             }
-            (SpawnDecision::Idle, _) if current_worker.is_some() => {
+            (SpawnDecision::Idle, _) if current.is_some() => {
                 // Active console session disappeared (user logged out;
                 // host returned to the welcome / lock screen with no
                 // logged-in user). The worker is still running but in
@@ -913,17 +1012,15 @@ pub fn run(
                 // controller sees the agent go offline cleanly; M3
                 // will fold in SYSTEM-context capture+input here so
                 // the lock screen itself becomes controllable.
-                if let Some(old) = current_worker.take() {
+                if let Some(old) = current.take() {
                     tracing::info!(
-                        pid = old.pid,
-                        old_session = ?current_session,
+                        pid = old.process.pid,
+                        old_session = old.session,
                         "supervisor: console session went idle (logout / lock screen); terminating worker"
                     );
-                    old.terminate();
-                    let _ = old.wait_for_exit(TERMINATE_WAIT);
+                    old.process.terminate();
+                    let _ = old.process.wait_for_exit(TERMINATE_WAIT);
                 }
-                current_session = None;
-                current_is_system_context = false;
             }
             // M3 A1 SYSTEM-context spawn arm. Fires when decide_spawn
             // returns SpawnSystemInSession(sid) AND we don't already
@@ -951,7 +1048,7 @@ pub fn run(
             // system-context feature) keep the existing _ => {}
             // catch-all behaviour.
             #[cfg(feature = "system-context")]
-            (SpawnDecision::SpawnSystemInSession(sid), true) if current_worker.is_none() => {
+            (SpawnDecision::SpawnSystemInSession(sid), true) if current.is_none() => {
                 use crate::system_context::winlogon_token;
                 let cmdline = winlogon_token::build_cmdline(&worker_exe, &args_borrow);
                 let res = (|| -> anyhow::Result<Option<OwnedProcess>> {
@@ -976,10 +1073,14 @@ pub fn run(
                             session_id = sid,
                             "supervisor: spawned SYSTEM-context worker via winlogon-token"
                         );
-                        current_worker = Some(p);
-                        current_session = Some(sid);
-                        current_is_system_context = true;
-                        consecutive_failures = 0;
+                        current = Some(ActiveWorker {
+                            process: p,
+                            session: sid,
+                            is_system_context: true,
+                            spawned_at: Instant::now(),
+                        });
+                        // rc.51: no consecutive_failures reset here —
+                        // the reset is uptime-gated in the reap path.
                         respawn_at = None;
                     }
                     Ok(None) => {
@@ -1012,22 +1113,21 @@ pub fn run(
             // next iteration spawns the right one.
             #[cfg(feature = "system-context")]
             (SpawnDecision::SpawnSystemInSession(sid), _)
-                if current_worker.is_some()
-                    && (current_session != Some(sid) || !current_is_system_context) =>
+                if current
+                    .as_ref()
+                    .is_some_and(|w| w.session != sid || !w.is_system_context) =>
             {
-                if let Some(old) = current_worker.take() {
+                if let Some(old) = current.take() {
                     tracing::info!(
-                        pid = old.pid,
-                        old_session = ?current_session,
-                        was_system_context = current_is_system_context,
+                        pid = old.process.pid,
+                        old_session = old.session,
+                        was_system_context = old.is_system_context,
                         new_session = sid,
                         "supervisor: swap to SYSTEM-context worker; terminating old worker"
                     );
-                    old.terminate();
-                    let _ = old.wait_for_exit(TERMINATE_WAIT);
+                    old.process.terminate();
+                    let _ = old.process.wait_for_exit(TERMINATE_WAIT);
                 }
-                current_session = None;
-                current_is_system_context = false;
             }
             _ => {}
         }
@@ -1273,5 +1373,75 @@ mod tests {
         // layouts. Just confirm the call doesn't panic and produces
         // either Some(u32) or None.
         let _ = active_console_session_id();
+    }
+
+    // ─── rc.51: uptime-gated counter reset ─────────────────────────────────
+
+    #[test]
+    fn reap_resets_counter_boundary() {
+        // Below the 30 s threshold → not healthy → counter keeps
+        // climbing (a crash-loop iteration).
+        assert!(!reap_resets_counter(Duration::ZERO));
+        assert!(!reap_resets_counter(Duration::from_millis(400)));
+        assert!(!reap_resets_counter(Duration::from_secs(29)));
+        // At/above the threshold → healthy → fresh ladder.
+        assert!(reap_resets_counter(Duration::from_secs(30)));
+        assert!(reap_resets_counter(Duration::from_secs(31)));
+        assert!(reap_resets_counter(Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn crash_loop_escalates_backoff_when_uptime_short() {
+        // Simulates the F1 field bug: a worker that spawns then dies
+        // in ~400 ms every iteration. The reap path passes the LIVE
+        // counter (uptime < 30 s) so `decide_exit_reaction` climbs the
+        // ladder — 2→4→8→16→32→60 s — instead of being pinned at 2 s.
+        let mut consecutive_failures: u32 = 0;
+        let short_uptime = Duration::from_millis(400);
+        let mut backoffs = Vec::new();
+        for _ in 0..6 {
+            let prior = if reap_resets_counter(short_uptime) {
+                0
+            } else {
+                consecutive_failures
+            };
+            let (reaction, next) = decide_exit_reaction(1, prior);
+            consecutive_failures = next;
+            if let ExitReaction::Backoff(d) = reaction {
+                backoffs.push(d.as_secs());
+            }
+        }
+        assert_eq!(backoffs, vec![2, 4, 8, 16, 32, 60]);
+        assert_eq!(consecutive_failures, 6);
+    }
+
+    #[test]
+    fn healthy_run_then_crash_starts_fresh_ladder() {
+        // A worker that ran well past the threshold then exited
+        // non-zero is an ISOLATED failure, not a loop — the reap path
+        // passes prior=0 so the next backoff is the 2 s floor, not an
+        // inherited escalated value.
+        let consecutive_failures: u32 = 5; // a prior loop had escalated
+        let long_uptime = Duration::from_secs(600);
+        let prior = if reap_resets_counter(long_uptime) {
+            0
+        } else {
+            consecutive_failures
+        };
+        let (reaction, next) = decide_exit_reaction(1, prior);
+        assert_eq!(next, 1, "healthy-then-crash restarts the ladder at 1");
+        assert!(matches!(reaction, ExitReaction::Backoff(d) if d == Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn clean_exit_resets_regardless_of_uptime() {
+        // code 0 always resets via decide_exit_reaction's own arm —
+        // the uptime gate never suppresses a clean-exit reset.
+        for uptime in [Duration::from_millis(50), Duration::from_secs(999)] {
+            let prior = if reap_resets_counter(uptime) { 0 } else { 9 };
+            let (reaction, next) = decide_exit_reaction(0, prior);
+            assert_eq!(next, 0);
+            assert!(matches!(reaction, ExitReaction::Respawn));
+        }
     }
 }

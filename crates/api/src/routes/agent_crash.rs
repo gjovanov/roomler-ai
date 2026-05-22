@@ -193,6 +193,7 @@ mod tests {
             os: "linux".to_string(),
             hostname: "test-host".to_string(),
             pid: 42,
+            suppressed_since_last: 0,
         }
     }
 
