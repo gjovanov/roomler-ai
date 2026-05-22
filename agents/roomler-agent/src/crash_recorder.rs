@@ -487,6 +487,7 @@ pub fn scrub_credentials(input: &str) -> (String, usize) {
     s = scrub_jwt_shape(&s, &mut count);
     s = scrub_mongodb_uri(&s, &mut count);
     s = scrub_password_param(&s, &mut count);
+    s = scrub_token_param(&s, &mut count);
     s = scrub_ice_credentials(&s, &mut count);
     (s, count)
 }
@@ -630,6 +631,66 @@ fn scrub_password_param(input: &str, count: &mut usize) -> String {
         } else {
             out.push_str(&input[cursor..=start]);
             cursor = start + 1;
+        }
+    }
+    out.push_str(&input[cursor..]);
+    out
+}
+
+/// rc.52: redact `…token = "value"` / `…token=value` assignments —
+/// TOML config lines (`agent_token = "eyJ…"`) and query-string
+/// params (`token=eyJ…`). The agent's `config.toml` stores the
+/// long-lived Agent JWT this way; a crash sidecar that logs config
+/// contents would otherwise leak it into the (world-readable until
+/// rc.52's dir-ACL) `%PROGRAMDATA%\roomler\…\crashes\` tree.
+/// `scrub_jwt_shape` misses this case because the surrounding quotes
+/// break its whitespace-delimited-word boundary detection.
+///
+/// Matches the literal lowercase substring `token` (covers
+/// `agent_token`, `enrollment_token`, bare `token`), then an optional
+/// run of spaces, a `=`, optional spaces, an optional opening `"`,
+/// and redacts the value up to the next `"`, `&`, or whitespace. The
+/// closing quote (if any) is preserved.
+fn scrub_token_param(input: &str, count: &mut usize) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut cursor = 0;
+    let bytes = input.as_bytes();
+    while let Some(rel) = input[cursor..].find("token") {
+        let kw_end = cursor + rel + "token".len();
+        let mut i = kw_end;
+        while i < bytes.len() && bytes[i] == b' ' {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b'=' {
+            // `token` not followed by an `=` assignment — emit through
+            // the keyword and keep scanning.
+            out.push_str(&input[cursor..kw_end]);
+            cursor = kw_end;
+            continue;
+        }
+        i += 1; // skip '='
+        while i < bytes.len() && bytes[i] == b' ' {
+            i += 1;
+        }
+        if i < bytes.len() && bytes[i] == b'"' {
+            i += 1; // skip opening quote — the value, not the quote, is secret
+        }
+        let value_start = i;
+        while i < bytes.len()
+            && bytes[i] != b'&'
+            && bytes[i] != b'"'
+            && !bytes[i].is_ascii_whitespace()
+        {
+            i += 1;
+        }
+        if i > value_start {
+            out.push_str(&input[cursor..value_start]);
+            out.push_str("[REDACTED]");
+            *count += 1;
+            cursor = i; // closing quote / delimiter emitted next iteration
+        } else {
+            out.push_str(&input[cursor..kw_end]);
+            cursor = kw_end;
         }
     }
     out.push_str(&input[cursor..]);
@@ -809,6 +870,38 @@ mod tests {
         // short / not base64url. Must NOT redact.
         let (out, n) = scrub_credentials("path /foo.bar.baz suffix");
         assert_eq!(out, "path /foo.bar.baz suffix");
+        assert_eq!(n, 0);
+    }
+
+    // ─── scrub: token= assignment (rc.52) ──────────────────────────────────
+
+    #[test]
+    fn scrub_redacts_toml_quoted_agent_token() {
+        // The exact config.toml shape that scrub_jwt_shape misses:
+        // the quotes break its whitespace-word boundary.
+        let line = r#"agent_token = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.sigpart""#;
+        let (out, n) = scrub_credentials(line);
+        assert!(out.contains("[REDACTED]"), "got: {out}");
+        assert!(!out.contains("eyJhbGci"), "token leaked: {out}");
+        assert!(n >= 1);
+        // The closing quote is structural, not secret — preserved.
+        assert!(out.trim_end().ends_with('"'));
+    }
+
+    #[test]
+    fn scrub_redacts_query_string_token() {
+        let (out, n) = scrub_credentials("ws connect token=abc123def&role=agent failed");
+        assert!(out.contains("token=[REDACTED]"), "got: {out}");
+        assert!(!out.contains("abc123def"));
+        assert!(out.contains("&role=agent")); // delimiter + rest preserved
+        assert!(n >= 1);
+    }
+
+    #[test]
+    fn scrub_token_param_ignores_token_without_assignment() {
+        // The word "token" in prose must not trip the scrub.
+        let (out, n) = scrub_credentials("the enrollment token expired yesterday");
+        assert_eq!(out, "the enrollment token expired yesterday");
         assert_eq!(n, 0);
     }
 
