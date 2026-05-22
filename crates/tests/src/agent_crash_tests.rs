@@ -57,6 +57,7 @@ fn fresh_payload() -> AgentCrashPayload {
         os: "linux".to_string(),
         hostname: "ci-host".to_string(),
         pid: 42,
+        suppressed_since_last: 0,
     }
 }
 

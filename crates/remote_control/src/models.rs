@@ -523,6 +523,16 @@ pub struct AgentCrashPayload {
     /// OS process id of the crashed worker (or supervisor, for the
     /// supervisor-detected branch).
     pub pid: u32,
+    /// rc.51: how many crash sidecars were rate-limit-suppressed
+    /// (`crash_recorder` 1/60 s throttle) between the previous
+    /// successfully-written sidecar and this one. `0` in steady
+    /// state; a high value means a tight crash-loop was in progress
+    /// and most of its iterations went unrecorded — so this one
+    /// sidecar represents `1 + suppressed_since_last` crashes.
+    /// `#[serde(default)]` so pre-rc.51 sidecars (which lack the
+    /// field) still deserialise.
+    #[serde(default)]
+    pub suppressed_since_last: u32,
 }
 
 /// Server-side persisted form of an agent crash report. The MongoDB
