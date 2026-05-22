@@ -343,6 +343,34 @@ pub fn default_config_path() -> Result<PathBuf> {
     Ok(dirs.config_dir().join("config.toml"))
 }
 
+/// rc.52: machine-global config path —
+/// `%PROGRAMDATA%\roomler\roomler-agent\config.toml`.
+///
+/// `default_config_path()` resolves to a per-USER profile
+/// (`%APPDATA%` via `ProjectDirs`). A SystemContext worker runs as
+/// LocalSystem and, crucially, must be able to load its config
+/// BEFORE any interactive user logs in (the whole point of M3 A1
+/// pre-logon control). A user-profile path is unreachable pre-logon;
+/// `%PROGRAMDATA%` is machine-global and LocalSystem-readable with no
+/// logged-in user. The perMachine + SystemContext installer writes
+/// the enrolled config here; the worker's resolution ladder consults
+/// it ahead of the (never-populated) SYSTEM-profile default.
+///
+/// Windows-only — there is no machine-global config concept on
+/// Linux/macOS (the agent there is perUser). Returns `None` if
+/// `%PROGRAMDATA%` can't be resolved (it always can on a sane
+/// Windows install; the `C:\ProgramData` literal is the documented
+/// fallback used elsewhere in the crate).
+#[cfg(target_os = "windows")]
+pub fn machine_global_config_path() -> PathBuf {
+    let base = std::env::var_os("PROGRAMDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+    base.join("roomler")
+        .join("roomler-agent")
+        .join("config.toml")
+}
+
 pub fn load(path: &PathBuf) -> Result<AgentConfig> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading config at {}", path.display()))?;
@@ -393,6 +421,20 @@ mod tests {
             derive_ws_url("https://roomler.live"),
             "wss://roomler.live/ws"
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn machine_global_config_path_under_programdata_roomler() {
+        let p = machine_global_config_path();
+        let s = p.to_string_lossy().to_lowercase();
+        assert!(s.contains("roomler"), "path missing roomler: {s}");
+        assert!(
+            s.ends_with(r"roomler\roomler-agent\config.toml"),
+            "unexpected tail: {s}"
+        );
+        // Distinct from the perUser default (which is under %APPDATA%).
+        assert_ne!(p, default_config_path().unwrap());
     }
 
     #[test]

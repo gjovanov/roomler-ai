@@ -338,8 +338,37 @@ async fn run_install_inner(
     // --- Step 7: enroll --------------------------------------------------
     check_cancel()?;
     emit(on_event, ProgressEvent::EnrollStarted);
-    let config_path = roomler_agent::config::default_config_path()
-        .map_err(|e| format!("resolve config path: {e}"))?;
+    // rc.52: the SystemContext flavour writes its config to the
+    // machine-global %PROGRAMDATA% path so the LocalSystem worker can
+    // load it pre-logon. plain perMachine + perUser keep the per-user
+    // %APPDATA% default. machine_id is derived from whichever path the
+    // config is written to, so it stays internally consistent.
+    let config_path = if is_system_context {
+        roomler_agent::config::machine_global_config_path()
+    } else {
+        roomler_agent::config::default_config_path()
+            .map_err(|e| format!("resolve config path: {e}"))?
+    };
+    // rc.52: for the SystemContext flavour, lock down
+    // %PROGRAMDATA%\roomler\ with an inheritable SYSTEM+Administrators
+    // DACL BEFORE the config (carrying the Agent JWT) is written —
+    // %PROGRAMDATA% is world-readable by default. The orchestrator
+    // runs inside the wizard's already-elevated context so `icacls`
+    // has the rights. Best-effort: a failure is logged + surfaced but
+    // doesn't abort the install (the config still lands; the operator
+    // can re-tighten). See harden_machine_global_dir.
+    if is_system_context && let Err(e) = harden_machine_global_dir(&config_path) {
+        emit(
+            on_event,
+            ProgressEvent::PreflightWarning {
+                message: format!(
+                    "could not restrict permissions on the machine-global \
+                     config directory ({e}); the Agent token file may be \
+                     readable by non-admin users until corrected"
+                ),
+            },
+        );
+    }
     let machine_id = roomler_agent::machine::derive_machine_id(&config_path);
     let inputs = roomler_agent::enrollment::EnrollInputs {
         server_url: &server,
@@ -398,6 +427,57 @@ pub fn force_kill_msi() -> Result<(), String> {
 }
 
 // ─── helpers ────────────────────────────────────────────────────────────────
+
+/// rc.52: apply a restrictive, inheritable DACL to the machine-global
+/// config directory so the Agent-JWT-bearing `config.toml` (and the
+/// crash sidecars under `crashes\`) are readable only by SYSTEM +
+/// Administrators. `%PROGRAMDATA%` is world-readable by default — a
+/// non-admin local user could otherwise read the long-lived agent
+/// token and impersonate the host to the Roomler server.
+///
+/// `config_path` is `…\roomler\roomler-agent\config.toml`; we harden
+/// its grandparent `…\roomler\` so `roomler-agent\`, `crashes\`, and
+/// every future child inherit the ACL — the directory-inheritance
+/// pattern (one `icacls` at install time) rather than a per-file ACL
+/// that has a create→ACL TOCTOU and gets re-widened by every later
+/// plain `config::save`. The directory is created first (icacls
+/// needs an existing target).
+///
+/// Well-known SIDs are used instead of the names `SYSTEM` /
+/// `Administrators` because those are localised on non-English
+/// Windows (`Administratoren`, etc.) and a name-based grant would
+/// fail there. `*S-1-5-18` = LocalSystem, `*S-1-5-32-544` =
+/// Administrators.
+fn harden_machine_global_dir(config_path: &std::path::Path) -> Result<(), String> {
+    let roomler_dir = config_path
+        .parent() // …\roomler\roomler-agent
+        .and_then(|p| p.parent()) // …\roomler
+        .ok_or_else(|| {
+            format!(
+                "machine-global config path {} has no grandparent dir to harden",
+                config_path.display()
+            )
+        })?;
+    std::fs::create_dir_all(roomler_dir)
+        .map_err(|e| format!("create {}: {e}", roomler_dir.display()))?;
+    let output = std::process::Command::new("icacls")
+        .arg(roomler_dir)
+        .arg("/inheritance:r")
+        .arg("/grant:r")
+        .arg("*S-1-5-18:(OI)(CI)F")
+        .arg("/grant:r")
+        .arg("*S-1-5-32-544:(OI)(CI)F")
+        .output()
+        .map_err(|e| format!("spawn icacls: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "icacls exited {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
 
 /// Projection of [`roomler_agent::win_service::system_context_attempt::Attempt`]
 /// into the shape `ProgressEvent::SystemContextError` consumes. Kept

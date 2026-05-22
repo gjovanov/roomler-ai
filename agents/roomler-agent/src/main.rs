@@ -23,7 +23,7 @@ use roomler_agent::{
     config, crash_uploader, encode, enrollment, instance_lock, logging, machine, notify,
     post_install, preflight, service, signaling, updater, watchdog,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 #[derive(Debug, Parser)]
@@ -51,6 +51,18 @@ enum Command {
         /// Friendly name shown in the admin agents list.
         #[arg(long)]
         name: String,
+        /// rc.52: write the enrolled config to the machine-global
+        /// path (`%PROGRAMDATA%\roomler\roomler-agent\config.toml`)
+        /// instead of the per-user `%APPDATA%` default. Required for
+        /// perMachine + SystemContext hosts so the LocalSystem worker
+        /// can load its config pre-logon. Windows-only; requires an
+        /// elevated (Administrator) terminal — a non-elevated enroll
+        /// cannot write `%PROGRAMDATA%` and will fail loudly rather
+        /// than silently falling back to a path the SC worker can't
+        /// read. The installer wizard's `permachine-system-context`
+        /// flavour passes this automatically.
+        #[arg(long)]
+        machine_global: bool,
     },
     /// Refresh this machine's agent token using a fresh enrollment JWT.
     /// Preserves `server_url` and `machine_name` from the existing
@@ -332,6 +344,161 @@ enum ServiceAction {
     },
 }
 
+/// rc.52: pure config-path precedence ladder. `exists` is injected so
+/// the resolution is unit-testable without touching the filesystem.
+///
+/// Precedence:
+///   1. explicit `--config <path>` — operator override, used verbatim
+///      (no existence check; the operator named it deliberately).
+///   2. machine-global `%PROGRAMDATA%` config — **SystemContext
+///      workers only**, when the file exists. This is the canonical
+///      pre-logon-readable SC config source (a LocalSystem worker
+///      cannot reach a user-profile path before anyone logs in).
+///   3. the platform default (`%APPDATA%` perUser) when it exists.
+///   4. the active-user fallback — **SystemContext workers only**,
+///      when it exists (post-logon: a perUser config the SC worker
+///      reaches via `WTSQueryUserToken`).
+///   5. nothing exists → the platform default, so `config::load`
+///      fails with an honest "not found" naming that path.
+///
+/// For a non-SystemContext worker the ladder collapses to
+/// `explicit > default` — unchanged pre-rc.52 behaviour.
+fn pick_config_path(
+    explicit: Option<PathBuf>,
+    is_system_context: bool,
+    machine_global: Option<&std::path::Path>,
+    default: &std::path::Path,
+    active_user: Option<&std::path::Path>,
+    exists: impl Fn(&std::path::Path) -> bool,
+) -> PathBuf {
+    if let Some(p) = explicit {
+        return p;
+    }
+    if is_system_context
+        && let Some(mg) = machine_global
+        && exists(mg)
+    {
+        return mg.to_path_buf();
+    }
+    if exists(default) {
+        return default.to_path_buf();
+    }
+    if is_system_context
+        && let Some(au) = active_user
+        && exists(au)
+    {
+        return au.to_path_buf();
+    }
+    default.to_path_buf()
+}
+
+/// rc.52: resolve the config path by wiring [`pick_config_path`] to
+/// the real environment — the worker-role probe, the candidate paths,
+/// and `Path::exists`. Logs the chosen path so a "wrong config" or
+/// "config not found" investigation lands on a clear line.
+fn resolve_config_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
+    let default = config::default_config_path().context("resolving default config path")?;
+
+    #[cfg(all(feature = "system-context", target_os = "windows"))]
+    {
+        use roomler_agent::system_context::{user_profile, worker_role};
+        let is_sc = matches!(
+            worker_role::probe_self(),
+            Ok(worker_role::WorkerRole::SystemContext)
+        );
+        let machine_global = config::machine_global_config_path();
+        let active_user = user_profile::active_user_config_path();
+        let chosen = pick_config_path(
+            explicit,
+            is_sc,
+            Some(machine_global.as_path()),
+            &default,
+            active_user.as_deref(),
+            |p| p.exists(),
+        );
+        tracing::info!(
+            config_path = %chosen.display(),
+            is_system_context = is_sc,
+            machine_global = %machine_global.display(),
+            "config: resolved load path"
+        );
+        Ok(chosen)
+    }
+    #[cfg(not(all(feature = "system-context", target_os = "windows")))]
+    {
+        // No SystemContext + no machine-global config concept on this
+        // build — the ladder collapses to `explicit > default`.
+        Ok(pick_config_path(
+            explicit,
+            false,
+            None,
+            &default,
+            None,
+            |p| p.exists(),
+        ))
+    }
+}
+
+/// rc.52 Phase 4: should a healthy-run SystemContext worker copy its
+/// config to the machine-global `%PROGRAMDATA%` location? Pure +
+/// cross-platform-testable. True only when all three hold: this is a
+/// SystemContext worker; the config was loaded from somewhere OTHER
+/// than the machine-global path (a perUser `%APPDATA%` / active-user
+/// fallback); and the machine-global path does not already hold a
+/// config. That is exactly an rc.50-or-earlier SystemContext install
+/// pre-dating the machine-global path — promoting it makes the next
+/// boot pre-logon-controllable with zero operator action.
+///
+/// Only the `system-context` + Windows build calls this in non-test
+/// code (via [`self_heal_machine_global_config`]); on other builds it
+/// is exercised solely by the unit tests, so suppress the dead-code
+/// lint there rather than cfg-gating the pure logic out of reach.
+#[cfg_attr(
+    not(all(feature = "system-context", target_os = "windows")),
+    allow(dead_code)
+)]
+fn should_self_heal_config(
+    is_system_context: bool,
+    loaded_path: &std::path::Path,
+    machine_global: &std::path::Path,
+    machine_global_exists: bool,
+) -> bool {
+    is_system_context && loaded_path != machine_global && !machine_global_exists
+}
+
+/// rc.52 Phase 4: promote a perUser-loaded SystemContext config to the
+/// machine-global `%PROGRAMDATA%` path after a healthy run. No-op on
+/// non-Windows, non-SystemContext, or when the machine-global config
+/// already exists. The worker runs as LocalSystem here so it has the
+/// rights to write `%PROGRAMDATA%`.
+#[cfg(all(feature = "system-context", target_os = "windows"))]
+fn self_heal_machine_global_config(loaded_path: &std::path::Path, cfg: &config::AgentConfig) {
+    use roomler_agent::system_context::worker_role;
+    let is_sc = matches!(
+        worker_role::probe_self(),
+        Ok(worker_role::WorkerRole::SystemContext)
+    );
+    let mg = config::machine_global_config_path();
+    if !should_self_heal_config(is_sc, loaded_path, &mg, mg.exists()) {
+        return;
+    }
+    match config::save(&mg, cfg) {
+        Ok(()) => tracing::info!(
+            from = %loaded_path.display(),
+            to = %mg.display(),
+            "config: self-healed perUser config to machine-global path \
+             (machine_id preserved; next boot is pre-logon-controllable)"
+        ),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "config: machine-global self-heal copy failed (will retry next healthy run)"
+        ),
+    }
+}
+
+#[cfg(not(all(feature = "system-context", target_os = "windows")))]
+fn self_heal_machine_global_config(_loaded_path: &std::path::Path, _cfg: &config::AgentConfig) {}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Set per-monitor-V2 DPI awareness as the very first thing on
@@ -374,63 +541,7 @@ async fn main() -> Result<()> {
     }
 
     let cli = Cli::parse();
-    let config_path = match cli.config.clone() {
-        Some(p) => p,
-        None => {
-            let default = config::default_config_path().context("resolving default config path")?;
-            // M3 A1 SystemContext fallback: when the worker is spawned
-            // by the SCM service via winlogon-token, it runs as
-            // LocalSystem (S-1-5-18) and `default` resolves to
-            // `C:\Windows\System32\config\systemprofile\AppData\
-            // Roaming\roomler\...` — NOT the user's profile where the
-            // enrollment config actually lives. Field repro PC50045
-            // 2026-05-06: every SystemContext spawn exited with
-            // code=1 within 500 ms because config::load failed before
-            // logging::init() could surface the real error. Fall back
-            // to the active session user's profile when (a) we're a
-            // SystemContext worker per worker_role probe AND (b) the
-            // SYSTEM-profile config doesn't exist.
-            #[cfg(all(feature = "system-context", target_os = "windows"))]
-            {
-                use roomler_agent::system_context::{user_profile, worker_role};
-                if !default.exists()
-                    && matches!(
-                        worker_role::probe_self(),
-                        Ok(worker_role::WorkerRole::SystemContext)
-                    )
-                {
-                    if let Some(user_path) = user_profile::active_user_config_path() {
-                        if user_path.exists() {
-                            tracing::info!(
-                                fallback_path = %user_path.display(),
-                                default_path = %default.display(),
-                                "config: SystemContext worker — using active-user config (default path is SYSTEM profile)"
-                            );
-                            user_path
-                        } else {
-                            tracing::warn!(
-                                attempted = %user_path.display(),
-                                default_path = %default.display(),
-                                "config: SystemContext fallback path also missing; will try default and likely fail"
-                            );
-                            default
-                        }
-                    } else {
-                        tracing::warn!(
-                            "config: SystemContext worker but couldn't resolve active-user profile; falling back to default"
-                        );
-                        default
-                    }
-                } else {
-                    default
-                }
-            }
-            #[cfg(not(all(feature = "system-context", target_os = "windows")))]
-            {
-                default
-            }
-        }
-    };
+    let config_path = resolve_config_path(cli.config.clone())?;
 
     let cmd = cli.command.unwrap_or(Command::Run { encoder: None });
     // Only the worker subcommand (`Run`) is the one the SCM supervisor
@@ -450,7 +561,8 @@ async fn main() -> Result<()> {
             server,
             token,
             name,
-        } => enroll_cmd(&config_path, &server, &token, &name).await,
+            machine_global,
+        } => enroll_cmd(&config_path, &server, &token, &name, machine_global).await,
         Command::ReEnroll { token } => re_enroll_cmd(&config_path, &token).await,
         Command::Run { encoder } => run_cmd(&config_path, encoder.as_deref()).await,
         Command::EncoderSmoke { encoder, codec } => encoder_smoke_cmd(&encoder, &codec).await,
@@ -678,13 +790,35 @@ fn resolve_encoder_preference(
 }
 
 async fn enroll_cmd(
-    config_path: &PathBuf,
+    config_path: &Path,
     server: &str,
     enrollment_token: &str,
     machine_name: &str,
+    machine_global: bool,
 ) -> Result<()> {
-    let machine_id = machine::derive_machine_id(config_path);
-    tracing::info!(%machine_id, "derived machine fingerprint");
+    // rc.52: --machine-global retargets the write to
+    // %PROGRAMDATA%\roomler\roomler-agent\config.toml so a perMachine
+    // + SystemContext host's LocalSystem worker can load it pre-logon.
+    // machine_id is derived from the SAME path the config is written
+    // to, so it stays internally consistent for this fresh enrollment.
+    let target_path: PathBuf = if machine_global {
+        #[cfg(target_os = "windows")]
+        {
+            config::machine_global_config_path()
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            bail!(
+                "--machine-global is Windows-only (there is no machine-global \
+                 config location on this platform)"
+            );
+        }
+    } else {
+        config_path.to_path_buf()
+    };
+
+    let machine_id = machine::derive_machine_id(&target_path);
+    tracing::info!(%machine_id, machine_global, "derived machine fingerprint");
 
     let cfg = enrollment::enroll(enrollment::EnrollInputs {
         server_url: server,
@@ -695,13 +829,32 @@ async fn enroll_cmd(
     .await
     .context("enrollment failed")?;
 
-    config::save(config_path, &cfg).context("saving config")?;
+    // rc.52: a machine-global write needs admin (%PROGRAMDATA% +, on
+    // the installer path, an ACL-restricted parent dir). On a
+    // non-elevated shell `config::save` fails with ACCESS_DENIED —
+    // surface an actionable error rather than letting the operator
+    // think they enrolled. We must NOT fall back to %APPDATA%: a
+    // SystemContext worker would never find the config there and
+    // would crash-loop pre-logon (rc.51 Finding 3).
+    config::save(&target_path, &cfg).map_err(|e| {
+        if machine_global {
+            anyhow::anyhow!(
+                "{e}\n\nWriting the machine-global config requires an elevated \
+                 (Administrator) terminal. Re-run this command from an elevated \
+                 prompt — do not retry without --machine-global, that would write \
+                 a config the SystemContext service cannot read."
+            )
+        } else {
+            anyhow::anyhow!(e).context("saving config")
+        }
+    })?;
     tracing::info!(
-        path = %config_path.display(),
+        path = %target_path.display(),
         agent_id = %cfg.agent_id,
         "enrollment complete"
     );
     println!("Enrollment successful. Agent id: {}", cfg.agent_id);
+    println!("Config written to: {}", target_path.display());
     println!("Run `roomler-agent run` to connect.");
     Ok(())
 }
@@ -714,12 +867,22 @@ async fn re_enroll_cmd(config_path: &PathBuf, enrollment_token: &str) -> Result<
         );
     }
     let existing = config::load(config_path).context("loading existing config")?;
-    let machine_id = machine::derive_machine_id(config_path);
+    // rc.52 BLOCKER-6: preserve the EXISTING machine_id verbatim — do
+    // NOT re-derive from `config_path`. `derive_machine_id` hashes the
+    // config path; after rc.52 a SystemContext host's config lives at
+    // %PROGRAMDATA% while its original enrollment used %APPDATA%, so
+    // re-deriving would mint a DIFFERENT machine_id, orphan the
+    // server's `agents` row, and break the `(tenant_id, machine_id)`
+    // unique key. The id the host enrolled with is stored in the
+    // config — reuse it. (Fresh `enroll` correctly derives from its
+    // own write path; only `re-enroll` of an unchanged host must
+    // pin the id.)
+    let machine_id = existing.machine_id.clone();
     tracing::info!(
         %machine_id,
         agent_id = %existing.agent_id,
         machine_name = %existing.machine_name,
-        "re-enrolling against existing config"
+        "re-enrolling against existing config (machine_id preserved)"
     );
 
     let new_cfg = enrollment::enroll(enrollment::EnrollInputs {
@@ -1030,6 +1193,15 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
                                     "clean-run threshold reached; promoted to last-known-good"
                                 );
                             }
+                            // rc.52 Phase 4: this run proved healthy.
+                            // If we're a SystemContext worker that
+                            // loaded its config from a perUser path,
+                            // promote a copy to the machine-global
+                            // %PROGRAMDATA% location so the NEXT boot
+                            // can load it pre-logon. machine_id is the
+                            // stored config field — copying the loaded
+                            // struct preserves it verbatim.
+                            self_heal_machine_global_config(&path, &current);
                         }
                         Err(e) => tracing::warn!(error = %e, "could not reload config for clean-run promotion"),
                     }
@@ -1742,5 +1914,83 @@ mod tests {
         // Line 2: restart-service
         let cli = Cli::try_parse_from(["roomler-agent", "restart-service"]);
         assert!(cli.is_ok(), "rc.30 snippet line 2 must parse: {cli:?}");
+    }
+
+    // ─── rc.52: config-path resolution ladder ──────────────────────────────
+
+    #[test]
+    fn pick_config_path_explicit_wins_unconditionally() {
+        // --config is an operator override — used verbatim, no
+        // existence check, regardless of worker role.
+        let explicit = PathBuf::from(r"D:\custom\config.toml");
+        let got = pick_config_path(
+            Some(explicit.clone()),
+            true,
+            Some(Path::new(
+                r"C:\ProgramData\roomler\roomler-agent\config.toml",
+            )),
+            Path::new(r"C:\Users\u\AppData\config.toml"),
+            None,
+            |_| true, // everything "exists" — explicit still wins
+        );
+        assert_eq!(got, explicit);
+    }
+
+    #[test]
+    fn pick_config_path_system_context_prefers_machine_global() {
+        let mg = Path::new(r"C:\ProgramData\roomler\roomler-agent\config.toml");
+        let default = Path::new(r"C:\Windows\System32\config\systemprofile\config.toml");
+        let got = pick_config_path(None, true, Some(mg), default, None, |p| p == mg);
+        assert_eq!(got, mg);
+    }
+
+    #[test]
+    fn pick_config_path_non_system_context_ignores_machine_global() {
+        // A perUser / perMachine-non-SC worker never reads the
+        // machine-global path even if it exists.
+        let mg = Path::new(r"C:\ProgramData\roomler\roomler-agent\config.toml");
+        let default = Path::new(r"C:\Users\u\AppData\config.toml");
+        let got = pick_config_path(None, false, Some(mg), default, None, |p| {
+            p == mg || p == default
+        });
+        assert_eq!(got, default);
+    }
+
+    #[test]
+    fn pick_config_path_system_context_falls_to_active_user() {
+        // Machine-global absent, default (SYSTEM profile) absent —
+        // post-logon SC worker uses the active-user fallback.
+        let mg = Path::new(r"C:\ProgramData\roomler\roomler-agent\config.toml");
+        let default = Path::new(r"C:\Windows\System32\config\systemprofile\config.toml");
+        let active = Path::new(r"C:\Users\u\AppData\Roaming\roomler\config.toml");
+        let got = pick_config_path(None, true, Some(mg), default, Some(active), |p| p == active);
+        assert_eq!(got, active);
+    }
+
+    #[test]
+    fn pick_config_path_returns_default_when_nothing_exists() {
+        // Nothing on disk → default, so config::load fails with an
+        // honest "not found" naming that path.
+        let mg = Path::new(r"C:\ProgramData\roomler\roomler-agent\config.toml");
+        let default = Path::new(r"C:\Windows\System32\config\systemprofile\config.toml");
+        let got = pick_config_path(None, true, Some(mg), default, None, |_| false);
+        assert_eq!(got, default);
+    }
+
+    // ─── rc.52: self-heal predicate ────────────────────────────────────────
+
+    #[test]
+    fn should_self_heal_only_for_system_context_peruser_load_without_machine_global() {
+        let mg = Path::new(r"C:\ProgramData\roomler\roomler-agent\config.toml");
+        let peruser = Path::new(r"C:\Users\u\AppData\Roaming\roomler\config.toml");
+        // The one true case: SC worker, loaded from a perUser path,
+        // machine-global absent.
+        assert!(should_self_heal_config(true, peruser, mg, false));
+        // Not a SystemContext worker → never.
+        assert!(!should_self_heal_config(false, peruser, mg, false));
+        // Already loaded FROM the machine-global path → nothing to do.
+        assert!(!should_self_heal_config(true, mg, mg, false));
+        // Machine-global already exists → don't clobber it.
+        assert!(!should_self_heal_config(true, peruser, mg, true));
     }
 }
