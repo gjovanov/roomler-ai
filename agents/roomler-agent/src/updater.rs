@@ -780,6 +780,13 @@ pub fn msiexec_argv(installer: &std::path::Path, flavour: WindowsInstallFlavour)
 /// Properties are appended verbatim — no shell-quoting, no escaping.
 /// Callers must ensure `VALUE` contains no whitespace; msiexec's
 /// public-property grammar is space-separated `KEY=VALUE` tokens.
+///
+/// cfg-gated to match [`msiexec_argv`] (which it calls) — `msiexec_argv`
+/// is `cfg(any(windows, test))`, so an ungated wrapper fails the
+/// Linux/macOS release build with `E0425: cannot find function
+/// msiexec_argv`. The `test` arm keeps the unit tests below buildable
+/// on every CI runner.
+#[cfg(any(target_os = "windows", test))]
 pub fn msiexec_argv_with_properties(
     installer: &std::path::Path,
     flavour: WindowsInstallFlavour,
