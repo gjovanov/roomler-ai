@@ -61,7 +61,7 @@ webrtc-ice = { path = "crates/vendored/webrtc-ice" }
 webrtc = { path = "crates/vendored/webrtc" }
 
 [workspace.package]
-version = "0.3.0-rc.52"
+version = "0.3.0-rc.53"
 edition = "2024"
 authors = ["Goran Jovanov <goran.jovanov@gmail.com>"]
 license = "MIT"
@@ -165,7 +165,15 @@ hex = "0.4"
 
 # Agent-specific
 clap = { version = "4", features = ["derive"] }
-tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+# rc.53 Phase 5: native cert roots (Schannel on Windows, CryptoKit on macOS,
+# system trust on Linux) — matches the rc.32 vendored webrtc-ice swap so a
+# corporate TLS-inspection box's root CA (e.g. Symantec Enterprise Mobile
+# Root) trusts both the TURNS/TCP path AND the WS signaling path uniformly.
+# Zero behaviour change on plain-internet hosts (native roots include the
+# Mozilla bundle on every supported platform via the OS trust store).
+# Backlog (rc.54): unify the third TLS stack — reqwest still uses native-tls
+# (Schannel) via default-tls. Three TLS implementations in one binary today.
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-native-roots"] }
 directories = "6"
 toml = "0.9"
 webrtc = "0.12"

@@ -582,11 +582,20 @@ pub fn decide_exit_reaction(code: u32, consecutive_failures: u32) -> (ExitReacti
 /// Should the supervisor write a crash sidecar for this worker exit?
 /// Pure predicate so the call site logic is unit-testable. The
 /// supervisor records `SupervisorDetected` crashes for every non-
-/// zero exit code EXCEPT `STALL_EXIT_CODE` — the watchdog already
-/// recorded that case before forcing exit, and double-recording
-/// inflates fleet crash metrics (B2 from the Task 9 plan critique).
+/// zero exit code EXCEPT:
+///
+///   * `STALL_EXIT_CODE` — the watchdog already recorded that case
+///     before forcing exit; double-recording would inflate fleet
+///     crash metrics (B2 from the Task 9 plan critique).
+///   * `AGENT_DELETED_EXIT_CODE` (rc.53) — the agent's
+///     `handle_server_msg` `ServerMsg::Goodbye` arm already raised a
+///     `needs-attention.txt` sentinel; the supervisor's fleet-crash
+///     dashboard would treat code-7 exits as silent crashes and
+///     mask the operator-action signal.
 pub fn should_record_supervisor_crash(code: u32) -> bool {
-    code != 0 && code != crate::watchdog::STALL_EXIT_CODE as u32
+    code != 0
+        && code != crate::watchdog::STALL_EXIT_CODE as u32
+        && code != crate::watchdog::AGENT_DELETED_EXIT_CODE as u32
 }
 
 /// Compute the next backoff duration given how many consecutive
@@ -805,28 +814,54 @@ pub fn run(
                             );
                             respawn_at = Some(Instant::now() + backoff);
 
-                            // rc.51: crash-loop alarm. Once the worker
-                            // has failed RESPAWN_ALARM_THRESHOLD times
-                            // in a row (≈ where backoff saturates at
-                            // the 60 s cap), emit a throttled `error!`
-                            // so a stuck host surfaces in log
-                            // aggregation. The supervisor never gives
-                            // up — infinite respawn is intentional (a
-                            // logon or auto-update can still recover
-                            // the host); this is purely observability.
-                            if consecutive_failures >= RESPAWN_ALARM_THRESHOLD {
+                            // rc.51 + rc.53: crash-loop / operator-action alarm.
+                            //
+                            // Two alarm gates feed the same throttled `error!`:
+                            //
+                            //   * rc.53 fast-path: code == AGENT_DELETED_EXIT_CODE
+                            //     fires on the FIRST failure (not after 8) so the
+                            //     "server-side row deleted → re-enrol required"
+                            //     signal is visible in <1 minute. Without this
+                            //     fast-path the alarm waits ~4 min (8 × ~30 s avg
+                            //     backoff) while the operator is staring at the
+                            //     wedge wondering why the host won't connect.
+                            //
+                            //   * rc.51 generic crash-loop: consecutive_failures
+                            //     ≥ RESPAWN_ALARM_THRESHOLD (~ where backoff
+                            //     saturates at the 60 s cap). Any non-zero exit
+                            //     code; covers the boot-loop case where there is
+                            //     no Goodbye on the wire.
+                            //
+                            // The supervisor NEVER gives up — infinite respawn is
+                            // intentional (a re-enrol or auto-update can still
+                            // recover the host); these alarms are purely
+                            // observability. 60 s throttle keeps log aggregation
+                            // sane during a sustained loop.
+                            let is_agent_deleted_exit =
+                                code == crate::watchdog::AGENT_DELETED_EXIT_CODE as u32;
+                            let alarm_due = is_agent_deleted_exit
+                                || consecutive_failures >= RESPAWN_ALARM_THRESHOLD;
+                            if alarm_due {
                                 let now = Instant::now();
-                                let due = last_alarm_at.is_none_or(|t| {
+                                let throttle_passed = last_alarm_at.is_none_or(|t| {
                                     now.duration_since(t) >= Duration::from_secs(60)
                                 });
-                                if due {
+                                if throttle_passed {
                                     last_alarm_at = Some(now);
-                                    tracing::error!(
-                                        consecutive_failures,
-                                        last_exit_code = code,
-                                        "supervisor: worker has failed {} times in a row — host likely needs operator attention (still respawning)",
-                                        consecutive_failures
-                                    );
+                                    if is_agent_deleted_exit {
+                                        tracing::error!(
+                                            last_exit_code = code,
+                                            "supervisor: worker exited with AGENT_DELETED_EXIT_CODE — server-side row was deleted or policy-rejected; operator action required (re-enrol with fresh token). Supervisor will keep respawning; expect successive code-{} exits until re-enrollment.",
+                                            crate::watchdog::AGENT_DELETED_EXIT_CODE
+                                        );
+                                    } else {
+                                        tracing::error!(
+                                            consecutive_failures,
+                                            last_exit_code = code,
+                                            "supervisor: worker has failed {} times in a row — host likely needs operator attention (still respawning)",
+                                            consecutive_failures
+                                        );
+                                    }
                                 }
                             }
 
@@ -1345,6 +1380,28 @@ mod tests {
         assert!(should_record_supervisor_crash(134));
         assert!(should_record_supervisor_crash(1));
         assert!(should_record_supervisor_crash(255));
+    }
+
+    #[test]
+    fn should_record_supervisor_crash_excludes_agent_deleted_exit_code() {
+        // rc.53: the agent's `handle_server_msg` `ServerMsg::Goodbye`
+        // arm already raised a `needs-attention.txt` sentinel before
+        // `process::exit(AGENT_DELETED_EXIT_CODE)`; the supervisor
+        // recording a crash sidecar on top would inflate fleet-crash
+        // metrics and mask the operator-action signal. Mirror
+        // exclusion of STALL_EXIT_CODE.
+        assert!(!should_record_supervisor_crash(
+            crate::watchdog::AGENT_DELETED_EXIT_CODE as u32
+        ));
+        // Defence: the constant must NOT collide with the stall code,
+        // otherwise either arm could mask the other (constants set in
+        // watchdog.rs — locked here so a future renumbering trips the
+        // test before it ships).
+        assert_ne!(
+            crate::watchdog::AGENT_DELETED_EXIT_CODE,
+            crate::watchdog::STALL_EXIT_CODE,
+            "exit-code sentinels must be distinct"
+        );
     }
 
     #[test]
