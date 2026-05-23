@@ -1,6 +1,6 @@
 # Playwright e2e runner image. Built and pushed to
-# `registry.roomler.ai/roomler-ai-e2e:<git-sha>` from mars; consumed by
-# the Job in the `roomler-ai-e2e` namespace's e2e overlay.
+# `<internal-registry>/roomler-ai-e2e:<git-sha>` from the build host;
+# consumed by the Job in the `roomler-ai-e2e` namespace's e2e overlay.
 #
 # Base: Microsoft's Playwright image with Chromium + Firefox + WebKit
 # preinstalled. Same major version (1.58.x) as `ui/package.json` to

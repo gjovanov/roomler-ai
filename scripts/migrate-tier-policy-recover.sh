@@ -8,7 +8,8 @@
 # Idempotent — safe to re-run.
 
 set -uo pipefail
-LOG=/home/gjovanov/migration-recover.log
+LOG="${LOG:-$HOME/migration-recover.log}"
+BACKUP_DIR="${BACKUP_DIR:-$HOME/migration-backups}"
 exec > >(tee -a "$LOG") 2>&1
 echo
 echo "=================================================="
@@ -196,11 +197,13 @@ for _ in $(seq 1 60); do
 done
 
 # Restore mongo
-DUMP=/home/gjovanov/migration-backups/bauleiter-mongo.dump.gz
+DUMP="$BACKUP_DIR"/bauleiter-mongo.dump.gz
 if [ -f "$DUMP" ] && [ "$(stat -c%s "$DUMP")" -gt 100 ]; then
   echo "Restoring bauleiter mongo..."
   kubectl -n bauleiter exec -i mongodb-0 -- mongorestore \
-    --username=XplorifyAdmin --password='Xp12345!' --authenticationDatabase=admin \
+    --username="${MONGO_ADMIN_USER:?set MONGO_ADMIN_USER}" \
+    --password="${MONGO_ADMIN_PASS:?set MONGO_ADMIN_PASS}" \
+    --authenticationDatabase=admin \
     --gzip --archive --drop \
     < "$DUMP" 2>&1 | tail -10
   echo "bauleiter mongo: done"
@@ -247,7 +250,7 @@ for _ in $(seq 1 60); do
 done
 
 # Restore regal data + uploads
-TAR=/home/gjovanov/migration-backups/regal-data.tar.gz
+TAR="$BACKUP_DIR"/regal-data.tar.gz
 if [ -f "$TAR" ] && [ "$(stat -c%s "$TAR")" -gt 200 ]; then
   echo "Restoring regal data..."
   kubectl -n regal cp "$TAR" deploy/regalbg:/tmp/d.tar.gz 2>&1 | tail -5
@@ -255,7 +258,7 @@ if [ -f "$TAR" ] && [ "$(stat -c%s "$TAR")" -gt 200 ]; then
   kubectl -n regal exec deploy/regalbg -- rm -f /tmp/d.tar.gz
   echo "regal data: done"
 fi
-TAR=/home/gjovanov/migration-backups/regal-uploads.tar.gz
+TAR="$BACKUP_DIR"/regal-uploads.tar.gz
 if [ -f "$TAR" ] && [ "$(stat -c%s "$TAR")" -gt 200 ]; then
   echo "Restoring regal uploads (~40 MB)..."
   kubectl -n regal cp "$TAR" deploy/regalbg:/tmp/u.tar.gz 2>&1 | tail -5

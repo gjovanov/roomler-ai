@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**Roomler AI** is a real-time collaboration platform with chat, video conferencing, file sharing, room management, and a TeamViewer-style remote desktop subsystem. Stack: Rust (Axum) + MongoDB + Vue 3/Vuetify 3 + Pinia + Mediasoup (WebRTC SFU) + webrtc-rs (P2P remote-control). The remote-control subsystem ships as a separate native agent binary (`roomler-agent`) that runs on controlled hosts — see `docs/remote-control.md` and `HANDOVER2.md`.
+**Roomler AI** is a real-time collaboration platform with chat, video conferencing, file sharing, room management, and a TeamViewer-style remote desktop subsystem. Stack: Rust (Axum) + MongoDB + Vue 3/Vuetify 3 + Pinia + Mediasoup (WebRTC SFU) + webrtc-rs (P2P remote-control). The remote-control subsystem ships as a separate native agent binary (`roomler-agent`) that runs on controlled hosts — see `docs/remote-control.md`.
 
 ## Commands
 
@@ -189,48 +189,54 @@ MongoDB native driver (not Mongoose). Models live in `crates/db/src/models/` exc
 
 - `.env` — development (not committed, in .gitignore)
 - Config via `ROOMLER__` prefixed env vars (double underscore separator)
-- Docker: `docker-compose.yml` runs MongoDB 7 (auth: roomler/R00m1eR_5uper5ecretPa55word), Redis 7, MinIO, coturn
+- Docker: `docker-compose.yml` runs MongoDB 7 (auth credentials defined in `docker-compose.yml`; local dev only), Redis 7, MinIO, coturn
 - Default DB URL: `mongodb://localhost:27019` (tests use no auth)
 
 ## Deployment
 
 - **Production URL**: `https://roomler.ai/` — the live deployment. Use this as the `--server` argument when enrolling agents and as the origin the browser controller loads.
 - **Docker**: Multi-stage build (rust:1.88-bookworm -> oven/bun:1 -> debian:trixie-slim + nginx)
-- **Deploy repo**: `/home/gjovanov/roomler-ai-deploy/` on mars. Kustomize manifests live under `k8s/base/` + `k8s/overlays/prod/`. Ansible playbooks retained for host-level tasks only (HAProxy, WireGuard, iptables).
-- **GitOps**: ArgoCD at [argocd.roomler.ai](https://argocd.roomler.ai) reconciles the `roomler-ai` Application from `github.com/gjovanov/roomler-ai-deploy @ master` path `k8s/overlays/prod`. Sync policy is **Automated + selfHeal + prune** with a GitHub webhook on the deploy repo: `git push` to master rolls out within ~5 s. 60 s polling fallback via `argocd-cm.timeout.reconciliation: 60s`. The 8 Application CRDs (bauleiter / lgr / oxmux / purestat / regal / roomler-ai / roomler-old / tickytack) are gitops-managed at `github.com/gjovanov/argocd-apps`; an `argocd-apps` parent app-of-apps watches that repo and reconciles `apps/*.yaml`. Verify the live targetRevision with `argocd app get roomler-ai --grpc-web | grep -E "Target|Sync Status"`.
-- **Image registry**: `registry.roomler.ai` (self-hosted Docker Registry v2 on mars, basic auth, cert auto-renewed via acme.sh). Pull secret `regcred` lives in the `roomler-ai` namespace.
-- **K8s cluster**: 3 control-plane + 3 worker nodes (Ubuntu 22.04, containerd 1.7.29, v1.31.14). Three zones via `topology.kubernetes.io/zone`: `mars`, `zeus`, `jupiter` (one master + one worker VM per bare-metal host).
-- **Tier policy** (added 2026-05-01): cluster nodes are labelled `tier=high-performance` (zeus + jupiter workers) and `tier=utility` (mars worker). roomler-ai schedules on `tier=high-performance` only — never on mars worker. Enforced via a Kustomize patch in `roomler-ai-deploy/k8s/overlays/prod/kustomization.yaml` (commit `dab3cfa`) that adds a required `nodeAffinity` to every Deployment + StatefulSet. Hostname pin in `base/` (`kubernetes.io/hostname: k8s-worker-3`) is intentionally retained — the StatefulSet PVCs use node-local storage, so the data lives on jupiter; the tier requirement is an *additional* constraint, both must match. **mars worker hosts**: monitoring (kube-prometheus), `registry.roomler.ai`, image builds (direct on the host), `bauleiter`, `regal`. **High-perf hosts (zeus + jupiter)**: roomler (old), roomler-ai, oxmux, clawui (when migrated to K8s), lgr, purestat, tickytack.
-- **Pod placement**: roomler-ai's pods run on `k8s-worker-3` (10.10.30.11, jupiter). Namespace `roomler-ai`, deployment `roomler2` (note: name is `roomler2` not `roomler-ai`), Recreate strategy, hostNetwork, `imagePullPolicy: IfNotPresent`.
+- **Deploy repo**: `<deploy-repo>` on the build host. Kustomize manifests live under `k8s/base/` + `k8s/overlays/prod/`. Ansible playbooks retained for host-level tasks only (HAProxy, WireGuard, iptables).
+- **GitOps**: ArgoCD (at `<argocd-host>`) reconciles the `roomler-ai` Application from the deploy repo's `master` branch, path `k8s/overlays/prod`. Sync policy is **Automated + selfHeal + prune** with a GitHub webhook on the deploy repo: `git push` to master rolls out within ~5 s. 60 s polling fallback via `argocd-cm.timeout.reconciliation: 60s`. Sibling Application CRDs (bauleiter / lgr / oxmux / purestat / regal / roomler-ai / roomler-old / tickytack) are gitops-managed under a parent app-of-apps. Verify the live targetRevision with `argocd app get roomler-ai --grpc-web | grep -E "Target|Sync Status"`.
+- **Image registry**: `<internal-registry>` (self-hosted Docker Registry v2 on the build host, basic auth, cert auto-renewed via acme.sh). Pull secret `regcred` lives in the `roomler-ai` namespace.
+- **K8s cluster**: 3 control-plane + 3 worker nodes (Ubuntu 22.04, containerd 1.7.29, v1.31.14). Three zones via `topology.kubernetes.io/zone` (one master + one worker VM per bare-metal host).
+- **Tier policy** (added 2026-05-01): cluster nodes are labelled `tier=high-performance` (the two high-perf worker hosts) and `tier=utility` (the build/utility worker host). roomler-ai schedules on `tier=high-performance` only — never on the utility worker. Enforced via a Kustomize patch in `<deploy-repo>/k8s/overlays/prod/kustomization.yaml` (commit `dab3cfa`) that adds a required `nodeAffinity` to every Deployment + StatefulSet. Hostname pin in `base/` (`kubernetes.io/hostname: <storage-pinned-worker>`) is intentionally retained — the StatefulSet PVCs use node-local storage, so the data lives on that specific node; the tier requirement is an *additional* constraint, both must match. **Utility worker hosts**: monitoring (kube-prometheus), `<internal-registry>`, image builds (direct on the host), `bauleiter`, `regal`. **High-perf workers**: roomler (old), roomler-ai, oxmux, clawui (when migrated to K8s), lgr, purestat, tickytack.
+- **Pod placement**: roomler-ai's pods run on `<storage-pinned-worker>` (`<worker-node-ip>`). Namespace `roomler-ai`, deployment `roomler2` (note: name is `roomler2` not `roomler-ai`), Recreate strategy, hostNetwork, `imagePullPolicy: IfNotPresent`.
 - **Health probes**: startup/readiness/liveness all on `/health` (port 80 via nginx -> :3000 backend)
 - **nginx**: Pod-internal reverse proxy (`files/nginx-pod.conf`) — SPA fallback + API proxy + WS proxy
 - **Agent binary**: built separately (`cargo build -p roomler-agent --release --features full`) and distributed to controlled hosts via GitHub Releases (MSI / .pkg / .deb auto-built by `.github/workflows/release-agent.yml` on `agent-v*` tag push). Not part of the API Docker image.
 
 ### K8s deploy pipeline (ArgoCD GitOps)
 
-Mars builds the image, pushes to `registry.roomler.ai/roomler-ai:<tag>`, bumps the tag in the gitops repo, and ArgoCD reconciles the Deployment.
+The build host builds the image, pushes to `<internal-registry>/roomler-ai:<tag>`, bumps the tag in the gitops repo, and ArgoCD reconciles the Deployment. Fill in the env vars at the top once per shell session:
 
 ```bash
-ssh mars
-cd /home/gjovanov/roomler-ai && git pull
-docker build -t registry.roomler.ai/roomler-ai:build-$$ .           # ~5–15 min (cache warm)
-TAG="v$(date +%Y%m%d)-$(docker images -q registry.roomler.ai/roomler-ai:build-$$ | head -c 12)"
-docker tag registry.roomler.ai/roomler-ai:build-$$ registry.roomler.ai/roomler-ai:$TAG
-docker tag registry.roomler.ai/roomler-ai:build-$$ registry.roomler.ai/roomler-ai:latest
-docker push registry.roomler.ai/roomler-ai:$TAG
-docker push registry.roomler.ai/roomler-ai:latest
+# Operator-filled (set once per shell):
+: "${BUILD_HOST:=ssh-target}"            # e.g. your build host alias
+: "${REGISTRY:=registry.example.com}"    # your <internal-registry>
+: "${REPO:=$HOME/roomler-ai}"            # local clone of this repo on the build host
+: "${DEPLOY_REPO:=$HOME/roomler-ai-deploy}"
 
-cd /home/gjovanov/roomler-ai-deploy
+ssh "$BUILD_HOST"
+cd "$REPO" && git pull
+docker build -t "$REGISTRY/roomler-ai:build-$$" .                   # ~5–15 min (cache warm)
+TAG="v$(date +%Y%m%d)-$(docker images -q "$REGISTRY/roomler-ai:build-$$" | head -c 12)"
+docker tag "$REGISTRY/roomler-ai:build-$$" "$REGISTRY/roomler-ai:$TAG"
+docker tag "$REGISTRY/roomler-ai:build-$$" "$REGISTRY/roomler-ai:latest"
+docker push "$REGISTRY/roomler-ai:$TAG"
+docker push "$REGISTRY/roomler-ai:latest"
+
+cd "$DEPLOY_REPO"
 git checkout master && git pull
 sed -i "s|newTag:.*|newTag: $TAG|" k8s/overlays/prod/kustomization.yaml
 git commit -am "chore(k8s): bump roomler-ai to $TAG"
 git push
 
-argocd app sync roomler-ai --grpc-web     # or Sync via argocd.roomler.ai UI
+argocd app sync roomler-ai --grpc-web     # or Sync via the ArgoCD UI
 curl -sI https://roomler.ai/health        # HTTP/2 200
 ```
 
-Registry retention: `/home/gjovanov/.local/bin/registry-retention.sh 1` (weekly cron at Sun 04:00) keeps at most 2 tags per repo (latest + most-recent-versioned) and GC's the registry storage.
+Registry retention: `registry-retention.sh 1` (weekly cron at Sun 04:00) keeps at most 2 tags per repo (latest + most-recent-versioned) and GC's the registry storage.
 
 ## Post-Implementation Testing
 
@@ -263,7 +269,7 @@ TeamViewer-style remote desktop. One native agent per controlled host, Roomler A
 
 **Design + architecture**: `docs/remote-control.md` (16 sections covering goals, topology, protocol, data model, security, latency budget).
 
-**Resumption note after a session break**: `HANDOVER22.md` is the most recent — captures the rc.28 install-wizard ship state and the W10 manual-smoke checklist. Earlier HANDOVERs (`HANDOVER2.md` → `HANDOVER21.md`) trace the historical arc.
+**Resumption note after a session break**: see `git log` and `docs/remote-control.md` — per-release handover files were retired 2026-05-23 as part of a privacy/security cleanup.
 
 **Wire protocol**: `rc:*` JSON messages over the existing `/ws` endpoint. `ClientMsg` / `ServerMsg` in `crates/remote_control/src/signaling.rs`. ObjectIds are raw hex strings (locked by tests); `Permissions` serialises as pipe-separated names (bitflags 2.x convention, also locked).
 
@@ -281,16 +287,20 @@ TeamViewer-style remote desktop. One native agent per controlled host, Roomler A
 - **Cross-flavour switch UI gate (BLOCKER-7)** — Welcome step shows a yellow banner when the detected install is the opposite flavour of what the operator picked, with an "I understand my enrollment will be lost; I have a fresh token" ack checkbox gating the Continue button. machine_id is preserved for same-flavour upgrades (`derive_machine_id` is deterministic over `(hostname + os + arch + config_path)`); cross-flavour shifts config_path so machine_id changes — operator needs a fresh enrollment token.
 - **Tests**: 42 installer-lib unit tests including a live Win32 smoke that spawns `cmd /c exit 1602`, attaches `MsiRunner` via `OpenProcess` + `WaitForSingleObject` + `GetExitCodeProcess`, asserts `MsiExitDecoded::UserCancel`. 328 agent-lib tests (+40 net new from rc.27). Backend has 11 new unit tests on the installer-proxy helpers. Clippy + fmt clean.
 - **Local release build verified** — `cargo build -p roomler-installer --release` produces `roomler-installer.exe` (14.4 MB) on Win11 MSVC. End-to-end Tauri runtime + custom-protocol bundled assets work.
-- **Pending W10 manual smoke** — wizard has NEVER been launched end-to-end on a fresh Win11 VM. Smoke pack S1-S10 (10 scenarios incl. S3a same-flavour / S3b cross-flavour / S5a pre-spawn-cancel / S5b post-spawn-force-kill / S9 single-instance-mid-install) covers the failure modes the plan critique flagged. Once smoke green → tag `agent-v0.3.0-rc.28`. **See `HANDOVER22.md` for the full W10 checklist.**
+- **Pending W10 manual smoke** — wizard has NEVER been launched end-to-end on a fresh Win11 VM. Smoke pack S1-S10 (10 scenarios incl. S3a same-flavour / S3b cross-flavour / S5a pre-spawn-cancel / S5b post-spawn-force-kill / S9 single-instance-mid-install) covers the failure modes the plan critique flagged. Once smoke green → tag `agent-v0.3.0-rc.28`.
 
-**Older releases (0.1.x → 0.3.0-rc.26)**: CLAUDE.md no longer mirrors per-release notes — `HANDOVER2.md` → `HANDOVER22.md`, `docs/remote-control.md`, and `git log` are authoritative for the historical arc. Key milestones, all shipped: live-verified WebRTC P2P (0.1.36), MF H.264 HW cascade with REMB-driven bitrate (0.1.26), codec negotiation H.264/HEVC/AV1 with probe-at-startup filter (0.1.28-0.1.30), clipboard + file-transfer data channels (0.1.32-0.1.33), WebCodecs canvas render bypass (0.1.36, Tier B7), agent lifecycle service hooks + auto-update (0.1.36), failure-resilience cycle with watchdog + crash rollback + SHA256 verification (0.1.50-0.1.54), heartbeat telemetry + pre-flight checks + opt-in Windows Service mode (0.1.55-0.1.58), M5 verification + clean-exit fixes + install-storm cooldown (0.1.61-0.1.63), M3 Z-path lock-screen overlay + browser auto-reconnect + perMachine MSI (0.2.0-0.2.5; A1 WGC NO-GO empirically confirmed), auto-update asset-picker flavour-aware (0.2.6), input regression fix (0.2.7), M3 A1 SystemContext-from-cold-start (rc.1-rc.7), UAC self-update + cross-flavour MSI cleanup + Tauri tray companion (rc.18), resumable file-DC transfers (rc.19-rc.20), ESET-evasive PROGRAMDATA staging (rc.21-rc.22), SystemContext Winlogon + elevated apps gating via `ROOMLER_AGENT_ENABLE_SYSTEM_SWAP` (rc.26).
+**Older releases (0.1.x → 0.3.0-rc.26)**: CLAUDE.md no longer mirrors per-release notes — `git log` and `docs/remote-control.md` are authoritative for the historical arc. Key milestones, all shipped: live-verified WebRTC P2P (0.1.36), MF H.264 HW cascade with REMB-driven bitrate (0.1.26), codec negotiation H.264/HEVC/AV1 with probe-at-startup filter (0.1.28-0.1.30), clipboard + file-transfer data channels (0.1.32-0.1.33), WebCodecs canvas render bypass (0.1.36, Tier B7), agent lifecycle service hooks + auto-update (0.1.36), failure-resilience cycle with watchdog + crash rollback + SHA256 verification (0.1.50-0.1.54), heartbeat telemetry + pre-flight checks + opt-in Windows Service mode (0.1.55-0.1.58), M5 verification + clean-exit fixes + install-storm cooldown (0.1.61-0.1.63), M3 Z-path lock-screen overlay + browser auto-reconnect + perMachine MSI (0.2.0-0.2.5; A1 WGC NO-GO empirically confirmed), auto-update asset-picker flavour-aware (0.2.6), input regression fix (0.2.7), M3 A1 SystemContext-from-cold-start (rc.1-rc.7), UAC self-update + cross-flavour MSI cleanup + Tauri tray companion (rc.18), resumable file-DC transfers (rc.19-rc.20), ESET-evasive PROGRAMDATA staging (rc.21-rc.22), SystemContext Winlogon + elevated apps gating via `ROOMLER_AGENT_ENABLE_SYSTEM_SWAP` (rc.26).
 
 ## Known Issues (OPEN only)
 
-Fixed-and-shipped issues live in `git log` / the HANDOVERs. Currently open:
+Fixed-and-shipped issues live in `git log`. Currently open:
 
-- [HIGH] [2026-03-10] JWT default secret is "change-me-in-production" — must be overridden in prod.
+- [HIGH] [2026-03-10] JWT default secret is "change-me-in-production" — must be overridden in prod. A startup `tracing::error!` fires if the default is in use (2026-05-23 cleanup); a hard-fail gated on an explicit `app.environment=production` setting is the next step.
 - [MEDIUM] [2026-04-17] Remote-control: consent auto-granted on agent (no tray-driven prompt yet); fine for self-controlled hosts, needs UI for org-controlled devices per docs §11.2.
+- [MEDIUM] [2026-05-23] CORS falls back to `Any` origin when `cors_origins` is unset or contains `"*"` (`crates/api/src/lib.rs:22-36`) — operator-misconfig risk; tighten the default in a follow-up.
+- [MEDIUM] [2026-05-23] File upload trusts the client-supplied `content-type` header (`crates/api/src/routes/file.rs:226-231`); no MIME whitelist. MIME-confusion risk when files are later served back.
+- [LOW] [2026-05-23] Agent `config.toml` holds `agent_token`. Unix saves with `0600`; Windows currently relies on the default user ACL — `agents/roomler-agent/src/config.rs` should set an explicit ACL.
+- [LOW] [2026-05-23] nginx (`files/nginx-pod.conf`) is missing `Strict-Transport-Security` and `Content-Security-Policy` headers.
 - [LOW] [2026-03-10] Deployment strategy is Recreate (no zero-downtime rolling updates).
 - [LOW] [2026-03-10] No git hooks configured (no pre-commit, no lint-staged).
 - [LOW] [2026-04-20] Remote-control: NVIDIA NVENC `ActivateObject` returns 0x8000FFFF on RTX 5090 Blackwell for H.264 / HEVC / AV1 MFTs regardless of adapter binding. Cascade routes around it (H.264+HEVC land on alternative MFTs; AV1 has no alternative and is filtered from advertised caps by the probe-at-startup check). Worth re-testing on newer drivers / `CODECAPI_AVEncAdapterLUID` experiments.
@@ -298,8 +308,10 @@ Fixed-and-shipped issues live in `git log` / the HANDOVERs. Currently open:
 
 ## Security Baseline
 
-- JWT expiry: access=604800s (7 days), refresh=2592000s (30 days) (configurable via ROOMLER__JWT__*)
-- Rate limiting: tower_governor 60 req/min per IP (2026-03-21)
-- CORS: configured via `cors_origins` (2026-03-21; no longer permissive)
-- nginx security headers: X-Frame-Options, X-Content-Type-Options, etc. (2026-03-21)
-- Last CVE scan: not yet run
+- JWT expiry: access=604800s (7 days), refresh=2592000s (30 days) (configurable via ROOMLER__JWT__*).
+- Rate limiting: tower_governor 60 req/min per IP (2026-03-21).
+- CORS: configured via `cors_origins` (2026-03-21); see Known Issues for the `Any`-origin fallback when `cors_origins` is unset.
+- nginx security headers: X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy (2026-03-21). HSTS + CSP still missing — Known Issues.
+- TURN `static-auth-secret` rotated out of the repo on 2026-05-23 — the committed `turnserver.conf` carries a `CHANGE-ME` placeholder; the live value lives in the operator's `ROOMLER__TURN__SHARED_SECRET` env.
+- `Content-Disposition` filenames sanitized + RFC 5987 encoded on the file-download route (2026-05-23).
+- Last CVE scan: not yet run.

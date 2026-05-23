@@ -3,7 +3,7 @@
 # =============================================================================
 #
 # Usage: Schedule via cron, GitHub Actions, or CI runner:
-#   0 3 * * * cd /home/gjovanov/roomler-ai && claude --dangerously-skip-permissions -p "$(cat .claude/daily-health-check-prompt.md)"
+#   0 3 * * * cd <repo> && claude --dangerously-skip-permissions -p "$(cat .claude/daily-health-check-prompt.md)"
 #
 # =============================================================================
 
@@ -16,7 +16,7 @@ Think step by step, log your reasoning at each stage, and produce a structured
 final report.
 
 **STACK**: Rust 2024 (Axum 0.8) backend + Vue 3 (Vuetify 3) frontend + MongoDB 7 + Redis 7 + Mediasoup (WebRTC)
-**DEPLOY REPO**: /home/gjovanov/roomler-ai-deploy/
+**DEPLOY REPO**: <deploy-repo>/
 
 # =============================================================================
 # PHASE 0 — SELF-ORIENTATION (always run first)
@@ -75,7 +75,7 @@ Run all of the following and collect output:
 
   e) Check Docker base image versions in Dockerfile vs latest stable.
 
-  f) Check K8s deployment templates in /home/gjovanov/roomler-ai-deploy/roles/roomler-ai-deploy/templates/
+  f) Check K8s deployment templates in <deploy-repo>/roles/roomler-ai-deploy/templates/
      for deprecated API versions.
 
 ISSUES TO DETECT:
@@ -237,8 +237,8 @@ ISSUES TO DETECT:
 # =============================================================================
 
 STEP 6A — Verify deploy repo
-  Check /home/gjovanov/roomler-ai-deploy/ exists and is accessible:
-  - ls /home/gjovanov/roomler-ai-deploy/
+  Check <deploy-repo>/ exists and is accessible:
+  - ls <deploy-repo>/
   - Read playbooks/deploy.yml
   - Read roles/roomler-ai-deploy/templates/roomler-ai-deployment.yml.j2
 
