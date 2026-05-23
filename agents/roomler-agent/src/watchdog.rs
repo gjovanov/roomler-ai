@@ -59,6 +59,24 @@ pub const SUSPEND_TOLERANCE: Duration = Duration::from_secs(60);
 /// log aggregation can pick out watchdog kills cleanly.
 pub const STALL_EXIT_CODE: i32 = 2;
 
+/// rc.53: sentinel exit code reserved for "server-side `rc:goodbye`
+/// said this agent's row is deleted / policy-rejected — operator
+/// action required, do not respawn-spam." The supervisor treats this
+/// distinctly from a generic non-zero exit:
+///
+///   * `should_record_supervisor_crash` excludes it (the agent
+///     already raised a `needs-attention` sentinel; double-recording
+///     would inflate fleet crash metrics — same rationale as the
+///     `STALL_EXIT_CODE` exclusion).
+///   * The respawn-alarm fast-path fires `error!` on the FIRST
+///     code-7 exit (not after 8 like the generic alarm) so the
+///     operator-action signal is visible in &lt;1 minute instead of
+///     ~4 minutes (8 × ~30 s avg backoff).
+///   * The supervisor still respawns indefinitely (an operator who
+///     re-enrols with a fresh token between code-7 exits recovers
+///     the host without a manual service restart).
+pub const AGENT_DELETED_EXIT_CODE: i32 = 7;
+
 /// Process-wide singleton. Set by `install`; read by the free
 /// functions and the `run` task.
 static WATCHDOG: OnceLock<Arc<Watchdog>> = OnceLock::new();
@@ -413,5 +431,24 @@ mod tests {
         gate("unregistered", true);
         // is_active may be true if a prior test in this run installed
         // it; that's fine — what matters is no panic.
+    }
+
+    #[test]
+    fn exit_code_sentinels_are_distinct_and_documented() {
+        // rc.53: the supervisor branches on these two specific codes
+        // (`STALL_EXIT_CODE` excluded from crash recording, and
+        // `AGENT_DELETED_EXIT_CODE` excluded AND fast-alarmed). A
+        // future change that collides them — e.g. someone renumbers
+        // AGENT_DELETED to 2 — would silently turn off the rc.53
+        // fast-alarm signal because the existing STALL exclusion
+        // would absorb it. This test fires before that ships.
+        assert_ne!(
+            STALL_EXIT_CODE, AGENT_DELETED_EXIT_CODE,
+            "exit-code sentinels must be distinct so supervisor branches don't alias"
+        );
+        // The constants are referenced by string in field-doc
+        // (operator runbook + smoke matrix) — pin the literal values.
+        assert_eq!(STALL_EXIT_CODE, 2);
+        assert_eq!(AGENT_DELETED_EXIT_CODE, 7);
     }
 }

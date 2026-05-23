@@ -98,6 +98,65 @@ pub enum CloseReason {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Agent connection-level close reasons (rc.53)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Server-initiated close reason for an agent WS connection. Carried
+/// by [`ServerMsg::Goodbye`]. Distinct from the session-level
+/// [`EndReason`] (which terminates one remote-control session) and
+/// from [`CloseReason`] (which terminates one tunnel flow) — this is
+/// connection-level.
+///
+/// `Deserialize` is implemented by hand so that unknown variants
+/// (rc.54+ additions) decode to [`PolicyRejected`] rather than
+/// serde-failing the whole message. This is the future-compat
+/// hatch a fielded rc.53 agent needs to survive a server that
+/// learned new reasons.
+///
+/// [`PolicyRejected`]: AgentCloseReason::PolicyRejected
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentCloseReason {
+    /// Server-side `agents` row has `deleted_at != null` or is
+    /// otherwise refused by the WS handler's lookup. The agent's
+    /// stored token is cryptographically valid but useless. Re-enrol
+    /// to revive (soft-deleted rows rehydrate on `(tenant_id,
+    /// machine_id)` match — `Hub::register_agent` calls `rehydrate()`).
+    AgentDeleted,
+    /// A newer WS connection presented the SAME `agent_id`; the Hub
+    /// kept the new one, dropped this old one. Indicates a duplicate
+    /// install somewhere (another physical host with a copy of this
+    /// `config.toml`, the tray companion, etc.).
+    ReplacedByNewerConnection,
+    /// Server-side policy refused (account suspended, tenant
+    /// disabled, version too old). Reserved for future use; also the
+    /// default the decoder picks for unknown-string variants so
+    /// future rc.54+ variants don't hard-fault rc.53 agents in the
+    /// field.
+    PolicyRejected,
+}
+
+impl<'de> Deserialize<'de> for AgentCloseReason {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Ok(match s.as_str() {
+            "agent_deleted" => AgentCloseReason::AgentDeleted,
+            "replaced_by_newer_connection" => AgentCloseReason::ReplacedByNewerConnection,
+            "policy_rejected" => AgentCloseReason::PolicyRejected,
+            // Forward-compat: unknown rc.54+ reasons decode to a
+            // safe non-panicking default. The agent's handle_server_msg
+            // arm treats PolicyRejected as fatal, which matches the
+            // semantics of "server told us to stop and we don't know
+            // why" better than `ReplacedByNewer` (which is recoverable).
+            _ => AgentCloseReason::PolicyRejected,
+        })
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Inbound from clients (agent or controller browser)
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -454,6 +513,35 @@ pub enum ServerMsg {
         message: String,
     },
 
+    /// Server-initiated close of an agent WS connection (rc.53).
+    /// Sent immediately before the WS Close frame so the agent can
+    /// surface a useful reason in its log + decide whether to
+    /// reconnect or stop.
+    ///
+    /// Emitted at three sites:
+    ///   * `crates/api/src/ws/handler.rs:189` — agent row is
+    ///     deleted/quarantined, `reason = AgentDeleted`.
+    ///   * `crates/remote_control/src/hub.rs::register_agent`
+    ///     displacement path, `reason = ReplacedByNewerConnection`.
+    ///   * (future) policy gate (account suspended, etc.),
+    ///     `reason = PolicyRejected`.
+    ///
+    /// Pre-rc.53 agents hit their existing `Err(e) => debug!`
+    /// decoder branch and ignore the message; the subsequent WS
+    /// Close still fires, so no regression. Pre-rc.53 server +
+    /// rc.53 agent: agent never receives Goodbye; raw close
+    /// is treated as transient (no fatal exit). Both directions
+    /// covered by Phase 4 back-compat tests.
+    #[serde(rename = "rc:goodbye")]
+    Goodbye {
+        reason: AgentCloseReason,
+        /// Human-readable, operator-targeted. Used verbatim in the
+        /// agent's `needs-attention.txt` sentinel + the
+        /// `tracing::error!` line that surfaces the close to the
+        /// operator.
+        message: String,
+    },
+
     // ─── server → tunnel-client / agent (rc:tunnel.*) ────────────────
     /// Server → client: peer-channel is up. `dc_pool_size` confirms
     /// the negotiated DC pool size (8 in v1) so the client knows
@@ -721,6 +809,111 @@ mod tests {
         let s = serde_json::to_string(&e).unwrap();
         // None → null, not omitted.
         assert!(s.contains("\"session_id\":null"));
+    }
+
+    // ─── AgentCloseReason / ServerMsg::Goodbye wire-format locks (rc.53) ───
+
+    #[test]
+    fn agent_close_reason_serialises_snake_case() {
+        // Lock-in: every variant rides as its canonical snake_case
+        // wire name. The agent's `handle_server_msg` match arm + the
+        // server's emit sites both pivot on these strings; renaming
+        // any is a wire break that strands fielded agents.
+        for (variant, expected) in [
+            (AgentCloseReason::AgentDeleted, "agent_deleted"),
+            (
+                AgentCloseReason::ReplacedByNewerConnection,
+                "replaced_by_newer_connection",
+            ),
+            (AgentCloseReason::PolicyRejected, "policy_rejected"),
+        ] {
+            let m = ServerMsg::Goodbye {
+                reason: variant,
+                message: "x".into(),
+            };
+            let s = serde_json::to_string(&m).unwrap();
+            assert!(
+                s.contains(&format!("\"reason\":\"{expected}\"")),
+                "variant {variant:?} did not serialise to {expected:?} in: {s}"
+            );
+            assert!(s.contains(r#""t":"rc:goodbye""#));
+        }
+    }
+
+    #[test]
+    fn goodbye_round_trips() {
+        let m = ServerMsg::Goodbye {
+            reason: AgentCloseReason::AgentDeleted,
+            message: "re-enrol required".into(),
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        let back: ServerMsg = serde_json::from_str(&s).unwrap();
+        match back {
+            ServerMsg::Goodbye { reason, message } => {
+                assert_eq!(reason, AgentCloseReason::AgentDeleted);
+                assert_eq!(message, "re-enrol required");
+            }
+            other => panic!("expected Goodbye, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pre_rc53_server_msg_rejects_goodbye_so_agent_err_arm_fires() {
+        // Phase 4 back-compat lock (rc.53 plan v2).
+        //
+        // A pre-rc.53 agent's `ServerMsg` enum does NOT have the
+        // `Goodbye` variant. When the rc.53 server emits an
+        // `rc:goodbye` frame, the old agent's `serde_json::from_str`
+        // returns `Err` and the existing `Err(e) => debug!(…,
+        // "ignoring non-rc:* frame")` arm at
+        // `agents/roomler-agent/src/signaling.rs:333` swallows it
+        // silently — no panic, no fatal exit.
+        //
+        // We simulate the rc.52 ServerMsg shape via a stripped local
+        // enum + the same `#[serde(tag = "t")]` attribute the real
+        // enum uses. If serde ever started succeeding here (e.g.
+        // because someone added `#[serde(other)]` to `ServerMsg` or
+        // changed the tag scheme), this test fires and rc.52 hosts
+        // would start panicking on the new variant.
+
+        #[derive(Deserialize, Debug)]
+        #[serde(tag = "t")]
+        #[allow(dead_code)]
+        enum Rc52ServerMsg {
+            #[serde(rename = "rc:pong")]
+            Pong { id: u32 },
+            #[serde(rename = "rc:error")]
+            Error { code: String },
+        }
+
+        let goodbye_json = r#"{"t":"rc:goodbye","reason":"agent_deleted","message":"x"}"#;
+        let result: Result<Rc52ServerMsg, _> = serde_json::from_str(goodbye_json);
+        assert!(
+            result.is_err(),
+            "pre-rc.53 ServerMsg shape must Err on the new Goodbye discriminator \
+             (rc.52 agents rely on the `Err(_) => debug!(…)` arm to absorb it)"
+        );
+    }
+
+    #[test]
+    fn goodbye_with_unknown_reason_decodes_to_policy_rejected_default() {
+        // Forward-compat: a fielded rc.53 agent that receives a
+        // future rc.54+ `reason` string it doesn't know MUST NOT
+        // panic / hard-fault. The custom `Deserialize` for
+        // `AgentCloseReason` rounds unknown strings to
+        // `PolicyRejected` (which the agent treats as fatal —
+        // semantically "server told us to stop and we don't know
+        // why" matches PolicyRejected better than ReplacedByNewer
+        // which would invite a reconnect loop).
+        let json = r#"{"t":"rc:goodbye","reason":"xyzzy_brand_new","message":"hi"}"#;
+        let back: ServerMsg = serde_json::from_str(json).unwrap();
+        match back {
+            ServerMsg::Goodbye { reason, message } => {
+                assert_eq!(reason, AgentCloseReason::PolicyRejected);
+                assert_eq!(message, "hi");
+            }
+            other => panic!("expected Goodbye, got {other:?}"),
+        }
     }
 
     // ─── rc:tunnel.* wire-format locks (T2.1) ─────────────────────────

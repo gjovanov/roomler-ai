@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
 use roomler_ai_remote_control::{
     models::{AgentCaps, DisplayInfo, EndReason, OsKind},
-    signaling::{ClientMsg, ServerMsg},
+    signaling::{AgentCloseReason, ClientMsg, ServerMsg},
 };
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::mpsc;
@@ -86,6 +86,14 @@ pub async fn run(
     );
     let mut backoff = Duration::from_secs(1);
     let mut auth_failures: u32 = 0;
+    // rc.53: rolling window of recent `ReplacedByNewerConnection`
+    // events. Three within 5 min escalates from "back off 60 s and
+    // hope the duel settles" to "operator action required +
+    // process::exit(AGENT_DELETED_EXIT_CODE)" — at that point the
+    // duel is real, neither instance can win, and the operator needs
+    // to find + stop the duplicate (or re-enrol THIS host with a
+    // fresh enrollment JWT to mint a new agent_id).
+    let mut recent_replacements: Vec<std::time::Instant> = Vec::new();
     loop {
         if *shutdown.borrow() {
             info!("shutdown signalled; exiting signaling loop");
@@ -148,6 +156,90 @@ pub async fn run(
                     },
                 }
             }
+            Err(ConnectError::FatalGoodbye { reason, message }) => {
+                // rc.53: server told us to stop reconnecting. The
+                // teardown of in-flight peers already ran in the
+                // `handle_server_msg::ServerMsg::Goodbye` arm
+                // (close_all_peers + close_all_tunnel_peers) — this
+                // arm only writes the operator sentinel + exits.
+                let body = format!(
+                    "Roomler agent: server-side close — {reason:?}.\n\n{message}\n\n\
+                     The agent will not reconnect. Re-enrol with a fresh enrollment \
+                     JWT from the admin UI:\n\n\
+                     \troomler-agent re-enroll --token <new-jwt>\n\n\
+                     then restart the service (or wait for the supervisor to relaunch)."
+                );
+                match notify::raise_attention_machine_aware(&body) {
+                    Ok(path) => warn!(
+                        path = %path.display(),
+                        ?reason,
+                        "wrote needs-attention sentinel for FatalGoodbye"
+                    ),
+                    Err(e) => warn!(
+                        error = %e,
+                        ?reason,
+                        "failed to write needs-attention sentinel for FatalGoodbye"
+                    ),
+                }
+                // Exit with the documented code so the SCM
+                // supervisor's rc.53 code-7 fast-alarm fires on this
+                // FIRST exit (not after 8). Operator sees the
+                // structured error within <1 minute.
+                std::process::exit(watchdog::AGENT_DELETED_EXIT_CODE);
+            }
+            Err(ConnectError::ReplacedByNewer { message }) => {
+                let now = std::time::Instant::now();
+                // Drop events older than the 5 min rolling window
+                // BEFORE pushing the new one (so escalation depends
+                // only on what's actually within the window).
+                recent_replacements
+                    .retain(|t| now.duration_since(*t) < Duration::from_secs(5 * 60));
+                recent_replacements.push(now);
+                warn!(
+                    %message,
+                    count = recent_replacements.len(),
+                    "server signalled this connection was replaced; staggering reconnect to break the duel"
+                );
+
+                if recent_replacements.len() >= 3 {
+                    let body = format!(
+                        "Roomler agent: duplicate-instance duel detected.\n\n{message}\n\n\
+                         This connection has been displaced {} times in the last 5 minutes — \
+                         another process (different physical host with a copy of this \
+                         config.toml, or a tray companion, etc.) is using the same agent_id. \
+                         Stop the duplicate or re-enrol THIS host with a fresh enrollment \
+                         JWT to mint a new agent_id.",
+                        recent_replacements.len()
+                    );
+                    match notify::raise_attention_machine_aware(&body) {
+                        Ok(path) => warn!(
+                            path = %path.display(),
+                            displacements = recent_replacements.len(),
+                            "wrote needs-attention sentinel for ReplacedByNewer escalation"
+                        ),
+                        Err(e) => warn!(
+                            error = %e,
+                            "failed to write needs-attention sentinel for ReplacedByNewer escalation"
+                        ),
+                    }
+                    std::process::exit(watchdog::AGENT_DELETED_EXIT_CODE);
+                }
+
+                // Back off 60 s minimum — long enough that two
+                // duelling instances stagger out of phase and one
+                // wins. Shorter would put both in sync and burn
+                // attempts before the escalation gate.
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(60)) => {},
+                    _ = shutdown.changed() => {
+                        if *shutdown.borrow() { return Ok(()); }
+                    },
+                }
+                // Reset the transient backoff — the next reconnect
+                // attempt is paced by the 60 s above, not by the
+                // exponential ladder.
+                backoff = Duration::from_secs(1);
+            }
             Err(ConnectError::Transient(e)) => {
                 warn!(error = %e, "signaling connect failed; backing off");
                 tokio::select! {
@@ -183,6 +275,25 @@ pub(crate) fn auth_backoff_for(consecutive_failures: u32) -> Duration {
 enum ConnectError {
     #[error("auth rejected")]
     AuthRejected,
+    /// rc.53: server explicitly told us to stop reconnecting (row
+    /// deleted, policy refused, or any unknown future-variant reason
+    /// which `AgentCloseReason::Deserialize` rounds to
+    /// `PolicyRejected`). The outer `run()` loop responds with a
+    /// needs-attention sentinel + `process::exit(AGENT_DELETED_EXIT_CODE)`
+    /// so the SCM supervisor's code-7 fast-alarm fires immediately.
+    #[error("fatal goodbye: {reason:?}: {message}")]
+    FatalGoodbye {
+        reason: AgentCloseReason,
+        message: String,
+    },
+    /// rc.53: server told us a newer WS connection displaced us
+    /// (duplicate-instance duel). The outer loop backs off ≥60 s on
+    /// the first 1-2 events (so two duelling instances stagger out
+    /// of phase and one wins); escalates to fatal +
+    /// process::exit(AGENT_DELETED_EXIT_CODE) on the 3rd event
+    /// within a 5 min rolling window.
+    #[error("replaced by newer connection: {message}")]
+    ReplacedByNewer { message: String },
     #[error(transparent)]
     Transient(#[from] anyhow::Error),
 }
@@ -569,6 +680,42 @@ async fn handle_server_msg(
             message,
         } => {
             warn!(?session_id, %code, %message, "server-side rc error");
+        }
+
+        // rc.53: server has decided this WS is over. Tear down every
+        // peer cleanly (so the controller side gets clean ICE-restart
+        // hints rather than a 10-30 s silence-detect) and surface the
+        // reason via a typed ConnectError so the outer `run()` loop
+        // can decide between fatal exit (`AgentDeleted` /
+        // `PolicyRejected`) and back-off-with-escalation
+        // (`ReplacedByNewerConnection`).
+        //
+        // The teardown invariant lives HERE — not in `run()` — because
+        // the existing `connect_once` exit paths only run cleanup at
+        // explicit `return` sites and the `?` propagation of this
+        // arm's Err would otherwise SKIP `close_all_peers`. SM-1b
+        // (delete-agent-with-active-session) checks this invariant
+        // explicitly.
+        ServerMsg::Goodbye { reason, message } => {
+            tracing::error!(
+                ?reason,
+                %message,
+                "server-side rc:goodbye received — stopping current session loop"
+            );
+            close_all_peers(peers, indicator).await;
+            close_all_tunnel_peers(tunnel_peers).await;
+            // Drop pending codec / transport entries too; they're tied
+            // to in-flight session_ids that no longer have peers.
+            pending_codecs.clear();
+            pending_transports.clear();
+            return match reason {
+                AgentCloseReason::AgentDeleted | AgentCloseReason::PolicyRejected => {
+                    Err(ConnectError::FatalGoodbye { reason, message })
+                }
+                AgentCloseReason::ReplacedByNewerConnection => {
+                    Err(ConnectError::ReplacedByNewer { message })
+                }
+            };
         }
 
         // Controller-oriented messages shouldn't reach us.
