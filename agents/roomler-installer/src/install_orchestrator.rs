@@ -343,8 +343,25 @@ async fn run_install_inner(
     // load it pre-logon. plain perMachine + perUser keep the per-user
     // %APPDATA% default. machine_id is derived from whichever path the
     // config is written to, so it stays internally consistent.
+    //
+    // rc.53 CI hotfix (fix to rc.52 tech debt): `machine_global_config_path`
+    // is `#[cfg(target_os = "windows")]` in the agent crate, so the
+    // workspace's Linux CI (`cargo clippy --workspace`) fails to build
+    // this crate unless the call site is itself cfg-gated. The
+    // SystemContext flavour is logically Windows-only — there is no
+    // %PROGRAMDATA% on Linux/macOS — so a non-Windows fallback that
+    // hard-errors is the right semantic (the wizard EXE only ships
+    // on Windows; this branch is unreachable in practice but keeps
+    // the workspace buildable).
     let config_path = if is_system_context {
-        roomler_agent::config::machine_global_config_path()
+        #[cfg(target_os = "windows")]
+        {
+            roomler_agent::config::machine_global_config_path()
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            return Err("SystemContext flavour is Windows-only".to_string());
+        }
     } else {
         roomler_agent::config::default_config_path()
             .map_err(|e| format!("resolve config path: {e}"))?
