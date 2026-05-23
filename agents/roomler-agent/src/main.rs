@@ -883,7 +883,11 @@ async fn enroll_cmd(
 /// builds always return false (no risk of asymmetry).
 #[cfg(all(feature = "system-context", target_os = "windows"))]
 fn enroll_user_context_warning_due() -> bool {
-    use system_context::worker_role::{WorkerRole, probe_self};
+    // main.rs is the bin crate; reach into the lib via its crate name
+    // — mirrors the existing call sites at :404, :476, :637, :1032, :1792.
+    // Local cargo test caught this only via the bin-tests build path
+    // because the test binary doesn't exercise the system-context feature.
+    use roomler_agent::system_context::worker_role::{WorkerRole, probe_self};
     !matches!(probe_self(), Ok(WorkerRole::SystemContext))
 }
 
