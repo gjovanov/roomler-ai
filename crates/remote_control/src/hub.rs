@@ -14,7 +14,7 @@ use bson::oid::ObjectId;
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tracing::{info, warn};
 
 use crate::audit::AuditSink;
@@ -23,7 +23,7 @@ use crate::error::{Error, Result};
 use crate::models::{AuditKind, EndReason, OsKind, SessionPhase};
 use crate::permissions::Permissions;
 use crate::session::{ClientTx, LiveSession};
-use crate::signaling::{ClientMsg, Role, ServerMsg};
+use crate::signaling::{AgentCloseReason, ClientMsg, Role, ServerMsg};
 use crate::turn_creds::{TurnConfig, ice_servers_for};
 
 const SERVER_TX_CAPACITY: usize = 64;
@@ -38,6 +38,13 @@ pub struct ConnectedAgent {
     pub tx: ClientTx,
     pub active_sessions: u8,
     pub max_sessions: u8,
+    /// rc.53: signalled by [`Hub::register_agent`] when a newer
+    /// connection displaces this one. The WS handler's read-loop
+    /// `select!`s on `socket_rx.next()` AND `cancel.notified()`, so
+    /// the displaced socket exits cleanly within milliseconds of the
+    /// displacement Goodbye landing — instead of lingering up to one
+    /// 25 s keepalive interval waiting for a ping-send to fail.
+    pub cancel: Arc<Notify>,
 }
 
 pub struct ConnectedController {
@@ -83,7 +90,18 @@ impl Hub {
     // ─── connection registration ──────────────────────────────────────
 
     /// Called by the WS handler when an agent finishes auth+hello.
-    /// Returns the rx half the WS layer should pump to the socket.
+    /// Returns `(tx, cancel, rx)`:
+    ///
+    ///   * `tx` — clone of the channel registered in `ConnectedAgent.tx`.
+    ///     The WS handler captures this so its later `unregister_agent`
+    ///     call can identify "still my entry?" via `ClientTx::same_channel`
+    ///     and avoid evicting a NEWER displacing connection's entry
+    ///     (rc.53 race fix; the pre-rc.53 unregister unconditionally
+    ///     removed by `agent_id`).
+    ///   * `cancel` — `Arc<Notify>` the WS handler `select!`s on so a
+    ///     displacement triggers an immediate read-loop exit, NOT a 25 s
+    ///     wait for the agent's own keepalive ping to fail.
+    ///   * `rx` — pump source for `pump_server_messages`.
     pub fn register_agent(
         &self,
         agent_id: ObjectId,
@@ -91,31 +109,106 @@ impl Hub {
         owner_user_id: ObjectId,
         os: OsKind,
         max_sessions: u8,
-    ) -> mpsc::Receiver<ServerMsg> {
+    ) -> (ClientTx, Arc<Notify>, mpsc::Receiver<ServerMsg>) {
         let (tx, rx) = mpsc::channel(SERVER_TX_CAPACITY);
+        let cancel = Arc::new(Notify::new());
         let entry = ConnectedAgent {
             agent_id,
             tenant_id,
             owner_user_id,
             os,
-            tx,
+            tx: tx.clone(),
             active_sessions: 0,
             max_sessions,
+            cancel: cancel.clone(),
         };
         if let Some(prev) = self.inner.agents.insert(agent_id, entry) {
-            // Replace older connection (e.g. agent reconnected on a flap).
-            // The old tx is dropped → its rx ends → the old WS task exits.
+            // rc.53: don't just `drop(prev)` — that leaves the old WS
+            // read-loop polling `socket_rx.next()` for up to one 25 s
+            // keepalive interval before the agent's own ping fails and
+            // surfaces as a transient. Instead:
+            //   1. Push a structured `ServerMsg::Goodbye {
+            //      reason: ReplacedByNewerConnection }` via try_send.
+            //   2. `notify_waiters()` on the cancel so the read-loop
+            //      exits within milliseconds.
+            //   3. drop(prev) — closes the channel; pump task exits
+            //      cleanly after forwarding the Goodbye to the socket.
             warn!(
-                "agent {} reconnected; dropping previous connection",
+                "agent {} reconnected; notifying previous connection with ReplacedByNewerConnection and dropping",
                 agent_id
             );
+            let goodbye = ServerMsg::Goodbye {
+                reason: AgentCloseReason::ReplacedByNewerConnection,
+                message: format!(
+                    "Another agent is connecting with the same agent_id ({agent_id}); \
+                     this connection is being closed. Check for a duplicate install \
+                     (another physical host with a copy of this config.toml, the tray \
+                     companion, etc.) or re-enrol to mint a fresh agent_id."
+                ),
+            };
+            match prev.tx.try_send(goodbye) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    // SERVER_TX_CAPACITY is 64; under contention the pump
+                    // may not have drained yet. Operator sees this and
+                    // knows the displaced agent likely missed the message
+                    // and will reconnect via the raw-close path.
+                    warn!(
+                        "agent {agent_id} displacement goodbye dropped (channel full); \
+                         displaced agent will see raw close only"
+                    );
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    // Displaced agent's pump task already exited; the
+                    // socket-close path will fire on its next read.
+                }
+            }
+            // `notify_one` (NOT notify_waiters) — the former LATCHES the
+            // notification when no waiter is parked, the latter just
+            // broadcasts to currently-parked waiters. Auto-fail #5 in
+            // the v2 plan: if the displacement fires before the
+            // displaced handler entered its select-loop (extreme race),
+            // notify_waiters would lose the signal and the old socket
+            // would linger waiting on its 25 s keepalive. notify_one's
+            // permit storage closes that hole.
+            prev.cancel.notify_one();
             drop(prev);
         }
         info!("agent {} online", agent_id);
-        rx
+        (tx, cancel, rx)
     }
 
-    pub fn unregister_agent(&self, agent_id: ObjectId) {
+    /// Unregister a connected agent. The optional `tx` is the channel
+    /// the caller captured at registration time; when provided, the
+    /// removal happens ONLY if the currently-registered tx is still
+    /// the same channel. This protects against a pre-existing race
+    /// (rc.53 critique #4) where a displaced `handle_agent_socket`'s
+    /// late unregister evicted the NEWER displacing connection's
+    /// registry entry, killing its in-flight sessions.
+    ///
+    /// Pass `None` for admin-driven kicks (e.g. the kick-agent route)
+    /// that don't carry the agent's tx identity — these always
+    /// remove unconditionally.
+    pub fn unregister_agent(&self, agent_id: ObjectId, tx: Option<&ClientTx>) {
+        if let Some(expected_tx) = tx {
+            // Identity-gated removal. Read the current entry's tx
+            // under the DashMap lock and compare; if it doesn't match
+            // ours, a newer connection has already taken over this
+            // slot — leave it alone.
+            let still_ours = self
+                .inner
+                .agents
+                .get(&agent_id)
+                .map(|a| ptr_eq(&a.tx, expected_tx))
+                .unwrap_or(false);
+            if !still_ours {
+                info!(
+                    "agent {} unregister skipped (tx no longer matches; newer connection holds the slot)",
+                    agent_id
+                );
+                return;
+            }
+        }
         if self.inner.agents.remove(&agent_id).is_some() {
             info!("agent {} offline", agent_id);
             // Force-close any sessions tied to this agent.
@@ -609,7 +702,7 @@ mod tests {
     async fn end_to_end_consent_grant() {
         let hub = test_hub().await;
         let agent_id = ObjectId::new();
-        let _agent_rx =
+        let (_agent_tx, _cancel, _agent_rx) =
             hub.register_agent(agent_id, ObjectId::new(), ObjectId::new(), OsKind::Linux, 3);
         let (ctl_tx, mut ctl_rx) = mpsc::channel(8);
         let sid = hub
@@ -637,5 +730,114 @@ mod tests {
         // Controller should now have a Ready message.
         let m = ctl_rx.try_recv().unwrap();
         assert!(matches!(m, ServerMsg::Ready { .. }));
+    }
+
+    // ─── rc.53 Phase 2b: Hub displacement notify-then-close ──────────
+
+    #[tokio::test]
+    async fn displacement_sends_goodbye_then_notifies_cancel() {
+        // The headline rc.53 fix: when a second connection arrives
+        // for the same agent_id, the FIRST connection's pump rx must
+        // receive a `ServerMsg::Goodbye{ReplacedByNewerConnection}`
+        // AND its cancel notify must fire so the read-loop exits
+        // within milliseconds (not 25 s waiting on keepalive).
+        let hub = test_hub().await;
+        let agent_id = ObjectId::new();
+
+        let (_tx1, cancel1, mut rx1) =
+            hub.register_agent(agent_id, ObjectId::new(), ObjectId::new(), OsKind::Linux, 3);
+        let (_tx2, _cancel2, _rx2) =
+            hub.register_agent(agent_id, ObjectId::new(), ObjectId::new(), OsKind::Linux, 3);
+
+        // First connection's pump rx should immediately have the
+        // Goodbye queued; the channel hasn't been polled yet so
+        // try_recv finds the message.
+        let msg = rx1
+            .try_recv()
+            .expect("displaced connection should receive Goodbye");
+        match msg {
+            ServerMsg::Goodbye { reason, message } => {
+                assert_eq!(reason, AgentCloseReason::ReplacedByNewerConnection);
+                assert!(
+                    message.contains(&agent_id.to_hex()),
+                    "Goodbye message should mention the agent_id: {message}"
+                );
+            }
+            other => panic!("expected Goodbye on displaced rx, got {other:?}"),
+        }
+
+        // cancel1 must have a stored notify-permit waiting. We use
+        // `notify_one` (not `notify_waiters`) in register_agent
+        // precisely so that the displacement signal latches even if
+        // the displaced handler hasn't entered its select-loop yet.
+        // `.notified()` here consumes that permit and resolves
+        // immediately. A 50 ms timeout is generous for any CI
+        // scheduler jitter — production wakes in microseconds.
+        tokio::time::timeout(Duration::from_millis(50), cancel1.notified())
+            .await
+            .expect(
+                "displacement must store a notify permit so the displaced read-loop \
+                 exits within milliseconds (rc.53 auto-fail #5 mitigation)",
+            );
+    }
+
+    #[tokio::test]
+    async fn unregister_agent_with_stale_tx_is_noop() {
+        // rc.53 race fix: the displaced `handle_agent_socket`
+        // eventually exits its read-loop and calls `unregister_agent`.
+        // By then the registry entry is the NEW connection's. The
+        // pre-rc.53 code unconditionally removed by agent_id, which
+        // evicted the NEW entry and killed its sessions. Phase 2b's
+        // `Option<&ClientTx>` gates the removal on identity match.
+        let hub = test_hub().await;
+        let agent_id = ObjectId::new();
+
+        let (tx1, _cancel1, _rx1) =
+            hub.register_agent(agent_id, ObjectId::new(), ObjectId::new(), OsKind::Linux, 3);
+        let (_tx2, _cancel2, _rx2) =
+            hub.register_agent(agent_id, ObjectId::new(), ObjectId::new(), OsKind::Linux, 3);
+
+        // tx1 is now stale (tx2 holds the slot). Stale-tx unregister
+        // must NOT evict tx2's entry.
+        hub.unregister_agent(agent_id, Some(&tx1));
+        assert!(
+            hub.is_agent_online(agent_id),
+            "stale-tx unregister evicted the NEW connection — rc.53 race regression"
+        );
+    }
+
+    #[tokio::test]
+    async fn unregister_agent_with_none_tx_always_removes() {
+        // Admin-kick path: `routes/remote_control.rs::kick_agent`
+        // calls `unregister_agent(aid, None)` — no tx identity is
+        // available there, so the call must always remove
+        // unconditionally (otherwise admins lose their kick power).
+        let hub = test_hub().await;
+        let agent_id = ObjectId::new();
+        let (_tx, _cancel, _rx) =
+            hub.register_agent(agent_id, ObjectId::new(), ObjectId::new(), OsKind::Linux, 3);
+        assert!(hub.is_agent_online(agent_id));
+
+        hub.unregister_agent(agent_id, None);
+        assert!(
+            !hub.is_agent_online(agent_id),
+            "None-tx unregister must always remove (admin-kick path)"
+        );
+    }
+
+    #[tokio::test]
+    async fn unregister_agent_with_matching_tx_removes() {
+        // Sanity: when the tx still matches, removal proceeds normally.
+        let hub = test_hub().await;
+        let agent_id = ObjectId::new();
+        let (tx, _cancel, _rx) =
+            hub.register_agent(agent_id, ObjectId::new(), ObjectId::new(), OsKind::Linux, 3);
+        assert!(hub.is_agent_online(agent_id));
+
+        hub.unregister_agent(agent_id, Some(&tx));
+        assert!(
+            !hub.is_agent_online(agent_id),
+            "matching-tx unregister must remove the entry"
+        );
     }
 }

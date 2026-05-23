@@ -1,7 +1,7 @@
 use axum::{
     extract::{
         Query, State, WebSocketUpgrade,
-        ws::{Message, WebSocket},
+        ws::{CloseFrame, Message, WebSocket},
     },
     response::Response,
 };
@@ -125,7 +125,17 @@ fn ws_upgrade_tunnel_client(state: AppState, token: String, ws: WebSocketUpgrade
                 roomler_ai_remote_control::models::AgentStatus::Quarantined
             )
         {
-            info!(%tunnel_client_id, "tunnel-client is quarantined or deleted; refusing WS");
+            // rc.53: mirror of the agent refusal path. Tunnel-clients
+            // have their own taxonomy (`ServerMsg::TunnelRevoked`) and
+            // the periodic re-check in `handle_tunnel_client_socket`
+            // already emits it on mid-session revocation — extend the
+            // same notification to the connect-time refusal so the CLI
+            // logs "tunnel revoked" instead of opaque socket close.
+            info!(%tunnel_client_id, "tunnel-client is quarantined or deleted; refusing WS with rc:tunnel.revoked");
+            let revoked = roomler_ai_remote_control::signaling::ServerMsg::TunnelRevoked {
+                reason: "tunnel-client row was deleted or quarantined; re-enrol to revive".into(),
+            };
+            send_goodbye_and_close(socket, &revoked, 4003, "tunnel_client_deleted").await;
             return;
         }
         crate::ws::tunnel::handle_tunnel_client_socket(
@@ -186,7 +196,24 @@ fn ws_upgrade_agent(state: AppState, token: String, ws: WebSocketUpgrade) -> Res
                 roomler_ai_remote_control::models::AgentStatus::Quarantined
             )
         {
-            info!(%agent_id, "agent is quarantined or deleted; refusing WS");
+            // rc.53: push a `ServerMsg::Goodbye { reason: AgentDeleted }`
+            // text frame + a Close frame BEFORE dropping the socket so
+            // the agent can log a useful "your row was deleted, re-enrol"
+            // line instead of an opaque `ws read` (the failure mode
+            // PC55331 wedged on for hours pre-rc.53). The agent's
+            // `handle_server_msg::ServerMsg::Goodbye` arm decides this is
+            // fatal + exits with `AGENT_DELETED_EXIT_CODE = 7`, which
+            // the SCM supervisor's rc.53 code-7 fast-alarm fires on the
+            // FIRST exit.
+            info!(%agent_id, "agent is quarantined or deleted; refusing WS with rc:goodbye");
+            let goodbye = roomler_ai_remote_control::signaling::ServerMsg::Goodbye {
+                reason: roomler_ai_remote_control::signaling::AgentCloseReason::AgentDeleted,
+                message: "This agent's server-side row was deleted (or quarantined). \
+                          Re-enrol with a fresh enrollment token from the admin UI to \
+                          revive (soft-deleted rows rehydrate by (tenant_id, machine_id))."
+                    .into(),
+            };
+            send_goodbye_and_close(socket, &goodbye, 4003, "agent_deleted").await;
             return;
         }
         crate::ws::remote_control::handle_agent_socket(
@@ -198,6 +225,51 @@ fn ws_upgrade_agent(state: AppState, token: String, ws: WebSocketUpgrade) -> Res
         )
         .await;
     })
+}
+
+/// rc.53: push a server-initiated close frame WITH a structured
+/// `ServerMsg` text frame in front of it, so the agent / tunnel-client
+/// learns WHY the connection is being closed before the socket
+/// drops. Used at the WS-handler refusal sites (`ws_upgrade_agent` /
+/// `ws_upgrade_tunnel_client`) when the row is deleted or
+/// quarantined.
+///
+/// Tungstenite serialises both frames into the same outbound TCP
+/// buffer; the OS delivers them in order. No `sleep` guard is needed
+/// — the `.await` on `send(Close)` completes the underlying flush.
+/// On send-error we still attempt the close so the agent at least
+/// gets the TCP FIN; on close-send-error we just drop (the socket
+/// is already dead, nothing further to do).
+async fn send_goodbye_and_close<M: serde::Serialize>(
+    socket: WebSocket,
+    msg: &M,
+    close_code: u16,
+    close_reason: &str,
+) {
+    let mut socket = socket;
+    let json = match serde_json::to_string(msg) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(%e, "failed to serialise Goodbye payload; closing without it");
+            let _ = socket.send(Message::Close(None)).await;
+            return;
+        }
+    };
+    if let Err(e) = socket.send(Message::Text(json.into())).await {
+        warn!(%e, "Goodbye text-send failed; attempting close anyway");
+    }
+    if let Err(e) = socket
+        .send(Message::Close(Some(CloseFrame {
+            code: close_code,
+            reason: close_reason.to_string().into(),
+        })))
+        .await
+    {
+        debug!(%e, "Goodbye close-send failed (socket may already be dropped)");
+    }
+    // socket drops here; tungstenite has flushed both frames into
+    // the outbound TCP buffer before the close-send `.await`
+    // returned.
 }
 
 async fn handle_socket(socket: WebSocket, state: AppState, user_id: ObjectId, username: String) {

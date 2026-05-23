@@ -856,7 +856,65 @@ async fn enroll_cmd(
     println!("Enrollment successful. Agent id: {}", cfg.agent_id);
     println!("Config written to: {}", target_path.display());
     println!("Run `roomler-agent run` to connect.");
+
+    // rc.53 Phase 7: PC55331's recurring pain — operator runs
+    // `enroll --machine-global` from a user PowerShell, the config
+    // lands in %PROGRAMDATA% (where the LocalSystem service reads
+    // it), but then `roomler-agent run` from THAT SAME user shell
+    // reads %APPDATA% (a separate config, different machine_id) and
+    // looks like a different host to the server. Surface the
+    // asymmetry explicitly so the operator doesn't burn an hour
+    // chasing "but I just enrolled!".
+    #[cfg(target_os = "windows")]
+    if machine_global && enroll_user_context_warning_due() {
+        eprintln!();
+        eprint!("{}", warning_message_for_user_context_enroll());
+    }
     Ok(())
+}
+
+/// rc.53 Phase 7 predicate: should the `--machine-global` enroll
+/// command print the user-vs-LocalSystem warning? True when the
+/// current process is NOT the LocalSystem worker — i.e. the operator
+/// is enrolling from a user shell where `roomler-agent run` would
+/// later read %APPDATA% instead of %PROGRAMDATA%.
+///
+/// Gated on `system-context` feature + Windows; non-Windows / non-SC
+/// builds always return false (no risk of asymmetry).
+#[cfg(all(feature = "system-context", target_os = "windows"))]
+fn enroll_user_context_warning_due() -> bool {
+    // main.rs is the bin crate; reach into the lib via its crate name
+    // — mirrors the existing call sites at :404, :476, :637, :1032, :1792.
+    // Local cargo test caught this only via the bin-tests build path
+    // because the test binary doesn't exercise the system-context feature.
+    use roomler_agent::system_context::worker_role::{WorkerRole, probe_self};
+    !matches!(probe_self(), Ok(WorkerRole::SystemContext))
+}
+
+#[cfg(all(not(feature = "system-context"), target_os = "windows"))]
+fn enroll_user_context_warning_due() -> bool {
+    // Without the system-context feature there is no SCM worker that
+    // would read %PROGRAMDATA% anyway, so the warning is always
+    // appropriate when --machine-global is used (the operator may
+    // be testing the install path or building an unusual config).
+    true
+}
+
+/// rc.53 Phase 7 message body. Extracted as a pure function so the
+/// unit test asserts the marker phrases without duplicating the
+/// string.
+#[cfg(target_os = "windows")]
+fn warning_message_for_user_context_enroll() -> String {
+    "NOTE: --machine-global wrote config to %PROGRAMDATA%, which is read by\n\
+     the LocalSystem service worker. A `roomler-agent run` from THIS user\n\
+     shell will instead read %APPDATA% (a separate config, different\n\
+     machine_id) and will look like a different host to the server.\n\
+\n\
+Either:\n\
+ (a) start the service: `sc start roomler-agent`  — uses %PROGRAMDATA%;\n\
+ (b) re-run `enroll` without --machine-global if you want to test in\n\
+     THIS user shell (will produce a different agent_id).\n"
+        .to_string()
 }
 
 async fn re_enroll_cmd(config_path: &PathBuf, enrollment_token: &str) -> Result<()> {
@@ -1894,6 +1952,37 @@ mod tests {
             Some(Command::RestartService { timeout_secs }) => assert_eq!(timeout_secs, 60),
             other => panic!("expected RestartService --timeout-secs 60, got {other:?}"),
         }
+    }
+
+    /// rc.53 Phase 7: the stderr warning for the
+    /// `%APPDATA% / %PROGRAMDATA%` same-session asymmetry that PC55331
+    /// burned hours on. Locks the marker phrases so a refactor that
+    /// drops "sc start roomler-agent" or "%APPDATA%" or "without
+    /// --machine-global" trips the test before it ships.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn enroll_warning_message_contains_expected_phrases() {
+        let msg = warning_message_for_user_context_enroll();
+        assert!(
+            msg.contains("sc start roomler-agent"),
+            "warning must reference `sc start roomler-agent` so the operator can run option (a): {msg}"
+        );
+        assert!(
+            msg.contains("%APPDATA%"),
+            "warning must call out %APPDATA% explicitly so the operator understands which path the user shell reads: {msg}"
+        );
+        assert!(
+            msg.contains("%PROGRAMDATA%"),
+            "warning must call out %PROGRAMDATA% so the operator sees the asymmetry: {msg}"
+        );
+        assert!(
+            msg.contains("without --machine-global"),
+            "warning must mention option (b) — re-running enroll without --machine-global: {msg}"
+        );
+        assert!(
+            msg.contains("machine_id"),
+            "warning must explain the failure mode (different machine_id) so the operator understands WHY this matters: {msg}"
+        );
     }
 
     /// The rc.30 Done-page snippet's exact form. If this test parses,
