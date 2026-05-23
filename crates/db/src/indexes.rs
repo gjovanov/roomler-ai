@@ -230,8 +230,7 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> 
     // UI query: "last N crashes for this agent in this tenant",
     // sorted by client-supplied `crashed_at_unix` desc. See
     // `roomler_ai_remote_control::models::AgentCrashRecord` for the
-    // shape + the Task 9 plan
-    // (`C:\Users\goran\.claude\plans\lucky-wiggling-marble.md`).
+    // shape (defined by the crash-report plan).
     create_indexes(
         db,
         "agent_crashes",

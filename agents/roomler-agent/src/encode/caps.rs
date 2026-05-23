@@ -105,9 +105,10 @@ fn compute_caps() -> AgentCaps {
 
         // AV1: same reasoning as HEVC, with sharper impact — the
         // RTX 5090 Blackwell regression causes the NVIDIA AV1 MFT to
-        // enumerate-and-fail on every activation on this dev box
-        // (HANDOVER7 §1). Probe-at-startup filters this out so the
-        // agent doesn't advertise a codec it can't actually produce.
+        // enumerate-and-fail on every activation on dev hardware
+        // (see `Known Issues` in CLAUDE.md). Probe-at-startup
+        // filters this out so the agent doesn't advertise a codec
+        // it can't actually produce.
         if let Ok(adapters) = super::mf::probe_av1_adapter_count()
             && adapters > 0
         {
