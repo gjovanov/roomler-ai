@@ -252,7 +252,11 @@ pub async fn delete_agent(
     }
 
     state.agents.soft_delete(tid, aid).await?;
-    state.rc_hub.unregister_agent(aid); // kick any live WS
+    // rc.53: admin-driven kick — no tx identity to thread through;
+    // pass None to force unconditional removal (the identity gate is
+    // only for the displaced-handler unregister race, not for
+    // operator kicks).
+    state.rc_hub.unregister_agent(aid, None); // kick any live WS
     Ok(Json(serde_json::json!({ "deleted": true })))
 }
 

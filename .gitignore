@@ -10,6 +10,7 @@ Cargo.lock
 *.swp
 *.swo
 *~
+webrtc-dump
 .DS_Store
 node_modules
 ui/node_modules
