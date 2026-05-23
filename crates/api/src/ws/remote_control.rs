@@ -63,10 +63,20 @@ pub async fn handle_agent_socket(
     }
 
     // Register with the Hub and start pumping server → socket.
+    //
+    // rc.53: register_agent now returns `(tx, cancel, rx)`:
+    //   * `tx` is captured for the eventual `unregister_agent` call so
+    //     a displaced-handler late unregister doesn't evict a newer
+    //     connection's entry (critique #4 race fix).
+    //   * `cancel` is an `Arc<Notify>` the read-loop `select!`s on,
+    //     so a displacement triggers an immediate read-loop exit
+    //     instead of waiting up to one 25 s keepalive interval.
+    //   * `rx` feeds the pump task as before.
     let max_sessions = caps.max_simultaneous_sessions.max(1);
-    let rx = state
-        .rc_hub
-        .register_agent(agent_id, tenant_id, owner_user_id, os, max_sessions);
+    let (registered_tx, cancel, rx) =
+        state
+            .rc_hub
+            .register_agent(agent_id, tenant_id, owner_user_id, os, max_sessions);
     let pump_socket_tx = socket_tx.clone();
     let pump = tokio::spawn(pump_server_messages(rx, pump_socket_tx));
 
@@ -81,47 +91,72 @@ pub async fn handle_agent_socket(
         controller_tx: None,
     };
 
-    // Read loop.
-    while let Some(msg) = socket_rx.next().await {
-        match msg {
-            Ok(Message::Text(text)) => match serde_json::from_str::<ClientMsg>(&text) {
-                Ok(parsed) => {
-                    // Tunnel-flow variants intercept first — Hub doesn't
-                    // know about tunnel-clients, so we route directly
-                    // through `AppState::tunnel_clients_by_session`. If
-                    // it's not a tunnel-flow variant the helper returns
-                    // the value unchanged for the Hub to handle.
-                    let Some(parsed) = relay_tunnel_msg_from_agent(&state, parsed).await else {
-                        continue;
-                    };
-                    // Phase 7: refresh last_seen_at on every heartbeat. Hub
-                    // dispatch is a no-op for AgentHeartbeat (handled here);
-                    // we still call dispatch so any future routing logic
-                    // (e.g. metrics fan-out) only needs one entry point.
-                    let is_heartbeat = matches!(&parsed, ClientMsg::AgentHeartbeat { .. });
-                    if let Err(e) = state.rc_hub.dispatch(&ctx, parsed) {
-                        warn!(%agent_id, %e, "rc:* dispatch failed (agent)");
-                    }
-                    if is_heartbeat && let Err(e) = state.agents.touch_heartbeat(agent_id).await {
-                        warn!(%agent_id, %e, "agent touch_heartbeat failed");
-                    }
-                }
-                Err(e) => {
-                    debug!(%agent_id, %e, "ignoring non-rc:* message on agent socket");
-                }
-            },
-            Ok(Message::Ping(data)) => {
-                let mut guard = socket_tx.lock().await;
-                let _ = guard.send(Message::Pong(data)).await;
+    // Read loop. rc.53: wrapped in `tokio::select!` so the Hub's
+    // displacement-cancel notify exits this loop within milliseconds
+    // — without the cancel arm, a displaced socket would linger up
+    // to one 25 s keepalive interval (auto-fail #3 in v2 plan).
+    loop {
+        tokio::select! {
+            // `biased` so cancel fires deterministically when both
+            // arms are ready in the same poll cycle. Without this,
+            // tokio's random arm selection could starve the cancel
+            // for several iterations in a hot read loop.
+            biased;
+            _ = cancel.notified() => {
+                info!(%agent_id, "agent connection cancelled by Hub (replaced by newer); exiting read-loop");
+                break;
             }
-            Ok(Message::Close(_)) | Err(_) => break,
-            _ => {}
+            maybe_msg = socket_rx.next() => {
+                let Some(msg) = maybe_msg else { break };
+                match msg {
+                    Ok(Message::Text(text)) => match serde_json::from_str::<ClientMsg>(&text) {
+                        Ok(parsed) => {
+                            // Tunnel-flow variants intercept first — Hub doesn't
+                            // know about tunnel-clients, so we route directly
+                            // through `AppState::tunnel_clients_by_session`. If
+                            // it's not a tunnel-flow variant the helper returns
+                            // the value unchanged for the Hub to handle.
+                            let Some(parsed) = relay_tunnel_msg_from_agent(&state, parsed).await else {
+                                continue;
+                            };
+                            // Phase 7: refresh last_seen_at on every heartbeat. Hub
+                            // dispatch is a no-op for AgentHeartbeat (handled here);
+                            // we still call dispatch so any future routing logic
+                            // (e.g. metrics fan-out) only needs one entry point.
+                            let is_heartbeat = matches!(&parsed, ClientMsg::AgentHeartbeat { .. });
+                            if let Err(e) = state.rc_hub.dispatch(&ctx, parsed) {
+                                warn!(%agent_id, %e, "rc:* dispatch failed (agent)");
+                            }
+                            if is_heartbeat && let Err(e) = state.agents.touch_heartbeat(agent_id).await {
+                                warn!(%agent_id, %e, "agent touch_heartbeat failed");
+                            }
+                        }
+                        Err(e) => {
+                            debug!(%agent_id, %e, "ignoring non-rc:* message on agent socket");
+                        }
+                    },
+                    Ok(Message::Ping(data)) => {
+                        let mut guard = socket_tx.lock().await;
+                        let _ = guard.send(Message::Pong(data)).await;
+                    }
+                    Ok(Message::Close(_)) | Err(_) => break,
+                    _ => {}
+                }
+            }
         }
     }
 
-    // Teardown: unregister + mark offline. Pump task exits when the Hub drops
-    // its sender (during unregister_agent), so we don't need to abort it.
-    state.rc_hub.unregister_agent(agent_id);
+    // Teardown: unregister + mark offline. rc.53: thread `registered_tx`
+    // into unregister_agent so a displaced-handler late unregister
+    // doesn't evict the newer connection's registry entry
+    // (critique #4 race fix). Pump task exits when the Hub drops its
+    // sender (during unregister_agent), so we don't need to abort it
+    // explicitly — but the `pump.abort()` is kept as a belt-and-
+    // suspenders for the case where the tx-identity check skipped
+    // the removal and the pump is still wired to the live channel.
+    state
+        .rc_hub
+        .unregister_agent(agent_id, Some(&registered_tx));
     pump.abort();
     if let Err(e) = state
         .agents
