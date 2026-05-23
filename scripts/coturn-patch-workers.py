@@ -1,10 +1,11 @@
 """One-off patch: rewrite the :443 block in /usr/local/bin/coturn-iptables.sh
-on zeus + jupiter so UDP/443 routes to coturn:3478 (plain TURN) instead of
-:5349 (DTLS/TLS). See coturn-patch-mars.py for the full rationale.
+on the secondary coturn worker hosts so UDP/443 routes to coturn:3478
+(plain TURN) instead of :5349 (DTLS/TLS). See coturn-patch-primary.py for
+the full rationale.
 
-zeus/jupiter use a different script layout than mars (literal iptables lines
-instead of an add_dnat() helper loop), so the patch is a simple string
-substitution on the two UDP/443 lines.
+The worker hosts use a different script layout than the primary (literal
+iptables lines instead of an add_dnat() helper loop), so the patch is a
+simple string substitution on the two UDP/443 lines.
 """
 import pathlib, sys
 

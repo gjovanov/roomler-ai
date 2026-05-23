@@ -141,7 +141,7 @@ describe('useAgentStore', () => {
           logTail: 'line 1\nline 2',
           agentVersion: '0.3.0-rc.35',
           os: 'windows',
-          hostname: 'PC50045',
+          hostname: 'the field-test host',
           pid: 4567,
         },
       ],

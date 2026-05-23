@@ -36,7 +36,7 @@
       <!-- Desktop / tablet (≥ sm): full table. Action column is leftmost so
            it never falls off the right edge regardless of overflow; codec
            chips collapse to "+N" on lgAndDown to reclaim ~200px on mid-width
-           viewports (was the field bug from PC50045 2026-05-01: "cannot
+           viewports (was the field bug from the field-test host 2026-05-01: "cannot
            select the last Laptop in the list, not possible to scroll").
            Below sm we render the dedicated card list further down. -->
       <v-table
@@ -150,7 +150,7 @@
       <!-- Mobile: stacked card list. Each card is a tappable target;
            Connect / Delete actions are full-width buttons at the bottom
            of the card so the rightmost item is reachable on a narrow
-           viewport (the field bug from PC50045 2026-05-01: "cannot
+           viewport (the field bug from the field-test host 2026-05-01: "cannot
            select the last Laptop in the list, not possible to scroll").
            Codecs / version / last-seen drop to small lines so the
            card stays compact at ~120px tall. -->

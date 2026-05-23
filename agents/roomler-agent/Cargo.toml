@@ -283,9 +283,9 @@ full-hw = ["full", "mf-encoder", "wgc-capture", "viewer-indicator"]
 # The perMachine MSI build sets `--features full-hw,system-context`;
 # the perUser MSI never compiles any of this.
 #
-# Empirically validated on PC50045 2026-05-04 via the M3 A1 pre-flight
-# probe binary — see HANDOVER12.md and memory
-# `project_m3_a1_preflights_2_3_5.md`. Architecture: DXGI Desktop
+# Empirically validated on a Windows field-test host 2026-05-04 via
+# the M3 A1 pre-flight probe binary (see memory
+# `project_m3_a1_preflights_2_3_5.md`). Architecture: DXGI Desktop
 # Duplication + winlogon-token spawn + LocalSystem SCM service +
 # lazy-rebind SetThreadDesktop on input. Replicates RustDesk's
 # pattern; no kernel driver, no undocumented APIs.

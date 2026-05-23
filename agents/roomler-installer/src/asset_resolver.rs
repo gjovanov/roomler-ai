@@ -6,7 +6,7 @@
 //! corporate ESET / Defender allow-lists are typically per-domain;
 //! roomler.ai's TLS cert is already trusted by IT (the agent's
 //! signaling traffic uses it), github.com is often blocked outright.
-//! PC50045 field repro 2026-05-11.
+//! the field-test host field repro 2026-05-11.
 //!
 //! Flow per install:
 //!   1. `resolve(flavour, version)` → GET `/installer/{flavour}/health`

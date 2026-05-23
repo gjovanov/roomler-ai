@@ -101,7 +101,7 @@
            stowed physical keyboard. Visible at every viewport
            during a connected session — the phone use case is the
            main driver but desktop operators have asked for it too
-           (PC50045 use case where the user types the host's
+           (the field-test host use case where the user types the host's
            username during an unlock from another PC). -->
       <v-btn
         v-if="rc.phase.value === 'connected'"
@@ -870,7 +870,7 @@
          toolbar button; shows the tail of the agent's rolling log file
          in a scrolling pre-block. Refresh button re-fetches. Auto-fetches
          on open with 500 lines (default) — enough to capture the run-up
-         to a typical upload failure on PC50045 without flooding the DC. -->
+         to a typical upload failure on the field-test host without flooding the DC. -->
     <v-dialog v-model="agentLogDialog" max-width="980" scrollable>
       <v-card>
         <v-toolbar density="compact" color="primary">
@@ -2545,7 +2545,7 @@ onBeforeUnmount(() => {
    borderline viewports where a long agent name + chips push past
    320px. The `flex-shrink: 1` on the title lets it ellipsis instead
    of forcing the end-of-row buttons off-screen. Field bug
-   PC50045 mobile 2026-05-01 ('cannot fullscreen, button is gone'
+   the field-test host mobile 2026-05-01 ('cannot fullscreen, button is gone'
    after Connect mounted +5 buttons in the single-row toolbar). */
 .remote-control-wrapper :deep(.rc-toolbar-primary .v-toolbar__content) {
   overflow-x: auto;

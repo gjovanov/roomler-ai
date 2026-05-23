@@ -28,7 +28,7 @@
 //!
 //! ## Privileges
 //!
-//! Empirically confirmed on PC50045 / Win11 24H2 (memory
+//! Empirically confirmed on the field-test host / Win11 24H2 (memory
 //! `project_m3_a1_preflights_2_3_5.md`): the bare 4-step sequence
 //! works without `AdjustTokenPrivileges`. SE_TCB_NAME and
 //! SE_IMPERSONATE are present in the spawned child by default;

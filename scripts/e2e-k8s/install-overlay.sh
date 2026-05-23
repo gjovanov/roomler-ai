@@ -1,13 +1,13 @@
 #!/bin/bash
 # One-shot installer that copies the e2e overlay template into the
-# deploy repo on mars. Run from the local repo root on mars:
+# deploy repo on the build host. Run from the local repo root:
 #   bash scripts/e2e-k8s/install-overlay.sh
 # Then commit + push the deploy repo if you want gitops to track it
 # (recommended: don't auto-sync via ArgoCD — keep manual-apply).
 set -euo pipefail
 
 REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}"
-DEPLOY_REPO="${DEPLOY_REPO:-/home/gjovanov/roomler-ai-deploy}"
+DEPLOY_REPO="${DEPLOY_REPO:-$HOME/roomler-ai-deploy}"
 DST="$DEPLOY_REPO/k8s/overlays/e2e"
 
 if [ ! -d "$DEPLOY_REPO" ]; then

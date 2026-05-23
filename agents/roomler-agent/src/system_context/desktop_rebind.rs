@@ -166,7 +166,7 @@ pub fn try_change_desktop() -> Result<DesktopChange> {
     // recycles the desktop's session_id. Re-binding to the FRESH
     // handle every time costs one syscall (~µs) but means the
     // thread's access token is always current. Field repro
-    // PC50045 rc.8 (2026-05-06): try_change_desktop returned
+    // the field-test host rc.8 (2026-05-06): try_change_desktop returned
     // Unchanged across a Win+L cycle (names matched stale handle)
     // but SendInput failed ACCESS_DENIED because the bound handle
     // had stale rights.

@@ -22,7 +22,7 @@ const API = process.env.API_URL || 'http://localhost:5001';
 const WS_BASE = process.env.WS_URL || 'ws://localhost:5001/ws';
 const MONGO_URL = process.env.MONGO_URL || 'mongodb://localhost:27019';
 const DB_NAME = process.env.DB_NAME || 'roomler-ai';
-const RESULTS_FILE = process.env.RESULTS_FILE || '/home/gjovanov/gjovanov/roomler-ai/stress-test-results.txt';
+const RESULTS_FILE = process.env.RESULTS_FILE || `${process.env.HOME ?? '.'}/roomler-ai/stress-test-results.txt`;
 
 // Tuning
 const BATCH_SIZE = 10;

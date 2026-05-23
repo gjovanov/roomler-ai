@@ -137,7 +137,7 @@ impl AgentInternal {
                 };
 
                 if let Err(err) = result {
-                    // Roomler vendor patch (2026-05-18 PC55331 log-flood
+                    // Roomler vendor patch (2026-05-18 a third field-test host log-flood
                     // fix): downgrade per-attempt STUN build failures
                     // to DEBUG so they don't drown the rolling log,
                     // and prefix with a target so they're greppable.
@@ -303,7 +303,7 @@ impl ControllingSelector for AgentInternal {
         };
 
         if let Err(err) = result {
-            // Roomler vendor patch (2026-05-18 PC55331 log-flood fix):
+            // Roomler vendor patch (2026-05-18 a third field-test host log-flood fix):
             // see nominate_pair above; per-candidate STUN build
             // failures are not session-fatal.
             log::debug!(target: "webrtc_ice::ping_candidate", "STUN message build failed: {}", err);
@@ -458,7 +458,7 @@ impl ControlledSelector for AgentInternal {
         };
 
         if let Err(err) = result {
-            // Roomler vendor patch (2026-05-18 PC55331 log-flood fix):
+            // Roomler vendor patch (2026-05-18 a third field-test host log-flood fix):
             // see nominate_pair above; per-candidate STUN build
             // failures are not session-fatal.
             log::debug!(target: "webrtc_ice::ping_candidate", "STUN message build failed: {}", err);

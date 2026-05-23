@@ -111,7 +111,7 @@ pub fn marker_path() -> PathBuf {
 /// marker effectively went stale 15 s after the first heartbeat
 /// regardless of how many subsequent writes happened. Writing varying
 /// bytes (the timestamp differs every second) forces NTFS to advance
-/// the mtime on every call. Field repro: PC50045 0.3.0-rc.2 2026-05-05
+/// the mtime on every call. Field repro: the field-test host 0.3.0-rc.2 2026-05-05
 /// — `peer-presence-status` self-write probe showed `signal_connected:
 /// OK; post-write age=2162s` after a successful write.
 pub fn signal_connected() -> std::io::Result<()> {

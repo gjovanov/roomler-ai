@@ -13,7 +13,7 @@
 //! SystemContext worker can't see it via the default
 //! `ProjectDirs::config_dir()` lookup.
 //!
-//! Field repro PC50045 2026-05-06: every SystemContext spawn exited
+//! Field repro the field-test host 2026-05-06: every SystemContext spawn exited
 //! with `code=1` within ~500 ms, no log files written. Root cause:
 //! `config::load(default_path)` returned `not found` for the SYSTEM-
 //! profile path; `anyhow` propagated to main; process exited with
@@ -96,7 +96,7 @@ pub fn active_user_config_path() -> Option<PathBuf> {
 /// SystemContext to land uploads in the user's actual Downloads
 /// folder, not the LocalSystem profile's
 /// `C:\Windows\System32\config\systemprofile\Downloads\` (which
-/// usually doesn't exist; field repro PC50045 rc.7: the file-DC
+/// usually doesn't exist; field repro the field-test host rc.7: the file-DC
 /// `begin()` call hung because `tokio::fs::create_dir_all` failed
 /// silently on a path with no SYSTEM-profile parent ACL grant).
 ///

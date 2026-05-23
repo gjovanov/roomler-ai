@@ -1,6 +1,6 @@
 //! Lock-screen detection for the user-context worker (M3 Z-path).
 //!
-//! Background. The M5 verification on PC50045 + e069019l confirmed
+//! Background. The M5 verification on the field-test host + operator confirmed
 //! the field gap: when the user presses Win+L (or Windows otherwise
 //! switches the input desktop to `winsta0\Winlogon`), the user-
 //! context agent worker stays alive — `WTSGetActiveConsoleSessionId`
@@ -128,7 +128,7 @@ mod win {
     /// input desktop IS `Default` and the operator's clicks
     /// should go through to admin pwsh / elevated apps.
     ///
-    /// Field repro on PC50045 between rc.7 (verified working) and
+    /// Field repro on the field-test host between rc.7 (verified working) and
     /// rc.21: mouse stopped responding when the operator hovered
     /// an elevated pwsh window. See
     /// `docs/remote-control-m3-elevated-switching.md` for the

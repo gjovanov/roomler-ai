@@ -2,19 +2,21 @@
 # migrate-tier-policy.sh — 2026-05-02
 #
 # One-shot migration to enforce the cluster tier policy:
-#   tickytack + roomler-old: worker-1 (mars utility) -> high-perf
-#                            (fresh init, old data on mars assumed stale)
-#   bauleiter + regal:       worker-3 (jupiter HP)   -> mars utility
-#                            (data restored from /home/gjovanov/migration-backups/)
+#   tickytack + roomler-old: utility-worker -> high-perf
+#                            (fresh init, old data on utility assumed stale)
+#   bauleiter + regal:       high-perf      -> utility-worker
+#                            (data restored from $BACKUP_DIR)
 #
 # Idempotent — safe to re-run after any failure or ssh drop.
-# Logs to /home/gjovanov/migration-tier-policy.log.
+# Logs to $LOG. Override BACKUP_DIR / LOG / DEPLOY_PARENT in the env if
+# your layout differs from the defaults below.
 #
-# Run on mars as gjovanov (kubectl context already configured).
+# Run on the build host as a user with kubectl context configured.
 
 set -uo pipefail
-BACKUP_DIR=/home/gjovanov/migration-backups
-LOG=/home/gjovanov/migration-tier-policy.log
+BACKUP_DIR="${BACKUP_DIR:-$HOME/migration-backups}"
+LOG="${LOG:-$HOME/migration-tier-policy.log}"
+DEPLOY_PARENT="${DEPLOY_PARENT:-$HOME}"
 exec > >(tee -a "$LOG") 2>&1
 echo
 echo "=================================================="
@@ -162,9 +164,9 @@ delete_pvc tickytack mongodb-data
 delete_pv  tickytack-mongodb-pv
 make_pv    tickytack-mongodb-pv mongodb tickytack 5Gi /data/tickytack/mongodb k8s-worker-3 mongodb-data
 make_pvc   tickytack mongodb-data tickytack-mongodb-pv 5Gi
-remove_hostname_pin /home/gjovanov/tickytack-deploy/k8s/base/deployment-tickytack.yaml
-remove_hostname_pin /home/gjovanov/tickytack-deploy/k8s/base/statefulset-mongodb.yaml
-push_deploy /home/gjovanov/tickytack-deploy 'feat(scheduling): unpin worker-1; tier=high-performance overlay handles placement (M5 migration)'
+remove_hostname_pin "$DEPLOY_PARENT"/tickytack-deploy/k8s/base/deployment-tickytack.yaml
+remove_hostname_pin "$DEPLOY_PARENT"/tickytack-deploy/k8s/base/statefulset-mongodb.yaml
+push_deploy "$DEPLOY_PARENT"/tickytack-deploy 'feat(scheduling): unpin worker-1; tier=high-performance overlay handles placement (M5 migration)'
 
 # ======================================================================
 # roomler-old — to worker-2 (zeus HP), fresh init
@@ -179,13 +181,13 @@ make_pv    roomler-mongodb-pv mongodb roomler 5Gi /data/roomler/mongodb k8s-work
 make_pv    roomler-uploads-pv roomler  roomler 5Gi /data/roomler/uploads k8s-worker-2 roomler-uploads
 make_pvc   roomler mongodb-data    roomler-mongodb-pv 5Gi
 make_pvc   roomler roomler-uploads roomler-uploads-pv 5Gi
-for f in /home/gjovanov/roomler-deploy/k8s/base/deployment-janus.yaml \
-         /home/gjovanov/roomler-deploy/k8s/base/deployment-redis.yaml \
-         /home/gjovanov/roomler-deploy/k8s/base/deployment-roomler.yaml \
-         /home/gjovanov/roomler-deploy/k8s/base/statefulset-mongodb.yaml; do
+for f in "$DEPLOY_PARENT"/roomler-deploy/k8s/base/deployment-janus.yaml \
+         "$DEPLOY_PARENT"/roomler-deploy/k8s/base/deployment-redis.yaml \
+         "$DEPLOY_PARENT"/roomler-deploy/k8s/base/deployment-roomler.yaml \
+         "$DEPLOY_PARENT"/roomler-deploy/k8s/base/statefulset-mongodb.yaml; do
   remove_hostname_pin "$f"
 done
-push_deploy /home/gjovanov/roomler-deploy 'feat(scheduling): unpin worker-1; tier=high-performance overlay handles placement (M5 migration)'
+push_deploy "$DEPLOY_PARENT"/roomler-deploy 'feat(scheduling): unpin worker-1; tier=high-performance overlay handles placement (M5 migration)'
 
 # ======================================================================
 # bauleiter — to worker-1 (mars utility), data restored from backup
@@ -200,17 +202,17 @@ make_pv    bauleiter-mongodb-pv  mongodb   bauleiter 1Gi /data/arse/mongodb     
 make_pv    bauleiter-uploads-pv  bauleiter bauleiter 1Gi /data/arse/bauleiter-uploads k8s-worker-1 bauleiter-uploads
 make_pvc   bauleiter mongodb-data      bauleiter-mongodb-pv  1Gi
 make_pvc   bauleiter bauleiter-uploads bauleiter-uploads-pv 1Gi
-change_hostname_pin /home/gjovanov/bauleiter-deploy/k8s/base/deployment-bauleiter.yaml k8s-worker-1
-change_hostname_pin /home/gjovanov/bauleiter-deploy/k8s/base/statefulset-mongodb.yaml  k8s-worker-1
+change_hostname_pin "$DEPLOY_PARENT"/bauleiter-deploy/k8s/base/deployment-bauleiter.yaml k8s-worker-1
+change_hostname_pin "$DEPLOY_PARENT"/bauleiter-deploy/k8s/base/statefulset-mongodb.yaml  k8s-worker-1
 
 # Append tier=utility patch to bauleiter overlay (deferred earlier).
-KUST=/home/gjovanov/bauleiter-deploy/k8s/overlays/prod/kustomization.yaml
+KUST="$DEPLOY_PARENT"/bauleiter-deploy/k8s/overlays/prod/kustomization.yaml
 if [ -f /tmp/tier-patch.tmpl ] && ! grep -q '^patches:' "$KUST"; then
   sed 's/TIER_VALUE/utility/g' /tmp/tier-patch.tmpl >> "$KUST"
   echo "OVERLAY bauleiter-deploy: added tier=utility patch"
 fi
 
-push_deploy /home/gjovanov/bauleiter-deploy 'feat(scheduling): repin worker-1 + tier=utility (M5 migration jupiter->mars)'
+push_deploy "$DEPLOY_PARENT"/bauleiter-deploy 'feat(scheduling): repin worker-1 + tier=utility (M5 migration jupiter->mars)'
 
 wait_pod_on_node bauleiter app=mongodb k8s-worker-1 300
 
@@ -218,8 +220,11 @@ wait_pod_on_node bauleiter app=mongodb k8s-worker-1 300
 DUMP="$BACKUP_DIR/bauleiter-mongo.dump.gz"
 if [ -f "$DUMP" ] && [ "$(stat -c%s "$DUMP")" -gt 100 ]; then
   echo "Restoring bauleiter mongo dump..."
+  : "${MONGO_ADMIN_USER:?set MONGO_ADMIN_USER for mongorestore}"
+  : "${MONGO_ADMIN_PASS:?set MONGO_ADMIN_PASS for mongorestore}"
   kubectl -n bauleiter exec -i mongodb-0 -- mongorestore \
-    --username=XplorifyAdmin --password='Xp12345!' --authenticationDatabase=admin \
+    --username="$MONGO_ADMIN_USER" --password="$MONGO_ADMIN_PASS" \
+    --authenticationDatabase=admin \
     --gzip --archive --drop \
     < "$DUMP"
   echo "bauleiter mongo: restored"
@@ -252,8 +257,8 @@ make_pv    regal-regalbg-data-pv    regalbg regal 1Gi /data/arse/regalbg-data   
 make_pv    regal-regalbg-uploads-pv regalbg regal 1Gi /data/arse/regalbg-uploads k8s-worker-1 regalbg-uploads
 make_pvc   regal regalbg-data    regal-regalbg-data-pv    1Gi
 make_pvc   regal regalbg-uploads regal-regalbg-uploads-pv 1Gi
-change_hostname_pin /home/gjovanov/regal-deploy/k8s/base/deployment-regalbg.yaml k8s-worker-1
-push_deploy /home/gjovanov/regal-deploy 'feat(scheduling): repin worker-1 (M5 migration jupiter->mars)'
+change_hostname_pin "$DEPLOY_PARENT"/regal-deploy/k8s/base/deployment-regalbg.yaml k8s-worker-1
+push_deploy "$DEPLOY_PARENT"/regal-deploy 'feat(scheduling): repin worker-1 (M5 migration jupiter->mars)'
 
 wait_pod_on_node regal app=regalbg k8s-worker-1 300
 

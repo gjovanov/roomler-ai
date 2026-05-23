@@ -51,7 +51,7 @@ pub const MIN_INSTALLER_BYTES: usize = 1_000_000;
 /// At-startup update-check cooldown. If we last spawned an installer
 /// within this window, skip the immediate `check_once` and proceed
 /// straight to the periodic interval. Prevents the install-storm
-/// failure mode found on host `e069019l` (2026-05-02): SCM service
+/// failure mode found on host `operator` (2026-05-02): SCM service
 /// supervisor + auto-updater + freshly-downloaded MSI = each newly
 /// spawned worker re-detects the same pending update, fires another
 /// installer, exits clean (code=0), supervisor respawns, repeat. The
@@ -275,7 +275,7 @@ pub fn is_newer(latest: &str, current: &str) -> bool {
 /// Used by [`pick_asset_for_platform`] to download the matching MSI
 /// for in-place upgrade — installing the wrong flavour silently fails
 /// the launch-condition check shipped in 0.2.5 and the auto-update
-/// loop never makes forward progress (field repro: PC50045
+/// loop never makes forward progress (field repro: the field-test host
 /// 2026-05-02, perUser agent on 0.2.0 picked the perMachine 0.2.5 MSI
 /// alphabetically; UAC-elevated install rejected by the cross-flavour
 /// guard; agent restarted at 0.2.0 forever).
@@ -727,7 +727,7 @@ pub fn spawn_installer_with_watch(
     // under SCM supervision) reads this marker on its first iteration
     // to skip the immediate update check. Without this, the worker
     // detects the same pending update, spawns another installer, and
-    // we get an install-storm. Field repro: e069019l 2026-05-02.
+    // we get an install-storm. Field repro: operator 2026-05-02.
     record_update_attempt();
     let installer_pid = spawn_installer_inner(installer_path)?;
     if let Some(tag) = expected_version
@@ -752,7 +752,7 @@ pub fn spawn_installer_with_watch(
 /// - **perMachine**: `/qb!` (basic UI, no Cancel). The MSI's
 ///   `InstallScope='perMachine'` REQUIRES elevation; `/qn` would
 ///   suppress the UAC prompt and the install would silently fail
-///   (the 2026-05-10 PC50045 field repro). `/qb!` shows a minimal
+///   (the 2026-05-10 the field-test host field repro). `/qb!` shows a minimal
 ///   progress dialog while still allowing UAC to prompt when the
 ///   caller is non-elevated. Pair with [`spawn_installer_inner`]'s
 ///   `ShellExecuteExW`-with-`runas` path so the elevation actually
@@ -812,8 +812,8 @@ pub fn spawn_installer_inner(installer_path: &std::path::Path) -> Result<u32> {
     // selected flavour, and a perMachine MSI launched non-elevated
     // exits with `1625 ERROR_INSTALL_PACKAGE_REJECTED`. Wizard callers
     // must use [`spawn_installer_for_flavour`] with the SPA-selected
-    // [`WindowsInstallFlavour`]. Field repro 2026-05-15 on
-    // GORAN-XMG-NEO16; see BLOCKER B6 in the rc.27/rc.28 master plan.
+    // [`WindowsInstallFlavour`]. Field repro 2026-05-15 on a Windows
+    // field-test host; see BLOCKER B6 in the rc.27/rc.28 master plan.
     #[cfg(target_os = "windows")]
     {
         spawn_installer_for_flavour(installer_path, current_install_flavour())
@@ -882,7 +882,7 @@ pub fn spawn_installer_for_flavour_with_properties(
                 // Elevate via ShellExecuteExW + verb="runas" so UAC
                 // prompts (when caller is non-elevated) AND so msiexec
                 // gets the admin token it needs to write under
-                // %ProgramFiles%. Field bug 2026-05-10 PC50045: plain
+                // %ProgramFiles%. Field bug 2026-05-10 the field-test host: plain
                 // `Command::new("msiexec").args(["/i", path, "/qn"])`
                 // silently fails because /qn suppresses the UAC
                 // prompt on a perMachine manifest.
@@ -1120,7 +1120,7 @@ pub async fn run_periodic(
         // log for "suppressed by recent-install cooldown" within the
         // 5-min window — the previous (0.1.62) ordering put the log
         // *after* the 24h sleep, which made the suppression invisible
-        // until the next periodic wake-up. Field repro on e069019l
+        // until the next periodic wake-up. Field repro on operator
         // 2026-05-02: cooldown was working (no storm) but verification
         // by grep failed because the line hadn't been written yet.
         let skip_first_check = first && recent_update_attempt(STARTUP_UPDATE_COOLDOWN);
@@ -1320,7 +1320,7 @@ mod tests {
     fn startup_update_cooldown_is_five_minutes() {
         // Lock the value: any future "make it shorter to retry faster"
         // change should require an explicit reason to land. A too-short
-        // cooldown re-opens the install-storm window from e069019l.
+        // cooldown re-opens the install-storm window from operator.
         assert_eq!(STARTUP_UPDATE_COOLDOWN, Duration::from_secs(300));
     }
 
@@ -1678,7 +1678,7 @@ mod tests {
         // Default cargo-wix perUser destination on Win11.
         assert_eq!(
             classify_install_flavour_from_path(std::path::Path::new(
-                r"C:\Users\e069019l\AppData\Local\Programs\roomler-agent\roomler-agent.exe"
+                r"C:\Users\operator\AppData\Local\Programs\roomler-agent\roomler-agent.exe"
             )),
             WindowsInstallFlavour::PerUser
         );
@@ -1711,14 +1711,14 @@ mod tests {
         // `current_install_flavour`/`classify_install_flavour_from_path`
         // when deciding the spawn elevation path; instead use
         // `spawn_installer_for_flavour(path, operator_selected_flavour)`.
-        // Field repro 2026-05-15 on GORAN-XMG-NEO16: wizard ran from
+        // Field repro 2026-05-15 on a Windows field-test host: wizard ran from
         // %TEMP%, classified as PerUser, spawned msiexec /qn against
         // a perMachine MSI, Windows Installer returned 1625
         // ERROR_INSTALL_PACKAGE_REJECTED.
         let wizard_paths = [
-            r"C:\Users\goran\Downloads\roomler-installer-0.3.0-rc.28-x86_64-pc-windows-msvc.exe",
-            r"C:\Users\goran\Desktop\roomler-installer.exe",
-            r"C:\Users\goran\AppData\Local\Temp\roomler-installer.exe",
+            r"C:\Users\operator\Downloads\roomler-installer-0.3.0-rc.28-x86_64-pc-windows-msvc.exe",
+            r"C:\Users\operator\Desktop\roomler-installer.exe",
+            r"C:\Users\operator\AppData\Local\Temp\roomler-installer.exe",
             r"D:\Installers\roomler-installer.exe",
         ];
         for p in wizard_paths {
@@ -1750,7 +1750,7 @@ mod tests {
     #[test]
     fn msiexec_argv_per_machine_uses_qb_bang() {
         // perMachine MSI requires UAC; /qn would suppress the UAC
-        // prompt and silently fail (field bug PC50045 2026-05-10).
+        // prompt and silently fail (field bug the field-test host 2026-05-10).
         // /qb! shows minimal progress UI but allows UAC to surface.
         let argv = msiexec_argv(
             std::path::Path::new(r"C:\Temp\roomler-agent-perMachine.msi"),

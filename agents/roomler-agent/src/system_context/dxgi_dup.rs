@@ -26,7 +26,7 @@
 //!
 //! M3 A1 ran into a `0x80070424 (ERROR_SERVICE_DOES_NOT_EXIST)` from
 //! `IGraphicsCaptureItemInterop::CreateForMonitor` when called from
-//! the SYSTEM session 0 (`psexec -s -i 1` on PC50045 2026-05-02).
+//! the SYSTEM session 0 (`psexec -s -i 1` on the field-test host 2026-05-02).
 //! WGC's WinRT activation chain has an undocumented service
 //! dependency that doesn't exist in session 0. DXGI Desktop
 //! Duplication has no WinRT activation and no service dependency —

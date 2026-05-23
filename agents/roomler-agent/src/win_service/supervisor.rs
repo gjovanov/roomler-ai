@@ -357,7 +357,7 @@ impl OwnedProcess {
     /// follow-up wait, the process can outlive its caller by tens
     /// to hundreds of milliseconds, which is enough for the named
     /// instance lock to still be held when the next worker is
-    /// spawned. M5 finding #8 (PC50045 2026-05-02): a 145 ms gap
+    /// spawned. M5 finding #8 (the field-test host 2026-05-02): a 145 ms gap
     /// between SCM Stop+Start was short enough that the new
     /// supervisor's first spawn lost the lock race and exited
     /// with code=0. Returns true if the process exited within the
@@ -373,7 +373,7 @@ impl OwnedProcess {
 
 /// How long to wait after `terminate()` for the OS to actually
 /// reap the worker. 1.5 s is comfortably more than the observed
-/// 145 ms gap on PC50045 and well under any human-perceptible
+/// 145 ms gap on the field-test host and well under any human-perceptible
 /// service-stop delay (services have 30 s before SCM force-kills).
 const TERMINATE_WAIT: Duration = Duration::from_millis(1500);
 
@@ -525,7 +525,7 @@ pub enum ExitReaction {
 ///
 /// Why: rc.4 → rc.6 used the marker as a swap gate so the supervisor
 /// would swap user→SystemContext only when a controller connected.
-/// Field repro PC50045 2026-05-06 showed that the swap window
+/// Field repro the field-test host 2026-05-06 showed that the swap window
 /// (terminate user-context → spawn SystemContext → caps probe →
 /// agent.hello, ~13 s) is LONGER than the browser's auto-reconnect
 /// ladder (16 s budget across 6 attempts), so the browser consistently
@@ -1006,7 +1006,7 @@ pub fn run(
                 // a now-dead session: every input event it tries to
                 // inject returns ERROR_ACCESS_DENIED, every capture
                 // call returns a stale frame. Field reproducer at
-                // 2026-05-01 (PC50045): logout → flood of "Zugriff
+                // 2026-05-01 (the field-test host): logout → flood of "Zugriff
                 // verweigert (os error 5)" with the worker still
                 // visible to the controller. Terminate eagerly so the
                 // controller sees the agent go offline cleanly; M3
@@ -1233,7 +1233,7 @@ mod tests {
 
     #[test]
     fn decide_spawn_idles_when_session_disappears_without_active_peer() {
-        // Field bug PC50045 2026-05-01: user logs out; active session
+        // Field bug the field-test host 2026-05-01: user logs out; active session
         // becomes None; the worker is still alive but in a dead
         // session and floods Access Denied. With no active peer
         // connection (keep_stream_alive=false), decide_spawn returns

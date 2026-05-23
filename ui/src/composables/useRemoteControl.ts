@@ -43,7 +43,7 @@ export const RC_RECONNECT_LADDER_MS = [250, 500, 1000, 2000, 4000, 8000] as cons
  * never surfacing a terminal "budget exhausted" state; the reconnect
  * loop keeps trying every `RC_RECONNECT_STEADY_MS` until the operator
  * cancels via the existing Cancel button or the upload completes via
- * resume. Field repro on PC50045 2026-05-11/12: large file uploads
+ * resume. Field repro on the field-test host 2026-05-11/12: large file uploads
  * fail with the legacy 6-attempt cap because ESET intercepts cause
  * repeated DC drops; an operator who walks away from their machine
  * came back to a failed upload with no diagnostic context. With the
@@ -160,7 +160,7 @@ export function parseControlInbound(data: unknown): RcControlInbound {
  * settling the in-flight transfer (Cancel button), tearing down the
  * session (Disconnect), or closing the page. rc.23 — was previously
  * `null` after 6 attempts, which surfaced "budget exhausted" to the
- * field; field repro on PC50045 made it clear that operators on
+ * field; field repro on the field-test host made it clear that operators on
  * corporate AV-protected hosts need indefinite retry.
  *
  * Exported for unit testing. Called by `scheduleReconnect()` inside
@@ -1244,7 +1244,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       // forever when the agent didn't respond (old agent unaware of
       // `rc:logs-fetch`, or DC half-open after a peer drop).
       let isActive = true
-      // rc.23 hotfix #2 — 30 s timeout (was 8 s). PC50045 field
+      // rc.23 hotfix #2 — 30 s timeout (was 8 s). the field-test host field
       // report: log fetch timing out even on rc.23 agent. Agent's
       // file read might be ESET-intercepted (the agent's tracing
       // log is itself a file that ESET scans on read). 8 s gave too
@@ -3219,7 +3219,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    * resume attempt (after `files:resumed`).
    */
   async function innerPump(file: File, startOffset: number, id: string): Promise<void> {
-    // rc.23 hotfix #3 (PC50045 2026-05-13): 64 KiB sat exactly at
+    // rc.23 hotfix #3 (the field-test host 2026-05-13): 64 KiB sat exactly at
     // webrtc-rs's SCTP `max_message_size` default (65536), so any
     // 64-KiB outbound chunk that landed AT the boundary triggered
     // `failed to handle_inbound: ErrChunk` warnings + silent drop on
@@ -3337,7 +3337,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    * modes do this), `runOnce` throws "channel closed" synchronously,
    * `waitForConnected` returns true immediately, the loop re-enters,
    * throws again — tight async loop that burns CPU and freezes the
-   * tab. Field repro on PC50045 2026-05-12 (CV.pdf upload + rc.23
+   * tab. Field repro on the field-test host 2026-05-12 (CV.pdf upload + rc.23
    * web on rc.23 agent → tab had to be killed).
    *
    * `pollIntervalMs` defaults to 250 — cheap; the DC opens once per
@@ -3505,7 +3505,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       // or files:complete arrives. `MAX_ATTEMPTS` retained as a label
       // for log lines + UI "attempt N/MAX" rendering, but tied to
       // `Number.POSITIVE_INFINITY` so the budget check below is a
-      // no-op. Was 6; rolled forward on PC50045 field repro where
+      // no-op. Was 6; rolled forward on the field-test host field repro where
       // ESET caused the agent to be killed repeatedly during 14 MB
       // uploads and the 6-attempt cap surfaced "exhausted" before
       // the DC could reconnect.
@@ -3576,7 +3576,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
             // resume loop is the operator's "DC stays open" promise;
             // legacy 30 s timeout could fire while the agent was
             // being installer-restarted by msiexec (5-90 s window
-            // observed during auto-update on PC50045). Outer
+            // observed during auto-update on the field-test host). Outer
             // settle-check at the top of `runOnce` handles the
             // operator-cancel path.
             const e2 = filesRegistry.get(id)
@@ -3588,7 +3588,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
             // returns true immediately (phase already 'connected'),
             // we retry, throw again — thousands of iterations per
             // second pin a CPU core and freeze the browser tab. Field
-            // repro on PC50045 2026-05-12 (CV.pdf upload). Backstop
+            // repro on the field-test host 2026-05-12 (CV.pdf upload). Backstop
             // delay also gives the agent breathing room to reopen
             // the DC before we ping it again.
             const backoffMs =

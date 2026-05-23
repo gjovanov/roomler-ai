@@ -14,7 +14,7 @@
 //!     coordinates that map (via the OS DPI virtualisation) to
 //!     physical position **left + above** of where the user clicked
 //!     in the captured frame. This was the field bug reported on
-//!     PC50045 (1920×1200) on 2026-05-01.
+//!     the field-test host (1920×1200) on 2026-05-01.
 //!
 //!   - In **per-monitor-aware-V2** mode (Win10 1703+), `main_display()`
 //!     returns physical pixels and `SetCursorPos` interprets
@@ -30,7 +30,7 @@
 //! rc.41 — `set_per_monitor_aware` now returns a `DpiOutcome` carrying
 //! both the API success flag and the *actual* awareness mode after the
 //! call (read back via `GetThreadDpiAwarenessContext` + a constant
-//! comparison). This closes the diagnostic loop for the PC50045 field
+//! comparison). This closes the diagnostic loop for the the field-test host field
 //! bug from rc.38-rc.40: prior code discarded the bool and never
 //! verified that the OS accepted the request. If a parent process
 //! (e.g. SCM service launcher) already pinned the process to a
@@ -108,7 +108,7 @@ pub fn set_per_monitor_aware() -> DpiOutcome {
 /// rc.44 — switched from raw `==` pointer comparison to
 /// `AreDpiAwarenessContextsEqual`. The rc.41 implementation used `==`
 /// against sentinel constants from `windows-sys`, which compares the
-/// stored sentinel pointer values directly. PC50045 field test
+/// stored sentinel pointer values directly. the field-test host field test
 /// 2026-05-18 showed `actual=unknown` despite `set_succeeded=true`
 /// — the returned handle from `GetThreadDpiAwarenessContext` is NOT
 /// guaranteed to be one of the sentinel pointer values; Microsoft

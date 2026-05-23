@@ -235,8 +235,8 @@ async fn run_install_inner(
     // A perMachine MSI launched on the perUser branch (`/qn`, no
     // ShellExecuteExW runas) gets rejected by Windows Installer with
     // exit code 1625 ERROR_INSTALL_PACKAGE_REJECTED. Field repro
-    // 2026-05-15 on GORAN-XMG-NEO16; BLOCKER B6 from the rc.27/rc.28
-    // master plan.
+    // 2026-05-15 on a Windows field-test host; BLOCKER B6 from the
+    // rc.27/rc.28 master plan.
     check_cancel()?;
     // rc.44: build the property table from the parsed flavour.
     //   peruser              → no property (wix/main.wxs doesn't declare it)

@@ -1,7 +1,7 @@
 #!/bin/bash
-# Roomler AI e2e orchestrator. Run on mars from any directory; assumes
-# the local repo is at /home/gjovanov/roomler-ai and the deploy repo is
-# at /home/gjovanov/roomler-ai-deploy.
+# Roomler AI e2e orchestrator. Run on the build host from any directory.
+# Override REPO_ROOT / DEPLOY_REPO / REGISTRY env vars if your local
+# layout differs from the defaults below.
 #
 # Usage:
 #   scripts/e2e-k8s.sh smoke       # Phase 1: run a single auth spec
@@ -25,10 +25,10 @@
 #   9. Print the path to the HTML report.
 set -euo pipefail
 
-REPO_ROOT="${REPO_ROOT:-/home/gjovanov/roomler-ai}"
-DEPLOY_REPO="${DEPLOY_REPO:-/home/gjovanov/roomler-ai-deploy}"
+REPO_ROOT="${REPO_ROOT:-$HOME/roomler-ai}"
+DEPLOY_REPO="${DEPLOY_REPO:-$HOME/roomler-ai-deploy}"
 NAMESPACE="${NAMESPACE:-roomler-ai-e2e}"
-REGISTRY="${REGISTRY:-registry.roomler.ai}"
+REGISTRY="${REGISTRY:?set REGISTRY=<internal-registry>}"
 IMAGE_NAME="roomler-ai-e2e"
 RESULTS_ROOT="${RESULTS_ROOT:-$HOME/e2e-results}"
 

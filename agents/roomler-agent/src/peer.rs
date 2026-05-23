@@ -140,7 +140,7 @@ mod quality {
     /// Map a quality preference to the bitrate target, scaled off the
     /// resolution-derived baseline. Low halves it (better fit for
     /// metered uplinks), High adds 50%. Ceiling lifted 30 → 50 Mbps in
-    /// rc.36 (PC50045 / CLK00017265 field test 2026-05-17) after the
+    /// rc.36 (the field-test host / a second field-test host field test 2026-05-17) after the
     /// rc.33–rc.35 cycles still left fine-text legibility worse than
     /// RustDesk on common screen-content events (window-uncover,
     /// Outlook open). At 4K60 + High the resolution-derived base
@@ -1311,7 +1311,7 @@ async fn media_pump(
                 // browser-side input normalisation (letterboxedNormalise)
                 // then uses a stale aspect ratio against the actual
                 // rendered surface — clicks land at wrong OS pixels
-                // (PC50045 field bug 2026-05-17).
+                // (the field-test host field bug 2026-05-17).
                 //
                 // Fix: drop the native-dim encoder + skip writing this
                 // frame to the track. The next iteration will rebuild
@@ -1602,7 +1602,7 @@ async fn media_pump_vp9_444_dc(
     // Force a keyframe on the NEXT frame so the operator sees a clean
     // refresh within 2 frames instead of waiting for the periodic IDR.
     //
-    // rc.43 — RETUNED for VBR-mode regression. Field log PC50045
+    // rc.43 — RETUNED for VBR-mode regression. Field log the field-test host
     // 2026-05-18 (rc.42 + VBR opt-in) showed 33 forced keyframes in
     // 3.5 minutes — one every 6 seconds — because VBR's natural delta
     // size variance (3-10× depending on motion) was tripping the
@@ -1637,7 +1637,7 @@ async fn media_pump_vp9_444_dc(
     const SCENE_CHANGE_MIN_INTERVAL: Duration = Duration::from_millis(1500);
     let mut last_scene_change_kf_at: Option<std::time::Instant> = None;
 
-    // rc.45 — dynamic cpu-used boost during motion. PC50045 field
+    // rc.45 — dynamic cpu-used boost during motion. the field-test host field
     // test 2026-05-18 (rc.43) confirmed scene-change keyframe cascade
     // is fixed (5× reduction in forced IDRs) but heavy-motion fps is
     // still 8-12 because SW VP9 4:4:4 at 1920×1200 + cpu-used=6 on
@@ -2368,7 +2368,7 @@ fn attach_control_handler(
                     // chunked stream for larger ones because a
                     // single SCTP message can't exceed the
                     // negotiated `max_message_size` (65536 default)
-                    // — field repro PC50045 2026-05-13 showed
+                    // — field repro the field-test host 2026-05-13 showed
                     // 1000-line requests silently dropping.
                     let lines = val
                         .get("lines")
@@ -2449,7 +2449,7 @@ fn attach_cursor_handler(dc: Arc<RTCDataChannel>, session_id: bson::oid::ObjectI
         // just-constructed RTCDataChannel hasn't completed the SCTP
         // handshake yet.
         let mut tracker = crate::capture::cursor::CursorTracker::new();
-        // rc.38 — bumped 33 ms (30 Hz) → 8 ms (120 Hz) after PC50045
+        // rc.38 — bumped 33 ms (30 Hz) → 8 ms (120 Hz) after the field-test host
         // field test 2026-05-17 surfaced sluggish cursor tracking even
         // when the controller's local pointermove was timely.
         // Operator perceives "where the cursor is" via:
@@ -3372,7 +3372,7 @@ async fn handle_files_chunk(
     // error path we need it to address the `files:error` reply
     // correctly. Without this the browser's per-upload promise
     // listener (which filters by id) silently drops the error and
-    // the upload spinner spins forever — field repro PC50045 rc.8
+    // the upload spinner spins forever — field repro the field-test host rc.8
     // (2026-05-06).
     let active_id = handler.current_id().await.unwrap_or_default();
     match handler.chunk(data).await {

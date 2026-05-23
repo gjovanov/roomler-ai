@@ -1,19 +1,23 @@
 /**
- * E2E: upload a >1 MB file to PC50045 via the live roomler.ai
- * production deployment. Validates the rc.23 reconnect + rc.22
- * staging fixes against the actual ESET-protected corporate host
- * that was failing 14 MB uploads in HANDOVER18.
+ * E2E: upload a >1 MB file to a remote agent via the live
+ * roomler.ai production deployment. Validates the rc.23 reconnect +
+ * rc.22 staging fixes against a real ESET-protected corporate host
+ * that was failing 14 MB uploads pre-rc.22.
  *
  * **Preconditions**:
  *  - `.cred` exists in the repo root, format: `username/password`
- *  - PC50045's agent is online and registered as
- *    tenant=`69a1dbbad2000f26adc875ce`, agent=`69f3771d9fc07b0c99e476f8`
- *  - `C:/Users/goran/Dropbox/Work/CV.pdf` exists locally and is >1 MB
+ *  - The target agent is online and registered. Tenant + agent IDs
+ *    are taken from env vars (`E2E_TENANT_ID`, `E2E_AGENT_ID`) — no
+ *    real identifiers are baked into this file.
+ *  - The upload payload path is `E2E_UPLOAD_FILE` (>1 MB).
  *
  * **Run**:
  * ```bash
- * cd ui && E2E_BASE_URL=https://roomler.ai bunx playwright test \
- *   remote-upload-pc50045 --headed --reporter=list
+ * cd ui && \
+ *   E2E_BASE_URL=https://roomler.ai \
+ *   E2E_TENANT_ID=<hex24> E2E_AGENT_ID=<hex24> \
+ *   E2E_UPLOAD_FILE=/path/to/payload.pdf \
+ *   bunx playwright test remote-upload-pc50045 --headed --reporter=list
  * ```
  *
  * **Why headed**: WebRTC peer connections need a real Chrome
@@ -27,9 +31,9 @@ import * as path from 'node:path'
 
 const REPO_ROOT = path.resolve(__dirname, '..', '..')
 const CRED_PATH = path.join(REPO_ROOT, '.cred')
-const UPLOAD_FILE = 'C:\\Users\\goran\\Dropbox\\Work\\CV.pdf'
-const TENANT_ID = '69a1dbbad2000f26adc875ce'
-const AGENT_ID = '69f3771d9fc07b0c99e476f8'
+const UPLOAD_FILE = process.env.E2E_UPLOAD_FILE ?? ''
+const TENANT_ID = process.env.E2E_TENANT_ID ?? ''
+const AGENT_ID = process.env.E2E_AGENT_ID ?? ''
 const REMOTE_URL = `/tenant/${TENANT_ID}/agent/${AGENT_ID}/remote`
 
 /**
@@ -69,14 +73,18 @@ async function login(page: Page, username: string, password: string) {
   await expect(page).toHaveURL(/\/$/, { timeout: 15_000 })
 }
 
-test.describe('Remote upload to PC50045', () => {
+test.describe('Remote upload to a field-test host', () => {
   test.skip(
     !process.env.E2E_BASE_URL || !process.env.E2E_BASE_URL.includes('roomler.ai'),
     'This spec targets PROD only. Set E2E_BASE_URL=https://roomler.ai to run.'
   )
   test.skip(
-    !fs.existsSync(UPLOAD_FILE),
-    `Upload file missing at ${UPLOAD_FILE}. Skipping (provide CV.pdf or override UPLOAD_FILE).`
+    !TENANT_ID || !AGENT_ID,
+    'E2E_TENANT_ID and E2E_AGENT_ID must be set to the target agent.'
+  )
+  test.skip(
+    !UPLOAD_FILE || !fs.existsSync(UPLOAD_FILE),
+    `Upload file missing. Set E2E_UPLOAD_FILE to a >1 MB local path.`
   )
 
   // The whole test can take many minutes when the file is large
@@ -85,7 +93,7 @@ test.describe('Remote upload to PC50045', () => {
   // converge.
   test.setTimeout(15 * 60 * 1000)
 
-  test('upload CV.pdf to PC50045 and wait for completion', async ({ page }) => {
+  test('upload payload to the remote agent and wait for completion', async ({ page }) => {
     const { username, password } = readCred()
 
     // -------- Login --------
@@ -128,8 +136,10 @@ test.describe('Remote upload to PC50045', () => {
     // -------- Wait for the Transfers panel to show our file --------
     // The Transfers panel renders one row per in-flight transfer,
     // with status pill: 'running' | 'reconnecting' | 'complete' |
-    // 'error'. We expect a row labelled CV.pdf.
-    const transferRow = page.locator('text=/CV\\.pdf/i').first()
+    // 'error'. We expect a row labelled with the uploaded filename.
+    const uploadName = path.basename(UPLOAD_FILE)
+    const escapedName = uploadName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const transferRow = page.locator(`text=/${escapedName}/i`).first()
     await expect(transferRow).toBeVisible({ timeout: 30_000 })
 
     // -------- Poll until complete (or test timeout) --------
@@ -167,7 +177,7 @@ test.describe('Remote upload to PC50045', () => {
       console.error('--- End console errors ---')
       throw new Error(
         `Upload did not complete within 12 min. Last status: "${lastStatus}". ` +
-          'Check the Transfers panel + agent log on PC50045.'
+          'Check the Transfers panel + agent log on the target host.'
       )
     }
 

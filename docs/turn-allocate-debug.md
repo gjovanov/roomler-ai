@@ -1,6 +1,6 @@
 # TURN Allocate "attribute not found" — investigation notes
 
-Field repro 2026-05-17 from CLK00017265 / PC55331 agent logs:
+Field repro 2026-05-17 from a second field-test host / a third field-test host agent logs:
 
 ```
 WARN [controlled]: could not get server reflexive address udp4 turn:coturn.roomler.ai:443?transport=udp: deadline has elapsed
@@ -102,7 +102,7 @@ This is consistent with one of two scenarios:
    Coturn DID process the Allocate request (would log "processed")
    but **may not be visible at the log level being captured**.
 
-**(b)** A corporate middlebox between CLK00017265 and coturn
+**(b)** A corporate middlebox between a second field-test host and coturn
    intercepts the STUN bytes and either (b1) modifies them in
    flight, stripping NONCE/REALM from the response, or (b2) drops
    the response entirely so the client times out — but the bare
@@ -133,7 +133,7 @@ upstream / vendoring + patching.
 
 ## Next-step options (ranked by cost / value)
 
-1. **Packet capture on CLK00017265** via Wireshark / `pktmon` for
+1. **Packet capture on a second field-test host** via Wireshark / `pktmon` for
    `tcp.port == 3478` during a fresh agent connection. Compare the
    STUN bytes coturn sent vs what webrtc-rs saw — confirms or
    refutes middlebox interference. ~30 min, definitive answer.
@@ -146,7 +146,7 @@ upstream / vendoring + patching.
    path; probably overkill before we have packet-capture evidence
    that the bug is webrtc-rs-side. ~1 day.
 
-(1) is the right next step — needs a person at CLK00017265 to run
+(1) is the right next step — needs a person at a second field-test host to run
 `pktmon` for 30 sec while the agent reconnects. Not actionable from
 this session.
 

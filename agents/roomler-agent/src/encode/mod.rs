@@ -74,7 +74,7 @@ pub(crate) fn initial_bitrate_for(width: u32, height: u32) -> u32 {
 /// minimum so a collapsing REMB signal can't drop encode quality into
 /// unusability while the link is still technically up.
 pub const MIN_BITRATE_BPS: u32 = 1_500_000;
-/// MAX bumped 25→40 Mbps in rc.36. Field-confirmed (PC50045) that
+/// MAX bumped 25→40 Mbps in rc.36. Field-confirmed (the field-test host) that
 /// rc.35 at 1920×1200 Quality=High was content-bound around 13 Mbps,
 /// well under the 25 Mbps cap — but `Quality=High × 1.5` math could
 /// land above 25 Mbps at 4K@60 and was getting clipped. Lifting the
@@ -85,7 +85,7 @@ pub const MAX_BITRATE_BPS: u32 = 40_000_000;
 
 pub(crate) fn initial_bitrate_for_fps(width: u32, height: u32, fps: u32) -> u32 {
     // bpp/s bumped 0.15 → 0.20 in rc.36. RustDesk's published default is
-    // ≈ 0.14–0.18; field reports (PC50045, CLK00017265, 2026-05-17)
+    // ≈ 0.14–0.18; field reports (the field-test host, a second field-test host, 2026-05-17)
     // showed that 0.15 left desktop content visibly under-bitted at
     // 1920×1200 — fine text on Outlook / Start menu / Notepad++ took
     // multiple frames to sharpen after a window-uncover event. 0.20

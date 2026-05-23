@@ -208,7 +208,7 @@ mod windows_impl {
     ///    alpha=0 everywhere — the alpha lives in `hbmMask` (1bpp AND
     ///    mask: 0=opaque cursor body, 1=transparent). The colour
     ///    bitmap alone renders as fully transparent → invisible
-    ///    cursor. **Field repro PC50045 rc.7+rc.8: I-beam invisible
+    ///    cursor. **Field repro the field-test host rc.7+rc.8: I-beam invisible
     ///    over Notepad++** — both monochrome (rc.7) and color+mask
     ///    (rc.8) paths have to be right.
     /// 3. **Pure monochrome cursor** (legacy / classic system I-beam

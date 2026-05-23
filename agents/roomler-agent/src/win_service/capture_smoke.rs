@@ -3,7 +3,7 @@
 //! Why this exists. M3's load-bearing assumption is that
 //! `Windows.Graphics.Capture` (WGC) on Win11 22H2+ supports session-0
 //! capture for SYSTEM processes attached to `winsta0\Winlogon`. The
-//! M5 verification on PC50045 (2026-05-02) confirmed the gap from the
+//! M5 verification on the field-test host (2026-05-02) confirmed the gap from the
 //! user-context side; before we commit to writing `system_worker.rs`,
 //! we need empirical evidence that WGC actually initialises against
 //! the secure desktop. The 2026-05-02 critic review (item D) flagged

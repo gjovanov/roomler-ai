@@ -173,7 +173,7 @@ fn map_button(b: Button) -> EnigoButton {
 /// back to primary. Out-of-range values are clamped.
 ///
 /// rc.39 — rate-limited diagnostic logging at INFO level for the first
-/// 50 dispatches per process. PC50045 / CLK00017265 field test 2026-05-17
+/// 50 dispatches per process. the field-test host / a second field-test host field test 2026-05-17
 /// shows mouse positioned wrong even after rc.38's aspect-preserving
 /// downscale + skip-first-frame fixes. Suspect a coord-system mismatch
 /// between enigo.main_display() (returns OS-reported logical pixels,

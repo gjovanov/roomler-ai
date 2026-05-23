@@ -54,7 +54,7 @@
 //! for the lock-screen / UAC use case.
 //!
 //! Performance: GDI BitBlt at 4K (3840x2160) measures ~14 ms per
-//! frame on PC50045 (RTX 5090 + Intel UHD 630), comfortably under
+//! frame on the field-test host (RTX 5090 + Intel UHD 630), comfortably under
 //! a 30 fps budget. Full-screen 1080p is ~3 ms. Acceptable as a
 //! fallback even though it's CPU-bound (DXGI is GPU-bound).
 //!
@@ -152,7 +152,7 @@ impl GdiBackend {
 
     /// Capture one frame. Returns BGRA8 bytes of the entire virtual
     /// desktop. Synchronous; GDI BitBlt is CPU-bound at ~3 ms /
-    /// 1080p, ~14 ms / 4K on PC50045 reference hardware.
+    /// 1080p, ~14 ms / 4K on the field-test host reference hardware.
     pub fn frame(&mut self) -> io::Result<GdiFrame> {
         capture_virtual_desktop(self.width, self.height)
     }

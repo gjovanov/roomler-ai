@@ -19,7 +19,7 @@
 //!      monitor.
 //!
 //! This module logs the actual layout at startup so we can confirm or
-//! reject (3) against PC50045 field data BEFORE writing a fix. No
+//! reject (3) against the field-test host field data BEFORE writing a fix. No
 //! behaviour change — `to_pixels` still uses the legacy path.
 //!
 //! When the data confirms the hypothesis: a follow-up rc adds a
@@ -295,7 +295,7 @@ pub fn log_monitor_diagnostic() {
         tracing::warn!(
             origin_x = p.origin_x,
             origin_y = p.origin_y,
-            "monitor_diag — primary monitor origin is NOT (0,0); to_pixels currently maps against primary dims without applying this offset. Likely root cause of PC50045 mouse-offset bug."
+            "monitor_diag — primary monitor origin is NOT (0,0); to_pixels currently maps against primary dims without applying this offset. Likely root cause of the field-test host mouse-offset bug."
         );
     }
 }

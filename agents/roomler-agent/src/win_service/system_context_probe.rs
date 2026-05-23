@@ -2,7 +2,7 @@
 //!
 //! Three orthogonal questions about the SYSTEM-context worker
 //! architecture, batched into one binary so the field operator runs
-//! them in a single PC50045 sitting:
+//! them in a single the field-test host sitting:
 //!
 //! - **`winlogon-token`** (Pre-flight #2): can a SYSTEM service in
 //!   session 0 steal `winlogon.exe`'s primary token via

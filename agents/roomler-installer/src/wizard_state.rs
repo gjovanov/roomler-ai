@@ -160,7 +160,7 @@ mod tests {
             step: Step::Token,
             flavour: Some("permachine-system-context".to_string()),
             server_url: "https://roomler.ai".to_string(),
-            device_name: "PC50045".to_string(),
+            device_name: "the field-test host".to_string(),
         };
         save(&path, &original).unwrap();
         let loaded = load(&path);

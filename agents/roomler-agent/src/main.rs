@@ -508,7 +508,7 @@ async fn main() -> Result<()> {
     // default — a 1920×1200 panel at 125% scale reports as 1536×960
     // and `SetCursorPos` interprets coordinates against that, so a
     // browser-side normalised click maps left+above of where the user
-    // clicked. Field bug PC50045 2026-05-01. Idempotent — a noop once
+    // clicked. Field bug the field-test host 2026-05-01. Idempotent — a noop once
     // some other subsystem has already set DPI for the process.
     // rc.41 — stash the DPI outcome (set + actual) and log it AFTER
     // logging::init() so the diagnostic line lands in the persistent
@@ -528,10 +528,10 @@ async fn main() -> Result<()> {
             requested = "per-monitor-v2",
             set_succeeded = dpi_outcome.set,
             actual = dpi_outcome.actual.as_str(),
-            "DPI awareness configured at process start (rc.41 diagnostic — surfaces residual PC50045 mouse-misposition cause)"
+            "DPI awareness configured at process start (rc.41 diagnostic — surfaces residual the field-test host mouse-misposition cause)"
         );
         // rc.48 — monitor-layout diagnostic. DPI is correctly set per
-        // the rc.41/44 readback, yet PC50045 field reports still show
+        // the rc.41/44 readback, yet the field-test host field reports still show
         // mouse-offset (per the rc.43-ui commit 79d6dee). Hypothesis:
         // the virtual-screen origin is non-zero (multi-monitor layout
         // where primary was repositioned) and our `to_pixels` doesn't
@@ -550,7 +550,7 @@ async fn main() -> Result<()> {
     // the supervisor's redundant SupervisorDetected sidecar (which
     // would carry SUPERVISOR-side log noise, useless for diagnosing
     // the worker failure) is suppressed by `crash_recorder`'s 30 s
-    // rate-limit. Field repro 2026-05-17 PC55331: the SystemContext
+    // rate-limit. Field repro 2026-05-17 a third field-test host: the SystemContext
     // worker was exiting code=1 right after the "couldn't resolve
     // active-user profile" warning, but the admin UI only saw
     // supervisor-side noise. With this hook the modal surfaces the
@@ -1247,7 +1247,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
             // (auto-updater spawning the installer, or rollback path
             // pinning a previous version). Treat that as graceful so
             // the next startup doesn't false-positive a crash counter
-            // increment. M5 finding #2 (PC50045 2026-05-02): every
+            // increment. M5 finding #2 (the field-test host 2026-05-02): every
             // auto-update bumped `crash_count` by 1; three rapid
             // updates would have tripped the rollback threshold.
             if *shutdown_rx.borrow() {
@@ -1567,7 +1567,7 @@ async fn self_update_cmd(check_only: bool) -> Result<()> {
             // outlives this process and records the installer's exit
             // code + the new binary's --version result. Diagnoses the
             // perMachine UAC-declined / silent-fail case that bit
-            // PC50045 on 2026-05-10.
+            // the field-test host on 2026-05-10.
             updater::spawn_installer_with_watch(&installer_path, Some(&latest))
                 .context("spawning installer")?;
             std::process::exit(0);

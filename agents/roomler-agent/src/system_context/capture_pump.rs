@@ -67,7 +67,7 @@ const HARD_ERROR_FALLBACK_THRESHOLD: u32 = 3;
 /// 3-5 seconds while the OS rebuilds the display compositor; spinning
 /// `b.reset()` 20 times per second over that window is ~30-50ms of
 /// GPU work per cycle, which starves the encoder + send threads and
-/// produces visible blocky motion (field repro PC50045 rc.9 lock/unlock
+/// produces visible blocky motion (field repro the field-test host rc.9 lock/unlock
 /// cycle: ~80 recreate attempts in 4 s, mouse motion not smooth).
 /// 8 consecutive AccessLost ≈ 400 ms — enough to be sure it's not a
 /// single transient blip but fast enough that the operator doesn't

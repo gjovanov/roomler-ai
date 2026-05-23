@@ -36,7 +36,7 @@
 //! shape sent a `text` field unbounded by length, which on payloads
 //! >~50 KB hit webrtc-rs's SCTP `max_message_size=65536` default and
 //! threw `failed to handle_inbound: ErrChunk`, killing the data
-//! channel + session (PC55331 field repro 2026-05-19, every 1-2 min
+//! channel + session (a third field-test host field repro 2026-05-19, every 1-2 min
 //! sessions). The chunked variants cap each envelope at ~14 KB to
 //! stay well under the SCTP ceiling; the receiver reassembles by
 //! `id` (write) / `req_id` (read response) and applies on `last`.

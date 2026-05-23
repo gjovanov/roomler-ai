@@ -165,7 +165,7 @@ pub async fn latest_release(
 //   1. Corporate ESET / Defender allow-lists are typically per-domain.
 //      `roomler.ai`'s TLS cert is already in IT-managed allow-lists
 //      (the agent's signaling traffic uses it); github.com is often
-//      blocked outright in locked-down environments. PC50045 field
+//      blocked outright in locked-down environments. the field-test host field
 //      repro 2026-05-11.
 //   2. Single source-of-truth for asset selection (perUser vs
 //      perMachine). The wizard hits one URL per flavour, never picks

@@ -47,7 +47,7 @@ const POST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Minimum delay between consecutive sidecar POSTs. The backend's
 /// `tower_governor` rate-limit is 60 req/min per IP = 1 req/sec
 /// steady-state with a 60-burst budget. Field repro 2026-05-17
-/// PC55331: agent drained 1317 sidecars at ~50/sec, exhausted the
+/// a third field-test host: agent drained 1317 sidecars at ~50/sec, exhausted the
 /// burst budget in ~1.2 sec, then ~1267 of them got 429s. With a
 /// 1.1-sec delay we stay safely under the steady-state limit; the
 /// drain takes longer (1317 × 1.1s = ~24 min worst case) but every
@@ -202,7 +202,7 @@ where
         UploadOutcome::Accepted
     } else if status == StatusCode::TOO_MANY_REQUESTS {
         // 429 is the BACKEND saying "slow down" — NOT permanent. Field
-        // repro 2026-05-17 PC55331: storm of 1317 sidecars hit the
+        // repro 2026-05-17 a third field-test host: storm of 1317 sidecars hit the
         // tower_governor 60-req/min IP limit; treating it as 4xx-
         // Rejected (the previous behaviour) deleted ~1267 of them
         // permanently. Now classified as Transient so the next agent
@@ -299,7 +299,7 @@ mod tests {
 
     #[tokio::test]
     async fn classify_429_returns_transient_not_rejected() {
-        // Field bug 2026-05-17 PC55331: 429 was being classified as
+        // Field bug 2026-05-17 a third field-test host: 429 was being classified as
         // 4xx-Rejected → sidecar deleted permanently → ~1267 of 1317
         // crash reports lost when the backend rate-limited a drain
         // burst. 429 MUST be Transient so the next agent startup

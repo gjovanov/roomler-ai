@@ -299,14 +299,112 @@ pub async fn download(
         .await
         .map_err(|e| ApiError::Internal(format!("Failed to read file: {}", e)))?;
 
+    // Sanitize the stored filename before it lands in a response
+    // header. `Response::builder()…unwrap()` panics if any header
+    // value contains a CR/LF/0x00, so an unsanitized filename was
+    // both an HTTP-header-injection risk AND a panic hazard. We
+    // emit BOTH a sanitized ASCII `filename=` (legacy clients) and
+    // an RFC 5987 `filename*=UTF-8''<pct-encoded>` (everything else)
+    // so unicode + special chars survive round-trip.
+    let (ascii_name, encoded_name) = sanitize_content_disposition_filename(&file.filename);
+    let disposition = format!(
+        "attachment; filename=\"{}\"; filename*=UTF-8''{}",
+        ascii_name, encoded_name
+    );
+
     Ok(Response::builder()
         .header("Content-Type", &file.content_type)
-        .header(
-            "Content-Disposition",
-            format!("attachment; filename=\"{}\"", file.filename),
-        )
+        .header("Content-Disposition", disposition)
         .body(Body::from(contents))
         .unwrap())
+}
+
+/// Sanitize a stored filename for the `Content-Disposition` header.
+/// Returns `(ascii_quoted, rfc5987_encoded)`:
+/// - `ascii_quoted` is safe to place inside `filename="…"` — control
+///   chars, `"`, and `\` are stripped, non-ASCII is replaced with `_`,
+///   and an empty result falls back to `"download"`.
+/// - `rfc5987_encoded` percent-encodes everything outside RFC 5987's
+///   `attr-char` set so it can sit after `filename*=UTF-8''`.
+fn sanitize_content_disposition_filename(raw: &str) -> (String, String) {
+    let mut ascii = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        if ch == '"' || ch == '\\' || (ch as u32) < 0x20 || ch == 0x7f as char {
+            continue;
+        }
+        if ch.is_ascii() {
+            ascii.push(ch);
+        } else {
+            ascii.push('_');
+        }
+    }
+    if ascii.trim().is_empty() {
+        ascii = "download".to_string();
+    }
+
+    // RFC 5987 attr-char = ALPHA / DIGIT / "!" / "#" / "$" / "&" / "+"
+    //                    / "-" / "." / "^" / "_" / "`" / "|" / "~"
+    let mut encoded = String::with_capacity(raw.len());
+    for byte in raw.as_bytes() {
+        let b = *byte;
+        let is_attr_char = b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'!' | b'#' | b'$' | b'&' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+            );
+        if is_attr_char {
+            encoded.push(b as char);
+        } else {
+            encoded.push_str(&format!("%{:02X}", b));
+        }
+    }
+    if encoded.is_empty() {
+        encoded = "download".to_string();
+    }
+
+    (ascii, encoded)
+}
+
+#[cfg(test)]
+mod content_disposition_tests {
+    use super::sanitize_content_disposition_filename;
+
+    #[test]
+    fn strips_crlf_and_quotes() {
+        // Hostile name: CR/LF would split the header; embedded quote
+        // would terminate the quoted-string early.
+        let raw = "evil\r\nX-Injected: 1\"\".txt";
+        let (ascii, _) = sanitize_content_disposition_filename(raw);
+        assert!(!ascii.contains('\r'));
+        assert!(!ascii.contains('\n'));
+        assert!(!ascii.contains('"'));
+    }
+
+    #[test]
+    fn empty_falls_back_to_download() {
+        let (ascii, encoded) = sanitize_content_disposition_filename("");
+        assert_eq!(ascii, "download");
+        assert_eq!(encoded, "download");
+    }
+
+    #[test]
+    fn unicode_preserved_in_rfc5987_dropped_in_ascii() {
+        // 'é' is 0xC3 0xA9 in UTF-8 → percent-encoded as %C3%A9.
+        let (ascii, encoded) = sanitize_content_disposition_filename("résumé.pdf");
+        assert!(!ascii.is_empty());
+        // ASCII fallback replaces non-ASCII with `_` so the legacy
+        // `filename=` token stays HTTP-safe.
+        assert!(ascii.contains('_'));
+        assert!(encoded.contains("%C3%A9"));
+    }
+
+    #[test]
+    fn percent_itself_is_encoded() {
+        // `%` is NOT an RFC 5987 attr-char, so a literal `%` in the
+        // source filename must come out as `%25`.
+        let (_, encoded) = sanitize_content_disposition_filename("50%off.txt");
+        assert!(encoded.contains("%2550off"));
+    }
 }
 
 pub async fn delete(

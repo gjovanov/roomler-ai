@@ -48,7 +48,7 @@
 //!
 //! ## Empirical validation
 //!
-//! All architectural assumptions verified on PC50045 via the M3 A1
+//! All architectural assumptions verified on the field-test host via the M3 A1
 //! pre-flight probe binary (`roomler-agent system-context-probe ...`);
 //! results saved to `project_m3_a1_preflights_2_3_5.md`. Bare token-dup
 //! works on Win11 24H2 (no `AdjustTokenPrivileges` needed); SE_TCB and

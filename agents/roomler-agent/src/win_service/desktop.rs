@@ -145,7 +145,7 @@ pub fn open_input_desktop() -> Result<Option<OwnedDesktop>> {
 /// That regression was the entire 0.2.7 hotfix (see
 /// `project_input_regression_0_2_x.md`). This helper is gated to the
 /// SystemContext path where we ARE SYSTEM and DO have full write
-/// rights to both Default and Winlogon. Field repro on PC50045
+/// rights to both Default and Winlogon. Field repro on the field-test host
 /// during 0.3.0-rc.7 and rc.8 testing (2026-05-06): `Zugriff
 /// verweigert (os error 5)` spam at roughly 50/s during the lock
 /// screen because the thread was bound via `GENERIC_READ` only and
@@ -374,7 +374,7 @@ mod tests {
         // capture frame. The codebase never calls SwitchDesktop, so
         // the right is dead weight.
         //
-        // Field repro: PC50045 / e069019l 2026-05-04. Fixed in 0.2.7.
+        // Field repro: the field-test host / operator 2026-05-04. Fixed in 0.2.7.
         // Memory: project_input_regression_0_2_x.md.
         //
         // Needle is the bitwise-or call-site fragment (pipe + space +

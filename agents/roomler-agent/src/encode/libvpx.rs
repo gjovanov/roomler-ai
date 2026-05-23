@@ -70,7 +70,7 @@ const DEFAULT_BITRATE_BPS: u32 = 8_000_000;
 ///
 /// Restoring the periodic IDR every 240 frames is the simplest fix:
 /// trades ~100 kbps of overhead for a hard quality-refresh floor.
-/// Field-confirmed (PC50045 / CLK00017265, 2026-05-17).
+/// Field-confirmed (the field-test host / a second field-test host, 2026-05-17).
 ///
 /// Followup if this still leaves visible blur on rapid scene changes:
 /// switch from `VPX_CBR` to `VPX_VBR` so the encoder can burst above
@@ -193,7 +193,7 @@ impl Vp9Encoder {
         cfg.kf_min_dist = 0;
         // rc.38 — scale kf_max_dist with target_fps so time-between-IDRs
         // stays roughly constant (~3 s) regardless of the actual
-        // encoder frame rate. Field-observed on PC50045 (rc.36): with
+        // encoder frame rate. Field-observed on the field-test host (rc.36): with
         // target_fps=60 but encoder-bound at 17 actual fps, a 240-frame
         // kf_max_dist meant ~14 s between IDRs and visible "blur takes
         // >1s to clear" on window-uncover events. KEYFRAME_INTERVAL
@@ -359,7 +359,7 @@ impl Vp9Encoder {
     /// configurable) to a faster preset (typically 8) when a
     /// scene-change spike fires, then drop back after motion subsides.
     /// Saves ~40-60 % per-frame encode time on iGPU-class hardware
-    /// (PC50045's Iris Xe is the field-validated case) where SW VP9
+    /// (the field-test host's Iris Xe is the field-validated case) where SW VP9
     /// 4:4:4 at 1920×1200 is CPU-bound to 8-12 fps with cpu-used=6.
     /// Quality drop is ~20 % per-frame, mostly invisible during motion
     /// (which is when this fires).
@@ -619,7 +619,7 @@ pub(crate) fn cpu_used_from_env() -> c_int {
 /// value falls back to `cbr` with a debug-log line.
 ///
 /// rc.42 ships this behind an env var (default cbr); rc.43 flips the
-/// default to vbr after one field cycle on PC50045 confirms the
+/// default to vbr after one field cycle on the field-test host confirms the
 /// envelope is acceptable.
 fn rc_mode_from_env() -> vpx::vpx_rc_mode {
     let raw = std::env::var("ROOMLER_AGENT_VP9_RC_MODE").unwrap_or_default();

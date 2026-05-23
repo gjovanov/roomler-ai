@@ -29,10 +29,10 @@
 //!   live step-by-step state. Replay log catches any events emitted
 //!   before the listener attached (H1).
 //!
-//! See `C:\Users\goran\.claude\plans\rc27-rc28-install-wizard.md`
-//! §rc.28 for the full plan, and the rc.27 lib surface in
-//! `roomler_agent::{install_detect, jwt_introspect, win_service,
-//! enrollment, config}` that this binary builds on.
+//! See the rc.27 lib surface in `roomler_agent::{install_detect,
+//! jwt_introspect, win_service, enrollment, config}` that this
+//! binary builds on; the rc.28 install-wizard plan §rc.28 has the
+//! full design rationale.
 
 #![allow(clippy::doc_lazy_continuation, clippy::doc_overindented_list_items)]
 #![cfg_attr(

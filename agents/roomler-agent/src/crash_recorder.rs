@@ -73,7 +73,7 @@ pub const LOG_TAIL_LINES: usize = 200;
 
 /// Minimum seconds between consecutive sidecar writes in the same
 /// dir. A tight crash-loop (e.g. SystemContext worker dying every
-/// 2s with `code=1`, field repro 2026-05-17 PC55331) would otherwise
+/// 2s with `code=1`, field repro 2026-05-17 a third field-test host) would otherwise
 /// fill the dir with ~24 sidecars/minute. With this rate-limit one
 /// crash is recorded every 30s, capturing enough forensics + leaving
 /// the disk + log alone.
@@ -113,7 +113,7 @@ pub fn record(reason: CrashReason, summary: &str, ctx: WriterContext) {
 /// SupervisorDetected crashes so the sidecar's `log_tail` carries
 /// the WORKER's last few KiB of stderr instead of the supervisor's
 /// own rolling log (which is useless for diagnosing why the worker
-/// died). Field repro: PC55331 SystemContext loop, 2026-05-17.
+/// died). Field repro: a third field-test host SystemContext loop, 2026-05-17.
 ///
 /// `log_tail_override = None` → existing behaviour (read
 /// supervisor's rolling log).
@@ -134,7 +134,7 @@ pub fn record_with_log_tail(
     }));
     match outcome {
         Ok(Ok(path)) => {
-            // Downgraded INFO → DEBUG (2026-05-17 PC55331 storm fix):
+            // Downgraded INFO → DEBUG (2026-05-17 a third field-test host storm fix):
             // a tight crash-loop would otherwise spam this line at INFO
             // through the rolling log file. The rate-limit kicks in
             // after the first write, but even those rate-limited
@@ -176,7 +176,7 @@ fn record_inner(
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
 
-    // Crash-loop suppression. Field repro 2026-05-17 on PC55331:
+    // Crash-loop suppression. Field repro 2026-05-17 on a third field-test host:
     // SystemContext worker dies every 2s with code=1 → supervisor
     // records a SupervisorDetected sidecar per spawn → without
     // suppression we'd fill PROGRAMDATA with ~24 sidecars/minute
@@ -1048,7 +1048,7 @@ mod tests {
         assert_eq!(n, 2);
     }
 
-    // ─── Crash-loop suppression (2026-05-17 PC55331 storm fix) ─────────────
+    // ─── Crash-loop suppression (2026-05-17 a third field-test host storm fix) ─────────────
 
     fn tempdir_for_test() -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

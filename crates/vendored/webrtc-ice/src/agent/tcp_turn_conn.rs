@@ -283,7 +283,7 @@ impl Conn for TcpTurnConn {
 /// intercepted by their TLS-inspection proxy. Browsers + `reqwest`
 /// (Schannel) trust those private CAs because they read the native
 /// store; the prior `webpki-roots`-only build failed with
-/// `UnknownIssuer` on PC55331 because the proxy's cert was signed by
+/// `UnknownIssuer` on a third field-test host because the proxy's cert was signed by
 /// a corporate CA Mozilla doesn't ship. Loading both stores makes the
 /// agent resilient on TLS-intercepted networks AND keeps working on
 /// direct-internet hosts where the native store may be sparse.

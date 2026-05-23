@@ -169,7 +169,7 @@ pub(crate) const PARTIAL_ORPHAN_TTL_SECS: i64 = 24 * 3600;
 /// Granularity at which `chunk()` calls `sync_data()` so that the
 /// page cache is flushed to disk at sub-1-MiB intervals.
 ///
-/// rc.24 — was 1 MiB. PC50045 field repro showed sub-1-MiB files
+/// rc.24 — was 1 MiB. the field-test host field repro showed sub-1-MiB files
 /// never had a sync point mid-upload; if the agent process was
 /// killed before `end()` flushed (e.g. msiexec auto-update,
 /// SCM service restart), the file stayed 0 bytes on disk and
@@ -185,7 +185,7 @@ pub(crate) const FSYNC_THRESHOLD_BYTES: u64 = 256 * 1024;
 /// regardless of the upload's `dest_dir`. When `false`, staging lives
 /// under `<dest_dir>/.roomler-partial/` (rc.19–rc.21 legacy layout).
 ///
-/// **Why**: PC50045 field repro 2026-05-11 — ESET Security real-time
+/// **Why**: the field-test host field repro 2026-05-11 — ESET Security real-time
 /// scanner intercepts per-chunk writes under `C:\Users\<user>\Downloads\`
 /// aggressively enough to push the file-DC's SCTP buffer into overflow
 /// during large uploads, ending in "reconnect budget exhausted after
@@ -1908,7 +1908,7 @@ fn download_dir() -> Result<PathBuf> {
     // LocalSystem profile (`C:\Windows\System32\config\systemprofile\
     // Downloads\`) which usually doesn't exist — uploads fail (or
     // worse, succeed silently into a directory the user can't see).
-    // Field repro PC50045 rc.7 2026-05-06: file upload via browse-
+    // Field repro the field-test host rc.7 2026-05-06: file upload via browse-
     // and-select hung because `create_dir_all` couldn't create the
     // SYSTEM-profile path. Same fallback shape as the rc.6 config
     // fix; see `system_context::user_profile`.
@@ -1933,7 +1933,7 @@ fn download_dir() -> Result<PathBuf> {
     {
         return Ok(dl.to_path_buf());
     }
-    // Windows-specific final fallback (PC50045 2026-05-11 rc.20 field
+    // Windows-specific final fallback (the field-test host 2026-05-11 rc.20 field
     // repro): when the worker is LocalSystem and the user's `Downloads`
     // is Folder-Redirected to a network share (e.g.
     // `\\fileserver\UserData$\<user>\Downloads`) that SYSTEM can't

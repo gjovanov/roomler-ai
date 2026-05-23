@@ -2,11 +2,11 @@
 
 **Status**: planning only (rc.22 cycle, 2026-05-12). No code in this RC. Implementation targeted for rc.23 once the bisect identifies the breaking commit.
 
-**Field bug** (HANDOVER18 Bug 2): on PC50045 (Win11, perMachine MSI, e069019 account, SystemContext worker active), mouse input stops responding when the operator hovers an elevated/admin pwsh window. Memory `project_m3_a1_implementation.md` records that rc.7 *did* support input over admin apps via the LocalSystem (S-1-5-18) worker bypassing UIPI. Something regressed between rc.7 (2026-04-26) and rc.21 (2026-05-11).
+**Field bug** (rc.21 cycle): on a Windows field-test host (Win11, perMachine MSI, non-admin account, SystemContext worker active), mouse input stops responding when the operator hovers an elevated/admin pwsh window. Memory `project_m3_a1_implementation.md` records that rc.7 *did* support input over admin apps via the LocalSystem (S-1-5-18) worker bypassing UIPI. Something regressed between rc.7 (2026-04-26) and rc.21 (2026-05-11).
 
 ## What we know
 
-- SystemContext worker IS active on PC50045 — agent log lines confirm:
+- SystemContext worker IS active on the field-test host — agent log lines confirm:
   ```
   INFO system-context capture: backend=DXGI
   INFO system-context input: thread already bound to input desktop at startup
@@ -18,7 +18,7 @@
 
 ## Candidate regression points (bisect targets)
 
-Per HANDOVER18 + recent commit history. Suspect order — most likely first:
+Per recent commit history. Suspect order — most likely first:
 
 ### 1. rc.20 lock_state probe runs on the wrong thread
 - `peer.rs::attach_input_handler` reads `lock_state_rx.borrow()` and short-circuits when `Locked`. The probe task's `current_thread_desktop_name()` reads the calling tokio thread's desktop — not the input desktop globally.
@@ -44,7 +44,7 @@ Per HANDOVER18 + recent commit history. Suspect order — most likely first:
 
 Before the next session touches code:
 
-1. **Bisect rc.7 → rc.21 on PC50045**. Pull the per-User MSI for each of rc.7, rc.10, rc.13, rc.16, rc.18, rc.20, rc.21 from `github.com/gjovanov/roomler-ai/releases`. Install each in order; after each install:
+1. **Bisect rc.7 → rc.21 on the field-test host**. Pull the per-User MSI for each of rc.7, rc.10, rc.13, rc.16, rc.18, rc.20, rc.21 from `github.com/gjovanov/roomler-ai/releases`. Install each in order; after each install:
    - Restart the agent (Scheduled Task or `roomler-agent run` from elevated shell).
    - Open an elevated pwsh (`Start-Process pwsh -Verb runas`).
    - Move the mouse over it from the browser viewer.
@@ -99,7 +99,7 @@ If hypothesis #3 (rebind leak) bisects in:
 
 **Tests**:
 - Unit: `bind_thread_to_default_if_needed` is a one-syscall-or-no-syscall helper; test the early-return path with a mock `current_thread_desktop_name`.
-- Manual: same admin pwsh scenario on PC50045.
+- Manual: same admin pwsh scenario on the field-test host.
 
 ### Change C: split the suppression policy
 
@@ -139,10 +139,10 @@ if matches!(*lock_state_rx.borrow(), lock_state::LockState::Locked) {
 
 - Unit: `probe_lock_state` with mock `open_input_desktop` + `desktop_name_of` returning various combinations (success-with-Default, success-with-Winlogon, denied, error).
 - Integration: simulate a desktop-transition watcher round-trip via the loopback peer harness; verify input flows correctly across the transition.
-- Manual: PC50045 + e069019 + admin pwsh; verify keyboard + mouse work consistently across Win+L lock/unlock cycles.
+- Manual: the field-test host + operator + admin pwsh; verify keyboard + mouse work consistently across Win+L lock/unlock cycles.
 
 ## Rollout plan
 
 1. Land Change A in rc.23 — it's the highest-confidence fix and doesn't touch the suppression policy.
-2. Bisect on PC50045; if admin pwsh input still fails after rc.23, escalate to Change B.
+2. Bisect on the field-test host; if admin pwsh input still fails after rc.23, escalate to Change B.
 3. If Change B doesn't resolve it, escalate to Change C, requiring an explicit UX decision about UAC-consent-prompt input policy.

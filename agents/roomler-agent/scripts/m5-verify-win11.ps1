@@ -11,7 +11,7 @@ The agent has shipped two autostart strategies on Windows since 0.1.58:
 Until M5, only the Scheduled Task path was field-tested. This script
 swaps one for the other, runs the host through a manual logout/login
 matrix, captures the supervisor logs at each transition, and is fully
-reversible (-Action Rollback). Runs on PC50045 (the dev box) but
+reversible (-Action Rollback). Runs on the field-test host (the dev box) but
 should work on any Win11 host where the agent's perUser MSI is
 already installed.
 
@@ -238,7 +238,7 @@ function Do-Install {
     # always drops the Scheduled Task even if the service is already
     # registered. Mixing both autostart hooks creates a sharp edge on
     # logon (Task fires, fights the SCM worker for the instance lock);
-    # field repro on PC50045 2026-05-02 -- both were registered.
+    # field repro on the field-test host 2026-05-02 -- both were registered.
     Require-Elevated
     Require-AgentExe
 
@@ -297,9 +297,9 @@ function Do-Install {
     Write-Host ''
     Write-Host '=== Next manual steps for M5 verification ===' -ForegroundColor Cyan
     Write-Host '  1. Open the controller (https://roomler.ai/) on a *separate* device,'
-    Write-Host '     connect to PC50045. Confirm video + mouse + keyboard work.'
+    Write-Host '     connect to the field-test host. Confirm video + mouse + keyboard work.'
     Write-Host ''
-    Write-Host '  2. While streaming, log out of PC50045. Expected:'
+    Write-Host '  2. While streaming, log out of the field-test host. Expected:'
     Write-Host '     - supervisor logs "console session went idle ... terminating worker"'
     Write-Host '     - browser canvas goes black; agent goes offline in the agent list'
     Write-Host ''

@@ -902,8 +902,8 @@ impl Agent {
                     Ok(conn) => Arc::new(conn),
                     Err(err) => {
                         let _ = client.close().await;
-                        // Roomler vendor diagnostic (2026-05-18 PC55331
-                        // / CLK00017265): include the scheme + transport
+                        // Roomler vendor diagnostic (2026-05-18 a third field-test host
+                        // / a second field-test host): include the scheme + transport
                         // so we can correlate which TURN URL flavour
                         // failed. `err` is typically just "attribute
                         // not found" — needs investigation downstream of
