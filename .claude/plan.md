@@ -26,7 +26,7 @@ Replicate the same health check infrastructure from the lgr repo, adapted for ro
 
 ## Phase 1: Create `CLAUDE.md`
 
-**File**: `/home/gjovanov/roomler-ai/CLAUDE.md`
+**File**: `<repo>/CLAUDE.md`
 
 Content sections (mirroring lgr's structure):
 - **Project Overview**: Roomler AI — real-time collaboration platform (chat, video conferencing, file sharing, rooms). Rust backend + Vue 3 frontend + MongoDB.
@@ -46,15 +46,15 @@ Content sections (mirroring lgr's structure):
 
 ## Phase 2: Create `.claude/skills/` Directory
 
-**File**: `/home/gjovanov/roomler-ai/.claude/skills/performance-patterns.md`
+**File**: `<repo>/.claude/skills/performance-patterns.md`
 - Initial content: document known patterns (CORS permissive config, deployment strategy Recreate, no rate limiting)
 
-**File**: `/home/gjovanov/roomler-ai/.claude/skills/security-patterns.md`
+**File**: `<repo>/.claude/skills/security-patterns.md`
 - Initial content: document known security findings (permissive CORS, no rate limiting, JWT default secret, missing nginx security headers, 5 TS type errors)
 
 ## Phase 3: Create `.claude/daily-health-check-prompt.md`
 
-**File**: `/home/gjovanov/roomler-ai/.claude/daily-health-check-prompt.md`
+**File**: `<repo>/.claude/daily-health-check-prompt.md`
 
 Heavily adapted from the template. Key adaptations:
 
@@ -126,7 +126,7 @@ Heavily adapted from the template. Key adaptations:
 
 ## Phase 4: Create GitHub Actions Workflow
 
-**File**: `/home/gjovanov/roomler-ai/.github/workflows/daily-health-check.yml`
+**File**: `<repo>/.github/workflows/daily-health-check.yml`
 
 ```yaml
 name: Daily Health Check

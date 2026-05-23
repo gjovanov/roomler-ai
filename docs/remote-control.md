@@ -678,8 +678,8 @@ Deferred per platform:
 
 ## 18. Viewer controls + codec negotiation + DC handlers (0.1.32 → 0.1.35)
 
-Post-Phase-3 the subsystem grew three feature families, tracked in
-`HANDOVER9.md` with full commit-by-commit detail. Summary:
+Post-Phase-3 the subsystem grew three feature families. Commit-by-commit
+detail is in `git log`. Summary:
 
 ### 18.1 Codec negotiation (0.1.28 → 0.1.30)
 
