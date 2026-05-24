@@ -1501,4 +1501,63 @@ mod tests {
             assert!(matches!(reaction, ExitReaction::Respawn));
         }
     }
+
+    // ─── Phase 4: observability constants pinned ─────────────────────────────
+
+    #[test]
+    fn respawn_alarm_threshold_aligns_with_backoff_cap() {
+        // RESPAWN_ALARM_THRESHOLD is the observability signal — past
+        // this many consecutive failures the supervisor escalates to
+        // `error!` (vs the default per-exit `warn!`) so a crash-loop
+        // surfaces in log aggregation. Pinned at 8: roughly where
+        // `next_backoff` saturates at the cap (2s, 4s, 8s, 16s, 32s,
+        // 60s, 60s, 60s — by failure #8 we've been climbing for
+        // ~3 min). A lower value would false-alarm on isolated
+        // crashes; a higher value buries crash-loops under hours of
+        // muted backoff.
+        assert!(
+            RESPAWN_ALARM_THRESHOLD >= 4,
+            "ALARM threshold must be high enough to avoid false-alarming \
+             on isolated crashes; got {RESPAWN_ALARM_THRESHOLD}"
+        );
+        assert!(
+            RESPAWN_ALARM_THRESHOLD <= 15,
+            "ALARM threshold must be low enough that crash-loops surface \
+             within minutes, not hours; got {RESPAWN_ALARM_THRESHOLD}"
+        );
+        // The threshold should align roughly with the failure count
+        // where next_backoff hits its cap — going beyond the cap adds
+        // no extra backoff growth, just delayed visibility.
+        let cap_failures = (0..32u32)
+            .find(|&n| next_backoff(n) >= RESPAWN_BACKOFF_CAP)
+            .expect("next_backoff must reach cap at some finite failure count");
+        // Phase 4: alarm should fire within ~5 failures of the backoff
+        // cap kicking in. The two values are tuned independently but
+        // logically belong together — a drift in either should
+        // trigger a paired review.
+        assert!(
+            RESPAWN_ALARM_THRESHOLD.abs_diff(cap_failures) <= 5,
+            "RESPAWN_ALARM_THRESHOLD ({RESPAWN_ALARM_THRESHOLD}) should align \
+             within ~5 of where backoff saturates ({cap_failures})"
+        );
+    }
+
+    #[test]
+    fn healthy_uptime_threshold_above_crash_loop_timing() {
+        // Field repro on a third field-test host (2026-05-17): doomed
+        // crash-loop worker died in ~400 ms each iteration. The reap
+        // path must NOT treat that as "healthy". 30 s is comfortable
+        // headroom — well above the observed crash-loop dwell, well
+        // below `next_backoff`'s 60 s cap (so a brief stutter doesn't
+        // get suppressed alongside a real loop).
+        assert!(
+            HEALTHY_UPTIME_THRESHOLD >= Duration::from_secs(5),
+            "HEALTHY_UPTIME_THRESHOLD must exceed observed crash-loop dwell"
+        );
+        assert!(
+            HEALTHY_UPTIME_THRESHOLD <= RESPAWN_BACKOFF_CAP,
+            "HEALTHY_UPTIME_THRESHOLD must be below backoff cap so the \
+             reset path can fire before a healthy worker is even possible"
+        );
+    }
 }
