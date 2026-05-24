@@ -33,13 +33,32 @@ resources:
   - deployment-mailpit.yaml
   - statefulset-mongodb.yaml
   - statefulset-minio.yaml
+  # Phase 1 Chunk 1B — agent-e2e harness. The seed Job runs once per
+  # namespace lifetime to create the admin + tenant; the StatefulSet
+  # runs 2 replicas of the synthetic-frame agent enrolled against
+  # that tenant. Secret pins the credentials + tenant_id the agents
+  # bootstrap with. After the first seed-Job run, paste the printed
+  # tenant_id into secret-agent-e2e-bootstrap.yaml + re-apply the
+  # overlay so the agent StatefulSet uses the real id (it ships
+  # with a placeholder zero-id that will loop until rebaked).
+  - secret-agent-e2e-bootstrap.yaml
+  - job-agent-e2e-seed.yaml
+  - service-agent-e2e.yaml
+  - statefulset-agent-e2e.yaml
 
 # Pin to whichever prod tag is currently live. Bump in lockstep when
 # you want e2e to validate a newer build than what's on roomler.ai.
 images:
   - name: gjovanov/roomler-ai
-    newName: registry.roomler.ai/roomler-ai
+    newName: <internal-registry>/roomler-ai
     newTag: v20260506-c89d55489f21
+  # Phase 1 Chunk 1B — agent-e2e Linux image, built from
+  # Dockerfile.agent-e2e. Pinned to `latest` for the first iteration
+  # while the bootstrap flow stabilises; switch to a sha-tagged
+  # image once the runbook is locked.
+  - name: gjovanov/roomler-agent-e2e
+    newName: <internal-registry>/roomler-agent-e2e
+    newTag: latest
 
 commonLabels:
   env: e2e

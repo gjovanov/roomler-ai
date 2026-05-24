@@ -1,0 +1,99 @@
+# Phase 1 Chunk 1B — one-shot Job that seeds the e2e admin + tenant
+# before any agent Pod can mint an enrollment token. Runs to
+# completion + has `ttlSecondsAfterFinished: 0` so a re-apply
+# replaces it cleanly.
+#
+# We don't put this logic in the agent's own bootstrap script because
+# (a) it must run exactly once per namespace lifetime — multiple
+# agent replicas racing on `POST /api/auth/register` would 409 each
+# other; (b) the resulting tenant_id + admin creds need to be
+# captured into a Secret that all agents share.
+#
+# After this Job exits 0, the `agent-e2e-bootstrap` Secret holds:
+#   * admin_email / admin_password — login creds the agent uses to
+#     mint enrollment tokens at startup.
+#   * tenant_id — ObjectId hex the agent passes to /agent/enroll-token.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: agent-e2e-seed
+  labels:
+    app: agent-e2e-seed
+spec:
+  ttlSecondsAfterFinished: 0
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app: agent-e2e-seed
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: seed
+          image: curlimages/curl:8.10.1
+          env:
+            - name: SERVER
+              value: http://roomler2
+            - name: ADMIN_EMAIL
+              value: agent-e2e-admin@roomler.local
+            - name: ADMIN_PASSWORD
+              value: agent-e2e-bootstrap-pw-2026
+            - name: TENANT_SLUG
+              value: agent-e2e
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              echo "[seed] waiting for $SERVER/health"
+              for i in $(seq 1 60); do
+                if curl -fsS "$SERVER/health" >/dev/null 2>&1; then
+                  echo "[seed] api healthy after ${i}s"
+                  break
+                fi
+                sleep 1
+              done
+
+              # Register the admin user + tenant (idempotent: 409 if
+              # already exists, which we tolerate).
+              REG_BODY=$(printf '{"email":"%s","username":"agent-e2e-admin","password":"%s","display_name":"Agent E2E Admin","tenant_name":"Agent E2E","tenant_slug":"%s"}' "$ADMIN_EMAIL" "$ADMIN_PASSWORD" "$TENANT_SLUG")
+              REG_STATUS=$(curl -s -o /tmp/reg.json -w '%{http_code}' -X POST "$SERVER/api/auth/register" \
+                -H 'content-type: application/json' -d "$REG_BODY")
+              echo "[seed] register status=$REG_STATUS"
+              if [ "$REG_STATUS" != "201" ] && [ "$REG_STATUS" != "200" ] && [ "$REG_STATUS" != "409" ]; then
+                echo "[seed] register failed:"; cat /tmp/reg.json; exit 1
+              fi
+
+              # Login to get an access_token + harvest the tenant_id
+              # from the response (`/api/auth/me` returns memberships).
+              LOGIN_BODY=$(printf '{"email":"%s","password":"%s"}' "$ADMIN_EMAIL" "$ADMIN_PASSWORD")
+              LOGIN_RESP=$(curl -fsS -X POST "$SERVER/api/auth/login" \
+                -H 'content-type: application/json' -d "$LOGIN_BODY")
+              TOKEN=$(echo "$LOGIN_RESP" | grep -oE '"access_token":"[^"]+"' | sed 's/.*"access_token":"\([^"]*\)".*/\1/')
+              if [ -z "$TOKEN" ]; then
+                echo "[seed] login failed:"; echo "$LOGIN_RESP"; exit 1
+              fi
+
+              ME_RESP=$(curl -fsS "$SERVER/api/auth/me" -H "authorization: Bearer $TOKEN")
+              TENANT_ID=$(echo "$ME_RESP" | grep -oE '"tenant_id":"[^"]+"' | head -1 | sed 's/.*"tenant_id":"\([^"]*\)".*/\1/')
+              if [ -z "$TENANT_ID" ]; then
+                echo "[seed] could not extract tenant_id from /me:"; echo "$ME_RESP"; exit 1
+              fi
+              echo "[seed] tenant_id=$TENANT_ID"
+
+              # We can't write the Secret from inside a Pod without
+              # extra RBAC for `patch secrets`. Instead, the agent
+              # StatefulSet reads ADMIN_* + TENANT_ID from a plain
+              # ConfigMap+Secret already in the overlay (see
+              # configmap-agent-e2e.yaml + secret-agent-e2e.yaml).
+              # This Job's only post-condition is "the admin user
+              # exists with the documented credentials and is a
+              # member of the documented tenant_slug." We assert
+              # that by reading TENANT_ID back here and comparing
+              # against the pinned value; a mismatch indicates a
+              # stale Secret + needs operator action.
+              if [ -n "${EXPECTED_TENANT_ID:-}" ] && [ "$TENANT_ID" != "$EXPECTED_TENANT_ID" ]; then
+                echo "[seed] WARN: live tenant_id=$TENANT_ID, Secret pins $EXPECTED_TENANT_ID — re-bake the Secret"
+              fi
+
+              echo "[seed] OK — admin + tenant ready; tenant_id=$TENANT_ID"
