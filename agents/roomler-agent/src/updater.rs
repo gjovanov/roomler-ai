@@ -913,6 +913,17 @@ fn preserve_system_context_property(_flavour: WindowsInstallFlavour) -> Vec<(Str
 ///   * SCM read error (best-effort; falling back matches pre-rc.56
 ///     behaviour — `enable-system-context` CLI remains the manual
 ///     escape hatch)
+//
+// cfg-gate so the function is only compiled where it's actually
+// reachable: on Windows (the SCM wrapper at line 869 calls it) and
+// under `cfg(test)` (the unit tests at lines 1959+ exercise it
+// directly without going through the Windows wrapper). Without the
+// gate, the Linux clippy job fails with `-D dead_code` because the
+// non-Windows `preserve_system_context_property` stub returns early
+// and never reaches this helper. Pre-existing master regression
+// repro'd in CI run 26375071253; fix landed alongside the
+// tunnel-wizard feature so the branch's CI can be green.
+#[cfg(any(target_os = "windows", test))]
 fn preserve_system_context_property_for(
     flavour: WindowsInstallFlavour,
     env_value: Result<Option<String>, String>,
