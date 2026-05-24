@@ -224,10 +224,31 @@ pub fn is_active() -> bool {
 /// Run the scan loop. Returns when shutdown is signalled or
 /// `on_stall` returns false. Production path passes
 /// [`force_exit_on_stall`] which never returns (calls `exit`).
+///
+/// Thin wrapper over [`run_with_intervals`] that pins the cadence
+/// to the production [`SCAN_INTERVAL`] + [`SUSPEND_TOLERANCE`]
+/// constants. Tests use the inner function to drive the loop on
+/// sub-second intervals; production callers go through `run` so
+/// they can't accidentally drift those tuning knobs.
 pub async fn run(
+    wd: Arc<Watchdog>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    on_stall: impl Fn(&[(&'static str, Duration)]) -> bool + Send + 'static,
+) {
+    run_with_intervals(wd, shutdown, on_stall, SCAN_INTERVAL, SUSPEND_TOLERANCE).await
+}
+
+/// rc.58 Phase 4: testable variant of [`run`] with both the scan
+/// cadence and the suspend-tolerance injected as parameters.
+/// `pub(crate)` so unit tests in this crate can drive the loop on a
+/// 25 ms scan interval (vs the production 5 s); external callers
+/// stick with [`run`].
+pub(crate) async fn run_with_intervals(
     wd: Arc<Watchdog>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     on_stall: impl Fn(&[(&'static str, Duration)]) -> bool + Send + 'static,
+    scan_interval: Duration,
+    suspend_tolerance: Duration,
 ) {
     let mut prev = Instant::now();
     loop {
@@ -235,7 +256,7 @@ pub async fn run(
             return;
         }
         tokio::select! {
-            _ = tokio::time::sleep(SCAN_INTERVAL) => {},
+            _ = tokio::time::sleep(scan_interval) => {},
             _ = shutdown.changed() => {
                 if *shutdown.borrow() { return; }
             },
@@ -246,7 +267,7 @@ pub async fn run(
         wd.own_heartbeat.fetch_add(1, Ordering::Release);
 
         let actual = now.saturating_duration_since(prev);
-        if actual > SCAN_INTERVAL + SUSPEND_TOLERANCE {
+        if actual > scan_interval + suspend_tolerance {
             tracing::warn!(
                 lag_secs = actual.as_secs(),
                 "watchdog detected wall-clock jump (suspend/resume); resetting pump heartbeats"
@@ -497,6 +518,185 @@ mod tests {
         let stalled = wd.scan_at(Instant::now());
         assert_eq!(stalled.len(), 1, "active pump with no ticks must stall");
         assert_eq!(stalled[0].0, "signaling");
+    }
+
+    // ─── Phase 4: run() loop semantics ───────────────────────────────────────
+
+    /// Run the loop with a tight 25 ms scan interval and a short
+    /// suspend tolerance. Returns the JoinHandle + shutdown sender so
+    /// the test can stop the loop cleanly.
+    fn spawn_run_loop(
+        wd: Arc<Watchdog>,
+        on_stall: impl Fn(&[(&'static str, Duration)]) -> bool + Send + 'static,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        tokio::sync::watch::Sender<bool>,
+    ) {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(async move {
+            run_with_intervals(
+                wd,
+                rx,
+                on_stall,
+                Duration::from_millis(25),
+                Duration::from_millis(500),
+            )
+            .await;
+        });
+        (handle, tx)
+    }
+
+    #[tokio::test]
+    async fn run_loop_invokes_on_stall_for_stalled_pump() {
+        // Pump with a near-zero threshold + active=true → the very
+        // first scan after registration must see it as stalled and
+        // invoke on_stall. Locks the "run() actually calls on_stall"
+        // invariant that the unit-level scan_at tests can't reach.
+        let wd = Watchdog::new();
+        wd.register("p", Duration::from_millis(5), true);
+
+        let calls = Arc::new(AtomicU64::new(0));
+        let calls_clone = calls.clone();
+        let (handle, tx) = spawn_run_loop(wd, move |stalled| {
+            // Defensive: only count scans that found OUR pump stalled,
+            // so an unrelated future pump can't quiet the assertion.
+            if stalled.iter().any(|(name, _)| *name == "p") {
+                calls_clone.fetch_add(1, Ordering::SeqCst);
+            }
+            true // keep loop running
+        });
+
+        // Three scan-intervals should comfortably allow ≥1 invocation
+        // even under CI jitter. We test for ≥1 (not ==1) because the
+        // loop scans repeatedly until on_stall returns false.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let _ = tx.send(true);
+        let _ = handle.await;
+
+        assert!(
+            calls.load(Ordering::SeqCst) >= 1,
+            "on_stall must be invoked at least once for a stalled pump; got {}",
+            calls.load(Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn run_loop_exits_when_on_stall_returns_false() {
+        // Production's on_stall (`force_exit_on_stall`) returns false
+        // so the loop bails before its own next iteration — defensive
+        // path for the unlikely case `std::process::exit` somehow
+        // doesn't terminate the process. We exercise that path here
+        // without actually exiting.
+        let wd = Watchdog::new();
+        wd.register("p", Duration::from_millis(5), true);
+        let (handle, _tx) = spawn_run_loop(wd, |_| false /* stop the loop */);
+
+        // The loop must return within a few scan intervals; if the
+        // false-return contract was broken (e.g. someone flipped the
+        // sign on the predicate) the join would block until the
+        // test framework's timeout.
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("run_loop must exit promptly when on_stall returns false")
+            .expect("run_loop task must not panic");
+    }
+
+    #[tokio::test]
+    async fn run_loop_exits_when_shutdown_signalled() {
+        // No pump registered → no stalls. The loop should sit on its
+        // tokio::select! awaiting either a scan tick or a shutdown
+        // change. Send `true` and assert prompt exit.
+        let wd = Watchdog::new();
+        let (handle, tx) = spawn_run_loop(wd, |_| true);
+
+        // Settle a bit so we know the loop is actively in the select
+        // (not just about to start), then signal shutdown.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = tx.send(true);
+
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("run_loop must exit promptly on shutdown signal")
+            .expect("run_loop task must not panic");
+    }
+
+    #[tokio::test]
+    async fn run_loop_bumps_own_heartbeat_each_scan() {
+        // The watchdog-of-watchdog (spawn_thread_watchdog) reads
+        // own_heartbeat to detect a fully-deadlocked tokio runtime.
+        // If a refactor stops bumping the counter inside the scan
+        // loop, the thread-watchdog would force-exit a perfectly
+        // healthy process after 60 s. Pin the contract.
+        let wd = Watchdog::new();
+        let initial = wd.own_heartbeat();
+        let (handle, tx) = spawn_run_loop(wd.clone(), |_| true);
+        // ≥3 scan intervals worth of wall time.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let _ = tx.send(true);
+        let _ = handle.await;
+        let after = wd.own_heartbeat();
+        assert!(
+            after >= initial + 3,
+            "own_heartbeat must bump ≥3 times across 150ms / 25ms scan-interval; \
+             initial={initial} after={after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_loop_does_not_fire_stall_for_inactive_pump_during_long_idle() {
+        // Locks the rc.58 cold-start fix at the loop level (the
+        // earlier `rc58_cold_start_grace_signaling_pattern_does_not_
+        // false_stall` covers it at the scan_at level). With the pump
+        // registered active=false from the start, the loop must NEVER
+        // see it as stalled even though we sleep long past the
+        // threshold. A regression that flipped `active=true` default
+        // back on would fire on_stall here.
+        let wd = Watchdog::new();
+        wd.register("signaling", Duration::from_millis(5), false);
+
+        let stall_calls = Arc::new(AtomicU64::new(0));
+        let stall_calls_clone = stall_calls.clone();
+        let (handle, tx) = spawn_run_loop(wd, move |stalled| {
+            if !stalled.is_empty() {
+                stall_calls_clone.fetch_add(1, Ordering::SeqCst);
+            }
+            true
+        });
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let _ = tx.send(true);
+        let _ = handle.await;
+
+        assert_eq!(
+            stall_calls.load(Ordering::SeqCst),
+            0,
+            "inactive pump must not be reported as stalled — \
+             this is the rc.58 cold-start grace contract"
+        );
+    }
+
+    // ─── Phase 4: production-cadence constants pinned ────────────────────────
+
+    #[test]
+    fn scan_interval_is_reasonable() {
+        // Too short → CPU waste from constant Mutex polls. Too long
+        // → stall-detection latency exceeds the operator's "agent
+        // looks frozen" patience window. The current 5 s value is
+        // 18× under the 90 s signaling threshold, giving plenty of
+        // scan opportunities to catch a stall.
+        assert!(SCAN_INTERVAL >= Duration::from_secs(1));
+        assert!(SCAN_INTERVAL <= Duration::from_secs(15));
+    }
+
+    #[test]
+    fn suspend_tolerance_covers_realistic_resume_gap() {
+        // SUSPEND_TOLERANCE distinguishes "the host was suspended"
+        // from "a pump genuinely stalled". A laptop closed-lid →
+        // open-lid cycle can take many seconds (NVMe wake, network
+        // re-attach); 60 s is comfortable headroom. A regression
+        // dropping this below ~10 s would start false-positive
+        // "wall-clock jump" warns on busy hosts.
+        assert!(SUSPEND_TOLERANCE >= Duration::from_secs(10));
     }
 
     #[test]

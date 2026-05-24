@@ -349,6 +349,28 @@ mod tests {
     }
 
     #[test]
+    fn crash_drain_interval_is_reasonable() {
+        // Phase 4 pin: too short → wasted CPU + needless HTTP load on
+        // long-running healthy agents. Too long → sidecars sit on
+        // disk for hours after network repair, defeating the rc.58
+        // periodic-drain motivation. 5 min hits the field-tuned
+        // sweet spot: cheap when no sidecars are pending (empty
+        // pending_all() returns immediately), responsive enough that
+        // an operator opening the admin UI within a coffee break of
+        // a network repair sees the evidence land.
+        assert!(
+            CRASH_DRAIN_INTERVAL_SECS >= 60,
+            "CRASH_DRAIN_INTERVAL_SECS must be >= 60s to keep periodic \
+             drain off the hot path; got {CRASH_DRAIN_INTERVAL_SECS}"
+        );
+        assert!(
+            CRASH_DRAIN_INTERVAL_SECS <= 30 * 60,
+            "CRASH_DRAIN_INTERVAL_SECS must be <= 30min so post-repair \
+             sidecar surfacing stays operator-visible; got {CRASH_DRAIN_INTERVAL_SECS}"
+        );
+    }
+
+    #[test]
     fn delete_sidecar_is_idempotent_when_file_missing() {
         let dir = std::env::temp_dir().join(format!(
             "crash_uploader_test_{}",
