@@ -26,6 +26,8 @@ mod recording_tests;
 #[cfg(test)]
 mod agent_crash_tests;
 #[cfg(test)]
+mod agent_e2e_tests;
+#[cfg(test)]
 mod agent_tests;
 #[cfg(test)]
 mod billing_tests;

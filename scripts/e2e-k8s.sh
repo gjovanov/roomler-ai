@@ -34,16 +34,24 @@ RESULTS_ROOT="${RESULTS_ROOT:-$HOME/e2e-results}"
 
 RESET=0
 FORCE_BUILD=0
+# Phase 1 Chunk 1D — opt-in agent harness. When --with-agents is set,
+# the orchestrator (a) waits for the agent-e2e StatefulSet's 2 Pods
+# to be Ready alongside the API stack, and (b) blocks on the seed
+# Job completing before treating the stack as ready. Default OFF so
+# the existing Playwright-only path keeps its ~3 min run time on
+# stacks that don't have the agent overlay applied yet.
+WITH_AGENTS=0
 MODE=""
 for arg in "$@"; do
   case "$arg" in
-    --reset)  RESET=1 ;;
-    --build)  FORCE_BUILD=1 ;;
+    --reset)        RESET=1 ;;
+    --build)        FORCE_BUILD=1 ;;
+    --with-agents)  WITH_AGENTS=1 ;;
     smoke|first-cut|full) MODE="$arg" ;;
     *) echo "unknown arg: $arg" >&2; exit 2 ;;
   esac
 done
-[ -z "$MODE" ] && { echo "usage: $0 [--reset] [--build] smoke|first-cut|full" >&2; exit 2; }
+[ -z "$MODE" ] && { echo "usage: $0 [--reset] [--build] [--with-agents] smoke|first-cut|full" >&2; exit 2; }
 
 cd "$REPO_ROOT"
 GIT_SHA=$(git rev-parse --short HEAD)
@@ -99,6 +107,37 @@ for selector in "app=mongodb" "app=redis" "app=minio" "app=mailpit" "app=roomler
   kubectl -n "$NAMESPACE" wait --for=condition=ready pod \
     -l "$selector" --timeout=180s
 done
+
+# Phase 1 Chunk 1D — agent harness wait. The agent-e2e StatefulSet
+# can't reach Ready until (a) the API is up (already waited above),
+# (b) the seed Job has created the admin/tenant, and (c) the
+# bootstrap Secret holds the real tenant_id (operator-side step
+# documented in scripts/e2e-k8s/AGENT-E2E.md). If --with-agents is
+# set but the harness hasn't been brought up yet, fail loud here
+# rather than mid-test with a "no enrolled agent" cryptic error.
+if [ "$WITH_AGENTS" = "1" ]; then
+  echo "[e2e-k8s] --with-agents: waiting for seed Job + 2 agent Pods"
+  # Seed Job: ttlSecondsAfterFinished=0 so once it's gone, it
+  # already ran successfully. If it's still present we wait for
+  # completion (typical ~5 s).
+  if kubectl -n "$NAMESPACE" get job/agent-e2e-seed >/dev/null 2>&1; then
+    kubectl -n "$NAMESPACE" wait --for=condition=complete --timeout=120s \
+      job/agent-e2e-seed || {
+        echo "[e2e-k8s] seed Job failed; check kubectl logs job/agent-e2e-seed" >&2
+        kubectl -n "$NAMESPACE" logs job/agent-e2e-seed >&2 || true
+        exit 1
+      }
+  fi
+  kubectl -n "$NAMESPACE" wait --for=condition=ready pod \
+    -l "app=agent-e2e" --timeout=180s || {
+      echo "[e2e-k8s] agent-e2e Pods never reached Ready — likely a stale" >&2
+      echo "          tenant_id in secret-agent-e2e-bootstrap.yaml. See" >&2
+      echo "          scripts/e2e-k8s/AGENT-E2E.md for the rebake runbook." >&2
+      kubectl -n "$NAMESPACE" logs -l app=agent-e2e --tail=80 >&2 || true
+      exit 1
+    }
+  echo "[e2e-k8s] agent harness ready ($(kubectl -n "$NAMESPACE" get pod -l app=agent-e2e --no-headers | wc -l) Pods)"
+fi
 
 # ──────────────────────────────────────────────────────────────────────
 # 4. Smoke probe
