@@ -51,3 +51,5 @@ mod rate_limit_tests;
 mod remote_control_tests;
 #[cfg(test)]
 mod role_tests;
+#[cfg(test)]
+mod tunnel_tests;
