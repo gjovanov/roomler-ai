@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod agent_crash;
+pub mod agent_log;
 pub mod base;
 pub mod file;
 pub mod invite;

@@ -38,3 +38,6 @@ pub use user::*;
 
 pub mod activation_code;
 pub use activation_code::*;
+
+pub mod agent_log;
+pub use agent_log::*;

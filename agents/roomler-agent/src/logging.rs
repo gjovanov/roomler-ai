@@ -22,14 +22,17 @@
 
 use std::backtrace::Backtrace;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use directories::ProjectDirs;
+use tokio::sync::mpsc;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
+
+use crate::logs_upload::{LogLine, LogUploadLayer};
 
 /// Holds the non-blocking appender's worker thread alive for the
 /// process lifetime. Dropping it stops the writer thread, which would
@@ -39,6 +42,14 @@ static GUARD: OnceLock<WorkerGuard> = OnceLock::new();
 /// Resolved log directory, exposed for diagnostics (the `panic` /
 /// `service status` paths surface it to the operator).
 static LOG_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+/// Holds the consumer end of the log-upload channel after [`init`]
+/// runs. [`take_log_upload_receiver`] consumes it (one-shot) so
+/// `main.rs` can spawn the uploader task once config is loaded. If
+/// the receiver is never claimed, the layer continues to capture
+/// events into the channel until it fills up + drops oldest (cap
+/// 10 000 lines).
+static LOG_UPLOAD_RX: OnceLock<Mutex<Option<mpsc::Receiver<LogLine>>>> = OnceLock::new();
 
 /// Days to retain rolling log + panic files. Anything older than this
 /// is pruned on startup (one-shot, not a background task).
@@ -60,6 +71,15 @@ pub fn init() {
 
     let stdout = fmt::layer().with_target(false).compact();
 
+    // rc.58 — log-upload layer. Captures every tracing event into an
+    // mpsc channel; `main.rs` claims the receiver via
+    // [`take_log_upload_receiver`] and spawns the uploader task once
+    // config is loaded. If the receiver is never claimed (e.g. config
+    // load fails), the channel fills + drops oldest with no impact on
+    // the on-disk rolling log.
+    let (upload_layer, upload_rx) = LogUploadLayer::new();
+    let _ = LOG_UPLOAD_RX.set(Mutex::new(Some(upload_rx)));
+
     let dir = resolve_log_dir();
     let _ = LOG_DIR.set(dir.clone());
 
@@ -78,17 +98,28 @@ pub fn init() {
             .with(env_filter)
             .with(stdout)
             .with(file)
+            .with(upload_layer)
             .try_init();
         install_panic_hook(d.to_path_buf());
     } else {
         let _ = tracing_subscriber::registry()
             .with(env_filter)
             .with(stdout)
+            .with(upload_layer)
             .try_init();
         // No log dir → no panic hook. Stdout-only is the right
         // fallback for cargo-test and ad-hoc `cargo run` from a
         // checkout where `directories` couldn't resolve a home.
     }
+}
+
+/// Claim the consumer end of the log-upload channel. Returns `None`
+/// if [`init`] hasn't run yet OR the receiver has already been taken
+/// — one-shot semantics so we don't have two parallel uploaders
+/// fighting for the same channel.
+pub fn take_log_upload_receiver() -> Option<mpsc::Receiver<LogLine>> {
+    let lock = LOG_UPLOAD_RX.get()?;
+    lock.lock().ok()?.take()
 }
 
 /// Path of the log directory, if persistent file logging is active.
