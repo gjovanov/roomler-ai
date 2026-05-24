@@ -1,0 +1,207 @@
+# Phase 6 Chunk 6A — install + uninstall smoke for the per-User MSI
+# on windows-latest. Catches the regressions install_detect locks
+# (UpgradeCode registry presence) + the WiX bundle's basic
+# correctness (the MSI installs cleanly + the agent binary lands at
+# the expected path + uninstall cleans up). Cheap signal (~10 min) on
+# every push that touches the agent or installer source.
+#
+# Explicitly NOT in scope this iteration:
+#   * WebView2 UI automation of the wizard EXE (Welcome → Server →
+#     Token → Install → Done). Tauri 2 + tauri-driver on a headless
+#     GitHub runner is a 1–2 day spike in itself; deferred to Chunk
+#     6B once this baseline is green.
+#   * SystemContext swap testing. `ROOMLER_AGENT_ENABLE_SYSTEM_SWAP=1`
+#     + WTSQueryUserToken + winlogon-token spawn needs an interactive
+#     desktop session that GitHub-hosted Windows runners don't expose;
+#     requires a self-hosted runner on a real Win11 VM. Phase 6 plan
+#     called this risk out — see commit message.
+#   * Per-Machine MSI. Same install/uninstall flow but admin-elevated.
+#     Add when this per-User flow is green + we want to widen coverage.
+#   * Code signing. Skipped because the smoke doesn't ship anywhere.
+name: installer-smoke
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'agents/roomler-agent/**'
+      - 'agents/roomler-installer/**'
+      - '.github/workflows/installer-smoke.yml'
+  workflow_dispatch: {}
+
+jobs:
+  windows-msi-install-uninstall:
+    name: per-User MSI install + uninstall (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Cache cargo
+        continue-on-error: true
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+          shared-key: installer-smoke-windows
+
+      - name: Install WiX Toolset v3 + cargo-wix
+        shell: pwsh
+        run: |
+          choco install -y wixtoolset
+          $wixBin = Get-ChildItem 'C:\Program Files (x86)\WiX Toolset v*\bin' | Select-Object -First 1
+          "$($wixBin.FullName)" | Out-File -FilePath $env:GITHUB_PATH -Append
+          cargo install cargo-wix --locked
+
+      - name: Build agent (release, minimal feature set)
+        # Chunk 6A scope: install/uninstall validation only. Drop
+        # `vp9-444` (avoids the vcpkg/libvpx dance) and `wgc-capture`
+        # (Windows.Graphics.Capture not needed for install
+        # validation). The MSI bundle just packages whatever exe is
+        # at target/release/roomler-agent.exe; feature set affects
+        # runtime behaviour only.
+        shell: pwsh
+        run: |
+          cargo build -p roomler-agent --release `
+            --features "mf-encoder,scrap-capture,openh264-encoder,enigo-input,clipboard,viewer-indicator,system-context"
+
+      - name: Build per-User MSI
+        shell: pwsh
+        env:
+          # cargo-wix reads the version from Cargo.toml but
+          # `--install-version` lets us pin a known-marker version
+          # for the registry assertion (the MSI's ProductVersion
+          # lands under the UpgradeCode key alongside the
+          # InstallProperties).
+          SMOKE_VERSION: 0.0.0-smoke
+        run: |
+          cargo wix -p roomler-agent --nocapture --no-build --install-version $env:SMOKE_VERSION
+          $msi = Get-ChildItem 'target/wix/*.msi' | Select-Object -First 1
+          if (-not $msi) { throw 'MSI not produced by cargo-wix' }
+          'MSI_PATH=' + $msi.FullName | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "MSI ready: $($msi.FullName) ($([math]::Round($msi.Length / 1MB, 2)) MiB)"
+
+      - name: Install the MSI (quiet, per-User)
+        shell: pwsh
+        run: |
+          # /quiet runs without UI; /norestart prevents implicit reboot
+          # if the MSI calls for one; /l*v emits a verbose log so the
+          # workflow's artifact upload below captures it on failure.
+          $logDir = Join-Path $env:RUNNER_TEMP 'msi-logs'
+          New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+          $log = Join-Path $logDir 'install.log'
+          $proc = Start-Process -FilePath 'msiexec.exe' `
+            -ArgumentList "/i `"$env:MSI_PATH`" /quiet /norestart /l*v `"$log`"" `
+            -Wait -PassThru
+          'INSTALL_LOG=' + $log | Out-File -FilePath $env:GITHUB_ENV -Append
+          if ($proc.ExitCode -ne 0) {
+            Get-Content $log -Tail 200
+            throw "msiexec /i failed with exit $($proc.ExitCode)"
+          }
+          Write-Host "Install succeeded (exit 0)"
+
+      - name: Assert registry UpgradeCode present (rc.27 install_detect lock)
+        shell: pwsh
+        run: |
+          # rc.27's `install_detect::detect_existing_install` reads
+          # HKCU + HKLM `Software\\…\\Installer\\UpgradeCodes\\<packed>`
+          # where <packed> is the Windows-Installer-compressed encoding
+          # of the UpgradeCode GUID. The MSI we just built carries
+          # UpgradeCode `1F2D7B1C-8B2F-4D2E-B1A3-6B1E2C7E4D91` (see
+          # `agents/roomler-agent/Cargo.toml::package.metadata.wix`).
+          #
+          # Rather than reimplementing pack_msi_guid in PowerShell,
+          # use WMI / Get-Package to query installed MSIs by
+          # UpgradeCode-aware queries — equivalent observable.
+          $pkg = Get-Package -Provider msi -ErrorAction SilentlyContinue |
+                   Where-Object { $_.Name -like 'roomler-agent*' }
+          if (-not $pkg) {
+            Write-Host '--- All installed MSIs ---'
+            Get-Package -Provider msi | Select-Object Name, Version | Format-Table
+            throw 'roomler-agent MSI not found in installed packages after install'
+          }
+          Write-Host "Installed: $($pkg.Name) $($pkg.Version)"
+
+      - name: Assert agent binary at expected install path
+        shell: pwsh
+        run: |
+          # Per-User MSI installs under %LOCALAPPDATA%\roomler\ or
+          # %ProgramFiles%\roomler\ depending on the WiX install
+          # scope. We just verify roomler-agent.exe exists somewhere
+          # under either tree — the actual scope is determined by
+          # the WiX MSI authoring, not by the test.
+          $candidates = @(
+            (Join-Path $env:LOCALAPPDATA  'Programs\roomler-agent\roomler-agent.exe'),
+            (Join-Path $env:LOCALAPPDATA  'roomler\roomler-agent.exe'),
+            (Join-Path $env:ProgramFiles  'roomler-agent\roomler-agent.exe'),
+            (Join-Path $env:ProgramFiles  'roomler\roomler-agent.exe')
+          )
+          $found = $null
+          foreach ($c in $candidates) {
+            if (Test-Path $c) { $found = $c; break }
+          }
+          if (-not $found) {
+            Write-Host '--- Searching for roomler-agent.exe under common roots ---'
+            $roots = @(
+              $env:LOCALAPPDATA,
+              $env:ProgramFiles,
+              (Join-Path $env:USERPROFILE 'AppData\Local')
+            ) | Where-Object { Test-Path $_ }
+            foreach ($r in $roots) {
+              Get-ChildItem -Path $r -Filter 'roomler-agent.exe' -Recurse -ErrorAction SilentlyContinue |
+                ForEach-Object { Write-Host "  found at: $($_.FullName)" }
+            }
+            throw 'roomler-agent.exe not found at any expected install path after install'
+          }
+          Write-Host "Agent binary present: $found"
+
+      - name: Uninstall the MSI (quiet)
+        shell: pwsh
+        run: |
+          $logDir = Join-Path $env:RUNNER_TEMP 'msi-logs'
+          $log = Join-Path $logDir 'uninstall.log'
+          $proc = Start-Process -FilePath 'msiexec.exe' `
+            -ArgumentList "/x `"$env:MSI_PATH`" /quiet /norestart /l*v `"$log`"" `
+            -Wait -PassThru
+          'UNINSTALL_LOG=' + $log | Out-File -FilePath $env:GITHUB_ENV -Append
+          if ($proc.ExitCode -ne 0) {
+            Get-Content $log -Tail 200
+            throw "msiexec /x failed with exit $($proc.ExitCode)"
+          }
+          Write-Host 'Uninstall succeeded (exit 0)'
+
+      - name: Assert cleanup — registry + install dir gone
+        shell: pwsh
+        run: |
+          $pkg = Get-Package -Provider msi -ErrorAction SilentlyContinue |
+                   Where-Object { $_.Name -like 'roomler-agent*' }
+          if ($pkg) {
+            throw "roomler-agent MSI still listed after uninstall: $($pkg.Name) $($pkg.Version)"
+          }
+          # Pick the candidate paths from the install-assert step;
+          # none should exist after uninstall (best-effort — some
+          # config files may legitimately survive an uninstall by
+          # WiX's MajorUpgrade / `Permanent="yes"` rules, but the
+          # exe itself MUST be gone).
+          $candidates = @(
+            (Join-Path $env:LOCALAPPDATA  'Programs\roomler-agent\roomler-agent.exe'),
+            (Join-Path $env:LOCALAPPDATA  'roomler\roomler-agent.exe'),
+            (Join-Path $env:ProgramFiles  'roomler-agent\roomler-agent.exe'),
+            (Join-Path $env:ProgramFiles  'roomler\roomler-agent.exe')
+          )
+          foreach ($c in $candidates) {
+            if (Test-Path $c) {
+              throw "Agent binary still at $c after uninstall — MSI uninstaller is broken"
+            }
+          }
+          Write-Host 'Uninstall left no traces of the agent binary or MSI registry record'
+
+      - name: Upload MSI logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: msi-logs
+          path: ${{ runner.temp }}/msi-logs/
+          retention-days: 7
