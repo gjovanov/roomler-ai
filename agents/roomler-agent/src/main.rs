@@ -1275,6 +1275,37 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         }
     });
 
+    // rc.58 — start the centralized log uploader BEFORE signaling
+    // moves cfg out of scope. Default ON; opt out with
+    // `ROOMLER_AGENT_LOGS_UPLOAD_DISABLED=1` per the rc.58 plan.
+    let logs_upload_disabled = roomler_agent::logs_upload::parse_disable_flag(
+        std::env::var("ROOMLER_AGENT_LOGS_UPLOAD_DISABLED")
+            .ok()
+            .as_deref(),
+    );
+    if !logs_upload_disabled && let Some(rx) = logging::take_log_upload_receiver() {
+        let host_hash = roomler_agent::logs_upload::hash_hostname(
+            &roomler_agent::machine::hostname().unwrap_or_else(|_| "unknown".to_string()),
+        );
+        let upload_cfg = roomler_agent::logs_upload::UploadConfig {
+            server_url: cfg.server_url.clone(),
+            tenant_id: cfg.tenant_id.clone(),
+            agent_id: cfg.agent_id.clone(),
+            agent_jwt: cfg.agent_token.clone(),
+            agent_version: env!("CARGO_PKG_VERSION").to_string(),
+            host_id_hash: host_hash,
+            source: roomler_agent::logs_upload::LogSource::Agent,
+        };
+        tokio::spawn(roomler_agent::logs_upload::run_uploader(rx, upload_cfg));
+        tracing::info!(
+            tenant_id = %cfg.tenant_id,
+            agent_id = %cfg.agent_id,
+            "logs upload task spawned (default ON; set ROOMLER_AGENT_LOGS_UPLOAD_DISABLED=1 to opt out)"
+        );
+    } else if logs_upload_disabled {
+        tracing::info!("logs upload disabled via ROOMLER_AGENT_LOGS_UPLOAD_DISABLED env var");
+    }
+
     let sig_task = tokio::spawn({
         let rx = shutdown_rx.clone();
         async move { signaling::run(cfg, encoder_preference, rx).await }

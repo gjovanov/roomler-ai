@@ -222,6 +222,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/me", put(routes::user::update_profile))
         .route("/{user_id}", get(routes::user::get_profile));
 
+    // rc.58 — browser console log batch ingest. User-authed (the
+    // controller user's JWT). The body MUST include an explicit
+    // `tenant_id` field since the user JWT doesn't pin a tenant; the
+    // route handler verifies membership before persisting.
+    let log_routes = Router::new().route("/browser", post(routes::agent_log::ingest_browser));
+
     // Search routes (under tenant)
     let search_routes = Router::new().route("/", get(routes::search::search));
 
@@ -241,6 +247,16 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/{agent_id}/crash",
             get(routes::agent_crash::list_for_agent),
+        )
+        // rc.58 — centralized log batch ingest + listing. Agent
+        // uploader POSTs here with its agent JWT; admin UI GETs to
+        // view recent batches. Route is under the `/agent/{agent_id}`
+        // tenant-scoped tree so the standard tenant-membership check
+        // applies for reads, and the agent JWT's `tenant_id` +
+        // `sub` claims are matched against the route params on writes.
+        .route(
+            "/{agent_id}/logs",
+            post(routes::agent_log::ingest_agent).get(routes::agent_log::list_for_agent),
         );
 
     // Remote-control session routes (tenant-scoped)
@@ -345,6 +361,7 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/tunnel-client", public_tunnel_routes)
         .nest("/tunnel", public_tunnel_release_routes)
         .nest("/turn", turn_routes)
+        .nest("/log", log_routes)
         .nest("/tenant", tenant_routes)
         .nest("/tenant/{tenant_id}/member", member_routes)
         .nest("/tenant/{tenant_id}/role", role_routes)

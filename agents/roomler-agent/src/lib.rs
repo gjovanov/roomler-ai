@@ -25,6 +25,7 @@ pub mod lock_overlay;
 pub mod lock_state;
 pub mod logging;
 pub mod logs_fetch;
+pub mod logs_upload;
 pub mod machine;
 pub mod notify;
 pub mod peer;

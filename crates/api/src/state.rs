@@ -72,6 +72,7 @@ pub struct AppState {
     pub remote_sessions: Arc<RemoteSessionDao>,
     pub remote_audit: Arc<RemoteAuditDao>,
     pub agent_crashes: Arc<roomler_ai_services::dao::agent_crash::AgentCrashDao>,
+    pub agent_logs: Arc<roomler_ai_services::dao::agent_log::AgentLogDao>,
     pub rc_hub: Arc<Hub>,
 
     // roomler-tunnel subsystem
@@ -175,6 +176,7 @@ impl AppState {
         let agent_crashes = Arc::new(roomler_ai_services::dao::agent_crash::AgentCrashDao::new(
             &db,
         ));
+        let agent_logs = Arc::new(roomler_ai_services::dao::agent_log::AgentLogDao::new(&db));
 
         let turn_cfg = build_turn_config(&settings.turn);
         let (audit_sink, _audit_handle) = AuditSink::spawn(db.clone());
@@ -215,6 +217,7 @@ impl AppState {
             remote_sessions,
             remote_audit,
             agent_crashes,
+            agent_logs,
             rc_hub,
             tunnel_clients,
             tunnel_policies,
