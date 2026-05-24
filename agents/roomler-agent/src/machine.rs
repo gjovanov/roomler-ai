@@ -29,7 +29,10 @@ pub fn derive_machine_id(config_path: &Path) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn hostname() -> std::io::Result<String> {
+/// OS hostname (POSIX `gethostname` on Unix, `COMPUTERNAME` env var
+/// on Windows). Exposed for `logs_upload.rs` so the agent's uploader
+/// can hash the hostname into `host_id_hash` per the rc.58 plan.
+pub fn hostname() -> std::io::Result<String> {
     // `hostname` crate is another dep; keep things simple with `uname -n`
     // (POSIX) / Windows GetComputerName (via HOSTNAME env var).
     #[cfg(unix)]

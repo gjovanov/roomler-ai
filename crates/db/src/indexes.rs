@@ -287,6 +287,26 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> 
     )
     .await?;
 
+    // Centralized log batches (rc.58). 7-day TTL on `created_at` so
+    // operators have a one-week diagnostic window. The compound
+    // tenant+agent+created_at index drives the admin UI query "last N
+    // batches for this agent". The text index on `lines.msg` powers
+    // full-text search in the admin UI; without it a tenant with 10k
+    // batches/day would hit a collection scan on every search.
+    create_indexes(
+        db,
+        "agent_logs",
+        vec![
+            index(bson::doc! { "tenant_id": 1, "agent_id": 1, "created_at": -1 }),
+            index(bson::doc! { "tenant_id": 1, "user_id": 1, "created_at": -1 }),
+            index(bson::doc! { "tenant_id": 1, "source": 1, "created_at": -1 }),
+            index(bson::doc! { "tenant_id": 1, "session_id": 1 }),
+            index_text(bson::doc! { "lines.msg": "text" }),
+            index_ttl(bson::doc! { "created_at": 1 }, 7 * 24 * 60 * 60),
+        ],
+    )
+    .await?;
+
     info!("All indexes ensured");
     Ok(())
 }
