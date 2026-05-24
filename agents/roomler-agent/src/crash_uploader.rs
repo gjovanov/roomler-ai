@@ -44,6 +44,17 @@ use crate::crash_recorder;
 /// + the K8s ingress before reaching the API pod.
 const POST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// rc.58: cadence for the periodic mid-session drain in `main.rs`.
+/// Before rc.58 the drain ran ONLY at startup; long-running agents
+/// that crashed once early (during, say, a flaky-network cold start
+/// like the field-test host 2026-05-24 watchdog-loop) never got their
+/// sidecars off disk because the next process restart was hours or
+/// days away. 5 min keeps the loop cheap (one HTTP HEAD-equivalent
+/// per drain when no sidecars are pending) while ensuring the admin
+/// UI sees evidence within a single coffee break of the network
+/// coming back. Pub so `main.rs` can import without re-defining.
+pub const CRASH_DRAIN_INTERVAL_SECS: u64 = 5 * 60;
+
 /// Minimum delay between consecutive sidecar POSTs. The backend's
 /// `tower_governor` rate-limit is 60 req/min per IP = 1 req/sec
 /// steady-state with a 60-burst budget. Field repro 2026-05-17
