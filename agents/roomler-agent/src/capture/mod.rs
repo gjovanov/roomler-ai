@@ -16,6 +16,15 @@ pub mod scrap_backend;
 #[cfg(all(target_os = "windows", feature = "wgc-capture"))]
 pub mod wgc_backend;
 
+/// Phase 1 — Linux CI / agent-e2e Pod path. Substitutes a deterministic
+/// 320×240 BGRA frame source for scrap-capture so a headless Pod
+/// without an X server can still drive the encode + WebRTC pipeline.
+/// `open_default` short-circuits to this backend when the runtime
+/// env var `ROOMLER_AGENT_SYNTHETIC_FRAMES=1` is set AND the binary
+/// was compiled with `--features synthetic-frame-source`.
+#[cfg(feature = "synthetic-frame-source")]
+pub mod synthetic_backend;
+
 pub mod cursor;
 
 /// A captured frame, in an encoder-agnostic representation.
@@ -129,6 +138,29 @@ impl ScreenCapture for NoopCapture {
 /// hardware encoder is handling the frame; pass `Auto` (the default)
 /// when the encoder is software openh264.
 pub fn open_default(_target_fps: u32, _downscale: DownscalePolicy) -> Box<dyn ScreenCapture> {
+    // Phase 1 — synthetic-frame-source short-circuit. When the agent
+    // is running inside the agent-e2e Pod (or any headless CI
+    // context that sets the env var), bypass the scrap / WGC /
+    // system-context cascade entirely. The synthetic backend has no
+    // system deps and produces deterministic 320×240 BGRA frames
+    // so encode + WebRTC end-to-end can be exercised without an X
+    // server or a real screen. Production agents never compile the
+    // feature in; even with the feature, the env var must be set —
+    // belt-and-suspenders so a stray production env var can't silently
+    // replace real capture with a synthetic stream.
+    #[cfg(feature = "synthetic-frame-source")]
+    {
+        if synthetic_env_enabled() {
+            let cap = synthetic_backend::primary(_target_fps, _downscale);
+            tracing::info!(
+                width = synthetic_backend::FRAME_W,
+                height = synthetic_backend::FRAME_H,
+                "capture: backend=synthetic (ROOMLER_AGENT_SYNTHETIC_FRAMES=1, CI / agent-e2e Pod)"
+            );
+            return Box::new(cap);
+        }
+    }
+
     // M3 A1: when the worker is running as SYSTEM (LocalSystem,
     // S-1-5-18) — i.e. spawned by the SCM service via
     // `winlogon_token::spawn_system_in_session` — WGC's WinRT
@@ -236,4 +268,74 @@ fn capture_env_prefers_scrap() -> bool {
     std::env::var("ROOMLER_AGENT_CAPTURE")
         .map(|v| v.trim().eq_ignore_ascii_case("scrap"))
         .unwrap_or(false)
+}
+
+/// Phase 1 — runtime gate for the synthetic-frame-source backend.
+/// True iff `ROOMLER_AGENT_SYNTHETIC_FRAMES` parses as truthy
+/// (`1` / `true` / `yes` / `on`, case-insensitive). Anything else
+/// (unset, `0`, garbage) falls back to the normal cascade.
+#[cfg(feature = "synthetic-frame-source")]
+fn synthetic_env_enabled() -> bool {
+    match std::env::var("ROOMLER_AGENT_SYNTHETIC_FRAMES") {
+        Ok(v) => {
+            let t = v.trim();
+            t.eq_ignore_ascii_case("1")
+                || t.eq_ignore_ascii_case("true")
+                || t.eq_ignore_ascii_case("yes")
+                || t.eq_ignore_ascii_case("on")
+        }
+        Err(_) => false,
+    }
+}
+
+#[cfg(all(test, feature = "synthetic-frame-source"))]
+mod synthetic_env_tests {
+    use super::synthetic_env_enabled;
+
+    /// SAFETY: env tests must run serially because `std::env::set_var`
+    /// is process-wide. We use a Mutex to enforce that — Rust's
+    /// `#[test]` doesn't guarantee serial execution per-module by
+    /// default.
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_env<F: FnOnce()>(key: &str, val: Option<&str>, f: F) {
+        let _guard = LOCK.lock().unwrap();
+        let prior = std::env::var(key).ok();
+        match val {
+            // SAFETY: serialised by LOCK; restored before the guard
+            // is dropped. Std flags set_var as unsafe in 2024 ed.
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+        f();
+        match prior {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+
+    #[test]
+    fn unset_returns_false() {
+        with_env("ROOMLER_AGENT_SYNTHETIC_FRAMES", None, || {
+            assert!(!synthetic_env_enabled());
+        });
+    }
+
+    #[test]
+    fn truthy_values_accepted() {
+        for v in &["1", "true", "TRUE", "yes", "On"] {
+            with_env("ROOMLER_AGENT_SYNTHETIC_FRAMES", Some(v), || {
+                assert!(synthetic_env_enabled(), "value {v:?} should be truthy");
+            });
+        }
+    }
+
+    #[test]
+    fn explicit_zero_or_garbage_is_false() {
+        for v in &["0", "false", "no", "off", "anything-else"] {
+            with_env("ROOMLER_AGENT_SYNTHETIC_FRAMES", Some(v), || {
+                assert!(!synthetic_env_enabled(), "value {v:?} should be falsy");
+            });
+        }
+    }
 }
