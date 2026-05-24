@@ -223,24 +223,32 @@ pub(crate) fn map_normalised_to_virtual(
 }
 
 /// Resolve the monitor we map normalised `(x, y)` against. Returns
-/// `(origin_x, origin_y, width_px, height_px)`. The new
-/// virtual-screen path looks up the OS-designated primary monitor and
-/// returns its virtual-desktop origin + physical dimensions; the
-/// legacy path returns `enigo.main_display()` (i.e. origin (0,0) +
-/// primary dims) so the math is identical to pre-rc.54.
+/// `(origin_x, origin_y, width_px, height_px)`.
 ///
-/// `mon` is accepted for the wire-protocol contract but ignored at
-/// rc.54 — multi-monitor `to_pixels(mon)` ships in rc.55.
-fn resolve_target_monitor(enigo: &Enigo, _mon: u8) -> (i32, i32, i32, i32) {
+/// Path resolution (when `ROOMLER_AGENT_VIRTUAL_SCREEN=1`):
+///   1. `win32_monitors::target_monitor(mon)` — looks up the cached
+///      enumerate() result by browser-supplied index, falls back to
+///      the primary monitor when out of range. Today's browser sends
+///      `mon=0` (only primary monitor streams), so this matches the
+///      `MonitorInfo` for the primary on every event. rc.55 wires
+///      the per-index lookup so the agent is ready when multi-stream
+///      lands.
+///
+/// Legacy path (default, gate off): returns `enigo.main_display()`
+/// (i.e. origin (0,0) + primary dims). Math is identical to pre-rc.54.
+fn resolve_target_monitor(enigo: &Enigo, mon: u8) -> (i32, i32, i32, i32) {
     if virtual_screen_enabled() {
         #[cfg(target_os = "windows")]
         {
-            if let Some(p) = crate::win32_monitors::primary() {
-                return (p.origin_x, p.origin_y, p.width_px, p.height_px);
+            if let Some(m) = crate::win32_monitors::target_monitor(mon) {
+                return (m.origin_x, m.origin_y, m.width_px, m.height_px);
             }
         }
     }
     // Legacy path / non-Windows / Win32 enumeration miss → enigo's view.
+    // `mon` is silently dropped here — single-monitor + non-Windows
+    // hosts only have one display to map against.
+    let _ = mon;
     let (w, h) = enigo.main_display().unwrap_or((1920, 1080));
     (0, 0, w, h)
 }

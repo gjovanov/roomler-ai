@@ -106,6 +106,42 @@ pub fn primary() -> Option<MonitorInfo> {
     monitor_info_from_handle(hmon, 0)
 }
 
+/// Resolve the `MonitorInfo` matching the browser's `mon` index in the
+/// `InputMsg::MouseMove { mon, .. }` field. Lookup order:
+///
+///   1. Cached `enumerate()` result `cached_monitors()[mon as usize]`
+///      when the index is in range — matches the order
+///      `rc:agent.hello`'s `displays` field reports, so the browser
+///      and agent agree on monitor identity.
+///   2. Fall back to [`primary`] when `mon` is out of range (or `0`
+///      and the cache is empty) so a misconfigured browser still gets
+///      sensible input dispatch.
+///
+/// rc.55 — wired into `enigo_backend::resolve_target_monitor` when the
+/// `ROOMLER_AGENT_VIRTUAL_SCREEN` gate is on. Today's browser only
+/// streams the primary monitor and sends `mon=0`, so this collapses to
+/// the primary lookup; the per-index path is future-proofing for when
+/// the agent's video pipeline gains multi-monitor streams.
+pub fn target_monitor(mon: u8) -> Option<MonitorInfo> {
+    let monitors = cached_monitors();
+    if let Some(m) = monitors.get(mon as usize) {
+        return Some(m.clone());
+    }
+    primary()
+}
+
+/// Cached enumeration result, populated once on first call via
+/// [`std::sync::LazyLock`]. Layout changes mid-session (hot-plug,
+/// dock/undock) WILL be stale until the agent process restarts;
+/// acceptable trade-off vs. paying ~1 ms FFI cost per mouse event.
+/// Operators can reconnect (kicks the agent supervisor → fresh worker
+/// → fresh cache) to pick up a new layout.
+pub fn cached_monitors() -> &'static Vec<MonitorInfo> {
+    use std::sync::LazyLock;
+    static MONITORS: LazyLock<Vec<MonitorInfo>> = LazyLock::new(enumerate);
+    &MONITORS
+}
+
 /// Walk every attached monitor via `EnumDisplayMonitors` and return one
 /// `MonitorInfo` per monitor. Indexed in enumeration order (which
 /// matches the order the agent's `displays.rs` already reports via
@@ -339,5 +375,31 @@ mod tests {
     #[test]
     fn log_diagnostic_does_not_panic() {
         log_monitor_diagnostic();
+    }
+
+    /// rc.55 — `cached_monitors` returns the same Vec on repeat calls
+    /// (memoised via LazyLock). Test only checks the call doesn't
+    /// panic + returns the same length each time; the actual content
+    /// is host-dependent (CI runners may report 0).
+    #[test]
+    fn cached_monitors_is_stable() {
+        let a = cached_monitors().len();
+        let b = cached_monitors().len();
+        assert_eq!(a, b, "cached_monitors should be memoised");
+    }
+
+    /// rc.55 — `target_monitor(0)` always resolves to *some* monitor on
+    /// a real desktop (either cached_monitors[0] or the primary
+    /// fallback). On headless CI it may return None — both are OK.
+    #[test]
+    fn target_monitor_in_range_or_falls_back_to_primary() {
+        let cached_count = cached_monitors().len();
+        let t0 = target_monitor(0);
+        if cached_count >= 1 {
+            assert!(t0.is_some(), "mon=0 must resolve on a host with ≥1 monitor");
+        }
+        // Out-of-range index: must NOT panic; falls back to primary or
+        // returns None on headless.
+        let _ = target_monitor(99);
     }
 }
