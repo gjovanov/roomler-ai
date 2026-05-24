@@ -1196,8 +1196,20 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     // Encoder + capture are registered but gated off until a session
     // attaches — those pumps can legitimately go idle for hours when
     // no controller is connected.
+    //
+    // rc.58: `signaling` is registered with `active=false` and only
+    // gated `true` after the first successful `connect_async` (inside
+    // `signaling::connect_once`). Before rc.58 the pump was active
+    // from process start, so the 90 s stall timer counted while the
+    // agent was still in initial backoff-reconnect mode against an
+    // unreachable server — every cold start against a flaky network
+    // got force-exited at 90 s, producing a crash loop. The pump
+    // re-toggles to false when each connection ends (the RAII guard
+    // in `connect_once`); the next successful connect re-enables it
+    // and `gate(true)` resets `last_tick` so each connection gets a
+    // clean 90 s budget against the 25 s keepalive cadence.
     let wd = watchdog::Watchdog::new();
-    wd.register("signaling", std::time::Duration::from_secs(90), true);
+    wd.register("signaling", std::time::Duration::from_secs(90), false);
     wd.register("encoder", std::time::Duration::from_secs(30), false);
     wd.register("capture", std::time::Duration::from_secs(30), false);
     let _ = watchdog::install(wd.clone());
@@ -1228,10 +1240,38 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     // v1; if the network is offline the HTTP POST fails fast +
     // sidecars stay on disk for the next startup). Snapshots
     // `cfg` BEFORE `signaling::run` consumes it.
+    //
+    // rc.58: drain runs once at startup AND every CRASH_DRAIN_INTERVAL
+    // (5 min) during the run. The startup-only drain leaves sidecars
+    // marooned on long-running agents that crashed before connectivity
+    // was up — a crash-loop recovered by transient network repair
+    // would never deliver its evidence to the admin UI until the next
+    // process restart. The periodic loop catches up the moment the
+    // network comes back; the HARD_CAP=100 in crash_recorder bounds
+    // worst-case disk in the still-offline case.
     let crash_drain_task = tokio::spawn({
         let cfg = cfg.clone();
+        let mut shutdown = shutdown_rx.clone();
         async move {
+            // Initial drain (formerly the only call site).
             crash_uploader::drain_and_upload(&cfg).await;
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                crash_uploader::CRASH_DRAIN_INTERVAL_SECS,
+            ));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            interval.tick().await; // swallow immediate first tick
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        crash_uploader::drain_and_upload(&cfg).await;
+                    }
+                    _ = shutdown.changed() => {
+                        if *shutdown.borrow() {
+                            return;
+                        }
+                    }
+                }
+            }
         }
     });
 
