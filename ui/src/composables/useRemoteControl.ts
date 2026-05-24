@@ -2714,6 +2714,23 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
      * pixel on the remote, and clicks in the letterbox bars get clamped to
      * the edge instead of being ignored.
      */
+    // rc.57 — mouse-offset diagnostic counter. Logs the first 50
+    // pointer-derived normalisation calls of THIS session at INFO
+    // level so we can verify that the browser-side intrinsic dims
+    // (videoElement.videoWidth/Height after the agent's auto-downscale
+    // rebuild) match what the agent expects. The Crystal-Clear-OFF
+    // H.264 path on PC50045 still mis-positions and we suspect a
+    // race between the SDP-advertised native dims (1920×1200) and
+    // the actual first frame (1280×800 post-downscale) — this log
+    // captures intrinsicW/H + renderRect + computed norm so a single
+    // session reproduces the bug AND surfaces the root cause.
+    //
+    // Counter is closure-scoped to `attachInput`, so it naturally
+    // resets per-session (each remote-control mount is a new
+    // attachInput call). NO process-global state.
+    const MOUSE_OFFSET_DIAG_LIMIT = 50
+    let mouseOffsetDiagCount = 0
+
     function normalisedXY(
       ev: PointerEvent | MouseEvent | WheelEvent,
     ): { x: number; y: number; insideVideo: boolean } {
@@ -2752,19 +2769,62 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       const renderEl: HTMLElement | null = useCanvasDims
         ? (surface.querySelector('canvas.remote-video') as HTMLElement | null)
         : video
+
+      let result: { x: number; y: number; insideVideo: boolean }
+      let path: 'direct' | 'letterbox'
+      let renderRect: DOMRect | null = null
+      let frameRect: DOMRect | null = null
+
       if (scaleMode.value !== 'adaptive' && renderEl) {
-        const r = renderEl.getBoundingClientRect()
-        return directVideoNormalise(
+        renderRect = renderEl.getBoundingClientRect()
+        result = directVideoNormalise(
           ev.clientX, ev.clientY,
-          { left: r.left, top: r.top, width: r.width, height: r.height },
+          { left: renderRect.left, top: renderRect.top, width: renderRect.width, height: renderRect.height },
         )
+        path = 'direct'
+      } else {
+        frameRect = surface.getBoundingClientRect()
+        result = letterboxedNormalise(
+          ev.clientX, ev.clientY,
+          { left: frameRect.left, top: frameRect.top, width: frameRect.width, height: frameRect.height },
+          intrinsicW, intrinsicH,
+        )
+        path = 'letterbox'
       }
-      const frameRect = surface.getBoundingClientRect()
-      return letterboxedNormalise(
-        ev.clientX, ev.clientY,
-        { left: frameRect.left, top: frameRect.top, width: frameRect.width, height: frameRect.height },
-        intrinsicW, intrinsicH,
-      )
+
+      // rc.57 — diagnostic dump (first 50 events of this session). Search
+      // browser console for `[rc] mouse-offset diag` to triage misposition
+      // reports. Compare `intrinsicW/H` against the agent log's reported
+      // capture width/height; mismatch identifies the auto-downscale race.
+      if (mouseOffsetDiagCount < MOUSE_OFFSET_DIAG_LIMIT) {
+        const seq = mouseOffsetDiagCount++
+        console.info('[rc] mouse-offset diag', {
+          seq,
+          path,
+          scaleMode: scaleMode.value,
+          useCanvasDims,
+          videoWidth: video?.videoWidth ?? 0,
+          videoHeight: video?.videoHeight ?? 0,
+          mediaIntrinsicW: mediaIntrinsicW.value,
+          mediaIntrinsicH: mediaIntrinsicH.value,
+          intrinsicW,
+          intrinsicH,
+          vp9_444Active: vp9_444Active.value,
+          webcodecsActive: webcodecsActive.value,
+          renderElTag: renderEl?.tagName ?? null,
+          renderRectW: renderRect?.width ?? null,
+          renderRectH: renderRect?.height ?? null,
+          frameRectW: frameRect?.width ?? null,
+          frameRectH: frameRect?.height ?? null,
+          clientX: Math.round(ev.clientX),
+          clientY: Math.round(ev.clientY),
+          computedX: Number(result.x.toFixed(4)),
+          computedY: Number(result.y.toFixed(4)),
+          insideVideo: result.insideVideo,
+        })
+      }
+
+      return result
     }
 
     function onPointerMove(ev: PointerEvent) {

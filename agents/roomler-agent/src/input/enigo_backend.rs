@@ -275,13 +275,12 @@ fn resolve_target_monitor(enigo: &Enigo, mon: u8) -> (i32, i32, i32, i32) {
 /// Default off; flip the default in a later rc once the field-test
 /// host smoke confirms the path on rc.54.
 fn to_pixels(enigo: &Enigo, x: f32, y: f32, mon: u8) -> (i32, i32) {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static DIAG_COUNT: AtomicU32 = AtomicU32::new(0);
+    use std::sync::atomic::Ordering;
     const DIAG_INFO_LIMIT: u32 = 50;
 
     let (origin_x, origin_y, w, h) = resolve_target_monitor(enigo, mon);
     let (px, py) = map_normalised_to_virtual(x, y, origin_x, origin_y, w, h);
-    let count = DIAG_COUNT.fetch_add(1, Ordering::Relaxed);
+    let count = super::INPUT_DIAG_COUNT.fetch_add(1, Ordering::Relaxed);
     let vscreen = virtual_screen_enabled();
     if count < DIAG_INFO_LIMIT {
         tracing::info!(

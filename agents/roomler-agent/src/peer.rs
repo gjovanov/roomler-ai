@@ -2127,6 +2127,14 @@ fn attach_input_handler(
     dc: Arc<RTCDataChannel>,
     lock_state_rx: tokio::sync::watch::Receiver<lock_state::LockState>,
 ) {
+    // rc.57 — reset the per-process `to_pixels` diagnostic counter so
+    // the FIRST 50 input events of THIS session land at INFO level
+    // again. Without the reset, the static counter is exhausted after
+    // session 1 and subsequent sessions only log at DEBUG — hiding any
+    // session-specific norm/px mismatch (e.g. the Crystal-Clear-OFF
+    // auto-downscale path, where the misposition reproduces but the
+    // earlier rc.55 field log had no INFO dispatch lines to inspect).
+    input::reset_input_diag_counter();
     // Injector is wrapped in `parking_lot::Mutex`-equivalent-style — we
     // don't have parking_lot imported here, so fall back to tokio's
     // Mutex. The inject() call is fast (just a channel send), so lock
