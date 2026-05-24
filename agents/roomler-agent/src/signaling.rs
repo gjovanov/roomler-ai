@@ -32,6 +32,67 @@ const PEER_OUTBOUND_CAP: usize = 64;
 /// Matches the dialer's default — see `tunnel::dialer::DEFAULT_TIMEOUT`.
 const TUNNEL_DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// rc.58: hard upper bound on a single `connect_async` attempt. Without
+/// a wrapper, a hung TLS handshake (e.g. server-side renegotiation
+/// race against a rustls client that refuses re-negotiation) sits
+/// inside `connect_async` indefinitely and the outer backoff ladder
+/// never fires. 30 s is much longer than a healthy WSS handshake
+/// (<1 s typical) and short enough that the operator notices in field
+/// logs. Timeouts are routed through `ConnectError::Transient` so the
+/// backoff loop handles them like any other connection failure.
+const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// rc.58: format an error chain by walking `source()` so the top-level
+/// `Display` (which `tokio_tungstenite::Error` keeps deliberately
+/// terse) doesn't hide the root cause — TLS handshake error,
+/// ECONNREFUSED, EAI_NONAME, etc. Field repro 2026-05-24: a flaky
+/// network turned every cold start into `error=ws connect` with no
+/// further detail, making it impossible to tell a DNS failure from a
+/// TLS failure without packet capture. The `preflight` module ships
+/// the same helper; duplicated here to avoid forcing every consumer
+/// crate to depend on `preflight`.
+fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = err.to_string();
+    let mut src = err.source();
+    while let Some(cause) = src {
+        out.push_str(": ");
+        out.push_str(&cause.to_string());
+        src = cause.source();
+    }
+    out
+}
+
+/// rc.58: RAII guard that flips the watchdog's `signaling` pump on
+/// for the lifetime of a single live WebSocket connection. On drop
+/// (every return path from `connect_once`, including `?` early-exit)
+/// the pump goes back to gated-off so the next reconnect-backoff loop
+/// doesn't count its silence against the 90 s stall threshold.
+///
+/// Before rc.58 the pump was registered with `active=true` from
+/// process start, so the watchdog's 90 s timer ran during initial
+/// exponential backoff against an unreachable server — every cold
+/// start with a flaky network got force-exited at 90 s and the
+/// supervisor crash-looped forever. See `main.rs` register call for
+/// the symmetric flip there.
+struct SignalingPumpGuard;
+
+impl SignalingPumpGuard {
+    /// Activate the watchdog's `signaling` pump and reset its
+    /// `last_tick` (the `gate(false → true)` transition resets the
+    /// timer; see `watchdog.rs::Watchdog::gate`). Use right after
+    /// `connect_async` returns Ok.
+    fn activate() -> Self {
+        watchdog::gate("signaling", true);
+        Self
+    }
+}
+
+impl Drop for SignalingPumpGuard {
+    fn drop(&mut self) {
+        watchdog::gate("signaling", false);
+    }
+}
+
 /// Drive the signaling loop forever. Returns only on fatal error (e.g.
 /// auth rejection) or shutdown signal.
 pub async fn run(
@@ -241,7 +302,15 @@ pub async fn run(
                 backoff = Duration::from_secs(1);
             }
             Err(ConnectError::Transient(e)) => {
-                warn!(error = %e, "signaling connect failed; backing off");
+                // rc.58: log the full `source()` chain alongside the
+                // top-level Display — `tokio_tungstenite::Error`'s top
+                // message is just "ws connect" / "ws read" without the
+                // underlying TLS / DNS / ECONNREFUSED detail. Field
+                // repro 2026-05-24: a flaky WSS handshake produced
+                // identical-looking `error=ws connect` lines for
+                // every failure mode, blocking root-cause analysis.
+                let cause = error_chain(e.as_ref());
+                warn!(error = %e, %cause, "signaling connect failed; backing off");
                 tokio::select! {
                     _ = tokio::time::sleep(backoff) => {},
                     _ = shutdown.changed() => {
@@ -312,15 +381,41 @@ async fn connect_once(
     );
     info!(%url, "connecting to signaling server");
 
-    let (mut ws, response) = connect_async(&url).await.map_err(|e| {
-        if let tokio_tungstenite::tungstenite::Error::Http(ref resp) = e
-            && resp.status().as_u16() == 401
-        {
-            return ConnectError::AuthRejected;
-        }
-        ConnectError::Transient(anyhow::Error::new(e).context("ws connect"))
-    })?;
+    // rc.58: wrap `connect_async` in a hard timeout. A hung TLS
+    // handshake (rustls refusing renegotiation against an LB that
+    // requests it mid-stream is one observed mode) would otherwise
+    // sit here indefinitely, never giving the outer backoff loop a
+    // chance to fire. The timeout becomes another `Transient` so the
+    // backoff handles it like any other connection failure.
+    let (mut ws, response) =
+        match tokio::time::timeout(WS_CONNECT_TIMEOUT, connect_async(&url)).await {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(e)) => {
+                if let tokio_tungstenite::tungstenite::Error::Http(ref resp) = e
+                    && resp.status().as_u16() == 401
+                {
+                    return Err(ConnectError::AuthRejected);
+                }
+                return Err(ConnectError::Transient(
+                    anyhow::Error::new(e).context("ws connect"),
+                ));
+            }
+            Err(_elapsed) => {
+                return Err(ConnectError::Transient(anyhow::anyhow!(
+                    "ws connect timed out after {}s",
+                    WS_CONNECT_TIMEOUT.as_secs()
+                )));
+            }
+        };
     debug!(status = ?response.status(), "ws upgrade complete");
+
+    // rc.58: now that the WS handshake is done, flip the watchdog's
+    // `signaling` pump on for the lifetime of this connection. The
+    // RAII guard ensures EVERY return path (Ok, ?-propagated Err,
+    // explicit `return Err(...)`) also flips it back off, so the next
+    // backoff-reconnect cycle isn't counted against the 90 s stall
+    // threshold. See the type-level comment on `SignalingPumpGuard`.
+    let _pump_guard = SignalingPumpGuard::activate();
 
     // Say hello.
     let hello = ClientMsg::AgentHello {
@@ -331,6 +426,13 @@ async fn connect_once(
         caps: stub_caps(),
     };
     send_msg(&mut ws, &hello).await.context("sending hello")?;
+    // rc.58: explicit tick on hello — the 25 s keepalive timer hasn't
+    // fired yet, and a slow first server response (no inbound frame
+    // for 30+ s) would otherwise leave the pump's `last_tick` at the
+    // gate-activation instant. Belt-and-suspenders: the gate already
+    // reset the timer, so this only matters when the server stalls
+    // immediately after upgrade.
+    watchdog::tick("signaling");
     info!("rc:agent.hello sent");
 
     // Outbound channel shared by all per-session peers. Peers push their
@@ -968,5 +1070,61 @@ mod tests {
             );
             last = d;
         }
+    }
+
+    // ─── rc.58 regression tests ──────────────────────────────────────────────
+
+    #[test]
+    fn ws_connect_timeout_is_long_enough_for_healthy_handshake() {
+        // A healthy WSS handshake is <1 s typical; the bound exists
+        // to catch hangs, not to clip latency. 30 s gives 30× headroom
+        // and matches the field-tested value from the rc.58 fix.
+        // A regression dropping this below ~5 s would start clipping
+        // legitimate slow handshakes (e.g. cold-cache TLS to a far-
+        // geo LB) and produce a fresh round of false-positive ws-
+        // connect-timeout warnings.
+        assert!(
+            WS_CONNECT_TIMEOUT >= Duration::from_secs(10),
+            "WS_CONNECT_TIMEOUT must give legitimate handshakes room; \
+             current={WS_CONNECT_TIMEOUT:?}"
+        );
+    }
+
+    #[test]
+    fn error_chain_walks_anyhow_context_layers() {
+        // The whole point of this helper is to surface root causes
+        // that `Display` hides. Pin the format so a future refactor
+        // (e.g. swap colon-join for newline-join) doesn't silently
+        // change field log shape that operators grep.
+        let inner = std::io::Error::other("ECONNREFUSED");
+        let middle = anyhow::Error::new(inner).context("tls handshake");
+        let outer = middle.context("ws connect");
+        let chain = error_chain(outer.as_ref());
+        // Each layer present and ordered outer→inner.
+        assert!(
+            chain.starts_with("ws connect"),
+            "outer must lead the chain; got: {chain}"
+        );
+        assert!(
+            chain.contains("tls handshake"),
+            "middle layer missing; got: {chain}"
+        );
+        assert!(
+            chain.contains("ECONNREFUSED"),
+            "root cause missing; got: {chain}"
+        );
+        assert!(
+            chain.matches(": ").count() >= 2,
+            "expected at least two layer separators; got: {chain}"
+        );
+    }
+
+    #[test]
+    fn error_chain_handles_single_layer_error() {
+        // A bare error with no `.source()` chain must round-trip its
+        // own message — the helper shouldn't panic or emit empty.
+        let bare = std::io::Error::other("simple");
+        let chain = error_chain(&bare);
+        assert_eq!(chain, "simple");
     }
 }

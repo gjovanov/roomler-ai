@@ -434,6 +434,72 @@ mod tests {
     }
 
     #[test]
+    fn rc58_cold_start_grace_signaling_pattern_does_not_false_stall() {
+        // Replicates the rc.58 fix exactly:
+        //   * `signaling` registered with `active=false` at process start
+        //     (was `true` before rc.58, which produced the field-test
+        //     host 2026-05-24 crash loop: cold start with an unreachable
+        //     server force-exited at 90 s every cycle because the
+        //     pump was counting silence against the threshold while
+        //     the agent was legitimately retry-backoff'ing).
+        //   * A simulated reconnect-backoff stretch (we sleep past the
+        //     threshold to ensure we'd fire if the pump was active).
+        //   * `gate(true)` after the (eventual) successful connect.
+        //     This MUST reset `last_tick` so the live connection gets
+        //     a clean budget — the `gate(false→true)` transition is
+        //     what handles the reset (see `Watchdog::gate`).
+        //   * Subsequent `gate(false)` on disconnect.
+        //   * A second `gate(true)` (next reconnect) must again reset
+        //     `last_tick` — this was the second half of the rc.58 bug:
+        //     `last_tick` was global and stale across reconnects, so
+        //     a successful hello at +1 s after reconnect still got
+        //     killed because the pre-disconnect `last_tick` had
+        //     already aged past 90 s.
+        let wd = Watchdog::new();
+        wd.register("signaling", Duration::from_millis(50), false);
+
+        // Cold-start backoff: long gap with the pump inactive. MUST
+        // NOT stall.
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(
+            wd.scan_at(Instant::now()).is_empty(),
+            "inactive pump must not stall during cold-start backoff"
+        );
+
+        // First successful connect → gate on.
+        wd.gate("signaling", true);
+        assert!(
+            wd.scan_at(Instant::now()).is_empty(),
+            "gate(false→true) must reset last_tick"
+        );
+
+        // Live connection ends → gate off.
+        wd.gate("signaling", false);
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(
+            wd.scan_at(Instant::now()).is_empty(),
+            "gate(true→false) must keep the pump quiet during reconnect-backoff"
+        );
+
+        // Second connect (the post-disconnect reconnect that rc.58
+        // fixes): gate on again MUST reset the timer.
+        wd.gate("signaling", true);
+        assert!(
+            wd.scan_at(Instant::now()).is_empty(),
+            "each gate(false→true) cycle must reset last_tick — \
+             stale timestamps across reconnects was the second half of the rc.58 bug"
+        );
+
+        // Now that we're active and have NOT ticked for > threshold,
+        // the watchdog MUST fire (proves the gating didn't accidentally
+        // disable stall detection altogether).
+        std::thread::sleep(Duration::from_millis(80));
+        let stalled = wd.scan_at(Instant::now());
+        assert_eq!(stalled.len(), 1, "active pump with no ticks must stall");
+        assert_eq!(stalled[0].0, "signaling");
+    }
+
+    #[test]
     fn exit_code_sentinels_are_distinct_and_documented() {
         // rc.53: the supervisor branches on these two specific codes
         // (`STALL_EXIT_CODE` excluded from crash recording, and
