@@ -816,11 +816,113 @@ pub fn spawn_installer_inner(installer_path: &std::path::Path) -> Result<u32> {
     // field-test host; see BLOCKER B6 in the rc.27/rc.28 master plan.
     #[cfg(target_os = "windows")]
     {
-        spawn_installer_for_flavour(installer_path, current_install_flavour())
+        let flavour = current_install_flavour();
+        // rc.56 SystemContext-preserve hotfix.
+        //
+        // Without this branch, the WiX `DisableSystemContext` deferred
+        // CA fires on every auto-update msiexec because the WiX
+        // `ENABLE_SYSTEM_CONTEXT` property defaults to `'0'` and the
+        // CA is conditioned on `ENABLE_SYSTEM_CONTEXT="0" AND NOT
+        // (REMOVE="ALL")` (see `wix-perMachine/main.wxs:344-346`).
+        // The CA runs `roomler-agent disable-system-context` which
+        // strips `ROOMLER_AGENT_ENABLE_SYSTEM_SWAP` from the SCM
+        // Environment block and restarts the service. After auto-update
+        // the supervisor sees env-var-off, doesn't perform the M3 A1
+        // winlogon-token swap, and the resulting LocalSystem worker
+        // tries to read its config from `%APPDATA%` (LocalSystem
+        // profile, empty) instead of the rc.52 machine-global
+        // `%PROGRAMDATA%\roomler\roomler-agent\config.toml` path. Net
+        // effect: every SystemContext-enabled host that auto-updates
+        // loses pre-logon capability and crash-loops until an operator
+        // re-runs the wizard. Field-reproduced 2026-05-24 on PC50045
+        // (rc.55 → reinstall).
+        //
+        // Fix: detect the env var BEFORE invoking msiexec and pass
+        // `ENABLE_SYSTEM_CONTEXT=1` so the WiX `EnableSystemContext`
+        // CA fires instead. The detection reads the SCM Environment
+        // REG_MULTI_SZ via the rc.27 helper — robust whether the
+        // SystemContext was enabled via the wizard, the
+        // `enable-system-context` CLI subcommand, or a prior MSI run.
+        let properties = preserve_system_context_property(flavour);
+        let props_ref: Vec<(&str, &str)> = properties
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        spawn_installer_for_flavour_with_properties(installer_path, flavour, &props_ref)
     }
     #[cfg(not(target_os = "windows"))]
     {
         spawn_installer_for_flavour_inner(installer_path)
+    }
+}
+
+/// rc.56: read the current SCM Environment block. If the perMachine
+/// service has `ROOMLER_AGENT_ENABLE_SYSTEM_SWAP=1` set, return
+/// `vec![("ENABLE_SYSTEM_CONTEXT", "1")]` so the auto-update msiexec
+/// invocation re-asserts the env var via the WiX `EnableSystemContext`
+/// CA instead of stripping it via `DisableSystemContext`.
+///
+/// Thin wrapper around [`preserve_system_context_property_for`] that
+/// reads the SCM env block; the inner pure helper is unit-tested
+/// against synthetic env-var values without an SCM dependency.
+#[cfg(target_os = "windows")]
+fn preserve_system_context_property(flavour: WindowsInstallFlavour) -> Vec<(String, String)> {
+    let env_value =
+        crate::win_service::environment::read_service_env_var("ROOMLER_AGENT_ENABLE_SYSTEM_SWAP")
+            .map_err(|e| {
+                tracing::warn!(
+                    error = %e,
+                    "updater: failed to read SCM env var ROOMLER_AGENT_ENABLE_SYSTEM_SWAP; \
+                     not passing ENABLE_SYSTEM_CONTEXT to msiexec (auto-update will proceed \
+                     but may strip SystemContext if it was enabled)"
+                );
+                format!("{e}")
+            });
+    let result = preserve_system_context_property_for(flavour, env_value);
+    if !result.is_empty() {
+        tracing::info!(
+            "updater: detected ROOMLER_AGENT_ENABLE_SYSTEM_SWAP=1 in service env; \
+             passing ENABLE_SYSTEM_CONTEXT=1 to msiexec to preserve SystemContext mode \
+             across auto-update (rc.56 hotfix)"
+        );
+    }
+    result
+}
+
+#[cfg(not(target_os = "windows"))]
+#[allow(dead_code)]
+fn preserve_system_context_property(_flavour: WindowsInstallFlavour) -> Vec<(String, String)> {
+    Vec::new()
+}
+
+/// rc.56 pure decision logic. Split from the SCM read so the rules
+/// are unit-testable without mocking the registry.
+///
+/// Returns `vec![("ENABLE_SYSTEM_CONTEXT", "1")]` iff:
+///   * flavour is PerMachine (perUser installs have no SCM service)
+///   * env_value == Ok(Some("1")) — the SCM block has the swap on
+///
+/// All other paths return an empty vec (pass nothing to msiexec):
+///   * PerUser flavour
+///   * env var absent (plain perMachine install — DisableSystemContext
+///     is a harmless idempotent no-op)
+///   * env var present but != "1" (operator may have set a non-"1"
+///     truthy variant the agent's `system_swap_enabled` accepts, but
+///     the WiX CA condition compares strictly against the string
+///     `"1"`; we follow WiX's strictness here)
+///   * SCM read error (best-effort; falling back matches pre-rc.56
+///     behaviour — `enable-system-context` CLI remains the manual
+///     escape hatch)
+fn preserve_system_context_property_for(
+    flavour: WindowsInstallFlavour,
+    env_value: Result<Option<String>, String>,
+) -> Vec<(String, String)> {
+    if flavour != WindowsInstallFlavour::PerMachine {
+        return Vec::new();
+    }
+    match env_value {
+        Ok(Some(v)) if v == "1" => vec![("ENABLE_SYSTEM_CONTEXT".to_string(), "1".to_string())],
+        _ => Vec::new(),
     }
 }
 
@@ -1852,6 +1954,99 @@ mod tests {
         assert_eq!(tail[0], "A=1");
         assert_eq!(tail[1], "B=two");
         assert_eq!(tail[2], "C=3");
+    }
+
+    // ----- rc.56 SystemContext-preserve hotfix (preserve_system_context_property_for) --
+
+    #[test]
+    fn preserve_system_context_per_user_always_empty() {
+        // perUser installs have no SCM service to read from; even if the
+        // env_value somehow returns "1" (impossible in production but
+        // the test asserts robustness) the function must NOT pass the
+        // property because perUser MSIs don't define the WiX
+        // `EnableSystemContext` CA at all.
+        assert_eq!(
+            preserve_system_context_property_for(
+                WindowsInstallFlavour::PerUser,
+                Ok(Some("1".into())),
+            ),
+            Vec::<(String, String)>::new()
+        );
+        assert_eq!(
+            preserve_system_context_property_for(WindowsInstallFlavour::PerUser, Ok(None),),
+            Vec::<(String, String)>::new()
+        );
+        assert_eq!(
+            preserve_system_context_property_for(
+                WindowsInstallFlavour::PerUser,
+                Err("nope".into()),
+            ),
+            Vec::<(String, String)>::new()
+        );
+    }
+
+    #[test]
+    fn preserve_system_context_per_machine_with_env_one_passes_property() {
+        // THE headline rc.56 case: perMachine + service env var "1" ⇒
+        // pass `ENABLE_SYSTEM_CONTEXT=1`. Without this assertion the
+        // WiX DisableSystemContext CA would strip the env var on every
+        // auto-update (field-repro PC50045 2026-05-24, rc.55 self-update).
+        let result = preserve_system_context_property_for(
+            WindowsInstallFlavour::PerMachine,
+            Ok(Some("1".into())),
+        );
+        assert_eq!(
+            result,
+            vec![("ENABLE_SYSTEM_CONTEXT".to_string(), "1".to_string())]
+        );
+    }
+
+    #[test]
+    fn preserve_system_context_per_machine_with_env_absent_returns_empty() {
+        // Plain perMachine install (no SystemContext ever enabled):
+        // env var absent ⇒ pass nothing. WiX default property `'0'`
+        // runs DisableSystemContext which is an idempotent no-op when
+        // there's nothing to disable.
+        assert_eq!(
+            preserve_system_context_property_for(WindowsInstallFlavour::PerMachine, Ok(None),),
+            Vec::<(String, String)>::new()
+        );
+    }
+
+    #[test]
+    fn preserve_system_context_per_machine_with_env_non_one_returns_empty() {
+        // Defensive: the WiX CA condition is strict (`="1"`). If the
+        // operator set the env var to "true" / "yes" / "on" (which
+        // `system_swap_enabled` ACCEPTS as truthy), we conservatively
+        // do NOT pass the property — WiX wouldn't match the condition
+        // anyway. The mismatch between agent truthy-parse and WiX
+        // strict-compare is documented; rc.57 candidate: tighten
+        // `system_swap_enabled` to also be strict.
+        for v in ["0", "true", "yes", "on", "TRUE", "", "anything"] {
+            assert_eq!(
+                preserve_system_context_property_for(
+                    WindowsInstallFlavour::PerMachine,
+                    Ok(Some(v.into())),
+                ),
+                Vec::<(String, String)>::new(),
+                "non-\"1\" env value {v:?} must NOT pass ENABLE_SYSTEM_CONTEXT"
+            );
+        }
+    }
+
+    #[test]
+    fn preserve_system_context_per_machine_with_read_error_returns_empty() {
+        // SCM read error (e.g. service masked or missing): fall back to
+        // pre-rc.56 behaviour rather than blocking the auto-update.
+        // Operator can re-enable SystemContext manually via
+        // `roomler-agent enable-system-context` if needed.
+        assert_eq!(
+            preserve_system_context_property_for(
+                WindowsInstallFlavour::PerMachine,
+                Err("SCM RegOpenKeyEx returned 5 ERROR_ACCESS_DENIED".into()),
+            ),
+            Vec::<(String, String)>::new()
+        );
     }
 
     // ---- rc.19 P3 — transfer-gated update timing ----
