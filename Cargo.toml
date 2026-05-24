@@ -99,8 +99,17 @@ config = "0.14"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
-# HTTP client
-reqwest = { version = "0.12", features = ["json", "multipart", "cookies", "stream"] }
+# HTTP client.
+#
+# rc.54 Phase A: `default-features = false` strips the implicit
+# `default-tls = native-tls` chain so this 3rd TLS stack in the agent
+# binary collapses into one. After this swap, all 3 paths
+# (reqwest, tokio-tungstenite, vendored webrtc-ice) speak rustls with
+# the OS-store-backed cert roots (`rustls-native-certs`) — a single
+# cert-chain surface per OS instead of the prior split. See
+# `docs/plans/rc54-cleanup-cycle-v2.md` Phase A for the rationale and
+# the `cargo tree -e features -i native-tls` CI invariant.
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "cookies", "stream", "rustls-tls-native-roots"] }
 
 # SMTP client (used by the EmailService SMTP backend; SendGrid HTTP
 # remains the prod default). `default-features = false` avoids pulling
@@ -148,8 +157,16 @@ anyhow = "1"
 dotenvy = "0.15"
 
 
-# Web Push
-web-push = "0.10"
+# Web Push.
+#
+# rc.54 Phase A: web-push 0.10's default `hyper-client` feature
+# transitively pulls `hyper-tls` → `native-tls`. Switching to
+# `isahc-client` removes that pull and keeps the binary on a single
+# rustls TLS stack (per the reqwest swap above). If push tests fail
+# under isahc, the documented fallback is the `a2` crate
+# (APNs-oriented but also handles VAPID-signed Web Push) — verify
+# during the `cargo tree -e features -i native-tls` CI gate.
+web-push = { version = "0.10", default-features = false, features = ["isahc-client"] }
 
 # Misc
 rand = "0.9"
