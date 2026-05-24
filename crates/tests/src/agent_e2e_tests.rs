@@ -115,9 +115,7 @@ fn urlencode(s: &str) -> String {
 async fn open_controller_ws(
     app: &TestApp,
     seeded: &crate::fixtures::seed::SeededTenant,
-) -> tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-> {
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
     use futures::StreamExt;
     use tokio_tungstenite::connect_async;
 

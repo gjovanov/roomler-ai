@@ -341,6 +341,26 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::tunnel_release::installer_proxy),
         );
 
+    // `/api/tunnel-wizard/{latest-release,{platform}/health,{platform}}`
+    // — public GitHub-Releases proxy for the `roomler-tunnel-installer`
+    // Tauri 2 wizard EXE. Separate from `public_tunnel_release_routes`
+    // (which serves the bare CLI tarball) so the two release cadences
+    // can iterate independently — `tunnel-wizard-v*` tags don't have
+    // to bump every time `tunnel-v*` does.
+    let public_tunnel_wizard_routes = Router::new()
+        .route(
+            "/latest-release",
+            get(routes::tunnel_wizard_release::latest_release),
+        )
+        .route(
+            "/{platform}/health",
+            get(routes::tunnel_wizard_release::installer_health),
+        )
+        .route(
+            "/{platform}",
+            get(routes::tunnel_wizard_release::installer_proxy),
+        );
+
     // TURN credentials (user-scoped, no tenant prefix)
     let turn_routes = Router::new().route(
         "/credentials",
@@ -360,6 +380,7 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/agent", public_agent_routes)
         .nest("/tunnel-client", public_tunnel_routes)
         .nest("/tunnel", public_tunnel_release_routes)
+        .nest("/tunnel-wizard", public_tunnel_wizard_routes)
         .nest("/turn", turn_routes)
         .nest("/log", log_routes)
         .nest("/tenant", tenant_routes)
