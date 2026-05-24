@@ -538,6 +538,21 @@ async fn main() -> Result<()> {
         // apply the origin offset. This logs the actual layout so we
         // can confirm or reject before writing a fix.
         win32_monitors::log_monitor_diagnostic();
+
+        // rc.54 — surface the ROOMLER_AGENT_VIRTUAL_SCREEN gate at
+        // startup so the operator sees which `to_pixels` path is live.
+        // The env var is also captured at first call inside the input
+        // worker via LazyLock; this line is the canonical "is the
+        // virtual-screen-aware path live?" data point.
+        let vscreen = roomler_agent::input::parse_virtual_screen_flag(
+            std::env::var("ROOMLER_AGENT_VIRTUAL_SCREEN")
+                .ok()
+                .as_deref(),
+        );
+        tracing::info!(
+            virtual_screen_enabled = vscreen,
+            "input mapping — rc.54 ROOMLER_AGENT_VIRTUAL_SCREEN gate (false = legacy enigo.main_display path; true = win32_monitors::primary virtual-screen offset)"
+        );
     }
 
     let cli = Cli::parse();

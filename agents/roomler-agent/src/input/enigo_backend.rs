@@ -167,6 +167,84 @@ fn map_button(b: Button) -> EnigoButton {
     }
 }
 
+/// Whether the virtual-screen-aware `to_pixels` path is enabled.
+///
+/// Opt-in via `ROOMLER_AGENT_VIRTUAL_SCREEN=1` (also accepts `true`,
+/// `yes`, `on` — case-insensitive). Default off — the legacy
+/// `enigo.main_display()` path is preserved verbatim.
+///
+/// rc.54 — addresses the "orthogonal mouse-offset" field bug surfaced
+/// in `79d6dee` and instrumented by the rc.48 `monitor_diag` log. When
+/// the primary monitor's virtual-screen origin is non-zero (multi-
+/// monitor host where the user has dragged the primary off `(0,0)`),
+/// `SetCursorPos` interprets coordinates in the virtual-desktop space,
+/// not the primary-local space; without the origin offset, clicks
+/// land on the wrong monitor or shifted by the offset magnitude.
+///
+/// Read once at process startup via [`std::sync::LazyLock`]; the
+/// resulting `bool` is then cheap to read from the hot input path.
+fn virtual_screen_enabled() -> bool {
+    use std::sync::LazyLock;
+    static FLAG: LazyLock<bool> = LazyLock::new(|| {
+        super::parse_virtual_screen_flag(
+            std::env::var("ROOMLER_AGENT_VIRTUAL_SCREEN")
+                .ok()
+                .as_deref(),
+        )
+    });
+    *FLAG
+}
+
+/// Map a normalised `(x, y)` in `[0,1]` plus a target monitor rect
+/// `(origin_x, origin_y, w, h)` (all in physical pixels on the virtual
+/// desktop) to absolute virtual-screen pixel coordinates suitable for
+/// `SetCursorPos` (Windows) / `XTest` (X11) / `CGEventPost` (macOS).
+///
+/// Out-of-range normalised values are clamped to `[0,1]`; degenerate
+/// `w` / `h` ≤ 1 still produce a well-defined origin-anchored point.
+pub(crate) fn map_normalised_to_virtual(
+    x: f32,
+    y: f32,
+    origin_x: i32,
+    origin_y: i32,
+    w: i32,
+    h: i32,
+) -> (i32, i32) {
+    let x_clamped = x.clamp(0.0, 1.0);
+    let y_clamped = y.clamp(0.0, 1.0);
+    // Clamp `(w-1)` / `(h-1)` to non-negative so a degenerate enumeration
+    // (0×0 monitor on a headless host) maps to (origin_x, origin_y)
+    // instead of an underflow-induced negative pixel value.
+    let span_w = (w - 1).max(0) as f32;
+    let span_h = (h - 1).max(0) as f32;
+    let local_px = (x_clamped * span_w).round() as i32;
+    let local_py = (y_clamped * span_h).round() as i32;
+    (origin_x + local_px, origin_y + local_py)
+}
+
+/// Resolve the monitor we map normalised `(x, y)` against. Returns
+/// `(origin_x, origin_y, width_px, height_px)`. The new
+/// virtual-screen path looks up the OS-designated primary monitor and
+/// returns its virtual-desktop origin + physical dimensions; the
+/// legacy path returns `enigo.main_display()` (i.e. origin (0,0) +
+/// primary dims) so the math is identical to pre-rc.54.
+///
+/// `mon` is accepted for the wire-protocol contract but ignored at
+/// rc.54 — multi-monitor `to_pixels(mon)` ships in rc.55.
+fn resolve_target_monitor(enigo: &Enigo, _mon: u8) -> (i32, i32, i32, i32) {
+    if virtual_screen_enabled() {
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(p) = crate::win32_monitors::primary() {
+                return (p.origin_x, p.origin_y, p.width_px, p.height_px);
+            }
+        }
+    }
+    // Legacy path / non-Windows / Win32 enumeration miss → enigo's view.
+    let (w, h) = enigo.main_display().unwrap_or((1920, 1080));
+    (0, 0, w, h)
+}
+
 /// Normalised `(x, y)` in `[0,1]` → absolute pixel coordinates on the
 /// agent's primary display. Multi-monitor mapping (`mon` > 0) picks the
 /// monitor from enigo's enumeration; on single-monitor hosts it falls
@@ -180,38 +258,50 @@ fn map_button(b: Button) -> EnigoButton {
 /// possibly DPI-virtualised) and the capture surface (device pixels).
 /// The first 50 events surface the actual numbers in agent logs;
 /// remaining events drop to debug level to avoid spam.
+///
+/// rc.54 — when `ROOMLER_AGENT_VIRTUAL_SCREEN=1` is set, the new path
+/// queries `win32_monitors::primary()` for the OS-designated primary
+/// monitor's virtual-screen origin and applies the offset to the
+/// computed pixel coords. Closes the orthogonal mouse-offset bug on
+/// multi-monitor hosts where the primary monitor isn't at (0,0).
+/// Default off; flip the default in a later rc once the field-test
+/// host smoke confirms the path on rc.54.
 fn to_pixels(enigo: &Enigo, x: f32, y: f32, mon: u8) -> (i32, i32) {
     use std::sync::atomic::{AtomicU32, Ordering};
     static DIAG_COUNT: AtomicU32 = AtomicU32::new(0);
     const DIAG_INFO_LIMIT: u32 = 50;
 
-    let (w, h) = enigo.main_display().unwrap_or((1920, 1080));
-    let x_clamped = x.clamp(0.0, 1.0);
-    let y_clamped = y.clamp(0.0, 1.0);
-    let px = (x_clamped * (w - 1) as f32).round() as i32;
-    let py = (y_clamped * (h - 1) as f32).round() as i32;
+    let (origin_x, origin_y, w, h) = resolve_target_monitor(enigo, mon);
+    let (px, py) = map_normalised_to_virtual(x, y, origin_x, origin_y, w, h);
     let count = DIAG_COUNT.fetch_add(1, Ordering::Relaxed);
+    let vscreen = virtual_screen_enabled();
     if count < DIAG_INFO_LIMIT {
         tracing::info!(
-            norm_x = x_clamped,
-            norm_y = y_clamped,
+            norm_x = x.clamp(0.0, 1.0),
+            norm_y = y.clamp(0.0, 1.0),
             display_w = w,
             display_h = h,
+            origin_x,
+            origin_y,
             px,
             py,
             mon,
+            virtual_screen = vscreen,
             seq = count,
             "input dispatch — diagnostic (first 50 events)"
         );
     } else {
         tracing::debug!(
-            norm_x = x_clamped,
-            norm_y = y_clamped,
+            norm_x = x.clamp(0.0, 1.0),
+            norm_y = y.clamp(0.0, 1.0),
             display_w = w,
             display_h = h,
+            origin_x,
+            origin_y,
             px,
             py,
             mon,
+            virtual_screen = vscreen,
             "input dispatch"
         );
     }
@@ -358,6 +448,109 @@ mod tests {
             Ok(_) => {}
             Err(e) => eprintln!("skipping — enigo unavailable: {e}"),
         }
+    }
+
+    /// rc.54 — virtual-screen-aware mapping math. Verifies the
+    /// `map_normalised_to_virtual` helper that produces the absolute
+    /// pixel coordinates passed to `SetCursorPos` / equivalents.
+    #[test]
+    fn map_zero_zero_lands_at_origin() {
+        // Origin (0, 0), single-monitor 1920×1200.
+        assert_eq!(
+            map_normalised_to_virtual(0.0, 0.0, 0, 0, 1920, 1200),
+            (0, 0)
+        );
+        // Non-zero origin (multi-monitor layout): (0,0) should land at
+        // the monitor origin, NOT at the virtual desktop origin.
+        assert_eq!(
+            map_normalised_to_virtual(0.0, 0.0, 1920, 0, 1920, 1200),
+            (1920, 0)
+        );
+        // Negative origin (primary to right of secondary).
+        assert_eq!(
+            map_normalised_to_virtual(0.0, 0.0, -1920, 0, 1920, 1200),
+            (-1920, 0)
+        );
+    }
+
+    #[test]
+    fn map_one_one_lands_at_far_corner() {
+        // Single-monitor 1920×1200: (1,1) → (1919, 1199) (w-1, h-1).
+        assert_eq!(
+            map_normalised_to_virtual(1.0, 1.0, 0, 0, 1920, 1200),
+            (1919, 1199)
+        );
+        // Non-zero origin: far corner is shifted by origin.
+        assert_eq!(
+            map_normalised_to_virtual(1.0, 1.0, 1920, 0, 1920, 1200),
+            (1920 + 1919, 1199)
+        );
+    }
+
+    #[test]
+    fn map_centre_lands_at_centre() {
+        // 1920×1200 centre at origin: (960, 600).
+        assert_eq!(
+            map_normalised_to_virtual(0.5, 0.5, 0, 0, 1920, 1200),
+            (960, 600)
+        );
+        // With origin offset (1920, 0): centre shifts by origin.
+        assert_eq!(
+            map_normalised_to_virtual(0.5, 0.5, 1920, 0, 1920, 1200),
+            (1920 + 960, 600)
+        );
+    }
+
+    #[test]
+    fn map_clamps_out_of_range_normalised_values() {
+        // Negative norm → clamped to 0 → at origin.
+        assert_eq!(
+            map_normalised_to_virtual(-0.5, -0.5, 0, 0, 1920, 1200),
+            (0, 0)
+        );
+        // > 1 → clamped to 1 → at far corner.
+        assert_eq!(
+            map_normalised_to_virtual(1.5, 1.5, 0, 0, 1920, 1200),
+            (1919, 1199)
+        );
+    }
+
+    #[test]
+    fn map_handles_degenerate_dims() {
+        // 0×0 monitor (e.g. enumeration anomaly on a headless host):
+        // result anchors at origin without underflow.
+        assert_eq!(
+            map_normalised_to_virtual(0.5, 0.5, 100, 200, 0, 0),
+            (100, 200)
+        );
+        // 1×1 (singular dim): span_w / span_h are 0 → result at origin.
+        assert_eq!(
+            map_normalised_to_virtual(0.5, 0.5, 100, 200, 1, 1),
+            (100, 200)
+        );
+    }
+
+    /// PC50045 layout regression check — primary monitor at virtual
+    /// origin (1920, 0): a click at centre-screen (0.5, 0.5) must land
+    /// inside the primary monitor's virtual rect, not on the secondary
+    /// monitor sitting at (0, 0).
+    #[test]
+    fn pc50045_primary_offset_layout_lands_correct_monitor() {
+        // Secondary 1920×1080 at (0, 0); primary 1920×1200 at (1920, 0).
+        // We map against primary's MonitorInfo.
+        let (px, py) = map_normalised_to_virtual(0.5, 0.5, 1920, 0, 1920, 1200);
+        // Must be inside primary's [1920, 3840) × [0, 1200) rect.
+        assert!(
+            px >= 1920 && px < 3840,
+            "centre x should be inside primary's x-range, got {px}"
+        );
+        assert!(
+            py >= 0 && py < 1200,
+            "centre y should be inside primary's y-range, got {py}"
+        );
+        // Pre-rc.54 would have produced (960, 600) — that's on the
+        // SECONDARY monitor, hence the field-bug.
+        assert_ne!((px, py), (960, 600));
     }
 
     #[test]
