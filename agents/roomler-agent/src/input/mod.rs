@@ -13,6 +13,26 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+/// Parse the `ROOMLER_AGENT_VIRTUAL_SCREEN` env-var value into a
+/// `bool`. Accepts `1`, `true`, `yes`, `on` (case-insensitive, trimmed)
+/// as truthy; anything else (including `None`) is false.
+///
+/// Lives here (in `input/mod.rs`) rather than `enigo_backend.rs` so
+/// it's reachable from `main.rs` regardless of whether the
+/// `enigo-input` feature is on for this build — the startup log line
+/// surfaces the gate value even on signalling-only builds.
+///
+/// rc.54 — gate for the virtual-screen-aware `to_pixels` path.
+pub fn parse_virtual_screen_flag(value: Option<&str>) -> bool {
+    match value {
+        Some(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        None => false,
+    }
+}
+
 #[cfg(feature = "enigo-input")]
 pub mod enigo_backend;
 
@@ -178,4 +198,39 @@ pub fn open_default() -> Box<dyn InputInjector + Send> {
         );
     }
     Box::new(NoopInjector)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// rc.54 — verify the env-var parse rules. Covers truthy variants
+    /// (case + whitespace), explicit false values, missing var, and
+    /// unrecognised values (which must default to false to keep the
+    /// gate fail-closed).
+    #[test]
+    fn parse_virtual_screen_flag_accepts_truthy_values() {
+        assert!(parse_virtual_screen_flag(Some("1")));
+        assert!(parse_virtual_screen_flag(Some("true")));
+        assert!(parse_virtual_screen_flag(Some("True")));
+        assert!(parse_virtual_screen_flag(Some("TRUE")));
+        assert!(parse_virtual_screen_flag(Some("yes")));
+        assert!(parse_virtual_screen_flag(Some("on")));
+        assert!(parse_virtual_screen_flag(Some("  1  ")));
+        assert!(parse_virtual_screen_flag(Some("\tTrue\n")));
+    }
+
+    #[test]
+    fn parse_virtual_screen_flag_rejects_falsy_values() {
+        assert!(!parse_virtual_screen_flag(None));
+        assert!(!parse_virtual_screen_flag(Some("")));
+        assert!(!parse_virtual_screen_flag(Some("0")));
+        assert!(!parse_virtual_screen_flag(Some("false")));
+        assert!(!parse_virtual_screen_flag(Some("no")));
+        assert!(!parse_virtual_screen_flag(Some("off")));
+        // Unrecognised values must be false — fail-closed gate.
+        assert!(!parse_virtual_screen_flag(Some("maybe")));
+        assert!(!parse_virtual_screen_flag(Some("2")));
+        assert!(!parse_virtual_screen_flag(Some("enabled")));
+    }
 }
