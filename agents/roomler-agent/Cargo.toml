@@ -276,6 +276,15 @@ full = ["media", "enigo-input", "clipboard"]
 # Everything needed including the MF hardware encoder. Production
 # Windows MSI builds with this.
 full-hw = ["full", "mf-encoder", "wgc-capture", "viewer-indicator"]
+# Phase 1 — deterministic synthetic frame source for the headless
+# Linux CI / agent-e2e Pod. Replaces scrap-capture when the runtime
+# env var `ROOMLER_AGENT_SYNTHETIC_FRAMES=1` is set, so a Pod with
+# no X server / no display can still drive encode + WebRTC end-to-
+# end. Production agents (`full` / `full-hw`) DO NOT compile this in;
+# the agent-e2e Dockerfile selects `--features synthetic-frame-source,
+# openh264-encoder,clipboard` (no scrap, no enigo, no WGC).
+synthetic-frame-source = []
+
 # M3 A1 — SYSTEM-context capture+input on the secure desktop. Lets
 # the perMachine MSI deployment drive the Windows lock screen / UAC
 # prompt by spawning a worker via stolen winlogon.exe primary-token
