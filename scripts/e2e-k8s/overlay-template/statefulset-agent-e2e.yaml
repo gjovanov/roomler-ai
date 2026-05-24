@@ -1,0 +1,93 @@
+# Phase 1 Chunk 1B — 2-replica StatefulSet of synthetic-frame agents
+# enrolled against the in-cluster API. StatefulSet (not Deployment)
+# so the Pod hostnames are deterministic — `agent-e2e-0`, `agent-e2e-1`
+# — which become the `machine_name` in the rc:agent.hello payload.
+# Tests that drive a session need a stable `agent_id` map; the
+# deterministic name makes the look-up cheap.
+#
+# Each Pod's bootstrap script (baked into the image — see
+# Dockerfile.agent-e2e) calls `roomler-agent enroll` on every start,
+# which mints a fresh agent_id per restart. Tests poll
+# `GET /api/tenant/<tid>/agent?name=<hostname>` to resolve the
+# current id before issuing rc:session.request.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: agent-e2e
+  labels:
+    app: agent-e2e
+spec:
+  serviceName: agent-e2e
+  replicas: 2
+  selector:
+    matchLabels:
+      app: agent-e2e
+  template:
+    metadata:
+      labels:
+        app: agent-e2e
+    spec:
+      imagePullSecrets:
+        - name: regcred
+      # The seed Job must complete before the agent Pods start —
+      # they need the admin user to exist before their bootstrap
+      # script can log in. K8s doesn't have a native "depend on a
+      # Job" primitive; the agent's bootstrap loop retries login
+      # for ~60 s so the Job's typical ~5 s completion fits within
+      # the agent's startup wait window.
+      containers:
+        - name: agent
+          image: gjovanov/roomler-agent-e2e:latest # rewritten by kustomization images:
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: ROOMLER_E2E_SERVER
+              value: http://roomler2
+            - name: ROOMLER_E2E_ADMIN_EMAIL
+              valueFrom:
+                secretKeyRef:
+                  name: agent-e2e-bootstrap
+                  key: admin_email
+            - name: ROOMLER_E2E_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: agent-e2e-bootstrap
+                  key: admin_password
+            - name: ROOMLER_E2E_TENANT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: agent-e2e-bootstrap
+                  key: tenant_id
+            # Capture cascade short-circuit — see capture/mod.rs:open_default.
+            - name: ROOMLER_AGENT_SYNTHETIC_FRAMES
+              value: "1"
+            # Image carries the version we want to test; don't let
+            # the auto-updater swap it mid-test.
+            - name: ROOMLER_AGENT_AUTO_UPDATE
+              value: "0"
+            # AutoGrant consent — no operator-prompt in CI.
+            - name: ROOMLER_AGENT_AUTO_GRANT_SESSION
+              value: "1"
+          volumeMounts:
+            - name: config
+              mountPath: /etc/roomler-agent
+            - name: data
+              mountPath: /root/.local/share/roomler/roomler-agent
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          # No HTTP listener on the agent — it's an outbound WS
+          # client. Liveness via `roomler-agent service status`
+          # would need wiring through a tiny health-port; skip for
+          # the initial Chunk 1B and rely on the watchdog's own
+          # process-exit on stall (the supervisor — implicitly the
+          # K8s restartPolicy=Always behaviour of a Pod — restarts).
+      volumes:
+        - name: config
+          emptyDir: {}
+        - name: data
+          emptyDir: {}
+      terminationGracePeriodSeconds: 10

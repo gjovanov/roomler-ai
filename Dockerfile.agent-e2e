@@ -1,0 +1,144 @@
+# Phase 1 Chunk 1B — Linux agent image for the roomler-ai-agent-e2e
+# overlay. Identical pattern to Dockerfile.e2e (multi-stage builder +
+# slim runtime + entrypoint script that touches /results/.done after
+# work completes), but the runtime is `roomler-agent run` driven by a
+# synthetic frame source instead of Playwright.
+#
+# Feature selection — DELIBERATELY minimal:
+#   * synthetic-frame-source — substitutes a deterministic 320×240
+#     BGRA generator for scrap-capture. No X server / no libxcb in
+#     the image; image stays ~80 MiB instead of dragging the X11
+#     stack in.
+#   * openh264-encoder — the SW H.264 encoder so the WebRTC track
+#     actually produces frames. NO mf-encoder / vp9-444 / wgc-capture
+#     — those are Windows-only or pull heavy C deps.
+#   * clipboard — exercises the clipboard data channel in Phase 3.
+#     Pulls arboard's x11rb back-end transitively but no system X
+#     libs are needed (x11rb is pure-Rust).
+#
+# No `--features enigo-input`: enigo on Linux needs an X server to
+# attach to. Phase 2's input round-trip will run in a different image
+# (Windows or with Xvfb) — see Phase 2 plan.
+
+# --- Stage 1: Rust build ---
+FROM rust:1.88-bookworm AS builder
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends cmake \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY . .
+# Build the agent binary with the e2e-only feature set. `--locked`
+# pins to Cargo.lock so a transient registry change can't shift
+# resolved versions between this build and the workspace.
+RUN cargo build --release -p roomler-agent --locked \
+    --no-default-features \
+    --features synthetic-frame-source,openh264-encoder,clipboard
+
+# --- Stage 2: Runtime ---
+FROM debian:trixie-slim AS runtime
+# curl for the bootstrap script (mints enrollment token via REST);
+# ca-certificates for TLS to the in-cluster API; libssl3 + libgcc-s1
+# satisfy reqwest's native-tls + the agent's openh264 crate runtime.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        libssl3 \
+        libgcc-s1 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /src/target/release/roomler-agent /usr/local/bin/roomler-agent
+
+# Bootstrap script. The Pod's StatefulSet sets `ROOMLER_E2E_SERVER`
+# (the in-cluster API URL) + `ROOMLER_E2E_TENANT_SLUG` + `ROOMLER_E2E_
+# ADMIN_EMAIL` / `ROOMLER_E2E_ADMIN_PASSWORD` (idempotent seed admin)
+# + the StatefulSet's pod index via `HOSTNAME` for the agent name.
+#
+# Flow:
+#   1. Poll the API's /health until 200 (Pod startup race with the
+#      roomler2 Deployment in the same namespace).
+#   2. POST /api/auth/login with the seed admin creds. If 401, the
+#      admin doesn't exist yet — POST /api/auth/register first, then
+#      mark verified via a one-shot SQL-equivalent endpoint (or just
+#      let the seed Job handle it; see job-agent-seed.yaml).
+#   3. POST /api/tenant/<tid>/agent/enroll-token to mint a fresh
+#      enrollment JWT.
+#   4. Run `roomler-agent --config /etc/roomler-agent/config.toml
+#      enroll --server $SERVER --token <jwt> --name <pod-hostname>`.
+#   5. Touch /results/.bootstrap-done so an external orchestrator
+#      can wait on Pod-readiness without scraping logs.
+COPY <<'EOF' /usr/local/bin/agent-bootstrap.sh
+#!/bin/sh
+set -eu
+SERVER="${ROOMLER_E2E_SERVER:?ROOMLER_E2E_SERVER must point at the in-cluster API}"
+ADMIN_EMAIL="${ROOMLER_E2E_ADMIN_EMAIL:?seed admin email}"
+ADMIN_PASS="${ROOMLER_E2E_ADMIN_PASSWORD:?seed admin password}"
+TENANT_ID="${ROOMLER_E2E_TENANT_ID:?seed tenant id (ObjectId hex)}"
+AGENT_NAME="${HOSTNAME:-agent-e2e}"
+CONFIG_PATH="${ROOMLER_AGENT_CONFIG_PATH:-/etc/roomler-agent/config.toml}"
+
+mkdir -p "$(dirname "$CONFIG_PATH")"
+mkdir -p /results
+
+echo "[bootstrap] waiting for $SERVER/health"
+for i in $(seq 1 60); do
+  if curl -fsS "$SERVER/health" >/dev/null 2>&1; then
+    echo "[bootstrap] api healthy after ${i}s"
+    break
+  fi
+  sleep 1
+done
+
+echo "[bootstrap] logging in as $ADMIN_EMAIL"
+LOGIN_BODY="$(printf '{"email":"%s","password":"%s"}' "$ADMIN_EMAIL" "$ADMIN_PASS")"
+LOGIN_RESP="$(curl -fsS -X POST "$SERVER/api/auth/login" \
+  -H 'content-type: application/json' \
+  -d "$LOGIN_BODY")"
+TOKEN="$(printf '%s' "$LOGIN_RESP" | grep -oE '"access_token":"[^"]+"' | sed 's/.*"access_token":"\([^"]*\)".*/\1/')"
+if [ -z "$TOKEN" ]; then
+  echo "[bootstrap] FAILED to extract access_token from login response" >&2
+  echo "$LOGIN_RESP" >&2
+  exit 1
+fi
+
+echo "[bootstrap] minting enrollment token for tenant=$TENANT_ID"
+ENROLL_RESP="$(curl -fsS -X POST "$SERVER/api/tenant/$TENANT_ID/agent/enroll-token" \
+  -H "authorization: Bearer $TOKEN")"
+ENROLL_JWT="$(printf '%s' "$ENROLL_RESP" | grep -oE '"enrollment_token":"[^"]+"' | sed 's/.*"enrollment_token":"\([^"]*\)".*/\1/')"
+if [ -z "$ENROLL_JWT" ]; then
+  echo "[bootstrap] FAILED to extract enrollment_token" >&2
+  echo "$ENROLL_RESP" >&2
+  exit 1
+fi
+
+echo "[bootstrap] enrolling agent name=$AGENT_NAME"
+/usr/local/bin/roomler-agent --config "$CONFIG_PATH" \
+  enroll \
+  --server "$SERVER" \
+  --token "$ENROLL_JWT" \
+  --name "$AGENT_NAME"
+
+touch /results/.bootstrap-done
+echo "[bootstrap] config written to $CONFIG_PATH; ready to run"
+EOF
+RUN chmod +x /usr/local/bin/agent-bootstrap.sh
+
+# Runner script: bootstrap (idempotent — re-enrol on every restart
+# uses a fresh token, which is correct for ephemeral e2e Pods) then
+# exec the agent. ROOMLER_AGENT_SYNTHETIC_FRAMES=1 is set by the
+# Deployment env so the capture cascade routes to the synthetic
+# backend; ROOMLER_AGENT_AUTO_UPDATE=0 disables the auto-updater
+# (the e2e image carries the version we want to test; an in-Pod
+# update would defeat the point).
+COPY <<'EOF' /usr/local/bin/run-agent-e2e.sh
+#!/bin/sh
+set -eu
+/usr/local/bin/agent-bootstrap.sh
+exec /usr/local/bin/roomler-agent --config "${ROOMLER_AGENT_CONFIG_PATH:-/etc/roomler-agent/config.toml}" run
+EOF
+RUN chmod +x /usr/local/bin/run-agent-e2e.sh
+
+ENV ROOMLER_AGENT_SYNTHETIC_FRAMES=1
+ENV ROOMLER_AGENT_AUTO_UPDATE=0
+ENV ROOMLER_AGENT_CONFIG_PATH=/etc/roomler-agent/config.toml
+
+ENTRYPOINT ["/usr/local/bin/run-agent-e2e.sh"]
