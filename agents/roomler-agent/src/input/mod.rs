@@ -12,6 +12,29 @@
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::AtomicU32;
+
+/// Process-global counter for `to_pixels` diagnostic logging. The first
+/// 50 increments are logged at INFO level; subsequent events drop to
+/// DEBUG. [`reset_input_diag_counter`] is called from
+/// `peer::attach_input_handler` so EVERY session gets the first-50
+/// INFO sample, not just the first session after process start.
+///
+/// rc.57 — promoted from a function-local static in `enigo_backend.rs`
+/// to a module-level static so peer.rs can reset it from outside the
+/// `enigo-input` feature gate. The field log from rc.55 ran out of
+/// INFO samples after session 1 — the subsequent Crystal-Clear-OFF
+/// session (where the misposition reproduces) had only DEBUG dispatch
+/// lines, hiding the per-event norm/px math.
+pub(crate) static INPUT_DIAG_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// Reset the per-process `to_pixels` diagnostic counter so the next 50
+/// input events are logged at INFO. Called from
+/// `peer::attach_input_handler` each time the `input` DC opens (once
+/// per session).
+pub fn reset_input_diag_counter() {
+    INPUT_DIAG_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// Parse the `ROOMLER_AGENT_VIRTUAL_SCREEN` env-var value into a
 /// `bool`. Accepts `1`, `true`, `yes`, `on` (case-insensitive, trimmed)
@@ -218,6 +241,21 @@ mod tests {
         assert!(parse_virtual_screen_flag(Some("on")));
         assert!(parse_virtual_screen_flag(Some("  1  ")));
         assert!(parse_virtual_screen_flag(Some("\tTrue\n")));
+    }
+
+    /// rc.57 — verify the diagnostic counter actually resets. Cargo
+    /// runs tests in parallel within a binary by default, but only one
+    /// test below mutates `INPUT_DIAG_COUNT` so there's no inter-test
+    /// race. If another test ever touches the counter, gate this with
+    /// `#[serial_test::serial]` or move both to a single test.
+    #[test]
+    fn reset_input_diag_counter_zeroes_the_counter() {
+        use std::sync::atomic::Ordering;
+        // Set to non-zero to prove the reset has work to do.
+        INPUT_DIAG_COUNT.store(42, Ordering::Relaxed);
+        assert_eq!(INPUT_DIAG_COUNT.load(Ordering::Relaxed), 42);
+        reset_input_diag_counter();
+        assert_eq!(INPUT_DIAG_COUNT.load(Ordering::Relaxed), 0);
     }
 
     #[test]
