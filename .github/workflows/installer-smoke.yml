@@ -75,7 +75,16 @@ jobs:
           # for the registry assertion (the MSI's ProductVersion
           # lands under the UpgradeCode key alongside the
           # InstallProperties).
-          SMOKE_VERSION: 0.0.0-smoke
+          #
+          # cargo-wix requires the prerelease component to be
+          # parseable as an integer — `0.0.0-smoke` fails with
+          # "we couldn't convert the prerelease components to an
+          # integer" (it maps semver `X.Y.Z-<text>.<N>` to MSI
+          # `X.Y.Z.N`). Use a trailing `.1` so it lands as MSI
+          # `0.0.0.1` — distinct enough from any real release
+          # (which always start at 0.3.0+ rc.N) that an operator
+          # who finds it on a machine knows it's a smoke artifact.
+          SMOKE_VERSION: 0.0.0-smoke.1
         run: |
           cargo wix -p roomler-agent --nocapture --no-build --install-version $env:SMOKE_VERSION
           $msi = Get-ChildItem 'target/wix/*.msi' | Select-Object -First 1
