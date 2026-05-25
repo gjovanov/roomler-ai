@@ -155,14 +155,18 @@ async function refreshTokenStep() {
     const view = await invoke('cmd_validate_token', { token: value });
     info.hidden = false;
     document.getElementById('token-issuer').textContent = view.issuer || '(none)';
-    document.getElementById('token-audience').textContent = view.audience || '(none)';
+    // Roomler tunnel-enrollment JWTs carry the discriminant in
+    // `token_type` (snake_case enum value), not `aud` — render that
+    // first when present, fall back to `aud` for backward-compat.
+    document.getElementById('token-audience').textContent =
+      view.tokenType || view.audience || '(none)';
     document.getElementById('token-expiry').textContent =
       view.expiresAtUnix ? formatExpiry(view.expiresAtUnix) : '(no exp)';
 
     if (!view.audienceMatches) {
       warnAudience.hidden = false;
       document.getElementById('token-warn-aud-name').textContent =
-        view.audience || '(none)';
+        view.tokenType || view.audience || '(none)';
       return;
     }
     if (view.appearsExpired) {
