@@ -1649,12 +1649,23 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         }
       }
     }
+    // rc.61 — pick the codec string based on the agent's advertised
+    // chroma format. `'yuv420'` → VP9 profile 0 (`vp09.00.10.08`),
+    // `'yuv444'` (default + pre-rc.61 agents) → profile 1
+    // (`vp09.01.10.08`). Mismatch with the bitstream the agent
+    // actually sends would leave the canvas blank.
+    const agentChroma = agent?.value?.capabilities?.vp9_chroma
+    const workerCodec = agentChroma === 'yuv420' ? 'vp09.00.10.08' : 'vp09.01.10.08'
+
     // Synthetic OffscreenCanvas — keeps the worker fully wired even
     // without a view-side canvas. Y.4 swaps in the visible canvas
     // via vp9_444CanvasEl watcher below.
     try {
       const synthetic = new OffscreenCanvas(2, 2)
-      worker.postMessage({ type: 'init-canvas', canvas: synthetic }, [synthetic])
+      worker.postMessage(
+        { type: 'init-canvas', canvas: synthetic, codec: workerCodec },
+        [synthetic],
+      )
     } catch (err) {
       console.warn('[rc] vp9-444: synthetic OffscreenCanvas init failed', err)
       try { worker.terminate() } catch { /* ignore */ }

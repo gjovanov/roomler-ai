@@ -33,6 +33,16 @@ export interface AgentCapabilities {
    *  Empty / unset on older agents — browsers fall back to
    *  `supports_file_transfer` as the upload-only marker. */
   files?: string[]
+  /** rc.61 — VP9 chroma format the agent emits on the
+   *  `data-channel-vp9-444` transport. Values: `'yuv444'` (default,
+   *  VP9 profile 1, sharpest text via ClearType chroma) or
+   *  `'yuv420'` (VP9 profile 0, ~30% bandwidth saving with slight
+   *  chroma softening on small Windows text). Empty / unset on
+   *  pre-rc.61 agents — browsers treat as `'yuv444'`. The vp9-444
+   *  worker uses this to pick the right `VideoDecoder` codec
+   *  string (`vp09.01.10.08` vs `vp09.00.10.08`); mismatch leaves
+   *  the canvas blank. */
+  vp9_chroma?: string
 }
 
 export interface Agent {
