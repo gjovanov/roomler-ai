@@ -1,28 +1,37 @@
-//! Tunnel-archive asset resolution + download.
+//! CLI-archive asset resolution + download.
 //!
-//! The wizard hits roomler.ai's `/api/tunnel-wizard/{platform}` proxy
-//! instead of downloading directly from `github.com`. Same rationale
-//! as the agent installer's `asset_resolver`: corporate
-//! ESET / Defender allow-lists are typically per-domain;
-//! `roomler.ai`'s TLS cert is already trusted by IT (the agent's
-//! signaling traffic uses it), `github.com` is often blocked outright.
+//! The wizard hits roomler.ai's `/api/tunnel/installer/{platform}`
+//! proxy — the CLI tarball endpoint — instead of downloading
+//! directly from `github.com`. Same rationale as the agent
+//! installer's `asset_resolver`: corporate ESET / Defender allow-
+//! lists are typically per-domain; `roomler.ai`'s TLS cert is
+//! already trusted by IT, `github.com` is often blocked.
+//!
+//! NB: the wizard EXE itself is delivered via a **separate** endpoint
+//! family (`/api/tunnel-wizard/<platform>`) that this module never
+//! touches. The wizard downloads the CLI tarball from THIS endpoint,
+//! extracts it, and adds the `roomler-tunnel(.exe)` binary inside to
+//! the operator's PATH. Pointing this module at `/api/tunnel-wizard`
+//! makes the wizard install itself (rc.60 bug, fixed rc.61).
 //!
 //! Flow per install:
 //!   1. `resolve(platform, version)` → GET
-//!      `/tunnel-wizard/{platform}/health` → JSON metadata
+//!      `/tunnel/installer/{platform}/health` → JSON metadata
 //!      (tag, size, sha256 digest, canonical filename).
 //!   2. `download(&health, on_progress)` → GET
-//!      `/tunnel-wizard/{platform}` → stream bytes to
+//!      `/tunnel/installer/{platform}` → stream bytes to
 //!      `<temp>/roomler-tunnel-installer/{tag}/{filename}`, firing
 //!      `on_progress(received_bytes)` per chunk.
 //!   3. `verify_sha256(&staged, &expected)` → hash the staged file,
 //!      compare to the digest from health. Mismatch → caller deletes
 //!      the file + re-downloads (or surfaces a tampered-bytes error).
 //!
-//! Override knob: env var `ROOMLER_TUNNEL_WIZARD_PROXY_BASE` swaps
-//! the domain. Used by the integration tests in `crates/tests/` to
-//! point the orchestrator at an in-process mock server. Production
-//! always uses `https://roomler.ai/api/tunnel-wizard`.
+//! Override knob: env var `ROOMLER_TUNNEL_CLI_PROXY_BASE` swaps the
+//! domain. Used by the integration tests in `crates/tests/` to point
+//! the orchestrator at an in-process mock server. The legacy
+//! `ROOMLER_TUNNEL_WIZARD_PROXY_BASE` is honoured as a fallback for
+//! back-compat with any test fixture that already set it.
+//! Production always uses `https://roomler.ai/api/tunnel/installer`.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -31,15 +40,28 @@ use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// Default proxy base. Override via `ROOMLER_TUNNEL_WIZARD_PROXY_BASE`
-/// for staging / local-server testing.
-const DEFAULT_PROXY_BASE: &str = "https://roomler.ai/api/tunnel-wizard";
+/// Default proxy base — the CLI tarball endpoint family.
+///
+/// rc.61 fix: this points at `/api/tunnel/installer` (which serves
+/// the `roomler-tunnel` CLI tarball that the wizard installs), NOT
+/// `/api/tunnel-wizard` (which serves the wizard EXE itself —
+/// downloading that here would have the wizard install ITSELF, then
+/// fail at the `find_tunnel_binary` step because the archive
+/// contains `roomler-tunnel-installer.exe`, not `roomler-tunnel.exe`).
+/// Field-reproduced 2026-05-25 on rc.60 with operator's PC.
+///
+/// Override via `ROOMLER_TUNNEL_CLI_PROXY_BASE` for staging / local-
+/// server testing. The legacy `ROOMLER_TUNNEL_WIZARD_PROXY_BASE`
+/// alias is honoured for backward-compat with any test fixture that
+/// already set it before the rename.
+const DEFAULT_PROXY_BASE: &str = "https://roomler.ai/api/tunnel/installer";
 
 /// Resolve the proxy base at runtime so the wizard can hit a staging
 /// API for testing. Always returns a URL without a trailing slash.
 fn proxy_base() -> String {
-    let raw = std::env::var("ROOMLER_TUNNEL_WIZARD_PROXY_BASE")
+    let raw = std::env::var("ROOMLER_TUNNEL_CLI_PROXY_BASE")
         .ok()
+        .or_else(|| std::env::var("ROOMLER_TUNNEL_WIZARD_PROXY_BASE").ok())
         .unwrap_or_else(|| DEFAULT_PROXY_BASE.to_string());
     normalise_proxy_base(&raw)
 }
@@ -128,11 +150,11 @@ pub async fn resolve(platform: &str, version: &str) -> Result<WizardArchiveHealt
         .with_context(|| format!("GET {url}"))?;
     if !resp.status().is_success() {
         return Err(anyhow!(
-            "wizard-health GET {url} returned {}",
+            "installer-health GET {url} returned {}",
             resp.status()
         ));
     }
-    let health: WizardArchiveHealth = resp.json().await.context("parsing wizard-health JSON")?;
+    let health: WizardArchiveHealth = resp.json().await.context("parsing installer-health JSON")?;
     Ok(health)
 }
 
@@ -170,10 +192,7 @@ pub async fn download<F: FnMut(u64)>(
         .await
         .with_context(|| format!("GET {url}"))?;
     if !resp.status().is_success() {
-        return Err(anyhow!(
-            "wizard archive GET {url} returned {}",
-            resp.status()
-        ));
+        return Err(anyhow!("CLI archive GET {url} returned {}", resp.status()));
     }
 
     use futures::StreamExt;
@@ -183,7 +202,7 @@ pub async fn download<F: FnMut(u64)>(
     let mut received: u64 = 0;
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let bytes = chunk.context("reading wizard archive chunk")?;
+        let bytes = chunk.context("reading CLI archive chunk")?;
         use tokio::io::AsyncWriteExt;
         file.write_all(&bytes)
             .await
@@ -200,21 +219,27 @@ pub async fn download<F: FnMut(u64)>(
 
 /// The origin (scheme://host[:port]) part of `proxy_base()` — used
 /// when composing absolute URLs from `health.uri`, which already
-/// starts with the `/api/tunnel-wizard/...` path segment so
-/// concatenation must not double up the path.
+/// starts with `/api/tunnel/installer/...` so concatenation must not
+/// double up the path.
 fn proxy_origin() -> String {
-    strip_wizard_path_suffix(&proxy_base())
+    strip_cli_path_suffix(&proxy_base())
 }
 
-/// Pure: strip the trailing `/api/tunnel-wizard` segment from `base`
-/// so concatenation with `health.uri` (which already starts with
-/// `/api/tunnel-wizard/...`) doesn't double up. If the suffix is
-/// missing (custom env var without the path segment), returns `base`
-/// unchanged.
-fn strip_wizard_path_suffix(base: &str) -> String {
-    base.strip_suffix("/api/tunnel-wizard")
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| base.to_string())
+/// Pure: strip the trailing `/api/tunnel/installer` segment from
+/// `base` so concatenation with `health.uri` (which already starts
+/// with `/api/tunnel/installer/...`) doesn't double up. If the
+/// suffix is missing (custom env var without the path segment),
+/// returns `base` unchanged. Also strips the legacy `/api/tunnel-
+/// wizard` suffix for backward-compat with the rc.59/rc.60 broken
+/// build's env-var convention.
+fn strip_cli_path_suffix(base: &str) -> String {
+    if let Some(stripped) = base.strip_suffix("/api/tunnel/installer") {
+        return stripped.to_string();
+    }
+    if let Some(stripped) = base.strip_suffix("/api/tunnel-wizard") {
+        return stripped.to_string();
+    }
+    base.to_string()
 }
 
 /// Verify a staged archive's SHA256 against the digest from
@@ -320,31 +345,47 @@ mod tests {
     #[test]
     fn normalise_proxy_base_strips_trailing_slash() {
         assert_eq!(
-            normalise_proxy_base("https://staging.local/api/tunnel-wizard/"),
-            "https://staging.local/api/tunnel-wizard"
+            normalise_proxy_base("https://staging.local/api/tunnel/installer/"),
+            "https://staging.local/api/tunnel/installer"
         );
     }
 
     #[test]
     fn normalise_proxy_base_passthrough_when_no_trailing_slash() {
         assert_eq!(
-            normalise_proxy_base("https://roomler.ai/api/tunnel-wizard"),
-            "https://roomler.ai/api/tunnel-wizard"
+            normalise_proxy_base("https://roomler.ai/api/tunnel/installer"),
+            "https://roomler.ai/api/tunnel/installer"
         );
     }
 
     #[test]
-    fn strip_wizard_path_suffix_removes_canonical_suffix() {
+    fn strip_cli_path_suffix_removes_canonical_suffix() {
+        // rc.61: the canonical suffix is `/api/tunnel/installer` (the
+        // CLI tarball endpoint). The wizard EXE is delivered via a
+        // separate endpoint family (`/api/tunnel-wizard/<platform>`)
+        // that the install pipeline never touches.
         assert_eq!(
-            strip_wizard_path_suffix("https://roomler.ai/api/tunnel-wizard"),
+            strip_cli_path_suffix("https://roomler.ai/api/tunnel/installer"),
             "https://roomler.ai"
         );
     }
 
     #[test]
-    fn strip_wizard_path_suffix_passthrough_when_suffix_absent() {
+    fn strip_cli_path_suffix_back_compat_strips_wizard_alias() {
+        // Anyone who set `ROOMLER_TUNNEL_WIZARD_PROXY_BASE` against
+        // the rc.59/rc.60 broken build should still get a working
+        // origin (the env-var pointed at the WRONG endpoint family,
+        // but the suffix-strip behaviour stays back-compat).
         assert_eq!(
-            strip_wizard_path_suffix("https://staging.local"),
+            strip_cli_path_suffix("https://staging.local/api/tunnel-wizard"),
+            "https://staging.local"
+        );
+    }
+
+    #[test]
+    fn strip_cli_path_suffix_passthrough_when_suffix_absent() {
+        assert_eq!(
+            strip_cli_path_suffix("https://staging.local"),
             "https://staging.local"
         );
     }
