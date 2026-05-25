@@ -173,6 +173,25 @@ fn compute_caps() -> AgentCaps {
         files.push("browse".to_string());
     }
 
+    // rc.61 — surface VP9 chroma format in caps so the browser worker
+    // picks the right codec string for VideoDecoder.configure(). Empty
+    // when vp9-444 transport isn't advertised (so we don't lie to the
+    // client about a format we don't emit).
+    let vp9_chroma: String = if transports.iter().any(|t| t == "data-channel-vp9-444") {
+        #[cfg(feature = "vp9-444")]
+        {
+            crate::encode::libvpx::vp9_chroma_from_env()
+                .as_str()
+                .to_string()
+        }
+        #[cfg(not(feature = "vp9-444"))]
+        {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
     AgentCaps {
         hw_encoders,
         codecs,
@@ -182,6 +201,7 @@ fn compute_caps() -> AgentCaps {
         max_simultaneous_sessions: 1,
         transports,
         files,
+        vp9_chroma,
     }
 }
 

@@ -1758,8 +1758,14 @@ async fn media_pump_vp9_444_dc(
         }
 
         if encoder_dims != Some((w, h)) {
-            info!(%session_id, w, h, target_fps, "VP9-444 encoder rebuild for dims");
-            match Vp9Encoder::new_with_fps(w, h, target_fps) {
+            // rc.61 — resolve chroma format from env. Default Yuv444
+            // preserves pre-rc.61 behaviour. Read at every rebuild so a
+            // mid-session env-var flip (operator changes it via the
+            // SCM service env block + restart) takes effect on the
+            // next dim change without needing a separate hook.
+            let chroma = crate::encode::libvpx::vp9_chroma_from_env();
+            info!(%session_id, w, h, target_fps, chroma = chroma.as_str(), "VP9-444 encoder rebuild for dims");
+            match Vp9Encoder::new_with_fps_chroma(w, h, target_fps, chroma) {
                 Ok(e) => {
                     encoder = Some(e);
                     encoder_dims = Some((w, h));
