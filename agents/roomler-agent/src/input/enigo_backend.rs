@@ -89,6 +89,7 @@ fn dispatch(enigo: &mut Enigo, msg: InputMsg) -> Result<()> {
             enigo
                 .move_mouse(px, py, Coordinate::Abs)
                 .map_err(|e| anyhow!("move_mouse: {e}"))?;
+            verify_cursor_position(px, py, "move");
         }
         InputMsg::MouseButton {
             btn,
@@ -103,6 +104,7 @@ fn dispatch(enigo: &mut Enigo, msg: InputMsg) -> Result<()> {
             enigo
                 .move_mouse(px, py, Coordinate::Abs)
                 .map_err(|e| anyhow!("move_mouse: {e}"))?;
+            verify_cursor_position(px, py, "button");
             let direction = if down {
                 Direction::Press
             } else {
@@ -314,6 +316,63 @@ fn to_pixels(enigo: &Enigo, x: f32, y: f32, mon: u8) -> (i32, i32) {
     }
     (px, py)
 }
+
+/// rc.60 — after enigo dispatches a mouse-move, read the OS's actual
+/// cursor position via `GetCursorPos` and log expected vs actual. If
+/// the two diverge on a per-monitor-v2 DPI-aware process, the
+/// hypothesis is enigo applying internal DPI conversion incorrectly
+/// for absolute coords (e.g., dividing by DPI scale when it shouldn't,
+/// producing a cursor at (px/1.5, py/1.5) on a 150% scale host).
+///
+/// User-reported symptom matches: top-left corner click (0, 0) lands
+/// correctly (0/1.5 = 0), but bottom-right click (1851, 1175) lands
+/// at ~(1234, 783) — "more to left and top" relative to where the
+/// user clicked in the browser.
+///
+/// Rate-limited via the same `INPUT_DIAG_COUNT` as `to_pixels` so it
+/// only fires for the first 50 events per session.
+#[cfg(target_os = "windows")]
+fn verify_cursor_position(expected_x: i32, expected_y: i32, op: &str) {
+    use std::sync::atomic::Ordering;
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
+
+    let count = super::INPUT_DIAG_COUNT.load(Ordering::Relaxed);
+    if count > 50 {
+        return;
+    }
+    let mut pt = POINT { x: 0, y: 0 };
+    // SAFETY: GetCursorPos takes a stack-allocated POINT pointer.
+    // Returns 0 on failure (e.g. session not interactive); we treat
+    // failure as a logged sentinel rather than a panic.
+    let ok = unsafe { GetCursorPos(&mut pt) };
+    if ok == 0 {
+        tracing::warn!(
+            op,
+            expected_x,
+            expected_y,
+            "cursor verify — GetCursorPos failed (session not interactive?)"
+        );
+        return;
+    }
+    let dx = pt.x - expected_x;
+    let dy = pt.y - expected_y;
+    let drift = dx != 0 || dy != 0;
+    tracing::info!(
+        op,
+        expected_x,
+        expected_y,
+        actual_x = pt.x,
+        actual_y = pt.y,
+        dx,
+        dy,
+        drift,
+        "cursor verify — enigo.move_mouse vs GetCursorPos"
+    );
+}
+
+#[cfg(not(target_os = "windows"))]
+fn verify_cursor_position(_expected_x: i32, _expected_y: i32, _op: &str) {}
 
 /// Convert a browser `WheelEvent` delta into enigo scroll "notches".
 /// Browsers emit pixels at 100+ per notch; enigo wants integer notches,
