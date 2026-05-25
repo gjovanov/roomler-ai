@@ -6668,6 +6668,7 @@ name = "roomler-tunnel-installer"
 version = "0.3.0-rc.60"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "directories",
  "flate2",
  "futures",

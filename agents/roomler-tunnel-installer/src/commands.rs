@@ -72,28 +72,54 @@ pub fn cmd_default_server_url() -> String {
     "https://roomler.ai".to_string()
 }
 
-/// Parsed view of an enrollment token. Mirrors the agent installer's
-/// shape so the SPA template can be near-identical. NEVER carries
-/// the raw token bytes back (H5).
+/// Parsed view of an enrollment token. NEVER carries the raw token
+/// bytes back (H5).
+///
+/// rc.60: The "audience match" gate was previously checking `aud ==
+/// "tunnel-enrollment"` but the Roomler server issues JWTs with a
+/// custom `token_type` claim (snake-case `tunnel_enrollment`) and NO
+/// `aud` claim at all (see crates/services/src/auth/mod.rs::
+/// TokenType, `#[serde(rename_all = "snake_case")]`). The check now
+/// reads `token_type` instead and the SPA renders that field
+/// alongside `audience` (which stays None for these tokens).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenValidation {
     pub issuer: Option<String>,
     pub audience: Option<String>,
+    /// Server-emitted `token_type` claim (snake_case enum value,
+    /// e.g. `"tunnel_enrollment"`). The SPA renders this in the
+    /// info card and the gating logic checks it for
+    /// `"tunnel_enrollment"`.
+    pub token_type: Option<String>,
     pub subject: Option<String>,
     pub jti: Option<String>,
     pub expires_at_unix: Option<i64>,
     /// `true` when `exp <= now` or `exp` is missing entirely.
     pub appears_expired: bool,
-    /// `true` when `aud == "tunnel-enrollment"`. The wizard expects
-    /// THIS audience specifically — the agent's `Enrollment` audience
-    /// won't enroll a tunnel client. Surfacing the mismatch here
-    /// catches "wrong token copied" mistakes before the POST.
+    /// `true` when `token_type == "tunnel_enrollment"`. Catches
+    /// "wrong token copied" mistakes (e.g. operator pasted the agent-
+    /// enrollment token from Admin → Agents instead of the tunnel-
+    /// enrollment one from Admin → Tunnels) before the POST.
+    ///
+    /// Field name kept as `audience_matches` for SPA backward-
+    /// compat — older builds of the SPA bind to `audienceMatches`.
+    /// The semantics are now "the token's TYPE matches what the
+    /// wizard wants" regardless of which JWT claim carries it.
     pub audience_matches: bool,
 }
 
 /// Introspect a JWT WITHOUT verifying the signature. Used by the
-/// Token step to show "Issuer / Audience / Expires in N min".
+/// Token step to show "Issuer / Token type / Expires in N min".
+///
+/// Two passes:
+///   1. `jwt_introspect::parse_unverified` for the standard claims
+///      the agent crate's helper exposes.
+///   2. An in-line base64+JSON parse of the payload to fish out the
+///      custom `token_type` claim (the helper doesn't expose it).
+///      Best-effort: a missing/unparseable `token_type` leaves the
+///      field None and the audience-matches gate stays false (= SPA
+///      shows the warning + Continue disabled).
 #[tauri::command]
 pub fn cmd_validate_token(token: String) -> Result<TokenValidation, String> {
     use roomler_agent::jwt_introspect::{is_likely_expired, parse_unverified};
@@ -102,20 +128,38 @@ pub fn cmd_validate_token(token: String) -> Result<TokenValidation, String> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    let audience_matches = view
-        .audience
-        .as_deref()
-        .map(|a| a == "tunnel-enrollment")
-        .unwrap_or(false);
+    let token_type = parse_token_type(&token);
+    let audience_matches = token_type.as_deref() == Some("tunnel_enrollment");
     Ok(TokenValidation {
         appears_expired: is_likely_expired(&view, now),
         audience_matches,
         issuer: view.issuer,
         audience: view.audience,
+        token_type,
         subject: view.subject,
         jti: view.jti,
         expires_at_unix: view.expires_at_unix,
     })
+}
+
+/// Decode the JWT's middle segment and return its `token_type` custom
+/// claim. Returns None for any failure path (malformed token, bad
+/// base64, non-JSON payload, missing claim, non-string claim) — the
+/// caller treats that as "audience-matches = false" which keeps the
+/// SPA's gate closed.
+fn parse_token_type(token: &str) -> Option<String> {
+    use base64::Engine;
+    let mut parts = token.split('.');
+    let _header = parts.next()?;
+    let payload_b64 = parts.next()?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload_b64)
+        .ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    value
+        .get("token_type")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
 }
 
 // ─── Wizard state persistence ────────────────────────────────────────────────
@@ -204,11 +248,12 @@ mod tests {
     #[test]
     fn token_validation_serialises_camel_case_and_audience_match() {
         let v = TokenValidation {
-            issuer: Some("roomler-ai".to_string()),
-            audience: Some("tunnel-enrollment".to_string()),
-            subject: None,
-            jti: None,
-            expires_at_unix: None,
+            issuer: Some("roomler2".to_string()),
+            audience: None,
+            token_type: Some("tunnel_enrollment".to_string()),
+            subject: Some("507f1f77bcf86cd799439011".to_string()),
+            jti: Some("abc".to_string()),
+            expires_at_unix: Some(1_700_000_000),
             appears_expired: false,
             audience_matches: true,
         };
@@ -216,6 +261,48 @@ mod tests {
         assert!(json.contains("audienceMatches"));
         assert!(json.contains("expiresAtUnix"));
         assert!(json.contains("appearsExpired"));
+        // The field name on the wire is `tokenType` (camelCase) so the
+        // SPA's `view.tokenType` access lands on a string, not undefined.
+        assert!(
+            json.contains(r#""tokenType":"tunnel_enrollment""#),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn parse_token_type_extracts_tunnel_enrollment() {
+        // Synthetic JWT mirroring the server's emitted shape: snake-case
+        // `token_type` claim, NO `aud`. Header + signature are placeholder
+        // strings (parse_token_type doesn't validate them).
+        //
+        // Payload JSON: {"sub":"x","tenant_id":"y","token_type":"tunnel_enrollment"}
+        // base64url-encoded (no pad).
+        let header = "eyJhbGciOiJIUzI1NiJ9";
+        let payload =
+            "eyJzdWIiOiJ4IiwidGVuYW50X2lkIjoieSIsInRva2VuX3R5cGUiOiJ0dW5uZWxfZW5yb2xsbWVudCJ9";
+        let sig = "sig";
+        let token = format!("{header}.{payload}.{sig}");
+        assert_eq!(
+            parse_token_type(&token).as_deref(),
+            Some("tunnel_enrollment")
+        );
+    }
+
+    #[test]
+    fn parse_token_type_returns_none_for_missing_claim() {
+        // Payload JSON: {"sub":"x"} — no token_type.
+        let header = "eyJhbGciOiJIUzI1NiJ9";
+        let payload = "eyJzdWIiOiJ4In0";
+        let sig = "sig";
+        let token = format!("{header}.{payload}.{sig}");
+        assert_eq!(parse_token_type(&token), None);
+    }
+
+    #[test]
+    fn parse_token_type_returns_none_for_malformed_token() {
+        assert_eq!(parse_token_type("not-a-jwt"), None);
+        assert_eq!(parse_token_type("only.two"), None);
+        assert_eq!(parse_token_type("ey!!.payload.sig"), None);
     }
 
     #[test]
