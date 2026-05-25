@@ -83,6 +83,40 @@ const KEYFRAME_INTERVAL: u32 = 240;
 const TIMEBASE_NUM: c_int = 1;
 const TIMEBASE_DEN: c_int = 1_000_000;
 
+/// VP9 chroma subsampling. Selects the encoder profile + the BGRA→YUV
+/// conversion path + the size of the U/V plane buffers.
+///
+/// rc.61 — added so the operator can pick between sharpest-text
+/// `Yuv444` (profile 1, default, ~1.5× bandwidth) and lower-bandwidth
+/// `Yuv420` (profile 0, ~30% bandwidth saving, slight ClearType
+/// softening on small text).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Vp9Chroma {
+    /// VP9 profile 0 — horizontal+vertical 2:1 chroma subsampling. Same
+    /// as WebRTC's default and what RustDesk uses by default.
+    Yuv420,
+    /// VP9 profile 1 — full 4:4:4 chroma. Currently the default; sharpest
+    /// text rendering, needed for unaltered Windows ClearType.
+    Yuv444,
+}
+
+impl Vp9Chroma {
+    /// libvpx `g_profile` value (0 or 1).
+    pub fn vpx_profile(self) -> c_uint {
+        match self {
+            Self::Yuv420 => 0,
+            Self::Yuv444 => 1,
+        }
+    }
+    /// String token used in `AgentCaps::vp9_chroma` + the browser side.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Yuv420 => "yuv420",
+            Self::Yuv444 => "yuv444",
+        }
+    }
+}
+
 pub struct Vp9Encoder {
     /// libvpx encoder context. Owned + freed in Drop.
     ctx: vpx::vpx_codec_ctx_t,
@@ -96,7 +130,12 @@ pub struct Vp9Encoder {
     /// the input frame has no monotonic timestamp). Set at
     /// construction; the pump rebuilds the encoder on fps changes.
     target_fps: u32,
-    /// Reusable I444 plane buffers — re-allocated on resolution change.
+    /// Chroma format this encoder was built for. Drives plane sizing,
+    /// BGRA→YUV conversion path, and the `img.fmt` / chroma-shift
+    /// fields populated for each `vpx_codec_encode` call.
+    chroma: Vp9Chroma,
+    /// Reusable YUV plane buffers — re-allocated on resolution change.
+    /// Y is always W*H; U/V are W*H for 4:4:4 or (W/2)*(H/2) for 4:2:0.
     /// Kept around between frames so steady-state encoding doesn't
     /// pressure the allocator.
     y_plane: Vec<u8>,
@@ -126,16 +165,29 @@ pub struct Vp9Encoder {
 unsafe impl Send for Vp9Encoder {}
 
 impl Vp9Encoder {
-    /// Construct at the default 30 fps target. Kept for tests and any
-    /// caller that doesn't have an fps in scope.
+    /// Construct at the default 30 fps target + Yuv444 chroma (current
+    /// default). Kept for tests and any caller that doesn't have an
+    /// fps / chroma in scope.
     pub fn new(width: u32, height: u32) -> Result<Self> {
-        Self::new_with_fps(width, height, 30)
+        Self::new_with_fps_chroma(width, height, 30, Vp9Chroma::Yuv444)
     }
 
-    /// Construct with an explicit target framerate. The fps participates
-    /// in the per-packet `duration_us` and the synthetic-PTS fallback;
-    /// the actual capture rate is enforced by the pump's sleep cadence.
+    /// Construct with an explicit target framerate. Defaults chroma to
+    /// `Yuv444` (pre-rc.61 behaviour). Caller in `peer.rs` resolves
+    /// chroma from env + handshake and uses [`new_with_fps_chroma`].
     pub fn new_with_fps(width: u32, height: u32, target_fps: u32) -> Result<Self> {
+        Self::new_with_fps_chroma(width, height, target_fps, Vp9Chroma::Yuv444)
+    }
+
+    /// Construct with an explicit target framerate AND chroma format.
+    /// rc.61 — the chroma param is new; it picks libvpx profile 0
+    /// (`Yuv420`) or 1 (`Yuv444`) and drives the U/V plane sizing.
+    pub fn new_with_fps_chroma(
+        width: u32,
+        height: u32,
+        target_fps: u32,
+        chroma: Vp9Chroma,
+    ) -> Result<Self> {
         if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
             bail!("vp9-444: require non-zero, even dimensions, got {width}x{height}");
         }
@@ -165,10 +217,13 @@ impl Vp9Encoder {
         // libvpx's contract means it fully initialised the cfg struct.
         let mut cfg: vpx::vpx_codec_enc_cfg_t = unsafe { cfg_uninit.assume_init() };
 
-        // Profile 1 = 8-bit 4:4:4. Browser's WebCodecs `VideoDecoder`
-        // is configured with `vp09.01.10.08` which decodes only this
-        // profile; mismatch would leave the canvas blank.
-        cfg.g_profile = 1;
+        // VP9 profile selects the chroma format the encoder accepts +
+        // emits. Profile 0 = 8-bit 4:2:0, Profile 1 = 8-bit 4:4:4.
+        // Browser's `VideoDecoder` MUST be configured with the matching
+        // codec string (`vp09.00.10.08` vs `vp09.01.10.08`); a mismatch
+        // leaves the canvas blank. rc.61 — picked from the `chroma`
+        // parameter (env-var-driven via `peer.rs::vp9_chroma_from_env`).
+        cfg.g_profile = chroma.vpx_profile();
         cfg.g_w = width as c_uint;
         cfg.g_h = height as c_uint;
         cfg.g_timebase = vpx::vpx_rational {
@@ -245,15 +300,30 @@ impl Vp9Encoder {
         // Apply VP9 controls that have no Config-struct equivalent.
         // Failure here is non-fatal but logged — we'd rather encode
         // sub-optimally than refuse to start.
+        // Plane allocation. Y is always full-resolution W×H. U/V are
+        // full-resolution for 4:4:4, quarter-resolution for 4:2:0
+        // (horizontal+vertical 2:1 subsampling). For odd W/H we round
+        // UP via integer division on `(W+1)/2 * (H+1)/2` so we don't
+        // underrun on a (theoretically possible) odd-dim probe.
+        let y_plane_size = (width as usize) * (height as usize);
+        let uv_plane_size = match chroma {
+            Vp9Chroma::Yuv444 => y_plane_size,
+            Vp9Chroma::Yuv420 => {
+                let cw = (width as usize).div_ceil(2);
+                let ch = (height as usize).div_ceil(2);
+                cw * ch
+            }
+        };
         let mut enc = Self {
             ctx,
             cfg,
             width,
             height,
             target_fps,
-            y_plane: vec![0; (width * height) as usize],
-            u_plane: vec![0; (width * height) as usize],
-            v_plane: vec![0; (width * height) as usize],
+            chroma,
+            y_plane: vec![0; y_plane_size],
+            u_plane: vec![0; uv_plane_size],
+            v_plane: vec![0; uv_plane_size],
             frame_idx: 0,
             force_keyframe: true, // first frame is always keyframe
             target_bitrate: DEFAULT_BITRATE_BPS,
@@ -372,10 +442,14 @@ impl Vp9Encoder {
         );
     }
 
-    /// Convert a BGRA frame into the three I444 planes. Uses
-    /// `dcv_color_primitives` AVX2 path on x86_64 with SSE2 fallback.
-    /// In-place into `self.{y,u,v}_plane`.
-    fn bgra_to_i444(&mut self, frame: &Frame) -> Result<()> {
+    /// Uses `dcv_color_primitives` AVX2 path on x86_64 with SSE2
+    /// fallback. In-place into `self.{y,u,v}_plane`.
+    ///
+    /// Convert BGRA → I444 or I420 into our reusable plane buffers,
+    /// selected by `self.chroma`. Pre-rc.61 this was `bgra_to_i444`;
+    /// the I420 path was added in rc.61 to support VP9 profile 0 for
+    /// lower-bandwidth sessions.
+    fn bgra_to_yuv(&mut self, frame: &Frame) -> Result<()> {
         if frame.width != self.width || frame.height != self.height {
             bail!(
                 "vp9-444: frame dim mismatch — encoder configured {}x{}, got {}x{}",
@@ -399,8 +473,12 @@ impl Vp9Encoder {
             color_space: dcv::ColorSpace::Rgb,
             num_planes: 1,
         };
+        let (dst_pixfmt, uv_stride) = match self.chroma {
+            Vp9Chroma::Yuv444 => (dcv::PixelFormat::I444, self.width as usize),
+            Vp9Chroma::Yuv420 => (dcv::PixelFormat::I420, (self.width as usize).div_ceil(2)),
+        };
         let dst_format = dcv::ImageFormat {
-            pixel_format: dcv::PixelFormat::I444,
+            pixel_format: dst_pixfmt,
             color_space: dcv::ColorSpace::Bt601,
             num_planes: 3,
         };
@@ -408,11 +486,7 @@ impl Vp9Encoder {
         let src_strides = &[(frame.width * 4) as usize];
         let dst_buffers: &mut [&mut [u8]] =
             &mut [&mut self.y_plane, &mut self.u_plane, &mut self.v_plane];
-        let dst_strides = &[
-            self.width as usize,
-            self.width as usize,
-            self.width as usize,
-        ];
+        let dst_strides = &[self.width as usize, uv_stride, uv_stride];
         dcv::convert_image(
             self.width,
             self.height,
@@ -423,7 +497,7 @@ impl Vp9Encoder {
             Some(dst_strides),
             dst_buffers,
         )
-        .map_err(|e| anyhow!("dcv BGRA→I444 failed: {e:?}"))?;
+        .map_err(|e| anyhow!("dcv BGRA→YUV failed: {e:?}"))?;
         Ok(())
     }
 }
@@ -445,15 +519,39 @@ impl VideoEncoder for Vp9Encoder {
         if frame.pixel_format != PixelFormat::Bgra {
             bail!("vp9-444: expected BGRA input, got {:?}", frame.pixel_format);
         }
-        self.bgra_to_i444(&frame)?;
+        self.bgra_to_yuv(&frame)?;
 
         // Build a vpx_image_t pointing at our three plane buffers. We
         // don't use vpx_img_wrap because that requires a single
         // contiguous buffer, and we have three separate Vecs that
         // dcv_color_primitives writes into directly. Manual setup
         // avoids the extra concat step.
+        //
+        // Chroma-dependent fields:
+        //   - fmt: I444 vs I420
+        //   - x_chroma_shift / y_chroma_shift: 0 for full chroma,
+        //     1 for half-resolution chroma (each shift = ÷2)
+        //   - bps: 24 (4:4:4 has 1 luma + 2 chroma samples per pixel)
+        //          vs 12 (4:2:0 averages chroma over 4 pixels)
+        //   - U/V stride: width for 4:4:4, width/2 for 4:2:0
         let mut img: vpx::vpx_image_t = unsafe { std::mem::zeroed() };
-        img.fmt = vpx::vpx_img_fmt::VPX_IMG_FMT_I444;
+        let (img_fmt, x_shift, y_shift, bps, uv_stride) = match self.chroma {
+            Vp9Chroma::Yuv444 => (
+                vpx::vpx_img_fmt::VPX_IMG_FMT_I444,
+                0u32,
+                0u32,
+                24,
+                self.width as c_int,
+            ),
+            Vp9Chroma::Yuv420 => (
+                vpx::vpx_img_fmt::VPX_IMG_FMT_I420,
+                1u32,
+                1u32,
+                12,
+                ((self.width as usize).div_ceil(2)) as c_int,
+            ),
+        };
+        img.fmt = img_fmt;
         img.cs = vpx::vpx_color_space::VPX_CS_BT_601;
         img.range = vpx::vpx_color_range::VPX_CR_STUDIO_RANGE;
         img.w = self.width as c_uint;
@@ -463,15 +561,15 @@ impl VideoEncoder for Vp9Encoder {
         img.r_w = self.width as c_uint;
         img.r_h = self.height as c_uint;
         img.bit_depth = 8;
-        img.x_chroma_shift = 0;
-        img.y_chroma_shift = 0;
-        img.bps = 24;
+        img.x_chroma_shift = x_shift;
+        img.y_chroma_shift = y_shift;
+        img.bps = bps;
         img.planes[vpx::VPX_PLANE_Y as usize] = self.y_plane.as_mut_ptr();
         img.planes[vpx::VPX_PLANE_U as usize] = self.u_plane.as_mut_ptr();
         img.planes[vpx::VPX_PLANE_V as usize] = self.v_plane.as_mut_ptr();
         img.stride[vpx::VPX_PLANE_Y as usize] = self.width as c_int;
-        img.stride[vpx::VPX_PLANE_U as usize] = self.width as c_int;
-        img.stride[vpx::VPX_PLANE_V as usize] = self.width as c_int;
+        img.stride[vpx::VPX_PLANE_U as usize] = uv_stride;
+        img.stride[vpx::VPX_PLANE_V as usize] = uv_stride;
 
         let pts = frame.monotonic_us as vpx::vpx_codec_pts_t;
         // Advance pts by one frame at the configured target fps when we
@@ -621,6 +719,36 @@ pub(crate) fn cpu_used_from_env() -> c_int {
 /// rc.42 ships this behind an env var (default cbr); rc.43 flips the
 /// default to vbr after one field cycle on the field-test host confirms the
 /// envelope is acceptable.
+/// Resolve the VP9 chroma format for this session. rc.61.
+///
+/// Env var `ROOMLER_AGENT_VP9_CHROMA` values:
+///   - `""` / `"yuv444"` / `"444"` → [`Vp9Chroma::Yuv444`] (default).
+///   - `"yuv420"` / `"420"` → [`Vp9Chroma::Yuv420`].
+///
+/// Lowercase + whitespace tolerant; anything else logs at debug and
+/// falls back to Yuv444 (the pre-rc.61 default — preserves behaviour
+/// for hosts that don't know about the new knob).
+pub fn vp9_chroma_from_env() -> Vp9Chroma {
+    let raw = std::env::var("ROOMLER_AGENT_VP9_CHROMA").unwrap_or_default();
+    let parsed = match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "yuv444" | "444" => Vp9Chroma::Yuv444,
+        "yuv420" | "420" => Vp9Chroma::Yuv420,
+        other => {
+            tracing::debug!(
+                value = other,
+                "vp9-444: unrecognised ROOMLER_AGENT_VP9_CHROMA — falling back to yuv444"
+            );
+            Vp9Chroma::Yuv444
+        }
+    };
+    tracing::info!(
+        chroma = parsed.as_str(),
+        env_value = %raw,
+        "vp9-444: chroma format selected"
+    );
+    parsed
+}
+
 fn rc_mode_from_env() -> vpx::vpx_rc_mode {
     let raw = std::env::var("ROOMLER_AGENT_VP9_RC_MODE").unwrap_or_default();
     let parsed = match raw.trim().to_ascii_lowercase().as_str() {

@@ -75,6 +75,20 @@ pub struct AgentCaps {
     /// `files:get` / `files:dir`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<String>,
+    /// VP9 chroma format the agent will emit on the
+    /// `data-channel-vp9-444` transport. Values: `"yuv444"` (default,
+    /// current behaviour, VP9 profile 1) for sharpest text via
+    /// ClearType chroma preservation, or `"yuv420"` (VP9 profile 0)
+    /// for ~1.5× lower bandwidth at the cost of slight chroma loss
+    /// on small Windows ClearType text.
+    ///
+    /// rc.61 — added so the browser-side `rc-vp9-444-worker.ts` can
+    /// pick the right codec string (`vp09.01.10.08` vs `vp09.00.10.08`)
+    /// when configuring its `VideoDecoder`. Mismatch leaves the canvas
+    /// blank. Empty / older agents deserialise to `""`; browsers treat
+    /// the empty value as `"yuv444"` for backward compat.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub vp9_chroma: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
