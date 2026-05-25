@@ -136,13 +136,20 @@ jobs:
             'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
             'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
           )
+          # Filter is intentionally loose: WiX's main.wxs uses the
+          # human-readable Product Name `"Roomler Agent"` (space-
+          # separated, capitalised) for DisplayName, NOT the Cargo
+          # kebab-case `roomler-agent`. Match either via case-
+          # insensitive regex against "roomler" + "agent". Run
+          # #26377062833 diag confirmed: the installed entry reads
+          # `DisplayName = "Roomler Agent"`.
           $found = $null
           foreach ($root in $uninstallRoots) {
             if (-not (Test-Path $root)) { continue }
             $found = Get-ChildItem $root -ErrorAction SilentlyContinue |
                        Get-ItemProperty -ErrorAction SilentlyContinue |
                        Where-Object {
-                         $_.DisplayName -and $_.DisplayName -like 'roomler-agent*'
+                         $_.DisplayName -and $_.DisplayName -match '(?i)roomler.*agent'
                        } |
                        Select-Object -First 1
             if ($found) {
@@ -224,13 +231,17 @@ jobs:
             'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
             'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
           )
+          # Same loose filter as the post-install step — match either
+          # "Roomler Agent" (WiX DisplayName) or "roomler-agent"
+          # (Cargo package name) so a future WiX rename in either
+          # direction doesn't silently turn this assert into a no-op.
           $stragglers = @()
           foreach ($root in $uninstallRoots) {
             if (-not (Test-Path $root)) { continue }
             $stragglers += Get-ChildItem $root -ErrorAction SilentlyContinue |
                              Get-ItemProperty -ErrorAction SilentlyContinue |
                              Where-Object {
-                               $_.DisplayName -and $_.DisplayName -like 'roomler-agent*'
+                               $_.DisplayName -and $_.DisplayName -match '(?i)roomler.*agent'
                              }
           }
           if ($stragglers.Count -gt 0) {
