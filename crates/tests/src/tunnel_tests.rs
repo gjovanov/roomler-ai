@@ -89,7 +89,9 @@ async fn policy_crud_round_trips() {
         .json()
         .await
         .unwrap();
-    let policy_id = created["id"].as_str().expect("policy id in create response");
+    let policy_id = created["id"]
+        .as_str()
+        .expect("policy id in create response");
     assert_eq!(created["name"].as_str(), Some("loopback-test"));
     assert_eq!(
         created["tenant_id"].as_str(),
@@ -121,7 +123,10 @@ async fn policy_crud_round_trips() {
     // --- GET one ---
     let fetched: Value = app
         .auth_get(
-            &format!("/api/tenant/{}/tunnel-policy/{}", seeded.tenant_id, policy_id),
+            &format!(
+                "/api/tenant/{}/tunnel-policy/{}",
+                seeded.tenant_id, policy_id
+            ),
             &seeded.admin.access_token,
         )
         .send()
@@ -152,7 +157,10 @@ async fn policy_crud_round_trips() {
     });
     let updated: Value = app
         .auth_put(
-            &format!("/api/tenant/{}/tunnel-policy/{}", seeded.tenant_id, policy_id),
+            &format!(
+                "/api/tenant/{}/tunnel-policy/{}",
+                seeded.tenant_id, policy_id
+            ),
             &seeded.admin.access_token,
         )
         .json(&update_body)
@@ -173,8 +181,9 @@ async fn policy_crud_round_trips() {
     );
     // Subjects/targets/allowlist were OMITTED in the update body —
     // they must be unchanged (locks the partial-update semantic).
-    let allowlist_after =
-        updated["allowlist"].as_array().expect("allowlist still present");
+    let allowlist_after = updated["allowlist"]
+        .as_array()
+        .expect("allowlist still present");
     assert_eq!(
         allowlist_after.len(),
         1,
@@ -184,7 +193,10 @@ async fn policy_crud_round_trips() {
     // --- DELETE ---
     let resp = app
         .auth_delete(
-            &format!("/api/tenant/{}/tunnel-policy/{}", seeded.tenant_id, policy_id),
+            &format!(
+                "/api/tenant/{}/tunnel-policy/{}",
+                seeded.tenant_id, policy_id
+            ),
             &seeded.admin.access_token,
         )
         .send()
@@ -199,7 +211,10 @@ async fn policy_crud_round_trips() {
     // --- GET after delete → 404 ---
     let resp = app
         .auth_get(
-            &format!("/api/tenant/{}/tunnel-policy/{}", seeded.tenant_id, policy_id),
+            &format!(
+                "/api/tenant/{}/tunnel-policy/{}",
+                seeded.tenant_id, policy_id
+            ),
             &seeded.admin.access_token,
         )
         .send()
