@@ -69,6 +69,16 @@ futures = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 
+# JWT payload decoding for `token_type` introspection (rc.60 hotfix).
+# The agent crate's `jwt_introspect::parse_unverified` only exposes
+# the standard claims (`iss`/`aud`/`exp`/`sub`/`jti`); the Roomler
+# server's tunnel-enrollment JWT uses a custom `token_type` claim
+# (snake-case enum value `tunnel_enrollment`) and NO `aud` claim, so
+# the wizard peeks at the payload itself to gate the Continue button
+# on the right token type. Lifting `token_type` into `JwtView` would
+# be the cleaner cross-crate fix; out of scope for this hotfix.
+base64 = { workspace = true }
+
 # Hostname for the default device-name field on the Server step.
 gethostname = "0.5"
 
