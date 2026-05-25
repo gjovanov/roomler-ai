@@ -121,17 +121,49 @@ jobs:
           # UpgradeCode `1F2D7B1C-8B2F-4D2E-B1A3-6B1E2C7E4D91` (see
           # `agents/roomler-agent/Cargo.toml::package.metadata.wix`).
           #
-          # Rather than reimplementing pack_msi_guid in PowerShell,
-          # use WMI / Get-Package to query installed MSIs by
-          # UpgradeCode-aware queries — equivalent observable.
-          $pkg = Get-Package -Provider msi -ErrorAction SilentlyContinue |
-                   Where-Object { $_.Name -like 'roomler-agent*' }
-          if (-not $pkg) {
-            Write-Host '--- All installed MSIs ---'
-            Get-Package -Provider msi | Select-Object Name, Version | Format-Table
-            throw 'roomler-agent MSI not found in installed packages after install'
+          # First attempt used `Get-Package -Provider msi` but the
+          # PackageManagement `msi` provider isn't available on
+          # PowerShell 7 (the runner's pwsh.exe), only on Windows
+          # PowerShell 5.x. Run #26376742677 hit `Unable to find
+          # package providers (msi)`. Switch to a direct registry walk
+          # against `Uninstall\*` — works on every PS version, is
+          # faster than Get-Package, and observably equivalent (an
+          # MSI install lands BOTH an Uninstall entry AND the
+          # UpgradeCodes entry; checking the former is sufficient
+          # for "the MSI installed and the system sees it").
+          $uninstallRoots = @(
+            'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+          )
+          $found = $null
+          foreach ($root in $uninstallRoots) {
+            if (-not (Test-Path $root)) { continue }
+            $found = Get-ChildItem $root -ErrorAction SilentlyContinue |
+                       Get-ItemProperty -ErrorAction SilentlyContinue |
+                       Where-Object {
+                         $_.DisplayName -and $_.DisplayName -like 'roomler-agent*'
+                       } |
+                       Select-Object -First 1
+            if ($found) {
+              Write-Host "Found install record under $root"
+              break
+            }
           }
-          Write-Host "Installed: $($pkg.Name) $($pkg.Version)"
+          if (-not $found) {
+            Write-Host '--- Roomler entries in any Uninstall hive ---'
+            foreach ($root in $uninstallRoots) {
+              if (-not (Test-Path $root)) { continue }
+              Get-ChildItem $root -ErrorAction SilentlyContinue |
+                Get-ItemProperty -ErrorAction SilentlyContinue |
+                Where-Object { $_.DisplayName -like '*roomler*' } |
+                Select-Object DisplayName, DisplayVersion, UninstallString |
+                Format-Table -AutoSize
+            }
+            throw 'roomler-agent install record not found in any Uninstall registry hive'
+          }
+          Write-Host "Installed: $($found.DisplayName) $($found.DisplayVersion)"
+          'INSTALLED_PRODUCT_CODE=' + $found.PSChildName | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Assert agent binary at expected install path
         shell: pwsh
@@ -184,10 +216,25 @@ jobs:
       - name: Assert cleanup — registry + install dir gone
         shell: pwsh
         run: |
-          $pkg = Get-Package -Provider msi -ErrorAction SilentlyContinue |
-                   Where-Object { $_.Name -like 'roomler-agent*' }
-          if ($pkg) {
-            throw "roomler-agent MSI still listed after uninstall: $($pkg.Name) $($pkg.Version)"
+          # Same registry-direct query as the post-install assert.
+          # Get-Package -Provider msi is PowerShell 5.x-only and the
+          # runner uses pwsh 7 (see post-install step's comment).
+          $uninstallRoots = @(
+            'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+          )
+          $stragglers = @()
+          foreach ($root in $uninstallRoots) {
+            if (-not (Test-Path $root)) { continue }
+            $stragglers += Get-ChildItem $root -ErrorAction SilentlyContinue |
+                             Get-ItemProperty -ErrorAction SilentlyContinue |
+                             Where-Object {
+                               $_.DisplayName -and $_.DisplayName -like 'roomler-agent*'
+                             }
+          }
+          if ($stragglers.Count -gt 0) {
+            throw "roomler-agent install record still present after uninstall: $($stragglers.DisplayName -join ', ')"
           }
           # Pick the candidate paths from the install-assert step;
           # none should exist after uninstall (best-effort — some
