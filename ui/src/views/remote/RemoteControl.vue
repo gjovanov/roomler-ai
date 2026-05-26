@@ -272,6 +272,23 @@
       >
         <v-icon>{{ vp9_444On ? 'mdi-format-color-fill' : 'mdi-format-color-marker-cancel' }}</v-icon>
       </v-btn>
+      <!-- rc.63 — VP9 chroma format dropdown for the desktop inline
+           toolbar. Mirrors the same select that lives in the mobile
+           bottom-sheet at line ~740. Compact width to fit the icon
+           row. Disabled until Crystal-Clear is on (the setting only
+           applies to the data-channel-vp9-444 transport). -->
+      <v-select
+        v-model="vp9Chroma"
+        :items="vp9ChromaOptionsCompact"
+        :disabled="!vp9_444On"
+        density="compact"
+        hide-details
+        variant="outlined"
+        style="max-width: 130px;"
+        prepend-inner-icon="mdi-format-color-fill"
+        aria-label="VP9 chroma format"
+        :title="vp9ChromaHint"
+      />
       <!-- Low-latency (WebCodecs) toggle. Bypasses Chrome's <video>
            jitter-buffer floor (~80ms). Disabled when the browser
            lacks RTCRtpScriptTransform / VideoDecoder. -->
@@ -1825,6 +1842,14 @@ const vp9ChromaOptions = [
   { title: 'Auto (agent default)', value: 'auto' },
   { title: '4:4:4 — High quality (sharp text, ~1.5× bandwidth)', value: 'yuv444' },
   { title: '4:2:0 — Standard (lower bandwidth, slight text softening)', value: 'yuv420' },
+] as const
+
+// rc.63 — short labels for the desktop inline toolbar where the
+// 190-px-wide v-select can't fit the descriptive option titles.
+const vp9ChromaOptionsCompact = [
+  { title: 'Auto', value: 'auto' },
+  { title: '4:4:4 (sharp)', value: 'yuv444' },
+  { title: '4:2:0 (low BW)', value: 'yuv420' },
 ] as const
 
 const vp9Chroma = computed<'auto' | 'yuv420' | 'yuv444'>({
