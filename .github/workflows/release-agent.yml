@@ -286,12 +286,14 @@ jobs:
           # Cache key invalidates when: vcpkg baseline changes, our feature
           # set changes, or the agent crate version changes (defensive
           # against a port-edit slipping past the manifest diff).
-          # rc.66 hotfix: rc.65 failed with "ffmpeg@6.1 does not have required
-          # feature avutil". Root cause: vcpkg's pre-installed baseline ships
-          # ffmpeg 6.1, but (a) ffmpeg-next 8.1 needs ffmpeg 7+, (b) `avutil`
-          # is never a selectable feature in vcpkg's ffmpeg port (it's always
-          # built). Bumped baseline to vcpkg HEAD (ffmpeg 8.1.1 — matches
-          # ffmpeg-next 8.1) + dropped `avutil` from the feature list.
+          # rc.67 hotfix: rc.66 failed with "no version database entry for
+          # vcpkg-tool-meson at 1.9.0#8". Root cause: the pre-installed
+          # vcpkg's working tree is at an older commit than my baseline
+          # references — its version database doesn't know about the version
+          # entries my baseline expects. Fix: add explicit `git fetch +
+          # reset --hard` step to bring local vcpkg to the same commit as my
+          # baseline (pinned to the most recent ffmpeg-port commit
+          # `ccab4e210c...`, 2026-05-08, which ships ffmpeg 8.1.1+cbs-backport).
           $manifest = @"
           {
             "name": "roomler-ffmpeg-pin",
@@ -299,7 +301,7 @@ jobs:
             "dependencies": [
               {"name": "ffmpeg", "features": ["avcodec", "swresample", "swscale", "nvcodec", "qsv", "amf", "libvpx"]}
             ],
-            "builtin-baseline": "e03dc9b29710050cd1018bc5674688108658d327"
+            "builtin-baseline": "ccab4e210cbfb237aab29423a63108958949ef3c"
           }
           "@
           $hash = (Get-FileHash -Algorithm SHA256 -InputStream ([IO.MemoryStream]::new([Text.Encoding]::UTF8.GetBytes($manifest)))).Hash.Substring(0, 12)
@@ -320,6 +322,33 @@ jobs:
             C:\ffmpeg-pin\vcpkg.json
           key: ${{ steps.ffmpeg_cache_key.outputs.key }}
 
+      - name: Update local vcpkg to match FFmpeg baseline
+        # rc.67 hotfix: the pre-installed vcpkg's working tree is at an older
+        # commit than my manifest baseline references. vcpkg's version DB
+        # depends on the working tree — entries my baseline expects (e.g.,
+        # vcpkg-tool-meson@1.9.0#8) don't exist in the older tree. Fix:
+        # fetch + reset --hard to bring local vcpkg up to the baseline commit.
+        # libvpx step's install is already in C:\vpx-pin\installed — separate
+        # tree, untouched by this checkout.
+        shell: pwsh
+        run: |
+          cd C:\vcpkg
+          # libvpx step already did fetch --tags / --unshallow, so origin
+          # is current. Reset to my chosen baseline.
+          git fetch origin
+          git reset --hard ccab4e210cbfb237aab29423a63108958949ef3c
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::Failed to checkout vcpkg to baseline ccab4e21. Either the commit doesn't exist on origin or git operations failed."
+            exit 1
+          }
+          # Re-bootstrap vcpkg.exe if it's missing (it gets blown away by
+          # `git reset --hard` if the commit predates the precompiled exe).
+          if (-not (Test-Path .\vcpkg.exe)) {
+            Write-Host "vcpkg.exe missing after reset — bootstrapping"
+            .\bootstrap-vcpkg.bat -disableMetrics
+          }
+          .\vcpkg.exe version
+
       - name: Build FFmpeg via vcpkg (encode-only HW backends)
         shell: pwsh
         run: |
@@ -332,7 +361,7 @@ jobs:
             Push-Location C:\ffmpeg-pin
             C:\vcpkg\vcpkg.exe install --triplet=x64-windows --x-install-root=C:\ffmpeg-pin\installed
             if ($LASTEXITCODE -ne 0) {
-              Write-Host "::error::vcpkg install ffmpeg failed — see logs above. rc.65 cannot proceed without this."
+              Write-Host "::error::vcpkg install ffmpeg failed — see logs above. rc.67 cannot proceed without this."
               exit 1
             }
             Pop-Location
