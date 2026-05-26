@@ -94,9 +94,26 @@
                   {{ a.is_online ? 'mdi-circle' : 'mdi-circle-outline' }}
                 </v-icon>
                 <span class="font-weight-medium">{{ a.name }}</span>
+                <v-btn
+                  :icon="copiedAgentId === a.id ? 'mdi-check' : 'mdi-content-copy'"
+                  size="x-small"
+                  variant="text"
+                  :color="copiedAgentId === a.id ? 'success' : undefined"
+                  class="ml-1"
+                  @click="copyAgentId(a.id)"
+                  :aria-label="`Copy agent ID for ${a.name}`"
+                  :title="copiedAgentId === a.id
+                    ? 'Copied!'
+                    : `Copy agent ID — use with \`roomler-tunnel forward --agent <id>\``"
+                />
               </div>
-              <div class="text-caption text-medium-emphasis">
-                {{ a.machine_id }}<span v-if="a.agent_version"> · v{{ a.agent_version }}</span>
+              <div class="text-caption text-medium-emphasis d-flex align-center flex-wrap">
+                <span class="agent-id-preview" :title="`Agent ID: ${a.id}`">
+                  id: {{ shortId(a.id) }}
+                </span>
+                <span class="mx-1">·</span>
+                <span :title="`machine_id: ${a.machine_id}`">{{ shortId(a.machine_id) }}</span>
+                <span v-if="a.agent_version"> · v{{ a.agent_version }}</span>
               </div>
             </td>
             <td>
@@ -175,13 +192,25 @@
                 {{ a.is_online ? 'mdi-circle' : 'mdi-circle-outline' }}
               </v-icon>
               <span class="font-weight-medium">{{ a.name }}</span>
+              <v-btn
+                :icon="copiedAgentId === a.id ? 'mdi-check' : 'mdi-content-copy'"
+                size="x-small"
+                variant="text"
+                :color="copiedAgentId === a.id ? 'success' : undefined"
+                class="ml-1"
+                @click="copyAgentId(a.id)"
+                :aria-label="`Copy agent ID for ${a.name}`"
+                :title="copiedAgentId === a.id ? 'Copied!' : 'Copy agent ID'"
+              />
               <v-spacer />
               <v-chip size="x-small" :color="statusColor(a)" variant="flat">
                 {{ a.is_online ? 'Online' : a.status }}
               </v-chip>
             </div>
             <div class="text-caption text-medium-emphasis mb-2">
-              {{ a.machine_id }}
+              <span :title="`Agent ID: ${a.id}`">id: {{ shortId(a.id) }}</span>
+              <span class="mx-1">·</span>
+              <span :title="`machine_id: ${a.machine_id}`">{{ shortId(a.machine_id) }}</span>
             </div>
             <div class="d-flex flex-wrap gap-1 mb-2">
               <v-chip
@@ -352,6 +381,13 @@ const enrollToken = ref<EnrollmentToken | null>(null)
 const enrollError = ref<string | null>(null)
 const copied = ref(false)
 
+// Per-row copy-feedback for the agent-id copy button. Holds the id
+// of the last-copied agent for 2 s so the row's mdi-content-copy
+// icon swaps to mdi-check (and back) without us having to thread
+// state through each row.
+const copiedAgentId = ref<string | null>(null)
+let copiedAgentIdTimer: ReturnType<typeof setTimeout> | null = null
+
 const deleteDialogOpen = ref(false)
 const deleteTarget = ref<Agent | null>(null)
 const deleting = ref(false)
@@ -437,6 +473,48 @@ async function copyTokenToClipboard() {
   } catch {
     // ignore — user can copy manually
   }
+}
+
+/**
+ * Copy an agent's hex ObjectId to the clipboard so the operator can
+ * paste it into `roomler-tunnel forward --agent <hex>` (or any other
+ * CLI / API call that needs the agent identifier).
+ *
+ * Surfaces transient success state via [`copiedAgentId`] for 2 s —
+ * the row's copy button swaps to mdi-check during that window.
+ *
+ * Best-effort: a clipboard-write failure is logged but otherwise
+ * silently swallowed; the operator can fall back to copying from
+ * the tooltip (the full id is rendered in the row's `title`
+ * attribute, so a long-hover surfaces it natively).
+ */
+async function copyAgentId(id: string) {
+  try {
+    await navigator.clipboard.writeText(id)
+    copiedAgentId.value = id
+    if (copiedAgentIdTimer !== null) {
+      clearTimeout(copiedAgentIdTimer)
+    }
+    copiedAgentIdTimer = setTimeout(() => {
+      copiedAgentId.value = null
+      copiedAgentIdTimer = null
+    }, 2000)
+  } catch (err) {
+    console.warn('copyAgentId: clipboard write failed', err)
+  }
+}
+
+/**
+ * Truncate a hex id to a 6-char prefix + ellipsis for inline display.
+ * The full id is always available via the cell's `title` attribute
+ * (long-press / hover tooltip) and the Copy button puts the full
+ * value on the clipboard. Inline truncation keeps the Agents table
+ * from blowing past the Actions column on mid-width viewports.
+ */
+function shortId(id: string): string {
+  if (!id) return '—'
+  if (id.length <= 8) return id
+  return `${id.slice(0, 6)}…`
 }
 
 function confirmDelete(a: Agent) {
