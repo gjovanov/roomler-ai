@@ -279,6 +279,7 @@ impl Hub {
         permissions: Permissions,
         browser_caps: Vec<String>,
         preferred_transport: Option<String>,
+        chroma_pref: Option<String>,
     ) -> Result<ObjectId> {
         let agent_org = {
             let mut agent = self
@@ -323,6 +324,7 @@ impl Hub {
             consent_timeout_secs: DEFAULT_CONSENT_TIMEOUT.as_secs() as u32,
             browser_caps,
             preferred_transport,
+            chroma_pref,
         });
 
         self.audit(session_id, agent_id, agent_org, AuditKind::SessionRequested);
@@ -601,6 +603,7 @@ impl Hub {
                     permissions,
                     browser_caps,
                     preferred_transport,
+                    chroma_pref,
                 },
             ) => {
                 // Forward browser codec caps verbatim to the agent in
@@ -622,6 +625,7 @@ impl Hub {
                     permissions,
                     browser_caps,
                     preferred_transport,
+                    chroma_pref,
                 )?;
                 Ok(())
             }

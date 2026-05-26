@@ -827,6 +827,25 @@
               Low-Latency {{ webcodecsOn ? 'ON' : 'OFF' }}
             </v-btn>
           </div>
+          <!-- rc.62 — VP9 chroma format dropdown. Only meaningful when
+               Crystal-Clear is ON (data-channel-vp9-444). 'Auto' lets
+               the agent decide via its `ROOMLER_AGENT_VP9_CHROMA` env
+               var; 'High quality' forces 4:4:4 (sharpest text on small
+               ClearType, ~1.5× bandwidth); 'Standard' forces 4:2:0
+               (~30% lower bandwidth, slight ClearType softening).
+               Takes effect on next Connect. -->
+          <v-select
+            v-model="vp9Chroma"
+            :items="vp9ChromaOptions"
+            :disabled="!vp9_444On"
+            density="compact"
+            hide-details
+            variant="outlined"
+            prepend-inner-icon="mdi-format-color-fill"
+            label="VP9 chroma (Crystal-Clear)"
+            :hint="vp9ChromaHint"
+            persistent-hint
+          />
           <!-- Connected-only tools. Hidden when no session is live —
                the underlying DCs are closed so the actions would
                silently fail. Each is a full-width button so it's
@@ -1794,6 +1813,36 @@ function toggleVp9_444() {
   const next: RcVideoTransport = vp9_444On.value ? 'webrtc' : 'data-channel-vp9-444'
   rc.setVideoTransport(next)
 }
+
+// rc.62: VP9 chroma format dropdown. Selecting 'yuv420' or 'yuv444'
+// sends `chroma_pref` in the next `rc:session.request`; the agent's
+// VP9-444 encoder uses that instead of its env-var default. 'auto'
+// (the default) omits the field so the agent picks its own default.
+// Takes effect on Connect — mid-session encoder profile changes are
+// disruptive (full encoder rebuild + browser VideoDecoder.configure()
+// re-call) and deferred to a future rc.
+const vp9ChromaOptions = [
+  { title: 'Auto (agent default)', value: 'auto' },
+  { title: '4:4:4 — High quality (sharp text, ~1.5× bandwidth)', value: 'yuv444' },
+  { title: '4:2:0 — Standard (lower bandwidth, slight text softening)', value: 'yuv420' },
+] as const
+
+const vp9Chroma = computed<'auto' | 'yuv420' | 'yuv444'>({
+  get: () => rc.vp9Chroma.value,
+  set: (v) => rc.setVp9Chroma(v),
+})
+
+const vp9ChromaHint = computed<string>(() => {
+  if (!vp9_444On.value) return 'Enable Crystal-Clear first'
+  switch (vp9Chroma.value) {
+    case 'yuv420':
+      return 'VP9 profile 0 — ~30% lower bandwidth than 4:4:4. Takes effect on next Connect.'
+    case 'yuv444':
+      return 'VP9 profile 1 — sharpest text. Takes effect on next Connect.'
+    default:
+      return 'Agent picks (env var ROOMLER_AGENT_VP9_CHROMA — defaults to 4:4:4)'
+  }
+})
 /** Bind callback for the webcodecs canvas ref. Vue calls this with
  *  the element (or null on unmount) — we forward to the composable's
  *  writable canvas ref so `pc.ontrack` can see it. */
