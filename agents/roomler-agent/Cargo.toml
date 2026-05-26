@@ -285,6 +285,28 @@ full-hw = ["full", "mf-encoder", "wgc-capture", "viewer-indicator"]
 # openh264-encoder,clipboard` (no scrap, no enigo, no WGC).
 synthetic-frame-source = []
 
+# Option B HEVC plan (rc.64+). Enables the FFmpeg-based encoder
+# backend in `src/encode/ffmpeg/` that bypasses Windows Media Foundation
+# entirely and routes HEVC + H.264 + VP9 through vendor HW encoders
+# (NVENC, Intel QSV / oneVPL, AMD AMF) via `ffmpeg-next`. Closes the
+# RTX 5090 Blackwell MF regression (Known Issues: ActivateObject
+# 0x8000FFFF) and the Iris Xe Tiger Lake async-MFT gap, plus unlocks
+# HW VP9 on Intel iGPUs (`vp9_qsv` — unavailable via MF).
+#
+# rc.64 ships THIS FEATURE FLAG ONLY — no `ffmpeg-next` dep, no CI
+# vcpkg plumbing, no encoder code. The stub `src/encode/ffmpeg/mod.rs`
+# compiles to `pub fn available() -> bool { false }`. Safe back-out is
+# `git revert` of one commit.
+#
+# rc.65 wires the vcpkg port at `vcpkg-ports/ffmpeg-roomler/` into
+# `release-agent.yml`, adds `ffmpeg-next` + `ffmpeg-sys-next` deps,
+# and verifies the binding version pair compiles against FFmpeg 7.x
+# with `hevc_qsv` / `vp9_qsv` symbols reachable. MSI size delta is
+# measured; >+8 MB compressed = HARD STOP and re-plan.
+#
+# Phased rollout documented in `docs/hevc-dc-plan.md`.
+ffmpeg-encoder = []
+
 # M3 A1 — SYSTEM-context capture+input on the secure desktop. Lets
 # the perMachine MSI deployment drive the Windows lock screen / UAC
 # prompt by spawning a worker via stolen winlogon.exe primary-token

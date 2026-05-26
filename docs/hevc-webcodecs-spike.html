@@ -1,0 +1,404 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Roomler HEVC WebCodecs Pre-flight Spike</title>
+  <style>
+    body { font-family: ui-sans-serif, system-ui, sans-serif; background: #0e1116; color: #e6edf3; margin: 0; padding: 24px; line-height: 1.5; }
+    h1 { margin: 0 0 8px; font-size: 22px; }
+    h2 { margin: 24px 0 8px; font-size: 16px; color: #7ee2ff; border-bottom: 1px solid #2a3340; padding-bottom: 4px; }
+    .row { display: flex; gap: 24px; flex-wrap: wrap; align-items: flex-start; }
+    .panel { background: #161b22; border: 1px solid #2a3340; border-radius: 6px; padding: 16px; flex: 1 1 360px; min-width: 320px; }
+    .ok { color: #5cdb5c; font-weight: 600; }
+    .fail { color: #ff6b6b; font-weight: 600; }
+    .warn { color: #f0c674; font-weight: 600; }
+    pre, code { font-family: ui-monospace, "JetBrains Mono", Consolas, monospace; font-size: 12px; }
+    pre { background: #0b0f14; padding: 10px; border-radius: 4px; overflow-x: auto; white-space: pre-wrap; word-break: break-all; }
+    table { border-collapse: collapse; width: 100%; margin: 8px 0; }
+    td, th { padding: 6px 10px; border-bottom: 1px solid #2a3340; text-align: left; vertical-align: top; }
+    th { color: #7ee2ff; font-weight: 600; font-size: 13px; }
+    button { background: #1f6feb; color: white; border: 0; padding: 8px 16px; border-radius: 4px; cursor: pointer; font-size: 14px; font-weight: 600; }
+    button:hover { background: #2978f0; }
+    button:disabled { background: #2a3340; color: #6e7681; cursor: not-allowed; }
+    canvas { background: #000; border: 1px solid #2a3340; border-radius: 4px; image-rendering: pixelated; }
+    #verdict { font-size: 20px; font-weight: 700; padding: 16px; border-radius: 6px; margin-top: 16px; text-align: center; }
+    #verdict.go { background: #0f4a14; color: #5cdb5c; }
+    #verdict.nogo { background: #4a0f14; color: #ff6b6b; }
+    #verdict.partial { background: #4a3a0f; color: #f0c674; }
+    .small { font-size: 12px; color: #8b949e; }
+  </style>
+</head>
+<body>
+
+<h1>Roomler HEVC WebCodecs Pre-flight Spike</h1>
+<p class="small">
+  GO/NO-GO gate for the Option B (ffmpeg-next) HEVC-over-DataChannel plan.
+  This page generates HEVC bytes in-browser via <code>VideoEncoder</code>, then attempts to decode them
+  via <code>VideoDecoder</code>. Tests both Annex-B (no description) and length-prefixed (hvcC, with description) paths.
+</p>
+
+<div class="row">
+  <div class="panel">
+    <h2>1. Browser capability probe</h2>
+    <table id="capTable">
+      <thead><tr><th>Check</th><th>Result</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <div class="panel">
+    <h2>2. Test controls</h2>
+    <button id="runBtn">Run full round-trip test</button>
+    <p class="small" id="runHint">Generates 30 frames (1s @ 30fps), encodes as HEVC, decodes back, renders.</p>
+  </div>
+</div>
+
+<div class="row" style="margin-top: 16px;">
+  <div class="panel">
+    <h2>3. Source frame (input to encoder)</h2>
+    <canvas id="srcCanvas" width="640" height="360"></canvas>
+  </div>
+  <div class="panel">
+    <h2>4. Decoded frame (output from decoder)</h2>
+    <canvas id="dstCanvas" width="640" height="360"></canvas>
+    <p class="small">Should match the source. Mismatch = decoder didn't accept the encoder's bytes.</p>
+  </div>
+</div>
+
+<h2>5. Test log</h2>
+<pre id="log"></pre>
+
+<h2>6. First IDR bytes (hex dump)</h2>
+<pre id="idrDump">(no encode yet)</pre>
+
+<h2>7. Verdict</h2>
+<div id="verdict">(run the test)</div>
+
+<script type="module">
+const $log = document.getElementById('log');
+const $verdict = document.getElementById('verdict');
+const $idrDump = document.getElementById('idrDump');
+const $capBody = document.querySelector('#capTable tbody');
+const $runBtn = document.getElementById('runBtn');
+const $srcCanvas = document.getElementById('srcCanvas');
+const $dstCanvas = document.getElementById('dstCanvas');
+
+function log(msg, cls = '') {
+  const span = cls ? `<span class="${cls}">${msg}</span>` : msg;
+  $log.innerHTML += span + '\n';
+  $log.scrollTop = $log.scrollHeight;
+  console.log(msg);
+}
+
+function addCap(name, ok, detail) {
+  const tr = document.createElement('tr');
+  const status = ok === true ? '<span class="ok">PASS</span>' : ok === false ? '<span class="fail">FAIL</span>' : '<span class="warn">SKIP</span>';
+  tr.innerHTML = `<td>${name}</td><td>${status}${detail ? ' &mdash; <code>' + detail + '</code>' : ''}</td>`;
+  $capBody.appendChild(tr);
+}
+
+function hexDump(bytes, max = 80) {
+  const slice = bytes.slice(0, max);
+  let out = '';
+  for (let i = 0; i < slice.length; i += 16) {
+    const row = slice.slice(i, i + 16);
+    const hex = Array.from(row).map(b => b.toString(16).padStart(2, '0')).join(' ');
+    out += hex.padEnd(48) + '\n';
+  }
+  if (bytes.length > max) out += `... (${bytes.length - max} more bytes, total ${bytes.length})\n`;
+  return out;
+}
+
+function findStartCodes(bytes) {
+  const positions = [];
+  for (let i = 0; i < bytes.length - 3; i++) {
+    if (bytes[i] === 0 && bytes[i + 1] === 0) {
+      if (bytes[i + 2] === 1) { positions.push({ pos: i, len: 3 }); }
+      else if (bytes[i + 2] === 0 && bytes[i + 3] === 1) { positions.push({ pos: i, len: 4 }); i += 1; }
+    }
+  }
+  return positions;
+}
+
+function nalTypeName(t) {
+  const names = {
+    0: 'TRAIL_N', 1: 'TRAIL_R', 19: 'IDR_W_RADL', 20: 'IDR_N_LP', 21: 'CRA',
+    32: 'VPS', 33: 'SPS', 34: 'PPS', 35: 'AUD', 39: 'PREFIX_SEI'
+  };
+  return names[t] || `type-${t}`;
+}
+
+async function probeCapabilities() {
+  log('--- Probing capabilities ---');
+
+  if (typeof VideoEncoder === 'undefined') {
+    addCap('WebCodecs VideoEncoder available', false);
+    log('VideoEncoder is undefined — WebCodecs unsupported.', 'fail');
+    return { decode: false, encode: false };
+  }
+  addCap('WebCodecs VideoEncoder available', true);
+
+  if (typeof VideoDecoder === 'undefined') {
+    addCap('WebCodecs VideoDecoder available', false);
+    return { decode: false, encode: false };
+  }
+  addCap('WebCodecs VideoDecoder available', true);
+
+  // Decoder probes
+  const decoderCodecs = [
+    'hev1.1.6.L93.B0',   // Main Profile, Level 3.1 (1080p) — Roomler's most likely
+    'hev1.1.6.L120.90',  // Main Profile, Level 4.0 (4K-ish)
+    'hev1.1.6.L150.90',  // Main Profile, Level 5.0 (4K60)
+    'hvc1.1.6.L93.B0',   // Same as hev1 but expects hvcC-style framing
+  ];
+  let anyDecode = false;
+  for (const codec of decoderCodecs) {
+    try {
+      const r = await VideoDecoder.isConfigSupported({ codec });
+      addCap(`VideoDecoder.isConfigSupported({codec:'${codec}'})`, r.supported, r.supported ? 'supported' : 'unsupported');
+      if (r.supported) anyDecode = true;
+    } catch (e) {
+      addCap(`VideoDecoder.isConfigSupported({codec:'${codec}'})`, false, e.message);
+    }
+  }
+
+  // Encoder probes
+  const encoderConfigs = [
+    { codec: 'hev1.1.6.L93.B0', width: 640, height: 360, bitrate: 2_000_000, framerate: 30, hevc: { format: 'annexb' } },
+    { codec: 'hev1.1.6.L93.B0', width: 640, height: 360, bitrate: 2_000_000, framerate: 30 }, // default format (usually avcc/hvcc)
+    { codec: 'hvc1.1.6.L93.B0', width: 640, height: 360, bitrate: 2_000_000, framerate: 30 },
+  ];
+  let anyEncode = false;
+  let workingEncoderConfig = null;
+  for (const cfg of encoderConfigs) {
+    try {
+      const r = await VideoEncoder.isConfigSupported(cfg);
+      const label = `VideoEncoder.isConfigSupported(${cfg.hevc ? 'annexb' : cfg.codec.startsWith('hvc1') ? 'hvc1' : 'default'})`;
+      addCap(label, r.supported, r.supported ? 'supported' : 'unsupported');
+      if (r.supported && !workingEncoderConfig) {
+        workingEncoderConfig = r.config || cfg;
+        anyEncode = true;
+      }
+    } catch (e) {
+      addCap(`VideoEncoder.isConfigSupported(${cfg.codec})`, false, e.message);
+    }
+  }
+
+  return { decode: anyDecode, encode: anyEncode, encoderConfig: workingEncoderConfig };
+}
+
+function drawSourceFrame(ctx, frameNum) {
+  // Static gradient + moving box. Real-looking content with sharp edges (text).
+  const g = ctx.createLinearGradient(0, 0, 640, 360);
+  g.addColorStop(0, '#1e3a8a');
+  g.addColorStop(1, '#7c2d92');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, 640, 360);
+
+  // Text — tests chroma fidelity
+  ctx.fillStyle = '#ffffff';
+  ctx.font = 'bold 32px monospace';
+  ctx.fillText('HEVC WebCodecs', 80, 80);
+  ctx.font = '20px monospace';
+  ctx.fillText(`Frame #${frameNum.toString().padStart(3, '0')}`, 80, 120);
+  ctx.fillText('Roomler pre-flight', 80, 150);
+
+  // Moving rectangle
+  const x = 60 + ((frameNum * 18) % 480);
+  ctx.fillStyle = '#fbbf24';
+  ctx.fillRect(x, 200, 80, 80);
+
+  // Test pattern — chroma resolution
+  for (let i = 0; i < 8; i++) {
+    ctx.fillStyle = `hsl(${i * 45}, 80%, 50%)`;
+    ctx.fillRect(80 + i * 60, 300, 50, 50);
+  }
+}
+
+async function runTest() {
+  $runBtn.disabled = true;
+  $log.textContent = '';
+  $verdict.className = '';
+  $verdict.textContent = 'Running…';
+
+  const caps = await probeCapabilities();
+
+  if (!caps.decode) {
+    $verdict.className = 'nogo';
+    $verdict.textContent = 'NO-GO — VideoDecoder does not support any HEVC codec string.';
+    log('Browser has no HEVC decode capability. Option B HEVC plan is not viable for this browser.', 'fail');
+    $runBtn.disabled = false;
+    return;
+  }
+
+  if (!caps.encode) {
+    $verdict.className = 'partial';
+    $verdict.textContent = 'PARTIAL — Decoder supports HEVC, but encoder does not. Cannot self-test round-trip.';
+    log('VideoEncoder cannot produce HEVC in this browser. The decode side may still work for real agent-encoded bytes.', 'warn');
+    log('Roomler agent encodes HEVC server-side via FFmpeg; the browser only decodes. The decoder probe passing is the load-bearing signal.', 'warn');
+    $runBtn.disabled = false;
+    return;
+  }
+
+  log(`Using encoder config: ${JSON.stringify(caps.encoderConfig)}`);
+
+  // Set up encoder
+  const chunks = [];
+  let firstChunkMeta = null;
+  const encoder = new VideoEncoder({
+    output: (chunk, meta) => {
+      const buf = new Uint8Array(chunk.byteLength);
+      chunk.copyTo(buf);
+      chunks.push({ buf, type: chunk.type, timestamp: chunk.timestamp, meta });
+      if (!firstChunkMeta) firstChunkMeta = meta;
+    },
+    error: (e) => log(`Encoder error: ${e.message}`, 'fail'),
+  });
+  encoder.configure(caps.encoderConfig);
+  log(`Encoder configured. State: ${encoder.state}`);
+
+  // Generate + encode 30 frames
+  const srcCtx = $srcCanvas.getContext('2d');
+  for (let i = 0; i < 30; i++) {
+    drawSourceFrame(srcCtx, i);
+    const frame = new VideoFrame($srcCanvas, { timestamp: i * 33_333 });
+    encoder.encode(frame, { keyFrame: i === 0 });
+    frame.close();
+  }
+  await encoder.flush();
+  encoder.close();
+  log(`Encoded ${chunks.length} chunks. First chunk: ${chunks[0].type}, ${chunks[0].buf.length} bytes`);
+
+  // Inspect first chunk format
+  const firstIdr = chunks[0].buf;
+  $idrDump.textContent = hexDump(firstIdr);
+
+  const startCodes = findStartCodes(firstIdr);
+  const isAnnexB = startCodes.length > 0;
+  log(`First chunk has ${startCodes.length} Annex-B start codes — format is ${isAnnexB ? 'Annex-B' : 'length-prefixed (hvcC)'}`);
+
+  if (isAnnexB && startCodes.length >= 3) {
+    log('Annex-B framing confirmed. NAL units in IDR:');
+    for (const sc of startCodes.slice(0, 5)) {
+      const nalHeader = firstIdr[sc.pos + sc.len];
+      const nalType = (nalHeader >> 1) & 0x3F;
+      log(`  pos ${sc.pos} (${sc.len}-byte start): NAL type ${nalType} (${nalTypeName(nalType)})`);
+    }
+  }
+
+  if (firstChunkMeta && firstChunkMeta.decoderConfig && firstChunkMeta.decoderConfig.description) {
+    const desc = new Uint8Array(firstChunkMeta.decoderConfig.description);
+    log(`Encoder produced decoderConfig.description (hvcC box?), ${desc.length} bytes: ${Array.from(desc.slice(0, 20)).map(b => b.toString(16).padStart(2, '0')).join(' ')}...`);
+  } else {
+    log('Encoder did NOT produce a decoderConfig.description (Annex-B mode).');
+  }
+
+  // Now try to decode WITHOUT description (the Roomler DC path)
+  log('--- Testing DECODE WITHOUT description ---');
+  let decodedFrames = 0;
+  let decoderConfig1Worked = false;
+  let decoderError1 = null;
+
+  await new Promise((resolve) => {
+    const decoder = new VideoDecoder({
+      output: (frame) => {
+        const ctx = $dstCanvas.getContext('2d');
+        ctx.drawImage(frame, 0, 0, 640, 360);
+        frame.close();
+        decodedFrames++;
+        if (decodedFrames === 1) log(`First frame decoded ✓`, 'ok');
+      },
+      error: (e) => {
+        if (!decoderError1) {
+          decoderError1 = e.message;
+          log(`Decoder error (no description): ${e.message}`, 'fail');
+          resolve();
+        }
+      },
+    });
+
+    try {
+      decoder.configure({ codec: caps.encoderConfig.codec });
+      decoderConfig1Worked = true;
+      log(`Decoder configured with codec='${caps.encoderConfig.codec}', no description`);
+    } catch (e) {
+      log(`Decoder configure failed: ${e.message}`, 'fail');
+      resolve();
+      return;
+    }
+
+    for (const c of chunks) {
+      decoder.decode(new EncodedVideoChunk({ type: c.type, timestamp: c.timestamp, data: c.buf }));
+    }
+    decoder.flush().then(() => {
+      decoder.close();
+      resolve();
+    }).catch((e) => {
+      log(`Flush error: ${e.message}`, 'fail');
+      resolve();
+    });
+  });
+
+  const noDescResult = decodedFrames > 0;
+  log(`No-description path: ${noDescResult ? `OK (${decodedFrames}/30 frames decoded)` : 'FAILED'}`, noDescResult ? 'ok' : 'fail');
+
+  // Try WITH description if encoder produced one
+  let withDescResult = false;
+  if (firstChunkMeta && firstChunkMeta.decoderConfig) {
+    log('--- Testing DECODE WITH description from encoder ---');
+    decodedFrames = 0;
+    await new Promise((resolve) => {
+      const decoder2 = new VideoDecoder({
+        output: (frame) => { decodedFrames++; frame.close(); },
+        error: (e) => { log(`Decoder2 error: ${e.message}`, 'fail'); resolve(); },
+      });
+      try {
+        decoder2.configure(firstChunkMeta.decoderConfig);
+        log(`Decoder2 configured with encoder's full decoderConfig`);
+      } catch (e) {
+        log(`Decoder2 configure failed: ${e.message}`, 'fail');
+        resolve();
+        return;
+      }
+      for (const c of chunks) {
+        decoder2.decode(new EncodedVideoChunk({ type: c.type, timestamp: c.timestamp, data: c.buf }));
+      }
+      decoder2.flush().then(() => {
+        decoder2.close();
+        withDescResult = decodedFrames > 0;
+        log(`With-description path: ${withDescResult ? `OK (${decodedFrames}/30 frames decoded)` : 'FAILED'}`, withDescResult ? 'ok' : 'fail');
+        resolve();
+      }).catch(() => resolve());
+    });
+  }
+
+  // Verdict
+  log('--- VERDICT ---');
+  if (noDescResult && isAnnexB) {
+    $verdict.className = 'go';
+    $verdict.textContent = 'GO — Browser accepts Annex-B HEVC without description. Roomler DC framing plan is valid.';
+    log('Recommended Roomler design: agent emits Annex-B (00 00 00 01 framed) HEVC bytes over DataChannel; worker calls VideoDecoder.configure({codec:\'hev1.1.6.L93.B0\'}) with no description field.', 'ok');
+  } else if (withDescResult) {
+    $verdict.className = 'partial';
+    $verdict.textContent = 'PARTIAL — Annex-B no-description rejected; with-description works. Roomler needs to send hvcC description.';
+    log('Recommended Roomler design: agent must extract VPS/SPS/PPS, build hvcC box, send as separate metadata channel OR length-prefix every chunk. Worker passes description to VideoDecoder.configure().', 'warn');
+  } else {
+    $verdict.className = 'nogo';
+    $verdict.textContent = 'NO-GO — Decoder cannot decode this browser\'s own HEVC output. HEVC plan needs deeper investigation.';
+    log('This is unexpected; usually the same browser\'s encoder + decoder work together. Likely browser bug or driver issue.', 'fail');
+  }
+
+  $runBtn.disabled = false;
+}
+
+// User-agent banner
+const ua = navigator.userAgent;
+log(`User agent: ${ua}`);
+log(`Platform: ${navigator.platform || 'unknown'}`);
+log('Click "Run full round-trip test" to begin.');
+
+$runBtn.addEventListener('click', runTest);
+</script>
+
+</body>
+</html>
