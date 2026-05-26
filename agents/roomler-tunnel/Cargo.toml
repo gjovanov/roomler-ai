@@ -54,6 +54,16 @@ webrtc = { workspace = true }
 # Random fallback for machine_id
 rand = { workspace = true }
 
+# rc.66: raw socket access for `setsockopt(SO_SNDBUF)` on the local
+# listener's accepted TcpStream. Tokio re-exports tcp socket helpers
+# but `set_send_buffer_size` isn't a stable public method on
+# `tokio::net::TcpStream`; the canonical async-Rust pattern is to
+# borrow a `socket2::SockRef` from the tokio socket and call
+# `set_send_buffer_size` on that. The crate is already a transitive
+# dep (vendored webrtc-data pulls it in), so adding it as a direct
+# dep is zero extra build cost.
+socket2 = "0.5"
+
 [dev-dependencies]
 tokio-test = { workspace = true }
 tempfile = { workspace = true }

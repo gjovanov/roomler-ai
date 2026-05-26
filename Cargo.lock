@@ -6419,7 +6419,11 @@ dependencies = [
 
 [[package]]
 name = "roomler-agent"
+<<<<<<< Updated upstream
 version = "0.3.0-rc.68"
+=======
+version = "0.3.0-rc.66"
+>>>>>>> Stashed changes
 dependencies = [
  "anyhow",
  "arboard",
@@ -6467,7 +6471,11 @@ dependencies = [
 
 [[package]]
 name = "roomler-agent-tray"
+<<<<<<< Updated upstream
 version = "0.3.0-rc.68"
+=======
+version = "0.3.0-rc.66"
+>>>>>>> Stashed changes
 dependencies = [
  "anyhow",
  "gethostname 0.5.0",
@@ -6486,7 +6494,11 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-api"
+<<<<<<< Updated upstream
 version = "0.3.0-rc.68"
+=======
+version = "0.3.0-rc.66"
+>>>>>>> Stashed changes
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6528,7 +6540,11 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-config"
+<<<<<<< Updated upstream
 version = "0.3.0-rc.68"
+=======
+version = "0.3.0-rc.66"
+>>>>>>> Stashed changes
 dependencies = [
  "config",
  "serde",
@@ -6537,7 +6553,11 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-db"
+<<<<<<< Updated upstream
 version = "0.3.0-rc.68"
+=======
+version = "0.3.0-rc.66"
+>>>>>>> Stashed changes
 dependencies = [
  "bson",
  "chrono",
@@ -6552,7 +6572,11 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-remote-control"
+<<<<<<< Updated upstream
 version = "0.3.0-rc.68"
+=======
+version = "0.3.0-rc.66"
+>>>>>>> Stashed changes
 dependencies = [
  "base64 0.22.1",
  "bitflags 2.11.1",
@@ -6572,7 +6596,11 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-services"
+<<<<<<< Updated upstream
 version = "0.3.0-rc.68"
+=======
+version = "0.3.0-rc.66"
+>>>>>>> Stashed changes
 dependencies = [
  "anyhow",
  "argon2",
@@ -6613,7 +6641,11 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-tests"
+<<<<<<< Updated upstream
 version = "0.3.0-rc.68"
+=======
+version = "0.3.0-rc.66"
+>>>>>>> Stashed changes
 dependencies = [
  "anyhow",
  "axum",
@@ -6644,7 +6676,11 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-tunnel-core"
+<<<<<<< Updated upstream
 version = "0.3.0-rc.68"
+=======
+version = "0.3.0-rc.66"
+>>>>>>> Stashed changes
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6664,7 +6700,11 @@ dependencies = [
 
 [[package]]
 name = "roomler-installer"
+<<<<<<< Updated upstream
 version = "0.3.0-rc.68"
+=======
+version = "0.3.0-rc.66"
+>>>>>>> Stashed changes
 dependencies = [
  "anyhow",
  "directories",
@@ -6691,7 +6731,11 @@ dependencies = [
 
 [[package]]
 name = "roomler-tunnel"
+<<<<<<< Updated upstream
 version = "0.3.0-rc.68"
+=======
+version = "0.3.0-rc.66"
+>>>>>>> Stashed changes
 dependencies = [
  "anyhow",
  "bson",
@@ -6706,6 +6750,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "socket2 0.5.10",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -6719,7 +6764,11 @@ dependencies = [
 
 [[package]]
 name = "roomler-tunnel-installer"
+<<<<<<< Updated upstream
 version = "0.3.0-rc.68"
+=======
+version = "0.3.0-rc.66"
+>>>>>>> Stashed changes
 dependencies = [
  "anyhow",
  "base64 0.22.1",

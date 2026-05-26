@@ -326,6 +326,35 @@ pub async fn run(cfg: TunnelConfig, agent_hex: &str, local: u16, remote: &str) -
         if let Err(e) = tcp.set_nodelay(true) {
             warn!(%peer_addr, %e, "set_nodelay(true) on local TCP failed");
         }
+        // rc.66 throughput follow-on: bump SO_SNDBUF on the accepted
+        // loopback socket from the OS default (Windows: 64 KiB-ish,
+        // can be as low as 8 KiB on some kernels) to 4 MiB. Windows
+        // loopback under TDS bulk-read fills the default send buffer
+        // in milliseconds; once full, every `write_all` in
+        // `pump_dc_to_tcp` blocks waiting for the local app to read,
+        // and that backpressures all the way up the chain. A 4 MiB
+        // ceiling absorbs the burst so the producer can keep pumping
+        // while the consumer drains. Best-effort: Windows may cap
+        // below 4 MiB silently (autotune); the actual ceiling is
+        // observable via `getsockopt` if needed, but the request
+        // alone is enough to lift the floor.
+        //
+        // Uses `socket2` indirectly via `tokio::net::TcpStream::set_send_buffer_size`
+        // when available; pre-1.41 tokio paths fall back through
+        // `as_raw_socket` / `WSAIoctl` on Windows. We're on tokio 1.x
+        // recent enough that `set_send_buffer_size` is exposed.
+        const LOCAL_SNDBUF_BYTES: u32 = 4 * 1024 * 1024;
+        // tokio 1.41+ has TcpStream::set_send_buffer_size returning
+        // io::Result; older versions don't. Use a feature-detected
+        // import path: socket2 on the raw fd/socket is portable.
+        #[cfg(any(unix, windows))]
+        {
+            use socket2::SockRef;
+            let sock = SockRef::from(&tcp);
+            if let Err(e) = sock.set_send_buffer_size(LOCAL_SNDBUF_BYTES as usize) {
+                warn!(%peer_addr, %e, "set_send_buffer_size(4MiB) on local TCP failed");
+            }
+        }
         debug!(%peer_addr, "accepted local TCP connection");
 
         let flow_id = flow_counter.fetch_add(1, Ordering::Relaxed);
