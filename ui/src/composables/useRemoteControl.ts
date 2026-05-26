@@ -508,6 +508,33 @@ export type RcVideoTransport = 'webrtc' | 'data-channel-vp9-444'
 
 const VIDEO_TRANSPORT_STORAGE_KEY = 'roomler-rc-video-transport'
 
+/** rc.62 — localStorage key for the per-browser VP9 chroma preference.
+ *  Recognised values: `'auto'` (let the agent decide via env var),
+ *  `'yuv420'` (VP9 profile 0, ~30% lower bandwidth), `'yuv444'`
+ *  (VP9 profile 1, sharpest text). Default `'auto'` keeps rc.61
+ *  behaviour for browsers that don't see the dropdown yet. */
+const VP9_CHROMA_STORAGE_KEY = 'roomler-rc-vp9-chroma'
+
+export type Vp9ChromaPref = 'auto' | 'yuv420' | 'yuv444'
+
+function readStoredVp9Chroma(): Vp9ChromaPref {
+  try {
+    const raw = globalThis.localStorage?.getItem(VP9_CHROMA_STORAGE_KEY)
+    if (raw === 'yuv420' || raw === 'yuv444' || raw === 'auto') return raw
+  } catch {
+    /* privacy mode → default */
+  }
+  return 'auto'
+}
+
+function persistVp9Chroma(c: Vp9ChromaPref) {
+  try {
+    globalThis.localStorage?.setItem(VP9_CHROMA_STORAGE_KEY, c)
+  } catch {
+    /* best-effort */
+  }
+}
+
 function readStoredVideoTransport(): RcVideoTransport {
   try {
     const raw = globalThis.localStorage?.getItem(VIDEO_TRANSPORT_STORAGE_KEY)
@@ -920,6 +947,13 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    *  agent reads `preferred_transport` and intersects it with its
    *  own `AgentCaps.transports`. Persisted per-browser. */
   const videoTransport = ref<RcVideoTransport>(readStoredVideoTransport())
+  /** rc.62 — VP9 chroma preference (per-browser, persisted). When set
+   *  to `'yuv420'` or `'yuv444'` the value is sent as `chroma_pref` in
+   *  the `rc:session.request` payload; the agent's VP9-444 encoder
+   *  uses it instead of its `ROOMLER_AGENT_VP9_CHROMA` env var. When
+   *  `'auto'` (default), the field is omitted and the agent uses its
+   *  own configured default. */
+  const vp9Chroma = ref<Vp9ChromaPref>(readStoredVp9Chroma())
   /** Whether VP9 profile 1 (8-bit 4:4:4) decode is supported on this
    *  browser. Resolved asynchronously by `isVp9_444DecodeSupported()`
    *  in `connect()` (and re-checked once on first composable use, so
@@ -1389,6 +1423,16 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     persistVideoTransport(t)
   }
 
+  /** rc.62 — switch VP9 chroma preference. Only takes effect on the
+   *  next `connect()` — the choice is baked into the
+   *  `rc:session.request.chroma_pref` field. Older agents that don't
+   *  understand the field ignore it and fall back to their own
+   *  `ROOMLER_AGENT_VP9_CHROMA` default (= no-op). */
+  function setVp9Chroma(c: Vp9ChromaPref) {
+    vp9Chroma.value = c
+    persistVp9Chroma(c)
+  }
+
   /** Install the receiver transform EAGERLY (at pc.ontrack time) so
    *  Chrome routes encoded frames to the worker from the very first
    *  RTP packet. The worker decodes into a null sink until a canvas
@@ -1654,8 +1698,18 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // `'yuv444'` (default + pre-rc.61 agents) → profile 1
     // (`vp09.01.10.08`). Mismatch with the bitstream the agent
     // actually sends would leave the canvas blank.
-    const agentChroma = agent?.value?.capabilities?.vp9_chroma
-    const workerCodec = agentChroma === 'yuv420' ? 'vp09.00.10.08' : 'vp09.01.10.08'
+    //
+    // rc.62 — the user's `vp9Chroma` ref OVERRIDES the agent's
+    // advertised default when it's not `'auto'`. The same value was
+    // sent as `chroma_pref` in `rc:session.request`, so the agent
+    // emits the format we picked.
+    let effectiveChroma: string | undefined
+    if (vp9Chroma.value === 'yuv420' || vp9Chroma.value === 'yuv444') {
+      effectiveChroma = vp9Chroma.value
+    } else {
+      effectiveChroma = agent?.value?.capabilities?.vp9_chroma
+    }
+    const workerCodec = effectiveChroma === 'yuv420' ? 'vp09.00.10.08' : 'vp09.01.10.08'
 
     // Synthetic OffscreenCanvas — keeps the worker fully wired even
     // without a view-side canvas. Y.4 swaps in the visible canvas
@@ -2645,6 +2699,12 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     }
     if (preferredTransport) {
       requestPayload.preferred_transport = preferredTransport
+      // rc.62 — only meaningful with the data-channel-vp9-444
+      // transport. Omit when user picks `'auto'` (= let agent decide
+      // via its env var).
+      if (vp9Chroma.value !== 'auto') {
+        requestPayload.chroma_pref = vp9Chroma.value
+      }
     }
     ws.sendRaw(requestPayload)
   }
@@ -4299,6 +4359,12 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     mediaIntrinsicH,
     videoTransport,
     setVideoTransport,
+    /** rc.62 — user's VP9 chroma preference ('auto' | 'yuv420' |
+     *  'yuv444'). Drives the `chroma_pref` field of
+     *  `rc:session.request` AND the vp9-444 worker's codec string
+     *  selection. */
+    vp9Chroma,
+    setVp9Chroma,
     vp9_444Supported,
     vp9_444Active,
     vp9_444FramesDecoded,

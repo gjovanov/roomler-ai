@@ -228,6 +228,16 @@ pub enum ClientMsg {
         browser_caps: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         preferred_transport: Option<String>,
+        /// rc.62 — per-session VP9 chroma override. Recognised values:
+        /// `"yuv420"` (VP9 profile 0; ~30% lower bandwidth; slight
+        /// ClearType softening) and `"yuv444"` (VP9 profile 1; sharpest
+        /// text; current default). `None` / unset means "use the
+        /// agent's `ROOMLER_AGENT_VP9_CHROMA` env-var default". Only
+        /// applies when `preferred_transport` is `data-channel-vp9-444`;
+        /// ignored otherwise. Forwarded verbatim to the agent in the
+        /// matching server-side [`ServerMsg::SessionRequest`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chroma_pref: Option<String>,
     },
 
     /// Controller sends an SDP offer (after consent granted).
@@ -455,6 +465,12 @@ pub enum ServerMsg {
         browser_caps: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         preferred_transport: Option<String>,
+        /// rc.62 — per-session VP9 chroma override forwarded verbatim
+        /// from the controller's [`ClientMsg::SessionRequest::chroma_pref`].
+        /// `None` / unset means "use the agent's
+        /// `ROOMLER_AGENT_VP9_CHROMA` env-var default".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chroma_pref: Option<String>,
     },
 
     /// Server forwards SDP offer from controller → agent.
