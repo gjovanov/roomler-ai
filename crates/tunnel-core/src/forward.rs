@@ -24,13 +24,14 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use roomler_ai_remote_control::signaling::CloseReason;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Notify, mpsc};
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
 
@@ -52,9 +53,74 @@ pub const CHUNK_BYTES: usize = 64 * 1024;
 /// Per-flow inbound mailbox capacity (in messages, not bytes). When
 /// the receiver is slow, the [`FlowDemux::on_message`] handler awaits
 /// `send` — cascading backpressure into the DC read loop and (via
-/// SCTP) the peer's sender. 256 messages × ~64 KiB chunks ≈ 16 MiB
-/// max buffered per flow, which matches the rc.19 file-DC behaviour.
-const FLOW_INBOX_CAP: usize = 256;
+/// SCTP) the peer's sender.
+///
+/// rc.66 bump: 256 → 4096. Field-test 2026-05-27 with TDS bulk read
+/// stalled at ~50 KB/s effective throughput while SCTP was happily
+/// acknowledging at 1-2 MB/s; arwnd closed monotonically and
+/// `roomler-tunnel.exe` was at 0% CPU (so not busy-loop, not lock
+/// contention — purely I/O-bound waiting for the local app to
+/// drain). With 4096 × ~64 KiB chunks the per-flow buffer ceiling
+/// is ~256 MiB; a momentary slow consumer no longer cascades back
+/// to the SCTP receive window before the receiver app catches up.
+/// Memory cost per flow is tiny — the mpsc only allocates slots as
+/// messages arrive, not upfront.
+const FLOW_INBOX_CAP: usize = 4096;
+
+/// rc.66: per-flow byte counters surfaced by `run_flow` for
+/// instrumentation. Each flow records three cumulative atomics + the
+/// current mailbox depth so a periodic logger task can sample at a
+/// 2 s cadence and we can see EXACTLY which of the four pump stages
+/// is rate-limiting under bulk-stream load.
+///
+/// Field-test 2026-05-27 with TDS bulk read showed `roomler-tunnel.
+/// exe` at 0% CPU while throughput effectively topped out at
+/// ~50 KB/s. These counters are the diagnostic we needed: by
+/// comparing `tcp_read_bytes` (producer side) against
+/// `tcp_write_bytes` (consumer side) and looking at `mailbox_depth`
+/// we can localise the slow stage in one log line per flow.
+///
+/// Atomics are `Relaxed`-only — they're counters, not synchronisation
+/// primitives. Cost per chunk is one atomic-add, well below the
+/// noise floor of a webrtc-data callback.
+#[derive(Debug, Default)]
+pub struct FlowStats {
+    /// Bytes the local TCP→DC pump has READ from the local TcpStream
+    /// (post-Nagle, post-read syscall). On the agent side that's the
+    /// corp-network destination; on the tunnel-client side it's the
+    /// operator's local app (sqlcmd, psql, …) writing toward the
+    /// tunnel.
+    pub tcp_read_bytes: AtomicU64,
+    /// Bytes the local TCP→DC pump has SENT into the DC after
+    /// framing — `tcp_read_bytes + 4 × frame_count` to a rounding
+    /// error; tracked separately so any divergence (frames refused
+    /// by `dc.send` due to send-buffer pressure, etc.) is visible.
+    pub dc_send_bytes: AtomicU64,
+    /// Bytes the DC→TCP pump has WRITTEN to the local TcpStream
+    /// (post-`write_all` on loopback in the tunnel-client case).
+    /// This is the bottom of the consumer chain — if it lags
+    /// `tcp_read_bytes` on the producer, that's the rate at which
+    /// the local app is draining.
+    pub tcp_write_bytes: AtomicU64,
+    /// Current mailbox depth — snapshot of `from_dc.len()` taken at
+    /// each successful `recv()`. If this stays near `FLOW_INBOX_CAP`
+    /// the bottleneck is the local TCP write (or the kernel /
+    /// application beyond it); if it stays near 0 the bottleneck is
+    /// upstream (DC delivery is slow).
+    pub mailbox_depth: AtomicU64,
+}
+
+impl FlowStats {
+    /// `(tcp_read, dc_send, tcp_write, mailbox_depth)` — relaxed snapshot.
+    pub fn snapshot(&self) -> (u64, u64, u64, u64) {
+        (
+            self.tcp_read_bytes.load(Ordering::Relaxed),
+            self.dc_send_bytes.load(Ordering::Relaxed),
+            self.tcp_write_bytes.load(Ordering::Relaxed),
+            self.mailbox_depth.load(Ordering::Relaxed),
+        )
+    }
+}
 
 /// In-band half-close sentinel: `[flow_id_le | HALF_CLOSE_MAGIC]`.
 /// Non-empty payload because empty-payload (4-byte total) DC
@@ -237,10 +303,52 @@ pub async fn run_flow(
 
     let (read_half, write_half) = tcp.into_split();
 
+    // rc.66 instrumentation: per-flow byte counters with a periodic
+    // logger that prints {tcp_read, dc_send, tcp_write, mailbox_depth}
+    // every 2 s. The logger task dies when the flow finishes (both
+    // pumps return). Throughput is reported as delta-per-period, so
+    // a steady-state value of "5 MB/s" means the flow moved 5 MB
+    // through that stage in the last 2 s window.
+    let stats = Arc::new(FlowStats::default());
+    let stats_for_logger = Arc::clone(&stats);
+    let logger_handle = tokio::spawn(async move {
+        let mut prev = stats_for_logger.snapshot();
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Burn the immediate first tick — `interval` fires right
+        // away by default, which would log a useless zero-delta on
+        // every flow that opens.
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let cur = stats_for_logger.snapshot();
+            let d_read = cur.0.saturating_sub(prev.0);
+            let d_send = cur.1.saturating_sub(prev.1);
+            let d_write = cur.2.saturating_sub(prev.2);
+            // Only emit when something moved — quiescent flows
+            // shouldn't spam the log.
+            if d_read != 0 || d_send != 0 || d_write != 0 {
+                info!(
+                    flow_id,
+                    tcp_read_total = cur.0,
+                    dc_send_total = cur.1,
+                    tcp_write_total = cur.2,
+                    mailbox_depth = cur.3,
+                    tcp_read_kbps = d_read / 1024 / 2,
+                    dc_send_kbps = d_send / 1024 / 2,
+                    tcp_write_kbps = d_write / 1024 / 2,
+                    "tunnel flow throughput (2s window)"
+                );
+            }
+            prev = cur;
+        }
+    });
+
     // Spawn TCP → DC.
     let dc_for_send = Arc::clone(&dc);
     let resume_for_send = Arc::clone(&resume);
     let on_local_eof_for_send = Arc::clone(&on_local_eof);
+    let stats_for_send = Arc::clone(&stats);
     let tcp_to_dc = tokio::spawn(async move {
         pump_tcp_to_dc(
             read_half,
@@ -248,16 +356,34 @@ pub async fn run_flow(
             flow_id,
             resume_for_send,
             on_local_eof_for_send,
+            stats_for_send,
         )
         .await
     });
 
     // Spawn DC → TCP.
-    let dc_to_tcp =
-        tokio::spawn(async move { pump_dc_to_tcp(write_half, &mut from_dc, flow_id).await });
+    let stats_for_recv = Arc::clone(&stats);
+    let dc_to_tcp = tokio::spawn(async move {
+        pump_dc_to_tcp(write_half, &mut from_dc, flow_id, stats_for_recv).await
+    });
 
     let r1 = tcp_to_dc.await.unwrap_or(CloseReason::IoError);
     let r2 = dc_to_tcp.await.unwrap_or(CloseReason::IoError);
+
+    // Log the final tallies before the logger task is aborted, so
+    // the operator gets a one-shot summary of the flow's lifetime
+    // throughput even if the 2 s ticker hadn't fired since the last
+    // delta.
+    let (read_total, send_total, write_total, _mb_depth) = stats.snapshot();
+    info!(
+        flow_id,
+        tcp_read_total = read_total,
+        dc_send_total = send_total,
+        tcp_write_total = write_total,
+        "tunnel flow closed — final throughput totals"
+    );
+    logger_handle.abort();
+
     if matches!(r1, CloseReason::Eof) && matches!(r2, CloseReason::Eof) {
         CloseReason::Eof
     } else {
@@ -271,6 +397,7 @@ async fn pump_tcp_to_dc(
     flow_id: u32,
     resume: Arc<Notify>,
     on_local_eof: HalfCloseSink,
+    stats: Arc<FlowStats>,
 ) -> CloseReason {
     let mut buf = vec![0u8; CHUNK_BYTES - mux::FLOW_ID_HEADER_BYTES];
     loop {
@@ -321,12 +448,17 @@ async fn pump_tcp_to_dc(
                 return CloseReason::IoError;
             }
         };
+        stats.tcp_read_bytes.fetch_add(n as u64, Ordering::Relaxed);
 
         let framed = mux::encode(flow_id, &buf[..n]);
+        let framed_len = framed.len();
         if let Err(e) = dc.send(&Bytes::from(framed)).await {
             debug!(flow_id, %e, "tunnel pump DC send error");
             return CloseReason::IoError;
         }
+        stats
+            .dc_send_bytes
+            .fetch_add(framed_len as u64, Ordering::Relaxed);
     }
 }
 
@@ -334,6 +466,7 @@ async fn pump_dc_to_tcp(
     mut write_half: tokio::net::tcp::OwnedWriteHalf,
     from_dc: &mut mpsc::Receiver<Bytes>,
     flow_id: u32,
+    stats: Arc<FlowStats>,
 ) -> CloseReason {
     loop {
         let chunk = match from_dc.recv().await {
@@ -349,10 +482,21 @@ async fn pump_dc_to_tcp(
                 return CloseReason::Eof;
             }
         };
+        // Snapshot the post-recv mailbox depth so the periodic
+        // logger can see "we keep draining but the mailbox stays
+        // full → upstream is the bottleneck" vs "mailbox is empty
+        // → downstream is the bottleneck."
+        stats
+            .mailbox_depth
+            .store(from_dc.len() as u64, Ordering::Relaxed);
+        let chunk_len = chunk.len();
         if let Err(e) = write_half.write_all(&chunk).await {
             debug!(flow_id, %e, "tunnel pump TCP write error");
             return CloseReason::IoError;
         }
+        stats
+            .tcp_write_bytes
+            .fetch_add(chunk_len as u64, Ordering::Relaxed);
     }
 }
 
