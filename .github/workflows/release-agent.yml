@@ -286,14 +286,20 @@ jobs:
           # Cache key invalidates when: vcpkg baseline changes, our feature
           # set changes, or the agent crate version changes (defensive
           # against a port-edit slipping past the manifest diff).
+          # rc.66 hotfix: rc.65 failed with "ffmpeg@6.1 does not have required
+          # feature avutil". Root cause: vcpkg's pre-installed baseline ships
+          # ffmpeg 6.1, but (a) ffmpeg-next 8.1 needs ffmpeg 7+, (b) `avutil`
+          # is never a selectable feature in vcpkg's ffmpeg port (it's always
+          # built). Bumped baseline to vcpkg HEAD (ffmpeg 8.1.1 — matches
+          # ffmpeg-next 8.1) + dropped `avutil` from the feature list.
           $manifest = @"
           {
             "name": "roomler-ffmpeg-pin",
             "version": "0.0.1",
             "dependencies": [
-              {"name": "ffmpeg", "features": ["avcodec", "avutil", "swresample", "swscale", "nvcodec", "qsv", "amf", "libvpx"]}
+              {"name": "ffmpeg", "features": ["avcodec", "swresample", "swscale", "nvcodec", "qsv", "amf", "libvpx"]}
             ],
-            "builtin-baseline": "4d73751b3428ef49a7ac5d5df696b92e302de993"
+            "builtin-baseline": "e03dc9b29710050cd1018bc5674688108658d327"
           }
           "@
           $hash = (Get-FileHash -Algorithm SHA256 -InputStream ([IO.MemoryStream]::new([Text.Encoding]::UTF8.GetBytes($manifest)))).Hash.Substring(0, 12)
