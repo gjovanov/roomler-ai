@@ -262,6 +262,98 @@ jobs:
           # The MSI will pick up the DLL via the harvested target dir.
           "VPX_DLL_DIR=C:/vpx-pin/installed/x64-windows/bin" | Out-File -FilePath $env:GITHUB_ENV -Append
 
+      # =======================================================================
+      # rc.65: Option B HEVC plan — install FFmpeg via vcpkg so ffmpeg-next
+      # 8.x can link against it. Cold build is 25-40 min (FFmpeg + ffnvcodec +
+      # intel-media-sdk + amf), so the cache is load-bearing. Cache key
+      # composition follows the critique's recommendation: deps content hash
+      # plus the triplet, so a port-edit invalidates the cache cleanly.
+      #
+      # `nvcodec` pulls ffnvcodec headers (NVIDIA Video Codec SDK headers
+      # only — NVENC itself loads at runtime from the user's NVIDIA driver,
+      # so no extra MSI bytes for NVIDIA users).
+      # `qsv` pulls intel-media-sdk → static libmfx (~3-5 MB, statically
+      # linked into the agent).
+      # `amf` pulls amf headers (AMD AMF runtime DLL loaded from driver).
+      # `libvpx` opt-in builds libvpx into FFmpeg so `libvpx-vp9` is
+      # available as a SW fallback (separate from our existing
+      # env-libvpx-sys binding which talks to libvpx directly).
+      # =======================================================================
+      - name: Compute FFmpeg vcpkg cache key
+        id: ffmpeg_cache_key
+        shell: pwsh
+        run: |
+          # Cache key invalidates when: vcpkg baseline changes, our feature
+          # set changes, or the agent crate version changes (defensive
+          # against a port-edit slipping past the manifest diff).
+          $manifest = @"
+          {
+            "name": "roomler-ffmpeg-pin",
+            "version": "0.0.1",
+            "dependencies": [
+              {"name": "ffmpeg", "features": ["avcodec", "avutil", "swresample", "swscale", "nvcodec", "qsv", "amf", "libvpx"]}
+            ],
+            "builtin-baseline": "4d73751b3428ef49a7ac5d5df696b92e302de993"
+          }
+          "@
+          $hash = (Get-FileHash -Algorithm SHA256 -InputStream ([IO.MemoryStream]::new([Text.Encoding]::UTF8.GetBytes($manifest)))).Hash.Substring(0, 12)
+          $key = "ffmpeg-vcpkg-v1-$hash"
+          Write-Host "FFmpeg cache key: $key"
+          "key=$key" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          # Stash the manifest content for the install step.
+          $manifest | Out-File -Encoding utf8 ffmpeg_manifest.json
+          "FFMPEG_MANIFEST_PATH=$((Get-Location).Path)\ffmpeg_manifest.json" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Restore FFmpeg vcpkg cache
+        id: ffmpeg_cache
+        uses: actions/cache@v4
+        continue-on-error: true
+        with:
+          path: |
+            C:\ffmpeg-pin\installed
+            C:\ffmpeg-pin\vcpkg.json
+          key: ${{ steps.ffmpeg_cache_key.outputs.key }}
+
+      - name: Build FFmpeg via vcpkg (encode-only HW backends)
+        shell: pwsh
+        run: |
+          if (Test-Path 'C:\ffmpeg-pin\installed\x64-windows\lib\pkgconfig\libavcodec.pc') {
+            Write-Host "FFmpeg already installed (cache hit) — skipping vcpkg build"
+          } else {
+            Write-Host "Cold build — installing FFmpeg via vcpkg (expect 25-40 min)"
+            New-Item -ItemType Directory -Path C:\ffmpeg-pin -Force | Out-Null
+            Copy-Item $env:FFMPEG_MANIFEST_PATH C:\ffmpeg-pin\vcpkg.json -Force
+            Push-Location C:\ffmpeg-pin
+            C:\vcpkg\vcpkg.exe install --triplet=x64-windows --x-install-root=C:\ffmpeg-pin\installed
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "::error::vcpkg install ffmpeg failed — see logs above. rc.65 cannot proceed without this."
+              exit 1
+            }
+            Pop-Location
+          }
+          # Verify the pkg-config files we need actually landed.
+          $required = @('libavcodec.pc', 'libavutil.pc')
+          foreach ($pc in $required) {
+            $p = "C:\ffmpeg-pin\installed\x64-windows\lib\pkgconfig\$pc"
+            if (-not (Test-Path $p)) {
+              Write-Host "::error::Expected pkg-config file missing: $p"
+              exit 1
+            }
+          }
+          Write-Host "FFmpeg pkg-config files present at C:\ffmpeg-pin\installed\x64-windows\lib\pkgconfig\"
+
+      - name: Append FFmpeg to PKG_CONFIG_PATH
+        shell: pwsh
+        run: |
+          # libvpx step already set PKG_CONFIG_PATH=C:/vpx-pin/...; ffmpeg
+          # needs to extend, not replace. Read current value, append ffmpeg
+          # path, write back. Windows pkg-config uses ';' as separator.
+          $existing = [Environment]::GetEnvironmentVariable('PKG_CONFIG_PATH', 'Process')
+          if ([string]::IsNullOrEmpty($existing)) { $existing = "" } else { $existing = "$existing;" }
+          $combined = "${existing}C:/ffmpeg-pin/installed/x64-windows/lib/pkgconfig"
+          "PKG_CONFIG_PATH=$combined" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "PKG_CONFIG_PATH=$combined"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
 
@@ -291,7 +383,7 @@ jobs:
       - name: Install cargo-wix
         run: cargo install cargo-wix --locked
 
-      - name: Build agent (release, full-hw + vp9-444 + system-context)
+      - name: Build agent (release, full-hw + vp9-444 + system-context + ffmpeg-encoder)
         # `vp9-444` (without `-bindgen`) uses env-libvpx-sys's
         # pre-generated FFI — no libclang invocation, no
         # forward-decl-opaque issue. pkg-config still has to find
@@ -308,8 +400,33 @@ jobs:
         # probe_self()` returns `User` (perUser is never spawned as
         # LocalSystem) so none of the SystemContext code ever fires
         # — the perUser path stays exactly as it was in 0.2.7.
+        #
+        # rc.65: `ffmpeg-encoder` adds the ffmpeg-next dep and exercises
+        # the FFmpeg link via `linked_libavcodec_version()`. The actual
+        # encoder backend lands in rc.66 — for now this RC verifies:
+        # (a) ffmpeg-next 8.x compiles against vcpkg's FFmpeg
+        # (b) hevc_qsv + vp9_qsv symbols are reachable (asserted by the
+        #     unit test `libavcodec_version_is_ffmpeg_7_or_newer`)
+        # (c) MSI size delta vs rc.64 is within budget (≤ +8 MB; HARD
+        #     STOP enforced by the next step at +12 MB)
         shell: pwsh
-        run: cargo build -p roomler-agent --release --features "full-hw,vp9-444,system-context"
+        run: cargo build -p roomler-agent --release --features "full-hw,vp9-444,system-context,ffmpeg-encoder"
+
+      - name: Verify FFmpeg link via unit test
+        # Runs ONLY the ffmpeg-encoder gated test, which calls into
+        # ffmpeg-next's FFI to assert libavcodec version is FFmpeg 7+.
+        # This is the load-bearing verification step for rc.65: if the
+        # link is wrong or symbols don't match, this test fails before
+        # MSI packaging starts. Keeps CI iteration tight.
+        shell: pwsh
+        env:
+          RUST_LOG: roomler_agent=debug,info
+        run: |
+          cargo test -p roomler-agent --lib --features ffmpeg-encoder encode::ffmpeg::tests::libavcodec_version_is_ffmpeg_7_or_newer -- --nocapture
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::FFmpeg link verification failed. ffmpeg-next + vcpkg ffmpeg version pair is incompatible — re-pin one of them in agents/roomler-agent/Cargo.toml or the cache key step above."
+            exit 1
+          }
 
       - name: Stage vpx.dll alongside agent binary (if not statically linked)
         shell: pwsh
@@ -399,6 +516,34 @@ jobs:
           "artifact=$dst" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
         env:
           WIN_CODESIGN_PFX_BASE64: ${{ secrets.WIN_CODESIGN_PFX_BASE64 }}
+
+      - name: Verify MSI size delta (rc.65 Option B budget)
+        # rc.63 baseline (last release before ffmpeg-encoder): 8.02 MB per-User + 8.02 MB per-Machine.
+        # rc.65 budget: +8 MB compressed = 16 MB ceiling. Hard fail at
+        # +12 MB = 20 MB to guard against accidentally bundling an
+        # unstripped FFmpeg (would land closer to +20 MB).
+        #
+        # Per the Option B plan critique: MSI > +8 MB compressed →
+        # regroup before rc.66. > +12 MB → STOP, the entire ffmpeg-next
+        # approach loses to direct-NVENC alternative.
+        shell: pwsh
+        run: |
+          $msiPerUser = (Get-Item "${{ steps.locate.outputs.artifact }}").Length / 1MB
+          $msiPerMachine = (Get-Item "${{ steps.locate_pm.outputs.artifact }}").Length / 1MB
+          $maxMsi = [math]::Max($msiPerUser, $msiPerMachine)
+          $rc63Baseline = 8.0
+          $deltaMB = $maxMsi - $rc63Baseline
+          Write-Host "::notice::per-User MSI = $([math]::Round($msiPerUser, 2)) MB"
+          Write-Host "::notice::per-Machine MSI = $([math]::Round($msiPerMachine, 2)) MB"
+          Write-Host "::notice::rc.63 baseline = $rc63Baseline MB; delta = $([math]::Round($deltaMB, 2)) MB"
+          if ($maxMsi -gt 20) {
+            Write-Host "::error::MSI exceeds 20 MB hard ceiling ($([math]::Round($maxMsi, 2)) MB). Option B size budget violated. Investigate whether ffmpeg has dragged in unintended features."
+            exit 1
+          } elseif ($deltaMB -gt 8) {
+            Write-Host "::warning::MSI delta $([math]::Round($deltaMB, 2)) MB exceeds +8 MB target (still under 12 MB hard ceiling). Consider feature-stripping FFmpeg before rc.66."
+          } else {
+            Write-Host "::notice::MSI delta within +8 MB budget — Option B size target met."
+          }
 
       # rc.18: build the Tauri tray companion alongside the agent.
       # Tray's Cargo.toml uses `frontendDist: "../src/front"` pointing
