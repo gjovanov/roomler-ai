@@ -299,7 +299,7 @@ jobs:
             "name": "roomler-ffmpeg-pin",
             "version": "0.0.1",
             "dependencies": [
-              {"name": "ffmpeg", "features": ["avcodec", "swresample", "swscale", "nvcodec", "qsv", "amf", "vpx"]}
+              {"name": "ffmpeg", "features": ["avcodec", "avformat", "avfilter", "avdevice", "swresample", "swscale", "nvcodec", "qsv", "amf", "vpx"]}
             ],
             "builtin-baseline": "ccab4e210cbfb237aab29423a63108958949ef3c"
           }

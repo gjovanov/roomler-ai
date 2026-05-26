@@ -119,10 +119,14 @@ enigo = { workspace = true, optional = true }
 # Tiger Lake async-MFT gap. Plus unlocks HW VP9 on Intel iGPUs via
 # `vp9_qsv`.
 #
-# `default-features = false` + `features = ["codec"]` pulls in just
-# `libavcodec` bindings. We don't need `libavformat` (no muxing — the
-# agent emits raw NAL units over DataChannel), `libavfilter` (no
-# filtering), or `libavdevice` (no capture — we use scrap for that).
+# rc.69 hotfix: rc.68 cargo build failed because ffmpeg-next 8.1's
+# `codec`-only opt-in still references libavformat symbols from
+# interrupt.rs + packet.rs that aren't gated by the `format` feature.
+# Switched to ffmpeg-next defaults (codec + format + filter + device +
+# sw-scaling + sw-resampling) AND added matching features to the vcpkg
+# ffmpeg manifest (avformat / avfilter / avdevice). Bigger MSI than the
+# original +6 MB estimate; a future RC can narrow ffmpeg-next features
+# once the crate's feature-gating is more reliable (upstream issue).
 #
 # Gated on `ffmpeg-encoder` feature; off by default. CI's Windows job
 # adds it to the build feature set so the link is exercised + measured.
@@ -133,7 +137,7 @@ enigo = { workspace = true, optional = true }
 # CI Windows job uses vcpkg's `ffmpeg[nvcodec,qsv,amf,...]` port and
 # exports `PKG_CONFIG_PATH` to point at the vcpkg install. See
 # `.github/workflows/release-agent.yml`.
-ffmpeg-next = { version = "8.1", optional = true, default-features = false, features = ["codec"] }
+ffmpeg-next = { version = "8.1", optional = true }
 
 # Cross-platform text clipboard (Win32 / X11 / macOS). Feature-gated
 # behind `clipboard` so builds without the clipboard DC handler
