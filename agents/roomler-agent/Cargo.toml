@@ -111,6 +111,30 @@ dcv-color-primitives = { version = "0.6", optional = true }
 # Cross-platform input injection (mouse / keyboard).
 enigo = { workspace = true, optional = true }
 
+# Option B HEVC plan (rc.65+). `ffmpeg-next` is the safe Rust wrapper
+# over FFmpeg's libav*. We use it to dispatch HEVC + H.264 + VP9 to
+# vendor HW encoders (NVENC, Intel QSV / oneVPL, AMD AMF) WITHOUT going
+# through Windows Media Foundation — closing the RTX 5090 Blackwell
+# regression (Known Issues: ActivateObject 0x8000FFFF) and the Iris Xe
+# Tiger Lake async-MFT gap. Plus unlocks HW VP9 on Intel iGPUs via
+# `vp9_qsv`.
+#
+# `default-features = false` + `features = ["codec"]` pulls in just
+# `libavcodec` bindings. We don't need `libavformat` (no muxing — the
+# agent emits raw NAL units over DataChannel), `libavfilter` (no
+# filtering), or `libavdevice` (no capture — we use scrap for that).
+#
+# Gated on `ffmpeg-encoder` feature; off by default. CI's Windows job
+# adds it to the build feature set so the link is exercised + measured.
+# Linux + macOS jobs stay unchanged (they get FFmpeg via VAAPI in
+# rc.74 + VideoToolbox in rc.75).
+#
+# Build-time: needs FFmpeg headers + libs findable via pkg-config.
+# CI Windows job uses vcpkg's `ffmpeg[nvcodec,qsv,amf,...]` port and
+# exports `PKG_CONFIG_PATH` to point at the vcpkg install. See
+# `.github/workflows/release-agent.yml`.
+ffmpeg-next = { version = "8.1", optional = true, default-features = false, features = ["codec"] }
+
 # Cross-platform text clipboard (Win32 / X11 / macOS). Feature-gated
 # behind `clipboard` so builds without the clipboard DC handler
 # (signalling-only CI images, future trimmed-down deployments) don't
@@ -305,7 +329,7 @@ synthetic-frame-source = []
 # measured; >+8 MB compressed = HARD STOP and re-plan.
 #
 # Phased rollout documented in `docs/hevc-dc-plan.md`.
-ffmpeg-encoder = []
+ffmpeg-encoder = ["dep:ffmpeg-next"]
 
 # M3 A1 — SYSTEM-context capture+input on the secure desktop. Lets
 # the perMachine MSI deployment drive the Windows lock screen / UAC
