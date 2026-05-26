@@ -28,6 +28,15 @@ pub mod libvpx;
 #[cfg(all(target_os = "windows", feature = "mf-encoder"))]
 pub mod mf;
 
+// rc.64 — Option B HEVC plan. `ffmpeg-encoder` ships header-only here:
+// the module declares zero callers and `available()` returns false, so
+// every release build with the feature flipped on or off behaves
+// identically. The CI plumbing that links stripped FFmpeg + libmfx is
+// rc.65; the actual encoder backend is rc.66. See
+// `docs/hevc-dc-plan.md` (rc.64) for the phased rollout.
+#[cfg(feature = "ffmpeg-encoder")]
+pub mod ffmpeg;
+
 // ---------------------------------------------------------------------
 // Shared helpers usable by every backend.
 // ---------------------------------------------------------------------
