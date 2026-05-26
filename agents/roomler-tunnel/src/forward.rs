@@ -311,6 +311,21 @@ pub async fn run(cfg: TunnelConfig, agent_hex: &str, local: u16, remote: &str) -
                 continue;
             }
         };
+        // P0 throughput fix (rc.64, field-repro 2026-05-26): disable
+        // Nagle on the local listener's accepted TCP socket. The agent
+        // side already sets TCP_NODELAY on its outbound (corp-side)
+        // dialer (see agents/roomler-agent/src/tunnel/dialer.rs); the
+        // asymmetry meant TDS row tokens flowing FROM the server,
+        // through the DC, OUT to the local SSMS/psql/JDBC client got
+        // Nagle-coalesced on this socket. Under MSSQL TDS the small
+        // row tokens batch up waiting for ACKs that don't come until
+        // ~40 ms later (delayed ACK + Nagle interaction), collapsing
+        // sustained throughput to tens of KB/s and triggering server-
+        // side ASYNC_NETWORK_IO suspensions. Setting nodelay is
+        // canonical for tunnels; no downside.
+        if let Err(e) = tcp.set_nodelay(true) {
+            warn!(%peer_addr, %e, "set_nodelay(true) on local TCP failed");
+        }
         debug!(%peer_addr, "accepted local TCP connection");
 
         let flow_id = flow_counter.fetch_add(1, Ordering::Relaxed);
