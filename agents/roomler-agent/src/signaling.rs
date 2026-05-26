@@ -452,6 +452,11 @@ async fn connect_once(
     // `Some("data-channel-vp9-444")` flips the pump into DC mode;
     // None is the legacy WebRTC track.
     let mut pending_transports: HashMap<bson::oid::ObjectId, Option<String>> = HashMap::new();
+    // rc.62: same lifecycle as `pending_transports` but for the
+    // per-session VP9 chroma override forwarded from the controller's
+    // `rc:session.request.chroma_pref`. `None` → fall back to the
+    // agent's `ROOMLER_AGENT_VP9_CHROMA` env-var default.
+    let mut pending_chroma: HashMap<bson::oid::ObjectId, Option<String>> = HashMap::new();
     // T2.10d: one `AgentTunnelPeer` per active `roomler-tunnel`
     // session. Distinct map from `peers` (remote-control sessions)
     // because the namespaces don't overlap and the lifecycles
@@ -534,6 +539,7 @@ async fn connect_once(
                                 &mut peers,
                                 &mut pending_codecs,
                                 &mut pending_transports,
+                                &mut pending_chroma,
                                 &mut tunnel_peers,
                                 &outbound_tx,
                                 encoder_preference,
@@ -576,6 +582,7 @@ async fn handle_server_msg(
     peers: &mut HashMap<bson::oid::ObjectId, AgentPeer>,
     pending_codecs: &mut HashMap<bson::oid::ObjectId, String>,
     pending_transports: &mut HashMap<bson::oid::ObjectId, Option<String>>,
+    pending_chroma: &mut HashMap<bson::oid::ObjectId, Option<String>>,
     tunnel_peers: &mut HashMap<bson::oid::ObjectId, Arc<crate::tunnel::peer::AgentTunnelPeer>>,
     outbound_tx: &mpsc::Sender<ClientMsg>,
     encoder_preference: crate::encode::EncoderPreference,
@@ -592,6 +599,7 @@ async fn handle_server_msg(
             consent_timeout_secs,
             browser_caps,
             preferred_transport,
+            chroma_pref,
         } => {
             // Pick the best codec for this session from the
             // intersection of (browser-advertised, agent-supported).
@@ -621,6 +629,12 @@ async fn handle_server_msg(
             // not actually applied (the bug Y.3's media-pump branch
             // surfaces).
             pending_transports.insert(session_id, negotiated_transport.clone());
+            // rc.62 — stash per-session chroma override so the
+            // SdpOffer handler can pass it into `AgentPeer::new` and
+            // ultimately into the VP9-444 media pump. Only meaningful
+            // when negotiated_transport == data-channel-vp9-444;
+            // ignored otherwise.
+            pending_chroma.insert(session_id, chroma_pref.clone());
             info!(
                 %session_id, %controller_user_id, %controller_name,
                 ?permissions, consent_timeout_secs,
@@ -628,6 +642,7 @@ async fn handle_server_msg(
                 chosen_codec = %chosen,
                 requested_transport = ?preferred_transport,
                 negotiated_transport = ?negotiated_transport,
+                chroma_pref = ?chroma_pref,
                 consent_mode = ?consent_broker.mode(),
                 "incoming session request — running consent broker"
             );
@@ -693,6 +708,10 @@ async fn handle_server_msg(
             // older controllers / sessions that arrived without
             // preferred_transport.
             let negotiated_transport = pending_transports.remove(&session_id).unwrap_or(None);
+            // rc.62 — pull the per-session chroma override stashed by
+            // the Request handler. `None` → AgentPeer falls back to
+            // `ROOMLER_AGENT_VP9_CHROMA` env-var default.
+            let chroma_pref = pending_chroma.remove(&session_id).unwrap_or(None);
 
             let peer = match AgentPeer::new(
                 session_id,
@@ -701,6 +720,7 @@ async fn handle_server_msg(
                 encoder_preference,
                 chosen_codec,
                 negotiated_transport,
+                chroma_pref,
             )
             .await
             {

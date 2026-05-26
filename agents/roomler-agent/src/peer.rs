@@ -228,6 +228,12 @@ impl AgentPeer {
     /// `video-bytes` DC opened by the controller. See the
     /// `on_data_channel` branch in `new()` for where the DC
     /// handle is stashed.
+    ///
+    /// rc.62 — `chroma_pref` is the per-session VP9 chroma override
+    /// forwarded from `ClientMsg::SessionRequest::chroma_pref`. When
+    /// `Some("yuv420" | "yuv444")` the VP9-444 pump uses it instead
+    /// of the agent's `ROOMLER_AGENT_VP9_CHROMA` env var. `None` →
+    /// fall back to env var (= operator default).
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
         session_id: bson::oid::ObjectId,
@@ -236,6 +242,7 @@ impl AgentPeer {
         encoder_preference: encode::EncoderPreference,
         chosen_codec: String,
         negotiated_transport: Option<String>,
+        chroma_pref: Option<String>,
     ) -> Result<Self> {
         let mut engine = MediaEngine::default();
         engine
@@ -737,6 +744,7 @@ impl AgentPeer {
             chosen_codec,
             target_resolution.clone(),
             negotiated_transport,
+            chroma_pref,
             video_bytes_dc.clone(),
             lock_state_rx,
         ));
@@ -838,6 +846,7 @@ async fn media_pump(
     chosen_codec: String,
     target_resolution: Arc<std::sync::Mutex<TargetResolution>>,
     negotiated_transport: Option<String>,
+    chroma_pref: Option<String>,
     video_bytes_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
     lock_state_rx: tokio::sync::watch::Receiver<lock_state::LockState>,
 ) {
@@ -882,11 +891,13 @@ async fn media_pump(
                 target_resolution,
                 lock_state_rx,
                 quality_state,
+                chroma_pref,
             )
             .await;
         }
         #[cfg(not(feature = "vp9-444"))]
         {
+            let _ = chroma_pref;
             tracing::warn!(
                 %session_id,
                 "negotiated_transport=data-channel-vp9-444 but agent was built without `vp9-444` feature — falling back to WebRTC video track"
@@ -1541,6 +1552,7 @@ async fn media_pump_vp9_444_dc(
     target_resolution: Arc<std::sync::Mutex<TargetResolution>>,
     lock_state_rx: tokio::sync::watch::Receiver<lock_state::LockState>,
     quality_state: Arc<std::sync::atomic::AtomicU8>,
+    chroma_pref: Option<String>,
 ) {
     // See `media_pump`: tracks lock-state transitions so we can
     // request a keyframe on the lock/unlock boundary.
@@ -1758,13 +1770,25 @@ async fn media_pump_vp9_444_dc(
         }
 
         if encoder_dims != Some((w, h)) {
-            // rc.61 — resolve chroma format from env. Default Yuv444
-            // preserves pre-rc.61 behaviour. Read at every rebuild so a
-            // mid-session env-var flip (operator changes it via the
-            // SCM service env block + restart) takes effect on the
-            // next dim change without needing a separate hook.
-            let chroma = crate::encode::libvpx::vp9_chroma_from_env();
-            info!(%session_id, w, h, target_fps, chroma = chroma.as_str(), "VP9-444 encoder rebuild for dims");
+            // rc.61 — resolve chroma format. Priority order:
+            //   1. Per-session `chroma_pref` from `rc:session.request`
+            //      (rc.62 — controller's UI choice).
+            //   2. `ROOMLER_AGENT_VP9_CHROMA` env var (rc.61, operator
+            //      default at the host).
+            //   3. Yuv444 (pre-rc.61 default, sharpest text).
+            // Read at every rebuild so a mid-session env-var flip
+            // (operator changes it via the SCM service env block +
+            // restart) takes effect on the next dim change without
+            // needing a separate hook.
+            let chroma = chroma_pref
+                .as_deref()
+                .and_then(|s| match s.trim().to_ascii_lowercase().as_str() {
+                    "yuv420" | "420" => Some(crate::encode::libvpx::Vp9Chroma::Yuv420),
+                    "yuv444" | "444" => Some(crate::encode::libvpx::Vp9Chroma::Yuv444),
+                    _ => None,
+                })
+                .unwrap_or_else(crate::encode::libvpx::vp9_chroma_from_env);
+            info!(%session_id, w, h, target_fps, chroma = chroma.as_str(), chroma_source = if chroma_pref.is_some() { "session_request" } else { "env_var" }, "VP9-444 encoder rebuild for dims");
             match Vp9Encoder::new_with_fps_chroma(w, h, target_fps, chroma) {
                 Ok(e) => {
                     encoder = Some(e);
