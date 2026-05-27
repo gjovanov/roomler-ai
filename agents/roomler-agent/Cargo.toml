@@ -133,7 +133,16 @@ enigo = { workspace = true, optional = true }
 # CI Windows job uses vcpkg's `ffmpeg[nvcodec,qsv,amf,...]` port and
 # exports `PKG_CONFIG_PATH` to point at the vcpkg install. See
 # `.github/workflows/release-agent.yml`.
-ffmpeg-next = { version = "8.1", optional = true, default-features = false, features = ["codec"] }
+#
+# rc.71 hotfix: `default-features = false, features = ["codec"]` caused
+# ffmpeg-next 8.1 to fail to compile because util/interrupt.rs and
+# codec/packet/packet.rs reference libavformat symbols that aren't
+# gated by the codec feature. Switched to defaults (codec + format +
+# filter + device + sw-scaling + sw-resampling) AND extended the vcpkg
+# manifest with avformat/avfilter/avdevice to match. MSI larger than
+# the original +6 MB estimate; future RC can narrow once feature
+# gating is fixed upstream.
+ffmpeg-next = { version = "8.1", optional = true }
 
 # Cross-platform text clipboard (Win32 / X11 / macOS). Feature-gated
 # behind `clipboard` so builds without the clipboard DC handler

@@ -299,7 +299,7 @@ jobs:
             "name": "roomler-ffmpeg-pin",
             "version": "0.0.1",
             "dependencies": [
-              {"name": "ffmpeg", "features": ["avcodec", "swresample", "swscale", "nvcodec", "qsv", "amf", "vpx"]}
+              {"name": "ffmpeg", "features": ["avcodec", "avformat", "avfilter", "avdevice", "swresample", "swscale", "nvcodec", "qsv", "amf", "vpx"]}
             ],
             "builtin-baseline": "ccab4e210cbfb237aab29423a63108958949ef3c"
           }
@@ -377,7 +377,7 @@ jobs:
           }
           Write-Host "FFmpeg pkg-config files present at C:\ffmpeg-pin\installed\x64-windows\lib\pkgconfig\"
 
-      - name: Append FFmpeg to PKG_CONFIG_PATH
+      - name: Append FFmpeg to PKG_CONFIG_PATH + DLL PATH
         shell: pwsh
         run: |
           # libvpx step already set PKG_CONFIG_PATH=C:/vpx-pin/...; ffmpeg
@@ -388,6 +388,14 @@ jobs:
           $combined = "${existing}C:/ffmpeg-pin/installed/x64-windows/lib/pkgconfig"
           "PKG_CONFIG_PATH=$combined" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "PKG_CONFIG_PATH=$combined"
+          # rc.71 hotfix: vcpkg's x64-windows triplet produces DLLs for
+          # ffmpeg (libavcodec-*.dll etc.), not static libs. The agent test
+          # binary links against them at compile time but Windows can't
+          # find them at runtime (STATUS_DLL_NOT_FOUND, 0xc0000135 — rc.69
+          # CI failure). Add the ffmpeg bin dir to GITHUB_PATH so cargo test
+          # picks it up. Also stash for the MSI staging step below.
+          "C:\ffmpeg-pin\installed\x64-windows\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          "FFMPEG_DLL_DIR=C:\ffmpeg-pin\installed\x64-windows\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
@@ -478,6 +486,32 @@ jobs:
             Write-Host "Staged vpx.dll for MSI harvest"
           } else {
             Write-Host "No vpx.dll under $env:VPX_DLL_DIR — static linkage, nothing to stage"
+          }
+
+      - name: Stage FFmpeg DLLs alongside agent binary (for MSI bundle)
+        # rc.71 hotfix: ffmpeg via vcpkg x64-windows triplet ships as DLLs
+        # (libavcodec-*.dll, libavformat-*.dll, libavutil-*.dll, etc.). The
+        # agent binary needs them at runtime. Copy all FFmpeg DLLs from the
+        # vcpkg install's bin dir to target\release\ so cargo-wix harvests
+        # them into the MSI. The harvest pattern in main.wxs already
+        # includes target\release\*.dll on a wildcard, so this is enough.
+        shell: pwsh
+        run: |
+          if (-not (Test-Path $env:FFMPEG_DLL_DIR)) {
+            Write-Host "::error::FFMPEG_DLL_DIR not set or doesn't exist: $env:FFMPEG_DLL_DIR"
+            exit 1
+          }
+          $dlls = Get-ChildItem -Path $env:FFMPEG_DLL_DIR -Filter "*.dll"
+          if ($dlls.Count -eq 0) {
+            Write-Host "::error::No DLLs found under $env:FFMPEG_DLL_DIR — vcpkg install may have failed silently or used a static triplet."
+            exit 1
+          }
+          foreach ($dll in $dlls) {
+            Copy-Item $dll.FullName target\release\
+          }
+          Write-Host "Staged $($dlls.Count) FFmpeg DLLs for MSI harvest:"
+          foreach ($dll in $dlls) {
+            Write-Host "  $($dll.Name) ($([math]::Round($dll.Length / 1KB, 0)) KB)"
           }
 
       - name: Encoder smoke test (MF cascade → openh264 fallback)
