@@ -76,6 +76,15 @@
                 title="Crash reports"
               />
               <v-btn
+                icon="mdi-text-box-search-outline"
+                size="small"
+                variant="text"
+                color="primary"
+                @click="openLogs(a)"
+                :aria-label="`View logs for ${a.name}`"
+                title="Agent logs"
+              />
+              <v-btn
                 icon="mdi-delete"
                 size="small"
                 variant="text"
@@ -263,6 +272,14 @@
                 :aria-label="`View crash reports for ${a.name}`"
               />
               <v-btn
+                icon="mdi-text-box-search-outline"
+                size="small"
+                variant="text"
+                color="primary"
+                @click="openLogs(a)"
+                :aria-label="`View logs for ${a.name}`"
+              />
+              <v-btn
                 icon="mdi-delete"
                 size="small"
                 variant="text"
@@ -339,6 +356,14 @@
     :agent-name="crashesTarget?.name ?? ''"
   />
 
+  <!-- Logs viewer modal (centralized agent-log upload, rc.58/rc.59) -->
+  <AgentLogsDialog
+    v-model="logsDialogOpen"
+    :tenant-id="tenantId"
+    :agent-id="logsTarget?.id ?? ''"
+    :agent-name="logsTarget?.name ?? ''"
+  />
+
   <!-- Delete confirmation -->
   <v-dialog v-model="deleteDialogOpen" max-width="440">
     <v-card>
@@ -365,6 +390,7 @@ import { useDisplay } from 'vuetify'
 import { useAgentStore, type Agent, type EnrollmentToken } from '@/stores/agents'
 import { codecChips } from './agentCodecChips'
 import AgentCrashesDialog from './AgentCrashesDialog.vue'
+import AgentLogsDialog from './AgentLogsDialog.vue'
 
 const props = defineProps<{ tenantId: string }>()
 
@@ -400,6 +426,17 @@ const crashesTarget = ref<Agent | null>(null)
 function openCrashes(a: Agent) {
   crashesTarget.value = a
   crashesDialogOpen.value = true
+}
+
+// Logs-viewer modal state (rc.74). Same no-cache, fetch-on-open
+// pattern as the crashes dialog — the AgentLogsDialog refetches the
+// recent uploaded log batches each time it opens.
+const logsDialogOpen = ref(false)
+const logsTarget = ref<Agent | null>(null)
+
+function openLogs(a: Agent) {
+  logsTarget.value = a
+  logsDialogOpen.value = true
 }
 
 function osIcon(os: string) {

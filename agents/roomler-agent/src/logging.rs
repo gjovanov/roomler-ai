@@ -66,8 +66,25 @@ pub fn init() {
         return;
     }
 
+    // Default filter. `RUST_LOG` (env, or the SCM service Environment
+    // block for the SystemContext service) overrides wholesale when
+    // set. The fallback keeps `roomler_agent` at info + everything
+    // else at warn, with ONE addition: `tunnel_core=info`.
+    //
+    // rc.74: `tunnel_core=info` surfaces the per-flow throughput
+    // logger (`tunnel flow throughput (2s window) …` + the
+    // flow-closed totals) added in rc.66. Those live in the
+    // `tunnel_core` target, so under the old `roomler_agent=info,warn`
+    // default they were filtered out of BOTH the on-disk rolling log
+    // AND the centralized upload layer — invisible unless an operator
+    // hand-set `RUST_LOG`. The throughput lines are low-volume (one
+    // per active flow per 2 s, only when bytes moved) and are exactly
+    // the signal we need to diagnose tunnel stalls remotely via the
+    // admin-UI log viewer, so they belong on by default. Everything
+    // else in `tunnel_core` is debug/trace and stays suppressed; the
+    // chatty `webrtc_sctp` / `webrtc_ice` targets stay at warn.
     let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("roomler_agent=info,warn"));
+        .unwrap_or_else(|_| EnvFilter::new("roomler_agent=info,tunnel_core=info,warn"));
 
     let stdout = fmt::layer().with_target(false).compact();
 
