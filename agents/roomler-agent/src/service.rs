@@ -494,7 +494,7 @@ mod linux {
              ExecStart={exe_str} run\n\
              Restart=on-failure\n\
              RestartSec=5\n\
-             Environment=RUST_LOG=roomler_agent=info,warn\n\
+             Environment=RUST_LOG=roomler_agent=info,tunnel_core=info,warn\n\
              \n\
              [Install]\n\
              WantedBy=default.target\n"
@@ -589,7 +589,7 @@ mod macos {
              \t<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>\n\
              \t<key>ProcessType</key><string>Interactive</string>\n\
              \t<key>EnvironmentVariables</key>\n\
-             \t<dict><key>RUST_LOG</key><string>roomler_agent=info,warn</string></dict>\n\
+             \t<dict><key>RUST_LOG</key><string>roomler_agent=info,tunnel_core=info,warn</string></dict>\n\
              </dict>\n\
              </plist>\n"
         );
