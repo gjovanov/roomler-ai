@@ -392,7 +392,35 @@ fn open_for_codec_av1(width: u32, height: u32) -> (Box<dyn VideoEncoder>, &'stat
 }
 
 /// HEVC opener — same fail-closed semantics as `open_for_codec_av1`.
+///
+/// rc.72: when `ROOMLER_AGENT_USE_FFMPEG=1` is set AND the
+/// `ffmpeg-encoder` feature is compiled in, try the FFmpeg backend first
+/// (`hevc_nvenc` → `hevc_qsv` → `hevc_amf`). Falls through to MF on
+/// FFmpeg construction failure so a misconfigured opt-in doesn't break
+/// existing sessions. Unset = MF default (preserves rc.71 behaviour).
 fn open_for_codec_hevc(width: u32, height: u32) -> (Box<dyn VideoEncoder>, &'static str) {
+    #[cfg(feature = "ffmpeg-encoder")]
+    {
+        if ffmpeg::available() {
+            match ffmpeg::FfmpegEncoder::new_hevc(width, height) {
+                Ok(e) => {
+                    tracing::info!(
+                        width,
+                        height,
+                        encoder = e.name(),
+                        "encoder selected: ffmpeg HEVC (hardware via vendor SDK)"
+                    );
+                    return (Box::new(e), "h265");
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        %err,
+                        "ROOMLER_AGENT_USE_FFMPEG=1 but ffmpeg HEVC construction failed; falling back to MF cascade"
+                    );
+                }
+            }
+        }
+    }
     #[cfg(all(target_os = "windows", feature = "mf-encoder"))]
     {
         match mf::MfEncoder::new_hevc(width, height) {
