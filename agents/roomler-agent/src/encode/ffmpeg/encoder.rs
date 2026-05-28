@@ -232,19 +232,24 @@ impl FfmpegEncoder {
         // Copy our converted NV12 planes into the AVFrame's plane buffers.
         // FFmpeg's allocator gives us width/height-aligned buffers; we
         // copy row-by-row to handle stride differences.
-        copy_plane_into_av(
-            av.data_mut(0),
-            av.stride(0),
-            &self.nv12_y,
-            self.width as usize,
-            self.height as usize,
-        );
+        //
+        // rc.73 borrow-checker fix: capture strides before the mutable
+        // borrow from data_mut(). `av.stride(N)` takes &self while
+        // `av.data_mut(N)` takes &mut self — calling them on the same
+        // expression triggers E0502.
+        let y_src_width = self.width as usize;
+        let y_rows = self.height as usize;
+        let uv_src_width = self.width as usize;
+        let uv_rows = (self.height / 2) as usize;
+        let y_stride = av.stride(0);
+        let uv_stride = av.stride(1);
+        copy_plane_into_av(av.data_mut(0), y_stride, &self.nv12_y, y_src_width, y_rows);
         copy_plane_into_av(
             av.data_mut(1),
-            av.stride(1),
+            uv_stride,
             &self.nv12_uv,
-            self.width as usize,
-            (self.height / 2) as usize,
+            uv_src_width,
+            uv_rows,
         );
 
         Ok(av)
