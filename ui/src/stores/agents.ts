@@ -98,6 +98,40 @@ interface AgentCrashListResponse {
   items: AgentCrash[]
 }
 
+/** One uploaded log line. Wire shape from
+ *  `crates/db/src/models/agent_log.rs::LogLine` serialised through
+ *  `crates/api/src/routes/agent_log.rs`. `level` is the UPPERCASE
+ *  Rust enum discriminant (TRACE/DEBUG/INFO/WARN/ERROR); `fields`
+ *  is an arbitrary structured-field object (may be empty). */
+export interface AgentLogLine {
+  ts: string
+  level: 'TRACE' | 'DEBUG' | 'INFO' | 'WARN' | 'ERROR'
+  target: string
+  msg: string
+  fields: Record<string, unknown>
+}
+
+/** One uploaded log batch. Mirrors `AgentLogBatchView` in
+ *  `crates/api/src/routes/agent_log.rs`. `source` is the lowercase
+ *  Rust enum (`agent`/`service`/`installer`/`crash`/`updater`/
+ *  `browser`); `createdAt` is the server ingest timestamp (RFC3339). */
+export interface AgentLogBatch {
+  id: string
+  source: string
+  agentId: string | null
+  userId: string | null
+  sessionId: string | null
+  hostIdHash: string | null
+  agentVersion: string | null
+  lineCount: number
+  createdAt: string
+  lines: AgentLogLine[]
+}
+
+interface AgentLogsListResponse {
+  batches: AgentLogBatch[]
+}
+
 export const useAgentStore = defineStore('agents', () => {
   const agents = ref<Agent[]>([])
   const total = ref(0)
@@ -161,6 +195,23 @@ export const useAgentStore = defineStore('agents', () => {
     return resp.items
   }
 
+  /** Fetch the most-recent uploaded log batches for an agent (rc.58/
+   *  rc.59 centralized log backbone). `limit` is the number of
+   *  BATCHES, not lines (the server clamps to 1..=500; default 50).
+   *  No store caching — the AgentLogsDialog holds the result and
+   *  refreshes on demand. Tenant-scoped on both sides; a foreign
+   *  agentId yields an empty list, not an error. */
+  async function fetchLogs(
+    tenantId: string,
+    agentId: string,
+    limit = 50,
+  ): Promise<AgentLogBatch[]> {
+    const resp = await api.get<AgentLogsListResponse>(
+      `/tenant/${tenantId}/agent/${agentId}/logs?limit=${limit}`,
+    )
+    return resp.batches
+  }
+
   return {
     agents,
     total,
@@ -172,5 +223,6 @@ export const useAgentStore = defineStore('agents', () => {
     updateAccessPolicy,
     deleteAgent,
     fetchCrashes,
+    fetchLogs,
   }
 })
