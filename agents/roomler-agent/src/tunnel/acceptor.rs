@@ -149,7 +149,7 @@ pub async fn handle_forward_request(
         return;
     };
 
-    let from_dc = demux.register(flow_id).await;
+    let (from_dc, stats) = demux.register(flow_id).await;
     let dc = demux.dc();
 
     // Accept the flow + start pumping.
@@ -168,7 +168,7 @@ pub async fn handle_forward_request(
 
     let half_close = tunnel_peer.half_close_sink(outbound.clone());
     let close_reason =
-        tunnel_core::forward::run_flow(stream, dc, flow_id, from_dc, half_close).await;
+        tunnel_core::forward::run_flow(stream, dc, flow_id, from_dc, half_close, stats).await;
     demux.unregister(flow_id).await;
     info!(%session_id, %flow_id, ?close_reason, "agent flow ended");
     let _ = outbound
