@@ -869,6 +869,45 @@ async fn media_pump(
             "media_pump: SystemContext worker — lock overlay disabled (real Winlogon frames will stream)"
         );
     }
+    // rc.77 — HEVC over DataChannel fork (Option B). Same shape as
+    // the VP9-444 path below: when the session negotiated HEVC over
+    // the `video-bytes` channel, route to the FFmpeg-encoder DC pump.
+    // Falls through to the VP9-444 path or legacy track-based pump
+    // when not selected — including when the feature is compiled in
+    // but `ROOMLER_AGENT_USE_FFMPEG=1` isn't set on this process
+    // (caps probe wouldn't have advertised the transport, but a
+    // mismatched / old controller could still ask for it).
+    if matches!(negotiated_transport.as_deref(), Some("data-channel-hevc")) {
+        #[cfg(feature = "ffmpeg-encoder")]
+        {
+            if crate::encode::ffmpeg::available() {
+                tracing::info!(
+                    %session_id,
+                    "media pump: HEVC over DataChannel (rc.77 — FFmpeg via vendor SDK)"
+                );
+                return media_pump_hevc_dc(
+                    session_id,
+                    video_bytes_dc,
+                    keyframe_requested,
+                    target_resolution,
+                    lock_state_rx,
+                    quality_state,
+                )
+                .await;
+            }
+            tracing::warn!(
+                %session_id,
+                "negotiated_transport=data-channel-hevc but ROOMLER_AGENT_USE_FFMPEG isn't set — falling back to WebRTC video track"
+            );
+        }
+        #[cfg(not(feature = "ffmpeg-encoder"))]
+        {
+            tracing::warn!(
+                %session_id,
+                "negotiated_transport=data-channel-hevc but agent was built without `ffmpeg-encoder` feature — falling back to WebRTC video track"
+            );
+        }
+    }
     // Y.3 fork: route to the DC pump when the session negotiated VP9
     // 4:4:4 over the `video-bytes` channel. Falls through to the
     // legacy track-based pump otherwise — including when the feature
@@ -2113,6 +2152,206 @@ async fn media_pump_vp9_444_dc(
                 scene_change_keyframes,
                 target_bps = last_applied_bitrate,
                 "VP9-444 DC pump heartbeat (≈1s window)"
+            );
+        }
+    }
+}
+
+/// rc.77 — HEVC over DataChannel pump (Option B, FFmpeg backend).
+///
+/// Mirrors `media_pump_vp9_444_dc` structurally but uses
+/// `FfmpegEncoder` (which dispatches to `hevc_nvenc` / `hevc_qsv` /
+/// `hevc_amf` via the vendor SDKs) and emits HEVC Annex-B
+/// length-prefixed over the `video-bytes` DC. Shares the same 13-byte
+/// header as the VP9 path so `frame_video_bytes` is reused verbatim.
+///
+/// Scope intentionally minimal for first ship: capture → encode →
+/// frame → send. No AIMD backpressure, no scene-change detection, no
+/// anti-IDR-storm coalescer (rc.78), no ROI hints (rc.79+). The pump
+/// is good enough to verify the wire format end-to-end and validate
+/// Gate 0 → real-session continuity; AIMD lands once we have field
+/// telemetry to tune against.
+#[cfg(feature = "ffmpeg-encoder")]
+async fn media_pump_hevc_dc(
+    session_id: bson::oid::ObjectId,
+    video_bytes_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
+    keyframe_requested: Arc<std::sync::atomic::AtomicBool>,
+    target_resolution: Arc<std::sync::Mutex<TargetResolution>>,
+    lock_state_rx: tokio::sync::watch::Receiver<lock_state::LockState>,
+    _quality_state: Arc<std::sync::atomic::AtomicU8>,
+) {
+    use crate::encode::VideoEncoder;
+    use crate::encode::ffmpeg::FfmpegEncoder;
+
+    // Mirror the VP9 pump's overlay gate. Under SystemContext the
+    // captured frame IS the real Winlogon screen; an overlay over it
+    // would hide the password prompt and block remote unlock.
+    let sys_ctx_worker = is_system_context_worker();
+    if sys_ctx_worker {
+        info!(
+            %session_id,
+            "media_pump_hevc_dc: SystemContext worker — lock overlay disabled"
+        );
+    }
+    let mut was_locked_last_iter = matches!(*lock_state_rx.borrow(), lock_state::LockState::Locked);
+
+    let target_fps: u32 = 30;
+    let frame_duration_floor = Duration::from_micros(1_000_000 / target_fps as u64);
+    let downscale = crate::capture::DownscalePolicy::Never;
+    info!(
+        %session_id,
+        target_fps,
+        "HEVC DC pump starting (rc.77 — FFmpeg backend)"
+    );
+    let mut capturer = capture::open_default(target_fps, downscale);
+    let mut encoder: Option<FfmpegEncoder> = None;
+    let mut encoder_dims: Option<(u32, u32)> = None;
+    let mut last_capture_at = std::time::Instant::now();
+    let mut last_good_frame: Option<std::sync::Arc<crate::capture::Frame>> = None;
+    const IDLE_KEEPALIVE: Duration = Duration::from_millis(1_000);
+
+    let mut frames_captured: u64 = 0;
+    let mut frames_encoded: u64 = 0;
+    let mut frames_sent: u64 = 0;
+    let mut bytes_written: u64 = 0;
+    let mut send_errors: u64 = 0;
+    let mut dc_unopen_drops: u64 = 0;
+    let mut last_heartbeat = std::time::Instant::now();
+    const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
+
+    loop {
+        // Pace at the encoder's target framerate. If the previous loop
+        // iteration ran fast, sleep until the next frame's deadline.
+        let elapsed = last_capture_at.elapsed();
+        if elapsed < frame_duration_floor {
+            tokio::time::sleep(frame_duration_floor - elapsed).await;
+        }
+        last_capture_at = std::time::Instant::now();
+
+        // Resolve the active target resolution (operator may have
+        // changed it mid-session via `rc:resolution`).
+        let target = *target_resolution.lock().unwrap();
+        let _ = target; // not yet wired to capture; same as VP9 path's rc.32 state
+
+        // Capture one frame; on transient failure, reuse the last
+        // good one as a keepalive so the browser decoder doesn't
+        // pause.
+        let frame_opt: Option<std::sync::Arc<crate::capture::Frame>> = match capturer.next() {
+            Some(f) => {
+                let arc = std::sync::Arc::new(f);
+                last_good_frame = Some(arc.clone());
+                frames_captured += 1;
+                Some(arc)
+            }
+            None => last_good_frame
+                .clone()
+                .filter(|_| last_capture_at.duration_since(last_capture_at) < IDLE_KEEPALIVE),
+        };
+
+        let Some(frame) = frame_opt else {
+            continue;
+        };
+
+        // Lazily build / rebuild the encoder when the frame dims change.
+        let (w, h) = (frame.width, frame.height);
+        let need_rebuild = match encoder_dims {
+            Some((ew, eh)) => ew != w || eh != h,
+            None => true,
+        };
+        if need_rebuild {
+            match FfmpegEncoder::new_hevc(w, h) {
+                Ok(enc) => {
+                    info!(
+                        %session_id,
+                        width = w,
+                        height = h,
+                        encoder = enc.name(),
+                        "HEVC DC pump: encoder (re)built"
+                    );
+                    encoder = Some(enc);
+                    encoder_dims = Some((w, h));
+                }
+                Err(e) => {
+                    tracing::error!(
+                        %session_id,
+                        %e,
+                        "HEVC DC pump: FfmpegEncoder construction failed — exiting pump"
+                    );
+                    return;
+                }
+            }
+        }
+
+        // Lock-state transitions force a keyframe so the browser sees
+        // a clean refresh when the operator's lock overlay paints or
+        // clears.
+        let is_locked_now = matches!(*lock_state_rx.borrow(), lock_state::LockState::Locked);
+        if is_locked_now != was_locked_last_iter {
+            if let Some(enc) = encoder.as_mut() {
+                enc.request_keyframe();
+            }
+            was_locked_last_iter = is_locked_now;
+        }
+
+        // Apply browser-requested keyframe (PLI/RTCP equivalent on DC).
+        if keyframe_requested.swap(false, std::sync::atomic::Ordering::SeqCst)
+            && let Some(enc) = encoder.as_mut()
+        {
+            enc.request_keyframe();
+        }
+
+        let Some(enc) = encoder.as_mut() else {
+            continue;
+        };
+
+        let packets = match enc.encode(frame.clone()).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(%session_id, %e, "HEVC DC pump: encode error");
+                continue;
+            }
+        };
+        frames_encoded += 1;
+
+        // Push each emitted packet through the framer + DC. FFmpeg may
+        // emit zero packets for some inputs (buffered B-frame
+        // equivalents); we set max_b_frames=0 so this is rare but
+        // possible at GOP boundaries.
+        let dc_arc = video_bytes_dc.lock().await.clone();
+        let Some(dc) = dc_arc else {
+            dc_unopen_drops += 1;
+            continue;
+        };
+
+        for pkt in packets {
+            let buf = frame_video_bytes(&pkt.data, pkt.is_keyframe, frame.monotonic_us);
+            match dc.send(&bytes::Bytes::from(buf.clone())).await {
+                Ok(n) => {
+                    frames_sent += 1;
+                    bytes_written += n as u64;
+                }
+                Err(e) => {
+                    send_errors += 1;
+                    tracing::warn!(%session_id, %e, "HEVC DC pump: DC send error");
+                }
+            }
+        }
+
+        // Heartbeat for log-grep observability. The VP9-444 pump emits
+        // a much richer set of fields (AIMD state, scene-change
+        // counters, ROI hits) — rc.77's HEVC pump keeps it tight until
+        // AIMD lands.
+        if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
+            last_heartbeat = std::time::Instant::now();
+            info!(
+                %session_id,
+                target_fps,
+                width = w,
+                height = h,
+                encoder = enc.name(),
+                frames_captured, frames_encoded, frames_sent, bytes_written,
+                send_errors, dc_unopen_drops,
+                "HEVC DC pump heartbeat (≈2s window)"
             );
         }
     }
