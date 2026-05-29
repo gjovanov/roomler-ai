@@ -338,7 +338,11 @@ synthetic-frame-source = []
 # measured; >+8 MB compressed = HARD STOP and re-plan.
 #
 # Phased rollout documented in `docs/hevc-dc-plan.md`.
-ffmpeg-encoder = ["dep:ffmpeg-next"]
+# rc.75 hotfix: ffmpeg-encoder needs dcv_color_primitives for BGRA→NV12.
+# Previously only `vp9-444` pulled the dep in, so the CI link-verify test
+# step that runs with `--features ffmpeg-encoder` alone hit
+# `error[E0432]: unresolved import dcv_color_primitives`.
+ffmpeg-encoder = ["dep:ffmpeg-next", "dep:dcv-color-primitives"]
 
 # M3 A1 — SYSTEM-context capture+input on the secure desktop. Lets
 # the perMachine MSI deployment drive the Windows lock screen / UAC

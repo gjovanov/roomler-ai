@@ -51,6 +51,21 @@ const HEVC_ENCODER_NAMES: &[&str] = &["hevc_nvenc", "hevc_qsv", "hevc_amf"];
 /// bitrate updates, and BGRA→NV12 conversion. The `convert_buf`
 /// scratch buffer is sized for the largest frame seen so far so we
 /// don't reallocate every frame.
+// Manually impl Debug — the underlying `codec::encoder::Video` doesn't
+// derive Debug, and we want a short stable repr for tracing + the
+// `Result<FfmpegEncoder, _>::unwrap_err()` in unit tests.
+impl std::fmt::Debug for FfmpegEncoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FfmpegEncoder")
+            .field("encoder_name", &self.encoder_name)
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("frame_count", &self.frame_count)
+            .field("force_keyframe", &self.force_keyframe)
+            .finish()
+    }
+}
+
 pub struct FfmpegEncoder {
     /// Stable identifier for logs / `is_hardware` decisions, e.g.
     /// `"hevc_nvenc"`. Bound at construction time, never changes.
