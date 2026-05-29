@@ -301,7 +301,13 @@ impl FfmpegEncoder {
         // rc.86 — configure an unopened encoder. Factored into a closure
         // so we can rebuild it for the fallback path (open_*_with consumes
         // the encoder, so a failed open can't be retried on the same one).
-        let configure = || -> Result<codec::encoder::Video> {
+        //
+        // rc.89 fix: the UNOPENED encoder is `encoder::video::Video`,
+        // which is a DIFFERENT type from `codec::encoder::Video` (the
+        // OPENED encoder this fn returns). `open_as*` converts unopened →
+        // opened. The closure must therefore declare the unopened type;
+        // annotating it as the opened type was the rc.86 CI E0308.
+        let configure = || -> Result<ffmpeg_next::encoder::video::Video> {
             let ctx = codec::Context::new_with_codec(codec);
             let mut enc = ctx.encoder().video().context("encoder().video() failed")?;
             enc.set_width(width);
