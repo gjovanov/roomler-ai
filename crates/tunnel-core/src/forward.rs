@@ -96,6 +96,22 @@ pub struct FlowStats {
     /// error; tracked separately so any divergence (frames refused
     /// by `dc.send` due to send-buffer pressure, etc.) is visible.
     pub dc_send_bytes: AtomicU64,
+    /// Bytes the FlowDemux's `on_message` handler RECEIVED off the DC
+    /// for this flow (payload bytes, post-frame-strip), incremented
+    /// the instant a message is dispatched — BEFORE it's pushed into
+    /// the mailbox.
+    ///
+    /// rc.78: re-added (it existed in the rc.66 draft, then was
+    /// dropped). This is the decisive counter for the tunnel-stall
+    /// investigation: compared against the PEER's `dc_send_bytes`, it
+    /// localises a freeze to either the wire/SCTP receive path
+    /// (peer's `dc_send` climbs but our `dc_recv` flatlines → data
+    /// left the sender but never reached our `on_message`) or the
+    /// local consumer (`dc_recv` tracks the peer's `dc_send` but
+    /// `tcp_write_bytes` lags). On the agent this counts the query
+    /// bytes from the client; on the tunnel-client it counts the
+    /// result-set bytes from the agent (the SELECT direction).
+    pub dc_recv_bytes: AtomicU64,
     /// Bytes the DC→TCP pump has WRITTEN to the local TcpStream
     /// (post-`write_all` on loopback in the tunnel-client case).
     /// This is the bottom of the consumer chain — if it lags
@@ -111,11 +127,13 @@ pub struct FlowStats {
 }
 
 impl FlowStats {
-    /// `(tcp_read, dc_send, tcp_write, mailbox_depth)` — relaxed snapshot.
-    pub fn snapshot(&self) -> (u64, u64, u64, u64) {
+    /// `(tcp_read, dc_send, dc_recv, tcp_write, mailbox_depth)` —
+    /// relaxed snapshot.
+    pub fn snapshot(&self) -> (u64, u64, u64, u64, u64) {
         (
             self.tcp_read_bytes.load(Ordering::Relaxed),
             self.dc_send_bytes.load(Ordering::Relaxed),
+            self.dc_recv_bytes.load(Ordering::Relaxed),
             self.tcp_write_bytes.load(Ordering::Relaxed),
             self.mailbox_depth.load(Ordering::Relaxed),
         )
@@ -155,7 +173,14 @@ const _: () = assert!(CHUNK_BYTES.is_power_of_two());
 // mailboxes by decoding the 4-byte `flow_id` prefix.
 // ────────────────────────────────────────────────────────────────────────────
 
-type FlowMap = Arc<Mutex<HashMap<u32, mpsc::Sender<Bytes>>>>;
+/// Per-flow demux entry: the mailbox sender + the flow's shared
+/// [`FlowStats`]. The stats live here (not just in `run_flow`) so the
+/// demux `on_message` handler — which runs per-DC, fanning out to many
+/// flows — can bump `dc_recv_bytes` for the right flow the instant a
+/// message is dispatched. Same `Arc<FlowStats>` is handed to
+/// `run_flow` so the throughput logger and the receive counter share
+/// one set of atomics.
+type FlowMap = Arc<Mutex<HashMap<u32, (mpsc::Sender<Bytes>, Arc<FlowStats>)>>>;
 
 /// Owns one `RTCDataChannel` and routes inbound messages to per-flow
 /// `mpsc::Receiver<Bytes>`. Install once per DC right after the pool
@@ -198,11 +223,11 @@ impl FlowDemux {
                     flows.lock().await.remove(&flow_id);
                     return;
                 }
-                let sender = {
+                let entry = {
                     let map = flows.lock().await;
                     map.get(&flow_id).cloned()
                 };
-                let Some(tx) = sender else {
+                let Some((tx, stats)) = entry else {
                     trace!(
                         flow_id,
                         len = payload.len(),
@@ -210,6 +235,15 @@ impl FlowDemux {
                     );
                     return;
                 };
+                // Count receipt the instant we dispatch — BEFORE the
+                // (potentially blocking) mailbox send — so `dc_recv_bytes`
+                // reflects what actually arrived off the DC, independent
+                // of how fast the local consumer drains. This is the
+                // counter that splits "stuck on the wire" from "stuck in
+                // the consumer" in the throughput log.
+                stats
+                    .dc_recv_bytes
+                    .fetch_add(payload.len() as u64, Ordering::Relaxed);
                 if let Err(e) = tx.send(Bytes::copy_from_slice(payload)).await {
                     debug!(flow_id, %e, "tunnel flow mailbox closed; dropping payload");
                 }
@@ -218,19 +252,23 @@ impl FlowDemux {
         Self { dc, flows }
     }
 
-    /// Open a mailbox for `flow_id`. The returned receiver yields
-    /// payload `Bytes` (flow_id prefix already stripped) and closes
+    /// Open a mailbox for `flow_id`. Returns the receiver (yielding
+    /// payload `Bytes` with the flow_id prefix already stripped) plus
+    /// the flow's [`FlowStats`] — hand the SAME `Arc<FlowStats>` to
+    /// [`run_flow`] so the demux's `dc_recv_bytes` counter and the
+    /// pumps' counters share one set of atomics. The mailbox closes
     /// when [`unregister`] fires or the DC drops.
-    pub async fn register(&self, flow_id: u32) -> mpsc::Receiver<Bytes> {
+    pub async fn register(&self, flow_id: u32) -> (mpsc::Receiver<Bytes>, Arc<FlowStats>) {
         let (tx, rx) = mpsc::channel(FLOW_INBOX_CAP);
+        let stats = Arc::new(FlowStats::default());
         let mut map = self.flows.lock().await;
-        if map.insert(flow_id, tx).is_some() {
+        if map.insert(flow_id, (tx, Arc::clone(&stats))).is_some() {
             warn!(
                 flow_id,
                 "tunnel flow re-registered; previous mailbox dropped"
             );
         }
-        rx
+        (rx, stats)
     }
 
     /// Close the mailbox for `flow_id`. Idempotent.
@@ -285,6 +323,7 @@ pub async fn run_flow(
     flow_id: u32,
     mut from_dc: mpsc::Receiver<Bytes>,
     on_local_eof: HalfCloseSink,
+    stats: Arc<FlowStats>,
 ) -> CloseReason {
     // Set the DC's low-water threshold once. `on_buffered_amount_low`
     // fires whenever the SCTP send queue drops back to or below this
@@ -303,13 +342,22 @@ pub async fn run_flow(
 
     let (read_half, write_half) = tcp.into_split();
 
-    // rc.66 instrumentation: per-flow byte counters with a periodic
-    // logger that prints {tcp_read, dc_send, tcp_write, mailbox_depth}
-    // every 2 s. The logger task dies when the flow finishes (both
-    // pumps return). Throughput is reported as delta-per-period, so
-    // a steady-state value of "5 MB/s" means the flow moved 5 MB
-    // through that stage in the last 2 s window.
-    let stats = Arc::new(FlowStats::default());
+    // rc.66/rc.78 instrumentation: per-flow byte counters with a
+    // periodic logger that prints {tcp_read, dc_send, dc_recv,
+    // tcp_write, mailbox_depth} every 2 s. The `stats` are created by
+    // [`FlowDemux::register`] and shared with the demux so `dc_recv`
+    // reflects what arrived off the DC. The logger task dies when the
+    // flow finishes (both pumps return). Throughput is reported as
+    // delta-per-period, so "5 MB/s" means 5 MB moved through that
+    // stage in the last 2 s window.
+    //
+    // rc.78: the `dc_recv_kbps` column is the decisive one for the
+    // stall hunt — compare it against the PEER's `dc_send_kbps`:
+    //   * peer dc_send climbing, our dc_recv flat  → wire / SCTP
+    //     receive-path stall (bytes left the sender, never reached
+    //     our on_message)
+    //   * dc_recv tracks peer dc_send, tcp_write lags → local
+    //     consumer stall (but mailbox_depth would also rise)
     let stats_for_logger = Arc::clone(&stats);
     let logger_handle = tokio::spawn(async move {
         let mut prev = stats_for_logger.snapshot();
@@ -324,18 +372,21 @@ pub async fn run_flow(
             let cur = stats_for_logger.snapshot();
             let d_read = cur.0.saturating_sub(prev.0);
             let d_send = cur.1.saturating_sub(prev.1);
-            let d_write = cur.2.saturating_sub(prev.2);
+            let d_recv = cur.2.saturating_sub(prev.2);
+            let d_write = cur.3.saturating_sub(prev.3);
             // Only emit when something moved — quiescent flows
             // shouldn't spam the log.
-            if d_read != 0 || d_send != 0 || d_write != 0 {
+            if d_read != 0 || d_send != 0 || d_recv != 0 || d_write != 0 {
                 info!(
                     flow_id,
                     tcp_read_total = cur.0,
                     dc_send_total = cur.1,
-                    tcp_write_total = cur.2,
-                    mailbox_depth = cur.3,
+                    dc_recv_total = cur.2,
+                    tcp_write_total = cur.3,
+                    mailbox_depth = cur.4,
                     tcp_read_kbps = d_read / 1024 / 2,
                     dc_send_kbps = d_send / 1024 / 2,
+                    dc_recv_kbps = d_recv / 1024 / 2,
                     tcp_write_kbps = d_write / 1024 / 2,
                     "tunnel flow throughput (2s window)"
                 );
@@ -374,11 +425,12 @@ pub async fn run_flow(
     // the operator gets a one-shot summary of the flow's lifetime
     // throughput even if the 2 s ticker hadn't fired since the last
     // delta.
-    let (read_total, send_total, write_total, _mb_depth) = stats.snapshot();
+    let (read_total, send_total, recv_total, write_total, _mb_depth) = stats.snapshot();
     info!(
         flow_id,
         tcp_read_total = read_total,
         dc_send_total = send_total,
+        dc_recv_total = recv_total,
         tcp_write_total = write_total,
         "tunnel flow closed — final throughput totals"
     );
@@ -404,15 +456,55 @@ async fn pump_tcp_to_dc(
         // Backpressure gate. Check current buffered_amount; if
         // above HIGH, wait on the notifier (which fires when SCTP
         // drains to LOW).
+        //
+        // rc.78 instrumentation: promote the pause/resume tracing from
+        // trace! to info! and count how long / how many wakeups a
+        // single pause spans. This is the OTHER half of the stall
+        // diagnostic: if the log shows "pump paused buffered=4.x MiB"
+        // followed by repeated "still paused" heartbeats and NO
+        // "resumed" line, the `bufferedAmountLow` event has stopped
+        // firing (a known webrtc-rs footgun) and the sender is wedged
+        // — distinct from a receive-side stall (which shows as the
+        // peer's dc_recv flatlining while THIS side never even fills
+        // its send buffer). Only the FIRST entry into the paused state
+        // logs at info; subsequent re-checks within the same pause use
+        // a heartbeat every ~2 s so a long pause is visible without
+        // spamming.
+        let mut paused_wakeups: u64 = 0;
         loop {
             let buffered = dc.buffered_amount().await;
             if buffered <= HIGH_WATER_MARK_BYTES {
+                if paused_wakeups > 0 {
+                    info!(
+                        flow_id,
+                        buffered,
+                        wakeups = paused_wakeups,
+                        "tunnel pump resumed — buffered drained below HIGH_WATER"
+                    );
+                }
                 break;
             }
-            trace!(
-                flow_id,
-                buffered, "tunnel pump paused — awaiting bufferedAmountLow"
-            );
+            // Log the first pause at info; thereafter a heartbeat every
+            // ~8 wakeups (≈2 s at the 250 ms re-check cadence) so a
+            // wedged sender is loud but a healthy transient pause is one
+            // line.
+            if paused_wakeups == 0 {
+                info!(
+                    flow_id,
+                    buffered,
+                    high_water = HIGH_WATER_MARK_BYTES,
+                    "tunnel pump paused — buffered above HIGH_WATER, awaiting bufferedAmountLow"
+                );
+            } else if paused_wakeups.is_multiple_of(8) {
+                info!(
+                    flow_id,
+                    buffered,
+                    wakeups = paused_wakeups,
+                    "tunnel pump STILL paused — bufferedAmountLow has not fired \
+                     (possible sender wedge)"
+                );
+            }
+            paused_wakeups += 1;
             // Race a small timeout so we don't deadlock if the
             // low-water event somehow never fires (defensive — the
             // event SHOULD fire reliably).
@@ -559,7 +651,7 @@ mod tests {
         let off_dc = offerer.dc(0).unwrap();
         let ans_dc = answerer.dc(0).unwrap();
         let ans_demux = FlowDemux::install(ans_dc.clone()).await;
-        let mut from_dc_answerer = ans_demux.register(1).await;
+        let (mut from_dc_answerer, _stats) = ans_demux.register(1).await;
 
         // Manual send loop — same framing as `pump_tcp_to_dc` but
         // bypasses the TCP read half so the test scope stays focused
@@ -643,7 +735,7 @@ mod tests {
         let off_dc = offerer.dc(0).unwrap();
         let ans_dc = answerer.dc(0).unwrap();
         let ans_demux = FlowDemux::install(ans_dc).await;
-        let mut from_dc = ans_demux.register(42).await;
+        let (mut from_dc, _stats) = ans_demux.register(42).await;
 
         let framed = mux::encode(42, b"hello world");
         off_dc.send(&Bytes::from(framed)).await.unwrap();

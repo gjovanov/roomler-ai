@@ -465,7 +465,7 @@ async fn handle_local_connection(
     };
     let demux = demux.clone();
 
-    let from_dc = demux.register(flow_id).await;
+    let (from_dc, stats) = demux.register(flow_id).await;
     active_flows.lock().await.insert(flow_id, dc_index);
 
     // Half-close audit callback. The in-band sentinel in the pump
@@ -487,7 +487,7 @@ async fn handle_local_connection(
 
     let dc = demux.dc();
     debug!(flow_id, dc_index, %peer_addr, "running flow");
-    let close_reason = run_flow(tcp, dc, flow_id, from_dc, on_local_eof).await;
+    let close_reason = run_flow(tcp, dc, flow_id, from_dc, on_local_eof, stats).await;
     info!(flow_id, ?close_reason, "flow ended");
 
     // Audit close.
