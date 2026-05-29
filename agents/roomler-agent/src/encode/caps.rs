@@ -141,6 +141,9 @@ fn compute_caps() -> AgentCaps {
     // works on RTX 5090 Blackwell — the two boxes MF was broken on.
     #[cfg(feature = "ffmpeg-encoder")]
     if crate::encode::ffmpeg::available() {
+        // `name()` is on the `VideoEncoder` trait — need the trait in
+        // scope at the call site for method-resolution.
+        use super::VideoEncoder;
         let start = std::time::Instant::now();
         match crate::encode::ffmpeg::FfmpegEncoder::new_hevc(PROBE_WIDTH, PROBE_HEIGHT) {
             Ok(enc) => {

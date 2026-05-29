@@ -2235,21 +2235,31 @@ async fn media_pump_hevc_dc(
 
         // Capture one frame; on transient failure, reuse the last
         // good one as a keepalive so the browser decoder doesn't
-        // pause.
-        let frame_opt: Option<std::sync::Arc<crate::capture::Frame>> = match capturer.next() {
-            Some(f) => {
+        // pause. ScreenCapture's method is `next_frame() -> Result<
+        // Option<Frame>>`, not Iterator::next — matches the pattern
+        // used by `media_pump_vp9_444_dc` at line ~1741.
+        let frame: std::sync::Arc<crate::capture::Frame> = match capturer.next_frame().await {
+            Ok(Some(f)) => {
                 let arc = std::sync::Arc::new(f);
                 last_good_frame = Some(arc.clone());
+                last_capture_at = std::time::Instant::now();
                 frames_captured += 1;
-                Some(arc)
+                arc
             }
-            None => last_good_frame
-                .clone()
-                .filter(|_| last_capture_at.duration_since(last_capture_at) < IDLE_KEEPALIVE),
-        };
-
-        let Some(frame) = frame_opt else {
-            continue;
+            Ok(None) => {
+                if last_capture_at.elapsed() >= IDLE_KEEPALIVE
+                    && let Some(ref f) = last_good_frame
+                {
+                    last_capture_at = std::time::Instant::now();
+                    f.clone()
+                } else {
+                    continue;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(%session_id, %e, "HEVC DC pump: capture error");
+                continue;
+            }
         };
 
         // Lazily build / rebuild the encoder when the frame dims change.
