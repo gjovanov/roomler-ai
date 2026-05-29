@@ -885,7 +885,8 @@ async fn media_pump(
                     %session_id,
                     "media pump: HEVC over DataChannel (rc.77 — FFmpeg via vendor SDK)"
                 );
-                return media_pump_hevc_dc(
+                return media_pump_ffmpeg_dc(
+                    FfmpegDcCodec::Hevc,
                     session_id,
                     video_bytes_dc,
                     keyframe_requested,
@@ -917,11 +918,45 @@ async fn media_pump(
         negotiated_transport.as_deref(),
         Some("data-channel-vp9-444")
     ) {
+        // rc.83 — Intel HW VP9 via FFmpeg vp9_qsv. When the env var is
+        // set AND the operator's host has a working vp9_qsv encoder,
+        // route the same `data-channel-vp9-444` transport through the
+        // FFmpeg pump (Intel iGPU instead of libvpx SW). Probe before
+        // we commit to this path so a missing-driver host transparently
+        // falls back to libvpx. Profile constraint: vp9_qsv is 4:2:0-
+        // only, so when the operator forced chroma=4:4:4 (via session
+        // request OR env var) we keep the libvpx SW path which is the
+        // only one that emits VP9 profile 1.
+        #[cfg(feature = "ffmpeg-encoder")]
+        {
+            let wants_444 = matches!(chroma_pref.as_deref(), Some("yuv444"));
+            if !wants_444 && crate::encode::ffmpeg::available() {
+                // Quick probe at the standard caps probe resolution. If
+                // it succeeds the host has a working vp9_qsv path.
+                if let Ok(probe) = crate::encode::ffmpeg::FfmpegEncoder::new_vp9(480, 270) {
+                    drop(probe);
+                    tracing::info!(
+                        %session_id,
+                        "media pump: VP9 over DataChannel via FFmpeg vp9_qsv (Intel HW; rc.83 Iris Xe fps unlock)"
+                    );
+                    return media_pump_ffmpeg_dc(
+                        FfmpegDcCodec::Vp9,
+                        session_id,
+                        video_bytes_dc,
+                        keyframe_requested,
+                        target_resolution,
+                        lock_state_rx,
+                        quality_state,
+                    )
+                    .await;
+                }
+            }
+        }
         #[cfg(feature = "vp9-444")]
         {
             tracing::info!(
                 %session_id,
-                "media pump: VP9-444 over DataChannel (Phase Y.3)"
+                "media pump: VP9-444 over DataChannel (Phase Y.3 libvpx SW path)"
             );
             return media_pump_vp9_444_dc(
                 session_id,
@@ -2157,22 +2192,57 @@ async fn media_pump_vp9_444_dc(
     }
 }
 
-/// rc.77 — HEVC over DataChannel pump (Option B, FFmpeg backend).
+/// rc.83 — Codec selector for the unified FFmpeg DC pump. Lets one
+/// pump function serve both HEVC (over `data-channel-hevc`) and VP9
+/// (over `data-channel-vp9-444` when FFmpeg vp9_qsv is preferred over
+/// libvpx SW) without duplicating the capture → encode → frame →
+/// send loop.
+#[cfg(feature = "ffmpeg-encoder")]
+#[derive(Debug, Clone, Copy)]
+enum FfmpegDcCodec {
+    Hevc,
+    Vp9,
+}
+
+#[cfg(feature = "ffmpeg-encoder")]
+impl FfmpegDcCodec {
+    fn open(self, w: u32, h: u32) -> anyhow::Result<crate::encode::ffmpeg::FfmpegEncoder> {
+        use crate::encode::ffmpeg::FfmpegEncoder;
+        match self {
+            Self::Hevc => FfmpegEncoder::new_hevc(w, h),
+            Self::Vp9 => FfmpegEncoder::new_vp9(w, h),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Hevc => "HEVC",
+            Self::Vp9 => "VP9",
+        }
+    }
+}
+
+/// rc.77/rc.83 — Unified FFmpeg-encoder DataChannel pump.
 ///
 /// Mirrors `media_pump_vp9_444_dc` structurally but uses
-/// `FfmpegEncoder` (which dispatches to `hevc_nvenc` / `hevc_qsv` /
-/// `hevc_amf` via the vendor SDKs) and emits HEVC Annex-B
-/// length-prefixed over the `video-bytes` DC. Shares the same 13-byte
-/// header as the VP9 path so `frame_video_bytes` is reused verbatim.
+/// `FfmpegEncoder` (which dispatches to vendor SDKs) and emits raw
+/// codec bytes length-prefixed over the `video-bytes` DC. Shares the
+/// same 13-byte header as the VP9 path so `frame_video_bytes` is
+/// reused verbatim.
+///
+/// `codec` chooses which encoder dispatch the FfmpegEncoder uses:
+/// - `Hevc` → `hevc_nvenc` / `hevc_qsv` / `hevc_amf` (rc.77 path)
+/// - `Vp9` → `vp9_qsv` (rc.83 path — Intel-only HW VP9, unblocks
+///   the Iris Xe CPU-bound 17 fps → 60 fps target)
 ///
 /// Scope intentionally minimal for first ship: capture → encode →
 /// frame → send. No AIMD backpressure, no scene-change detection, no
-/// anti-IDR-storm coalescer (rc.78), no ROI hints (rc.79+). The pump
-/// is good enough to verify the wire format end-to-end and validate
-/// Gate 0 → real-session continuity; AIMD lands once we have field
-/// telemetry to tune against.
+/// anti-IDR-storm coalescer, no ROI hints. The pump is good enough
+/// to verify the wire format end-to-end and validate Gate 0 → real-
+/// session continuity; AIMD lands once we have field telemetry.
 #[cfg(feature = "ffmpeg-encoder")]
-async fn media_pump_hevc_dc(
+async fn media_pump_ffmpeg_dc(
+    codec: FfmpegDcCodec,
     session_id: bson::oid::ObjectId,
     video_bytes_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
     keyframe_requested: Arc<std::sync::atomic::AtomicBool>,
@@ -2183,6 +2253,8 @@ async fn media_pump_hevc_dc(
     use crate::encode::VideoEncoder;
     use crate::encode::ffmpeg::FfmpegEncoder;
 
+    let codec_label = codec.label();
+
     // Mirror the VP9 pump's overlay gate. Under SystemContext the
     // captured frame IS the real Winlogon screen; an overlay over it
     // would hide the password prompt and block remote unlock.
@@ -2190,7 +2262,8 @@ async fn media_pump_hevc_dc(
     if sys_ctx_worker {
         info!(
             %session_id,
-            "media_pump_hevc_dc: SystemContext worker — lock overlay disabled"
+            codec_label,
+            "media_pump_ffmpeg_dc: SystemContext worker — lock overlay disabled"
         );
     }
     let mut was_locked_last_iter = matches!(*lock_state_rx.borrow(), lock_state::LockState::Locked);
@@ -2200,8 +2273,9 @@ async fn media_pump_hevc_dc(
     let downscale = crate::capture::DownscalePolicy::Never;
     info!(
         %session_id,
+        codec_label,
         target_fps,
-        "HEVC DC pump starting (rc.77 — FFmpeg backend)"
+        "FFmpeg DC pump starting"
     );
     let mut capturer = capture::open_default(target_fps, downscale);
     let mut encoder: Option<FfmpegEncoder> = None;
@@ -2269,14 +2343,15 @@ async fn media_pump_hevc_dc(
             None => true,
         };
         if need_rebuild {
-            match FfmpegEncoder::new_hevc(w, h) {
+            match codec.open(w, h) {
                 Ok(enc) => {
                     info!(
                         %session_id,
+                        codec_label,
                         width = w,
                         height = h,
                         encoder = enc.name(),
-                        "HEVC DC pump: encoder (re)built"
+                        "FFmpeg DC pump: encoder (re)built"
                     );
                     encoder = Some(enc);
                     encoder_dims = Some((w, h));
@@ -2284,8 +2359,9 @@ async fn media_pump_hevc_dc(
                 Err(e) => {
                     tracing::error!(
                         %session_id,
+                        codec_label,
                         %e,
-                        "HEVC DC pump: FfmpegEncoder construction failed — exiting pump"
+                        "FFmpeg DC pump: encoder construction failed — exiting pump"
                     );
                     return;
                 }
@@ -2317,7 +2393,7 @@ async fn media_pump_hevc_dc(
         let packets = match enc.encode(frame.clone()).await {
             Ok(p) => p,
             Err(e) => {
-                tracing::warn!(%session_id, %e, "HEVC DC pump: encode error");
+                tracing::warn!(%session_id, codec_label, %e, "FFmpeg DC pump: encode error");
                 continue;
             }
         };
@@ -2342,26 +2418,27 @@ async fn media_pump_hevc_dc(
                 }
                 Err(e) => {
                     send_errors += 1;
-                    tracing::warn!(%session_id, %e, "HEVC DC pump: DC send error");
+                    tracing::warn!(%session_id, codec_label, %e, "FFmpeg DC pump: DC send error");
                 }
             }
         }
 
         // Heartbeat for log-grep observability. The VP9-444 pump emits
         // a much richer set of fields (AIMD state, scene-change
-        // counters, ROI hits) — rc.77's HEVC pump keeps it tight until
-        // AIMD lands.
+        // counters, ROI hits) — this pump keeps it tight until AIMD
+        // lands.
         if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
             last_heartbeat = std::time::Instant::now();
             info!(
                 %session_id,
+                codec_label,
                 target_fps,
                 width = w,
                 height = h,
                 encoder = enc.name(),
                 frames_captured, frames_encoded, frames_sent, bytes_written,
                 send_errors, dc_unopen_drops,
-                "HEVC DC pump heartbeat (≈2s window)"
+                "FFmpeg DC pump heartbeat (≈2s window)"
             );
         }
     }
