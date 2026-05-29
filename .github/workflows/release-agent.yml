@@ -305,7 +305,10 @@ jobs:
           }
           "@
           $hash = (Get-FileHash -Algorithm SHA256 -InputStream ([IO.MemoryStream]::new([Text.Encoding]::UTF8.GetBytes($manifest)))).Hash.Substring(0, 12)
-          $key = "ffmpeg-vcpkg-v1-$hash"
+          # rc.76: bumped cache key to v2 because the triplet changed from
+          # x64-windows (dynamic, DLLs) to x64-windows-static-md (static
+          # libs). Same manifest content but different cached artifacts.
+          $key = "ffmpeg-vcpkg-v2-static-md-$hash"
           Write-Host "FFmpeg cache key: $key"
           "key=$key" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           # Stash the manifest content for the install step.
@@ -352,14 +355,23 @@ jobs:
       - name: Build FFmpeg via vcpkg (encode-only HW backends)
         shell: pwsh
         run: |
-          if (Test-Path 'C:\ffmpeg-pin\installed\x64-windows\lib\pkgconfig\libavcodec.pc') {
+          if (Test-Path 'C:\ffmpeg-pin\installed\x64-windows-static-md\lib\pkgconfig\libavcodec.pc') {
             Write-Host "FFmpeg already installed (cache hit) — skipping vcpkg build"
           } else {
             Write-Host "Cold build — installing FFmpeg via vcpkg (expect 25-40 min)"
             New-Item -ItemType Directory -Path C:\ffmpeg-pin -Force | Out-Null
             Copy-Item $env:FFMPEG_MANIFEST_PATH C:\ffmpeg-pin\vcpkg.json -Force
             Push-Location C:\ffmpeg-pin
-            C:\vcpkg\vcpkg.exe install --triplet=x64-windows --x-install-root=C:\ffmpeg-pin\installed
+            # rc.76: switched from x64-windows (dynamic, DLLs) to
+            # x64-windows-static-md (static libs + dynamic MS runtime,
+            # Rust-compatible). Pre-rc.72 the FFmpeg link was effectively
+            # dead-stripped (no symbols called from non-test paths), so
+            # x64-windows shipped DLL-less MSIs that happened to work.
+            # rc.72 added actual FFmpeg calls in FfmpegEncoder, so the
+            # link became real and the missing-DLL bug surfaced at
+            # install time (avcodec-62.dll not found). Static linkage
+            # bundles FFmpeg into the EXE — no DLLs to ship.
+            C:\vcpkg\vcpkg.exe install --triplet=x64-windows-static-md --x-install-root=C:\ffmpeg-pin\installed
             if ($LASTEXITCODE -ne 0) {
               Write-Host "::error::vcpkg install ffmpeg failed — see logs above. rc.67 cannot proceed without this."
               exit 1
@@ -369,13 +381,13 @@ jobs:
           # Verify the pkg-config files we need actually landed.
           $required = @('libavcodec.pc', 'libavutil.pc')
           foreach ($pc in $required) {
-            $p = "C:\ffmpeg-pin\installed\x64-windows\lib\pkgconfig\$pc"
+            $p = "C:\ffmpeg-pin\installed\x64-windows-static-md\lib\pkgconfig\$pc"
             if (-not (Test-Path $p)) {
               Write-Host "::error::Expected pkg-config file missing: $p"
               exit 1
             }
           }
-          Write-Host "FFmpeg pkg-config files present at C:\ffmpeg-pin\installed\x64-windows\lib\pkgconfig\"
+          Write-Host "FFmpeg pkg-config files present at C:\ffmpeg-pin\installed\x64-windows-static-md\lib\pkgconfig\"
 
       - name: Append FFmpeg to PKG_CONFIG_PATH + DLL PATH
         shell: pwsh
@@ -385,7 +397,7 @@ jobs:
           # path, write back. Windows pkg-config uses ';' as separator.
           $existing = [Environment]::GetEnvironmentVariable('PKG_CONFIG_PATH', 'Process')
           if ([string]::IsNullOrEmpty($existing)) { $existing = "" } else { $existing = "$existing;" }
-          $combined = "${existing}C:/ffmpeg-pin/installed/x64-windows/lib/pkgconfig"
+          $combined = "${existing}C:/ffmpeg-pin/installed/x64-windows-static-md/lib/pkgconfig"
           "PKG_CONFIG_PATH=$combined" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "PKG_CONFIG_PATH=$combined"
           # rc.71 hotfix: vcpkg's x64-windows triplet produces DLLs for
@@ -394,8 +406,8 @@ jobs:
           # find them at runtime (STATUS_DLL_NOT_FOUND, 0xc0000135 — rc.69
           # CI failure). Add the ffmpeg bin dir to GITHUB_PATH so cargo test
           # picks it up. Also stash for the MSI staging step below.
-          "C:\ffmpeg-pin\installed\x64-windows\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
-          "FFMPEG_DLL_DIR=C:\ffmpeg-pin\installed\x64-windows\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "C:\ffmpeg-pin\installed\x64-windows-static-md\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          "FFMPEG_DLL_DIR=C:\ffmpeg-pin\installed\x64-windows-static-md\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
@@ -488,23 +500,22 @@ jobs:
             Write-Host "No vpx.dll under $env:VPX_DLL_DIR — static linkage, nothing to stage"
           }
 
-      - name: Stage FFmpeg DLLs alongside agent binary (for MSI bundle)
-        # rc.71 hotfix: ffmpeg via vcpkg x64-windows triplet ships as DLLs
-        # (libavcodec-*.dll, libavformat-*.dll, libavutil-*.dll, etc.). The
-        # agent binary needs them at runtime. Copy all FFmpeg DLLs from the
-        # vcpkg install's bin dir to target\release\ so cargo-wix harvests
-        # them into the MSI. The harvest pattern in main.wxs already
-        # includes target\release\*.dll on a wildcard, so this is enough.
+      - name: Stage FFmpeg DLLs alongside agent binary (no-op for static-md)
+        # rc.76: triplet switched to x64-windows-static-md so no FFmpeg
+        # DLLs exist — FFmpeg is statically linked into the EXE. This
+        # step becomes a soft no-op when FFMPEG_DLL_DIR is empty or
+        # doesn't exist (vs the rc.71 hard error). Kept around in case
+        # we ever switch back to a dynamic triplet for size reasons.
         shell: pwsh
         run: |
           if (-not (Test-Path $env:FFMPEG_DLL_DIR)) {
-            Write-Host "::error::FFMPEG_DLL_DIR not set or doesn't exist: $env:FFMPEG_DLL_DIR"
-            exit 1
+            Write-Host "No bin dir under $env:FFMPEG_DLL_DIR — static-md triplet, nothing to stage."
+            exit 0
           }
           $dlls = Get-ChildItem -Path $env:FFMPEG_DLL_DIR -Filter "*.dll"
           if ($dlls.Count -eq 0) {
-            Write-Host "::error::No DLLs found under $env:FFMPEG_DLL_DIR — vcpkg install may have failed silently or used a static triplet."
-            exit 1
+            Write-Host "No DLLs under $env:FFMPEG_DLL_DIR — static-md triplet, nothing to stage."
+            exit 0
           }
           foreach ($dll in $dlls) {
             Copy-Item $dll.FullName target\release\
