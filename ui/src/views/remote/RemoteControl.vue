@@ -289,6 +289,21 @@
         aria-label="VP9 chroma format"
         :title="vp9ChromaHint"
       />
+      <!-- rc.81 — HEVC over DataChannel toggle. Mutually exclusive
+           with Crystal-Clear (both write `videoTransport`). Disabled
+           when the browser lacks HW HEVC decode. -->
+      <v-btn
+        icon
+        variant="text"
+        size="small"
+        :color="hevcOn ? 'primary' : undefined"
+        :disabled="!rc.hevcSupported.value"
+        :aria-label="hevcOn ? 'Disable HEVC DataChannel path' : 'Enable HEVC DataChannel path'"
+        :title="hevcTooltip"
+        @click="toggleHevc"
+      >
+        <v-icon>{{ hevcOn ? 'mdi-video-vintage' : 'mdi-video' }}</v-icon>
+      </v-btn>
       <!-- Low-latency (WebCodecs) toggle. Bypasses Chrome's <video>
            jitter-buffer floor (~80ms). Disabled when the browser
            lacks RTCRtpScriptTransform / VideoDecoder. -->
@@ -834,7 +849,7 @@
           <!-- Session-config toggles. Side-by-side on phone since
                they're each one tap and the icons make the meaning
                obvious; the title on each is the full description. -->
-          <div class="d-flex ga-2 align-center">
+          <div class="d-flex ga-2 align-center flex-wrap">
             <v-btn
               variant="tonal"
               :color="vp9_444On ? 'primary' : undefined"
@@ -845,6 +860,20 @@
               @click="toggleVp9_444"
             >
               Crystal-Clear {{ vp9_444On ? 'ON' : 'OFF' }}
+            </v-btn>
+            <!-- rc.81 — HEVC over DataChannel toggle (mobile). Mutually
+                 exclusive with Crystal-Clear since both write
+                 `videoTransport`. -->
+            <v-btn
+              variant="tonal"
+              :color="hevcOn ? 'primary' : undefined"
+              :disabled="!rc.hevcSupported.value"
+              prepend-icon="mdi-video"
+              :title="hevcTooltip"
+              class="flex-grow-1"
+              @click="toggleHevc"
+            >
+              HEVC {{ hevcOn ? 'ON' : 'OFF' }}
             </v-btn>
             <v-btn
               variant="tonal"
@@ -1842,6 +1871,29 @@ const vp9_444Tooltip = computed<string>(() => {
 })
 function toggleVp9_444() {
   const next: RcVideoTransport = vp9_444On.value ? 'webrtc' : 'data-channel-vp9-444'
+  rc.setVideoTransport(next)
+}
+
+// rc.81 — HEVC over DataChannel toggle. Same shape as
+// `toggleVp9_444`; cycles `data-channel-hevc` ↔ `webrtc` on the
+// composable's `videoTransport`. Mutually exclusive with the
+// Crystal-Clear (VP9-444) toggle since both write the same ref —
+// flipping HEVC on overrides VP9-444 and vice-versa. The composable
+// auto-falls back to VP9-444 then webrtc if HEVC decode is
+// unsupported at session-establish time.
+const hevcOn = computed<boolean>(
+  () => rc.videoTransport.value === 'data-channel-hevc',
+)
+const hevcTooltip = computed<string>(() => {
+  if (!rc.hevcSupported.value) {
+    return 'HEVC over DataChannel requires WebCodecs VideoDecoder hev1.1.6.L93.B0 with a HW HEVC decoder — not supported in this browser'
+  }
+  return hevcOn.value
+    ? 'HEVC over DataChannel ON — agent encodes via NVENC/QSV/AMF (Option B). Takes effect on next Connect.'
+    : 'HEVC over DataChannel OFF — using current transport. Click to switch to HEVC on next Connect.'
+})
+function toggleHevc() {
+  const next: RcVideoTransport = hevcOn.value ? 'webrtc' : 'data-channel-hevc'
   rc.setVideoTransport(next)
 }
 
