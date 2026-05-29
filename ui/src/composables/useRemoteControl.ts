@@ -504,7 +504,7 @@ export function isWebCodecsSupported(): boolean {
  *    `data-channel-vp9-444` in its `AgentCaps.transports`. Falls
  *    back to `webrtc` silently when either side lacks support.
  *    Takes effect on the next `connect()`. */
-export type RcVideoTransport = 'webrtc' | 'data-channel-vp9-444'
+export type RcVideoTransport = 'webrtc' | 'data-channel-vp9-444' | 'data-channel-hevc'
 
 const VIDEO_TRANSPORT_STORAGE_KEY = 'roomler-rc-video-transport'
 
@@ -538,7 +538,12 @@ function persistVp9Chroma(c: Vp9ChromaPref) {
 function readStoredVideoTransport(): RcVideoTransport {
   try {
     const raw = globalThis.localStorage?.getItem(VIDEO_TRANSPORT_STORAGE_KEY)
-    if (raw === 'data-channel-vp9-444' || raw === 'webrtc') return raw
+    if (
+      raw === 'data-channel-vp9-444'
+      || raw === 'data-channel-hevc'
+      || raw === 'webrtc'
+    )
+      return raw
   } catch {
     /* privacy mode → default */
   }
@@ -569,6 +574,37 @@ export async function isVp9_444DecodeSupported(): Promise<boolean> {
   if (typeof isConfigSupported !== 'function') return false
   try {
     const res = await isConfigSupported({ codec: 'vp09.01.10.08' })
+    return res?.supported === true
+  } catch {
+    return false
+  }
+}
+
+/** rc.78 — feature-detect HEVC decode via WebCodecs. Pre-flight
+ *  WebCodecs spike (2026-05-26) confirmed Chrome + Edge accept
+ *  `hev1.1.6.L93.B0` (Main profile, Level 3.1) with Annex-B no-
+ *  description bytes. The composable probes once on construction +
+ *  caches in `hevcSupported`; `connect()` re-probes on the off-
+ *  chance the cache hasn't resolved yet.
+ *
+ *  Unlike VP9, HEVC has NO software fallback in WebCodecs — Chromium
+ *  only enables HEVC decode when the OS provides a HW decoder.
+ *  Returns false on:
+ *  - any pre-WebCodecs browser (no `VideoDecoder` at all)
+ *  - Linux Chromium without HW HEVC (typical default)
+ *  - corporate Chrome with HEVC policy disabled
+ *  - very old GPUs without HW HEVC
+ *
+ *  Exported for tests so the codec string is locked alongside the
+ *  worker's `VideoDecoder.configure` call. */
+export async function isHevcDecodeSupported(): Promise<boolean> {
+  const g = globalThis as unknown as {
+    VideoDecoder?: { isConfigSupported?: (cfg: { codec: string }) => Promise<{ supported?: boolean }> }
+  }
+  const isConfigSupported = g.VideoDecoder?.isConfigSupported
+  if (typeof isConfigSupported !== 'function') return false
+  try {
+    const res = await isConfigSupported({ codec: 'hev1.1.6.L93.B0' })
     return res?.supported === true
   } catch {
     return false
@@ -1031,6 +1067,43 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    *  bytes flow + decode happens against a synthetic OffscreenCanvas
    *  instead. */
   const vp9_444CanvasEl = ref<HTMLCanvasElement | null>(null)
+
+  // rc.78 — HEVC over DataChannel pipeline (Option B). Sibling to the
+  // VP9-444 pipeline above; shares the `video-bytes` DC label (the
+  // agent emits HEVC OR VP9-444 there based on negotiated_transport,
+  // never both). Independent worker because the codec string +
+  // decoder configure differ, and we want a clean failure isolation
+  // boundary if one path regresses.
+  let hevcWorker: Worker | null = null
+  /** Whether HEVC decode is supported on this browser. Probe runs
+   *  once on composable construction (and re-checks in connect()).
+   *  HEVC has NO software fallback in WebCodecs — Linux Chromium
+   *  and corporate-policy boxes return false here, and the connect
+   *  path falls back to VP9-444-DC or webrtc. */
+  const hevcSupported = ref<boolean>(false)
+  void isHevcDecodeSupported().then((ok) => {
+    hevcSupported.value = ok
+  })
+  /** `true` once the HEVC worker has been spun up and the DC opened.
+   *  Same semantics as `vp9_444Active`. */
+  const hevcActive = ref(false)
+  /** Number of decoded HEVC frames so far. */
+  const hevcFramesDecoded = ref(0)
+  /** Rolling-window stats from the HEVC worker. Same shape as the
+   *  VP9-444 stats so the view's HUD code is shared. */
+  const hevcStats = ref<{
+    bitrateBps: number
+    fps: number
+    width: number
+    height: number
+    bytesReceivedTotal: number
+  }>({ bitrateBps: 0, fps: 0, width: 0, height: 0, bytesReceivedTotal: 0 })
+  /** The visible `<canvas>` the view paints HEVC frames into. View
+   *  writes this on mount; composable posts `init-canvas` to the
+   *  worker. Null until view-side wiring lands (rc.79+); rc.78 ships
+   *  with synthetic OffscreenCanvas so bytes still flow + decode
+   *  happens for verification. */
+  const hevcCanvasEl = ref<HTMLCanvasElement | null>(null)
 
   let pc: RTCPeerConnection | null = null
   /** Data channels we open proactively (per docs §5). Labels match the
@@ -1779,6 +1852,134 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     }
   })
 
+  /** rc.78 — boot the HEVC worker, open the `video-bytes` DataChannel,
+   *  and forward incoming binary messages to the worker. Mirror of
+   *  `startVp9_444Path` for the HEVC transport. Called from
+   *  `connect()` only when the browser opted in to
+   *  `data-channel-hevc` AND `hevcSupported` resolved true.
+   *
+   *  Returns the worker handle so tests can drive it directly. */
+  function startHevcPath(): Worker | null {
+    if (hevcWorker) return hevcWorker
+    if (!pc) return null
+    let worker: Worker
+    try {
+      worker = new Worker(
+        new URL('../workers/rc-hevc-worker.ts', import.meta.url),
+        { type: 'module' },
+      )
+    } catch (err) {
+      console.warn('[rc] hevc worker construction failed', err)
+      return null
+    }
+    worker.onmessage = (ev) => {
+      const msg = ev.data as Record<string, unknown> | undefined
+      if (!msg || typeof msg.type !== 'string') return
+      if (msg.type === 'first-frame'
+        && typeof msg.width === 'number'
+        && typeof msg.height === 'number') {
+        mediaIntrinsicW.value = msg.width
+        mediaIntrinsicH.value = msg.height
+        hevcFramesDecoded.value = Math.max(hevcFramesDecoded.value, 1)
+        console.info('[rc] hevc first frame', msg.width, 'x', msg.height)
+      } else if (msg.type === 'decoder-configured') {
+        console.info('[rc] hevc decoder configured', msg.codec)
+      } else if (msg.type === 'decoder-error'
+        || msg.type === 'decoder-configure-error'
+        || msg.type === 'decode-error') {
+        // Mid-session HEVC HW driver hiccup OR the decoder
+        // claimed support then rejected real bytes. Tear down so
+        // the view re-mounts <video> and the standard RTP path
+        // (which the agent sends in parallel) renders normally.
+        console.warn('[rc] hevc worker', msg.type, msg.error, '— auto-fallback to <video>')
+        stopHevcPath()
+      } else if (msg.type === 'frame-rejected') {
+        console.warn('[rc] hevc frame rejected', msg)
+      } else if (msg.type === 'frame-decoded') {
+        hevcFramesDecoded.value++
+      } else if (msg.type === 'stats') {
+        const m = msg as {
+          bitrateBps?: number
+          fps?: number
+          width?: number
+          height?: number
+          bytesReceivedTotal?: number
+        }
+        hevcStats.value = {
+          bitrateBps: typeof m.bitrateBps === 'number' ? m.bitrateBps : 0,
+          fps: typeof m.fps === 'number' ? m.fps : 0,
+          width: typeof m.width === 'number' ? m.width : 0,
+          height: typeof m.height === 'number' ? m.height : 0,
+          bytesReceivedTotal: typeof m.bytesReceivedTotal === 'number' ? m.bytesReceivedTotal : 0,
+        }
+      }
+    }
+    // Synthetic OffscreenCanvas — keeps the worker fully wired even
+    // without a view-side canvas. rc.79+ swaps in the visible canvas
+    // via hevcCanvasEl watcher below.
+    try {
+      const synthetic = new OffscreenCanvas(2, 2)
+      worker.postMessage(
+        { type: 'init-canvas', canvas: synthetic },
+        [synthetic],
+      )
+    } catch (err) {
+      console.warn('[rc] hevc: synthetic OffscreenCanvas init failed', err)
+      try { worker.terminate() } catch { /* ignore */ }
+      return null
+    }
+    // Open the same `video-bytes` DC the VP9-444 path uses — the
+    // agent's `media_pump_hevc_dc` writes there based on the
+    // negotiated_transport. Browser opens unconditionally; the
+    // agent stays silent if it picked the WebRTC track instead.
+    let dc: RTCDataChannel
+    try {
+      dc = pc.createDataChannel(VP9_444_DC_LABEL, VP9_444_DC_OPTIONS)
+    } catch (err) {
+      console.warn('[rc] hevc DC creation failed', err)
+      try { worker.terminate() } catch { /* ignore */ }
+      return null
+    }
+    dc.binaryType = 'arraybuffer'
+    dc.onmessage = (ev) => {
+      if (!(ev.data instanceof ArrayBuffer)) return
+      try {
+        worker.postMessage({ type: 'chunk', bytes: ev.data }, [ev.data])
+      } catch (err) {
+        console.warn('[rc] hevc worker post failed', err)
+      }
+    }
+    dc.onopen = () => {
+      console.info('[rc] hevc DC opened')
+    }
+    dc.onclose = () => {
+      console.info('[rc] hevc DC closed')
+    }
+    channels.videoBytes = dc
+    hevcWorker = worker
+    hevcActive.value = true
+    return worker
+  }
+
+  function stopHevcPath() {
+    hevcActive.value = false
+    hevcFramesDecoded.value = 0
+    if (!hevcWorker) return
+    try { hevcWorker.postMessage({ type: 'close' }) } catch { /* ignore */ }
+    try { hevcWorker.terminate() } catch { /* ignore */ }
+    hevcWorker = null
+  }
+
+  watch(hevcCanvasEl, (el) => {
+    if (!el || !hevcWorker) return
+    try {
+      const off = el.transferControlToOffscreen()
+      hevcWorker.postMessage({ type: 'init-canvas', canvas: off }, [off])
+    } catch (err) {
+      console.warn('[rc] hevc: transferControlToOffscreen failed', err)
+    }
+  })
+
   // Late-canvas watcher. The transform is installed eagerly in
   // pc.ontrack, but the canvas is gated on phase === 'connected'
   // so it mounts after ontrack fires. When it mounts, hand the
@@ -2019,6 +2220,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     stopStatsPoll()
     stopWebCodecsPath()
     stopVp9_444Path()
+    stopHevcPath()
     for (const ch of Object.values(channels)) {
       try { ch.close() } catch { /* ignore */ }
     }
@@ -2673,6 +2875,32 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
           '[rc] preferred_transport=data-channel-vp9-444 dropped — VideoDecoder.isConfigSupported(vp09.01.10.08) returned false. Falling back to webrtc.',
         )
       }
+    } else if (videoTransport.value === 'data-channel-hevc') {
+      // rc.78 — HEVC over DataChannel (Option B). HEVC HW decode is
+      // not universal in WebCodecs; probe before sending the
+      // transport in `preferred_transport`. Pre-flight spike
+      // confirmed Chrome 119+ + Edge accept Annex-B HEVC no-
+      // description; fall through to VP9-444-DC (if supported) or
+      // webrtc when this browser lacks HW HEVC decode (Linux
+      // Chromium typically, corporate-policy disabled, old GPUs).
+      const supported = hevcSupported.value || (await isHevcDecodeSupported())
+      hevcSupported.value = supported
+      if (supported) {
+        preferredTransport = 'data-channel-hevc'
+      } else {
+        const fallback = vp9_444Supported.value || (await isVp9_444DecodeSupported())
+        vp9_444Supported.value = fallback
+        if (fallback) {
+          console.info(
+            '[rc] preferred_transport=data-channel-hevc dropped — VideoDecoder.isConfigSupported(hev1.1.6.L93.B0) returned false. Falling back to data-channel-vp9-444.',
+          )
+          preferredTransport = 'data-channel-vp9-444'
+        } else {
+          console.info(
+            '[rc] preferred_transport=data-channel-hevc dropped + VP9-444 also unsupported. Falling back to webrtc.',
+          )
+        }
+      }
     }
 
     // If we're advertising the data-channel transport, open the DC +
@@ -2682,6 +2910,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // older agents (they ignore the channel entirely).
     if (preferredTransport === 'data-channel-vp9-444') {
       startVp9_444Path()
+    } else if (preferredTransport === 'data-channel-hevc') {
+      startHevcPath()
     }
 
     // Kick off the rc:* handshake. browser_caps lets the agent pick
@@ -4370,6 +4600,14 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     vp9_444FramesDecoded,
     vp9_444Stats,
     vp9_444CanvasEl,
+    /** rc.78 — HEVC over DataChannel (Option B). Same shape as the
+     *  VP9-444 fields above; view can branch on which is active to
+     *  decide which canvas/HUD to render. */
+    hevcSupported,
+    hevcActive,
+    hevcFramesDecoded,
+    hevcStats,
+    hevcCanvasEl,
   }
 }
 
