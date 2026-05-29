@@ -2324,8 +2324,24 @@ async fn media_pump_ffmpeg_dc(
     let mut bytes_written: u64 = 0;
     let mut send_errors: u64 = 0;
     let mut dc_unopen_drops: u64 = 0;
+    // rc.88 — frames dropped because the DC send buffer was over the
+    // high-water mark (congested link). Shedding a delta frame keeps the
+    // capture/encode loop at cadence instead of stalling on `send().await`
+    // — the likely cause of the field's "13 fps under motion".
+    let mut frames_dropped_backpressure: u64 = 0;
+    // rc.88 — per-stage timing accumulators (µs since last heartbeat) so
+    // the field log localises the bottleneck: capture vs encode vs send.
+    let mut capture_us: u64 = 0;
+    let mut encode_us: u64 = 0;
+    let mut send_us: u64 = 0;
+    let mut heartbeat_frames_base: u64 = 0;
     let mut last_heartbeat = std::time::Instant::now();
     const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
+    // rc.88 — DC send-buffer high-water mark. Above this we drop the
+    // frame rather than queueing it (and await-blocking the loop). 1 MiB
+    // matches the VP9-444 pump's AIMD high-water. webrtc-data's own
+    // buffer cap is higher; this is a latency guard, not a hard limit.
+    const BACKPRESSURE_HIGH_WATER: usize = 1024 * 1024;
 
     loop {
         // Pace at the encoder's target framerate. If the previous loop
@@ -2346,7 +2362,10 @@ async fn media_pump_ffmpeg_dc(
         // pause. ScreenCapture's method is `next_frame() -> Result<
         // Option<Frame>>`, not Iterator::next — matches the pattern
         // used by `media_pump_vp9_444_dc` at line ~1741.
-        let frame: std::sync::Arc<crate::capture::Frame> = match capturer.next_frame().await {
+        let capture_start = std::time::Instant::now();
+        let next = capturer.next_frame().await;
+        capture_us += capture_start.elapsed().as_micros() as u64;
+        let frame: std::sync::Arc<crate::capture::Frame> = match next {
             Ok(Some(f)) => {
                 let arc = std::sync::Arc::new(f);
                 last_good_frame = Some(arc.clone());
@@ -2365,7 +2384,7 @@ async fn media_pump_ffmpeg_dc(
                 }
             }
             Err(e) => {
-                tracing::warn!(%session_id, %e, "HEVC DC pump: capture error");
+                tracing::warn!(%session_id, codec_label, %e, "FFmpeg DC pump: capture error");
                 continue;
             }
         };
@@ -2445,6 +2464,7 @@ async fn media_pump_ffmpeg_dc(
             continue;
         };
 
+        let encode_start = std::time::Instant::now();
         let packets = match enc.encode(frame.clone()).await {
             Ok(p) => p,
             Err(e) => {
@@ -2452,6 +2472,7 @@ async fn media_pump_ffmpeg_dc(
                 continue;
             }
         };
+        encode_us += encode_start.elapsed().as_micros() as u64;
         frames_encoded += 1;
 
         // Push each emitted packet through the framer + DC. FFmpeg may
@@ -2464,6 +2485,27 @@ async fn media_pump_ffmpeg_dc(
             continue;
         };
 
+        // rc.88 — backpressure: if the DC send buffer is already over the
+        // high-water mark the link can't keep up. Drop this frame (shed
+        // load) rather than `await`-blocking the loop on a congested
+        // channel — blocking is what dragged the field's fps down to 13
+        // under motion. Dropping a delta frame is benign (the decoder
+        // holds the last frame); after a drop we force a keyframe so the
+        // next sent frame fully resyncs the browser. Keyframes are NEVER
+        // dropped (they're the recovery point).
+        let has_keyframe = packets.iter().any(|p| p.is_keyframe);
+        if !has_keyframe {
+            let buffered = dc.buffered_amount().await;
+            if buffered > BACKPRESSURE_HIGH_WATER {
+                frames_dropped_backpressure += 1;
+                // Force the next frame to be a keyframe so the browser
+                // resyncs cleanly once the buffer drains.
+                enc.request_keyframe();
+                continue;
+            }
+        }
+
+        let send_start = std::time::Instant::now();
         for pkt in packets {
             let wire = frame_video_bytes(&pkt.data, pkt.is_keyframe, frame.monotonic_us);
             let wire_len = wire.len() as u64;
@@ -2496,13 +2538,19 @@ async fn media_pump_ffmpeg_dc(
                 bytes_written += wire_len;
             }
         }
+        send_us += send_start.elapsed().as_micros() as u64;
 
-        // Heartbeat for log-grep observability. The VP9-444 pump emits
-        // a much richer set of fields (AIMD state, scene-change
-        // counters, ROI hits) — this pump keeps it tight until AIMD
-        // lands.
+        // Heartbeat for log-grep observability. rc.88 adds per-stage
+        // averages (capture/encode/send ms) so the field can localise
+        // the bottleneck behind a low fps, plus the backpressure-drop
+        // counter. `_avg_*` are over frames encoded since the last
+        // heartbeat.
         if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
             last_heartbeat = std::time::Instant::now();
+            let window_frames = frames_encoded.saturating_sub(heartbeat_frames_base).max(1);
+            let avg_capture_ms = (capture_us / window_frames) as f64 / 1000.0;
+            let avg_encode_ms = (encode_us / window_frames) as f64 / 1000.0;
+            let avg_send_ms = (send_us / window_frames) as f64 / 1000.0;
             info!(
                 %session_id,
                 codec_label,
@@ -2511,9 +2559,14 @@ async fn media_pump_ffmpeg_dc(
                 height = h,
                 encoder = enc.name(),
                 frames_captured, frames_encoded, frames_sent, bytes_written,
-                send_errors, dc_unopen_drops,
+                send_errors, dc_unopen_drops, frames_dropped_backpressure,
+                avg_capture_ms, avg_encode_ms, avg_send_ms,
                 "FFmpeg DC pump heartbeat (≈2s window)"
             );
+            heartbeat_frames_base = frames_encoded;
+            capture_us = 0;
+            encode_us = 0;
+            send_us = 0;
         }
     }
 }
