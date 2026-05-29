@@ -57,6 +57,113 @@ const HEVC_ENCODER_NAMES: &[&str] = &["hevc_nvenc", "hevc_qsv", "hevc_amf"];
 /// on iGPU HW).
 const VP9_ENCODER_NAMES: &[&str] = &["vp9_qsv"];
 
+/// rc.86 — constant-quality target (lower = sharper, more bits).
+/// Default 22 is a good screen-content sweet spot for HEVC/VP9 — fine
+/// text edges stay crisp without a full lossless blow-out. Range
+/// clamped to [10, 40]; below 10 is near-lossless (huge), above 40 is
+/// visibly soft. Env-overridable for field tuning without a rebuild.
+fn ffmpeg_cq() -> u32 {
+    std::env::var("ROOMLER_AGENT_FFMPEG_CQ")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .map(|c| c.clamp(10, 40))
+        .unwrap_or(22)
+}
+
+/// rc.86 — bandwidth CEILING (maxrate/bufsize), NOT a target. With
+/// constant-quality rate control the encoder uses only what the `cq`
+/// quality demands (idle ≈ 0); this cap just bounds the worst-case
+/// burst on a full-screen scene change. Derived at ~0.07 bpp/s — about
+/// a third of the old 0.20-bpp/s *target* the pre-rc.86 path fed as a
+/// VBR goal — clamped to [3, 12] Mbps. RustDesk holds ~3 Mbps at
+/// 1920×1200; 0.07 bpp/s puts our 1920×1200 cap at ~4.8 Mbps, leaving
+/// headroom for genuine motion without the 6-7 Mbps idle-ish bursts
+/// the field saw on the old uncapped 13.8 Mbps target.
+/// Env override `ROOMLER_AGENT_FFMPEG_MAXRATE_KBPS` for field tuning.
+fn ffmpeg_maxrate_bps(width: u32, height: u32, fps: u32) -> usize {
+    if let Some(kbps) = std::env::var("ROOMLER_AGENT_FFMPEG_MAXRATE_KBPS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|k| *k > 0)
+    {
+        return kbps * 1000;
+    }
+    const SCREEN_BPP_PER_SECOND: f64 = 0.07;
+    let raw = (width as f64 * height as f64 * fps as f64 * SCREEN_BPP_PER_SECOND) as usize;
+    raw.clamp(3_000_000, 12_000_000)
+}
+
+/// rc.86 — per-encoder private-option dictionary for constant-quality
+/// + low-latency + screen-content tuning. Keys mirror the FFmpeg CLI
+/// (`-cq`, `-preset`, `-tune`, `-spatial-aq`, `-maxrate`, …). Any option
+/// the encoder doesn't recognise on this FFmpeg build / driver combo
+/// makes `open_as_with` fail; `build_encoder` then retries a plain open
+/// so we degrade to defaults rather than failing the session.
+///
+/// `preset`/`tune` are env-overridable so the field can trade quality
+/// vs latency vs CPU without a rebuild.
+///
+/// Returns the dict PLUS a human-readable `key=value …` summary string
+/// built as we go (so we don't depend on `Dictionary::iter()` — keeps
+/// the logging robust across ffmpeg-next minor versions).
+fn encoder_options(
+    name: &str,
+    maxrate_bps: usize,
+    cq: u32,
+) -> (ffmpeg_next::Dictionary<'static>, String) {
+    let mut d = ffmpeg_next::Dictionary::new();
+    let mut summary: Vec<String> = Vec::new();
+    let cap = maxrate_bps.to_string();
+    let cq_s = cq.to_string();
+    let preset = std::env::var("ROOMLER_AGENT_FFMPEG_PRESET").ok();
+    let tune = std::env::var("ROOMLER_AGENT_FFMPEG_TUNE").ok();
+
+    // Local closure: set on the dict AND append to the summary in one go.
+    let mut put = |d: &mut ffmpeg_next::Dictionary<'static>, k: &str, v: &str| {
+        d.set(k, v);
+        summary.push(format!("{k}={v}"));
+    };
+
+    if name.contains("nvenc") {
+        // NVENC constant-quality VBR: `cq` drives quality, `maxrate`
+        // bounds the burst, bit_rate=0 (set in build_encoder) makes it
+        // pure target-quality. `tune=ll` keeps it responsive for remote
+        // desktop; `spatial-aq` spends bits on high-detail text regions;
+        // bf=0 + rc-lookahead=0 minimise latency.
+        put(&mut d, "rc", "vbr");
+        put(&mut d, "cq", &cq_s);
+        put(&mut d, "preset", preset.as_deref().unwrap_or("p4"));
+        put(&mut d, "tune", tune.as_deref().unwrap_or("ll"));
+        put(&mut d, "rc-lookahead", "0");
+        put(&mut d, "bf", "0");
+        put(&mut d, "spatial-aq", "1");
+        put(&mut d, "maxrate", &cap);
+        put(&mut d, "bufsize", &cap);
+    } else if name.contains("qsv") {
+        // Intel QSV: ICQ-style quality via `global_quality`; `maxrate`
+        // caps the burst. `low_power` uses the fixed-function VDENC path
+        // (faster, lower power — the Iris Xe fps-unlock path).
+        put(&mut d, "global_quality", &cq_s);
+        if let Some(p) = preset.as_deref() {
+            put(&mut d, "preset", p);
+        }
+        put(&mut d, "low_power", "1");
+        put(&mut d, "maxrate", &cap);
+        put(&mut d, "bufsize", &cap);
+    } else if name.contains("amf") {
+        // AMD AMF: constant-QP-ish via qp_i/qp_p, latency-tuned VBR,
+        // capped burst.
+        put(&mut d, "rc", "vbr_latency");
+        put(&mut d, "qp_i", &cq_s);
+        put(&mut d, "qp_p", &cq_s);
+        put(&mut d, "maxrate", &cap);
+        put(&mut d, "bufsize", &cap);
+    }
+
+    let joined = summary.join(" ");
+    (d, joined)
+}
+
 /// FFmpeg-based video encoder.
 ///
 /// Holds a `codec::encoder::Video` plus state for keyframe forcing,
@@ -127,19 +234,28 @@ impl FfmpegEncoder {
         // run on each new encoder. Sets up codec registration.
         ffmpeg_next::init().context("ffmpeg_next::init failed")?;
 
-        let bit_rate = crate::encode::initial_bitrate_for(width, height) as usize;
         let fps = 30; // initial framerate; set_bitrate doesn't change this
+        // rc.86 — RustDesk-parity rate control. Drive the encoder by
+        // CONSTANT QUALITY (cq / global_quality) with a bandwidth CAP
+        // (maxrate), not by the old 0.20-bpp/s VBR target. On screen
+        // content this keeps text edges sharp (cq guarantees per-block
+        // quality so nothing "crystallizes over seconds") while idle
+        // frames cost ~0 and bursts are bounded by the cap. Both knobs
+        // are env-overridable so the field can dial in without a rebuild.
+        let cq = ffmpeg_cq();
+        let maxrate_bps = ffmpeg_maxrate_bps(width, height, fps as u32);
 
         let mut last_err: Option<anyhow::Error> = None;
         for name in names {
-            match Self::build_encoder(name, width, height, bit_rate, fps) {
+            match Self::build_encoder(name, width, height, fps, maxrate_bps, cq) {
                 Ok(encoder) => {
                     tracing::info!(
                         encoder = name,
                         width,
                         height,
-                        bit_rate,
-                        "ffmpeg encoder opened"
+                        cq,
+                        maxrate_bps,
+                        "ffmpeg encoder opened (constant-quality + maxrate cap)"
                     );
                     let plane_pixels = (width as usize) * (height as usize);
                     return Ok(Self {
@@ -175,31 +291,72 @@ impl FfmpegEncoder {
         name: &'static str,
         width: u32,
         height: u32,
-        bit_rate: usize,
         fps: i32,
+        maxrate_bps: usize,
+        cq: u32,
     ) -> Result<codec::encoder::Video> {
         let codec = codec::encoder::find_by_name(name)
             .ok_or_else(|| anyhow!("ffmpeg encoder not registered: {}", name))?;
 
-        let mut ctx = codec::Context::new_with_codec(codec);
-        let mut enc = ctx.encoder().video().context("encoder().video() failed")?;
+        // rc.86 — configure an unopened encoder. Factored into a closure
+        // so we can rebuild it for the fallback path (open_*_with consumes
+        // the encoder, so a failed open can't be retried on the same one).
+        let configure = || -> Result<codec::encoder::Video> {
+            let ctx = codec::Context::new_with_codec(codec);
+            let mut enc = ctx.encoder().video().context("encoder().video() failed")?;
+            enc.set_width(width);
+            enc.set_height(height);
+            enc.set_format(format::Pixel::NV12);
+            // For NVENC constant-quality VBR we set bit_rate=0 so `cq`
+            // drives quality and `maxrate` is the only ceiling (idle ≈ 0).
+            // QSV/AMF keep `maxrate` as the VBR anchor since their
+            // quality modes are less reliable about honouring b:v=0.
+            let target_bps = if name.contains("nvenc") {
+                0
+            } else {
+                maxrate_bps
+            };
+            enc.set_bit_rate(target_bps);
+            // Time base: 1/1000 (ms resolution). Pts is set per-frame from
+            // monotonic_us / 1000.
+            enc.set_time_base((1, TIME_BASE_DEN));
+            enc.set_frame_rate(Some((fps, 1)));
+            enc.set_gop(KEYFRAME_INTERVAL as u32);
+            enc.set_max_b_frames(0); // low-latency: no B-frames
+            Ok(enc)
+        };
 
-        enc.set_width(width);
-        enc.set_height(height);
-        enc.set_format(format::Pixel::NV12);
-        enc.set_bit_rate(bit_rate);
-        // Time base: 1/1000 (ms resolution). Pts is set per-frame from
-        // monotonic_us / 1000.
-        enc.set_time_base((1, TIME_BASE_DEN));
-        enc.set_frame_rate(Some((fps, 1)));
-        enc.set_gop(KEYFRAME_INTERVAL as u32);
-        enc.set_max_b_frames(0); // low-latency: no B-frames
+        let (opts, opt_summary) = encoder_options(name, maxrate_bps, cq);
 
-        let encoder = enc
-            .open_as(codec)
-            .with_context(|| format!("open_as({}) failed", name))?;
-
-        Ok(encoder)
+        // Try opening WITH the quality/tuning options. If the encoder
+        // rejects any of them (unknown private option on this FFmpeg
+        // build / driver combo), fall back to a plain open so we degrade
+        // to default rate control rather than failing the encoder
+        // outright — a blurry-but-working session beats a black screen.
+        let enc = configure()?;
+        match enc.open_as_with(codec, opts) {
+            Ok(encoder) => {
+                tracing::info!(
+                    encoder = name,
+                    options = opt_summary,
+                    "ffmpeg encoder opened with quality options"
+                );
+                Ok(encoder)
+            }
+            Err(open_err) => {
+                tracing::warn!(
+                    encoder = name,
+                    %open_err,
+                    attempted_options = opt_summary,
+                    "ffmpeg open_as_with rejected the quality options — retrying with encoder defaults"
+                );
+                let enc2 = configure()?;
+                let encoder = enc2
+                    .open_as(codec)
+                    .with_context(|| format!("open_as({}) fallback failed", name))?;
+                Ok(encoder)
+            }
+        }
     }
 
     fn convert_bgra_to_nv12(&mut self, frame: &Frame) -> Result<()> {
