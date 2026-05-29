@@ -122,6 +122,51 @@ fn compute_caps() -> AgentCaps {
 
     #[allow(unused_mut)]
     let mut transports: Vec<String> = Vec::new();
+
+    // rc.77 — FFmpeg HEVC over DataChannel.
+    //
+    // Gated behind `ROOMLER_AGENT_USE_FFMPEG=1` env var so that an
+    // accidental FFmpeg dep in the build doesn't change negotiation
+    // for existing field sessions. When the env var IS set, probe
+    // `FfmpegEncoder::new_hevc` at the standard probe resolution; on
+    // success advertise both the `h265` codec (additive to whatever
+    // MF found) and the `data-channel-hevc` transport. The browser's
+    // rc:session.request can then ask for codec=h265 + transport=
+    // data-channel-hevc and `peer.rs::media_pump` will route to the
+    // HEVC DC pump.
+    //
+    // Pre-flight WebCodecs spike (2026-05-26) confirmed Chrome + Edge
+    // decode Annex-B no-description HEVC. Gate 0 smoke (2026-05-29)
+    // confirmed hevc_qsv works on Iris Xe Tiger Lake AND hevc_nvenc
+    // works on RTX 5090 Blackwell — the two boxes MF was broken on.
+    #[cfg(feature = "ffmpeg-encoder")]
+    if crate::encode::ffmpeg::available() {
+        let start = std::time::Instant::now();
+        match crate::encode::ffmpeg::FfmpegEncoder::new_hevc(PROBE_WIDTH, PROBE_HEIGHT) {
+            Ok(enc) => {
+                let name = enc.name();
+                drop(enc);
+                tracing::info!(
+                    encoder = name,
+                    elapsed_ms = start.elapsed().as_millis(),
+                    "caps probe: ffmpeg HEVC encoder activates — advertising h265 + data-channel-hevc"
+                );
+                if !codecs.iter().any(|c| c == "h265") {
+                    codecs.push("h265".into());
+                }
+                transports.push("data-channel-hevc".into());
+                hw_encoders.push(format!("ffmpeg-{name}"));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    %e,
+                    elapsed_ms = start.elapsed().as_millis(),
+                    "caps probe: ffmpeg HEVC encoder failed to init — NOT advertising data-channel-hevc"
+                );
+            }
+        }
+    }
+
     #[cfg(feature = "vp9-444")]
     {
         // Phase Y.4 caps probe (Y.runtime-encoder rewrite landed,
