@@ -595,12 +595,26 @@
           :class="`scale-${rc.scaleMode.value}`"
           :style="videoScaleStyle"
         />
+        <!-- rc.80 render path: canvas fed by the HEVC worker over the
+             same `video-bytes` DataChannel (no WebRTC video track).
+             Mounts when the composable's `hevcActive` flag flips
+             true. Same `transferControlToOffscreen` wiring as the
+             VP9-444 path — the composable's watcher swaps the
+             synthetic OffscreenCanvas the worker started with for
+             this visible element. -->
+        <canvas
+          v-if="isHevcRender"
+          :ref="bindHevcCanvas"
+          class="remote-video hevc-canvas"
+          :class="`scale-${rc.scaleMode.value}`"
+          :style="videoScaleStyle"
+        />
         <!-- Live stats readout: codec + bitrate + fps. Populated from
              RTCPeerConnection.getStats() every 500 ms inside the
              composable. Pill format keeps it unobtrusive over the
              video content. Hidden until at least the codec is known. -->
         <div
-          v-if="rc.hasMedia.value && (statsCodecLabel || rc.vp9_444Active.value)"
+          v-if="rc.hasMedia.value && (statsCodecLabel || rc.vp9_444Active.value || rc.hevcActive.value)"
           class="stats-readout"
           role="status"
           aria-live="polite"
@@ -1892,6 +1906,18 @@ function bindVp9_444Canvas(el: Element | unknown) {
   rc.vp9_444CanvasEl.value = (el as HTMLCanvasElement | null) ?? null
 }
 
+// rc.80 — HEVC over DataChannel render gate. Flips true when the
+// composable's `media_pump_hevc_dc` peer-side counterpart has opened
+// the DC + spun up the HEVC worker. Drives the template's HEVC
+// canvas mount.
+const isHevcRender = computed<boolean>(() => rc.hevcActive.value)
+/** Bind callback for the HEVC canvas. Same `transferControlToOffscreen`
+ *  pattern as the VP9-444 canvas — composable's `hevcCanvasEl`
+ *  watcher fires once the ref lands. */
+function bindHevcCanvas(el: Element | unknown) {
+  rc.hevcCanvasEl.value = (el as HTMLCanvasElement | null) ?? null
+}
+
 // Fullscreen toggle. Drives the stage element into/out of the browser's
 // Fullscreen API. `isFullscreen` tracks the real DOM state via the
 // fullscreenchange event so ESC (which the browser handles natively)
@@ -2016,12 +2042,18 @@ const resolutionButtonTitle = computed(() => {
  *  dims), otherwise from the WebRTC track's `videoWidth/Height`
  *  carried via `mediaIntrinsicW/H`. Zero before the first frame. */
 const nativeSourceW = computed<number>(() => {
+  if (rc.hevcActive.value && rc.hevcStats.value.width > 0) {
+    return rc.hevcStats.value.width
+  }
   if (rc.vp9_444Active.value && rc.vp9_444Stats.value.width > 0) {
     return rc.vp9_444Stats.value.width
   }
   return rc.mediaIntrinsicW.value || 0
 })
 const nativeSourceH = computed<number>(() => {
+  if (rc.hevcActive.value && rc.hevcStats.value.height > 0) {
+    return rc.hevcStats.value.height
+  }
   if (rc.vp9_444Active.value && rc.vp9_444Stats.value.height > 0) {
     return rc.vp9_444Stats.value.height
   }
@@ -2140,6 +2172,11 @@ const statsCodecLabel = computed(() => {
   // VP9-444 path bypasses the WebRTC track + getStats(), so report
   // the known codec directly. SW-only on the agent today (libvpx).
   if (rc.vp9_444Active.value) return 'VP9 4:4:4 SW'
+  // rc.80 — HEVC over DataChannel. Always HW on the agent (FFmpeg
+  // dispatches to NVENC / QSV / AMF). The specific backend name is
+  // in agent.capabilities.hw_encoders if the operator wants more
+  // detail; the pill keeps it terse.
+  if (rc.hevcActive.value) return 'H.265 HW'
   const raw = rc.stats.value.codec
   if (!raw) return ''
   const lower = raw.toLowerCase()
@@ -2158,19 +2195,23 @@ const statsCodecLabel = computed(() => {
   return `${display} ${hasHw ? 'HW' : 'SW'}`
 })
 const statsBitrateLabel = computed(() => {
-  // VP9-444 reads from the worker-emitted stats (rc.35) since no
-  // RTP track means getStats() has nothing for video.
-  const bps = rc.vp9_444Active.value
-    ? rc.vp9_444Stats.value.bitrateBps
-    : rc.stats.value.bitrate_bps
+  // VP9-444 + rc.80 HEVC read from the worker-emitted stats since
+  // there's no RTP track means getStats() has nothing for video.
+  const bps = rc.hevcActive.value
+    ? rc.hevcStats.value.bitrateBps
+    : rc.vp9_444Active.value
+      ? rc.vp9_444Stats.value.bitrateBps
+      : rc.stats.value.bitrate_bps
   if (bps <= 0) return '— bps'
   if (bps >= 1_000_000) return `${(bps / 1_000_000).toFixed(1)} Mbps`
   return `${Math.round(bps / 1_000)} kbps`
 })
 const statsFpsLabel = computed(() => {
-  const fps = rc.vp9_444Active.value
-    ? rc.vp9_444Stats.value.fps
-    : rc.stats.value.fps
+  const fps = rc.hevcActive.value
+    ? rc.hevcStats.value.fps
+    : rc.vp9_444Active.value
+      ? rc.vp9_444Stats.value.fps
+      : rc.stats.value.fps
   if (fps <= 0) return '— fps'
   return `${Math.round(fps)} fps`
 })
@@ -2180,12 +2221,16 @@ const statsFpsLabel = computed(() => {
  *  or `<video>.onresize`). Useful when verifying that rc:resolution
  *  / auto-downscale / DPI flips landed at the dims you expect. */
 const statsResolutionLabel = computed(() => {
-  const w = rc.vp9_444Active.value
-    ? rc.vp9_444Stats.value.width
-    : rc.mediaIntrinsicW.value
-  const h = rc.vp9_444Active.value
-    ? rc.vp9_444Stats.value.height
-    : rc.mediaIntrinsicH.value
+  const w = rc.hevcActive.value
+    ? rc.hevcStats.value.width
+    : rc.vp9_444Active.value
+      ? rc.vp9_444Stats.value.width
+      : rc.mediaIntrinsicW.value
+  const h = rc.hevcActive.value
+    ? rc.hevcStats.value.height
+    : rc.vp9_444Active.value
+      ? rc.vp9_444Stats.value.height
+      : rc.mediaIntrinsicH.value
   if (!w || !h) return ''
   return `${w}×${h}`
 })
@@ -2249,7 +2294,7 @@ function cursorMapping(): { sx: number; sy: number; offsetX: number; offsetY: nu
   // `<video>` is hidden + unfed (videoWidth=0), so the agent's encode
   // resolution we cached from the worker's `first-frame` message is
   // the only ground truth for source pixel size.
-  const useIntrinsic = rc.vp9_444Active.value || rc.webcodecsActive.value
+  const useIntrinsic = rc.vp9_444Active.value || rc.webcodecsActive.value || rc.hevcActive.value
   const srcW = useIntrinsic
     ? rc.mediaIntrinsicW.value
     : (video?.videoWidth ?? 0)
