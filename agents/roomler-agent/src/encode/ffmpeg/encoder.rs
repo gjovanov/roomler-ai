@@ -45,6 +45,18 @@ const TIME_BASE_DEN: i32 = 1000;
 /// open_as` wins. Matches RustDesk's order (NVIDIA → Intel → AMD).
 const HEVC_ENCODER_NAMES: &[&str] = &["hevc_nvenc", "hevc_qsv", "hevc_amf"];
 
+/// rc.83 — Codec dispatch order for VP9. Intel oneVPL only — NVIDIA
+/// NVENC + AMD AMF never added VP9 encode (they skipped to AV1). On
+/// non-Intel hosts the cascade falls through to libvpx SW via the
+/// existing `media_pump_vp9_444_dc` path (no FFmpeg fallback here —
+/// libvpx is what the caps probe advertises).
+///
+/// Gate 0 validated `hevc_qsv` on Iris Xe Tiger Lake; `vp9_qsv` on
+/// the same iGPU family is the load-bearing assumption for the Iris
+/// Xe fps unlock (CPU-bound 17 fps on libvpx SW → expected 30-60 fps
+/// on iGPU HW).
+const VP9_ENCODER_NAMES: &[&str] = &["vp9_qsv"];
+
 /// FFmpeg-based video encoder.
 ///
 /// Holds a `codec::encoder::Video` plus state for keyframe forcing,
@@ -99,6 +111,15 @@ impl FfmpegEncoder {
     /// backends fail — the caller falls back to MF / NoopEncoder.
     pub fn new_hevc(width: u32, height: u32) -> Result<Self> {
         Self::new_with_dispatch(HEVC_ENCODER_NAMES, width, height)
+    }
+
+    /// rc.83 — Try to open a VP9 HW encoder. Currently Intel oneVPL
+    /// only (`vp9_qsv`). Returns `Err` on non-Intel hosts; the caller
+    /// falls back to libvpx SW. Profile 0 (4:2:0 8-bit) is the only
+    /// profile vp9_qsv supports — 4:4:4 sessions stay on libvpx
+    /// regardless of this method's availability.
+    pub fn new_vp9(width: u32, height: u32) -> Result<Self> {
+        Self::new_with_dispatch(VP9_ENCODER_NAMES, width, height)
     }
 
     fn new_with_dispatch(names: &[&'static str], width: u32, height: u32) -> Result<Self> {
