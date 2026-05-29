@@ -144,6 +144,38 @@ fn compute_caps() -> AgentCaps {
         // `name()` is on the `VideoEncoder` trait — need the trait in
         // scope at the call site for method-resolution.
         use super::VideoEncoder;
+
+        // rc.83 — probe vp9_qsv to surface in caps + heartbeat whether
+        // this host can use Intel HW VP9. The transport advertisement
+        // (`data-channel-vp9-444`) stays gated on the libvpx probe
+        // above — both encoder paths emit the same VP9 bitstream that
+        // the same browser worker decodes; only the encoder source
+        // differs. The runtime peer.rs dispatch picks vp9_qsv at
+        // session-establish time when this probe passed AND the host
+        // didn't request 4:4:4 chroma (which vp9_qsv doesn't support).
+        {
+            let start_vp9 = std::time::Instant::now();
+            match crate::encode::ffmpeg::FfmpegEncoder::new_vp9(PROBE_WIDTH, PROBE_HEIGHT) {
+                Ok(enc) => {
+                    let name = enc.name();
+                    drop(enc);
+                    tracing::info!(
+                        encoder = name,
+                        elapsed_ms = start_vp9.elapsed().as_millis(),
+                        "caps probe: ffmpeg VP9 (vp9_qsv) encoder activates — runtime peer dispatch will prefer it over libvpx SW on data-channel-vp9-444 sessions"
+                    );
+                    hw_encoders.push(format!("ffmpeg-{name}"));
+                }
+                Err(e) => {
+                    tracing::info!(
+                        %e,
+                        elapsed_ms = start_vp9.elapsed().as_millis(),
+                        "caps probe: ffmpeg vp9_qsv not available (NVIDIA/AMD host, Intel without QSV, or Intel driver issue) — VP9 sessions stay on libvpx SW"
+                    );
+                }
+            }
+        }
+
         let start = std::time::Instant::now();
         match crate::encode::ffmpeg::FfmpegEncoder::new_hevc(PROBE_WIDTH, PROBE_HEIGHT) {
             Ok(enc) => {
