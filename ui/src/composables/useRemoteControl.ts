@@ -82,9 +82,22 @@ export type RcLogsFetchReply = {
   error?: string
 }
 
+/** rc.87 — the agent's real encoder info, sent over the control DC
+ *  when a DC video pump opens its encoder. Lets the stats badge show
+ *  the truth (e.g. "VP9 4:2:0 HW vp9_qsv") instead of the hardcoded
+ *  "VP9 4:4:4 SW". `codec` is the negotiation vocabulary ("h265"/
+ *  "vp9"); `chroma` is "yuv420"/"yuv444". */
+export interface RcVideoInfo {
+  codec: string
+  encoder: string
+  hardware: boolean
+  chroma: string
+}
+
 export type RcControlInbound =
   | { kind: 'host_locked'; locked: boolean }
   | { kind: 'desktop_changed'; name: string }
+  | { kind: 'video_info'; info: RcVideoInfo }
   | { kind: 'logs_fetch_reply'; reply: RcLogsFetchReply }
   | { kind: 'logs_fetch_start'; id: string | null; path?: string; totalLines?: number; truncated?: boolean }
   | { kind: 'logs_fetch_chunk'; id: string | null; lines: string[] }
@@ -110,6 +123,21 @@ export function parseControlInbound(data: unknown): RcControlInbound {
     obj.name.length > 0
   ) {
     return { kind: 'desktop_changed', name: obj.name }
+  }
+  if (
+    obj.t === 'rc:video-info' &&
+    typeof obj.codec === 'string' &&
+    typeof obj.encoder === 'string'
+  ) {
+    return {
+      kind: 'video_info',
+      info: {
+        codec: obj.codec,
+        encoder: obj.encoder,
+        hardware: obj.hardware === true,
+        chroma: typeof obj.chroma === 'string' ? obj.chroma : '',
+      },
+    }
   }
   if (obj.t === 'rc:logs-fetch.reply') {
     const reply: RcLogsFetchReply = {
@@ -902,6 +930,12 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    * always-false matches the pre-overlay behaviour for those agents.
    */
   const hostLocked = ref(false)
+  /** rc.87 — the agent's real encoder (codec/encoder/hardware/chroma),
+   *  reported over the control DC by the FFmpeg DC pump. Null until
+   *  the agent sends `rc:video-info` (legacy track + libvpx paths
+   *  don't send it yet → badge falls back to a selection-derived
+   *  label). The stats badge reads this for an honest readout. */
+  const videoInfo = ref<RcVideoInfo | null>(null)
   /**
    * Current input desktop name reported by the SYSTEM-context
    * worker (agents 0.3.0+) via the `rc:desktop_changed` control-DC
@@ -2238,6 +2272,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     mediaIntrinsicH.value = 0
     hostLocked.value = false
     currentDesktop.value = 'Default'
+    videoInfo.value = null
   }
 
   async function connect(
@@ -2821,6 +2856,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         hostLocked.value = parsed.locked
       } else if (parsed?.kind === 'desktop_changed') {
         currentDesktop.value = parsed.name
+      } else if (parsed?.kind === 'video_info') {
+        // rc.87 — the agent told us its real encoder. Drives the
+        // honest stats badge (replaces the hardcoded "VP9 4:4:4 SW").
+        videoInfo.value = parsed.info
+        console.info('[rc] video-info', parsed.info)
       } else if (parsed?.kind === 'logs_fetch_reply') {
         agentLogs.value = parsed.reply
         agentLogsLoading.value = false
@@ -4528,6 +4568,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
      * padlock overlay frame.
      */
     hostLocked,
+    /** rc.87 — real encoder info from the agent (`rc:video-info`).
+     *  Null on the legacy track / libvpx paths (no message); the
+     *  badge falls back to a selection-derived label then. */
+    videoInfo,
     /**
      * Name of the input desktop the agent is currently bound to,
      * as reported by the SYSTEM-context worker via the
