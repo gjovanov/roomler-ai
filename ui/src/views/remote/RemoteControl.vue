@@ -2221,14 +2221,35 @@ function stopFitResizeObserver() {
 // advertised AgentCaps.hw_encoders (2A.2 wired). This makes the
 // pill informative ("H.265 HW") rather than ambiguous ("H265").
 const statsCodecLabel = computed(() => {
-  // VP9-444 path bypasses the WebRTC track + getStats(), so report
-  // the known codec directly. SW-only on the agent today (libvpx).
-  if (rc.vp9_444Active.value) return 'VP9 4:4:4 SW'
+  // rc.87 — when the agent reported its REAL encoder via
+  // `rc:video-info`, use that (the honest source of truth). Format:
+  // "VP9 4:2:0 HW (vp9_qsv)" / "H.265 4:2:0 HW (hevc_nvenc)". This
+  // replaces the hardcoded "VP9 4:4:4 SW" that lied when the agent
+  // actually ran vp9_qsv HW at 4:2:0.
+  const vi = rc.videoInfo.value
+  if (vi && (rc.vp9_444Active.value || rc.hevcActive.value)) {
+    const codecName = vi.codec.toLowerCase() === 'h265'
+      ? 'H.265'
+      : vi.codec.toLowerCase() === 'vp9'
+        ? 'VP9'
+        : vi.codec.toUpperCase()
+    const chromaName = vi.chroma === 'yuv444' ? '4:4:4' : vi.chroma === 'yuv420' ? '4:2:0' : ''
+    const hw = vi.hardware ? 'HW' : 'SW'
+    const enc = vi.encoder ? ` (${vi.encoder})` : ''
+    return [codecName, chromaName, hw].filter(Boolean).join(' ') + enc
+  }
+  // Fallback when the agent hasn't sent video-info (legacy track /
+  // libvpx VP9-444 path). Derive chroma from the USER's selection
+  // (`vp9Chroma`) instead of hardcoding — so a 4:2:0 selection no
+  // longer mislabels as 4:4:4. We can't know HW/SW without the
+  // agent telling us, so omit that claim.
+  if (rc.vp9_444Active.value) {
+    const chroma = rc.vp9Chroma.value === 'yuv420' ? '4:2:0' : '4:4:4'
+    return `VP9 ${chroma}`
+  }
   // rc.80 — HEVC over DataChannel. Always HW on the agent (FFmpeg
-  // dispatches to NVENC / QSV / AMF). The specific backend name is
-  // in agent.capabilities.hw_encoders if the operator wants more
-  // detail; the pill keeps it terse.
-  if (rc.hevcActive.value) return 'H.265 HW'
+  // dispatches to NVENC / QSV / AMF).
+  if (rc.hevcActive.value) return 'H.265 4:2:0 HW'
   const raw = rc.stats.value.codec
   if (!raw) return ''
   const lower = raw.toLowerCase()
