@@ -403,16 +403,77 @@ fn capture_one_blocking(
                 Ok(None)
             }
         },
-        ActiveBackend::Gdi(g) => match g.frame() {
-            Ok(frame) => {
-                *consecutive_empty = 0;
-                Ok(Some(gdi_to_frame(frame, start)))
+        ActiveBackend::Gdi(g) => {
+            // rc.90 — proactively re-bind the input desktop BEFORE each
+            // GDI BitBlt. The capture thread bound once at worker startup
+            // (worker_main step 2), but the displayed input desktop flips
+            // afterwards (Win+L lock/unlock, UAC secure desktop, fast-
+            // user-switch). The DXGI arm rebinds on its errors; the GDI
+            // arm NEVER did, so a stale binding made BitBlt fail
+            // ERROR_ACCESS_DENIED ("Zugriff verweigert", os error 5)
+            // ~25×/s forever with no recovery — video never rendered AND
+            // the spam buried the throughput lines in the log upload
+            // (field: PC50054). `SetThreadDesktop` is per-thread and this
+            // always runs on `roomler-agent-system-capture`, so the
+            // rebind sticks for the BitBlt that follows. `try_change_desktop`
+            // dedupes (only SetThreadDesktop when the desktop actually
+            // changed), so steady-state cost is one OpenInputDesktop
+            // syscall (µs) per frame — negligible at GDI-fallback rates.
+            match desktop_rebind::try_change_desktop() {
+                Ok(desktop_rebind::DesktopChange::Switched(name)) => {
+                    tracing::info!(
+                        %name,
+                        "system-context capture (GDI): rebound input desktop before BitBlt"
+                    );
+                    *consecutive_hard = 0;
+                }
+                Ok(desktop_rebind::DesktopChange::Unchanged) => {}
+                Err(e) => {
+                    // Can't reach the input desktop AT ALL — almost
+                    // always the worker isn't on WinSta0 or isn't in the
+                    // active session. A per-thread rebind can't fix that;
+                    // surface it (rate-limited) so the field log shows the
+                    // REAL blocker (session/winstation) instead of BitBlt
+                    // spam. Distinguishes "stale binding" (recoverable
+                    // here) from "wrong session" (needs a spawn fix).
+                    *consecutive_hard = consecutive_hard.saturating_add(1);
+                    if *consecutive_hard <= 3 || consecutive_hard.is_multiple_of(150) {
+                        tracing::warn!(
+                            %e,
+                            count = *consecutive_hard,
+                            "system-context capture (GDI): cannot reach input desktop — video stalled (worker likely not on WinSta0 / wrong session)"
+                        );
+                    }
+                    return Ok(None);
+                }
             }
-            Err(e) => {
-                tracing::warn!(%e, "GDI capture error — pump will rebuild");
-                Err(anyhow!("GDI BitBlt fallback failed: {e}"))
+            match g.frame() {
+                Ok(frame) => {
+                    *consecutive_hard = 0;
+                    *consecutive_empty = 0;
+                    Ok(Some(gdi_to_frame(frame, start)))
+                }
+                Err(e) => {
+                    *consecutive_hard = consecutive_hard.saturating_add(1);
+                    // Rate-limit: WARN first 3, then ~once / 5 s (150
+                    // frames @ 30 fps). Pre-rc.90 this logged EVERY frame.
+                    if *consecutive_hard <= 3 || consecutive_hard.is_multiple_of(150) {
+                        tracing::warn!(
+                            %e,
+                            count = *consecutive_hard,
+                            "system-context capture (GDI): BitBlt failed after desktop rebind — retrying"
+                        );
+                    }
+                    // Return Ok(None), NOT Err. The worker loop doesn't
+                    // rebuild the backend on Err (it just propagates one
+                    // failed frame the media pump skips anyway), so Err
+                    // bought nothing but a noisier log. Ok(None) is a
+                    // clean keepalive tick; the proactive rebind above
+                    // recovers automatically once the desktop is reachable.
+                    Ok(None)
+                }
             }
-        },
+        }
     }
 }
 
