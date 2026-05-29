@@ -747,6 +747,10 @@ impl AgentPeer {
             chroma_pref,
             video_bytes_dc.clone(),
             lock_state_rx,
+            // rc.87 — control DC so the DC video pumps can emit
+            // `rc:video-info` (real encoder/codec/chroma) to the browser
+            // for an honest stats badge.
+            control_dc.clone(),
         ));
 
         Ok(Self {
@@ -849,6 +853,7 @@ async fn media_pump(
     chroma_pref: Option<String>,
     video_bytes_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
     lock_state_rx: tokio::sync::watch::Receiver<lock_state::LockState>,
+    control_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
 ) {
     // Tracks the lock-state value seen on the previous loop iteration
     // so we can request an encoder keyframe on each transition. The
@@ -893,6 +898,7 @@ async fn media_pump(
                     target_resolution,
                     lock_state_rx,
                     quality_state,
+                    control_dc.clone(),
                 )
                 .await;
             }
@@ -947,6 +953,7 @@ async fn media_pump(
                         target_resolution,
                         lock_state_rx,
                         quality_state,
+                        control_dc.clone(),
                     )
                     .await;
                 }
@@ -984,6 +991,12 @@ async fn media_pump(
     // on_data_channel callback unconditionally stashes any DC named
     // `video-bytes` for forward-compat with future agent builds.
     let _ = &video_bytes_dc;
+    // rc.87 — control_dc is only consumed by the DC video pumps
+    // (HEVC/VP9 FFmpeg paths) for the `rc:video-info` send. The legacy
+    // WebRTC-track pump below doesn't use it; silence unused on builds
+    // that fall through here (no ffmpeg-encoder feature, or webrtc
+    // transport).
+    let _ = &control_dc;
     // Capture downscale policy mirrors the encoder preference. When the
     // HW encoder is in play (or will be, on Auto + Windows), we want
     // native-resolution frames; the HW path handles 4K fine and any
@@ -2220,6 +2233,22 @@ impl FfmpegDcCodec {
             Self::Vp9 => "VP9",
         }
     }
+
+    /// Wire codec name for the `rc:video-info` message — matches the
+    /// `AgentCaps.codecs` / negotiation vocabulary the browser uses.
+    fn wire_codec(self) -> &'static str {
+        match self {
+            Self::Hevc => "h265",
+            Self::Vp9 => "vp9",
+        }
+    }
+
+    /// Chroma the FFmpeg path emits. Both `hevc_*` (Main profile) and
+    /// `vp9_qsv` (profile 0) are 4:2:0 8-bit — the 4:4:4 path stays on
+    /// libvpx SW (`media_pump_vp9_444_dc`), never this pump.
+    fn wire_chroma(self) -> &'static str {
+        "yuv420"
+    }
 }
 
 /// rc.77/rc.83 — Unified FFmpeg-encoder DataChannel pump.
@@ -2249,11 +2278,16 @@ async fn media_pump_ffmpeg_dc(
     target_resolution: Arc<std::sync::Mutex<TargetResolution>>,
     lock_state_rx: tokio::sync::watch::Receiver<lock_state::LockState>,
     _quality_state: Arc<std::sync::atomic::AtomicU8>,
+    control_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
 ) {
     use crate::encode::VideoEncoder;
     use crate::encode::ffmpeg::FfmpegEncoder;
 
     let codec_label = codec.label();
+    // rc.87 — emit `rc:video-info` once the encoder is built so the
+    // browser stats badge shows the TRUTH (real encoder + HW + chroma)
+    // instead of the hardcoded "VP9 4:4:4 SW". Sent once on first build.
+    let mut video_info_sent = false;
 
     // Mirror the VP9 pump's overlay gate. Under SystemContext the
     // captured frame IS the real Winlogon screen; an overlay over it
@@ -2345,14 +2379,35 @@ async fn media_pump_ffmpeg_dc(
         if need_rebuild {
             match codec.open(w, h) {
                 Ok(enc) => {
+                    let encoder_name = enc.name();
                     info!(
                         %session_id,
                         codec_label,
                         width = w,
                         height = h,
-                        encoder = enc.name(),
+                        encoder = encoder_name,
                         "FFmpeg DC pump: encoder (re)built"
                     );
+                    // rc.87 — tell the browser the real encoder so the
+                    // stats badge stops claiming "VP9 4:4:4 SW". Sent
+                    // once on first successful build. FFmpeg HEVC/VP9
+                    // paths are always HW (NVENC/QSV/AMF) and 4:2:0.
+                    if !video_info_sent {
+                        let payload = format!(
+                            r#"{{"t":"rc:video-info","codec":"{}","encoder":"{}","hardware":true,"chroma":"{}"}}"#,
+                            codec.wire_codec(),
+                            encoder_name,
+                            codec.wire_chroma(),
+                        );
+                        let cdc = control_dc.lock().await.clone();
+                        if let Some(cdc) = cdc {
+                            if let Err(e) = cdc.send_text(payload).await {
+                                debug!(%session_id, %e, "rc:video-info send failed (control DC closed?)");
+                            } else {
+                                video_info_sent = true;
+                            }
+                        }
+                    }
                     encoder = Some(enc);
                     encoder_dims = Some((w, h));
                 }
