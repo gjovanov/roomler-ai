@@ -44,11 +44,24 @@ pub const HIGH_WATER_MARK_BYTES: usize = 4 * 1024 * 1024;
 /// matters — too tight = thrash; too loose = latency under burst.
 pub const LOW_WATER_MARK_BYTES: usize = 1024 * 1024;
 
-/// Default chunk size for native↔native DC sends. May rise to 256 KiB
-/// post-bench (T3 perf harness) if SCTP+OS sockbuf cooperate. Subtract
-/// the flow_id prefix from the TCP read budget so the framed DC
-/// message stays under the SCTP max_message_size of 65536.
-pub const CHUNK_BYTES: usize = 64 * 1024;
+/// Hard ceiling on one framed DC message (4-byte flow_id prefix +
+/// payload) — and thus the chunk size for native↔native DC sends. The
+/// TCP read budget below subtracts the flow_id prefix so the framed
+/// `encode(flow_id, &buf[..n])` never exceeds this.
+///
+/// This MUST be ≤ 65535, NOT merely ≤ the SCTP max_message_size of
+/// 65536. webrtc-data's `DataChannel` read loop reads every inbound
+/// message into a fixed `u16::MAX` = 65535-byte buffer
+/// (`DATA_CHANNEL_BUFFER_SIZE`). A reassembled SCTP message larger than
+/// that buffer makes `read_sctp` return `ErrShortBuffer`, which
+/// webrtc-data turns into a *stream close* and the read loop then
+/// breaks — so `on_message` stops firing for the life of the DC. The
+/// one-byte gap between 65535 and 65536 silently stalled large
+/// transfers mid-flight: the first full-size chunk to cross the wire
+/// killed the receiver's read loop (sender `dc_send` kept climbing while
+/// the receiver's `dc_recv` flatlined), while small/slow transfers that
+/// never filled a whole chunk worked fine. Was `64 * 1024` (= 65536).
+pub const CHUNK_BYTES: usize = u16::MAX as usize;
 
 /// Per-flow inbound mailbox capacity (in messages, not bytes). When
 /// the receiver is slow, the [`FlowDemux::on_message`] handler awaits
@@ -162,11 +175,14 @@ const _: () = assert!(
     HIGH_WATER_MARK_BYTES >= LOW_WATER_MARK_BYTES * 2,
     "watermark hysteresis must be non-trivial — too close = thrash"
 );
-// SCTP max_message_size default is 65536 (webrtc-sctp
-// DEFAULT_MAX_MESSAGE_SIZE). 64 KiB sits exactly at it; any larger
-// and we'd need a SettingEngine knob for message size too.
-const _: () = assert!(CHUNK_BYTES <= 65536);
-const _: () = assert!(CHUNK_BYTES.is_power_of_two());
+// The framed wire message (`CHUNK_BYTES`, which is the framed ceiling
+// including the flow_id prefix) must fit webrtc-data's read-loop
+// buffer, a fixed `u16::MAX` = 65535 bytes. This is one byte tighter
+// than the SCTP max_message_size of 65536 — exceeding it makes the
+// receiver's read loop break on `ErrShortBuffer` and never deliver
+// another message. See `CHUNK_BYTES` above for the full failure mode.
+const _: () = assert!(CHUNK_BYTES <= u16::MAX as usize);
+const _: () = assert!(CHUNK_BYTES > mux::FLOW_ID_HEADER_BYTES);
 
 // ────────────────────────────────────────────────────────────────────────────
 // Flow demux — one per DC, fans inbound DC messages to per-flow
@@ -744,6 +760,93 @@ mod tests {
             .await
             .expect("demux did not deliver within 5s");
         assert_eq!(received.as_deref(), Some(b"hello world".as_ref()));
+    }
+
+    /// Regression lock for the one-byte framing overflow that silently
+    /// stalled large transfers: the sender's `dc_send` kept climbing
+    /// while the receiver's `dc_recv` flatlined the moment the first
+    /// full-size chunk crossed the wire. webrtc-data reads every inbound
+    /// message into a fixed `u16::MAX` = 65535-byte buffer; a 65536-byte
+    /// message returned `ErrShortBuffer`, which closed the stream and
+    /// broke the read loop so `on_message` never fired again. A single
+    /// MAX-size framed message (`CHUNK_BYTES` on the wire) must arrive
+    /// intact AND leave the DC alive for a follow-up — every other test
+    /// here uses tiny messages or 4 KiB sub-chunks, so none caught it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn max_size_framed_message_survives_receiver_read_loop() {
+        let offerer = TunnelPeer::new(vec![]).await.unwrap();
+        let answerer = TunnelPeer::new(vec![]).await.unwrap();
+        let answerer_pc = answerer.peer_connection();
+        offerer.on_local_ice_candidate(move |c| {
+            let pc = Arc::clone(&answerer_pc);
+            Box::pin(async move {
+                if let Some(c) = c
+                    && let Ok(init) = c.to_json()
+                {
+                    let _ = pc.add_ice_candidate(init).await;
+                }
+            })
+        });
+        let offerer_pc = offerer.peer_connection();
+        answerer.on_local_ice_candidate(move |c| {
+            let pc = Arc::clone(&offerer_pc);
+            Box::pin(async move {
+                if let Some(c) = c
+                    && let Ok(init) = c.to_json()
+                {
+                    let _ = pc.add_ice_candidate(init).await;
+                }
+            })
+        });
+        let offer = offerer.create_offer().await.unwrap();
+        let answer = answerer.accept_offer(&offer.sdp).await.unwrap();
+        offerer.accept_answer(&answer.sdp).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), offerer.wait_pool_open())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), answerer.wait_pool_open())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let off_dc = offerer.dc(0).unwrap();
+        let ans_dc = answerer.dc(0).unwrap();
+        let ans_demux = FlowDemux::install(ans_dc).await;
+        let (mut from_dc, _stats) = ans_demux.register(7).await;
+
+        // Largest legal payload: framed length == CHUNK_BYTES == exactly
+        // the receiver's 65535-byte read buffer.
+        let payload = vec![0xABu8; CHUNK_BYTES - mux::FLOW_ID_HEADER_BYTES];
+        let framed = mux::encode(7, &payload);
+        assert_eq!(
+            framed.len(),
+            CHUNK_BYTES,
+            "framed message must be the max size"
+        );
+        off_dc.send(&Bytes::from(framed)).await.unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(5), from_dc.recv())
+            .await
+            .expect("receiver read loop died on a max-size message (the overflow regression)")
+            .expect("flow mailbox closed unexpectedly");
+        assert_eq!(
+            received.len(),
+            payload.len(),
+            "max-size payload length mismatch"
+        );
+        assert_eq!(received, payload, "max-size payload corrupted");
+
+        // The DC must still be alive: a follow-up message must arrive.
+        // Pre-fix the read loop had already broken — on_message was dead.
+        off_dc
+            .send(&Bytes::from(mux::encode(7, b"still alive")))
+            .await
+            .unwrap();
+        let received2 = tokio::time::timeout(Duration::from_secs(5), from_dc.recv())
+            .await
+            .expect("receiver read loop did not survive past the max-size message");
+        assert_eq!(received2.as_deref(), Some(b"still alive".as_ref()));
     }
 
     #[tokio::test(flavor = "multi_thread")]
