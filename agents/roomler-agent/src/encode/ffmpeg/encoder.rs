@@ -139,7 +139,7 @@ impl FfmpegEncoder {
                         width,
                         height,
                         bit_rate,
-                        "ffmpeg HEVC encoder opened"
+                        "ffmpeg encoder opened"
                     );
                     let plane_pixels = (width as usize) * (height as usize);
                     return Ok(Self {
@@ -155,12 +155,20 @@ impl FfmpegEncoder {
                     });
                 }
                 Err(e) => {
-                    tracing::warn!(encoder = name, error = %e, "ffmpeg encoder open failed; trying next");
+                    // rc.85 — DEBUG not WARN. A candidate failing in the
+                    // cascade is the cascade doing its job, not a warning
+                    // condition. The CALLER logs the consequential outcome
+                    // at the right level (caps.rs: INFO+%e for VP9, WARN
+                    // for HEVC; peer.rs: falls through to libvpx/MF). The
+                    // "; trying next" suffix lied for single-entry lists
+                    // (VP9_ENCODER_NAMES = ["vp9_qsv"]). Error reason is
+                    // preserved in `last_err` → surfaced by the caller.
+                    tracing::debug!(encoder = name, error = %e, "ffmpeg encoder candidate failed to open");
                     last_err = Some(e);
                 }
             }
         }
-        Err(last_err.unwrap_or_else(|| anyhow!("no HEVC encoder names tried")))
+        Err(last_err.unwrap_or_else(|| anyhow!("no ffmpeg encoder candidates were tried")))
     }
 
     fn build_encoder(

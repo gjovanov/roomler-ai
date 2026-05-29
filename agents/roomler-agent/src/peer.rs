@@ -2410,16 +2410,35 @@ async fn media_pump_ffmpeg_dc(
         };
 
         for pkt in packets {
-            let buf = frame_video_bytes(&pkt.data, pkt.is_keyframe, frame.monotonic_us);
-            match dc.send(&bytes::Bytes::from(buf.clone())).await {
-                Ok(n) => {
-                    frames_sent += 1;
-                    bytes_written += n as u64;
-                }
-                Err(e) => {
+            let wire = frame_video_bytes(&pkt.data, pkt.is_keyframe, frame.monotonic_us);
+            let wire_len = wire.len() as u64;
+            // rc.85 CRITICAL FIX: chunk into ≤ 16 KiB pieces, exactly like
+            // `media_pump_vp9_444_dc` (line ~2158). rc.77–rc.84 sent the
+            // WHOLE framed packet in one `dc.send()`, which is fatal: an
+            // HEVC IDR is 50 KB–2 MB and webrtc-data's DataChannel read
+            // loop reads every inbound message into a fixed 65535-byte
+            // buffer — a single message ≥ 65536 makes `read_sctp` return
+            // ErrShortBuffer → stream close → the DC dies permanently for
+            // the rest of the session (root cause documented in the
+            // parallel-session tunnel fix 5afe40a). The Gate 0 smoke
+            // never caught this because it only encodes; it never sends
+            // over a DC. The browser worker's `consumeBytes` already
+            // reassembles across `onmessage` boundaries via the 13-byte
+            // header's size field, so chunked sends are exactly what it
+            // expects.
+            const SCTP_CHUNK_SIZE: usize = 16 * 1024;
+            let mut frame_failed = false;
+            for chunk in wire.chunks(SCTP_CHUNK_SIZE) {
+                if let Err(e) = dc.send(&bytes::Bytes::copy_from_slice(chunk)).await {
                     send_errors += 1;
-                    tracing::warn!(%session_id, codec_label, %e, "FFmpeg DC pump: DC send error");
+                    tracing::warn!(%session_id, codec_label, %e, send_errors, "FFmpeg DC pump: DC send failed");
+                    frame_failed = true;
+                    break;
                 }
+            }
+            if !frame_failed {
+                frames_sent += 1;
+                bytes_written += wire_len;
             }
         }
 
