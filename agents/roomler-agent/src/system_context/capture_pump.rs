@@ -211,7 +211,21 @@ fn worker_main(
     let mut consecutive_access_lost: u32 = 0;
     let mut consecutive_empty: u64 = 0;
 
+    // rc.91 — worker-side capture timing. The pump-side heartbeat's
+    // `avg_capture_ms` measures the WHOLE next_frame() round-trip
+    // (mpsc command → this thread → scrap frame() → oneshot reply →
+    // tokio reschedule). Field data (PC50054, 2026-05-30) showed ~45ms
+    // there under motion — far too slow for a ~3-5ms DXGI acquire+copy,
+    // so the suspicion is the per-frame thread handoff dominates. This
+    // accumulator times JUST the `capture_one_blocking` call (scrap
+    // frame() + handling) on THIS thread; the diff between the
+    // worker-side avg logged here and the pump-side `avg_capture_ms`
+    // attributes the round-trip overhead. Logged ~once / 150 captures.
+    let mut worker_capture_us: u64 = 0;
+    let mut worker_capture_calls: u64 = 0;
+
     while let Ok(res_tx) = cmd_rx.recv() {
+        let cap_start = Instant::now();
         let reply = capture_one_blocking(
             &mut backend,
             &mut consecutive_hard,
@@ -219,6 +233,18 @@ fn worker_main(
             &mut consecutive_empty,
             start,
         );
+        worker_capture_us += cap_start.elapsed().as_micros() as u64;
+        worker_capture_calls += 1;
+        if worker_capture_calls.is_multiple_of(150) {
+            let avg_ms = (worker_capture_us / worker_capture_calls) as f64 / 1000.0;
+            tracing::info!(
+                worker_avg_capture_ms = avg_ms,
+                calls = worker_capture_calls,
+                "system-context capture: worker-side scrap frame() timing (compare to pump heartbeat avg_capture_ms — the diff is the per-frame async round-trip)"
+            );
+            worker_capture_us = 0;
+            worker_capture_calls = 0;
+        }
         // Best-effort send; if the async side dropped its rx the next
         // recv() above will error out and we exit cleanly.
         let _ = res_tx.send(reply);
