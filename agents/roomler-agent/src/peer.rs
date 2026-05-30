@@ -2302,8 +2302,13 @@ async fn media_pump_ffmpeg_dc(
     }
     let mut was_locked_last_iter = matches!(*lock_state_rx.borrow(), lock_state::LockState::Locked);
 
-    let target_fps: u32 = 30;
-    let frame_duration_floor = Duration::from_micros(1_000_000 / target_fps as u64);
+    // rc.93 — target fps. Pre-rc.93 this was hardcoded 30, which capped the
+    // scrap backend's internal pacer (`scrap_backend::next_frame` sleeps to
+    // `1000/target_fps` ms) AND drove a redundant pump-side floor sleep.
+    // The fast legacy `media_pump` runs the SAME capturer at 60 with no
+    // pump floor and hits ~55 fps; HW encode (vp9_qsv/hevc_qsv ~4-6 ms)
+    // easily sustains that. Default 60, operator-overridable via env.
+    let target_fps: u32 = ffmpeg_target_fps_from_env();
     let downscale = crate::capture::DownscalePolicy::Never;
     info!(
         %session_id,
@@ -2314,20 +2319,14 @@ async fn media_pump_ffmpeg_dc(
     let mut capturer = capture::open_default(target_fps, downscale);
     let mut encoder: Option<FfmpegEncoder> = None;
     let mut encoder_dims: Option<(u32, u32)> = None;
-    // rc.92 — two purpose-specific clocks. Pre-rc.92 a single
-    // `last_capture_at` served BOTH the pacing floor and the idle
-    // keepalive AND was set twice per loop (loop top + after capture), so
-    // the floor measured only the post-capture work and the loop period
-    // came out to `floor + capture` instead of `floor`. Worse, the
-    // idle-keepalive check then measured ~capture-time (never ≥1 s) so it
-    // could never fire. Split them:
-    //   - `frame_started_at` is the pacing clock: set once per loop right
-    //     after the floor sleep, so the cadence loop-top→loop-top is
-    //     exactly `frame_duration_floor`.
-    //   - `last_good_at` is the idle-keepalive clock: set only when a real
-    //     (or reused) frame is produced.
-    let mut frame_started_at = std::time::Instant::now();
-    let mut last_good_at = std::time::Instant::now();
+    // rc.93 — single keepalive clock, mirroring `media_pump`. The rc.92
+    // pacing clock + pump-side floor sleep were REMOVED: the capture
+    // backend is the single pacer (scrap sleeps to `1000/target_fps`;
+    // SystemContext capture delivers at display rate), so a second
+    // pump-side floor just halved fps and amplified idle Nones — that was
+    // the real vp9_qsv ~15 fps bug (rc.92's timer theory was a red herring;
+    // timeBeginPeriod(1) landed but didn't move fps).
+    let mut last_capture_at = std::time::Instant::now();
     let mut last_good_frame: Option<std::sync::Arc<crate::capture::Frame>> = None;
     const IDLE_KEEPALIVE: Duration = Duration::from_millis(1_000);
 
@@ -2347,13 +2346,12 @@ async fn media_pump_ffmpeg_dc(
     let mut capture_us: u64 = 0;
     let mut encode_us: u64 = 0;
     let mut send_us: u64 = 0;
-    // rc.92 — time actually spent in the pacing-floor `tokio::time::sleep`.
-    // Confirms the timer-resolution fix: at 30 fps with a ~5 ms working
-    // loop this should sit ~28 ms; if the loop is fps-limited by the floor
-    // it shows up here, and if the Windows 15.6 ms timer is still in force
-    // the value will be quantized (multiples of ~15.6 ms) rather than the
-    // smooth `floor - work` we expect at 1 ms resolution.
-    let mut floor_sleep_us: u64 = 0;
+    // rc.93 — count Ok(None) ticks (capturer had no new frame). Replaces
+    // the rc.92 floor-sleep accumulator now that the pump floor is gone. A
+    // high frames_empty *under motion* would mean the capture backend (not
+    // the pump) is the fps limiter; near-zero under motion confirms the
+    // pump now runs at capture rate like `media_pump`.
+    let mut frames_empty: u64 = 0;
     let mut heartbeat_frames_base: u64 = 0;
     let mut last_heartbeat = std::time::Instant::now();
     const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
@@ -2364,22 +2362,12 @@ async fn media_pump_ffmpeg_dc(
     const BACKPRESSURE_HIGH_WATER: usize = 1024 * 1024;
 
     loop {
-        // Pace at the encoder's target framerate. `frame_started_at` is
-        // the pacing clock from the PREVIOUS iteration's loop top, so
-        // `elapsed` already includes that iteration's capture + encode +
-        // send. Sleeping `floor - elapsed` makes the loop-top→loop-top
-        // period exactly `frame_duration_floor` (rc.92: pre-rc.92 this was
-        // measured from a post-capture timestamp, so the period was
-        // `floor + capture` and the loop ran slow). At 1 ms timer
-        // resolution (win_timer::TimerResolutionGuard) the sleep is precise
-        // to ~1 ms; without it Windows rounds up to ~15.6 ms ticks.
-        let elapsed = frame_started_at.elapsed();
-        if elapsed < frame_duration_floor {
-            let sleep_for = frame_duration_floor - elapsed;
-            tokio::time::sleep(sleep_for).await;
-            floor_sleep_us += sleep_for.as_micros() as u64;
-        }
-        frame_started_at = std::time::Instant::now();
+        // rc.93 — NO pump-side pacing floor (the rc.86→rc.92 floor sleep
+        // was the fps bug). The capture backend is the single pacer:
+        // scrap_backend sleeps to `1000/target_fps` internally, and the
+        // SystemContext worker delivers at display rate. A second floor
+        // here just halved the achieved fps and amplified idle Nones. Poll
+        // continuously, exactly like the fast `media_pump`.
 
         // Resolve the active target resolution (operator may have
         // changed it mid-session via `rc:resolution`).
@@ -2398,21 +2386,22 @@ async fn media_pump_ffmpeg_dc(
             Ok(Some(f)) => {
                 let arc = std::sync::Arc::new(f);
                 last_good_frame = Some(arc.clone());
-                last_good_at = std::time::Instant::now();
+                last_capture_at = std::time::Instant::now();
                 frames_captured += 1;
                 arc
             }
             Ok(None) => {
-                // No new frame this tick. Once we've gone IDLE_KEEPALIVE
-                // without a fresh frame, resend the last good one so the
-                // browser decoder doesn't pause; otherwise skip and let the
-                // floor pace the next attempt. `last_good_at` (not the
-                // pacing clock) is what makes this fire after a real idle
-                // gap — rc.92 separated the two.
-                if last_good_at.elapsed() >= IDLE_KEEPALIVE
+                // No new frame this tick (DXGI only fires on screen change).
+                // Mirror `media_pump`: once we've been idle ≥ IDLE_KEEPALIVE,
+                // re-encode the last good frame so the browser decoder doesn't
+                // pause; otherwise `continue` immediately. No sleep here — the
+                // capture backend's own pacer prevents a hot spin, and adding
+                // a sleep is exactly what dragged fps down pre-rc.93.
+                frames_empty += 1;
+                if last_capture_at.elapsed() >= IDLE_KEEPALIVE
                     && let Some(ref f) = last_good_frame
                 {
-                    last_good_at = std::time::Instant::now();
+                    last_capture_at = std::time::Instant::now();
                     f.clone()
                 } else {
                     continue;
@@ -2586,7 +2575,6 @@ async fn media_pump_ffmpeg_dc(
             let avg_capture_ms = (capture_us / window_frames) as f64 / 1000.0;
             let avg_encode_ms = (encode_us / window_frames) as f64 / 1000.0;
             let avg_send_ms = (send_us / window_frames) as f64 / 1000.0;
-            let avg_floor_sleep_ms = (floor_sleep_us / window_frames) as f64 / 1000.0;
             info!(
                 %session_id,
                 codec_label,
@@ -2595,15 +2583,14 @@ async fn media_pump_ffmpeg_dc(
                 height = h,
                 encoder = enc.name(),
                 frames_captured, frames_encoded, frames_sent, bytes_written,
-                send_errors, dc_unopen_drops, frames_dropped_backpressure,
-                avg_capture_ms, avg_encode_ms, avg_send_ms, avg_floor_sleep_ms,
+                send_errors, dc_unopen_drops, frames_dropped_backpressure, frames_empty,
+                avg_capture_ms, avg_encode_ms, avg_send_ms,
                 "FFmpeg DC pump heartbeat (≈2s window)"
             );
             heartbeat_frames_base = frames_encoded;
             capture_us = 0;
             encode_us = 0;
             send_us = 0;
-            floor_sleep_us = 0;
         }
     }
 }
@@ -2624,6 +2611,24 @@ fn vp9_444_target_fps_from_env() -> u32 {
         Some(_) => 30,
         None => DEFAULT_FPS,
     }
+}
+
+/// Read the `ROOMLER_AGENT_FFMPEG_FPS` env var for the FFmpeg HW DC pump
+/// (HEVC / vp9_qsv). Default **60** — hardware encode sustains it and the
+/// capture backend caps the real delivered rate anyway. Deliberately
+/// distinct from the libvpx VP9-444 pump's `ROOMLER_AGENT_VP9_FPS`
+/// (default 30, because SW 4:4:4 encode can't keep up at 60). Pre-rc.93
+/// the FFmpeg pump hardcoded 30, which throttled the scrap backend's
+/// internal pacer to 30 fps and is the root of the vp9_qsv ~15 fps field
+/// bug. Clamped to 1..=240 so a high-refresh display can opt higher.
+#[cfg(feature = "ffmpeg-encoder")]
+fn ffmpeg_target_fps_from_env() -> u32 {
+    const DEFAULT_FPS: u32 = 60;
+    std::env::var("ROOMLER_AGENT_FFMPEG_FPS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .map(|fps| fps.clamp(1, 240))
+        .unwrap_or(DEFAULT_FPS)
 }
 
 /// Attach the `input` data-channel message handler. Each inbound payload
