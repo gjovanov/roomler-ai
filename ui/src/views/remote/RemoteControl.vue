@@ -1886,7 +1886,7 @@ const hevcOn = computed<boolean>(
 )
 const hevcTooltip = computed<string>(() => {
   if (!rc.hevcSupported.value) {
-    return 'HEVC over DataChannel requires WebCodecs VideoDecoder hev1.1.6.L93.B0 with a HW HEVC decoder — not supported in this browser'
+    return 'HEVC over DataChannel requires WebCodecs VideoDecoder hev1.1.6.L153.B0 with a HW HEVC decoder — not supported in this browser'
   }
   return hevcOn.value
     ? 'HEVC over DataChannel ON — agent encodes via NVENC/QSV/AMF (Option B). Takes effect on next Connect.'
