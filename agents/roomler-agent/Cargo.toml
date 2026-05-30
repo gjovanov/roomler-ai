@@ -211,6 +211,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_Security",
     "Win32_System_RemoteDesktop",        # WTS* APIs
     "Win32_System_Threading",            # CreateProcessAsUserW, STARTUPINFO
+    "Win32_Media",                       # timeBeginPeriod/timeEndPeriod/timeGetDevCaps (rc.92 — 1ms timer res so the FFmpeg DC pump isn't quantized to the 15.6ms default)
     "Win32_System_Environment",          # CreateEnvironmentBlock
     "Win32_System_StationsAndDesktops",  # winsta0\default desktop attach
     "Win32_System_Diagnostics_ToolHelp", # CreateToolhelp32Snapshot (find winlogon.exe pid for M3 A1)

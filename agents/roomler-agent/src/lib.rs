@@ -42,3 +42,5 @@ pub mod watchdog;
 pub mod win32_monitors;
 #[cfg(target_os = "windows")]
 pub mod win_service;
+#[cfg(target_os = "windows")]
+pub mod win_timer;
