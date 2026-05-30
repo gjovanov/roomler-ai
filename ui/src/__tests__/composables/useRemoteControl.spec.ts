@@ -840,8 +840,8 @@ describe('resolutionWireMessage', () => {
 describe('codecMimeForShort', () => {
   it('maps the known codec short-names to permissive WebCodecs strings', () => {
     expect(codecMimeForShort('h264')).toBe('avc1.42E01F')
-    expect(codecMimeForShort('h265')).toBe('hev1.1.6.L93.B0')
-    expect(codecMimeForShort('hevc')).toBe('hev1.1.6.L93.B0')
+    expect(codecMimeForShort('h265')).toBe('hev1.1.6.L153.B0')
+    expect(codecMimeForShort('hevc')).toBe('hev1.1.6.L153.B0')
     expect(codecMimeForShort('av1')).toBe('av01.0.08M.08')
     expect(codecMimeForShort('vp9')).toBe('vp09.00.10.08')
     expect(codecMimeForShort('vp8')).toBe('vp8')
@@ -849,7 +849,7 @@ describe('codecMimeForShort', () => {
 
   it('is case-insensitive', () => {
     expect(codecMimeForShort('H264')).toBe('avc1.42E01F')
-    expect(codecMimeForShort('HEVC')).toBe('hev1.1.6.L93.B0')
+    expect(codecMimeForShort('HEVC')).toBe('hev1.1.6.L153.B0')
   })
 
   it('falls back to H.264 for unknown short-names so a typo or stale wire value still produces a valid decoder config', () => {

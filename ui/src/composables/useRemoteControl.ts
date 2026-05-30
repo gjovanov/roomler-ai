@@ -608,12 +608,16 @@ export async function isVp9_444DecodeSupported(): Promise<boolean> {
   }
 }
 
-/** rc.78 — feature-detect HEVC decode via WebCodecs. Pre-flight
- *  WebCodecs spike (2026-05-26) confirmed Chrome + Edge accept
- *  `hev1.1.6.L93.B0` (Main profile, Level 3.1) with Annex-B no-
- *  description bytes. The composable probes once on construction +
- *  caches in `hevcSupported`; `connect()` re-probes on the off-
- *  chance the cache hasn't resolved yet.
+/** rc.78 — feature-detect HEVC decode via WebCodecs. rc.94 — probes
+ *  `hev1.1.6.L153.B0` (Main profile, Level **5.1**), matching the
+ *  worker's `DEFAULT_HEVC_CODEC`. MUST stay in sync with the worker:
+ *  the probe has to declare the SAME level the worker will configure,
+ *  or we'd green-light a level the decoder then rejects on real bytes.
+ *  Bumped from L3.1 (`L93`) which maxed at ~1280×720 and rendered the
+ *  field host's 1920×1200 capture as a black screen (see worker note).
+ *  The composable probes once on construction + caches in
+ *  `hevcSupported`; `connect()` re-probes on the off-chance the cache
+ *  hasn't resolved yet.
  *
  *  Unlike VP9, HEVC has NO software fallback in WebCodecs — Chromium
  *  only enables HEVC decode when the OS provides a HW decoder.
@@ -632,7 +636,7 @@ export async function isHevcDecodeSupported(): Promise<boolean> {
   const isConfigSupported = g.VideoDecoder?.isConfigSupported
   if (typeof isConfigSupported !== 'function') return false
   try {
-    const res = await isConfigSupported({ codec: 'hev1.1.6.L93.B0' })
+    const res = await isConfigSupported({ codec: 'hev1.1.6.L153.B0' })
     return res?.supported === true
   } catch {
     return false
@@ -2932,7 +2936,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         vp9_444Supported.value = fallback
         if (fallback) {
           console.info(
-            '[rc] preferred_transport=data-channel-hevc dropped — VideoDecoder.isConfigSupported(hev1.1.6.L93.B0) returned false. Falling back to data-channel-vp9-444.',
+            '[rc] preferred_transport=data-channel-hevc dropped — VideoDecoder.isConfigSupported(hev1.1.6.L153.B0) returned false. Falling back to data-channel-vp9-444.',
           )
           preferredTransport = 'data-channel-vp9-444'
         } else {

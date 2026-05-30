@@ -4,10 +4,12 @@
  * rc.78 — HEVC decoder worker for the Option B HEVC-over-DataChannel
  * transport. Sibling to `rc-vp9-444-worker.ts`; same wire format, same
  * 13-byte length-prefix header, same `OffscreenCanvas` paint path.
- * Only difference: codec string is `hev1.1.6.L93.B0` (HEVC Main
- * profile, Level 3.1, no decoder description) per the pre-flight
- * WebCodecs spike (2026-05-26) that confirmed Chrome + Edge accept
- * Annex-B no-description HEVC.
+ * Only difference: codec string is `hev1.1.6.L153.B0` (HEVC Main
+ * profile, Level 5.1, no decoder description). The pre-flight WebCodecs
+ * spike (2026-05-26) confirmed Chrome + Edge accept Annex-B no-
+ * description HEVC at L3.1; rc.94 bumped the level to 5.1 because the
+ * field SystemContext host captures 1920×1200, which exceeds L3.1's
+ * ~1280×720 ceiling and rendered black (see DEFAULT_HEVC_CODEC note).
  *
  * Source agent: `agents/roomler-agent/src/encode/ffmpeg/encoder.rs`
  * via `peer.rs::media_pump_hevc_dc`. Cascade: hevc_nvenc → hevc_qsv
@@ -46,11 +48,19 @@ type IncomingMessage = InitCanvasMessage | ChunkMessage | CloseMessage
 
 const HEADER_BYTES = 13
 const FLAG_KEYFRAME = 0x01
-/** Default codec — HEVC Main, Level 3.1, no decoder description.
- *  The pre-flight WebCodecs spike confirmed Chrome + Edge accept
- *  this with raw Annex-B bytes. Tests can override via the `codec`
- *  field on `init-canvas`. */
-const DEFAULT_HEVC_CODEC = 'hev1.1.6.L93.B0'
+/** Default codec — HEVC Main, Level **5.1**, no decoder description.
+ *  rc.94 — bumped from L3.1 (`L93`). L3.1 maxes at 983,040 luma
+ *  samples (~1280×720); the field SystemContext host (PC50054)
+ *  captures 1920×1200 = 2,304,000 samples, which exceeds even L4.1
+ *  (2,228,224) — so Chromium's HW HEVC decoder rejected the stream
+ *  and rendered a BLACK screen. The pre-flight spike only validated a
+ *  low-res sample at L3.1, so it never caught this. L5.1 (`L153`,
+ *  8,912,896 samples, up to 4K@64) covers every realistic desktop
+ *  resolution and is HW-decodable on Iris Xe / RTX 5090 (the Gate 0
+ *  hosts). The codec-string level is a declared MAX; a smaller stream
+ *  decodes fine under it. Tests can override via the `codec` field on
+ *  `init-canvas`. */
+const DEFAULT_HEVC_CODEC = 'hev1.1.6.L153.B0'
 let activeCodec: string = DEFAULT_HEVC_CODEC
 
 const workerScope = self as unknown as {
