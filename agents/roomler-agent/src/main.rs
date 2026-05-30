@@ -18,6 +18,8 @@ use roomler_agent::dpi;
 #[cfg(target_os = "windows")]
 use roomler_agent::win_service;
 #[cfg(target_os = "windows")]
+use roomler_agent::win_timer;
+#[cfg(target_os = "windows")]
 use roomler_agent::win32_monitors;
 use roomler_agent::{
     config, crash_uploader, encode, enrollment, instance_lock, logging, machine, notify,
@@ -518,6 +520,16 @@ async fn main() -> Result<()> {
     #[cfg(target_os = "windows")]
     let dpi_outcome = dpi::set_per_monitor_aware();
 
+    // rc.92 — request 1 ms multimedia timer resolution for the whole
+    // process. Windows defaults to a 15.6 ms timer; that quantized the
+    // FFmpeg DC pump's per-frame capture round-trip + `tokio::time::sleep`
+    // floor up to 15.6 ms ticks → ~12 fps under motion on the
+    // SystemContext path (field PC50054). Held for the process lifetime;
+    // the guard's Drop restores the previous resolution. Logged below
+    // (after logging::init) alongside the DPI diagnostic. See win_timer.rs.
+    #[cfg(target_os = "windows")]
+    let _timer_guard = win_timer::TimerResolutionGuard::request_1ms();
+
     logging::init();
     if let Some(dir) = logging::log_dir() {
         tracing::debug!(log_dir = %dir.display(), "persistent file logging active");
@@ -529,6 +541,18 @@ async fn main() -> Result<()> {
             set_succeeded = dpi_outcome.set,
             actual = dpi_outcome.actual.as_str(),
             "DPI awareness configured at process start (rc.41 diagnostic — surfaces residual the field-test host mouse-misposition cause)"
+        );
+        // rc.92 — surface the timer-resolution request so the field log
+        // confirms 1 ms is in force. If `active=false` the OS refused the
+        // request (power throttling of a background session-0 process) and
+        // the FFmpeg DC pump's `avg_capture_ms` will stay quantized — the
+        // signal to add a ProcessPowerThrottling timer-resolution opt-out.
+        tracing::info!(
+            requested_ms = _timer_guard.period_ms(),
+            active = _timer_guard.active(),
+            device_min_ms = _timer_guard.device_min_ms(),
+            device_max_ms = _timer_guard.device_max_ms(),
+            "multimedia timer resolution requested (rc.92 — 1ms so the FFmpeg DC pump isn't paced by the 15.6ms Windows default)"
         );
         // rc.48 — monitor-layout diagnostic. DPI is correctly set per
         // the rc.41/44 readback, yet the field-test host field reports still show
