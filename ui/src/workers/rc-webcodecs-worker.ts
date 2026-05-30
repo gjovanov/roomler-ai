@@ -302,7 +302,12 @@ export function codecMimeForShort(short: string): string {
       return 'avc1.42E01F'
     case 'h265':
     case 'hevc':
-      return 'hev1.1.6.L93.B0'
+      // rc.94 — Level 5.1 (`L153`), not L3.1 (`L93`). L3.1 maxes at
+      // ~1280×720; desktops at 1920×1200 / 1440p / 4K exceed it and the
+      // HW HEVC decoder renders black. L5.1 (up to 4K@64) is a declared
+      // MAX, so smaller streams still decode. Matches rc-hevc-worker's
+      // DEFAULT_HEVC_CODEC + the isHevcDecodeSupported probe.
+      return 'hev1.1.6.L153.B0'
     case 'av1':
       return 'av01.0.08M.08'
     case 'vp9':
