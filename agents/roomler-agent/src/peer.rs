@@ -2314,7 +2314,20 @@ async fn media_pump_ffmpeg_dc(
     let mut capturer = capture::open_default(target_fps, downscale);
     let mut encoder: Option<FfmpegEncoder> = None;
     let mut encoder_dims: Option<(u32, u32)> = None;
-    let mut last_capture_at = std::time::Instant::now();
+    // rc.92 — two purpose-specific clocks. Pre-rc.92 a single
+    // `last_capture_at` served BOTH the pacing floor and the idle
+    // keepalive AND was set twice per loop (loop top + after capture), so
+    // the floor measured only the post-capture work and the loop period
+    // came out to `floor + capture` instead of `floor`. Worse, the
+    // idle-keepalive check then measured ~capture-time (never ≥1 s) so it
+    // could never fire. Split them:
+    //   - `frame_started_at` is the pacing clock: set once per loop right
+    //     after the floor sleep, so the cadence loop-top→loop-top is
+    //     exactly `frame_duration_floor`.
+    //   - `last_good_at` is the idle-keepalive clock: set only when a real
+    //     (or reused) frame is produced.
+    let mut frame_started_at = std::time::Instant::now();
+    let mut last_good_at = std::time::Instant::now();
     let mut last_good_frame: Option<std::sync::Arc<crate::capture::Frame>> = None;
     const IDLE_KEEPALIVE: Duration = Duration::from_millis(1_000);
 
@@ -2334,6 +2347,13 @@ async fn media_pump_ffmpeg_dc(
     let mut capture_us: u64 = 0;
     let mut encode_us: u64 = 0;
     let mut send_us: u64 = 0;
+    // rc.92 — time actually spent in the pacing-floor `tokio::time::sleep`.
+    // Confirms the timer-resolution fix: at 30 fps with a ~5 ms working
+    // loop this should sit ~28 ms; if the loop is fps-limited by the floor
+    // it shows up here, and if the Windows 15.6 ms timer is still in force
+    // the value will be quantized (multiples of ~15.6 ms) rather than the
+    // smooth `floor - work` we expect at 1 ms resolution.
+    let mut floor_sleep_us: u64 = 0;
     let mut heartbeat_frames_base: u64 = 0;
     let mut last_heartbeat = std::time::Instant::now();
     const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
@@ -2344,13 +2364,22 @@ async fn media_pump_ffmpeg_dc(
     const BACKPRESSURE_HIGH_WATER: usize = 1024 * 1024;
 
     loop {
-        // Pace at the encoder's target framerate. If the previous loop
-        // iteration ran fast, sleep until the next frame's deadline.
-        let elapsed = last_capture_at.elapsed();
+        // Pace at the encoder's target framerate. `frame_started_at` is
+        // the pacing clock from the PREVIOUS iteration's loop top, so
+        // `elapsed` already includes that iteration's capture + encode +
+        // send. Sleeping `floor - elapsed` makes the loop-top→loop-top
+        // period exactly `frame_duration_floor` (rc.92: pre-rc.92 this was
+        // measured from a post-capture timestamp, so the period was
+        // `floor + capture` and the loop ran slow). At 1 ms timer
+        // resolution (win_timer::TimerResolutionGuard) the sleep is precise
+        // to ~1 ms; without it Windows rounds up to ~15.6 ms ticks.
+        let elapsed = frame_started_at.elapsed();
         if elapsed < frame_duration_floor {
-            tokio::time::sleep(frame_duration_floor - elapsed).await;
+            let sleep_for = frame_duration_floor - elapsed;
+            tokio::time::sleep(sleep_for).await;
+            floor_sleep_us += sleep_for.as_micros() as u64;
         }
-        last_capture_at = std::time::Instant::now();
+        frame_started_at = std::time::Instant::now();
 
         // Resolve the active target resolution (operator may have
         // changed it mid-session via `rc:resolution`).
@@ -2369,15 +2398,21 @@ async fn media_pump_ffmpeg_dc(
             Ok(Some(f)) => {
                 let arc = std::sync::Arc::new(f);
                 last_good_frame = Some(arc.clone());
-                last_capture_at = std::time::Instant::now();
+                last_good_at = std::time::Instant::now();
                 frames_captured += 1;
                 arc
             }
             Ok(None) => {
-                if last_capture_at.elapsed() >= IDLE_KEEPALIVE
+                // No new frame this tick. Once we've gone IDLE_KEEPALIVE
+                // without a fresh frame, resend the last good one so the
+                // browser decoder doesn't pause; otherwise skip and let the
+                // floor pace the next attempt. `last_good_at` (not the
+                // pacing clock) is what makes this fire after a real idle
+                // gap — rc.92 separated the two.
+                if last_good_at.elapsed() >= IDLE_KEEPALIVE
                     && let Some(ref f) = last_good_frame
                 {
-                    last_capture_at = std::time::Instant::now();
+                    last_good_at = std::time::Instant::now();
                     f.clone()
                 } else {
                     continue;
@@ -2551,6 +2586,7 @@ async fn media_pump_ffmpeg_dc(
             let avg_capture_ms = (capture_us / window_frames) as f64 / 1000.0;
             let avg_encode_ms = (encode_us / window_frames) as f64 / 1000.0;
             let avg_send_ms = (send_us / window_frames) as f64 / 1000.0;
+            let avg_floor_sleep_ms = (floor_sleep_us / window_frames) as f64 / 1000.0;
             info!(
                 %session_id,
                 codec_label,
@@ -2560,13 +2596,14 @@ async fn media_pump_ffmpeg_dc(
                 encoder = enc.name(),
                 frames_captured, frames_encoded, frames_sent, bytes_written,
                 send_errors, dc_unopen_drops, frames_dropped_backpressure,
-                avg_capture_ms, avg_encode_ms, avg_send_ms,
+                avg_capture_ms, avg_encode_ms, avg_send_ms, avg_floor_sleep_ms,
                 "FFmpeg DC pump heartbeat (≈2s window)"
             );
             heartbeat_frames_base = frames_encoded;
             capture_us = 0;
             encode_us = 0;
             send_us = 0;
+            floor_sleep_us = 0;
         }
     }
 }
