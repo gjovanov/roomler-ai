@@ -2369,11 +2369,6 @@ async fn media_pump_ffmpeg_dc(
         // here just halved the achieved fps and amplified idle Nones. Poll
         // continuously, exactly like the fast `media_pump`.
 
-        // Resolve the active target resolution (operator may have
-        // changed it mid-session via `rc:resolution`).
-        let target = *target_resolution.lock().unwrap();
-        let _ = target; // not yet wired to capture; same as VP9 path's rc.32 state
-
         // Capture one frame; on transient failure, reuse the last
         // good one as a keepalive so the browser decoder doesn't
         // pause. ScreenCapture's method is `next_frame() -> Result<
@@ -2412,6 +2407,20 @@ async fn media_pump_ffmpeg_dc(
                 continue;
             }
         };
+
+        // rc.96 — apply the controller-chosen resolution (`rc:resolution`),
+        // bringing the FFmpeg pump to parity with `media_pump_vp9_444_dc`
+        // (which already does this). `Native` is a passthrough; `Fixed`
+        // downscales (CPU box filter) before encode, so the encoder rebuilds
+        // for the smaller dims via the dim-change check below. This shrinks
+        // the encode + the wire bytes + the browser-side decode load.
+        //
+        // NOTE: this runs AFTER the full-resolution capture, so on a host
+        // whose bottleneck is the capture/duplication rate (e.g. a 4K panel
+        // on a weak iGPU — frames_empty ≫ frames_encoded) it does NOT raise
+        // fps; it's a bandwidth/quality lever, not a capture-fps fix. Hosts
+        // that are genuinely encode-bound do gain fps from the smaller encode.
+        let frame = apply_target_resolution(frame, *target_resolution.lock().unwrap());
 
         // Lazily build / rebuild the encoder when the frame dims change.
         let (w, h) = (frame.width, frame.height);
