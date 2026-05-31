@@ -464,6 +464,16 @@ async fn connect_once(
     // disconnect; rc peers live until session-end.
     let mut tunnel_peers: HashMap<bson::oid::ObjectId, Arc<crate::tunnel::peer::AgentTunnelPeer>> =
         HashMap::new();
+    // Phase 1d (quic-v1): one `AgentQuicPeer` per active tunnel session
+    // negotiated onto the QUIC transport. Separate map from
+    // `tunnel_peers` (WebRTC DC) because a session uses exactly one
+    // data plane — `TcpForwardForward` dispatch checks this map first
+    // and falls back to the WebRTC `tunnel_peers` map. Same lifecycle:
+    // live until `TunnelTerminate` / WS disconnect.
+    let mut tunnel_quic_peers: HashMap<
+        bson::oid::ObjectId,
+        Arc<crate::tunnel::quic_peer::AgentQuicPeer>,
+    > = HashMap::new();
 
     // Keepalive. nginx + K8s ingress commonly idle-close WSes at 60-120s of
     // silence; send an application-level Ping every 25s so the connection
@@ -491,6 +501,7 @@ async fn connect_once(
                     info!("shutdown signalled; closing ws");
                     close_all_peers(&mut peers, &indicator).await;
                     close_all_tunnel_peers(&mut tunnel_peers).await;
+                    close_all_tunnel_quic_peers(&mut tunnel_quic_peers).await;
                     let _ = ws.send(Message::Close(None)).await;
                     return Ok(());
                 }
@@ -500,6 +511,7 @@ async fn connect_once(
                     warn!(%e, "keepalive ping failed — will reconnect");
                     close_all_peers(&mut peers, &indicator).await;
                     close_all_tunnel_peers(&mut tunnel_peers).await;
+                    close_all_tunnel_quic_peers(&mut tunnel_quic_peers).await;
                     return Err(ConnectError::Transient(anyhow::Error::new(e).context("ws ping")));
                 }
                 // Liveness: a successful keepalive proves the WS pump
@@ -518,6 +530,7 @@ async fn connect_once(
                     warn!(%e, "heartbeat send failed — will reconnect");
                     close_all_peers(&mut peers, &indicator).await;
                     close_all_tunnel_peers(&mut tunnel_peers).await;
+                    close_all_tunnel_quic_peers(&mut tunnel_quic_peers).await;
                     return Err(ConnectError::Transient(e.context("heartbeat send")));
                 }
                 watchdog::tick("signaling");
@@ -541,6 +554,7 @@ async fn connect_once(
                                 &mut pending_transports,
                                 &mut pending_chroma,
                                 &mut tunnel_peers,
+                                &mut tunnel_quic_peers,
                                 &outbound_tx,
                                 encoder_preference,
                                 &indicator,
@@ -560,11 +574,13 @@ async fn connect_once(
                     info!("ws closed by peer");
                     close_all_peers(&mut peers, &indicator).await;
                     close_all_tunnel_peers(&mut tunnel_peers).await;
+                    close_all_tunnel_quic_peers(&mut tunnel_quic_peers).await;
                     return Ok(());
                 }
                 Some(Err(e)) => {
                     close_all_peers(&mut peers, &indicator).await;
                     close_all_tunnel_peers(&mut tunnel_peers).await;
+                    close_all_tunnel_quic_peers(&mut tunnel_quic_peers).await;
                     return Err(ConnectError::Transient(anyhow::Error::new(e).context("ws read")));
                 }
                 _ => {}
@@ -584,6 +600,10 @@ async fn handle_server_msg(
     pending_transports: &mut HashMap<bson::oid::ObjectId, Option<String>>,
     pending_chroma: &mut HashMap<bson::oid::ObjectId, Option<String>>,
     tunnel_peers: &mut HashMap<bson::oid::ObjectId, Arc<crate::tunnel::peer::AgentTunnelPeer>>,
+    tunnel_quic_peers: &mut HashMap<
+        bson::oid::ObjectId,
+        Arc<crate::tunnel::quic_peer::AgentQuicPeer>,
+    >,
     outbound_tx: &mpsc::Sender<ClientMsg>,
     encoder_preference: crate::encode::EncoderPreference,
     indicator: &ViewerIndicator,
@@ -826,6 +846,7 @@ async fn handle_server_msg(
             );
             close_all_peers(peers, indicator).await;
             close_all_tunnel_peers(tunnel_peers).await;
+            close_all_tunnel_quic_peers(tunnel_quic_peers).await;
             // Drop pending codec / transport entries too; they're tied
             // to in-flight session_ids that no longer have peers.
             pending_codecs.clear();
@@ -861,10 +882,33 @@ async fn handle_server_msg(
             dst_port,
             owner_user_id: _,
         } => {
-            // Look up the tunnel peer for this session — must exist
-            // before the server is allowed to relay a forward request
-            // for it. If absent (race / bad server), synthesise an
-            // AgentError reject so the client doesn't hang.
+            // Dispatch on the session's negotiated data plane: a QUIC
+            // session has an entry in `tunnel_quic_peers`, otherwise
+            // it's a WebRTC-DC session in `tunnel_peers`. The server
+            // negotiates exactly one transport per session, so at most
+            // one map matches; QUIC is checked first.
+            if let Some(quic_peer) = tunnel_quic_peers.get(&session_id).cloned() {
+                let outbound = outbound_tx.clone();
+                let acl = forward_acl.clone();
+                tokio::spawn(async move {
+                    crate::tunnel::acceptor::handle_forward_request_quic(
+                        session_id,
+                        flow_id,
+                        &dst_host,
+                        dst_port,
+                        &acl,
+                        TUNNEL_DIAL_TIMEOUT,
+                        &quic_peer,
+                        outbound,
+                    )
+                    .await;
+                });
+                return Ok(());
+            }
+            // Look up the WebRTC tunnel peer for this session — must
+            // exist before the server is allowed to relay a forward
+            // request for it. If absent (race / bad server), synthesise
+            // an AgentError reject so the client doesn't hang.
             let Some(tunnel_peer) = tunnel_peers.get(&session_id).cloned() else {
                 warn!(%session_id, %flow_id, "TcpForwardForward for unknown tunnel session — rejecting");
                 let reply = ClientMsg::TcpForwardReject {
@@ -922,6 +966,45 @@ async fn handle_server_msg(
             }
         }
 
+        // rc:tunnel.quic.setup — QUIC analogue of TunnelSdpOffer. The
+        // server's trigger to stand up a quinn server endpoint for this
+        // session and authorize the client bearing `quic_auth_token`.
+        // We mint an ephemeral cert + bind the endpoint, then reply
+        // `rc:tunnel.quic.ready` with the cert fingerprint (for the
+        // client to pin — there's no CA) + dialable addrs.
+        ServerMsg::TunnelQuicSetup {
+            session_id,
+            quic_auth_token,
+        } => {
+            // Bind 0.0.0.0:0 so every interface is reachable in
+            // production; Phase 2 enumerates srflx candidates into
+            // `addrs`. Today `addrs` carries the bound local addr —
+            // dialable on directly-reachable paths + loopback tests.
+            let bind = match "0.0.0.0:0".parse() {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(%session_id, %e, "tunnel quic: bad bind addr — skipping setup");
+                    return Ok(());
+                }
+            };
+            match crate::tunnel::quic_peer::AgentQuicPeer::setup(session_id, quic_auth_token, bind)
+            {
+                Ok(peer) => {
+                    let ready = ClientMsg::TunnelQuicReady {
+                        session_id,
+                        cert_fingerprint: peer.cert_fingerprint().to_string(),
+                        addrs: peer.addrs(),
+                    };
+                    tunnel_quic_peers.insert(session_id, Arc::new(peer));
+                    let _ = outbound_tx.send(ready).await;
+                    info!(%session_id, "agent QUIC peer ready; rc:tunnel.quic.ready sent");
+                }
+                Err(e) => {
+                    warn!(%session_id, %e, "tunnel quic: AgentQuicPeer::setup failed");
+                }
+            }
+        }
+
         // rc:tunnel.ice — trickle one ICE candidate into the agent's
         // tunnel peer. Drop silently if the peer is gone (e.g. peer
         // already torn down by a `TunnelTerminate`).
@@ -944,6 +1027,12 @@ async fn handle_server_msg(
             info!(%session_id, ?reason, "rc:tunnel.terminate — closing peer");
             if let Some(peer) = tunnel_peers.remove(&session_id) {
                 peer.close().await;
+            }
+            // The session may instead be on the QUIC data plane.
+            // `AgentQuicPeer::close` is synchronous (aborts the accept
+            // task; the endpoint drops with the last Arc).
+            if let Some(quic_peer) = tunnel_quic_peers.remove(&session_id) {
+                quic_peer.close();
             }
         }
 
@@ -1015,6 +1104,27 @@ async fn close_all_tunnel_peers(
         peer.close().await;
     }
     info!(count, "torn down agent tunnel peers on ws disconnect");
+}
+
+/// Phase 1d (quic-v1): tear down every QUIC tunnel peer on WS
+/// disconnect. `AgentQuicPeer::close` is synchronous (aborts the
+/// accept task; the quinn endpoint drops with the last `Arc`), so
+/// unlike [`close_all_tunnel_peers`] there's no per-peer `.await`.
+/// Cheap no-op when the map is empty (normal for non-QUIC agents).
+async fn close_all_tunnel_quic_peers(
+    tunnel_quic_peers: &mut HashMap<
+        bson::oid::ObjectId,
+        Arc<crate::tunnel::quic_peer::AgentQuicPeer>,
+    >,
+) {
+    if tunnel_quic_peers.is_empty() {
+        return;
+    }
+    let count = tunnel_quic_peers.len();
+    for (_, peer) in tunnel_quic_peers.drain() {
+        peer.close();
+    }
+    info!(count, "torn down agent QUIC tunnel peers on ws disconnect");
 }
 
 async fn send_msg(
