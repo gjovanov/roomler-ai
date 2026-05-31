@@ -40,6 +40,7 @@ use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, info, warn};
 use tunnel_core::policy::{GateResult, ResolvedSubject, check_forward_request};
+use tunnel_core::transport::{TRANSPORT_QUIC_V1, TRANSPORT_WEBRTC_DC_V1};
 
 use crate::state::AppState;
 use crate::ws::remote_control::pump_server_messages;
@@ -102,6 +103,12 @@ pub async fn handle_tunnel_client_socket(
     // by every audit row + outbound message.
     let mut session: Option<TunnelSession> = None;
 
+    // Transports the client advertised in `rc:tunnel.hello`. Captured
+    // here so `TunnelOpen` can intersect them with the requested
+    // transport (Phase 1c). Empty until hello arrives → quic-v1 is
+    // never negotiated, which is the safe default.
+    let mut client_supported_transports: Vec<String> = Vec::new();
+
     // Periodic revocation re-check task — same as T1 stub, but now
     // sends a typed `TunnelRevoked` `ServerMsg` instead of an
     // ad-hoc JSON frame.
@@ -143,10 +150,11 @@ pub async fn handle_tunnel_client_socket(
                 supported_transports,
             } => {
                 debug!(%tunnel_client_id, %version, ?supported_transports, "rc:tunnel.hello");
-                // T2.5 stub: nothing to negotiate yet — v1 ships
-                // only "webrtc-dc-v1". The transport selection lands
-                // on `TunnelOpen` where the server replies with the
-                // chosen transport in `TunnelOpened`.
+                // Stash the advertised transports; `TunnelOpen`
+                // intersects them with the requested transport to pick
+                // the data plane (quic-v1 when both name it, else the
+                // webrtc-dc-v1 default).
+                client_supported_transports = supported_transports;
             }
 
             ClientMsg::TunnelOpen {
@@ -164,6 +172,7 @@ pub async fn handle_tunnel_client_socket(
                     client_os,
                     agent_id,
                     transport,
+                    &client_supported_transports,
                 )
                 .await;
             }
@@ -352,6 +361,7 @@ async fn handle_tunnel_open(
     client_os: roomler_ai_remote_control::models::OsKind,
     agent_id: ObjectId,
     transport: String,
+    client_supported: &[String],
 ) {
     // 1. Fetch the agent (any tenant — we need the row to enforce
     // the cross-tenant gate ourselves). `find_in_tenant` is wrong
@@ -407,15 +417,42 @@ async fn handle_tunnel_open(
         return;
     }
 
+    // Transport negotiation (Phase 1c). Honor quic-v1 only when the
+    // client both requested it AND advertised it in rc:tunnel.hello;
+    // otherwise keep the requested transport (webrtc-dc-v1 in practice).
+    // Agent-side QUIC support is ASSUMED for rc.96+ agents — no per-
+    // agent tunnel-transport capability is advertised yet, so an older
+    // agent that ignores the TunnelQuicSetup below never sends
+    // TunnelQuicReady; the client then times out and (for
+    // `--transport auto`) re-opens over webrtc-dc-v1.
+    let negotiated_transport = if transport == TRANSPORT_QUIC_V1 {
+        if client_supported.iter().any(|t| t == TRANSPORT_QUIC_V1) {
+            TRANSPORT_QUIC_V1.to_string()
+        } else {
+            TRANSPORT_WEBRTC_DC_V1.to_string()
+        }
+    } else {
+        transport.clone()
+    };
+    // Mint a per-session bearer token for quic-v1; the agent validates
+    // the direct P2P link by string-equality (see
+    // tunnel_core::transport::quic::server_authenticate). `None` for
+    // webrtc-dc-v1 keeps those sessions byte-identical on the wire.
+    let quic_auth_token = if negotiated_transport == TRANSPORT_QUIC_V1 {
+        Some(mint_quic_token())
+    } else {
+        None
+    };
+
     // 4. Create the session id + persist on the connection +
-    // register the outbound channel so the agent WS handler can
-    // relay TcpForwardAccept/Reject/HalfClose/Closed back to us.
+    // register the outbound channel so the agent WS handler can relay
+    // TcpForwardAccept/Reject/HalfClose/Closed (+ TunnelQuicReady) back.
     let tunnel_session_id = ObjectId::new();
     let new_session = TunnelSession {
         tunnel_session_id,
         agent_id,
         agent_tenant_id: agent.tenant_id,
-        transport: transport.clone(),
+        transport: negotiated_transport.clone(),
     };
     *session = Some(new_session.clone());
     state
@@ -451,26 +488,55 @@ async fn handle_tunnel_open(
         })
         .await;
 
-    // 6. Reply with TunnelOpened. ICE candidates + actual SDP come in
-    // T2.7 once the WebRTC peer negotiation lands. For now we send
-    // empty ice_servers; the SCTP rwnd value mirrors the vendored
-    // webrtc patch's target so the CLI's `diagnose` subcommand can
-    // verify the patch took effect.
+    // For quic-v1, tell the agent to stand up its endpoint + authorize
+    // this token NOW. The client is already registered in
+    // `tunnel_clients_by_session` (step 4), so the agent's
+    // `TunnelQuicReady` can race back and be relayed to the client
+    // while it's still processing the `TunnelOpened` below.
+    if let Some(token) = quic_auth_token.clone()
+        && let Err(e) = state.rc_hub.send_to_agent(
+            agent_id,
+            ServerMsg::TunnelQuicSetup {
+                session_id: tunnel_session_id,
+                quic_auth_token: token,
+            },
+        )
+    {
+        warn!(%agent_id, %e, "TunnelQuicSetup relay failed; client will fall back to webrtc-dc-v1");
+    }
+
+    // 6. Reply with TunnelOpened carrying the NEGOTIATED transport +
+    // (for quic-v1) the bearer token. ICE candidates + actual SDP come
+    // in T2.7 for the webrtc path; quic carries its own handshake. The
+    // SCTP rwnd value mirrors the vendored webrtc patch's target so the
+    // CLI's `diagnose` subcommand can verify the patch took effect.
     send_msg(
         outbound_tx,
         ServerMsg::TunnelOpened {
             session_id: tunnel_session_id,
-            transport,
+            transport: negotiated_transport,
             dc_pool_size: 8,
             sctp_rwnd_bytes: 8 * 1024 * 1024,
             ice_servers: vec![],
-            // Phase 1c mints the real QUIC session token here when the
-            // negotiated transport is quic-v1; None keeps webrtc-dc-v1
-            // sessions byte-identical on the wire.
-            quic_auth_token: None,
+            quic_auth_token,
         },
     )
     .await;
+}
+
+/// Mint an opaque per-session QUIC bearer token. The server hands the
+/// SAME value to the client (`TunnelOpened.quic_auth_token`) and the
+/// agent (`TunnelQuicSetup.quic_auth_token`); the agent authenticates
+/// the direct P2P QUIC connection by string-equality. It needs no
+/// shared secret or verifiable signature because both endpoints receive
+/// it over their already-authenticated WS connections — it only needs
+/// to be unguessable. Two v4 UUIDs = 244 bits of randomness.
+fn mint_quic_token() -> String {
+    format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
