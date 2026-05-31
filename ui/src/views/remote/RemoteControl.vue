@@ -572,7 +572,7 @@
              math hang off `rc.mediaIntrinsicW/H` which the composable
              keeps in sync either way. -->
         <video
-          v-show="!isWebCodecsRender && !isVp9_444Render"
+          v-show="!isWebCodecsRender && !isVp9_444Render && !isHevcRender"
           ref="videoEl"
           autoplay
           playsinline
