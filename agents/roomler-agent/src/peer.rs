@@ -2352,6 +2352,11 @@ async fn media_pump_ffmpeg_dc(
     // the pump) is the fps limiter; near-zero under motion confirms the
     // pump now runs at capture rate like `media_pump`.
     let mut frames_empty: u64 = 0;
+    // rc.98 — one-shot confirmation that the encoder actually emits a
+    // key-FLAGGED packet (pkt.is_keyframe). On NVENC this only happens with
+    // `forced-idr=1`; if this log never fires while the browser reports "A
+    // key frame is required", the encoder isn't flagging IDRs.
+    let mut first_keyframe_logged = false;
     let mut heartbeat_frames_base: u64 = 0;
     let mut last_heartbeat = std::time::Instant::now();
     const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
@@ -2544,6 +2549,13 @@ async fn media_pump_ffmpeg_dc(
         // next sent frame fully resyncs the browser. Keyframes are NEVER
         // dropped (they're the recovery point).
         let has_keyframe = packets.iter().any(|p| p.is_keyframe);
+        if has_keyframe && !first_keyframe_logged {
+            first_keyframe_logged = true;
+            info!(
+                %session_id, codec_label, encoder = enc.name(),
+                "FFmpeg DC pump: first key-flagged packet emitted (rc.98 — confirms IDR flagging; NVENC needs forced-idr=1)"
+            );
+        }
         if !has_keyframe {
             let buffered = dc.buffered_amount().await;
             if buffered > BACKPRESSURE_HIGH_WATER {
