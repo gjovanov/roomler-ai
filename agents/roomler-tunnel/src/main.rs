@@ -132,6 +132,12 @@ async fn enroll_cmd(
         "enrollment_token": enrollment_token,
         "machine_name": machine_name,
         "machine_id": derive_machine_id(&machine_name),
+        // The server's TunnelEnrollRequest requires `os` (OsKind,
+        // snake_case) + `client_version`. `std::env::consts::OS` already
+        // yields the exact wire values ("windows" / "linux" / "macos").
+        // Without these the enroll fails with HTTP 422 "missing field".
+        "os": std::env::consts::OS,
+        "client_version": env!("CARGO_PKG_VERSION"),
     });
     let resp = reqwest::Client::new()
         .post(&enroll_url)
