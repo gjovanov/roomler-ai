@@ -2514,9 +2514,26 @@ async fn media_pump_ffmpeg_dc(
         // possible at GOP boundaries.
         let dc_arc = video_bytes_dc.lock().await.clone();
         let Some(dc) = dc_arc else {
+            // rc.97 — DC not open yet (offer/answer/ICE/SCTP still setting
+            // up). Force a keyframe so that whenever the DC *does* open, the
+            // FIRST frame the browser receives is an IDR. Without this the
+            // encoder proceeds along its GOP and the first delivered frame is
+            // a delta → the browser's WebCodecs decoder rejects it with "A key
+            // frame is required after configure() or flush()" → black screen
+            // (field: GORAN-XMG-NEO16 HEVC). media_pump_vp9_444_dc already
+            // does this; the FFmpeg pump didn't, so it only rendered when the
+            // DC happened to open at a GOP boundary (timing luck). Covers both
+            // HEVC and vp9_qsv DC paths.
+            keyframe_requested.store(true, std::sync::atomic::Ordering::SeqCst);
             dc_unopen_drops += 1;
             continue;
         };
+        // Handle exists but the channel hasn't reached Open yet — same guard.
+        if dc.ready_state() != webrtc::data_channel::data_channel_state::RTCDataChannelState::Open {
+            keyframe_requested.store(true, std::sync::atomic::Ordering::SeqCst);
+            dc_unopen_drops += 1;
+            continue;
+        }
 
         // rc.88 — backpressure: if the DC send buffer is already over the
         // high-water mark the link can't keep up. Drop this frame (shed
