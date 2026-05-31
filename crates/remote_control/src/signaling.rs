@@ -417,6 +417,22 @@ pub enum ClientMsg {
         session_id: ObjectId,
         candidate: serde_json::Value,
     },
+
+    /// Agent → server → tunnel-client: the agent's QUIC server endpoint
+    /// is up. Carries the SHA-256 fingerprint of the agent's ephemeral
+    /// self-signed cert (the client PINS it — there is no CA) plus the
+    /// candidate address(es) to dial. The QUIC analogue of
+    /// `TunnelSdpAnswer`. Phase 1 ships direct/host `addrs`; Phase 2
+    /// adds STUN server-reflexive candidates.
+    #[serde(rename = "rc:tunnel.quic.ready")]
+    TunnelQuicReady {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        /// Lowercase-hex SHA-256 of the agent's ephemeral cert (DER).
+        cert_fingerprint: String,
+        /// `ip:port` candidates the client may dial (priority order).
+        addrs: Vec<String>,
+    },
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -574,6 +590,13 @@ pub enum ServerMsg {
         dc_pool_size: u8,
         sctp_rwnd_bytes: u32,
         ice_servers: Vec<IceServer>,
+        /// Short-lived token the client presents on the QUIC connection
+        /// so the agent's quinn endpoint can authorize the dialer (the
+        /// server is no longer in the byte path for QUIC). `None` for
+        /// `webrtc-dc-v1` sessions. Minted by the server, bound to the
+        /// `session_id` + agent. Wired in Phase 1c/1d.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quic_auth_token: Option<String>,
     },
 
     /// Server → agent: a tunnel-client wants to open this TCP
@@ -675,6 +698,29 @@ pub enum ServerMsg {
         session_id: ObjectId,
         candidate: serde_json::Value,
     },
+
+    /// Server → agent: prepare a QUIC server endpoint for this session
+    /// and authorize the client that presents `quic_auth_token`. The
+    /// agent's trigger to mint its ephemeral cert + bind a quinn
+    /// endpoint, then reply with `ClientMsg::TunnelQuicReady`. The QUIC
+    /// analogue of the server relaying an SDP offer to the agent.
+    #[serde(rename = "rc:tunnel.quic.setup")]
+    TunnelQuicSetup {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        quic_auth_token: String,
+    },
+
+    /// Server → tunnel-client: relays the agent's `TunnelQuicReady`
+    /// (cert fingerprint to pin + dialable addrs). Mirror of
+    /// `ClientMsg::TunnelQuicReady`.
+    #[serde(rename = "rc:tunnel.quic.ready")]
+    TunnelQuicReady {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        cert_fingerprint: String,
+        addrs: Vec<String>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -733,6 +779,7 @@ mod tests {
             permissions: Permissions::VIEW | Permissions::INPUT,
             browser_caps: vec!["h264".into(), "h265".into()],
             preferred_transport: None,
+            chroma_pref: None,
         };
         let s = serde_json::to_string(&req).unwrap();
         assert!(!s.contains("$oid"));
@@ -751,6 +798,7 @@ mod tests {
             permissions: Permissions::VIEW,
             browser_caps: vec![],
             preferred_transport: Some("data-channel-vp9-444".into()),
+            chroma_pref: None,
         };
         let s = serde_json::to_string(&req_with_t).unwrap();
         assert!(s.contains("\"preferred_transport\":\"data-channel-vp9-444\""));
@@ -1087,11 +1135,93 @@ mod tests {
             dc_pool_size: 8,
             sctp_rwnd_bytes: 8 * 1024 * 1024,
             ice_servers: vec![],
+            quic_auth_token: None,
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(r#""t":"rc:tunnel.opened""#));
         assert!(s.contains(r#""dc_pool_size":8"#));
         assert!(s.contains(r#""sctp_rwnd_bytes":8388608"#));
+        // Back-compat: a None quic_auth_token must NOT appear on the
+        // wire, so a webrtc-dc-v1 controller predating the field parses
+        // TunnelOpened unchanged.
+        assert!(!s.contains("quic_auth_token"));
+    }
+
+    #[test]
+    fn tunnel_opened_carries_quic_auth_token_when_set() {
+        let m = ServerMsg::TunnelOpened {
+            session_id: ObjectId::new(),
+            transport: "quic-v1".into(),
+            dc_pool_size: 0,
+            sctp_rwnd_bytes: 0,
+            ice_servers: vec![],
+            quic_auth_token: Some("tok-abc123".into()),
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(r#""transport":"quic-v1""#));
+        assert!(s.contains(r#""quic_auth_token":"tok-abc123""#));
+        match serde_json::from_str::<ServerMsg>(&s).unwrap() {
+            ServerMsg::TunnelOpened {
+                quic_auth_token,
+                transport,
+                ..
+            } => {
+                assert_eq!(transport, "quic-v1");
+                assert_eq!(quic_auth_token.as_deref(), Some("tok-abc123"));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn tunnel_opened_missing_quic_auth_token_defaults_to_none() {
+        // An OLD server (no field) → the wire omits it → a NEW client
+        // must deserialize None (serde default) and treat it as a
+        // webrtc-dc-v1 session. Locks the back-compat path.
+        let json = r#"{"t":"rc:tunnel.opened","session_id":"6a11682e804368d30edf57c6","transport":"webrtc-dc-v1","dc_pool_size":8,"sctp_rwnd_bytes":8388608,"ice_servers":[]}"#;
+        match serde_json::from_str::<ServerMsg>(json).unwrap() {
+            ServerMsg::TunnelOpened {
+                quic_auth_token, ..
+            } => assert_eq!(quic_auth_token, None),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn tunnel_quic_ready_round_trips_with_distinct_discriminator() {
+        let m = ClientMsg::TunnelQuicReady {
+            session_id: ObjectId::new(),
+            cert_fingerprint: "ab".repeat(32),
+            addrs: vec!["203.0.113.7:51820".into(), "192.168.1.5:51820".into()],
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(r#""t":"rc:tunnel.quic.ready""#));
+        match serde_json::from_str::<ClientMsg>(&s).unwrap() {
+            ClientMsg::TunnelQuicReady {
+                cert_fingerprint,
+                addrs,
+                ..
+            } => {
+                assert_eq!(cert_fingerprint.len(), 64);
+                assert_eq!(addrs.len(), 2);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn tunnel_quic_setup_is_server_to_agent() {
+        let m = ServerMsg::TunnelQuicSetup {
+            session_id: ObjectId::new(),
+            quic_auth_token: "tok-xyz".into(),
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(r#""t":"rc:tunnel.quic.setup""#));
+        assert!(s.contains(r#""quic_auth_token":"tok-xyz""#));
+        assert!(matches!(
+            serde_json::from_str::<ServerMsg>(&s).unwrap(),
+            ServerMsg::TunnelQuicSetup { .. }
+        ));
     }
 
     #[test]

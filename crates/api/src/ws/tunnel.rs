@@ -464,6 +464,10 @@ async fn handle_tunnel_open(
             dc_pool_size: 8,
             sctp_rwnd_bytes: 8 * 1024 * 1024,
             ice_servers: vec![],
+            // Phase 1c mints the real QUIC session token here when the
+            // negotiated transport is quic-v1; None keeps webrtc-dc-v1
+            // sessions byte-identical on the wire.
+            quic_auth_token: None,
         },
     )
     .await;
