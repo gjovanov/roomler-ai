@@ -3093,7 +3093,13 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       // there also reports via `first-frame`), but in that path the
       // `<video>` is also fed the RTP track so videoWidth is non-zero
       // anyway — falling through to the canvas path is harmless.
-      const useCanvasDims = vp9_444Active.value || webcodecsActive.value
+      // rc.95 — HEVC-over-DC is a canvas path too (rc-hevc-worker reports
+      // dims via `first-frame` → mediaIntrinsicW/H). It was MISSING here,
+      // so HEVC sessions mapped input against the now-hidden `<video>`'s
+      // videoWidth=0 (the sibling of the RemoteControl.vue `<video>`
+      // v-show omission that black-screened HEVC). Include it.
+      const useCanvasDims =
+        vp9_444Active.value || webcodecsActive.value || hevcActive.value
       const intrinsicW = useCanvasDims
         ? mediaIntrinsicW.value
         : (video?.videoWidth ?? 0)
@@ -3156,6 +3162,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
           intrinsicH,
           vp9_444Active: vp9_444Active.value,
           webcodecsActive: webcodecsActive.value,
+          hevcActive: hevcActive.value,
           renderElTag: renderEl?.tagName ?? null,
           renderRectW: renderRect?.width ?? null,
           renderRectH: renderRect?.height ?? null,
