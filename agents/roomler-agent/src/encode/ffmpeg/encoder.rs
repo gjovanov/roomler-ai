@@ -130,12 +130,26 @@ fn encoder_options(
         // pure target-quality. `tune=ll` keeps it responsive for remote
         // desktop; `spatial-aq` spends bits on high-detail text regions;
         // bf=0 + rc-lookahead=0 minimise latency.
+        //
+        // rc.98 — `forced-idr=1` is REQUIRED for our keyframe forcing to
+        // work on NVENC. We force keyframes via `frame.set_kind(I)`
+        // (pict_type=I) — on the DC-open frame, on browser PLI, on
+        // scene-change. Without `forced-idr`, FFmpeg's nvenc manages its
+        // own GOP and a forced pict_type=I is NOT emitted as a flagged IDR:
+        // the output packet lacks AV_PKT_FLAG_KEY, so `pkt.is_key()` is
+        // false → our framer marks the chunk `delta` → the browser's
+        // WebCodecs decoder rejects the first frame with "A key frame is
+        // required after configure() or flush()" → black screen (field:
+        // GORAN-XMG-NEO16, hevc_nvenc; hevc_qsv flags forced-I correctly,
+        // which is why PC50054 rendered and this didn't). `forced-idr=1`
+        // makes pict_type=I a true, key-flagged IDR.
         put(&mut d, "rc", "vbr");
         put(&mut d, "cq", &cq_s);
         put(&mut d, "preset", preset.as_deref().unwrap_or("p4"));
         put(&mut d, "tune", tune.as_deref().unwrap_or("ll"));
         put(&mut d, "rc-lookahead", "0");
         put(&mut d, "bf", "0");
+        put(&mut d, "forced-idr", "1");
         put(&mut d, "spatial-aq", "1");
         put(&mut d, "maxrate", &cap);
         put(&mut d, "bufsize", &cap);
