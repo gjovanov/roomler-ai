@@ -6852,6 +6852,7 @@ dependencies = [
  "hex",
  "ipnet",
  "quinn",
+ "rand 0.9.4",
  "rcgen",
  "roomler-ai-remote-control",
  "rustls",
