@@ -210,6 +210,43 @@ impl QuicPeer {
         Ok(Self { endpoint })
     }
 
+    /// Phase 3: build a QUIC **server** endpoint over an arbitrary
+    /// [`quinn::AsyncUdpSocket`] — e.g. [`crate::transport::relay::RelayUdpSocket`]
+    /// wrapping a TURN-relayed conn, so QUIC rides a coturn allocation
+    /// for symmetric-NAT / UDP-blocked nets. `local_addr()` of the
+    /// socket is what the peer dials (the relay address).
+    pub fn server_over_abstract_socket(
+        socket: Arc<dyn quinn::AsyncUdpSocket>,
+    ) -> Result<(Self, String)> {
+        let (cfg, fingerprint) = build_server_config()?;
+        let runtime = quinn::default_runtime().context("no async runtime for quinn endpoint")?;
+        let endpoint = Endpoint::new_with_abstract_socket(
+            quinn::EndpointConfig::default(),
+            Some(cfg),
+            socket,
+            runtime,
+        )
+        .context("quic server endpoint over abstract socket")?;
+        Ok((Self { endpoint }, fingerprint))
+    }
+
+    /// Phase 3: client analogue of [`server_over_abstract_socket`].
+    pub fn client_over_abstract_socket(
+        socket: Arc<dyn quinn::AsyncUdpSocket>,
+        pinned_fingerprint_hex: &str,
+    ) -> Result<Self> {
+        let runtime = quinn::default_runtime().context("no async runtime for quinn endpoint")?;
+        let mut endpoint = Endpoint::new_with_abstract_socket(
+            quinn::EndpointConfig::default(),
+            None,
+            socket,
+            runtime,
+        )
+        .context("quic client endpoint over abstract socket")?;
+        endpoint.set_default_client_config(build_client_config(pinned_fingerprint_hex)?);
+        Ok(Self { endpoint })
+    }
+
     /// The local socket address (after binding to port 0, the OS-chosen
     /// port) — needed to feed the peer our candidate over signaling.
     pub fn local_addr(&self) -> Result<SocketAddr> {
