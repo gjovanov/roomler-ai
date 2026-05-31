@@ -62,6 +62,13 @@ enum Command {
         /// to the agent's allowlist + the tenant's tunnel_policies.
         #[arg(long)]
         remote: String,
+        /// Data-plane transport. `webrtc` (default) uses the proven
+        /// WebRTC DataChannel path; `quic` forces QUIC; `auto` prefers
+        /// QUIC and transparently falls back to WebRTC if QUIC setup
+        /// fails. QUIC needs server-side negotiation (rolling out) —
+        /// until then prefer `webrtc`.
+        #[arg(long, value_enum, default_value = "webrtc")]
+        transport: forward::TransportPref,
     },
     /// Read a multi-forward config from disk and run all forwards as
     /// persistent listeners. Auto-reconnects on transient failure.
@@ -96,9 +103,10 @@ async fn main() -> Result<()> {
             agent,
             local,
             remote,
+            transport,
         } => {
             let cfg = config::load(cli.config).context("loading tunnel config")?;
-            forward::run(cfg, &agent, local, &remote).await
+            forward::run(cfg, &agent, local, &remote, transport).await
         }
         Command::Run {} => bail!("T3: multi-forward `run` not yet wired"),
         Command::Diagnose { agent } => {
@@ -210,10 +218,59 @@ mod tests {
                 agent,
                 local,
                 remote,
+                transport,
             } => {
                 assert_eq!(agent, "507f1f77bcf86cd799439011");
                 assert_eq!(local, 5432);
                 assert_eq!(remote, "10.0.0.5:5432");
+                // No --transport given → default is the proven webrtc path.
+                assert_eq!(transport, forward::TransportPref::Webrtc);
+            }
+            other => panic!("expected Forward, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_forward_transport_quic() {
+        let cli = Cli::try_parse_from([
+            "roomler-tunnel",
+            "forward",
+            "--agent",
+            "507f1f77bcf86cd799439011",
+            "--local",
+            "5432",
+            "--remote",
+            "10.0.0.5:5432",
+            "--transport",
+            "quic",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Forward { transport, .. } => {
+                assert_eq!(transport, forward::TransportPref::Quic);
+            }
+            other => panic!("expected Forward, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_forward_transport_auto() {
+        let cli = Cli::try_parse_from([
+            "roomler-tunnel",
+            "forward",
+            "--agent",
+            "507f1f77bcf86cd799439011",
+            "--local",
+            "5432",
+            "--remote",
+            "10.0.0.5:5432",
+            "--transport",
+            "auto",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Forward { transport, .. } => {
+                assert_eq!(transport, forward::TransportPref::Auto);
             }
             other => panic!("expected Forward, got {other:?}"),
         }
