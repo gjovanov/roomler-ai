@@ -44,5 +44,17 @@ bytes = "1"
 # CIDR matching in DestinationRule — tiny, no_std-friendly.
 ipnet = "2"
 
+# QUIC transport (`quic-v1`). Force the `ring` crypto provider on quinn,
+# rustls, AND rcgen so QUIC adds NO new C/NASM build: the tree already
+# resolves rustls 0.23 + ring 0.17 + rcgen 0.13 with aws-lc-rs ABSENT
+# (webrtc-dtls pulls rcgen+ring), so ring-only keeps that invariant and
+# dodges the openssl/vp9-444/aws-lc-rs C-build pain. quinn's default
+# features include rustls-aws-lc-rs, hence default-features = false.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring"] }
+sha2 = { workspace = true }
+hex = { workspace = true }
+
 [dev-dependencies]
 tokio-test = { workspace = true }

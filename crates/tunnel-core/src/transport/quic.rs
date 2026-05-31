@@ -1,0 +1,489 @@
+//! `quic-v1` transport — opportunistic QUIC P2P data plane (quinn).
+//!
+//! This is the Phase-1a *core*: a [`QuicPeer`] that builds a quinn
+//! endpoint (server or client) and yields per-flow bidirectional
+//! streams. Each tunnel flow is a native QUIC bi-stream — multiplexed,
+//! flow-controlled, ordered, with an explicit FIN — so the WebRTC-DC
+//! machinery in [`crate::forward`] (the `flow_id` framing, the
+//! `HALF_CLOSE_MAGIC` sentinel, the 65535-byte cap, the
+//! `bufferedAmountLow` watermark dance) is **not needed here**. The
+//! data pump is just [`crate::forward::run_flow_quic`] piping TCP ↔
+//! stream.
+//!
+//! **Auth without a CA** (mirrors WebRTC's DTLS-fingerprint model):
+//! the server side mints an *ephemeral self-signed* cert and publishes
+//! its SHA-256 fingerprint over the already-trusted signaling channel;
+//! the client *pins* that fingerprint via [`FingerprintVerifier`]
+//! instead of trusting a CA. The reverse direction (is the dialing
+//! client authorized?) is a short-lived token presented on the
+//! connection — wired in Phase 1d; this module carries the cert-pin
+//! half and the stream plumbing.
+//!
+//! **Crypto provider:** `ring` everywhere (see Cargo.toml) so QUIC adds
+//! no aws-lc-rs C/NASM build.
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use anyhow::{Context, Result, anyhow, bail};
+use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
+use quinn::{ClientConfig, Connection, Endpoint, RecvStream, SendStream, ServerConfig};
+use rustls::DigitallySignedStruct;
+use rustls::SignatureScheme;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
+use sha2::{Digest, Sha256};
+
+use super::{Capabilities, TRANSPORT_QUIC_V1, Transport};
+
+/// ALPN id for the tunnel's QUIC connections. Both ends must match or
+/// the TLS handshake fails (a cheap version/role guard).
+const ALPN: &[u8] = b"roomler-tunnel-quic-v1";
+
+/// Placeholder SNI — the client pins by cert fingerprint, not by name,
+/// so the value only needs to be a syntactically-valid DNS name.
+const SNI: &str = "roomler-tunnel";
+
+/// SHA-256 fingerprint of a DER certificate, lowercase hex. This is the
+/// value the agent advertises over signaling and the client pins.
+pub fn cert_fingerprint(cert_der: &[u8]) -> String {
+    hex::encode(Sha256::digest(cert_der))
+}
+
+/// One QUIC endpoint (server or client side). Connections + per-flow
+/// streams are opened off this.
+pub struct QuicPeer {
+    endpoint: Endpoint,
+}
+
+impl QuicPeer {
+    /// Build a QUIC **server** endpoint with a fresh ephemeral
+    /// self-signed cert. Returns the peer plus the cert fingerprint to
+    /// advertise over signaling so the dialing client can pin it.
+    pub fn server(bind: SocketAddr) -> Result<(Self, String)> {
+        let certified = rcgen::generate_simple_self_signed(vec![SNI.to_string()])
+            .context("rcgen ephemeral self-signed cert")?;
+        let cert_der = CertificateDer::from(certified.cert.der().to_vec());
+        let fingerprint = cert_fingerprint(&cert_der);
+        let key =
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()));
+
+        let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(provider()))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .context("quic server: tls13-only")?
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key)
+            .context("quic server: single cert")?;
+        tls.alpn_protocols = vec![ALPN.to_vec()];
+
+        let qsc = QuicServerConfig::try_from(tls).context("quic server config from rustls")?;
+        let endpoint = Endpoint::server(ServerConfig::with_crypto(Arc::new(qsc)), bind)
+            .context("quic server endpoint")?;
+        Ok((Self { endpoint }, fingerprint))
+    }
+
+    /// Build a QUIC **client** endpoint that will only trust a server
+    /// whose cert SHA-256 fingerprint equals `pinned_fingerprint_hex`
+    /// (the value the agent sent over signaling).
+    pub fn client(bind: SocketAddr, pinned_fingerprint_hex: &str) -> Result<Self> {
+        let pinned = decode_fingerprint(pinned_fingerprint_hex)?;
+        let verifier = Arc::new(FingerprintVerifier {
+            pinned,
+            provider: Arc::new(provider()),
+        });
+        let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(provider()))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .context("quic client: tls13-only")?
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_no_client_auth();
+        tls.alpn_protocols = vec![ALPN.to_vec()];
+
+        let qcc = QuicClientConfig::try_from(tls).context("quic client config from rustls")?;
+        let mut endpoint = Endpoint::client(bind).context("quic client endpoint")?;
+        endpoint.set_default_client_config(ClientConfig::new(Arc::new(qcc)));
+        Ok(Self { endpoint })
+    }
+
+    /// The local socket address (after binding to port 0, the OS-chosen
+    /// port) — needed to feed the peer our candidate over signaling.
+    pub fn local_addr(&self) -> Result<SocketAddr> {
+        self.endpoint.local_addr().context("quic local_addr")
+    }
+
+    /// Dial `addr` and complete the QUIC handshake (incl. the pinned
+    /// cert check). The returned [`Connection`] carries per-flow streams.
+    pub async fn connect(&self, addr: SocketAddr) -> Result<Connection> {
+        let conn = self
+            .endpoint
+            .connect(addr, SNI)
+            .context("quic connect")?
+            .await
+            .context("quic handshake")?;
+        Ok(conn)
+    }
+
+    /// Accept the next inbound QUIC connection, or `None` when the
+    /// endpoint is closed.
+    pub async fn accept(&self) -> Option<Result<Connection>> {
+        let incoming = self.endpoint.accept().await?;
+        Some(incoming.await.context("quic accept handshake"))
+    }
+}
+
+impl Transport for QuicPeer {
+    fn label(&self) -> &'static str {
+        TRANSPORT_QUIC_V1
+    }
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            multi_stream: true,  // one QUIC connection carries many flow streams natively
+            supports_udp: false, // v1 forwards TCP only
+            l3: false,
+        }
+    }
+}
+
+/// Open a new bidirectional stream for `flow_id` and write the 4-byte
+/// `flow_id` preamble so the accepting peer can correlate the stream to
+/// the flow it already authorized + dialed via the `TcpForward*`
+/// signaling. Returns the stream halves ready for the pump.
+pub async fn open_flow(conn: &Connection, flow_id: u32) -> Result<(SendStream, RecvStream)> {
+    let (mut send, recv) = conn.open_bi().await.context("quic open_bi")?;
+    send.write_all(&flow_id.to_le_bytes())
+        .await
+        .context("quic write flow_id preamble")?;
+    Ok((send, recv))
+}
+
+/// Accept the next bidirectional flow stream and read its `flow_id`
+/// preamble. Returns `(flow_id, send, recv)`.
+pub async fn accept_flow(conn: &Connection) -> Result<(u32, SendStream, RecvStream)> {
+    let (send, mut recv) = conn.accept_bi().await.context("quic accept_bi")?;
+    let mut hdr = [0u8; 4];
+    recv.read_exact(&mut hdr)
+        .await
+        .context("quic read flow_id preamble")?;
+    Ok((u32::from_le_bytes(hdr), send, recv))
+}
+
+/// Upper bound on the auth token length (a JWT is ~200–800 bytes; this
+/// is a generous cap that also bounds the agent's read allocation).
+const MAX_TOKEN_BYTES: usize = 4096;
+
+/// Client side of the QUIC mutual-auth handshake. Cert-pinning already
+/// authenticated the AGENT to us; this authenticates US to the agent.
+/// Open a dedicated uni-stream and send the length-prefixed session
+/// token the server minted (delivered over signaling in
+/// `TunnelOpened.quic_auth_token`). Call once, right after [`connect`],
+/// before opening any flow streams.
+pub async fn client_authenticate(conn: &Connection, token: &str) -> Result<()> {
+    let bytes = token.as_bytes();
+    let len = u16::try_from(bytes.len()).map_err(|_| anyhow!("quic auth token too long"))?;
+    let mut s = conn.open_uni().await.context("quic open auth uni-stream")?;
+    s.write_all(&len.to_le_bytes())
+        .await
+        .context("quic auth len")?;
+    s.write_all(bytes).await.context("quic auth token")?;
+    s.finish().context("quic auth finish")?;
+    Ok(())
+}
+
+/// Agent side: accept the client's auth uni-stream and verify the token
+/// matches the one the server minted for this session
+/// (`TunnelQuicSetup.quic_auth_token`). Returns `Ok` only on an exact
+/// match. Call once right after accepting the connection, BEFORE
+/// serving any flow streams — the server is no longer in the byte path
+/// for QUIC, so this token is what keeps the P2P endpoint from being an
+/// open relay for anyone who reaches the address.
+pub async fn server_authenticate(conn: &Connection, expected_token: &str) -> Result<()> {
+    let mut s = conn
+        .accept_uni()
+        .await
+        .context("quic accept auth uni-stream")?;
+    let mut len_buf = [0u8; 2];
+    s.read_exact(&mut len_buf)
+        .await
+        .context("quic auth len read")?;
+    let len = u16::from_le_bytes(len_buf) as usize;
+    if len == 0 || len > MAX_TOKEN_BYTES {
+        bail!("quic auth token length {len} out of range");
+    }
+    let mut tok = vec![0u8; len];
+    s.read_exact(&mut tok)
+        .await
+        .context("quic auth token read")?;
+    let got = std::str::from_utf8(&tok).context("quic auth token not utf-8")?;
+    // Tokens are short + server-minted; a plain compare is fine (this
+    // is not a password-equality oracle — a mismatch just drops the
+    // connection, no timing signal of value to an attacker).
+    if got == expected_token {
+        Ok(())
+    } else {
+        bail!("quic auth token mismatch")
+    }
+}
+
+/// The `ring` crypto provider. Used for both the rustls configs and the
+/// pinning verifier's signature checks, so everything stays on ring.
+fn provider() -> CryptoProvider {
+    rustls::crypto::ring::default_provider()
+}
+
+fn decode_fingerprint(hex_str: &str) -> Result<[u8; 32]> {
+    let bytes = hex::decode(hex_str.trim()).context("quic: fingerprint not hex")?;
+    let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+        anyhow!(
+            "quic: fingerprint must be 32 bytes (SHA-256), got {}",
+            bytes.len()
+        )
+    })?;
+    Ok(arr)
+}
+
+/// rustls server-cert verifier that trusts exactly one cert, identified
+/// by its SHA-256 fingerprint (pinned out-of-band over signaling).
+/// Signature checks still run via the `ring` provider — only the
+/// trust-anchor decision is replaced.
+#[derive(Debug)]
+struct FingerprintVerifier {
+    pinned: [u8; 32],
+    provider: Arc<CryptoProvider>,
+}
+
+impl ServerCertVerifier for FingerprintVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let got = Sha256::digest(end_entity.as_ref());
+        if got.as_slice() == self.pinned {
+            Ok(ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General(
+                "quic: server cert fingerprint mismatch (pin failed)".into(),
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn loopback() -> SocketAddr {
+        "127.0.0.1:0".parse().unwrap()
+    }
+
+    /// Drain a recv stream to EOF into a Vec (test helper).
+    async fn read_to_end(recv: &mut RecvStream) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; 64 * 1024];
+        while let Some(n) = recv.read(&mut buf).await.unwrap() {
+            out.extend_from_slice(&buf[..n]);
+        }
+        out
+    }
+
+    /// A pinned-fingerprint client + ephemeral-cert server connect on
+    /// loopback, open one flow stream, and round-trip a 4 MiB payload
+    /// (echo). Proves the quinn/rustls/rcgen `ring` stack builds + works
+    /// on this platform and that the flow_id preamble correlates.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn quic_loopback_flow_roundtrips_4mib() {
+        let (server, fingerprint) = QuicPeer::server(loopback()).expect("server endpoint");
+        let server_addr = server.local_addr().unwrap();
+        let client = QuicPeer::client(loopback(), &fingerprint).expect("client endpoint");
+
+        let srv = tokio::spawn(async move {
+            let conn = server.accept().await.expect("incoming").expect("handshake");
+            let (flow_id, mut send, mut recv) = accept_flow(&conn).await.expect("accept_flow");
+            assert_eq!(flow_id, 7, "flow_id preamble must survive");
+            let echoed = read_to_end(&mut recv).await;
+            send.write_all(&echoed).await.expect("echo write");
+            send.finish().expect("echo finish");
+            // Keep the connection alive until the client has read the echo.
+            conn.closed().await;
+            echoed.len()
+        });
+
+        let conn = client.connect(server_addr).await.expect("connect");
+        let (mut send, mut recv) = open_flow(&conn, 7).await.expect("open_flow");
+        let payload = vec![0xABu8; 4 * 1024 * 1024];
+        send.write_all(&payload).await.expect("write payload");
+        send.finish().expect("finish");
+
+        let got = read_to_end(&mut recv).await;
+        assert_eq!(got.len(), payload.len(), "echo length mismatch");
+        assert_eq!(got, payload, "echo payload corrupted");
+        conn.close(0u32.into(), b"done");
+        let _ = srv.await;
+    }
+
+    /// A client that pins the WRONG fingerprint must fail the handshake
+    /// — the cert-pin is load-bearing (no CA, so a mismatch is the only
+    /// thing standing between us and trusting an impostor at that IP).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn quic_wrong_fingerprint_is_rejected() {
+        let (server, _real_fp) = QuicPeer::server(loopback()).expect("server endpoint");
+        let server_addr = server.local_addr().unwrap();
+        // Pin a bogus (but well-formed) fingerprint.
+        let bogus = hex::encode([0x11u8; 32]);
+        let client = QuicPeer::client(loopback(), &bogus).expect("client endpoint");
+
+        tokio::spawn(async move {
+            // Server may or may not see the attempt; just keep it alive.
+            let _ = server.accept().await;
+        });
+
+        let result = client.connect(server_addr).await;
+        assert!(
+            result.is_err(),
+            "handshake must fail when the pinned fingerprint does not match"
+        );
+    }
+
+    /// End-to-end: a local TCP byte stream piped through
+    /// `run_flow_quic` on the client side → QUIC stream → `run_flow_quic`
+    /// on the agent side → a local TCP stream. Writing into "app A"
+    /// must surface, intact, at "app B" — proving the QUIC data-plane
+    /// pump works both ways with FIN-driven half-close.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_flow_quic_pipes_tcp_app_to_app() {
+        use crate::forward::{FlowStats, run_flow_quic};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        // QUIC connection (client dials, agent accepts).
+        let (server, fp) = QuicPeer::server(loopback()).unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = QuicPeer::client(loopback(), &fp).unwrap();
+        let agent_accept = tokio::spawn(async move { server.accept().await.unwrap().unwrap() });
+        let client_conn = client.connect(server_addr).await.unwrap();
+        let agent_conn = agent_accept.await.unwrap();
+
+        // One flow stream: client opens (writes flow_id preamble), agent accepts.
+        let (c_send, c_recv) = open_flow(&client_conn, 1).await.unwrap();
+        let (fid, a_send, a_recv) = accept_flow(&agent_conn).await.unwrap();
+        assert_eq!(fid, 1);
+
+        // "App A" (client-local) + "dst B" (agent-local), each a connected TCP pair.
+        let la = TcpListener::bind(loopback()).await.unwrap();
+        let a_addr = la.local_addr().unwrap();
+        let a_into_tunnel = TcpStream::connect(a_addr).await.unwrap();
+        let (mut app_a, _) = la.accept().await.unwrap();
+
+        let lb = TcpListener::bind(loopback()).await.unwrap();
+        let b_addr = lb.local_addr().unwrap();
+        let b_into_tunnel = TcpStream::connect(b_addr).await.unwrap();
+        let (mut app_b, _) = lb.accept().await.unwrap();
+
+        // Pumps: app_a → c_send → [QUIC] → a_recv → app_b.
+        tokio::spawn(run_flow_quic(
+            a_into_tunnel,
+            c_send,
+            c_recv,
+            1,
+            Arc::new(FlowStats::default()),
+        ));
+        tokio::spawn(run_flow_quic(
+            b_into_tunnel,
+            a_send,
+            a_recv,
+            1,
+            Arc::new(FlowStats::default()),
+        ));
+
+        let payload = vec![0xCDu8; 2 * 1024 * 1024];
+        app_a.write_all(&payload).await.unwrap();
+        app_a.shutdown().await.unwrap(); // EOF → FIN propagates A→B
+
+        let mut got = Vec::new();
+        let mut tmp = vec![0u8; 64 * 1024];
+        loop {
+            match app_b.read(&mut tmp).await.unwrap() {
+                0 => break,
+                n => got.extend_from_slice(&tmp[..n]),
+            }
+        }
+        assert_eq!(got.len(), payload.len(), "A→B length mismatch through QUIC");
+        assert_eq!(got, payload, "A→B payload corrupted through QUIC");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn quic_token_auth_accepts_matching() {
+        let (server, fp) = QuicPeer::server(loopback()).unwrap();
+        let addr = server.local_addr().unwrap();
+        let client = QuicPeer::client(loopback(), &fp).unwrap();
+        let srv = tokio::spawn(async move {
+            let conn = server.accept().await.unwrap().unwrap();
+            server_authenticate(&conn, "sekret-token").await
+        });
+        let conn = client.connect(addr).await.unwrap();
+        client_authenticate(&conn, "sekret-token").await.unwrap();
+        assert!(
+            srv.await.unwrap().is_ok(),
+            "matching token must authenticate"
+        );
+        conn.close(0u32.into(), b"done");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn quic_token_auth_rejects_mismatch() {
+        let (server, fp) = QuicPeer::server(loopback()).unwrap();
+        let addr = server.local_addr().unwrap();
+        let client = QuicPeer::client(loopback(), &fp).unwrap();
+        let srv = tokio::spawn(async move {
+            let conn = server.accept().await.unwrap().unwrap();
+            server_authenticate(&conn, "the-right-token").await
+        });
+        let conn = client.connect(addr).await.unwrap();
+        // The send itself succeeds; the agent rejects on compare.
+        let _ = client_authenticate(&conn, "WRONG").await;
+        assert!(
+            srv.await.unwrap().is_err(),
+            "mismatched token must be rejected"
+        );
+        conn.close(0u32.into(), b"done");
+    }
+}

@@ -11,6 +11,7 @@
 
 use async_trait::async_trait;
 
+pub mod quic;
 pub mod webrtc_dc;
 pub mod wireguard;
 
@@ -20,6 +21,10 @@ pub mod wireguard;
 /// transport.
 pub const TRANSPORT_WEBRTC_DC_V1: &str = "webrtc-dc-v1";
 pub const TRANSPORT_WIREGUARD_V1: &str = "wireguard-v1";
+/// Opportunistic QUIC P2P transport (quinn). Tried before
+/// `webrtc-dc-v1` when both peers advertise it; falls back to WebRTC if
+/// QUIC connection setup fails. See [`quic`].
+pub const TRANSPORT_QUIC_V1: &str = "quic-v1";
 
 /// Capabilities a transport advertises.
 #[derive(Debug, Clone, Default)]
