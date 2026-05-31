@@ -142,13 +142,27 @@ impl AgentQuicPeer {
 
     /// Dialable candidate addresses for the client.
     ///
-    /// Phase 1 (direct-reachable) returns the bound local address. When
-    /// bound to `0.0.0.0`, that is NOT directly dialable — Phase 2 will
-    /// enumerate non-loopback interface IPs and add STUN
-    /// server-reflexive candidates here. Today this is correct for the
-    /// loopback test and for hosts dialed by a directly-reachable IP.
+    /// Bound to a specific IP (tests / explicit bind) means it is
+    /// already dialable, so advertise it as-is. Bound to `0.0.0.0`
+    /// (production) means we enumerate real host candidates (the primary
+    /// egress interface IP with the bound port) via
+    /// [`quic::host_candidates`]; the bare `0.0.0.0:port` the endpoint
+    /// listens on is NOT dialable by a remote client. This is the
+    /// Phase-2 (Tier 1) host-candidate step; Phase 2b appends STUN
+    /// server-reflexive candidates for NAT'd hosts. If no egress route
+    /// is found we fall back to the bound address so same-host dials
+    /// still resolve (a failed remote dial degrades to webrtc-dc-v1).
     pub fn addrs(&self) -> Vec<String> {
-        vec![self.local_addr.to_string()]
+        if self.local_addr.ip().is_unspecified() {
+            let cands = quic::host_candidates(self.local_addr.port());
+            if cands.is_empty() {
+                vec![self.local_addr.to_string()]
+            } else {
+                cands.into_iter().map(|a| a.to_string()).collect()
+            }
+        } else {
+            vec![self.local_addr.to_string()]
+        }
     }
 
     /// Register interest in `flow_id`'s inbound QUIC stream and await it.
