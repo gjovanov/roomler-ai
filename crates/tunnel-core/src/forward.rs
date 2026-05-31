@@ -35,6 +35,8 @@ use tracing::{debug, info, trace, warn};
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
 
+use quinn::{RecvStream, SendStream};
+
 use crate::mux;
 
 /// Threshold above which the pump pauses TCP reads. 4 MiB.
@@ -374,42 +376,7 @@ pub async fn run_flow(
     //     our on_message)
     //   * dc_recv tracks peer dc_send, tcp_write lags → local
     //     consumer stall (but mailbox_depth would also rise)
-    let stats_for_logger = Arc::clone(&stats);
-    let logger_handle = tokio::spawn(async move {
-        let mut prev = stats_for_logger.snapshot();
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        // Burn the immediate first tick — `interval` fires right
-        // away by default, which would log a useless zero-delta on
-        // every flow that opens.
-        interval.tick().await;
-        loop {
-            interval.tick().await;
-            let cur = stats_for_logger.snapshot();
-            let d_read = cur.0.saturating_sub(prev.0);
-            let d_send = cur.1.saturating_sub(prev.1);
-            let d_recv = cur.2.saturating_sub(prev.2);
-            let d_write = cur.3.saturating_sub(prev.3);
-            // Only emit when something moved — quiescent flows
-            // shouldn't spam the log.
-            if d_read != 0 || d_send != 0 || d_recv != 0 || d_write != 0 {
-                info!(
-                    flow_id,
-                    tcp_read_total = cur.0,
-                    dc_send_total = cur.1,
-                    dc_recv_total = cur.2,
-                    tcp_write_total = cur.3,
-                    mailbox_depth = cur.4,
-                    tcp_read_kbps = d_read / 1024 / 2,
-                    dc_send_kbps = d_send / 1024 / 2,
-                    dc_recv_kbps = d_recv / 1024 / 2,
-                    tcp_write_kbps = d_write / 1024 / 2,
-                    "tunnel flow throughput (2s window)"
-                );
-            }
-            prev = cur;
-        }
-    });
+    let logger_handle = spawn_flow_logger(flow_id, Arc::clone(&stats));
 
     // Spawn TCP → DC.
     let dc_for_send = Arc::clone(&dc);
@@ -449,6 +416,158 @@ pub async fn run_flow(
         dc_recv_total = recv_total,
         tcp_write_total = write_total,
         "tunnel flow closed — final throughput totals"
+    );
+    logger_handle.abort();
+
+    if matches!(r1, CloseReason::Eof) && matches!(r2, CloseReason::Eof) {
+        CloseReason::Eof
+    } else {
+        CloseReason::IoError
+    }
+}
+
+/// Spawn the per-flow 2 s throughput logger shared by [`run_flow`]
+/// (WebRTC-DC) and [`run_flow_quic`] (QUIC). Samples [`FlowStats`] every
+/// 2 s and logs the `{tcp_read, dc_send, dc_recv, tcp_write}` deltas +
+/// totals — the SAME line shape across transports, so the admin-UI log
+/// viewer and the stall-diagnosis comparison work identically. Abort the
+/// returned handle when the flow ends.
+fn spawn_flow_logger(flow_id: u32, stats: Arc<FlowStats>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut prev = stats.snapshot();
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Burn the immediate first tick — `interval` fires right away by
+        // default, which would log a useless zero-delta on every flow.
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let cur = stats.snapshot();
+            let d_read = cur.0.saturating_sub(prev.0);
+            let d_send = cur.1.saturating_sub(prev.1);
+            let d_recv = cur.2.saturating_sub(prev.2);
+            let d_write = cur.3.saturating_sub(prev.3);
+            if d_read != 0 || d_send != 0 || d_recv != 0 || d_write != 0 {
+                info!(
+                    flow_id,
+                    tcp_read_total = cur.0,
+                    dc_send_total = cur.1,
+                    dc_recv_total = cur.2,
+                    tcp_write_total = cur.3,
+                    mailbox_depth = cur.4,
+                    tcp_read_kbps = d_read / 1024 / 2,
+                    dc_send_kbps = d_send / 1024 / 2,
+                    dc_recv_kbps = d_recv / 1024 / 2,
+                    tcp_write_kbps = d_write / 1024 / 2,
+                    "tunnel flow throughput (2s window)"
+                );
+            }
+            prev = cur;
+        }
+    })
+}
+
+/// QUIC variant of [`run_flow`]: drive one accepted forward over a
+/// native QUIC bidirectional stream. **None** of the WebRTC-DC
+/// machinery applies — no `flow_id` framing (the stream is dedicated to
+/// one flow, with a one-time preamble handled by
+/// [`crate::transport::quic::open_flow`]/`accept_flow`), no
+/// `HALF_CLOSE_MAGIC` (QUIC FIN), no `bufferedAmountLow` watermark dance
+/// (quinn's per-stream flow control applies backpressure on
+/// `write_all`), and no 65535-byte cap. The same [`FlowStats`] columns
+/// are populated (tcp_read/dc_send outbound, dc_recv/tcp_write inbound)
+/// so the 2 s logger reads identically across transports. Both halves
+/// are awaited so half-close survives a duplex flow.
+pub async fn run_flow_quic(
+    tcp: TcpStream,
+    mut send: SendStream,
+    mut recv: RecvStream,
+    flow_id: u32,
+    stats: Arc<FlowStats>,
+) -> CloseReason {
+    let (mut read_half, mut write_half) = tcp.into_split();
+    let logger_handle = spawn_flow_logger(flow_id, Arc::clone(&stats));
+
+    // TCP → QUIC send.
+    let stats_send = Arc::clone(&stats);
+    let tcp_to_quic = tokio::spawn(async move {
+        let mut buf = vec![0u8; CHUNK_BYTES];
+        loop {
+            match read_half.read(&mut buf).await {
+                Ok(0) => {
+                    // Local read half EOF → clean FIN on the QUIC stream.
+                    let _ = send.finish();
+                    return CloseReason::Eof;
+                }
+                Ok(n) => {
+                    stats_send
+                        .tcp_read_bytes
+                        .fetch_add(n as u64, Ordering::Relaxed);
+                    if let Err(e) = send.write_all(&buf[..n]).await {
+                        debug!(flow_id, %e, "quic pump: stream write error");
+                        return CloseReason::IoError;
+                    }
+                    // quinn's write_all returns once the bytes are
+                    // accepted into the (flow-controlled) send buffer —
+                    // backpressure is implicit, no watermark poll needed.
+                    stats_send
+                        .dc_send_bytes
+                        .fetch_add(n as u64, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    debug!(flow_id, %e, "quic pump: TCP read error");
+                    let _ = send.reset(0u32.into());
+                    return CloseReason::IoError;
+                }
+            }
+        }
+    });
+
+    // QUIC recv → TCP write.
+    let stats_recv = Arc::clone(&stats);
+    let quic_to_tcp = tokio::spawn(async move {
+        let mut buf = vec![0u8; CHUNK_BYTES];
+        loop {
+            match recv.read(&mut buf).await {
+                Ok(Some(n)) => {
+                    stats_recv
+                        .dc_recv_bytes
+                        .fetch_add(n as u64, Ordering::Relaxed);
+                    if let Err(e) = write_half.write_all(&buf[..n]).await {
+                        debug!(flow_id, %e, "quic pump: TCP write error");
+                        return CloseReason::IoError;
+                    }
+                    stats_recv
+                        .tcp_write_bytes
+                        .fetch_add(n as u64, Ordering::Relaxed);
+                }
+                Ok(None) => {
+                    // Peer finished the stream (FIN) — shut the local
+                    // write half so downstream sees EOF.
+                    if let Err(e) = write_half.shutdown().await {
+                        debug!(flow_id, %e, "quic pump: TCP shutdown after EOF failed");
+                    }
+                    return CloseReason::Eof;
+                }
+                Err(e) => {
+                    debug!(flow_id, %e, "quic pump: stream read error");
+                    return CloseReason::IoError;
+                }
+            }
+        }
+    });
+
+    let r1 = tcp_to_quic.await.unwrap_or(CloseReason::IoError);
+    let r2 = quic_to_tcp.await.unwrap_or(CloseReason::IoError);
+
+    let (read_total, send_total, recv_total, write_total, _mb) = stats.snapshot();
+    info!(
+        flow_id,
+        tcp_read_total = read_total,
+        dc_send_total = send_total,
+        dc_recv_total = recv_total,
+        tcp_write_total = write_total,
+        "tunnel flow closed (quic) — final throughput totals"
     );
     logger_handle.abort();
 

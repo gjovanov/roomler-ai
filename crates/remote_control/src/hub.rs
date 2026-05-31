@@ -698,6 +698,7 @@ mod tests {
             Permissions::default(),
             Vec::new(),
             None,
+            None, // chroma_pref
         );
         assert!(matches!(res, Err(Error::AgentOffline(_))));
     }
@@ -718,6 +719,7 @@ mod tests {
                 Permissions::default(),
                 Vec::new(),
                 None,
+                None, // chroma_pref
             )
             .unwrap();
 
