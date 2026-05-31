@@ -390,6 +390,26 @@ async fn relay_tunnel_msg_from_agent(state: &AppState, parsed: ClientMsg) -> Opt
             .await;
             None
         }
+        // Phase 1c: the agent's QUIC endpoint is up — relay its cert
+        // fingerprint (for the client to pin) + dialable addrs to the
+        // tunnel-client so it can connect the direct P2P QUIC link.
+        ClientMsg::TunnelQuicReady {
+            session_id,
+            cert_fingerprint,
+            addrs,
+        } => {
+            relay_to_client(
+                state,
+                session_id,
+                ServerMsg::TunnelQuicReady {
+                    session_id,
+                    cert_fingerprint,
+                    addrs,
+                },
+            )
+            .await;
+            None
+        }
         // `TunnelHello` / `TunnelOpen` / `TcpForwardRequest` /
         // `TunnelSdpOffer` are tunnel-client → server messages;
         // agents shouldn't emit them. Pass through to the Hub so a
