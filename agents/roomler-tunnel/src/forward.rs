@@ -29,7 +29,7 @@ use anyhow::{Context, Result, bail};
 use bson::oid::ObjectId;
 use futures::{SinkExt, StreamExt};
 use roomler_ai_remote_control::signaling::{
-    ClientMsg, CloseReason, Direction, RejectKind, ServerMsg, TunnelRole,
+    ClientMsg, CloseReason, Direction, IceServer, RejectKind, ServerMsg, TunnelRole,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -38,8 +38,10 @@ use tokio::net::TcpListener;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
-use tunnel_core::forward::{FlowDemux, HalfCloseSink, run_flow};
+use tunnel_core::forward::{FlowDemux, HalfCloseSink, run_flow, run_flow_quic};
+use tunnel_core::transport::quic::{self, QuicConnection, QuicPeer};
 use tunnel_core::transport::webrtc_dc::TunnelPeer;
+use tunnel_core::transport::{TRANSPORT_QUIC_V1, TRANSPORT_WEBRTC_DC_V1};
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 
@@ -64,6 +66,72 @@ const PEER_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3
 /// dial timeout in the relay case.
 const FLOW_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Cap on waiting for `rc:tunnel.quic.ready` after `rc:tunnel.opened`
+/// negotiated `quic-v1`. The server has to relay `TunnelQuicSetup` to
+/// the agent + relay the agent's reply back, so it's a server↔agent
+/// round-trip plus the agent's endpoint bind. On timeout the client
+/// abandons QUIC and (for `--transport auto`) re-opens over WebRTC.
+const QUIC_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Operator's transport preference for `roomler-tunnel forward`,
+/// selected with `--transport`. Drives which transports the client
+/// advertises in `rc:tunnel.hello` and which it requests in
+/// `rc:tunnel.open`; the server is authoritative for the final pick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+#[value(rename_all = "lowercase")]
+pub enum TransportPref {
+    /// Prefer QUIC; transparently fall back to WebRTC if QUIC setup
+    /// fails. Becomes the natural default once server-side QUIC
+    /// negotiation (Phase 1c) ships; until then it costs one setup
+    /// round-trip against servers that don't yet negotiate QUIC.
+    Auto,
+    /// Force QUIC; error out if it can't be established (no fallback).
+    Quic,
+    /// Force the proven WebRTC SCTP DataChannel transport. Default
+    /// while the server-side QUIC negotiation is not yet deployed.
+    #[default]
+    Webrtc,
+}
+
+impl TransportPref {
+    /// Transports advertised in `rc:tunnel.hello`, in preference order.
+    fn supported_transports(self) -> Vec<String> {
+        match self {
+            TransportPref::Auto => vec![
+                TRANSPORT_QUIC_V1.to_string(),
+                TRANSPORT_WEBRTC_DC_V1.to_string(),
+            ],
+            TransportPref::Quic => vec![TRANSPORT_QUIC_V1.to_string()],
+            TransportPref::Webrtc => vec![TRANSPORT_WEBRTC_DC_V1.to_string()],
+        }
+    }
+
+    /// The single transport requested in `rc:tunnel.open`.
+    fn request_transport(self) -> &'static str {
+        match self {
+            TransportPref::Auto | TransportPref::Quic => TRANSPORT_QUIC_V1,
+            TransportPref::Webrtc => TRANSPORT_WEBRTC_DC_V1,
+        }
+    }
+}
+
+/// Outcome of one [`run_session`] attempt, so `run` can decide whether
+/// to fall back to WebRTC.
+enum SessionOutcome {
+    /// The session ran its data plane (listener loop entered).
+    Completed,
+    /// A QUIC session couldn't be established during setup; the caller
+    /// may re-open over WebRTC.
+    QuicSetupFailed,
+}
+
+/// Read half of the signaling WebSocket. Aliased so the per-transport
+/// session bodies can own it without a generic bound (they move it into
+/// a spawned dispatch task, which needs a concrete `Send + 'static`).
+type WsSource = futures::stream::SplitStream<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+>;
+
 /// Reply registry: per-flow oneshot for the server's accept/reject.
 type ReplyRegistry = Arc<Mutex<HashMap<u32, oneshot::Sender<ForwardReply>>>>;
 
@@ -78,8 +146,16 @@ enum ForwardReply {
     Reject { kind: RejectKind, reason: String },
 }
 
-/// Entry point for `roomler-tunnel forward`.
-pub async fn run(cfg: TunnelConfig, agent_hex: &str, local: u16, remote: &str) -> Result<()> {
+/// Entry point for `roomler-tunnel forward`. Tries the operator's
+/// preferred transport and, for `--transport auto`, transparently
+/// re-opens the session forcing `webrtc-dc-v1` if QUIC setup fails.
+pub async fn run(
+    cfg: TunnelConfig,
+    agent_hex: &str,
+    local: u16,
+    remote: &str,
+    transport: TransportPref,
+) -> Result<()> {
     let agent_id = ObjectId::parse_str(agent_hex)
         .with_context(|| format!("--agent must be a 24-hex ObjectId, got {agent_hex}"))?;
     let (dst_host, dst_port) = parse_remote(remote)?;
@@ -90,9 +166,59 @@ pub async fn run(cfg: TunnelConfig, agent_hex: &str, local: u16, remote: &str) -
         local,
         dst_host,
         dst_port,
+        ?transport,
         "roomler-tunnel forward starting"
     );
 
+    // First attempt: request the operator's preferred transport.
+    let outcome = run_session(
+        &cfg,
+        agent_id,
+        local,
+        &dst_host,
+        dst_port,
+        transport.supported_transports(),
+        transport.request_transport(),
+    )
+    .await?;
+    if matches!(outcome, SessionOutcome::QuicSetupFailed) {
+        if transport == TransportPref::Auto {
+            warn!("QUIC transport setup failed; re-opening session forcing webrtc-dc-v1");
+            let fallback = run_session(
+                &cfg,
+                agent_id,
+                local,
+                &dst_host,
+                dst_port,
+                vec![TRANSPORT_WEBRTC_DC_V1.to_string()],
+                TRANSPORT_WEBRTC_DC_V1,
+            )
+            .await?;
+            if matches!(fallback, SessionOutcome::QuicSetupFailed) {
+                bail!("webrtc-dc-v1 fallback unexpectedly reported QUIC-setup-failed");
+            }
+        } else {
+            bail!("QUIC transport setup failed and --transport={transport:?} forbids fallback");
+        }
+    }
+    Ok(())
+}
+
+/// One session attempt over a fresh WS connection: handshake, open the
+/// tunnel requesting `request_transport`, then run whichever data plane
+/// the server negotiated. Returns [`SessionOutcome::QuicSetupFailed`]
+/// (not an `Err`) when a QUIC session can't be established, so the
+/// caller can fall back to WebRTC.
+#[allow(clippy::too_many_arguments)]
+async fn run_session(
+    cfg: &TunnelConfig,
+    agent_id: ObjectId,
+    local: u16,
+    dst_host: &str,
+    dst_port: u16,
+    supported_transports: Vec<String>,
+    request_transport: &str,
+) -> Result<SessionOutcome> {
     // ────────────── WS connect ─────────────────────────────────────
     let ws_base = derive_ws_url(&cfg.server_url)?;
     let ws_url = format!(
@@ -127,21 +253,22 @@ pub async fn run(cfg: TunnelConfig, agent_hex: &str, local: u16, remote: &str) -
         debug!("outbound WS task exiting");
     });
 
-    // Say hello.
+    // Say hello — advertise every transport this client supports.
     outbound_tx
         .send(ClientMsg::TunnelHello {
             role: TunnelRole::Client,
             version: env!("CARGO_PKG_VERSION").to_string(),
-            supported_transports: vec!["webrtc-dc-v1".to_string()],
+            supported_transports,
         })
         .await
         .context("send TunnelHello")?;
 
-    // Open the tunnel.
+    // Open the tunnel requesting our preferred transport; the server is
+    // authoritative and echoes the negotiated one in `TunnelOpened`.
     outbound_tx
         .send(ClientMsg::TunnelOpen {
             agent_id,
-            transport: "webrtc-dc-v1".to_string(),
+            transport: request_transport.to_string(),
         })
         .await
         .context("send TunnelOpen")?;
@@ -157,14 +284,15 @@ pub async fn run(cfg: TunnelConfig, agent_hex: &str, local: u16, remote: &str) -
                     dc_pool_size,
                     sctp_rwnd_bytes,
                     ice_servers,
-                    .. // quic_auth_token consumed in Phase 1e
+                    quic_auth_token,
                 } => {
                     info!(
                         %session_id, %transport, dc_pool_size, sctp_rwnd_bytes,
                         ice_servers = ice_servers.len(),
+                        quic = quic_auth_token.is_some(),
                         "rc:tunnel.opened"
                     );
-                    break anyhow::Ok((session_id, ice_servers));
+                    break anyhow::Ok((session_id, transport, ice_servers, quic_auth_token));
                 }
                 ServerMsg::TunnelRevoked { reason } => {
                     bail!("tunnel revoked by server during open: {reason}");
@@ -182,8 +310,47 @@ pub async fn run(cfg: TunnelConfig, agent_hex: &str, local: u16, remote: &str) -
     })
     .await
     .context("waiting for rc:tunnel.opened")??;
-    let (session_id, ice_servers) = opened;
+    let (session_id, negotiated_transport, ice_servers, quic_auth_token) = opened;
 
+    // ────────────── Dispatch on the negotiated transport ───────────
+    if negotiated_transport == TRANSPORT_QUIC_V1 {
+        return run_quic_session(
+            ws_source,
+            outbound_tx,
+            session_id,
+            quic_auth_token,
+            local,
+            dst_host,
+            dst_port,
+        )
+        .await;
+    }
+    run_webrtc_session(
+        ws_source,
+        outbound_tx,
+        session_id,
+        ice_servers,
+        local,
+        dst_host,
+        dst_port,
+    )
+    .await?;
+    Ok(SessionOutcome::Completed)
+}
+
+/// The proven WebRTC SCTP DataChannel data plane (`webrtc-dc-v1`):
+/// build the peer, run the SDP/ICE handshake, open the DC pool, then
+/// serve local TCP connections over round-robin flows.
+#[allow(clippy::too_many_arguments)]
+async fn run_webrtc_session(
+    mut ws_source: WsSource,
+    outbound_tx: mpsc::Sender<ClientMsg>,
+    session_id: ObjectId,
+    ice_servers: Vec<IceServer>,
+    local: u16,
+    dst_host: &str,
+    dst_port: u16,
+) -> Result<()> {
     // ────────────── Build TunnelPeer + SDP/ICE handshake ───────────
     let rtc_ice_servers: Vec<RTCIceServer> = ice_servers
         .into_iter()
@@ -369,7 +536,7 @@ pub async fn run(cfg: TunnelConfig, agent_hex: &str, local: u16, remote: &str) -
         let reply_registry = Arc::clone(&reply_registry);
         let active_flows = Arc::clone(&active_flows);
         let outbound_tx = outbound_tx.clone();
-        let dst_host = dst_host.clone();
+        let dst_host = dst_host.to_string();
         tokio::spawn(async move {
             if let Err(e) = handle_local_connection(
                 tcp,
@@ -635,6 +802,375 @@ async fn dispatch_loop(
     debug!("WS source ended; dispatch loop exiting");
 }
 
+/// The QUIC data plane (`quic-v1`). Awaits the agent's
+/// `rc:tunnel.quic.ready` (relayed by the server), connects to the
+/// agent's quinn endpoint (cert pinned from that message, authed with
+/// the server-minted token), then serves local TCP connections — one
+/// QUIC bidirectional stream per flow. Returns
+/// [`SessionOutcome::QuicSetupFailed`] (not an `Err`) if the QUIC link
+/// can't be established during setup, so the caller can fall back to
+/// WebRTC. Once flows can start it's committed (the listener loop runs
+/// until process teardown, like the WebRTC path).
+#[allow(clippy::too_many_arguments)]
+async fn run_quic_session(
+    mut ws_source: WsSource,
+    outbound_tx: mpsc::Sender<ClientMsg>,
+    session_id: ObjectId,
+    quic_auth_token: Option<String>,
+    local: u16,
+    dst_host: &str,
+    dst_port: u16,
+) -> Result<SessionOutcome> {
+    let Some(token) = quic_auth_token else {
+        warn!("server negotiated quic-v1 but sent no quic_auth_token — cannot authenticate");
+        return Ok(SessionOutcome::QuicSetupFailed);
+    };
+
+    // Await `rc:tunnel.quic.ready`: the agent's ephemeral cert
+    // fingerprint to pin + the dialable addrs.
+    let ready = tokio::time::timeout(QUIC_READY_TIMEOUT, async {
+        loop {
+            match recv_server_msg(&mut ws_source).await? {
+                ServerMsg::TunnelQuicReady {
+                    session_id: sid,
+                    cert_fingerprint,
+                    addrs,
+                } if sid == session_id => break anyhow::Ok((cert_fingerprint, addrs)),
+                ServerMsg::TunnelRevoked { reason } => {
+                    bail!("tunnel revoked during quic setup: {reason}")
+                }
+                ServerMsg::TunnelTerminate { reason, .. } => {
+                    bail!("tunnel terminated during quic setup: {reason:?}")
+                }
+                other => debug!(?other, "ignoring pre-quic-ready ServerMsg"),
+            }
+        }
+    })
+    .await;
+    let (cert_fingerprint, addrs) = match ready {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            warn!(%e, "error awaiting rc:tunnel.quic.ready");
+            return Ok(SessionOutcome::QuicSetupFailed);
+        }
+        Err(_) => {
+            warn!("timed out waiting for rc:tunnel.quic.ready");
+            return Ok(SessionOutcome::QuicSetupFailed);
+        }
+    };
+    info!(
+        addrs = ?addrs,
+        fp_prefix = %cert_fingerprint.chars().take(12).collect::<String>(),
+        "rc:tunnel.quic.ready"
+    );
+
+    // Build a client endpoint pinned to the agent's ephemeral cert.
+    let bind: std::net::SocketAddr = "0.0.0.0:0".parse().expect("0.0.0.0:0 is a valid bind addr");
+    let peer = match QuicPeer::client(bind, &cert_fingerprint) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(%e, "QuicPeer::client failed");
+            return Ok(SessionOutcome::QuicSetupFailed);
+        }
+    };
+
+    // Dial the advertised addrs in priority order (Phase 1: usually one
+    // direct addr; Phase 2 adds srflx candidates).
+    let Some(conn) = connect_first(&peer, &addrs).await else {
+        warn!(addrs = ?addrs, "could not connect QUIC to any advertised addr");
+        return Ok(SessionOutcome::QuicSetupFailed);
+    };
+    if let Err(e) = quic::client_authenticate(&conn, &token).await {
+        warn!(%e, "QUIC client_authenticate failed");
+        return Ok(SessionOutcome::QuicSetupFailed);
+    }
+    info!(remote = %conn.remote_address(), "QUIC connection established + authenticated");
+
+    // From here the QUIC link is live; we're committed (no WebRTC
+    // fallback once flows can start). Spawn the WS dispatcher for
+    // per-flow accept/reject + teardown signals.
+    let reply_registry: ReplyRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let active_flows: ActiveFlows = Arc::new(Mutex::new(HashMap::new()));
+    let _dispatcher_task = {
+        let reply_registry = Arc::clone(&reply_registry);
+        let active_flows = Arc::clone(&active_flows);
+        let outbound_tx = outbound_tx.clone();
+        tokio::spawn(async move {
+            quic_dispatch_loop(
+                ws_source,
+                session_id,
+                reply_registry,
+                active_flows,
+                outbound_tx,
+            )
+            .await
+        })
+    };
+
+    // Keep the endpoint + connection alive for the session lifetime
+    // (dropping the endpoint closes quinn; dropping the last `conn`
+    // Arc closes the connection).
+    let conn = Arc::new(conn);
+    let _peer = Arc::new(peer);
+
+    // ────────────── Local TCP listener ─────────────────────────────
+    let listener = TcpListener::bind(("127.0.0.1", local))
+        .await
+        .with_context(|| format!("binding 127.0.0.1:{local}"))?;
+    info!(local = %listener.local_addr()?, "listening for local TCP connections (quic-v1)");
+    let flow_counter = Arc::new(AtomicU32::new(1));
+
+    loop {
+        let (tcp, peer_addr) = match listener.accept().await {
+            Ok(x) => x,
+            Err(e) => {
+                error!(%e, "accept failed");
+                continue;
+            }
+        };
+        // Same Nagle + SO_SNDBUF tuning as the WebRTC path — see the
+        // long-form rationale in `run_webrtc_session`'s listener loop.
+        if let Err(e) = tcp.set_nodelay(true) {
+            warn!(%peer_addr, %e, "set_nodelay(true) on local TCP failed");
+        }
+        #[cfg(any(unix, windows))]
+        {
+            use socket2::SockRef;
+            const LOCAL_SNDBUF_BYTES: usize = 4 * 1024 * 1024;
+            let sock = SockRef::from(&tcp);
+            if let Err(e) = sock.set_send_buffer_size(LOCAL_SNDBUF_BYTES) {
+                warn!(%peer_addr, %e, "set_send_buffer_size(4MiB) on local TCP failed");
+            }
+        }
+        debug!(%peer_addr, "accepted local TCP connection (quic-v1)");
+
+        let flow_id = flow_counter.fetch_add(1, Ordering::Relaxed);
+        let (reply_tx, reply_rx) = oneshot::channel::<ForwardReply>();
+        reply_registry.lock().await.insert(flow_id, reply_tx);
+
+        let reply_registry = Arc::clone(&reply_registry);
+        let active_flows = Arc::clone(&active_flows);
+        let outbound_tx = outbound_tx.clone();
+        let dst_host = dst_host.to_string();
+        let conn = Arc::clone(&conn);
+        tokio::spawn(async move {
+            if let Err(e) = handle_local_connection_quic(
+                tcp,
+                peer_addr,
+                flow_id,
+                session_id,
+                conn,
+                &dst_host,
+                dst_port,
+                outbound_tx,
+                reply_rx,
+                reply_registry,
+                active_flows,
+            )
+            .await
+            {
+                warn!(flow_id, %e, "quic flow ended with error");
+            }
+        });
+    }
+}
+
+/// Try each advertised addr in order; return the first QUIC connection
+/// that handshakes. Logs + skips unparseable / unreachable addrs.
+async fn connect_first(peer: &QuicPeer, addrs: &[String]) -> Option<QuicConnection> {
+    for a in addrs {
+        let Ok(sa) = a.parse::<std::net::SocketAddr>() else {
+            warn!(addr = %a, "skipping unparseable quic addr");
+            continue;
+        };
+        match peer.connect(sa).await {
+            Ok(c) => return Some(c),
+            Err(e) => warn!(addr = %sa, %e, "quic connect failed; trying next addr"),
+        }
+    }
+    None
+}
+
+/// WS read loop for a QUIC session. Routes per-flow accept/reject into
+/// the `reply_registry` and handles teardown. Unlike the WebRTC
+/// [`dispatch_loop`] it has no SDP/ICE to forward — QUIC carries its
+/// own handshake — so it only consumes the control-plane signals.
+async fn quic_dispatch_loop(
+    mut ws_source: WsSource,
+    session_id: ObjectId,
+    reply_registry: ReplyRegistry,
+    active_flows: ActiveFlows,
+    outbound_tx: mpsc::Sender<ClientMsg>,
+) {
+    while let Some(item) = ws_source.next().await {
+        let text = match item {
+            Ok(Message::Text(t)) => t,
+            Ok(Message::Close(c)) => {
+                info!(?c, "server closed WS");
+                return;
+            }
+            Ok(Message::Ping(d)) => {
+                debug!(len = d.len(), "ws ping");
+                continue;
+            }
+            Ok(_) => continue,
+            Err(e) => {
+                warn!(%e, "ws read error; exiting quic dispatch loop");
+                return;
+            }
+        };
+        let parsed: ServerMsg = match serde_json::from_str(text.as_str()) {
+            Ok(p) => p,
+            Err(e) => {
+                debug!(%e, text = %text.as_str(), "ignoring non-rc:* / unparseable frame");
+                continue;
+            }
+        };
+        match parsed {
+            ServerMsg::TcpForwardAccept {
+                session_id: sid,
+                flow_id,
+                dc_index,
+            } if sid == session_id => {
+                if let Some(tx) = reply_registry.lock().await.remove(&flow_id) {
+                    let _ = tx.send(ForwardReply::Accept { dc_index });
+                } else {
+                    warn!(flow_id, "accept for unknown flow_id");
+                }
+            }
+            ServerMsg::TcpForwardReject {
+                session_id: sid,
+                flow_id,
+                kind,
+                reason,
+            } if sid == session_id => {
+                if let Some(tx) = reply_registry.lock().await.remove(&flow_id) {
+                    let _ = tx.send(ForwardReply::Reject { kind, reason });
+                } else {
+                    warn!(flow_id, ?kind, %reason, "reject for unknown flow_id");
+                }
+            }
+            ServerMsg::TcpHalfClose {
+                session_id: sid,
+                flow_id,
+                direction,
+            } if sid == session_id => {
+                debug!(flow_id, ?direction, "rc:tunnel.tcp.half_close (audit)");
+            }
+            ServerMsg::TcpClosed {
+                session_id: sid,
+                flow_id,
+                reason,
+            } if sid == session_id => {
+                debug!(flow_id, ?reason, "rc:tunnel.tcp.closed (audit)");
+                active_flows.lock().await.remove(&flow_id);
+            }
+            ServerMsg::TunnelTerminate {
+                session_id: sid,
+                reason,
+            } if sid == session_id => {
+                info!(?reason, "rc:tunnel.terminate — peer torn down by server");
+                return;
+            }
+            ServerMsg::TunnelRevoked { reason } => {
+                error!(%reason, "rc:tunnel.revoked — admin revoked our enrollment");
+                let _ = outbound_tx
+                    .send(ClientMsg::TunnelTerminate {
+                        session_id,
+                        reason: CloseReason::ServerTerminated,
+                    })
+                    .await;
+                return;
+            }
+            other => debug!(?other, "quic dispatch: ignoring ServerMsg"),
+        }
+    }
+    debug!("WS source ended; quic dispatch loop exiting");
+}
+
+/// QUIC analogue of [`handle_local_connection`]: request the forward,
+/// await accept/reject, then open a QUIC bidirectional stream for the
+/// flow and pump it with [`run_flow_quic`]. No DC pool / round-robin —
+/// each flow is its own stream.
+#[allow(clippy::too_many_arguments)]
+async fn handle_local_connection_quic(
+    tcp: tokio::net::TcpStream,
+    peer_addr: std::net::SocketAddr,
+    flow_id: u32,
+    session_id: ObjectId,
+    conn: Arc<QuicConnection>,
+    dst_host: &str,
+    dst_port: u16,
+    outbound_tx: mpsc::Sender<ClientMsg>,
+    reply_rx: oneshot::Receiver<ForwardReply>,
+    reply_registry: ReplyRegistry,
+    active_flows: ActiveFlows,
+) -> Result<()> {
+    // Request the forward.
+    outbound_tx
+        .send(ClientMsg::TcpForwardRequest {
+            session_id,
+            flow_id,
+            dst_host: dst_host.to_string(),
+            dst_port,
+        })
+        .await
+        .context("send TcpForwardRequest")?;
+
+    // Await accept/reject.
+    let reply = match tokio::time::timeout(FLOW_OPEN_TIMEOUT, reply_rx).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(_canceled)) => {
+            reply_registry.lock().await.remove(&flow_id);
+            bail!("reply oneshot dropped — dispatcher exited?");
+        }
+        Err(_) => {
+            reply_registry.lock().await.remove(&flow_id);
+            warn!(flow_id, "TcpForwardRequest timed out");
+            bail!("forward request timed out after {FLOW_OPEN_TIMEOUT:?}");
+        }
+    };
+    match reply {
+        ForwardReply::Accept { dc_index } => {
+            // dc_index is meaningless for QUIC (the agent sends 0);
+            // logged only for symmetry with the WebRTC path.
+            debug!(flow_id, dc_index, "rc:tunnel.tcp.accept (quic)");
+        }
+        ForwardReply::Reject { kind, reason } => {
+            warn!(flow_id, ?kind, %reason, "rc:tunnel.tcp.reject — dropping local conn");
+            drop(tcp);
+            return Ok(());
+        }
+    }
+
+    active_flows.lock().await.insert(flow_id, 0);
+    // Open the QUIC stream for this flow (writes the 4-byte flow_id
+    // preamble the agent reads to correlate the stream to the dialed
+    // dst via its `take_flow` rendezvous).
+    let (send, recv) = match quic::open_flow(&conn, flow_id).await {
+        Ok(s) => s,
+        Err(e) => {
+            active_flows.lock().await.remove(&flow_id);
+            drop(tcp);
+            bail!("quic open_flow for flow {flow_id}: {e}");
+        }
+    };
+
+    let stats = Arc::new(tunnel_core::forward::FlowStats::default());
+    debug!(flow_id, %peer_addr, "running quic flow");
+    let close_reason = run_flow_quic(tcp, send, recv, flow_id, stats).await;
+    info!(flow_id, ?close_reason, "quic flow ended");
+    let _ = outbound_tx
+        .send(ClientMsg::TcpClosed {
+            session_id,
+            flow_id,
+            reason: close_reason,
+        })
+        .await;
+    active_flows.lock().await.remove(&flow_id);
+    Ok(())
+}
+
 async fn recv_server_msg<S>(source: &mut S) -> Result<ServerMsg>
 where
     S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
@@ -762,5 +1298,150 @@ mod tests {
     #[test]
     fn urlencoding_lite_encodes_space() {
         assert_eq!(urlencoding_lite("a b"), "a%20b");
+    }
+
+    #[test]
+    fn transport_pref_advertises_and_requests_correctly() {
+        // Locks the exact wire strings transport negotiation depends on
+        // (catches accidental drift in the tunnel_core consts).
+        assert_eq!(
+            TransportPref::Webrtc.supported_transports(),
+            vec!["webrtc-dc-v1".to_string()]
+        );
+        assert_eq!(TransportPref::Webrtc.request_transport(), "webrtc-dc-v1");
+
+        assert_eq!(
+            TransportPref::Quic.supported_transports(),
+            vec!["quic-v1".to_string()]
+        );
+        assert_eq!(TransportPref::Quic.request_transport(), "quic-v1");
+
+        // Auto advertises BOTH (quic first = preference order) + requests quic.
+        assert_eq!(
+            TransportPref::Auto.supported_transports(),
+            vec!["quic-v1".to_string(), "webrtc-dc-v1".to_string()]
+        );
+        assert_eq!(TransportPref::Auto.request_transport(), "quic-v1");
+
+        // Default is the proven path while server-side QUIC negotiation
+        // (Phase 1c) is not yet deployed.
+        assert_eq!(TransportPref::default(), TransportPref::Webrtc);
+    }
+
+    /// Client glue: [`handle_local_connection_quic`] sends the forward
+    /// request, on `Accept` opens a QUIC flow, and `run_flow_quic` pumps
+    /// the local TCP socket to the agent and back. The "agent" here is
+    /// built from tunnel-core primitives (server endpoint + auth +
+    /// accept_flow + run_flow_quic to a loopback echo dst) — the
+    /// symmetric counterpart to the agent crate's
+    /// `handle_forward_request_quic` test.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn quic_local_connection_requests_accepts_and_pumps() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Loopback TCP echo "dst" the agent dials.
+        let dst = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dst_port = dst.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = dst.accept().await.unwrap();
+            let (mut r, mut w) = s.split();
+            let _ = tokio::io::copy(&mut r, &mut w).await;
+        });
+
+        // "Agent": quinn server endpoint that authenticates the client,
+        // accepts one flow, dials the echo dst, and pumps it.
+        let (agent, fp) = QuicPeer::server("127.0.0.1:0".parse().unwrap()).unwrap();
+        let agent_addr = agent.local_addr().unwrap();
+        let token = "client-glue-token".to_string();
+        let token_a = token.clone();
+        tokio::spawn(async move {
+            let conn = agent.accept().await.unwrap().unwrap();
+            quic::server_authenticate(&conn, &token_a).await.unwrap();
+            let (flow_id, send, recv) = quic::accept_flow(&conn).await.unwrap();
+            let dst_tcp = tokio::net::TcpStream::connect(("127.0.0.1", dst_port))
+                .await
+                .unwrap();
+            let stats = Arc::new(tunnel_core::forward::FlowStats::default());
+            tunnel_core::forward::run_flow_quic(dst_tcp, send, recv, flow_id, stats).await;
+        });
+
+        // Client: connect + authenticate (cert pinned to the agent's fp).
+        let client = QuicPeer::client("127.0.0.1:0".parse().unwrap(), &fp).unwrap();
+        let conn = Arc::new(client.connect(agent_addr).await.unwrap());
+        quic::client_authenticate(&conn, &token).await.unwrap();
+
+        // Local app socket <-> the `tcp` we hand to the glue.
+        let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = local_listener.local_addr().unwrap();
+        let app = tokio::net::TcpStream::connect(local_addr).await.unwrap();
+        let (tcp, _) = local_listener.accept().await.unwrap();
+
+        // Pre-arm the reply oneshot with Accept (in production the WS
+        // dispatcher fills this from the server's TcpForwardAccept).
+        let (reply_tx, reply_rx) = oneshot::channel::<ForwardReply>();
+        reply_tx.send(ForwardReply::Accept { dc_index: 0 }).unwrap();
+
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<ClientMsg>(16);
+        let reply_registry: ReplyRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let active_flows: ActiveFlows = Arc::new(Mutex::new(HashMap::new()));
+        let session_id = ObjectId::new();
+        let flow_id = 1u32;
+
+        let conn_c = Arc::clone(&conn);
+        let glue = tokio::spawn(async move {
+            handle_local_connection_quic(
+                tcp,
+                "127.0.0.1:0".parse().unwrap(),
+                flow_id,
+                session_id,
+                conn_c,
+                "echo.intranet",
+                dst_port,
+                outbound_tx,
+                reply_rx,
+                reply_registry,
+                active_flows,
+            )
+            .await
+        });
+
+        // The glue sends a TcpForwardRequest first.
+        match outbound_rx
+            .recv()
+            .await
+            .expect("expected TcpForwardRequest from glue")
+        {
+            ClientMsg::TcpForwardRequest {
+                flow_id: f,
+                dst_port: p,
+                ..
+            } => {
+                assert_eq!(f, flow_id);
+                assert_eq!(p, dst_port);
+            }
+            other => panic!("expected TcpForwardRequest, got {other:?}"),
+        }
+
+        // Local app writes, half-closes; expects the echo back over QUIC.
+        let (mut app_r, mut app_w) = app.into_split();
+        app_w.write_all(b"ping over client quic").await.unwrap();
+        app_w.shutdown().await.unwrap();
+        let mut echoed = Vec::new();
+        app_r.read_to_end(&mut echoed).await.unwrap();
+        assert_eq!(
+            &echoed, b"ping over client quic",
+            "bytes must round-trip the local TCP ↔ QUIC ↔ agent ↔ dst loop"
+        );
+
+        glue.await.unwrap().expect("glue returns Ok");
+        // After the flow ends the glue emits TcpClosed for audit.
+        match outbound_rx
+            .recv()
+            .await
+            .expect("expected TcpClosed after flow end")
+        {
+            ClientMsg::TcpClosed { flow_id: f, .. } => assert_eq!(f, flow_id),
+            other => panic!("expected TcpClosed, got {other:?}"),
+        }
     }
 }
