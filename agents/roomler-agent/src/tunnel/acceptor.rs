@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bson::oid::ObjectId;
-use roomler_ai_remote_control::signaling::{ClientMsg, RejectKind};
+use roomler_ai_remote_control::signaling::{ClientMsg, CloseReason, RejectKind};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -24,6 +24,7 @@ use tracing::{debug, info, warn};
 use super::acl::{AclDecision, AgentForwardAcl};
 use super::dialer::{DialError, dial_dst};
 use super::peer::AgentTunnelPeer;
+use super::quic_peer::AgentQuicPeer;
 
 /// Cap on how long we'll wait for the DC pool to finish opening
 /// before bailing on a forward request. The pool usually opens
@@ -31,6 +32,14 @@ use super::peer::AgentTunnelPeer;
 /// forward arrives suspiciously early or the peer connection
 /// stalled.
 const POOL_READY_WAIT: Duration = Duration::from_secs(10);
+
+/// `quic-v1` analogue of [`POOL_READY_WAIT`]: how long the agent waits
+/// for the client to open the QUIC flow stream after the agent replies
+/// `TcpForwardAccept`. The client opens it immediately on receipt of
+/// the Accept, so this only fires when the client died in that window
+/// or the QUIC connection stalled — bounded so a dialed dst socket
+/// can't leak waiting for a stream that never comes.
+const FLOW_RENDEZVOUS_WAIT: Duration = Duration::from_secs(10);
 
 /// Policy + dial layer. Pure decision logic, no peer interaction —
 /// keeps the unit tests self-contained.
@@ -180,6 +189,84 @@ pub async fn handle_forward_request(
         .await;
 }
 
+/// `quic-v1` analogue of [`handle_forward_request`]. The QUIC data
+/// plane has no DC pool — each flow is a native QUIC bidirectional
+/// stream — so the WebRTC ceremony (`wait_pool_ready` / `pool_size` /
+/// `demux.register`) collapses to: decide + dial, reply
+/// `TcpForwardAccept`, grab the client-opened flow stream from the
+/// peer's rendezvous, then drive [`tunnel_core::forward::run_flow_quic`].
+///
+/// Ordering: we send `TcpForwardAccept` BEFORE awaiting the stream,
+/// because the client opens its QUIC stream only after it sees the
+/// Accept. [`AgentQuicPeer::take_flow`] is order-independent (it
+/// stashes a stream that beats the waiter), so the window between the
+/// send and the await can't drop the flow.
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_forward_request_quic(
+    session_id: ObjectId,
+    flow_id: u32,
+    dst_host: &str,
+    dst_port: u16,
+    acl: &AgentForwardAcl,
+    dial_timeout: Duration,
+    quic_peer: &Arc<AgentQuicPeer>,
+    outbound: mpsc::Sender<ClientMsg>,
+) {
+    let stream =
+        match decide_forward(session_id, flow_id, dst_host, dst_port, acl, dial_timeout).await {
+            Ok(s) => s,
+            Err(reject) => {
+                let _ = outbound.send(reject).await;
+                return;
+            }
+        };
+
+    // Accept first — the client opens its QUIC flow stream in
+    // response. `dc_index` is meaningless for QUIC (no pool); send 0
+    // for wire-compat with the shared `TcpForwardAccept` shape.
+    if let Err(e) = outbound
+        .send(ClientMsg::TcpForwardAccept {
+            session_id,
+            flow_id,
+            dc_index: 0,
+        })
+        .await
+    {
+        debug!(%session_id, %flow_id, %e, "TcpForwardAccept send failed (channel closed)");
+        return;
+    }
+
+    // Grab the client-opened flow stream from the rendezvous. Times
+    // out if the client never opens it (died right after Accept, QUIC
+    // path stalled) so the dialed dst socket doesn't leak.
+    let (send, recv) = match quic_peer.take_flow(flow_id, FLOW_RENDEZVOUS_WAIT).await {
+        Ok(streams) => streams,
+        Err(e) => {
+            warn!(%session_id, %flow_id, %e, "QUIC flow stream never opened — closing dst");
+            let _ = outbound
+                .send(ClientMsg::TcpClosed {
+                    session_id,
+                    flow_id,
+                    reason: CloseReason::IoError,
+                })
+                .await;
+            return;
+        }
+    };
+
+    let stats = Arc::new(tunnel_core::forward::FlowStats::default());
+    let close_reason =
+        tunnel_core::forward::run_flow_quic(stream, send, recv, flow_id, stats).await;
+    info!(%session_id, %flow_id, ?close_reason, "agent QUIC flow ended");
+    let _ = outbound
+        .send(ClientMsg::TcpClosed {
+            session_id,
+            flow_id,
+            reason: close_reason,
+        })
+        .await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,5 +383,103 @@ mod tests {
         // Just verify the stream is bound to a peer — the post-decide
         // data-plane (`run_flow`) is exercised by `peer::tests`.
         assert!(stream.peer_addr().is_ok());
+    }
+
+    /// End-to-end glue for the QUIC data plane: drive
+    /// [`handle_forward_request_quic`] against a real loopback QUIC
+    /// pair + a loopback TCP echo dst, and assert the full sequence —
+    /// dial dst → reply `TcpForwardAccept` → rendezvous the client-
+    /// opened flow stream → pump bytes both ways → emit `TcpClosed`.
+    /// Locks the ordering invariant (Accept BEFORE the stream is
+    /// opened) that the two-map rendezvous relies on; the WebRTC
+    /// `handle_forward_request` has no equivalent test here because its
+    /// post-decide path is covered by `peer::tests`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn quic_forward_request_accepts_then_pumps_to_dst() {
+        use crate::tunnel::quic_peer::AgentQuicPeer;
+        use tunnel_core::transport::quic::{self, QuicPeer};
+
+        // dst: a loopback TCP echo server (echoes whatever it reads,
+        // then closes when its peer half-closes).
+        let dst = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dst_port = dst.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = dst.accept().await.unwrap();
+            let (mut r, mut w) = sock.split();
+            let _ = tokio::io::copy(&mut r, &mut w).await;
+        });
+
+        // Agent QUIC peer + a pinned, token-authed client connection.
+        let session_id = ObjectId::new();
+        let token = "tok-quic-accept";
+        let agent = Arc::new(
+            AgentQuicPeer::setup(
+                session_id,
+                token.to_string(),
+                "127.0.0.1:0".parse().unwrap(),
+            )
+            .unwrap(),
+        );
+        let addr: std::net::SocketAddr = agent.addrs()[0].parse().unwrap();
+        let client =
+            QuicPeer::client("127.0.0.1:0".parse().unwrap(), agent.cert_fingerprint()).unwrap();
+        let conn = client.connect(addr).await.unwrap();
+        quic::client_authenticate(&conn, token).await.unwrap();
+
+        // Outbound channel the acceptor replies on.
+        let (tx, mut rx) = mpsc::channel::<ClientMsg>(16);
+        let acl = AgentForwardAcl {
+            enabled: true,
+            allowlist: vec![],
+        };
+        let flow_id = 9;
+
+        // Drive the acceptor: decide+dial → Accept → take_flow → pump.
+        let agent_task = Arc::clone(&agent);
+        let handle = tokio::spawn(async move {
+            handle_forward_request_quic(
+                session_id,
+                flow_id,
+                "127.0.0.1",
+                dst_port,
+                &acl,
+                Duration::from_secs(2),
+                &agent_task,
+                tx,
+            )
+            .await;
+        });
+
+        // Client must see Accept FIRST, then opens the flow stream.
+        match rx.recv().await.expect("expected a ClientMsg from acceptor") {
+            ClientMsg::TcpForwardAccept {
+                flow_id: f,
+                dc_index,
+                ..
+            } => {
+                assert_eq!(f, flow_id);
+                assert_eq!(dc_index, 0, "QUIC has no DC pool; dc_index is 0");
+            }
+            other => panic!("expected TcpForwardAccept, got {other:?}"),
+        }
+
+        let (mut send, mut recv) = quic::open_flow(&conn, flow_id).await.unwrap();
+        send.write_all(b"ping over quic acceptor").await.unwrap();
+        send.finish().unwrap();
+        // dst echoes it back over the same flow.
+        let echoed = recv.read_to_end(64 * 1024).await.unwrap();
+        assert_eq!(
+            &echoed, b"ping over quic acceptor",
+            "bytes must round-trip TCP↔QUIC through the acceptor"
+        );
+
+        // Flow ended cleanly → acceptor emits TcpClosed for audit.
+        match rx.recv().await.expect("expected TcpClosed after flow end") {
+            ClientMsg::TcpClosed { flow_id: f, .. } => assert_eq!(f, flow_id),
+            other => panic!("expected TcpClosed, got {other:?}"),
+        }
+
+        handle.await.unwrap();
+        agent.close();
     }
 }
