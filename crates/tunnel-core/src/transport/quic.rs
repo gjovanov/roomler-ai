@@ -22,7 +22,7 @@
 //! **Crypto provider:** `ring` everywhere (see Cargo.toml) so QUIC adds
 //! no aws-lc-rs C/NASM build.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -54,6 +54,44 @@ const SNI: &str = "roomler-tunnel";
 /// value the agent advertises over signaling and the client pins.
 pub fn cert_fingerprint(cert_der: &[u8]) -> String {
     hex::encode(Sha256::digest(cert_der))
+}
+
+/// Phase 2 (Tier 1): gather dialable **host candidates** for a QUIC
+/// endpoint bound on `port`. Returns the primary egress-interface IPv4
+/// paired with `port` — i.e. an address a peer on the same LAN (or one
+/// with a direct route / port-forward) can dial. The agent advertises
+/// these in `rc:tunnel.quic.ready` so the client's connect loop can try
+/// them in order; the bare `0.0.0.0:port` the endpoint binds to is NOT
+/// dialable, which is why this exists.
+///
+/// Phase 2b adds STUN **server-reflexive** candidates (the public
+/// mapping behind a NAT) alongside these. For now this is host-only,
+/// which already unblocks same-LAN / directly-reachable hosts.
+pub fn host_candidates(port: u16) -> Vec<SocketAddr> {
+    let mut out = Vec::new();
+    if let Some(ip) = primary_egress_ipv4() {
+        out.push(SocketAddr::new(ip, port));
+    }
+    out
+}
+
+/// Discover the primary egress-interface IPv4 via the classic
+/// "connect a UDP socket to a public address and read its local_addr"
+/// trick: `connect` on a UDP socket sends NO datagram — it just makes
+/// the OS pick the outbound route and bind the socket to the egress
+/// interface's address, which `local_addr` then reports. Needs no
+/// interface-enumeration crate and no network round-trip. Returns
+/// `None` when there's no usable route (offline / loopback-only), in
+/// which case the caller simply advertises no host candidate and the
+/// client falls back to another transport.
+fn primary_egress_ipv4() -> Option<IpAddr> {
+    let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    // 8.8.8.8:80 is a route hint only; no packet is sent by `connect`.
+    sock.connect((Ipv4Addr::new(8, 8, 8, 8), 80)).ok()?;
+    match sock.local_addr().ok()?.ip() {
+        IpAddr::V4(v4) if !v4.is_loopback() && !v4.is_unspecified() => Some(IpAddr::V4(v4)),
+        _ => None,
+    }
 }
 
 /// One QUIC endpoint (server or client side). Connections + per-flow
@@ -317,6 +355,25 @@ mod tests {
 
     fn loopback() -> SocketAddr {
         "127.0.0.1:0".parse().unwrap()
+    }
+
+    /// `host_candidates` must pair the egress IP with the requested
+    /// port and never advertise a loopback/unspecified address. We
+    /// tolerate an empty result (CI sandboxes with no egress route),
+    /// asserting only the shape of whatever it does return.
+    #[test]
+    fn host_candidates_are_dialable_or_empty() {
+        let port = 51820;
+        for addr in host_candidates(port) {
+            assert_eq!(addr.port(), port, "candidate must carry the bound port");
+            let ip = addr.ip();
+            assert!(
+                !ip.is_loopback(),
+                "loopback is not a useful candidate: {ip}"
+            );
+            assert!(!ip.is_unspecified(), "0.0.0.0 is not dialable: {ip}");
+            assert!(ip.is_ipv4(), "Phase-2a gathers IPv4 host candidates only");
+        }
     }
 
     /// Drain a recv stream to EOF into a Vec (test helper).
