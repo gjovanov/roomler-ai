@@ -12,6 +12,7 @@
 use async_trait::async_trait;
 
 pub mod quic;
+pub mod stun;
 pub mod webrtc_dc;
 pub mod wireguard;
 

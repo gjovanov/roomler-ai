@@ -94,6 +94,72 @@ fn primary_egress_ipv4() -> Option<IpAddr> {
     }
 }
 
+/// Gather all dialable candidates for a QUIC endpoint that will adopt
+/// `socket`: host candidates (Phase 2a) plus one STUN server-reflexive
+/// candidate per reachable entry in `stun_servers` (Phase 2b). Run this
+/// BEFORE handing the socket to [`QuicPeer::server_from_socket`] /
+/// [`QuicPeer::client_from_socket`] so STUN traverses the SAME NAT
+/// mapping QUIC will use. De-dups; a STUN failure is logged + skipped
+/// (host candidates alone still serve same-LAN / directly-reachable
+/// peers).
+pub async fn gather_candidates(
+    socket: &tokio::net::UdpSocket,
+    stun_servers: &[SocketAddr],
+    stun_timeout: std::time::Duration,
+) -> Vec<SocketAddr> {
+    let port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
+    let mut cands = host_candidates(port);
+    for &server in stun_servers {
+        match super::stun::srflx_query(socket, server, stun_timeout).await {
+            Ok(srflx) if !cands.contains(&srflx) => cands.push(srflx),
+            Ok(_) => {}
+            Err(e) => tracing::debug!(%server, %e, "stun srflx gather failed; skipping"),
+        }
+    }
+    cands
+}
+
+/// Build the quinn server config (TLS1.3, ephemeral self-signed cert,
+/// ALPN) shared by [`QuicPeer::server`] and
+/// [`QuicPeer::server_from_socket`]. Returns the config plus the cert
+/// fingerprint to advertise over signaling.
+fn build_server_config() -> Result<(ServerConfig, String)> {
+    let certified = rcgen::generate_simple_self_signed(vec![SNI.to_string()])
+        .context("rcgen ephemeral self-signed cert")?;
+    let cert_der = CertificateDer::from(certified.cert.der().to_vec());
+    let fingerprint = cert_fingerprint(&cert_der);
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()));
+    let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(provider()))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .context("quic server: tls13-only")?
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key)
+        .context("quic server: single cert")?;
+    tls.alpn_protocols = vec![ALPN.to_vec()];
+    let qsc = QuicServerConfig::try_from(tls).context("quic server config from rustls")?;
+    Ok((ServerConfig::with_crypto(Arc::new(qsc)), fingerprint))
+}
+
+/// Build the quinn client config (TLS1.3, pinned-fingerprint verifier,
+/// ALPN) shared by [`QuicPeer::client`] and
+/// [`QuicPeer::client_from_socket`].
+fn build_client_config(pinned_fingerprint_hex: &str) -> Result<ClientConfig> {
+    let pinned = decode_fingerprint(pinned_fingerprint_hex)?;
+    let verifier = Arc::new(FingerprintVerifier {
+        pinned,
+        provider: Arc::new(provider()),
+    });
+    let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(provider()))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .context("quic client: tls13-only")?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![ALPN.to_vec()];
+    let qcc = QuicClientConfig::try_from(tls).context("quic client config from rustls")?;
+    Ok(ClientConfig::new(Arc::new(qcc)))
+}
+
 /// One QUIC endpoint (server or client side). Connections + per-flow
 /// streams are opened off this.
 pub struct QuicPeer {
@@ -105,24 +171,20 @@ impl QuicPeer {
     /// self-signed cert. Returns the peer plus the cert fingerprint to
     /// advertise over signaling so the dialing client can pin it.
     pub fn server(bind: SocketAddr) -> Result<(Self, String)> {
-        let certified = rcgen::generate_simple_self_signed(vec![SNI.to_string()])
-            .context("rcgen ephemeral self-signed cert")?;
-        let cert_der = CertificateDer::from(certified.cert.der().to_vec());
-        let fingerprint = cert_fingerprint(&cert_der);
-        let key =
-            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()));
+        let (cfg, fingerprint) = build_server_config()?;
+        let endpoint = Endpoint::server(cfg, bind).context("quic server endpoint")?;
+        Ok((Self { endpoint }, fingerprint))
+    }
 
-        let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(provider()))
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .context("quic server: tls13-only")?
-            .with_no_client_auth()
-            .with_single_cert(vec![cert_der], key)
-            .context("quic server: single cert")?;
-        tls.alpn_protocols = vec![ALPN.to_vec()];
-
-        let qsc = QuicServerConfig::try_from(tls).context("quic server config from rustls")?;
-        let endpoint = Endpoint::server(ServerConfig::with_crypto(Arc::new(qsc)), bind)
-            .context("quic server endpoint")?;
+    /// Like [`server`](Self::server) but adopts an EXISTING UDP socket so
+    /// the caller can run STUN + hole-punch on it FIRST (Phase 2) — the
+    /// NAT mapping QUIC then uses is the one that was punched. Pass the
+    /// socket from [`gather_candidates`]'s tokio socket via `into_std()`.
+    pub fn server_from_socket(socket: std::net::UdpSocket) -> Result<(Self, String)> {
+        let (cfg, fingerprint) = build_server_config()?;
+        let runtime = quinn::default_runtime().context("no async runtime for quinn endpoint")?;
+        let endpoint = Endpoint::new(quinn::EndpointConfig::default(), Some(cfg), socket, runtime)
+            .context("quic server endpoint from socket")?;
         Ok((Self { endpoint }, fingerprint))
     }
 
@@ -130,22 +192,21 @@ impl QuicPeer {
     /// whose cert SHA-256 fingerprint equals `pinned_fingerprint_hex`
     /// (the value the agent sent over signaling).
     pub fn client(bind: SocketAddr, pinned_fingerprint_hex: &str) -> Result<Self> {
-        let pinned = decode_fingerprint(pinned_fingerprint_hex)?;
-        let verifier = Arc::new(FingerprintVerifier {
-            pinned,
-            provider: Arc::new(provider()),
-        });
-        let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(provider()))
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .context("quic client: tls13-only")?
-            .dangerous()
-            .with_custom_certificate_verifier(verifier)
-            .with_no_client_auth();
-        tls.alpn_protocols = vec![ALPN.to_vec()];
-
-        let qcc = QuicClientConfig::try_from(tls).context("quic client config from rustls")?;
         let mut endpoint = Endpoint::client(bind).context("quic client endpoint")?;
-        endpoint.set_default_client_config(ClientConfig::new(Arc::new(qcc)));
+        endpoint.set_default_client_config(build_client_config(pinned_fingerprint_hex)?);
+        Ok(Self { endpoint })
+    }
+
+    /// Like [`client`](Self::client) but adopts an EXISTING (already
+    /// STUN'd + punched) UDP socket. Phase 2.
+    pub fn client_from_socket(
+        socket: std::net::UdpSocket,
+        pinned_fingerprint_hex: &str,
+    ) -> Result<Self> {
+        let runtime = quinn::default_runtime().context("no async runtime for quinn endpoint")?;
+        let mut endpoint = Endpoint::new(quinn::EndpointConfig::default(), None, socket, runtime)
+            .context("quic client endpoint from socket")?;
+        endpoint.set_default_client_config(build_client_config(pinned_fingerprint_hex)?);
         Ok(Self { endpoint })
     }
 
@@ -374,6 +435,55 @@ mod tests {
             assert!(!ip.is_unspecified(), "0.0.0.0 is not dialable: {ip}");
             assert!(ip.is_ipv4(), "Phase-2a gathers IPv4 host candidates only");
         }
+    }
+
+    /// The Phase-2 socket-sharing constructors must produce working
+    /// endpoints: gather candidates on a tokio socket, convert it to
+    /// std, build server/client endpoints from those sockets, and
+    /// round-trip a flow on loopback. Proves quinn's
+    /// `Endpoint::new(socket, ..)` path + the shared config builders.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn quic_from_socket_loopback_roundtrips() {
+        use std::time::Duration;
+
+        let s_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // No STUN servers → host candidates only; we just exercise the
+        // gather + into_std path (the dial below uses the loopback addr).
+        let _ = gather_candidates(&s_sock, &[], Duration::from_millis(200)).await;
+        let s_std = s_sock.into_std().unwrap();
+        let (server, fp) = QuicPeer::server_from_socket(s_std).expect("server_from_socket");
+        let server_addr = server.local_addr().unwrap();
+
+        let c_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let c_std = c_sock.into_std().unwrap();
+        let client = QuicPeer::client_from_socket(c_std, &fp).expect("client_from_socket");
+
+        let srv = tokio::spawn(async move {
+            let conn = server.accept().await.expect("incoming").expect("handshake");
+            let (flow_id, mut send, mut recv) = accept_flow(&conn).await.expect("accept_flow");
+            assert_eq!(
+                flow_id, 3,
+                "flow_id preamble must survive the from-socket path"
+            );
+            let echoed = read_to_end(&mut recv).await;
+            send.write_all(&echoed).await.expect("echo write");
+            send.finish().expect("echo finish");
+            conn.closed().await;
+        });
+
+        let conn = client.connect(server_addr).await.expect("connect");
+        let (mut send, mut recv) = open_flow(&conn, 3).await.expect("open_flow");
+        send.write_all(b"from-socket quic works")
+            .await
+            .expect("write");
+        send.finish().expect("finish");
+        let got = read_to_end(&mut recv).await;
+        assert_eq!(
+            &got, b"from-socket quic works",
+            "round-trip over from-socket"
+        );
+        conn.close(0u32.into(), b"done");
+        let _ = srv.await;
     }
 
     /// Drain a recv stream to EOF into a Vec (test helper).
