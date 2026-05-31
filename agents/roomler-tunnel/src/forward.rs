@@ -157,6 +157,7 @@ pub async fn run(cfg: TunnelConfig, agent_hex: &str, local: u16, remote: &str) -
                     dc_pool_size,
                     sctp_rwnd_bytes,
                     ice_servers,
+                    .. // quic_auth_token consumed in Phase 1e
                 } => {
                     info!(
                         %session_id, %transport, dc_pool_size, sctp_rwnd_bytes,
