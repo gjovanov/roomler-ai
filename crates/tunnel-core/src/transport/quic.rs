@@ -27,7 +27,12 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
-use quinn::{ClientConfig, Connection, Endpoint, RecvStream, SendStream, ServerConfig};
+use quinn::{ClientConfig, Connection, Endpoint, ServerConfig};
+// Re-export the quinn stream + connection types so consumer crates (the
+// agent + tunnel-client) can name flow-stream halves WITHOUT a direct
+// quinn dependency — which would otherwise need its own ring crypto-
+// provider feature config to avoid pulling aws-lc-rs (a C build).
+pub use quinn::{Connection as QuicConnection, RecvStream, SendStream};
 use rustls::DigitallySignedStruct;
 use rustls::SignatureScheme;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
