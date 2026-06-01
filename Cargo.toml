@@ -178,6 +178,18 @@ tokio-tungstenite = { version = "0.28", features = ["rustls-tls-native-roots"] }
 directories = "6"
 toml = "0.9"
 webrtc = "0.12"
+# TURN client + the `webrtc-util` `Conn` trait it yields, for the
+# QUIC-over-TURN relay tiers (Phase 3 Tier 2/3). `tunnel-core`'s
+# `transport::relay::TurnRelayConn` wraps a TURN-relayed `util::Conn`
+# as a quinn `AsyncUdpSocket` so QUIC rides a coturn allocation on
+# symmetric-NAT / UDP-blocked nets. Versions pinned to exactly what the
+# vendored `webrtc-ice` already resolves (`turn` 0.9.0 / `webrtc-util`
+# 0.10.0) so there's a SINGLE `util::Conn` trait instance in the tree —
+# a mismatch would make the `turn` client's `allocate()` hand back a
+# `dyn Conn` from a different crate version that `TurnRelayConn` can't
+# name. Both are pure-Rust (no OpenSSL) so they build under MSVC.
+turn = "0.9"
+webrtc-util = "0.10"
 # Screen capture. `scrap` is pure-X11 on Linux and avoids the libwayland-dev
 # build dep that xcap / screenshots would pull in. Cross-platform: XShm on
 # Linux, DXGI Desktop Duplication on Windows, CoreGraphics on macOS.

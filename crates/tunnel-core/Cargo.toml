@@ -60,5 +60,14 @@ hex = { workspace = true }
 # workspace dep already in the tree; ring/quinn pull it transitively.
 rand = { workspace = true }
 
+# QUIC-over-TURN relay tiers (Phase 3 Tier 2/3). The `turn` client
+# yields a TURN-relayed `util::Conn` that `transport::relay::TurnRelayConn`
+# bridges to quinn's `AsyncUdpSocket`, so QUIC can ride a coturn
+# allocation when direct hole-punch fails. `webrtc-util` (lib name
+# `util`) is the home of the `Conn` trait that `turn` returns. Versions
+# match the vendored `webrtc-ice` resolve — one `util::Conn` in the tree.
+turn = { workspace = true }
+webrtc-util = { workspace = true }
+
 [dev-dependencies]
 tokio-test = { workspace = true }
