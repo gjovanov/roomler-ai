@@ -2392,11 +2392,8 @@ async fn media_pump_ffmpeg_dc(
             }
             Ok(None) => {
                 // No new frame this tick (DXGI only fires on screen change).
-                // Mirror `media_pump`: once we've been idle ≥ IDLE_KEEPALIVE,
-                // re-encode the last good frame so the browser decoder doesn't
-                // pause; otherwise `continue` immediately. No sleep here — the
-                // capture backend's own pacer prevents a hot spin, and adding
-                // a sleep is exactly what dragged fps down pre-rc.93.
+                // Once idle ≥ IDLE_KEEPALIVE, re-encode the last good frame so
+                // the browser decoder doesn't pause.
                 frames_empty += 1;
                 if last_capture_at.elapsed() >= IDLE_KEEPALIVE
                     && let Some(ref f) = last_good_frame
@@ -2404,6 +2401,24 @@ async fn media_pump_ffmpeg_dc(
                     last_capture_at = std::time::Instant::now();
                     f.clone()
                 } else {
+                    // rc.99 — pace empty polls with a short sleep before
+                    // retrying. rc.93 removed the top-of-loop floor (correctly
+                    // — it capped the Some-rate) AND made this `continue`
+                    // immediately, on the assumption the capture backend self-
+                    // paces. That's TRUE for scrap (internal target_frame_period
+                    // sleep) but FALSE for the SystemContext worker, which has
+                    // NO pacer: the pump then spins MILLIONS of empty oneshot
+                    // round-trips/session (frames_empty ≫ frames_encoded),
+                    // saturating the runtime so the real-frame round-trip
+                    // latency spikes intermittently → fps swings (field
+                    // GORAN-XMG-NEO16 2560×1600 SystemContext: cap 7↔117ms,
+                    // fps 9↔67, stuttery). A 2 ms sleep paces empties to
+                    // ~500/s (vs millions) — precise at 1 ms timer resolution
+                    // (win_timer rc.92) — WITHOUT capping the Some-rate (this
+                    // only fires when there's no new frame), so it does NOT
+                    // regress the rc.93 fps win. ~2 ms adds negligible
+                    // frame-catch latency vs a 60 Hz (16 ms) source.
+                    tokio::time::sleep(Duration::from_millis(2)).await;
                     continue;
                 }
             }
