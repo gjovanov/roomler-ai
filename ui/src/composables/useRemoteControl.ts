@@ -1940,6 +1940,14 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         stopHevcPath()
       } else if (msg.type === 'frame-rejected') {
         console.warn('[rc] hevc frame rejected', msg)
+      } else if (msg.type === 'awaiting-keyframe') {
+        // rc.103 — the leading-delta gate is dropping deltas while it waits
+        // for the first IDR (async-encoder DC-open race). Expected for a
+        // few frames right after "hevc DC opened"; a high/growing count
+        // means the agent isn't shipping an IDR (check encoder forced-idr).
+        console.info('[rc] hevc awaiting keyframe — dropped', msg.dropped, 'leading delta(s)')
+      } else if (msg.type === 'keyframe-acquired') {
+        console.info('[rc] hevc first keyframe acquired (dropped', msg.droppedBefore, 'leading delta(s))')
       } else if (msg.type === 'frame-decoded') {
         hevcFramesDecoded.value++
       } else if (msg.type === 'stats') {
