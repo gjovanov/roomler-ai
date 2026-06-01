@@ -6865,6 +6865,7 @@ dependencies = [
  "tracing",
  "turn",
  "webrtc",
+ "webrtc-ice",
  "webrtc-util",
 ]
 

@@ -69,5 +69,13 @@ rand = { workspace = true }
 turn = { workspace = true }
 webrtc-util = { workspace = true }
 
+# Tier 3 (TURNS/TCP, for UDP-blocked corp nets): reuse the vendored
+# `webrtc-ice`'s field-proven `TcpTurnConn` (a `util::Conn` over
+# TLS-over-TCP to coturn, with RFC 5766 §11.5 ChannelData framing) as the
+# `turn` client's underlay. Already in the tree transitively via `webrtc`;
+# declared directly here just to name `webrtc_ice::agent::tcp_turn_conn`.
+# Resolves to `crates/vendored/webrtc-ice` via the root `[patch.crates-io]`.
+webrtc-ice = "0.12.0"
+
 [dev-dependencies]
 tokio-test = { workspace = true }
