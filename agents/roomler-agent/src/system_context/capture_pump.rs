@@ -189,6 +189,14 @@ fn worker_main(
         }
     }
 
+    // rc.105 Phase 0 — log the DXGI adapter/output layout BEFORE picking
+    // a backend, so a single rc:logs-fetch shows which adapter owns the
+    // primary output and whether a render-only dGPU exposes zero outputs
+    // (the Optimus signature behind the GDI-fallback / ~85ms-capture bug
+    // on hybrid hosts like PC55331). Best-effort; never blocks capture.
+    #[cfg(feature = "mf-encoder")]
+    super::dxgi_util::log_adapters_and_outputs();
+
     // 3. Build the primary backend. Prefer DXGI; fall back to GDI if
     //    DXGI fails to initialise (no GPU, driver missing, etc.).
     let mut backend = match build_initial_backend() {
@@ -240,6 +248,7 @@ fn worker_main(
             tracing::info!(
                 worker_avg_capture_ms = avg_ms,
                 calls = worker_capture_calls,
+                backend = backend_name(&backend),
                 "system-context capture: worker-side scrap frame() timing (compare to pump heartbeat avg_capture_ms — the diff is the per-frame async round-trip)"
             );
             worker_capture_us = 0;
@@ -284,6 +293,18 @@ fn backend_dimensions(b: &ActiveBackend) -> (u32, u32) {
         #[cfg(feature = "scrap-capture")]
         ActiveBackend::Dxgi(d) => d.dimensions(),
         ActiveBackend::Gdi(g) => g.dimensions(),
+    }
+}
+
+/// Human-readable name of the active capture backend, for the worker
+/// heartbeat (rc.105 Phase 0 — so a single rc:logs-fetch shows whether
+/// capture is on fast DXGI Desktop Duplication or the slow GDI BitBlt
+/// fallback, the decisive A-vs-B signal for the hybrid-GPU bug).
+fn backend_name(b: &ActiveBackend) -> &'static str {
+    match b {
+        #[cfg(feature = "scrap-capture")]
+        ActiveBackend::Dxgi(_) => "dxgi",
+        ActiveBackend::Gdi(_) => "gdi",
     }
 }
 
