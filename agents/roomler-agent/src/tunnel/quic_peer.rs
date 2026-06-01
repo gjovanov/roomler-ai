@@ -38,6 +38,7 @@ use bson::oid::ObjectId;
 use tokio::sync::{Mutex, oneshot};
 use tracing::{debug, info, warn};
 use tunnel_core::transport::quic::{self, QuicPeer, RecvStream, SendStream};
+use tunnel_core::transport::relay::{RelayConn, RelayUdpSocket};
 
 /// The two stream halves of one QUIC flow.
 pub type FlowStreams = (SendStream, RecvStream);
@@ -62,6 +63,67 @@ pub struct AgentQuicPeer {
     /// closes the quinn endpoint). `_peer` is read only via the accept
     /// task's clone; held here so the session owns its lifetime.
     _peer: Arc<QuicPeer>,
+    /// Phase 3d: present when this peer rides a TURN relay
+    /// (QUIC-over-TURN). Held so [`permit`](Self::permit) can install a
+    /// TURN permission for the client's relay address by sending one
+    /// bootstrap datagram through the same allocation the endpoint uses.
+    /// `None` for a direct (host-candidate) peer.
+    relay: Option<Arc<dyn RelayConn>>,
+}
+
+/// Spawn the accept loop shared by [`AgentQuicPeer::setup`] and
+/// [`AgentQuicPeer::setup_over_relay`]: accept ONE client connection,
+/// validate `quic_auth_token`, then rendezvous each inbound flow stream
+/// to whichever [`AgentQuicPeer::take_flow`] waiter wants it (stashing
+/// streams that arrive before their waiter registers).
+fn spawn_accept_loop(
+    peer: Arc<QuicPeer>,
+    session_id: ObjectId,
+    quic_auth_token: String,
+    rendezvous: Arc<Mutex<Rendezvous>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let conn = match peer.accept().await {
+            Some(Ok(c)) => c,
+            Some(Err(e)) => {
+                warn!(%session_id, %e, "agent quic: accept failed");
+                return;
+            }
+            None => {
+                debug!(%session_id, "agent quic: endpoint closed before connect");
+                return;
+            }
+        };
+        // The server is no longer in the byte path — this token is what
+        // authorizes the dialing client (cert-pinning already
+        // authenticated US to them).
+        if let Err(e) = quic::server_authenticate(&conn, &quic_auth_token).await {
+            warn!(%session_id, %e, "agent quic: client auth FAILED — dropping connection");
+            conn.close(1u32.into(), b"auth failed");
+            return;
+        }
+        info!(%session_id, "agent quic: client authenticated; serving flow streams");
+        loop {
+            match quic::accept_flow(&conn).await {
+                Ok((flow_id, send, recv)) => {
+                    let mut rdv = rendezvous.lock().await;
+                    if let Some(tx) = rdv.waiters.remove(&flow_id) {
+                        // A forward is already waiting — hand it over.
+                        if tx.send((send, recv)).is_err() {
+                            debug!(%session_id, flow_id, "agent quic: forward dropped before stream");
+                        }
+                    } else {
+                        // Stream beat the forward — stash it.
+                        rdv.ready.insert(flow_id, (send, recv));
+                    }
+                }
+                Err(e) => {
+                    debug!(%session_id, %e, "agent quic: accept_flow loop ended");
+                    break;
+                }
+            }
+        }
+    })
 }
 
 impl AgentQuicPeer {
@@ -78,51 +140,12 @@ impl AgentQuicPeer {
         let local_addr = peer.local_addr().context("agent quic: local_addr")?;
         let peer = Arc::new(peer);
         let rendezvous: Arc<Mutex<Rendezvous>> = Arc::new(Mutex::new(Rendezvous::default()));
-
-        let peer_task = Arc::clone(&peer);
-        let rdv_task = Arc::clone(&rendezvous);
-        let accept_task = tokio::spawn(async move {
-            let conn = match peer_task.accept().await {
-                Some(Ok(c)) => c,
-                Some(Err(e)) => {
-                    warn!(%session_id, %e, "agent quic: accept failed");
-                    return;
-                }
-                None => {
-                    debug!(%session_id, "agent quic: endpoint closed before connect");
-                    return;
-                }
-            };
-            // The server is no longer in the byte path — this token is
-            // what authorizes the dialing client (cert-pinning already
-            // authenticated US to them).
-            if let Err(e) = quic::server_authenticate(&conn, &quic_auth_token).await {
-                warn!(%session_id, %e, "agent quic: client auth FAILED — dropping connection");
-                conn.close(1u32.into(), b"auth failed");
-                return;
-            }
-            info!(%session_id, "agent quic: client authenticated; serving flow streams");
-            loop {
-                match quic::accept_flow(&conn).await {
-                    Ok((flow_id, send, recv)) => {
-                        let mut rdv = rdv_task.lock().await;
-                        if let Some(tx) = rdv.waiters.remove(&flow_id) {
-                            // A forward is already waiting — hand it over.
-                            if tx.send((send, recv)).is_err() {
-                                debug!(%session_id, flow_id, "agent quic: forward dropped before stream");
-                            }
-                        } else {
-                            // Stream beat the forward — stash it.
-                            rdv.ready.insert(flow_id, (send, recv));
-                        }
-                    }
-                    Err(e) => {
-                        debug!(%session_id, %e, "agent quic: accept_flow loop ended");
-                        break;
-                    }
-                }
-            }
-        });
+        let accept_task = spawn_accept_loop(
+            Arc::clone(&peer),
+            session_id,
+            quic_auth_token,
+            Arc::clone(&rendezvous),
+        );
 
         Ok(Self {
             session_id,
@@ -131,6 +154,51 @@ impl AgentQuicPeer {
             rendezvous,
             accept_task,
             _peer: peer,
+            relay: None,
+        })
+    }
+
+    /// Phase 3d: like [`setup`](Self::setup) but stand the quinn server
+    /// endpoint up over a TURN-relayed datagram conn (QUIC-over-TURN) for
+    /// symmetric-NAT / UDP-restricted nets where a direct host candidate
+    /// is unreachable. `relay` is a live allocation (from
+    /// [`tunnel_core::transport::relay::allocate_relay_from_ice`]); we
+    /// wrap it in a [`RelayUdpSocket`] for quinn and keep a clone so
+    /// [`permit`](Self::permit) can bootstrap the client's TURN
+    /// permission. [`addrs`](Self::addrs) then reports the **relayed**
+    /// address coturn handed out — what the client dials (over its own
+    /// relay). The accept loop + auth + rendezvous are identical to the
+    /// direct path.
+    pub fn setup_over_relay(
+        session_id: ObjectId,
+        quic_auth_token: String,
+        relay: Arc<dyn RelayConn>,
+    ) -> Result<Self> {
+        let local_addr = relay
+            .local_addr()
+            .context("agent quic relay: relayed local_addr")?;
+        let sock = Arc::new(
+            RelayUdpSocket::new(Arc::clone(&relay)).context("agent quic relay: socket bridge")?,
+        );
+        let (peer, cert_fingerprint) = QuicPeer::server_over_abstract_socket(sock)
+            .context("agent quic relay: server endpoint over relay")?;
+        let peer = Arc::new(peer);
+        let rendezvous: Arc<Mutex<Rendezvous>> = Arc::new(Mutex::new(Rendezvous::default()));
+        let accept_task = spawn_accept_loop(
+            Arc::clone(&peer),
+            session_id,
+            quic_auth_token,
+            Arc::clone(&rendezvous),
+        );
+
+        Ok(Self {
+            session_id,
+            cert_fingerprint,
+            local_addr,
+            rendezvous,
+            accept_task,
+            _peer: peer,
+            relay: Some(relay),
         })
     }
 
@@ -162,6 +230,32 @@ impl AgentQuicPeer {
             }
         } else {
             vec![self.local_addr.to_string()]
+        }
+    }
+
+    /// Phase 3d: install a TURN permission for `client_addr` by sending
+    /// one bootstrap datagram to it through this peer's relay allocation.
+    /// The agent is the QUIC *server* and never sends first, so without a
+    /// pre-installed permission for the client's relay address coturn
+    /// silently drops the client's opening Initials. Called from the
+    /// signaling loop on `rc:tunnel.quic.candidate`. The stray byte is
+    /// discarded by the client's quinn as a too-short packet; QUIC's
+    /// Initial retransmission covers any install/handshake race. A no-op
+    /// (`Ok`) for a direct (non-relay) peer — there is nothing to permit.
+    pub async fn permit(&self, client_addr: SocketAddr) -> Result<()> {
+        match &self.relay {
+            Some(relay) => {
+                relay
+                    .send_to(b"\x00", client_addr)
+                    .await
+                    .with_context(|| format!("agent quic: permit bootstrap to {client_addr}"))?;
+                debug!(session_id = %self.session_id, %client_addr, "agent quic: TURN permission installed");
+                Ok(())
+            }
+            None => {
+                debug!(session_id = %self.session_id, %client_addr, "agent quic: permit on direct peer — ignoring");
+                Ok(())
+            }
         }
     }
 
@@ -268,6 +362,68 @@ mod tests {
         assert!(
             r.is_err(),
             "no flow may be served to an unauthenticated client"
+        );
+        agent.close();
+    }
+
+    /// Phase 3d: the agent's QUIC-over-relay path. The agent peer stands
+    /// up its quinn server over a [`RelayConn`] (here two loopback UDP
+    /// sockets stand in for two coturn allocations — the real
+    /// permission-gated TURN path is proven in tunnel-core's
+    /// `quinn_runs_over_two_turn_allocations`), reports its relay addr via
+    /// `addrs()`, `permit`s the client's relay addr, and a client riding
+    /// its own relay socket connects + authenticates + delivers a flow
+    /// through the same rendezvous the direct path uses.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_quic_over_relay_delivers_flow() {
+        use tunnel_core::transport::relay::UdpRelayConn;
+
+        let agent_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let agent_relay_addr = agent_sock.local_addr().unwrap();
+        let client_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_relay_addr = client_sock.local_addr().unwrap();
+        let agent_relay: Arc<dyn RelayConn> = Arc::new(UdpRelayConn(agent_sock));
+        let client_relay: Arc<dyn RelayConn> = Arc::new(UdpRelayConn(client_sock));
+
+        let session_id = ObjectId::new();
+        let token = "relay-session-token";
+        let agent = AgentQuicPeer::setup_over_relay(
+            session_id,
+            token.to_string(),
+            Arc::clone(&agent_relay),
+        )
+        .unwrap();
+        assert_eq!(
+            agent.addrs(),
+            vec![agent_relay_addr.to_string()],
+            "a relay peer advertises its relayed address (not 0.0.0.0/host)"
+        );
+        let fingerprint = agent.cert_fingerprint().to_string();
+
+        // What the signaling candidate handler does: permit the client's
+        // relay addr (no-op over plain UDP, but exercises the path).
+        agent.permit(client_relay_addr).await.unwrap();
+
+        // Client endpoint over ITS relay socket, pinned to the agent cert.
+        let csock = Arc::new(RelayUdpSocket::new(Arc::clone(&client_relay)).unwrap());
+        let client = ClientQuicPeer::client_over_abstract_socket(csock, &fingerprint).unwrap();
+
+        let (taken, _drive) =
+            tokio::join!(agent.take_flow(9, Duration::from_secs(10)), async move {
+                let conn = client.connect(agent_relay_addr).await.unwrap();
+                quic::client_authenticate(&conn, token).await.unwrap();
+                let (mut send, _recv) = quic::open_flow(&conn, 9).await.unwrap();
+                send.write_all(b"flow bytes over the relay").await.unwrap();
+                send.finish().unwrap();
+                // Hold the connection open until the agent has read the flow.
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            });
+
+        let (_a_send, mut a_recv) = taken.expect("agent must receive flow 9 over the relay");
+        let buf = a_recv.read_to_end(64 * 1024).await.unwrap();
+        assert_eq!(
+            &buf, b"flow bytes over the relay",
+            "flow bytes must survive the relay socket bridge"
         );
         agent.close();
     }
