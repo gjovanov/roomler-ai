@@ -200,6 +200,28 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Uninstall older roomler-agent MSI versions left behind on this
+    /// host. The release pipeline puts the rc number in the MSI 4th
+    /// version field (`0.3.0.N`), which Windows Installer ignores for
+    /// upgrade comparison — so `MajorUpgrade` never removes the prior
+    /// version and they pile up. This removes every install of THIS
+    /// flavour strictly OLDER than the running version; it never touches
+    /// the current version, a newer one, or the other flavour.
+    ///
+    /// perMachine uninstall needs elevation — run from an admin shell.
+    /// Start with `--dry-run` to see exactly what would be removed.
+    #[command(name = "sweep-old-versions")]
+    SweepOldVersions {
+        /// Print what WOULD be uninstalled without removing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Override flavour autodetection (`perUser` | `perMachine`).
+        /// Default: inferred from the running EXE's path — but a
+        /// cargo-built dev binary always classifies as perUser, so pass
+        /// this to sweep perMachine products from a non-installed build.
+        #[arg(long)]
+        flavour: Option<String>,
+    },
     /// Approve or deny a pending operator-consent prompt for a remote-
     /// control session. Used when the agent's `auto_grant_session` is
     /// `false` (org-controlled fleets). The agent watches a sentinel
@@ -621,6 +643,9 @@ async fn main() -> Result<()> {
             target_flavour,
             dry_run,
         } => cleanup_legacy_install_cmd(&target_flavour, dry_run),
+        Command::SweepOldVersions { dry_run, flavour } => {
+            sweep_old_versions_cmd(dry_run, flavour.as_deref())
+        }
         Command::Consent {
             session,
             approve,
@@ -710,6 +735,34 @@ fn cleanup_legacy_install_cmd(target_flavour: &str, dry_run: bool) -> Result<()>
     if !report.errors.is_empty() {
         for e in &report.errors {
             tracing::warn!(error = %e, "cleanup-legacy-install: partial failure");
+        }
+    }
+    Ok(())
+}
+
+/// Uninstall roomler-agent MSI versions older than the running one
+/// (see [`roomler_agent::version_sweep`] for why they pile up). Prints
+/// a one-line summary; exits 0 even on partial failure (best-effort,
+/// like `cleanup-legacy-install`). Use `--dry-run` to preview.
+fn sweep_old_versions_cmd(dry_run: bool, flavour: Option<&str>) -> Result<()> {
+    let flavour_override = match flavour {
+        Some(s) => match roomler_agent::install_detect::Flavour::parse(s) {
+            Some(f) => Some(f),
+            None => {
+                eprintln!(
+                    "sweep-old-versions: unrecognised --flavour {s:?}; \
+                     expected `perUser` or `perMachine`"
+                );
+                return Ok(());
+            }
+        },
+        None => None,
+    };
+    let report = roomler_agent::version_sweep::run_sweep(dry_run, flavour_override)?;
+    println!("{}", report.summary());
+    if !report.errors.is_empty() {
+        for e in &report.errors {
+            tracing::warn!(error = %e, "sweep-old-versions: partial failure");
         }
     }
     Ok(())

@@ -37,6 +37,7 @@ pub mod signaling;
 pub mod system_context;
 pub mod tunnel;
 pub mod updater;
+pub mod version_sweep;
 pub mod watchdog;
 #[cfg(target_os = "windows")]
 pub mod win32_monitors;
