@@ -61,6 +61,11 @@
 pub mod capture_pump;
 pub mod desktop_rebind;
 pub mod dxgi_dup;
+// rc.105 Phase 0 — DXGI adapter/output enumeration for the hybrid-GPU
+// capture diagnostics. Uses the `windows` crate, gated on `mf-encoder`
+// (present in the production `full-hw` build).
+#[cfg(feature = "mf-encoder")]
+pub mod dxgi_util;
 pub mod gdi_backend;
 pub mod peer_presence;
 pub mod user_profile;
