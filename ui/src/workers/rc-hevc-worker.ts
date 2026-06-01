@@ -158,19 +158,27 @@ function initDecoder() {
       // gap without another round-trip.
       const codedW = frame.codedWidth || frame.displayWidth
       const codedH = frame.codedHeight || frame.displayHeight
-      statsLastWidth = codedW
-      statsLastHeight = codedH
-      paintFrame(frame, codedW, codedH)
+      // rc.101 — capture the diagnostic dims BEFORE paintFrame() calls
+      // frame.close(); a closed VideoFrame reports 0/null (rc.100 logged
+      // {0,0}/null for exactly this reason — the functional codedW was read
+      // pre-close so the fix still worked, but the diag was useless).
+      let firstFrameMsg: Record<string, unknown> | null = null
       if (framesDecoded === 1) {
         const vr = frame.visibleRect
-        workerScope.postMessage({
+        firstFrameMsg = {
           type: 'first-frame',
           width: codedW,
           height: codedH,
           coded: { w: frame.codedWidth, h: frame.codedHeight },
           display: { w: frame.displayWidth, h: frame.displayHeight },
           visible: vr ? { x: vr.x, y: vr.y, w: vr.width, h: vr.height } : null,
-        })
+        }
+      }
+      statsLastWidth = codedW
+      statsLastHeight = codedH
+      paintFrame(frame, codedW, codedH)
+      if (firstFrameMsg) {
+        workerScope.postMessage(firstFrameMsg)
       } else {
         workerScope.postMessage({ type: 'frame-decoded', count: framesDecoded })
       }
