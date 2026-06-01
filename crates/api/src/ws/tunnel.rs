@@ -285,6 +285,13 @@ pub async fn handle_tunnel_client_socket(
                 relay_ice_to_agent(&state, session.as_ref(), session_id, candidate).await;
             }
 
+            ClientMsg::TunnelQuicCandidate { session_id, addrs } => {
+                // QUIC-over-TURN (Phase 3c): the client's relay
+                // address(es). Relay to the agent so it can install a
+                // TURN permission for the client BEFORE the handshake.
+                relay_quic_candidate_to_agent(&state, session.as_ref(), session_id, addrs).await;
+            }
+
             ClientMsg::TunnelSdpAnswer { .. } => {
                 // Clients only emit offers, agents only emit answers.
                 // A client SDP answer means the wire is being abused.
@@ -488,6 +495,17 @@ async fn handle_tunnel_open(
         })
         .await;
 
+    // QUIC-over-TURN (Phase 3c): mint short-lived coturn creds for THIS
+    // session and hand the SAME set to both peers so each can allocate
+    // its own TURN relay. Empty when no TURN `shared_secret` is
+    // configured (dev / direct-only) — the QUIC path then stays on
+    // host/srflx candidates. `user_id` for the HMAC is the session id so
+    // both peers derive identical, session-scoped creds.
+    let quic_ice_servers = roomler_ai_remote_control::turn_creds::ice_servers_for(
+        &tunnel_session_id.to_hex(),
+        crate::state::build_turn_config(&state.settings.turn).as_ref(),
+    );
+
     // For quic-v1, tell the agent to stand up its endpoint + authorize
     // this token NOW. The client is already registered in
     // `tunnel_clients_by_session` (step 4), so the agent's
@@ -499,6 +517,7 @@ async fn handle_tunnel_open(
             ServerMsg::TunnelQuicSetup {
                 session_id: tunnel_session_id,
                 quic_auth_token: token,
+                ice_servers: quic_ice_servers.clone(),
             },
         )
     {
@@ -517,7 +536,7 @@ async fn handle_tunnel_open(
             transport: negotiated_transport,
             dc_pool_size: 8,
             sctp_rwnd_bytes: 8 * 1024 * 1024,
-            ice_servers: vec![],
+            ice_servers: quic_ice_servers,
             quic_auth_token,
         },
     )
@@ -1027,6 +1046,32 @@ async fn relay_ice_to_agent(
         },
     ) {
         debug!(%request_session_id, %e, "tunnel ICE relay to agent failed");
+    }
+}
+
+/// Relay the tunnel-client's QUIC relay candidate(s) to the agent so it
+/// can install a TURN permission for the client's relay address before
+/// the QUIC handshake (Phase 3c). Mirror of [`relay_ice_to_agent`].
+async fn relay_quic_candidate_to_agent(
+    state: &AppState,
+    session: Option<&TunnelSession>,
+    request_session_id: ObjectId,
+    addrs: Vec<String>,
+) {
+    let Some(s) = session else {
+        return;
+    };
+    if s.tunnel_session_id != request_session_id {
+        return;
+    }
+    if let Err(e) = state.rc_hub.send_to_agent(
+        s.agent_id,
+        ServerMsg::TunnelQuicCandidate {
+            session_id: request_session_id,
+            addrs,
+        },
+    ) {
+        debug!(%request_session_id, %e, "tunnel QUIC candidate relay to agent failed");
     }
 }
 
