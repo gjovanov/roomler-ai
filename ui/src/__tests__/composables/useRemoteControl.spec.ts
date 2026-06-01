@@ -35,7 +35,8 @@ import {
   type KeyDecision,
 } from '@/composables/useRemoteControl'
 import { codecMimeForShort } from '@/workers/rc-webcodecs-worker'
-import { parseFrameHeader, isKeyframe } from '@/workers/rc-vp9-444-worker'
+import { parseFrameHeader, isKeyframe, shouldDecodeFrame } from '@/workers/rc-vp9-444-worker'
+import { shouldDecodeFrame as shouldDecodeFrameHevc } from '@/workers/rc-hevc-worker'
 
 function keyEvent(code: string, mods: Partial<{ ctrl: boolean; alt: boolean; meta: boolean; shift: boolean }> = {}): KeyboardEvent {
   return {
@@ -1308,6 +1309,52 @@ describe('rc-vp9-444-worker frame header', () => {
     const parsed = parseFrameHeader(header)
     expect(parsed!.payloadSize).toBe(8_000_000)
   })
+})
+
+describe('leading-delta keyframe gate (rc.103)', () => {
+  // Locks the fix for the LAPTOP-P2TU89GB hevc_qsv failure: the HW decoder
+  // throws "A key frame is required after configure() or flush()" on a
+  // leading delta, and the FFmpeg async encoder can ship a buffered delta
+  // ahead of the DC-open IDR. The worker must DROP deltas until the first
+  // keyframe, then decode everything.
+  for (const [label, gate] of [
+    ['vp9-444', shouldDecodeFrame],
+    ['hevc', shouldDecodeFrameHevc],
+  ] as const) {
+    describe(label, () => {
+      it('drops a leading delta before any keyframe is seen', () => {
+        expect(gate(false, false)).toBe(false)
+      })
+
+      it('always accepts a keyframe (the resync/start point)', () => {
+        expect(gate(false, true)).toBe(true)
+      })
+
+      it('accepts deltas once a keyframe has been seen', () => {
+        expect(gate(true, false)).toBe(true)
+      })
+
+      it('keeps accepting keyframes mid-stream', () => {
+        expect(gate(true, true)).toBe(true)
+      })
+
+      it('models the DC-open race: drop deltas, latch on the IDR, then flow', () => {
+        // Stream the worker would assemble right after "DC opened" on an
+        // async encoder: a few buffered deltas, then the forced IDR, then
+        // normal GOP. The gate state flips on the first keyframe.
+        const stream = [false, false, false, true, false, false, true, false]
+        let seen = false
+        const decoded: boolean[] = []
+        for (const isKey of stream) {
+          const accept = gate(seen, isKey)
+          decoded.push(accept)
+          if (accept && isKey) seen = true
+        }
+        // First three leading deltas dropped; everything from the IDR on decodes.
+        expect(decoded).toEqual([false, false, false, true, true, true, true, true])
+      })
+    })
+  }
 })
 
 describe('RC_RECONNECT_LADDER_MS', () => {

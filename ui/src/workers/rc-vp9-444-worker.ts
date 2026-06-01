@@ -60,6 +60,17 @@ let decoder: VideoDecoder | null = null
 let configured = false
 let framesDecoded = 0
 let framesReceived = 0
+// rc.103 — leading-delta gate, mirrored from rc-hevc-worker. The
+// VideoDecoder rejects a delta as its FIRST input ("A key frame is
+// required after configure() or flush()"). The libvpx pump that feeds
+// this worker is synchronous (the first emitted packet is already the
+// IDR) so the gate normally passes immediately — but the FFmpeg vp9_qsv
+// path is async (pipeline depth) and can drain a buffered delta ahead of
+// the DC-open IDR, exactly like the HEVC failure on LAPTOP-P2TU89GB. Drop
+// leading deltas until the first keyframe so neither feeder can wedge the
+// decode path into a permanent <video> fallback.
+let sawKeyframe = false
+let framesSkippedAwaitingKey = 0
 
 /** Rolling-window stats for the HUD. Computed in the worker so the
  *  main thread doesn't need to touch the DC traffic. Bitrate is
@@ -270,6 +281,24 @@ function emitFrame(): void {
   const payload = assembler.payloadBuf
   if (!payload) return
   const isKey = (assembler.pendingFlags & FLAG_KEYFRAME) !== 0
+  // rc.103 — gate on the first keyframe (see `sawKeyframe` note above).
+  if (!shouldDecodeFrame(sawKeyframe, isKey)) {
+    framesSkippedAwaitingKey++
+    if (framesSkippedAwaitingKey === 1 || framesSkippedAwaitingKey % 60 === 0) {
+      workerScope.postMessage({
+        type: 'awaiting-keyframe',
+        dropped: framesSkippedAwaitingKey,
+      })
+    }
+    return
+  }
+  if (isKey && !sawKeyframe) {
+    sawKeyframe = true
+    workerScope.postMessage({
+      type: 'keyframe-acquired',
+      droppedBefore: framesSkippedAwaitingKey,
+    })
+  }
   // EncodedVideoChunk.timestamp is a microsecond integer per spec.
   // We pass the agent-side capture timestamp through unmodified —
   // VideoDecoder uses it for ordering / frame.timestamp passthrough.
@@ -317,6 +346,9 @@ function teardown(): void {
   ctx = null
   framesDecoded = 0
   framesReceived = 0
+  // rc.103 — re-arm the leading-delta gate for the next decoder.
+  sawKeyframe = false
+  framesSkippedAwaitingKey = 0
   assembler.headerHave = 0
   assembler.payloadBuf = null
   assembler.payloadHave = 0
@@ -351,4 +383,11 @@ export function parseFrameHeader(buf: Uint8Array): {
 
 export function isKeyframe(flags: number): boolean {
   return (flags & FLAG_KEYFRAME) !== 0
+}
+
+/** rc.103 — leading-delta gate decision, pure for vitest. A delta is only
+ *  decodable once a keyframe has been seen; a keyframe is always decodable.
+ *  Mirrors rc-hevc-worker so the wire-level invariant is shared. */
+export function shouldDecodeFrame(hasSeenKeyframe: boolean, isKey: boolean): boolean {
+  return hasSeenKeyframe || isKey
 }

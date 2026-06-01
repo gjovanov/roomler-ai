@@ -74,6 +74,20 @@ let decoder: VideoDecoder | null = null
 let configured = false
 let framesDecoded = 0
 let framesReceived = 0
+// rc.103 — leading-delta gate. The HW HEVC decoder rejects a delta as
+// its FIRST input after configure()/flush() ("A key frame is required").
+// The agent's FFmpeg QSV/NVENC encoder is ASYNC (pipeline depth): at the
+// instant the DC reaches Open, the packet draining is a buffered delta
+// from earlier in the encoder queue — it ships ahead of the freshly-forced
+// IDR (rc.97 force-kf-on-open), so the browser's first ASSEMBLED frame is
+// sometimes a delta. Field LAPTOP-P2TU89GB (hevc_qsv) hit exactly this:
+// "hevc DC opened" → "decode-error: A key frame is required" → permanent
+// <video> fallback. The libvpx VP9-444 path never hit it because libvpx is
+// synchronous (request_keyframe → the very next packet IS the IDR). Drop
+// leading deltas until the first keyframe; the IDR is only a handful of
+// frames behind them in the async queue, so the wait is a few ms.
+let sawKeyframe = false
+let framesSkippedAwaitingKey = 0
 
 /** Rolling-window stats for the HUD, matching the VP9-444 worker so
  *  the composable can consume both with the same message shape. */
@@ -307,6 +321,29 @@ function emitFrame(): void {
   const payload = assembler.payloadBuf
   if (!payload) return
   const isKey = (assembler.pendingFlags & FLAG_KEYFRAME) !== 0
+  // rc.103 — gate on the first keyframe (see `sawKeyframe` note above).
+  // Feeding a leading delta to the HW decoder throws "A key frame is
+  // required" and the composable then tears the whole HEVC path down to
+  // <video>. Drop deltas until the IDR (right behind them) arrives.
+  if (!shouldDecodeFrame(sawKeyframe, isKey)) {
+    framesSkippedAwaitingKey++
+    // One-shot + periodic diagnostic so the field log shows the gate
+    // engaged (and how many deltas it ate) without flooding.
+    if (framesSkippedAwaitingKey === 1 || framesSkippedAwaitingKey % 60 === 0) {
+      workerScope.postMessage({
+        type: 'awaiting-keyframe',
+        dropped: framesSkippedAwaitingKey,
+      })
+    }
+    return
+  }
+  if (isKey && !sawKeyframe) {
+    sawKeyframe = true
+    workerScope.postMessage({
+      type: 'keyframe-acquired',
+      droppedBefore: framesSkippedAwaitingKey,
+    })
+  }
   const ts = Number(assembler.pendingTimestampUs)
   try {
     const chunk = new EncodedVideoChunk({
@@ -355,6 +392,10 @@ function teardown(): void {
   ctx = null
   framesDecoded = 0
   framesReceived = 0
+  // rc.103 — re-arm the leading-delta gate so a fresh decoder (re-connect
+  // / re-negotiation) again waits for an IDR before its first decode().
+  sawKeyframe = false
+  framesSkippedAwaitingKey = 0
   assembler.headerHave = 0
   assembler.payloadBuf = null
   assembler.payloadHave = 0
@@ -388,4 +429,14 @@ export function parseFrameHeader(buf: Uint8Array): {
 
 export function isKeyframe(flags: number): boolean {
   return (flags & FLAG_KEYFRAME) !== 0
+}
+
+/** rc.103 — leading-delta gate decision, pure for vitest. Returns whether
+ *  a frame should be fed to `decoder.decode()`: a delta is only decodable
+ *  once a keyframe has already been seen; a keyframe is always decodable.
+ *  This is the guard that stops the HW HEVC decoder throwing "A key frame
+ *  is required after configure() or flush()" on a leading delta — the
+ *  field LAPTOP-P2TU89GB hevc_qsv failure (async-encoder DC-open race). */
+export function shouldDecodeFrame(hasSeenKeyframe: boolean, isKey: boolean): boolean {
+  return hasSeenKeyframe || isKey
 }
