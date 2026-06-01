@@ -144,27 +144,42 @@ function initDecoder() {
     output: (frame) => {
       framesDecoded++
       statsFramesInWindow++
-      // rc.100 — Chrome's NVDEC HEVC decode reports a SHRUNKEN
-      // displayWidth/Height for our hevc_nvenc stream (field GORAN-XMG-NEO16,
-      // RTX 5090: agent encodes 2560×1600 — proven by the pump heartbeat —
-      // but `displayWidth/Height` come out 1280×720, and the aspect even
-      // changes 16:10→16:9, so it is NOT a clean SAR). Drive the canvas +
-      // the reported intrinsic dims from the decoded buffer's CODED size,
-      // which is the true resolution — this restores correct geometry
-      // (canvas aspect AND the controller's mouse-normalisation, both of
-      // which were broken by the 16:9 displayWidth). `displayWidth`/
-      // `visibleRect` are forwarded in the one-shot first-frame message
-      // purely as a field diagnostic so we can confirm the coded↔display
-      // gap without another round-trip.
+      // rc.100/rc.102 — Chrome's NVDEC HEVC decode mis-reports the picture
+      // geometry for our hevc_nvenc stream (field GORAN-XMG-NEO16, RTX 5090):
+      // the agent encodes a FULL 2560×1600 desktop (proven by the FFmpeg DC
+      // pump heartbeat: w=2560 h=1600 enc=hevc_nvenc, ~3 MB/window), but the
+      // decoded VideoFrame carries a SPURIOUS conformance window —
+      // codedWidth/Height = 2560×1600 yet visibleRect/displayWidth = 1280×720
+      // at offset (0,0). `drawImage` honours visibleRect, so we were painting
+      // only the top-left region. The coded pixels ARE the whole desktop, so
+      // re-wrap the frame with visibleRect = the full coded rect and render
+      // THAT. Intel hevc_qsv is unaffected (visibleRect already == coded), so
+      // the re-wrap is a no-op there. (rc.100 first moved to codedWidth for the
+      // reported intrinsic; rc.102 also overrides the crop drawImage honours.)
       const codedW = frame.codedWidth || frame.displayWidth
       const codedH = frame.codedHeight || frame.displayHeight
-      // rc.101 — capture the diagnostic dims BEFORE paintFrame() calls
-      // frame.close(); a closed VideoFrame reports 0/null (rc.100 logged
-      // {0,0}/null for exactly this reason — the functional codedW was read
-      // pre-close so the fix still worked, but the diag was useless).
+      const vr = frame.visibleRect
+      let render: VideoFrame = frame
+      let rewrapped = false
+      if (
+        frame.codedWidth > 0 &&
+        frame.codedHeight > 0 &&
+        vr &&
+        (vr.width !== frame.codedWidth || vr.height !== frame.codedHeight)
+      ) {
+        try {
+          render = new VideoFrame(frame, {
+            visibleRect: { x: 0, y: 0, width: frame.codedWidth, height: frame.codedHeight },
+          })
+          rewrapped = true
+        } catch {
+          render = frame // re-wrap rejected → fall back to the cropped frame
+        }
+      }
+      // Capture the one-shot diagnostic BEFORE paintFrame() calls close()
+      // (a closed VideoFrame reports 0/null — rc.100 logged {0,0} this way).
       let firstFrameMsg: Record<string, unknown> | null = null
       if (framesDecoded === 1) {
-        const vr = frame.visibleRect
         firstFrameMsg = {
           type: 'first-frame',
           width: codedW,
@@ -172,11 +187,13 @@ function initDecoder() {
           coded: { w: frame.codedWidth, h: frame.codedHeight },
           display: { w: frame.displayWidth, h: frame.displayHeight },
           visible: vr ? { x: vr.x, y: vr.y, w: vr.width, h: vr.height } : null,
+          rewrapped,
         }
       }
       statsLastWidth = codedW
       statsLastHeight = codedH
-      paintFrame(frame, codedW, codedH)
+      paintFrame(render, codedW, codedH)
+      if (rewrapped) frame.close() // paintFrame closed `render`; close the original too
       if (firstFrameMsg) {
         workerScope.postMessage(firstFrameMsg)
       } else {
