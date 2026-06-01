@@ -144,13 +144,33 @@ function initDecoder() {
     output: (frame) => {
       framesDecoded++
       statsFramesInWindow++
-      const w = frame.displayWidth
-      const h = frame.displayHeight
-      statsLastWidth = w
-      statsLastHeight = h
-      paintFrame(frame)
+      // rc.100 — Chrome's NVDEC HEVC decode reports a SHRUNKEN
+      // displayWidth/Height for our hevc_nvenc stream (field GORAN-XMG-NEO16,
+      // RTX 5090: agent encodes 2560×1600 — proven by the pump heartbeat —
+      // but `displayWidth/Height` come out 1280×720, and the aspect even
+      // changes 16:10→16:9, so it is NOT a clean SAR). Drive the canvas +
+      // the reported intrinsic dims from the decoded buffer's CODED size,
+      // which is the true resolution — this restores correct geometry
+      // (canvas aspect AND the controller's mouse-normalisation, both of
+      // which were broken by the 16:9 displayWidth). `displayWidth`/
+      // `visibleRect` are forwarded in the one-shot first-frame message
+      // purely as a field diagnostic so we can confirm the coded↔display
+      // gap without another round-trip.
+      const codedW = frame.codedWidth || frame.displayWidth
+      const codedH = frame.codedHeight || frame.displayHeight
+      statsLastWidth = codedW
+      statsLastHeight = codedH
+      paintFrame(frame, codedW, codedH)
       if (framesDecoded === 1) {
-        workerScope.postMessage({ type: 'first-frame', width: w, height: h })
+        const vr = frame.visibleRect
+        workerScope.postMessage({
+          type: 'first-frame',
+          width: codedW,
+          height: codedH,
+          coded: { w: frame.codedWidth, h: frame.codedHeight },
+          display: { w: frame.displayWidth, h: frame.displayHeight },
+          visible: vr ? { x: vr.x, y: vr.y, w: vr.width, h: vr.height } : null,
+        })
       } else {
         workerScope.postMessage({ type: 'frame-decoded', count: framesDecoded })
       }
@@ -278,15 +298,19 @@ function emitFrame(): void {
   }
 }
 
-function paintFrame(frame: VideoFrame): void {
+function paintFrame(frame: VideoFrame, w: number, h: number): void {
   if (!canvas || !ctx) {
     frame.close()
     return
   }
   try {
-    if (canvas.width !== frame.displayWidth) canvas.width = frame.displayWidth
-    if (canvas.height !== frame.displayHeight) canvas.height = frame.displayHeight
-    ctx.drawImage(frame, 0, 0)
+    if (canvas.width !== w) canvas.width = w
+    if (canvas.height !== h) canvas.height = h
+    // rc.100 — pass the explicit dest rect. The bare `drawImage(frame, 0, 0)`
+    // uses the frame's `displayWidth/Height` as its natural size, which is
+    // exactly the shrunken value we're routing around; an explicit dest of
+    // the coded size keeps the output at full resolution.
+    ctx.drawImage(frame, 0, 0, w, h)
   } catch {
     /* canvas lost mid-teardown */
   } finally {

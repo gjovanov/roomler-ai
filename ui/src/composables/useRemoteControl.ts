@@ -1919,7 +1919,14 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         mediaIntrinsicW.value = msg.width
         mediaIntrinsicH.value = msg.height
         hevcFramesDecoded.value = Math.max(hevcFramesDecoded.value, 1)
-        console.info('[rc] hevc first frame', msg.width, 'x', msg.height)
+        // rc.100 — the worker now reports the CODED size as width/height and
+        // forwards coded/display/visibleRect for field diagnosis. Logging the
+        // gap localises the NVDEC HEVC dim mismatch (GORAN-XMG-NEO16: agent
+        // encodes 2560×1600 but display came out 1280×720).
+        console.info(
+          '[rc] hevc first frame', msg.width, 'x', msg.height,
+          '| coded', msg.coded, 'display', msg.display, 'visible', msg.visible,
+        )
       } else if (msg.type === 'decoder-configured') {
         console.info('[rc] hevc decoder configured', msg.codec)
       } else if (msg.type === 'decoder-error'
