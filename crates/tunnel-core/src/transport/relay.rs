@@ -40,6 +40,12 @@ use tokio::sync::mpsc;
 // renamed to `util`; we use the real name here).
 use turn::client::{Client, ClientConfig};
 use webrtc_util::conn::Conn as UtilConn;
+// Tier 3 (TURNS/TCP): the vendored `webrtc-ice`'s field-proven `util::Conn`
+// adapter over TLS-over-TCP to coturn. `webrtc-ice` resolves to
+// `crates/vendored/webrtc-ice` via the root `[patch.crates-io]`, and its
+// `util` is the SAME `webrtc-util 0.10` `turn` 0.9 uses — so a
+// `TcpTurnConn` is accepted as `ClientConfig.conn` with no type bridging.
+use webrtc_ice::agent::tcp_turn_conn::TcpTurnConn;
 
 /// A relayed datagram connection — the subset of a TURN-relayed
 /// `util::Conn` that [`RelayUdpSocket`] needs. Phase 3b implements this
@@ -380,6 +386,43 @@ pub fn turn_udp_server(urls: &[String]) -> Option<String> {
     None
 }
 
+/// Pick the first `turns:HOST:PORT?transport=tcp` (TLS-over-TCP) TURN
+/// server from an ICE-server URL list, returning `(host, port)`. The host
+/// is kept UNRESOLVED — Tier 3 needs the hostname for TLS SNI + cert
+/// verification ([`TcpTurnConn`] connects + handshakes to it). `turn:`
+/// (plain) and the TURNS-over-UDP (DTLS) flavour are skipped — the
+/// `TcpTurnConn` adapter rides TCP only, so an explicit `transport=tcp` is
+/// required.
+pub fn turn_tls_server(urls: &[String]) -> Option<(String, u16)> {
+    for url in urls {
+        let Some(rest) = url.strip_prefix("turns:") else {
+            continue; // skip stun: / plain turn:
+        };
+        let (hostport, query) = match rest.split_once('?') {
+            Some((hp, q)) => (hp, Some(q)),
+            None => (rest, None),
+        };
+        let is_tcp = match query {
+            None => false, // no transport ⇒ DTLS/UDP default, which we can't ride
+            Some(q) => q
+                .split('&')
+                .any(|kv| kv.eq_ignore_ascii_case("transport=tcp")),
+        };
+        if !is_tcp {
+            continue;
+        }
+        // rsplit so a bare hostname:port splits correctly (coturn URLs use
+        // a hostname, never a bracketed IPv6 literal, so this is safe).
+        if let Some((host, port_str)) = hostport.rsplit_once(':')
+            && let Ok(port) = port_str.parse::<u16>()
+            && !host.is_empty()
+        {
+            return Some((host.to_string(), port));
+        }
+    }
+    None
+}
+
 /// Initial realm handed to the `turn` client. coturn in `use-auth-secret`
 /// (REST) mode returns its own realm in the 401 challenge and the
 /// webrtc-rs client OVERWRITES this with the challenge realm before
@@ -388,32 +431,147 @@ pub fn turn_udp_server(urls: &[String]) -> Option<String> {
 /// the production realm for tidiness.
 const DEFAULT_TURN_REALM: &str = "roomler.ai";
 
-/// Allocate a TURN relay from coturn ICE-server credentials: pick the UDP
-/// TURN url, resolve its `host:port`, and [`allocate_turn_relay`].
-/// `username` + `credential` are the short-lived REST-API creds the
-/// server minted (`turn_creds::ice_servers_for`). This is the Phase-3d
-/// entry both the agent and the tunnel-client call once they hold their
-/// per-session creds.
+/// Cap on the UDP TURN-allocate attempt before falling back to TURNS/TCP.
+/// On a UDP-OK net the allocate completes in ~1 RTT; on a net that blocks
+/// outbound UDP to coturn the `turn` client would otherwise retransmit for
+/// ~tens of seconds before erroring, so we bound it and switch to Tier 3.
+const UDP_ALLOC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Allocate a TURN relay from coturn ICE-server credentials, trying the
+/// connectivity tiers in order:
+/// * **Tier 2** — UDP relay (`turn:…?transport=udp`); the common path.
+/// * **Tier 3** — TURNS/TCP relay (`turns:…?transport=tcp`) via the
+///   vendored [`TcpTurnConn`]; for corp nets that block ALL outbound UDP.
+///
+/// `username` + `credential` are the short-lived REST-API creds the server
+/// minted (`turn_creds::ice_servers_for`). Returns the first tier that
+/// establishes an allocation. **The relay tier is independent per peer** —
+/// coturn hands each side a public relayed address that interoperates
+/// regardless of how the *other* peer reached coturn — so the agent +
+/// tunnel-client need not agree on a tier. This is the Phase-3 entry both
+/// the agent and the client call once they hold their per-session creds.
 pub async fn allocate_relay_from_ice(
     urls: &[String],
     username: &str,
     credential: &str,
 ) -> anyhow::Result<TurnRelayConn> {
-    use anyhow::Context as _;
-    let server = turn_udp_server(urls)
-        .with_context(|| format!("no turn:…?transport=udp url among {urls:?}"))?;
-    let resolved = tokio::net::lookup_host(&server)
+    // Tier 2: UDP relay (bounded — falls through to Tier 3 on timeout/err).
+    if let Some(server) = turn_udp_server(urls) {
+        match tokio::net::lookup_host(&server).await {
+            Ok(mut addrs) => match addrs.next() {
+                Some(resolved) => {
+                    match tokio::time::timeout(
+                        UDP_ALLOC_TIMEOUT,
+                        allocate_turn_relay(
+                            resolved,
+                            username.to_string(),
+                            credential.to_string(),
+                            DEFAULT_TURN_REALM.to_string(),
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(Ok(relay)) => return Ok(relay),
+                        Ok(Err(e)) => {
+                            tracing::warn!(%server, %e, "UDP TURN allocate failed; trying TURNS/TCP")
+                        }
+                        Err(_) => {
+                            tracing::warn!(%server, "UDP TURN allocate timed out; trying TURNS/TCP")
+                        }
+                    }
+                }
+                None => {
+                    tracing::warn!(%server, "UDP TURN server resolved to no addresses; trying TURNS/TCP")
+                }
+            },
+            Err(e) => tracing::warn!(%server, %e, "UDP TURN server unresolvable; trying TURNS/TCP"),
+        }
+    }
+
+    // Tier 3: TURNS/TCP relay (UDP-blocked nets).
+    if let Some((host, port)) = turn_tls_server(urls) {
+        use anyhow::Context as _;
+        return allocate_turn_relay_tls(
+            &host,
+            port,
+            username.to_string(),
+            credential.to_string(),
+            DEFAULT_TURN_REALM.to_string(),
+        )
         .await
-        .with_context(|| format!("resolve TURN server {server}"))?
+        .with_context(|| format!("TURNS/TCP relay allocate to {host}:{port}"));
+    }
+
+    anyhow::bail!("no usable TURN url (turn:…udp or turns:…tcp) among {urls:?}")
+}
+
+/// Tier 3: allocate a TURN relay over **TURNS (TLS-over-TCP)** for nets
+/// that block outbound UDP. Connects TCP → drives the TLS handshake (SNI =
+/// `host`) via the vendored [`TcpTurnConn`] → feeds that as the `turn`
+/// client's underlay → allocates. The relayed address coturn returns is
+/// what the peer dials (delivered over signaling like the UDP path); QUIC
+/// rides the allocation exactly as in Tier 2 — only the client→coturn leg
+/// differs (TLS/TCP instead of UDP).
+///
+/// `realm` is a don't-care (coturn returns its own in the 401 challenge,
+/// which the `turn` client adopts before computing MESSAGE-INTEGRITY). The
+/// `TcpTurnConn` is field-proven for the WebRTC relay-gather path; this is
+/// its first QUIC use.
+pub async fn allocate_turn_relay_tls(
+    host: &str,
+    port: u16,
+    username: String,
+    password: String,
+    realm: String,
+) -> anyhow::Result<TurnRelayConn> {
+    use anyhow::Context as _;
+
+    // Resolve once so the TCP connect + `turn_serv_addr` (which the client
+    // formats into its STUN transactions) agree on a concrete SocketAddr;
+    // SNI still uses the hostname for certificate verification.
+    let resolved = tokio::net::lookup_host((host, port))
+        .await
+        .with_context(|| format!("resolve TURNS server {host}:{port}"))?
         .next()
-        .with_context(|| format!("TURN server {server} resolved to no addresses"))?;
-    allocate_turn_relay(
-        resolved,
-        username.to_string(),
-        credential.to_string(),
-        DEFAULT_TURN_REALM.to_string(),
-    )
+        .with_context(|| format!("TURNS server {host}:{port} resolved to no addresses"))?;
+
+    let tcp = tokio::net::TcpStream::connect(resolved)
+        .await
+        .with_context(|| format!("TCP connect to TURNS server {resolved}"))?;
+    let adapter = TcpTurnConn::connect_tls(tcp, host)
+        .await
+        .with_context(|| format!("TLS handshake to TURNS server {host}"))?;
+    let conn: Arc<dyn UtilConn + Send + Sync> = Arc::new(adapter);
+
+    let client = Client::new(ClientConfig {
+        stun_serv_addr: String::new(),
+        turn_serv_addr: resolved.to_string(),
+        username,
+        password,
+        realm,
+        software: String::new(),
+        rto_in_ms: 0,
+        // Over TCP every byte rides the one TLS connection — no vnet (which
+        // would try to open side sockets for keepalives).
+        conn,
+        vnet: None,
+    })
     .await
+    .context("TURNS client::new")?;
+
+    client.listen().await.context("TURNS client listen")?;
+    let relay = client.allocate().await.context("TURNS allocate")?;
+    let relayed_addr = relay
+        .local_addr()
+        .map_err(util_to_io)
+        .context("TURNS relayed local_addr")?;
+    tracing::info!(%host, port, %relayed_addr, "TURNS/TCP TURN allocation established");
+
+    Ok(TurnRelayConn {
+        _client: client,
+        relay: Arc::new(relay),
+        relayed_addr,
+    })
 }
 
 #[cfg(test)]
@@ -455,6 +613,33 @@ mod tests {
         );
         assert_eq!(turn_udp_server(&["stun:host:3478".to_string()]), None);
         assert_eq!(turn_udp_server(&[]), None);
+    }
+
+    /// Tier 3: `turn_tls_server` must select the `turns:…?transport=tcp`
+    /// entry (keeping the hostname for SNI) and skip stun/plain-turn/UDP.
+    #[test]
+    fn turn_tls_server_picks_the_turns_tcp_url() {
+        let prod = vec![
+            "stun:stun.l.google.com:19302".to_string(),
+            "turn:coturn.roomler.ai:3478?transport=udp".to_string(),
+            "turns:coturn.roomler.ai:443?transport=tcp".to_string(),
+            "turns:coturn.roomler.ai:5349?transport=tcp".to_string(),
+        ];
+        assert_eq!(
+            turn_tls_server(&prod),
+            Some(("coturn.roomler.ai".to_string(), 443)),
+            "first turns:…?transport=tcp wins; host kept unresolved for SNI"
+        );
+        // turns: without an explicit transport=tcp ⇒ DTLS/UDP, which the
+        // TcpTurnConn adapter can't ride.
+        assert_eq!(turn_tls_server(&["turns:host:5349".to_string()]), None);
+        // Plain turn:/udp + stun: are Tier-2 / not-TURN — never TLS-TCP.
+        assert_eq!(
+            turn_tls_server(&["turn:host:3478?transport=udp".to_string()]),
+            None
+        );
+        assert_eq!(turn_tls_server(&["stun:host:3478".to_string()]), None);
+        assert_eq!(turn_tls_server(&[]), None);
     }
 
     /// The adapter must faithfully carry datagrams both ways: send via
