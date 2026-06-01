@@ -117,7 +117,7 @@ pub(super) fn parse_frame_len(buf: &[u8]) -> Result<Option<usize>, &'static str>
 /// adapter de-frames the inbound byte stream into one STUN or
 /// ChannelData message per `recv_from` call and passes outbound
 /// bytes through unchanged.
-pub(crate) struct TcpTurnConn {
+pub struct TcpTurnConn {
     read: Mutex<ReadState>,
     write: Mutex<WriteHalf<TlsStream<TcpStream>>>,
     local: SocketAddr,
