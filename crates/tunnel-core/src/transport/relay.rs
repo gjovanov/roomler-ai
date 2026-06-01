@@ -326,32 +326,135 @@ pub async fn allocate_turn_relay(
     })
 }
 
+/// A [`RelayConn`] over a plain tokio `UdpSocket` — the datagrams are NOT
+/// actually relayed (`send_to`/`recv_from` hit the wire directly), i.e.
+/// the "relay" is just a socket. Two uses: (1) a directly-reachable /
+/// same-host path can still drive a [`QuicPeer`](crate::transport::quic::QuicPeer)
+/// through the same [`RelayUdpSocket`] abstraction the TURN path uses,
+/// and (2) tests exercise the bridge + the agent/client relay
+/// orchestration (Phase 3d) without standing up coturn.
+pub struct UdpRelayConn(pub tokio::net::UdpSocket);
+
+#[async_trait]
+impl RelayConn for UdpRelayConn {
+    async fn send_to(&self, buf: &[u8], dst: SocketAddr) -> io::Result<usize> {
+        self.0.send_to(buf, dst).await
+    }
+    async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        self.0.recv_from(buf).await
+    }
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.0.local_addr()
+    }
+}
+
+/// Pick the first plain-UDP TURN server (`turn:HOST:PORT?transport=udp`,
+/// or `turn:HOST:PORT` with no transport — UDP is the TURN default) from
+/// an ICE-server URL list and return its `HOST:PORT`. `stun:`, `turns:`
+/// (TLS) and `?transport=tcp` URLs are skipped: the webrtc-rs `turn`
+/// client this feeds drives a UDP underlay only (Tier 2). Tier 3
+/// (TURNS/TCP, for UDP-blocked nets) must ride the vendored webrtc-ice
+/// `tcp_turn_conn` instead — the `turn` client silently drops non-UDP
+/// transports (see the webrtc-rs TURN-URL gap memo).
+pub fn turn_udp_server(urls: &[String]) -> Option<String> {
+    for url in urls {
+        // Only `turn:` (plain). `turns:` (note the trailing s) is TLS and
+        // `strip_prefix("turn:")` correctly rejects it.
+        let Some(rest) = url.strip_prefix("turn:") else {
+            continue;
+        };
+        let (hostport, query) = match rest.split_once('?') {
+            Some((hp, q)) => (hp, Some(q)),
+            None => (rest, None),
+        };
+        let is_udp = match query {
+            None => true, // no transport param ⇒ UDP per RFC 7065 default
+            Some(q) => q
+                .split('&')
+                .any(|kv| kv.eq_ignore_ascii_case("transport=udp")),
+        };
+        if is_udp && !hostport.is_empty() {
+            return Some(hostport.to_string());
+        }
+    }
+    None
+}
+
+/// Initial realm handed to the `turn` client. coturn in `use-auth-secret`
+/// (REST) mode returns its own realm in the 401 challenge and the
+/// webrtc-rs client OVERWRITES this with the challenge realm before
+/// computing MESSAGE-INTEGRITY (`turn-0.9.0` `client/mod.rs:542`), so the
+/// value only has to be non-empty; the live realm wins regardless. We use
+/// the production realm for tidiness.
+const DEFAULT_TURN_REALM: &str = "roomler.ai";
+
+/// Allocate a TURN relay from coturn ICE-server credentials: pick the UDP
+/// TURN url, resolve its `host:port`, and [`allocate_turn_relay`].
+/// `username` + `credential` are the short-lived REST-API creds the
+/// server minted (`turn_creds::ice_servers_for`). This is the Phase-3d
+/// entry both the agent and the tunnel-client call once they hold their
+/// per-session creds.
+pub async fn allocate_relay_from_ice(
+    urls: &[String],
+    username: &str,
+    credential: &str,
+) -> anyhow::Result<TurnRelayConn> {
+    use anyhow::Context as _;
+    let server = turn_udp_server(urls)
+        .with_context(|| format!("no turn:…?transport=udp url among {urls:?}"))?;
+    let resolved = tokio::net::lookup_host(&server)
+        .await
+        .with_context(|| format!("resolve TURN server {server}"))?
+        .next()
+        .with_context(|| format!("TURN server {server} resolved to no addresses"))?;
+    allocate_turn_relay(
+        resolved,
+        username.to_string(),
+        credential.to_string(),
+        DEFAULT_TURN_REALM.to_string(),
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tokio::net::UdpSocket;
 
-    /// A [`RelayConn`] over a plain tokio `UdpSocket` — stands in for a
-    /// TURN-relayed conn so the adapter is testable without coturn.
-    struct UdpRelayConn(UdpSocket);
-
-    #[async_trait]
-    impl RelayConn for UdpRelayConn {
-        async fn send_to(&self, buf: &[u8], dst: SocketAddr) -> io::Result<usize> {
-            self.0.send_to(buf, dst).await
-        }
-        async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-            self.0.recv_from(buf).await
-        }
-        fn local_addr(&self) -> io::Result<SocketAddr> {
-            self.0.local_addr()
-        }
-    }
-
     async fn udp_relay() -> (Arc<dyn RelayConn>, SocketAddr) {
         let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = sock.local_addr().unwrap();
         (Arc::new(UdpRelayConn(sock)), addr)
+    }
+
+    /// `turn_udp_server` must pick the plain-UDP TURN url out of the
+    /// production 6-url ICE list (which leads with STUN + interleaves
+    /// TCP/TLS flavours) and skip everything the UDP `turn` client can't
+    /// use.
+    #[test]
+    fn turn_udp_server_picks_the_udp_url() {
+        let prod = vec![
+            "stun:stun.l.google.com:19302".to_string(),
+            "turns:coturn.roomler.ai:5349?transport=tcp".to_string(),
+            "turn:coturn.roomler.ai:3478?transport=udp".to_string(),
+            "turn:coturn.roomler.ai:3478?transport=tcp".to_string(),
+        ];
+        assert_eq!(
+            turn_udp_server(&prod).as_deref(),
+            Some("coturn.roomler.ai:3478")
+        );
+        // No `?transport` ⇒ UDP default.
+        assert_eq!(
+            turn_udp_server(&["turn:host.example:3478".to_string()]).as_deref(),
+            Some("host.example:3478")
+        );
+        // Only TLS / TCP flavours ⇒ nothing the Tier-2 UDP client can use.
+        assert_eq!(
+            turn_udp_server(&["turns:host:5349?transport=tcp".to_string()]),
+            None
+        );
+        assert_eq!(turn_udp_server(&["stun:host:3478".to_string()]), None);
+        assert_eq!(turn_udp_server(&[]), None);
     }
 
     /// The adapter must faithfully carry datagrams both ways: send via

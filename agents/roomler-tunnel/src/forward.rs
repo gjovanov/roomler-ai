@@ -40,6 +40,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 use tunnel_core::forward::{FlowDemux, HalfCloseSink, run_flow, run_flow_quic};
 use tunnel_core::transport::quic::{self, QuicConnection, QuicPeer};
+use tunnel_core::transport::relay;
 use tunnel_core::transport::webrtc_dc::TunnelPeer;
 use tunnel_core::transport::{TRANSPORT_QUIC_V1, TRANSPORT_WEBRTC_DC_V1};
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
@@ -72,6 +73,13 @@ const FLOW_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 /// round-trip plus the agent's endpoint bind. On timeout the client
 /// abandons QUIC and (for `--transport auto`) re-opens over WebRTC.
 const QUIC_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Phase 3d: head start we give the agent's TURN-permission install (it
+/// fires when our `rc:tunnel.quic.candidate` reaches the agent over WS)
+/// before we send the first QUIC Initial over the relay. QUIC's Initial
+/// retransmission covers any remaining race, so this is just a latency
+/// optimisation to avoid the first-packet drop + retransmit wait.
+const QUIC_PERMIT_SETTLE: std::time::Duration = std::time::Duration::from_millis(300);
 
 /// Operator's transport preference for `roomler-tunnel forward`,
 /// selected with `--transport`. Drives which transports the client
@@ -319,6 +327,7 @@ async fn run_session(
             outbound_tx,
             session_id,
             quic_auth_token,
+            ice_servers,
             local,
             dst_host,
             dst_port,
@@ -817,6 +826,7 @@ async fn run_quic_session(
     outbound_tx: mpsc::Sender<ClientMsg>,
     session_id: ObjectId,
     quic_auth_token: Option<String>,
+    ice_servers: Vec<IceServer>,
     local: u16,
     dst_host: &str,
     dst_port: u16,
@@ -864,21 +874,46 @@ async fn run_quic_session(
         "rc:tunnel.quic.ready"
     );
 
-    // Build a client endpoint pinned to the agent's ephemeral cert.
-    let bind: std::net::SocketAddr = "0.0.0.0:0".parse().expect("0.0.0.0:0 is a valid bind addr");
-    let peer = match QuicPeer::client(bind, &cert_fingerprint) {
-        Ok(p) => p,
-        Err(e) => {
-            warn!(%e, "QuicPeer::client failed");
-            return Ok(SessionOutcome::QuicSetupFailed);
+    // Establish the QUIC connection. Phase 3d: when the server minted
+    // coturn creds we ride QUIC-over-TURN (Tier 2) — the agent advertised
+    // its relay address, and we dial it through our OWN relay so coturn's
+    // permission model lets the datagrams flow. Otherwise (no creds) dial
+    // the agent's direct host candidates (Phase 1e/2a). Either branch
+    // yields a connected `(peer, conn)`; auth + the data plane below are
+    // transport-agnostic.
+    let (peer, conn) = if let Some((urls, user, cred)) = pick_turn_creds(&ice_servers) {
+        info!("QUIC: server provided TURN creds — establishing QUIC-over-TURN (Tier 2)");
+        match setup_quic_over_relay(
+            &urls,
+            &user,
+            &cred,
+            &cert_fingerprint,
+            &addrs,
+            session_id,
+            &outbound_tx,
+        )
+        .await
+        {
+            Some(pc) => pc,
+            None => return Ok(SessionOutcome::QuicSetupFailed),
         }
-    };
-
-    // Dial the advertised addrs in priority order (Phase 1: usually one
-    // direct addr; Phase 2 adds srflx candidates).
-    let Some(conn) = connect_first(&peer, &addrs).await else {
-        warn!(addrs = ?addrs, "could not connect QUIC to any advertised addr");
-        return Ok(SessionOutcome::QuicSetupFailed);
+    } else {
+        let bind: std::net::SocketAddr =
+            "0.0.0.0:0".parse().expect("0.0.0.0:0 is a valid bind addr");
+        let peer = match QuicPeer::client(bind, &cert_fingerprint) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(%e, "QuicPeer::client failed");
+                return Ok(SessionOutcome::QuicSetupFailed);
+            }
+        };
+        // Dial the advertised addrs in priority order (direct host /
+        // srflx candidates).
+        let Some(conn) = connect_first(&peer, &addrs).await else {
+            warn!(addrs = ?addrs, "could not connect QUIC to any advertised addr");
+            return Ok(SessionOutcome::QuicSetupFailed);
+        };
+        (peer, conn)
     };
     if let Err(e) = quic::client_authenticate(&conn, &token).await {
         warn!(%e, "QUIC client_authenticate failed");
@@ -989,6 +1024,115 @@ async fn connect_first(peer: &QuicPeer, addrs: &[String]) -> Option<QuicConnecti
         }
     }
     None
+}
+
+/// Pick the first ICE server carrying usable plain-UDP TURN relay creds
+/// (a `turn:…?transport=udp` url plus username + credential). Returns the
+/// `(urls, username, credential)` for [`setup_quic_over_relay`], or
+/// `None` when the server sent only STUN / TLS-TCP entries (→ direct
+/// QUIC). Phase 3d.
+fn pick_turn_creds(ice_servers: &[IceServer]) -> Option<(Vec<String>, String, String)> {
+    ice_servers
+        .iter()
+        .find_map(|s| match (&s.username, &s.credential) {
+            (Some(u), Some(c)) if relay::turn_udp_server(&s.urls).is_some() => {
+                Some((s.urls.clone(), u.clone(), c.clone()))
+            }
+            _ => None,
+        })
+}
+
+/// Phase 3d: bring the client's QUIC endpoint up over its OWN coturn TURN
+/// relay and dial the agent's relay address (QUIC-over-TURN, Tier 2).
+///
+/// 1. Allocate a relay from the session creds → a [`relay::RelayUdpSocket`]
+///    quinn rides; the relayed address is what coturn handed us.
+/// 2. Send `rc:tunnel.quic.candidate { our relay addr }` so the agent
+///    installs a TURN permission for us (it's the QUIC server + never
+///    sends first).
+/// 3. Bootstrap our OWN permission for each agent relay addr (one stray
+///    datagram each — the webrtc-rs TURN client auto-creates the
+///    CreatePermission on first send; the agent's quinn discards the
+///    byte). This is the mutual half coturn needs to relay the agent's
+///    handshake replies back to us.
+/// 4. After a short settle, dial the agent's relay addr over our relay.
+///
+/// Returns the connected `(peer, conn)` or `None` on any setup failure
+/// (caller soft-falls back to webrtc-dc-v1). The full Tier-2 datagram +
+/// permission path is proven in tunnel-core's
+/// `quinn_runs_over_two_turn_allocations`.
+#[allow(clippy::too_many_arguments)]
+async fn setup_quic_over_relay(
+    urls: &[String],
+    username: &str,
+    credential: &str,
+    cert_fingerprint: &str,
+    agent_addrs: &[String],
+    session_id: ObjectId,
+    outbound_tx: &mpsc::Sender<ClientMsg>,
+) -> Option<(QuicPeer, QuicConnection)> {
+    let turn_relay = match relay::allocate_relay_from_ice(urls, username, credential).await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(%e, "QUIC client: TURN allocate failed");
+            return None;
+        }
+    };
+    let relay_conn: Arc<dyn relay::RelayConn> = Arc::new(turn_relay);
+    let our_relay_addr = match relay_conn.local_addr() {
+        Ok(a) => a,
+        Err(e) => {
+            warn!(%e, "QUIC client: relay local_addr");
+            return None;
+        }
+    };
+    info!(relay_addr = %our_relay_addr, "QUIC client: TURN relay allocated");
+
+    let sock = match relay::RelayUdpSocket::new(Arc::clone(&relay_conn)) {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            warn!(%e, "QUIC client: relay socket bridge");
+            return None;
+        }
+    };
+    let peer = match QuicPeer::client_over_abstract_socket(sock, cert_fingerprint) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(%e, "QUIC client: endpoint over relay");
+            return None;
+        }
+    };
+
+    // Tell the agent our relay addr so it permits us (server relays this
+    // candidate to the agent, which installs the TURN permission).
+    if let Err(e) = outbound_tx
+        .send(ClientMsg::TunnelQuicCandidate {
+            session_id,
+            addrs: vec![our_relay_addr.to_string()],
+        })
+        .await
+    {
+        warn!(%e, "QUIC client: send relay candidate failed");
+        return None;
+    }
+    // Bootstrap our side of the mutual permission for each agent relay
+    // addr.
+    for a in agent_addrs {
+        if let Ok(sa) = a.parse::<std::net::SocketAddr>()
+            && let Err(e) = relay_conn.send_to(b"\x00", sa).await
+        {
+            debug!(addr = %sa, %e, "QUIC client: permission bootstrap datagram failed");
+        }
+    }
+    tokio::time::sleep(QUIC_PERMIT_SETTLE).await;
+
+    match connect_first(&peer, agent_addrs).await {
+        Some(conn) => Some((peer, conn)),
+        None => {
+            warn!(addrs = ?agent_addrs, "QUIC client: could not connect over the relay");
+            None
+        }
+    }
 }
 
 /// WS read loop for a QUIC session. Routes per-flow accept/reject into
@@ -1247,6 +1391,49 @@ mod tests {
         let (h, p) = parse_remote("db.intranet:5432").unwrap();
         assert_eq!(h, "db.intranet");
         assert_eq!(p, 5432);
+    }
+
+    /// Phase 3d: `pick_turn_creds` must select the TURN ICE server (with
+    /// usable UDP creds) out of the production list — which leads with a
+    /// credential-less STUN entry — and ignore a creds-less or
+    /// TLS/TCP-only list (→ direct QUIC, no relay).
+    #[test]
+    fn pick_turn_creds_selects_the_udp_turn_server() {
+        let ice = vec![
+            IceServer {
+                urls: vec!["stun:stun.l.google.com:19302".into()],
+                username: None,
+                credential: None,
+            },
+            IceServer {
+                urls: vec![
+                    "turn:coturn.roomler.ai:3478?transport=udp".into(),
+                    "turns:coturn.roomler.ai:5349?transport=tcp".into(),
+                ],
+                username: Some("1780000000:sess".into()),
+                credential: Some("base64hmac".into()),
+            },
+        ];
+        let (urls, user, cred) = pick_turn_creds(&ice).expect("must find the TURN server");
+        assert!(urls.iter().any(|u| u.starts_with("turn:")));
+        assert_eq!(user, "1780000000:sess");
+        assert_eq!(cred, "base64hmac");
+
+        // STUN-only → no relay creds.
+        let stun_only = vec![IceServer {
+            urls: vec!["stun:stun.l.google.com:19302".into()],
+            username: None,
+            credential: None,
+        }];
+        assert!(pick_turn_creds(&stun_only).is_none());
+
+        // TURN url present but no creds → unusable.
+        let no_creds = vec![IceServer {
+            urls: vec!["turn:coturn.roomler.ai:3478?transport=udp".into()],
+            username: None,
+            credential: None,
+        }];
+        assert!(pick_turn_creds(&no_creds).is_none());
     }
 
     #[test]
