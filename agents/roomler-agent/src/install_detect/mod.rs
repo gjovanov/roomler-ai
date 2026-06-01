@@ -99,9 +99,66 @@ pub fn detect_existing_install() -> ExistingInstall {
     }
 }
 
+/// MSI install flavour of a discovered product. Mirrors
+/// [`crate::updater::WindowsInstallFlavour`] but lives here so the
+/// install-detection layer carries no dependency on the updater.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flavour {
+    PerUser,
+    PerMachine,
+}
+
+impl Flavour {
+    /// Parse a friendly flavour string (CLI `--flavour`). Mirrors
+    /// [`crate::install_cleanup::TargetFlavour::parse`]'s accepted forms.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "peruser" | "per-user" | "user" => Some(Self::PerUser),
+            "permachine" | "per-machine" | "machine" => Some(Self::PerMachine),
+            _ => None,
+        }
+    }
+}
+
+/// One installed roomler-agent MSI product, discovered by walking
+/// **all** ProductCode values under an UpgradeCode key — unlike
+/// [`detect_existing_install`], which reports only the first. The
+/// obsolete-version sweep ([`crate::version_sweep`]) uses this to find
+/// the pile-up that accumulates when WiX `MajorUpgrade` doesn't fire
+/// (the rc number lands in the MSI 4th version field, which Windows
+/// Installer ignores for upgrade comparison — so every rc looks like
+/// the same `0.3.0` product and the old one is never removed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub struct InstalledProduct {
+    pub flavour: Flavour,
+    /// Brace-wrapped, uppercase ProductCode GUID exactly as it appears
+    /// in the Uninstall key and as accepted by `msiexec /x` (e.g.
+    /// `{1317F249-CDA7-4372-92B6-883239BCB780}`).
+    pub product_code: String,
+    /// `DisplayVersion` (e.g. `0.3.0.99`); `None` when the Uninstall
+    /// key or value is missing.
+    pub version: Option<String>,
+}
+
+/// Enumerate **all** installed roomler-agent MSI products across both
+/// flavours (perUser HKCU + perMachine HKLM). Returns every ProductCode
+/// registered under either UpgradeCode key, each with its
+/// `DisplayVersion`. Non-Windows hosts return an empty vec.
+pub fn enumerate_installed_products() -> Vec<InstalledProduct> {
+    #[cfg(target_os = "windows")]
+    {
+        windows::enumerate()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Vec::new()
+    }
+}
+
 #[cfg(target_os = "windows")]
 mod windows {
-    use super::{InstallInfo, InstallProbe};
+    use super::{Flavour, InstallInfo, InstallProbe, InstalledProduct};
     use crate::install_detect::{
         PERMACHINE_UPGRADE_CODE, PERUSER_UPGRADE_CODE, pack_msi_guid, unpack_msi_guid,
     };
@@ -286,6 +343,95 @@ mod windows {
             peruser,
             permachine,
         }
+    }
+
+    /// Enumerate ALL value names under an open key. The
+    /// `UpgradeCodes\<packed>` key holds one value per installed
+    /// ProductCode (the value NAME is the packed ProductCode); when
+    /// `MajorUpgrade` fails to remove prior versions, several pile up
+    /// here. Iterates `RegEnumValueW` from index 0 until it stops
+    /// returning `ERROR_SUCCESS` (i.e. `ERROR_NO_MORE_ITEMS`).
+    fn all_value_names(key: &OpenKey) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut idx: u32 = 0;
+        loop {
+            let mut name_buf = vec![0u16; 256];
+            let mut name_len: u32 = name_buf.len() as u32;
+            // SAFETY: name_len is the in-out buffer capacity per
+            // RegEnumValueW docs; all other out-params are null because
+            // we only need the value name, not its data/type.
+            let rc = unsafe {
+                RegEnumValueW(
+                    key.0,
+                    idx,
+                    name_buf.as_mut_ptr(),
+                    &mut name_len,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                )
+            };
+            if rc != ERROR_SUCCESS {
+                break;
+            }
+            names.push(String::from_utf16_lossy(&name_buf[..name_len as usize]));
+            idx += 1;
+        }
+        names
+    }
+
+    /// Enumerate every ProductCode under one flavour's UpgradeCode key,
+    /// resolving each to its canonical `{GUID}` + `DisplayVersion`.
+    fn enumerate_one(
+        hive: HKEY,
+        upgrade_codes_subpath: &str,
+        packed_upgrade_code: &str,
+        uninstall_subpath: &str,
+        flavour: Flavour,
+    ) -> Vec<InstalledProduct> {
+        let upgrade_path = format!("{upgrade_codes_subpath}\\{packed_upgrade_code}");
+        let Some(upgrade_key) = open_subkey_read(hive, &upgrade_path) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for packed_product in all_value_names(&upgrade_key) {
+            let Ok(product_code) = unpack_msi_guid(&packed_product) else {
+                continue;
+            };
+            let uninstall_path = format!("{uninstall_subpath}\\{product_code}");
+            let version = open_subkey_read(hive, &uninstall_path)
+                .and_then(|k| read_string_value(&k, "DisplayVersion"));
+            out.push(InstalledProduct {
+                flavour,
+                product_code,
+                version,
+            });
+        }
+        out
+    }
+
+    pub(super) fn enumerate() -> Vec<InstalledProduct> {
+        let mut out = Vec::new();
+        if let Ok(packed) = pack_msi_guid(PERUSER_UPGRADE_CODE) {
+            out.extend(enumerate_one(
+                HKEY_CURRENT_USER,
+                r"Software\Microsoft\Installer\UpgradeCodes",
+                &packed,
+                r"Software\Microsoft\Windows\CurrentVersion\Uninstall",
+                Flavour::PerUser,
+            ));
+        }
+        if let Ok(packed) = pack_msi_guid(PERMACHINE_UPGRADE_CODE) {
+            out.extend(enumerate_one(
+                HKEY_LOCAL_MACHINE,
+                r"SOFTWARE\Classes\Installer\UpgradeCodes",
+                &packed,
+                r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+                Flavour::PerMachine,
+            ));
+        }
+        out
     }
 }
 
