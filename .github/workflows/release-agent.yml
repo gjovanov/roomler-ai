@@ -35,6 +35,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.resolve.outputs.version }}
+      msi_version: ${{ steps.resolve.outputs.msi_version }}
       tag: ${{ steps.resolve.outputs.tag }}
       is_release: ${{ steps.resolve.outputs.is_release }}
     steps:
@@ -79,7 +80,43 @@ jobs:
             exit 1
           fi
 
+          # Derive the MSI ProductVersion. Windows Installer IGNORES the
+          # 4th (revision) version field for upgrade comparison, so the
+          # raw semver `0.3.0-rc.N` — which cargo-wix maps to `0.3.0.N` —
+          # made every rc look like the same `0.3.0` product: WiX
+          # MajorUpgrade never saw a "newer" version, never removed the
+          # prior one, and rc builds piled up (8 perMachine versions
+          # found coexisting on a host 2026-06-01). Fix: put the rc in
+          # the 3rd (build) field so MSI ProductVersions are monotonic —
+          # `MAJOR.MINOR.RC`. A final (non-rc) release maps the build
+          # field to 65535 so it outranks every rc of that minor. Only
+          # the MSI-internal ProductVersion changes; the .msi *filename*
+          # keeps the readable semver (see the rename steps below).
+          # Assumes the project's `MAJOR.MINOR.0-rc.N` scheme (patch == 0
+          # for rc builds) — fails loudly otherwise so the mapping can't
+          # silently collide.
+          if [[ "$version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)-rc\.([0-9]+)$ ]]; then
+            vmajor="${BASH_REMATCH[1]}"; vminor="${BASH_REMATCH[2]}"
+            vpatch="${BASH_REMATCH[3]}"; vrc="${BASH_REMATCH[4]}"
+            if [[ "$vpatch" != "0" ]]; then
+              echo "::error::rc builds must have patch == 0 (got ${version}); the MAJOR.MINOR.RC MSI mapping would collide with a patched rc"
+              exit 1
+            fi
+            if (( vrc > 65535 )); then
+              echo "::error::rc number ${vrc} exceeds the MSI build-field max (65535)"
+              exit 1
+            fi
+            msi_version="${vmajor}.${vminor}.${vrc}"
+          elif [[ "$version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            msi_version="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.65535"
+          else
+            echo "::error::cannot derive an MSI version from '${version}' (expected MAJOR.MINOR.PATCH or MAJOR.MINOR.PATCH-rc.N)"
+            exit 1
+          fi
+          echo "Resolved MSI ProductVersion: ${msi_version} (from ${version})"
+
           echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "msi_version=${msi_version}" >> "$GITHUB_OUTPUT"
           echo "tag=${tag}"         >> "$GITHUB_OUTPUT"
           echo "is_release=${is_release}" >> "$GITHUB_OUTPUT"
 
@@ -176,6 +213,10 @@ jobs:
     timeout-minutes: 90
     env:
       VERSION: ${{ needs.validate-version.outputs.version }}
+      # Monotonic MSI ProductVersion (rc in the 3rd/build field) so
+      # MajorUpgrade fires — see the derivation in the validate-version
+      # job. VERSION (the readable semver) still names the .msi files.
+      MSI_VERSION: ${{ needs.validate-version.outputs.msi_version }}
     steps:
       - uses: actions/checkout@v4
 
@@ -543,7 +584,7 @@ jobs:
         run: |
           # cargo-wix reads agents/roomler-agent/wix/main.wxs and sets the
           # Version preprocessor variable from --install-version.
-          cargo wix -p roomler-agent --nocapture --no-build --install-version $env:VERSION
+          cargo wix -p roomler-agent --nocapture --no-build --install-version $env:MSI_VERSION
 
       - name: Locate + rename per-User MSI
         id: locate
@@ -577,7 +618,7 @@ jobs:
           Copy-Item "$wixDir\main.wxs" "$wixDir\main.wxs.bak" -Force
           Copy-Item $pmSrc "$wixDir\main.wxs" -Force
           try {
-            cargo wix -p roomler-agent --nocapture --no-build --install-version $env:VERSION
+            cargo wix -p roomler-agent --nocapture --no-build --install-version $env:MSI_VERSION
           } finally {
             Move-Item "$wixDir\main.wxs.bak" "$wixDir\main.wxs" -Force
           }
