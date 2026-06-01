@@ -858,4 +858,125 @@ mod turn_tests {
         outcome.expect("quinn-over-TURN round-trip timed out");
         let _ = srv.await;
     }
+
+    // ───────────── LIVE coturn smokes (Phase 3 e2e, ignored) ─────────────
+    //
+    // These exercise the REAL [`allocate_relay_from_ice`] entry against the
+    // production coturn cluster — the same allocate → mutual-permission →
+    // quinn-handshake path as `quinn_runs_over_two_turn_allocations`, minus
+    // the in-process server. They prove Tier 2 (UDP) and Tier 3 (TURNS/TCP)
+    // work against live coturn, isolating the relay primitives from the
+    // agent/client signaling (which is covered by the wire-lock + glue
+    // tests). `#[ignore]` + env-gated so they never run in CI: provide
+    //   ROOMLER_TEST_TURN_HOST   = coturn.roomler.ai
+    //   ROOMLER_TEST_TURN_SECRET = coturn's static-auth-secret (from the
+    //                              k8s secret / ROOMLER__TURN__SHARED_SECRET)
+    // and run on a host with outbound UDP/3478 (UDP smoke) or TCP/443
+    // (TURNS/TCP smoke) to coturn. The secret stays in the env — never in
+    // source. Run e.g.:
+    //   cargo test -p roomler-ai-tunnel-core --ignored relay_against_real_coturn
+
+    /// Allocate TWO relays via the real [`allocate_relay_from_ice`] entry,
+    /// mutually permission them, and run a full quinn handshake + flow
+    /// round-trip between them over the live cluster.
+    async fn two_relay_quinn_roundtrip(urls: &[String], user: &str, cred: &str) {
+        let agent_relay = allocate_relay_from_ice(urls, user, cred)
+            .await
+            .expect("agent relay allocate (live coturn)");
+        let client_relay = allocate_relay_from_ice(urls, user, cred)
+            .await
+            .expect("client relay allocate (live coturn)");
+        let r_agent = agent_relay.local_addr().unwrap();
+        let r_client = client_relay.local_addr().unwrap();
+        eprintln!("live coturn relays: agent={r_agent} client={r_client}");
+        assert_ne!(
+            r_agent, r_client,
+            "two allocations get distinct relay addrs"
+        );
+
+        // Mutual permission bootstrap (one stray datagram each way).
+        agent_relay.send_to(b"\x00", r_client).await.unwrap();
+        client_relay.send_to(b"\x00", r_agent).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let agent_sock = Arc::new(RelayUdpSocket::new(Arc::new(agent_relay)).unwrap());
+        let client_sock = Arc::new(RelayUdpSocket::new(Arc::new(client_relay)).unwrap());
+        let (server, fp) =
+            QuicPeer::server_over_abstract_socket(agent_sock).expect("quic server over coturn");
+        let client = QuicPeer::client_over_abstract_socket(client_sock, &fp)
+            .expect("quic client over coturn");
+
+        let srv = tokio::spawn(async move {
+            let conn = server.accept().await.expect("incoming").expect("handshake");
+            let (flow_id, mut send, mut recv) = accept_flow(&conn).await.expect("accept_flow");
+            assert_eq!(flow_id, 77);
+            let got = recv.read_to_end(64 * 1024).await.unwrap();
+            assert_eq!(&got, b"ping-over-coturn");
+            send.write_all(b"pong-over-coturn").await.unwrap();
+            send.finish().unwrap();
+            conn.closed().await;
+        });
+
+        let outcome = tokio::time::timeout(Duration::from_secs(30), async {
+            let conn = client
+                .connect(r_agent)
+                .await
+                .expect("connect over live coturn relay");
+            let (mut send, mut recv) = open_flow(&conn, 77).await.expect("open_flow");
+            send.write_all(b"ping-over-coturn").await.unwrap();
+            send.finish().unwrap();
+            let reply = recv.read_to_end(64 * 1024).await.unwrap();
+            assert_eq!(
+                &reply, b"pong-over-coturn",
+                "quinn round-trip over live coturn relay"
+            );
+            conn.close(0u32.into(), b"done");
+        })
+        .await;
+        outcome.expect("quinn-over-coturn round-trip timed out");
+        let _ = srv.await;
+    }
+
+    /// Mint live REST creds from env, or `None` to skip (env unset).
+    fn live_coturn_creds(
+        urls_for: impl Fn(&str) -> Vec<String>,
+    ) -> Option<(Vec<String>, String, String)> {
+        let host = std::env::var("ROOMLER_TEST_TURN_HOST").ok()?;
+        let secret = std::env::var("ROOMLER_TEST_TURN_SECRET").ok()?;
+        let cfg = roomler_ai_remote_control::turn_creds::TurnConfig {
+            urls: urls_for(&host),
+            shared_secret: secret,
+            ttl_secs: 600,
+        };
+        let ice = cfg.issue("quic-coturn-smoke");
+        Some((ice.urls, ice.username?, ice.credential?))
+    }
+
+    /// LIVE Tier-2: UDP relay against the production coturn cluster.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "hits live coturn; set ROOMLER_TEST_TURN_HOST + ROOMLER_TEST_TURN_SECRET"]
+    async fn relay_against_real_coturn_udp() {
+        let Some((urls, user, cred)) =
+            live_coturn_creds(|h| vec![format!("turn:{h}:3478?transport=udp")])
+        else {
+            eprintln!("SKIP relay_against_real_coturn_udp: env unset");
+            return;
+        };
+        two_relay_quinn_roundtrip(&urls, &user, &cred).await;
+    }
+
+    /// LIVE Tier-3: TURNS/TCP relay (TLS over TCP/443 — the UDP-blocked-net
+    /// path). The url list has no `turn:…udp` entry, so
+    /// `allocate_relay_from_ice` falls through to the TURNS/TCP tier.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "hits live coturn over TLS/TCP; set ROOMLER_TEST_TURN_HOST + ROOMLER_TEST_TURN_SECRET"]
+    async fn relay_against_real_coturn_turns_tcp() {
+        let Some((urls, user, cred)) =
+            live_coturn_creds(|h| vec![format!("turns:{h}:443?transport=tcp")])
+        else {
+            eprintln!("SKIP relay_against_real_coturn_turns_tcp: env unset");
+            return;
+        };
+        two_relay_quinn_roundtrip(&urls, &user, &cred).await;
+    }
 }
