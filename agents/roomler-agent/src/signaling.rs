@@ -22,6 +22,7 @@ use crate::indicator::ViewerIndicator;
 use crate::notify;
 use crate::peer::AgentPeer;
 use crate::watchdog;
+use tunnel_core::transport::relay;
 
 /// Capacity of the outbound channel peers use to push `ClientMsg` back into
 /// the signaling loop (ICE trickles, terminate signals). 64 is generous for
@@ -975,24 +976,53 @@ async fn handle_server_msg(
         ServerMsg::TunnelQuicSetup {
             session_id,
             quic_auth_token,
-            // Phase 3c wire field; Phase 3d uses these coturn creds to
-            // allocate the agent's own TURN relay (QUIC-over-TURN). For
-            // now the agent always binds a direct UDP endpoint below.
-            ice_servers: _ice_servers,
+            ice_servers,
         } => {
-            // Bind 0.0.0.0:0 so every interface is reachable in
-            // production; Phase 2 enumerates srflx candidates into
-            // `addrs`. Today `addrs` carries the bound local addr —
-            // dialable on directly-reachable paths + loopback tests.
-            let bind = match "0.0.0.0:0".parse() {
-                Ok(b) => b,
-                Err(e) => {
-                    warn!(%session_id, %e, "tunnel quic: bad bind addr — skipping setup");
-                    return Ok(());
+            // Phase 3d: if the server minted coturn creds, ride QUIC over
+            // a TURN relay (QUIC-over-TURN) so symmetric-NAT /
+            // UDP-restricted hosts are reachable; the relay peer
+            // advertises its coturn relayed address. Otherwise bind a
+            // direct 0.0.0.0:0 UDP endpoint (same-LAN / directly-
+            // reachable; Phase 2a host candidates). A relay allocation
+            // failure is non-fatal — we simply don't reply
+            // `rc:tunnel.quic.ready`, and the client soft-falls back to
+            // webrtc-dc-v1.
+            let turn_creds = ice_servers
+                .iter()
+                .find_map(|s| match (&s.username, &s.credential) {
+                    (Some(u), Some(c)) if relay::turn_udp_server(&s.urls).is_some() => {
+                        Some((s.urls.clone(), u.clone(), c.clone()))
+                    }
+                    _ => None,
+                });
+
+            let peer_result = if let Some((urls, user, cred)) = turn_creds {
+                match relay::allocate_relay_from_ice(&urls, &user, &cred).await {
+                    Ok(turn_relay) => {
+                        let relay_conn: Arc<dyn relay::RelayConn> = Arc::new(turn_relay);
+                        crate::tunnel::quic_peer::AgentQuicPeer::setup_over_relay(
+                            session_id,
+                            quic_auth_token,
+                            relay_conn,
+                        )
+                    }
+                    Err(e) => {
+                        warn!(%session_id, %e, "tunnel quic: TURN allocate failed — no QUIC relay this session");
+                        return Ok(());
+                    }
                 }
+            } else {
+                let bind = match "0.0.0.0:0".parse() {
+                    Ok(b) => b,
+                    Err(e) => {
+                        warn!(%session_id, %e, "tunnel quic: bad bind addr — skipping setup");
+                        return Ok(());
+                    }
+                };
+                crate::tunnel::quic_peer::AgentQuicPeer::setup(session_id, quic_auth_token, bind)
             };
-            match crate::tunnel::quic_peer::AgentQuicPeer::setup(session_id, quic_auth_token, bind)
-            {
+
+            match peer_result {
                 Ok(peer) => {
                     let ready = ClientMsg::TunnelQuicReady {
                         session_id,
@@ -1004,8 +1034,33 @@ async fn handle_server_msg(
                     info!(%session_id, "agent QUIC peer ready; rc:tunnel.quic.ready sent");
                 }
                 Err(e) => {
-                    warn!(%session_id, %e, "tunnel quic: AgentQuicPeer::setup failed");
+                    warn!(%session_id, %e, "tunnel quic: AgentQuicPeer setup failed");
                 }
+            }
+        }
+
+        // rc:tunnel.quic.candidate — the tunnel-client's relay
+        // address(es), relayed by the server. The agent is the QUIC
+        // *server* and never sends first, so for each candidate we
+        // install a TURN permission (one bootstrap datagram through our
+        // own allocation) — without it coturn drops the client's opening
+        // QUIC Initials. No-op for a direct (non-relay) peer. Phase 3d.
+        ServerMsg::TunnelQuicCandidate { session_id, addrs } => {
+            if let Some(peer) = tunnel_quic_peers.get(&session_id) {
+                for a in &addrs {
+                    match a.parse::<std::net::SocketAddr>() {
+                        Ok(sa) => {
+                            if let Err(e) = peer.permit(sa).await {
+                                debug!(%session_id, addr = %a, %e, "tunnel quic: permit failed");
+                            }
+                        }
+                        Err(e) => {
+                            debug!(%session_id, addr = %a, %e, "tunnel quic: unparseable candidate addr")
+                        }
+                    }
+                }
+            } else {
+                debug!(%session_id, "tunnel quic candidate for unknown session — dropping");
             }
         }
 
