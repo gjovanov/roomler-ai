@@ -3156,6 +3156,14 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       // capture width/height; mismatch identifies the auto-downscale race.
       if (mouseOffsetDiagCount < MOUSE_OFFSET_DIAG_LIMIT) {
         const seq = mouseOffsetDiagCount++
+        // rc.101 — log the canvas's ACTUAL rendered rect. `renderRect` is
+        // only computed in the direct (non-letterbox) path; in adaptive
+        // letterbox mode it's null. If `canvasRectW/H` reads the backing-
+        // store size (e.g. 2560×1600) instead of the frame size, the canvas
+        // isn't constrained to its container → CSS sizing bug (the rc.101
+        // overflow symptom on GORAN). When constrained it should equal the
+        // frame box (object-fit letterboxes the bitmap inside it).
+        const elRect = renderEl?.getBoundingClientRect() ?? null
         console.info('[rc] mouse-offset diag', {
           seq,
           path,
@@ -3173,6 +3181,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
           renderElTag: renderEl?.tagName ?? null,
           renderRectW: renderRect?.width ?? null,
           renderRectH: renderRect?.height ?? null,
+          canvasRectW: elRect ? Math.round(elRect.width) : null,
+          canvasRectH: elRect ? Math.round(elRect.height) : null,
           frameRectW: frameRect?.width ?? null,
           frameRectH: frameRect?.height ?? null,
           clientX: Math.round(ev.clientX),

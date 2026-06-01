@@ -2877,12 +2877,23 @@ onBeforeUnmount(() => {
  * browsers without the hint fall back silently to `auto` (bilinear).
  * For pixel-perfect 1:1 viewing, switch the scale mode to Original. */
 .remote-video.webcodecs-canvas,
-.remote-video.vp9-444-canvas {
+.remote-video.vp9-444-canvas,
+.remote-video.hevc-canvas {
   image-rendering: high-quality;
 }
 .remote-video.scale-adaptive {
   width: 100%;
   height: 100%;
+  /* rc.101 — belt-and-suspenders cap. A transferred-OffscreenCanvas
+     placeholder can lay out at its backing-store intrinsic size
+     (e.g. 2560×1600) instead of honouring `width/height: 100%` on some
+     Chrome builds → the canvas overflowed its frame and was clipped on
+     BOTH sides on the 16:10 GORAN host (only fit once the remote res was
+     dropped to 1280×720). `max-*: 100%` is relative to the containing
+     block, so it constrains the element regardless; `object-fit: contain`
+     then letterboxes the bitmap into the capped box. */
+  max-width: 100%;
+  max-height: 100%;
   object-fit: contain;
 }
 .remote-video.scale-original,
