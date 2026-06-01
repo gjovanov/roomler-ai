@@ -975,6 +975,10 @@ async fn handle_server_msg(
         ServerMsg::TunnelQuicSetup {
             session_id,
             quic_auth_token,
+            // Phase 3c wire field; Phase 3d uses these coturn creds to
+            // allocate the agent's own TURN relay (QUIC-over-TURN). For
+            // now the agent always binds a direct UDP endpoint below.
+            ice_servers: _ice_servers,
         } => {
             // Bind 0.0.0.0:0 so every interface is reachable in
             // production; Phase 2 enumerates srflx candidates into

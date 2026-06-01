@@ -239,7 +239,9 @@ impl AppState {
 
 /// Build a [`TurnConfig`] from settings. Returns `None` when `shared_secret` is
 /// absent (e.g. dev environments using static username/password instead).
-fn build_turn_config(turn: &roomler_ai_config::TurnSettings) -> Option<TurnConfig> {
+/// `pub(crate)` so the tunnel WS handler (`ws/tunnel.rs`) can mint
+/// per-session QUIC-over-TURN creds the same way (Phase 3c).
+pub(crate) fn build_turn_config(turn: &roomler_ai_config::TurnSettings) -> Option<TurnConfig> {
     let secret = turn.shared_secret.as_ref()?.clone();
     let base = turn.url.as_deref()?;
 

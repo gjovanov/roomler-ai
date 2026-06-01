@@ -433,6 +433,24 @@ pub enum ClientMsg {
         /// `ip:port` candidates the client may dial (priority order).
         addrs: Vec<String>,
     },
+
+    /// Tunnel-client → server → agent: the client's own QUIC candidate
+    /// address(es) — specifically its TURN-relayed address when the
+    /// session uses QUIC-over-TURN (Tier 2/3). The agent needs this to
+    /// install a TURN permission for the client's relay address BEFORE
+    /// the QUIC handshake: the agent is the QUIC *server* and never
+    /// sends first, so without a permission pre-installed for the
+    /// client's relay address coturn would drop the client's opening
+    /// Initial packets. The client→agent mirror of `TunnelQuicReady`'s
+    /// agent→client `addrs`. Phase 3c.
+    #[serde(rename = "rc:tunnel.quic.candidate")]
+    TunnelQuicCandidate {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        /// `ip:port` candidates — the client's relay address for Tier
+        /// 2/3, optionally plus host/srflx. Priority order.
+        addrs: Vec<String>,
+    },
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -709,6 +727,14 @@ pub enum ServerMsg {
         #[serde(with = "oid_hex")]
         session_id: ObjectId,
         quic_auth_token: String,
+        /// Short-lived coturn ICE/TURN credentials the AGENT uses to
+        /// allocate its own relay for QUIC-over-TURN (Tier 2/3). Empty
+        /// for direct-only sessions and from pre-3c servers (hence
+        /// `#[serde(default)]` — an older agent simply ignores the field
+        /// and a newer agent treats its absence as "no relay creds, go
+        /// direct"). Phase 3c.
+        #[serde(default)]
+        ice_servers: Vec<IceServer>,
     },
 
     /// Server → tunnel-client: relays the agent's `TunnelQuicReady`
@@ -719,6 +745,16 @@ pub enum ServerMsg {
         #[serde(with = "oid_hex")]
         session_id: ObjectId,
         cert_fingerprint: String,
+        addrs: Vec<String>,
+    },
+
+    /// Server → agent: relays the tunnel-client's `TunnelQuicCandidate`
+    /// (the client's relay address the agent must permit before the
+    /// handshake). Mirror of `ClientMsg::TunnelQuicCandidate`. Phase 3c.
+    #[serde(rename = "rc:tunnel.quic.candidate")]
+    TunnelQuicCandidate {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
         addrs: Vec<String>,
     },
 }
@@ -1214,14 +1250,59 @@ mod tests {
         let m = ServerMsg::TunnelQuicSetup {
             session_id: ObjectId::new(),
             quic_auth_token: "tok-xyz".into(),
+            ice_servers: vec![IceServer {
+                urls: vec!["turn:coturn.roomler.live:3478?transport=udp".into()],
+                username: Some("1780000000:agent".into()),
+                credential: Some("base64hmac".into()),
+            }],
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(r#""t":"rc:tunnel.quic.setup""#));
         assert!(s.contains(r#""quic_auth_token":"tok-xyz""#));
-        assert!(matches!(
-            serde_json::from_str::<ServerMsg>(&s).unwrap(),
-            ServerMsg::TunnelQuicSetup { .. }
-        ));
+        match serde_json::from_str::<ServerMsg>(&s).unwrap() {
+            ServerMsg::TunnelQuicSetup { ice_servers, .. } => {
+                assert_eq!(ice_servers.len(), 1, "agent gets its own TURN creds");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn tunnel_quic_setup_back_compat_no_ice_servers() {
+        // A pre-3c server omits `ice_servers`; a 3c+ agent must still
+        // deserialize it (serde default → empty), treating the absence
+        // as "no relay creds, direct only".
+        let json = r#"{"t":"rc:tunnel.quic.setup","session_id":"69e2a1ee7af054f8a14e84c6","quic_auth_token":"tok"}"#;
+        match serde_json::from_str::<ServerMsg>(json).unwrap() {
+            ServerMsg::TunnelQuicSetup { ice_servers, .. } => assert!(ice_servers.is_empty()),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn tunnel_quic_candidate_round_trips_both_directions() {
+        // client → server
+        let c = ClientMsg::TunnelQuicCandidate {
+            session_id: ObjectId::new(),
+            addrs: vec!["94.130.141.74:49160".into()],
+        };
+        let cs = serde_json::to_string(&c).unwrap();
+        assert!(cs.contains(r#""t":"rc:tunnel.quic.candidate""#));
+        match serde_json::from_str::<ClientMsg>(&cs).unwrap() {
+            ClientMsg::TunnelQuicCandidate { addrs, .. } => assert_eq!(addrs.len(), 1),
+            _ => panic!("wrong client variant"),
+        }
+        // server → agent (same wire tag, mirror variant)
+        let s = ServerMsg::TunnelQuicCandidate {
+            session_id: ObjectId::new(),
+            addrs: vec!["94.130.141.74:49160".into(), "10.0.0.4:51820".into()],
+        };
+        let ss = serde_json::to_string(&s).unwrap();
+        assert!(ss.contains(r#""t":"rc:tunnel.quic.candidate""#));
+        match serde_json::from_str::<ServerMsg>(&ss).unwrap() {
+            ServerMsg::TunnelQuicCandidate { addrs, .. } => assert_eq!(addrs.len(), 2),
+            _ => panic!("wrong server variant"),
+        }
     }
 
     #[test]
