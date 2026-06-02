@@ -308,6 +308,31 @@ fn build_initial_backend() -> Result<ActiveBackend> {
 /// backend hits an unexpected init error.
 #[cfg(feature = "scrap-capture")]
 fn try_build_dxgi() -> Option<Box<dyn DxgiCapture>> {
+    // rc.109 — re-bind the worker thread to the CURRENT input desktop BEFORE
+    // attempting DXGI Desktop Duplication. `DuplicateOutput` returns
+    // E_ACCESSDENIED (mapped to `DesktopMismatch`) when the calling thread
+    // isn't on the desktop it's trying to duplicate. The GDI re-climb retried
+    // DXGI on a possibly-stale binding — the GDI arm's per-frame
+    // `try_change_desktop` runs AFTER the top-of-fn re-climb — so a hybrid host
+    // that fell to GDI after a lock/unlock stayed pinned on ~12 fps GDI
+    // (field PC55331 rc.108: dxgi-direct engaged 28× then stuck on gdi with
+    // repeated `DesktopMismatch` even while Unlocked/Default). Rebinding here
+    // makes both the startup AND re-climb attempts target the right desktop.
+    // `try_change_desktop` dedupes (SetThreadDesktop only on a real change), so
+    // the steady-state cost is one OpenInputDesktop syscall. The desktop name
+    // is logged so a PERSISTENT post-rebind E_ACCESSDENIED — which would mean
+    // the thread IS on the right desktop but duplication is still denied
+    // (another process holds it, or a session-0 nuance) rather than a stale
+    // binding — is distinguishable in the field log.
+    match desktop_rebind::try_change_desktop() {
+        Ok(desktop_rebind::DesktopChange::Switched(name)) => {
+            tracing::info!(%name, "try_build_dxgi: rebound input desktop before DXGI build");
+        }
+        Ok(desktop_rebind::DesktopChange::Unchanged) => {}
+        Err(e) => {
+            tracing::warn!(%e, "try_build_dxgi: desktop rebind failed before DXGI build");
+        }
+    }
     #[cfg(all(feature = "mf-encoder", feature = "scrap-capture"))]
     {
         match DxgiDirectBackend::primary() {
@@ -318,7 +343,7 @@ fn try_build_dxgi() -> Option<Box<dyn DxgiCapture>> {
             Err(e) => {
                 tracing::warn!(
                     ?e,
-                    "direct-DXGI backend init failed — trying scrap auto-adapter DXGI"
+                    "direct-DXGI backend init failed after desktop rebind — trying scrap auto-adapter DXGI"
                 );
             }
         }
