@@ -45,14 +45,16 @@
 use anyhow::{Result, anyhow};
 use std::sync::mpsc as std_mpsc;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
 use crate::capture::{DownscalePolicy, Frame, PixelFormat, ScreenCapture};
 
 use super::desktop_rebind;
+#[cfg(all(feature = "mf-encoder", feature = "scrap-capture"))]
+use super::dxgi_direct::DxgiDirectBackend;
 #[cfg(feature = "scrap-capture")]
-use super::dxgi_dup::{BackendBail, DxgiDupBackend, DxgiFrame};
+use super::dxgi_dup::{BackendBail, DxgiCapture, DxgiDupBackend, DxgiFrame};
 use super::gdi_backend::{GdiBackend, GdiFrame};
 
 /// After this many consecutive `BackendBail::HardError` returns from
@@ -74,11 +76,24 @@ const HARD_ERROR_FALLBACK_THRESHOLD: u32 = 3;
 /// stare at black frames for long.
 const ACCESS_LOST_FALLBACK_THRESHOLD: u32 = 8;
 
+/// rc.108 — once we've fallen back to the slow GDI BitBlt path, retry DXGI
+/// at most this often. The doc-comment has promised a DXGI re-climb since
+/// M3 A1 but the GDI arm never actually did it (latent bug noted in the
+/// hybrid-GPU memory) — so a transient Optimus AccessLost / driver reset
+/// pinned the host on ~12 fps GDI forever. 5 s is long enough that a
+/// rebuild storm (DXGI keeps failing → 3 frames lost → back to GDI) costs
+/// negligible CPU, short enough that recovery is quick once DXGI is healthy.
+#[cfg(feature = "scrap-capture")]
+const DXGI_RECLIMB_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Active capture backend. Starts as DXGI; swaps to GDI on persistent
-/// HardError; can climb back to DXGI when it recovers.
+/// HardError; can climb back to DXGI when it recovers. The DXGI variant is
+/// boxed behind [`DxgiCapture`] so it can hold either the adapter-bound
+/// [`DxgiDirectBackend`] (preferred — correct on hybrid Optimus hosts) or
+/// the `scrap` auto-adapter [`DxgiDupBackend`] (fallback) transparently.
 #[cfg(feature = "scrap-capture")]
 enum ActiveBackend {
-    Dxgi(DxgiDupBackend),
+    Dxgi(Box<dyn DxgiCapture>),
     Gdi(GdiBackend),
 }
 
@@ -218,6 +233,11 @@ fn worker_main(
     let mut consecutive_hard: u32 = 0;
     let mut consecutive_access_lost: u32 = 0;
     let mut consecutive_empty: u64 = 0;
+    // rc.108 — last time we attempted to climb back from a GDI fallback to
+    // DXGI. Init to now() so the first re-climb attempt waits one full
+    // interval (don't fight a just-failed DXGI startup). Only consulted on
+    // the GDI path; harmlessly carried otherwise.
+    let mut last_dxgi_reclimb = Instant::now();
 
     // rc.91 — worker-side capture timing. The pump-side heartbeat's
     // `avg_capture_ms` measures the WHOLE next_frame() round-trip
@@ -239,6 +259,7 @@ fn worker_main(
             &mut consecutive_hard,
             &mut consecutive_access_lost,
             &mut consecutive_empty,
+            &mut last_dxgi_reclimb,
             start,
         );
         worker_capture_us += cap_start.elapsed().as_micros() as u64;
@@ -263,20 +284,54 @@ fn worker_main(
 
 #[cfg(feature = "scrap-capture")]
 fn build_initial_backend() -> Result<ActiveBackend> {
+    if let Some(b) = try_build_dxgi() {
+        return Ok(ActiveBackend::Dxgi(b));
+    }
+    tracing::warn!(
+        "system-context capture: all DXGI backends failed at startup — falling back to GDI BitBlt"
+    );
+    let gdi = GdiBackend::primary()
+        .map_err(|e| anyhow!("DXGI + GDI both failed to initialise at startup: gdi={e}"))?;
+    Ok(ActiveBackend::Gdi(gdi))
+}
+
+/// Build a DXGI backend, preferring the adapter-bound direct backend (rc.108
+/// hybrid-GPU fix) and falling back to the `scrap` auto-adapter backend.
+/// Returns `None` only when BOTH fail to initialise — the caller then drops
+/// to GDI. Used both at startup and by the GDI re-climb path.
+///
+/// On a hybrid Optimus host the direct backend binds Desktop Duplication to
+/// the iGPU (which owns the display output) instead of the render-only dGPU
+/// `scrap` picks — the difference between fast DXGI (~1-3 ms) and the slow
+/// GDI fallback (~85 ms ⇒ 12 fps). On an Intel-only host both pick the same
+/// adapter, so the scrap path is an exact-behaviour fallback if the direct
+/// backend hits an unexpected init error.
+#[cfg(feature = "scrap-capture")]
+fn try_build_dxgi() -> Option<Box<dyn DxgiCapture>> {
+    #[cfg(all(feature = "mf-encoder", feature = "scrap-capture"))]
+    {
+        match DxgiDirectBackend::primary() {
+            Ok(b) => {
+                tracing::info!("system-context capture: backend=DXGI (direct, adapter-bound)");
+                return Some(Box::new(b));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    ?e,
+                    "direct-DXGI backend init failed — trying scrap auto-adapter DXGI"
+                );
+            }
+        }
+    }
     match DxgiDupBackend::primary() {
         Ok(b) => {
-            tracing::info!("system-context capture: backend=DXGI");
-            Ok(ActiveBackend::Dxgi(b))
+            tracing::info!("system-context capture: backend=DXGI (scrap auto-adapter)");
+            Some(Box::new(b))
         }
-        Err(BackendBail::HardError(e)) => {
-            tracing::warn!(%e, "DXGI primary failed at startup — falling back to GDI BitBlt");
-            let gdi = GdiBackend::primary()
-                .map_err(|e2| anyhow!("DXGI + GDI both failed at startup: dxgi={e}; gdi={e2}"))?;
-            Ok(ActiveBackend::Gdi(gdi))
+        Err(e) => {
+            tracing::warn!(?e, "scrap DXGI backend init also failed");
+            None
         }
-        Err(other) => Err(anyhow!(
-            "DXGI primary returned non-HardError bail at startup: {other:?}"
-        )),
     }
 }
 
@@ -303,7 +358,10 @@ fn backend_dimensions(b: &ActiveBackend) -> (u32, u32) {
 fn backend_name(b: &ActiveBackend) -> &'static str {
     match b {
         #[cfg(feature = "scrap-capture")]
-        ActiveBackend::Dxgi(_) => "dxgi",
+        // "dxgi-direct" (adapter-bound, the rc.108 hybrid fix) vs
+        // "dxgi-scrap" (auto-adapter fallback) — so a single rc:logs-fetch
+        // shows whether the Phase 1 fix actually engaged on a hybrid host.
+        ActiveBackend::Dxgi(d) => d.kind(),
         ActiveBackend::Gdi(_) => "gdi",
     }
 }
@@ -323,8 +381,38 @@ fn capture_one_blocking(
     consecutive_hard: &mut u32,
     consecutive_access_lost: &mut u32,
     consecutive_empty: &mut u64,
+    // rc.108 — re-climb timer for the non-permanent GDI fallback. Read +
+    // written only on the GDI path (under `scrap-capture`); an unused
+    // parameter on the GDI-only build, which Rust does not warn on.
+    last_dxgi_reclimb: &mut Instant,
     start: Instant,
 ) -> CaptureReply {
+    // rc.108 — NON-PERMANENT GDI fallback. The doc-comment has claimed
+    // since M3 A1 that "every successful GDI frame also re-tries DXGI"
+    // but the GDI arm never did — a transient Optimus AccessLost / driver
+    // reset that forced us onto the slow ~12 fps GDI BitBlt path pinned us
+    // there for the rest of the session. Here we actually do it: if we're
+    // on GDI and the re-climb interval has elapsed, rebuild DXGI (the
+    // adapter-bound direct backend is preferred). Runs BEFORE the match
+    // takes any binding on `backend`, so reassigning it is borrow-clean.
+    #[cfg(feature = "scrap-capture")]
+    if matches!(backend, ActiveBackend::Gdi(_))
+        && last_dxgi_reclimb.elapsed() >= DXGI_RECLIMB_INTERVAL
+    {
+        *last_dxgi_reclimb = Instant::now();
+        if let Some(b) = try_build_dxgi() {
+            tracing::info!(
+                kind = b.kind(),
+                "system-context capture: climbed back from GDI fallback to DXGI"
+            );
+            *backend = ActiveBackend::Dxgi(b);
+            *consecutive_hard = 0;
+            *consecutive_access_lost = 0;
+            // Fall through — the match below now takes the Dxgi arm and
+            // attempts a real frame this tick.
+        }
+    }
+
     match backend {
         #[cfg(feature = "scrap-capture")]
         ActiveBackend::Dxgi(b) => match b.frame() {
