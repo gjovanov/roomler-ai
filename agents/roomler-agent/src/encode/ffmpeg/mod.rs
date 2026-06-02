@@ -53,22 +53,28 @@ pub fn linked_libavcodec_version() -> u32 {
     unsafe { ffmpeg_next::ffi::avcodec_version() }
 }
 
-/// Whether the FFmpeg encoder backend is opted-in for this process.
-/// Set `ROOMLER_AGENT_USE_FFMPEG=1` to enable (or `true`, `yes`, `on`).
-/// Any other value (or unset) leaves the MF cascade as the default.
+/// Whether the FFmpeg encoder backend is enabled for this process.
 ///
-/// rc.72: only `open_for_codec_hevc` consults this. H.264 and AV1 paths
-/// stay on MF. rc.73+ extends to AV1 once D3D11VA zero-copy lands.
+/// **rc.107: DEFAULT ON.** HEVC-over-DataChannel is the primary remote-video
+/// path now, so the FFmpeg backend is enabled UNLESS explicitly disabled with
+/// `ROOMLER_AGENT_USE_FFMPEG=0` (or `false`/`no`/`off`/empty). The rc.72 opt-IN
+/// gate flipped this default because an MSI MajorUpgrade WIPES the operator's
+/// service env block, and since 6bc9d58 every `agent-v*` bump is a MajorUpgrade
+/// → the dropped `USE_FFMPEG=1` silently disabled HEVC FLEET-WIDE (caps stopped
+/// advertising `data-channel-hevc` → black canvas; field rc.105→rc.106). The
+/// caps probe still gates ADVERTISEMENT on a real `FfmpegEncoder` probe, so a
+/// host without working HW HEVC/QSV falls back cleanly regardless of this flag.
 #[cfg(feature = "ffmpeg-encoder")]
 pub fn ffmpeg_backend_enabled() -> bool {
-    std::env::var("ROOMLER_AGENT_USE_FFMPEG")
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
+    match std::env::var("ROOMLER_AGENT_USE_FFMPEG") {
+        // Explicit opt-OUT only. Any other value (the old truthy set, or
+        // unrecognised text) leaves the backend ON.
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off" | ""
+        ),
+        Err(_) => true,
+    }
 }
 
 /// rc.72 entrypoint: returns true when the FFmpeg backend is opted in
@@ -94,33 +100,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn available_false_when_env_unset() {
+    fn available_default_on_when_env_unset() {
         // SAFETY: tests share the process env; this module is the only
         // one touching ROOMLER_AGENT_USE_FFMPEG so no concurrent reads.
         unsafe { std::env::remove_var("ROOMLER_AGENT_USE_FFMPEG") };
+        // rc.107 — DEFAULT ON in the ffmpeg-encoder build (HEVC-over-DC is
+        // the primary path); the feature-off build hardwires available()=false.
+        #[cfg(feature = "ffmpeg-encoder")]
+        assert!(
+            available(),
+            "rc.107: FFmpeg backend defaults ON unless explicitly disabled (=0)"
+        );
+        #[cfg(not(feature = "ffmpeg-encoder"))]
         assert!(
             !available(),
-            "available() must default off so MF cascade stays the default"
+            "feature-off build: available() is hardwired false"
         );
     }
 
     #[cfg(feature = "ffmpeg-encoder")]
     #[test]
-    fn ffmpeg_backend_enabled_reads_truthy_values() {
+    fn ffmpeg_backend_enabled_default_on_with_explicit_opt_out() {
         unsafe { std::env::remove_var("ROOMLER_AGENT_USE_FFMPEG") };
-        assert!(!ffmpeg_backend_enabled(), "unset → off");
-        for truthy in ["1", "true", "TRUE", "yes", "On"] {
-            unsafe { std::env::set_var("ROOMLER_AGENT_USE_FFMPEG", truthy) };
+        assert!(ffmpeg_backend_enabled(), "rc.107: unset → ON (default)");
+        for on in ["1", "true", "TRUE", "yes", "On", "whatever"] {
+            unsafe { std::env::set_var("ROOMLER_AGENT_USE_FFMPEG", on) };
             assert!(
                 ffmpeg_backend_enabled(),
-                "value {truthy:?} should enable the FFmpeg backend"
+                "value {on:?} (not an explicit off-value) should keep the FFmpeg backend ON"
             );
         }
-        for falsy in ["0", "false", "no", "off", ""] {
-            unsafe { std::env::set_var("ROOMLER_AGENT_USE_FFMPEG", falsy) };
+        for off in ["0", "false", "no", "off", ""] {
+            unsafe { std::env::set_var("ROOMLER_AGENT_USE_FFMPEG", off) };
             assert!(
                 !ffmpeg_backend_enabled(),
-                "value {falsy:?} should leave MF cascade as default"
+                "value {off:?} should explicitly disable the FFmpeg backend"
             );
         }
         unsafe { std::env::remove_var("ROOMLER_AGENT_USE_FFMPEG") };
