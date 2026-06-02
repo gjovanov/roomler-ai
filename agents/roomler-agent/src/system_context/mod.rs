@@ -61,6 +61,14 @@
 pub mod capture_pump;
 pub mod desktop_rebind;
 pub mod dxgi_dup;
+// rc.108 Phase 1 — adapter-bound DXGI Desktop Duplication that binds to the
+// adapter owning the PRIMARY OUTPUT (the iGPU on a hybrid Optimus host), so
+// capture stays on fast DXGI instead of falling to GDI BitBlt. Needs both
+// the `windows` crate (`mf-encoder`) and the scrap fallback / DxgiFrame
+// surface (`scrap-capture`) — i.e. the production `full-hw,system-context`
+// MSI. See the module header for the PC55331 motivation.
+#[cfg(all(feature = "mf-encoder", feature = "scrap-capture"))]
+pub mod dxgi_direct;
 // rc.105 Phase 0 — DXGI adapter/output enumeration for the hybrid-GPU
 // capture diagnostics. Uses the `windows` crate, gated on `mf-encoder`
 // (present in the production `full-hw` build).

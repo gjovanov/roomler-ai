@@ -162,6 +162,28 @@ pub struct DxgiFrame {
     pub stride: u32,
 }
 
+/// Uniform interface over the two DXGI Desktop Duplication backends —
+/// the `scrap`-wrapping [`DxgiDupBackend`] (auto-adapter) and the
+/// adapter-bound [`super::dxgi_direct::DxgiDirectBackend`] (rc.108, the
+/// hybrid-GPU fix). The capture pump holds a `Box<dyn DxgiCapture>` so its
+/// per-frame match arm is identical regardless of which backend won at
+/// startup. Gated on `scrap-capture` because the surface returns
+/// [`DxgiFrame`]; the direct backend additionally needs `mf-encoder`.
+#[cfg(feature = "scrap-capture")]
+pub trait DxgiCapture {
+    /// Acquire one frame (non-blocking). `BackendBail::Transient` on a
+    /// static desktop (no new frame this tick).
+    fn frame(&mut self) -> Result<DxgiFrame, BackendBail>;
+    /// Drop + recreate the duplication after `AccessLost`.
+    fn reset(&mut self) -> Result<(), BackendBail>;
+    /// Capture dimensions in pixels.
+    fn dimensions(&self) -> (u32, u32);
+    /// Short backend label for the worker heartbeat (`"dxgi-scrap"` /
+    /// `"dxgi-direct"`) so a single `rc:logs-fetch` shows which DXGI path
+    /// is live on a hybrid host.
+    fn kind(&self) -> &'static str;
+}
+
 /// DXGI Desktop Duplication backend. Owns one `scrap::Capturer`
 /// pinned to the calling thread. Not `Send`.
 #[cfg(feature = "scrap-capture")]
@@ -246,6 +268,25 @@ impl DxgiDupBackend {
         // which releases the duplication.
         *self = new;
         Ok(())
+    }
+}
+
+#[cfg(feature = "scrap-capture")]
+impl DxgiCapture for DxgiDupBackend {
+    // Inherent methods win method resolution, so these delegate without
+    // recursing. Kept as a thin shim so the capture pump can box this
+    // backend behind `dyn DxgiCapture` alongside the adapter-bound one.
+    fn frame(&mut self) -> Result<DxgiFrame, BackendBail> {
+        DxgiDupBackend::frame(self)
+    }
+    fn reset(&mut self) -> Result<(), BackendBail> {
+        DxgiDupBackend::reset(self)
+    }
+    fn dimensions(&self) -> (u32, u32) {
+        DxgiDupBackend::dimensions(self)
+    }
+    fn kind(&self) -> &'static str {
+        "dxgi-scrap"
     }
 }
 
