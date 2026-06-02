@@ -68,11 +68,13 @@ const PEER_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3
 const FLOW_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Cap on waiting for `rc:tunnel.quic.ready` after `rc:tunnel.opened`
-/// negotiated `quic-v1`. The server has to relay `TunnelQuicSetup` to
-/// the agent + relay the agent's reply back, so it's a server↔agent
-/// round-trip plus the agent's endpoint bind. On timeout the client
-/// abandons QUIC and (for `--transport auto`) re-opens over WebRTC.
-const QUIC_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// negotiated `quic-v1`. The agent may walk several TURN-relay candidates
+/// before replying — on a corp net that blocks UDP, a UDP attempt
+/// (`:3478`, ~5 s) then a TURNS/TCP allocate (`:443`) — so this must cover
+/// the agent's full tier walk, not just one RTT. 30 s comfortably bounds
+/// 1–2 UDP timeouts + a TLS allocate. On timeout the client abandons QUIC
+/// and (for `--transport auto`) re-opens over WebRTC.
+const QUIC_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Phase 3d: head start we give the agent's TURN-permission install (it
 /// fires when our `rc:tunnel.quic.candidate` reaches the agent over WS)
