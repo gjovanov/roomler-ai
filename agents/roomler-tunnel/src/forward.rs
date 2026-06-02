@@ -1073,7 +1073,30 @@ async fn setup_quic_over_relay(
     session_id: ObjectId,
     outbound_tx: &mpsc::Sender<ClientMsg>,
 ) -> Option<(QuicPeer, QuicConnection)> {
-    let turn_relay = match relay::allocate_relay_from_ice(urls, username, credential).await {
+    // Same-worker pin: coturn relays between two allocations on the SAME
+    // worker via hairpin, but cross-worker relay-to-relay breaks on this
+    // cluster (the dual-public-IP SNAT rewrites the relay's egress source
+    // so the peer's CreatePermission no longer matches). The agent — often
+    // UDP-blocked — can't be pinned (its TLS allocate needs the coturn
+    // hostname for SNI), so the CLIENT follows the agent onto its worker by
+    // allocating its UDP relay directly on the agent's relay IP. Falls back
+    // to the round-robin hostname urls if that UDP allocate fails (e.g. a
+    // UDP-blocked controller), which lands cross-worker but at least tries.
+    let mut alloc_urls: Vec<String> = Vec::new();
+    if let Some(ip) = agent_addrs
+        .iter()
+        .find_map(|a| a.parse::<std::net::SocketAddr>().ok().map(|s| s.ip()))
+    {
+        let host = if ip.is_ipv6() {
+            format!("[{ip}]")
+        } else {
+            ip.to_string()
+        };
+        alloc_urls.push(format!("turn:{host}:3478?transport=udp"));
+        info!(%ip, "QUIC client: pinning relay to the agent's coturn worker (hairpin)");
+    }
+    alloc_urls.extend_from_slice(urls);
+    let turn_relay = match relay::allocate_relay_from_ice(&alloc_urls, username, credential).await {
         Ok(r) => r,
         Err(e) => {
             warn!(%e, "QUIC client: TURN allocate failed");
