@@ -2352,6 +2352,13 @@ async fn media_pump_ffmpeg_dc(
     // capture/encode loop at cadence instead of stalling on `send().await`
     // — the likely cause of the field's "13 fps under motion".
     let mut frames_dropped_backpressure: u64 = 0;
+    // rc.111 — frames skipped at the SOURCE (before capture+encode) because
+    // the send channel was full. Distinct from frames_dropped_backpressure
+    // (which counts frames encoded THEN dropped at try_send). Skipping before
+    // encode is the cheaper, smoother response: no wasted GPU encode and no
+    // resync-keyframe churn (the HEVC delta chain stays intact). See the gate
+    // at the top of the loop.
+    let mut frames_skipped_backpressure: u64 = 0;
     // rc.88 — per-stage timing accumulators (µs since last heartbeat) so
     // the field log localises the bottleneck: capture vs encode vs send.
     let mut capture_us: u64 = 0;
@@ -2434,6 +2441,46 @@ async fn media_pump_ffmpeg_dc(
         // SystemContext worker delivers at display rate. A second floor
         // here just halved the achieved fps and amplified idle Nones. Poll
         // continuously, exactly like the fast `media_pump`.
+
+        // rc.111 — BACKPRESSURE GATE. Gate frame PRODUCTION on the send
+        // channel having capacity. When the dedicated send task can't drain
+        // the link fast enough (bandwidth-limited / relayed path), the bounded
+        // channel (depth FFMPEG_SEND_QUEUE_DEPTH) fills. Pre-rc.111 the pump
+        // kept capturing + encoding at full rate and DROPPED the encoded frame
+        // at `try_send` (frames_dropped_backpressure) + scheduled a resync
+        // keyframe — wasting GPU encode and, worse, the resync IDRs (the
+        // LARGEST frames) piled MORE bytes onto an already-congested link,
+        // amplifying the stall. Field GORAN-XMG-NEO16 (RTX 5090, 2560×1600):
+        // capture 6 ms + encode 8 ms (fast) but ~37% of encoded frames dropped
+        // + resync churn → stutter.
+        //
+        // Skipping at the source instead: don't capture/encode a frame we
+        // can't send. Production auto-paces to the drain rate, the HEVC delta
+        // chain stays continuous (no resync keyframe needed — the next encoded
+        // frame just deltas from the last ENCODED one across the gap), and the
+        // GPU is freed. Single-producer, so capacity()>0 here guarantees the
+        // post-encode try_send below won't block; that try_send stays as a
+        // safety net for the rare multi-packet frame that overflows mid-send.
+        // The 2 ms yield matches the empty-poll pace (precise at the rc.92 1 ms
+        // timer resolution) and only fires under genuine congestion.
+        //
+        // Check is_closed() FIRST: the send task only dies if its receiver is
+        // dropped (or it panics). Were that to happen, capacity() stays 0 and
+        // the skip-loop would livelock without ever reaching the try_send that
+        // detects Closed — so exit the pump here instead, mirroring the
+        // try_send Closed arm below.
+        if send_tx.is_closed() {
+            tracing::warn!(
+                %session_id, codec_label,
+                "FFmpeg DC pump: send task gone (channel closed) — exiting pump"
+            );
+            return;
+        }
+        if send_tx.capacity() == 0 {
+            frames_skipped_backpressure += 1;
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            continue;
+        }
 
         // Capture one frame; on transient failure, reuse the last
         // good one as a keepalive so the browser decoder doesn't
@@ -2692,7 +2739,8 @@ async fn media_pump_ffmpeg_dc(
                 height = h,
                 encoder = enc.name(),
                 frames_captured, frames_encoded, frames_sent, bytes_written,
-                send_errors, dc_unopen_drops, frames_dropped_backpressure, frames_empty,
+                send_errors, dc_unopen_drops, frames_dropped_backpressure,
+                frames_skipped_backpressure, frames_empty,
                 avg_capture_ms, avg_encode_ms, avg_send_ms,
                 "FFmpeg DC pump heartbeat (≈2s window)"
             );
