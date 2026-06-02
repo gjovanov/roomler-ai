@@ -24,6 +24,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
@@ -119,6 +120,22 @@ pub async fn gather_candidates(
     cands
 }
 
+/// Shared quinn transport tuning for both endpoints. **Keepalive is
+/// load-bearing for the tunnel:** a forward sits idle between queries, and
+/// without periodic traffic quinn idle-closes the connection (≈30 s) — so
+/// the next query hits a dead connection (`open_bi` fails). An 8 s
+/// keepalive also keeps the TURN permission/binding fresh on the relay
+/// path (coturn permissions lapse ~5 min). `keep_alive_interval` MUST stay
+/// below `max_idle_timeout`.
+fn quic_transport_config() -> Arc<quinn::TransportConfig> {
+    let mut t = quinn::TransportConfig::default();
+    t.keep_alive_interval(Some(Duration::from_secs(8)));
+    t.max_idle_timeout(Some(
+        quinn::IdleTimeout::try_from(Duration::from_secs(30)).expect("30s is a valid idle timeout"),
+    ));
+    Arc::new(t)
+}
+
 /// Build the quinn server config (TLS1.3, ephemeral self-signed cert,
 /// ALPN) shared by [`QuicPeer::server`] and
 /// [`QuicPeer::server_from_socket`]. Returns the config plus the cert
@@ -137,7 +154,9 @@ fn build_server_config() -> Result<(ServerConfig, String)> {
         .context("quic server: single cert")?;
     tls.alpn_protocols = vec![ALPN.to_vec()];
     let qsc = QuicServerConfig::try_from(tls).context("quic server config from rustls")?;
-    Ok((ServerConfig::with_crypto(Arc::new(qsc)), fingerprint))
+    let mut server_config = ServerConfig::with_crypto(Arc::new(qsc));
+    server_config.transport_config(quic_transport_config());
+    Ok((server_config, fingerprint))
 }
 
 /// Build the quinn client config (TLS1.3, pinned-fingerprint verifier,
@@ -157,7 +176,9 @@ fn build_client_config(pinned_fingerprint_hex: &str) -> Result<ClientConfig> {
         .with_no_client_auth();
     tls.alpn_protocols = vec![ALPN.to_vec()];
     let qcc = QuicClientConfig::try_from(tls).context("quic client config from rustls")?;
-    Ok(ClientConfig::new(Arc::new(qcc)))
+    let mut client_config = ClientConfig::new(Arc::new(qcc));
+    client_config.transport_config(quic_transport_config());
+    Ok(client_config)
 }
 
 /// One QUIC endpoint (server or client side). Connections + per-flow
