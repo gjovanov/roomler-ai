@@ -2332,9 +2332,20 @@ async fn media_pump_ffmpeg_dc(
 
     let mut frames_captured: u64 = 0;
     let mut frames_encoded: u64 = 0;
-    let mut frames_sent: u64 = 0;
-    let mut bytes_written: u64 = 0;
-    let mut send_errors: u64 = 0;
+    // rc.106 — frames_sent / bytes_written / send_errors are owned by the
+    // dedicated send task (spawned below) and shared back as atomics so the
+    // heartbeat can still read them. Moving the chunked DC send off the
+    // pump's hot path stops a big (IDR / motion) frame from stalling
+    // capture+encode on `send().await` — the "hangs every few seconds"
+    // under window movement (field GORAN-XMG-NEO16: 46 fps with periodic
+    // freezes; the inline send blocked the loop ~tens of ms per multi-MB
+    // frame).
+    let frames_sent = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let bytes_written = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let send_errors = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // rc.106 — set after a backpressure drop so the first frame that
+    // successfully re-enqueues is forced to a keyframe (clean browser resync).
+    let mut resync_pending = false;
     let mut dc_unopen_drops: u64 = 0;
     // rc.88 — frames dropped because the DC send buffer was over the
     // high-water mark (congested link). Shedding a delta frame keeps the
@@ -2360,11 +2371,61 @@ async fn media_pump_ffmpeg_dc(
     let mut heartbeat_frames_base: u64 = 0;
     let mut last_heartbeat = std::time::Instant::now();
     const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
-    // rc.88 — DC send-buffer high-water mark. Above this we drop the
-    // frame rather than queueing it (and await-blocking the loop). 1 MiB
-    // matches the VP9-444 pump's AIMD high-water. webrtc-data's own
-    // buffer cap is higher; this is a latency guard, not a hard limit.
-    const BACKPRESSURE_HIGH_WATER: usize = 1024 * 1024;
+
+    // rc.106 — dedicated DC send task. The chunked `dc.send().await` is
+    // flow-controlled by SCTP; on a multi-MB frame (HEVC IDR / high-motion
+    // delta) it blocks for tens of ms. Doing that inline in the pump (rc.88)
+    // stalled capture+encode → the periodic freeze (field GORAN-XMG-NEO16).
+    // Hand framed frames to this task over a small bounded channel instead;
+    // the pump never blocks on the link (see the `try_send` below). A SINGLE
+    // consumer keeps the 16 KiB chunk order intact (the browser reassembler
+    // needs it). Depth is small so we stay low-latency — under sustained
+    // congestion the pump sheds load (drops + schedules a resync keyframe)
+    // rather than building a stale backlog.
+    const FFMPEG_SEND_QUEUE_DEPTH: usize = 4;
+    let (send_tx, mut send_rx) =
+        tokio::sync::mpsc::channel::<bytes::Bytes>(FFMPEG_SEND_QUEUE_DEPTH);
+    {
+        let video_bytes_dc = video_bytes_dc.clone();
+        let frames_sent = frames_sent.clone();
+        let bytes_written = bytes_written.clone();
+        let send_errors = send_errors.clone();
+        let task_session = session_id;
+        tokio::spawn(async move {
+            use std::sync::atomic::Ordering::Relaxed;
+            const SCTP_CHUNK_SIZE: usize = 16 * 1024;
+            while let Some(wire) = send_rx.recv().await {
+                // Fetch the DC fresh each frame — the same handle the pump's
+                // open-check uses. None means it closed under us (the pump's
+                // open-guard re-requests a keyframe on its side).
+                let Some(dc) = video_bytes_dc.lock().await.clone() else {
+                    continue;
+                };
+                let total = wire.len();
+                let mut off = 0usize;
+                let mut ok = true;
+                while off < total {
+                    let end = (off + SCTP_CHUNK_SIZE).min(total);
+                    // `wire.slice` is zero-copy (shares the Bytes buffer).
+                    if let Err(e) = dc.send(&wire.slice(off..end)).await {
+                        let n = send_errors.fetch_add(1, Relaxed) + 1;
+                        tracing::warn!(
+                            session = %task_session, %e, send_errors = n,
+                            "FFmpeg DC pump send task: DC send failed"
+                        );
+                        ok = false;
+                        break;
+                    }
+                    off = end;
+                }
+                if ok {
+                    frames_sent.fetch_add(1, Relaxed);
+                    bytes_written.fetch_add(total as u64, Relaxed);
+                }
+            }
+            tracing::debug!(session = %task_session, "FFmpeg DC pump send task exiting (channel closed)");
+        });
+    }
 
     loop {
         // rc.93 — NO pump-side pacing floor (the rc.86→rc.92 floor sleep
@@ -2555,14 +2616,9 @@ async fn media_pump_ffmpeg_dc(
             continue;
         }
 
-        // rc.88 — backpressure: if the DC send buffer is already over the
-        // high-water mark the link can't keep up. Drop this frame (shed
-        // load) rather than `await`-blocking the loop on a congested
-        // channel — blocking is what dragged the field's fps down to 13
-        // under motion. Dropping a delta frame is benign (the decoder
-        // holds the last frame); after a drop we force a keyframe so the
-        // next sent frame fully resyncs the browser. Keyframes are NEVER
-        // dropped (they're the recovery point).
+        // rc.106 — backpressure moved to the bounded send channel (the
+        // `try_send` below sheds load instead of blocking). This block now
+        // only powers the one-shot first-key-flagged-packet diagnostic.
         let has_keyframe = packets.iter().any(|p| p.is_keyframe);
         if has_keyframe && !first_keyframe_logged {
             first_keyframe_logged = true;
@@ -2571,48 +2627,43 @@ async fn media_pump_ffmpeg_dc(
                 "FFmpeg DC pump: first key-flagged packet emitted (rc.98 — confirms IDR flagging; NVENC needs forced-idr=1)"
             );
         }
-        if !has_keyframe {
-            let buffered = dc.buffered_amount().await;
-            if buffered > BACKPRESSURE_HIGH_WATER {
-                frames_dropped_backpressure += 1;
-                // Force the next frame to be a keyframe so the browser
-                // resyncs cleanly once the buffer drains.
-                enc.request_keyframe();
-                continue;
-            }
-        }
-
+        // rc.106 — hand each framed packet to the send task rather than
+        // chunk-sending inline. `try_send` NEVER blocks the capture/encode
+        // loop: if the task is behind (the link can't drain a big motion/IDR
+        // frame fast enough) the bounded channel fills and we shed THIS frame,
+        // scheduling a resync keyframe for when the queue drains. The send
+        // task owns the 16 KiB chunking + the flow-controlled `dc.send().await`
+        // (still ≤ 16 KiB per message — the webrtc-data 65535-byte read-buffer
+        // cap that rc.85 fixed). A single consumer preserves chunk order for
+        // the browser reassembler.
         let send_start = std::time::Instant::now();
         for pkt in packets {
-            let wire = frame_video_bytes(&pkt.data, pkt.is_keyframe, frame.monotonic_us);
-            let wire_len = wire.len() as u64;
-            // rc.85 CRITICAL FIX: chunk into ≤ 16 KiB pieces, exactly like
-            // `media_pump_vp9_444_dc` (line ~2158). rc.77–rc.84 sent the
-            // WHOLE framed packet in one `dc.send()`, which is fatal: an
-            // HEVC IDR is 50 KB–2 MB and webrtc-data's DataChannel read
-            // loop reads every inbound message into a fixed 65535-byte
-            // buffer — a single message ≥ 65536 makes `read_sctp` return
-            // ErrShortBuffer → stream close → the DC dies permanently for
-            // the rest of the session (root cause documented in the
-            // parallel-session tunnel fix 5afe40a). The Gate 0 smoke
-            // never caught this because it only encodes; it never sends
-            // over a DC. The browser worker's `consumeBytes` already
-            // reassembles across `onmessage` boundaries via the 13-byte
-            // header's size field, so chunked sends are exactly what it
-            // expects.
-            const SCTP_CHUNK_SIZE: usize = 16 * 1024;
-            let mut frame_failed = false;
-            for chunk in wire.chunks(SCTP_CHUNK_SIZE) {
-                if let Err(e) = dc.send(&bytes::Bytes::copy_from_slice(chunk)).await {
-                    send_errors += 1;
-                    tracing::warn!(%session_id, codec_label, %e, send_errors, "FFmpeg DC pump: DC send failed");
-                    frame_failed = true;
-                    break;
+            let wire = bytes::Bytes::from(frame_video_bytes(
+                &pkt.data,
+                pkt.is_keyframe,
+                frame.monotonic_us,
+            ));
+            match send_tx.try_send(wire) {
+                Ok(()) => {
+                    if resync_pending {
+                        // First frame through after a drop burst — make the
+                        // NEXT one a keyframe so the browser resyncs the
+                        // deltas it missed during congestion.
+                        resync_pending = false;
+                        enc.request_keyframe();
+                    }
                 }
-            }
-            if !frame_failed {
-                frames_sent += 1;
-                bytes_written += wire_len;
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    frames_dropped_backpressure += 1;
+                    resync_pending = true;
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    tracing::warn!(
+                        %session_id, codec_label,
+                        "FFmpeg DC pump: send task gone — exiting pump"
+                    );
+                    return;
+                }
             }
         }
         send_us += send_start.elapsed().as_micros() as u64;
@@ -2624,6 +2675,11 @@ async fn media_pump_ffmpeg_dc(
         // heartbeat.
         if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
             last_heartbeat = std::time::Instant::now();
+            // rc.106 — these three are owned by the send task now; snapshot
+            // them for the log line.
+            let frames_sent = frames_sent.load(std::sync::atomic::Ordering::Relaxed);
+            let bytes_written = bytes_written.load(std::sync::atomic::Ordering::Relaxed);
+            let send_errors = send_errors.load(std::sync::atomic::Ordering::Relaxed);
             let window_frames = frames_encoded.saturating_sub(heartbeat_frames_base).max(1);
             let avg_capture_ms = (capture_us / window_frames) as f64 / 1000.0;
             let avg_encode_ms = (encode_us / window_frames) as f64 / 1000.0;
