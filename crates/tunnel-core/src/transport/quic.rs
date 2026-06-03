@@ -134,14 +134,19 @@ fn quic_transport_config() -> Arc<quinn::TransportConfig> {
         quinn::IdleTimeout::try_from(Duration::from_secs(30)).expect("30s is a valid idle timeout"),
     ));
     // Flow-control windows tuned for the relay's high BDP (controller →
-    // coturn → agent's TLS/TCP leg → dst). quinn's ~1 MiB defaults throttle
-    // a single bulk stream over the relay; 2026-06-03 measurement showed
-    // QUIC at ~4.7 Mbps vs WebRTC ~14.4 Mbps (whose vendored SCTP a_rwnd is
-    // 8 MiB) for the same `select *`. Match that: 8 MiB per stream, with
-    // 2× connection + send headroom. The RECEIVER advertises these, so
-    // tuning a peer raises how much its sender (the other end) may keep
-    // in-flight toward it.
-    const STREAM_WIN: u32 = 8 * 1024 * 1024;
+    // coturn → agent's TLS/TCP leg → dst — the TCP relay's buffering
+    // inflates the effective BDP far above the raw RTT). quinn's ~1 MiB
+    // defaults throttled a single bulk stream hard: 2026-06-03 measured QUIC
+    // 238 s vs WebRTC 77 s for the same `select *`; raising the stream
+    // window to 8 MiB (WebRTC's vendored SCTP a_rwnd) cut QUIC to 61 s —
+    // faster than WebRTC. 16 MiB (rc.114) gives headroom to fully saturate
+    // the ~24 Mbps link in both directions. `VarInt` allows far more
+    // (~4.6 EB); past the BDP it only adds buffering/bufferbloat, so 16 MiB
+    // is the deliberate ceiling. The RECEIVER advertises these, so BOTH
+    // peers need the tuned build for their RECEIVE direction (the client's
+    // window governs DB→client download; the agent's governs client→DB
+    // upload).
+    const STREAM_WIN: u32 = 16 * 1024 * 1024;
     t.stream_receive_window(quinn::VarInt::from_u32(STREAM_WIN));
     t.receive_window(quinn::VarInt::from_u32(2 * STREAM_WIN));
     t.send_window(u64::from(2 * STREAM_WIN));
