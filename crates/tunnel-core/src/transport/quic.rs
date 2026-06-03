@@ -133,6 +133,18 @@ fn quic_transport_config() -> Arc<quinn::TransportConfig> {
     t.max_idle_timeout(Some(
         quinn::IdleTimeout::try_from(Duration::from_secs(30)).expect("30s is a valid idle timeout"),
     ));
+    // Flow-control windows tuned for the relay's high BDP (controller →
+    // coturn → agent's TLS/TCP leg → dst). quinn's ~1 MiB defaults throttle
+    // a single bulk stream over the relay; 2026-06-03 measurement showed
+    // QUIC at ~4.7 Mbps vs WebRTC ~14.4 Mbps (whose vendored SCTP a_rwnd is
+    // 8 MiB) for the same `select *`. Match that: 8 MiB per stream, with
+    // 2× connection + send headroom. The RECEIVER advertises these, so
+    // tuning a peer raises how much its sender (the other end) may keep
+    // in-flight toward it.
+    const STREAM_WIN: u32 = 8 * 1024 * 1024;
+    t.stream_receive_window(quinn::VarInt::from_u32(STREAM_WIN));
+    t.receive_window(quinn::VarInt::from_u32(2 * STREAM_WIN));
+    t.send_window(u64::from(2 * STREAM_WIN));
     Arc::new(t)
 }
 
