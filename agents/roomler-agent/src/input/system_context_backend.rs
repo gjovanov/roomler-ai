@@ -175,22 +175,44 @@ fn run_worker(mut enigo: Enigo, rx: std_mpsc::Receiver<InputMsg>) {
     let mut key_events: u64 = 0;
     while let Ok(msg) = rx.recv() {
         events_since_log = events_since_log.wrapping_add(1);
-        // rc.120 — correlate keystrokes with the focused window's integrity.
-        // Rate-limited (first 20 key events + every 256th) so it never spams the
-        // log during fast typing. If `fg_integrity` > `worker_integrity`, UIPI is
-        // silently dropping these keys — which is exactly the "can't type into an
-        // elevated PowerShell" symptom, and SendInput returns success regardless.
-        if matches!(msg, InputMsg::Key { .. } | InputMsg::KeyText { .. }) {
-            key_events = key_events.wrapping_add(1);
-            if key_events <= 20 || key_events.is_multiple_of(256) {
-                tracing::info!(
-                    seq = key_events,
-                    worker_integrity = %self_integrity_label(),
-                    foreground = %foreground_window_diag(),
-                    "system-context input: key dispatch diagnostic (rc.120)"
-                );
+        // rc.121 — rc.120 PROVED this is NOT UIPI on REGAL-112500982 (worker
+        // integrity=System 0x4000 > foreground powershell.exe High 0x3000 ⇒
+        // UIPI-exempt) yet letters don't land while Enter/Backspace do. The
+        // remaining unknown is the INJECTION PATH: a printable letter arrives as
+        // `key_text` → enigo.text() → KEYEVENTF_UNICODE (VK_PACKET — which the
+        // Windows console / PSReadLine is known to drop), whereas Enter/Backspace
+        // arrive as `key` → a real virtual key (accepted). This logs the path +
+        // first-char CLASS + enigo's result so one reproduction settles it.
+        //
+        // PRIVACY: never log the literal typed text (it can be a password) — only
+        // the message kind, char count, and the Unicode class of the first char.
+        let key_diag: Option<String> = match &msg {
+            InputMsg::Key { code, down, mods } => Some(format!(
+                "path=key(real-VK) code=0x{code:02x} down={down} mods=0x{mods:02x}"
+            )),
+            InputMsg::KeyText { text } => {
+                let n = text.chars().count();
+                let class = match text.chars().next() {
+                    Some(c) if c.is_alphabetic() => "alpha",
+                    Some(c) if c.is_ascii_digit() => "digit",
+                    Some(c) if c.is_ascii_punctuation() => "punct",
+                    Some(c) if c.is_whitespace() => "space",
+                    Some(_) => "other",
+                    None => "empty",
+                };
+                let ascii = text.chars().next().map(|c| c.is_ascii()).unwrap_or(false);
+                Some(format!(
+                    "path=key_text(enigo.text->KEYEVENTF_UNICODE) chars={n} first_class={class} first_ascii={ascii}"
+                ))
             }
-        }
+            _ => None,
+        };
+        let log_key = if key_diag.is_some() {
+            key_events = key_events.wrapping_add(1);
+            key_events <= 30 || key_events.is_multiple_of(256)
+        } else {
+            false
+        };
         match desktop_rebind::try_change_desktop() {
             Ok(desktop_rebind::DesktopChange::Unchanged) => {
                 // Most common branch by ~1000:1. Stay quiet.
@@ -219,7 +241,30 @@ fn run_worker(mut enigo: Enigo, rx: std_mpsc::Receiver<InputMsg>) {
                 );
             }
         }
-        match enigo_backend::dispatch_for_external(&mut enigo, msg.clone()) {
+        let dispatch_result = enigo_backend::dispatch_for_external(&mut enigo, msg.clone());
+        // rc.121 — log the path + enigo result for key events (rate-limited). If
+        // `dispatch=ok` but the letter never appears in PowerShell, enigo injected
+        // it (KEYEVENTF_UNICODE) and the CONSOLE dropped it → fix = inject typed
+        // chars as real virtual keys, not VK_PACKET. If `dispatch=err`, injection
+        // itself failed. If letters arrive as `path=key(real-VK)` (not key_text),
+        // the deployed browser is sending VK codes → fix is browser-side.
+        if log_key {
+            if let Some(desc) = &key_diag {
+                let dispatch = match &dispatch_result {
+                    Ok(_) => "ok".to_string(),
+                    Err(e) => format!("err: {e}"),
+                };
+                tracing::info!(
+                    seq = key_events,
+                    detail = %desc,
+                    dispatch = %dispatch,
+                    worker_integrity = %self_integrity_label(),
+                    foreground = %foreground_window_diag(),
+                    "system-context input: key dispatch diagnostic (rc.121)"
+                );
+            }
+        }
+        match dispatch_result {
             Ok(_) => {
                 consec_dispatch_errors = 0;
             }
