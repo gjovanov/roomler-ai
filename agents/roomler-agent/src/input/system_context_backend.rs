@@ -202,7 +202,7 @@ fn run_worker(mut enigo: Enigo, rx: std_mpsc::Receiver<InputMsg>) {
                 };
                 let ascii = text.chars().next().map(|c| c.is_ascii()).unwrap_or(false);
                 Some(format!(
-                    "path=key_text(enigo.text->KEYEVENTF_UNICODE) chars={n} first_class={class} first_ascii={ascii}"
+                    "path=key_text(rc.122 real-VK+scancode, unicode fallback) chars={n} first_class={class} first_ascii={ascii}"
                 ))
             }
             _ => None,

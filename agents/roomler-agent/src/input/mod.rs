@@ -59,6 +59,12 @@ pub fn parse_virtual_screen_flag(value: Option<&str>) -> bool {
 #[cfg(feature = "enigo-input")]
 pub mod enigo_backend;
 
+// rc.122 — Windows real-virtual-key text injection so typed letters land in the
+// legacy console (Windows PowerShell 5.1 / cmd), which drops enigo.text()'s
+// KEYEVENTF_UNICODE. Used by the shared `dispatch` KeyText arm.
+#[cfg(all(target_os = "windows", feature = "enigo-input"))]
+pub mod win_text;
+
 #[cfg(all(
     feature = "system-context",
     target_os = "windows",
