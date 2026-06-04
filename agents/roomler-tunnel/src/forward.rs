@@ -91,15 +91,16 @@ const QUIC_PERMIT_SETTLE: std::time::Duration = std::time::Duration::from_millis
 #[value(rename_all = "lowercase")]
 pub enum TransportPref {
     /// Prefer QUIC; transparently fall back to WebRTC if QUIC setup
-    /// fails. Becomes the natural default once server-side QUIC
-    /// negotiation (Phase 1c) ships; until then it costs one setup
-    /// round-trip against servers that don't yet negotiate QUIC.
+    /// fails. The default: server-side QUIC negotiation (Phase 1c) is
+    /// deployed and gates on the agent's reported version, so QUIC is
+    /// only attempted against agents that actually speak it — no wasted
+    /// setup round-trip against an older agent.
+    #[default]
     Auto,
     /// Force QUIC; error out if it can't be established (no fallback).
     Quic,
-    /// Force the proven WebRTC SCTP DataChannel transport. Default
-    /// while the server-side QUIC negotiation is not yet deployed.
-    #[default]
+    /// Force the proven WebRTC SCTP DataChannel transport (the pre-QUIC
+    /// default; still the right pick for a forced, no-fallback run).
     Webrtc,
 }
 
@@ -1535,9 +1536,9 @@ mod tests {
         );
         assert_eq!(TransportPref::Auto.request_transport(), "quic-v1");
 
-        // Default is the proven path while server-side QUIC negotiation
-        // (Phase 1c) is not yet deployed.
-        assert_eq!(TransportPref::default(), TransportPref::Webrtc);
+        // Default is Auto now that server-side QUIC negotiation (Phase
+        // 1c) is deployed: prefer QUIC, fall back to WebRTC on failure.
+        assert_eq!(TransportPref::default(), TransportPref::Auto);
     }
 
     /// Client glue: [`handle_local_connection_quic`] sends the forward
