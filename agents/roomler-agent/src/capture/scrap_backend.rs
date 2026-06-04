@@ -26,6 +26,18 @@ use super::{DownscalePolicy, Frame, PixelFormat, ScreenCapture};
 
 pub const DEFAULT_TARGET_FPS: u32 = 30;
 
+/// Bounded retry for a transient `Capturer::new` failure at init. On Windows a
+/// `permission denied` (E_ACCESSDENIED) here means the input desktop is
+/// mid-transition — UAC secure desktop up, a just-completed logon, or a
+/// fast-user-switch — and clears within a few hundred ms once the user's
+/// desktop is back. Without a retry the worker dropped straight to
+/// `NoopCapture` (a black screen) with no recovery. 8 × 120 ms ≈ 1 s worst
+/// case. Only `PermissionDenied` is retried — a missing display / unsupported
+/// adapter won't fix itself with a backoff. No-op on Linux/macOS (succeeds
+/// first attempt).
+const INIT_MAX_ATTEMPTS: u32 = 8;
+const INIT_RETRY_BACKOFF: Duration = Duration::from_millis(120);
+
 type CaptureReply = Result<Option<Frame>>;
 type CaptureCmd = oneshot::Sender<CaptureReply>;
 
@@ -49,14 +61,34 @@ impl ScrapCapture {
         thread::Builder::new()
             .name("roomler-agent-capture".into())
             .spawn(move || {
-                let init = || -> Result<(Capturer, u32, u32)> {
-                    let display = Display::primary().context("no primary display")?;
+                let mut attempt: u32 = 0;
+                let init_outcome = loop {
+                    attempt += 1;
+                    let display = match Display::primary() {
+                        Ok(d) => d,
+                        Err(e) => break Err(anyhow!("no primary display: {e}")),
+                    };
                     let w = display.width() as u32;
                     let h = display.height() as u32;
-                    let cap = Capturer::new(display).context("creating scrap::Capturer")?;
-                    Ok((cap, w, h))
+                    match Capturer::new(display) {
+                        Ok(cap) => break Ok((cap, w, h)),
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::PermissionDenied
+                                && attempt < INIT_MAX_ATTEMPTS =>
+                        {
+                            tracing::warn!(
+                                attempt,
+                                max = INIT_MAX_ATTEMPTS,
+                                %e,
+                                "scrap::Capturer::new permission denied (input desktop mid-transition) — backing off + retrying"
+                            );
+                            thread::sleep(INIT_RETRY_BACKOFF);
+                            continue;
+                        }
+                        Err(e) => break Err(anyhow!("creating scrap::Capturer: {e}")),
+                    }
                 };
-                let (mut cap, w, h) = match init() {
+                let (mut cap, w, h) = match init_outcome {
                     Ok(v) => {
                         let _ = ready_tx.send(Ok((v.1, v.2)));
                         v
