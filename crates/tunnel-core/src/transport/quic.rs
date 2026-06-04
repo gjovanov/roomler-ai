@@ -133,20 +133,22 @@ fn quic_transport_config() -> Arc<quinn::TransportConfig> {
     t.max_idle_timeout(Some(
         quinn::IdleTimeout::try_from(Duration::from_secs(30)).expect("30s is a valid idle timeout"),
     ));
-    // Flow-control windows tuned for the relay's high BDP (controller →
+    // Flow-control windows sized for the relay's high BDP (controller →
     // coturn → agent's TLS/TCP leg → dst — the TCP relay's buffering
-    // inflates the effective BDP far above the raw RTT). quinn's ~1 MiB
-    // defaults throttled a single bulk stream hard: 2026-06-03 measured QUIC
-    // 238 s vs WebRTC 77 s for the same `select *`; raising the stream
-    // window to 8 MiB (WebRTC's vendored SCTP a_rwnd) cut QUIC to 61 s —
-    // faster than WebRTC. 16 MiB (rc.114) gives headroom to fully saturate
-    // the ~24 Mbps link in both directions. `VarInt` allows far more
-    // (~4.6 EB); past the BDP it only adds buffering/bufferbloat, so 16 MiB
-    // is the deliberate ceiling. The RECEIVER advertises these, so BOTH
-    // peers need the tuned build for their RECEIVE direction (the client's
-    // window governs DB→client download; the agent's governs client→DB
-    // upload).
-    const STREAM_WIN: u32 = 16 * 1024 * 1024;
+    // inflates the effective BDP far above the raw RTT, to ~9 MiB at the
+    // ~24 Mbps ceiling). quinn's ~1 MiB defaults throttled a single bulk
+    // stream hard: 2026-06-03 measured QUIC 238 s vs WebRTC 77 s for the
+    // same `select *`; raising the stream window to 8 MiB cut QUIC to 61 s
+    // — faster than WebRTC. **8 MiB is the chosen value.** An interleaved
+    // 8-vs-16 MiB A/B (2026-06-04, 3 rounds) found them equivalent —
+    // 8 MiB avg 75.6 s (tight 75.2–76.0) vs 16 MiB avg 73.8 s (noisy
+    // 69.3–77.5) — i.e. past the ~9 MiB BDP a bigger window buys nothing
+    // (only buffering), so we keep 8 MiB for half the per-stream memory and
+    // steadier latency. `VarInt` allows far more (~4.6 EB) if a future
+    // higher-BDP path needs it. The RECEIVER advertises these, so each
+    // peer's window governs its RECEIVE direction (client → DB→client
+    // download; agent → client→DB upload).
+    const STREAM_WIN: u32 = 8 * 1024 * 1024;
     t.stream_receive_window(quinn::VarInt::from_u32(STREAM_WIN));
     t.receive_window(quinn::VarInt::from_u32(2 * STREAM_WIN));
     t.send_window(u64::from(2 * STREAM_WIN));
