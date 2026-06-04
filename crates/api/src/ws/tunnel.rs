@@ -424,18 +424,29 @@ async fn handle_tunnel_open(
         return;
     }
 
-    // Transport negotiation (Phase 1c). Honor quic-v1 only when the
-    // client both requested it AND advertised it in rc:tunnel.hello;
-    // otherwise keep the requested transport (webrtc-dc-v1 in practice).
-    // Agent-side QUIC support is ASSUMED for rc.96+ agents — no per-
-    // agent tunnel-transport capability is advertised yet, so an older
-    // agent that ignores the TunnelQuicSetup below never sends
-    // TunnelQuicReady; the client then times out and (for
-    // `--transport auto`) re-opens over webrtc-dc-v1.
+    // Transport negotiation (Phase 1c + Phase 4 agent-version gate).
+    // Negotiate quic-v1 only when the client requested it, advertised it
+    // in rc:tunnel.hello, AND the target agent's reported version
+    // actually speaks the QUIC tunnel setup. Otherwise fall back to the
+    // proven webrtc-dc-v1.
+    //
+    // The agent-version gate is what makes `--transport auto` safe as
+    // the client default: a pre-rc.104 agent silently ignores the
+    // TunnelQuicSetup below and never replies, so without this gate the
+    // client would burn its full QUIC_READY_TIMEOUT (30 s) before
+    // falling back. `agent_version` is refreshed on every agent WS
+    // connect (update_hello), so it's current for any *online* agent —
+    // and only an online agent can be tunneled to (send_to_agent fails
+    // otherwise).
+    let agent_speaks_quic = tunnel_core::transport::agent_supports_quic(&agent.agent_version);
     let negotiated_transport = if transport == TRANSPORT_QUIC_V1 {
-        if client_supported.iter().any(|t| t == TRANSPORT_QUIC_V1) {
+        if client_supported.iter().any(|t| t == TRANSPORT_QUIC_V1) && agent_speaks_quic {
             TRANSPORT_QUIC_V1.to_string()
         } else {
+            debug!(
+                %agent_id, agent_version = %agent.agent_version, agent_speaks_quic,
+                "client requested quic-v1 → negotiating webrtc-dc-v1 (agent too old, or client didn't advertise quic)"
+            );
             TRANSPORT_WEBRTC_DC_V1.to_string()
         }
     } else {
