@@ -148,7 +148,24 @@ fn dispatch(enigo: &mut Enigo, msg: InputMsg) -> Result<()> {
             }
         }
         InputMsg::KeyText { text } => {
-            enigo.text(&text).map_err(|e| anyhow!("text: {e}"))?;
+            // rc.122 — on Windows, inject printable text as real virtual keys
+            // (scancode) instead of enigo.text()'s KEYEVENTF_UNICODE, which the
+            // legacy console (Windows PowerShell 5.1 / cmd in conhost) silently
+            // drops (field: REGAL-112500982 — letters vanished in elevated
+            // Windows PowerShell but worked in pwsh 7 / Windows Terminal). The
+            // `ROOMLER_AGENT_UNICODE_TEXT=1` kill switch reverts to enigo.text().
+            #[cfg(target_os = "windows")]
+            {
+                if super::win_text::unicode_only() {
+                    enigo.text(&text).map_err(|e| anyhow!("text: {e}"))?;
+                } else {
+                    super::win_text::type_text(&text);
+                }
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                enigo.text(&text).map_err(|e| anyhow!("text: {e}"))?;
+            }
         }
         InputMsg::Touch { .. } => {
             // No cross-platform touch injection in enigo yet. Map to
