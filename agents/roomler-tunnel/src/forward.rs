@@ -884,8 +884,8 @@ async fn run_quic_session(
     // the agent's direct host candidates (Phase 1e/2a). Either branch
     // yields a connected `(peer, conn)`; auth + the data plane below are
     // transport-agnostic.
-    let (peer, conn) = if let Some((urls, user, cred)) = pick_turn_creds(&ice_servers) {
-        info!("QUIC: server provided TURN creds — establishing QUIC-over-TURN (Tier 2)");
+    let (peer, conn, path) = if let Some((urls, user, cred)) = pick_turn_creds(&ice_servers) {
+        info!("QUIC: server provided TURN creds — establishing QUIC-over-TURN (relay)");
         match setup_quic_over_relay(
             &urls,
             &user,
@@ -897,7 +897,10 @@ async fn run_quic_session(
         )
         .await
         {
-            Some(pc) => pc,
+            // Relay sub-tier — UDP (Tier 2) vs TURNS/TCP (Tier 3) — is
+            // logged by the allocation itself ("TURN allocation established"
+            // vs "TURNS/TCP …"); at the QUIC level both are the relay path.
+            Some((peer, conn)) => (peer, conn, "relay"),
             None => return Ok(SessionOutcome::QuicSetupFailed),
         }
     } else {
@@ -916,13 +919,23 @@ async fn run_quic_session(
             warn!(addrs = ?addrs, "could not connect QUIC to any advertised addr");
             return Ok(SessionOutcome::QuicSetupFailed);
         };
-        (peer, conn)
+        (peer, conn, "direct")
     };
     if let Err(e) = quic::client_authenticate(&conn, &token).await {
         warn!(%e, "QUIC client_authenticate failed");
         return Ok(SessionOutcome::QuicSetupFailed);
     }
-    info!(remote = %conn.remote_address(), "QUIC connection established + authenticated");
+    // Per-tier connection summary — one greppable line for field
+    // diagnosis: transport + path (relay vs direct hole-punch) + the
+    // negotiated peer address. The relay sub-tier (UDP Tier 2 / TURNS-TCP
+    // Tier 3) and our own relay address are in the adjacent
+    // relay-allocation log lines; throughput follows in the 2 s logger.
+    info!(
+        transport = "quic-v1",
+        path,
+        remote = %conn.remote_address(),
+        "tunnel established"
+    );
 
     // From here the QUIC link is live; we're committed (no WebRTC
     // fallback once flows can start). Spawn the WS dispatcher for
