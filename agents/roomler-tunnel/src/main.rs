@@ -62,12 +62,13 @@ enum Command {
         /// to the agent's allowlist + the tenant's tunnel_policies.
         #[arg(long)]
         remote: String,
-        /// Data-plane transport. `webrtc` (default) uses the proven
-        /// WebRTC DataChannel path; `quic` forces QUIC; `auto` prefers
-        /// QUIC and transparently falls back to WebRTC if QUIC setup
-        /// fails. QUIC needs server-side negotiation (rolling out) —
-        /// until then prefer `webrtc`.
-        #[arg(long, value_enum, default_value = "webrtc")]
+        /// Data-plane transport. `auto` (default) prefers QUIC and
+        /// transparently falls back to WebRTC if QUIC setup fails;
+        /// `quic` forces QUIC (no fallback); `webrtc` forces the proven
+        /// WebRTC DataChannel path. Server-side QUIC negotiation is
+        /// deployed and gates on the agent's reported version, so `auto`
+        /// only attempts QUIC against agents that actually support it.
+        #[arg(long, value_enum, default_value = "auto")]
         transport: forward::TransportPref,
     },
     /// Read a multi-forward config from disk and run all forwards as
@@ -229,8 +230,9 @@ mod tests {
                 assert_eq!(agent, "507f1f77bcf86cd799439011");
                 assert_eq!(local, 5432);
                 assert_eq!(remote, "10.0.0.5:5432");
-                // No --transport given → default is the proven webrtc path.
-                assert_eq!(transport, forward::TransportPref::Webrtc);
+                // No --transport given → default is auto (prefer QUIC,
+                // fall back to WebRTC on setup failure).
+                assert_eq!(transport, forward::TransportPref::Auto);
             }
             other => panic!("expected Forward, got {other:?}"),
         }
