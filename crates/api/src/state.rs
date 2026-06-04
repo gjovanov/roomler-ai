@@ -10,7 +10,8 @@ use roomler_ai_services::{
     TaskService,
     dao::{
         activation_code::ActivationCodeDao, agent::AgentDao, file::FileDao, invite::InviteDao,
-        message::MessageDao, notification::NotificationDao, push_subscription::PushSubscriptionDao,
+        message::MessageDao, notification::NotificationDao, overlay_network::OverlayNetworkDao,
+        overlay_node::OverlayNodeDao, push_subscription::PushSubscriptionDao,
         reaction::ReactionDao, recording::RecordingDao, remote_audit::RemoteAuditDao,
         remote_session::RemoteSessionDao, role::RoleDao, room::RoomDao, tenant::TenantDao,
         tunnel_audit::TunnelAuditDao, tunnel_client::TunnelClientDao,
@@ -81,6 +82,16 @@ pub struct AppState {
     pub tunnel_audit: Arc<TunnelAuditDao>,
     /// Per-tunnel-session WS outbound channels. See [`TunnelClientOutbound`].
     pub tunnel_clients_by_session: TunnelClientOutbound,
+
+    // Overlay-network subsystem (Tailscale-style L3 mesh)
+    pub overlay_networks: Arc<OverlayNetworkDao>,
+    pub overlay_nodes: Arc<OverlayNodeDao>,
+    /// Connection-lifetime WS outbound channels for **tunnel-client**
+    /// overlay nodes, keyed by `tunnel_client_id` (agent nodes are
+    /// reached via [`Hub::send_to_agent`]). Used by the overlay broker
+    /// to fan netmaps/deltas to client nodes. Distinct from
+    /// `tunnel_clients_by_session`, which is keyed per forward-session.
+    pub overlay_nodes_by_id: TunnelClientOutbound,
 
     /// 1h-TTL in-memory cache backing `/api/agent/latest-release`.
     /// All agents share this single cache; one upstream GitHub fetch
@@ -193,6 +204,10 @@ impl AppState {
         let tunnel_policies = Arc::new(TunnelPolicyDao::new(&db));
         let tunnel_audit = Arc::new(TunnelAuditDao::new(&db));
 
+        // Overlay-network subsystem
+        let overlay_networks = Arc::new(OverlayNetworkDao::new(&db));
+        let overlay_nodes = Arc::new(OverlayNodeDao::new(&db));
+
         Ok(Self {
             db,
             settings,
@@ -229,6 +244,9 @@ impl AppState {
             tunnel_policies,
             tunnel_audit,
             tunnel_clients_by_session: Arc::new(DashMap::new()),
+            overlay_networks,
+            overlay_nodes,
+            overlay_nodes_by_id: Arc::new(DashMap::new()),
             latest_release_cache: crate::routes::agent_release::LatestReleaseCache::new(),
             tunnel_release_cache: crate::routes::tunnel_release::LatestTunnelReleaseCache::new(),
             tunnel_wizard_release_cache:
