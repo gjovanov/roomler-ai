@@ -4,11 +4,33 @@ A `roomler-tunnel` connection has three sides:
 
 | Side | What it does | Where it runs |
 |---|---|---|
-| **Tunnel-client** (`roomler-tunnel`) | Listens on a local TCP port on the operator's machine. Every incoming connection rides through a WebRTC P2P data channel to the agent. | Operator's laptop (Win11 / Linux / macOS) |
+| **Tunnel-client** (`roomler-tunnel`) | Listens on a local TCP port on the operator's machine. Each incoming connection rides a **QUIC** stream to the agent by default (transparently falling back to a WebRTC data channel if QUIC setup fails). | Operator's laptop (Win11 / Linux / macOS) |
 | **Agent** (`roomler-agent`) | Receives the forward request, dials the destination from inside the corp network, and pumps bytes back. | A host inside the corp network with route to the destination |
 | **Server** (`roomler.ai`) | Issues JWTs, enforces the tenant ACL policy, relays SDP / ICE between the two peers (it never sees the payload). | Roomler-managed |
 
 This guide walks through the Win11-on-both-sides flavour. Linux and macOS commands are inline where they diverge.
+
+---
+
+## Transport: QUIC by default, WebRTC fallback
+
+Since `roomler-tunnel` / `roomler-agent` **0.3.0-rc.118**, the data plane defaults to **QUIC** (`quic-v1`, via [quinn](https://github.com/quinn-rs/quinn)) and falls back to the original **WebRTC data channel** (`webrtc-dc-v1`) only if QUIC can't be set up. Tuned QUIC is faster than WebRTC on a relayed path and reaches the same hard networks. Choose explicitly with `--transport`:
+
+| `--transport` | Behaviour |
+|---|---|
+| `auto` *(default)* | Try QUIC; transparently re-open over WebRTC if QUIC setup fails. |
+| `quic` | Force QUIC; error out if it can't be established (no fallback). |
+| `webrtc` | Force the proven WebRTC data-channel path. |
+
+**Reaching hard networks** — QUIC has no ICE, so it walks its own connectivity tiers in priority order, reusing the same coturn cluster as WebRTC:
+
+1. **Direct** — dial the agent's host / server-reflexive candidates (best latency, no relay).
+2. **QUIC-over-TURN (UDP relay, "Tier 2")** — when direct fails but UDP egress to coturn works.
+3. **QUIC-over-TURNS/TCP (TLS relay, "Tier 3")** — when UDP is fully blocked (corporate firewall). Same reach as WebRTC.
+
+The forward logs which path it took (`tunnel established transport=quic-v1 path=relay|direct …`); the relay allocation logs the UDP-vs-TLS sub-tier.
+
+**Mixed fleets** — the server negotiates `quic-v1` only when the target **agent's version supports it** (≥ rc.104); against an older agent it transparently uses `webrtc-dc-v1`, so `--transport auto` is always safe.
 
 ---
 
@@ -225,10 +247,14 @@ Expected output:
 ```
 INFO connecting websocket   ws_base=wss://roomler.ai/ws
 INFO websocket connected
-INFO rc:tunnel.opened   session_id=… transport=webrtc-dc-v1 dc_pool_size=8 sctp_rwnd_bytes=8388608 ice_servers=N
-INFO DC pool fully open (8 channels)
-INFO listening for local TCP connections   local=127.0.0.1:5432
+INFO rc:tunnel.opened   session_id=… transport=quic-v1 ice_servers=N quic=true
+INFO QUIC: server provided TURN creds — establishing QUIC-over-TURN (relay)
+INFO QUIC client: TURN relay allocated   relay_addr=…
+INFO tunnel established   transport=quic-v1 path=relay remote=…
+INFO listening for local TCP connections (quic-v1)   local=127.0.0.1:5432
 ```
+
+(On a directly-reachable agent you'll see `path=direct` and no relay line. If the agent is older than rc.104 or QUIC setup fails, `--transport auto` falls back and you'll instead see `transport=webrtc-dc-v1`, `DC pool fully open (8 channels)`, and the WebRTC path.)
 
 In a second shell, test with the real client:
 
@@ -237,7 +263,7 @@ psql -h 127.0.0.1 -p 5432 -U <db-user> -d <db-name>
 # Or any TCP service: curl http://127.0.0.1:8080/ , ssh -p 22 user@127.0.0.1 , etc.
 ```
 
-The forward stays up until you press Ctrl-C. Each new `psql` connection opens a new `flow_id` over the existing DC pool — no per-connection ICE setup, only the framing prefix.
+The forward stays up until you press Ctrl-C. Each new `psql` connection opens a new flow to the agent — a fresh QUIC bidirectional stream (or, on the WebRTC fallback path, a `flow_id` over the existing DC pool) — with no per-connection ICE / relay setup.
 
 ---
 
@@ -263,7 +289,7 @@ roomler-tunnel forward --agent … --local 5432 --remote db.intranet:5432
 | `acl_denied` from the server | policy gate rejected the (subject × target × destination) tuple | Edit the policy to include the destination, or add subject/target |
 | `dial_failed` from the agent | destination unreachable from inside corp | Check from the agent host directly: `Test-NetConnection db.intranet -Port 5432` |
 | `cross_tenant` | tunnel-client and agent belong to different tenants | Re-enroll one of them in the correct tenant |
-| Pool never opens | UDP blocked end-to-end; TURN-relay candidate also failing | Switch the agent's host onto a network that allows outbound UDP/443 or TCP/443; check `RUST_LOG=webrtc_ice=debug` |
+| Never connects (no `tunnel established` / `DC pool fully open` line) | UDP blocked end-to-end **and** the TURNS/TCP (`:443`) relay also failing | Ensure outbound TCP/443 to the coturn cluster from both hosts; check `RUST_LOG=tunnel_core=debug,webrtc_ice=debug` |
 
 ---
 
