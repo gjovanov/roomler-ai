@@ -80,6 +80,16 @@ use super::enigo_backend;
 use super::{InputInjector, InputMsg};
 use crate::system_context::desktop_rebind;
 
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE};
+use windows_sys::Win32::Security::{
+    GetTokenInformation, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TokenIntegrityLevel,
+};
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+    QueryFullProcessImageNameW,
+};
+use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+
 /// Async-side handle. Constructor blocks until the worker thread has
 /// successfully attached to `WinSta0` AND constructed `Enigo`; then
 /// returns. After that all `inject` calls just push onto the mpsc.
@@ -131,6 +141,20 @@ impl SystemContextInjector {
                         return;
                     }
                 };
+                // rc.120 — log the worker's own integrity level + the foreground
+                // window's integrity at startup. The REGAL-112500982 field report
+                // (can't type into a "Run as admin" PowerShell, can type into a
+                // normal one) is the textbook UIPI signature; this line tells us
+                // whether the system-context worker is actually at System IL
+                // (UIPI-exempt — so the cause is external/EDR) or has ended up
+                // below the elevated target's High IL.
+                tracing::info!(
+                    worker_integrity = %self_integrity_label(),
+                    enable_system_swap = %std::env::var("ROOMLER_AGENT_ENABLE_SYSTEM_SWAP")
+                        .unwrap_or_else(|_| "<unset>".to_string()),
+                    foreground = %foreground_window_diag(),
+                    "system-context input: worker identity diagnostic (rc.120) — keystrokes land only when worker_integrity >= the focused window's integrity (UIPI)"
+                );
                 run_worker(enigo, rx);
             })
             .context("spawn system-context input thread")?;
@@ -148,8 +172,25 @@ impl SystemContextInjector {
 fn run_worker(mut enigo: Enigo, rx: std_mpsc::Receiver<InputMsg>) {
     let mut events_since_log: u64 = 0;
     let mut consec_dispatch_errors: u64 = 0;
+    let mut key_events: u64 = 0;
     while let Ok(msg) = rx.recv() {
         events_since_log = events_since_log.wrapping_add(1);
+        // rc.120 — correlate keystrokes with the focused window's integrity.
+        // Rate-limited (first 20 key events + every 256th) so it never spams the
+        // log during fast typing. If `fg_integrity` > `worker_integrity`, UIPI is
+        // silently dropping these keys — which is exactly the "can't type into an
+        // elevated PowerShell" symptom, and SendInput returns success regardless.
+        if matches!(msg, InputMsg::Key { .. } | InputMsg::KeyText { .. }) {
+            key_events = key_events.wrapping_add(1);
+            if key_events <= 20 || key_events.is_multiple_of(256) {
+                tracing::info!(
+                    seq = key_events,
+                    worker_integrity = %self_integrity_label(),
+                    foreground = %foreground_window_diag(),
+                    "system-context input: key dispatch diagnostic (rc.120)"
+                );
+            }
+        }
         match desktop_rebind::try_change_desktop() {
             Ok(desktop_rebind::DesktopChange::Unchanged) => {
                 // Most common branch by ~1000:1. Stay quiet.
@@ -232,9 +273,166 @@ impl InputInjector for SystemContextInjector {
     }
 }
 
+// ───────────────────────── rc.120 input diagnostics ─────────────────────────
+// REGAL-112500982 (rc.116): keystrokes reach a normal (Medium-IL) PowerShell
+// but NOT a "Run as administrator" (High-IL) one. That is the textbook UIPI
+// integrity block — and `SendInput` returns SUCCESS even when UIPI silently
+// drops the event, so nothing showed up in the logs. We never logged the
+// worker's own integrity level, so we could not tell whether the system-context
+// worker is genuinely at System IL (UIPI-exempt — pointing at an external
+// blocker like corporate EDR) or has somehow ended up below the elevated
+// target's High IL. These helpers surface both, so one field session settles it.
+
+/// Map a Windows mandatory-integrity RID to a human label.
+fn integrity_rid_to_label(rid: u32) -> &'static str {
+    match rid {
+        0x0000 => "Untrusted",
+        0x1000 => "Low",
+        0x2000 => "Medium",
+        0x2100 => "MediumPlus",
+        0x3000 => "High",
+        0x4000 => "System",
+        0x5000 => "ProtectedProcess",
+        _ => "Unknown",
+    }
+}
+
+/// Read a token's integrity level — the single subauthority of its
+/// `TokenIntegrityLevel` label SID (an `S-1-16-<rid>`). Returns e.g.
+/// `"System (0x4000)"`. The RID lives at byte offset 8..12 of the SID, same
+/// fixed-layout read [`crate::system_context::worker_role`] uses for the user SID.
+fn token_integrity_label(token: HANDLE) -> String {
+    // SAFETY: `token` is a valid TOKEN_QUERY handle owned by the caller. The
+    // two-call GetTokenInformation size-discovery pattern is documented; we read
+    // only the fixed SID prefix the OS guarantees self-consistent.
+    unsafe {
+        let mut needed: u32 = 0;
+        let _ = GetTokenInformation(
+            token,
+            TokenIntegrityLevel,
+            std::ptr::null_mut(),
+            0,
+            &mut needed,
+        );
+        if needed == 0 {
+            return "err:needed0".to_string();
+        }
+        let mut buf = vec![0u8; needed as usize];
+        let ok = GetTokenInformation(
+            token,
+            TokenIntegrityLevel,
+            buf.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        );
+        if ok == 0 {
+            return format!("err:gti:{}", GetLastError());
+        }
+        let label = &*(buf.as_ptr() as *const TOKEN_MANDATORY_LABEL);
+        let sid = label.Label.Sid as *const u8;
+        if sid.is_null() {
+            return "err:nullsid".to_string();
+        }
+        if *sid.add(1) == 0 {
+            return "err:subcount0".to_string();
+        }
+        let rid = u32::from_le_bytes([*sid.add(8), *sid.add(9), *sid.add(10), *sid.add(11)]);
+        format!("{} (0x{rid:04x})", integrity_rid_to_label(rid))
+    }
+}
+
+/// Integrity label of the calling (worker) process.
+fn self_integrity_label() -> String {
+    // SAFETY: GetCurrentProcess is a pseudo-handle; OpenProcessToken with
+    // TOKEN_QUERY over our own process is documented infallible. Handle closed
+    // before return.
+    unsafe {
+        let mut tok: HANDLE = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut tok) == 0 {
+            return format!("err:opt:{}", GetLastError());
+        }
+        let label = token_integrity_label(tok);
+        CloseHandle(tok);
+        label
+    }
+}
+
+/// Trailing path component of a Windows path (after the last `\` or `/`).
+fn basename(p: &str) -> &str {
+    p.rsplit(['\\', '/']).next().unwrap_or(p)
+}
+
+/// Snapshot of the foreground window's owning process: exe basename, pid, and
+/// integrity level — i.e. the window keystrokes would land in. If the worker's
+/// IL is below this IL, UIPI silently drops the input (the REGAL symptom).
+fn foreground_window_diag() -> String {
+    // SAFETY: all calls take valid args; every opened handle is closed. A null
+    // HWND / failed open returns a sentinel string rather than dereferencing.
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_null() {
+            return "fg=none".to_string();
+        }
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        if pid == 0 {
+            return "fg=nopid".to_string();
+        }
+        let proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if proc.is_null() {
+            return format!("fg_pid={pid} open_err={}", GetLastError());
+        }
+        let mut nbuf = [0u16; 260];
+        let mut nsz: u32 = nbuf.len() as u32;
+        let exe = if QueryFullProcessImageNameW(proc, 0, nbuf.as_mut_ptr(), &mut nsz) != 0 {
+            let full = String::from_utf16_lossy(&nbuf[..nsz as usize]);
+            basename(&full).to_string()
+        } else {
+            "?".to_string()
+        };
+        let mut tok: HANDLE = std::ptr::null_mut();
+        let il = if OpenProcessToken(proc, TOKEN_QUERY, &mut tok) != 0 {
+            let l = token_integrity_label(tok);
+            CloseHandle(tok);
+            l
+        } else {
+            format!("opt_err={}", GetLastError())
+        };
+        CloseHandle(proc);
+        format!("fg_exe={exe} fg_pid={pid} fg_integrity={il}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn integrity_labels_cover_known_rids() {
+        assert_eq!(integrity_rid_to_label(0x2000), "Medium");
+        assert_eq!(integrity_rid_to_label(0x3000), "High");
+        assert_eq!(integrity_rid_to_label(0x4000), "System");
+        assert_eq!(integrity_rid_to_label(0x1234), "Unknown");
+    }
+
+    #[test]
+    fn basename_extracts_trailing_component() {
+        assert_eq!(
+            basename(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"),
+            "powershell.exe"
+        );
+        assert_eq!(basename("powershell.exe"), "powershell.exe");
+        assert_eq!(basename("/usr/bin/foo"), "foo");
+    }
+
+    #[test]
+    fn self_integrity_label_is_nonempty() {
+        // Under the test runner this is the developer's process (Medium/High);
+        // we only assert it produces a real label, not an error sentinel.
+        let l = self_integrity_label();
+        assert!(!l.is_empty());
+        assert!(!l.starts_with("err:"), "unexpected error label: {l}");
+    }
 
     #[test]
     fn injector_is_send() {
