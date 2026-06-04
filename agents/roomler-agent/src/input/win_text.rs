@@ -35,10 +35,11 @@
 
 #![cfg(all(target_os = "windows", feature = "enigo-input"))]
 
+use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyboardLayout, HKL, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
-    KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, MapVirtualKeyExW, SendInput,
-    VK_CONTROL, VK_MENU, VK_RETURN, VK_SHIFT, VK_TAB, VkKeyScanExW,
+    GetKeyState, GetKeyboardLayout, HKL, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
+    KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, MapVirtualKeyExW,
+    SendInput, VK_CAPITAL, VK_CONTROL, VK_MENU, VK_RETURN, VK_SHIFT, VK_TAB, VkKeyScanExW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
@@ -152,17 +153,46 @@ fn send_unicode(c: char) {
     send(&inputs);
 }
 
+/// Read the target's CapsLock toggle state. `GetKeyState`'s toggle bit is
+/// per-thread-input-queue, and the SYSTEM-context worker doesn't pump messages,
+/// so we briefly `AttachThreadInput` to the foreground thread to share its key
+/// state for an accurate read. Best-effort: a failed attach falls back to the
+/// worker's own state (CapsLock treated as off → no compensation).
+fn capslock_on(fg_tid: u32) -> bool {
+    // SAFETY: Attach/Detach are paired; GetKeyState reads thread-queue state.
+    unsafe {
+        let our_tid = GetCurrentThreadId();
+        let attach = fg_tid != 0 && fg_tid != our_tid;
+        if attach {
+            AttachThreadInput(our_tid, fg_tid, 1);
+        }
+        let on = (GetKeyState(VK_CAPITAL as i32) & 0x0001) != 0;
+        if attach {
+            AttachThreadInput(our_tid, fg_tid, 0);
+        }
+        on
+    }
+}
+
 /// Type `text` into the foreground window. Per character: real VK+scancode when
 /// the active layout can produce it (legacy-console-compatible), else Unicode.
 pub(super) fn type_text(text: &str) {
     // The active layout is the FOREGROUND thread's — that's what interprets the
-    // injected scancodes. Read it once per call.
+    // injected scancodes. Read it (and the thread id) once per call.
     // SAFETY: GetForegroundWindow may return null (no foreground); GetKeyboard-
     // Layout(0) then returns the calling thread's layout, a safe default.
-    let hkl: HKL = unsafe {
+    let (hkl, fg_tid): (HKL, u32) = unsafe {
         let tid = GetWindowThreadProcessId(GetForegroundWindow(), std::ptr::null_mut());
-        GetKeyboardLayout(tid)
+        (GetKeyboardLayout(tid), tid)
     };
+    // rc.123 — scancode injection is subject to the TARGET's CapsLock (unlike the
+    // old KEYEVENTF_UNICODE path, which ignored it). REGAL-112500982 had CapsLock
+    // toggled ON → every injected letter came out with inverted case. VkKeyScanExW
+    // computes the shift state assuming CapsLock OFF, so when it's ON we flip the
+    // shift bit for ALPHABETIC chars (CapsLock only affects letters). Non-letters
+    // and the Unicode fallback are unaffected. Hosts with CapsLock off (e.g.
+    // PC50045) read `false` here → no change.
+    let caps = capslock_on(fg_tid);
     for c in text.chars() {
         match c {
             '\n' | '\r' => tap_vk(VK_RETURN, false, false, false, hkl),
@@ -178,7 +208,14 @@ pub(super) fn type_text(text: &str) {
                     None // astral (emoji) — never a single VK
                 };
                 match decoded {
-                    Some((vk, shift, ctrl, alt)) => tap_vk(vk, shift, ctrl, alt, hkl),
+                    Some((vk, shift, ctrl, alt)) => {
+                        let shift = if caps && c.is_alphabetic() {
+                            !shift
+                        } else {
+                            shift
+                        };
+                        tap_vk(vk, shift, ctrl, alt, hkl);
+                    }
                     None => send_unicode(c),
                 }
             }
