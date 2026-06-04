@@ -62,8 +62,6 @@
 
 #![cfg(target_os = "windows")]
 
-#[cfg(feature = "scrap-capture")]
-use anyhow::Context as _;
 use std::io;
 
 /// What kind of failure the backend just reported. The capture pump
@@ -213,9 +211,20 @@ impl DxgiDupBackend {
         })?;
         let width = display.width() as u32;
         let height = display.height() as u32;
-        let capturer = scrap::Capturer::new(display)
-            .with_context(|| "scrap::Capturer::new")
-            .map_err(|e| BackendBail::HardError(io::Error::other(format!("{e:#}"))))?;
+        let capturer = scrap::Capturer::new(display).map_err(|e| {
+            // PRESERVE the io::ErrorKind. scrap returns E_ACCESSDENIED (the
+            // thread isn't on a desktop it can duplicate yet — secure desktop
+            // up, mid session-transition, etc.) as `PermissionDenied`, which
+            // `from_io` classifies as the RECOVERABLE `DesktopMismatch` — same
+            // as the per-frame path and the adapter-bound direct backend.
+            // Flattening to `io::Error::other` here (the pre-fix behaviour)
+            // dropped the kind to `Other`, so a transient desktop race surfaced
+            // as a `HardError` and burned the 3-strike GDI fallback, pinning the
+            // host on ~12 fps GDI. Re-wrap with the SAME kind + a `Capturer::new`
+            // prefix so the HardError message stays self-describing in the field log.
+            let kind = e.kind();
+            BackendBail::from_io(io::Error::new(kind, format!("scrap::Capturer::new: {e}")))
+        })?;
         Ok(Self {
             capturer,
             width,
@@ -322,6 +331,22 @@ mod tests {
         let e = io::Error::from(io::ErrorKind::PermissionDenied);
         assert!(matches!(
             BackendBail::from_io(e),
+            BackendBail::DesktopMismatch
+        ));
+    }
+
+    #[test]
+    fn init_permission_denied_wraps_to_desktop_mismatch() {
+        // Fix lock: DxgiDupBackend::primary() re-wraps a scrap
+        // Capturer::new failure with `io::Error::new(kind, msg)` (NOT
+        // `io::Error::other`), so an E_ACCESSDENIED at init keeps its
+        // PermissionDenied kind and classifies as the recoverable
+        // DesktopMismatch. Reproduce that exact wrapping here.
+        let scrap_err = io::Error::new(io::ErrorKind::PermissionDenied, "permission denied");
+        let kind = scrap_err.kind();
+        let wrapped = io::Error::new(kind, format!("scrap::Capturer::new: {scrap_err}"));
+        assert!(matches!(
+            BackendBail::from_io(wrapped),
             BackendBail::DesktopMismatch
         ));
     }

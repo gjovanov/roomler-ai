@@ -284,7 +284,12 @@ fn worker_main(
 
 #[cfg(feature = "scrap-capture")]
 fn build_initial_backend() -> Result<ActiveBackend> {
-    if let Some(b) = try_build_dxgi() {
+    // Startup uses the retry-with-rebind builder so a transient E_ACCESSDENIED
+    // (secure desktop up / session transition at the instant we build) doesn't
+    // wrongly concede the fast DXGI path to GDI. The GDI re-climb path keeps
+    // using the single-attempt `try_build_dxgi` (it must not block the
+    // frame-serving thread).
+    if let Some(b) = build_dxgi_with_retry() {
         return Ok(ActiveBackend::Dxgi(b));
     }
     tracing::warn!(
@@ -295,42 +300,49 @@ fn build_initial_backend() -> Result<ActiveBackend> {
     Ok(ActiveBackend::Gdi(gdi))
 }
 
-/// Build a DXGI backend, preferring the adapter-bound direct backend (rc.108
-/// hybrid-GPU fix) and falling back to the `scrap` auto-adapter backend.
-/// Returns `None` only when BOTH fail to initialise — the caller then drops
-/// to GDI. Used both at startup and by the GDI re-climb path.
-///
-/// On a hybrid Optimus host the direct backend binds Desktop Duplication to
-/// the iGPU (which owns the display output) instead of the render-only dGPU
-/// `scrap` picks — the difference between fast DXGI (~1-3 ms) and the slow
-/// GDI fallback (~85 ms ⇒ 12 fps). On an Intel-only host both pick the same
-/// adapter, so the scrap path is an exact-behaviour fallback if the direct
-/// backend hits an unexpected init error.
+/// rc.110 — bounded init retry for a recoverable `DesktopMismatch`
+/// (E_ACCESSDENIED) at DXGI build. A denied duplication at startup is almost
+/// always a desktop/session-transition RACE — secure desktop (UAC/lock) up at
+/// the instant we build, a just-completed logon, or a fast-user-switch — not a
+/// permanent capability gap. We rebind + back off + retry a handful of times
+/// before conceding the fast DXGI path to the slow GDI fallback. 8 × 120 ms
+/// caps the worst-case startup stall at ~1 s, after which a genuinely-denied
+/// host still reaches GDI (and the 5 s re-climb keeps trying DXGI thereafter).
 #[cfg(feature = "scrap-capture")]
-fn try_build_dxgi() -> Option<Box<dyn DxgiCapture>> {
-    // rc.109 — re-bind the worker thread to the CURRENT input desktop BEFORE
-    // attempting DXGI Desktop Duplication. `DuplicateOutput` returns
-    // E_ACCESSDENIED (mapped to `DesktopMismatch`) when the calling thread
-    // isn't on the desktop it's trying to duplicate. The GDI re-climb retried
-    // DXGI on a possibly-stale binding — the GDI arm's per-frame
-    // `try_change_desktop` runs AFTER the top-of-fn re-climb — so a hybrid host
-    // that fell to GDI after a lock/unlock stayed pinned on ~12 fps GDI
-    // (field PC55331 rc.108: dxgi-direct engaged 28× then stuck on gdi with
-    // repeated `DesktopMismatch` even while Unlocked/Default). Rebinding here
-    // makes both the startup AND re-climb attempts target the right desktop.
-    // `try_change_desktop` dedupes (SetThreadDesktop only on a real change), so
-    // the steady-state cost is one OpenInputDesktop syscall. The desktop name
-    // is logged so a PERSISTENT post-rebind E_ACCESSDENIED — which would mean
-    // the thread IS on the right desktop but duplication is still denied
-    // (another process holds it, or a session-0 nuance) rather than a stale
-    // binding — is distinguishable in the field log.
+const DXGI_INIT_MAX_ATTEMPTS: u32 = 8;
+#[cfg(feature = "scrap-capture")]
+const DXGI_INIT_RETRY_BACKOFF: Duration = Duration::from_millis(120);
+
+/// One DXGI build attempt: rebind the worker thread to the CURRENT input
+/// desktop, then try the adapter-bound direct backend (rc.108 hybrid-GPU fix),
+/// then the `scrap` auto-adapter backend. Returns the TYPED [`BackendBail`] on
+/// failure so the caller can tell a recoverable `DesktopMismatch`
+/// (E_ACCESSDENIED — retry after rebind) from a terminal-for-DXGI `HardError`
+/// (driver missing / unsupported — concede to GDI).
+///
+/// rc.109 — the rebind BEFORE the build matters: `DuplicateOutput` returns
+/// E_ACCESSDENIED when the calling thread isn't on the desktop it's trying to
+/// duplicate. `try_change_desktop` dedupes (SetThreadDesktop only on a real
+/// change), so the steady-state cost is one OpenInputDesktop syscall. The
+/// desktop name is logged so a PERSISTENT post-rebind E_ACCESSDENIED — the
+/// thread IS on the right desktop but duplication is still denied (another
+/// process holds it, or a session-0 nuance) — is distinguishable in the field.
+///
+/// On a hybrid Optimus host the direct backend binds Desktop Duplication to the
+/// iGPU (which owns the display output) instead of the render-only dGPU `scrap`
+/// picks — the difference between fast DXGI (~1-3 ms) and the slow GDI fallback
+/// (~85 ms ⇒ 12 fps). On an Intel-only host both pick the same adapter, so the
+/// scrap path is an exact-behaviour fallback if the direct backend hits an
+/// unexpected init error.
+#[cfg(feature = "scrap-capture")]
+fn attempt_build_dxgi() -> Result<Box<dyn DxgiCapture>, BackendBail> {
     match desktop_rebind::try_change_desktop() {
         Ok(desktop_rebind::DesktopChange::Switched(name)) => {
-            tracing::info!(%name, "try_build_dxgi: rebound input desktop before DXGI build");
+            tracing::info!(%name, "attempt_build_dxgi: rebound input desktop before DXGI build");
         }
         Ok(desktop_rebind::DesktopChange::Unchanged) => {}
         Err(e) => {
-            tracing::warn!(%e, "try_build_dxgi: desktop rebind failed before DXGI build");
+            tracing::warn!(%e, "attempt_build_dxgi: desktop rebind failed before DXGI build");
         }
     }
     #[cfg(all(feature = "mf-encoder", feature = "scrap-capture"))]
@@ -338,8 +350,13 @@ fn try_build_dxgi() -> Option<Box<dyn DxgiCapture>> {
         match DxgiDirectBackend::primary() {
             Ok(b) => {
                 tracing::info!("system-context capture: backend=DXGI (direct, adapter-bound)");
-                return Some(Box::new(b));
+                return Ok(Box::new(b));
             }
+            // E_ACCESSDENIED on the direct backend means the thread isn't on a
+            // desktop it can duplicate yet — recoverable. Surface it straight to
+            // the retry loop; the scrap backend would only hit the same denial
+            // on this desktop, so there's nothing to gain from trying it now.
+            Err(BackendBail::DesktopMismatch) => return Err(BackendBail::DesktopMismatch),
             Err(e) => {
                 tracing::warn!(
                     ?e,
@@ -351,13 +368,72 @@ fn try_build_dxgi() -> Option<Box<dyn DxgiCapture>> {
     match DxgiDupBackend::primary() {
         Ok(b) => {
             tracing::info!("system-context capture: backend=DXGI (scrap auto-adapter)");
-            Some(Box::new(b))
+            Ok(Box::new(b))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Single-attempt DXGI build used by the GDI re-climb path (every
+/// [`DXGI_RECLIMB_INTERVAL`]). Deliberately does NOT loop/back off: this runs
+/// on the frame-serving worker thread, so blocking it for ~1 s would stall GDI
+/// output — the 5 s re-climb cadence is itself the retry. Init failures (incl.
+/// a recoverable `DesktopMismatch`) just stay on GDI until the next tick.
+#[cfg(feature = "scrap-capture")]
+fn try_build_dxgi() -> Option<Box<dyn DxgiCapture>> {
+    match attempt_build_dxgi() {
+        Ok(b) => Some(b),
+        Err(BackendBail::DesktopMismatch) => {
+            // Not logged at warn — the re-climb fires every 5 s and a desktop
+            // race clears on its own; the GDI arm keeps serving frames meanwhile.
+            tracing::debug!(
+                "DXGI re-climb: E_ACCESSDENIED (desktop transition) — staying on GDI this tick"
+            );
+            None
         }
         Err(e) => {
             tracing::warn!(?e, "scrap DXGI backend init also failed");
             None
         }
     }
+}
+
+/// Resilient DXGI build used at worker STARTUP. Retries a recoverable
+/// `DesktopMismatch` (E_ACCESSDENIED) with a rebind + backoff before conceding
+/// to GDI — see [`DXGI_INIT_MAX_ATTEMPTS`]. Safe to block here: no frames are
+/// being served yet (`SystemContextCapture::primary` is awaiting the ready-ack).
+/// Returns `None` only when DXGI is genuinely unavailable (HardError) or still
+/// denied after the full retry budget — the caller then drops to GDI.
+#[cfg(feature = "scrap-capture")]
+fn build_dxgi_with_retry() -> Option<Box<dyn DxgiCapture>> {
+    for attempt in 1..=DXGI_INIT_MAX_ATTEMPTS {
+        match attempt_build_dxgi() {
+            Ok(b) => return Some(b),
+            Err(BackendBail::DesktopMismatch) if attempt < DXGI_INIT_MAX_ATTEMPTS => {
+                tracing::info!(
+                    attempt,
+                    max = DXGI_INIT_MAX_ATTEMPTS,
+                    "DXGI init: E_ACCESSDENIED (desktop/session transition) — rebinding + retrying before GDI fallback"
+                );
+                thread::sleep(DXGI_INIT_RETRY_BACKOFF);
+            }
+            Err(BackendBail::DesktopMismatch) => {
+                tracing::warn!(
+                    attempts = DXGI_INIT_MAX_ATTEMPTS,
+                    "DXGI init: still E_ACCESSDENIED after retries — conceding to GDI for now (5 s re-climb will keep trying)"
+                );
+                return None;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    ?e,
+                    "DXGI init failed (non-recoverable) — falling back to GDI BitBlt"
+                );
+                return None;
+            }
+        }
+    }
+    None
 }
 
 #[cfg(not(feature = "scrap-capture"))]
