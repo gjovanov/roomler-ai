@@ -81,6 +81,14 @@ pub async fn handle_tunnel_client_socket(
     let (outbound_tx, outbound_rx) = mpsc::channel::<ServerMsg>(OUTBOUND_CAP);
     let pump = tokio::spawn(pump_server_messages(outbound_rx, socket_tx.clone()));
 
+    // Register this connection in the overlay registry (keyed by
+    // tunnel_client_id) so the overlay broker can fan netmaps/deltas to
+    // it as a node. Harmless if the client never joins the overlay;
+    // removed on disconnect below.
+    state
+        .overlay_nodes_by_id
+        .insert(tunnel_client_id, outbound_tx.clone());
+
     // Look up tunnel-client metadata once for audit-row enrichment
     // (client_version + client_os). Best-effort — audit rows still
     // get written if this fails, just with empty version/os.
@@ -141,6 +149,19 @@ pub async fn handle_tunnel_client_socket(
                 .await;
                 continue;
             }
+        };
+
+        // Overlay `rc:overlay.*` variants are brokered separately (this
+        // tunnel-client is an overlay node). Consumed messages return
+        // None; everything else falls through to the tunnel match below.
+        let Some(parsed) = crate::ws::overlay::relay_overlay_msg_from_node(
+            &state,
+            crate::ws::overlay::NodeIdentity::TunnelClient(tunnel_client_id),
+            parsed,
+        )
+        .await
+        else {
+            continue;
         };
 
         match parsed {
@@ -314,6 +335,17 @@ pub async fn handle_tunnel_client_socket(
     }
 
     revocation_handle.abort();
+
+    // Overlay teardown: drop this node from the registry + mark it
+    // offline so peers' netmaps lose it. Best-effort; no-op if the
+    // client never joined the overlay.
+    state.overlay_nodes_by_id.remove(&tunnel_client_id);
+    crate::ws::overlay::handle_overlay_leave(
+        &state,
+        crate::ws::overlay::NodeIdentity::TunnelClient(tunnel_client_id),
+    )
+    .await;
+
     if let Some(s) = session {
         state.tunnel_clients_by_session.remove(&s.tunnel_session_id);
         // Best-effort: tell the agent the peer is gone so it tears

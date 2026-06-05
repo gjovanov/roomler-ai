@@ -119,6 +119,18 @@ pub async fn handle_agent_socket(
                             let Some(parsed) = relay_tunnel_msg_from_agent(&state, parsed).await else {
                                 continue;
                             };
+                            // Overlay `rc:overlay.*` variants are brokered
+                            // here too (the Hub doesn't know about the
+                            // overlay). Consumed messages return None.
+                            let Some(parsed) = crate::ws::overlay::relay_overlay_msg_from_node(
+                                &state,
+                                crate::ws::overlay::NodeIdentity::Agent(agent_id),
+                                parsed,
+                            )
+                            .await
+                            else {
+                                continue;
+                            };
                             // Phase 7: refresh last_seen_at on every heartbeat. Hub
                             // dispatch is a no-op for AgentHeartbeat (handled here);
                             // we still call dispatch so any future routing logic
@@ -154,6 +166,14 @@ pub async fn handle_agent_socket(
     // explicitly — but the `pump.abort()` is kept as a belt-and-
     // suspenders for the case where the tx-identity check skipped
     // the removal and the pump is still wired to the live channel.
+    // If this agent was an overlay node, mark it offline + drop it from
+    // peers' netmaps (best-effort; it re-syncs on its next join).
+    crate::ws::overlay::handle_overlay_leave(
+        &state,
+        crate::ws::overlay::NodeIdentity::Agent(agent_id),
+    )
+    .await;
+
     state
         .rc_hub
         .unregister_agent(agent_id, Some(&registered_tx));
