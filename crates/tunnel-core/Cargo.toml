@@ -86,9 +86,23 @@ webrtc-ice = "0.12.0"
 boringtun = { version = "0.7", optional = true }
 base64 = { workspace = true, optional = true }
 
+# Overlay L3 surface (`overlay-l3` feature): the OS TUN virtual NIC.
+# Pure-Rust build — loads Wintun (a signed driver DLL) at runtime on
+# Windows, /dev/net/tun on Linux, utun on macOS; no C compiled here.
+# `AsyncDevice::{recv,send}` take `&self`, so one `Arc<AsyncDevice>`
+# drives the bridge's concurrent read + write loops. Kept separate from
+# `overlay` (the WG core) so the server/lib can use the WG types without
+# pulling a TUN dependency.
+tun = { version = "0.8", optional = true, features = ["async"] }
+
 [features]
 # Userspace WireGuard L3 overlay (Phase 2+). Off by default.
 overlay = ["dep:boringtun", "dep:base64"]
+# Phase 3: the OS TUN device (`overlay::tun::SystemTun`) on top of the WG
+# core. `overlay` alone gives the WG device + the bridge logic + the
+# in-memory MockTun loopback test (no real device); `overlay-l3` adds the
+# `tun` crate's real `SystemTun`. Off by default.
+overlay-l3 = ["overlay", "dep:tun"]
 
 [dev-dependencies]
 tokio-test = { workspace = true }
