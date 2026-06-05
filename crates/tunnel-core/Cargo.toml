@@ -77,5 +77,18 @@ webrtc-util = { workspace = true }
 # Resolves to `crates/vendored/webrtc-ice` via the root `[patch.crates-io]`.
 webrtc-ice = "0.12.0"
 
+# Overlay L3 data plane (`overlay` feature): userspace WireGuard via
+# boringtun (pure-Rust Noise state machine — `Tunn::encapsulate` /
+# `decapsulate`, no socket/TUN of its own, so the same WG ciphertext
+# rides either a UDP socket or the coturn `RelayConn`). Curve25519 keygen
+# comes from boringtun's re-exported `x25519`. Feature-gated so default
+# builds stay overlay-free (same discipline as the agent's `vp9-444`).
+boringtun = { version = "0.7", optional = true }
+base64 = { workspace = true, optional = true }
+
+[features]
+# Userspace WireGuard L3 overlay (Phase 2+). Off by default.
+overlay = ["dep:boringtun", "dep:base64"]
+
 [dev-dependencies]
 tokio-test = { workspace = true }

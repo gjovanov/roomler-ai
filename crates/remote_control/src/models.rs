@@ -577,3 +577,103 @@ pub struct AgentCrashRecord {
 impl AgentCrashRecord {
     pub const COLLECTION: &'static str = "agent_crashes";
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Overlay network (Tailscale-style L3 mesh)
+// ────────────────────────────────────────────────────────────────────────────
+//
+// An overlay node is the unifying layer above `Agent` and `TunnelClient`:
+// either kind of host can join a per-tenant virtual LAN, get a stable
+// overlay IP, and reach any permitted peer at L3 over WireGuard. The two
+// underlying collections keep their distinct lifecycles/audiences; an
+// `OverlayNode` references one of them via [`NodeRef`] and adds the
+// overlay-specific identity (WG pubkey + overlay IP + endpoints).
+
+/// Which underlying host an [`OverlayNode`] is. Adjacently tagged so the
+/// BSON/JSON shape is `{"kind":"agent","id":<oid>}` — mirrors the
+/// `PolicySubject` / `PolicyTarget` style. The `id` stays a native
+/// ObjectId for DB rows (Mongo indexes rely on native encoding); the
+/// wire/netmap exposes nodes by their `overlay_nodes._id`, not by this.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NodeRef {
+    Agent {
+        #[serde(rename = "id")]
+        agent_id: ObjectId,
+    },
+    TunnelClient {
+        #[serde(rename = "id")]
+        tunnel_client_id: ObjectId,
+    },
+}
+
+/// One member of a tenant's overlay network. Keyed for rehydrate-on-
+/// re-enroll by `(tenant_id, machine_id)` exactly like [`Agent`] /
+/// [`TunnelClient`], so a re-joining host keeps its overlay IP (and may
+/// register a rotated WG key). The WG **private** key never leaves the
+/// node; only `wg_public_key` is stored + distributed in the netmap.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct OverlayNode {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub tenant_id: ObjectId,
+    pub node_ref: NodeRef,
+    pub network_id: ObjectId,
+    /// Rehydrate key — carried from the underlying agent/tunnel-client so
+    /// a re-join finds the existing row (and its leased overlay IP).
+    pub machine_id: String,
+    /// Leased overlay address, e.g. `"100.64.0.7"`. Stable for the row's
+    /// life; reclaimed only on hard-delete.
+    pub overlay_ip: String,
+    /// base64-encoded Curve25519 public key (WireGuard static key).
+    pub wg_public_key: String,
+    /// Bumped on key rotation (Phase 5). `0` at first join.
+    #[serde(default)]
+    pub key_epoch: u32,
+    /// Current connectivity candidates (host / srflx / relay), as
+    /// `host:port` strings the peer can dial. Trickled via
+    /// `rc:overlay.endpoints`.
+    #[serde(default)]
+    pub endpoints: Vec<String>,
+    /// Preferred relay region/home, if any (Phase 5 multi-relay).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_home: Option<String>,
+    pub status: AgentStatus,
+    pub last_seen_at: DateTime,
+    pub created_at: DateTime,
+    pub updated_at: DateTime,
+    pub deleted_at: Option<DateTime>,
+}
+
+impl OverlayNode {
+    pub const COLLECTION: &'static str = "overlay_nodes";
+}
+
+/// IPAM authority for one tenant's overlay. One row per tenant. The
+/// allocator hands out host numbers monotonically from `next_host`
+/// (atomic `$inc`), so leases are stable and never recycled while the
+/// node row lives.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct OverlayNetwork {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub tenant_id: ObjectId,
+    /// CGNAT range per the Tailscale convention, e.g. `"100.64.0.0/10"`.
+    pub cidr: String,
+    /// Monotonic host cursor — the next host number to hand out. `1` for
+    /// a fresh network (host `0` is the network address, reserved).
+    pub next_host: u32,
+    /// Path MTU for the overlay. 1280 leaves headroom for the WG +
+    /// carrier (UDP/relay) overhead under a 1500-byte underlay.
+    pub mtu: u16,
+    pub created_at: DateTime,
+    pub updated_at: DateTime,
+}
+
+impl OverlayNetwork {
+    pub const COLLECTION: &'static str = "overlay_networks";
+    /// Default tenant overlay range (CGNAT block, like Tailscale).
+    pub const DEFAULT_CIDR: &'static str = "100.64.0.0/10";
+    /// Default overlay MTU.
+    pub const DEFAULT_MTU: u16 = 1280;
+}

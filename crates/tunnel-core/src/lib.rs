@@ -29,6 +29,9 @@
 pub mod auth;
 pub mod forward;
 pub mod mux;
+/// Overlay L3 data plane (userspace WireGuard mesh) — feature `overlay`.
+#[cfg(feature = "overlay")]
+pub mod overlay;
 pub mod policy;
 pub mod signaling;
 pub mod transport;

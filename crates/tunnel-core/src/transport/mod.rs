@@ -83,6 +83,46 @@ pub fn agent_supports_quic(version: &str) -> bool {
     }
 }
 
+/// Lowest agent release that runs the overlay WireGuard L3 data plane
+/// (`wireguard-v1` + the `rc:overlay.*` netmap). An agent older than
+/// this ignores overlay setup, so the server must NOT treat it as an
+/// overlay node. Bumped to the first rc that ships the `overlay`
+/// feature; placeholder until that tag is cut.
+pub const MIN_OVERLAY_AGENT_RC: u32 = 130;
+
+/// Whether an agent reporting `version` supports the overlay L3 data
+/// plane — i.e. whether the server may enroll it as an overlay node and
+/// negotiate `wireguard-v1` for it. Same parse-and-compare shape +
+/// conservative-on-unparseable contract as [`agent_supports_quic`].
+///
+/// * `0.3.0-rc.N` → `N >= MIN_OVERLAY_AGENT_RC`
+/// * `0.3.0` final / any later line (`0.3.1`, `0.4.x`, `1.x`) → `true`
+/// * anything earlier, or an unparseable string → `false`
+pub fn agent_supports_overlay(version: &str) -> bool {
+    let (core, rc) = match version.split_once("-rc.") {
+        Some((core, n)) => (core, Some(n)),
+        None => (version, None),
+    };
+    let core = core.split(['-', '+']).next().unwrap_or(core).trim();
+    let mut parts = core.split('.').map(|p| p.trim().parse::<u32>().ok());
+    let triple = match (parts.next(), parts.next(), parts.next()) {
+        (Some(Some(maj)), Some(Some(min)), Some(Some(pat))) => (maj, min, pat),
+        _ => return false,
+    };
+    use std::cmp::Ordering::{Equal, Greater, Less};
+    match triple.cmp(&(0, 3, 0)) {
+        Greater => true,
+        Less => false,
+        Equal => match rc {
+            None => true,
+            Some(n) => n
+                .trim()
+                .parse::<u32>()
+                .is_ok_and(|n| n >= MIN_OVERLAY_AGENT_RC),
+        },
+    }
+}
+
 /// Capabilities a transport advertises.
 #[derive(Debug, Clone, Default)]
 pub struct Capabilities {
@@ -136,5 +176,35 @@ mod tests {
         assert!(!agent_supports_quic("0.3")); // not a full triple
         assert!(!agent_supports_quic("0.3.x"));
         assert!(!agent_supports_quic("0.3.0-rc.notanumber"));
+    }
+
+    #[test]
+    fn agent_overlay_gate_rc_threshold() {
+        assert!(!agent_supports_overlay(&format!(
+            "0.3.0-rc.{}",
+            MIN_OVERLAY_AGENT_RC - 1
+        )));
+        assert!(agent_supports_overlay(&format!(
+            "0.3.0-rc.{MIN_OVERLAY_AGENT_RC}"
+        )));
+        assert!(agent_supports_overlay(&format!(
+            "0.3.0-rc.{}",
+            MIN_OVERLAY_AGENT_RC + 10
+        )));
+    }
+
+    #[test]
+    fn agent_overlay_gate_release_lines_and_unparseable() {
+        // Earlier lines never speak overlay, even at a high rc.
+        assert!(!agent_supports_overlay("0.2.99-rc.999"));
+        assert!(!agent_supports_overlay("0.3.0-rc.1"));
+        // 0.3.0 final + every later line is overlay-capable.
+        assert!(agent_supports_overlay("0.3.0"));
+        assert!(agent_supports_overlay("0.4.0"));
+        assert!(agent_supports_overlay("1.0.0"));
+        // Conservative on garbage.
+        assert!(!agent_supports_overlay(""));
+        assert!(!agent_supports_overlay("0.3.x"));
+        assert!(!agent_supports_overlay("0.3.0-rc.notanumber"));
     }
 }
