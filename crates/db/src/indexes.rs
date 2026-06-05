@@ -256,6 +256,31 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> 
     )
     .await?;
 
+    // Overlay networks — one IPAM row per tenant. Unique on tenant_id
+    // so `get_or_create` races collapse to one network.
+    create_indexes(
+        db,
+        "overlay_networks",
+        vec![index_unique(bson::doc! { "tenant_id": 1 })],
+    )
+    .await?;
+
+    // Overlay nodes — virtual-LAN membership above agents/tunnel_clients.
+    // Same (tenant_id, machine_id) rehydrate contract as agents; the
+    // (tenant_id, network_id, overlay_ip) unique index guarantees no two
+    // live nodes share an overlay address. The (tenant_id, network_id,
+    // deleted_at) index backs the netmap build query.
+    create_indexes(
+        db,
+        "overlay_nodes",
+        vec![
+            index_unique(bson::doc! { "tenant_id": 1, "machine_id": 1 }),
+            index_unique(bson::doc! { "tenant_id": 1, "network_id": 1, "overlay_ip": 1 }),
+            index(bson::doc! { "tenant_id": 1, "network_id": 1, "deleted_at": 1 }),
+        ],
+    )
+    .await?;
+
     // Tunnel policies — tenant-scoped allowlists. The server-side ACL
     // gate fetches `list_active_for_tenant(tenant_id)` on every
     // TcpForwardRequest; the (tenant_id, deleted_at) compound index
