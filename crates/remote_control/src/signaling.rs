@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::models::{AgentCaps, DisplayInfo, EndReason, OsKind};
 use crate::permissions::Permissions;
-use crate::serde_helpers::{oid_hex, option_oid_hex};
+use crate::serde_helpers::{oid_hex, option_oid_hex, vec_oid_hex};
 
 /// Which side of the connection sent / receives a message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -451,6 +451,51 @@ pub enum ClientMsg {
         /// 2/3, optionally plus host/srflx. Priority order.
         addrs: Vec<String>,
     },
+
+    // ─── overlay node → server (rc:overlay.*) ────────────────────────
+    /// Node (agent or tunnel-client) announces itself to the overlay and
+    /// registers its WireGuard static public key. The server does IPAM
+    /// (allocating or rehydrating the node's overlay IP), persists the
+    /// `OverlayNode`, and replies with a full `rc:overlay.netmap`.
+    #[serde(rename = "rc:overlay.join")]
+    OverlayJoin {
+        /// Optional hint for which network to join (multi-network is a
+        /// later phase; today the tenant has exactly one).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        network_hint: Option<String>,
+        /// base64 Curve25519 public key.
+        wg_public_key: String,
+        #[serde(default)]
+        key_epoch: u32,
+        /// Transports the node speaks (`["wireguard-v1", ...]`).
+        #[serde(default)]
+        supported: Vec<String>,
+        /// Node's overlay MTU preference (server clamps to the network).
+        mtu: u16,
+        /// Initial connectivity candidates (host/srflx/relay).
+        #[serde(default)]
+        endpoints: Vec<String>,
+    },
+
+    /// Node trickles updated connectivity candidates; the server fans a
+    /// delta to permitted peers.
+    #[serde(rename = "rc:overlay.endpoints")]
+    OverlayEndpoints { candidates: Vec<String> },
+
+    /// Node leaves the overlay (graceful). Server marks it offline and
+    /// pushes a `netmap_delta` removing it from peers.
+    #[serde(rename = "rc:overlay.leave")]
+    OverlayLeave {},
+
+    /// Node asks for short-lived coturn credentials to stand up a relay
+    /// leg to a specific peer (used when direct hole-punch to that peer
+    /// fails). The server replies with `rc:overlay.relay_grant` carrying
+    /// creds keyed by the symmetric `pair_key`.
+    #[serde(rename = "rc:overlay.relay_request")]
+    OverlayRelayRequest {
+        #[serde(with = "oid_hex")]
+        peer_node_id: ObjectId,
+    },
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -757,6 +802,43 @@ pub enum ServerMsg {
         session_id: ObjectId,
         addrs: Vec<String>,
     },
+
+    // ─── server → overlay node (rc:overlay.*) ────────────────────────
+    /// Full network map sent to a node on join. Carries the node's own
+    /// `self_ip`, the network parameters, and every peer it may reach.
+    /// `epoch` monotonically increases per network so a node can detect
+    /// a missed delta and (in a later phase) request a resync.
+    #[serde(rename = "rc:overlay.netmap")]
+    OverlayNetmap {
+        self_ip: String,
+        network: OverlayNetworkInfo,
+        peers: Vec<NetmapPeer>,
+        epoch: u64,
+    },
+
+    /// Incremental netmap update: peers to add/update and node_ids to
+    /// remove. Pushed on join/leave/endpoint-change (and, later,
+    /// ACL-change/rekey).
+    #[serde(rename = "rc:overlay.netmap_delta")]
+    OverlayNetmapDelta {
+        epoch: u64,
+        #[serde(default)]
+        upserts: Vec<NetmapPeer>,
+        #[serde(default, with = "vec_oid_hex")]
+        removes: Vec<ObjectId>,
+    },
+
+    /// On-demand coturn credentials for a relay leg to a specific peer.
+    /// `pair_key = sorted(node_a_hex, node_b_hex)` so both ends derive
+    /// identical short-lived creds (same-worker hairpin), exactly like
+    /// the QUIC tunnel's per-session creds.
+    #[serde(rename = "rc:overlay.relay_grant")]
+    OverlayRelayGrant {
+        ice_servers: Vec<IceServer>,
+        #[serde(with = "oid_hex")]
+        peer_node_id: ObjectId,
+        pair_key: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -766,6 +848,39 @@ pub struct IceServer {
     pub username: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credential: Option<String>,
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Overlay network supporting types (rc:overlay.*)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// One peer in a netmap. `node_id` is the peer's `overlay_nodes._id`
+/// (the stable handle the control plane uses for fan-out + ACL). The
+/// node installs this peer as a WireGuard `Tunn` keyed by
+/// `wg_public_key`, with `allowed_ips = overlay_ip/32`. `reachable` is
+/// **server-precomputed** from the ACL — a forbidden peer is dropped
+/// from the netmap entirely, so this is `true` for every peer the node
+/// actually receives (the field is retained so a future soft-deny can
+/// ship a peer with `reachable=false` without a wire change).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct NetmapPeer {
+    #[serde(with = "oid_hex")]
+    pub node_id: ObjectId,
+    pub overlay_ip: String,
+    pub wg_public_key: String,
+    #[serde(default)]
+    pub endpoints: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_home: Option<String>,
+    pub reachable: bool,
+}
+
+/// Network-wide parameters carried in a full netmap so the node can size
+/// its TUN/MTU and validate its own address against the range.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct OverlayNetworkInfo {
+    pub cidr: String,
+    pub mtu: u16,
 }
 
 #[cfg(test)]
@@ -1396,6 +1511,157 @@ mod tests {
         match back {
             ClientMsg::TunnelIce { candidate: c2, .. } => assert_eq!(c2, candidate),
             other => panic!("expected TunnelIce, got {other:?}"),
+        }
+    }
+
+    // ─── rc:overlay.* wire-format locks ───────────────────────────────
+
+    #[test]
+    fn overlay_join_roundtrip() {
+        let m = ClientMsg::OverlayJoin {
+            network_hint: None,
+            wg_public_key: "cHVia2V5".into(),
+            key_epoch: 0,
+            supported: vec!["wireguard-v1".into(), "quic-v1".into()],
+            mtu: 1280,
+            endpoints: vec!["203.0.113.5:51820".into()],
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(r#""t":"rc:overlay.join""#));
+        match serde_json::from_str::<ClientMsg>(&s).unwrap() {
+            ClientMsg::OverlayJoin {
+                wg_public_key,
+                mtu,
+                supported,
+                ..
+            } => {
+                assert_eq!(wg_public_key, "cHVia2V5");
+                assert_eq!(mtu, 1280);
+                assert!(supported.iter().any(|t| t == "wireguard-v1"));
+            }
+            other => panic!("expected OverlayJoin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn overlay_endpoints_and_leave_roundtrip() {
+        let e = ClientMsg::OverlayEndpoints {
+            candidates: vec!["198.51.100.7:51820".into()],
+        };
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(s.contains(r#""t":"rc:overlay.endpoints""#));
+        assert!(matches!(
+            serde_json::from_str::<ClientMsg>(&s).unwrap(),
+            ClientMsg::OverlayEndpoints { .. }
+        ));
+
+        let l = ClientMsg::OverlayLeave {};
+        let s = serde_json::to_string(&l).unwrap();
+        assert!(s.contains(r#""t":"rc:overlay.leave""#));
+        assert!(matches!(
+            serde_json::from_str::<ClientMsg>(&s).unwrap(),
+            ClientMsg::OverlayLeave {}
+        ));
+    }
+
+    #[test]
+    fn overlay_relay_request_uses_raw_hex_peer_id() {
+        let peer = ObjectId::parse_str("507f1f77bcf86cd799439014").unwrap();
+        let m = ClientMsg::OverlayRelayRequest { peer_node_id: peer };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(r#""t":"rc:overlay.relay_request""#));
+        assert!(!s.contains("$oid"));
+        match serde_json::from_str::<ClientMsg>(&s).unwrap() {
+            ClientMsg::OverlayRelayRequest { peer_node_id } => assert_eq!(peer_node_id, peer),
+            other => panic!("expected OverlayRelayRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn overlay_netmap_roundtrip_with_raw_hex_node_id() {
+        let node_id = ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap();
+        let m = ServerMsg::OverlayNetmap {
+            self_ip: "100.64.0.3".into(),
+            network: OverlayNetworkInfo {
+                cidr: "100.64.0.0/10".into(),
+                mtu: 1280,
+            },
+            peers: vec![NetmapPeer {
+                node_id,
+                overlay_ip: "100.64.0.4".into(),
+                wg_public_key: "cGVlcg==".into(),
+                endpoints: vec!["203.0.113.9:51820".into()],
+                relay_home: None,
+                reachable: true,
+            }],
+            epoch: 7,
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(r#""t":"rc:overlay.netmap""#));
+        // node_id is a bare hex string on the wire (no $oid).
+        assert!(!s.contains("$oid"));
+        assert!(s.contains("\"507f1f77bcf86cd799439011\""));
+        match serde_json::from_str::<ServerMsg>(&s).unwrap() {
+            ServerMsg::OverlayNetmap {
+                self_ip,
+                peers,
+                epoch,
+                ..
+            } => {
+                assert_eq!(self_ip, "100.64.0.3");
+                assert_eq!(epoch, 7);
+                assert_eq!(peers.len(), 1);
+                assert_eq!(peers[0].node_id, node_id);
+            }
+            other => panic!("expected OverlayNetmap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn overlay_netmap_delta_removes_are_raw_hex() {
+        let rm = ObjectId::parse_str("507f1f77bcf86cd799439012").unwrap();
+        let m = ServerMsg::OverlayNetmapDelta {
+            epoch: 8,
+            upserts: vec![],
+            removes: vec![rm],
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(r#""t":"rc:overlay.netmap_delta""#));
+        assert!(!s.contains("$oid"));
+        assert!(s.contains("\"507f1f77bcf86cd799439012\""));
+        match serde_json::from_str::<ServerMsg>(&s).unwrap() {
+            ServerMsg::OverlayNetmapDelta { removes, epoch, .. } => {
+                assert_eq!(epoch, 8);
+                assert_eq!(removes, vec![rm]);
+            }
+            other => panic!("expected OverlayNetmapDelta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn overlay_relay_grant_roundtrip() {
+        let peer = ObjectId::parse_str("507f1f77bcf86cd799439013").unwrap();
+        let m = ServerMsg::OverlayRelayGrant {
+            ice_servers: vec![IceServer {
+                urls: vec!["turns:coturn.roomler.ai:443?transport=tcp".into()],
+                username: Some("u".into()),
+                credential: Some("c".into()),
+            }],
+            peer_node_id: peer,
+            pair_key: "a..b".into(),
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(r#""t":"rc:overlay.relay_grant""#));
+        match serde_json::from_str::<ServerMsg>(&s).unwrap() {
+            ServerMsg::OverlayRelayGrant {
+                peer_node_id,
+                ice_servers,
+                ..
+            } => {
+                assert_eq!(peer_node_id, peer);
+                assert_eq!(ice_servers.len(), 1);
+            }
+            other => panic!("expected OverlayRelayGrant, got {other:?}"),
         }
     }
 }
