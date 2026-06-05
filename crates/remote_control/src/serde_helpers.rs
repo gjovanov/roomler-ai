@@ -46,6 +46,25 @@ pub mod option_oid_hex {
     }
 }
 
+pub mod vec_oid_hex {
+    use super::*;
+    use serde::ser::SerializeSeq;
+
+    pub fn serialize<S: Serializer>(oids: &[ObjectId], s: S) -> Result<S::Ok, S::Error> {
+        let mut seq = s.serialize_seq(Some(oids.len()))?;
+        for oid in oids {
+            seq.serialize_element(&oid.to_hex())?;
+        }
+        seq.end()
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<ObjectId>, D::Error> {
+        // Lenient inbound, like `oid_hex`: each element accepts both
+        // `"hex"` and `{"$oid":"hex"}`.
+        Vec::<ObjectId>::deserialize(d)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -57,6 +76,8 @@ mod tests {
         id: ObjectId,
         #[serde(with = "option_oid_hex")]
         maybe: Option<ObjectId>,
+        #[serde(with = "vec_oid_hex")]
+        many: Vec<ObjectId>,
     }
 
     #[test]
@@ -65,29 +86,34 @@ mod tests {
         let w = Wrap {
             id,
             maybe: Some(id),
+            many: vec![id],
         };
         let s = serde_json::to_string(&w).unwrap();
         // No `$oid` wrapping on either field.
         assert!(!s.contains("$oid"), "expected hex strings, got: {s}");
         assert!(s.contains("\"507f1f77bcf86cd799439011\""));
+        // The Vec element is also a bare hex string.
+        assert!(s.contains("\"many\":[\"507f1f77bcf86cd799439011\"]"));
     }
 
     #[test]
     fn accepts_plain_hex_inbound() {
-        let json = r#"{"id":"507f1f77bcf86cd799439011","maybe":"507f1f77bcf86cd799439011"}"#;
+        let json = r#"{"id":"507f1f77bcf86cd799439011","maybe":"507f1f77bcf86cd799439011","many":["507f1f77bcf86cd799439011"]}"#;
         let w: Wrap = serde_json::from_str(json).unwrap();
         assert_eq!(w.id.to_hex(), "507f1f77bcf86cd799439011");
         assert!(w.maybe.is_some());
+        assert_eq!(w.many.len(), 1);
     }
 
     #[test]
     fn accepts_extended_json_inbound() {
         // Backward compat: servers / agents that still emit extended JSON
         // (say, while we're rolling out the fix) parse fine.
-        let json = r#"{"id":{"$oid":"507f1f77bcf86cd799439011"},"maybe":{"$oid":"507f1f77bcf86cd799439011"}}"#;
+        let json = r#"{"id":{"$oid":"507f1f77bcf86cd799439011"},"maybe":{"$oid":"507f1f77bcf86cd799439011"},"many":[{"$oid":"507f1f77bcf86cd799439011"}]}"#;
         let w: Wrap = serde_json::from_str(json).unwrap();
         assert_eq!(w.id.to_hex(), "507f1f77bcf86cd799439011");
         assert!(w.maybe.is_some());
+        assert_eq!(w.many.len(), 1);
     }
 
     #[test]
@@ -95,8 +121,10 @@ mod tests {
         let w = Wrap {
             id: ObjectId::new(),
             maybe: None,
+            many: vec![],
         };
         let s = serde_json::to_string(&w).unwrap();
         assert!(s.contains("\"maybe\":null"));
+        assert!(s.contains("\"many\":[]"));
     }
 }
