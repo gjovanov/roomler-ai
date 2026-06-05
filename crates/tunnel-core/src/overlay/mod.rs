@@ -16,6 +16,8 @@
 //! * [`tun`] — the [`tun::TunIo`] OS-NIC seam (`SystemTun` behind
 //!   `overlay-l3`; an in-memory mock in tests).
 //! * [`bridge`] — the TUN↔`WgDevice` packet pump ([`bridge::run_bridge`]).
+//! * [`runtime`] — the node runtime ([`runtime::OverlayRuntime`]): join →
+//!   netmap → install WG peers + bring up the TUN + pump packets.
 //!
 //! Identity: each node owns a stable Curve25519 keypair. The private
 //! key never leaves the node; the base64 public key is registered with
@@ -24,6 +26,7 @@
 pub mod bridge;
 pub mod netmap;
 pub mod router;
+pub mod runtime;
 pub mod tun;
 pub mod wg;
 
