@@ -92,6 +92,20 @@ jobs:
         #     locks the rc:agent.hello advertisement contract.
         run: cargo test -p roomler-agent --features vp9-444,vp9-444-bindgen --lib
 
+      # Overlay L3 (Phase 3) feature gate. `overlay-l3` pulls the `tun`
+      # crate (Wintun on Windows / /dev/net/tun on Linux) + the TUN↔WG
+      # bridge; the default `--workspace` clippy never compiles it
+      # (opt-in), so lint + test it explicitly here — mirrors the
+      # vp9-444 gate, catching an L3-path regression before it ships
+      # under the flag.
+      - name: Clippy tunnel-core --features overlay-l3
+        run: cargo clippy -p roomler-ai-tunnel-core --features overlay-l3 --all-targets -- -D warnings
+
+      - name: Test tunnel-core --features overlay-l3
+        # WG handshake (direct + RelayConn) + the TUN↔WG bridge loopback
+        # test — all in-process over 127.0.0.1, no real device.
+        run: cargo test -p roomler-ai-tunnel-core --features overlay-l3 --lib
+
   frontend:
     name: Frontend checks
     runs-on: ubuntu-latest
