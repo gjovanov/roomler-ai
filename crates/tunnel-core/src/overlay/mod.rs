@@ -13,13 +13,18 @@
 //!   here).
 //! * [`netmap`] — decode a signed `rc:overlay.netmap` peer into a
 //!   routable [`netmap::PeerConfig`].
+//! * [`tun`] — the [`tun::TunIo`] OS-NIC seam (`SystemTun` behind
+//!   `overlay-l3`; an in-memory mock in tests).
+//! * [`bridge`] — the TUN↔`WgDevice` packet pump ([`bridge::run_bridge`]).
 //!
 //! Identity: each node owns a stable Curve25519 keypair. The private
 //! key never leaves the node; the base64 public key is registered with
 //! the coordination server and distributed in the netmap.
 
+pub mod bridge;
 pub mod netmap;
 pub mod router;
+pub mod tun;
 pub mod wg;
 
 use base64::Engine as _;
