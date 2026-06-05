@@ -420,7 +420,7 @@ async fn current_node(state: &AppState, ident: NodeIdentity) -> Option<OverlayNo
 /// `policy::evaluate_overlay`.
 fn to_netmap_peer(node: &OverlayNode) -> NetmapPeer {
     NetmapPeer {
-        node_id: node.id.unwrap_or_else(ObjectId::new),
+        node_id: node.id.unwrap_or_default(),
         overlay_ip: node.overlay_ip.clone(),
         wg_public_key: node.wg_public_key.clone(),
         endpoints: node.endpoints.clone(),
