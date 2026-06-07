@@ -1097,6 +1097,20 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         }
     }
 
+    // Phase 3b: generate + persist this node's WireGuard identity on the
+    // first overlay-enabled startup. The public key is what the netmap
+    // distributes; the secret never leaves the host. Kept here (not in
+    // `migrate`) so `config.rs` stays free of the overlay-l3 feature dep.
+    #[cfg(feature = "overlay-l3")]
+    if cfg.overlay_enabled && cfg.overlay_wg_secret_key.is_none() {
+        let kp = tunnel_core::overlay::WgKeypair::generate();
+        cfg.overlay_wg_secret_key = Some(kp.secret_base64());
+        match config::save(config_path, &cfg) {
+            Ok(()) => tracing::info!("overlay: generated + persisted node WireGuard key"),
+            Err(e) => tracing::warn!(error = %e, "overlay: failed to persist WG key"),
+        }
+    }
+
     let encoder_preference = resolve_encoder_preference(cli_encoder, cfg.encoder_preference);
 
     // Wire the file-DC v2 `files:dir` browse capability. Default
