@@ -28,6 +28,8 @@ pub mod logs_fetch;
 pub mod logs_upload;
 pub mod machine;
 pub mod notify;
+#[cfg(feature = "overlay-l3")]
+pub mod overlay;
 pub mod peer;
 pub mod post_install;
 pub mod preflight;

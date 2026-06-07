@@ -106,6 +106,12 @@ jobs:
         # test — all in-process over 127.0.0.1, no real device.
         run: cargo test -p roomler-ai-tunnel-core --features overlay-l3 --lib
 
+      - name: Clippy roomler-agent --features overlay-l3
+        # Phase 3b: the agent's overlay glue (overlay.rs + the main /
+        # signaling hooks) only compiles under the opt-in feature, so the
+        # default --workspace clippy never sees it. Lint it explicitly.
+        run: cargo clippy -p roomler-agent --features overlay-l3 -- -D warnings
+
   frontend:
     name: Frontend checks
     runs-on: ubuntu-latest

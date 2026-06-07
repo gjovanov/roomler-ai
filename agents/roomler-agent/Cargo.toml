@@ -366,6 +366,12 @@ ffmpeg-encoder = ["dep:ffmpeg-next", "dep:dcv-color-primitives"]
 # nothing reaches user code.
 system-context = []
 
+# Phase 3b — overlay L3 mesh (Tailscale-style). Pulls the WireGuard data
+# plane + TUN device from tunnel-core. Default-OFF + gated on the
+# `overlay_enabled` config. The agent runs privileged (service), so the
+# TUN device + routes come up directly (no helper).
+overlay-l3 = ["roomler-ai-tunnel-core/overlay-l3"]
+
 [dev-dependencies]
 tokio-test = { workspace = true }
 tempfile = { workspace = true }

@@ -28,9 +28,10 @@ use tracing::{debug, info, warn};
 
 use super::WgKeypair;
 use super::netmap::{PeerConfig, peer_config_from_netmap};
+use super::relay_link::{ReadyLink, RelayCoordinator};
 use super::tun::TunIo;
 use super::wg::{Carrier, WgDevice};
-use roomler_ai_remote_control::signaling::{ClientMsg, NetmapPeer, OverlayNetworkInfo};
+use roomler_ai_remote_control::signaling::{ClientMsg, IceServer, NetmapPeer, OverlayNetworkInfo};
 
 /// Overlay control events the runtime consumes, fed in from the node's
 /// signaling loop (the `ServerMsg::Overlay*` handlers forward these).
@@ -47,6 +48,11 @@ pub enum OverlayEvent {
     NetmapDelta {
         upserts: Vec<NetmapPeer>,
         removes: Vec<ObjectId>,
+    },
+    /// Coturn creds for a relay leg to `peer_node_id` (relay mode only).
+    RelayGrant {
+        peer_node_id: ObjectId,
+        ice_servers: Vec<IceServer>,
     },
 }
 
@@ -78,17 +84,29 @@ fn prefix_of_cidr(cidr: &str) -> Option<u8> {
         .and_then(|(_, p)| p.trim().parse().ok())
 }
 
-/// One node's overlay runtime. Construct with [`OverlayRuntime::new`],
-/// then `tokio::spawn(rt.run(events, endpoints))`.
+/// How the runtime obtains a carrier for each peer.
+enum CarrierMode {
+    /// Direct/test: a stateless [`LinkFactory`] builds the carrier
+    /// immediately (loopback in tests).
+    Direct(Arc<dyn LinkFactory>),
+    /// Production: coturn relay coordination ([`RelayCoordinator`]) —
+    /// field-pending.
+    Relay,
+}
+
+/// One node's overlay runtime. Construct with [`OverlayRuntime::new`] (or
+/// [`new_relay`](OverlayRuntime::new_relay)), then
+/// `tokio::spawn(rt.run(events, endpoints))`.
 pub struct OverlayRuntime {
     keypair: WgKeypair,
     outbound: mpsc::Sender<ClientMsg>,
-    links: Arc<dyn LinkFactory>,
+    mode: CarrierMode,
     tun_factory: TunFactory,
     mtu: u16,
 }
 
 impl OverlayRuntime {
+    /// Direct/test runtime: carriers come from `links`.
     pub fn new(
         keypair: WgKeypair,
         outbound: mpsc::Sender<ClientMsg>,
@@ -99,7 +117,24 @@ impl OverlayRuntime {
         Self {
             keypair,
             outbound,
-            links,
+            mode: CarrierMode::Direct(links),
+            tun_factory,
+            mtu,
+        }
+    }
+
+    /// Production runtime: carriers come from the coturn relay
+    /// coordination (field-pending).
+    pub fn new_relay(
+        keypair: WgKeypair,
+        outbound: mpsc::Sender<ClientMsg>,
+        tun_factory: TunFactory,
+        mtu: u16,
+    ) -> Self {
+        Self {
+            keypair,
+            outbound,
+            mode: CarrierMode::Relay,
             tun_factory,
             mtu,
         }
@@ -133,6 +168,7 @@ impl OverlayRuntime {
                     peers,
                 }) => break (self_ip, network, peers),
                 Some(OverlayEvent::NetmapDelta { .. }) => continue, // pre-netmap; ignore
+                Some(OverlayEvent::RelayGrant { .. }) => continue,  // pre-netmap; ignore
                 None => return,
             }
         };
@@ -167,7 +203,11 @@ impl OverlayRuntime {
         });
 
         let mut by_node: HashMap<ObjectId, [u8; 32]> = HashMap::new();
-        self.apply_upserts(&mut wg, &mut by_node, &first_peers)
+        let mut relay = match self.mode {
+            CarrierMode::Relay => Some(RelayCoordinator::new(self.outbound.clone())),
+            CarrierMode::Direct(_) => None,
+        };
+        self.install_peers(&mut wg, &mut by_node, &mut relay, &first_peers)
             .await;
 
         // Phase 2 — steady state.
@@ -181,15 +221,25 @@ impl OverlayRuntime {
                     // Re-sync: install any newly-listed peers (deltas drive
                     // removals; a full diff/prune is a later refinement).
                     Some(OverlayEvent::Netmap { peers, .. }) => {
-                        self.apply_upserts(&mut wg, &mut by_node, &peers).await;
+                        self.install_peers(&mut wg, &mut by_node, &mut relay, &peers).await;
                     }
                     Some(OverlayEvent::NetmapDelta { upserts, removes }) => {
-                        self.apply_upserts(&mut wg, &mut by_node, &upserts).await;
+                        self.install_peers(&mut wg, &mut by_node, &mut relay, &upserts).await;
                         for node_id in removes {
                             if let Some(pk) = by_node.remove(&node_id) {
                                 wg.remove_peer(&pk);
                                 info!(peer = %node_id, "overlay: peer removed");
                             }
+                            if let Some(r) = relay.as_mut() {
+                                r.forget(&node_id);
+                            }
+                        }
+                    }
+                    Some(OverlayEvent::RelayGrant { peer_node_id, ice_servers }) => {
+                        if let Some(r) = relay.as_mut()
+                            && let Some(link) = r.on_grant(peer_node_id, ice_servers).await
+                        {
+                            self.install_ready(&mut wg, &mut by_node, link);
                         }
                     }
                     None => break,
@@ -200,16 +250,17 @@ impl OverlayRuntime {
         inbound.abort();
     }
 
-    /// Install any peers in `peers` not already tracked, recording each in
-    /// `by_node` so a later delta can drop it by node id. Dedup is by node
-    /// id (a re-listed peer is skipped).
-    async fn apply_upserts(
+    /// For each peer not already installed: in Direct mode build the
+    /// carrier + install immediately; in Relay mode drive the coturn
+    /// coordination (complete an in-flight allocation, else request creds).
+    /// Dedup is by node id.
+    async fn install_peers(
         &self,
         wg: &mut WgDevice,
         by_node: &mut HashMap<ObjectId, [u8; 32]>,
+        relay: &mut Option<RelayCoordinator>,
         peers: &[NetmapPeer],
     ) {
-        let self_pub = self.keypair.public.to_bytes();
         for np in peers {
             if by_node.contains_key(&np.node_id) {
                 continue; // already installed
@@ -217,18 +268,49 @@ impl OverlayRuntime {
             let Some(cfg) = peer_config_from_netmap(np) else {
                 continue;
             };
-            let Some(carrier) = self.links.build_carrier(&cfg).await else {
-                debug!(peer = %np.node_id, "overlay: no carrier built; will retry on next netmap");
-                continue;
-            };
-            // Deterministic single initiator per link: the lexicographically
-            // smaller public key dials. Both ends compute this identically,
-            // so exactly one sends the handshake initiation.
-            let initiate = self_pub < cfg.public_key;
-            wg.add_peer(cfg.public_key, cfg.overlay_ip, carrier, initiate);
-            by_node.insert(np.node_id, cfg.public_key);
-            info!(peer = %np.node_id, overlay_ip = %cfg.overlay_ip, initiate, "overlay: peer installed");
+            match &self.mode {
+                CarrierMode::Direct(links) => {
+                    let Some(carrier) = links.build_carrier(&cfg).await else {
+                        debug!(peer = %np.node_id, "overlay: no carrier built; retry next netmap");
+                        continue;
+                    };
+                    self.install_ready(
+                        wg,
+                        by_node,
+                        ReadyLink {
+                            node_id: np.node_id,
+                            public_key: cfg.public_key,
+                            overlay_ip: cfg.overlay_ip,
+                            carrier,
+                        },
+                    );
+                }
+                CarrierMode::Relay => {
+                    if let Some(coord) = relay.as_mut() {
+                        if let Some(link) = coord.maybe_complete(np.node_id, &cfg) {
+                            self.install_ready(wg, by_node, link);
+                        } else if !coord.is_tracking(&np.node_id) {
+                            coord.request(np.node_id, cfg).await;
+                        }
+                    }
+                }
+            }
         }
+    }
+
+    /// Install a ready carrier as a WG peer + record it for later removal.
+    fn install_ready(
+        &self,
+        wg: &mut WgDevice,
+        by_node: &mut HashMap<ObjectId, [u8; 32]>,
+        link: ReadyLink,
+    ) {
+        // Deterministic single initiator per link: the lexicographically
+        // smaller public key dials. Both ends compute this identically.
+        let initiate = self.keypair.public.to_bytes() < link.public_key;
+        wg.add_peer(link.public_key, link.overlay_ip, link.carrier, initiate);
+        by_node.insert(link.node_id, link.public_key);
+        info!(peer = %link.node_id, overlay_ip = %link.overlay_ip, initiate, "overlay: peer installed");
     }
 }
 

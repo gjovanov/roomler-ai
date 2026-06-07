@@ -25,6 +25,7 @@
 
 pub mod bridge;
 pub mod netmap;
+pub mod relay_link;
 pub mod router;
 pub mod runtime;
 pub mod tun;

@@ -440,6 +440,12 @@ async fn connect_once(
     // locally-gathered ICE candidates and state-change terminates here;
     // the main loop flushes them to the WS.
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<ClientMsg>(PEER_OUTBOUND_CAP);
+    // Phase 3b: if overlay is enabled, start the node runtime (relay mode)
+    // and capture the channel its `rc:overlay.*` events flow into. The
+    // runtime sends its `ClientMsg`s back through `outbound_tx`, like any
+    // peer, and tears down when this connection's `overlay_evt_tx` drops.
+    #[cfg(feature = "overlay-l3")]
+    let overlay_evt_tx = crate::overlay::maybe_start(cfg, outbound_tx.clone());
     let mut peers: HashMap<bson::oid::ObjectId, AgentPeer> = HashMap::new();
     // Codec selected for each pending session (computed from the
     // browser∩agent intersection when `rc:session.request` arrives, read
@@ -547,6 +553,17 @@ async fn connect_once(
                     watchdog::tick("signaling");
                     match serde_json::from_str::<ServerMsg>(&text) {
                         Ok(parsed) => {
+                            // Phase 3b: route `rc:overlay.*` to the node
+                            // runtime; everything else falls through to the
+                            // normal dispatch below.
+                            #[cfg(feature = "overlay-l3")]
+                            let parsed = match &overlay_evt_tx {
+                                Some(tx) => match crate::overlay::intercept(tx, parsed) {
+                                    Some(p) => p,
+                                    None => continue,
+                                },
+                                None => parsed,
+                            };
                             handle_server_msg(
                                 &mut ws,
                                 parsed,
