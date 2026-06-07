@@ -135,6 +135,17 @@ pub struct AgentConfig {
     /// semantics.
     #[serde(default)]
     pub forward_acl: AgentForwardAcl,
+
+    /// Phase 3b: opt into the overlay L3 mesh. Default off — an
+    /// `overlay-l3` build only joins the mesh when this is set.
+    #[serde(default)]
+    pub overlay_enabled: bool,
+
+    /// Phase 3b: this node's persisted WireGuard Curve25519 secret key
+    /// (base64). Generated on the first overlay-enabled startup in `main`;
+    /// the public key is what the netmap distributes. `None` until then.
+    #[serde(default)]
+    pub overlay_wg_secret_key: Option<String>,
 }
 
 /// Current schema version. Bumped whenever [`migrate`] gains a new
@@ -473,6 +484,8 @@ mod tests {
             last_run_unhealthy: false,
             config_schema_version: None,
             forward_acl: AgentForwardAcl::default(),
+            overlay_enabled: false,
+            overlay_wg_secret_key: None,
         }
     }
 
