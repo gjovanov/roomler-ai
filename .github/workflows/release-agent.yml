@@ -175,7 +175,13 @@ jobs:
         # runs against the system libvpx 1.14 headers; without this the
         # build script panics looking for `vpx-ffi-1.14.0.rs` in the
         # crate's `generated/` dir (only ships ≤ 1.13.0).
-        run: cargo build -p roomler-agent --release --features "full,vp9-444,vp9-444-bindgen"
+        # `overlay-l3` (Phase 3b) compiles in the Tailscale-style overlay
+        # mesh (WireGuard via boringtun + the TUN device). Pure-Rust, no
+        # extra system dep on Linux (/dev/net/tun is in-kernel). Default-
+        # OFF: an agent only joins the mesh when its config sets
+        # `overlay_enabled` — so shipping it everywhere is inert until an
+        # operator opts a host in.
+        run: cargo build -p roomler-agent --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3"
 
       - name: Build .deb
         working-directory: agents/roomler-agent
@@ -506,7 +512,16 @@ jobs:
         # (c) MSI size delta vs rc.64 is within budget (≤ +8 MB; HARD
         #     STOP enforced by the next step at +12 MB)
         shell: pwsh
-        run: cargo build -p roomler-agent --release --features "full-hw,vp9-444,system-context,ffmpeg-encoder"
+        # `overlay-l3` (Phase 3b): the overlay mesh (WireGuard + TUN). The
+        # binary compiles overlay in everywhere, but on Windows the TUN is
+        # Wintun, which LoadLibrary's a signed `wintun.dll` at runtime —
+        # NOT yet bundled in the MSI (follow-up: a `WintunDll` wxs
+        # component in both wix/ + wix-perMachine/ + a download step). So
+        # overlay on Windows degrades gracefully (SystemTun::up fails →
+        # the runtime logs + aborts → the agent runs normally) until that
+        # lands; Linux (/dev/net/tun) + macOS (utun) need no extra dep and
+        # work today. Default-OFF (config `overlay_enabled`).
+        run: cargo build -p roomler-agent --release --features "full-hw,vp9-444,system-context,ffmpeg-encoder,overlay-l3"
 
       - name: Verify FFmpeg link via unit test
         # Runs ONLY the ffmpeg-encoder gated test, which calls into
@@ -839,7 +854,10 @@ jobs:
         # for `generated/vpx-ffi-1.16.0.rs`. macOS bindgen + libclang
         # has none of the Windows opaque-struct issue, so this just
         # works.
-        run: cargo build -p roomler-agent --release --features "full,vp9-444,vp9-444-bindgen" --target aarch64-apple-darwin
+        # `overlay-l3` (Phase 3b): the overlay mesh (WireGuard + TUN, utun
+        # on macOS — in-kernel, no extra dep). Default-OFF (config
+        # `overlay_enabled`), inert until an operator opts a host in.
+        run: cargo build -p roomler-agent --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3" --target aarch64-apple-darwin
 
       - name: Stage .app bundle
         shell: bash
