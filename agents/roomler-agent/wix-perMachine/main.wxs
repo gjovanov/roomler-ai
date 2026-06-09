@@ -120,6 +120,20 @@
                             Source='agents\roomler-agent\packaging\windows\README.txt' />
                     </Component>
 
+                    <!-- Phase 3b: Wintun TUN driver DLL for the overlay-l3
+                         WireGuard mesh. LoadLibrary'd at runtime; present only
+                         in overlay-l3 builds (the release pipeline produces
+                         them) + staged into target\release by the workflow's
+                         wintun step. Guid='*' since the DLL is its own KeyPath. -->
+                    <Component Id='WintunDll' Guid='*' Win64='yes'>
+                        <File
+                            Id='wintun_dll'
+                            Name='wintun.dll'
+                            DiskId='1'
+                            KeyPath='yes'
+                            Source='target\release\wintun.dll' />
+                    </Component>
+
                     <!--
                       M3 A1: enable SendSAS() from LocalSystem services so the
                       SYSTEM-context worker can deliver Ctrl+Alt+Del to the
@@ -181,6 +195,7 @@
             <ComponentRef Id='AgentExe' />
             <ComponentRef Id='LicenseTxt' />
             <ComponentRef Id='ReadmeTxt' />
+            <ComponentRef Id='WintunDll' />
             <ComponentRef Id='SoftwareSASRegistry' />
         </Feature>
 
