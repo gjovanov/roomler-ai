@@ -1,27 +1,31 @@
 //! Coturn-relay carrier coordination for the overlay runtime (Phase 3b).
 //!
-//! **FIELD-PENDING.** Unlike the rest of the overlay (loopback-proven),
-//! the relay carrier can only be validated on real hosts against live
-//! coturn — exactly like the QUIC tunnel's relay path, which took
-//! several RCs of field iteration (the same-worker pin, the dual-IP SNAT
-//! quirk). This module ships the *mechanics* (request → grant → allocate
-//! → advertise → build) compile-verified; the live address-exchange
-//! timing, endpoint disambiguation, and same-worker pin are tuned in the
-//! field. First-cut simplifications are marked `FIELD:` below.
+//! **Same-worker pin (rc.125).** The first field bring-up failed because
+//! the two nodes allocated on *different* coturn workers, and cross-worker
+//! relay-to-relay drops under mars's dual-public-IP SNAT (the exact issue
+//! the QUIC tunnel fixed in rc.112). The fix here mirrors that pin: the
+//! deterministic **initiator** (smaller WG public key) allocates its relay
+//! round-robin and advertises it first; the **responder** then allocates on
+//! the *initiator's* coturn worker — an intra-worker hairpin with no
+//! cross-worker SNAT. See `agents/roomler-tunnel/src/forward.rs`
+//! (`setup_quic_over_relay`) for the QUIC original.
 //!
-//! Per-peer flow (both ends do this symmetrically):
-//! 1. peer appears in the netmap → [`RelayCoordinator::request`] sends
-//!    `rc:overlay.relay_request` and stashes the peer's config.
-//! 2. server replies `rc:overlay.relay_grant` → [`RelayCoordinator::on_grant`]
-//!    allocates a coturn relay (`allocate_relay_from_ice`), advertises
-//!    its own relayed address via `rc:overlay.endpoints` so the peer can
-//!    dial it, and stores the allocation.
-//! 3. the peer's relayed address arrives in a later netmap (it advertised
-//!    its own) → [`RelayCoordinator::maybe_complete`] builds the
-//!    `Carrier::relay` and yields a [`ReadyLink`] the runtime installs.
+//! Per-peer flow (each side does this symmetrically):
+//! 1. peer appears → [`request`](RelayCoordinator::request) sends
+//!    `rc:overlay.relay_request` and stashes the peer config + whether we
+//!    initiate.
+//! 2. `rc:overlay.relay_grant` → [`on_grant`](RelayCoordinator::on_grant):
+//!    the initiator allocates now (round-robin) + advertises; the responder
+//!    defers until it knows the initiator's relayed address.
+//! 3. the peer's relayed address arrives in a netmap delta →
+//!    [`maybe_complete`](RelayCoordinator::maybe_complete): the responder
+//!    allocates *pinned to that worker* + advertises, and both sides build
+//!    the `Carrier::relay`.
+//!
+//! **Still field-pending:** validated only against live coturn + two hosts.
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use bson::oid::ObjectId;
@@ -40,6 +44,17 @@ pub struct ReadyLink {
     pub carrier: Arc<Carrier>,
 }
 
+/// A peer we're coordinating a relay link to, before our allocation exists.
+struct PendingPeer {
+    peer: PeerConfig,
+    /// Do *we* initiate this link (our WG pubkey is the smaller)? The
+    /// initiator allocates round-robin first; the responder pins to the
+    /// initiator's worker.
+    initiate: bool,
+    /// coturn creds from `relay_grant` (`None` until granted).
+    ice: Option<Vec<IceServer>>,
+}
+
 /// A relay allocation made for one peer, awaiting that peer's relayed
 /// address before the carrier can be built.
 struct Allocated {
@@ -50,9 +65,8 @@ struct Allocated {
 /// Drives the relay handshake for every peer the node wants to reach.
 pub struct RelayCoordinator {
     outbound: tokio::sync::mpsc::Sender<ClientMsg>,
-    /// Requested a grant; awaiting `relay_grant`. Stores the peer config
-    /// so `on_grant` knows the pubkey / overlay IP.
-    pending: HashMap<ObjectId, PeerConfig>,
+    /// Requested (and maybe granted), not yet allocated.
+    pending: HashMap<ObjectId, PendingPeer>,
     /// Allocated + advertised; awaiting the peer's relayed address.
     allocated: HashMap<ObjectId, Allocated>,
     /// Every relayed address we've allocated this session — each
@@ -75,9 +89,9 @@ impl RelayCoordinator {
         self.pending.contains_key(node_id) || self.allocated.contains_key(node_id)
     }
 
-    /// Kick off a relay link: ask the server for short-lived coturn creds
-    /// for this peer, stashing its config for `on_grant`.
-    pub async fn request(&mut self, node_id: ObjectId, peer: PeerConfig) {
+    /// Kick off a relay link: ask the server for coturn creds, stashing the
+    /// peer config + whether we initiate (drives the same-worker pin).
+    pub async fn request(&mut self, node_id: ObjectId, peer: PeerConfig, initiate: bool) {
         if self.is_tracking(&node_id) {
             return;
         }
@@ -92,32 +106,79 @@ impl RelayCoordinator {
             warn!(peer = %node_id, "overlay relay: control channel closed; cannot request");
             return;
         }
-        self.pending.insert(node_id, peer);
-        debug!(peer = %node_id, "overlay relay: requested coturn creds");
+        self.pending.insert(
+            node_id,
+            PendingPeer {
+                peer,
+                initiate,
+                ice: None,
+            },
+        );
+        debug!(peer = %node_id, initiate, "overlay relay: requested coturn creds");
     }
 
-    /// Got coturn creds for `node_id`: allocate our own relay, advertise
-    /// its address (so the peer can dial us), and try to complete the link
-    /// if the peer already advertised its address.
+    /// Got coturn creds. The initiator allocates immediately (round-robin);
+    /// the responder waits until it knows the initiator's relayed address so
+    /// it can pin to the same coturn worker.
     pub async fn on_grant(
         &mut self,
         node_id: ObjectId,
         ice_servers: Vec<IceServer>,
     ) -> Option<ReadyLink> {
-        let Some(peer) = self.pending.remove(&node_id) else {
-            debug!(peer = %node_id, "overlay relay: grant for an untracked/linked peer; ignoring");
-            return None;
+        let ready_to_alloc = {
+            let pp = self.pending.get_mut(&node_id)?;
+            pp.ice = Some(ice_servers);
+            pp.initiate || peer_worker_ip(&pp.peer).is_some()
         };
-        let (urls, user, cred) = turn_creds(&ice_servers)?;
-        let conn: Arc<dyn RelayConn> = match allocate_relay_from_ice(&urls, &user, &cred).await {
-            Ok(c) => Arc::new(c),
-            Err(e) => {
-                warn!(peer = %node_id, %e, "overlay relay: allocate failed");
-                return None;
-            }
+        if ready_to_alloc {
+            self.allocate_and_store(node_id).await
+        } else {
+            debug!(peer = %node_id, "overlay relay: responder waiting for the initiator's relay addr before pinning");
+            None
+        }
+    }
+
+    /// A fresh netmap view arrived. Refresh the peer config; if we're a
+    /// responder that was waiting for the initiator's relayed address, it may
+    /// now be known — allocate (pinned) and build the carrier.
+    pub async fn maybe_complete(
+        &mut self,
+        node_id: ObjectId,
+        peer: &PeerConfig,
+    ) -> Option<ReadyLink> {
+        if let Some(a) = self.allocated.get_mut(&node_id) {
+            a.peer = peer.clone();
+            return self.try_build(&node_id);
+        }
+        let should_alloc = if let Some(pp) = self.pending.get_mut(&node_id) {
+            pp.peer = peer.clone();
+            pp.ice.is_some() && !pp.initiate && peer_worker_ip(&pp.peer).is_some()
+        } else {
+            false
         };
-        // Advertise our relayed address so the peer can dial it.
+        if should_alloc {
+            return self.allocate_and_store(node_id).await;
+        }
+        None
+    }
+
+    /// Allocate this peer's relay (pinned to its coturn worker iff we're the
+    /// responder and know its address), advertise it, move it to `allocated`,
+    /// and try to build the carrier.
+    async fn allocate_and_store(&mut self, node_id: ObjectId) -> Option<ReadyLink> {
+        let (ice, peer, initiate) = {
+            let pp = self.pending.get(&node_id)?;
+            (pp.ice.clone()?, pp.peer.clone(), pp.initiate)
+        };
+        // Same-worker pin: a responder follows the initiator onto its worker.
+        let pin = if initiate {
+            None
+        } else {
+            peer_worker_ip(&peer)
+        };
+        let conn = self.allocate(&ice, pin).await?;
         if let Ok(own) = conn.local_addr() {
+            info!(peer = %node_id, %own, pinned = pin.is_some(), "overlay relay: allocated");
             let own = own.to_string();
             if !self.advertised.contains(&own) {
                 self.advertised.push(own);
@@ -129,28 +190,45 @@ impl RelayCoordinator {
                 })
                 .await;
         }
+        self.pending.remove(&node_id);
         self.allocated.insert(node_id, Allocated { conn, peer });
         self.try_build(&node_id)
     }
 
-    /// A fresh netmap view of `node_id` arrived (possibly now carrying its
-    /// relayed address). Refresh the stored peer + try to finish the link.
-    pub fn maybe_complete(&mut self, node_id: ObjectId, peer: &PeerConfig) -> Option<ReadyLink> {
-        if let Some(a) = self.allocated.get_mut(&node_id) {
-            a.peer = peer.clone();
-            return self.try_build(&node_id);
+    /// Allocate a coturn relay. With `pin = Some(ip)` the peer's coturn
+    /// worker is tried first (UDP, then TURNS/TCP for UDP-blocked corp
+    /// hosts), so the relay-to-relay path becomes an intra-worker hairpin.
+    async fn allocate(&self, ice: &[IceServer], pin: Option<IpAddr>) -> Option<Arc<dyn RelayConn>> {
+        let (urls, user, cred) = turn_creds(ice)?;
+        let urls = match pin {
+            Some(ip) => {
+                let h = if ip.is_ipv6() {
+                    format!("[{ip}]")
+                } else {
+                    ip.to_string()
+                };
+                let mut pinned = vec![
+                    format!("turn:{h}:3478?transport=udp"),
+                    format!("turns:{h}:443?transport=tcp"),
+                ];
+                pinned.extend(urls);
+                pinned
+            }
+            None => urls,
+        };
+        match allocate_relay_from_ice(&urls, &user, &cred).await {
+            Ok(c) => Some(Arc::new(c) as Arc<dyn RelayConn>),
+            Err(e) => {
+                warn!(%e, pinned = pin.is_some(), "overlay relay: allocate failed");
+                None
+            }
         }
-        None
     }
 
     /// Build the carrier once we have an allocation AND a dialable peer
     /// address. On success the link leaves `allocated`.
     fn try_build(&mut self, node_id: &ObjectId) -> Option<ReadyLink> {
         let a = self.allocated.get(node_id)?;
-        // FIELD: relay-only peers advertise just their relayed address via
-        // `rc:overlay.endpoints`, so the first parseable endpoint is it. A
-        // peer that also carries direct candidates needs server-side relay
-        // tagging to disambiguate — a later cut.
         let dst: SocketAddr = a.peer.endpoints.iter().find_map(|e| e.parse().ok())?;
         let carrier = Carrier::relay(a.conn.clone(), dst);
         let link = ReadyLink {
@@ -181,6 +259,14 @@ fn turn_creds(ice_servers: &[IceServer]) -> Option<(Vec<String>, String, String)
     })
 }
 
+/// The coturn worker IP a peer is on, from its advertised relayed address.
+fn peer_worker_ip(peer: &PeerConfig) -> Option<IpAddr> {
+    peer.endpoints
+        .iter()
+        .find_map(|e| e.parse::<SocketAddr>().ok())
+        .map(|s| s.ip())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,6 +295,21 @@ mod tests {
         assert!(turn_creds(&[]).is_none());
     }
 
+    #[test]
+    fn peer_worker_ip_reads_first_endpoint() {
+        let peer = PeerConfig {
+            public_key: [1u8; 32],
+            overlay_ip: Ipv4Addr::new(100, 64, 0, 9),
+            endpoints: vec!["5.9.157.226:11696".into()],
+        };
+        assert_eq!(peer_worker_ip(&peer), Some("5.9.157.226".parse().unwrap()));
+        let no_ep = PeerConfig {
+            endpoints: vec![],
+            ..peer
+        };
+        assert_eq!(peer_worker_ip(&no_ep), None);
+    }
+
     #[tokio::test]
     async fn request_is_idempotent_and_sends_one_relay_request() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
@@ -219,8 +320,8 @@ mod tests {
             overlay_ip: Ipv4Addr::new(100, 64, 0, 9),
             endpoints: vec![],
         };
-        coord.request(node, peer.clone()).await;
-        coord.request(node, peer).await; // de-duped
+        coord.request(node, peer.clone(), true).await;
+        coord.request(node, peer, true).await; // de-duped
         assert!(coord.is_tracking(&node));
         assert!(matches!(
             rx.recv().await,
