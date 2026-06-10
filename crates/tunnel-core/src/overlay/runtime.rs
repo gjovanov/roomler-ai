@@ -50,9 +50,12 @@ pub enum OverlayEvent {
         removes: Vec<ObjectId>,
     },
     /// Coturn creds for a relay leg to `peer_node_id` (relay mode only).
+    /// `pair_key` is the server's symmetric `sorted(a,b)` key — both ends
+    /// receive an identical value and use it to pick the same coturn worker.
     RelayGrant {
         peer_node_id: ObjectId,
         ice_servers: Vec<IceServer>,
+        pair_key: String,
     },
 }
 
@@ -235,9 +238,9 @@ impl OverlayRuntime {
                             }
                         }
                     }
-                    Some(OverlayEvent::RelayGrant { peer_node_id, ice_servers }) => {
+                    Some(OverlayEvent::RelayGrant { peer_node_id, ice_servers, pair_key }) => {
                         if let Some(r) = relay.as_mut()
-                            && let Some(link) = r.on_grant(peer_node_id, ice_servers).await
+                            && let Some(link) = r.on_grant(peer_node_id, ice_servers, pair_key).await
                         {
                             self.install_ready(&mut wg, &mut by_node, link);
                         }
@@ -287,15 +290,15 @@ impl OverlayRuntime {
                 }
                 CarrierMode::Relay => {
                     if let Some(coord) = relay.as_mut() {
-                        if let Some(link) = coord.maybe_complete(np.node_id, &cfg).await {
+                        if let Some(link) = coord.maybe_complete(np.node_id, &cfg) {
                             self.install_ready(wg, by_node, link);
                         } else if !coord.is_tracking(&np.node_id) {
-                            // Same initiator tie-break as the WG handshake: the
-                            // lexicographically smaller pubkey initiates + its
-                            // relay is allocated round-robin first; the other
-                            // side pins onto that coturn worker.
-                            let initiate = self.keypair.public.to_bytes() < cfg.public_key;
-                            coord.request(np.node_id, cfg, initiate).await;
+                            // Both ends pick the same coturn worker from the
+                            // server's symmetric pair_key (in the grant), so no
+                            // initiator/responder asymmetry is needed here — see
+                            // relay_link.rs. The WG handshake still tie-breaks
+                            // the dialer by pubkey in `install_ready`.
+                            coord.request(np.node_id, cfg).await;
                         }
                     }
                 }
