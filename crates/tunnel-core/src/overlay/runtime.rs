@@ -205,12 +205,14 @@ impl OverlayRuntime {
             }
         });
 
-        let mut by_node: HashMap<ObjectId, [u8; 32]> = HashMap::new();
+        // node_id → (WG pubkey, overlay IP). The IP is kept so a peer's
+        // `/32` route can be torn down when it leaves.
+        let mut by_node: HashMap<ObjectId, ([u8; 32], Ipv4Addr)> = HashMap::new();
         let mut relay = match self.mode {
             CarrierMode::Relay => Some(RelayCoordinator::new(self.outbound.clone())),
             CarrierMode::Direct(_) => None,
         };
-        self.install_peers(&mut wg, &mut by_node, &mut relay, &first_peers)
+        self.install_peers(&mut wg, &mut by_node, &mut relay, &tun, &first_peers)
             .await;
 
         // Phase 2 — steady state.
@@ -224,13 +226,14 @@ impl OverlayRuntime {
                     // Re-sync: install any newly-listed peers (deltas drive
                     // removals; a full diff/prune is a later refinement).
                     Some(OverlayEvent::Netmap { peers, .. }) => {
-                        self.install_peers(&mut wg, &mut by_node, &mut relay, &peers).await;
+                        self.install_peers(&mut wg, &mut by_node, &mut relay, &tun, &peers).await;
                     }
                     Some(OverlayEvent::NetmapDelta { upserts, removes }) => {
-                        self.install_peers(&mut wg, &mut by_node, &mut relay, &upserts).await;
+                        self.install_peers(&mut wg, &mut by_node, &mut relay, &tun, &upserts).await;
                         for node_id in removes {
-                            if let Some(pk) = by_node.remove(&node_id) {
+                            if let Some((pk, ip)) = by_node.remove(&node_id) {
                                 wg.remove_peer(&pk);
+                                tun.del_peer_route(ip).await;
                                 info!(peer = %node_id, "overlay: peer removed");
                             }
                             if let Some(r) = relay.as_mut() {
@@ -242,7 +245,7 @@ impl OverlayRuntime {
                         if let Some(r) = relay.as_mut()
                             && let Some(link) = r.on_grant(peer_node_id, ice_servers, pair_key).await
                         {
-                            self.install_ready(&mut wg, &mut by_node, link);
+                            self.install_ready(&mut wg, &mut by_node, &tun, link).await;
                         }
                     }
                     None => break,
@@ -260,8 +263,9 @@ impl OverlayRuntime {
     async fn install_peers(
         &self,
         wg: &mut WgDevice,
-        by_node: &mut HashMap<ObjectId, [u8; 32]>,
+        by_node: &mut HashMap<ObjectId, ([u8; 32], Ipv4Addr)>,
         relay: &mut Option<RelayCoordinator>,
+        tun: &Arc<dyn TunIo>,
         peers: &[NetmapPeer],
     ) {
         for np in peers {
@@ -280,18 +284,20 @@ impl OverlayRuntime {
                     self.install_ready(
                         wg,
                         by_node,
+                        tun,
                         ReadyLink {
                             node_id: np.node_id,
                             public_key: cfg.public_key,
                             overlay_ip: cfg.overlay_ip,
                             carrier,
                         },
-                    );
+                    )
+                    .await;
                 }
                 CarrierMode::Relay => {
                     if let Some(coord) = relay.as_mut() {
                         if let Some(link) = coord.maybe_complete(np.node_id, &cfg) {
-                            self.install_ready(wg, by_node, link);
+                            self.install_ready(wg, by_node, tun, link).await;
                         } else if !coord.is_tracking(&np.node_id) {
                             // Both ends pick the same coturn worker from the
                             // server's symmetric pair_key (in the grant), so no
@@ -306,18 +312,26 @@ impl OverlayRuntime {
         }
     }
 
-    /// Install a ready carrier as a WG peer + record it for later removal.
-    fn install_ready(
+    /// Install a ready carrier as a WG peer, add its `/32` route, and record
+    /// it (pubkey + IP) for later removal.
+    async fn install_ready(
         &self,
         wg: &mut WgDevice,
-        by_node: &mut HashMap<ObjectId, [u8; 32]>,
+        by_node: &mut HashMap<ObjectId, ([u8; 32], Ipv4Addr)>,
+        tun: &Arc<dyn TunIo>,
         link: ReadyLink,
     ) {
         // Deterministic single initiator per link: the lexicographically
         // smaller public key dials. Both ends compute this identically.
         let initiate = self.keypair.public.to_bytes() < link.public_key;
         wg.add_peer(link.public_key, link.overlay_ip, link.carrier, initiate);
-        by_node.insert(link.node_id, link.public_key);
+        by_node.insert(link.node_id, (link.public_key, link.overlay_ip));
+        // Host `/32` so overlay traffic to this peer beats any colliding
+        // less-specific route on the uplink (e.g. a carrier CGNAT /10).
+        // Best-effort — clean hosts route fine via the connected /10.
+        if let Err(e) = tun.add_peer_route(link.overlay_ip).await {
+            debug!(peer = %link.node_id, %e, "overlay: /32 peer route not installed (ok on clean hosts)");
+        }
         info!(peer = %link.node_id, overlay_ip = %link.overlay_ip, initiate, "overlay: peer installed");
     }
 }
