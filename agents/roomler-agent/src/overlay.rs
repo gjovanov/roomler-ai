@@ -79,10 +79,11 @@ pub fn intercept(evt_tx: &mpsc::Sender<OverlayEvent>, msg: ServerMsg) -> Option<
         ServerMsg::OverlayRelayGrant {
             ice_servers,
             peer_node_id,
-            ..
+            pair_key,
         } => OverlayEvent::RelayGrant {
             peer_node_id,
             ice_servers,
+            pair_key,
         },
         other => return Some(other),
     };
