@@ -31,6 +31,23 @@ pub trait TunIo: Send + Sync {
 
     /// Write one IP packet to the device.
     async fn write_packet(&self, packet: &[u8]) -> std::io::Result<()>;
+
+    /// Install a host (`/32`) route for a peer's overlay IP via this device,
+    /// so overlay traffic out-specifics any colliding *less*-specific route on
+    /// the host's uplink — e.g. an ISP/corp **CGNAT `100.64.0.0/10`** that
+    /// otherwise swallows the packets. The connected-CIDR route alone is not
+    /// enough on such a host (field bug 2026-06-10: PC50045's pings to peers
+    /// leaked to its carrier's CGNAT until a manual `/32` was added). Default
+    /// no-op (the in-memory mock + platforms where the connected route is
+    /// sufficient). **Best-effort:** a failure is logged by the caller, not
+    /// fatal — direct/clean hosts route fine via the `/10` regardless.
+    async fn add_peer_route(&self, _peer: std::net::Ipv4Addr) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Remove the `/32` installed by [`add_peer_route`] (the peer left the
+    /// mesh). Best-effort; never fails the caller.
+    async fn del_peer_route(&self, _peer: std::net::Ipv4Addr) {}
 }
 
 /// The real OS TUN device. Behind `overlay-l3` so the WG core + the
@@ -100,5 +117,106 @@ mod system {
                 .map(|_| ())
                 .map_err(|e| std::io::Error::other(e.to_string()))
         }
+
+        /// Add an on-link `/32` for `peer` via the overlay NIC. Windows uses
+        /// `netsh` (by adapter name, so no LUID/index lookup); Linux uses
+        /// `ip route replace` (idempotent). macOS utun is left to the
+        /// connected route for now (refined when 3b/3c field-test there). The
+        /// agent runs privileged (service), so the route call has rights.
+        async fn add_peer_route(&self, peer: Ipv4Addr) -> std::io::Result<()> {
+            #[cfg(target_os = "windows")]
+            {
+                run_cmd(
+                    "netsh",
+                    vec![
+                        "interface".into(),
+                        "ipv4".into(),
+                        "add".into(),
+                        "route".into(),
+                        format!("prefix={peer}/32"),
+                        format!("interface={IF_NAME}"),
+                        "store=active".into(),
+                    ],
+                )
+                .await
+            }
+            #[cfg(target_os = "linux")]
+            {
+                run_cmd(
+                    "ip",
+                    vec![
+                        "route".into(),
+                        "replace".into(),
+                        format!("{peer}/32"),
+                        "dev".into(),
+                        IF_NAME.into(),
+                    ],
+                )
+                .await
+            }
+            #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+            {
+                let _ = peer;
+                Ok(())
+            }
+        }
+
+        async fn del_peer_route(&self, peer: Ipv4Addr) {
+            #[cfg(target_os = "windows")]
+            let _ = run_cmd(
+                "netsh",
+                vec![
+                    "interface".into(),
+                    "ipv4".into(),
+                    "delete".into(),
+                    "route".into(),
+                    format!("prefix={peer}/32"),
+                    format!("interface={IF_NAME}"),
+                ],
+            )
+            .await;
+            #[cfg(target_os = "linux")]
+            let _ = run_cmd(
+                "ip",
+                vec![
+                    "route".into(),
+                    "del".into(),
+                    format!("{peer}/32"),
+                    "dev".into(),
+                    IF_NAME.into(),
+                ],
+            )
+            .await;
+            #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+            let _ = peer;
+        }
+    }
+
+    /// The overlay NIC name we set in [`SystemTun::up`] — used to target
+    /// per-peer `/32` routes without a LUID/index lookup.
+    #[cfg(target_os = "windows")]
+    const IF_NAME: &str = "roomler";
+    #[cfg(target_os = "linux")]
+    const IF_NAME: &str = "roomler0";
+
+    /// Run an OS route command off the async reactor (`std::process` in a
+    /// blocking task — avoids pulling in tokio's `process` feature). Non-zero
+    /// exit → `Err` with the captured stderr.
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    async fn run_cmd(prog: &'static str, args: Vec<String>) -> std::io::Result<()> {
+        tokio::task::spawn_blocking(move || {
+            let out = std::process::Command::new(prog).args(&args).output()?;
+            if out.status.success() {
+                Ok(())
+            } else {
+                Err(std::io::Error::other(format!(
+                    "{prog} {args:?} exited {}: {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )))
+            }
+        })
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?
     }
 }
