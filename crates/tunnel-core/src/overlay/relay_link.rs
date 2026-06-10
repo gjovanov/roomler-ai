@@ -69,9 +69,15 @@ pub struct RelayCoordinator {
     pending: HashMap<ObjectId, PendingPeer>,
     /// Allocated + advertised; awaiting the peer's relayed address.
     allocated: HashMap<ObjectId, Allocated>,
-    /// Every relayed address we've allocated this session — each
-    /// `endpoints` trickle carries all of them so a peer never misses one.
-    advertised: Vec<String>,
+    /// Our relayed address **per peer** (peer node_id → the relay we
+    /// allocated for that link). Keyed so a re-allocation *replaces* and
+    /// [`forget`](Self::forget) *prunes* the entry — a flat append-only
+    /// list let a relay torn down in an earlier churn cycle linger in the
+    /// advertised set, and the peer (which dials `endpoints[0]`) then sent
+    /// WireGuard to a dead allocation forever. That was the rc.125 field
+    /// failure (a node dialed `:11110`, a relay closed three churn cycles
+    /// earlier). Each `endpoints` trickle carries every *current* value.
+    advertised: HashMap<ObjectId, String>,
 }
 
 impl RelayCoordinator {
@@ -80,7 +86,7 @@ impl RelayCoordinator {
             outbound,
             pending: HashMap::new(),
             allocated: HashMap::new(),
-            advertised: Vec::new(),
+            advertised: HashMap::new(),
         }
     }
 
@@ -179,14 +185,15 @@ impl RelayCoordinator {
         let conn = self.allocate(&ice, pin).await?;
         if let Ok(own) = conn.local_addr() {
             info!(peer = %node_id, %own, pinned = pin.is_some(), "overlay relay: allocated");
-            let own = own.to_string();
-            if !self.advertised.contains(&own) {
-                self.advertised.push(own);
-            }
+            // Per-peer (not append-only) so this replaces any prior relay we
+            // allocated for the same peer across a churn cycle — see the
+            // `advertised` field doc. A peer reads `endpoints[0]`, so a stale
+            // relay must never outlive its allocation here.
+            self.advertised.insert(node_id, own.to_string());
             let _ = self
                 .outbound
                 .send(ClientMsg::OverlayEndpoints {
-                    candidates: self.advertised.clone(),
+                    candidates: self.advertised.values().cloned().collect(),
                 })
                 .await;
         }
@@ -242,10 +249,16 @@ impl RelayCoordinator {
         Some(link)
     }
 
-    /// Drop all state for a peer (it left the netmap).
+    /// Drop all state for a peer (it left the netmap), including the relay
+    /// we advertised for it — so when the peer's WG carrier is torn down
+    /// (`wg.remove_peer`) and the underlying allocation closes, we stop
+    /// advertising that now-dead address. Without this the next
+    /// `OverlayEndpoints` trickle still carries the stale relay and a
+    /// re-joining peer dials it (the rc.125 accumulation bug).
     pub fn forget(&mut self, node_id: &ObjectId) {
         self.pending.remove(node_id);
         self.allocated.remove(node_id);
+        self.advertised.remove(node_id);
     }
 }
 
@@ -328,5 +341,35 @@ mod tests {
             Some(ClientMsg::OverlayRelayRequest { peer_node_id }) if peer_node_id == node
         ));
         assert!(rx.try_recv().is_err()); // only one request sent
+    }
+
+    #[test]
+    fn forget_prunes_the_advertised_relay() {
+        // rc.126 regression lock: a churn-removed peer must drop the relay
+        // we advertised for it, or the next `OverlayEndpoints` trickle keeps
+        // carrying a now-dead allocation and the peer dials it forever.
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut coord = RelayCoordinator::new(tx);
+        let node = ObjectId::new();
+        coord.advertised.insert(node, "94.130.141.74:11085".into());
+        coord.pending.insert(
+            node,
+            PendingPeer {
+                peer: PeerConfig {
+                    public_key: [2u8; 32],
+                    overlay_ip: Ipv4Addr::new(100, 64, 0, 9),
+                    endpoints: vec![],
+                },
+                initiate: false,
+                ice: None,
+            },
+        );
+        assert!(coord.is_tracking(&node));
+        coord.forget(&node);
+        assert!(!coord.is_tracking(&node));
+        assert!(
+            coord.advertised.is_empty(),
+            "forget must prune the advertised relay so a re-joining peer can't dial a dead allocation"
+        );
     }
 }
