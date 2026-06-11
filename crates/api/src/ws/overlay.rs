@@ -26,14 +26,15 @@
 //! tenant+network-scoped query, so the cross-tenant gate is structural);
 //! Phase 4 swaps in `policy::evaluate_overlay`.
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 
 use bson::{DateTime, oid::ObjectId};
 use roomler_ai_remote_control::{
     models::{AgentStatus, NodeRef, OverlayNode},
-    signaling::{ClientMsg, NetmapPeer, OverlayNetworkInfo, ServerMsg},
+    signaling::{ClientMsg, IceServer, NetmapPeer, OverlayNetworkInfo, ServerMsg},
     turn_creds,
 };
+use tokio::net::lookup_host;
 use tracing::{debug, warn};
 
 use crate::state::{AppState, build_turn_config};
@@ -294,11 +295,11 @@ async fn handle_overlay_relay_request(
     };
 
     let pair_key = pair_key(self_id, peer_node_id);
-    // Both ends derive identical creds from the symmetric pair_key (the
-    // same-worker hairpin), exactly like the QUIC tunnel's per-session
-    // creds (`ws/tunnel.rs` `quic_ice_servers`).
-    let ice_servers =
-        turn_creds::ice_servers_for(&pair_key, build_turn_config(&state.settings.turn).as_ref());
+    // Both ends derive identical creds from the symmetric pair_key, AND the
+    // broker pins them to a single deterministic coturn worker (see
+    // `overlay_ice_servers`) so the relay-to-relay leg is an intra-worker
+    // hairpin that never crosses mars's dual-public-IP SNAT.
+    let ice_servers = overlay_ice_servers(state, &pair_key).await;
 
     send_to_node(
         state,
@@ -456,6 +457,84 @@ fn next_epoch() -> u64 {
     DateTime::now().timestamp_millis().max(0) as u64
 }
 
+/// Overlay relay creds, pinned to ONE coturn worker for this pair.
+///
+/// The relay-to-relay leg must hairpin on a single worker — cross-worker
+/// traffic drops under mars's dual-public-IP SNAT (the flakiness the QUIC
+/// tunnel pinned around in rc.112). The agent's own deterministic pick
+/// (`relay_link::pick_worker`) can't co-locate the two nodes because they
+/// resolve `coturn.roomler.ai` to *different* IP sets per host. The broker
+/// resolves it ONCE and picks one worker by `pair_key`, so its choice is
+/// authoritative for both peers → guaranteed intra-worker hairpin. Falls back
+/// to the hostname-based servers (pre-fix behaviour) with no TURN config or on
+/// DNS failure.
+async fn overlay_ice_servers(state: &AppState, pair_key: &str) -> Vec<IceServer> {
+    let Some(turn_cfg) = build_turn_config(&state.settings.turn) else {
+        return turn_creds::ice_servers_for(pair_key, None);
+    };
+    let servers = turn_creds::ice_servers_for(pair_key, Some(&turn_cfg));
+    let Some(host) = turn_cfg.urls.first().and_then(|u| turn_url_host(u)) else {
+        return servers;
+    };
+    let Some(ip) = resolve_pick_worker(&host, pair_key).await else {
+        warn!(%host, "overlay relay: coturn DNS resolve failed; not pinning a worker");
+        return servers;
+    };
+    let ip_s = ip.to_string();
+    servers
+        .into_iter()
+        .map(|mut s| {
+            for u in s.urls.iter_mut() {
+                *u = u.replace(&host, &ip_s);
+            }
+            s
+        })
+        .collect()
+}
+
+/// Hostname of a `turn:`/`turns:` url (strips scheme + `:port` + `?query`).
+fn turn_url_host(u: &str) -> Option<String> {
+    let rest = u
+        .strip_prefix("turns:")
+        .or_else(|| u.strip_prefix("turn:"))?;
+    let host = rest.split([':', '?']).next()?;
+    (!host.is_empty()).then(|| host.to_string())
+}
+
+/// Resolve `host` and pick one IPv4 worker, indexed by `pair_key`.
+async fn resolve_pick_worker(host: &str, pair_key: &str) -> Option<IpAddr> {
+    let ips: Vec<IpAddr> = lookup_host((host, 3478u16))
+        .await
+        .ok()?
+        .map(|s| s.ip())
+        .collect();
+    pick_worker_idx(pair_key, ips)
+}
+
+/// Pure pick: sort+dedup the IPv4 candidates and index by a stable hash of
+/// `pair_key`. Both peers of a pair share the `pair_key`, and the broker
+/// hands them the SAME single result, so they co-locate.
+fn pick_worker_idx(pair_key: &str, mut ips: Vec<IpAddr>) -> Option<IpAddr> {
+    ips.retain(IpAddr::is_ipv4);
+    ips.sort();
+    ips.dedup();
+    if ips.is_empty() {
+        return None;
+    }
+    let idx = (fnv1a(pair_key.as_bytes()) % ips.len() as u64) as usize;
+    Some(ips[idx])
+}
+
+/// Stable 64-bit FNV-1a (process-independent, unlike the stdlib hasher).
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -480,5 +559,37 @@ mod tests {
         let b = ObjectId::parse_str("507f1f77bcf86cd799439012").unwrap();
         assert_eq!(pair_key(a, b), pair_key(b, a));
         assert!(pair_key(a, b).contains(&a.to_hex()));
+    }
+
+    #[test]
+    fn turn_url_host_strips_scheme_port_query() {
+        assert_eq!(
+            turn_url_host("turn:coturn.roomler.ai:3478?transport=udp").as_deref(),
+            Some("coturn.roomler.ai")
+        );
+        assert_eq!(
+            turn_url_host("turns:coturn.roomler.ai:5349?transport=tcp").as_deref(),
+            Some("coturn.roomler.ai")
+        );
+        assert_eq!(turn_url_host("stun:stun.l.google.com:19302"), None);
+    }
+
+    #[test]
+    fn worker_pick_is_deterministic_and_order_independent() {
+        // The broker hands BOTH peers the same single result, so it just has
+        // to be stable per pair_key regardless of DNS ordering.
+        let a: IpAddr = "5.9.157.221".parse().unwrap();
+        let b: IpAddr = "5.9.157.226".parse().unwrap();
+        let c: IpAddr = "94.130.141.74".parse().unwrap();
+        let key = "507f1f77bcf86cd799439011:507f1f77bcf86cd799439012";
+        let p = pick_worker_idx(key, vec![a, b, c]).unwrap();
+        assert_eq!(p, pick_worker_idx(key, vec![c, a, b]).unwrap()); // shuffled
+        assert_eq!(p, pick_worker_idx(key, vec![b, a, c, b]).unwrap()); // +dup
+        assert!([a, b, c].contains(&p));
+        // ipv6 filtered; empty → None
+        let v6: IpAddr = "::1".parse().unwrap();
+        assert_eq!(pick_worker_idx(key, vec![v6, a]).unwrap(), a);
+        assert!(pick_worker_idx(key, vec![v6]).is_none());
+        assert!(pick_worker_idx(key, vec![]).is_none());
     }
 }
