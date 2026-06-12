@@ -89,6 +89,27 @@ let framesReceived = 0
 let sawKeyframe = false
 let framesSkippedAwaitingKey = 0
 
+// rc.130 — decode-backlog shed. With `optimizeForLatency` the decoder keeps
+// its input queue at 0–1 when it's keeping up; a sustained queue above this
+// means it has fallen behind (slow client / 4K on a weak iGPU / throttled
+// background tab) and the stream latency is growing monotonically. When that
+// happens we drop incoming DELTAS and ask the agent for a fresh keyframe to
+// resync — never dropping a key frame (it's the resync point). Without this
+// the queue never drains and "typing appears seconds later" is permanent.
+const MAX_DECODE_QUEUE = 2
+let framesDroppedBacklog = 0
+let lastKeyframeReqMs = 0
+
+/** Ask the agent (via the composable → `control` DC) to force an IDR so the
+ *  decoder can resync after a backlog drop. Debounced so a sustained deficit
+ *  can't spam keyframe requests (the largest frames) onto a congested link. */
+function requestKeyframeResync(): void {
+  const now = typeof performance !== 'undefined' ? performance.now() : Date.now()
+  if (now - lastKeyframeReqMs < 250) return
+  lastKeyframeReqMs = now
+  workerScope.postMessage({ type: 'request-keyframe' })
+}
+
 /** Rolling-window stats for the HUD, matching the VP9-444 worker so
  *  the composable can consume both with the same message shape. */
 let statsBytesInWindow = 0
@@ -114,6 +135,8 @@ function maybeEmitStats(): void {
     height: statsLastHeight,
     framesDecodedTotal: framesDecoded,
     bytesReceivedTotal: statsBytesTotal,
+    decodeQueueSize: decoder?.decodeQueueSize ?? 0,
+    framesDroppedBacklog,
   })
   statsBytesInWindow = 0
   statsFramesInWindow = 0
@@ -344,6 +367,23 @@ function emitFrame(): void {
       droppedBefore: framesSkippedAwaitingKey,
     })
   }
+  // rc.130 — backlog shed. If the decoder has fallen behind, drop this delta
+  // and re-arm the keyframe gate so we keep dropping deltas (which would
+  // otherwise decode-error against the missing reference and tear the path
+  // down to <video>) until the resync IDR lands.
+  if (!isKey && decoder.decodeQueueSize > MAX_DECODE_QUEUE) {
+    framesDroppedBacklog++
+    sawKeyframe = false
+    requestKeyframeResync()
+    if (framesDroppedBacklog === 1 || framesDroppedBacklog % 60 === 0) {
+      workerScope.postMessage({
+        type: 'backlog-drop',
+        dropped: framesDroppedBacklog,
+        queue: decoder.decodeQueueSize,
+      })
+    }
+    return
+  }
   const ts = Number(assembler.pendingTimestampUs)
   try {
     const chunk = new EncodedVideoChunk({
@@ -396,6 +436,7 @@ function teardown(): void {
   // / re-negotiation) again waits for an IDR before its first decode().
   sawKeyframe = false
   framesSkippedAwaitingKey = 0
+  framesDroppedBacklog = 0
   assembler.headerHave = 0
   assembler.payloadBuf = null
   assembler.payloadHave = 0
