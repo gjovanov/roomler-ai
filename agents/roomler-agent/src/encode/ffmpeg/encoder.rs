@@ -106,22 +106,33 @@ fn ffmpeg_maxrate_bps(width: u32, height: u32, fps: u32) -> usize {
 /// Returns the dict PLUS a human-readable `key=value …` summary string
 /// built as we go (so we don't depend on `Dictionary::iter()` — keeps
 /// the logging robust across ffmpeg-next minor versions).
+/// Returns `(base, lowlat, summary)`. `base` is the quality/tuning private
+/// options (incl. `forced-idr` — load-bearing for keyframe flagging).
+/// `lowlat` is the output-latency knobs that some older drivers reject;
+/// `build_encoder` applies them in a SEPARATE open tier so a rejection drops
+/// ONLY them. (A full-dict rejection would revert to encoder defaults and
+/// lose `forced-idr` → the NVENC black-screen IDR bug.) Pure — no ffmpeg API.
 fn encoder_options(
     name: &str,
     maxrate_bps: usize,
     cq: u32,
-) -> (ffmpeg_next::Dictionary<'static>, String) {
-    let mut d = ffmpeg_next::Dictionary::new();
-    let mut summary: Vec<String> = Vec::new();
+) -> (Vec<(String, String)>, Vec<(String, String)>, String) {
+    let mut base: Vec<(String, String)> = Vec::new();
+    let mut lowlat: Vec<(String, String)> = Vec::new();
     let cap = maxrate_bps.to_string();
     let cq_s = cq.to_string();
     let preset = std::env::var("ROOMLER_AGENT_FFMPEG_PRESET").ok();
     let tune = std::env::var("ROOMLER_AGENT_FFMPEG_TUNE").ok();
 
-    // Local closure: set on the dict AND append to the summary in one go.
-    let mut put = |d: &mut ffmpeg_next::Dictionary<'static>, k: &str, v: &str| {
-        d.set(k, v);
-        summary.push(format!("{k}={v}"));
+    // Resolve a low-latency knob: env override wins; an explicitly EMPTY env
+    // value OMITS the knob (escape hatch for a driver that rejects it); unset
+    // → the default. Defaults are ON.
+    let lowlat_knob = |env_name: &str, default: &str| -> Option<String> {
+        match std::env::var(env_name) {
+            Ok(v) if v.trim().is_empty() => None,
+            Ok(v) => Some(v.trim().to_string()),
+            Err(_) => Some(default.to_string()),
+        }
     };
 
     if name.contains("nvenc") {
@@ -143,39 +154,74 @@ fn encoder_options(
         // GORAN-XMG-NEO16, hevc_nvenc; hevc_qsv flags forced-I correctly,
         // which is why PC50054 rendered and this didn't). `forced-idr=1`
         // makes pict_type=I a true, key-flagged IDR.
-        put(&mut d, "rc", "vbr");
-        put(&mut d, "cq", &cq_s);
-        put(&mut d, "preset", preset.as_deref().unwrap_or("p4"));
-        put(&mut d, "tune", tune.as_deref().unwrap_or("ll"));
-        put(&mut d, "rc-lookahead", "0");
-        put(&mut d, "bf", "0");
-        put(&mut d, "forced-idr", "1");
-        put(&mut d, "spatial-aq", "1");
-        put(&mut d, "maxrate", &cap);
-        put(&mut d, "bufsize", &cap);
+        base.push(("rc".into(), "vbr".into()));
+        base.push(("cq".into(), cq_s.clone()));
+        base.push(("preset".into(), preset.as_deref().unwrap_or("p4").into()));
+        base.push(("tune".into(), tune.as_deref().unwrap_or("ll").into()));
+        base.push(("rc-lookahead".into(), "0".into()));
+        base.push(("bf".into(), "0".into()));
+        base.push(("forced-idr".into(), "1".into()));
+        base.push(("spatial-aq".into(), "1".into()));
+        base.push(("maxrate".into(), cap.clone()));
+        base.push(("bufsize".into(), cap.clone()));
+        // rc.130 — `delay=0`: emit each packet with ZERO output-queue delay.
+        // NVENC's default output delay (~surfaces−1, ≈4 frames) is the
+        // typing-latency bug: with change-driven DXGI capture a keystroke's
+        // frame sits in the encoder ~4 frames, which at caret-blink rate
+        // (~2 fps while typing) is ~2 s. Window-move (~60 fps) drains the
+        // same 4 frames in ~66 ms → smooth. Independent of tune=ll/forced-idr.
+        if let Some(v) = lowlat_knob("ROOMLER_AGENT_FFMPEG_NVENC_DELAY", "0") {
+            lowlat.push(("delay".into(), v));
+        }
     } else if name.contains("qsv") {
         // Intel QSV: ICQ-style quality via `global_quality`; `maxrate`
         // caps the burst. `low_power` uses the fixed-function VDENC path
         // (faster, lower power — the Iris Xe fps-unlock path).
-        put(&mut d, "global_quality", &cq_s);
+        base.push(("global_quality".into(), cq_s.clone()));
         if let Some(p) = preset.as_deref() {
-            put(&mut d, "preset", p);
+            base.push(("preset".into(), p.into()));
         }
-        put(&mut d, "low_power", "1");
-        put(&mut d, "maxrate", &cap);
-        put(&mut d, "bufsize", &cap);
+        base.push(("low_power".into(), "1".into()));
+        base.push(("maxrate".into(), cap.clone()));
+        base.push(("bufsize".into(), cap.clone()));
+        // rc.130 — `async_depth=1`: cap QSV's in-flight pipeline to one frame
+        // so it emits immediately instead of buffering ~4 (low_power VDENC
+        // respects it). Same typing-latency fix as NVENC `delay=0`.
+        if let Some(v) = lowlat_knob("ROOMLER_AGENT_FFMPEG_QSV_ASYNC_DEPTH", "1") {
+            lowlat.push(("async_depth".into(), v));
+        }
     } else if name.contains("amf") {
         // AMD AMF: constant-QP-ish via qp_i/qp_p, latency-tuned VBR,
         // capped burst.
-        put(&mut d, "rc", "vbr_latency");
-        put(&mut d, "qp_i", &cq_s);
-        put(&mut d, "qp_p", &cq_s);
-        put(&mut d, "maxrate", &cap);
-        put(&mut d, "bufsize", &cap);
+        base.push(("rc".into(), "vbr_latency".into()));
+        base.push(("qp_i".into(), cq_s.clone()));
+        base.push(("qp_p".into(), cq_s.clone()));
+        base.push(("maxrate".into(), cap.clone()));
+        base.push(("bufsize".into(), cap.clone()));
+        // rc.130 — `query_timeout=1`: minimise the output-poll block (AMF's
+        // low-latency lever alongside vbr_latency).
+        if let Some(v) = lowlat_knob("ROOMLER_AGENT_FFMPEG_AMF_QUERY_TIMEOUT", "1") {
+            lowlat.push(("query_timeout".into(), v));
+        }
     }
 
-    let joined = summary.join(" ");
-    (d, joined)
+    let summary = base
+        .iter()
+        .chain(lowlat.iter())
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    (base, lowlat, summary)
+}
+
+/// Build an ffmpeg option `Dictionary` from owned key/value pairs. `av_dict`
+/// copies the strings, so the returned dict owns its data (`'static`).
+fn dict_from_pairs(pairs: &[(String, String)]) -> ffmpeg_next::Dictionary<'static> {
+    let mut d = ffmpeg_next::Dictionary::new();
+    for (k, v) in pairs {
+        d.set(k.as_str(), v.as_str());
+    }
+    d
 }
 
 /// FFmpeg-based video encoder.
@@ -346,19 +392,53 @@ impl FfmpegEncoder {
             Ok(enc)
         };
 
-        let (opts, opt_summary) = encoder_options(name, maxrate_bps, cq);
+        let (base, lowlat, opt_summary) = encoder_options(name, maxrate_bps, cq);
 
-        // Try opening WITH the quality/tuning options. If the encoder
-        // rejects any of them (unknown private option on this FFmpeg
-        // build / driver combo), fall back to a plain open so we degrade
-        // to default rate control rather than failing the encoder
-        // outright — a blurry-but-working session beats a black screen.
+        // TIERED open. The encoder's option dict is ALL-OR-NOTHING: if the
+        // driver rejects any single private option, the WHOLE dict is
+        // dropped. So the low-latency knobs (`delay`/`async_depth`/…) get
+        // their own tier:
+        //   1. quality + low-latency,
+        //   2. quality ALONE (keeps `forced-idr` etc. if only a lowlat knob
+        //      was rejected — a full revert to defaults would lose
+        //      `forced-idr` → the NVENC black-screen IDR bug),
+        //   3. plain defaults (blurry-but-working beats a black screen).
+        if !lowlat.is_empty() {
+            let mut full = dict_from_pairs(&base);
+            for (k, v) in &lowlat {
+                full.set(k.as_str(), v.as_str());
+            }
+            let enc = configure()?;
+            match enc.open_as_with(codec, full) {
+                Ok(encoder) => {
+                    tracing::info!(
+                        encoder = name,
+                        options = opt_summary,
+                        "ffmpeg encoder opened with quality + low-latency options"
+                    );
+                    return Ok(encoder);
+                }
+                Err(open_err) => {
+                    tracing::warn!(
+                        encoder = name,
+                        %open_err,
+                        "ffmpeg open rejected the low-latency knobs — retrying with quality options only"
+                    );
+                }
+            }
+        }
+
+        let base_summary = base
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         let enc = configure()?;
-        match enc.open_as_with(codec, opts) {
+        match enc.open_as_with(codec, dict_from_pairs(&base)) {
             Ok(encoder) => {
                 tracing::info!(
                     encoder = name,
-                    options = opt_summary,
+                    options = base_summary,
                     "ffmpeg encoder opened with quality options"
                 );
                 Ok(encoder)
@@ -367,7 +447,7 @@ impl FfmpegEncoder {
                 tracing::warn!(
                     encoder = name,
                     %open_err,
-                    attempted_options = opt_summary,
+                    attempted_options = base_summary,
                     "ffmpeg open_as_with rejected the quality options — retrying with encoder defaults"
                 );
                 let enc2 = configure()?;
