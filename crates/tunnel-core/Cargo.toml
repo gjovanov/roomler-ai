@@ -86,6 +86,12 @@ webrtc-ice = "0.12.0"
 boringtun = { version = "0.7", optional = true }
 base64 = { workspace = true, optional = true }
 
+# Overlay direct LAN path (rc.131/132): enumerate the node's local interface
+# IPv4s so a multi-homed host advertises ALL its LAN endpoints (not just the
+# default-route one) — a peer then matches whichever is on its subnet.
+# Cross-platform (Posix getifaddrs + Windows GetAdaptersAddresses), no C build.
+if-addrs = { version = "0.15", optional = true }
+
 # Overlay L3 surface (`overlay-l3` feature): the OS TUN virtual NIC.
 # Pure-Rust build — loads Wintun (a signed driver DLL) at runtime on
 # Windows, /dev/net/tun on Linux, utun on macOS; no C compiled here.
@@ -116,7 +122,7 @@ features = [
 
 [features]
 # Userspace WireGuard L3 overlay (Phase 2+). Off by default.
-overlay = ["dep:boringtun", "dep:base64"]
+overlay = ["dep:boringtun", "dep:base64", "dep:if-addrs"]
 # Phase 3: the OS TUN device (`overlay::tun::SystemTun`) on top of the WG
 # core. `overlay` alone gives the WG device + the bridge logic + the
 # in-memory MockTun loopback test (no real device); `overlay-l3` adds the
