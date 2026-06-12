@@ -95,6 +95,25 @@ base64 = { workspace = true, optional = true }
 # pulling a TUN dependency.
 tun = { version = "0.8", optional = true, features = ["async"] }
 
+# Overlay L3 firewall (`overlay-l3`, Windows only): program the Windows
+# Filtering Platform directly so the overlay's inbound/outbound survives a
+# GPO-locked Defender Firewall (a high-weight, hard-permit sublayer scoped
+# to the `roomler` adapter LUID — Tailscale's approach). Same `windows-sys`
+# 0.61 the `tun` crate already resolves, so no new crate and no C build.
+# `dep:windows-sys` is activated by `overlay-l3`; the `cfg(windows)` target
+# table keeps it off non-Windows builds.
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.61"
+optional = true
+features = [
+    "Win32_Foundation",                                 # HANDLE, FWP_E_ALREADY_EXISTS, WIN32_ERROR
+    "Win32_Security",                                   # PSECURITY_DESCRIPTOR (passed null)
+    "Win32_System_Rpc",                                 # RPC_C_AUTHN_WINNT, SEC_WINNT_AUTH_IDENTITY_W
+    "Win32_NetworkManagement_WindowsFilteringPlatform", # Fwpm*, FWPM_* structs/flags/layer GUIDs
+    "Win32_NetworkManagement_IpHelper",                 # ConvertInterfaceAliasToLuid (fallback)
+    "Win32_NetworkManagement_Ndis",                     # NET_LUID_LH (fallback)
+]
+
 [features]
 # Userspace WireGuard L3 overlay (Phase 2+). Off by default.
 overlay = ["dep:boringtun", "dep:base64"]
@@ -102,7 +121,7 @@ overlay = ["dep:boringtun", "dep:base64"]
 # core. `overlay` alone gives the WG device + the bridge logic + the
 # in-memory MockTun loopback test (no real device); `overlay-l3` adds the
 # `tun` crate's real `SystemTun`. Off by default.
-overlay-l3 = ["overlay", "dep:tun"]
+overlay-l3 = ["overlay", "dep:tun", "dep:windows-sys"]
 
 [dev-dependencies]
 tokio-test = { workspace = true }
