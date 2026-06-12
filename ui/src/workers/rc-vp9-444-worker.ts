@@ -72,6 +72,21 @@ let framesReceived = 0
 let sawKeyframe = false
 let framesSkippedAwaitingKey = 0
 
+// rc.130 — decode-backlog shed (see the HEVC worker for the rationale). Drop
+// deltas + ask the agent for a resync IDR when the decoder's input queue
+// grows, so a sustained decode deficit can't make latency grow without bound.
+const MAX_DECODE_QUEUE = 2
+let framesDroppedBacklog = 0
+let lastKeyframeReqMs = 0
+
+/** Debounced keyframe-resync request after a backlog drop. */
+function requestKeyframeResync(): void {
+  const now = typeof performance !== 'undefined' ? performance.now() : Date.now()
+  if (now - lastKeyframeReqMs < 250) return
+  lastKeyframeReqMs = now
+  workerScope.postMessage({ type: 'request-keyframe' })
+}
+
 /** Rolling-window stats for the HUD. Computed in the worker so the
  *  main thread doesn't need to touch the DC traffic. Bitrate is
  *  delivered-bytes/sec at the SCTP-receive boundary (post-network,
@@ -100,6 +115,8 @@ function maybeEmitStats(): void {
     height: statsLastHeight,
     framesDecodedTotal: framesDecoded,
     bytesReceivedTotal: statsBytesTotal,
+    decodeQueueSize: decoder?.decodeQueueSize ?? 0,
+    framesDroppedBacklog,
   })
   statsBytesInWindow = 0
   statsFramesInWindow = 0
@@ -299,6 +316,22 @@ function emitFrame(): void {
       droppedBefore: framesSkippedAwaitingKey,
     })
   }
+  // rc.130 — backlog shed. Drop this delta + re-arm the keyframe gate (so we
+  // keep dropping deltas, which would otherwise decode-error against the
+  // missing reference) until the resync IDR lands.
+  if (!isKey && decoder.decodeQueueSize > MAX_DECODE_QUEUE) {
+    framesDroppedBacklog++
+    sawKeyframe = false
+    requestKeyframeResync()
+    if (framesDroppedBacklog === 1 || framesDroppedBacklog % 60 === 0) {
+      workerScope.postMessage({
+        type: 'backlog-drop',
+        dropped: framesDroppedBacklog,
+        queue: decoder.decodeQueueSize,
+      })
+    }
+    return
+  }
   // EncodedVideoChunk.timestamp is a microsecond integer per spec.
   // We pass the agent-side capture timestamp through unmodified —
   // VideoDecoder uses it for ordering / frame.timestamp passthrough.
@@ -349,6 +382,7 @@ function teardown(): void {
   // rc.103 — re-arm the leading-delta gate for the next decoder.
   sawKeyframe = false
   framesSkippedAwaitingKey = 0
+  framesDroppedBacklog = 0
   assembler.headerHave = 0
   assembler.payloadBuf = null
   assembler.payloadHave = 0

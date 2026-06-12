@@ -1448,6 +1448,21 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     }
   }
 
+  /** rc.130 — ask the agent to force an encoder keyframe (IDR). A decode
+   *  worker fires this (its `request-keyframe` message) after it drops
+   *  deltas to recover from a decode backlog and needs a fresh resync
+   *  point. The agent min-gap-clamps it. No-op if the control channel
+   *  isn't open. */
+  function requestKeyframe() {
+    const ch = channels.control
+    if (!ch || ch.readyState !== 'open') return
+    try {
+      ch.send(JSON.stringify({ t: 'rc:keyframe' }))
+    } catch {
+      /* channel closed between check and send — drop */
+    }
+  }
+
   /** Update the controller's quality preference, persist it, and push
    *  the new value to the agent. No-ops (other than the persist) if the
    *  control channel isn't open yet — the onopen handler will re-send. */
@@ -1753,6 +1768,12 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     worker.onmessage = (ev) => {
       const msg = ev.data as Record<string, unknown> | undefined
       if (!msg || typeof msg.type !== 'string') return
+      if (msg.type === 'request-keyframe') {
+        // rc.130 — worker dropped deltas on a decode backlog; ask the agent
+        // for a fresh IDR so it can resync.
+        requestKeyframe()
+        return
+      }
       if (msg.type === 'first-frame'
         && typeof msg.width === 'number'
         && typeof msg.height === 'number') {
@@ -1913,6 +1934,12 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     worker.onmessage = (ev) => {
       const msg = ev.data as Record<string, unknown> | undefined
       if (!msg || typeof msg.type !== 'string') return
+      if (msg.type === 'request-keyframe') {
+        // rc.130 — worker dropped deltas on a decode backlog; ask the agent
+        // for a fresh IDR so it can resync.
+        requestKeyframe()
+        return
+      }
       if (msg.type === 'first-frame'
         && typeof msg.width === 'number'
         && typeof msg.height === 'number') {

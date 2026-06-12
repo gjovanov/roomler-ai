@@ -650,6 +650,10 @@ impl AgentPeer {
         // Downloads folder.
         let quality_for_dc = quality_state.clone();
         let target_res_for_dc = target_resolution.clone();
+        // rc.130 — the control DC handler forces an encoder keyframe on the
+        // browser's `rc:keyframe` (sent when its decode queue backs up and it
+        // drops deltas to resync). Same atomic the media pumps already poll.
+        let keyframe_for_dc = keyframe_requested.clone();
         let video_bytes_dc_for_callback = video_bytes_dc.clone();
         let control_dc_for_callback = control_dc.clone();
         let lock_state_rx_for_dc = lock_state_rx.clone();
@@ -658,6 +662,7 @@ impl AgentPeer {
             info!(session = %session_id, %label, "data channel opened");
             let quality_for_dc = quality_for_dc.clone();
             let target_res_for_dc = target_res_for_dc.clone();
+            let keyframe_for_dc = keyframe_for_dc.clone();
             let video_bytes_stash = video_bytes_dc_for_callback.clone();
             let control_stash = control_dc_for_callback.clone();
             let lock_state_rx_for_input = lock_state_rx_for_dc.clone();
@@ -672,7 +677,13 @@ impl AgentPeer {
                         // pre-clone-and-stash, the emitter task would
                         // have no way to write outbound messages.
                         *control_stash.lock().await = Some(dc.clone());
-                        attach_control_handler(dc, session_id, quality_for_dc, target_res_for_dc)
+                        attach_control_handler(
+                            dc,
+                            session_id,
+                            quality_for_dc,
+                            target_res_for_dc,
+                            keyframe_for_dc,
+                        )
                     }
                     "cursor" => attach_cursor_handler(dc, session_id),
                     #[cfg(feature = "clipboard")]
@@ -1682,7 +1693,12 @@ async fn media_pump_vp9_444_dc(
     let mut encoder_dims: Option<(u32, u32)> = None;
     let mut last_capture_at = std::time::Instant::now();
     let mut last_good_frame: Option<std::sync::Arc<crate::capture::Frame>> = None;
-    const IDLE_KEEPALIVE: Duration = Duration::from_millis(1_000);
+    // rc.130 — 60 ms (was 1 s), matching the FFmpeg pump. libvpx is synchronous
+    // (g_lag_in_frames=0) so there's no encoder-output queue to drain here, but
+    // the faster keepalive still feeds the browser decoder more tightly and
+    // pushes the last idle frame through the (now bounded, see the send task
+    // below) DC path promptly. Fires only on capture-None.
+    const IDLE_KEEPALIVE: Duration = Duration::from_millis(60);
     let start = std::time::Instant::now();
 
     let mut frames_captured: u64 = 0;
@@ -2328,7 +2344,17 @@ async fn media_pump_ffmpeg_dc(
     // timeBeginPeriod(1) landed but didn't move fps).
     let mut last_capture_at = std::time::Instant::now();
     let mut last_good_frame: Option<std::sync::Arc<crate::capture::Frame>> = None;
-    const IDLE_KEEPALIVE: Duration = Duration::from_millis(1_000);
+    // rc.130 — 60 ms (was 1 s). Doubles as the SPARSE-INPUT DRAIN. With the
+    // HW encoder's output queue capped to ~1 frame (encoder.rs delay=0 /
+    // async_depth=1), re-feeding the last good frame here flushes the held
+    // frame within ~60 ms of the screen going idle — so the LAST keystroke's
+    // pixels reach the browser promptly instead of waiting up to a full
+    // second (the old keepalive value) for the next caret blink to push them
+    // out. Fires only on capture-None (no new frame) and, via the rc.111
+    // capacity gate above, only when the send channel has room — so it adds
+    // ZERO frames under motion (real frames keep resetting last_capture_at).
+    // Idle cost: ~16 fps of near-zero-byte static deltas.
+    const IDLE_KEEPALIVE: Duration = Duration::from_millis(60);
 
     let mut frames_captured: u64 = 0;
     let mut frames_encoded: u64 = 0;
@@ -2934,14 +2960,23 @@ fn attach_control_handler(
     session_id: bson::oid::ObjectId,
     quality_state: Arc<std::sync::atomic::AtomicU8>,
     target_resolution: Arc<std::sync::Mutex<TargetResolution>>,
+    keyframe_requested: Arc<std::sync::atomic::AtomicBool>,
 ) {
     // Clone the Arc so the on_message closure can send replies
     // (e.g. rc:logs-fetch.reply) back over the same DC. Original
     // `dc` parameter is kept for the on_message registration below.
     let dc_for_reply = dc.clone();
+    // rc.130 — min-gap clamp for browser-requested keyframes (rc:keyframe).
+    // The atomic itself coalesces (the pump forces at most one IDR per encode
+    // regardless of how often it's set) and the browser debounces, but this
+    // bounds a misbehaving/old controller to one forced IDR per gap so a
+    // resync storm can't pile the LARGEST frames onto a congested link.
+    let last_kf_request = Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
     dc.on_message(Box::new(move |msg| {
         let quality_state = quality_state.clone();
         let target_resolution = target_resolution.clone();
+        let keyframe_requested = keyframe_requested.clone();
+        let last_kf_request = last_kf_request.clone();
         let dc_for_reply = dc_for_reply.clone();
         Box::pin(async move {
             // Trust-but-verify: a malformed message must never crash
@@ -3113,6 +3148,22 @@ fn attach_control_handler(
                             // sends.
                             break;
                         }
+                    }
+                }
+                "rc:keyframe" => {
+                    // Browser's decode queue backed up → it dropped deltas and
+                    // needs a fresh IDR to resync. Force one (min-gap clamped).
+                    const MIN_KF_GAP: Duration = Duration::from_millis(200);
+                    let now = std::time::Instant::now();
+                    let mut guard = last_kf_request.lock().unwrap();
+                    let allow = guard
+                        .map(|t| now.duration_since(t) >= MIN_KF_GAP)
+                        .unwrap_or(true);
+                    if allow {
+                        *guard = Some(now);
+                        drop(guard);
+                        keyframe_requested.store(true, std::sync::atomic::Ordering::Relaxed);
+                        debug!(%session_id, "control: rc:keyframe — forcing IDR (browser decode-backlog resync)");
                     }
                 }
                 other => {
