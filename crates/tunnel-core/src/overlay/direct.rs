@@ -9,10 +9,13 @@
 //! the **same /24** build a direct UDP [`Carrier`](super::wg::Carrier) and skip
 //! the relay entirely.
 //!
-//! v1 scope: **same-subnet only** (reliable L2 reachability — no NAT
-//! hole-punch, no handshake-timeout fallback). Peers NOT on a shared subnet
-//! still use the relay exactly as before. srflx hole-punch + an AP-isolation
-//! relay-fallback are follow-ups (rc.132). See `docs/overlay-wfp.md` siblings.
+//! Scope: **same-subnet only** (reliable L2 reachability — no NAT hole-punch,
+//! no handshake-timeout fallback). Peers NOT on a shared subnet still use the
+//! relay exactly as before. rc.131 advertised one interface (a connect-trick);
+//! **rc.132 enumerates ALL interfaces** (a multi-homed host advertises every
+//! LAN IP — field host PC50045 routes the internet via corporate Ethernet but
+//! its peer is on the Wi-Fi). srflx hole-punch + an AP-isolation relay-fallback
+//! are later follow-ups. See `docs/overlay-wfp.md` siblings.
 
 use std::net::{Ipv4Addr, SocketAddr};
 
@@ -33,35 +36,34 @@ pub fn direct_enabled() -> bool {
     }
 }
 
-/// Discover this node's primary LAN IPv4 — the source address the OS would
-/// use to reach the internet (the default-route interface). Uses the
-/// "connect a UDP socket and read its local address" trick: `connect` on a
-/// UDP socket sends nothing, it just fixes the route, so `local_addr()` then
-/// reveals the chosen source IP. No interface-enumeration crate, no packets.
+/// Enumerate this node's usable LAN IPv4 addresses across **all** interfaces,
+/// so a multi-homed host advertises every LAN endpoint and a peer matches
+/// whichever is on its subnet.
 ///
-/// Returns `None` if there's no route (offline / CI sandbox) or the source is
-/// not a usable LAN address (loopback / link-local / unspecified). The overlay
-/// CGNAT range `100.64.0.0/10` is also rejected so a carrier-CGNAT cellular
-/// interface (which collides with the overlay) is never advertised as a LAN
-/// endpoint.
-pub async fn primary_lan_ip() -> Option<Ipv4Addr> {
-    // Two well-known public IPs; the dst is never contacted (connect only sets
-    // the route). Try a second if the first has no route.
-    for probe in ["1.1.1.1:80", "8.8.8.8:80"] {
-        let Ok(sock) = tokio::net::UdpSocket::bind("0.0.0.0:0").await else {
-            continue;
-        };
-        if sock.connect(probe).await.is_err() {
-            continue;
-        }
-        if let Ok(SocketAddr::V4(local)) = sock.local_addr() {
-            let ip = *local.ip();
-            if is_usable_lan_ipv4(ip) {
-                return Some(ip);
+/// rc.132 — replaces the rc.131 connect-trick (default-route IP only), which
+/// picked the WRONG interface on a multi-homed host: field host PC50045 routes
+/// the internet via its corporate Ethernet (`172.30.x`) but its overlay peer
+/// (NEO16) is on the Wi-Fi (`192.168.68.x`), so the single default-route IP it
+/// advertised was unreachable by the peer → no same-subnet match → fell back
+/// to the (failing) relay. Enumerating all interfaces advertises both, so the
+/// peer finds the `192.168.68.x` one.
+///
+/// Excludes loopback / link-local / CGNAT (`100.64.0.0/10` — the overlay's own
+/// range + some cellular carriers). Order is `get_if_addrs`' (stable enough);
+/// dups removed. Empty if enumeration fails (→ relay only, as before).
+pub fn gather_lan_ips() -> Vec<Ipv4Addr> {
+    let mut ips = Vec::new();
+    if let Ok(addrs) = if_addrs::get_if_addrs() {
+        for a in addrs {
+            if let std::net::IpAddr::V4(ip) = a.ip()
+                && is_usable_lan_ipv4(ip)
+                && !ips.contains(&ip)
+            {
+                ips.push(ip);
             }
         }
     }
-    None
+    ips
 }
 
 /// True for an IPv4 that can serve as a same-LAN endpoint: not loopback, not
@@ -92,16 +94,17 @@ pub fn same_subnet_24(a: Ipv4Addr, b: Ipv4Addr) -> bool {
 }
 
 /// From a peer's advertised `endpoints` (host/srflx/relay strings), pick the
-/// first that is a directly-dialable host endpoint **on our LAN** — i.e. an
-/// `IP:port` whose IP is in our /24. `None` if the peer advertised no
-/// same-subnet endpoint (→ caller falls back to the relay).
-pub fn pick_same_subnet_endpoint(my_ip: Ipv4Addr, endpoints: &[String]) -> Option<SocketAddr> {
+/// first that is a directly-dialable host endpoint **on one of our LANs** —
+/// i.e. an `IP:port` whose IP shares a /24 with any of our interface IPs.
+/// `None` if the peer advertised no same-subnet endpoint (→ caller falls back
+/// to the relay).
+pub fn pick_same_subnet_endpoint(my_ips: &[Ipv4Addr], endpoints: &[String]) -> Option<SocketAddr> {
     for ep in endpoints {
         // Tolerate scheme-ish prefixes defensively; we only emit bare IP:port.
         let raw = ep.trim();
         if let Ok(SocketAddr::V4(sa)) = raw.parse::<SocketAddr>()
-            && same_subnet_24(my_ip, *sa.ip())
             && is_usable_lan_ipv4(*sa.ip())
+            && my_ips.iter().any(|me| same_subnet_24(*me, *sa.ip()))
         {
             return Some(SocketAddr::V4(sa));
         }
@@ -137,22 +140,66 @@ mod tests {
 
     #[test]
     fn picks_same_subnet_host_endpoint_else_none() {
-        let me: Ipv4Addr = "192.168.68.103".parse().unwrap();
+        let me: [Ipv4Addr; 1] = ["192.168.68.103".parse().unwrap()];
         // Mixed endpoint list: a far srflx, the relay, and the LAN host.
         let eps = vec![
             "37.63.112.129:49358".to_string(),  // srflx (different /24) — skip
             "94.130.141.74:3478".to_string(),   // relay — skip
             "192.168.68.110:51820".to_string(), // same /24 — pick this
         ];
-        let got = pick_same_subnet_endpoint(me, &eps).unwrap();
+        let got = pick_same_subnet_endpoint(&me, &eps).unwrap();
         assert_eq!(got, "192.168.68.110:51820".parse::<SocketAddr>().unwrap());
 
         // No same-subnet endpoint → None (caller uses relay).
         let only_far = vec!["37.63.112.129:49358".to_string()];
-        assert!(pick_same_subnet_endpoint(me, &only_far).is_none());
+        assert!(pick_same_subnet_endpoint(&me, &only_far).is_none());
 
         // A same-subnet but CGNAT endpoint is rejected.
         let cgnat = vec!["100.64.0.110:51820".to_string()];
-        assert!(pick_same_subnet_endpoint("100.64.0.103".parse().unwrap(), &cgnat).is_none());
+        assert!(pick_same_subnet_endpoint(&["100.64.0.103".parse().unwrap()], &cgnat).is_none());
+    }
+
+    #[test]
+    fn gather_lan_ips_returns_only_usable_uniques() {
+        // Exercises the real if-addrs enumeration on this host/CI runner. We
+        // can't assert a specific set (host-dependent), only the invariants:
+        // every gathered IP is usable, and there are no duplicates.
+        let ips = gather_lan_ips();
+        for ip in &ips {
+            assert!(
+                is_usable_lan_ipv4(*ip),
+                "gather returned a non-usable IP: {ip}"
+            );
+        }
+        let mut deduped = ips.clone();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(
+            deduped.len(),
+            ips.len(),
+            "gather_lan_ips returned duplicates"
+        );
+    }
+
+    #[test]
+    fn multi_homed_host_matches_on_the_right_interface() {
+        // rc.132 regression guard: PC50045's bug. The node is multi-homed —
+        // corporate Ethernet 172.30.x (the default route) + Wi-Fi 192.168.68.x.
+        // The peer is on the Wi-Fi; we must match the 192.168.68 endpoint even
+        // though 172.30 is "primary".
+        let my_ips: [Ipv4Addr; 2] = [
+            "172.30.239.96".parse().unwrap(), // corporate Ethernet (default route)
+            "192.168.68.103".parse().unwrap(), // Wi-Fi (where the peer lives)
+        ];
+        // The peer (NEO16) advertises only ITS interfaces — a far srflx and its
+        // Wi-Fi host. We must match the Wi-Fi endpoint against our SECONDARY
+        // (non-default-route) Wi-Fi IP — the rc.131 connect-trick advertised
+        // only 172.30 and so never matched.
+        let peer_eps = vec![
+            "37.63.112.129:49358".to_string(),  // peer srflx (far) — skip
+            "192.168.68.110:58307".to_string(), // peer Wi-Fi — same /24 as our .103
+        ];
+        let got = pick_same_subnet_endpoint(&my_ips, &peer_eps).unwrap();
+        assert_eq!(got, "192.168.68.110:58307".parse::<SocketAddr>().unwrap());
     }
 }
