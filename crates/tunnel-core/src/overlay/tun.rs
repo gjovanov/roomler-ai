@@ -70,6 +70,13 @@ mod system {
     /// + write loops.
     pub struct SystemTun {
         dev: Arc<tun::AsyncDevice>,
+        /// WFP hard-permit guard. Holds a dynamic WFP session whose `Drop`
+        /// reaps the `roomler`-adapter permit filters, so it must live as
+        /// long as the device. `None` when disabled
+        /// (`ROOMLER_AGENT_WFP_PERMIT=0`) or when install failed
+        /// (best-effort — the overlay still works on non-locked hosts).
+        #[cfg(windows)]
+        _wfp: Option<crate::overlay::wfp::WfpGuard>,
     }
 
     impl SystemTun {
@@ -91,7 +98,43 @@ mod system {
 
             let dev =
                 tun::create_as_async(&config).map_err(|e| std::io::Error::other(e.to_string()))?;
-            Ok(Self { dev: Arc::new(dev) })
+            let dev = Arc::new(dev);
+
+            // Program WFP so the overlay's inbound survives a GPO-locked
+            // Defender Firewall (Tailscale's approach). Best-effort: a
+            // failure is logged and the overlay still comes up — it only
+            // matters on hosts where the firewall is the blocker.
+            #[cfg(windows)]
+            let _wfp = if crate::overlay::wfp::wfp_enabled() {
+                use tun::AbstractDeviceExt as _;
+                let luid = dev.tun_luid();
+                match crate::overlay::wfp::WfpGuard::install(luid) {
+                    Ok(g) => {
+                        tracing::info!(
+                            luid = format_args!("{luid:#x}"),
+                            "overlay: WFP hard-permit installed for the roomler adapter"
+                        );
+                        Some(g)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "overlay: WFP permit NOT installed; if inbound traffic fails behind a \
+                             GPO-locked firewall, request an IT-managed exception for the roomler adapter"
+                        );
+                        None
+                    }
+                }
+            } else {
+                tracing::info!("overlay: WFP permit disabled via ROOMLER_AGENT_WFP_PERMIT");
+                None
+            };
+
+            Ok(Self {
+                dev,
+                #[cfg(windows)]
+                _wfp,
+            })
         }
     }
 
