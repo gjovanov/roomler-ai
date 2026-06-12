@@ -31,6 +31,11 @@ pub mod runtime;
 pub mod tun;
 pub mod wg;
 
+/// WFP firewall override (Windows + `overlay-l3`): hard-permit the
+/// `roomler` adapter so the overlay survives a GPO-locked Defender Firewall.
+#[cfg(all(feature = "overlay-l3", windows))]
+pub mod wfp;
+
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use boringtun::x25519::{PublicKey, StaticSecret};
