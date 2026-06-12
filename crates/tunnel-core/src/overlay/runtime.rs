@@ -420,9 +420,20 @@ impl OverlayRuntime {
         tun: &Arc<dyn TunIo>,
         link: ReadyLink,
     ) {
-        // Deterministic single initiator per link: the lexicographically
-        // smaller public key dials. Both ends compute this identically.
-        let initiate = self.keypair.public.to_bytes() < link.public_key;
+        // Handshake direction. RELAY carriers use a deterministic single
+        // initiator (the lexicographically smaller pubkey dials; both ends
+        // compute it identically) — fine because the relay forwards both ways.
+        //
+        // rc.133 — DIRECT carriers need BOTH ends to initiate (bilateral
+        // hole-punch). A direct WG init is an UNSOLICITED inbound UDP on the
+        // responder's PHYSICAL interface, which default Windows Firewall drops
+        // (field: two same-LAN hosts, direct carrier built but
+        // HANDSHAKE(REKEY_TIMEOUT) forever). When both ends initiate, each
+        // side's outbound init opens a stateful firewall hole for the other's
+        // inbound, so the handshake completes. The relay path never hit this
+        // because its ciphertext rides the agent's OWN outbound TURN
+        // connection (already a stateful hole).
+        let initiate = link.carrier.is_direct() || self.keypair.public.to_bytes() < link.public_key;
         wg.add_peer(link.public_key, link.overlay_ip, link.carrier, initiate);
         by_node.insert(link.node_id, (link.public_key, link.overlay_ip));
         // Host `/32` so overlay traffic to this peer beats any colliding
