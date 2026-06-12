@@ -24,6 +24,7 @@
 //! the coordination server and distributed in the netmap.
 
 pub mod bridge;
+pub mod direct;
 pub mod netmap;
 pub mod relay_link;
 pub mod router;
