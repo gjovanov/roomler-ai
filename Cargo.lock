@@ -3801,6 +3801,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "if-addrs"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0a05c691e1fae256cf7013d99dad472dc52d5543322761f83ec8d47eab40d2b"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "indenter"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6722,7 +6732,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-agent"
-version = "0.3.0-rc.131"
+version = "0.3.0-rc.132"
 dependencies = [
  "anyhow",
  "arboard",
@@ -6770,7 +6780,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-agent-tray"
-version = "0.3.0-rc.131"
+version = "0.3.0-rc.132"
 dependencies = [
  "anyhow",
  "gethostname 0.5.0",
@@ -6789,7 +6799,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-api"
-version = "0.3.0-rc.131"
+version = "0.3.0-rc.132"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6831,7 +6841,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-config"
-version = "0.3.0-rc.131"
+version = "0.3.0-rc.132"
 dependencies = [
  "config",
  "serde",
@@ -6840,7 +6850,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-db"
-version = "0.3.0-rc.131"
+version = "0.3.0-rc.132"
 dependencies = [
  "bson",
  "chrono",
@@ -6855,7 +6865,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-remote-control"
-version = "0.3.0-rc.131"
+version = "0.3.0-rc.132"
 dependencies = [
  "base64 0.22.1",
  "bitflags 2.11.1",
@@ -6875,7 +6885,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-services"
-version = "0.3.0-rc.131"
+version = "0.3.0-rc.132"
 dependencies = [
  "anyhow",
  "argon2",
@@ -6916,7 +6926,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-tests"
-version = "0.3.0-rc.131"
+version = "0.3.0-rc.132"
 dependencies = [
  "anyhow",
  "axum",
@@ -6947,7 +6957,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-tunnel-core"
-version = "0.3.0-rc.131"
+version = "0.3.0-rc.132"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6957,6 +6967,7 @@ dependencies = [
  "bytes",
  "futures",
  "hex",
+ "if-addrs",
  "ipnet",
  "quinn",
  "rand 0.9.4",
@@ -6980,7 +6991,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-installer"
-version = "0.3.0-rc.131"
+version = "0.3.0-rc.132"
 dependencies = [
  "anyhow",
  "directories",
@@ -7007,7 +7018,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-tunnel"
-version = "0.3.0-rc.131"
+version = "0.3.0-rc.132"
 dependencies = [
  "anyhow",
  "bson",
@@ -7036,7 +7047,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-tunnel-installer"
-version = "0.3.0-rc.131"
+version = "0.3.0-rc.132"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

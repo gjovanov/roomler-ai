@@ -35,13 +35,15 @@ use super::tun::TunIo;
 use super::wg::{Carrier, WgDevice};
 use roomler_ai_remote_control::signaling::{ClientMsg, IceServer, NetmapPeer, OverlayNetworkInfo};
 
-/// rc.131 — direct LAN carrier context. A shared UDP socket peers dial, plus
-/// this node's LAN IP (for the same-subnet test) and the `IP:port` endpoint we
-/// advertise in the join so a peer knows where to reach us directly.
+/// rc.131/132 — direct LAN carrier context. A shared UDP socket peers dial,
+/// this node's LAN IPs across ALL interfaces (for the same-subnet test), and
+/// the `IP:port` endpoints we advertise (one per interface, all on the shared
+/// socket's port) so a multi-homed peer can reach us on whichever subnet it
+/// shares with us.
 struct DirectCtx {
     sock: Arc<UdpSocket>,
-    lan_ip: Ipv4Addr,
-    endpoint: String,
+    my_ips: Vec<Ipv4Addr>,
+    endpoints: Vec<String>,
 }
 
 /// Overlay control events the runtime consumes, fed in from the node's
@@ -168,7 +170,7 @@ impl OverlayRuntime {
         let mut direct_peer: Option<ObjectId> = None;
         let mut advertised = endpoints;
         if let Some(ctx) = &direct_ctx {
-            advertised.push(ctx.endpoint.clone());
+            advertised.extend(ctx.endpoints.iter().cloned());
         }
 
         let join = ClientMsg::OverlayJoin {
@@ -301,15 +303,24 @@ impl OverlayRuntime {
         if !matches!(self.mode, CarrierMode::Relay) || !direct::direct_enabled() {
             return None;
         }
-        let lan_ip = direct::primary_lan_ip().await?;
+        let my_ips = direct::gather_lan_ips();
+        if my_ips.is_empty() {
+            info!("overlay: no usable LAN interface; direct path off (relay only)");
+            return None;
+        }
         let sock = Arc::new(UdpSocket::bind("0.0.0.0:0").await.ok()?);
         let port = sock.local_addr().ok()?.port();
-        let endpoint = format!("{lan_ip}:{port}");
-        info!(%endpoint, "overlay: advertising direct LAN endpoint (same-subnet peers dial direct)");
+        // One endpoint per interface IP — all reach the single 0.0.0.0:port
+        // socket; the peer dials whichever shares its subnet.
+        let endpoints: Vec<String> = my_ips.iter().map(|ip| format!("{ip}:{port}")).collect();
+        info!(
+            endpoints = ?endpoints,
+            "overlay: advertising direct LAN endpoints (same-subnet peers dial direct)"
+        );
         Some(DirectCtx {
             sock,
-            lan_ip,
-            endpoint,
+            my_ips,
+            endpoints,
         })
     }
 
@@ -365,7 +376,7 @@ impl OverlayRuntime {
                     if direct_peer.is_none()
                         && let Some(ctx) = direct_ctx
                         && let Some(dst) =
-                            direct::pick_same_subnet_endpoint(ctx.lan_ip, &cfg.endpoints)
+                            direct::pick_same_subnet_endpoint(&ctx.my_ips, &cfg.endpoints)
                     {
                         info!(peer = %np.node_id, %dst, "overlay: direct LAN carrier (same subnet) — skipping relay");
                         self.install_ready(
