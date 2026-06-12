@@ -23,15 +23,26 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bson::oid::ObjectId;
+use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use super::WgKeypair;
+use super::direct;
 use super::netmap::{PeerConfig, peer_config_from_netmap};
 use super::relay_link::{ReadyLink, RelayCoordinator};
 use super::tun::TunIo;
 use super::wg::{Carrier, WgDevice};
 use roomler_ai_remote_control::signaling::{ClientMsg, IceServer, NetmapPeer, OverlayNetworkInfo};
+
+/// rc.131 — direct LAN carrier context. A shared UDP socket peers dial, plus
+/// this node's LAN IP (for the same-subnet test) and the `IP:port` endpoint we
+/// advertise in the join so a peer knows where to reach us directly.
+struct DirectCtx {
+    sock: Arc<UdpSocket>,
+    lan_ip: Ipv4Addr,
+    endpoint: String,
+}
 
 /// Overlay control events the runtime consumes, fed in from the node's
 /// signaling loop (the `ServerMsg::Overlay*` handlers forward these).
@@ -148,13 +159,25 @@ impl OverlayRuntime {
     /// node's overlay IP), brings up the TUN + inbound writer, then
     /// steady-state pumps TUN traffic and applies netmap deltas.
     pub async fn run(self, mut events: mpsc::Receiver<OverlayEvent>, endpoints: Vec<String>) {
+        // rc.131 — direct LAN path: bind a shared UDP socket + discover our
+        // LAN endpoint so a same-subnet peer dials us directly and skips the
+        // relay. Off in Direct mode (the test/helper path) and when disabled.
+        let direct_ctx = self.setup_direct().await;
+        // The single direct-LAN peer's node id (v1 installs at most one — see
+        // install_peers). Reset when it leaves so a later peer can go direct.
+        let mut direct_peer: Option<ObjectId> = None;
+        let mut advertised = endpoints;
+        if let Some(ctx) = &direct_ctx {
+            advertised.push(ctx.endpoint.clone());
+        }
+
         let join = ClientMsg::OverlayJoin {
             network_hint: None,
             wg_public_key: self.keypair.public_base64(),
             key_epoch: 0,
             supported: vec!["wireguard-v1".to_string()],
             mtu: self.mtu,
-            endpoints,
+            endpoints: advertised,
         };
         if self.outbound.send(join).await.is_err() {
             warn!("overlay: control channel closed before join");
@@ -212,8 +235,16 @@ impl OverlayRuntime {
             CarrierMode::Relay => Some(RelayCoordinator::new(self.outbound.clone())),
             CarrierMode::Direct(_) => None,
         };
-        self.install_peers(&mut wg, &mut by_node, &mut relay, &tun, &first_peers)
-            .await;
+        self.install_peers(
+            &mut wg,
+            &mut by_node,
+            &mut relay,
+            &tun,
+            &first_peers,
+            direct_ctx.as_ref(),
+            &mut direct_peer,
+        )
+        .await;
 
         // Phase 2 — steady state.
         loop {
@@ -226,10 +257,10 @@ impl OverlayRuntime {
                     // Re-sync: install any newly-listed peers (deltas drive
                     // removals; a full diff/prune is a later refinement).
                     Some(OverlayEvent::Netmap { peers, .. }) => {
-                        self.install_peers(&mut wg, &mut by_node, &mut relay, &tun, &peers).await;
+                        self.install_peers(&mut wg, &mut by_node, &mut relay, &tun, &peers, direct_ctx.as_ref(), &mut direct_peer).await;
                     }
                     Some(OverlayEvent::NetmapDelta { upserts, removes }) => {
-                        self.install_peers(&mut wg, &mut by_node, &mut relay, &tun, &upserts).await;
+                        self.install_peers(&mut wg, &mut by_node, &mut relay, &tun, &upserts, direct_ctx.as_ref(), &mut direct_peer).await;
                         for node_id in removes {
                             if let Some((pk, ip)) = by_node.remove(&node_id) {
                                 wg.remove_peer(&pk);
@@ -238,6 +269,11 @@ impl OverlayRuntime {
                             }
                             if let Some(r) = relay.as_mut() {
                                 r.forget(&node_id);
+                            }
+                            // Free the direct slot so a later same-subnet peer
+                            // can take the direct LAN carrier (rc.131).
+                            if direct_peer == Some(node_id) {
+                                direct_peer = None;
                             }
                         }
                     }
@@ -256,10 +292,33 @@ impl OverlayRuntime {
         inbound.abort();
     }
 
+    /// rc.131 — bind the shared direct-carrier socket + discover our LAN
+    /// endpoint. Only in Relay mode (Direct mode is the loopback test/helper
+    /// path) and when `ROOMLER_AGENT_OVERLAY_DIRECT` isn't disabled. `None` if
+    /// disabled, not relay mode, the bind fails, or there's no usable LAN IP
+    /// (offline / CGNAT-only) — the node then stays relay-only as before.
+    async fn setup_direct(&self) -> Option<DirectCtx> {
+        if !matches!(self.mode, CarrierMode::Relay) || !direct::direct_enabled() {
+            return None;
+        }
+        let lan_ip = direct::primary_lan_ip().await?;
+        let sock = Arc::new(UdpSocket::bind("0.0.0.0:0").await.ok()?);
+        let port = sock.local_addr().ok()?.port();
+        let endpoint = format!("{lan_ip}:{port}");
+        info!(%endpoint, "overlay: advertising direct LAN endpoint (same-subnet peers dial direct)");
+        Some(DirectCtx {
+            sock,
+            lan_ip,
+            endpoint,
+        })
+    }
+
     /// For each peer not already installed: in Direct mode build the
-    /// carrier + install immediately; in Relay mode drive the coturn
+    /// carrier + install immediately; in Relay mode prefer a direct LAN
+    /// carrier for a same-subnet peer (rc.131), else drive the coturn
     /// coordination (complete an in-flight allocation, else request creds).
     /// Dedup is by node id.
+    #[allow(clippy::too_many_arguments)]
     async fn install_peers(
         &self,
         wg: &mut WgDevice,
@@ -267,6 +326,8 @@ impl OverlayRuntime {
         relay: &mut Option<RelayCoordinator>,
         tun: &Arc<dyn TunIo>,
         peers: &[NetmapPeer],
+        direct_ctx: Option<&DirectCtx>,
+        direct_peer: &mut Option<ObjectId>,
     ) {
         for np in peers {
             if by_node.contains_key(&np.node_id) {
@@ -295,6 +356,33 @@ impl OverlayRuntime {
                     .await;
                 }
                 CarrierMode::Relay => {
+                    // rc.131 — prefer a DIRECT LAN carrier for a same-subnet
+                    // peer and skip the relay entirely (no coturn hop, immune
+                    // to UDP/TLS-inspected/CGNAT uplinks). v1 installs at most
+                    // ONE direct peer: the shared socket has a single recv loop
+                    // per peer, so a second direct peer would race it — others
+                    // relay until the N>2 source-demux refactor (rc.132).
+                    if direct_peer.is_none()
+                        && let Some(ctx) = direct_ctx
+                        && let Some(dst) =
+                            direct::pick_same_subnet_endpoint(ctx.lan_ip, &cfg.endpoints)
+                    {
+                        info!(peer = %np.node_id, %dst, "overlay: direct LAN carrier (same subnet) — skipping relay");
+                        self.install_ready(
+                            wg,
+                            by_node,
+                            tun,
+                            ReadyLink {
+                                node_id: np.node_id,
+                                public_key: cfg.public_key,
+                                overlay_ip: cfg.overlay_ip,
+                                carrier: Carrier::direct(ctx.sock.clone(), dst),
+                            },
+                        )
+                        .await;
+                        *direct_peer = Some(np.node_id);
+                        continue;
+                    }
                     if let Some(coord) = relay.as_mut() {
                         if let Some(link) = coord.maybe_complete(np.node_id, &cfg) {
                             self.install_ready(wg, by_node, tun, link).await;
