@@ -74,6 +74,13 @@ impl Carrier {
         Arc::new(Carrier::Relay { conn, dst })
     }
 
+    /// A direct UDP carrier (vs a coturn relay). The runtime uses this to
+    /// decide handshake direction: a direct carrier needs BOTH ends to
+    /// initiate (bilateral hole-punch — see `install_ready`).
+    pub fn is_direct(&self) -> bool {
+        matches!(self, Carrier::Direct { .. })
+    }
+
     async fn send(&self, buf: &[u8]) -> io::Result<usize> {
         match self {
             Carrier::Direct { sock, dst } => sock.send_to(buf, *dst).await,
