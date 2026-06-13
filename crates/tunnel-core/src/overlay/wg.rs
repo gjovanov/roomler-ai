@@ -103,6 +103,12 @@ struct Peer {
     carrier: Arc<Carrier>,
     overlay_ip: Ipv4Addr,
     tasks: Vec<JoinHandle<()>>,
+    /// rc.134 — for a SHARED-direct peer, the source address it sends from
+    /// (== the carrier dst). `Some` ⇒ its inbound is handled by the device's
+    /// shared demux loop (no per-peer recv task), and `remove_peer` must
+    /// un-register it from the demux routing table. `None` for relay /
+    /// dedicated-socket carriers (those own a per-peer recv task).
+    direct_src: Option<SocketAddr>,
 }
 
 impl Drop for Peer {
@@ -111,6 +117,18 @@ impl Drop for Peer {
             t.abort();
         }
     }
+}
+
+/// rc.134 — shared-socket demux for N direct-LAN peers. ONE UDP socket serves
+/// every direct carrier; a single recv loop routes each datagram to the peer
+/// whose endpoint matches the source address (the WireGuard model), so many
+/// same-subnet peers can be direct at once — lifting the rc.131 "one direct
+/// peer" cap (which existed only because per-peer recv loops raced on a shared
+/// socket). `routes` maps a peer's send-from address → its `Tunn`.
+struct DirectDemux {
+    sock: Arc<UdpSocket>,
+    routes: Arc<Mutex<HashMap<SocketAddr, Arc<Mutex<Tunn>>>>>,
+    task: JoinHandle<()>,
 }
 
 /// A node's userspace WireGuard device: one static keypair, N peers,
@@ -122,6 +140,17 @@ pub struct WgDevice {
     router: Router,
     tun_tx: mpsc::Sender<Vec<u8>>,
     next_index: u32,
+    /// rc.134 — the shared direct-LAN socket + demux loop, lazily created on
+    /// the first direct peer (`ensure_direct_demux`). `None` until then.
+    direct: Option<DirectDemux>,
+}
+
+impl Drop for WgDevice {
+    fn drop(&mut self) {
+        if let Some(d) = &self.direct {
+            d.task.abort();
+        }
+    }
 }
 
 impl WgDevice {
@@ -139,6 +168,7 @@ impl WgDevice {
                 router: Router::new(),
                 tun_tx,
                 next_index: 1,
+                direct: None,
             },
             tun_rx,
         )
@@ -214,6 +244,100 @@ impl WgDevice {
                 carrier: carrier.clone(),
                 overlay_ip,
                 tasks: vec![recv_task, timer_task],
+                direct_src: None,
+            },
+        );
+
+        if initiate {
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; WG_BUF];
+                let mut t = tunn.lock().await;
+                if let TunnResult::WriteToNetwork(b) =
+                    t.format_handshake_initiation(&mut buf, false)
+                {
+                    let _ = carrier.send(b).await;
+                }
+            });
+        }
+    }
+
+    /// rc.134 — ensure the shared direct-LAN socket + its demux loop exist.
+    /// Idempotent; the first direct peer triggers it. The demux loop reads the
+    /// socket forever and routes each datagram to the peer matching its source
+    /// address (replacing the per-peer recv loop for direct carriers).
+    pub fn ensure_direct_demux(&mut self, sock: Arc<UdpSocket>) {
+        if self.direct.is_some() {
+            return;
+        }
+        let routes: Arc<Mutex<HashMap<SocketAddr, Arc<Mutex<Tunn>>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let task = tokio::spawn(run_direct_demux(
+            sock.clone(),
+            routes.clone(),
+            self.tun_tx.clone(),
+        ));
+        self.direct = Some(DirectDemux { sock, routes, task });
+    }
+
+    /// rc.134 — install a peer reached over the SHARED direct socket. Its
+    /// inbound is handled by the device's single demux loop (routed by source
+    /// address), so N direct peers share one socket without racing — unlike
+    /// `add_peer`, which spawns a per-peer recv loop. `ensure_direct_demux`
+    /// must have run. `initiate` ⇒ send a handshake init now (direct carriers
+    /// initiate bilaterally so both firewalls open — rc.133).
+    pub async fn add_direct_peer(
+        &mut self,
+        peer_public: [u8; 32],
+        overlay_ip: Ipv4Addr,
+        dst: SocketAddr,
+        initiate: bool,
+    ) {
+        let Some(demux) = &self.direct else {
+            warn!("wg: add_direct_peer before ensure_direct_demux; ignoring");
+            return;
+        };
+        let sock = demux.sock.clone();
+        let carrier = Carrier::direct(sock, dst);
+
+        let index = self.next_index;
+        self.next_index = self.next_index.wrapping_add(1);
+        let tunn = Arc::new(Mutex::new(Tunn::new(
+            self.secret.clone(),
+            PublicKey::from(peer_public),
+            None,
+            Some(KEEPALIVE_SECS),
+            index,
+            None,
+        )));
+
+        // Register for demux BEFORE the handshake so inbound is routed.
+        demux.routes.lock().await.insert(dst, tunn.clone());
+
+        // Timer task only — no recv task; the shared demux loop delivers
+        // this peer's inbound.
+        let timer_tunn = tunn.clone();
+        let timer_carrier = carrier.clone();
+        let timer_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; WG_BUF];
+            let mut tick = tokio::time::interval(Duration::from_millis(TIMER_TICK_MS));
+            loop {
+                tick.tick().await;
+                let mut t = timer_tunn.lock().await;
+                if let TunnResult::WriteToNetwork(b) = t.update_timers(&mut buf) {
+                    let _ = timer_carrier.send(b).await;
+                }
+            }
+        });
+
+        self.router.upsert(overlay_ip, peer_public);
+        self.peers.insert(
+            peer_public,
+            Peer {
+                tunn: tunn.clone(),
+                carrier: carrier.clone(),
+                overlay_ip,
+                tasks: vec![timer_task],
+                direct_src: Some(dst),
             },
         );
 
@@ -231,10 +355,16 @@ impl WgDevice {
     }
 
     /// Remove a peer (drops its `Tunn` + aborts its tasks + clears its
-    /// route). Used when the netmap drops a peer (ACL change / leave).
-    pub fn remove_peer(&mut self, peer_public: &[u8; 32]) {
+    /// route). Used when the netmap drops a peer (ACL change / leave) or to
+    /// re-install it with a different carrier (relay→direct upgrade, rc.134).
+    /// `async` because un-registering a shared-direct peer locks the demux
+    /// routing table.
+    pub async fn remove_peer(&mut self, peer_public: &[u8; 32]) {
         if let Some(p) = self.peers.remove(peer_public) {
             self.router.remove(&p.overlay_ip);
+            if let (Some(src), Some(demux)) = (p.direct_src, &self.direct) {
+                demux.routes.lock().await.remove(&src);
+            }
         }
     }
 
@@ -323,6 +453,44 @@ async fn process_inbound(
         }
         TunnResult::Done => {}
         TunnResult::Err(e) => debug!(?e, "wg decapsulate error"),
+    }
+}
+
+/// rc.134 — the shared direct-socket recv loop. Reads every datagram and
+/// routes it to the peer registered for its SOURCE address (a direct peer
+/// sends from the same address we send to), processing it with that peer's
+/// `Tunn` and replying over the same socket. One loop serves all direct peers,
+/// so N same-subnet peers share one socket without racing. Exits when the
+/// socket errors (device gone / dropped).
+async fn run_direct_demux(
+    sock: Arc<UdpSocket>,
+    routes: Arc<Mutex<HashMap<SocketAddr, Arc<Mutex<Tunn>>>>>,
+    tun_tx: mpsc::Sender<Vec<u8>>,
+) {
+    let mut buf = vec![0u8; WG_BUF];
+    loop {
+        let (n, src) = match sock.recv_from(&mut buf).await {
+            Ok(v) => v,
+            Err(e) => {
+                debug!(%e, "wg direct demux recv ended; loop exiting");
+                break;
+            }
+        };
+        // Clone the Arc<Tunn> out under the routes lock, then release it before
+        // the (potentially awaiting) process_inbound so the demux map stays
+        // contended only briefly.
+        let tunn = routes.lock().await.get(&src).cloned();
+        let Some(tunn) = tunn else {
+            // No direct peer for this source — a peer not yet registered, or
+            // stray noise. Drop it.
+            continue;
+        };
+        let reply = Carrier::Direct {
+            sock: sock.clone(),
+            dst: src,
+        };
+        let mut t = tunn.lock().await;
+        process_inbound(&mut t, n, &mut buf, &reply, &tun_tx).await;
     }
 }
 
@@ -420,6 +588,74 @@ mod tests {
             .expect("B did not receive a decrypted packet in time")
             .expect("tun channel closed");
         assert_eq!(got, pkt, "decrypted IP packet must arrive intact");
+    }
+
+    /// rc.134 — one HUB device serves TWO peers over a SINGLE shared socket
+    /// (the source-address demux). Proves N direct peers coexist without the
+    /// per-peer-recv-loop race the old "one direct peer" cap worked around:
+    /// both handshakes complete and the hub's data reaches the correct peer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shared_direct_socket_demuxes_multiple_peers() {
+        const IP_C: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 3);
+        let hub = WgKeypair::generate();
+        let b = WgKeypair::generate();
+        let c = WgKeypair::generate();
+
+        let hub_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sock_b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sock_c = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let hub_addr = hub_sock.local_addr().unwrap();
+        let addr_b = sock_b.local_addr().unwrap();
+        let addr_c = sock_c.local_addr().unwrap();
+
+        let (mut dev_hub, _rx_hub) = WgDevice::new(hub.secret.clone());
+        let (mut dev_b, mut rx_b) = WgDevice::new(b.secret.clone());
+        let (mut dev_c, mut rx_c) = WgDevice::new(c.secret.clone());
+
+        // Hub: BOTH peers over the ONE shared socket (inbound demuxed by src).
+        dev_hub.ensure_direct_demux(hub_sock.clone());
+        dev_hub
+            .add_direct_peer(b.public.to_bytes(), IP_B, addr_b, true)
+            .await;
+        dev_hub
+            .add_direct_peer(c.public.to_bytes(), IP_C, addr_c, true)
+            .await;
+
+        // Peers: dedicated sockets, respond to the hub's initiation.
+        dev_b.add_peer(
+            hub.public.to_bytes(),
+            IP_A,
+            Carrier::direct(sock_b.clone(), hub_addr),
+            false,
+        );
+        dev_c.add_peer(
+            hub.public.to_bytes(),
+            IP_A,
+            Carrier::direct(sock_c.clone(), hub_addr),
+            false,
+        );
+
+        // Both handshakes complete THROUGH the one shared socket — the hub's
+        // demux routed each peer's response to the right Tunn.
+        wait_connected(&dev_hub, &b.public.to_bytes()).await;
+        wait_connected(&dev_hub, &c.public.to_bytes()).await;
+
+        // And the hub's data reaches the correct peer (no cross-talk).
+        let pkt_b = synthetic_ipv4(IP_A, IP_B, b"hub-to-b");
+        send_until_ok(&dev_hub, &b.public.to_bytes(), &pkt_b).await;
+        let got_b = tokio::time::timeout(Duration::from_secs(15), rx_b.recv())
+            .await
+            .expect("B did not receive its packet")
+            .expect("tun channel closed");
+        assert_eq!(got_b, pkt_b);
+
+        let pkt_c = synthetic_ipv4(IP_A, IP_C, b"hub-to-c");
+        send_until_ok(&dev_hub, &c.public.to_bytes(), &pkt_c).await;
+        let got_c = tokio::time::timeout(Duration::from_secs(15), rx_c.recv())
+            .await
+            .expect("C did not receive its packet")
+            .expect("tun channel closed");
+        assert_eq!(got_c, pkt_c);
     }
 
     #[tokio::test(flavor = "multi_thread")]
