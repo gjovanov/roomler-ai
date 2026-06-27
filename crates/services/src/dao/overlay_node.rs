@@ -54,6 +54,10 @@ impl OverlayNodeDao {
             overlay_ip,
             wg_public_key,
             key_epoch,
+            // The join carries the agent's DIRECT LAN candidates; seed BOTH
+            // buckets. The relay trickle later replaces `endpoints` only —
+            // `lan_endpoints` survives so peers keep seeing the LAN address.
+            lan_endpoints: endpoints.clone(),
             endpoints,
             relay_home: None,
             status: AgentStatus::Online,
@@ -86,7 +90,11 @@ impl OverlayNodeDao {
                         "node_ref": node_ref_bson,
                         "wg_public_key": wg_public_key,
                         "key_epoch": key_epoch as i64,
+                        // Refresh BOTH buckets from the join (rc.135) — a DHCP
+                        // IP change is picked up, and the LAN bucket is restored
+                        // before the next relay trickle replaces `endpoints`.
                         "endpoints": endpoints,
+                        "lan_endpoints": endpoints,
                         "status": bson::to_bson(&AgentStatus::Online).unwrap(),
                         "last_seen_at": DateTime::now(),
                         "updated_at": DateTime::now(),
