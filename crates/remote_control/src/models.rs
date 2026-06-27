@@ -630,11 +630,21 @@ pub struct OverlayNode {
     /// Bumped on key rotation (Phase 5). `0` at first join.
     #[serde(default)]
     pub key_epoch: u32,
-    /// Current connectivity candidates (host / srflx / relay), as
-    /// `host:port` strings the peer can dial. Trickled via
-    /// `rc:overlay.endpoints`.
+    /// Current connectivity candidates (srflx / relay), as `host:port`
+    /// strings the peer can dial. REPLACED on each `rc:overlay.endpoints`
+    /// trickle from the relay coordinator.
     #[serde(default)]
     pub endpoints: Vec<String>,
+    /// rc.135 — DIRECT LAN candidates, set from the agent's JOIN (kept in a
+    /// SEPARATE bucket so the relay-endpoint trickle — which REPLACES
+    /// `endpoints` — can't clobber them). The netmap a peer receives unions
+    /// `lan_endpoints ∪ endpoints` so a same-subnet peer can always find the
+    /// LAN address and go direct. (Field 2026-06-27: the trickle stripped
+    /// `192.168.68.x` from nodes that had allocated a relay, forcing every
+    /// peer onto the relay path.) Refreshed on each (re)join, so a DHCP IP
+    /// change is picked up.
+    #[serde(default)]
+    pub lan_endpoints: Vec<String>,
     /// Preferred relay region/home, if any (Phase 5 multi-relay).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_home: Option<String>,
