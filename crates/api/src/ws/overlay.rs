@@ -424,10 +424,27 @@ fn to_netmap_peer(node: &OverlayNode) -> NetmapPeer {
         node_id: node.id.unwrap_or_default(),
         overlay_ip: node.overlay_ip.clone(),
         wg_public_key: node.wg_public_key.clone(),
-        endpoints: node.endpoints.clone(),
+        // rc.135 — union the DIRECT LAN bucket with the trickled (srflx/relay)
+        // bucket, LAN first, deduped. The relay trickle REPLACES `endpoints`,
+        // so a node that allocated a relay would otherwise advertise no LAN
+        // address and every peer would fall back to the relay path. Keeping
+        // `lan_endpoints` separate and unioning here lets a same-subnet peer
+        // always find the LAN candidate (field fix 2026-06-27).
+        endpoints: union_endpoints(&node.lan_endpoints, &node.endpoints),
         relay_home: node.relay_home.clone(),
         reachable: true,
     }
+}
+
+/// `lan ∪ rest`, LAN first, order-preserving dedup.
+fn union_endpoints(lan: &[String], rest: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(lan.len() + rest.len());
+    for ep in lan.iter().chain(rest.iter()) {
+        if !out.contains(ep) {
+            out.push(ep.clone());
+        }
+    }
+    out
 }
 
 /// `base_cidr` + host number → dotted overlay IP. e.g.

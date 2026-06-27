@@ -83,16 +83,32 @@ pub struct RelayCoordinator {
     /// WireGuard to a dead allocation forever (the rc.125→126 field failure).
     /// Each `endpoints` trickle carries every *current* value.
     advertised: HashMap<ObjectId, String>,
+    /// rc.135 — this node's DIRECT LAN endpoints (from `setup_direct`). The
+    /// server REPLACES a node's stored endpoints on each `rc:overlay.endpoints`
+    /// trickle, so the trickle MUST re-include the LAN endpoints or they're
+    /// clobbered — which is exactly what stripped `.2`/`.3`'s `192.168.68.x`
+    /// from the netmap and forced peers onto relay (field 2026-06-27). Every
+    /// trickle now carries `lan ∪ current relays`.
+    lan_endpoints: Vec<String>,
 }
 
 impl RelayCoordinator {
-    pub fn new(outbound: tokio::sync::mpsc::Sender<ClientMsg>) -> Self {
+    pub fn new(outbound: tokio::sync::mpsc::Sender<ClientMsg>, lan_endpoints: Vec<String>) -> Self {
         Self {
             outbound,
             pending: HashMap::new(),
             allocated: HashMap::new(),
             advertised: HashMap::new(),
+            lan_endpoints,
         }
+    }
+
+    /// LAN endpoints ∪ every current relay address — the full candidate set the
+    /// server should store (it replaces on each trickle, so LAN must be here).
+    fn all_endpoints(&self) -> Vec<String> {
+        let mut eps = self.lan_endpoints.clone();
+        eps.extend(self.advertised.values().cloned());
+        eps
     }
 
     /// Already coordinating a link to this peer (pending or allocated)?
@@ -180,7 +196,7 @@ impl RelayCoordinator {
             let _ = self
                 .outbound
                 .send(ClientMsg::OverlayEndpoints {
-                    candidates: self.advertised.values().cloned().collect(),
+                    candidates: self.all_endpoints(),
                 })
                 .await;
         }
@@ -401,7 +417,7 @@ mod tests {
     #[tokio::test]
     async fn request_is_idempotent_and_sends_one_relay_request() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        let mut coord = RelayCoordinator::new(tx);
+        let mut coord = RelayCoordinator::new(tx, vec![]);
         let node = ObjectId::new();
         let peer = PeerConfig {
             public_key: [1u8; 32],
@@ -424,7 +440,7 @@ mod tests {
         // we advertised for it, or the next `OverlayEndpoints` trickle keeps
         // carrying a now-dead allocation and the peer dials it forever.
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        let mut coord = RelayCoordinator::new(tx);
+        let mut coord = RelayCoordinator::new(tx, vec!["192.168.68.5:51820".into()]);
         let node = ObjectId::new();
         coord.advertised.insert(node, "94.130.141.74:11085".into());
         coord.pending.insert(
@@ -445,6 +461,32 @@ mod tests {
         assert!(
             coord.advertised.is_empty(),
             "forget must prune the advertised relay so a re-joining peer can't dial a dead allocation"
+        );
+        // rc.135 — the LAN endpoint is ALWAYS in the trickle's candidate set
+        // (the server replaces, so the LAN endpoint must survive each trickle);
+        // forgetting a relay drops only that relay, never the LAN endpoint.
+        assert_eq!(
+            coord.all_endpoints(),
+            vec!["192.168.68.5:51820".to_string()],
+            "LAN endpoint must persist; only the relay is pruned"
+        );
+    }
+
+    #[test]
+    fn all_endpoints_unions_lan_and_relays() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut coord = RelayCoordinator::new(tx, vec!["192.168.68.5:51820".into()]);
+        coord
+            .advertised
+            .insert(ObjectId::new(), "94.130.141.74:11085".into());
+        let eps = coord.all_endpoints();
+        assert!(
+            eps.contains(&"192.168.68.5:51820".to_string()),
+            "LAN included"
+        );
+        assert!(
+            eps.contains(&"94.130.141.74:11085".to_string()),
+            "relay included"
         );
     }
 }
