@@ -231,7 +231,16 @@ impl OverlayRuntime {
         // `/32` route can be torn down when it leaves.
         let mut by_node: HashMap<ObjectId, ([u8; 32], Ipv4Addr, bool)> = HashMap::new();
         let mut relay = match self.mode {
-            CarrierMode::Relay => Some(RelayCoordinator::new(self.outbound.clone())),
+            // Pass our LAN endpoints so the relay-endpoint trickle re-includes
+            // them (the server replaces, so they'd otherwise be clobbered —
+            // rc.135). Empty when the direct path is off.
+            CarrierMode::Relay => Some(RelayCoordinator::new(
+                self.outbound.clone(),
+                direct_ctx
+                    .as_ref()
+                    .map(|c| c.endpoints.clone())
+                    .unwrap_or_default(),
+            )),
             CarrierMode::Direct(_) => None,
         };
         self.install_peers(
