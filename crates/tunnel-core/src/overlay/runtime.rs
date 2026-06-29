@@ -20,6 +20,7 @@
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bson::oid::ObjectId;
@@ -45,6 +46,35 @@ struct DirectCtx {
     my_ips: Vec<Ipv4Addr>,
     endpoints: Vec<String>,
 }
+
+/// An installed peer carrier + the bookkeeping the direct→relay fallback
+/// (rc.136) needs.
+struct Installed {
+    pubkey: [u8; 32],
+    overlay_ip: Ipv4Addr,
+    /// `true` if reached over the direct LAN socket, `false` over the relay.
+    is_direct: bool,
+    /// When this carrier was installed — for the never-established timeout.
+    since: Instant,
+}
+
+/// How long to wait for a DIRECT carrier's first handshake before giving up
+/// and falling back to relay. WG retries every ~5 s (REKEY_TIMEOUT), so 20 s
+/// is ~4 attempts — enough to rule out a viable LAN path, fast enough that a
+/// "looks same-subnet but isn't reachable" peer (corp full-tunnel VPN, Wi-Fi
+/// AP/client isolation, asymmetric firewall) doesn't stay dark for long.
+const DIRECT_HS_TIMEOUT: Duration = Duration::from_secs(20);
+/// A direct carrier that DID handshake but has gone this long without a fresh
+/// one is treated as broken (the path died mid-session — e.g. a VPN connected
+/// after the link was up). Above WG's ~2-minute rekey interval so an idle but
+/// healthy link isn't false-flagged.
+const DIRECT_STALE: Duration = Duration::from_secs(150);
+/// After a direct carrier fails, don't retry direct for this peer for this
+/// long — it stays on relay, then re-attempts direct (auto-recovers when the
+/// blocking condition clears, e.g. the VPN disconnects).
+const DIRECT_COOLDOWN: Duration = Duration::from_secs(60);
+/// How often the fallback sweep runs.
+const FALLBACK_TICK: Duration = Duration::from_secs(10);
 
 /// Overlay control events the runtime consumes, fed in from the node's
 /// signaling loop (the `ServerMsg::Overlay*` handlers forward these).
@@ -227,9 +257,16 @@ impl OverlayRuntime {
             }
         });
 
-        // node_id → (WG pubkey, overlay IP). The IP is kept so a peer's
-        // `/32` route can be torn down when it leaves.
-        let mut by_node: HashMap<ObjectId, ([u8; 32], Ipv4Addr, bool)> = HashMap::new();
+        // node_id → installed carrier (pubkey/IP/kind/install-time).
+        let mut by_node: HashMap<ObjectId, Installed> = HashMap::new();
+        // rc.136 — peers whose DIRECT carrier just failed: don't retry direct
+        // until the Instant (they stay on relay). Auto-expires → direct retried.
+        let mut direct_cooldown: HashMap<ObjectId, Instant> = HashMap::new();
+        // Latest netmap view (node_id → peer), so the fallback sweep can drive
+        // the relay path for a downgraded peer without waiting for a netmap.
+        let mut current_peers: HashMap<ObjectId, NetmapPeer> =
+            first_peers.iter().map(|p| (p.node_id, p.clone())).collect();
+        let mut fallback = tokio::time::interval(FALLBACK_TICK);
         let mut relay = match self.mode {
             // Pass our LAN endpoints so the relay-endpoint trickle re-includes
             // them (the server replaces, so they'd otherwise be clobbered —
@@ -250,6 +287,7 @@ impl OverlayRuntime {
             &tun,
             &first_peers,
             direct_ctx.as_ref(),
+            &direct_cooldown,
         )
         .await;
 
@@ -260,18 +298,34 @@ impl OverlayRuntime {
                     Ok(pkt) => { let _ = wg.send_ip_packet(&pkt).await; }
                     Err(e) => { debug!(%e, "overlay: TUN read ended; runtime exiting"); break; }
                 },
+                // rc.136 — direct→relay fallback sweep. A DIRECT carrier whose
+                // handshake never completes (or dies mid-session) means the LAN
+                // path only LOOKED viable (same subnet) but isn't actually
+                // reachable — a corp full-tunnel VPN that hijacks routing, Wi-Fi
+                // AP/client isolation, an asymmetric firewall. Tear it down and
+                // switch the peer to relay (with a cooldown so the next netmap
+                // doesn't immediately re-upgrade it to direct).
+                _ = fallback.tick() => {
+                    self.sweep_direct_fallback(
+                        &mut wg, &mut by_node, &mut relay, &tun,
+                        &mut direct_cooldown, &current_peers,
+                    ).await;
+                },
                 evt = events.recv() => match evt {
                     // Re-sync: install any newly-listed peers (deltas drive
                     // removals; a full diff/prune is a later refinement).
                     Some(OverlayEvent::Netmap { peers, .. }) => {
-                        self.install_peers(&mut wg, &mut by_node, &mut relay, &tun, &peers, direct_ctx.as_ref()).await;
+                        current_peers = peers.iter().map(|p| (p.node_id, p.clone())).collect();
+                        self.install_peers(&mut wg, &mut by_node, &mut relay, &tun, &peers, direct_ctx.as_ref(), &direct_cooldown).await;
                     }
                     Some(OverlayEvent::NetmapDelta { upserts, removes }) => {
-                        self.install_peers(&mut wg, &mut by_node, &mut relay, &tun, &upserts, direct_ctx.as_ref()).await;
+                        for p in &upserts { current_peers.insert(p.node_id, p.clone()); }
+                        self.install_peers(&mut wg, &mut by_node, &mut relay, &tun, &upserts, direct_ctx.as_ref(), &direct_cooldown).await;
                         for node_id in removes {
-                            if let Some((pk, ip, _)) = by_node.remove(&node_id) {
-                                wg.remove_peer(&pk).await;
-                                tun.del_peer_route(ip).await;
+                            current_peers.remove(&node_id);
+                            if let Some(e) = by_node.remove(&node_id) {
+                                wg.remove_peer(&e.pubkey).await;
+                                tun.del_peer_route(e.overlay_ip).await;
                                 info!(peer = %node_id, "overlay: peer removed");
                             }
                             if let Some(r) = relay.as_mut() {
@@ -292,6 +346,54 @@ impl OverlayRuntime {
         }
 
         inbound.abort();
+    }
+
+    /// rc.136 — find DIRECT carriers that aren't (or are no longer) healthy and
+    /// fall them back to relay. `handshake_age == None` past
+    /// [`DIRECT_HS_TIMEOUT`] = never established; `Some(age) >= DIRECT_STALE` =
+    /// established then died. Each downgraded peer is put on a
+    /// [`DIRECT_COOLDOWN`] and its relay leg is requested immediately.
+    async fn sweep_direct_fallback(
+        &self,
+        wg: &mut WgDevice,
+        by_node: &mut HashMap<ObjectId, Installed>,
+        relay: &mut Option<RelayCoordinator>,
+        tun: &Arc<dyn TunIo>,
+        direct_cooldown: &mut HashMap<ObjectId, Instant>,
+        current_peers: &HashMap<ObjectId, NetmapPeer>,
+    ) {
+        // Collect first (the health check awaits, and the action mutates).
+        let mut dead: Vec<ObjectId> = Vec::new();
+        for (nid, e) in by_node.iter() {
+            if !e.is_direct {
+                continue;
+            }
+            let unhealthy = match wg.handshake_age(&e.pubkey).await {
+                None => e.since.elapsed() >= DIRECT_HS_TIMEOUT,
+                Some(age) => age >= DIRECT_STALE,
+            };
+            if unhealthy {
+                dead.push(*nid);
+            }
+        }
+        for nid in dead {
+            let Some(e) = by_node.remove(&nid) else {
+                continue;
+            };
+            wg.remove_peer(&e.pubkey).await;
+            tun.del_peer_route(e.overlay_ip).await;
+            direct_cooldown.insert(nid, Instant::now() + DIRECT_COOLDOWN);
+            warn!(
+                peer = %nid,
+                "overlay: direct LAN carrier didn't establish (VPN / AP-isolation / firewall?) — falling back to relay"
+            );
+            // Drive the relay leg now (don't wait for the next netmap).
+            if let (Some(coord), Some(np)) = (relay.as_mut(), current_peers.get(&nid))
+                && let Some(cfg) = peer_config_from_netmap(np)
+            {
+                coord.request(nid, cfg).await;
+            }
+        }
     }
 
     /// rc.131 — bind the shared direct-carrier socket + discover our LAN
@@ -331,29 +433,42 @@ impl OverlayRuntime {
     /// coturn relay coordination. ALREADY-installed on RELAY but a same-subnet
     /// endpoint has since appeared → UPGRADE to direct (rc.134 re-evaluation:
     /// a peer first seen before its endpoint arrived would otherwise stay on
-    /// relay forever). `by_node` value = (pubkey, overlay_ip, is_direct).
+    /// relay forever). A peer in a [`DIRECT_COOLDOWN`] (its direct carrier just
+    /// failed — rc.136) is kept on relay regardless of a same-subnet endpoint.
     #[allow(clippy::too_many_arguments)]
     async fn install_peers(
         &self,
         wg: &mut WgDevice,
-        by_node: &mut HashMap<ObjectId, ([u8; 32], Ipv4Addr, bool)>,
+        by_node: &mut HashMap<ObjectId, Installed>,
         relay: &mut Option<RelayCoordinator>,
         tun: &Arc<dyn TunIo>,
         peers: &[NetmapPeer],
         direct_ctx: Option<&DirectCtx>,
+        direct_cooldown: &HashMap<ObjectId, Instant>,
     ) {
         for np in peers {
             let Some(cfg) = peer_config_from_netmap(np) else {
                 continue;
             };
+            // rc.136 — suppress direct while this peer is cooling down from a
+            // failed direct carrier (treat as if it had no same-subnet endpoint
+            // → relay). Expired entries fall through, so direct is retried.
+            let in_cooldown = direct_cooldown
+                .get(&np.node_id)
+                .is_some_and(|&until| until > Instant::now());
             // A same-subnet direct endpoint for this peer, if any (Relay mode +
-            // direct enabled + the peer advertised one on one of our subnets).
-            let direct_dst = direct_ctx
-                .and_then(|ctx| direct::pick_same_subnet_endpoint(&ctx.my_ips, &cfg.endpoints));
+            // direct enabled + not cooling down + the peer advertised one on
+            // one of our subnets).
+            let direct_dst = if in_cooldown {
+                None
+            } else {
+                direct_ctx
+                    .and_then(|ctx| direct::pick_same_subnet_endpoint(&ctx.my_ips, &cfg.endpoints))
+            };
 
-            match by_node.get(&np.node_id).copied() {
-                Some((_, _, true)) => continue, // already direct
-                Some((pk, _, false)) => {
+            match by_node.get(&np.node_id).map(|e| (e.is_direct, e.pubkey)) {
+                Some((true, _)) => continue, // already direct
+                Some((false, pk)) => {
                     // Installed on RELAY — upgrade to direct now that a
                     // same-subnet endpoint has appeared (re-evaluation).
                     if let (Some(ctx), Some(dst)) = (direct_ctx, direct_dst) {
@@ -424,7 +539,7 @@ impl OverlayRuntime {
     async fn install_direct(
         &self,
         wg: &mut WgDevice,
-        by_node: &mut HashMap<ObjectId, ([u8; 32], Ipv4Addr, bool)>,
+        by_node: &mut HashMap<ObjectId, Installed>,
         tun: &Arc<dyn TunIo>,
         ctx: &DirectCtx,
         node_id: ObjectId,
@@ -434,7 +549,15 @@ impl OverlayRuntime {
         wg.ensure_direct_demux(ctx.sock.clone());
         wg.add_direct_peer(cfg.public_key, cfg.overlay_ip, dst, true)
             .await;
-        by_node.insert(node_id, (cfg.public_key, cfg.overlay_ip, true));
+        by_node.insert(
+            node_id,
+            Installed {
+                pubkey: cfg.public_key,
+                overlay_ip: cfg.overlay_ip,
+                is_direct: true,
+                since: Instant::now(),
+            },
+        );
         if let Err(e) = tun.add_peer_route(cfg.overlay_ip).await {
             debug!(peer = %node_id, %e, "overlay: /32 peer route not installed (ok on clean hosts)");
         }
@@ -446,7 +569,7 @@ impl OverlayRuntime {
     async fn install_ready(
         &self,
         wg: &mut WgDevice,
-        by_node: &mut HashMap<ObjectId, ([u8; 32], Ipv4Addr, bool)>,
+        by_node: &mut HashMap<ObjectId, Installed>,
         tun: &Arc<dyn TunIo>,
         link: ReadyLink,
     ) {
@@ -464,8 +587,17 @@ impl OverlayRuntime {
         // because its ciphertext rides the agent's OWN outbound TURN
         // connection (already a stateful hole).
         let initiate = link.carrier.is_direct() || self.keypair.public.to_bytes() < link.public_key;
+        let is_direct = link.carrier.is_direct();
         wg.add_peer(link.public_key, link.overlay_ip, link.carrier, initiate);
-        by_node.insert(link.node_id, (link.public_key, link.overlay_ip, false));
+        by_node.insert(
+            link.node_id,
+            Installed {
+                pubkey: link.public_key,
+                overlay_ip: link.overlay_ip,
+                is_direct,
+                since: Instant::now(),
+            },
+        );
         // Host `/32` so overlay traffic to this peer beats any colliding
         // less-specific route on the uplink (e.g. a carrier CGNAT /10).
         // Best-effort — clean hosts route fine via the connected /10.
