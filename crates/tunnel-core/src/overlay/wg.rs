@@ -414,6 +414,16 @@ impl WgDevice {
         };
         peer.tunn.lock().await.time_since_last_handshake().is_some()
     }
+
+    /// rc.136 — time since the last completed handshake to `peer_public`.
+    /// `None` if the peer is unknown OR no handshake has ever completed (used
+    /// by the runtime's direct→relay fallback to tell a never-established
+    /// carrier from a healthy one). On a live link this stays under WG's
+    /// ~2-minute rekey interval.
+    pub async fn handshake_age(&self, peer_public: &[u8; 32]) -> Option<Duration> {
+        let peer = self.peers.get(peer_public)?;
+        peer.tunn.lock().await.time_since_last_handshake()
+    }
 }
 
 /// Handle one inbound carrier datagram: decapsulate, echo any
