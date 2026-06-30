@@ -6732,7 +6732,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-agent"
-version = "0.3.0-rc.138"
+version = "0.3.0-rc.139"
 dependencies = [
  "anyhow",
  "arboard",
@@ -6780,7 +6780,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-agent-tray"
-version = "0.3.0-rc.138"
+version = "0.3.0-rc.139"
 dependencies = [
  "anyhow",
  "gethostname 0.5.0",
@@ -6799,7 +6799,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-api"
-version = "0.3.0-rc.138"
+version = "0.3.0-rc.139"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6841,7 +6841,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-config"
-version = "0.3.0-rc.138"
+version = "0.3.0-rc.139"
 dependencies = [
  "config",
  "serde",
@@ -6850,7 +6850,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-db"
-version = "0.3.0-rc.138"
+version = "0.3.0-rc.139"
 dependencies = [
  "bson",
  "chrono",
@@ -6865,7 +6865,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-remote-control"
-version = "0.3.0-rc.138"
+version = "0.3.0-rc.139"
 dependencies = [
  "base64 0.22.1",
  "bitflags 2.11.1",
@@ -6885,7 +6885,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-services"
-version = "0.3.0-rc.138"
+version = "0.3.0-rc.139"
 dependencies = [
  "anyhow",
  "argon2",
@@ -6926,7 +6926,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-tests"
-version = "0.3.0-rc.138"
+version = "0.3.0-rc.139"
 dependencies = [
  "anyhow",
  "axum",
@@ -6957,7 +6957,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-tunnel-core"
-version = "0.3.0-rc.138"
+version = "0.3.0-rc.139"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6991,7 +6991,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-installer"
-version = "0.3.0-rc.138"
+version = "0.3.0-rc.139"
 dependencies = [
  "anyhow",
  "directories",
@@ -7018,7 +7018,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-tunnel"
-version = "0.3.0-rc.138"
+version = "0.3.0-rc.139"
 dependencies = [
  "anyhow",
  "bson",
@@ -7047,7 +7047,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-tunnel-installer"
-version = "0.3.0-rc.138"
+version = "0.3.0-rc.139"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
