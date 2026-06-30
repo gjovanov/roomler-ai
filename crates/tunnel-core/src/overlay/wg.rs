@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use boringtun::noise::{Tunn, TunnResult};
@@ -96,6 +97,22 @@ impl Carrier {
     }
 }
 
+/// rc.137 — lock-free per-peer traffic counters. `tx` = IP packets we
+/// encapsulated + sent; `rx` = inbound IP packets we decapsulated to the TUN.
+/// The runtime's direct→relay fallback reads these WITHOUT locking the `Tunn`
+/// (locking it on a timer inside the packet loop is what added a ~660 ms
+/// latency spike every sweep in rc.136), and uses "tx climbing while rx is
+/// flat" as a fast, lock-free "this carrier is one-way / dead" signal.
+#[derive(Default)]
+pub struct PeerStats {
+    tx: AtomicU64,
+    rx: AtomicU64,
+}
+
+/// Demux routing table: a direct peer's source address → its `Tunn` + stats.
+/// One shared map drives the single direct-socket recv loop (rc.134).
+type DemuxRoutes = HashMap<SocketAddr, (Arc<Mutex<Tunn>>, Arc<PeerStats>)>;
+
 /// One installed peer: its `Tunn`, its carrier, and the background tasks
 /// that pump it. Dropping aborts the tasks.
 struct Peer {
@@ -103,6 +120,7 @@ struct Peer {
     carrier: Arc<Carrier>,
     overlay_ip: Ipv4Addr,
     tasks: Vec<JoinHandle<()>>,
+    stats: Arc<PeerStats>,
     /// rc.134 — for a SHARED-direct peer, the source address it sends from
     /// (== the carrier dst). `Some` ⇒ its inbound is handled by the device's
     /// shared demux loop (no per-peer recv task), and `remove_peer` must
@@ -127,7 +145,7 @@ impl Drop for Peer {
 /// socket). `routes` maps a peer's send-from address → its `Tunn`.
 struct DirectDemux {
     sock: Arc<UdpSocket>,
-    routes: Arc<Mutex<HashMap<SocketAddr, Arc<Mutex<Tunn>>>>>,
+    routes: Arc<Mutex<DemuxRoutes>>,
     task: JoinHandle<()>,
 }
 
@@ -202,10 +220,13 @@ impl WgDevice {
         );
         let tunn = Arc::new(Mutex::new(tunn));
 
+        let stats = Arc::new(PeerStats::default());
+
         // recv task: carrier → decapsulate → tun / network echo.
         let recv_tunn = tunn.clone();
         let recv_carrier = carrier.clone();
         let tun_tx = self.tun_tx.clone();
+        let recv_stats = stats.clone();
         let recv_task = tokio::spawn(async move {
             let mut buf = vec![0u8; WG_BUF];
             loop {
@@ -217,7 +238,7 @@ impl WgDevice {
                     }
                 };
                 let mut t = recv_tunn.lock().await;
-                process_inbound(&mut t, n, &mut buf, &recv_carrier, &tun_tx).await;
+                process_inbound(&mut t, n, &mut buf, &recv_carrier, &tun_tx, &recv_stats).await;
             }
         });
 
@@ -244,6 +265,7 @@ impl WgDevice {
                 carrier: carrier.clone(),
                 overlay_ip,
                 tasks: vec![recv_task, timer_task],
+                stats,
                 direct_src: None,
             },
         );
@@ -269,8 +291,7 @@ impl WgDevice {
         if self.direct.is_some() {
             return;
         }
-        let routes: Arc<Mutex<HashMap<SocketAddr, Arc<Mutex<Tunn>>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let routes: Arc<Mutex<DemuxRoutes>> = Arc::new(Mutex::new(HashMap::new()));
         let task = tokio::spawn(run_direct_demux(
             sock.clone(),
             routes.clone(),
@@ -310,8 +331,13 @@ impl WgDevice {
             None,
         )));
 
+        let stats = Arc::new(PeerStats::default());
         // Register for demux BEFORE the handshake so inbound is routed.
-        demux.routes.lock().await.insert(dst, tunn.clone());
+        demux
+            .routes
+            .lock()
+            .await
+            .insert(dst, (tunn.clone(), stats.clone()));
 
         // Timer task only — no recv task; the shared demux loop delivers
         // this peer's inbound.
@@ -337,6 +363,7 @@ impl WgDevice {
                 carrier: carrier.clone(),
                 overlay_ip,
                 tasks: vec![timer_task],
+                stats,
                 direct_src: Some(dst),
             },
         );
@@ -396,7 +423,13 @@ impl WgDevice {
         let mut buf = vec![0u8; WG_BUF];
         let mut t = peer.tunn.lock().await;
         match t.encapsulate(packet, &mut buf) {
-            TunnResult::WriteToNetwork(b) => peer.carrier.send(b).await.is_ok(),
+            TunnResult::WriteToNetwork(b) => {
+                let ok = peer.carrier.send(b).await.is_ok();
+                if ok {
+                    peer.stats.tx.fetch_add(1, Ordering::Relaxed);
+                }
+                ok
+            }
             TunnResult::Done => false,
             TunnResult::Err(e) => {
                 warn!(?e, "wg encapsulate error");
@@ -415,14 +448,17 @@ impl WgDevice {
         peer.tunn.lock().await.time_since_last_handshake().is_some()
     }
 
-    /// rc.136 — time since the last completed handshake to `peer_public`.
-    /// `None` if the peer is unknown OR no handshake has ever completed (used
-    /// by the runtime's direct→relay fallback to tell a never-established
-    /// carrier from a healthy one). On a live link this stays under WG's
-    /// ~2-minute rekey interval.
-    pub async fn handshake_age(&self, peer_public: &[u8; 32]) -> Option<Duration> {
+    /// rc.137 — LOCK-FREE `(tx, rx)` IP-packet counts for `peer_public`
+    /// (`None` if unknown). Read by the runtime's fallback sweep WITHOUT
+    /// locking the `Tunn`, so the periodic health check can't stall the packet
+    /// path (the rc.136 regression). `tx` climbing while `rx` is flat ⇒ the
+    /// carrier is one-way / dead ⇒ fall back to relay.
+    pub fn peer_traffic(&self, peer_public: &[u8; 32]) -> Option<(u64, u64)> {
         let peer = self.peers.get(peer_public)?;
-        peer.tunn.lock().await.time_since_last_handshake()
+        Some((
+            peer.stats.tx.load(Ordering::Relaxed),
+            peer.stats.rx.load(Ordering::Relaxed),
+        ))
     }
 }
 
@@ -435,6 +471,7 @@ async fn process_inbound(
     buf: &mut [u8],
     carrier: &Carrier,
     tun_tx: &mpsc::Sender<Vec<u8>>,
+    stats: &PeerStats,
 ) {
     // Decapsulate writes into a separate scratch buffer so the borrow on
     // the result doesn't alias the inbound `buf`.
@@ -456,9 +493,11 @@ async fn process_inbound(
             }
         }
         TunnResult::WriteToTunnelV4(pkt, _) => {
+            stats.rx.fetch_add(1, Ordering::Relaxed);
             let _ = tun_tx.send(pkt.to_vec()).await;
         }
         TunnResult::WriteToTunnelV6(pkt, _) => {
+            stats.rx.fetch_add(1, Ordering::Relaxed);
             let _ = tun_tx.send(pkt.to_vec()).await;
         }
         TunnResult::Done => {}
@@ -474,7 +513,7 @@ async fn process_inbound(
 /// socket errors (device gone / dropped).
 async fn run_direct_demux(
     sock: Arc<UdpSocket>,
-    routes: Arc<Mutex<HashMap<SocketAddr, Arc<Mutex<Tunn>>>>>,
+    routes: Arc<Mutex<DemuxRoutes>>,
     tun_tx: mpsc::Sender<Vec<u8>>,
 ) {
     let mut buf = vec![0u8; WG_BUF];
@@ -486,11 +525,11 @@ async fn run_direct_demux(
                 break;
             }
         };
-        // Clone the Arc<Tunn> out under the routes lock, then release it before
-        // the (potentially awaiting) process_inbound so the demux map stays
+        // Clone the Arcs out under the routes lock, then release it before the
+        // (potentially awaiting) process_inbound so the demux map stays
         // contended only briefly.
-        let tunn = routes.lock().await.get(&src).cloned();
-        let Some(tunn) = tunn else {
+        let entry = routes.lock().await.get(&src).cloned();
+        let Some((tunn, stats)) = entry else {
             // No direct peer for this source — a peer not yet registered, or
             // stray noise. Drop it.
             continue;
@@ -500,7 +539,7 @@ async fn run_direct_demux(
             dst: src,
         };
         let mut t = tunn.lock().await;
-        process_inbound(&mut t, n, &mut buf, &reply, &tun_tx).await;
+        process_inbound(&mut t, n, &mut buf, &reply, &tun_tx, &stats).await;
     }
 }
 
