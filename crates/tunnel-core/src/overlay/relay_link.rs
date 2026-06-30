@@ -235,11 +235,33 @@ impl RelayCoordinator {
         }
     }
 
-    /// Build the carrier once we have an allocation AND a dialable peer
+    /// Build the carrier once we have an allocation AND the peer's RELAYED
     /// address. On success the link leaves `allocated`.
+    ///
+    /// rc.138 — dial the peer's endpoint on the SAME coturn worker we
+    /// allocated on (the deterministic pin lands both ends on one worker, so
+    /// its IP == our relay's local IP), falling back to any other PUBLIC
+    /// endpoint. NEVER a private/LAN address: rc.135's netmap unions
+    /// `[LAN…, relay]`, and the old "first parseable endpoint" grabbed the
+    /// peer's LAN address — which a coturn relay can't reach (and is dead
+    /// under Wi-Fi AP isolation / a VPN), so the relay carried nothing
+    /// (field: relay-only 100 % loss; VPN fallback leaked to the gateway).
+    /// `None` until the peer advertises a relay/public address (retry next
+    /// netmap) — we must not dial its LAN address as the "relay".
     fn try_build(&mut self, node_id: &ObjectId) -> Option<ReadyLink> {
         let a = self.allocated.get(node_id)?;
-        let dst: SocketAddr = a.peer.endpoints.iter().find_map(|e| e.parse().ok())?;
+        let our_worker_ip = a.conn.local_addr().ok().map(|s| s.ip());
+        let parsed: Vec<SocketAddr> = a
+            .peer
+            .endpoints
+            .iter()
+            .filter_map(|e| e.parse().ok())
+            .collect();
+        let dst: SocketAddr = parsed
+            .iter()
+            .find(|s| Some(s.ip()) == our_worker_ip)
+            .or_else(|| parsed.iter().find(|s| !is_lan_addr(s.ip())))
+            .copied()?;
         let carrier = Carrier::relay(a.conn.clone(), dst);
         let link = ReadyLink {
             node_id: *node_id,
@@ -262,6 +284,25 @@ impl RelayCoordinator {
         self.pending.remove(node_id);
         self.allocated.remove(node_id);
         self.advertised.remove(node_id);
+    }
+}
+
+/// rc.138 — is `ip` a private/LAN (non-relay) address? Used to keep
+/// `try_build` from dialing a peer's LAN endpoint as its "relay". Covers RFC
+/// 1918, link-local, loopback, and the overlay/CGNAT `100.64.0.0/10` — so the
+/// coturn-relayed public addresses (94.130.141.74, 5.9.157.x) are the only
+/// ones that pass through.
+fn is_lan_addr(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            v4.is_private()
+                || v4.is_link_local()
+                || v4.is_loopback()
+                || v4.is_unspecified()
+                || (o[0] == 100 && (64..=127).contains(&o[1])) // CGNAT / overlay
+        }
+        IpAddr::V6(v6) => v6.is_loopback() || (v6.segments()[0] & 0xffc0) == 0xfe80,
     }
 }
 
@@ -470,6 +511,68 @@ mod tests {
             vec!["192.168.68.5:51820".to_string()],
             "LAN endpoint must persist; only the relay is pruned"
         );
+    }
+
+    #[test]
+    fn is_lan_addr_keeps_only_relay_publics() {
+        let lan = |s: &str| is_lan_addr(s.parse().unwrap());
+        // LAN / private / overlay → true (must NOT be dialed as a relay).
+        assert!(lan("192.168.0.241")); // Wi-Fi
+        assert!(lan("172.31.176.1")); // WSL / vEthernet
+        assert!(lan("172.26.0.1"));
+        assert!(lan("10.16.6.34")); // corp
+        assert!(lan("169.254.1.2")); // link-local
+        assert!(lan("100.64.0.2")); // overlay/CGNAT
+        // coturn-relayed publics → false (these ARE the relay address).
+        assert!(!lan("94.130.141.74")); // mars
+        assert!(!lan("5.9.157.221")); // hetzner coturn
+        assert!(!lan("5.9.157.226"));
+    }
+
+    #[test]
+    fn relay_dst_picks_worker_then_public_never_lan() {
+        // The selection logic from `try_build`, isolated: given the peer's
+        // unioned endpoints (LAN first, rc.135) and our coturn worker IP, dial
+        // the peer's relay on our worker — never the LAN address.
+        let our_worker: std::net::IpAddr = "94.130.141.74".parse().unwrap();
+        let endpoints = [
+            "192.168.0.241:64392".to_string(), // peer LAN (first) — must skip
+            "172.26.0.1:64392".to_string(),    // peer virtual — must skip
+            "94.130.141.74:11947".to_string(), // peer relay on OUR worker — pick
+            "5.9.157.221:10000".to_string(),   // peer relay on another worker
+        ];
+        let parsed: Vec<SocketAddr> = endpoints.iter().filter_map(|e| e.parse().ok()).collect();
+        let dst = parsed
+            .iter()
+            .find(|s| s.ip() == our_worker)
+            .or_else(|| parsed.iter().find(|s| !is_lan_addr(s.ip())))
+            .copied()
+            .unwrap();
+        assert_eq!(dst, "94.130.141.74:11947".parse::<SocketAddr>().unwrap());
+
+        // No relay on our worker → fall back to ANY public, still never LAN.
+        let only_other = [
+            "192.168.0.241:64392".to_string(),
+            "5.9.157.221:10000".to_string(),
+        ];
+        let parsed: Vec<SocketAddr> = only_other.iter().filter_map(|e| e.parse().ok()).collect();
+        let dst = parsed
+            .iter()
+            .find(|s| s.ip() == our_worker)
+            .or_else(|| parsed.iter().find(|s| !is_lan_addr(s.ip())))
+            .copied()
+            .unwrap();
+        assert_eq!(dst, "5.9.157.221:10000".parse::<SocketAddr>().unwrap());
+
+        // Only LAN advertised → None (don't dial LAN as relay; wait for relay).
+        let only_lan = ["192.168.0.241:64392".to_string()];
+        let parsed: Vec<SocketAddr> = only_lan.iter().filter_map(|e| e.parse().ok()).collect();
+        let dst = parsed
+            .iter()
+            .find(|s| s.ip() == our_worker)
+            .or_else(|| parsed.iter().find(|s| !is_lan_addr(s.ip())))
+            .copied();
+        assert!(dst.is_none());
     }
 
     #[test]
