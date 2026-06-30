@@ -75,8 +75,14 @@ const BAD_SWEEPS_TO_FALLBACK: u32 = 3;
 /// long — it stays on relay, then re-attempts direct (auto-recovers when the
 /// blocking condition clears, e.g. the VPN disconnects).
 const DIRECT_COOLDOWN: Duration = Duration::from_secs(60);
-/// How often the fallback sweep runs. Cheap now (lock-free atomic reads), so a
-/// tighter cadence is fine and makes detection quicker.
+/// rc.139 — a dead RELAY carrier (one-way, same `tx>rx` signal) is usually a
+/// STALE coturn port: the peer re-allocated (restart/churn → new port) and we
+/// kept dialing the old one. Refresh it (re-request → fresh allocation, re-dial
+/// the peer's CURRENT address) — but not more than once per this window, so two
+/// ends each refreshing don't ping-pong faster than they can converge.
+const RELAY_REFRESH_COOLDOWN: Duration = Duration::from_secs(30);
+/// How often the carrier-health sweep runs. Cheap (lock-free atomic reads), so
+/// a tighter cadence is fine and makes detection quicker.
 const FALLBACK_TICK: Duration = Duration::from_secs(5);
 
 /// Overlay control events the runtime consumes, fed in from the node's
@@ -265,6 +271,8 @@ impl OverlayRuntime {
         // rc.136 — peers whose DIRECT carrier just failed: don't retry direct
         // until the Instant (they stay on relay). Auto-expires → direct retried.
         let mut direct_cooldown: HashMap<ObjectId, Instant> = HashMap::new();
+        // rc.139 — peers whose stale relay was just refreshed (anti-ping-pong).
+        let mut relay_refresh_cooldown: HashMap<ObjectId, Instant> = HashMap::new();
         // Latest netmap view (node_id → peer), so the fallback sweep can drive
         // the relay path for a downgraded peer without waiting for a netmap.
         let mut current_peers: HashMap<ObjectId, NetmapPeer> =
@@ -309,9 +317,9 @@ impl OverlayRuntime {
                 // switch the peer to relay (with a cooldown so the next netmap
                 // doesn't immediately re-upgrade it to direct).
                 _ = fallback.tick() => {
-                    self.sweep_direct_fallback(
+                    self.sweep_carrier_health(
                         &mut wg, &mut by_node, &mut relay, &tun,
-                        &mut direct_cooldown, &current_peers,
+                        &mut direct_cooldown, &mut relay_refresh_cooldown, &current_peers,
                     ).await;
                 },
                 evt = events.recv() => match evt {
@@ -351,28 +359,34 @@ impl OverlayRuntime {
         inbound.abort();
     }
 
-    /// rc.137 — find DIRECT carriers that are one-way / dead and fall them back
-    /// to relay. Health is LOCK-FREE: each sweep snapshots `(tx, rx)` (atomic
-    /// reads — no `Tunn` lock, so it can't stall the packet path like the
-    /// rc.136 handshake-age check did) and a carrier where **tx climbed but rx
-    /// stayed flat** for [`BAD_SWEEPS_TO_FALLBACK`] consecutive sweeps is
-    /// dead (we're sending, nothing comes back — corp VPN route hijack, Wi-Fi
-    /// AP/client isolation, asymmetric firewall). Each downgraded peer gets a
-    /// [`DIRECT_COOLDOWN`] and its relay leg is requested immediately.
-    async fn sweep_direct_fallback(
+    /// rc.137/139 — find carriers that are one-way / dead and repair them.
+    /// Health is LOCK-FREE: each sweep snapshots `(tx, rx)` (atomic reads — no
+    /// `Tunn` lock, so it can't stall the packet path like the rc.136
+    /// handshake-age check did); a carrier where **tx climbed but rx stayed
+    /// flat** for [`BAD_SWEEPS_TO_FALLBACK`] consecutive sweeps is dead (we're
+    /// sending, nothing comes back). The repair depends on the carrier kind:
+    /// - **direct** → fall back to relay (the LAN path only LOOKED viable —
+    ///   corp VPN route hijack, Wi-Fi AP/client isolation, asymmetric firewall);
+    ///   [`DIRECT_COOLDOWN`] keeps the next netmap from re-upgrading it.
+    /// - **relay** (rc.139) → refresh it: the peer almost certainly
+    ///   re-allocated its coturn port (restart/churn) and we're dialing a stale
+    ///   one. Re-request so we re-allocate + re-dial the peer's CURRENT address
+    ///   ([`RELAY_REFRESH_COOLDOWN`] bounds two ends ping-ponging).
+    #[allow(clippy::too_many_arguments)]
+    async fn sweep_carrier_health(
         &self,
         wg: &mut WgDevice,
         by_node: &mut HashMap<ObjectId, Installed>,
         relay: &mut Option<RelayCoordinator>,
         tun: &Arc<dyn TunIo>,
         direct_cooldown: &mut HashMap<ObjectId, Instant>,
+        relay_refresh_cooldown: &mut HashMap<ObjectId, Instant>,
         current_peers: &HashMap<ObjectId, NetmapPeer>,
     ) {
-        let mut dead: Vec<ObjectId> = Vec::new();
+        let now = Instant::now();
+        // (node_id, was_direct)
+        let mut dead: Vec<(ObjectId, bool)> = Vec::new();
         for (nid, e) in by_node.iter_mut() {
-            if !e.is_direct {
-                continue;
-            }
             let Some((tx, rx)) = wg.peer_traffic(&e.pubkey) else {
                 continue;
             };
@@ -390,24 +404,44 @@ impl OverlayRuntime {
                 e.bad_sweeps = 0;
             }
             if e.bad_sweeps >= BAD_SWEEPS_TO_FALLBACK {
-                dead.push(*nid);
+                // For a relay, hold off if we just refreshed it (anti-ping-pong).
+                if !e.is_direct
+                    && relay_refresh_cooldown
+                        .get(nid)
+                        .is_some_and(|&until| until > now)
+                {
+                    continue;
+                }
+                dead.push((*nid, e.is_direct));
             }
         }
-        for nid in dead {
+        for (nid, was_direct) in dead {
             let Some(e) = by_node.remove(&nid) else {
                 continue;
             };
             wg.remove_peer(&e.pubkey).await;
             tun.del_peer_route(e.overlay_ip).await;
-            direct_cooldown.insert(nid, Instant::now() + DIRECT_COOLDOWN);
-            warn!(
-                peer = %nid,
-                "overlay: direct LAN carrier didn't establish (VPN / AP-isolation / firewall?) — falling back to relay"
-            );
-            // Drive the relay leg now (don't wait for the next netmap).
+            if was_direct {
+                direct_cooldown.insert(nid, now + DIRECT_COOLDOWN);
+                warn!(
+                    peer = %nid,
+                    "overlay: direct LAN carrier didn't establish (VPN / AP-isolation / firewall?) — falling back to relay"
+                );
+            } else {
+                relay_refresh_cooldown.insert(nid, now + RELAY_REFRESH_COOLDOWN);
+                warn!(
+                    peer = %nid,
+                    "overlay: relay carrier one-way (stale coturn port?) — re-allocating"
+                );
+            }
+            // (Re)request the relay now (don't wait for the next netmap). For a
+            // refresh we first forget the stale allocation so a fresh one is made.
             if let (Some(coord), Some(np)) = (relay.as_mut(), current_peers.get(&nid))
                 && let Some(cfg) = peer_config_from_netmap(np)
             {
+                if !was_direct {
+                    coord.forget(&nid);
+                }
                 coord.request(nid, cfg).await;
             }
         }
