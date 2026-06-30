@@ -48,33 +48,36 @@ struct DirectCtx {
 }
 
 /// An installed peer carrier + the bookkeeping the direct→relay fallback
-/// (rc.136) needs.
+/// (rc.136/137) needs.
 struct Installed {
     pubkey: [u8; 32],
     overlay_ip: Ipv4Addr,
     /// `true` if reached over the direct LAN socket, `false` over the relay.
     is_direct: bool,
-    /// When this carrier was installed — for the never-established timeout.
+    /// When this carrier was installed — for the warm-up grace period.
     since: Instant,
+    /// Last `(tx, rx)` snapshot from the previous sweep (rc.137 lock-free
+    /// health). Only meaningful for direct carriers.
+    last_traffic: (u64, u64),
+    /// Consecutive sweeps where we sent but received nothing (tx grew, rx
+    /// flat). A few in a row ⇒ the direct carrier is one-way / dead.
+    bad_sweeps: u32,
 }
 
-/// How long to wait for a DIRECT carrier's first handshake before giving up
-/// and falling back to relay. WG retries every ~5 s (REKEY_TIMEOUT), so 20 s
-/// is ~4 attempts — enough to rule out a viable LAN path, fast enough that a
-/// "looks same-subnet but isn't reachable" peer (corp full-tunnel VPN, Wi-Fi
-/// AP/client isolation, asymmetric firewall) doesn't stay dark for long.
-const DIRECT_HS_TIMEOUT: Duration = Duration::from_secs(20);
-/// A direct carrier that DID handshake but has gone this long without a fresh
-/// one is treated as broken (the path died mid-session — e.g. a VPN connected
-/// after the link was up). Above WG's ~2-minute rekey interval so an idle but
-/// healthy link isn't false-flagged.
-const DIRECT_STALE: Duration = Duration::from_secs(150);
+/// Grace after install before the fallback can fire — lets the bilateral
+/// handshake + first packets flow before we judge the carrier.
+const DIRECT_GRACE: Duration = Duration::from_secs(8);
+/// Consecutive bad sweeps (sent, received nothing) before falling back. At the
+/// 5 s tick that's ~15 s of one-way traffic — long enough to ignore a blip,
+/// short enough that a VPN/AP-isolation break doesn't stay dark for long.
+const BAD_SWEEPS_TO_FALLBACK: u32 = 3;
 /// After a direct carrier fails, don't retry direct for this peer for this
 /// long — it stays on relay, then re-attempts direct (auto-recovers when the
 /// blocking condition clears, e.g. the VPN disconnects).
 const DIRECT_COOLDOWN: Duration = Duration::from_secs(60);
-/// How often the fallback sweep runs.
-const FALLBACK_TICK: Duration = Duration::from_secs(10);
+/// How often the fallback sweep runs. Cheap now (lock-free atomic reads), so a
+/// tighter cadence is fine and makes detection quicker.
+const FALLBACK_TICK: Duration = Duration::from_secs(5);
 
 /// Overlay control events the runtime consumes, fed in from the node's
 /// signaling loop (the `ServerMsg::Overlay*` handlers forward these).
@@ -348,10 +351,13 @@ impl OverlayRuntime {
         inbound.abort();
     }
 
-    /// rc.136 — find DIRECT carriers that aren't (or are no longer) healthy and
-    /// fall them back to relay. `handshake_age == None` past
-    /// [`DIRECT_HS_TIMEOUT`] = never established; `Some(age) >= DIRECT_STALE` =
-    /// established then died. Each downgraded peer is put on a
+    /// rc.137 — find DIRECT carriers that are one-way / dead and fall them back
+    /// to relay. Health is LOCK-FREE: each sweep snapshots `(tx, rx)` (atomic
+    /// reads — no `Tunn` lock, so it can't stall the packet path like the
+    /// rc.136 handshake-age check did) and a carrier where **tx climbed but rx
+    /// stayed flat** for [`BAD_SWEEPS_TO_FALLBACK`] consecutive sweeps is
+    /// dead (we're sending, nothing comes back — corp VPN route hijack, Wi-Fi
+    /// AP/client isolation, asymmetric firewall). Each downgraded peer gets a
     /// [`DIRECT_COOLDOWN`] and its relay leg is requested immediately.
     async fn sweep_direct_fallback(
         &self,
@@ -362,17 +368,28 @@ impl OverlayRuntime {
         direct_cooldown: &mut HashMap<ObjectId, Instant>,
         current_peers: &HashMap<ObjectId, NetmapPeer>,
     ) {
-        // Collect first (the health check awaits, and the action mutates).
         let mut dead: Vec<ObjectId> = Vec::new();
-        for (nid, e) in by_node.iter() {
+        for (nid, e) in by_node.iter_mut() {
             if !e.is_direct {
                 continue;
             }
-            let unhealthy = match wg.handshake_age(&e.pubkey).await {
-                None => e.since.elapsed() >= DIRECT_HS_TIMEOUT,
-                Some(age) => age >= DIRECT_STALE,
+            let Some((tx, rx)) = wg.peer_traffic(&e.pubkey) else {
+                continue;
             };
-            if unhealthy {
+            let (last_tx, last_rx) = e.last_traffic;
+            e.last_traffic = (tx, rx);
+            // Warm-up grace: let the handshake + first packets flow.
+            if e.since.elapsed() < DIRECT_GRACE {
+                continue;
+            }
+            // Sent this interval but received nothing back ⇒ suspect. (If we
+            // didn't send either, the link is just idle — no judgment.)
+            if tx > last_tx && rx == last_rx {
+                e.bad_sweeps += 1;
+            } else {
+                e.bad_sweeps = 0;
+            }
+            if e.bad_sweeps >= BAD_SWEEPS_TO_FALLBACK {
                 dead.push(*nid);
             }
         }
@@ -556,6 +573,8 @@ impl OverlayRuntime {
                 overlay_ip: cfg.overlay_ip,
                 is_direct: true,
                 since: Instant::now(),
+                last_traffic: (0, 0),
+                bad_sweeps: 0,
             },
         );
         if let Err(e) = tun.add_peer_route(cfg.overlay_ip).await {
@@ -596,6 +615,8 @@ impl OverlayRuntime {
                 overlay_ip: link.overlay_ip,
                 is_direct,
                 since: Instant::now(),
+                last_traffic: (0, 0),
+                bad_sweeps: 0,
             },
         );
         // Host `/32` so overlay traffic to this peer beats any colliding
