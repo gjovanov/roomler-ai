@@ -831,6 +831,53 @@ mod tests {
         conn.close(0u32.into(), b"done");
         let _ = srv.await;
     }
+
+    /// Overlay carrier (Phase 1): WG-over-QUIC **datagrams** ride a
+    /// `RelayUdpSocket`. Asserts both ends' datagram budget fits a 1280-MTU WG
+    /// packet (≈1312 B) and round-trips one each way — the raw material the
+    /// `Carrier::QuicRelay` carrier is built from.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn quinn_datagrams_over_relay_socket() {
+        use crate::transport::quic::QuicPeer;
+        use bytes::Bytes;
+
+        let (conn_s, addr_s) = udp_relay().await;
+        let (conn_c, _addr_c) = udp_relay().await;
+        let server_sock = Arc::new(RelayUdpSocket::new(conn_s).unwrap());
+        let client_sock = Arc::new(RelayUdpSocket::new(conn_c).unwrap());
+
+        let server =
+            QuicPeer::server_over_relay_datagram(server_sock).expect("datagram server over relay");
+        let client =
+            QuicPeer::client_over_relay_datagram(client_sock).expect("datagram client over relay");
+
+        let srv = tokio::spawn(async move {
+            let conn = server.accept().await.expect("incoming").expect("handshake");
+            assert!(
+                conn.max_datagram_size().unwrap_or(0) >= 1312,
+                "server datagram budget must fit a 1280-MTU WG packet"
+            );
+            let d = conn.read_datagram().await.expect("read datagram");
+            assert_eq!(d.len(), 1312);
+            assert!(d.iter().all(|&b| b == 0x42), "payload intact");
+            conn.send_datagram(Bytes::from(vec![0x24u8; 1312]))
+                .expect("send reply datagram");
+            conn.closed().await;
+        });
+
+        let conn = client.connect(addr_s).await.expect("connect over relay");
+        assert!(
+            conn.max_datagram_size().unwrap_or(0) >= 1312,
+            "client datagram budget must fit a 1280-MTU WG packet"
+        );
+        conn.send_datagram(Bytes::from(vec![0x42u8; 1312]))
+            .expect("send datagram");
+        let reply = conn.read_datagram().await.expect("read reply");
+        assert_eq!(reply.len(), 1312);
+        assert!(reply.iter().all(|&b| b == 0x24), "reply payload intact");
+        conn.close(0u32.into(), b"done");
+        let _ = srv.await;
+    }
 }
 
 #[cfg(test)]

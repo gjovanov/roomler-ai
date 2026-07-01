@@ -47,6 +47,11 @@ use super::{Capabilities, TRANSPORT_QUIC_V1, Transport};
 /// the TLS handshake fails (a cheap version/role guard).
 const ALPN: &[u8] = b"roomler-tunnel-quic-v1";
 
+/// ALPN id for the overlay's WG-over-QUIC **datagram** carrier. Distinct from
+/// [`ALPN`] so a stream-tunnel endpoint and a datagram endpoint can never
+/// complete a handshake against each other (mismatched ALPN → clean failure).
+const OVERLAY_ALPN: &[u8] = b"roomler-overlay-wg-v1";
+
 /// Placeholder SNI — the client pins by cert fingerprint, not by name,
 /// so the value only needs to be a syntactically-valid DNS name.
 const SNI: &str = "roomler-tunnel";
@@ -155,6 +160,33 @@ fn quic_transport_config() -> Arc<quinn::TransportConfig> {
     Arc::new(t)
 }
 
+/// Transport config for the overlay's WG-over-QUIC **datagram** carrier —
+/// distinct from the stream-tunnel [`quic_transport_config`]. Same 8 s
+/// keepalive / 30 s idle (keeps the coturn permission fresh + the connection
+/// from idle-closing), but raises `initial_mtu` so a full 1280-MTU WireGuard
+/// packet (≈1312 B ciphertext) fits ONE QUIC datagram: quinn's usable datagram
+/// ≈ `current_mtu − 38`, and the default `initial_mtu` of 1200 yields only
+/// ~1162 B — too small. 1400 → ~1362 B usable (≥1312 with ~50 B margin, since
+/// the exact overhead varies with connection-ID length); PLPMTUD may climb
+/// higher. Wire frame stays ≈1432 B (1400 + coturn ChannelData 4 + UDP/IP 28)
+/// < 1500 on both relay legs → no fragmentation. Stream windows are irrelevant
+/// (this carrier only sends datagrams) so they're left default; datagrams
+/// themselves are on by quinn default (`datagram_receive_buffer_size = Some(..)`).
+fn overlay_datagram_transport_config() -> Arc<quinn::TransportConfig> {
+    let mut t = quinn::TransportConfig::default();
+    t.keep_alive_interval(Some(Duration::from_secs(8)));
+    t.max_idle_timeout(Some(
+        quinn::IdleTimeout::try_from(Duration::from_secs(30)).expect("30s is a valid idle timeout"),
+    ));
+    // ≥ 1312 (WG over MTU 1280) + ~38 (quinn 1-RTT + datagram-frame overhead),
+    // with margin; wire frame ≈1432 B < 1500 so it won't fragment over coturn.
+    t.initial_mtu(1400);
+    // Absorb a short burst of WG packets before the congestion controller drains
+    // them (datagrams stay lossy under it — this only bounds the send queue).
+    t.datagram_send_buffer_size(256 * 1024);
+    Arc::new(t)
+}
+
 /// Build the quinn server config (TLS1.3, ephemeral self-signed cert,
 /// ALPN) shared by [`QuicPeer::server`] and
 /// [`QuicPeer::server_from_socket`]. Returns the config plus the cert
@@ -197,6 +229,51 @@ fn build_client_config(pinned_fingerprint_hex: &str) -> Result<ClientConfig> {
     let qcc = QuicClientConfig::try_from(tls).context("quic client config from rustls")?;
     let mut client_config = ClientConfig::new(Arc::new(qcc));
     client_config.transport_config(quic_transport_config());
+    Ok(client_config)
+}
+
+/// Server config for the overlay WG-over-QUIC datagram carrier — an ephemeral
+/// self-signed cert like [`build_server_config`], but the datagram transport
+/// config + the overlay ALPN. No fingerprint is returned: the datagram client
+/// accepts any cert (WG authenticates inside — see [`build_client_config_insecure`]).
+fn build_server_config_datagram() -> Result<ServerConfig> {
+    let certified = rcgen::generate_simple_self_signed(vec![SNI.to_string()])
+        .context("rcgen ephemeral self-signed cert")?;
+    let cert_der = CertificateDer::from(certified.cert.der().to_vec());
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()));
+    let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(provider()))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .context("quic overlay server: tls13-only")?
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key)
+        .context("quic overlay server: single cert")?;
+    tls.alpn_protocols = vec![OVERLAY_ALPN.to_vec()];
+    let qsc = QuicServerConfig::try_from(tls).context("quic overlay server config from rustls")?;
+    let mut server_config = ServerConfig::with_crypto(Arc::new(qsc));
+    server_config.transport_config(overlay_datagram_transport_config());
+    Ok(server_config)
+}
+
+/// Client config for the overlay WG-over-QUIC datagram carrier — accepts ANY
+/// server cert. SOUND here because WireGuard Noise (Curve25519 netmap keys) is
+/// the end-to-end auth boundary INSIDE the QUIC datagrams: coturn and any
+/// on-path party only ever see WG ciphertext wrapped in QUIC, and a MITM who
+/// swapped the QUIC cert still cannot pass the WG handshake. So per-node
+/// cert-fingerprint plumbing would buy zero security; QUIC TLS is transport-only.
+fn build_client_config_insecure() -> Result<ClientConfig> {
+    let verifier = Arc::new(InsecureServerVerifier {
+        provider: Arc::new(provider()),
+    });
+    let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(provider()))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .context("quic overlay client: tls13-only")?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![OVERLAY_ALPN.to_vec()];
+    let qcc = QuicClientConfig::try_from(tls).context("quic overlay client config from rustls")?;
+    let mut client_config = ClientConfig::new(Arc::new(qcc));
+    client_config.transport_config(overlay_datagram_transport_config());
     Ok(client_config)
 }
 
@@ -284,6 +361,39 @@ impl QuicPeer {
         )
         .context("quic client endpoint over abstract socket")?;
         endpoint.set_default_client_config(build_client_config(pinned_fingerprint_hex)?);
+        Ok(Self { endpoint })
+    }
+
+    /// Overlay carrier: a QUIC **server** endpoint that carries WireGuard as
+    /// unreliable datagrams over a [`crate::transport::relay::RelayUdpSocket`]
+    /// (a coturn allocation). Datagram-tuned transport (`initial_mtu=1350`,
+    /// 8 s keepalive), transport-only TLS (accept-any-cert client). The peer
+    /// dials this endpoint's relayed `local_addr`.
+    pub fn server_over_relay_datagram(socket: Arc<dyn quinn::AsyncUdpSocket>) -> Result<Self> {
+        let cfg = build_server_config_datagram()?;
+        let runtime = quinn::default_runtime().context("no async runtime for quinn endpoint")?;
+        let endpoint = Endpoint::new_with_abstract_socket(
+            quinn::EndpointConfig::default(),
+            Some(cfg),
+            socket,
+            runtime,
+        )
+        .context("quic overlay-datagram server endpoint")?;
+        Ok(Self { endpoint })
+    }
+
+    /// Overlay carrier: client analogue of [`server_over_relay_datagram`].
+    /// Accepts any server cert (WG Noise is the auth boundary inside).
+    pub fn client_over_relay_datagram(socket: Arc<dyn quinn::AsyncUdpSocket>) -> Result<Self> {
+        let runtime = quinn::default_runtime().context("no async runtime for quinn endpoint")?;
+        let mut endpoint = Endpoint::new_with_abstract_socket(
+            quinn::EndpointConfig::default(),
+            None,
+            socket,
+            runtime,
+        )
+        .context("quic overlay-datagram client endpoint")?;
+        endpoint.set_default_client_config(build_client_config_insecure()?);
         Ok(Self { endpoint })
     }
 
@@ -450,6 +560,64 @@ impl ServerCertVerifier for FingerprintVerifier {
                 "quic: server cert fingerprint mismatch (pin failed)".into(),
             ))
         }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// rustls server-cert verifier that trusts ANY presented cert. Used ONLY by the
+/// overlay WG-over-QUIC datagram carrier, where WireGuard Noise is the real
+/// end-to-end auth boundary (see [`build_client_config_insecure`]). TLS
+/// signature checks still run via the `ring` provider — only the trust-anchor
+/// decision is a no-op, so this is not a downgrade to unauthenticated TLS, it's
+/// a deliberate "the cert identity doesn't matter, WG does" posture.
+#[derive(Debug)]
+struct InsecureServerVerifier {
+    provider: Arc<CryptoProvider>,
+}
+
+impl ServerCertVerifier for InsecureServerVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
     }
 
     fn verify_tls12_signature(

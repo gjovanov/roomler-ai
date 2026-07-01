@@ -33,7 +33,7 @@ use super::direct;
 use super::netmap::{PeerConfig, peer_config_from_netmap};
 use super::relay_link::{ReadyLink, RelayCoordinator};
 use super::tun::TunIo;
-use super::wg::{Carrier, WgDevice};
+use super::wg::{Carrier, QUIC_BUILD_TIMEOUT, WG_OVERHEAD, WgDevice, overlay_quic_enabled};
 use roomler_ai_remote_control::signaling::{ClientMsg, IceServer, NetmapPeer, OverlayNetworkInfo};
 
 /// rc.131/132 — direct LAN carrier context. A shared UDP socket peers dial,
@@ -551,6 +551,7 @@ impl OverlayRuntime {
                             public_key: cfg.public_key,
                             overlay_ip: cfg.overlay_ip,
                             carrier,
+                            relay_parts: None,
                         },
                     )
                     .await;
@@ -639,9 +640,43 @@ impl OverlayRuntime {
         // inbound, so the handshake completes. The relay path never hit this
         // because its ciphertext rides the agent's OWN outbound TURN
         // connection (already a stateful hole).
-        let initiate = link.carrier.is_direct() || self.keypair.public.to_bytes() < link.public_key;
-        let is_direct = link.carrier.is_direct();
-        wg.add_peer(link.public_key, link.overlay_ip, link.carrier, initiate);
+        // Optional QUIC-over-TURN upgrade of a relay carrier (opt-in, default
+        // OFF via `overlay_quic_enabled`). QUIC's congestion control smooths the
+        // relay's buffer-bloat latency spikes and its keepalive holds the TURN
+        // permission fresh. On ANY handshake failure/timeout we fall back to the
+        // already-built raw relay carrier, so the upgrade can only improve —
+        // never break — the link.
+        let carrier = if overlay_quic_enabled() && link.relay_parts.is_some() {
+            let (conn, dst) = link.relay_parts.clone().unwrap();
+            // Deterministic role: the lexicographically-smaller pubkey serves
+            // (same rule as the WG relay initiator, so both ends agree on who
+            // dials vs accepts).
+            let am_server = self.keypair.public.to_bytes() < link.public_key;
+            match Carrier::quic_relay(
+                conn,
+                dst,
+                am_server,
+                self.mtu as usize + WG_OVERHEAD,
+                QUIC_BUILD_TIMEOUT,
+            )
+            .await
+            {
+                Ok(q) => {
+                    info!(peer = %link.node_id, %dst, "overlay: QUIC-over-TURN carrier up");
+                    q
+                }
+                Err(e) => {
+                    warn!(peer = %link.node_id, %e, "overlay: QUIC carrier build failed; using raw relay");
+                    link.carrier
+                }
+            }
+        } else {
+            link.carrier
+        };
+
+        let initiate = carrier.is_direct() || self.keypair.public.to_bytes() < link.public_key;
+        let is_direct = carrier.is_direct();
+        wg.add_peer(link.public_key, link.overlay_ip, carrier, initiate);
         by_node.insert(
             link.node_id,
             Installed {
