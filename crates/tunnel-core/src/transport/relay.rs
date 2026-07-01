@@ -24,7 +24,7 @@
 
 use std::fmt;
 use std::io::{self, IoSliceMut};
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::task::{Context, Poll};
@@ -404,8 +404,8 @@ pub fn turn_udp_server(urls: &[String]) -> Option<String> {
 /// path most likely to traverse — try it before `:5349`. `turn:` (plain) +
 /// TURNS-over-UDP (DTLS) are skipped (the adapter rides TCP only).
 /// De-duped.
-pub fn turn_tls_servers(urls: &[String]) -> Vec<(String, u16)> {
-    let mut out: Vec<(String, u16)> = Vec::new();
+pub fn turn_tls_servers(urls: &[String]) -> Vec<(String, u16, Option<IpAddr>)> {
+    let mut out: Vec<(String, u16, Option<IpAddr>)> = Vec::new();
     for url in urls {
         let Some(rest) = url.strip_prefix("turns:") else {
             continue; // skip stun: / plain turn:
@@ -421,24 +421,34 @@ pub fn turn_tls_servers(urls: &[String]) -> Vec<(String, u16)> {
         if !is_tcp {
             continue; // no transport=tcp ⇒ DTLS/UDP, which the adapter can't ride
         }
+        // rc.140: an optional `&pin=<ip>` names the coturn worker to DIAL while
+        // the URL host stays the hostname for TLS SNI + cert verification — so
+        // the deterministic same-worker hairpin survives TURNS on UDP-blocked
+        // corp VPNs. Dialing the IP AS the host would verify coturn's DNS-only
+        // cert against an IP literal → NotValidForName → handshake failure.
+        let pin = query.and_then(|q| {
+            q.split('&')
+                .find_map(|kv| kv.strip_prefix("pin="))
+                .and_then(|v| v.parse::<IpAddr>().ok())
+        });
         // rsplit so a bare hostname:port splits correctly (coturn URLs use a
         // hostname, never a bracketed IPv6 literal, so this is safe).
         if let Some((host, port_str)) = hostport.rsplit_once(':')
             && let Ok(port) = port_str.parse::<u16>()
             && !host.is_empty()
-            && !out.iter().any(|(h, p)| h == host && *p == port)
+            && !out.iter().any(|(h, p, _)| h == host && *p == port)
         {
-            out.push((host.to_string(), port));
+            out.push((host.to_string(), port, pin));
         }
     }
     // :443 (alt-tls, corp-friendly) first; stable otherwise (keeps list order).
-    out.sort_by_key(|(_, p)| u16::from(*p != 443));
+    out.sort_by_key(|(_, p, _)| u16::from(*p != 443));
     out
 }
 
 /// First TLS-over-TCP TURN server (`:443`-preferred). Back-compat wrapper
 /// over [`turn_tls_servers`].
-pub fn turn_tls_server(urls: &[String]) -> Option<(String, u16)> {
+pub fn turn_tls_server(urls: &[String]) -> Option<(String, u16, Option<IpAddr>)> {
     turn_tls_servers(urls).into_iter().next()
 }
 
@@ -510,10 +520,11 @@ pub async fn allocate_relay_from_ice(
     }
 
     // Tier 3: each TURNS/TCP relay candidate (:443 first; UDP-blocked nets).
-    for (host, port) in turn_tls_servers(urls) {
+    for (host, port, pin) in turn_tls_servers(urls) {
         match allocate_turn_relay_tls(
             &host,
             port,
+            pin,
             username.to_string(),
             credential.to_string(),
             DEFAULT_TURN_REALM.to_string(),
@@ -526,7 +537,7 @@ pub async fn allocate_relay_from_ice(
                 // rustls error (e.g. "invalid peer certificate: NotValidForName"
                 // = SNI/cert-name mismatch, vs "UnknownIssuer"/handshake reset =
                 // a genuine middlebox block) — the signal that gates the fix.
-                tracing::warn!(%host, port, e = format!("{e:#}"), "TURNS/TCP TURN allocate failed; trying next")
+                tracing::warn!(%host, port, ?pin, e = format!("{e:#}"), "TURNS/TCP TURN allocate failed; trying next")
             }
         }
     }
@@ -551,20 +562,28 @@ pub async fn allocate_relay_from_ice(
 pub async fn allocate_turn_relay_tls(
     host: &str,
     port: u16,
+    pin: Option<IpAddr>,
     username: String,
     password: String,
     realm: String,
 ) -> anyhow::Result<TurnRelayConn> {
     use anyhow::Context as _;
 
-    // Resolve once so the TCP connect + `turn_serv_addr` (which the client
-    // formats into its STUN transactions) agree on a concrete SocketAddr;
-    // SNI still uses the hostname for certificate verification.
-    let resolved = tokio::net::lookup_host((host, port))
-        .await
-        .with_context(|| format!("resolve TURNS server {host}:{port}"))?
-        .next()
-        .with_context(|| format!("TURNS server {host}:{port} resolved to no addresses"))?;
+    // Dial the pinned worker IP when the server named one (`&pin=`), else
+    // resolve the hostname (DNS round-robin). EITHER path uses `host` (the
+    // coturn hostname) for TLS SNI + cert verification below, so an IP-pinned
+    // dial still presents a name coturn's DNS-only cert matches — the fix that
+    // lets the deterministic same-worker hairpin survive TURNS on UDP-blocked
+    // corp VPNs. `turn_serv_addr` is set to this dialed addr, so the client's
+    // STUN addressing agrees with the socket.
+    let resolved = match pin {
+        Some(ip) => SocketAddr::new(ip, port),
+        None => tokio::net::lookup_host((host, port))
+            .await
+            .with_context(|| format!("resolve TURNS server {host}:{port}"))?
+            .next()
+            .with_context(|| format!("TURNS server {host}:{port} resolved to no addresses"))?,
+    };
 
     let tcp = tokio::time::timeout(
         TLS_CONNECT_TIMEOUT,
@@ -669,14 +688,14 @@ mod tests {
         ];
         assert_eq!(
             turn_tls_server(&prod),
-            Some(("coturn.roomler.ai".to_string(), 443)),
+            Some(("coturn.roomler.ai".to_string(), 443, None)),
             ":443 must win over :5349 even though :5349 is listed first"
         );
         assert_eq!(
             turn_tls_servers(&prod),
             vec![
-                ("coturn.roomler.ai".to_string(), 443),
-                ("coturn.roomler.ai".to_string(), 5349),
+                ("coturn.roomler.ai".to_string(), 443, None),
+                ("coturn.roomler.ai".to_string(), 5349, None),
             ],
             "plural returns all turns:tcp, :443 first"
         );
@@ -695,6 +714,37 @@ mod tests {
         assert!(turn_tls_servers(&["turn:host:3478?transport=tcp".to_string()]).is_empty());
         assert_eq!(turn_tls_server(&["stun:host:3478".to_string()]), None);
         assert_eq!(turn_tls_server(&[]), None);
+    }
+
+    /// rc.140: `&pin=<ip>` names the coturn worker to DIAL while the URL host
+    /// stays the hostname for TLS SNI + cert verification. turn_tls_servers must
+    /// surface the pin (and yield None for a garbage/absent pin), and the UDP
+    /// enumerator must ignore a stray `&pin=`.
+    #[test]
+    fn turn_tls_servers_extracts_pin_but_keeps_hostname() {
+        assert_eq!(
+            turn_tls_servers(&[
+                "turns:coturn.roomler.ai:443?transport=tcp&pin=94.130.141.74".to_string()
+            ]),
+            vec![(
+                "coturn.roomler.ai".to_string(),
+                443,
+                Some("94.130.141.74".parse::<IpAddr>().unwrap())
+            )],
+            "SNI host stays the hostname; the dial target is the pin"
+        );
+        // Unparseable pin ⇒ None (fall back to hostname DNS resolution).
+        assert_eq!(
+            turn_tls_servers(&[
+                "turns:coturn.roomler.ai:443?transport=tcp&pin=not-an-ip".to_string()
+            ]),
+            vec![("coturn.roomler.ai".to_string(), 443, None)]
+        );
+        // A stray `&pin=` on a UDP url must not confuse the UDP enumerator.
+        assert_eq!(
+            turn_udp_servers(&["turn:1.2.3.4:3478?transport=udp&pin=1.2.3.4".to_string()]),
+            vec!["1.2.3.4:3478".to_string()]
+        );
     }
 
     /// The adapter must faithfully carry datagrams both ways: send via
