@@ -48,6 +48,11 @@ pub struct ReadyLink {
     pub public_key: [u8; 32],
     pub overlay_ip: std::net::Ipv4Addr,
     pub carrier: Arc<Carrier>,
+    /// The raw TURN allocation + peer relayed `dst` behind `carrier` (relay
+    /// carriers only; `None` for direct/test). Lets the runtime optionally
+    /// upgrade the carrier to QUIC-over-TURN in `install_ready`, falling back
+    /// to the already-built raw `carrier` on failure.
+    pub relay_parts: Option<(Arc<dyn RelayConn>, SocketAddr)>,
 }
 
 /// A peer we're coordinating a relay link to, before our allocation exists.
@@ -271,6 +276,7 @@ impl RelayCoordinator {
             public_key: a.peer.public_key,
             overlay_ip: a.peer.overlay_ip,
             carrier,
+            relay_parts: Some((a.conn.clone(), dst)),
         };
         self.allocated.remove(node_id);
         info!(peer = %node_id, %dst, "overlay relay: link ready");
