@@ -514,8 +514,15 @@ fn rewrite_ice_hosts(servers: Vec<IceServer>, host: &str, ip: &str) -> Vec<IceSe
         .into_iter()
         .map(|mut s| {
             for u in s.urls.iter_mut() {
-                // Keep the hostname for TLS URLs (SNI + cert verification).
                 if u.starts_with("turns:") {
+                    // Keep the hostname for TLS SNI + cert verification, and
+                    // append `&pin=<ip>` so the agent DIALS the pinned worker
+                    // while still presenting the hostname coturn's cert matches
+                    // (rc.140) — restores the same-worker hairpin over TURNS.
+                    if !u.contains("pin=") {
+                        let sep = if u.contains('?') { '&' } else { '?' };
+                        u.push_str(&format!("{sep}pin={ip}"));
+                    }
                     continue;
                 }
                 *u = u.replace(host, ip);
@@ -608,10 +615,11 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_ice_hosts_pins_udp_but_keeps_turns_hostname() {
-        // The pinned worker IP belongs on the UDP/STUN URLs (no TLS) but must
-        // NOT replace the hostname on `turns:` (TLS) URLs — the agent verifies
-        // coturn's DNS cert against the SNI, and an IP literal → NotValidForName.
+    fn rewrite_ice_hosts_pins_udp_ip_but_turns_keeps_hostname_plus_pin() {
+        // The pinned worker IP replaces the hostname on UDP/STUN URLs (no TLS),
+        // but `turns:` (TLS) URLs keep the hostname for SNI/cert verification and
+        // instead get a `&pin=<ip>` dial hint — an IP host would fail cert
+        // verification (NotValidForName), yet we still need the same-worker pin.
         let servers = vec![IceServer {
             urls: vec![
                 "stun:coturn.roomler.ai:3478".to_string(),
@@ -630,8 +638,8 @@ mod tests {
                 "stun:94.130.141.74:3478".to_string(),
                 "turn:94.130.141.74:3478?transport=udp".to_string(),
                 "turn:94.130.141.74:443?transport=udp".to_string(),
-                "turns:coturn.roomler.ai:443?transport=tcp".to_string(),
-                "turns:coturn.roomler.ai:5349?transport=tcp".to_string(),
+                "turns:coturn.roomler.ai:443?transport=tcp&pin=94.130.141.74".to_string(),
+                "turns:coturn.roomler.ai:5349?transport=tcp&pin=94.130.141.74".to_string(),
             ]
         );
     }
