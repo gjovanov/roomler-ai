@@ -498,11 +498,27 @@ async fn overlay_ice_servers(state: &AppState, pair_key: &str) -> Vec<IceServer>
         return servers;
     };
     let ip_s = ip.to_string();
+    rewrite_ice_hosts(servers, &host, &ip_s)
+}
+
+/// Rewrite the coturn hostname to the pinned worker `ip` in every ICE URL —
+/// EXCEPT `turns:` (TLS) URLs, which keep the hostname so the agent's TLS SNI +
+/// certificate verification match coturn's DNS-only cert. Pinning the worker IP
+/// is correct for the UDP tier (no TLS); on the TURNS/TCP tier an IP host makes
+/// rustls verify a DNS cert against an IP literal → `NotValidForName` → the
+/// handshake fails on the UDP-blocked corp VPNs that are the ONLY nets to reach
+/// Tier 3. The same-worker hairpin for TURNS is restored separately via a
+/// `&pin=` dial hint (rc.140); here we simply leave `turns:` hostnames intact.
+fn rewrite_ice_hosts(servers: Vec<IceServer>, host: &str, ip: &str) -> Vec<IceServer> {
     servers
         .into_iter()
         .map(|mut s| {
             for u in s.urls.iter_mut() {
-                *u = u.replace(&host, &ip_s);
+                // Keep the hostname for TLS URLs (SNI + cert verification).
+                if u.starts_with("turns:") {
+                    continue;
+                }
+                *u = u.replace(host, ip);
             }
             s
         })
@@ -589,6 +605,35 @@ mod tests {
             Some("coturn.roomler.ai")
         );
         assert_eq!(turn_url_host("stun:stun.l.google.com:19302"), None);
+    }
+
+    #[test]
+    fn rewrite_ice_hosts_pins_udp_but_keeps_turns_hostname() {
+        // The pinned worker IP belongs on the UDP/STUN URLs (no TLS) but must
+        // NOT replace the hostname on `turns:` (TLS) URLs — the agent verifies
+        // coturn's DNS cert against the SNI, and an IP literal → NotValidForName.
+        let servers = vec![IceServer {
+            urls: vec![
+                "stun:coturn.roomler.ai:3478".to_string(),
+                "turn:coturn.roomler.ai:3478?transport=udp".to_string(),
+                "turn:coturn.roomler.ai:443?transport=udp".to_string(),
+                "turns:coturn.roomler.ai:443?transport=tcp".to_string(),
+                "turns:coturn.roomler.ai:5349?transport=tcp".to_string(),
+            ],
+            username: "u".to_string(),
+            credential: "c".to_string(),
+        }];
+        let out = rewrite_ice_hosts(servers, "coturn.roomler.ai", "94.130.141.74");
+        assert_eq!(
+            out[0].urls,
+            vec![
+                "stun:94.130.141.74:3478".to_string(),
+                "turn:94.130.141.74:3478?transport=udp".to_string(),
+                "turn:94.130.141.74:443?transport=udp".to_string(),
+                "turns:coturn.roomler.ai:443?transport=tcp".to_string(),
+                "turns:coturn.roomler.ai:5349?transport=tcp".to_string(),
+            ]
+        );
     }
 
     #[test]
