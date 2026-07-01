@@ -27,13 +27,15 @@ use std::time::Duration;
 
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
+use bytes::Bytes;
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 use super::router::Router;
-use crate::transport::relay::RelayConn;
+use crate::transport::quic::QuicPeer;
+use crate::transport::relay::{RelayConn, RelayUdpSocket};
 
 /// Scratch buffer size for encap/decap + carrier I/O. The overlay MTU is
 /// 1280; a WG datagram adds ~32 B of overhead, so 2048 is comfortable
@@ -50,6 +52,32 @@ const KEEPALIVE_SECS: u16 = 25;
 /// keeps handshake setup snappy without busy-looping.
 const TIMER_TICK_MS: u64 = 250;
 
+/// Bytes a WG data message adds over the inner IP packet (16 B header +
+/// 16 B Poly1305 tag). The QUIC datagram carrier's budget must fit
+/// `overlay_mtu + WG_OVERHEAD`.
+pub const WG_OVERHEAD: usize = 32;
+
+/// How long to wait for the QUIC-over-TURN handshake before falling back to
+/// the raw relay carrier.
+pub const QUIC_BUILD_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Opt-in gate for the QUIC-over-TURN carrier (`ROOMLER_AGENT_OVERLAY_QUIC`).
+/// **Default OFF** — the raw relay is the proven path; QUIC is enabled per-host
+/// only after field-proving (mirrors the direct-path arc). Truthy =
+/// `1`/`true`/`yes`/`on` (case-insensitive); anything else (incl. unset) is off.
+pub fn overlay_quic_enabled() -> bool {
+    match std::env::var("ROOMLER_AGENT_OVERLAY_QUIC") {
+        Ok(v) => {
+            let t = v.trim();
+            t.eq_ignore_ascii_case("1")
+                || t.eq_ignore_ascii_case("true")
+                || t.eq_ignore_ascii_case("yes")
+                || t.eq_ignore_ascii_case("on")
+        }
+        Err(_) => false,
+    }
+}
+
 /// How a peer's WG datagrams reach it. Both arms are "send bytes to a
 /// dst / recv bytes"; boringtun output rides either unchanged.
 pub enum Carrier {
@@ -64,6 +92,17 @@ pub enum Carrier {
         conn: Arc<dyn RelayConn>,
         dst: SocketAddr,
     },
+    /// Tier 2/3 + QUIC (opt-in): WG datagrams ride an unreliable QUIC
+    /// datagram stream over a coturn allocation. QUIC's congestion control
+    /// smooths the relay's buffer-bloat latency spikes and its keepalive holds
+    /// the TURN permission fresh — the carrier stays healthier on a hostile
+    /// (corp-VPN) relay path than raw fire-and-forget. `_peer` owns the QUIC
+    /// endpoint (→ `RelayUdpSocket` → `RelayConn` → TURN allocation); it is
+    /// held only to keep that stack alive for the connection's lifetime.
+    QuicRelay {
+        _peer: QuicPeer,
+        conn: quinn::Connection,
+    },
 }
 
 impl Carrier {
@@ -73,6 +112,55 @@ impl Carrier {
 
     pub fn relay(conn: Arc<dyn RelayConn>, dst: SocketAddr) -> Arc<Self> {
         Arc::new(Carrier::Relay { conn, dst })
+    }
+
+    /// Build a QUIC-over-TURN carrier over an existing TURN allocation `conn`,
+    /// with the peer's relayed `dst`. `am_server` (deterministic — the
+    /// lexicographically-smaller pubkey serves) picks the QUIC role; the client
+    /// accepts any cert because WireGuard authenticates end-to-end INSIDE the
+    /// datagrams. Returns `Err` (→ the caller falls back to the raw
+    /// `Carrier::relay`) on a handshake timeout, or if the negotiated datagram
+    /// budget can't hold a WG packet (`min_datagram`). Both ends install the
+    /// coturn permission (stray `\x00`) before the bidirectional handshake.
+    pub async fn quic_relay(
+        conn: Arc<dyn RelayConn>,
+        dst: SocketAddr,
+        am_server: bool,
+        min_datagram: usize,
+        timeout: Duration,
+    ) -> anyhow::Result<Arc<Self>> {
+        use anyhow::{Context as _, bail};
+
+        let _ = conn.send_to(b"\x00", dst).await;
+        let sock = Arc::new(RelayUdpSocket::new(conn)?);
+
+        let (peer, quic) = if am_server {
+            let peer = QuicPeer::server_over_relay_datagram(sock)?;
+            let quic = tokio::time::timeout(timeout, peer.accept())
+                .await
+                .context("QUIC-over-TURN server accept timed out")?
+                .context("QUIC-over-TURN server: no incoming connection")?
+                .context("QUIC-over-TURN server handshake failed")?;
+            (peer, quic)
+        } else {
+            let peer = QuicPeer::client_over_relay_datagram(sock)?;
+            let quic = tokio::time::timeout(timeout, peer.connect(dst))
+                .await
+                .context("QUIC-over-TURN client connect timed out")?
+                .context("QUIC-over-TURN client handshake failed")?;
+            (peer, quic)
+        };
+
+        let budget = quic.max_datagram_size().unwrap_or(0);
+        if budget < min_datagram {
+            bail!(
+                "QUIC datagram budget {budget} < WG packet {min_datagram}; falling back to raw relay"
+            );
+        }
+        Ok(Arc::new(Carrier::QuicRelay {
+            _peer: peer,
+            conn: quic,
+        }))
     }
 
     /// A direct UDP carrier (vs a coturn relay). The runtime uses this to
@@ -86,6 +174,13 @@ impl Carrier {
         match self {
             Carrier::Direct { sock, dst } => sock.send_to(buf, *dst).await,
             Carrier::Relay { conn, dst } => conn.send_to(buf, *dst).await,
+            // send_datagram queues on the connection (quinn's driver flushes it
+            // over the RelayUdpSocket); an over-budget/closed conn errors, which
+            // the WG layer treats like any dropped datagram.
+            Carrier::QuicRelay { conn, .. } => conn
+                .send_datagram(Bytes::copy_from_slice(buf))
+                .map(|()| buf.len())
+                .map_err(io::Error::other),
         }
     }
 
@@ -93,6 +188,14 @@ impl Carrier {
         match self {
             Carrier::Direct { sock, .. } => Ok(sock.recv_from(buf).await?.0),
             Carrier::Relay { conn, .. } => Ok(conn.recv_from(buf).await?.0),
+            // A dead QUIC connection errors here → the recv task exits → the
+            // runtime's health sweep sees rx go flat and rebuilds the carrier.
+            Carrier::QuicRelay { conn, .. } => {
+                let d = conn.read_datagram().await.map_err(io::Error::other)?;
+                let n = d.len().min(buf.len());
+                buf[..n].copy_from_slice(&d[..n]);
+                Ok(n)
+            }
         }
     }
 }
@@ -753,6 +856,58 @@ mod tests {
             got, pkt,
             "decrypted IP packet must arrive over the relay carrier"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wg_handshake_and_data_over_quic_relay() {
+        use crate::transport::relay::UdpRelayConn;
+
+        let a = WgKeypair::generate();
+        let b = WgKeypair::generate();
+
+        let sock_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sock_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr_a = sock_a.local_addr().unwrap();
+        let addr_b = sock_b.local_addr().unwrap();
+        let conn_a: Arc<dyn RelayConn> = Arc::new(UdpRelayConn(sock_a));
+        let conn_b: Arc<dyn RelayConn> = Arc::new(UdpRelayConn(sock_b));
+
+        // Same deterministic role rule as `install_ready`: the smaller pubkey is
+        // BOTH the WG initiator AND the QUIC server. Build both carriers
+        // CONCURRENTLY — the server's `accept()` blocks on the client's dial.
+        let a_is_server = a.public.to_bytes() < b.public.to_bytes();
+        let (car_a, car_b) = tokio::join!(
+            Carrier::quic_relay(conn_a, addr_b, a_is_server, 1312, Duration::from_secs(10)),
+            Carrier::quic_relay(conn_b, addr_a, !a_is_server, 1312, Duration::from_secs(10)),
+        );
+        let car_a = car_a.expect("A: QUIC-over-relay carrier");
+        let car_b = car_b.expect("B: QUIC-over-relay carrier");
+
+        let (mut dev_a, mut rx_a) = WgDevice::new(a.secret.clone());
+        let (mut dev_b, mut rx_b) = WgDevice::new(b.secret.clone());
+
+        dev_a.add_peer(b.public.to_bytes(), IP_B, car_a, a_is_server);
+        dev_b.add_peer(a.public.to_bytes(), IP_A, car_b, !a_is_server);
+
+        wait_connected(&dev_a, &b.public.to_bytes()).await;
+
+        // A → B
+        let pkt_ab = synthetic_ipv4(IP_A, IP_B, b"hello-over-quic-relay");
+        send_until_ok(&dev_a, &b.public.to_bytes(), &pkt_ab).await;
+        let got_b = tokio::time::timeout(Duration::from_secs(15), rx_b.recv())
+            .await
+            .expect("B did not receive a decrypted packet over QUIC")
+            .expect("tun channel closed");
+        assert_eq!(got_b, pkt_ab);
+
+        // B → A (bidirectional over the same QUIC datagram carrier)
+        let pkt_ba = synthetic_ipv4(IP_B, IP_A, b"reply-over-quic-relay");
+        send_until_ok(&dev_b, &a.public.to_bytes(), &pkt_ba).await;
+        let got_a = tokio::time::timeout(Duration::from_secs(15), rx_a.recv())
+            .await
+            .expect("A did not receive a decrypted packet over QUIC")
+            .expect("tun channel closed");
+        assert_eq!(got_a, pkt_ba);
     }
 
     // ───────────── LIVE coturn smoke (two real TURN allocations) ─────────────
