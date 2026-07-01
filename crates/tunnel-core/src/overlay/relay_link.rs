@@ -217,10 +217,13 @@ impl RelayCoordinator {
                 } else {
                     ip.to_string()
                 };
-                let mut pinned = vec![
-                    format!("turn:{h}:3478?transport=udp"),
-                    format!("turns:{h}:443?transport=tcp"),
-                ];
+                // UDP tier only: pin the worker for the Tier-2 intra-worker
+                // hairpin. Do NOT prepend a `turns:{ip}` URL — TLS to an IP
+                // literal fails coturn's DNS-cert verification (NotValidForName).
+                // The TURNS tier is pinned via the server's `&pin=` on its
+                // hostname URL (rc.140), which dials this same worker while
+                // keeping the SNI valid.
+                let mut pinned = vec![format!("turn:{h}:3478?transport=udp")];
                 pinned.extend(urls);
                 pinned
             }
