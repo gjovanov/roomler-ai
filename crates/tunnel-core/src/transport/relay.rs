@@ -522,7 +522,11 @@ pub async fn allocate_relay_from_ice(
         {
             Ok(relay) => return Ok(relay),
             Err(e) => {
-                tracing::warn!(%host, port, %e, "TURNS/TCP TURN allocate failed; trying next")
+                // `{:#}` surfaces the full anyhow chain incl. the underlying
+                // rustls error (e.g. "invalid peer certificate: NotValidForName"
+                // = SNI/cert-name mismatch, vs "UnknownIssuer"/handshake reset =
+                // a genuine middlebox block) — the signal that gates the fix.
+                tracing::warn!(%host, port, e = format!("{e:#}"), "TURNS/TCP TURN allocate failed; trying next")
             }
         }
     }
