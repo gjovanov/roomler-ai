@@ -58,8 +58,14 @@ const TIMER_TICK_MS: u64 = 250;
 pub const WG_OVERHEAD: usize = 32;
 
 /// How long to wait for the QUIC-over-TURN handshake before falling back to
-/// the raw relay carrier.
-pub const QUIC_BUILD_TIMEOUT: Duration = Duration::from_secs(5);
+/// the raw relay carrier. This is the rendezvous window: the QUIC server's
+/// `accept()` and the client's `connect()` must overlap, but the two ends
+/// install peers at slightly different times (sequential per-peer install +
+/// staggered restarts), so a too-short window makes one side time out → raw
+/// while the other lands on QUIC (a silent split). 8 s tolerates that skew;
+/// residual skew self-heals via the health sweep (both sides see rx flat on a
+/// split and re-request). Bounded so a dead relay still falls back promptly.
+pub const QUIC_BUILD_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Opt-in gate for the QUIC-over-TURN carrier (`ROOMLER_AGENT_OVERLAY_QUIC`).
 /// **Default OFF** — the raw relay is the proven path; QUIC is enabled per-host

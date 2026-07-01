@@ -72,9 +72,18 @@ pub async fn relay_overlay_msg_from_node(
             wg_public_key,
             key_epoch,
             endpoints,
+            supports_quic,
             ..
         } => {
-            handle_overlay_join(state, ident, wg_public_key, key_epoch, endpoints).await;
+            handle_overlay_join(
+                state,
+                ident,
+                wg_public_key,
+                key_epoch,
+                endpoints,
+                supports_quic,
+            )
+            .await;
             None
         }
         ClientMsg::OverlayEndpoints { candidates } => {
@@ -101,6 +110,7 @@ async fn handle_overlay_join(
     wg_public_key: String,
     key_epoch: u32,
     endpoints: Vec<String>,
+    supports_quic: bool,
 ) {
     let node_ref = ident.node_ref();
     let Some((tenant_id, machine_id)) = resolve_tenant_and_machine(state, ident).await else {
@@ -130,7 +140,14 @@ async fn handle_overlay_join(
             let Some(id) = existing.id else { return };
             match state
                 .overlay_nodes
-                .rehydrate(id, &node_ref, &wg_public_key, key_epoch, &endpoints)
+                .rehydrate(
+                    id,
+                    &node_ref,
+                    &wg_public_key,
+                    key_epoch,
+                    &endpoints,
+                    supports_quic,
+                )
                 .await
             {
                 Ok(n) => n,
@@ -163,6 +180,7 @@ async fn handle_overlay_join(
                     wg_public_key,
                     key_epoch,
                     endpoints,
+                    supports_quic,
                 )
                 .await
             {
@@ -433,6 +451,7 @@ fn to_netmap_peer(node: &OverlayNode) -> NetmapPeer {
         endpoints: union_endpoints(&node.lan_endpoints, &node.endpoints),
         relay_home: node.relay_home.clone(),
         reachable: true,
+        supports_quic: node.supports_quic,
     }
 }
 

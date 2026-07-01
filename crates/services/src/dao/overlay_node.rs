@@ -43,6 +43,7 @@ impl OverlayNodeDao {
         wg_public_key: String,
         key_epoch: u32,
         endpoints: Vec<String>,
+        supports_quic: bool,
     ) -> DaoResult<OverlayNode> {
         let now = DateTime::now();
         let node = OverlayNode {
@@ -60,6 +61,7 @@ impl OverlayNodeDao {
             lan_endpoints: endpoints.clone(),
             endpoints,
             relay_home: None,
+            supports_quic,
             status: AgentStatus::Online,
             last_seen_at: now,
             created_at: now,
@@ -80,6 +82,7 @@ impl OverlayNodeDao {
         wg_public_key: &str,
         key_epoch: u32,
         endpoints: &[String],
+        supports_quic: bool,
     ) -> DaoResult<OverlayNode> {
         let node_ref_bson = bson::to_bson(node_ref).unwrap_or(bson::Bson::Null);
         self.base
@@ -95,6 +98,9 @@ impl OverlayNodeDao {
                         // before the next relay trickle replaces `endpoints`.
                         "endpoints": endpoints,
                         "lan_endpoints": endpoints,
+                        // rc.142 — refresh the QUIC capability on each re-join
+                        // (an operator may flip ROOMLER_AGENT_OVERLAY_QUIC).
+                        "supports_quic": supports_quic,
                         "status": bson::to_bson(&AgentStatus::Online).unwrap(),
                         "last_seen_at": DateTime::now(),
                         "updated_at": DateTime::now(),
