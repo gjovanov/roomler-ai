@@ -20,6 +20,10 @@ pub struct PeerConfig {
     /// Dialable endpoints (host/srflx/relay), priority order — the
     /// runtime picks one to build the carrier.
     pub endpoints: Vec<String>,
+    /// rc.142 — the peer advertised it can carry WG over QUIC-over-TURN. The
+    /// runtime only attempts the QUIC relay carrier when this is set (both
+    /// ends must agree, else the pair falls back to raw relay).
+    pub supports_quic: bool,
 }
 
 /// Decode a netmap peer. `None` if the pubkey isn't valid base64/length
@@ -36,6 +40,7 @@ pub fn peer_config_from_netmap(peer: &NetmapPeer) -> Option<PeerConfig> {
         public_key,
         overlay_ip,
         endpoints: peer.endpoints.clone(),
+        supports_quic: peer.supports_quic,
     })
 }
 
@@ -53,6 +58,7 @@ mod tests {
             endpoints: vec!["203.0.113.5:51820".into()],
             relay_home: None,
             reachable,
+            supports_quic: false,
         }
     }
 

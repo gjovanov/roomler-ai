@@ -648,6 +648,11 @@ pub struct OverlayNode {
     /// Preferred relay region/home, if any (Phase 5 multi-relay).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_home: Option<String>,
+    /// rc.142 — the node advertised (on JOIN) that it can carry WG over a
+    /// QUIC-over-TURN relay carrier. Echoed per-peer in the netmap so QUIC is
+    /// only attempted when both ends support it (no silent QUIC/raw split).
+    #[serde(default)]
+    pub supports_quic: bool,
     pub status: AgentStatus,
     pub last_seen_at: DateTime,
     pub created_at: DateTime,

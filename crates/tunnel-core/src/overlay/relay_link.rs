@@ -53,6 +53,9 @@ pub struct ReadyLink {
     /// upgrade the carrier to QUIC-over-TURN in `install_ready`, falling back
     /// to the already-built raw `carrier` on failure.
     pub relay_parts: Option<(Arc<dyn RelayConn>, SocketAddr)>,
+    /// rc.142 — the peer advertised QUIC-over-TURN support. `install_ready`
+    /// only attempts the QUIC upgrade when this is set (both ends must agree).
+    pub supports_quic: bool,
 }
 
 /// A peer we're coordinating a relay link to, before our allocation exists.
@@ -277,6 +280,7 @@ impl RelayCoordinator {
             overlay_ip: a.peer.overlay_ip,
             carrier,
             relay_parts: Some((a.conn.clone(), dst)),
+            supports_quic: a.peer.supports_quic,
         };
         self.allocated.remove(node_id);
         info!(peer = %node_id, %dst, "overlay relay: link ready");
@@ -473,6 +477,7 @@ mod tests {
             public_key: [1u8; 32],
             overlay_ip: Ipv4Addr::new(100, 64, 0, 9),
             endpoints: vec![],
+            supports_quic: false,
         };
         coord.request(node, peer.clone()).await;
         coord.request(node, peer).await; // de-duped
@@ -500,6 +505,7 @@ mod tests {
                     public_key: [2u8; 32],
                     overlay_ip: Ipv4Addr::new(100, 64, 0, 9),
                     endpoints: vec![],
+                    supports_quic: false,
                 },
                 ice: None,
                 pair_key: None,
