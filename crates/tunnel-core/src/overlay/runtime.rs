@@ -216,6 +216,9 @@ impl OverlayRuntime {
             supported: vec!["wireguard-v1".to_string()],
             mtu: self.mtu,
             endpoints: advertised,
+            // rc.142 — advertise the QUIC-over-TURN capability so the server
+            // only tells a peer to attempt QUIC when BOTH ends support it.
+            supports_quic: overlay_quic_enabled(),
         };
         if self.outbound.send(join).await.is_err() {
             warn!("overlay: control channel closed before join");
@@ -552,6 +555,7 @@ impl OverlayRuntime {
                             overlay_ip: cfg.overlay_ip,
                             carrier,
                             relay_parts: None,
+                            supports_quic: cfg.supports_quic,
                         },
                     )
                     .await;
@@ -646,7 +650,8 @@ impl OverlayRuntime {
         // permission fresh. On ANY handshake failure/timeout we fall back to the
         // already-built raw relay carrier, so the upgrade can only improve —
         // never break — the link.
-        let carrier = if overlay_quic_enabled() && link.relay_parts.is_some() {
+        let carrier = if overlay_quic_enabled() && link.supports_quic && link.relay_parts.is_some()
+        {
             let (conn, dst) = link.relay_parts.clone().unwrap();
             // Deterministic role: the lexicographically-smaller pubkey serves
             // (same rule as the WG relay initiator, so both ends agree on who
@@ -793,6 +798,7 @@ mod tests {
             endpoints: vec![],
             relay_home: None,
             reachable: true,
+            supports_quic: false,
         }
     }
 
