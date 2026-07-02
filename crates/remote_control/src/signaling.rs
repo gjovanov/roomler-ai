@@ -475,6 +475,12 @@ pub enum ClientMsg {
         /// Initial connectivity candidates (host/srflx/relay).
         #[serde(default)]
         endpoints: Vec<String>,
+        /// rc.142 — the node can carry WG over a QUIC-over-TURN relay carrier
+        /// (`ROOMLER_AGENT_OVERLAY_QUIC=1`). The server persists it and echoes it
+        /// per-peer in the netmap so QUIC is only attempted when BOTH ends
+        /// advertise it (a QUIC/raw split would silently break the pair).
+        #[serde(default)]
+        supports_quic: bool,
     },
 
     /// Node trickles updated connectivity candidates; the server fans a
@@ -873,6 +879,12 @@ pub struct NetmapPeer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_home: Option<String>,
     pub reachable: bool,
+    /// rc.142 — this peer advertised it can carry WG over a QUIC-over-TURN
+    /// relay carrier. A node only attempts the QUIC upgrade with a peer when
+    /// both ends set this (else raw relay), so a capability mismatch can't
+    /// leave one side on QUIC and the other on raw (which wouldn't decapsulate).
+    #[serde(default)]
+    pub supports_quic: bool,
 }
 
 /// Network-wide parameters carried in a full netmap so the node can size
@@ -1525,6 +1537,7 @@ mod tests {
             supported: vec!["wireguard-v1".into(), "quic-v1".into()],
             mtu: 1280,
             endpoints: vec!["203.0.113.5:51820".into()],
+            supports_quic: true,
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(r#""t":"rc:overlay.join""#));
@@ -1533,11 +1546,13 @@ mod tests {
                 wg_public_key,
                 mtu,
                 supported,
+                supports_quic,
                 ..
             } => {
                 assert_eq!(wg_public_key, "cHVia2V5");
                 assert_eq!(mtu, 1280);
                 assert!(supported.iter().any(|t| t == "wireguard-v1"));
+                assert!(supports_quic, "supports_quic must round-trip");
             }
             other => panic!("expected OverlayJoin, got {other:?}"),
         }
@@ -1593,6 +1608,7 @@ mod tests {
                 endpoints: vec!["203.0.113.9:51820".into()],
                 relay_home: None,
                 reachable: true,
+                supports_quic: true,
             }],
             epoch: 7,
         };
