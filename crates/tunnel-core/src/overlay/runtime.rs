@@ -36,13 +36,19 @@ use super::tun::TunIo;
 use super::wg::{Carrier, QUIC_BUILD_TIMEOUT, WG_OVERHEAD, WgDevice, overlay_quic_enabled};
 use roomler_ai_remote_control::signaling::{ClientMsg, IceServer, NetmapPeer, OverlayNetworkInfo};
 
-/// rc.131/132 — direct LAN carrier context. A shared UDP socket peers dial,
-/// this node's LAN IPs across ALL interfaces (for the same-subnet test), and
-/// the `IP:port` endpoints we advertise (one per interface, all on the shared
-/// socket's port) so a multi-homed peer can reach us on whichever subnet it
-/// shares with us.
+/// rc.131/132/143 — direct LAN carrier context: one UDP socket per LAN
+/// interface (each bound to that interface IP — rc.143), this node's LAN IPs
+/// across ALL interfaces (for the same-subnet test), and the `IP:port`
+/// endpoints we advertise (one per interface socket) so a multi-homed peer can
+/// reach us on whichever subnet it shares with us.
 struct DirectCtx {
-    sock: Arc<UdpSocket>,
+    /// One UDP socket bound to EACH usable LAN interface IP (rc.143 — NOT
+    /// `0.0.0.0`). Binding to the specific address forces egress out that NIC,
+    /// so a same-subnet peer is reached over the LAN even when a full-tunnel VPN
+    /// has hijacked the default route (a `0.0.0.0` socket sent the reply out the
+    /// VPN and the peer never got it). A peer is served by the socket whose
+    /// interface IP shares its /24.
+    socks: Vec<(Ipv4Addr, Arc<UdpSocket>)>,
     my_ips: Vec<Ipv4Addr>,
     endpoints: Vec<String>,
 }
@@ -464,17 +470,37 @@ impl OverlayRuntime {
             info!("overlay: no usable LAN interface; direct path off (relay only)");
             return None;
         }
-        let sock = Arc::new(UdpSocket::bind("0.0.0.0:0").await.ok()?);
-        let port = sock.local_addr().ok()?.port();
-        // One endpoint per interface IP — all reach the single 0.0.0.0:port
-        // socket; the peer dials whichever shares its subnet.
-        let endpoints: Vec<String> = my_ips.iter().map(|ip| format!("{ip}:{port}")).collect();
+        // rc.143 — bind ONE socket per interface IP (to that IP, not 0.0.0.0),
+        // so sending to a same-subnet peer egresses out the matching NIC even
+        // when a full-tunnel VPN owns the default route. Advertise each socket's
+        // own `ip:port`; the peer dials whichever shares its subnet, and both
+        // sides then send/receive over that interface's socket.
+        let mut socks: Vec<(Ipv4Addr, Arc<UdpSocket>)> = Vec::new();
+        let mut endpoints: Vec<String> = Vec::new();
+        for ip in &my_ips {
+            match UdpSocket::bind((*ip, 0)).await {
+                Ok(s) => match s.local_addr() {
+                    Ok(local) => {
+                        endpoints.push(format!("{ip}:{}", local.port()));
+                        socks.push((*ip, Arc::new(s)));
+                    }
+                    Err(e) => warn!(%ip, %e, "overlay: direct socket local_addr failed; skipping"),
+                },
+                Err(e) => {
+                    warn!(%ip, %e, "overlay: bind direct socket on interface failed; skipping")
+                }
+            }
+        }
+        if socks.is_empty() {
+            info!("overlay: no bindable LAN interface; direct path off (relay only)");
+            return None;
+        }
         info!(
             endpoints = ?endpoints,
-            "overlay: advertising direct LAN endpoints (same-subnet peers dial direct)"
+            "overlay: advertising direct LAN endpoints (per-interface sockets; same-subnet peers dial direct)"
         );
         Some(DirectCtx {
-            sock,
+            socks,
             my_ips,
             endpoints,
         })
@@ -525,13 +551,13 @@ impl OverlayRuntime {
                 Some((false, pk)) => {
                     // Installed on RELAY — upgrade to direct now that a
                     // same-subnet endpoint has appeared (re-evaluation).
-                    if let (Some(ctx), Some(dst)) = (direct_ctx, direct_dst) {
+                    if let (Some(ctx), Some((local_ip, dst))) = (direct_ctx, direct_dst) {
                         info!(peer = %np.node_id, %dst, "overlay: upgrading relay peer to direct LAN carrier");
                         wg.remove_peer(&pk).await;
                         if let Some(r) = relay.as_mut() {
                             r.forget(&np.node_id);
                         }
-                        self.install_direct(wg, by_node, tun, ctx, np.node_id, &cfg, dst)
+                        self.install_direct(wg, by_node, tun, ctx, np.node_id, &cfg, local_ip, dst)
                             .await;
                     }
                     continue;
@@ -561,14 +587,14 @@ impl OverlayRuntime {
                     .await;
                 }
                 CarrierMode::Relay => {
-                    if let (Some(ctx), Some(dst)) = (direct_ctx, direct_dst) {
+                    if let (Some(ctx), Some((local_ip, dst))) = (direct_ctx, direct_dst) {
                         // Same-subnet → direct, skip the relay. Forget any
                         // pending relay request so a late grant can't later
                         // clobber the direct carrier.
                         if let Some(r) = relay.as_mut() {
                             r.forget(&np.node_id);
                         }
-                        self.install_direct(wg, by_node, tun, ctx, np.node_id, &cfg, dst)
+                        self.install_direct(wg, by_node, tun, ctx, np.node_id, &cfg, local_ip, dst)
                             .await;
                     } else if let Some(coord) = relay.as_mut() {
                         if let Some(link) = coord.maybe_complete(np.node_id, &cfg) {
@@ -600,10 +626,17 @@ impl OverlayRuntime {
         ctx: &DirectCtx,
         node_id: ObjectId,
         cfg: &PeerConfig,
+        local_ip: Ipv4Addr,
         dst: std::net::SocketAddr,
     ) {
-        wg.ensure_direct_demux(ctx.sock.clone());
-        wg.add_direct_peer(cfg.public_key, cfg.overlay_ip, dst, true)
+        // Use the socket bound to the interface that shares the peer's subnet
+        // (rc.143) so send/receive stay on the right NIC past a full-tunnel VPN.
+        let Some((_, sock)) = ctx.socks.iter().find(|(ip, _)| *ip == local_ip) else {
+            warn!(peer = %node_id, %local_ip, "overlay: no socket bound for the matching LAN interface; skipping direct");
+            return;
+        };
+        wg.ensure_direct_demux(sock.clone());
+        wg.add_direct_peer(sock.clone(), cfg.public_key, cfg.overlay_ip, dst, true)
             .await;
         by_node.insert(
             node_id,
