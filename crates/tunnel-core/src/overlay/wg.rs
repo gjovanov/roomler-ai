@@ -246,16 +246,21 @@ impl Drop for Peer {
     }
 }
 
-/// rc.134 — shared-socket demux for N direct-LAN peers. ONE UDP socket serves
-/// every direct carrier; a single recv loop routes each datagram to the peer
-/// whose endpoint matches the source address (the WireGuard model), so many
-/// same-subnet peers can be direct at once — lifting the rc.131 "one direct
-/// peer" cap (which existed only because per-peer recv loops raced on a shared
-/// socket). `routes` maps a peer's send-from address → its `Tunn`.
+/// rc.134/143 — shared-routes demux for N direct-LAN peers. One UDP socket
+/// **per usable LAN interface** (each bound to its interface IP, not `0.0.0.0`
+/// — rc.143), and one recv loop per socket, all routing into a single shared
+/// `routes` map that dispatches each datagram to the peer whose endpoint matches
+/// the source address (the WireGuard model). Many same-subnet peers can be
+/// direct at once (lifting the rc.131 "one direct peer" cap), and each peer is
+/// sent/received on the socket bound to the interface it shares a subnet with —
+/// so a full-tunnel VPN can't hijack the egress (a single `0.0.0.0` socket let
+/// the OS route the reply out the VPN, breaking direct on VPN'd hosts).
 struct DirectDemux {
-    sock: Arc<UdpSocket>,
     routes: Arc<Mutex<DemuxRoutes>>,
-    task: JoinHandle<()>,
+    /// The per-interface sockets that have a live demux recv loop (deduped by
+    /// local address so `ensure_direct_demux` is idempotent per interface).
+    socks: Vec<Arc<UdpSocket>>,
+    tasks: Vec<JoinHandle<()>>,
 }
 
 /// A node's userspace WireGuard device: one static keypair, N peers,
@@ -275,7 +280,9 @@ pub struct WgDevice {
 impl Drop for WgDevice {
     fn drop(&mut self) {
         if let Some(d) = &self.direct {
-            d.task.abort();
+            for t in &d.tasks {
+                t.abort();
+            }
         }
     }
 }
@@ -397,16 +404,31 @@ impl WgDevice {
     /// socket forever and routes each datagram to the peer matching its source
     /// address (replacing the per-peer recv loop for direct carriers).
     pub fn ensure_direct_demux(&mut self, sock: Arc<UdpSocket>) {
-        if self.direct.is_some() {
+        let local = match sock.local_addr() {
+            Ok(a) => a,
+            Err(e) => {
+                warn!(%e, "wg: direct socket has no local_addr; skipping demux loop");
+                return;
+            }
+        };
+        let tun_tx = self.tun_tx.clone();
+        let demux = self.direct.get_or_insert_with(|| DirectDemux {
+            routes: Arc::new(Mutex::new(HashMap::new())),
+            socks: Vec::new(),
+            tasks: Vec::new(),
+        });
+        // One recv loop per interface socket, all feeding the shared `routes`.
+        // Idempotent per interface so repeated installs don't spawn duplicates.
+        if demux
+            .socks
+            .iter()
+            .any(|s| s.local_addr().map(|a| a == local).unwrap_or(false))
+        {
             return;
         }
-        let routes: Arc<Mutex<DemuxRoutes>> = Arc::new(Mutex::new(HashMap::new()));
-        let task = tokio::spawn(run_direct_demux(
-            sock.clone(),
-            routes.clone(),
-            self.tun_tx.clone(),
-        ));
-        self.direct = Some(DirectDemux { sock, routes, task });
+        let task = tokio::spawn(run_direct_demux(sock.clone(), demux.routes.clone(), tun_tx));
+        demux.socks.push(sock);
+        demux.tasks.push(task);
     }
 
     /// rc.134 — install a peer reached over the SHARED direct socket. Its
@@ -417,6 +439,7 @@ impl WgDevice {
     /// initiate bilaterally so both firewalls open — rc.133).
     pub async fn add_direct_peer(
         &mut self,
+        sock: Arc<UdpSocket>,
         peer_public: [u8; 32],
         overlay_ip: Ipv4Addr,
         dst: SocketAddr,
@@ -426,7 +449,8 @@ impl WgDevice {
             warn!("wg: add_direct_peer before ensure_direct_demux; ignoring");
             return;
         };
-        let sock = demux.sock.clone();
+        // Send from the interface-bound socket that shares the peer's subnet
+        // (rc.143) — forces egress out the right NIC past a full-tunnel VPN.
         let carrier = Carrier::direct(sock, dst);
 
         let index = self.next_index;
@@ -773,10 +797,10 @@ mod tests {
         // Hub: BOTH peers over the ONE shared socket (inbound demuxed by src).
         dev_hub.ensure_direct_demux(hub_sock.clone());
         dev_hub
-            .add_direct_peer(b.public.to_bytes(), IP_B, addr_b, true)
+            .add_direct_peer(hub_sock.clone(), b.public.to_bytes(), IP_B, addr_b, true)
             .await;
         dev_hub
-            .add_direct_peer(c.public.to_bytes(), IP_C, addr_c, true)
+            .add_direct_peer(hub_sock.clone(), c.public.to_bytes(), IP_C, addr_c, true)
             .await;
 
         // Peers: dedicated sockets, respond to the hub's initiation.
