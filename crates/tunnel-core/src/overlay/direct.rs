@@ -95,18 +95,25 @@ pub fn same_subnet_24(a: Ipv4Addr, b: Ipv4Addr) -> bool {
 
 /// From a peer's advertised `endpoints` (host/srflx/relay strings), pick the
 /// first that is a directly-dialable host endpoint **on one of our LANs** —
-/// i.e. an `IP:port` whose IP shares a /24 with any of our interface IPs.
+/// i.e. an `IP:port` whose IP shares a /24 with one of our interface IPs.
+/// Returns `(our matching interface IP, the peer's endpoint)` so the caller can
+/// send from the socket bound to THAT interface (rc.143 — binding to the
+/// interface forces egress out the right NIC, so a same-subnet peer is reached
+/// over the LAN even when a full-tunnel VPN has hijacked the default route).
 /// `None` if the peer advertised no same-subnet endpoint (→ caller falls back
 /// to the relay).
-pub fn pick_same_subnet_endpoint(my_ips: &[Ipv4Addr], endpoints: &[String]) -> Option<SocketAddr> {
+pub fn pick_same_subnet_endpoint(
+    my_ips: &[Ipv4Addr],
+    endpoints: &[String],
+) -> Option<(Ipv4Addr, SocketAddr)> {
     for ep in endpoints {
         // Tolerate scheme-ish prefixes defensively; we only emit bare IP:port.
         let raw = ep.trim();
         if let Ok(SocketAddr::V4(sa)) = raw.parse::<SocketAddr>()
             && is_usable_lan_ipv4(*sa.ip())
-            && my_ips.iter().any(|me| same_subnet_24(*me, *sa.ip()))
+            && let Some(local) = my_ips.iter().find(|me| same_subnet_24(**me, *sa.ip()))
         {
-            return Some(SocketAddr::V4(sa));
+            return Some((*local, SocketAddr::V4(sa)));
         }
     }
     None
@@ -148,7 +155,13 @@ mod tests {
             "192.168.68.110:51820".to_string(), // same /24 — pick this
         ];
         let got = pick_same_subnet_endpoint(&me, &eps).unwrap();
-        assert_eq!(got, "192.168.68.110:51820".parse::<SocketAddr>().unwrap());
+        assert_eq!(
+            got,
+            (
+                "192.168.68.103".parse::<Ipv4Addr>().unwrap(),
+                "192.168.68.110:51820".parse::<SocketAddr>().unwrap()
+            )
+        );
 
         // No same-subnet endpoint → None (caller uses relay).
         let only_far = vec!["37.63.112.129:49358".to_string()];
@@ -200,6 +213,12 @@ mod tests {
             "192.168.68.110:58307".to_string(), // peer Wi-Fi — same /24 as our .103
         ];
         let got = pick_same_subnet_endpoint(&my_ips, &peer_eps).unwrap();
-        assert_eq!(got, "192.168.68.110:58307".parse::<SocketAddr>().unwrap());
+        assert_eq!(
+            got,
+            (
+                "192.168.68.103".parse::<Ipv4Addr>().unwrap(),
+                "192.168.68.110:58307".parse::<SocketAddr>().unwrap()
+            )
+        );
     }
 }
