@@ -465,27 +465,37 @@ impl OverlayRuntime {
         if !matches!(self.mode, CarrierMode::Relay) || !direct::direct_enabled() {
             return None;
         }
-        let my_ips = direct::gather_lan_ips();
+        let ifaces = direct::gather_lan_interfaces();
+        let my_ips: Vec<Ipv4Addr> = ifaces.iter().map(|(ip, _)| *ip).collect();
         if my_ips.is_empty() {
             info!("overlay: no usable LAN interface; direct path off (relay only)");
             return None;
         }
-        // rc.143 — bind ONE socket per interface IP (to that IP, not 0.0.0.0),
-        // so sending to a same-subnet peer egresses out the matching NIC even
-        // when a full-tunnel VPN owns the default route. Advertise each socket's
-        // own `ip:port`; the peer dials whichever shares its subnet, and both
-        // sides then send/receive over that interface's socket.
+        // rc.143 — bind ONE socket per interface IP (to that IP, not 0.0.0.0);
+        // rc.144 — ALSO pin egress to that NIC via IP_UNICAST_IF, because on
+        // Windows a source-IP bind alone doesn't force the egress interface (the
+        // route does), so a full-tunnel VPN's default route otherwise steals the
+        // send and same-WiFi direct oscillates. Advertise each socket's own
+        // `ip:port`; the peer dials whichever shares its subnet, and both sides
+        // then send/receive over that interface's pinned socket.
         let mut socks: Vec<(Ipv4Addr, Arc<UdpSocket>)> = Vec::new();
         let mut endpoints: Vec<String> = Vec::new();
-        for ip in &my_ips {
+        for (ip, ifindex) in &ifaces {
             match UdpSocket::bind((*ip, 0)).await {
-                Ok(s) => match s.local_addr() {
-                    Ok(local) => {
-                        endpoints.push(format!("{ip}:{}", local.port()));
-                        socks.push((*ip, Arc::new(s)));
+                Ok(s) => {
+                    if let Some(idx) = ifindex {
+                        direct::force_egress_interface(&s, *idx);
                     }
-                    Err(e) => warn!(%ip, %e, "overlay: direct socket local_addr failed; skipping"),
-                },
+                    match s.local_addr() {
+                        Ok(local) => {
+                            endpoints.push(format!("{ip}:{}", local.port()));
+                            socks.push((*ip, Arc::new(s)));
+                        }
+                        Err(e) => {
+                            warn!(%ip, %e, "overlay: direct socket local_addr failed; skipping")
+                        }
+                    }
+                }
                 Err(e) => {
                     warn!(%ip, %e, "overlay: bind direct socket on interface failed; skipping")
                 }
