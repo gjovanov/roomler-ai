@@ -27,6 +27,8 @@
 //! Phase 4 swaps in `policy::evaluate_overlay`.
 
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use bson::{DateTime, oid::ObjectId};
 use roomler_ai_remote_control::{
@@ -560,13 +562,62 @@ fn turn_url_host(u: &str) -> Option<String> {
     (!host.is_empty()).then(|| host.to_string())
 }
 
-/// Resolve `host` and pick one IPv4 worker, indexed by `pair_key`.
+/// Short-TTL process cache of the resolved coturn worker IP set.
+///
+/// The relay pin MUST be identical for BOTH ends of a pair — they co-locate on
+/// one coturn worker so the relay-to-relay leg is an intra-worker hairpin
+/// (cross-worker traffic drops under mars's dual-public-IP SNAT). But
+/// `lookup_host` can return a rotating subset/order per call, so two grants for
+/// the same pair seconds apart could resolve **different-sized** IP sets and
+/// `pick_worker_idx` (FNV `% len`) would then pick DIFFERENT workers — exactly
+/// the field split (NEO16 on one worker, the VPN'd peer on another → 100% loss).
+/// Resolving ONCE and caching for a short TTL makes every grant in the window
+/// share one stable set → one pin. On a transient resolve failure we reuse the
+/// last-good set rather than emit an unpinned grant that would round-robin the
+/// pair apart. (roomler-ai runs a single API pod, so this process cache is
+/// authoritative for every grant.)
+static WORKER_SET_CACHE: Mutex<Option<(Instant, Vec<IpAddr>)>> = Mutex::new(None);
+const WORKER_SET_TTL: Duration = Duration::from_secs(300);
+
+/// Resolve the coturn worker IPs through [`WORKER_SET_CACHE`] so the pin is
+/// stable across grants. Returns the cached set while fresh; otherwise resolves,
+/// caches, and returns; on resolve failure reuses the last-good set (may be
+/// empty only before the first successful resolve).
+async fn resolve_workers_cached(host: &str) -> Vec<IpAddr> {
+    {
+        let guard = WORKER_SET_CACHE.lock().unwrap();
+        if let Some((at, ips)) = guard.as_ref()
+            && at.elapsed() < WORKER_SET_TTL
+            && !ips.is_empty()
+        {
+            return ips.clone();
+        }
+    }
+    let mut ips: Vec<IpAddr> = match lookup_host((host, 3478u16)).await {
+        Ok(addrs) => addrs.map(|s| s.ip()).collect(),
+        Err(_) => Vec::new(),
+    };
+    ips.sort();
+    ips.dedup();
+    if !ips.is_empty() {
+        *WORKER_SET_CACHE.lock().unwrap() = Some((Instant::now(), ips.clone()));
+        return ips;
+    }
+    // Transient resolve failure: reuse the last-good set (even if past TTL) so a
+    // DNS blip doesn't unpin grants and split pairs across workers.
+    WORKER_SET_CACHE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|(_, ips)| ips.clone())
+        .unwrap_or_default()
+}
+
+/// Resolve `host` (cached, stable) and pick one IPv4 worker, indexed by
+/// `pair_key`. Both ends of a pair get the identical result → intra-worker
+/// hairpin.
 async fn resolve_pick_worker(host: &str, pair_key: &str) -> Option<IpAddr> {
-    let ips: Vec<IpAddr> = lookup_host((host, 3478u16))
-        .await
-        .ok()?
-        .map(|s| s.ip())
-        .collect();
+    let ips = resolve_workers_cached(host).await;
     pick_worker_idx(pair_key, ips)
 }
 
