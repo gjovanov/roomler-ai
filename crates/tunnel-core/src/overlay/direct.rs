@@ -52,19 +52,73 @@ pub fn direct_enabled() -> bool {
 /// range + some cellular carriers). Order is `get_if_addrs`' (stable enough);
 /// dups removed. Empty if enumeration fails (→ relay only, as before).
 pub fn gather_lan_ips() -> Vec<Ipv4Addr> {
-    let mut ips = Vec::new();
+    gather_lan_interfaces()
+        .into_iter()
+        .map(|(ip, _)| ip)
+        .collect()
+}
+
+/// Like [`gather_lan_ips`] but also returns each interface's OS index (for
+/// `IP_UNICAST_IF` egress pinning — rc.144). The index is `None` when
+/// `if-addrs` can't supply one (then egress can't be pinned — the socket falls
+/// back to rc.143 source-IP binding only). Deduped by IP.
+pub fn gather_lan_interfaces() -> Vec<(Ipv4Addr, Option<u32>)> {
+    let mut out: Vec<(Ipv4Addr, Option<u32>)> = Vec::new();
     if let Ok(addrs) = if_addrs::get_if_addrs() {
         for a in addrs {
             if let std::net::IpAddr::V4(ip) = a.ip()
                 && is_usable_lan_ipv4(ip)
-                && !ips.contains(&ip)
+                && !out.iter().any(|(existing, _)| *existing == ip)
             {
-                ips.push(ip);
+                out.push((ip, a.index));
             }
         }
     }
-    ips
+    out
 }
+
+/// rc.144 — force outbound datagrams on `sock` out the interface with OS index
+/// `ifindex` via Windows `IP_UNICAST_IF`. Binding the source IP (rc.143) sets
+/// the address but NOT the egress NIC on Windows (the "weak host model" — the
+/// routing table picks the NIC), so a full-tunnel VPN's default route still
+/// steals egress and same-WiFi direct oscillates (field: 4-7ms when it wins the
+/// race, timeouts otherwise). `IP_UNICAST_IF` pins the NIC deterministically —
+/// the Windows equivalent of `SO_BINDTODEVICE`. Best-effort: warns + continues
+/// (a clean host routes fine, and the source-IP bind still helps).
+#[cfg(all(windows, feature = "overlay-l3"))]
+pub fn force_egress_interface(sock: &tokio::net::UdpSocket, ifindex: u32) {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{IPPROTO_IP, SOCKET, setsockopt};
+    // IP_UNICAST_IF = 31. For IPv4 the value is the interface index in NETWORK
+    // byte order (the classic gotcha — IPv6's IPV6_UNICAST_IF uses host order).
+    const IP_UNICAST_IF: i32 = 31;
+    let optval: u32 = ifindex.to_be();
+    let ret = unsafe {
+        setsockopt(
+            sock.as_raw_socket() as SOCKET,
+            IPPROTO_IP,
+            IP_UNICAST_IF,
+            (&optval as *const u32).cast::<u8>(),
+            std::mem::size_of::<u32>() as i32,
+        )
+    };
+    if ret == 0 {
+        tracing::info!(
+            ifindex,
+            "overlay: pinned direct-socket egress to interface (IP_UNICAST_IF)"
+        );
+    } else {
+        tracing::warn!(
+            ifindex,
+            "overlay: IP_UNICAST_IF failed; egress may follow the VPN default route"
+        );
+    }
+}
+
+/// No-op off Windows / without the WinSock bindings — the interface-bound
+/// socket (rc.143) is the portable part; egress pinning is Windows-specific.
+#[cfg(not(all(windows, feature = "overlay-l3")))]
+pub fn force_egress_interface(_sock: &tokio::net::UdpSocket, _ifindex: u32) {}
 
 /// True for an IPv4 that can serve as a same-LAN endpoint: not loopback, not
 /// link-local (169.254), not unspecified/broadcast, and not in the overlay
