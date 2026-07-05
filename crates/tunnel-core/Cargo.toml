@@ -118,6 +118,7 @@ features = [
     "Win32_NetworkManagement_WindowsFilteringPlatform", # Fwpm*, FWPM_* structs/flags/layer GUIDs
     "Win32_NetworkManagement_IpHelper",                 # ConvertInterfaceAliasToLuid (fallback)
     "Win32_NetworkManagement_Ndis",                     # NET_LUID_LH (fallback)
+    "Win32_Networking_WinSock",                         # setsockopt IP_UNICAST_IF (rc.144 direct egress pin)
 ]
 
 [features]
