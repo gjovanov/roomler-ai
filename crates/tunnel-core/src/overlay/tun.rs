@@ -100,6 +100,21 @@ mod system {
                 tun::create_as_async(&config).map_err(|e| std::io::Error::other(e.to_string()))?;
             let dev = Arc::new(dev);
 
+            // Pin the overlay NIC to the lowest interface metric so its routes
+            // (the connected `/10` + the per-peer `/32`s) are preferred over a
+            // full-tunnel VPN's captured routes for the overlay's 100.64.0.0/10
+            // range. Check Point Endpoint installs competing `/32`s via its NIC
+            // at metric 1, which otherwise swallow overlay traffic (the packet
+            // is bounced to the VPN gateway → "destination host unreachable").
+            // Best-effort + sync (`up` isn't async) — a blocking `netsh` at
+            // bring-up is fine; a failure just leaves the default metric.
+            #[cfg(target_os = "windows")]
+            {
+                let _ = std::process::Command::new("netsh")
+                    .args(["interface", "ipv4", "set", "interface", IF_NAME, "metric=1"])
+                    .output();
+            }
+
             // Program WFP so the overlay's inbound survives a GPO-locked
             // Defender Firewall (Tailscale's approach). Best-effort: a
             // failure is logged and the overlay still comes up — it only
@@ -169,6 +184,24 @@ mod system {
         async fn add_peer_route(&self, peer: Ipv4Addr) -> std::io::Result<()> {
             #[cfg(target_os = "windows")]
             {
+                // A full-tunnel VPN (Check Point Endpoint) installs a competing
+                // `/32` for each overlay peer via its own NIC at metric 1, which
+                // swallows overlay traffic. The overlay OWNS 100.64.0.0/10, so
+                // any non-wintun route for a peer is wrong by construction:
+                // evict ALL `/32`s for this IP (cross-interface `route delete`),
+                // then (re-)add ours via the wintun at a low metric so it wins
+                // even if the VPN re-adds later. `route delete` erroring (no
+                // such route on first install) is expected → ignored.
+                let _ = run_cmd(
+                    "route",
+                    vec![
+                        "delete".into(),
+                        peer.to_string(),
+                        "mask".into(),
+                        "255.255.255.255".into(),
+                    ],
+                )
+                .await;
                 run_cmd(
                     "netsh",
                     vec![
@@ -178,6 +211,7 @@ mod system {
                         "route".into(),
                         format!("prefix={peer}/32"),
                         format!("interface={IF_NAME}"),
+                        "metric=1".into(),
                         "store=active".into(),
                     ],
                 )
