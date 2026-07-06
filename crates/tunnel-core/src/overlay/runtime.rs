@@ -90,6 +90,16 @@ const RELAY_REFRESH_COOLDOWN: Duration = Duration::from_secs(30);
 /// How often the carrier-health sweep runs. Cheap (lock-free atomic reads), so
 /// a tighter cadence is fine and makes detection quicker.
 const FALLBACK_TICK: Duration = Duration::from_secs(5);
+/// How often to re-assert per-peer `/32` routes on the overlay NIC (rc.146).
+/// A full-tunnel VPN (Check Point) keeps re-installing a competing `/32` for
+/// each overlay IP via its own NIC that swallows overlay traffic; the route
+/// table flaps between it and ours. Re-asserting UNCONDITIONALLY on a tight
+/// cadence — not gated on the carrier's traffic counters, because a captured
+/// route means our packets never reach the WG device so `tx` stays flat and a
+/// traffic-gated check would never fire — keeps the overlay winning the route
+/// war. Cheap (a couple of route commands per peer) and 2 s bounds the capture
+/// window to a couple of dropped pings.
+const ROUTE_GUARD_TICK: Duration = Duration::from_secs(2);
 
 /// Overlay control events the runtime consumes, fed in from the node's
 /// signaling loop (the `ServerMsg::Overlay*` handlers forward these).
@@ -287,6 +297,11 @@ impl OverlayRuntime {
         let mut current_peers: HashMap<ObjectId, NetmapPeer> =
             first_peers.iter().map(|p| (p.node_id, p.clone())).collect();
         let mut fallback = tokio::time::interval(FALLBACK_TICK);
+        // rc.146 — re-assert per-peer /32 routes so a full-tunnel VPN can't keep
+        // its competing capture routes installed. First tick fires immediately;
+        // skip it (routes are freshly installed by `install_peers` below).
+        let mut route_guard = tokio::time::interval(ROUTE_GUARD_TICK);
+        route_guard.tick().await;
         let mut relay = match self.mode {
             // Pass our LAN endpoints so the relay-endpoint trickle re-includes
             // them (the server replaces, so they'd otherwise be clobbered —
@@ -330,6 +345,16 @@ impl OverlayRuntime {
                         &mut wg, &mut by_node, &mut relay, &tun,
                         &mut direct_cooldown, &mut relay_refresh_cooldown, &current_peers,
                     ).await;
+                },
+                // rc.146 — re-assert every installed peer's /32 on the overlay
+                // NIC (evict any competing route a full-tunnel VPN re-added, then
+                // re-add ours at low metric). Unconditional: a captured route
+                // keeps our packets off the WG device, so the carrier's traffic
+                // counters can't detect it — only a periodic re-assert can.
+                _ = route_guard.tick() => {
+                    for e in by_node.values() {
+                        tun.add_peer_route(e.overlay_ip).await.ok();
+                    }
                 },
                 evt = events.recv() => match evt {
                     // Re-sync: install any newly-listed peers (deltas drive
@@ -409,14 +434,6 @@ impl OverlayRuntime {
             // didn't send either, the link is just idle — no judgment.)
             if tx > last_tx && rx == last_rx {
                 e.bad_sweeps += 1;
-                // "Sent, nothing back" is exactly the signature of a full-tunnel
-                // VPN having (re-)installed a competing /32 for this overlay IP
-                // that swallows our traffic (Check Point re-adds its captures).
-                // Re-assert our route — evict the competitor + re-add the wintun
-                // /32 — BEFORE judging the carrier dead. Cheap, self-limiting
-                // (once traffic flows `rx` climbs and this stops firing), and it
-                // recovers a carrier the VPN silently hijacked at the OS layer.
-                tun.add_peer_route(e.overlay_ip).await.ok();
             } else {
                 e.bad_sweeps = 0;
             }
