@@ -409,6 +409,14 @@ impl OverlayRuntime {
             // didn't send either, the link is just idle — no judgment.)
             if tx > last_tx && rx == last_rx {
                 e.bad_sweeps += 1;
+                // "Sent, nothing back" is exactly the signature of a full-tunnel
+                // VPN having (re-)installed a competing /32 for this overlay IP
+                // that swallows our traffic (Check Point re-adds its captures).
+                // Re-assert our route — evict the competitor + re-add the wintun
+                // /32 — BEFORE judging the carrier dead. Cheap, self-limiting
+                // (once traffic flows `rx` climbs and this stops firing), and it
+                // recovers a carrier the VPN silently hijacked at the OS layer.
+                tun.add_peer_route(e.overlay_ip).await.ok();
             } else {
                 e.bad_sweeps = 0;
             }
