@@ -622,6 +622,13 @@ pub struct OverlayNode {
     /// Rehydrate key — carried from the underlying agent/tunnel-client so
     /// a re-join finds the existing row (and its leased overlay IP).
     pub machine_id: String,
+    /// Human-facing node name — denormalized from the underlying
+    /// [`Agent`]/[`TunnelClient`] `name` at join, sanitized to a DNS label and
+    /// made unique per network (collisions get a `-2`/`-3` suffix). This is the
+    /// MagicDNS authority and the netmap's `name`. Empty on rows created before
+    /// Phase 0 (Tailscale-style names).
+    #[serde(default)]
+    pub name: String,
     /// Leased overlay address, e.g. `"100.64.0.7"`. Stable for the row's
     /// life; reclaimed only on hard-delete.
     pub overlay_ip: String,

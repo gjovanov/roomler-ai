@@ -277,6 +277,13 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> 
             index_unique(bson::doc! { "tenant_id": 1, "machine_id": 1 }),
             index_unique(bson::doc! { "tenant_id": 1, "network_id": 1, "overlay_ip": 1 }),
             index(bson::doc! { "tenant_id": 1, "network_id": 1, "deleted_at": 1 }),
+            // Phase 0 — per-network-unique node name (MagicDNS). Partial so the
+            // empty names on pre-Phase-0 rows (backfilled on next rejoin) don't
+            // collide.
+            index_unique_partial(
+                bson::doc! { "tenant_id": 1, "network_id": 1, "name": 1 },
+                bson::doc! { "name": { "$gt": "" } },
+            ),
         ],
     )
     .await?;
@@ -366,6 +373,21 @@ fn index_unique_sparse(keys: bson::Document) -> IndexModel {
     IndexModel::builder()
         .keys(keys)
         .options(IndexOptions::builder().unique(true).sparse(true).build())
+        .build()
+}
+
+/// Unique index scoped by a partial filter — uniqueness is enforced only for
+/// documents matching `filter` (e.g. non-empty `name`, so pre-Phase-0 rows with
+/// an empty name don't collide).
+fn index_unique_partial(keys: bson::Document, filter: bson::Document) -> IndexModel {
+    IndexModel::builder()
+        .keys(keys)
+        .options(
+            IndexOptions::builder()
+                .unique(true)
+                .partial_filter_expression(filter)
+                .build(),
+        )
         .build()
 }
 
