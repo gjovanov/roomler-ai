@@ -45,6 +45,7 @@ impl OverlayNodeDao {
         key_epoch: u32,
         endpoints: Vec<String>,
         supports_quic: bool,
+        advertised_routes: Vec<String>,
     ) -> DaoResult<OverlayNode> {
         let now = DateTime::now();
         let node = OverlayNode {
@@ -64,6 +65,10 @@ impl OverlayNodeDao {
             endpoints,
             relay_home: None,
             supports_quic,
+            // Phase 1 — the node's claimed routes; nothing approved until an
+            // admin acts, so a fresh node routes for no one.
+            advertised_routes,
+            approved_routes: Vec::new(),
             status: AgentStatus::Online,
             last_seen_at: now,
             created_at: now,
@@ -87,6 +92,7 @@ impl OverlayNodeDao {
         key_epoch: u32,
         endpoints: &[String],
         supports_quic: bool,
+        advertised_routes: &[String],
     ) -> DaoResult<OverlayNode> {
         let node_ref_bson = bson::to_bson(node_ref).unwrap_or(bson::Bson::Null);
         self.base
@@ -99,6 +105,10 @@ impl OverlayNodeDao {
                         // (existing name reused, or a freshly deduped one when
                         // backfilling a pre-Phase-0 row).
                         "name": name,
+                        // Phase 1 — refresh the CLAIMED routes on each join.
+                        // `approved_routes` is admin-controlled and intentionally
+                        // NOT touched here, so approvals survive a rejoin.
+                        "advertised_routes": advertised_routes,
                         "wg_public_key": wg_public_key,
                         "key_epoch": key_epoch as i64,
                         // Refresh BOTH buckets from the join (rc.135) — a DHCP
@@ -163,6 +173,26 @@ impl OverlayNodeDao {
                 } },
             )
             .await
+    }
+
+    /// Phase 1 — set the admin-APPROVED subnet routes for a node and return the
+    /// updated row. The caller must first verify the node belongs to the admin's
+    /// tenant and that each route is among the node's `advertised_routes`.
+    pub async fn set_approved_routes(
+        &self,
+        node_id: ObjectId,
+        approved_routes: &[String],
+    ) -> DaoResult<OverlayNode> {
+        self.base
+            .update_by_id(
+                node_id,
+                doc! { "$set": {
+                    "approved_routes": approved_routes,
+                    "updated_at": DateTime::now(),
+                } },
+            )
+            .await?;
+        self.base.find_by_id(node_id).await
     }
 
     pub async fn touch_heartbeat(&self, node_id: ObjectId) -> DaoResult<bool> {
