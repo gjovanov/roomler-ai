@@ -360,6 +360,15 @@ async fn handle_overlay_relay_request(
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Re-fan a node's current netmap entry to its peers as an upsert delta — used
+/// when something OUT of band changes the node's wire shape (Phase 1: an admin
+/// approving/revoking its subnet `routes`), so peers pick it up immediately
+/// instead of waiting for the next join. Best-effort.
+pub(crate) async fn refan_node(state: &AppState, node: &OverlayNode) {
+    let upsert = to_netmap_peer(node);
+    fan_delta_to_peers(state, node, next_epoch(), vec![upsert], vec![]).await;
+}
+
 /// Fan a delta to every active peer of `self_node` in its network.
 async fn fan_delta_to_peers(
     state: &AppState,
@@ -562,8 +571,7 @@ fn sanitize_cidrs(routes: Vec<String>) -> Vec<String> {
             let Some((ip, pfx)) = r.split_once('/') else {
                 return false;
             };
-            ip.parse::<std::net::Ipv4Addr>().is_ok()
-                && pfx.parse::<u8>().is_ok_and(|p| p <= 32)
+            ip.parse::<std::net::Ipv4Addr>().is_ok() && pfx.parse::<u8>().is_ok_and(|p| p <= 32)
         })
         .collect()
 }
