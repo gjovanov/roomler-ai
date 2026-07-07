@@ -873,6 +873,10 @@ pub struct NetmapPeer {
     #[serde(with = "oid_hex")]
     pub node_id: ObjectId,
     pub overlay_ip: String,
+    /// Human-facing node name (Phase 0) — the MagicDNS label for this peer,
+    /// unique per network. Empty from a pre-Phase-0 server (`#[serde(default)]`).
+    #[serde(default)]
+    pub name: String,
     pub wg_public_key: String,
     #[serde(default)]
     pub endpoints: Vec<String>,
@@ -1604,6 +1608,7 @@ mod tests {
             peers: vec![NetmapPeer {
                 node_id,
                 overlay_ip: "100.64.0.4".into(),
+                name: "neo16".into(),
                 wg_public_key: "cGVlcg==".into(),
                 endpoints: vec!["203.0.113.9:51820".into()],
                 relay_home: None,

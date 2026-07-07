@@ -39,6 +39,7 @@ impl OverlayNodeDao {
         node_ref: NodeRef,
         network_id: ObjectId,
         machine_id: String,
+        name: String,
         overlay_ip: String,
         wg_public_key: String,
         key_epoch: u32,
@@ -52,6 +53,7 @@ impl OverlayNodeDao {
             node_ref,
             network_id,
             machine_id,
+            name,
             overlay_ip,
             wg_public_key,
             key_epoch,
@@ -75,10 +77,12 @@ impl OverlayNodeDao {
     /// Re-join: clear `deleted_at`, refresh the WG key + endpoints +
     /// node_ref, mark Online. Keeps the existing `overlay_ip`. Returns
     /// the updated row.
+    #[allow(clippy::too_many_arguments)]
     pub async fn rehydrate(
         &self,
         node_id: ObjectId,
         node_ref: &NodeRef,
+        name: &str,
         wg_public_key: &str,
         key_epoch: u32,
         endpoints: &[String],
@@ -91,6 +95,10 @@ impl OverlayNodeDao {
                 doc! {
                     "$set": {
                         "node_ref": node_ref_bson,
+                        // Phase 0 — the join handler passes the stable name
+                        // (existing name reused, or a freshly deduped one when
+                        // backfilling a pre-Phase-0 row).
+                        "name": name,
                         "wg_public_key": wg_public_key,
                         "key_epoch": key_epoch as i64,
                         // Refresh BOTH buckets from the join (rc.135) — a DHCP
