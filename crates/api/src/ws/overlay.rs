@@ -115,10 +115,14 @@ async fn handle_overlay_join(
     supports_quic: bool,
 ) {
     let node_ref = ident.node_ref();
-    let Some((tenant_id, machine_id)) = resolve_tenant_and_machine(state, ident).await else {
+    let Some((tenant_id, machine_id, display_name)) =
+        resolve_tenant_and_machine(state, ident).await
+    else {
         warn!(?ident, "overlay.join from an unknown node; ignoring");
         return;
     };
+    // Phase 0 — the DNS-safe base label from the node's display name.
+    let base_name = dns_label(&display_name, &machine_id);
 
     let network = match state.overlay_networks.get_or_create(tenant_id).await {
         Ok(n) => n,
@@ -140,11 +144,19 @@ async fn handle_overlay_join(
     {
         Ok(Some(existing)) => {
             let Some(id) = existing.id else { return };
+            // Keep the existing stable name (DNS mustn't churn on rejoin);
+            // backfill a freshly-deduped one for a pre-Phase-0 empty row.
+            let name = if existing.name.is_empty() {
+                unique_node_name(state, tenant_id, network_id, &base_name, Some(id)).await
+            } else {
+                existing.name.clone()
+            };
             match state
                 .overlay_nodes
                 .rehydrate(
                     id,
                     &node_ref,
+                    &name,
                     &wg_public_key,
                     key_epoch,
                     &endpoints,
@@ -160,6 +172,8 @@ async fn handle_overlay_join(
             }
         }
         Ok(None) => {
+            // Fresh node — a per-network-unique name from the base label.
+            let name = unique_node_name(state, tenant_id, network_id, &base_name, None).await;
             let host = match state.overlay_networks.allocate_host(network_id).await {
                 Ok(h) => h,
                 Err(e) => {
@@ -178,6 +192,7 @@ async fn handle_overlay_join(
                     node_ref,
                     network_id,
                     machine_id,
+                    name,
                     overlay_ip,
                     wg_public_key,
                     key_epoch,
@@ -402,10 +417,13 @@ async fn send_to_node(state: &AppState, node: &OverlayNode, msg: ServerMsg) {
 }
 
 /// Resolve the underlying `(tenant_id, machine_id)` for a node identity.
+/// Returns `(tenant_id, machine_id, display_name)` for the identity — the
+/// display name is the underlying agent/tunnel-client `name` (Phase 0, for the
+/// overlay node name / MagicDNS).
 async fn resolve_tenant_and_machine(
     state: &AppState,
     ident: NodeIdentity,
-) -> Option<(ObjectId, String)> {
+) -> Option<(ObjectId, String, String)> {
     match ident {
         NodeIdentity::Agent(id) => state
             .agents
@@ -413,20 +431,20 @@ async fn resolve_tenant_and_machine(
             .find_by_id(id)
             .await
             .ok()
-            .map(|a| (a.tenant_id, a.machine_id)),
+            .map(|a| (a.tenant_id, a.machine_id, a.name)),
         NodeIdentity::TunnelClient(id) => state
             .tunnel_clients
             .base
             .find_by_id(id)
             .await
             .ok()
-            .map(|c| (c.tenant_id, c.machine_id)),
+            .map(|c| (c.tenant_id, c.machine_id, c.name)),
     }
 }
 
 /// Fetch the joined `OverlayNode` row for an identity (post-join ops).
 async fn current_node(state: &AppState, ident: NodeIdentity) -> Option<OverlayNode> {
-    let (tenant_id, machine_id) = resolve_tenant_and_machine(state, ident).await?;
+    let (tenant_id, machine_id, _name) = resolve_tenant_and_machine(state, ident).await?;
     state
         .overlay_nodes
         .find_by_tenant_and_machine(tenant_id, &machine_id)
@@ -436,6 +454,72 @@ async fn current_node(state: &AppState, ident: NodeIdentity) -> Option<OverlayNo
         .filter(|n| n.deleted_at.is_none())
 }
 
+/// Sanitize a display name to a single DNS label — lowercase `[a-z0-9-]`, no
+/// leading/trailing dashes, no dash runs, ≤63 chars. Falls back to `fallback`
+/// (the machine_id) then `"node"` when the name yields no usable characters.
+fn dns_label(display: &str, fallback: &str) -> String {
+    fn sanitize(s: &str) -> String {
+        let mut out = String::new();
+        let mut prev_dash = false;
+        for c in s.chars() {
+            let c = c.to_ascii_lowercase();
+            if c.is_ascii_alphanumeric() {
+                out.push(c);
+                prev_dash = false;
+            } else if !out.is_empty() && !prev_dash {
+                out.push('-');
+                prev_dash = true;
+            }
+        }
+        out.truncate(63);
+        while out.ends_with('-') {
+            out.pop();
+        }
+        out
+    }
+    let primary = sanitize(display);
+    if !primary.is_empty() {
+        return primary;
+    }
+    let fb = sanitize(fallback);
+    if !fb.is_empty() {
+        return fb;
+    }
+    "node".to_string()
+}
+
+/// Make `base` unique among the network's node names (append `-2`, `-3`, …),
+/// ignoring `exclude` (self, when backfilling). Best-effort — a lost race is
+/// still caught by the unique `(tenant,network,name)` index.
+async fn unique_node_name(
+    state: &AppState,
+    tenant_id: ObjectId,
+    network_id: ObjectId,
+    base: &str,
+    exclude: Option<ObjectId>,
+) -> String {
+    let taken: std::collections::HashSet<String> = state
+        .overlay_nodes
+        .list_active_in_network(tenant_id, network_id)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|n| n.id != exclude)
+        .map(|n| n.name)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !taken.contains(base) {
+        return base.to_string();
+    }
+    for i in 2..1000 {
+        let candidate = format!("{base}-{i}");
+        if !taken.contains(&candidate) {
+            return candidate;
+        }
+    }
+    format!("{base}-{}", next_epoch())
+}
+
 /// Phase 1 reachability is structural (same tenant + network), so every
 /// peer the node receives is `reachable = true`. Phase 4 sets this from
 /// `policy::evaluate_overlay`.
@@ -443,6 +527,7 @@ fn to_netmap_peer(node: &OverlayNode) -> NetmapPeer {
     NetmapPeer {
         node_id: node.id.unwrap_or_default(),
         overlay_ip: node.overlay_ip.clone(),
+        name: node.name.clone(),
         wg_public_key: node.wg_public_key.clone(),
         // rc.135 — union the DIRECT LAN bucket with the trickled (srflx/relay)
         // bucket, LAN first, deduped. The relay trickle REPLACES `endpoints`,
