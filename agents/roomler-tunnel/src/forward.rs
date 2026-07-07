@@ -160,6 +160,20 @@ enum ForwardReply {
 /// Entry point for `roomler-tunnel forward`. Tries the operator's
 /// preferred transport and, for `--transport auto`, transparently
 /// re-opens the session forcing `webrtc-dc-v1` if QUIC setup fails.
+/// What each accepted local connection forwards to.
+#[derive(Debug, Clone)]
+pub enum Target {
+    /// Static `--remote host:port` (the `forward` command) — every local
+    /// connection dials the same destination.
+    Static { host: String, port: u16 },
+    /// Per-connection SOCKS5 CONNECT target (the `socks5` command) — the local
+    /// port is a SOCKS5 proxy and each connection names its own destination.
+    /// This is the tunnel's userspace mode: no OS routing, so it works on strict
+    /// full-tunnel corp VPNs that capture the L3 overlay's routes.
+    Socks5,
+}
+
+/// `roomler-tunnel forward` — one static local→remote TCP forward.
 pub async fn run(
     cfg: TunnelConfig,
     agent_hex: &str,
@@ -167,16 +181,47 @@ pub async fn run(
     remote: &str,
     transport: TransportPref,
 ) -> Result<()> {
+    let (host, port) = parse_remote(remote)?;
+    run_forward(
+        cfg,
+        agent_hex,
+        local,
+        Target::Static { host, port },
+        transport,
+    )
+    .await
+}
+
+/// `roomler-tunnel socks5` — the userspace-mode SOCKS5 proxy. Same transport +
+/// server policy + agent allowlist as a static forward; the destination is taken
+/// from each connection's SOCKS5 CONNECT instead of a fixed `--remote`.
+pub async fn run_socks5(
+    cfg: TunnelConfig,
+    agent_hex: &str,
+    local: u16,
+    transport: TransportPref,
+) -> Result<()> {
+    run_forward(cfg, agent_hex, local, Target::Socks5, transport).await
+}
+
+/// Shared driver for `forward` (static target) and `socks5` (per-connection
+/// target): open a session with the preferred transport (Auto → QUIC →
+/// WebRTC-DC fallback) and serve local TCP connections through it.
+async fn run_forward(
+    cfg: TunnelConfig,
+    agent_hex: &str,
+    local: u16,
+    target: Target,
+    transport: TransportPref,
+) -> Result<()> {
     let agent_id = ObjectId::parse_str(agent_hex)
         .with_context(|| format!("--agent must be a 24-hex ObjectId, got {agent_hex}"))?;
-    let (dst_host, dst_port) = parse_remote(remote)?;
 
     info!(
         server = %cfg.server_url,
         agent = %agent_id,
         local,
-        dst_host,
-        dst_port,
+        ?target,
         ?transport,
         "roomler-tunnel forward starting"
     );
@@ -186,8 +231,7 @@ pub async fn run(
         &cfg,
         agent_id,
         local,
-        &dst_host,
-        dst_port,
+        &target,
         transport.supported_transports(),
         transport.request_transport(),
     )
@@ -199,8 +243,7 @@ pub async fn run(
                 &cfg,
                 agent_id,
                 local,
-                &dst_host,
-                dst_port,
+                &target,
                 vec![TRANSPORT_WEBRTC_DC_V1.to_string()],
                 TRANSPORT_WEBRTC_DC_V1,
             )
@@ -225,8 +268,7 @@ async fn run_session(
     cfg: &TunnelConfig,
     agent_id: ObjectId,
     local: u16,
-    dst_host: &str,
-    dst_port: u16,
+    target: &Target,
     supported_transports: Vec<String>,
     request_transport: &str,
 ) -> Result<SessionOutcome> {
@@ -332,8 +374,7 @@ async fn run_session(
             quic_auth_token,
             ice_servers,
             local,
-            dst_host,
-            dst_port,
+            target,
         )
         .await;
     }
@@ -343,8 +384,7 @@ async fn run_session(
         session_id,
         ice_servers,
         local,
-        dst_host,
-        dst_port,
+        target,
     )
     .await?;
     Ok(SessionOutcome::Completed)
@@ -360,8 +400,7 @@ async fn run_webrtc_session(
     session_id: ObjectId,
     ice_servers: Vec<IceServer>,
     local: u16,
-    dst_host: &str,
-    dst_port: u16,
+    target: &Target,
 ) -> Result<()> {
     // ────────────── Build TunnelPeer + SDP/ICE handshake ───────────
     let rtc_ice_servers: Vec<RTCIceServer> = ice_servers
@@ -484,7 +523,7 @@ async fn run_webrtc_session(
     let rr_counter = Arc::new(AtomicUsize::new(0));
 
     loop {
-        let (tcp, peer_addr) = match listener.accept().await {
+        let (mut tcp, peer_addr) = match listener.accept().await {
             Ok(x) => x,
             Err(e) => {
                 error!(%e, "accept failed");
@@ -540,29 +579,42 @@ async fn run_webrtc_session(
         let flow_id = flow_counter.fetch_add(1, Ordering::Relaxed);
         let dc_index_chosen = (rr_counter.fetch_add(1, Ordering::Relaxed) % demuxes.len()) as u8;
 
-        // Install reply oneshot before sending the request.
-        let (reply_tx, reply_rx) = oneshot::channel::<ForwardReply>();
-        reply_registry.lock().await.insert(flow_id, reply_tx);
-
         let demuxes = Arc::clone(&demuxes);
         let reply_registry = Arc::clone(&reply_registry);
         let active_flows = Arc::clone(&active_flows);
         let outbound_tx = outbound_tx.clone();
-        let dst_host = dst_host.to_string();
+        let target = target.clone();
         tokio::spawn(async move {
+            // Resolve the destination: the static `--remote`, or the
+            // per-connection SOCKS5 CONNECT target (userspace mode).
+            let (host, port, socks) = match &target {
+                Target::Static { host, port } => (host.clone(), *port, false),
+                Target::Socks5 => match crate::socks5::accept_connect(&mut tcp).await {
+                    Ok((h, p)) => (h, p, true),
+                    Err(e) => {
+                        warn!(%peer_addr, %e, "socks5 handshake failed; dropping");
+                        return;
+                    }
+                },
+            };
+            // Register the reply mailbox now that we're proceeding — before the
+            // request is sent, so the dispatcher can route the accept/reject.
+            let (reply_tx, reply_rx) = oneshot::channel::<ForwardReply>();
+            reply_registry.lock().await.insert(flow_id, reply_tx);
             if let Err(e) = handle_local_connection(
                 tcp,
                 peer_addr,
                 flow_id,
                 dc_index_chosen,
                 session_id,
-                &dst_host,
-                dst_port,
+                &host,
+                port,
                 outbound_tx,
                 reply_rx,
                 reply_registry,
                 active_flows,
                 demuxes,
+                socks,
             )
             .await
             {
@@ -586,7 +638,7 @@ async fn run_webrtc_session(
 /// `rc:tunnel.tcp.request` variant can carry a preference.
 #[allow(clippy::too_many_arguments)]
 async fn handle_local_connection(
-    tcp: tokio::net::TcpStream,
+    mut tcp: tokio::net::TcpStream,
     peer_addr: std::net::SocketAddr,
     flow_id: u32,
     _dc_index_hint: u8,
@@ -598,6 +650,9 @@ async fn handle_local_connection(
     reply_registry: ReplyRegistry,
     active_flows: ActiveFlows,
     demuxes: Arc<Vec<FlowDemux>>,
+    // SOCKS5 mode — send the CONNECT reply on this stream once the agent
+    // accepts/rejects the forward (userspace mode); `false` for static forwards.
+    socks: bool,
 ) -> Result<()> {
     // Send the request.
     outbound_tx
@@ -627,10 +682,16 @@ async fn handle_local_connection(
     let dc_index = match reply {
         ForwardReply::Accept { dc_index } => {
             info!(flow_id, dc_index, "rc:tunnel.tcp.accept");
+            if socks {
+                crate::socks5::reply(&mut tcp, crate::socks5::REP_SUCCESS).await;
+            }
             dc_index
         }
         ForwardReply::Reject { kind, reason } => {
             warn!(flow_id, ?kind, %reason, "rc:tunnel.tcp.reject — dropping local conn");
+            if socks {
+                crate::socks5::reply(&mut tcp, crate::socks5::REP_GENERAL_FAILURE).await;
+            }
             drop(tcp);
             return Ok(());
         }
@@ -831,8 +892,7 @@ async fn run_quic_session(
     quic_auth_token: Option<String>,
     ice_servers: Vec<IceServer>,
     local: u16,
-    dst_host: &str,
-    dst_port: u16,
+    target: &Target,
 ) -> Result<SessionOutcome> {
     let Some(token) = quic_auth_token else {
         warn!("server negotiated quic-v1 but sent no quic_auth_token — cannot authenticate");
@@ -972,7 +1032,7 @@ async fn run_quic_session(
     let flow_counter = Arc::new(AtomicU32::new(1));
 
     loop {
-        let (tcp, peer_addr) = match listener.accept().await {
+        let (mut tcp, peer_addr) = match listener.accept().await {
             Ok(x) => x,
             Err(e) => {
                 error!(%e, "accept failed");
@@ -996,27 +1056,40 @@ async fn run_quic_session(
         debug!(%peer_addr, "accepted local TCP connection (quic-v1)");
 
         let flow_id = flow_counter.fetch_add(1, Ordering::Relaxed);
-        let (reply_tx, reply_rx) = oneshot::channel::<ForwardReply>();
-        reply_registry.lock().await.insert(flow_id, reply_tx);
 
         let reply_registry = Arc::clone(&reply_registry);
         let active_flows = Arc::clone(&active_flows);
         let outbound_tx = outbound_tx.clone();
-        let dst_host = dst_host.to_string();
+        let target = target.clone();
         let conn = Arc::clone(&conn);
         tokio::spawn(async move {
+            // Resolve the destination: static `--remote`, or the per-connection
+            // SOCKS5 CONNECT target (userspace mode).
+            let (host, port, socks) = match &target {
+                Target::Static { host, port } => (host.clone(), *port, false),
+                Target::Socks5 => match crate::socks5::accept_connect(&mut tcp).await {
+                    Ok((h, p)) => (h, p, true),
+                    Err(e) => {
+                        warn!(%peer_addr, %e, "socks5 handshake failed; dropping");
+                        return;
+                    }
+                },
+            };
+            let (reply_tx, reply_rx) = oneshot::channel::<ForwardReply>();
+            reply_registry.lock().await.insert(flow_id, reply_tx);
             if let Err(e) = handle_local_connection_quic(
                 tcp,
                 peer_addr,
                 flow_id,
                 session_id,
                 conn,
-                &dst_host,
-                dst_port,
+                &host,
+                port,
                 outbound_tx,
                 reply_rx,
                 reply_registry,
                 active_flows,
+                socks,
             )
             .await
             {
@@ -1277,7 +1350,7 @@ async fn quic_dispatch_loop(
 /// each flow is its own stream.
 #[allow(clippy::too_many_arguments)]
 async fn handle_local_connection_quic(
-    tcp: tokio::net::TcpStream,
+    mut tcp: tokio::net::TcpStream,
     peer_addr: std::net::SocketAddr,
     flow_id: u32,
     session_id: ObjectId,
@@ -1288,6 +1361,7 @@ async fn handle_local_connection_quic(
     reply_rx: oneshot::Receiver<ForwardReply>,
     reply_registry: ReplyRegistry,
     active_flows: ActiveFlows,
+    socks: bool,
 ) -> Result<()> {
     // Request the forward.
     outbound_tx
@@ -1318,9 +1392,15 @@ async fn handle_local_connection_quic(
             // dc_index is meaningless for QUIC (the agent sends 0);
             // logged only for symmetry with the WebRTC path.
             debug!(flow_id, dc_index, "rc:tunnel.tcp.accept (quic)");
+            if socks {
+                crate::socks5::reply(&mut tcp, crate::socks5::REP_SUCCESS).await;
+            }
         }
         ForwardReply::Reject { kind, reason } => {
             warn!(flow_id, ?kind, %reason, "rc:tunnel.tcp.reject — dropping local conn");
+            if socks {
+                crate::socks5::reply(&mut tcp, crate::socks5::REP_GENERAL_FAILURE).await;
+            }
             drop(tcp);
             return Ok(());
         }
@@ -1627,6 +1707,7 @@ mod tests {
                 reply_rx,
                 reply_registry,
                 active_flows,
+                false,
             )
             .await
         });
