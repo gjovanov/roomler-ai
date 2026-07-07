@@ -8,6 +8,7 @@
 
 pub mod config;
 pub mod forward;
+pub mod mesh;
 pub mod socks5;
 
 pub use tunnel_core::forward as core_forward;
