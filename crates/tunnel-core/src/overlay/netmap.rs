@@ -17,6 +17,9 @@ use super::decode_public;
 pub struct PeerConfig {
     pub public_key: [u8; 32],
     pub overlay_ip: Ipv4Addr,
+    /// Human-facing node name (Phase 0), for MagicDNS name→IP. Empty when the
+    /// server predates Phase 0.
+    pub name: String,
     /// Dialable endpoints (host/srflx/relay), priority order — the
     /// runtime picks one to build the carrier.
     pub endpoints: Vec<String>,
@@ -39,6 +42,7 @@ pub fn peer_config_from_netmap(peer: &NetmapPeer) -> Option<PeerConfig> {
     Some(PeerConfig {
         public_key,
         overlay_ip,
+        name: peer.name.clone(),
         endpoints: peer.endpoints.clone(),
         supports_quic: peer.supports_quic,
     })
@@ -54,6 +58,7 @@ mod tests {
         NetmapPeer {
             node_id: ObjectId::new(),
             overlay_ip: ip.into(),
+            name: String::new(),
             wg_public_key: pubkey_b64.into(),
             endpoints: vec!["203.0.113.5:51820".into()],
             relay_home: None,
