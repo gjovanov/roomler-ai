@@ -102,6 +102,65 @@ pub async fn reply(tcp: &mut TcpStream, rep: u8) {
         .await;
 }
 
+/// Minimal SOCKS5 **client** handshake over an already-connected `stream`:
+/// negotiate no-auth, then CONNECT to `dst_host:dst_port` (sent as a domain-name
+/// ATYP so the far proxy resolves it). Returns `Ok(())` on a success reply,
+/// leaving the stream positioned at the first payload byte. Used by the mesh to
+/// chain into a per-agent loopback proxy.
+pub async fn client_connect(stream: &mut TcpStream, dst_host: &str, dst_port: u16) -> Result<()> {
+    stream
+        .write_all(&[VER, 0x01, METHOD_NO_AUTH])
+        .await
+        .context("socks client greeting")?;
+    let mut sel = [0u8; 2];
+    stream
+        .read_exact(&mut sel)
+        .await
+        .context("socks client method reply")?;
+    if sel != [VER, METHOD_NO_AUTH] {
+        bail!("proxy rejected no-auth (got {sel:?})");
+    }
+    let host = dst_host.as_bytes();
+    if host.len() > 255 {
+        bail!("dst_host too long for SOCKS domain ATYP");
+    }
+    let mut req = vec![VER, CMD_CONNECT, 0x00, ATYP_DOMAIN, host.len() as u8];
+    req.extend_from_slice(host);
+    req.extend_from_slice(&dst_port.to_be_bytes());
+    stream
+        .write_all(&req)
+        .await
+        .context("socks client connect request")?;
+    let mut head = [0u8; 4];
+    stream
+        .read_exact(&mut head)
+        .await
+        .context("socks client reply header")?;
+    if head[1] != REP_SUCCESS {
+        bail!("proxy CONNECT failed (REP={:#x})", head[1]);
+    }
+    // Consume BND.ADDR + BND.PORT so the stream is positioned at the payload.
+    let addr_len = match head[3] {
+        ATYP_IPV4 => 4,
+        ATYP_IPV6 => 16,
+        ATYP_DOMAIN => {
+            let mut l = [0u8; 1];
+            stream
+                .read_exact(&mut l)
+                .await
+                .context("socks client reply domain len")?;
+            l[0] as usize
+        }
+        other => bail!("bad reply atyp {other:#x}"),
+    };
+    let mut skip = vec![0u8; addr_len + 2];
+    stream
+        .read_exact(&mut skip)
+        .await
+        .context("socks client reply addr")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
