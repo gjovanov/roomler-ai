@@ -71,6 +71,24 @@ enum Command {
         #[arg(long, value_enum, default_value = "auto")]
         transport: forward::TransportPref,
     },
+    /// Run a local SOCKS5 proxy ("userspace mode"): apps point at
+    /// `127.0.0.1:<local>` and each connection's SOCKS5 CONNECT target is dialed
+    /// by the named agent over the tunnel. Needs NO OS routing, so it works on
+    /// strict full-tunnel corporate VPNs (Check Point, etc.) where the L3 overlay
+    /// can't win the routing table. Same server policy + agent allowlist as
+    /// `forward`. Stays in the foreground; Ctrl-C tears down. TCP CONNECT only.
+    Socks5 {
+        /// Hex `agent_id` of the target agent (visible in the admin UI).
+        #[arg(long)]
+        agent: String,
+        /// Local TCP port for the SOCKS5 listener (bound to 127.0.0.1).
+        #[arg(long)]
+        local: u16,
+        /// Data-plane transport — same semantics as `forward` (`auto` prefers
+        /// QUIC with WebRTC-DC fallback).
+        #[arg(long, value_enum, default_value = "auto")]
+        transport: forward::TransportPref,
+    },
     /// Read a multi-forward config from disk and run all forwards as
     /// persistent listeners. Auto-reconnects on transient failure.
     /// T3 implements the operability layer; not yet wired.
@@ -108,6 +126,14 @@ async fn main() -> Result<()> {
         } => {
             let cfg = config::load(cli.config).context("loading tunnel config")?;
             forward::run(cfg, &agent, local, &remote, transport).await
+        }
+        Command::Socks5 {
+            agent,
+            local,
+            transport,
+        } => {
+            let cfg = config::load(cli.config).context("loading tunnel config")?;
+            forward::run_socks5(cfg, &agent, local, transport).await
         }
         Command::Run {} => bail!("T3: multi-forward `run` not yet wired"),
         Command::Diagnose { agent } => {
@@ -281,6 +307,31 @@ mod tests {
                 assert_eq!(transport, forward::TransportPref::Auto);
             }
             other => panic!("expected Forward, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_socks5() {
+        let cli = Cli::try_parse_from([
+            "roomler-tunnel",
+            "socks5",
+            "--agent",
+            "507f1f77bcf86cd799439011",
+            "--local",
+            "1080",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Socks5 {
+                agent,
+                local,
+                transport,
+            } => {
+                assert_eq!(agent, "507f1f77bcf86cd799439011");
+                assert_eq!(local, 1080);
+                assert_eq!(transport, forward::TransportPref::Auto);
+            }
+            other => panic!("expected Socks5, got {other:?}"),
         }
     }
 
