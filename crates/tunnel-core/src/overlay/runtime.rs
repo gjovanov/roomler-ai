@@ -862,6 +862,7 @@ mod tests {
         NetmapPeer {
             node_id: ObjectId::new(),
             overlay_ip: ip.into(),
+            name: String::new(),
             wg_public_key: kp.public_base64(),
             endpoints: vec![],
             relay_home: None,
