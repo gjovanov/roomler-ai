@@ -12,6 +12,7 @@ use futures::{SinkExt, StreamExt, stream::SplitSink};
 use roomler_ai_remote_control::{
     Hub,
     hub::DispatchCtx,
+    models::ConsentMode,
     signaling::{ClientMsg, Role, ServerMsg},
 };
 use std::sync::Arc;
@@ -89,6 +90,9 @@ pub async fn handle_agent_socket(
         agent_id: Some(agent_id),
         controller_name: None,
         controller_tx: None,
+        // Unused for agent-role dispatch (only a controller's SessionRequest
+        // consumes it); a harmless default.
+        consent_mode: ConsentMode::Prompt,
     };
 
     // Read loop. rc.53: wrapped in `tokio::select!` so the Hub's
@@ -238,6 +242,7 @@ pub fn dispatch_controller_rc(
     controller_name: &str,
     controller_tx: &roomler_ai_remote_control::session::ClientTx,
     text: &str,
+    consent_mode: ConsentMode,
 ) -> bool {
     let Ok(parsed) = serde_json::from_str::<ClientMsg>(text) else {
         return false;
@@ -248,6 +253,7 @@ pub fn dispatch_controller_rc(
         agent_id: None,
         controller_name: Some(controller_name.to_string()),
         controller_tx: Some(controller_tx.clone()),
+        consent_mode,
     };
     if let Err(e) = hub.dispatch(&ctx, parsed) {
         warn!(%user_id, %e, "rc:* dispatch failed (controller)");
@@ -263,69 +269,76 @@ pub fn dispatch_controller_rc(
     true
 }
 
-/// Authorization gate for `rc:session.request` — the Hub can't do this because
-/// the `remote_control` crate sits below `services` in the dep graph and has no
-/// access to tenant roles. Returns `Some(reason)` to DENY, or `None` to allow
-/// (also `None` for any non-`SessionRequest` rc:* message — those are
-/// intra-session and gated by the session itself).
+/// Authorization + consent-mode gate for `rc:session.request` — the Hub can't
+/// do this because the `remote_control` crate sits below `services` in the dep
+/// graph and has no access to tenant roles. Returns `Ok(consent_mode)` for an
+/// allowed request (the effective mode the agent should apply), or `Err(reason)`
+/// to DENY. A non-`SessionRequest` rc:* message returns `Ok(Prompt)` — those are
+/// intra-session and the mode is unused (only `create_session` reads it).
 ///
 /// Layers (the consent-model plan's coarse→fine authz): quarantine → self-control
 /// → tenant capability (`ADMINISTRATOR` break-glass / `REMOTE_CONTROL`) →
-/// per-agent allowlist (an empty allowlist = no per-device restriction; the
-/// device's consent mode is then the real gate). Consent-mode *resolution* is
-/// Phase 2 — this is only the "may they request at all" decision.
-pub async fn deny_reason_for_session_request(
+/// per-agent allowlist (an empty allowlist = no per-device restriction). The
+/// resolved consent mode is: self-control → `Auto`; otherwise the device's
+/// `AccessPolicy.effective_consent_mode()` (per-device override, else `Prompt` =
+/// attended). Break-glass (admin skips consent) is Phase 5.
+pub async fn resolve_session_authz(
     state: &AppState,
     controller_user_id: ObjectId,
     text: &str,
-) -> Option<String> {
+) -> Result<ConsentMode, String> {
     use roomler_ai_db::models::role::permissions;
     use roomler_ai_remote_control::models::AgentStatus;
 
     let agent_id = match serde_json::from_str::<ClientMsg>(text) {
         Ok(ClientMsg::SessionRequest { agent_id, .. }) => agent_id,
-        _ => return None,
+        // Not a session request → the mode is unused; allow through.
+        _ => return Ok(ConsentMode::Prompt),
     };
 
     // Unknown / soft-deleted agent → let the Hub answer with a clean
-    // AgentNotFound rather than surfacing a permission error.
+    // AgentNotFound rather than surfacing a permission error (the mode is moot —
+    // create_session will fail on the agent lookup).
     let agent = match state.agents.base.find_by_id(agent_id).await {
         Ok(a) if a.deleted_at.is_none() => a,
-        _ => return None,
+        _ => return Ok(ConsentMode::Prompt),
     };
 
     if agent.status == AgentStatus::Quarantined {
-        return Some("device is quarantined; new sessions are blocked".to_string());
+        return Err("device is quarantined; new sessions are blocked".to_string());
     }
 
-    // Controlling your OWN device is always allowed (its consent mode still
-    // applies downstream).
+    // Controlling your OWN device is always allowed AND auto-consents.
     if agent.owner_user_id == controller_user_id {
-        return None;
+        return Ok(ConsentMode::Auto);
     }
+
+    // The effective mode for an allowed non-owner controller (attended default).
+    let mode = agent.access_policy.effective_consent_mode();
 
     let perms = state
         .tenants
         .get_member_permissions(agent.tenant_id, controller_user_id)
         .await
         .unwrap_or(0);
-    // ADMINISTRATOR is the break-glass bypass (Phase 5 adds the mandatory reason
-    // + owner notification; the authz decision itself lives here).
+    // ADMINISTRATOR is the break-glass bypass for AUTHZ (Phase 5 adds the
+    // consent-skip + mandatory reason + owner notification); they still get the
+    // device's consent mode here.
     if permissions::has(perms, permissions::ADMINISTRATOR) {
-        return None;
+        return Ok(mode);
     }
     if !permissions::has(perms, permissions::REMOTE_CONTROL) {
-        return Some("you don't have permission to control others' devices".to_string());
+        return Err("you don't have permission to control others' devices".to_string());
     }
 
     // Per-agent allowlist. Empty ⇒ no per-device restriction (any operator may
     // request; consent is the real gate). Non-empty ⇒ user or a role must match.
     let policy = &agent.access_policy;
     if policy.allowed_user_ids.is_empty() && policy.allowed_role_ids.is_empty() {
-        return None;
+        return Ok(mode);
     }
     if policy.allowed_user_ids.contains(&controller_user_id) {
-        return None;
+        return Ok(mode);
     }
     let role_ids = state
         .tenants
@@ -333,9 +346,9 @@ pub async fn deny_reason_for_session_request(
         .await
         .unwrap_or_default();
     if policy.allowed_role_ids.iter().any(|r| role_ids.contains(r)) {
-        return None;
+        return Ok(mode);
     }
-    Some("you're not on this device's control allowlist".to_string())
+    Err("you're not on this device's control allowlist".to_string())
 }
 
 /// Stable short code for the wire. Exhaustive match so a new

@@ -20,7 +20,7 @@ use tracing::{info, warn};
 use crate::audit::AuditSink;
 use crate::consent::{ConsentOutcome, DEFAULT_CONSENT_TIMEOUT};
 use crate::error::{Error, Result};
-use crate::models::{AuditKind, EndReason, OsKind, SessionPhase};
+use crate::models::{AuditKind, ConsentMode, EndReason, OsKind, SessionPhase};
 use crate::permissions::Permissions;
 use crate::session::{ClientTx, LiveSession};
 use crate::signaling::{AgentCloseReason, ClientMsg, Role, ServerMsg};
@@ -280,6 +280,7 @@ impl Hub {
         browser_caps: Vec<String>,
         preferred_transport: Option<String>,
         chroma_pref: Option<String>,
+        consent_mode: ConsentMode,
     ) -> Result<ObjectId> {
         let agent_org = {
             let mut agent = self
@@ -325,6 +326,10 @@ impl Hub {
             browser_caps,
             preferred_transport,
             chroma_pref,
+            // Server-authoritative directive: the agent obeys this rather than
+            // its local `auto_grant_session`. `Auto` → immediate grant; anything
+            // else → on-host prompt.
+            consent_mode: Some(consent_mode),
         });
 
         self.audit(session_id, agent_id, agent_org, AuditKind::SessionRequested);
@@ -591,6 +596,12 @@ pub struct DispatchCtx {
     pub agent_id: Option<ObjectId>, // Some for Agent
     pub controller_name: Option<String>,
     pub controller_tx: Option<ClientTx>,
+    /// Phase 2 — the server-resolved consent mode for a controller's
+    /// `SessionRequest` (self-control → `Auto`; else the device's effective
+    /// mode). The API WS layer computes it (it has the DB access the Hub lacks)
+    /// and sets it here; `create_session` forwards it to the agent. Ignored for
+    /// non-request messages and agent-role dispatch (defaults to `Prompt`).
+    pub consent_mode: ConsentMode,
 }
 
 impl Hub {
@@ -626,6 +637,7 @@ impl Hub {
                     browser_caps,
                     preferred_transport,
                     chroma_pref,
+                    ctx.consent_mode,
                 )?;
                 Ok(())
             }
@@ -699,6 +711,7 @@ mod tests {
             Vec::new(),
             None,
             None, // chroma_pref
+            ConsentMode::Prompt,
         );
         assert!(matches!(res, Err(Error::AgentOffline(_))));
     }
@@ -720,6 +733,7 @@ mod tests {
                 Vec::new(),
                 None,
                 None, // chroma_pref
+                ConsentMode::Prompt,
             )
             .unwrap();
 

@@ -16,7 +16,7 @@
 use bson::oid::ObjectId;
 use serde::{Deserialize, Serialize};
 
-use crate::models::{AgentCaps, DisplayInfo, EndReason, OsKind};
+use crate::models::{AgentCaps, ConsentMode, DisplayInfo, EndReason, OsKind};
 use crate::permissions::Permissions;
 use crate::serde_helpers::{oid_hex, option_oid_hex, vec_oid_hex};
 
@@ -562,6 +562,14 @@ pub enum ServerMsg {
         /// `ROOMLER_AGENT_VP9_CHROMA` env-var default".
         #[serde(default, skip_serializing_if = "Option::is_none")]
         chroma_pref: Option<String>,
+        /// Phase 2 — server-authoritative consent directive. `None` (an older
+        /// server that predates consent modes) → the agent falls back to its
+        /// local `auto_grant_session` config; `Some(mode)` → the agent OBEYS:
+        /// `Auto` grants immediately with no prompt, everything else runs the
+        /// on-host prompt path. Resolved server-side from the device's
+        /// `AccessPolicy.consent_mode` (self-control → `Auto`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        consent_mode: Option<ConsentMode>,
     },
 
     /// Server forwards SDP offer from controller → agent.

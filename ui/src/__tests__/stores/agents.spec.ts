@@ -30,7 +30,7 @@ function mkAgent(over: Partial<Agent> = {}): Agent {
     is_online: false,
     last_seen_at: '2026-04-17T09:00:00Z',
     access_policy: {
-      require_consent: true,
+      consent_mode: 'prompt',
       allowed_role_ids: [],
       allowed_user_ids: [],
       auto_terminate_idle_minutes: null,
@@ -115,7 +115,7 @@ describe('useAgentStore', () => {
     const s = useAgentStore()
     s.agents = [mkAgent({ id: 'a1' })]
     const policy = {
-      require_consent: false,
+      consent_mode: 'auto' as const,
       allowed_role_ids: ['r1'],
       allowed_user_ids: [],
       auto_terminate_idle_minutes: 30,

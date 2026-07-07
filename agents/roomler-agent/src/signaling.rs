@@ -638,6 +638,7 @@ async fn handle_server_msg(
             browser_caps,
             preferred_transport,
             chroma_pref,
+            consent_mode,
         } => {
             // Pick the best codec for this session from the
             // intersection of (browser-advertised, agent-supported).
@@ -695,15 +696,35 @@ async fn handle_server_msg(
             // background; auto-grant resolves <1ms, prompt mode can
             // take up to 30s — we MUST NOT block the WS read loop.
             // Decision flows back via outbound_tx as a ClientMsg::Consent.
+            // Phase 2 — obey the server's per-session consent directive when
+            // present; fall back to the broker's startup mode (local
+            // `auto_grant_session`) for an older server that sends none.
+            let directed_mode: Option<crate::consent::Mode> = consent_mode.map(|m| match m {
+                roomler_ai_remote_control::models::ConsentMode::Auto => {
+                    crate::consent::Mode::AutoGrant
+                }
+                // Prompt + the async owner-side channels (Email / Push /
+                // PromptThenEmail) all resolve to an on-host prompt at the
+                // agent: the server drives the owner channels itself (Phase 4)
+                // and asks the agent to prompt as the on-console path/fallback.
+                // Bound the wait by the server-sent timeout.
+                _ => crate::consent::Mode::Prompt {
+                    timeout: std::time::Duration::from_secs(consent_timeout_secs as u64),
+                },
+            });
             let broker = consent_broker.clone();
             let outbound = outbound_tx.clone();
             let session_hex = session_id.to_hex();
             tokio::spawn(async move {
-                let decision = broker.request(&session_hex).await;
+                let decision = match directed_mode {
+                    Some(m) => broker.request_with_mode(&session_hex, m).await,
+                    None => broker.request(&session_hex).await,
+                };
                 let granted = decision.granted();
                 tracing::info!(
                     session = %session_hex,
                     ?decision,
+                    ?directed_mode,
                     granted,
                     "consent decision → sending rc:consent"
                 );

@@ -91,14 +91,52 @@ pub struct AgentCaps {
     pub vp9_chroma: String,
 }
 
+/// How consent is obtained before a controller may drive a device. Resolved
+/// server-side per session from the device's [`AccessPolicy::consent_mode`]
+/// (with `Prompt` — attended — as the system default), then carried to the agent
+/// in `ServerMsg::Request` as a directive the agent obeys. Self-control
+/// (`controller == owner_user_id`) short-circuits to `Auto` in the API gate.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsentMode {
+    /// Unattended: grant immediately, no prompt. For self-owned / kiosk / server
+    /// devices explicitly marked unattended.
+    Auto,
+    /// Attended (the default): the controlled host prompts (tray / CLI) and the
+    /// person there must approve within the timeout.
+    #[default]
+    Prompt,
+    /// Email an approve-link to the device owner; the session waits (Phase 4).
+    Email,
+    /// Push an in-app consent card to the device owner (Phase 4).
+    Push,
+    /// Prompt the host first; fall back to email if nobody answers (Phase 4).
+    PromptThenEmail,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct AccessPolicy {
-    pub require_consent: bool,
+    /// How consent is obtained for a non-owner controller. `None` = inherit the
+    /// system default ([`ConsentMode::Prompt`] — attended). Set per device by a
+    /// `MANAGE_AGENTS` admin. (Replaces the legacy `require_consent` bool; old
+    /// rows carrying that field deserialize to `None` → attended, the safe
+    /// default.)
+    #[serde(default)]
+    pub consent_mode: Option<ConsentMode>,
     #[serde(default)]
     pub allowed_role_ids: Vec<ObjectId>,
     #[serde(default)]
     pub allowed_user_ids: Vec<ObjectId>,
     pub auto_terminate_idle_minutes: Option<u32>,
+}
+
+impl AccessPolicy {
+    /// Effective consent mode for a NON-owner controller: the per-device mode,
+    /// or the system default (`Prompt` = attended) when unset. Self-control is
+    /// resolved to `Auto` by the caller before this is consulted.
+    pub fn effective_consent_mode(&self) -> ConsentMode {
+        self.consent_mode.unwrap_or(ConsentMode::Prompt)
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
