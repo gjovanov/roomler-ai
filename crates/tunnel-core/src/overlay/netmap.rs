@@ -10,6 +10,7 @@ use std::net::Ipv4Addr;
 use roomler_ai_remote_control::signaling::NetmapPeer;
 
 use super::decode_public;
+use super::router::Cidr;
 
 /// A peer reduced to what the WG device needs: its static public key and
 /// its single-host overlay address (`allowed_ips = overlay_ip/32`).
@@ -20,6 +21,11 @@ pub struct PeerConfig {
     /// Human-facing node name (Phase 0), for MagicDNS name→IP. Empty when the
     /// server predates Phase 0.
     pub name: String,
+    /// Phase 1 — approved subnet routes this peer is a router for. Installed into
+    /// the local [`Router`](super::router::Router) (allowed_ips) + OS route table
+    /// so LAN behind the peer is reachable over the overlay. Empty for a normal
+    /// peer.
+    pub subnets: Vec<Cidr>,
     /// Dialable endpoints (host/srflx/relay), priority order — the
     /// runtime picks one to build the carrier.
     pub endpoints: Vec<String>,
@@ -43,6 +49,7 @@ pub fn peer_config_from_netmap(peer: &NetmapPeer) -> Option<PeerConfig> {
         public_key,
         overlay_ip,
         name: peer.name.clone(),
+        subnets: peer.routes.iter().filter_map(|r| Cidr::parse(r)).collect(),
         endpoints: peer.endpoints.clone(),
         supports_quic: peer.supports_quic,
     })
