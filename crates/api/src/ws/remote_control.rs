@@ -263,6 +263,81 @@ pub fn dispatch_controller_rc(
     true
 }
 
+/// Authorization gate for `rc:session.request` — the Hub can't do this because
+/// the `remote_control` crate sits below `services` in the dep graph and has no
+/// access to tenant roles. Returns `Some(reason)` to DENY, or `None` to allow
+/// (also `None` for any non-`SessionRequest` rc:* message — those are
+/// intra-session and gated by the session itself).
+///
+/// Layers (the consent-model plan's coarse→fine authz): quarantine → self-control
+/// → tenant capability (`ADMINISTRATOR` break-glass / `REMOTE_CONTROL`) →
+/// per-agent allowlist (an empty allowlist = no per-device restriction; the
+/// device's consent mode is then the real gate). Consent-mode *resolution* is
+/// Phase 2 — this is only the "may they request at all" decision.
+pub async fn deny_reason_for_session_request(
+    state: &AppState,
+    controller_user_id: ObjectId,
+    text: &str,
+) -> Option<String> {
+    use roomler_ai_db::models::role::permissions;
+    use roomler_ai_remote_control::models::AgentStatus;
+
+    let agent_id = match serde_json::from_str::<ClientMsg>(text) {
+        Ok(ClientMsg::SessionRequest { agent_id, .. }) => agent_id,
+        _ => return None,
+    };
+
+    // Unknown / soft-deleted agent → let the Hub answer with a clean
+    // AgentNotFound rather than surfacing a permission error.
+    let agent = match state.agents.base.find_by_id(agent_id).await {
+        Ok(a) if a.deleted_at.is_none() => a,
+        _ => return None,
+    };
+
+    if agent.status == AgentStatus::Quarantined {
+        return Some("device is quarantined; new sessions are blocked".to_string());
+    }
+
+    // Controlling your OWN device is always allowed (its consent mode still
+    // applies downstream).
+    if agent.owner_user_id == controller_user_id {
+        return None;
+    }
+
+    let perms = state
+        .tenants
+        .get_member_permissions(agent.tenant_id, controller_user_id)
+        .await
+        .unwrap_or(0);
+    // ADMINISTRATOR is the break-glass bypass (Phase 5 adds the mandatory reason
+    // + owner notification; the authz decision itself lives here).
+    if permissions::has(perms, permissions::ADMINISTRATOR) {
+        return None;
+    }
+    if !permissions::has(perms, permissions::REMOTE_CONTROL) {
+        return Some("you don't have permission to control others' devices".to_string());
+    }
+
+    // Per-agent allowlist. Empty ⇒ no per-device restriction (any operator may
+    // request; consent is the real gate). Non-empty ⇒ user or a role must match.
+    let policy = &agent.access_policy;
+    if policy.allowed_user_ids.is_empty() && policy.allowed_role_ids.is_empty() {
+        return None;
+    }
+    if policy.allowed_user_ids.contains(&controller_user_id) {
+        return None;
+    }
+    let role_ids = state
+        .tenants
+        .member_role_ids(agent.tenant_id, controller_user_id)
+        .await
+        .unwrap_or_default();
+    if policy.allowed_role_ids.iter().any(|r| role_ids.contains(r)) {
+        return None;
+    }
+    Some("you're not on this device's control allowlist".to_string())
+}
+
 /// Stable short code for the wire. Exhaustive match so a new
 /// `remote_control::Error` variant triggers a compile error here rather
 /// than silently being reported as "internal".

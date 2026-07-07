@@ -52,6 +52,15 @@ pub mod permissions {
     pub const MANAGE_MEETINGS: u64 = 1 << 21;
     pub const MANAGE_DOCUMENTS: u64 = 1 << 22;
     pub const ADMINISTRATOR: u64 = 1 << 23;
+    /// Enroll / rename / delete / assign-owner / set-policy for remote-control
+    /// agents (devices).
+    pub const MANAGE_AGENTS: u64 = 1 << 24;
+    /// Initiate a remote-control session against a device you do NOT own.
+    /// (Controlling your OWN device — `controller == owner_user_id` — never
+    /// needs this; it's gated only by the device's consent mode.)
+    pub const REMOTE_CONTROL: u64 = 1 << 25;
+    /// View the remote-control audit log (`remote_audit`).
+    pub const VIEW_REMOTE_AUDIT: u64 = 1 << 26;
 
     /// Default member permissions
     pub const DEFAULT_MEMBER: u64 = VIEW_CHANNELS
@@ -78,10 +87,15 @@ pub mod permissions {
         | DEAFEN_MEMBERS
         | MOVE_MEMBERS
         | MANAGE_MEETINGS
-        | MANAGE_DOCUMENTS;
+        | MANAGE_DOCUMENTS
+        | MANAGE_AGENTS
+        | REMOTE_CONTROL
+        | VIEW_REMOTE_AUDIT;
 
-    /// Owner permissions (everything)
-    pub const ALL: u64 = (1 << 24) - 1;
+    /// Owner permissions (everything). Bump the mask whenever a new bit is
+    /// added above so `ALL` literally contains every defined permission (owner
+    /// also passes via the `ADMINISTRATOR` bypass in `has`, but keep this exact).
+    pub const ALL: u64 = (1 << 27) - 1;
 
     pub fn has(permissions: u64, flag: u64) -> bool {
         permissions & ADMINISTRATOR != 0 || permissions & flag == flag
