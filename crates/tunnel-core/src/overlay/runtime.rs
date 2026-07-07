@@ -285,6 +285,11 @@ impl OverlayRuntime {
         };
         info!(%self_v4, mtu = self.mtu, "overlay: TUN up");
 
+        // Phase 1 — if this node advertises subnet routes, turn on IP forwarding
+        // + NAT so overlay peers can reach the LANs it fronts. Held for the
+        // runtime's lifetime; its `Drop` reverts on WS disconnect / shutdown.
+        let _subnet_router = super::nat::enable(&network.cidr, &self.advertised_routes).await;
+
         // Inbound writer: decrypted packets → TUN. Independent of the
         // device, so it's a plain spawned task.
         let writer_tun = tun.clone();
