@@ -50,6 +50,7 @@
             <th>Name</th>
             <th>Status</th>
             <th>OS</th>
+            <th>Consent</th>
             <th>Codecs</th>
             <th>Last seen</th>
           </tr>
@@ -134,6 +135,20 @@
               <v-chip size="x-small" :prepend-icon="osIcon(a.os)" variant="tonal">
                 {{ a.os }}
               </v-chip>
+            </td>
+            <td>
+              <v-select
+                :model-value="a.access_policy.consent_mode ?? 'prompt'"
+                :items="CONSENT_MODE_ITEMS"
+                density="compact"
+                variant="plain"
+                hide-details
+                :disabled="consentBusy === a.id"
+                :loading="consentBusy === a.id"
+                class="consent-select"
+                :aria-label="`Consent mode for ${a.name}`"
+                @update:model-value="(m) => onConsentModeChange(a, m as ConsentMode)"
+              />
             </td>
             <td>
               <div v-if="codecChips(a).length === 0" class="text-caption text-medium-emphasis">—</div>
@@ -387,7 +402,12 @@
 <script setup lang="ts">
 import { ref, onMounted, watch } from 'vue'
 import { useDisplay } from 'vuetify'
-import { useAgentStore, type Agent, type EnrollmentToken } from '@/stores/agents'
+import {
+  useAgentStore,
+  type Agent,
+  type ConsentMode,
+  type EnrollmentToken,
+} from '@/stores/agents'
 import { codecChips } from './agentCodecChips'
 import AgentCrashesDialog from './AgentCrashesDialog.vue'
 import AgentLogsDialog from './AgentLogsDialog.vue'
@@ -395,6 +415,29 @@ import AgentLogsDialog from './AgentLogsDialog.vue'
 const props = defineProps<{ tenantId: string }>()
 
 const agentStore = useAgentStore()
+
+// Phase 2 — per-device consent mode. Only the two modes enforced today are
+// offered; Email / Push / PromptThenEmail arrive with Phase 4's owner channels.
+const CONSENT_MODE_ITEMS: { title: string; value: ConsentMode }[] = [
+  { title: 'Prompt on host (attended)', value: 'prompt' },
+  { title: 'Auto-grant (unattended)', value: 'auto' },
+]
+// Agent id whose consent mode is mid-update (disables + spins that row's select).
+const consentBusy = ref<string | null>(null)
+async function onConsentModeChange(a: Agent, mode: ConsentMode) {
+  if ((a.access_policy.consent_mode ?? 'prompt') === mode) return
+  consentBusy.value = a.id
+  try {
+    await agentStore.updateAccessPolicy(props.tenantId, a.id, {
+      ...a.access_policy,
+      consent_mode: mode,
+    })
+  } catch (e) {
+    agentStore.error = (e as Error).message
+  } finally {
+    consentBusy.value = null
+  }
+}
 
 // `mobile` flips below sm (~600px) so the table stays usable on tablets
 // and small laptops; `lgAndDown` (≤1280) drives the codec-chip rollup so
