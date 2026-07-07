@@ -7,14 +7,14 @@
 //! change to the tunnel hot path; each per-agent proxy keeps its own
 //! keepalive/auto-reconnect session.
 //!
-//! v1.5a addresses an agent by its **24-hex agent-id** as the SOCKS hostname
-//! (`curl --socks5-hostname <agent-id>:3389`). A friendly-name roster
-//! (name → agent-id, from the server) is the v1.5b follow-up.
+//! Address an agent by its **friendly name** (from the server roster) or its
+//! **24-hex agent-id** as the SOCKS hostname
+//! (`curl --socks5-hostname neo16:3389` or `<agent-id>:3389`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use bson::oid::ObjectId;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
@@ -29,6 +29,10 @@ use crate::socks5;
 /// and reused thereafter.
 type ProxyPorts = Arc<Mutex<HashMap<ObjectId, u16>>>;
 
+/// Friendly-name → agent-id map (lowercased keys), fetched from the server so a
+/// CONNECT can name an agent by its label instead of its raw 24-hex id.
+type Roster = Arc<Mutex<HashMap<String, ObjectId>>>;
+
 /// Cap on connecting to a freshly-spawned per-agent proxy (it must bind its
 /// listener; its tunnel session establishes lazily on the first forwarded flow).
 const PROXY_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -41,9 +45,24 @@ pub async fn run_mesh(cfg: TunnelConfig, local: u16, transport: TransportPref) -
     info!(
         local = %listener.local_addr()?,
         ?transport,
-        "roomler-tunnel SOCKS5 mesh listening (address an agent by its 24-hex id as the SOCKS hostname)"
+        "roomler-tunnel SOCKS5 mesh listening (address an agent by its name or 24-hex id as the SOCKS hostname)"
     );
     let ports: ProxyPorts = Arc::new(Mutex::new(HashMap::new()));
+
+    // Agent roster (friendly-name → agent-id). Best-effort at startup — if it
+    // fails (older server, transient), addressing by raw 24-hex agent-id still
+    // works, and an unknown name triggers a lazy re-fetch below.
+    let roster: Roster = Arc::new(Mutex::new(HashMap::new()));
+    match fetch_roster(&cfg).await {
+        Ok(r) => {
+            info!(
+                agents = r.len(),
+                "mesh: fetched agent roster (name → agent-id)"
+            );
+            *roster.lock().await = r;
+        }
+        Err(e) => warn!(%e, "mesh: roster fetch failed; agent-id addressing still works"),
+    }
 
     loop {
         let (mut tcp, peer_addr) = match listener.accept().await {
@@ -56,6 +75,7 @@ pub async fn run_mesh(cfg: TunnelConfig, local: u16, transport: TransportPref) -
         let _ = tcp.set_nodelay(true);
         let cfg = cfg.clone();
         let ports = Arc::clone(&ports);
+        let roster = Arc::clone(&roster);
         tokio::spawn(async move {
             // SOCKS server handshake → the client's CONNECT target.
             let (host, port) = match socks5::accept_connect(&mut tcp).await {
@@ -65,12 +85,10 @@ pub async fn run_mesh(cfg: TunnelConfig, local: u16, transport: TransportPref) -
                     return;
                 }
             };
-            // v1.5a: the SOCKS hostname IS the agent id.
-            let Ok(agent_id) = ObjectId::parse_str(&host) else {
-                warn!(
-                    %peer_addr, host,
-                    "mesh: unknown target (v1.5a expects a 24-hex agent-id as the SOCKS hostname)"
-                );
+            // Resolve the SOCKS hostname → agent: a raw 24-hex agent-id, or a
+            // friendly name from the roster (case-insensitive).
+            let Some(agent_id) = resolve_agent(&host, &cfg, &roster).await else {
+                warn!(%peer_addr, host, "mesh: unknown target agent (not an id, not a known name)");
                 socks5::reply(&mut tcp, socks5::REP_GENERAL_FAILURE).await;
                 return;
             };
@@ -150,4 +168,64 @@ async fn connect_proxy(proxy_port: u16, dst_port: u16) -> Result<TcpStream> {
     let _ = stream.set_nodelay(true);
     socks5::client_connect(&mut stream, "127.0.0.1", dst_port).await?;
     Ok(stream)
+}
+
+/// One agent in the server's roster response.
+#[derive(serde::Deserialize)]
+struct AgentInfo {
+    agent_id: String,
+    name: String,
+}
+
+/// Resolve a SOCKS-CONNECT hostname to an agent-id: a raw 24-hex id, or a
+/// friendly name from the roster (case-insensitive). On a name miss, re-fetch
+/// the roster once (picks up a newly-added / renamed agent) and retry.
+async fn resolve_agent(host: &str, cfg: &TunnelConfig, roster: &Roster) -> Option<ObjectId> {
+    if let Ok(id) = ObjectId::parse_str(host) {
+        return Some(id);
+    }
+    let key = host.to_ascii_lowercase();
+    if let Some(id) = roster.lock().await.get(&key).copied() {
+        return Some(id);
+    }
+    // Unknown name — refresh once and retry.
+    match fetch_roster(cfg).await {
+        Ok(fresh) => {
+            let id = fresh.get(&key).copied();
+            *roster.lock().await = fresh;
+            id
+        }
+        Err(e) => {
+            warn!(%e, "mesh: roster refresh failed");
+            None
+        }
+    }
+}
+
+/// GET the tenant's agent roster (`/api/tunnel-client/agents`, TunnelClient
+/// bearer auth) and build a case-insensitive `name → agent-id` map.
+async fn fetch_roster(cfg: &TunnelConfig) -> Result<HashMap<String, ObjectId>> {
+    let url = format!(
+        "{}/api/tunnel-client/agents",
+        cfg.server_url.trim_end_matches('/')
+    );
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .bearer_auth(&cfg.tunnel_client_token)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
+    if !resp.status().is_success() {
+        bail!("roster fetch: HTTP {}", resp.status());
+    }
+    let agents: Vec<AgentInfo> = resp.json().await.context("parse roster json")?;
+    let mut map = HashMap::new();
+    for a in agents {
+        if !a.name.is_empty()
+            && let Ok(id) = ObjectId::parse_str(&a.agent_id)
+        {
+            map.insert(a.name.to_ascii_lowercase(), id);
+        }
+    }
+    Ok(map)
 }
