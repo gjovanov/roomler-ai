@@ -67,6 +67,17 @@ const PEER_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3
 /// dial timeout in the relay case.
 const FLOW_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How often to send a WebSocket keepalive Ping on the control channel so an
+/// idle middlebox (WS proxy / corp full-tunnel VPN) doesn't reap it after
+/// ~5 min. Well under any real idle-reap window.
+const WS_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Auto-reconnect backoff bounds. Start short (a session that ran then dropped
+/// usually reconnects instantly) and cap so a persistently-offline agent isn't
+/// hammered.
+const RECONNECT_BACKOFF_MIN: std::time::Duration = std::time::Duration::from_secs(1);
+const RECONNECT_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Cap on waiting for `rc:tunnel.quic.ready` after `rc:tunnel.opened`
 /// negotiated `quic-v1`. The agent may walk several TURN-relay candidates
 /// before replying — on a corp net that blocks UDP, a UDP attempt
@@ -205,8 +216,10 @@ pub async fn run_socks5(
 }
 
 /// Shared driver for `forward` (static target) and `socks5` (per-connection
-/// target): open a session with the preferred transport (Auto → QUIC →
-/// WebRTC-DC fallback) and serve local TCP connections through it.
+/// target). Runs sessions in an **auto-reconnect loop**: each session serves
+/// local TCP connections until its WS control channel drops (idle-reap by a WS
+/// proxy / corp VPN, a network blip, a VPN reconnect), then re-establishes with
+/// backoff. Ctrl-C kills the process, which ends the loop.
 async fn run_forward(
     cfg: TunnelConfig,
     agent_hex: &str,
@@ -226,12 +239,40 @@ async fn run_forward(
         "roomler-tunnel forward starting"
     );
 
-    // First attempt: request the operator's preferred transport.
+    let mut backoff = RECONNECT_BACKOFF_MIN;
+    loop {
+        match run_one_session(&cfg, agent_id, local, &target, transport).await {
+            // A session that established then dropped resets the backoff so the
+            // reconnect is near-instant; a repeated setup failure grows it.
+            Ok(()) => {
+                info!("tunnel session ended; reconnecting");
+                backoff = RECONNECT_BACKOFF_MIN;
+            }
+            Err(e) => {
+                warn!(%e, backoff_s = backoff.as_secs(), "tunnel session failed; retrying");
+            }
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+    }
+}
+
+/// One session attempt: request the preferred transport (Auto → QUIC →
+/// WebRTC-DC fallback) and serve local TCP connections until the control
+/// channel drops. Returns `Ok(())` when a session ran and ended (→ reconnect),
+/// `Err` on a setup failure (→ backoff + retry).
+async fn run_one_session(
+    cfg: &TunnelConfig,
+    agent_id: ObjectId,
+    local: u16,
+    target: &Target,
+    transport: TransportPref,
+) -> Result<()> {
     let outcome = run_session(
-        &cfg,
+        cfg,
         agent_id,
         local,
-        &target,
+        target,
         transport.supported_transports(),
         transport.request_transport(),
     )
@@ -240,10 +281,10 @@ async fn run_forward(
         if transport == TransportPref::Auto {
             warn!("QUIC transport setup failed; re-opening session forcing webrtc-dc-v1");
             let fallback = run_session(
-                &cfg,
+                cfg,
                 agent_id,
                 local,
-                &target,
+                target,
                 vec![TRANSPORT_WEBRTC_DC_V1.to_string()],
                 TRANSPORT_WEBRTC_DC_V1,
             )
@@ -290,17 +331,36 @@ async fn run_session(
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<ClientMsg>(WS_OUT_CHANNEL_DEPTH);
 
     let _sender_task = tokio::spawn(async move {
-        while let Some(msg) = outbound_rx.recv().await {
-            let json = match serde_json::to_string(&msg) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(%e, "outbound serialise failed");
-                    continue;
+        // Keepalive so an idle middlebox (our nginx/HAProxy WS proxy, or a corp
+        // full-tunnel VPN like Check Point) doesn't reap the control channel
+        // after ~5 min of silence. Post-setup the data plane rides QUIC/DC and
+        // the WS goes quiet, so without this the next SOCKS/forward connection —
+        // which needs the WS to carry TcpForwardRequest — fails against a dead
+        // socket. A protocol-level Ping needs no server change (axum auto-pongs).
+        let mut keepalive = tokio::time::interval(WS_KEEPALIVE);
+        keepalive.tick().await; // consume the immediate first tick
+        loop {
+            tokio::select! {
+                maybe = outbound_rx.recv() => {
+                    let Some(msg) = maybe else { break };
+                    let json = match serde_json::to_string(&msg) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            warn!(%e, "outbound serialise failed");
+                            continue;
+                        }
+                    };
+                    if let Err(e) = ws_sink.send(Message::text(json)).await {
+                        warn!(%e, "outbound WS send failed; dropping");
+                        break;
+                    }
                 }
-            };
-            if let Err(e) = ws_sink.send(Message::text(json)).await {
-                warn!(%e, "outbound WS send failed; dropping");
-                break;
+                _ = keepalive.tick() => {
+                    if let Err(e) = ws_sink.send(Message::Ping(Vec::new().into())).await {
+                        warn!(%e, "WS keepalive ping failed; sender exiting");
+                        break;
+                    }
+                }
             }
         }
         debug!("outbound WS task exiting");
@@ -471,7 +531,7 @@ async fn run_webrtc_session(
     let peer_for_dispatch = Arc::new(peer);
     let pool_ready = Arc::new(tokio::sync::Notify::new());
 
-    let _dispatcher_task = {
+    let mut dispatcher_task = {
         let peer = Arc::clone(&peer_for_dispatch);
         let reply_registry = Arc::clone(&reply_registry);
         let active_flows = Arc::clone(&active_flows);
@@ -523,11 +583,20 @@ async fn run_webrtc_session(
     let rr_counter = Arc::new(AtomicUsize::new(0));
 
     loop {
-        let (mut tcp, peer_addr) = match listener.accept().await {
-            Ok(x) => x,
-            Err(e) => {
-                error!(%e, "accept failed");
-                continue;
+        let (mut tcp, peer_addr) = tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok(x) => x,
+                Err(e) => {
+                    error!(%e, "accept failed");
+                    continue;
+                }
+            },
+            // The WS dispatcher exited — the control channel is gone, so new
+            // flows can't be requested. End the session so `run_forward`
+            // reconnects instead of accepting into a dead socket.
+            _ = &mut dispatcher_task => {
+                warn!("control channel closed; ending session to reconnect");
+                break;
             }
         };
         // P0 throughput fix (rc.64, field-repro 2026-05-26): disable
@@ -623,9 +692,10 @@ async fn run_webrtc_session(
         });
     }
 
-    // Listen loop above never returns under normal operation — Ctrl-C
-    // signals tear down the runtime. The spawned `_sender_task` and
-    // `_dispatcher_task` ride that teardown.
+    // Reached only when the dispatcher exited (control channel gone). Return so
+    // `run_forward` reconnects; the `_sender_task` rides the WS teardown, and
+    // in-flight per-flow tasks finish or die with the connection.
+    Ok(())
 }
 
 /// Send `TcpForwardRequest`, await accept/reject, and on accept drive
@@ -1002,7 +1072,7 @@ async fn run_quic_session(
     // per-flow accept/reject + teardown signals.
     let reply_registry: ReplyRegistry = Arc::new(Mutex::new(HashMap::new()));
     let active_flows: ActiveFlows = Arc::new(Mutex::new(HashMap::new()));
-    let _dispatcher_task = {
+    let mut dispatcher_task = {
         let reply_registry = Arc::clone(&reply_registry);
         let active_flows = Arc::clone(&active_flows);
         let outbound_tx = outbound_tx.clone();
@@ -1032,11 +1102,19 @@ async fn run_quic_session(
     let flow_counter = Arc::new(AtomicU32::new(1));
 
     loop {
-        let (mut tcp, peer_addr) = match listener.accept().await {
-            Ok(x) => x,
-            Err(e) => {
-                error!(%e, "accept failed");
-                continue;
+        let (mut tcp, peer_addr) = tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok(x) => x,
+                Err(e) => {
+                    error!(%e, "accept failed");
+                    continue;
+                }
+            },
+            // WS dispatcher exited (control channel gone) — end the session so
+            // `run_forward` reconnects instead of accepting into a dead socket.
+            _ = &mut dispatcher_task => {
+                warn!("control channel closed; ending quic session to reconnect");
+                break;
             }
         };
         // Same Nagle + SO_SNDBUF tuning as the WebRTC path — see the
@@ -1097,6 +1175,10 @@ async fn run_quic_session(
             }
         });
     }
+
+    // Reached only when the dispatcher exited — return so `run_forward`
+    // reconnects (the QUIC endpoint + conn drop here, closing the connection).
+    Ok(SessionOutcome::Completed)
 }
 
 /// Try each advertised addr in order; return the first QUIC connection
