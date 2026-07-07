@@ -660,6 +660,16 @@ pub struct OverlayNode {
     /// only attempted when both ends support it (no silent QUIC/raw split).
     #[serde(default)]
     pub supports_quic: bool,
+    /// Phase 1 — subnet CIDRs this node CLAIMS it can route for peers (from its
+    /// `--advertise-routes` config, refreshed on each join). Untrusted until an
+    /// admin approves; see `approved_routes`.
+    #[serde(default)]
+    pub advertised_routes: Vec<String>,
+    /// Phase 1 — the admin-APPROVED subset of `advertised_routes`, distributed
+    /// to peers as the netmap `routes`. Empty = this node routes nothing for
+    /// anyone. An admin manages this via the overlay-route approval UI.
+    #[serde(default)]
+    pub approved_routes: Vec<String>,
     pub status: AgentStatus,
     pub last_seen_at: DateTime,
     pub created_at: DateTime,
