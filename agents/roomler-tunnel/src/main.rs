@@ -16,7 +16,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-use roomler_tunnel::{config, forward};
+use roomler_tunnel::{config, forward, mesh};
 
 #[derive(Debug, Parser)]
 #[command(name = "roomler-tunnel", version, about, long_about = None)]
@@ -78,9 +78,11 @@ enum Command {
     /// can't win the routing table. Same server policy + agent allowlist as
     /// `forward`. Stays in the foreground; Ctrl-C tears down. TCP CONNECT only.
     Socks5 {
-        /// Hex `agent_id` of the target agent (visible in the admin UI).
+        /// Hex `agent_id` of the target agent. OMIT for **mesh mode**: one proxy
+        /// reaches the whole tenant, addressing an agent by its 24-hex id as the
+        /// SOCKS hostname (`--socks5-hostname <agent-id>:<port>`).
         #[arg(long)]
-        agent: String,
+        agent: Option<String>,
         /// Local TCP port for the SOCKS5 listener (bound to 127.0.0.1).
         #[arg(long)]
         local: u16,
@@ -133,7 +135,10 @@ async fn main() -> Result<()> {
             transport,
         } => {
             let cfg = config::load(cli.config).context("loading tunnel config")?;
-            forward::run_socks5(cfg, &agent, local, transport).await
+            match agent {
+                Some(agent) => forward::run_socks5(cfg, &agent, local, transport).await,
+                None => mesh::run_mesh(cfg, local, transport).await,
+            }
         }
         Command::Run {} => bail!("T3: multi-forward `run` not yet wired"),
         Command::Diagnose { agent } => {
@@ -327,9 +332,21 @@ mod tests {
                 local,
                 transport,
             } => {
-                assert_eq!(agent, "507f1f77bcf86cd799439011");
+                assert_eq!(agent.as_deref(), Some("507f1f77bcf86cd799439011"));
                 assert_eq!(local, 1080);
                 assert_eq!(transport, forward::TransportPref::Auto);
+            }
+            other => panic!("expected Socks5, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_socks5_mesh_without_agent() {
+        let cli = Cli::try_parse_from(["roomler-tunnel", "socks5", "--local", "1080"]).unwrap();
+        match cli.command {
+            Command::Socks5 { agent, local, .. } => {
+                assert_eq!(agent, None); // mesh mode
+                assert_eq!(local, 1080);
             }
             other => panic!("expected Socks5, got {other:?}"),
         }
