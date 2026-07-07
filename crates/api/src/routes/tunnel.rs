@@ -149,6 +149,67 @@ pub async fn enroll_tunnel_client(
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Tunnel-client agent roster (SOCKS mesh routing)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// One agent in the tenant, for the SOCKS mesh's name → agent-id routing.
+#[derive(Debug, Serialize)]
+pub struct TunnelAgentInfo {
+    pub agent_id: String,
+    pub name: String,
+    pub online: bool,
+}
+
+/// GET /api/tunnel-client/agents — the tenant's agent roster, so
+/// `roomler-tunnel socks5` (mesh mode) can route a CONNECT by friendly agent
+/// name instead of the raw 24-hex id. Authenticated by the caller's TunnelClient
+/// JWT (`Authorization: Bearer <token>`) and scoped to that token's tenant.
+pub async fn list_tenant_agents(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<Vec<TunnelAgentInfo>>, ApiError> {
+    let token = bearer_token(&headers)
+        .ok_or_else(|| ApiError::Unauthorized("missing tunnel-client bearer token".to_string()))?;
+    let claims = state
+        .auth
+        .verify_tunnel_client_token(token)
+        .map_err(|_| ApiError::Unauthorized("invalid tunnel-client token".to_string()))?;
+    let tid = ObjectId::parse_str(&claims.tenant_id)
+        .map_err(|_| ApiError::BadRequest("invalid tenant_id claim".to_string()))?;
+
+    // Tenants have tens of agents; one large page covers them.
+    let params = PaginationParams {
+        per_page: 500,
+        ..Default::default()
+    };
+    let page = state.agents.list_for_tenant(tid, &params).await?;
+    let agents = page
+        .items
+        .into_iter()
+        .map(|a| {
+            let online =
+                a.id.map(|i| state.rc_hub.is_agent_online(i))
+                    .unwrap_or(false);
+            TunnelAgentInfo {
+                agent_id: a.id.map(|i| i.to_hex()).unwrap_or_default(),
+                name: a.name,
+                online,
+            }
+        })
+        .collect();
+    Ok(Json(agents))
+}
+
+/// Extract the `Bearer <token>` value from the `Authorization` header.
+fn bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Tunnel-client listing (admin UI)
 // ────────────────────────────────────────────────────────────────────────────
 
