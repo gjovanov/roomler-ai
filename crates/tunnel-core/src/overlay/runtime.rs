@@ -630,6 +630,7 @@ impl OverlayRuntime {
                             carrier,
                             relay_parts: None,
                             supports_quic: cfg.supports_quic,
+                            subnets: cfg.subnets.clone(),
                         },
                     )
                     .await;
@@ -700,6 +701,10 @@ impl OverlayRuntime {
         if let Err(e) = tun.add_peer_route(cfg.overlay_ip).await {
             debug!(peer = %node_id, %e, "overlay: /32 peer route not installed (ok on clean hosts)");
         }
+        // Phase 1 — if this peer is an approved subnet router, route its CIDRs
+        // to it (router allowed_ips + OS route).
+        self.install_subnets(wg, tun, node_id, cfg.public_key, &cfg.subnets)
+            .await;
         info!(peer = %node_id, overlay_ip = %cfg.overlay_ip, %dst, "overlay: direct LAN carrier (same subnet) — skipping relay");
     }
 
@@ -780,7 +785,32 @@ impl OverlayRuntime {
         if let Err(e) = tun.add_peer_route(link.overlay_ip).await {
             debug!(peer = %link.node_id, %e, "overlay: /32 peer route not installed (ok on clean hosts)");
         }
+        // Phase 1 — subnet-router peer: route its approved CIDRs to it.
+        self.install_subnets(wg, tun, link.node_id, link.public_key, &link.subnets)
+            .await;
         info!(peer = %link.node_id, overlay_ip = %link.overlay_ip, initiate, "overlay: peer installed");
+    }
+
+    /// Phase 1 — register a peer's approved subnet routes in the crypto-router
+    /// (so packets to those CIDRs encapsulate to it) and install the matching OS
+    /// routes via the overlay NIC. No-op when the peer advertised none.
+    async fn install_subnets(
+        &self,
+        wg: &mut WgDevice,
+        tun: &Arc<dyn TunIo>,
+        node_id: ObjectId,
+        pubkey: [u8; 32],
+        subnets: &[super::router::Cidr],
+    ) {
+        wg.set_peer_subnets(pubkey, subnets);
+        for c in subnets {
+            let cidr = c.to_string();
+            if let Err(e) = tun.add_cidr_route(&cidr).await {
+                debug!(peer = %node_id, %cidr, %e, "overlay: subnet route not installed");
+            } else {
+                info!(peer = %node_id, %cidr, "overlay: subnet route installed (router peer)");
+            }
+        }
     }
 }
 
