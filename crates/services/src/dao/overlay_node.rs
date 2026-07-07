@@ -77,6 +77,7 @@ impl OverlayNodeDao {
     /// Re-join: clear `deleted_at`, refresh the WG key + endpoints +
     /// node_ref, mark Online. Keeps the existing `overlay_ip`. Returns
     /// the updated row.
+    #[allow(clippy::too_many_arguments)]
     pub async fn rehydrate(
         &self,
         node_id: ObjectId,
