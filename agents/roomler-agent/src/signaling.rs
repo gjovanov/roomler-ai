@@ -712,19 +712,37 @@ async fn handle_server_msg(
                     timeout: std::time::Duration::from_secs(consent_timeout_secs as u64),
                 },
             });
+            // Resolve to a concrete mode (directive, else the broker's startup
+            // mode) so the .pending write and the request use the same decision.
+            let effective_mode = directed_mode.unwrap_or_else(|| consent_broker.mode());
+            let session_hex = session_id.to_hex();
+            // Phase 3 — when this session will actually PROMPT, drop a `.pending`
+            // request marker in the shared consent dir so the tray can pop a rich
+            // Approve/Deny modal (the previously-missing agent→tray signal). Auto
+            // grants write nothing. The broker's poll loop removes it when the
+            // decision resolves. Best-effort: a failure just falls back to the
+            // CLI-driven consent path.
+            if matches!(effective_mode, crate::consent::Mode::Prompt { .. }) {
+                let body = serde_json::json!({
+                    "session_id": session_hex,
+                    "controller_name": controller_name,
+                    "permissions": permissions,
+                    "timeout_secs": consent_timeout_secs,
+                })
+                .to_string();
+                if let Err(e) = consent_broker.write_pending(&session_hex, &body) {
+                    tracing::warn!(session = %session_hex, %e, "could not write .pending consent marker for tray");
+                }
+            }
             let broker = consent_broker.clone();
             let outbound = outbound_tx.clone();
-            let session_hex = session_id.to_hex();
             tokio::spawn(async move {
-                let decision = match directed_mode {
-                    Some(m) => broker.request_with_mode(&session_hex, m).await,
-                    None => broker.request(&session_hex).await,
-                };
+                let decision = broker.request_with_mode(&session_hex, effective_mode).await;
                 let granted = decision.granted();
                 tracing::info!(
                     session = %session_hex,
                     ?decision,
-                    ?directed_mode,
+                    ?effective_mode,
                     granted,
                     "consent decision → sending rc:consent"
                 );
