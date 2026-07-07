@@ -476,6 +476,7 @@ mod tests {
         let peer = PeerConfig {
             public_key: [1u8; 32],
             overlay_ip: Ipv4Addr::new(100, 64, 0, 9),
+            name: String::new(),
             endpoints: vec![],
             supports_quic: false,
         };
@@ -504,6 +505,7 @@ mod tests {
                 peer: PeerConfig {
                     public_key: [2u8; 32],
                     overlay_ip: Ipv4Addr::new(100, 64, 0, 9),
+                    name: String::new(),
                     endpoints: vec![],
                     supports_quic: false,
                 },
