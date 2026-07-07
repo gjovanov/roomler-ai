@@ -21,12 +21,13 @@
 //! 30 s timeout → auto-deny. Outcome propagates back through the
 //! [`ConsentBroker::request`] future the signaling layer awaits.
 //!
-//! The tray-icon UX described in the planner's spec is deferred to
-//! a follow-up: building cross-platform `tray-icon` infrastructure
-//! is a sizable extra dep tree (GTK on Linux, separate event-loop
-//! thread on Windows) and the CLI fallback already meets the v1
-//! security need of "no automatic grant on org hosts." Operators who
-//! want a GUI prompt will land it in a 0.4.x cycle.
+//! The tray popup (Phase 3) now renders this prompt on attended
+//! sessions: the signaling layer calls [`ConsentBroker::write_pending`]
+//! to drop a `<session>.pending` marker in this same dir, the
+//! `roomler-agent-tray` companion watches for it and shows an
+//! Approve/Deny modal, and the operator's choice writes the same
+//! `.approve`/`.deny` sentinel the poll loop below already consumes.
+//! The CLI subcommand remains a headless fallback.
 //!
 //! Audit lifecycle: hub.rs already emits
 //! [`AuditKind::ConsentPrompted`] on `rc:request` send and
