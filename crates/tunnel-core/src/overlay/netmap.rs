@@ -64,6 +64,7 @@ mod tests {
             relay_home: None,
             reachable,
             supports_quic: false,
+            routes: vec![],
         }
     }
 

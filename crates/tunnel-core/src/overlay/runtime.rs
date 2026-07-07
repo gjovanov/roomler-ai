@@ -174,6 +174,9 @@ pub struct OverlayRuntime {
     mode: CarrierMode,
     tun_factory: TunFactory,
     mtu: u16,
+    /// Phase 1 — subnet CIDRs this node advertises as a router (from config).
+    /// Sent in the join; the server gates them behind admin approval.
+    advertised_routes: Vec<String>,
 }
 
 impl OverlayRuntime {
@@ -191,6 +194,7 @@ impl OverlayRuntime {
             mode: CarrierMode::Direct(links),
             tun_factory,
             mtu,
+            advertised_routes: Vec::new(),
         }
     }
 
@@ -208,7 +212,14 @@ impl OverlayRuntime {
             mode: CarrierMode::Relay,
             tun_factory,
             mtu,
+            advertised_routes: Vec::new(),
         }
+    }
+
+    /// Phase 1 — set the subnet routes this node advertises as a router.
+    pub fn with_advertised_routes(mut self, routes: Vec<String>) -> Self {
+        self.advertised_routes = routes;
+        self
     }
 
     /// Run until the event channel closes (WS disconnect). Sends
@@ -235,6 +246,8 @@ impl OverlayRuntime {
             // rc.142 — advertise the QUIC-over-TURN capability so the server
             // only tells a peer to attempt QUIC when BOTH ends support it.
             supports_quic: overlay_quic_enabled(),
+            // Phase 1 — subnet routes we offer (admin must approve server-side).
+            advertised_routes: self.advertised_routes.clone(),
         };
         if self.outbound.send(join).await.is_err() {
             warn!("overlay: control channel closed before join");
@@ -868,6 +881,7 @@ mod tests {
             relay_home: None,
             reachable: true,
             supports_quic: false,
+            routes: vec![],
         }
     }
 
