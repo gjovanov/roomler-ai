@@ -189,6 +189,17 @@ impl ConsentBroker {
     /// stale `.approve` files won't accidentally pre-approve a
     /// future session.
     pub async fn request(&self, session_hex: &str) -> Decision {
+        self.request_with_mode(session_hex, self.inner.mode).await
+    }
+
+    /// Like [`request`], but drives the decision with an explicit per-session
+    /// `mode` — the server's Phase-2 consent directive
+    /// (`ServerMsg::Request { consent_mode }`) — instead of the broker's startup
+    /// mode. Server-authoritative consent: the agent obeys the server rather
+    /// than its local `auto_grant_session`. The sentinel dir + poll loop are
+    /// shared state, so a broker built for `AutoGrant` can still prompt on
+    /// demand when the server directs a `Prompt`.
+    pub async fn request_with_mode(&self, session_hex: &str, mode: Mode) -> Decision {
         // Reject anything that doesn't look like a hex session id.
         // Stops a stray empty-string request from scanning the
         // entire sentinel dir.
@@ -196,7 +207,7 @@ impl ConsentBroker {
             tracing::warn!(session = session_hex, "consent request with implausible id");
             return Decision::Denied;
         }
-        match self.inner.mode {
+        match mode {
             Mode::AutoGrant => Decision::Granted,
             Mode::Prompt { timeout } => self.run_prompt(session_hex, timeout).await,
         }
@@ -360,6 +371,53 @@ mod tests {
             "auto-grant must not block on any I/O"
         );
         // Cleanup
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn request_with_mode_overrides_startup_mode() {
+        // Server-authoritative consent (Phase 2): the per-session directive from
+        // `ServerMsg::Request { consent_mode }` wins over the broker's startup
+        // (`auto_grant_session`) mode in BOTH directions.
+        let dir = fixture_dir("directive");
+
+        // Startup = AutoGrant, but the server directs Prompt → we take the prompt
+        // path and (no sentinel) time out, proving auto-grant was NOT used.
+        let auto_broker = ConsentBroker::new(Mode::AutoGrant, dir.clone()).unwrap();
+        let d = auto_broker
+            .request_with_mode(
+                "aaaaaaaaaaaaaaaaaaaaaaaa",
+                Mode::Prompt {
+                    timeout: Duration::from_millis(80),
+                },
+            )
+            .await;
+        assert_eq!(
+            d,
+            Decision::Timeout,
+            "Prompt directive must override startup AutoGrant"
+        );
+
+        // Startup = Prompt, but the server directs Auto → immediate grant, no
+        // sentinel wait.
+        let prompt_broker = ConsentBroker::new(
+            Mode::Prompt {
+                timeout: Duration::from_secs(30),
+            },
+            dir.clone(),
+        )
+        .unwrap();
+        let start = Instant::now();
+        let d = prompt_broker
+            .request_with_mode("bbbbbbbbbbbbbbbbbbbbbbbb", Mode::AutoGrant)
+            .await;
+        assert_eq!(
+            d,
+            Decision::Granted,
+            "Auto directive must override startup Prompt"
+        );
+        assert!(start.elapsed() < Duration::from_millis(200));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
