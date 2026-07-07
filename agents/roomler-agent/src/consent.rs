@@ -248,6 +248,10 @@ impl ConsentBroker {
         // doesn't see a stale decision.
         let _ = std::fs::remove_file(&approve);
         let _ = std::fs::remove_file(&deny);
+        // Also clear the `.pending` request marker the tray watches, so a
+        // resolved prompt disappears from the tray immediately (best-effort;
+        // absent when the request came without one — e.g. the CLI path).
+        let _ = std::fs::remove_file(self.pending_path(session_hex));
         {
             let mut pending = self.inner.pending.lock().await;
             pending.remove(session_hex);
@@ -270,6 +274,36 @@ impl ConsentBroker {
             .unwrap_or(0);
         std::fs::write(&path, format!("{now_ts}\n"))
             .with_context(|| format!("writing sentinel {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path)?.permissions();
+            perms.set_mode(0o600);
+            std::fs::set_permissions(&path, perms)?;
+        }
+        Ok(path)
+    }
+
+    /// Path of the `.pending` request marker for `session_hex`. Distinct from the
+    /// `.approve`/`.deny` decision sentinels: this one is written by the AGENT
+    /// (not the operator) when an attended session is awaiting a decision, so the
+    /// tray can discover it and pop a prompt. Removed when the decision resolves.
+    pub fn pending_path(&self, session_hex: &str) -> PathBuf {
+        self.inner
+            .sentinel_dir
+            .join(format!("{session_hex}.pending"))
+    }
+
+    /// Write the `.pending` request marker (`body` = JSON describing the request:
+    /// controller, permissions, timeout) for `session_hex`. Called by the
+    /// signaling layer, which holds that metadata, right before an attended
+    /// prompt begins. The tray watches for these files; the poll loop removes
+    /// this one when the decision resolves. Best-effort — a write failure just
+    /// means the tray falls back to its CLI-less state; the CLI path still works.
+    pub fn write_pending(&self, session_hex: &str, body: &str) -> Result<PathBuf> {
+        let path = self.pending_path(session_hex);
+        std::fs::write(&path, body)
+            .with_context(|| format!("writing pending marker {}", path.display()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -417,6 +451,44 @@ mod tests {
             "Auto directive must override startup Prompt"
         );
         assert!(start.elapsed() < Duration::from_millis(200));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn pending_marker_written_and_cleared_on_resolve() {
+        // Phase 3 — the signaling layer drops a `.pending` marker so the tray
+        // can prompt; the broker's poll loop clears it once the decision lands.
+        let dir = fixture_dir("pending");
+        let broker = ConsentBroker::new(
+            Mode::Prompt {
+                timeout: Duration::from_secs(5),
+            },
+            dir.clone(),
+        )
+        .unwrap();
+        let session = "cccccccccccccccccccccccc";
+
+        let pending = broker
+            .write_pending(session, r#"{"session_id":"c","controller_name":"x"}"#)
+            .unwrap();
+        assert!(pending.exists(), ".pending must exist while awaiting");
+        assert_eq!(broker.pending_path(session), pending);
+
+        // Operator approves → run the prompt to resolution, which clears .pending.
+        broker
+            .write_sentinel(session, SentinelKind::Approve)
+            .unwrap();
+        let decision = broker
+            .request_with_mode(
+                session,
+                Mode::Prompt {
+                    timeout: Duration::from_secs(5),
+                },
+            )
+            .await;
+        assert_eq!(decision, Decision::Granted);
+        assert!(!pending.exists(), ".pending must be cleared once resolved");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
