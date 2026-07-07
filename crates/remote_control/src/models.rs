@@ -106,7 +106,15 @@ pub struct Agent {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
     pub id: Option<ObjectId>,
     pub tenant_id: ObjectId,
+    /// The user who "owns" this device — consent for a non-self controller can
+    /// route to them (email/push), and a controller equal to the owner
+    /// self-controls (no external allowlist needed). Set to `enrolled_by` at
+    /// enrollment; reassignable by a `MANAGE_AGENTS` admin.
     pub owner_user_id: ObjectId,
+    /// The user whose enrollment token created this agent (audit; the initial
+    /// `owner_user_id`). `#[serde(default)]` → older rows deserialize to `None`.
+    #[serde(default)]
+    pub enrolled_by: Option<ObjectId>,
     pub name: String,
     pub machine_id: String,
     pub os: OsKind,
