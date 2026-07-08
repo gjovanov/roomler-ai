@@ -39,6 +39,16 @@ pub struct DnsConfig {
     pub names: NameMap,
 }
 
+/// Parse an upstream nameserver — accepts a bare IP (`"1.1.1.1"`, defaults to
+/// port 53) or `host:port` (`"1.1.1.1:53"`). `None` if neither parses.
+pub fn parse_upstream(s: &str) -> Option<SocketAddr> {
+    if let Ok(sa) = s.parse::<SocketAddr>() {
+        return Some(sa);
+    }
+    let ip: std::net::IpAddr = s.parse().ok()?;
+    Some(SocketAddr::new(ip, 53))
+}
+
 /// Serve until the socket errors (or the task is dropped). Best-effort: a bind
 /// failure (needs :53 privileges + the address on the NIC) logs and returns, so
 /// the overlay keeps working without DNS.
