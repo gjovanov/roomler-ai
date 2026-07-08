@@ -216,6 +216,139 @@ async fn forward_upstream(query: &[u8], upstream: SocketAddr) -> Option<Vec<u8>>
     Some(buf)
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Per-OS split-DNS config
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The overlay NIC name (matches `tun.rs`). Linux only — the Windows path keys
+/// its NRPT rule off the domain, not the interface.
+#[cfg(target_os = "linux")]
+const DNS_IF_NAME: &str = "roomler0";
+
+/// RAII guard for the per-OS DNS config — points `<magic_domain>` queries at our
+/// resolver (Windows NRPT / Linux systemd-resolved routing domain). `Drop`
+/// reverts it. Best-effort: a failure just means MagicDNS isn't wired into the
+/// OS on that host (the resolver still runs).
+pub struct DnsOsGuard {
+    magic_domain: String,
+    active: bool,
+}
+
+/// Route `magic_domain` queries to our `resolver_ip` at the OS level. Returns a
+/// guard that reverts on `Drop`.
+pub async fn configure_os(resolver_ip: Ipv4Addr, magic_domain: &str) -> DnsOsGuard {
+    let active = setup_os(resolver_ip, magic_domain).await;
+    if active {
+        info!(%resolver_ip, domain = %magic_domain, "magicdns: OS split-DNS configured");
+    }
+    DnsOsGuard {
+        magic_domain: magic_domain.to_string(),
+        active,
+    }
+}
+
+#[cfg(target_os = "windows")]
+async fn setup_os(resolver_ip: Ipv4Addr, magic_domain: &str) -> bool {
+    // NRPT split-DNS: only `*.<domain>` queries go to our resolver; everything
+    // else stays on the system resolvers. Idempotent-ish — clear a stale rule
+    // for this namespace first.
+    let ns = format!(".{magic_domain}");
+    let _ = run_cmd(vec![
+        "powershell".into(),
+        "-NoProfile".into(),
+        "-Command".into(),
+        format!(
+            "Get-DnsClientNrptRule | Where-Object {{ $_.Namespace -eq '{ns}' }} | \
+             Remove-DnsClientNrptRule -Force -ErrorAction SilentlyContinue"
+        ),
+    ])
+    .await;
+    run_cmd(vec![
+        "powershell".into(),
+        "-NoProfile".into(),
+        "-Command".into(),
+        format!("Add-DnsClientNrptRule -Namespace '{ns}' -NameServers '{resolver_ip}'"),
+    ])
+    .await
+}
+
+#[cfg(target_os = "linux")]
+async fn setup_os(resolver_ip: Ipv4Addr, magic_domain: &str) -> bool {
+    // systemd-resolved: point the overlay link at our resolver and mark
+    // `<domain>` a routing-only domain (`~`) so only it resolves here.
+    let a = run_cmd(vec![
+        "resolvectl".into(),
+        "dns".into(),
+        DNS_IF_NAME.into(),
+        resolver_ip.to_string(),
+    ])
+    .await;
+    let b = run_cmd(vec![
+        "resolvectl".into(),
+        "domain".into(),
+        DNS_IF_NAME.into(),
+        format!("~{magic_domain}"),
+    ])
+    .await;
+    a && b
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+async fn setup_os(_resolver_ip: Ipv4Addr, _magic_domain: &str) -> bool {
+    false
+}
+
+impl Drop for DnsOsGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let ns = format!(".{}", self.magic_domain);
+            let _ = std::process::Command::new("powershell")
+                .args([
+                    "-NoProfile",
+                    "-Command",
+                    &format!(
+                        "Get-DnsClientNrptRule | Where-Object {{ $_.Namespace -eq '{ns}' }} | \
+                         Remove-DnsClientNrptRule -Force -ErrorAction SilentlyContinue"
+                    ),
+                ])
+                .output();
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let _ = std::process::Command::new("resolvectl")
+                .args(["revert", DNS_IF_NAME])
+                .output();
+        }
+        info!(domain = %self.magic_domain, "magicdns: OS split-DNS reverted");
+    }
+}
+
+/// Run an OS command off the reactor; `true` on exit 0, else logs stderr.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+async fn run_cmd(args: Vec<String>) -> bool {
+    tokio::task::spawn_blocking(move || {
+        let prog = args[0].clone();
+        match std::process::Command::new(&prog).args(&args[1..]).output() {
+            Ok(o) if o.status.success() => true,
+            Ok(o) => {
+                warn!(%prog, stderr = %String::from_utf8_lossy(&o.stderr).trim(),
+                    "magicdns: OS-config command failed");
+                false
+            }
+            Err(e) => {
+                warn!(%prog, %e, "magicdns: OS-config command spawn failed");
+                false
+            }
+        }
+    })
+    .await
+    .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
