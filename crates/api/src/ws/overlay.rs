@@ -241,6 +241,19 @@ async fn handle_overlay_join(
         .map(to_netmap_peer)
         .collect();
 
+    // Phase 2 MagicDNS — carry the tenant's DNS suffix + upstreams so the node
+    // brings up its split-DNS resolver. Absent tenant settings → MagicDNS off.
+    let (magic_domain, nameservers) = match state.tenants.base.find_by_id(tenant_id).await {
+        Ok(t) => (
+            t.settings.magic_dns_domain.clone(),
+            t.settings.magic_dns_nameservers.clone(),
+        ),
+        Err(e) => {
+            debug!(%tenant_id, %e, "overlay.join: tenant fetch for MagicDNS failed; DNS off");
+            (None, Vec::new())
+        }
+    };
+
     // Full netmap → joiner.
     send_to_node(
         state,
@@ -250,6 +263,8 @@ async fn handle_overlay_join(
             network: OverlayNetworkInfo {
                 cidr: network.cidr.clone(),
                 mtu: network.mtu,
+                magic_domain,
+                nameservers,
             },
             peers,
             epoch,

@@ -910,6 +910,16 @@ pub struct NetmapPeer {
 pub struct OverlayNetworkInfo {
     pub cidr: String,
     pub mtu: u16,
+    /// Phase 2 MagicDNS — the tenant's overlay DNS suffix (e.g.
+    /// `"myorg.roomler.net"`), or `None` when MagicDNS is off. A node with a
+    /// domain set brings up its local split-DNS resolver. `#[serde(default)]`
+    /// for pre-Phase-2 servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub magic_domain: Option<String>,
+    /// Phase 2 MagicDNS — upstream nameservers for non-overlay queries. Empty →
+    /// the node's existing system resolvers.
+    #[serde(default)]
+    pub nameservers: Vec<String>,
 }
 
 #[cfg(test)]
@@ -1620,6 +1630,8 @@ mod tests {
             network: OverlayNetworkInfo {
                 cidr: "100.64.0.0/10".into(),
                 mtu: 1280,
+                magic_domain: Some("myorg.roomler.net".into()),
+                nameservers: vec!["1.1.1.1".into()],
             },
             peers: vec![NetmapPeer {
                 node_id,
