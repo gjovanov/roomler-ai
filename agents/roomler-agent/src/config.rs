@@ -146,6 +146,13 @@ pub struct AgentConfig {
     /// the public key is what the netmap distributes. `None` until then.
     #[serde(default)]
     pub overlay_wg_secret_key: Option<String>,
+
+    /// Phase 1 subnet router — CIDRs this node offers to route for overlay peers
+    /// (e.g. `["192.168.1.0/24"]`). Sent on join as `advertised_routes`; each is
+    /// gated behind admin approval server-side before any peer uses it. Empty =
+    /// this node is not a subnet router.
+    #[serde(default)]
+    pub overlay_advertised_routes: Vec<String>,
 }
 
 /// Current schema version. Bumped whenever [`migrate`] gains a new
@@ -486,6 +493,7 @@ mod tests {
             forward_acl: AgentForwardAcl::default(),
             overlay_enabled: false,
             overlay_wg_secret_key: None,
+            overlay_advertised_routes: Vec::new(),
         }
     }
 
