@@ -4,6 +4,7 @@ pub mod agent_log;
 pub mod agent_release;
 pub mod auth;
 pub mod background_task;
+pub mod consent;
 pub mod export;
 pub mod file;
 pub mod giphy;

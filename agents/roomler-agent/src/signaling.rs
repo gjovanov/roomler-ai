@@ -638,6 +638,7 @@ async fn handle_server_msg(
             browser_caps,
             preferred_transport,
             chroma_pref,
+            consent_mode,
         } => {
             // Pick the best codec for this session from the
             // intersection of (browser-advertised, agent-supported).
@@ -695,28 +696,84 @@ async fn handle_server_msg(
             // background; auto-grant resolves <1ms, prompt mode can
             // take up to 30s — we MUST NOT block the WS read loop.
             // Decision flows back via outbound_tx as a ClientMsg::Consent.
-            let broker = consent_broker.clone();
-            let outbound = outbound_tx.clone();
-            let session_hex = session_id.to_hex();
-            tokio::spawn(async move {
-                let decision = broker.request(&session_hex).await;
-                let granted = decision.granted();
-                tracing::info!(
-                    session = %session_hex,
-                    ?decision,
-                    granted,
-                    "consent decision → sending rc:consent"
-                );
-                if let Err(e) = outbound
-                    .send(ClientMsg::Consent {
-                        session_id,
-                        granted,
-                    })
-                    .await
-                {
-                    tracing::warn!(session = %session_hex, %e, "outbound consent send failed (channel closed)");
+            // Phase 2 — obey the server's per-session consent directive when
+            // present; fall back to the broker's startup mode (local
+            // `auto_grant_session`) for an older server that sends none.
+            let directed_mode: Option<crate::consent::Mode> = consent_mode.map(|m| match m {
+                roomler_ai_remote_control::models::ConsentMode::Auto => {
+                    crate::consent::Mode::AutoGrant
                 }
+                // Prompt + the async owner-side channels (Email / Push /
+                // PromptThenEmail) all resolve to an on-host prompt at the
+                // agent: the server drives the owner channels itself (Phase 4)
+                // and asks the agent to prompt as the on-console path/fallback.
+                // Bound the wait by the server-sent timeout.
+                _ => crate::consent::Mode::Prompt {
+                    timeout: std::time::Duration::from_secs(consent_timeout_secs as u64),
+                },
             });
+            // Resolve to a concrete mode (directive, else the broker's startup
+            // mode) so the .pending write and the request use the same decision.
+            let effective_mode = directed_mode.unwrap_or_else(|| consent_broker.mode());
+            let session_hex = session_id.to_hex();
+            // Phase 4 — Email/Push are OWNER-side modes: the SERVER obtains
+            // consent from the device owner (email link / push), so the agent
+            // must NOT decide — no prompt, no `.pending`, no `rc:consent`. It
+            // just waits; when the owner approves, the server sends `rc:ready`,
+            // the controller offers, and the agent builds the peer from the
+            // media context stashed above.
+            let owner_side_consent = matches!(
+                consent_mode,
+                Some(roomler_ai_remote_control::models::ConsentMode::Email)
+                    | Some(roomler_ai_remote_control::models::ConsentMode::Push)
+            );
+            // Phase 3 — when this session will PROMPT on the host, drop a
+            // `.pending` marker so the tray can pop a rich Approve/Deny modal
+            // (the agent→tray signal). Auto grants + owner-side modes write
+            // nothing. The broker's poll loop removes it when the decision
+            // resolves. Best-effort; a failure falls back to the CLI path.
+            if !owner_side_consent && matches!(effective_mode, crate::consent::Mode::Prompt { .. })
+            {
+                let body = serde_json::json!({
+                    "session_id": session_hex,
+                    "controller_name": controller_name,
+                    "permissions": permissions,
+                    "timeout_secs": consent_timeout_secs,
+                })
+                .to_string();
+                if let Err(e) = consent_broker.write_pending(&session_hex, &body) {
+                    tracing::warn!(session = %session_hex, %e, "could not write .pending consent marker for tray");
+                }
+            }
+            if owner_side_consent {
+                info!(
+                    %session_id, ?consent_mode,
+                    "owner-side consent (email/push) — agent waits for the server to resolve"
+                );
+            } else {
+                let broker = consent_broker.clone();
+                let outbound = outbound_tx.clone();
+                tokio::spawn(async move {
+                    let decision = broker.request_with_mode(&session_hex, effective_mode).await;
+                    let granted = decision.granted();
+                    tracing::info!(
+                        session = %session_hex,
+                        ?decision,
+                        ?effective_mode,
+                        granted,
+                        "consent decision → sending rc:consent"
+                    );
+                    if let Err(e) = outbound
+                        .send(ClientMsg::Consent {
+                            session_id,
+                            granted,
+                        })
+                        .await
+                    {
+                        tracing::warn!(session = %session_hex, %e, "outbound consent send failed (channel closed)");
+                    }
+                });
+            }
         }
 
         ServerMsg::SdpOffer {

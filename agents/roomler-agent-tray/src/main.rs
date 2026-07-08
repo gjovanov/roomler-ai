@@ -75,14 +75,59 @@ fn main() {
             commands::cmd_open_config_dir,
             commands::cmd_consent_approve,
             commands::cmd_consent_deny,
+            commands::cmd_get_pending_consents,
         ])
         .setup(|app| {
             // Install the tray icon + menu. The main window starts
             // hidden (visible:false in tauri.conf.json); operator
             // opens it from the tray menu.
             tray::install(app.handle())?;
+            // Phase 3 — watch the shared consent dir; when the agent drops a new
+            // `.pending` marker (a remote session awaiting approval), surface the
+            // window so the operator sees the Approve/Deny modal the SPA renders
+            // from `cmd_get_pending_consents`.
+            let handle = app.handle().clone();
+            std::thread::spawn(move || consent_watch_loop(handle));
             Ok(())
         })
         .run(tauri::generate_context!())
         .expect("error while running roomler-agent-tray");
+}
+
+/// Poll the shared consent dir; when a NEW `.pending` marker appears (a session
+/// the operator hasn't been shown yet), surface the tray window so the SPA's
+/// consent modal is visible. Runs on its own OS thread — a 750 ms filesystem
+/// scan is cheap and needs no async runtime. The SPA does the actual
+/// render/approve/deny via `cmd_get_pending_consents` + the existing
+/// approve/deny commands; this loop's only job is "bring the window forward when
+/// something new needs a decision."
+fn consent_watch_loop(app: tauri::AppHandle) {
+    use std::collections::HashSet;
+
+    let Ok(dir) = roomler_agent::consent::ConsentBroker::default_sentinel_dir() else {
+        return;
+    };
+    let mut seen: HashSet<String> = HashSet::new();
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(750));
+        let mut current: HashSet<String> = HashSet::new();
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.extension().and_then(|e| e.to_str()) == Some("pending")
+                    && let Some(name) = p.file_stem().and_then(|s| s.to_str())
+                {
+                    current.insert(name.to_string());
+                }
+            }
+        }
+        // A newly-appeared pending (not in `seen`) → bring the window forward.
+        if current.difference(&seen).next().is_some()
+            && let Some(win) = app.get_webview_window("main")
+        {
+            let _ = win.show();
+            let _ = win.set_focus();
+        }
+        seen = current;
+    }
 }

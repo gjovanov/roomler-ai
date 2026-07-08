@@ -27,6 +27,9 @@ pub enum NotificationType {
     Invite,
     Call,
     TaskComplete,
+    /// A remote-control session is awaiting the device owner's approval
+    /// (Phase 4 owner-consent). `link` points at the in-app consent page.
+    ConsentRequest,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

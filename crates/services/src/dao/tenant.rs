@@ -94,13 +94,16 @@ impl TenantDao {
                 id: None,
                 tenant_id,
                 name: "moderator".to_string(),
-                description: Some("Moderate channels and messages".to_string()),
+                description: Some(
+                    "Moderate channels/messages; remote-control operator".to_string(),
+                ),
                 color: Some(0x4CAF50),
                 position: 2,
                 permissions: permissions::DEFAULT_MEMBER
                     | permissions::MANAGE_MESSAGES
                     | permissions::MUTE_MEMBERS
-                    | permissions::KICK_MEMBERS,
+                    | permissions::KICK_MEMBERS
+                    | permissions::REMOTE_CONTROL,
                 is_default: false,
                 is_managed: true,
                 is_mentionable: true,
@@ -262,5 +265,21 @@ impl TenantDao {
 
         let combined = roles.iter().fold(0u64, |acc, r| acc | r.permissions);
         Ok(combined)
+    }
+
+    /// The role ids a member holds in a tenant (empty if not a member). Used by
+    /// the remote-control session gate to test `access_policy.allowed_role_ids`
+    /// overlap without re-deriving the combined permission bitfield.
+    pub async fn member_role_ids(
+        &self,
+        tenant_id: ObjectId,
+        user_id: ObjectId,
+    ) -> DaoResult<Vec<ObjectId>> {
+        Ok(self
+            .members
+            .find_one(doc! { "tenant_id": tenant_id, "user_id": user_id })
+            .await?
+            .map(|m| m.role_ids)
+            .unwrap_or_default())
     }
 }
