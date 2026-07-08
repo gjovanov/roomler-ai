@@ -42,6 +42,7 @@ const adminSections = [
   { name: 'admin-tunnel-clients', icon: 'mdi-tunnel',            title: 'Tunnels'   },
   { name: 'admin-tunnel-policies', icon: 'mdi-shield-key',       title: 'Tunnel ACL' },
   { name: 'admin-subnet-routes', icon: 'mdi-lan-connect',        title: 'Subnet Routes' },
+  { name: 'admin-magic-dns',  icon: 'mdi-dns',                  title: 'MagicDNS'  },
   { name: 'admin-tasks',     icon: 'mdi-progress-clock',       title: 'Tasks'     },
   { name: 'admin-audit-log', icon: 'mdi-clipboard-text-clock', title: 'Audit Log' },
 ]
