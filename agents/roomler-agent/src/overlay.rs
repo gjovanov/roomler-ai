@@ -50,7 +50,9 @@ pub fn maybe_start(
     let (evt_tx, evt_rx) = mpsc::channel::<OverlayEvent>(64);
     let tun_factory: TunFactory =
         Box::new(|ip, nm, mtu| SystemTun::up(ip, nm, mtu).map(|t| Arc::new(t) as Arc<dyn TunIo>));
-    let rt = OverlayRuntime::new_relay(keypair, outbound, tun_factory, OVERLAY_MTU);
+    let rt = OverlayRuntime::new_relay(keypair, outbound, tun_factory, OVERLAY_MTU)
+        // Phase 1 — advertise this node's subnet routes (admin-gated server-side).
+        .with_advertised_routes(cfg.overlay_advertised_routes.clone());
     // FIELD: endpoints are advertised lazily — the relay coordinator
     // trickles each relayed address post-allocation — so join carries none.
     tokio::spawn(rt.run(evt_rx, Vec::new()));
