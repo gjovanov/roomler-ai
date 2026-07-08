@@ -20,7 +20,7 @@ use bson::oid::ObjectId;
 
 pub use roomler_ai_remote_control::models::{
     Agent, AgentStatus, DestinationRule, HostPattern, PolicySubject, PolicyTarget, PortRange,
-    TunnelPolicy,
+    ProtocolKind, TunnelPolicy,
 };
 pub use roomler_ai_remote_control::signaling::RejectKind;
 
@@ -74,6 +74,7 @@ pub fn evaluate(
     agent_id: ObjectId,
     dst_host: &str,
     dst_port: u16,
+    proto: ProtocolKind,
 ) -> Decision {
     for policy in policies {
         if policy.deleted_at.is_some() {
@@ -88,7 +89,7 @@ pub fn evaluate(
         if let Some(rule) = policy
             .allowlist
             .iter()
-            .find(|r| dst_matches(r, dst_host, dst_port))
+            .find(|r| r.proto.permits(proto) && dst_matches(r, dst_host, dst_port))
         {
             return Decision::Allow {
                 policy_id: policy.id.unwrap_or_else(ObjectId::new),
@@ -178,6 +179,7 @@ pub fn check_forward_request(
     subject: &ResolvedSubject,
     dst_host: &str,
     dst_port: u16,
+    proto: ProtocolKind,
 ) -> GateResult {
     // 1. Cross-tenant gate
     if client_tenant_id != agent.tenant_id {
@@ -212,7 +214,7 @@ pub fn check_forward_request(
             };
         }
     };
-    match evaluate(policies, subject, agent_id, dst_host, dst_port) {
+    match evaluate(policies, subject, agent_id, dst_host, dst_port, proto) {
         Decision::Allow {
             policy_id,
             rule,
@@ -273,7 +275,57 @@ mod tests {
         DestinationRule {
             host_pattern: p,
             port_range: PortRange { low, high },
+            proto: ProtocolKind::Any,
         }
+    }
+
+    /// A `proto`-narrowed rule for the UDP/TCP gating tests below.
+    fn rule_proto(p: HostPattern, low: u16, high: u16, proto: ProtocolKind) -> DestinationRule {
+        DestinationRule {
+            host_pattern: p,
+            port_range: PortRange { low, high },
+            proto,
+        }
+    }
+
+    /// Test wrapper: `evaluate` with `proto = Tcp` — the pre-UDP
+    /// default the bulk of these cases exercise. The proto-specific
+    /// gating is locked separately in `proto_*` tests.
+    fn eval_tcp(
+        policies: &[TunnelPolicy],
+        subject: &ResolvedSubject,
+        agent_id: ObjectId,
+        dst_host: &str,
+        dst_port: u16,
+    ) -> Decision {
+        evaluate(
+            policies,
+            subject,
+            agent_id,
+            dst_host,
+            dst_port,
+            ProtocolKind::Tcp,
+        )
+    }
+
+    /// Test wrapper: `check_forward_request` with `proto = Tcp`.
+    fn check_tcp(
+        client_tenant_id: ObjectId,
+        agent: &Agent,
+        policies: &[TunnelPolicy],
+        subject: &ResolvedSubject,
+        dst_host: &str,
+        dst_port: u16,
+    ) -> GateResult {
+        check_forward_request(
+            client_tenant_id,
+            agent,
+            policies,
+            subject,
+            dst_host,
+            dst_port,
+            ProtocolKind::Tcp,
+        )
     }
 
     #[test]
@@ -321,7 +373,7 @@ mod tests {
         assert!(!dst_matches(&r, "b", 1));
     }
 
-    // ─── Full evaluate() coverage (T2.3) ─────────────────────────────
+    // ─── Full eval_tcp() coverage (T2.3) ─────────────────────────────
 
     use bson::DateTime;
 
@@ -355,7 +407,7 @@ mod tests {
 
     #[test]
     fn empty_policy_list_denies() {
-        let d = evaluate(&[], &subject(ObjectId::new()), ObjectId::new(), "h", 1);
+        let d = eval_tcp(&[], &subject(ObjectId::new()), ObjectId::new(), "h", 1);
         assert!(matches!(d, Decision::Deny { .. }));
     }
 
@@ -368,7 +420,7 @@ mod tests {
             vec![PolicyTarget::AgentId { agent_id: aid }],
             vec![rule(HostPattern::Exact("db".into()), 5432, 5432)],
         );
-        let d = evaluate(&[p], &subject(uid), aid, "db", 5432);
+        let d = eval_tcp(&[p], &subject(uid), aid, "db", 5432);
         assert!(d.is_allow(), "{d:?}");
     }
 
@@ -382,7 +434,7 @@ mod tests {
             vec![PolicyTarget::AgentId { agent_id: aid }],
             vec![rule(HostPattern::Exact("db".into()), 5432, 5432)],
         );
-        let d = evaluate(&[p], &subject(other_user), aid, "db", 5432);
+        let d = eval_tcp(&[p], &subject(other_user), aid, "db", 5432);
         assert!(matches!(d, Decision::Deny { .. }));
     }
 
@@ -401,7 +453,7 @@ mod tests {
             role_ids: vec![role_b, role_a],
             tunnel_client_id: ObjectId::new(),
         };
-        assert!(evaluate(&[p], &req, aid, "db", 5432).is_allow());
+        assert!(eval_tcp(&[p], &req, aid, "db", 5432).is_allow());
     }
 
     #[test]
@@ -420,7 +472,7 @@ mod tests {
             role_ids: vec![],
             tunnel_client_id: cid,
         };
-        assert!(evaluate(&[p], &req, aid, "db", 5432).is_allow());
+        assert!(eval_tcp(&[p], &req, aid, "db", 5432).is_allow());
     }
 
     #[test]
@@ -431,7 +483,7 @@ mod tests {
             vec![PolicyTarget::AgentId { agent_id: aid }],
             vec![rule(HostPattern::Exact("db".into()), 5432, 5432)],
         );
-        assert!(evaluate(&[p], &subject(ObjectId::new()), aid, "db", 5432).is_allow());
+        assert!(eval_tcp(&[p], &subject(ObjectId::new()), aid, "db", 5432).is_allow());
     }
 
     #[test]
@@ -441,7 +493,7 @@ mod tests {
             vec![PolicyTarget::AllAgents],
             vec![rule(HostPattern::Exact("db".into()), 5432, 5432)],
         );
-        assert!(evaluate(&[p], &subject(ObjectId::new()), ObjectId::new(), "db", 5432).is_allow());
+        assert!(eval_tcp(&[p], &subject(ObjectId::new()), ObjectId::new(), "db", 5432).is_allow());
     }
 
     #[test]
@@ -455,7 +507,7 @@ mod tests {
             }],
             vec![rule(HostPattern::Exact("db".into()), 5432, 5432)],
         );
-        let d = evaluate(&[p], &subject(ObjectId::new()), other_agent, "db", 5432);
+        let d = eval_tcp(&[p], &subject(ObjectId::new()), other_agent, "db", 5432);
         assert!(matches!(d, Decision::Deny { .. }));
     }
 
@@ -475,7 +527,7 @@ mod tests {
             vec![PolicyTarget::AllAgents],
             vec![rule(HostPattern::Exact("ssh".into()), 22, 22)],
         );
-        assert!(evaluate(&[p1, p2], &subject(ObjectId::new()), aid, "ssh", 22).is_allow());
+        assert!(eval_tcp(&[p1, p2], &subject(ObjectId::new()), aid, "ssh", 22).is_allow());
     }
 
     #[test]
@@ -491,7 +543,7 @@ mod tests {
         // deleted flag stops it. Defence in depth — DAO's
         // list_active_for_tenant already filters, but a stale cache
         // shouldn't allow access.
-        let d = evaluate(&[p], &subject(ObjectId::new()), aid, "db", 5432);
+        let d = eval_tcp(&[p], &subject(ObjectId::new()), aid, "db", 5432);
         assert!(matches!(d, Decision::Deny { .. }));
     }
 
@@ -506,7 +558,7 @@ mod tests {
                 rule(HostPattern::Exact("ssh".into()), 22, 22),
             ],
         );
-        assert!(evaluate(&[p], &subject(ObjectId::new()), aid, "ssh", 22).is_allow());
+        assert!(eval_tcp(&[p], &subject(ObjectId::new()), aid, "ssh", 22).is_allow());
     }
 
     #[test]
@@ -519,7 +571,7 @@ mod tests {
             vec![PolicyTarget::AgentId { agent_id: aid }],
             vec![rule(HostPattern::Exact("db".into()), 5432, 5432)],
         );
-        let d = evaluate(&[p], &subject(ObjectId::new()), aid, "evil-dst", 5432);
+        let d = eval_tcp(&[p], &subject(ObjectId::new()), aid, "evil-dst", 5432);
         assert!(matches!(d, Decision::Deny { .. }));
     }
 
@@ -537,7 +589,7 @@ mod tests {
         p.max_bytes_per_session = Some(1024 * 1024 * 1024);
         let expected_pid = p.id.unwrap();
 
-        match evaluate(&[p], &subject(uid), aid, "db", 5432) {
+        match eval_tcp(&[p], &subject(uid), aid, "db", 5432) {
             Decision::Allow {
                 policy_id,
                 rule: matched,
@@ -555,7 +607,7 @@ mod tests {
 
     #[test]
     fn deny_carries_human_reason() {
-        let d = evaluate(&[], &subject(ObjectId::new()), ObjectId::new(), "h", 1);
+        let d = eval_tcp(&[], &subject(ObjectId::new()), ObjectId::new(), "h", 1);
         match d {
             Decision::Deny { reason } => assert!(!reason.is_empty()),
             _ => panic!("expected deny"),
@@ -571,7 +623,7 @@ mod tests {
             vec![rule(HostPattern::Cidr("10.0.0.0/24".into()), 5432, 5432)],
         );
         assert!(
-            evaluate(
+            eval_tcp(
                 std::slice::from_ref(&p),
                 &subject(ObjectId::new()),
                 aid,
@@ -581,7 +633,7 @@ mod tests {
             .is_allow()
         );
         assert!(matches!(
-            evaluate(&[p], &subject(ObjectId::new()), aid, "10.1.0.5", 5432),
+            eval_tcp(&[p], &subject(ObjectId::new()), aid, "10.1.0.5", 5432),
             Decision::Deny { .. }
         ));
     }
@@ -653,7 +705,7 @@ mod tests {
         // A policy in tenant B that would otherwise allow this.
         let p = allow_all_policy_for(tenant_b);
 
-        let result = check_forward_request(
+        let result = check_tcp(
             tenant_a, // ← client is in tenant A
             &agent_in_b,
             &[p],
@@ -676,7 +728,7 @@ mod tests {
         let tenant_a = ObjectId::new();
         let tenant_b = ObjectId::new();
         let agent_in_b = agent_for(tenant_b, AgentStatus::Online, false);
-        let result = check_forward_request(
+        let result = check_tcp(
             tenant_a,
             &agent_in_b,
             &[],
@@ -694,7 +746,7 @@ mod tests {
     fn deleted_agent_rejects_with_agent_error() {
         let tenant = ObjectId::new();
         let agent = agent_for(tenant, AgentStatus::Online, true);
-        let result = check_forward_request(
+        let result = check_tcp(
             tenant,
             &agent,
             &[allow_all_policy_for(tenant)],
@@ -712,7 +764,7 @@ mod tests {
     fn quarantined_agent_rejects_with_agent_error() {
         let tenant = ObjectId::new();
         let agent = agent_for(tenant, AgentStatus::Quarantined, false);
-        let result = check_forward_request(
+        let result = check_tcp(
             tenant,
             &agent,
             &[allow_all_policy_for(tenant)],
@@ -738,8 +790,7 @@ mod tests {
         p.max_bytes_per_session = Some(500 * 1024 * 1024);
         let expected_pid = p.id.unwrap();
 
-        let result =
-            check_forward_request(tenant, &agent, &[p], &subject(ObjectId::new()), "db", 5432);
+        let result = check_tcp(tenant, &agent, &[p], &subject(ObjectId::new()), "db", 5432);
         match result {
             GateResult::Allow {
                 policy_id,
@@ -761,8 +812,7 @@ mod tests {
         // the dashboard's "policy gaps" report to be accurate.
         let tenant = ObjectId::new();
         let agent = agent_for(tenant, AgentStatus::Online, false);
-        let result =
-            check_forward_request(tenant, &agent, &[], &subject(ObjectId::new()), "db", 5432);
+        let result = check_tcp(tenant, &agent, &[], &subject(ObjectId::new()), "db", 5432);
         match result {
             GateResult::Reject { kind, .. } => assert_eq!(kind, RejectKind::AclDenied),
             _ => panic!("expected AclDenied"),
@@ -776,7 +826,7 @@ mod tests {
         // policy, not liveness.
         let tenant = ObjectId::new();
         let agent = agent_for(tenant, AgentStatus::Offline, false);
-        let result = check_forward_request(
+        let result = check_tcp(
             tenant,
             &agent,
             &[allow_all_policy_for(tenant)],
@@ -785,5 +835,151 @@ mod tests {
             5432,
         );
         assert!(result.is_allow());
+    }
+
+    // ─── proto gating (UDP ASSOCIATE) ────────────────────────────────
+
+    #[test]
+    fn any_proto_rule_permits_both_tcp_and_udp() {
+        let aid = ObjectId::new();
+        let p = policy(
+            vec![PolicySubject::AllUsers],
+            vec![PolicyTarget::AllAgents],
+            vec![rule_proto(
+                HostPattern::Exact("dns".into()),
+                53,
+                53,
+                ProtocolKind::Any,
+            )],
+        );
+        assert!(
+            evaluate(
+                std::slice::from_ref(&p),
+                &subject(ObjectId::new()),
+                aid,
+                "dns",
+                53,
+                ProtocolKind::Tcp
+            )
+            .is_allow()
+        );
+        assert!(
+            evaluate(
+                &[p],
+                &subject(ObjectId::new()),
+                aid,
+                "dns",
+                53,
+                ProtocolKind::Udp
+            )
+            .is_allow()
+        );
+    }
+
+    #[test]
+    fn udp_rule_denies_tcp_request_and_vice_versa() {
+        let aid = ObjectId::new();
+        let udp_only = policy(
+            vec![PolicySubject::AllUsers],
+            vec![PolicyTarget::AllAgents],
+            vec![rule_proto(
+                HostPattern::Exact("dns".into()),
+                53,
+                53,
+                ProtocolKind::Udp,
+            )],
+        );
+        assert!(
+            evaluate(
+                std::slice::from_ref(&udp_only),
+                &subject(ObjectId::new()),
+                aid,
+                "dns",
+                53,
+                ProtocolKind::Udp
+            )
+            .is_allow()
+        );
+        assert!(matches!(
+            evaluate(
+                &[udp_only],
+                &subject(ObjectId::new()),
+                aid,
+                "dns",
+                53,
+                ProtocolKind::Tcp
+            ),
+            Decision::Deny { .. }
+        ));
+
+        let tcp_only = policy(
+            vec![PolicySubject::AllUsers],
+            vec![PolicyTarget::AllAgents],
+            vec![rule_proto(
+                HostPattern::Exact("db".into()),
+                5432,
+                5432,
+                ProtocolKind::Tcp,
+            )],
+        );
+        assert!(
+            evaluate(
+                std::slice::from_ref(&tcp_only),
+                &subject(ObjectId::new()),
+                aid,
+                "db",
+                5432,
+                ProtocolKind::Tcp
+            )
+            .is_allow()
+        );
+        assert!(matches!(
+            evaluate(
+                &[tcp_only],
+                &subject(ObjectId::new()),
+                aid,
+                "db",
+                5432,
+                ProtocolKind::Udp
+            ),
+            Decision::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn check_forward_request_gates_udp_proto() {
+        let tenant = ObjectId::new();
+        let agent = agent_for(tenant, AgentStatus::Online, false);
+        let mut p = allow_all_policy_for(tenant);
+        p.allowlist = vec![rule_proto(
+            HostPattern::Exact("db".into()),
+            5432,
+            5432,
+            ProtocolKind::Udp,
+        )];
+        assert!(
+            check_forward_request(
+                tenant,
+                &agent,
+                std::slice::from_ref(&p),
+                &subject(ObjectId::new()),
+                "db",
+                5432,
+                ProtocolKind::Udp
+            )
+            .is_allow()
+        );
+        match check_forward_request(
+            tenant,
+            &agent,
+            &[p],
+            &subject(ObjectId::new()),
+            "db",
+            5432,
+            ProtocolKind::Tcp,
+        ) {
+            GateResult::Reject { kind, .. } => assert_eq!(kind, RejectKind::AclDenied),
+            r => panic!("expected AclDenied, got {r:?}"),
+        }
     }
 }

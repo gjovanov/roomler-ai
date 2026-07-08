@@ -155,18 +155,23 @@ type WsSource = futures::stream::SplitStream<
 >;
 
 /// Reply registry: per-flow oneshot for the server's accept/reject.
-type ReplyRegistry = Arc<Mutex<HashMap<u32, oneshot::Sender<ForwardReply>>>>;
+/// `pub(crate)` so the `udp` relay module shares the same correlation
+/// map (flow_ids are unique per session across TCP + UDP).
+pub(crate) type ReplyRegistry = Arc<Mutex<HashMap<u32, oneshot::Sender<ForwardReply>>>>;
 
 /// Active-flow registry: which DC index a given flow is bound to, so
 /// the WS dispatch can route inbound `TcpHalfClose` audit signals
 /// (no demux action — in-band marker handles the data-plane close).
-type ActiveFlows = Arc<Mutex<HashMap<u32, u8>>>;
+pub(crate) type ActiveFlows = Arc<Mutex<HashMap<u32, u8>>>;
 
 #[derive(Debug)]
-enum ForwardReply {
+pub(crate) enum ForwardReply {
     Accept { dc_index: u8 },
     Reject { kind: RejectKind, reason: String },
 }
+
+/// Per-flow open round-trip cap, shared with the `udp` relay module.
+pub(crate) const FLOW_OPEN_TIMEOUT_SHARED: std::time::Duration = FLOW_OPEN_TIMEOUT;
 
 /// Entry point for `roomler-tunnel forward`. Tries the operator's
 /// preferred transport and, for `--transport auto`, transparently
@@ -653,13 +658,31 @@ async fn run_webrtc_session(
         let active_flows = Arc::clone(&active_flows);
         let outbound_tx = outbound_tx.clone();
         let target = target.clone();
+        let flow_counter_for_udp = Arc::clone(&flow_counter);
         tokio::spawn(async move {
             // Resolve the destination: the static `--remote`, or the
-            // per-connection SOCKS5 CONNECT target (userspace mode).
+            // per-connection SOCKS5 request (userspace mode). A SOCKS5
+            // UDP ASSOCIATE forks off the UDP relay and never uses the
+            // pre-allocated TCP flow_id.
             let (host, port, socks) = match &target {
                 Target::Static { host, port } => (host.clone(), *port, false),
-                Target::Socks5 => match crate::socks5::accept_connect(&mut tcp).await {
-                    Ok((h, p)) => (h, p, true),
+                Target::Socks5 => match crate::socks5::accept_request(&mut tcp).await {
+                    Ok(crate::socks5::Socks5Request::Connect { host, port }) => (host, port, true),
+                    Ok(crate::socks5::Socks5Request::UdpAssociate) => {
+                        if let Err(e) = crate::udp::handle_associate(
+                            tcp,
+                            session_id,
+                            crate::udp::AssocCarrier::Dc { demuxes },
+                            reply_registry,
+                            outbound_tx,
+                            flow_counter_for_udp,
+                        )
+                        .await
+                        {
+                            warn!(%peer_addr, %e, "socks5 UDP associate ended with error");
+                        }
+                        return;
+                    }
                     Err(e) => {
                         warn!(%peer_addr, %e, "socks5 handshake failed; dropping");
                         return;
@@ -922,6 +945,37 @@ async fn dispatch_loop(
                 debug!(flow_id, ?reason, "rc:tunnel.tcp.closed (audit)");
                 active_flows.lock().await.remove(&flow_id);
             }
+            ServerMsg::UdpForwardAccept {
+                session_id: sid,
+                flow_id,
+                dc_index,
+            } if sid == session_id => {
+                if let Some(tx) = reply_registry.lock().await.remove(&flow_id) {
+                    let _ = tx.send(ForwardReply::Accept { dc_index });
+                } else {
+                    warn!(flow_id, "udp accept for unknown flow_id");
+                }
+            }
+            ServerMsg::UdpForwardReject {
+                session_id: sid,
+                flow_id,
+                kind,
+                reason,
+            } if sid == session_id => {
+                if let Some(tx) = reply_registry.lock().await.remove(&flow_id) {
+                    let _ = tx.send(ForwardReply::Reject { kind, reason });
+                } else {
+                    warn!(flow_id, ?kind, %reason, "udp reject for unknown flow_id");
+                }
+            }
+            ServerMsg::UdpClosed {
+                session_id: sid,
+                flow_id,
+                reason,
+            } if sid == session_id => {
+                debug!(flow_id, ?reason, "rc:tunnel.udp.closed (audit)");
+                active_flows.lock().await.remove(&flow_id);
+            }
             ServerMsg::TunnelTerminate {
                 session_id: sid,
                 reason,
@@ -1140,13 +1194,30 @@ async fn run_quic_session(
         let outbound_tx = outbound_tx.clone();
         let target = target.clone();
         let conn = Arc::clone(&conn);
+        let flow_counter_for_udp = Arc::clone(&flow_counter);
         tokio::spawn(async move {
             // Resolve the destination: static `--remote`, or the per-connection
-            // SOCKS5 CONNECT target (userspace mode).
+            // SOCKS5 request (userspace mode). UDP ASSOCIATE forks off the UDP
+            // relay over this session's QUIC connection.
             let (host, port, socks) = match &target {
                 Target::Static { host, port } => (host.clone(), *port, false),
-                Target::Socks5 => match crate::socks5::accept_connect(&mut tcp).await {
-                    Ok((h, p)) => (h, p, true),
+                Target::Socks5 => match crate::socks5::accept_request(&mut tcp).await {
+                    Ok(crate::socks5::Socks5Request::Connect { host, port }) => (host, port, true),
+                    Ok(crate::socks5::Socks5Request::UdpAssociate) => {
+                        if let Err(e) = crate::udp::handle_associate(
+                            tcp,
+                            session_id,
+                            crate::udp::AssocCarrier::Quic { conn },
+                            reply_registry,
+                            outbound_tx,
+                            flow_counter_for_udp,
+                        )
+                        .await
+                        {
+                            warn!(%peer_addr, %e, "socks5 UDP associate ended with error");
+                        }
+                        return;
+                    }
                     Err(e) => {
                         warn!(%peer_addr, %e, "socks5 handshake failed; dropping");
                         return;
@@ -1401,6 +1472,37 @@ async fn quic_dispatch_loop(
                 reason,
             } if sid == session_id => {
                 debug!(flow_id, ?reason, "rc:tunnel.tcp.closed (audit)");
+                active_flows.lock().await.remove(&flow_id);
+            }
+            ServerMsg::UdpForwardAccept {
+                session_id: sid,
+                flow_id,
+                dc_index,
+            } if sid == session_id => {
+                if let Some(tx) = reply_registry.lock().await.remove(&flow_id) {
+                    let _ = tx.send(ForwardReply::Accept { dc_index });
+                } else {
+                    warn!(flow_id, "udp accept for unknown flow_id");
+                }
+            }
+            ServerMsg::UdpForwardReject {
+                session_id: sid,
+                flow_id,
+                kind,
+                reason,
+            } if sid == session_id => {
+                if let Some(tx) = reply_registry.lock().await.remove(&flow_id) {
+                    let _ = tx.send(ForwardReply::Reject { kind, reason });
+                } else {
+                    warn!(flow_id, ?kind, %reason, "udp reject for unknown flow_id");
+                }
+            }
+            ServerMsg::UdpClosed {
+                session_id: sid,
+                flow_id,
+                reason,
+            } if sid == session_id => {
+                debug!(flow_id, ?reason, "rc:tunnel.udp.closed (audit)");
                 active_flows.lock().await.remove(&flow_id);
             }
             ServerMsg::TunnelTerminate {
