@@ -481,6 +481,12 @@ pub enum ClientMsg {
         /// advertise it (a QUIC/raw split would silently break the pair).
         #[serde(default)]
         supports_quic: bool,
+        /// Phase 1 — subnet CIDRs this node offers to route for peers
+        /// (`--advertise-routes` / config). The server stores them as *claimed*
+        /// routes; an admin must **approve** each before it's distributed in the
+        /// netmap `routes`. Empty for a normal node (`#[serde(default)]`).
+        #[serde(default)]
+        advertised_routes: Vec<String>,
     },
 
     /// Node trickles updated connectivity candidates; the server fans a
@@ -889,6 +895,13 @@ pub struct NetmapPeer {
     /// leave one side on QUIC and the other on raw (which wouldn't decapsulate).
     #[serde(default)]
     pub supports_quic: bool,
+    /// Phase 1 — subnet routes this peer is an **approved** router for (CIDR
+    /// strings like `"192.168.1.0/24"`). A receiving node installs each CIDR
+    /// into its router (allowed_ips) + OS route table pointing at this peer, so
+    /// LAN behind the peer is reachable over the overlay. Empty for a normal
+    /// (non-router) peer or a pre-Phase-1 server (`#[serde(default)]`).
+    #[serde(default)]
+    pub routes: Vec<String>,
 }
 
 /// Network-wide parameters carried in a full netmap so the node can size
@@ -1542,6 +1555,7 @@ mod tests {
             mtu: 1280,
             endpoints: vec!["203.0.113.5:51820".into()],
             supports_quic: true,
+            advertised_routes: vec!["192.168.1.0/24".into()],
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(r#""t":"rc:overlay.join""#));
@@ -1551,12 +1565,14 @@ mod tests {
                 mtu,
                 supported,
                 supports_quic,
+                advertised_routes,
                 ..
             } => {
                 assert_eq!(wg_public_key, "cHVia2V5");
                 assert_eq!(mtu, 1280);
                 assert!(supported.iter().any(|t| t == "wireguard-v1"));
                 assert!(supports_quic, "supports_quic must round-trip");
+                assert_eq!(advertised_routes, vec!["192.168.1.0/24".to_string()]);
             }
             other => panic!("expected OverlayJoin, got {other:?}"),
         }
@@ -1614,6 +1630,7 @@ mod tests {
                 relay_home: None,
                 reachable: true,
                 supports_quic: true,
+                routes: vec!["10.0.0.0/24".into()],
             }],
             epoch: 7,
         };

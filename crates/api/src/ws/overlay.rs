@@ -75,6 +75,7 @@ pub async fn relay_overlay_msg_from_node(
             key_epoch,
             endpoints,
             supports_quic,
+            advertised_routes,
             ..
         } => {
             handle_overlay_join(
@@ -84,6 +85,7 @@ pub async fn relay_overlay_msg_from_node(
                 key_epoch,
                 endpoints,
                 supports_quic,
+                advertised_routes,
             )
             .await;
             None
@@ -106,6 +108,7 @@ pub async fn relay_overlay_msg_from_node(
 
 /// Join: IPAM (allocate or rehydrate) → persist → full netmap to the
 /// joiner → upsert delta to each permitted peer.
+#[allow(clippy::too_many_arguments)]
 async fn handle_overlay_join(
     state: &AppState,
     ident: NodeIdentity,
@@ -113,6 +116,7 @@ async fn handle_overlay_join(
     key_epoch: u32,
     endpoints: Vec<String>,
     supports_quic: bool,
+    advertised_routes: Vec<String>,
 ) {
     let node_ref = ident.node_ref();
     let Some((tenant_id, machine_id, display_name)) =
@@ -123,6 +127,8 @@ async fn handle_overlay_join(
     };
     // Phase 0 — the DNS-safe base label from the node's display name.
     let base_name = dns_label(&display_name, &machine_id);
+    // Phase 1 — drop malformed CIDRs so a bad advertisement can't poison state.
+    let advertised_routes = sanitize_cidrs(advertised_routes);
 
     let network = match state.overlay_networks.get_or_create(tenant_id).await {
         Ok(n) => n,
@@ -161,6 +167,7 @@ async fn handle_overlay_join(
                     key_epoch,
                     &endpoints,
                     supports_quic,
+                    &advertised_routes,
                 )
                 .await
             {
@@ -198,6 +205,7 @@ async fn handle_overlay_join(
                     key_epoch,
                     endpoints,
                     supports_quic,
+                    advertised_routes,
                 )
                 .await
             {
@@ -351,6 +359,15 @@ async fn handle_overlay_relay_request(
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Re-fan a node's current netmap entry to its peers as an upsert delta — used
+/// when something OUT of band changes the node's wire shape (Phase 1: an admin
+/// approving/revoking its subnet `routes`), so peers pick it up immediately
+/// instead of waiting for the next join. Best-effort.
+pub(crate) async fn refan_node(state: &AppState, node: &OverlayNode) {
+    let upsert = to_netmap_peer(node);
+    fan_delta_to_peers(state, node, next_epoch(), vec![upsert], vec![]).await;
+}
 
 /// Fan a delta to every active peer of `self_node` in its network.
 async fn fan_delta_to_peers(
@@ -539,7 +556,24 @@ fn to_netmap_peer(node: &OverlayNode) -> NetmapPeer {
         relay_home: node.relay_home.clone(),
         reachable: true,
         supports_quic: node.supports_quic,
+        // Phase 1 — only the admin-APPROVED routes reach peers.
+        routes: node.approved_routes.clone(),
     }
+}
+
+/// Keep only well-formed IPv4 CIDR strings (`a.b.c.d/nn`, prefix ≤ 32) so a
+/// malformed or malicious advertisement can't poison the stored/distributed
+/// route set. (Phase 1.)
+fn sanitize_cidrs(routes: Vec<String>) -> Vec<String> {
+    routes
+        .into_iter()
+        .filter(|r| {
+            let Some((ip, pfx)) = r.split_once('/') else {
+                return false;
+            };
+            ip.parse::<std::net::Ipv4Addr>().is_ok() && pfx.parse::<u8>().is_ok_and(|p| p <= 32)
+        })
+        .collect()
 }
 
 /// `lan ∪ rest`, LAN first, order-preserving dedup.

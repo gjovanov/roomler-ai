@@ -125,6 +125,7 @@ const routes: RouteRecordRaw[] = [
               { path: 'agents',    name: 'admin-agents',    props: true, component: () => import('@/components/admin/AgentsSection.vue') },
               { path: 'tunnel-clients', name: 'admin-tunnel-clients', props: true, component: () => import('@/components/admin/TunnelClientsSection.vue') },
               { path: 'tunnel-policies', name: 'admin-tunnel-policies', props: true, component: () => import('@/components/admin/TunnelPoliciesSection.vue') },
+              { path: 'subnet-routes', name: 'admin-subnet-routes', props: true, component: () => import('@/components/admin/OverlaySubnetRoutesSection.vue') },
               { path: 'tasks',     name: 'admin-tasks',     props: true, component: () => import('@/components/admin/TasksSection.vue') },
               { path: 'audit-log', name: 'admin-audit-log', props: true, component: () => import('@/components/admin/AuditSection.vue') },
             ],
