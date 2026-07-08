@@ -39,7 +39,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, info, warn};
-use tunnel_core::policy::{GateResult, ResolvedSubject, check_forward_request};
+use tunnel_core::policy::{GateResult, ProtocolKind, ResolvedSubject, check_forward_request};
 use tunnel_core::transport::{TRANSPORT_QUIC_V1, TRANSPORT_WEBRTC_DC_V1};
 
 use crate::state::AppState;
@@ -204,7 +204,32 @@ pub async fn handle_tunnel_client_socket(
                 dst_host,
                 dst_port,
             } => {
-                handle_tcp_forward_request(
+                handle_forward_request(
+                    ProtocolKind::Tcp,
+                    &state,
+                    &outbound_tx,
+                    session.as_ref(),
+                    tunnel_client_id,
+                    tenant_id,
+                    owner_user_id,
+                    &client_version,
+                    client_os,
+                    session_id,
+                    flow_id,
+                    &dst_host,
+                    dst_port,
+                )
+                .await;
+            }
+
+            ClientMsg::UdpForwardRequest {
+                session_id,
+                flow_id,
+                dst_host,
+                dst_port,
+            } => {
+                handle_forward_request(
+                    ProtocolKind::Udp,
                     &state,
                     &outbound_tx,
                     session.as_ref(),
@@ -291,6 +316,26 @@ pub async fn handle_tunnel_client_socket(
                 .await;
             }
 
+            ClientMsg::UdpClosed {
+                session_id,
+                flow_id,
+                reason,
+            } => {
+                // Relay UDP flow-close to agent + append audit row.
+                relay_udp_closed_to_agent(
+                    &state,
+                    session.as_ref(),
+                    tunnel_client_id,
+                    owner_user_id,
+                    &client_version,
+                    client_os,
+                    session_id,
+                    flow_id,
+                    reason,
+                )
+                .await;
+            }
+
             ClientMsg::TunnelSdpOffer { session_id, sdp } => {
                 // Relay SDP offer to the agent so it can build its
                 // answerer-side TunnelPeer. Server-side route is
@@ -319,7 +364,10 @@ pub async fn handle_tunnel_client_socket(
                 debug!(%tunnel_client_id, "client emitted TunnelSdpAnswer — ignoring");
             }
 
-            ClientMsg::TcpForwardAccept { .. } | ClientMsg::TcpForwardReject { .. } => {
+            ClientMsg::TcpForwardAccept { .. }
+            | ClientMsg::TcpForwardReject { .. }
+            | ClientMsg::UdpForwardAccept { .. }
+            | ClientMsg::UdpForwardReject { .. } => {
                 // Client → server: clients never originate these
                 // (server-side ACL + agent are the deciders). Tests
                 // exercise the wire; just log so we notice if a
@@ -601,8 +649,67 @@ fn mint_quic_token() -> String {
     )
 }
 
+/// Build the transport-appropriate reject ServerMsg. TCP and UDP
+/// forwards share the identical gate logic; only the wire discriminator
+/// differs.
+fn forward_reject_msg(
+    proto: ProtocolKind,
+    session_id: ObjectId,
+    flow_id: u32,
+    kind: RejectKind,
+    reason: String,
+) -> ServerMsg {
+    match proto {
+        ProtocolKind::Udp => ServerMsg::UdpForwardReject {
+            session_id,
+            flow_id,
+            kind,
+            reason,
+        },
+        _ => ServerMsg::TcpForwardReject {
+            session_id,
+            flow_id,
+            kind,
+            reason,
+        },
+    }
+}
+
+/// Build the transport-appropriate forward ServerMsg (server → agent).
+fn forward_forward_msg(
+    proto: ProtocolKind,
+    session_id: ObjectId,
+    flow_id: u32,
+    dst_host: String,
+    dst_port: u16,
+    owner_user_id: ObjectId,
+) -> ServerMsg {
+    match proto {
+        ProtocolKind::Udp => ServerMsg::UdpForwardForward {
+            session_id,
+            flow_id,
+            dst_host,
+            dst_port,
+            owner_user_id,
+        },
+        _ => ServerMsg::TcpForwardForward {
+            session_id,
+            flow_id,
+            dst_host,
+            dst_port,
+            owner_user_id,
+        },
+    }
+}
+
+/// Server-side forward gate + relay, shared by TCP CONNECT
+/// (`proto = Tcp`) and UDP ASSOCIATE (`proto = Udp`) forwards. The ACL
+/// eval, cross-tenant gate, agent-liveness re-check, and audit trail are
+/// identical; `proto` selects the wire discriminator + the policy
+/// protocol axis.
 #[allow(clippy::too_many_arguments)]
-async fn handle_tcp_forward_request(
+async fn handle_forward_request(
+    proto: ProtocolKind,
     state: &AppState,
     outbound_tx: &mpsc::Sender<ServerMsg>,
     session: Option<&TunnelSession>,
@@ -620,12 +727,13 @@ async fn handle_tcp_forward_request(
         // No prior TunnelOpen — client is using the wire wrong.
         send_msg(
             outbound_tx,
-            ServerMsg::TcpForwardReject {
-                session_id: request_session_id,
+            forward_reject_msg(
+                proto,
+                request_session_id,
                 flow_id,
-                kind: RejectKind::AgentError,
-                reason: "no open session (send rc:tunnel.open first)".into(),
-            },
+                RejectKind::AgentError,
+                "no open session (send rc:tunnel.open first)".into(),
+            ),
         )
         .await;
         return;
@@ -633,12 +741,13 @@ async fn handle_tcp_forward_request(
     if s.tunnel_session_id != request_session_id {
         send_msg(
             outbound_tx,
-            ServerMsg::TcpForwardReject {
-                session_id: request_session_id,
+            forward_reject_msg(
+                proto,
+                request_session_id,
                 flow_id,
-                kind: RejectKind::AgentError,
-                reason: "session_id mismatch".into(),
-            },
+                RejectKind::AgentError,
+                "session_id mismatch".into(),
+            ),
         )
         .await;
         return;
@@ -665,12 +774,13 @@ async fn handle_tcp_forward_request(
             .await;
             send_msg(
                 outbound_tx,
-                ServerMsg::TcpForwardReject {
-                    session_id: request_session_id,
+                forward_reject_msg(
+                    proto,
+                    request_session_id,
                     flow_id,
-                    kind: RejectKind::AgentError,
-                    reason: "agent row vanished".into(),
-                },
+                    RejectKind::AgentError,
+                    "agent row vanished".into(),
+                ),
             )
             .await;
             return;
@@ -708,24 +818,26 @@ async fn handle_tcp_forward_request(
         &subject,
         dst_host,
         dst_port,
+        proto,
     );
 
     match result {
         GateResult::Allow { policy_id, .. } => {
-            debug!(%tunnel_client_id, %flow_id, %dst_host, %dst_port, %policy_id, "tcp forward allowed by policy; relaying to agent");
+            debug!(%tunnel_client_id, %flow_id, %dst_host, %dst_port, ?proto, %policy_id, "forward allowed by policy; relaying to agent");
             // T2.10c: relay to the agent's WS. The agent dials dst,
-            // then replies with `ClientMsg::TcpForwardAccept` (or
-            // Reject) which the agent WS handler routes back to us
-            // via `tunnel_clients_by_session`.
+            // then replies with `ClientMsg::TcpForwardAccept` /
+            // `UdpForwardAccept` (or Reject) which the agent WS handler
+            // routes back to us via `tunnel_clients_by_session`.
             let relay = state.rc_hub.send_to_agent(
                 s.agent_id,
-                ServerMsg::TcpForwardForward {
-                    session_id: request_session_id,
+                forward_forward_msg(
+                    proto,
+                    request_session_id,
                     flow_id,
-                    dst_host: dst_host.to_string(),
+                    dst_host.to_string(),
                     dst_port,
                     owner_user_id,
-                },
+                ),
             );
             match relay {
                 Ok(()) => {
@@ -764,19 +876,20 @@ async fn handle_tcp_forward_request(
                     .await;
                     send_msg(
                         outbound_tx,
-                        ServerMsg::TcpForwardReject {
-                            session_id: request_session_id,
+                        forward_reject_msg(
+                            proto,
+                            request_session_id,
                             flow_id,
-                            kind: RejectKind::AgentError,
-                            reason: format!("agent unreachable: {e}"),
-                        },
+                            RejectKind::AgentError,
+                            format!("agent unreachable: {e}"),
+                        ),
                     )
                     .await;
                 }
             }
         }
         GateResult::Reject { kind, reason } => {
-            info!(%tunnel_client_id, %flow_id, %dst_host, %dst_port, ?kind, %reason, "tcp forward rejected");
+            info!(%tunnel_client_id, %flow_id, %dst_host, %dst_port, ?proto, ?kind, %reason, "forward rejected");
             audit_tcp_reject(
                 state,
                 s,
@@ -793,12 +906,7 @@ async fn handle_tcp_forward_request(
             .await;
             send_msg(
                 outbound_tx,
-                ServerMsg::TcpForwardReject {
-                    session_id: request_session_id,
-                    flow_id,
-                    kind,
-                    reason,
-                },
+                forward_reject_msg(proto, request_session_id, flow_id, kind, reason),
             )
             .await;
         }
@@ -1024,6 +1132,50 @@ async fn relay_tcp_closed_to_agent(
         },
     ) {
         debug!(%tunnel_client_id, %flow_id, %e, "tcp-closed relay to agent failed");
+    }
+    audit_tcp_close(
+        state,
+        s,
+        tunnel_client_id,
+        owner_user_id,
+        client_version,
+        client_os,
+        flow_id,
+        reason,
+    )
+    .await;
+}
+
+/// UDP analogue of [`relay_tcp_closed_to_agent`]: relay a UDP-flow close
+/// to the agent + append an audit row. Reuses [`audit_tcp_close`] — the
+/// close accounting is L4-agnostic (flow_id + reason).
+#[allow(clippy::too_many_arguments)]
+async fn relay_udp_closed_to_agent(
+    state: &AppState,
+    session: Option<&TunnelSession>,
+    tunnel_client_id: ObjectId,
+    owner_user_id: ObjectId,
+    client_version: &str,
+    client_os: roomler_ai_remote_control::models::OsKind,
+    request_session_id: ObjectId,
+    flow_id: u32,
+    reason: CloseReason,
+) {
+    let Some(s) = session else {
+        return;
+    };
+    if s.tunnel_session_id != request_session_id {
+        return;
+    }
+    if let Err(e) = state.rc_hub.send_to_agent(
+        s.agent_id,
+        ServerMsg::UdpClosed {
+            session_id: request_session_id,
+            flow_id,
+            reason,
+        },
+    ) {
+        debug!(%tunnel_client_id, %flow_id, %e, "udp-closed relay to agent failed");
     }
     audit_tcp_close(
         state,

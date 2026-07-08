@@ -25,9 +25,15 @@ export interface PortRange {
   high: number
 }
 
+// `ProtocolKind` in `models.rs` — which L4 protocol a rule permits.
+// `#[serde(default)]` on the Rust side means omitting it (or 'any')
+// matches both TCP CONNECT and UDP ASSOCIATE forwards.
+export type ProtocolKind = 'tcp' | 'udp' | 'any'
+
 export interface DestinationRule {
   host_pattern: HostPattern
   port_range: PortRange
+  proto?: ProtocolKind
 }
 
 // `PolicySubject` is `#[serde(tag = "kind", rename_all = "snake_case")]`

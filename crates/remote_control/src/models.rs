@@ -241,10 +241,41 @@ pub struct PortRange {
     pub high: u16,
 }
 
+/// Which L4 protocol a [`DestinationRule`] permits. `Any` (the default,
+/// and what pre-UDP stored rules deserialise to) matches both TCP
+/// CONNECT forwards and UDP ASSOCIATE forwards; `Tcp` / `Udp` narrow a
+/// rule to one. The forward gate evaluates the request's protocol
+/// against this via [`ProtocolKind::permits`].
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProtocolKind {
+    Tcp,
+    Udp,
+    /// Matches any protocol. Default so a rule authored (or stored)
+    /// without a `proto` field keeps its pre-UDP behaviour.
+    #[default]
+    Any,
+}
+
+impl ProtocolKind {
+    /// Does a rule declaring `self` permit a forward request of
+    /// protocol `req`? `Any` permits everything; otherwise the request
+    /// must match exactly. `req` is always concrete (`Tcp` / `Udp`) —
+    /// a request never carries `Any`.
+    pub fn permits(self, req: ProtocolKind) -> bool {
+        matches!(self, ProtocolKind::Any) || self == req
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct DestinationRule {
     pub host_pattern: HostPattern,
     pub port_range: PortRange,
+    /// L4 protocol this rule permits. `#[serde(default)]` → `Any` for
+    /// pre-UDP stored rules + omitting it on the wire. Gated in
+    /// `tunnel_core::policy::evaluate`.
+    #[serde(default)]
+    pub proto: ProtocolKind,
 }
 
 /// Who a policy applies to. `{"kind":"all_users"}` is the catch-all

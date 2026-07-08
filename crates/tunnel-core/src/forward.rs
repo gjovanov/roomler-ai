@@ -578,6 +578,205 @@ pub async fn run_flow_quic(
     }
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// UDP ASSOCIATE datagram carriage (SOCKS5 UDP over the tunnel)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Largest UDP datagram carried over a flow. 65535 covers any real
+/// UDP payload and is exactly what the 2-byte length prefix can encode.
+pub const MAX_UDP_DATAGRAM: usize = u16::MAX as usize;
+
+/// Default idle timeout for a UDP flow. UDP has no EOF, so a flow that
+/// sees no traffic in either direction for this long is closed (RFC 1928
+/// ties the association to the SOCKS control TCP connection; individual
+/// per-target flows idle-close under it). 60 s comfortably outlives a
+/// DNS query/response and a typical request/response exchange.
+pub const UDP_FLOW_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Frame one datagram for carriage: `[u16 BE len | datagram]`. The
+/// length prefix (a) delimits datagrams on a QUIC reliable stream and
+/// (b) guarantees a UDP flow's DC payload can never collide with the
+/// 1-byte [`HALF_CLOSE_MAGIC`] TCP sentinel (a framed datagram is ≥ 2
+/// bytes). Returns `None` if the datagram exceeds [`MAX_UDP_DATAGRAM`]
+/// (dropped, matching UDP's lossy semantics).
+pub fn frame_udp_datagram(dg: &[u8]) -> Option<Vec<u8>> {
+    if dg.len() > MAX_UDP_DATAGRAM {
+        return None;
+    }
+    let mut out = Vec::with_capacity(2 + dg.len());
+    out.extend_from_slice(&(dg.len() as u16).to_be_bytes());
+    out.extend_from_slice(dg);
+    Some(out)
+}
+
+/// Strip the 2-byte length prefix from a DC-carried UDP frame (one DC
+/// message = one framed datagram). Returns the datagram bytes, or `None`
+/// on a short / malformed frame.
+pub fn deframe_udp_datagram(buf: &[u8]) -> Option<&[u8]> {
+    if buf.len() < 2 {
+        return None;
+    }
+    let len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
+    buf.get(2..2 + len)
+}
+
+/// Read one length-prefixed datagram off a QUIC recv stream. Returns
+/// `Ok(None)` on a clean stream FIN at a datagram boundary (the peer
+/// closed the flow). A FIN mid-frame is an error.
+pub async fn quic_read_datagram(recv: &mut RecvStream) -> std::io::Result<Option<Vec<u8>>> {
+    let mut lenb = [0u8; 2];
+    match recv.read_exact(&mut lenb).await {
+        Ok(()) => {}
+        // FinishedEarly(0) == clean FIN exactly at a datagram boundary.
+        Err(quinn::ReadExactError::FinishedEarly(0)) => return Ok(None),
+        Err(e) => return Err(std::io::Error::other(e)),
+    }
+    let len = u16::from_be_bytes(lenb) as usize;
+    let mut dg = vec![0u8; len];
+    recv.read_exact(&mut dg)
+        .await
+        .map_err(std::io::Error::other)?;
+    Ok(Some(dg))
+}
+
+/// Write one length-prefixed datagram to a QUIC send stream. Oversized
+/// datagrams are dropped (UDP semantics) rather than erroring the flow.
+pub async fn quic_write_datagram(send: &mut SendStream, dg: &[u8]) -> std::io::Result<()> {
+    let Some(framed) = frame_udp_datagram(dg) else {
+        return Ok(());
+    };
+    send.write_all(&framed).await.map_err(std::io::Error::other)
+}
+
+/// Frame + send one UDP datagram on a DataChannel for `flow_id`
+/// (`mux::encode(flow_id, [u16 len | datagram])`). Convenience so a
+/// caller (the tunnel-client UDP relay) needn't depend on `bytes` /
+/// webrtc directly. Oversized datagrams are dropped.
+pub async fn send_udp_datagram_dc(
+    dc: &RTCDataChannel,
+    flow_id: u32,
+    dg: &[u8],
+) -> std::io::Result<()> {
+    let Some(framed) = frame_udp_datagram(dg) else {
+        return Ok(());
+    };
+    dc.send(&Bytes::from(mux::encode(flow_id, &framed)))
+        .await
+        .map(|_| ())
+        .map_err(std::io::Error::other)
+}
+
+/// Agent-side UDP flow pump over the WebRTC DataChannel pool. `udp` is a
+/// socket the caller has already `connect()`ed to the flow's target, so
+/// `send`/`recv` are unambiguous. Datagrams from the carrier
+/// (`from_dc`, each mailbox `Bytes` = one `[u16 len | datagram]` frame)
+/// are sent to the target; datagrams from the target are framed and
+/// pushed onto the DC as `mux::encode(flow_id, [u16 len | datagram])`.
+///
+/// A single idle timer covers both directions and resets on any
+/// activity — a one-directional stream (media in, nothing back) keeps
+/// the flow alive. Returns [`CloseReason::IdleTimeout`] when both
+/// directions are silent for `idle_timeout`, [`CloseReason::Eof`] when
+/// the client closes the flow (mailbox drop), or [`CloseReason::IoError`]
+/// on a transport error.
+pub async fn run_flow_udp_dc(
+    udp: tokio::net::UdpSocket,
+    dc: Arc<RTCDataChannel>,
+    flow_id: u32,
+    mut from_dc: mpsc::Receiver<Bytes>,
+    idle_timeout: std::time::Duration,
+    stats: Arc<FlowStats>,
+) -> CloseReason {
+    let mut buf = vec![0u8; MAX_UDP_DATAGRAM];
+    loop {
+        tokio::select! {
+            // carrier → target
+            m = from_dc.recv() => match m {
+                Some(framed) => {
+                    if let Some(dg) = deframe_udp_datagram(&framed) {
+                        stats.dc_recv_bytes.fetch_add(dg.len() as u64, Ordering::Relaxed);
+                        match udp.send(dg).await {
+                            Ok(_) => { stats.tcp_write_bytes.fetch_add(dg.len() as u64, Ordering::Relaxed); }
+                            Err(e) => debug!(flow_id, %e, "udp pump: send to target failed"),
+                        }
+                    } else {
+                        warn!(flow_id, len = framed.len(), "udp pump: malformed carrier frame");
+                    }
+                }
+                None => return CloseReason::Eof,
+            },
+            // target → carrier
+            r = udp.recv(&mut buf) => match r {
+                Ok(n) => {
+                    stats.tcp_read_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                    if let Some(framed) = frame_udp_datagram(&buf[..n]) {
+                        if let Err(e) = dc.send(&Bytes::from(mux::encode(flow_id, &framed))).await {
+                            debug!(flow_id, %e, "udp pump: DC send failed");
+                            return CloseReason::IoError;
+                        }
+                        stats.dc_send_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                    }
+                }
+                Err(e) => {
+                    debug!(flow_id, %e, "udp pump: recv from target failed");
+                    return CloseReason::IoError;
+                }
+            },
+            _ = tokio::time::sleep(idle_timeout) => return CloseReason::IdleTimeout,
+        }
+    }
+}
+
+/// Agent-side UDP flow pump over a native QUIC bidirectional stream. The
+/// `udp` socket is `connect()`ed to the target; the stream carries
+/// `[u16 len | datagram]` frames (via [`quic_read_datagram`] /
+/// [`quic_write_datagram`]). Idle + close semantics match
+/// [`run_flow_udp_dc`]; a clean stream FIN from the client closes the
+/// flow.
+pub async fn run_flow_udp_quic(
+    udp: tokio::net::UdpSocket,
+    mut send: SendStream,
+    mut recv: RecvStream,
+    flow_id: u32,
+    idle_timeout: std::time::Duration,
+    stats: Arc<FlowStats>,
+) -> CloseReason {
+    let mut buf = vec![0u8; MAX_UDP_DATAGRAM];
+    loop {
+        tokio::select! {
+            r = quic_read_datagram(&mut recv) => match r {
+                Ok(Some(dg)) => {
+                    stats.dc_recv_bytes.fetch_add(dg.len() as u64, Ordering::Relaxed);
+                    match udp.send(&dg).await {
+                        Ok(_) => { stats.tcp_write_bytes.fetch_add(dg.len() as u64, Ordering::Relaxed); }
+                        Err(e) => debug!(flow_id, %e, "udp pump: send to target failed"),
+                    }
+                }
+                Ok(None) => return CloseReason::Eof,
+                Err(e) => {
+                    debug!(flow_id, %e, "udp pump: quic read failed");
+                    return CloseReason::IoError;
+                }
+            },
+            r = udp.recv(&mut buf) => match r {
+                Ok(n) => {
+                    stats.tcp_read_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                    if let Err(e) = quic_write_datagram(&mut send, &buf[..n]).await {
+                        debug!(flow_id, %e, "udp pump: quic write failed");
+                        return CloseReason::IoError;
+                    }
+                    stats.dc_send_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    debug!(flow_id, %e, "udp pump: recv from target failed");
+                    return CloseReason::IoError;
+                }
+            },
+            _ = tokio::time::sleep(idle_timeout) => return CloseReason::IdleTimeout,
+        }
+    }
+}
+
 async fn pump_tcp_to_dc(
     mut read_half: tokio::net::tcp::OwnedReadHalf,
     dc: Arc<RTCDataChannel>,
@@ -978,5 +1177,139 @@ mod tests {
         // flow ids, the test would fail by causing the runtime to
         // tear down. As-is this just exercises the trace! path.
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // ─── UDP ASSOCIATE datagram carriage ─────────────────────────────
+
+    #[test]
+    fn udp_datagram_framing_roundtrip() {
+        for dg in [&b""[..], b"x", b"hello world", &vec![0xABu8; 4096]] {
+            let framed = frame_udp_datagram(dg).unwrap();
+            assert_eq!(framed.len(), dg.len() + 2, "2-byte length prefix");
+            assert_eq!(deframe_udp_datagram(&framed), Some(dg));
+        }
+    }
+
+    #[test]
+    fn udp_framing_never_collides_with_half_close_magic() {
+        // A single-byte 0xFF datagram frames to [0x00,0x01,0xFF] — never
+        // equal to the 1-byte TCP HALF_CLOSE_MAGIC, so a UDP flow's DC
+        // payload can't trip the demux half-close path.
+        let framed = frame_udp_datagram(&[0xFF]).unwrap();
+        assert_ne!(framed.as_slice(), HALF_CLOSE_MAGIC);
+        assert!(framed.len() >= 2);
+    }
+
+    #[test]
+    fn deframe_rejects_short_and_truncated() {
+        assert_eq!(deframe_udp_datagram(&[]), None);
+        assert_eq!(deframe_udp_datagram(&[0x00]), None); // < 2 bytes
+        // Declares len=5 but only 2 payload bytes present → None.
+        assert_eq!(deframe_udp_datagram(&[0x00, 0x05, 1, 2]), None);
+        // Exact fit: len=2, 2 bytes.
+        assert_eq!(
+            deframe_udp_datagram(&[0x00, 0x02, 9, 9]),
+            Some(&[9u8, 9][..])
+        );
+    }
+
+    #[test]
+    fn oversized_datagram_is_dropped_by_framer() {
+        let too_big = vec![0u8; MAX_UDP_DATAGRAM + 1];
+        assert!(frame_udp_datagram(&too_big).is_none());
+    }
+
+    /// Agent-side UDP pump over a real DC pool: a datagram sent by the
+    /// "client" DC lands at the pump, is delivered to a loopback UDP
+    /// echo target, and the echo is framed back onto the DC. Exercises
+    /// [`run_flow_udp_dc`] end-to-end incl. the `mux` + framing layers.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_flow_udp_dc_echoes_through_pool() {
+        // Loopback UDP echo server.
+        let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut b = [0u8; 2048];
+            while let Ok((n, from)) = echo.recv_from(&mut b).await {
+                let _ = echo.send_to(&b[..n], from).await;
+            }
+        });
+
+        // WebRTC-DC peer pair with ICE wired.
+        let offerer = TunnelPeer::new(vec![]).await.unwrap();
+        let answerer = TunnelPeer::new(vec![]).await.unwrap();
+        let answerer_pc = answerer.peer_connection();
+        offerer.on_local_ice_candidate(move |c| {
+            let pc = Arc::clone(&answerer_pc);
+            Box::pin(async move {
+                if let Some(c) = c
+                    && let Ok(init) = c.to_json()
+                {
+                    let _ = pc.add_ice_candidate(init).await;
+                }
+            })
+        });
+        let offerer_pc = offerer.peer_connection();
+        answerer.on_local_ice_candidate(move |c| {
+            let pc = Arc::clone(&offerer_pc);
+            Box::pin(async move {
+                if let Some(c) = c
+                    && let Ok(init) = c.to_json()
+                {
+                    let _ = pc.add_ice_candidate(init).await;
+                }
+            })
+        });
+        let offer = offerer.create_offer().await.unwrap();
+        let answer = answerer.accept_offer(&offer.sdp).await.unwrap();
+        offerer.accept_answer(&answer.sdp).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), offerer.wait_pool_open())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), answerer.wait_pool_open())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let flow_id = 3;
+        // Client (offerer) receives the agent's echoes via a demux on
+        // its own DC; agent (answerer) receives client datagrams via a
+        // demux on its DC — the socket the pump owns.
+        let client_demux = FlowDemux::install(offerer.dc(0).unwrap()).await;
+        let (mut client_from_dc, _cs) = client_demux.register(flow_id).await;
+        let agent_demux = FlowDemux::install(answerer.dc(0).unwrap()).await;
+        let (agent_from_dc, _as) = agent_demux.register(flow_id).await;
+
+        // Agent pump: a UDP socket connected to the echo target.
+        let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        udp.connect(echo_addr).await.unwrap();
+        let agent_dc = answerer.dc(0).unwrap();
+        let pump = tokio::spawn(run_flow_udp_dc(
+            udp,
+            agent_dc,
+            flow_id,
+            agent_from_dc,
+            Duration::from_secs(3),
+            Arc::new(FlowStats::default()),
+        ));
+
+        // Client sends a datagram over its DC toward the agent.
+        let client_dc = offerer.dc(0).unwrap();
+        send_udp_datagram_dc(&client_dc, flow_id, b"ping-udp")
+            .await
+            .unwrap();
+
+        // The echo comes back framed onto the client's DC.
+        let echoed = tokio::time::timeout(Duration::from_secs(5), client_from_dc.recv())
+            .await
+            .expect("no echo within 5s")
+            .expect("client mailbox closed");
+        assert_eq!(
+            deframe_udp_datagram(&echoed),
+            Some(&b"ping-udp"[..]),
+            "echoed datagram must round-trip through the UDP pump"
+        );
+        pump.abort();
     }
 }

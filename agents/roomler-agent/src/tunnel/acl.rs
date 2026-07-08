@@ -15,7 +15,7 @@
 //! helper applies.
 
 use serde::{Deserialize, Serialize};
-use tunnel_core::policy::{DestinationRule, dst_matches};
+use tunnel_core::policy::{DestinationRule, ProtocolKind, dst_matches};
 
 /// Why the agent rejected a forward request. Maps to wire-level
 /// `RejectKind::AgentAclDenied` (the agent's local denial — distinct
@@ -71,8 +71,10 @@ impl Default for AgentForwardAcl {
 impl AgentForwardAcl {
     /// Belt-and-suspenders check. Called AFTER the server's gate has
     /// already approved the request (otherwise the agent would never
-    /// see a `ServerMsg::TcpForwardForward`).
-    pub fn check(&self, dst_host: &str, dst_port: u16) -> AclDecision {
+    /// see a `ServerMsg::TcpForwardForward` / `UdpForwardForward`).
+    /// `proto` is the request's L4 protocol so a narrowed local rule
+    /// (`proto = tcp`/`udp`) can reject a mismatched forward.
+    pub fn check(&self, dst_host: &str, dst_port: u16, proto: ProtocolKind) -> AclDecision {
         if !self.enabled {
             return AclDecision::Reject {
                 reason: "agent has tunnel forwards disabled".into(),
@@ -83,12 +85,12 @@ impl AgentForwardAcl {
             return AclDecision::Allow;
         }
         for rule in &self.allowlist {
-            if dst_matches(rule, dst_host, dst_port) {
+            if rule.proto.permits(proto) && dst_matches(rule, dst_host, dst_port) {
                 return AclDecision::Allow;
             }
         }
         AclDecision::Reject {
-            reason: format!("{dst_host}:{dst_port} not in agent allowlist"),
+            reason: format!("{dst_host}:{dst_port} ({proto:?}) not in agent allowlist"),
         }
     }
 }
@@ -102,6 +104,7 @@ mod tests {
         DestinationRule {
             host_pattern: p,
             port_range: PortRange { low, high },
+            proto: ProtocolKind::Any,
         }
     }
 
@@ -114,7 +117,7 @@ mod tests {
         let acl = AgentForwardAcl::default();
         assert!(acl.enabled);
         assert!(acl.allowlist.is_empty());
-        assert!(acl.check("db.intranet", 5432).is_allow());
+        assert!(acl.check("db.intranet", 5432, ProtocolKind::Tcp).is_allow());
     }
 
     #[test]
@@ -123,7 +126,10 @@ mod tests {
             enabled: false,
             allowlist: vec![rule(HostPattern::Exact("db".into()), 5432, 5432)],
         };
-        assert!(matches!(acl.check("db", 5432), AclDecision::Reject { .. }));
+        assert!(matches!(
+            acl.check("db", 5432, ProtocolKind::Tcp),
+            AclDecision::Reject { .. }
+        ));
     }
 
     #[test]
@@ -134,8 +140,11 @@ mod tests {
         };
         // Server has already gated this request, so the agent accepts
         // any (dst_host, dst_port) the server sent down.
-        assert!(acl.check("anywhere", 1).is_allow());
-        assert!(acl.check("evil.example", 65535).is_allow());
+        assert!(acl.check("anywhere", 1, ProtocolKind::Tcp).is_allow());
+        assert!(
+            acl.check("evil.example", 65535, ProtocolKind::Tcp)
+                .is_allow()
+        );
     }
 
     #[test]
@@ -144,12 +153,12 @@ mod tests {
             enabled: true,
             allowlist: vec![rule(HostPattern::Exact("db.intranet".into()), 5432, 5432)],
         };
-        assert!(acl.check("db.intranet", 5432).is_allow());
+        assert!(acl.check("db.intranet", 5432, ProtocolKind::Tcp).is_allow());
         // Same host, wrong port — rejected even though the server
         // approved it (server's policy may allow a broader port
         // range; agent operator chose to narrow further).
         assert!(matches!(
-            acl.check("db.intranet", 22),
+            acl.check("db.intranet", 22, ProtocolKind::Tcp),
             AclDecision::Reject { .. }
         ));
     }
@@ -160,10 +169,10 @@ mod tests {
             enabled: true,
             allowlist: vec![rule(HostPattern::Wildcard("*.intranet".into()), 1, 65535)],
         };
-        assert!(acl.check("db.intranet", 5432).is_allow());
-        assert!(acl.check("ssh.intranet", 22).is_allow());
+        assert!(acl.check("db.intranet", 5432, ProtocolKind::Tcp).is_allow());
+        assert!(acl.check("ssh.intranet", 22, ProtocolKind::Tcp).is_allow());
         assert!(matches!(
-            acl.check("evilintranet", 80),
+            acl.check("evilintranet", 80, ProtocolKind::Tcp),
             AclDecision::Reject { .. }
         ));
     }
@@ -174,9 +183,9 @@ mod tests {
             enabled: true,
             allowlist: vec![rule(HostPattern::Cidr("10.0.0.0/24".into()), 5432, 5432)],
         };
-        assert!(acl.check("10.0.0.5", 5432).is_allow());
+        assert!(acl.check("10.0.0.5", 5432, ProtocolKind::Tcp).is_allow());
         assert!(matches!(
-            acl.check("10.0.1.5", 5432),
+            acl.check("10.0.1.5", 5432, ProtocolKind::Tcp),
             AclDecision::Reject { .. }
         ));
     }
