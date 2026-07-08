@@ -5,8 +5,13 @@ import { api } from '@/api/client'
 export type AgentOs = 'linux' | 'macos' | 'windows'
 export type AgentStatusValue = 'online' | 'offline' | 'unenrolled' | 'quarantined'
 
+/** How consent is obtained before a controller may drive a device. Mirrors the
+ *  Rust `ConsentMode` (snake_case). `null` = inherit the system default
+ *  (`prompt` — attended). Replaces the legacy `require_consent` bool. */
+export type ConsentMode = 'auto' | 'prompt' | 'email' | 'push' | 'prompt_then_email'
+
 export interface AccessPolicy {
-  require_consent: boolean
+  consent_mode: ConsentMode | null
   allowed_role_ids: string[]
   allowed_user_ids: string[]
   auto_terminate_idle_minutes: number | null

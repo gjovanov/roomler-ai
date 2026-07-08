@@ -2,6 +2,7 @@ pub mod agent;
 pub mod agent_crash;
 pub mod agent_log;
 pub mod base;
+pub mod consent_request;
 pub mod file;
 pub mod invite;
 pub mod message;

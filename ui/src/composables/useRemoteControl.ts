@@ -2321,6 +2321,12 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     videoInfo.value = null
   }
 
+  // Phase 5 — admin break-glass reason for the NEXT `connect()`. The UI sets it
+  // (via a confirm dialog) before a forced session; `connect` reads it into the
+  // `rc:session.request` and clears it. The server ignores it unless the caller
+  // is a validated `ADMINISTRATOR`.
+  const overrideReason = ref('')
+
   async function connect(
     agentId: string,
     permissions = 'VIEW | INPUT | CLIPBOARD',
@@ -3022,7 +3028,15 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         requestPayload.chroma_pref = vp9Chroma.value
       }
     }
+    // Phase 5 — admin break-glass. A non-empty reason asks the server to skip
+    // consent; it's honoured ONLY if the server validates the caller as an
+    // ADMINISTRATOR who isn't the owner (a non-admin's value is ignored). One-
+    // shot: cleared after send so a later normal Connect isn't a silent force.
+    if (overrideReason.value.trim()) {
+      requestPayload.override_reason = overrideReason.value.trim()
+    }
     ws.sendRaw(requestPayload)
+    overrideReason.value = ''
   }
 
   function disconnect() {
@@ -4606,6 +4620,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     phase,
     error,
     sessionId,
+    overrideReason,
     remoteStream,
     hasMedia,
     inputChannelOpen,

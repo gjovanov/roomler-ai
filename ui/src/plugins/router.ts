@@ -48,6 +48,14 @@ const routes: RouteRecordRaw[] = [
     component: () => import('@/views/invite/InviteLandingView.vue'),
   },
   {
+    // Public owner-consent landing (Phase 4). No `meta.auth` — the token in the
+    // path is the capability, so a logged-out owner can approve from the email
+    // link / push tap.
+    path: '/consent/:token',
+    name: 'consent',
+    component: () => import('@/views/remote/ConsentView.vue'),
+  },
+  {
     path: '/',
     component: () => import('@/components/layout/AppLayout.vue'),
     meta: { auth: true },
