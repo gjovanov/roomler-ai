@@ -497,6 +497,62 @@ async fn relay_tunnel_msg_from_agent(state: &AppState, parsed: ClientMsg) -> Opt
             .await;
             None
         }
+        // UDP ASSOCIATE relays — mirror the Tcp* variants above. The
+        // agent bound a UDP socket (Accept) / rejected / closed a UDP
+        // flow; relay each to the tunnel-client by session_id.
+        ClientMsg::UdpForwardAccept {
+            session_id,
+            flow_id,
+            dc_index,
+        } => {
+            relay_to_client(
+                state,
+                session_id,
+                ServerMsg::UdpForwardAccept {
+                    session_id,
+                    flow_id,
+                    dc_index,
+                },
+            )
+            .await;
+            None
+        }
+        ClientMsg::UdpForwardReject {
+            session_id,
+            flow_id,
+            kind,
+            reason,
+        } => {
+            relay_to_client(
+                state,
+                session_id,
+                ServerMsg::UdpForwardReject {
+                    session_id,
+                    flow_id,
+                    kind,
+                    reason,
+                },
+            )
+            .await;
+            None
+        }
+        ClientMsg::UdpClosed {
+            session_id,
+            flow_id,
+            reason,
+        } => {
+            relay_to_client(
+                state,
+                session_id,
+                ServerMsg::UdpClosed {
+                    session_id,
+                    flow_id,
+                    reason,
+                },
+            )
+            .await;
+            None
+        }
         ClientMsg::TunnelTerminate { session_id, reason } => {
             relay_to_client(
                 state,
