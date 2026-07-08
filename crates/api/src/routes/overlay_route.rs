@@ -187,15 +187,14 @@ pub async fn set_magic_dns(
         .magic_dns_domain
         .map(|d| d.trim().trim_matches('.').to_ascii_lowercase())
         .filter(|d| !d.is_empty());
-    if let Some(d) = &domain {
-        if !d
+    if let Some(d) = &domain
+        && !d
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
-        {
-            return Err(ApiError::BadRequest(
-                "magic_dns_domain has invalid characters".to_string(),
-            ));
-        }
+    {
+        return Err(ApiError::BadRequest(
+            "magic_dns_domain has invalid characters".to_string(),
+        ));
     }
     let nameservers: Vec<String> = body
         .magic_dns_nameservers
