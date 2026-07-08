@@ -332,11 +332,14 @@ impl OverlayRuntime {
             first_peers.iter().map(|p| (p.node_id, p.clone())).collect();
 
         // Phase 2 MagicDNS — if the tenant set a domain, run a local split-DNS
-        // resolver bound to our overlay IP:53 and keep its name→IP map synced
-        // with the netmap. `None` when MagicDNS is off (no domain). The OS-DNS
-        // config (agent side) points the roomler interface at this address.
+        // resolver bound to our overlay IP:53, point the OS at it for that
+        // domain, and keep the resolver's name→IP map synced with the netmap.
+        // `None` when MagicDNS is off. `_dns_os_guard` reverts the OS DNS config
+        // on runtime exit (WS disconnect / shutdown).
+        let mut _dns_os_guard: Option<dns::DnsOsGuard> = None;
         let dns_names: Option<dns::NameMap> = match &network.magic_domain {
             Some(domain) if !domain.is_empty() => {
+                let magic_domain = domain.trim_end_matches('.').to_ascii_lowercase();
                 let names: dns::NameMap = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
                 sync_name_map(&names, &current_peers).await;
                 let upstream = network
@@ -346,10 +349,12 @@ impl OverlayRuntime {
                     .unwrap_or_else(|| SocketAddr::from(([1, 1, 1, 1], 53)));
                 tokio::spawn(dns::run(dns::DnsConfig {
                     bind: SocketAddr::new(self_v4.into(), 53),
-                    magic_domain: domain.trim_end_matches('.').to_ascii_lowercase(),
+                    magic_domain: magic_domain.clone(),
                     upstream,
                     names: names.clone(),
                 }));
+                // Point the OS resolver at us for `<magic_domain>` (reverted on Drop).
+                _dns_os_guard = Some(dns::configure_os(self_v4, &magic_domain).await);
                 Some(names)
             }
             _ => None,
