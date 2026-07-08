@@ -83,6 +83,7 @@
             <td>
               <div v-for="(r, i) in p.allowlist" :key="i" class="text-caption">
                 <code>{{ hostLabel(r.host_pattern) }}:{{ portRangeLabel(r.port_range) }}</code>
+                <span class="text-medium-emphasis">/{{ (r.proto ?? 'any') }}</span>
               </div>
             </td>
             <td class="text-caption">
@@ -304,6 +305,15 @@
               hide-details
               style="max-width: 120px"
             />
+            <v-select
+              v-model="r.proto"
+              :items="protoKinds"
+              label="Proto"
+              variant="outlined"
+              density="compact"
+              hide-details
+              style="max-width: 120px"
+            />
             <v-btn
               icon="mdi-close"
               size="x-small"
@@ -386,6 +396,7 @@ import {
   type HostPattern,
   type PolicySubject,
   type PolicyTarget,
+  type ProtocolKind,
   type TunnelPolicy,
   type TunnelPolicyCreate,
   useTunnelPolicyStore,
@@ -409,6 +420,11 @@ const hostKinds = [
   { title: 'Wildcard', value: 'wildcard' },
   { title: 'CIDR', value: 'cidr' },
 ]
+const protoKinds = [
+  { title: 'Any', value: 'any' },
+  { title: 'TCP', value: 'tcp' },
+  { title: 'UDP', value: 'udp' },
+]
 
 const editDialog = ref(false)
 const editingId = ref<string | null>(null)
@@ -426,6 +442,7 @@ interface FormTarget {
 interface FormRule {
   host_pattern: { kind: 'exact' | 'wildcard' | 'cidr'; value: string }
   port_range: { low: number; high: number }
+  proto: ProtocolKind
 }
 
 const form = reactive<{
@@ -446,6 +463,7 @@ function emptyForm() {
       {
         host_pattern: { kind: 'exact' as const, value: '' },
         port_range: { low: 1, high: 65535 },
+        proto: 'any' as ProtocolKind,
       },
     ],
     max_concurrent_flows: null as number | null,
@@ -478,6 +496,7 @@ function openEditDialog(p: TunnelPolicy) {
   form.allowlist = p.allowlist.map((r) => ({
     host_pattern: { kind: r.host_pattern.kind, value: r.host_pattern.value },
     port_range: { low: r.port_range.low, high: r.port_range.high },
+    proto: r.proto ?? 'any',
   }))
   form.max_concurrent_flows = p.max_concurrent_flows
   form.max_bytes_per_session = p.max_bytes_per_session
@@ -516,6 +535,7 @@ function addAllowRule() {
   form.allowlist.push({
     host_pattern: { kind: 'exact', value: '' },
     port_range: { low: 1, high: 65535 },
+    proto: 'any',
   })
 }
 function removeAllowRule(i: number) {
@@ -545,6 +565,7 @@ function buildPayload(): TunnelPolicyCreate {
     allowlist: form.allowlist.map((r) => ({
       host_pattern: { kind: r.host_pattern.kind, value: r.host_pattern.value.trim() } as HostPattern,
       port_range: { low: Number(r.port_range.low), high: Number(r.port_range.high) },
+      proto: r.proto,
     })) as DestinationRule[],
     max_concurrent_flows: form.max_concurrent_flows ?? null,
     max_bytes_per_session: form.max_bytes_per_session ?? null,
