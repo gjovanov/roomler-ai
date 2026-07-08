@@ -130,3 +130,85 @@ pub async fn set_approved_routes(
     crate::ws::overlay::refan_node(&state, &updated).await;
     Ok(Json(updated.into()))
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Phase 2 MagicDNS — tenant DNS settings
+// ────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct MagicDnsResponse {
+    /// Overlay DNS suffix (`None` = MagicDNS off).
+    pub magic_dns_domain: Option<String>,
+    /// Upstream nameservers for non-overlay queries.
+    pub magic_dns_nameservers: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetMagicDnsRequest {
+    #[serde(default)]
+    pub magic_dns_domain: Option<String>,
+    #[serde(default)]
+    pub magic_dns_nameservers: Vec<String>,
+}
+
+/// GET /api/tenant/{tenant_id}/magic-dns — the tenant's current MagicDNS config.
+pub async fn get_magic_dns(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(tenant_id): Path<String>,
+) -> Result<Json<MagicDnsResponse>, ApiError> {
+    let tid = ObjectId::parse_str(&tenant_id)
+        .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
+    if !state.tenants.is_member(tid, auth.user_id).await? {
+        return Err(ApiError::Forbidden("Not a member".to_string()));
+    }
+    let tenant = state.tenants.base.find_by_id(tid).await?;
+    Ok(Json(MagicDnsResponse {
+        magic_dns_domain: tenant.settings.magic_dns_domain,
+        magic_dns_nameservers: tenant.settings.magic_dns_nameservers,
+    }))
+}
+
+/// PUT /api/tenant/{tenant_id}/magic-dns — set the MagicDNS domain + upstreams.
+/// An empty domain disables MagicDNS.
+pub async fn set_magic_dns(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(tenant_id): Path<String>,
+    Json(body): Json<SetMagicDnsRequest>,
+) -> Result<Json<MagicDnsResponse>, ApiError> {
+    let tid = ObjectId::parse_str(&tenant_id)
+        .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
+    if !state.tenants.is_member(tid, auth.user_id).await? {
+        return Err(ApiError::Forbidden("Not a member".to_string()));
+    }
+    // Normalize: blank domain → None (off); lowercase, strip surrounding dots.
+    let domain = body
+        .magic_dns_domain
+        .map(|d| d.trim().trim_matches('.').to_ascii_lowercase())
+        .filter(|d| !d.is_empty());
+    if let Some(d) = &domain {
+        if !d
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        {
+            return Err(ApiError::BadRequest(
+                "magic_dns_domain has invalid characters".to_string(),
+            ));
+        }
+    }
+    let nameservers: Vec<String> = body
+        .magic_dns_nameservers
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let tenant = state
+        .tenants
+        .set_magic_dns(tid, domain, nameservers)
+        .await?;
+    Ok(Json(MagicDnsResponse {
+        magic_dns_domain: tenant.settings.magic_dns_domain,
+        magic_dns_nameservers: tenant.settings.magic_dns_nameservers,
+    }))
+}
