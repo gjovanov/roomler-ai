@@ -3,19 +3,20 @@ use dashmap::DashMap;
 use mongodb::Database;
 use roomler_ai_config::Settings;
 use roomler_ai_remote_control::{
-    Hub, audit::AuditSink, signaling::ServerMsg, turn_creds::TurnConfig,
+    Hub, audit::AuditSink, hub::ConsentEvent, models::ConsentMode, signaling::ServerMsg,
+    turn_creds::TurnConfig,
 };
 use roomler_ai_services::{
     AuthService, EmailService, GiphyService, OAuthService, PushService, RecognitionService,
     TaskService,
     dao::{
-        activation_code::ActivationCodeDao, agent::AgentDao, file::FileDao, invite::InviteDao,
-        message::MessageDao, notification::NotificationDao, overlay_network::OverlayNetworkDao,
-        overlay_node::OverlayNodeDao, push_subscription::PushSubscriptionDao,
-        reaction::ReactionDao, recording::RecordingDao, remote_audit::RemoteAuditDao,
-        remote_session::RemoteSessionDao, role::RoleDao, room::RoomDao, tenant::TenantDao,
-        tunnel_audit::TunnelAuditDao, tunnel_client::TunnelClientDao,
-        tunnel_policy::TunnelPolicyDao, user::UserDao,
+        activation_code::ActivationCodeDao, agent::AgentDao, consent_request::ConsentRequestDao,
+        file::FileDao, invite::InviteDao, message::MessageDao, notification::NotificationDao,
+        overlay_network::OverlayNetworkDao, overlay_node::OverlayNodeDao,
+        push_subscription::PushSubscriptionDao, reaction::ReactionDao, recording::RecordingDao,
+        remote_audit::RemoteAuditDao, remote_session::RemoteSessionDao, role::RoleDao,
+        room::RoomDao, tenant::TenantDao, tunnel_audit::TunnelAuditDao,
+        tunnel_client::TunnelClientDao, tunnel_policy::TunnelPolicyDao, user::UserDao,
     },
     media::{room_manager::RoomManager, worker_pool::WorkerPool},
 };
@@ -74,6 +75,8 @@ pub struct AppState {
     pub remote_audit: Arc<RemoteAuditDao>,
     pub agent_crashes: Arc<roomler_ai_services::dao::agent_crash::AgentCrashDao>,
     pub agent_logs: Arc<roomler_ai_services::dao::agent_log::AgentLogDao>,
+    /// Phase 4 — owner-side consent requests (email/push approve-link tokens).
+    pub consent_requests: Arc<ConsentRequestDao>,
     pub rc_hub: Arc<Hub>,
 
     // roomler-tunnel subsystem
@@ -195,9 +198,32 @@ impl AppState {
         ));
         let agent_logs = Arc::new(roomler_ai_services::dao::agent_log::AgentLogDao::new(&db));
 
+        let consent_requests = Arc::new(ConsentRequestDao::new(&db));
+
         let turn_cfg = build_turn_config(&settings.turn);
         let (audit_sink, _audit_handle) = AuditSink::spawn(db.clone());
-        let rc_hub = Arc::new(Hub::new(audit_sink, turn_cfg));
+        // Phase 4 — owner-side consent: the Hub emits a `ConsentEvent` for each
+        // Email/Push session; this consumer resolves the owner + persists a
+        // `ConsentRequest` + sends the email / web-push. Wiring `Some(consent_tx)`
+        // is what turns those modes on; with `None` (tests) they'd just time out.
+        let (consent_tx, consent_rx) = mpsc::channel::<ConsentEvent>(64);
+        let rc_hub = Arc::new(Hub::new_with_consent(
+            audit_sink,
+            turn_cfg,
+            Some(consent_tx),
+        ));
+        spawn_consent_consumer(
+            consent_rx,
+            ConsentConsumerDeps {
+                agents: agents.clone(),
+                users: users.clone(),
+                consent_requests: consent_requests.clone(),
+                push_subscriptions: push_subscriptions.clone(),
+                email: email.clone(),
+                push: push.clone(),
+                base_url: settings.oauth.base_url.clone(),
+            },
+        );
 
         // roomler-tunnel subsystem
         let tunnel_clients = Arc::new(TunnelClientDao::new(&db));
@@ -239,6 +265,7 @@ impl AppState {
             remote_audit,
             agent_crashes,
             agent_logs,
+            consent_requests,
             rc_hub,
             tunnel_clients,
             tunnel_policies,
@@ -294,4 +321,116 @@ pub(crate) fn build_turn_config(turn: &roomler_ai_config::TurnSettings) -> Optio
         shared_secret: secret,
         ttl_secs: 600, // 10 minutes
     })
+}
+
+/// Dependencies the Phase-4 owner-consent consumer needs — cheap `Arc` clones of
+/// the relevant DAOs / services, captured when [`AppState`] is built.
+struct ConsentConsumerDeps {
+    agents: Arc<AgentDao>,
+    users: Arc<UserDao>,
+    consent_requests: Arc<ConsentRequestDao>,
+    push_subscriptions: Arc<PushSubscriptionDao>,
+    email: Option<Arc<EmailService>>,
+    push: Option<Arc<PushService>>,
+    base_url: String,
+}
+
+/// Spawn the background task that turns Hub [`ConsentEvent`]s (Email/Push sessions
+/// awaiting the device owner) into a `ConsentRequest` row + an email / web-push
+/// carrying the approve-link. One task for the process lifetime; a per-event
+/// failure is logged, never fatal.
+fn spawn_consent_consumer(mut rx: mpsc::Receiver<ConsentEvent>, deps: ConsentConsumerDeps) {
+    tokio::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            if let Err(e) = handle_consent_event(&deps, &ev).await {
+                tracing::warn!(session = %ev.session_id, %e, "owner-consent notification failed");
+            }
+        }
+    });
+}
+
+async fn handle_consent_event(deps: &ConsentConsumerDeps, ev: &ConsentEvent) -> anyhow::Result<()> {
+    // Resolve the device owner + display name (the Hub is DB-agnostic, so it
+    // only knows the agent_id).
+    let agent = deps.agents.base.find_by_id(ev.agent_id).await?;
+    let owner_id = agent.owner_user_id;
+    let device_name = agent.name.clone();
+
+    // Persist the request with a fresh capability token + a TTL that matches the
+    // session's consent window (a stale link can't resolve a long-gone session).
+    let req = deps
+        .consent_requests
+        .create(
+            ev.tenant_id,
+            ev.session_id,
+            ev.agent_id,
+            ev.controller_user_id,
+            ev.controller_name.clone(),
+            owner_id,
+            ev.timeout_secs as i64,
+        )
+        .await?;
+
+    let consent_url = format!(
+        "{}/consent/{}",
+        deps.base_url.trim_end_matches('/'),
+        req.token
+    );
+
+    match ev.mode {
+        ConsentMode::Email => {
+            let owner = deps.users.base.find_by_id(owner_id).await?;
+            match &deps.email {
+                Some(email) => {
+                    email
+                        .send_consent_request(
+                            &owner.email,
+                            &ev.controller_name,
+                            &device_name,
+                            &consent_url,
+                        )
+                        .await?;
+                }
+                None => tracing::warn!(
+                    session = %ev.session_id,
+                    "Email consent mode but no email service is configured — owner cannot approve"
+                ),
+            }
+        }
+        ConsentMode::Push => match &deps.push {
+            Some(push) => {
+                let subs = deps.push_subscriptions.find_by_user(owner_id).await?;
+                if subs.is_empty() {
+                    tracing::warn!(
+                        session = %ev.session_id,
+                        "Push consent mode but the owner has no push subscriptions"
+                    );
+                }
+                let title = "Remote control request";
+                let body = format!("{} wants to control {}", ev.controller_name, device_name);
+                for sub in subs {
+                    // Best-effort per subscription (a stale endpoint shouldn't
+                    // block the others).
+                    let _ = push
+                        .send(
+                            &sub.endpoint,
+                            &sub.keys.auth,
+                            &sub.keys.p256dh,
+                            title,
+                            &body,
+                            Some(&consent_url),
+                        )
+                        .await;
+                }
+            }
+            None => tracing::warn!(
+                session = %ev.session_id,
+                "Push consent mode but no push service is configured — owner cannot approve"
+            ),
+        },
+        // The Hub only emits events for Email/Push; other modes never reach here.
+        _ => {}
+    }
+
+    Ok(())
 }
