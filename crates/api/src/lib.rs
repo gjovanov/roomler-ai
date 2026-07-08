@@ -329,6 +329,12 @@ pub fn build_router(state: AppState) -> Router {
             put(routes::overlay_route::set_approved_routes),
         );
 
+    // Phase 2 MagicDNS — the tenant's overlay DNS domain + upstreams.
+    let magic_dns_routes = Router::new().route(
+        "/",
+        get(routes::overlay_route::get_magic_dns).put(routes::overlay_route::set_magic_dns),
+    );
+
     let public_tunnel_routes = Router::new()
         .route("/enroll", post(routes::tunnel::enroll_tunnel_client))
         // Auth is in-handler (TunnelClient bearer token), so it rides the
@@ -414,6 +420,7 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/tenant/{tenant_id}/tunnel-client", tunnel_client_routes)
         .nest("/tenant/{tenant_id}/tunnel-policy", tunnel_policy_routes)
         .nest("/tenant/{tenant_id}/overlay-node", overlay_node_routes)
+        .nest("/tenant/{tenant_id}/magic-dns", magic_dns_routes)
         .nest("/tenant/{tenant_id}/session", remote_session_routes);
 
     // Health check
