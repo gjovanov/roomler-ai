@@ -311,9 +311,12 @@ mod tests {
             .await
             .expect("accept_answer");
 
-        // Both sides should see all 8 DCs open.
-        let off_wait = tokio::time::timeout(Duration::from_secs(10), offerer.wait_pool_open());
-        let ans_wait = tokio::time::timeout(Duration::from_secs(10), answerer.wait_pool_open());
+        // Both sides should see all 8 DCs open. 30s (not 10s) so a loaded CI
+        // runner — many loopback WebRTC/QUIC peer tests run concurrently, incl.
+        // the rc.152 UDP echo tests — has headroom for ICE to complete; the
+        // handshake takes <1s locally, so a real hang still fails fast enough.
+        let off_wait = tokio::time::timeout(Duration::from_secs(30), offerer.wait_pool_open());
+        let ans_wait = tokio::time::timeout(Duration::from_secs(30), answerer.wait_pool_open());
         let (a, b) = tokio::join!(off_wait, ans_wait);
         a.expect("offerer pool timeout")
             .expect("offerer pool error");
@@ -369,10 +372,10 @@ mod tests {
         offerer.accept_answer(&answer.sdp).await.unwrap();
 
         // Wait for pool open on both sides, then send.
-        let _ = tokio::time::timeout(Duration::from_secs(10), offerer.wait_pool_open())
+        let _ = tokio::time::timeout(Duration::from_secs(30), offerer.wait_pool_open())
             .await
             .expect("offerer timeout");
-        let _ = tokio::time::timeout(Duration::from_secs(10), answerer.wait_pool_open())
+        let _ = tokio::time::timeout(Duration::from_secs(30), answerer.wait_pool_open())
             .await
             .expect("answerer timeout");
 
