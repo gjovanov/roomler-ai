@@ -361,10 +361,14 @@ impl Hub {
             agent_id,
         });
 
-        // Per-mode consent window: owner-side channels (Email/Push) get a much
-        // longer window than the on-host prompt.
+        // Per-mode consent window: modes with an owner-side (email/push) leg get
+        // a much longer window than the pure on-host prompt — `PromptThenEmail`
+        // included, since its host prompt runs alongside the emailed link and the
+        // owner needs time to act.
         let timeout = match consent_mode {
-            ConsentMode::Email | ConsentMode::Push => ASYNC_CONSENT_TIMEOUT,
+            ConsentMode::Email | ConsentMode::Push | ConsentMode::PromptThenEmail => {
+                ASYNC_CONSENT_TIMEOUT
+            }
             _ => DEFAULT_CONSENT_TIMEOUT,
         };
 
@@ -409,8 +413,10 @@ impl Hub {
         // (when a break-glass just happened) an informational "your device was
         // accessed" NOTICE. Best-effort; the API consumer resolves the owner from
         // `agent_id`. With no consumer wired the session relies on the waiter.
-        if (matches!(consent_mode, ConsentMode::Email | ConsentMode::Push)
-            || override_for_notify.is_some())
+        if (matches!(
+            consent_mode,
+            ConsentMode::Email | ConsentMode::Push | ConsentMode::PromptThenEmail
+        ) || override_for_notify.is_some())
             && let Some(tx) = &self.inner.consent_tx
         {
             let _ = tx.try_send(ConsentEvent {
