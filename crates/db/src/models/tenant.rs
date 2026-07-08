@@ -46,6 +46,17 @@ pub struct TenantSettings {
     pub max_members: u32,
     #[serde(default = "default_file_upload_limit")]
     pub file_upload_limit: u64,
+    /// Phase 2 MagicDNS — the tenant's overlay DNS suffix (e.g.
+    /// `"myorg.roomler.net"`). When set, overlay nodes run a local split-DNS
+    /// resolver that answers `<node-name>.<domain>` with the peer's overlay IP.
+    /// `None` = MagicDNS off for the tenant.
+    #[serde(default)]
+    pub magic_dns_domain: Option<String>,
+    /// Phase 2 MagicDNS — upstream nameservers the resolver forwards
+    /// non-overlay queries to (e.g. `["1.1.1.1"]`). Empty = use the node's
+    /// existing system resolvers as the fallback.
+    #[serde(default)]
+    pub magic_dns_nameservers: Vec<String>,
 }
 
 impl Default for TenantSettings {
@@ -57,6 +68,8 @@ impl Default for TenantSettings {
             allow_guest_access: false,
             max_members: default_max_members(),
             file_upload_limit: default_file_upload_limit(),
+            magic_dns_domain: None,
+            magic_dns_nameservers: Vec::new(),
         }
     }
 }
