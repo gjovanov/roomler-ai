@@ -1012,6 +1012,64 @@ async fn handle_server_msg(
             });
         }
 
+        // rc:tunnel.udp.forward — UDP ASSOCIATE analogue of
+        // TcpForwardForward. Same dispatch: a QUIC session dials over
+        // its quinn peer, a WebRTC-DC session over its DC pool. The
+        // acceptor binds a target UDP socket, replies Accept/Reject,
+        // and pumps datagrams.
+        ServerMsg::UdpForwardForward {
+            session_id,
+            flow_id,
+            dst_host,
+            dst_port,
+            owner_user_id: _,
+        } => {
+            if let Some(quic_peer) = tunnel_quic_peers.get(&session_id).cloned() {
+                let outbound = outbound_tx.clone();
+                let acl = forward_acl.clone();
+                tokio::spawn(async move {
+                    crate::tunnel::acceptor::handle_udp_forward_request_quic(
+                        session_id,
+                        flow_id,
+                        &dst_host,
+                        dst_port,
+                        &acl,
+                        TUNNEL_DIAL_TIMEOUT,
+                        &quic_peer,
+                        outbound,
+                    )
+                    .await;
+                });
+                return Ok(());
+            }
+            let Some(tunnel_peer) = tunnel_peers.get(&session_id).cloned() else {
+                warn!(%session_id, %flow_id, "UdpForwardForward for unknown tunnel session — rejecting");
+                let reply = ClientMsg::UdpForwardReject {
+                    session_id,
+                    flow_id,
+                    kind: roomler_ai_remote_control::signaling::RejectKind::AgentError,
+                    reason: "tunnel session not open on agent".into(),
+                };
+                let _ = outbound_tx.send(reply).await;
+                return Ok(());
+            };
+            let outbound = outbound_tx.clone();
+            let acl = forward_acl.clone();
+            tokio::spawn(async move {
+                crate::tunnel::acceptor::handle_udp_forward_request(
+                    session_id,
+                    flow_id,
+                    &dst_host,
+                    dst_port,
+                    &acl,
+                    TUNNEL_DIAL_TIMEOUT,
+                    &tunnel_peer,
+                    outbound,
+                )
+                .await;
+            });
+        }
+
         // rc:tunnel.sdp.offer — controller's offer for the WebRTC
         // peer. Build an AgentTunnelPeer, accept the offer, ship the
         // answer back as `rc:tunnel.sdp.answer`. The peer takes care

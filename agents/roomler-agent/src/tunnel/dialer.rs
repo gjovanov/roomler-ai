@@ -49,6 +49,42 @@ pub async fn dial_dst(host: &str, port: u16, timeout: Duration) -> Result<TcpStr
     Ok(stream)
 }
 
+/// Bind a local UDP socket and `connect()` it to `host:port` for a UDP
+/// ASSOCIATE flow. UDP `connect` sends nothing — it fixes the default
+/// peer (so `send`/`recv` need no address and ICMP errors surface) and
+/// lets the pump treat the socket like a point-to-point pipe to the
+/// target. Resolution is bounded by `timeout`; the socket family
+/// (v4/v6) follows the resolved target. Returns the connected socket.
+pub async fn dial_udp(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+) -> Result<tokio::net::UdpSocket, DialError> {
+    let addr = format!("{host}:{port}");
+    // Resolve first so we can pick the bind family + fail fast on a bad
+    // host (mirrors `dial_dst`'s tight budget for interactive UX).
+    let target = match tokio::time::timeout(timeout, tokio::net::lookup_host(&addr)).await {
+        Ok(Ok(mut it)) => it.next().ok_or_else(|| {
+            DialError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "resolved to no addresses",
+            ))
+        })?,
+        Ok(Err(e)) => return Err(DialError::Io(e)),
+        Err(_) => return Err(DialError::Timeout(timeout)),
+    };
+    let bind: std::net::SocketAddr = if target.is_ipv6() {
+        (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
+    } else {
+        (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
+    };
+    let sock = tokio::net::UdpSocket::bind(bind)
+        .await
+        .map_err(DialError::Io)?;
+    sock.connect(target).await.map_err(DialError::Io)?;
+    Ok(sock)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

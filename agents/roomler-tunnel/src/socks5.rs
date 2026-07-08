@@ -29,13 +29,25 @@ pub const REP_GENERAL_FAILURE: u8 = 0x01;
 const REP_CMD_NOT_SUPPORTED: u8 = 0x07;
 const REP_ATYP_NOT_SUPPORTED: u8 = 0x08;
 
-/// Run the SOCKS5 method negotiation (offering only no-auth) and read the
-/// CONNECT request, returning the client-specified `(host, port)`. On return the
-/// stream is positioned at the first byte of application payload. Writes the
-/// appropriate SOCKS failure reply itself for protocol-level rejections
-/// (unsupported command / address type) before erroring; the caller sends the
-/// success reply via [`reply`] once the agent has accepted the forward.
-pub async fn accept_connect(tcp: &mut TcpStream) -> Result<(String, u16)> {
+/// A parsed SOCKS5 request after method negotiation. `Connect` carries
+/// the CONNECT target; `UdpAssociate` signals the client wants a UDP
+/// relay (the request's DST is the address the app *will* send from —
+/// per RFC 1928 it's advisory and we ignore it, binding a fresh relay
+/// socket instead).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Socks5Request {
+    Connect { host: String, port: u16 },
+    UdpAssociate,
+}
+
+/// Run the SOCKS5 method negotiation (offering only no-auth) and read
+/// one request, returning either a CONNECT target or a UDP ASSOCIATE.
+/// On a `Connect` return the stream is positioned at the first byte of
+/// application payload. Writes the appropriate SOCKS failure reply
+/// itself for protocol-level rejections (unsupported command / address
+/// type) before erroring; the caller sends the success reply once the
+/// agent has accepted the forward.
+pub async fn accept_request(tcp: &mut TcpStream) -> Result<Socks5Request> {
     // ── method negotiation: VER, NMETHODS, METHODS ──
     let ver = tcp.read_u8().await.context("read socks version")?;
     if ver != VER {
@@ -85,11 +97,28 @@ pub async fn accept_connect(tcp: &mut TcpStream) -> Result<(String, u16)> {
         }
     };
     let port = tcp.read_u16().await.context("read dst port")?; // big-endian
-    if cmd != CMD_CONNECT {
-        reply(tcp, REP_CMD_NOT_SUPPORTED).await;
-        bail!("unsupported SOCKS command {cmd:#x} (only CONNECT)");
+    match cmd {
+        CMD_CONNECT => Ok(Socks5Request::Connect { host, port }),
+        CMD_UDP_ASSOCIATE => Ok(Socks5Request::UdpAssociate),
+        other => {
+            reply(tcp, REP_CMD_NOT_SUPPORTED).await;
+            bail!("unsupported SOCKS command {other:#x} (only CONNECT / UDP ASSOCIATE)");
+        }
     }
-    Ok((host, port))
+}
+
+/// Convenience wrapper over [`accept_request`] for the TCP-only paths
+/// (static `--remote` forward, or a listener that doesn't relay UDP):
+/// returns the CONNECT `(host, port)` and rejects UDP ASSOCIATE with a
+/// command-not-supported reply.
+pub async fn accept_connect(tcp: &mut TcpStream) -> Result<(String, u16)> {
+    match accept_request(tcp).await? {
+        Socks5Request::Connect { host, port } => Ok((host, port)),
+        Socks5Request::UdpAssociate => {
+            reply(tcp, REP_CMD_NOT_SUPPORTED).await;
+            bail!("UDP ASSOCIATE not supported on this listener");
+        }
+    }
 }
 
 /// Write a SOCKS5 reply with `rep` and a zero `BND.ADDR`/`BND.PORT`
@@ -101,6 +130,25 @@ pub async fn reply(tcp: &mut TcpStream, rep: u8) {
     let _ = tcp
         .write_all(&[VER, rep, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0])
         .await;
+}
+
+/// Write a SOCKS5 reply carrying a real `BND.ADDR`/`BND.PORT` — used by
+/// UDP ASSOCIATE, where the app MUST learn the relay socket's address
+/// to send its datagrams to. `rep` is normally [`REP_SUCCESS`].
+pub async fn reply_bound(tcp: &mut TcpStream, rep: u8, addr: std::net::SocketAddr) {
+    let mut msg = vec![VER, rep, 0x00];
+    match addr.ip() {
+        std::net::IpAddr::V4(v4) => {
+            msg.push(ATYP_IPV4);
+            msg.extend_from_slice(&v4.octets());
+        }
+        std::net::IpAddr::V6(v6) => {
+            msg.push(ATYP_IPV6);
+            msg.extend_from_slice(&v6.octets());
+        }
+    }
+    msg.extend_from_slice(&addr.port().to_be_bytes());
+    let _ = tcp.write_all(&msg).await;
 }
 
 /// Minimal SOCKS5 **client** handshake over an already-connected `stream`:
@@ -339,6 +387,42 @@ mod tests {
             (h2.as_str(), p2, &framed[o2..]),
             ("8.8.8.8", 53, &b"answer"[..])
         );
+    }
+
+    /// A UDP ASSOCIATE request is parsed (not rejected) by
+    /// `accept_request`, and `reply_bound` echoes a real BND addr the
+    /// app can send datagrams to.
+    #[tokio::test]
+    async fn accept_request_parses_udp_associate_and_reply_bound() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let mut c = TcpStream::connect(addr).await.unwrap();
+            c.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+            let mut sel = [0u8; 2];
+            c.read_exact(&mut sel).await.unwrap();
+            // CMD=0x03 UDP ASSOCIATE, ATYP=IPv4 0.0.0.0:0 (advisory DST).
+            c.write_all(&[0x05, CMD_UDP_ASSOCIATE, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+            let mut head = [0u8; 4];
+            c.read_exact(&mut head).await.unwrap();
+            // Consume BND.ADDR (ipv4) + BND.PORT.
+            let mut rest = [0u8; 6];
+            c.read_exact(&mut rest).await.unwrap();
+            (head, rest)
+        });
+        let (mut srv, _) = listener.accept().await.unwrap();
+        let req = accept_request(&mut srv).await.unwrap();
+        assert_eq!(req, Socks5Request::UdpAssociate);
+        let bind: std::net::SocketAddr = "127.0.0.1:51820".parse().unwrap();
+        reply_bound(&mut srv, REP_SUCCESS, bind).await;
+        let (head, rest) = client.await.unwrap();
+        assert_eq!(head[0], VER);
+        assert_eq!(head[1], REP_SUCCESS);
+        assert_eq!(head[3], ATYP_IPV4);
+        assert_eq!(&rest[..4], &[127, 0, 0, 1]);
+        assert_eq!(u16::from_be_bytes([rest[4], rest[5]]), 51820);
     }
 
     #[test]
