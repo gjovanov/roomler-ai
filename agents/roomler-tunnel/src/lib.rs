@@ -10,6 +10,7 @@ pub mod config;
 pub mod forward;
 pub mod mesh;
 pub mod socks5;
+pub mod update;
 
 pub use tunnel_core::forward as core_forward;
 pub use tunnel_core::{auth, mux, policy, signaling, transport};
