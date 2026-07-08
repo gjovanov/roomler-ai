@@ -3,9 +3,30 @@ use axum::{
     extract::{Path, State},
 };
 use bson::oid::ObjectId;
+use roomler_ai_db::models::role::permissions;
 use serde::{Deserialize, Serialize};
 
 use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
+
+/// Require `MANAGE_ROLES` for role administration. Doubles as the membership
+/// check — `get_member_permissions` returns `Forbidden` for a non-member;
+/// `owner`/admin pass via the `ADMINISTRATOR` bypass in `has`.
+async fn require_manage_roles(
+    state: &AppState,
+    tenant_id: ObjectId,
+    user_id: ObjectId,
+) -> Result<(), ApiError> {
+    let perms = state
+        .tenants
+        .get_member_permissions(tenant_id, user_id)
+        .await?;
+    if !permissions::has(perms, permissions::MANAGE_ROLES) {
+        return Err(ApiError::Forbidden(
+            "Missing MANAGE_ROLES permission".to_string(),
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Serialize)]
 pub struct RoleResponse {
@@ -66,9 +87,7 @@ pub async fn create(
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
 
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
-    }
+    require_manage_roles(&state, tid, auth.user_id).await?;
 
     let role = state
         .roles
@@ -98,9 +117,7 @@ pub async fn update(
     let rid = ObjectId::parse_str(&role_id)
         .map_err(|_| ApiError::BadRequest("Invalid role_id".to_string()))?;
 
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
-    }
+    require_manage_roles(&state, tid, auth.user_id).await?;
 
     state
         .roles
@@ -128,9 +145,7 @@ pub async fn delete(
     let rid = ObjectId::parse_str(&role_id)
         .map_err(|_| ApiError::BadRequest("Invalid role_id".to_string()))?;
 
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
-    }
+    require_manage_roles(&state, tid, auth.user_id).await?;
 
     state.roles.delete(rid, tid).await?;
 
@@ -149,9 +164,7 @@ pub async fn assign(
     let uid = ObjectId::parse_str(&user_id)
         .map_err(|_| ApiError::BadRequest("Invalid user_id".to_string()))?;
 
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
-    }
+    require_manage_roles(&state, tid, auth.user_id).await?;
 
     state.tenants.assign_role(tid, uid, rid).await?;
 
@@ -170,9 +183,7 @@ pub async fn unassign(
     let uid = ObjectId::parse_str(&user_id)
         .map_err(|_| ApiError::BadRequest("Invalid user_id".to_string()))?;
 
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
-    }
+    require_manage_roles(&state, tid, auth.user_id).await?;
 
     state.tenants.remove_role(tid, uid, rid).await?;
 
