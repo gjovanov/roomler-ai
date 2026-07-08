@@ -25,6 +25,7 @@
 
 pub mod bridge;
 pub mod direct;
+pub mod dns;
 pub mod nat;
 pub mod netmap;
 pub mod relay_link;
