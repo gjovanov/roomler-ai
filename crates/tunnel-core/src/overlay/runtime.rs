@@ -18,7 +18,7 @@
 //! without reworking the runtime.
 
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -30,6 +30,7 @@ use tracing::{debug, info, warn};
 
 use super::WgKeypair;
 use super::direct;
+use super::dns;
 use super::netmap::{PeerConfig, peer_config_from_netmap};
 use super::relay_link::{ReadyLink, RelayCoordinator};
 use super::tun::TunIo;
@@ -153,6 +154,21 @@ fn netmask_for_prefix(prefix: u8) -> Ipv4Addr {
 fn prefix_of_cidr(cidr: &str) -> Option<u8> {
     cidr.split_once('/')
         .and_then(|(_, p)| p.trim().parse().ok())
+}
+
+/// Phase 2 MagicDNS — rebuild the resolver's `name → overlay-IP` map from the
+/// current netmap peers (named peers only). Called after each netmap change.
+async fn sync_name_map(names: &dns::NameMap, peers: &HashMap<ObjectId, NetmapPeer>) {
+    let mut map = names.write().await;
+    map.clear();
+    for p in peers.values() {
+        if p.name.is_empty() {
+            continue;
+        }
+        if let Ok(ip) = p.overlay_ip.parse::<Ipv4Addr>() {
+            map.insert(p.name.clone(), ip);
+        }
+    }
 }
 
 /// How the runtime obtains a carrier for each peer.
@@ -314,6 +330,36 @@ impl OverlayRuntime {
         // the relay path for a downgraded peer without waiting for a netmap.
         let mut current_peers: HashMap<ObjectId, NetmapPeer> =
             first_peers.iter().map(|p| (p.node_id, p.clone())).collect();
+
+        // Phase 2 MagicDNS — if the tenant set a domain, run a local split-DNS
+        // resolver bound to our overlay IP:53, point the OS at it for that
+        // domain, and keep the resolver's name→IP map synced with the netmap.
+        // `None` when MagicDNS is off. `_dns_os_guard` reverts the OS DNS config
+        // on runtime exit (WS disconnect / shutdown).
+        let mut _dns_os_guard: Option<dns::DnsOsGuard> = None;
+        let dns_names: Option<dns::NameMap> = match &network.magic_domain {
+            Some(domain) if !domain.is_empty() => {
+                let magic_domain = domain.trim_end_matches('.').to_ascii_lowercase();
+                let names: dns::NameMap = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+                sync_name_map(&names, &current_peers).await;
+                let upstream = network
+                    .nameservers
+                    .iter()
+                    .find_map(|s| dns::parse_upstream(s))
+                    .unwrap_or_else(|| SocketAddr::from(([1, 1, 1, 1], 53)));
+                tokio::spawn(dns::run(dns::DnsConfig {
+                    bind: SocketAddr::new(self_v4.into(), 53),
+                    magic_domain: magic_domain.clone(),
+                    upstream,
+                    names: names.clone(),
+                }));
+                // Point the OS resolver at us for `<magic_domain>` (reverted on Drop).
+                _dns_os_guard = Some(dns::configure_os(self_v4, &magic_domain).await);
+                Some(names)
+            }
+            _ => None,
+        };
+
         let mut fallback = tokio::time::interval(FALLBACK_TICK);
         // rc.146 — re-assert per-peer /32 routes so a full-tunnel VPN can't keep
         // its competing capture routes installed. First tick fires immediately;
@@ -379,6 +425,7 @@ impl OverlayRuntime {
                     // removals; a full diff/prune is a later refinement).
                     Some(OverlayEvent::Netmap { peers, .. }) => {
                         current_peers = peers.iter().map(|p| (p.node_id, p.clone())).collect();
+                        if let Some(names) = &dns_names { sync_name_map(names, &current_peers).await; }
                         self.install_peers(&mut wg, &mut by_node, &mut relay, &tun, &peers, direct_ctx.as_ref(), &direct_cooldown).await;
                     }
                     Some(OverlayEvent::NetmapDelta { upserts, removes }) => {
@@ -395,6 +442,7 @@ impl OverlayRuntime {
                                 r.forget(&node_id);
                             }
                         }
+                        if let Some(names) = &dns_names { sync_name_map(names, &current_peers).await; }
                     }
                     Some(OverlayEvent::RelayGrant { peer_node_id, ice_servers, pair_key }) => {
                         if let Some(r) = relay.as_mut()
@@ -904,6 +952,8 @@ mod tests {
         OverlayNetworkInfo {
             cidr: "100.64.0.0/10".into(),
             mtu: 1280,
+            magic_domain: None,
+            nameservers: vec![],
         }
     }
     fn peer(kp: &WgKeypair, ip: &str) -> NetmapPeer {
