@@ -57,12 +57,16 @@ pub struct ConnectedController {
     pub tx: ClientTx,
 }
 
-/// Emitted by [`Hub::create_session`] when a session's consent must be obtained
-/// from the device OWNER out-of-band (Email / Push modes). The Hub stays
-/// DB-agnostic: it just publishes the event. An API-side consumer looks up the
-/// owner (via `agent_id`), persists a `ConsentRequest`, and sends the email /
-/// push; the owner's later approve/deny calls [`Hub::deliver_consent`], which
-/// resolves the SAME slot the [`create_session`](Hub::create_session) waiter awaits.
+/// Emitted by [`Hub::create_session`] to have the API layer notify the device
+/// OWNER. Two flavours, distinguished by `override_reason`:
+/// * `None` — Email/Push consent modes: the owner must APPROVE (the API persists
+///   a `ConsentRequest` + sends the approve-link; the owner's approve/deny later
+///   calls [`Hub::deliver_consent`], resolving the SAME slot the waiter awaits).
+/// * `Some(reason)` — an admin break-glass already happened: an INFORMATIONAL
+///   "your device was accessed" notice (no approval needed, no token).
+///
+/// The Hub stays DB-agnostic — it just publishes; the API consumer resolves the
+/// owner from `agent_id`.
 #[derive(Debug, Clone)]
 pub struct ConsentEvent {
     pub session_id: ObjectId,
@@ -74,6 +78,9 @@ pub struct ConsentEvent {
     /// Same window the waiter uses — the consumer sizes the `ConsentRequest`
     /// TTL to match so a stale link can't resolve a long-gone session.
     pub timeout_secs: u32,
+    /// `Some` ⇒ this is a break-glass NOTICE (already-granted), carrying the
+    /// admin's reason; `None` ⇒ an Email/Push APPROVAL request.
+    pub override_reason: Option<String>,
 }
 
 pub struct HubInner {
@@ -388,6 +395,7 @@ impl Hub {
         // gate only sets `override_reason` for a validated `ADMINISTRATOR` force;
         // `consent_mode` was resolved to `Auto` alongside it, so consent is
         // skipped and this audit is the accountability trail for it.
+        let override_for_notify = override_reason.clone();
         if let Some(reason) = override_reason {
             self.audit(
                 session_id,
@@ -397,10 +405,12 @@ impl Hub {
             );
         }
 
-        // Phase 4 — owner-side consent: hand the API layer what it needs to notify
-        // the owner (it resolves the owner from `agent_id`). Best-effort; with no
-        // consumer wired the session just relies on the waiter timeout.
-        if matches!(consent_mode, ConsentMode::Email | ConsentMode::Push)
+        // Phase 4/5 — owner-side notification: an Email/Push APPROVAL request, or
+        // (when a break-glass just happened) an informational "your device was
+        // accessed" NOTICE. Best-effort; the API consumer resolves the owner from
+        // `agent_id`. With no consumer wired the session relies on the waiter.
+        if (matches!(consent_mode, ConsentMode::Email | ConsentMode::Push)
+            || override_for_notify.is_some())
             && let Some(tx) = &self.inner.consent_tx
         {
             let _ = tx.try_send(ConsentEvent {
@@ -411,6 +421,7 @@ impl Hub {
                 controller_name,
                 mode: consent_mode,
                 timeout_secs: timeout.as_secs() as u32,
+                override_reason: override_for_notify,
             });
         }
 
