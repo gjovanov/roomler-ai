@@ -241,17 +241,39 @@ jobs:
           "$llvm\bin"              | Out-File -FilePath $env:GITHUB_PATH -Append
           & "$llvm\bin\clang.exe" --version
 
-      - name: Install pkg-config (env-libvpx-sys build script needs it)
+      - name: Install pkg-config (env-libvpx-sys + ffmpeg-sys build scripts need it)
         shell: pwsh
         run: |
-          # `env-libvpx-sys`'s build.rs shells out to pkg-config to find
-          # the libvpx headers + lib paths. windows-latest doesn't ship
-          # one. pkg-config-lite is a single-binary build of pkg-config
-          # without glib deps — exactly what we need.
-          choco install -y pkgconfiglite
-          # The choco package puts pkg-config.exe under
-          # C:\ProgramData\chocolatey\bin which is already on PATH for
-          # subsequent steps. Verify before continuing.
+          # `env-libvpx-sys` / `ffmpeg-sys-next` build.rs shell out to
+          # `pkg-config`; windows-latest ships none. We install vcpkg's
+          # `pkgconf` — we already have vcpkg (pre-installed at C:\vcpkg,
+          # used below for libvpx + FFmpeg), so this pulls from the vcpkg
+          # registry, NOT SourceForge. The old `choco pkgconfiglite`
+          # downloaded its binary from SourceForge, which timed out and
+          # failed the rc.151 MSI build. Kept as a retried fallback.
+          $got = $false
+          if (Test-Path 'C:\vcpkg\vcpkg.exe') {
+            C:\vcpkg\vcpkg.exe install pkgconf:x64-windows
+            $tools = 'C:\vcpkg\installed\x64-windows\tools\pkgconf'
+            if (Test-Path "$tools\pkgconf.exe") {
+              # The *-sys scripts invoke the command `pkg-config`; pkgconf is
+              # a drop-in replacement, so expose it under that name too.
+              Copy-Item "$tools\pkgconf.exe" "$tools\pkg-config.exe" -Force
+              $tools | Out-File -FilePath $env:GITHUB_PATH -Append
+              $env:PATH = "$tools;$env:PATH"
+              $got = $true
+            }
+          }
+          if (-not $got) {
+            Write-Host "vcpkg pkgconf unavailable — falling back to choco pkgconfiglite (SourceForge; retried)"
+            for ($i = 1; $i -le 3; $i++) {
+              choco install -y pkgconfiglite
+              if (Get-Command pkg-config -ErrorAction SilentlyContinue) { break }
+              Write-Host "pkgconfiglite attempt $i failed (likely SourceForge); retrying in 15s"
+              Start-Sleep -Seconds 15
+            }
+          }
+          # Fails the step loudly if neither path produced a usable pkg-config.
           pkg-config --version
 
       - name: Build libvpx 1.12.0 via vcpkg (matches pre-generated bindings)

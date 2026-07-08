@@ -67,6 +67,24 @@ jobs:
           cargo build -p roomler-agent --release `
             --features "mf-encoder,scrap-capture,openh264-encoder,enigo-input,clipboard,viewer-indicator,system-context"
 
+      - name: Stage wintun.dll for the MSI bundle
+        shell: pwsh
+        run: |
+          # wix/main.wxs UNCONDITIONALLY bundles a `WintunDll` component
+          # (overlay-l3's TUN driver) from target\release\wintun.dll, so the
+          # WiX `light` step needs the DLL present even in this minimal-feature
+          # smoke build — otherwise it fails with LGHT0103 (the long-standing
+          # installer-smoke red). Mirrors release-agent.yml's staging step.
+          $ver = '0.14.1'
+          $zip = "$env:RUNNER_TEMP\wintun.zip"
+          Invoke-WebRequest -Uri "https://www.wintun.net/builds/wintun-$ver.zip" -OutFile $zip -UseBasicParsing
+          $dest = "$env:RUNNER_TEMP\wintun"
+          Expand-Archive -Path $zip -DestinationPath $dest -Force
+          $dll = Join-Path $dest 'wintun\bin\amd64\wintun.dll'
+          if (-not (Test-Path $dll)) { Write-Host "::error::wintun.dll (amd64) not found in the downloaded archive"; exit 1 }
+          Copy-Item $dll target\release\wintun.dll -Force
+          Write-Host "Staged wintun.dll ($([math]::Round((Get-Item target\release\wintun.dll).Length/1KB,0)) KB) for the MSI bundle"
+
       - name: Build per-User MSI
         shell: pwsh
         env:
