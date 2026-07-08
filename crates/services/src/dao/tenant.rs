@@ -19,6 +19,27 @@ impl TenantDao {
         }
     }
 
+    /// Phase 2 MagicDNS — set the tenant's overlay DNS domain + upstream
+    /// nameservers (`None` domain disables MagicDNS). Returns the updated tenant.
+    pub async fn set_magic_dns(
+        &self,
+        tenant_id: ObjectId,
+        domain: Option<String>,
+        nameservers: Vec<String>,
+    ) -> DaoResult<Tenant> {
+        self.base
+            .update_by_id(
+                tenant_id,
+                doc! { "$set": {
+                    "settings.magic_dns_domain": domain,
+                    "settings.magic_dns_nameservers": nameservers,
+                    "updated_at": DateTime::now(),
+                } },
+            )
+            .await?;
+        self.base.find_by_id(tenant_id).await
+    }
+
     pub async fn create(
         &self,
         name: String,
