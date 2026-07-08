@@ -13,6 +13,9 @@ pub struct MemberResponse {
     pub id: String,
     pub user_id: String,
     pub nickname: Option<String>,
+    /// The user's display name (falls back to username), resolved from the users
+    /// collection — so member pickers can show a name, not a raw id.
+    pub display_name: String,
     pub role_ids: Vec<String>,
     pub joined_at: String,
 }
@@ -60,6 +63,14 @@ pub async fn list_members(
         )
         .await?;
 
+    // Resolve display names in one batch so the response carries names, not just
+    // ids (used by member pickers, e.g. the agent owner-reassign dialog).
+    let user_ids: Vec<ObjectId> = result.items.iter().map(|m| m.user_id).collect();
+    let names = state
+        .users
+        .find_display_names(&user_ids)
+        .await
+        .unwrap_or_default();
     let items: Vec<MemberResponse> = result
         .items
         .into_iter()
@@ -67,6 +78,7 @@ pub async fn list_members(
             id: m.id.unwrap().to_hex(),
             user_id: m.user_id.to_hex(),
             nickname: m.nickname,
+            display_name: names.get(&m.user_id).cloned().unwrap_or_default(),
             role_ids: m.role_ids.iter().map(|r| r.to_hex()).collect(),
             joined_at: m.joined_at.try_to_rfc3339_string().unwrap_or_default(),
         })

@@ -86,6 +86,15 @@
                 title="Agent logs"
               />
               <v-btn
+                icon="mdi-account-switch"
+                size="small"
+                variant="text"
+                color="primary"
+                @click="openReassign(a)"
+                :aria-label="`Reassign owner of ${a.name}`"
+                title="Reassign owner"
+              />
+              <v-btn
                 icon="mdi-delete"
                 size="small"
                 variant="text"
@@ -410,10 +419,44 @@
       </v-card-actions>
     </v-card>
   </v-dialog>
+
+  <!-- Reassign device owner (MANAGE_AGENTS) -->
+  <v-dialog v-model="reassignDialogOpen" max-width="440">
+    <v-card>
+      <v-card-title>Reassign device owner</v-card-title>
+      <v-card-text>
+        <p class="text-body-2 mb-3">
+          Owner of <strong>{{ reassignTarget?.name }}</strong>. The owner self-controls
+          without an allowlist entry, and consent (email / push) routes to them.
+        </p>
+        <v-select
+          v-model="reassignOwnerId"
+          :items="memberSelectItems"
+          label="New owner"
+          density="compact"
+          variant="outlined"
+          hide-details
+        />
+      </v-card-text>
+      <v-card-actions>
+        <v-spacer />
+        <v-btn variant="text" @click="reassignDialogOpen = false">Cancel</v-btn>
+        <v-btn
+          color="primary"
+          variant="flat"
+          :loading="reassignBusy"
+          :disabled="!reassignOwnerId || reassignOwnerId === reassignTarget?.owner_user_id"
+          @click="confirmReassign"
+        >
+          Reassign
+        </v-btn>
+      </v-card-actions>
+    </v-card>
+  </v-dialog>
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, watch } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
 import { useDisplay } from 'vuetify'
 import {
   useAgentStore,
@@ -437,6 +480,7 @@ const CONSENT_MODE_ITEMS: { title: string; value: ConsentMode }[] = [
   { title: 'Auto-grant (unattended)', value: 'auto' },
   { title: 'Email the owner', value: 'email' },
   { title: 'Push to the owner', value: 'push' },
+  { title: 'Prompt host + email owner', value: 'prompt_then_email' },
 ]
 // Agent id whose consent mode is mid-update (disables + spins that row's select).
 const consentBusy = ref<string | null>(null)
@@ -630,8 +674,39 @@ async function performDelete() {
   }
 }
 
+// Owner reassignment (MANAGE_AGENTS). Resolve owner_user_id → a name via the
+// tenant members, and pick a new owner from that list.
+const reassignDialogOpen = ref(false)
+const reassignTarget = ref<Agent | null>(null)
+const reassignOwnerId = ref<string>('')
+const reassignBusy = ref(false)
+const memberSelectItems = computed(() =>
+  agentStore.tenantMembers.map((m) => ({
+    title: m.display_name || m.nickname || m.user_id,
+    value: m.user_id,
+  })),
+)
+function openReassign(a: Agent) {
+  reassignTarget.value = a
+  reassignOwnerId.value = a.owner_user_id
+  reassignDialogOpen.value = true
+}
+async function confirmReassign() {
+  if (!reassignTarget.value || !reassignOwnerId.value) return
+  reassignBusy.value = true
+  try {
+    await agentStore.updateOwner(props.tenantId, reassignTarget.value.id, reassignOwnerId.value)
+    reassignDialogOpen.value = false
+  } catch (e) {
+    agentStore.error = (e as Error).message
+  } finally {
+    reassignBusy.value = false
+  }
+}
+
 onMounted(() => {
   agentStore.fetchAgents(props.tenantId)
+  agentStore.fetchTenantMembers(props.tenantId)
 })
 
 watch(() => props.tenantId, (tid) => {

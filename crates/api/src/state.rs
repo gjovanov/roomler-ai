@@ -414,7 +414,11 @@ async fn handle_consent_event(deps: &ConsentConsumerDeps, ev: &ConsentEvent) -> 
     );
 
     match ev.mode {
-        ConsentMode::Email => {
+        // Email + PromptThenEmail both email the owner an approve-link. For
+        // PromptThenEmail the agent ALSO prompts on the host in parallel — either
+        // the person at the console or the owner via the link can approve, first
+        // wins (both resolve the same slot within the shared timeout).
+        ConsentMode::Email | ConsentMode::PromptThenEmail => {
             let owner = deps.users.base.find_by_id(owner_id).await?;
             match &deps.email {
                 Some(email) => {
