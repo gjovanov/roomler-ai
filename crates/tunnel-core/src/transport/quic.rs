@@ -867,6 +867,71 @@ mod tests {
         assert_eq!(got, payload, "A→B payload corrupted through QUIC");
     }
 
+    /// End-to-end UDP ASSOCIATE pump over QUIC: the agent side runs
+    /// [`crate::forward::run_flow_udp_quic`] against a loopback UDP echo
+    /// target; the "client" writes a length-prefixed datagram on the
+    /// flow stream and reads the echo back framed. Proves the QUIC
+    /// datagram framing ([`crate::forward::quic_read_datagram`] /
+    /// `quic_write_datagram`) + the pump round-trip.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_flow_udp_quic_echoes_datagram() {
+        use crate::forward::{
+            FlowStats, frame_udp_datagram, quic_read_datagram, run_flow_udp_quic,
+        };
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        // Loopback UDP echo server.
+        let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut b = [0u8; 2048];
+            while let Ok((n, from)) = echo.recv_from(&mut b).await {
+                let _ = echo.send_to(&b[..n], from).await;
+            }
+        });
+
+        // QUIC pair + one flow stream.
+        let (server, fp) = QuicPeer::server(loopback()).unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = QuicPeer::client(loopback(), &fp).unwrap();
+        let agent_accept = tokio::spawn(async move { server.accept().await.unwrap().unwrap() });
+        let client_conn = client.connect(server_addr).await.unwrap();
+        let agent_conn = agent_accept.await.unwrap();
+        let (mut c_send, mut c_recv) = open_flow(&client_conn, 1).await.unwrap();
+        let (_fid, a_send, a_recv) = accept_flow(&agent_conn).await.unwrap();
+
+        // Agent pump: UDP socket connected to the echo target.
+        let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        udp.connect(echo_addr).await.unwrap();
+        let pump = tokio::spawn(run_flow_udp_quic(
+            udp,
+            a_send,
+            a_recv,
+            1,
+            Duration::from_secs(3),
+            Arc::new(FlowStats::default()),
+        ));
+
+        // Client → agent: one framed datagram.
+        c_send
+            .write_all(&frame_udp_datagram(b"ping-quic").unwrap())
+            .await
+            .unwrap();
+
+        // Echo returns framed on the same stream.
+        let echoed = tokio::time::timeout(Duration::from_secs(5), quic_read_datagram(&mut c_recv))
+            .await
+            .expect("no echo within 5s")
+            .expect("quic read error")
+            .expect("stream finished early");
+        assert_eq!(
+            echoed, b"ping-quic",
+            "datagram must round-trip the QUIC pump"
+        );
+        pump.abort();
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn quic_token_auth_accepts_matching() {
         let (server, fp) = QuicPeer::server(loopback()).unwrap();
