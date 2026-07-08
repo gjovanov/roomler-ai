@@ -384,6 +384,61 @@ pub enum ClientMsg {
         reason: CloseReason,
     },
 
+    /// Client → server (→ agent): open one UDP forward (SOCKS5 UDP
+    /// ASSOCIATE). Gated exactly like [`TcpForwardRequest`] but the
+    /// server evaluates the policy with `proto = udp`. `flow_id` is
+    /// client-chosen + monotonic per `session_id`; one UDP flow is
+    /// opened per distinct `(dst_host, dst_port)` the app addresses
+    /// within a single SOCKS association. Datagrams for the flow are
+    /// carried length-prefixed over the negotiated transport (DC: one
+    /// `mux`-framed message per datagram; QUIC: a per-flow bidi stream
+    /// of `[u16 len | datagram]`). Association lifetime = the SOCKS
+    /// control TCP connection on the client; individual flows
+    /// idle-close.
+    #[serde(rename = "rc:tunnel.udp.request")]
+    UdpForwardRequest {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        flow_id: u32,
+        dst_host: String,
+        dst_port: u16,
+    },
+
+    /// Agent → server → client: agent bound a UDP socket for the flow
+    /// and is ready to relay datagrams. Mirrors [`TcpForwardAccept`];
+    /// `dc_index` selects the pool DC for the WebRTC transport (0 for
+    /// QUIC, which has no DC pool).
+    #[serde(rename = "rc:tunnel.udp.accept")]
+    UdpForwardAccept {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        flow_id: u32,
+        dc_index: u8,
+    },
+
+    /// Agent → server (or server-synthesised on ACL deny): the UDP flow
+    /// is rejected. Mirrors [`TcpForwardReject`].
+    #[serde(rename = "rc:tunnel.udp.reject")]
+    UdpForwardReject {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        flow_id: u32,
+        kind: RejectKind,
+        reason: String,
+    },
+
+    /// Either side closes a UDP flow (idle-timeout, or the client's
+    /// SOCKS association tore down). No half-close — UDP is
+    /// datagram-oriented, there is no read-half to shut. Server relays
+    /// to the peer + appends to `tunnel_audit` like [`TcpClosed`].
+    #[serde(rename = "rc:tunnel.udp.closed")]
+    UdpClosed {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        flow_id: u32,
+        reason: CloseReason,
+    },
+
     /// Either side tears down the whole peer (Ctrl-C on the CLI,
     /// agent shutdown, etc.). Server cleans up state + audits.
     #[serde(rename = "rc:tunnel.terminate")]
@@ -740,6 +795,51 @@ pub enum ServerMsg {
     /// Server → peer: relays a flow close.
     #[serde(rename = "rc:tunnel.tcp.closed")]
     TcpClosed {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        flow_id: u32,
+        reason: CloseReason,
+    },
+
+    /// Server → agent: a tunnel-client wants to open this UDP forward;
+    /// the server has already passed the cross-tenant gate + the tenant
+    /// policy (evaluated with `proto = udp`). Mirrors
+    /// [`TcpForwardForward`]. Agent binds a UDP socket + replies with
+    /// `UdpForwardAccept` / `UdpForwardReject`.
+    #[serde(rename = "rc:tunnel.udp.forward")]
+    UdpForwardForward {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        flow_id: u32,
+        dst_host: String,
+        dst_port: u16,
+        #[serde(with = "oid_hex")]
+        owner_user_id: ObjectId,
+    },
+
+    /// Server → client: relays the agent's `UdpForwardAccept`.
+    #[serde(rename = "rc:tunnel.udp.accept")]
+    UdpForwardAccept {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        flow_id: u32,
+        dc_index: u8,
+    },
+
+    /// Server → client: relays the agent's reject OR synthesises one
+    /// from the server-side ACL gate.
+    #[serde(rename = "rc:tunnel.udp.reject")]
+    UdpForwardReject {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        flow_id: u32,
+        kind: RejectKind,
+        reason: String,
+    },
+
+    /// Server → peer: relays a UDP flow close.
+    #[serde(rename = "rc:tunnel.udp.closed")]
+    UdpClosed {
         #[serde(with = "oid_hex")]
         session_id: ObjectId,
         flow_id: u32,
@@ -1257,6 +1357,89 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn udp_forward_wire_discriminators_and_roundtrip() {
+        let session_id = ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap();
+        // Client → server request.
+        let req = ClientMsg::UdpForwardRequest {
+            session_id,
+            flow_id: 7,
+            dst_host: "dns.intranet".into(),
+            dst_port: 53,
+        };
+        let s = serde_json::to_string(&req).unwrap();
+        assert!(s.contains(r#""t":"rc:tunnel.udp.request""#));
+        assert!(s.contains(r#""dst_port":53"#));
+        assert!(matches!(
+            serde_json::from_str::<ClientMsg>(&s).unwrap(),
+            ClientMsg::UdpForwardRequest {
+                flow_id: 7,
+                dst_port: 53,
+                ..
+            }
+        ));
+
+        // Client → server close (agent-emitted too).
+        let closed = ClientMsg::UdpClosed {
+            session_id,
+            flow_id: 7,
+            reason: CloseReason::IdleTimeout,
+        };
+        let s = serde_json::to_string(&closed).unwrap();
+        assert!(s.contains(r#""t":"rc:tunnel.udp.closed""#));
+
+        // Server → agent forward.
+        let owner = ObjectId::parse_str("507f1f77bcf86cd799439012").unwrap();
+        let fwd = ServerMsg::UdpForwardForward {
+            session_id,
+            flow_id: 7,
+            dst_host: "dns.intranet".into(),
+            dst_port: 53,
+            owner_user_id: owner,
+        };
+        let s = serde_json::to_string(&fwd).unwrap();
+        assert!(s.contains(r#""t":"rc:tunnel.udp.forward""#));
+        assert!(matches!(
+            serde_json::from_str::<ServerMsg>(&s).unwrap(),
+            ServerMsg::UdpForwardForward {
+                flow_id: 7,
+                dst_port: 53,
+                ..
+            }
+        ));
+
+        // Server → client accept.
+        let acc = ServerMsg::UdpForwardAccept {
+            session_id,
+            flow_id: 7,
+            dc_index: 3,
+        };
+        let s = serde_json::to_string(&acc).unwrap();
+        assert!(s.contains(r#""t":"rc:tunnel.udp.accept""#));
+        assert!(s.contains(r#""dc_index":3"#));
+    }
+
+    #[test]
+    fn destination_rule_proto_defaults_to_any_and_roundtrips() {
+        use crate::models::{DestinationRule, HostPattern, PortRange, ProtocolKind};
+        // A pre-UDP stored rule (no `proto` field) deserialises to Any.
+        let legacy = r#"{"host_pattern":{"kind":"exact","value":"db"},"port_range":{"low":5432,"high":5432}}"#;
+        let r: DestinationRule = serde_json::from_str(legacy).unwrap();
+        assert_eq!(r.proto, ProtocolKind::Any);
+        // Explicit proto round-trips snake_case.
+        let udp = DestinationRule {
+            host_pattern: HostPattern::Exact("dns".into()),
+            port_range: PortRange { low: 53, high: 53 },
+            proto: ProtocolKind::Udp,
+        };
+        let s = serde_json::to_string(&udp).unwrap();
+        assert!(s.contains(r#""proto":"udp""#));
+        assert_eq!(
+            serde_json::from_str::<DestinationRule>(&s).unwrap().proto,
+            ProtocolKind::Udp
+        );
     }
 
     #[test]
