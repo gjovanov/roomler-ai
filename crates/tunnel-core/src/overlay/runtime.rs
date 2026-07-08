@@ -82,6 +82,38 @@ const BAD_SWEEPS_TO_FALLBACK: u32 = 3;
 /// long — it stays on relay, then re-attempts direct (auto-recovers when the
 /// blocking condition clears, e.g. the VPN disconnects).
 const DIRECT_COOLDOWN: Duration = Duration::from_secs(60);
+/// After this many consecutive direct-carrier failures for a peer, stop
+/// retrying direct for the rest of the session (escalate to
+/// [`DIRECT_DENY_COOLDOWN`]). The "same /24" was a false LAN signal that never
+/// actually reaches — the classic case is two hosts sharing a corp full-tunnel
+/// VPN's client pool (e.g. Check Point hands both a `192.168.0.x`) where the
+/// VPN isolates clients from each other. Without this, the 60 s
+/// [`DIRECT_COOLDOWN`] lapses and the next netmap re-upgrades the WORKING relay
+/// to a direct carrier that can never complete — an endless relay↔direct flap
+/// (field-observed: clean 44 ms relay pings interleaved with multi-second
+/// stalls + total route-drop windows). A genuine transient (real-LAN blip) still
+/// gets `DIRECT_MAX_FAILURES` attempts; a direct carrier that later proves
+/// healthy clears the strike count.
+const DIRECT_MAX_FAILURES: u32 = 2;
+/// The session-sticky "give up on direct for this peer" cooldown, applied once a
+/// peer hits [`DIRECT_MAX_FAILURES`]. Long enough to outlive any agent session
+/// (agents cycle well under a day), so the peer stays pinned to the working
+/// relay; a restart — or the peer genuinely landing on a real LAN in a later
+/// session — re-attempts direct.
+const DIRECT_DENY_COOLDOWN: Duration = Duration::from_secs(24 * 3600);
+
+/// The cooldown to apply after a direct-carrier failure. Escalates to the
+/// session-sticky [`DIRECT_DENY_COOLDOWN`] once a peer has failed direct
+/// [`DIRECT_MAX_FAILURES`] times (a persistent false /24 match — a VPN client
+/// pool — rather than a transient blip). `fails` is the running failure count
+/// INCLUDING the current failure.
+fn direct_retry_cooldown(fails: u32) -> Duration {
+    if fails >= DIRECT_MAX_FAILURES {
+        DIRECT_DENY_COOLDOWN
+    } else {
+        DIRECT_COOLDOWN
+    }
+}
 /// rc.139 — a dead RELAY carrier (one-way, same `tx>rx` signal) is usually a
 /// STALE coturn port: the peer re-allocated (restart/churn → new port) and we
 /// kept dialing the old one. Refresh it (re-request → fresh allocation, re-dial
@@ -324,6 +356,10 @@ impl OverlayRuntime {
         // rc.136 — peers whose DIRECT carrier just failed: don't retry direct
         // until the Instant (they stay on relay). Auto-expires → direct retried.
         let mut direct_cooldown: HashMap<ObjectId, Instant> = HashMap::new();
+        // Per-peer consecutive direct-failure count. Escalates the cooldown to
+        // session-sticky after DIRECT_MAX_FAILURES so a VPN-pool false /24 match
+        // can't flap the working relay forever (see `direct_retry_cooldown`).
+        let mut direct_fail_count: HashMap<ObjectId, u32> = HashMap::new();
         // rc.139 — peers whose stale relay was just refreshed (anti-ping-pong).
         let mut relay_refresh_cooldown: HashMap<ObjectId, Instant> = HashMap::new();
         // Latest netmap view (node_id → peer), so the fallback sweep can drive
@@ -407,7 +443,8 @@ impl OverlayRuntime {
                 _ = fallback.tick() => {
                     self.sweep_carrier_health(
                         &mut wg, &mut by_node, &mut relay, &tun,
-                        &mut direct_cooldown, &mut relay_refresh_cooldown, &current_peers,
+                        &mut direct_cooldown, &mut direct_fail_count,
+                        &mut relay_refresh_cooldown, &current_peers,
                     ).await;
                 },
                 // rc.146 — re-assert every installed peer's /32 on the overlay
@@ -480,6 +517,7 @@ impl OverlayRuntime {
         relay: &mut Option<RelayCoordinator>,
         tun: &Arc<dyn TunIo>,
         direct_cooldown: &mut HashMap<ObjectId, Instant>,
+        direct_fail_count: &mut HashMap<ObjectId, u32>,
         relay_refresh_cooldown: &mut HashMap<ObjectId, Instant>,
         current_peers: &HashMap<ObjectId, NetmapPeer>,
     ) {
@@ -502,6 +540,13 @@ impl OverlayRuntime {
                 e.bad_sweeps += 1;
             } else {
                 e.bad_sweeps = 0;
+                // A direct carrier that's actually RECEIVING is genuinely
+                // healthy → clear its strike count so old failures don't
+                // accumulate across a long healthy period and prematurely pin a
+                // real-LAN peer to relay. (rx advancing, not just idle.)
+                if e.is_direct && rx > last_rx {
+                    direct_fail_count.remove(nid);
+                }
             }
             if e.bad_sweeps >= BAD_SWEEPS_TO_FALLBACK {
                 // For a relay, hold off if we just refreshed it (anti-ping-pong).
@@ -522,11 +567,25 @@ impl OverlayRuntime {
             wg.remove_peer(&e.pubkey).await;
             tun.del_peer_route(e.overlay_ip).await;
             if was_direct {
-                direct_cooldown.insert(nid, now + DIRECT_COOLDOWN);
-                warn!(
-                    peer = %nid,
-                    "overlay: direct LAN carrier didn't establish (VPN / AP-isolation / firewall?) — falling back to relay"
-                );
+                // Escalating cooldown: after DIRECT_MAX_FAILURES consecutive
+                // failures, pin this peer to relay for the session — the "same
+                // /24" was a VPN client pool, not a reachable LAN, so retrying
+                // direct just flaps the working relay.
+                let fails = direct_fail_count.entry(nid).or_insert(0);
+                *fails += 1;
+                let sticky = *fails >= DIRECT_MAX_FAILURES;
+                direct_cooldown.insert(nid, now + direct_retry_cooldown(*fails));
+                if sticky {
+                    warn!(
+                        peer = %nid, fails = *fails,
+                        "overlay: direct LAN carrier failed repeatedly (VPN client-isolation / AP-isolation?) — pinning this peer to relay for the session"
+                    );
+                } else {
+                    warn!(
+                        peer = %nid,
+                        "overlay: direct LAN carrier didn't establish (VPN / AP-isolation / firewall?) — falling back to relay"
+                    );
+                }
             } else {
                 relay_refresh_cooldown.insert(nid, now + RELAY_REFRESH_COOLDOWN);
                 warn!(
@@ -881,6 +940,26 @@ mod tests {
     use std::time::Duration;
     use tokio::net::UdpSocket;
     use tokio::sync::Mutex;
+
+    #[test]
+    fn direct_cooldown_escalates_to_sticky_after_repeated_failures() {
+        // The VPN-pool relay↔direct anti-flap fix: the 1st direct failure gets
+        // the normal 60 s retry, but once a peer hits DIRECT_MAX_FAILURES the
+        // cooldown becomes session-sticky so it stops re-upgrading the working
+        // relay to a direct carrier that can never complete.
+        // `direct_retry_cooldown(1) == DIRECT_COOLDOWN` only holds when
+        // DIRECT_MAX_FAILURES >= 2, so this also guards that invariant (at least
+        // one plain retry before the sticky pin).
+        assert_eq!(direct_retry_cooldown(1), DIRECT_COOLDOWN);
+        assert_eq!(
+            direct_retry_cooldown(DIRECT_MAX_FAILURES),
+            DIRECT_DENY_COOLDOWN
+        );
+        assert_eq!(
+            direct_retry_cooldown(DIRECT_MAX_FAILURES + 3),
+            DIRECT_DENY_COOLDOWN
+        );
+    }
 
     struct MockTun {
         inject: Mutex<mpsc::UnboundedReceiver<Vec<u8>>>,
