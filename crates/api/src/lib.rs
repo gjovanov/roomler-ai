@@ -329,8 +329,11 @@ pub fn build_router(state: AppState) -> Router {
             put(routes::overlay_route::set_approved_routes),
         );
 
-    let public_tunnel_routes =
-        Router::new().route("/enroll", post(routes::tunnel::enroll_tunnel_client));
+    let public_tunnel_routes = Router::new()
+        .route("/enroll", post(routes::tunnel::enroll_tunnel_client))
+        // Auth is in-handler (TunnelClient bearer token), so it rides the
+        // "public" (no user-JWT-middleware) tunnel router.
+        .route("/agents", get(routes::tunnel::list_tenant_agents));
 
     // `/api/tunnel/{latest-release,installer/{platform}}` — public
     // GitHub-Releases proxy for the roomler-tunnel binary. Same
