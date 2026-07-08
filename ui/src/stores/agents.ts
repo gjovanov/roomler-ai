@@ -66,6 +66,14 @@ export interface Agent {
   capabilities?: AgentCapabilities
 }
 
+/** A tenant member as returned by `GET /tenant/{id}/member` — enough to populate
+ *  the owner-reassign picker + resolve `owner_user_id` to a name. */
+export interface TenantMember {
+  user_id: string
+  display_name: string
+  nickname: string | null
+}
+
 export interface EnrollmentToken {
   enrollment_token: string
   expires_in: number
@@ -179,6 +187,26 @@ export const useAgentStore = defineStore('agents', () => {
     if (idx !== -1) agents.value[idx]!.access_policy = policy
   }
 
+  /** Reassign the device owner (a MANAGE_AGENTS admin action). The owner is who
+   *  self-controls without an allowlist entry + who consent routes to. */
+  async function updateOwner(tenantId: string, agentId: string, ownerUserId: string) {
+    await api.put(`/tenant/${tenantId}/agent/${agentId}`, { owner_user_id: ownerUserId })
+    const idx = agents.value.findIndex((a) => a.id === agentId)
+    if (idx !== -1) agents.value[idx]!.owner_user_id = ownerUserId
+  }
+
+  /** Tenant members — for the owner-reassign picker + resolving an agent's
+   *  `owner_user_id` to a display name. Fetched on demand by AgentsSection. */
+  const tenantMembers = ref<TenantMember[]>([])
+  async function fetchTenantMembers(tenantId: string) {
+    try {
+      const resp = await api.get<{ items: TenantMember[] }>(`/tenant/${tenantId}/member`)
+      tenantMembers.value = resp.items
+    } catch {
+      tenantMembers.value = []
+    }
+  }
+
   async function deleteAgent(tenantId: string, agentId: string) {
     await api.delete(`/tenant/${tenantId}/agent/${agentId}`)
     agents.value = agents.value.filter((a) => a.id !== agentId)
@@ -226,6 +254,9 @@ export const useAgentStore = defineStore('agents', () => {
     issueEnrollmentToken,
     rename,
     updateAccessPolicy,
+    updateOwner,
+    tenantMembers,
+    fetchTenantMembers,
     deleteAgent,
     fetchCrashes,
     fetchLogs,
