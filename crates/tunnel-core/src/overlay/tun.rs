@@ -48,6 +48,16 @@ pub trait TunIo: Send + Sync {
     /// Remove the `/32` installed by [`add_peer_route`] (the peer left the
     /// mesh). Best-effort; never fails the caller.
     async fn del_peer_route(&self, _peer: std::net::Ipv4Addr) {}
+
+    /// Phase 1 — install an OS route for a subnet `cidr` (e.g. `"192.168.1.0/24"`)
+    /// via this device, so LAN behind a router-peer is reachable over the
+    /// overlay. Default no-op; best-effort.
+    async fn add_cidr_route(&self, _cidr: &str) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Remove a CIDR route installed by [`add_cidr_route`]. Best-effort.
+    async fn del_cidr_route(&self, _cidr: &str) {}
 }
 
 /// The real OS TUN device. Behind `overlay-l3` so the WG core + the
@@ -266,6 +276,91 @@ mod system {
             .await;
             #[cfg(not(any(target_os = "windows", target_os = "linux")))]
             let _ = peer;
+        }
+
+        /// Phase 1 — install an OS route for `cidr` via the overlay NIC (a
+        /// subnet a router-peer serves). Idempotent (delete-then-add on Windows;
+        /// `ip route replace` on Linux). Low metric so it wins a colliding uplink
+        /// route, mirroring the per-peer `/32` path.
+        async fn add_cidr_route(&self, cidr: &str) -> std::io::Result<()> {
+            #[cfg(target_os = "windows")]
+            {
+                let _ = run_cmd(
+                    "netsh",
+                    vec![
+                        "interface".into(),
+                        "ipv4".into(),
+                        "delete".into(),
+                        "route".into(),
+                        format!("prefix={cidr}"),
+                        format!("interface={IF_NAME}"),
+                    ],
+                )
+                .await;
+                run_cmd(
+                    "netsh",
+                    vec![
+                        "interface".into(),
+                        "ipv4".into(),
+                        "add".into(),
+                        "route".into(),
+                        format!("prefix={cidr}"),
+                        format!("interface={IF_NAME}"),
+                        "metric=1".into(),
+                        "store=active".into(),
+                    ],
+                )
+                .await
+            }
+            #[cfg(target_os = "linux")]
+            {
+                run_cmd(
+                    "ip",
+                    vec![
+                        "route".into(),
+                        "replace".into(),
+                        cidr.to_string(),
+                        "dev".into(),
+                        IF_NAME.into(),
+                    ],
+                )
+                .await
+            }
+            #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+            {
+                let _ = cidr;
+                Ok(())
+            }
+        }
+
+        async fn del_cidr_route(&self, cidr: &str) {
+            #[cfg(target_os = "windows")]
+            let _ = run_cmd(
+                "netsh",
+                vec![
+                    "interface".into(),
+                    "ipv4".into(),
+                    "delete".into(),
+                    "route".into(),
+                    format!("prefix={cidr}"),
+                    format!("interface={IF_NAME}"),
+                ],
+            )
+            .await;
+            #[cfg(target_os = "linux")]
+            let _ = run_cmd(
+                "ip",
+                vec![
+                    "route".into(),
+                    "del".into(),
+                    cidr.to_string(),
+                    "dev".into(),
+                    IF_NAME.into(),
+                ],
+            )
+            .await;
+            #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+            let _ = cidr;
         }
     }
 
