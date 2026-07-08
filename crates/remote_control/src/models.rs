@@ -489,16 +489,42 @@ pub enum AuditKind {
     ConsentDenied,
     ConsentTimedOut,
     SessionStarted,
-    SessionEnded { reason: EndReason },
-    ClipboardWriteToHost { bytes: u32 },
-    ClipboardReadFromHost { bytes: u32 },
-    FileSentToHost { name: String, bytes: u64 },
-    FileSentFromHost { name: String, bytes: u64 },
+    SessionEnded {
+        reason: EndReason,
+    },
+    ClipboardWriteToHost {
+        bytes: u32,
+    },
+    ClipboardReadFromHost {
+        bytes: u32,
+    },
+    FileSentToHost {
+        name: String,
+        bytes: u64,
+    },
+    FileSentFromHost {
+        name: String,
+        bytes: u64,
+    },
     KeyframeRequested,
-    PermissionsChanged { permissions: Permissions },
-    WatcherJoined { user_id: ObjectId },
-    WatcherLeft { user_id: ObjectId },
-    Error { message: String },
+    PermissionsChanged {
+        permissions: Permissions,
+    },
+    WatcherJoined {
+        user_id: ObjectId,
+    },
+    WatcherLeft {
+        user_id: ObjectId,
+    },
+    Error {
+        message: String,
+    },
+    /// An `ADMINISTRATOR` started this session via break-glass, skipping the
+    /// device's consent mode. `reason` is operator-supplied and mandatory — the
+    /// accountability record for a forced, unconsented session (docs §11.5).
+    AdminOverride {
+        reason: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

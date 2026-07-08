@@ -381,9 +381,9 @@ async fn handle_client_message(
         // (self-control / admin / REMOTE_CONTROL + per-device allowlist +
         // quarantine). A non-request rc:* message resolves to `Ok(Prompt)` and
         // falls straight through to dispatch (the mode is unused for it).
-        let consent_mode =
+        let authz =
             match crate::ws::remote_control::resolve_session_authz(state, *user_id, text).await {
-                Ok(mode) => mode,
+                Ok(a) => a,
                 Err(reason) => {
                     warn!(?user_id, %reason, "rc:session.request denied by authz gate");
                     let _ = rc_controller_tx.try_send(
@@ -402,7 +402,8 @@ async fn handle_client_message(
             username,
             rc_controller_tx,
             text,
-            consent_mode,
+            authz.mode,
+            authz.override_reason,
         );
         if handled {
             return;

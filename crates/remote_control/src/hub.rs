@@ -320,6 +320,7 @@ impl Hub {
         preferred_transport: Option<String>,
         chroma_pref: Option<String>,
         consent_mode: ConsentMode,
+        override_reason: Option<String>,
     ) -> Result<ObjectId> {
         let agent_org = {
             let mut agent = self
@@ -382,6 +383,19 @@ impl Hub {
 
         self.audit(session_id, agent_id, agent_org, AuditKind::SessionRequested);
         self.audit(session_id, agent_id, agent_org, AuditKind::ConsentPrompted);
+
+        // Phase 5 — record the break-glass BEFORE the session proceeds. The API
+        // gate only sets `override_reason` for a validated `ADMINISTRATOR` force;
+        // `consent_mode` was resolved to `Auto` alongside it, so consent is
+        // skipped and this audit is the accountability trail for it.
+        if let Some(reason) = override_reason {
+            self.audit(
+                session_id,
+                agent_id,
+                agent_org,
+                AuditKind::AdminOverride { reason },
+            );
+        }
 
         // Phase 4 — owner-side consent: hand the API layer what it needs to notify
         // the owner (it resolves the owner from `agent_id`). Best-effort; with no
@@ -667,6 +681,11 @@ pub struct DispatchCtx {
     /// and sets it here; `create_session` forwards it to the agent. Ignored for
     /// non-request messages and agent-role dispatch (defaults to `Prompt`).
     pub consent_mode: ConsentMode,
+    /// Phase 5 — a VALIDATED admin break-glass reason (the API gate confirmed the
+    /// controller is an `ADMINISTRATOR` forcing a device they don't own). `Some`
+    /// ⇒ consent was skipped; `create_session` records an `AdminOverride` audit.
+    /// The `SessionRequest` wire field is NOT trusted directly — only this.
+    pub override_reason: Option<String>,
 }
 
 impl Hub {
@@ -680,6 +699,9 @@ impl Hub {
                     browser_caps,
                     preferred_transport,
                     chroma_pref,
+                    // Ignored here — the Hub can't validate admin; the API gate
+                    // validates the wire field and re-supplies it via `ctx`.
+                    override_reason: _,
                 },
             ) => {
                 // Forward browser codec caps verbatim to the agent in
@@ -703,6 +725,7 @@ impl Hub {
                     preferred_transport,
                     chroma_pref,
                     ctx.consent_mode,
+                    ctx.override_reason.clone(),
                 )?;
                 Ok(())
             }
@@ -777,6 +800,7 @@ mod tests {
             None,
             None, // chroma_pref
             ConsentMode::Prompt,
+            None, // override_reason
         );
         assert!(matches!(res, Err(Error::AgentOffline(_))));
     }
@@ -799,6 +823,7 @@ mod tests {
                 None,
                 None, // chroma_pref
                 ConsentMode::Prompt,
+                None, // override_reason
             )
             .unwrap();
 
