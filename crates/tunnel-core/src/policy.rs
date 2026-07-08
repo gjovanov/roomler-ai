@@ -608,6 +608,7 @@ mod tests {
             id: Some(ObjectId::new()),
             tenant_id,
             owner_user_id: ObjectId::new(),
+            enrolled_by: None,
             name: "test-agent".into(),
             machine_id: "m".into(),
             os: OsKind::Linux,

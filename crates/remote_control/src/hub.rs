@@ -20,13 +20,18 @@ use tracing::{info, warn};
 use crate::audit::AuditSink;
 use crate::consent::{ConsentOutcome, DEFAULT_CONSENT_TIMEOUT};
 use crate::error::{Error, Result};
-use crate::models::{AuditKind, EndReason, OsKind, SessionPhase};
+use crate::models::{AuditKind, ConsentMode, EndReason, OsKind, SessionPhase};
 use crate::permissions::Permissions;
 use crate::session::{ClientTx, LiveSession};
 use crate::signaling::{AgentCloseReason, ClientMsg, Role, ServerMsg};
 use crate::turn_creds::{TurnConfig, ice_servers_for};
 
 const SERVER_TX_CAPACITY: usize = 64;
+
+/// Consent window for owner-side channels (Email/Push) — the owner has to read a
+/// mail / tap a push, so it's far longer than the 30 s on-host prompt
+/// ([`DEFAULT_CONSENT_TIMEOUT`]). Also bounds the `ConsentRequest` link TTL.
+const ASYNC_CONSENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -52,6 +57,32 @@ pub struct ConnectedController {
     pub tx: ClientTx,
 }
 
+/// Emitted by [`Hub::create_session`] to have the API layer notify the device
+/// OWNER. Two flavours, distinguished by `override_reason`:
+/// * `None` — Email/Push consent modes: the owner must APPROVE (the API persists
+///   a `ConsentRequest` + sends the approve-link; the owner's approve/deny later
+///   calls [`Hub::deliver_consent`], resolving the SAME slot the waiter awaits).
+/// * `Some(reason)` — an admin break-glass already happened: an INFORMATIONAL
+///   "your device was accessed" notice (no approval needed, no token).
+///
+/// The Hub stays DB-agnostic — it just publishes; the API consumer resolves the
+/// owner from `agent_id`.
+#[derive(Debug, Clone)]
+pub struct ConsentEvent {
+    pub session_id: ObjectId,
+    pub agent_id: ObjectId,
+    pub tenant_id: ObjectId,
+    pub controller_user_id: ObjectId,
+    pub controller_name: String,
+    pub mode: ConsentMode,
+    /// Same window the waiter uses — the consumer sizes the `ConsentRequest`
+    /// TTL to match so a stale link can't resolve a long-gone session.
+    pub timeout_secs: u32,
+    /// `Some` ⇒ this is a break-glass NOTICE (already-granted), carrying the
+    /// admin's reason; `None` ⇒ an Email/Push APPROVAL request.
+    pub override_reason: Option<String>,
+}
+
 pub struct HubInner {
     /// Online agents, keyed by agent_id.
     agents: DashMap<ObjectId, ConnectedAgent>,
@@ -67,6 +98,11 @@ pub struct HubInner {
 
     /// Audit sink.
     audit: AuditSink,
+
+    /// Phase 4 — async-consent event sink (Email/Push). `None` (tests / no email
+    /// configured) drops the events and those sessions fall back to the waiter
+    /// timeout.
+    consent_tx: Option<mpsc::Sender<ConsentEvent>>,
 }
 
 #[derive(Clone)]
@@ -76,6 +112,15 @@ pub struct Hub {
 
 impl Hub {
     pub fn new(audit: AuditSink, turn: Option<TurnConfig>) -> Self {
+        Self::new_with_consent(audit, turn, None)
+    }
+
+    /// Like [`Hub::new`] but wires the Phase-4 async-consent event sender.
+    pub fn new_with_consent(
+        audit: AuditSink,
+        turn: Option<TurnConfig>,
+        consent_tx: Option<mpsc::Sender<ConsentEvent>>,
+    ) -> Self {
         Self {
             inner: Arc::new(HubInner {
                 agents: DashMap::new(),
@@ -83,6 +128,7 @@ impl Hub {
                 controllers: DashMap::new(),
                 turn,
                 audit,
+                consent_tx,
             }),
         }
     }
@@ -280,6 +326,8 @@ impl Hub {
         browser_caps: Vec<String>,
         preferred_transport: Option<String>,
         chroma_pref: Option<String>,
+        consent_mode: ConsentMode,
+        override_reason: Option<String>,
     ) -> Result<ObjectId> {
         let agent_org = {
             let mut agent = self
@@ -313,27 +361,74 @@ impl Hub {
             agent_id,
         });
 
-        // Move to AwaitingConsent and tell the agent.
+        // Per-mode consent window: owner-side channels (Email/Push) get a much
+        // longer window than the on-host prompt.
+        let timeout = match consent_mode {
+            ConsentMode::Email | ConsentMode::Push => ASYNC_CONSENT_TIMEOUT,
+            _ => DEFAULT_CONSENT_TIMEOUT,
+        };
+
+        // Move to AwaitingConsent and tell the agent. The agent always gets the
+        // Request (it needs the codec / transport context) + the mode directive;
+        // for Email/Push it will NOT respond — the owner resolves the slot.
         self.with_session(session_id, |s| s.transition(SessionPhase::AwaitingConsent))?;
         let agent_tx = self.agent_tx(agent_id)?;
         let _ = agent_tx.try_send(ServerMsg::Request {
             session_id,
             controller_user_id,
-            controller_name,
+            controller_name: controller_name.clone(),
             permissions,
-            consent_timeout_secs: DEFAULT_CONSENT_TIMEOUT.as_secs() as u32,
+            consent_timeout_secs: timeout.as_secs() as u32,
             browser_caps,
             preferred_transport,
             chroma_pref,
+            // Server-authoritative directive: the agent obeys this rather than
+            // its local `auto_grant_session`. `Auto` → immediate grant;
+            // `Prompt` → on-host prompt; `Email`/`Push` → wait (owner resolves).
+            consent_mode: Some(consent_mode),
         });
 
         self.audit(session_id, agent_id, agent_org, AuditKind::SessionRequested);
         self.audit(session_id, agent_id, agent_org, AuditKind::ConsentPrompted);
 
+        // Phase 5 — record the break-glass BEFORE the session proceeds. The API
+        // gate only sets `override_reason` for a validated `ADMINISTRATOR` force;
+        // `consent_mode` was resolved to `Auto` alongside it, so consent is
+        // skipped and this audit is the accountability trail for it.
+        let override_for_notify = override_reason.clone();
+        if let Some(reason) = override_reason {
+            self.audit(
+                session_id,
+                agent_id,
+                agent_org,
+                AuditKind::AdminOverride { reason },
+            );
+        }
+
+        // Phase 4/5 — owner-side notification: an Email/Push APPROVAL request, or
+        // (when a break-glass just happened) an informational "your device was
+        // accessed" NOTICE. Best-effort; the API consumer resolves the owner from
+        // `agent_id`. With no consumer wired the session relies on the waiter.
+        if (matches!(consent_mode, ConsentMode::Email | ConsentMode::Push)
+            || override_for_notify.is_some())
+            && let Some(tx) = &self.inner.consent_tx
+        {
+            let _ = tx.try_send(ConsentEvent {
+                session_id,
+                agent_id,
+                tenant_id: agent_org,
+                controller_user_id,
+                controller_name,
+                mode: consent_mode,
+                timeout_secs: timeout.as_secs() as u32,
+                override_reason: override_for_notify,
+            });
+        }
+
         // Spawn the consent watcher.
         let hub = self.clone();
         tokio::spawn(async move {
-            let outcome = waiter.wait(DEFAULT_CONSENT_TIMEOUT).await;
+            let outcome = waiter.wait(timeout).await;
             hub.handle_consent_outcome(session_id, outcome);
         });
 
@@ -591,6 +686,17 @@ pub struct DispatchCtx {
     pub agent_id: Option<ObjectId>, // Some for Agent
     pub controller_name: Option<String>,
     pub controller_tx: Option<ClientTx>,
+    /// Phase 2 — the server-resolved consent mode for a controller's
+    /// `SessionRequest` (self-control → `Auto`; else the device's effective
+    /// mode). The API WS layer computes it (it has the DB access the Hub lacks)
+    /// and sets it here; `create_session` forwards it to the agent. Ignored for
+    /// non-request messages and agent-role dispatch (defaults to `Prompt`).
+    pub consent_mode: ConsentMode,
+    /// Phase 5 — a VALIDATED admin break-glass reason (the API gate confirmed the
+    /// controller is an `ADMINISTRATOR` forcing a device they don't own). `Some`
+    /// ⇒ consent was skipped; `create_session` records an `AdminOverride` audit.
+    /// The `SessionRequest` wire field is NOT trusted directly — only this.
+    pub override_reason: Option<String>,
 }
 
 impl Hub {
@@ -604,6 +710,9 @@ impl Hub {
                     browser_caps,
                     preferred_transport,
                     chroma_pref,
+                    // Ignored here — the Hub can't validate admin; the API gate
+                    // validates the wire field and re-supplies it via `ctx`.
+                    override_reason: _,
                 },
             ) => {
                 // Forward browser codec caps verbatim to the agent in
@@ -626,6 +735,8 @@ impl Hub {
                     browser_caps,
                     preferred_transport,
                     chroma_pref,
+                    ctx.consent_mode,
+                    ctx.override_reason.clone(),
                 )?;
                 Ok(())
             }
@@ -699,6 +810,8 @@ mod tests {
             Vec::new(),
             None,
             None, // chroma_pref
+            ConsentMode::Prompt,
+            None, // override_reason
         );
         assert!(matches!(res, Err(Error::AgentOffline(_))));
     }
@@ -720,6 +833,8 @@ mod tests {
                 Vec::new(),
                 None,
                 None, // chroma_pref
+                ConsentMode::Prompt,
+                None, // override_reason
             )
             .unwrap();
 

@@ -9,7 +9,7 @@
 use roomler_agent::config::{self, AgentConfig};
 use roomler_agent::enrollment::{self, EnrollInputs};
 use roomler_agent::{logging, notify};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -287,6 +287,47 @@ pub fn cmd_consent_deny(session: String) -> Result<String, String> {
         .write_sentinel(&session, roomler_agent::consent::SentinelKind::Deny)
         .map_err(|e| format!("Writing sentinel: {e}"))?;
     Ok(path.to_string_lossy().into_owned())
+}
+
+/// One pending remote-control consent request, parsed from a
+/// `<session>.pending` marker the agent drops in the shared consent dir. Shape
+/// mirrors the JSON written by `roomler-agent`'s signaling layer.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PendingConsent {
+    pub session_id: String,
+    #[serde(default)]
+    pub controller_name: String,
+    /// Pipe-separated permission names (serde form of the agent's `Permissions`).
+    #[serde(default)]
+    pub permissions: String,
+    #[serde(default)]
+    pub timeout_secs: u64,
+}
+
+/// List consent requests currently awaiting a decision — the `.pending` markers
+/// the agent wrote. The SPA polls this to render the Approve/Deny modal. A
+/// missing dir / unparseable marker is skipped, never an error (the tray must
+/// stay quiet when nothing is pending).
+#[tauri::command]
+pub fn cmd_get_pending_consents() -> Result<Vec<PendingConsent>, String> {
+    let dir = roomler_agent::consent::ConsentBroker::default_sentinel_dir()
+        .map_err(|e| format!("Consent dir: {e}"))?;
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Ok(out); // dir not created yet ⇒ nothing pending
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("pending") {
+            continue;
+        }
+        if let Ok(body) = std::fs::read_to_string(&path)
+            && let Ok(pc) = serde_json::from_str::<PendingConsent>(&body)
+        {
+            out.push(pc);
+        }
+    }
+    Ok(out)
 }
 
 // ─── helpers ───────────────────────────────────────────────────────

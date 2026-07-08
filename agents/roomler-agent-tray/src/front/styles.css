@@ -201,3 +201,65 @@ textarea {
   word-break: break-all;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
+
+/* ── Phase 3: remote-control consent modal (consent.js) ────────────── */
+#consent-modal[hidden] {
+  display: none;
+}
+#consent-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.consent-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+}
+.consent-card {
+  position: relative;
+  z-index: 1;
+  width: min(420px, calc(100vw - 32px));
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 20px 22px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+}
+.consent-card h2 {
+  margin: 0 0 10px;
+  font-size: 18px;
+}
+.consent-lead {
+  margin: 0 0 8px;
+}
+.consent-perms {
+  margin: 0 0 16px;
+  color: var(--muted);
+  font-size: 13px;
+}
+.consent-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+.consent-btn {
+  min-width: 96px;
+}
+.consent-approve {
+  background: var(--primary);
+  color: #fff;
+  border-color: var(--primary);
+}
+.consent-deny {
+  background: var(--bg-elev);
+  color: var(--error);
+  border-color: var(--error);
+}
+.consent-hint {
+  margin: 12px 0 0;
+  min-height: 1em;
+}

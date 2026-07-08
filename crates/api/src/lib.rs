@@ -299,6 +299,13 @@ pub fn build_router(state: AppState) -> Router {
         // directly.
         .route("/crash", post(routes::agent_crash::ingest));
 
+    // Public owner-consent routes (Phase 4). No auth extractor — the unguessable
+    // token IS the capability; the handler validates it, single-uses it, and
+    // resolves the session's consent slot via the Hub.
+    let public_consent_routes = Router::new()
+        .route("/{token}/approve", post(routes::consent::approve_consent))
+        .route("/{token}/deny", post(routes::consent::deny_consent));
+
     // roomler-tunnel routes — same enrollment two-step shape as the
     // agent, but a distinct audience (`TunnelClient` JWT) so a leaked
     // agent token can't impersonate a client and vice-versa. CRUD +
@@ -390,6 +397,7 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/push", push_routes)
         .nest("/notification", notification_routes)
         .nest("/agent", public_agent_routes)
+        .nest("/consent", public_consent_routes)
         .nest("/tunnel-client", public_tunnel_routes)
         .nest("/tunnel", public_tunnel_release_routes)
         .nest("/tunnel-wizard", public_tunnel_wizard_routes)
