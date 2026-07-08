@@ -91,8 +91,9 @@ pub async fn handle_agent_socket(
         controller_name: None,
         controller_tx: None,
         // Unused for agent-role dispatch (only a controller's SessionRequest
-        // consumes it); a harmless default.
+        // consumes these); harmless defaults.
         consent_mode: ConsentMode::Prompt,
+        override_reason: None,
     };
 
     // Read loop. rc.53: wrapped in `tokio::select!` so the Hub's
@@ -243,6 +244,7 @@ pub fn dispatch_controller_rc(
     controller_tx: &roomler_ai_remote_control::session::ClientTx,
     text: &str,
     consent_mode: ConsentMode,
+    override_reason: Option<String>,
 ) -> bool {
     let Ok(parsed) = serde_json::from_str::<ClientMsg>(text) else {
         return false;
@@ -254,6 +256,7 @@ pub fn dispatch_controller_rc(
         controller_name: Some(controller_name.to_string()),
         controller_tx: Some(controller_tx.clone()),
         consent_mode,
+        override_reason,
     };
     if let Err(e) = hub.dispatch(&ctx, parsed) {
         warn!(%user_id, %e, "rc:* dispatch failed (controller)");
@@ -269,31 +272,54 @@ pub fn dispatch_controller_rc(
     true
 }
 
+/// Result of the session authz gate: the effective consent mode plus a VALIDATED
+/// admin break-glass reason (Phase 5). `override_reason` is `Some` only when an
+/// `ADMINISTRATOR` force-started a device they don't own with a non-empty reason
+/// — in which case `mode` is `Auto` (consent skipped) and the Hub records an
+/// `AdminOverride` audit.
+pub struct SessionAuthz {
+    pub mode: ConsentMode,
+    pub override_reason: Option<String>,
+}
+
+impl SessionAuthz {
+    fn allow(mode: ConsentMode) -> Self {
+        Self {
+            mode,
+            override_reason: None,
+        }
+    }
+}
+
 /// Authorization + consent-mode gate for `rc:session.request` — the Hub can't
 /// do this because the `remote_control` crate sits below `services` in the dep
-/// graph and has no access to tenant roles. Returns `Ok(consent_mode)` for an
-/// allowed request (the effective mode the agent should apply), or `Err(reason)`
-/// to DENY. A non-`SessionRequest` rc:* message returns `Ok(Prompt)` — those are
-/// intra-session and the mode is unused (only `create_session` reads it).
+/// graph and has no access to tenant roles. Returns `Ok(SessionAuthz)` for an
+/// allowed request, or `Err(reason)` to DENY. A non-`SessionRequest` rc:* message
+/// returns `Ok(allow(Prompt))` — those are intra-session and the mode is unused.
 ///
-/// Layers (the consent-model plan's coarse→fine authz): quarantine → self-control
-/// → tenant capability (`ADMINISTRATOR` break-glass / `REMOTE_CONTROL`) →
-/// per-agent allowlist (an empty allowlist = no per-device restriction). The
-/// resolved consent mode is: self-control → `Auto`; otherwise the device's
-/// `AccessPolicy.effective_consent_mode()` (per-device override, else `Prompt` =
-/// attended). Break-glass (admin skips consent) is Phase 5.
+/// Layers (coarse→fine authz): quarantine → self-control → tenant capability
+/// (`ADMINISTRATOR` / `REMOTE_CONTROL`) → per-agent allowlist (empty = no
+/// per-device restriction). Consent mode: self-control → `Auto`; else the
+/// device's `effective_consent_mode()`. **Break-glass (Phase 5):** an
+/// `ADMINISTRATOR` who sends a non-empty `override_reason` for a device they
+/// don't own gets `Auto` (consent skipped) + the reason carried through for the
+/// `AdminOverride` audit.
 pub async fn resolve_session_authz(
     state: &AppState,
     controller_user_id: ObjectId,
     text: &str,
-) -> Result<ConsentMode, String> {
+) -> Result<SessionAuthz, String> {
     use roomler_ai_db::models::role::permissions;
     use roomler_ai_remote_control::models::AgentStatus;
 
-    let agent_id = match serde_json::from_str::<ClientMsg>(text) {
-        Ok(ClientMsg::SessionRequest { agent_id, .. }) => agent_id,
+    let (agent_id, override_reason) = match serde_json::from_str::<ClientMsg>(text) {
+        Ok(ClientMsg::SessionRequest {
+            agent_id,
+            override_reason,
+            ..
+        }) => (agent_id, override_reason),
         // Not a session request → the mode is unused; allow through.
-        _ => return Ok(ConsentMode::Prompt),
+        _ => return Ok(SessionAuthz::allow(ConsentMode::Prompt)),
     };
 
     // Unknown / soft-deleted agent → let the Hub answer with a clean
@@ -301,7 +327,7 @@ pub async fn resolve_session_authz(
     // create_session will fail on the agent lookup).
     let agent = match state.agents.base.find_by_id(agent_id).await {
         Ok(a) if a.deleted_at.is_none() => a,
-        _ => return Ok(ConsentMode::Prompt),
+        _ => return Ok(SessionAuthz::allow(ConsentMode::Prompt)),
     };
 
     if agent.status == AgentStatus::Quarantined {
@@ -310,7 +336,7 @@ pub async fn resolve_session_authz(
 
     // Controlling your OWN device is always allowed AND auto-consents.
     if agent.owner_user_id == controller_user_id {
-        return Ok(ConsentMode::Auto);
+        return Ok(SessionAuthz::allow(ConsentMode::Auto));
     }
 
     // The effective mode for an allowed non-owner controller (attended default).
@@ -321,11 +347,17 @@ pub async fn resolve_session_authz(
         .get_member_permissions(agent.tenant_id, controller_user_id)
         .await
         .unwrap_or(0);
-    // ADMINISTRATOR is the break-glass bypass for AUTHZ (Phase 5 adds the
-    // consent-skip + mandatory reason + owner notification); they still get the
-    // device's consent mode here.
     if permissions::has(perms, permissions::ADMINISTRATOR) {
-        return Ok(mode);
+        // Phase 5 break-glass: an ADMINISTRATOR may SKIP consent, but only with a
+        // non-empty reason. A blank/absent reason ⇒ the admin gets the device's
+        // normal consent mode (no forced override).
+        if let Some(reason) = override_reason.filter(|r| !r.trim().is_empty()) {
+            return Ok(SessionAuthz {
+                mode: ConsentMode::Auto,
+                override_reason: Some(reason),
+            });
+        }
+        return Ok(SessionAuthz::allow(mode));
     }
     if !permissions::has(perms, permissions::REMOTE_CONTROL) {
         return Err("you don't have permission to control others' devices".to_string());
@@ -335,10 +367,10 @@ pub async fn resolve_session_authz(
     // request; consent is the real gate). Non-empty ⇒ user or a role must match.
     let policy = &agent.access_policy;
     if policy.allowed_user_ids.is_empty() && policy.allowed_role_ids.is_empty() {
-        return Ok(mode);
+        return Ok(SessionAuthz::allow(mode));
     }
     if policy.allowed_user_ids.contains(&controller_user_id) {
-        return Ok(mode);
+        return Ok(SessionAuthz::allow(mode));
     }
     let role_ids = state
         .tenants
@@ -346,7 +378,7 @@ pub async fn resolve_session_authz(
         .await
         .unwrap_or_default();
     if policy.allowed_role_ids.iter().any(|r| role_ids.contains(r)) {
-        return Ok(mode);
+        return Ok(SessionAuthz::allow(mode));
     }
     Err("you're not on this device's control allowlist".to_string())
 }

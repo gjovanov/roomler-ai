@@ -238,6 +238,13 @@ pub enum ClientMsg {
         /// matching server-side [`ServerMsg::SessionRequest`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
         chroma_pref: Option<String>,
+        /// Phase 5 — admin break-glass. When an `ADMINISTRATOR` force-starts a
+        /// session against a device they don't own, this carries the mandatory
+        /// reason. The API gate VALIDATES it (admin + non-owner); a non-admin
+        /// setting it has no effect. A validated override skips consent (`Auto`)
+        /// and is recorded as `AuditKind::AdminOverride`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        override_reason: Option<String>,
     },
 
     /// Controller sends an SDP offer (after consent granted).
@@ -968,6 +975,7 @@ mod tests {
             browser_caps: vec!["h264".into(), "h265".into()],
             preferred_transport: None,
             chroma_pref: None,
+            override_reason: None,
         };
         let s = serde_json::to_string(&req).unwrap();
         assert!(!s.contains("$oid"));
@@ -987,6 +995,7 @@ mod tests {
             browser_caps: vec![],
             preferred_transport: Some("data-channel-vp9-444".into()),
             chroma_pref: None,
+            override_reason: None,
         };
         let s = serde_json::to_string(&req_with_t).unwrap();
         assert!(s.contains("\"preferred_transport\":\"data-channel-vp9-444\""));
