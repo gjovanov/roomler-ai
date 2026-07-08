@@ -211,6 +211,76 @@ impl EmailService {
         self.send(to_email, &subject, &html).await
     }
 
+    /// Notify a device owner that a remote-control session is awaiting their
+    /// approval. Links to the in-app consent page (Approve/Deny live there, as
+    /// authenticated POSTs) rather than an approve endpoint directly, so an
+    /// email prefetcher can't auto-approve via a GET.
+    pub async fn send_consent_request(
+        &self,
+        to_email: &str,
+        controller_name: &str,
+        device_name: &str,
+        consent_url: &str,
+    ) -> anyhow::Result<()> {
+        let subject = format!("Approve remote control of {device_name}?");
+        let html = format!(
+            r#"<div style="font-family: sans-serif; max-width: 600px; margin: 0 auto;">
+<h2>Remote control request</h2>
+<p><strong>{controller}</strong> is requesting to remotely control your device <strong>{device}</strong>.</p>
+<p style="margin: 24px 0;">
+  <a href="{url}" style="background: #1976d2; color: #fff; padding: 12px 24px; border-radius: 6px; text-decoration: none; font-weight: bold;">
+    Review request
+  </a>
+</p>
+<p style="color: #666; font-size: 13px;">
+  Or copy this link: <a href="{url}">{url}</a>
+</p>
+<p style="color: #b45309; font-size: 12px;">
+  If you didn't expect this, open the link and deny — the session cannot start
+  without your approval, and the link expires shortly.
+</p>
+<p style="color: #999; font-size: 12px; margin-top: 32px;">— The Roomler Team</p>
+</div>"#,
+            controller = controller_name,
+            device = device_name,
+            url = consent_url,
+        );
+        self.send(to_email, &subject, &html).await
+    }
+
+    /// Notify a device owner that their device was accessed via an ADMINISTRATOR
+    /// break-glass (Phase 5) — informational, no action needed. `reason` is the
+    /// operator-supplied justification, recorded in the audit log too.
+    pub async fn send_override_notice(
+        &self,
+        to_email: &str,
+        admin_name: &str,
+        device_name: &str,
+        reason: &str,
+    ) -> anyhow::Result<()> {
+        let subject = format!("Your device {device_name} was accessed by an administrator");
+        let html = format!(
+            r#"<div style="font-family: sans-serif; max-width: 600px; margin: 0 auto;">
+<h2>Device accessed via administrator override</h2>
+<p><strong>{admin}</strong> started a remote-control session on your device
+<strong>{device}</strong> using an administrator break-glass — <em>without</em> the usual
+consent prompt.</p>
+<p style="background: #fff7ed; border-left: 4px solid #b45309; padding: 8px 12px;">
+  Reason given: {reason}
+</p>
+<p style="color: #666; font-size: 13px;">
+  If this was unexpected, contact your tenant administrator. This access is recorded in
+  the remote-control audit log.
+</p>
+<p style="color: #999; font-size: 12px; margin-top: 32px;">— The Roomler Team</p>
+</div>"#,
+            admin = admin_name,
+            device = device_name,
+            reason = reason,
+        );
+        self.send(to_email, &subject, &html).await
+    }
+
     /// Send a mention notification email.
     pub async fn send_mention_notification(
         &self,

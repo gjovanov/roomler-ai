@@ -16,7 +16,7 @@
 use bson::oid::ObjectId;
 use serde::{Deserialize, Serialize};
 
-use crate::models::{AgentCaps, DisplayInfo, EndReason, OsKind};
+use crate::models::{AgentCaps, ConsentMode, DisplayInfo, EndReason, OsKind};
 use crate::permissions::Permissions;
 use crate::serde_helpers::{oid_hex, option_oid_hex, vec_oid_hex};
 
@@ -238,6 +238,13 @@ pub enum ClientMsg {
         /// matching server-side [`ServerMsg::SessionRequest`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
         chroma_pref: Option<String>,
+        /// Phase 5 — admin break-glass. When an `ADMINISTRATOR` force-starts a
+        /// session against a device they don't own, this carries the mandatory
+        /// reason. The API gate VALIDATES it (admin + non-owner); a non-admin
+        /// setting it has no effect. A validated override skips consent (`Auto`)
+        /// and is recorded as `AuditKind::AdminOverride`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        override_reason: Option<String>,
     },
 
     /// Controller sends an SDP offer (after consent granted).
@@ -562,6 +569,14 @@ pub enum ServerMsg {
         /// `ROOMLER_AGENT_VP9_CHROMA` env-var default".
         #[serde(default, skip_serializing_if = "Option::is_none")]
         chroma_pref: Option<String>,
+        /// Phase 2 — server-authoritative consent directive. `None` (an older
+        /// server that predates consent modes) → the agent falls back to its
+        /// local `auto_grant_session` config; `Some(mode)` → the agent OBEYS:
+        /// `Auto` grants immediately with no prompt, everything else runs the
+        /// on-host prompt path. Resolved server-side from the device's
+        /// `AccessPolicy.consent_mode` (self-control → `Auto`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        consent_mode: Option<ConsentMode>,
     },
 
     /// Server forwards SDP offer from controller → agent.
@@ -960,6 +975,7 @@ mod tests {
             browser_caps: vec!["h264".into(), "h265".into()],
             preferred_transport: None,
             chroma_pref: None,
+            override_reason: None,
         };
         let s = serde_json::to_string(&req).unwrap();
         assert!(!s.contains("$oid"));
@@ -979,6 +995,7 @@ mod tests {
             browser_caps: vec![],
             preferred_transport: Some("data-channel-vp9-444".into()),
             chroma_pref: None,
+            override_reason: None,
         };
         let s = serde_json::to_string(&req_with_t).unwrap();
         assert!(s.contains("\"preferred_transport\":\"data-channel-vp9-444\""));

@@ -133,6 +133,20 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> 
     )
     .await?;
 
+    // Consent requests (Phase 4 — owner email/push consent). Unique capability
+    // token; lookup by session; TTL-swept at `expires_at` (expireAfterSeconds=0
+    // ⇒ the doc's own date is the expiry).
+    create_indexes(
+        db,
+        "consent_requests",
+        vec![
+            index_unique(bson::doc! { "token": 1 }),
+            index(bson::doc! { "session_id": 1 }),
+            index_ttl(bson::doc! { "expires_at": 1 }, 0),
+        ],
+    )
+    .await?;
+
     // Background Tasks
     create_indexes(
         db,

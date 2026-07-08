@@ -21,12 +21,13 @@
 //! 30 s timeout → auto-deny. Outcome propagates back through the
 //! [`ConsentBroker::request`] future the signaling layer awaits.
 //!
-//! The tray-icon UX described in the planner's spec is deferred to
-//! a follow-up: building cross-platform `tray-icon` infrastructure
-//! is a sizable extra dep tree (GTK on Linux, separate event-loop
-//! thread on Windows) and the CLI fallback already meets the v1
-//! security need of "no automatic grant on org hosts." Operators who
-//! want a GUI prompt will land it in a 0.4.x cycle.
+//! The tray popup (Phase 3) now renders this prompt on attended
+//! sessions: the signaling layer calls [`ConsentBroker::write_pending`]
+//! to drop a `<session>.pending` marker in this same dir, the
+//! `roomler-agent-tray` companion watches for it and shows an
+//! Approve/Deny modal, and the operator's choice writes the same
+//! `.approve`/`.deny` sentinel the poll loop below already consumes.
+//! The CLI subcommand remains a headless fallback.
 //!
 //! Audit lifecycle: hub.rs already emits
 //! [`AuditKind::ConsentPrompted`] on `rc:request` send and
@@ -189,6 +190,17 @@ impl ConsentBroker {
     /// stale `.approve` files won't accidentally pre-approve a
     /// future session.
     pub async fn request(&self, session_hex: &str) -> Decision {
+        self.request_with_mode(session_hex, self.inner.mode).await
+    }
+
+    /// Like [`request`], but drives the decision with an explicit per-session
+    /// `mode` — the server's Phase-2 consent directive
+    /// (`ServerMsg::Request { consent_mode }`) — instead of the broker's startup
+    /// mode. Server-authoritative consent: the agent obeys the server rather
+    /// than its local `auto_grant_session`. The sentinel dir + poll loop are
+    /// shared state, so a broker built for `AutoGrant` can still prompt on
+    /// demand when the server directs a `Prompt`.
+    pub async fn request_with_mode(&self, session_hex: &str, mode: Mode) -> Decision {
         // Reject anything that doesn't look like a hex session id.
         // Stops a stray empty-string request from scanning the
         // entire sentinel dir.
@@ -196,7 +208,7 @@ impl ConsentBroker {
             tracing::warn!(session = session_hex, "consent request with implausible id");
             return Decision::Denied;
         }
-        match self.inner.mode {
+        match mode {
             Mode::AutoGrant => Decision::Granted,
             Mode::Prompt { timeout } => self.run_prompt(session_hex, timeout).await,
         }
@@ -237,6 +249,10 @@ impl ConsentBroker {
         // doesn't see a stale decision.
         let _ = std::fs::remove_file(&approve);
         let _ = std::fs::remove_file(&deny);
+        // Also clear the `.pending` request marker the tray watches, so a
+        // resolved prompt disappears from the tray immediately (best-effort;
+        // absent when the request came without one — e.g. the CLI path).
+        let _ = std::fs::remove_file(self.pending_path(session_hex));
         {
             let mut pending = self.inner.pending.lock().await;
             pending.remove(session_hex);
@@ -259,6 +275,36 @@ impl ConsentBroker {
             .unwrap_or(0);
         std::fs::write(&path, format!("{now_ts}\n"))
             .with_context(|| format!("writing sentinel {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path)?.permissions();
+            perms.set_mode(0o600);
+            std::fs::set_permissions(&path, perms)?;
+        }
+        Ok(path)
+    }
+
+    /// Path of the `.pending` request marker for `session_hex`. Distinct from the
+    /// `.approve`/`.deny` decision sentinels: this one is written by the AGENT
+    /// (not the operator) when an attended session is awaiting a decision, so the
+    /// tray can discover it and pop a prompt. Removed when the decision resolves.
+    pub fn pending_path(&self, session_hex: &str) -> PathBuf {
+        self.inner
+            .sentinel_dir
+            .join(format!("{session_hex}.pending"))
+    }
+
+    /// Write the `.pending` request marker (`body` = JSON describing the request:
+    /// controller, permissions, timeout) for `session_hex`. Called by the
+    /// signaling layer, which holds that metadata, right before an attended
+    /// prompt begins. The tray watches for these files; the poll loop removes
+    /// this one when the decision resolves. Best-effort — a write failure just
+    /// means the tray falls back to its CLI-less state; the CLI path still works.
+    pub fn write_pending(&self, session_hex: &str, body: &str) -> Result<PathBuf> {
+        let path = self.pending_path(session_hex);
+        std::fs::write(&path, body)
+            .with_context(|| format!("writing pending marker {}", path.display()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -360,6 +406,91 @@ mod tests {
             "auto-grant must not block on any I/O"
         );
         // Cleanup
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn request_with_mode_overrides_startup_mode() {
+        // Server-authoritative consent (Phase 2): the per-session directive from
+        // `ServerMsg::Request { consent_mode }` wins over the broker's startup
+        // (`auto_grant_session`) mode in BOTH directions.
+        let dir = fixture_dir("directive");
+
+        // Startup = AutoGrant, but the server directs Prompt → we take the prompt
+        // path and (no sentinel) time out, proving auto-grant was NOT used.
+        let auto_broker = ConsentBroker::new(Mode::AutoGrant, dir.clone()).unwrap();
+        let d = auto_broker
+            .request_with_mode(
+                "aaaaaaaaaaaaaaaaaaaaaaaa",
+                Mode::Prompt {
+                    timeout: Duration::from_millis(80),
+                },
+            )
+            .await;
+        assert_eq!(
+            d,
+            Decision::Timeout,
+            "Prompt directive must override startup AutoGrant"
+        );
+
+        // Startup = Prompt, but the server directs Auto → immediate grant, no
+        // sentinel wait.
+        let prompt_broker = ConsentBroker::new(
+            Mode::Prompt {
+                timeout: Duration::from_secs(30),
+            },
+            dir.clone(),
+        )
+        .unwrap();
+        let start = Instant::now();
+        let d = prompt_broker
+            .request_with_mode("bbbbbbbbbbbbbbbbbbbbbbbb", Mode::AutoGrant)
+            .await;
+        assert_eq!(
+            d,
+            Decision::Granted,
+            "Auto directive must override startup Prompt"
+        );
+        assert!(start.elapsed() < Duration::from_millis(200));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn pending_marker_written_and_cleared_on_resolve() {
+        // Phase 3 — the signaling layer drops a `.pending` marker so the tray
+        // can prompt; the broker's poll loop clears it once the decision lands.
+        let dir = fixture_dir("pending");
+        let broker = ConsentBroker::new(
+            Mode::Prompt {
+                timeout: Duration::from_secs(5),
+            },
+            dir.clone(),
+        )
+        .unwrap();
+        let session = "cccccccccccccccccccccccc";
+
+        let pending = broker
+            .write_pending(session, r#"{"session_id":"c","controller_name":"x"}"#)
+            .unwrap();
+        assert!(pending.exists(), ".pending must exist while awaiting");
+        assert_eq!(broker.pending_path(session), pending);
+
+        // Operator approves → run the prompt to resolution, which clears .pending.
+        broker
+            .write_sentinel(session, SentinelKind::Approve)
+            .unwrap();
+        let decision = broker
+            .request_with_mode(
+                session,
+                Mode::Prompt {
+                    timeout: Duration::from_secs(5),
+                },
+            )
+            .await;
+        assert_eq!(decision, Decision::Granted);
+        assert!(!pending.exists(), ".pending must be cleared once resolved");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
