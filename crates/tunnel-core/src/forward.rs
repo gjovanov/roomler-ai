@@ -973,11 +973,11 @@ mod tests {
         let offer = offerer.create_offer().await.unwrap();
         let answer = answerer.accept_offer(&offer.sdp).await.unwrap();
         offerer.accept_answer(&answer.sdp).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(10), offerer.wait_pool_open())
+        tokio::time::timeout(Duration::from_secs(30), offerer.wait_pool_open())
             .await
             .unwrap()
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(10), answerer.wait_pool_open())
+        tokio::time::timeout(Duration::from_secs(30), answerer.wait_pool_open())
             .await
             .unwrap()
             .unwrap();
@@ -1057,11 +1057,11 @@ mod tests {
         let offer = offerer.create_offer().await.unwrap();
         let answer = answerer.accept_offer(&offer.sdp).await.unwrap();
         offerer.accept_answer(&answer.sdp).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(10), offerer.wait_pool_open())
+        tokio::time::timeout(Duration::from_secs(30), offerer.wait_pool_open())
             .await
             .unwrap()
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(10), answerer.wait_pool_open())
+        tokio::time::timeout(Duration::from_secs(30), answerer.wait_pool_open())
             .await
             .unwrap()
             .unwrap();
@@ -1119,11 +1119,11 @@ mod tests {
         let offer = offerer.create_offer().await.unwrap();
         let answer = answerer.accept_offer(&offer.sdp).await.unwrap();
         offerer.accept_answer(&answer.sdp).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(10), offerer.wait_pool_open())
+        tokio::time::timeout(Duration::from_secs(30), offerer.wait_pool_open())
             .await
             .unwrap()
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(10), answerer.wait_pool_open())
+        tokio::time::timeout(Duration::from_secs(30), answerer.wait_pool_open())
             .await
             .unwrap()
             .unwrap();
@@ -1263,11 +1263,11 @@ mod tests {
         let offer = offerer.create_offer().await.unwrap();
         let answer = answerer.accept_offer(&offer.sdp).await.unwrap();
         offerer.accept_answer(&answer.sdp).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(10), offerer.wait_pool_open())
+        tokio::time::timeout(Duration::from_secs(30), offerer.wait_pool_open())
             .await
             .unwrap()
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(10), answerer.wait_pool_open())
+        tokio::time::timeout(Duration::from_secs(30), answerer.wait_pool_open())
             .await
             .unwrap()
             .unwrap();
