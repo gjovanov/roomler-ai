@@ -541,6 +541,55 @@
           This agent is currently offline. The session will fail until the agent
           reconnects.
         </p>
+        <v-btn
+          variant="text"
+          size="small"
+          color="warning"
+          class="mt-3"
+          prepend-icon="mdi-shield-key-outline"
+          :disabled="!canConnect"
+          @click="forceDialogOpen = true"
+        >
+          Force control (admin break-glass)
+        </v-btn>
+
+        <!-- Phase 5 — admin break-glass. Starts the session skipping the device's
+             consent; only works for a tenant administrator (server-validated) and
+             is recorded in the audit log. -->
+        <v-dialog v-model="forceDialogOpen" max-width="460">
+        <v-card>
+          <v-card-title>Force control (break-glass)</v-card-title>
+          <v-card-text>
+            <p class="text-body-2 mb-3">
+              This starts the session <strong>without</strong> the device's consent.
+              It only works if you're a tenant administrator, and it's recorded in the
+              audit log. Enter a reason:
+            </p>
+            <v-textarea
+              v-model="forceReason"
+              label="Reason (required)"
+              rows="2"
+              auto-grow
+              autofocus
+              variant="outlined"
+              density="compact"
+              hide-details
+            />
+          </v-card-text>
+          <v-card-actions>
+            <v-spacer />
+            <v-btn variant="text" @click="forceDialogOpen = false">Cancel</v-btn>
+            <v-btn
+              color="warning"
+              variant="flat"
+              :disabled="!forceReason.trim()"
+              @click="confirmForce"
+            >
+              Force control
+            </v-btn>
+          </v-card-actions>
+        </v-card>
+        </v-dialog>
       </div>
 
       <div
@@ -2581,6 +2630,19 @@ async function loadAgent() {
 function startSession() {
   if (!agent.value) return
   rc.connect(agent.value.id)
+}
+
+// Phase 5 — admin break-glass. The reason is stashed on the composable and rides
+// the next `rc:session.request`; the server honours it only for a validated
+// administrator (a non-admin's request just falls back to normal consent).
+const forceDialogOpen = ref(false)
+const forceReason = ref('')
+function confirmForce() {
+  if (!forceReason.value.trim()) return
+  rc.overrideReason.value = forceReason.value.trim()
+  forceDialogOpen.value = false
+  forceReason.value = ''
+  startSession()
 }
 
 // When the remote stream becomes available, attach it to the video element.
