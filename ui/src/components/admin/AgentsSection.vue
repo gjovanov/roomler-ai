@@ -50,6 +50,7 @@
             <th>Name</th>
             <th>Status</th>
             <th>OS</th>
+            <th>Consent</th>
             <th>Codecs</th>
             <th>Last seen</th>
           </tr>
@@ -134,6 +135,20 @@
               <v-chip size="x-small" :prepend-icon="osIcon(a.os)" variant="tonal">
                 {{ a.os }}
               </v-chip>
+            </td>
+            <td>
+              <v-select
+                :model-value="a.access_policy.consent_mode ?? 'prompt'"
+                :items="CONSENT_MODE_ITEMS"
+                density="compact"
+                variant="plain"
+                hide-details
+                :disabled="consentBusy === a.id"
+                :loading="consentBusy === a.id"
+                class="consent-select"
+                :aria-label="`Consent mode for ${a.name}`"
+                @update:model-value="(m) => onConsentModeChange(a, m as ConsentMode)"
+              />
             </td>
             <td>
               <div v-if="codecChips(a).length === 0" class="text-caption text-medium-emphasis">—</div>
@@ -250,6 +265,19 @@
             <div class="text-caption text-medium-emphasis mb-2">
               Last seen: {{ fmtDate(a.last_seen_at) }}
             </div>
+            <v-select
+              :model-value="a.access_policy.consent_mode ?? 'prompt'"
+              :items="CONSENT_MODE_ITEMS"
+              label="Consent"
+              density="compact"
+              variant="outlined"
+              hide-details
+              :disabled="consentBusy === a.id"
+              :loading="consentBusy === a.id"
+              class="mb-2"
+              :aria-label="`Consent mode for ${a.name}`"
+              @update:model-value="(m) => onConsentModeChange(a, m as ConsentMode)"
+            />
             <div class="d-flex gap-2">
               <v-btn
                 size="small"
@@ -387,7 +415,12 @@
 <script setup lang="ts">
 import { ref, onMounted, watch } from 'vue'
 import { useDisplay } from 'vuetify'
-import { useAgentStore, type Agent, type EnrollmentToken } from '@/stores/agents'
+import {
+  useAgentStore,
+  type Agent,
+  type ConsentMode,
+  type EnrollmentToken,
+} from '@/stores/agents'
 import { codecChips } from './agentCodecChips'
 import AgentCrashesDialog from './AgentCrashesDialog.vue'
 import AgentLogsDialog from './AgentLogsDialog.vue'
@@ -395,6 +428,32 @@ import AgentLogsDialog from './AgentLogsDialog.vue'
 const props = defineProps<{ tenantId: string }>()
 
 const agentStore = useAgentStore()
+
+// Per-device consent mode. Email/Push route the request to the device OWNER
+// (approve-link) for unattended hosts; PromptThenEmail (host-then-email hybrid)
+// is not offered yet — it still behaves as host-prompt server-side.
+const CONSENT_MODE_ITEMS: { title: string; value: ConsentMode }[] = [
+  { title: 'Prompt on host (attended)', value: 'prompt' },
+  { title: 'Auto-grant (unattended)', value: 'auto' },
+  { title: 'Email the owner', value: 'email' },
+  { title: 'Push to the owner', value: 'push' },
+]
+// Agent id whose consent mode is mid-update (disables + spins that row's select).
+const consentBusy = ref<string | null>(null)
+async function onConsentModeChange(a: Agent, mode: ConsentMode) {
+  if ((a.access_policy.consent_mode ?? 'prompt') === mode) return
+  consentBusy.value = a.id
+  try {
+    await agentStore.updateAccessPolicy(props.tenantId, a.id, {
+      ...a.access_policy,
+      consent_mode: mode,
+    })
+  } catch (e) {
+    agentStore.error = (e as Error).message
+  } finally {
+    consentBusy.value = null
+  }
+}
 
 // `mobile` flips below sm (~600px) so the table stays usable on tablets
 // and small laptops; `lgAndDown` (≤1280) drives the codec-chip rollup so

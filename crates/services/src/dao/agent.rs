@@ -33,6 +33,7 @@ impl AgentDao {
             id: None,
             tenant_id,
             owner_user_id,
+            enrolled_by: Some(owner_user_id),
             name,
             machine_id,
             os,
@@ -204,5 +205,21 @@ impl AgentDao {
 
     pub async fn soft_delete(&self, tenant_id: ObjectId, agent_id: ObjectId) -> DaoResult<bool> {
         self.base.soft_delete_in_tenant(tenant_id, agent_id).await
+    }
+
+    /// Reassign the device owner (a `MANAGE_AGENTS` admin action). Leaves
+    /// `enrolled_by` untouched — that's the audit trail of who first enrolled it.
+    pub async fn update_owner(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        owner_user_id: ObjectId,
+    ) -> DaoResult<bool> {
+        self.base
+            .update_one(
+                doc! { "_id": agent_id, "tenant_id": tenant_id },
+                doc! { "$set": { "owner_user_id": owner_user_id } },
+            )
+            .await
     }
 }
