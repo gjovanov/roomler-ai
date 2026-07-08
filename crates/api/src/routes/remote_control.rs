@@ -9,6 +9,7 @@ use axum::{
     extract::{Path, Query, State},
 };
 use bson::{DateTime, oid::ObjectId};
+use roomler_ai_db::models::role::permissions;
 use roomler_ai_remote_control::{
     models::{AccessPolicy, AgentStatus, OsKind, RemoteAuditEvent, RemoteSession},
     permissions::Permissions,
@@ -21,6 +22,26 @@ use serde::{Deserialize, Serialize};
 use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
 
 const ENROLLMENT_TTL_SECS: u64 = 600; // 10 minutes per §11.1
+
+/// Require a `role::permissions` bit for `user_id` in `tenant_id`. Doubles as
+/// the membership check — `get_member_permissions` returns `Forbidden` for a
+/// non-member. `owner` always passes via the `ADMINISTRATOR` bypass in `has`.
+async fn require_permission(
+    state: &AppState,
+    tenant_id: ObjectId,
+    user_id: ObjectId,
+    flag: u64,
+    label: &str,
+) -> Result<(), ApiError> {
+    let perms = state
+        .tenants
+        .get_member_permissions(tenant_id, user_id)
+        .await?;
+    if !permissions::has(perms, flag) {
+        return Err(ApiError::Forbidden(format!("Missing {label} permission")));
+    }
+    Ok(())
+}
 
 // ────────────────────────────────────────────────────────────────────────────
 // Agent enrollment
@@ -44,9 +65,14 @@ pub async fn issue_enrollment_token(
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
 
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
-    }
+    require_permission(
+        &state,
+        tid,
+        auth.user_id,
+        permissions::MANAGE_AGENTS,
+        "MANAGE_AGENTS",
+    )
+    .await?;
 
     let (token, jti) = state
         .auth
@@ -210,6 +236,8 @@ pub async fn get_agent(
 pub struct UpdateAgentRequest {
     pub name: Option<String>,
     pub access_policy: Option<AccessPolicy>,
+    /// Reassign the device owner (hex user id). `MANAGE_AGENTS` only.
+    pub owner_user_id: Option<String>,
 }
 
 pub async fn update_agent(
@@ -223,10 +251,20 @@ pub async fn update_agent(
     let aid = ObjectId::parse_str(&agent_id)
         .map_err(|_| ApiError::BadRequest("Invalid agent_id".to_string()))?;
 
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
-    }
+    require_permission(
+        &state,
+        tid,
+        auth.user_id,
+        permissions::MANAGE_AGENTS,
+        "MANAGE_AGENTS",
+    )
+    .await?;
 
+    if let Some(owner) = body.owner_user_id {
+        let owner_id = ObjectId::parse_str(&owner)
+            .map_err(|_| ApiError::BadRequest("Invalid owner_user_id".to_string()))?;
+        state.agents.update_owner(tid, aid, owner_id).await?;
+    }
     if let Some(name) = body.name {
         state.agents.rename(tid, aid, &name).await?;
     }
@@ -247,9 +285,14 @@ pub async fn delete_agent(
     let aid = ObjectId::parse_str(&agent_id)
         .map_err(|_| ApiError::BadRequest("Invalid agent_id".to_string()))?;
 
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
-    }
+    require_permission(
+        &state,
+        tid,
+        auth.user_id,
+        permissions::MANAGE_AGENTS,
+        "MANAGE_AGENTS",
+    )
+    .await?;
 
     state.agents.soft_delete(tid, aid).await?;
     // rc.53: admin-driven kick — no tx identity to thread through;
@@ -337,9 +380,14 @@ pub async fn session_audit(
     let sid = ObjectId::parse_str(&session_id)
         .map_err(|_| ApiError::BadRequest("Invalid session_id".to_string()))?;
 
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
-    }
+    require_permission(
+        &state,
+        tid,
+        auth.user_id,
+        permissions::VIEW_REMOTE_AUDIT,
+        "VIEW_REMOTE_AUDIT",
+    )
+    .await?;
 
     // Ensure the session actually belongs to this tenant.
     let _ = state.remote_sessions.find_in_tenant(tid, sid).await?;

@@ -377,12 +377,33 @@ async fn handle_client_message(
     // Peek at the raw JSON before full parse so we don't pay the cost on
     // every media/presence message.
     if text.contains("\"rc:") {
+        // Authorization + consent-mode gate for `rc:session.request`
+        // (self-control / admin / REMOTE_CONTROL + per-device allowlist +
+        // quarantine). A non-request rc:* message resolves to `Ok(Prompt)` and
+        // falls straight through to dispatch (the mode is unused for it).
+        let authz =
+            match crate::ws::remote_control::resolve_session_authz(state, *user_id, text).await {
+                Ok(a) => a,
+                Err(reason) => {
+                    warn!(?user_id, %reason, "rc:session.request denied by authz gate");
+                    let _ = rc_controller_tx.try_send(
+                        roomler_ai_remote_control::signaling::ServerMsg::Error {
+                            session_id: None,
+                            code: "permission_denied".to_string(),
+                            message: reason,
+                        },
+                    );
+                    return;
+                }
+            };
         let handled = crate::ws::remote_control::dispatch_controller_rc(
             &state.rc_hub,
             *user_id,
             username,
             rc_controller_tx,
             text,
+            authz.mode,
+            authz.override_reason,
         );
         if handled {
             return;

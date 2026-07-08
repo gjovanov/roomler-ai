@@ -15,7 +15,7 @@ function makeAgent(caps?: Agent['capabilities']): Agent {
     is_online: true,
     last_seen_at: '2026-04-20T00:00:00Z',
     access_policy: {
-      require_consent: false,
+      consent_mode: null,
       allowed_role_ids: [],
       allowed_user_ids: [],
       auto_terminate_idle_minutes: null,
