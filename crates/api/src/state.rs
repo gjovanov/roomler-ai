@@ -356,6 +356,42 @@ async fn handle_consent_event(deps: &ConsentConsumerDeps, ev: &ConsentEvent) -> 
     let owner_id = agent.owner_user_id;
     let device_name = agent.name.clone();
 
+    // Phase 5 — break-glass NOTICE: an admin already forced the session, so this
+    // is informational (no approval, no ConsentRequest). Tell the owner their
+    // device was accessed + why, then we're done.
+    if let Some(reason) = &ev.override_reason {
+        if let Some(email) = &deps.email {
+            let owner = deps.users.base.find_by_id(owner_id).await?;
+            let _ = email
+                .send_override_notice(&owner.email, &ev.controller_name, &device_name, reason)
+                .await;
+        }
+        if let Some(push) = &deps.push {
+            let subs = deps
+                .push_subscriptions
+                .find_by_user(owner_id)
+                .await
+                .unwrap_or_default();
+            let body = format!(
+                "{} accessed {} via admin break-glass. Reason: {}",
+                ev.controller_name, device_name, reason
+            );
+            for sub in subs {
+                let _ = push
+                    .send(
+                        &sub.endpoint,
+                        &sub.keys.auth,
+                        &sub.keys.p256dh,
+                        "Device accessed (admin override)",
+                        &body,
+                        None,
+                    )
+                    .await;
+            }
+        }
+        return Ok(());
+    }
+
     // Persist the request with a fresh capability token + a TTL that matches the
     // session's consent window (a stale link can't resolve a long-gone session).
     let req = deps
