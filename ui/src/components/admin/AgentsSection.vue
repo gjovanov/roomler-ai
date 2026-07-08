@@ -265,6 +265,19 @@
             <div class="text-caption text-medium-emphasis mb-2">
               Last seen: {{ fmtDate(a.last_seen_at) }}
             </div>
+            <v-select
+              :model-value="a.access_policy.consent_mode ?? 'prompt'"
+              :items="CONSENT_MODE_ITEMS"
+              label="Consent"
+              density="compact"
+              variant="outlined"
+              hide-details
+              :disabled="consentBusy === a.id"
+              :loading="consentBusy === a.id"
+              class="mb-2"
+              :aria-label="`Consent mode for ${a.name}`"
+              @update:model-value="(m) => onConsentModeChange(a, m as ConsentMode)"
+            />
             <div class="d-flex gap-2">
               <v-btn
                 size="small"
