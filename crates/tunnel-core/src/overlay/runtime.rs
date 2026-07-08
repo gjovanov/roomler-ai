@@ -174,6 +174,9 @@ pub struct OverlayRuntime {
     mode: CarrierMode,
     tun_factory: TunFactory,
     mtu: u16,
+    /// Phase 1 — subnet CIDRs this node advertises as a router (from config).
+    /// Sent in the join; the server gates them behind admin approval.
+    advertised_routes: Vec<String>,
 }
 
 impl OverlayRuntime {
@@ -191,6 +194,7 @@ impl OverlayRuntime {
             mode: CarrierMode::Direct(links),
             tun_factory,
             mtu,
+            advertised_routes: Vec::new(),
         }
     }
 
@@ -208,7 +212,14 @@ impl OverlayRuntime {
             mode: CarrierMode::Relay,
             tun_factory,
             mtu,
+            advertised_routes: Vec::new(),
         }
+    }
+
+    /// Phase 1 — set the subnet routes this node advertises as a router.
+    pub fn with_advertised_routes(mut self, routes: Vec<String>) -> Self {
+        self.advertised_routes = routes;
+        self
     }
 
     /// Run until the event channel closes (WS disconnect). Sends
@@ -235,6 +246,8 @@ impl OverlayRuntime {
             // rc.142 — advertise the QUIC-over-TURN capability so the server
             // only tells a peer to attempt QUIC when BOTH ends support it.
             supports_quic: overlay_quic_enabled(),
+            // Phase 1 — subnet routes we offer (admin must approve server-side).
+            advertised_routes: self.advertised_routes.clone(),
         };
         if self.outbound.send(join).await.is_err() {
             warn!("overlay: control channel closed before join");
@@ -271,6 +284,11 @@ impl OverlayRuntime {
             }
         };
         info!(%self_v4, mtu = self.mtu, "overlay: TUN up");
+
+        // Phase 1 — if this node advertises subnet routes, turn on IP forwarding
+        // + NAT so overlay peers can reach the LANs it fronts. Held for the
+        // runtime's lifetime; its `Drop` reverts on WS disconnect / shutdown.
+        let _subnet_router = super::nat::enable(&network.cidr, &self.advertised_routes).await;
 
         // Inbound writer: decrypted packets → TUN. Independent of the
         // device, so it's a plain spawned task.
@@ -617,6 +635,7 @@ impl OverlayRuntime {
                             carrier,
                             relay_parts: None,
                             supports_quic: cfg.supports_quic,
+                            subnets: cfg.subnets.clone(),
                         },
                     )
                     .await;
@@ -687,6 +706,10 @@ impl OverlayRuntime {
         if let Err(e) = tun.add_peer_route(cfg.overlay_ip).await {
             debug!(peer = %node_id, %e, "overlay: /32 peer route not installed (ok on clean hosts)");
         }
+        // Phase 1 — if this peer is an approved subnet router, route its CIDRs
+        // to it (router allowed_ips + OS route).
+        self.install_subnets(wg, tun, node_id, cfg.public_key, &cfg.subnets)
+            .await;
         info!(peer = %node_id, overlay_ip = %cfg.overlay_ip, %dst, "overlay: direct LAN carrier (same subnet) — skipping relay");
     }
 
@@ -767,7 +790,32 @@ impl OverlayRuntime {
         if let Err(e) = tun.add_peer_route(link.overlay_ip).await {
             debug!(peer = %link.node_id, %e, "overlay: /32 peer route not installed (ok on clean hosts)");
         }
+        // Phase 1 — subnet-router peer: route its approved CIDRs to it.
+        self.install_subnets(wg, tun, link.node_id, link.public_key, &link.subnets)
+            .await;
         info!(peer = %link.node_id, overlay_ip = %link.overlay_ip, initiate, "overlay: peer installed");
+    }
+
+    /// Phase 1 — register a peer's approved subnet routes in the crypto-router
+    /// (so packets to those CIDRs encapsulate to it) and install the matching OS
+    /// routes via the overlay NIC. No-op when the peer advertised none.
+    async fn install_subnets(
+        &self,
+        wg: &mut WgDevice,
+        tun: &Arc<dyn TunIo>,
+        node_id: ObjectId,
+        pubkey: [u8; 32],
+        subnets: &[super::router::Cidr],
+    ) {
+        wg.set_peer_subnets(pubkey, subnets);
+        for c in subnets {
+            let cidr = c.to_string();
+            if let Err(e) = tun.add_cidr_route(&cidr).await {
+                debug!(peer = %node_id, %cidr, %e, "overlay: subnet route not installed");
+            } else {
+                info!(peer = %node_id, %cidr, "overlay: subnet route installed (router peer)");
+            }
+        }
     }
 }
 
@@ -868,6 +916,7 @@ mod tests {
             relay_home: None,
             reachable: true,
             supports_quic: false,
+            routes: vec![],
         }
     }
 

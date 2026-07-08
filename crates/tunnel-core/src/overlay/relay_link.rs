@@ -56,6 +56,9 @@ pub struct ReadyLink {
     /// rc.142 — the peer advertised QUIC-over-TURN support. `install_ready`
     /// only attempts the QUIC upgrade when this is set (both ends must agree).
     pub supports_quic: bool,
+    /// Phase 1 — approved subnet routes this peer is a router for; `install_ready`
+    /// registers them in the router + installs OS routes.
+    pub subnets: Vec<super::router::Cidr>,
 }
 
 /// A peer we're coordinating a relay link to, before our allocation exists.
@@ -281,6 +284,7 @@ impl RelayCoordinator {
             carrier,
             relay_parts: Some((a.conn.clone(), dst)),
             supports_quic: a.peer.supports_quic,
+            subnets: a.peer.subnets.clone(),
         };
         self.allocated.remove(node_id);
         info!(peer = %node_id, %dst, "overlay relay: link ready");
@@ -477,6 +481,7 @@ mod tests {
             public_key: [1u8; 32],
             overlay_ip: Ipv4Addr::new(100, 64, 0, 9),
             name: String::new(),
+            subnets: vec![],
             endpoints: vec![],
             supports_quic: false,
         };
@@ -506,6 +511,7 @@ mod tests {
                     public_key: [2u8; 32],
                     overlay_ip: Ipv4Addr::new(100, 64, 0, 9),
                     name: String::new(),
+                    subnets: vec![],
                     endpoints: vec![],
                     supports_quic: false,
                 },

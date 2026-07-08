@@ -320,6 +320,15 @@ pub fn build_router(state: AppState) -> Router {
                 .put(routes::tunnel::update_tunnel_policy)
                 .delete(routes::tunnel::delete_tunnel_policy),
         );
+    // Phase 1 subnet router — admin approves which advertised routes a node may
+    // actually route for peers.
+    let overlay_node_routes = Router::new()
+        .route("/", get(routes::overlay_route::list_overlay_nodes))
+        .route(
+            "/{node_id}/approved-routes",
+            put(routes::overlay_route::set_approved_routes),
+        );
+
     let public_tunnel_routes = Router::new()
         .route("/enroll", post(routes::tunnel::enroll_tunnel_client))
         // Auth is in-handler (TunnelClient bearer token), so it rides the
@@ -404,6 +413,7 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/tenant/{tenant_id}/agent", agent_routes)
         .nest("/tenant/{tenant_id}/tunnel-client", tunnel_client_routes)
         .nest("/tenant/{tenant_id}/tunnel-policy", tunnel_policy_routes)
+        .nest("/tenant/{tenant_id}/overlay-node", overlay_node_routes)
         .nest("/tenant/{tenant_id}/session", remote_session_routes);
 
     // Health check

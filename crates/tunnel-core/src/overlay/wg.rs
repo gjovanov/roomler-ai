@@ -528,6 +528,13 @@ impl WgDevice {
         }
     }
 
+    /// Phase 1 — set the subnet routes a peer is a router for, so packets to
+    /// those CIDRs are encapsulated to it (longest-prefix after the host `/32`s).
+    /// Replaces any previously-set subnets for the peer; empty clears them.
+    pub fn set_peer_subnets(&mut self, peer_public: [u8; 32], subnets: &[super::router::Cidr]) {
+        self.router.set_subnets(peer_public, subnets);
+    }
+
     /// Number of installed peers.
     pub fn peer_count(&self) -> usize {
         self.peers.len()
