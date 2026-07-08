@@ -416,11 +416,14 @@ const props = defineProps<{ tenantId: string }>()
 
 const agentStore = useAgentStore()
 
-// Phase 2 — per-device consent mode. Only the two modes enforced today are
-// offered; Email / Push / PromptThenEmail arrive with Phase 4's owner channels.
+// Per-device consent mode. Email/Push route the request to the device OWNER
+// (approve-link) for unattended hosts; PromptThenEmail (host-then-email hybrid)
+// is not offered yet — it still behaves as host-prompt server-side.
 const CONSENT_MODE_ITEMS: { title: string; value: ConsentMode }[] = [
   { title: 'Prompt on host (attended)', value: 'prompt' },
   { title: 'Auto-grant (unattended)', value: 'auto' },
+  { title: 'Email the owner', value: 'email' },
+  { title: 'Push to the owner', value: 'push' },
 ]
 // Agent id whose consent mode is mid-update (disables + spins that row's select).
 const consentBusy = ref<string | null>(null)
