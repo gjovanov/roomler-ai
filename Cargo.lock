@@ -7043,6 +7043,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "webrtc",
+ "zip",
 ]
 
 [[package]]

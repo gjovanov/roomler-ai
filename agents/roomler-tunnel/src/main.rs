@@ -16,7 +16,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-use roomler_tunnel::{config, forward, mesh};
+use roomler_tunnel::{config, forward, mesh, update};
 
 #[derive(Debug, Parser)]
 #[command(name = "roomler-tunnel", version, about, long_about = None)]
@@ -102,6 +102,13 @@ enum Command {
         #[arg(long)]
         agent: Option<String>,
     },
+    /// Check for a newer roomler-tunnel release and self-replace the running
+    /// binary (Windows). Mirrors `roomler-agent self-update`.
+    SelfUpdate {
+        /// Only check + report whether an update is available; don't install.
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 #[tokio::main]
@@ -143,6 +150,10 @@ async fn main() -> Result<()> {
         Command::Run {} => bail!("T3: multi-forward `run` not yet wired"),
         Command::Diagnose { agent } => {
             bail!("T3: diagnose not yet wired (agent={:?})", agent);
+        }
+        Command::SelfUpdate { check } => {
+            let cfg = config::load(cli.config).context("loading tunnel config")?;
+            update::self_update(&cfg, check).await
         }
     }
 }
