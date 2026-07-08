@@ -22,9 +22,10 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use super::acl::{AclDecision, AgentForwardAcl};
-use super::dialer::{DialError, dial_dst};
+use super::dialer::{DialError, dial_dst, dial_udp};
 use super::peer::AgentTunnelPeer;
 use super::quic_peer::AgentQuicPeer;
+use tunnel_core::policy::ProtocolKind;
 
 /// Cap on how long we'll wait for the DC pool to finish opening
 /// before bailing on a forward request. The pool usually opens
@@ -51,7 +52,9 @@ pub async fn decide_forward(
     acl: &AgentForwardAcl,
     dial_timeout: Duration,
 ) -> Result<TcpStream, ClientMsg> {
-    if let AclDecision::Reject { reason } = acl.check(dst_host, dst_port) {
+    if let AclDecision::Reject { reason } =
+        acl.check(dst_host, dst_port, tunnel_core::policy::ProtocolKind::Tcp)
+    {
         info!(
             %session_id, %flow_id, %dst_host, %dst_port, %reason,
             "agent ACL rejected forward"
@@ -267,6 +270,229 @@ pub async fn handle_forward_request_quic(
         .await;
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// UDP ASSOCIATE — agent side (mirror of the TCP handlers above)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// UDP analogue of [`decide_forward`]: agent-local ACL (`proto = udp`)
+/// then bind + `connect()` a UDP socket to the target. Returns the
+/// connected socket or a typed [`ClientMsg::UdpForwardReject`].
+pub async fn decide_forward_udp(
+    session_id: ObjectId,
+    flow_id: u32,
+    dst_host: &str,
+    dst_port: u16,
+    acl: &AgentForwardAcl,
+    dial_timeout: Duration,
+) -> Result<tokio::net::UdpSocket, ClientMsg> {
+    if let AclDecision::Reject { reason } = acl.check(dst_host, dst_port, ProtocolKind::Udp) {
+        info!(
+            %session_id, %flow_id, %dst_host, %dst_port, %reason,
+            "agent ACL rejected UDP forward"
+        );
+        return Err(ClientMsg::UdpForwardReject {
+            session_id,
+            flow_id,
+            kind: RejectKind::AclDenied,
+            reason: format!("agent: {reason}"),
+        });
+    }
+    match dial_udp(dst_host, dst_port, dial_timeout).await {
+        Ok(sock) => {
+            debug!(%session_id, %flow_id, %dst_host, %dst_port, "agent bound UDP socket for flow");
+            Ok(sock)
+        }
+        Err(DialError::Timeout(d)) => {
+            warn!(%session_id, %flow_id, %dst_host, %dst_port, ?d, "udp resolve timeout");
+            Err(ClientMsg::UdpForwardReject {
+                session_id,
+                flow_id,
+                kind: RejectKind::DialFailed,
+                reason: format!("udp resolve timed out after {d:?}"),
+            })
+        }
+        Err(DialError::Io(e)) => {
+            warn!(%session_id, %flow_id, %dst_host, %dst_port, %e, "udp bind/connect failed");
+            Err(ClientMsg::UdpForwardReject {
+                session_id,
+                flow_id,
+                kind: RejectKind::DialFailed,
+                reason: format!("udp: {e}"),
+            })
+        }
+    }
+}
+
+/// UDP analogue of [`handle_forward_request`] (WebRTC-DC data plane).
+/// Decides + binds the target socket, registers the flow on the DC
+/// pool, replies `UdpForwardAccept`, pumps datagrams via
+/// [`tunnel_core::forward::run_flow_udp_dc`], then emits `UdpClosed`.
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_udp_forward_request(
+    session_id: ObjectId,
+    flow_id: u32,
+    dst_host: &str,
+    dst_port: u16,
+    acl: &AgentForwardAcl,
+    dial_timeout: Duration,
+    tunnel_peer: &Arc<AgentTunnelPeer>,
+    outbound: mpsc::Sender<ClientMsg>,
+) {
+    let udp = match decide_forward_udp(session_id, flow_id, dst_host, dst_port, acl, dial_timeout)
+        .await
+    {
+        Ok(s) => s,
+        Err(reject) => {
+            let _ = outbound.send(reject).await;
+            return;
+        }
+    };
+
+    if !tunnel_peer.wait_pool_ready(POOL_READY_WAIT).await {
+        warn!(%session_id, %flow_id, "DC pool not ready within budget — rejecting UDP");
+        let _ = outbound
+            .send(ClientMsg::UdpForwardReject {
+                session_id,
+                flow_id,
+                kind: RejectKind::AgentError,
+                reason: "DC pool not ready on agent".into(),
+            })
+            .await;
+        return;
+    }
+    let pool_size = tunnel_peer.pool_size().await;
+    if pool_size == 0 {
+        let _ = outbound
+            .send(ClientMsg::UdpForwardReject {
+                session_id,
+                flow_id,
+                kind: RejectKind::AgentError,
+                reason: "empty DC pool on agent".into(),
+            })
+            .await;
+        return;
+    }
+    let dc_index = (flow_id % pool_size as u32) as u8;
+    let Some(demux) = tunnel_peer.demux(dc_index).await else {
+        let _ = outbound
+            .send(ClientMsg::UdpForwardReject {
+                session_id,
+                flow_id,
+                kind: RejectKind::AgentError,
+                reason: format!("demux missing for dc_index={dc_index}"),
+            })
+            .await;
+        return;
+    };
+
+    let (from_dc, stats) = demux.register(flow_id).await;
+    let dc = demux.dc();
+
+    if let Err(e) = outbound
+        .send(ClientMsg::UdpForwardAccept {
+            session_id,
+            flow_id,
+            dc_index,
+        })
+        .await
+    {
+        debug!(%session_id, %flow_id, %e, "UdpForwardAccept send failed (channel closed)");
+        demux.unregister(flow_id).await;
+        return;
+    }
+
+    let close_reason = tunnel_core::forward::run_flow_udp_dc(
+        udp,
+        dc,
+        flow_id,
+        from_dc,
+        tunnel_core::forward::UDP_FLOW_IDLE_TIMEOUT,
+        stats,
+    )
+    .await;
+    demux.unregister(flow_id).await;
+    info!(%session_id, %flow_id, ?close_reason, "agent UDP flow ended");
+    let _ = outbound
+        .send(ClientMsg::UdpClosed {
+            session_id,
+            flow_id,
+            reason: close_reason,
+        })
+        .await;
+}
+
+/// UDP analogue of [`handle_forward_request_quic`]. Decides + binds the
+/// target socket, replies `UdpForwardAccept` (dc_index 0), rendezvouses
+/// the client-opened QUIC flow stream, then pumps datagrams via
+/// [`tunnel_core::forward::run_flow_udp_quic`].
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_udp_forward_request_quic(
+    session_id: ObjectId,
+    flow_id: u32,
+    dst_host: &str,
+    dst_port: u16,
+    acl: &AgentForwardAcl,
+    dial_timeout: Duration,
+    quic_peer: &Arc<AgentQuicPeer>,
+    outbound: mpsc::Sender<ClientMsg>,
+) {
+    let udp = match decide_forward_udp(session_id, flow_id, dst_host, dst_port, acl, dial_timeout)
+        .await
+    {
+        Ok(s) => s,
+        Err(reject) => {
+            let _ = outbound.send(reject).await;
+            return;
+        }
+    };
+
+    if let Err(e) = outbound
+        .send(ClientMsg::UdpForwardAccept {
+            session_id,
+            flow_id,
+            dc_index: 0,
+        })
+        .await
+    {
+        debug!(%session_id, %flow_id, %e, "UdpForwardAccept send failed (channel closed)");
+        return;
+    }
+
+    let (send, recv) = match quic_peer.take_flow(flow_id, FLOW_RENDEZVOUS_WAIT).await {
+        Ok(streams) => streams,
+        Err(e) => {
+            warn!(%session_id, %flow_id, %e, "QUIC UDP flow stream never opened — closing socket");
+            let _ = outbound
+                .send(ClientMsg::UdpClosed {
+                    session_id,
+                    flow_id,
+                    reason: CloseReason::IoError,
+                })
+                .await;
+            return;
+        }
+    };
+
+    let stats = Arc::new(tunnel_core::forward::FlowStats::default());
+    let close_reason = tunnel_core::forward::run_flow_udp_quic(
+        udp,
+        send,
+        recv,
+        flow_id,
+        tunnel_core::forward::UDP_FLOW_IDLE_TIMEOUT,
+        stats,
+    )
+    .await;
+    info!(%session_id, %flow_id, ?close_reason, "agent QUIC UDP flow ended");
+    let _ = outbound
+        .send(ClientMsg::UdpClosed {
+            session_id,
+            flow_id,
+            reason: close_reason,
+        })
+        .await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,6 +532,7 @@ mod tests {
                     low: 5432,
                     high: 5432,
                 },
+                proto: tunnel_core::policy::ProtocolKind::Any,
             }],
         };
         let reply = decide_forward(
