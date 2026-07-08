@@ -104,7 +104,13 @@ jobs:
       - name: Test tunnel-core --features overlay-l3
         # WG handshake (direct + RelayConn) + the TUN↔WG bridge loopback
         # test — all in-process over 127.0.0.1, no real device.
-        run: cargo test -p roomler-ai-tunnel-core --features overlay-l3 --lib
+        # `--test-threads=1`: several tests each stand up a full loopback
+        # WebRTC/QUIC peer PAIR (ICE + SCTP 8-DC pool). Run in parallel on a
+        # 2-core CI runner they starve each other and intermittently blow the
+        # pool-open timeout (`Elapsed`) — flaky on master + PRs alike. Serial
+        # execution keeps at most one peer-pair up at a time; the tests are
+        # individually fast (<1s), so the whole step stays well under a minute.
+        run: cargo test -p roomler-ai-tunnel-core --features overlay-l3 --lib -- --test-threads=1
 
       - name: Clippy roomler-agent --features overlay-l3
         # Phase 3b: the agent's overlay glue (overlay.rs + the main /
