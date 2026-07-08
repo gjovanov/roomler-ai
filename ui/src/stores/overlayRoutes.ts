@@ -18,6 +18,12 @@ interface OverlayNodeListResponse {
   items: OverlayNode[]
 }
 
+// Matches `overlay_route.rs::MagicDnsResponse` / `SetMagicDnsRequest`.
+export interface MagicDnsSettings {
+  magic_dns_domain: string | null
+  magic_dns_nameservers: string[]
+}
+
 export const useOverlayRoutesStore = defineStore('overlayRoutes', () => {
   const nodes = ref<OverlayNode[]>([])
   const loading = ref(false)
@@ -53,5 +59,27 @@ export const useOverlayRoutesStore = defineStore('overlayRoutes', () => {
     return updated
   }
 
-  return { nodes, loading, error, fetchNodes, setApprovedRoutes }
+  async function fetchMagicDns(tenantId: string): Promise<MagicDnsSettings> {
+    return await api.get<MagicDnsSettings>(`/tenant/${tenantId}/magic-dns`)
+  }
+
+  async function saveMagicDns(
+    tenantId: string,
+    settings: MagicDnsSettings,
+  ): Promise<MagicDnsSettings> {
+    return await api.put<MagicDnsSettings>(
+      `/tenant/${tenantId}/magic-dns`,
+      settings,
+    )
+  }
+
+  return {
+    nodes,
+    loading,
+    error,
+    fetchNodes,
+    setApprovedRoutes,
+    fetchMagicDns,
+    saveMagicDns,
+  }
 })
