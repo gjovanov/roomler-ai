@@ -20,6 +20,7 @@ const VER: u8 = 0x05;
 const METHOD_NO_AUTH: u8 = 0x00;
 const METHOD_NONE: u8 = 0xFF;
 const CMD_CONNECT: u8 = 0x01;
+pub const CMD_UDP_ASSOCIATE: u8 = 0x03;
 const ATYP_IPV4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x03;
 const ATYP_IPV6: u8 = 0x04;
@@ -161,6 +162,79 @@ pub async fn client_connect(stream: &mut TcpStream, dst_host: &str, dst_port: u1
     Ok(())
 }
 
+/// Parse a SOCKS5 UDP-relay datagram (RFC 1928 §7):
+/// `[RSV(2)=0 | FRAG(1) | ATYP | DST.ADDR | DST.PORT | DATA]`.
+/// Returns `(dst_host, dst_port, data_offset)` — the payload is
+/// `buf[data_offset..]`. Fragmented datagrams (`FRAG != 0`) are rejected
+/// (unsupported, like most proxies — the app's upper layer handles MTU).
+pub fn parse_udp_datagram(buf: &[u8]) -> Result<(String, u16, usize)> {
+    if buf.len() < 4 {
+        bail!("socks udp datagram too short ({} bytes)", buf.len());
+    }
+    if buf[2] != 0 {
+        bail!(
+            "fragmented socks udp datagrams unsupported (FRAG={})",
+            buf[2]
+        );
+    }
+    let (host, addr_end) = match buf[3] {
+        ATYP_IPV4 => {
+            if buf.len() < 4 + 4 + 2 {
+                bail!("socks udp ipv4 datagram truncated");
+            }
+            (
+                std::net::Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]).to_string(),
+                8,
+            )
+        }
+        ATYP_IPV6 => {
+            if buf.len() < 4 + 16 + 2 {
+                bail!("socks udp ipv6 datagram truncated");
+            }
+            let mut o = [0u8; 16];
+            o.copy_from_slice(&buf[4..20]);
+            (std::net::Ipv6Addr::from(o).to_string(), 20)
+        }
+        ATYP_DOMAIN => {
+            let len = *buf.get(4).context("socks udp domain len")? as usize;
+            let end = 5 + len;
+            if buf.len() < end + 2 {
+                bail!("socks udp domain datagram truncated");
+            }
+            let host =
+                String::from_utf8(buf[5..end].to_vec()).context("socks udp domain not utf-8")?;
+            (host, end)
+        }
+        other => bail!("socks udp unsupported atyp {other:#x}"),
+    };
+    let port = u16::from_be_bytes([buf[addr_end], buf[addr_end + 1]]);
+    Ok((host, port, addr_end + 2))
+}
+
+/// Encode a SOCKS5 UDP-relay datagram wrapping `data` originating from
+/// `(src_host, src_port)`, for delivery back to the app. `src_host` may be an IP
+/// (→ ipv4/ipv6 ATYP) or a domain (→ domain ATYP). RSV=0, FRAG=0.
+pub fn encode_udp_datagram(src_host: &str, src_port: u16, data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() + 22);
+    out.extend_from_slice(&[0, 0, 0]); // RSV(2)=0, FRAG=0
+    if let Ok(v4) = src_host.parse::<std::net::Ipv4Addr>() {
+        out.push(ATYP_IPV4);
+        out.extend_from_slice(&v4.octets());
+    } else if let Ok(v6) = src_host.parse::<std::net::Ipv6Addr>() {
+        out.push(ATYP_IPV6);
+        out.extend_from_slice(&v6.octets());
+    } else {
+        let h = src_host.as_bytes();
+        let n = h.len().min(255);
+        out.push(ATYP_DOMAIN);
+        out.push(n as u8);
+        out.extend_from_slice(&h[..n]);
+    }
+    out.extend_from_slice(&src_port.to_be_bytes());
+    out.extend_from_slice(data);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,5 +319,45 @@ mod tests {
         assert!(accept_connect(&mut srv).await.is_err());
         let sel = client.await.unwrap();
         assert_eq!(sel, [VER, METHOD_NONE]);
+    }
+
+    #[test]
+    fn udp_datagram_ipv4_roundtrip() {
+        // Build [RSV=0,0 | FRAG=0 | ATYP=ipv4 | 8.8.8.8 | 53 | payload]
+        let mut d = vec![0, 0, 0, ATYP_IPV4, 8, 8, 8, 8];
+        d.extend_from_slice(&53u16.to_be_bytes());
+        d.extend_from_slice(b"query");
+        let (host, port, off) = parse_udp_datagram(&d).unwrap();
+        assert_eq!(host, "8.8.8.8");
+        assert_eq!(port, 53);
+        assert_eq!(&d[off..], b"query");
+
+        // Encode a reply datagram from 8.8.8.8:53 and parse it back.
+        let framed = encode_udp_datagram("8.8.8.8", 53, b"answer");
+        let (h2, p2, o2) = parse_udp_datagram(&framed).unwrap();
+        assert_eq!(
+            (h2.as_str(), p2, &framed[o2..]),
+            ("8.8.8.8", 53, &b"answer"[..])
+        );
+    }
+
+    #[test]
+    fn udp_datagram_domain_and_rejects_fragment() {
+        let host = b"dns.internal";
+        let mut d = vec![0, 0, 0, ATYP_DOMAIN, host.len() as u8];
+        d.extend_from_slice(host);
+        d.extend_from_slice(&5353u16.to_be_bytes());
+        d.extend_from_slice(b"x");
+        let (h, p, off) = parse_udp_datagram(&d).unwrap();
+        assert_eq!(
+            (h.as_str(), p, &d[off..]),
+            ("dns.internal", 5353, &b"x"[..])
+        );
+
+        // FRAG != 0 is rejected.
+        let frag = vec![0, 0, 1, ATYP_IPV4, 1, 2, 3, 4, 0, 53];
+        assert!(parse_udp_datagram(&frag).is_err());
+        // Too short.
+        assert!(parse_udp_datagram(&[0, 0, 0]).is_err());
     }
 }
