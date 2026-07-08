@@ -28,6 +28,11 @@ use crate::turn_creds::{TurnConfig, ice_servers_for};
 
 const SERVER_TX_CAPACITY: usize = 64;
 
+/// Consent window for owner-side channels (Email/Push) — the owner has to read a
+/// mail / tap a push, so it's far longer than the 30 s on-host prompt
+/// ([`DEFAULT_CONSENT_TIMEOUT`]). Also bounds the `ConsentRequest` link TTL.
+const ASYNC_CONSENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 // ────────────────────────────────────────────────────────────────────────────
 
 pub struct ConnectedAgent {
@@ -52,6 +57,25 @@ pub struct ConnectedController {
     pub tx: ClientTx,
 }
 
+/// Emitted by [`Hub::create_session`] when a session's consent must be obtained
+/// from the device OWNER out-of-band (Email / Push modes). The Hub stays
+/// DB-agnostic: it just publishes the event. An API-side consumer looks up the
+/// owner (via `agent_id`), persists a `ConsentRequest`, and sends the email /
+/// push; the owner's later approve/deny calls [`Hub::deliver_consent`], which
+/// resolves the SAME slot the [`create_session`](Hub::create_session) waiter awaits.
+#[derive(Debug, Clone)]
+pub struct ConsentEvent {
+    pub session_id: ObjectId,
+    pub agent_id: ObjectId,
+    pub tenant_id: ObjectId,
+    pub controller_user_id: ObjectId,
+    pub controller_name: String,
+    pub mode: ConsentMode,
+    /// Same window the waiter uses — the consumer sizes the `ConsentRequest`
+    /// TTL to match so a stale link can't resolve a long-gone session.
+    pub timeout_secs: u32,
+}
+
 pub struct HubInner {
     /// Online agents, keyed by agent_id.
     agents: DashMap<ObjectId, ConnectedAgent>,
@@ -67,6 +91,11 @@ pub struct HubInner {
 
     /// Audit sink.
     audit: AuditSink,
+
+    /// Phase 4 — async-consent event sink (Email/Push). `None` (tests / no email
+    /// configured) drops the events and those sessions fall back to the waiter
+    /// timeout.
+    consent_tx: Option<mpsc::Sender<ConsentEvent>>,
 }
 
 #[derive(Clone)]
@@ -76,6 +105,15 @@ pub struct Hub {
 
 impl Hub {
     pub fn new(audit: AuditSink, turn: Option<TurnConfig>) -> Self {
+        Self::new_with_consent(audit, turn, None)
+    }
+
+    /// Like [`Hub::new`] but wires the Phase-4 async-consent event sender.
+    pub fn new_with_consent(
+        audit: AuditSink,
+        turn: Option<TurnConfig>,
+        consent_tx: Option<mpsc::Sender<ConsentEvent>>,
+    ) -> Self {
         Self {
             inner: Arc::new(HubInner {
                 agents: DashMap::new(),
@@ -83,6 +121,7 @@ impl Hub {
                 controllers: DashMap::new(),
                 turn,
                 audit,
+                consent_tx,
             }),
         }
     }
@@ -314,31 +353,57 @@ impl Hub {
             agent_id,
         });
 
-        // Move to AwaitingConsent and tell the agent.
+        // Per-mode consent window: owner-side channels (Email/Push) get a much
+        // longer window than the on-host prompt.
+        let timeout = match consent_mode {
+            ConsentMode::Email | ConsentMode::Push => ASYNC_CONSENT_TIMEOUT,
+            _ => DEFAULT_CONSENT_TIMEOUT,
+        };
+
+        // Move to AwaitingConsent and tell the agent. The agent always gets the
+        // Request (it needs the codec / transport context) + the mode directive;
+        // for Email/Push it will NOT respond — the owner resolves the slot.
         self.with_session(session_id, |s| s.transition(SessionPhase::AwaitingConsent))?;
         let agent_tx = self.agent_tx(agent_id)?;
         let _ = agent_tx.try_send(ServerMsg::Request {
             session_id,
             controller_user_id,
-            controller_name,
+            controller_name: controller_name.clone(),
             permissions,
-            consent_timeout_secs: DEFAULT_CONSENT_TIMEOUT.as_secs() as u32,
+            consent_timeout_secs: timeout.as_secs() as u32,
             browser_caps,
             preferred_transport,
             chroma_pref,
             // Server-authoritative directive: the agent obeys this rather than
-            // its local `auto_grant_session`. `Auto` → immediate grant; anything
-            // else → on-host prompt.
+            // its local `auto_grant_session`. `Auto` → immediate grant;
+            // `Prompt` → on-host prompt; `Email`/`Push` → wait (owner resolves).
             consent_mode: Some(consent_mode),
         });
 
         self.audit(session_id, agent_id, agent_org, AuditKind::SessionRequested);
         self.audit(session_id, agent_id, agent_org, AuditKind::ConsentPrompted);
 
+        // Phase 4 — owner-side consent: hand the API layer what it needs to notify
+        // the owner (it resolves the owner from `agent_id`). Best-effort; with no
+        // consumer wired the session just relies on the waiter timeout.
+        if matches!(consent_mode, ConsentMode::Email | ConsentMode::Push)
+            && let Some(tx) = &self.inner.consent_tx
+        {
+            let _ = tx.try_send(ConsentEvent {
+                session_id,
+                agent_id,
+                tenant_id: agent_org,
+                controller_user_id,
+                controller_name,
+                mode: consent_mode,
+                timeout_secs: timeout.as_secs() as u32,
+            });
+        }
+
         // Spawn the consent watcher.
         let hub = self.clone();
         tokio::spawn(async move {
-            let outcome = waiter.wait(DEFAULT_CONSENT_TIMEOUT).await;
+            let outcome = waiter.wait(timeout).await;
             hub.handle_consent_outcome(session_id, outcome);
         });
 

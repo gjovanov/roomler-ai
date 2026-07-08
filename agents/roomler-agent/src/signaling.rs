@@ -716,13 +716,24 @@ async fn handle_server_msg(
             // mode) so the .pending write and the request use the same decision.
             let effective_mode = directed_mode.unwrap_or_else(|| consent_broker.mode());
             let session_hex = session_id.to_hex();
-            // Phase 3 — when this session will actually PROMPT, drop a `.pending`
-            // request marker in the shared consent dir so the tray can pop a rich
-            // Approve/Deny modal (the previously-missing agent→tray signal). Auto
-            // grants write nothing. The broker's poll loop removes it when the
-            // decision resolves. Best-effort: a failure just falls back to the
-            // CLI-driven consent path.
-            if matches!(effective_mode, crate::consent::Mode::Prompt { .. }) {
+            // Phase 4 — Email/Push are OWNER-side modes: the SERVER obtains
+            // consent from the device owner (email link / push), so the agent
+            // must NOT decide — no prompt, no `.pending`, no `rc:consent`. It
+            // just waits; when the owner approves, the server sends `rc:ready`,
+            // the controller offers, and the agent builds the peer from the
+            // media context stashed above.
+            let owner_side_consent = matches!(
+                consent_mode,
+                Some(roomler_ai_remote_control::models::ConsentMode::Email)
+                    | Some(roomler_ai_remote_control::models::ConsentMode::Push)
+            );
+            // Phase 3 — when this session will PROMPT on the host, drop a
+            // `.pending` marker so the tray can pop a rich Approve/Deny modal
+            // (the agent→tray signal). Auto grants + owner-side modes write
+            // nothing. The broker's poll loop removes it when the decision
+            // resolves. Best-effort; a failure falls back to the CLI path.
+            if !owner_side_consent && matches!(effective_mode, crate::consent::Mode::Prompt { .. })
+            {
                 let body = serde_json::json!({
                     "session_id": session_hex,
                     "controller_name": controller_name,
@@ -734,28 +745,35 @@ async fn handle_server_msg(
                     tracing::warn!(session = %session_hex, %e, "could not write .pending consent marker for tray");
                 }
             }
-            let broker = consent_broker.clone();
-            let outbound = outbound_tx.clone();
-            tokio::spawn(async move {
-                let decision = broker.request_with_mode(&session_hex, effective_mode).await;
-                let granted = decision.granted();
-                tracing::info!(
-                    session = %session_hex,
-                    ?decision,
-                    ?effective_mode,
-                    granted,
-                    "consent decision → sending rc:consent"
+            if owner_side_consent {
+                info!(
+                    %session_id, ?consent_mode,
+                    "owner-side consent (email/push) — agent waits for the server to resolve"
                 );
-                if let Err(e) = outbound
-                    .send(ClientMsg::Consent {
-                        session_id,
+            } else {
+                let broker = consent_broker.clone();
+                let outbound = outbound_tx.clone();
+                tokio::spawn(async move {
+                    let decision = broker.request_with_mode(&session_hex, effective_mode).await;
+                    let granted = decision.granted();
+                    tracing::info!(
+                        session = %session_hex,
+                        ?decision,
+                        ?effective_mode,
                         granted,
-                    })
-                    .await
-                {
-                    tracing::warn!(session = %session_hex, %e, "outbound consent send failed (channel closed)");
-                }
-            });
+                        "consent decision → sending rc:consent"
+                    );
+                    if let Err(e) = outbound
+                        .send(ClientMsg::Consent {
+                            session_id,
+                            granted,
+                        })
+                        .await
+                    {
+                        tracing::warn!(session = %session_hex, %e, "outbound consent send failed (channel closed)");
+                    }
+                });
+            }
         }
 
         ServerMsg::SdpOffer {

@@ -41,3 +41,6 @@ pub use activation_code::*;
 
 pub mod agent_log;
 pub use agent_log::*;
+
+pub mod consent_request;
+pub use consent_request::*;
