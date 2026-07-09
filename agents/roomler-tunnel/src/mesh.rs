@@ -31,9 +31,43 @@ use crate::socks5;
 /// and reused thereafter.
 type ProxyPorts = Arc<Mutex<HashMap<ObjectId, u16>>>;
 
-/// Friendly-name → agent-id map (lowercased keys), fetched from the server so a
-/// CONNECT can name an agent by its label instead of its raw 24-hex id.
-type Roster = Arc<Mutex<HashMap<String, ObjectId>>>;
+/// The tenant's routing table, fetched from the server: friendly-name →
+/// agent-id (so a CONNECT can name an agent by label instead of its raw
+/// 24-hex id), plus (Phase 2) advertised subnet CIDR → agent-id for
+/// longest-prefix routing of LAN-IP targets.
+#[derive(Default)]
+struct RosterData {
+    /// Lowercased friendly name → agent-id.
+    names: HashMap<String, ObjectId>,
+    /// Advertised route CIDR → agent-id (subnet-router). Not de-duplicated;
+    /// [`RosterData::match_route`] does longest-prefix with a deterministic
+    /// (lowest agent-id) tiebreak on equal-length overlaps.
+    routes: Vec<(ipnet::IpNet, ObjectId)>,
+}
+
+impl RosterData {
+    /// Longest-prefix-match `ip` against advertised routes; on equal prefix
+    /// length, the lowest agent-id wins (deterministic across refreshes).
+    fn match_route(&self, ip: std::net::IpAddr) -> Option<ObjectId> {
+        self.routes
+            .iter()
+            .filter(|(net, _)| net.contains(&ip))
+            .min_by_key(|(net, id)| (std::cmp::Reverse(net.prefix_len()), *id))
+            .map(|(_, id)| *id)
+    }
+}
+
+type Roster = Arc<Mutex<RosterData>>;
+
+/// Where a resolved mesh target should be dialed. A NAME/id target reaches
+/// the agent's OWN host (`127.0.0.1`); a SUBNET (LAN-IP) target reaches the
+/// real IP, which the covering agent dials over its LAN.
+struct MeshTarget {
+    agent_id: ObjectId,
+    /// The host string the covering agent dials — `"127.0.0.1"` for a
+    /// name/id target, or the literal LAN IP for a subnet target.
+    dial_host: String,
+}
 
 /// Cap on connecting to a freshly-spawned per-agent proxy (it must bind its
 /// listener; its tunnel session establishes lazily on the first forwarded flow).
@@ -54,12 +88,13 @@ pub async fn run_mesh(cfg: TunnelConfig, local: u16, transport: TransportPref) -
     // Agent roster (friendly-name → agent-id). Best-effort at startup — if it
     // fails (older server, transient), addressing by raw 24-hex agent-id still
     // works, and an unknown name triggers a lazy re-fetch below.
-    let roster: Roster = Arc::new(Mutex::new(HashMap::new()));
+    let roster: Roster = Arc::new(Mutex::new(RosterData::default()));
     match fetch_roster(&cfg).await {
         Ok(r) => {
             info!(
-                agents = r.len(),
-                "mesh: fetched agent roster (name → agent-id)"
+                names = r.names.len(),
+                routes = r.routes.len(),
+                "mesh: fetched agent roster (name → agent-id + subnet routes)"
             );
             *roster.lock().await = r;
         }
@@ -96,13 +131,16 @@ pub async fn run_mesh(cfg: TunnelConfig, local: u16, transport: TransportPref) -
                     return;
                 }
             };
-            // Resolve the SOCKS hostname → agent: a raw 24-hex agent-id, or a
-            // friendly name from the roster (case-insensitive).
-            let Some(agent_id) = resolve_agent(&host, &cfg, &roster).await else {
-                warn!(%peer_addr, host, "mesh: unknown target agent (not an id, not a known name)");
+            // Resolve the SOCKS hostname → a target: a 24-hex agent-id or a
+            // friendly name (→ that agent's own 127.0.0.1), or a LAN-IP that
+            // longest-prefix-matches an agent's advertised subnet route (→ the
+            // covering agent dials the real IP).
+            let Some(target) = resolve_target(&host, &cfg, &roster).await else {
+                warn!(%peer_addr, host, "mesh: no target agent (unknown name/id, and no matching subnet route)");
                 socks5::reply(&mut tcp, socks5::REP_GENERAL_FAILURE).await;
                 return;
             };
+            let agent_id = target.agent_id;
             let proxy_port = match get_or_spawn_proxy(agent_id, &cfg, transport, &ports).await {
                 Ok(p) => p,
                 Err(e) => {
@@ -111,9 +149,10 @@ pub async fn run_mesh(cfg: TunnelConfig, local: u16, transport: TransportPref) -
                     return;
                 }
             };
-            // Chain into the agent's loopback proxy: reach the requested port on
-            // the agent's OWN host (`127.0.0.1:port` from the agent's vantage).
-            let mut inner = match connect_proxy(proxy_port, port).await {
+            // Chain into the agent's loopback proxy. `dial_host` is `127.0.0.1`
+            // for a name/id target (the agent's own host) or the real LAN IP
+            // for a subnet target (the agent dials it over its LAN).
+            let mut inner = match connect_proxy(proxy_port, &target.dial_host, port).await {
                 Ok(s) => s,
                 Err(e) => {
                     warn!(%peer_addr, %agent_id, %e, "mesh: chaining to agent proxy failed");
@@ -329,11 +368,14 @@ async fn connect_tcp(proxy_port: u16) -> Result<TcpStream> {
     }
 }
 
-/// Connect to a per-agent loopback proxy and SOCKS-CONNECT to `127.0.0.1:dst_port`
-/// (the agent's own host from its vantage).
-async fn connect_proxy(proxy_port: u16, dst_port: u16) -> Result<TcpStream> {
+/// Connect to a per-agent loopback proxy and SOCKS-CONNECT to
+/// `dial_host:dst_port`. `dial_host` is `127.0.0.1` for a name/id target
+/// (the agent's own host) or a LAN IP for a subnet target (the agent dials
+/// it directly). The host rides a domain-ATYP CONNECT either way — an IP
+/// string round-trips fine — so no new socks5 surface is needed.
+async fn connect_proxy(proxy_port: u16, dial_host: &str, dst_port: u16) -> Result<TcpStream> {
     let mut stream = connect_tcp(proxy_port).await?;
-    socks5::client_connect(&mut stream, "127.0.0.1", dst_port).await?;
+    socks5::client_connect(&mut stream, dial_host, dst_port).await?;
     Ok(stream)
 }
 
@@ -342,23 +384,84 @@ async fn connect_proxy(proxy_port: u16, dst_port: u16) -> Result<TcpStream> {
 struct AgentInfo {
     agent_id: String,
     name: String,
+    /// Advertised subnet-router CIDRs. `#[serde(default)]` so an older
+    /// server (no field) still deserializes.
+    #[serde(default)]
+    routes: Vec<String>,
 }
 
-/// Resolve a SOCKS-CONNECT hostname to an agent-id: a raw 24-hex id, or a
-/// friendly name from the roster (case-insensitive). On a name miss, re-fetch
-/// the roster once (picks up a newly-added / renamed agent) and retry.
+/// Resolve a SOCKS-CONNECT hostname to a [`MeshTarget`], in strict order: a
+/// raw 24-hex agent-id → that agent's own host (`127.0.0.1`); else a literal
+/// IP → longest-prefix-match against advertised subnet routes → the covering
+/// agent dials the real IP; else a friendly name → that agent's own host. A
+/// literal IP NEVER falls through to name resolution, so an agent named like
+/// an IP can't shadow the route table. Refreshes the roster once on an
+/// IP-route miss or a name miss (picks up a newly-added route / renamed agent).
+async fn resolve_target(host: &str, cfg: &TunnelConfig, roster: &Roster) -> Option<MeshTarget> {
+    // 1. Raw agent-id.
+    if let Ok(id) = ObjectId::parse_str(host) {
+        return Some(MeshTarget {
+            agent_id: id,
+            dial_host: "127.0.0.1".to_string(),
+        });
+    }
+    // 2. Literal IP → subnet route table (never falls through to name).
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        if let Some(id) = roster.lock().await.match_route(ip) {
+            return Some(MeshTarget {
+                agent_id: id,
+                dial_host: host.to_string(),
+            });
+        }
+        // Route miss — refresh once (a new route may have been added).
+        if let Ok(fresh) = fetch_roster(cfg).await {
+            let id = fresh.match_route(ip);
+            *roster.lock().await = fresh;
+            return id.map(|agent_id| MeshTarget {
+                agent_id,
+                dial_host: host.to_string(),
+            });
+        }
+        return None;
+    }
+    // 3. Friendly name.
+    let key = host.to_ascii_lowercase();
+    if let Some(id) = roster.lock().await.names.get(&key).copied() {
+        return Some(MeshTarget {
+            agent_id: id,
+            dial_host: "127.0.0.1".to_string(),
+        });
+    }
+    match fetch_roster(cfg).await {
+        Ok(fresh) => {
+            let id = fresh.names.get(&key).copied();
+            *roster.lock().await = fresh;
+            id.map(|agent_id| MeshTarget {
+                agent_id,
+                dial_host: "127.0.0.1".to_string(),
+            })
+        }
+        Err(e) => {
+            warn!(%e, "mesh: roster refresh failed");
+            None
+        }
+    }
+}
+
+/// Resolve a SOCKS hostname to an agent-id by **name or 24-hex id only** (no
+/// subnet routing) — used by the UDP mesh path, which is name/id-only in v1.
+/// Refreshes on a name miss.
 async fn resolve_agent(host: &str, cfg: &TunnelConfig, roster: &Roster) -> Option<ObjectId> {
     if let Ok(id) = ObjectId::parse_str(host) {
         return Some(id);
     }
     let key = host.to_ascii_lowercase();
-    if let Some(id) = roster.lock().await.get(&key).copied() {
+    if let Some(id) = roster.lock().await.names.get(&key).copied() {
         return Some(id);
     }
-    // Unknown name — refresh once and retry.
     match fetch_roster(cfg).await {
         Ok(fresh) => {
-            let id = fresh.get(&key).copied();
+            let id = fresh.names.get(&key).copied();
             *roster.lock().await = fresh;
             id
         }
@@ -370,8 +473,11 @@ async fn resolve_agent(host: &str, cfg: &TunnelConfig, roster: &Roster) -> Optio
 }
 
 /// GET the tenant's agent roster (`/api/tunnel-client/agents`, TunnelClient
-/// bearer auth) and build a case-insensitive `name → agent-id` map.
-async fn fetch_roster(cfg: &TunnelConfig) -> Result<HashMap<String, ObjectId>> {
+/// bearer auth) → a case-insensitive `name → agent-id` map plus the subnet
+/// route table. The route table is built independently of the name filter so
+/// an unnamed, route-only agent still routes. Unparseable CIDRs are skipped
+/// with a warning; equal-length overlaps log a warning (tiebreak = lowest id).
+async fn fetch_roster(cfg: &TunnelConfig) -> Result<RosterData> {
     let url = format!(
         "{}/api/tunnel-client/agents",
         cfg.server_url.trim_end_matches('/')
@@ -386,13 +492,74 @@ async fn fetch_roster(cfg: &TunnelConfig) -> Result<HashMap<String, ObjectId>> {
         bail!("roster fetch: HTTP {}", resp.status());
     }
     let agents: Vec<AgentInfo> = resp.json().await.context("parse roster json")?;
-    let mut map = HashMap::new();
+    let mut data = RosterData::default();
     for a in agents {
-        if !a.name.is_empty()
-            && let Ok(id) = ObjectId::parse_str(&a.agent_id)
-        {
-            map.insert(a.name.to_ascii_lowercase(), id);
+        let Ok(id) = ObjectId::parse_str(&a.agent_id) else {
+            continue;
+        };
+        // Route table (independent of the name filter — a route-only agent
+        // with an empty name still routes).
+        for cidr in &a.routes {
+            match cidr.parse::<ipnet::IpNet>() {
+                Ok(net) => {
+                    if let Some((_, other)) =
+                        data.routes.iter().find(|(n, oid)| *n == net && *oid != id)
+                    {
+                        warn!(%cidr, agent_a = %other, agent_b = %id, "mesh: two agents advertise the same route — tiebreak is lowest agent-id");
+                    }
+                    data.routes.push((net, id));
+                }
+                Err(e) => warn!(%cidr, %e, "mesh: skipping unparseable advertised route"),
+            }
+        }
+        if !a.name.is_empty() {
+            data.names.insert(a.name.to_ascii_lowercase(), id);
         }
     }
-    Ok(map)
+    Ok(data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn net(s: &str) -> ipnet::IpNet {
+        s.parse().unwrap()
+    }
+    fn ip(s: &str) -> std::net::IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn match_route_longest_prefix_wins() {
+        let broad = ObjectId::new();
+        let specific = ObjectId::new();
+        let r = RosterData {
+            names: HashMap::new(),
+            routes: vec![(net("10.0.0.0/8"), broad), (net("10.1.2.0/24"), specific)],
+        };
+        // Most-specific covering route wins.
+        assert_eq!(r.match_route(ip("10.1.2.5")), Some(specific));
+        // Only the broad route covers this.
+        assert_eq!(r.match_route(ip("10.9.9.9")), Some(broad));
+        // No route covers a public IP.
+        assert_eq!(r.match_route(ip("8.8.8.8")), None);
+    }
+
+    #[test]
+    fn match_route_equal_prefix_tiebreak_lowest_id_is_deterministic() {
+        let a = ObjectId::parse_str("0000000000000000000000aa").unwrap();
+        let b = ObjectId::parse_str("0000000000000000000000bb").unwrap();
+        // Same /24 on two agents; lowest agent-id wins regardless of order.
+        let r1 = RosterData {
+            names: HashMap::new(),
+            routes: vec![(net("192.168.0.0/24"), b), (net("192.168.0.0/24"), a)],
+        };
+        let r2 = RosterData {
+            names: HashMap::new(),
+            routes: vec![(net("192.168.0.0/24"), a), (net("192.168.0.0/24"), b)],
+        };
+        assert_eq!(r1.match_route(ip("192.168.0.5")), Some(a));
+        assert_eq!(r2.match_route(ip("192.168.0.5")), Some(a));
+    }
 }
