@@ -22,8 +22,8 @@ use roomler_agent::win_timer;
 #[cfg(target_os = "windows")]
 use roomler_agent::win32_monitors;
 use roomler_agent::{
-    config, crash_uploader, encode, enrollment, instance_lock, logging, machine, notify,
-    post_install, preflight, service, signaling, updater, watchdog,
+    config, crash_uploader, encode, enrollment, instance_lock, localapi_state, logging, machine,
+    notify, post_install, preflight, service, signaling, updater, watchdog,
 };
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -1397,9 +1397,40 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         tracing::info!("logs upload disabled via ROOMLER_AGENT_LOGS_UPLOAD_DISABLED env var");
     }
 
+    // Unification P1 — LocalAPI: expose read-only node / peer / flow state on a
+    // local-only pipe (Windows) / socket (unix) so `roomler status` and the
+    // desktop app can read it without touching the daemon's internals. The
+    // connected flag + the overlay-view channel are created HERE so they're
+    // stable across WS reconnects (the signaling loop rebuilds the overlay
+    // runtime on each reconnect, but publishes into this same channel). The
+    // listener runs regardless of the overlay feature — without it `peers()` is
+    // simply empty. A bind failure is logged, never fatal.
+    let localapi_connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (overlay_view_tx, overlay_view_rx) =
+        tokio::sync::watch::channel(tunnel_core::localapi::OverlayView::default());
+    let localapi_state: std::sync::Arc<dyn tunnel_core::localapi::LocalApiState> =
+        std::sync::Arc::new(localapi_state::DaemonState::new(
+            cfg.agent_id.clone(),
+            cfg.machine_name.clone(),
+            tunnel_core::localapi::DaemonMode::Service,
+            (!cfg.tenant_id.is_empty()).then(|| cfg.tenant_id.clone()),
+            localapi_connected.clone(),
+            overlay_view_rx,
+        ));
+    let localapi_task = tokio::spawn({
+        let shutdown = shutdown_rx.clone();
+        async move {
+            if let Err(e) = tunnel_core::localapi::serve(localapi_state, shutdown).await {
+                tracing::warn!(error = %e, "localapi: listener exited with error");
+            }
+        }
+    });
+
     let sig_task = tokio::spawn({
         let rx = shutdown_rx.clone();
-        async move { signaling::run(cfg, encoder_preference, rx).await }
+        let connected = localapi_connected.clone();
+        let view_tx = overlay_view_tx.clone();
+        async move { signaling::run(cfg, encoder_preference, rx, connected, view_tx).await }
     });
 
     // Clean-run promotion task: after the agent has been alive for
@@ -1501,6 +1532,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     wd_task.abort();
     clean_run_task.abort();
     crash_drain_task.abort();
+    localapi_task.abort();
     if let Some(t) = upd_task {
         t.abort();
     }
