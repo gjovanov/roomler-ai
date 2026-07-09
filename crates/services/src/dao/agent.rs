@@ -44,6 +44,7 @@ impl AgentDao {
             displays: Vec::new(),
             capabilities: AgentCaps::default(),
             access_policy: AccessPolicy::default(),
+            routes: Vec::new(),
             created_at: now,
             updated_at: now,
             deleted_at: None,
