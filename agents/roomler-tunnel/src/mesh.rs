@@ -12,13 +12,15 @@
 //! (`curl --socks5-hostname neo16:3389` or `<agent-id>:3389`).
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use bson::oid::ObjectId;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::AsyncReadExt;
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Mutex;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::TunnelConfig;
 use crate::forward::{self, TransportPref};
@@ -77,9 +79,18 @@ pub async fn run_mesh(cfg: TunnelConfig, local: u16, transport: TransportPref) -
         let ports = Arc::clone(&ports);
         let roster = Arc::clone(&roster);
         tokio::spawn(async move {
-            // SOCKS server handshake → the client's CONNECT target.
-            let (host, port) = match socks5::accept_connect(&mut tcp).await {
-                Ok(hp) => hp,
+            // SOCKS server handshake → CONNECT target or UDP ASSOCIATE.
+            let (host, port) = match socks5::accept_request(&mut tcp).await {
+                Ok(socks5::Socks5Request::Connect { host, port }) => (host, port),
+                Ok(socks5::Socks5Request::UdpAssociate) => {
+                    // UDP ASSOCIATE routes per-datagram (each names an agent);
+                    // hand off to the mesh UDP relay.
+                    if let Err(e) = handle_associate_mesh(tcp, cfg, transport, ports, roster).await
+                    {
+                        warn!(%peer_addr, %e, "mesh UDP associate ended with error");
+                    }
+                    return;
+                }
                 Err(e) => {
                     warn!(%peer_addr, %e, "mesh socks handshake failed");
                     return;
@@ -118,6 +129,155 @@ pub async fn run_mesh(cfg: TunnelConfig, local: u16, transport: TransportPref) -
     }
 }
 
+/// Handle a SOCKS5 UDP ASSOCIATE on the mesh listener. Binds a local
+/// relay socket, replies with its address, then relays each app datagram
+/// to the agent named in the datagram's SOCKS-UDP header by SOCKS-UDP-
+/// chaining into that agent's Phase-1 loopback proxy (which already does
+/// UDP ASSOCIATE for a single agent). The target host names an agent
+/// (name / 24-hex id); the agent dials `127.0.0.1:port` (its own host),
+/// exactly like the mesh TCP path. Association lifetime = the SOCKS
+/// control TCP connection (RFC 1928).
+async fn handle_associate_mesh(
+    mut tcp: TcpStream,
+    cfg: TunnelConfig,
+    transport: TransportPref,
+    ports: ProxyPorts,
+    roster: Roster,
+) -> Result<()> {
+    let relay = Arc::new(
+        UdpSocket::bind(("127.0.0.1", 0))
+            .await
+            .context("bind mesh udp relay")?,
+    );
+    let relay_addr = relay.local_addr()?;
+    socks5::reply_bound(&mut tcp, socks5::REP_SUCCESS, relay_addr).await;
+    info!(%relay_addr, "mesh: UDP ASSOCIATE relay bound");
+
+    // agent-id → the mesh-side UDP socket chained to that agent's proxy relay.
+    let chains: Arc<Mutex<HashMap<ObjectId, Arc<UdpSocket>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let mut app_src: Option<SocketAddr> = None;
+    let mut buf = vec![0u8; 64 * 1024 + 512];
+
+    loop {
+        tokio::select! {
+            // App's TCP control conn closing ends the whole association.
+            _ = drain_control(&mut tcp) => {
+                debug!("mesh: UDP control connection closed; ending association");
+                break;
+            }
+            recvd = relay.recv_from(&mut buf) => {
+                let (n, from) = match recvd {
+                    Ok(x) => x,
+                    Err(e) => { warn!(%e, "mesh: udp relay recv_from failed"); continue; }
+                };
+                let src = *app_src.get_or_insert(from);
+                if from != src {
+                    debug!(%from, %src, "mesh: udp datagram from unexpected source — dropping");
+                    continue;
+                }
+                let (name, port, off) = match socks5::parse_udp_datagram(&buf[..n]) {
+                    Ok(x) => x,
+                    Err(e) => { debug!(%e, "mesh: malformed socks udp datagram — dropping"); continue; }
+                };
+                let Some(agent_id) = resolve_agent(&name, &cfg, &roster).await else {
+                    debug!(host = %name, "mesh: udp datagram for unknown agent — dropping");
+                    continue;
+                };
+                let existing = chains.lock().await.get(&agent_id).cloned();
+                let sock = match existing {
+                    Some(s) => s,
+                    None => match open_udp_chain(
+                        agent_id, &cfg, transport, &ports, &relay, src, &name, &chains,
+                    )
+                    .await
+                    {
+                        Ok(s) => s,
+                        Err(e) => {
+                            warn!(%agent_id, %e, "mesh: udp chain open failed");
+                            continue;
+                        }
+                    },
+                };
+                // Forward to the proxy relay, target rewritten to the agent's
+                // own host (`127.0.0.1:port`) — the mesh addressing model.
+                let framed = socks5::encode_udp_datagram("127.0.0.1", port, &buf[off..n]);
+                if let Err(e) = sock.send(&framed).await {
+                    debug!(%agent_id, %e, "mesh: udp send to agent proxy failed");
+                }
+            }
+        }
+    }
+    // Dropping `chains` drops the mesh-side sockets; each response task sees
+    // its socket close and exits, dropping its held control-TCP → the proxy
+    // tears the per-agent association down.
+    Ok(())
+}
+
+/// Open a SOCKS-UDP chain into `agent_id`'s Phase-1 loopback proxy:
+/// spawn/reuse the proxy, TCP-connect + UDP ASSOCIATE against it, and bind
+/// a mesh-side UDP socket connected to the proxy's relay. Spawns a task
+/// pumping the proxy's responses back to the app, re-framed with the agent
+/// `name` as source (so the app sees a reply from what it addressed).
+#[allow(clippy::too_many_arguments)]
+async fn open_udp_chain(
+    agent_id: ObjectId,
+    cfg: &TunnelConfig,
+    transport: TransportPref,
+    ports: &ProxyPorts,
+    app_relay: &Arc<UdpSocket>,
+    app_src: SocketAddr,
+    name: &str,
+    chains: &Arc<Mutex<HashMap<ObjectId, Arc<UdpSocket>>>>,
+) -> Result<Arc<UdpSocket>> {
+    let proxy_port = get_or_spawn_proxy(agent_id, cfg, transport, ports).await?;
+    let mut control = connect_tcp(proxy_port).await?;
+    let proxy_relay = socks5::client_udp_associate(&mut control).await?;
+    let sock = Arc::new(
+        UdpSocket::bind(("127.0.0.1", 0))
+            .await
+            .context("bind mesh->proxy udp")?,
+    );
+    sock.connect(proxy_relay)
+        .await
+        .context("connect to agent proxy relay")?;
+    debug!(%agent_id, %proxy_relay, "mesh: udp chain to agent proxy open");
+
+    let sock_rx = Arc::clone(&sock);
+    let app_relay = Arc::clone(app_relay);
+    let name = name.to_string();
+    let chains_rx = Arc::clone(chains);
+    tokio::spawn(async move {
+        let _control = control; // hold the association open for its lifetime
+        let mut buf = vec![0u8; 64 * 1024 + 512];
+        while let Ok(n) = sock_rx.recv(&mut buf).await {
+            // Proxy response header names 127.0.0.1:port; rewrite source to
+            // the agent name the app used so the app accepts the reply.
+            if let Ok((_h, port, off)) = socks5::parse_udp_datagram(&buf[..n]) {
+                let reframed = socks5::encode_udp_datagram(&name, port, &buf[off..n]);
+                let _ = app_relay.send_to(&reframed, app_src).await;
+            }
+        }
+        chains_rx.lock().await.remove(&agent_id);
+    });
+
+    chains.lock().await.insert(agent_id, Arc::clone(&sock));
+    Ok(sock)
+}
+
+/// Read + discard the SOCKS control connection until EOF/error — its close
+/// is the UDP association's teardown signal (RFC 1928).
+async fn drain_control(tcp: &mut TcpStream) -> std::io::Result<()> {
+    let mut b = [0u8; 256];
+    loop {
+        match tcp.read(&mut b).await {
+            Ok(0) => return Ok(()),
+            Ok(_) => {}
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Get the loopback port of `agent_id`'s Phase-1 SOCKS proxy, spawning it (a
 /// persistent `run_socks5` task on a free loopback port) on first use.
 async fn get_or_spawn_proxy(
@@ -151,21 +311,28 @@ async fn get_or_spawn_proxy(
     Ok(port)
 }
 
-/// Connect to a per-agent loopback proxy and SOCKS-CONNECT to `127.0.0.1:dst_port`
-/// (the agent's own host from its vantage). Retries the TCP connect briefly while
-/// the freshly-spawned proxy binds its listener.
-async fn connect_proxy(proxy_port: u16, dst_port: u16) -> Result<TcpStream> {
+/// TCP-connect to a per-agent loopback proxy, retrying briefly while the
+/// freshly-spawned proxy binds its listener.
+async fn connect_tcp(proxy_port: u16) -> Result<TcpStream> {
     let deadline = tokio::time::Instant::now() + PROXY_READY_TIMEOUT;
-    let mut stream = loop {
+    loop {
         match TcpStream::connect(("127.0.0.1", proxy_port)).await {
-            Ok(s) => break s,
+            Ok(s) => {
+                let _ = s.set_nodelay(true);
+                return Ok(s);
+            }
             Err(_) if tokio::time::Instant::now() < deadline => {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
             Err(e) => return Err(e).context("connect to agent proxy"),
         }
-    };
-    let _ = stream.set_nodelay(true);
+    }
+}
+
+/// Connect to a per-agent loopback proxy and SOCKS-CONNECT to `127.0.0.1:dst_port`
+/// (the agent's own host from its vantage).
+async fn connect_proxy(proxy_port: u16, dst_port: u16) -> Result<TcpStream> {
+    let mut stream = connect_tcp(proxy_port).await?;
     socks5::client_connect(&mut stream, "127.0.0.1", dst_port).await?;
     Ok(stream)
 }

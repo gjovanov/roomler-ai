@@ -210,6 +210,56 @@ pub async fn client_connect(stream: &mut TcpStream, dst_host: &str, dst_port: u1
     Ok(())
 }
 
+/// SOCKS5 **client** UDP ASSOCIATE against an already-connected `stream`
+/// (a per-agent loopback proxy in the mesh): negotiate no-auth, request
+/// UDP ASSOCIATE, and return the proxy's relay `SocketAddr` (its
+/// `BND.ADDR`/`BND.PORT`) that the caller sends SOCKS-UDP datagrams to.
+/// The caller MUST keep `stream` open — the association lives as long as
+/// this TCP control connection (RFC 1928).
+pub async fn client_udp_associate(stream: &mut TcpStream) -> Result<std::net::SocketAddr> {
+    stream
+        .write_all(&[VER, 0x01, METHOD_NO_AUTH])
+        .await
+        .context("socks udp greeting")?;
+    let mut sel = [0u8; 2];
+    stream
+        .read_exact(&mut sel)
+        .await
+        .context("socks udp method reply")?;
+    if sel != [VER, METHOD_NO_AUTH] {
+        bail!("proxy rejected no-auth (got {sel:?})");
+    }
+    // UDP ASSOCIATE with an advisory DST of 0.0.0.0:0.
+    stream
+        .write_all(&[VER, CMD_UDP_ASSOCIATE, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0])
+        .await
+        .context("socks udp associate request")?;
+    let mut head = [0u8; 4];
+    stream
+        .read_exact(&mut head)
+        .await
+        .context("socks udp reply header")?;
+    if head[1] != REP_SUCCESS {
+        bail!("proxy UDP ASSOCIATE failed (REP={:#x})", head[1]);
+    }
+    let ip = match head[3] {
+        ATYP_IPV4 => {
+            let mut b = [0u8; 4];
+            stream.read_exact(&mut b).await.context("udp reply ipv4")?;
+            std::net::IpAddr::V4(std::net::Ipv4Addr::from(b))
+        }
+        ATYP_IPV6 => {
+            let mut b = [0u8; 16];
+            stream.read_exact(&mut b).await.context("udp reply ipv6")?;
+            std::net::IpAddr::V6(std::net::Ipv6Addr::from(b))
+        }
+        other => bail!("proxy returned unsupported BND.ADDR atyp {other:#x}"),
+    };
+    let mut p = [0u8; 2];
+    stream.read_exact(&mut p).await.context("udp reply port")?;
+    Ok(std::net::SocketAddr::new(ip, u16::from_be_bytes(p)))
+}
+
 /// Parse a SOCKS5 UDP-relay datagram (RFC 1928 §7):
 /// `[RSV(2)=0 | FRAG(1) | ATYP | DST.ADDR | DST.PORT | DATA]`.
 /// Returns `(dst_host, dst_port, data_offset)` — the payload is
@@ -423,6 +473,31 @@ mod tests {
         assert_eq!(head[3], ATYP_IPV4);
         assert_eq!(&rest[..4], &[127, 0, 0, 1]);
         assert_eq!(u16::from_be_bytes([rest[4], rest[5]]), 51820);
+    }
+
+    /// The mesh's SOCKS-UDP CLIENT handshake against a per-agent proxy:
+    /// `client_udp_associate` must negotiate no-auth, request UDP
+    /// ASSOCIATE, and return the proxy's relay bind addr. Driven against
+    /// a real `accept_request` + `reply_bound` server (the proxy side).
+    #[tokio::test]
+    async fn client_udp_associate_reads_relay_addr() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                accept_request(&mut s).await.unwrap(),
+                Socks5Request::UdpAssociate
+            );
+            let bind: std::net::SocketAddr = "127.0.0.1:40404".parse().unwrap();
+            reply_bound(&mut s, REP_SUCCESS, bind).await;
+            // Hold the control conn briefly (association lifetime).
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        });
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        let relay = client_udp_associate(&mut c).await.unwrap();
+        assert_eq!(relay, "127.0.0.1:40404".parse().unwrap());
+        srv.await.unwrap();
     }
 
     #[test]
