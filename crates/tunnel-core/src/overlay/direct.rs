@@ -19,20 +19,21 @@
 
 use std::net::{Ipv4Addr, SocketAddr};
 
-/// `ROOMLER_AGENT_OVERLAY_DIRECT` — default **ON**. Set `0`/`false`/`no`/`off`
-/// to disable the direct LAN path and force pure relay (the pre-rc.131
-/// behaviour) if a field host misbehaves. Matches the agent's truthy
-/// convention (and the WFP gate's).
+/// `ROOMLER_NODE_OVERLAY_DIRECT` (legacy `ROOMLER_AGENT_OVERLAY_DIRECT` still
+/// honoured — see [`crate::env::node_env`]) — default **ON**. Set
+/// `0`/`false`/`no`/`off` to disable the direct LAN path and force pure relay
+/// (the pre-rc.131 behaviour) if a field host misbehaves. Matches the node's
+/// truthy convention (and the WFP gate's).
 pub fn direct_enabled() -> bool {
-    match std::env::var("ROOMLER_AGENT_OVERLAY_DIRECT") {
-        Ok(v) => {
+    match crate::env::node_env("OVERLAY_DIRECT") {
+        Some(v) => {
             let t = v.trim();
             !(t.eq_ignore_ascii_case("0")
                 || t.eq_ignore_ascii_case("false")
                 || t.eq_ignore_ascii_case("no")
                 || t.eq_ignore_ascii_case("off"))
         }
-        Err(_) => true,
+        None => true,
     }
 }
 

@@ -12,6 +12,7 @@ use roomler_ai_remote_control::{
     models::{AgentCaps, DisplayInfo, EndReason, OsKind},
     signaling::{AgentCloseReason, ClientMsg, ServerMsg},
 };
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -22,6 +23,7 @@ use crate::indicator::ViewerIndicator;
 use crate::notify;
 use crate::peer::AgentPeer;
 use crate::watchdog;
+use tunnel_core::localapi::OverlayView;
 use tunnel_core::transport::relay;
 
 /// Capacity of the outbound channel peers use to push `ClientMsg` back into
@@ -94,12 +96,38 @@ impl Drop for SignalingPumpGuard {
     }
 }
 
+/// Unification P1 — RAII flag that marks the daemon "connected to the
+/// coordination server" for the LocalAPI (`roomler status`) while a WS
+/// connection is live, and clears it on EVERY exit path from `connect_once`
+/// (Ok, `?`-propagated Err, explicit return) — same discipline as
+/// [`SignalingPumpGuard`]. The `DaemonState` reads this flag; while it's false
+/// `peers()` reports none (the overlay carriers are torn down on disconnect).
+struct ConnectedGuard(Arc<AtomicBool>);
+
+impl ConnectedGuard {
+    fn mark(flag: Arc<AtomicBool>) -> Self {
+        flag.store(true, Ordering::Relaxed);
+        Self(flag)
+    }
+}
+
+impl Drop for ConnectedGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+}
+
 /// Drive the signaling loop forever. Returns only on fatal error (e.g.
 /// auth rejection) or shutdown signal.
 pub async fn run(
     cfg: AgentConfig,
     encoder_preference: crate::encode::EncoderPreference,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
+    // Unification P1 — LocalAPI live handles (stable across reconnects, owned by
+    // `run_cmd`): a flag flipped while connected, and the channel the overlay
+    // runtime publishes its mesh view on.
+    connected: Arc<AtomicBool>,
+    overlay_view_tx: tokio::sync::watch::Sender<OverlayView>,
 ) -> Result<()> {
     // One overlay handle, reused across reconnects. Failing to bring up
     // the indicator is non-fatal — the session still works, the user
@@ -168,6 +196,8 @@ pub async fn run(
             shutdown.clone(),
             indicator.clone(),
             consent_broker.clone(),
+            connected.clone(),
+            overlay_view_tx.clone(),
         )
         .await
         {
@@ -368,12 +398,15 @@ enum ConnectError {
     Transient(#[from] anyhow::Error),
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn connect_once(
     cfg: &AgentConfig,
     encoder_preference: crate::encode::EncoderPreference,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     indicator: ViewerIndicator,
     consent_broker: crate::consent::ConsentBroker,
+    connected: Arc<AtomicBool>,
+    overlay_view_tx: tokio::sync::watch::Sender<OverlayView>,
 ) -> Result<(), ConnectError> {
     let url = format!(
         "{}?token={}&role=agent",
@@ -417,6 +450,9 @@ async fn connect_once(
     // backoff-reconnect cycle isn't counted against the 90 s stall
     // threshold. See the type-level comment on `SignalingPumpGuard`.
     let _pump_guard = SignalingPumpGuard::activate();
+    // Unification P1 — mark the daemon connected for the LocalAPI; the guard
+    // clears it on every return path (like `_pump_guard`).
+    let _connected_guard = ConnectedGuard::mark(connected);
 
     // Say hello.
     let hello = ClientMsg::AgentHello {
@@ -445,7 +481,12 @@ async fn connect_once(
     // runtime sends its `ClientMsg`s back through `outbound_tx`, like any
     // peer, and tears down when this connection's `overlay_evt_tx` drops.
     #[cfg(feature = "overlay-l3")]
-    let overlay_evt_tx = crate::overlay::maybe_start(cfg, outbound_tx.clone());
+    let overlay_evt_tx =
+        crate::overlay::maybe_start(cfg, outbound_tx.clone(), overlay_view_tx.clone());
+    // Without the overlay feature nothing publishes the view; keep the param
+    // used so the LocalAPI wiring stays feature-agnostic in `run_cmd`.
+    #[cfg(not(feature = "overlay-l3"))]
+    let _ = &overlay_view_tx;
     let mut peers: HashMap<bson::oid::ObjectId, AgentPeer> = HashMap::new();
     // Codec selected for each pending session (computed from the
     // browser∩agent intersection when `rc:session.request` arrives, read

@@ -263,3 +263,54 @@ textarea {
   margin: 12px 0 0;
   min-height: 1em;
 }
+
+/* ── P2: Devices view (devices.js) ─────────────────────────────────── */
+#devices-view {
+  margin-top: 20px;
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+}
+#devices-view h2 {
+  margin: 0 0 8px;
+}
+.peers {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  margin-top: 8px;
+}
+.peers th {
+  text-align: left;
+  font-weight: 500;
+  color: var(--muted);
+  font-size: 12px;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border);
+}
+.peers td {
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+}
+.dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  vertical-align: middle;
+}
+.dot-on { background: var(--ok); }
+.dot-off { background: var(--muted); }
+.badge {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 600;
+  border: 1px solid transparent;
+}
+/* One colour per connection type — mirrors ConnectionType (snake_case). */
+.badge-direct  { color: var(--ok);      background: rgba(21, 128, 61, 0.12);   border-color: var(--ok); }
+.badge-relay   { color: var(--primary); background: rgba(25, 118, 210, 0.12);   border-color: var(--primary); }
+.badge-tunnel  { color: var(--warn);    background: rgba(180, 83, 9, 0.12);     border-color: var(--warn); }
+.badge-blocked { color: var(--error);   background: rgba(185, 28, 28, 0.12);    border-color: var(--error); }
+.badge-offline { color: var(--muted);   background: rgba(107, 114, 128, 0.12);  border-color: var(--muted); }

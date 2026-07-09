@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bson::oid::ObjectId;
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
 use super::WgKeypair;
@@ -35,6 +35,7 @@ use super::netmap::{PeerConfig, peer_config_from_netmap};
 use super::relay_link::{ReadyLink, RelayCoordinator};
 use super::tun::TunIo;
 use super::wg::{Carrier, QUIC_BUILD_TIMEOUT, WG_OVERHEAD, WgDevice, overlay_quic_enabled};
+use crate::localapi::{ConnectionType, OverlayView, PeerInfo};
 use roomler_ai_remote_control::signaling::{ClientMsg, IceServer, NetmapPeer, OverlayNetworkInfo};
 
 /// rc.131/132/143 — direct LAN carrier context: one UDP socket per LAN
@@ -225,6 +226,58 @@ pub struct OverlayRuntime {
     /// Phase 1 — subnet CIDRs this node advertises as a router (from config).
     /// Sent in the join; the server gates them behind admin approval.
     advertised_routes: Vec<String>,
+    /// Unification P1 — where to publish this node's live overlay view (self
+    /// IP + peers with connection type) for the daemon's LocalAPI. `None` in
+    /// test / direct mode (nothing reads it there).
+    peer_view: Option<watch::Sender<OverlayView>>,
+}
+
+/// Map the runtime's live carrier bookkeeping into the LocalAPI [`OverlayView`]
+/// — the daemon-internal shape the `roomler status` / `peers` verbs read. Pure
+/// (no I/O / no `self`) so the [`ConnectionType`] classification is unit-tested
+/// directly. `current_peers` (the netmap) is authoritative for membership;
+/// `by_node` tells us HOW we currently reach each one:
+/// - installed **direct** carrier → [`ConnectionType::Direct`]
+/// - installed **relay** carrier → [`ConnectionType::Relay`]
+/// - known + server-reachable but no carrier yet (relay pending, cooling down)
+///   → [`ConnectionType::Blocked`]
+/// - not server-reachable → [`ConnectionType::Offline`]
+///
+/// `Tunnel` is never produced here — that's the userspace-tunnel fallback the
+/// daemon labels once the tunnel-client folds in (P3). RTT / last-seen aren't
+/// tracked by the runtime yet, so both are `None`.
+fn build_overlay_view(
+    self_ip: &str,
+    by_node: &HashMap<ObjectId, Installed>,
+    current_peers: &HashMap<ObjectId, NetmapPeer>,
+) -> OverlayView {
+    let mut peers: Vec<PeerInfo> = current_peers
+        .values()
+        .map(|np| {
+            let connection = match by_node.get(&np.node_id) {
+                Some(inst) if inst.is_direct => ConnectionType::Direct,
+                Some(_) => ConnectionType::Relay,
+                None if np.reachable => ConnectionType::Blocked,
+                None => ConnectionType::Offline,
+            };
+            PeerInfo {
+                node_id: np.node_id.to_hex(),
+                name: np.name.clone(),
+                overlay_ip: (!np.overlay_ip.is_empty()).then(|| np.overlay_ip.clone()),
+                online: np.reachable,
+                connection,
+                rtt_ms: None,
+                last_seen_ms: None,
+            }
+        })
+        .collect();
+    // Stable order so a LocalAPI reader doesn't see the list jitter between
+    // otherwise-identical reads (HashMap iteration order is nondeterministic).
+    peers.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+    OverlayView {
+        self_ip: (!self_ip.is_empty()).then(|| self_ip.to_string()),
+        peers,
+    }
 }
 
 impl OverlayRuntime {
@@ -243,6 +296,7 @@ impl OverlayRuntime {
             tun_factory,
             mtu,
             advertised_routes: Vec::new(),
+            peer_view: None,
         }
     }
 
@@ -261,6 +315,7 @@ impl OverlayRuntime {
             tun_factory,
             mtu,
             advertised_routes: Vec::new(),
+            peer_view: None,
         }
     }
 
@@ -268,6 +323,33 @@ impl OverlayRuntime {
     pub fn with_advertised_routes(mut self, routes: Vec<String>) -> Self {
         self.advertised_routes = routes;
         self
+    }
+
+    /// Unification P1 — publish this node's live overlay view (self IP + peers
+    /// with connection type) on `tx` so the daemon's LocalAPI can answer
+    /// `roomler status` / `peers`. The runtime republishes on join and after
+    /// every netmap / carrier-state change. Unset (test / direct mode) → the
+    /// runtime publishes nothing.
+    pub fn with_peer_view(mut self, tx: watch::Sender<OverlayView>) -> Self {
+        self.peer_view = Some(tx);
+        self
+    }
+
+    /// Rebuild + publish the [`OverlayView`] if a LocalAPI receiver is wired.
+    /// Cheap (a few-element Vec + a `watch` replace); called at each point the
+    /// netmap or a carrier changes. The `watch` keeps only the latest value, so
+    /// coalescing bursts is automatic.
+    fn publish_view(
+        &self,
+        self_ip: &str,
+        by_node: &HashMap<ObjectId, Installed>,
+        current_peers: &HashMap<ObjectId, NetmapPeer>,
+    ) {
+        if let Some(tx) = &self.peer_view {
+            // send_replace never fails (unlike send) even if the receiver is
+            // transiently absent, and keeps the value for the next borrow.
+            tx.send_replace(build_overlay_view(self_ip, by_node, current_peers));
+        }
     }
 
     /// Run until the event channel closes (WS disconnect). Sends
@@ -425,6 +507,9 @@ impl OverlayRuntime {
             &direct_cooldown,
         )
         .await;
+        // Unification P1 — first LocalAPI view, so `roomler status` right after
+        // join isn't empty until the first sweep.
+        self.publish_view(&self_ip, &by_node, &current_peers);
 
         // Phase 2 — steady state.
         loop {
@@ -446,6 +531,9 @@ impl OverlayRuntime {
                         &mut direct_cooldown, &mut direct_fail_count,
                         &mut relay_refresh_cooldown, &current_peers,
                     ).await;
+                    // A direct→relay fallback (or relay refresh) changed how we
+                    // reach a peer — refresh the LocalAPI view.
+                    self.publish_view(&self_ip, &by_node, &current_peers);
                 },
                 // rc.146 — re-assert every installed peer's /32 on the overlay
                 // NIC (evict any competing route a full-tunnel VPN re-added, then
@@ -464,6 +552,7 @@ impl OverlayRuntime {
                         current_peers = peers.iter().map(|p| (p.node_id, p.clone())).collect();
                         if let Some(names) = &dns_names { sync_name_map(names, &current_peers).await; }
                         self.install_peers(&mut wg, &mut by_node, &mut relay, &tun, &peers, direct_ctx.as_ref(), &direct_cooldown).await;
+                        self.publish_view(&self_ip, &by_node, &current_peers);
                     }
                     Some(OverlayEvent::NetmapDelta { upserts, removes }) => {
                         for p in &upserts { current_peers.insert(p.node_id, p.clone()); }
@@ -480,6 +569,7 @@ impl OverlayRuntime {
                             }
                         }
                         if let Some(names) = &dns_names { sync_name_map(names, &current_peers).await; }
+                        self.publish_view(&self_ip, &by_node, &current_peers);
                     }
                     Some(OverlayEvent::RelayGrant { peer_node_id, ice_servers, pair_key }) => {
                         if let Some(r) = relay.as_mut()
@@ -959,6 +1049,72 @@ mod tests {
             direct_retry_cooldown(DIRECT_MAX_FAILURES + 3),
             DIRECT_DENY_COOLDOWN
         );
+    }
+
+    #[test]
+    fn overlay_view_classifies_connection_types_and_sorts() {
+        // Locks the LocalAPI connection-type mapping (the Tailscale-style
+        // per-device "how am I reaching it" column): installed-direct → Direct,
+        // installed-relay → Relay, reachable-but-no-carrier → Blocked,
+        // not-reachable → Offline. And the peer list is node_id-sorted so a
+        // LocalAPI reader doesn't see it jitter.
+        fn oid(b: u8) -> ObjectId {
+            ObjectId::from_bytes([b, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+        }
+        fn np(id: ObjectId, name: &str, ip: &str, reachable: bool) -> NetmapPeer {
+            NetmapPeer {
+                node_id: id,
+                overlay_ip: ip.into(),
+                name: name.into(),
+                wg_public_key: String::new(),
+                endpoints: vec![],
+                relay_home: None,
+                reachable,
+                supports_quic: false,
+                routes: vec![],
+            }
+        }
+        fn installed(is_direct: bool, ip: Ipv4Addr) -> Installed {
+            Installed {
+                pubkey: [0u8; 32],
+                overlay_ip: ip,
+                is_direct,
+                since: Instant::now(),
+                last_traffic: (0, 0),
+                bad_sweeps: 0,
+            }
+        }
+
+        let (d, r, b, o) = (oid(0x01), oid(0x02), oid(0x03), oid(0x04));
+        let mut by_node = HashMap::new();
+        by_node.insert(d, installed(true, Ipv4Addr::new(100, 64, 0, 1)));
+        by_node.insert(r, installed(false, Ipv4Addr::new(100, 64, 0, 2)));
+
+        let mut current = HashMap::new();
+        current.insert(d, np(d, "direct-peer", "100.64.0.1", true));
+        current.insert(r, np(r, "relay-peer", "100.64.0.2", true));
+        current.insert(b, np(b, "pending-peer", "100.64.0.3", true)); // no carrier
+        current.insert(o, np(o, "offline-peer", "100.64.0.4", false));
+
+        let view = build_overlay_view("100.64.0.9", &by_node, &current);
+        assert_eq!(view.self_ip.as_deref(), Some("100.64.0.9"));
+        assert_eq!(view.peers.len(), 4);
+        // Sorted by node_id hex → 01,02,03,04.
+        assert_eq!(view.peers[0].connection, ConnectionType::Direct);
+        assert_eq!(view.peers[0].name, "direct-peer");
+        assert_eq!(view.peers[0].overlay_ip.as_deref(), Some("100.64.0.1"));
+        assert!(view.peers[0].online);
+        assert_eq!(view.peers[1].connection, ConnectionType::Relay);
+        assert_eq!(view.peers[2].connection, ConnectionType::Blocked);
+        assert!(
+            view.peers[2].online,
+            "blocked peer is still server-reachable"
+        );
+        assert_eq!(view.peers[3].connection, ConnectionType::Offline);
+        assert!(!view.peers[3].online);
+        // RTT / last-seen aren't tracked by the runtime yet.
+        assert!(view.peers[0].rtt_ms.is_none());
+        assert!(view.peers[0].last_seen_ms.is_none());
     }
 
     struct MockTun {
