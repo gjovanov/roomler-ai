@@ -14,6 +14,13 @@ path = "src/main.rs"
 # config struct shape + enrollment HTTP client transitively.
 roomler-agent = { path = "../roomler-agent" }
 
+# LocalAPI client (unification P2): the tray reads live node/peer state from
+# the running daemon via `tunnel_core::localapi::Client`. Adds ZERO new crates
+# to the build — tunnel-core is already in the graph transitively via
+# `roomler-agent` → `roomler-ai-tunnel-core`; the direct dep just makes the
+# `localapi` module nameable from tray code.
+roomler-ai-tunnel-core = { path = "../../crates/tunnel-core" }
+
 # Tauri 2.x runtime + tray + plugins.
 #
 # `custom-protocol` is REQUIRED for plain `cargo build --release` to

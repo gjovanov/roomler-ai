@@ -12,6 +12,7 @@ use roomler_agent::{logging, notify};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::process::Command;
+use tunnel_core::localapi::{self, NodeStatus, PeerInfo};
 
 /// What the SPA shows on the status page. Returned from
 /// [`cmd_status`]. All fields are JSON-friendly primitives so the
@@ -66,6 +67,69 @@ pub fn cmd_status() -> StatusReport {
         attention,
         log_dir,
         config_dir,
+    }
+}
+
+/// What the "Devices" page renders (unification P2). Read from the running
+/// daemon over the LocalAPI. `available` = the daemon's local control endpoint
+/// was reachable; the nested `status.connected` is the SEPARATE daemon↔server
+/// link. All JSON-friendly (the `localapi` wire types are `Serialize`).
+#[derive(Debug, Serialize)]
+pub struct DeviceView {
+    /// The daemon's LocalAPI pipe/socket was reachable.
+    pub available: bool,
+    /// Why not, when `available` is false: `"daemon_unreachable"` (pipe absent —
+    /// the agent isn't running) or `"connect_error"` (other I/O).
+    pub reason: Option<String>,
+    /// This node's status, when reachable.
+    pub status: Option<NodeStatus>,
+    /// Peers with their current connection type (empty when the overlay is off
+    /// or the daemon is disconnected from the server).
+    pub peers: Vec<PeerInfo>,
+}
+
+impl DeviceView {
+    fn unavailable(reason: &str) -> Self {
+        Self {
+            available: false,
+            reason: Some(reason.to_string()),
+            status: None,
+            peers: Vec::new(),
+        }
+    }
+}
+
+/// Read the live device view from the daemon over the LocalAPI. NEVER errors
+/// (mirrors [`cmd_status`]): if the agent isn't running the pipe/socket is
+/// absent, and this returns `available:false` + a `reason` so the SPA renders a
+/// clean "device service not running" state instead of a rejected promise. On
+/// success it issues `status` then `peers` on ONE connection.
+#[tauri::command]
+pub async fn cmd_device_view() -> DeviceView {
+    let mut client = match localapi::connect().await {
+        Ok(c) => c,
+        Err(e) => {
+            let reason = if e.kind() == std::io::ErrorKind::NotFound {
+                "daemon_unreachable"
+            } else {
+                "connect_error"
+            };
+            return DeviceView::unavailable(reason);
+        }
+    };
+    let status = match client.status().await {
+        Ok(s) => s,
+        // Reached the endpoint but the exchange failed (daemon shutting down,
+        // protocol error) — treat as unreachable for the UI.
+        Err(_) => return DeviceView::unavailable("daemon_unreachable"),
+    };
+    // Peers are best-effort: a status-ok / peers-fail shouldn't blank the view.
+    let peers = client.peers().await.unwrap_or_default();
+    DeviceView {
+        available: true,
+        reason: None,
+        status: Some(status),
+        peers,
     }
 }
 

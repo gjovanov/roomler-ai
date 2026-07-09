@@ -62,8 +62,44 @@
         </div>
         <pre id="action-output" class="output" hidden></pre>
       </section>
+
+      <!-- Devices (unification P2): this node + its overlay peers, read live
+           from the running daemon over the LocalAPI (cmd_device_view). -->
+      <section id="devices-view">
+        <h2 class="muted small">Devices</h2>
+        <p id="devices-loading" class="muted small">Loading devices…</p>
+
+        <div id="devices-unavailable" class="banner banner-warn" hidden>
+          <div>
+            <strong>Device service not running</strong>
+            <p class="muted small">The Roomler agent isn't running on this machine, so live device state is unavailable.</p>
+          </div>
+        </div>
+
+        <div id="devices-self" hidden>
+          <dl class="kv">
+            <dt>This device</dt>
+            <dd id="dv-self-name" class="mono">—</dd>
+            <dt>Overlay IP</dt>
+            <dd id="dv-self-ip" class="mono">—</dd>
+            <dt>Server link</dt>
+            <dd id="dv-self-conn">—</dd>
+            <dt>Device version</dt>
+            <dd id="dv-self-version" class="mono small">—</dd>
+          </dl>
+
+          <p id="dv-peers-empty" class="muted small" hidden></p>
+          <table id="dv-peers-table" class="peers" hidden>
+            <thead>
+              <tr><th>Device</th><th>Overlay IP</th><th>Connection</th><th>RTT</th></tr>
+            </thead>
+            <tbody id="dv-peers-body"></tbody>
+          </table>
+        </div>
+      </section>
     </main>
     <script src="status.js"></script>
     <script src="consent.js"></script>
+    <script src="devices.js"></script>
   </body>
 </html>
