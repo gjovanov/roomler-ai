@@ -27,7 +27,11 @@
 //! locks this; do not relax it.
 
 pub mod auth;
+/// Node env-var reads with `ROOMLER_NODE_*` → legacy `ROOMLER_AGENT_*` fallback.
+pub mod env;
 pub mod forward;
+/// LocalAPI — the daemon's local control surface (P1: read-only protocol).
+pub mod localapi;
 pub mod mux;
 /// Overlay L3 data plane (userspace WireGuard mesh) — feature `overlay`.
 #[cfg(feature = "overlay")]
