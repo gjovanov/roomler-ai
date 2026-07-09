@@ -6785,6 +6785,7 @@ dependencies = [
  "anyhow",
  "gethostname 0.5.0",
  "roomler-agent",
+ "roomler-ai-tunnel-core",
  "serde",
  "serde_json",
  "tauri",
