@@ -101,19 +101,19 @@ if-addrs = { version = "0.15", optional = true }
 # pulling a TUN dependency.
 tun = { version = "0.8", optional = true, features = ["async"] }
 
-# Overlay L3 firewall (`overlay-l3`, Windows only): program the Windows
-# Filtering Platform directly so the overlay's inbound/outbound survives a
-# GPO-locked Defender Firewall (a high-weight, hard-permit sublayer scoped
-# to the `roomler` adapter LUID — Tailscale's approach). Same `windows-sys`
-# 0.61 the `tun` crate already resolves, so no new crate and no C build.
-# `dep:windows-sys` is activated by `overlay-l3`; the `cfg(windows)` target
-# table keeps it off non-Windows builds.
+# Windows bindings (Win32). Always compiled on Windows (NOT optional) because
+# the LocalAPI named-pipe listener (`localapi::serve`, unification P1) needs the
+# SDDL security-descriptor helpers in EVERY build — the LocalAPI is core daemon
+# plumbing, not overlay-gated. The overlay-l3 WFP features (below) ride the same
+# dependency; they're only *used* under `cfg(all(windows, feature="overlay-l3"))`
+# in `wfp.rs`, but compiling their bindings unconditionally is free (metadata).
+# Same `windows-sys` 0.61 the `tun` crate already resolves — no new crate, no C build.
 [target.'cfg(windows)'.dependencies.windows-sys]
 version = "0.61"
-optional = true
 features = [
-    "Win32_Foundation",                                 # HANDLE, FWP_E_ALREADY_EXISTS, WIN32_ERROR
-    "Win32_Security",                                   # PSECURITY_DESCRIPTOR (passed null)
+    "Win32_Foundation",                                 # HANDLE, FWP_E_ALREADY_EXISTS, WIN32_ERROR, LocalFree (free the converted SD)
+    "Win32_Security",                                   # PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES
+    "Win32_Security_Authorization",                     # ConvertStringSecurityDescriptorToSecurityDescriptorW (LocalAPI pipe SDDL)
     "Win32_System_Rpc",                                 # RPC_C_AUTHN_WINNT, SEC_WINNT_AUTH_IDENTITY_W
     "Win32_NetworkManagement_WindowsFilteringPlatform", # Fwpm*, FWPM_* structs/flags/layer GUIDs
     "Win32_NetworkManagement_IpHelper",                 # ConvertInterfaceAliasToLuid (fallback)
@@ -128,7 +128,7 @@ overlay = ["dep:boringtun", "dep:base64", "dep:if-addrs"]
 # core. `overlay` alone gives the WG device + the bridge logic + the
 # in-memory MockTun loopback test (no real device); `overlay-l3` adds the
 # `tun` crate's real `SystemTun`. Off by default.
-overlay-l3 = ["overlay", "dep:tun", "dep:windows-sys"]
+overlay-l3 = ["overlay", "dep:tun"]
 
 [dev-dependencies]
 tokio-test = { workspace = true }
