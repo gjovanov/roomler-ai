@@ -15,6 +15,7 @@
 //! `{"t":<verb>,"d":<payload>}`) so a payload may be a struct OR a sequence.
 
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 /// How this node currently reaches a peer — the Tailscale-style connection
 /// type shown per device in the UI. `Tunnel` is the userspace SOCKS/forward
@@ -128,7 +129,7 @@ pub enum Response {
 /// Read-only snapshot the daemon provides to [`handle`]. The daemon's impl
 /// gathers this from its live overlay / tunnel / forward state; the trait keeps
 /// the protocol unit-testable with a mock and free of daemon internals.
-pub trait LocalApiState {
+pub trait LocalApiState: Send + Sync {
     fn status(&self) -> NodeStatus;
     fn peers(&self) -> Vec<PeerInfo>;
     fn flows(&self) -> Vec<FlowInfo>;
@@ -143,6 +144,46 @@ pub fn handle(req: &Request, state: &dyn LocalApiState) -> Response {
         Request::Peers => Response::Peers(state.peers()),
         Request::Flows => Response::Flows(state.flows()),
     }
+}
+
+/// Serve one LocalAPI client connection to completion: read
+/// newline-delimited JSON [`Request`]s, [`handle`] each against `state`,
+/// write the newline-delimited JSON [`Response`] back, and loop until the
+/// client closes the stream (EOF). A line that isn't a valid `Request`
+/// gets an [`Response::Error`] and the connection stays open (so a client
+/// can recover). **Transport-agnostic** — the platform listeners (Windows
+/// named pipe with an ACL'd security descriptor, unix socket; P1-cont)
+/// accept a connection and hand the accepted stream here. The daemon
+/// spawns one task per connection: `serve_connection(stream, state.as_ref())`.
+pub async fn serve_connection<S>(stream: S, state: &dyn LocalApiState) -> std::io::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let (rd, mut wr) = tokio::io::split(stream);
+    let mut lines = tokio::io::BufReader::new(rd).lines();
+    while let Some(line) = lines.next_line().await? {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let resp = match serde_json::from_str::<Request>(&line) {
+            Ok(req) => handle(&req, state),
+            Err(e) => Response::Error {
+                message: format!("bad request: {e}"),
+            },
+        };
+        // A Response always serialises; fall back to an Error line if a
+        // custom serializer ever failed, so we never break the frame.
+        let mut out = serde_json::to_vec(&resp).unwrap_or_else(|e| {
+            serde_json::to_vec(&Response::Error {
+                message: format!("encode error: {e}"),
+            })
+            .expect("Error response always serialises")
+        });
+        out.push(b'\n');
+        wr.write_all(&out).await?;
+        wr.flush().await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -266,5 +307,46 @@ mod tests {
             serde_json::to_string(&ConnectionType::Tunnel).unwrap(),
             r#""tunnel""#
         );
+    }
+
+    #[tokio::test]
+    async fn serve_connection_round_trips_and_recovers_from_garbage() {
+        // In-memory duplex stands in for the named pipe / unix socket, so the
+        // dispatch loop is transport-independently tested.
+        let (client, server) = tokio::io::duplex(4096);
+        let srv = tokio::spawn(async move {
+            let state = Mock;
+            serve_connection(server, &state).await
+        });
+        let (crd, mut cwr) = tokio::io::split(client);
+        let mut clines = tokio::io::BufReader::new(crd).lines();
+
+        cwr.write_all(b"{\"t\":\"status\"}\n").await.unwrap();
+        let r = clines.next_line().await.unwrap().unwrap();
+        assert!(matches!(
+            serde_json::from_str::<Response>(&r).unwrap(),
+            Response::Status(_)
+        ));
+
+        cwr.write_all(b"{\"t\":\"peers\"}\n").await.unwrap();
+        let r = clines.next_line().await.unwrap().unwrap();
+        assert!(matches!(
+            serde_json::from_str::<Response>(&r).unwrap(),
+            Response::Peers(p) if p.len() == 2
+        ));
+
+        // Garbage line → Error response, and the connection survives for the
+        // next request (recoverable, not a frame break).
+        cwr.write_all(b"not json\n").await.unwrap();
+        let r = clines.next_line().await.unwrap().unwrap();
+        assert!(matches!(
+            serde_json::from_str::<Response>(&r).unwrap(),
+            Response::Error { .. }
+        ));
+
+        // Client closes the stream → serve_connection returns Ok(()).
+        drop(cwr);
+        drop(clines);
+        srv.await.unwrap().unwrap();
     }
 }
