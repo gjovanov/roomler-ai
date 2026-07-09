@@ -51,6 +51,9 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 # ObjectId for session keys (mirrors the shared protocol)
 bson = { workspace = true }
 
+# CIDR parsing + longest-prefix match for the mesh subnet-router route table.
+ipnet = "2"
+
 # WebRTC peer (vendored — SCTP rwnd setter)
 webrtc = { workspace = true }
 
