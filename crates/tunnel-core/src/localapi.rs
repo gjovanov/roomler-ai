@@ -2,7 +2,8 @@
 //!
 //! The unified daemon (`roomlerd`) will expose this over a local-only channel
 //! (named pipe on Windows / unix socket elsewhere; ACL-authenticated — wired in
-//! P1-cont) so thin clients — the CLI (`roomler`) and the tray — can read live
+//! P1-cont) so thin clients — the CLI (`roomler`) and the desktop app (Roomler)
+//! — can read live
 //! node / peer / flow state without reaching into the daemon's internals. This
 //! module is the **transport-agnostic protocol**: the request/response wire
 //! types plus a pure [`handle`] dispatch over a [`LocalApiState`] snapshot. The

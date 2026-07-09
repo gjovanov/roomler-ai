@@ -6,8 +6,8 @@ daemon `roomler-agent` is being renamed to **`roomlerd`**; a machine is a
 describes the role (once tunnel + overlay fold in, the machine *reaches out*, not
 just *gets controlled*) and collides with "AI agent".
 
-**Rule of thumb:** rename the *surface* freely and now (UI, docs, installer, tray,
-LocalAPI, CLI). Migrate *contracts* (things a field host or a stored token
+**Rule of thumb:** rename the *surface* freely and now (UI, docs, installer,
+desktop app, LocalAPI, CLI). Migrate *contracts* (things a field host or a stored token
 depends on) only with a back-compat shim — never a big-bang, or you orphan the
 installed fleet.
 
@@ -17,6 +17,7 @@ installed fleet.
 |---|---|---|
 | binary `roomler-agent` | `roomlerd` | rename at P3; ship `roomler-agent` alias 1 release |
 | binary `roomler-tunnel` | `roomler` (CLI) | thin LocalAPI client; keep alias 1–2 releases |
+| binary `roomler-agent-tray` | `roomler-desktop` (display "Roomler") | extend to the unified LocalAPI (both roles); the system-tray icon is just where it lives, not its name |
 | **env `ROOMLER_AGENT_*`** | `ROOMLER_NODE_*` | **dual-read via `tunnel_core::env::node_env` — prefers `ROOMLER_NODE_<X>`, still honours `ROOMLER_AGENT_<X>`. Never drop the legacy prefix** (it's the MajorUpgrade-drops-env-vars bug — operators set these in the service Environment block). |
 | service name `RoomlerAgent` | `Roomler` / `roomlerd` | installer stop-old / install-new |
 | config `…/roomler-agent/config.toml` | `…/roomler/config.toml` | migrate-on-first-run OR read-both |
