@@ -166,6 +166,13 @@ pub struct Agent {
     pub capabilities: AgentCaps,
     #[serde(default)]
     pub access_policy: AccessPolicy,
+    /// Subnet-router CIDRs this agent is a gateway for (Phase 2). The SOCKS
+    /// mesh longest-prefix-matches a LAN-IP target against these to pick the
+    /// covering agent, which then dials the real IP (still gated by the
+    /// tenant's `tunnel_policies`). Admin-configured. `#[serde(default)]` →
+    /// older rows deserialize to no routes.
+    #[serde(default)]
+    pub routes: Vec<String>,
     pub created_at: DateTime,
     pub updated_at: DateTime,
     pub deleted_at: Option<DateTime>,
