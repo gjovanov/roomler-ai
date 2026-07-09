@@ -21,6 +21,7 @@ pub mod install_cleanup;
 pub mod install_detect;
 pub mod instance_lock;
 pub mod jwt_introspect;
+pub mod localapi_state;
 pub mod lock_overlay;
 pub mod lock_state;
 pub mod logging;
