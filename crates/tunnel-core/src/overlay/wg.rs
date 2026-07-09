@@ -67,20 +67,22 @@ pub const WG_OVERHEAD: usize = 32;
 /// split and re-request). Bounded so a dead relay still falls back promptly.
 pub const QUIC_BUILD_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// Opt-in gate for the QUIC-over-TURN carrier (`ROOMLER_AGENT_OVERLAY_QUIC`).
-/// **Default OFF** — the raw relay is the proven path; QUIC is enabled per-host
-/// only after field-proving (mirrors the direct-path arc). Truthy =
-/// `1`/`true`/`yes`/`on` (case-insensitive); anything else (incl. unset) is off.
+/// Opt-in gate for the QUIC-over-TURN carrier (`ROOMLER_NODE_OVERLAY_QUIC`;
+/// legacy `ROOMLER_AGENT_OVERLAY_QUIC` still honoured — see
+/// [`crate::env::node_env`]). **Default OFF** — the raw relay is the proven
+/// path; QUIC is enabled per-host only after field-proving (mirrors the
+/// direct-path arc). Truthy = `1`/`true`/`yes`/`on` (case-insensitive);
+/// anything else (incl. unset) is off.
 pub fn overlay_quic_enabled() -> bool {
-    match std::env::var("ROOMLER_AGENT_OVERLAY_QUIC") {
-        Ok(v) => {
+    match crate::env::node_env("OVERLAY_QUIC") {
+        Some(v) => {
             let t = v.trim();
             t.eq_ignore_ascii_case("1")
                 || t.eq_ignore_ascii_case("true")
                 || t.eq_ignore_ascii_case("yes")
                 || t.eq_ignore_ascii_case("on")
         }
-        Err(_) => false,
+        None => false,
     }
 }
 

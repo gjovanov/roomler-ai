@@ -14,9 +14,10 @@
 use std::sync::Arc;
 
 use roomler_ai_remote_control::signaling::{ClientMsg, ServerMsg};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 
+use tunnel_core::localapi::OverlayView;
 use tunnel_core::overlay::WgKeypair;
 use tunnel_core::overlay::runtime::{OverlayEvent, OverlayRuntime, TunFactory};
 use tunnel_core::overlay::tun::{SystemTun, TunIo};
@@ -34,6 +35,7 @@ const OVERLAY_MTU: u16 = 1280;
 pub fn maybe_start(
     cfg: &AgentConfig,
     outbound: mpsc::Sender<ClientMsg>,
+    peer_view: watch::Sender<OverlayView>,
 ) -> Option<mpsc::Sender<OverlayEvent>> {
     if !cfg.overlay_enabled {
         return None;
@@ -52,7 +54,10 @@ pub fn maybe_start(
         Box::new(|ip, nm, mtu| SystemTun::up(ip, nm, mtu).map(|t| Arc::new(t) as Arc<dyn TunIo>));
     let rt = OverlayRuntime::new_relay(keypair, outbound, tun_factory, OVERLAY_MTU)
         // Phase 1 — advertise this node's subnet routes (admin-gated server-side).
-        .with_advertised_routes(cfg.overlay_advertised_routes.clone());
+        .with_advertised_routes(cfg.overlay_advertised_routes.clone())
+        // Unification P1 — publish the live mesh view for the LocalAPI so
+        // `roomler status` / `peers` see per-device connection types.
+        .with_peer_view(peer_view);
     // FIELD: endpoints are advertised lazily — the relay coordinator
     // trickles each relayed address post-allocation — so join carries none.
     tokio::spawn(rt.run(evt_rx, Vec::new()));
