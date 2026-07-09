@@ -152,12 +152,16 @@ pub async fn enroll_tunnel_client(
 // Tunnel-client agent roster (SOCKS mesh routing)
 // ────────────────────────────────────────────────────────────────────────────
 
-/// One agent in the tenant, for the SOCKS mesh's name → agent-id routing.
+/// One agent in the tenant, for the SOCKS mesh's name → agent-id routing
+/// and (Phase 2) subnet-router CIDR → agent-id routing.
 #[derive(Debug, Serialize)]
 pub struct TunnelAgentInfo {
     pub agent_id: String,
     pub name: String,
     pub online: bool,
+    /// Subnet-router CIDRs this agent is a gateway for. The mesh
+    /// longest-prefix-matches a LAN-IP target against these.
+    pub routes: Vec<String>,
 }
 
 /// GET /api/tunnel-client/agents — the tenant's agent roster, so
@@ -194,6 +198,7 @@ pub async fn list_tenant_agents(
                 agent_id: a.id.map(|i| i.to_hex()).unwrap_or_default(),
                 name: a.name,
                 online,
+                routes: a.routes,
             }
         })
         .collect();
