@@ -483,6 +483,135 @@ pub(crate) async fn serve_unix_at(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Client (unification P2)
+//
+// The thin clients — the CLI (`roomler`) and the desktop app — connect to the
+// daemon's LocalAPI over the same platform endpoint the server binds and issue
+// read-only requests. Lives in-module so it shares the endpoint constants
+// (`LOCALAPI_PIPE_NAME` / `unix_socket_path`) and the wire types with the
+// server: one source of truth, no re-declared pipe name.
+// ---------------------------------------------------------------------------
+
+/// A boxed local-endpoint stream (Windows named pipe or unix socket) — both are
+/// `AsyncRead + AsyncWrite`, so the client is transport-agnostic like the
+/// server's [`serve_connection`].
+trait ClientStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> ClientStream for T {}
+
+/// A connected LocalAPI client. Open with [`connect`], then issue requests one
+/// at a time. The daemon serves multiple requests on one connection, so a
+/// single `Client` is reused across a poll (e.g. `status()` then `peers()`).
+pub struct Client {
+    stream: tokio::io::BufReader<Box<dyn ClientStream>>,
+}
+
+/// Connect to the local daemon's LocalAPI endpoint (the fixed
+/// `\\.\pipe\roomler` / `$XDG_RUNTIME_DIR/roomler.sock`). "Daemon not running"
+/// surfaces as [`std::io::ErrorKind::NotFound`] — callers should render that as
+/// "device service not running", not a hard failure.
+pub async fn connect() -> std::io::Result<Client> {
+    #[cfg(windows)]
+    {
+        connect_windows_at(LOCALAPI_PIPE_NAME).await
+    }
+    #[cfg(not(windows))]
+    {
+        connect_unix_at(unix_socket_path()).await
+    }
+}
+
+/// Named-pipe connect, parameterised on the pipe name so tests can target a
+/// private one. Retries ONCE on `ERROR_PIPE_BUSY` (the server is momentarily
+/// between instances — it pre-creates the next on each accept, but there's a
+/// sub-ms window); any other error (notably `ERROR_FILE_NOT_FOUND` = daemon not
+/// running) propagates immediately. No multi-second wait — this is an
+/// interactive path.
+#[cfg(windows)]
+pub(crate) async fn connect_windows_at(pipe_name: &str) -> std::io::Result<Client> {
+    use tokio::net::windows::named_pipe::ClientOptions;
+    const ERROR_PIPE_BUSY: i32 = 231;
+    let mut retried = false;
+    let pipe = loop {
+        match ClientOptions::new().open(pipe_name) {
+            Ok(p) => break p,
+            Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) && !retried => {
+                retried = true;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    };
+    Ok(Client::new(Box::new(pipe)))
+}
+
+/// Unix-socket connect, parameterised on the path so tests can target a private
+/// one.
+#[cfg(unix)]
+pub(crate) async fn connect_unix_at(path: std::path::PathBuf) -> std::io::Result<Client> {
+    let stream = tokio::net::UnixStream::connect(path).await?;
+    Ok(Client::new(Box::new(stream)))
+}
+
+impl Client {
+    fn new(stream: Box<dyn ClientStream>) -> Self {
+        Self {
+            stream: tokio::io::BufReader::new(stream),
+        }
+    }
+
+    /// One newline-JSON round-trip — write the request, read one response line.
+    /// Mirrors the server's [`serve_connection`] framing.
+    pub async fn request(&mut self, req: &Request) -> std::io::Result<Response> {
+        let mut buf = serde_json::to_vec(req).map_err(std::io::Error::other)?;
+        buf.push(b'\n');
+        self.stream.write_all(&buf).await?;
+        self.stream.flush().await?;
+
+        let mut line = String::new();
+        if self.stream.read_line(&mut line).await? == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "localapi: connection closed before a response",
+            ));
+        }
+        serde_json::from_str(line.trim_end()).map_err(std::io::Error::other)
+    }
+
+    /// `Request::Status` → [`NodeStatus`]. A `Response::Error` maps to `Err`.
+    pub async fn status(&mut self) -> std::io::Result<NodeStatus> {
+        match self.request(&Request::Status).await? {
+            Response::Status(s) => Ok(s),
+            other => Err(unexpected_response(other)),
+        }
+    }
+
+    /// `Request::Peers` → the peer list with connection types.
+    pub async fn peers(&mut self) -> std::io::Result<Vec<PeerInfo>> {
+        match self.request(&Request::Peers).await? {
+            Response::Peers(p) => Ok(p),
+            other => Err(unexpected_response(other)),
+        }
+    }
+
+    /// `Request::Flows` → active forwards / SOCKS5 listeners (empty on the agent
+    /// daemon until the tunnel-client folds in at P3).
+    pub async fn flows(&mut self) -> std::io::Result<Vec<FlowInfo>> {
+        match self.request(&Request::Flows).await? {
+            Response::Flows(f) => Ok(f),
+            other => Err(unexpected_response(other)),
+        }
+    }
+}
+
+/// Map an error / mismatched response to an `io::Error` for the typed helpers.
+fn unexpected_response(resp: Response) -> std::io::Error {
+    match resp {
+        Response::Error { message } => std::io::Error::other(format!("localapi error: {message}")),
+        other => std::io::Error::other(format!("localapi: unexpected response: {other:?}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -649,23 +778,21 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn serve_windows_named_pipe_round_trips() {
-        // Exercises the real named-pipe listener + the SDDL security descriptor
-        // (PipeSecurity::new must convert the SDDL, or bind fails). A private
-        // pipe name avoids colliding with a real daemon on the dev box.
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        use tokio::net::windows::named_pipe::ClientOptions;
-
+    async fn client_round_trips_over_named_pipe() {
+        // Drives the real `Client` against `serve_windows_at` — exercises the
+        // named pipe + the SDDL security descriptor (PipeSecurity::new must
+        // convert the SDDL, or bind fails) + the client connect/request path. A
+        // private pipe name avoids colliding with a real daemon on the box.
         let pipe = format!(r"\\.\pipe\roomler-test-{}", std::process::id());
         let (sd_tx, sd_rx) = watch::channel(false);
         let state: Arc<dyn LocalApiState> = Arc::new(Mock);
         let pipe_srv = pipe.clone();
         let srv = tokio::spawn(async move { serve_windows_at(&pipe_srv, state, sd_rx).await });
 
-        // Retry until the first pipe instance exists.
+        // Retry connect until the first pipe instance exists.
         let mut client = None;
         for _ in 0..200 {
-            match ClientOptions::new().open(&pipe) {
+            match connect_windows_at(&pipe).await {
                 Ok(c) => {
                     client = Some(c);
                     break;
@@ -673,15 +800,16 @@ mod tests {
                 Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
             }
         }
-        let client = client.expect("connect to the LocalAPI pipe");
-        let (rd, mut wr) = tokio::io::split(client);
-        let mut lines = BufReader::new(rd).lines();
-        wr.write_all(b"{\"t\":\"peers\"}\n").await.unwrap();
-        let line = lines.next_line().await.unwrap().unwrap();
-        assert!(matches!(
-            serde_json::from_str::<Response>(&line).unwrap(),
-            Response::Peers(p) if p.len() == 2
-        ));
+        let mut client = client.expect("connect to the LocalAPI pipe");
+
+        let status = client.status().await.unwrap();
+        assert_eq!(status.name, "neo16");
+        assert!(status.connected);
+        let peers = client.peers().await.unwrap();
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[0].connection, ConnectionType::Tunnel);
+        // A second request on the SAME connection works (the daemon loops).
+        assert_eq!(client.peers().await.unwrap().len(), 2);
 
         sd_tx.send(true).unwrap();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), srv).await;
@@ -689,10 +817,10 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn serve_unix_socket_round_trips_and_is_0600() {
+    async fn client_round_trips_over_unix_socket_and_is_0600() {
+        // Drives the real `Client` against `serve_unix_at` + asserts the socket
+        // is owner-only.
         use std::os::unix::fs::PermissionsExt;
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        use tokio::net::UnixStream;
 
         let dir = std::env::temp_dir().join(format!("roomler-lat-{}", std::process::id()));
         let path = dir.join("s.sock");
@@ -707,17 +835,11 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        let stream = UnixStream::connect(&path)
+        let mut client = connect_unix_at(path.clone())
             .await
             .expect("connect to the LocalAPI socket");
-        let (rd, mut wr) = stream.into_split();
-        let mut lines = BufReader::new(rd).lines();
-        wr.write_all(b"{\"t\":\"status\"}\n").await.unwrap();
-        let line = lines.next_line().await.unwrap().unwrap();
-        assert!(matches!(
-            serde_json::from_str::<Response>(&line).unwrap(),
-            Response::Status(_)
-        ));
+        assert_eq!(client.status().await.unwrap().name, "neo16");
+        assert_eq!(client.peers().await.unwrap().len(), 2);
 
         // The control socket must be private to the owner.
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
