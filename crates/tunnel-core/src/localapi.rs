@@ -102,8 +102,25 @@ pub struct FlowInfo {
     pub bytes_out: u64,
 }
 
-/// A LocalAPI request. P1 exposes read-only verbs; create/kill/consent verbs
-/// (P2+) extend this enum. Adjacently tagged on `t`.
+/// One remote-control session awaiting an operator consent decision (rc.46).
+/// Surfaced by [`Request::ConsentPending`] so the desktop app renders its
+/// Approve/Deny modal over the LocalAPI instead of reading the daemon's private
+/// sentinel dir — which lives in the daemon's profile and is unreachable to the
+/// interactive-user app when the daemon runs as SYSTEM (P2b bug fix).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ConsentRequest {
+    pub session_id: String,
+    #[serde(default)]
+    pub controller_name: String,
+    /// Pipe-separated permission names (the agent's `Permissions` serde form).
+    #[serde(default)]
+    pub permissions: String,
+    #[serde(default)]
+    pub timeout_secs: u64,
+}
+
+/// A LocalAPI request. P1 exposed read-only verbs; P2b adds the (mutating)
+/// consent verbs. Adjacently tagged on `t`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "t", content = "d", rename_all = "snake_case")]
 pub enum Request {
@@ -113,6 +130,10 @@ pub enum Request {
     Peers,
     /// Active forwards / SOCKS5 listeners + throughput.
     Flows,
+    /// Remote-control sessions awaiting an operator consent decision.
+    ConsentPending,
+    /// Approve (`allow=true`) or deny a pending consent, by session id.
+    ConsentDecide { session_id: String, allow: bool },
 }
 
 /// A LocalAPI response. Adjacently tagged so a payload may be a struct
@@ -123,6 +144,12 @@ pub enum Response {
     Status(NodeStatus),
     Peers(Vec<PeerInfo>),
     Flows(Vec<FlowInfo>),
+    /// Sessions awaiting a consent decision.
+    ConsentPending(Vec<ConsentRequest>),
+    /// Result of a [`Request::ConsentDecide`] — `ok` = the decision was recorded.
+    ConsentDecided {
+        ok: bool,
+    },
     /// The verb couldn't be served (bad request, state unavailable).
     Error {
         message: String,
@@ -153,6 +180,17 @@ pub trait LocalApiState: Send + Sync {
     fn status(&self) -> NodeStatus;
     fn peers(&self) -> Vec<PeerInfo>;
     fn flows(&self) -> Vec<FlowInfo>;
+    /// Remote-control sessions awaiting an operator consent decision (P2b).
+    /// Default: none — so existing impls / mocks and the read-only contract are
+    /// undisturbed; the agent daemon overrides this.
+    fn consent_pending(&self) -> Vec<ConsentRequest> {
+        Vec::new()
+    }
+    /// Apply an operator consent decision to `session_id` (P2b). Returns whether
+    /// it was recorded. Default: no-op `false`.
+    fn consent_decide(&self, _session_id: &str, _allow: bool) -> bool {
+        false
+    }
 }
 
 /// Pure dispatch: map a [`Request`] to a [`Response`] over a state snapshot.
@@ -163,6 +201,10 @@ pub fn handle(req: &Request, state: &dyn LocalApiState) -> Response {
         Request::Status => Response::Status(state.status()),
         Request::Peers => Response::Peers(state.peers()),
         Request::Flows => Response::Flows(state.flows()),
+        Request::ConsentPending => Response::ConsentPending(state.consent_pending()),
+        Request::ConsentDecide { session_id, allow } => Response::ConsentDecided {
+            ok: state.consent_decide(session_id, *allow),
+        },
     }
 }
 
@@ -249,14 +291,22 @@ pub async fn serve(
 #[cfg(windows)]
 const LOCALAPI_PIPE_NAME: &str = r"\\.\pipe\roomler";
 
-/// SDDL for the pipe DACL: allow (`A`) generic-all (`GA`) to Local `SY`stem,
+/// SDDL for the pipe. DACL: allow (`A`) generic-all (`GA`) to Local `SY`stem,
 /// `B`uiltin `A`dministrators, and `I`nteractive `U`sers — and, by omission,
 /// deny everyone else. IU covers the desktop app / CLI running in the operator's
 /// interactive session (including a non-elevated admin, whose Administrators SID
 /// is deny-only but who still matches IU). No OWNER is set — a user-mode daemon
 /// can't assign one it doesn't hold, and the creator is a valid owner anyway.
+///
+/// SACL `S:(ML;;NW;;;ME)` — a mandatory-integrity label at **Medium** with
+/// No-Write-Up: a process **below** medium integrity (an AppContainer / sandboxed
+/// browser child / low-IL malware) can't write to the pipe, so it can't send a
+/// request at all — hardening the (mutating) consent verb against a low-IL
+/// caller (P2b security review H1). The interactive user's tray + CLI run at
+/// medium IL and SYSTEM above it, so both are unaffected. Setting a label at or
+/// below the creator's own IL needs no privilege.
 #[cfg(windows)]
-const LOCALAPI_SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;IU)";
+const LOCALAPI_SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;IU)S:(ML;;NW;;;ME)";
 
 /// `SDDL_REVISION_1` — the only defined SDDL revision.
 #[cfg(windows)]
@@ -602,6 +652,27 @@ impl Client {
             other => Err(unexpected_response(other)),
         }
     }
+
+    /// `Request::ConsentPending` → remote-control sessions awaiting a decision.
+    pub async fn consent_pending(&mut self) -> std::io::Result<Vec<ConsentRequest>> {
+        match self.request(&Request::ConsentPending).await? {
+            Response::ConsentPending(v) => Ok(v),
+            other => Err(unexpected_response(other)),
+        }
+    }
+
+    /// `Request::ConsentDecide` → approve/deny a pending consent. Returns
+    /// whether the daemon recorded the decision.
+    pub async fn consent_decide(&mut self, session_id: &str, allow: bool) -> std::io::Result<bool> {
+        let req = Request::ConsentDecide {
+            session_id: session_id.to_string(),
+            allow,
+        };
+        match self.request(&req).await? {
+            Response::ConsentDecided { ok } => Ok(ok),
+            other => Err(unexpected_response(other)),
+        }
+    }
 }
 
 /// Map an error / mismatched response to an `io::Error` for the typed helpers.
@@ -664,6 +735,19 @@ mod tests {
                 bytes_out: 8192,
             }]
         }
+        fn consent_pending(&self) -> Vec<ConsentRequest> {
+            vec![ConsentRequest {
+                session_id: "sess-1".into(),
+                controller_name: "alice".into(),
+                permissions: "view|control".into(),
+                timeout_secs: 30,
+            }]
+        }
+        fn consent_decide(&self, session_id: &str, allow: bool) -> bool {
+            // Test echo: proves both args crossed the wire (real impl writes a
+            // sentinel). Records only a non-empty session that was approved.
+            !session_id.is_empty() && allow
+        }
     }
 
     #[test]
@@ -692,6 +776,53 @@ mod tests {
             }
             other => panic!("expected Flows, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn handle_dispatches_consent_verbs() {
+        let s = Mock;
+        match handle(&Request::ConsentPending, &s) {
+            Response::ConsentPending(v) => {
+                assert_eq!(v.len(), 1);
+                assert_eq!(v[0].session_id, "sess-1");
+                assert_eq!(v[0].permissions, "view|control");
+            }
+            other => panic!("expected ConsentPending, got {other:?}"),
+        }
+        // The `allow` bit crosses the wire (Mock echoes it).
+        match handle(
+            &Request::ConsentDecide {
+                session_id: "sess-1".into(),
+                allow: true,
+            },
+            &s,
+        ) {
+            Response::ConsentDecided { ok } => assert!(ok),
+            other => panic!("expected ConsentDecided, got {other:?}"),
+        }
+        match handle(
+            &Request::ConsentDecide {
+                session_id: "sess-1".into(),
+                allow: false,
+            },
+            &s,
+        ) {
+            Response::ConsentDecided { ok } => assert!(!ok),
+            other => panic!("expected ConsentDecided, got {other:?}"),
+        }
+        // Wire shape — locks the discriminators the tray/CLI depend on.
+        assert_eq!(
+            serde_json::to_string(&Request::ConsentDecide {
+                session_id: "s".into(),
+                allow: true,
+            })
+            .unwrap(),
+            r#"{"t":"consent_decide","d":{"session_id":"s","allow":true}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<Request>(r#"{"t":"consent_pending"}"#).unwrap(),
+            Request::ConsentPending
+        );
     }
 
     #[test]
@@ -810,6 +941,13 @@ mod tests {
         assert_eq!(peers[0].connection, ConnectionType::Tunnel);
         // A second request on the SAME connection works (the daemon loops).
         assert_eq!(client.peers().await.unwrap().len(), 2);
+
+        // Consent verbs over the real pipe (P2b).
+        let pending = client.consent_pending().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].session_id, "sess-1");
+        assert!(client.consent_decide("sess-1", true).await.unwrap());
+        assert!(!client.consent_decide("sess-1", false).await.unwrap());
 
         sd_tx.send(true).unwrap();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), srv).await;
