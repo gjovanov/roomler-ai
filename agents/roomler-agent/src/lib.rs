@@ -36,6 +36,7 @@ pub mod post_install;
 pub mod preflight;
 pub mod service;
 pub mod signaling;
+pub mod subnet_detect;
 #[cfg(feature = "system-context")]
 pub mod system_context;
 pub mod tunnel;
