@@ -219,7 +219,7 @@ pub fn cmd_default_device_name() -> String {
 #[tauri::command]
 pub fn cmd_check_update() -> Result<String, String> {
     let exe = agent_exe_path()?;
-    let output = Command::new(&exe)
+    let output = no_window_command(&exe)
         .args(["self-update", "--check-only"])
         .output()
         .map_err(|e| format!("Spawning self-update: {e}"))?;
@@ -242,7 +242,7 @@ pub fn cmd_apply_update() -> Result<(), String> {
     let exe = agent_exe_path()?;
     // Detached spawn — agent does its own self-update + exits; we
     // don't want to block the tray's event loop.
-    Command::new(&exe)
+    no_window_command(&exe)
         .arg("self-update")
         .spawn()
         .map_err(|e| format!("Spawning self-update: {e}"))?;
@@ -255,7 +255,7 @@ pub fn cmd_apply_update() -> Result<(), String> {
 #[tauri::command]
 pub fn cmd_service_install(as_service: bool) -> Result<(), String> {
     let exe = agent_exe_path()?;
-    let mut cmd = Command::new(&exe);
+    let mut cmd = no_window_command(&exe);
     cmd.arg("service").arg("install");
     if as_service {
         cmd.arg("--as-service");
@@ -273,7 +273,7 @@ pub fn cmd_service_install(as_service: bool) -> Result<(), String> {
 #[tauri::command]
 pub fn cmd_service_uninstall(as_service: bool) -> Result<(), String> {
     let exe = agent_exe_path()?;
-    let mut cmd = Command::new(&exe);
+    let mut cmd = no_window_command(&exe);
     cmd.arg("service").arg("uninstall");
     if as_service {
         cmd.arg("--as-service");
@@ -293,7 +293,7 @@ pub fn cmd_service_uninstall(as_service: bool) -> Result<(), String> {
 #[tauri::command]
 pub fn cmd_service_status(as_service: bool) -> Result<String, String> {
     let exe = agent_exe_path()?;
-    let mut cmd = Command::new(&exe);
+    let mut cmd = no_window_command(&exe);
     cmd.arg("service").arg("status");
     if as_service {
         cmd.arg("--as-service");
@@ -386,6 +386,22 @@ fn load_optional_config() -> Option<AgentConfig> {
     config::load(&path).ok()
 }
 
+/// A `Command` that never flashes a console window on Windows. The tray is a GUI
+/// app (`windows_subsystem = "windows"`), so a plain `std::process::Command`
+/// spawning the console-mode `roomler-agent` pops a console each time — and
+/// `cmd_status` polls the service state every 10 s, so without this the tray
+/// flashes a terminal every 10 s. No-op on non-Windows.
+fn no_window_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut cmd = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    cmd
+}
+
 /// Probe service state via the agent's own `service status` CLI.
 /// Returns (kind, running). `kind` is "scheduledTask" on perUser and
 /// "scmService" on perMachine. "none" when neither is registered.
@@ -394,7 +410,10 @@ fn probe_service_state() -> (String, bool) {
         return ("none".to_string(), false);
     };
     // Scheduled Task probe — works for both flavours' status query.
-    let task_status = Command::new(&exe).args(["service", "status"]).output().ok();
+    let task_status = no_window_command(&exe)
+        .args(["service", "status"])
+        .output()
+        .ok();
     if let Some(out) = task_status {
         let s = String::from_utf8_lossy(&out.stdout).to_ascii_lowercase();
         if s.contains("running") {
@@ -402,7 +421,7 @@ fn probe_service_state() -> (String, bool) {
         }
     }
     // SCM service probe (perMachine).
-    let svc_status = Command::new(&exe)
+    let svc_status = no_window_command(&exe)
         .args(["service", "status", "--as-service"])
         .output()
         .ok();

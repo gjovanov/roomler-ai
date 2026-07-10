@@ -403,12 +403,37 @@ pub(crate) async fn serve_windows_at(
         return Ok(());
     }
     let mut security = PipeSecurity::new(LOCALAPI_SDDL)?;
+    // Retry the FIRST-instance create instead of failing permanently. If another
+    // process already holds `\\.\pipe\roomler` (a stale/leftover agent, or a
+    // rogue squatter), a one-shot bind would leave the LocalAPI dead until the
+    // daemon restarts — and a squatter keeps feeding thin clients FAKE data
+    // (field-observed: a leftover test server made the tray show mock peers +
+    // no consent prompts). Retrying every 30 s self-heals the moment the pipe
+    // frees, with a loud warning so the operator sees the contention.
+    //
     // SAFETY: `security.as_ptr()` stays valid for the lifetime of `security`,
     // which outlives every create call below.
-    let mut server = unsafe {
-        ServerOptions::new()
-            .first_pipe_instance(true)
-            .create_with_security_attributes_raw(pipe_name, security.as_ptr())?
+    let mut server = loop {
+        match unsafe {
+            ServerOptions::new()
+                .first_pipe_instance(true)
+                .create_with_security_attributes_raw(pipe_name, security.as_ptr())
+        } {
+            Ok(s) => break s,
+            Err(e) => {
+                tracing::warn!(
+                    pipe = pipe_name, error = %e,
+                    "localapi: pipe bind failed — another process may hold the pipe; retrying in 30s"
+                );
+                tokio::select! {
+                    biased;
+                    _ = shutdown.changed() => {
+                        if *shutdown.borrow() { return Ok(()); }
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
+                }
+            }
+        }
     };
     tracing::info!(
         pipe = pipe_name,
