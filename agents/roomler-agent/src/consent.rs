@@ -39,9 +39,8 @@
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
 
 /// Default operator-decision timeout when an operator-consent prompt
 /// is required. 30 s matches the planner's spec; deliberately on the
@@ -218,7 +217,7 @@ impl ConsentBroker {
         // Stamp this session as pending; safe to clear unconditionally
         // at exit because run_prompt fully owns its own decision flow.
         {
-            let mut pending = self.inner.pending.lock().await;
+            let mut pending = self.inner.pending.lock().unwrap();
             pending.insert(session_hex.to_string());
         }
         tracing::info!(
@@ -231,6 +230,12 @@ impl ConsentBroker {
 
         let approve = self.sentinel_path(session_hex, SentinelKind::Approve);
         let deny = self.sentinel_path(session_hex, SentinelKind::Deny);
+        // SECURITY (P2b): purge any pre-existing decision sentinel so ONLY a
+        // decision that arrives AFTER this prompt starts can resolve it — a
+        // sentinel written before the request (stale from a prior run, or a
+        // pre-emptive approve) cannot pre-approve this session.
+        let _ = std::fs::remove_file(&approve);
+        let _ = std::fs::remove_file(&deny);
         let deadline = Instant::now() + timeout;
         let outcome = loop {
             if approve.exists() {
@@ -254,7 +259,7 @@ impl ConsentBroker {
         // absent when the request came without one — e.g. the CLI path).
         let _ = std::fs::remove_file(self.pending_path(session_hex));
         {
-            let mut pending = self.inner.pending.lock().await;
+            let mut pending = self.inner.pending.lock().unwrap();
             pending.remove(session_hex);
         }
         tracing::info!(session = session_hex, ?outcome, "operator consent decision");
@@ -283,6 +288,36 @@ impl ConsentBroker {
             std::fs::set_permissions(&path, perms)?;
         }
         Ok(path)
+    }
+
+    /// Record an operator decision for `session_hex` — the LocalAPI's entry point
+    /// (P2b) — but ONLY if that session is CURRENTLY being prompted (present in
+    /// the live `pending` set). Returns whether it was recorded. Gating on the
+    /// live prompt means a caller can't pre-approve, nor approve an unknown or
+    /// stale session: a decision only counts as an answer to a question the
+    /// broker is actively asking (the confused-deputy guard). `session_hex` is
+    /// hex-validated by the caller (`DaemonState::consent_decide`) before it
+    /// reaches this.
+    pub fn record_decision(&self, session_hex: &str, allow: bool) -> bool {
+        if !self.inner.pending.lock().unwrap().contains(session_hex) {
+            tracing::warn!(
+                session = session_hex,
+                "consent decision ignored — no active prompt for this session"
+            );
+            return false;
+        }
+        let kind = if allow {
+            SentinelKind::Approve
+        } else {
+            SentinelKind::Deny
+        };
+        match self.write_sentinel(session_hex, kind) {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!(session = session_hex, %e, "consent sentinel write failed");
+                false
+            }
+        }
     }
 
     /// Path of the `.pending` request marker for `session_hex`. Distinct from the
@@ -410,6 +445,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn record_decision_requires_an_active_prompt() {
+        // The LocalAPI decision path (P2b) must IGNORE a decision for a session
+        // that isn't currently being prompted (no pre-approval / confused
+        // deputy) and HONOR one that is.
+        let dir = fixture_dir("record");
+        let broker = ConsentBroker::new(
+            Mode::Prompt {
+                timeout: Duration::from_secs(5),
+            },
+            dir.clone(),
+        )
+        .unwrap();
+        let sess = "0123456789abcdef01234567";
+
+        // Not pending yet ⇒ rejected, and NO sentinel is written.
+        assert!(!broker.record_decision(sess, true));
+        assert!(!broker.sentinel_path(sess, SentinelKind::Approve).exists());
+
+        // Start a prompt; once it's pending, a decision is honored + resolves it.
+        let b2 = broker.clone();
+        let s2 = sess.to_string();
+        let prompt = tokio::spawn(async move { b2.request(&s2).await });
+        let mut recorded = false;
+        for _ in 0..100 {
+            if broker.record_decision(sess, true) {
+                recorded = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            recorded,
+            "decision should be accepted once the session is pending"
+        );
+        assert_eq!(prompt.await.unwrap(), Decision::Granted);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn request_with_mode_overrides_startup_mode() {
         // Server-authoritative consent (Phase 2): the per-session directive from
         // `ServerMsg::Request { consent_mode }` wins over the broker's startup
@@ -476,19 +551,34 @@ mod tests {
         assert!(pending.exists(), ".pending must exist while awaiting");
         assert_eq!(broker.pending_path(session), pending);
 
-        // Operator approves → run the prompt to resolution, which clears .pending.
-        broker
-            .write_sentinel(session, SentinelKind::Approve)
-            .unwrap();
-        let decision = broker
-            .request_with_mode(
-                session,
+        // Operator approves AFTER the prompt starts. P2b: a pre-dropped approve
+        // sentinel is purged at prompt start, so the decision must arrive once
+        // the session is actively pending (delivered here via record_decision,
+        // the LocalAPI path, which gates on the live pending set).
+        let b2 = broker.clone();
+        let s2 = session.to_string();
+        let prompt = tokio::spawn(async move {
+            b2.request_with_mode(
+                &s2,
                 Mode::Prompt {
                     timeout: Duration::from_secs(5),
                 },
             )
-            .await;
-        assert_eq!(decision, Decision::Granted);
+            .await
+        });
+        let mut recorded = false;
+        for _ in 0..100 {
+            if broker.record_decision(session, true) {
+                recorded = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            recorded,
+            "approval should record once the session is pending"
+        );
+        assert_eq!(prompt.await.unwrap(), Decision::Granted);
         assert!(!pending.exists(), ".pending must be cleared once resolved");
 
         let _ = std::fs::remove_dir_all(&dir);
