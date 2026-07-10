@@ -291,14 +291,22 @@ pub async fn serve(
 #[cfg(windows)]
 const LOCALAPI_PIPE_NAME: &str = r"\\.\pipe\roomler";
 
-/// SDDL for the pipe DACL: allow (`A`) generic-all (`GA`) to Local `SY`stem,
+/// SDDL for the pipe. DACL: allow (`A`) generic-all (`GA`) to Local `SY`stem,
 /// `B`uiltin `A`dministrators, and `I`nteractive `U`sers — and, by omission,
 /// deny everyone else. IU covers the desktop app / CLI running in the operator's
 /// interactive session (including a non-elevated admin, whose Administrators SID
 /// is deny-only but who still matches IU). No OWNER is set — a user-mode daemon
 /// can't assign one it doesn't hold, and the creator is a valid owner anyway.
+///
+/// SACL `S:(ML;;NW;;;ME)` — a mandatory-integrity label at **Medium** with
+/// No-Write-Up: a process **below** medium integrity (an AppContainer / sandboxed
+/// browser child / low-IL malware) can't write to the pipe, so it can't send a
+/// request at all — hardening the (mutating) consent verb against a low-IL
+/// caller (P2b security review H1). The interactive user's tray + CLI run at
+/// medium IL and SYSTEM above it, so both are unaffected. Setting a label at or
+/// below the creator's own IL needs no privilege.
 #[cfg(windows)]
-const LOCALAPI_SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;IU)";
+const LOCALAPI_SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;IU)S:(ML;;NW;;;ME)";
 
 /// `SDDL_REVISION_1` — the only defined SDDL revision.
 #[cfg(windows)]
