@@ -62,6 +62,12 @@ export interface Agent {
   is_online: boolean
   last_seen_at: string
   access_policy: AccessPolicy
+  /** Subnet-router CIDRs this agent advertises for the mesh subnet-router
+   *  (Phase 2). Managed via the Subnet-routes dialog; the `roomler-tunnel`
+   *  mesh longest-prefix-matches a LAN target IP against these to pick the
+   *  covering agent. Optional because pre-Phase-2 agents / older API
+   *  responses may omit it. */
+  routes?: string[]
   /** Optional because pre-2A.1 agents (and tests) may not include it. */
   capabilities?: AgentCapabilities
 }
@@ -187,6 +193,17 @@ export const useAgentStore = defineStore('agents', () => {
     if (idx !== -1) agents.value[idx]!.access_policy = policy
   }
 
+  /** Replace the agent's advertised subnet-router CIDRs (mesh Phase 2). A
+   *  MANAGE_AGENTS admin action. The server validates + canonicalizes each
+   *  CIDR (masks host bits, dedups) and rejects invalid input with 400; we
+   *  optimistically patch local state with the caller's already-canonicalized
+   *  list. */
+  async function updateRoutes(tenantId: string, agentId: string, routes: string[]) {
+    await api.put(`/tenant/${tenantId}/agent/${agentId}`, { routes })
+    const idx = agents.value.findIndex((a) => a.id === agentId)
+    if (idx !== -1) agents.value[idx]!.routes = routes
+  }
+
   /** Reassign the device owner (a MANAGE_AGENTS admin action). The owner is who
    *  self-controls without an allowlist entry + who consent routes to. */
   async function updateOwner(tenantId: string, agentId: string, ownerUserId: string) {
@@ -254,6 +271,7 @@ export const useAgentStore = defineStore('agents', () => {
     issueEnrollmentToken,
     rename,
     updateAccessPolicy,
+    updateRoutes,
     updateOwner,
     tenantMembers,
     fetchTenantMembers,
