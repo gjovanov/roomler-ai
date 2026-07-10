@@ -45,19 +45,33 @@ pub async fn handle_agent_socket(
             agent_version,
             displays,
             caps,
-        }) => (machine_name, os, agent_version, displays, caps),
+            advertised_routes,
+        }) => (
+            machine_name,
+            os,
+            agent_version,
+            displays,
+            caps,
+            advertised_routes,
+        ),
         other => {
             warn!(?other, "agent opened WS without rc:agent.hello — closing");
             return;
         }
     };
-    let (machine_name, os, agent_version, displays, caps) = hello;
+    let (machine_name, os, agent_version, displays, caps, advertised_routes) = hello;
 
     // Persist: mark online, update hello fields on the Mongo row. Best-effort —
     // signaling still works if Mongo lags.
     if let Err(e) = state
         .agents
-        .update_hello(agent_id, &agent_version, &displays, &caps)
+        .update_hello(
+            agent_id,
+            &agent_version,
+            &displays,
+            &caps,
+            &advertised_routes,
+        )
         .await
     {
         warn!(%agent_id, %e, "agent update_hello failed");
