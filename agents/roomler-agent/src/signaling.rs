@@ -432,10 +432,11 @@ async fn connect_once(
         agent_version: env!("CARGO_PKG_VERSION").to_string(),
         displays: stub_displays(),
         caps: stub_caps(),
-        // Tunnel mesh subnet-router: advertise the CIDRs this host is
-        // configured to route. Admin-gated server-side (untrusted until an
-        // admin approves them into this agent's `routes`).
-        advertised_routes: cfg.advertise_routes.clone(),
+        // Tunnel mesh subnet-router: advertise the CIDRs this host offers to
+        // route — explicit `advertise_routes` config unioned with auto-detected
+        // local subnets. Admin-gated server-side (untrusted until an admin
+        // approves them into this agent's `routes`).
+        advertised_routes: crate::subnet_detect::local_advertised_routes(cfg),
     };
     send_msg(&mut ws, &hello).await.context("sending hello")?;
     // rc.58: explicit tick on hello — the 25 s keepalive timer hasn't
