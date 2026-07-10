@@ -95,6 +95,15 @@
                 title="Reassign owner"
               />
               <v-btn
+                icon="mdi-ip-network-outline"
+                size="small"
+                variant="text"
+                color="primary"
+                @click="openRoutes(a)"
+                :aria-label="`Manage subnet routes for ${a.name}`"
+                title="Subnet routes"
+              />
+              <v-btn
                 icon="mdi-delete"
                 size="small"
                 variant="text"
@@ -317,6 +326,14 @@
                 :aria-label="`View logs for ${a.name}`"
               />
               <v-btn
+                icon="mdi-ip-network-outline"
+                size="small"
+                variant="text"
+                color="primary"
+                @click="openRoutes(a)"
+                :aria-label="`Manage subnet routes for ${a.name}`"
+              />
+              <v-btn
                 icon="mdi-delete"
                 size="small"
                 variant="text"
@@ -449,6 +466,62 @@
           @click="confirmReassign"
         >
           Reassign
+        </v-btn>
+      </v-card-actions>
+    </v-card>
+  </v-dialog>
+
+  <!-- Subnet routes (mesh subnet-router, Phase 2 — MANAGE_AGENTS) -->
+  <v-dialog v-model="routesDialogOpen" max-width="560">
+    <v-card>
+      <v-card-title>Subnet routes</v-card-title>
+      <v-card-text>
+        <p class="text-body-2 mb-3">
+          CIDRs that <strong>{{ routesTarget?.name }}</strong> advertises for the
+          mesh (<code>roomler-tunnel socks5</code>). A LAN target IP matching one of
+          these routes is dialed by this agent, so the mesh can reach non-agent
+          devices behind it (a NAS, a printer, a database host). Access is still
+          gated by your <strong>Tunnel ACL</strong> — a route steers the dial, it
+          doesn't authorize it.
+        </p>
+
+        <div v-if="routesDraft.length" class="d-flex flex-wrap gap-2 mb-3">
+          <v-chip
+            v-for="cidr in routesDraft"
+            :key="cidr"
+            closable
+            size="small"
+            variant="tonal"
+            color="primary"
+            prepend-icon="mdi-ip-network-outline"
+            @click:close="removeRoute(cidr)"
+          >
+            {{ cidr }}
+          </v-chip>
+        </div>
+        <p v-else class="text-body-2 text-medium-emphasis mb-3">
+          No routes yet — this agent only reaches its own host.
+        </p>
+
+        <v-text-field
+          v-model="routeInput"
+          label="Add route (CIDR)"
+          placeholder="10.66.24.0/24"
+          density="compact"
+          variant="outlined"
+          :error-messages="routeInputError ? [routeInputError] : []"
+          append-inner-icon="mdi-plus"
+          hint="e.g. 10.66.24.0/24 (subnet) or 10.66.24.53/32 (single host)"
+          persistent-hint
+          @click:append-inner="addRoute"
+          @keyup.enter="addRoute"
+        />
+      </v-card-text>
+      <v-card-actions>
+        <v-spacer />
+        <v-btn variant="text" @click="routesDialogOpen = false">Cancel</v-btn>
+        <v-btn color="primary" variant="flat" :loading="routesBusy" @click="saveRoutes">
+          Save
         </v-btn>
       </v-card-actions>
     </v-card>
@@ -701,6 +774,85 @@ async function confirmReassign() {
     agentStore.error = (e as Error).message
   } finally {
     reassignBusy.value = false
+  }
+}
+
+// Subnet routes (mesh subnet-router, Phase 2 — MANAGE_AGENTS). Edit the agent's
+// advertised route CIDRs; the mesh longest-prefix-matches a LAN target IP
+// against these. The draft is applied atomically on Save via a full-replace PUT.
+const routesDialogOpen = ref(false)
+const routesTarget = ref<Agent | null>(null)
+const routesDraft = ref<string[]>([])
+const routeInput = ref('')
+const routeInputError = ref<string | null>(null)
+const routesBusy = ref(false)
+
+function openRoutes(a: Agent) {
+  routesTarget.value = a
+  routesDraft.value = [...(a.routes ?? [])]
+  routeInput.value = ''
+  routeInputError.value = null
+  routesDialogOpen.value = true
+}
+
+/**
+ * Validate a CIDR and return its canonical network form — IPv4 host bits are
+ * masked to the network address, so `10.66.24.53/24` → `10.66.24.0/24`.
+ * Returns null for anything that isn't valid CIDR notation: a bare IP (no
+ * prefix), a bad octet, or an out-of-range prefix. IPv6 is validated loosely
+ * and returned as-typed; the server canonicalizes authoritatively (both ends
+ * share the same `ipnet` semantics). Mirrors `normalize_routes` in the API.
+ */
+function canonicalizeCidr(raw: string): string | null {
+  const t = raw.trim()
+  const m = t.match(/^([^/]+)\/(\d{1,3})$/)
+  if (!m) return null
+  const addr = m[1]!
+  const prefix = Number(m[2])
+  if (addr.includes(':')) {
+    // IPv6 — loose check; the server has the authoritative parser.
+    if (prefix < 0 || prefix > 128 || !/^[0-9a-fA-F:]+$/.test(addr)) return null
+    return `${addr}/${prefix}`
+  }
+  const octets = addr.split('.')
+  if (octets.length !== 4) return null
+  if (!octets.every((o) => /^\d{1,3}$/.test(o) && Number(o) <= 255)) return null
+  if (prefix < 0 || prefix > 32) return null
+  const nums = octets.map((o) => Number(o))
+  const bits = ((nums[0]! << 24) | (nums[1]! << 16) | (nums[2]! << 8) | nums[3]!) >>> 0
+  const mask = prefix === 0 ? 0 : (0xffffffff << (32 - prefix)) >>> 0
+  const net = (bits & mask) >>> 0
+  const masked = [(net >>> 24) & 255, (net >>> 16) & 255, (net >>> 8) & 255, net & 255].join('.')
+  return `${masked}/${prefix}`
+}
+
+function addRoute() {
+  const canonical = canonicalizeCidr(routeInput.value)
+  if (!canonical) {
+    routeInputError.value = 'Enter a valid CIDR, e.g. 10.66.24.0/24 or 10.66.24.53/32'
+    return
+  }
+  if (!routesDraft.value.includes(canonical)) {
+    routesDraft.value.push(canonical)
+  }
+  routeInput.value = ''
+  routeInputError.value = null
+}
+
+function removeRoute(cidr: string) {
+  routesDraft.value = routesDraft.value.filter((r) => r !== cidr)
+}
+
+async function saveRoutes() {
+  if (!routesTarget.value) return
+  routesBusy.value = true
+  try {
+    await agentStore.updateRoutes(props.tenantId, routesTarget.value.id, routesDraft.value)
+    routesDialogOpen.value = false
+  } catch (e) {
+    agentStore.error = (e as Error).message
+  } finally {
+    routesBusy.value = false
   }
 }
 

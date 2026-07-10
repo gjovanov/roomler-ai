@@ -53,3 +53,4 @@ hex.workspace = true
 base64.workspace = true
 async-trait.workspace = true
 nanoid.workspace = true
+ipnet = "2" # subnet-route CIDR validation for the mesh subnet-router admin API
