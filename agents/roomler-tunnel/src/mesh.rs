@@ -69,6 +69,17 @@ struct MeshTarget {
     dial_host: String,
 }
 
+/// A live mesh UDP chain into a covering agent's per-agent proxy, keyed by the
+/// app's ORIGINAL destination (name / id / LAN-IP). `dial_host` is what that
+/// agent dials — its own `127.0.0.1` for a name/id target, or the real LAN IP
+/// for a subnet route — so each datagram forwards correctly without
+/// re-resolving; the reply pump reframes replies with the app's original DST.
+#[derive(Clone)]
+struct ChainEntry {
+    sock: Arc<UdpSocket>,
+    dial_host: String,
+}
+
 /// Cap on connecting to a freshly-spawned per-agent proxy (it must bind its
 /// listener; its tunnel session establishes lazily on the first forwarded flow).
 const PROXY_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -192,9 +203,12 @@ async fn handle_associate_mesh(
     socks5::reply_bound(&mut tcp, socks5::REP_SUCCESS, relay_addr).await;
     info!(%relay_addr, "mesh: UDP ASSOCIATE relay bound");
 
-    // agent-id → the mesh-side UDP socket chained to that agent's proxy relay.
-    let chains: Arc<Mutex<HashMap<ObjectId, Arc<UdpSocket>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    // app-original-DST (name / id / LAN-IP) → the mesh-side UDP socket chained
+    // to the covering agent's proxy relay, plus the host that agent dials.
+    // Keyed by the app's TARGET — not by agent-id — so each chain's reply pump
+    // reframes with exactly what the app addressed (v1.1: lets subnet LAN-IP
+    // targets ride alongside name/id ones through the same covering agent).
+    let chains: Arc<Mutex<HashMap<String, ChainEntry>>> = Arc::new(Mutex::new(HashMap::new()));
     let mut app_src: Option<SocketAddr> = None;
     let mut buf = vec![0u8; 64 * 1024 + 512];
 
@@ -219,30 +233,47 @@ async fn handle_associate_mesh(
                     Ok(x) => x,
                     Err(e) => { debug!(%e, "mesh: malformed socks udp datagram — dropping"); continue; }
                 };
-                let Some(agent_id) = resolve_agent(&name, &cfg, &roster).await else {
-                    debug!(host = %name, "mesh: udp datagram for unknown agent — dropping");
-                    continue;
-                };
-                let existing = chains.lock().await.get(&agent_id).cloned();
-                let sock = match existing {
-                    Some(s) => s,
-                    None => match open_udp_chain(
-                        agent_id, &cfg, transport, &ports, &relay, src, &name, &chains,
-                    )
-                    .await
-                    {
-                        Ok(s) => s,
-                        Err(e) => {
-                            warn!(%agent_id, %e, "mesh: udp chain open failed");
+                // Chains are keyed by the app's original destination so each
+                // reply is reframed with exactly what the app addressed.
+                let existing = chains.lock().await.get(&name).cloned();
+                let entry = match existing {
+                    Some(e) => e,
+                    None => {
+                        // IP-aware resolution — the SAME longest-prefix route
+                        // table the TCP path uses: a LAN-IP target picks the
+                        // covering agent and `dial_host` is the real IP; a
+                        // name/id target dials the agent's own 127.0.0.1.
+                        let Some(target) = resolve_target(&name, &cfg, &roster).await else {
+                            debug!(host = %name, "mesh: udp datagram for unknown target — dropping");
                             continue;
+                        };
+                        match open_udp_chain(
+                            target.agent_id,
+                            target.dial_host,
+                            &cfg,
+                            transport,
+                            &ports,
+                            &relay,
+                            src,
+                            &name,
+                            &chains,
+                        )
+                        .await
+                        {
+                            Ok(e) => e,
+                            Err(err) => {
+                                warn!(host = %name, %err, "mesh: udp chain open failed");
+                                continue;
+                            }
                         }
-                    },
+                    }
                 };
-                // Forward to the proxy relay, target rewritten to the agent's
-                // own host (`127.0.0.1:port`) — the mesh addressing model.
-                let framed = socks5::encode_udp_datagram("127.0.0.1", port, &buf[off..n]);
-                if let Err(e) = sock.send(&framed).await {
-                    debug!(%agent_id, %e, "mesh: udp send to agent proxy failed");
+                // Forward to the proxy relay with the per-target dial host: the
+                // agent's own `127.0.0.1` for a name/id target, or the real LAN
+                // IP for a subnet route (so the covering agent dials the device).
+                let framed = socks5::encode_udp_datagram(&entry.dial_host, port, &buf[off..n]);
+                if let Err(e) = entry.sock.send(&framed).await {
+                    debug!(host = %name, %e, "mesh: udp send to agent proxy failed");
                 }
             }
         }
@@ -256,19 +287,22 @@ async fn handle_associate_mesh(
 /// Open a SOCKS-UDP chain into `agent_id`'s Phase-1 loopback proxy:
 /// spawn/reuse the proxy, TCP-connect + UDP ASSOCIATE against it, and bind
 /// a mesh-side UDP socket connected to the proxy's relay. Spawns a task
-/// pumping the proxy's responses back to the app, re-framed with the agent
-/// `name` as source (so the app sees a reply from what it addressed).
+/// pumping the proxy's responses back to the app, re-framed with `name` — the
+/// app's ORIGINAL DST (name / id / LAN-IP) — as source, so the app sees a
+/// reply from what it addressed. `dial_host` is the host the covering agent
+/// dials (its own `127.0.0.1` for name/id, or the real LAN IP for a subnet).
 #[allow(clippy::too_many_arguments)]
 async fn open_udp_chain(
     agent_id: ObjectId,
+    dial_host: String,
     cfg: &TunnelConfig,
     transport: TransportPref,
     ports: &ProxyPorts,
     app_relay: &Arc<UdpSocket>,
     app_src: SocketAddr,
     name: &str,
-    chains: &Arc<Mutex<HashMap<ObjectId, Arc<UdpSocket>>>>,
-) -> Result<Arc<UdpSocket>> {
+    chains: &Arc<Mutex<HashMap<String, ChainEntry>>>,
+) -> Result<ChainEntry> {
     let proxy_port = get_or_spawn_proxy(agent_id, cfg, transport, ports).await?;
     let mut control = connect_tcp(proxy_port).await?;
     let proxy_relay = socks5::client_udp_associate(&mut control).await?;
@@ -284,24 +318,31 @@ async fn open_udp_chain(
 
     let sock_rx = Arc::clone(&sock);
     let app_relay = Arc::clone(app_relay);
-    let name = name.to_string();
+    // The app's original DST — reframe replies with it (a name → domain ATYP,
+    // a LAN-IP → IPv4/IPv6 ATYP) and use it as the chain key on teardown.
+    let pump_key = name.to_string();
     let chains_rx = Arc::clone(chains);
     tokio::spawn(async move {
         let _control = control; // hold the association open for its lifetime
         let mut buf = vec![0u8; 64 * 1024 + 512];
         while let Ok(n) = sock_rx.recv(&mut buf).await {
-            // Proxy response header names 127.0.0.1:port; rewrite source to
-            // the agent name the app used so the app accepts the reply.
+            // The proxy response header carries what the agent dialed
+            // (`127.0.0.1` for name/id, the real IP for a subnet route); rewrite
+            // the source to the app's original DST so the app accepts the reply.
             if let Ok((_h, port, off)) = socks5::parse_udp_datagram(&buf[..n]) {
-                let reframed = socks5::encode_udp_datagram(&name, port, &buf[off..n]);
+                let reframed = socks5::encode_udp_datagram(&pump_key, port, &buf[off..n]);
                 let _ = app_relay.send_to(&reframed, app_src).await;
             }
         }
-        chains_rx.lock().await.remove(&agent_id);
+        chains_rx.lock().await.remove(&pump_key);
     });
 
-    chains.lock().await.insert(agent_id, Arc::clone(&sock));
-    Ok(sock)
+    let entry = ChainEntry {
+        sock: Arc::clone(&sock),
+        dial_host,
+    };
+    chains.lock().await.insert(name.to_string(), entry.clone());
+    Ok(entry)
 }
 
 /// Read + discard the SOCKS control connection until EOF/error — its close
@@ -440,30 +481,6 @@ async fn resolve_target(host: &str, cfg: &TunnelConfig, roster: &Roster) -> Opti
                 agent_id,
                 dial_host: "127.0.0.1".to_string(),
             })
-        }
-        Err(e) => {
-            warn!(%e, "mesh: roster refresh failed");
-            None
-        }
-    }
-}
-
-/// Resolve a SOCKS hostname to an agent-id by **name or 24-hex id only** (no
-/// subnet routing) — used by the UDP mesh path, which is name/id-only in v1.
-/// Refreshes on a name miss.
-async fn resolve_agent(host: &str, cfg: &TunnelConfig, roster: &Roster) -> Option<ObjectId> {
-    if let Ok(id) = ObjectId::parse_str(host) {
-        return Some(id);
-    }
-    let key = host.to_ascii_lowercase();
-    if let Some(id) = roster.lock().await.names.get(&key).copied() {
-        return Some(id);
-    }
-    match fetch_roster(cfg).await {
-        Ok(fresh) => {
-            let id = fresh.names.get(&key).copied();
-            *roster.lock().await = fresh;
-            id
         }
         Err(e) => {
             warn!(%e, "mesh: roster refresh failed");
