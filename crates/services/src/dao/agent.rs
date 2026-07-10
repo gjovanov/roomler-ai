@@ -190,6 +190,28 @@ impl AgentDao {
             .await
     }
 
+    /// Replace the agent's advertised subnet-router CIDRs (mesh Phase 2). A
+    /// `MANAGE_AGENTS` admin action. Callers pass already validated +
+    /// canonicalized CIDR strings (see `normalize_routes` in the agent route
+    /// handler); the mesh client longest-prefix-matches a LAN target IP
+    /// against these to pick the covering agent. Still gated server-side by
+    /// the tenant's `tunnel_policies` — routes only steer the dial, they
+    /// don't authorize it.
+    pub async fn update_routes(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        routes: &[String],
+    ) -> DaoResult<bool> {
+        let routes_bson = bson::to_bson(routes).unwrap_or(bson::Bson::Array(vec![]));
+        self.base
+            .update_one(
+                doc! { "_id": agent_id, "tenant_id": tenant_id },
+                doc! { "$set": { "routes": routes_bson } },
+            )
+            .await
+    }
+
     pub async fn rename(
         &self,
         tenant_id: ObjectId,

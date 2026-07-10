@@ -179,6 +179,11 @@ pub struct AgentResponse {
     pub is_online: bool,
     pub last_seen_at: String,
     pub access_policy: AccessPolicy,
+    /// Subnet-router CIDRs this agent advertises for the mesh (Phase 2). The
+    /// `roomler-tunnel socks5` mesh longest-prefix-matches a LAN target IP
+    /// against these to pick the covering agent, which then dials the real
+    /// IP. Admin-managed here; still gated by the tenant's `tunnel_policies`.
+    pub routes: Vec<String>,
     /// Codec + HW backend availability advertised by the agent in its
     /// most recent rc:agent.hello. Default empty for pre-2A.1 agents
     /// that haven't reconnected since the schema change.
@@ -238,6 +243,10 @@ pub struct UpdateAgentRequest {
     pub access_policy: Option<AccessPolicy>,
     /// Reassign the device owner (hex user id). `MANAGE_AGENTS` only.
     pub owner_user_id: Option<String>,
+    /// Replace the advertised subnet-router CIDRs (mesh Phase 2). Each entry
+    /// is validated + canonicalized by `normalize_routes`; an invalid CIDR
+    /// fails the whole request with 400. `MANAGE_AGENTS` only.
+    pub routes: Option<Vec<String>>,
 }
 
 pub async fn update_agent(
@@ -270,6 +279,10 @@ pub async fn update_agent(
     }
     if let Some(policy) = body.access_policy {
         state.agents.update_access_policy(tid, aid, &policy).await?;
+    }
+    if let Some(routes) = body.routes {
+        let normalized = normalize_routes(routes)?;
+        state.agents.update_routes(tid, aid, &normalized).await?;
     }
 
     Ok(Json(serde_json::json!({ "updated": true })))
@@ -478,6 +491,7 @@ fn to_agent_response(
         is_online,
         last_seen_at: fmt_dt(a.last_seen_at),
         access_policy: a.access_policy,
+        routes: a.routes,
         capabilities: a.capabilities,
     }
 }
@@ -499,4 +513,87 @@ fn to_session_response(s: RemoteSession) -> SessionResponse {
 fn fmt_dt(dt: DateTime) -> String {
     dt.try_to_rfc3339_string()
         .unwrap_or_else(|_| dt.timestamp_millis().to_string())
+}
+
+/// Validate + canonicalize the subnet-route CIDRs an admin assigns to an agent
+/// for the mesh subnet-router (Phase 2). Every entry must be valid CIDR
+/// notation — IPv4 or IPv6, e.g. `10.66.24.0/24` or a single host
+/// `10.66.24.53/32`. Host bits are masked to the network address, blank entries
+/// are dropped, and duplicates removed. A bare IP or any unparseable entry
+/// fails the whole request with 400 so the admin UI shows a clear error instead
+/// of silently storing a route the mesh client would skip. Mirrors the
+/// client-side parse in `roomler-tunnel`'s `mesh.rs` (both use `ipnet::IpNet`).
+fn normalize_routes(raw: Vec<String>) -> Result<Vec<String>, ApiError> {
+    use std::str::FromStr;
+    const MAX_ROUTES: usize = 64;
+    let mut out: Vec<String> = Vec::with_capacity(raw.len());
+    for entry in raw {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let net = ipnet::IpNet::from_str(trimmed).map_err(|_| {
+            ApiError::BadRequest(format!(
+                "Invalid route CIDR '{trimmed}' — use CIDR notation, \
+                 e.g. 10.66.24.0/24 or a single host 10.66.24.53/32"
+            ))
+        })?;
+        let canonical = net.trunc().to_string();
+        if !out.contains(&canonical) {
+            out.push(canonical);
+        }
+    }
+    if out.len() > MAX_ROUTES {
+        return Err(ApiError::BadRequest(format!(
+            "Too many routes ({}); max {MAX_ROUTES}",
+            out.len()
+        )));
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_routes;
+
+    #[test]
+    fn normalize_routes_canonicalizes_and_dedups() {
+        // host bits masked to the network; duplicate collapsed; blanks dropped
+        let out = normalize_routes(vec![
+            "10.66.24.53/24".to_string(),
+            "  ".to_string(),
+            "10.66.24.0/24".to_string(),
+            "192.168.1.0/24".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(out, vec!["10.66.24.0/24", "192.168.1.0/24"]);
+    }
+
+    #[test]
+    fn normalize_routes_accepts_host_route_and_ipv6() {
+        let out = normalize_routes(vec![
+            "10.66.24.53/32".to_string(),
+            "2001:db8::/32".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(out, vec!["10.66.24.53/32", "2001:db8::/32"]);
+    }
+
+    #[test]
+    fn normalize_routes_rejects_bare_ip_and_garbage() {
+        // a bare IP (no prefix) is rejected — CIDR notation is required so the
+        // stored value always parses on the mesh client side.
+        assert!(normalize_routes(vec!["10.66.24.53".to_string()]).is_err());
+        assert!(normalize_routes(vec!["not-a-cidr".to_string()]).is_err());
+        assert!(normalize_routes(vec!["10.66.24.0/33".to_string()]).is_err());
+    }
+
+    #[test]
+    fn normalize_routes_empty_is_ok() {
+        assert_eq!(normalize_routes(vec![]).unwrap(), Vec::<String>::new());
+        assert_eq!(
+            normalize_routes(vec!["".to_string(), "   ".to_string()]).unwrap(),
+            Vec::<String>::new()
+        );
+    }
 }
