@@ -98,6 +98,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         // Phase 1: no advertised subnet routes until the operator configures them.
         overlay_advertised_routes: Vec::new(),
         advertise_routes: Vec::new(),
+        advertise_local_subnets: true,
     })
 }
 
