@@ -1405,6 +1405,32 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     // runtime on each reconnect, but publishes into this same channel). The
     // listener runs regardless of the overlay feature — without it `peers()` is
     // simply empty. A bind failure is logged, never fatal.
+    //
+    // P2b — the operator-consent broker is created HERE (not inside
+    // signaling::run) so the LocalAPI's DaemonState shares the SAME instance the
+    // signaling loop prompts on; its live `pending` set gates LocalAPI consent
+    // decisions (a decision is honoured only for an actively-prompting session).
+    let consent_mode = roomler_agent::consent::Mode::from_config(cfg.auto_grant_session);
+    let consent_dir =
+        roomler_agent::consent::ConsentBroker::default_sentinel_dir().unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "could not resolve consent sentinel dir; using temp dir");
+            std::env::temp_dir().join("roomler-agent-consent")
+        });
+    let consent_broker = roomler_agent::consent::ConsentBroker::new(consent_mode, consent_dir)
+        .unwrap_or_else(|e| {
+            // FAIL CLOSED for prompt-mode fleets: keep the CONFIGURED mode on the
+            // temp dir rather than downgrading to AutoGrant. A Prompt broker whose
+            // dir doesn't match the tray's simply times out → deny (safe), instead
+            // of the pre-P2b fail-OPEN that auto-granted every session on a glitch.
+            tracing::error!(error = %e, ?consent_mode, "consent broker init failed; retrying on temp dir with the SAME mode (prompt-mode fails closed)");
+            roomler_agent::consent::ConsentBroker::new(consent_mode, std::env::temp_dir())
+                .expect("consent broker init cannot fail with temp_dir")
+        });
+    tracing::info!(
+        mode = ?consent_broker.mode(),
+        sentinel_dir = %consent_broker.sentinel_dir().display(),
+        "operator-consent broker ready"
+    );
     let localapi_connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (overlay_view_tx, overlay_view_rx) =
         tokio::sync::watch::channel(tunnel_core::localapi::OverlayView::default());
@@ -1416,6 +1442,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
             (!cfg.tenant_id.is_empty()).then(|| cfg.tenant_id.clone()),
             localapi_connected.clone(),
             overlay_view_rx,
+            consent_broker.clone(),
         ));
     let localapi_task = tokio::spawn({
         let shutdown = shutdown_rx.clone();
@@ -1430,7 +1457,17 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         let rx = shutdown_rx.clone();
         let connected = localapi_connected.clone();
         let view_tx = overlay_view_tx.clone();
-        async move { signaling::run(cfg, encoder_preference, rx, connected, view_tx).await }
+        async move {
+            signaling::run(
+                cfg,
+                encoder_preference,
+                rx,
+                connected,
+                view_tx,
+                consent_broker,
+            )
+            .await
+        }
     });
 
     // Clean-run promotion task: after the agent has been alive for
