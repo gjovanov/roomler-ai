@@ -140,6 +140,13 @@ impl AgentTunnelPeer {
                         };
                         demuxes.push(FlowDemux::install(dc).await);
                     }
+                    // Idle keepalive: mirror the client — webrtc-dc has no
+                    // built-in keepalive, so send a tiny frame over dc(0)
+                    // periodically to keep the TURN-relay permission / NAT
+                    // mapping warm. Detached; self-exits when the pool drops.
+                    if let Some(first) = demuxes.first() {
+                        tunnel_core::forward::spawn_dc_keepalive(first.dc());
+                    }
                     *demuxes_for_task.lock().await = demuxes;
                     info!(%session_id, pool_size, "agent tunnel DC pool open + demuxes installed");
                     pool_ready_for_task.notify_waiters();
