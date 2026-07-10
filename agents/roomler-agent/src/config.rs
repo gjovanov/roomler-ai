@@ -153,6 +153,14 @@ pub struct AgentConfig {
     /// this node is not a subnet router.
     #[serde(default)]
     pub overlay_advertised_routes: Vec<String>,
+
+    /// Tunnel mesh subnet-router — CIDRs this host advertises it can route for
+    /// the SOCKS mesh (e.g. `["192.168.1.0/24"]`). Sent on `rc:agent.hello` as
+    /// `advertised_routes`; an admin approves a subset (Admin → Agents → Subnet
+    /// routes) before the mesh uses them. Separate from
+    /// `overlay_advertised_routes` (the L3 overlay's own subnet router).
+    #[serde(default)]
+    pub advertise_routes: Vec<String>,
 }
 
 /// Current schema version. Bumped whenever [`migrate`] gains a new
@@ -494,6 +502,7 @@ mod tests {
             overlay_enabled: false,
             overlay_wg_secret_key: None,
             overlay_advertised_routes: Vec::new(),
+            advertise_routes: Vec::new(),
         }
     }
 

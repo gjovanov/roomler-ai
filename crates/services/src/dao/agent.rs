@@ -45,6 +45,7 @@ impl AgentDao {
             capabilities: AgentCaps::default(),
             access_policy: AccessPolicy::default(),
             routes: Vec::new(),
+            advertised_routes: Vec::new(),
             created_at: now,
             updated_at: now,
             deleted_at: None,
@@ -127,9 +128,11 @@ impl AgentDao {
         agent_version: &str,
         displays: &[DisplayInfo],
         capabilities: &AgentCaps,
+        advertised_routes: &[String],
     ) -> DaoResult<bool> {
         let displays_bson = bson::to_bson(displays).unwrap_or(bson::Bson::Array(vec![]));
         let caps_bson = bson::to_bson(capabilities).unwrap_or(bson::Bson::Null);
+        let advertised_bson = bson::to_bson(advertised_routes).unwrap_or(bson::Bson::Array(vec![]));
         self.base
             .update_by_id(
                 agent_id,
@@ -138,6 +141,7 @@ impl AgentDao {
                         "agent_version": agent_version,
                         "displays": displays_bson,
                         "capabilities": caps_bson,
+                        "advertised_routes": advertised_bson,
                         "status": bson::to_bson(&AgentStatus::Online).unwrap(),
                         "last_seen_at": DateTime::now(),
                     }

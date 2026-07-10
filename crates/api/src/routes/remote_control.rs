@@ -184,6 +184,10 @@ pub struct AgentResponse {
     /// against these to pick the covering agent, which then dials the real
     /// IP. Admin-managed here; still gated by the tenant's `tunnel_policies`.
     pub routes: Vec<String>,
+    /// Subnet CIDRs the agent itself ADVERTISES it can route (from its
+    /// `advertise_routes` config, sent on `rc:agent.hello`). Untrusted
+    /// suggestions the admin approves into `routes`. Empty for pre-feature agents.
+    pub advertised_routes: Vec<String>,
     /// Codec + HW backend availability advertised by the agent in its
     /// most recent rc:agent.hello. Default empty for pre-2A.1 agents
     /// that haven't reconnected since the schema change.
@@ -492,6 +496,7 @@ fn to_agent_response(
         last_seen_at: fmt_dt(a.last_seen_at),
         access_policy: a.access_policy,
         routes: a.routes,
+        advertised_routes: a.advertised_routes,
         capabilities: a.capabilities,
     }
 }
