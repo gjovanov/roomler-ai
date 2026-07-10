@@ -208,7 +208,11 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (y, m, d)
 }
 
-fn resolve_log_dir() -> Option<PathBuf> {
+/// Compute the default log directory PATH — purely, without the `LOG_DIR`
+/// `OnceLock` (which is only set by [`init`], so it's `None` in any process
+/// that didn't run the agent's logging setup, e.g. the tray). The tray uses
+/// this so "Open Logs Folder" resolves a real path instead of failing.
+pub fn resolve_log_dir() -> Option<PathBuf> {
     let dirs = ProjectDirs::from("live", "roomler", "roomler-agent")?;
     Some(dirs.data_local_dir().join("logs"))
 }
