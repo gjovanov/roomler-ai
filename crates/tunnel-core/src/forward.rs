@@ -171,6 +171,21 @@ impl FlowStats {
 /// sentinel inside [`FlowDemux::install`].
 pub(crate) const HALF_CLOSE_MAGIC: &[u8] = &[0xFF];
 
+/// Reserved `flow_id` for the idle keepalive frame. Real flows start at
+/// 1 (the client's `flow_counter` is `AtomicU32::new(1)` and the agent
+/// reuses that id), so 0 never collides with a live flow and serves as a
+/// marker that [`FlowDemux::install`] silently drops.
+pub const KEEPALIVE_FLOW_ID: u32 = 0;
+
+/// How often each peer sends a keepalive frame over one DC so an idle
+/// `webrtc-dc` tunnel's TURN-relay permission / NAT mapping stays warm.
+/// webrtc-dc — unlike QUIC, which sets `keep_alive_interval` (8 s) on the
+/// endpoint — has no built-in keepalive, so an idle relay path gets
+/// reaped: coturn permissions lapse ~5 min and a corp NAT can drop an
+/// idle UDP mapping sooner. 20 s comfortably beats both and is negligible
+/// on the wire (one 5-byte frame). See [`spawn_dc_keepalive`].
+pub const DC_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+
 // Compile-time invariants. Cross-referenced from the audit log
 // dashboard's roll-up — see CLAUDE.md for the constants we lock here.
 const _: () = assert!(
@@ -228,6 +243,13 @@ impl FlowDemux {
                     );
                     return;
                 };
+                // Idle keepalive frame (see `spawn_dc_keepalive`): the
+                // reserved flow_id carries no flow data — drop it silently
+                // so it isn't logged as an unregistered flow.
+                if flow_id == KEEPALIVE_FLOW_ID {
+                    trace!("tunnel DC idle keepalive received");
+                    return;
+                }
                 // In-band half-close. SCTP ordering guarantees this
                 // byte arrives strictly after every prior chunk on
                 // the same flow, so dropping the sender now means
@@ -299,6 +321,34 @@ impl FlowDemux {
     pub fn dc(&self) -> Arc<RTCDataChannel> {
         Arc::clone(&self.dc)
     }
+}
+
+/// Spawn a task that sends a tiny keepalive frame over `dc` every
+/// [`DC_KEEPALIVE_INTERVAL`], keeping an idle `webrtc-dc` tunnel's
+/// TURN-relay permission / NAT mapping warm. Both peers run this — the
+/// client once its DC pool opens, the agent once it installs its demuxes
+/// — so traffic flows both ways and neither relay half lapses. The frame
+/// rides [`KEEPALIVE_FLOW_ID`], which [`FlowDemux::install`] drops on
+/// receipt. QUIC needs no equivalent: quinn's `keep_alive_interval` does
+/// this at the transport layer. Fire-and-forget: the task self-terminates
+/// when the DC send fails (the pool is torn down at session end).
+pub fn spawn_dc_keepalive(dc: Arc<RTCDataChannel>) {
+    // Non-empty 1-byte payload → a 5-byte frame. Empty-payload (4-byte)
+    // DC messages were unreliably delivered in the local two-peer fixture
+    // (see the `HALF_CLOSE_MAGIC` note), so never send a bare prefix.
+    let frame = Bytes::from(mux::encode(KEEPALIVE_FLOW_ID, &[0u8]));
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(DC_KEEPALIVE_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick.tick().await; // consume the immediate first tick
+        loop {
+            tick.tick().await;
+            if let Err(e) = dc.send(&frame).await {
+                debug!(%e, "tunnel DC keepalive send failed; keepalive task exiting");
+                break;
+            }
+        }
+    });
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1217,6 +1267,27 @@ mod tests {
     fn oversized_datagram_is_dropped_by_framer() {
         let too_big = vec![0u8; MAX_UDP_DATAGRAM + 1];
         assert!(frame_udp_datagram(&too_big).is_none());
+    }
+
+    #[test]
+    fn keepalive_frame_uses_reserved_flow_id() {
+        // The idle keepalive (spawn_dc_keepalive) rides flow_id 0 — reserved
+        // because real flows start at 1 — as a 5-byte frame the demux drops.
+        let frame = mux::encode(KEEPALIVE_FLOW_ID, &[0u8]);
+        let (flow_id, payload) = mux::decode(&frame).expect("keepalive frame decodes");
+        assert_eq!(flow_id, KEEPALIVE_FLOW_ID);
+        assert_eq!(
+            KEEPALIVE_FLOW_ID, 0,
+            "reserved id must not collide with live flows (which start at 1)"
+        );
+        // Distinct from the half-close sentinel so the demux's check order
+        // (keepalive first, then half-close) is unambiguous.
+        assert_ne!(payload, HALF_CLOSE_MAGIC);
+        assert_eq!(
+            frame.len(),
+            5,
+            "4-byte prefix + 1-byte pad; never a bare prefix"
+        );
     }
 
     /// Agent-side UDP pump over a real DC pool: a datagram sent by the
