@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::watch;
 use tunnel_core::localapi::{
-    DaemonMode, FlowInfo, LocalApiState, NodeStatus, OverlayView, PeerInfo,
+    ConsentRequest, DaemonMode, FlowInfo, LocalApiState, NodeStatus, OverlayView, PeerInfo,
 };
 
 /// Live daemon state behind the LocalAPI. Built once in `run_cmd`, wrapped in an
@@ -35,6 +35,11 @@ pub struct DaemonState {
     /// disabled or this build lacks `overlay-l3` (nothing publishes) — so
     /// `peers()` is simply empty there.
     overlay: watch::Receiver<OverlayView>,
+    /// The SAME consent broker the signaling loop prompts on (injected from
+    /// `run_cmd`) — so `consent_decide` gates on the LIVE pending set and reads
+    /// the broker's own sentinel dir, rather than a throwaway broker over a
+    /// re-resolved path.
+    consent: crate::consent::ConsentBroker,
 }
 
 impl DaemonState {
@@ -49,6 +54,7 @@ impl DaemonState {
         tenant_id: Option<String>,
         connected: Arc<AtomicBool>,
         overlay: watch::Receiver<OverlayView>,
+        consent: crate::consent::ConsentBroker,
     ) -> Self {
         Self {
             node_id,
@@ -58,6 +64,7 @@ impl DaemonState {
             tenant_id,
             connected,
             overlay,
+            consent,
         }
     }
 }
@@ -93,6 +100,54 @@ impl LocalApiState for DaemonState {
         // daemon runs none — an honest empty, not a stub.
         Vec::new()
     }
+
+    fn consent_pending(&self) -> Vec<ConsentRequest> {
+        // Read the broker's OWN sentinel dir — resolved in-process, so it's the
+        // daemon's real profile even under SystemContext, where the interactive-
+        // user tray reading the dir directly would look in the WRONG profile (the
+        // P2b bug fix). Same parse the tray's cmd_get_pending_consents used to do.
+        let Ok(entries) = std::fs::read_dir(self.consent.sentinel_dir()) else {
+            return Vec::new(); // dir not created yet ⇒ nothing pending
+        };
+        let mut out = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("pending") {
+                continue;
+            }
+            if let Ok(body) = std::fs::read_to_string(&path)
+                && let Ok(pc) = serde_json::from_str::<ConsentRequest>(&body)
+            {
+                out.push(pc);
+            }
+        }
+        out
+    }
+
+    fn consent_decide(&self, session_id: &str, allow: bool) -> bool {
+        // SECURITY: the session id becomes a sentinel FILE NAME, so reject
+        // anything that isn't a 24-char hex ObjectId before it's used (path-
+        // traversal / injection guard). The pipe SDDL already limits WHO can call
+        // this (SYSTEM + Administrators + interactive user, ≥ medium integrity).
+        if !is_hex_object_id(session_id) {
+            tracing::warn!(
+                session = %session_id,
+                "localapi: rejecting consent decision — session id is not a 24-char hex ObjectId"
+            );
+            return false;
+        }
+        // Record via the LIVE broker: honored ONLY if the session is actively
+        // being prompted (no pre-approval / confused-deputy — the decision is an
+        // answer to a question the broker is currently asking).
+        self.consent.record_decision(session_id, allow)
+    }
+}
+
+/// A 24-char hex ObjectId — the only shape a session id may take before it's
+/// used as a sentinel filename. Guards [`DaemonState::consent_decide`] against a
+/// caller smuggling path separators / traversal into the filename.
+fn is_hex_object_id(s: &str) -> bool {
+    s.len() == 24 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 #[cfg(test)]
@@ -116,9 +171,27 @@ mod tests {
     }
 
     #[test]
+    fn consent_decide_hex_guard_rejects_unsafe_session_ids() {
+        // The guard fires BEFORE any filesystem write, so a bad id is a pure
+        // no-op — traversal / separators / wrong-length are all rejected.
+        assert!(is_hex_object_id("0123456789abcdef01234567"));
+        assert!(is_hex_object_id("6A11682E804368D30EDF57C6")); // upper-case hex ok
+        assert!(!is_hex_object_id("6a11682e804368d30edf57c")); // 23 chars
+        assert!(!is_hex_object_id("6a11682e804368d30edf57c6z")); // 25 / non-hex
+        assert!(!is_hex_object_id("../../etc/passwd"));
+        assert!(!is_hex_object_id("6a11682e804368d30edf57c6.approve"));
+        assert!(!is_hex_object_id(""));
+    }
+
+    #[test]
     fn status_and_peers_track_connected_flag() {
         let connected = Arc::new(AtomicBool::new(false));
         let (_tx, rx) = watch::channel(view());
+        let consent = crate::consent::ConsentBroker::new(
+            crate::consent::Mode::AutoGrant,
+            std::env::temp_dir().join(format!("roomler-las-consent-{}", std::process::id())),
+        )
+        .unwrap();
         let st = DaemonState::new(
             "aid".into(),
             "host".into(),
@@ -126,6 +199,7 @@ mod tests {
             Some("tid".into()),
             connected.clone(),
             rx,
+            consent,
         );
 
         // Identity + overlay IP are always reported; connected reflects the flag.
