@@ -578,6 +578,15 @@ async fn run_webrtc_session(
     }
     let demuxes = Arc::new(demuxes);
 
+    // Idle keepalive: webrtc-dc has no built-in keepalive (QUIC does), so
+    // without periodic traffic an idle tunnel's TURN-relay permission /
+    // NAT mapping lapses (~5 min) and the DTLS/SCTP association dies. Send
+    // a tiny frame over dc(0); the agent mirrors it. Detached — it
+    // self-exits when the pool drops at session end.
+    if let Some(dc0) = peer_for_dispatch.dc(0) {
+        tunnel_core::forward::spawn_dc_keepalive(dc0);
+    }
+
     // ────────────── Local TCP listener ─────────────────────────────
     let listener = TcpListener::bind(("127.0.0.1", local))
         .await
