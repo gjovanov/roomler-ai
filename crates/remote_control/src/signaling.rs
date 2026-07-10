@@ -173,6 +173,12 @@ pub enum ClientMsg {
         agent_version: String,
         displays: Vec<DisplayInfo>,
         caps: AgentCaps,
+        /// Subnet CIDRs the agent advertises it can route for the tunnel mesh
+        /// subnet-router (from its `advertise_routes` config). Admin-gated —
+        /// stored as untrusted suggestions until approved into `Agent.routes`.
+        /// `#[serde(default)]` keeps pre-feature agents (no field) compatible.
+        #[serde(default)]
+        advertised_routes: Vec<String>,
     },
 
     /// Agent periodic stats.
@@ -1048,6 +1054,42 @@ mod tests {
         assert!(s.contains(r#""t":"rc:ping""#));
         let back: ClientMsg = serde_json::from_str(&s).unwrap();
         assert!(matches!(back, ClientMsg::Ping { id: 42 }));
+    }
+
+    #[test]
+    fn agent_hello_advertised_routes_default_and_roundtrip() {
+        // New agent: round-trip preserves advertised_routes on the wire.
+        let m = ClientMsg::AgentHello {
+            machine_name: "host".into(),
+            os: OsKind::Linux,
+            agent_version: "0.3.0".into(),
+            displays: vec![],
+            caps: AgentCaps::default(),
+            advertised_routes: vec!["192.168.1.0/24".into()],
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(r#""t":"rc:agent.hello""#));
+        assert!(s.contains(r#""advertised_routes":["192.168.1.0/24"]"#));
+        match serde_json::from_str::<ClientMsg>(&s).unwrap() {
+            ClientMsg::AgentHello {
+                advertised_routes, ..
+            } => assert_eq!(advertised_routes, vec!["192.168.1.0/24".to_string()]),
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        // Old (pre-feature) agent: the same hello minus the field must
+        // deserialize with advertised_routes defaulted to [] (wire back-compat).
+        let mut obj = serde_json::to_value(&m).unwrap();
+        obj.as_object_mut().unwrap().remove("advertised_routes");
+        match serde_json::from_value::<ClientMsg>(obj).unwrap() {
+            ClientMsg::AgentHello {
+                advertised_routes, ..
+            } => assert!(
+                advertised_routes.is_empty(),
+                "a hello without advertised_routes must default to none"
+            ),
+            other => panic!("wrong variant: {other:?}"),
+        }
     }
 
     #[test]
