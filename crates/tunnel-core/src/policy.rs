@@ -672,6 +672,7 @@ mod tests {
             capabilities: AgentCaps::default(),
             access_policy: Default::default(),
             routes: Vec::new(),
+            advertised_routes: Vec::new(),
             created_at: DateTime::now(),
             updated_at: DateTime::now(),
             deleted_at: deleted.then(DateTime::now),
