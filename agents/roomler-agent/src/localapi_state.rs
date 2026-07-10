@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::watch;
 use tunnel_core::localapi::{
-    DaemonMode, FlowInfo, LocalApiState, NodeStatus, OverlayView, PeerInfo,
+    ConsentRequest, DaemonMode, FlowInfo, LocalApiState, NodeStatus, OverlayView, PeerInfo,
 };
 
 /// Live daemon state behind the LocalAPI. Built once in `run_cmd`, wrapped in an
@@ -93,6 +93,74 @@ impl LocalApiState for DaemonState {
         // daemon runs none — an honest empty, not a stub.
         Vec::new()
     }
+
+    fn consent_pending(&self) -> Vec<ConsentRequest> {
+        // Scan OUR OWN sentinel dir — resolved in-process, so it's the daemon's
+        // real profile even under SystemContext, where the interactive-user tray
+        // reading the dir directly would look in the WRONG profile (the P2b bug
+        // fix). Same parse the tray's cmd_get_pending_consents used to do.
+        let Ok(dir) = crate::consent::ConsentBroker::default_sentinel_dir() else {
+            return Vec::new();
+        };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Vec::new(); // dir not created yet ⇒ nothing pending
+        };
+        let mut out = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("pending") {
+                continue;
+            }
+            if let Ok(body) = std::fs::read_to_string(&path)
+                && let Ok(pc) = serde_json::from_str::<ConsentRequest>(&body)
+            {
+                out.push(pc);
+            }
+        }
+        out
+    }
+
+    fn consent_decide(&self, session_id: &str, allow: bool) -> bool {
+        // SECURITY: the session id becomes a sentinel FILE NAME, so reject
+        // anything that isn't a 24-char hex ObjectId before it ever touches the
+        // filesystem (path-traversal / injection guard). The pipe SDDL already
+        // limits WHO can call this (SYSTEM + Administrators + interactive user).
+        if !is_hex_object_id(session_id) {
+            tracing::warn!(
+                session = %session_id,
+                "localapi: rejecting consent decision — session id is not a 24-char hex ObjectId"
+            );
+            return false;
+        }
+        let Ok(dir) = crate::consent::ConsentBroker::default_sentinel_dir() else {
+            return false;
+        };
+        // Mode is irrelevant — we only use write_sentinel (same pattern as the
+        // pre-P2b tray cmd_consent_approve/deny).
+        let Ok(broker) = crate::consent::ConsentBroker::new(crate::consent::Mode::AutoGrant, dir)
+        else {
+            return false;
+        };
+        let kind = if allow {
+            crate::consent::SentinelKind::Approve
+        } else {
+            crate::consent::SentinelKind::Deny
+        };
+        match broker.write_sentinel(session_id, kind) {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!(session = %session_id, %e, "localapi: writing consent sentinel failed");
+                false
+            }
+        }
+    }
+}
+
+/// A 24-char hex ObjectId — the only shape a session id may take before it's
+/// used as a sentinel filename. Guards [`DaemonState::consent_decide`] against a
+/// caller smuggling path separators / traversal into the filename.
+fn is_hex_object_id(s: &str) -> bool {
+    s.len() == 24 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 #[cfg(test)]
@@ -113,6 +181,19 @@ mod tests {
                 last_seen_ms: None,
             }],
         }
+    }
+
+    #[test]
+    fn consent_decide_hex_guard_rejects_unsafe_session_ids() {
+        // The guard fires BEFORE any filesystem write, so a bad id is a pure
+        // no-op — traversal / separators / wrong-length are all rejected.
+        assert!(is_hex_object_id("0123456789abcdef01234567"));
+        assert!(is_hex_object_id("6A11682E804368D30EDF57C6")); // upper-case hex ok
+        assert!(!is_hex_object_id("6a11682e804368d30edf57c")); // 23 chars
+        assert!(!is_hex_object_id("6a11682e804368d30edf57c6z")); // 25 / non-hex
+        assert!(!is_hex_object_id("../../etc/passwd"));
+        assert!(!is_hex_object_id("6a11682e804368d30edf57c6.approve"));
+        assert!(!is_hex_object_id(""));
     }
 
     #[test]
