@@ -127,6 +127,16 @@ describe('useAgentStore', () => {
     expect(s.agents[0]!.access_policy).toEqual(policy)
   })
 
+  it('updateRoutes PUTs routes and patches local row', async () => {
+    mockApi.put.mockResolvedValueOnce({ updated: true })
+    const s = useAgentStore()
+    s.agents = [mkAgent({ id: 'a1' })]
+    const routes = ['10.66.24.0/24', '192.168.1.0/24']
+    await s.updateRoutes(TENANT_ID, 'a1', routes)
+    expect(mockApi.put).toHaveBeenCalledWith(`/tenant/${TENANT_ID}/agent/a1`, { routes })
+    expect(s.agents[0]!.routes).toEqual(routes)
+  })
+
   // ─── Task 9 Phase 3: crash-report fetch ────────────────────────
 
   it('fetchCrashes GETs the tenant-scoped per-agent endpoint and unwraps items', async () => {
