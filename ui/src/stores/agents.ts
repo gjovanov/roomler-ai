@@ -68,6 +68,11 @@ export interface Agent {
    *  covering agent. Optional because pre-Phase-2 agents / older API
    *  responses may omit it. */
   routes?: string[]
+  /** Subnet CIDRs the agent itself ADVERTISES it can route (from its
+   *  `advertise_routes` config, sent on hello). Untrusted suggestions the
+   *  admin approves into `routes` via the Subnet-routes dialog. Optional /
+   *  empty for pre-feature agents. */
+  advertised_routes?: string[]
   /** Optional because pre-2A.1 agents (and tests) may not include it. */
   capabilities?: AgentCapabilities
 }

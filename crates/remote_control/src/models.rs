@@ -173,6 +173,13 @@ pub struct Agent {
     /// older rows deserialize to no routes.
     #[serde(default)]
     pub routes: Vec<String>,
+    /// Subnet CIDRs the AGENT itself advertises it can route (from its
+    /// `advertise_routes` config, refreshed on each `rc:agent.hello`). These
+    /// are untrusted SUGGESTIONS — an admin approves a subset into `routes`
+    /// (what the mesh actually consumes). `#[serde(default)]` → older rows /
+    /// pre-feature agents deserialize to none.
+    #[serde(default)]
+    pub advertised_routes: Vec<String>,
     pub created_at: DateTime,
     pub updated_at: DateTime,
     pub deleted_at: Option<DateTime>,
