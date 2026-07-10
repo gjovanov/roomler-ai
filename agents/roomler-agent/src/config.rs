@@ -161,6 +161,20 @@ pub struct AgentConfig {
     /// `overlay_advertised_routes` (the L3 overlay's own subnet router).
     #[serde(default)]
     pub advertise_routes: Vec<String>,
+
+    /// Auto-detect this host's directly-connected IPv4 subnets and advertise
+    /// them alongside `advertise_routes` (union). Default ON: a subnet router
+    /// is zero-config — the admin sees each LAN the host is on as a suggestion
+    /// (Admin → Agents → Subnet routes) and approves what should be routed. Set
+    /// `false` to advertise only the explicit `advertise_routes`. Detected
+    /// routes are UNTRUSTED until approved, so this is safe to leave on.
+    #[serde(default = "default_true")]
+    pub advertise_local_subnets: bool,
+}
+
+/// serde default for `advertise_local_subnets` — auto-detect is ON by default.
+fn default_true() -> bool {
+    true
 }
 
 /// Current schema version. Bumped whenever [`migrate`] gains a new
@@ -503,6 +517,7 @@ mod tests {
             overlay_wg_secret_key: None,
             overlay_advertised_routes: Vec::new(),
             advertise_routes: Vec::new(),
+            advertise_local_subnets: true,
         }
     }
 
