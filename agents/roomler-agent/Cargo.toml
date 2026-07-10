@@ -25,6 +25,11 @@ tokio-tungstenite = { workspace = true }
 reqwest = { workspace = true }
 futures = { workspace = true }
 
+# Subnet auto-detection for the tunnel mesh subnet-router (advertised_routes):
+# enumerate local interfaces (if-addrs) + canonicalize CIDRs (ipnet).
+if-addrs = "0.15"
+ipnet = "2"
+
 # CLI + config
 clap = { workspace = true }
 directories = { workspace = true }

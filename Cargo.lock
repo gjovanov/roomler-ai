@@ -6750,6 +6750,8 @@ dependencies = [
  "ffmpeg-next",
  "futures",
  "hex",
+ "if-addrs",
+ "ipnet",
  "libc",
  "openh264",
  "openh264-sys2",
