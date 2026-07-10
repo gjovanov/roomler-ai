@@ -33,21 +33,26 @@ pub struct StatusReport {
     pub config_dir: String,
 }
 
-/// Read current agent config + probe service state for the status
-/// view. Never errors — missing config = `enrolled: false`.
+/// Read current agent config + probe service state for the status view. Never
+/// errors — missing config = `enrolled: false`.
+///
+/// ASYNC so the blocking service-state probe runs OFF the main (UI) thread:
+/// Tauri runs synchronous commands on the main thread, and `status.js` polls
+/// this every 10 s. `probe_service_state()` spawns + waits on the console-mode
+/// agent CLI TWICE, so a synchronous `cmd_status` froze the whole webview for a
+/// couple of seconds every 10 s (field-observed on rc.156). Off-loading it to
+/// the blocking pool keeps the tray responsive.
 #[tauri::command]
-pub fn cmd_status() -> StatusReport {
+pub async fn cmd_status() -> StatusReport {
+    tokio::task::spawn_blocking(status_report)
+        .await
+        .unwrap_or_else(|_| status_report())
+}
+
+/// The blocking status-probe body — run on the blocking pool by [`cmd_status`],
+/// and directly by the (already-async, user-triggered) enroll commands.
+fn status_report() -> StatusReport {
     let cfg = load_optional_config();
-    let log_dir = logging::log_dir()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "(unknown)".to_string());
-    let config_dir = config::default_config_path()
-        .map(|p| {
-            p.parent()
-                .map(|d| d.to_string_lossy().into_owned())
-                .unwrap_or_else(|| p.to_string_lossy().into_owned())
-        })
-        .unwrap_or_else(|_| "(unknown)".to_string());
     let (service_kind, service_running) = probe_service_state();
     let attention = if notify::has_attention() {
         notify::attention_path().map(|p| p.to_string_lossy().into_owned())
@@ -65,9 +70,49 @@ pub fn cmd_status() -> StatusReport {
         service_running,
         service_kind,
         attention,
-        log_dir,
-        config_dir,
+        log_dir: resolve_log_dir_string(),
+        config_dir: resolve_config_dir_string(),
     }
+}
+
+/// The agent log directory as a path. `logging::log_dir()` only works IN the
+/// agent process (its `LOG_DIR` OnceLock); the tray never runs that setup, so
+/// it computes the default path directly. (For a SYSTEM/SCM service the real
+/// logs live under the service account's profile — this is the interactive
+/// user's dir; good enough for "open a folder", exact SCM-service-log routing
+/// is a follow-up.)
+fn resolve_log_dir_path() -> Option<PathBuf> {
+    logging::log_dir().or_else(logging::resolve_log_dir)
+}
+
+fn resolve_log_dir_string() -> String {
+    resolve_log_dir_path()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "(unknown)".to_string())
+}
+
+/// The config directory to show / open. Prefers the machine-global
+/// (`%PROGRAMDATA%`) config a perMachine SCM service uses WHEN it exists (that's
+/// what the SYSTEM service actually reads, and it's world-readable), else the
+/// perUser config. Fixes the tray showing the wrong (perUser) folder for an SCM
+/// install.
+fn resolve_config_dir_path() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        let mg = config::machine_global_config_path();
+        if mg.exists() {
+            return mg.parent().map(|p| p.to_path_buf());
+        }
+    }
+    config::default_config_path()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+}
+
+fn resolve_config_dir_string() -> String {
+    resolve_config_dir_path()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "(unknown)".to_string())
 }
 
 /// What the "Devices" page renders (unification P2). Read from the running
@@ -161,7 +206,7 @@ pub async fn cmd_enroll(
     .await
     .map_err(|e| format!("Enrollment failed: {e:#}"))?;
     config::save(&path, &cfg).map_err(|e| format!("Saving config: {e}"))?;
-    Ok(cmd_status())
+    Ok(status_report())
 }
 
 /// Refresh the token using an existing config. Mirrors the CLI's
@@ -183,7 +228,7 @@ pub async fn cmd_re_enroll(token: String) -> Result<StatusReport, String> {
     .await
     .map_err(|e| format!("Re-enrollment failed: {e:#}"))?;
     config::save(&path, &cfg).map_err(|e| format!("Saving config: {e}"))?;
-    Ok(cmd_status())
+    Ok(status_report())
 }
 
 /// Update the device name on the persisted config. Effective on next
@@ -199,7 +244,7 @@ pub fn cmd_set_device_name(name: String) -> Result<StatusReport, String> {
     let mut cfg = config::load(&path).map_err(|e| format!("Loading config: {e}"))?;
     cfg.machine_name = trimmed;
     config::save(&path, &cfg).map_err(|e| format!("Saving config: {e}"))?;
-    Ok(cmd_status())
+    Ok(status_report())
 }
 
 /// Default device name for first enrollment — the local hostname.
@@ -308,18 +353,18 @@ pub fn cmd_service_status(as_service: bool) -> Result<String, String> {
 /// platform's default open verb (Explorer / Finder / xdg-open).
 #[tauri::command]
 pub fn cmd_open_log_dir() -> Result<(), String> {
-    let path = logging::log_dir().ok_or_else(|| "log dir not resolvable".to_string())?;
+    let path = resolve_log_dir_path().ok_or_else(|| "log dir not resolvable".to_string())?;
+    // Create it if the agent hasn't written a log here yet, so the folder opens
+    // instead of failing.
+    let _ = std::fs::create_dir_all(&path);
     open_path_in_explorer(&path)
 }
 
 /// Open the agent's config directory in the OS file manager.
 #[tauri::command]
 pub fn cmd_open_config_dir() -> Result<(), String> {
-    let path = config::default_config_path().map_err(|e| format!("Config path: {e}"))?;
-    let dir = path
-        .parent()
-        .ok_or_else(|| "Config path has no parent".to_string())?;
-    open_path_in_explorer(dir)
+    let dir = resolve_config_dir_path().ok_or_else(|| "config dir not resolvable".to_string())?;
+    open_path_in_explorer(&dir)
 }
 
 /// Approve a pending operator-consent prompt over the LocalAPI (P2b). The daemon
