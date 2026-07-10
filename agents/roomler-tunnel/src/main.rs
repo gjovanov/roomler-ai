@@ -11,12 +11,15 @@
 //!   roomler-tunnel forward --agent <agent_id> --local <port> --remote <host:port>
 //!   roomler-tunnel run [--config <path>]
 //!   roomler-tunnel diagnose [--agent <agent_id>]
+//!   roomler-tunnel status [--json]     # local daemon's node state (LocalAPI)
+//!   roomler-tunnel peers  [--json]     # peers + connection types (LocalAPI)
+//!   roomler-tunnel flows  [--json]     # active forwards / SOCKS5 (LocalAPI)
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
-use roomler_tunnel::{config, forward, mesh, update};
+use roomler_tunnel::{config, forward, localclient, mesh, update};
 
 #[derive(Debug, Parser)]
 #[command(name = "roomler-tunnel", version, about, long_about = None)]
@@ -109,6 +112,36 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
+    /// Show the local daemon's node state (id, version, mode, overlay IP,
+    /// server connection) over the LocalAPI. Read-only; needs no config/token —
+    /// the OS pipe/socket ACL is the trust boundary.
+    Status {
+        #[command(flatten)]
+        fmt: OutputFmt,
+    },
+    /// List the peers the local daemon currently sees, with each peer's live
+    /// connection type (direct / relay / tunnel / blocked / offline).
+    Peers {
+        #[command(flatten)]
+        fmt: OutputFmt,
+    },
+    /// List the local daemon's active forwards / SOCKS5 listeners + throughput.
+    /// (Empty until the tunnel data plane folds into the daemon — P3b.)
+    Flows {
+        #[command(flatten)]
+        fmt: OutputFmt,
+    },
+}
+
+/// Shared output flag for the read-only LocalAPI verbs (`status`/`peers`/
+/// `flows`). `--json` emits the raw wire structs for scripting; omitted, a
+/// human table is printed. Meaningless on `enroll`/`forward`, so it's flattened
+/// only onto the three read verbs rather than made global.
+#[derive(Debug, Args)]
+struct OutputFmt {
+    /// Emit raw JSON instead of a human-readable table.
+    #[arg(long)]
+    json: bool,
 }
 
 #[tokio::main]
@@ -155,6 +188,11 @@ async fn main() -> Result<()> {
             let cfg = config::load(cli.config).context("loading tunnel config")?;
             update::self_update(&cfg, check).await
         }
+        // Read-only LocalAPI verbs: no config/token — talk straight to the
+        // local daemon over its ACL-gated pipe/socket.
+        Command::Status { fmt } => localclient::status(fmt.json).await,
+        Command::Peers { fmt } => localclient::peers(fmt.json).await,
+        Command::Flows { fmt } => localclient::flows(fmt.json).await,
     }
 }
 
@@ -401,5 +439,45 @@ mod tests {
     #[test]
     fn derive_machine_id_changes_with_name() {
         assert_ne!(derive_machine_id("a"), derive_machine_id("b"));
+    }
+
+    #[test]
+    fn parses_status_peers_flows() {
+        for verb in ["status", "peers", "flows"] {
+            let cli = Cli::try_parse_from(["roomler-tunnel", verb]).unwrap();
+            match (verb, cli.command) {
+                ("status", Command::Status { fmt }) => assert!(!fmt.json),
+                ("peers", Command::Peers { fmt }) => assert!(!fmt.json),
+                ("flows", Command::Flows { fmt }) => assert!(!fmt.json),
+                (v, other) => panic!("verb {v} parsed as {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parses_status_json_flag() {
+        let cli = Cli::try_parse_from(["roomler-tunnel", "status", "--json"]).unwrap();
+        match cli.command {
+            Command::Status { fmt } => assert!(fmt.json),
+            other => panic!("expected Status, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_flag_is_not_global() {
+        // A fully-valid `forward` + `--json` must fail: `--json` belongs only to
+        // the read verbs (flattened there), not globally.
+        let r = Cli::try_parse_from([
+            "roomler-tunnel",
+            "forward",
+            "--agent",
+            "507f1f77bcf86cd799439011",
+            "--local",
+            "5432",
+            "--remote",
+            "10.0.0.5:5432",
+            "--json",
+        ]);
+        assert!(r.is_err(), "--json must not be accepted on `forward`");
     }
 }

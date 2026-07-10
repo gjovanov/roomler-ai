@@ -8,6 +8,8 @@
 
 pub mod config;
 pub mod forward;
+/// Thin-client read verbs (`status`/`peers`/`flows`) over the daemon LocalAPI.
+pub mod localclient;
 pub mod mesh;
 pub mod socks5;
 pub mod udp;
