@@ -9,10 +9,10 @@
 use roomler_agent::config::{self, AgentConfig};
 use roomler_agent::enrollment::{self, EnrollInputs};
 use roomler_agent::{logging, notify};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::path::PathBuf;
 use std::process::Command;
-use tunnel_core::localapi::{self, NodeStatus, PeerInfo};
+use tunnel_core::localapi::{self, ConsentRequest, NodeStatus, PeerInfo};
 
 /// What the SPA shows on the status page. Returned from
 /// [`cmd_status`]. All fields are JSON-friendly primitives so the
@@ -322,76 +322,53 @@ pub fn cmd_open_config_dir() -> Result<(), String> {
     open_path_in_explorer(dir)
 }
 
-/// Approve a pending operator-consent prompt. Drops the sentinel
-/// directly via the ConsentBroker's public helper — no subprocess.
+/// Approve a pending operator-consent prompt over the LocalAPI (P2b). The daemon
+/// owns the profile-correct sentinel dir, so this works even when the agent runs
+/// as SYSTEM — where the tray writing the sentinel itself would land in the
+/// wrong profile and the agent would never see it.
 #[tauri::command]
-pub fn cmd_consent_approve(session: String) -> Result<String, String> {
-    let dir = roomler_agent::consent::ConsentBroker::default_sentinel_dir()
-        .map_err(|e| format!("Consent dir: {e}"))?;
-    let broker = roomler_agent::consent::ConsentBroker::new(
-        roomler_agent::consent::Mode::AutoGrant, // mode irrelevant — we only use write_sentinel
-        dir,
-    )
-    .map_err(|e| format!("Opening consent broker: {e}"))?;
-    let path = broker
-        .write_sentinel(&session, roomler_agent::consent::SentinelKind::Approve)
-        .map_err(|e| format!("Writing sentinel: {e}"))?;
-    Ok(path.to_string_lossy().into_owned())
+pub async fn cmd_consent_approve(session: String) -> Result<String, String> {
+    consent_decide(&session, true).await
 }
 
-/// Deny a pending operator-consent prompt.
+/// Deny a pending operator-consent prompt over the LocalAPI.
 #[tauri::command]
-pub fn cmd_consent_deny(session: String) -> Result<String, String> {
-    let dir = roomler_agent::consent::ConsentBroker::default_sentinel_dir()
-        .map_err(|e| format!("Consent dir: {e}"))?;
-    let broker =
-        roomler_agent::consent::ConsentBroker::new(roomler_agent::consent::Mode::AutoGrant, dir)
-            .map_err(|e| format!("Opening consent broker: {e}"))?;
-    let path = broker
-        .write_sentinel(&session, roomler_agent::consent::SentinelKind::Deny)
-        .map_err(|e| format!("Writing sentinel: {e}"))?;
-    Ok(path.to_string_lossy().into_owned())
+pub async fn cmd_consent_deny(session: String) -> Result<String, String> {
+    consent_decide(&session, false).await
 }
 
-/// One pending remote-control consent request, parsed from a
-/// `<session>.pending` marker the agent drops in the shared consent dir. Shape
-/// mirrors the JSON written by `roomler-agent`'s signaling layer.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PendingConsent {
-    pub session_id: String,
-    #[serde(default)]
-    pub controller_name: String,
-    /// Pipe-separated permission names (serde form of the agent's `Permissions`).
-    #[serde(default)]
-    pub permissions: String,
-    #[serde(default)]
-    pub timeout_secs: u64,
-}
-
-/// List consent requests currently awaiting a decision — the `.pending` markers
-/// the agent wrote. The SPA polls this to render the Approve/Deny modal. A
-/// missing dir / unparseable marker is skipped, never an error (the tray must
-/// stay quiet when nothing is pending).
-#[tauri::command]
-pub fn cmd_get_pending_consents() -> Result<Vec<PendingConsent>, String> {
-    let dir = roomler_agent::consent::ConsentBroker::default_sentinel_dir()
-        .map_err(|e| format!("Consent dir: {e}"))?;
-    let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Ok(out); // dir not created yet ⇒ nothing pending
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("pending") {
-            continue;
-        }
-        if let Ok(body) = std::fs::read_to_string(&path)
-            && let Ok(pc) = serde_json::from_str::<PendingConsent>(&body)
-        {
-            out.push(pc);
-        }
+/// Send an Approve/Deny decision to the daemon over the LocalAPI.
+async fn consent_decide(session: &str, allow: bool) -> Result<String, String> {
+    let mut client = localapi::connect()
+        .await
+        .map_err(|e| format!("Device service unreachable: {e}"))?;
+    let ok = client
+        .consent_decide(session, allow)
+        .await
+        .map_err(|e| format!("LocalAPI error: {e}"))?;
+    if ok {
+        Ok(if allow {
+            "approved".into()
+        } else {
+            "denied".into()
+        })
+    } else {
+        Err("The device service rejected the decision (unknown or invalid session).".into())
     }
-    Ok(out)
+}
+
+/// List consent requests currently awaiting a decision — asked of the daemon
+/// over the LocalAPI (it reads its own, profile-correct sentinel dir). The SPA
+/// polls this to render the Approve/Deny modal. NEVER errors — the modal must
+/// stay quiet when the daemon is down or nothing is pending. `ConsentRequest`
+/// serialises to the same `{session_id, controller_name, permissions,
+/// timeout_secs}` shape the SPA already consumes.
+#[tauri::command]
+pub async fn cmd_get_pending_consents() -> Vec<ConsentRequest> {
+    match localapi::connect().await {
+        Ok(mut c) => c.consent_pending().await.unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
 }
 
 // ─── helpers ───────────────────────────────────────────────────────

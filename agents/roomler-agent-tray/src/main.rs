@@ -88,40 +88,39 @@ fn main() {
             // window so the operator sees the Approve/Deny modal the SPA renders
             // from `cmd_get_pending_consents`.
             let handle = app.handle().clone();
-            std::thread::spawn(move || consent_watch_loop(handle));
+            tauri::async_runtime::spawn(consent_watch_loop(handle));
             Ok(())
         })
         .run(tauri::generate_context!())
         .expect("error while running roomler-agent-tray");
 }
 
-/// Poll the shared consent dir; when a NEW `.pending` marker appears (a session
-/// the operator hasn't been shown yet), surface the tray window so the SPA's
-/// consent modal is visible. Runs on its own OS thread — a 750 ms filesystem
-/// scan is cheap and needs no async runtime. The SPA does the actual
-/// render/approve/deny via `cmd_get_pending_consents` + the existing
+/// Ask the daemon (over the LocalAPI) which sessions await consent; when a NEW
+/// one appears (not shown yet), surface the tray window so the SPA's consent
+/// modal is visible. P2b: polling the daemon — not a profile-specific sentinel
+/// dir — means this also works when the agent runs as SYSTEM (the dir would be
+/// in the SYSTEM profile, unreachable to this interactive-user process). Runs on
+/// Tauri's async runtime; a 750 ms poll over the local pipe is cheap. The SPA
+/// does the actual render/approve/deny via `cmd_get_pending_consents` + the
 /// approve/deny commands; this loop's only job is "bring the window forward when
 /// something new needs a decision."
-fn consent_watch_loop(app: tauri::AppHandle) {
+async fn consent_watch_loop(app: tauri::AppHandle) {
     use std::collections::HashSet;
 
-    let Ok(dir) = roomler_agent::consent::ConsentBroker::default_sentinel_dir() else {
-        return;
-    };
     let mut seen: HashSet<String> = HashSet::new();
     loop {
-        std::thread::sleep(std::time::Duration::from_millis(750));
-        let mut current: HashSet<String> = HashSet::new();
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.extension().and_then(|e| e.to_str()) == Some("pending")
-                    && let Some(name) = p.file_stem().and_then(|s| s.to_str())
-                {
-                    current.insert(name.to_string());
-                }
-            }
-        }
+        tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+        let current: HashSet<String> = match tunnel_core::localapi::connect().await {
+            Ok(mut c) => c
+                .consent_pending()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|p| p.session_id)
+                .collect(),
+            // Daemon down / pipe absent ⇒ nothing pending (stay quiet).
+            Err(_) => HashSet::new(),
+        };
         // A newly-appeared pending (not in `seen`) → bring the window forward.
         if current.difference(&seen).next().is_some()
             && let Some(win) = app.get_webview_window("main")
