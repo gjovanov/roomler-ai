@@ -128,6 +128,9 @@ pub async fn run(
     // runtime publishes its mesh view on.
     connected: Arc<AtomicBool>,
     overlay_view_tx: tokio::sync::watch::Sender<OverlayView>,
+    // P2b — the operator-consent broker, created in `run_cmd` and SHARED with the
+    // LocalAPI's DaemonState so its live `pending` set gates LocalAPI decisions.
+    consent_broker: crate::consent::ConsentBroker,
 ) -> Result<()> {
     // One overlay handle, reused across reconnects. Failing to bring up
     // the indicator is non-fatal — the session still works, the user
@@ -139,41 +142,9 @@ pub async fn run(
             ViewerIndicator::disabled()
         }
     };
-    // Operator-consent broker lives across reconnects so a sentinel
-    // file dropped while the WS was down is still honoured when the
-    // next session.request arrives. Mode is locked at startup from
-    // the config (back-compat default = AutoGrant; org fleets flip
-    // `auto_grant_session=false` to require operator approval).
-    let consent_mode = crate::consent::Mode::from_config(cfg.auto_grant_session);
-    let consent_dir = match crate::consent::ConsentBroker::default_sentinel_dir() {
-        Ok(p) => p,
-        Err(e) => {
-            warn!(%e, "could not resolve consent sentinel dir; falling back to temp dir");
-            std::env::temp_dir().join("roomler-agent-consent")
-        }
-    };
-    let consent_broker = match crate::consent::ConsentBroker::new(consent_mode, consent_dir.clone())
-    {
-        Ok(b) => b,
-        Err(e) => {
-            warn!(%e, "consent broker init failed; defaulting to AutoGrant for this run");
-            // Fail open in the broker-init failure path so a directory-
-            // permission glitch doesn't stop the agent from servicing
-            // self-host (auto-grant) deployments. Org-controlled
-            // fleets relying on Prompt mode still get audit visibility
-            // via the failure log line above.
-            crate::consent::ConsentBroker::new(
-                crate::consent::Mode::AutoGrant,
-                std::env::temp_dir(),
-            )
-            .expect("AutoGrant broker init cannot fail with temp_dir")
-        }
-    };
-    info!(
-        mode = ?consent_broker.mode(),
-        sentinel_dir = %consent_broker.sentinel_dir().display(),
-        "operator-consent broker ready"
-    );
+    // Operator-consent broker: created in `run_cmd` and passed in (P2b), so the
+    // LocalAPI shares the SAME instance and its live `pending` set. Lives across
+    // reconnects, so a sentinel dropped while the WS was down is still honoured.
     let mut backoff = Duration::from_secs(1);
     let mut auth_failures: u32 = 0;
     // rc.53: rolling window of recent `ReplacedByNewerConnection`
