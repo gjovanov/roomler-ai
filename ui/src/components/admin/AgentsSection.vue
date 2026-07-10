@@ -503,6 +503,27 @@
           No routes yet — this agent only reaches its own host.
         </p>
 
+        <div v-if="advertisedSuggestions.length" class="mb-3">
+          <p class="text-caption text-medium-emphasis mb-1">
+            Advertised by the agent — click to approve into the routes above:
+          </p>
+          <div class="d-flex flex-wrap gap-2">
+            <v-chip
+              v-for="cidr in advertisedSuggestions"
+              :key="cidr"
+              size="small"
+              variant="outlined"
+              color="primary"
+              prepend-icon="mdi-lan-pending"
+              append-icon="mdi-plus"
+              @click="approveAdvertised(cidr)"
+              :aria-label="`Approve advertised route ${cidr}`"
+            >
+              {{ cidr }}
+            </v-chip>
+          </div>
+        </div>
+
         <v-text-field
           v-model="routeInput"
           label="Add route (CIDR)"
@@ -841,6 +862,28 @@ function addRoute() {
 
 function removeRoute(cidr: string) {
   routesDraft.value = routesDraft.value.filter((r) => r !== cidr)
+}
+
+/** Advertised routes the agent proposed that aren't already in the draft —
+ *  canonicalized + deduped so they compare cleanly against approved routes.
+ *  Approving one moves it into the routes draft (and it drops off this list). */
+const advertisedSuggestions = computed<string[]>(() => {
+  const adv = routesTarget.value?.advertised_routes ?? []
+  const seen = new Set(routesDraft.value)
+  const out: string[] = []
+  for (const raw of adv) {
+    const c = canonicalizeCidr(raw)
+    if (c && !seen.has(c) && !out.includes(c)) out.push(c)
+  }
+  return out
+})
+
+/** Approve an advertised CIDR (already canonical from `advertisedSuggestions`)
+ *  into the routes draft; Save then persists it to the agent's approved routes. */
+function approveAdvertised(cidr: string) {
+  if (!routesDraft.value.includes(cidr)) {
+    routesDraft.value.push(cidr)
+  }
 }
 
 async function saveRoutes() {

@@ -97,6 +97,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         overlay_wg_secret_key: None,
         // Phase 1: no advertised subnet routes until the operator configures them.
         overlay_advertised_routes: Vec::new(),
+        advertise_routes: Vec::new(),
     })
 }
 
