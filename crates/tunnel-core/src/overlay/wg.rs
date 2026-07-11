@@ -542,10 +542,11 @@ impl WgDevice {
         self.peers.len()
     }
 
-    /// Encapsulate + send a raw IPv4 packet to whichever peer owns its
-    /// destination overlay address. `false` if no route or no session.
+    /// Encapsulate + send a raw IP packet (v4, or a derived-ULA v6 — see
+    /// [`Router::dst_of_ip_packet`]) to whichever peer owns its destination
+    /// overlay address. `false` if no route or no session.
     pub async fn send_ip_packet(&self, packet: &[u8]) -> bool {
-        let Some(dst) = Router::dst_of_ipv4_packet(packet) else {
+        let Some(dst) = Router::dst_of_ip_packet(packet) else {
             return false;
         };
         let Some(pubkey) = self.router.route(&dst) else {
