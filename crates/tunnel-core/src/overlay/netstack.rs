@@ -37,9 +37,10 @@
 //! (an inbound packet, an app write, a control request). This is the standard
 //! "netstack actor" shape.
 //!
-//! v1 scope: TCP `connect` (the SOCKS-CONNECT backend) + `listen` (mostly for
-//! the self-contained echo tests). UDP-associate and ICMP `ping` reuse the same
-//! device + poll loop and land in a follow-up; the socket buffers for them are
+//! Scope: TCP `connect` (the SOCKS-CONNECT backend) + `listen`, and UDP via
+//! [`NetstackHandle::udp_bind`] (the SOCKS UDP-ASSOCIATE backend — one socket
+//! per association, sending to arbitrary overlay peers). ICMP `ping` reuses the
+//! same device + poll loop and lands in a follow-up; its socket buffer is
 //! already compiled in via the crate features.
 //!
 //! [smoltcp]: https://docs.rs/smoltcp
@@ -56,9 +57,9 @@ use async_trait::async_trait;
 use futures::task::AtomicWaker;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
-use smoltcp::socket::tcp;
+use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant as SmolInstant;
-use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpListenEndpoint};
+use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tracing::{debug, trace};
@@ -82,6 +83,15 @@ const SLEEP_BACKSTOP: Duration = Duration::from_millis(50);
 /// Default connect timeout — smoltcp will retransmit SYNs for far longer, but
 /// an app expects a bounded failure when the peer is unreachable.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Per-UDP-socket payload ring (each direction). A UDP association funnels every
+/// datagram the app addresses through one socket, so give it a healthy buffer;
+/// datagrams past it are dropped at the IP layer (UDP is lossy).
+const UDP_BUF: usize = 64 * 1024;
+/// Per-UDP-socket datagram-metadata slots (each direction).
+const UDP_META: usize = 64;
+/// Depth of each app⇄stack UDP datagram channel. Backpressures (not drops) past
+/// this — a full channel just stalls delivery until the app drains it.
+const UDP_CHAN_CAP: usize = 256;
 
 // ===========================================================================
 // Device — a smoltcp `phy::Device` backed by two packet queues.
@@ -187,6 +197,9 @@ enum Control {
         port: u16,
         accepted: mpsc::Sender<NsTcpStream>,
     },
+    UdpBind {
+        resp: oneshot::Sender<io::Result<NsUdpSocket>>,
+    },
 }
 
 /// App-facing handle to a running netstack. Cheap to clone; each clone can open
@@ -228,6 +241,19 @@ impl NetstackHandle {
             .map_err(|_| io::Error::other("netstack poll loop gone"))?;
         Ok(NsListener { rx })
     }
+
+    /// Bind a UDP socket on an ephemeral overlay port. The returned
+    /// [`NsUdpSocket`] can `send_to` any overlay address and `recv_from`
+    /// whoever replies — the datagram backend for a SOCKS5 UDP ASSOCIATE.
+    pub async fn udp_bind(&self) -> io::Result<NsUdpSocket> {
+        let (resp, rx) = oneshot::channel();
+        self.ctl
+            .send(Control::UdpBind { resp })
+            .await
+            .map_err(|_| io::Error::other("netstack poll loop gone"))?;
+        rx.await
+            .map_err(|_| io::Error::other("netstack dropped the udp_bind request"))?
+    }
 }
 
 /// Yields inbound connections to a listened port, in arrival order.
@@ -239,6 +265,70 @@ impl NsListener {
     /// Next accepted connection, or `None` once the netstack shuts down.
     pub async fn accept(&mut self) -> Option<NsTcpStream> {
         self.rx.recv().await
+    }
+}
+
+// ===========================================================================
+// UDP socket — the datagram backend for SOCKS5 UDP ASSOCIATE.
+// ===========================================================================
+
+/// The send half of an [`NsUdpSocket`], cheaply cloneable so a relay loop can
+/// hold it to `send_to` while `recv_from` borrows the socket in the same
+/// `select!`.
+#[derive(Clone)]
+pub struct NsUdpSender {
+    to_stack: mpsc::Sender<(SocketAddrV4, Vec<u8>)>,
+    wake: Arc<Notify>,
+}
+
+impl NsUdpSender {
+    /// Queue `data` for delivery to `dst` over the overlay. Applies
+    /// backpressure once the channel to the stack is full (rather than
+    /// silently dropping), then nudges the poll loop to flush it.
+    pub async fn send_to(&self, data: &[u8], dst: SocketAddrV4) -> io::Result<()> {
+        self.to_stack
+            .send((dst, data.to_vec()))
+            .await
+            .map_err(|_| io::Error::other("netstack udp socket closed"))?;
+        self.wake.notify_one();
+        Ok(())
+    }
+}
+
+/// A UDP socket inside the netstack. Datagrams shuttle to/from the poll loop
+/// over bounded channels: the stack sends them to arbitrary overlay peers and
+/// delivers replies back with their source address. One socket backs one SOCKS
+/// UDP association (it is connectionless — every datagram carries its own dst).
+pub struct NsUdpSocket {
+    tx: NsUdpSender,
+    from_stack: mpsc::Receiver<(SocketAddrV4, Vec<u8>)>,
+    local_port: u16,
+}
+
+impl NsUdpSocket {
+    /// A cloneable send handle (see [`NsUdpSender`]).
+    pub fn sender(&self) -> NsUdpSender {
+        self.tx.clone()
+    }
+
+    /// Send a datagram to `dst` (convenience for `self.sender().send_to`).
+    pub async fn send_to(&self, data: &[u8], dst: SocketAddrV4) -> io::Result<()> {
+        self.tx.send_to(data, dst).await
+    }
+
+    /// The next datagram delivered from the overlay, with its source address.
+    /// `Err` once the netstack shuts down.
+    pub async fn recv_from(&mut self) -> io::Result<(Vec<u8>, SocketAddrV4)> {
+        self.from_stack
+            .recv()
+            .await
+            .map(|(src, data)| (data, src))
+            .ok_or_else(|| io::Error::other("netstack udp socket closed"))
+    }
+
+    /// The ephemeral overlay port this socket is bound to.
+    pub fn local_port(&self) -> u16 {
+        self.local_port
     }
 }
 
@@ -382,6 +472,19 @@ struct PendingListen {
     accepted: mpsc::Sender<NsTcpStream>,
 }
 
+/// Stack-side bookkeeping for one UDP socket (keyed by its [`SocketHandle`] in
+/// [`PollLoop::udp_conns`]).
+struct UdpConn {
+    /// Stack → app: `(source addr, datagram)`.
+    to_app: mpsc::Sender<(SocketAddrV4, Vec<u8>)>,
+    /// App → stack: `(destination addr, datagram)`.
+    from_app: mpsc::Receiver<(SocketAddrV4, Vec<u8>)>,
+    /// A datagram pulled from `from_app` but not yet accepted by smoltcp's tx
+    /// buffer (transient backpressure); retried next pass.
+    pending: Option<(SocketAddrV4, Vec<u8>)>,
+    app_send_closed: bool,
+}
+
 struct PollLoop {
     iface: Interface,
     sockets: SocketSet<'static>,
@@ -392,6 +495,7 @@ struct PollLoop {
     conns: HashMap<SocketHandle, Conn>,
     pending_connect: HashMap<SocketHandle, PendingConnect>,
     pending_listen: HashMap<SocketHandle, PendingListen>,
+    udp_conns: HashMap<SocketHandle, UdpConn>,
     next_port: u16,
     base: Instant,
 }
@@ -457,6 +561,47 @@ impl PollLoop {
         let handle = self.sockets.add(sock);
         self.pending_listen
             .insert(handle, PendingListen { port, accepted });
+    }
+
+    fn do_udp_bind(&mut self, resp: oneshot::Sender<io::Result<NsUdpSocket>>) {
+        let mut sock = udp::Socket::new(
+            udp::PacketBuffer::new(
+                vec![udp::PacketMetadata::EMPTY; UDP_META],
+                vec![0u8; UDP_BUF],
+            ),
+            udp::PacketBuffer::new(
+                vec![udp::PacketMetadata::EMPTY; UDP_META],
+                vec![0u8; UDP_BUF],
+            ),
+        );
+        // Bind to a non-zero ephemeral port (smoltcp requires a bound local
+        // port to send) on any of our addresses.
+        let port = self.ephemeral_port();
+        if let Err(e) = sock.bind(port) {
+            let _ = resp.send(Err(io::Error::other(format!("udp bind: {e}"))));
+            return;
+        }
+        let handle = self.sockets.add(sock);
+        let (to_app, from_stack) = mpsc::channel(UDP_CHAN_CAP);
+        let (to_stack, from_app) = mpsc::channel(UDP_CHAN_CAP);
+        self.udp_conns.insert(
+            handle,
+            UdpConn {
+                to_app,
+                from_app,
+                pending: None,
+                app_send_closed: false,
+            },
+        );
+        let socket = NsUdpSocket {
+            tx: NsUdpSender {
+                to_stack,
+                wake: self.wake.clone(),
+            },
+            from_stack,
+            local_port: port,
+        };
+        let _ = resp.send(Ok(socket));
     }
 
     /// Build the paired stack-side [`Conn`] + app-side [`NsTcpStream`] for a
@@ -655,6 +800,80 @@ impl PollLoop {
         progressed
     }
 
+    /// Move datagrams between the UDP sockets and their app channels. Returns
+    /// `true` if it made progress.
+    fn service_udp(&mut self) -> bool {
+        let mut progressed = false;
+        let mut dead = Vec::new();
+        let handles: Vec<SocketHandle> = self.udp_conns.keys().copied().collect();
+        for h in handles {
+            let sock = self.sockets.get_mut::<udp::Socket>(h);
+            let conn = self.udp_conns.get_mut(&h).unwrap();
+
+            // Stack → app: deliver each buffered datagram with its source. A
+            // slow app (no channel capacity) leaves datagrams in smoltcp's rx
+            // buffer, which back-pressures the IP layer rather than dropping.
+            while sock.can_recv() {
+                let Ok(permit) = conn.to_app.try_reserve() else {
+                    break;
+                };
+                match sock.recv() {
+                    Ok((data, meta)) => {
+                        let datav = data.to_vec();
+                        if let Some(src) = sockaddr_v4_of(meta.endpoint) {
+                            permit.send((src, datav));
+                            progressed = true;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+
+            // App → stack: send queued datagrams to their targets.
+            loop {
+                if conn.pending.is_none() {
+                    match conn.from_app.try_recv() {
+                        Ok(d) => conn.pending = Some(d),
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => {
+                            conn.app_send_closed = true;
+                            break;
+                        }
+                    }
+                }
+                let Some((dst, payload)) = conn.pending.as_ref() else {
+                    break;
+                };
+                if !sock.can_send() {
+                    break;
+                }
+                let meta = IpEndpoint::from((IpAddress::Ipv4(*dst.ip()), dst.port()));
+                match sock.send_slice(payload, meta) {
+                    Ok(()) => {
+                        conn.pending = None;
+                        progressed = true;
+                    }
+                    // Unaddressable / buffer full ⇒ drop this datagram (lossy).
+                    Err(_) => {
+                        conn.pending = None;
+                        break;
+                    }
+                }
+            }
+
+            // App dropped both halves of the socket ⇒ reap.
+            if conn.to_app.is_closed() && conn.app_send_closed {
+                dead.push(h);
+            }
+        }
+        for h in dead {
+            self.udp_conns.remove(&h);
+            self.sockets.remove(h);
+            progressed = true;
+        }
+        progressed
+    }
+
     /// One settle pass: poll smoltcp, promote handshakes, shuttle bytes —
     /// repeated until it quiesces (bounded), so an inbound packet and the app
     /// I/O it unblocks flush in the same wake.
@@ -663,8 +882,9 @@ impl PollLoop {
             let now = self.now();
             let _ = self.iface.poll(now, &mut self.device, &mut self.sockets);
             self.promote_pending();
-            let progressed = self.service_conns();
-            if !progressed && self.device.rx.is_empty() {
+            let tcp = self.service_conns();
+            let udp = self.service_udp();
+            if !tcp && !udp && self.device.rx.is_empty() {
                 break;
             }
         }
@@ -688,6 +908,7 @@ impl PollLoop {
                 ctl = self.ctl_rx.recv() => match ctl {
                     Some(Control::Connect { dst, resp }) => self.do_connect(dst, resp),
                     Some(Control::Listen { port, accepted }) => self.do_listen(port, accepted),
+                    Some(Control::UdpBind { resp }) => self.do_udp_bind(resp),
                     None => break, // handle dropped ⇒ shut down
                 },
                 pkt = self.in_rx.recv() => {
@@ -780,6 +1001,7 @@ impl Netstack {
             conns: HashMap::new(),
             pending_connect: HashMap::new(),
             pending_listen: HashMap::new(),
+            udp_conns: HashMap::new(),
             next_port: EPHEMERAL_BASE,
             base,
         };
@@ -924,5 +1146,54 @@ mod tests {
         )
         .await
         .expect("round trip over the WG bridge in time");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn direct_pair_udp_echo() {
+        // Two stacks on the same /24, cross-linked packet-for-packet.
+        let a_ip = Ipv4Addr::new(10, 8, 0, 1);
+        let b_ip = Ipv4Addr::new(10, 8, 0, 2);
+        let a = Netstack::start(a_ip, 24, 1280);
+        let b = Netstack::start(b_ip, 24, 1280);
+
+        let (a_tun, b_tun) = (a.tun.clone(), b.tun.clone());
+        tokio::spawn(async move {
+            while let Ok(pkt) = a_tun.read_packet().await {
+                if b_tun.write_packet(&pkt).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let (a_tun2, b_tun2) = (a.tun.clone(), b.tun.clone());
+        tokio::spawn(async move {
+            while let Ok(pkt) = b_tun2.read_packet().await {
+                if a_tun2.write_packet(&pkt).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // B: a UDP echo — bounce each datagram back to its source.
+        let mut b_udp = b.handle.udp_bind().await.unwrap();
+        let b_port = b_udp.local_port();
+        let b_tx = b_udp.sender();
+        tokio::spawn(async move {
+            while let Ok((data, src)) = b_udp.recv_from().await {
+                let _ = b_tx.send_to(&data, src).await;
+            }
+        });
+
+        // A: send a datagram to B's port and read the echo back.
+        let mut a_udp = a.handle.udp_bind().await.unwrap();
+        let dst = SocketAddrV4::new(b_ip, b_port);
+        let body = async {
+            a_udp.send_to(b"udp-over-netstack", dst).await.unwrap();
+            let (data, src) = a_udp.recv_from().await.unwrap();
+            assert_eq!(&data, b"udp-over-netstack");
+            assert_eq!(src, dst, "reply's source is B's bound port");
+        };
+        tokio::time::timeout(Duration::from_secs(10), body)
+            .await
+            .expect("udp round trip in time");
     }
 }
