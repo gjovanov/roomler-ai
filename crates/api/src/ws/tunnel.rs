@@ -183,6 +183,11 @@ pub async fn handle_tunnel_client_socket(
             ClientMsg::TunnelOpen {
                 agent_id,
                 transport,
+                // B1 dormant: the standalone tunnel-client CLI is
+                // single-open, so its nonce (if any) is unused here.
+                // PR-B2 threads the nonce into the reply so a daemon
+                // multiplexing many opens over one WS can demux them.
+                open_nonce: _,
             } => {
                 handle_tunnel_open(
                     &state,
@@ -465,6 +470,7 @@ async fn handle_tunnel_open(
                     session_id: None,
                     code: "agent_not_found".into(),
                     message: format!("agent {agent_id} does not exist"),
+                    open_nonce: None,
                 },
             )
             .await;
@@ -485,6 +491,7 @@ async fn handle_tunnel_open(
                 session_id: None,
                 code: "cross_tenant".into(),
                 message: "agent belongs to a different tenant".into(),
+                open_nonce: None,
             },
         )
         .await;
@@ -500,6 +507,7 @@ async fn handle_tunnel_open(
                 session_id: None,
                 code: "agent_unavailable".into(),
                 message: "agent is quarantined or deleted".into(),
+                open_nonce: None,
             },
         )
         .await;
@@ -631,6 +639,7 @@ async fn handle_tunnel_open(
             sctp_rwnd_bytes: 8 * 1024 * 1024,
             ice_servers: quic_ice_servers,
             quic_auth_token,
+            open_nonce: None,
         },
     )
     .await;
@@ -1065,6 +1074,7 @@ async fn send_error(
             session_id,
             code: code.into(),
             message: message.into(),
+            open_nonce: None,
         },
     )
     .await;
