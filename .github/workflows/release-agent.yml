@@ -165,6 +165,34 @@ jobs:
       - name: Install cargo-deb
         run: cargo install cargo-deb --locked
 
+      - name: Fetch vendored FFmpeg 8.1.2 (for the ffmpeg-encoder HEVC backend)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Prebuilt LGPL FFmpeg 8.1.2 (nvenc/qsv/amf/vaapi/vulkan HEVC + the
+          # LGPL libkvazaar SW encoder; NO GPL libx265 → the MIT agent stays
+          # license-clean, matching the Windows vcpkg policy). Published once
+          # at the `vendored-ffmpeg-8.1.2` release and reused by every build
+          # instead of compiling FFmpeg from source: Ubuntu apt ships only
+          # FFmpeg 6.1, but `ffmpeg-next = 8.1` needs 8.x.
+          gh release download vendored-ffmpeg-8.1.2 \
+            --repo "${{ github.repository }}" \
+            --pattern 'ffmpeg-8.1.2-linux64-lgpl-shared.tar.xz' \
+            --dir /tmp/ffdl
+          sudo mkdir -p /opt/roomler-ffmpeg
+          sudo tar xf /tmp/ffdl/ffmpeg-8.1.2-linux64-lgpl-shared.tar.xz \
+            -C /opt/roomler-ffmpeg --strip-components=1
+          # BtbN's pkgconfig files hardcode the build-machine prefix; rewrite
+          # it to our extract path so pkg-config emits correct -L/-I flags.
+          sudo sed -i "s|^prefix=.*|prefix=/opt/roomler-ffmpeg|" \
+            /opt/roomler-ffmpeg/lib/pkgconfig/*.pc
+          {
+            echo "FFMPEG_DIR=/opt/roomler-ffmpeg"
+            echo "PKG_CONFIG_PATH=/opt/roomler-ffmpeg/lib/pkgconfig"
+            echo "LD_LIBRARY_PATH=/opt/roomler-ffmpeg/lib"
+          } >> "$GITHUB_ENV"
+
       - name: Build agent (release, full + vp9-444 + vp9-444-bindgen)
         # `vp9-444` adds the libvpx VP9 profile-1 (8-bit 4:4:4) software
         # encoder for the DataChannel-bypass video transport (Phase Y in
@@ -184,7 +212,10 @@ jobs:
         # sets `overlay_enabled`, and netstack mode additionally needs
         # `ROOMLER_AGENT_OVERLAY_NETSTACK_SOCKS=<port>` — so shipping both
         # everywhere is inert until an operator opts a host in.
-        run: cargo build -p roomler-agent --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack"
+        # `ffmpeg-encoder` adds the FFmpeg HEVC backend (hevc_nvenc / qsv / amf
+        # / vaapi / vulkan) via the vendored FFmpeg 8.1.2 fetched above — the
+        # Linux/WSL counterpart to the Windows MF/vcpkg HEVC path.
+        run: cargo build -p roomler-agent --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack,ffmpeg-encoder"
 
       - name: Build .deb
         working-directory: agents/roomler-agent
