@@ -26,6 +26,11 @@
     offline: 'Offline',
   };
 
+  // Last ping outcome per target (overlay IP / name). The peers table repaints
+  // every 2s (replaceChildren), so results are kept here and re-rendered rather
+  // than living only in the transient DOM.
+  const pingResults = new Map();
+
   async function refresh() {
     let view;
     try {
@@ -85,7 +90,65 @@
     tr.appendChild(textCell(p.overlay_ip || '—', 'mono'));
     tr.appendChild(badgeCell(p.connection));
     tr.appendChild(textCell(p.rtt_ms != null ? `${p.rtt_ms} ms` : '—'));
+    tr.appendChild(pingCell(p));
     return tr;
+  }
+
+  // A live ICMP ping button per peer — resolves the peer by overlay IP (or name)
+  // and pings it over the userspace netstack via `cmd_ping`. The result (RTT or a
+  // failure with the daemon's message as a tooltip) persists across repaints via
+  // `pingResults`. Disabled for a peer with no address to target.
+  function pingCell(p) {
+    const td = document.createElement('td');
+    td.className = 'ping-cell';
+    const target = p.overlay_ip || p.name;
+    const btn = document.createElement('button');
+    btn.className = 'ping-btn';
+    btn.textContent = 'Ping';
+    const out = document.createElement('span');
+    out.className = 'ping-result';
+
+    const prior = target ? pingResults.get(target) : null;
+    if (prior) {
+      out.classList.add(prior.ok ? 'ok' : 'err');
+      out.textContent = prior.text;
+      if (prior.title) out.title = prior.title;
+    }
+    if (!target) {
+      btn.disabled = true;
+      btn.title = 'No overlay address to ping';
+    } else {
+      btn.addEventListener('click', () => void runPing(target, btn, out));
+    }
+    td.appendChild(btn);
+    td.appendChild(document.createTextNode(' '));
+    td.appendChild(out);
+    return td;
+  }
+
+  async function runPing(target, btn, out) {
+    btn.disabled = true;
+    const label = btn.textContent;
+    btn.textContent = '…';
+    out.className = 'ping-result';
+    out.textContent = '';
+    out.removeAttribute('title');
+    try {
+      const r = await invoke('cmd_ping', { target });
+      const text = `${Number(r.rtt_ms).toFixed(1)} ms`;
+      pingResults.set(target, { ok: true, text });
+      out.classList.add('ok');
+      out.textContent = text;
+    } catch (err) {
+      const msg = String(err);
+      pingResults.set(target, { ok: false, text: 'failed', title: msg });
+      out.classList.add('err');
+      out.textContent = 'failed';
+      out.title = msg;
+    } finally {
+      btn.textContent = label;
+      btn.disabled = false;
+    }
   }
 
   function textCell(text, cls) {
