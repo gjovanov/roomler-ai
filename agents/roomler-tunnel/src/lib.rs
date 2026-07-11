@@ -11,9 +11,7 @@ pub mod forward;
 /// Thin-client read verbs (`status`/`peers`/`flows`) over the daemon LocalAPI.
 pub mod localclient;
 pub mod mesh;
-pub mod socks5;
-pub mod udp;
 pub mod update;
 
 pub use tunnel_core::forward as core_forward;
-pub use tunnel_core::{auth, mux, policy, signaling, transport};
+pub use tunnel_core::{auth, mux, policy, signaling, socks5, transport, udp};

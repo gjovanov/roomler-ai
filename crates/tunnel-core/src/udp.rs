@@ -30,17 +30,17 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{debug, info, warn};
 
-use tunnel_core::forward::{
+use crate::forward::{
     FlowDemux, MAX_UDP_DATAGRAM, UDP_FLOW_IDLE_TIMEOUT, deframe_udp_datagram, quic_read_datagram,
     quic_write_datagram, send_udp_datagram_dc,
 };
-use tunnel_core::transport::quic::{self, QuicConnection};
+use crate::transport::quic::{self, QuicConnection};
 
-use crate::forward::{FLOW_OPEN_TIMEOUT_SHARED, ForwardReply, ReplyRegistry};
+use crate::driver::{FLOW_OPEN_TIMEOUT, ForwardReply, ReplyRegistry};
 
 /// The data plane a UDP association's flows ride, mirroring the session's
 /// negotiated transport. Cloned per-flow into the spawned pump.
-pub(crate) enum AssocCarrier {
+pub enum AssocCarrier {
     /// WebRTC-DC pool — flows multiplex onto the shared DCs by `flow_id`.
     Dc { demuxes: Arc<Vec<FlowDemux>> },
     /// QUIC — each flow is its own bidirectional stream on the session's
@@ -59,7 +59,7 @@ type FlowTx = mpsc::Sender<Vec<u8>>;
 /// Drive one SOCKS5 UDP ASSOCIATE association to completion. Binds the
 /// relay socket, replies with its address, then relays datagrams until
 /// the app's TCP control connection (`tcp`) closes.
-pub(crate) async fn handle_associate(
+pub async fn handle_associate(
     mut tcp: TcpStream,
     session_id: ObjectId,
     carrier: AssocCarrier,
@@ -212,7 +212,7 @@ async fn open_udp_flow(
         })
         .await
         .context("send UdpForwardRequest")?;
-    let reply = match tokio::time::timeout(FLOW_OPEN_TIMEOUT_SHARED, reply_rx).await {
+    let reply = match tokio::time::timeout(FLOW_OPEN_TIMEOUT, reply_rx).await {
         Ok(Ok(r)) => r,
         Ok(Err(_)) => {
             reply_registry.lock().await.remove(&flow_id);
@@ -220,7 +220,7 @@ async fn open_udp_flow(
         }
         Err(_) => {
             reply_registry.lock().await.remove(&flow_id);
-            bail!("UdpForwardRequest timed out after {FLOW_OPEN_TIMEOUT_SHARED:?}");
+            bail!("UdpForwardRequest timed out after {FLOW_OPEN_TIMEOUT:?}");
         }
     };
     match reply {
