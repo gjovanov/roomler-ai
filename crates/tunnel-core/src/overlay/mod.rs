@@ -32,6 +32,10 @@ pub mod netmap;
 /// OS-free twin of [`tun::SystemTun`]. Feature `overlay-netstack`.
 #[cfg(feature = "overlay-netstack")]
 pub mod netstack;
+/// SOCKS5-CONNECT front for the [`netstack`] — the app-facing half of the
+/// OS-free path. Feature `overlay-netstack`.
+#[cfg(feature = "overlay-netstack")]
+pub mod netstack_socks;
 pub mod relay_link;
 pub mod router;
 pub mod runtime;

@@ -29,7 +29,7 @@ pub mod logs_fetch;
 pub mod logs_upload;
 pub mod machine;
 pub mod notify;
-#[cfg(feature = "overlay-l3")]
+#[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
 pub mod overlay;
 pub mod peer;
 pub mod post_install;
