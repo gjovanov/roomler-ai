@@ -1,9 +1,29 @@
 # Netstack IPv6 — implementation plan
 
-Status: **planning** (2026-07-11). The netstack (userspace smoltcp TCP/IP stack,
-feature `overlay-netstack`) is IPv4-only today. This document plans dual-stack
-(IPv4 + IPv6) support: what changes, in what order, and the decisions that make
-it tractable.
+Status (2026-07-11):
+
+- **Phase A shipped** (PR #85) — dual-stack netstack internals: smoltcp
+  `proto-ipv6`, `IpAddr`/`SocketAddr` API widening, the derived-v6 ULA
+  (`fd72:6f6f:6d6c::/48`, pinned), dual-addressed iface, ICMPv6 echo, v6
+  direct-pair tests. Inert.
+- **Phase B shipped** — v6 *routing* on both surfaces, with one refinement
+  over the plan below: instead of installing a per-peer v6 `/128` in
+  `router.rs`, the router **unmaps a derived-ULA destination to its embedded
+  v4 at packet-extraction time** (`Router::dst_of_ip_packet`) and routes on
+  the existing v4 table — zero per-peer v6 state, zero `install_peers`
+  change. Inbound needed nothing (boringtun's `WriteToTunnelV6` was already
+  handled). OS-TUN parity: `SystemTun::up` assigns the derived v6 `/96`
+  (Linux `ip -6 addr replace`, Windows `netsh`, best-effort; macOS deferred
+  like the v4 per-peer routes). Proven by
+  `bridge_v6_tcp_echo_and_ping_over_wireguard` (v4-only peer install; TCP +
+  ICMPv6 round-trip over the derived v6 through a real WG pair).
+- **Phases C / D**: not started — no surface resolves a genuine v6 target
+  yet.
+
+The original plan follows. The netstack (userspace smoltcp TCP/IP stack,
+feature `overlay-netstack`) was IPv4-only when written. This document plans
+dual-stack (IPv4 + IPv6) support: what changes, in what order, and the
+decisions that make it tractable.
 
 ## Why (and why it can wait)
 
