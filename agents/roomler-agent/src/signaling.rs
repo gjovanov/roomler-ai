@@ -456,12 +456,12 @@ async fn connect_once(
     // and capture the channel its `rc:overlay.*` events flow into. The
     // runtime sends its `ClientMsg`s back through `outbound_tx`, like any
     // peer, and tears down when this connection's `overlay_evt_tx` drops.
-    #[cfg(feature = "overlay-l3")]
+    #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
     let overlay_evt_tx =
         crate::overlay::maybe_start(cfg, outbound_tx.clone(), overlay_view_tx.clone());
-    // Without the overlay feature nothing publishes the view; keep the param
+    // Without an overlay surface nothing publishes the view; keep the param
     // used so the LocalAPI wiring stays feature-agnostic in `run_cmd`.
-    #[cfg(not(feature = "overlay-l3"))]
+    #[cfg(not(any(feature = "overlay-l3", feature = "overlay-netstack")))]
     let _ = &overlay_view_tx;
     let mut peers: HashMap<bson::oid::ObjectId, AgentPeer> = HashMap::new();
     // Codec selected for each pending session (computed from the
@@ -573,7 +573,7 @@ async fn connect_once(
                             // Phase 3b: route `rc:overlay.*` to the node
                             // runtime; everything else falls through to the
                             // normal dispatch below.
-                            #[cfg(feature = "overlay-l3")]
+                            #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
                             let parsed = match &overlay_evt_tx {
                                 Some(tx) => match crate::overlay::intercept(tx, parsed) {
                                     Some(p) => p,
