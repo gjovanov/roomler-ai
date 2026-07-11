@@ -9,7 +9,7 @@
 //! created there (stable across WS reconnects), the signaling loop updates them,
 //! and the listener reads this state.
 
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -27,8 +27,9 @@ use tunnel_core::localapi::{
 /// on any node not running the userspace stack.
 #[async_trait]
 pub trait NetstackPinger: Send + Sync {
-    /// ICMP-ping `dst` (already resolved) over the netstack; `Ok(rtt)` on reply.
-    async fn ping(&self, dst: Ipv4Addr, timeout: Duration) -> Result<Duration, String>;
+    /// ICMP-ping `dst` (already resolved, either family) over the netstack;
+    /// `Ok(rtt)` on reply.
+    async fn ping(&self, dst: IpAddr, timeout: Duration) -> Result<Duration, String>;
 }
 
 /// Live daemon state behind the LocalAPI. Built once in `run_cmd`, wrapped in an
@@ -88,11 +89,14 @@ impl DaemonState {
         }
     }
 
-    /// Resolve a `ping` target — a literal overlay IPv4 or a peer **name** —
-    /// against the live mesh view. Mirrors the netstack SOCKS front's resolver
-    /// (bare label / first DNS label), but reads the view `DaemonState` holds.
-    fn resolve_overlay(&self, target: &str) -> Option<Ipv4Addr> {
-        if let Ok(ip) = target.parse::<Ipv4Addr>() {
+    /// Resolve a `ping` target — a literal overlay IP (either family) or a peer
+    /// **name** — against the live mesh view. Mirrors the netstack SOCKS
+    /// front's resolver (bare label / first DNS label), but reads the view
+    /// `DaemonState` holds. A name resolves to the peer's IPv4 by default, or
+    /// its *derived* overlay IPv6 (published by the runtime) with `prefer_v6`;
+    /// a literal is used as-is (an unroutable v6 fails cleanly at the send).
+    fn resolve_overlay(&self, target: &str, prefer_v6: bool) -> Option<IpAddr> {
+        if let Ok(ip) = target.parse::<IpAddr>() {
             return Some(ip);
         }
         let tl = target.to_ascii_lowercase();
@@ -100,9 +104,15 @@ impl DaemonState {
         self.overlay.borrow().peers.iter().find_map(|p| {
             let n = p.name.to_ascii_lowercase();
             if !p.name.is_empty() && (n == tl || n == bare) {
-                p.overlay_ip
-                    .as_deref()
-                    .and_then(|s| s.parse::<Ipv4Addr>().ok())
+                let v4 = p.overlay_ip.as_deref();
+                let pick = if prefer_v6 {
+                    // Fall back to v4 if no published v6 (shouldn't happen —
+                    // the runtime derives one whenever the v4 exists).
+                    p.overlay_ip6.as_deref().or(v4)
+                } else {
+                    v4
+                };
+                pick.and_then(|s| s.parse::<IpAddr>().ok())
             } else {
                 None
             }
@@ -122,6 +132,7 @@ impl LocalApiState for DaemonState {
             // The overlay IP the runtime last assigned us — a stable identity,
             // so it's kept even across a brief disconnect.
             overlay_ip: self.overlay.borrow().self_ip.clone(),
+            overlay_ip6: self.overlay.borrow().self_ip6.clone(),
             connected: self.connected.load(Ordering::Relaxed),
         }
     }
@@ -184,7 +195,7 @@ impl LocalApiState for DaemonState {
         self.consent.record_decision(session_id, allow)
     }
 
-    async fn ping(&self, target: &str, timeout_ms: u64) -> Response {
+    async fn ping(&self, target: &str, timeout_ms: u64, prefer_v6: bool) -> Response {
         let Some(pinger) = self.pinger.clone() else {
             return Response::Error {
                 message: "ping requires netstack mode (this node isn't running the userspace \
@@ -192,7 +203,7 @@ impl LocalApiState for DaemonState {
                     .into(),
             };
         };
-        let Some(ip) = self.resolve_overlay(target) else {
+        let Some(ip) = self.resolve_overlay(target, prefer_v6) else {
             return Response::Error {
                 message: format!("no overlay peer named '{target}' — try an overlay IP or `peers`"),
             };
@@ -219,15 +230,18 @@ fn is_hex_object_id(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
     use tunnel_core::localapi::ConnectionType;
 
     fn view() -> OverlayView {
         OverlayView {
             self_ip: Some("100.64.0.2".into()),
+            self_ip6: Some("fd72:6f6f:6d6c::6440:2".into()),
             peers: vec![PeerInfo {
                 node_id: "n2".into(),
                 name: "peer".into(),
                 overlay_ip: Some("100.64.0.1".into()),
+                overlay_ip6: Some("fd72:6f6f:6d6c::6440:1".into()),
                 online: true,
                 connection: ConnectionType::Relay,
                 rtt_ms: None,
@@ -259,20 +273,33 @@ mod tests {
         );
         // Resolve by peer name (from `view`), by first label, and by literal IP.
         assert_eq!(
-            st.resolve_overlay("peer"),
-            Some(Ipv4Addr::new(100, 64, 0, 1))
+            st.resolve_overlay("peer", false),
+            Some(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)))
         );
         assert_eq!(
-            st.resolve_overlay("PEER.myorg.roomler.net"),
-            Some(Ipv4Addr::new(100, 64, 0, 1))
+            st.resolve_overlay("PEER.myorg.roomler.net", false),
+            Some(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)))
         );
         assert_eq!(
-            st.resolve_overlay("100.64.0.9"),
-            Some(Ipv4Addr::new(100, 64, 0, 9))
+            st.resolve_overlay("100.64.0.9", false),
+            Some(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 9)))
         );
-        assert_eq!(st.resolve_overlay("ghost"), None);
+        // prefer_v6 picks the runtime-published derived v6 for a NAME target…
+        assert_eq!(
+            st.resolve_overlay("peer", true),
+            Some("fd72:6f6f:6d6c::6440:1".parse().unwrap())
+        );
+        // …and a literal v6 target is accepted as-is.
+        assert_eq!(
+            st.resolve_overlay("fd72:6f6f:6d6c::6440:9", false),
+            Some("fd72:6f6f:6d6c::6440:9".parse().unwrap())
+        );
+        assert_eq!(st.resolve_overlay("ghost", false), None);
         // With no pinger (not a netstack node) `ping` is a clean Error, not a Pong.
-        assert!(matches!(st.ping("peer", 0).await, Response::Error { .. }));
+        assert!(matches!(
+            st.ping("peer", 0, false).await,
+            Response::Error { .. }
+        ));
     }
 
     #[test]
