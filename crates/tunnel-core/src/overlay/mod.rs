@@ -28,6 +28,10 @@ pub mod direct;
 pub mod dns;
 pub mod nat;
 pub mod netmap;
+/// Userspace TCP/IP stack (smoltcp) presented as a [`tun::TunIo`] — the
+/// OS-free twin of [`tun::SystemTun`]. Feature `overlay-netstack`.
+#[cfg(feature = "overlay-netstack")]
+pub mod netstack;
 pub mod relay_link;
 pub mod router;
 pub mod runtime;
