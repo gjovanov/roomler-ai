@@ -32,7 +32,7 @@ use axum::extract::ws::{Message, WebSocket};
 use bson::{DateTime, oid::ObjectId};
 use futures::{SinkExt, StreamExt, stream::SplitSink};
 use roomler_ai_remote_control::{
-    models::{AgentStatus, RelayMode, TunnelAuditEvent, TunnelAuditKind},
+    models::{AgentStatus, OsKind, RelayMode, TunnelAuditEvent, TunnelAuditKind},
     signaling::{ClientMsg, CloseReason, RejectKind, ServerMsg},
 };
 use std::sync::Arc;
@@ -119,6 +119,22 @@ pub async fn handle_tunnel_client_socket(
     // never negotiated, which is the safe default.
     let mut client_supported_transports: Vec<String> = Vec::new();
 
+    // Bundle the originator identity + reply channel once. Every tunnel
+    // handler is subject-agnostic (P3b-2) and takes this by ref, so the
+    // very same open/forward/relay/audit code serves an agent driving the
+    // tunnel-client role over its own WS (see
+    // `relay_tunnel_client_msg_from_agent`). `client_version` is moved in
+    // here; `client_os` + the ids are Copy, so the locals remain for the
+    // logs / revocation task / overlay teardown below.
+    let orig = Originator {
+        principal: Principal::TunnelClient(tunnel_client_id),
+        tenant_id,
+        owner_user_id,
+        client_version,
+        client_os,
+        outbound_tx: outbound_tx.clone(),
+    };
+
     // Periodic revocation re-check task — same as T1 stub, but now
     // sends a typed `TunnelRevoked` `ServerMsg` instead of an
     // ad-hoc JSON frame.
@@ -183,23 +199,16 @@ pub async fn handle_tunnel_client_socket(
             ClientMsg::TunnelOpen {
                 agent_id,
                 transport,
-                // B1 dormant: the standalone tunnel-client CLI is
-                // single-open, so its nonce (if any) is unused here.
-                // PR-B2 threads the nonce into the reply so a daemon
-                // multiplexing many opens over one WS can demux them.
-                open_nonce: _,
+                open_nonce,
             } => {
-                handle_tunnel_open(
+                // The dedicated CLI is single-open, so `open_nonce` is
+                // normally None; the server echoes back whatever it sent.
+                session = handle_tunnel_open(
                     &state,
-                    &outbound_tx,
-                    &mut session,
-                    tunnel_client_id,
-                    tenant_id,
-                    owner_user_id,
-                    &client_version,
-                    client_os,
+                    &orig,
                     agent_id,
                     transport,
+                    open_nonce,
                     &client_supported_transports,
                 )
                 .await;
@@ -214,13 +223,8 @@ pub async fn handle_tunnel_client_socket(
                 handle_forward_request(
                     ProtocolKind::Tcp,
                     &state,
-                    &outbound_tx,
+                    &orig,
                     session.as_ref(),
-                    tunnel_client_id,
-                    tenant_id,
-                    owner_user_id,
-                    &client_version,
-                    client_os,
                     session_id,
                     flow_id,
                     &dst_host,
@@ -238,13 +242,8 @@ pub async fn handle_tunnel_client_socket(
                 handle_forward_request(
                     ProtocolKind::Udp,
                     &state,
-                    &outbound_tx,
+                    &orig,
                     session.as_ref(),
-                    tunnel_client_id,
-                    tenant_id,
-                    owner_user_id,
-                    &client_version,
-                    client_os,
                     session_id,
                     flow_id,
                     &dst_host,
@@ -271,15 +270,7 @@ pub async fn handle_tunnel_client_socket(
                 }
                 if let Some(s) = session.take() {
                     state.tunnel_clients_by_session.remove(&s.tunnel_session_id);
-                    audit_peer_close(
-                        &state,
-                        &s,
-                        owner_user_id,
-                        tunnel_client_id,
-                        &client_version,
-                        client_os,
-                    )
-                    .await;
+                    audit_peer_close(&state, &s, &orig).await;
                 }
             }
 
@@ -311,11 +302,8 @@ pub async fn handle_tunnel_client_socket(
                 // Relay flow-close to agent + append audit row.
                 relay_tcp_closed_to_agent(
                     &state,
+                    &orig,
                     session.as_ref(),
-                    tunnel_client_id,
-                    owner_user_id,
-                    &client_version,
-                    client_os,
                     session_id,
                     flow_id,
                     reason,
@@ -331,11 +319,8 @@ pub async fn handle_tunnel_client_socket(
                 // Relay UDP flow-close to agent + append audit row.
                 relay_udp_closed_to_agent(
                     &state,
+                    &orig,
                     session.as_ref(),
-                    tunnel_client_id,
-                    owner_user_id,
-                    &client_version,
-                    client_os,
                     session_id,
                     flow_id,
                     reason,
@@ -412,15 +397,7 @@ pub async fn handle_tunnel_client_socket(
                 reason: CloseReason::ClientShutdown,
             },
         );
-        audit_peer_close(
-            &state,
-            &s,
-            owner_user_id,
-            tunnel_client_id,
-            &client_version,
-            client_os,
-        )
-        .await;
+        audit_peer_close(&state, &s, &orig).await;
     }
     // Drop our outbound_tx so the pump task can exit cleanly. Any
     // clones in tunnel_clients_by_session were just removed; any
@@ -435,28 +412,75 @@ pub async fn handle_tunnel_client_socket(
 /// Per-connection state created on `TunnelOpen` and consumed by every
 /// subsequent flow event for audit correlation.
 #[derive(Debug, Clone)]
-struct TunnelSession {
-    tunnel_session_id: ObjectId,
+pub(crate) struct TunnelSession {
+    pub(crate) tunnel_session_id: ObjectId,
     agent_id: ObjectId,
     agent_tenant_id: ObjectId,
     #[allow(dead_code)] // T2.6 will plumb this into the agent-WS relay
     transport: String,
 }
 
+/// Identity + reply channel of whoever originated a tunnel-CLIENT session
+/// on this server. Two principals drive the identical handlers:
+///   * `Principal::TunnelClient` — a dedicated `roomler-tunnel` WS
+///     (`handle_tunnel_client_socket`).
+///   * `Principal::Agent` — an enrolled agent driving the tunnel-client
+///     role over its own agent WS (P3b-2,
+///     `relay_tunnel_client_msg_from_agent`).
+///
+/// Bundling the per-originator values here lets ONE subject-agnostic set
+/// of handlers serve both WS roles instead of duplicating the open /
+/// forward / relay / audit logic per role.
+#[derive(Clone)]
+pub(crate) struct Originator {
+    pub(crate) principal: Principal,
+    /// The originator's own tenant. For an agent origin this is the
+    /// agent's tenant — the value the cross-tenant gate compares against
+    /// the TARGET agent's tenant.
+    pub(crate) tenant_id: ObjectId,
+    pub(crate) owner_user_id: ObjectId,
+    pub(crate) client_version: String,
+    pub(crate) client_os: OsKind,
+    /// The originator's outbound `ServerMsg` channel. For a tunnel-client
+    /// WS this is its per-connection `outbound_tx`; for an agent it is a
+    /// clone of the agent's Hub-owned `registered_tx`, so a target's
+    /// answers relayed via `tunnel_clients_by_session[session_id]` reach
+    /// the agent's socket through its EXISTING pump — no target-side change.
+    pub(crate) outbound_tx: mpsc::Sender<ServerMsg>,
+}
+
+impl Originator {
+    /// The originating tunnel-client row id, or `None` for an agent origin.
+    fn tunnel_client_id(&self) -> Option<ObjectId> {
+        match self.principal {
+            Principal::TunnelClient(id) => Some(id),
+            Principal::Agent(_) => None,
+        }
+    }
+    /// The originating agent id, or `None` for a dedicated-client origin.
+    fn origin_agent_id(&self) -> Option<ObjectId> {
+        match self.principal {
+            Principal::Agent(id) => Some(id),
+            Principal::TunnelClient(_) => None,
+        }
+    }
+    /// Stable id for log lines, regardless of principal kind.
+    fn log_id(&self) -> ObjectId {
+        match self.principal {
+            Principal::TunnelClient(id) | Principal::Agent(id) => id,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_tunnel_open(
     state: &AppState,
-    outbound_tx: &mpsc::Sender<ServerMsg>,
-    session: &mut Option<TunnelSession>,
-    tunnel_client_id: ObjectId,
-    client_tenant_id: ObjectId,
-    owner_user_id: ObjectId,
-    client_version: &str,
-    client_os: roomler_ai_remote_control::models::OsKind,
+    orig: &Originator,
     agent_id: ObjectId,
     transport: String,
+    open_nonce: Option<String>,
     client_supported: &[String],
-) {
+) -> Option<TunnelSession> {
     // 1. Fetch the agent (any tenant — we need the row to enforce
     // the cross-tenant gate ourselves). `find_in_tenant` is wrong
     // here because it scopes by tenant — we need the agent's actual
@@ -465,53 +489,80 @@ async fn handle_tunnel_open(
         Ok(a) => a,
         Err(_) => {
             send_msg(
-                outbound_tx,
+                &orig.outbound_tx,
                 ServerMsg::Error {
                     session_id: None,
                     code: "agent_not_found".into(),
                     message: format!("agent {agent_id} does not exist"),
-                    open_nonce: None,
+                    open_nonce: open_nonce.clone(),
                 },
             )
             .await;
-            return;
+            return None;
         }
     };
 
     // 2. Cross-tenant gate (Sev0 — see plan §"Multi-tenancy gotcha").
-    if agent.tenant_id != client_tenant_id {
+    // The originator's tenant is the client tenant; for an agent origin
+    // it is the agent's own tenant.
+    if agent.tenant_id != orig.tenant_id {
         warn!(
-            %tunnel_client_id, %agent_id, %client_tenant_id,
+            origin = %orig.log_id(), %agent_id, client_tenant_id = %orig.tenant_id,
             agent_tenant_id = %agent.tenant_id,
-            "tunnel-client tried to open peer to a cross-tenant agent"
+            "tunnel originator tried to open a peer to a cross-tenant agent"
         );
         send_msg(
-            outbound_tx,
+            &orig.outbound_tx,
             ServerMsg::Error {
                 session_id: None,
                 code: "cross_tenant".into(),
                 message: "agent belongs to a different tenant".into(),
-                open_nonce: None,
+                open_nonce: open_nonce.clone(),
             },
         )
         .await;
-        return;
+        return None;
     }
 
-    // 3. Refuse if agent is soft-deleted or quarantined — early
-    // signal beats waiting for the relay step to fail.
+    // 3. Refuse if the TARGET agent is soft-deleted or quarantined —
+    // early signal beats waiting for the relay step to fail.
     if agent.deleted_at.is_some() || matches!(agent.status, AgentStatus::Quarantined) {
         send_msg(
-            outbound_tx,
+            &orig.outbound_tx,
             ServerMsg::Error {
                 session_id: None,
                 code: "agent_unavailable".into(),
                 message: "agent is quarantined or deleted".into(),
-                open_nonce: None,
+                open_nonce: open_nonce.clone(),
             },
         )
         .await;
-        return;
+        return None;
+    }
+
+    // 3b. Defence-in-depth for an AGENT origin (P3b-2 Risk 7): refuse if
+    // the ORIGINATING agent's row is soft-deleted / quarantined. Its WS
+    // auth already gated it at connect and the Hub closes a deleted
+    // agent's socket, but re-checking at the origination entry point stops
+    // a mid-session quarantine from spawning a fresh tunnel.
+    if let Principal::Agent(origin_id) = orig.principal {
+        let origin_ok = matches!(
+            state.agents.base.find_by_id(origin_id).await,
+            Ok(a) if a.deleted_at.is_none() && !matches!(a.status, AgentStatus::Quarantined)
+        );
+        if !origin_ok {
+            send_msg(
+                &orig.outbound_tx,
+                ServerMsg::Error {
+                    session_id: None,
+                    code: "origin_unavailable".into(),
+                    message: "originating agent is quarantined or deleted".into(),
+                    open_nonce: open_nonce.clone(),
+                },
+            )
+            .await;
+            return None;
+        }
     }
 
     // Transport negotiation (Phase 1c + Phase 4 agent-version gate).
@@ -552,9 +603,12 @@ async fn handle_tunnel_open(
         None
     };
 
-    // 4. Create the session id + persist on the connection +
-    // register the outbound channel so the agent WS handler can relay
-    // TcpForwardAccept/Reject/HalfClose/Closed (+ TunnelQuicReady) back.
+    // 4. Create the session id + register the outbound channel so the
+    // agent WS handler can relay TcpForwardAccept/Reject/HalfClose/Closed
+    // (+ TunnelQuicReady) back to the originator. For an agent origin this
+    // channel IS the agent's own socket, so the existing target->client
+    // relay path serves it unchanged. The caller stores the returned
+    // session (in its `Option` or its per-agent session map).
     let tunnel_session_id = ObjectId::new();
     let new_session = TunnelSession {
         tunnel_session_id,
@@ -562,10 +616,9 @@ async fn handle_tunnel_open(
         agent_tenant_id: agent.tenant_id,
         transport: negotiated_transport.clone(),
     };
-    *session = Some(new_session.clone());
     state
         .tunnel_clients_by_session
-        .insert(tunnel_session_id, outbound_tx.clone());
+        .insert(tunnel_session_id, orig.outbound_tx.clone());
 
     // 5. Audit the open. RelayMode is "Direct" until ICE finishes —
     // T2.7 updates this after candidate selection.
@@ -573,11 +626,12 @@ async fn handle_tunnel_open(
         .tunnel_audit
         .append(&TunnelAuditEvent {
             id: None,
-            tenant_id: client_tenant_id,
+            tenant_id: orig.tenant_id,
             tunnel_session_id,
-            tunnel_client_id,
+            tunnel_client_id: orig.tunnel_client_id(),
+            origin_agent_id: orig.origin_agent_id(),
             agent_id,
-            user_id: owner_user_id,
+            user_id: orig.owner_user_id,
             at: DateTime::now(),
             kind: TunnelAuditKind::PeerOpen,
             flow_id: None,
@@ -590,8 +644,8 @@ async fn handle_tunnel_open(
             relay: RelayMode::Direct,
             client_src_ip: None, // T2.6 — extract X-Forwarded-For at upgrade
             agent_src_port: None,
-            client_version: client_version.to_string(),
-            client_os,
+            client_version: orig.client_version.clone(),
+            client_os: orig.client_os,
             reason: None,
         })
         .await;
@@ -631,7 +685,7 @@ async fn handle_tunnel_open(
     // SCTP rwnd value mirrors the vendored webrtc patch's target so the
     // CLI's `diagnose` subcommand can verify the patch took effect.
     send_msg(
-        outbound_tx,
+        &orig.outbound_tx,
         ServerMsg::TunnelOpened {
             session_id: tunnel_session_id,
             transport: negotiated_transport,
@@ -639,10 +693,12 @@ async fn handle_tunnel_open(
             sctp_rwnd_bytes: 8 * 1024 * 1024,
             ice_servers: quic_ice_servers,
             quic_auth_token,
-            open_nonce: None,
+            open_nonce,
         },
     )
     .await;
+
+    Some(new_session)
 }
 
 /// Mint an opaque per-session QUIC bearer token. The server hands the
@@ -722,13 +778,8 @@ fn forward_forward_msg(
 async fn handle_forward_request(
     proto: ProtocolKind,
     state: &AppState,
-    outbound_tx: &mpsc::Sender<ServerMsg>,
+    orig: &Originator,
     session: Option<&TunnelSession>,
-    tunnel_client_id: ObjectId,
-    client_tenant_id: ObjectId,
-    owner_user_id: ObjectId,
-    client_version: &str,
-    client_os: roomler_ai_remote_control::models::OsKind,
     request_session_id: ObjectId,
     flow_id: u32,
     dst_host: &str,
@@ -737,7 +788,7 @@ async fn handle_forward_request(
     let Some(s) = session else {
         // No prior TunnelOpen — client is using the wire wrong.
         send_msg(
-            outbound_tx,
+            &orig.outbound_tx,
             forward_reject_msg(
                 proto,
                 request_session_id,
@@ -751,7 +802,7 @@ async fn handle_forward_request(
     };
     if s.tunnel_session_id != request_session_id {
         send_msg(
-            outbound_tx,
+            &orig.outbound_tx,
             forward_reject_msg(
                 proto,
                 request_session_id,
@@ -772,10 +823,7 @@ async fn handle_forward_request(
             audit_tcp_reject(
                 state,
                 s,
-                tunnel_client_id,
-                owner_user_id,
-                client_version,
-                client_os,
+                orig,
                 flow_id,
                 dst_host,
                 dst_port,
@@ -784,7 +832,7 @@ async fn handle_forward_request(
             )
             .await;
             send_msg(
-                outbound_tx,
+                &orig.outbound_tx,
                 forward_reject_msg(
                     proto,
                     request_session_id,
@@ -808,25 +856,27 @@ async fn handle_forward_request(
     {
         Ok(p) => p,
         Err(e) => {
-            warn!(%tunnel_client_id, %e, "policy fetch failed; defaulting to deny");
+            warn!(origin = %orig.log_id(), %e, "policy fetch failed; defaulting to deny");
             Vec::new()
         }
     };
 
     let subject = ResolvedSubject {
-        user_id: owner_user_id,
+        user_id: orig.owner_user_id,
         // T2.6 will resolve role_ids via the existing tenant
         // membership lookup. For T2.5 we use an empty list — only
-        // UserId / TunnelClientId / AllUsers policy subjects match.
+        // UserId / TunnelClientId / AgentId / AllUsers policy subjects
+        // match.
         role_ids: Vec::new(),
-        // This is the tunnel-CLIENT WS handler, so the principal is always a
-        // tunnel client. P3b-2's agent-origination path (in the agent WS
-        // handler) will construct `Principal::Agent` instead.
-        principal: Principal::TunnelClient(tunnel_client_id),
+        // Subject-agnostic (P3b-2): a tunnel-client WS carries
+        // `Principal::TunnelClient`, an agent driving the client role over
+        // its own WS carries `Principal::Agent`. The ACL evaluator
+        // discriminates the id-specific subjects on the principal kind.
+        principal: orig.principal,
     };
 
     let result = check_forward_request(
-        client_tenant_id,
+        orig.tenant_id,
         &agent,
         &policies,
         &subject,
@@ -837,7 +887,7 @@ async fn handle_forward_request(
 
     match result {
         GateResult::Allow { policy_id, .. } => {
-            debug!(%tunnel_client_id, %flow_id, %dst_host, %dst_port, ?proto, %policy_id, "forward allowed by policy; relaying to agent");
+            debug!(origin = %orig.log_id(), %flow_id, %dst_host, %dst_port, ?proto, %policy_id, "forward allowed by policy; relaying to agent");
             // T2.10c: relay to the agent's WS. The agent dials dst,
             // then replies with `ClientMsg::TcpForwardAccept` /
             // `UdpForwardAccept` (or Reject) which the agent WS handler
@@ -850,7 +900,7 @@ async fn handle_forward_request(
                     flow_id,
                     dst_host.to_string(),
                     dst_port,
-                    owner_user_id,
+                    orig.owner_user_id,
                 ),
             );
             match relay {
@@ -858,29 +908,15 @@ async fn handle_forward_request(
                     // Server side accepted-relayed; the actual
                     // accept (or agent-side reject) lands later
                     // via the agent's WS.
-                    audit_tcp_accept(
-                        state,
-                        s,
-                        tunnel_client_id,
-                        owner_user_id,
-                        client_version,
-                        client_os,
-                        flow_id,
-                        dst_host,
-                        dst_port,
-                    )
-                    .await;
+                    audit_tcp_accept(state, s, orig, flow_id, dst_host, dst_port).await;
                 }
                 Err(e) => {
                     // Agent not online or its channel is wedged.
-                    warn!(%tunnel_client_id, %flow_id, agent = %s.agent_id, %e, "agent relay failed");
+                    warn!(origin = %orig.log_id(), %flow_id, agent = %s.agent_id, %e, "agent relay failed");
                     audit_tcp_reject(
                         state,
                         s,
-                        tunnel_client_id,
-                        owner_user_id,
-                        client_version,
-                        client_os,
+                        orig,
                         flow_id,
                         dst_host,
                         dst_port,
@@ -889,7 +925,7 @@ async fn handle_forward_request(
                     )
                     .await;
                     send_msg(
-                        outbound_tx,
+                        &orig.outbound_tx,
                         forward_reject_msg(
                             proto,
                             request_session_id,
@@ -903,23 +939,10 @@ async fn handle_forward_request(
             }
         }
         GateResult::Reject { kind, reason } => {
-            info!(%tunnel_client_id, %flow_id, %dst_host, %dst_port, ?proto, ?kind, %reason, "forward rejected");
-            audit_tcp_reject(
-                state,
-                s,
-                tunnel_client_id,
-                owner_user_id,
-                client_version,
-                client_os,
-                flow_id,
-                dst_host,
-                dst_port,
-                kind,
-                &reason,
-            )
-            .await;
+            info!(origin = %orig.log_id(), %flow_id, %dst_host, %dst_port, ?proto, ?kind, %reason, "forward rejected");
+            audit_tcp_reject(state, s, orig, flow_id, dst_host, dst_port, kind, &reason).await;
             send_msg(
-                outbound_tx,
+                &orig.outbound_tx,
                 forward_reject_msg(proto, request_session_id, flow_id, kind, reason),
             )
             .await;
@@ -935,10 +958,7 @@ async fn handle_forward_request(
 async fn audit_tcp_accept(
     state: &AppState,
     session: &TunnelSession,
-    tunnel_client_id: ObjectId,
-    owner_user_id: ObjectId,
-    client_version: &str,
-    client_os: roomler_ai_remote_control::models::OsKind,
+    orig: &Originator,
     flow_id: u32,
     dst_host: &str,
     dst_port: u16,
@@ -949,9 +969,10 @@ async fn audit_tcp_accept(
             id: None,
             tenant_id: session.agent_tenant_id,
             tunnel_session_id: session.tunnel_session_id,
-            tunnel_client_id,
+            tunnel_client_id: orig.tunnel_client_id(),
+            origin_agent_id: orig.origin_agent_id(),
             agent_id: session.agent_id,
-            user_id: owner_user_id,
+            user_id: orig.owner_user_id,
             at: DateTime::now(),
             kind: TunnelAuditKind::TcpAccept,
             flow_id: Some(flow_id),
@@ -964,8 +985,8 @@ async fn audit_tcp_accept(
             relay: RelayMode::Direct,
             client_src_ip: None,
             agent_src_port: None,
-            client_version: client_version.to_string(),
-            client_os,
+            client_version: orig.client_version.clone(),
+            client_os: orig.client_os,
             reason: None,
         })
         .await;
@@ -975,10 +996,7 @@ async fn audit_tcp_accept(
 async fn audit_tcp_reject(
     state: &AppState,
     session: &TunnelSession,
-    tunnel_client_id: ObjectId,
-    owner_user_id: ObjectId,
-    client_version: &str,
-    client_os: roomler_ai_remote_control::models::OsKind,
+    orig: &Originator,
     flow_id: u32,
     dst_host: &str,
     dst_port: u16,
@@ -991,9 +1009,10 @@ async fn audit_tcp_reject(
             id: None,
             tenant_id: session.agent_tenant_id,
             tunnel_session_id: session.tunnel_session_id,
-            tunnel_client_id,
+            tunnel_client_id: orig.tunnel_client_id(),
+            origin_agent_id: orig.origin_agent_id(),
             agent_id: session.agent_id,
-            user_id: owner_user_id,
+            user_id: orig.owner_user_id,
             at: DateTime::now(),
             kind: TunnelAuditKind::TcpReject,
             flow_id: Some(flow_id),
@@ -1006,30 +1025,24 @@ async fn audit_tcp_reject(
             relay: RelayMode::Direct,
             client_src_ip: None,
             agent_src_port: None,
-            client_version: client_version.to_string(),
-            client_os,
+            client_version: orig.client_version.clone(),
+            client_os: orig.client_os,
             reason: Some(format!("{kind:?}: {reason}")),
         })
         .await;
 }
 
-async fn audit_peer_close(
-    state: &AppState,
-    session: &TunnelSession,
-    owner_user_id: ObjectId,
-    tunnel_client_id: ObjectId,
-    client_version: &str,
-    client_os: roomler_ai_remote_control::models::OsKind,
-) {
+async fn audit_peer_close(state: &AppState, session: &TunnelSession, orig: &Originator) {
     let _ = state
         .tunnel_audit
         .append(&TunnelAuditEvent {
             id: None,
             tenant_id: session.agent_tenant_id,
             tunnel_session_id: session.tunnel_session_id,
-            tunnel_client_id,
+            tunnel_client_id: orig.tunnel_client_id(),
+            origin_agent_id: orig.origin_agent_id(),
             agent_id: session.agent_id,
-            user_id: owner_user_id,
+            user_id: orig.owner_user_id,
             at: DateTime::now(),
             kind: TunnelAuditKind::PeerClose,
             flow_id: None,
@@ -1042,8 +1055,8 @@ async fn audit_peer_close(
             relay: RelayMode::Direct,
             client_src_ip: None,
             agent_src_port: None,
-            client_version: client_version.to_string(),
-            client_os,
+            client_version: orig.client_version.clone(),
+            client_os: orig.client_os,
             reason: None,
         })
         .await;
@@ -1120,14 +1133,10 @@ async fn relay_half_close_to_agent(
 /// agent and append an audit row. The flow is fully closed at this
 /// point; `tunnel_audit` records the close reason so admins can
 /// reconstruct the lifecycle.
-#[allow(clippy::too_many_arguments)]
 async fn relay_tcp_closed_to_agent(
     state: &AppState,
+    orig: &Originator,
     session: Option<&TunnelSession>,
-    tunnel_client_id: ObjectId,
-    owner_user_id: ObjectId,
-    client_version: &str,
-    client_os: roomler_ai_remote_control::models::OsKind,
     request_session_id: ObjectId,
     flow_id: u32,
     reason: CloseReason,
@@ -1146,32 +1155,18 @@ async fn relay_tcp_closed_to_agent(
             reason,
         },
     ) {
-        debug!(%tunnel_client_id, %flow_id, %e, "tcp-closed relay to agent failed");
+        debug!(origin = %orig.log_id(), %flow_id, %e, "tcp-closed relay to agent failed");
     }
-    audit_tcp_close(
-        state,
-        s,
-        tunnel_client_id,
-        owner_user_id,
-        client_version,
-        client_os,
-        flow_id,
-        reason,
-    )
-    .await;
+    audit_tcp_close(state, s, orig, flow_id, reason).await;
 }
 
 /// UDP analogue of [`relay_tcp_closed_to_agent`]: relay a UDP-flow close
 /// to the agent + append an audit row. Reuses [`audit_tcp_close`] — the
 /// close accounting is L4-agnostic (flow_id + reason).
-#[allow(clippy::too_many_arguments)]
 async fn relay_udp_closed_to_agent(
     state: &AppState,
+    orig: &Originator,
     session: Option<&TunnelSession>,
-    tunnel_client_id: ObjectId,
-    owner_user_id: ObjectId,
-    client_version: &str,
-    client_os: roomler_ai_remote_control::models::OsKind,
     request_session_id: ObjectId,
     flow_id: u32,
     reason: CloseReason,
@@ -1190,19 +1185,9 @@ async fn relay_udp_closed_to_agent(
             reason,
         },
     ) {
-        debug!(%tunnel_client_id, %flow_id, %e, "udp-closed relay to agent failed");
+        debug!(origin = %orig.log_id(), %flow_id, %e, "udp-closed relay to agent failed");
     }
-    audit_tcp_close(
-        state,
-        s,
-        tunnel_client_id,
-        owner_user_id,
-        client_version,
-        client_os,
-        flow_id,
-        reason,
-    )
-    .await;
+    audit_tcp_close(state, s, orig, flow_id, reason).await;
 }
 
 /// Relay a tunnel-client SDP offer to the agent. Cheap session_id
@@ -1285,14 +1270,10 @@ async fn relay_quic_candidate_to_agent(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn audit_tcp_close(
     state: &AppState,
     session: &TunnelSession,
-    tunnel_client_id: ObjectId,
-    owner_user_id: ObjectId,
-    client_version: &str,
-    client_os: roomler_ai_remote_control::models::OsKind,
+    orig: &Originator,
     flow_id: u32,
     reason: CloseReason,
 ) {
@@ -1302,9 +1283,10 @@ async fn audit_tcp_close(
             id: None,
             tenant_id: session.agent_tenant_id,
             tunnel_session_id: session.tunnel_session_id,
-            tunnel_client_id,
+            tunnel_client_id: orig.tunnel_client_id(),
+            origin_agent_id: orig.origin_agent_id(),
             agent_id: session.agent_id,
-            user_id: owner_user_id,
+            user_id: orig.owner_user_id,
             at: DateTime::now(),
             kind: TunnelAuditKind::TcpClosed,
             flow_id: Some(flow_id),
@@ -1317,8 +1299,8 @@ async fn audit_tcp_close(
             relay: RelayMode::Direct,
             client_src_ip: None,
             agent_src_port: None,
-            client_version: client_version.to_string(),
-            client_os,
+            client_version: orig.client_version.clone(),
+            client_os: orig.client_os,
             reason: Some(format!("{reason:?}")),
         })
         .await;
@@ -1376,4 +1358,249 @@ fn spawn_revocation_check(
             }
         }
     })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// P3b-2: an agent driving the tunnel-CLIENT role over its own agent WS
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Agent-WS interception for the tunnel-CLIENT role (P3b-2, identity model
+/// (b)). An enrolled agent may ORIGINATE tunnel-client sessions over its
+/// own agent WS. This runs FIRST in the agent read-loop — ahead of the
+/// target-side [`crate::ws::remote_control::relay_tunnel_msg_from_agent`] —
+/// and consumes the variants where THIS agent acts as the tunnel
+/// *originator*, driving the same subject-agnostic handlers with
+/// `Principal::Agent`.
+///
+/// Returns `None` when consumed; `Some(parsed)` to pass the message on to
+/// the target-side handler (this agent is the tunnel TARGET for that
+/// session, not its originator).
+///
+/// Demux (P3b-2 Risk 1). The client-only-by-type variants
+/// (`TunnelHello` / `TunnelOpen` / `Tcp|UdpForwardRequest` /
+/// `TunnelSdpOffer` / `TunnelQuicCandidate`) are always originator-side
+/// here — an agent never emits them as a target. The genuinely
+/// bidirectional ones (`TunnelIce` / `TunnelTerminate` / `TcpHalfClose` /
+/// `TcpClosed` / `UdpClosed`) are consumed ONLY for a session THIS agent
+/// originated (`session_id ∈ sessions`); otherwise they fall through so
+/// the existing target-side path relays the agent's answer back to the far
+/// originating client. The reply path for an originated session reuses
+/// `tunnel_clients_by_session[session_id]` — registered on open with the
+/// agent's OWN outbound channel — so a target's answers reach this agent's
+/// socket unchanged.
+pub(crate) async fn relay_tunnel_client_msg_from_agent(
+    state: &AppState,
+    orig: &Originator,
+    sessions: &mut std::collections::HashMap<ObjectId, TunnelSession>,
+    supported_transports: &mut Vec<String>,
+    parsed: ClientMsg,
+) -> Option<ClientMsg> {
+    match parsed {
+        ClientMsg::TunnelHello {
+            role: _,
+            version,
+            supported_transports: advertised,
+        } => {
+            debug!(agent = %orig.log_id(), %version, ?advertised, "agent tunnel-client hello");
+            *supported_transports = advertised;
+            None
+        }
+        ClientMsg::TunnelOpen {
+            agent_id,
+            transport,
+            open_nonce,
+        } => {
+            if let Some(s) = handle_tunnel_open(
+                state,
+                orig,
+                agent_id,
+                transport,
+                open_nonce,
+                supported_transports,
+            )
+            .await
+            {
+                sessions.insert(s.tunnel_session_id, s);
+            }
+            None
+        }
+        ClientMsg::TcpForwardRequest {
+            session_id,
+            flow_id,
+            dst_host,
+            dst_port,
+        } => {
+            handle_forward_request(
+                ProtocolKind::Tcp,
+                state,
+                orig,
+                sessions.get(&session_id),
+                session_id,
+                flow_id,
+                &dst_host,
+                dst_port,
+            )
+            .await;
+            None
+        }
+        ClientMsg::UdpForwardRequest {
+            session_id,
+            flow_id,
+            dst_host,
+            dst_port,
+        } => {
+            handle_forward_request(
+                ProtocolKind::Udp,
+                state,
+                orig,
+                sessions.get(&session_id),
+                session_id,
+                flow_id,
+                &dst_host,
+                dst_port,
+            )
+            .await;
+            None
+        }
+        ClientMsg::TunnelSdpOffer { session_id, sdp } => {
+            relay_sdp_offer_to_agent(state, sessions.get(&session_id), session_id, sdp).await;
+            None
+        }
+        ClientMsg::TunnelQuicCandidate { session_id, addrs } => {
+            relay_quic_candidate_to_agent(state, sessions.get(&session_id), session_id, addrs)
+                .await;
+            None
+        }
+        // ── genuinely bidirectional: consume only if WE originated it ──
+        ClientMsg::TunnelIce {
+            session_id,
+            candidate,
+        } => {
+            if sessions.contains_key(&session_id) {
+                relay_ice_to_agent(state, sessions.get(&session_id), session_id, candidate).await;
+                None
+            } else {
+                Some(ClientMsg::TunnelIce {
+                    session_id,
+                    candidate,
+                })
+            }
+        }
+        ClientMsg::TcpHalfClose {
+            session_id,
+            flow_id,
+            direction,
+        } => {
+            if sessions.contains_key(&session_id) {
+                relay_half_close_to_agent(
+                    state,
+                    sessions.get(&session_id),
+                    orig.log_id(),
+                    session_id,
+                    flow_id,
+                    direction,
+                )
+                .await;
+                None
+            } else {
+                Some(ClientMsg::TcpHalfClose {
+                    session_id,
+                    flow_id,
+                    direction,
+                })
+            }
+        }
+        ClientMsg::TcpClosed {
+            session_id,
+            flow_id,
+            reason,
+        } => {
+            if sessions.contains_key(&session_id) {
+                relay_tcp_closed_to_agent(
+                    state,
+                    orig,
+                    sessions.get(&session_id),
+                    session_id,
+                    flow_id,
+                    reason,
+                )
+                .await;
+                None
+            } else {
+                Some(ClientMsg::TcpClosed {
+                    session_id,
+                    flow_id,
+                    reason,
+                })
+            }
+        }
+        ClientMsg::UdpClosed {
+            session_id,
+            flow_id,
+            reason,
+        } => {
+            if sessions.contains_key(&session_id) {
+                relay_udp_closed_to_agent(
+                    state,
+                    orig,
+                    sessions.get(&session_id),
+                    session_id,
+                    flow_id,
+                    reason,
+                )
+                .await;
+                None
+            } else {
+                Some(ClientMsg::UdpClosed {
+                    session_id,
+                    flow_id,
+                    reason,
+                })
+            }
+        }
+        ClientMsg::TunnelTerminate { session_id, reason } => {
+            if let Some(s) = sessions.remove(&session_id) {
+                // We originated this session — tear it down like the
+                // tunnel-client socket's terminate arm: tell the target
+                // agent, drop the reply-channel registration, audit close.
+                let _ = state.rc_hub.send_to_agent(
+                    s.agent_id,
+                    ServerMsg::TunnelTerminate {
+                        session_id: s.tunnel_session_id,
+                        reason,
+                    },
+                );
+                state.tunnel_clients_by_session.remove(&s.tunnel_session_id);
+                audit_peer_close(state, &s, orig).await;
+                None
+            } else {
+                Some(ClientMsg::TunnelTerminate { session_id, reason })
+            }
+        }
+        // Everything else — target-side answers + non-tunnel rc:* — passes
+        // through to the target-side interception / Hub.
+        other => Some(other),
+    }
+}
+
+/// Tear down every tunnel session an agent originated when its WS drops.
+/// Mirrors the tunnel-client socket's disconnect path: for each session,
+/// tell the target agent, drop the reply-channel registration, and audit
+/// the close. Consumes the map.
+pub(crate) async fn teardown_agent_originated_sessions(
+    state: &AppState,
+    orig: &Originator,
+    sessions: std::collections::HashMap<ObjectId, TunnelSession>,
+) {
+    for (_session_id, s) in sessions {
+        state.tunnel_clients_by_session.remove(&s.tunnel_session_id);
+        let _ = state.rc_hub.send_to_agent(
+            s.agent_id,
+            ServerMsg::TunnelTerminate {
+                session_id: s.tunnel_session_id,
+                reason: CloseReason::ClientShutdown,
+            },
+        );
+        audit_peer_close(state, &s, orig).await;
+    }
 }
