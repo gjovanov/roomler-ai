@@ -41,6 +41,9 @@ pub mod mux;
 pub mod overlay;
 pub mod policy;
 pub mod signaling;
+/// The tunnel-session driver's signaling seam — the cloneable sink + single-
+/// consumer source `run_tunnel_session` rides instead of owning a WebSocket.
+pub mod signaling_link;
 /// SOCKS5 server + client wire codec — the userspace-mode proxy + mesh chaining.
 pub mod socks5;
 pub mod transport;
