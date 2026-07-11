@@ -23,6 +23,8 @@ tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
 reqwest = { workspace = true }
 futures = { workspace = true }
+# Trait-object signaling seam impls (WsSink / WsSource) for the tunnel driver.
+async-trait = { workspace = true }
 
 # CLI + config
 clap = { workspace = true }

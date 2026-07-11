@@ -7047,6 +7047,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "smoltcp",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tokio-test",
@@ -7091,6 +7092,7 @@ name = "roomler-tunnel"
 version = "0.3.0-rc.161"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bson",
  "clap",
  "directories",
