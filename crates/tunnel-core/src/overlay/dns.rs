@@ -8,12 +8,21 @@
 //! `100.100.100.100`; the node's own overlay IP avoids an extra NIC-address
 //! assignment for v1).
 //!
-//! Hand-rolled A-record codec — no DNS-library dependency. We only need to parse
-//! the first question and build a single `A` answer for a hit; misses relay the
-//! raw bytes upstream, so the full RR machinery never has to exist here.
+//! Hand-rolled A/AAAA-record codec — no DNS-library dependency. We only need to
+//! parse the first question and build a single answer for a hit; misses relay
+//! the raw bytes upstream, so the full RR machinery never has to exist here.
+//!
+//! Dual-stack: an `AAAA` query for a known node answers its **derived** overlay
+//! IPv6 ([`derive_overlay_v6`]) — same map, no v6 state. Default-on;
+//! `ROOMLER_AGENT_DNS_AAAA=0` (read by the runtime into
+//! [`DnsConfig::answer_aaaa`]) reverts to A-only, the mixed-fleet escape hatch:
+//! an old peer's OS doesn't own its derived v6, so v6 toward it blackholes —
+//! happy-eyeballs apps fall back to A, strictly-sequential ones may hang.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
+
+use super::router::derive_overlay_v6;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -37,6 +46,9 @@ pub struct DnsConfig {
     pub upstream: SocketAddr,
     /// name → overlay IP.
     pub names: NameMap,
+    /// Answer `AAAA` for known nodes with their derived overlay IPv6. `false`
+    /// (the `ROOMLER_AGENT_DNS_AAAA=0` escape hatch) answers NODATA instead.
+    pub answer_aaaa: bool,
 }
 
 /// Parse an upstream nameserver — accepts a bare IP (`"1.1.1.1"`, defaults to
@@ -110,7 +122,8 @@ async fn build_response(query: &[u8], cfg: &DnsConfig) -> Option<Vec<u8>> {
             let names = cfg.names.read().await;
             return Some(match names.get(label) {
                 Some(ip) if q.qtype == 1 => build_a(query, q.qend, *ip),
-                Some(_) => build_status(query, q.qend, 0), // AAAA → NODATA
+                Some(ip) if cfg.answer_aaaa => build_aaaa(query, q.qend, derive_overlay_v6(*ip)),
+                Some(_) => build_status(query, q.qend, 0), // AAAA off → NODATA
                 None => build_status(query, q.qend, 3),    // NXDOMAIN
             });
         }
@@ -122,8 +135,10 @@ async fn build_response(query: &[u8], cfg: &DnsConfig) -> Option<Vec<u8>> {
             if let Some(ip) = names.get(&q.qname) {
                 return Some(if q.qtype == 1 {
                     build_a(query, q.qend, *ip)
+                } else if cfg.answer_aaaa {
+                    build_aaaa(query, q.qend, derive_overlay_v6(*ip))
                 } else {
-                    build_status(query, q.qend, 0) // AAAA → NODATA
+                    build_status(query, q.qend, 0) // AAAA off → NODATA
                 });
             }
         }
@@ -191,6 +206,19 @@ fn build_a(query: &[u8], qend: usize, ip: Ipv4Addr) -> Vec<u8> {
     out.extend_from_slice(&[0, 1]); // CLASS IN
     out.extend_from_slice(&[0, 0, 0, 60]); // TTL 60s
     out.extend_from_slice(&[0, 4]); // RDLENGTH
+    out.extend_from_slice(&ip.octets());
+    out
+}
+
+/// Positive `AAAA` answer — the node's derived overlay IPv6 (same shape as
+/// [`build_a`], TYPE 28 / RDLENGTH 16).
+fn build_aaaa(query: &[u8], qend: usize, ip: std::net::Ipv6Addr) -> Vec<u8> {
+    let mut out = resp_header_and_question(query, qend, 1, 0);
+    out.extend_from_slice(&[0xC0, 0x0C]); // NAME → question at offset 12
+    out.extend_from_slice(&[0, 28]); // TYPE AAAA
+    out.extend_from_slice(&[0, 1]); // CLASS IN
+    out.extend_from_slice(&[0, 0, 0, 60]); // TTL 60s
+    out.extend_from_slice(&[0, 16]); // RDLENGTH
     out.extend_from_slice(&ip.octets());
     out
 }
@@ -396,6 +424,7 @@ mod tests {
             magic_domain: "myorg.roomler.net".into(),
             upstream: "127.0.0.1:0".parse().unwrap(),
             names: Arc::new(RwLock::new(map)),
+            answer_aaaa: true,
         };
 
         let hit = build_response(&query_for("neo16.myorg.roomler.net", 1), &cfg)
@@ -412,6 +441,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aaaa_answers_derived_v6_and_kill_switch_reverts_to_nodata() {
+        let mut map = HashMap::new();
+        map.insert("neo16".to_string(), Ipv4Addr::new(100, 64, 0, 7));
+        let mut cfg = DnsConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            magic_domain: "myorg.roomler.net".into(),
+            upstream: "127.0.0.1:0".parse().unwrap(),
+            names: Arc::new(RwLock::new(map)),
+            answer_aaaa: true,
+        };
+
+        // In-zone AAAA → one answer whose RDATA is the DERIVED overlay v6.
+        let hit = build_response(&query_for("neo16.myorg.roomler.net", 28), &cfg)
+            .await
+            .unwrap();
+        assert_eq!(u16::from_be_bytes([hit[6], hit[7]]), 1); // one answer
+        let want = derive_overlay_v6(Ipv4Addr::new(100, 64, 0, 7)).octets();
+        assert_eq!(&hit[hit.len() - 16..], &want);
+        // The answer RR's TYPE field is AAAA (28).
+        let rr = hit.len() - 16 - 10; // RDATA(16) + RDLEN(2)+TTL(4)+CLASS(2)+TYPE(2)
+        assert_eq!(&hit[rr..rr + 2], &[0, 28]);
+
+        // Bare label AAAA resolves the same way.
+        let bare = build_response(&query_for("neo16", 28), &cfg).await.unwrap();
+        assert_eq!(&bare[bare.len() - 16..], &want);
+
+        // Unknown in-zone name stays NXDOMAIN on AAAA too.
+        let miss = build_response(&query_for("ghost.myorg.roomler.net", 28), &cfg)
+            .await
+            .unwrap();
+        assert_eq!(miss[3] & 0x0F, 3);
+
+        // Kill switch: AAAA → NODATA (name exists, zero answers, rcode 0).
+        cfg.answer_aaaa = false;
+        let off = build_response(&query_for("neo16.myorg.roomler.net", 28), &cfg)
+            .await
+            .unwrap();
+        assert_eq!(off[3] & 0x0F, 0);
+        assert_eq!(u16::from_be_bytes([off[6], off[7]]), 0);
+        // A records are unaffected by the switch.
+        let a = build_response(&query_for("neo16.myorg.roomler.net", 1), &cfg)
+            .await
+            .unwrap();
+        assert_eq!(&a[a.len() - 4..], &[100, 64, 0, 7]);
+    }
+
+    #[tokio::test]
     async fn bare_known_label_resolves() {
         let mut map = HashMap::new();
         map.insert("neo16".to_string(), Ipv4Addr::new(100, 64, 0, 9));
@@ -420,6 +496,7 @@ mod tests {
             magic_domain: "myorg.roomler.net".into(),
             upstream: "127.0.0.1:0".parse().unwrap(),
             names: Arc::new(RwLock::new(map)),
+            answer_aaaa: true,
         };
         let resp = build_response(&query_for("neo16", 1), &cfg).await.unwrap();
         assert_eq!(&resp[resp.len() - 4..], &[100, 64, 0, 9]);

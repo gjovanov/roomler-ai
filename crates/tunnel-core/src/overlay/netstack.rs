@@ -102,36 +102,11 @@ const ICMP_META: usize = 8;
 /// Payload carried in each echo request (the peer echoes it back verbatim).
 const PING_PAYLOAD: &[u8] = b"roomler-netstack-ping";
 
-/// Roomler's overlay IPv6 ULA — `fd72:6f6f:6d6c::/48` (`fd` + ASCII "rooml").
-/// A node's overlay v6 is its overlay v4 embedded in the low 32 bits of the
-/// fixed `/96` inside this ULA, so v6 is *derived*, never separately allocated
-/// (see `docs/netstack-ipv6-plan.md`). Pinned once — every derived address
-/// bakes it in, so it must never change.
-const OVERLAY_ULA_HEXTETS: [u16; 6] = [0xfd72, 0x6f6f, 0x6d6c, 0, 0, 0];
-/// On-link prefix for the derived-v6 network: the fixed `/96` (48-bit ULA + 48
-/// zero bits). Assigning the iface this prefix makes every peer's
-/// `fd72:6f6f:6d6c::<their-v4>` on-link — the v6 mirror of how the v4 network
-/// prefix makes peers on-link, so no route table is needed for peer traffic.
-const OVERLAY_V6_ONLINK_PREFIX: u8 = 96;
-
-/// Derive a node's overlay IPv6 from its overlay IPv4: embed the 32-bit v4 in
-/// the low 32 bits of Roomler's ULA `/96` (`fd72:6f6f:6d6c::<v4>`). Deterministic
-/// and reversible, so a node self-derives its own v6 and every peer's v6 from
-/// the v4 the server already assigns — no server allocation, no wire change.
-pub fn derive_overlay_v6(v4: Ipv4Addr) -> Ipv6Addr {
-    let o = v4.octets();
-    let [a, b, c, d, e, f] = OVERLAY_ULA_HEXTETS;
-    Ipv6Addr::new(
-        a,
-        b,
-        c,
-        d,
-        e,
-        f,
-        u16::from_be_bytes([o[0], o[1]]),
-        u16::from_be_bytes([o[2], o[3]]),
-    )
-}
+use super::router::OVERLAY_V6_ONLINK_PREFIX;
+/// Overlay-v6 derivation lives in [`super::router`] (compiled under plain
+/// `overlay`, where the crypto-router unmaps derived-v6 destinations); this
+/// re-export keeps `netstack::derive_overlay_v6` working for existing callers.
+pub use super::router::derive_overlay_v6;
 
 // ===========================================================================
 // Device — a smoltcp `phy::Device` backed by two packet queues.
@@ -1386,6 +1361,86 @@ mod tests {
         )
         .await
         .expect("round trip over the WG bridge in time");
+    }
+
+    /// The Phase B proof: **IPv6 rides the same WG mesh with no v6 routing
+    /// state**. A dials B's *derived* overlay v6; the outbound path unmaps the
+    /// ULA destination to B's embedded v4 ([`Router::dst_of_ip_packet`]) and
+    /// routes on the ordinary v4 table; B's decapsulate delivers the v6 packet
+    /// (`WriteToTunnelV6`) to its dual-addressed netstack. TCP echo + ICMPv6
+    /// ping both round-trip — the peers were installed with v4 ONLY.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bridge_v6_tcp_echo_and_ping_over_wireguard() {
+        use crate::overlay::WgKeypair;
+        use crate::overlay::bridge::run_bridge;
+        use crate::overlay::router::Router;
+        use crate::overlay::wg::{Carrier, WgDevice};
+        use tokio::net::UdpSocket;
+
+        let a_ip = Ipv4Addr::new(100, 64, 0, 1);
+        let b_ip = Ipv4Addr::new(100, 64, 0, 2);
+
+        let ka = WgKeypair::generate();
+        let kb = WgKeypair::generate();
+        let sock_a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sock_b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr_a = sock_a.local_addr().unwrap();
+        let addr_b = sock_b.local_addr().unwrap();
+        let (mut dev_a, rx_a) = WgDevice::new(ka.secret.clone());
+        let (mut dev_b, rx_b) = WgDevice::new(kb.secret.clone());
+        // v4-only peer install — exactly what the runtime does today.
+        dev_a.add_peer(
+            kb.public.to_bytes(),
+            b_ip,
+            Carrier::direct(sock_a.clone(), addr_b),
+            true,
+        );
+        dev_b.add_peer(
+            ka.public.to_bytes(),
+            a_ip,
+            Carrier::direct(sock_b.clone(), addr_a),
+            false,
+        );
+        let (dev_a, dev_b) = (Arc::new(dev_a), Arc::new(dev_b));
+
+        let a = Netstack::start(a_ip, 10, 1280);
+        let b = Netstack::start(b_ip, 10, 1280);
+        tokio::spawn(run_bridge(a.tun.clone() as Arc<dyn TunIo>, dev_a, rx_a));
+        tokio::spawn(run_bridge(b.tun.clone() as Arc<dyn TunIo>, dev_b, rx_b));
+
+        let b_v6 = derive_overlay_v6(b_ip);
+        // Sanity: the routing key a v6 packet resolves to is B's v4.
+        let mut probe = [0u8; 40];
+        probe[0] = 0x60;
+        probe[24..40].copy_from_slice(&b_v6.octets());
+        assert_eq!(Router::dst_of_ip_packet(&probe), Some(b_ip));
+
+        let mut listener = b.handle.listen(3389).await.unwrap();
+        tokio::spawn(async move {
+            if let Some(s) = listener.accept().await {
+                echo(s).await;
+            }
+        });
+
+        // TCP echo over the derived v6, through the real WG pair.
+        let dst = SocketAddr::new(IpAddr::V6(b_v6), 3389);
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            round_trip(&a.handle, dst, b"v6-over-userspace-wireguard"),
+        )
+        .await
+        .expect("v6 round trip over the WG bridge in time");
+
+        // ICMPv6 ping over the same path — B's iface auto-answers.
+        let rtt = tokio::time::timeout(
+            Duration::from_secs(10),
+            a.handle.ping(IpAddr::V6(b_v6), Duration::from_secs(8)),
+        )
+        .await
+        .expect("v6 ping over the WG bridge completes in time")
+        .expect("v6 ping over the WG bridge succeeds");
+        assert!(rtt < Duration::from_secs(8), "rtt within the timeout");
+        let _keep = b;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
