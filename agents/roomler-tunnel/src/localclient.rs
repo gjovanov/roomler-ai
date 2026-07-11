@@ -90,6 +90,60 @@ pub async fn ping(target: &str, timeout_ms: u64, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// `roomler forward --daemon --agent <node> --local L --remote R` — ask the
+/// LOCAL daemon to open + supervise a static forward over its OWN agent WS
+/// (identity model b: no separate tunnel-client token — the pipe/socket ACL is
+/// the trust boundary). Returns as soon as the daemon registers the flow; the
+/// flow runs IN the daemon and survives this CLI's exit. `roomler flows` shows
+/// it; `roomler kill <id>` stops it. A daemon-side error (bad node/remote, port
+/// in use) surfaces verbatim; only a *connect* failure maps through [`daemon_err`].
+pub async fn create_forward(node: &str, local: u16, remote: &str, transport: &str) -> Result<()> {
+    let mut client = localapi::connect().await.map_err(daemon_err)?;
+    let id = client
+        .create_forward(node, local, remote, transport)
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
+    println!("forward created: {id}");
+    println!(
+        "  127.0.0.1:{local} → {remote}  via node {}",
+        short_id(node)
+    );
+    println!("  roomler flows          # show it");
+    println!("  roomler kill {id}      # stop it");
+    Ok(())
+}
+
+/// `roomler socks5 --daemon --agent <node> --local L` — ask the LOCAL daemon to
+/// open + supervise a SOCKS5 listener (userspace mode; per-connection target)
+/// toward `node`. Same lifecycle as [`create_forward`].
+pub async fn create_socks5(node: &str, local: u16, transport: &str) -> Result<()> {
+    let mut client = localapi::connect().await.map_err(daemon_err)?;
+    let id = client
+        .create_socks5(node, local, transport)
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
+    println!("socks5 listener created: {id}");
+    println!(
+        "  127.0.0.1:{local} → node {} (per-connection target)",
+        short_id(node)
+    );
+    println!("  roomler flows          # show it");
+    println!("  roomler kill {id}      # stop it");
+    Ok(())
+}
+
+/// `roomler kill <flow-id>` — stop + deregister a daemon flow. Reports whether
+/// the id matched.
+pub async fn kill(id: &str) -> Result<()> {
+    let mut client = localapi::connect().await.map_err(daemon_err)?;
+    if client.kill_flow(id).await.map_err(daemon_err)? {
+        println!("killed flow {id}");
+    } else {
+        println!("no active flow with id {id}");
+    }
+    Ok(())
+}
+
 /// Map a LocalAPI connect/IO error to a user-facing one. A missing daemon is an
 /// *expected* state, so `NotFound` collapses to a single clean line with **no**
 /// `.source()` chain (the raw "The system cannot find the file specified" /

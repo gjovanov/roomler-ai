@@ -45,6 +45,17 @@ impl From<CliTransport> for forward::TransportPref {
     }
 }
 
+impl CliTransport {
+    /// The lowercase wire word the daemon's LocalAPI `create_*` verbs expect.
+    fn as_word(self) -> &'static str {
+        match self {
+            CliTransport::Auto => "auto",
+            CliTransport::Quic => "quic",
+            CliTransport::Webrtc => "webrtc",
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "roomler-tunnel", version, about, long_about = None)]
 struct Cli {
@@ -97,6 +108,13 @@ enum Command {
         /// only attempts QUIC against agents that actually support it.
         #[arg(long, value_enum, default_value = "auto")]
         transport: CliTransport,
+        /// Hand the forward to the LOCAL daemon over the LocalAPI instead of
+        /// running it in this process: the daemon opens it over its own agent
+        /// WS (no tunnel-client token needed) + supervises it, and this command
+        /// returns immediately. The flow survives this CLI's exit — manage it
+        /// with `flows` / `kill`. (Becomes the default at the P3d rename.)
+        #[arg(long)]
+        daemon: bool,
     },
     /// Run a local SOCKS5 proxy ("userspace mode"): apps point at
     /// `127.0.0.1:<local>` and each connection's SOCKS5 CONNECT target is dialed
@@ -117,6 +135,17 @@ enum Command {
         /// QUIC with WebRTC-DC fallback).
         #[arg(long, value_enum, default_value = "auto")]
         transport: CliTransport,
+        /// Hand the listener to the LOCAL daemon over the LocalAPI (see
+        /// `forward --daemon`). Requires `--agent` (daemon mesh mode is a later
+        /// slice); returns immediately, manage with `flows` / `kill`.
+        #[arg(long)]
+        daemon: bool,
+    },
+    /// Stop a daemon-run forward / SOCKS5 listener by its flow id (from
+    /// `flows`). Talks to the LOCAL daemon over the LocalAPI — no config/token.
+    Kill {
+        /// Flow id to stop (as shown in the `flows` `ID` column).
+        id: String,
     },
     /// Read a multi-forward config from disk and run all forwards as
     /// persistent listeners. Auto-reconnects on transient failure.
@@ -201,22 +230,38 @@ async fn main() -> Result<()> {
             local,
             remote,
             transport,
+            daemon,
         } => {
-            let cfg = config::load(cli.config).context("loading tunnel config")?;
-            forward::run(cfg, &agent, local, &remote, transport.into()).await
+            if daemon {
+                // Thin-client path: hand it to the local daemon over the
+                // LocalAPI (no config/token — the pipe ACL is the boundary).
+                localclient::create_forward(&agent, local, &remote, transport.as_word()).await
+            } else {
+                let cfg = config::load(cli.config).context("loading tunnel config")?;
+                forward::run(cfg, &agent, local, &remote, transport.into()).await
+            }
         }
         Command::Socks5 {
             agent,
             local,
             transport,
+            daemon,
         } => {
-            let cfg = config::load(cli.config).context("loading tunnel config")?;
-            let transport = transport.into();
-            match agent {
-                Some(agent) => forward::run_socks5(cfg, &agent, local, transport).await,
-                None => mesh::run_mesh(cfg, local, transport).await,
+            if daemon {
+                let node = agent.context(
+                    "--daemon socks5 requires --agent (daemon mesh mode is a later slice)",
+                )?;
+                localclient::create_socks5(&node, local, transport.as_word()).await
+            } else {
+                let cfg = config::load(cli.config).context("loading tunnel config")?;
+                let transport = transport.into();
+                match agent {
+                    Some(agent) => forward::run_socks5(cfg, &agent, local, transport).await,
+                    None => mesh::run_mesh(cfg, local, transport).await,
+                }
             }
         }
+        Command::Kill { id } => localclient::kill(&id).await,
         Command::Run {} => bail!("T3: multi-forward `run` not yet wired"),
         Command::Diagnose { agent } => {
             bail!("T3: diagnose not yet wired (agent={:?})", agent);
@@ -348,6 +393,7 @@ mod tests {
                 local,
                 remote,
                 transport,
+                daemon,
             } => {
                 assert_eq!(agent, "507f1f77bcf86cd799439011");
                 assert_eq!(local, 5432);
@@ -355,6 +401,8 @@ mod tests {
                 // No --transport given → default is auto (prefer QUIC,
                 // fall back to WebRTC on setup failure).
                 assert_eq!(transport, CliTransport::Auto);
+                // No --daemon → in-process standalone (the current default).
+                assert!(!daemon);
             }
             other => panic!("expected Forward, got {other:?}"),
         }
@@ -422,10 +470,12 @@ mod tests {
                 agent,
                 local,
                 transport,
+                daemon,
             } => {
                 assert_eq!(agent.as_deref(), Some("507f1f77bcf86cd799439011"));
                 assert_eq!(local, 1080);
                 assert_eq!(transport, CliTransport::Auto);
+                assert!(!daemon);
             }
             other => panic!("expected Socks5, got {other:?}"),
         }
@@ -441,6 +491,42 @@ mod tests {
             }
             other => panic!("expected Socks5, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_forward_daemon_flag() {
+        let cli = Cli::try_parse_from([
+            "roomler-tunnel",
+            "forward",
+            "--agent",
+            "507f1f77bcf86cd799439011",
+            "--local",
+            "5432",
+            "--remote",
+            "10.0.0.5:5432",
+            "--daemon",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Forward { daemon, .. } => assert!(daemon),
+            other => panic!("expected Forward, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_kill_verb() {
+        let cli = Cli::try_parse_from(["roomler-tunnel", "kill", "fl-7"]).unwrap();
+        match cli.command {
+            Command::Kill { id } => assert_eq!(id, "fl-7"),
+            other => panic!("expected Kill, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transport_as_word_matches_localapi_wire() {
+        assert_eq!(CliTransport::Auto.as_word(), "auto");
+        assert_eq!(CliTransport::Quic.as_word(), "quic");
+        assert_eq!(CliTransport::Webrtc.as_word(), "webrtc");
     }
 
     #[test]
