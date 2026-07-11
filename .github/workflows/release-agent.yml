@@ -217,6 +217,30 @@ jobs:
         # Linux/WSL counterpart to the Windows MF/vcpkg HEVC path.
         run: cargo build -p roomler-agent --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack,ffmpeg-encoder"
 
+      - name: Bundle FFmpeg into the .deb (self-contained, RPATH)
+        run: |
+          set -euo pipefail
+          # Ubuntu 24.04 ships FFmpeg 6.1 (libavcodec.so.60) but the agent links
+          # 8.1.2 (libavcodec.so.62), so the .deb must CARRY its own FFmpeg or it
+          # won't start on a stock box. Ship each lib under its SONAME as a real
+          # file (no symlinks) into /usr/lib/roomler-agent; RPATH wires it up.
+          sudo apt-get update -qq && sudo apt-get install -y patchelf
+          dst=agents/roomler-agent/vendor-ffmpeg
+          rm -rf "$dst" && mkdir -p "$dst"
+          for real in $(find /opt/roomler-ffmpeg/lib -maxdepth 1 -type f -name 'lib*.so.*'); do
+            soname=$(patchelf --print-soname "$real")
+            cp "$real" "$dst/$soname"
+          done
+          # Each FFmpeg lib finds its siblings in the same dir ($ORIGIN); the
+          # binary finds them at the absolute install dir. Only glibc-family
+          # deps remain external (audited) — the HW encoders (nvenc/qsv/amf/
+          # vaapi/vulkan) dlopen their driver libs at runtime, so no extra
+          # .deb `depends` are needed.
+          for lib in "$dst"/*.so.*; do patchelf --set-rpath '$ORIGIN' "$lib"; done
+          patchelf --set-rpath '/usr/lib/roomler-agent' target/release/roomler-agent
+          echo "bundled: $(ls "$dst" | tr '\n' ' ')"
+          echo "binary RUNPATH -> $(patchelf --print-rpath target/release/roomler-agent)"
+
       - name: Build .deb
         working-directory: agents/roomler-agent
         run: cargo deb --no-build --no-strip
