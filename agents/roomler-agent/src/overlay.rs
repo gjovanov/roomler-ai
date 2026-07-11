@@ -65,7 +65,10 @@ pub fn maybe_start(
     // Either surface can be absent at build time; the helper warns + `None`s,
     // and `?` aborts the (mis)configured start.
     let tun_factory: TunFactory = match netstack_socks_port() {
-        Some(port) => netstack_tun_factory(port)?,
+        // Give the netstack SOCKS front a live mesh view so it can resolve
+        // DOMAIN targets (peer name / MagicDNS FQDN → overlay IP). Same channel
+        // the runtime publishes to below, so it's stable across reconnects.
+        Some(port) => netstack_tun_factory(port, peer_view.subscribe())?,
         None => systun_tun_factory()?,
     };
     let rt = OverlayRuntime::new_relay(keypair, outbound, tun_factory, OVERLAY_MTU)
@@ -112,7 +115,10 @@ fn systun_tun_factory() -> Option<TunFactory> {
 /// userspace stack and publishes its handle to the process-wide loopback SOCKS
 /// front (bound once), so the front outlives reconnects without rebinding.
 #[cfg(feature = "overlay-netstack")]
-fn netstack_tun_factory(socks_port: u16) -> Option<TunFactory> {
+fn netstack_tun_factory(
+    socks_port: u16,
+    view_rx: watch::Receiver<OverlayView>,
+) -> Option<TunFactory> {
     use std::net::Ipv4Addr;
     use tunnel_core::overlay::netstack::{Netstack, NetstackHandle};
     use tunnel_core::overlay::netstack_socks::serve_socks5;
@@ -120,7 +126,7 @@ fn netstack_tun_factory(socks_port: u16) -> Option<TunFactory> {
     static SOCKS: std::sync::OnceLock<watch::Sender<Option<NetstackHandle>>> =
         std::sync::OnceLock::new();
     let handle_tx = SOCKS
-        .get_or_init(|| {
+        .get_or_init(move || {
             let (tx, rx) = watch::channel::<Option<NetstackHandle>>(None);
             tokio::spawn(async move {
                 match tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, socks_port)).await {
@@ -129,7 +135,7 @@ fn netstack_tun_factory(socks_port: u16) -> Option<TunFactory> {
                             port = socks_port,
                             "overlay netstack: SOCKS5 front on 127.0.0.1"
                         );
-                        serve_socks5(rx, l).await;
+                        serve_socks5(rx, view_rx, l).await;
                     }
                     Err(e) => {
                         warn!(port = socks_port, error = %e, "overlay netstack: SOCKS bind failed")
@@ -148,7 +154,10 @@ fn netstack_tun_factory(socks_port: u16) -> Option<TunFactory> {
     }))
 }
 #[cfg(not(feature = "overlay-netstack"))]
-fn netstack_tun_factory(_socks_port: u16) -> Option<TunFactory> {
+fn netstack_tun_factory(
+    _socks_port: u16,
+    _view_rx: watch::Receiver<OverlayView>,
+) -> Option<TunFactory> {
     warn!(
         "overlay: netstack mode requested (ROOMLER_AGENT_OVERLAY_NETSTACK_SOCKS set) \
          but this build lacks `overlay-netstack`; not joining"
