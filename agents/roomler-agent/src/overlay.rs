@@ -111,6 +111,19 @@ fn systun_tun_factory() -> Option<TunFactory> {
     None
 }
 
+/// Process-wide netstack handle channel — the live [`NetstackHandle`], (re)
+/// published on each overlay connect. A `OnceLock` so the SOCKS front (below)
+/// and the [`netstack_pinger`] `ping` backend share ONE channel regardless of
+/// which touches it first.
+#[cfg(feature = "overlay-netstack")]
+fn ns_handle_tx() -> &'static watch::Sender<Option<tunnel_core::overlay::netstack::NetstackHandle>>
+{
+    static NS_HANDLE: std::sync::OnceLock<
+        watch::Sender<Option<tunnel_core::overlay::netstack::NetstackHandle>>,
+    > = std::sync::OnceLock::new();
+    NS_HANDLE.get_or_init(|| watch::channel(None).0)
+}
+
 /// Netstack factory (`overlay-netstack`): each (re)connect builds a fresh
 /// userspace stack and publishes its handle to the process-wide loopback SOCKS
 /// front (bound once), so the front outlives reconnects without rebinding.
@@ -120,37 +133,68 @@ fn netstack_tun_factory(
     view_rx: watch::Receiver<OverlayView>,
 ) -> Option<TunFactory> {
     use std::net::Ipv4Addr;
-    use tunnel_core::overlay::netstack::{Netstack, NetstackHandle};
+    use tunnel_core::overlay::netstack::Netstack;
     use tunnel_core::overlay::netstack_socks::serve_socks5;
 
-    static SOCKS: std::sync::OnceLock<watch::Sender<Option<NetstackHandle>>> =
-        std::sync::OnceLock::new();
-    let handle_tx = SOCKS
-        .get_or_init(move || {
-            let (tx, rx) = watch::channel::<Option<NetstackHandle>>(None);
-            tokio::spawn(async move {
-                match tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, socks_port)).await {
-                    Ok(l) => {
-                        info!(
-                            port = socks_port,
-                            "overlay netstack: SOCKS5 front on 127.0.0.1"
-                        );
-                        serve_socks5(rx, view_rx, l).await;
-                    }
-                    Err(e) => {
-                        warn!(port = socks_port, error = %e, "overlay netstack: SOCKS bind failed")
-                    }
+    // Bind the loopback SOCKS front exactly once, subscribing to the shared
+    // handle channel so it always serves whatever stack is currently live.
+    static SOCKS_BOUND: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    SOCKS_BOUND.get_or_init(move || {
+        let handle_rx = ns_handle_tx().subscribe();
+        tokio::spawn(async move {
+            match tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, socks_port)).await {
+                Ok(l) => {
+                    info!(
+                        port = socks_port,
+                        "overlay netstack: SOCKS5 front on 127.0.0.1"
+                    );
+                    serve_socks5(handle_rx, view_rx, l).await;
                 }
-            });
-            tx
-        })
-        .clone();
+                Err(e) => {
+                    warn!(port = socks_port, error = %e, "overlay netstack: SOCKS bind failed")
+                }
+            }
+        });
+    });
 
     Some(Box::new(move |ip, nm, mtu| {
         let ns = Netstack::start(ip, netmask_to_prefix(nm), mtu);
-        let _ = handle_tx.send(Some(ns.handle.clone()));
+        let _ = ns_handle_tx().send(Some(ns.handle.clone()));
         info!(%ip, socks_port, "overlay netstack: userspace stack up (OS-free)");
         Ok(ns.tun as Arc<dyn TunIo>)
+    }))
+}
+
+/// The netstack ICMP backend for the `roomler ping` LocalAPI verb, watching the
+/// shared handle channel. `None` unless this node is in netstack mode
+/// (`ROOMLER_AGENT_OVERLAY_NETSTACK_SOCKS` set) — an OS-TUN node has no OS-free
+/// ICMP path (the OS `ping` works there).
+#[cfg(feature = "overlay-netstack")]
+pub fn netstack_pinger() -> Option<Arc<dyn crate::localapi_state::NetstackPinger>> {
+    use std::net::Ipv4Addr;
+    use std::time::Duration;
+    use tunnel_core::overlay::netstack::NetstackHandle;
+
+    // Only meaningful in netstack mode; `?` short-circuits to `None` otherwise.
+    netstack_socks_port()?;
+
+    struct NsPinger {
+        handle: watch::Receiver<Option<NetstackHandle>>,
+    }
+    #[async_trait::async_trait]
+    impl crate::localapi_state::NetstackPinger for NsPinger {
+        async fn ping(&self, dst: Ipv4Addr, timeout: Duration) -> Result<Duration, String> {
+            let handle = self
+                .handle
+                .borrow()
+                .clone()
+                .ok_or_else(|| "netstack not up yet (mesh not joined)".to_string())?;
+            handle.ping(dst, timeout).await.map_err(|e| e.to_string())
+        }
+    }
+
+    Some(Arc::new(NsPinger {
+        handle: ns_handle_tx().subscribe(),
     }))
 }
 #[cfg(not(feature = "overlay-netstack"))]
