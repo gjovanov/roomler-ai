@@ -42,15 +42,29 @@
 //!   wall holds for an agent origin (a tenant-1 agent must not open a
 //!   tunnel to a tenant-2 agent).
 //!
-//! WebRTC DC round-trip (agent + tunnel-client + echo server +
-//! TCP byte exchange) is NOT covered here — the existing in-process
-//! ICE flakiness in `agent_tests::agent_answers_sdp_offer_with_real_
-//! webrtc_peer` (see its "best-effort" comment) makes it too
-//! unstable for CI without a TURN fixture. Cluster-side validation
-//! happens via the Phase 5 cluster harness (Chunk 5B, follow-on).
+//! * `agent_daemon_originated_forward_reaches_target` (P3b-2 PR-C) — the
+//!   DAEMON consumer end-to-end: origin A's REAL signaling loop runs with a
+//!   `TunnelClientHub`, the test drives `create_forward` on it (the LocalAPI
+//!   verb's path), and target B receives the relayed `rc:tunnel.sdp.offer` —
+//!   proving `create_forward` → nonce-stamped open → agent authz →
+//!   `rc:tunnel.opened` demuxed BACK BY NONCE → peer + offer → relay. Also
+//!   asserts `flows()` reflects the flow + `kill_flow` tears it down.
+//!
+//! Full WebRTC DC round-trip (echo server + TCP byte exchange) is NOT covered
+//! here — the in-process ICE flakiness in
+//! `agent_tests::agent_answers_sdp_offer_with_real_webrtc_peer` (see its
+//! "best-effort" comment) makes DC-pool establishment too unstable for CI
+//! without a TURN fixture. The PR-C test above stops at the offer (sent
+//! pre-ICE, so it's robust) and kills the flow before the flaky pool wait; the
+//! byte-level data plane is validated on real hosts via the `tunnel-fleet-test`
+//! field gate.
 
 use crate::fixtures::test_app::TestApp;
 use futures::{SinkExt, StreamExt};
+use roomler_agent::config::AgentConfig;
+use roomler_agent::encode::EncoderPreference;
+use roomler_agent::tunnel::client_mgr::TunnelClientHub;
+use roomler_agent::{enrollment, signaling};
 use serde_json::{Value, json};
 use std::time::Duration;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
@@ -663,4 +677,162 @@ async fn agent_tunnel_open_cross_tenant_rejected() {
         Some("cross_tenant"),
         "cross-tenant open must be refused with code=cross_tenant"
     );
+}
+
+/// Enroll an agent via the agent LIBRARY (returns a full `AgentConfig` pointed
+/// at the test server), so we can run its real `signaling::run` loop in-process.
+/// Mirrors `agent_tests::enrol_via_agent_lib` (duplicated so the tunnel suite
+/// stands alone).
+async fn enrol_agent_lib(
+    app: &TestApp,
+    seeded: &crate::fixtures::seed::SeededTenant,
+    machine_id: &str,
+    machine_name: &str,
+) -> AgentConfig {
+    let et: Value = app
+        .auth_post(
+            &format!("/api/tenant/{}/agent/enroll-token", seeded.tenant_id),
+            &seeded.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    enrollment::enroll(enrollment::EnrollInputs {
+        server_url: &app.base_url,
+        enrollment_token: et["enrollment_token"].as_str().unwrap(),
+        machine_id,
+        machine_name,
+    })
+    .await
+    .expect("agent enrollment")
+}
+
+/// Run the origin agent's real signaling loop with a caller-supplied
+/// [`TunnelClientHub`] (so the test can drive `create_forward` on the SAME hub
+/// the loop publishes its egress into). Mirrors
+/// `agent_tests::spawn_agent_signaling` + the extra P3b-2 PR-C hub arg.
+fn spawn_origin_signaling(
+    cfg: AgentConfig,
+    hub: TunnelClientHub,
+    stop_rx: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (view_tx, _view_rx) = tokio::sync::watch::channel(Default::default());
+        let broker = roomler_agent::consent::ConsentBroker::new(
+            roomler_agent::consent::Mode::AutoGrant,
+            std::env::temp_dir().join(format!("roomler-test-consent-{}", cfg.agent_id)),
+        )
+        .expect("consent broker init");
+        let _ = signaling::run(
+            cfg,
+            EncoderPreference::Software,
+            stop_rx,
+            connected,
+            view_tx,
+            broker,
+            hub,
+        )
+        .await;
+    })
+}
+
+/// A free loopback TCP port (bind :0 → read the port → drop). The daemon's
+/// `create_forward` re-binds it; the tiny window is a non-issue in a test.
+async fn free_local_port() -> u16 {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    drop(l);
+    port
+}
+
+#[tokio::test]
+async fn agent_daemon_originated_forward_reaches_target() {
+    // P3b-2 PR-C — the DAEMON consumer, end-to-end. Origin agent A runs its REAL
+    // signaling loop with a `TunnelClientHub`; the test drives `create_forward`
+    // on that same hub (as the LocalAPI verb does). This exercises the full
+    // daemon-origination path through BOTH the PR-B2 server code and the PR-C
+    // client code:
+    //   create_forward → supervised session → DaemonSink stamps `open_nonce`
+    //   onto rc:tunnel.open → server relay_tunnel_client_msg_from_agent →
+    //   Principal::Agent authz (all_users policy) → rc:tunnel.opened →
+    //   client_mgr::intercept_server_msg demuxes it BACK BY NONCE → the driver
+    //   builds its peer + sends the SDP offer → the server relays it to target B.
+    // Asserting B receives rc:tunnel.sdp.offer is robust: the offer is sent right
+    // after create_offer(), NOT gated on ICE completion (the in-process-ICE
+    // flakiness the suite avoids happens later, at DC-pool establishment, which
+    // this test never reaches — it kills the flow first).
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("p3b2c-daemon-orig").await;
+
+    // all_users loopback policy authorizes A's agent principal to reach B.
+    let policy = json!({
+        "name": "allow-loopback",
+        "subjects": [{ "kind": "all_users" }],
+        "targets": [{ "kind": "all_agents" }],
+        "allowlist": [{
+            "host_pattern": { "kind": "cidr", "value": "127.0.0.0/8" },
+            "port_range": { "low": 9000, "high": 9999 }
+        }],
+        "max_concurrent_flows": 32,
+        "max_bytes_per_session": 1048576
+    });
+    app.auth_post(
+        &format!("/api/tenant/{}/tunnel-policy", seeded.tenant_id),
+        &seeded.admin.access_token,
+    )
+    .json(&policy)
+    .send()
+    .await
+    .unwrap();
+
+    // Target B: a raw agent WS that will receive the relayed offer.
+    let (b_id, b_tok) = enroll_agent(&app, &seeded, "mach-p3b2c-B", "target-B").await;
+    let mut b_ws = connect_agent_ws(&app, &b_tok, "target-B").await;
+    wait_agent_online(&app, &seeded, &b_id).await;
+
+    // Origin A: its REAL signaling loop + the hub we drive.
+    let a_cfg = enrol_agent_lib(&app, &seeded, "mach-p3b2c-A", "origin-A").await;
+    let a_id = a_cfg.agent_id.clone();
+    let hub = TunnelClientHub::new("0.3.0-test".into());
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let sig = spawn_origin_signaling(a_cfg, hub.clone(), stop_rx);
+    wait_agent_online(&app, &seeded, &a_id).await;
+
+    // Drive the daemon consumer: open a forward to B over A's own agent WS.
+    let local = free_local_port().await;
+    let flow_id = hub
+        .create_forward(&b_id, local, "127.0.0.1:9000", "webrtc")
+        .await
+        .expect("create_forward registers the flow");
+
+    // `flows()` reflects the live flow (structural fields; throughput is P3b-3).
+    let snap = hub.flows_snapshot();
+    assert_eq!(snap.len(), 1);
+    assert_eq!(snap[0].id, flow_id);
+    assert_eq!(snap[0].target.as_deref(), Some("127.0.0.1:9000"));
+    assert_eq!(snap[0].node.as_deref(), Some(b_id.as_str()));
+
+    // The offer must reach target B — proving nonce demux + agent authz + relay.
+    let offer = read_until(&mut b_ws, "rc:tunnel.sdp.offer")
+        .await
+        .expect("target B must receive the daemon-originated rc:tunnel.sdp.offer");
+    assert!(
+        offer["session_id"].as_str().is_some(),
+        "relayed offer carries the server-minted session_id"
+    );
+    assert!(
+        offer["sdp"].as_str().is_some_and(|s| !s.is_empty()),
+        "relayed offer carries a non-empty SDP"
+    );
+
+    // kill_flow tears it down + deregisters.
+    assert!(hub.kill_flow(&flow_id), "kill_flow removes the registered flow");
+    assert!(hub.flows_snapshot().is_empty(), "flows() empty after kill");
+
+    let _ = stop_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(3), sig).await;
 }
