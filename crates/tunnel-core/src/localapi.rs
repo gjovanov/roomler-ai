@@ -16,6 +16,7 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::sync::watch;
@@ -134,6 +135,13 @@ pub enum Request {
     ConsentPending,
     /// Approve (`allow=true`) or deny a pending consent, by session id.
     ConsentDecide { session_id: String, allow: bool },
+    /// ICMP-ping an overlay peer (by name or IP) over the userspace netstack —
+    /// the OS-free reachability probe. `timeout_ms` 0 ⇒ the daemon's default.
+    Ping {
+        target: String,
+        #[serde(default)]
+        timeout_ms: u64,
+    },
 }
 
 /// A LocalAPI response. Adjacently tagged so a payload may be a struct
@@ -149,6 +157,14 @@ pub enum Response {
     /// Result of a [`Request::ConsentDecide`] — `ok` = the decision was recorded.
     ConsentDecided {
         ok: bool,
+    },
+    /// Round-trip result of [`Request::Ping`] — the resolved overlay IP + RTT.
+    Pong {
+        target: String,
+        overlay_ip: String,
+        /// Round-trip time in microseconds. Integer keeps the wire type `Eq`;
+        /// the client renders it as milliseconds.
+        rtt_micros: u64,
     },
     /// The verb couldn't be served (bad request, state unavailable).
     Error {
@@ -176,6 +192,7 @@ pub struct OverlayView {
 /// Read-only snapshot the daemon provides to [`handle`]. The daemon's impl
 /// gathers this from its live overlay / tunnel / forward state; the trait keeps
 /// the protocol unit-testable with a mock and free of daemon internals.
+#[async_trait]
 pub trait LocalApiState: Send + Sync {
     fn status(&self) -> NodeStatus;
     fn peers(&self) -> Vec<PeerInfo>;
@@ -191,6 +208,16 @@ pub trait LocalApiState: Send + Sync {
     fn consent_decide(&self, _session_id: &str, _allow: bool) -> bool {
         false
     }
+    /// ICMP-ping an overlay peer by name/IP over the userspace netstack, and
+    /// return a [`Response::Pong`] (or [`Response::Error`]). Async — awaited by
+    /// [`serve_connection`], not the sync [`handle`]. Default: unsupported (a
+    /// node not running the netstack has no OS-free ICMP path).
+    async fn ping(&self, _target: &str, _timeout_ms: u64) -> Response {
+        Response::Error {
+            message: "ping is not supported on this node (not running the userspace netstack)"
+                .into(),
+        }
+    }
 }
 
 /// Pure dispatch: map a [`Request`] to a [`Response`] over a state snapshot.
@@ -204,6 +231,11 @@ pub fn handle(req: &Request, state: &dyn LocalApiState) -> Response {
         Request::ConsentPending => Response::ConsentPending(state.consent_pending()),
         Request::ConsentDecide { session_id, allow } => Response::ConsentDecided {
             ok: state.consent_decide(session_id, *allow),
+        },
+        // `Ping` is async — intercepted in `serve_connection` before this sync
+        // dispatch runs. This arm only satisfies match exhaustiveness.
+        Request::Ping { .. } => Response::Error {
+            message: "ping must be served on the async path".into(),
         },
     }
 }
@@ -228,6 +260,9 @@ where
             continue;
         }
         let resp = match serde_json::from_str::<Request>(&line) {
+            // `Ping` is the one async verb — await it here; everything else is a
+            // pure sync dispatch through `handle`.
+            Ok(Request::Ping { target, timeout_ms }) => state.ping(&target, timeout_ms).await,
             Ok(req) => handle(&req, state),
             Err(e) => Response::Error {
                 message: format!("bad request: {e}"),
@@ -674,6 +709,25 @@ impl Client {
     pub async fn flows(&mut self) -> std::io::Result<Vec<FlowInfo>> {
         match self.request(&Request::Flows).await? {
             Response::Flows(f) => Ok(f),
+            other => Err(unexpected_response(other)),
+        }
+    }
+
+    /// `Request::Ping` → the resolved `(overlay_ip, rtt_ms)`. A daemon
+    /// [`Response::Error`] (unknown peer / not a netstack node / timeout)
+    /// surfaces its message verbatim.
+    pub async fn ping(&mut self, target: &str, timeout_ms: u64) -> std::io::Result<(String, f64)> {
+        let req = Request::Ping {
+            target: target.to_string(),
+            timeout_ms,
+        };
+        match self.request(&req).await? {
+            Response::Pong {
+                overlay_ip,
+                rtt_micros,
+                ..
+            } => Ok((overlay_ip, rtt_micros as f64 / 1000.0)),
+            Response::Error { message } => Err(std::io::Error::other(message)),
             other => Err(unexpected_response(other)),
         }
     }

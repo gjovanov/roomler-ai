@@ -155,6 +155,18 @@ enum Command {
         #[command(flatten)]
         fmt: OutputFmt,
     },
+    /// ICMP-ping an overlay peer (by name or IP) over the userspace netstack —
+    /// the OS-free reachability probe. Only meaningful when the local daemon runs
+    /// in netstack mode (a locked-down host with no OS route to the mesh).
+    Ping {
+        /// Overlay peer to ping — a name (e.g. `neo16`) or an overlay IP.
+        target: String,
+        /// Round-trip timeout in milliseconds.
+        #[arg(long, default_value_t = 3000)]
+        timeout_ms: u64,
+        #[command(flatten)]
+        fmt: OutputFmt,
+    },
 }
 
 /// Shared output flag for the read-only LocalAPI verbs (`status`/`peers`/
@@ -218,6 +230,11 @@ async fn main() -> Result<()> {
         Command::Status { fmt } => localclient::status(fmt.json).await,
         Command::Peers { fmt } => localclient::peers(fmt.json).await,
         Command::Flows { fmt } => localclient::flows(fmt.json).await,
+        Command::Ping {
+            target,
+            timeout_ms,
+            fmt,
+        } => localclient::ping(&target, timeout_ms, fmt.json).await,
     }
 }
 
