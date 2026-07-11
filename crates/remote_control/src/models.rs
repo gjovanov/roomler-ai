@@ -312,6 +312,14 @@ pub enum PolicySubject {
         #[serde(rename = "id")]
         tunnel_client_id: ObjectId,
     },
+    /// A specific agent acting as a tunnel CLIENT (node-stack unification,
+    /// P3b-2). Orthogonal to `PolicyTarget::AgentId` (which names the forward's
+    /// DESTINATION): here the agent is the ORIGIN of the tunnel. Purely additive
+    /// — old policy docs never carry this variant, so no migration is needed.
+    AgentId {
+        #[serde(rename = "id")]
+        agent_id: ObjectId,
+    },
     /// Every user in the policy's tenant.
     AllUsers,
 }
