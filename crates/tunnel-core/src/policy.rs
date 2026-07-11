@@ -24,7 +24,20 @@ pub use roomler_ai_remote_control::models::{
 };
 pub use roomler_ai_remote_control::signaling::RejectKind;
 
-/// Concrete identity for the requesting tunnel client. The caller
+/// The concrete principal that ORIGINATED a tunnel request. Historically
+/// this was always a `TunnelClient`; the node-stack unification (P3b-2) lets
+/// an enrolled **agent** originate tunnels over its own WS, so the principal
+/// is now a typed union rather than a bare `tunnel_client_id`. `AllUsers` /
+/// `UserId{owner}` / `RoleId` policy subjects match EITHER principal (they key
+/// on `user_id`/`role_ids`); only the id-specific subjects
+/// (`TunnelClientId` / `AgentId`) discriminate on the principal kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Principal {
+    TunnelClient(ObjectId),
+    Agent(ObjectId),
+}
+
+/// Concrete identity for the requesting tunnel origin. The caller
 /// resolves this once per request (from the WS handler's auth
 /// context + a Mongo lookup for `role_ids`) and hands it to
 /// [`evaluate`].
@@ -32,7 +45,7 @@ pub use roomler_ai_remote_control::signaling::RejectKind;
 pub struct ResolvedSubject {
     pub user_id: ObjectId,
     pub role_ids: Vec<ObjectId>,
-    pub tunnel_client_id: ObjectId,
+    pub principal: Principal,
 }
 
 /// Outcome of an ACL evaluation. On allow, carries the policy id +
@@ -111,8 +124,16 @@ pub fn subject_matches(subjects: &[PolicySubject], req: &ResolvedSubject) -> boo
         PolicySubject::AllUsers => true,
         PolicySubject::UserId { user_id } => *user_id == req.user_id,
         PolicySubject::RoleId { role_id } => req.role_ids.contains(role_id),
+        // Id-specific subjects discriminate on the principal KIND: a
+        // `TunnelClientId` subject only matches a tunnel-client principal, an
+        // `AgentId` subject only an agent principal. Never cross the kinds —
+        // an agent_id must not satisfy a tunnel_client_id subject even on a
+        // (vanishingly unlikely) ObjectId collision.
         PolicySubject::TunnelClientId { tunnel_client_id } => {
-            *tunnel_client_id == req.tunnel_client_id
+            matches!(req.principal, Principal::TunnelClient(id) if id == *tunnel_client_id)
+        }
+        PolicySubject::AgentId { agent_id } => {
+            matches!(req.principal, Principal::Agent(id) if id == *agent_id)
         }
     })
 }
@@ -401,7 +422,7 @@ mod tests {
         ResolvedSubject {
             user_id,
             role_ids: vec![],
-            tunnel_client_id: ObjectId::new(),
+            principal: Principal::TunnelClient(ObjectId::new()),
         }
     }
 
@@ -451,7 +472,7 @@ mod tests {
         let req = ResolvedSubject {
             user_id: ObjectId::new(),
             role_ids: vec![role_b, role_a],
-            tunnel_client_id: ObjectId::new(),
+            principal: Principal::TunnelClient(ObjectId::new()),
         };
         assert!(eval_tcp(&[p], &req, aid, "db", 5432).is_allow());
     }
@@ -470,8 +491,108 @@ mod tests {
         let req = ResolvedSubject {
             user_id: ObjectId::new(),
             role_ids: vec![],
-            tunnel_client_id: cid,
+            principal: Principal::TunnelClient(cid),
         };
+        assert!(eval_tcp(&[p], &req, aid, "db", 5432).is_allow());
+    }
+
+    // ─── agent-principal subject matching (P3b-2) ────────────────────
+
+    /// Build a `ResolvedSubject` whose principal is an agent originating a
+    /// tunnel (the P3b-2 case). `user_id` is the agent's owner.
+    fn agent_subject(owner_user_id: ObjectId, agent_id: ObjectId) -> ResolvedSubject {
+        ResolvedSubject {
+            user_id: owner_user_id,
+            role_ids: vec![],
+            principal: Principal::Agent(agent_id),
+        }
+    }
+
+    #[test]
+    fn agent_id_subject_matches_agent_principal() {
+        let target = ObjectId::new();
+        let origin_agent = ObjectId::new();
+        let p = policy(
+            vec![PolicySubject::AgentId {
+                agent_id: origin_agent,
+            }],
+            vec![PolicyTarget::AgentId { agent_id: target }],
+            vec![rule(HostPattern::Exact("db".into()), 5432, 5432)],
+        );
+        let req = agent_subject(ObjectId::new(), origin_agent);
+        assert!(eval_tcp(&[p], &req, target, "db", 5432).is_allow());
+    }
+
+    #[test]
+    fn agent_principal_does_not_match_tunnel_client_subject() {
+        // An `AgentId`-kinded principal must NOT satisfy a `TunnelClientId`
+        // subject even if the raw ObjectId happened to be equal — the kinds
+        // are disjoint. Use the SAME id for both to prove the kind gate, not
+        // an id mismatch, is what denies.
+        let aid = ObjectId::new();
+        let shared = ObjectId::new();
+        let p = policy(
+            vec![PolicySubject::TunnelClientId {
+                tunnel_client_id: shared,
+            }],
+            vec![PolicyTarget::AgentId { agent_id: aid }],
+            vec![rule(HostPattern::Exact("db".into()), 5432, 5432)],
+        );
+        let req = agent_subject(ObjectId::new(), shared);
+        assert!(matches!(
+            eval_tcp(&[p], &req, aid, "db", 5432),
+            Decision::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn tunnel_client_principal_does_not_match_agent_subject() {
+        // The reverse of the above — a tunnel-client principal must not
+        // satisfy an `AgentId` subject.
+        let aid = ObjectId::new();
+        let shared = ObjectId::new();
+        let p = policy(
+            vec![PolicySubject::AgentId { agent_id: shared }],
+            vec![PolicyTarget::AgentId { agent_id: aid }],
+            vec![rule(HostPattern::Exact("db".into()), 5432, 5432)],
+        );
+        let req = ResolvedSubject {
+            user_id: ObjectId::new(),
+            role_ids: vec![],
+            principal: Principal::TunnelClient(shared),
+        };
+        assert!(matches!(
+            eval_tcp(&[p], &req, aid, "db", 5432),
+            Decision::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn all_users_subject_matches_agent_principal() {
+        // The de-risking property: an `AllUsers` policy authorizes an
+        // agent-originated tunnel with no new subject type needed.
+        let aid = ObjectId::new();
+        let p = policy(
+            vec![PolicySubject::AllUsers],
+            vec![PolicyTarget::AllAgents],
+            vec![rule(HostPattern::Exact("db".into()), 5432, 5432)],
+        );
+        let req = agent_subject(ObjectId::new(), ObjectId::new());
+        assert!(eval_tcp(&[p], &req, aid, "db", 5432).is_allow());
+    }
+
+    #[test]
+    fn user_id_subject_matches_agent_principal_by_owner() {
+        // An agent principal is authorized by a `UserId{owner}` policy —
+        // the owner drives the match, independent of principal kind.
+        let owner = ObjectId::new();
+        let aid = ObjectId::new();
+        let p = policy(
+            vec![PolicySubject::UserId { user_id: owner }],
+            vec![PolicyTarget::AllAgents],
+            vec![rule(HostPattern::Exact("db".into()), 5432, 5432)],
+        );
+        let req = agent_subject(owner, ObjectId::new());
         assert!(eval_tcp(&[p], &req, aid, "db", 5432).is_allow());
     }
 
