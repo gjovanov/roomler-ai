@@ -160,8 +160,16 @@ impl TunnelClientHub {
     /// Returns a guard that clears it back to `None` on drop — so a supervisor
     /// that holds a clone of the dead `outbound_tx` fails its next send and
     /// re-waits for the next connection's sink (mirrors `ConnectedGuard`).
+    ///
+    /// Uses `send_replace`, NOT `send`: at publish time there may be no live
+    /// receiver (a flow supervisor subscribes only when its flow is created,
+    /// which can be AFTER the first WS connect), and `watch::Sender::send`
+    /// silently fails + drops the value when there are no receivers — the value
+    /// would stay `None` and every later-subscribing supervisor would hang.
+    /// `send_replace` always updates the stored value, so a supervisor that
+    /// subscribes afterward sees the live sink.
     pub fn publish_sink(&self, tx: mpsc::Sender<ClientMsg>) -> SinkGuard {
-        let _ = self.inner.sink_tx.send(Some(tx));
+        self.inner.sink_tx.send_replace(Some(tx));
         SinkGuard { hub: self.clone() }
     }
 
@@ -398,7 +406,10 @@ pub struct SinkGuard {
 
 impl Drop for SinkGuard {
     fn drop(&mut self) {
-        let _ = self.hub.inner.sink_tx.send(None);
+        // `send_replace` (not `send`): clear the value even if no supervisor is
+        // currently subscribed, so a supervisor created later doesn't see a
+        // stale sink from a dead connection.
+        self.hub.inner.sink_tx.send_replace(None);
     }
 }
 
@@ -984,5 +995,29 @@ mod tests {
         assert!(hub.kill_flow("fl-1"));
         assert!(hub.flows_snapshot().is_empty());
         assert!(!hub.kill_flow("fl-1"), "second kill is a no-op false");
+    }
+
+    #[tokio::test]
+    async fn publish_sink_is_visible_to_a_later_subscriber() {
+        // Regression (found via the E2E test): a flow supervisor subscribes only
+        // when its flow is created, which can be AFTER the first WS connect
+        // published the sink. `watch::Sender::send` silently drops the value when
+        // there are no receivers yet, so a plain `send` left the value `None` and
+        // the supervisor hung at wait_for_sink forever. `publish_sink` must use
+        // `send_replace` so a LATER subscriber still sees the live sink.
+        let hub = TunnelClientHub::new("t".into());
+        let (tx, _rx) = mpsc::channel::<ClientMsg>(1);
+        let _guard = hub.publish_sink(tx); // published with NO subscriber yet
+        let mut sink_rx = hub.inner.sink_tx.subscribe();
+        assert!(
+            sink_rx.borrow_and_update().is_some(),
+            "a subscriber created after publish_sink must see the live egress"
+        );
+        // Dropping the guard clears it (also visible to the existing subscriber).
+        drop(_guard);
+        assert!(
+            sink_rx.borrow_and_update().is_none(),
+            "the guard clears the sink on drop"
+        );
     }
 }
