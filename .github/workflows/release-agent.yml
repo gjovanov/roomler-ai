@@ -948,7 +948,34 @@ jobs:
         # Windows is upstream-only-on-1.16, so brew's 1.15 works).
         run: brew install cmake libvpx pkg-config
 
-      - name: Build agent (release, full + vp9-444 + vp9-444-bindgen)
+      - name: Fetch vendored FFmpeg 8.1.2 (for the ffmpeg-encoder HEVC backend)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Prebuilt LGPL FFmpeg 8.1.2 for Apple Silicon (HEVC via
+          # hevc_videotoolbox; no GPL libx264/x265 → the MIT agent stays
+          # license-clean). Built once by vendor-ffmpeg-macos.yml and fetched
+          # here — the macOS counterpart to the Linux BtbN vendored build.
+          gh release download vendored-ffmpeg-8.1.2 \
+            --repo "${{ github.repository }}" \
+            --pattern 'ffmpeg-8.1.2-macos-arm64-lgpl-shared.tar.xz' \
+            --dir "$RUNNER_TEMP/ffdl"
+          FFPREFIX="$RUNNER_TEMP/roomler-ffmpeg"
+          mkdir -p "$FFPREFIX"
+          # Tarball root is lib/ + include/ (no top dir) — no --strip-components.
+          tar xf "$RUNNER_TEMP/ffdl/ffmpeg-8.1.2-macos-arm64-lgpl-shared.tar.xz" -C "$FFPREFIX"
+          # .pc prefix is baked to the builder's path; rewrite it (BSD sed).
+          sed -i '' "s|^prefix=.*|prefix=$FFPREFIX|" "$FFPREFIX"/lib/pkgconfig/*.pc
+          {
+            echo "FFMPEG_DIR=$FFPREFIX"
+            # Prepend ffmpeg but KEEP the default pc_path so brew's libvpx.pc
+            # (vp9-444) still resolves.
+            echo "PKG_CONFIG_PATH=$FFPREFIX/lib/pkgconfig:$(pkg-config --variable pc_path pkg-config)"
+            echo "FFPREFIX=$FFPREFIX"
+          } >> "$GITHUB_ENV"
+
+      - name: Build agent (release, full + vp9-444 + vp9-444-bindgen + ffmpeg-encoder)
         # `vp9-444-bindgen` runs bindgen against brew's libvpx 1.16
         # headers — env-libvpx-sys's pre-generated bindings only cover
         # 1.13.0, so without bindgen the build script panics looking
@@ -958,7 +985,10 @@ jobs:
         # `overlay-l3` (Phase 3b): the overlay mesh (WireGuard + TUN, utun
         # on macOS — in-kernel, no extra dep). Default-OFF (config
         # `overlay_enabled`), inert until an operator opts a host in.
-        run: cargo build -p roomler-agent --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack" --target aarch64-apple-darwin
+        # `ffmpeg-encoder`: HEVC via the vendored FFmpeg fetched above
+        # (hevc_videotoolbox on Apple Silicon) — the macOS counterpart to the
+        # Linux/Windows HEVC path.
+        run: cargo build -p roomler-agent --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack,ffmpeg-encoder" --target aarch64-apple-darwin
 
       - name: Stage .app bundle
         shell: bash
@@ -968,6 +998,21 @@ jobs:
           APP=stage/roomler-agent.app
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
           cp "$BIN" "$APP/Contents/MacOS/roomler-agent"
+          # Bundle the vendored FFmpeg dylibs into the .app so it's
+          # self-contained (macOS ships no FFmpeg). They carry @rpath install
+          # names (built --install-name-dir=@rpath), so a single LC_RPATH of
+          # @executable_path/../Frameworks on the binary resolves BOTH the
+          # binary's FFmpeg deps and the dylibs' siblings — the macOS analog of
+          # the Linux $ORIGIN patchelf.
+          mkdir -p "$APP/Contents/Frameworks"
+          cp -a "$FFPREFIX"/lib/*.dylib "$APP/Contents/Frameworks/"
+          install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP/Contents/MacOS/roomler-agent"
+          echo "=== FFmpeg load commands (want @rpath/libav*) ==="
+          otool -L "$APP/Contents/MacOS/roomler-agent" | grep -E '@rpath/lib(av|sw)' || true
+          echo "=== self-containment check: staged arm64 binary loads its bundled FFmpeg? ==="
+          # macos-14 is arm64, so the aarch64 binary runs here; if the rpath +
+          # bundled dylibs are wrong, dyld fails and this step (set -e) fails.
+          "$APP/Contents/MacOS/roomler-agent" --version
           cp agents/roomler-agent/packaging/macos/com.roomler.agent.plist "$APP/Contents/Resources/"
           cat > "$APP/Contents/Info.plist" <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
@@ -1023,6 +1068,13 @@ jobs:
         if: env.APP_P12_BASE64 != ''
         run: |
           set -euo pipefail
+          # Sign the bundled FFmpeg dylibs FIRST (inside-out) — the hardened
+          # runtime + notarisation reject unsigned nested code. (No-op on the
+          # current unsigned builds; correct once Apple secrets are configured.)
+          find stage/roomler-agent.app/Contents/Frameworks -type f -name '*.dylib' -print0 \
+            | while IFS= read -r -d '' dylib; do
+                codesign --sign "Developer ID Application" --options runtime --timestamp "$dylib"
+              done
           codesign --sign "Developer ID Application" \
                    --options runtime --timestamp \
                    --entitlements agents/roomler-agent/packaging/macos/entitlements.plist \
