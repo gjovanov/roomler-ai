@@ -446,7 +446,6 @@ impl TunnelSignalingSink for DaemonSink {
             },
             other => other,
         };
-        debug!(nonce = %self.nonce, "DaemonSink: enqueue ClientMsg to agent-WS egress");
         self.tx
             .send(msg)
             .await
@@ -506,10 +505,7 @@ async fn run_flow_supervisor(
         *live.status.lock().unwrap() = FlowStatus::Connecting;
         // Wait for a live agent WS.
         let sink_tx = match wait_for_sink(&mut sink_rx).await {
-            Some(tx) => {
-                info!(flow = %flow_id, "flow supervisor: got live agent-WS sink");
-                tx
-            }
+            Some(tx) => tx,
             None => return, // hub dropped — the daemon is shutting down
         };
 
