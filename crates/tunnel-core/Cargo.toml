@@ -41,6 +41,12 @@ webrtc = { workspace = true }
 # explicit; the version constraint matches the agent's pin.
 bytes = "1"
 
+# Raw socket options for the tunnel-session driver's local TCP accept loop:
+# `setsockopt` TCP_NODELAY (Nagle off) + a 4 MiB SO_SNDBUF on each accepted
+# stream — the P0 throughput fix (moved here from the CLI's `forward.rs` in
+# P3b-1). Already transitive via vendored webrtc-data, so zero extra build.
+socket2 = "0.5"
+
 # CIDR matching in DestinationRule — tiny, no_std-friendly.
 ipnet = "2"
 
