@@ -1,9 +1,44 @@
 # Netstack IPv6 — implementation plan
 
-Status: **planning** (2026-07-11). The netstack (userspace smoltcp TCP/IP stack,
-feature `overlay-netstack`) is IPv4-only today. This document plans dual-stack
-(IPv4 + IPv6) support: what changes, in what order, and the decisions that make
-it tractable.
+Status (2026-07-11):
+
+- **Phase A shipped** (PR #85) — dual-stack netstack internals: smoltcp
+  `proto-ipv6`, `IpAddr`/`SocketAddr` API widening, the derived-v6 ULA
+  (`fd72:6f6f:6d6c::/48`, pinned), dual-addressed iface, ICMPv6 echo, v6
+  direct-pair tests. Inert.
+- **Phase B shipped** — v6 *routing* on both surfaces, with one refinement
+  over the plan below: instead of installing a per-peer v6 `/128` in
+  `router.rs`, the router **unmaps a derived-ULA destination to its embedded
+  v4 at packet-extraction time** (`Router::dst_of_ip_packet`) and routes on
+  the existing v4 table — zero per-peer v6 state, zero `install_peers`
+  change. Inbound needed nothing (boringtun's `WriteToTunnelV6` was already
+  handled). OS-TUN parity: `SystemTun::up` assigns the derived v6 `/96`
+  (Linux `ip -6 addr replace`, Windows `netsh`, best-effort; macOS deferred
+  like the v4 per-peer routes). Proven by
+  `bridge_v6_tcp_echo_and_ping_over_wireguard` (v4-only peer install; TCP +
+  ICMPv6 round-trip over the derived v6 through a real WG pair).
+- **Phase C shipped** — dual-stack surfaces. SOCKS front: a genuine
+  ATYP=IPv6 target dials over v6 when it's a derived-ULA address (v4-mapped
+  unwraps; other v6 → instant host-unreachable); names keep resolving to v4
+  (universal — v6 is derived from it). MagicDNS answers `AAAA` with the
+  derived v6 (default-on; `ROOMLER_AGENT_DNS_AAAA=0` reverts to A-only — the
+  mixed-fleet escape hatch, since an old peer's OS doesn't own its derived v6
+  and v6 toward it blackholes; happy-eyeballs apps fall back). `roomler ping`
+  accepts v6 literals and `-6/--ipv6` resolves a name to the peer's derived
+  v6 (`Request::Ping.prefer_v6`, serde-default so old daemons/clients
+  interop).
+- **Phase D shipped** — v6 visibility, with one refinement: **no wire/DB
+  `overlay_ip6`** (derivation makes it redundant and it would be a
+  consistency liability). The overlay runtime derives + publishes
+  `self_ip6`/`overlay_ip6` into the LocalAPI view (`NodeStatus`/`PeerInfo`,
+  serde-default), so `roomler status`/`peers`, the tray Devices view, and —
+  via a TS mirror of the derivation (`ui: deriveOverlayV6`) — the admin
+  overlay-nodes table all show both addresses with zero server change.
+
+The original plan follows. The netstack (userspace smoltcp TCP/IP stack,
+feature `overlay-netstack`) was IPv4-only when written. This document plans
+dual-stack (IPv4 + IPv6) support: what changes, in what order, and the
+decisions that make it tractable.
 
 ## Why (and why it can wait)
 
