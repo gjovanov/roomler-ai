@@ -76,11 +76,20 @@ pub struct InstallerHealth {
 
 /// `GET /api/tunnel/latest-release` — same wire shape as the agent's
 /// `latest-release` so the CLI / installer logic can reuse one parser.
+///
+/// FILTERS to `tunnel-v*` tags. The cache holds the raw repo release list
+/// (`agent-v*`, `vendored-ffmpeg-*`, `tunnel-v*`, …); `roomler-tunnel
+/// self-update` takes `.first()` as "latest". Without this filter the newest
+/// UNRELATED release — e.g. a `vendored-ffmpeg-*` helper published for the
+/// agent's HEVC libs — was served as the latest tunnel, so self-update reported
+/// a bogus version and failed the SHA-256 check against the wrong asset.
 pub async fn latest_release(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<AgentRelease>>, ApiError> {
     let releases = ensure_releases_cached(&state).await?;
-    Ok(Json(releases))
+    Ok(Json(
+        crate::routes::agent_release::filter_component_releases(releases, "tunnel-v"),
+    ))
 }
 
 /// `GET /api/tunnel/installer/{platform}/health` — manifest (tag,
@@ -433,5 +442,30 @@ mod tests {
         assert!(pick_release(&releases, "0.3.0").is_some());
         assert!(pick_release(&releases, "tunnel-v0.3.0").is_some());
         assert!(pick_release(&releases, "0.99.0").is_none());
+    }
+
+    #[test]
+    fn latest_release_filter_drops_non_tunnel_tags() {
+        // Regression: the raw repo list is newest-first and mixes components.
+        // A `vendored-ffmpeg-*` helper release published newest must NOT be
+        // served as the latest tunnel — self-update takes `.first()`.
+        let releases = vec![
+            release("vendored-ffmpeg-8.1.2", false, &["ffmpeg-libs.zip"]),
+            release("agent-v0.3.0-rc.168", false, &[]),
+            release(
+                "tunnel-v0.3.0-rc.167",
+                false,
+                &["roomler-tunnel-0.3.0-rc.167-x86_64-pc-windows-msvc.zip"],
+            ),
+            release("tunnel-v0.3.0-rc.166", false, &[]),
+        ];
+        let filtered =
+            crate::routes::agent_release::filter_component_releases(releases, "tunnel-v");
+        assert_eq!(filtered.len(), 2, "only tunnel-v* survive");
+        assert_eq!(
+            filtered.first().unwrap().tag_name,
+            "tunnel-v0.3.0-rc.167",
+            "newest tunnel-v* is first (what self-update's .first() reads)"
+        );
     }
 }
