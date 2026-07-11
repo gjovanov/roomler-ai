@@ -1100,8 +1100,11 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     // Phase 3b: generate + persist this node's WireGuard identity on the
     // first overlay-enabled startup. The public key is what the netmap
     // distributes; the secret never leaves the host. Kept here (not in
-    // `migrate`) so `config.rs` stays free of the overlay-l3 feature dep.
-    #[cfg(feature = "overlay-l3")]
+    // `migrate`) so `config.rs` stays free of the overlay feature dep. Gated on
+    // ANY overlay surface — the netstack (`overlay-netstack`) needs the WG key
+    // just as much as the OS-TUN path (`overlay-l3`); an `overlay-l3`-only gate
+    // meant a netstack-only build never generated a key and never joined.
+    #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
     if cfg.overlay_enabled && cfg.overlay_wg_secret_key.is_none() {
         let kp = tunnel_core::overlay::WgKeypair::generate();
         cfg.overlay_wg_secret_key = Some(kp.secret_base64());
