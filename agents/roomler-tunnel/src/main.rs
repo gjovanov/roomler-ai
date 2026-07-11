@@ -21,6 +21,30 @@ use std::path::PathBuf;
 
 use roomler_tunnel::{config, forward, localclient, mesh, update};
 
+/// CLI transport shim — the parsed `--transport` value. The real preference
+/// enum (`tunnel_core::driver::TransportPref`) is clap-free (so the driver
+/// crate needn't depend on clap); this mirrors its variants for the CLI and
+/// converts into it at dispatch. Wire values are lowercase (`auto`/`quic`/
+/// `webrtc`), matching the pre-refactor `#[value(rename_all = "lowercase")]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+#[value(rename_all = "lowercase")]
+enum CliTransport {
+    #[default]
+    Auto,
+    Quic,
+    Webrtc,
+}
+
+impl From<CliTransport> for forward::TransportPref {
+    fn from(t: CliTransport) -> Self {
+        match t {
+            CliTransport::Auto => forward::TransportPref::Auto,
+            CliTransport::Quic => forward::TransportPref::Quic,
+            CliTransport::Webrtc => forward::TransportPref::Webrtc,
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "roomler-tunnel", version, about, long_about = None)]
 struct Cli {
@@ -72,7 +96,7 @@ enum Command {
         /// deployed and gates on the agent's reported version, so `auto`
         /// only attempts QUIC against agents that actually support it.
         #[arg(long, value_enum, default_value = "auto")]
-        transport: forward::TransportPref,
+        transport: CliTransport,
     },
     /// Run a local SOCKS5 proxy ("userspace mode"): apps point at
     /// `127.0.0.1:<local>` and each connection's SOCKS5 CONNECT target is dialed
@@ -92,7 +116,7 @@ enum Command {
         /// Data-plane transport — same semantics as `forward` (`auto` prefers
         /// QUIC with WebRTC-DC fallback).
         #[arg(long, value_enum, default_value = "auto")]
-        transport: forward::TransportPref,
+        transport: CliTransport,
     },
     /// Read a multi-forward config from disk and run all forwards as
     /// persistent listeners. Auto-reconnects on transient failure.
@@ -167,7 +191,7 @@ async fn main() -> Result<()> {
             transport,
         } => {
             let cfg = config::load(cli.config).context("loading tunnel config")?;
-            forward::run(cfg, &agent, local, &remote, transport).await
+            forward::run(cfg, &agent, local, &remote, transport.into()).await
         }
         Command::Socks5 {
             agent,
@@ -175,6 +199,7 @@ async fn main() -> Result<()> {
             transport,
         } => {
             let cfg = config::load(cli.config).context("loading tunnel config")?;
+            let transport = transport.into();
             match agent {
                 Some(agent) => forward::run_socks5(cfg, &agent, local, transport).await,
                 None => mesh::run_mesh(cfg, local, transport).await,
@@ -312,7 +337,7 @@ mod tests {
                 assert_eq!(remote, "10.0.0.5:5432");
                 // No --transport given → default is auto (prefer QUIC,
                 // fall back to WebRTC on setup failure).
-                assert_eq!(transport, forward::TransportPref::Auto);
+                assert_eq!(transport, CliTransport::Auto);
             }
             other => panic!("expected Forward, got {other:?}"),
         }
@@ -335,7 +360,7 @@ mod tests {
         .unwrap();
         match cli.command {
             Command::Forward { transport, .. } => {
-                assert_eq!(transport, forward::TransportPref::Quic);
+                assert_eq!(transport, CliTransport::Quic);
             }
             other => panic!("expected Forward, got {other:?}"),
         }
@@ -358,7 +383,7 @@ mod tests {
         .unwrap();
         match cli.command {
             Command::Forward { transport, .. } => {
-                assert_eq!(transport, forward::TransportPref::Auto);
+                assert_eq!(transport, CliTransport::Auto);
             }
             other => panic!("expected Forward, got {other:?}"),
         }
@@ -383,7 +408,7 @@ mod tests {
             } => {
                 assert_eq!(agent.as_deref(), Some("507f1f77bcf86cd799439011"));
                 assert_eq!(local, 1080);
-                assert_eq!(transport, forward::TransportPref::Auto);
+                assert_eq!(transport, CliTransport::Auto);
             }
             other => panic!("expected Socks5, got {other:?}"),
         }
