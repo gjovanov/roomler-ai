@@ -435,6 +435,7 @@ impl TunnelSignalingSink for DaemonSink {
             },
             other => other,
         };
+        debug!(nonce = %self.nonce, "DaemonSink: enqueue ClientMsg to agent-WS egress");
         self.tx
             .send(msg)
             .await
@@ -486,6 +487,7 @@ async fn run_flow_supervisor(
     pref: TransportPref,
     live: Arc<FlowLive>,
 ) {
+    info!(flow = %flow_id, "flow supervisor started");
     let mut sink_rx = hub.inner.sink_tx.subscribe();
     let mut backoff = RECONNECT_BACKOFF_MIN;
     let mut attempt: u64 = 0;
@@ -493,7 +495,10 @@ async fn run_flow_supervisor(
         *live.status.lock().unwrap() = FlowStatus::Connecting;
         // Wait for a live agent WS.
         let sink_tx = match wait_for_sink(&mut sink_rx).await {
-            Some(tx) => tx,
+            Some(tx) => {
+                info!(flow = %flow_id, "flow supervisor: got live agent-WS sink");
+                tx
+            }
             None => return, // hub dropped — the daemon is shutting down
         };
 
@@ -631,6 +636,7 @@ async fn drive_one(
         live: live.clone(),
     });
 
+    info!(flow = %flow_id, %nonce, request, "flow: driving run_tunnel_session (hello+open)");
     let result = run_tunnel_session(
         sink,
         source,
