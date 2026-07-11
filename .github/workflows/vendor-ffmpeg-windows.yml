@@ -1,0 +1,84 @@
+name: Vendor FFmpeg (Windows x64 MSVC static-md, LGPL)
+
+# One-off (workflow_dispatch) builder that runs the SAME vcpkg install the
+# agent's build-windows job used to run inline (ffmpeg 8.1.1+cbs-backport,
+# LGPL: nvcodec/qsv/amf/vpx, no GPL x264/x265), then uploads the resulting
+# x64-windows-static-md tree to the vendored-ffmpeg-8.1.2 release so
+# build-windows can FETCH it instead of compiling FFmpeg on every run
+# (25-40 min cold). Static-md keeps FFmpeg linked INTO the EXE → no DLLs to
+# ship → the MSI stays small. This is the Windows counterpart to the Linux
+# BtbN / macOS from-source vendored builds.
+#
+# Re-run this only when bumping the FFmpeg version / vcpkg baseline.
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: vcpkg install FFmpeg + upload static-md tree
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Build FFmpeg via vcpkg (x64-windows-static-md, LGPL HW backends)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Identical manifest + baseline to the (removed) inline build-windows
+          # step — proven to produce a Rust-linkable static-md FFmpeg.
+          $manifest = @"
+          {
+            "name": "roomler-ffmpeg-pin",
+            "version": "0.0.1",
+            "dependencies": [
+              {"name": "ffmpeg", "features": ["avcodec", "avformat", "avfilter", "avdevice", "swresample", "swscale", "nvcodec", "qsv", "amf", "vpx"]}
+            ],
+            "builtin-baseline": "ccab4e210cbfb237aab29423a63108958949ef3c"
+          }
+          "@
+          # Bring the pre-installed vcpkg to the baseline commit so its version
+          # DB matches the manifest (same rc.67 hotfix as build-windows).
+          cd C:\vcpkg
+          git fetch origin
+          git reset --hard ccab4e210cbfb237aab29423a63108958949ef3c
+          if (-not (Test-Path .\vcpkg.exe)) { .\bootstrap-vcpkg.bat -disableMetrics }
+          .\vcpkg.exe version
+          New-Item -ItemType Directory -Path C:\ffmpeg-pin -Force | Out-Null
+          $manifest | Out-File -Encoding utf8 C:\ffmpeg-pin\vcpkg.json
+          Push-Location C:\ffmpeg-pin
+          C:\vcpkg\vcpkg.exe install --triplet=x64-windows-static-md --x-install-root=C:\ffmpeg-pin\installed
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::vcpkg install ffmpeg failed"; exit 1 }
+          Pop-Location
+          $pc = 'C:\ffmpeg-pin\installed\x64-windows-static-md\lib\pkgconfig\libavcodec.pc'
+          if (-not (Test-Path $pc)) { Write-Host "::error::libavcodec.pc missing after install"; exit 1 }
+          Write-Host "=== libavcodec.pc (prefix style) ==="
+          Get-Content $pc | Select-String -Pattern '^(prefix|libdir|includedir|Version)='
+
+      - name: Confirm LGPL-clean (no GPL x264/x265 in the tree)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $lib = 'C:\ffmpeg-pin\installed\x64-windows-static-md\lib'
+          $gpl = Get-ChildItem $lib -Filter '*.lib' | Where-Object { $_.Name -match 'x264|x265' }
+          if ($gpl) { Write-Host "::error::GPL codec lib present: $($gpl.Name)"; exit 1 }
+          Write-Host "LGPL-clean (no x264/x265 static libs)."
+
+      - name: Package + upload the static-md tree
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = 'C:\ffmpeg-pin\installed\x64-windows-static-md'
+          # Ship release lib/ (static .lib + pkgconfig) + include/ only —
+          # drop debug/, tools/, share/ to keep the artifact lean.
+          $zip = "$env:RUNNER_TEMP\ffmpeg-8.1.2-win64-msvc-static-md-lgpl.zip"
+          Compress-Archive -Path "$root\lib","$root\include" -DestinationPath $zip -CompressionLevel Optimal
+          $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+          "$hash  $(Split-Path $zip -Leaf)" | Out-File -Encoding ascii "$zip.sha256"
+          Write-Host "zip: $([math]::Round((Get-Item $zip).Length / 1MB, 1)) MB  sha256=$hash"
+          gh release upload vendored-ffmpeg-8.1.2 $zip "$zip.sha256" --repo "${{ github.repository }}" --clobber
+          Write-Host "uploaded $(Split-Path $zip -Leaf) to vendored-ffmpeg-8.1.2"
