@@ -226,6 +226,18 @@ docker tag "$REGISTRY/roomler-ai:build-$$" "$REGISTRY/roomler-ai:latest"
 docker push "$REGISTRY/roomler-ai:$TAG"
 docker push "$REGISTRY/roomler-ai:latest"
 
+# ── ALWAYS run after every deploy: reclaim the build's disk footprint. ──
+# The image is safely in the registry now, so the local copies are just build
+# leftovers. Every deploy bakes a fresh multi-stage image (+ intermediate layers
+# + build cache); without pruning they pile up until the build host's root FS
+# fills. (2026-07-12: `/` hit 100% from ~13 GB of stale build images mid-deploy.)
+# `-a` drops images not backed by a RUNNING container, so the mongo + registry
+# containers (and their images) are untouched; NO `--volumes`, so mongo DATA is
+# safe. Reclaims the per-deploy delta every time.
+docker system prune -af
+docker builder prune -f
+df -h / | awk 'NR==2{print "build-host / : "$4" free ("$5")"}'   # sanity
+
 cd "$DEPLOY_REPO"
 git checkout master && git pull
 sed -i "s|newTag:.*|newTag: $TAG|" k8s/overlays/prod/kustomization.yaml
@@ -236,7 +248,9 @@ argocd app sync roomler-ai --grpc-web     # or Sync via the ArgoCD UI
 curl -sI https://roomler.ai/health        # HTTP/2 200
 ```
 
-Registry retention: `registry-retention.sh 1` (weekly cron at Sun 04:00) keeps at most 2 tags per repo (latest + most-recent-versioned) and GC's the registry storage.
+Registry retention: `registry-retention.sh 1` (weekly cron at Sun 04:00) keeps at most 2 tags per repo (latest + most-recent-versioned) and GC's the registry storage. **Run it manually if `/gjovanov/registry` is fat** — the blob store isn't touched by `docker system prune` (it's the registry's own storage, not docker's), and heavy repos (e.g. `lgr` at ~7.5 GB/image) accrete fast between weekly GCs.
+
+**Periodic build-host maintenance (NOT per-deploy):** the fattest reclaimables are the local Rust `target/` dirs of the *other* projects cloned on the build host (`~/{harvex,oxmux,purestat,parakeet-rs}/target` were ~44 GB combined on 2026-07-12) — `cargo clean` or `rm -rf <proj>/target` when idle; they just recompile on next build. **Never touch `/var/lib/libvirt`** (the running k8s master+worker VM disks, ~87 GB) or the active container data volumes.
 
 ## Post-Implementation Testing
 
