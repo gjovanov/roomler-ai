@@ -39,7 +39,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, info, warn};
-use tunnel_core::policy::{GateResult, ProtocolKind, ResolvedSubject, check_forward_request};
+use tunnel_core::policy::{
+    GateResult, Principal, ProtocolKind, ResolvedSubject, check_forward_request,
+};
 use tunnel_core::transport::{TRANSPORT_QUIC_V1, TRANSPORT_WEBRTC_DC_V1};
 
 use crate::state::AppState;
@@ -808,7 +810,10 @@ async fn handle_forward_request(
         // membership lookup. For T2.5 we use an empty list — only
         // UserId / TunnelClientId / AllUsers policy subjects match.
         role_ids: Vec::new(),
-        tunnel_client_id,
+        // This is the tunnel-CLIENT WS handler, so the principal is always a
+        // tunnel client. P3b-2's agent-origination path (in the agent WS
+        // handler) will construct `Principal::Agent` instead.
+        principal: Principal::TunnelClient(tunnel_client_id),
     };
 
     let result = check_forward_request(
