@@ -186,13 +186,18 @@ pub struct PingResult {
     pub rtt_ms: f64,
 }
 
-/// `cmd_ping(target, timeoutMs?)` — ICMP-ping an overlay peer (by name or IP)
-/// over the userspace netstack via the daemon's LocalAPI. Mirrors
+/// `cmd_ping(target, timeoutMs?, preferV6?)` — ICMP-ping an overlay peer (by
+/// name or IP) over the userspace netstack via the daemon's LocalAPI. Mirrors
 /// [`cmd_device_view`]'s connect pattern; a missing daemon or a daemon-side error
 /// (unknown peer / timeout / "not a netstack node") rejects with a user-facing
-/// string the SPA shows on the button.
+/// string the SPA shows on the button. `preferV6` resolves a name target to the
+/// peer's derived overlay IPv6.
 #[tauri::command]
-pub async fn cmd_ping(target: String, timeout_ms: Option<u64>) -> Result<PingResult, String> {
+pub async fn cmd_ping(
+    target: String,
+    timeout_ms: Option<u64>,
+    prefer_v6: Option<bool>,
+) -> Result<PingResult, String> {
     let mut client = localapi::connect().await.map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             "device service not running".to_string()
@@ -201,7 +206,11 @@ pub async fn cmd_ping(target: String, timeout_ms: Option<u64>) -> Result<PingRes
         }
     })?;
     let (overlay_ip, rtt_ms) = client
-        .ping(&target, timeout_ms.unwrap_or(3000))
+        .ping(
+            &target,
+            timeout_ms.unwrap_or(3000),
+            prefer_v6.unwrap_or(false),
+        )
         .await
         .map_err(|e| e.to_string())?;
     Ok(PingResult { overlay_ip, rtt_ms })

@@ -159,11 +159,16 @@ enum Command {
     /// the OS-free reachability probe. Only meaningful when the local daemon runs
     /// in netstack mode (a locked-down host with no OS route to the mesh).
     Ping {
-        /// Overlay peer to ping — a name (e.g. `neo16`) or an overlay IP.
+        /// Overlay peer to ping — a name (e.g. `neo16`) or an overlay IP
+        /// (either family; `fd72:6f6f:6d6c::<v4>` is the derived overlay IPv6).
         target: String,
         /// Round-trip timeout in milliseconds.
         #[arg(long, default_value_t = 3000)]
         timeout_ms: u64,
+        /// Ping the peer's derived overlay IPv6 instead of its IPv4 (name
+        /// targets only; a literal IP already picks its own family).
+        #[arg(short = '6', long = "ipv6")]
+        prefer_v6: bool,
         #[command(flatten)]
         fmt: OutputFmt,
     },
@@ -233,8 +238,9 @@ async fn main() -> Result<()> {
         Command::Ping {
             target,
             timeout_ms,
+            prefer_v6,
             fmt,
-        } => localclient::ping(&target, timeout_ms, fmt.json).await,
+        } => localclient::ping(&target, timeout_ms, prefer_v6, fmt.json).await,
     }
 }
 

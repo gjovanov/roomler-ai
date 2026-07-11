@@ -264,6 +264,7 @@ fn build_overlay_view(
                 node_id: np.node_id.to_hex(),
                 name: np.name.clone(),
                 overlay_ip: (!np.overlay_ip.is_empty()).then(|| np.overlay_ip.clone()),
+                overlay_ip6: derived_v6_of(&np.overlay_ip),
                 online: np.reachable,
                 connection,
                 rtt_ms: None,
@@ -276,8 +277,20 @@ fn build_overlay_view(
     peers.sort_by(|a, b| a.node_id.cmp(&b.node_id));
     OverlayView {
         self_ip: (!self_ip.is_empty()).then(|| self_ip.to_string()),
+        self_ip6: derived_v6_of(self_ip),
         peers,
     }
+}
+
+/// The *derived* overlay IPv6 for an overlay-v4 string ([`derive_overlay_v6`]
+/// as display text), or `None` for an empty/unparseable one. The runtime is the
+/// single place the daemon-facing view learns v6 addresses — the daemon and its
+/// clients (CLI / tray) render them without needing the `overlay` feature.
+fn derived_v6_of(overlay_ip: &str) -> Option<String> {
+    overlay_ip
+        .parse::<Ipv4Addr>()
+        .ok()
+        .map(|v4| super::router::derive_overlay_v6(v4).to_string())
 }
 
 impl OverlayRuntime {
@@ -470,6 +483,12 @@ impl OverlayRuntime {
                     magic_domain: magic_domain.clone(),
                     upstream,
                     names: names.clone(),
+                    // AAAA (derived overlay v6) default-on; ROOMLER_AGENT_DNS_AAAA=0
+                    // reverts to A-only without a rebuild — the mixed-fleet escape
+                    // hatch (an old peer's OS doesn't own its derived v6, so v6 to
+                    // it blackholes; happy-eyeballs apps fall back, sequential apps
+                    // may hang on it).
+                    answer_aaaa: std::env::var("ROOMLER_AGENT_DNS_AAAA").as_deref() != Ok("0"),
                 }));
                 // Point the OS resolver at us for `<magic_domain>` (reverted on Drop).
                 _dns_os_guard = Some(dns::configure_os(self_v4, &magic_domain).await);

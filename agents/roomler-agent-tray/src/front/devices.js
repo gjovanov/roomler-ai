@@ -57,7 +57,15 @@
 
     const s = view.status || {};
     setText('dv-self-name', s.name || '—');
-    setText('dv-self-ip', s.overlay_ip || '(no overlay IP)');
+    // Both families when the daemon publishes the derived v6.
+    setText(
+      'dv-self-ip',
+      s.overlay_ip
+        ? s.overlay_ip6
+          ? `${s.overlay_ip} · ${s.overlay_ip6}`
+          : s.overlay_ip
+        : '(no overlay IP)',
+    );
     setText('dv-self-conn', s.connected ? 'connected' : 'disconnected');
     setText('dv-self-version', s.version || '—');
 
@@ -88,6 +96,7 @@
     const tr = document.createElement('tr');
     tr.appendChild(nameCell(p));
     tr.appendChild(textCell(p.overlay_ip || '—', 'mono'));
+    tr.appendChild(textCell(p.overlay_ip6 || '—', 'mono'));
     tr.appendChild(badgeCell(p.connection));
     tr.appendChild(textCell(p.rtt_ms != null ? `${p.rtt_ms} ms` : '—'));
     tr.appendChild(pingCell(p));
