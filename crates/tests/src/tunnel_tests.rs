@@ -7,14 +7,14 @@
 //! `DestinationRule`), the cross-tenant gate, and the tunnel-client
 //! enrollment idempotence the rehydrate path is supposed to guarantee.
 //!
-//! Three tests:
+//! Tests:
 //!
 //! * `policy_crud_round_trips` — POST → GET list → GET one → PUT →
-//!   GET one (verifies update applied) → DELETE → GET (404). Locks
-//!   the policy CRUD wire shape that the admin UI consumes; a
-//!   serde drift on any of the adjacently-tagged enums (e.g. someone
-//!   renames `kind` to `t`) would break the admin UI silently — this
-//!   catches it server-side first.
+//!   GET one (verifies update applied) → DELETE → gone-from-listing.
+//!   Locks the policy CRUD wire shape (`{kind, id}` subjects) that the
+//!   admin UI consumes; a serde drift on any of the adjacently-tagged
+//!   enums (e.g. someone renames `kind` to `t`) would break the admin
+//!   UI silently — this catches it server-side first.
 //!
 //! * `tunnel_client_enrollment_idempotent_on_same_machine_id` —
 //!   enrol → enrol again with the same `machine_id` → assert the
@@ -30,6 +30,17 @@
 //!   architecture (cross-tenant boundary is the only defence
 //!   against an admin in tenant A exfiltrating an enrollment token
 //!   that grants tunnel access into tenant B's agents).
+//!
+//! * `agent_originates_tunnel_authorized_and_relayed_to_target` (P3b-2)
+//!   — an agent drives the tunnel-CLIENT role over its own agent WS
+//!   (`Principal::Agent`), opens a tunnel to another agent, and the
+//!   server authorizes it (via an `all_users` policy) + relays the TCP
+//!   forward to the target. Locks the identity-model-(b) origination
+//!   path end-to-end.
+//!
+//! * `agent_tunnel_open_cross_tenant_rejected` (P3b-2) — the cross-tenant
+//!   wall holds for an agent origin (a tenant-1 agent must not open a
+//!   tunnel to a tenant-2 agent).
 //!
 //! WebRTC DC round-trip (agent + tunnel-client + echo server +
 //! TCP byte exchange) is NOT covered here — the existing in-process
@@ -56,17 +67,19 @@ async fn policy_crud_round_trips() {
     // Wire shape locks (see crates/remote_control/src/models.rs):
     //   - HostPattern: adjacently-tagged `{kind, value}`,
     //     variants snake_cased — `cidr` / `exact` / `wildcard`.
-    //   - PolicySubject: internally-tagged `{kind, <variant-field>}`,
-    //     variants snake_cased — `user_id` / `role_id` /
-    //     `tunnel_client_id` / `all_users`. So `kind` and the data
-    //     field share the same name for the *_id variants; that's
-    //     by-design (the variant's data field carries the value).
-    //   - PolicyTarget: internally-tagged the same way —
-    //     `agent_id` / `all_agents`.
+    //   - PolicySubject: internally-tagged `{kind, id}` — `kind` names
+    //     the variant (`user_id` / `role_id` / `tunnel_client_id` /
+    //     `agent_id` / `all_users`) and the data field is ALWAYS `id`
+    //     (`#[serde(rename = "id")]`), NOT the kind's own name. Locked
+    //     against the admin UI, which posts `{kind, id}` (see
+    //     ui/src/stores/tunnelPolicies.ts). `all_users` is a bare
+    //     `{kind: "all_users"}` unit.
+    //   - PolicyTarget: internally-tagged the same way — `{kind, id}`
+    //     for `agent_id`, bare `{kind}` for `all_agents`.
     let create_body = json!({
         "name": "loopback-test",
         "subjects": [
-            { "kind": "user_id", "user_id": seeded.admin.id }
+            { "kind": "user_id", "id": seeded.admin.id }
         ],
         "targets": [
             { "kind": "all_agents" }
@@ -211,23 +224,31 @@ async fn policy_crud_round_trips() {
         resp.status()
     );
 
-    // --- GET after delete → 404 ---
-    let resp = app
+    // --- LIST after delete → policy gone from the active listing ---
+    // `soft_delete` sets `deleted_at`; the listing the admin UI reads
+    // (`list_active_for_tenant` / `list_for_tenant`) filters on
+    // `deleted_at: null`, so the row disappears from it. NOTE: GET-one
+    // (`find_in_tenant`) does NOT filter `deleted_at`, so it still returns
+    // the tombstone (200) — an intentional asymmetry today; whether GET-one
+    // should 404 for a soft-deleted policy is a separate API-semantics call
+    // (tracked outside P3b-2). The listing is the contract the UI relies on.
+    let list_after: Value = app
         .auth_get(
-            &format!(
-                "/api/tenant/{}/tunnel-policy/{}",
-                seeded.tenant_id, policy_id
-            ),
+            &format!("/api/tenant/{}/tunnel-policy", seeded.tenant_id),
             &seeded.admin.access_token,
         )
         .send()
         .await
+        .unwrap()
+        .json()
+        .await
         .unwrap();
-    assert_eq!(
-        resp.status().as_u16(),
-        404,
-        "GET after delete must 404; got {}",
-        resp.status()
+    let remaining = list_after["items"].as_array().expect("items after delete");
+    assert!(
+        remaining
+            .iter()
+            .all(|p| p["id"].as_str() != Some(policy_id)),
+        "soft-deleted policy must not appear in the active listing"
     );
 }
 
