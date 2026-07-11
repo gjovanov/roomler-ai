@@ -107,9 +107,19 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
 /// returned trimmed but otherwise untouched — `https://` URLs stay
 /// `https://`, and a malformed input is left to fail at the reqwest
 /// layer with a clearer diagnostic than we'd produce here.
+///
+/// **Loopback is exempt**: `http://127.0.0.1`, `http://localhost`, `http://[::1]`
+/// stay `http://`. A loopback address has no off-host network path, so there's
+/// no MITM to defend against — and dev / test / CI servers run plaintext on
+/// loopback (the integration `TestApp` binds `http://127.0.0.1:<port>`). Forcing
+/// TLS there just breaks the enroll POST with a `wrong version number` SSL error.
+/// A remote host (the production case) is still upgraded.
 fn normalize_server_url(raw: &str) -> String {
     let trimmed = raw.trim_end_matches('/');
     if let Some(rest) = trimmed.strip_prefix("http://") {
+        if is_loopback_authority(rest) {
+            return trimmed.to_string();
+        }
         tracing::warn!(
             original = trimmed,
             "upgrading http:// to https:// — enrollment tokens must travel over TLS"
@@ -117,6 +127,31 @@ fn normalize_server_url(raw: &str) -> String {
         return format!("https://{rest}");
     }
     trimmed.to_string()
+}
+
+/// Is the `host[:port][/path]` authority a loopback host? Handles
+/// `127.0.0.1:41003`, `localhost`, `[::1]:8080`, and any `127.0.0.0/8` /
+/// IPv6-loopback literal.
+fn is_loopback_authority(after_scheme: &str) -> bool {
+    // Drop any path, then the port. Bracketed IPv6 keeps its `:`s until the
+    // brackets are stripped, so split the path first, then rsplit the port only
+    // when the last segment can't be part of an unbracketed host.
+    let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
+    let host = if let Some(inner) = authority.strip_prefix('[') {
+        // `[::1]:8080` → `::1`
+        inner.split(']').next().unwrap_or(inner)
+    } else if let Some((h, _port)) = authority.rsplit_once(':') {
+        // Only treat the tail as a port if the head still looks like a host
+        // (an unbracketed IPv6 has multiple `:` — leave it whole for the parse).
+        if h.contains(':') { authority } else { h }
+    } else {
+        authority
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
 }
 
 fn detect_os() -> OsKind {
@@ -148,6 +183,30 @@ mod tests {
         assert_eq!(
             normalize_server_url("http://10.0.0.5:3000"),
             "https://10.0.0.5:3000"
+        );
+    }
+
+    #[test]
+    fn http_loopback_is_not_promoted() {
+        // Loopback has no off-host path to MITM — keep it plaintext so a dev /
+        // test / CI server on 127.0.0.1 (the integration `TestApp`) enrolls.
+        assert_eq!(
+            normalize_server_url("http://127.0.0.1:41003"),
+            "http://127.0.0.1:41003"
+        );
+        assert_eq!(
+            normalize_server_url("http://localhost:5001/"),
+            "http://localhost:5001"
+        );
+        assert_eq!(
+            normalize_server_url("http://[::1]:8080"),
+            "http://[::1]:8080"
+        );
+        assert_eq!(normalize_server_url("http://127.5.5.5"), "http://127.5.5.5");
+        // A non-loopback private IP is still upgraded (only loopback is exempt).
+        assert_eq!(
+            normalize_server_url("http://192.168.1.10:3000"),
+            "https://192.168.1.10:3000"
         );
     }
 
