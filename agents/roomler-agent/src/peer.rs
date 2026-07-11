@@ -1719,11 +1719,40 @@ async fn media_pump_vp9_444_dc(
     const IDLE_KEEPALIVE: Duration = Duration::from_millis(60);
     let start = std::time::Instant::now();
 
+    // rc.166 freeze fix — relay-aware bitrate clamp + tighter backpressure.
+    // The WSL / corp path forces all media over a single TURN-TCP relay
+    // (ROOMLER_AGENT_ICE_RELAY_TCP=1), which carries only ~1-4 Mbps and is
+    // head-of-line-blocked. The 0.20-bpp VP9-444 target (~12 Mbps at
+    // 2560×1600) collapses it. Clamp the encoder to relay_max_bps (3 Mbps
+    // default) and, per Change D, trip AIMD at a shallower 256 KiB buffered
+    // watermark so we shed BEFORE the relay's tiny pipe backs up seconds deep.
+    let constrained_transport = crate::encode::transport_is_constrained();
+    let bitrate_cap: u32 = if constrained_transport {
+        crate::encode::relay_max_bps()
+    } else {
+        u32::MAX
+    };
+    // Change D: trigger AIMD earlier on the shallow relay-TCP pipe.
+    let dc_buffered_high: u64 = if constrained_transport {
+        256 * 1024
+    } else {
+        DC_BUFFERED_HIGH_BYTES
+    };
+    if constrained_transport {
+        info!(%session_id, bitrate_cap, dc_buffered_high, "VP9-444 DC pump: constrained (relay-TCP) transport — clamping bitrate + tightening backpressure");
+    }
+
     let mut frames_captured: u64 = 0;
     let mut frames_encoded: u64 = 0;
-    let mut frames_sent: u64 = 0;
-    let mut bytes_written: u64 = 0;
-    let mut send_errors: u64 = 0;
+    // rc.166 freeze fix — these three are now owned by a dedicated DC send
+    // task (spawned below, mirroring the FFmpeg pump rc.106 pattern) and
+    // shared back as atomics so the heartbeat can still read them. Moving the
+    // chunked `dc.send().await` off the pump's hot path stops a big
+    // (IDR / high-motion) frame from stalling capture+encode on the send —
+    // the 27s screen+input freeze the WSL relay-TCP path hit under motion.
+    let frames_sent = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let bytes_written = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let send_errors = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut dc_unopen_drops: u64 = 0;
     let mut frames_skipped_backpressure: u64 = 0;
     let mut scene_change_keyframes: u64 = 0;
@@ -1819,7 +1848,79 @@ async fn media_pump_vp9_444_dc(
     // libvpx's config across single-bps wobble.
     const HYSTERESIS_PCT: u32 = 15;
 
+    // rc.166 freeze fix — dedicated DC send task, ported from the FFmpeg pump
+    // (rc.106). The chunked `dc.send().await` is SCTP-flow-controlled; on a
+    // multi-MB frame over the relay-TCP path it blocks for tens of ms → whole
+    // seconds under the 27s freeze. Doing it inline (pre-rc.166) stalled
+    // capture + input. Hand framed frames to this task over a small bounded
+    // channel; the pump never blocks on the link (see the `try_send` in the
+    // loop). A SINGLE consumer keeps the 16 KiB chunk order intact (the browser
+    // reassembler needs it). Depth is intentionally shallow so we stay
+    // low-latency — under sustained congestion the pump sheds load rather than
+    // building a stale backlog.
+    const VP9_SEND_QUEUE_DEPTH: usize = 2; // shallower than FFmpeg's 4 — VP9-444 frames are large; minimise input head-of-line delay
+    let send_depth = if constrained_transport {
+        VP9_SEND_QUEUE_DEPTH
+    } else {
+        4
+    };
+    let (send_tx, mut send_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(send_depth);
+    {
+        let video_bytes_dc = video_bytes_dc.clone();
+        let frames_sent = frames_sent.clone();
+        let bytes_written = bytes_written.clone();
+        let send_errors = send_errors.clone();
+        let task_session = session_id;
+        tokio::spawn(async move {
+            use std::sync::atomic::Ordering::Relaxed;
+            const SCTP_CHUNK_SIZE: usize = 16 * 1024;
+            while let Some(wire) = send_rx.recv().await {
+                let Some(dc) = video_bytes_dc.lock().await.clone() else {
+                    continue;
+                };
+                let total = wire.len();
+                let mut off = 0usize;
+                let mut ok = true;
+                while off < total {
+                    let end = (off + SCTP_CHUNK_SIZE).min(total);
+                    if let Err(e) = dc.send(&wire.slice(off..end)).await {
+                        let n = send_errors.fetch_add(1, Relaxed) + 1;
+                        tracing::warn!(session = %task_session, %e, send_errors = n, "VP9-444 DC send task: DC send failed");
+                        ok = false;
+                        break;
+                    }
+                    off = end;
+                }
+                if ok {
+                    frames_sent.fetch_add(1, Relaxed);
+                    bytes_written.fetch_add(total as u64, Relaxed);
+                }
+            }
+            tracing::debug!(session = %task_session, "VP9-444 DC send task exiting (channel closed)");
+        });
+    }
+
     loop {
+        // rc.166 freeze fix — BACKPRESSURE GATE (ported from FFmpeg pump
+        // rc.111). Gate frame PRODUCTION on the send channel having capacity.
+        // When the send task can't drain the relay-TCP link fast enough the
+        // bounded channel fills; skip BEFORE capture+encode so we don't waste a
+        // VP9 encode on a frame we can't send AND — unlike the AIMD-skip below
+        // — we do NOT request a keyframe here: skipping before encode leaves the
+        // encoder's reference chain intact (the next encoded frame just deltas
+        // from the last ENCODED one across the gap), same rationale as the
+        // FFmpeg rc.111 comment. Check is_closed() FIRST so a dead send task
+        // exits the pump instead of livelocking on a permanently-0 capacity.
+        if send_tx.is_closed() {
+            warn!(%session_id, "VP9-444 DC pump: send task gone — exiting pump");
+            return;
+        }
+        if send_tx.capacity() == 0 {
+            frames_skipped_backpressure += 1;
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            continue;
+        }
+
         let frame: std::sync::Arc<crate::capture::Frame> = match capturer.next_frame().await {
             Ok(Some(f)) => {
                 frames_captured += 1;
@@ -1947,7 +2048,9 @@ async fn media_pump_vp9_444_dc(
         let q_now = quality_state.load(std::sync::atomic::Ordering::Relaxed);
         if let Some((ew, eh)) = encoder_dims {
             let base = encode::initial_bitrate_for_fps(ew, eh, target_fps);
-            let target = quality::target_bitrate(q_now, base);
+            // rc.166 freeze fix — clamp to the relay ceiling on a constrained
+            // transport (u32::MAX = no-op otherwise).
+            let target = quality::target_bitrate(q_now, base).min(bitrate_cap);
             let quality_changed = q_now != last_applied_quality;
             let drift_too_big = if last_applied_bitrate == 0 {
                 true
@@ -2122,7 +2225,9 @@ async fn media_pump_vp9_444_dc(
         // operator's Quality=Low/Auto/High preference allows.
         let buffered = dc.buffered_amount().await as u64;
         let now = std::time::Instant::now();
-        if buffered > DC_BUFFERED_HIGH_BYTES {
+        // rc.166 freeze fix (Change D) — `dc_buffered_high` is 256 KiB on a
+        // constrained relay, the 1 MiB const otherwise.
+        if buffered > dc_buffered_high {
             // Multiplicative decrease, applied once per AIMD interval
             // to avoid free-falling the bitrate on a transient blip.
             if now.duration_since(last_aimd_event_at) >= Duration::from_millis(500)
@@ -2162,7 +2267,10 @@ async fn media_pump_vp9_444_dc(
             {
                 if let Some((ew, eh)) = encoder_dims {
                     let base = encode::initial_bitrate_for_fps(ew, eh, target_fps);
-                    let quality_ceiling = quality::target_bitrate(q_now, base);
+                    // rc.166 freeze fix — clamp the AIMD-increase ceiling too;
+                    // without this the additive-increase ratchets the encoder
+                    // back up past the relay clamp between congestion events.
+                    let quality_ceiling = quality::target_bitrate(q_now, base).min(bitrate_cap);
                     let new_target = (last_applied_bitrate / AIMD_INCREASE_DEN)
                         .saturating_mul(AIMD_INCREASE_NUM)
                         .min(quality_ceiling);
@@ -2187,34 +2295,29 @@ async fn media_pump_vp9_444_dc(
             last_low_water_at = None;
         }
 
+        // rc.166 freeze fix — hand each framed packet to the dedicated send
+        // task (see above the loop) rather than chunk-sending inline. The send
+        // task owns the 16 KiB SCTP chunking + the flow-controlled
+        // `dc.send().await`; `try_send` NEVER blocks the capture/encode loop.
+        // If the send task is behind (the relay-TCP link can't drain a big
+        // motion/IDR frame fast enough) the bounded channel fills and we shed
+        // THIS frame + request a keyframe so the browser resyncs cleanly when
+        // the queue drains. A single consumer preserves 16 KiB chunk order for
+        // the browser reassembler. (frames_sent / bytes_written / send_errors
+        // are incremented by the send task via the shared atomics now.)
         for p in packets {
             let ts_us = start.elapsed().as_micros() as u64;
-            let wire = frame_video_bytes(&p.data, p.is_keyframe, ts_us);
-            let wire_len = wire.len() as u64;
-            // SCTP DataChannels cap individual `dc.send()` payloads at
-            // ~64 KiB (Chrome's RTCDataChannel default; some configs
-            // negotiate higher but 16 KiB is the safe cross-browser
-            // floor). VP9 4:4:4 keyframes at 2560×1600 are ~150–300 KB
-            // and would be rejected wholesale ("outbound packet larger
-            // than maximum message size"). Split into ≤ 16 KiB chunks
-            // and rely on the browser worker's byte-stream assembler
-            // (`consumeBytes` in rc-vp9-444-worker.ts) to glue them
-            // back together — it tracks header + payload progress
-            // across `dc.onmessage` calls without caring about message
-            // boundaries.
-            const SCTP_CHUNK_SIZE: usize = 16 * 1024;
-            let mut frame_failed = false;
-            for chunk in wire.chunks(SCTP_CHUNK_SIZE) {
-                if let Err(e) = dc.send(&Bytes::copy_from_slice(chunk)).await {
-                    send_errors += 1;
-                    warn!(%session_id, %e, send_errors, "VP9-444 DC send failed");
-                    frame_failed = true;
-                    break;
+            let wire = bytes::Bytes::from(frame_video_bytes(&p.data, p.is_keyframe, ts_us));
+            match send_tx.try_send(wire) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    frames_skipped_backpressure += 1;
+                    keyframe_requested.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
-            }
-            if !frame_failed {
-                frames_sent += 1;
-                bytes_written += wire_len;
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    warn!(%session_id, "VP9-444 DC pump: send task gone — exiting pump");
+                    return;
+                }
             }
         }
 
@@ -2224,6 +2327,11 @@ async fn media_pump_vp9_444_dc(
             // shows 30 when the operator set 60, the env var didn't
             // reach the agent process (wrong service-block scope, or
             // process wasn't restarted to inherit the new block).
+            // rc.166 freeze fix — the send-owned counters are snapshotted from
+            // the atomics for the log line.
+            let frames_sent = frames_sent.load(std::sync::atomic::Ordering::Relaxed);
+            let bytes_written = bytes_written.load(std::sync::atomic::Ordering::Relaxed);
+            let send_errors = send_errors.load(std::sync::atomic::Ordering::Relaxed);
             info!(
                 %session_id,
                 target_fps,
