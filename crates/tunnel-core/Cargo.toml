@@ -101,6 +101,25 @@ if-addrs = { version = "0.15", optional = true }
 # pulling a TUN dependency.
 tun = { version = "0.8", optional = true, features = ["async"] }
 
+# Overlay netstack (`overlay-netstack` feature): a userspace TCP/IP stack
+# (smoltcp) that terminates the overlay CIDR IN-PROCESS — the OS-free twin
+# of `SystemTun`. On a locked-down host (full-tunnel VPN) there is then no
+# OS route for the VPN to hijack and no TUN it can see; apps reach the mesh
+# via a local SOCKS front backed by the netstack. Pure-Rust, `no_std`-friendly
+# crate — NO C build, no crypto — so it keeps the ring-only / no-openssl
+# invariant intact (builds under MSVC locally like the rest of tunnel-core).
+# default-features off to drop the Unix-only phy backends (`phy-tuntap_interface`)
+# and the protocols we don't terminate; we feed/drain raw IP packets ourselves
+# via a channel-backed `phy::Device`, so only the `medium-ip` surface is needed.
+smoltcp = { version = "0.13", optional = true, default-features = false, features = [
+    "std",
+    "medium-ip",
+    "proto-ipv4",
+    "socket-tcp",
+    "socket-udp",
+    "socket-icmp",
+] }
+
 # Windows bindings (Win32). Always compiled on Windows (NOT optional) because
 # the LocalAPI named-pipe listener (`localapi::serve`, unification P1) needs the
 # SDDL security-descriptor helpers in EVERY build — the LocalAPI is core daemon
@@ -129,6 +148,13 @@ overlay = ["dep:boringtun", "dep:base64", "dep:if-addrs"]
 # in-memory MockTun loopback test (no real device); `overlay-l3` adds the
 # `tun` crate's real `SystemTun`. Off by default.
 overlay-l3 = ["overlay", "dep:tun"]
+# Netstack: a userspace smoltcp TCP/IP stack presented as an alternative
+# `TunIo` (so the WG bridge pumps it exactly like `SystemTun`), plus an
+# app-facing `connect()`/`listen()` surface for a SOCKS front. Builds on the
+# WG core (`overlay`) but NOT the OS device (`overlay-l3`) — that's the whole
+# point: no OS routing. Off by default; independent of `overlay-l3` (a node
+# runs one surface or the other).
+overlay-netstack = ["overlay", "dep:smoltcp"]
 
 [dev-dependencies]
 tokio-test = { workspace = true }

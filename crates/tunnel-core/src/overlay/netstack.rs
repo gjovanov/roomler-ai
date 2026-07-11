@@ -1,0 +1,928 @@
+//! Userspace TCP/IP stack (netstack) — the overlay's OS-free twin.
+//!
+//! [`SystemTun`](super::tun::SystemTun) hands the overlay's IP packets to the
+//! OS kernel via a real TUN device, which means the OS routing table decides
+//! where overlay traffic goes — and on a full-tunnel corporate VPN (Check
+//! Point) that table is exactly what the VPN captures. The netstack removes the
+//! OS from the overlay data path entirely: it terminates the overlay CIDR's
+//! TCP/UDP/ICMP **in userspace** with [smoltcp], so there is no OS route for the
+//! VPN to hijack and no TUN device it can see.
+//!
+//! ```text
+//!            app (SOCKS front)                overlay peers
+//!                  │  connect(100.64.0.5:3389)      ▲
+//!                  ▼                                 │ WG ciphertext
+//!         ┌──────────────────┐  IP pkts   ┌──────────┴─────────┐
+//!         │  Netstack        │───────────▶│ NetstackTun(TunIo) │──▶ run_bridge
+//!         │  (smoltcp poll   │◀───────────│  out_rx / in_tx    │◀── WgDevice
+//!         │   loop actor)    │  IP pkts   └────────────────────┘
+//!         └──────────────────┘
+//! ```
+//!
+//! The [`NetstackTun`] is a drop-in [`TunIo`](super::tun::TunIo): the WG
+//! [`bridge`](super::bridge) pumps it exactly like the real device
+//! (`read_packet` = "the next IP packet the stack wants to send into the mesh";
+//! `write_packet` = "an IP packet that arrived from the mesh, feed it to the
+//! stack"). Apps reach the mesh through [`NetstackHandle::connect`], which opens
+//! a smoltcp TCP socket to an overlay address; the SYN rides the WG carriers to
+//! the owning peer and the established stream is surfaced as an
+//! [`AsyncRead`]+[`AsyncWrite`] [`NsTcpStream`] a SOCKS front can
+//! [`copy_bidirectional`](tokio::io::copy_bidirectional) against.
+//!
+//! **Concurrency model.** smoltcp is sans-I/O and not `Sync`, so a single
+//! **poll-loop task** owns the [`Interface`] + [`SocketSet`] + the
+//! [`NetstackDevice`] and is the sole mutator of stack state. Everything else —
+//! the TUN read/write halves, the app-facing sockets — talks to it over
+//! channels, and a shared [`Notify`] wakes it whenever there is new work
+//! (an inbound packet, an app write, a control request). This is the standard
+//! "netstack actor" shape.
+//!
+//! v1 scope: TCP `connect` (the SOCKS-CONNECT backend) + `listen` (mostly for
+//! the self-contained echo tests). UDP-associate and ICMP `ping` reuse the same
+//! device + poll loop and land in a follow-up; the socket buffers for them are
+//! already compiled in via the crate features.
+//!
+//! [smoltcp]: https://docs.rs/smoltcp
+
+use std::collections::{HashMap, VecDeque};
+use std::io;
+use std::net::{Ipv4Addr, SocketAddrV4};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll};
+use std::time::{Duration, Instant};
+
+use async_trait::async_trait;
+use futures::task::AtomicWaker;
+use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
+use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use smoltcp::socket::tcp;
+use smoltcp::time::Instant as SmolInstant;
+use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpListenEndpoint};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot};
+use tracing::{debug, trace};
+
+use super::tun::TunIo;
+
+/// Per-socket smoltcp ring-buffer size (each direction). 64 KiB gives a
+/// healthy TCP window over the ~1280-MTU overlay without being wasteful.
+const SOCK_BUF: usize = 64 * 1024;
+/// Max bytes moved between a smoltcp socket buffer and an app channel in one
+/// chunk — bounds per-copy allocation and keeps chunks SCTP-friendly.
+const CHUNK: usize = 16 * 1024;
+/// Depth of each app⇄stack byte channel (in chunks). Backpressure kicks in
+/// past this; the smoltcp window then closes and the peer slows.
+const CHAN_CAP: usize = 32;
+/// First ephemeral local port handed to outbound connects (IANA dynamic range).
+const EPHEMERAL_BASE: u16 = 49152;
+/// Backstop cap on the poll-loop sleep. smoltcp's own `poll_delay` drives
+/// timers precisely; this only guarantees liveness if a wake is ever missed.
+const SLEEP_BACKSTOP: Duration = Duration::from_millis(50);
+/// Default connect timeout — smoltcp will retransmit SYNs for far longer, but
+/// an app expects a bounded failure when the peer is unreachable.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+// ===========================================================================
+// Device — a smoltcp `phy::Device` backed by two packet queues.
+// ===========================================================================
+
+/// smoltcp's link layer, wired to the overlay instead of a NIC. Owned solely by
+/// the poll loop, so it needs no interior locking: inbound packets (from the
+/// mesh) are pushed onto `rx` before each poll; outbound packets smoltcp emits
+/// are handed to `out_tx` (drained by [`NetstackTun::read_packet`]).
+struct NetstackDevice {
+    rx: VecDeque<Vec<u8>>,
+    out_tx: mpsc::UnboundedSender<Vec<u8>>,
+    mtu: usize,
+}
+
+/// Owns one received packet; smoltcp borrows it immutably to parse.
+struct NsRxToken(Vec<u8>);
+/// Carries a clone of the outbound sender so smoltcp can emit a packet (a data
+/// segment from `transmit`, or a reply like a RST from `receive`).
+struct NsTxToken(mpsc::UnboundedSender<Vec<u8>>);
+
+impl RxToken for NsRxToken {
+    fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
+        f(&self.0)
+    }
+}
+
+impl TxToken for NsTxToken {
+    fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
+        let mut buf = vec![0u8; len];
+        let r = f(&mut buf);
+        // Best-effort: a closed receiver means the bridge/overlay is gone; the
+        // packet is dropped exactly like a NIC dropping toward a down link.
+        let _ = self.0.send(buf);
+        r
+    }
+}
+
+impl Device for NetstackDevice {
+    type RxToken<'a> = NsRxToken;
+    type TxToken<'a> = NsTxToken;
+
+    fn receive(&mut self, _t: SmolInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        let pkt = self.rx.pop_front()?;
+        Some((NsRxToken(pkt), NsTxToken(self.out_tx.clone())))
+    }
+
+    fn transmit(&mut self, _t: SmolInstant) -> Option<Self::TxToken<'_>> {
+        Some(NsTxToken(self.out_tx.clone()))
+    }
+
+    fn capabilities(&self) -> DeviceCapabilities {
+        let mut caps = DeviceCapabilities::default();
+        caps.medium = Medium::Ip;
+        caps.max_transmission_unit = self.mtu;
+        caps
+    }
+}
+
+// ===========================================================================
+// TUN seam — the `TunIo` the WG bridge pumps.
+// ===========================================================================
+
+/// The netstack presented as a [`TunIo`]. `read_packet` yields packets the
+/// stack wants on the wire (overlay-bound); `write_packet` injects packets that
+/// arrived from the mesh and nudges the poll loop to process them.
+pub struct NetstackTun {
+    out_rx: Mutex<mpsc::UnboundedReceiver<Vec<u8>>>,
+    in_tx: mpsc::UnboundedSender<Vec<u8>>,
+    wake: Arc<Notify>,
+}
+
+#[async_trait]
+impl TunIo for NetstackTun {
+    async fn read_packet(&self) -> io::Result<Vec<u8>> {
+        self.out_rx
+            .lock()
+            .await
+            .recv()
+            .await
+            .ok_or_else(|| io::Error::other("netstack outbound channel closed"))
+    }
+
+    async fn write_packet(&self, packet: &[u8]) -> io::Result<()> {
+        self.in_tx
+            .send(packet.to_vec())
+            .map_err(|_| io::Error::other("netstack inbound channel closed"))?;
+        self.wake.notify_one();
+        Ok(())
+    }
+}
+
+// ===========================================================================
+// Control plane — app requests to the poll loop.
+// ===========================================================================
+
+enum Control {
+    Connect {
+        dst: SocketAddrV4,
+        resp: oneshot::Sender<io::Result<NsTcpStream>>,
+    },
+    Listen {
+        port: u16,
+        accepted: mpsc::Sender<NsTcpStream>,
+    },
+}
+
+/// App-facing handle to a running netstack. Cheap to clone; each clone can open
+/// connections concurrently (all serialised through the one poll loop).
+#[derive(Clone)]
+pub struct NetstackHandle {
+    ctl: mpsc::Sender<Control>,
+}
+
+impl NetstackHandle {
+    /// Open a TCP connection to an overlay address. Resolves once the smoltcp
+    /// handshake completes (or errors / times out). This is the SOCKS-CONNECT
+    /// backend: the returned [`NsTcpStream`] is [`AsyncRead`]+[`AsyncWrite`].
+    pub async fn connect(&self, dst: SocketAddrV4) -> io::Result<NsTcpStream> {
+        let (resp, rx) = oneshot::channel();
+        self.ctl
+            .send(Control::Connect { dst, resp })
+            .await
+            .map_err(|_| io::Error::other("netstack poll loop gone"))?;
+        match tokio::time::timeout(CONNECT_TIMEOUT, rx).await {
+            Ok(Ok(res)) => res,
+            Ok(Err(_)) => Err(io::Error::other("netstack dropped the connect request")),
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("netstack connect to {dst} timed out"),
+            )),
+        }
+    }
+
+    /// Listen on an overlay TCP port and accept connections. Primarily exercises
+    /// the inbound path in tests; a real deployment mostly uses [`connect`].
+    ///
+    /// [`connect`]: NetstackHandle::connect
+    pub async fn listen(&self, port: u16) -> io::Result<NsListener> {
+        let (accepted, rx) = mpsc::channel(CHAN_CAP);
+        self.ctl
+            .send(Control::Listen { port, accepted })
+            .await
+            .map_err(|_| io::Error::other("netstack poll loop gone"))?;
+        Ok(NsListener { rx })
+    }
+}
+
+/// Yields inbound connections to a listened port, in arrival order.
+pub struct NsListener {
+    rx: mpsc::Receiver<NsTcpStream>,
+}
+
+impl NsListener {
+    /// Next accepted connection, or `None` once the netstack shuts down.
+    pub async fn accept(&mut self) -> Option<NsTcpStream> {
+        self.rx.recv().await
+    }
+}
+
+// ===========================================================================
+// Stream — the AsyncRead/AsyncWrite the app drives.
+// ===========================================================================
+
+/// One established TCP connection inside the netstack, as an
+/// [`AsyncRead`]+[`AsyncWrite`] handle. Bytes shuttle to/from the poll loop over
+/// bounded channels: reads pull chunks the stack delivered; writes push chunks
+/// the stack will segment onto the wire. Dropping the stream aborts the socket;
+/// [`poll_shutdown`](AsyncWrite::poll_shutdown) half-closes it (FIN).
+pub struct NsTcpStream {
+    /// Stack → app. `None`/closed ⇒ EOF (peer FIN or socket gone).
+    from_stack: mpsc::Receiver<Vec<u8>>,
+    /// Leftover of a delivered chunk not yet fully copied into a read buffer.
+    read_rem: Vec<u8>,
+    read_off: usize,
+    /// App → stack. `None` after shutdown (its drop tells the stack to FIN).
+    to_stack: Option<mpsc::Sender<Vec<u8>>>,
+    /// Woken by the stack when `to_stack` drains, so a backpressured writer
+    /// re-polls.
+    write_waker: Arc<AtomicWaker>,
+    /// Nudge the poll loop after an app read/write so it refills/flushes.
+    wake: Arc<Notify>,
+    peer: SocketAddrV4,
+}
+
+impl NsTcpStream {
+    /// The overlay address this stream is connected to (or accepted from).
+    pub fn peer_addr(&self) -> SocketAddrV4 {
+        self.peer
+    }
+}
+
+impl AsyncRead for NsTcpStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+
+        // Drain any leftover from a previous chunk first.
+        if this.read_off < this.read_rem.len() {
+            let n = (this.read_rem.len() - this.read_off).min(buf.remaining());
+            buf.put_slice(&this.read_rem[this.read_off..this.read_off + n]);
+            this.read_off += n;
+            this.wake.notify_one();
+            return Poll::Ready(Ok(()));
+        }
+
+        match this.from_stack.poll_recv(cx) {
+            Poll::Ready(Some(chunk)) => {
+                let n = chunk.len().min(buf.remaining());
+                buf.put_slice(&chunk[..n]);
+                this.read_rem = chunk;
+                this.read_off = n;
+                this.wake.notify_one();
+                Poll::Ready(Ok(()))
+            }
+            // Channel closed ⇒ clean EOF (0 bytes filled).
+            Poll::Ready(None) => Poll::Ready(Ok(())),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl AsyncWrite for NsTcpStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let Some(tx) = this.to_stack.as_ref() else {
+            return Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)));
+        };
+        let n = buf.len().min(CHUNK);
+        match tx.try_send(buf[..n].to_vec()) {
+            Ok(()) => {
+                this.wake.notify_one();
+                Poll::Ready(Ok(n))
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                // Register for a wake when the stack drains a slot, then retry.
+                this.write_waker.register(cx.waker());
+                Poll::Pending
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)))
+            }
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        // Bytes are queued to the stack; the wire flush is the stack's job.
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        // Dropping the sender signals the stack to FIN once its queue drains.
+        this.to_stack = None;
+        this.wake.notify_one();
+        Poll::Ready(Ok(()))
+    }
+}
+
+// ===========================================================================
+// Poll loop — the single owner of smoltcp state.
+// ===========================================================================
+
+/// Stack-side bookkeeping for one established connection (keyed by its
+/// [`SocketHandle`] in [`PollLoop::conns`]).
+struct Conn {
+    /// Stack → app. `None` after we've signalled EOF (dropped to close it).
+    to_app: Option<mpsc::Sender<Vec<u8>>>,
+    /// App → stack.
+    from_app: mpsc::Receiver<Vec<u8>>,
+    /// A chunk pulled from `from_app` but not yet fully written into smoltcp.
+    pending: Option<Vec<u8>>,
+    pending_off: usize,
+    write_waker: Arc<AtomicWaker>,
+    app_write_closed: bool,
+    fin_sent: bool,
+}
+
+/// A connect awaiting its handshake; fires `resp` on Established / failure.
+/// Keyed by its [`SocketHandle`] in [`PollLoop::pending_connect`].
+struct PendingConnect {
+    resp: Option<oneshot::Sender<io::Result<NsTcpStream>>>,
+    dst: SocketAddrV4,
+}
+
+/// A listening socket; each accepted connection is sent on `accepted`, then a
+/// fresh listening socket is armed for the same port (single-backlog accept).
+/// Keyed by its [`SocketHandle`] in [`PollLoop::pending_listen`].
+struct PendingListen {
+    port: u16,
+    accepted: mpsc::Sender<NsTcpStream>,
+}
+
+struct PollLoop {
+    iface: Interface,
+    sockets: SocketSet<'static>,
+    device: NetstackDevice,
+    in_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    ctl_rx: mpsc::Receiver<Control>,
+    wake: Arc<Notify>,
+    conns: HashMap<SocketHandle, Conn>,
+    pending_connect: HashMap<SocketHandle, PendingConnect>,
+    pending_listen: HashMap<SocketHandle, PendingListen>,
+    next_port: u16,
+    base: Instant,
+}
+
+impl PollLoop {
+    fn now(&self) -> SmolInstant {
+        SmolInstant::from_micros(self.base.elapsed().as_micros() as i64)
+    }
+
+    fn ephemeral_port(&mut self) -> u16 {
+        let p = self.next_port;
+        self.next_port = self.next_port.checked_add(1).unwrap_or(EPHEMERAL_BASE);
+        p
+    }
+
+    fn new_tcp_socket() -> tcp::Socket<'static> {
+        tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0u8; SOCK_BUF]),
+            tcp::SocketBuffer::new(vec![0u8; SOCK_BUF]),
+        )
+    }
+
+    fn do_connect(&mut self, dst: SocketAddrV4, resp: oneshot::Sender<io::Result<NsTcpStream>>) {
+        let mut sock = Self::new_tcp_socket();
+        let local = IpListenEndpoint {
+            addr: None,
+            port: self.ephemeral_port(),
+        };
+        let remote = (IpAddress::from(*dst.ip()), dst.port());
+        let handle = self.sockets.add(sock_taken(&mut sock));
+        let cx = self.iface.context();
+        match self
+            .sockets
+            .get_mut::<tcp::Socket>(handle)
+            .connect(cx, remote, local)
+        {
+            Ok(()) => {
+                self.pending_connect.insert(
+                    handle,
+                    PendingConnect {
+                        resp: Some(resp),
+                        dst,
+                    },
+                );
+            }
+            Err(e) => {
+                self.sockets.remove(handle);
+                let _ = resp.send(Err(io::Error::other(format!("connect: {e}"))));
+            }
+        }
+    }
+
+    fn do_listen(&mut self, port: u16, accepted: mpsc::Sender<NsTcpStream>) {
+        self.arm_listener(port, accepted);
+    }
+
+    fn arm_listener(&mut self, port: u16, accepted: mpsc::Sender<NsTcpStream>) {
+        let mut sock = Self::new_tcp_socket();
+        if let Err(e) = sock.listen(port) {
+            debug!(%port, error = %e, "netstack: listen failed");
+            return;
+        }
+        let handle = self.sockets.add(sock);
+        self.pending_listen
+            .insert(handle, PendingListen { port, accepted });
+    }
+
+    /// Build the paired stack-side [`Conn`] + app-side [`NsTcpStream`] for a
+    /// freshly established socket.
+    fn make_pair(&self, peer: SocketAddrV4) -> (Conn, NsTcpStream) {
+        let (to_app, from_stack) = mpsc::channel(CHAN_CAP);
+        let (to_stack, from_app) = mpsc::channel(CHAN_CAP);
+        let write_waker = Arc::new(AtomicWaker::new());
+        let conn = Conn {
+            to_app: Some(to_app),
+            from_app,
+            pending: None,
+            pending_off: 0,
+            write_waker: write_waker.clone(),
+            app_write_closed: false,
+            fin_sent: false,
+        };
+        let stream = NsTcpStream {
+            from_stack,
+            read_rem: Vec::new(),
+            read_off: 0,
+            to_stack: Some(to_stack),
+            write_waker,
+            wake: self.wake.clone(),
+            peer,
+        };
+        (conn, stream)
+    }
+
+    /// Promote pending connects/listens whose sockets have established, and fail
+    /// connects whose sockets died during the handshake.
+    fn promote_pending(&mut self) {
+        // Connects.
+        let mut established = Vec::new();
+        let mut failed = Vec::new();
+        for (h, pc) in self.pending_connect.iter() {
+            let s = self.sockets.get::<tcp::Socket>(*h);
+            match s.state() {
+                tcp::State::Established => established.push(*h),
+                tcp::State::Closed => failed.push((*h, pc.dst)),
+                _ => {}
+            }
+        }
+        for h in established {
+            let mut pc = self.pending_connect.remove(&h).unwrap();
+            let (conn, stream) = self.make_pair(pc.dst);
+            self.conns.insert(h, conn);
+            if let Some(resp) = pc.resp.take() {
+                let _ = resp.send(Ok(stream));
+            }
+            trace!(peer = %pc.dst, "netstack: connect established");
+        }
+        for (h, dst) in failed {
+            let mut pc = self.pending_connect.remove(&h).unwrap();
+            self.sockets.remove(h);
+            if let Some(resp) = pc.resp.take() {
+                let _ = resp.send(Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    format!("netstack connect to {dst} failed"),
+                )));
+            }
+        }
+
+        // Listens.
+        let ready: Vec<SocketHandle> = self
+            .pending_listen
+            .iter()
+            .filter(|(h, _)| {
+                self.sockets.get::<tcp::Socket>(**h).state() == tcp::State::Established
+            })
+            .map(|(h, _)| *h)
+            .collect();
+        for h in ready {
+            let pl = self.pending_listen.remove(&h).unwrap();
+            let peer = self
+                .sockets
+                .get::<tcp::Socket>(h)
+                .remote_endpoint()
+                .and_then(sockaddr_v4_of)
+                .unwrap_or_else(|| SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, pl.port));
+            let (conn, stream) = self.make_pair(peer);
+            self.conns.insert(h, conn);
+            // Re-arm a fresh listener for the next connection before delivering.
+            self.arm_listener(pl.port, pl.accepted.clone());
+            if pl.accepted.try_send(stream).is_err() {
+                debug!(
+                    port = pl.port,
+                    "netstack: accept queue full/closed; dropping conn"
+                );
+            }
+        }
+    }
+
+    /// Move bytes between smoltcp sockets and the app channels for every live
+    /// connection. Returns `true` if it made progress (⇒ poll again).
+    fn service_conns(&mut self) -> bool {
+        let mut progressed = false;
+        let mut dead = Vec::new();
+
+        let handles: Vec<SocketHandle> = self.conns.keys().copied().collect();
+        for h in handles {
+            let sock = self.sockets.get_mut::<tcp::Socket>(h);
+            let conn = self.conns.get_mut(&h).unwrap();
+
+            // App dropped the whole stream (both halves gone) ⇒ abort.
+            let app_gone = conn.to_app.as_ref().is_none_or(mpsc::Sender::is_closed)
+                && conn.from_app.is_closed()
+                && conn.pending.is_none();
+            if app_gone && sock.is_open() {
+                sock.abort();
+            }
+
+            // Stack → app.
+            while sock.can_recv() {
+                let Some(tx) = conn.to_app.as_ref() else {
+                    break;
+                };
+                let Ok(permit) = tx.try_reserve() else { break }; // app slow ⇒ window closes
+                let chunk = sock
+                    .recv(|data| {
+                        let n = data.len().min(CHUNK);
+                        (n, data[..n].to_vec())
+                    })
+                    .unwrap_or_default();
+                if chunk.is_empty() {
+                    break;
+                }
+                permit.send(chunk);
+                progressed = true;
+            }
+            // Peer half-closed and the buffer is drained ⇒ signal EOF to the app.
+            if conn.to_app.is_some() && !sock.may_recv() && !sock.can_recv() {
+                conn.to_app = None; // dropping the sender = EOF for the reader
+                progressed = true;
+            }
+
+            // App → stack.
+            loop {
+                if conn.pending.is_none() {
+                    match conn.from_app.try_recv() {
+                        Ok(chunk) => {
+                            conn.pending = Some(chunk);
+                            conn.pending_off = 0;
+                        }
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => {
+                            conn.app_write_closed = true;
+                            break;
+                        }
+                    }
+                }
+                let Some(chunk) = conn.pending.as_ref() else {
+                    break;
+                };
+                if !sock.can_send() {
+                    break;
+                }
+                match sock.send_slice(&chunk[conn.pending_off..]) {
+                    Ok(0) => break, // no room
+                    Ok(sent) => {
+                        conn.pending_off += sent;
+                        progressed = true;
+                        if conn.pending_off >= chunk.len() {
+                            conn.pending = None;
+                            conn.pending_off = 0;
+                        }
+                    }
+                    Err(_) => {
+                        conn.pending = None;
+                        break;
+                    }
+                }
+            }
+            // A drained queue may unblock a backpressured writer.
+            conn.write_waker.wake();
+
+            // App finished writing and we've flushed everything ⇒ FIN.
+            if conn.app_write_closed && conn.pending.is_none() && !conn.fin_sent && sock.may_send()
+            {
+                sock.close();
+                conn.fin_sent = true;
+                progressed = true;
+            }
+
+            // Fully closed both ways ⇒ reap.
+            if matches!(sock.state(), tcp::State::Closed) && !sock.is_active() {
+                dead.push(h);
+            }
+        }
+
+        for h in dead {
+            self.conns.remove(&h);
+            self.sockets.remove(h);
+            progressed = true;
+        }
+        progressed
+    }
+
+    /// One settle pass: poll smoltcp, promote handshakes, shuttle bytes —
+    /// repeated until it quiesces (bounded), so an inbound packet and the app
+    /// I/O it unblocks flush in the same wake.
+    fn run_stack(&mut self) {
+        for _ in 0..8 {
+            let now = self.now();
+            let _ = self.iface.poll(now, &mut self.device, &mut self.sockets);
+            self.promote_pending();
+            let progressed = self.service_conns();
+            if !progressed && self.device.rx.is_empty() {
+                break;
+            }
+        }
+    }
+
+    fn sleep_delay(&mut self) -> Duration {
+        let now = self.now();
+        self.iface
+            .poll_delay(now, &self.sockets)
+            .map(|d| Duration::from_micros(d.total_micros()))
+            .unwrap_or(SLEEP_BACKSTOP)
+            .min(SLEEP_BACKSTOP)
+    }
+
+    async fn run(mut self) {
+        loop {
+            self.run_stack();
+            let delay = self.sleep_delay();
+            tokio::select! {
+                biased;
+                ctl = self.ctl_rx.recv() => match ctl {
+                    Some(Control::Connect { dst, resp }) => self.do_connect(dst, resp),
+                    Some(Control::Listen { port, accepted }) => self.do_listen(port, accepted),
+                    None => break, // handle dropped ⇒ shut down
+                },
+                pkt = self.in_rx.recv() => {
+                    // `None` ⇒ the TUN write half is gone; keep serving app-side.
+                    if let Some(p) = pkt {
+                        self.device.rx.push_back(p);
+                    }
+                }
+                _ = self.wake.notified() => {}
+                _ = tokio::time::sleep(delay) => {}
+            }
+        }
+        debug!("netstack: poll loop exiting");
+    }
+}
+
+/// Move a socket out by value (smoltcp `Socket::new` gives an owned socket; this
+/// keeps [`PollLoop::do_connect`] readable where a temporary is needed).
+fn sock_taken(s: &mut tcp::Socket<'static>) -> tcp::Socket<'static> {
+    std::mem::replace(
+        s,
+        tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![]),
+            tcp::SocketBuffer::new(vec![]),
+        ),
+    )
+}
+
+/// smoltcp `IpEndpoint` → `SocketAddrV4` (IPv4 only; `None` for v6/unspecified).
+fn sockaddr_v4_of(ep: smoltcp::wire::IpEndpoint) -> Option<SocketAddrV4> {
+    match ep.addr {
+        // smoltcp 0.12+ uses `std::net::Ipv4Addr` directly, so no conversion.
+        IpAddress::Ipv4(v4) => Some(SocketAddrV4::new(v4, ep.port)),
+        // Unreachable while only `proto-ipv4` is enabled (single-variant enum),
+        // but keeps the match total if `proto-ipv6` is ever turned on.
+        #[allow(unreachable_patterns)]
+        _ => None,
+    }
+}
+
+// ===========================================================================
+// Constructor.
+// ===========================================================================
+
+/// A running netstack: the [`TunIo`] the bridge pumps + the app-facing handle.
+pub struct Netstack {
+    /// Plug into [`run_bridge`](super::bridge::run_bridge) as the `tun`.
+    pub tun: Arc<NetstackTun>,
+    /// Open connections / listeners against the mesh.
+    pub handle: NetstackHandle,
+}
+
+impl Netstack {
+    /// Start a netstack that owns `self_ip` on a `prefix`-length overlay network
+    /// (e.g. `/10` for `100.64.0.0/10`), with the given `mtu`. Spawns the poll
+    /// loop on the current Tokio runtime. Assigning the network prefix makes
+    /// every overlay peer on-link, so no route table is needed for peer-to-peer
+    /// traffic (LAN-subnet routing via the netstack is a follow-up).
+    pub fn start(self_ip: Ipv4Addr, prefix: u8, mtu: u16) -> Self {
+        let (out_tx, out_rx) = mpsc::unbounded_channel();
+        let (in_tx, in_rx) = mpsc::unbounded_channel();
+        let (ctl_tx, ctl_rx) = mpsc::channel(CHAN_CAP);
+        let wake = Arc::new(Notify::new());
+
+        let mut device = NetstackDevice {
+            rx: VecDeque::new(),
+            out_tx,
+            mtu: mtu as usize,
+        };
+
+        let base = Instant::now();
+        let mut config = Config::new(HardwareAddress::Ip);
+        config.random_seed = rand::random();
+        let mut iface = Interface::new(
+            config,
+            &mut device,
+            SmolInstant::from_micros(base.elapsed().as_micros() as i64),
+        );
+        iface.update_ip_addrs(|addrs| {
+            let _ = addrs.push(IpCidr::new(IpAddress::from(self_ip), prefix));
+        });
+
+        let poll_loop = PollLoop {
+            iface,
+            sockets: SocketSet::new(Vec::new()),
+            device,
+            in_rx,
+            ctl_rx,
+            wake: wake.clone(),
+            conns: HashMap::new(),
+            pending_connect: HashMap::new(),
+            pending_listen: HashMap::new(),
+            next_port: EPHEMERAL_BASE,
+            base,
+        };
+        tokio::spawn(poll_loop.run());
+
+        Self {
+            tun: Arc::new(NetstackTun {
+                out_rx: Mutex::new(out_rx),
+                in_tx,
+                wake,
+            }),
+            handle: NetstackHandle { ctl: ctl_tx },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Two proofs of the userspace path:
+    //! * `direct_pair_tcp_echo` — two netstacks cross-linked at L3 (no WG): the
+    //!   smoltcp wrapper alone carries a TCP echo.
+    //! * `bridge_tcp_echo_over_wireguard` — two netstacks bridged through a real
+    //!   [`WgDevice`] pair (mirrors [`super::super::bridge`]'s loopback test):
+    //!   the full `app → smoltcp → WG → carrier → WG → smoltcp → app` path
+    //!   carries a TCP echo entirely in userspace, no OS device, no privilege.
+
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Echo everything received back to the sender until EOF.
+    async fn echo(stream: NsTcpStream) {
+        let (mut r, mut w) = tokio::io::split(stream);
+        let _ = tokio::io::copy(&mut r, &mut w).await;
+        let _ = w.shutdown().await;
+    }
+
+    /// Drive an app request/echo round-trip against a connected stack.
+    async fn round_trip(handle: &NetstackHandle, dst: SocketAddrV4, msg: &[u8]) {
+        let mut s = handle.connect(dst).await.expect("connect");
+        s.write_all(msg).await.expect("write");
+        s.flush().await.expect("flush");
+        let mut got = vec![0u8; msg.len()];
+        s.read_exact(&mut got).await.expect("read echo");
+        assert_eq!(got, msg, "echo must round-trip through the netstack");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn direct_pair_tcp_echo() {
+        // Two stacks on the same /24, cross-linked packet-for-packet.
+        let a_ip = Ipv4Addr::new(10, 9, 0, 1);
+        let b_ip = Ipv4Addr::new(10, 9, 0, 2);
+        let a = Netstack::start(a_ip, 24, 1280);
+        let b = Netstack::start(b_ip, 24, 1280);
+
+        // a.out → b.in  and  b.out → a.in.
+        let (a_tun, b_tun) = (a.tun.clone(), b.tun.clone());
+        tokio::spawn(async move {
+            while let Ok(pkt) = a_tun.read_packet().await {
+                if b_tun.write_packet(&pkt).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let (a_tun2, b_tun2) = (a.tun.clone(), b.tun.clone());
+        tokio::spawn(async move {
+            while let Ok(pkt) = b_tun2.read_packet().await {
+                if a_tun2.write_packet(&pkt).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // B listens + echoes.
+        let mut listener = b.handle.listen(9000).await.unwrap();
+        tokio::spawn(async move {
+            if let Some(s) = listener.accept().await {
+                echo(s).await;
+            }
+        });
+
+        let dst = SocketAddrV4::new(b_ip, 9000);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            round_trip(&a.handle, dst, b"hello-netstack"),
+        )
+        .await
+        .expect("round trip in time");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bridge_tcp_echo_over_wireguard() {
+        use crate::overlay::WgKeypair;
+        use crate::overlay::bridge::run_bridge;
+        use crate::overlay::wg::{Carrier, WgDevice};
+        use tokio::net::UdpSocket;
+
+        let a_ip = Ipv4Addr::new(100, 64, 0, 1);
+        let b_ip = Ipv4Addr::new(100, 64, 0, 2);
+
+        // WG carrier pair over loopback UDP (as in the bridge module test).
+        let ka = WgKeypair::generate();
+        let kb = WgKeypair::generate();
+        let sock_a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sock_b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr_a = sock_a.local_addr().unwrap();
+        let addr_b = sock_b.local_addr().unwrap();
+        let (mut dev_a, rx_a) = WgDevice::new(ka.secret.clone());
+        let (mut dev_b, rx_b) = WgDevice::new(kb.secret.clone());
+        dev_a.add_peer(
+            kb.public.to_bytes(),
+            b_ip,
+            Carrier::direct(sock_a.clone(), addr_b),
+            true,
+        );
+        dev_b.add_peer(
+            ka.public.to_bytes(),
+            a_ip,
+            Carrier::direct(sock_b.clone(), addr_a),
+            false,
+        );
+        let (dev_a, dev_b) = (Arc::new(dev_a), Arc::new(dev_b));
+
+        // A netstack ↔ dev_a bridge; B netstack ↔ dev_b bridge. /10 = overlay CIDR.
+        let a = Netstack::start(a_ip, 10, 1280);
+        let b = Netstack::start(b_ip, 10, 1280);
+        tokio::spawn(run_bridge(a.tun.clone() as Arc<dyn TunIo>, dev_a, rx_a));
+        tokio::spawn(run_bridge(b.tun.clone() as Arc<dyn TunIo>, dev_b, rx_b));
+
+        let mut listener = b.handle.listen(3389).await.unwrap();
+        tokio::spawn(async move {
+            if let Some(s) = listener.accept().await {
+                echo(s).await;
+            }
+        });
+
+        // WG handshake + SYN retransmit can take a beat; connect() retries via
+        // smoltcp until the session is up, bounded by CONNECT_TIMEOUT.
+        let dst = SocketAddrV4::new(b_ip, 3389);
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            round_trip(&a.handle, dst, b"rdp-over-userspace-wireguard"),
+        )
+        .await
+        .expect("round trip over the WG bridge in time");
+    }
+}
