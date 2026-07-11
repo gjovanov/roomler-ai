@@ -15,6 +15,8 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 #[cfg(target_os = "windows")]
 use roomler_agent::dpi;
+#[cfg(target_os = "linux")]
+use roomler_agent::virtual_desktop;
 #[cfg(target_os = "windows")]
 use roomler_agent::win_service;
 #[cfg(target_os = "windows")]
@@ -1051,6 +1053,54 @@ async fn re_enroll_cmd(config_path: &PathBuf, enrollment_token: &str) -> Result<
     Ok(())
 }
 
+/// True if virtual-desktop mode was requested (`ROOMLER_AGENT_VIRTUAL_DESKTOP`).
+fn virtual_desktop_requested() -> bool {
+    std::env::var("ROOMLER_AGENT_VIRTUAL_DESKTOP")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Linux: if requested, bring up the virtual desktop, point capture at it via
+/// `DISPLAY`, and auto-enable relay-over-TCP media (hostile-NAT hosts like WSL
+/// flap the UDP TURN relay otherwise). Returns a handle to keep alive for the
+/// process lifetime. Config comes from env (`ROOMLER_AGENT_VIRTUAL_DESKTOP_*`).
+#[cfg(target_os = "linux")]
+fn maybe_start_virtual_desktop() -> Result<Option<virtual_desktop::VirtualDesktop>> {
+    if !virtual_desktop_requested() {
+        return Ok(None);
+    }
+    let startup = std::env::var("ROOMLER_AGENT_VIRTUAL_DESKTOP_STARTUP")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .map(|a| a.trim().to_string())
+                .filter(|a| !a.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let cfg = virtual_desktop::Config {
+        resolution: std::env::var("ROOMLER_AGENT_VIRTUAL_DESKTOP_RESOLUTION")
+            .unwrap_or_else(|_| "1920x1080".to_string()),
+        wm: std::env::var("ROOMLER_AGENT_VIRTUAL_DESKTOP_WM")
+            .unwrap_or_else(|_| "openbox".to_string()),
+        startup,
+    };
+    let vd = virtual_desktop::start(&cfg).context("starting virtual desktop")?;
+    // Point capture at the virtual display + pin media to TURNS/TCP. Set here
+    // (early in `run_cmd`, before the agent spawns its session tasks) so the
+    // caps/display probe and every later capture see it. `set_var` is `unsafe`
+    // in edition 2024; sound here because nothing else reads these vars yet.
+    unsafe {
+        std::env::set_var("DISPLAY", vd.display());
+        std::env::set_var("ROOMLER_AGENT_ICE_RELAY_TCP", "1");
+    }
+    tracing::info!(
+        display = vd.display(),
+        "virtual-desktop active — capturing it; relay-over-TCP media enabled"
+    );
+    Ok(Some(vd))
+}
+
 async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()> {
     if !config_path.exists() {
         bail!(
@@ -1095,6 +1145,18 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
                 "config migrated and persisted"
             );
         }
+    }
+
+    // rc.162: virtual-desktop mode (Linux) — bring up a headless Xvfb desktop
+    // + WM the agent captures, so a Linux/WSL node becomes a browser-remotable
+    // desktop. WSLg's own display can't be screen-grabbed (rootless XWayland),
+    // so we spawn a dedicated one. The handle is kept alive for the process
+    // lifetime; its Drop tears the desktop down.
+    #[cfg(target_os = "linux")]
+    let _virtual_desktop = maybe_start_virtual_desktop()?;
+    #[cfg(not(target_os = "linux"))]
+    if virtual_desktop_requested() {
+        tracing::warn!("virtual-desktop mode is Linux-only — ignoring on this platform");
     }
 
     // Phase 3b: generate + persist this node's WireGuard identity on the
