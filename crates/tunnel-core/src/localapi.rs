@@ -142,6 +142,31 @@ pub enum Request {
         #[serde(default)]
         timeout_ms: u64,
     },
+    /// Create a daemon-driven static forward: the daemon opens a tunnel to
+    /// `node` (a hex agent id) over its own agent WS and listens on `local`,
+    /// dialing `remote` (`host:port`) from the target. Mutating — like
+    /// [`Request::ConsentDecide`], the pipe/socket ACL is the trust boundary
+    /// (P3b-2). Returns [`Response::FlowCreated`] with the assigned flow id.
+    CreateForward {
+        node: String,
+        local: u16,
+        remote: String,
+        /// `auto` (default) | `quic` | `webrtc`. Empty ⇒ `auto`.
+        #[serde(default)]
+        transport: String,
+    },
+    /// Create a daemon-driven SOCKS5 listener toward `node` (userspace mode —
+    /// per-connection CONNECT target, no OS routing). Returns
+    /// [`Response::FlowCreated`].
+    CreateSocks5 {
+        node: String,
+        local: u16,
+        #[serde(default)]
+        transport: String,
+    },
+    /// Stop + deregister a daemon flow by its id. Returns
+    /// [`Response::FlowKilled`] (`ok=false` if the id was unknown).
+    KillFlow { id: String },
 }
 
 /// A LocalAPI response. Adjacently tagged so a payload may be a struct
@@ -165,6 +190,15 @@ pub enum Response {
         /// Round-trip time in microseconds. Integer keeps the wire type `Eq`;
         /// the client renders it as milliseconds.
         rtt_micros: u64,
+    },
+    /// A forward / SOCKS5 listener was created — carries its assigned flow id
+    /// (usable with [`Request::KillFlow`] + shown by [`Request::Flows`]).
+    FlowCreated {
+        id: String,
+    },
+    /// Result of [`Request::KillFlow`] — `ok=false` if the id wasn't found.
+    FlowKilled {
+        ok: bool,
     },
     /// The verb couldn't be served (bad request, state unavailable).
     Error {
@@ -218,6 +252,33 @@ pub trait LocalApiState: Send + Sync {
                 .into(),
         }
     }
+    /// Create a daemon-driven static forward (P3b-2). Async — awaited by
+    /// [`serve_connection`], not the sync [`handle`]. Returns
+    /// [`Response::FlowCreated`] or [`Response::Error`]. Default: unsupported
+    /// (a node that can't originate tunnels, e.g. no agent WS).
+    async fn create_forward(
+        &self,
+        _node: &str,
+        _local: u16,
+        _remote: &str,
+        _transport: &str,
+    ) -> Response {
+        Response::Error {
+            message: "forward origination is not supported on this node".into(),
+        }
+    }
+    /// Create a daemon-driven SOCKS5 listener (P3b-2). Async; default
+    /// unsupported.
+    async fn create_socks5(&self, _node: &str, _local: u16, _transport: &str) -> Response {
+        Response::Error {
+            message: "socks5 origination is not supported on this node".into(),
+        }
+    }
+    /// Stop + deregister a daemon flow by id (P3b-2). Returns whether a flow was
+    /// found + killed. Default: no-op `false`.
+    fn kill_flow(&self, _id: &str) -> bool {
+        false
+    }
 }
 
 /// Pure dispatch: map a [`Request`] to a [`Response`] over a state snapshot.
@@ -232,11 +293,17 @@ pub fn handle(req: &Request, state: &dyn LocalApiState) -> Response {
         Request::ConsentDecide { session_id, allow } => Response::ConsentDecided {
             ok: state.consent_decide(session_id, *allow),
         },
-        // `Ping` is async — intercepted in `serve_connection` before this sync
-        // dispatch runs. This arm only satisfies match exhaustiveness.
-        Request::Ping { .. } => Response::Error {
-            message: "ping must be served on the async path".into(),
+        Request::KillFlow { id } => Response::FlowKilled {
+            ok: state.kill_flow(id),
         },
+        // `Ping` / `CreateForward` / `CreateSocks5` are async — intercepted in
+        // `serve_connection` before this sync dispatch runs. These arms only
+        // satisfy match exhaustiveness.
+        Request::Ping { .. } | Request::CreateForward { .. } | Request::CreateSocks5 { .. } => {
+            Response::Error {
+                message: "this verb must be served on the async path".into(),
+            }
+        }
     }
 }
 
@@ -260,9 +327,24 @@ where
             continue;
         }
         let resp = match serde_json::from_str::<Request>(&line) {
-            // `Ping` is the one async verb — await it here; everything else is a
-            // pure sync dispatch through `handle`.
+            // The async verbs — await them here; everything else is a pure sync
+            // dispatch through `handle`.
             Ok(Request::Ping { target, timeout_ms }) => state.ping(&target, timeout_ms).await,
+            Ok(Request::CreateForward {
+                node,
+                local,
+                remote,
+                transport,
+            }) => {
+                state
+                    .create_forward(&node, local, &remote, &transport)
+                    .await
+            }
+            Ok(Request::CreateSocks5 {
+                node,
+                local,
+                transport,
+            }) => state.create_socks5(&node, local, &transport).await,
             Ok(req) => handle(&req, state),
             Err(e) => Response::Error {
                 message: format!("bad request: {e}"),
@@ -752,6 +834,59 @@ impl Client {
             other => Err(unexpected_response(other)),
         }
     }
+
+    /// `Request::CreateForward` → the assigned flow id. A daemon
+    /// [`Response::Error`] (bad node/remote, port unavailable, no agent WS)
+    /// surfaces its message verbatim.
+    pub async fn create_forward(
+        &mut self,
+        node: &str,
+        local: u16,
+        remote: &str,
+        transport: &str,
+    ) -> std::io::Result<String> {
+        let req = Request::CreateForward {
+            node: node.to_string(),
+            local,
+            remote: remote.to_string(),
+            transport: transport.to_string(),
+        };
+        match self.request(&req).await? {
+            Response::FlowCreated { id } => Ok(id),
+            Response::Error { message } => Err(std::io::Error::other(message)),
+            other => Err(unexpected_response(other)),
+        }
+    }
+
+    /// `Request::CreateSocks5` → the assigned flow id.
+    pub async fn create_socks5(
+        &mut self,
+        node: &str,
+        local: u16,
+        transport: &str,
+    ) -> std::io::Result<String> {
+        let req = Request::CreateSocks5 {
+            node: node.to_string(),
+            local,
+            transport: transport.to_string(),
+        };
+        match self.request(&req).await? {
+            Response::FlowCreated { id } => Ok(id),
+            Response::Error { message } => Err(std::io::Error::other(message)),
+            other => Err(unexpected_response(other)),
+        }
+    }
+
+    /// `Request::KillFlow` → whether a flow with that id was found + killed.
+    pub async fn kill_flow(&mut self, id: &str) -> std::io::Result<bool> {
+        match self
+            .request(&Request::KillFlow { id: id.to_string() })
+            .await?
+        {
+            Response::FlowKilled { ok } => Ok(ok),
+            other => Err(unexpected_response(other)),
+        }
+    }
 }
 
 /// Map an error / mismatched response to an `io::Error` for the typed helpers.
@@ -767,6 +902,7 @@ mod tests {
     use super::*;
 
     struct Mock;
+    #[async_trait]
     impl LocalApiState for Mock {
         fn status(&self) -> NodeStatus {
             NodeStatus {
@@ -826,6 +962,26 @@ mod tests {
             // Test echo: proves both args crossed the wire (real impl writes a
             // sentinel). Records only a non-empty session that was approved.
             !session_id.is_empty() && allow
+        }
+        async fn create_forward(
+            &self,
+            node: &str,
+            local: u16,
+            _remote: &str,
+            _transport: &str,
+        ) -> Response {
+            // Echo the args back as the flow id so the test proves they crossed.
+            Response::FlowCreated {
+                id: format!("{node}:{local}"),
+            }
+        }
+        async fn create_socks5(&self, node: &str, local: u16, _transport: &str) -> Response {
+            Response::FlowCreated {
+                id: format!("socks-{node}:{local}"),
+            }
+        }
+        fn kill_flow(&self, id: &str) -> bool {
+            id == "f1"
         }
     }
 
@@ -901,6 +1057,78 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Request>(r#"{"t":"consent_pending"}"#).unwrap(),
             Request::ConsentPending
+        );
+    }
+
+    #[tokio::test]
+    async fn create_and_kill_flow_verbs_dispatch_and_lock_wire_shape() {
+        let s = Mock;
+        // KillFlow is sync — through `handle`.
+        assert!(matches!(
+            handle(&Request::KillFlow { id: "f1".into() }, &s),
+            Response::FlowKilled { ok: true }
+        ));
+        assert!(matches!(
+            handle(&Request::KillFlow { id: "nope".into() }, &s),
+            Response::FlowKilled { ok: false }
+        ));
+        // CreateForward / CreateSocks5 are async — awaited on the trait (the
+        // `handle` sync arm returns the async-path Error, also asserted).
+        match s.create_forward("aid", 5432, "db:5432", "auto").await {
+            Response::FlowCreated { id } => assert_eq!(id, "aid:5432"),
+            other => panic!("expected FlowCreated, got {other:?}"),
+        }
+        match s.create_socks5("aid", 1080, "quic").await {
+            Response::FlowCreated { id } => assert_eq!(id, "socks-aid:1080"),
+            other => panic!("expected FlowCreated, got {other:?}"),
+        }
+        assert!(matches!(
+            handle(
+                &Request::CreateForward {
+                    node: "a".into(),
+                    local: 1,
+                    remote: "h:2".into(),
+                    transport: String::new()
+                },
+                &s
+            ),
+            Response::Error { .. }
+        ));
+
+        // Wire shape — locks the discriminators the CLI depends on.
+        assert_eq!(
+            serde_json::to_string(&Request::CreateForward {
+                node: "aid".into(),
+                local: 5432,
+                remote: "db:5432".into(),
+                transport: "auto".into(),
+            })
+            .unwrap(),
+            r#"{"t":"create_forward","d":{"node":"aid","local":5432,"remote":"db:5432","transport":"auto"}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::KillFlow { id: "f1".into() }).unwrap(),
+            r#"{"t":"kill_flow","d":{"id":"f1"}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Response::FlowCreated { id: "f1".into() }).unwrap(),
+            r#"{"t":"flow_created","d":{"id":"f1"}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Response::FlowKilled { ok: true }).unwrap(),
+            r#"{"t":"flow_killed","d":{"ok":true}}"#
+        );
+        // `transport` defaults when omitted (older CLI / minimal request).
+        assert_eq!(
+            serde_json::from_str::<Request>(
+                r#"{"t":"create_socks5","d":{"node":"aid","local":1080}}"#
+            )
+            .unwrap(),
+            Request::CreateSocks5 {
+                node: "aid".into(),
+                local: 1080,
+                transport: String::new(),
+            }
         );
     }
 

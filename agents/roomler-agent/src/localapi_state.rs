@@ -57,6 +57,11 @@ pub struct DaemonState {
     /// The netstack ICMP backend for the `ping` verb. `None` on a node not
     /// running the userspace stack (OS-TUN or non-overlay build).
     pinger: Option<Arc<dyn NetstackPinger>>,
+    /// The tunnel-client hub (P3b-2 PR-C) — the same instance the signaling loop
+    /// publishes its egress into. Backs the `flows` / `create_forward` /
+    /// `create_socks5` / `kill_flow` verbs; the daemon originates tunnels over
+    /// its own agent WS.
+    tunnel_hub: crate::tunnel::client_mgr::TunnelClientHub,
 }
 
 impl DaemonState {
@@ -74,6 +79,7 @@ impl DaemonState {
         overlay: watch::Receiver<OverlayView>,
         consent: crate::consent::ConsentBroker,
         pinger: Option<Arc<dyn NetstackPinger>>,
+        tunnel_hub: crate::tunnel::client_mgr::TunnelClientHub,
     ) -> Self {
         Self {
             node_id,
@@ -85,6 +91,7 @@ impl DaemonState {
             overlay,
             consent,
             pinger,
+            tunnel_hub,
         }
     }
 
@@ -136,11 +143,9 @@ impl LocalApiState for DaemonState {
     }
 
     fn flows(&self) -> Vec<FlowInfo> {
-        // The agent is the "be accessed" side; outbound forwards / SOCKS5
-        // listeners (the `FlowStats`-instrumented data plane) live in the
-        // tunnel-client, which folds into the daemon at P3. Until then this
-        // daemon runs none — an honest empty, not a stub.
-        Vec::new()
+        // P3b-2 PR-C: the tunnel data plane folded into the daemon — report the
+        // supervised forwards / SOCKS5 listeners it originates over its agent WS.
+        self.tunnel_hub.flows_snapshot()
     }
 
     fn consent_pending(&self) -> Vec<ConsentRequest> {
@@ -207,6 +212,34 @@ impl LocalApiState for DaemonState {
             Err(message) => Response::Error { message },
         }
     }
+
+    async fn create_forward(
+        &self,
+        node: &str,
+        local: u16,
+        remote: &str,
+        transport: &str,
+    ) -> Response {
+        match self
+            .tunnel_hub
+            .create_forward(node, local, remote, transport)
+            .await
+        {
+            Ok(id) => Response::FlowCreated { id },
+            Err(message) => Response::Error { message },
+        }
+    }
+
+    async fn create_socks5(&self, node: &str, local: u16, transport: &str) -> Response {
+        match self.tunnel_hub.create_socks5(node, local, transport).await {
+            Ok(id) => Response::FlowCreated { id },
+            Err(message) => Response::Error { message },
+        }
+    }
+
+    fn kill_flow(&self, id: &str) -> bool {
+        self.tunnel_hub.kill_flow(id)
+    }
 }
 
 /// A 24-char hex ObjectId — the only shape a session id may take before it's
@@ -256,6 +289,7 @@ mod tests {
             rx,
             consent_broker("ping"),
             None, // no netstack pinger
+            crate::tunnel::client_mgr::TunnelClientHub::new("test".into()),
         );
         // Resolve by peer name (from `view`), by first label, and by literal IP.
         assert_eq!(
@@ -306,6 +340,7 @@ mod tests {
             rx,
             consent,
             None,
+            crate::tunnel::client_mgr::TunnelClientHub::new("test".into()),
         );
 
         // Identity + overlay IP are always reported; connected reflects the flag.
