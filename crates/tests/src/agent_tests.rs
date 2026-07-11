@@ -9,6 +9,39 @@ use roomler_agent::{config::AgentConfig, encode::EncoderPreference, enrollment, 
 use serde_json::{Value, json};
 use std::time::Duration;
 
+/// Spawn the agent signaling loop with test-friendly defaults for the
+/// LocalAPI / consent handles `signaling::run` gained in the Unification
+/// P1 (`connected` flag + overlay-view watch channel) and P2b
+/// (`ConsentBroker`) work. Centralises the 6-arg call so the tests below
+/// don't each have to fabricate those handles. `AutoGrant` consent + a
+/// per-agent temp sentinel dir keep it side-effect-light.
+fn spawn_agent_signaling(
+    cfg: AgentConfig,
+    stop_rx: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Value type (OverlayView) is inferred from `run`'s Sender param, so
+        // the tests crate needs no direct tunnel-core dep. Keep `_view_rx`
+        // alive for the lifetime of `run` so its sends don't fail.
+        let (view_tx, _view_rx) = tokio::sync::watch::channel(Default::default());
+        let broker = roomler_agent::consent::ConsentBroker::new(
+            roomler_agent::consent::Mode::AutoGrant,
+            std::env::temp_dir().join(format!("roomler-test-consent-{}", cfg.agent_id)),
+        )
+        .expect("consent broker init");
+        let _ = signaling::run(
+            cfg,
+            EncoderPreference::Software,
+            stop_rx,
+            connected,
+            view_tx,
+            broker,
+        )
+        .await;
+    })
+}
+
 /// Helper: issue an enrollment token via the admin REST route, then run the
 /// agent's own `enrollment::enroll()` to get back an `AgentConfig` pointed
 /// at the test server.
@@ -80,12 +113,7 @@ async fn agent_library_connects_and_goes_online() {
     // Start the signaling loop. `run()` loops until shutdown; we just need it
     // to get through one successful connect + hello, then we stop it.
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-    let sig_task = tokio::spawn({
-        let cfg = cfg.clone();
-        async move {
-            let _ = signaling::run(cfg, EncoderPreference::Software, stop_rx).await;
-        }
-    });
+    let sig_task = spawn_agent_signaling(cfg.clone(), stop_rx);
 
     // Poll the admin API until the agent's DB row flips to online.
     let agent_id = cfg.agent_id.clone();
@@ -166,12 +194,7 @@ async fn agent_answers_sdp_offer_with_real_webrtc_peer() {
 
     // Spin up the agent library.
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-    let sig_task = tokio::spawn({
-        let cfg = cfg.clone();
-        async move {
-            let _ = signaling::run(cfg, EncoderPreference::Software, stop_rx).await;
-        }
-    });
+    let sig_task = spawn_agent_signaling(cfg.clone(), stop_rx);
 
     // Wait for the agent to go online.
     for _ in 0..60 {
