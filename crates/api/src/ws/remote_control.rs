@@ -97,6 +97,28 @@ pub async fn handle_agent_socket(
 
     debug!(%agent_id, %machine_name, "agent registered in Hub");
 
+    // P3b-2: an agent may drive the tunnel-CLIENT role over this same WS
+    // (originate tunnel-client sessions to OTHER nodes). Bundle its
+    // originator identity once — the reply channel is a clone of the
+    // Hub-owned `registered_tx`, so a target's answers relayed via
+    // `tunnel_clients_by_session` reach this socket through the pump above.
+    // `tunnel_orig_sessions` tracks the sessions THIS agent originated, so
+    // the interception can demux the bidirectional variants + tear them
+    // down when the WS drops.
+    let tunnel_orig = crate::ws::tunnel::Originator {
+        principal: tunnel_core::policy::Principal::Agent(agent_id),
+        tenant_id,
+        owner_user_id,
+        client_version: agent_version.clone(),
+        client_os: os,
+        outbound_tx: registered_tx.clone(),
+    };
+    let mut tunnel_orig_sessions: std::collections::HashMap<
+        ObjectId,
+        crate::ws::tunnel::TunnelSession,
+    > = std::collections::HashMap::new();
+    let mut tunnel_orig_transports: Vec<String> = Vec::new();
+
     // Build a ctx once — it's Copy-able across messages for this connection.
     let ctx = DispatchCtx {
         role: Role::Agent,
@@ -130,7 +152,24 @@ pub async fn handle_agent_socket(
                 match msg {
                     Ok(Message::Text(text)) => match serde_json::from_str::<ClientMsg>(&text) {
                         Ok(parsed) => {
-                            // Tunnel-flow variants intercept first — Hub doesn't
+                            // P3b-2: originator-side interception FIRST — if
+                            // this agent is driving the tunnel-client role,
+                            // consume its open/forward/relay/terminate here
+                            // (Principal::Agent). Returns the value unchanged
+                            // when this agent is the tunnel TARGET (or the
+                            // message is non-tunnel), so it falls through below.
+                            let Some(parsed) = crate::ws::tunnel::relay_tunnel_client_msg_from_agent(
+                                &state,
+                                &tunnel_orig,
+                                &mut tunnel_orig_sessions,
+                                &mut tunnel_orig_transports,
+                                parsed,
+                            )
+                            .await
+                            else {
+                                continue;
+                            };
+                            // Tunnel-flow variants intercept next — Hub doesn't
                             // know about tunnel-clients, so we route directly
                             // through `AppState::tunnel_clients_by_session`. If
                             // it's not a tunnel-flow variant the helper returns
@@ -185,6 +224,16 @@ pub async fn handle_agent_socket(
     // explicitly — but the `pump.abort()` is kept as a belt-and-
     // suspenders for the case where the tx-identity check skipped
     // the removal and the pump is still wired to the live channel.
+    // P3b-2: tear down any tunnel-client sessions THIS agent originated —
+    // tell each target agent, drop the reply-channel registration, and
+    // audit the close (consumes the session map).
+    crate::ws::tunnel::teardown_agent_originated_sessions(
+        &state,
+        &tunnel_orig,
+        tunnel_orig_sessions,
+    )
+    .await;
+
     // If this agent was an overlay node, mark it offline + drop it from
     // peers' netmaps (best-effort; it re-syncs on its next join).
     crate::ws::overlay::handle_overlay_leave(

@@ -422,7 +422,20 @@ pub struct TunnelAuditEvent {
     /// Correlation key — every event for one peer lifetime shares
     /// this id. New ObjectId per `tunnel forward` invocation.
     pub tunnel_session_id: ObjectId,
-    pub tunnel_client_id: ObjectId,
+    /// The originating tunnel-CLIENT row, set when a dedicated
+    /// `roomler-tunnel` client opened this session. `None` for an
+    /// agent-originated session (P3b-2), where `origin_agent_id` is set
+    /// instead. Exactly one of `tunnel_client_id` / `origin_agent_id`
+    /// is populated. Optional (not a bare `ObjectId`) since P3b-2 —
+    /// old rows carry a bare id which still deserialises into `Some`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel_client_id: Option<ObjectId>,
+    /// The originating AGENT, set when an enrolled agent drove the
+    /// tunnel-client role over its own WS (P3b-2). `None` for a
+    /// dedicated-client session. `agent_id` below is always the TARGET
+    /// of the tunnel, regardless of origin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_agent_id: Option<ObjectId>,
     pub agent_id: ObjectId,
     pub user_id: ObjectId,
     pub at: DateTime,
