@@ -1,0 +1,96 @@
+name: Vendor FFmpeg (macOS arm64, LGPL)
+
+# One-off (workflow_dispatch) builder for a prebuilt LGPL FFmpeg on Apple
+# Silicon, uploaded to the `vendored-ffmpeg-8.1.2` GitHub Release so the
+# agent's `build-macos` job can FETCH it instead of compiling FFmpeg on
+# every release (the same prebuild-once model as the Linux BtbN build).
+#
+# LGPL, NOT GPL: `--disable-gpl --disable-nonfree` — no libx264/libx265, so
+# the MIT agent stays license-clean. HEVC comes from `--enable-videotoolbox`
+# (Apple's HW encoder, `hevc_videotoolbox`), which is part of the OS SDK and
+# needs no third-party codec lib.
+#
+# `--install-name-dir=@rpath` makes every dylib's install_name (and its
+# recorded sibling deps) `@rpath/libX.dylib`, so the .app can carry them in
+# Contents/Frameworks and resolve them via the binary's LC_RPATH — the macOS
+# analog of the Linux `patchelf --set-rpath '$ORIGIN'`.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ffmpeg_ref:
+        description: 'FFmpeg git tag to build (must be an 8.1.x that maps to 8.1.2)'
+        default: 'n8.1.2'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build + upload FFmpeg 8.1.2 (macOS arm64, LGPL)
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - name: Install build deps
+        # nasm is x86-only (harmless on arm64 — FFmpeg uses its own arm64 asm
+        # via clang's integrated assembler); installed defensively so configure
+        # never blocks on a missing assembler.
+        run: brew install nasm
+
+      - name: Build LGPL FFmpeg (shared, VideoToolbox, @rpath install names)
+        run: |
+          set -euo pipefail
+          REF="${{ github.event.inputs.ffmpeg_ref }}"
+          git clone --depth 1 --branch "$REF" https://github.com/FFmpeg/FFmpeg.git ffsrc
+          cd ffsrc
+          echo "FFmpeg source: $(git describe --tags --always)"
+          OUT="$RUNNER_TEMP/ffout"
+          ./configure \
+            --prefix="$OUT" \
+            --enable-shared --disable-static \
+            --disable-gpl --disable-nonfree \
+            --enable-videotoolbox \
+            --disable-programs --disable-doc --disable-debug \
+            --install-name-dir=@rpath \
+            --enable-pic
+          make -j"$(sysctl -n hw.ncpu)"
+          make install
+          echo "OUT=$OUT" >> "$GITHUB_ENV"
+
+      - name: Sanity-check the build (arm64 dylibs, @rpath install names, no GPL)
+        run: |
+          set -euo pipefail
+          cd "$OUT"
+          echo "=== dylibs ==="; ls -1 lib/*.dylib
+          echo "=== libavcodec arch + install_name (want arm64 + @rpath) ==="
+          lipo -info lib/libavcodec.*.dylib | head -1
+          otool -D lib/libavcodec.*.dylib | tail -1
+          echo "=== libavcodec sibling deps (want @rpath/libav*) ==="
+          otool -L lib/libavcodec.*.dylib | grep -E '@rpath|/opt|/usr/local' || true
+          echo "=== confirm NO GPL encoders linked (no libx264/libx265) ==="
+          if otool -L lib/libavcodec.*.dylib | grep -Ei 'x264|x265'; then
+            echo "::error::GPL codec linked — build is not LGPL-clean"; exit 1
+          fi
+          echo "  LGPL-clean."
+
+      - name: Package tarball
+        run: |
+          set -euo pipefail
+          cd "$OUT"
+          TAR="ffmpeg-8.1.2-macos-arm64-lgpl-shared.tar.xz"
+          tar cJf "$RUNNER_TEMP/$TAR" lib include
+          cd "$RUNNER_TEMP"
+          shasum -a 256 "$TAR" | tee "$TAR.sha256"
+          echo "TAR=$RUNNER_TEMP/$TAR" >> "$GITHUB_ENV"
+          echo "size: $(du -h "$TAR" | cut -f1)"
+
+      - name: Upload to the vendored-ffmpeg-8.1.2 release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release upload vendored-ffmpeg-8.1.2 \
+            "$TAR" "$TAR.sha256" \
+            --repo "${{ github.repository }}" --clobber
+          echo "uploaded $(basename "$TAR") to vendored-ffmpeg-8.1.2"
