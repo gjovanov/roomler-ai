@@ -106,6 +106,43 @@ pub(crate) fn initial_bitrate_for_fps(width: u32, height: u32, fps: u32) -> u32 
     raw.clamp(MIN_BITRATE_BPS, MAX_BITRATE_BPS)
 }
 
+/// True when the ICE transport is forced to a TURN relay — on TCP (WSL,
+/// corp-UDP-blocked nets) that path is bandwidth- + head-of-line-constrained.
+/// Set by virtual-desktop mode and the corp path via ROOMLER_AGENT_ICE_RELAY_TCP.
+///
+/// Only the VP9-444 DC pump (`vp9-444`) and the FFmpeg DC pump
+/// (`ffmpeg-encoder`) consume this; the default-feature build has neither, so
+/// the `dead_code` allow keeps the signalling-only CI build warning-clean
+/// (mirrors `initial_bitrate_for`'s feature guard above).
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+pub(crate) fn transport_is_constrained() -> bool {
+    std::env::var("ROOMLER_AGENT_ICE_RELAY_TCP")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Bitrate ceiling (bps) for a constrained relay-TCP transport. Default 3 Mbps;
+/// override with ROOMLER_AGENT_RELAY_MAX_KBPS. A single TURN-TCP relay carries
+/// ~1-4 Mbps; the VP9-444 0.20-bpp ~12 Mbps target collapses it (27s freeze).
+///
+/// See `transport_is_constrained` for why the `dead_code` allow is keyed on the
+/// pump features (the `mod tests` use below does not count for a non-test build).
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+pub(crate) fn relay_max_bps() -> u32 {
+    std::env::var("ROOMLER_AGENT_RELAY_MAX_KBPS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|k| *k > 0)
+        .map(|k| k.saturating_mul(1000))
+        .unwrap_or(3_000_000)
+}
+
 #[derive(Debug, Clone)]
 pub struct EncodedPacket {
     pub data: Vec<u8>,
@@ -493,5 +530,55 @@ mod tests {
             );
         }
         unsafe { std::env::remove_var("ROOMLER_AGENT_HW_AUTO") };
+    }
+
+    #[test]
+    fn relay_max_bps_reads_env() {
+        // Hermetic: save the prior value, exercise set/unset, then restore.
+        // SAFETY: same reasoning as `hw_auto_disabled_reads_env` — no other
+        // code in this crate touches ROOMLER_AGENT_RELAY_MAX_KBPS at test
+        // time, and this module's env-touching tests don't overlap on it.
+        let prior = std::env::var("ROOMLER_AGENT_RELAY_MAX_KBPS").ok();
+
+        unsafe { std::env::remove_var("ROOMLER_AGENT_RELAY_MAX_KBPS") };
+        assert_eq!(
+            relay_max_bps(),
+            3_000_000,
+            "unset defaults to the 3 Mbps relay ceiling"
+        );
+
+        unsafe { std::env::set_var("ROOMLER_AGENT_RELAY_MAX_KBPS", "1500") };
+        assert_eq!(relay_max_bps(), 1_500_000, "kbps env is multiplied by 1000");
+
+        // Whitespace-trimmed + a 0 / garbage value falls back to the default.
+        unsafe { std::env::set_var("ROOMLER_AGENT_RELAY_MAX_KBPS", "  4200 ") };
+        assert_eq!(relay_max_bps(), 4_200_000, "value is trimmed before parse");
+        unsafe { std::env::set_var("ROOMLER_AGENT_RELAY_MAX_KBPS", "0") };
+        assert_eq!(relay_max_bps(), 3_000_000, "0 is rejected → default");
+        unsafe { std::env::set_var("ROOMLER_AGENT_RELAY_MAX_KBPS", "nope") };
+        assert_eq!(relay_max_bps(), 3_000_000, "non-numeric → default");
+
+        // Restore the pre-test environment.
+        match prior {
+            Some(v) => unsafe { std::env::set_var("ROOMLER_AGENT_RELAY_MAX_KBPS", v) },
+            None => unsafe { std::env::remove_var("ROOMLER_AGENT_RELAY_MAX_KBPS") },
+        }
+    }
+
+    #[test]
+    fn relay_clamp_caps_vp9_444_target() {
+        // Pure logic (no env): the `x.min(relay_max_bps())` clamp the pump
+        // applies must pull a 0.20-bpp 2560×1600@30 VP9-444 target
+        // (12_441_600 bps) down to the 3 Mbps relay ceiling.
+        let prior = std::env::var("ROOMLER_AGENT_RELAY_MAX_KBPS").ok();
+        unsafe { std::env::remove_var("ROOMLER_AGENT_RELAY_MAX_KBPS") };
+
+        let vp9_444_target: u32 = 12_441_600;
+        assert_eq!(vp9_444_target.min(relay_max_bps()), 3_000_000);
+
+        match prior {
+            Some(v) => unsafe { std::env::set_var("ROOMLER_AGENT_RELAY_MAX_KBPS", v) },
+            None => unsafe { std::env::remove_var("ROOMLER_AGENT_RELAY_MAX_KBPS") },
+        }
     }
 }
