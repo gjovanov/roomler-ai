@@ -37,11 +37,12 @@
 //! (an inbound packet, an app write, a control request). This is the standard
 //! "netstack actor" shape.
 //!
-//! Scope: TCP `connect` (the SOCKS-CONNECT backend) + `listen`, and UDP via
+//! Scope: TCP `connect` (the SOCKS-CONNECT backend) + `listen`, UDP via
 //! [`NetstackHandle::udp_bind`] (the SOCKS UDP-ASSOCIATE backend — one socket
-//! per association, sending to arbitrary overlay peers). ICMP `ping` reuses the
-//! same device + poll loop and lands in a follow-up; its socket buffer is
-//! already compiled in via the crate features.
+//! per association, sending to arbitrary overlay peers), and ICMP
+//! [`NetstackHandle::ping`] (an OS-free reachability probe). The iface also
+//! auto-answers inbound echo requests, so a netstack host is itself pingable.
+//! All three ride the same device + poll loop.
 //!
 //! [smoltcp]: https://docs.rs/smoltcp
 
@@ -56,10 +57,12 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use futures::task::AtomicWaker;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
-use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
-use smoltcp::socket::{tcp, udp};
+use smoltcp::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use smoltcp::socket::{icmp, tcp, udp};
 use smoltcp::time::Instant as SmolInstant;
-use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint};
+use smoltcp::wire::{
+    HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint,
+};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tracing::{debug, trace};
@@ -92,6 +95,11 @@ const UDP_META: usize = 64;
 /// Depth of each app⇄stack UDP datagram channel. Backpressures (not drops) past
 /// this — a full channel just stalls delivery until the app drains it.
 const UDP_CHAN_CAP: usize = 256;
+/// ICMP socket buffers — `ping` is low-volume, so a few packets suffice.
+const ICMP_BUF: usize = 4 * 1024;
+const ICMP_META: usize = 8;
+/// Payload carried in each echo request (the peer echoes it back verbatim).
+const PING_PAYLOAD: &[u8] = b"roomler-netstack-ping";
 
 // ===========================================================================
 // Device — a smoltcp `phy::Device` backed by two packet queues.
@@ -200,6 +208,11 @@ enum Control {
     UdpBind {
         resp: oneshot::Sender<io::Result<NsUdpSocket>>,
     },
+    Ping {
+        dst: Ipv4Addr,
+        /// Fires with the measured round-trip time when the echo reply lands.
+        resp: oneshot::Sender<Duration>,
+    },
 }
 
 /// App-facing handle to a running netstack. Cheap to clone; each clone can open
@@ -253,6 +266,30 @@ impl NetstackHandle {
             .map_err(|_| io::Error::other("netstack poll loop gone"))?;
         rx.await
             .map_err(|_| io::Error::other("netstack dropped the udp_bind request"))?
+    }
+
+    /// Send an ICMP echo request to an overlay address and resolve with the
+    /// round-trip time once the reply lands. `Err(TimedOut)` if no reply arrives
+    /// within `timeout`. The OS-free reachability probe for a netstack host,
+    /// which can't use the OS `ping` (there's no OS route to the overlay).
+    pub async fn ping(&self, dst: Ipv4Addr, timeout: Duration) -> io::Result<Duration> {
+        let (resp, rx) = oneshot::channel();
+        self.ctl
+            .send(Control::Ping { dst, resp })
+            .await
+            .map_err(|_| io::Error::other("netstack poll loop gone"))?;
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(rtt)) => Ok(rtt),
+            // Sender dropped ⇒ the request couldn't be emitted (unaddressable).
+            Ok(Err(_)) => Err(io::Error::new(
+                io::ErrorKind::HostUnreachable,
+                format!("netstack could not send ping to {dst}"),
+            )),
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("ping to {dst} timed out"),
+            )),
+        }
     }
 }
 
@@ -496,6 +533,16 @@ struct PollLoop {
     pending_connect: HashMap<SocketHandle, PendingConnect>,
     pending_listen: HashMap<SocketHandle, PendingListen>,
     udp_conns: HashMap<SocketHandle, UdpConn>,
+    /// The one ICMP socket (bound to `ping_ident`) that all pings ride.
+    icmp: SocketHandle,
+    /// ICMP echo identifier for our outgoing pings — a per-instance random value
+    /// so a peer's own ping socket never intercepts our request (and vice-versa;
+    /// its iface auto-answers instead).
+    ping_ident: u16,
+    /// In-flight pings: echo `seq_no` → (send time, waiter). Resolved with the
+    /// RTT when the matching echo reply arrives.
+    pending_pings: HashMap<u16, (Instant, oneshot::Sender<Duration>)>,
+    next_ping_seq: u16,
     next_port: u16,
     base: Instant,
 }
@@ -602,6 +649,31 @@ impl PollLoop {
             local_port: port,
         };
         let _ = resp.send(Ok(socket));
+    }
+
+    fn do_ping(&mut self, dst: Ipv4Addr, resp: oneshot::Sender<Duration>) {
+        let seq = self.next_ping_seq;
+        self.next_ping_seq = self.next_ping_seq.wrapping_add(1);
+        let repr = Icmpv4Repr::EchoRequest {
+            ident: self.ping_ident,
+            seq_no: seq,
+            data: PING_PAYLOAD,
+        };
+        let mut buf = vec![0u8; repr.buffer_len()];
+        repr.emit(
+            &mut Icmpv4Packet::new_unchecked(&mut buf),
+            &ChecksumCapabilities::default(),
+        );
+        let sock = self.sockets.get_mut::<icmp::Socket>(self.icmp);
+        match sock.send_slice(&buf, IpAddress::Ipv4(dst)) {
+            // Record the send time; `service_icmp` fires `resp` with the RTT when
+            // the matching reply arrives.
+            Ok(()) => {
+                self.pending_pings.insert(seq, (Instant::now(), resp));
+            }
+            // Unaddressable / buffer full ⇒ drop `resp`; `ping()` errors at once.
+            Err(e) => debug!(%dst, error = %e, "netstack: ping send failed"),
+        }
     }
 
     /// Build the paired stack-side [`Conn`] + app-side [`NsTcpStream`] for a
@@ -874,6 +946,32 @@ impl PollLoop {
         progressed
     }
 
+    /// Match inbound ICMP echo replies to in-flight pings and resolve each
+    /// waiter with its round-trip time. Returns `true` if a ping resolved.
+    /// (Inbound echo *requests* are auto-answered by the iface — feature
+    /// `auto-icmp-echo-reply` — so a netstack host is pingable without a socket.)
+    fn service_icmp(&mut self) -> bool {
+        let mut matched: Vec<u16> = Vec::new();
+        {
+            let ident = self.ping_ident;
+            let sock = self.sockets.get_mut::<icmp::Socket>(self.icmp);
+            while sock.can_recv() {
+                let Ok((data, _src)) = sock.recv() else { break };
+                if let Some(seq) = echo_reply_seq(data, ident) {
+                    matched.push(seq);
+                }
+            }
+        }
+        let mut progressed = false;
+        for seq in matched {
+            if let Some((sent, resp)) = self.pending_pings.remove(&seq) {
+                let _ = resp.send(sent.elapsed());
+                progressed = true;
+            }
+        }
+        progressed
+    }
+
     /// One settle pass: poll smoltcp, promote handshakes, shuttle bytes —
     /// repeated until it quiesces (bounded), so an inbound packet and the app
     /// I/O it unblocks flush in the same wake.
@@ -884,7 +982,8 @@ impl PollLoop {
             self.promote_pending();
             let tcp = self.service_conns();
             let udp = self.service_udp();
-            if !tcp && !udp && self.device.rx.is_empty() {
+            let icmp = self.service_icmp();
+            if !tcp && !udp && !icmp && self.device.rx.is_empty() {
                 break;
             }
         }
@@ -909,6 +1008,7 @@ impl PollLoop {
                     Some(Control::Connect { dst, resp }) => self.do_connect(dst, resp),
                     Some(Control::Listen { port, accepted }) => self.do_listen(port, accepted),
                     Some(Control::UdpBind { resp }) => self.do_udp_bind(resp),
+                    Some(Control::Ping { dst, resp }) => self.do_ping(dst, resp),
                     None => break, // handle dropped ⇒ shut down
                 },
                 pkt = self.in_rx.recv() => {
@@ -935,6 +1035,19 @@ fn sock_taken(s: &mut tcp::Socket<'static>) -> tcp::Socket<'static> {
             tcp::SocketBuffer::new(vec![]),
         ),
     )
+}
+
+/// Parse an ICMPv4 packet; return the echo-reply `seq_no` iff it's an
+/// `EchoReply` whose identifier matches `ident` (our ping socket's). `None` for
+/// a malformed packet or any other ICMP message.
+fn echo_reply_seq(data: &[u8], ident: u16) -> Option<u16> {
+    let pkt = Icmpv4Packet::new_checked(data).ok()?;
+    match Icmpv4Repr::parse(&pkt, &ChecksumCapabilities::default()).ok()? {
+        Icmpv4Repr::EchoReply {
+            ident: id, seq_no, ..
+        } if id == ident => Some(seq_no),
+        _ => None,
+    }
 }
 
 /// smoltcp `IpEndpoint` → `SocketAddrV4` (IPv4 only; `None` for v6/unspecified).
@@ -991,9 +1104,27 @@ impl Netstack {
             let _ = addrs.push(IpCidr::new(IpAddress::from(self_ip), prefix));
         });
 
+        // The single ICMP socket every ping rides, bound to a per-instance
+        // random identifier (so a peer's own ping socket never intercepts our
+        // requests — its iface auto-answers them instead).
+        let mut sockets = SocketSet::new(Vec::new());
+        let mut icmp_sock = icmp::Socket::new(
+            icmp::PacketBuffer::new(
+                vec![icmp::PacketMetadata::EMPTY; ICMP_META],
+                vec![0u8; ICMP_BUF],
+            ),
+            icmp::PacketBuffer::new(
+                vec![icmp::PacketMetadata::EMPTY; ICMP_META],
+                vec![0u8; ICMP_BUF],
+            ),
+        );
+        let ping_ident: u16 = rand::random();
+        let _ = icmp_sock.bind(icmp::Endpoint::Ident(ping_ident));
+        let icmp = sockets.add(icmp_sock);
+
         let poll_loop = PollLoop {
             iface,
-            sockets: SocketSet::new(Vec::new()),
+            sockets,
             device,
             in_rx,
             ctl_rx,
@@ -1002,6 +1133,10 @@ impl Netstack {
             pending_connect: HashMap::new(),
             pending_listen: HashMap::new(),
             udp_conns: HashMap::new(),
+            icmp,
+            ping_ident,
+            pending_pings: HashMap::new(),
+            next_ping_seq: 0,
             next_port: EPHEMERAL_BASE,
             base,
         };
@@ -1195,5 +1330,44 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(10), body)
             .await
             .expect("udp round trip in time");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn direct_pair_icmp_ping() {
+        // Two stacks on the same /24, cross-linked packet-for-packet.
+        let a_ip = Ipv4Addr::new(10, 7, 0, 1);
+        let b_ip = Ipv4Addr::new(10, 7, 0, 2);
+        let a = Netstack::start(a_ip, 24, 1280);
+        let b = Netstack::start(b_ip, 24, 1280);
+
+        let (a_tun, b_tun) = (a.tun.clone(), b.tun.clone());
+        tokio::spawn(async move {
+            while let Ok(pkt) = a_tun.read_packet().await {
+                if b_tun.write_packet(&pkt).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let (a_tun2, b_tun2) = (a.tun.clone(), b.tun.clone());
+        tokio::spawn(async move {
+            while let Ok(pkt) = b_tun2.read_packet().await {
+                if a_tun2.write_packet(&pkt).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // A pings B — B's iface auto-answers the echo request (no app socket on
+        // B), A's icmp socket matches the reply and reports the RTT. B needs no
+        // task at all: `auto-icmp-echo-reply` replies inside its poll loop.
+        let rtt = tokio::time::timeout(
+            Duration::from_secs(5),
+            a.handle.ping(b_ip, Duration::from_secs(3)),
+        )
+        .await
+        .expect("ping completes in time")
+        .expect("ping succeeds");
+        assert!(rtt < Duration::from_secs(3), "rtt within the timeout");
+        let _keep = b; // keep B's netstack alive for the ping
     }
 }
