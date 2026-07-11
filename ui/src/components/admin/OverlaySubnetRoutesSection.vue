@@ -72,7 +72,12 @@
               </div>
               <div class="text-caption text-medium-emphasis">{{ n.kind }}</div>
             </td>
-            <td>{{ n.overlay_ip }}</td>
+            <td>
+              <div>{{ n.overlay_ip }}</div>
+              <div class="text-caption text-medium-emphasis">
+                {{ deriveOverlayV6(n.overlay_ip) }}
+              </div>
+            </td>
             <td>
               <v-checkbox
                 v-for="cidr in n.advertised_routes"
@@ -105,7 +110,11 @@
 
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue'
-import { useOverlayRoutesStore, type OverlayNode } from '@/stores/overlayRoutes'
+import {
+  deriveOverlayV6,
+  useOverlayRoutesStore,
+  type OverlayNode,
+} from '@/stores/overlayRoutes'
 
 const props = defineProps<{ tenantId: string }>()
 const store = useOverlayRoutesStore()

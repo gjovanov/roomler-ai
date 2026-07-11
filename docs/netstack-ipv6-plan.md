@@ -17,8 +17,23 @@ Status (2026-07-11):
   like the v4 per-peer routes). Proven by
   `bridge_v6_tcp_echo_and_ping_over_wireguard` (v4-only peer install; TCP +
   ICMPv6 round-trip over the derived v6 through a real WG pair).
-- **Phases C / D**: not started — no surface resolves a genuine v6 target
-  yet.
+- **Phase C shipped** — dual-stack surfaces. SOCKS front: a genuine
+  ATYP=IPv6 target dials over v6 when it's a derived-ULA address (v4-mapped
+  unwraps; other v6 → instant host-unreachable); names keep resolving to v4
+  (universal — v6 is derived from it). MagicDNS answers `AAAA` with the
+  derived v6 (default-on; `ROOMLER_AGENT_DNS_AAAA=0` reverts to A-only — the
+  mixed-fleet escape hatch, since an old peer's OS doesn't own its derived v6
+  and v6 toward it blackholes; happy-eyeballs apps fall back). `roomler ping`
+  accepts v6 literals and `-6/--ipv6` resolves a name to the peer's derived
+  v6 (`Request::Ping.prefer_v6`, serde-default so old daemons/clients
+  interop).
+- **Phase D shipped** — v6 visibility, with one refinement: **no wire/DB
+  `overlay_ip6`** (derivation makes it redundant and it would be a
+  consistency liability). The overlay runtime derives + publishes
+  `self_ip6`/`overlay_ip6` into the LocalAPI view (`NodeStatus`/`PeerInfo`,
+  serde-default), so `roomler status`/`peers`, the tray Devices view, and —
+  via a TS mirror of the derivation (`ui: deriveOverlayV6`) — the admin
+  overlay-nodes table all show both addresses with zero server change.
 
 The original plan follows. The netstack (userspace smoltcp TCP/IP stack,
 feature `overlay-netstack`) was IPv4-only when written. This document plans
