@@ -175,13 +175,16 @@ jobs:
         # runs against the system libvpx 1.14 headers; without this the
         # build script panics looking for `vpx-ffi-1.14.0.rs` in the
         # crate's `generated/` dir (only ships ≤ 1.13.0).
-        # `overlay-l3` (Phase 3b) compiles in the Tailscale-style overlay
-        # mesh (WireGuard via boringtun + the TUN device). Pure-Rust, no
-        # extra system dep on Linux (/dev/net/tun is in-kernel). Default-
-        # OFF: an agent only joins the mesh when its config sets
-        # `overlay_enabled` — so shipping it everywhere is inert until an
-        # operator opts a host in.
-        run: cargo build -p roomler-agent --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3"
+        # `overlay-l3` (Phase 3b) compiles in the Tailscale-style overlay mesh
+        # (WireGuard via boringtun + the OS TUN device). `overlay-netstack` adds
+        # the userspace-smoltcp OS-free surface (field-validated 2026-07-11
+        # against the live overlay incl. a Check Point host). Both pure-Rust, no
+        # extra system dep on Linux (/dev/net/tun is in-kernel; smoltcp needs
+        # nothing). Default-OFF: an agent only joins the mesh when its config
+        # sets `overlay_enabled`, and netstack mode additionally needs
+        # `ROOMLER_AGENT_OVERLAY_NETSTACK_SOCKS=<port>` — so shipping both
+        # everywhere is inert until an operator opts a host in.
+        run: cargo build -p roomler-agent --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack"
 
       - name: Build .deb
         working-directory: agents/roomler-agent
@@ -543,7 +546,7 @@ jobs:
         # the runtime logs + aborts → the agent runs normally) until that
         # lands; Linux (/dev/net/tun) + macOS (utun) need no extra dep and
         # work today. Default-OFF (config `overlay_enabled`).
-        run: cargo build -p roomler-agent --release --features "full-hw,vp9-444,system-context,ffmpeg-encoder,overlay-l3"
+        run: cargo build -p roomler-agent --release --features "full-hw,vp9-444,system-context,ffmpeg-encoder,overlay-l3,overlay-netstack"
 
       - name: Verify FFmpeg link via unit test
         # Runs ONLY the ffmpeg-encoder gated test, which calls into
@@ -900,7 +903,7 @@ jobs:
         # `overlay-l3` (Phase 3b): the overlay mesh (WireGuard + TUN, utun
         # on macOS — in-kernel, no extra dep). Default-OFF (config
         # `overlay_enabled`), inert until an operator opts a host in.
-        run: cargo build -p roomler-agent --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3" --target aarch64-apple-darwin
+        run: cargo build -p roomler-agent --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack" --target aarch64-apple-darwin
 
       - name: Stage .app bundle
         shell: bash
