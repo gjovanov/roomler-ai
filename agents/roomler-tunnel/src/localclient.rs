@@ -67,16 +67,16 @@ pub async fn flows(json: bool) -> Result<()> {
     Ok(())
 }
 
-/// `roomler ping <target> [--timeout-ms N]` — ICMP-ping an overlay peer (by
+/// `roomler ping <target> [-6] [--timeout-ms N]` — ICMP-ping an overlay peer (by
 /// name or IP) over the userspace netstack: the OS-free reachability probe for a
 /// locked-down host with no OS route to the mesh. Meaningful on a netstack node;
 /// other daemons reply "not supported". The daemon's own error (unknown peer /
 /// timeout / not-a-netstack-node) is surfaced verbatim — only a *connect* failure
 /// maps through [`daemon_err`].
-pub async fn ping(target: &str, timeout_ms: u64, json: bool) -> Result<()> {
+pub async fn ping(target: &str, timeout_ms: u64, prefer_v6: bool, json: bool) -> Result<()> {
     let mut client = localapi::connect().await.map_err(daemon_err)?;
     let (overlay_ip, rtt_ms) = client
-        .ping(target, timeout_ms)
+        .ping(target, timeout_ms, prefer_v6)
         .await
         .map_err(|e| anyhow!("{e}"))?;
     if json {
@@ -201,10 +201,11 @@ fn fmt_peer_row(p: &PeerInfo, now_ms: u64) -> String {
         p.name.clone()
     };
     format!(
-        "{} {:<20} {:<16} {:<8} {:>7} {}",
+        "{} {:<20} {:<16} {:<26} {:<8} {:>7} {}",
         up_glyph(p.online),
         name,
         opt(p.overlay_ip.as_deref()),
+        opt(p.overlay_ip6.as_deref()),
         connection_label(p.connection),
         rtt,
         fmt_last_seen(p.last_seen_ms, now_ms),
@@ -248,6 +249,7 @@ fn print_status(s: &NodeStatus) {
     println!("  mode        {mode}");
     println!("  tenant      {}", opt(s.tenant_id.as_deref()));
     println!("  overlay ip  {}", opt(s.overlay_ip.as_deref()));
+    println!("  overlay ip6 {}", opt(s.overlay_ip6.as_deref()));
     println!(
         "  server      {}",
         if s.connected {
@@ -260,8 +262,8 @@ fn print_status(s: &NodeStatus) {
 
 fn print_peers(peers: &[PeerInfo], now_ms: u64) {
     println!(
-        "  {:<20} {:<16} {:<8} {:>7} LAST SEEN",
-        "NAME", "OVERLAY IP", "CONN", "RTT"
+        "  {:<20} {:<16} {:<26} {:<8} {:>7} LAST SEEN",
+        "NAME", "OVERLAY IP", "OVERLAY IP6", "CONN", "RTT"
     );
     if peers.is_empty() {
         println!("(no peers)");
@@ -321,6 +323,7 @@ mod tests {
             node_id: "n2".into(),
             name: "pc50045".into(),
             overlay_ip: Some("100.64.0.1".into()),
+            overlay_ip6: Some("fd72:6f6f:6d6c::6440:1".into()),
             online: true,
             connection: ConnectionType::Tunnel,
             rtt_ms: Some(52),
@@ -330,6 +333,7 @@ mod tests {
         assert!(row.starts_with('●'));
         assert!(row.contains("pc50045"));
         assert!(row.contains("100.64.0.1"));
+        assert!(row.contains("fd72:6f6f:6d6c::6440:1"));
         assert!(row.contains("tunnel"));
         assert!(row.contains("52 ms"));
         assert!(row.contains("3s ago"));
@@ -338,6 +342,7 @@ mod tests {
             node_id: "n3".into(),
             name: "home".into(),
             overlay_ip: None,
+            overlay_ip6: None,
             online: false,
             connection: ConnectionType::Offline,
             rtt_ms: None,
@@ -356,6 +361,7 @@ mod tests {
             node_id: "0123456789abcdef0123".into(),
             name: String::new(),
             overlay_ip: Some("100.64.0.7".into()),
+            overlay_ip6: None,
             online: true,
             connection: ConnectionType::Direct,
             rtt_ms: None,
