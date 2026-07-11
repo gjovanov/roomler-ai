@@ -390,151 +390,48 @@ jobs:
           "VPX_DLL_DIR=C:/vpx-pin/installed/x64-windows/bin" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       # =======================================================================
-      # rc.65: Option B HEVC plan — install FFmpeg via vcpkg so ffmpeg-next
-      # 8.x can link against it. Cold build is 25-40 min (FFmpeg + ffnvcodec +
-      # intel-media-sdk + amf), so the cache is load-bearing. Cache key
-      # composition follows the critique's recommendation: deps content hash
-      # plus the triplet, so a port-edit invalidates the cache cleanly.
-      #
-      # `nvcodec` pulls ffnvcodec headers (NVIDIA Video Codec SDK headers
-      # only — NVENC itself loads at runtime from the user's NVIDIA driver,
-      # so no extra MSI bytes for NVIDIA users).
-      # `qsv` pulls intel-media-sdk → static libmfx (~3-5 MB, statically
-      # linked into the agent).
-      # `amf` pulls amf headers (AMD AMF runtime DLL loaded from driver).
-      # `libvpx` opt-in builds libvpx into FFmpeg so `libvpx-vp9` is
-      # available as a SW fallback (separate from our existing
-      # env-libvpx-sys binding which talks to libvpx directly).
+      # rc.166: FFmpeg comes PREBUILT from the `vendored-ffmpeg-8.1.2` release
+      # (built once by vendor-ffmpeg-windows.yml — same vcpkg manifest/baseline
+      # as before: ffmpeg 8.1.1+cbs-backport, x64-windows-static-md, LGPL with
+      # nvcodec/qsv/amf/vpx, no GPL x264/x265). Replaces the inline 25-40 min
+      # vcpkg compile — the Windows counterpart to the Linux BtbN / macOS
+      # from-source vendored fetches. static-md → FFmpeg links INTO the EXE, so
+      # there are still NO DLLs to ship (small MSI); NVENC/QSV/AMF load at
+      # runtime from the GPU driver. Re-run the vendoring workflow when bumping
+      # the FFmpeg version / vcpkg baseline.
       # =======================================================================
-      - name: Compute FFmpeg vcpkg cache key
-        id: ffmpeg_cache_key
+      - name: Fetch vendored FFmpeg 8.1.2 (MSVC static-md, for ffmpeg-encoder)
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          # Cache key invalidates when: vcpkg baseline changes, our feature
-          # set changes, or the agent crate version changes (defensive
-          # against a port-edit slipping past the manifest diff).
-          # rc.67 hotfix: rc.66 failed with "no version database entry for
-          # vcpkg-tool-meson at 1.9.0#8". Root cause: the pre-installed
-          # vcpkg's working tree is at an older commit than my baseline
-          # references — its version database doesn't know about the version
-          # entries my baseline expects. Fix: add explicit `git fetch +
-          # reset --hard` step to bring local vcpkg to the same commit as my
-          # baseline (pinned to the most recent ffmpeg-port commit
-          # `ccab4e210c...`, 2026-05-08, which ships ffmpeg 8.1.1+cbs-backport).
-          $manifest = @"
-          {
-            "name": "roomler-ffmpeg-pin",
-            "version": "0.0.1",
-            "dependencies": [
-              {"name": "ffmpeg", "features": ["avcodec", "avformat", "avfilter", "avdevice", "swresample", "swscale", "nvcodec", "qsv", "amf", "vpx"]}
-            ],
-            "builtin-baseline": "ccab4e210cbfb237aab29423a63108958949ef3c"
+          $ErrorActionPreference = 'Stop'
+          $dl = "$env:RUNNER_TEMP\ffdl"
+          gh release download vendored-ffmpeg-8.1.2 --repo "${{ github.repository }}" `
+            --pattern 'ffmpeg-8.1.2-win64-msvc-static-md-lgpl.zip' --dir $dl
+          $ff = "C:\ffmpeg-vendored"
+          if (Test-Path $ff) { Remove-Item -Recurse -Force $ff }
+          Expand-Archive -Path "$dl\ffmpeg-8.1.2-win64-msvc-static-md-lgpl.zip" -DestinationPath $ff -Force
+          $ffFwd = $ff -replace '\\','/'
+          $pcdir = "$ff\lib\pkgconfig"
+          # Rewrite any ABSOLUTE prefix baked at vendoring time to the extract
+          # dir (forward slashes for pkg-config). A relative ${pcfiledir} prefix
+          # doesn't match ^prefix=<drive>: and is left untouched (relocatable).
+          Get-ChildItem "$pcdir\*.pc" | ForEach-Object {
+            (Get-Content $_.FullName) -replace '^prefix=[A-Za-z]:.*', "prefix=$ffFwd" | Set-Content $_.FullName
           }
-          "@
-          $hash = (Get-FileHash -Algorithm SHA256 -InputStream ([IO.MemoryStream]::new([Text.Encoding]::UTF8.GetBytes($manifest)))).Hash.Substring(0, 12)
-          # rc.76: bumped cache key to v2 because the triplet changed from
-          # x64-windows (dynamic, DLLs) to x64-windows-static-md (static
-          # libs). Same manifest content but different cached artifacts.
-          $key = "ffmpeg-vcpkg-v2-static-md-$hash"
-          Write-Host "FFmpeg cache key: $key"
-          "key=$key" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          # Stash the manifest content for the install step.
-          $manifest | Out-File -Encoding utf8 ffmpeg_manifest.json
-          "FFMPEG_MANIFEST_PATH=$((Get-Location).Path)\ffmpeg_manifest.json" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      - name: Restore FFmpeg vcpkg cache
-        id: ffmpeg_cache
-        uses: actions/cache@v4
-        continue-on-error: true
-        with:
-          path: |
-            C:\ffmpeg-pin\installed
-            C:\ffmpeg-pin\vcpkg.json
-          key: ${{ steps.ffmpeg_cache_key.outputs.key }}
-
-      - name: Update local vcpkg to match FFmpeg baseline
-        # rc.67 hotfix: the pre-installed vcpkg's working tree is at an older
-        # commit than my manifest baseline references. vcpkg's version DB
-        # depends on the working tree — entries my baseline expects (e.g.,
-        # vcpkg-tool-meson@1.9.0#8) don't exist in the older tree. Fix:
-        # fetch + reset --hard to bring local vcpkg up to the baseline commit.
-        # libvpx step's install is already in C:\vpx-pin\installed — separate
-        # tree, untouched by this checkout.
-        shell: pwsh
-        run: |
-          cd C:\vcpkg
-          # libvpx step already did fetch --tags / --unshallow, so origin
-          # is current. Reset to my chosen baseline.
-          git fetch origin
-          git reset --hard ccab4e210cbfb237aab29423a63108958949ef3c
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "::error::Failed to checkout vcpkg to baseline ccab4e21. Either the commit doesn't exist on origin or git operations failed."
-            exit 1
+          foreach ($pc in @('libavcodec.pc','libavutil.pc')) {
+            if (-not (Test-Path "$pcdir\$pc")) { Write-Host "::error::vendored FFmpeg missing $pc"; exit 1 }
           }
-          # Re-bootstrap vcpkg.exe if it's missing (it gets blown away by
-          # `git reset --hard` if the commit predates the precompiled exe).
-          if (-not (Test-Path .\vcpkg.exe)) {
-            Write-Host "vcpkg.exe missing after reset — bootstrapping"
-            .\bootstrap-vcpkg.bat -disableMetrics
-          }
-          .\vcpkg.exe version
-
-      - name: Build FFmpeg via vcpkg (encode-only HW backends)
-        shell: pwsh
-        run: |
-          if (Test-Path 'C:\ffmpeg-pin\installed\x64-windows-static-md\lib\pkgconfig\libavcodec.pc') {
-            Write-Host "FFmpeg already installed (cache hit) — skipping vcpkg build"
-          } else {
-            Write-Host "Cold build — installing FFmpeg via vcpkg (expect 25-40 min)"
-            New-Item -ItemType Directory -Path C:\ffmpeg-pin -Force | Out-Null
-            Copy-Item $env:FFMPEG_MANIFEST_PATH C:\ffmpeg-pin\vcpkg.json -Force
-            Push-Location C:\ffmpeg-pin
-            # rc.76: switched from x64-windows (dynamic, DLLs) to
-            # x64-windows-static-md (static libs + dynamic MS runtime,
-            # Rust-compatible). Pre-rc.72 the FFmpeg link was effectively
-            # dead-stripped (no symbols called from non-test paths), so
-            # x64-windows shipped DLL-less MSIs that happened to work.
-            # rc.72 added actual FFmpeg calls in FfmpegEncoder, so the
-            # link became real and the missing-DLL bug surfaced at
-            # install time (avcodec-62.dll not found). Static linkage
-            # bundles FFmpeg into the EXE — no DLLs to ship.
-            C:\vcpkg\vcpkg.exe install --triplet=x64-windows-static-md --x-install-root=C:\ffmpeg-pin\installed
-            if ($LASTEXITCODE -ne 0) {
-              Write-Host "::error::vcpkg install ffmpeg failed — see logs above. rc.67 cannot proceed without this."
-              exit 1
-            }
-            Pop-Location
-          }
-          # Verify the pkg-config files we need actually landed.
-          $required = @('libavcodec.pc', 'libavutil.pc')
-          foreach ($pc in $required) {
-            $p = "C:\ffmpeg-pin\installed\x64-windows-static-md\lib\pkgconfig\$pc"
-            if (-not (Test-Path $p)) {
-              Write-Host "::error::Expected pkg-config file missing: $p"
-              exit 1
-            }
-          }
-          Write-Host "FFmpeg pkg-config files present at C:\ffmpeg-pin\installed\x64-windows-static-md\lib\pkgconfig\"
-
-      - name: Append FFmpeg to PKG_CONFIG_PATH + DLL PATH
-        shell: pwsh
-        run: |
-          # libvpx step already set PKG_CONFIG_PATH=C:/vpx-pin/...; ffmpeg
-          # needs to extend, not replace. Read current value, append ffmpeg
-          # path, write back. Windows pkg-config uses ';' as separator.
+          # Append to PKG_CONFIG_PATH (the libvpx step already set it; ';' sep).
           $existing = [Environment]::GetEnvironmentVariable('PKG_CONFIG_PATH', 'Process')
           if ([string]::IsNullOrEmpty($existing)) { $existing = "" } else { $existing = "$existing;" }
-          $combined = "${existing}C:/ffmpeg-pin/installed/x64-windows-static-md/lib/pkgconfig"
-          "PKG_CONFIG_PATH=$combined" | Out-File -FilePath $env:GITHUB_ENV -Append
-          Write-Host "PKG_CONFIG_PATH=$combined"
-          # rc.71 hotfix: vcpkg's x64-windows triplet produces DLLs for
-          # ffmpeg (libavcodec-*.dll etc.), not static libs. The agent test
-          # binary links against them at compile time but Windows can't
-          # find them at runtime (STATUS_DLL_NOT_FOUND, 0xc0000135 — rc.69
-          # CI failure). Add the ffmpeg bin dir to GITHUB_PATH so cargo test
-          # picks it up. Also stash for the MSI staging step below.
-          "C:\ffmpeg-pin\installed\x64-windows-static-md\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
-          "FFMPEG_DLL_DIR=C:\ffmpeg-pin\installed\x64-windows-static-md\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PKG_CONFIG_PATH=${existing}$ffFwd/lib/pkgconfig" | Out-File -FilePath $env:GITHUB_ENV -Append
+          # static-md → no DLLs to ship. Point FFMPEG_DLL_DIR at a NON-EXISTENT
+          # bin dir so the DLL-staging step below cleanly no-ops via Test-Path
+          # (an empty value would risk a parameter-binding error).
+          "FFMPEG_DLL_DIR=$ff\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "vendored FFmpeg extracted to $ff; PKG_CONFIG_PATH updated"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
