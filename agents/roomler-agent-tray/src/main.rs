@@ -63,6 +63,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             commands::cmd_status,
             commands::cmd_device_view,
+            commands::cmd_ping,
             commands::cmd_enroll,
             commands::cmd_re_enroll,
             commands::cmd_set_device_name,
