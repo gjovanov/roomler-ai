@@ -124,6 +124,10 @@ smoltcp = { version = "0.13", optional = true, default-features = false, feature
     "socket-tcp",
     "socket-udp",
     "socket-icmp",
+    # Auto-answer ICMP echo requests to our own overlay IP at the iface layer, so
+    # a netstack host is `roomler ping`-able like a normal host (no app socket
+    # needed to reply). The `ping` verb itself is `socket-icmp` (above).
+    "auto-icmp-echo-reply",
 ] }
 
 # Windows bindings (Win32). Always compiled on Windows (NOT optional) because
