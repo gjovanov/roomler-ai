@@ -48,7 +48,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
@@ -61,7 +61,8 @@ use smoltcp::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxT
 use smoltcp::socket::{icmp, tcp, udp};
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{
-    HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint,
+    HardwareAddress, Icmpv4Packet, Icmpv4Repr, Icmpv6Packet, Icmpv6Repr, IpAddress, IpCidr,
+    IpEndpoint, IpListenEndpoint,
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
@@ -100,6 +101,37 @@ const ICMP_BUF: usize = 4 * 1024;
 const ICMP_META: usize = 8;
 /// Payload carried in each echo request (the peer echoes it back verbatim).
 const PING_PAYLOAD: &[u8] = b"roomler-netstack-ping";
+
+/// Roomler's overlay IPv6 ULA — `fd72:6f6f:6d6c::/48` (`fd` + ASCII "rooml").
+/// A node's overlay v6 is its overlay v4 embedded in the low 32 bits of the
+/// fixed `/96` inside this ULA, so v6 is *derived*, never separately allocated
+/// (see `docs/netstack-ipv6-plan.md`). Pinned once — every derived address
+/// bakes it in, so it must never change.
+const OVERLAY_ULA_HEXTETS: [u16; 6] = [0xfd72, 0x6f6f, 0x6d6c, 0, 0, 0];
+/// On-link prefix for the derived-v6 network: the fixed `/96` (48-bit ULA + 48
+/// zero bits). Assigning the iface this prefix makes every peer's
+/// `fd72:6f6f:6d6c::<their-v4>` on-link — the v6 mirror of how the v4 network
+/// prefix makes peers on-link, so no route table is needed for peer traffic.
+const OVERLAY_V6_ONLINK_PREFIX: u8 = 96;
+
+/// Derive a node's overlay IPv6 from its overlay IPv4: embed the 32-bit v4 in
+/// the low 32 bits of Roomler's ULA `/96` (`fd72:6f6f:6d6c::<v4>`). Deterministic
+/// and reversible, so a node self-derives its own v6 and every peer's v6 from
+/// the v4 the server already assigns — no server allocation, no wire change.
+pub fn derive_overlay_v6(v4: Ipv4Addr) -> Ipv6Addr {
+    let o = v4.octets();
+    let [a, b, c, d, e, f] = OVERLAY_ULA_HEXTETS;
+    Ipv6Addr::new(
+        a,
+        b,
+        c,
+        d,
+        e,
+        f,
+        u16::from_be_bytes([o[0], o[1]]),
+        u16::from_be_bytes([o[2], o[3]]),
+    )
+}
 
 // ===========================================================================
 // Device — a smoltcp `phy::Device` backed by two packet queues.
@@ -545,6 +577,9 @@ struct PollLoop {
     next_ping_seq: u16,
     next_port: u16,
     base: Instant,
+    /// This iface's derived overlay v6 (`fd72:6f6f:6d6c::<self-v4>`), the source
+    /// address for the ICMPv6 echo pseudo-header checksum.
+    self_v6: Ipv6Addr,
 }
 
 impl PollLoop {
@@ -689,11 +724,24 @@ impl PollLoop {
                 );
                 Some(buf)
             }
-            // ICMPv6 echo needs the iface's derived v6 source for its
-            // pseudo-header checksum; it lands with the dual-address iface.
-            IpAddr::V6(_) => {
-                debug!(%dst, "netstack: v6 ping not yet wired");
-                None
+            IpAddr::V6(dst6) => {
+                let repr = Icmpv6Repr::EchoRequest {
+                    ident: self.ping_ident,
+                    seq_no: seq,
+                    data: PING_PAYLOAD,
+                };
+                let mut buf = vec![0u8; repr.buffer_len()];
+                // ICMPv6's checksum covers a pseudo-header (src + dst), unlike
+                // v4. Emit with our derived v6 as source; the iface recomputes
+                // the checksum on dispatch with the source it selects — the same
+                // single v6 — so the two always agree.
+                repr.emit(
+                    &self.self_v6,
+                    &dst6,
+                    &mut Icmpv6Packet::new_unchecked(&mut buf),
+                    &ChecksumCapabilities::default(),
+                );
+                Some(buf)
             }
         }
     }
@@ -976,10 +1024,17 @@ impl PollLoop {
         let mut matched: Vec<u16> = Vec::new();
         {
             let ident = self.ping_ident;
+            let self_v6 = self.self_v6;
             let sock = self.sockets.get_mut::<icmp::Socket>(self.icmp);
             while sock.can_recv() {
-                let Ok((data, _src)) = sock.recv() else { break };
-                if let Some(seq) = echo_reply_seq(data, ident) {
+                let Ok((data, src)) = sock.recv() else { break };
+                // One ident-bound icmp socket receives both families; pick the
+                // parser by the reply's source-address family.
+                let seq = match src {
+                    IpAddress::Ipv4(_) => echo_reply_seq(data, ident),
+                    IpAddress::Ipv6(peer6) => echo_reply_seq6(data, peer6, self_v6, ident),
+                };
+                if let Some(seq) = seq {
                     matched.push(seq);
                 }
             }
@@ -1072,6 +1127,21 @@ fn echo_reply_seq(data: &[u8], ident: u16) -> Option<u16> {
     }
 }
 
+/// Parse an ICMPv6 packet; return the echo-reply `seq_no` iff it's an
+/// `EchoReply` whose identifier matches `ident`. `src`/`dst` are the reply's
+/// addresses (smoltcp's parser wants them for the pseudo-header); the checksum
+/// is not re-verified (`ignored()`) — the iface already validated it inbound and
+/// we only need the ident + seq. `None` for a malformed / non-echo-reply packet.
+fn echo_reply_seq6(data: &[u8], src: Ipv6Addr, dst: Ipv6Addr, ident: u16) -> Option<u16> {
+    let pkt = Icmpv6Packet::new_checked(data).ok()?;
+    match Icmpv6Repr::parse(&src, &dst, &pkt, &ChecksumCapabilities::ignored()).ok()? {
+        Icmpv6Repr::EchoReply {
+            ident: id, seq_no, ..
+        } if id == ident => Some(seq_no),
+        _ => None,
+    }
+}
+
 /// smoltcp `IpEndpoint` → `std::net::SocketAddr`, either family. smoltcp 0.12+
 /// carries `std::net` addresses directly, so this is a straight rewrap; the
 /// `Option` mirrors the callers' existing `and_then`/`if let` shape (an
@@ -1101,6 +1171,11 @@ impl Netstack {
     /// loop on the current Tokio runtime. Assigning the network prefix makes
     /// every overlay peer on-link, so no route table is needed for peer-to-peer
     /// traffic (LAN-subnet routing via the netstack is a follow-up).
+    ///
+    /// Dual-stack: the iface also gets this node's *derived* overlay IPv6
+    /// ([`derive_overlay_v6`]) on the ULA `/96`, so a v6 peer address routes and
+    /// answers ICMPv6 with no server allocation — inert until a surface targets
+    /// it (see `docs/netstack-ipv6-plan.md`).
     pub fn start(self_ip: Ipv4Addr, prefix: u8, mtu: u16) -> Self {
         let (out_tx, out_rx) = mpsc::unbounded_channel();
         let (in_tx, in_rx) = mpsc::unbounded_channel();
@@ -1121,8 +1196,16 @@ impl Netstack {
             &mut device,
             SmolInstant::from_micros(base.elapsed().as_micros() as i64),
         );
+        // Dual-stack: the server-assigned v4 CIDR, plus this node's derived
+        // overlay v6 on the ULA /96 so every peer's `fd72:6f6f:6d6c::<their-v4>`
+        // is on-link (the v6 mirror of the v4 network prefix — no route table).
+        let self_v6 = derive_overlay_v6(self_ip);
         iface.update_ip_addrs(|addrs| {
             let _ = addrs.push(IpCidr::new(IpAddress::from(self_ip), prefix));
+            let _ = addrs.push(IpCidr::new(
+                IpAddress::Ipv6(self_v6),
+                OVERLAY_V6_ONLINK_PREFIX,
+            ));
         });
 
         // The single ICMP socket every ping rides, bound to a per-instance
@@ -1160,6 +1243,7 @@ impl Netstack {
             next_ping_seq: 0,
             next_port: EPHEMERAL_BASE,
             base,
+            self_v6,
         };
         tokio::spawn(poll_loop.run());
 
@@ -1390,5 +1474,103 @@ mod tests {
         .expect("ping succeeds");
         assert!(rtt < Duration::from_secs(3), "rtt within the timeout");
         let _keep = b; // keep B's netstack alive for the ping
+    }
+
+    /// Cross-link two netstacks packet-for-packet at L3 (no WG), both directions.
+    fn cross_link(a: &Netstack, b: &Netstack) {
+        let (a_tun, b_tun) = (a.tun.clone(), b.tun.clone());
+        tokio::spawn(async move {
+            while let Ok(pkt) = a_tun.read_packet().await {
+                if b_tun.write_packet(&pkt).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let (a_tun2, b_tun2) = (a.tun.clone(), b.tun.clone());
+        tokio::spawn(async move {
+            while let Ok(pkt) = b_tun2.read_packet().await {
+                if a_tun2.write_packet(&pkt).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn direct_pair_tcp_echo_v6() {
+        // Two stacks cross-linked; talk over the DERIVED overlay v6 (ULA /96).
+        let a_v4 = Ipv4Addr::new(10, 6, 0, 1);
+        let b_v4 = Ipv4Addr::new(10, 6, 0, 2);
+        let a = Netstack::start(a_v4, 24, 1280);
+        let b = Netstack::start(b_v4, 24, 1280);
+        cross_link(&a, &b);
+
+        let mut listener = b.handle.listen(9000).await.unwrap();
+        tokio::spawn(async move {
+            if let Some(s) = listener.accept().await {
+                echo(s).await;
+            }
+        });
+
+        let dst = SocketAddr::new(IpAddr::V6(derive_overlay_v6(b_v4)), 9000);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            round_trip(&a.handle, dst, b"hello-netstack-v6"),
+        )
+        .await
+        .expect("v6 round trip in time");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn direct_pair_udp_echo_v6() {
+        let a_v4 = Ipv4Addr::new(10, 5, 0, 1);
+        let b_v4 = Ipv4Addr::new(10, 5, 0, 2);
+        let a = Netstack::start(a_v4, 24, 1280);
+        let b = Netstack::start(b_v4, 24, 1280);
+        cross_link(&a, &b);
+
+        // B: bounce each datagram back to its source, over v6.
+        let mut b_udp = b.handle.udp_bind().await.unwrap();
+        let b_port = b_udp.local_port();
+        let b_tx = b_udp.sender();
+        tokio::spawn(async move {
+            while let Ok((data, src)) = b_udp.recv_from().await {
+                let _ = b_tx.send_to(&data, src).await;
+            }
+        });
+
+        let mut a_udp = a.handle.udp_bind().await.unwrap();
+        let dst = SocketAddr::new(IpAddr::V6(derive_overlay_v6(b_v4)), b_port);
+        let body = async {
+            a_udp.send_to(b"udp-over-netstack-v6", dst).await.unwrap();
+            let (data, src) = a_udp.recv_from().await.unwrap();
+            assert_eq!(&data, b"udp-over-netstack-v6");
+            assert_eq!(src, dst, "reply's source is B's bound v6 port");
+        };
+        tokio::time::timeout(Duration::from_secs(10), body)
+            .await
+            .expect("v6 udp round trip in time");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn direct_pair_icmp_ping_v6() {
+        let a_v4 = Ipv4Addr::new(10, 4, 0, 1);
+        let b_v4 = Ipv4Addr::new(10, 4, 0, 2);
+        let a = Netstack::start(a_v4, 24, 1280);
+        let b = Netstack::start(b_v4, 24, 1280);
+        cross_link(&a, &b);
+
+        // A pings B's derived v6 — B's iface auto-answers the ICMPv6 echo
+        // (`auto-icmp-echo-reply`); A matches the reply by ident and reports RTT.
+        let dst = derive_overlay_v6(b_v4);
+        let rtt = tokio::time::timeout(
+            Duration::from_secs(5),
+            a.handle.ping(IpAddr::V6(dst), Duration::from_secs(3)),
+        )
+        .await
+        .expect("v6 ping completes in time")
+        .expect("v6 ping succeeds");
+        assert!(rtt < Duration::from_secs(3), "rtt within the timeout");
+        let _keep = b;
     }
 }
