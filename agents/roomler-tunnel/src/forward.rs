@@ -29,7 +29,7 @@ use anyhow::{Context, Result, bail};
 use bson::oid::ObjectId;
 use futures::{SinkExt, StreamExt};
 use roomler_ai_remote_control::signaling::{
-    ClientMsg, CloseReason, Direction, IceServer, RejectKind, ServerMsg, TunnelRole,
+    ClientMsg, CloseReason, Direction, IceServer, ServerMsg, TunnelRole,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -38,6 +38,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
+use tunnel_core::driver::{ActiveFlows, FLOW_OPEN_TIMEOUT, ForwardReply, ReplyRegistry};
 use tunnel_core::forward::{FlowDemux, HalfCloseSink, run_flow, run_flow_quic};
 use tunnel_core::transport::quic::{self, QuicConnection, QuicPeer};
 use tunnel_core::transport::relay;
@@ -61,11 +62,6 @@ const TUNNEL_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// plus relay candidate establishment which can take a few seconds
 /// on TURN paths.
 const PEER_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// Cap on per-flow `TcpForwardRequest` → `Accept/Reject` round-trip.
-/// Server-side ACL eval is local but the request rides the agent's
-/// dial timeout in the relay case.
-const FLOW_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How often to send a WebSocket keepalive Ping on the control channel so an
 /// idle middlebox (WS proxy / corp full-tunnel VPN) doesn't reap it after
@@ -153,25 +149,6 @@ enum SessionOutcome {
 type WsSource = futures::stream::SplitStream<
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
 >;
-
-/// Reply registry: per-flow oneshot for the server's accept/reject.
-/// `pub(crate)` so the `udp` relay module shares the same correlation
-/// map (flow_ids are unique per session across TCP + UDP).
-pub(crate) type ReplyRegistry = Arc<Mutex<HashMap<u32, oneshot::Sender<ForwardReply>>>>;
-
-/// Active-flow registry: which DC index a given flow is bound to, so
-/// the WS dispatch can route inbound `TcpHalfClose` audit signals
-/// (no demux action — in-band marker handles the data-plane close).
-pub(crate) type ActiveFlows = Arc<Mutex<HashMap<u32, u8>>>;
-
-#[derive(Debug)]
-pub(crate) enum ForwardReply {
-    Accept { dc_index: u8 },
-    Reject { kind: RejectKind, reason: String },
-}
-
-/// Per-flow open round-trip cap, shared with the `udp` relay module.
-pub(crate) const FLOW_OPEN_TIMEOUT_SHARED: std::time::Duration = FLOW_OPEN_TIMEOUT;
 
 /// Entry point for `roomler-tunnel forward`. Tries the operator's
 /// preferred transport and, for `--transport auto`, transparently
