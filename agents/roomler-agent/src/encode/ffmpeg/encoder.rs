@@ -90,7 +90,17 @@ fn ffmpeg_maxrate_bps(width: u32, height: u32, fps: u32) -> usize {
     }
     const SCREEN_BPP_PER_SECOND: f64 = 0.07;
     let raw = (width as f64 * height as f64 * fps as f64 * SCREEN_BPP_PER_SECOND) as usize;
-    raw.clamp(3_000_000, 12_000_000)
+    let clamped = raw.clamp(3_000_000, 12_000_000);
+    // rc.166 freeze fix — on a constrained relay-TCP transport (WSL / corp
+    // UDP-blocked, ROOMLER_AGENT_ICE_RELAY_TCP=1) even the low end of the
+    // [3, 12] Mbps HEVC/vp9_qsv maxrate band overruns the ~1-4 Mbps pipe.
+    // Pull it down to relay_max_bps (3 Mbps default) so the FFmpeg DC pump
+    // matches the VP9-444 pump's relay clamp.
+    if crate::encode::transport_is_constrained() {
+        clamped.min(crate::encode::relay_max_bps() as usize)
+    } else {
+        clamped
+    }
 }
 
 /// rc.86 — per-encoder private-option dictionary for constant-quality
