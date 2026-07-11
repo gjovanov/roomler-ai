@@ -131,6 +131,10 @@ pub async fn run(
     // P2b — the operator-consent broker, created in `run_cmd` and SHARED with the
     // LocalAPI's DaemonState so its live `pending` set gates LocalAPI decisions.
     consent_broker: crate::consent::ConsentBroker,
+    // P3b-2 PR-C — the tunnel-client hub, created in `run_cmd` and SHARED with the
+    // LocalAPI's DaemonState (create/kill/flows verbs). The signaling loop
+    // publishes the live agent-WS egress into it + demuxes client-bound replies.
+    tunnel_hub: crate::tunnel::client_mgr::TunnelClientHub,
 ) -> Result<()> {
     // One overlay handle, reused across reconnects. Failing to bring up
     // the indicator is non-fatal — the session still works, the user
@@ -169,6 +173,7 @@ pub async fn run(
             consent_broker.clone(),
             connected.clone(),
             overlay_view_tx.clone(),
+            tunnel_hub.clone(),
         )
         .await
         {
@@ -378,6 +383,7 @@ async fn connect_once(
     consent_broker: crate::consent::ConsentBroker,
     connected: Arc<AtomicBool>,
     overlay_view_tx: tokio::sync::watch::Sender<OverlayView>,
+    tunnel_hub: crate::tunnel::client_mgr::TunnelClientHub,
 ) -> Result<(), ConnectError> {
     let url = format!(
         "{}?token={}&role=agent",
@@ -452,6 +458,11 @@ async fn connect_once(
     // locally-gathered ICE candidates and state-change terminates here;
     // the main loop flushes them to the WS.
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<ClientMsg>(PEER_OUTBOUND_CAP);
+    // P3b-2 PR-C: publish this connection's egress so tunnel-client flow
+    // supervisors can open sessions over it; the guard clears it to `None` on
+    // every exit path (like `_connected_guard`), so a supervisor holding the
+    // dead egress re-waits for the next connection's sink.
+    let _sink_guard = tunnel_hub.publish_sink(outbound_tx.clone());
     // Phase 3b: if overlay is enabled, start the node runtime (relay mode)
     // and capture the channel its `rc:overlay.*` events flow into. The
     // runtime sends its `ClientMsg`s back through `outbound_tx`, like any
@@ -580,6 +591,17 @@ async fn connect_once(
                                     None => continue,
                                 },
                                 None => parsed,
+                            };
+                            // P3b-2 PR-C: route client-bound tunnel replies to
+                            // this daemon's originated flows; everything else
+                            // (incl. the target-side tunnel messages) falls
+                            // through to `handle_server_msg` unchanged.
+                            let parsed = match crate::tunnel::client_mgr::intercept_server_msg(
+                                &tunnel_hub,
+                                parsed,
+                            ) {
+                                Some(p) => p,
+                                None => continue,
                             };
                             handle_server_msg(
                                 &mut ws,
