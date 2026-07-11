@@ -16,6 +16,12 @@
 //! [`super::wg::WgDevice::send_ip_packet`]. (macOS utun is point-to-point
 //! and may need an explicit `route add` for the CIDR — refined when 3b/3c
 //! field-test there.)
+//!
+//! Dual-stack: the device also carries the node's *derived* overlay IPv6
+//! ([`super::router::derive_overlay_v6`]) on the ULA `/96`, assigned
+//! best-effort at bring-up — the connected `/96` route makes every peer's
+//! derived v6 on-link, and the WG bridge routes those packets by unmapping
+//! the ULA destination to its embedded v4 (no v6 route table anywhere).
 
 use async_trait::async_trait;
 
@@ -95,6 +101,18 @@ mod system {
         /// `/10` → `255.192.0.0`) so the whole overlay CIDR routes here
         /// via the OS-installed connected route. Must be called inside a
         /// Tokio runtime (the async device registers with the reactor).
+        ///
+        /// Dual-stack: the device also gets this node's *derived* overlay
+        /// IPv6 ([`derive_overlay_v6`](crate::overlay::router::derive_overlay_v6))
+        /// on the ULA `/96` (best-effort, on
+        /// Linux and Windows) — the OS-TUN mirror of the netstack's
+        /// dual-addressed iface. The connected `/96` route auto-installs,
+        /// making every peer's derived v6 on-link; the WG bridge routes it
+        /// by unmapping the ULA destination to its embedded v4
+        /// ([`Router::dst_of_ip_packet`](crate::overlay::router::Router::dst_of_ip_packet)).
+        /// No per-peer v6 `/128`s and no v6 metric pin: unlike the CGNAT
+        /// `100.64.0.0/10`, nothing else on a host claims our random ULA, so
+        /// there is no route war to win (the reason the v4 side needs both).
         pub fn up(self_ip: Ipv4Addr, netmask: Ipv4Addr, mtu: u16) -> std::io::Result<Self> {
             let mut config = tun::Configuration::default();
             config.address(self_ip).netmask(netmask).mtu(mtu).up();
@@ -124,6 +142,12 @@ mod system {
                     .args(["interface", "ipv4", "set", "interface", IF_NAME, "metric=1"])
                     .output();
             }
+
+            // Dual-stack: assign the derived overlay v6 on the ULA /96 (the
+            // `tun` crate's Configuration is v4-only, so this is an OS call —
+            // sync + best-effort like the metric pin; a failure leaves the
+            // node v4-only, which keeps working unchanged).
+            assign_derived_v6(self_ip);
 
             // Program WFP so the overlay's inbound survives a GPO-locked
             // Defender Firewall (Tailscale's approach). Best-effort: a
@@ -370,6 +394,89 @@ mod system {
     const IF_NAME: &str = "roomler";
     #[cfg(target_os = "linux")]
     const IF_NAME: &str = "roomler0";
+
+    /// Assign this node's derived overlay IPv6 (`fd72:6f6f:6d6c::<v4>`, `/96`
+    /// on-link) to the overlay NIC. Sync + best-effort (`up` isn't async): the
+    /// `tun` crate's `Configuration` carries no v6 surface, so Linux uses
+    /// `ip -6 addr replace` (idempotent) and Windows the delete-then-add
+    /// `netsh` pattern the route helpers already use (the Wintun adapter
+    /// persists across reconnects, so the address may already be present).
+    /// macOS utun stays v4-only for now, matching the per-peer-route stance.
+    fn assign_derived_v6(self_ip: Ipv4Addr) {
+        let v6 = crate::overlay::router::derive_overlay_v6(self_ip);
+        #[cfg(target_os = "linux")]
+        {
+            let cidr = format!("{v6}/{}", crate::overlay::router::OVERLAY_V6_ONLINK_PREFIX);
+            match std::process::Command::new("ip")
+                .args(["-6", "addr", "replace", &cidr, "dev", IF_NAME])
+                .output()
+            {
+                Ok(out) if out.status.success() => {
+                    tracing::info!(addr = %cidr, "overlay: derived IPv6 assigned to the TUN");
+                }
+                Ok(out) => tracing::warn!(
+                    addr = %cidr,
+                    stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                    "overlay: derived-IPv6 assign failed; node stays v4-only"
+                ),
+                Err(e) => tracing::warn!(
+                    addr = %cidr,
+                    error = %e,
+                    "overlay: derived-IPv6 assign failed; node stays v4-only"
+                ),
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            // Delete (ignored when absent — first bring-up), then add.
+            let iface = format!("interface={IF_NAME}");
+            let _ = std::process::Command::new("netsh")
+                .args([
+                    "interface",
+                    "ipv6",
+                    "delete",
+                    "address",
+                    &iface,
+                    &format!("address={v6}"),
+                ])
+                .output();
+            let addr = format!(
+                "address={v6}/{}",
+                crate::overlay::router::OVERLAY_V6_ONLINK_PREFIX
+            );
+            match std::process::Command::new("netsh")
+                .args([
+                    "interface",
+                    "ipv6",
+                    "add",
+                    "address",
+                    &iface,
+                    &addr,
+                    "store=active",
+                ])
+                .output()
+            {
+                Ok(out) if out.status.success() => {
+                    tracing::info!(%addr, "overlay: derived IPv6 assigned to the TUN");
+                }
+                Ok(out) => tracing::warn!(
+                    %addr,
+                    stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                    "overlay: derived-IPv6 assign failed; node stays v4-only"
+                ),
+                Err(e) => tracing::warn!(
+                    %addr,
+                    error = %e,
+                    "overlay: derived-IPv6 assign failed; node stays v4-only"
+                ),
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        {
+            // macOS utun: v4-only for now (see the doc comment).
+            let _ = v6;
+        }
+    }
 
     /// Run an OS route command off the async reactor (`std::process` in a
     /// blocking task — avoids pulling in tokio's `process` feature). Non-zero
