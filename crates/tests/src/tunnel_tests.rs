@@ -830,7 +830,10 @@ async fn agent_daemon_originated_forward_reaches_target() {
     );
 
     // kill_flow tears it down + deregisters.
-    assert!(hub.kill_flow(&flow_id), "kill_flow removes the registered flow");
+    assert!(
+        hub.kill_flow(&flow_id),
+        "kill_flow removes the registered flow"
+    );
     assert!(hub.flows_snapshot().is_empty(), "flows() empty after kill");
 
     let _ = stop_tx.send(true);
