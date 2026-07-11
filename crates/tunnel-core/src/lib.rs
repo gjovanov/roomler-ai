@@ -27,6 +27,9 @@
 //! locks this; do not relax it.
 
 pub mod auth;
+/// Tunnel-client session driver — the shared flow vocabulary (P3b-1); the session
+/// orchestration + the `TunnelSignaling` seam fold in at P3b-2.
+pub mod driver;
 /// Node env-var reads with `ROOMLER_NODE_*` → legacy `ROOMLER_AGENT_*` fallback.
 pub mod env;
 pub mod forward;
@@ -38,4 +41,8 @@ pub mod mux;
 pub mod overlay;
 pub mod policy;
 pub mod signaling;
+/// SOCKS5 server + client wire codec — the userspace-mode proxy + mesh chaining.
+pub mod socks5;
 pub mod transport;
+/// SOCKS5 UDP ASSOCIATE relay for the tunnel client's userspace mode.
+pub mod udp;
