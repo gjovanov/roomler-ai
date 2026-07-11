@@ -35,6 +35,34 @@ use roomler_agent::{config::AgentConfig, encode::EncoderPreference, enrollment, 
 use serde_json::{Value, json};
 use std::time::Duration;
 
+/// Spawn the agent signaling loop with test-friendly defaults for the
+/// LocalAPI / consent handles `signaling::run` gained in the Unification
+/// P1 + P2b work. Duplicated from `agent_tests.rs` so this file stands
+/// alone (same rationale as the `enrol` helper below).
+fn spawn_agent_signaling(
+    cfg: AgentConfig,
+    stop_rx: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (view_tx, _view_rx) = tokio::sync::watch::channel(Default::default());
+        let broker = roomler_agent::consent::ConsentBroker::new(
+            roomler_agent::consent::Mode::AutoGrant,
+            std::env::temp_dir().join(format!("roomler-test-consent-{}", cfg.agent_id)),
+        )
+        .expect("consent broker init");
+        let _ = signaling::run(
+            cfg,
+            EncoderPreference::Software,
+            stop_rx,
+            connected,
+            view_tx,
+            broker,
+        )
+        .await;
+    })
+}
+
 /// Helper copy of `agent_tests::enrol_via_agent_lib` — duplicated
 /// rather than pulled into a shared module so this file can stand
 /// alone if the agent_tests.rs surface gets refactored.
@@ -77,12 +105,7 @@ async fn spawn_agent_and_wait_online(
     tokio::sync::watch::Sender<bool>,
 ) {
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-    let sig_task = tokio::spawn({
-        let cfg = cfg.clone();
-        async move {
-            let _ = signaling::run(cfg, EncoderPreference::Software, stop_rx).await;
-        }
-    });
+    let sig_task = spawn_agent_signaling(cfg.clone(), stop_rx);
     for _ in 0..60 {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let row: Value = app
