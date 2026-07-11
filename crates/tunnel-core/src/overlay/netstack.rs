@@ -48,7 +48,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
@@ -61,7 +61,8 @@ use smoltcp::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxT
 use smoltcp::socket::{icmp, tcp, udp};
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{
-    HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint,
+    HardwareAddress, Icmpv4Packet, Icmpv4Repr, Icmpv6Packet, Icmpv6Repr, IpAddress, IpCidr,
+    IpEndpoint, IpListenEndpoint,
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
@@ -100,6 +101,37 @@ const ICMP_BUF: usize = 4 * 1024;
 const ICMP_META: usize = 8;
 /// Payload carried in each echo request (the peer echoes it back verbatim).
 const PING_PAYLOAD: &[u8] = b"roomler-netstack-ping";
+
+/// Roomler's overlay IPv6 ULA — `fd72:6f6f:6d6c::/48` (`fd` + ASCII "rooml").
+/// A node's overlay v6 is its overlay v4 embedded in the low 32 bits of the
+/// fixed `/96` inside this ULA, so v6 is *derived*, never separately allocated
+/// (see `docs/netstack-ipv6-plan.md`). Pinned once — every derived address
+/// bakes it in, so it must never change.
+const OVERLAY_ULA_HEXTETS: [u16; 6] = [0xfd72, 0x6f6f, 0x6d6c, 0, 0, 0];
+/// On-link prefix for the derived-v6 network: the fixed `/96` (48-bit ULA + 48
+/// zero bits). Assigning the iface this prefix makes every peer's
+/// `fd72:6f6f:6d6c::<their-v4>` on-link — the v6 mirror of how the v4 network
+/// prefix makes peers on-link, so no route table is needed for peer traffic.
+const OVERLAY_V6_ONLINK_PREFIX: u8 = 96;
+
+/// Derive a node's overlay IPv6 from its overlay IPv4: embed the 32-bit v4 in
+/// the low 32 bits of Roomler's ULA `/96` (`fd72:6f6f:6d6c::<v4>`). Deterministic
+/// and reversible, so a node self-derives its own v6 and every peer's v6 from
+/// the v4 the server already assigns — no server allocation, no wire change.
+pub fn derive_overlay_v6(v4: Ipv4Addr) -> Ipv6Addr {
+    let o = v4.octets();
+    let [a, b, c, d, e, f] = OVERLAY_ULA_HEXTETS;
+    Ipv6Addr::new(
+        a,
+        b,
+        c,
+        d,
+        e,
+        f,
+        u16::from_be_bytes([o[0], o[1]]),
+        u16::from_be_bytes([o[2], o[3]]),
+    )
+}
 
 // ===========================================================================
 // Device — a smoltcp `phy::Device` backed by two packet queues.
@@ -198,7 +230,7 @@ impl TunIo for NetstackTun {
 
 enum Control {
     Connect {
-        dst: SocketAddrV4,
+        dst: SocketAddr,
         resp: oneshot::Sender<io::Result<NsTcpStream>>,
     },
     Listen {
@@ -209,7 +241,7 @@ enum Control {
         resp: oneshot::Sender<io::Result<NsUdpSocket>>,
     },
     Ping {
-        dst: Ipv4Addr,
+        dst: IpAddr,
         /// Fires with the measured round-trip time when the echo reply lands.
         resp: oneshot::Sender<Duration>,
     },
@@ -226,7 +258,7 @@ impl NetstackHandle {
     /// Open a TCP connection to an overlay address. Resolves once the smoltcp
     /// handshake completes (or errors / times out). This is the SOCKS-CONNECT
     /// backend: the returned [`NsTcpStream`] is [`AsyncRead`]+[`AsyncWrite`].
-    pub async fn connect(&self, dst: SocketAddrV4) -> io::Result<NsTcpStream> {
+    pub async fn connect(&self, dst: SocketAddr) -> io::Result<NsTcpStream> {
         let (resp, rx) = oneshot::channel();
         self.ctl
             .send(Control::Connect { dst, resp })
@@ -272,7 +304,7 @@ impl NetstackHandle {
     /// round-trip time once the reply lands. `Err(TimedOut)` if no reply arrives
     /// within `timeout`. The OS-free reachability probe for a netstack host,
     /// which can't use the OS `ping` (there's no OS route to the overlay).
-    pub async fn ping(&self, dst: Ipv4Addr, timeout: Duration) -> io::Result<Duration> {
+    pub async fn ping(&self, dst: IpAddr, timeout: Duration) -> io::Result<Duration> {
         let (resp, rx) = oneshot::channel();
         self.ctl
             .send(Control::Ping { dst, resp })
@@ -314,7 +346,7 @@ impl NsListener {
 /// `select!`.
 #[derive(Clone)]
 pub struct NsUdpSender {
-    to_stack: mpsc::Sender<(SocketAddrV4, Vec<u8>)>,
+    to_stack: mpsc::Sender<(SocketAddr, Vec<u8>)>,
     wake: Arc<Notify>,
 }
 
@@ -322,7 +354,7 @@ impl NsUdpSender {
     /// Queue `data` for delivery to `dst` over the overlay. Applies
     /// backpressure once the channel to the stack is full (rather than
     /// silently dropping), then nudges the poll loop to flush it.
-    pub async fn send_to(&self, data: &[u8], dst: SocketAddrV4) -> io::Result<()> {
+    pub async fn send_to(&self, data: &[u8], dst: SocketAddr) -> io::Result<()> {
         self.to_stack
             .send((dst, data.to_vec()))
             .await
@@ -338,7 +370,7 @@ impl NsUdpSender {
 /// UDP association (it is connectionless — every datagram carries its own dst).
 pub struct NsUdpSocket {
     tx: NsUdpSender,
-    from_stack: mpsc::Receiver<(SocketAddrV4, Vec<u8>)>,
+    from_stack: mpsc::Receiver<(SocketAddr, Vec<u8>)>,
     local_port: u16,
 }
 
@@ -349,13 +381,13 @@ impl NsUdpSocket {
     }
 
     /// Send a datagram to `dst` (convenience for `self.sender().send_to`).
-    pub async fn send_to(&self, data: &[u8], dst: SocketAddrV4) -> io::Result<()> {
+    pub async fn send_to(&self, data: &[u8], dst: SocketAddr) -> io::Result<()> {
         self.tx.send_to(data, dst).await
     }
 
     /// The next datagram delivered from the overlay, with its source address.
     /// `Err` once the netstack shuts down.
-    pub async fn recv_from(&mut self) -> io::Result<(Vec<u8>, SocketAddrV4)> {
+    pub async fn recv_from(&mut self) -> io::Result<(Vec<u8>, SocketAddr)> {
         self.from_stack
             .recv()
             .await
@@ -391,12 +423,12 @@ pub struct NsTcpStream {
     write_waker: Arc<AtomicWaker>,
     /// Nudge the poll loop after an app read/write so it refills/flushes.
     wake: Arc<Notify>,
-    peer: SocketAddrV4,
+    peer: SocketAddr,
 }
 
 impl NsTcpStream {
     /// The overlay address this stream is connected to (or accepted from).
-    pub fn peer_addr(&self) -> SocketAddrV4 {
+    pub fn peer_addr(&self) -> SocketAddr {
         self.peer
     }
 }
@@ -498,7 +530,7 @@ struct Conn {
 /// Keyed by its [`SocketHandle`] in [`PollLoop::pending_connect`].
 struct PendingConnect {
     resp: Option<oneshot::Sender<io::Result<NsTcpStream>>>,
-    dst: SocketAddrV4,
+    dst: SocketAddr,
 }
 
 /// A listening socket; each accepted connection is sent on `accepted`, then a
@@ -513,12 +545,12 @@ struct PendingListen {
 /// [`PollLoop::udp_conns`]).
 struct UdpConn {
     /// Stack → app: `(source addr, datagram)`.
-    to_app: mpsc::Sender<(SocketAddrV4, Vec<u8>)>,
+    to_app: mpsc::Sender<(SocketAddr, Vec<u8>)>,
     /// App → stack: `(destination addr, datagram)`.
-    from_app: mpsc::Receiver<(SocketAddrV4, Vec<u8>)>,
+    from_app: mpsc::Receiver<(SocketAddr, Vec<u8>)>,
     /// A datagram pulled from `from_app` but not yet accepted by smoltcp's tx
     /// buffer (transient backpressure); retried next pass.
-    pending: Option<(SocketAddrV4, Vec<u8>)>,
+    pending: Option<(SocketAddr, Vec<u8>)>,
     app_send_closed: bool,
 }
 
@@ -545,6 +577,9 @@ struct PollLoop {
     next_ping_seq: u16,
     next_port: u16,
     base: Instant,
+    /// This iface's derived overlay v6 (`fd72:6f6f:6d6c::<self-v4>`), the source
+    /// address for the ICMPv6 echo pseudo-header checksum.
+    self_v6: Ipv6Addr,
 }
 
 impl PollLoop {
@@ -565,13 +600,13 @@ impl PollLoop {
         )
     }
 
-    fn do_connect(&mut self, dst: SocketAddrV4, resp: oneshot::Sender<io::Result<NsTcpStream>>) {
+    fn do_connect(&mut self, dst: SocketAddr, resp: oneshot::Sender<io::Result<NsTcpStream>>) {
         let mut sock = Self::new_tcp_socket();
         let local = IpListenEndpoint {
             addr: None,
             port: self.ephemeral_port(),
         };
-        let remote = (IpAddress::from(*dst.ip()), dst.port());
+        let remote = (IpAddress::from(dst.ip()), dst.port());
         let handle = self.sockets.add(sock_taken(&mut sock));
         let cx = self.iface.context();
         match self
@@ -651,21 +686,16 @@ impl PollLoop {
         let _ = resp.send(Ok(socket));
     }
 
-    fn do_ping(&mut self, dst: Ipv4Addr, resp: oneshot::Sender<Duration>) {
+    fn do_ping(&mut self, dst: IpAddr, resp: oneshot::Sender<Duration>) {
         let seq = self.next_ping_seq;
         self.next_ping_seq = self.next_ping_seq.wrapping_add(1);
-        let repr = Icmpv4Repr::EchoRequest {
-            ident: self.ping_ident,
-            seq_no: seq,
-            data: PING_PAYLOAD,
+        let Some(buf) = self.emit_echo_request(dst, seq) else {
+            // Family not yet wired (v6 lands in the next commit) ⇒ drop `resp`
+            // so `ping()` fails fast instead of hanging to the timeout.
+            return;
         };
-        let mut buf = vec![0u8; repr.buffer_len()];
-        repr.emit(
-            &mut Icmpv4Packet::new_unchecked(&mut buf),
-            &ChecksumCapabilities::default(),
-        );
         let sock = self.sockets.get_mut::<icmp::Socket>(self.icmp);
-        match sock.send_slice(&buf, IpAddress::Ipv4(dst)) {
+        match sock.send_slice(&buf, IpAddress::from(dst)) {
             // Record the send time; `service_icmp` fires `resp` with the RTT when
             // the matching reply arrives.
             Ok(()) => {
@@ -676,9 +706,49 @@ impl PollLoop {
         }
     }
 
+    /// Serialise an ICMP echo request (`seq`, our `ping_ident`, [`PING_PAYLOAD`])
+    /// for `dst`'s address family into a fresh buffer. `None` if the family is
+    /// not wired yet — v6 arrives with the dual-address iface in a follow-up.
+    fn emit_echo_request(&self, dst: IpAddr, seq: u16) -> Option<Vec<u8>> {
+        match dst {
+            IpAddr::V4(_) => {
+                let repr = Icmpv4Repr::EchoRequest {
+                    ident: self.ping_ident,
+                    seq_no: seq,
+                    data: PING_PAYLOAD,
+                };
+                let mut buf = vec![0u8; repr.buffer_len()];
+                repr.emit(
+                    &mut Icmpv4Packet::new_unchecked(&mut buf),
+                    &ChecksumCapabilities::default(),
+                );
+                Some(buf)
+            }
+            IpAddr::V6(dst6) => {
+                let repr = Icmpv6Repr::EchoRequest {
+                    ident: self.ping_ident,
+                    seq_no: seq,
+                    data: PING_PAYLOAD,
+                };
+                let mut buf = vec![0u8; repr.buffer_len()];
+                // ICMPv6's checksum covers a pseudo-header (src + dst), unlike
+                // v4. Emit with our derived v6 as source; the iface recomputes
+                // the checksum on dispatch with the source it selects — the same
+                // single v6 — so the two always agree.
+                repr.emit(
+                    &self.self_v6,
+                    &dst6,
+                    &mut Icmpv6Packet::new_unchecked(&mut buf),
+                    &ChecksumCapabilities::default(),
+                );
+                Some(buf)
+            }
+        }
+    }
+
     /// Build the paired stack-side [`Conn`] + app-side [`NsTcpStream`] for a
     /// freshly established socket.
-    fn make_pair(&self, peer: SocketAddrV4) -> (Conn, NsTcpStream) {
+    fn make_pair(&self, peer: SocketAddr) -> (Conn, NsTcpStream) {
         let (to_app, from_stack) = mpsc::channel(CHAN_CAP);
         let (to_stack, from_app) = mpsc::channel(CHAN_CAP);
         let write_waker = Arc::new(AtomicWaker::new());
@@ -752,8 +822,8 @@ impl PollLoop {
                 .sockets
                 .get::<tcp::Socket>(h)
                 .remote_endpoint()
-                .and_then(sockaddr_v4_of)
-                .unwrap_or_else(|| SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, pl.port));
+                .and_then(sockaddr_of)
+                .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), pl.port));
             let (conn, stream) = self.make_pair(peer);
             self.conns.insert(h, conn);
             // Re-arm a fresh listener for the next connection before delivering.
@@ -892,7 +962,7 @@ impl PollLoop {
                 match sock.recv() {
                     Ok((data, meta)) => {
                         let datav = data.to_vec();
-                        if let Some(src) = sockaddr_v4_of(meta.endpoint) {
+                        if let Some(src) = sockaddr_of(meta.endpoint) {
                             permit.send((src, datav));
                             progressed = true;
                         }
@@ -919,7 +989,7 @@ impl PollLoop {
                 if !sock.can_send() {
                     break;
                 }
-                let meta = IpEndpoint::from((IpAddress::Ipv4(*dst.ip()), dst.port()));
+                let meta = IpEndpoint::from((IpAddress::from(dst.ip()), dst.port()));
                 match sock.send_slice(payload, meta) {
                     Ok(()) => {
                         conn.pending = None;
@@ -954,10 +1024,17 @@ impl PollLoop {
         let mut matched: Vec<u16> = Vec::new();
         {
             let ident = self.ping_ident;
+            let self_v6 = self.self_v6;
             let sock = self.sockets.get_mut::<icmp::Socket>(self.icmp);
             while sock.can_recv() {
-                let Ok((data, _src)) = sock.recv() else { break };
-                if let Some(seq) = echo_reply_seq(data, ident) {
+                let Ok((data, src)) = sock.recv() else { break };
+                // One ident-bound icmp socket receives both families; pick the
+                // parser by the reply's source-address family.
+                let seq = match src {
+                    IpAddress::Ipv4(_) => echo_reply_seq(data, ident),
+                    IpAddress::Ipv6(peer6) => echo_reply_seq6(data, peer6, self_v6, ident),
+                };
+                if let Some(seq) = seq {
                     matched.push(seq);
                 }
             }
@@ -1050,15 +1127,29 @@ fn echo_reply_seq(data: &[u8], ident: u16) -> Option<u16> {
     }
 }
 
-/// smoltcp `IpEndpoint` → `SocketAddrV4` (IPv4 only; `None` for v6/unspecified).
-fn sockaddr_v4_of(ep: smoltcp::wire::IpEndpoint) -> Option<SocketAddrV4> {
-    match ep.addr {
-        // smoltcp 0.12+ uses `std::net::Ipv4Addr` directly, so no conversion.
-        IpAddress::Ipv4(v4) => Some(SocketAddrV4::new(v4, ep.port)),
-        // Unreachable while only `proto-ipv4` is enabled (single-variant enum),
-        // but keeps the match total if `proto-ipv6` is ever turned on.
-        #[allow(unreachable_patterns)]
+/// Parse an ICMPv6 packet; return the echo-reply `seq_no` iff it's an
+/// `EchoReply` whose identifier matches `ident`. `src`/`dst` are the reply's
+/// addresses (smoltcp's parser wants them for the pseudo-header); the checksum
+/// is not re-verified (`ignored()`) — the iface already validated it inbound and
+/// we only need the ident + seq. `None` for a malformed / non-echo-reply packet.
+fn echo_reply_seq6(data: &[u8], src: Ipv6Addr, dst: Ipv6Addr, ident: u16) -> Option<u16> {
+    let pkt = Icmpv6Packet::new_checked(data).ok()?;
+    match Icmpv6Repr::parse(&src, &dst, &pkt, &ChecksumCapabilities::ignored()).ok()? {
+        Icmpv6Repr::EchoReply {
+            ident: id, seq_no, ..
+        } if id == ident => Some(seq_no),
         _ => None,
+    }
+}
+
+/// smoltcp `IpEndpoint` → `std::net::SocketAddr`, either family. smoltcp 0.12+
+/// carries `std::net` addresses directly, so this is a straight rewrap; the
+/// `Option` mirrors the callers' existing `and_then`/`if let` shape (an
+/// `IpEndpoint` addr is always a concrete v4/v6, so it is in practice `Some`).
+fn sockaddr_of(ep: smoltcp::wire::IpEndpoint) -> Option<SocketAddr> {
+    match ep.addr {
+        IpAddress::Ipv4(v4) => Some(SocketAddr::from((v4, ep.port))),
+        IpAddress::Ipv6(v6) => Some(SocketAddr::from((v6, ep.port))),
     }
 }
 
@@ -1080,6 +1171,11 @@ impl Netstack {
     /// loop on the current Tokio runtime. Assigning the network prefix makes
     /// every overlay peer on-link, so no route table is needed for peer-to-peer
     /// traffic (LAN-subnet routing via the netstack is a follow-up).
+    ///
+    /// Dual-stack: the iface also gets this node's *derived* overlay IPv6
+    /// ([`derive_overlay_v6`]) on the ULA `/96`, so a v6 peer address routes and
+    /// answers ICMPv6 with no server allocation — inert until a surface targets
+    /// it (see `docs/netstack-ipv6-plan.md`).
     pub fn start(self_ip: Ipv4Addr, prefix: u8, mtu: u16) -> Self {
         let (out_tx, out_rx) = mpsc::unbounded_channel();
         let (in_tx, in_rx) = mpsc::unbounded_channel();
@@ -1100,8 +1196,16 @@ impl Netstack {
             &mut device,
             SmolInstant::from_micros(base.elapsed().as_micros() as i64),
         );
+        // Dual-stack: the server-assigned v4 CIDR, plus this node's derived
+        // overlay v6 on the ULA /96 so every peer's `fd72:6f6f:6d6c::<their-v4>`
+        // is on-link (the v6 mirror of the v4 network prefix — no route table).
+        let self_v6 = derive_overlay_v6(self_ip);
         iface.update_ip_addrs(|addrs| {
             let _ = addrs.push(IpCidr::new(IpAddress::from(self_ip), prefix));
+            let _ = addrs.push(IpCidr::new(
+                IpAddress::Ipv6(self_v6),
+                OVERLAY_V6_ONLINK_PREFIX,
+            ));
         });
 
         // The single ICMP socket every ping rides, bound to a per-instance
@@ -1139,6 +1243,7 @@ impl Netstack {
             next_ping_seq: 0,
             next_port: EPHEMERAL_BASE,
             base,
+            self_v6,
         };
         tokio::spawn(poll_loop.run());
 
@@ -1174,7 +1279,7 @@ mod tests {
     }
 
     /// Drive an app request/echo round-trip against a connected stack.
-    async fn round_trip(handle: &NetstackHandle, dst: SocketAddrV4, msg: &[u8]) {
+    async fn round_trip(handle: &NetstackHandle, dst: SocketAddr, msg: &[u8]) {
         let mut s = handle.connect(dst).await.expect("connect");
         s.write_all(msg).await.expect("write");
         s.flush().await.expect("flush");
@@ -1217,7 +1322,7 @@ mod tests {
             }
         });
 
-        let dst = SocketAddrV4::new(b_ip, 9000);
+        let dst = SocketAddr::from((b_ip, 9000));
         tokio::time::timeout(
             Duration::from_secs(10),
             round_trip(&a.handle, dst, b"hello-netstack"),
@@ -1274,7 +1379,7 @@ mod tests {
 
         // WG handshake + SYN retransmit can take a beat; connect() retries via
         // smoltcp until the session is up, bounded by CONNECT_TIMEOUT.
-        let dst = SocketAddrV4::new(b_ip, 3389);
+        let dst = SocketAddr::from((b_ip, 3389));
         tokio::time::timeout(
             Duration::from_secs(20),
             round_trip(&a.handle, dst, b"rdp-over-userspace-wireguard"),
@@ -1320,7 +1425,7 @@ mod tests {
 
         // A: send a datagram to B's port and read the echo back.
         let mut a_udp = a.handle.udp_bind().await.unwrap();
-        let dst = SocketAddrV4::new(b_ip, b_port);
+        let dst = SocketAddr::from((b_ip, b_port));
         let body = async {
             a_udp.send_to(b"udp-over-netstack", dst).await.unwrap();
             let (data, src) = a_udp.recv_from().await.unwrap();
@@ -1362,12 +1467,110 @@ mod tests {
         // task at all: `auto-icmp-echo-reply` replies inside its poll loop.
         let rtt = tokio::time::timeout(
             Duration::from_secs(5),
-            a.handle.ping(b_ip, Duration::from_secs(3)),
+            a.handle.ping(IpAddr::V4(b_ip), Duration::from_secs(3)),
         )
         .await
         .expect("ping completes in time")
         .expect("ping succeeds");
         assert!(rtt < Duration::from_secs(3), "rtt within the timeout");
         let _keep = b; // keep B's netstack alive for the ping
+    }
+
+    /// Cross-link two netstacks packet-for-packet at L3 (no WG), both directions.
+    fn cross_link(a: &Netstack, b: &Netstack) {
+        let (a_tun, b_tun) = (a.tun.clone(), b.tun.clone());
+        tokio::spawn(async move {
+            while let Ok(pkt) = a_tun.read_packet().await {
+                if b_tun.write_packet(&pkt).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let (a_tun2, b_tun2) = (a.tun.clone(), b.tun.clone());
+        tokio::spawn(async move {
+            while let Ok(pkt) = b_tun2.read_packet().await {
+                if a_tun2.write_packet(&pkt).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn direct_pair_tcp_echo_v6() {
+        // Two stacks cross-linked; talk over the DERIVED overlay v6 (ULA /96).
+        let a_v4 = Ipv4Addr::new(10, 6, 0, 1);
+        let b_v4 = Ipv4Addr::new(10, 6, 0, 2);
+        let a = Netstack::start(a_v4, 24, 1280);
+        let b = Netstack::start(b_v4, 24, 1280);
+        cross_link(&a, &b);
+
+        let mut listener = b.handle.listen(9000).await.unwrap();
+        tokio::spawn(async move {
+            if let Some(s) = listener.accept().await {
+                echo(s).await;
+            }
+        });
+
+        let dst = SocketAddr::new(IpAddr::V6(derive_overlay_v6(b_v4)), 9000);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            round_trip(&a.handle, dst, b"hello-netstack-v6"),
+        )
+        .await
+        .expect("v6 round trip in time");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn direct_pair_udp_echo_v6() {
+        let a_v4 = Ipv4Addr::new(10, 5, 0, 1);
+        let b_v4 = Ipv4Addr::new(10, 5, 0, 2);
+        let a = Netstack::start(a_v4, 24, 1280);
+        let b = Netstack::start(b_v4, 24, 1280);
+        cross_link(&a, &b);
+
+        // B: bounce each datagram back to its source, over v6.
+        let mut b_udp = b.handle.udp_bind().await.unwrap();
+        let b_port = b_udp.local_port();
+        let b_tx = b_udp.sender();
+        tokio::spawn(async move {
+            while let Ok((data, src)) = b_udp.recv_from().await {
+                let _ = b_tx.send_to(&data, src).await;
+            }
+        });
+
+        let mut a_udp = a.handle.udp_bind().await.unwrap();
+        let dst = SocketAddr::new(IpAddr::V6(derive_overlay_v6(b_v4)), b_port);
+        let body = async {
+            a_udp.send_to(b"udp-over-netstack-v6", dst).await.unwrap();
+            let (data, src) = a_udp.recv_from().await.unwrap();
+            assert_eq!(&data, b"udp-over-netstack-v6");
+            assert_eq!(src, dst, "reply's source is B's bound v6 port");
+        };
+        tokio::time::timeout(Duration::from_secs(10), body)
+            .await
+            .expect("v6 udp round trip in time");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn direct_pair_icmp_ping_v6() {
+        let a_v4 = Ipv4Addr::new(10, 4, 0, 1);
+        let b_v4 = Ipv4Addr::new(10, 4, 0, 2);
+        let a = Netstack::start(a_v4, 24, 1280);
+        let b = Netstack::start(b_v4, 24, 1280);
+        cross_link(&a, &b);
+
+        // A pings B's derived v6 — B's iface auto-answers the ICMPv6 echo
+        // (`auto-icmp-echo-reply`); A matches the reply by ident and reports RTT.
+        let dst = derive_overlay_v6(b_v4);
+        let rtt = tokio::time::timeout(
+            Duration::from_secs(5),
+            a.handle.ping(IpAddr::V6(dst), Duration::from_secs(3)),
+        )
+        .await
+        .expect("v6 ping completes in time")
+        .expect("v6 ping succeeds");
+        assert!(rtt < Duration::from_secs(3), "rtt within the timeout");
+        let _keep = b;
     }
 }
