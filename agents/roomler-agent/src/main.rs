@@ -1505,6 +1505,12 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     let netstack_pinger = roomler_agent::overlay::netstack_pinger();
     #[cfg(not(feature = "overlay-netstack"))]
     let netstack_pinger: Option<std::sync::Arc<dyn localapi_state::NetstackPinger>> = None;
+    // P3b-2 PR-C: the tunnel-client hub, created ONCE here (stable across WS
+    // reconnects) and SHARED between the LocalAPI's DaemonState (create/kill/
+    // flows verbs) and the signaling loop (publish the live egress + demux).
+    let tunnel_hub = roomler_agent::tunnel::client_mgr::TunnelClientHub::new(
+        env!("CARGO_PKG_VERSION").to_string(),
+    );
     let localapi_state: std::sync::Arc<dyn tunnel_core::localapi::LocalApiState> =
         std::sync::Arc::new(localapi_state::DaemonState::new(
             cfg.agent_id.clone(),
@@ -1515,6 +1521,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
             overlay_view_rx,
             consent_broker.clone(),
             netstack_pinger,
+            tunnel_hub.clone(),
         ));
     let localapi_task = tokio::spawn({
         let shutdown = shutdown_rx.clone();
@@ -1537,6 +1544,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
                 connected,
                 view_tx,
                 consent_broker,
+                tunnel_hub,
             )
             .await
         }

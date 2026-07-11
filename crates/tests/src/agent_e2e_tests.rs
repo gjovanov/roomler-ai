@@ -58,6 +58,7 @@ fn spawn_agent_signaling(
             connected,
             view_tx,
             broker,
+            roomler_agent::tunnel::client_mgr::TunnelClientHub::new("test".into()),
         )
         .await;
     })
