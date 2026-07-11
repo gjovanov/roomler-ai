@@ -769,10 +769,6 @@ async fn agent_daemon_originated_forward_reaches_target() {
     // after create_offer(), NOT gated on ICE completion (the in-process-ICE
     // flakiness the suite avoids happens later, at DC-pool establishment, which
     // this test never reaches — it kills the flow first).
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_test_writer()
-        .try_init();
     let app = TestApp::spawn().await;
     let seeded = app.seed_tenant("p3b2c-daemon-orig").await;
 
