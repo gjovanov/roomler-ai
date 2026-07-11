@@ -9,13 +9,27 @@
 //! created there (stable across WS reconnects), the signaling loop updates them,
 //! and the listener reads this state.
 
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
+use async_trait::async_trait;
 use tokio::sync::watch;
 use tunnel_core::localapi::{
     ConsentRequest, DaemonMode, FlowInfo, LocalApiState, NodeStatus, OverlayView, PeerInfo,
+    Response,
 };
+
+/// The netstack ICMP backend behind the `ping` verb, abstracted so
+/// [`DaemonState`] never names the feature-gated `NetstackHandle` type. The
+/// concrete impl lives in `crate::overlay` (feature `overlay-netstack`); `None`
+/// on any node not running the userspace stack.
+#[async_trait]
+pub trait NetstackPinger: Send + Sync {
+    /// ICMP-ping `dst` (already resolved) over the netstack; `Ok(rtt)` on reply.
+    async fn ping(&self, dst: Ipv4Addr, timeout: Duration) -> Result<Duration, String>;
+}
 
 /// Live daemon state behind the LocalAPI. Built once in `run_cmd`, wrapped in an
 /// `Arc<dyn LocalApiState>` for the listener; reads are cheap clones off a
@@ -40,6 +54,9 @@ pub struct DaemonState {
     /// the broker's own sentinel dir, rather than a throwaway broker over a
     /// re-resolved path.
     consent: crate::consent::ConsentBroker,
+    /// The netstack ICMP backend for the `ping` verb. `None` on a node not
+    /// running the userspace stack (OS-TUN or non-overlay build).
+    pinger: Option<Arc<dyn NetstackPinger>>,
 }
 
 impl DaemonState {
@@ -47,6 +64,7 @@ impl DaemonState {
     /// privilege the daemon runs at (today's agent is always the full "be
     /// accessed" service node → [`DaemonMode::Service`]; the unprivileged
     /// user-mode daemon arrives with the binary unification at P3).
+    #[allow(clippy::too_many_arguments)] // a daemon-state constructor; grouping would obscure
     pub fn new(
         node_id: String,
         name: String,
@@ -55,6 +73,7 @@ impl DaemonState {
         connected: Arc<AtomicBool>,
         overlay: watch::Receiver<OverlayView>,
         consent: crate::consent::ConsentBroker,
+        pinger: Option<Arc<dyn NetstackPinger>>,
     ) -> Self {
         Self {
             node_id,
@@ -65,10 +84,33 @@ impl DaemonState {
             connected,
             overlay,
             consent,
+            pinger,
         }
+    }
+
+    /// Resolve a `ping` target — a literal overlay IPv4 or a peer **name** —
+    /// against the live mesh view. Mirrors the netstack SOCKS front's resolver
+    /// (bare label / first DNS label), but reads the view `DaemonState` holds.
+    fn resolve_overlay(&self, target: &str) -> Option<Ipv4Addr> {
+        if let Ok(ip) = target.parse::<Ipv4Addr>() {
+            return Some(ip);
+        }
+        let tl = target.to_ascii_lowercase();
+        let bare = tl.split('.').next().unwrap_or(&tl).to_string();
+        self.overlay.borrow().peers.iter().find_map(|p| {
+            let n = p.name.to_ascii_lowercase();
+            if !p.name.is_empty() && (n == tl || n == bare) {
+                p.overlay_ip
+                    .as_deref()
+                    .and_then(|s| s.parse::<Ipv4Addr>().ok())
+            } else {
+                None
+            }
+        })
     }
 }
 
+#[async_trait]
 impl LocalApiState for DaemonState {
     fn status(&self) -> NodeStatus {
         NodeStatus {
@@ -141,6 +183,30 @@ impl LocalApiState for DaemonState {
         // answer to a question the broker is currently asking).
         self.consent.record_decision(session_id, allow)
     }
+
+    async fn ping(&self, target: &str, timeout_ms: u64) -> Response {
+        let Some(pinger) = self.pinger.clone() else {
+            return Response::Error {
+                message: "ping requires netstack mode (this node isn't running the userspace \
+                          stack)"
+                    .into(),
+            };
+        };
+        let Some(ip) = self.resolve_overlay(target) else {
+            return Response::Error {
+                message: format!("no overlay peer named '{target}' — try an overlay IP or `peers`"),
+            };
+        };
+        let timeout = Duration::from_millis(if timeout_ms == 0 { 3000 } else { timeout_ms });
+        match pinger.ping(ip, timeout).await {
+            Ok(rtt) => Response::Pong {
+                target: target.to_string(),
+                overlay_ip: ip.to_string(),
+                rtt_micros: rtt.as_micros() as u64,
+            },
+            Err(message) => Response::Error { message },
+        }
+    }
 }
 
 /// A 24-char hex ObjectId — the only shape a session id may take before it's
@@ -168,6 +234,45 @@ mod tests {
                 last_seen_ms: None,
             }],
         }
+    }
+
+    fn consent_broker(tag: &str) -> crate::consent::ConsentBroker {
+        crate::consent::ConsentBroker::new(
+            crate::consent::Mode::AutoGrant,
+            std::env::temp_dir().join(format!("roomler-las-consent-{tag}-{}", std::process::id())),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn resolve_targets_and_ping_without_pinger_errors() {
+        let (_tx, rx) = watch::channel(view());
+        let st = DaemonState::new(
+            "aid".into(),
+            "host".into(),
+            DaemonMode::Service,
+            None,
+            Arc::new(AtomicBool::new(true)),
+            rx,
+            consent_broker("ping"),
+            None, // no netstack pinger
+        );
+        // Resolve by peer name (from `view`), by first label, and by literal IP.
+        assert_eq!(
+            st.resolve_overlay("peer"),
+            Some(Ipv4Addr::new(100, 64, 0, 1))
+        );
+        assert_eq!(
+            st.resolve_overlay("PEER.myorg.roomler.net"),
+            Some(Ipv4Addr::new(100, 64, 0, 1))
+        );
+        assert_eq!(
+            st.resolve_overlay("100.64.0.9"),
+            Some(Ipv4Addr::new(100, 64, 0, 9))
+        );
+        assert_eq!(st.resolve_overlay("ghost"), None);
+        // With no pinger (not a netstack node) `ping` is a clean Error, not a Pong.
+        assert!(matches!(st.ping("peer", 0).await, Response::Error { .. }));
     }
 
     #[test]
@@ -200,6 +305,7 @@ mod tests {
             connected.clone(),
             rx,
             consent,
+            None,
         );
 
         // Identity + overlay IP are always reported; connected reflects the flag.
