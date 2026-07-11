@@ -56,6 +56,10 @@ pub struct NodeStatus {
     pub tenant_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlay_ip: Option<String>,
+    /// The node's *derived* overlay IPv6 (`fd72:6f6f:6d6c::<v4>`), published by
+    /// the overlay runtime alongside the v4. Absent on a v4-only daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_ip6: Option<String>,
     /// Connected to the coordination server.
     pub connected: bool,
 }
@@ -67,6 +71,10 @@ pub struct PeerInfo {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlay_ip: Option<String>,
+    /// The peer's *derived* overlay IPv6 (`fd72:6f6f:6d6c::<their-v4>`),
+    /// published by the overlay runtime alongside the v4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_ip6: Option<String>,
     pub online: bool,
     pub connection: ConnectionType,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -141,6 +149,10 @@ pub enum Request {
         target: String,
         #[serde(default)]
         timeout_ms: u64,
+        /// Resolve a *name* target to the peer's derived overlay IPv6 instead
+        /// of its v4 (`roomler ping -6`). Ignored for literal-IP targets.
+        #[serde(default)]
+        prefer_v6: bool,
     },
     /// Create a daemon-driven static forward: the daemon opens a tunnel to
     /// `node` (a hex agent id) over its own agent WS and listens on `local`,
@@ -219,6 +231,10 @@ pub enum Response {
 pub struct OverlayView {
     /// This node's assigned overlay IP (the netmap `self_ip`), once joined.
     pub self_ip: Option<String>,
+    /// This node's *derived* overlay IPv6, filled by the overlay runtime
+    /// alongside `self_ip` (the daemon never derives — it has no `overlay`
+    /// feature guarantee).
+    pub self_ip6: Option<String>,
     /// Peers as the runtime currently reaches them.
     pub peers: Vec<PeerInfo>,
 }
@@ -244,9 +260,10 @@ pub trait LocalApiState: Send + Sync {
     }
     /// ICMP-ping an overlay peer by name/IP over the userspace netstack, and
     /// return a [`Response::Pong`] (or [`Response::Error`]). Async — awaited by
-    /// [`serve_connection`], not the sync [`handle`]. Default: unsupported (a
+    /// [`serve_connection`], not the sync [`handle`]. `prefer_v6` resolves a
+    /// name target to the peer's derived overlay IPv6. Default: unsupported (a
     /// node not running the netstack has no OS-free ICMP path).
-    async fn ping(&self, _target: &str, _timeout_ms: u64) -> Response {
+    async fn ping(&self, _target: &str, _timeout_ms: u64, _prefer_v6: bool) -> Response {
         Response::Error {
             message: "ping is not supported on this node (not running the userspace netstack)"
                 .into(),
@@ -329,7 +346,11 @@ where
         let resp = match serde_json::from_str::<Request>(&line) {
             // The async verbs — await them here; everything else is a pure sync
             // dispatch through `handle`.
-            Ok(Request::Ping { target, timeout_ms }) => state.ping(&target, timeout_ms).await,
+            Ok(Request::Ping {
+                target,
+                timeout_ms,
+                prefer_v6,
+            }) => state.ping(&target, timeout_ms, prefer_v6).await,
             Ok(Request::CreateForward {
                 node,
                 local,
@@ -798,10 +819,16 @@ impl Client {
     /// `Request::Ping` → the resolved `(overlay_ip, rtt_ms)`. A daemon
     /// [`Response::Error`] (unknown peer / not a netstack node / timeout)
     /// surfaces its message verbatim.
-    pub async fn ping(&mut self, target: &str, timeout_ms: u64) -> std::io::Result<(String, f64)> {
+    pub async fn ping(
+        &mut self,
+        target: &str,
+        timeout_ms: u64,
+        prefer_v6: bool,
+    ) -> std::io::Result<(String, f64)> {
         let req = Request::Ping {
             target: target.to_string(),
             timeout_ms,
+            prefer_v6,
         };
         match self.request(&req).await? {
             Response::Pong {
@@ -912,6 +939,7 @@ mod tests {
                 mode: DaemonMode::Service,
                 tenant_id: Some("t1".into()),
                 overlay_ip: Some("100.64.0.2".into()),
+                overlay_ip6: None,
                 connected: true,
             }
         }
@@ -921,6 +949,7 @@ mod tests {
                     node_id: "n2".into(),
                     name: "pc50045".into(),
                     overlay_ip: Some("100.64.0.1".into()),
+                    overlay_ip6: None,
                     online: true,
                     connection: ConnectionType::Tunnel,
                     rtt_ms: Some(52),
@@ -930,6 +959,7 @@ mod tests {
                     node_id: "n3".into(),
                     name: "home".into(),
                     overlay_ip: Some("100.64.0.9".into()),
+                    overlay_ip6: None,
                     online: true,
                     connection: ConnectionType::Direct,
                     rtt_ms: Some(3),

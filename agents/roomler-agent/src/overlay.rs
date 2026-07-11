@@ -171,7 +171,7 @@ fn netstack_tun_factory(
 /// ICMP path (the OS `ping` works there).
 #[cfg(feature = "overlay-netstack")]
 pub fn netstack_pinger() -> Option<Arc<dyn crate::localapi_state::NetstackPinger>> {
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::IpAddr;
     use std::time::Duration;
     use tunnel_core::overlay::netstack::NetstackHandle;
 
@@ -183,18 +183,13 @@ pub fn netstack_pinger() -> Option<Arc<dyn crate::localapi_state::NetstackPinger
     }
     #[async_trait::async_trait]
     impl crate::localapi_state::NetstackPinger for NsPinger {
-        async fn ping(&self, dst: Ipv4Addr, timeout: Duration) -> Result<Duration, String> {
+        async fn ping(&self, dst: IpAddr, timeout: Duration) -> Result<Duration, String> {
             let handle = self
                 .handle
                 .borrow()
                 .clone()
                 .ok_or_else(|| "netstack not up yet (mesh not joined)".to_string())?;
-            // The netstack API is dual-stack (`IpAddr`); the pinger trait still
-            // hands us a v4 today (v6 target resolution is a later surface phase).
-            handle
-                .ping(IpAddr::V4(dst), timeout)
-                .await
-                .map_err(|e| e.to_string())
+            handle.ping(dst, timeout).await.map_err(|e| e.to_string())
         }
     }
 

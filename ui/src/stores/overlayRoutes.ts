@@ -18,6 +18,24 @@ interface OverlayNodeListResponse {
   items: OverlayNode[]
 }
 
+// A node's *derived* overlay IPv6: its overlay v4 embedded in the low 32 bits
+// of Roomler's ULA /96 (`fd72:6f6f:6d6c::<v4>`). Mirrors
+// `crates/tunnel-core/src/overlay/router.rs::derive_overlay_v6` — display-only
+// here (routing derives it node-side), so the server never has to publish v6.
+// Matches Rust's `Ipv6Addr` Display: `::` swallows the zero run, hex segments
+// carry no leading zeros, and a zero high segment folds into the `::`.
+export function deriveOverlayV6(v4: string): string | null {
+  const parts = v4.split('.').map(Number)
+  if (parts.length !== 4 || parts.some((p) => !Number.isInteger(p) || p < 0 || p > 255)) {
+    return null
+  }
+  const hi = (parts[0] << 8) | parts[1]
+  const lo = (parts[2] << 8) | parts[3]
+  if (hi === 0 && lo === 0) return 'fd72:6f6f:6d6c::'
+  if (hi === 0) return `fd72:6f6f:6d6c::${lo.toString(16)}`
+  return `fd72:6f6f:6d6c::${hi.toString(16)}:${lo.toString(16)}`
+}
+
 // Matches `overlay_route.rs::MagicDnsResponse` / `SetMagicDnsRequest`.
 export interface MagicDnsSettings {
   magic_dns_domain: string | null
