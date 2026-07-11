@@ -32,6 +32,7 @@ use webrtc::media::Sample;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::rtp_transceiver::RTCPFeedback;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
@@ -264,10 +265,27 @@ impl AgentPeer {
             .with_interceptor_registry(registry)
             .build();
 
-        let config = RTCConfiguration {
-            ice_servers: map_ice_servers(ice_servers),
+        // rc.162: hostile-NAT hosts (WSL2 + wsl-vpnkit, other userspace-VPN
+        // stacks) mangle UDP source ports, breaking the TURN allocation
+        // refresh — the media peer flaps Connected/Disconnected and the
+        // desktop freezes. `ROOMLER_AGENT_ICE_RELAY_TCP=1` pins the media to
+        // the TURNS/TCP relay (the vendored webrtc-ice TCP branch), a single
+        // stable TCP connection that survives it — the same escape hatch the
+        // tunnel uses on corp VPNs. Opt-in: the default path is unchanged.
+        let relay_tcp = std::env::var("ROOMLER_AGENT_ICE_RELAY_TCP")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let mut config = RTCConfiguration {
+            ice_servers: if relay_tcp {
+                map_ice_servers_relay_tcp(ice_servers)
+            } else {
+                map_ice_servers(ice_servers)
+            },
             ..Default::default()
         };
+        if relay_tcp {
+            config.ice_transport_policy = RTCIceTransportPolicy::Relay;
+        }
 
         let pc = Arc::new(
             api.new_peer_connection(config)
@@ -4161,6 +4179,99 @@ fn map_ice_servers(servers: &[IceServer]) -> Vec<RTCIceServer> {
             credential: s.credential.clone().unwrap_or_default(),
         })
         .collect()
+}
+
+/// Filter mapped ICE servers to the TURNS-over-TCP relay only, for
+/// `ROOMLER_AGENT_ICE_RELAY_TCP` mode. Hostile-NAT hosts (WSL2 +
+/// wsl-vpnkit, other userspace-VPN stacks) mangle UDP source ports so the
+/// TURN allocation refresh fails and the media peer flaps; a single
+/// TURNS/TCP connection (handled by the vendored `webrtc-ice` TCP branch)
+/// survives it. Keeps only `turns:…?transport=tcp` URLs and drops STUN +
+/// plain-UDP TURN. Returns the full mapping unchanged when no TCP-relay
+/// URL is present, so the knob can never break connectivity outright.
+fn map_ice_servers_relay_tcp(servers: &[IceServer]) -> Vec<RTCIceServer> {
+    let all = map_ice_servers(servers);
+    let filtered: Vec<RTCIceServer> = all
+        .iter()
+        .filter_map(|s| {
+            let tcp_urls: Vec<String> = s
+                .urls
+                .iter()
+                .filter(|u| {
+                    let lu = u.to_ascii_lowercase();
+                    lu.starts_with("turns:") && lu.contains("transport=tcp")
+                })
+                .cloned()
+                .collect();
+            (!tcp_urls.is_empty()).then(|| RTCIceServer {
+                urls: tcp_urls,
+                username: s.username.clone(),
+                credential: s.credential.clone(),
+            })
+        })
+        .collect();
+    if filtered.is_empty() {
+        warn!(
+            "ICE_RELAY_TCP set but no turns:…?transport=tcp URL available — using all ICE servers"
+        );
+        all
+    } else {
+        info!(
+            servers = filtered.len(),
+            "ICE relay-over-TCP: media pinned to TURNS/TCP relay (hostile-NAT mode)"
+        );
+        filtered
+    }
+}
+
+#[cfg(test)]
+mod ice_relay_tcp_tests {
+    use super::{map_ice_servers, map_ice_servers_relay_tcp};
+    use roomler_ai_remote_control::signaling::IceServer;
+
+    fn srv(urls: &[&str], with_cred: bool) -> IceServer {
+        IceServer {
+            urls: urls.iter().map(|s| s.to_string()).collect(),
+            username: with_cred.then(|| "u".to_string()),
+            credential: with_cred.then(|| "c".to_string()),
+        }
+    }
+
+    #[test]
+    fn relay_tcp_keeps_only_turns_tcp_and_drops_stun_and_udp() {
+        let servers = vec![
+            srv(&["stun:stun.l.google.com:19302"], false),
+            srv(
+                &[
+                    "turn:coturn.example:443?transport=udp",
+                    "turn:coturn.example:3478?transport=tcp",
+                    "turns:coturn.example:443?transport=tcp",
+                ],
+                true,
+            ),
+        ];
+        let out = map_ice_servers_relay_tcp(&servers);
+        // Only the server that carries a `turns:…?transport=tcp` URL
+        // survives, and only that URL is kept (STUN + UDP + plain-TCP TURN
+        // dropped — the vendored ice fork only handles TURNS-over-TCP).
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].urls, vec!["turns:coturn.example:443?transport=tcp"]);
+        assert_eq!(out[0].username, "u");
+        assert_eq!(out[0].credential, "c");
+    }
+
+    #[test]
+    fn relay_tcp_falls_back_to_all_when_no_tcp_relay() {
+        // No `turns:…?transport=tcp` anywhere → never break connectivity;
+        // return the full mapping unchanged.
+        let servers = vec![
+            srv(&["stun:stun.l.google.com:19302"], false),
+            srv(&["turn:coturn.example:3478?transport=udp"], true),
+        ];
+        let out = map_ice_servers_relay_tcp(&servers);
+        assert_eq!(out.len(), map_ice_servers(&servers).len());
+        assert_eq!(out.len(), 2);
+    }
 }
 
 /// Build the `RTCRtpCodecCapability` for the negotiated codec. Matches
