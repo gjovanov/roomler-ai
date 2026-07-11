@@ -45,18 +45,22 @@
 //! * `agent_daemon_originated_forward_reaches_target` (P3b-2 PR-C) — the
 //!   DAEMON consumer end-to-end: origin A's REAL signaling loop runs with a
 //!   `TunnelClientHub`, the test drives `create_forward` on it (the LocalAPI
-//!   verb's path), and target B receives the relayed `rc:tunnel.sdp.offer` —
-//!   proving `create_forward` → nonce-stamped open → agent authz →
-//!   `rc:tunnel.opened` demuxed BACK BY NONCE → peer + offer → relay. Also
-//!   asserts `flows()` reflects the flow + `kill_flow` tears it down.
+//!   verb's path), and then polls `flows()` until the flow reports its
+//!   NEGOTIATED transport — which the per-session source records only when it
+//!   yields `rc:tunnel.opened` to the driver. That proves the whole consumer
+//!   path: `create_forward` → nonce-stamped `rc:tunnel.open` → server
+//!   `Principal::Agent` authz (all_users policy) → `rc:tunnel.opened` demuxed
+//!   BACK BY NONCE. Also asserts `flows()` reflects the flow + `kill_flow`
+//!   tears it down. (Target B stays online so the open passes the server's
+//!   target-online check.)
 //!
-//! Full WebRTC DC round-trip (echo server + TCP byte exchange) is NOT covered
-//! here — the in-process ICE flakiness in
+//! The assertion deliberately stops at the OPEN handshake. The subsequent
+//! WebRTC DC data plane (peer build → SDP offer → answer → DC pool → TCP byte
+//! exchange) is NOT covered here — the in-process ICE flakiness in
 //! `agent_tests::agent_answers_sdp_offer_with_real_webrtc_peer` (see its
-//! "best-effort" comment) makes DC-pool establishment too unstable for CI
-//! without a TURN fixture. The PR-C test above stops at the offer (sent
-//! pre-ICE, so it's robust) and kills the flow before the flaky pool wait; the
-//! byte-level data plane is validated on real hosts via the `tunnel-fleet-test`
+//! "best-effort" comment) makes it too unstable for CI without a TURN fixture.
+//! The flow is killed right after the open, before that data plane; the
+//! byte-level round-trip is validated on real hosts via the `tunnel-fleet-test`
 //! field gate.
 
 use crate::fixtures::test_app::TestApp;
@@ -789,9 +793,11 @@ async fn agent_daemon_originated_forward_reaches_target() {
     .await
     .unwrap();
 
-    // Target B: a raw agent WS that will receive the relayed offer.
+    // Target B: a raw agent WS kept alive so B stays online (the server checks
+    // the target is online at open time). We assert on A's flow state, not B's
+    // frames, so B is a keep-alive only.
     let (b_id, b_tok) = enroll_agent(&app, &seeded, "mach-p3b2c-B", "target-B").await;
-    let mut b_ws = connect_agent_ws(&app, &b_tok, "target-B").await;
+    let _b_ws = connect_agent_ws(&app, &b_tok, "target-B").await;
     wait_agent_online(&app, &seeded, &b_id).await;
 
     // Origin A: its REAL signaling loop + the hub we drive.
@@ -816,17 +822,32 @@ async fn agent_daemon_originated_forward_reaches_target() {
     assert_eq!(snap[0].target.as_deref(), Some("127.0.0.1:9000"));
     assert_eq!(snap[0].node.as_deref(), Some(b_id.as_str()));
 
-    // The offer must reach target B — proving nonce demux + agent authz + relay.
-    let offer = read_until(&mut b_ws, "rc:tunnel.sdp.offer")
-        .await
-        .expect("target B must receive the daemon-originated rc:tunnel.sdp.offer");
-    assert!(
-        offer["session_id"].as_str().is_some(),
-        "relayed offer carries the server-minted session_id"
-    );
-    assert!(
-        offer["sdp"].as_str().is_some_and(|s| !s.is_empty()),
-        "relayed offer carries a non-empty SDP"
+    // Poll flows() until the flow reports its NEGOTIATED transport — proving the
+    // open handshake completed AND the hub demuxed `rc:tunnel.opened` BACK BY
+    // NONCE (the per-session `ChannelSource` records the negotiated transport
+    // only when it yields the `opened` frame to the driver). This is the full
+    // daemon-consumer path: create_forward → nonce-stamped `rc:tunnel.open` →
+    // server `Principal::Agent` authz (all_users policy) → `rc:tunnel.opened` →
+    // nonce demux. It stops at the OPEN, before the in-process WebRTC DC data
+    // plane the suite avoids as flaky — the subsequent peer build + offer are
+    // aborted with the flow below.
+    let mut negotiated = None;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let snap = hub.flows_snapshot();
+        if let Some(f) = snap.first()
+            && f.transport != "connecting"
+            && f.transport != "down"
+        {
+            negotiated = Some(f.transport.clone());
+            break;
+        }
+    }
+    assert_eq!(
+        negotiated.as_deref(),
+        Some("webrtc-dc-v1"),
+        "the daemon-originated session must open + demux rc:tunnel.opened by nonce \
+         (negotiated transport recorded on the flow)"
     );
 
     // kill_flow tears it down + deregisters.
