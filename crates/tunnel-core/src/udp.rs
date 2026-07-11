@@ -34,6 +34,7 @@ use crate::forward::{
     FlowDemux, MAX_UDP_DATAGRAM, UDP_FLOW_IDLE_TIMEOUT, deframe_udp_datagram, quic_read_datagram,
     quic_write_datagram, send_udp_datagram_dc,
 };
+use crate::signaling_link::TunnelSignalingSink;
 use crate::transport::quic::{self, QuicConnection};
 
 use crate::driver::{FLOW_OPEN_TIMEOUT, ForwardReply, ReplyRegistry};
@@ -64,7 +65,7 @@ pub async fn handle_associate(
     session_id: ObjectId,
     carrier: AssocCarrier,
     reply_registry: ReplyRegistry,
-    outbound_tx: mpsc::Sender<ClientMsg>,
+    sink: Arc<dyn TunnelSignalingSink>,
     flow_counter: Arc<AtomicU32>,
 ) -> Result<()> {
     let relay = Arc::new(
@@ -117,7 +118,7 @@ pub async fn handle_associate(
                     src,
                     &relay,
                     &reply_registry,
-                    &outbound_tx,
+                    &sink,
                     &flow_counter,
                 )
                 .await;
@@ -146,7 +147,7 @@ async fn get_or_open_flow(
     app_src: SocketAddr,
     relay: &Arc<UdpSocket>,
     reply_registry: &ReplyRegistry,
-    outbound_tx: &mpsc::Sender<ClientMsg>,
+    sink: &Arc<dyn TunnelSignalingSink>,
     flow_counter: &Arc<AtomicU32>,
 ) -> FlowTx {
     let key = (host.to_string(), port);
@@ -161,7 +162,7 @@ async fn get_or_open_flow(
     let flows2 = Arc::clone(flows);
     let relay2 = Arc::clone(relay);
     let registry2 = Arc::clone(reply_registry);
-    let outbound2 = outbound_tx.clone();
+    let outbound2 = sink.clone();
     let host_owned = host.to_string();
     match carrier {
         AssocCarrier::Dc { demuxes } => {
@@ -199,19 +200,18 @@ async fn open_udp_flow(
     host: &str,
     port: u16,
     reply_registry: &ReplyRegistry,
-    outbound_tx: &mpsc::Sender<ClientMsg>,
+    sink: &Arc<dyn TunnelSignalingSink>,
 ) -> Result<u8> {
     let (reply_tx, reply_rx) = oneshot::channel::<ForwardReply>();
     reply_registry.lock().await.insert(flow_id, reply_tx);
-    outbound_tx
-        .send(ClientMsg::UdpForwardRequest {
-            session_id,
-            flow_id,
-            dst_host: host.to_string(),
-            dst_port: port,
-        })
-        .await
-        .context("send UdpForwardRequest")?;
+    sink.send(ClientMsg::UdpForwardRequest {
+        session_id,
+        flow_id,
+        dst_host: host.to_string(),
+        dst_port: port,
+    })
+    .await
+    .context("send UdpForwardRequest")?;
     let reply = match tokio::time::timeout(FLOW_OPEN_TIMEOUT, reply_rx).await {
         Ok(Ok(r)) => r,
         Ok(Err(_)) => {
@@ -243,24 +243,16 @@ async fn run_flow_dc(
     app_src: SocketAddr,
     mut outbound_rx: mpsc::Receiver<Vec<u8>>,
     reply_registry: ReplyRegistry,
-    outbound_tx: mpsc::Sender<ClientMsg>,
+    sink: Arc<dyn TunnelSignalingSink>,
 ) {
-    let dc_index = match open_udp_flow(
-        session_id,
-        flow_id,
-        &host,
-        port,
-        &reply_registry,
-        &outbound_tx,
-    )
-    .await
-    {
-        Ok(i) => i,
-        Err(e) => {
-            warn!(%session_id, flow_id, %host, port, %e, "udp flow open failed");
-            return;
-        }
-    };
+    let dc_index =
+        match open_udp_flow(session_id, flow_id, &host, port, &reply_registry, &sink).await {
+            Ok(i) => i,
+            Err(e) => {
+                warn!(%session_id, flow_id, %host, port, %e, "udp flow open failed");
+                return;
+            }
+        };
     let Some(demux) = demuxes.get(dc_index as usize).cloned() else {
         warn!(%session_id, flow_id, dc_index, "server returned out-of-range dc_index for udp flow");
         return;
@@ -297,7 +289,7 @@ async fn run_flow_dc(
 
     demux.unregister(flow_id).await;
     debug!(%session_id, flow_id, ?reason, "udp flow ended (dc)");
-    let _ = outbound_tx
+    let _ = sink
         .send(ClientMsg::UdpClosed {
             session_id,
             flow_id,
@@ -318,18 +310,9 @@ async fn run_flow_quic(
     app_src: SocketAddr,
     mut outbound_rx: mpsc::Receiver<Vec<u8>>,
     reply_registry: ReplyRegistry,
-    outbound_tx: mpsc::Sender<ClientMsg>,
+    sink: Arc<dyn TunnelSignalingSink>,
 ) {
-    if let Err(e) = open_udp_flow(
-        session_id,
-        flow_id,
-        &host,
-        port,
-        &reply_registry,
-        &outbound_tx,
-    )
-    .await
-    {
+    if let Err(e) = open_udp_flow(session_id, flow_id, &host, port, &reply_registry, &sink).await {
         warn!(%session_id, flow_id, %host, port, %e, "udp flow open failed");
         return;
     }
@@ -371,7 +354,7 @@ async fn run_flow_quic(
     };
 
     debug!(%session_id, flow_id, ?reason, "udp flow ended (quic)");
-    let _ = outbound_tx
+    let _ = sink
         .send(ClientMsg::UdpClosed {
             session_id,
             flow_id,
