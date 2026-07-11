@@ -413,6 +413,11 @@ section = "net"
 priority = "optional"
 assets = [
     ["target/release/roomler-agent", "usr/bin/", "755"],
+    # Bundled FFmpeg 8.1.2 (LGPL) for the ffmpeg-encoder HEVC backend. Populated
+    # by the "Bundle FFmpeg" CI step (SONAME-named real files, $ORIGIN RPATH) so
+    # the .deb is self-contained — stock Ubuntu ships an ABI-incompatible FFmpeg
+    # 6.1. This glob is CI-only (the Linux .deb is never built locally).
+    ["vendor-ffmpeg/*.so.*", "usr/lib/roomler-agent/", "644"],
     ["packaging/linux/roomler-agent.service", "usr/lib/systemd/user/roomler-agent.service", "644"],
     ["packaging/linux/README.Debian", "usr/share/doc/roomler-agent/README.Debian", "644"],
 ]
