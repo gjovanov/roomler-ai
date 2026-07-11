@@ -376,6 +376,13 @@ system-context = []
 # `overlay_enabled` config. The agent runs privileged (service), so the
 # TUN device + routes come up directly (no helper).
 overlay-l3 = ["roomler-ai-tunnel-core/overlay-l3"]
+# Netstack overlay surface — the OS-free twin of `overlay-l3`. Instead of a
+# real TUN, the node terminates the overlay CIDR in a userspace smoltcp stack
+# and exposes a loopback SOCKS5 front, so a locked-down host (full-tunnel VPN)
+# reaches the mesh with NO OS routing. Opt in per-run with the env var
+# `ROOMLER_AGENT_OVERLAY_NETSTACK_SOCKS=<port>` (see `overlay.rs`). Independent
+# of `overlay-l3`; a build may carry either or both (config picks at runtime).
+overlay-netstack = ["roomler-ai-tunnel-core/overlay-netstack"]
 
 [dev-dependencies]
 tokio-test = { workspace = true }
