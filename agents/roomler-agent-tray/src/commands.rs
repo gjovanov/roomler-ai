@@ -178,6 +178,35 @@ pub async fn cmd_device_view() -> DeviceView {
     }
 }
 
+/// A live ICMP-ping result over the netstack — returned from [`cmd_ping`] for the
+/// SPA's per-peer Ping button. `rtt_ms` is the userspace round-trip time.
+#[derive(Debug, Serialize)]
+pub struct PingResult {
+    pub overlay_ip: String,
+    pub rtt_ms: f64,
+}
+
+/// `cmd_ping(target, timeoutMs?)` — ICMP-ping an overlay peer (by name or IP)
+/// over the userspace netstack via the daemon's LocalAPI. Mirrors
+/// [`cmd_device_view`]'s connect pattern; a missing daemon or a daemon-side error
+/// (unknown peer / timeout / "not a netstack node") rejects with a user-facing
+/// string the SPA shows on the button.
+#[tauri::command]
+pub async fn cmd_ping(target: String, timeout_ms: Option<u64>) -> Result<PingResult, String> {
+    let mut client = localapi::connect().await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            "device service not running".to_string()
+        } else {
+            format!("connecting to the device service: {e}")
+        }
+    })?;
+    let (overlay_ip, rtt_ms) = client
+        .ping(&target, timeout_ms.unwrap_or(3000))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(PingResult { overlay_ip, rtt_ms })
+}
+
 /// First-time enrollment flow. Args mirror the CLI's `roomler-agent
 /// enroll --server --token --name`. On success writes config.toml +
 /// returns a redacted `StatusReport` (no agent_token).
