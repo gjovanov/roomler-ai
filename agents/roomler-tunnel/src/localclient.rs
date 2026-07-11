@@ -67,6 +67,29 @@ pub async fn flows(json: bool) -> Result<()> {
     Ok(())
 }
 
+/// `roomler ping <target> [--timeout-ms N]` — ICMP-ping an overlay peer (by
+/// name or IP) over the userspace netstack: the OS-free reachability probe for a
+/// locked-down host with no OS route to the mesh. Meaningful on a netstack node;
+/// other daemons reply "not supported". The daemon's own error (unknown peer /
+/// timeout / not-a-netstack-node) is surfaced verbatim — only a *connect* failure
+/// maps through [`daemon_err`].
+pub async fn ping(target: &str, timeout_ms: u64, json: bool) -> Result<()> {
+    let mut client = localapi::connect().await.map_err(daemon_err)?;
+    let (overlay_ip, rtt_ms) = client
+        .ping(target, timeout_ms)
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "target": target, "overlay_ip": overlay_ip, "rtt_ms": rtt_ms })
+        );
+    } else {
+        println!("{target} ({overlay_ip}): {rtt_ms:.1} ms");
+    }
+    Ok(())
+}
+
 /// Map a LocalAPI connect/IO error to a user-facing one. A missing daemon is an
 /// *expected* state, so `NotFound` collapses to a single clean line with **no**
 /// `.source()` chain (the raw "The system cannot find the file specified" /

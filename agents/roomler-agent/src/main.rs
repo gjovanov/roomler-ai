@@ -1499,6 +1499,12 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     let localapi_connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (overlay_view_tx, overlay_view_rx) =
         tokio::sync::watch::channel(tunnel_core::localapi::OverlayView::default());
+    // The netstack ICMP backend for `roomler ping` — Some only on a node running
+    // the userspace stack (netstack mode); None otherwise (OS-TUN / non-overlay).
+    #[cfg(feature = "overlay-netstack")]
+    let netstack_pinger = roomler_agent::overlay::netstack_pinger();
+    #[cfg(not(feature = "overlay-netstack"))]
+    let netstack_pinger: Option<std::sync::Arc<dyn localapi_state::NetstackPinger>> = None;
     let localapi_state: std::sync::Arc<dyn tunnel_core::localapi::LocalApiState> =
         std::sync::Arc::new(localapi_state::DaemonState::new(
             cfg.agent_id.clone(),
@@ -1508,6 +1514,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
             localapi_connected.clone(),
             overlay_view_rx,
             consent_broker.clone(),
+            netstack_pinger,
         ));
     let localapi_task = tokio::spawn({
         let shutdown = shutdown_rx.clone();
