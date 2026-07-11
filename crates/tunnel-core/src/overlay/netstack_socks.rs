@@ -20,15 +20,16 @@
 //!   `neo16.myorg.roomler.net`), resolved to an overlay IPv4 from the live mesh
 //!   view ([`resolve_overlay_host`]). MagicDNS-independent: it reads the
 //!   netmap's `name → overlay-IP` directly, no DNS server / magic-domain needed.
-//! * **IPv6** — the overlay is IPv4-only, so a genuine IPv6 target is
-//!   unreachable; an **IPv4-mapped** IPv6 (`::ffff:a.b.c.d`) is unwrapped to its
-//!   embedded IPv4.
+//! * **IPv6** — a **derived overlay v6** (`fd72:6f6f:6d6c::<v4>`) dials over
+//!   IPv6 end-to-end; an **IPv4-mapped** IPv6 (`::ffff:a.b.c.d`) is unwrapped to
+//!   its embedded IPv4; any other IPv6 is not an overlay address and is
+//!   rejected immediately (host-unreachable) rather than left to time out.
 //!
 //! The SOCKS5 request parse + UDP framing are shared with the tunnel's
 //! [`crate::socks5`]; only the data plane (netstack vs tunnel transport)
 //! differs. BIND is not supported.
 
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -50,24 +51,35 @@ const REP_HOST_UNREACHABLE: u8 = 0x04;
 /// slack). Datagrams larger than the overlay MTU fragment at the IP layer.
 const UDP_RELAY_BUF: usize = 64 * 1024 + 512;
 
-/// Resolve a SOCKS5 target host to an **overlay IPv4** using the live mesh
+/// Resolve a SOCKS5 target host to an **overlay address** using the live mesh
 /// `view`. Resolution order:
 ///
 /// 1. a literal IPv4 string (`"100.64.0.2"`) — used as-is;
-/// 2. an **IPv4-mapped IPv6** literal (`"::ffff:a.b.c.d"`) — unwrapped to its
-///    embedded IPv4 (a genuine IPv6 has none ⇒ `None`, the overlay is v4-only);
-/// 3. an exact, case-insensitive match against a peer's name (`"neo16"`);
+/// 2. a literal IPv6:
+///    * **IPv4-mapped** (`"::ffff:a.b.c.d"`) — unwrapped to its embedded IPv4;
+///    * a **derived overlay v6** (`"fd72:6f6f:6d6c::<v4>"`,
+///      [`embedded_v4_of_overlay_v6`](super::router::embedded_v4_of_overlay_v6))
+///      — kept as v6, so the dial exercises IPv6 end-to-end;
+///    * anything else is not an overlay address ⇒ `None` — an instant
+///      host-unreachable instead of a doomed connect that times out;
+/// 3. an exact, case-insensitive match against a peer's name (`"neo16"`) — its
+///    IPv4 (universal; every peer has one, v6 is derived from it);
 /// 4. the first DNS label, so a MagicDNS FQDN (`"neo16.myorg.roomler.net"`)
 ///    resolves to the same peer as its bare label.
 ///
 /// `None` if nothing matches. Names come straight from the netmap the runtime
 /// already publishes, so this needs no DNS server and no magic-domain config.
-fn resolve_overlay_host(view: &OverlayView, host: &str) -> Option<Ipv4Addr> {
+fn resolve_overlay_host(view: &OverlayView, host: &str) -> Option<IpAddr> {
     if let Ok(ip) = host.parse::<Ipv4Addr>() {
-        return Some(ip);
+        return Some(IpAddr::V4(ip));
     }
     if let Ok(v6) = host.parse::<Ipv6Addr>() {
-        return v6.to_ipv4_mapped();
+        if let Some(mapped) = v6.to_ipv4_mapped() {
+            return Some(IpAddr::V4(mapped));
+        }
+        return super::router::embedded_v4_of_overlay_v6(v6)
+            .is_some()
+            .then_some(IpAddr::V6(v6));
     }
     let host_lc = host.to_ascii_lowercase();
     let bare = host_lc.split('.').next().unwrap_or(host_lc.as_str());
@@ -80,6 +92,7 @@ fn resolve_overlay_host(view: &OverlayView, host: &str) -> Option<Ipv4Addr> {
             p.overlay_ip
                 .as_deref()
                 .and_then(|s| s.parse::<Ipv4Addr>().ok())
+                .map(IpAddr::V4)
         } else {
             None
         }
@@ -155,7 +168,7 @@ async fn connect_and_splice(
         reply(&mut client, REP_HOST_UNREACHABLE).await;
         return Err(std::io::Error::other("unknown overlay host"));
     };
-    let dst = SocketAddr::from((ip, port));
+    let dst = SocketAddr::new(ip, port);
     let mut upstream = match handle.connect(dst).await {
         Ok(s) => s,
         Err(e) => {
@@ -218,7 +231,7 @@ async fn handle_udp_associate(
                     debug!(%host, "netstack socks: udp target not an overlay peer — dropping");
                     continue;
                 };
-                let _ = ns_tx.send_to(&buf[off..n], SocketAddr::from((ip, port))).await;
+                let _ = ns_tx.send_to(&buf[off..n], SocketAddr::new(ip, port)).await;
             }
             // overlay → app
             got = ns_udp.recv_from() => {
@@ -276,6 +289,7 @@ mod tests {
 
     const CMD_CONNECT: u8 = 0x01;
     const ATYP_DOMAIN: u8 = 0x03;
+    const ATYP_IPV6: u8 = 0x04;
 
     /// Pump every packet A emits into B and vice-versa (L3 loopback, no WG).
     fn crosslink(a: &Netstack, b: &Netstack) {
@@ -308,6 +322,7 @@ mod tests {
             node_id: "0".repeat(24),
             name: name.into(),
             overlay_ip: Some(ip.into()),
+            overlay_ip6: None,
             online: true,
             connection: ConnectionType::Direct,
             rtt_ms: None,
@@ -316,29 +331,38 @@ mod tests {
     }
 
     #[test]
-    fn resolves_ip_name_fqdn_and_mapped_v6() {
+    fn resolves_ip_name_fqdn_and_v6_forms() {
+        use crate::overlay::router::derive_overlay_v6;
+
         let view = OverlayView {
             self_ip: Some("100.64.0.1".into()),
+            self_ip6: None,
             peers: vec![peer("NEO16", "100.64.0.2"), peer("pc50045", "100.64.0.4")],
         };
         assert_eq!(
             resolve_overlay_host(&view, "100.64.0.9"),
-            Some(Ipv4Addr::new(100, 64, 0, 9))
+            Some(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 9)))
         );
         assert_eq!(
             resolve_overlay_host(&view, "neo16"),
-            Some(Ipv4Addr::new(100, 64, 0, 2))
+            Some(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2)))
         );
         assert_eq!(
             resolve_overlay_host(&view, "PC50045.myorg.roomler.net"),
-            Some(Ipv4Addr::new(100, 64, 0, 4))
+            Some(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 4)))
         );
         // IPv4-mapped IPv6 literal → embedded overlay IPv4.
         assert_eq!(
             resolve_overlay_host(&view, "::ffff:100.64.0.7"),
-            Some(Ipv4Addr::new(100, 64, 0, 7))
+            Some(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 7)))
         );
-        // genuine IPv6 → unreachable; unknown name → miss.
+        // A DERIVED overlay v6 literal stays v6 (dials over IPv6 end-to-end).
+        let d6 = derive_overlay_v6(Ipv4Addr::new(100, 64, 0, 2));
+        assert_eq!(
+            resolve_overlay_host(&view, &d6.to_string()),
+            Some(IpAddr::V6(d6))
+        );
+        // A non-overlay IPv6 → instant unreachable; unknown name → miss.
         assert_eq!(resolve_overlay_host(&view, "2001:db8::1"), None);
         assert_eq!(resolve_overlay_host(&view, "ghost"), None);
     }
@@ -382,6 +406,7 @@ mod tests {
         let (handle_tx, handle_rx) = watch::channel(Some(a.handle.clone()));
         let (view_tx, view_rx) = watch::channel(OverlayView {
             self_ip: Some(a_ip.to_string()),
+            self_ip6: None,
             peers: vec![peer("peerb", &b_ip.to_string())],
         });
         tokio::spawn(serve_socks5(handle_rx, view_rx, socks));
@@ -411,13 +436,20 @@ mod tests {
         let mut by_name = vec![ATYP_DOMAIN, name.len() as u8];
         by_name.extend_from_slice(name);
         by_name.extend_from_slice(&4000u16.to_be_bytes());
+        // (3) by B's DERIVED overlay v6 (a genuine ATYP_IPV6 frame) — the
+        // whole splice runs over IPv6 inside the netstack.
+        let d6 = crate::overlay::router::derive_overlay_v6(b_ip).octets();
+        let mut by_v6 = vec![ATYP_IPV6];
+        by_v6.extend_from_slice(&d6);
+        by_v6.extend_from_slice(&4000u16.to_be_bytes());
 
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(Duration::from_secs(15), async {
             connect_round_trip(socks_addr, &by_ip).await;
             connect_round_trip(socks_addr, &by_name).await;
+            connect_round_trip(socks_addr, &by_v6).await;
         })
         .await
-        .expect("both socks round trips in time");
+        .expect("all three socks round trips in time");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
