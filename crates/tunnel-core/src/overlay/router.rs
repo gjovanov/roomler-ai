@@ -9,9 +9,63 @@
 //!
 //! Outbound path: read the destination address out of the IP packet
 //! header → [`Router::route`] → the peer's pubkey → the peer's `Tunn`.
+//!
+//! **IPv6 (dual-stack)**: a node's overlay v6 is *derived* from its overlay
+//! v4 — the v4 embedded in the low 32 bits of Roomler's ULA `/96`
+//! ([`derive_overlay_v6`], `docs/netstack-ipv6-plan.md`). Routing therefore
+//! needs **no v6 table**: [`Router::dst_of_ip_packet`] unmaps a derived-ULA
+//! destination back to its embedded v4 and routes on the existing v4 entries,
+//! covering every present and future peer with zero per-peer state and zero
+//! netmap change. A v6 destination outside the ULA (link-local/multicast OS
+//! noise, genuine internet v6) is unroutable by construction and dropped.
 
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
+
+/// Roomler's overlay IPv6 ULA — `fd72:6f6f:6d6c::/48` (`fd` + ASCII "rooml").
+/// A node's overlay v6 is its overlay v4 embedded in the low 32 bits of the
+/// fixed `/96` inside this ULA, so v6 is *derived*, never separately allocated
+/// (see `docs/netstack-ipv6-plan.md`). Pinned once — every derived address
+/// bakes it in, so it must never change.
+const OVERLAY_ULA_HEXTETS: [u16; 6] = [0xfd72, 0x6f6f, 0x6d6c, 0, 0, 0];
+/// On-link prefix for the derived-v6 network: the fixed `/96` (48-bit ULA + 48
+/// zero bits). Assigning an iface this prefix makes every peer's
+/// `fd72:6f6f:6d6c::<their-v4>` on-link — the v6 mirror of how the v4 network
+/// prefix makes peers on-link — so no OS/netstack route table is needed for
+/// peer traffic.
+pub const OVERLAY_V6_ONLINK_PREFIX: u8 = 96;
+
+/// Derive a node's overlay IPv6 from its overlay IPv4: embed the 32-bit v4 in
+/// the low 32 bits of Roomler's ULA `/96` (`fd72:6f6f:6d6c::<v4>`). Deterministic
+/// and reversible ([`embedded_v4_of_overlay_v6`]), so a node self-derives its
+/// own v6 and every peer's v6 from the v4 the server already assigns — no
+/// server allocation, no wire change.
+pub fn derive_overlay_v6(v4: Ipv4Addr) -> Ipv6Addr {
+    let o = v4.octets();
+    let [a, b, c, d, e, f] = OVERLAY_ULA_HEXTETS;
+    Ipv6Addr::new(
+        a,
+        b,
+        c,
+        d,
+        e,
+        f,
+        u16::from_be_bytes([o[0], o[1]]),
+        u16::from_be_bytes([o[2], o[3]]),
+    )
+}
+
+/// The inverse of [`derive_overlay_v6`]: the overlay v4 embedded in a
+/// derived-ULA v6, or `None` if `v6` is not inside Roomler's ULA `/96`.
+pub fn embedded_v4_of_overlay_v6(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    let seg = v6.segments();
+    if seg[..6] != OVERLAY_ULA_HEXTETS {
+        return None;
+    }
+    let hi = seg[6].to_be_bytes();
+    let lo = seg[7].to_be_bytes();
+    Some(Ipv4Addr::new(hi[0], hi[1], lo[0], lo[1]))
+}
 
 /// An IPv4 CIDR — Phase 1 subnet routes. Hand-rolled (no dep): the overlay only
 /// needs `contains` + `parse` for a handful of advertised subnets per peer.
@@ -109,18 +163,25 @@ impl Router {
             .map(|(_, pk)| *pk)
     }
 
-    /// Destination address from an IPv4 packet (bytes 16..20), or `None`
-    /// for a non-IPv4 / too-short buffer. The TUN bridge (Phase 3) hands
-    /// raw IP packets here to pick a peer.
-    pub fn dst_of_ipv4_packet(packet: &[u8]) -> Option<Ipv4Addr> {
-        // Version nibble must be 4 and the header must reach the dst
-        // field.
-        if packet.len() < 20 || (packet[0] >> 4) != 4 {
-            return None;
+    /// The **v4 routing key** for a raw IP packet's destination, or `None` if
+    /// it is unroutable. The TUN/netstack bridge hands raw IP packets here to
+    /// pick a peer:
+    /// * IPv4 → the dst field (bytes 16..20).
+    /// * IPv6 → the dst field (bytes 24..40 of the fixed header) **unmapped**
+    ///   to its embedded v4 iff it is a derived-ULA address
+    ///   ([`embedded_v4_of_overlay_v6`]) — so v6 routes on the same v4 table.
+    ///   Any other v6 (link-local/multicast OS noise, internet v6) → `None`.
+    pub fn dst_of_ip_packet(packet: &[u8]) -> Option<Ipv4Addr> {
+        match packet.first()? >> 4 {
+            4 if packet.len() >= 20 => Some(Ipv4Addr::new(
+                packet[16], packet[17], packet[18], packet[19],
+            )),
+            6 if packet.len() >= 40 => {
+                let dst: [u8; 16] = packet[24..40].try_into().ok()?;
+                embedded_v4_of_overlay_v6(Ipv6Addr::from(dst))
+            }
+            _ => None,
         }
-        Some(Ipv4Addr::new(
-            packet[16], packet[17], packet[18], packet[19],
-        ))
     }
 }
 
@@ -180,20 +241,56 @@ mod tests {
     }
 
     #[test]
-    fn dst_of_ipv4_packet_reads_header() {
+    fn dst_of_ip_packet_reads_v4_header() {
         // Minimal IPv4 header: version/IHL=0x45, then 12 bytes, then
         // src (4) at offset 12, dst (4) at offset 16.
         let mut pkt = [0u8; 20];
         pkt[0] = 0x45;
         pkt[16..20].copy_from_slice(&[100, 64, 0, 9]);
         assert_eq!(
-            Router::dst_of_ipv4_packet(&pkt),
+            Router::dst_of_ip_packet(&pkt),
             Some(Ipv4Addr::new(100, 64, 0, 9))
         );
-        // Non-IPv4 / short buffers reject.
-        assert_eq!(Router::dst_of_ipv4_packet(&[0u8; 10]), None);
-        let mut v6 = [0u8; 20];
-        v6[0] = 0x60;
-        assert_eq!(Router::dst_of_ipv4_packet(&v6), None);
+        // Short / empty buffers reject.
+        assert_eq!(Router::dst_of_ip_packet(&[0u8; 10]), None);
+        assert_eq!(Router::dst_of_ip_packet(&[]), None);
+        // A version nibble that is neither 4 nor 6 rejects.
+        let mut junk = [0u8; 40];
+        junk[0] = 0x50;
+        assert_eq!(Router::dst_of_ip_packet(&junk), None);
+    }
+
+    #[test]
+    fn derive_and_unmap_overlay_v6_round_trip() {
+        let v4 = Ipv4Addr::new(100, 64, 3, 129);
+        let v6 = derive_overlay_v6(v4);
+        // The textual form pins the ULA scheme (fd72:6f6f:6d6c::/96).
+        assert_eq!(v6.to_string(), "fd72:6f6f:6d6c::6440:381");
+        assert_eq!(embedded_v4_of_overlay_v6(v6), Some(v4));
+        // Outside the ULA → not an overlay v6.
+        assert_eq!(embedded_v4_of_overlay_v6("fe80::1".parse().unwrap()), None);
+        assert_eq!(
+            embedded_v4_of_overlay_v6("fd00::6440:381".parse().unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn dst_of_ip_packet_unmaps_derived_v6_and_drops_other_v6() {
+        let v4 = Ipv4Addr::new(100, 64, 0, 9);
+        // Minimal IPv6 fixed header: version nibble 6; dst at bytes 24..40.
+        let mut pkt = [0u8; 40];
+        pkt[0] = 0x60;
+        pkt[24..40].copy_from_slice(&derive_overlay_v6(v4).octets());
+        assert_eq!(Router::dst_of_ip_packet(&pkt), Some(v4));
+
+        // A non-ULA v6 destination (OS link-local noise) is unroutable.
+        let mut ll = [0u8; 40];
+        ll[0] = 0x60;
+        ll[24..40].copy_from_slice(&"fe80::1".parse::<Ipv6Addr>().unwrap().octets());
+        assert_eq!(Router::dst_of_ip_packet(&ll), None);
+
+        // A truncated v6 header rejects.
+        assert_eq!(Router::dst_of_ip_packet(&[0x60; 39]), None);
     }
 }
