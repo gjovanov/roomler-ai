@@ -28,7 +28,7 @@
 //! [`crate::socks5`]; only the data plane (netstack vs tunnel transport)
 //! differs. BIND is not supported.
 
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -155,7 +155,7 @@ async fn connect_and_splice(
         reply(&mut client, REP_HOST_UNREACHABLE).await;
         return Err(std::io::Error::other("unknown overlay host"));
     };
-    let dst = SocketAddrV4::new(ip, port);
+    let dst = SocketAddr::from((ip, port));
     let mut upstream = match handle.connect(dst).await {
         Ok(s) => s,
         Err(e) => {
@@ -218,7 +218,7 @@ async fn handle_udp_associate(
                     debug!(%host, "netstack socks: udp target not an overlay peer — dropping");
                     continue;
                 };
-                let _ = ns_tx.send_to(&buf[off..n], SocketAddrV4::new(ip, port)).await;
+                let _ = ns_tx.send_to(&buf[off..n], SocketAddr::from((ip, port))).await;
             }
             // overlay → app
             got = ns_udp.recv_from() => {
@@ -447,10 +447,10 @@ mod tests {
             let mut rep = [0u8; 10];
             ctl.read_exact(&mut rep).await.unwrap();
             assert_eq!(rep[1], REP_SUCCESS, "UDP ASSOCIATE must succeed");
-            let relay = SocketAddrV4::new(
+            let relay = SocketAddr::from((
                 Ipv4Addr::new(rep[4], rep[5], rep[6], rep[7]),
                 u16::from_be_bytes([rep[8], rep[9]]),
-            );
+            ));
 
             // App UDP socket → send a SOCKS-UDP datagram addressing B by NAME.
             let app = UdpSocket::bind("127.0.0.1:0").await.unwrap();

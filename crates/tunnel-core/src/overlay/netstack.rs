@@ -48,7 +48,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
@@ -198,7 +198,7 @@ impl TunIo for NetstackTun {
 
 enum Control {
     Connect {
-        dst: SocketAddrV4,
+        dst: SocketAddr,
         resp: oneshot::Sender<io::Result<NsTcpStream>>,
     },
     Listen {
@@ -209,7 +209,7 @@ enum Control {
         resp: oneshot::Sender<io::Result<NsUdpSocket>>,
     },
     Ping {
-        dst: Ipv4Addr,
+        dst: IpAddr,
         /// Fires with the measured round-trip time when the echo reply lands.
         resp: oneshot::Sender<Duration>,
     },
@@ -226,7 +226,7 @@ impl NetstackHandle {
     /// Open a TCP connection to an overlay address. Resolves once the smoltcp
     /// handshake completes (or errors / times out). This is the SOCKS-CONNECT
     /// backend: the returned [`NsTcpStream`] is [`AsyncRead`]+[`AsyncWrite`].
-    pub async fn connect(&self, dst: SocketAddrV4) -> io::Result<NsTcpStream> {
+    pub async fn connect(&self, dst: SocketAddr) -> io::Result<NsTcpStream> {
         let (resp, rx) = oneshot::channel();
         self.ctl
             .send(Control::Connect { dst, resp })
@@ -272,7 +272,7 @@ impl NetstackHandle {
     /// round-trip time once the reply lands. `Err(TimedOut)` if no reply arrives
     /// within `timeout`. The OS-free reachability probe for a netstack host,
     /// which can't use the OS `ping` (there's no OS route to the overlay).
-    pub async fn ping(&self, dst: Ipv4Addr, timeout: Duration) -> io::Result<Duration> {
+    pub async fn ping(&self, dst: IpAddr, timeout: Duration) -> io::Result<Duration> {
         let (resp, rx) = oneshot::channel();
         self.ctl
             .send(Control::Ping { dst, resp })
@@ -314,7 +314,7 @@ impl NsListener {
 /// `select!`.
 #[derive(Clone)]
 pub struct NsUdpSender {
-    to_stack: mpsc::Sender<(SocketAddrV4, Vec<u8>)>,
+    to_stack: mpsc::Sender<(SocketAddr, Vec<u8>)>,
     wake: Arc<Notify>,
 }
 
@@ -322,7 +322,7 @@ impl NsUdpSender {
     /// Queue `data` for delivery to `dst` over the overlay. Applies
     /// backpressure once the channel to the stack is full (rather than
     /// silently dropping), then nudges the poll loop to flush it.
-    pub async fn send_to(&self, data: &[u8], dst: SocketAddrV4) -> io::Result<()> {
+    pub async fn send_to(&self, data: &[u8], dst: SocketAddr) -> io::Result<()> {
         self.to_stack
             .send((dst, data.to_vec()))
             .await
@@ -338,7 +338,7 @@ impl NsUdpSender {
 /// UDP association (it is connectionless — every datagram carries its own dst).
 pub struct NsUdpSocket {
     tx: NsUdpSender,
-    from_stack: mpsc::Receiver<(SocketAddrV4, Vec<u8>)>,
+    from_stack: mpsc::Receiver<(SocketAddr, Vec<u8>)>,
     local_port: u16,
 }
 
@@ -349,13 +349,13 @@ impl NsUdpSocket {
     }
 
     /// Send a datagram to `dst` (convenience for `self.sender().send_to`).
-    pub async fn send_to(&self, data: &[u8], dst: SocketAddrV4) -> io::Result<()> {
+    pub async fn send_to(&self, data: &[u8], dst: SocketAddr) -> io::Result<()> {
         self.tx.send_to(data, dst).await
     }
 
     /// The next datagram delivered from the overlay, with its source address.
     /// `Err` once the netstack shuts down.
-    pub async fn recv_from(&mut self) -> io::Result<(Vec<u8>, SocketAddrV4)> {
+    pub async fn recv_from(&mut self) -> io::Result<(Vec<u8>, SocketAddr)> {
         self.from_stack
             .recv()
             .await
@@ -391,12 +391,12 @@ pub struct NsTcpStream {
     write_waker: Arc<AtomicWaker>,
     /// Nudge the poll loop after an app read/write so it refills/flushes.
     wake: Arc<Notify>,
-    peer: SocketAddrV4,
+    peer: SocketAddr,
 }
 
 impl NsTcpStream {
     /// The overlay address this stream is connected to (or accepted from).
-    pub fn peer_addr(&self) -> SocketAddrV4 {
+    pub fn peer_addr(&self) -> SocketAddr {
         self.peer
     }
 }
@@ -498,7 +498,7 @@ struct Conn {
 /// Keyed by its [`SocketHandle`] in [`PollLoop::pending_connect`].
 struct PendingConnect {
     resp: Option<oneshot::Sender<io::Result<NsTcpStream>>>,
-    dst: SocketAddrV4,
+    dst: SocketAddr,
 }
 
 /// A listening socket; each accepted connection is sent on `accepted`, then a
@@ -513,12 +513,12 @@ struct PendingListen {
 /// [`PollLoop::udp_conns`]).
 struct UdpConn {
     /// Stack → app: `(source addr, datagram)`.
-    to_app: mpsc::Sender<(SocketAddrV4, Vec<u8>)>,
+    to_app: mpsc::Sender<(SocketAddr, Vec<u8>)>,
     /// App → stack: `(destination addr, datagram)`.
-    from_app: mpsc::Receiver<(SocketAddrV4, Vec<u8>)>,
+    from_app: mpsc::Receiver<(SocketAddr, Vec<u8>)>,
     /// A datagram pulled from `from_app` but not yet accepted by smoltcp's tx
     /// buffer (transient backpressure); retried next pass.
-    pending: Option<(SocketAddrV4, Vec<u8>)>,
+    pending: Option<(SocketAddr, Vec<u8>)>,
     app_send_closed: bool,
 }
 
@@ -565,13 +565,13 @@ impl PollLoop {
         )
     }
 
-    fn do_connect(&mut self, dst: SocketAddrV4, resp: oneshot::Sender<io::Result<NsTcpStream>>) {
+    fn do_connect(&mut self, dst: SocketAddr, resp: oneshot::Sender<io::Result<NsTcpStream>>) {
         let mut sock = Self::new_tcp_socket();
         let local = IpListenEndpoint {
             addr: None,
             port: self.ephemeral_port(),
         };
-        let remote = (IpAddress::from(*dst.ip()), dst.port());
+        let remote = (IpAddress::from(dst.ip()), dst.port());
         let handle = self.sockets.add(sock_taken(&mut sock));
         let cx = self.iface.context();
         match self
@@ -651,21 +651,16 @@ impl PollLoop {
         let _ = resp.send(Ok(socket));
     }
 
-    fn do_ping(&mut self, dst: Ipv4Addr, resp: oneshot::Sender<Duration>) {
+    fn do_ping(&mut self, dst: IpAddr, resp: oneshot::Sender<Duration>) {
         let seq = self.next_ping_seq;
         self.next_ping_seq = self.next_ping_seq.wrapping_add(1);
-        let repr = Icmpv4Repr::EchoRequest {
-            ident: self.ping_ident,
-            seq_no: seq,
-            data: PING_PAYLOAD,
+        let Some(buf) = self.emit_echo_request(dst, seq) else {
+            // Family not yet wired (v6 lands in the next commit) ⇒ drop `resp`
+            // so `ping()` fails fast instead of hanging to the timeout.
+            return;
         };
-        let mut buf = vec![0u8; repr.buffer_len()];
-        repr.emit(
-            &mut Icmpv4Packet::new_unchecked(&mut buf),
-            &ChecksumCapabilities::default(),
-        );
         let sock = self.sockets.get_mut::<icmp::Socket>(self.icmp);
-        match sock.send_slice(&buf, IpAddress::Ipv4(dst)) {
+        match sock.send_slice(&buf, IpAddress::from(dst)) {
             // Record the send time; `service_icmp` fires `resp` with the RTT when
             // the matching reply arrives.
             Ok(()) => {
@@ -676,9 +671,36 @@ impl PollLoop {
         }
     }
 
+    /// Serialise an ICMP echo request (`seq`, our `ping_ident`, [`PING_PAYLOAD`])
+    /// for `dst`'s address family into a fresh buffer. `None` if the family is
+    /// not wired yet — v6 arrives with the dual-address iface in a follow-up.
+    fn emit_echo_request(&self, dst: IpAddr, seq: u16) -> Option<Vec<u8>> {
+        match dst {
+            IpAddr::V4(_) => {
+                let repr = Icmpv4Repr::EchoRequest {
+                    ident: self.ping_ident,
+                    seq_no: seq,
+                    data: PING_PAYLOAD,
+                };
+                let mut buf = vec![0u8; repr.buffer_len()];
+                repr.emit(
+                    &mut Icmpv4Packet::new_unchecked(&mut buf),
+                    &ChecksumCapabilities::default(),
+                );
+                Some(buf)
+            }
+            // ICMPv6 echo needs the iface's derived v6 source for its
+            // pseudo-header checksum; it lands with the dual-address iface.
+            IpAddr::V6(_) => {
+                debug!(%dst, "netstack: v6 ping not yet wired");
+                None
+            }
+        }
+    }
+
     /// Build the paired stack-side [`Conn`] + app-side [`NsTcpStream`] for a
     /// freshly established socket.
-    fn make_pair(&self, peer: SocketAddrV4) -> (Conn, NsTcpStream) {
+    fn make_pair(&self, peer: SocketAddr) -> (Conn, NsTcpStream) {
         let (to_app, from_stack) = mpsc::channel(CHAN_CAP);
         let (to_stack, from_app) = mpsc::channel(CHAN_CAP);
         let write_waker = Arc::new(AtomicWaker::new());
@@ -752,8 +774,8 @@ impl PollLoop {
                 .sockets
                 .get::<tcp::Socket>(h)
                 .remote_endpoint()
-                .and_then(sockaddr_v4_of)
-                .unwrap_or_else(|| SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, pl.port));
+                .and_then(sockaddr_of)
+                .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), pl.port));
             let (conn, stream) = self.make_pair(peer);
             self.conns.insert(h, conn);
             // Re-arm a fresh listener for the next connection before delivering.
@@ -892,7 +914,7 @@ impl PollLoop {
                 match sock.recv() {
                     Ok((data, meta)) => {
                         let datav = data.to_vec();
-                        if let Some(src) = sockaddr_v4_of(meta.endpoint) {
+                        if let Some(src) = sockaddr_of(meta.endpoint) {
                             permit.send((src, datav));
                             progressed = true;
                         }
@@ -919,7 +941,7 @@ impl PollLoop {
                 if !sock.can_send() {
                     break;
                 }
-                let meta = IpEndpoint::from((IpAddress::Ipv4(*dst.ip()), dst.port()));
+                let meta = IpEndpoint::from((IpAddress::from(dst.ip()), dst.port()));
                 match sock.send_slice(payload, meta) {
                     Ok(()) => {
                         conn.pending = None;
@@ -1050,15 +1072,14 @@ fn echo_reply_seq(data: &[u8], ident: u16) -> Option<u16> {
     }
 }
 
-/// smoltcp `IpEndpoint` → `SocketAddrV4` (IPv4 only; `None` for v6/unspecified).
-fn sockaddr_v4_of(ep: smoltcp::wire::IpEndpoint) -> Option<SocketAddrV4> {
+/// smoltcp `IpEndpoint` → `std::net::SocketAddr`, either family. smoltcp 0.12+
+/// carries `std::net` addresses directly, so this is a straight rewrap; the
+/// `Option` mirrors the callers' existing `and_then`/`if let` shape (an
+/// `IpEndpoint` addr is always a concrete v4/v6, so it is in practice `Some`).
+fn sockaddr_of(ep: smoltcp::wire::IpEndpoint) -> Option<SocketAddr> {
     match ep.addr {
-        // smoltcp 0.12+ uses `std::net::Ipv4Addr` directly, so no conversion.
-        IpAddress::Ipv4(v4) => Some(SocketAddrV4::new(v4, ep.port)),
-        // Unreachable while only `proto-ipv4` is enabled (single-variant enum),
-        // but keeps the match total if `proto-ipv6` is ever turned on.
-        #[allow(unreachable_patterns)]
-        _ => None,
+        IpAddress::Ipv4(v4) => Some(SocketAddr::from((v4, ep.port))),
+        IpAddress::Ipv6(v6) => Some(SocketAddr::from((v6, ep.port))),
     }
 }
 
@@ -1174,7 +1195,7 @@ mod tests {
     }
 
     /// Drive an app request/echo round-trip against a connected stack.
-    async fn round_trip(handle: &NetstackHandle, dst: SocketAddrV4, msg: &[u8]) {
+    async fn round_trip(handle: &NetstackHandle, dst: SocketAddr, msg: &[u8]) {
         let mut s = handle.connect(dst).await.expect("connect");
         s.write_all(msg).await.expect("write");
         s.flush().await.expect("flush");
@@ -1217,7 +1238,7 @@ mod tests {
             }
         });
 
-        let dst = SocketAddrV4::new(b_ip, 9000);
+        let dst = SocketAddr::from((b_ip, 9000));
         tokio::time::timeout(
             Duration::from_secs(10),
             round_trip(&a.handle, dst, b"hello-netstack"),
@@ -1274,7 +1295,7 @@ mod tests {
 
         // WG handshake + SYN retransmit can take a beat; connect() retries via
         // smoltcp until the session is up, bounded by CONNECT_TIMEOUT.
-        let dst = SocketAddrV4::new(b_ip, 3389);
+        let dst = SocketAddr::from((b_ip, 3389));
         tokio::time::timeout(
             Duration::from_secs(20),
             round_trip(&a.handle, dst, b"rdp-over-userspace-wireguard"),
@@ -1320,7 +1341,7 @@ mod tests {
 
         // A: send a datagram to B's port and read the echo back.
         let mut a_udp = a.handle.udp_bind().await.unwrap();
-        let dst = SocketAddrV4::new(b_ip, b_port);
+        let dst = SocketAddr::from((b_ip, b_port));
         let body = async {
             a_udp.send_to(b"udp-over-netstack", dst).await.unwrap();
             let (data, src) = a_udp.recv_from().await.unwrap();
@@ -1362,7 +1383,7 @@ mod tests {
         // task at all: `auto-icmp-echo-reply` replies inside its poll loop.
         let rtt = tokio::time::timeout(
             Duration::from_secs(5),
-            a.handle.ping(b_ip, Duration::from_secs(3)),
+            a.handle.ping(IpAddr::V4(b_ip), Duration::from_secs(3)),
         )
         .await
         .expect("ping completes in time")
