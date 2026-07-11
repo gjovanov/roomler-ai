@@ -147,11 +147,16 @@ fn binary_on_path(bin: &str) -> Option<std::path::PathBuf> {
     })
 }
 
-/// Pick a free `:N` by scanning the X11 socket dir (`:99..=:120`). Falls
-/// back to `:99` when the dir is unreadable (non-Linux / not yet created).
+/// Pick a free `:N` (`:99..=:120`) by requiring BOTH a missing X socket
+/// (`<x11_dir>/X<N>`) AND a missing lock (`/tmp/.X<N>-lock`). Xvfb refuses a
+/// display whose lock file exists even when the socket is gone — a crash-loop
+/// leaves stale `/tmp/.X<N>-lock` behind, which is exactly the WSL failure
+/// mode — so skip any display that still has one. Falls back to `:99`.
 fn pick_display(x11_dir: &str) -> String {
     for n in 99..=120 {
-        if !Path::new(x11_dir).join(format!("X{n}")).exists() {
+        let socket = Path::new(x11_dir).join(format!("X{n}"));
+        let lock = Path::new("/tmp").join(format!(".X{n}-lock"));
+        if !socket.exists() && !lock.exists() {
             return format!(":{n}");
         }
     }
