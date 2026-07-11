@@ -391,6 +391,7 @@ async fn handle_client_message(
                             session_id: None,
                             code: "permission_denied".to_string(),
                             message: reason,
+                            open_nonce: None,
                         },
                     );
                     return;

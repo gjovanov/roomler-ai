@@ -912,6 +912,7 @@ async fn handle_server_msg(
             session_id,
             code,
             message,
+            open_nonce: _,
         } => {
             warn!(?session_id, %code, %message, "server-side rc error");
         }
