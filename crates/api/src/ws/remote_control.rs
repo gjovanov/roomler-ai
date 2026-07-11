@@ -281,6 +281,7 @@ pub fn dispatch_controller_rc(
             session_id: error_session_id(&e),
             code: error_code(&e).to_string(),
             message: e.to_string(),
+            open_nonce: None,
         });
     }
     true

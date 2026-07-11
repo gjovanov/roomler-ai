@@ -322,6 +322,17 @@ pub enum ClientMsg {
         agent_id: ObjectId,
         /// One of `supported_transports` from the client's hello.
         transport: String,
+        /// Client-chosen correlation id, echoed verbatim on the matching
+        /// `TunnelOpened` (success) or open-failure `Error`. Lets ONE WS
+        /// carry N concurrent opens: the `roomlerd` daemon (P3b-2)
+        /// multiplexes many client sessions over its single agent WS and
+        /// demuxes the reply by this nonce (post-open it switches to the
+        /// server-minted `session_id`). The standalone `roomler-tunnel`
+        /// CLI has a single in-flight open and sends `None`, matching the
+        /// reply positionally. `None` is omitted on the wire, so a
+        /// pre-P3b-2 server/client stays byte-identical.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        open_nonce: Option<String>,
     },
 
     /// Client → server (forwarded to agent): open one TCP forward.
@@ -694,6 +705,14 @@ pub enum ServerMsg {
         session_id: Option<ObjectId>,
         code: String,
         message: String,
+        /// Set only when this error rejects a `TunnelOpen` — carries that
+        /// open's `open_nonce` so a multiplexing daemon can fail the exact
+        /// pending flow instead of guessing. `None` (omitted) for every
+        /// non-open error and whenever the originator sent no nonce. A
+        /// nonce-less `Error` arriving mid-open therefore reads as "open
+        /// rejected / server too old" and fails that flow fast.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        open_nonce: Option<String>,
     },
 
     /// Server-initiated close of an agent WS connection (rc.53).
@@ -748,6 +767,12 @@ pub enum ServerMsg {
         /// `session_id` + agent. Wired in Phase 1c/1d.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         quic_auth_token: Option<String>,
+        /// Correlation id echoed from the originating `TunnelOpen`, so a
+        /// daemon multiplexing N opens over one WS can match THIS
+        /// `TunnelOpened` to the pending open that caused it. `None`
+        /// (omitted) for the single-open CLI and for pre-P3b-2 servers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        open_nonce: Option<String>,
     },
 
     /// Server → agent: a tunnel-client wants to open this TCP
@@ -1218,6 +1243,7 @@ mod tests {
             session_id: None,
             code: "x".into(),
             message: "y".into(),
+            open_nonce: None,
         };
         let s = serde_json::to_string(&e).unwrap();
         // None → null, not omitted.
@@ -1369,6 +1395,7 @@ mod tests {
         let m = ClientMsg::TunnelOpen {
             agent_id,
             transport: "webrtc-dc-v1".into(),
+            open_nonce: None,
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(!s.contains("$oid"), "extended JSON leaked: {s}");
@@ -1568,6 +1595,7 @@ mod tests {
             sctp_rwnd_bytes: 8 * 1024 * 1024,
             ice_servers: vec![],
             quic_auth_token: None,
+            open_nonce: None,
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(r#""t":"rc:tunnel.opened""#));
@@ -1575,8 +1603,9 @@ mod tests {
         assert!(s.contains(r#""sctp_rwnd_bytes":8388608"#));
         // Back-compat: a None quic_auth_token must NOT appear on the
         // wire, so a webrtc-dc-v1 controller predating the field parses
-        // TunnelOpened unchanged.
+        // TunnelOpened unchanged. Same contract for the P3b-2 open_nonce.
         assert!(!s.contains("quic_auth_token"));
+        assert!(!s.contains("open_nonce"));
     }
 
     #[test]
@@ -1588,6 +1617,7 @@ mod tests {
             sctp_rwnd_bytes: 0,
             ice_servers: vec![],
             quic_auth_token: Some("tok-abc123".into()),
+            open_nonce: None,
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(r#""transport":"quic-v1""#));
@@ -1615,6 +1645,118 @@ mod tests {
             ServerMsg::TunnelOpened {
                 quic_auth_token, ..
             } => assert_eq!(quic_auth_token, None),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // ─── open_nonce correlation-id wire locks (P3b-2) ──────────────────
+    //
+    // The daemon multiplexes N tunnel-client opens over its single agent
+    // WS and demuxes each `TunnelOpened` / open-failure `Error` by the
+    // `open_nonce` it stamped on the `TunnelOpen`. These lock: (a) the
+    // nonce round-trips on all three carriers when set, (b) it is OMITTED
+    // (not null) when None so a pre-P3b-2 peer is byte-identical, and
+    // (c) a wire frame with no `open_nonce` deserialises to None (the
+    // single-open CLI + old-server safe-degrade path).
+
+    #[test]
+    fn tunnel_open_carries_open_nonce_when_set() {
+        let m = ClientMsg::TunnelOpen {
+            agent_id: ObjectId::new(),
+            transport: "webrtc-dc-v1".into(),
+            open_nonce: Some("nonce-7f3a".into()),
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(r#""open_nonce":"nonce-7f3a""#));
+        match serde_json::from_str::<ClientMsg>(&s).unwrap() {
+            ClientMsg::TunnelOpen { open_nonce, .. } => {
+                assert_eq!(open_nonce.as_deref(), Some("nonce-7f3a"));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn tunnel_open_omits_open_nonce_when_none() {
+        // A single-open CLI sends None → the field must not appear, so a
+        // pre-P3b-2 server (which has no such field) parses it unchanged.
+        let m = ClientMsg::TunnelOpen {
+            agent_id: ObjectId::new(),
+            transport: "webrtc-dc-v1".into(),
+            open_nonce: None,
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(
+            !s.contains("open_nonce"),
+            "None nonce leaked onto wire: {s}"
+        );
+    }
+
+    #[test]
+    fn tunnel_open_missing_open_nonce_defaults_to_none() {
+        // A pre-P3b-2 client omits the field → a P3b-2 server must
+        // deserialize None (serde default) and match the reply
+        // positionally.
+        let json = r#"{"t":"rc:tunnel.open","agent_id":"507f1f77bcf86cd799439012","transport":"webrtc-dc-v1"}"#;
+        match serde_json::from_str::<ClientMsg>(json).unwrap() {
+            ClientMsg::TunnelOpen { open_nonce, .. } => assert_eq!(open_nonce, None),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn tunnel_opened_carries_open_nonce_when_set() {
+        let m = ServerMsg::TunnelOpened {
+            session_id: ObjectId::new(),
+            transport: "webrtc-dc-v1".into(),
+            dc_pool_size: 8,
+            sctp_rwnd_bytes: 8 * 1024 * 1024,
+            ice_servers: vec![],
+            quic_auth_token: None,
+            open_nonce: Some("nonce-7f3a".into()),
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(r#""open_nonce":"nonce-7f3a""#));
+        match serde_json::from_str::<ServerMsg>(&s).unwrap() {
+            ServerMsg::TunnelOpened { open_nonce, .. } => {
+                assert_eq!(open_nonce.as_deref(), Some("nonce-7f3a"));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn error_carries_open_nonce_when_set() {
+        // The open-failure carrier: the server rejects a TunnelOpen and
+        // echoes the nonce so the daemon fails the exact pending flow.
+        let e = ServerMsg::Error {
+            session_id: None,
+            code: "cross_tenant".into(),
+            message: "agent belongs to a different tenant".into(),
+            open_nonce: Some("nonce-dead".into()),
+        };
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(s.contains(r#""open_nonce":"nonce-dead""#));
+        match serde_json::from_str::<ServerMsg>(&s).unwrap() {
+            ServerMsg::Error {
+                open_nonce, code, ..
+            } => {
+                assert_eq!(open_nonce.as_deref(), Some("nonce-dead"));
+                assert_eq!(code, "cross_tenant");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn error_missing_open_nonce_defaults_to_none() {
+        // A nonce-less Error mid-open (e.g. from a pre-P3b-2 server that
+        // routed the open to the Hub) MUST decode to None so the daemon
+        // reads it as "open rejected / server too old" and fails fast —
+        // never hangs the pending waiter.
+        let json = r#"{"t":"rc:error","session_id":null,"code":"boom","message":"x"}"#;
+        match serde_json::from_str::<ServerMsg>(json).unwrap() {
+            ServerMsg::Error { open_nonce, .. } => assert_eq!(open_nonce, None),
             _ => panic!("wrong variant"),
         }
     }

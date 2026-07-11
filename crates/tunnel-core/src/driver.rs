@@ -197,6 +197,11 @@ pub async fn run_tunnel_session(
     sink.send(ClientMsg::TunnelOpen {
         agent_id: params.agent_id,
         transport: request_transport.to_string(),
+        // Single in-flight open per driver invocation, so the reply is
+        // matched positionally and no nonce is needed. The daemon that
+        // multiplexes many opens over one agent WS stamps a real nonce
+        // (P3b-2 PR-C) and demuxes the reply by it.
+        open_nonce: None,
     })
     .await
     .context("send TunnelOpen")?;
@@ -216,6 +221,10 @@ pub async fn run_tunnel_session(
                     sctp_rwnd_bytes,
                     ice_servers,
                     quic_auth_token,
+                    // The daemon's shared-WS demux already consumed the
+                    // nonce to route this frame here; the single-session
+                    // driver doesn't need it.
+                    open_nonce: _,
                 } => {
                     info!(
                         %session_id, %transport, dc_pool_size, sctp_rwnd_bytes,
@@ -232,6 +241,7 @@ pub async fn run_tunnel_session(
                     session_id: _,
                     code,
                     message,
+                    open_nonce: _,
                 } => {
                     bail!("server error during tunnel.open: {code}: {message}");
                 }
