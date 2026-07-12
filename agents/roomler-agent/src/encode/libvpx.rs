@@ -253,9 +253,19 @@ impl Vp9Encoder {
         // kf_max_dist meant ~14 s between IDRs and visible "blur takes
         // >1s to clear" on window-uncover events. KEYFRAME_INTERVAL
         // is kept as a sanity floor in case target_fps is somehow zero.
-        let kf_max_dist = (target_fps.saturating_mul(3))
-            .max(60)
-            .min(KEYFRAME_INTERVAL);
+        // rc.171 — keyframe interval is now env-tunable (default keeps the
+        // historical ~3 s). A short periodic IDR re-sharpens screen-content
+        // text that per-frame deltas can't always afford to code crisply on a
+        // constrained link. The reliable SCTP DataChannel doesn't NEED periodic
+        // IDRs for loss recovery (on-demand `request_keyframe` covers first
+        // frame / late joiner / resync), so on a very slow relay — where each
+        // IDR is a costly burst — an operator can lengthen the interval via
+        // `ROOMLER_AGENT_VP9_KF_SECONDS` to trade text crispness for smoothness.
+        let kf_seconds = kf_seconds_from_env();
+        // Allow the knob to go up to a ~60 s backstop (the old 240-frame
+        // KEYFRAME_INTERVAL was an ~8 s cap tuned for the lossy RTP path).
+        let kf_cap = target_fps.saturating_mul(60).max(KEYFRAME_INTERVAL);
+        let kf_max_dist = target_fps.saturating_mul(kf_seconds).clamp(60, kf_cap);
         cfg.kf_max_dist = kf_max_dist;
         // Real-time-friendly buffer sizing: 1s buffer at target bitrate
         // with a 0.5s initial / optimal floor. Matches RustDesk's defaults.
@@ -710,6 +720,26 @@ pub(crate) fn cpu_used_from_env() -> c_int {
         .and_then(|v| v.trim().parse::<i32>().ok())
         .unwrap_or(DEFAULT_CPU_USED);
     raw.clamp(4, 9) as c_int
+}
+
+/// Seconds between periodic keyframes (IDRs) on the reliable-DC VP9 path.
+/// Default 3 s (unchanged from the historical value) — a periodic full-quality
+/// refresh keeps screen-content TEXT crisp: on a bitrate-constrained link the
+/// per-frame deltas can't always afford to sharply re-code text edges, and the
+/// IDR re-sharpens them (field: text editors looked soft with a longer
+/// interval). The DataChannel is reliable, so IDRs aren't needed for loss
+/// recovery — but they ARE a cheap quality lever, so we keep the short default
+/// and expose the interval as a knob. Trade-off: on a very slow relay each IDR
+/// is a costly burst (a brief pause), so `ROOMLER_AGENT_VP9_KF_SECONDS` lets an
+/// operator lengthen it (up to 60 s) to favour smoothness over text crispness.
+pub(crate) fn kf_seconds_from_env() -> u32 {
+    const DEFAULT_KF_SECONDS: u32 = 3;
+    std::env::var("ROOMLER_AGENT_VP9_KF_SECONDS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(DEFAULT_KF_SECONDS)
+        .clamp(1, 60)
 }
 
 /// Read the `ROOMLER_AGENT_VP9_RC_MODE` env var. Default `cbr` (pre-
