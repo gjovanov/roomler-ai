@@ -213,6 +213,11 @@ pub struct AgentPeer {
     pc: Arc<RTCPeerConnection>,
     session_id: bson::oid::ObjectId,
     media_pump: Option<JoinHandle<()>>,
+    /// System-audio → Opus pump. `Some` only when the session
+    /// negotiated `audio_enabled` AND the `audio` feature is compiled
+    /// in. Held so `close()` can abort it alongside the video pump.
+    #[cfg(feature = "audio")]
+    audio_pump: Option<JoinHandle<()>>,
     /// Reads RTCP from the video sender to handle PLI/FIR. Held so that
     /// `close()` can abort it — otherwise it outlives the AgentPeer and
     /// leaks under session churn until `video_sender.read_rtcp()` errors
@@ -244,6 +249,10 @@ impl AgentPeer {
         chosen_codec: String,
         negotiated_transport: Option<String>,
         chroma_pref: Option<String>,
+        // Opt-in system-audio track. Only acted on when the `audio`
+        // feature is compiled in; underscored-through otherwise so the
+        // default-feature build doesn't warn on the unused binding.
+        #[cfg_attr(not(feature = "audio"), allow(unused_variables))] audio_enabled: bool,
     ) -> Result<Self> {
         let mut engine = MediaEngine::default();
         engine
@@ -314,6 +323,31 @@ impl AgentPeer {
             .add_track(video_track.clone() as Arc<dyn TrackLocal + Send + Sync>)
             .await
             .context("add_track(video)")?;
+
+        // Opt-in system-audio: add a sendonly Opus track + spawn the
+        // audio pump. Gated on both the `audio` Cargo feature and the
+        // per-session `audio_enabled` directive. The Opus capability
+        // must match the MediaEngine's default Opus registration
+        // byte-for-byte (see `build_audio_codec_cap`) or SDP negotiation
+        // can't resolve PT 111. The track is added BEFORE the SDP answer
+        // is created so the m=audio section is advertised; when audio is
+        // off we add no track and the SDP carries video only (fully
+        // backward-compatible with controllers that never request audio).
+        #[cfg(feature = "audio")]
+        let audio_pump_handle: Option<JoinHandle<()>> = if audio_enabled {
+            let audio_track = Arc::new(TrackLocalStaticSample::new(
+                build_audio_codec_cap(),
+                "audio".to_owned(),
+                "roomler-agent".to_owned(),
+            ));
+            pc.add_track(audio_track.clone() as Arc<dyn TrackLocal + Send + Sync>)
+                .await
+                .context("add_track(audio)")?;
+            info!(%session_id, "audio: Opus track added — spawning audio pump");
+            Some(tokio::spawn(audio_pump(session_id, audio_track)))
+        } else {
+            None
+        };
 
         // Pin the SDP answer's m=video codec list to the chosen codec.
         // Without this, webrtc-rs offers H.264 + H.265 + AV1 + VP8 + VP9
@@ -786,6 +820,8 @@ impl AgentPeer {
             pc,
             session_id,
             media_pump: Some(pump),
+            #[cfg(feature = "audio")]
+            audio_pump: audio_pump_handle,
             rtcp_reader: Some(rtcp_reader),
         })
     }
@@ -843,6 +879,10 @@ impl AgentPeer {
 
     pub async fn close(&self) {
         if let Some(pump) = &self.media_pump {
+            pump.abort();
+        }
+        #[cfg(feature = "audio")]
+        if let Some(pump) = &self.audio_pump {
             pump.abort();
         }
         if let Some(reader) = &self.rtcp_reader {
@@ -4459,6 +4499,127 @@ fn build_video_codec_cap(codec: &str) -> RTCRtpCodecCapability {
                 .to_string(),
             rtcp_feedback: feedback,
         },
+    }
+}
+
+/// Opus capability for the system-audio track. MUST match webrtc-rs's
+/// default MediaEngine Opus registration byte-for-byte — mime
+/// `audio/opus`, clock_rate 48000, channels 2, fmtp
+/// `minptime=10;useinbandfec=1`, empty rtcp_feedback (PT 111). A
+/// mismatch on any field makes the transceiver fail to resolve a
+/// payload type and the browser gets an m=audio section it can't bind.
+/// (Verified against `crates/vendored/webrtc/.../media_engine/mod.rs`.)
+#[cfg(feature = "audio")]
+fn build_audio_codec_cap() -> RTCRtpCodecCapability {
+    RTCRtpCodecCapability {
+        mime_type: "audio/opus".to_string(),
+        clock_rate: 48000,
+        channels: 2,
+        sdp_fmtp_line: "minptime=10;useinbandfec=1".to_string(),
+        rtcp_feedback: vec![],
+    }
+}
+
+/// Per-session system-audio pump. Captures desktop/system audio,
+/// encodes to Opus (48 kHz stereo, 20 ms frames), and writes each
+/// packet into the WebRTC Opus track. Self-regulating: with no capture
+/// backend (macOS, or a device-open failure) `open_default` returns a
+/// Noop that parks forever, so this task idles producing no samples —
+/// the m=audio section is still negotiated but stays silent.
+///
+/// Each 20 ms Opus packet is written with a fixed `duration` of 20 ms so
+/// the track's RTP timestamps advance at the real audio clock (unlike
+/// the video pump, audio frames are inherently fixed-cadence).
+///
+/// Aborted by `AgentPeer::close()`.
+#[cfg(feature = "audio")]
+async fn audio_pump(session_id: bson::oid::ObjectId, audio_track: Arc<TrackLocalStaticSample>) {
+    use crate::audio;
+
+    let mut capture = audio::open_default();
+    let mut encoder = match audio::opus_encode::OpusEncoder::new() {
+        Ok(e) => e,
+        Err(e) => {
+            warn!(%session_id, %e, "audio: failed to init Opus encoder — audio pump exiting");
+            return;
+        }
+    };
+
+    // 20 ms per Opus frame (960 samples/ch @ 48 kHz). Fixed cadence —
+    // the browser's jitter buffer relies on this.
+    const FRAME_DURATION: Duration = Duration::from_millis(20);
+
+    let mut frames_captured: u64 = 0;
+    let mut packets_sent: u64 = 0;
+    let mut write_errors: u64 = 0;
+    let mut bytes_sent: u64 = 0;
+    let mut last_heartbeat = std::time::Instant::now();
+    const HEARTBEAT: Duration = Duration::from_secs(5);
+
+    info!(%session_id, "audio pump started");
+
+    loop {
+        let frame = match capture.next_frame().await {
+            Ok(Some(f)) => f,
+            Ok(None) => {
+                // Capture exhausted (stream torn down). Nothing more to
+                // do — exit cleanly.
+                info!(
+                    %session_id,
+                    frames_captured, packets_sent,
+                    "audio: capture exhausted — audio pump exiting"
+                );
+                return;
+            }
+            Err(e) => {
+                warn!(%session_id, %e, "audio: capture error — audio pump exiting");
+                return;
+            }
+        };
+        frames_captured += 1;
+
+        let packets = match encoder.push(&frame.samples, frame.channels, frame.sample_rate) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(%session_id, %e, "audio: opus encode error — audio pump exiting");
+                return;
+            }
+        };
+
+        for packet in packets {
+            let len = packet.len() as u64;
+            let sample = Sample {
+                data: Bytes::from(packet),
+                timestamp: SystemTime::now(),
+                duration: FRAME_DURATION,
+                packet_timestamp: 0,
+                prev_dropped_packets: 0,
+                prev_padding_packets: 0,
+            };
+            if let Err(e) = audio_track.write_sample(&sample).await {
+                write_errors += 1;
+                // Sample once per ~5s heartbeat window rather than per
+                // failure; a dead track fails every frame and would flood.
+                if write_errors == 1 {
+                    warn!(%session_id, %e, "audio: write_sample failed (first)");
+                }
+            } else {
+                packets_sent += 1;
+                bytes_sent += len;
+            }
+        }
+
+        if last_heartbeat.elapsed() >= HEARTBEAT {
+            info!(
+                %session_id,
+                frames_captured,
+                packets_sent,
+                bytes_sent,
+                write_errors,
+                "audio pump heartbeat"
+            );
+            last_heartbeat = std::time::Instant::now();
+        }
     }
 }
 
