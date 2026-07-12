@@ -244,6 +244,13 @@ pub enum ClientMsg {
         /// matching server-side [`ServerMsg::SessionRequest`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
         chroma_pref: Option<String>,
+        /// Opt-in system/desktop audio. When `true` the controller wants
+        /// the agent to add a WebRTC Opus audio track (the agent must
+        /// also advertise `"opus"` in `AgentCaps.audio` and be built with
+        /// the `audio` feature). `#[serde(default)]` → older controllers
+        /// that omit the field get no audio track (silent-by-default).
+        #[serde(default)]
+        audio_enabled: bool,
         /// Phase 5 — admin break-glass. When an `ADMINISTRATOR` force-starts a
         /// session against a device they don't own, this carries the mandatory
         /// reason. The API gate VALIDATES it (admin + non-owner); a non-admin
@@ -641,6 +648,13 @@ pub enum ServerMsg {
         /// `ROOMLER_AGENT_VP9_CHROMA` env-var default".
         #[serde(default, skip_serializing_if = "Option::is_none")]
         chroma_pref: Option<String>,
+        /// Opt-in system/desktop audio, forwarded verbatim from the
+        /// controller's [`ClientMsg::SessionRequest::audio_enabled`]. When
+        /// `true` the agent adds a WebRTC Opus audio track (if built with
+        /// the `audio` feature). `#[serde(default)]` → older servers /
+        /// controllers that omit it get no audio track.
+        #[serde(default)]
+        audio_enabled: bool,
         /// Phase 2 — server-authoritative consent directive. `None` (an older
         /// server that predates consent modes) → the agent falls back to its
         /// local `auto_grant_session` config; `Some(mode)` → the agent OBEYS:
@@ -1152,6 +1166,7 @@ mod tests {
             browser_caps: vec!["h264".into(), "h265".into()],
             preferred_transport: None,
             chroma_pref: None,
+            audio_enabled: false,
             override_reason: None,
         };
         let s = serde_json::to_string(&req).unwrap();
@@ -1172,6 +1187,7 @@ mod tests {
             browser_caps: vec![],
             preferred_transport: Some("data-channel-vp9-444".into()),
             chroma_pref: None,
+            audio_enabled: true,
             override_reason: None,
         };
         let s = serde_json::to_string(&req_with_t).unwrap();
