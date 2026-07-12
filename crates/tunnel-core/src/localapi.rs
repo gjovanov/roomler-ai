@@ -81,6 +81,13 @@ pub struct PeerInfo {
     pub rtt_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen_ms: Option<u64>,
+    /// The `agents._id` (hex) backing this peer, when it's an agent node
+    /// (P3b-3). Carried from the netmap so the daemon can join this peer to a
+    /// daemon-originated tunnel flow (keyed by agent id) and label it
+    /// `ConnectionType::Tunnel`. `None` for a tunnel-client node / pre-P3b-3
+    /// runtime. Not a display column — a join key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
 }
 
 /// Whether a forward is a static `--remote` forward or a SOCKS5 listener.
@@ -954,6 +961,7 @@ mod tests {
                     connection: ConnectionType::Tunnel,
                     rtt_ms: Some(52),
                     last_seen_ms: Some(1000),
+                    agent_id: Some("6a074fe5ef3ba556ab041966".into()),
                 },
                 PeerInfo {
                     node_id: "n3".into(),
@@ -964,6 +972,7 @@ mod tests {
                     connection: ConnectionType::Direct,
                     rtt_ms: Some(3),
                     last_seen_ms: Some(1200),
+                    agent_id: None,
                 },
             ]
         }
