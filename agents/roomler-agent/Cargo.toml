@@ -434,15 +434,16 @@ controlled host, maintains an outbound WebSocket connection to the \
 Roomler API for signalling, and serves a WebRTC peer directly to the \
 browser controller (video + input over P2P — the server never sees \
 raw pixels or keystrokes)."""
-# The agent binary is built on the 24.04 CI runner, so it links glibc 2.39 and
-# libvpx.so.9 — the .deb therefore targets Ubuntu 24.04+. `libc6 (>= 2.39)`
-# makes apt REFUSE the install on older releases (22.04 ships glibc 2.35) with a
-# clear dependency error, instead of installing cleanly and then crashing at
-# load. `libvpx9` is the real link (the old `libvpx9 | libvpx7` alt was a lie —
-# libvpx.so.7 can't satisfy a .so.9 link). `libasound2` backs the Opus
-# system-audio capture track. FFmpeg 8.1.2's libav* libs are bundled by the CI
-# "Bundle FFmpeg" step (usr/lib/roomler-agent, $ORIGIN RPATH).
-depends = "libc6 (>= 2.39), libvpx9, libxcb1, libxcb-shm0, libxcb-randr0, libasound2"
+# The agent binary is built on ubuntu-22.04 (glibc 2.34) and links libvpx.so.7.
+# The CI "Bundle FFmpeg" step ships FFmpeg 8.1.2's libav* AND libvpx.so.7 inside
+# usr/lib/roomler-agent (binary RPATH + $ORIGIN), so the .deb is self-contained
+# and runs on BOTH Ubuntu 22.04 (native libvpx.so.7) and 24.04 (which ships only
+# libvpx.so.9 — the bundled .so.7 is exactly what makes 24.04 work). Hence NO
+# libvpx dep and no raised glibc floor: `libvpx9` was a lie (the binary needs
+# .so.7, not .so.9) and `libc6 (>= 2.39)` wrongly blocked 22.04 (binary is glibc
+# 2.34). `libasound2` backs the Opus system-audio capture track; libxcb* are the
+# always-present X11 client libs.
+depends = "libc6, libxcb1, libxcb-shm0, libxcb-randr0, libasound2"
 section = "net"
 priority = "optional"
 assets = [
