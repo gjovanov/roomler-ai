@@ -48,6 +48,13 @@ export interface AgentCapabilities {
    *  string (`vp09.01.10.08` vs `vp09.00.10.08`); mismatch leaves
    *  the canvas blank. */
   vp9_chroma?: string
+  /** Audio codecs the agent can stream on the opt-in WebRTC audio
+   *  track (system / desktop audio). Known value: `'opus'`. Empty /
+   *  unset on older agents or agents built without the `audio` Cargo
+   *  feature — the browser hides/disables the "receive audio" toggle
+   *  when this doesn't contain `'opus'`. Mirrors `AgentCaps.audio` in
+   *  `crates/remote_control/src/models.rs`. */
+  audio?: string[]
 }
 
 export interface Agent {
