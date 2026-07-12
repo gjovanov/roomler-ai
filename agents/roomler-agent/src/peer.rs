@@ -27,6 +27,11 @@ use webrtc::api::APIBuilder;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit};
+// Only the VP9-444 DC pump consumes the per-session transport detection today
+// (the FFmpeg pump joins in Phase B); keep the import off the signalling-only
+// / FFmpeg-only builds so `clippy -D warnings` stays clean.
+#[cfg(feature = "vp9-444")]
+use webrtc::ice_transport::ice_candidate_type::RTCIceCandidateType;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::media::Sample;
 use webrtc::peer_connection::RTCPeerConnection;
@@ -814,6 +819,7 @@ impl AgentPeer {
             // `rc:video-info` (real encoder/codec/chroma) to the browser
             // for an honest stats badge.
             control_dc.clone(),
+            pc.clone(),
         ));
 
         Ok(Self {
@@ -894,6 +900,62 @@ impl AgentPeer {
     }
 }
 
+/// Detect whether THIS session's negotiated ICE path runs through a TURN
+/// relay, by inspecting the selected candidate pair. A relayed path (TURN,
+/// especially over TCP on WSL / corp-UDP-blocked nets) is bandwidth- and
+/// head-of-line-constrained, so the DC pumps clamp their bitrate ceiling to
+/// `relay_max_bps()` for it. Unlike the process-wide
+/// `ROOMLER_AGENT_ICE_RELAY_TCP` env flag, this is PER SESSION — the same
+/// agent process serves both direct-local and cross-host-relay controllers
+/// (e.g. the WSL virtual-desktop agent advertises a direct mirrored-network
+/// path to a LAN browser AND a TURN-relayed path to a remote one), so the
+/// env flag mis-classifies one of them.
+///
+/// The explicit env flag still wins as an OVERRIDE: vd-mode / the corp path
+/// force `ice_transport_policy=Relay` up front, so the path IS relayed and
+/// there's nothing to detect. Otherwise poll the selected pair briefly (ICE
+/// may not have nominated the instant the pump starts) and fall back to
+/// "unconstrained" if it hasn't nominated within ~3 s — the AIMD converges
+/// regardless of the initial guess.
+///
+/// Gated on `vp9-444` for now (the only caller); the FFmpeg DC pump starts
+/// calling it in Phase B, at which point this widens to `any(...)`.
+#[cfg(feature = "vp9-444")]
+async fn detect_constrained_transport(
+    pc: &Arc<RTCPeerConnection>,
+    session_id: bson::oid::ObjectId,
+) -> bool {
+    if crate::encode::transport_is_constrained() {
+        return true;
+    }
+    // Bind each Arc so the borrowed `&RTCIceTransport` outlives the chain.
+    let sctp = pc.sctp();
+    let dtls = sctp.transport();
+    let ice = dtls.ice_transport();
+    for _ in 0..30 {
+        if let Some(pair) = ice.get_selected_candidate_pair().await {
+            let relay = pair.local().typ == RTCIceCandidateType::Relay
+                || pair.remote().typ == RTCIceCandidateType::Relay;
+            info!(
+                %session_id,
+                relay,
+                local_typ = ?pair.local().typ,
+                local_proto = ?pair.local().protocol,
+                remote_typ = ?pair.remote().typ,
+                remote_proto = ?pair.remote().protocol,
+                "per-session ICE path detected (adaptive bitrate)"
+            );
+            return relay;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    warn!(
+        %session_id,
+        "ICE candidate pair not nominated within 3s — treating as direct (unconstrained)"
+    );
+    false
+}
+
 /// Per-session media pump. Captures frames, encodes to the negotiated
 /// codec, writes Samples into the WebRTC track. Rebuilds the encoder
 /// if the capture resolution changes mid-session (e.g. dock/undock).
@@ -923,7 +985,16 @@ async fn media_pump(
     video_bytes_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
     lock_state_rx: tokio::sync::watch::Receiver<lock_state::LockState>,
     control_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
+    // Adaptive bitrate — the peer connection, so the DC pumps can detect
+    // THIS session's actual ICE path (relay vs direct) at runtime instead
+    // of the process-wide `ROOMLER_AGENT_ICE_RELAY_TCP` env flag.
+    pc: Arc<RTCPeerConnection>,
 ) {
+    // `pc` is consumed only by the VP9-444 DC pump's per-session transport
+    // detection (feature-gated); keep the signalling-only / non-vp9 build
+    // warning-clean.
+    #[cfg(not(feature = "vp9-444"))]
+    let _ = &pc;
     // Tracks the lock-state value seen on the previous loop iteration
     // so we can request an encoder keyframe on each transition. The
     // browser decoder otherwise has to wait for the next periodic
@@ -1042,6 +1113,7 @@ async fn media_pump(
                 lock_state_rx,
                 quality_state,
                 chroma_pref,
+                pc,
             )
             .await;
         }
@@ -1701,6 +1773,7 @@ pub(crate) fn frame_video_bytes(payload: &[u8], is_keyframe: bool, timestamp_us:
 ///   opt-in escape hatch — full warmup-probe / control-DC plumbing
 ///   deferred to a follow-up).
 #[cfg(feature = "vp9-444")]
+#[allow(clippy::too_many_arguments)]
 async fn media_pump_vp9_444_dc(
     session_id: bson::oid::ObjectId,
     video_bytes_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
@@ -1709,6 +1782,7 @@ async fn media_pump_vp9_444_dc(
     lock_state_rx: tokio::sync::watch::Receiver<lock_state::LockState>,
     quality_state: Arc<std::sync::atomic::AtomicU8>,
     chroma_pref: Option<String>,
+    pc: Arc<RTCPeerConnection>,
 ) {
     // See `media_pump`: tracks lock-state transitions so we can
     // request a keyframe on the lock/unlock boundary.
@@ -1766,7 +1840,10 @@ async fn media_pump_vp9_444_dc(
     // 2560×1600) collapses it. Clamp the encoder to relay_max_bps (3 Mbps
     // default) and, per Change D, trip AIMD at a shallower 256 KiB buffered
     // watermark so we shed BEFORE the relay's tiny pipe backs up seconds deep.
-    let constrained_transport = crate::encode::transport_is_constrained();
+    // Adaptive bitrate (A1) — detect THIS session's actual ICE path rather
+    // than reading the process-wide env flag. The env flag still wins as an
+    // explicit override (see `detect_constrained_transport`).
+    let constrained_transport = detect_constrained_transport(&pc, session_id).await;
     let bitrate_cap: u32 = if constrained_transport {
         crate::encode::relay_max_bps()
     } else {
@@ -1870,23 +1947,24 @@ async fn media_pump_vp9_444_dc(
     // unconditionally applies the current preference even when the
     // controller hasn't yet pushed `rc:quality`.
     let mut last_applied_quality: u8 = 0xFF;
+    // Mirror of the AIMD controller's applied bitrate, for the heartbeat log.
     let mut last_applied_bitrate: u32 = 0;
-    // AIMD state for DC backpressure (no REMB on the DC transport).
-    // High watermark: bufferedAmount above this triggers multiplicative
-    // decrease + drops the frame. Low watermark + 5 s settle window
-    // triggers additive increase.
+    // AIMD backpressure controller (rc.171) — substitutes the missing REMB
+    // path on the DC transport. It's driven off the SEND-CHANNEL OCCUPANCY at
+    // the capacity gate (the real webrtc-rs backpressure signal), NOT
+    // `dc.buffered_amount()` — the send task's `dc.send().await` blocks under
+    // SCTP flow control, so buffered_amount stays low even while the link is
+    // saturated, and the pre-rc.171 AIMD (which ran AFTER the gate's
+    // `continue`) never fired under sustained congestion → the bitrate stayed
+    // pinned at 12.4 Mbps and the pump collapsed to ~2 fps. Constructed lazily
+    // once the first encoder gives us dims → a quality/relay ceiling. See
+    // `encode::aimd` for the full signal model + the ×0.8/×1.1 factors that
+    // used to live here inline.
+    let mut aimd: Option<encode::aimd::AimdController> = None;
+    // High watermark for the SECONDARY buffer-overflow decrease trigger
+    // (`dc_buffered_high` above resolves it to 256 KiB on a constrained relay,
+    // this 1 MiB const otherwise).
     const DC_BUFFERED_HIGH_BYTES: u64 = 1_048_576; // 1 MiB
-    const DC_BUFFERED_LOW_BYTES: u64 = 65_536; // 64 KiB
-    const AIMD_INCREASE_INTERVAL: Duration = Duration::from_secs(5);
-    const AIMD_DECREASE_NUM: u32 = 80; // ×0.80 on overflow
-    const AIMD_DECREASE_DEN: u32 = 100;
-    const AIMD_INCREASE_NUM: u32 = 110; // ×1.10 on settle
-    const AIMD_INCREASE_DEN: u32 = 100;
-    let mut last_aimd_event_at = std::time::Instant::now();
-    let mut last_low_water_at: Option<std::time::Instant> = None;
-    // Hysteresis on quality-driven set_bitrate so we don't thrash
-    // libvpx's config across single-bps wobble.
-    const HYSTERESIS_PCT: u32 = 15;
 
     // rc.166 freeze fix — dedicated DC send task, ported from the FFmpeg pump
     // (rc.106). The chunked `dc.send().await` is SCTP-flow-controlled; on a
@@ -1961,6 +2039,22 @@ async fn media_pump_vp9_444_dc(
         }
         if send_tx.capacity() == 0 {
             frames_skipped_backpressure += 1;
+            // Adaptive bitrate (rc.171) — a FULL send channel is the real DC
+            // backpressure signal. Drive the multiplicative decrease HERE,
+            // before the `continue`, so it runs DURING sustained congestion
+            // (pre-rc.171 the loop bailed at this gate and the AIMD below
+            // never ran → bitrate pinned at 12.4 Mbps, the ~2 fps starvation
+            // bug). Apply to the existing encoder immediately so the next
+            // frame that DOES get through is already smaller.
+            if let Some(ctrl) = aimd.as_mut() {
+                ctrl.observe(send_depth as u32, true, std::time::Instant::now());
+                if let Some(bps) = ctrl.take_pending() {
+                    if let Some(enc) = encoder.as_mut() {
+                        enc.set_bitrate(bps);
+                    }
+                    last_applied_bitrate = bps;
+                }
+            }
             tokio::time::sleep(Duration::from_millis(2)).await;
             continue;
         }
@@ -2084,36 +2178,46 @@ async fn media_pump_vp9_444_dc(
             enc.request_keyframe();
         }
 
-        // rc.33 — apply resolution + quality-derived bitrate target.
-        // Pre-rc.33 the encoder ran at its 8 Mbps boot default; this
-        // block lifts 4K Quality=High to ~25-30 Mbps and is the single
-        // largest motion-smoothness lever. Cheap on every frame: two
-        // atomic loads + integer math + a single comparison.
+        // rc.33/rc.171 — resolution + quality-derived bitrate CEILING, fed to
+        // the AIMD controller. The controller (not this block) owns the actual
+        // applied bitrate: it starts at the ceiling and tracks the link down
+        // under congestion / back up on recovery. The ceiling still lifts 4K
+        // Quality=High to ~25-30 Mbps (the largest motion-smoothness lever)
+        // and clamps to the relay cap on a constrained transport.
         let q_now = quality_state.load(std::sync::atomic::Ordering::Relaxed);
         if let Some((ew, eh)) = encoder_dims {
             let base = encode::initial_bitrate_for_fps(ew, eh, target_fps);
-            // rc.166 freeze fix — clamp to the relay ceiling on a constrained
-            // transport (u32::MAX = no-op otherwise).
-            let target = quality::target_bitrate(q_now, base).min(bitrate_cap);
-            let quality_changed = q_now != last_applied_quality;
-            let drift_too_big = if last_applied_bitrate == 0 {
-                true
-            } else {
-                let band = (last_applied_bitrate / 100).saturating_mul(HYSTERESIS_PCT);
-                target.abs_diff(last_applied_bitrate) > band
-            };
-            if quality_changed || drift_too_big {
+            let ceiling = quality::target_bitrate(q_now, base).min(bitrate_cap);
+            let now = std::time::Instant::now();
+            let ctrl = aimd.get_or_insert_with(|| {
+                encode::aimd::AimdController::new(
+                    ceiling,
+                    encode::MIN_BITRATE_BPS,
+                    ceiling,
+                    send_depth as u32,
+                    now,
+                )
+            });
+            ctrl.set_ceiling(ceiling);
+            // Non-full occupancy sample so the additive-increase can recover
+            // once the link has drained (the FULL samples come from the gate).
+            let cap = send_tx.capacity();
+            ctrl.observe(send_depth.saturating_sub(cap) as u32, cap == 0, now);
+            if let Some(target) = ctrl.take_pending() {
                 enc.set_bitrate(target);
-                info!(
-                    %session_id,
-                    quality = quality::label(q_now),
-                    base_bps = base,
-                    target_bps = target,
-                    "VP9-444 set_bitrate (quality/resolution-derived)"
-                );
-                last_applied_quality = q_now;
+                if q_now != last_applied_quality || target != last_applied_bitrate {
+                    info!(
+                        %session_id,
+                        quality = quality::label(q_now),
+                        base_bps = base,
+                        ceiling_bps = ceiling,
+                        target_bps = target,
+                        "VP9-444 set_bitrate (AIMD)"
+                    );
+                }
                 last_applied_bitrate = target;
             }
+            last_applied_quality = q_now;
         }
 
         let packets = match enc.encode(frame).await {
@@ -2254,89 +2358,34 @@ async fn media_pump_vp9_444_dc(
             continue;
         }
 
-        // rc.33 — AIMD backpressure. Substitutes the missing REMB
-        // path on the DC transport. Probe the buffered amount once
-        // per frame and adjust the encoder bitrate accordingly.
-        //
-        // The webrtc-rs API name is `buffered_amount()` returning a
-        // `usize`. On overflow (> 1 MiB) we multiplicatively decrease
-        // the target by 20% and SKIP the frame entirely — that keeps
-        // us from layering more bytes on top of an already-backed-up
-        // SCTP queue, which would compound into seconds of latency.
-        // Under-watermark (< 64 KiB) for 5 s lets the encoder climb
-        // back up by 10% — additive increase. Capped at the
-        // quality-derived ceiling so we never exceed what the
-        // operator's Quality=Low/Auto/High preference allows.
+        // Secondary congestion signal (rc.171) — the PRIMARY AIMD driver is
+        // send-channel occupancy (see the capacity gate + the ceiling/observe
+        // block above). But if the SCTP buffer DOES spike over the high
+        // watermark, note it to the controller (a rate-limited decrease) and
+        // shed this frame so we don't pile more bytes on an already-backed-up
+        // queue. On webrtc-rs this rarely fires (dc.send().await blocks first,
+        // keeping buffered_amount low), but it's a cheap belt-and-suspenders
+        // check that also preserves the shed-on-overflow behaviour.
         let buffered = dc.buffered_amount().await as u64;
-        let now = std::time::Instant::now();
-        // rc.166 freeze fix (Change D) — `dc_buffered_high` is 256 KiB on a
-        // constrained relay, the 1 MiB const otherwise.
         if buffered > dc_buffered_high {
-            // Multiplicative decrease, applied once per AIMD interval
-            // to avoid free-falling the bitrate on a transient blip.
-            if now.duration_since(last_aimd_event_at) >= Duration::from_millis(500)
-                && last_applied_bitrate > 0
-            {
-                let new_target = (last_applied_bitrate / AIMD_DECREASE_DEN)
-                    .saturating_mul(AIMD_DECREASE_NUM)
-                    .max(encode::MIN_BITRATE_BPS);
-                if new_target < last_applied_bitrate {
-                    enc.set_bitrate(new_target);
+            if let Some(ctrl) = aimd.as_mut() {
+                ctrl.note_buffer_overflow(std::time::Instant::now());
+                if let Some(bps) = ctrl.take_pending() {
+                    enc.set_bitrate(bps);
                     info!(
                         %session_id,
                         buffered,
-                        old_target = last_applied_bitrate,
-                        new_target,
+                        new_target = bps,
                         "VP9-444 AIMD decrease (DC buffer over high watermark)"
                     );
-                    last_applied_bitrate = new_target;
-                    last_aimd_event_at = now;
+                    last_applied_bitrate = bps;
                 }
             }
-            // Skip this frame entirely + ask the controller for a
-            // keyframe on resume so the decoder doesn't choke on a
-            // delta-after-gap. Counted in the heartbeat.
+            // Skip this frame entirely + ask the controller for a keyframe on
+            // resume so the decoder doesn't choke on a delta-after-gap.
             frames_skipped_backpressure += packets.len() as u64;
             keyframe_requested.store(true, std::sync::atomic::Ordering::Relaxed);
-            last_low_water_at = None;
             continue;
-        } else if buffered < DC_BUFFERED_LOW_BYTES {
-            // Additive increase, but only after the buffer has been
-            // continuously under the low watermark for AIMD_INCREASE_INTERVAL.
-            // Avoids ratcheting up on a single low sample between bursts.
-            let settled_since = *last_low_water_at.get_or_insert(now);
-            if now.duration_since(settled_since) >= AIMD_INCREASE_INTERVAL
-                && now.duration_since(last_aimd_event_at) >= AIMD_INCREASE_INTERVAL
-                && last_applied_bitrate > 0
-            {
-                if let Some((ew, eh)) = encoder_dims {
-                    let base = encode::initial_bitrate_for_fps(ew, eh, target_fps);
-                    // rc.166 freeze fix — clamp the AIMD-increase ceiling too;
-                    // without this the additive-increase ratchets the encoder
-                    // back up past the relay clamp between congestion events.
-                    let quality_ceiling = quality::target_bitrate(q_now, base).min(bitrate_cap);
-                    let new_target = (last_applied_bitrate / AIMD_INCREASE_DEN)
-                        .saturating_mul(AIMD_INCREASE_NUM)
-                        .min(quality_ceiling);
-                    if new_target > last_applied_bitrate {
-                        enc.set_bitrate(new_target);
-                        info!(
-                            %session_id,
-                            buffered,
-                            old_target = last_applied_bitrate,
-                            new_target,
-                            ceiling = quality_ceiling,
-                            "VP9-444 AIMD increase (DC buffer settled under low watermark)"
-                        );
-                        last_applied_bitrate = new_target;
-                    }
-                    last_aimd_event_at = now;
-                    last_low_water_at = Some(now);
-                }
-            }
-        } else {
-            // Between watermarks — reset the low-water settle timer.
-            last_low_water_at = None;
         }
 
         // rc.166 freeze fix — hand each framed packet to the dedicated send
