@@ -492,6 +492,13 @@ async fn connect_once(
     // `rc:session.request.chroma_pref`. `None` → fall back to the
     // agent's `ROOMLER_AGENT_VP9_CHROMA` env-var default.
     let mut pending_chroma: HashMap<bson::oid::ObjectId, Option<String>> = HashMap::new();
+    // Same lifecycle as `pending_transports`/`pending_chroma` but for the
+    // opt-in system-audio flag forwarded from the controller's
+    // `rc:session.request.audio_enabled`. `false`/missing → no audio
+    // track. Inserted when `rc:request` arrives, consumed at
+    // `rc:sdp.offer` time where the AgentPeer + (optional) audio pump
+    // are built.
+    let mut pending_audio: HashMap<bson::oid::ObjectId, bool> = HashMap::new();
     // T2.10d: one `AgentTunnelPeer` per active `roomler-tunnel`
     // session. Distinct map from `peers` (remote-control sessions)
     // because the namespaces don't overlap and the lifecycles
@@ -610,6 +617,7 @@ async fn connect_once(
                                 &mut pending_codecs,
                                 &mut pending_transports,
                                 &mut pending_chroma,
+                                &mut pending_audio,
                                 &mut tunnel_peers,
                                 &mut tunnel_quic_peers,
                                 &outbound_tx,
@@ -656,6 +664,7 @@ async fn handle_server_msg(
     pending_codecs: &mut HashMap<bson::oid::ObjectId, String>,
     pending_transports: &mut HashMap<bson::oid::ObjectId, Option<String>>,
     pending_chroma: &mut HashMap<bson::oid::ObjectId, Option<String>>,
+    pending_audio: &mut HashMap<bson::oid::ObjectId, bool>,
     tunnel_peers: &mut HashMap<bson::oid::ObjectId, Arc<crate::tunnel::peer::AgentTunnelPeer>>,
     tunnel_quic_peers: &mut HashMap<
         bson::oid::ObjectId,
@@ -677,6 +686,7 @@ async fn handle_server_msg(
             browser_caps,
             preferred_transport,
             chroma_pref,
+            audio_enabled,
             consent_mode,
         } => {
             // Pick the best codec for this session from the
@@ -713,6 +723,15 @@ async fn handle_server_msg(
             // when negotiated_transport == data-channel-vp9-444;
             // ignored otherwise.
             pending_chroma.insert(session_id, chroma_pref.clone());
+            // Opt-in system audio. Only honour the controller's request
+            // when the agent actually advertises an audio codec
+            // (`AgentCaps.audio` non-empty ⇒ the `audio` feature is
+            // compiled in and cpal/opus are available). Otherwise store
+            // `false` so the SdpOffer handler never tries to add a track
+            // this build can't feed — matches the transport intersection
+            // above.
+            let audio_negotiated = audio_enabled && !our_caps.audio.is_empty();
+            pending_audio.insert(session_id, audio_negotiated);
             info!(
                 %session_id, %controller_user_id, %controller_name,
                 ?permissions, consent_timeout_secs,
@@ -721,6 +740,8 @@ async fn handle_server_msg(
                 requested_transport = ?preferred_transport,
                 negotiated_transport = ?negotiated_transport,
                 chroma_pref = ?chroma_pref,
+                audio_requested = audio_enabled,
+                audio_negotiated,
                 consent_mode = ?consent_broker.mode(),
                 "incoming session request — running consent broker"
             );
@@ -846,6 +867,10 @@ async fn handle_server_msg(
             // the Request handler. `None` → AgentPeer falls back to
             // `ROOMLER_AGENT_VP9_CHROMA` env-var default.
             let chroma_pref = pending_chroma.remove(&session_id).unwrap_or(None);
+            // Pull the opt-in audio flag stashed by the Request handler.
+            // Missing (session skipped rc:request in a test harness) →
+            // no audio track, the safe default.
+            let audio_enabled = pending_audio.remove(&session_id).unwrap_or(false);
 
             let peer = match AgentPeer::new(
                 session_id,
@@ -855,6 +880,7 @@ async fn handle_server_msg(
                 chosen_codec,
                 negotiated_transport,
                 chroma_pref,
+                audio_enabled,
             )
             .await
             {
@@ -927,6 +953,7 @@ async fn handle_server_msg(
             // exchanged).
             pending_codecs.remove(&session_id);
             pending_transports.remove(&session_id);
+            pending_audio.remove(&session_id);
             indicator.hide_session(session_id.to_hex());
         }
 
@@ -966,6 +993,8 @@ async fn handle_server_msg(
             // to in-flight session_ids that no longer have peers.
             pending_codecs.clear();
             pending_transports.clear();
+            pending_chroma.clear();
+            pending_audio.clear();
             return match reason {
                 AgentCloseReason::AgentDeleted | AgentCloseReason::PolicyRejected => {
                     Err(ConnectError::FatalGoodbye { reason, message })

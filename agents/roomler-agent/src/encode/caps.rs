@@ -272,6 +272,23 @@ fn compute_caps() -> AgentCaps {
         String::new()
     };
 
+    // Audio track advertisement. Only when the `audio` feature is
+    // compiled in do we offer a WebRTC Opus track (system/desktop
+    // audio, opt-in per session). The browser reads this list to decide
+    // whether to set `audio_enabled` in `rc:session.request`; an empty
+    // list means the agent won't add an audio track at all. Mirrors the
+    // vp9-444 pattern (advertise a capability only when the code path
+    // that fulfils it is actually built). No runtime probe: unlike the
+    // video HW encoders, a failed audio-device open degrades to silence
+    // (NoopAudioCapture) rather than a black/broken track, so it's safe
+    // to advertise on feature presence alone.
+    #[allow(unused_mut)]
+    let mut audio: Vec<String> = Vec::new();
+    #[cfg(feature = "audio")]
+    {
+        audio.push("opus".into());
+    }
+
     AgentCaps {
         hw_encoders,
         codecs,
@@ -282,6 +299,7 @@ fn compute_caps() -> AgentCaps {
         transports,
         files,
         vp9_chroma,
+        audio,
     }
 }
 
@@ -503,6 +521,34 @@ mod tests {
             caps.hw_encoders.iter().any(|e| e == "libvpx-vp9-444-sw"),
             "libvpx encoder label must be advertised when probe succeeds; got {:?}",
             caps.hw_encoders
+        );
+    }
+
+    /// Audio caps: a build WITH the `audio` feature must advertise
+    /// `opus` so the browser knows it may request `audio_enabled`.
+    #[cfg(feature = "audio")]
+    #[test]
+    fn detect_advertises_opus_audio_when_feature_enabled() {
+        let caps = compute_caps();
+        assert!(
+            caps.audio.iter().any(|c| c == "opus"),
+            "audio-feature build must advertise opus; got {:?}",
+            caps.audio
+        );
+    }
+
+    /// Audio caps: a default (no `audio` feature) build must NOT
+    /// advertise any audio codec — the agent adds no audio track, so a
+    /// browser that saw `opus` and asked for `audio_enabled` would wait
+    /// forever for a track that never arrives.
+    #[cfg(not(feature = "audio"))]
+    #[test]
+    fn detect_omits_audio_when_feature_disabled() {
+        let caps = compute_caps();
+        assert!(
+            caps.audio.is_empty(),
+            "default build must not advertise audio; got {:?}",
+            caps.audio
         );
     }
 

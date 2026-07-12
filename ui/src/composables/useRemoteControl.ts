@@ -586,6 +586,48 @@ function persistVideoTransport(t: RcVideoTransport) {
   }
 }
 
+/** Opt-in "receive host audio" preference. localStorage key for the
+ *  per-browser flag. When on, the controller adds a `recvonly` audio
+ *  transceiver at `connect()` time AND sets `audio_enabled: true` in
+ *  the `rc:session.request` payload; the agent only attaches an Opus
+ *  track when it *also* advertises `"opus"` in `AgentCaps.audio` and
+ *  was built with the `audio` feature — otherwise it silently ignores
+ *  the flag (graceful no-op). Default OFF so audio stays opt-in and no
+ *  autoplay-with-sound prompt fires unless the user asked for it. */
+const AUDIO_ENABLED_STORAGE_KEY = 'roomler-rc-audio-enabled'
+
+/** Read the persisted audio-enabled flag. Pure + exported so the wire
+ *  contract (default OFF, exact truthy value) is locked by a unit
+ *  test alongside the request-payload builder. */
+export function readStoredAudioEnabled(): boolean {
+  try {
+    return globalThis.localStorage?.getItem(AUDIO_ENABLED_STORAGE_KEY) === '1'
+  } catch {
+    /* privacy mode → default OFF */
+    return false
+  }
+}
+
+/** Persist the audio-enabled flag (`'1'` on, key removed off). */
+export function persistAudioEnabled(on: boolean) {
+  try {
+    if (on) globalThis.localStorage?.setItem(AUDIO_ENABLED_STORAGE_KEY, '1')
+    else globalThis.localStorage?.removeItem(AUDIO_ENABLED_STORAGE_KEY)
+  } catch {
+    /* best-effort */
+  }
+}
+
+/** Pure builder for the audio-related fields of an `rc:session.request`.
+ *  Returns `{ audio_enabled: true }` only when the user opted in; an
+ *  empty object otherwise so pre-audio agents get the silent-by-default
+ *  behaviour (`#[serde(default)]` on the agent side → `false`).
+ *  Exported so the field name + presence semantics are locked by a
+ *  unit test. */
+export function audioRequestFields(audioEnabled: boolean): Record<string, unknown> {
+  return audioEnabled ? { audio_enabled: true } : {}
+}
+
 /** Feature-detect VP9 profile 1 (8-bit 4:4:4) decode via WebCodecs.
  *  Returns `false` synchronously when the browser has no
  *  `VideoDecoder` at all; otherwise calls `isConfigSupported` and
@@ -1021,6 +1063,27 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    *  agent reads `preferred_transport` and intersects it with its
    *  own `AgentCaps.transports`. Persisted per-browser. */
   const videoTransport = ref<RcVideoTransport>(readStoredVideoTransport())
+  /** Opt-in "receive host audio" preference (per-browser, persisted).
+   *  When true `connect()` adds a `recvonly` audio transceiver AND sets
+   *  `audio_enabled: true` on the request; the received Opus track is
+   *  played through a dedicated `<audio>` sink (the `<video>` element
+   *  stays `muted` since video may travel over the DataChannel/canvas
+   *  path). Only takes effect on the next `connect()` — matching the
+   *  video-transport toggles. Graceful no-op when the agent doesn't
+   *  advertise `"opus"`. */
+  const audioEnabled = ref<boolean>(readStoredAudioEnabled())
+  /** The received host-audio track, wrapped in its OWN MediaStream so
+   *  it never clobbers `remoteStream` (which the `<video>` element
+   *  binds to). Set in `pc.ontrack` for `kind === 'audio'`; the view
+   *  binds it to a hidden `<audio autoplay>` element. Null until an
+   *  audio track arrives. */
+  const remoteAudioStream = ref<MediaStream | null>(null)
+  /** True when a received audio track could NOT be auto-played because
+   *  the browser blocked autoplay-with-sound (no prior user gesture on
+   *  the page). The view surfaces a one-click "unmute" affordance that
+   *  calls `resumeAudioPlayback()`. Reset to false once playback
+   *  succeeds or audio tears down. */
+  const audioAutoplayBlocked = ref<boolean>(false)
   /** rc.62 — VP9 chroma preference (per-browser, persisted). When set
    *  to `'yuv420'` or `'yuv444'` the value is sent as `chroma_pref` in
    *  the `rc:session.request` payload; the agent's VP9-444 encoder
@@ -1547,6 +1610,25 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   function setVideoTransport(t: RcVideoTransport) {
     videoTransport.value = t
     persistVideoTransport(t)
+  }
+
+  /** Toggle opt-in host-audio reception. Only takes effect on the next
+   *  `connect()` — the choice is baked into the `recvonly` audio
+   *  transceiver + the request's `audio_enabled` field, both fixed at
+   *  offer time. Persisted per-browser. */
+  function setAudioEnabled(on: boolean) {
+    audioEnabled.value = on
+    persistAudioEnabled(on)
+  }
+
+  /** Retry playback of the received host-audio stream after the browser
+   *  blocked autoplay-with-sound. The view calls this from a user
+   *  gesture (the "unmute" button click) so the browser's autoplay
+   *  policy is satisfied. The actual `<audio>.play()` lives in the
+   *  view; here we just clear the blocked flag so the view's watcher
+   *  re-attempts. Idempotent + safe when no audio is active. */
+  function resumeAudioPlayback() {
+    audioAutoplayBlocked.value = false
   }
 
   /** rc.62 — switch VP9 chroma preference. Only takes effect on the
@@ -2310,6 +2392,16 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       pc = null
     }
     remoteStream.value = null
+    // Stop + drop the host-audio track so the <audio> sink goes silent
+    // and the browser releases the decoder. The view's watcher clears
+    // the element's srcObject when this flips to null.
+    if (remoteAudioStream.value) {
+      for (const t of remoteAudioStream.value.getTracks()) {
+        try { t.stop() } catch { /* ignore */ }
+      }
+    }
+    remoteAudioStream.value = null
+    audioAutoplayBlocked.value = false
     hasMedia.value = false
     remoteDescriptionSet = false
     pendingRemoteIce.length = 0
@@ -2400,6 +2492,20 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     })
 
     pc.ontrack = (ev) => {
+      // Opt-in host audio arrives on its own m=audio section. Route it
+      // to a SEPARATE stream + sink so it never clobbers `remoteStream`
+      // (bound to the <video> element) and never rides through the
+      // muted <video> / DataChannel-canvas video path. The view binds
+      // `remoteAudioStream` to a hidden <audio autoplay> element; if
+      // the browser blocks autoplay-with-sound we flip
+      // `audioAutoplayBlocked` so the view can offer a one-click unmute.
+      // Return early — none of the video/WebCodecs plumbing below
+      // applies to an audio track.
+      if (ev.track.kind === 'audio') {
+        remoteAudioStream.value = new MediaStream([ev.track])
+        hasMedia.value = true
+        return
+      }
       // Replace rather than append. addTrack accumulates across ICE
       // restarts / renegotiations, leaving dead tracks attached to the
       // MediaStream; the <video> element would render the wrong one.
@@ -2517,6 +2623,17 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // one either — ontrack never fires and hasMedia stays false. See the
     // peer-side mirror in agents/roomler-agent/src/peer.rs (add_track).
     pc.addTransceiver('video', { direction: 'recvonly' })
+
+    // Opt-in host audio: declare a recvonly audio transceiver so the
+    // offer carries an m=audio section the agent can answer with its
+    // Opus track. Only when the user asked for it — otherwise no audio
+    // m-line is offered and the agent adds no audio track (mirrors the
+    // `audio_enabled` request flag). The agent still gates on its own
+    // `AgentCaps.audio` advertising `"opus"`, so this is a safe no-op
+    // against agents without the audio feature.
+    if (audioEnabled.value) {
+      pc.addTransceiver('audio', { direction: 'recvonly' })
+    }
 
     // Create the four data channels up front per architecture doc §5.
     // Reliability profiles match the doc: unreliable+unordered for input,
@@ -3028,6 +3145,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         requestPayload.chroma_pref = vp9Chroma.value
       }
     }
+    // Opt-in host audio → `audio_enabled: true` (omitted when off so
+    // pre-audio agents/servers keep the silent-by-default behaviour via
+    // `#[serde(default)]`). Field name locked by a unit test on
+    // `audioRequestFields`.
+    Object.assign(requestPayload, audioRequestFields(audioEnabled.value))
     // Phase 5 — admin break-glass. A non-empty reason asks the server to skip
     // consent; it's honoured ONLY if the server validates the caller as an
     // ADMINISTRATOR who isn't the owner (a non-admin's value is ignored). One-
@@ -4711,6 +4833,19 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     mediaIntrinsicH,
     videoTransport,
     setVideoTransport,
+    /** Opt-in "receive host audio" flag (per-browser, persisted).
+     *  Drives the recvonly audio transceiver + `audio_enabled` request
+     *  field. Takes effect on next Connect. */
+    audioEnabled,
+    setAudioEnabled,
+    /** The received host-audio stream (own MediaStream). View binds it
+     *  to a hidden <audio autoplay> sink. Null until an Opus track
+     *  arrives. */
+    remoteAudioStream,
+    /** True when autoplay-with-sound was blocked; view shows a one-
+     *  click unmute affordance that calls `resumeAudioPlayback`. */
+    audioAutoplayBlocked,
+    resumeAudioPlayback,
     /** rc.62 — user's VP9 chroma preference ('auto' | 'yuv420' |
      *  'yuv444'). Drives the `chroma_pref` field of
      *  `rc:session.request` AND the vp9-444 worker's codec string

@@ -133,6 +133,23 @@
       >
         <v-icon>mdi-keyboard-outline</v-icon>
       </v-btn>
+      <!-- Unmute affordance: only shown when the browser blocked
+           autoplay-with-sound for the received host-audio track (no
+           prior user gesture on the page). The click IS the gesture,
+           so it retries playback. Amber to stand out. -->
+      <v-btn
+        v-if="rc.audioAutoplayBlocked.value"
+        color="warning"
+        variant="flat"
+        size="small"
+        class="mr-1"
+        prepend-icon="mdi-volume-off"
+        aria-label="Unmute host audio (autoplay was blocked)"
+        title="Click to hear the host's audio — the browser blocked autoplay"
+        @click="onUnmuteAudio"
+      >
+        Unmute
+      </v-btn>
       <v-btn
         v-if="rc.phase.value === 'idle' || rc.phase.value === 'closed' || rc.phase.value === 'error'"
         color="primary"
@@ -318,6 +335,23 @@
         @click="toggleWebCodecs"
       >
         <v-icon>{{ webcodecsOn ? 'mdi-flash' : 'mdi-flash-outline' }}</v-icon>
+      </v-btn>
+      <!-- Opt-in "receive host audio" toggle. Adds a recvonly Opus
+           audio track on the next Connect; the host's system/desktop
+           audio plays through a hidden <audio> sink. Disabled while a
+           session is live (takes effect on next Connect) and when the
+           agent doesn't advertise 'opus' in its caps. -->
+      <v-btn
+        icon
+        variant="text"
+        size="small"
+        :color="audioOn ? 'primary' : undefined"
+        :disabled="sessionLive || !agentSupportsAudio"
+        :aria-label="audioOn ? 'Disable receiving host audio' : 'Enable receiving host audio'"
+        :title="audioTooltip"
+        @click="toggleAudio"
+      >
+        <v-icon>{{ audioOn ? 'mdi-volume-high' : 'mdi-volume-off' }}</v-icon>
       </v-btn>
       <!-- Connected-only tools: clipboard send/get + file upload.
            Both DCs only open while connected, so the buttons are
@@ -630,6 +664,17 @@
           :class="`scale-${rc.scaleMode.value}`"
           :style="videoScaleStyle"
         />
+        <!-- Opt-in host-audio sink. Separate element (NOT the muted
+             <video> above, which may carry no track at all when video
+             travels over the DataChannel/canvas path). The watcher
+             binds `rc.remoteAudioStream` here; `autoplay` handles the
+             common case, and the unmute button below covers browsers
+             that block autoplay-with-sound. Kept out of the layout. -->
+        <audio
+          ref="audioEl"
+          autoplay
+          style="display: none;"
+        />
         <!-- Low-latency render path: canvas fed by the Worker-driven
              VideoDecoder. transferControlToOffscreen() happens once
              per session in the composable; this element is the main-
@@ -934,6 +979,20 @@
               @click="toggleWebCodecs"
             >
               Low-Latency {{ webcodecsOn ? 'ON' : 'OFF' }}
+            </v-btn>
+            <!-- Opt-in "receive host audio" toggle (mobile). Disabled
+                 while a session is live + when the agent lacks 'opus'
+                 audio caps. Takes effect on next Connect. -->
+            <v-btn
+              variant="tonal"
+              :color="audioOn ? 'primary' : undefined"
+              :disabled="sessionLive || !agentSupportsAudio"
+              :prepend-icon="audioOn ? 'mdi-volume-high' : 'mdi-volume-off'"
+              :title="audioTooltip"
+              class="flex-grow-1"
+              @click="toggleAudio"
+            >
+              Audio {{ audioOn ? 'ON' : 'OFF' }}
             </v-btn>
           </div>
           <!-- rc.62 — VP9 chroma format dropdown. Only meaningful when
@@ -1304,6 +1363,11 @@ async function onGetClipboard() {
 // setup time, which kills the whole RemoteControl page before it
 // can paint. Keep template refs at the top of setup to avoid this.
 const videoEl = ref<HTMLVideoElement | null>(null)
+// Hidden sink for the opt-in host-audio track. Bound to
+// `rc.remoteAudioStream` by the watcher below. Kept separate from
+// `videoEl` (which is muted + may carry no track under the DC video
+// paths).
+const audioEl = ref<HTMLAudioElement | null>(null)
 const stageEl = ref<HTMLElement | null>(null)
 const cursorCanvas = ref<HTMLCanvasElement | null>(null)
 const fileInput = ref<HTMLInputElement | null>(null)
@@ -1944,6 +2008,53 @@ const hevcTooltip = computed<string>(() => {
 function toggleHevc() {
   const next: RcVideoTransport = hevcOn.value ? 'webrtc' : 'data-channel-hevc'
   rc.setVideoTransport(next)
+}
+
+// Opt-in "receive host audio" toggle. Same "takes effect on next
+// Connect" shape as the transport toggles above (the recvonly audio
+// transceiver + `audio_enabled` request flag are fixed at offer time),
+// so we DISABLE it while a session is live rather than let a mid-
+// session flip look like it did nothing. `audioOn` reads the
+// composable's persisted `audioEnabled` ref so the button reflects
+// what the next Connect would do.
+const audioOn = computed<boolean>(() => rc.audioEnabled.value)
+// A session is "live" from request through connected/reconnecting.
+// Only the terminal idle/closed/error states allow flipping the audio
+// preference (matching when a Connect button is available).
+const sessionLive = computed<boolean>(
+  () => rc.phase.value !== 'idle' && rc.phase.value !== 'closed' && rc.phase.value !== 'error',
+)
+// Best-effort caps gating: the agent advertises its audio codecs in
+// `AgentCaps.audio` (mirrored onto `Agent.capabilities.audio` server-
+// side and returned by GET /tenant/{id}/agent). When the list is
+// present but doesn't contain 'opus', the agent can't stream audio, so
+// we disable the toggle with an explanatory tooltip — mirroring how
+// Crystal-Clear disables on `!vp9_444Supported`. When caps haven't
+// loaded yet (agent === null) we DON'T block: the toggle stays enabled
+// and the agent ignores `audio_enabled` if it can't honour it (graceful
+// no-op). An empty/absent list on an already-loaded agent means "no
+// audio feature" → disabled.
+const agentAudioCaps = computed<string[] | undefined>(() => agent.value?.capabilities?.audio)
+const agentSupportsAudio = computed<boolean>(() => {
+  // Unknown (caps not loaded) → optimistically allow.
+  if (!agent.value) return true
+  return (agentAudioCaps.value ?? []).includes('opus')
+})
+const audioTooltip = computed<string>(() => {
+  if (!agentSupportsAudio.value) {
+    return 'This agent does not advertise audio support (needs an agent built with the audio feature) — receive-audio unavailable'
+  }
+  if (sessionLive.value) {
+    return audioOn.value
+      ? 'Host audio ON — disconnect to change (takes effect on next Connect)'
+      : 'Host audio OFF — disconnect to change (takes effect on next Connect)'
+  }
+  return audioOn.value
+    ? 'Receive host audio ON — the host\'s system/desktop audio plays here. Takes effect on next Connect.'
+    : 'Receive host audio OFF — click to hear the host\'s system/desktop audio on next Connect.'
+})
+function toggleAudio() {
+  rc.setAudioEnabled(!audioOn.value)
 }
 
 // rc.62: VP9 chroma format dropdown. Selecting 'yuv420' or 'yuv444'
@@ -2704,6 +2815,52 @@ watch(
   },
   { immediate: true },
 )
+
+// Bind the opt-in host-audio stream to the hidden <audio> sink and try
+// to play it. Same both-refs race as the video watcher — the <audio>
+// element only exists inside the connected-stage v-else-if, so watch
+// both the stream and the element ref. `<audio autoplay>` covers most
+// cases, but Chrome/Safari block autoplay-WITH-SOUND without a prior
+// user gesture on the page; on a rejected play() we flip
+// `audioAutoplayBlocked` so the toolbar shows a one-click Unmute
+// button (the click satisfies the gesture requirement → retry). When
+// the stream clears (teardown), drop the element's srcObject.
+watch(
+  () => [rc.remoteAudioStream.value, audioEl.value] as const,
+  ([stream, el]) => {
+    if (!el) return
+    if (!stream) {
+      if (el.srcObject) el.srcObject = null
+      return
+    }
+    if (el.srcObject !== stream) {
+      el.srcObject = stream
+    }
+    el.muted = false
+    el.play()
+      .then(() => { rc.audioAutoplayBlocked.value = false })
+      .catch(() => {
+        // Autoplay-with-sound blocked — surface the Unmute affordance.
+        rc.audioAutoplayBlocked.value = true
+      })
+  },
+  { immediate: true },
+)
+
+// Unmute button click. The click itself is the user gesture the
+// autoplay policy wants, so retry playback directly on the element,
+// then let the composable clear its blocked flag.
+function onUnmuteAudio() {
+  const el = audioEl.value
+  if (el) {
+    el.muted = false
+    el.play()
+      .then(() => rc.resumeAudioPlayback())
+      .catch(() => { /* still blocked — leave the button up */ })
+  } else {
+    rc.resumeAudioPlayback()
+  }
+}
 
 // Once the connected stage mounts, wire input listeners to it. Detach
 // when we leave the "connected" phase so keystrokes don't escape after

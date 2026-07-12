@@ -116,6 +116,17 @@ dcv-color-primitives = { version = "0.6", optional = true }
 # Cross-platform input injection (mouse / keyboard).
 enigo = { workspace = true, optional = true }
 
+# Opus audio encoder for the system/desktop-audio WebRTC track (`audio`
+# feature). Bundles libopus and builds it from C source on first build,
+# so there's no runtime lib dependency and it's independent of the
+# `ffmpeg-encoder` feature. Platform-agnostic — the codec is the same
+# everywhere; only the capture backend (cpal, target-gated below) differs.
+# NOTE: 0.3 ships only as a pre-release on crates.io (`0.3.0-rc.0`), so
+# the version must name it explicitly — a bare "0.3" resolves to nothing.
+# The 0.3 line is the one with the `coder::Encoder` + `SampleRate` /
+# `Bitrate::BitsPerSecond` API this module targets.
+audiopus = { version = "0.3.0-rc.0", optional = true }
+
 # Option B HEVC plan (rc.65+). `ffmpeg-next` is the safe Rust wrapper
 # over FFmpeg's libav*. We use it to dispatch HEVC + H.264 + VP9 to
 # vendor HW encoders (NVENC, Intel QSV / oneVPL, AMD AMF) WITHOUT going
@@ -193,6 +204,14 @@ tokio-util = { version = "0.7", features = ["compat"] }
 # never touch the `windows` crate. Feature list scoped to the MF, D3D11,
 # DXGI, and COM interfaces the encoder actually needs — full-crate
 # features blow up compile time without any benefit.
+# System-audio capture (`audio` feature). Linux = PulseAudio monitor
+# source; Windows = WASAPI loopback (open the default OUTPUT device as an
+# input). macOS uses a Noop stub (no cpal there) until ScreenCaptureKit
+# lands, so cpal is scoped to just these two targets. Optional so
+# default / signalling-only builds don't pull in the audio host libs.
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+cpal = { version = "0.15", optional = true }
+
 [target.'cfg(unix)'.dependencies]
 # Used for `flock` in the single-instance lock. Tiny crate, ubiquitous.
 libc = "0.2"
@@ -305,6 +324,13 @@ clipboard = ["dep:arboard"]
 # is watching". Excluded from screen capture via SetWindowDisplayAffinity
 # so it never makes it into the RTP stream. No-op on non-Windows.
 viewer-indicator = ["dep:windows"]
+# System / desktop audio → WebRTC Opus track (opt-in per session via
+# `ServerMsg::Request.audio_enabled`). Pulls in the Opus encoder
+# (audiopus, bundled libopus from C source) and the cpal capture backend
+# (PulseAudio monitor on Linux, WASAPI loopback on Windows; macOS falls
+# back to a silent Noop capture). Independent of `ffmpeg-encoder`. See
+# `src/audio/`.
+audio = ["dep:audiopus", "dep:cpal"]
 # Convenience: full media pipeline (capture + software encode).
 media = ["scrap-capture", "openh264-encoder"]
 # Full media pipeline including the MF hardware encoder. Production
@@ -312,7 +338,7 @@ media = ["scrap-capture", "openh264-encoder"]
 # MF when available and fall back to openh264 when not.
 media-hw = ["media", "mf-encoder"]
 # Everything needed for a full remote-control session, software only.
-full = ["media", "enigo-input", "clipboard"]
+full = ["media", "enigo-input", "clipboard", "audio"]
 # Everything needed including the MF hardware encoder. Production
 # Windows MSI builds with this.
 full-hw = ["full", "mf-encoder", "wgc-capture", "viewer-indicator"]
@@ -414,7 +440,7 @@ raw pixels or keystrokes)."""
 # the ABI-stable, always-present X11 client libs stay external — a false
 # `libvpx9 | libvpx7` alt used to be here and made the agent claim-compatible
 # with 22.04's libvpx.so.7 while its FFmpeg actually hard-links libvpx.so.9.
-depends = "libc6, libxcb1, libxcb-shm0, libxcb-randr0"
+depends = "libc6, libxcb1, libxcb-shm0, libxcb-randr0, libasound2"
 section = "net"
 priority = "optional"
 assets = [
