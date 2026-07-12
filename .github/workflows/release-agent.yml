@@ -243,6 +243,16 @@ jobs:
             soname=$(patchelf --print-soname "$real")
             cp "$real" "$dst/$soname"
           done
+          # The agent binary ITSELF dynamically links libvpx.so.7 (the `vp9-444`
+          # VP9 software encoder — env-libvpx-sys links this build runner's
+          # libvpx-dev, which is 1.12 / libvpx.so.7 on ubuntu-22.04). Stock
+          # Ubuntu 24.04 ships only libvpx.so.9, so WITHOUT bundling this the
+          # .deb installs cleanly but the agent aborts at load with
+          # `libvpx.so.7: cannot open shared object file`. Carry it alongside the
+          # FFmpeg libs so the .deb runs on 22.04 (native) AND 24.04 (bundled).
+          vpx7=$(readlink -f /usr/lib/x86_64-linux-gnu/libvpx.so.7)
+          cp "$vpx7" "$dst/libvpx.so.7"
+          [ -f "$dst/libvpx.so.7" ] || { echo "::error::libvpx.so.7 not bundled — agent aborts at load on 24.04"; exit 1; }
           # Each FFmpeg lib finds its siblings in the same dir ($ORIGIN); the
           # binary finds them at the absolute install dir. Only glibc-family
           # deps remain external (audited) — the HW encoders (nvenc/qsv/amf/
@@ -252,6 +262,19 @@ jobs:
           patchelf --set-rpath '/usr/lib/roomler-agent' target/release/roomler-agent
           echo "bundled: $(ls "$dst" | tr '\n' ' ')"
           echo "binary RUNPATH -> $(patchelf --print-rpath target/release/roomler-agent)"
+
+      - name: Verify the bundled agent loads on stock Ubuntu 24.04
+        # The binary is a 22.04 build (glibc 2.34) that links libvpx.so.7; 24.04
+        # ships only libvpx.so.9, so this proves the bundled libvpx.so.7 + FFmpeg
+        # make the .deb self-contained on 24.04 (22.04 works trivially — native
+        # libvpx7 + lower glibc). Only the declared `depends` are installed; the
+        # bundle is reached via LD_LIBRARY_PATH (the .deb wires it via RPATH).
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD:/w" ubuntu:24.04 bash -euc '
+            apt-get update -qq
+            apt-get install -y -qq libxcb1 libxcb-shm0 libxcb-randr0 libasound2 >/dev/null
+            LD_LIBRARY_PATH=/w/agents/roomler-agent/vendor-ffmpeg /w/target/release/roomler-agent --version'
 
       - name: Build .deb
         working-directory: agents/roomler-agent
