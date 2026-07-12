@@ -72,6 +72,7 @@ mod tests {
             reachable,
             supports_quic: false,
             routes: vec![],
+            agent_id: None,
         }
     }
 
