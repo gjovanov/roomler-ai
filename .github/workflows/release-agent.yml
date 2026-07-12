@@ -126,7 +126,11 @@ jobs:
   build-linux:
     name: Build .deb (Linux x86_64)
     needs: validate-version
-    runs-on: ubuntu-latest
+    # Build on 22.04 (glibc 2.35), NOT ubuntu-latest (now 24.04 = glibc 2.39):
+    # a 24.04-built binary requires GLIBC_2.39 and fails the "loads on stock
+    # Ubuntu 22.04" guard (and won't run on any pre-24.04 host). Building on
+    # 22.04 produces a binary + bundled host-libs that load on 22.04 AND 24.04.
+    runs-on: ubuntu-22.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
