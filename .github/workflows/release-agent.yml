@@ -273,7 +273,7 @@ jobs:
           set -euo pipefail
           docker run --rm -v "$PWD:/w" ubuntu:24.04 bash -euc '
             apt-get update -qq
-            apt-get install -y -qq libxcb1 libxcb-shm0 libxcb-randr0 libasound2 >/dev/null
+            apt-get install -y -qq libxcb1 libxcb-shm0 libxcb-randr0 libasound2t64 >/dev/null
             LD_LIBRARY_PATH=/w/agents/roomler-agent/vendor-ffmpeg /w/target/release/roomler-agent --version'
 
       - name: Build .deb
