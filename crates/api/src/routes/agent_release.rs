@@ -123,7 +123,10 @@ pub async fn latest_release(
         if let Some(entry) = g.as_ref()
             && entry.fetched_at.elapsed() < CACHE_TTL
         {
-            return Ok(Json(entry.payload.clone()));
+            return Ok(Json(filter_component_releases(
+                entry.payload.clone(),
+                "agent-v",
+            )));
         }
     }
 
@@ -135,7 +138,7 @@ pub async fn latest_release(
                 fetched_at: Instant::now(),
                 payload: releases.clone(),
             });
-            Ok(Json(releases))
+            Ok(Json(filter_component_releases(releases, "agent-v")))
         }
         Err(e) => {
             // Stale-on-error: if we have any prior payload, serve
@@ -145,13 +148,33 @@ pub async fn latest_release(
             tracing::warn!(error = %e, "GitHub releases fetch failed; serving stale cache if any");
             let g = cache.inner.read().await;
             if let Some(entry) = g.as_ref() {
-                return Ok(Json(entry.payload.clone()));
+                return Ok(Json(filter_component_releases(
+                    entry.payload.clone(),
+                    "agent-v",
+                )));
             }
             Err(ApiError::Internal(format!(
                 "upstream releases fetch failed and no cache: {e}"
             )))
         }
     }
+}
+
+/// Keep only non-draft releases whose tag starts with `prefix` (`agent-v` /
+/// `tunnel-v`), preserving GitHub's newest-first order so a self-update client's
+/// `.first()` is the latest release for THIS component. The releases cache holds
+/// the raw repo list (agent, tunnel, AND unrelated helper releases like
+/// `vendored-ffmpeg-*`); without this filter a client would treat the newest
+/// unrelated release as its own latest and fail the SHA-256 check. Shared by the
+/// agent + tunnel `latest_release` handlers.
+pub(crate) fn filter_component_releases(
+    releases: Vec<AgentRelease>,
+    prefix: &str,
+) -> Vec<AgentRelease> {
+    releases
+        .into_iter()
+        .filter(|r| !r.draft && r.tag_name.starts_with(prefix))
+        .collect()
 }
 
 // ─── installer download proxy ─────────────────────────────────────────────────
@@ -409,6 +432,26 @@ mod tests {
             published_at: None,
             assets: asset_names.iter().map(|n| asset(n)).collect(),
         }
+    }
+
+    #[test]
+    fn filter_component_releases_keeps_only_matching_prefix_newest_first() {
+        // Regression: the raw repo list is newest-first + mixes components.
+        // `latest_release` must drop `vendored-ffmpeg-*` / `tunnel-v*` so an
+        // agent self-update taking `.first()` sees the newest agent-v* release.
+        let releases = vec![
+            release("vendored-ffmpeg-8.1.2", false, &[]),
+            release("agent-v0.3.0-rc.168", false, &[]),
+            release("tunnel-v0.3.0-rc.167", false, &[]),
+            release("agent-v0.3.0-rc.166", false, &[]),
+        ];
+        let agent = filter_component_releases(releases.clone(), "agent-v");
+        assert_eq!(agent.len(), 2);
+        assert_eq!(agent.first().unwrap().tag_name, "agent-v0.3.0-rc.168");
+        // And the same helper serves the tunnel handler.
+        let tunnel = filter_component_releases(releases, "tunnel-v");
+        assert_eq!(tunnel.len(), 1);
+        assert_eq!(tunnel.first().unwrap().tag_name, "tunnel-v0.3.0-rc.167");
     }
 
     #[test]
