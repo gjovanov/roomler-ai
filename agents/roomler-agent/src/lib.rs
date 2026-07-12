@@ -2,6 +2,8 @@
 //! CLI shell around these modules; exposing them here lets integration
 //! tests drive the agent in-process against a `TestApp` server.
 
+#[cfg(feature = "audio")]
+pub mod audio;
 pub mod capture;
 #[cfg(feature = "clipboard")]
 pub mod clipboard;
