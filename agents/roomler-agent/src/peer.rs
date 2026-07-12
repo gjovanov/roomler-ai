@@ -1862,7 +1862,11 @@ async fn media_pump_vp9_444_dc(
     let send_depth = if constrained_transport {
         VP9_SEND_QUEUE_DEPTH
     } else {
-        4
+        // Direct/LAN path (localhost under WSL mirrored networking): plenty of
+        // bandwidth + sub-ms latency, so a deeper queue absorbs high-motion
+        // frame bursts instead of shedding them (the "movement stutter").
+        // Input rides a SEPARATE DC, so a deeper video queue adds no input lag.
+        8
     };
     let (send_tx, mut send_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(send_depth);
     {
@@ -2541,9 +2545,17 @@ async fn media_pump_ffmpeg_dc(
     // needs it). Depth is small so we stay low-latency — under sustained
     // congestion the pump sheds load (drops + schedules a resync keyframe)
     // rather than building a stale backlog.
-    const FFMPEG_SEND_QUEUE_DEPTH: usize = 4;
-    let (send_tx, mut send_rx) =
-        tokio::sync::mpsc::channel::<bytes::Bytes>(FFMPEG_SEND_QUEUE_DEPTH);
+    // Deeper queue on the direct/LAN path (localhost under WSL mirrored
+    // networking) so high-motion HEVC bursts (big IDR/motion frames) get
+    // BUFFERED instead of shed (the "movement stutter"); a constrained relay-TCP
+    // path stays shallow to shed fast rather than build a stale backlog. Input
+    // rides a SEPARATE DC, so a deeper video queue adds no input lag.
+    let ffmpeg_send_depth = if crate::encode::transport_is_constrained() {
+        4
+    } else {
+        12
+    };
+    let (send_tx, mut send_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(ffmpeg_send_depth);
     {
         let video_bytes_dc = video_bytes_dc.clone();
         let frames_sent = frames_sent.clone();
