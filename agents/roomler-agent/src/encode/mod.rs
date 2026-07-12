@@ -37,6 +37,17 @@ pub mod mf;
 #[cfg(feature = "ffmpeg-encoder")]
 pub mod ffmpeg;
 
+// Shared AIMD bitrate controller for the DataChannel pumps (VP9-444 +
+// FFmpeg). Always compiled — it's pure (no ffmpeg/webrtc types), so its
+// unit tests run on the default `cargo test --lib`. The pump features are
+// what USE it, so allow dead_code on the signalling-only build to keep
+// `clippy -D warnings` clean (mirrors `transport_is_constrained` below).
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+pub mod aimd;
+
 // ---------------------------------------------------------------------
 // Shared helpers usable by every backend.
 // ---------------------------------------------------------------------
