@@ -434,24 +434,23 @@ controlled host, maintains an outbound WebSocket connection to the \
 Roomler API for signalling, and serves a WebRTC peer directly to the \
 browser controller (video + input over P2P — the server never sees \
 raw pixels or keystrokes)."""
-# libvpx / opus / vorbis / dav1d etc. are NOT listed: the CI "Bundle FFmpeg +
-# its runtime deps" step ships them (SONAME-named, $ORIGIN RPATH) inside
-# usr/lib/roomler-agent so the .deb is self-contained on any glibc host. Only
-# the ABI-stable, always-present X11 client libs stay external — a false
-# `libvpx9 | libvpx7` alt used to be here and made the agent claim-compatible
-# with 22.04's libvpx.so.7 while its FFmpeg actually hard-links libvpx.so.9.
-depends = "libc6, libxcb1, libxcb-shm0, libxcb-randr0, libasound2"
+# The agent binary is built on the 24.04 CI runner, so it links glibc 2.39 and
+# libvpx.so.9 — the .deb therefore targets Ubuntu 24.04+. `libc6 (>= 2.39)`
+# makes apt REFUSE the install on older releases (22.04 ships glibc 2.35) with a
+# clear dependency error, instead of installing cleanly and then crashing at
+# load. `libvpx9` is the real link (the old `libvpx9 | libvpx7` alt was a lie —
+# libvpx.so.7 can't satisfy a .so.9 link). `libasound2` backs the Opus
+# system-audio capture track. FFmpeg 8.1.2's libav* libs are bundled by the CI
+# "Bundle FFmpeg" step (usr/lib/roomler-agent, $ORIGIN RPATH).
+depends = "libc6 (>= 2.39), libvpx9, libxcb1, libxcb-shm0, libxcb-randr0, libasound2"
 section = "net"
 priority = "optional"
 assets = [
     ["target/release/roomler-agent", "usr/bin/", "755"],
-    # Bundled FFmpeg 8.1.2 (LGPL) + its transitive runtime deps (libvpx, opus,
-    # vorbis, dav1d, …) for the ffmpeg-encoder HEVC + vp9-444 backends. Populated
-    # by the "Bundle FFmpeg + its runtime deps" CI step (SONAME-named real files,
-    # $ORIGIN RPATH) so the .deb is self-contained on any glibc host — stock
-    # Ubuntu ships an ABI-incompatible FFmpeg 6.1, and 22.04 has libvpx.so.7 vs
-    # the .so.9 the vendored FFmpeg links. This glob is CI-only (the Linux .deb is
-    # never built locally).
+    # Bundled FFmpeg 8.1.2 (LGPL) for the ffmpeg-encoder HEVC backend. Populated
+    # by the "Bundle FFmpeg" CI step (SONAME-named real files, $ORIGIN RPATH) so
+    # the .deb is self-contained — stock Ubuntu ships an ABI-incompatible FFmpeg
+    # 6.1. This glob is CI-only (the Linux .deb is never built locally).
     ["vendor-ffmpeg/*.so.*", "usr/lib/roomler-agent/", "644"],
     ["packaging/linux/roomler-agent.service", "usr/lib/systemd/user/roomler-agent.service", "644"],
     ["packaging/linux/README.Debian", "usr/share/doc/roomler-agent/README.Debian", "644"],
