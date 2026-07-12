@@ -36,6 +36,14 @@ use crate::encode::{EncodedPacket, VideoEncoder};
 /// IDRs can be emitted regardless of this setting.
 const KEYFRAME_INTERVAL: i32 = 240;
 
+/// Phase B — default fps for the non-DC-pump constructors (`new_hevc` /
+/// `new_vp9`), which serve the caps probe + the legacy REMB-adaptive WebRTC
+/// track path. The DataChannel pump threads its real per-session `target_fps`
+/// through `new_hevc_adaptive` / `new_vp9_adaptive` instead (fixing the
+/// pre-Phase-B latent bug where this was hardcoded 30 while the pump captured
+/// at 60, so `set_frame_rate` + the maxrate math were computed for 30 fps).
+const DEFAULT_ENCODER_FPS: i32 = 30;
+
 /// Time-base denominator. We use 1000 (millisecond resolution) so that
 /// `monotonic_us` from `Frame` can be converted to pts via integer
 /// division without precision loss at typical capture rates.
@@ -80,7 +88,14 @@ fn ffmpeg_cq() -> u32 {
 /// headroom for genuine motion without the 6-7 Mbps idle-ish bursts
 /// the field saw on the old uncapped 13.8 Mbps target.
 /// Env override `ROOMLER_AGENT_FFMPEG_MAXRATE_KBPS` for field tuning.
-fn ffmpeg_maxrate_bps(width: u32, height: u32, fps: u32) -> usize {
+///
+/// `constrained` is THIS session's detected transport (Phase B). Pre-Phase-B
+/// this read the process-wide `transport_is_constrained()` env flag, which
+/// mis-classified an agent serving BOTH a direct-local and a cross-host-relay
+/// session from one process (the WSL virtual-desktop case): the relay clamp
+/// either throttled the direct session or missed the relay one. The DC pump
+/// now passes its per-session `detect_constrained_transport` result.
+pub(crate) fn ffmpeg_maxrate_bps(width: u32, height: u32, fps: u32, constrained: bool) -> usize {
     if let Some(kbps) = std::env::var("ROOMLER_AGENT_FFMPEG_MAXRATE_KBPS")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
@@ -92,11 +107,10 @@ fn ffmpeg_maxrate_bps(width: u32, height: u32, fps: u32) -> usize {
     let raw = (width as f64 * height as f64 * fps as f64 * SCREEN_BPP_PER_SECOND) as usize;
     let clamped = raw.clamp(3_000_000, 12_000_000);
     // rc.166 freeze fix — on a constrained relay-TCP transport (WSL / corp
-    // UDP-blocked, ROOMLER_AGENT_ICE_RELAY_TCP=1) even the low end of the
-    // [3, 12] Mbps HEVC/vp9_qsv maxrate band overruns the ~1-4 Mbps pipe.
-    // Pull it down to relay_max_bps (3 Mbps default) so the FFmpeg DC pump
-    // matches the VP9-444 pump's relay clamp.
-    if crate::encode::transport_is_constrained() {
+    // UDP-blocked) even the low end of the [3, 12] Mbps HEVC/vp9_qsv maxrate
+    // band overruns the ~1-4 Mbps pipe. Pull it down to relay_max_bps (3 Mbps
+    // default) so the FFmpeg DC pump matches the VP9-444 pump's relay clamp.
+    if constrained {
         clamped.min(crate::encode::relay_max_bps() as usize)
     } else {
         clamped
@@ -280,14 +294,48 @@ pub struct FfmpegEncoder {
     nv12_y: Vec<u8>,
     /// Scratch buffer for the NV12 UV interleaved plane. Reused across frames.
     nv12_uv: Vec<u8>,
+
+    /// Target fps this session runs at — threaded from the DC pump's
+    /// `target_fps` (Phase B). Reused on the QSV/AMF bitrate REBUILD so the
+    /// rebuilt encoder keeps the session's real framerate. Fixes the
+    /// pre-Phase-B latent bug where `new_with_dispatch` hardcoded 30.
+    fps: i32,
+    /// Constant-quality target, stored so the QSV/AMF bitrate rebuild reuses
+    /// the same `cq` the session opened with.
+    cq: u32,
+    /// The maxrate ceiling (bps) the encoder is CURRENTLY running with. Updated
+    /// in place on an NVENC reconfigure and on a QSV/AMF rebuild — `set_bitrate`
+    /// consults it (coarsened) to decide whether a change is even needed.
+    maxrate_bps: usize,
+    /// True when this backend honours an in-place `rc_max_rate` reconfigure
+    /// mid-stream. NVENC does (FFmpeg's `reconfig_encoder` reads the field on
+    /// the next `send_frame` and calls `nvEncReconfigureEncoder`); QSV/AMF do
+    /// NOT reliably, so they go through a full encoder rebuild instead.
+    supports_dynamic_bitrate: bool,
 }
 
 impl FfmpegEncoder {
     /// Try to open an HEVC encoder via the dispatch cascade. Returns
     /// the first encoder that opens cleanly. Returns `Err` if all
     /// backends fail — the caller falls back to MF / NoopEncoder.
+    ///
+    /// Fixed-30-fps + env-based relay clamp. Used by the caps probe and the
+    /// legacy REMB-adaptive WebRTC track path; the DataChannel pump uses
+    /// [`Self::new_hevc_adaptive`] to thread its real per-session fps + ceiling.
     pub fn new_hevc(width: u32, height: u32) -> Result<Self> {
-        Self::new_with_dispatch(HEVC_ENCODER_NAMES, width, height)
+        let maxrate = ffmpeg_maxrate_bps(
+            width,
+            height,
+            DEFAULT_ENCODER_FPS as u32,
+            crate::encode::transport_is_constrained(),
+        );
+        Self::new_with_dispatch(
+            HEVC_ENCODER_NAMES,
+            width,
+            height,
+            DEFAULT_ENCODER_FPS,
+            maxrate,
+        )
     }
 
     /// rc.83 — Try to open a VP9 HW encoder. Currently Intel oneVPL
@@ -296,24 +344,72 @@ impl FfmpegEncoder {
     /// profile vp9_qsv supports — 4:4:4 sessions stay on libvpx
     /// regardless of this method's availability.
     pub fn new_vp9(width: u32, height: u32) -> Result<Self> {
-        Self::new_with_dispatch(VP9_ENCODER_NAMES, width, height)
+        let maxrate = ffmpeg_maxrate_bps(
+            width,
+            height,
+            DEFAULT_ENCODER_FPS as u32,
+            crate::encode::transport_is_constrained(),
+        );
+        Self::new_with_dispatch(
+            VP9_ENCODER_NAMES,
+            width,
+            height,
+            DEFAULT_ENCODER_FPS,
+            maxrate,
+        )
     }
 
-    fn new_with_dispatch(names: &[&'static str], width: u32, height: u32) -> Result<Self> {
+    /// Phase B — DataChannel-pump HEVC constructor. Threads the session's real
+    /// `target_fps` and a per-session `maxrate_bps` ceiling (relay-aware, from
+    /// the pump's `detect_constrained_transport`), so the encoder's framerate
+    /// and burst cap match the actual link instead of the fixed-30 defaults.
+    pub fn new_hevc_adaptive(
+        width: u32,
+        height: u32,
+        fps: u32,
+        maxrate_bps: usize,
+    ) -> Result<Self> {
+        Self::new_with_dispatch(
+            HEVC_ENCODER_NAMES,
+            width,
+            height,
+            fps.max(1) as i32,
+            maxrate_bps,
+        )
+    }
+
+    /// Phase B — DataChannel-pump VP9 (`vp9_qsv`) constructor. See
+    /// [`Self::new_hevc_adaptive`].
+    pub fn new_vp9_adaptive(width: u32, height: u32, fps: u32, maxrate_bps: usize) -> Result<Self> {
+        Self::new_with_dispatch(
+            VP9_ENCODER_NAMES,
+            width,
+            height,
+            fps.max(1) as i32,
+            maxrate_bps,
+        )
+    }
+
+    fn new_with_dispatch(
+        names: &[&'static str],
+        width: u32,
+        height: u32,
+        fps: i32,
+        maxrate_bps: usize,
+    ) -> Result<Self> {
         // `ffmpeg_next::init()` is idempotent + cheap to call; safe to
         // run on each new encoder. Sets up codec registration.
         ffmpeg_next::init().context("ffmpeg_next::init failed")?;
 
-        let fps = 30; // initial framerate; set_bitrate doesn't change this
         // rc.86 — RustDesk-parity rate control. Drive the encoder by
         // CONSTANT QUALITY (cq / global_quality) with a bandwidth CAP
         // (maxrate), not by the old 0.20-bpp/s VBR target. On screen
         // content this keeps text edges sharp (cq guarantees per-block
         // quality so nothing "crystallizes over seconds") while idle
-        // frames cost ~0 and bursts are bounded by the cap. Both knobs
-        // are env-overridable so the field can dial in without a rebuild.
+        // frames cost ~0 and bursts are bounded by the cap. cq is
+        // env-overridable; `fps` + `maxrate_bps` come from the caller
+        // (Phase B threads the DC pump's real per-session values).
         let cq = ffmpeg_cq();
-        let maxrate_bps = ffmpeg_maxrate_bps(width, height, fps as u32);
 
         let mut last_err: Option<anyhow::Error> = None;
         for name in names {
@@ -323,6 +419,7 @@ impl FfmpegEncoder {
                         encoder = name,
                         width,
                         height,
+                        fps,
                         cq,
                         maxrate_bps,
                         "ffmpeg encoder opened (constant-quality + maxrate cap)"
@@ -338,6 +435,10 @@ impl FfmpegEncoder {
                         nv12_y: vec![0u8; plane_pixels],
                         // UV is half-width × half-height × 2 channels = pixels / 2
                         nv12_uv: vec![0u8; plane_pixels / 2],
+                        fps,
+                        cq,
+                        maxrate_bps,
+                        supports_dynamic_bitrate: name.contains("nvenc"),
                     });
                 }
                 Err(e) => {
@@ -623,18 +724,83 @@ impl VideoEncoder for FfmpegEncoder {
     }
 
     fn set_bitrate(&mut self, bps: u32) {
-        // ffmpeg-next 8.x doesn't expose a stable runtime-bitrate setter on
-        // `codec::encoder::Video`. NVENC + QSV both accept reconfigure via
-        // `AVCodecContext->bit_rate = X` followed by an internal reconfigure
-        // call, but the safe Rust API doesn't surface this. For rc.72 we
-        // just log the request; rc.73 wires the reconfigure via raw FFI
-        // (similar to the openh264-sys2 bitrate-set pattern in the libvpx
-        // path).
-        tracing::debug!(
-            bps,
-            encoder = self.encoder_name,
-            "set_bitrate not yet wired (rc.72 limitation)"
-        );
+        // Phase B — runtime maxrate adaptivity, driven by the DC pump's AIMD.
+        // The controller emits a CONTINUOUS desired bitrate; snap it to a
+        // coarse ladder first so we don't reconfigure/rebuild on every fine
+        // step (each change is heavy — see the two branches below). Only ACT
+        // when the coarsened target differs from the coarsened current ceiling.
+        let target = crate::encode::aimd::coarsen_bitrate(bps) as usize;
+        if crate::encode::aimd::coarsen_bitrate(self.maxrate_bps as u32) as usize == target {
+            return;
+        }
+
+        if self.supports_dynamic_bitrate {
+            // NVENC: move the ceiling IN PLACE. FFmpeg's `reconfig_encoder`
+            // (libavcodec/nvenc.c) reads `avctx->rc_max_rate` / `rc_buffer_size`
+            // on the NEXT `send_frame` and calls `nvEncReconfigureEncoder`
+            // (with `forceIDR`) when they change — but ONLY while
+            // `rc != NV_ENC_PARAMS_RC_CONSTQP && support_dyn_bitrate`. Our
+            // NVENC config is `rc=vbr` with `bit_rate=0` (cq-driven), so the
+            // maxBitRate branch fires and the burst cap moves without a full
+            // encoder rebuild. `bit_rate` stays 0, so the averageBitRate branch
+            // is skipped — we modulate only the ceiling, which is the right
+            // lever for a constant-quality stream.
+            //
+            // SAFETY: `self.encoder` owns the `AVCodecContext` and we hold
+            // `&mut self`, so nothing reads/writes it concurrently. Writing
+            // these two RC fields between `send_frame` calls is exactly the
+            // reconfigure contract FFmpeg's nvenc implements.
+            unsafe {
+                let ctx = self.encoder.as_mut_ptr();
+                (*ctx).rc_max_rate = target as i64;
+                (*ctx).rc_buffer_size = target as std::os::raw::c_int;
+            }
+            self.maxrate_bps = target;
+            tracing::debug!(
+                encoder = self.encoder_name,
+                maxrate_bps = target,
+                "ffmpeg set_bitrate: NVENC in-place maxrate reconfigure"
+            );
+        } else {
+            // QSV / AMF: no dependable in-place bitrate reconfigure via a field
+            // write (the driver reads RC params only at init), so REBUILD the
+            // encoder with the new maxrate. The coarsen ladder above + the
+            // AIMD's own rate-limiting (MD ≤ 1/500 ms, AI ≤ 1/5 s, monotonic per
+            // direction) bound how often the bucket — and thus this rebuild —
+            // actually changes, so no extra time-debounce is needed (and a
+            // debounce here would silently drop a target the AIMD already
+            // marked applied). The fresh encoder's first frame is an IDR
+            // (`frame_count == 0` path in `build_av_frame`), so the browser
+            // resyncs cleanly across the swap.
+            match Self::build_encoder(
+                self.encoder_name,
+                self.width,
+                self.height,
+                self.fps,
+                target,
+                self.cq,
+            ) {
+                Ok(enc) => {
+                    self.encoder = enc;
+                    self.maxrate_bps = target;
+                    self.frame_count = 0;
+                    self.force_keyframe = true;
+                    tracing::info!(
+                        encoder = self.encoder_name,
+                        maxrate_bps = target,
+                        "ffmpeg set_bitrate: QSV/AMF encoder rebuilt for new maxrate"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        encoder = self.encoder_name,
+                        maxrate_bps = target,
+                        %e,
+                        "ffmpeg set_bitrate: rebuild failed — keeping current encoder"
+                    );
+                }
+            }
+        }
     }
 
     fn set_roi_hints(&mut self, _rects: &[DirtyRect], _frame_dims: (u32, u32)) {
@@ -693,6 +859,8 @@ mod tests {
             &["nope_nvenc_xx", "nope_qsv_xx", "nope_amf_xx"],
             640,
             360,
+            30,
+            3_000_000,
         );
         assert!(res.is_err(), "expected Err for unknown encoder names");
         let msg = res.unwrap_err().to_string();

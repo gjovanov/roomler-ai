@@ -225,6 +225,52 @@ impl AimdController {
     }
 }
 
+/// Bitrate ladder for [`coarsen_bitrate`]. ~1.33–1.5× spacing across the DC
+/// pump's operating band, extending past the 12 Mbps FFmpeg maxrate cap so a
+/// raised ceiling (direct/LAN, high resolution) still has rungs to climb.
+const BITRATE_LADDER_BPS: &[u32] = &[
+    1_500_000, 2_000_000, 3_000_000, 4_500_000, 6_000_000, 8_000_000, 12_000_000, 16_000_000,
+    20_000_000, 25_000_000,
+];
+
+/// Snap a continuous AIMD bitrate to the nearest [`BITRATE_LADDER_BPS`] rung.
+///
+/// Only the FFmpeg HW pump uses this. Each maxrate change there is expensive:
+/// on NVENC it forces an IDR (FFmpeg's `reconfig_encoder` sets `resetEncoder=1`
+/// / `forceIDR=1`), and on QSV/AMF it's a full encoder rebuild — both are far
+/// too heavy to run on every fine AIMD step. Coarsening to a rung means a
+/// typical ×0.85 multiplicative-decrease step (−15 %) usually lands on the SAME
+/// rung (no reconfigure) and only crosses a rung every ~2–3 steps, bounding the
+/// reconfigure/IDR rate. The libvpx VP9-444 pump does NOT use this — libvpx
+/// takes a hard bitrate target cheaply, so it drives the raw AIMD value.
+///
+/// Nearest (not floor) so we track the controller faithfully instead of always
+/// under-shooting; the shed-on-full send gate absorbs the sub-rung slack. Pure
+/// and always-compiled, so it unit-tests on the default `cargo test --lib` even
+/// though the FFmpeg encoder that consumes it is CI-only on the dev box.
+pub fn coarsen_bitrate(bps: u32) -> u32 {
+    let first = BITRATE_LADDER_BPS[0];
+    let last = BITRATE_LADDER_BPS[BITRATE_LADDER_BPS.len() - 1];
+    if bps <= first {
+        return first;
+    }
+    if bps >= last {
+        return last;
+    }
+    let mut best = first;
+    let mut best_dist = bps.abs_diff(best);
+    for &rung in &BITRATE_LADDER_BPS[1..] {
+        let d = bps.abs_diff(rung);
+        // Strictly-smaller so ties resolve to the LOWER rung (we iterate
+        // ascending) — a mild conservative bias on a congested link.
+        if d < best_dist {
+            best = rung;
+            best_dist = d;
+        }
+    }
+    best
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,5 +459,72 @@ mod tests {
         }
         // ~4.6 s of settle since the overflow → still blocked.
         assert_eq!(c.desired(), d, "AI blocked <5 s after a buffer overflow");
+    }
+
+    // (9) coarsen_bitrate: exact rungs are fixed points; out-of-range clamps.
+    #[test]
+    fn coarsen_clamps_and_fixes_rungs() {
+        assert_eq!(
+            coarsen_bitrate(1_000_000),
+            1_500_000,
+            "below floor → floor rung"
+        );
+        assert_eq!(
+            coarsen_bitrate(30_000_000),
+            25_000_000,
+            "above top → top rung"
+        );
+        for &rung in BITRATE_LADDER_BPS {
+            assert_eq!(
+                coarsen_bitrate(rung),
+                rung,
+                "exact rung {rung} is a fixed point"
+            );
+        }
+    }
+
+    // (10) coarsen_bitrate snaps to the NEAREST rung (ties → lower).
+    #[test]
+    fn coarsen_snaps_to_nearest_rung() {
+        assert_eq!(
+            coarsen_bitrate(3_400_000),
+            3_000_000,
+            "3.4M nearer 3M than 4.5M"
+        );
+        assert_eq!(
+            coarsen_bitrate(4_080_000),
+            4_500_000,
+            "4.08M nearer 4.5M than 3M"
+        );
+        assert_eq!(
+            coarsen_bitrate(5_000_000),
+            4_500_000,
+            "5.0M nearer 4.5M than 6M"
+        );
+        assert_eq!(
+            coarsen_bitrate(5_300_000),
+            6_000_000,
+            "5.3M nearer 6M than 4.5M"
+        );
+        // Exact midpoint 3.75M (between 3M and 4.5M) → the lower rung (tie bias).
+        assert_eq!(
+            coarsen_bitrate(3_750_000),
+            3_000_000,
+            "midpoint ties to the lower rung"
+        );
+    }
+
+    // (11) coarsen_bitrate is monotonic non-decreasing across the band.
+    #[test]
+    fn coarsen_is_monotonic() {
+        let mut prev = 0u32;
+        for bps in (1_000_000..=26_000_000).step_by(100_000) {
+            let c = coarsen_bitrate(bps);
+            assert!(
+                c >= prev,
+                "coarsen must be non-decreasing: {c} < {prev} at {bps}"
+            );
+            prev = c;
+        }
     }
 }
