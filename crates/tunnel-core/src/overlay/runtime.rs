@@ -292,6 +292,9 @@ fn build_overlay_view(
                 connection,
                 rtt_ms: None,
                 last_seen_ms,
+                // P3b-3 — carry the backing agent id (hex) so the daemon can join
+                // this peer to a tunnel flow and label it `Tunnel`.
+                agent_id: np.agent_id.map(|a| a.to_hex()),
             }
         })
         .collect();
@@ -1286,6 +1289,7 @@ mod tests {
             reachable: true,
             supports_quic: false,
             routes: vec![],
+            agent_id: None,
         }
     }
 
