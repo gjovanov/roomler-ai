@@ -1086,17 +1086,29 @@ fn maybe_start_virtual_desktop() -> Result<Option<virtual_desktop::VirtualDeskto
         startup,
     };
     let vd = virtual_desktop::start(&cfg).context("starting virtual desktop")?;
-    // Point capture at the virtual display + pin media to TURNS/TCP. Set here
-    // (early in `run_cmd`, before the agent spawns its session tasks) so the
-    // caps/display probe and every later capture see it. `set_var` is `unsafe`
-    // in edition 2024; sound here because nothing else reads these vars yet.
+    // Point capture at the virtual display + (by default) pin media to TURNS/TCP.
+    // Set here (early in `run_cmd`, before the agent spawns its session tasks) so
+    // the caps/display probe and every later capture see it. `set_var` is
+    // `unsafe` in edition 2024; sound here because nothing else reads these vars
+    // yet.
+    //
+    // vd-mode defaults to relay-over-TCP because a hostile-NAT WSL (wsl-vpnkit /
+    // default NAT) flaps the UDP TURN relay. But respect an EXPLICIT opt-out:
+    // WSL *mirrored* networking gives native UDP + a direct local path, which is
+    // far better than round-tripping a local desktop through a TURN relay. So an
+    // operator can set `ROOMLER_AGENT_ICE_RELAY_TCP=0` and keep it.
+    let relay_forced = std::env::var_os("ROOMLER_AGENT_ICE_RELAY_TCP").is_some();
     unsafe {
         std::env::set_var("DISPLAY", vd.display());
-        std::env::set_var("ROOMLER_AGENT_ICE_RELAY_TCP", "1");
+        if !relay_forced {
+            std::env::set_var("ROOMLER_AGENT_ICE_RELAY_TCP", "1");
+        }
     }
+    let relay_over_tcp = std::env::var("ROOMLER_AGENT_ICE_RELAY_TCP").as_deref() == Ok("1");
     tracing::info!(
         display = vd.display(),
-        "virtual-desktop active — capturing it; relay-over-TCP media enabled"
+        relay_over_tcp,
+        "virtual-desktop active — capturing it"
     );
     Ok(Some(vd))
 }
