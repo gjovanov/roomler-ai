@@ -126,7 +126,11 @@ jobs:
   build-linux:
     name: Build .deb (Linux x86_64)
     needs: validate-version
-    runs-on: ubuntu-latest
+    # Build on 22.04 (glibc 2.35), NOT ubuntu-latest (now 24.04 = glibc 2.39):
+    # a 24.04-built binary requires GLIBC_2.39 and fails the "loads on stock
+    # Ubuntu 22.04" guard (and won't run on any pre-24.04 host). Building on
+    # 22.04 produces a binary + bundled host-libs that load on 22.04 AND 24.04.
+    runs-on: ubuntu-22.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -143,7 +147,8 @@ jobs:
           sudo apt-get install -y \
             libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev \
             cmake libclang-dev pkg-config \
-            libvpx-dev
+            libvpx-dev \
+            libasound2-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
@@ -215,6 +220,13 @@ jobs:
         # `ffmpeg-encoder` adds the FFmpeg HEVC backend (hevc_nvenc / qsv / amf
         # / vaapi / vulkan) via the vendored FFmpeg 8.1.2 fetched above — the
         # Linux/WSL counterpart to the Windows MF/vcpkg HEVC path.
+        # `full` now includes `audio` (system-audio Opus track) → pulls cpal
+        # (ALSA, libasound2-dev above) + audiopus (bundled libopus via CMake).
+        env:
+          # audiopus_sys' bundled libopus CMakeLists declares
+          # cmake_minimum_required(VERSION < 3.5); CMake 3.31+ errors without
+          # this policy shim.
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
         run: cargo build -p roomler-agent --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack,ffmpeg-encoder"
 
       - name: Bundle FFmpeg + its runtime deps into the .deb (self-contained, RPATH)
@@ -646,6 +658,10 @@ jobs:
         # the runtime logs + aborts → the agent runs normally) until that
         # lands; Linux (/dev/net/tun) + macOS (utun) need no extra dep and
         # work today. Default-OFF (config `overlay_enabled`).
+        # `full-hw` includes `audio` (via `full`) → cpal WASAPI loopback (no
+        # extra lib on Windows) + audiopus (bundled libopus via CMake).
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
         run: cargo build -p roomler-agent --release --features "full-hw,vp9-444,system-context,ffmpeg-encoder,overlay-l3,overlay-netstack"
 
       - name: Verify FFmpeg link via unit test
@@ -1033,6 +1049,10 @@ jobs:
         # `ffmpeg-encoder`: HEVC via the vendored FFmpeg fetched above
         # (hevc_videotoolbox on Apple Silicon) — the macOS counterpart to the
         # Linux/Windows HEVC path.
+        # `full` includes `audio` → cpal CoreAudio (in the OS SDK, no extra
+        # lib) + audiopus (bundled libopus via CMake).
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
         run: cargo build -p roomler-agent --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack,ffmpeg-encoder" --target aarch64-apple-darwin
 
       - name: Stage .app bundle

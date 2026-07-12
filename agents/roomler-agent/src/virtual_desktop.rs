@@ -21,6 +21,24 @@ use tracing::{info, warn};
 
 const X11_UNIX_DIR: &str = "/tmp/.X11-unix";
 
+/// WSLg's PulseAudio server socket. When the agent runs inside WSL2 with
+/// WSLg, the host's audio server is reachable here; exporting
+/// `PULSE_SERVER` at it lets the virtual-desktop's apps (and thus the
+/// `audio` feature's PulseAudio-monitor capture) actually route sound.
+/// Without it, cpal's monitor source is silent under WSLg. On a native
+/// Linux host this path doesn't exist and we leave `PULSE_SERVER`
+/// untouched (the system default applies).
+const WSLG_PULSE_SERVER: &str = "/mnt/wslg/PulseServer";
+
+/// Add `PULSE_SERVER` pointing at the WSLg socket to `cmd`, but only when
+/// that socket actually exists (i.e. we're under WSLg). No-op on native
+/// Linux so the system default PulseAudio server is used.
+fn with_wslg_pulse(cmd: &mut Command) {
+    if Path::new(WSLG_PULSE_SERVER).exists() {
+        cmd.env("PULSE_SERVER", WSLG_PULSE_SERVER);
+    }
+}
+
 /// What to bring up: `WxH` resolution, a WM binary, and optional startup apps.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -85,12 +103,13 @@ pub fn start(cfg: &Config) -> Result<VirtualDesktop> {
     }
     info!(display = dpy.as_str(), resolution = %cfg.resolution, "virtual-desktop: Xvfb up");
 
-    match Command::new(&cfg.wm)
+    let mut wm_cmd = Command::new(&cfg.wm);
+    wm_cmd
         .env("DISPLAY", &dpy)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
+        .stderr(Stdio::null());
+    with_wslg_pulse(&mut wm_cmd);
+    match wm_cmd.spawn() {
         Ok(c) => children.push(c),
         Err(e) => {
             warn!(wm = %cfg.wm, %e, "virtual-desktop: window manager failed to start (continuing bare)")
@@ -98,12 +117,13 @@ pub fn start(cfg: &Config) -> Result<VirtualDesktop> {
     }
 
     for app in &cfg.startup {
-        match Command::new(app)
+        let mut app_cmd = Command::new(app);
+        app_cmd
             .env("DISPLAY", &dpy)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        {
+            .stderr(Stdio::null());
+        with_wslg_pulse(&mut app_cmd);
+        match app_cmd.spawn() {
             Ok(c) => children.push(c),
             Err(e) => warn!(%app, %e, "virtual-desktop: startup app failed to launch"),
         }
