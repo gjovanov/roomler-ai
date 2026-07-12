@@ -317,6 +317,10 @@ async fn run_session(
         },
         supported_transports,
         request_transport,
+        // The standalone CLI has one forward per process and doesn't surface a
+        // `flows` table — a throwaway aggregate (P3b-3); the daemon owns the
+        // real one.
+        Arc::new(tunnel_core::forward::SessionThroughput::default()),
     )
     .await
 }
