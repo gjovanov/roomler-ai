@@ -341,10 +341,20 @@ fn normalise_flavour(s: &str) -> Result<&'static str, ApiError> {
 
 fn pick_release<'a>(releases: &'a [AgentRelease], version: &str) -> Option<&'a AgentRelease> {
     if version == "latest" {
+        // Filter to `agent-v*` tags — the raw release list mixes components
+        // (`tunnel-v*`, unrelated helper releases like `vendored-ffmpeg-*`), and
+        // the newest non-prerelease overall may not be an agent release. Without
+        // this the wizard / self-update `?version=latest` resolved to an
+        // unrelated release and 404'd on the MSI asset (same class as the
+        // `latest_release` manifest bug fixed in #90).
         releases
             .iter()
-            .find(|r| !r.draft && !r.prerelease)
-            .or_else(|| releases.iter().find(|r| !r.draft))
+            .find(|r| !r.draft && !r.prerelease && r.tag_name.starts_with("agent-v"))
+            .or_else(|| {
+                releases
+                    .iter()
+                    .find(|r| !r.draft && r.tag_name.starts_with("agent-v"))
+            })
     } else {
         let target_with_prefix = format!("agent-v{}", version.trim_start_matches("agent-v"));
         let target_bare = version.trim_start_matches("agent-v");
@@ -521,6 +531,25 @@ mod tests {
         let releases = vec![release("agent-v0.3.0-rc.27", true, &[])];
         let picked = pick_release(&releases, "latest").unwrap();
         assert_eq!(picked.tag_name, "agent-v0.3.0-rc.27");
+    }
+
+    #[test]
+    fn pick_release_latest_skips_non_agent_tags() {
+        // Regression: the raw repo list is newest-first + mixes components. A
+        // newer `vendored-ffmpeg-*` / `tunnel-v*` release must NOT be picked as
+        // the latest AGENT release (the wizard / self-update `?version=latest`
+        // 404'd on the MSI asset otherwise).
+        let releases = vec![
+            release("vendored-ffmpeg-8.1.2", false, &["ffmpeg-libs.zip"]),
+            release("tunnel-v0.3.0-rc.167", false, &[]),
+            release(
+                "agent-v0.3.0-rc.166",
+                true,
+                &["roomler-agent-permachine.msi"],
+            ),
+        ];
+        let picked = pick_release(&releases, "latest").unwrap();
+        assert_eq!(picked.tag_name, "agent-v0.3.0-rc.166");
     }
 
     #[test]
