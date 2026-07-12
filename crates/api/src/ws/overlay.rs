@@ -573,6 +573,14 @@ fn to_netmap_peer(node: &OverlayNode) -> NetmapPeer {
         supports_quic: node.supports_quic,
         // Phase 1 — only the admin-APPROVED routes reach peers.
         routes: node.approved_routes.clone(),
+        // P3b-3 — expose the backing agent id (bridging overlay-node-id →
+        // agents._id) so a controlling node can join this peer to a
+        // daemon-originated tunnel flow and label it `ConnectionType::Tunnel`.
+        // `None` for a tunnel-client node.
+        agent_id: match &node.node_ref {
+            NodeRef::Agent { agent_id } => Some(*agent_id),
+            NodeRef::TunnelClient { .. } => None,
+        },
     }
 }
 
