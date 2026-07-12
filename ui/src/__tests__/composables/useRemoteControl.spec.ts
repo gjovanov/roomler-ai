@@ -25,6 +25,9 @@ import {
   CLIPBOARD_SINGLE_ENVELOPE_THRESHOLD_BYTES,
   VP9_444_DC_LABEL,
   VP9_444_DC_OPTIONS,
+  readStoredAudioEnabled,
+  persistAudioEnabled,
+  audioRequestFields,
   shortCodecFromReceiver,
   codecFromSdp,
   decideKeyAction,
@@ -1163,6 +1166,40 @@ describe('VP9_444_DC_LABEL + VP9_444_DC_OPTIONS', () => {
   // also bumping the worker assembler tests.
   it('uses the reliable + ordered DC profile', () => {
     expect(VP9_444_DC_OPTIONS).toEqual({ ordered: true })
+  })
+})
+
+describe('audio opt-in (persist + request wire shape)', () => {
+  beforeEach(() => {
+    globalThis.localStorage?.clear()
+  })
+
+  it('defaults OFF when nothing is stored', () => {
+    expect(readStoredAudioEnabled()).toBe(false)
+  })
+
+  it('round-trips through persistAudioEnabled', () => {
+    persistAudioEnabled(true)
+    expect(readStoredAudioEnabled()).toBe(true)
+    persistAudioEnabled(false)
+    expect(readStoredAudioEnabled()).toBe(false)
+  })
+
+  it('treats any non-"1" stored value as OFF (only the exact flag is truthy)', () => {
+    globalThis.localStorage?.setItem('roomler-rc-audio-enabled', 'true')
+    expect(readStoredAudioEnabled()).toBe(false)
+  })
+
+  // The agent's `rc:session.request` handler reads `audio_enabled`
+  // (bool) with `#[serde(default)]` — omitting it must mean "no audio".
+  // Lock the EXACT field name + presence so a rename on either side is
+  // caught here rather than surfacing as silent no-audio in the field.
+  it('emits { audio_enabled: true } only when enabled', () => {
+    expect(audioRequestFields(true)).toEqual({ audio_enabled: true })
+  })
+
+  it('emits an empty object (field omitted) when disabled', () => {
+    expect(audioRequestFields(false)).toEqual({})
   })
 })
 
