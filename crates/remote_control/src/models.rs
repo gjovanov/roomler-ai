@@ -89,6 +89,15 @@ pub struct AgentCaps {
     /// the empty value as `"yuv444"` for backward compat.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub vp9_chroma: String,
+    /// Audio codecs the agent can stream on the WebRTC audio track
+    /// (system / desktop audio, opt-in per session). Empty / unset
+    /// (older agents, or agents built without the `audio` feature)
+    /// means "no audio track offered" — the browser must not request
+    /// `audio_enabled`. Known value: `"opus"` (audio/opus, 48 kHz
+    /// stereo, PT 111 — the WebRTC default). Populated by the agent's
+    /// caps builder only when the `audio` Cargo feature is compiled in.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audio: Vec<String>,
 }
 
 /// How consent is obtained before a controller may drive a device. Resolved

@@ -326,6 +326,7 @@ impl Hub {
         browser_caps: Vec<String>,
         preferred_transport: Option<String>,
         chroma_pref: Option<String>,
+        audio_enabled: bool,
         consent_mode: ConsentMode,
         override_reason: Option<String>,
     ) -> Result<ObjectId> {
@@ -386,6 +387,7 @@ impl Hub {
             browser_caps,
             preferred_transport,
             chroma_pref,
+            audio_enabled,
             // Server-authoritative directive: the agent obeys this rather than
             // its local `auto_grant_session`. `Auto` → immediate grant;
             // `Prompt` → on-host prompt; `Email`/`Push` → wait (owner resolves).
@@ -716,6 +718,7 @@ impl Hub {
                     browser_caps,
                     preferred_transport,
                     chroma_pref,
+                    audio_enabled,
                     // Ignored here — the Hub can't validate admin; the API gate
                     // validates the wire field and re-supplies it via `ctx`.
                     override_reason: _,
@@ -741,6 +744,7 @@ impl Hub {
                     browser_caps,
                     preferred_transport,
                     chroma_pref,
+                    audio_enabled,
                     ctx.consent_mode,
                     ctx.override_reason.clone(),
                 )?;
@@ -815,7 +819,8 @@ mod tests {
             Permissions::default(),
             Vec::new(),
             None,
-            None, // chroma_pref
+            None,  // chroma_pref
+            false, // audio_enabled
             ConsentMode::Prompt,
             None, // override_reason
         );
@@ -838,7 +843,8 @@ mod tests {
                 Permissions::default(),
                 Vec::new(),
                 None,
-                None, // chroma_pref
+                None,  // chroma_pref
+                false, // audio_enabled
                 ConsentMode::Prompt,
                 None, // override_reason
             )
