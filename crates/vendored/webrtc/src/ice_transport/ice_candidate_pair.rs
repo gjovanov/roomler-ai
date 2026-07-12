@@ -37,4 +37,16 @@ impl RTCIceCandidatePair {
             remote,
         }
     }
+
+    /// The local candidate of the selected pair. Exposed (roomler patch) so
+    /// the agent can inspect the negotiated path's candidate `typ`/`protocol`
+    /// at runtime (per-session TURN-relay detection for adaptive bitrate).
+    pub fn local(&self) -> &RTCIceCandidate {
+        &self.local
+    }
+
+    /// The remote candidate of the selected pair. See [`Self::local`].
+    pub fn remote(&self) -> &RTCIceCandidate {
+        &self.remote
+    }
 }
