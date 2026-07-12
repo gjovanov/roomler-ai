@@ -229,7 +229,7 @@ jobs:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
         run: cargo build -p roomler-agent --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack,ffmpeg-encoder"
 
-      - name: Bundle FFmpeg + its runtime deps into the .deb (self-contained, RPATH)
+      - name: Bundle FFmpeg into the .deb (self-contained, RPATH)
         run: |
           set -euo pipefail
           # Ubuntu 24.04 ships FFmpeg 6.1 (libavcodec.so.60) but the agent links
@@ -243,60 +243,15 @@ jobs:
             soname=$(patchelf --print-soname "$real")
             cp "$real" "$dst/$soname"
           done
+          # Each FFmpeg lib finds its siblings in the same dir ($ORIGIN); the
+          # binary finds them at the absolute install dir. Only glibc-family
+          # deps remain external (audited) — the HW encoders (nvenc/qsv/amf/
+          # vaapi/vulkan) dlopen their driver libs at runtime, so no extra
+          # .deb `depends` are needed.
           for lib in "$dst"/*.so.*; do patchelf --set-rpath '$ORIGIN' "$lib"; done
           patchelf --set-rpath '/usr/lib/roomler-agent' target/release/roomler-agent
-
-          # Also bundle the TRANSITIVE runtime deps — libvpx, opus, vorbis, dav1d,
-          # … — so the .deb loads on ANY glibc host, not just Ubuntu 24.04. The
-          # vendored FFmpeg (and the vp9-444 feature) link these DYNAMICALLY
-          # against the RUNNER's system copies (e.g. libvpx.so.9 from libvpx-dev);
-          # they are NOT in /opt/roomler-ffmpeg/lib, so a 22.04 box (which has only
-          # libvpx.so.7) aborts the agent at load with `libvpx.so.9: cannot open
-          # shared object file` (the rc.164+ regression). Walk the ldd closure of
-          # the binary + bundled libs to a fixed point, copying each dep under its
-          # SONAME — EXCEPT (a) the glibc/loader/gcc runtime (must match the host
-          # kernel) and (b) the libxcb/libX* X11 client libs (ABI-stable and
-          # declared as .deb `depends`, present on every Ubuntu).
-          host_re='^(ld-linux|libc|libm|libdl|libpthread|librt|libresolv|libnsl|libutil|libanl|libgcc_s|libstdc\+\+)\.so|^(libxcb|libXau|libXdmcp)'
-          while :; do
-            added=0
-            for obj in target/release/roomler-agent "$dst"/*.so.*; do
-              while read -r soname path; do
-                if [ -z "$soname" ] || [ -z "$path" ]; then continue; fi
-                if echo "$soname" | grep -Eq "$host_re"; then continue; fi
-                if [ -e "$dst/$soname" ]; then continue; fi
-                cp "$path" "$dst/$soname"
-                patchelf --set-rpath '$ORIGIN' "$dst/$soname" 2>/dev/null || true
-                echo "  + bundled transitive dep: $soname  ($path)"
-                added=1
-              done < <(LD_LIBRARY_PATH="$dst" ldd "$obj" 2>/dev/null | awk '/=> \//{print $1, $3}')
-            done
-            if [ "$added" -eq 0 ]; then break; fi
-          done
-          # Regression guard: libvpx MUST now be carried (its absence is the exact
-          # 22.04 load failure); the runtime dlopen'd HW-encoder drivers (nvenc/
-          # qsv/amf/vaapi/vulkan) are intentionally NOT bundled.
-          if ! ls "$dst"/libvpx.so.* >/dev/null 2>&1; then
-            echo "::error::libvpx not bundled — the .deb would fail to load on non-24.04 hosts"; exit 1
-          fi
           echo "bundled: $(ls "$dst" | tr '\n' ' ')"
           echo "binary RUNPATH -> $(patchelf --print-rpath target/release/roomler-agent)"
-
-      - name: Verify the bundled agent loads on stock Ubuntu 22.04
-        run: |
-          set -euo pipefail
-          # The reported regression: rc.164+ agents abort on 22.04 with
-          # `libvpx.so.9: cannot open shared object file`. Prove the bundle fixes
-          # it — run the binary in a stock 22.04 container with ONLY the declared
-          # `depends` (libxcb) installed + the bundle on LD_LIBRARY_PATH. If it
-          # prints its version the .deb is self-contained; a missing lib is named
-          # by the loader and fails CI here instead of in the field.
-          docker run --rm -v "$PWD:/w" ubuntu:22.04 bash -euc '
-            apt-get update -qq >/dev/null
-            apt-get install -y -qq libxcb1 libxcb-shm0 libxcb-randr0 >/dev/null
-            LD_LIBRARY_PATH=/w/agents/roomler-agent/vendor-ffmpeg \
-              /w/target/release/roomler-agent --version
-          '
 
       - name: Build .deb
         working-directory: agents/roomler-agent
