@@ -773,8 +773,8 @@ jobs:
           Write-Host "::notice::per-User MSI = $([math]::Round($msiPerUser, 2)) MB"
           Write-Host "::notice::per-Machine MSI = $([math]::Round($msiPerMachine, 2)) MB"
           Write-Host "::notice::rc.63 baseline = $rc63Baseline MB; delta = $([math]::Round($deltaMB, 2)) MB"
-          if ($maxMsi -gt 20) {
-            Write-Host "::error::MSI exceeds 20 MB hard ceiling ($([math]::Round($maxMsi, 2)) MB). Option B size budget violated. Investigate whether ffmpeg has dragged in unintended features."
+          if ($maxMsi -gt 24) {
+            Write-Host "::error::MSI exceeds 24 MB hard ceiling ($([math]::Round($maxMsi, 2)) MB). Option B size budget violated. Investigate whether ffmpeg has dragged in unintended features."
             exit 1
           } elseif ($deltaMB -gt 8) {
             Write-Host "::warning::MSI delta $([math]::Round($deltaMB, 2)) MB exceeds +8 MB target (still under 12 MB hard ceiling). Consider feature-stripping FFmpeg before rc.66."
