@@ -9,17 +9,32 @@
 //! created there (stable across WS reconnects), the signaling loop updates them,
 //! and the listener reads this state.
 
+use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use tokio::sync::watch;
 use tunnel_core::localapi::{
-    ConsentRequest, DaemonMode, FlowInfo, LocalApiState, NodeStatus, OverlayView, PeerInfo,
-    Response,
+    ConnectionType, ConsentRequest, DaemonMode, FlowInfo, LocalApiState, NodeStatus, OverlayView,
+    PeerInfo, Response,
 };
+
+/// How often the RTT prober ICMP-pings each carrier-reachable peer (P3b-3).
+pub const RTT_PROBE_INTERVAL: Duration = Duration::from_secs(15);
+/// A cached RTT older than this is dropped from the peer view (the peer stopped
+/// answering) so the column fades to "—" rather than showing a stale number.
+/// ~3 missed probes.
+pub const RTT_STALE: Duration = Duration::from_secs(45);
+/// Per-peer ICMP probe timeout — short so one unreachable peer can't stretch the
+/// sequential cycle past [`RTT_PROBE_INTERVAL`].
+const RTT_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Shared RTT cache: overlay-ip → (last measured RTT ms, when measured). Written
+/// by the prober task, read by [`DaemonState::peers`].
+pub type RttCache = Arc<Mutex<HashMap<String, (u32, Instant)>>>;
 
 /// The netstack ICMP backend behind the `ping` verb, abstracted so
 /// [`DaemonState`] never names the feature-gated `NetstackHandle` type. The
@@ -63,6 +78,10 @@ pub struct DaemonState {
     /// `create_socks5` / `kill_flow` verbs; the daemon originates tunnels over
     /// its own agent WS.
     tunnel_hub: crate::tunnel::client_mgr::TunnelClientHub,
+    /// Per-peer RTT cache filled by the ICMP prober task (P3b-3), read by
+    /// `peers()` to populate `rtt_ms`. Empty on a node without the netstack
+    /// pinger (no prober runs) → `rtt_ms` stays `None`.
+    rtt_cache: RttCache,
 }
 
 impl DaemonState {
@@ -81,6 +100,7 @@ impl DaemonState {
         consent: crate::consent::ConsentBroker,
         pinger: Option<Arc<dyn NetstackPinger>>,
         tunnel_hub: crate::tunnel::client_mgr::TunnelClientHub,
+        rtt_cache: RttCache,
     ) -> Self {
         Self {
             node_id,
@@ -93,6 +113,7 @@ impl DaemonState {
             consent,
             pinger,
             tunnel_hub,
+            rtt_cache,
         }
     }
 
@@ -150,7 +171,23 @@ impl LocalApiState for DaemonState {
         if !self.connected.load(Ordering::Relaxed) {
             return Vec::new();
         }
-        self.overlay.borrow().peers.clone()
+        let mut peers = self.overlay.borrow().peers.clone();
+        // P3b-3: fill `rtt_ms` from the ICMP prober cache (netstack nodes only).
+        // A stale entry (peer stopped answering) is dropped so the column fades
+        // to "—" rather than lying. Empty cache (no prober) → all stay `None`.
+        if let Ok(cache) = self.rtt_cache.lock()
+            && !cache.is_empty()
+        {
+            for p in &mut peers {
+                if let Some(ip) = p.overlay_ip.as_deref()
+                    && let Some((ms, at)) = cache.get(ip)
+                    && at.elapsed() < RTT_STALE
+                {
+                    p.rtt_ms = Some(*ms);
+                }
+            }
+        }
+        peers
     }
 
     fn flows(&self) -> Vec<FlowInfo> {
@@ -253,6 +290,58 @@ impl LocalApiState for DaemonState {
     }
 }
 
+/// Spawn the RTT prober (P3b-3): every [`RTT_PROBE_INTERVAL`], ICMP-ping each
+/// carrier-reachable peer over the userspace netstack and cache the round-trip
+/// so `peers()` can surface `rtt_ms`. Only meaningful on a netstack node (the
+/// caller spawns it only when a `pinger` exists); the cache stays empty
+/// otherwise and every peer's `rtt_ms` is `None`.
+///
+/// Probes **only** `Direct`/`Relay` peers — a `Blocked`/`Offline` peer has no
+/// working carrier, so a ping just burns the full timeout and would stretch the
+/// sequential cycle. Pings sequentially so a burst of ICMP never hits the wire
+/// at once; the worst-case cycle is (live-peer-count × [`RTT_PROBE_TIMEOUT`]),
+/// comfortably under the interval for realistic meshes. Exits on `shutdown`.
+pub fn spawn_rtt_prober(
+    pinger: Arc<dyn NetstackPinger>,
+    overlay: watch::Receiver<OverlayView>,
+    cache: RttCache,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(RTT_PROBE_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() { return; }
+                }
+                _ = tick.tick() => {}
+            }
+            // Snapshot the peers to probe, then release the watch borrow before
+            // any await (the borrow is not held across the ping).
+            let targets: Vec<(String, IpAddr)> = overlay
+                .borrow()
+                .peers
+                .iter()
+                .filter(|p| matches!(p.connection, ConnectionType::Direct | ConnectionType::Relay))
+                .filter_map(|p| {
+                    let ip = p.overlay_ip.as_deref()?;
+                    ip.parse::<IpAddr>().ok().map(|addr| (ip.to_string(), addr))
+                })
+                .collect();
+            for (key, ip) in targets {
+                if let Ok(rtt) = pinger.ping(ip, RTT_PROBE_TIMEOUT).await {
+                    let ms = rtt.as_millis().min(u32::MAX as u128) as u32;
+                    if let Ok(mut c) = cache.lock() {
+                        c.insert(key, (ms, Instant::now()));
+                    }
+                }
+            }
+        }
+    });
+}
+
 /// A 24-char hex ObjectId — the only shape a session id may take before it's
 /// used as a sentinel filename. Guards [`DaemonState::consent_decide`] against a
 /// caller smuggling path separators / traversal into the filename.
@@ -291,6 +380,10 @@ mod tests {
         .unwrap()
     }
 
+    fn empty_rtt_cache() -> RttCache {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
+
     #[tokio::test]
     async fn resolve_targets_and_ping_without_pinger_errors() {
         let (_tx, rx) = watch::channel(view());
@@ -304,6 +397,7 @@ mod tests {
             consent_broker("ping"),
             None, // no netstack pinger
             crate::tunnel::client_mgr::TunnelClientHub::new("test".into()),
+            empty_rtt_cache(),
         );
         // Resolve by peer name (from `view`), by first label, and by literal IP.
         assert_eq!(
@@ -368,6 +462,7 @@ mod tests {
             consent,
             None,
             crate::tunnel::client_mgr::TunnelClientHub::new("test".into()),
+            empty_rtt_cache(),
         );
 
         // Identity + overlay IP are always reported; connected reflects the flag.
@@ -390,5 +485,45 @@ mod tests {
 
         // Flows are empty on the agent side in P1.
         assert!(st.flows().is_empty());
+    }
+
+    #[test]
+    fn peers_fill_rtt_from_fresh_cache_and_drop_stale() {
+        // The `view()` peer is a Relay with overlay_ip 100.64.0.1.
+        let (_tx, rx) = watch::channel(view());
+        let cache = empty_rtt_cache();
+        let st = DaemonState::new(
+            "aid".into(),
+            "host".into(),
+            DaemonMode::Service,
+            None,
+            Arc::new(AtomicBool::new(true)),
+            rx,
+            consent_broker("rtt"),
+            None,
+            crate::tunnel::client_mgr::TunnelClientHub::new("test".into()),
+            cache.clone(),
+        );
+
+        // Fresh cache entry → surfaced as rtt_ms.
+        cache
+            .lock()
+            .unwrap()
+            .insert("100.64.0.1".into(), (52, Instant::now()));
+        assert_eq!(st.peers()[0].rtt_ms, Some(52));
+
+        // Stale entry (older than RTT_STALE) → dropped to None (fade to "—").
+        let stale_at = Instant::now()
+            .checked_sub(RTT_STALE + Duration::from_secs(1))
+            .unwrap();
+        cache
+            .lock()
+            .unwrap()
+            .insert("100.64.0.1".into(), (52, stale_at));
+        assert_eq!(st.peers()[0].rtt_ms, None);
+
+        // Empty cache → None.
+        cache.lock().unwrap().clear();
+        assert_eq!(st.peers()[0].rtt_ms, None);
     }
 }
