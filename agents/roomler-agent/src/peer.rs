@@ -30,7 +30,7 @@ use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit}
 // Only the VP9-444 DC pump consumes the per-session transport detection today
 // (the FFmpeg pump joins in Phase B); keep the import off the signalling-only
 // / FFmpeg-only builds so `clippy -D warnings` stays clean.
-#[cfg(feature = "vp9-444")]
+#[cfg(any(feature = "vp9-444", feature = "ffmpeg-encoder"))]
 use webrtc::ice_transport::ice_candidate_type::RTCIceCandidateType;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::media::Sample;
@@ -918,9 +918,9 @@ impl AgentPeer {
 /// "unconstrained" if it hasn't nominated within ~3 s — the AIMD converges
 /// regardless of the initial guess.
 ///
-/// Gated on `vp9-444` for now (the only caller); the FFmpeg DC pump starts
-/// calling it in Phase B, at which point this widens to `any(...)`.
-#[cfg(feature = "vp9-444")]
+/// Gated on `any(vp9-444, ffmpeg-encoder)` — both DataChannel pumps call it
+/// (Phase B added the FFmpeg HEVC/vp9_qsv pump as the second caller).
+#[cfg(any(feature = "vp9-444", feature = "ffmpeg-encoder"))]
 async fn detect_constrained_transport(
     pc: &Arc<RTCPeerConnection>,
     session_id: bson::oid::ObjectId,
@@ -1039,6 +1039,7 @@ async fn media_pump(
                     lock_state_rx,
                     quality_state,
                     control_dc.clone(),
+                    pc.clone(),
                 )
                 .await;
             }
@@ -1094,6 +1095,7 @@ async fn media_pump(
                         lock_state_rx,
                         quality_state,
                         control_dc.clone(),
+                        pc.clone(),
                     )
                     .await;
                 }
@@ -2454,11 +2456,20 @@ enum FfmpegDcCodec {
 
 #[cfg(feature = "ffmpeg-encoder")]
 impl FfmpegDcCodec {
-    fn open(self, w: u32, h: u32) -> anyhow::Result<crate::encode::ffmpeg::FfmpegEncoder> {
+    /// Phase B — `fps` + `maxrate_bps` are the pump's per-session values
+    /// (real `target_fps`, relay-aware ceiling), threaded into the encoder so
+    /// its framerate + burst cap match the actual link instead of a fixed 30.
+    fn open(
+        self,
+        w: u32,
+        h: u32,
+        fps: u32,
+        maxrate_bps: usize,
+    ) -> anyhow::Result<crate::encode::ffmpeg::FfmpegEncoder> {
         use crate::encode::ffmpeg::FfmpegEncoder;
         match self {
-            Self::Hevc => FfmpegEncoder::new_hevc(w, h),
-            Self::Vp9 => FfmpegEncoder::new_vp9(w, h),
+            Self::Hevc => FfmpegEncoder::new_hevc_adaptive(w, h, fps, maxrate_bps),
+            Self::Vp9 => FfmpegEncoder::new_vp9_adaptive(w, h, fps, maxrate_bps),
         }
     }
 
@@ -2499,12 +2510,14 @@ impl FfmpegDcCodec {
 /// - `Vp9` → `vp9_qsv` (rc.83 path — Intel-only HW VP9, unblocks
 ///   the Iris Xe CPU-bound 17 fps → 60 fps target)
 ///
-/// Scope intentionally minimal for first ship: capture → encode →
-/// frame → send. No AIMD backpressure, no scene-change detection, no
-/// anti-IDR-storm coalescer, no ROI hints. The pump is good enough
-/// to verify the wire format end-to-end and validate Gate 0 → real-
-/// session continuity; AIMD lands once we have field telemetry.
+/// Capture → encode → frame → send, with (Phase B) a per-session AIMD
+/// backpressure controller mirroring `media_pump_vp9_444_dc`: it detects THIS
+/// session's ICE path (relay vs direct), picks the target fps + a relay-aware
+/// maxrate ceiling accordingly, and drives `FfmpegEncoder::set_bitrate` off
+/// send-channel occupancy so the HEVC/vp9_qsv burst cap tracks the actual link.
+/// (No scene-change detection / ROI hints yet — those remain future work.)
 #[cfg(feature = "ffmpeg-encoder")]
+#[allow(clippy::too_many_arguments)]
 async fn media_pump_ffmpeg_dc(
     codec: FfmpegDcCodec,
     session_id: bson::oid::ObjectId,
@@ -2514,6 +2527,10 @@ async fn media_pump_ffmpeg_dc(
     lock_state_rx: tokio::sync::watch::Receiver<lock_state::LockState>,
     _quality_state: Arc<std::sync::atomic::AtomicU8>,
     control_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
+    // Phase B — the peer connection, so the pump can detect THIS session's
+    // actual ICE path (relay vs direct) at runtime for the per-session
+    // bitrate/fps clamp instead of the process-wide env flag.
+    pc: Arc<RTCPeerConnection>,
 ) {
     use crate::encode::VideoEncoder;
     use crate::encode::ffmpeg::FfmpegEncoder;
@@ -2537,13 +2554,23 @@ async fn media_pump_ffmpeg_dc(
     }
     let mut was_locked_last_iter = matches!(*lock_state_rx.borrow(), lock_state::LockState::Locked);
 
+    // Phase B — detect THIS session's ICE path (relay vs direct) up front so
+    // the target fps + maxrate ceiling + send-queue depth all match the actual
+    // link, and the AIMD clamps per session rather than off the process-wide
+    // env flag. The env flag still wins as an explicit override (see
+    // `detect_constrained_transport`). ICE may not have nominated yet, so this
+    // briefly polls; the AIMD converges regardless of the initial guess.
+    let constrained = detect_constrained_transport(&pc, session_id).await;
+
     // rc.93 — target fps. Pre-rc.93 this was hardcoded 30, which capped the
     // scrap backend's internal pacer (`scrap_backend::next_frame` sleeps to
     // `1000/target_fps` ms) AND drove a redundant pump-side floor sleep.
     // The fast legacy `media_pump` runs the SAME capturer at 60 with no
     // pump floor and hits ~55 fps; HW encode (vp9_qsv/hevc_qsv ~4-6 ms)
-    // easily sustains that. Default 60, operator-overridable via env.
-    let target_fps: u32 = ffmpeg_target_fps_from_env();
+    // easily sustains that. Phase B: default 60 on a direct link, 30 on a
+    // constrained relay (which can't sustain 60 fps of HEVC without shedding);
+    // an explicit env override wins either way.
+    let target_fps: u32 = ffmpeg_target_fps(constrained);
     let downscale = crate::capture::DownscalePolicy::Never;
     info!(
         %session_id,
@@ -2639,12 +2666,21 @@ async fn media_pump_ffmpeg_dc(
     // BUFFERED instead of shed (the "movement stutter"); a constrained relay-TCP
     // path stays shallow to shed fast rather than build a stale backlog. Input
     // rides a SEPARATE DC, so a deeper video queue adds no input lag.
-    let ffmpeg_send_depth = if crate::encode::transport_is_constrained() {
-        4
-    } else {
-        12
-    };
+    let ffmpeg_send_depth = if constrained { 4 } else { 12 };
     let (send_tx, mut send_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(ffmpeg_send_depth);
+
+    // Phase B — AIMD backpressure controller (mirrors media_pump_vp9_444_dc).
+    // Substitutes the missing REMB signal on the DC transport: driven off
+    // SEND-CHANNEL OCCUPANCY at the capacity gate (the real webrtc-rs
+    // backpressure signal — the send task's `dc.send().await` blocks under SCTP
+    // flow control, so `buffered_amount()` stays low even while saturated).
+    // Constructed lazily once the first encoder gives us dims → a per-resolution,
+    // relay-aware maxrate ceiling. The controller emits a continuous target;
+    // `FfmpegEncoder::set_bitrate` coarsens it to a ladder and applies it as an
+    // in-place NVENC reconfigure or a debounced QSV/AMF rebuild.
+    let mut aimd: Option<encode::aimd::AimdController> = None;
+    // Mirror of the AIMD's applied bitrate, for the heartbeat + change-gated log.
+    let mut last_applied_bitrate: u32 = 0;
     {
         let video_bytes_dc = video_bytes_dc.clone();
         let frames_sent = frames_sent.clone();
@@ -2731,6 +2767,20 @@ async fn media_pump_ffmpeg_dc(
         }
         if send_tx.capacity() == 0 {
             frames_skipped_backpressure += 1;
+            // Phase B — a FULL send channel is the real DC backpressure signal.
+            // Drive the multiplicative decrease HERE, before the `continue`, so
+            // it runs DURING sustained congestion (the VP9 pump's rc.171
+            // starvation-fix rationale) instead of never firing. Apply to the
+            // live encoder so the next frame that gets through is already smaller.
+            if let Some(ctrl) = aimd.as_mut() {
+                ctrl.observe(ffmpeg_send_depth as u32, true, std::time::Instant::now());
+                if let Some(bps) = ctrl.take_pending() {
+                    if let Some(enc) = encoder.as_mut() {
+                        enc.set_bitrate(bps);
+                    }
+                    last_applied_bitrate = bps;
+                }
+            }
             tokio::time::sleep(Duration::from_millis(2)).await;
             continue;
         }
@@ -2805,12 +2855,19 @@ async fn media_pump_ffmpeg_dc(
 
         // Lazily build / rebuild the encoder when the frame dims change.
         let (w, h) = (frame.width, frame.height);
+        // Phase B — per-resolution, per-session (relay-aware) maxrate ceiling.
+        // Recomputed each frame (cheap) so a dim change or a mid-session env
+        // tweak re-seeds it; the AIMD starts at this ceiling and tracks the
+        // link down from it. Also the initial maxrate the encoder is built with.
+        let ceiling =
+            crate::encode::ffmpeg::encoder::ffmpeg_maxrate_bps(w, h, target_fps, constrained)
+                as u32;
         let need_rebuild = match encoder_dims {
             Some((ew, eh)) => ew != w || eh != h,
             None => true,
         };
         if need_rebuild {
-            match codec.open(w, h) {
+            match codec.open(w, h, target_fps, ceiling as usize) {
                 Ok(enc) => {
                     let encoder_name = enc.name();
                     info!(
@@ -2843,6 +2900,13 @@ async fn media_pump_ffmpeg_dc(
                     }
                     encoder = Some(enc);
                     encoder_dims = Some((w, h));
+                    // Phase B — a fresh encoder starts at the full `ceiling`
+                    // maxrate; force the AIMD to re-apply its current (possibly
+                    // lower) target so we don't snap back up to the ceiling
+                    // after a dim change / resolution switch.
+                    if let Some(ctrl) = aimd.as_mut() {
+                        ctrl.force_reapply();
+                    }
                 }
                 Err(e) => {
                     tracing::error!(
@@ -2877,6 +2941,43 @@ async fn media_pump_ffmpeg_dc(
         let Some(enc) = encoder.as_mut() else {
             continue;
         };
+
+        // Phase B — drive the AIMD off send-channel occupancy (the real DC
+        // backpressure signal) each frame. Ceiling = the per-resolution,
+        // relay-aware maxrate cap; the controller starts there and tracks the
+        // link down under congestion / back up on recovery. `set_bitrate`
+        // coarsens the target to a ladder before reconfiguring, so applying it
+        // every frame is cheap (a no-op unless the coarse bucket moved).
+        {
+            let now = std::time::Instant::now();
+            let ctrl = aimd.get_or_insert_with(|| {
+                encode::aimd::AimdController::new(
+                    ceiling,
+                    encode::MIN_BITRATE_BPS,
+                    ceiling,
+                    ffmpeg_send_depth as u32,
+                    now,
+                )
+            });
+            ctrl.set_ceiling(ceiling);
+            // Non-full occupancy sample so the additive-increase can recover
+            // once the link has drained (the FULL samples come from the gate).
+            let cap = send_tx.capacity();
+            ctrl.observe(ffmpeg_send_depth.saturating_sub(cap) as u32, cap == 0, now);
+            if let Some(target) = ctrl.take_pending() {
+                enc.set_bitrate(target);
+                if target != last_applied_bitrate {
+                    info!(
+                        %session_id,
+                        codec_label,
+                        ceiling_bps = ceiling,
+                        target_bps = target,
+                        "FFmpeg DC pump set_bitrate (AIMD)"
+                    );
+                }
+                last_applied_bitrate = target;
+            }
+        }
 
         let encode_start = std::time::Instant::now();
         let packets = match enc.encode(frame.clone()).await {
@@ -2956,6 +3057,17 @@ async fn media_pump_ffmpeg_dc(
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                     frames_dropped_backpressure += 1;
                     resync_pending = true;
+                    // Phase B — a full channel at try_send (a big IDR / motion
+                    // frame the link can't drain) is a secondary congestion
+                    // signal; note it to the AIMD (rate-limited MD internally).
+                    // `enc` is in scope from the encode above.
+                    if let Some(ctrl) = aimd.as_mut() {
+                        ctrl.note_buffer_overflow(std::time::Instant::now());
+                        if let Some(bps) = ctrl.take_pending() {
+                            enc.set_bitrate(bps);
+                            last_applied_bitrate = bps;
+                        }
+                    }
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                     tracing::warn!(
@@ -2988,6 +3100,8 @@ async fn media_pump_ffmpeg_dc(
                 %session_id,
                 codec_label,
                 target_fps,
+                constrained,
+                target_bps = last_applied_bitrate,
                 width = w,
                 height = h,
                 encoder = enc.name(),
@@ -3023,22 +3137,29 @@ fn vp9_444_target_fps_from_env() -> u32 {
     }
 }
 
-/// Read the `ROOMLER_AGENT_FFMPEG_FPS` env var for the FFmpeg HW DC pump
-/// (HEVC / vp9_qsv). Default **60** — hardware encode sustains it and the
-/// capture backend caps the real delivered rate anyway. Deliberately
-/// distinct from the libvpx VP9-444 pump's `ROOMLER_AGENT_VP9_FPS`
-/// (default 30, because SW 4:4:4 encode can't keep up at 60). Pre-rc.93
-/// the FFmpeg pump hardcoded 30, which throttled the scrap backend's
-/// internal pacer to 30 fps and is the root of the vp9_qsv ~15 fps field
-/// bug. Clamped to 1..=240 so a high-refresh display can opt higher.
+/// Target fps for the FFmpeg HW DC pump (HEVC / vp9_qsv): explicit env wins,
+/// else pick per-session by transport (Phase B).
+///
+/// An explicit `ROOMLER_AGENT_FFMPEG_FPS` ALWAYS wins (clamped 1..=240) — a
+/// high-refresh host can force 60 even on a relay, or pin 30 on a direct link.
+/// With no override: a direct/LAN link defaults to **60** (HW encode sustains
+/// it and the capture backend caps the real delivered rate anyway); a
+/// constrained relay-TCP link defaults to **30**, because 60 fps of HEVC
+/// overruns the ~1-4 Mbps pipe and just sheds frames. Deliberately distinct
+/// from the libvpx VP9-444 pump's `ROOMLER_AGENT_VP9_FPS` (default 30 — SW
+/// 4:4:4 can't keep up at 60).
+///
+/// Pre-rc.93 the pump hardcoded 30, which throttled the scrap backend's
+/// internal pacer to 30 fps and was the root of the vp9_qsv ~15 fps field bug.
 #[cfg(feature = "ffmpeg-encoder")]
-fn ffmpeg_target_fps_from_env() -> u32 {
-    const DEFAULT_FPS: u32 = 60;
-    std::env::var("ROOMLER_AGENT_FFMPEG_FPS")
+fn ffmpeg_target_fps(constrained: bool) -> u32 {
+    if let Some(fps) = std::env::var("ROOMLER_AGENT_FFMPEG_FPS")
         .ok()
         .and_then(|v| v.trim().parse::<u32>().ok())
-        .map(|fps| fps.clamp(1, 240))
-        .unwrap_or(DEFAULT_FPS)
+    {
+        return fps.clamp(1, 240);
+    }
+    if constrained { 30 } else { 60 }
 }
 
 /// Attach the `input` data-channel message handler. Each inbound payload
