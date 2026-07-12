@@ -25,14 +25,18 @@
 //! pump's capacity gate skips frames. THAT gate is the true congestion
 //! signal. This controller is driven from there:
 //!
-//! - **Multiplicative decrease** (×0.8, rate-limited to one per 500 ms):
+//! - **Multiplicative decrease** (×0.85, rate-limited to one per 500 ms):
 //!   the channel is FULL (`capacity() == 0`). Asymmetric + instantaneous
 //!   so we back off fast the moment we saturate.
-//! - **Additive increase** (×1.1): the channel has NOT been full for
-//!   `AI_SETTLE` (5 s) AND a low-occupancy EWMA — cautious, so we only
-//!   climb when the link has demonstrably drained. The EWMA + the
-//!   no-full-in-5s gate together tame the coarse signal on a shallow
-//!   (depth-2) relay channel where occupancy flips 0↔full.
+//! - **Additive increase** (a small fixed step, NOT multiplicative): the
+//!   channel has NOT been full for `AI_SETTLE` (5 s) AND a low-occupancy
+//!   EWMA — cautious, so we only climb when the link has demonstrably
+//!   drained. Additive so we converge just UNDER the link capacity with a
+//!   small ripple rather than overshooting it every climb (a multiplicative
+//!   increase sawtooths, showing up as a periodic pause+blur on a
+//!   capacity-limited relay). The EWMA + the no-full-in-5s gate together
+//!   tame the coarse signal on a shallow (depth-2) relay channel where
+//!   occupancy flips 0↔full.
 //!
 //! The controller is **pure** — no ffmpeg / webrtc / tokio types, every
 //! method takes an explicit `now: Instant` — so it unit-tests on the
@@ -49,12 +53,19 @@
 
 use std::time::{Duration, Instant};
 
-/// Multiplicative-decrease factor: ×0.80 on a full channel.
-const MD_NUM: u32 = 80;
+/// Multiplicative-decrease factor: ×0.85 on a full channel. Gentler than a
+/// ×0.8 so the quality dip on each backoff is less eye-catching.
+const MD_NUM: u32 = 85;
 const MD_DEN: u32 = 100;
-/// Additive-increase factor: ×1.10 once the link has settled.
-const AI_NUM: u32 = 110;
-const AI_DEN: u32 = 100;
+/// Additive-increase step per settle interval = `max(ceiling / AI_STEP_DIVISOR,
+/// AI_MIN_STEP_BPS)`. ADDITIVE (not the old multiplicative ×1.1) so the
+/// controller CONVERGES just under the link capacity with a small ripple
+/// instead of overshooting it by a fixed percentage on every climb — the
+/// sawtooth that showed up as a periodic pause+blur on a capacity-limited
+/// relay. The step scales with the ceiling so recovery isn't glacial at high
+/// (LAN) bitrates.
+const AI_STEP_DIVISOR: u32 = 16;
+const AI_MIN_STEP_BPS: u32 = 150_000;
 /// At most one multiplicative decrease per this interval — avoids
 /// free-falling the bitrate on a transient burst.
 const MD_MIN_INTERVAL: Duration = Duration::from_millis(500);
@@ -203,9 +214,8 @@ impl AimdController {
     }
 
     fn apply_ai(&mut self, now: Instant) {
-        let next = (self.desired_bps / AI_DEN)
-            .saturating_mul(AI_NUM)
-            .min(self.ceiling_bps);
+        let step = (self.ceiling_bps / AI_STEP_DIVISOR).max(AI_MIN_STEP_BPS);
+        let next = self.desired_bps.saturating_add(step).min(self.ceiling_bps);
         if next > self.desired_bps {
             self.desired_bps = next;
         }
@@ -292,10 +302,12 @@ mod tests {
             t += Duration::from_millis(200);
             c.observe(0, false, t);
         }
-        // t is now ~8 s in; the first eligible increase should have fired.
+        // t is now ~8 s in; exactly one additive increase should have fired
+        // (the next is gated 5 s after the first, beyond the loop).
         let d = c.desired();
+        let step = (CEIL / AI_STEP_DIVISOR).max(AI_MIN_STEP_BPS);
         assert!(d > 3_000_000, "AI should climb after settle: {d}");
-        assert!(d <= 3_300_000 + 1, "single ×1.1 step at a time: {d}");
+        assert_eq!(d, 3_000_000 + step, "one additive AI step: {d}");
         assert!(d <= CEIL);
     }
 
