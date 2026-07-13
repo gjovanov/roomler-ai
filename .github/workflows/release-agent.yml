@@ -166,6 +166,13 @@ jobs:
         with:
           workspaces: '. -> target'
           shared-key: agent-linux
+          # Tag-ref cache saves can never be restored by a future tag run
+          # (GH cache isolation: own ref or default branch only) — they
+          # were just piling ~0.5 GB of dead weight per tag against the
+          # repo's 10 GB budget. Only non-tag runs (workflow_dispatch
+          # rehearsals, which execute on master) save — seeding the cache
+          # every subsequent tag build restores.
+          save-if: ${{ github.ref_type != 'tag' }}
 
       - name: Install cargo-deb
         run: cargo install cargo-deb --locked
@@ -339,11 +346,13 @@ jobs:
         run: |
           # `env-libvpx-sys` / `ffmpeg-sys-next` build.rs shell out to
           # `pkg-config`; windows-latest ships none. We install vcpkg's
-          # `pkgconf` — we already have vcpkg (pre-installed at C:\vcpkg,
-          # used below for libvpx + FFmpeg), so this pulls from the vcpkg
-          # registry, NOT SourceForge. The old `choco pkgconfiglite`
-          # downloaded its binary from SourceForge, which timed out and
-          # failed the rc.151 MSI build. Kept as a retried fallback.
+          # `pkgconf` from the pre-installed vcpkg at C:\vcpkg (the ONLY
+          # remaining vcpkg use in this job — libvpx + FFmpeg are fetched
+          # prebuilt from the vendored-* releases below), so this pulls
+          # from the vcpkg registry, NOT SourceForge. The old `choco
+          # pkgconfiglite` downloaded its binary from SourceForge, which
+          # timed out and failed the rc.151 MSI build. Kept as a retried
+          # fallback.
           $got = $false
           if (Test-Path 'C:\vcpkg\vcpkg.exe') {
             C:\vcpkg\vcpkg.exe install pkgconf:x64-windows
@@ -369,9 +378,12 @@ jobs:
           # Fails the step loudly if neither path produced a usable pkg-config.
           pkg-config --version
 
-      - name: Build libvpx 1.12.0 via vcpkg (matches pre-generated bindings)
+      - name: Fetch vendored libvpx 1.12.0 (matches pre-generated bindings)
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          $ErrorActionPreference = 'Stop'
           # We DON'T enable `vp9-444-bindgen` on Windows because bindgen
           # 0.68.1 + libclang on Windows has a regression that opaques
           # `vpx_codec_enc_cfg` (forward-declared in vpx_codec.h's union
@@ -381,175 +393,71 @@ jobs:
           # libvpx-version issue, it's a Windows-libclang issue.
           #
           # Workaround: skip bindgen entirely. env-libvpx-sys ships
-          # pre-generated FFI for libvpx 1.3.0–1.13.0 (look in
-          # ~/.cargo/registry/src/.../env-libvpx-sys-5.1.3/generated/).
-          # build.rs picks the file matching pkg-config's reported
-          # version EXACTLY. We pin to 1.12.0 because vcpkg has it (the
-          # 1.13.0 entry was bumped to 1.13.1, which env-libvpx-sys
-          # doesn't ship a pre-generated file for).
-          # windows-latest pre-installs vcpkg at C:\vcpkg. Reuse it if
-          # present (skip clone + bootstrap), otherwise install fresh.
-          if (-not (Test-Path 'C:\vcpkg\vcpkg.exe')) {
-            git clone https://github.com/microsoft/vcpkg.git C:\vcpkg
-            C:\vcpkg\bootstrap-vcpkg.bat -disableMetrics
-          } else {
-            Write-Host "Using pre-installed vcpkg at C:\vcpkg"
-          }
-          # Need full history to resolve the 1.12.0 baseline (the
-          # baseline commit must contain the version-specific git-tree
-          # entry vcpkg looks up). `git fetch --unshallow` errors on
-          # already-complete repos, so probe first.
-          if ((git -C C:\vcpkg rev-parse --is-shallow-repository) -eq 'true') {
-            git -C C:\vcpkg fetch --unshallow
-          } else {
-            git -C C:\vcpkg fetch --tags
-          }
-          New-Item -ItemType Directory -Path C:\vpx-pin -Force | Out-Null
-          @'
-          {
-            "name": "roomler-vpx-pin",
-            "version": "0.0.1",
-            "dependencies": [{"name": "libvpx", "version>=": "1.12.0"}],
-            "overrides":    [{"name": "libvpx", "version":   "1.12.0"}],
-            "builtin-baseline": "4d73751b3428ef49a7ac5d5df696b92e302de993"
-          }
-          '@ | Set-Content -Encoding utf8 C:\vpx-pin\vcpkg.json
-          Push-Location C:\vpx-pin
-          C:\vcpkg\vcpkg.exe install --triplet=x64-windows --x-install-root=C:\vpx-pin\installed
-          Pop-Location
+          # pre-generated FFI for libvpx 1.3.0–1.13.0 and its build.rs
+          # picks the file matching pkg-config's reported version EXACTLY
+          # — hence the 1.12.0 pin. Built once by vendor-libvpx-windows.yml
+          # (same manifest/baseline/triplet the inline vcpkg build used)
+          # and fetched here in seconds instead of ~5 min of vcpkg compile
+          # per tag — same pattern as the vendored FFmpeg below.
+          $dl = "$env:RUNNER_TEMP\vpxdl"
+          gh release download vendored-libvpx-1.12.0 --repo "${{ github.repository }}" `
+            --pattern 'libvpx-1.12.0-win64-msvc.zip*' --dir $dl
+          $zip = "$dl\libvpx-1.12.0-win64-msvc.zip"
+          $expected = ((Get-Content "$zip.sha256" -Raw).Trim() -split '\s+')[0].ToLower()
+          $actual = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+          if ($actual -ne $expected) { Write-Host "::error::vendored libvpx sha256 mismatch (got $actual, want $expected)"; exit 1 }
+          # Extract to the EXACT tree the old inline vcpkg build produced so
+          # the baked .pc paths + the env exports below stay valid.
+          $root = 'C:\vpx-pin\installed\x64-windows'
+          New-Item -ItemType Directory -Path $root -Force | Out-Null
+          tar -xf $zip -C $root
+          if (-not (Test-Path "$root\lib\pkgconfig\vpx.pc")) { Write-Host "::error::vpx.pc missing after extract"; exit 1 }
           # Expose the install dir to subsequent steps.
           "PKG_CONFIG_PATH=C:/vpx-pin/installed/x64-windows/lib/pkgconfig" | Out-File -FilePath $env:GITHUB_ENV -Append
-          # libvpx ships as DLL on x64-windows; copy alongside the agent
-          # binary so encoder-smoke + the MSI bundle find it at runtime.
-          # The MSI will pick up the DLL via the harvested target dir.
+          # The x64-windows libvpx port yields a static .lib only (no DLL),
+          # so the staging step below no-ops; the env stays for the day the
+          # port grows a bin/ again.
           "VPX_DLL_DIR=C:/vpx-pin/installed/x64-windows/bin" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       # =======================================================================
-      # rc.65: Option B HEVC plan — install FFmpeg via vcpkg so ffmpeg-next
-      # 8.x can link against it. Cold build is 25-40 min (FFmpeg + ffnvcodec +
-      # intel-media-sdk + amf), so the cache is load-bearing. Cache key
-      # composition follows the critique's recommendation: deps content hash
-      # plus the triplet, so a port-edit invalidates the cache cleanly.
-      #
-      # `nvcodec` pulls ffnvcodec headers (NVIDIA Video Codec SDK headers
-      # only — NVENC itself loads at runtime from the user's NVIDIA driver,
-      # so no extra MSI bytes for NVIDIA users).
-      # `qsv` pulls intel-media-sdk → static libmfx (~3-5 MB, statically
-      # linked into the agent).
-      # `amf` pulls amf headers (AMD AMF runtime DLL loaded from driver).
-      # `libvpx` opt-in builds libvpx into FFmpeg so `libvpx-vp9` is
-      # available as a SW fallback (separate from our existing
-      # env-libvpx-sys binding which talks to libvpx directly).
+      # rc.65 Option B HEVC → ffmpeg-next 8.x links a static-md FFmpeg
+      # (avcodec/…/nvcodec/qsv/amf/vpx, LGPL — no GPL x264/x265). Until
+      # rc.179 this was a 25-40 min inline vcpkg build behind an
+      # actions/cache that was BOTH structurally unreliable for tag runs
+      # (caches save on the tag ref; a future tag can only restore own-ref
+      # or default-branch caches, and nothing ever seeded master) AND
+      # LRU-evicted by the repo's blown 10 GB cache budget — rc.176
+      # measured a 29-min rebuild on a miss. Now built ONCE by
+      # vendor-ffmpeg-windows.yml (identical manifest/baseline/triplet,
+      # LGPL-verified) and fetched from the vendored-ffmpeg-8.1.2 release
+      # in seconds. Re-dispatch that workflow when bumping FFmpeg.
       # =======================================================================
-      - name: Compute FFmpeg vcpkg cache key
-        id: ffmpeg_cache_key
+      - name: Fetch vendored FFmpeg 8.1.2 (win64 static-md, LGPL)
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          # Cache key invalidates when: vcpkg baseline changes, our feature
-          # set changes, or the agent crate version changes (defensive
-          # against a port-edit slipping past the manifest diff).
-          # rc.67 hotfix: rc.66 failed with "no version database entry for
-          # vcpkg-tool-meson at 1.9.0#8". Root cause: the pre-installed
-          # vcpkg's working tree is at an older commit than my baseline
-          # references — its version database doesn't know about the version
-          # entries my baseline expects. Fix: add explicit `git fetch +
-          # reset --hard` step to bring local vcpkg to the same commit as my
-          # baseline (pinned to the most recent ffmpeg-port commit
-          # `ccab4e210c...`, 2026-05-08, which ships ffmpeg 8.1.1+cbs-backport).
-          $manifest = @"
-          {
-            "name": "roomler-ffmpeg-pin",
-            "version": "0.0.1",
-            "dependencies": [
-              {"name": "ffmpeg", "features": ["avcodec", "avformat", "avfilter", "avdevice", "swresample", "swscale", "nvcodec", "qsv", "amf", "vpx"]}
-            ],
-            "builtin-baseline": "ccab4e210cbfb237aab29423a63108958949ef3c"
+          $ErrorActionPreference = 'Stop'
+          $dl = "$env:RUNNER_TEMP\ffdl"
+          gh release download vendored-ffmpeg-8.1.2 --repo "${{ github.repository }}" `
+            --pattern 'ffmpeg-8.1.2-win64-msvc-static-md-lgpl.zip*' --dir $dl
+          $zip = "$dl\ffmpeg-8.1.2-win64-msvc-static-md-lgpl.zip"
+          $expected = ((Get-Content "$zip.sha256" -Raw).Trim() -split '\s+')[0].ToLower()
+          $actual = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+          if ($actual -ne $expected) { Write-Host "::error::vendored FFmpeg sha256 mismatch (got $actual, want $expected)"; exit 1 }
+          # Extract to the EXACT tree the old inline vcpkg build produced so
+          # the baked .pc paths + every downstream step (PKG_CONFIG_PATH
+          # append, static-md no-op DLL staging) stay valid. bsdtar handles
+          # zip and is much faster than Expand-Archive. (If bsdtar ever
+          # chokes on Compress-Archive's backslash entry names, swap to
+          # Expand-Archive — the .pc assert below catches it loudly.)
+          $root = 'C:\ffmpeg-pin\installed\x64-windows-static-md'
+          New-Item -ItemType Directory -Path $root -Force | Out-Null
+          tar -xf $zip -C $root
+          foreach ($pc in 'libavcodec.pc', 'libavutil.pc') {
+            if (-not (Test-Path "$root\lib\pkgconfig\$pc")) { Write-Host "::error::$pc missing after extract"; exit 1 }
           }
-          "@
-          $hash = (Get-FileHash -Algorithm SHA256 -InputStream ([IO.MemoryStream]::new([Text.Encoding]::UTF8.GetBytes($manifest)))).Hash.Substring(0, 12)
-          # rc.76: bumped cache key to v2 because the triplet changed from
-          # x64-windows (dynamic, DLLs) to x64-windows-static-md (static
-          # libs). Same manifest content but different cached artifacts.
-          $key = "ffmpeg-vcpkg-v2-static-md-$hash"
-          Write-Host "FFmpeg cache key: $key"
-          "key=$key" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          # Stash the manifest content for the install step.
-          $manifest | Out-File -Encoding utf8 ffmpeg_manifest.json
-          "FFMPEG_MANIFEST_PATH=$((Get-Location).Path)\ffmpeg_manifest.json" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      - name: Restore FFmpeg vcpkg cache
-        id: ffmpeg_cache
-        uses: actions/cache@v4
-        continue-on-error: true
-        with:
-          path: |
-            C:\ffmpeg-pin\installed
-            C:\ffmpeg-pin\vcpkg.json
-          key: ${{ steps.ffmpeg_cache_key.outputs.key }}
-
-      - name: Update local vcpkg to match FFmpeg baseline
-        # rc.67 hotfix: the pre-installed vcpkg's working tree is at an older
-        # commit than my manifest baseline references. vcpkg's version DB
-        # depends on the working tree — entries my baseline expects (e.g.,
-        # vcpkg-tool-meson@1.9.0#8) don't exist in the older tree. Fix:
-        # fetch + reset --hard to bring local vcpkg up to the baseline commit.
-        # libvpx step's install is already in C:\vpx-pin\installed — separate
-        # tree, untouched by this checkout.
-        shell: pwsh
-        run: |
-          cd C:\vcpkg
-          # libvpx step already did fetch --tags / --unshallow, so origin
-          # is current. Reset to my chosen baseline.
-          git fetch origin
-          git reset --hard ccab4e210cbfb237aab29423a63108958949ef3c
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "::error::Failed to checkout vcpkg to baseline ccab4e21. Either the commit doesn't exist on origin or git operations failed."
-            exit 1
-          }
-          # Re-bootstrap vcpkg.exe if it's missing (it gets blown away by
-          # `git reset --hard` if the commit predates the precompiled exe).
-          if (-not (Test-Path .\vcpkg.exe)) {
-            Write-Host "vcpkg.exe missing after reset — bootstrapping"
-            .\bootstrap-vcpkg.bat -disableMetrics
-          }
-          .\vcpkg.exe version
-
-      - name: Build FFmpeg via vcpkg (encode-only HW backends)
-        shell: pwsh
-        run: |
-          if (Test-Path 'C:\ffmpeg-pin\installed\x64-windows-static-md\lib\pkgconfig\libavcodec.pc') {
-            Write-Host "FFmpeg already installed (cache hit) — skipping vcpkg build"
-          } else {
-            Write-Host "Cold build — installing FFmpeg via vcpkg (expect 25-40 min)"
-            New-Item -ItemType Directory -Path C:\ffmpeg-pin -Force | Out-Null
-            Copy-Item $env:FFMPEG_MANIFEST_PATH C:\ffmpeg-pin\vcpkg.json -Force
-            Push-Location C:\ffmpeg-pin
-            # rc.76: switched from x64-windows (dynamic, DLLs) to
-            # x64-windows-static-md (static libs + dynamic MS runtime,
-            # Rust-compatible). Pre-rc.72 the FFmpeg link was effectively
-            # dead-stripped (no symbols called from non-test paths), so
-            # x64-windows shipped DLL-less MSIs that happened to work.
-            # rc.72 added actual FFmpeg calls in FfmpegEncoder, so the
-            # link became real and the missing-DLL bug surfaced at
-            # install time (avcodec-62.dll not found). Static linkage
-            # bundles FFmpeg into the EXE — no DLLs to ship.
-            C:\vcpkg\vcpkg.exe install --triplet=x64-windows-static-md --x-install-root=C:\ffmpeg-pin\installed
-            if ($LASTEXITCODE -ne 0) {
-              Write-Host "::error::vcpkg install ffmpeg failed — see logs above. rc.67 cannot proceed without this."
-              exit 1
-            }
-            Pop-Location
-          }
-          # Verify the pkg-config files we need actually landed.
-          $required = @('libavcodec.pc', 'libavutil.pc')
-          foreach ($pc in $required) {
-            $p = "C:\ffmpeg-pin\installed\x64-windows-static-md\lib\pkgconfig\$pc"
-            if (-not (Test-Path $p)) {
-              Write-Host "::error::Expected pkg-config file missing: $p"
-              exit 1
-            }
-          }
-          Write-Host "FFmpeg pkg-config files present at C:\ffmpeg-pin\installed\x64-windows-static-md\lib\pkgconfig\"
+          Write-Host "FFmpeg pkg-config files present at $root\lib\pkgconfig\"
 
       - name: Append FFmpeg to PKG_CONFIG_PATH + DLL PATH
         shell: pwsh
@@ -587,6 +495,11 @@ jobs:
         with:
           workspaces: '. -> target'
           shared-key: agent-windows-vp9-444
+          # Tag-ref cache saves can never be restored by a future tag run
+          # (GH cache isolation: own ref or default branch only). Only
+          # non-tag runs (workflow_dispatch rehearsals on master) save —
+          # seeding the cache every subsequent tag build restores.
+          save-if: ${{ github.ref_type != 'tag' }}
 
       - name: Install WiX Toolset v3
         shell: pwsh
@@ -647,14 +560,24 @@ jobs:
         # ffmpeg-next's FFI to assert libavcodec version is FFmpeg 7+.
         # This is the load-bearing verification step for rc.65: if the
         # link is wrong or symbols don't match, this test fails before
-        # MSI packaging starts. Keeps CI iteration tight.
+        # MSI packaging starts.
+        #
+        # --release + the SAME feature set as the `Build agent` step above
+        # (keep the two in LOCKSTEP) so cargo reuses the release dep
+        # artifacts instead of recompiling the whole graph in debug — the
+        # old form (debug, `ffmpeg-encoder` only) cost ~7-9 min per tag.
+        # Not a total reuse: dev-dep tokio-test enables tokio/test-util, so
+        # the tokio-downstream subgraph rebuilds once in the test graph;
+        # the expensive rest (windows-rs, ring, ffmpeg-sys bindgen, C
+        # codec builds) is reused.
         shell: pwsh
         env:
           RUST_LOG: roomler_agent=debug,info
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
         run: |
-          cargo test -p roomler-agent --lib --features ffmpeg-encoder encode::ffmpeg::tests::libavcodec_version_is_ffmpeg_7_or_newer -- --nocapture
+          cargo test -p roomler-agent --lib --release --features "full-hw,vp9-444,system-context,ffmpeg-encoder,overlay-l3,overlay-netstack" encode::ffmpeg::tests::libavcodec_version_is_ffmpeg_7_or_newer -- --nocapture
           if ($LASTEXITCODE -ne 0) {
-            Write-Host "::error::FFmpeg link verification failed. ffmpeg-next + vcpkg ffmpeg version pair is incompatible — re-pin one of them in agents/roomler-agent/Cargo.toml or the cache key step above."
+            Write-Host "::error::FFmpeg link verification failed. ffmpeg-next + the vendored FFmpeg version pair is incompatible — re-pin one of them (agents/roomler-agent/Cargo.toml, or re-vendor via vendor-ffmpeg-windows.yml)."
             exit 1
           }
 
@@ -821,12 +744,107 @@ jobs:
             Write-Host "::notice::MSI delta within +8 MB budget — Option B size target met."
           }
 
-      # rc.18: build the Tauri tray companion alongside the agent.
-      # Tray's Cargo.toml uses `frontendDist: "../src/front"` pointing
-      # at static HTML/CSS/JS — no front-end bundler step needed.
-      # The build.rs generates placeholder icons if missing so this
-      # works without an offline icon-prep step. Released as a plain
-      # EXE for rc.18; cargo-tauri MSI bundling defers to rc.19.
+      # Tray + installer wizard EXEs are built by the parallel
+      # `build-windows-companions` job below (they only need the agent's
+      # DEFAULT feature graph — no vcpkg/FFmpeg/libvpx — and used to add
+      # ~9 min of serial tail here).
+
+      - name: Authenticode sign (per-User + per-Machine MSIs)
+        if: env.WIN_CODESIGN_PFX_BASE64 != ''
+        shell: pwsh
+        env:
+          WIN_CODESIGN_PFX_BASE64: ${{ secrets.WIN_CODESIGN_PFX_BASE64 }}
+          WIN_CODESIGN_PASSWORD:   ${{ secrets.WIN_CODESIGN_PASSWORD }}
+        run: |
+          $pfxPath = Join-Path $env:RUNNER_TEMP "codesign.pfx"
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WIN_CODESIGN_PFX_BASE64))
+
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" |
+                      Sort-Object FullName -Descending | Select-Object -First 1
+          & $signtool.FullName sign `
+              /f $pfxPath `
+              /p $env:WIN_CODESIGN_PASSWORD `
+              /fd SHA256 `
+              /tr http://timestamp.digicert.com `
+              /td SHA256 `
+              "${{ steps.locate.outputs.artifact }}" `
+              "${{ steps.locate_pm.outputs.artifact }}"
+
+          Remove-Item $pfxPath -Force
+
+      - name: Warn on unsigned build
+        if: env.WIN_CODESIGN_PFX_BASE64 == ''
+        shell: bash
+        run: echo "::warning::WIN_CODESIGN_PFX_BASE64 not set — MSIs are unsigned. SmartScreen will flag 'Unknown publisher'."
+        env:
+          WIN_CODESIGN_PFX_BASE64: ${{ secrets.WIN_CODESIGN_PFX_BASE64 }}
+
+      - name: SHA256 checksum (both MSIs)
+        shell: pwsh
+        run: |
+          $files = @(
+            "${{ steps.locate.outputs.artifact }}",
+            "${{ steps.locate_pm.outputs.artifact }}"
+          )
+          foreach ($f in $files) {
+            $hash = (Get-FileHash -Algorithm SHA256 $f).Hash.ToLower()
+            "$hash  $f" | Out-File -Encoding ascii "$f.sha256"
+          }
+
+      - name: Upload artifacts (per-User + per-Machine MSIs)
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-msi
+          path: |
+            ${{ steps.locate.outputs.artifact }}
+            ${{ steps.locate.outputs.artifact }}.sha256
+            ${{ steps.locate_pm.outputs.artifact }}
+            ${{ steps.locate_pm.outputs.artifact }}.sha256
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # 2b. Windows companions — tray + installer wizard EXEs, built in PARALLEL
+  #     with the MSI job. Both crates dep on roomler-agent with DEFAULT
+  #     features (`default = []`, signalling-only), so this job needs no
+  #     vcpkg / FFmpeg / libvpx / LLVM — precedent: release-tunnel-wizard.yml
+  #     builds Tauri 2 + the agent-default graph on a bare windows-latest.
+  #     The MSIs never contained these EXEs (they ship standalone), so the
+  #     split changes wall-clock only.
+  # ---------------------------------------------------------------------------
+  build-windows-companions:
+    name: Build tray + installer EXEs (Windows x86_64)
+    needs: validate-version
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      VERSION: ${{ needs.validate-version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Cache cargo
+        # `continue-on-error: true` so a flaky cache save can't sink an
+        # otherwise-green build (same rationale as the sibling jobs).
+        # shared-key reuses installer-smoke's master-seeded cache — same
+        # rustc pin + lockfile → same derived key, and installer-smoke
+        # runs on master pushes so its cache IS restorable here (unlike
+        # anything saved on a tag ref). save-if: only non-tag runs
+        # (dispatch rehearsals on master) save, enriching that key with
+        # the Tauri artifacts this job compiles.
+        continue-on-error: true
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+          shared-key: installer-smoke-windows
+          save-if: ${{ github.ref_type != 'tag' }}
+
+      # rc.18: the Tauri tray companion. Tray's Cargo.toml uses
+      # `frontendDist: "../src/front"` pointing at static HTML/CSS/JS —
+      # no front-end bundler step needed. The build.rs generates
+      # placeholder icons if missing so this works without an offline
+      # icon-prep step. Released as a plain EXE.
       - name: Build tray binary (release)
         shell: pwsh
         run: cargo build -p roomler-agent-tray --release
@@ -846,12 +864,12 @@ jobs:
         env:
           WIN_CODESIGN_PFX_BASE64: ${{ secrets.WIN_CODESIGN_PFX_BASE64 }}
 
-      # rc.28: build the installer wizard EXE. Like the tray, it ships
-      # as a plain Authenticode-signed `.exe` operators double-click;
-      # MSI bundling deferred. The lib target is named `wizard_core`
-      # (NOT `roomler_installer`) so cargo's test-binary names dodge
-      # Windows UAC's "installer detection" filename heuristic; the
-      # user-facing bin EXE keeps the marketing-friendly name.
+      # rc.28: the installer wizard EXE. Ships as a plain
+      # Authenticode-signed `.exe` operators double-click; MSI bundling
+      # deferred. The lib target is named `wizard_core` (NOT
+      # `roomler_installer`) so cargo's test-binary names dodge Windows
+      # UAC's "installer detection" filename heuristic; the user-facing
+      # bin EXE keeps the marketing-friendly name.
       - name: Build installer wizard EXE (release)
         shell: pwsh
         run: cargo build -p roomler-installer --release
@@ -871,7 +889,7 @@ jobs:
         env:
           WIN_CODESIGN_PFX_BASE64: ${{ secrets.WIN_CODESIGN_PFX_BASE64 }}
 
-      - name: Authenticode sign (MSIs + tray + installer wizard)
+      - name: Authenticode sign (tray + installer wizard)
         if: env.WIN_CODESIGN_PFX_BASE64 != ''
         shell: pwsh
         env:
@@ -895,8 +913,6 @@ jobs:
               /fd SHA256 `
               /tr http://timestamp.digicert.com `
               /td SHA256 `
-              "${{ steps.locate.outputs.artifact }}" `
-              "${{ steps.locate_pm.outputs.artifact }}" `
               "${{ steps.locate_tray.outputs.artifact }}" `
               "${{ steps.locate_installer.outputs.artifact }}"
 
@@ -905,16 +921,14 @@ jobs:
       - name: Warn on unsigned build
         if: env.WIN_CODESIGN_PFX_BASE64 == ''
         shell: bash
-        run: echo "::warning::WIN_CODESIGN_PFX_BASE64 not set — MSIs + tray + installer EXEs are unsigned. SmartScreen will flag 'Unknown publisher' and ESET may quarantine the installer."
+        run: echo "::warning::WIN_CODESIGN_PFX_BASE64 not set — tray + installer EXEs are unsigned. SmartScreen will flag 'Unknown publisher' and ESET may quarantine the installer."
         env:
           WIN_CODESIGN_PFX_BASE64: ${{ secrets.WIN_CODESIGN_PFX_BASE64 }}
 
-      - name: SHA256 checksum (all 4 artifacts)
+      - name: SHA256 checksum (both EXEs)
         shell: pwsh
         run: |
           $files = @(
-            "${{ steps.locate.outputs.artifact }}",
-            "${{ steps.locate_pm.outputs.artifact }}",
             "${{ steps.locate_tray.outputs.artifact }}",
             "${{ steps.locate_installer.outputs.artifact }}"
           )
@@ -923,15 +937,11 @@ jobs:
             "$hash  $f" | Out-File -Encoding ascii "$f.sha256"
           }
 
-      - name: Upload artifacts (per-User + per-Machine + tray + installer)
+      - name: Upload artifacts (tray + installer)
         uses: actions/upload-artifact@v4
         with:
-          name: windows-msi
+          name: windows-companions
           path: |
-            ${{ steps.locate.outputs.artifact }}
-            ${{ steps.locate.outputs.artifact }}.sha256
-            ${{ steps.locate_pm.outputs.artifact }}
-            ${{ steps.locate_pm.outputs.artifact }}.sha256
             ${{ steps.locate_tray.outputs.artifact }}
             ${{ steps.locate_tray.outputs.artifact }}.sha256
             ${{ steps.locate_installer.outputs.artifact }}
@@ -978,6 +988,11 @@ jobs:
         with:
           workspaces: '. -> target'
           shared-key: agent-macos
+          # Tag-ref cache saves can never be restored by a future tag run
+          # (GH cache isolation: own ref or default branch only). Only
+          # non-tag runs (workflow_dispatch rehearsals on master) save —
+          # seeding the cache every subsequent tag build restores.
+          save-if: ${{ github.ref_type != 'tag' }}
 
       - name: Install system deps
         # libvpx for the `vp9-444` feature; pkg-config for the
@@ -1209,7 +1224,7 @@ jobs:
   release:
     name: Publish GitHub Release
     if: needs.validate-version.outputs.is_release == 'true'
-    needs: [validate-version, build-linux, build-windows, build-macos]
+    needs: [validate-version, build-linux, build-windows, build-windows-companions, build-macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -1223,9 +1238,10 @@ jobs:
         run: |
           mkdir -p release
           # rc.18: include `.exe` so the tray companion EXE makes
-          # the GitHub Release alongside the agent MSI/.pkg/.deb. The
-          # `windows-msi` artifact bundles agent MSIs + tray EXE +
-          # all .sha256 files; flatten preserves them all.
+          # the GitHub Release alongside the agent MSI/.pkg/.deb.
+          # `windows-msi` carries the two agent MSIs; `windows-companions`
+          # carries the tray + installer EXEs; flatten is extension-based
+          # so both artifact dirs (+ all .sha256 files) land unchanged.
           find dist -type f \( -name '*.msi' -o -name '*.pkg' -o -name '*.deb' -o -name '*.exe' -o -name '*.sha256' \) \
             -exec mv {} release/ \;
           ls -la release/
