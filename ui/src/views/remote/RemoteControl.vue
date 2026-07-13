@@ -2396,7 +2396,13 @@ const statsCodecLabel = computed(() => {
     const chromaName = vi.chroma === 'yuv444' ? '4:4:4' : vi.chroma === 'yuv420' ? '4:2:0' : ''
     const hw = vi.hardware ? 'HW' : 'SW'
     const enc = vi.encoder ? ` (${vi.encoder})` : ''
-    return [codecName, chromaName, hw].filter(Boolean).join(' ') + enc
+    // Relay-escape — show WHICH ICE path this session took ("relay" =
+    // TURN-relayed → bitrate-clamped + extra RTT; "direct" = P2P). The
+    // agent re-sends video-info when the path changes mid-session, so
+    // this suffix flips live. Empty from agents older than the field.
+    const path =
+      vi.transport === 'relay' ? ' · relay' : vi.transport === 'direct' ? ' · direct' : ''
+    return [codecName, chromaName, hw].filter(Boolean).join(' ') + enc + path
   }
   // Fallback when the agent hasn't sent video-info (legacy track /
   // libvpx VP9-444 path). Derive chroma from the USER's selection
