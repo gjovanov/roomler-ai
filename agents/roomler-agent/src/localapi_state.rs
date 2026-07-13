@@ -9,7 +9,7 @@
 //! created there (stable across WS reconnects), the signaling loop updates them,
 //! and the listener reads this state.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -172,6 +172,9 @@ impl LocalApiState for DaemonState {
             return Vec::new();
         }
         let mut peers = self.overlay.borrow().peers.clone();
+        // P3b-3: overlay a peer as `Tunnel` when its WG carrier is down and the
+        // daemon reaches its backing agent via a live tunnel flow.
+        apply_tunnel_override(&mut peers, &self.tunnel_hub.active_flow_agent_ids());
         // P3b-3: fill `rtt_ms` from the ICMP prober cache (netstack nodes only).
         // A stale entry (peer stopped answering) is dropped so the column fades
         // to "—" rather than lying. Empty cache (no prober) → all stay `None`.
@@ -290,6 +293,27 @@ impl LocalApiState for DaemonState {
     }
 }
 
+/// Overlay [`ConnectionType::Tunnel`] onto every peer whose WG carrier is down
+/// (`Blocked`/`Offline`) but whose backing `agent_id` is in `tunneled` — the set
+/// of agent ids reached by a live daemon tunnel flow (P3b-3). Pure so the
+/// precedence (Direct > Relay > **Tunnel** > Blocked > Offline — Tunnel never
+/// masks a live WG carrier) is unit-tested without a hub. No-op on empty
+/// `tunneled`.
+fn apply_tunnel_override(peers: &mut [PeerInfo], tunneled: &HashSet<String>) {
+    if tunneled.is_empty() {
+        return;
+    }
+    for p in peers.iter_mut() {
+        let gap = matches!(
+            p.connection,
+            ConnectionType::Blocked | ConnectionType::Offline
+        );
+        if gap && p.agent_id.as_deref().is_some_and(|a| tunneled.contains(a)) {
+            p.connection = ConnectionType::Tunnel;
+        }
+    }
+}
+
 /// Spawn the RTT prober (P3b-3): every [`RTT_PROBE_INTERVAL`], ICMP-ping each
 /// carrier-reachable peer over the userspace netstack and cache the round-trip
 /// so `peers()` can surface `rtt_ms`. Only meaningful on a netstack node (the
@@ -368,6 +392,7 @@ mod tests {
                 connection: ConnectionType::Relay,
                 rtt_ms: None,
                 last_seen_ms: None,
+                agent_id: None,
             }],
         }
     }
@@ -525,5 +550,43 @@ mod tests {
         // Empty cache → None.
         cache.lock().unwrap().clear();
         assert_eq!(st.peers()[0].rtt_ms, None);
+    }
+
+    #[test]
+    fn tunnel_override_only_fills_carrier_gaps_and_respects_precedence() {
+        fn peer(agent: Option<&str>, conn: ConnectionType) -> PeerInfo {
+            PeerInfo {
+                node_id: "n".into(),
+                name: "p".into(),
+                overlay_ip: None,
+                overlay_ip6: None,
+                online: true,
+                connection: conn,
+                rtt_ms: None,
+                last_seen_ms: None,
+                agent_id: agent.map(|s| s.into()),
+            }
+        }
+        let tunneled: HashSet<String> = ["aid-1".to_string()].into_iter().collect();
+        let mut peers = vec![
+            peer(Some("aid-1"), ConnectionType::Blocked), // → Tunnel (gap + live flow)
+            peer(Some("aid-1"), ConnectionType::Offline), // → Tunnel (gap + live flow)
+            peer(Some("aid-1"), ConnectionType::Direct),  // stays Direct (carrier wins)
+            peer(Some("aid-1"), ConnectionType::Relay),   // stays Relay (carrier wins)
+            peer(Some("aid-2"), ConnectionType::Blocked), // stays Blocked (no flow)
+            peer(None, ConnectionType::Blocked),          // stays Blocked (no agent_id)
+        ];
+        apply_tunnel_override(&mut peers, &tunneled);
+        assert_eq!(peers[0].connection, ConnectionType::Tunnel);
+        assert_eq!(peers[1].connection, ConnectionType::Tunnel);
+        assert_eq!(peers[2].connection, ConnectionType::Direct);
+        assert_eq!(peers[3].connection, ConnectionType::Relay);
+        assert_eq!(peers[4].connection, ConnectionType::Blocked);
+        assert_eq!(peers[5].connection, ConnectionType::Blocked);
+
+        // Empty tunneled set → untouched.
+        let mut p2 = vec![peer(Some("aid-1"), ConnectionType::Blocked)];
+        apply_tunnel_override(&mut p2, &HashSet::new());
+        assert_eq!(p2[0].connection, ConnectionType::Blocked);
     }
 }
