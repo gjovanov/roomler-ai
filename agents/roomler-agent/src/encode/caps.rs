@@ -289,6 +289,17 @@ fn compute_caps() -> AgentCaps {
         audio.push("opus".into());
     }
 
+    // Remote app selection & launch (virtual-desktop hosts). Advertised
+    // only when this process can actually manage a desktop (Linux VD
+    // mode) AND the operator hasn't disabled it; the browser gates its
+    // Apps menu on this list. Older agents omit the field → menu hidden.
+    let mut apps: Vec<String> = Vec::new();
+    if crate::apps::apps_supported() {
+        apps.push("list".into());
+        apps.push("focus".into());
+        apps.push("launch".into());
+    }
+
     AgentCaps {
         hw_encoders,
         codecs,
@@ -300,6 +311,7 @@ fn compute_caps() -> AgentCaps {
         files,
         vp9_chroma,
         audio,
+        apps,
     }
 }
 
