@@ -100,6 +100,10 @@ jobs:
         with:
           workspaces: '. -> target'
           shared-key: tunnel-linux
+          # Tag-ref cache saves can never be restored by a future tag run
+          # (GH cache isolation: own ref or default branch only) — only
+          # non-tag runs (dispatch rehearsals on master) save.
+          save-if: ${{ github.ref_type != 'tag' }}
       - name: Install cargo-deb
         run: cargo install cargo-deb --locked
       - name: Build roomler-tunnel (release)
@@ -165,6 +169,10 @@ jobs:
         with:
           workspaces: '. -> target'
           shared-key: tunnel-macos
+          # Tag-ref cache saves can never be restored by a future tag run
+          # (GH cache isolation: own ref or default branch only) — only
+          # non-tag runs (dispatch rehearsals on master) save.
+          save-if: ${{ github.ref_type != 'tag' }}
       - name: Build roomler-tunnel x86_64
         run: cargo build -p roomler-tunnel --release --target x86_64-apple-darwin
       - name: Build roomler-tunnel aarch64
@@ -218,6 +226,10 @@ jobs:
         with:
           workspaces: '. -> target'
           shared-key: tunnel-windows
+          # Tag-ref cache saves can never be restored by a future tag run
+          # (GH cache isolation: own ref or default branch only) — only
+          # non-tag runs (dispatch rehearsals on master) save.
+          save-if: ${{ github.ref_type != 'tag' }}
       - name: Build roomler-tunnel (release)
         shell: pwsh
         run: cargo build -p roomler-tunnel --release
