@@ -30,6 +30,7 @@ pub mod logging;
 pub mod logs_fetch;
 pub mod logs_upload;
 pub mod machine;
+pub mod mdns_resolve;
 pub mod notify;
 #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
 pub mod overlay;
