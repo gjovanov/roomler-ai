@@ -35,6 +35,11 @@ import {
   nextReconnectDelayMs,
   nextDirPath,
   parseControlInbound,
+  parseAppsListReply,
+  parseAppsActionReply,
+  appsListWireMessage,
+  appsFocusWireMessage,
+  appsLaunchWireMessage,
   type KeyDecision,
 } from '@/composables/useRemoteControl'
 import { codecMimeForShort } from '@/workers/rc-webcodecs-worker'
@@ -1561,6 +1566,147 @@ describe('parseControlInbound', () => {
       '{"t":"rc:logs-fetch.reply","ok":true,"truncated":"yes"}'
     )
     expect(r).toEqual({ kind: 'logs_fetch_reply', reply: { ok: true } })
+  })
+})
+
+// rc.NEXT — remote app selection & launch (virtual-desktop hosts). The
+// Apps menu is driven entirely by these pure parsers + wire builders, so
+// they carry the wire-format invariants.
+describe('parseAppsListReply', () => {
+  it('parses a full list reply with windows + launchable', () => {
+    const reply = parseAppsListReply({
+      t: 'rc:apps.list.reply',
+      id: 'a1',
+      ok: true,
+      supported: true,
+      windows: [
+        { window_id: '0x1', title: 'Terminal (main)', session: 'main', focused: true },
+        { window_id: '0x2', title: 'htop', app_key: 'htop', focused: false },
+      ],
+      launchable: [{ key: 'bash', label: 'New bash session' }],
+    })
+    expect(reply.ok).toBe(true)
+    expect(reply.supported).toBe(true)
+    expect(reply.windows).toEqual([
+      { window_id: '0x1', title: 'Terminal (main)', session: 'main', focused: true },
+      { window_id: '0x2', title: 'htop', app_key: 'htop', focused: false },
+    ])
+    expect(reply.launchable).toEqual([{ key: 'bash', label: 'New bash session' }])
+  })
+
+  it('defaults ok/supported to false and arrays to empty when missing (version skew)', () => {
+    const reply = parseAppsListReply({ t: 'rc:apps.list.reply' })
+    expect(reply).toEqual({ ok: false, supported: false, windows: [], launchable: [] })
+  })
+
+  it('filters malformed window + launchable entries', () => {
+    const reply = parseAppsListReply({
+      ok: true,
+      supported: true,
+      windows: [
+        { window_id: '0x1', title: 'ok', focused: false },
+        { window_id: 42, title: 'bad id' },
+        { title: 'no id' },
+        'not-an-object',
+      ],
+      launchable: [{ key: 'bash', label: 'Bash' }, { key: 'x' }, { label: 'y' }],
+    })
+    expect(reply.windows).toEqual([{ window_id: '0x1', title: 'ok', focused: false }])
+    expect(reply.launchable).toEqual([{ key: 'bash', label: 'Bash' }])
+  })
+
+  it('carries an error string when present and coerces non-boolean focused', () => {
+    const reply = parseAppsListReply({
+      ok: false,
+      supported: true,
+      error: 'wmctrl not installed',
+      windows: [{ window_id: '0x1', title: 't', focused: 'yes' }],
+    })
+    expect(reply.error).toBe('wmctrl not installed')
+    expect(reply.windows[0].focused).toBe(false)
+  })
+})
+
+describe('parseAppsActionReply', () => {
+  it('parses focus/launch ok replies with optional window_id', () => {
+    expect(parseAppsActionReply({ ok: true })).toEqual({ ok: true })
+    expect(parseAppsActionReply({ ok: true, window_id: '0xNEW' })).toEqual({
+      ok: true,
+      window_id: '0xNEW',
+    })
+  })
+
+  it('parses error replies and coerces non-boolean ok to false', () => {
+    expect(parseAppsActionReply({ ok: false, error: 'no such window' })).toEqual({
+      ok: false,
+      error: 'no such window',
+    })
+    expect(parseAppsActionReply({ ok: 'truthy' }).ok).toBe(false)
+  })
+})
+
+describe('parseControlInbound — rc:apps.*', () => {
+  it('routes rc:apps.list.reply with id', () => {
+    const r = parseControlInbound(
+      '{"t":"rc:apps.list.reply","id":"a1","ok":true,"supported":true,"windows":[],"launchable":[]}'
+    )
+    expect(r).toEqual({
+      kind: 'apps_list_reply',
+      id: 'a1',
+      reply: { ok: true, supported: true, windows: [], launchable: [] },
+    })
+  })
+
+  it('tolerates a null / missing id on apps replies', () => {
+    const r = parseControlInbound('{"t":"rc:apps.list.reply","ok":true,"supported":false}')
+    expect(r?.kind).toBe('apps_list_reply')
+    expect((r as { id: string | null }).id).toBeNull()
+  })
+
+  it('routes focus + launch replies', () => {
+    expect(parseControlInbound('{"t":"rc:apps.focus.reply","id":"f1","ok":true}')).toEqual({
+      kind: 'apps_focus_reply',
+      id: 'f1',
+      reply: { ok: true },
+    })
+    expect(
+      parseControlInbound('{"t":"rc:apps.launch.reply","id":"l1","ok":true,"window_id":"0x9"}')
+    ).toEqual({
+      kind: 'apps_launch_reply',
+      id: 'l1',
+      reply: { ok: true, window_id: '0x9' },
+    })
+  })
+
+  it('returns null for an unknown rc:apps.* subtype (forward-compat)', () => {
+    expect(parseControlInbound('{"t":"rc:apps.something-new"}')).toBeNull()
+  })
+})
+
+describe('apps wire builders', () => {
+  it('appsListWireMessage builds { t, id } and rejects empty id', () => {
+    expect(appsListWireMessage('a1')).toEqual({ t: 'rc:apps.list', id: 'a1' })
+    expect(appsListWireMessage('')).toBeNull()
+  })
+
+  it('appsFocusWireMessage requires id + windowId', () => {
+    expect(appsFocusWireMessage('a1', '0x5')).toEqual({
+      t: 'rc:apps.focus',
+      id: 'a1',
+      window_id: '0x5',
+    })
+    expect(appsFocusWireMessage('a1', '')).toBeNull()
+    expect(appsFocusWireMessage('', '0x5')).toBeNull()
+  })
+
+  it('appsLaunchWireMessage requires id + appKey', () => {
+    expect(appsLaunchWireMessage('a1', 'bash')).toEqual({
+      t: 'rc:apps.launch',
+      id: 'a1',
+      app_key: 'bash',
+    })
+    expect(appsLaunchWireMessage('a1', '')).toBeNull()
+    expect(appsLaunchWireMessage('', 'bash')).toBeNull()
   })
 })
 

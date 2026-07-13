@@ -410,6 +410,27 @@
       >
         <v-icon>mdi-folder-open</v-icon>
       </v-btn>
+      <!-- Apps: list / focus / launch windows on the remote desktop
+           (virtual-desktop hosts). Shown only when the agent advertises
+           the `apps` capability; disabled if its first list reply said
+           the host has no manageable desktop. -->
+      <v-btn
+        v-if="rc.phase.value === 'connected' && agentSupportsApps"
+        icon
+        variant="text"
+        size="small"
+        class="d-none d-sm-inline-flex"
+        :disabled="rc.appsSupported.value === false"
+        aria-label="Remote apps"
+        :title="
+          rc.appsSupported.value === false
+            ? 'This agent has no manageable desktop'
+            : 'Apps — list / focus / launch remote windows'
+        "
+        @click="openAppsDialog"
+      >
+        <v-icon>mdi-apps</v-icon>
+      </v-btn>
       <!-- rc.23 — open the agent log viewer. Diagnostic feature
            added so operators can see what's happening on the host
            (e.g. ESET interrupt logs, sync_data failures) without
@@ -1044,6 +1065,16 @@
             >
               Upload file → remote
             </v-btn>
+            <!-- Apps (mobile) — same shared dialog as the desktop toolbar. -->
+            <v-btn
+              v-if="agentSupportsApps"
+              variant="tonal"
+              prepend-icon="mdi-apps"
+              :disabled="rc.appsSupported.value === false"
+              @click="openAppsDialog"
+            >
+              Apps
+            </v-btn>
           </template>
         </v-card-text>
         <v-card-actions>
@@ -1058,6 +1089,80 @@
          in a scrolling pre-block. Refresh button re-fetches. Auto-fetches
          on open with 500 lines (default) — enough to capture the run-up
          to a typical upload failure on the field-test host without flooding the DC. -->
+    <!-- Apps dialog (shared by the desktop toolbar + mobile sheet). Lists
+         windows on the remote virtual desktop; click one to focus (or
+         re-attach a detached tmux session), or launch a new allowlisted
+         app under "Launch new". -->
+    <v-dialog v-model="appsDialog" max-width="480" scrollable>
+      <v-card>
+        <v-toolbar density="compact" color="primary">
+          <v-icon class="ml-3">mdi-apps</v-icon>
+          <v-toolbar-title class="text-body-1">Apps</v-toolbar-title>
+          <v-spacer />
+          <v-btn
+            icon
+            size="small"
+            :loading="rc.appsLoading.value"
+            title="Refresh"
+            @click="refreshAppsSafe"
+          >
+            <v-icon>mdi-refresh</v-icon>
+          </v-btn>
+          <v-btn icon size="small" title="Close" @click="appsDialog = false">
+            <v-icon>mdi-close</v-icon>
+          </v-btn>
+        </v-toolbar>
+        <v-alert
+          v-if="rc.appsError.value"
+          type="warning"
+          density="compact"
+          variant="tonal"
+          class="ma-2"
+        >
+          {{ rc.appsError.value }}
+        </v-alert>
+        <v-list density="compact" max-height="420" class="overflow-y-auto">
+          <v-list-subheader>Open windows</v-list-subheader>
+          <v-list-item
+            v-for="w in rc.remoteWindows.value"
+            :key="w.window_id"
+            :active="w.focused"
+            @click="onFocusWindow(w)"
+          >
+            <template #prepend>
+              <v-icon>{{ w.session ? 'mdi-console' : 'mdi-window-restore' }}</v-icon>
+            </template>
+            <v-list-item-title>{{ w.title }}</v-list-item-title>
+            <v-list-item-subtitle v-if="w.session">tmux: {{ w.session }}</v-list-item-subtitle>
+            <template #append>
+              <v-chip v-if="w.focused" size="x-small" color="primary" variant="flat">
+                focused
+              </v-chip>
+            </template>
+          </v-list-item>
+          <v-list-item
+            v-if="rc.remoteWindows.value.length === 0 && !rc.appsLoading.value"
+            class="text-medium-emphasis"
+            title="No windows reported"
+          />
+          <template v-if="rc.launchableApps.value.length">
+            <v-divider />
+            <v-list-subheader>Launch new</v-list-subheader>
+            <v-list-item
+              v-for="a in rc.launchableApps.value"
+              :key="a.key"
+              @click="onLaunchApp(a)"
+            >
+              <template #prepend>
+                <v-icon>mdi-plus-box-outline</v-icon>
+              </template>
+              <v-list-item-title>{{ a.label }}</v-list-item-title>
+            </v-list-item>
+          </template>
+        </v-list>
+      </v-card>
+    </v-dialog>
+
     <v-dialog v-model="agentLogDialog" max-width="980" scrollable>
       <v-card>
         <v-toolbar density="compact" color="primary">
@@ -1518,6 +1623,39 @@ const agentLogDialog = ref(false)
 // webrtc-rs's SCTP max_message_size (~64 KiB).
 const agentLogLines = ref(200)
 const agentLogPreEl = ref<HTMLElement | null>(null)
+
+// rc.NEXT — remote app selection & launch (virtual-desktop hosts).
+const appsDialog = ref(false)
+function refreshAppsSafe() {
+  void rc
+    .refreshApps()
+    .catch((e) => showError(`Apps: ${e instanceof Error ? e.message : String(e)}`))
+}
+function openAppsDialog() {
+  appsDialog.value = true
+  refreshAppsSafe()
+}
+async function onFocusWindow(w: { window_id: string }) {
+  try {
+    const r = await rc.focusWindow(w.window_id)
+    if (!r.ok) showError(r.error ?? 'Focus failed')
+  } catch (e) {
+    showError(`Focus failed: ${e instanceof Error ? e.message : String(e)}`)
+  }
+}
+async function onLaunchApp(a: { key: string; label: string }) {
+  try {
+    const r = await rc.launchApp(a.key)
+    if (r.ok) {
+      showSuccess(`Launched ${a.label}`)
+      void rc.refreshApps().catch(() => {})
+    } else {
+      showError(r.error ?? 'Launch failed')
+    }
+  } catch (e) {
+    showError(`Launch failed: ${e instanceof Error ? e.message : String(e)}`)
+  }
+}
 
 async function openAgentLogDialog() {
   agentLogDialog.value = true
@@ -2726,6 +2864,10 @@ function transferProgressPct(t: { bytes: number; total: number | null }): number
 // unanswered request.
 const agentFilesCaps = computed<string[]>(() => agent.value?.capabilities?.files ?? [])
 const agentSupportsBrowse = computed(() => agentFilesCaps.value.includes('browse'))
+// rc.NEXT — remote app selection & launch. Advertised only by
+// virtual-desktop-mode agents; drives the Apps toolbar entry's v-if.
+const agentAppsCaps = computed<string[]>(() => agent.value?.capabilities?.apps ?? [])
+const agentSupportsApps = computed(() => agentAppsCaps.value.includes('list'))
 const agentSupportsDownload = computed(() =>
   agentFilesCaps.value.includes('download') || agentFilesCaps.value.includes('download-folder')
 )
