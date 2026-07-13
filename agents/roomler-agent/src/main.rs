@@ -1523,6 +1523,12 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     let tunnel_hub = roomler_agent::tunnel::client_mgr::TunnelClientHub::new(
         env!("CARGO_PKG_VERSION").to_string(),
     );
+    // P3b-3: shared RTT cache — filled by the prober task (below), read by
+    // `peers()`. Clone the pinger for the prober; the original moves into
+    // `DaemonState` for the `ping` verb.
+    let rtt_cache: roomler_agent::localapi_state::RttCache =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let pinger_for_prober = netstack_pinger.clone();
     let localapi_state: std::sync::Arc<dyn tunnel_core::localapi::LocalApiState> =
         std::sync::Arc::new(localapi_state::DaemonState::new(
             cfg.agent_id.clone(),
@@ -1534,7 +1540,20 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
             consent_broker.clone(),
             netstack_pinger,
             tunnel_hub.clone(),
+            rtt_cache.clone(),
         ));
+    // P3b-3: the RTT prober — spawned only on a netstack node (pinger = Some).
+    // Pings each carrier-reachable peer every RTT_PROBE_INTERVAL into rtt_cache;
+    // exits on shutdown. A fresh `overlay_view_tx.subscribe()` receiver (the
+    // original moved into DaemonState).
+    if let Some(pinger) = pinger_for_prober {
+        roomler_agent::localapi_state::spawn_rtt_prober(
+            pinger,
+            overlay_view_tx.subscribe(),
+            rtt_cache,
+            shutdown_rx.clone(),
+        );
+    }
     let localapi_task = tokio::spawn({
         let shutdown = shutdown_rx.clone();
         async move {
