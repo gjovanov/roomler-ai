@@ -92,6 +92,8 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         config_schema_version: Some(crate::config::CURRENT_SCHEMA_VERSION.to_string()),
         // T2.8 default = enabled + empty allowlist (trust server).
         forward_acl: crate::tunnel::acl::AgentForwardAcl::default(),
+        // Remote app-launch: default = enabled with a seeded bash/tmux entry.
+        virtual_desktop_apps: crate::apps::VirtualDesktopAppsConfig::default(),
         // Phase 3b: overlay opt-in, off until the operator enables it.
         overlay_enabled: false,
         overlay_wg_secret_key: None,
