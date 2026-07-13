@@ -631,12 +631,30 @@ impl Agent {
                     let server_addr = match net2.resolve_addr(is_ipv4, &host_port).await {
                         Ok(addr) => addr,
                         Err(err) => {
-                            log::warn!(
-                                "[{}]: failed to resolve stun host: {}: {}",
-                                agent_internal2.get_name(),
-                                host_port,
-                                err
-                            );
+                            // A v4-only host resolving the STUN host for the IPv6
+                            // network type gets "No available ipv6 IP address
+                            // found" — benign (the host simply has no IPv6), but
+                            // it fired a WARN per url per gather → thousands of
+                            // noise lines on corp v4-only endpoints (roomler fleet
+                            // diag 2026-07-13: ~1770× on the overlay hosts). Log
+                            // the no-address-of-that-family case at DEBUG; keep a
+                            // genuine DNS failure at WARN.
+                            let es = err.to_string();
+                            if es.contains("No available") && es.contains("address found") {
+                                log::debug!(
+                                    "[{}]: no {} local address; skipping srflx to {}",
+                                    agent_internal2.get_name(),
+                                    network,
+                                    host_port,
+                                );
+                            } else {
+                                log::warn!(
+                                    "[{}]: failed to resolve stun host: {}: {}",
+                                    agent_internal2.get_name(),
+                                    host_port,
+                                    es
+                                );
+                            }
                             return Ok(());
                         }
                     };
