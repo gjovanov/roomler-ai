@@ -877,6 +877,39 @@ impl AgentPeer {
             other => serde_json::from_value(other)
                 .map_err(|e| anyhow!("bad ICE candidate shape: {e}"))?,
         };
+        // Relay-escape — Chrome hides its LAN host candidates behind mDNS
+        // `.local` names (the controller page holds no cam/mic permission),
+        // and webrtc-ice's in-process QueryOnly resolution is unreliable on
+        // Windows (the native mDNS resolver owns udp/5353, doubly so under
+        // the SYSTEM service) — so those candidates were effectively
+        // dropped and the direct LAN pair depended on prflx-discovery luck
+        // racing the pre-warmed TURN pair (field 2026-07-13: same-LAN
+        // sessions nominating the Germany relay most connects). Resolve the
+        // name via the OS resolver and rewrite the candidate so a real
+        // host↔host pair forms. Spawned so the ~750 ms worst-case
+        // resolution never stalls the signaling loop — ICE doesn't care
+        // about candidate arrival order. On resolution failure the original
+        // is added unmodified (status quo). See `mdns_resolve` module docs.
+        if crate::mdns_resolve::candidate_mdns_name(&init.candidate).is_some() {
+            let pc = self.pc.clone();
+            let session_id = self.session_id;
+            let mut init = init;
+            tokio::spawn(async move {
+                match crate::mdns_resolve::resolve_mdns_candidate(&init.candidate).await {
+                    Some(rewritten) => init.candidate = rewritten,
+                    None => {
+                        debug!(
+                            session = %session_id,
+                            "mDNS candidate resolution failed — adding unmodified (prflx fallback)"
+                        );
+                    }
+                }
+                if let Err(e) = pc.add_ice_candidate(init).await {
+                    debug!(session = %session_id, %e, "add_ice_candidate (mDNS path) failed");
+                }
+            });
+            return Ok(());
+        }
         self.pc
             .add_ice_candidate(init)
             .await
@@ -936,13 +969,19 @@ async fn detect_constrained_transport(
         if let Some(pair) = ice.get_selected_candidate_pair().await {
             let relay = pair.local().typ == RTCIceCandidateType::Relay
                 || pair.remote().typ == RTCIceCandidateType::Relay;
+            // Relay-escape — log the ADDRESSES, not just the types: a
+            // "direct" Srflx↔Prflx pair whose remote is the router's WAN IP
+            // is a NAT hairpin, while a 192.168.x remote is the true LAN
+            // path. Types alone couldn't tell them apart in the field.
             info!(
                 %session_id,
                 relay,
                 local_typ = ?pair.local().typ,
                 local_proto = ?pair.local().protocol,
+                local_addr = %format!("{}:{}", pair.local().address, pair.local().port),
                 remote_typ = ?pair.remote().typ,
                 remote_proto = ?pair.remote().protocol,
+                remote_addr = %format!("{}:{}", pair.remote().address, pair.remote().port),
                 "per-session ICE path detected (adaptive bitrate)"
             );
             return relay;
@@ -954,6 +993,41 @@ async fn detect_constrained_transport(
         "ICE candidate pair not nominated within 3s — treating as direct (unconstrained)"
     );
     false
+}
+
+/// Relay-escape — mid-session re-read of the selected ICE pair. The DC
+/// pumps poll this every [`TRANSPORT_RECHECK_INTERVAL`] so a pair switch
+/// (Chrome renominates relay→direct once the mDNS-resolved host pair
+/// succeeds, or direct→relay on a path failure) updates the bitrate clamp
+/// LIVE instead of staying pinned to the guess made at pump start.
+/// `None` = no pair currently nominated (transient) — keep the last value.
+#[cfg(any(feature = "vp9-444", feature = "ffmpeg-encoder"))]
+const TRANSPORT_RECHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+#[cfg(any(feature = "vp9-444", feature = "ffmpeg-encoder"))]
+async fn current_pair_is_relay(
+    pc: &Arc<RTCPeerConnection>,
+    session_id: bson::oid::ObjectId,
+    previous: bool,
+) -> Option<bool> {
+    let sctp = pc.sctp();
+    let dtls = sctp.transport();
+    let ice = dtls.ice_transport();
+    let pair = ice.get_selected_candidate_pair().await?;
+    let relay = pair.local().typ == RTCIceCandidateType::Relay
+        || pair.remote().typ == RTCIceCandidateType::Relay;
+    if relay != previous {
+        info!(
+            %session_id,
+            was_relay = previous,
+            now_relay = relay,
+            local_addr = %format!("{}:{}", pair.local().address, pair.local().port),
+            remote_typ = ?pair.remote().typ,
+            remote_addr = %format!("{}:{}", pair.remote().address, pair.remote().port),
+            "transport path changed mid-session — updating bitrate clamp (relay-escape)"
+        );
+    }
+    Some(relay)
 }
 
 /// Per-session media pump. Captures frames, encodes to the negotiated
@@ -1845,14 +1919,14 @@ async fn media_pump_vp9_444_dc(
     // Adaptive bitrate (A1) — detect THIS session's actual ICE path rather
     // than reading the process-wide env flag. The env flag still wins as an
     // explicit override (see `detect_constrained_transport`).
-    let constrained_transport = detect_constrained_transport(&pc, session_id).await;
-    let bitrate_cap: u32 = if constrained_transport {
+    let mut constrained_transport = detect_constrained_transport(&pc, session_id).await;
+    let mut bitrate_cap: u32 = if constrained_transport {
         crate::encode::relay_max_bps()
     } else {
         u32::MAX
     };
     // Change D: trigger AIMD earlier on the shallow relay-TCP pipe.
-    let dc_buffered_high: u64 = if constrained_transport {
+    let mut dc_buffered_high: u64 = if constrained_transport {
         256 * 1024
     } else {
         DC_BUFFERED_HIGH_BYTES
@@ -1860,6 +1934,8 @@ async fn media_pump_vp9_444_dc(
     if constrained_transport {
         info!(%session_id, bitrate_cap, dc_buffered_high, "VP9-444 DC pump: constrained (relay-TCP) transport — clamping bitrate + tightening backpressure");
     }
+    // Relay-escape — re-check the selected pair periodically (see the loop).
+    let mut last_transport_check = std::time::Instant::now();
 
     let mut frames_captured: u64 = 0;
     let mut frames_encoded: u64 = 0;
@@ -2025,6 +2101,37 @@ async fn media_pump_vp9_444_dc(
     }
 
     loop {
+        // Relay-escape — every TRANSPORT_RECHECK_INTERVAL re-read the
+        // selected ICE pair: Chrome renominates mid-session (relay→direct
+        // once the mDNS-resolved host pair succeeds; direct→relay on a path
+        // failure) and the bitrate clamp should follow LIVE instead of
+        // staying pinned to the pump-start guess. The env override still
+        // pins constrained (the ICE policy itself is forced to relay —
+        // nothing to re-detect). The send-queue depth + buffered watermark
+        // stay as chosen at start (the channel size is fixed at
+        // construction); the ceiling is the lever that matters.
+        if last_transport_check.elapsed() >= TRANSPORT_RECHECK_INTERVAL {
+            last_transport_check = std::time::Instant::now();
+            if !crate::encode::transport_is_constrained() {
+                let relay_now = current_pair_is_relay(&pc, session_id, constrained_transport).await;
+                if let Some(relay) = relay_now
+                    && relay != constrained_transport
+                {
+                    constrained_transport = relay;
+                    bitrate_cap = if relay {
+                        crate::encode::relay_max_bps()
+                    } else {
+                        u32::MAX
+                    };
+                    dc_buffered_high = if relay {
+                        256 * 1024
+                    } else {
+                        DC_BUFFERED_HIGH_BYTES
+                    };
+                }
+            }
+        }
+
         // rc.166 freeze fix — BACKPRESSURE GATE (ported from FFmpeg pump
         // rc.111). Gate frame PRODUCTION on the send channel having capacity.
         // When the send task can't drain the relay-TCP link fast enough the
@@ -2497,6 +2604,27 @@ impl FfmpegDcCodec {
     }
 }
 
+/// `rc:video-info` payload for the FFmpeg DC pump — one builder so the
+/// initial send (encoder build) and the relay-escape transport refresh emit
+/// the identical shape. `transport` is "relay"/"direct" so the browser's
+/// stats badge shows WHICH path this session actually took (field
+/// 2026-07-13: same-LAN sessions silently landing on the Germany TURN relay
+/// were indistinguishable from direct ones without log access).
+#[cfg(feature = "ffmpeg-encoder")]
+fn ffmpeg_video_info_payload(
+    codec: FfmpegDcCodec,
+    encoder_name: &str,
+    constrained: bool,
+) -> String {
+    format!(
+        r#"{{"t":"rc:video-info","codec":"{}","encoder":"{}","hardware":true,"chroma":"{}","transport":"{}"}}"#,
+        codec.wire_codec(),
+        encoder_name,
+        codec.wire_chroma(),
+        if constrained { "relay" } else { "direct" },
+    )
+}
+
 /// rc.77/rc.83 — Unified FFmpeg-encoder DataChannel pump.
 ///
 /// Mirrors `media_pump_vp9_444_dc` structurally but uses
@@ -2560,7 +2688,10 @@ async fn media_pump_ffmpeg_dc(
     // env flag. The env flag still wins as an explicit override (see
     // `detect_constrained_transport`). ICE may not have nominated yet, so this
     // briefly polls; the AIMD converges regardless of the initial guess.
-    let constrained = detect_constrained_transport(&pc, session_id).await;
+    // Relay-escape: `mut` — the loop re-checks the selected pair periodically
+    // and follows a mid-session renomination (see the block at the loop top).
+    let mut constrained = detect_constrained_transport(&pc, session_id).await;
+    let mut last_transport_check = std::time::Instant::now();
 
     // rc.93 — target fps. Pre-rc.93 this was hardcoded 30, which capped the
     // scrap backend's internal pacer (`scrap_backend::next_frame` sleeps to
@@ -2724,6 +2855,35 @@ async fn media_pump_ffmpeg_dc(
     }
 
     loop {
+        // Relay-escape — twin of the VP9 pump's loop-top block: re-read the
+        // selected ICE pair every TRANSPORT_RECHECK_INTERVAL and follow a
+        // mid-session renomination. A flip flows into `ceiling` (recomputed
+        // per frame from `constrained`) → the AIMD clamps/unclamps live.
+        // `target_fps` + the send-queue depth stay as chosen at pump start
+        // (fps is baked into the capture pacer — a relay→direct upgrade
+        // keeps 30 fps until reconnect, documented trade-off). Also refresh
+        // the browser stats badge so the operator SEES the path flip.
+        if last_transport_check.elapsed() >= TRANSPORT_RECHECK_INTERVAL {
+            last_transport_check = std::time::Instant::now();
+            if !crate::encode::transport_is_constrained() {
+                let relay_now = current_pair_is_relay(&pc, session_id, constrained).await;
+                if let Some(relay) = relay_now
+                    && relay != constrained
+                {
+                    constrained = relay;
+                    if let Some(enc_name) = encoder.as_ref().map(|e| e.name()) {
+                        let payload = ffmpeg_video_info_payload(codec, enc_name, constrained);
+                        let cdc = control_dc.lock().await.clone();
+                        if let Some(cdc) = cdc {
+                            if let Err(e) = cdc.send_text(payload).await {
+                                debug!(%session_id, %e, "rc:video-info transport refresh send failed");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // rc.93 — NO pump-side pacing floor (the rc.86→rc.92 floor sleep
         // was the fps bug). The capture backend is the single pacer:
         // scrap_backend sleeps to `1000/target_fps` internally, and the
@@ -2882,13 +3042,10 @@ async fn media_pump_ffmpeg_dc(
                     // stats badge stops claiming "VP9 4:4:4 SW". Sent
                     // once on first successful build. FFmpeg HEVC/VP9
                     // paths are always HW (NVENC/QSV/AMF) and 4:2:0.
+                    // Relay-escape adds `transport` (re-sent on a
+                    // mid-session path change — see the loop-top block).
                     if !video_info_sent {
-                        let payload = format!(
-                            r#"{{"t":"rc:video-info","codec":"{}","encoder":"{}","hardware":true,"chroma":"{}"}}"#,
-                            codec.wire_codec(),
-                            encoder_name,
-                            codec.wire_chroma(),
-                        );
+                        let payload = ffmpeg_video_info_payload(codec, encoder_name, constrained);
                         let cdc = control_dc.lock().await.clone();
                         if let Some(cdc) = cdc {
                             if let Err(e) = cdc.send_text(payload).await {
