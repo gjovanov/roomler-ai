@@ -3671,6 +3671,35 @@ fn attach_control_handler(
                         debug!(%session_id, "control: rc:keyframe — forcing IDR (browser decode-backlog resync)");
                     }
                 }
+                "rc:apps.list" | "rc:apps.focus" | "rc:apps.launch" => {
+                    // Remote app selection & launch (virtual-desktop
+                    // hosts). Mirror rc:logs-fetch: handle off-thread
+                    // (shells out / FFI) then reply over the same control
+                    // DC. Every path returns a well-formed *.reply.
+                    let t_owned = t.to_string();
+                    let val_for_task = val.clone();
+                    let reply = tokio::task::spawn_blocking(move || {
+                        crate::apps::handle_control_message(&val_for_task)
+                    })
+                    .await
+                    .unwrap_or_else(|e| {
+                        serde_json::json!({
+                            "t": format!("{t_owned}.reply"),
+                            "ok": false,
+                            "error": format!("apps handler panicked: {e}"),
+                        })
+                    });
+                    match serde_json::to_string(&reply) {
+                        Ok(text) => {
+                            if let Err(e) = dc_for_reply.send_text(text).await {
+                                debug!(%session_id, %e, "control: rc:apps.* reply send failed");
+                            }
+                        }
+                        Err(e) => {
+                            debug!(%session_id, %e, "control: rc:apps.* reply serialise failed");
+                        }
+                    }
+                }
                 other => {
                     debug!(%session_id, t = other, "control: unknown message type");
                 }
