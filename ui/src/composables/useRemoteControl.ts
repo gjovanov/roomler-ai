@@ -98,6 +98,38 @@ export interface RcVideoInfo {
   transport: string
 }
 
+/** rc.NEXT — remote app selection & launch (virtual-desktop hosts). The
+ *  agent enumerates windows on its desktop; the browser can focus one or
+ *  launch a new allowlisted app. Rides the control DC (same request/reply
+ *  pattern as rc:logs-fetch). See `agents/roomler-agent/src/apps/`. */
+export interface RcWindowEntry {
+  window_id: string
+  title: string
+  /** matches a `launchable.key` when the window is a known launched app */
+  app_key?: string
+  /** tmux session (bash flagship); absent for GUI windows */
+  session?: string
+  focused: boolean
+}
+export interface RcLaunchable {
+  key: string
+  label: string
+}
+export interface RcAppsListReply {
+  ok: boolean
+  supported: boolean
+  windows: RcWindowEntry[]
+  launchable: RcLaunchable[]
+  error?: string
+}
+/** focus + launch share this shape. `window_id` is the new window on a
+ *  successful launch (best-effort — may be absent). */
+export interface RcAppsActionReply {
+  ok: boolean
+  window_id?: string
+  error?: string
+}
+
 export type RcControlInbound =
   | { kind: 'host_locked'; locked: boolean }
   | { kind: 'desktop_changed'; name: string }
@@ -106,6 +138,9 @@ export type RcControlInbound =
   | { kind: 'logs_fetch_start'; id: string | null; path?: string; totalLines?: number; truncated?: boolean }
   | { kind: 'logs_fetch_chunk'; id: string | null; lines: string[] }
   | { kind: 'logs_fetch_end'; id: string | null }
+  | { kind: 'apps_list_reply'; id: string | null; reply: RcAppsListReply }
+  | { kind: 'apps_focus_reply'; id: string | null; reply: RcAppsActionReply }
+  | { kind: 'apps_launch_reply'; id: string | null; reply: RcAppsActionReply }
   | null
 
 export function parseControlInbound(data: unknown): RcControlInbound {
@@ -181,7 +216,85 @@ export function parseControlInbound(data: unknown): RcControlInbound {
     const id = typeof obj.id === 'string' ? obj.id : null
     return { kind: 'logs_fetch_end', id }
   }
+  if (obj.t === 'rc:apps.list.reply') {
+    return { kind: 'apps_list_reply', id: strOrNull(obj.id), reply: parseAppsListReply(obj) }
+  }
+  if (obj.t === 'rc:apps.focus.reply') {
+    return { kind: 'apps_focus_reply', id: strOrNull(obj.id), reply: parseAppsActionReply(obj) }
+  }
+  if (obj.t === 'rc:apps.launch.reply') {
+    return { kind: 'apps_launch_reply', id: strOrNull(obj.id), reply: parseAppsActionReply(obj) }
+  }
   return null
+}
+
+function strOrNull(v: unknown): string | null {
+  return typeof v === 'string' ? v : null
+}
+
+/** Parse an `rc:apps.list.reply` body defensively — unknown/missing
+ *  fields degrade to safe empties (never throws) so version skew can't
+ *  break the menu. Exported so the wire format is locked by tests. */
+export function parseAppsListReply(obj: Record<string, unknown>): RcAppsListReply {
+  const windows: RcWindowEntry[] = Array.isArray(obj.windows)
+    ? obj.windows
+        .filter((w): w is Record<string, unknown> => typeof w === 'object' && w !== null)
+        .filter((w) => typeof w.window_id === 'string' && typeof w.title === 'string')
+        .map((w) => {
+          const e: RcWindowEntry = {
+            window_id: w.window_id as string,
+            title: w.title as string,
+            focused: w.focused === true,
+          }
+          if (typeof w.app_key === 'string') e.app_key = w.app_key
+          if (typeof w.session === 'string') e.session = w.session
+          return e
+        })
+    : []
+  const launchable: RcLaunchable[] = Array.isArray(obj.launchable)
+    ? obj.launchable
+        .filter((a): a is Record<string, unknown> => typeof a === 'object' && a !== null)
+        .filter((a) => typeof a.key === 'string' && typeof a.label === 'string')
+        .map((a) => ({ key: a.key as string, label: a.label as string }))
+    : []
+  const reply: RcAppsListReply = {
+    ok: obj.ok === true,
+    supported: obj.supported === true,
+    windows,
+    launchable,
+  }
+  if (typeof obj.error === 'string') reply.error = obj.error
+  return reply
+}
+
+/** Parse an `rc:apps.focus.reply` / `rc:apps.launch.reply` body. Exported for tests. */
+export function parseAppsActionReply(obj: Record<string, unknown>): RcAppsActionReply {
+  const reply: RcAppsActionReply = { ok: obj.ok === true }
+  if (typeof obj.window_id === 'string') reply.window_id = obj.window_id
+  if (typeof obj.error === 'string') reply.error = obj.error
+  return reply
+}
+
+/** Build the `rc:apps.list` request. Exported so the wire format is
+ *  locked by tests (mirrors `resolutionWireMessage`). Returns null on an
+ *  empty id so the caller drops the send. */
+export function appsListWireMessage(id: string): Record<string, unknown> | null {
+  if (!id) return null
+  return { t: 'rc:apps.list', id }
+}
+export function appsFocusWireMessage(
+  id: string,
+  windowId: string,
+): Record<string, unknown> | null {
+  if (!id || !windowId) return null
+  return { t: 'rc:apps.focus', id, window_id: windowId }
+}
+export function appsLaunchWireMessage(
+  id: string,
+  appKey: string,
+): Record<string, unknown> | null {
+  if (!id || !appKey) return null
+  return { t: 'rc:apps.launch', id, app_key: appKey }
 }
 
 /**
@@ -1005,6 +1118,36 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    */
   const agentLogs = ref<RcLogsFetchReply | null>(null)
   const agentLogsLoading = ref(false)
+  // rc.NEXT — remote app selection & launch (virtual-desktop hosts).
+  const remoteWindows = ref<RcWindowEntry[]>([])
+  const launchableApps = ref<RcLaunchable[]>([])
+  const appsLoading = ref(false)
+  const appsError = ref<string | null>(null)
+  /** Capability truth: null = unknown (never asked); set from the first
+   *  list reply's `supported` field, or flipped false by a request
+   *  timeout (an agent too old to speak rc:apps.*). */
+  const appsSupported = ref<boolean | null>(null)
+  /** id→resolver map for interleaved list/focus/launch round-trips
+   *  (mirrors `pendingDirRequests`). */
+  const pendingAppsRequests = new Map<
+    string,
+    {
+      resolve: (r: RcAppsListReply | RcAppsActionReply) => void
+      reject: (e: Error) => void
+      timer: ReturnType<typeof setTimeout>
+    }
+  >()
+  function settleAppsRequest(id: string) {
+    const p = pendingAppsRequests.get(id)
+    if (!p) return null
+    clearTimeout(p.timer)
+    pendingAppsRequests.delete(id)
+    return { resolve: p.resolve, reject: p.reject }
+  }
+  let nextAppsReqId = 1
+  function makeAppsReqId(): string {
+    return `apps-${Date.now().toString(36)}-${nextAppsReqId++}`
+  }
   /**
    * Single-flight promise resolver — when set, the next
    * `rc:logs-fetch.reply` arriving over the control DC resolves it.
@@ -1500,6 +1643,68 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         reject(e instanceof Error ? e : new Error(String(e)))
       }
     })
+  }
+
+  // ── Remote app selection & launch (virtual-desktop hosts) ──────────
+  // All three ride the control DC (same request/reply shape as
+  // rc:logs-fetch), id-correlated via `pendingAppsRequests`. The 10 s
+  // timeout doubles as the old-agent detector: an agent that predates
+  // rc:apps.* never replies → `appsSupported` flips false → menu disables.
+  function sendAppsRequest<T extends RcAppsListReply | RcAppsActionReply>(
+    msg: Record<string, unknown> | null,
+    onTimeout?: () => void,
+  ): Promise<T> {
+    const ch = channels.control
+    if (!ch || ch.readyState !== 'open') {
+      return Promise.reject(new Error('control DC not open — not connected to agent'))
+    }
+    if (!msg || typeof msg.id !== 'string') {
+      return Promise.reject(new Error('malformed apps request'))
+    }
+    const id = msg.id
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (pendingAppsRequests.delete(id)) {
+          onTimeout?.()
+          if (appsSupported.value === null) appsSupported.value = false
+          reject(new Error('apps request timed out (10 s) — agent may predate rc:apps.*'))
+        }
+      }, 10_000)
+      pendingAppsRequests.set(id, {
+        resolve: resolve as (r: RcAppsListReply | RcAppsActionReply) => void,
+        reject,
+        timer,
+      })
+      try {
+        ch.send(JSON.stringify(msg))
+      } catch (e) {
+        clearTimeout(timer)
+        pendingAppsRequests.delete(id)
+        reject(e instanceof Error ? e : new Error(String(e)))
+      }
+    })
+  }
+
+  /** Fetch the remote desktop's window list + launchable apps. Populates
+   *  `remoteWindows` / `launchableApps` / `appsSupported` via the
+   *  control-DC onmessage arm; also resolves with the reply. */
+  function refreshApps(): Promise<RcAppsListReply> {
+    appsLoading.value = true
+    return sendAppsRequest<RcAppsListReply>(appsListWireMessage(makeAppsReqId()), () => {
+      appsLoading.value = false
+    }).finally(() => {
+      appsLoading.value = false
+    })
+  }
+  /** Focus a window by its opaque id from the last list. For a detached
+   *  tmux session (a `tmux:<name>` synthetic id) the agent re-attaches by
+   *  spawning a fresh xterm. */
+  function focusWindow(windowId: string): Promise<RcAppsActionReply> {
+    return sendAppsRequest<RcAppsActionReply>(appsFocusWireMessage(makeAppsReqId(), windowId))
+  }
+  /** Launch a new allowlisted app by its key. */
+  function launchApp(appKey: string): Promise<RcAppsActionReply> {
+    return sendAppsRequest<RcAppsActionReply>(appsLaunchWireMessage(makeAppsReqId(), appKey))
   }
 
   /** Send a `rc:quality` preference over the control channel. Safe to
@@ -3063,6 +3268,24 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         const resolve = pendingLogsResolver
         pendingLogsResolver = null
         if (resolve) resolve(reply)
+      } else if (parsed?.kind === 'apps_list_reply') {
+        // Update the reactive refs even when the agent didn't echo the id
+        // (id-null tolerance, like the streamed logs path); only the
+        // promise resolution is skipped in that case.
+        appsLoading.value = false
+        appsSupported.value = parsed.reply.supported
+        if (parsed.reply.ok) {
+          remoteWindows.value = parsed.reply.windows
+          launchableApps.value = parsed.reply.launchable
+          appsError.value = null
+        } else {
+          appsError.value = parsed.reply.error ?? 'apps list failed'
+        }
+        if (parsed.id) settleAppsRequest(parsed.id)?.resolve(parsed.reply)
+      } else if (parsed?.kind === 'apps_focus_reply') {
+        if (parsed.id) settleAppsRequest(parsed.id)?.resolve(parsed.reply)
+      } else if (parsed?.kind === 'apps_launch_reply') {
+        if (parsed.id) settleAppsRequest(parsed.id)?.resolve(parsed.reply)
       }
     }
 
@@ -4799,6 +5022,15 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     agentLogs,
     agentLogsLoading,
     fetchAgentLogs,
+    // rc.NEXT — remote app selection & launch (virtual-desktop hosts).
+    remoteWindows,
+    launchableApps,
+    appsSupported,
+    appsLoading,
+    appsError,
+    refreshApps,
+    focusWindow,
+    launchApp,
     attachInput,
     /** Wire `key_text` over the input DC (used by mobile keyboard +
      *  IME composition path). See [`sendKeyText`] for the full

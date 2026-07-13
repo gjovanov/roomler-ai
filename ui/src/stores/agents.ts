@@ -55,6 +55,11 @@ export interface AgentCapabilities {
    *  when this doesn't contain `'opus'`. Mirrors `AgentCaps.audio` in
    *  `crates/remote_control/src/models.rs`. */
   audio?: string[]
+  /** rc.NEXT — remote app selection & launch on virtual-desktop hosts.
+   *  Known values: 'list', 'focus', 'launch'. Empty / unset on older
+   *  agents or non-VD hosts — the browser hides the Apps menu. Mirrors
+   *  `AgentCaps.apps` in `crates/remote_control/src/models.rs`. */
+  apps?: string[]
 }
 
 export interface Agent {
