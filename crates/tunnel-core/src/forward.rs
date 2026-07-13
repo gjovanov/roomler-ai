@@ -139,6 +139,17 @@ pub struct FlowStats {
     /// application beyond it); if it stays near 0 the bottleneck is
     /// upstream (DC delivery is slow).
     pub mailbox_depth: AtomicU64,
+    /// Optional back-pointer to the session-level throughput aggregate
+    /// (P3b-3). Set by [`FlowDemux::register`] (WebRTC) / the QUIC
+    /// client path when the daemon originates the flow; `None` on the
+    /// agent target side + the CLI + every `FlowStats::default()`, so
+    /// those carry no aggregate. When present, the pumps mirror each
+    /// TCP-side byte add into the session cumulative (`bytes_out` =
+    /// local→peer, `bytes_in` = peer→local) so `roomler flows` can
+    /// report per-forward throughput. TCP-side (not `dc_send`) so the
+    /// count is the true application payload — comparable across
+    /// WebRTC (which adds a 4-byte frame prefix) and QUIC.
+    pub session: Option<Arc<SessionThroughput>>,
 }
 
 impl FlowStats {
@@ -152,6 +163,97 @@ impl FlowStats {
             self.tcp_write_bytes.load(Ordering::Relaxed),
             self.mailbox_depth.load(Ordering::Relaxed),
         )
+    }
+
+    /// Mirror an outbound (local→peer) byte count into the session
+    /// aggregate, if this flow is session-tracked. No-op otherwise.
+    #[inline]
+    fn add_session_out(&self, n: u64) {
+        if let Some(s) = &self.session {
+            s.bytes_out.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    /// Mirror an inbound (peer→local) byte count into the session
+    /// aggregate, if this flow is session-tracked. No-op otherwise.
+    #[inline]
+    fn add_session_in(&self, n: u64) {
+        if let Some(s) = &self.session {
+            s.bytes_in.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Session-level throughput aggregate for a daemon-originated tunnel
+/// (P3b-3). One per `roomler forward` / `socks5` flow, shared across
+/// its per-connection [`FlowStats`] and across WS-reconnect attempts
+/// (so `bytes_in`/`bytes_out` are cumulative for the forward's life).
+/// Read by the daemon's `flows` LocalAPI verb.
+///
+/// Named `SessionThroughput` (not `SessionStats`) to avoid colliding
+/// with the unrelated video-session `roomler_ai_remote_control::models::
+/// SessionStats`.
+///
+/// `bytes_*` are cumulative (never decremented). `active_flows` is a
+/// live GAUGE of currently-pumping connections, maintained by a
+/// [`FlowGauge`] RAII guard held for each flow's pump lifetime — so it
+/// decrements on normal return AND on a tokio task-abort (`kill_flow`).
+/// It is best-effort across a reconnect (a prior session's draining
+/// flow can briefly decrement after the next session's
+/// [`reset_active_flows`](Self::reset_active_flows)); `saturating_sub`
+/// keeps it from underflowing and it self-heals as flows churn.
+#[derive(Debug, Default)]
+pub struct SessionThroughput {
+    /// Cumulative peer→local bytes (the local app RECEIVES).
+    pub bytes_in: AtomicU64,
+    /// Cumulative local→peer bytes (the local app SENDS).
+    pub bytes_out: AtomicU64,
+    /// Live count of currently-pumping connections through this flow.
+    pub active_flows: AtomicU64,
+}
+
+impl SessionThroughput {
+    /// `(bytes_in, bytes_out, active_flows)` — relaxed snapshot.
+    pub fn snapshot(&self) -> (u64, u64, u64) {
+        (
+            self.bytes_in.load(Ordering::Relaxed),
+            self.bytes_out.load(Ordering::Relaxed),
+            self.active_flows.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Zero the `active_flows` GAUGE at the start of a session attempt
+    /// so a prior session's leaked count (unclean WS teardown) can't
+    /// carry over. Does NOT touch the cumulative `bytes_*`.
+    pub fn reset_active_flows(&self) {
+        self.active_flows.store(0, Ordering::Relaxed);
+    }
+}
+
+/// RAII guard that holds an `active_flows` increment for one flow's
+/// pump lifetime. Increments on construction; saturating-decrements on
+/// `Drop` — which tokio runs when the owning task returns normally OR
+/// is aborted (`kill_flow`), so the gauge can't leak on either path.
+struct FlowGauge(Arc<SessionThroughput>);
+
+impl FlowGauge {
+    fn new(session: Arc<SessionThroughput>) -> Self {
+        session.active_flows.fetch_add(1, Ordering::Relaxed);
+        Self(session)
+    }
+}
+
+impl Drop for FlowGauge {
+    fn drop(&mut self) {
+        // AtomicU64 has no saturating fetch_sub; fetch_update with a
+        // saturating closure clamps at 0 (a stale cross-attempt drop
+        // can otherwise underflow-wrap to u64::MAX).
+        let _ = self
+            .0
+            .active_flows
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            });
     }
 }
 
@@ -223,14 +325,20 @@ type FlowMap = Arc<Mutex<HashMap<u32, (mpsc::Sender<Bytes>, Arc<FlowStats>)>>>;
 pub struct FlowDemux {
     dc: Arc<RTCDataChannel>,
     flows: FlowMap,
+    /// Session throughput aggregate (P3b-3), stamped onto every
+    /// registered flow's [`FlowStats`] so the pumps mirror bytes into
+    /// it. `None` on the agent target side + tests (no `flows` verb).
+    session: Option<Arc<SessionThroughput>>,
 }
 
 impl FlowDemux {
     /// Wrap a DC and install the routing `on_message` handler. The
     /// handler `await`s on a slow mailbox so backpressure cascades
     /// into the DC reader. Unregistered flow_ids are logged + dropped
-    /// (e.g. the peer raced a close).
-    pub async fn install(dc: Arc<RTCDataChannel>) -> Self {
+    /// (e.g. the peer raced a close). `session` is the daemon's
+    /// per-forward throughput aggregate (P3b-3) or `None` (agent side /
+    /// tests).
+    pub async fn install(dc: Arc<RTCDataChannel>, session: Option<Arc<SessionThroughput>>) -> Self {
         let flows: FlowMap = Arc::new(Mutex::new(HashMap::new()));
         let flows_for_handler = Arc::clone(&flows);
         dc.on_message(Box::new(move |msg: DataChannelMessage| {
@@ -289,7 +397,7 @@ impl FlowDemux {
                 }
             })
         }));
-        Self { dc, flows }
+        Self { dc, flows, session }
     }
 
     /// Open a mailbox for `flow_id`. Returns the receiver (yielding
@@ -300,7 +408,10 @@ impl FlowDemux {
     /// when [`unregister`] fires or the DC drops.
     pub async fn register(&self, flow_id: u32) -> (mpsc::Receiver<Bytes>, Arc<FlowStats>) {
         let (tx, rx) = mpsc::channel(FLOW_INBOX_CAP);
-        let stats = Arc::new(FlowStats::default());
+        let stats = Arc::new(FlowStats {
+            session: self.session.clone(),
+            ..Default::default()
+        });
         let mut map = self.flows.lock().await;
         if map.insert(flow_id, (tx, Arc::clone(&stats))).is_some() {
             warn!(
@@ -393,6 +504,9 @@ pub async fn run_flow(
     on_local_eof: HalfCloseSink,
     stats: Arc<FlowStats>,
 ) -> CloseReason {
+    // P3b-3: hold an `active_flows` gauge for this flow's pump lifetime
+    // (no-op when not session-tracked). Drops on return AND on abort.
+    let _gauge = stats.session.clone().map(FlowGauge::new);
     // Set the DC's low-water threshold once. `on_buffered_amount_low`
     // fires whenever the SCTP send queue drops back to or below this
     // value — i.e. when we have room to push more.
@@ -535,6 +649,9 @@ pub async fn run_flow_quic(
     flow_id: u32,
     stats: Arc<FlowStats>,
 ) -> CloseReason {
+    // P3b-3: hold an `active_flows` gauge for this flow's pump lifetime
+    // (no-op when not session-tracked). Drops on return AND on abort.
+    let _gauge = stats.session.clone().map(FlowGauge::new);
     let (mut read_half, mut write_half) = tcp.into_split();
     let logger_handle = spawn_flow_logger(flow_id, Arc::clone(&stats));
 
@@ -553,6 +670,7 @@ pub async fn run_flow_quic(
                     stats_send
                         .tcp_read_bytes
                         .fetch_add(n as u64, Ordering::Relaxed);
+                    stats_send.add_session_out(n as u64);
                     if let Err(e) = send.write_all(&buf[..n]).await {
                         debug!(flow_id, %e, "quic pump: stream write error");
                         return CloseReason::IoError;
@@ -590,6 +708,7 @@ pub async fn run_flow_quic(
                     stats_recv
                         .tcp_write_bytes
                         .fetch_add(n as u64, Ordering::Relaxed);
+                    stats_recv.add_session_in(n as u64);
                 }
                 Ok(None) => {
                     // Peer finished the stream (FIN) — shut the local
@@ -925,6 +1044,7 @@ async fn pump_tcp_to_dc(
             }
         };
         stats.tcp_read_bytes.fetch_add(n as u64, Ordering::Relaxed);
+        stats.add_session_out(n as u64);
 
         let framed = mux::encode(flow_id, &buf[..n]);
         let framed_len = framed.len();
@@ -973,6 +1093,7 @@ async fn pump_dc_to_tcp(
         stats
             .tcp_write_bytes
             .fetch_add(chunk_len as u64, Ordering::Relaxed);
+        stats.add_session_in(chunk_len as u64);
     }
 }
 
@@ -982,6 +1103,65 @@ mod tests {
     use crate::transport::webrtc_dc::TunnelPeer;
     use std::sync::Arc;
     use std::time::Duration;
+
+    /// P3b-3: a session-tracked `FlowStats` mirrors TCP-side byte adds into the
+    /// shared `SessionThroughput` (`bytes_out` = local→peer, `bytes_in` =
+    /// peer→local); an untracked one (`session: None`) is a silent no-op.
+    #[test]
+    fn session_throughput_mirrors_tcp_side_bytes() {
+        let session = Arc::new(SessionThroughput::default());
+        let tracked = FlowStats {
+            session: Some(session.clone()),
+            ..Default::default()
+        };
+        tracked.add_session_out(100);
+        tracked.add_session_out(23);
+        tracked.add_session_in(40);
+        assert_eq!(
+            session.snapshot(),
+            (40, 123, 0),
+            "(bytes_in, bytes_out, active)"
+        );
+
+        // No aggregate → no-op, no panic.
+        let untracked = FlowStats::default();
+        untracked.add_session_out(999);
+        untracked.add_session_in(999);
+    }
+
+    /// The `active_flows` gauge saturates at 0 — a stale cross-attempt
+    /// `FlowGauge::drop` can decrement more than were incremented, and an
+    /// `AtomicU64` `fetch_sub` would wrap to `u64::MAX`. The `fetch_update`
+    /// saturating decrement must clamp instead.
+    #[test]
+    fn active_flows_gauge_never_underflows() {
+        let session = Arc::new(SessionThroughput::default());
+        // Two live flows, then three drops (one stale) → clamps at 0, not wrap.
+        let g1 = FlowGauge::new(session.clone());
+        let g2 = FlowGauge::new(session.clone());
+        assert_eq!(session.active_flows.load(Ordering::Relaxed), 2);
+        drop(g1);
+        drop(g2);
+        assert_eq!(session.active_flows.load(Ordering::Relaxed), 0);
+        // An extra (stale) decrement clamps rather than wrapping to u64::MAX.
+        let _ = session
+            .active_flows
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            });
+        assert_eq!(session.active_flows.load(Ordering::Relaxed), 0);
+    }
+
+    /// `reset_active_flows` zeroes the gauge without touching cumulative bytes.
+    #[test]
+    fn reset_active_flows_leaves_bytes_untouched() {
+        let s = SessionThroughput::default();
+        s.bytes_in.fetch_add(500, Ordering::Relaxed);
+        s.bytes_out.fetch_add(700, Ordering::Relaxed);
+        s.active_flows.fetch_add(3, Ordering::Relaxed);
+        s.reset_active_flows();
+        assert_eq!(s.snapshot(), (500, 700, 0));
+    }
 
     /// Stress the [`FlowDemux`] with sustained traffic + the in-band
     /// half-close marker: send 256 KiB in 4-KiB framed chunks via
@@ -1034,7 +1214,7 @@ mod tests {
 
         let off_dc = offerer.dc(0).unwrap();
         let ans_dc = answerer.dc(0).unwrap();
-        let ans_demux = FlowDemux::install(ans_dc.clone()).await;
+        let ans_demux = FlowDemux::install(ans_dc.clone(), None).await;
         let (mut from_dc_answerer, _stats) = ans_demux.register(1).await;
 
         // Manual send loop — same framing as `pump_tcp_to_dc` but
@@ -1118,7 +1298,7 @@ mod tests {
 
         let off_dc = offerer.dc(0).unwrap();
         let ans_dc = answerer.dc(0).unwrap();
-        let ans_demux = FlowDemux::install(ans_dc).await;
+        let ans_demux = FlowDemux::install(ans_dc, None).await;
         let (mut from_dc, _stats) = ans_demux.register(42).await;
 
         let framed = mux::encode(42, b"hello world");
@@ -1180,7 +1360,7 @@ mod tests {
 
         let off_dc = offerer.dc(0).unwrap();
         let ans_dc = answerer.dc(0).unwrap();
-        let ans_demux = FlowDemux::install(ans_dc).await;
+        let ans_demux = FlowDemux::install(ans_dc, None).await;
         let (mut from_dc, _stats) = ans_demux.register(7).await;
 
         // Largest legal payload: framed length == CHUNK_BYTES == exactly
@@ -1221,7 +1401,7 @@ mod tests {
     async fn unregistered_flow_id_drops_messages_silently() {
         let peer = TunnelPeer::new(vec![]).await.unwrap();
         let dc = peer.dc(0).unwrap();
-        let _demux = FlowDemux::install(dc).await;
+        let _demux = FlowDemux::install(dc, None).await;
         // No register; flow_id 99 mailbox doesn't exist. No
         // assertion needed — if the handler panicked on unknown
         // flow ids, the test would fail by causing the runtime to
@@ -1347,9 +1527,9 @@ mod tests {
         // Client (offerer) receives the agent's echoes via a demux on
         // its own DC; agent (answerer) receives client datagrams via a
         // demux on its DC — the socket the pump owns.
-        let client_demux = FlowDemux::install(offerer.dc(0).unwrap()).await;
+        let client_demux = FlowDemux::install(offerer.dc(0).unwrap(), None).await;
         let (mut client_from_dc, _cs) = client_demux.register(flow_id).await;
-        let agent_demux = FlowDemux::install(answerer.dc(0).unwrap()).await;
+        let agent_demux = FlowDemux::install(answerer.dc(0).unwrap(), None).await;
         let (agent_from_dc, _as) = agent_demux.register(flow_id).await;
 
         // Agent pump: a UDP socket connected to the echo target.

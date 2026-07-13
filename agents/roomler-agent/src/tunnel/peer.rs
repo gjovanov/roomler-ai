@@ -138,7 +138,9 @@ impl AgentTunnelPeer {
                             warn!(%session_id, idx, "pool_open succeeded but dc({idx}) None — pool corrupt");
                             return;
                         };
-                        demuxes.push(FlowDemux::install(dc).await);
+                        // Agent target side has no session throughput aggregate
+                        // (the `flows` verb reports the daemon's CLIENT flows).
+                        demuxes.push(FlowDemux::install(dc, None).await);
                     }
                     // Idle keepalive: mirror the client — webrtc-dc has no
                     // built-in keepalive, so send a tiny frame over dc(0)

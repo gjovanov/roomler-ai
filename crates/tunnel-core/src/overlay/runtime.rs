@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
 use bson::oid::ObjectId;
@@ -70,6 +70,13 @@ struct Installed {
     /// Consecutive sweeps where we sent but received nothing (tx grew, rx
     /// flat). A few in a row ⇒ the direct carrier is one-way / dead.
     bad_sweeps: u32,
+    /// Monotonic instant the peer's rx IP-packet count last advanced — a real
+    /// "last seen from this peer" (P3b-3). Seeded to `since` at install;
+    /// advanced by `sweep_carrier_health` whenever rx climbs. Converted to an
+    /// absolute epoch-ms `last_seen_ms` in `build_overlay_view`. Sweep cadence
+    /// (`FALLBACK_TICK`, ~5 s) sets the granularity — fine for a human
+    /// "Ns/Nm ago" column, and passive keepalives keep it fresh for live peers.
+    last_rx_at: Instant,
 }
 
 /// Grace after install before the fallback can fire — lets the bilateral
@@ -244,22 +251,38 @@ pub struct OverlayRuntime {
 /// - not server-reachable → [`ConnectionType::Offline`]
 ///
 /// `Tunnel` is never produced here — that's the userspace-tunnel fallback the
-/// daemon labels once the tunnel-client folds in (P3). RTT / last-seen aren't
-/// tracked by the runtime yet, so both are `None`.
+/// daemon labels once the tunnel-client folds in (P3). `rtt_ms` isn't tracked by
+/// the runtime (the daemon fills it from an ICMP prober); `last_seen_ms` is the
+/// absolute epoch-ms of the peer's last inbound packet (P3b-3), `None` for a peer
+/// with no installed carrier.
+///
+/// `now` + `epoch_now_ms` are the monotonic + wall-clock references captured by
+/// the caller ([`publish_view`]); passed in (not read here) so this stays a pure
+/// function the tests can drive with a fixed clock.
 fn build_overlay_view(
     self_ip: &str,
     by_node: &HashMap<ObjectId, Installed>,
     current_peers: &HashMap<ObjectId, NetmapPeer>,
+    now: Instant,
+    epoch_now_ms: u64,
 ) -> OverlayView {
     let mut peers: Vec<PeerInfo> = current_peers
         .values()
         .map(|np| {
-            let connection = match by_node.get(&np.node_id) {
+            let inst = by_node.get(&np.node_id);
+            let connection = match inst {
                 Some(inst) if inst.is_direct => ConnectionType::Direct,
                 Some(_) => ConnectionType::Relay,
                 None if np.reachable => ConnectionType::Blocked,
                 None => ConnectionType::Offline,
             };
+            // Absolute epoch-ms of the last inbound packet (what the CLI's
+            // `fmt_last_seen` expects). Only a peer with an installed carrier
+            // has an `last_rx_at`; Blocked/Offline stay `None`.
+            let last_seen_ms = inst.map(|inst| {
+                let age_ms = now.saturating_duration_since(inst.last_rx_at).as_millis() as u64;
+                epoch_now_ms.saturating_sub(age_ms)
+            });
             PeerInfo {
                 node_id: np.node_id.to_hex(),
                 name: np.name.clone(),
@@ -268,7 +291,7 @@ fn build_overlay_view(
                 online: np.reachable,
                 connection,
                 rtt_ms: None,
-                last_seen_ms: None,
+                last_seen_ms,
             }
         })
         .collect();
@@ -359,9 +382,24 @@ impl OverlayRuntime {
         current_peers: &HashMap<ObjectId, NetmapPeer>,
     ) {
         if let Some(tx) = &self.peer_view {
+            // Capture both clocks together so `last_seen_ms` (absolute epoch-ms)
+            // is derived from the same instant the monotonic ages are measured
+            // against. `UNIX_EPOCH` is monotonic-safe here (a backwards wall
+            // clock only makes a last_seen look slightly newer).
+            let now = Instant::now();
+            let epoch_now_ms = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
             // send_replace never fails (unlike send) even if the receiver is
             // transiently absent, and keeps the value for the next borrow.
-            tx.send_replace(build_overlay_view(self_ip, by_node, current_peers));
+            tx.send_replace(build_overlay_view(
+                self_ip,
+                by_node,
+                current_peers,
+                now,
+                epoch_now_ms,
+            ));
         }
     }
 
@@ -639,6 +677,13 @@ impl OverlayRuntime {
             };
             let (last_tx, last_rx) = e.last_traffic;
             e.last_traffic = (tx, rx);
+            // P3b-3: rx advancing = a packet arrived FROM this peer → a real
+            // "last seen". Advance BEFORE the warm-up `continue` so a freshly
+            // installed peer's first inbound packets already register. Reuses
+            // the same lock-free `(tx,rx)` snapshot the health check reads.
+            if rx > last_rx {
+                e.last_rx_at = now;
+            }
             // Warm-up grace: let the handshake + first packets flow.
             if e.since.elapsed() < DIRECT_GRACE {
                 continue;
@@ -917,6 +962,7 @@ impl OverlayRuntime {
                 since: Instant::now(),
                 last_traffic: (0, 0),
                 bad_sweeps: 0,
+                last_rx_at: Instant::now(),
             },
         );
         if let Err(e) = tun.add_peer_route(cfg.overlay_ip).await {
@@ -998,6 +1044,7 @@ impl OverlayRuntime {
                 since: Instant::now(),
                 last_traffic: (0, 0),
                 bad_sweeps: 0,
+                last_rx_at: Instant::now(),
             },
         );
         // Host `/32` so overlay traffic to this peer beats any colliding
@@ -1093,7 +1140,7 @@ mod tests {
                 routes: vec![],
             }
         }
-        fn installed(is_direct: bool, ip: Ipv4Addr) -> Installed {
+        fn installed(is_direct: bool, ip: Ipv4Addr, last_rx_at: Instant) -> Installed {
             Installed {
                 pubkey: [0u8; 32],
                 overlay_ip: ip,
@@ -1101,13 +1148,26 @@ mod tests {
                 since: Instant::now(),
                 last_traffic: (0, 0),
                 bad_sweeps: 0,
+                last_rx_at,
             }
         }
 
+        // Fixed clock basis so the epoch-ms conversion is deterministic. Both
+        // the peers' `last_rx_at` and the view's `now` derive from this `now`.
+        let now = Instant::now();
+        let epoch_now_ms: u64 = 1_000_000_000_000;
         let (d, r, b, o) = (oid(0x01), oid(0x02), oid(0x03), oid(0x04));
         let mut by_node = HashMap::new();
-        by_node.insert(d, installed(true, Ipv4Addr::new(100, 64, 0, 1)));
-        by_node.insert(r, installed(false, Ipv4Addr::new(100, 64, 0, 2)));
+        // Direct peer last received a packet 10 s ago; relay peer just now.
+        by_node.insert(
+            d,
+            installed(
+                true,
+                Ipv4Addr::new(100, 64, 0, 1),
+                now.checked_sub(std::time::Duration::from_secs(10)).unwrap(),
+            ),
+        );
+        by_node.insert(r, installed(false, Ipv4Addr::new(100, 64, 0, 2), now));
 
         let mut current = HashMap::new();
         current.insert(d, np(d, "direct-peer", "100.64.0.1", true));
@@ -1115,7 +1175,7 @@ mod tests {
         current.insert(b, np(b, "pending-peer", "100.64.0.3", true)); // no carrier
         current.insert(o, np(o, "offline-peer", "100.64.0.4", false));
 
-        let view = build_overlay_view("100.64.0.9", &by_node, &current);
+        let view = build_overlay_view("100.64.0.9", &by_node, &current, now, epoch_now_ms);
         assert_eq!(view.self_ip.as_deref(), Some("100.64.0.9"));
         assert_eq!(view.peers.len(), 4);
         // Sorted by node_id hex → 01,02,03,04.
@@ -1131,9 +1191,14 @@ mod tests {
         );
         assert_eq!(view.peers[3].connection, ConnectionType::Offline);
         assert!(!view.peers[3].online);
-        // RTT / last-seen aren't tracked by the runtime yet.
+        // RTT isn't tracked by the runtime (the daemon's prober fills it).
         assert!(view.peers[0].rtt_ms.is_none());
-        assert!(view.peers[0].last_seen_ms.is_none());
+        // last_seen_ms is absolute epoch-ms of the last inbound packet: the
+        // direct peer 10 s ago, the relay peer ~now; carrier-less peers None.
+        assert_eq!(view.peers[0].last_seen_ms, Some(epoch_now_ms - 10_000));
+        assert_eq!(view.peers[1].last_seen_ms, Some(epoch_now_ms));
+        assert!(view.peers[2].last_seen_ms.is_none());
+        assert!(view.peers[3].last_seen_ms.is_none());
     }
 
     struct MockTun {
