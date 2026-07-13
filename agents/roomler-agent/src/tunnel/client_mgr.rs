@@ -44,6 +44,7 @@ use tracing::{debug, info, warn};
 use tunnel_core::driver::{
     SessionOutcome, SessionParams, Target, TransportPref, run_tunnel_session,
 };
+use tunnel_core::forward::SessionThroughput;
 use tunnel_core::localapi::{FlowInfo, FlowKind};
 use tunnel_core::signaling_link::{TunnelSignalingSink, TunnelSignalingSource};
 use tunnel_core::transport::TRANSPORT_WEBRTC_DC_V1;
@@ -118,6 +119,11 @@ struct FlowLive {
     session_id: Mutex<Option<ObjectId>>,
     /// Current in-flight open nonce.
     nonce: Mutex<Option<String>>,
+    /// Cumulative throughput for this forward (P3b-3). One `Arc`, created
+    /// with the flow and cloned into every `run_tunnel_session` attempt, so
+    /// `bytes_in`/`bytes_out` accumulate across WS reconnects; `active_flows`
+    /// is the live connection gauge. Read by [`TunnelClientHub::flows_snapshot`].
+    throughput: Arc<SessionThroughput>,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -174,11 +180,13 @@ impl TunnelClientHub {
     }
 
     /// Snapshot the registry as LocalAPI [`FlowInfo`]. Live throughput
-    /// (`bytes_in`/`bytes_out`/`active_flows`) is `0` for now — surfacing the
-    /// driver's per-flow `FlowStats` needs a session-stats handle threaded
-    /// through `run_tunnel_session`; deferred to P3b-3 alongside peer
-    /// rtt/last_seen. The `transport` column doubles as a liveness signal:
-    /// `connecting` / `down` until a session negotiates a concrete transport.
+    /// (`bytes_in`/`bytes_out`/`active_flows`) is read from each flow's shared
+    /// [`SessionThroughput`] aggregate (P3b-3): `bytes_*` are cumulative for
+    /// the forward's life (across WS reconnects); `active_flows` is the live
+    /// connection gauge. TCP payload only — SOCKS5 UDP-ASSOCIATE bytes are not
+    /// counted (they run on `FlowStats` with no session aggregate). The
+    /// `transport` column doubles as a liveness signal: `connecting` / `down`
+    /// until a session negotiates a concrete transport.
     pub fn flows_snapshot(&self) -> Vec<FlowInfo> {
         let flows = self.inner.flows.lock().unwrap();
         let mut out: Vec<FlowInfo> = flows
@@ -195,6 +203,7 @@ impl TunnelClientHub {
                 } else {
                     status_word(status).to_string()
                 };
+                let (bytes_in, bytes_out, active) = h.live.throughput.snapshot();
                 FlowInfo {
                     id: id.clone(),
                     kind: h.kind,
@@ -202,9 +211,9 @@ impl TunnelClientHub {
                     target: h.target.clone(),
                     node: Some(h.node.clone()),
                     transport,
-                    active_flows: 0,
-                    bytes_in: 0,
-                    bytes_out: 0,
+                    active_flows: active.min(u32::MAX as u64) as u32,
+                    bytes_in,
+                    bytes_out,
                 }
             })
             .collect();
@@ -655,6 +664,8 @@ async fn drive_one(
         },
         supported,
         request,
+        // Same Arc every attempt → cumulative bytes across reconnects (P3b-3).
+        live.throughput.clone(),
     )
     .await;
 
@@ -986,6 +997,15 @@ mod tests {
         *live.status.lock().unwrap() = FlowStatus::Up;
         *live.transport.lock().unwrap() = Some("quic-v1".into());
         assert_eq!(hub.flows_snapshot()[0].transport, "quic-v1");
+
+        // P3b-3: throughput surfaces from the flow's shared SessionThroughput.
+        live.throughput.bytes_in.fetch_add(1234, Ordering::Relaxed);
+        live.throughput.bytes_out.fetch_add(5678, Ordering::Relaxed);
+        live.throughput.active_flows.fetch_add(2, Ordering::Relaxed);
+        let snap = hub.flows_snapshot();
+        assert_eq!(snap[0].bytes_in, 1234);
+        assert_eq!(snap[0].bytes_out, 5678);
+        assert_eq!(snap[0].active_flows, 2);
 
         // kill removes it from the registry.
         assert!(hub.kill_flow("fl-1"));
