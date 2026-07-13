@@ -1062,6 +1062,19 @@ pub struct NetmapPeer {
     /// (non-router) peer or a pre-Phase-1 server (`#[serde(default)]`).
     #[serde(default)]
     pub routes: Vec<String>,
+    /// P3b-3 — the `agents._id` backing this overlay node, when the node is an
+    /// agent (`OverlayNode.node_ref == Agent`). `None` for a tunnel-client node
+    /// or a pre-P3b-3 server (`#[serde(default)]`). Lets a controlling node join
+    /// this overlay peer to a daemon-originated tunnel flow (which is keyed by
+    /// agent id, a DIFFERENT ObjectId namespace than `node_id` = overlay-node
+    /// id) and surface `ConnectionType::Tunnel`. `option_oid_hex` keeps it a
+    /// bare-hex string on the wire (NOT bson `{"$oid":…}`), matching `node_id`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "option_oid_hex"
+    )]
+    pub agent_id: Option<ObjectId>,
 }
 
 /// Network-wide parameters carried in a full netmap so the node can size
@@ -2025,6 +2038,9 @@ mod tests {
     #[test]
     fn overlay_netmap_roundtrip_with_raw_hex_node_id() {
         let node_id = ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap();
+        // P3b-3: the agent_id backing an agent node — a DISTINCT ObjectId from
+        // node_id (different namespace), so the test can assert both round-trip.
+        let agent_id = ObjectId::parse_str("aaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
         let m = ServerMsg::OverlayNetmap {
             self_ip: "100.64.0.3".into(),
             network: OverlayNetworkInfo {
@@ -2043,14 +2059,18 @@ mod tests {
                 reachable: true,
                 supports_quic: true,
                 routes: vec!["10.0.0.0/24".into()],
+                agent_id: Some(agent_id),
             }],
             epoch: 7,
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(r#""t":"rc:overlay.netmap""#));
-        // node_id is a bare hex string on the wire (no $oid).
+        // Both node_id AND the populated agent_id are bare hex on the wire (no
+        // $oid) — the latter locks the `option_oid_hex` serde (a bare
+        // `Option<ObjectId>` would leak bson `{"$oid":…}`, the B1 trap).
         assert!(!s.contains("$oid"));
         assert!(s.contains("\"507f1f77bcf86cd799439011\""));
+        assert!(s.contains("\"aaaaaaaaaaaaaaaaaaaaaaaa\""));
         match serde_json::from_str::<ServerMsg>(&s).unwrap() {
             ServerMsg::OverlayNetmap {
                 self_ip,
@@ -2062,9 +2082,25 @@ mod tests {
                 assert_eq!(epoch, 7);
                 assert_eq!(peers.len(), 1);
                 assert_eq!(peers[0].node_id, node_id);
+                assert_eq!(peers[0].agent_id, Some(agent_id));
             }
             other => panic!("expected OverlayNetmap, got {other:?}"),
         }
+    }
+
+    /// Back-compat: a netmap peer from a pre-P3b-3 server carries no `agent_id`
+    /// field → it deserialises to `None` (no Tunnel labelling), unchanged.
+    #[test]
+    fn netmap_peer_without_agent_id_defaults_to_none() {
+        let json = r#"{
+            "node_id":"507f1f77bcf86cd799439011",
+            "overlay_ip":"100.64.0.4",
+            "name":"neo16",
+            "wg_public_key":"cGVlcg==",
+            "reachable":true
+        }"#;
+        let p: NetmapPeer = serde_json::from_str(json).unwrap();
+        assert!(p.agent_id.is_none());
     }
 
     #[test]

@@ -327,6 +327,7 @@ mod tests {
             connection: ConnectionType::Direct,
             rtt_ms: None,
             last_seen_ms: None,
+            agent_id: None,
         }
     }
 
