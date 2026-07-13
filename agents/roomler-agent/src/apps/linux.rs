@@ -181,7 +181,7 @@ impl WindowManager for LinuxWm {
             let title = format!("roomler:tmux:{session}");
             self.spawn_detached(
                 "xterm",
-                &["-T", &title, "-e", "tmux", "attach", "-t", session],
+                &["-T", title.as_str(), "-e", "tmux", "attach", "-t", session],
                 "xterm",
             )
             .with_context(|| format!("attaching to tmux session {session}"))?;
@@ -216,7 +216,7 @@ impl WindowManager for LinuxWm {
             let session = next_tmux_session_name(&existing);
 
             // Create the detached session running the configured shell.
-            let mut new_args: Vec<&str> = vec!["new-session", "-d", "-s", &session];
+            let mut new_args: Vec<&str> = vec!["new-session", "-d", "-s", session.as_str()];
             new_args.extend(app.command.iter().map(String::as_str));
             let created = self.run_capture("tmux", &new_args, "tmux")?;
             if !created.status.success() {
@@ -230,7 +230,15 @@ impl WindowManager for LinuxWm {
             let title = format!("roomler:tmux:{session}");
             self.spawn_detached(
                 "xterm",
-                &["-T", &title, "-e", "tmux", "attach", "-t", &session],
+                &[
+                    "-T",
+                    title.as_str(),
+                    "-e",
+                    "tmux",
+                    "attach",
+                    "-t",
+                    session.as_str(),
+                ],
                 "xterm",
             )?;
 
@@ -244,7 +252,7 @@ impl WindowManager for LinuxWm {
         if app.terminal {
             // TUI app in an xterm titled by our convention.
             let title = format!("roomler:app:{}", app.key);
-            let mut args: Vec<&str> = vec!["-T", &title, "-e"];
+            let mut args: Vec<&str> = vec!["-T", title.as_str(), "-e"];
             args.extend(app.command.iter().map(String::as_str));
             self.spawn_detached("xterm", &args, "xterm")?;
             std::thread::sleep(LAUNCH_SETTLE);
