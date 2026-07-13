@@ -98,6 +98,13 @@ pub struct AgentCaps {
     /// caps builder only when the `audio` Cargo feature is compiled in.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub audio: Vec<String>,
+    /// Remote app selection & launch on virtual-desktop hosts. Present +
+    /// non-empty only when the agent can manage a desktop (Linux
+    /// virtual-desktop mode) AND `virtual_desktop_apps.enabled`. Known
+    /// values: `"list"`, `"focus"`, `"launch"`. Empty / unset (older
+    /// agents, non-VD hosts) → the browser hides the Apps menu.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub apps: Vec<String>,
 }
 
 /// How consent is obtained before a controller may drive a device. Resolved

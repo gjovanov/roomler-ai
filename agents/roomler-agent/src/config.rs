@@ -136,6 +136,14 @@ pub struct AgentConfig {
     #[serde(default)]
     pub forward_acl: AgentForwardAcl,
 
+    /// Remote app selection & launch on virtual-desktop hosts. Default:
+    /// enabled with a seeded bash/tmux entry so a headless VD host offers
+    /// "New bash session" out of the box. Operators add htop/mc/… per host
+    /// in the TOML. The browser only ever sends an allowlist KEY, never a
+    /// command line. See `agents/roomler-agent/src/apps/`.
+    #[serde(default)]
+    pub virtual_desktop_apps: crate::apps::VirtualDesktopAppsConfig,
+
     /// Phase 3b: opt into the overlay L3 mesh. Default off — an
     /// `overlay-l3` build only joins the mesh when this is set.
     #[serde(default)]
@@ -180,7 +188,7 @@ fn default_true() -> bool {
 /// Current schema version. Bumped whenever [`migrate`] gains a new
 /// step. Persisted into the config file by the migration so subsequent
 /// runs short-circuit the migration check.
-pub const CURRENT_SCHEMA_VERSION: &str = "0.3.0-rc.26";
+pub const CURRENT_SCHEMA_VERSION: &str = "0.3.0-rc.27";
 
 /// Apply schema migrations to `cfg` in place. Returns `true` when the
 /// caller should persist the mutated config via [`save`]. Safe to call
@@ -513,6 +521,7 @@ mod tests {
             last_run_unhealthy: false,
             config_schema_version: None,
             forward_acl: AgentForwardAcl::default(),
+            virtual_desktop_apps: crate::apps::VirtualDesktopAppsConfig::default(),
             overlay_enabled: false,
             overlay_wg_secret_key: None,
             overlay_advertised_routes: Vec::new(),
