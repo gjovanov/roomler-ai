@@ -1203,6 +1203,17 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     roomler_agent::files::set_remote_browse_enabled(browse_enabled);
     tracing::info!(browse_enabled, "file-DC remote browse capability");
 
+    // Remote app selection & launch (virtual-desktop hosts). Same
+    // process-global install as the browse flag above; the caps builder's
+    // `apps::apps_supported()` additionally gates on VD mode (a DISPLAY
+    // being set), so this is inert on non-VD hosts.
+    roomler_agent::apps::set_apps_config(cfg.virtual_desktop_apps.clone());
+    tracing::info!(
+        apps_enabled = cfg.virtual_desktop_apps.enabled,
+        apps_allowlist = cfg.virtual_desktop_apps.allowlist.len(),
+        "remote app-launch capability"
+    );
+
     // M3 A1 worker-role probe (perMachine MSI builds with the
     // `system-context` feature only). Reads the worker's own primary
     // token at startup and decides whether downstream plumbing
