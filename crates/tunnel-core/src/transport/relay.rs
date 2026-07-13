@@ -592,6 +592,25 @@ pub async fn allocate_turn_relay_tls(
     .await
     .with_context(|| format!("TCP connect to TURNS server {resolved} timed out"))?
     .with_context(|| format!("TCP connect to TURNS server {resolved}"))?;
+    // Keep the long-lived TURNS/TCP control connection warm. The `turn` client
+    // only writes on it at the sparse allocation-refresh (~10 min) + permission-
+    // refresh (~5 min) cadence; between those it's idle, and a corporate
+    // middlebox reaps an idle TCP → the next refresh hits a dead socket (os
+    // error 10054 "connection reset") → the relay carrier dies + churns + the
+    // overlay peer flaps to Blocked (fleet diag 2026-07-13: 870× "refresh
+    // allocation failed" on the corp host pc50045, while it kept re-allocating
+    // TURNS/TCP fine — a persistence, not a reachability, failure). A ~30 s TCP
+    // keepalive holds the 5-tuple open across the refresh gap AND surfaces a
+    // genuinely-dead path fast. Best-effort: a keepalive-set failure must never
+    // fail the allocation. `with_time`+`with_interval` are supported on Windows
+    // (SIO_KEEPALIVE_VALS) + Linux; `with_retries` is not portable, so omitted.
+    if let Err(e) = socket2::SockRef::from(&tcp).set_tcp_keepalive(
+        &socket2::TcpKeepalive::new()
+            .with_time(std::time::Duration::from_secs(30))
+            .with_interval(std::time::Duration::from_secs(15)),
+    ) {
+        tracing::debug!(%e, "TURNS/TCP: could not set TCP keepalive (non-fatal)");
+    }
     let adapter = TcpTurnConn::connect_tls(tcp, host)
         .await
         .with_context(|| format!("TLS handshake to TURNS server {host}"))?;
