@@ -28,7 +28,7 @@ use tracing::{debug, error, info, warn};
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 
-use crate::forward::{FlowDemux, HalfCloseSink, run_flow, run_flow_quic};
+use crate::forward::{FlowDemux, HalfCloseSink, SessionThroughput, run_flow, run_flow_quic};
 use crate::signaling_link::{TunnelSignalingSink, TunnelSignalingSource};
 use crate::transport::quic::{self, QuicConnection, QuicPeer};
 use crate::transport::relay;
@@ -182,7 +182,14 @@ pub async fn run_tunnel_session(
     params: SessionParams,
     supported_transports: Vec<String>,
     request_transport: &str,
+    session: Arc<SessionThroughput>,
 ) -> Result<SessionOutcome> {
+    // P3b-3: zero the per-session `active_flows` gauge at the start of each
+    // attempt so a prior session's leaked count (unclean WS teardown) can't
+    // carry over. Cumulative `bytes_*` are untouched — they accumulate for
+    // the whole forward's life across reconnects.
+    session.reset_active_flows();
+
     // Say hello — advertise every transport this client supports.
     sink.send(ClientMsg::TunnelHello {
         role: TunnelRole::Client,
@@ -263,6 +270,7 @@ pub async fn run_tunnel_session(
             ice_servers,
             local,
             &params.target,
+            session,
         )
         .await;
     }
@@ -273,6 +281,7 @@ pub async fn run_tunnel_session(
         ice_servers,
         local,
         &params.target,
+        session,
     )
     .await?;
     Ok(SessionOutcome::Completed)
@@ -289,6 +298,7 @@ async fn run_webrtc_session(
     ice_servers: Vec<IceServer>,
     local: u16,
     target: &Target,
+    session: Arc<SessionThroughput>,
 ) -> Result<()> {
     // ────────────── Build TunnelPeer + SDP/ICE handshake ───────────
     let rtc_ice_servers: Vec<RTCIceServer> = ice_servers
@@ -396,7 +406,9 @@ async fn run_webrtc_session(
         let dc = peer_for_dispatch
             .dc(idx)
             .with_context(|| format!("dc({idx}) returned None after pool_open"))?;
-        demuxes.push(FlowDemux::install(dc).await);
+        // All DCs in this session feed the same per-forward throughput
+        // aggregate (P3b-3) — every registered flow stamps it onto its stats.
+        demuxes.push(FlowDemux::install(dc, Some(session.clone())).await);
     }
     let demuxes = Arc::new(demuxes);
 
@@ -820,6 +832,7 @@ async fn run_quic_session(
     ice_servers: Vec<IceServer>,
     local: u16,
     target: &Target,
+    session: Arc<SessionThroughput>,
 ) -> Result<SessionOutcome> {
     let Some(token) = quic_auth_token else {
         warn!("server negotiated quic-v1 but sent no quic_auth_token — cannot authenticate");
@@ -995,6 +1008,7 @@ async fn run_quic_session(
         let target = target.clone();
         let conn = Arc::clone(&conn);
         let flow_counter_for_udp = Arc::clone(&flow_counter);
+        let session = Arc::clone(&session);
         tokio::spawn(async move {
             // Resolve the destination: static `--remote`, or the per-connection
             // SOCKS5 request (userspace mode). UDP ASSOCIATE forks off the UDP
@@ -1039,6 +1053,7 @@ async fn run_quic_session(
                 reply_registry,
                 active_flows,
                 socks,
+                session,
             )
             .await
             {
@@ -1323,6 +1338,7 @@ async fn handle_local_connection_quic(
     reply_registry: ReplyRegistry,
     active_flows: ActiveFlows,
     socks: bool,
+    session: Arc<SessionThroughput>,
 ) -> Result<()> {
     // Request the forward.
     sink.send(ClientMsg::TcpForwardRequest {
@@ -1379,7 +1395,14 @@ async fn handle_local_connection_quic(
         }
     };
 
-    let stats = Arc::new(crate::forward::FlowStats::default());
+    // Stamp the per-forward throughput aggregate (P3b-3) onto the flow's
+    // stats so `run_flow_quic`'s pumps mirror bytes + hold the active-flows
+    // gauge. (The `active_flows` map above is the QUIC path's own flow-id
+    // bookkeeping — distinct from the SessionThroughput gauge.)
+    let stats = Arc::new(crate::forward::FlowStats {
+        session: Some(session),
+        ..Default::default()
+    });
     debug!(flow_id, %peer_addr, "running quic flow");
     let close_reason = run_flow_quic(tcp, send, recv, flow_id, stats).await;
     info!(flow_id, ?close_reason, "quic flow ended");
@@ -1564,6 +1587,7 @@ mod tests {
                 reply_registry,
                 active_flows,
                 false,
+                Arc::new(SessionThroughput::default()),
             )
             .await
         });
