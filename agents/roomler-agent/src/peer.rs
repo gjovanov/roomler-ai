@@ -1189,6 +1189,7 @@ async fn media_pump(
                 lock_state_rx,
                 quality_state,
                 chroma_pref,
+                control_dc.clone(),
                 pc,
             )
             .await;
@@ -1858,6 +1859,12 @@ async fn media_pump_vp9_444_dc(
     lock_state_rx: tokio::sync::watch::Receiver<lock_state::LockState>,
     quality_state: Arc<std::sync::atomic::AtomicU8>,
     chroma_pref: Option<String>,
+    // Badge-truth — the control DC, so this pump finally sends
+    // `rc:video-info` (codec/encoder/chroma/transport) like the FFmpeg
+    // pump has since rc.87. Pre-badge-truth, libvpx sessions showed the
+    // browser's fallback label with no transport — one of the two causes
+    // of the field's "neither relay nor direct" badges.
+    control_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
     pc: Arc<RTCPeerConnection>,
 ) {
     // See `media_pump`: tracks lock-state transitions so we can
@@ -1936,6 +1943,12 @@ async fn media_pump_vp9_444_dc(
     }
     // Relay-escape — re-check the selected pair periodically (see the loop).
     let mut last_transport_check = std::time::Instant::now();
+    // Badge-truth — `rc:video-info` state (retry-until-delivered, mirroring
+    // the FFmpeg pump). `chroma_wire` tracks the ACTUAL chroma the encoder
+    // was built with (session pref / env / default), set at each rebuild.
+    let mut video_info_sent = false;
+    let mut last_video_info_attempt: Option<std::time::Instant> = None;
+    let mut chroma_wire: &'static str = "yuv444";
 
     let mut frames_captured: u64 = 0;
     let mut frames_encoded: u64 = 0;
@@ -2128,6 +2141,29 @@ async fn media_pump_vp9_444_dc(
                     } else {
                         DC_BUFFERED_HIGH_BYTES
                     };
+                    // Badge-truth: refresh the browser badge with the new
+                    // transport via the retry block below.
+                    video_info_sent = false;
+                }
+            }
+        }
+
+        // Badge-truth — deliver `rc:video-info` reliably (twin of the FFmpeg
+        // pump's block): libvpx sessions never sent it at all, so the badge
+        // fell back to a transport-less selection-derived label. Attempted
+        // whenever undelivered (encoder built + 500 ms since last try);
+        // rebuilds and transport flips clear `video_info_sent`.
+        if !video_info_sent
+            && last_video_info_attempt.is_none_or(|t| t.elapsed() >= VIDEO_INFO_RETRY)
+            && encoder.is_some()
+        {
+            last_video_info_attempt = Some(std::time::Instant::now());
+            let payload =
+                video_info_payload("vp9", "libvpx", false, chroma_wire, constrained_transport);
+            let cdc = control_dc.lock().await.clone();
+            if let Some(cdc) = cdc {
+                if cdc.send_text(payload).await.is_ok() {
+                    video_info_sent = true;
                 }
             }
         }
@@ -2262,6 +2298,10 @@ async fn media_pump_vp9_444_dc(
                 Ok(e) => {
                     encoder = Some(e);
                     encoder_dims = Some((w, h));
+                    // Badge-truth — record the ACTUAL chroma for the
+                    // `rc:video-info` retry block and (re)announce it.
+                    chroma_wire = chroma.as_str();
+                    video_info_sent = false;
                     // rc.33 — force quality re-apply on the new
                     // encoder. set_bitrate state lives on the
                     // encoder instance, so a rebuild reverts to the
@@ -2604,26 +2644,47 @@ impl FfmpegDcCodec {
     }
 }
 
-/// `rc:video-info` payload for the FFmpeg DC pump — one builder so the
-/// initial send (encoder build) and the relay-escape transport refresh emit
-/// the identical shape. `transport` is "relay"/"direct" so the browser's
-/// stats badge shows WHICH path this session actually took (field
-/// 2026-07-13: same-LAN sessions silently landing on the Germany TURN relay
-/// were indistinguishable from direct ones without log access).
-#[cfg(feature = "ffmpeg-encoder")]
-fn ffmpeg_video_info_payload(
-    codec: FfmpegDcCodec,
-    encoder_name: &str,
+/// `rc:video-info` payload — ONE builder shared by BOTH DC pumps (FFmpeg
+/// HEVC/vp9_qsv and libvpx VP9-444) so every session type reports the same
+/// shape. `transport` is "relay"/"direct" so the browser's stats badge shows
+/// WHICH path this session actually took (field 2026-07-13: same-LAN
+/// sessions silently landing on the Germany TURN relay were
+/// indistinguishable from direct ones without log access).
+///
+/// Badge-truth rc: the libvpx pump historically sent NO video-info at all,
+/// and the FFmpeg pump sent it exactly once at encoder build — which raced
+/// the control-DC open on slow (relay) sessions and silently lost the
+/// message (rc.87 latent bug, surfaced by the transport field: every
+/// "neither relay nor direct" badge in the 2026-07-13 field matrix was a
+/// relay or VP9 session). Both pumps now retry until delivered.
+///
+/// Always compiled (pump features gate the CALLERS) so the default-build
+/// unit test locks the wire shape, mirroring the signaling serde locks.
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+fn video_info_payload(
+    codec: &str,
+    encoder: &str,
+    hardware: bool,
+    chroma: &str,
     constrained: bool,
 ) -> String {
     format!(
-        r#"{{"t":"rc:video-info","codec":"{}","encoder":"{}","hardware":true,"chroma":"{}","transport":"{}"}}"#,
-        codec.wire_codec(),
-        encoder_name,
-        codec.wire_chroma(),
+        r#"{{"t":"rc:video-info","codec":"{codec}","encoder":"{encoder}","hardware":{hardware},"chroma":"{chroma}","transport":"{}"}}"#,
         if constrained { "relay" } else { "direct" },
     )
 }
+
+/// Retry cadence for an undelivered `rc:video-info` — the control DC opens
+/// within a second or two of session start (longer on relay), so a 500 ms
+/// re-attempt converges fast without hammering the mutex.
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+const VIDEO_INFO_RETRY: Duration = Duration::from_millis(500);
 
 /// rc.77/rc.83 — Unified FFmpeg-encoder DataChannel pump.
 ///
@@ -2664,10 +2725,13 @@ async fn media_pump_ffmpeg_dc(
     use crate::encode::ffmpeg::FfmpegEncoder;
 
     let codec_label = codec.label();
-    // rc.87 — emit `rc:video-info` once the encoder is built so the
-    // browser stats badge shows the TRUTH (real encoder + HW + chroma)
-    // instead of the hardcoded "VP9 4:4:4 SW". Sent once on first build.
+    // rc.87 — emit `rc:video-info` so the browser stats badge shows the
+    // TRUTH (real encoder + HW + chroma + transport). Badge-truth rc:
+    // RETRIED until delivered (see the loop-top block) — the old
+    // send-once-at-encoder-build raced the control-DC open on slow (relay)
+    // sessions and silently lost the message.
     let mut video_info_sent = false;
+    let mut last_video_info_attempt: Option<std::time::Instant> = None;
 
     // Mirror the VP9 pump's overlay gate. Under SystemContext the
     // captured frame IS the real Winlogon screen; an overlay over it
@@ -2871,15 +2935,38 @@ async fn media_pump_ffmpeg_dc(
                     && relay != constrained
                 {
                     constrained = relay;
-                    if let Some(enc_name) = encoder.as_ref().map(|e| e.name()) {
-                        let payload = ffmpeg_video_info_payload(codec, enc_name, constrained);
-                        let cdc = control_dc.lock().await.clone();
-                        if let Some(cdc) = cdc {
-                            if let Err(e) = cdc.send_text(payload).await {
-                                debug!(%session_id, %e, "rc:video-info transport refresh send failed");
-                            }
-                        }
-                    }
+                    // Badge-truth: the retry block below re-sends video-info
+                    // with the new transport (single send path, no lost
+                    // refresh when the control DC hiccups).
+                    video_info_sent = false;
+                }
+            }
+        }
+
+        // Badge-truth — deliver `rc:video-info` reliably. Attempted whenever
+        // undelivered (encoder built + 500 ms since the last try), instead of
+        // the old once-at-encoder-build send: on relay sessions the control
+        // DC often opens AFTER the first encoder build (Germany RTT), so the
+        // one-shot send failed and the badge fell back to a transport-less
+        // label — exactly the sessions where seeing "· relay" matters most
+        // (field 2026-07-13). A dim rebuild or a transport flip clears
+        // `video_info_sent`, so refreshes ride the same path.
+        if !video_info_sent
+            && last_video_info_attempt.is_none_or(|t| t.elapsed() >= VIDEO_INFO_RETRY)
+            && let Some(enc_name) = encoder.as_ref().map(|e| e.name())
+        {
+            last_video_info_attempt = Some(std::time::Instant::now());
+            let payload = video_info_payload(
+                codec.wire_codec(),
+                enc_name,
+                true,
+                codec.wire_chroma(),
+                constrained,
+            );
+            let cdc = control_dc.lock().await.clone();
+            if let Some(cdc) = cdc {
+                if cdc.send_text(payload).await.is_ok() {
+                    video_info_sent = true;
                 }
             }
         }
@@ -3038,23 +3125,13 @@ async fn media_pump_ffmpeg_dc(
                         encoder = encoder_name,
                         "FFmpeg DC pump: encoder (re)built"
                     );
-                    // rc.87 — tell the browser the real encoder so the
-                    // stats badge stops claiming "VP9 4:4:4 SW". Sent
-                    // once on first successful build. FFmpeg HEVC/VP9
-                    // paths are always HW (NVENC/QSV/AMF) and 4:2:0.
-                    // Relay-escape adds `transport` (re-sent on a
-                    // mid-session path change — see the loop-top block).
-                    if !video_info_sent {
-                        let payload = ffmpeg_video_info_payload(codec, encoder_name, constrained);
-                        let cdc = control_dc.lock().await.clone();
-                        if let Some(cdc) = cdc {
-                            if let Err(e) = cdc.send_text(payload).await {
-                                debug!(%session_id, %e, "rc:video-info send failed (control DC closed?)");
-                            } else {
-                                video_info_sent = true;
-                            }
-                        }
-                    }
+                    // rc.87/badge-truth — (re)announce the real encoder via
+                    // the loop-top retry block (the encoder name may change
+                    // across a rebuild if the dispatch cascade lands
+                    // elsewhere). The old inline one-shot send here raced
+                    // the control-DC open on relay sessions and lost the
+                    // message — retry-until-delivered replaced it.
+                    video_info_sent = false;
                     encoder = Some(enc);
                     encoder_dims = Some((w, h));
                     // Phase B — a fresh encoder starts at the full `ceiling`
@@ -5074,6 +5151,21 @@ mod codec_cap_tests {
 #[cfg(test)]
 mod tests {
     use super::quality::*;
+
+    // Badge-truth — lock the `rc:video-info` wire shape (both pumps emit
+    // through this one builder; the browser's parseControlInbound reads
+    // exactly these keys). Runs on the default build.
+    #[test]
+    fn video_info_payload_wire_shape() {
+        assert_eq!(
+            super::video_info_payload("h265", "hevc_nvenc", true, "yuv420", false),
+            r#"{"t":"rc:video-info","codec":"h265","encoder":"hevc_nvenc","hardware":true,"chroma":"yuv420","transport":"direct"}"#
+        );
+        assert_eq!(
+            super::video_info_payload("vp9", "libvpx", false, "yuv444", true),
+            r#"{"t":"rc:video-info","codec":"vp9","encoder":"libvpx","hardware":false,"chroma":"yuv444","transport":"relay"}"#
+        );
+    }
 
     #[test]
     fn from_wire_accepts_known_values_case_insensitively() {
