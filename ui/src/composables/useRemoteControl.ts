@@ -86,12 +86,16 @@ export type RcLogsFetchReply = {
  *  when a DC video pump opens its encoder. Lets the stats badge show
  *  the truth (e.g. "VP9 4:2:0 HW vp9_qsv") instead of the hardcoded
  *  "VP9 4:4:4 SW". `codec` is the negotiation vocabulary ("h265"/
- *  "vp9"); `chroma` is "yuv420"/"yuv444". */
+ *  "vp9"); `chroma` is "yuv420"/"yuv444". `transport` (relay-escape) is
+ *  "relay"/"direct" — WHICH ICE path this session took; the agent
+ *  re-sends the message when the path changes mid-session. '' from
+ *  agents older than the field. */
 export interface RcVideoInfo {
   codec: string
   encoder: string
   hardware: boolean
   chroma: string
+  transport: string
 }
 
 export type RcControlInbound =
@@ -136,6 +140,7 @@ export function parseControlInbound(data: unknown): RcControlInbound {
         encoder: obj.encoder,
         hardware: obj.hardware === true,
         chroma: typeof obj.chroma === 'string' ? obj.chroma : '',
+        transport: typeof obj.transport === 'string' ? obj.transport : '',
       },
     }
   }
