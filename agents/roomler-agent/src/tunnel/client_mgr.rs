@@ -222,6 +222,21 @@ impl TunnelClientHub {
         out
     }
 
+    /// The set of target node ids (hex agent ids) reached by a live (`Up`)
+    /// daemon tunnel flow (P3b-3). `DaemonState::peers()` overlays these as
+    /// [`tunnel_core::localapi::ConnectionType::Tunnel`] when the overlay
+    /// carrier is Blocked/Offline — the "reachable via the userspace forward
+    /// even though the WG carrier is down" signal. Only `Up` flows count, so a
+    /// connecting/backing-off flow doesn't prematurely claim Tunnel.
+    pub fn active_flow_agent_ids(&self) -> std::collections::HashSet<String> {
+        let flows = self.inner.flows.lock().unwrap();
+        flows
+            .values()
+            .filter(|h| *h.live.status.lock().unwrap() == FlowStatus::Up)
+            .map(|h| h.node.clone())
+            .collect()
+    }
+
     /// Create a supervised static forward. Validates the node id + remote +
     /// that `local` is bindable, then spawns the supervisor and returns the
     /// assigned flow id. `Err` is a user-facing message for the LocalAPI.
@@ -1011,6 +1026,38 @@ mod tests {
         assert!(hub.kill_flow("fl-1"));
         assert!(hub.flows_snapshot().is_empty());
         assert!(!hub.kill_flow("fl-1"), "second kill is a no-op false");
+    }
+
+    #[test]
+    fn active_flow_agent_ids_returns_only_up_flow_nodes() {
+        // P3b-3: the Tunnel-override join reads this — only `Up` flows count, so
+        // a connecting / backing-off flow doesn't prematurely claim Tunnel.
+        let hub = TunnelClientHub::new("test".into());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mk = |node: &str, status: FlowStatus| {
+            let live = Arc::new(FlowLive::default());
+            *live.status.lock().unwrap() = status;
+            FlowHandle {
+                abort: rt.spawn(async {}).abort_handle(),
+                kind: FlowKind::Forward,
+                local: 1,
+                target: None,
+                node: node.into(),
+                requested: "auto".into(),
+                live,
+            }
+        };
+        {
+            let mut flows = hub.inner.flows.lock().unwrap();
+            flows.insert("fl-1".into(), mk("aid-up", FlowStatus::Up));
+            flows.insert("fl-2".into(), mk("aid-connecting", FlowStatus::Connecting));
+            flows.insert("fl-3".into(), mk("aid-down", FlowStatus::Down));
+        }
+        let ids = hub.active_flow_agent_ids();
+        assert_eq!(ids.len(), 1);
+        assert!(ids.contains("aid-up"));
+        assert!(!ids.contains("aid-connecting"));
+        assert!(!ids.contains("aid-down"));
     }
 
     #[tokio::test]
