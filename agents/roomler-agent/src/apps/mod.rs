@@ -47,6 +47,8 @@ use serde_json::{Value, json};
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "windows")]
+mod windows;
 
 // ---------------------------------------------------------------------------
 // Wire types (agent → browser)
@@ -153,6 +155,19 @@ fn default_true() -> bool {
 impl Default for VirtualDesktopAppsConfig {
     fn default() -> Self {
         let mut allowlist = BTreeMap::new();
+        // Seed an OS-appropriate shell so a fresh host has one launchable
+        // entry out of the box; operators add more in the TOML.
+        #[cfg(target_os = "windows")]
+        allowlist.insert(
+            "cmd".to_string(),
+            AppSpec {
+                command: vec!["cmd.exe".to_string()],
+                label: Some("New Command Prompt".to_string()),
+                terminal: false,
+                tmux: false,
+            },
+        );
+        #[cfg(not(target_os = "windows"))]
         allowlist.insert(
             "bash".to_string(),
             AppSpec {
@@ -198,9 +213,15 @@ pub fn apps_supported() -> bool {
     }
     #[cfg(target_os = "linux")]
     {
+        // Linux: only in virtual-desktop mode (a DISPLAY is set).
         std::env::var_os("DISPLAY").is_some()
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    {
+        // Windows: the agent always drives the active user's desktop.
+        true
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         false
     }
@@ -214,7 +235,12 @@ pub fn backend(display: Option<&str>) -> Option<Box<dyn WindowManager>> {
     {
         display.map(|d| Box::new(linux::LinuxWm::new(d.to_string())) as Box<dyn WindowManager>)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    {
+        let _ = display;
+        Some(Box::new(windows::WindowsWm) as Box<dyn WindowManager>)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         let _ = display;
         None
@@ -541,12 +567,20 @@ mod tests {
     }
 
     #[test]
-    fn default_config_seeds_bash() {
+    fn default_config_seeds_a_shell() {
         let cfg = VirtualDesktopAppsConfig::default();
         assert!(cfg.enabled);
-        let bash = cfg.allowlist.get("bash").expect("bash seeded");
-        assert_eq!(bash.command, vec!["bash".to_string()]);
-        assert!(bash.tmux && bash.terminal);
+        #[cfg(target_os = "windows")]
+        {
+            let cmd = cfg.allowlist.get("cmd").expect("cmd seeded");
+            assert_eq!(cmd.command, vec!["cmd.exe".to_string()]);
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let bash = cfg.allowlist.get("bash").expect("bash seeded");
+            assert_eq!(bash.command, vec!["bash".to_string()]);
+            assert!(bash.tmux && bash.terminal);
+        }
     }
 
     #[test]
