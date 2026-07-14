@@ -502,6 +502,7 @@ async fn run_webrtc_session(
         let sink = sink.clone();
         let target = target.clone();
         let flow_counter_for_udp = Arc::clone(&flow_counter);
+        let session = Arc::clone(&session);
         tokio::spawn(async move {
             // Resolve the destination: the static `--remote`, or the
             // per-connection SOCKS5 request (userspace mode). A SOCKS5
@@ -519,6 +520,7 @@ async fn run_webrtc_session(
                             reply_registry,
                             sink,
                             flow_counter_for_udp,
+                            session,
                         )
                         .await
                         {
@@ -1025,6 +1027,7 @@ async fn run_quic_session(
                             reply_registry,
                             sink,
                             flow_counter_for_udp,
+                            session,
                         )
                         .await
                         {
