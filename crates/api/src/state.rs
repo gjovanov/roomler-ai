@@ -290,9 +290,39 @@ pub(crate) fn build_turn_config(turn: &roomler_ai_config::TurnSettings) -> Optio
     let secret = turn.shared_secret.as_ref()?.clone();
     let base = turn.url.as_deref()?;
 
-    // Expand a single `turn:host:port` into UDP/TCP/TLS variants the same way
-    // `ws/handler.rs::handle_media_join` already does for the media path, so
-    // the remote-control path behaves consistently behind NAT.
+    // Same-worker TURN affinity (2026-07-14): optional comma-separated
+    // per-worker base URLs, each expanded into the same transport variants
+    // as the generic hostname. The Hub then pins BOTH sides of a session to
+    // one worker (see `turn_creds::issue_for_session`) — the generic
+    // hostname is 3 DNS A records, so without this each ICE side resolves
+    // independently and relay↔relay sessions straddle two coturn workers.
+    // Unset → empty → exactly the old single-hostname behaviour.
+    let workers: Vec<Vec<String>> = turn
+        .worker_urls
+        .as_deref()
+        .map(|s| {
+            s.split(',')
+                .map(str::trim)
+                .filter(|w| !w.is_empty())
+                .map(expand_turn_url)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Some(TurnConfig {
+        urls: expand_turn_url(base),
+        workers,
+        shared_secret: secret,
+        ttl_secs: 600, // 10 minutes
+    })
+}
+
+/// Expand a single `turn:host:port` base into UDP/TCP/TLS variants the same
+/// way `ws/handler.rs::handle_media_join` already does for the media path, so
+/// the remote-control path behaves consistently behind NAT. Factored out of
+/// `build_turn_config` so the per-worker affinity URLs get the identical
+/// expansion.
+fn expand_turn_url(base: &str) -> Vec<String> {
     let mut urls = vec![base.to_string()];
     if base.starts_with("turn:") && !base.contains("?transport=") {
         // Plain TURN-over-UDP on :443 — same code path as the base URL, just
@@ -315,12 +345,7 @@ pub(crate) fn build_turn_config(turn: &roomler_ai_config::TurnSettings) -> Optio
         urls.push(format!("{}?transport=udp", turns_443));
         urls.push(format!("{}?transport=tcp", turns_443));
     }
-
-    Some(TurnConfig {
-        urls,
-        shared_secret: secret,
-        ttl_secs: 600, // 10 minutes
-    })
+    urls
 }
 
 /// Dependencies the Phase-4 owner-consent consumer needs — cheap `Arc` clones of
