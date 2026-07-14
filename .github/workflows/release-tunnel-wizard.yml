@@ -113,6 +113,10 @@ jobs:
         with:
           workspaces: '. -> target'
           shared-key: tunnel-wizard-linux
+          # Tag-ref cache saves can never be restored by a future tag run
+          # (GH cache isolation: own ref or default branch only) — only
+          # non-tag runs (dispatch rehearsals on master) save.
+          save-if: ${{ github.ref_type != 'tag' }}
       - name: Install Tauri Linux system deps
         # webkit2gtk + libsoup + ayatana for tray (tray is unused here
         # but the Tauri Linux runtime links to it; matches agent
@@ -173,6 +177,10 @@ jobs:
         with:
           workspaces: '. -> target'
           shared-key: tunnel-wizard-macos
+          # Tag-ref cache saves can never be restored by a future tag run
+          # (GH cache isolation: own ref or default branch only) — only
+          # non-tag runs (dispatch rehearsals on master) save.
+          save-if: ${{ github.ref_type != 'tag' }}
       - name: Build wizard x86_64
         run: cargo build -p roomler-tunnel-installer --release --target x86_64-apple-darwin
       - name: Build wizard aarch64
@@ -226,6 +234,10 @@ jobs:
         with:
           workspaces: '. -> target'
           shared-key: tunnel-wizard-windows
+          # Tag-ref cache saves can never be restored by a future tag run
+          # (GH cache isolation: own ref or default branch only) — only
+          # non-tag runs (dispatch rehearsals on master) save.
+          save-if: ${{ github.ref_type != 'tag' }}
       - name: Build wizard (release)
         shell: pwsh
         run: cargo build -p roomler-tunnel-installer --release
