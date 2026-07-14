@@ -1115,6 +1115,7 @@ mod turn_tests {
         let host = std::env::var("ROOMLER_TEST_TURN_HOST").ok()?;
         let secret = std::env::var("ROOMLER_TEST_TURN_SECRET").ok()?;
         let cfg = roomler_ai_remote_control::turn_creds::TurnConfig {
+            workers: vec![],
             urls: urls_for(&host),
             shared_secret: secret,
             ttl_secs: 600,

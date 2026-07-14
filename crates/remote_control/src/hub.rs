@@ -24,7 +24,7 @@ use crate::models::{AuditKind, ConsentMode, EndReason, OsKind, SessionPhase};
 use crate::permissions::Permissions;
 use crate::session::{ClientTx, LiveSession};
 use crate::signaling::{AgentCloseReason, ClientMsg, Role, ServerMsg};
-use crate::turn_creds::{TurnConfig, ice_servers_for};
+use crate::turn_creds::{TurnConfig, ice_servers_for_session};
 
 const SERVER_TX_CAPACITY: usize = 64;
 
@@ -465,7 +465,11 @@ impl Hub {
                 // Tell the controller it can send its offer.
                 if let Some(tx) = controller_tx {
                     let user_id = self.controller_for(session_id).unwrap_or_default();
-                    let ice = ice_servers_for(&user_id.to_hex(), self.inner.turn.as_ref());
+                    let ice = ice_servers_for_session(
+                        &user_id.to_hex(),
+                        &session_id.to_hex(),
+                        self.inner.turn.as_ref(),
+                    );
                     let _ = tx.try_send(ServerMsg::Ready {
                         session_id,
                         ice_servers: ice,
@@ -504,7 +508,11 @@ impl Hub {
     pub fn forward_offer(&self, session_id: ObjectId, sdp: String) -> Result<()> {
         let agent_id = self.with_session(session_id, |s| Ok(s.agent_id))?;
         let user_id = self.controller_for(session_id).unwrap_or_default();
-        let ice = ice_servers_for(&user_id.to_hex(), self.inner.turn.as_ref());
+        let ice = ice_servers_for_session(
+            &user_id.to_hex(),
+            &session_id.to_hex(),
+            self.inner.turn.as_ref(),
+        );
         let agent_tx = self.agent_tx(agent_id)?;
         agent_tx
             .try_send(ServerMsg::SdpOffer {
@@ -527,7 +535,11 @@ impl Hub {
             (s.controller_tx.clone(), s.controller_user_id)
         };
         let tx = controller_tx.ok_or(Error::SendFailed)?;
-        let ice = ice_servers_for(&user_id.to_hex(), self.inner.turn.as_ref());
+        let ice = ice_servers_for_session(
+            &user_id.to_hex(),
+            &session_id.to_hex(),
+            self.inner.turn.as_ref(),
+        );
         tx.try_send(ServerMsg::SdpAnswer {
             session_id,
             sdp,

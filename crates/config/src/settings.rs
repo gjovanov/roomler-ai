@@ -116,6 +116,12 @@ pub struct MediasoupSettings {
 #[derive(Debug, Deserialize, Clone)]
 pub struct TurnSettings {
     pub url: Option<String>,
+    /// Same-worker TURN affinity: comma-separated per-worker base URLs, one
+    /// per coturn worker (e.g.
+    /// "turn:coturn-1.roomler.ai:3478,turn:coturn-2.roomler.ai:3478").
+    /// Each is expanded into transport variants like `url`. Unset = no
+    /// affinity (single-hostname DNS round-robin behaviour).
+    pub worker_urls: Option<String>,
     pub username: Option<String>,
     pub password: Option<String>,
     pub shared_secret: Option<String>,
@@ -207,6 +213,7 @@ impl Settings {
             .set_default("mediasoup.rtc_min_port", 40000)?
             .set_default("mediasoup.rtc_max_port", 49999)?
             .set_default("turn.url", None::<String>)?
+            .set_default("turn.worker_urls", None::<String>)?
             .set_default("turn.username", None::<String>)?
             .set_default("turn.password", None::<String>)?
             .set_default("turn.force_relay", false)?
