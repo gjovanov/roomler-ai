@@ -234,10 +234,10 @@ impl SessionThroughput {
 /// pump lifetime. Increments on construction; saturating-decrements on
 /// `Drop` — which tokio runs when the owning task returns normally OR
 /// is aborted (`kill_flow`), so the gauge can't leak on either path.
-struct FlowGauge(Arc<SessionThroughput>);
+pub(crate) struct FlowGauge(Arc<SessionThroughput>);
 
 impl FlowGauge {
-    fn new(session: Arc<SessionThroughput>) -> Self {
+    pub(crate) fn new(session: Arc<SessionThroughput>) -> Self {
         session.active_flows.fetch_add(1, Ordering::Relaxed);
         Self(session)
     }
