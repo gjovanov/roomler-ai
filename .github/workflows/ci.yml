@@ -21,16 +21,20 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Cache Rust target directory
-        uses: actions/cache@v4
+      - name: Rust cache
+        # Swatinem prunes workspace-member artifacts + stale registry
+        # entries before saving — ~1–1.5 GB instead of the ~4 GB
+        # actions/cache tars (full ~/.cargo + target) this step used to
+        # write per Cargo.lock hash. Two of those were standing at once,
+        # blowing the repo's 10 GB Actions-cache budget and LRU-evicting
+        # the release lane's caches (agent-v0.3.0-rc.176 rebuilt FFmpeg
+        # from source for 29 min because of it).
+        continue-on-error: true
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          workspaces: '. -> target'
+          shared-key: ci-linux
+          cache-on-failure: true
 
       - name: Check formatting
         run: cargo fmt --check --all
