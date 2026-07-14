@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use boringtun::noise::{Tunn, TunnResult};
@@ -99,6 +99,12 @@ pub enum Carrier {
     Relay {
         conn: Arc<dyn RelayConn>,
         dst: SocketAddr,
+        /// rc.181 — latched when `send` hard-errors (a TURNS/TCP reset: the
+        /// `tcp-turn write: connection reset` the next send returns after a
+        /// corp middlebox reaps the idle control TCP). The runtime's health
+        /// sweep reads it via [`WgDevice::peer_carrier_dead`] and re-allocates
+        /// on the next tick, instead of waiting out the ~20 s rx-flat heuristic.
+        dead: AtomicBool,
     },
     /// Tier 2/3 + QUIC (opt-in): WG datagrams ride an unreliable QUIC
     /// datagram stream over a coturn allocation. QUIC's congestion control
@@ -110,6 +116,10 @@ pub enum Carrier {
     QuicRelay {
         _peer: QuicPeer,
         conn: quinn::Connection,
+        /// rc.181 — latched when `send_datagram` reports `ConnectionLost` (the
+        /// QUIC-over-TURN carrier died). Same fast re-allocate signal as
+        /// [`Carrier::Relay`]'s `dead`.
+        dead: AtomicBool,
     },
 }
 
@@ -119,7 +129,11 @@ impl Carrier {
     }
 
     pub fn relay(conn: Arc<dyn RelayConn>, dst: SocketAddr) -> Arc<Self> {
-        Arc::new(Carrier::Relay { conn, dst })
+        Arc::new(Carrier::Relay {
+            conn,
+            dst,
+            dead: AtomicBool::new(false),
+        })
     }
 
     /// Build a QUIC-over-TURN carrier over an existing TURN allocation `conn`,
@@ -168,6 +182,7 @@ impl Carrier {
         Ok(Arc::new(Carrier::QuicRelay {
             _peer: peer,
             conn: quic,
+            dead: AtomicBool::new(false),
         }))
     }
 
@@ -178,17 +193,51 @@ impl Carrier {
         matches!(self, Carrier::Direct { .. })
     }
 
+    /// rc.181 — a relay carrier whose `send` hard-errored (a TURNS/TCP reset,
+    /// or a lost QUIC-over-TURN connection). The runtime's health sweep treats
+    /// this as an immediate carrier death and re-allocates on the next tick,
+    /// without waiting out the multi-sweep rx-flat heuristic. Always `false`
+    /// for a direct carrier (its `send` failing is a dropped UDP datagram, not
+    /// a dead session).
+    pub fn is_dead(&self) -> bool {
+        match self {
+            Carrier::Direct { .. } => false,
+            Carrier::Relay { dead, .. } | Carrier::QuicRelay { dead, .. } => {
+                dead.load(Ordering::Relaxed)
+            }
+        }
+    }
+
     async fn send(&self, buf: &[u8]) -> io::Result<usize> {
         match self {
             Carrier::Direct { sock, dst } => sock.send_to(buf, *dst).await,
-            Carrier::Relay { conn, dst } => conn.send_to(buf, *dst).await,
+            // A TURNS/TCP write error (`tcp-turn write: connection reset`) or a
+            // dead UDP relay means the allocation is gone — latch `dead` so the
+            // health sweep re-allocates promptly (next ≤5 s tick) instead of
+            // waiting out the ~20 s rx-flat heuristic.
+            Carrier::Relay { conn, dst, dead } => {
+                let r = conn.send_to(buf, *dst).await;
+                if r.is_err() {
+                    dead.store(true, Ordering::Relaxed);
+                }
+                r
+            }
             // send_datagram queues on the connection (quinn's driver flushes it
-            // over the RelayUdpSocket); an over-budget/closed conn errors, which
-            // the WG layer treats like any dropped datagram.
-            Carrier::QuicRelay { conn, .. } => conn
-                .send_datagram(Bytes::copy_from_slice(buf))
-                .map(|()| buf.len())
-                .map_err(io::Error::other),
+            // over the RelayUdpSocket). `ConnectionLost` = the carrier died →
+            // latch `dead`; `TooLarge`/`Disabled`/`UnsupportedByPeer` are a
+            // healthy conn refusing THIS datagram, so the WG layer just treats
+            // them like any dropped datagram.
+            Carrier::QuicRelay { conn, dead, .. } => {
+                match conn.send_datagram(Bytes::copy_from_slice(buf)) {
+                    Ok(()) => Ok(buf.len()),
+                    Err(e) => {
+                        if matches!(e, quinn::SendDatagramError::ConnectionLost(_)) {
+                            dead.store(true, Ordering::Relaxed);
+                        }
+                        Err(io::Error::other(e))
+                    }
+                }
+            }
         }
     }
 
@@ -602,6 +651,15 @@ impl WgDevice {
             peer.stats.tx.load(Ordering::Relaxed),
             peer.stats.rx.load(Ordering::Relaxed),
         ))
+    }
+
+    /// rc.181 — `true` if `peer_public`'s carrier has latched a hard send error
+    /// (a TURNS/TCP reset or a lost QUIC-over-TURN connection); `false` for a
+    /// healthy or direct carrier; `None` if the peer is unknown. Lock-free. The
+    /// health sweep uses this as a FAST carrier-death signal — re-allocate on
+    /// the next tick instead of waiting for the multi-sweep rx-flat heuristic.
+    pub fn peer_carrier_dead(&self, peer_public: &[u8; 32]) -> Option<bool> {
+        Some(self.peers.get(peer_public)?.carrier.is_dead())
     }
 }
 
@@ -1046,5 +1104,75 @@ mod tests {
             return;
         };
         wg_over_two_live_allocations(&urls, &user, &cred).await;
+    }
+
+    // rc.181 — a `RelayConn` whose `send_to` always hard-errors, mirroring a
+    // TURNS/TCP `tcp-turn write: connection reset` after a corp middlebox reaps
+    // the idle control TCP. `recv_from` parks forever; `local_addr` is a stub.
+    struct FailingRelay;
+    #[async_trait::async_trait]
+    impl RelayConn for FailingRelay {
+        async fn send_to(&self, _buf: &[u8], _dst: SocketAddr) -> io::Result<usize> {
+            Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "tcp-turn write: connection reset (os error 10054)",
+            ))
+        }
+        async fn recv_from(&self, _buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+            std::future::pending().await
+        }
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok("127.0.0.1:0".parse().unwrap())
+        }
+    }
+
+    /// A `RelayConn` whose `send_to` always succeeds.
+    struct OkRelay;
+    #[async_trait::async_trait]
+    impl RelayConn for OkRelay {
+        async fn send_to(&self, buf: &[u8], _dst: SocketAddr) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+        async fn recv_from(&self, _buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+            std::future::pending().await
+        }
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok("127.0.0.1:0".parse().unwrap())
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_send_error_latches_carrier_dead() {
+        let dst: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let carrier = Carrier::relay(Arc::new(FailingRelay), dst);
+        assert!(!carrier.is_dead(), "a fresh relay carrier is alive");
+        let r = carrier.send(b"wg-datagram").await;
+        assert!(r.is_err(), "the mock relay hard-errors on send");
+        assert!(
+            carrier.is_dead(),
+            "a hard send error must latch the carrier dead so the sweep re-allocates on the next tick"
+        );
+    }
+
+    #[tokio::test]
+    async fn healthy_relay_send_keeps_carrier_alive() {
+        let dst: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let carrier = Carrier::relay(Arc::new(OkRelay), dst);
+        carrier.send(b"wg-datagram").await.expect("send ok");
+        assert!(
+            !carrier.is_dead(),
+            "a successful send must not mark the carrier dead"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_carrier_is_never_dead() {
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let dst: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let carrier = Carrier::direct(sock, dst);
+        // A direct (UDP) carrier is never "dead": a failed datagram is dropped,
+        // not a session death — so the sweep keeps using the rx-flat heuristic.
+        let _ = carrier.send(b"x").await;
+        assert!(!carrier.is_dead());
     }
 }
