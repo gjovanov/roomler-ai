@@ -435,40 +435,13 @@ pub async fn turn_credentials(
     State(state): State<AppState>,
     auth: AuthUser,
 ) -> Result<Json<TurnCredentialsResponse>, ApiError> {
-    // Build a fresh TurnConfig view the same way AppState does. We can't hold
-    // a TurnConfig in AppState because it's owned by the Hub; query it here
-    // via a small helper.
-    let turn_cfg = build_turn_config(&state.settings.turn);
+    // Build a fresh TurnConfig view the same way AppState does — reuses
+    // `state::build_turn_config` (a former inline duplicate). This route is
+    // session-less (a pre-fetch), so it issues the generic URL list; the
+    // per-session same-worker affinity happens on the Hub's issuance paths.
+    let turn_cfg = crate::state::build_turn_config(&state.settings.turn);
     let ice_servers = ice_servers_for(&auth.user_id.to_hex(), turn_cfg.as_ref());
     Ok(Json(TurnCredentialsResponse { ice_servers }))
-}
-
-fn build_turn_config(
-    turn: &roomler_ai_config::TurnSettings,
-) -> Option<roomler_ai_remote_control::turn_creds::TurnConfig> {
-    let secret = turn.shared_secret.as_ref()?.clone();
-    let base = turn.url.as_deref()?;
-    let mut urls = vec![base.to_string()];
-    if base.starts_with("turn:") && !base.contains("?transport=") {
-        // Plain TURN-over-UDP on :443 (webrtc-rs ICE agent CAN use this; many
-        // corporate firewalls drop UDP/3478 but allow UDP/443). See
-        // `state.rs::build_turn_config` for the full rationale.
-        let turn_443 = base.replace(":3478", ":443");
-        urls.push(format!("{}?transport=udp", turn_443));
-        urls.push(format!("{}?transport=tcp", base));
-        let turns_5349 = base
-            .replacen("turn:", "turns:", 1)
-            .replace(":3478", ":5349");
-        urls.push(format!("{}?transport=tcp", turns_5349));
-        let turns_443 = base.replacen("turn:", "turns:", 1).replace(":3478", ":443");
-        urls.push(format!("{}?transport=udp", turns_443));
-        urls.push(format!("{}?transport=tcp", turns_443));
-    }
-    Some(roomler_ai_remote_control::turn_creds::TurnConfig {
-        urls,
-        shared_secret: secret,
-        ttl_secs: 600,
-    })
 }
 
 // ────────────────────────────────────────────────────────────────────────────
