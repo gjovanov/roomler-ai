@@ -422,6 +422,12 @@ impl AgentPeer {
         // sync pump loop and writes from the async DC callback are
         // both brief.
         let target_resolution = Arc::new(std::sync::Mutex::new(TargetResolution::Native));
+        // Native (pre-downscale) capture dimensions, published by the
+        // active media pump each frame (packed w:h) so the cursor pump can
+        // express the OS cursor position in the encoded frame's pixel
+        // space when the controller downscales. 0 = no frame captured yet.
+        // rc.183 — remote-cursor offset fix at non-native resolutions.
+        let capture_native_dims = Arc::new(std::sync::atomic::AtomicU64::new(0));
         // Phase Y.3 (docs/vp9-444-plan.md). When the browser opens a
         // `video-bytes` data channel — only happens when both sides
         // negotiated `data-channel-vp9-444` transport in caps — we
@@ -707,6 +713,7 @@ impl AgentPeer {
         // Downloads folder.
         let quality_for_dc = quality_state.clone();
         let target_res_for_dc = target_resolution.clone();
+        let native_dims_for_dc = capture_native_dims.clone();
         // rc.130 — the control DC handler forces an encoder keyframe on the
         // browser's `rc:keyframe` (sent when its decode queue backs up and it
         // drops deltas to resync). Same atomic the media pumps already poll.
@@ -719,6 +726,7 @@ impl AgentPeer {
             info!(session = %session_id, %label, "data channel opened");
             let quality_for_dc = quality_for_dc.clone();
             let target_res_for_dc = target_res_for_dc.clone();
+            let native_dims_for_dc = native_dims_for_dc.clone();
             let keyframe_for_dc = keyframe_for_dc.clone();
             let video_bytes_stash = video_bytes_dc_for_callback.clone();
             let control_stash = control_dc_for_callback.clone();
@@ -742,7 +750,9 @@ impl AgentPeer {
                             keyframe_for_dc,
                         )
                     }
-                    "cursor" => attach_cursor_handler(dc, session_id),
+                    "cursor" => {
+                        attach_cursor_handler(dc, session_id, target_res_for_dc, native_dims_for_dc)
+                    }
                     #[cfg(feature = "clipboard")]
                     "clipboard" => attach_clipboard_handler(dc, session_id),
                     "files" => attach_files_handler(dc, session_id),
@@ -820,6 +830,7 @@ impl AgentPeer {
             // for an honest stats badge.
             control_dc.clone(),
             pc.clone(),
+            capture_native_dims,
         ));
 
         Ok(Self {
@@ -1063,6 +1074,10 @@ async fn media_pump(
     // THIS session's actual ICE path (relay vs direct) at runtime instead
     // of the process-wide `ROOMLER_AGENT_ICE_RELAY_TCP` env flag.
     pc: Arc<RTCPeerConnection>,
+    // Published each frame with the native (pre-downscale) capture dims so
+    // the cursor pump can scale the OS cursor position into the encoded
+    // frame's space (rc.183). Packed w:h; 0 until the first frame.
+    capture_native_dims: Arc<std::sync::atomic::AtomicU64>,
 ) {
     // `pc` is consumed only by the VP9-444 DC pump's per-session transport
     // detection (feature-gated); keep the signalling-only / non-vp9 build
@@ -1114,6 +1129,7 @@ async fn media_pump(
                     quality_state,
                     control_dc.clone(),
                     pc.clone(),
+                    capture_native_dims,
                 )
                 .await;
             }
@@ -1170,6 +1186,7 @@ async fn media_pump(
                         quality_state,
                         control_dc.clone(),
                         pc.clone(),
+                        capture_native_dims,
                     )
                     .await;
                 }
@@ -1191,6 +1208,7 @@ async fn media_pump(
                 chroma_pref,
                 control_dc.clone(),
                 pc,
+                capture_native_dims,
             )
             .await;
         }
@@ -1387,6 +1405,16 @@ async fn media_pump(
         // native since upsampling wastes encoder budget on interpolated
         // pixels that carry no new information). On resolution change
         // the `encoder_dims` check below rebuilds the encoder.
+        // Publish the native (pre-downscale) dims so the cursor pump can
+        // map the OS cursor into the encoded frame's pixel space (rc.183).
+        // `frame` here is still native — apply_target_resolution is what
+        // downscales it. On HW paths (DownscalePolicy::Never) this is the
+        // true monitor resolution; that's every host that hits the DC
+        // video pumps in the field.
+        capture_native_dims.store(
+            pack_dims(frame.width, frame.height),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let frame = apply_target_resolution(frame, *target_resolution.lock().unwrap());
 
         // Lock-screen overlay (M3 phase 3, Z-path). When the user-
@@ -1866,6 +1894,8 @@ async fn media_pump_vp9_444_dc(
     // of the field's "neither relay nor direct" badges.
     control_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
     pc: Arc<RTCPeerConnection>,
+    // rc.183 — publish native pre-downscale dims for the cursor pump.
+    capture_native_dims: Arc<std::sync::atomic::AtomicU64>,
 ) {
     // See `media_pump`: tracks lock-state transitions so we can
     // request a keyframe on the lock/unlock boundary.
@@ -2240,6 +2270,16 @@ async fn media_pump_vp9_444_dc(
         // requirement. The encoder rejects odd dims — round down by 1
         // to cover the rare case where the resolution control message
         // landed an odd value.
+        // Publish the native (pre-downscale) dims so the cursor pump can
+        // map the OS cursor into the encoded frame's pixel space (rc.183).
+        // `frame` here is still native — apply_target_resolution is what
+        // downscales it. On HW paths (DownscalePolicy::Never) this is the
+        // true monitor resolution; that's every host that hits the DC
+        // video pumps in the field.
+        capture_native_dims.store(
+            pack_dims(frame.width, frame.height),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let frame = apply_target_resolution(frame, *target_resolution.lock().unwrap());
 
         // Lock-screen overlay (M3 phase 3, Z-path). Same logic as
@@ -2720,6 +2760,8 @@ async fn media_pump_ffmpeg_dc(
     // actual ICE path (relay vs direct) at runtime for the per-session
     // bitrate/fps clamp instead of the process-wide env flag.
     pc: Arc<RTCPeerConnection>,
+    // rc.183 — publish native pre-downscale dims for the cursor pump.
+    capture_native_dims: Arc<std::sync::atomic::AtomicU64>,
 ) {
     use crate::encode::VideoEncoder;
     use crate::encode::ffmpeg::FfmpegEncoder;
@@ -3098,6 +3140,16 @@ async fn media_pump_ffmpeg_dc(
         // on a weak iGPU — frames_empty ≫ frames_encoded) it does NOT raise
         // fps; it's a bandwidth/quality lever, not a capture-fps fix. Hosts
         // that are genuinely encode-bound do gain fps from the smaller encode.
+        // Publish the native (pre-downscale) dims so the cursor pump can
+        // map the OS cursor into the encoded frame's pixel space (rc.183).
+        // `frame` here is still native — apply_target_resolution is what
+        // downscales it. On HW paths (DownscalePolicy::Never) this is the
+        // true monitor resolution; that's every host that hits the DC
+        // video pumps in the field.
+        capture_native_dims.store(
+            pack_dims(frame.width, frame.height),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let frame = apply_target_resolution(frame, *target_resolution.lock().unwrap());
 
         // Lazily build / rebuild the encoder when the frame dims change.
@@ -3792,7 +3844,17 @@ fn attach_control_handler(
 /// bitmaps by HCURSOR handle so repeated polls at the same shape only
 /// send position updates — on a static cursor the bitmap pays for
 /// itself once per shape change (arrow → I-beam → hand → etc.).
-fn attach_cursor_handler(dc: Arc<RTCDataChannel>, session_id: bson::oid::ObjectId) {
+fn attach_cursor_handler(
+    dc: Arc<RTCDataChannel>,
+    session_id: bson::oid::ObjectId,
+    // Shared with the media pump so the streamed cursor position tracks
+    // the encoded frame's pixel space when the controller downscales
+    // (rc.183 remote-cursor offset fix). `target_resolution` = the
+    // controller-chosen encode target; `capture_native_dims` = the
+    // native pre-downscale dims the active pump publishes each frame.
+    target_resolution: Arc<std::sync::Mutex<TargetResolution>>,
+    capture_native_dims: Arc<std::sync::atomic::AtomicU64>,
+) {
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as BASE64;
 
@@ -3846,11 +3908,22 @@ fn attach_cursor_handler(dc: Arc<RTCDataChannel>, session_id: bson::oid::ObjectI
                             let _ = dc.send_text(s).await;
                         }
                     }
+                    // Express the native-pixel cursor position in the
+                    // encoded frame's pixel space so the browser overlay
+                    // (which divides by the decoded `mediaIntrinsicW/H`)
+                    // lands correctly when the controller downscales.
+                    // No-op (scale 1.0) at native resolution. The shape
+                    // hotspot is bitmap-local and stays unscaled — the
+                    // browser subtracts it after this multiply.
+                    let (sx, sy) = cursor_encode_scale(
+                        capture_native_dims.load(std::sync::atomic::Ordering::Relaxed),
+                        *target_resolution.lock().unwrap(),
+                    );
                     let msg = serde_json::json!({
                         "t": "cursor:pos",
                         "id": tick.shape_id,
-                        "x": tick.x,
-                        "y": tick.y,
+                        "x": (tick.x as f32 * sx).round() as i32,
+                        "y": (tick.y as f32 * sy).round() as i32,
                     });
                     if let Ok(s) = serde_json::to_string(&msg)
                         && dc.send_text(s).await.is_err()
@@ -3916,6 +3989,57 @@ fn apply_target_resolution(
         // default until we wire per-rect scaling.
         dirty_rects: Vec::new(),
     })
+}
+
+/// Pack `(width, height)` into one `u64` (hi 32 = w, lo 32 = h) so the
+/// media pumps can publish the current native capture dimensions to the
+/// cursor pump through a single lock-free `AtomicU64`. `0` means "no
+/// frame captured yet".
+fn pack_dims(w: u32, h: u32) -> u64 {
+    ((w as u64) << 32) | (h as u64)
+}
+
+/// Per-axis scale factor the frame downscale applies to a captured frame,
+/// so the remote-cursor overlay lands on the right pixel when the
+/// controller selects a resolution below native.
+///
+/// The cursor DC streams the OS cursor position in **native** capture
+/// pixels (`GetCursorPos`), but the *video* frame is downscaled by
+/// [`apply_target_resolution`] before encode, so the browser sees the
+/// **encoded** dimensions (`mediaIntrinsicW/H`, read from the decoded
+/// frame) and computes the overlay as `pos.x * visibleW / mediaIntrinsicW`.
+/// When native ≠ encoded that overshoots by `native/encoded` (e.g.
+/// 1920/1280 = 1.5×) — the field-reported "mouse lands in a different
+/// place at non-original resolution" bug. Scaling `pos` by this factor on
+/// the agent puts the cursor in the same pixel space as the frame, so the
+/// browser math is correct with no viewer change.
+///
+/// Mirrors `apply_target_resolution`'s cap-at-native rule EXACTLY: a
+/// target ≥ native on both axes is a no-op there, so it must return
+/// `(1.0, 1.0)` here — a non-downscaled session is byte-for-byte
+/// unchanged. `(sx, sy)` are in `(0, 1]` for the normal (uniformly
+/// smaller) target.
+fn cursor_encode_scale(native_dims: u64, target: TargetResolution) -> (f32, f32) {
+    let nw = (native_dims >> 32) as u32;
+    let nh = (native_dims & 0xFFFF_FFFF) as u32;
+    if nw == 0 || nh == 0 {
+        // No native dims yet → don't scale (matches pre-fix behaviour
+        // until the first frame lands).
+        return (1.0, 1.0);
+    }
+    match target {
+        TargetResolution::Native => (1.0, 1.0),
+        TargetResolution::Fixed { width, height } => {
+            // apply_target_resolution returns the frame untouched when
+            // `width >= nw && height >= nh` (or a zero dim) — the cursor
+            // stays native-space in that case too.
+            if width == 0 || height == 0 || (width >= nw && height >= nh) {
+                (1.0, 1.0)
+            } else {
+                (width as f32 / nw as f32, height as f32 / nh as f32)
+            }
+        }
+    }
 }
 
 /// CPU box-filter downscale for BGRA frames. For each destination
@@ -5165,6 +5289,87 @@ mod tests {
             super::video_info_payload("vp9", "libvpx", false, "yuv444", true),
             r#"{"t":"rc:video-info","codec":"vp9","encoder":"libvpx","hardware":false,"chroma":"yuv444","transport":"relay"}"#
         );
+    }
+
+    // rc.183 — remote-cursor downscale mapping. `cursor_encode_scale`
+    // must mirror `apply_target_resolution`'s cap-at-native rule so the
+    // streamed cursor position lands on the encoded frame's pixel space.
+    #[test]
+    fn cursor_encode_scale_identity_at_native_target() {
+        let native = super::pack_dims(1920, 1200);
+        assert_eq!(
+            super::cursor_encode_scale(native, super::TargetResolution::Native),
+            (1.0, 1.0)
+        );
+    }
+
+    #[test]
+    fn cursor_encode_scale_halves_at_half_resolution() {
+        let native = super::pack_dims(1920, 1200);
+        let (sx, sy) = super::cursor_encode_scale(
+            native,
+            super::TargetResolution::Fixed {
+                width: 960,
+                height: 600,
+            },
+        );
+        assert!((sx - 0.5).abs() < 1e-6, "sx={sx}");
+        assert!((sy - 0.5).abs() < 1e-6, "sy={sy}");
+    }
+
+    #[test]
+    fn cursor_encode_scale_fixes_1280_overshoot() {
+        // The field-reported case: 1920×1200 native, 1280×800 encode.
+        // A cursor at native x=1920 must map to encoded x=1280 (the
+        // frame's right edge), killing the prior 1.5× overshoot.
+        let native = super::pack_dims(1920, 1200);
+        let (sx, _sy) = super::cursor_encode_scale(
+            native,
+            super::TargetResolution::Fixed {
+                width: 1280,
+                height: 800,
+            },
+        );
+        assert!((1920.0 * sx - 1280.0).abs() < 1.0, "1920*{sx} != ~1280");
+    }
+
+    #[test]
+    fn cursor_encode_scale_caps_at_native_no_upscale() {
+        // Target ≥ native on both axes → apply_target_resolution is a
+        // no-op, so the cursor must NOT be upscaled.
+        let native = super::pack_dims(1920, 1200);
+        assert_eq!(
+            super::cursor_encode_scale(
+                native,
+                super::TargetResolution::Fixed {
+                    width: 3840,
+                    height: 2160,
+                },
+            ),
+            (1.0, 1.0)
+        );
+    }
+
+    #[test]
+    fn cursor_encode_scale_identity_before_first_frame() {
+        // native_dims == 0 (no frame captured yet) must not scale.
+        assert_eq!(
+            super::cursor_encode_scale(
+                0,
+                super::TargetResolution::Fixed {
+                    width: 1280,
+                    height: 800,
+                },
+            ),
+            (1.0, 1.0)
+        );
+    }
+
+    #[test]
+    fn pack_dims_round_trips() {
+        let packed = super::pack_dims(2560, 1600);
+        assert_eq!((packed >> 32) as u32, 2560);
+        assert_eq!((packed & 0xFFFF_FFFF) as u32, 1600);
     }
 
     #[test]
