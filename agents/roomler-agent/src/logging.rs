@@ -84,7 +84,22 @@ pub fn init() {
     // else in `tunnel_core` is debug/trace and stays suppressed; the
     // chatty `webrtc_sctp` / `webrtc_ice` targets stay at warn.
     let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("roomler_agent=info,tunnel_core=info,warn"));
+        .unwrap_or_else(|_| EnvFilter::new("roomler_agent=info,tunnel_core=info,warn"))
+        // rc.181 — silence the `turn` crate's periodic refresh-failure warns
+        // (`refresh allocation/permissions failed`, target `turn::client::relay_conn`).
+        // Now that the overlay re-allocates a dead relay carrier on the send-error
+        // signal (wg.rs `Carrier::dead` → `sweep_carrier_health`), these are
+        // transient noise — one every ~5–10 min per corp-VPN host — and they
+        // dominate the error/warn-biased agent_logs upload. Appended
+        // UNCONDITIONALLY (even when the SCM service sets `RUST_LOG` wholesale) so
+        // it lands fleet-wide on the next binary, not just fresh installs. The
+        // sweep's own `relay carrier … — re-allocating` warn is the actionable
+        // signal that replaces them.
+        .add_directive(
+            "turn::client::relay_conn=error"
+                .parse()
+                .expect("static EnvFilter directive is valid"),
+        );
 
     let stdout = fmt::layer().with_target(false).compact();
 
