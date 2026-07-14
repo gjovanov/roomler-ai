@@ -275,6 +275,7 @@ fn test_settings() -> Settings {
             rtc_max_port: 40100,
         },
         turn: roomler_ai_config::TurnSettings {
+            worker_urls: None,
             url: None,
             username: None,
             password: None,
