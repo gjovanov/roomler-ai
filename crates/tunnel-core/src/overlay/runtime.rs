@@ -672,8 +672,8 @@ impl OverlayRuntime {
         current_peers: &HashMap<ObjectId, NetmapPeer>,
     ) {
         let now = Instant::now();
-        // (node_id, was_direct)
-        let mut dead: Vec<(ObjectId, bool)> = Vec::new();
+        // (node_id, was_direct, hard_dead)
+        let mut dead: Vec<(ObjectId, bool, bool)> = Vec::new();
         for (nid, e) in by_node.iter_mut() {
             let Some((tx, rx)) = wg.peer_traffic(&e.pubkey) else {
                 continue;
@@ -687,8 +687,15 @@ impl OverlayRuntime {
             if rx > last_rx {
                 e.last_rx_at = now;
             }
+            // rc.181 — a relay carrier whose underlying send hard-errored (a
+            // TURNS/TCP reset, or a lost QUIC-over-TURN connection) is dead
+            // NOW. Skip BOTH the warm-up grace and the multi-sweep rx-flat
+            // heuristic for it and re-allocate on this tick (still rate-limited
+            // by `relay_refresh_cooldown` below). Always `false` for a direct
+            // carrier, so this only ever fast-paths a relay.
+            let hard_dead = wg.peer_carrier_dead(&e.pubkey).unwrap_or(false);
             // Warm-up grace: let the handshake + first packets flow.
-            if e.since.elapsed() < DIRECT_GRACE {
+            if !hard_dead && e.since.elapsed() < DIRECT_GRACE {
                 continue;
             }
             // Sent this interval but received nothing back ⇒ suspect. (If we
@@ -705,7 +712,7 @@ impl OverlayRuntime {
                     direct_fail_count.remove(nid);
                 }
             }
-            if e.bad_sweeps >= BAD_SWEEPS_TO_FALLBACK {
+            if e.bad_sweeps >= BAD_SWEEPS_TO_FALLBACK || hard_dead {
                 // For a relay, hold off if we just refreshed it (anti-ping-pong).
                 if !e.is_direct
                     && relay_refresh_cooldown
@@ -714,10 +721,10 @@ impl OverlayRuntime {
                 {
                     continue;
                 }
-                dead.push((*nid, e.is_direct));
+                dead.push((*nid, e.is_direct, hard_dead));
             }
         }
-        for (nid, was_direct) in dead {
+        for (nid, was_direct, hard_dead) in dead {
             let Some(e) = by_node.remove(&nid) else {
                 continue;
             };
@@ -745,10 +752,17 @@ impl OverlayRuntime {
                 }
             } else {
                 relay_refresh_cooldown.insert(nid, now + RELAY_REFRESH_COOLDOWN);
-                warn!(
-                    peer = %nid,
-                    "overlay: relay carrier one-way (stale coturn port?) — re-allocating"
-                );
+                if hard_dead {
+                    warn!(
+                        peer = %nid,
+                        "overlay: relay carrier send hard-errored (TURNS/TCP reset / QUIC-over-TURN lost) — re-allocating"
+                    );
+                } else {
+                    warn!(
+                        peer = %nid,
+                        "overlay: relay carrier one-way (stale coturn port?) — re-allocating"
+                    );
+                }
             }
             // (Re)request the relay now (don't wait for the next netmap). For a
             // refresh we first forget the stale allocation so a fresh one is made.
