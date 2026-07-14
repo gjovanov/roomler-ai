@@ -31,8 +31,8 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 use crate::forward::{
-    FlowDemux, MAX_UDP_DATAGRAM, UDP_FLOW_IDLE_TIMEOUT, deframe_udp_datagram, quic_read_datagram,
-    quic_write_datagram, send_udp_datagram_dc,
+    FlowDemux, FlowGauge, MAX_UDP_DATAGRAM, SessionThroughput, UDP_FLOW_IDLE_TIMEOUT,
+    deframe_udp_datagram, quic_read_datagram, quic_write_datagram, send_udp_datagram_dc,
 };
 use crate::signaling_link::TunnelSignalingSink;
 use crate::transport::quic::{self, QuicConnection};
@@ -67,6 +67,11 @@ pub async fn handle_associate(
     reply_registry: ReplyRegistry,
     sink: Arc<dyn TunnelSignalingSink>,
     flow_counter: Arc<AtomicU32>,
+    // P3b-4: the per-forward throughput aggregate. Each UDP flow's pump
+    // mirrors datagram bytes into it (out = app→target, in = target→app) and
+    // holds a `FlowGauge` for `active_flows`, so `roomler flows` reports UDP
+    // the same way it reports TCP CONNECT flows (previously always 0 B).
+    session: Arc<SessionThroughput>,
 ) -> Result<()> {
     let relay = Arc::new(
         UdpSocket::bind(("127.0.0.1", 0))
@@ -120,6 +125,7 @@ pub async fn handle_associate(
                     &reply_registry,
                     &sink,
                     &flow_counter,
+                    &session,
                 )
                 .await;
                 // Lossy hand-off — a full/closed outbox drops the datagram.
@@ -149,6 +155,7 @@ async fn get_or_open_flow(
     reply_registry: &ReplyRegistry,
     sink: &Arc<dyn TunnelSignalingSink>,
     flow_counter: &Arc<AtomicU32>,
+    session: &Arc<SessionThroughput>,
 ) -> FlowTx {
     let key = (host.to_string(), port);
     let mut map = flows.lock().await;
@@ -167,10 +174,11 @@ async fn get_or_open_flow(
     match carrier {
         AssocCarrier::Dc { demuxes } => {
             let demuxes = Arc::clone(demuxes);
+            let session = Arc::clone(session);
             tokio::spawn(async move {
                 run_flow_dc(
                     session_id, flow_id, host_owned, port, demuxes, relay2, app_src, frx,
-                    registry2, outbound2,
+                    registry2, outbound2, session,
                 )
                 .await;
                 flows2.lock().await.remove(&key);
@@ -178,10 +186,11 @@ async fn get_or_open_flow(
         }
         AssocCarrier::Quic { conn } => {
             let conn = Arc::clone(conn);
+            let session = Arc::clone(session);
             tokio::spawn(async move {
                 run_flow_quic(
                     session_id, flow_id, host_owned, port, conn, relay2, app_src, frx, registry2,
-                    outbound2,
+                    outbound2, session,
                 )
                 .await;
                 flows2.lock().await.remove(&key);
@@ -244,6 +253,7 @@ async fn run_flow_dc(
     mut outbound_rx: mpsc::Receiver<Vec<u8>>,
     reply_registry: ReplyRegistry,
     sink: Arc<dyn TunnelSignalingSink>,
+    session: Arc<SessionThroughput>,
 ) {
     let dc_index =
         match open_udp_flow(session_id, flow_id, &host, port, &reply_registry, &sink).await {
@@ -260,6 +270,10 @@ async fn run_flow_dc(
     let (mut from_dc, _stats) = demux.register(flow_id).await;
     let dc = demux.dc();
     debug!(%session_id, flow_id, dc_index, %host, port, "udp flow open (dc)");
+    // P3b-4: count this flow in `active_flows` for its pump lifetime, and
+    // mirror datagram payload bytes into the session aggregate so `flows`
+    // reports UDP throughput. Datagram bytes (not framed) = the true payload.
+    let _gauge = FlowGauge::new(session.clone());
 
     let reason = loop {
         tokio::select! {
@@ -269,12 +283,14 @@ async fn run_flow_dc(
                         debug!(%session_id, flow_id, %e, "udp flow DC send failed");
                         break CloseReason::IoError;
                     }
+                    session.bytes_out.fetch_add(dg.len() as u64, Ordering::Relaxed);
                 }
                 None => break CloseReason::ClientShutdown,
             },
             inb = from_dc.recv() => match inb {
                 Some(bytes) => {
                     if let Some(dg) = deframe_udp_datagram(&bytes) {
+                        session.bytes_in.fetch_add(dg.len() as u64, Ordering::Relaxed);
                         let framed = crate::socks5::encode_udp_datagram(&host, port, dg);
                         if let Err(e) = relay.send_to(&framed, app_src).await {
                             debug!(%session_id, flow_id, %e, "udp flow relay send_to app failed");
@@ -311,6 +327,7 @@ async fn run_flow_quic(
     mut outbound_rx: mpsc::Receiver<Vec<u8>>,
     reply_registry: ReplyRegistry,
     sink: Arc<dyn TunnelSignalingSink>,
+    session: Arc<SessionThroughput>,
 ) {
     if let Err(e) = open_udp_flow(session_id, flow_id, &host, port, &reply_registry, &sink).await {
         warn!(%session_id, flow_id, %host, port, %e, "udp flow open failed");
@@ -324,6 +341,8 @@ async fn run_flow_quic(
         }
     };
     debug!(%session_id, flow_id, %host, port, "udp flow open (quic)");
+    // P3b-4: active_flows gauge + per-datagram byte accounting (see run_flow_dc).
+    let _gauge = FlowGauge::new(session.clone());
 
     let reason = loop {
         tokio::select! {
@@ -333,11 +352,13 @@ async fn run_flow_quic(
                         debug!(%session_id, flow_id, %e, "udp flow quic write failed");
                         break CloseReason::IoError;
                     }
+                    session.bytes_out.fetch_add(dg.len() as u64, Ordering::Relaxed);
                 }
                 None => break CloseReason::ClientShutdown,
             },
             inb = quic_read_datagram(&mut recv) => match inb {
                 Ok(Some(dg)) => {
+                    session.bytes_in.fetch_add(dg.len() as u64, Ordering::Relaxed);
                     let framed = crate::socks5::encode_udp_datagram(&host, port, &dg);
                     if let Err(e) = relay.send_to(&framed, app_src).await {
                         debug!(%session_id, flow_id, %e, "udp flow relay send_to app failed");
@@ -374,5 +395,185 @@ async fn drain_control(tcp: &mut TcpStream) -> std::io::Result<()> {
             Ok(_) => {}
             Err(e) => return Err(e),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::forward::{FlowStats, run_flow_udp_dc};
+    use crate::transport::webrtc_dc::TunnelPeer;
+    use std::time::Duration;
+
+    /// Minimal sink: the client UDP pump emits `UdpForwardRequest` (auto-accepted
+    /// below) + `UdpClosed`; the test doesn't inspect them.
+    struct NoopSink;
+    #[async_trait::async_trait]
+    impl TunnelSignalingSink for NoopSink {
+        async fn send(&self, _msg: ClientMsg) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// P3b-4 regression: the CLIENT-side UDP pump (`run_flow_dc`) carries a
+    /// SOCKS5-UDP datagram round-trip over the DC pool AND mirrors the payload
+    /// bytes into the `SessionThroughput` aggregate — previously always 0, the
+    /// gap that let daemon SOCKS5 UDP look "broken". Also asserts the
+    /// `active_flows` gauge is held for the flow's lifetime and released on
+    /// teardown. Reuses the in-process DC pair from
+    /// `forward::tests::run_flow_udp_dc_echoes_through_pool` (reliable — the ICE
+    /// is loopback, not the flaky over-the-network path the E2E suite avoids).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn client_udp_flow_dc_accounts_session_bytes() {
+        // Loopback UDP echo target.
+        let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut b = [0u8; 2048];
+            while let Ok((n, from)) = echo.recv_from(&mut b).await {
+                let _ = echo.send_to(&b[..n], from).await;
+            }
+        });
+
+        // WebRTC-DC peer pair: offerer = client, answerer = agent.
+        let offerer = TunnelPeer::new(vec![]).await.unwrap();
+        let answerer = TunnelPeer::new(vec![]).await.unwrap();
+        let answerer_pc = answerer.peer_connection();
+        offerer.on_local_ice_candidate(move |c| {
+            let pc = Arc::clone(&answerer_pc);
+            Box::pin(async move {
+                if let Some(c) = c
+                    && let Ok(init) = c.to_json()
+                {
+                    let _ = pc.add_ice_candidate(init).await;
+                }
+            })
+        });
+        let offerer_pc = offerer.peer_connection();
+        answerer.on_local_ice_candidate(move |c| {
+            let pc = Arc::clone(&offerer_pc);
+            Box::pin(async move {
+                if let Some(c) = c
+                    && let Ok(init) = c.to_json()
+                {
+                    let _ = pc.add_ice_candidate(init).await;
+                }
+            })
+        });
+        let offer = offerer.create_offer().await.unwrap();
+        let answer = answerer.accept_offer(&offer.sdp).await.unwrap();
+        offerer.accept_answer(&answer.sdp).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(30), offerer.wait_pool_open())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(30), answerer.wait_pool_open())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let flow_id = 7u32;
+        // Agent side: run_flow_udp_dc echoes datagrams to the echo target.
+        let agent_demux = FlowDemux::install(answerer.dc(0).unwrap(), None).await;
+        let (agent_from_dc, _as) = agent_demux.register(flow_id).await;
+        let audp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        audp.connect(echo_addr).await.unwrap();
+        let agent_pump = tokio::spawn(run_flow_udp_dc(
+            audp,
+            answerer.dc(0).unwrap(),
+            flow_id,
+            agent_from_dc,
+            Duration::from_secs(5),
+            Arc::new(FlowStats::default()),
+        ));
+
+        // Client side: OUR run_flow_dc, driven with a real SessionThroughput.
+        let client_demux = FlowDemux::install(offerer.dc(0).unwrap(), None).await;
+        let relay = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let app = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let app_src = app.local_addr().unwrap();
+        let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(16);
+        let reply_registry: ReplyRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let sink: Arc<dyn TunnelSignalingSink> = Arc::new(NoopSink);
+        let session = Arc::new(SessionThroughput::default());
+
+        // Stand in for the server's UdpForwardAccept: the session dispatch loop
+        // would route it into `reply_registry` by flow_id; here a task does.
+        {
+            let reg = Arc::clone(&reply_registry);
+            tokio::spawn(async move {
+                for _ in 0..300 {
+                    if let Some(tx) = reg.lock().await.remove(&flow_id) {
+                        let _ = tx.send(ForwardReply::Accept { dc_index: 0 });
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            });
+        }
+
+        let client_pump = tokio::spawn(run_flow_dc(
+            ObjectId::new(),
+            flow_id,
+            "127.0.0.1".to_string(),
+            echo_addr.port(),
+            Arc::new(vec![client_demux]),
+            Arc::clone(&relay),
+            app_src,
+            out_rx,
+            reply_registry,
+            sink,
+            Arc::clone(&session),
+        ));
+
+        // App sends a datagram toward the target (payload only — as
+        // `handle_associate` hands the parsed payload to the flow).
+        let payload = b"ping-udp-acct";
+        out_tx.send(payload.to_vec()).await.unwrap();
+
+        // The pump relays the agent's echo back to the app as a SOCKS-UDP frame.
+        let mut rb = vec![0u8; 2048];
+        let (n, _from) = tokio::time::timeout(Duration::from_secs(8), app.recv_from(&mut rb))
+            .await
+            .expect("no echo delivered to the app within 8s")
+            .unwrap();
+        let (_h, _p, off) = crate::socks5::parse_udp_datagram(&rb[..n])
+            .expect("app received a valid socks-udp datagram");
+        assert_eq!(
+            &rb[off..n],
+            payload,
+            "the datagram must round-trip through the CLIENT udp pump"
+        );
+
+        // P3b-4: the round-trip must be reflected in the session aggregate.
+        let (bytes_in, bytes_out, active) = session.snapshot();
+        assert_eq!(
+            bytes_out,
+            payload.len() as u64,
+            "bytes_out counts the datagram sent toward the target"
+        );
+        assert_eq!(
+            bytes_in,
+            payload.len() as u64,
+            "bytes_in counts the echoed datagram"
+        );
+        assert_eq!(active, 1, "the live UDP flow holds one active_flows gauge");
+
+        // Aborting the pump drops its FlowGauge → active_flows returns to 0.
+        client_pump.abort();
+        agent_pump.abort();
+        let mut settled = false;
+        for _ in 0..100 {
+            if session.snapshot().2 == 0 {
+                settled = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            settled,
+            "active_flows returns to 0 after the flow's pump ends"
+        );
+        drop(out_tx);
     }
 }
