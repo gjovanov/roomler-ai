@@ -97,6 +97,43 @@ fn is_advertisable_v4(ip: &Ipv4Addr) -> bool {
         || is_cgnat)
 }
 
+/// True when the host has a globally-routable (public) IPv4 on any interface.
+///
+/// Used to decide whether virtual-desktop mode should auto-pin media to
+/// TURNS/TCP: hostile-NAT hosts (WSL, corp laptops) carry only private / CGNAT
+/// addresses and benefit from the relay pin, whereas a real public-IP server
+/// (cloud VM, dedicated host) can and should use normal ICE (direct host /
+/// srflx / UDP relay). Returns `false` on enumeration failure (fail toward the
+/// relay pin — the safe default for an unknown host). Note: a cloud VM whose
+/// public IP is NAT'd (not on a local interface) reads as non-public here — the
+/// operator overrides with an explicit `ROOMLER_AGENT_ICE_RELAY_TCP` in that case.
+pub fn host_has_public_ipv4() -> bool {
+    let Ok(ifaces) = if_addrs::get_if_addrs() else {
+        return false;
+    };
+    ifaces.iter().any(|iface| match iface.addr {
+        if_addrs::IfAddr::V4(ref v4) => is_public_v4(&v4.ip),
+        if_addrs::IfAddr::V6(_) => false,
+    })
+}
+
+/// True for a globally-routable public unicast IPv4 — excludes private
+/// (RFC 1918: 10/8, 172.16/12, 192.168/16), loopback, link-local, CGNAT
+/// (100.64/10), documentation, and unspecified / broadcast / multicast. Stands
+/// in for the still-unstable `Ipv4Addr::is_global` for the cases we care about.
+fn is_public_v4(ip: &Ipv4Addr) -> bool {
+    let o = ip.octets();
+    let is_cgnat = o[0] == 100 && (o[1] & 0xc0) == 0x40;
+    !(ip.is_private()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || is_cgnat
+        || ip.is_unspecified()
+        || ip.is_broadcast()
+        || ip.is_multicast()
+        || ip.is_documentation())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,6 +157,25 @@ mod tests {
         assert!(!is_advertisable_v4(&Ipv4Addr::new(100, 127, 255, 254)));
         // 100.0.0.0/8 outside the CGNAT sub-range is fine.
         assert!(is_advertisable_v4(&Ipv4Addr::new(100, 0, 0, 1)));
+    }
+
+    #[test]
+    fn public_v4_classifier() {
+        // Real public IPs (mars eth0, a DNS server) → public.
+        assert!(is_public_v4(&Ipv4Addr::new(94, 130, 141, 98)));
+        assert!(is_public_v4(&Ipv4Addr::new(8, 8, 8, 8)));
+        // NAT / private hosts (the relay-pin cases) → NOT public.
+        assert!(!is_public_v4(&Ipv4Addr::new(192, 168, 1, 10)));
+        assert!(!is_public_v4(&Ipv4Addr::new(10, 66, 24, 53)));
+        assert!(!is_public_v4(&Ipv4Addr::new(172, 19, 233, 180))); // WSL NAT
+        assert!(!is_public_v4(&Ipv4Addr::new(127, 0, 0, 1)));
+        assert!(!is_public_v4(&Ipv4Addr::new(169, 254, 1, 1)));
+        assert!(!is_public_v4(&Ipv4Addr::new(100, 64, 0, 1))); // CGNAT / overlay
+        assert!(!is_public_v4(&Ipv4Addr::new(0, 0, 0, 0)));
+        assert!(!is_public_v4(&Ipv4Addr::new(224, 0, 0, 1))); // multicast
+        assert!(!is_public_v4(&Ipv4Addr::new(192, 0, 2, 1))); // documentation
+        // 100.0.0.0/8 outside CGNAT is a real public range.
+        assert!(is_public_v4(&Ipv4Addr::new(100, 0, 0, 1)));
     }
 
     #[test]

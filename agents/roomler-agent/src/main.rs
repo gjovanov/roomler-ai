@@ -1061,8 +1061,9 @@ fn virtual_desktop_requested() -> bool {
 }
 
 /// Linux: if requested, bring up the virtual desktop, point capture at it via
-/// `DISPLAY`, and auto-enable relay-over-TCP media (hostile-NAT hosts like WSL
-/// flap the UDP TURN relay otherwise). Returns a handle to keep alive for the
+/// `DISPLAY`, and — only on a hostile-NAT host with no public IPv4 — auto-enable
+/// relay-over-TCP media (WSL / corp NAT flap the UDP TURN relay otherwise; a
+/// public-IP server uses normal ICE). Returns a handle to keep alive for the
 /// process lifetime. Config comes from env (`ROOMLER_AGENT_VIRTUAL_DESKTOP_*`).
 #[cfg(target_os = "linux")]
 fn maybe_start_virtual_desktop() -> Result<Option<virtual_desktop::VirtualDesktop>> {
@@ -1092,15 +1093,20 @@ fn maybe_start_virtual_desktop() -> Result<Option<virtual_desktop::VirtualDeskto
     // `unsafe` in edition 2024; sound here because nothing else reads these vars
     // yet.
     //
-    // vd-mode defaults to relay-over-TCP because a hostile-NAT WSL (wsl-vpnkit /
-    // default NAT) flaps the UDP TURN relay. But respect an EXPLICIT opt-out:
-    // WSL *mirrored* networking gives native UDP + a direct local path, which is
-    // far better than round-tripping a local desktop through a TURN relay. So an
-    // operator can set `ROOMLER_AGENT_ICE_RELAY_TCP=0` and keep it.
+    // vd-mode auto-pins media to TURNS/TCP ONLY on a hostile-NAT host (WSL /
+    // corp laptop), whose default NAT flaps the UDP TURN relay. A host with a
+    // routable PUBLIC IPv4 (cloud VM, dedicated server) uses normal ICE instead:
+    // forcing TURNS/TCP-only there wastes the direct path AND, against a
+    // co-located / dual-public-IP coturn, can strand ICE with no usable
+    // candidate ("pingAllCandidates: no candidate pairs"). Either way an operator
+    // overrides with an EXPLICIT `ROOMLER_AGENT_ICE_RELAY_TCP=0|1` (`=1` on a
+    // cloud-NAT VM whose public IP isn't on a local iface; `=0` for WSL
+    // mirrored-mode with native UDP).
     let relay_forced = std::env::var_os("ROOMLER_AGENT_ICE_RELAY_TCP").is_some();
+    let host_public = roomler_agent::subnet_detect::host_has_public_ipv4();
     unsafe {
         std::env::set_var("DISPLAY", vd.display());
-        if !relay_forced {
+        if !relay_forced && !host_public {
             std::env::set_var("ROOMLER_AGENT_ICE_RELAY_TCP", "1");
         }
     }
@@ -1108,6 +1114,7 @@ fn maybe_start_virtual_desktop() -> Result<Option<virtual_desktop::VirtualDeskto
     tracing::info!(
         display = vd.display(),
         relay_over_tcp,
+        host_public_ipv4 = host_public,
         "virtual-desktop active — capturing it"
     );
     Ok(Some(vd))
