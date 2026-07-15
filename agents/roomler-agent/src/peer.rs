@@ -2957,6 +2957,12 @@ async fn media_pump_ffmpeg_dc(
     let mut decode_skip_divisor: u32 = 1;
     let mut decode_skip_counter: u32 = 0;
     let mut frames_skipped_decode: u64 = 0;
+    // rc.186 — encode-pressure: when the encoder saturates (heartbeat
+    // avg_encode_ms high), scale the maxrate ceiling down so a weak sender
+    // GPU stops thrashing (the dynamic `FFMPEG_FPS=30`). Stepped once per
+    // heartbeat; applied to the ceiling every frame. 1.0 = full quality.
+    let mut encode_pressure = crate::encode::encode_pressure::EncodePressure::new();
+    let mut encode_factor: f32 = 1.0;
     // rc.88 — per-stage timing accumulators (µs since last heartbeat) so
     // the field log localises the bottleneck: capture vs encode vs send.
     let mut capture_us: u64 = 0;
@@ -3247,9 +3253,15 @@ async fn media_pump_ffmpeg_dc(
         // Recomputed each frame (cheap) so a dim change or a mid-session env
         // tweak re-seeds it; the AIMD starts at this ceiling and tracks the
         // link down from it. Also the initial maxrate the encoder is built with.
-        let ceiling =
+        let base_ceiling =
             crate::encode::ffmpeg::encoder::ffmpeg_maxrate_bps(w, h, target_fps, constrained)
                 as u32;
+        // rc.186 — apply the encode-pressure factor. When the encoder is
+        // saturating (factor < 1.0) this feeds a lower ceiling to both the
+        // encoder rebuild AND the AIMD (which propagates it to the running
+        // encoder via set_bitrate) → smaller frames → faster encode. Floored
+        // at MIN_BITRATE_BPS so we never starve the stream.
+        let ceiling = (((base_ceiling as f32) * encode_factor) as u32).max(encode::MIN_BITRATE_BPS);
         let need_rebuild = match encoder_dims {
             Some((ew, eh)) => ew != w || eh != h,
             None => true,
@@ -3513,6 +3525,11 @@ async fn media_pump_ffmpeg_dc(
             let avg_capture_ms = (capture_us / window_frames) as f64 / 1000.0;
             let avg_encode_ms = (encode_us / window_frames) as f64 / 1000.0;
             let avg_send_ms = (send_us / window_frames) as f64 / 1000.0;
+            // rc.186 — step the encode-pressure controller off this window's
+            // avg encode time; the new factor applies to the ceiling from the
+            // next frame on (throttles a saturating encoder, restores when it
+            // recovers).
+            encode_factor = encode_pressure.observe(avg_encode_ms as f32);
             info!(
                 %session_id,
                 codec_label,
@@ -3526,6 +3543,7 @@ async fn media_pump_ffmpeg_dc(
                 send_errors, dc_unopen_drops, frames_dropped_backpressure,
                 frames_skipped_backpressure, frames_empty,
                 avg_capture_ms, avg_encode_ms, avg_send_ms,
+                encode_factor,
                 "FFmpeg DC pump heartbeat (≈2s window)"
             );
             heartbeat_frames_base = frames_encoded;

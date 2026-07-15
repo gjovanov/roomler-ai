@@ -57,6 +57,14 @@ pub mod aimd;
 )]
 pub mod decode_pressure;
 
+// Encode-pressure controller — auto-reduces the maxrate ceiling when the
+// SENDER's encoder saturates (avg encode time high), the dynamic version of
+// the field-proven `FFMPEG_FPS=30`. Pure (unit-tested on the default build);
+// only `media_pump_ffmpeg_dc` (the ffmpeg-encoder feature) USES it, so the
+// dead_code allow is keyed on that feature alone.
+#[cfg_attr(not(feature = "ffmpeg-encoder"), allow(dead_code))]
+pub mod encode_pressure;
+
 // ---------------------------------------------------------------------
 // Shared helpers usable by every backend.
 // ---------------------------------------------------------------------
