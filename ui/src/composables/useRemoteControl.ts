@@ -803,6 +803,54 @@ export async function isHevcDecodeSupported(): Promise<boolean> {
   }
 }
 
+/** rc.186 — HARDWARE-and-smooth HEVC decode probe.
+ *
+ *  `isHevcDecodeSupported()` (VideoDecoder.isConfigSupported) returns `true`
+ *  even when the browser can only decode HEVC in SOFTWARE or via a HW path
+ *  too slow for real-time — the comment above assumed "no SW fallback", but
+ *  the field disproved it: a weak Intel iGPU (Iris Xe) reports HEVC support,
+ *  picks HEVC-over-DC, then its decode queue backs up at 1080p+/40fps →
+ *  periodic keyframe-request spiral → the 1-2 s hang. The SAME viewer is
+ *  perfectly smooth on VP9 4:2:0 (universal fixed-function HW decode).
+ *
+ *  `MediaCapabilities.decodingInfo()` exposes the two signals that matter:
+ *  `smooth` (can sustain the target framerate) + `powerEfficient` (uses
+ *  fixed-function silicon, not the CPU / GPU shaders). We require BOTH at a
+ *  representative 1920×1200@60 before PREFERRING HEVC; otherwise the caller
+ *  falls back to VP9 4:2:0. Biasing toward VP9 is cheap (it's HW-decoded
+ *  everywhere) and avoids the software-HEVC hang. Decoding is still probed
+ *  via `isHevcDecodeSupported()` for the worker — this only gates the
+ *  transport *preference*. */
+export async function isHevcHwDecodeSupported(): Promise<boolean> {
+  const mc = (
+    navigator as Navigator & {
+      mediaCapabilities?: {
+        decodingInfo?: (cfg: unknown) => Promise<{
+          supported?: boolean
+          smooth?: boolean
+          powerEfficient?: boolean
+        }>
+      }
+    }
+  ).mediaCapabilities
+  if (typeof mc?.decodingInfo !== 'function') return false
+  try {
+    const info = await mc.decodingInfo({
+      type: 'file',
+      video: {
+        contentType: 'video/mp4; codecs="hev1.1.6.L153.B0"',
+        width: 1920,
+        height: 1200,
+        bitrate: 8_000_000,
+        framerate: 60,
+      },
+    })
+    return info.supported === true && info.smooth === true && info.powerEfficient === true
+  } catch {
+    return false
+  }
+}
+
 /** rc.44 — clipboard chunking constants. The single-envelope
  *  `clipboard:write` shape sent a `text` field unbounded by length;
  *  on payloads >~50 KB this hit webrtc-rs's SCTP `max_message_size=
@@ -3302,6 +3350,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // to webrtc when the user opted in but the browser lacks
     // support keeps the UX boring rather than broken.
     let preferredTransport: RcVideoTransport | null = null
+    // rc.186 — set to 'yuv420' when we fall back from software-HEVC to VP9
+    // so the fallback lands on VP9 profile 0 (hardware-decoded), overriding
+    // the user's chroma choice for the fallback session only.
+    let chromaOverride: string | null = null
     if (videoTransport.value === 'data-channel-vp9-444') {
       const supported = vp9_444Supported.value || (await isVp9_444DecodeSupported())
       vp9_444Supported.value = supported
@@ -3313,28 +3365,36 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         )
       }
     } else if (videoTransport.value === 'data-channel-hevc') {
-      // rc.78 — HEVC over DataChannel (Option B). HEVC HW decode is
-      // not universal in WebCodecs; probe before sending the
-      // transport in `preferred_transport`. Pre-flight spike
-      // confirmed Chrome 119+ + Edge accept Annex-B HEVC no-
-      // description; fall through to VP9-444-DC (if supported) or
-      // webrtc when this browser lacks HW HEVC decode (Linux
-      // Chromium typically, corporate-policy disabled, old GPUs).
-      const supported = hevcSupported.value || (await isHevcDecodeSupported())
-      hevcSupported.value = supported
-      if (supported) {
+      // rc.78 — HEVC over DataChannel (Option B). rc.186 — require
+      // HARDWARE + real-time-smooth decode, not just "decodable":
+      // `isConfigSupported` returns true even for software / too-slow HEVC,
+      // and a weak iGPU then hangs at 1080p+/40fps (field: Iris Xe backs up
+      // → keyframe spiral → 1-2 s hang, while VP9 4:2:0 is smooth on the
+      // same device). `isHevcHwDecodeSupported()` gates on MediaCapabilities
+      // `smooth` + `powerEfficient`. On failure we fall back to VP9 4:2:0
+      // (profile 0 = universal fixed-function HW decode) — NOT VP9-444
+      // (profile 1), which is ALSO software-decoded and would hang too.
+      const decodable = hevcSupported.value || (await isHevcDecodeSupported())
+      hevcSupported.value = decodable
+      const hwSmooth = decodable && (await isHevcHwDecodeSupported())
+      if (hwSmooth) {
         preferredTransport = 'data-channel-hevc'
       } else {
         const fallback = vp9_444Supported.value || (await isVp9_444DecodeSupported())
         vp9_444Supported.value = fallback
         if (fallback) {
           console.info(
-            '[rc] preferred_transport=data-channel-hevc dropped — VideoDecoder.isConfigSupported(hev1.1.6.L153.B0) returned false. Falling back to data-channel-vp9-444.',
+            decodable
+              ? '[rc] data-channel-hevc dropped — HEVC decode is software / not real-time-smooth here (MediaCapabilities.smooth/powerEfficient). Falling back to VP9 4:2:0 (hardware).'
+              : '[rc] data-channel-hevc dropped — HEVC decode unsupported. Falling back to VP9 4:2:0.',
           )
           preferredTransport = 'data-channel-vp9-444'
+          // Force 4:2:0 (VP9 profile 0, hardware-decoded); 4:4:4 (profile 1)
+          // would be software again and defeat the fallback.
+          chromaOverride = 'yuv420'
         } else {
           console.info(
-            '[rc] preferred_transport=data-channel-hevc dropped + VP9-444 also unsupported. Falling back to webrtc.',
+            '[rc] data-channel-hevc dropped + VP9 also unsupported. Falling back to webrtc.',
           )
         }
       }
@@ -3368,8 +3428,13 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       requestPayload.preferred_transport = preferredTransport
       // rc.62 — only meaningful with the data-channel-vp9-444
       // transport. Omit when user picks `'auto'` (= let agent decide
-      // via its env var).
-      if (vp9Chroma.value !== 'auto') {
+      // via its env var). rc.186 — a `chromaOverride` (from the
+      // software-HEVC → VP9 4:2:0 fallback) wins unconditionally so the
+      // fallback lands on the hardware-decoded profile 0 even if the user
+      // left chroma on 'auto' or '4:4:4'.
+      if (chromaOverride) {
+        requestPayload.chroma_pref = chromaOverride
+      } else if (vp9Chroma.value !== 'auto') {
         requestPayload.chroma_pref = vp9Chroma.value
       }
     }
