@@ -428,6 +428,11 @@ impl AgentPeer {
         // space when the controller downscales. 0 = no frame captured yet.
         // rc.183 — remote-cursor offset fix at non-native resolutions.
         let capture_native_dims = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // rc.184 — viewer decode-pressure. The control handler bumps this on
+        // every browser `rc:keyframe`; the DC video pumps sample+reset it
+        // once a second, feed the count to `decode_pressure::DecodePressure`,
+        // and shed effective fps (frame-skip) when a weak decoder spirals.
+        let kf_request_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
         // Phase Y.3 (docs/vp9-444-plan.md). When the browser opens a
         // `video-bytes` data channel — only happens when both sides
         // negotiated `data-channel-vp9-444` transport in caps — we
@@ -718,6 +723,7 @@ impl AgentPeer {
         // browser's `rc:keyframe` (sent when its decode queue backs up and it
         // drops deltas to resync). Same atomic the media pumps already poll.
         let keyframe_for_dc = keyframe_requested.clone();
+        let kf_count_for_dc = kf_request_count.clone();
         let video_bytes_dc_for_callback = video_bytes_dc.clone();
         let control_dc_for_callback = control_dc.clone();
         let lock_state_rx_for_dc = lock_state_rx.clone();
@@ -728,6 +734,7 @@ impl AgentPeer {
             let target_res_for_dc = target_res_for_dc.clone();
             let native_dims_for_dc = native_dims_for_dc.clone();
             let keyframe_for_dc = keyframe_for_dc.clone();
+            let kf_count_for_dc = kf_count_for_dc.clone();
             let video_bytes_stash = video_bytes_dc_for_callback.clone();
             let control_stash = control_dc_for_callback.clone();
             let lock_state_rx_for_input = lock_state_rx_for_dc.clone();
@@ -748,6 +755,7 @@ impl AgentPeer {
                             quality_for_dc,
                             target_res_for_dc,
                             keyframe_for_dc,
+                            kf_count_for_dc,
                         )
                     }
                     "cursor" => {
@@ -831,6 +839,7 @@ impl AgentPeer {
             control_dc.clone(),
             pc.clone(),
             capture_native_dims,
+            kf_request_count,
         ));
 
         Ok(Self {
@@ -1078,12 +1087,19 @@ async fn media_pump(
     // the cursor pump can scale the OS cursor position into the encoded
     // frame's space (rc.183). Packed w:h; 0 until the first frame.
     capture_native_dims: Arc<std::sync::atomic::AtomicU64>,
+    // rc.184 — browser keyframe-request count; forwarded to the DC pumps for
+    // the decode-pressure frame-skip. Only the DC pumps consume it.
+    kf_request_count: Arc<std::sync::atomic::AtomicU32>,
 ) {
     // `pc` is consumed only by the VP9-444 DC pump's per-session transport
     // detection (feature-gated); keep the signalling-only / non-vp9 build
     // warning-clean.
     #[cfg(not(feature = "vp9-444"))]
     let _ = &pc;
+    // `kf_request_count` is consumed only by the DC video pumps (vp9-444 +
+    // ffmpeg-encoder); keep the signalling-only build warning-clean.
+    #[cfg(not(any(feature = "vp9-444", feature = "ffmpeg-encoder")))]
+    let _ = &kf_request_count;
     // Tracks the lock-state value seen on the previous loop iteration
     // so we can request an encoder keyframe on each transition. The
     // browser decoder otherwise has to wait for the next periodic
@@ -1130,6 +1146,7 @@ async fn media_pump(
                     control_dc.clone(),
                     pc.clone(),
                     capture_native_dims,
+                    kf_request_count,
                 )
                 .await;
             }
@@ -1187,6 +1204,7 @@ async fn media_pump(
                         control_dc.clone(),
                         pc.clone(),
                         capture_native_dims,
+                        kf_request_count,
                     )
                     .await;
                 }
@@ -1209,6 +1227,7 @@ async fn media_pump(
                 control_dc.clone(),
                 pc,
                 capture_native_dims,
+                kf_request_count,
             )
             .await;
         }
@@ -1896,6 +1915,8 @@ async fn media_pump_vp9_444_dc(
     pc: Arc<RTCPeerConnection>,
     // rc.183 — publish native pre-downscale dims for the cursor pump.
     capture_native_dims: Arc<std::sync::atomic::AtomicU64>,
+    // rc.184 — browser keyframe-request count for the decode-pressure skip.
+    kf_request_count: Arc<std::sync::atomic::AtomicU32>,
 ) {
     // See `media_pump`: tracks lock-state transitions so we can
     // request a keyframe on the lock/unlock boundary.
@@ -1994,6 +2015,13 @@ async fn media_pump_vp9_444_dc(
     let mut dc_unopen_drops: u64 = 0;
     let mut frames_skipped_backpressure: u64 = 0;
     let mut scene_change_keyframes: u64 = 0;
+    // rc.184 — viewer decode-pressure fps shedding (see `encode::decode_pressure`
+    // and the identical block in `media_pump_ffmpeg_dc`).
+    let mut decode_pressure = crate::encode::decode_pressure::DecodePressure::new();
+    let mut decode_pressure_window = std::time::Instant::now();
+    let mut decode_skip_divisor: u32 = 1;
+    let mut decode_skip_counter: u32 = 0;
+    let mut frames_skipped_decode: u64 = 0;
 
     // rc.39 — agent-side scene-change keyframe trigger. Heuristic:
     // after each encode, if the latest delta packet's size exceeds
@@ -2363,8 +2391,43 @@ async fn media_pump_vp9_444_dc(
             }
         }
         let enc = encoder.as_mut().unwrap();
+        let mut force_keyframe_this_iter = false;
         if keyframe_requested.swap(false, std::sync::atomic::Ordering::Relaxed) {
             enc.request_keyframe();
+            force_keyframe_this_iter = true;
+        }
+
+        // rc.184 — viewer decode-pressure fps shedding (mirror of the
+        // media_pump_ffmpeg_dc block). Once a second, turn the browser
+        // keyframe-request rate into a pressure level + fps-first skip
+        // divisor, then drop (divisor-1) of every `divisor` delta frames so a
+        // weak decoder's queue drains. Keyframes are never skipped.
+        let dp_now = std::time::Instant::now();
+        if dp_now.duration_since(decode_pressure_window) >= Duration::from_secs(1) {
+            let reqs = kf_request_count.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let level = decode_pressure.step(reqs);
+            let new_div = crate::encode::decode_pressure::DecodePressure::fps_divisor(level);
+            if new_div != decode_skip_divisor || reqs > 0 {
+                info!(
+                    %session_id,
+                    kf_reqs = reqs,
+                    pressure = level,
+                    skip_divisor = new_div,
+                    frames_skipped_decode,
+                    "VP9-444 DC pump: decode-pressure fps shed"
+                );
+            }
+            decode_skip_divisor = new_div;
+            decode_pressure_window = dp_now;
+        }
+        if decode_skip_divisor > 1 && !force_keyframe_this_iter {
+            // Keep 1 of every `decode_skip_divisor` delta frames.
+            if decode_skip_counter + 1 < decode_skip_divisor {
+                decode_skip_counter += 1;
+                frames_skipped_decode += 1;
+                continue;
+            }
+            decode_skip_counter = 0;
         }
 
         // rc.33/rc.171 — resolution + quality-derived bitrate CEILING, fed to
@@ -2762,6 +2825,8 @@ async fn media_pump_ffmpeg_dc(
     pc: Arc<RTCPeerConnection>,
     // rc.183 — publish native pre-downscale dims for the cursor pump.
     capture_native_dims: Arc<std::sync::atomic::AtomicU64>,
+    // rc.184 — browser keyframe-request count for the decode-pressure skip.
+    kf_request_count: Arc<std::sync::atomic::AtomicU32>,
 ) {
     use crate::encode::VideoEncoder;
     use crate::encode::ffmpeg::FfmpegEncoder;
@@ -2868,6 +2933,16 @@ async fn media_pump_ffmpeg_dc(
     // resync-keyframe churn (the HEVC delta chain stays intact). See the gate
     // at the top of the loop.
     let mut frames_skipped_backpressure: u64 = 0;
+    // rc.184 — viewer decode-pressure fps shedding. Sample the browser
+    // keyframe-request rate once a second → a pressure level → an fps-first
+    // frame-skip divisor (skip N-1 of every N delta frames; keyframes are
+    // never skipped). Relieves a weak decoder spiralling on high-motion
+    // drags. See `encode::decode_pressure`.
+    let mut decode_pressure = crate::encode::decode_pressure::DecodePressure::new();
+    let mut decode_pressure_window = std::time::Instant::now();
+    let mut decode_skip_divisor: u32 = 1;
+    let mut decode_skip_counter: u32 = 0;
+    let mut frames_skipped_decode: u64 = 0;
     // rc.88 — per-stage timing accumulators (µs since last heartbeat) so
     // the field log localises the bottleneck: capture vs encode vs send.
     let mut capture_us: u64 = 0;
@@ -3206,6 +3281,11 @@ async fn media_pump_ffmpeg_dc(
             }
         }
 
+        // A keyframe requested THIS iteration must never be dropped by the
+        // decode-pressure frame-skip below (the browser needs the IDR to
+        // resync). Tracked here, consumed by the skip gate.
+        let mut force_keyframe_this_iter = false;
+
         // Lock-state transitions force a keyframe so the browser sees
         // a clean refresh when the operator's lock overlay paints or
         // clears.
@@ -3213,6 +3293,7 @@ async fn media_pump_ffmpeg_dc(
         if is_locked_now != was_locked_last_iter {
             if let Some(enc) = encoder.as_mut() {
                 enc.request_keyframe();
+                force_keyframe_this_iter = true;
             }
             was_locked_last_iter = is_locked_now;
         }
@@ -3222,6 +3303,42 @@ async fn media_pump_ffmpeg_dc(
             && let Some(enc) = encoder.as_mut()
         {
             enc.request_keyframe();
+            force_keyframe_this_iter = true;
+        }
+
+        // rc.184 — viewer decode-pressure fps shedding. Once a second, turn
+        // the browser keyframe-request count into a pressure level and an
+        // fps-first skip divisor; then drop (divisor-1) of every `divisor`
+        // delta frames so a weak decoder gets fewer frames to chew and its
+        // queue drains (breaking the request→IDR→heavier-decode spiral).
+        // Keyframes are never skipped. No-op at divisor 1 (level 0).
+        let dp_now = std::time::Instant::now();
+        if dp_now.duration_since(decode_pressure_window) >= Duration::from_secs(1) {
+            let reqs = kf_request_count.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let level = decode_pressure.step(reqs);
+            let new_div = crate::encode::decode_pressure::DecodePressure::fps_divisor(level);
+            if new_div != decode_skip_divisor || reqs > 0 {
+                info!(
+                    %session_id,
+                    codec_label,
+                    kf_reqs = reqs,
+                    pressure = level,
+                    skip_divisor = new_div,
+                    frames_skipped_decode,
+                    "FFmpeg DC pump: decode-pressure fps shed"
+                );
+            }
+            decode_skip_divisor = new_div;
+            decode_pressure_window = dp_now;
+        }
+        if decode_skip_divisor > 1 && !force_keyframe_this_iter {
+            // Keep 1 of every `decode_skip_divisor` delta frames.
+            if decode_skip_counter + 1 < decode_skip_divisor {
+                decode_skip_counter += 1;
+                frames_skipped_decode += 1;
+                continue;
+            }
+            decode_skip_counter = 0;
         }
 
         let Some(enc) = encoder.as_mut() else {
@@ -3589,12 +3706,16 @@ async fn emit_host_locked(
 /// shared atomic that the media pump polls before each encode); future
 /// types (rc:cursor-shape from agent → controller, rc:bitrate-hint,
 /// rc:dpi-change) layer on the same parse-by-`t` switch.
+#[allow(clippy::too_many_arguments)]
 fn attach_control_handler(
     dc: Arc<RTCDataChannel>,
     session_id: bson::oid::ObjectId,
     quality_state: Arc<std::sync::atomic::AtomicU8>,
     target_resolution: Arc<std::sync::Mutex<TargetResolution>>,
     keyframe_requested: Arc<std::sync::atomic::AtomicBool>,
+    // rc.184 — bumped on every `rc:keyframe`; the DC video pumps sample it
+    // to drive the decode-pressure frame-skip.
+    kf_request_count: Arc<std::sync::atomic::AtomicU32>,
 ) {
     // Clone the Arc so the on_message closure can send replies
     // (e.g. rc:logs-fetch.reply) back over the same DC. Original
@@ -3610,6 +3731,7 @@ fn attach_control_handler(
         let quality_state = quality_state.clone();
         let target_resolution = target_resolution.clone();
         let keyframe_requested = keyframe_requested.clone();
+        let kf_request_count = kf_request_count.clone();
         let last_kf_request = last_kf_request.clone();
         let dc_for_reply = dc_for_reply.clone();
         Box::pin(async move {
@@ -3785,6 +3907,9 @@ fn attach_control_handler(
                     }
                 }
                 "rc:keyframe" => {
+                    // rc.184 — count EVERY request (incl. gap-suppressed) as the
+                    // viewer decode-backup signal the DC pumps sample to shed fps.
+                    kf_request_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     // Browser's decode queue backed up → it dropped deltas and
                     // needs a fresh IDR to resync. Force one (min-gap clamped).
                     const MIN_KF_GAP: Duration = Duration::from_millis(200);
