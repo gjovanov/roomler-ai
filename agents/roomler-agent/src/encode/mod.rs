@@ -48,6 +48,15 @@ pub mod ffmpeg;
 )]
 pub mod aimd;
 
+// Viewer decode-pressure controller — turns the browser's `rc:keyframe`
+// request rate into an fps-first frame-skip level for the DC pumps. Pure
+// (unit-tested on the default build); only the pump features USE it.
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+pub mod decode_pressure;
+
 // ---------------------------------------------------------------------
 // Shared helpers usable by every backend.
 // ---------------------------------------------------------------------
