@@ -2439,6 +2439,20 @@ async fn media_pump_vp9_444_dc(
         let q_now = quality_state.load(std::sync::atomic::Ordering::Relaxed);
         if let Some((ew, eh)) = encoder_dims {
             let base = encode::initial_bitrate_for_fps(ew, eh, target_fps);
+            // rc.185 — chroma-aware ceiling. `initial_bitrate_for_fps` is
+            // pixel×fps only; it doesn't know the chroma format. 4:4:4 (VP9
+            // profile 1) carries FULL U/V planes — ~1.5× the pixel data of
+            // 4:2:0's quarter-res chroma — so at the same ceiling it must ride
+            // QP higher under motion (rc_max_quantizer=63) → the "text starts
+            // blurry, sharpens when static, re-blurs on movement" the field
+            // reported on 4:4:4 but NOT 4:2:0. Give 4:4:4 the ~1.5× headroom
+            // its extra chroma needs so text stays crisp under motion. The
+            // relay clamp (`bitrate_cap`) still bounds it on a constrained link.
+            let base = if chroma_wire == "yuv444" {
+                base.saturating_mul(3) / 2
+            } else {
+                base
+            };
             let ceiling = quality::target_bitrate(q_now, base).min(bitrate_cap);
             let now = std::time::Instant::now();
             let ctrl = aimd.get_or_insert_with(|| {
