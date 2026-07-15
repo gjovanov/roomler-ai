@@ -330,6 +330,41 @@ impl Hub {
         consent_mode: ConsentMode,
         override_reason: Option<String>,
     ) -> Result<ObjectId> {
+        // rc.185 — self-heal the fast connect→disconnect race. A controller
+        // that connects then drops before teardown completes can leave an
+        // ORPHANED session pinned to this agent: `active_sessions` stays
+        // elevated (the next reconnect hits `AgentBusy`) AND the agent's
+        // "being viewed" red-frame indicator never clears (the
+        // controller-disconnect cleanup missed the not-yet-registered
+        // session, or the best-effort Terminate raced the socket close, or
+        // the peer sits ~30 s in ICE-`Disconnected` before it reaches
+        // `Failed` and self-terminates). Before the capacity gate, reap any
+        // of THIS agent's sessions whose controller channel is already
+        // closed. `terminate()` frees the counter AND re-sends
+        // `ServerMsg::Terminate` to the agent, which clears the stale
+        // indicator + peer. Mirrors the iterate-and-lock pattern in
+        // `unregister_controller`; a mid-setup session keeps a live
+        // controller_tx so it is never a false positive.
+        let orphaned: Vec<ObjectId> = self
+            .inner
+            .sessions
+            .iter()
+            .filter_map(|e| {
+                let dead_controller = {
+                    let s = e.value().lock();
+                    s.agent_id == agent_id
+                        && s.controller_tx
+                            .as_ref()
+                            .map(|tx| tx.is_closed())
+                            .unwrap_or(true)
+                };
+                dead_controller.then(|| *e.key())
+            })
+            .collect();
+        for sid in orphaned {
+            let _ = self.terminate(sid, EndReason::ControllerHangup);
+        }
+
         let agent_org = {
             let mut agent = self
                 .inner
@@ -875,6 +910,98 @@ mod tests {
         // Controller should now have a Ready message.
         let m = ctl_rx.try_recv().unwrap();
         assert!(matches!(m, ServerMsg::Ready { .. }));
+    }
+
+    // rc.185 — the fast connect→disconnect reconnect fix. An orphaned
+    // session (controller channel closed) must NOT permanently pin
+    // `active_sessions`; the next create_session reaps it and succeeds.
+    #[tokio::test]
+    async fn create_session_reaps_orphan_from_dead_controller() {
+        let hub = test_hub().await;
+        let agent_id = ObjectId::new();
+        // max_sessions = 1 so a single orphan blocks reconnect pre-fix.
+        let (_agent_tx, _cancel, mut agent_rx) =
+            hub.register_agent(agent_id, ObjectId::new(), ObjectId::new(), OsKind::Linux, 1);
+
+        // Controller A connects, then "disconnects" (drop its receiver) —
+        // the fast connect→disconnect that used to leave a stuck session.
+        let (ctl_tx_a, ctl_rx_a) = mpsc::channel(8);
+        let sid_a = hub
+            .create_session(
+                agent_id,
+                ObjectId::new(),
+                "A".into(),
+                ctl_tx_a,
+                Permissions::default(),
+                Vec::new(),
+                None,
+                None,
+                false,
+                ConsentMode::Prompt,
+                None,
+            )
+            .unwrap();
+        drop(ctl_rx_a); // controller gone → the session's controller_tx.is_closed()
+
+        // Controller B reconnects. Pre-fix this returned AgentBusy because
+        // A's orphan still held the only slot. The reap must free it.
+        let (ctl_tx_b, _ctl_rx_b) = mpsc::channel(8);
+        let res_b = hub.create_session(
+            agent_id,
+            ObjectId::new(),
+            "B".into(),
+            ctl_tx_b,
+            Permissions::default(),
+            Vec::new(),
+            None,
+            None,
+            false,
+            ConsentMode::Prompt,
+            None,
+        );
+        assert!(
+            res_b.is_ok(),
+            "reconnect must reap the orphaned session and succeed, got {res_b:?}"
+        );
+        assert_ne!(res_b.as_ref().unwrap(), &sid_a, "should be a fresh session");
+
+        // The reap must have re-sent a Terminate to the agent for A (so the
+        // agent clears its stale indicator + peer). The agent's queue holds
+        // A's Request, then B's — plus a Terminate for A somewhere between.
+        let mut saw_terminate_for_a = false;
+        while let Ok(msg) = agent_rx.try_recv() {
+            if let ServerMsg::Terminate { session_id, .. } = msg {
+                if session_id == sid_a {
+                    saw_terminate_for_a = true;
+                }
+            }
+        }
+        assert!(
+            saw_terminate_for_a,
+            "agent must be told to terminate the orphaned session (clears the indicator)"
+        );
+
+        // Counter integrity: with B live and max_sessions=1, a THIRD live
+        // controller must still be rejected — the reap freed exactly one slot,
+        // it didn't leak the counter to 0.
+        let (ctl_tx_c, _ctl_rx_c) = mpsc::channel(8);
+        let res_c = hub.create_session(
+            agent_id,
+            ObjectId::new(),
+            "C".into(),
+            ctl_tx_c,
+            Permissions::default(),
+            Vec::new(),
+            None,
+            None,
+            false,
+            ConsentMode::Prompt,
+            None,
+        );
+        assert!(
+            matches!(res_c, Err(Error::AgentBusy)),
+            "a live session must still occupy the slot, got {res_c:?}"
+        );
     }
 
     // ─── rc.53 Phase 2b: Hub displacement notify-then-close ──────────
