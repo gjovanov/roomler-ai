@@ -97,6 +97,11 @@ let statsBytesTotal = 0
 let statsFramesInWindow = 0
 let statsLastWidth = 0
 let statsLastHeight = 0
+// rc.187 — last frame dims we reported to the composable. Re-posted whenever
+// the decoded size changes (the agent's viewer-adaptive resolution downscales
+// mid-session), so the cursor mapping's `mediaIntrinsic` never goes stale.
+let lastPostedW = 0
+let lastPostedH = 0
 let statsLastEmitMs: number = (typeof performance !== 'undefined' ? performance.now() : Date.now())
 const STATS_EMIT_INTERVAL_MS = 1000
 
@@ -174,9 +179,14 @@ function initDecoder() {
       statsLastWidth = w
       statsLastHeight = h
       paintFrame(frame)
-      if (framesDecoded === 1) {
+      // rc.187 — report dims on frame 1 AND on every size change (live
+      // downscale), so the composable updates the cursor-mapping intrinsic.
+      if (w !== lastPostedW || h !== lastPostedH) {
+        lastPostedW = w
+        lastPostedH = h
         workerScope.postMessage({ type: 'first-frame', width: w, height: h })
-      } else {
+      }
+      if (framesDecoded > 1) {
         // Composable-side counter consumes this for view diagnostics
         // and tests; we deliberately do NOT include the VideoFrame
         // itself in the message (already closed by paintFrame, and
@@ -379,6 +389,8 @@ function teardown(): void {
   ctx = null
   framesDecoded = 0
   framesReceived = 0
+  lastPostedW = 0
+  lastPostedH = 0
   // rc.103 — re-arm the leading-delta gate for the next decoder.
   sawKeyframe = false
   framesSkippedAwaitingKey = 0
