@@ -88,6 +88,14 @@ pub struct PeerInfo {
     /// runtime. Not a display column — a join key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
+    /// rc.187 — for a RELAY peer: our own coturn-relayed address and the peer's
+    /// relayed address we dial (both `host:port`). `None` for direct/blocked/
+    /// offline. Lets `peers --json` show which coturn worker each end pinned —
+    /// same-worker (the two IPs match) vs cross-worker — without a debug-log hunt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_local: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_dst: Option<String>,
 }
 
 /// Whether a forward is a static `--remote` forward or a SOCKS5 listener.
@@ -962,6 +970,8 @@ mod tests {
                     rtt_ms: Some(52),
                     last_seen_ms: Some(1000),
                     agent_id: Some("6a074fe5ef3ba556ab041966".into()),
+                    relay_local: Some("94.130.141.74:10850".into()),
+                    relay_dst: Some("5.9.157.226:12728".into()),
                 },
                 PeerInfo {
                     node_id: "n3".into(),
@@ -973,6 +983,8 @@ mod tests {
                     rtt_ms: Some(3),
                     last_seen_ms: Some(1200),
                     agent_id: None,
+                    relay_local: None,
+                    relay_dst: None,
                 },
             ]
         }
