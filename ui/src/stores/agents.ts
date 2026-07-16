@@ -27,8 +27,17 @@ export interface AccessPolicy {
 export interface AgentCapabilities {
   /** mime-style codec names: 'h264', 'h265', 'av1'. */
   codecs: string[]
-  /** Descriptive backend labels: 'openh264-sw', 'mf-h264-hw', 'mf-h265-hw'. */
+  /** Descriptive backend labels: 'openh264-sw', 'mf-h264-hw', 'mf-h265-hw',
+   *  'ffmpeg-hevc_nvenc', 'ffmpeg-vp9_qsv', 'ffmpeg-av1_nvenc',
+   *  'libvpx-vp9-444-sw'. The rc.190 HW×HW transport auto-rank reads
+   *  these to know which codecs the agent HARDWARE-encodes. */
   hw_encoders: string[]
+  /** DC video transports beyond the default WebRTC track:
+   *  'data-channel-vp9-444', 'data-channel-hevc', 'data-channel-av1'.
+   *  Serialized only when non-empty (serde skip_serializing_if), so
+   *  it's optional here; the auto-rank falls back to deriving from
+   *  `hw_encoders` for older agent rows. */
+  transports?: string[]
   has_input_permission: boolean
   supports_clipboard: boolean
   supports_file_transfer: boolean

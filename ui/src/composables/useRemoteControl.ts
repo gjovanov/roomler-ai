@@ -554,7 +554,15 @@ function readStoredResolution(agentId: string): RcResolutionSetting {
   } catch {
     /* fall through to default */
   }
-  return { mode: 'original' }
+  // rc.190 — default is FIT (agent downscales to this viewer's stage ×
+  // devicePixelRatio): never stream more pixels than the viewer can
+  // display. Field 2026-07-16: a 1200p viewer receiving a 4K stream paid
+  // 4× the encode+bandwidth+decode for pixels it threw away. Dims are
+  // filled in by the view's `applyFitResolution()` as soon as the stage
+  // is measured (the dims-less setting is not sent — see
+  // `resolutionWireMessage`); users who explicitly picked a resolution
+  // have a stored value and keep it.
+  return { mode: 'fit' }
 }
 
 function persistResolution(agentId: string, s: RcResolutionSetting) {
@@ -666,7 +674,12 @@ export function isWebCodecsSupported(): boolean {
  *    `data-channel-vp9-444` in its `AgentCaps.transports`. Falls
  *    back to `webrtc` silently when either side lacks support.
  *    Takes effect on the next `connect()`. */
-export type RcVideoTransport = 'webrtc' | 'data-channel-vp9-444' | 'data-channel-hevc'
+export type RcVideoTransport =
+  | 'auto'
+  | 'webrtc'
+  | 'data-channel-vp9-444'
+  | 'data-channel-hevc'
+  | 'data-channel-av1'
 
 const VIDEO_TRANSPORT_STORAGE_KEY = 'roomler-rc-video-transport'
 
@@ -703,13 +716,19 @@ function readStoredVideoTransport(): RcVideoTransport {
     if (
       raw === 'data-channel-vp9-444'
       || raw === 'data-channel-hevc'
+      || raw === 'data-channel-av1'
       || raw === 'webrtc'
+      || raw === 'auto'
     )
       return raw
   } catch {
     /* privacy mode → default */
   }
-  return 'webrtc'
+  // rc.190 — default is AUTO: rank the transports by what's HARDWARE on
+  // BOTH ends (agent hw_encoders × viewer MediaCapabilities) at connect
+  // time. Users who explicitly picked a transport (any stored value,
+  // incl. 'webrtc' written by a toggle) keep their choice.
+  return 'auto'
 }
 
 function persistVideoTransport(t: RcVideoTransport) {
@@ -865,6 +884,175 @@ export async function isHevcHwDecodeSupported(): Promise<boolean> {
   } catch {
     return false
   }
+}
+
+/** rc.190 — the AV1 codec string for the `data-channel-av1` transport.
+ *  Main profile (0), seq_level_idx 13 = Level 5.1 (covers 4K@60 — the
+ *  HEVC L3.1 lesson: the declared level is a MAX, a smaller stream
+ *  decodes fine under it, but a level BELOW the stream's resolution
+ *  hard-rejects), Main tier, 8-bit. Shared by the probe + the decode
+ *  worker `configure()` so they can't drift. */
+export const AV1_CODEC_STRING = 'av01.0.13M.08'
+
+/** rc.190 — feature-detect AV1 decode via WebCodecs. Chromium ships an
+ *  in-tree dav1d SOFTWARE decoder, so unlike HEVC this is ~always true
+ *  on Chrome — it gates the explicit user pick, not the auto-rank
+ *  (which requires `isAv1HwDecodeSupported`). */
+export async function isAv1DecodeSupported(): Promise<boolean> {
+  const g = globalThis as unknown as {
+    VideoDecoder?: { isConfigSupported?: (cfg: { codec: string }) => Promise<{ supported?: boolean }> }
+  }
+  const isConfigSupported = g.VideoDecoder?.isConfigSupported
+  if (typeof isConfigSupported !== 'function') return false
+  try {
+    const res = await isConfigSupported({ codec: AV1_CODEC_STRING })
+    return res?.supported === true
+  } catch {
+    return false
+  }
+}
+
+/** rc.190 — HARDWARE-and-smooth AV1 decode probe (MediaCapabilities
+ *  `smooth` + `powerEfficient`, same contract as the HEVC HW probe).
+ *  dav1d SW decode exists everywhere, so `powerEfficient` is what
+ *  separates a Gen12-Iris-Xe/RTX/RDNA2 viewer (fixed-function AV1
+ *  decode) from a weak CPU grinding 4K AV1 in software. */
+export async function isAv1HwDecodeSupported(): Promise<boolean> {
+  const mc = (
+    navigator as Navigator & {
+      mediaCapabilities?: {
+        decodingInfo?: (cfg: unknown) => Promise<{
+          supported?: boolean
+          smooth?: boolean
+          powerEfficient?: boolean
+        }>
+      }
+    }
+  ).mediaCapabilities
+  if (typeof mc?.decodingInfo !== 'function') return false
+  try {
+    const info = await mc.decodingInfo({
+      type: 'file',
+      video: {
+        contentType: `video/mp4; codecs="${AV1_CODEC_STRING}"`,
+        width: 1920,
+        height: 1200,
+        bitrate: 8_000_000,
+        framerate: 60,
+      },
+    })
+    return info.supported === true && info.smooth === true && info.powerEfficient === true
+  } catch {
+    return false
+  }
+}
+
+/** rc.190 — HARDWARE-and-smooth VP9 profile-0 decode probe, for the
+ *  auto-rank + the viewer-decode HUD badge. Profile 0 (4:2:0 8-bit) is
+ *  the universally-HW-decoded VP9; profile 1 (4:4:4) is software
+ *  everywhere and intentionally NOT probed here. */
+export async function isVp9HwDecodeSupported(): Promise<boolean> {
+  const mc = (
+    navigator as Navigator & {
+      mediaCapabilities?: {
+        decodingInfo?: (cfg: unknown) => Promise<{
+          supported?: boolean
+          smooth?: boolean
+          powerEfficient?: boolean
+        }>
+      }
+    }
+  ).mediaCapabilities
+  if (typeof mc?.decodingInfo !== 'function') return false
+  try {
+    const info = await mc.decodingInfo({
+      type: 'file',
+      video: {
+        contentType: 'video/mp4; codecs="vp09.00.10.08"',
+        width: 1920,
+        height: 1200,
+        bitrate: 8_000_000,
+        framerate: 60,
+      },
+    })
+    return info.supported === true && info.smooth === true && info.powerEfficient === true
+  } catch {
+    return false
+  }
+}
+
+/** rc.190 — inputs to the pure transport auto-rank. `agentTransports` /
+ *  `agentHwEncoders` come from `Agent.capabilities` (the agent's caps
+ *  probe truth); the `viewer*` bits are this browser's MediaCapabilities
+ *  probes. */
+export interface AutoTransportInputs {
+  agentTransports: string[]
+  agentHwEncoders: string[]
+  viewerAv1Hw: boolean
+  viewerHevcHw: boolean
+  viewerVp9Hw: boolean
+  viewerVp9Decodable: boolean
+}
+
+/** rc.190 — pure HW×HW transport rank for `videoTransport === 'auto'`.
+ *
+ *  Field lesson (2026-07-16, GEAL8N6/NEO16 → PC50045): VP9 is
+ *  software-ENCODED on almost every host (only Intel Gen11+ iGPUs have
+ *  VP9 encode silicon; NVIDIA/AMD never shipped it), and HEVC/AV1 can be
+ *  software-DECODED on the viewer — a codec is only smooth when it's
+ *  hardware on BOTH ends. Rank:
+ *    1. AV1-DC   — agent HW av1 encoder  × viewer HW AV1 decode
+ *    2. HEVC-DC  — agent HW hevc encoder × viewer HW HEVC decode
+ *    3. VP9-DC 4:2:0 — agent HW vp9 encoder (vp9_qsv) × viewer HW VP9
+ *    4. VP9-DC 4:2:0 — agent libvpx SW encode (the agent's rc.190 SW cap
+ *       keeps it ≤1920 long edge) × viewer HW VP9 decode
+ *    5. webrtc   — the REMB-adaptive H.264 track (universal fallback)
+ *  Returns the transport (null = webrtc) + a chroma override ('yuv420'
+ *  for the VP9 picks so the fallback never lands on software-decoded
+ *  profile 1). Exported for vitest. */
+export function pickAutoTransport(inputs: AutoTransportInputs): {
+  transport: Exclude<RcVideoTransport, 'auto' | 'webrtc'> | null
+  chromaOverride: string | null
+  reason: string
+} {
+  const t = inputs.agentTransports
+  const enc = inputs.agentHwEncoders
+  // Transport advertisement, with hw_encoders-derived fallback for agent
+  // rows saved before `transports` serialization existed.
+  const hasAv1Dc = t.includes('data-channel-av1') || enc.some((e) => e.startsWith('ffmpeg-av1_'))
+  const hasHevcDc = t.includes('data-channel-hevc') || enc.some((e) => e.startsWith('ffmpeg-hevc_'))
+  const hasVp9Dc = t.includes('data-channel-vp9-444') || enc.includes('libvpx-vp9-444-sw')
+  const agentVp9Hw = enc.includes('ffmpeg-vp9_qsv')
+
+  if (hasAv1Dc && inputs.viewerAv1Hw) {
+    return {
+      transport: 'data-channel-av1',
+      chromaOverride: null,
+      reason: 'AV1: HW encode on agent + HW decode here',
+    }
+  }
+  if (hasHevcDc && inputs.viewerHevcHw) {
+    return {
+      transport: 'data-channel-hevc',
+      chromaOverride: null,
+      reason: 'HEVC: HW encode on agent + HW decode here',
+    }
+  }
+  if (hasVp9Dc && agentVp9Hw && inputs.viewerVp9Hw) {
+    return {
+      transport: 'data-channel-vp9-444',
+      chromaOverride: 'yuv420',
+      reason: 'VP9 4:2:0: HW encode (vp9_qsv) + HW decode here',
+    }
+  }
+  if (hasVp9Dc && inputs.viewerVp9Decodable) {
+    return {
+      transport: 'data-channel-vp9-444',
+      chromaOverride: 'yuv420',
+      reason: 'VP9 4:2:0: SW encode on agent (capped ≤1920) — no HW×HW codec pair available',
+    }
+  }
+  return { transport: null, chromaOverride: null, reason: 'webrtc H.264 fallback' }
 }
 
 /** rc.44 — clipboard chunking constants. The single-envelope
@@ -1262,6 +1450,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   const resolution = ref<RcResolutionSetting>({ mode: 'original' })
   // Tracks the last agentId we loaded + persist under. Set in connect().
   let resolutionAgentId: string | null = null
+  // rc.190 (A1) — true once the USER changed resolution this session, so
+  // connect()'s per-agent restore doesn't clobber a pre-connect pick.
+  let resolutionUserPickedThisSession = false
 
   /** Viewer render path. `video` goes through `<video>` + the browser's
    *  jitter buffer; `webcodecs` uses the Worker + VideoDecoder + canvas
@@ -1315,6 +1506,17 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   // it eagerly lets the UI disable the toolbar toggle on browsers
   // that lack VP9 profile 1 support.
   void isVp9_444DecodeSupported().then((ok) => { vp9_444Supported.value = ok })
+  /** rc.190 — whether WebCodecs AV1 decode is available here (dav1d SW
+   *  ships in Chromium, so ~always true on Chrome). Gates the AV1
+   *  toggle; the HW-vs-SW truth is `viewerDecodeHw` below. */
+  const av1Supported = ref<boolean>(false)
+  void isAv1DecodeSupported().then((ok) => { av1Supported.value = ok })
+  /** rc.190 — whether THIS viewer decodes the active session's codec in
+   *  hardware (MediaCapabilities `smooth && powerEfficient` at pick
+   *  time). `null` = unknown / webrtc path. Surfaces the viewer half of
+   *  the HW×HW story in the stats HUD, next to the agent-side
+   *  `hardware` flag from `rc:video-info`. */
+  const viewerDecodeHw = ref<boolean | null>(null)
   /** Whether this browser actually supports the WebCodecs path. UI
    *  reads this to disable the toggle when the APIs aren't present
    *  (Firefox, Safari < 17, old Chromium). */
@@ -1900,6 +2102,13 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    *  choice survives reloads without bleeding across machines. */
   function setResolution(next: RcResolutionSetting) {
     resolution.value = next
+    // rc.190 (A1) — remember that the user picked THIS session. Before
+    // this flag, a dropdown pick made BEFORE Connect was (a) never
+    // persisted (`resolutionAgentId` is null until connect()) and then
+    // (b) CLOBBERED by connect()'s readStoredResolution restore — the
+    // field-reported "initial resolution selection doesn't work, I must
+    // connect at original THEN change it" bug.
+    resolutionUserPickedThisSession = true
     if (resolutionAgentId) persistResolution(resolutionAgentId, next)
     sendResolutionPreference()
   }
@@ -2151,8 +2360,14 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    *  Bytes still flow + frames still decode in the synthetic case,
    *  which is what e2e + integration tests assert against.
    *
-   *  Returns the worker handle so tests can drive it directly. */
-  function startVp9_444Path(): Worker | null {
+   *  Returns the worker handle so tests can drive it directly.
+   *
+   *  rc.190 — `codecOverride` reuses this whole path for AV1-over-DC
+   *  (`AV1_CODEC_STRING`): identical 13-byte wire framing, identical DC
+   *  label, the worker's VideoDecoder just gets a different codec
+   *  string. Only one DC video transport is active per session, so the
+   *  shared worker/stats plumbing can't collide. */
+  function startVp9_444Path(codecOverride?: string): Worker | null {
     if (vp9_444Worker) return vp9_444Worker
     if (!pc) return null
     let worker: Worker
@@ -2245,7 +2460,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     } else {
       effectiveChroma = agent?.value?.capabilities?.vp9_chroma
     }
-    const workerCodec = effectiveChroma === 'yuv420' ? 'vp09.00.10.08' : 'vp09.01.10.08'
+    // rc.190 — an explicit codec override (the AV1 path) wins over the
+    // VP9 chroma-derived string.
+    const workerCodec =
+      codecOverride ?? (effectiveChroma === 'yuv420' ? 'vp09.00.10.08' : 'vp09.01.10.08')
 
     // Synthetic OffscreenCanvas — keeps the worker fully wired even
     // without a view-side canvas. Y.4 swaps in the visible canvas
@@ -2779,7 +2997,17 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // before the route params resolve on some mount paths, and we
     // don't want a stale value from a different agent leaking in.
     resolutionAgentId = agentId
-    resolution.value = readStoredResolution(agentId)
+    if (resolutionUserPickedThisSession) {
+      // rc.190 (A1) — the user picked a resolution BEFORE connecting (the
+      // dropdown next to Connect). Keep it, and persist it now that we
+      // finally know which agent it belongs to. Pre-fix this line
+      // unconditionally overwrote the pick with the stored value
+      // ('original' by old default) — the "initial resolution selection
+      // in the dropdown doesn't work" field bug.
+      persistResolution(agentId, resolution.value)
+    } else {
+      resolution.value = readStoredResolution(agentId)
+    }
 
     // Inspect what video codecs this browser can decode so the agent
     // can pick the best intersection with its own AgentCaps.codecs
@@ -3423,11 +3651,59 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // so the fallback lands on VP9 profile 0 (hardware-decoded), overriding
     // the user's chroma choice for the fallback session only.
     let chromaOverride: string | null = null
-    if (videoTransport.value === 'data-channel-vp9-444') {
+    viewerDecodeHw.value = null
+    if (videoTransport.value === 'auto') {
+      // rc.190 (A3) — HW×HW auto-rank. A codec is only smooth when it's
+      // hardware on BOTH ends (field: VP9 is SW-encoded on non-Intel
+      // hosts; HEVC/AV1 can be SW-decoded on weak viewers). Cross the
+      // agent's advertised encoders with this browser's MediaCapabilities
+      // and pick the best pair; explicit user picks skip this entirely.
+      const caps = agent?.value?.capabilities
+      const [av1Hw, hevcHw, vp9Hw, vp9Dec] = await Promise.all([
+        isAv1HwDecodeSupported(),
+        isHevcHwDecodeSupported(),
+        isVp9HwDecodeSupported(),
+        isVp9_444DecodeSupported(),
+      ])
+      vp9_444Supported.value = vp9Dec
+      const pick = pickAutoTransport({
+        agentTransports: caps?.transports ?? [],
+        agentHwEncoders: caps?.hw_encoders ?? [],
+        viewerAv1Hw: av1Hw,
+        viewerHevcHw: hevcHw,
+        viewerVp9Hw: vp9Hw,
+        viewerVp9Decodable: vp9Dec,
+      })
+      preferredTransport = pick.transport
+      chromaOverride = pick.chromaOverride
+      viewerDecodeHw.value =
+        pick.transport === 'data-channel-av1'
+          ? av1Hw
+          : pick.transport === 'data-channel-hevc'
+            ? hevcHw
+            : pick.transport === 'data-channel-vp9-444'
+              ? vp9Hw
+              : null
+      console.info(`[rc] auto transport → ${pick.transport ?? 'webrtc'} (${pick.reason})`)
+    } else if (videoTransport.value === 'data-channel-av1') {
+      // rc.190 — explicit AV1 pick. Chromium always has dav1d SW decode,
+      // so gate only on decodability; the badge surfaces HW vs SW truth.
+      const decodable = av1Supported.value || (await isAv1DecodeSupported())
+      av1Supported.value = decodable
+      if (decodable) {
+        preferredTransport = 'data-channel-av1'
+        viewerDecodeHw.value = await isAv1HwDecodeSupported()
+      } else {
+        console.info(
+          '[rc] preferred_transport=data-channel-av1 dropped — WebCodecs AV1 decode unsupported here. Falling back to webrtc.',
+        )
+      }
+    } else if (videoTransport.value === 'data-channel-vp9-444') {
       const supported = vp9_444Supported.value || (await isVp9_444DecodeSupported())
       vp9_444Supported.value = supported
       if (supported) {
         preferredTransport = 'data-channel-vp9-444'
+        viewerDecodeHw.value = await isVp9HwDecodeSupported()
       } else {
         console.info(
           '[rc] preferred_transport=data-channel-vp9-444 dropped — VideoDecoder.isConfigSupported(vp09.01.10.08) returned false. Falling back to webrtc.',
@@ -3448,6 +3724,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       const hwSmooth = decodable && (await isHevcHwDecodeSupported())
       if (hwSmooth) {
         preferredTransport = 'data-channel-hevc'
+        viewerDecodeHw.value = true
       } else {
         const fallback = vp9_444Supported.value || (await isVp9_444DecodeSupported())
         vp9_444Supported.value = fallback
@@ -3461,6 +3738,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
           // Force 4:2:0 (VP9 profile 0, hardware-decoded); 4:4:4 (profile 1)
           // would be software again and defeat the fallback.
           chromaOverride = 'yuv420'
+          viewerDecodeHw.value = await isVp9HwDecodeSupported()
         } else {
           console.info(
             '[rc] data-channel-hevc dropped + VP9 also unsupported. Falling back to webrtc.',
@@ -3475,9 +3753,18 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // the same transport, so opening it speculatively is harmless on
     // older agents (they ignore the channel entirely).
     if (preferredTransport === 'data-channel-vp9-444') {
-      startVp9_444Path()
+      // rc.190 — when the pick forced 4:2:0 (auto-rank / HEVC fallback),
+      // configure the worker for profile 0 explicitly so the codec
+      // string matches the bitstream the agent will emit, instead of
+      // deriving from the user's chroma pref (which may say 4:4:4).
+      startVp9_444Path(chromaOverride === 'yuv420' ? 'vp09.00.10.08' : undefined)
     } else if (preferredTransport === 'data-channel-hevc') {
       startHevcPath()
+    } else if (preferredTransport === 'data-channel-av1') {
+      // rc.190 — AV1 rides the SAME wire format + worker as VP9-over-DC
+      // (13-byte length-prefix framing; the worker's VideoDecoder just
+      // gets the AV1 codec string). No separate worker file needed.
+      startVp9_444Path(AV1_CODEC_STRING)
     }
 
     // Kick off the rc:* handshake. browser_caps lets the agent pick
@@ -3495,16 +3782,20 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     }
     if (preferredTransport) {
       requestPayload.preferred_transport = preferredTransport
-      // rc.62 — only meaningful with the data-channel-vp9-444
-      // transport. Omit when user picks `'auto'` (= let agent decide
-      // via its env var). rc.186 — a `chromaOverride` (from the
-      // software-HEVC → VP9 4:2:0 fallback) wins unconditionally so the
-      // fallback lands on the hardware-decoded profile 0 even if the user
-      // left chroma on 'auto' or '4:4:4'.
-      if (chromaOverride) {
-        requestPayload.chroma_pref = chromaOverride
-      } else if (vp9Chroma.value !== 'auto') {
-        requestPayload.chroma_pref = vp9Chroma.value
+      // rc.62 — chroma_pref is only meaningful on the
+      // data-channel-vp9-444 transport (rc.190 narrowed the send to it —
+      // HEVC/AV1 sessions are 4:2:0 by construction and ignore it). Omit
+      // when the user picks `'auto'` (= let agent decide via its env
+      // var). rc.186 — a `chromaOverride` (from the software-HEVC → VP9
+      // 4:2:0 fallback OR the rc.190 auto-rank) wins unconditionally so
+      // the pick lands on the hardware-decoded profile 0 even if the
+      // user left chroma on 'auto' or '4:4:4'.
+      if (preferredTransport === 'data-channel-vp9-444') {
+        if (chromaOverride) {
+          requestPayload.chroma_pref = chromaOverride
+        } else if (vp9Chroma.value !== 'auto') {
+          requestPayload.chroma_pref = vp9Chroma.value
+        }
       }
     }
     // Opt-in host audio → `audio_enabled: true` (omitted when off so
@@ -5204,6 +5495,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     mediaIntrinsicH,
     videoTransport,
     setVideoTransport,
+    /** rc.190 — WebCodecs AV1 decode availability (gates the AV1 toggle). */
+    av1Supported,
+    /** rc.190 — whether this viewer HW-decodes the active session's codec
+     *  (null = unknown / webrtc). The viewer half of the HW×HW badge. */
+    viewerDecodeHw,
     /** Opt-in "receive host audio" flag (per-browser, persisted).
      *  Drives the recvonly audio transceiver + `audio_enabled` request
      *  field. Takes effect on next Connect. */
