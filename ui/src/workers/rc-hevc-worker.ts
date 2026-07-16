@@ -117,6 +117,11 @@ let statsBytesTotal = 0
 let statsFramesInWindow = 0
 let statsLastWidth = 0
 let statsLastHeight = 0
+// rc.187 — last frame dims reported to the composable; re-posted on every size
+// change (live viewer-adaptive downscale) so the cursor-mapping intrinsic
+// tracks the actual resolution instead of freezing on the first frame's size.
+let lastPostedW = 0
+let lastPostedH = 0
 let statsLastEmitMs: number = (typeof performance !== 'undefined' ? performance.now() : Date.now())
 const STATS_EMIT_INTERVAL_MS = 1000
 
@@ -216,7 +221,12 @@ function initDecoder() {
       // Capture the one-shot diagnostic BEFORE paintFrame() calls close()
       // (a closed VideoFrame reports 0/null — rc.100 logged {0,0} this way).
       let firstFrameMsg: Record<string, unknown> | null = null
-      if (framesDecoded === 1) {
+      // rc.187 — post dims on frame 1 AND whenever the decoded size changes
+      // (the agent's viewer-adaptive resolution downscales mid-session), so the
+      // composable's cursor mapping never divides by a stale intrinsic.
+      if (codedW !== lastPostedW || codedH !== lastPostedH) {
+        lastPostedW = codedW
+        lastPostedH = codedH
         firstFrameMsg = {
           type: 'first-frame',
           width: codedW,
@@ -432,6 +442,8 @@ function teardown(): void {
   ctx = null
   framesDecoded = 0
   framesReceived = 0
+  lastPostedW = 0
+  lastPostedH = 0
   // rc.103 — re-arm the leading-delta gate so a fresh decoder (re-connect
   // / re-negotiation) again waits for an IDR before its first decode().
   sawKeyframe = false
