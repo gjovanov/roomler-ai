@@ -41,6 +41,7 @@ import {
   appsFocusWireMessage,
   appsLaunchWireMessage,
   decodeStatWireMessage,
+  displayMatchWireMessage,
   pickAutoTransport,
   AV1_CODEC_STRING,
   type AutoTransportInputs,
@@ -1907,6 +1908,24 @@ describe('pickAutoTransport (rc.190 HW×HW codec auto-rank)', () => {
       }),
     )
     expect(r.transport).toBe('data-channel-hevc')
+  })
+})
+
+describe('displayMatchWireMessage (rc.191)', () => {
+  it('sends rounded dims for an enable request', () => {
+    expect(displayMatchWireMessage({ width: 1672.4, height: 818.6 })).toEqual({
+      t: 'rc:display-match',
+      width: 1672,
+      height: 819,
+    })
+  })
+
+  it('null / non-finite dims become a restore request', () => {
+    expect(displayMatchWireMessage(null)).toEqual({ t: 'rc:display-match', enable: false })
+    expect(displayMatchWireMessage({ width: NaN, height: 800 })).toEqual({
+      t: 'rc:display-match',
+      enable: false,
+    })
   })
 })
 

@@ -897,6 +897,23 @@ export async function isHevcHwDecodeSupported(): Promise<boolean> {
   }
 }
 
+/** rc.191 — wire shape for the display-match request (the agent switches
+ *  its display to the largest mode fitting the viewer's stage, making the
+ *  pixel chain 1:1 — see the agent's `display_match` module). `null` dims
+ *  = disable/restore. Pure + exported so the shape is test-locked. */
+export function displayMatchWireMessage(
+  dims: { width: number; height: number } | null,
+): Record<string, unknown> {
+  if (!dims || !Number.isFinite(dims.width) || !Number.isFinite(dims.height)) {
+    return { t: 'rc:display-match', enable: false }
+  }
+  return {
+    t: 'rc:display-match',
+    width: Math.max(1, Math.round(dims.width)),
+    height: Math.max(1, Math.round(dims.height)),
+  }
+}
+
 /** rc.190 — the AV1 codec string for the `data-channel-av1` transport.
  *  Main profile (0), seq_level_idx 13 = Level 5.1 (covers 4K@60 — the
  *  HEVC L3.1 lesson: the declared level is a MAX, a smaller stream
@@ -2102,6 +2119,20 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     if (!msg) return
     try {
       ch.send(JSON.stringify(msg))
+    } catch {
+      /* channel closed between check and send — drop */
+    }
+  }
+
+  /** rc.191 — send a display-match request over the control DC: the agent
+   *  switches its display to the largest mode fitting `dims` (viewer stage
+   *  in physical px) and restores on `null` / channel close. No-op while
+   *  the channel is closed. */
+  function sendDisplayMatch(dims: { width: number; height: number } | null) {
+    const ch = channels.control
+    if (!ch || ch.readyState !== 'open') return
+    try {
+      ch.send(JSON.stringify(displayMatchWireMessage(dims)))
     } catch {
       /* channel closed between check and send — drop */
     }
@@ -5508,6 +5539,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     setVideoTransport,
     /** rc.190 — WebCodecs AV1 decode availability (gates the AV1 toggle). */
     av1Supported,
+    /** rc.191 — display-match sender (agent switches its display mode to
+     *  fit the viewer's stage; null restores). View owns the toggle. */
+    sendDisplayMatch,
     /** rc.190 — whether this viewer HW-decodes the active session's codec
      *  (null = unknown / webrtc). The viewer half of the HW×HW badge. */
     viewerDecodeHw,
