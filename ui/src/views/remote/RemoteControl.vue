@@ -1028,6 +1028,20 @@
             >
               Auto {{ transportAutoOn ? 'ON' : 'OFF' }}
             </v-btn>
+            <!-- rc.191 — Match remote display: the HOST switches its display
+                 mode to fit this window (1:1 pixels = sharpest text),
+                 restored on disconnect. Windows hosts only. -->
+            <v-btn
+              variant="tonal"
+              :color="displayMatchOn ? 'primary' : undefined"
+              :disabled="!agentSupportsDisplayMatch"
+              prepend-icon="mdi-monitor-screenshot"
+              :title="displayMatchTooltip"
+              class="flex-grow-1"
+              @click="toggleDisplayMatch"
+            >
+              1:1 Match {{ displayMatchOn ? 'ON' : 'OFF' }}
+            </v-btn>
             <v-btn
               variant="tonal"
               :color="webcodecsOn ? 'primary' : undefined"
@@ -2569,6 +2583,70 @@ function applyFitResolution() {
   rc.setResolution({ mode: 'fit', width: w, height: h })
 }
 
+// rc.191 — "Match remote display" toggle. When ON, the agent switches the
+// HOST's display to the largest mode fitting this viewer's stage (and
+// restores it on disconnect/toggle-off) — the RDP-style fix that makes the
+// pixel chain 1:1 so remote text is rendered AT the viewed size instead of
+// downscaled into mush. Opt-in (changing a host's display mode is
+// invasive), persisted per-agent, Windows hosts only (v1).
+const DISPLAY_MATCH_STORAGE_PREFIX = 'roomler-rc-display-match.v2:'
+const displayMatchOn = ref(false)
+const agentSupportsDisplayMatch = computed<boolean>(() => {
+  // Gate on OS — old agents just ignore the unknown control message, so
+  // there's no version gate needed (harmless no-op there).
+  return (agent.value?.os ?? '').toLowerCase().startsWith('win')
+})
+const displayMatchTooltip = computed<string>(() => {
+  if (!agentSupportsDisplayMatch.value) {
+    return 'Match remote display is available for Windows hosts only (v1)'
+  }
+  return displayMatchOn.value
+    ? 'Match remote display ON — the host switched its display mode to fit this window (restored on disconnect). Sharpest text.'
+    : 'Match remote display OFF — click to switch the HOST\'s display mode to fit this window (1:1 pixels, sharpest text). Restored on disconnect.'
+})
+function readStoredDisplayMatch(agentId: string): boolean {
+  try {
+    return globalThis.localStorage?.getItem(DISPLAY_MATCH_STORAGE_PREFIX + agentId) === '1'
+  } catch {
+    return false
+  }
+}
+function persistDisplayMatch(agentId: string, on: boolean) {
+  try {
+    if (on) globalThis.localStorage?.setItem(DISPLAY_MATCH_STORAGE_PREFIX + agentId, '1')
+    else globalThis.localStorage?.removeItem(DISPLAY_MATCH_STORAGE_PREFIX + agentId)
+  } catch {
+    /* best-effort */
+  }
+}
+/** Send the display-match request for the CURRENT stage size. */
+function sendDisplayMatchNow() {
+  const el = stageEl.value
+  if (!el) return
+  const rect = el.getBoundingClientRect()
+  const dpr = window.devicePixelRatio || 1
+  rc.sendDisplayMatch({
+    width: Math.max(160, Math.round(rect.width * dpr)),
+    height: Math.max(90, Math.round(rect.height * dpr)),
+  })
+}
+function toggleDisplayMatch() {
+  displayMatchOn.value = !displayMatchOn.value
+  persistDisplayMatch(agentId.value, displayMatchOn.value)
+  if (rc.phase.value === 'connected') {
+    if (displayMatchOn.value) sendDisplayMatchNow()
+    else rc.sendDisplayMatch(null)
+  }
+}
+// Restore the per-agent preference (route param is stable per mount).
+watch(
+  agentId,
+  (id) => {
+    if (id) displayMatchOn.value = readStoredDisplayMatch(id)
+  },
+  { immediate: true },
+)
+
 // ResizeObserver on the stage so Fit mode tracks viewport changes.
 // Debounced — drag-resize fires dozens of events per second and each
 // rc:resolution change rebuilds the encoder on the agent side.
@@ -3154,6 +3232,12 @@ watch(
       // stored width/height are from the previous session — re-emit
       // with the current window size so the agent uses today's dims.
       if (rc.resolution.value.mode === 'fit') applyFitResolution()
+      // rc.191 — re-assert the display-match preference each session (the
+      // agent restores its display mode on every disconnect, so an ON
+      // toggle must be re-sent per connect).
+      if (displayMatchOn.value && agentSupportsDisplayMatch.value) {
+        sendDisplayMatchNow()
+      }
     } else if (phase !== 'connected' && detachInput) {
       detachInput()
       detachInput = null
