@@ -1741,9 +1741,9 @@ fn service_install_as_service() -> Result<()> {
     println!(
         "Service registered: {} ({}). Launching `sc start {}` will run the service \
          under LocalSystem; AutoStart fires on next boot.",
-        win_service::SERVICE_NAME,
+        win_service::NEW_SERVICE_NAME,
         win_service::SERVICE_DISPLAY_NAME,
-        win_service::SERVICE_NAME
+        win_service::NEW_SERVICE_NAME
     );
     Ok(())
 }
@@ -1759,7 +1759,7 @@ fn service_install_as_service() -> Result<()> {
 #[cfg(target_os = "windows")]
 fn service_uninstall_as_service() -> Result<()> {
     win_service::uninstall().context("deregistering RoomlerAgentService")?;
-    println!("Service deregistered ({}).", win_service::SERVICE_NAME);
+    println!("Service deregistered ({}).", win_service::NEW_SERVICE_NAME);
     Ok(())
 }
 
@@ -1771,7 +1771,7 @@ fn service_uninstall_as_service() -> Result<()> {
 #[cfg(target_os = "windows")]
 fn service_status_as_service() -> Result<()> {
     let status = win_service::status().context("querying SCM service status")?;
-    println!("{}: {:?}", win_service::SERVICE_NAME, status);
+    println!("{}: {:?}", win_service::NEW_SERVICE_NAME, status);
     Ok(())
 }
 

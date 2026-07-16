@@ -43,7 +43,7 @@ use windows_sys::Win32::System::Registry::{
     RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
 };
 
-use super::SERVICE_NAME;
+use super::resolved_service_name;
 
 const ENV_KEY_PREFIX: &str = r"SYSTEM\CurrentControlSet\Services\";
 const ENV_VALUE_NAME: &str = "Environment";
@@ -134,7 +134,7 @@ pub fn rmw_unset(pairs: Vec<(String, String)>, name: &str) -> Vec<(String, Strin
 // ─── SCM-side IO ──────────────────────────────────────────────────────────────
 
 fn service_env_key_path() -> String {
-    format!("{ENV_KEY_PREFIX}{SERVICE_NAME}")
+    format!("{ENV_KEY_PREFIX}{}", resolved_service_name())
 }
 
 fn wide_with_nul(s: &str) -> Vec<u16> {
@@ -282,10 +282,10 @@ pub fn restart_service(timeout: Duration) -> Result<()> {
         .context("ServiceManager::local_computer(CONNECT)")?;
     let service = manager
         .open_service(
-            SERVICE_NAME,
+            resolved_service_name(),
             ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::START,
         )
-        .with_context(|| format!("open_service({SERVICE_NAME})"))?;
+        .with_context(|| format!("open_service({})", resolved_service_name()))?;
 
     let status = service.query_status().context("query_status before stop")?;
     if status.current_state == ServiceState::Running

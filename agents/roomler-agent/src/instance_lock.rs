@@ -6,14 +6,17 @@
 //! stomp each other every ~25 s as one's keepalive forces the
 //! server-side WS to drop the other.
 //!
-//! - **Windows**: a per-session named mutex `Local\RoomlerAgent-<sha>`.
-//!   The `Local\` namespace scopes the mutex to one Terminal Services
-//!   session, so on a multi-user host (rare for the agent's per-user
-//!   install model, but possible on a shared workstation) each user
-//!   has their own lock. `<sha>` is a SHA-256 prefix of the config
-//!   path so different enrollments on one machine for one user are
-//!   ALSO caught — those would collide on `agent_id` server-side and
-//!   stomp each other in subtler ways.
+//! - **Windows**: a pair of per-session named mutexes,
+//!   `Local\Roomler-<sha>` (post-P3D-rename) AND `Local\RoomlerAgent-<sha>`
+//!   (pre-rename). Acquiring both means an OLD `roomler-agent run` and a
+//!   NEW one can't both run during the rename window — either one already
+//!   holding either name blocks the other. The `Local\` namespace scopes
+//!   each mutex to one Terminal Services session, so on a multi-user host
+//!   (rare for the agent's per-user install model, but possible on a
+//!   shared workstation) each user has their own lock. `<sha>` is a
+//!   SHA-256 prefix of the config path so different enrollments on one
+//!   machine for one user are ALSO caught — those would collide on
+//!   `agent_id` server-side and stomp each other in subtler ways.
 //! - **Unix**: `flock(LOCK_EX | LOCK_NB)` on a file in the runtime
 //!   dir (`$XDG_RUNTIME_DIR` or `~/.cache/...` fallback). The kernel
 //!   releases the lock when the FD is closed (Drop) or the process
@@ -41,8 +44,13 @@ pub enum AcquireOutcome {
 /// releases it. Implementations are platform-specific and gated
 /// below; the type is opaque to callers.
 pub struct InstanceLock {
+    // Both the new `Roomler-<id>` and legacy `RoomlerAgent-<id>` mutex
+    // handles are held for the process lifetime; each `WinMutex::drop`
+    // calls CloseHandle, releasing that name so a fresh acquire succeeds.
     #[cfg(target_os = "windows")]
-    _win: WinMutex,
+    _win_new: WinMutex,
+    #[cfg(target_os = "windows")]
+    _win_legacy: WinMutex,
     #[cfg(unix)]
     _unix: std::fs::File,
 }
@@ -112,23 +120,31 @@ impl Drop for WinMutex {
 }
 
 #[cfg(target_os = "windows")]
-fn win_acquire(id: &str) -> Result<AcquireOutcome> {
-    type Handle = *mut std::ffi::c_void;
+type WinHandle = *mut std::ffi::c_void;
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" {
+    fn CreateMutexW(
+        lp_mutex_attributes: *mut std::ffi::c_void,
+        b_initial_owner: i32,
+        lp_name: *const u16,
+    ) -> WinHandle;
+    fn GetLastError() -> u32;
+}
+
+/// Create one named mutex. Returns:
+///   - `Ok(Some(handle))` — we freshly created it (nobody else holds it);
+///     the caller owns `handle` and must keep it alive / close it.
+///   - `Ok(None)` — it already existed (another process holds it); the
+///     handle we opened is closed here, nothing to keep.
+///   - `Err` — CreateMutexW failed outright.
+#[cfg(target_os = "windows")]
+fn create_named_mutex(name: &str) -> Result<Option<WinHandle>> {
     const ERROR_ALREADY_EXISTS: u32 = 183;
-
     unsafe extern "system" {
-        fn CreateMutexW(
-            lp_mutex_attributes: *mut std::ffi::c_void,
-            b_initial_owner: i32,
-            lp_name: *const u16,
-        ) -> Handle;
-        fn GetLastError() -> u32;
-        fn CloseHandle(handle: Handle) -> i32;
+        fn CloseHandle(handle: WinHandle) -> i32;
     }
-
-    let name = format!("Local\\RoomlerAgent-{id}");
     let name_w: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
-
     // SAFETY: NULL security attributes is allowed (default ACL); name
     // is null-terminated UTF-16; b_initial_owner=FALSE means we don't
     // hold the mutex (we don't need to — we just want existence
@@ -136,18 +152,47 @@ fn win_acquire(id: &str) -> Result<AcquireOutcome> {
     let h = unsafe { CreateMutexW(std::ptr::null_mut(), 0, name_w.as_ptr()) };
     if h.is_null() {
         let err = unsafe { GetLastError() };
-        anyhow::bail!("CreateMutexW failed (GetLastError={err})");
+        anyhow::bail!("CreateMutexW failed for {name} (GetLastError={err})");
     }
     let last = unsafe { GetLastError() };
     if last == ERROR_ALREADY_EXISTS {
-        // Some other process (or, on retry, ourselves) already owns
-        // the mutex object. Close our handle and report.
+        // Some other process (or, on retry, ourselves) already owns the
+        // mutex object. Close the handle we opened and report "taken".
         unsafe {
             CloseHandle(h);
         }
-        return Ok(AcquireOutcome::AlreadyRunning);
+        return Ok(None);
     }
-    Ok(AcquireOutcome::Acquired(InstanceLock { _win: WinMutex(h) }))
+    Ok(Some(h))
+}
+
+#[cfg(target_os = "windows")]
+fn win_acquire(id: &str) -> Result<AcquireOutcome> {
+    // Acquire BOTH names so an OLD `RoomlerAgent-<id>` instance and a NEW
+    // `Roomler-<id>` instance can't both run during the rename window.
+    let new_name = format!("Local\\Roomler-{id}");
+    let legacy_name = format!("Local\\RoomlerAgent-{id}");
+
+    // New name first.
+    let Some(new_h) = create_named_mutex(&new_name)? else {
+        return Ok(AcquireOutcome::AlreadyRunning);
+    };
+    // Wrap immediately so that if the legacy acquire below reports
+    // AlreadyRunning (or errors), this handle is dropped/closed via
+    // WinMutex::drop and we don't leak the `Roomler-<id>` mutex.
+    let new_mutex = WinMutex(new_h);
+
+    let Some(legacy_h) = create_named_mutex(&legacy_name)? else {
+        // Legacy name is held by an old instance. `new_mutex` drops here,
+        // releasing the new name we just took.
+        return Ok(AcquireOutcome::AlreadyRunning);
+    };
+
+    // Both freshly created — hold both handles for the process lifetime.
+    Ok(AcquireOutcome::Acquired(InstanceLock {
+        _win_new: new_mutex,
+        _win_legacy: WinMutex(legacy_h),
+    }))
 }
 
 // ---------------------------------------------------------------------------
