@@ -10,10 +10,10 @@
 //! Operator who wants live tail can request again every few seconds.
 //!
 //! Path resolution: uses `logging::log_dir()` as the source-of-truth,
-//! then picks the lexicographically-latest `roomler-agent.log.*`
-//! file. `tracing_appender::rolling::daily` rotates daily so the
-//! latest by name is also the latest by mtime — no I/O needed to
-//! choose.
+//! then picks the lexicographically-latest `roomlerd.log.*` file (or a
+//! legacy `roomler-agent.log.*` on a pre-rename host — P3d Slice B).
+//! `tracing_appender::rolling::daily` rotates daily so the latest by
+//! name is also the latest by mtime — no I/O needed to choose.
 //!
 //! Truncation: we read the last N lines (default 500, capped at
 //! 5000) by streaming from EOF backwards in 4 KiB chunks. Files >
@@ -35,8 +35,14 @@ pub const MAX_TAIL_LINES: usize = 5000;
 
 /// Resolve the current log file path. Returns `Err` when log dir is
 /// unresolvable (rare — only on platforms without a data dir) or
-/// when no `roomler-agent.log*` file exists yet (e.g. agent just
-/// started and `tracing_appender` hasn't created the first file).
+/// when no `roomlerd.log*` (or legacy `roomler-agent.log*`) file exists
+/// yet (e.g. agent just started and `tracing_appender` hasn't created
+/// the first file).
+///
+/// P3d Slice B: the live basename is now `roomlerd.log`; a pre-rename host
+/// may still have `roomler-agent.log*` files. Accept BOTH prefixes. The
+/// lexicographic pick naturally prefers `roomlerd.*` over `roomler-agent.*`
+/// (`'d'` > `'-'`), which matches "the new-basename file is the current one".
 pub fn current_log_path() -> Result<PathBuf> {
     let dir = crate::logging::log_dir()
         .ok_or_else(|| anyhow!("log dir is unresolvable on this platform"))?;
@@ -45,11 +51,11 @@ pub fn current_log_path() -> Result<PathBuf> {
     let mut best: Option<(String, PathBuf)> = None;
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        if !name.starts_with("roomler-agent.log") {
+        if !name.starts_with("roomlerd.log") && !name.starts_with("roomler-agent.log") {
             continue;
         }
         // Prefer the lexicographically-latest filename. tracing's
-        // daily rotation creates `roomler-agent.log.YYYY-MM-DD` so
+        // daily rotation creates `roomlerd.log.YYYY-MM-DD` so
         // the latest day sorts last. The current-day's file (no
         // suffix yet on some appender versions) is fine too — we
         // pick whichever sorts highest.
@@ -58,8 +64,12 @@ pub fn current_log_path() -> Result<PathBuf> {
             _ => best = Some((name, entry.path())),
         }
     }
-    best.map(|(_, p)| p)
-        .ok_or_else(|| anyhow!("no roomler-agent.log* file in {}", dir.display()))
+    best.map(|(_, p)| p).ok_or_else(|| {
+        anyhow!(
+            "no roomlerd.log* or roomler-agent.log* file in {}",
+            dir.display()
+        )
+    })
 }
 
 /// Read the last `lines` lines from the current log file and return

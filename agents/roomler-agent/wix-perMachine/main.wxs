@@ -95,9 +95,35 @@
                  dance needed because ProgramFiles is system-scoped. -->
             <Directory Id='ProgramFiles64Folder'>
                 <Directory Id='APPLICATIONFOLDER' Name='roomler-agent'>
+                    <!-- P3d Slice B: the daemon EXE is now `roomlerd.exe`. File
+                         Id stays `roomler_agent_exe` so every <CustomAction
+                         FileKey='roomler_agent_exe'> (RegisterService,
+                         EnableSystemContext, cleanup, ...) still resolves to THIS
+                         real daemon file. Component Id + Guid unchanged for
+                         stable identity across upgrade; perMachine keys off the
+                         file itself (KeyPath='yes'), Win64='yes' like siblings. -->
                     <Component Id='AgentExe' Guid='6E4F5B23-7A3D-4F2C-8E5D-9F2C3E5F7A04' Win64='yes'>
                         <File
                             Id='roomler_agent_exe'
+                            Name='roomlerd.exe'
+                            DiskId='1'
+                            KeyPath='yes'
+                            Source='target\release\roomlerd.exe' />
+                    </Component>
+                    <!-- P3d Slice B: INERT compatibility alias. Ships a
+                         `roomler-agent.exe` copy (produced by the
+                         release-agent.yml `Copy-Item roomlerd.exe
+                         roomler-agent.exe` step before cargo-wix) alongside the
+                         renamed daemon so a mixed / in-flight fleet still
+                         resolves the old basename. NO CustomAction targets this
+                         file — every FileKey stays on the primary
+                         `roomler_agent_exe`. Fresh unique GUID; keys off the file
+                         itself (KeyPath='yes') + Win64='yes' like its siblings
+                         (perMachine ProgramFiles is system-scoped, so no HKCU
+                         dance is needed — same as AgentExe). -->
+                    <Component Id='AgentExeAlias' Guid='F1F83CBE-51DC-4D11-91AB-B7DABE094344' Win64='yes'>
+                        <File
+                            Id='roomler_agent_exe_alias'
                             Name='roomler-agent.exe'
                             DiskId='1'
                             KeyPath='yes'
@@ -193,6 +219,8 @@
             InstallDefault='local'
             Absent='disallow'>
             <ComponentRef Id='AgentExe' />
+            <!-- P3d Slice B: inert `roomler-agent.exe` compatibility alias. -->
+            <ComponentRef Id='AgentExeAlias' />
             <ComponentRef Id='LicenseTxt' />
             <ComponentRef Id='ReadmeTxt' />
             <ComponentRef Id='WintunDll' />
