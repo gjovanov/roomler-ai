@@ -12,6 +12,7 @@ pub mod config;
 pub mod consent;
 pub mod crash_recorder;
 pub mod crash_uploader;
+pub mod display_match;
 pub mod displays;
 #[cfg(target_os = "windows")]
 pub mod dpi;
