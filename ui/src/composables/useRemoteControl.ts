@@ -490,8 +490,15 @@ export interface RcResolutionSetting {
 
 /** Per-agent localStorage prefix — resolution preferences should NOT
  *  bleed across machines (a "Fit to local at 1920×1080" set for my
- *  laptop monitor is wrong for my 4K desktop). */
-const RESOLUTION_STORAGE_PREFIX = 'roomler-rc-resolution:'
+ *  laptop monitor is wrong for my 4K desktop).
+ *
+ *  rc.190.1 — prefix bumped `:` → `.v2:` as a ONE-TIME migration to the
+ *  new Fit default. Field 2026-07-16: prefs stored during the earlier
+ *  debugging rounds (e.g. 'original' left on GEAL8N6) silently overrode
+ *  the new default and kept a 4K panel streaming at native through a
+ *  ~60 ms/frame encode. Old-key values are intentionally orphaned; any
+ *  pick made from now on persists under the new key as usual. */
+const RESOLUTION_STORAGE_PREFIX = 'roomler-rc-resolution.v2:'
 
 const SCALE_MODE_STORAGE_KEY = 'roomler-rc-scale-mode'
 const SCALE_CUSTOM_PCT_STORAGE_KEY = 'roomler-rc-scale-pct'
@@ -681,7 +688,11 @@ export type RcVideoTransport =
   | 'data-channel-hevc'
   | 'data-channel-av1'
 
-const VIDEO_TRANSPORT_STORAGE_KEY = 'roomler-rc-video-transport'
+/** rc.190.1 — key bumped as a ONE-TIME migration to the new Auto
+ *  default (same rationale as the resolution-prefix bump: transports
+ *  toggled during the earlier debugging rounds would silently block the
+ *  HW×HW auto-rank forever). Explicit picks made from now on persist. */
+const VIDEO_TRANSPORT_STORAGE_KEY = 'roomler-rc-video-transport.v2'
 
 /** rc.62 — localStorage key for the per-browser VP9 chroma preference.
  *  Recognised values: `'auto'` (let the agent decide via env var),
