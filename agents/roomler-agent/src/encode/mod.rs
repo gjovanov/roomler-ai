@@ -48,14 +48,17 @@ pub mod ffmpeg;
 )]
 pub mod aimd;
 
-// Viewer decode-pressure controller — turns the browser's `rc:keyframe`
-// request rate into an fps-first frame-skip level for the DC pumps. Pure
-// (unit-tested on the default build); only the pump features USE it.
+// Viewer-rate controller (rc.188) — folds the browser's measured `rc:decodestat`
+// (decoded fps + struggling) into a send-fps cap for the DC pumps, so the agent
+// settles at the viewer's real sustainable rate instead of firehosing 60 fps and
+// relying on the (harmful) keyframe-storm the rc.184 `decode_pressure` heuristic
+// tried and failed to break. Pure (unit-tested on the default build); only the
+// pump features USE it.
 #[cfg_attr(
     not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
     allow(dead_code)
 )]
-pub mod decode_pressure;
+pub mod viewer_rate;
 
 // Encode-pressure controller — auto-reduces the maxrate ceiling when the
 // SENDER's encoder saturates (avg encode time high), the dynamic version of
