@@ -41,6 +41,9 @@ import {
   appsFocusWireMessage,
   appsLaunchWireMessage,
   decodeStatWireMessage,
+  pickAutoTransport,
+  AV1_CODEC_STRING,
+  type AutoTransportInputs,
   type KeyDecision,
 } from '@/composables/useRemoteControl'
 import { codecMimeForShort } from '@/workers/rc-webcodecs-worker'
@@ -1819,6 +1822,99 @@ describe('nextDirPath', () => {
         nextDirPath({ name: 'dev', is_dir: true }, '\\\\?\\C:\\', false)
       ).toBe('\\\\?\\C:\\dev')
     })
+  })
+})
+
+describe('pickAutoTransport (rc.190 HW×HW codec auto-rank)', () => {
+  const base = (over: Partial<AutoTransportInputs>): AutoTransportInputs => ({
+    agentTransports: [],
+    agentHwEncoders: [],
+    viewerAv1Hw: false,
+    viewerHevcHw: false,
+    viewerVp9Hw: false,
+    viewerVp9Decodable: false,
+    ...over,
+  })
+
+  it('NEO16→capable-viewer pair picks AV1 (HW on both ends)', () => {
+    const r = pickAutoTransport(
+      base({
+        agentTransports: ['data-channel-vp9-444', 'data-channel-hevc', 'data-channel-av1'],
+        agentHwEncoders: ['ffmpeg-hevc_nvenc', 'ffmpeg-av1_nvenc', 'libvpx-vp9-444-sw'],
+        viewerAv1Hw: true,
+        viewerHevcHw: true,
+        viewerVp9Hw: true,
+        viewerVp9Decodable: true,
+      }),
+    )
+    expect(r.transport).toBe('data-channel-av1')
+  })
+
+  it('GEAL8N6→PC50045 pair picks HEVC (agent has NO AV1/VP9 HW encode)', () => {
+    // UHD 630 + GTX 1650: hevc_nvenc is the only HW DC encoder.
+    const r = pickAutoTransport(
+      base({
+        agentTransports: ['data-channel-vp9-444', 'data-channel-hevc'],
+        agentHwEncoders: ['ffmpeg-hevc_nvenc', 'libvpx-vp9-444-sw'],
+        viewerAv1Hw: true, // viewer could do AV1 — agent can't encode it
+        viewerHevcHw: true,
+        viewerVp9Hw: true,
+        viewerVp9Decodable: true,
+      }),
+    )
+    expect(r.transport).toBe('data-channel-hevc')
+    expect(r.chromaOverride).toBeNull()
+  })
+
+  it('weak viewer (no HW HEVC) on an Intel sender lands on VP9 4:2:0 HW×HW', () => {
+    const r = pickAutoTransport(
+      base({
+        agentTransports: ['data-channel-vp9-444', 'data-channel-hevc'],
+        agentHwEncoders: ['ffmpeg-hevc_qsv', 'ffmpeg-vp9_qsv', 'libvpx-vp9-444-sw'],
+        viewerHevcHw: false, // HEVC would be SW-decoded here — skip it
+        viewerVp9Hw: true,
+        viewerVp9Decodable: true,
+      }),
+    )
+    expect(r.transport).toBe('data-channel-vp9-444')
+    expect(r.chromaOverride).toBe('yuv420')
+  })
+
+  it('no HW×HW pair at all → VP9 SW-encode fallback (agent caps it ≤1920)', () => {
+    const r = pickAutoTransport(
+      base({
+        agentTransports: ['data-channel-vp9-444'],
+        agentHwEncoders: ['libvpx-vp9-444-sw'],
+        viewerVp9Hw: false,
+        viewerVp9Decodable: true,
+      }),
+    )
+    expect(r.transport).toBe('data-channel-vp9-444')
+    expect(r.chromaOverride).toBe('yuv420')
+  })
+
+  it('nothing decodable / nothing advertised → webrtc (null)', () => {
+    expect(pickAutoTransport(base({})).transport).toBeNull()
+  })
+
+  it('derives transports from hw_encoders for pre-transports agent rows', () => {
+    // Older DB rows lack `transports` (skip_serializing_if empty) — the
+    // hw_encoders labels alone must still light up the HEVC path.
+    const r = pickAutoTransport(
+      base({
+        agentHwEncoders: ['ffmpeg-hevc_nvenc'],
+        viewerHevcHw: true,
+      }),
+    )
+    expect(r.transport).toBe('data-channel-hevc')
+  })
+})
+
+describe('AV1_CODEC_STRING (rc.190)', () => {
+  it('is Main profile, level 5.1, Main tier, 8-bit — covers 4K@60', () => {
+    // The declared level is a MAX (HEVC L3.1 lesson: too low a level
+    // hard-rejects streams above it); 13 = 5.1.
+    expect(AV1_CODEC_STRING).toBe('av01.0.13M.08')
   })
 })
 
