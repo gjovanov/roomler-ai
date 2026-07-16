@@ -232,8 +232,9 @@ fn pick_device(host: &cpal::Host) -> Result<(cpal::Device, bool)> {
     }
     #[cfg(target_os = "linux")]
     {
+        use tunnel_core::env::node_env;
         // 1. Explicit override via env.
-        if let Ok(name) = std::env::var("ROOMLER_AGENT_AUDIO_SOURCE") {
+        if let Some(name) = node_env("AUDIO_SOURCE") {
             if !name.trim().is_empty() {
                 if let Some(dev) = find_input_by_name(host, &name) {
                     tracing::info!(source = %name, "audio: using ROOMLER_AGENT_AUDIO_SOURCE monitor");

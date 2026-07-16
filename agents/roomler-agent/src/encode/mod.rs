@@ -13,6 +13,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use tunnel_core::env::node_env;
 
 use crate::capture::{DirtyRect, Frame};
 
@@ -150,7 +151,7 @@ pub(crate) fn initial_bitrate_for_fps(width: u32, height: u32, fps: u32) -> u32 
     allow(dead_code)
 )]
 pub(crate) fn transport_is_constrained() -> bool {
-    std::env::var("ROOMLER_AGENT_ICE_RELAY_TCP")
+    node_env("ICE_RELAY_TCP")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }
@@ -166,8 +167,7 @@ pub(crate) fn transport_is_constrained() -> bool {
     allow(dead_code)
 )]
 pub(crate) fn relay_max_bps() -> u32 {
-    std::env::var("ROOMLER_AGENT_RELAY_MAX_KBPS")
-        .ok()
+    node_env("RELAY_MAX_KBPS")
         .and_then(|v| v.trim().parse::<u32>().ok())
         .filter(|k| *k > 0)
         .map(|k| k.saturating_mul(1000))
@@ -520,7 +520,7 @@ fn open_for_codec_hevc(width: u32, height: u32) -> (Box<dyn VideoEncoder>, &'sta
 /// MF-HW-first branch of the Auto cascade. Unset or any other value
 /// leaves the default (MF-HW first) in place.
 fn hw_auto_disabled() -> bool {
-    std::env::var("ROOMLER_AGENT_HW_AUTO")
+    node_env("HW_AUTO")
         .map(|v| {
             matches!(
                 v.trim().to_ascii_lowercase().as_str(),

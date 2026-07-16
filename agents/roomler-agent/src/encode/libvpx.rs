@@ -44,6 +44,7 @@ use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use std::os::raw::{c_int, c_uint};
 use std::sync::Arc;
+use tunnel_core::env::node_env;
 use vpx_sys as vpx;
 
 /// Initial bitrate target before any back-channel feedback. The
@@ -715,8 +716,7 @@ fn num_cpus_for_encode() -> c_uint {
 /// unparseable / unset value falls back to the default.
 pub(crate) fn cpu_used_from_env() -> c_int {
     const DEFAULT_CPU_USED: i32 = 6;
-    let raw = std::env::var("ROOMLER_AGENT_VP9_CPU_USED")
-        .ok()
+    let raw = node_env("VP9_CPU_USED")
         .and_then(|v| v.trim().parse::<i32>().ok())
         .unwrap_or(DEFAULT_CPU_USED);
     raw.clamp(4, 9) as c_int
@@ -734,8 +734,7 @@ pub(crate) fn cpu_used_from_env() -> c_int {
 /// operator lengthen it (up to 60 s) to favour smoothness over text crispness.
 pub(crate) fn kf_seconds_from_env() -> u32 {
     const DEFAULT_KF_SECONDS: u32 = 3;
-    std::env::var("ROOMLER_AGENT_VP9_KF_SECONDS")
-        .ok()
+    node_env("VP9_KF_SECONDS")
         .and_then(|v| v.trim().parse::<u32>().ok())
         .filter(|s| *s > 0)
         .unwrap_or(DEFAULT_KF_SECONDS)
@@ -759,7 +758,7 @@ pub(crate) fn kf_seconds_from_env() -> u32 {
 /// falls back to Yuv444 (the pre-rc.61 default — preserves behaviour
 /// for hosts that don't know about the new knob).
 pub fn vp9_chroma_from_env() -> Vp9Chroma {
-    let raw = std::env::var("ROOMLER_AGENT_VP9_CHROMA").unwrap_or_default();
+    let raw = node_env("VP9_CHROMA").unwrap_or_default();
     let parsed = match raw.trim().to_ascii_lowercase().as_str() {
         "" | "yuv444" | "444" => Vp9Chroma::Yuv444,
         "yuv420" | "420" => Vp9Chroma::Yuv420,
@@ -780,7 +779,7 @@ pub fn vp9_chroma_from_env() -> Vp9Chroma {
 }
 
 fn rc_mode_from_env() -> vpx::vpx_rc_mode {
-    let raw = std::env::var("ROOMLER_AGENT_VP9_RC_MODE").unwrap_or_default();
+    let raw = node_env("VP9_RC_MODE").unwrap_or_default();
     let parsed = match raw.trim().to_ascii_lowercase().as_str() {
         "" | "cbr" => vpx::vpx_rc_mode::VPX_CBR,
         "vbr" => vpx::vpx_rc_mode::VPX_VBR,

@@ -29,6 +29,7 @@ use ffmpeg_next::{codec, format, frame, util};
 
 use crate::capture::{DirtyRect, Frame, PixelFormat};
 use crate::encode::{EncodedPacket, VideoEncoder};
+use tunnel_core::env::node_env;
 
 /// Initial GOP interval — every Nth frame is forced IDR. Matches libvpx
 /// VP9-444 cadence in `encode::libvpx`. The DC framing path's
@@ -71,8 +72,7 @@ const VP9_ENCODER_NAMES: &[&str] = &["vp9_qsv"];
 /// clamped to [10, 40]; below 10 is near-lossless (huge), above 40 is
 /// visibly soft. Env-overridable for field tuning without a rebuild.
 fn ffmpeg_cq() -> u32 {
-    std::env::var("ROOMLER_AGENT_FFMPEG_CQ")
-        .ok()
+    node_env("FFMPEG_CQ")
         .and_then(|v| v.trim().parse::<u32>().ok())
         .map(|c| c.clamp(10, 40))
         .unwrap_or(22)
@@ -96,8 +96,7 @@ fn ffmpeg_cq() -> u32 {
 /// either throttled the direct session or missed the relay one. The DC pump
 /// now passes its per-session `detect_constrained_transport` result.
 pub(crate) fn ffmpeg_maxrate_bps(width: u32, height: u32, fps: u32, constrained: bool) -> usize {
-    if let Some(kbps) = std::env::var("ROOMLER_AGENT_FFMPEG_MAXRATE_KBPS")
-        .ok()
+    if let Some(kbps) = node_env("FFMPEG_MAXRATE_KBPS")
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|k| *k > 0)
     {
@@ -145,17 +144,17 @@ fn encoder_options(
     let mut lowlat: Vec<(String, String)> = Vec::new();
     let cap = maxrate_bps.to_string();
     let cq_s = cq.to_string();
-    let preset = std::env::var("ROOMLER_AGENT_FFMPEG_PRESET").ok();
-    let tune = std::env::var("ROOMLER_AGENT_FFMPEG_TUNE").ok();
+    let preset = node_env("FFMPEG_PRESET");
+    let tune = node_env("FFMPEG_TUNE");
 
     // Resolve a low-latency knob: env override wins; an explicitly EMPTY env
     // value OMITS the knob (escape hatch for a driver that rejects it); unset
     // → the default. Defaults are ON.
-    let lowlat_knob = |env_name: &str, default: &str| -> Option<String> {
-        match std::env::var(env_name) {
-            Ok(v) if v.trim().is_empty() => None,
-            Ok(v) => Some(v.trim().to_string()),
-            Err(_) => Some(default.to_string()),
+    let lowlat_knob = |suffix: &str, default: &str| -> Option<String> {
+        match node_env(suffix) {
+            Some(v) if v.trim().is_empty() => None,
+            Some(v) => Some(v.trim().to_string()),
+            None => Some(default.to_string()),
         }
     };
 
@@ -194,7 +193,7 @@ fn encoder_options(
         // frame sits in the encoder ~4 frames, which at caret-blink rate
         // (~2 fps while typing) is ~2 s. Window-move (~60 fps) drains the
         // same 4 frames in ~66 ms → smooth. Independent of tune=ll/forced-idr.
-        if let Some(v) = lowlat_knob("ROOMLER_AGENT_FFMPEG_NVENC_DELAY", "0") {
+        if let Some(v) = lowlat_knob("FFMPEG_NVENC_DELAY", "0") {
             lowlat.push(("delay".into(), v));
         }
     } else if name.contains("qsv") {
@@ -211,7 +210,7 @@ fn encoder_options(
         // rc.130 — `async_depth=1`: cap QSV's in-flight pipeline to one frame
         // so it emits immediately instead of buffering ~4 (low_power VDENC
         // respects it). Same typing-latency fix as NVENC `delay=0`.
-        if let Some(v) = lowlat_knob("ROOMLER_AGENT_FFMPEG_QSV_ASYNC_DEPTH", "1") {
+        if let Some(v) = lowlat_knob("FFMPEG_QSV_ASYNC_DEPTH", "1") {
             lowlat.push(("async_depth".into(), v));
         }
     } else if name.contains("amf") {
@@ -224,7 +223,7 @@ fn encoder_options(
         base.push(("bufsize".into(), cap.clone()));
         // rc.130 — `query_timeout=1`: minimise the output-poll block (AMF's
         // low-latency lever alongside vbr_latency).
-        if let Some(v) = lowlat_knob("ROOMLER_AGENT_FFMPEG_AMF_QUERY_TIMEOUT", "1") {
+        if let Some(v) = lowlat_knob("FFMPEG_AMF_QUERY_TIMEOUT", "1") {
             lowlat.push(("query_timeout".into(), v));
         }
     }

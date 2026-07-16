@@ -66,14 +66,15 @@ pub fn linked_libavcodec_version() -> u32 {
 /// host without working HW HEVC/QSV falls back cleanly regardless of this flag.
 #[cfg(feature = "ffmpeg-encoder")]
 pub fn ffmpeg_backend_enabled() -> bool {
-    match std::env::var("ROOMLER_AGENT_USE_FFMPEG") {
+    use tunnel_core::env::node_env;
+    match node_env("USE_FFMPEG") {
         // Explicit opt-OUT only. Any other value (the old truthy set, or
         // unrecognised text) leaves the backend ON.
-        Ok(v) => !matches!(
+        Some(v) => !matches!(
             v.trim().to_ascii_lowercase().as_str(),
             "0" | "false" | "no" | "off" | ""
         ),
-        Err(_) => true,
+        None => true,
     }
 }
 

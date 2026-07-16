@@ -51,6 +51,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
+use tunnel_core::env::node_env_os;
 
 /// 2 GiB. SCTP DCs in webrtc-rs can carry larger payloads in theory
 /// but per-transfer >2 GB is outside the "drop a file" use case and
@@ -215,7 +216,7 @@ pub(crate) static STAGE_IN_PROGRAMDATA: std::sync::LazyLock<bool> =
         if cfg!(test) {
             return false;
         }
-        if std::env::var_os("ROOMLER_AGENT_STAGING_LEGACY_PER_DEST").is_some() {
+        if node_env_os("STAGING_LEGACY_PER_DEST").is_some() {
             tracing::info!(
                 "files: ROOMLER_AGENT_STAGING_LEGACY_PER_DEST set; reverting to per-dest staging"
             );

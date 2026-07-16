@@ -18,6 +18,7 @@
 use anyhow::{Context, Result};
 use audiopus::coder::Encoder as OpusCoder;
 use audiopus::{Application, Bitrate, Channels, SampleRate};
+use tunnel_core::env::node_env;
 
 /// Opus output sample rate — the only rate WebRTC negotiates.
 const OUT_RATE: u32 = 48_000;
@@ -105,8 +106,8 @@ impl OpusEncoder {
 /// (6–510 kbps). Falls back to [`DEFAULT_BITRATE_BPS`] on unset /
 /// unparseable / out-of-range.
 fn bitrate_from_env() -> i32 {
-    match std::env::var("ROOMLER_AGENT_AUDIO_BITRATE_BPS") {
-        Ok(v) => match v.trim().parse::<i32>() {
+    match node_env("AUDIO_BITRATE_BPS") {
+        Some(v) => match v.trim().parse::<i32>() {
             Ok(n) if (6_000..=510_000).contains(&n) => n,
             Ok(n) => {
                 tracing::warn!(
@@ -123,7 +124,7 @@ fn bitrate_from_env() -> i32 {
                 DEFAULT_BITRATE_BPS
             }
         },
-        Err(_) => DEFAULT_BITRATE_BPS,
+        None => DEFAULT_BITRATE_BPS,
     }
 }
 

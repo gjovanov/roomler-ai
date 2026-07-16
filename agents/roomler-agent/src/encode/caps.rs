@@ -401,7 +401,8 @@ fn activates(codec: CodecProbe) -> ProbeResult {
 /// / AMF).
 #[cfg(all(target_os = "windows", feature = "mf-encoder"))]
 fn allow_sw_heavy_override() -> bool {
-    std::env::var("ROOMLER_AGENT_ALLOW_SW_HEAVY")
+    use tunnel_core::env::node_env;
+    node_env("ALLOW_SW_HEAVY")
         .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false)
 }
