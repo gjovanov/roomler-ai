@@ -75,7 +75,14 @@ let framesSkippedAwaitingKey = 0
 // rc.130 — decode-backlog shed (see the HEVC worker for the rationale). Drop
 // deltas + ask the agent for a resync IDR when the decoder's input queue
 // grows, so a sustained decode deficit can't make latency grow without bound.
-const MAX_DECODE_QUEUE = 2
+// rc.188 — raised 2→4: the agent now caps send-fps to this viewer's reported
+// sustainable rate (`rc:decodestat`), so in steady state the queue sits at ~0.
+// The higher ceiling only matters transiently — it lets an onset burst (the
+// first ~1 s of a window-drag, before the agent's cap engages) ride through
+// WITHOUT the destructive drop+IDR-storm that used to freeze the screen. The
+// `struggling` bit we report trips at queue > 1, so the cap reacts before we
+// ever reach this drop threshold.
+const MAX_DECODE_QUEUE = 4
 let framesDroppedBacklog = 0
 let lastKeyframeReqMs = 0
 
