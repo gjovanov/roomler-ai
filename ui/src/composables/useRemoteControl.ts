@@ -411,6 +411,10 @@ interface TurnCredsResponse {
 const EMPTY_STATS: RcStats = { bitrate_bps: 0, fps: 0, codec: '' }
 const QUALITY_STORAGE_KEY = 'rc:quality'
 const STATS_POLL_MS = 500
+// rc.187 — viewer decode-adaptive resolution: evaluate the decode-backup rate
+// this often. ~2.5 s balances responsiveness against not thrashing the
+// encoder with resolution rebuilds.
+const ADAPTIVE_RES_WINDOW_MS = 2500
 
 function readStoredQuality(): RcQuality {
   try {
@@ -588,6 +592,49 @@ export function resolutionWireMessage(
   const h = Math.round(s.height)
   if (w < 1 || h < 1) return null
   return { t: 'rc:resolution', mode: s.mode, width: w, height: h }
+}
+
+/** rc.187 — viewer decode-adaptive resolution ladder. When the VIEWER's own
+ *  decoder persistently backs up (its worker keeps posting `request-keyframe`
+ *  because it's dropping deltas to resync — the signal a weak laptop can't
+ *  decode+render a high-res sender's stream, e.g. an Iris Xe viewing neo16's
+ *  2560×1600@60), the composable steps the requested resolution DOWN this
+ *  ladder, then probes back UP when it recovers. Reuses `rc:resolution` → the
+ *  agent's target_resolution, so the cursor overlay (rc.183, which reads
+ *  target_resolution) stays correct with zero extra plumbing. */
+export const ADAPTIVE_RES_LADDER: ({ width: number; height: number } | null)[] = [
+  null, // 0: native (no cap)
+  { width: 1920, height: 1200 },
+  { width: 1280, height: 800 },
+  { width: 960, height: 600 },
+]
+
+/** Pure step decision for the viewer decode-adaptive resolution. `struggles`
+ *  = decode-backup (`request-keyframe`) events observed this window. Step DOWN
+ *  on ≥2 (fast relief), UP after 4 consecutive clean windows (~10s, lazy
+ *  probe), HOLD in the 1-struggle dead zone (reset recovery). Returns the next
+ *  ladder step + carried clean-tick count. Exported so the policy is unit-
+ *  tested without a live channel. */
+export function decideAdaptiveResStep(
+  struggles: number,
+  currentStep: number,
+  cleanTicks: number,
+  ladderLen: number,
+): { step: number; cleanTicks: number } {
+  const DOWN_THRESHOLD = 2
+  const UP_AFTER_TICKS = 4
+  if (struggles >= DOWN_THRESHOLD) {
+    return { step: Math.min(currentStep + 1, ladderLen - 1), cleanTicks: 0 }
+  }
+  if (struggles === 0) {
+    const ticks = cleanTicks + 1
+    if (ticks >= UP_AFTER_TICKS && currentStep > 0) {
+      return { step: currentStep - 1, cleanTicks: 0 }
+    }
+    return { step: currentStep, cleanTicks: ticks }
+  }
+  // Dead zone (exactly 1 struggle): hold the step, reset the recovery streak.
+  return { step: currentStep, cleanTicks: 0 }
 }
 
 /** Which render path the viewer uses for the inbound video track.
@@ -1560,6 +1607,13 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   // derive a delta bitrate. Reset in teardown() so a fresh connection
   // doesn't see a stale byte counter.
   let statsTimer: ReturnType<typeof setInterval> | null = null
+  // rc.187 — viewer decode-adaptive resolution state. `adaptiveStruggleCount`
+  // accumulates the worker's decode-backup (`request-keyframe`) events between
+  // windows; the timer steps `adaptiveResStep` along ADAPTIVE_RES_LADDER.
+  let adaptiveResTimer: ReturnType<typeof setInterval> | null = null
+  let adaptiveStruggleCount = 0
+  let adaptiveCleanTicks = 0
+  let adaptiveResStep = 0
   let statsPrevBytes = 0
   let statsPrevTsMs = 0
 
@@ -1775,6 +1829,12 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    *  point. The agent min-gap-clamps it. No-op if the control channel
    *  isn't open. */
   function requestKeyframe() {
+    // rc.187 — every worker decode-backup feeds the viewer decode-adaptive
+    // resolution stepper. The only callers are the two decode workers'
+    // `request-keyframe` messages (fired when they drop deltas to resync), so
+    // this is a clean per-session struggle signal; a lone startup request
+    // sits in the stepper's dead zone and triggers nothing.
+    adaptiveStruggleCount++
     const ch = channels.control
     if (!ch || ch.readyState !== 'open') return
     try {
@@ -2426,6 +2486,75 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     }, STATS_POLL_MS)
   }
 
+  /** rc.187 — send an adaptive resolution cap over the control DC WITHOUT
+   *  touching the user's `resolution` ref (the dropdown keeps reading
+   *  'original'/auto). `null` restores native. */
+  function sendAdaptiveResolutionCap(
+    dims: { width: number; height: number } | null,
+  ) {
+    const ch = channels.control
+    if (!ch || ch.readyState !== 'open') return
+    const msg = dims
+      ? { t: 'rc:resolution', mode: 'fit', width: dims.width, height: dims.height }
+      : { t: 'rc:resolution', mode: 'original' }
+    try {
+      ch.send(JSON.stringify(msg))
+    } catch {
+      /* channel closed between check and send — drop */
+    }
+  }
+
+  /** rc.187 — viewer decode-adaptive resolution poller. Once per window it
+   *  turns the accumulated decode-backup count into a ladder step (see
+   *  `decideAdaptiveResStep`) and, on a change, sends the new cap. Only
+   *  auto-manages while the user is on the default `original` resolution — a
+   *  manual `fit`/`custom` choice is respected and resets the adaptive state. */
+  function startAdaptiveResPoll() {
+    if (adaptiveResTimer !== null) return
+    adaptiveStruggleCount = 0
+    adaptiveCleanTicks = 0
+    adaptiveResStep = 0
+    adaptiveResTimer = setInterval(() => {
+      if (resolution.value.mode !== 'original') {
+        // User took manual control — stand down (don't fight their choice).
+        adaptiveResStep = 0
+        adaptiveStruggleCount = 0
+        adaptiveCleanTicks = 0
+        return
+      }
+      const struggles = adaptiveStruggleCount
+      adaptiveStruggleCount = 0
+      const before = adaptiveResStep
+      const r = decideAdaptiveResStep(
+        struggles,
+        before,
+        adaptiveCleanTicks,
+        ADAPTIVE_RES_LADDER.length,
+      )
+      adaptiveCleanTicks = r.cleanTicks
+      if (r.step !== before) {
+        adaptiveResStep = r.step
+        const dims = ADAPTIVE_RES_LADDER[r.step] ?? null
+        sendAdaptiveResolutionCap(dims)
+        console.info(
+          `[rc] viewer decode-adaptive: resolution ${
+            r.step > before ? 'DOWN' : 'UP'
+          } → ${dims ? `${dims.width}×${dims.height}` : 'native'} (${struggles} decode-backups last window)`,
+        )
+      }
+    }, ADAPTIVE_RES_WINDOW_MS)
+  }
+
+  function stopAdaptiveResPoll() {
+    if (adaptiveResTimer !== null) {
+      clearInterval(adaptiveResTimer)
+      adaptiveResTimer = null
+    }
+    adaptiveStruggleCount = 0
+    adaptiveCleanTicks = 0
+    adaptiveResStep = 0
+  }
+
   /**
    * Decode a `cursor:shape` payload into an `ImageBitmap` and stash
    * it in the cursor shape cache. Fire-and-forget: a failed decode
@@ -2638,6 +2767,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
 
   function teardown() {
     stopStatsPoll()
+    stopAdaptiveResPoll()
     stopWebCodecsPath()
     stopVp9_444Path()
     stopHevcPath()
@@ -3341,6 +3471,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // live bitrate/fps/codec. Runs unconditionally while `pc` exists;
     // teardown() stops + clears it.
     startStatsPoll()
+    startAdaptiveResPoll()
 
     // Resolve VP9-444 decode support before sending the request so
     // we only advertise `data-channel-vp9-444` when the browser can
