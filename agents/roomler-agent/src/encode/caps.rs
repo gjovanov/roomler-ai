@@ -200,6 +200,39 @@ fn compute_caps() -> AgentCaps {
                 );
             }
         }
+
+        // rc.190 — AV1 over DataChannel. HW-only encode silicon (NVIDIA
+        // Ada+ / Intel Arc / AMD RDNA3+); on the current fleet only the
+        // RTX 5090 host passes. Probe-gated exactly like HEVC so a host
+        // without AV1 encode (or with the MF-era NVENC activation bug
+        // resurfacing through FFmpeg) never advertises the transport.
+        // The browser gates its side on WebCodecs AV1 decode support —
+        // universal in Chromium (dav1d SW fallback) with HW decode on
+        // Gen12+ Iris Xe / RTX / RDNA2+ viewers.
+        let start_av1 = std::time::Instant::now();
+        match crate::encode::ffmpeg::FfmpegEncoder::new_av1(PROBE_WIDTH, PROBE_HEIGHT) {
+            Ok(enc) => {
+                let name = enc.name();
+                drop(enc);
+                tracing::info!(
+                    encoder = name,
+                    elapsed_ms = start_av1.elapsed().as_millis(),
+                    "caps probe: ffmpeg AV1 encoder activates — advertising av1 + data-channel-av1"
+                );
+                if !codecs.iter().any(|c| c == "av1") {
+                    codecs.push("av1".into());
+                }
+                transports.push("data-channel-av1".into());
+                hw_encoders.push(format!("ffmpeg-{name}"));
+            }
+            Err(e) => {
+                tracing::info!(
+                    %e,
+                    elapsed_ms = start_av1.elapsed().as_millis(),
+                    "caps probe: ffmpeg AV1 encoder not available (no AV1 encode silicon on this host) — NOT advertising data-channel-av1"
+                );
+            }
+        }
     }
 
     #[cfg(feature = "vp9-444")]
