@@ -1959,6 +1959,10 @@ async fn media_pump_vp9_444_dc(
     let mut encoder_dims: Option<(u32, u32)> = None;
     let mut last_capture_at = std::time::Instant::now();
     let mut last_good_frame: Option<std::sync::Arc<crate::capture::Frame>> = None;
+    // rc.187 — stale-frame fix (see media_pump_ffmpeg_dc): the first idle
+    // keepalive after motion settles forces a keyframe so a viewer that dropped
+    // frames during the motion resyncs to the settled state.
+    let mut idle_keyframe_sent = false;
     // rc.130 — 60 ms (was 1 s), matching the FFmpeg pump. libvpx is synchronous
     // (g_lag_in_frames=0) so there's no encoder-output queue to drain here, but
     // the faster keepalive still feeds the browser decoder more tightly and
@@ -2268,12 +2272,21 @@ async fn media_pump_vp9_444_dc(
                 last_capture_at = std::time::Instant::now();
                 let arc = std::sync::Arc::new(f);
                 last_good_frame = Some(arc.clone());
+                // Motion resumed — the next settle owes the viewer a keyframe.
+                idle_keyframe_sent = false;
                 arc
             }
             Ok(None) => {
                 if last_capture_at.elapsed() >= IDLE_KEEPALIVE {
                     if let Some(ref f) = last_good_frame {
                         last_capture_at = std::time::Instant::now();
+                        // rc.187 — first keepalive after settle = keyframe, so a
+                        // viewer that dropped frames mid-motion resyncs to the
+                        // settled state instead of freezing on the old position.
+                        if !idle_keyframe_sent {
+                            keyframe_requested.store(true, std::sync::atomic::Ordering::Relaxed);
+                            idle_keyframe_sent = true;
+                        }
                         f.clone()
                     } else {
                         tokio::time::sleep(frame_duration_floor).await;
@@ -2906,6 +2919,11 @@ async fn media_pump_ffmpeg_dc(
     // timeBeginPeriod(1) landed but didn't move fps).
     let mut last_capture_at = std::time::Instant::now();
     let mut last_good_frame: Option<std::sync::Arc<crate::capture::Frame>> = None;
+    // rc.187 — stale-frame fix. `false` while real frames flow; the FIRST idle
+    // keepalive after motion settles forces a keyframe so a viewer that dropped
+    // frames during the motion (backpressure / decode backlog) can resync to
+    // the settled state instead of freezing on the pre-settle position.
+    let mut idle_keyframe_sent = false;
     // rc.130 — 60 ms (was 1 s). Doubles as the SPARSE-INPUT DRAIN. With the
     // HW encoder's output queue capped to ~1 frame (encoder.rs delay=0 /
     // async_depth=1), re-feeding the last good frame here flushes the held
@@ -3183,6 +3201,8 @@ async fn media_pump_ffmpeg_dc(
                 last_good_frame = Some(arc.clone());
                 last_capture_at = std::time::Instant::now();
                 frames_captured += 1;
+                // Motion resumed — the next settle owes the viewer a keyframe.
+                idle_keyframe_sent = false;
                 arc
             }
             Ok(None) => {
@@ -3194,6 +3214,16 @@ async fn media_pump_ffmpeg_dc(
                     && let Some(ref f) = last_good_frame
                 {
                     last_capture_at = std::time::Instant::now();
+                    // rc.187 — the FIRST keepalive after the screen settles is
+                    // a KEYFRAME. `keyframe_requested` is consumed by the force
+                    // block below (which also exempts it from the decode
+                    // frame-skip), so this settled frame lands as a fresh IDR
+                    // any viewer can decode standalone — fixing the "window
+                    // shows the old position after a drag" freeze.
+                    if !idle_keyframe_sent {
+                        keyframe_requested.store(true, std::sync::atomic::Ordering::SeqCst);
+                        idle_keyframe_sent = true;
+                    }
                     f.clone()
                 } else {
                     // rc.99 — pace empty polls with a short sleep before
