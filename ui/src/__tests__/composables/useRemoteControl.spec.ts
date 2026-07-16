@@ -40,8 +40,7 @@ import {
   appsListWireMessage,
   appsFocusWireMessage,
   appsLaunchWireMessage,
-  decideAdaptiveResStep,
-  ADAPTIVE_RES_LADDER,
+  decodeStatWireMessage,
   type KeyDecision,
 } from '@/composables/useRemoteControl'
 import { codecMimeForShort } from '@/workers/rc-webcodecs-worker'
@@ -1823,44 +1822,27 @@ describe('nextDirPath', () => {
   })
 })
 
-describe('decideAdaptiveResStep (viewer decode-adaptive resolution)', () => {
-  const LEN = ADAPTIVE_RES_LADDER.length
-
-  it('ladder starts at native and descends monotonically', () => {
-    expect(ADAPTIVE_RES_LADDER[0]).toBeNull()
-    expect(ADAPTIVE_RES_LADDER[1]).toEqual({ width: 1920, height: 1200 })
-    for (let i = 2; i < LEN; i++) {
-      expect(ADAPTIVE_RES_LADDER[i]!.width).toBeLessThan(ADAPTIVE_RES_LADDER[i - 1]!.width)
-    }
+describe('decodeStatWireMessage (rc.188 viewer-rate feedback)', () => {
+  it('rounds + clamps the reported fps and carries the struggling bit', () => {
+    expect(decodeStatWireMessage(58.7, true)).toEqual({
+      t: 'rc:decodestat',
+      fps: 59,
+      struggling: true,
+    })
+    expect(decodeStatWireMessage(30, false)).toEqual({
+      t: 'rc:decodestat',
+      fps: 30,
+      struggling: false,
+    })
   })
 
-  it('steps DOWN one rung on >=2 decode-backups', () => {
-    expect(decideAdaptiveResStep(3, 0, 0, LEN)).toEqual({ step: 1, cleanTicks: 0 })
+  it('coerces non-finite / negative fps to 0 (a clean "no useful number")', () => {
+    expect(decodeStatWireMessage(NaN, false).fps).toBe(0)
+    expect(decodeStatWireMessage(-5, true).fps).toBe(0)
+    expect(decodeStatWireMessage(Infinity, false).fps).toBe(0)
   })
 
-  it('caps at the bottom rung', () => {
-    expect(decideAdaptiveResStep(5, LEN - 1, 0, LEN).step).toBe(LEN - 1)
-  })
-
-  it('holds in the 1-struggle dead zone and resets the recovery streak', () => {
-    expect(decideAdaptiveResStep(1, 2, 3, LEN)).toEqual({ step: 2, cleanTicks: 0 })
-  })
-
-  it('probes UP only after 4 consecutive clean windows', () => {
-    let step = 2
-    let ct = 0
-    for (let i = 0; i < 3; i++) {
-      const r = decideAdaptiveResStep(0, step, ct, LEN)
-      step = r.step
-      ct = r.cleanTicks
-    }
-    expect(step).toBe(2) // still down after 3 clean windows
-    expect(ct).toBe(3)
-    const r = decideAdaptiveResStep(0, step, ct, LEN)
-    expect(r).toEqual({ step: 1, cleanTicks: 0 }) // 4th → up one rung
-  })
-
-  it('never steps below native no matter how calm', () => {
-    expect(decideAdaptiveResStep(0, 0, 99, LEN).step).toBe(0)
+  it('caps absurd fps at 240 so the packed 16-bit agent field never overflows', () => {
+    expect(decodeStatWireMessage(100000, true).fps).toBe(240)
   })
 })
