@@ -25,7 +25,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use directories::ProjectDirs;
 use tokio::sync::mpsc;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
@@ -228,7 +227,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 /// that didn't run the agent's logging setup, e.g. the tray). The tray uses
 /// this so "Open Logs Folder" resolves a real path instead of failing.
 pub fn resolve_log_dir() -> Option<PathBuf> {
-    let dirs = ProjectDirs::from("live", "roomler", "roomler-agent")?;
+    let dirs = crate::appdirs::project_dirs()?;
     Some(dirs.data_local_dir().join("logs"))
 }
 
