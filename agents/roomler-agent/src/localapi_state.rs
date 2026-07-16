@@ -393,6 +393,8 @@ mod tests {
                 rtt_ms: None,
                 last_seen_ms: None,
                 agent_id: None,
+                relay_local: Some("94.130.141.74:10850".into()),
+                relay_dst: Some("5.9.157.226:12728".into()),
             }],
         }
     }
@@ -565,6 +567,8 @@ mod tests {
                 rtt_ms: None,
                 last_seen_ms: None,
                 agent_id: agent.map(|s| s.into()),
+                relay_local: None,
+                relay_dst: None,
             }
         }
         let tunneled: HashSet<String> = ["aid-1".to_string()].into_iter().collect();

@@ -383,6 +383,8 @@ mod tests {
             rtt_ms: Some(52),
             last_seen_ms: Some(now - 3_000),
             agent_id: None,
+            relay_local: None,
+            relay_dst: None,
         };
         let row = fmt_peer_row(&online, now);
         assert!(row.starts_with('●'));
@@ -403,6 +405,8 @@ mod tests {
             rtt_ms: None,
             last_seen_ms: None,
             agent_id: None,
+            relay_local: None,
+            relay_dst: None,
         };
         let row = fmt_peer_row(&offline, now);
         assert!(row.starts_with('○'));
@@ -423,6 +427,8 @@ mod tests {
             rtt_ms: None,
             last_seen_ms: None,
             agent_id: None,
+            relay_local: None,
+            relay_dst: None,
         };
         let row = fmt_peer_row(&p, now);
         assert!(row.contains("0123456789ab…"), "row was: {row}");

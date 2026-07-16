@@ -77,6 +77,13 @@ struct Installed {
     /// (`FALLBACK_TICK`, ~5 s) sets the granularity — fine for a human
     /// "Ns/Nm ago" column, and passive keepalives keep it fresh for live peers.
     last_rx_at: Instant,
+    /// rc.187 — for a RELAY carrier: our own coturn-relayed address (the worker
+    /// we allocated on) and the peer's relayed address we dial. `None` for a
+    /// direct carrier. Surfaced in the LocalAPI `peers` view so an operator can
+    /// see — without a debug-log hunt — which coturn worker each end pinned and
+    /// whether a relay pair is same-worker (IPs equal) or cross-worker.
+    relay_local: Option<std::net::SocketAddr>,
+    relay_dst: Option<std::net::SocketAddr>,
 }
 
 /// Grace after install before the fallback can fire — lets the bilateral
@@ -295,6 +302,10 @@ fn build_overlay_view(
                 // P3b-3 — carry the backing agent id (hex) so the daemon can join
                 // this peer to a tunnel flow and label it `Tunnel`.
                 agent_id: np.agent_id.map(|a| a.to_hex()),
+                // rc.187 — relay endpoints (relay carriers only) so `peers --json`
+                // shows each end's coturn worker; same IP on both = same-worker.
+                relay_local: inst.and_then(|i| i.relay_local).map(|a| a.to_string()),
+                relay_dst: inst.and_then(|i| i.relay_dst).map(|a| a.to_string()),
             }
         })
         .collect();
@@ -980,6 +991,8 @@ impl OverlayRuntime {
                 last_traffic: (0, 0),
                 bad_sweeps: 0,
                 last_rx_at: Instant::now(),
+                relay_local: None,
+                relay_dst: None,
             },
         );
         if let Err(e) = tun.add_peer_route(cfg.overlay_ip).await {
@@ -1020,6 +1033,13 @@ impl OverlayRuntime {
         // permission fresh. On ANY handshake failure/timeout we fall back to the
         // already-built raw relay carrier, so the upgrade can only improve —
         // never break — the link.
+        // rc.187 — capture the relay endpoints for `peers` visibility BEFORE the
+        // carrier is (maybe) upgraded to QUIC. `relay_parts` is `Some` for any
+        // relay carrier (raw or QUIC-over-TURN), `None` for a direct link.
+        let (relay_local, relay_dst) = match &link.relay_parts {
+            Some((conn, dst)) => (conn.local_addr().ok(), Some(*dst)),
+            None => (None, None),
+        };
         let carrier = if overlay_quic_enabled() && link.supports_quic && link.relay_parts.is_some()
         {
             let (conn, dst) = link.relay_parts.clone().unwrap();
@@ -1062,6 +1082,8 @@ impl OverlayRuntime {
                 last_traffic: (0, 0),
                 bad_sweeps: 0,
                 last_rx_at: Instant::now(),
+                relay_local,
+                relay_dst,
             },
         );
         // Host `/32` so overlay traffic to this peer beats any colliding
@@ -1158,7 +1180,12 @@ mod tests {
                 agent_id: None,
             }
         }
-        fn installed(is_direct: bool, ip: Ipv4Addr, last_rx_at: Instant) -> Installed {
+        fn installed(
+            is_direct: bool,
+            ip: Ipv4Addr,
+            last_rx_at: Instant,
+            relay: Option<(std::net::SocketAddr, std::net::SocketAddr)>,
+        ) -> Installed {
             Installed {
                 pubkey: [0u8; 32],
                 overlay_ip: ip,
@@ -1167,6 +1194,8 @@ mod tests {
                 last_traffic: (0, 0),
                 bad_sweeps: 0,
                 last_rx_at,
+                relay_local: relay.map(|(l, _)| l),
+                relay_dst: relay.map(|(_, d)| d),
             }
         }
 
@@ -1183,9 +1212,21 @@ mod tests {
                 true,
                 Ipv4Addr::new(100, 64, 0, 1),
                 now.checked_sub(std::time::Duration::from_secs(10)).unwrap(),
+                None,
             ),
         );
-        by_node.insert(r, installed(false, Ipv4Addr::new(100, 64, 0, 2), now));
+        by_node.insert(
+            r,
+            installed(
+                false,
+                Ipv4Addr::new(100, 64, 0, 2),
+                now,
+                Some((
+                    "94.130.141.74:10850".parse().unwrap(),
+                    "5.9.157.226:12728".parse().unwrap(),
+                )),
+            ),
+        );
 
         let mut current = HashMap::new();
         current.insert(d, np(d, "direct-peer", "100.64.0.1", true));
@@ -1217,6 +1258,20 @@ mod tests {
         assert_eq!(view.peers[1].last_seen_ms, Some(epoch_now_ms));
         assert!(view.peers[2].last_seen_ms.is_none());
         assert!(view.peers[3].last_seen_ms.is_none());
+        // rc.187 — relay endpoints surface only for the relay peer (local=mars,
+        // dst=zeus ⇒ the cross-worker signal an operator reads from `peers`);
+        // direct + carrier-less peers carry none.
+        assert_eq!(
+            view.peers[1].relay_local.as_deref(),
+            Some("94.130.141.74:10850")
+        );
+        assert_eq!(
+            view.peers[1].relay_dst.as_deref(),
+            Some("5.9.157.226:12728")
+        );
+        assert!(view.peers[0].relay_local.is_none() && view.peers[0].relay_dst.is_none());
+        assert!(view.peers[2].relay_dst.is_none());
+        assert!(view.peers[3].relay_dst.is_none());
     }
 
     struct MockTun {
