@@ -4010,6 +4010,18 @@ fn attach_control_handler(
     // bounds a misbehaving/old controller to one forced IDR per gap so a
     // resync storm can't pile the LARGEST frames onto a congested link.
     let last_kf_request = Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
+    // rc.191 — display-match cleanup: restore the host's original display
+    // mode when the session's control channel closes (normal disconnect,
+    // browser tab gone, watchdog pc.close() — all funnel here). The
+    // CDS_FULLSCREEN temporary-change semantics additionally auto-restore
+    // if the agent PROCESS dies, so every exit path is covered. No-op when
+    // display-match never switched anything.
+    dc.on_close(Box::new(move || {
+        Box::pin(async move {
+            // Detach — restore is fire-and-forget (JoinHandle drop is fine).
+            drop(tokio::task::spawn_blocking(crate::display_match::restore));
+        })
+    }));
     dc.on_message(Box::new(move |msg| {
         let quality_state = quality_state.clone();
         let target_resolution = target_resolution.clone();
@@ -4207,6 +4219,45 @@ fn attach_control_handler(
                         std::sync::atomic::Ordering::Relaxed,
                     );
                 }
+                "rc:display-match" => {
+                    // rc.191 — viewer asked the host to switch its display to
+                    // the largest mode fitting the viewer's stage (opt-in
+                    // toggle; makes the whole pixel chain 1:1 — see
+                    // `display_match`). `{enable:false}` restores. Runs off
+                    // the callback thread: ChangeDisplaySettingsExW blocks.
+                    let enable = val
+                        .get("enable")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    let w = val.get("width").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                    let h = val.get("height").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                    tokio::task::spawn_blocking(move || {
+                        if !enable {
+                            crate::display_match::restore();
+                            tracing::info!("display-match: restored original mode");
+                            return;
+                        }
+                        if w == 0 || h == 0 {
+                            tracing::debug!("display-match: missing width/height — ignored");
+                            return;
+                        }
+                        match crate::display_match::apply(w, h) {
+                            Ok((mw, mh)) => tracing::info!(
+                                req_w = w,
+                                req_h = h,
+                                mode_w = mw,
+                                mode_h = mh,
+                                "display-match: switched host display mode"
+                            ),
+                            Err(e) => tracing::warn!(
+                                req_w = w,
+                                req_h = h,
+                                %e,
+                                "display-match: could not switch mode"
+                            ),
+                        }
+                    });
+                }
                 "rc:keyframe" => {
                     // Browser's decode queue backed up → it dropped deltas and
                     // needs a fresh IDR to resync. Force one (min-gap clamped).
@@ -4398,8 +4449,18 @@ fn apply_target_resolution(
         // than produce a mis-formatted downscale.
         return frame;
     }
-    let downscaled =
-        downscale_bgra_box(&frame.data, frame.width, frame.height, frame.stride, tw, th);
+    // rc.191 — filter selection by ratio. Box averaging is correct (and
+    // cheap) for big shrinks, but at near-native ratios it blends
+    // fractional neighbours into ClearType mush (field: relay 0.67× and
+    // fit 0.75× looked "blurred/pixely"). Lanczos-3 keeps edge contrast
+    // through those ratios at a few extra ms. Kill switch
+    // `ROOMLER_AGENT_LANCZOS=0` reverts to box everywhere.
+    let scale = (tw as f32 / frame.width as f32).min(th as f32 / frame.height as f32);
+    let downscaled = if scale > 0.55 && lanczos_enabled() {
+        downscale_bgra_lanczos3(&frame.data, frame.width, frame.height, frame.stride, tw, th)
+    } else {
+        downscale_bgra_box(&frame.data, frame.width, frame.height, frame.stride, tw, th)
+    };
     std::sync::Arc::new(crate::capture::Frame {
         width: tw,
         height: th,
@@ -4452,6 +4513,66 @@ fn aspect_preserved_target(src_w: u32, src_h: u32, cap_long_edge: u32) -> (u32, 
 ///   `Native`, mirroring the RTP pump's "operator can override via
 ///   rc:resolution" contract — an explicit pick wins even above the cap.
 ///
+/// rc.191 — linear scale ABOVE which a controller box request snaps to
+/// Native. Field 2026-07-16 (GEAL8N6@1920×1200 + Fit 1672×818): a
+/// near-1:1 NON-INTEGER resample is the worst case for any filter —
+/// text mush + "pixely" form aliasing — while saving almost no bits.
+/// Snapping to Native keeps the chain 1:1 (crisp) whenever the request
+/// is within ~15% of the source. Env `ROOMLER_AGENT_SNAP_NATIVE_PCT`
+/// (percent, default 85; `0` disables snapping).
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+fn snap_native_scale() -> f32 {
+    let pct = std::env::var("ROOMLER_AGENT_SNAP_NATIVE_PCT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(85);
+    (pct.min(100) as f32) / 100.0
+}
+
+/// rc.191 — resolve a controller `Fixed{w,h}` request as an ASPECT-PRESERVING
+/// bounding box against the native frame: scale the source uniformly by
+/// `min(box_w/native_w, box_h/native_h, 1.0)` and even-align. Two field bugs
+/// this kills (2026-07-16):
+///
+/// * Distortion — `apply_target_resolution` scaled to the EXACT requested
+///   dims, so a Fit request shaped like the viewer's stage (e.g. 1672×818)
+///   squashed a 16:9/16:10 source by up to ~20%. The controller's letterbox
+///   rendering means the browser handles a smaller-than-stage frame fine.
+/// * Near-native mush — when the uniform scale lands ≥ `snap_native_scale`,
+///   return Native instead: a 0.87× box resample destroys ClearType text for
+///   a ~13% pixel saving nobody asked for.
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+fn resolve_user_box(user: TargetResolution, native_w: u32, native_h: u32) -> TargetResolution {
+    let TargetResolution::Fixed { width, height } = user else {
+        return TargetResolution::Native;
+    };
+    if width == 0 || height == 0 || native_w == 0 || native_h == 0 {
+        return TargetResolution::Native;
+    }
+    let scale = (width as f32 / native_w as f32)
+        .min(height as f32 / native_h as f32)
+        .min(1.0);
+    let snap = snap_native_scale();
+    if snap > 0.0 && scale >= snap {
+        return TargetResolution::Native;
+    }
+    let w = ((native_w as f32 * scale) as u32) & !1;
+    let h = ((native_h as f32 * scale) as u32) & !1;
+    if w == 0 || h == 0 || (w, h) == (native_w, native_h) {
+        return TargetResolution::Native;
+    }
+    TargetResolution::Fixed {
+        width: w,
+        height: h,
+    }
+}
+
 /// Pure so the composition rules are unit-tested on the default build.
 /// Only the DC pumps (feature-gated) call it, hence the dead_code allow on
 /// the signalling-only build (tests don't count for liveness).
@@ -4466,6 +4587,9 @@ fn effective_target_resolution(
     hard_cap_long_edge: Option<u32>,
     soft_cap_long_edge: Option<u32>,
 ) -> TargetResolution {
+    // rc.191 — controller boxes become aspect-preserving targets (with the
+    // near-native snap) BEFORE the cap tiers compose.
+    let user = resolve_user_box(user, native_w, native_h);
     // Soft tier: only fills in for an absent controller preference.
     let mut effective = match (user, soft_cap_long_edge) {
         (TargetResolution::Native, Some(cap)) => {
@@ -4611,6 +4735,133 @@ fn cursor_scale_from_dims(native_dims: u64, encoded_dims: u64) -> (f32, f32) {
 /// on 4K→1080p on a modern laptop CPU; good enough for 30 fps and
 /// tolerable at 60 fps. GPU path via VideoProcessorMFT is the
 /// follow-up (deferred Tier C/1C.3 in the RustDesk-parity plan).
+/// rc.191 — kill switch for the Lanczos-3 near-native downscale path.
+/// `ROOMLER_AGENT_LANCZOS=0` (or `false`) reverts every downscale to the
+/// box filter without a rebuild.
+fn lanczos_enabled() -> bool {
+    !matches!(
+        std::env::var("ROOMLER_AGENT_LANCZOS").ok().as_deref(),
+        Some("0") | Some("false")
+    )
+}
+
+/// rc.191 — per-output-pixel Lanczos-3 tap table for one axis, in Q12
+/// fixed point. For downscaling the kernel is stretched by `src/dst`
+/// (support = 3·src/dst source pixels per output pixel); weights are
+/// normalised to sum exactly 4096 so flat fields round-trip losslessly.
+fn lanczos3_taps(src: u32, dst: u32) -> Vec<(i32, Vec<i32>)> {
+    const A: f32 = 3.0;
+    let ratio = src as f32 / dst as f32; // > 1 for downscale
+    let support = A * ratio.max(1.0);
+    let mut out = Vec::with_capacity(dst as usize);
+    for i in 0..dst {
+        let center = (i as f32 + 0.5) * ratio - 0.5;
+        let lo = (center - support).ceil() as i32;
+        let hi = (center + support).floor() as i32;
+        let lo_c = lo.max(0);
+        let hi_c = hi.min(src as i32 - 1);
+        let mut weights = Vec::with_capacity((hi_c - lo_c + 1) as usize);
+        let mut sum = 0.0f32;
+        let scale_inv = 1.0 / ratio.max(1.0);
+        for t in lo_c..=hi_c {
+            let x = (t as f32 - center) * scale_inv;
+            let w = if x.abs() < 1e-6 {
+                1.0
+            } else if x.abs() >= A {
+                0.0
+            } else {
+                let pix = std::f32::consts::PI * x;
+                (A * pix.sin() * (pix / A).sin()) / (pix * pix)
+            };
+            weights.push(w);
+            sum += w;
+        }
+        // Normalise → Q12 fixed point; distribute rounding residue onto the
+        // largest tap so the row sums to exactly 4096.
+        let mut fixed: Vec<i32> = weights
+            .iter()
+            .map(|w| ((w / sum) * 4096.0).round() as i32)
+            .collect();
+        let total: i32 = fixed.iter().sum();
+        if let Some(max_idx) = fixed
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, v)| **v)
+            .map(|(i, _)| i)
+        {
+            fixed[max_idx] += 4096 - total;
+        }
+        out.push((lo_c, fixed));
+    }
+    out
+}
+
+/// rc.191 — separable Lanczos-3 downscale for BGRA frames. The box filter
+/// below is right for BIG shrinks (≥2×, wide averaging is the correct
+/// anti-alias); at near-native ratios (relay 0.67×, fit 0.75-0.85×) it
+/// blends fractional neighbours into ClearType mush — the field
+/// "blurred/pixely text" report. Lanczos-3 keeps edge contrast through
+/// those ratios. Q12 integer accumulation (i32), horizontal pass into an
+/// i16 intermediate, vertical pass back to u8 with clamping (the kernel
+/// has negative lobes). Cost ≈ 10-20 ms for the 0.67-0.85× cases on a
+/// laptop core — inside a 30 fps budget; the >2× cases stay on box.
+fn downscale_bgra_lanczos3(
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+    src_stride: u32,
+    dst_w: u32,
+    dst_h: u32,
+) -> Vec<u8> {
+    let h_taps = lanczos3_taps(src_w, dst_w);
+    let v_taps = lanczos3_taps(src_h, dst_h);
+    // Horizontal pass: src_h rows × dst_w columns, Q12 >> 6 = Q6 stored in
+    // i16 (max |value| ≈ 255·4096·1.15 / 64 ≈ 18.8k — fits i16 with the
+    // ~15% negative-lobe overshoot headroom).
+    let mut mid = vec![0i16; (dst_w as usize) * (src_h as usize) * 4];
+    for y in 0..src_h as usize {
+        let row = y * src_stride as usize;
+        let mid_row = y * (dst_w as usize) * 4;
+        for (x, (lo, ws)) in h_taps.iter().enumerate() {
+            let mut acc = [0i32; 4];
+            for (k, w) in ws.iter().enumerate() {
+                let si = row + ((*lo as usize) + k) * 4;
+                acc[0] += w * src[si] as i32;
+                acc[1] += w * src[si + 1] as i32;
+                acc[2] += w * src[si + 2] as i32;
+                acc[3] += w * src[si + 3] as i32;
+            }
+            let di = mid_row + x * 4;
+            mid[di] = (acc[0] >> 6) as i16;
+            mid[di + 1] = (acc[1] >> 6) as i16;
+            mid[di + 2] = (acc[2] >> 6) as i16;
+            mid[di + 3] = (acc[3] >> 6) as i16;
+        }
+    }
+    // Vertical pass: Q6 · Q12 = Q18 → >> 18 back to u8, clamped.
+    let mut dst = vec![0u8; (dst_w as usize) * (dst_h as usize) * 4];
+    let mid_stride = (dst_w as usize) * 4;
+    for (y, (lo, ws)) in v_taps.iter().enumerate() {
+        let dst_row = y * mid_stride;
+        for x in 0..dst_w as usize {
+            let mut acc = [0i32; 4];
+            for (k, w) in ws.iter().enumerate() {
+                let si = ((*lo as usize) + k) * mid_stride + x * 4;
+                acc[0] += w * mid[si] as i32;
+                acc[1] += w * mid[si + 1] as i32;
+                acc[2] += w * mid[si + 2] as i32;
+                acc[3] += w * mid[si + 3] as i32;
+            }
+            let di = dst_row + x * 4;
+            dst[di] = ((acc[0] + (1 << 17)) >> 18).clamp(0, 255) as u8;
+            dst[di + 1] = ((acc[1] + (1 << 17)) >> 18).clamp(0, 255) as u8;
+            dst[di + 2] = ((acc[2] + (1 << 17)) >> 18).clamp(0, 255) as u8;
+            dst[di + 3] = ((acc[3] + (1 << 17)) >> 18).clamp(0, 255) as u8;
+        }
+    }
+    dst
+}
+
 fn downscale_bgra_box(
     src: &[u8],
     src_w: u32,
@@ -6028,6 +6279,89 @@ mod tests {
         assert_eq!(
             super::effective_target_resolution(TR::Native, 1280, 720, Some(1280), None),
             TR::Native
+        );
+    }
+
+    // rc.191 — aspect-preserving box resolve + near-native snap.
+    #[test]
+    fn user_box_preserves_source_aspect() {
+        // The field distortion case: stage-shaped Fit 1672×818 against a
+        // 16:9 source must NOT squash — uniform scale = min(0.87, 0.757).
+        let r = super::effective_target_resolution(
+            TR::Fixed {
+                width: 1672,
+                height: 818,
+            },
+            1920,
+            1080,
+            None,
+            None,
+        );
+        let TR::Fixed { width, height } = r else {
+            panic!("expected Fixed, got {r:?}");
+        };
+        // Aspect within a pixel of 16:9 after even-align.
+        let src_aspect = 1920.0 / 1080.0;
+        let out_aspect = width as f32 / height as f32;
+        assert!(
+            (out_aspect - src_aspect).abs() < 0.01,
+            "aspect distorted: {width}x{height}"
+        );
+        assert!(width <= 1672 && height <= 818, "must fit the box");
+    }
+
+    #[test]
+    fn near_native_box_snaps_to_native() {
+        // Within 15% of the source → 1:1 passthrough instead of a mushy
+        // 0.9× resample (needs ambient env unset — tests don't set it).
+        assert_eq!(
+            super::effective_target_resolution(
+                TR::Fixed {
+                    width: 1836,
+                    height: 1148
+                },
+                1920,
+                1200,
+                None,
+                None
+            ),
+            TR::Native
+        );
+        // A fullscreen-sized box ≥ native is Native outright.
+        assert_eq!(
+            super::effective_target_resolution(
+                TR::Fixed {
+                    width: 1920,
+                    height: 1200
+                },
+                1920,
+                1080,
+                None,
+                None
+            ),
+            TR::Native
+        );
+    }
+
+    #[test]
+    fn snapped_native_still_respects_hard_cap() {
+        // Snap must not dodge relay physics: near-native box on a relay
+        // session still clamps to the cap.
+        assert_eq!(
+            super::effective_target_resolution(
+                TR::Fixed {
+                    width: 1836,
+                    height: 1148
+                },
+                1920,
+                1200,
+                Some(1280),
+                None
+            ),
+            TR::Fixed {
+                width: 1280,
+                height: 800
+            }
         );
     }
 

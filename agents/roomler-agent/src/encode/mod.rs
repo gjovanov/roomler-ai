@@ -598,12 +598,19 @@ mod tests {
         unsafe { std::env::remove_var("ROOMLER_AGENT_HW_AUTO") };
     }
 
+    // rc.191 — BOTH tests below read/write ROOMLER_AGENT_RELAY_MAX_KBPS;
+    // cargo's parallel runner interleaved them once the peer::tests grew
+    // (field flake 2026-07-16: the clamp test observed the reader test's
+    // mid-flight "4200" write). Serialise them on one lock.
+    static RELAY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn relay_max_bps_reads_env() {
+        let _guard = RELAY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Hermetic: save the prior value, exercise set/unset, then restore.
         // SAFETY: same reasoning as `hw_auto_disabled_reads_env` — no other
         // code in this crate touches ROOMLER_AGENT_RELAY_MAX_KBPS at test
-        // time, and this module's env-touching tests don't overlap on it.
+        // time, and the tests that do share RELAY_ENV_LOCK.
         let prior = std::env::var("ROOMLER_AGENT_RELAY_MAX_KBPS").ok();
 
         unsafe { std::env::remove_var("ROOMLER_AGENT_RELAY_MAX_KBPS") };
@@ -633,9 +640,10 @@ mod tests {
 
     #[test]
     fn relay_clamp_caps_vp9_444_target() {
-        // Pure logic (no env): the `x.min(relay_max_bps())` clamp the pump
-        // applies must pull a 0.20-bpp 2560×1600@30 VP9-444 target
-        // (12_441_600 bps) down to the 3 Mbps relay ceiling.
+        let _guard = RELAY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // The `x.min(relay_max_bps())` clamp the pump applies must pull a
+        // 0.20-bpp 2560×1600@30 VP9-444 target (12_441_600 bps) down to
+        // the 3 Mbps relay ceiling.
         let prior = std::env::var("ROOMLER_AGENT_RELAY_MAX_KBPS").ok();
         unsafe { std::env::remove_var("ROOMLER_AGENT_RELAY_MAX_KBPS") };
 
