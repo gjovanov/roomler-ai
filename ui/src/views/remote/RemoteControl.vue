@@ -321,6 +321,20 @@
       >
         <v-icon>{{ hevcOn ? 'mdi-video-vintage' : 'mdi-video' }}</v-icon>
       </v-btn>
+      <!-- rc.190 — AV1 over DataChannel toggle. Gated on the agent
+           advertising AV1 encode silicon + WebCodecs AV1 decode here. -->
+      <v-btn
+        icon
+        variant="text"
+        size="small"
+        :color="av1On ? 'primary' : undefined"
+        :disabled="!rc.av1Supported.value || !agentHasAv1"
+        :aria-label="av1On ? 'Disable AV1 DataChannel path' : 'Enable AV1 DataChannel path'"
+        :title="av1Tooltip"
+        @click="toggleAv1"
+      >
+        <v-icon>mdi-alpha-a-box{{ av1On ? '' : '-outline' }}</v-icon>
+      </v-btn>
       <!-- Low-latency (WebCodecs) toggle. Bypasses Chrome's <video>
            jitter-buffer floor (~80ms). Disabled when the browser
            lacks RTCRtpScriptTransform / VideoDecoder. -->
@@ -989,6 +1003,30 @@
               @click="toggleHevc"
             >
               HEVC {{ hevcOn ? 'ON' : 'OFF' }}
+            </v-btn>
+            <!-- rc.190 — AV1 over DataChannel toggle (drawer). -->
+            <v-btn
+              variant="tonal"
+              :color="av1On ? 'primary' : undefined"
+              :disabled="!rc.av1Supported.value || !agentHasAv1"
+              prepend-icon="mdi-alpha-a-box"
+              :title="av1Tooltip"
+              class="flex-grow-1"
+              @click="toggleAv1"
+            >
+              AV1 {{ av1On ? 'ON' : 'OFF' }}
+            </v-btn>
+            <!-- rc.190 — return to Auto transport (the default): pick the
+                 best HW×HW codec for this agent+viewer pair at Connect. -->
+            <v-btn
+              variant="tonal"
+              :color="transportAutoOn ? 'primary' : undefined"
+              prepend-icon="mdi-auto-fix"
+              :title="transportAutoTooltip"
+              class="flex-grow-1"
+              @click="setTransportAuto"
+            >
+              Auto {{ transportAutoOn ? 'ON' : 'OFF' }}
             </v-btn>
             <v-btn
               variant="tonal"
@@ -2148,6 +2186,52 @@ function toggleHevc() {
   rc.setVideoTransport(next)
 }
 
+// rc.190 — AV1 over DataChannel toggle. Same shape as toggleHevc. Gated
+// on the agent advertising AV1 encode silicon (only NVIDIA Ada+/RTX 40xx+,
+// Intel Arc, AMD RDNA3+ have it) AND WebCodecs AV1 decode here (dav1d SW
+// ships in Chromium, so the browser side is ~always true on Chrome).
+const av1On = computed<boolean>(() => rc.videoTransport.value === 'data-channel-av1')
+const agentHasAv1 = computed<boolean>(() => {
+  const caps = agent.value?.capabilities
+  // Caps not loaded yet → optimistic; the agent falls back to the WebRTC
+  // track if it can't honour the transport (same contract as HEVC).
+  if (!caps) return true
+  return (
+    (caps.transports ?? []).includes('data-channel-av1')
+    || (caps.hw_encoders ?? []).some((e) => e.startsWith('ffmpeg-av1_'))
+  )
+})
+const av1Tooltip = computed<string>(() => {
+  if (!rc.av1Supported.value) {
+    return 'AV1 over DataChannel requires WebCodecs AV1 decode — not supported in this browser'
+  }
+  if (!agentHasAv1.value) {
+    return 'This agent has no AV1 hardware encoder (needs NVIDIA RTX 40xx+, Intel Arc, or AMD RDNA3+) — AV1 unavailable'
+  }
+  return av1On.value
+    ? 'AV1 over DataChannel ON — best quality per bit at low bitrates (agent encodes via av1_nvenc/qsv/amf). Takes effect on next Connect.'
+    : 'AV1 over DataChannel OFF — click to switch to AV1 on next Connect.'
+})
+function toggleAv1() {
+  const next: RcVideoTransport = av1On.value ? 'webrtc' : 'data-channel-av1'
+  rc.setVideoTransport(next)
+}
+
+// rc.190 — Auto transport (the new default): at Connect the composable
+// ranks codecs by what's HARDWARE on BOTH ends (agent hw_encoders ×
+// this browser's MediaCapabilities) — AV1 > HEVC > VP9-HW > VP9-SW >
+// webrtc. Any explicit toggle above overrides; this button returns to
+// Auto.
+const transportAutoOn = computed<boolean>(() => rc.videoTransport.value === 'auto')
+const transportAutoTooltip = computed<string>(() =>
+  transportAutoOn.value
+    ? 'Transport AUTO — the best hardware-accelerated codec for this agent+viewer pair is picked at Connect'
+    : 'Click to let the viewer auto-pick the best hardware codec for this agent+viewer pair on next Connect',
+)
+function setTransportAuto() {
+  rc.setVideoTransport('auto')
+}
+
 // Opt-in "receive host audio" toggle. Same "takes effect on next
 // Connect" shape as the transport toggles above (the recvonly audio
 // transceiver + `audio_enabled` request flag are fixed at offer time),
@@ -2540,7 +2624,18 @@ const statsCodecLabel = computed(() => {
     // this suffix flips live. Empty from agents older than the field.
     const path =
       vi.transport === 'relay' ? ' · relay' : vi.transport === 'direct' ? ' · direct' : ''
-    return [codecName, chromaName, hw].filter(Boolean).join(' ') + enc + path
+    // rc.190 — the VIEWER half of the HW×HW story: whether THIS browser
+    // decodes the session's codec on fixed-function silicon
+    // (MediaCapabilities smooth+powerEfficient at transport-pick time).
+    // The agent-side `hw` above covers encode; a weak viewer grinding a
+    // codec in software is now visible instead of a mystery.
+    const dec =
+      rc.viewerDecodeHw.value === true
+        ? ' · dec HW'
+        : rc.viewerDecodeHw.value === false
+          ? ' · dec SW'
+          : ''
+    return [codecName, chromaName, hw].filter(Boolean).join(' ') + enc + path + dec
   }
   // Fallback when the agent hasn't sent video-info (legacy track /
   // libvpx VP9-444 path). Derive chroma from the USER's selection
