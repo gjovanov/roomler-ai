@@ -321,3 +321,26 @@ The HTTP listing from python's server should appear via the tunnel. Bytes flow: 
 **Revoke an agent**: **Admin → Tenant → Agents → click agent → Revoke**. Same mechanism.
 
 **Soft-delete a policy**: **Admin → Tenant → Tunnel ACL → click delete on the row**. Live tunnel sessions keep working until they close naturally; new `TcpForwardRequest`s that relied on that policy alone start being rejected with `acl_denied` from the next request onward.
+
+---
+
+## 10. Keeping the CLI current
+
+**Tunnel-only hosts** (installed just the `roomler` CLI — the tunnel-client role,
+no daemon MSI) self-update in place:
+
+```
+roomler self-update            # download + verify + swap the running exe
+roomler self-update --check    # report the latest version without installing
+```
+
+It polls `roomler.ai/api/tunnel/latest-release`, downloads the matching build
+through the same corp-AV-friendly proxy, verifies the SHA-256, and swaps the
+binary (Windows today; other OSes are pointed at the manual re-download). This is
+the single updater for tunnel-only hosts.
+
+**Daemon hosts** (installed a "be-accessed" role — the agent MSI) do NOT need
+this: since the node-stack unification the daemon MSI *carries* `roomler.exe`, so
+the daemon's own auto-update refreshes the CLI alongside `roomlerd` on every MSI
+upgrade. Running `roomler self-update` on such a host still works but is
+redundant — the MSI is the source of truth there.
