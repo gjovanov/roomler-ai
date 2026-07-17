@@ -706,9 +706,18 @@ function renderDone() {
   const isTunnel = (done.principalKind ?? "") === "tunnel_client"
     || (!done.principalKind && state.role === "tunnel-client");
 
+  // P4b: daemon MSIs carry the roomler CLI (role→action composition —
+  // a daemon install subsumes the tunnel client). cliIncluded is the
+  // orchestrator's post-install existence check; false/absent means an
+  // old pre-P4b MSI was served, so we don't promise a CLI we didn't
+  // deliver.
+  const cliIncluded = !isTunnel && done.cliIncluded === true;
   document.getElementById("done-lead").textContent = isTunnel
     ? "The tunnel client is installed, enrolled, and on PATH."
-    : "The Roomler daemon is installed and enrolled.";
+    : cliIncluded
+      ? "The Roomler daemon is installed and enrolled. The roomler CLI " +
+        "came with it (managed by the daemon's updater from now on)."
+      : "The Roomler daemon is installed and enrolled.";
 
   document.getElementById("done-principal-label").textContent =
     isTunnel ? "Tunnel client ID" : "Agent ID";
@@ -732,7 +741,10 @@ function renderDone() {
   if (done.binaryPath) {
     document.getElementById("done-binary-path").textContent = done.binaryPath;
   }
-  document.getElementById("done-path-note").hidden = !(isTunnel && done.pathUpdated);
+  // P4b: the PATH note applies to BOTH principals now (daemon MSIs
+  // append the install dir; the tunnel pipeline integrates its own
+  // bin dir) — gate on pathUpdated alone.
+  document.getElementById("done-path-note").hidden = !done.pathUpdated;
 
   // Config path (both pipelines report it).
   document.getElementById("done-config-label").hidden = !done.configPath;

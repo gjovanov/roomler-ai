@@ -318,9 +318,12 @@ pub fn classify_install_flavour_from_path(p: &std::path::Path) -> WindowsInstall
 }
 
 /// The MSI install folder name since P4b — both wxs files set
-/// `APPLICATIONFOLDER Name='Roomler'`.
+/// `APPLICATIONFOLDER Name='Roomler'`. `pub` (not `pub(crate)`): the
+/// roomler-setup wizard's daemon orchestrator derives the CLI's
+/// post-install path from it (same visibility-lift precedent as the
+/// rc.27 wizard helpers).
 #[cfg(target_os = "windows")]
-pub(crate) const INSTALL_FOLDER_NAME: &str = "Roomler";
+pub const INSTALL_FOLDER_NAME: &str = "Roomler";
 
 /// The pre-P4b install folder name both MSI flavours used through
 /// rc.194. The `cleanup-legacy-install` vacated-dir sweep targets
@@ -337,7 +340,7 @@ pub(crate) const LEGACY_INSTALL_FOLDER_NAME: &str = "roomler-agent";
 /// upgrade vacated (`install_cleanup` sweep). `None` when the root
 /// env var is unset (effectively never on a real Windows session).
 #[cfg(target_os = "windows")]
-pub(crate) fn install_dir_with_name(
+pub fn install_dir_with_name(
     flavour: WindowsInstallFlavour,
     folder_name: &str,
 ) -> Option<std::path::PathBuf> {
