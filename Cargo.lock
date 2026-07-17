@@ -7229,33 +7229,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "roomler-installer"
-version = "0.3.0-rc.197"
-dependencies = [
- "anyhow",
- "directories",
- "futures",
- "gethostname 0.5.0",
- "hex",
- "reqwest 0.12.28",
- "roomler-agent",
- "roomler-setup-core",
- "serde",
- "serde_json",
- "sha2",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-shell",
- "tauri-plugin-single-instance",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "roomler-setup"
 version = "0.3.0-rc.197"
 dependencies = [
@@ -7333,36 +7306,6 @@ dependencies = [
  "tracing-subscriber",
  "webrtc",
  "zip",
-]
-
-[[package]]
-name = "roomler-tunnel-installer"
-version = "0.3.0-rc.197"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "directories",
- "futures",
- "gethostname 0.5.0",
- "hex",
- "reqwest 0.12.28",
- "roomler-agent",
- "roomler-setup-core",
- "roomler-tunnel",
- "serde",
- "serde_json",
- "sha2",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-shell",
- "tauri-plugin-single-instance",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "toml 0.9.12+spec-1.1.0",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
