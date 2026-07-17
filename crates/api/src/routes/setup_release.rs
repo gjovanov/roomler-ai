@@ -264,6 +264,39 @@ pub fn pick_setup_asset<'a>(
     })
 }
 
+/// The terminal-driven installers (scripts/install.sh + install.ps1),
+/// embedded at COMPILE time so the API serves them with no runtime
+/// filesystem dependency. Canonical usage:
+///
+///   curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
+///       --role daemon --token <jwt>
+///
+/// and the PowerShell twin via `/api/setup/install.ps1`. These are the
+/// no-GUI equivalent of the roomler-setup wizard (same resolve →
+/// download → verify → install → enroll steps). Short cache so script
+/// fixes roll out within minutes of a web deploy.
+const INSTALL_SH: &str = include_str!("../../../../scripts/install.sh");
+const INSTALL_PS1: &str = include_str!("../../../../scripts/install.ps1");
+
+fn script_response(body: &'static str, content_type: &'static str) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", content_type)
+        .header("Cache-Control", "public, max-age=300")
+        .body(Body::from(body))
+        .unwrap_or_else(|_| Response::new(Body::from(body)))
+}
+
+/// `GET /api/setup/install.sh` — the Linux/macOS terminal installer.
+pub async fn install_script_sh() -> Response {
+    script_response(INSTALL_SH, "text/x-shellscript; charset=utf-8")
+}
+
+/// `GET /api/setup/install.ps1` — the Windows terminal installer.
+pub async fn install_script_ps1() -> Response {
+    script_response(INSTALL_PS1, "text/plain; charset=utf-8")
+}
+
 /// Stream a release asset's bytes through the proxy with download
 /// headers. Shared by the legacy tunnel-wizard proxy and the P4b
 /// `/api/setup` proxy (extracted verbatim from the former).
@@ -641,6 +674,23 @@ mod tests {
             "roomler-tunnel-installer-0.3.0-x86_64-pc-windows-msvc.zip",
         )];
         assert!(pick_setup_asset(&legacy_only, "windows-x86_64").is_none());
+    }
+
+    #[test]
+    fn embedded_install_scripts_look_right() {
+        // Shape locks on the compile-time-embedded terminal installers
+        // — a broken include path or an emptied script fails here, not
+        // in production.
+        assert!(INSTALL_SH.starts_with("#!/bin/sh"), "install.sh shebang");
+        assert!(INSTALL_SH.contains("/api/agent/latest-release"));
+        assert!(INSTALL_SH.contains("--role"));
+        assert!(INSTALL_PS1.contains("daemon-user"));
+        assert!(INSTALL_PS1.contains("/api/agent/installer/"));
+        assert!(INSTALL_PS1.contains("tunnel-client"));
+        // The served scripts must never embed a JWT (base64url JWTs
+        // start with "eyJ" — the {"typ"/{"alg" header).
+        assert!(!INSTALL_SH.contains("eyJ"));
+        assert!(!INSTALL_PS1.contains("eyJ"));
     }
 
     #[test]

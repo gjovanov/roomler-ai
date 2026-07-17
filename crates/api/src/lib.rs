@@ -386,10 +386,19 @@ pub fn build_router(state: AppState) -> Router {
     // `setup-v*`). Shares the tunnel-wizard release cache (one mixed
     // list, per-family tag filtering); ships DARK — clean 404s /
     // empty list — until P4c tags the first `setup-v*` release.
+    // NB `/install.sh` + `/install.ps1` are static segments — axum's
+    // matchit gives them precedence over the `/{platform}` param, so
+    // the script endpoints never shadow (or get shadowed by) the
+    // artifact proxy.
     let public_setup_routes = Router::new()
         .route(
             "/latest-release",
             get(routes::setup_release::setup_latest_release),
+        )
+        .route("/install.sh", get(routes::setup_release::install_script_sh))
+        .route(
+            "/install.ps1",
+            get(routes::setup_release::install_script_ps1),
         )
         .route(
             "/{platform}/health",
