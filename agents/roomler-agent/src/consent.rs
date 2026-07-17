@@ -154,7 +154,7 @@ impl ConsentBroker {
     /// `last-install.json`/`needs-attention.txt` sentinels in
     /// `updater.rs` so operators only have to remember one location.
     pub fn default_sentinel_dir() -> Result<PathBuf> {
-        let dirs = directories::ProjectDirs::from("live", "roomler", "roomler-agent")
+        let dirs = crate::appdirs::project_dirs()
             .context("could not resolve a platform data directory")?;
         Ok(dirs.data_dir().join("logs").join("consent"))
     }

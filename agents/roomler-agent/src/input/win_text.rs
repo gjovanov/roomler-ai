@@ -43,12 +43,12 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
+use tunnel_core::env::node_env;
+
 /// Whether the operator has forced the old KEYEVENTF_UNICODE-only path.
 pub(super) fn unicode_only() -> bool {
     matches!(
-        std::env::var("ROOMLER_AGENT_UNICODE_TEXT")
-            .ok()
-            .map(|s| s.trim().to_ascii_lowercase()),
+        node_env("UNICODE_TEXT").map(|s| s.trim().to_ascii_lowercase()),
         Some(v) if v == "1" || v == "true" || v == "yes" || v == "on"
     )
 }

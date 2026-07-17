@@ -20,6 +20,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::time::Duration;
+use tunnel_core::env::node_env;
 
 /// GitHub "Releases" repo slug. Centralised here so a fork can redirect
 /// its update feed without grepping the codebase.
@@ -411,8 +412,7 @@ pub fn pick_asset_for_unix(assets: &[GithubAsset]) -> Option<&GithubAsset> {
 /// landed. Always pull the full list and let `pick_latest_release`
 /// apply our own filter (draft=false + tag prefix + parseable).
 async fn fetch_latest_release() -> Result<GithubRelease> {
-    let proxy_url =
-        std::env::var("ROOMLER_AGENT_UPDATE_URL").unwrap_or_else(|_| DEFAULT_PROXY_URL.to_string());
+    let proxy_url = node_env("UPDATE_URL").unwrap_or_else(|| DEFAULT_PROXY_URL.to_string());
     // Proxy first — handles rate limiting, returns the same JSON shape
     // as GitHub's /releases endpoint (slimmed to fields we read).
     match fetch_releases_from(&proxy_url).await {
@@ -1180,7 +1180,7 @@ fn spawn_watcher(
 /// in [`resolve_check_interval_with`] so tests don't have to mutate
 /// process env (which races between parallel test runs).
 pub fn resolve_check_interval(cfg: &crate::config::AgentConfig) -> Duration {
-    let env_val = std::env::var("ROOMLER_AGENT_UPDATE_INTERVAL_H").ok();
+    let env_val = node_env("UPDATE_INTERVAL_H");
     resolve_check_interval_with(env_val.as_deref(), cfg.update_check_interval_h)
 }
 

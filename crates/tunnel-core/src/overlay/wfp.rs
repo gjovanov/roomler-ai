@@ -66,15 +66,15 @@ const LAYERS: [GUID; 4] = [
 /// on a host where IT installed a managed exception, or to silence an
 /// AV "firewall tampering" alert. Matches the agent's truthy convention.
 pub fn wfp_enabled() -> bool {
-    match std::env::var("ROOMLER_AGENT_WFP_PERMIT") {
-        Ok(v) => {
+    match crate::env::node_env("WFP_PERMIT") {
+        Some(v) => {
             let t = v.trim();
             !(t.eq_ignore_ascii_case("0")
                 || t.eq_ignore_ascii_case("false")
                 || t.eq_ignore_ascii_case("no")
                 || t.eq_ignore_ascii_case("off"))
         }
-        Err(_) => true,
+        None => true,
     }
 }
 

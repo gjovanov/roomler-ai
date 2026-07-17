@@ -27,8 +27,7 @@ pub const ATTENTION_FILENAME: &str = "needs-attention.txt";
 /// platforms where `directories` can't determine a config dir
 /// (extremely rare; same scope as `config::default_config_path`).
 pub fn attention_path() -> Option<PathBuf> {
-    use directories::ProjectDirs;
-    let dirs = ProjectDirs::from("live", "roomler", "roomler-agent")?;
+    let dirs = crate::appdirs::project_dirs()?;
     Some(dirs.config_dir().join(ATTENTION_FILENAME))
 }
 
@@ -105,11 +104,7 @@ pub fn has_attention() -> bool {
 pub fn attention_path_for_worker() -> Option<(PathBuf, bool)> {
     use crate::system_context::worker_role::{WorkerRole, probe_self};
     if let Ok(WorkerRole::SystemContext) = probe_self() {
-        let pd = std::env::var_os("PROGRAMDATA")?;
-        let path = PathBuf::from(pd)
-            .join("roomler")
-            .join("roomler-agent")
-            .join(ATTENTION_FILENAME);
+        let path = crate::appdirs::machine_global_dir().join(ATTENTION_FILENAME);
         return Some((path, true));
     }
     attention_path().map(|p| (p, false))

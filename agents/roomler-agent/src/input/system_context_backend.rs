@@ -79,6 +79,7 @@ use std::thread;
 use super::enigo_backend;
 use super::{InputInjector, InputMsg};
 use crate::system_context::desktop_rebind;
+use tunnel_core::env::node_env;
 
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE};
 use windows_sys::Win32::Security::{
@@ -150,8 +151,7 @@ impl SystemContextInjector {
                 // below the elevated target's High IL.
                 tracing::info!(
                     worker_integrity = %self_integrity_label(),
-                    enable_system_swap = %std::env::var("ROOMLER_AGENT_ENABLE_SYSTEM_SWAP")
-                        .unwrap_or_else(|_| "<unset>".to_string()),
+                    enable_system_swap = node_env("ENABLE_SYSTEM_SWAP").as_deref().unwrap_or("<unset>"),
                     foreground = %foreground_window_diag(),
                     "system-context input: worker identity diagnostic (rc.120) — keystrokes land only when worker_integrity >= the focused window's integrity (UIPI)"
                 );

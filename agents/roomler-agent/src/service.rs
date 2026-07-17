@@ -3,9 +3,10 @@
 //! `roomler-agent service install` registers the agent so it launches
 //! automatically on the next interactive login:
 //!
-//!   - **Windows**: Scheduled Task named `RoomlerAgent`, ONLOGON trigger,
-//!     LIMITED run level (matches the agent's un-elevated-by-design
-//!     posture from `packaging/windows/README.txt`).
+//!   - **Windows**: Scheduled Task named `Roomler` (pre-P3D-rename hosts
+//!     have `RoomlerAgent`, which `install()` retires and `uninstall()`
+//!     deletes), ONLOGON trigger, LIMITED run level (matches the agent's
+//!     un-elevated-by-design posture from `packaging/windows/README.txt`).
 //!   - **Linux**: systemd user unit. The .deb already drops the unit
 //!     file at `/usr/lib/systemd/user/roomler-agent.service`; install
 //!     here means `systemctl --user enable --now roomler-agent.service`.
@@ -143,7 +144,11 @@ mod windows {
     use std::path::PathBuf;
     use std::process::Command;
 
-    pub const TASK_NAME: &str = "RoomlerAgent";
+    /// Canonical scheduled-task name after the P3D rename.
+    pub const NEW_TASK_NAME: &str = "Roomler";
+    /// Pre-rename scheduled-task name, retired best-effort by `install()`
+    /// and deleted by `uninstall()`.
+    pub const LEGACY_TASK_NAME: &str = "RoomlerAgent";
 
     pub fn install() -> Result<()> {
         let exe = std::env::current_exe().context("locating current exe")?;
@@ -157,7 +162,7 @@ mod windows {
             .args([
                 "/Create",
                 "/TN",
-                TASK_NAME,
+                NEW_TASK_NAME,
                 "/XML",
                 xml_path.to_string_lossy().as_ref(),
                 "/F",
@@ -178,12 +183,27 @@ mod windows {
             ));
         }
         let _ = std::fs::remove_file(&xml_path);
+        // New task is registered — retire the pre-rename task best-effort.
+        // Idempotent: a fresh install (no legacy task) just no-ops here.
+        let _ = Command::new("schtasks")
+            .args(["/Delete", "/TN", LEGACY_TASK_NAME, "/F"])
+            .output();
         Ok(())
     }
 
     pub fn uninstall() -> Result<()> {
+        // Delete BOTH the new and legacy tasks. Each tolerates "not found"
+        // so an idempotent uninstall works on a migrated host (only the
+        // new task exists), a pre-rename host (only the legacy), or a
+        // half-migrated host (both).
+        delete_task(NEW_TASK_NAME)?;
+        delete_task(LEGACY_TASK_NAME)?;
+        Ok(())
+    }
+
+    fn delete_task(name: &str) -> Result<()> {
         let output = Command::new("schtasks")
-            .args(["/Delete", "/TN", TASK_NAME, "/F"])
+            .args(["/Delete", "/TN", name, "/F"])
             .output()
             .context("running schtasks /Delete")?;
         if !output.status.success() {
@@ -203,8 +223,17 @@ mod windows {
     }
 
     pub fn status() -> Result<AutostartStatus> {
+        // Query the new task first; fall back to the legacy task so a
+        // pre-rename host mid-migration still reports Installed.
+        match query_task(NEW_TASK_NAME)? {
+            AutostartStatus::NotInstalled => query_task(LEGACY_TASK_NAME),
+            other => Ok(other),
+        }
+    }
+
+    fn query_task(name: &str) -> Result<AutostartStatus> {
         let output = Command::new("schtasks")
-            .args(["/Query", "/TN", TASK_NAME])
+            .args(["/Query", "/TN", name])
             .output()
             .context("running schtasks /Query")?;
         if output.status.success() {
@@ -249,9 +278,9 @@ mod windows {
             r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <Author>roomler-agent</Author>
+    <Author>roomlerd</Author>
     <Description>Roomler AI remote-control agent — auto-start on logon, restart on failure.</Description>
-    <URI>\RoomlerAgent</URI>
+    <URI>\Roomler</URI>
   </RegistrationInfo>
   <Triggers>
     <LogonTrigger>
