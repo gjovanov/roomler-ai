@@ -1,0 +1,353 @@
+name: Release roomler-setup
+
+# Builds the unified `roomler-setup` Tauri 2 wizard for the three
+# desktop targets the operator might run on:
+#   - Linux x86_64 (gtk + webkit2gtk) — packaged as `.tar.gz`
+#   - macOS universal (x86_64 + aarch64 lipo'd) — packaged as `.tar.gz`
+#   - Windows x86_64 (msvc + webview2 auto-bootstrap) — SIGNED EXE in a `.zip`
+#
+# The unified wizard supersedes the two legacy wizard EXEs
+# (roomler-installer = agent/daemon, roomler-tunnel-installer = tunnel CLI).
+# On Windows it offers all roles (daemon perMachine-SCM / perUser-task /
+# perMachine + tunnel-client); on Linux/macOS only the tunnel-client
+# role is functional (the daemon roles are MSI-only) — so the
+# Linux/macOS build replaces the legacy 3-platform tunnel wizard.
+#
+# Tag schema: `setup-v<workspace_version>` — a NEW family, INDEPENDENT
+# of agent-v* / tunnel-v* / tunnel-wizard-v*. Workspace Cargo.toml
+# version is the source of truth (validate-version enforces it). The
+# api's `/api/setup/<platform>` proxy (routes/setup_release.rs) serves
+# the published assets via its 1h cache; `pick_setup_asset` requires
+# the exact `roomler-setup-<v>-<triple>.<ext>` names produced below
+# (windows→.zip, linux→.tar.gz, macos→.tar.gz).
+#
+# Windows signing is REQUIRED (the wizard downloads MSIs + invokes
+# msiexec — corporate ESET/Defender quarantine an unsigned downloader
+# as a "downloader trojan"; rc.28 BLOCKER-10). Signing is opt-in via
+# the WIN_CODESIGN_PFX_BASE64 secret (same cert as release-agent); a
+# missing secret emits an unsigned zip + a ::warning:: rather than
+# failing, so packaging can be iterated before certs are wired.
+# Linux/macOS stay unsigned (Gatekeeper/SmartScreen workaround in
+# docs/tunnel-install.md), matching the legacy wizard.
+#
+# Triggered by:
+#  - `git push` of a tag matching `setup-v*` → publishes a GitHub Release.
+#  - `workflow_dispatch` with `version` + `publish_release` → artifacts
+#    only (30-day retention) unless `publish_release=true`.
+
+on:
+  push:
+    tags:
+      - 'setup-v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Setup wizard version (e.g. 0.3.0-rc.196) — must match workspace Cargo.toml'
+        required: true
+      publish_release:
+        description: 'Create a GitHub Release with the artifacts'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 0. Validate version matches Cargo.toml
+  # ---------------------------------------------------------------------------
+  validate-version:
+    name: Validate version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      is_release: ${{ steps.resolve.outputs.is_release }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve version + tag
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            tag="${GITHUB_REF_NAME}"
+            version="${tag#setup-v}"
+            is_release=true
+          else
+            version="${{ github.event.inputs.version }}"
+            tag="setup-v${version}"
+            if [[ "${{ github.event.inputs.publish_release }}" == "true" ]]; then
+              is_release=true
+            else
+              is_release=false
+            fi
+          fi
+          echo "Resolved: version=${version} tag=${tag} is_release=${is_release}"
+          cargo_version=$(awk '
+            /^\[workspace\.package\]/ {in_section=1; next}
+            /^\[/ {in_section=0}
+            in_section && /^version[[:space:]]*=/ {
+              gsub(/"/, "", $3)
+              print $3
+              exit
+            }
+          ' Cargo.toml)
+          echo "Cargo.toml workspace version: ${cargo_version}"
+          if [[ "${cargo_version}" != "${version}" ]]; then
+            echo "::error::Version mismatch: requested ${version} but Cargo.toml has ${cargo_version}"
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}"         >> "$GITHUB_OUTPUT"
+          echo "is_release=${is_release}" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # 1. Linux x86_64 — Tauri webkit2gtk needs apt-installed deps
+  # ---------------------------------------------------------------------------
+  build-linux:
+    name: Build wizard (Linux x86_64)
+    needs: validate-version
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+      - name: Cache cargo
+        continue-on-error: true
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+          shared-key: setup-linux
+          # Tag-ref cache saves can never be restored by a future tag run
+          # (GH cache isolation: own ref or default branch only) — only
+          # non-tag runs (dispatch rehearsals on master) save.
+          save-if: ${{ github.ref_type != 'tag' }}
+      - name: Install Tauri Linux system deps
+        # webkit2gtk + libsoup + ayatana; librsvg2 for icon decode. Same
+        # set as the legacy tunnel wizard (roomler-setup pulls the same
+        # Tauri Linux runtime). roomler-agent comes in with DEFAULT
+        # features (signalling-only) — no vcpkg/FFmpeg/libvpx needed.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev \
+            librsvg2-dev \
+            libayatana-appindicator3-dev \
+            patchelf
+      - name: Build wizard (release)
+        run: cargo build -p roomler-setup --release
+      - name: Strip binary
+        run: strip target/release/roomler-setup
+      - name: Pack tarball
+        id: tar
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.validate-version.outputs.version }}"
+          name="roomler-setup-${version}-x86_64-unknown-linux-gnu"
+          mkdir -p "/tmp/${name}"
+          cp target/release/roomler-setup "/tmp/${name}/"
+          cp LICENSE README.md "/tmp/${name}/" 2>/dev/null || true
+          (cd /tmp && tar czf "${name}.tar.gz" "${name}")
+          sha256sum "/tmp/${name}.tar.gz" | awk '{print $1"  "$2}' > "/tmp/${name}.tar.gz.sha256"
+          mv "/tmp/${name}.tar.gz" "/tmp/${name}.tar.gz.sha256" .
+          echo "artifact=${name}.tar.gz" >> "$GITHUB_OUTPUT"
+      - name: Upload Linux wizard artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: setup-linux-x86_64
+          path: |
+            ${{ steps.tar.outputs.artifact }}
+            ${{ steps.tar.outputs.artifact }}.sha256
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # 2. macOS — universal binary (x86_64 + aarch64 lipo'd) + tarball
+  # ---------------------------------------------------------------------------
+  build-macos:
+    name: Build wizard (macOS universal)
+    needs: validate-version
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+      - name: Cache cargo
+        continue-on-error: true
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+          shared-key: setup-macos
+          save-if: ${{ github.ref_type != 'tag' }}
+      - name: Build wizard x86_64
+        run: cargo build -p roomler-setup --release --target x86_64-apple-darwin
+      - name: Build wizard aarch64
+        run: cargo build -p roomler-setup --release --target aarch64-apple-darwin
+      - name: Lipo into universal
+        run: |
+          mkdir -p target/release-universal
+          lipo -create -output target/release-universal/roomler-setup \
+            target/x86_64-apple-darwin/release/roomler-setup \
+            target/aarch64-apple-darwin/release/roomler-setup
+          strip target/release-universal/roomler-setup
+          file target/release-universal/roomler-setup
+      - name: Pack tarball
+        id: tar
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.validate-version.outputs.version }}"
+          name="roomler-setup-${version}-universal-apple-darwin"
+          mkdir -p "/tmp/${name}"
+          cp target/release-universal/roomler-setup "/tmp/${name}/"
+          cp LICENSE README.md "/tmp/${name}/" 2>/dev/null || true
+          (cd /tmp && tar czf "${name}.tar.gz" "${name}")
+          shasum -a 256 "/tmp/${name}.tar.gz" | awk '{print $1"  "$2}' > "/tmp/${name}.tar.gz.sha256"
+          mv "/tmp/${name}.tar.gz" "/tmp/${name}.tar.gz.sha256" .
+          echo "artifact=${name}.tar.gz" >> "$GITHUB_OUTPUT"
+      - name: Upload macOS wizard artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: setup-macos-universal
+          path: |
+            ${{ steps.tar.outputs.artifact }}
+            ${{ steps.tar.outputs.artifact }}.sha256
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # 3. Windows x86_64 — SIGN the EXE, then zip it (pick_setup_asset wants .zip)
+  # ---------------------------------------------------------------------------
+  build-windows:
+    name: Build wizard (Windows x86_64)
+    needs: validate-version
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      VERSION: ${{ needs.validate-version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+      - name: Cache cargo
+        continue-on-error: true
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+          shared-key: setup-windows
+          save-if: ${{ github.ref_type != 'tag' }}
+      - name: Build wizard (release)
+        shell: pwsh
+        run: cargo build -p roomler-setup --release
+      - name: Authenticode sign the wizard EXE
+        # Sign BEFORE zipping so the zipped EXE the operator extracts is
+        # signed. Opt-in via the secret; a missing secret warns rather
+        # than fails (unsigned zip — SmartScreen/AV will flag it).
+        if: env.WIN_CODESIGN_PFX_BASE64 != ''
+        shell: pwsh
+        env:
+          WIN_CODESIGN_PFX_BASE64: ${{ secrets.WIN_CODESIGN_PFX_BASE64 }}
+          WIN_CODESIGN_PASSWORD:   ${{ secrets.WIN_CODESIGN_PASSWORD }}
+        run: |
+          $pfxPath = Join-Path $env:RUNNER_TEMP "codesign.pfx"
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WIN_CODESIGN_PFX_BASE64))
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" |
+                      Sort-Object FullName -Descending | Select-Object -First 1
+          & $signtool.FullName sign `
+              /f $pfxPath `
+              /p $env:WIN_CODESIGN_PASSWORD `
+              /fd SHA256 `
+              /tr http://timestamp.digicert.com `
+              /td SHA256 `
+              "target\release\roomler-setup.exe"
+          Remove-Item $pfxPath -Force
+      - name: Warn on unsigned build
+        if: env.WIN_CODESIGN_PFX_BASE64 == ''
+        shell: bash
+        run: echo "::warning::WIN_CODESIGN_PFX_BASE64 not set — roomler-setup.exe is unsigned. SmartScreen/ESET may quarantine the downloader."
+        env:
+          WIN_CODESIGN_PFX_BASE64: ${{ secrets.WIN_CODESIGN_PFX_BASE64 }}
+      - name: Pack zip
+        id: zip
+        shell: pwsh
+        run: |
+          $version = "${{ needs.validate-version.outputs.version }}"
+          # Stable name (no -unsigned suffix): pick_setup_asset matches on
+          # `contains(x86_64-pc-windows-msvc) && endsWith(.zip)`, and the
+          # health endpoint returns whatever filename exists — a stable
+          # name keeps the operator-facing URI deterministic. Signed-ness
+          # is a property of the EXE inside, surfaced in the release notes.
+          $name = "roomler-setup-$version-x86_64-pc-windows-msvc"
+          New-Item -ItemType Directory -Path "$env:RUNNER_TEMP\$name" -Force | Out-Null
+          Copy-Item target\release\roomler-setup.exe "$env:RUNNER_TEMP\$name\"
+          if (Test-Path LICENSE) { Copy-Item LICENSE "$env:RUNNER_TEMP\$name\" }
+          if (Test-Path README.md) { Copy-Item README.md "$env:RUNNER_TEMP\$name\" }
+          Compress-Archive -Path "$env:RUNNER_TEMP\$name\*" -DestinationPath "$name.zip"
+          $hash = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name.zip" | Out-File "$name.zip.sha256" -Encoding ascii
+          "artifact=$name.zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+      - name: Upload Windows wizard artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: setup-windows-x86_64
+          path: |
+            ${{ steps.zip.outputs.artifact }}
+            ${{ steps.zip.outputs.artifact }}.sha256
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # 4. Publish GitHub Release
+  # ---------------------------------------------------------------------------
+  publish-release:
+    name: Publish GitHub Release
+    needs: [validate-version, build-linux, build-macos, build-windows]
+    if: needs.validate-version.outputs.is_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Flatten + list
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.sha256' \) -exec cp {} release/ \;
+          ls -la release/
+      - name: Create / update Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.validate-version.outputs.tag }}
+          name: roomler-setup ${{ needs.validate-version.outputs.version }}
+          draft: false
+          # prerelease:true for rc/alpha/beta — unlike the agent (whose
+          # updater polls /releases/latest and so must be non-prerelease),
+          # the `/api/setup` proxy filters by the `setup-v` prefix with a
+          # prerelease fallback (setup_release.rs pick_release_for), so an
+          # rc setup release is served fine while the repo's "Latest"
+          # badge correctly stays on the agent release.
+          prerelease: ${{ contains(needs.validate-version.outputs.version, 'rc.') || contains(needs.validate-version.outputs.version, 'alpha') || contains(needs.validate-version.outputs.version, 'beta') }}
+          body: |
+            Automated build of the unified `roomler-setup` wizard ${{ needs.validate-version.outputs.version }} via
+            [release-setup.yml](.github/workflows/release-setup.yml).
+
+            **Download / run:**
+            - Windows x86_64: `.zip` containing a signed `roomler-setup.exe` — extract + double-click.
+            - Linux x86_64: `.tar.gz` — extract, run `./roomler-setup`.
+            - macOS universal (x86_64 + aarch64): `.tar.gz` — extract, run `./roomler-setup`
+              (Gatekeeper may require `xattr -d com.apple.quarantine ./roomler-setup` on first launch).
+
+            **What the wizard does:** pick a role, detect existing installs, paste an enrollment token, and it
+            resolves → downloads → verifies → installs → enrolls the node. On Windows the daemon roles
+            (be-accessed: perMachine-SCM / perUser / perMachine + SystemContext) run the agent MSI (which
+            carries the `roomler` CLI); every OS offers the tunnel-client role (reach-others). A terminal
+            equivalent is served at `roomler.ai/api/setup/install.sh` (Linux/macOS) and
+            `roomler.ai/api/setup/install.ps1` (Windows).
+          files: release/*
