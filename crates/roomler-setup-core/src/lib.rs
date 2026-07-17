@@ -18,4 +18,7 @@ pub mod asset_resolver;
 pub mod extract;
 pub mod integration;
 pub mod msi_runner;
+pub mod progress;
+pub mod token_peek;
 pub mod tunnel_enroll;
+pub mod wizard_state;
