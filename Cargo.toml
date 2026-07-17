@@ -6,6 +6,7 @@ members = [
     "crates/services",
     "crates/remote_control",
     "crates/tunnel-core",
+    "crates/roomler-setup-core",
 
     "crates/api",
     "crates/tests",
