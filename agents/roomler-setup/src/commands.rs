@@ -243,8 +243,15 @@ pub fn cmd_save_state(state: wizard_shared::wizard_state::WizardState) -> Result
 /// Output of a successful `cmd_install`, whichever orchestrator ran.
 /// Surfaced on the Done step. `principal_kind` is `"agent"` or
 /// `"tunnel_client"`; the trailing `Option` fields are per-role
-/// extras (flavour for daemon roles; binary/PATH details for the
-/// tunnel role; config path for both).
+/// extras (flavour for daemon roles; binary/PATH details for
+/// whichever pipeline delivered a CLI; config path for both).
+///
+/// P4b (role→action composition): daemon MSIs carry the `roomler`
+/// CLI, so daemon roles now also populate `binary_path` /
+/// `path_updated` and set `cli_included` from a post-install
+/// existence check (`Some(false)` = an old pre-P4b MSI was served —
+/// the SPA then doesn't promise a CLI that wasn't delivered).
+/// `None` for the tunnel role, where the CLI *is* the install.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DoneReport {
@@ -258,6 +265,7 @@ pub struct DoneReport {
     pub config_path: Option<String>,
     pub path_updated: Option<bool>,
     pub shortcut_created: Option<bool>,
+    pub cli_included: Option<bool>,
 }
 
 /// Drive the full install pipeline end-to-end for the picked role:
@@ -409,6 +417,7 @@ mod tests {
             config_path: Some("/home/foo/.config/roomler-tunnel/config.toml".to_string()),
             path_updated: Some(true),
             shortcut_created: Some(false),
+            cli_included: None,
         };
         let json = serde_json::to_string(&r).unwrap();
         assert!(
@@ -422,6 +431,9 @@ mod tests {
         assert!(json.contains("configPath"), "{json}");
         assert!(json.contains("pathUpdated"), "{json}");
         assert!(json.contains("shortcutCreated"), "{json}");
+        // P4b: camelCase lock for the composition flag.
+        assert!(json.contains("cliIncluded"), "{json}");
+        assert!(!json.contains("cli_included"), "{json}");
         assert!(!json.contains("principal_kind"), "{json}");
         // Round-trips (Deserialize derive is part of the contract).
         let back: DoneReport = serde_json::from_str(&json).unwrap();
