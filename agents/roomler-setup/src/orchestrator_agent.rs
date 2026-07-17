@@ -418,6 +418,14 @@ async fn run_install_inner(
         },
     );
 
+    // --- Step 7b: place the roomler-desktop GUI companion (GAP-A / P6) ---
+    // The desktop EXE is NOT in the MSI (it's a standalone release
+    // asset), so a daemon install would otherwise land only roomlerd +
+    // roomler. Fetch + place it beside the daemon so all three ship
+    // together. Best-effort — a failure never sinks the enrolled
+    // install; the operator can always grab it later.
+    let desktop_installed = place_desktop_companion(wfx, on_event).await;
+
     // --- Step 8: done ----------------------------------------------------
     emit(on_event, ProgressEvent::Done);
 
@@ -440,7 +448,97 @@ async fn run_install_inner(
         path_updated: cli_path_updated,
         shortcut_created: None,
         cli_included,
+        desktop_installed,
     })
+}
+
+/// Fetch + place the `roomler-desktop` GUI companion beside the daemon
+/// (GAP-A / P6). The GUI EXE ships as a standalone release asset
+/// (`roomler-desktop-*-x86_64-pc-windows-msvc*.exe`), not inside the
+/// MSI, so a daemon install needs this extra step to land all three
+/// binaries. Best-effort: `Some(true)` placed, `Some(false)` on any
+/// failure or a server with no desktop asset, `None` on non-Windows.
+/// Never errors the install — mirrors the terminal `install.ps1`
+/// `Install-Desktop` try/catch.
+#[cfg(target_os = "windows")]
+async fn place_desktop_companion(
+    flavour: WindowsInstallFlavour,
+    on_event: &Channel<ProgressEvent>,
+) -> Option<bool> {
+    let dir = roomler_agent::updater::install_dir_with_name(
+        flavour,
+        roomler_agent::updater::INSTALL_FOLDER_NAME,
+    )?;
+    emit(
+        on_event,
+        ProgressEvent::AssetResolving {
+            artifact: "roomler-desktop".to_string(),
+        },
+    );
+    let origin = crate::proxy::origin_of(&crate::proxy::agent_base());
+    let lr_url = format!("{origin}/api/agent/latest-release");
+    let asset = match asset_resolver::find_release_asset(
+        &lr_url,
+        "agent-v",
+        "roomler-desktop",
+        ".exe",
+        crate::proxy::USER_AGENT,
+    )
+    .await
+    {
+        Ok(Some(a)) => a,
+        Ok(None) => {
+            tracing::warn!(
+                "no roomler-desktop asset in the latest agent release — companion skipped"
+            );
+            return Some(false);
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "resolving roomler-desktop failed — companion skipped");
+            return Some(false);
+        }
+    };
+    let staged = std::env::temp_dir()
+        .join("roomler-setup")
+        .join(&asset.filename);
+    let spec = asset_resolver::DownloadSpec {
+        url: &asset.url,
+        dest: &staged,
+        user_agent: crate::proxy::USER_AGENT,
+        artifact_label: "desktop companion",
+    };
+    if let Err(e) = asset_resolver::download(&spec, &crate::CANCEL_REQUESTED, |_| {}).await {
+        tracing::warn!(error = %e, "downloading roomler-desktop failed — companion skipped");
+        return Some(false);
+    }
+    if let Some(digest) = asset.digest.as_deref() {
+        match asset_resolver::verify_sha256(&staged, digest) {
+            Ok(true) => {}
+            _ => {
+                tracing::warn!("roomler-desktop sha256 mismatch — companion skipped");
+                let _ = std::fs::remove_file(&staged);
+                return Some(false);
+            }
+        }
+    }
+    let target = dir.join("roomler-desktop.exe");
+    match std::fs::copy(&staged, &target) {
+        Ok(_) => Some(true),
+        Err(e) => {
+            tracing::warn!(error = %e, path = %target.display(), "placing roomler-desktop failed");
+            Some(false)
+        }
+    }
+}
+
+/// Non-Windows: daemon roles don't run a real install here, and the
+/// desktop companion is Windows-only.
+#[cfg(not(target_os = "windows"))]
+async fn place_desktop_companion(
+    _flavour: WindowsInstallFlavour,
+    _on_event: &Channel<ProgressEvent>,
+) -> Option<bool> {
+    None
 }
 
 /// Post-install probe for the MSI-carried tunnel CLI: derive the
