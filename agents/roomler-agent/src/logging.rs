@@ -2,14 +2,20 @@
 //!
 //! Stdout output is preserved for foreground / interactive runs; a daily-
 //! rolling file appender writes everything to
-//! `<data-local-dir>/logs/roomler-agent.log[.YYYY-MM-DD]` so a Scheduled-
+//! `<data-local-dir>/logs/roomlerd.log[.YYYY-MM-DD]` so a Scheduled-
 //! Task / systemd / launchd-supervised agent (where stdout is `/dev/null`)
 //! still leaves a forensic trail.
 //!
-//! On Windows that resolves to `%LOCALAPPDATA%\roomler\roomler-agent\data\logs\`
-//! via `directories::ProjectDirs::data_local_dir`. Linux: `~/.local/share/
-//! roomler-agent/logs/`. macOS: `~/Library/Application Support/live.roomler.
-//! roomler-agent/logs/`.
+//! P3d Slice B renamed the daemon (`roomler-agent` -> `roomlerd`); the log
+//! basename moved to match. Old rolled `roomler-agent.log*` files on an
+//! upgraded host stay readable — [`active_log_path`] and [`prune_old_logs_at`]
+//! (and `logs_fetch`) accept BOTH prefixes.
+//!
+//! The log DIR is resolved by `appdirs` (new-then-old segment). On a fresh
+//! Windows install that's `%LOCALAPPDATA%\roomler\roomler\data\logs\`; a
+//! pre-rename host keeps `...\roomler\roomler-agent\data\logs\`. Linux:
+//! `~/.local/share/roomler/logs/` (or `.../roomler-agent/logs/` on an upgraded
+//! host). macOS: `~/Library/Application Support/live.roomler.roomler/logs/`.
 //!
 //! A process-wide panic hook captures the message + backtrace and writes
 //! it synchronously to `<log_dir>/panic-<pid>-<unix_ts>.log` *before*
@@ -25,7 +31,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use directories::ProjectDirs;
 use tokio::sync::mpsc;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
@@ -119,7 +124,8 @@ pub fn init() {
         && std::fs::create_dir_all(d).is_ok()
     {
         prune_old_logs(d, KEEP_DAYS);
-        let appender = tracing_appender::rolling::daily(d, "roomler-agent.log");
+        // P3d Slice B: write under the new `roomlerd.log` basename.
+        let appender = tracing_appender::rolling::daily(d, "roomlerd.log");
         let (nb, guard) = tracing_appender::non_blocking(appender);
         let _ = GUARD.set(guard);
         let file = fmt::layer()
@@ -167,11 +173,14 @@ pub fn log_dir() -> Option<PathBuf> {
 /// dir resolved (test harness / no-home environment).
 ///
 /// The path is computed deterministically from the rolling
-/// appender's daily-rotation convention: `<log_dir>/roomler-agent.
-/// log.YYYY-MM-DD` for archived days; `<log_dir>/roomler-agent.log`
-/// is the symlink-ish "current" name on some platforms but in
-/// practice tracing-appender writes to the dated name from the very
-/// first line. Probe both and return whichever exists.
+/// appender's daily-rotation convention: `<log_dir>/roomlerd.log.YYYY-MM-DD`
+/// for archived days; `<log_dir>/roomlerd.log` is the symlink-ish "current"
+/// name on some platforms but in practice tracing-appender writes to the dated
+/// name from the very first line.
+///
+/// P3d Slice B: probe the new `roomlerd.log[.date]` basenames first, then fall
+/// back to the legacy `roomler-agent.log[.date]` so an upgraded host whose most
+/// recent rolled file predates the rename is still found.
 pub fn active_log_path() -> Option<PathBuf> {
     let dir = log_dir()?;
     let today = SystemTime::now()
@@ -182,13 +191,15 @@ pub fn active_log_path() -> Option<PathBuf> {
     // Format unix seconds → YYYY-MM-DD without pulling chrono.
     // tracing-appender uses UTC by default; mirror that.
     let date = format_utc_date(today);
-    let dated = dir.join(format!("roomler-agent.log.{date}"));
-    if dated.exists() {
-        return Some(dated);
-    }
-    let plain = dir.join("roomler-agent.log");
-    if plain.exists() {
-        return Some(plain);
+    for base in ["roomlerd.log", "roomler-agent.log"] {
+        let dated = dir.join(format!("{base}.{date}"));
+        if dated.exists() {
+            return Some(dated);
+        }
+        let plain = dir.join(base);
+        if plain.exists() {
+            return Some(plain);
+        }
     }
     None
 }
@@ -228,7 +239,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 /// that didn't run the agent's logging setup, e.g. the tray). The tray uses
 /// this so "Open Logs Folder" resolves a real path instead of failing.
 pub fn resolve_log_dir() -> Option<PathBuf> {
-    let dirs = ProjectDirs::from("live", "roomler", "roomler-agent")?;
+    let dirs = crate::appdirs::project_dirs()?;
     Some(dirs.data_local_dir().join("logs"))
 }
 
@@ -245,10 +256,14 @@ fn prune_old_logs(dir: &Path, keep_days: u64) {
 
 /// Same as [`prune_old_logs`] but takes the cutoff as a parameter so
 /// tests can drive it deterministically. Files matching one of our
-/// two prefixes (`roomler-agent.log` rolling files, `panic-` panic
-/// dumps) and with mtime older than `cutoff` are unlinked. Anything
-/// else in the directory is left alone — the operator may have stashed
-/// notes there.
+/// prefixes (`roomlerd.log` / legacy `roomler-agent.log` rolling files,
+/// `panic-` panic dumps) and with mtime older than `cutoff` are unlinked.
+/// Anything else in the directory is left alone — the operator may have
+/// stashed notes there.
+///
+/// P3d Slice B: prunes BOTH the new `roomlerd.log*` files and the legacy
+/// `roomler-agent.log*` files so an upgraded host's old rolled logs age out
+/// under the same retention policy instead of accreting forever.
 fn prune_old_logs_at(dir: &Path, cutoff: SystemTime) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -262,7 +277,9 @@ fn prune_old_logs_at(dir: &Path, cutoff: SystemTime) {
         };
         let name = entry.file_name();
         let lossy = name.to_string_lossy();
-        let is_ours = lossy.starts_with("roomler-agent.log") || lossy.starts_with("panic-");
+        let is_ours = lossy.starts_with("roomlerd.log")
+            || lossy.starts_with("roomler-agent.log")
+            || lossy.starts_with("panic-");
         if is_ours && mtime < cutoff {
             let _ = std::fs::remove_file(entry.path());
         }
@@ -377,18 +394,30 @@ mod tests {
     #[test]
     fn prune_with_future_cutoff_drops_matching_files() {
         let tmp = tempfile::tempdir().unwrap();
+        // New (roomlerd) + legacy (roomler-agent) rolling files must BOTH be
+        // pruned (P3d Slice B both-name retention).
+        let logd = tmp.path().join("roomlerd.log.2026-07-15");
+        let logd_root = tmp.path().join("roomlerd.log");
         let log = tmp.path().join("roomler-agent.log.2026-04-29");
         let log_root = tmp.path().join("roomler-agent.log");
         let panic = tmp.path().join("panic-1234-100.log");
         let unrelated = tmp.path().join("readme.txt");
-        for p in [&log, &log_root, &panic, &unrelated] {
+        for p in [&logd, &logd_root, &log, &log_root, &panic, &unrelated] {
             std::fs::write(p, b"x").unwrap();
         }
         // Cutoff 1 day in the future — every file's mtime is older.
         let future = SystemTime::now() + Duration::from_secs(86_400);
         prune_old_logs_at(tmp.path(), future);
-        assert!(!log.exists(), "rolling log should be pruned");
-        assert!(!log_root.exists(), "current rolling log should be pruned");
+        assert!(!logd.exists(), "new rolling log should be pruned");
+        assert!(
+            !logd_root.exists(),
+            "new current rolling log should be pruned"
+        );
+        assert!(!log.exists(), "legacy rolling log should be pruned");
+        assert!(
+            !log_root.exists(),
+            "legacy current rolling log should be pruned"
+        );
         assert!(!panic.exists(), "panic dump should be pruned");
         assert!(unrelated.exists(), "unrelated files must be left alone");
     }

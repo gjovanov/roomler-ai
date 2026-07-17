@@ -9,7 +9,8 @@ PartOf=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/roomler-agent run
+# P3d Slice B: the daemon binary is now `roomlerd` (was `roomler-agent`).
+ExecStart=/usr/bin/roomlerd run
 Restart=on-failure
 RestartSec=5
 Environment=RUST_LOG=roomler_agent=info,warn
@@ -18,7 +19,11 @@ Environment=RUST_LOG=roomler_agent=info,warn
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%h/.config/roomler-agent %h/.local/share/roomler-agent
+# P3d Slice B: the appdirs resolver (src/appdirs.rs) uses the NEW `roomler`
+# app segment on fresh installs but keeps the OLD `roomler-agent` tree when a
+# pre-rename host already has one. Whitelist BOTH so neither a fresh install
+# nor an upgraded host is blocked by ProtectHome=read-only.
+ReadWritePaths=%h/.config/roomler %h/.local/share/roomler %h/.config/roomler-agent %h/.local/share/roomler-agent
 
 [Install]
 WantedBy=default.target

@@ -29,9 +29,10 @@
 /// below ~40% the picture degrades more than the freeze it prevents.
 pub const FACTOR_FLOOR: f32 = 0.4;
 
-fn env_f32(key: &str, default: f32) -> f32 {
-    std::env::var(key)
-        .ok()
+use tunnel_core::env::node_env;
+
+fn env_f32(suffix: &str, default: f32) -> f32 {
+    node_env(suffix)
         .and_then(|v| v.trim().parse::<f32>().ok())
         .filter(|v| v.is_finite() && *v > 0.0)
         .unwrap_or(default)
@@ -52,13 +53,11 @@ impl EncodePressure {
             // Saturate above `high_ms` (encoder can't hold ~40 fps), recover
             // below `low_ms`. Env-tunable so the field trigger can move
             // without a rebuild; kill switch pins the factor at 1.0.
-            high_ms: env_f32("ROOMLER_AGENT_ENCODE_PRESSURE_HIGH_MS", 25.0),
-            low_ms: env_f32("ROOMLER_AGENT_ENCODE_PRESSURE_LOW_MS", 15.0),
+            high_ms: env_f32("ENCODE_PRESSURE_HIGH_MS", 25.0),
+            low_ms: env_f32("ENCODE_PRESSURE_LOW_MS", 15.0),
             factor: 1.0,
             enabled: !matches!(
-                std::env::var("ROOMLER_AGENT_ENCODE_PRESSURE")
-                    .ok()
-                    .as_deref(),
+                node_env("ENCODE_PRESSURE").as_deref(),
                 Some("0") | Some("false")
             ),
         }
