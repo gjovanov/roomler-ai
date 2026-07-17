@@ -78,6 +78,10 @@ fn main() {
             commands::cmd_consent_approve,
             commands::cmd_consent_deny,
             commands::cmd_get_pending_consents,
+            commands::cmd_route_list,
+            commands::cmd_route_add,
+            commands::cmd_route_remove,
+            commands::cmd_route_set_enabled,
         ])
         .setup(|app| {
             // Install the tray icon + menu. The main window starts
