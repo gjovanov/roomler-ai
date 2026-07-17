@@ -101,6 +101,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         overlay_advertised_routes: Vec::new(),
         advertise_routes: Vec::new(),
         advertise_local_subnets: true,
+        tunnel_routes: Vec::new(),
     })
 }
 
