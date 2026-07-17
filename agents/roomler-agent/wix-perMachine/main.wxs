@@ -109,6 +109,15 @@
                             DiskId='1'
                             KeyPath='yes'
                             Source='target\release\roomlerd.exe' />
+                        <!-- P3d Slice B hardening: start the SCM service via the
+                             native StartServices standard action. RegisterService
+                             (deferred CA, After InstallFiles) creates the `Roomler`
+                             service earlier in the sequence, so StartServices finds
+                             it. Belt-and-suspenders next to the DisableSystemContext
+                             restart. Wait='no' so a slow start never fails the
+                             install; stop/remove stay with the Unregister CA. -->
+                        <ServiceControl Id='StartRoomlerSvc' Name='Roomler'
+                                        Start='install' Wait='no' />
                     </Component>
                     <!-- P3d Slice B: INERT compatibility alias. Ships a
                          `roomler-agent.exe` copy (produced by the

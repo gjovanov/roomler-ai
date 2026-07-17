@@ -80,7 +80,10 @@ fn service_present(name: &str) -> bool {
 }
 
 /// Display name shown in services.msc, Get-Service output, and Server Manager.
-pub const SERVICE_DISPLAY_NAME: &str = "Roomler AI Remote-Control Agent";
+// Distinct from the legacy service's "Roomler AI Remote-Control Agent" display so
+// the two can never collide (ERROR_DUPLICATE_SERVICE_NAME) during the migration
+// overlap — two services must not share a display name.
+pub const SERVICE_DISPLAY_NAME: &str = "Roomler";
 
 /// One-line description shown in services.msc properties dialog.
 pub const SERVICE_DESCRIPTION: &str = "Native remote-control agent for the Roomler AI platform. Maintains an outbound \
