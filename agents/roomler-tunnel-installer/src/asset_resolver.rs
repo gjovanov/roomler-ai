@@ -1,4 +1,13 @@
-//! CLI-archive asset resolution + download.
+//! CLI-archive asset resolution + download — legacy wrapper.
+//!
+//! P4a: the streaming mechanics moved to
+//! `wizard_shared::asset_resolver`; this wrapper keeps the wizard's
+//! identity — the `/api/tunnel/installer` proxy base + its env
+//! overrides (incl. the legacy alias), the
+//! `<temp>/roomler-tunnel-installer` staging namespace, the
+//! historical `roomler-tunnel-installer/<v>` User-Agent, and the
+//! `WizardArchiveHealth` shape — so behaviour stays byte-identical
+//! while this legacy wizard ships. Retired with the crate in P4c.
 //!
 //! The wizard hits roomler.ai's `/api/tunnel/installer/{platform}`
 //! proxy — the CLI tarball endpoint — instead of downloading
@@ -14,18 +23,6 @@
 //! the operator's PATH. Pointing this module at `/api/tunnel-wizard`
 //! makes the wizard install itself (rc.60 bug, fixed rc.61).
 //!
-//! Flow per install:
-//!   1. `resolve(platform, version)` → GET
-//!      `/tunnel/installer/{platform}/health` → JSON metadata
-//!      (tag, size, sha256 digest, canonical filename).
-//!   2. `download(&health, on_progress)` → GET
-//!      `/tunnel/installer/{platform}` → stream bytes to
-//!      `<temp>/roomler-tunnel-installer/{tag}/{filename}`, firing
-//!      `on_progress(received_bytes)` per chunk.
-//!   3. `verify_sha256(&staged, &expected)` → hash the staged file,
-//!      compare to the digest from health. Mismatch → caller deletes
-//!      the file + re-downloads (or surfaces a tampered-bytes error).
-//!
 //! Override knob: env var `ROOMLER_TUNNEL_CLI_PROXY_BASE` swaps the
 //! domain. Used by the integration tests in `crates/tests/` to point
 //! the orchestrator at an in-process mock server. The legacy
@@ -33,12 +30,23 @@
 //! back-compat with any test fixture that already set it.
 //! Production always uses `https://roomler.ai/api/tunnel/installer`.
 
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+
+pub use wizard_shared::asset_resolver::{current_platform, verify_sha256};
+
+/// Historical wire-visible User-Agent — preserved verbatim through
+/// the P4a extraction (the moved core fns take the UA as a
+/// parameter).
+const USER_AGENT: &str = concat!("roomler-tunnel-installer/", env!("CARGO_PKG_VERSION"));
+
+/// Legacy wizards keep their step-boundary-only cancel granularity:
+/// the core `download` gained a mid-stream cancel check, and this
+/// never-true flag opts the shipped wizard out of it.
+static NEVER_CANCELLED: AtomicBool = AtomicBool::new(false);
 
 /// Default proxy base — the CLI tarball endpoint family.
 ///
@@ -72,12 +80,12 @@ fn normalise_proxy_base(raw: &str) -> String {
     raw.trim_end_matches('/').to_string()
 }
 
-/// Mirror of the backend's `TunnelWizardHealth` JSON. Wire shape is
-/// pinned by `crates/api/src/routes/tunnel_wizard_release.rs`; keep
-/// in sync.
+/// Mirror of the backend's health JSON for the CLI-archive endpoint.
+/// Wire shape is pinned by `crates/api/src/routes/tunnel_release.rs`;
+/// keep in sync.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WizardArchiveHealth {
-    /// Resolved tag, e.g. `tunnel-wizard-v0.3.0-rc.1`.
+    /// Resolved tag, e.g. `tunnel-v0.3.0-rc.46`.
     pub tag: String,
     /// Normalised platform: `"windows-x86_64" | "linux-x86_64" |
     /// "linux-deb" | "macos"`.
@@ -95,38 +103,16 @@ pub struct WizardArchiveHealth {
     pub uri: String,
 }
 
-/// Detect the current platform string the backend understands. The
-/// wizard EXE runs on the same OS+arch as the CLI it's about to
-/// install, so the platform discriminator is whatever the wizard
-/// itself was compiled for.
-pub fn current_platform() -> &'static str {
-    // Matches the backend's `normalise_platform` enum-shape used in
-    // both tunnel_release.rs and tunnel_wizard_release.rs.
-    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    {
-        "windows-x86_64"
-    }
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    {
-        // Wizard defaults to the plain tarball; the `.deb` variant is
-        // a packaging detail for fleet installs, not what a
-        // double-clicked wizard EXE consumes.
-        "linux-x86_64"
-    }
-    #[cfg(target_os = "macos")]
-    {
-        "macos"
-    }
-    #[cfg(not(any(
-        all(target_os = "windows", target_arch = "x86_64"),
-        all(target_os = "linux", target_arch = "x86_64"),
-        target_os = "macos"
-    )))]
-    {
-        // Aarch64-Linux, FreeBSD, etc. — wizard EXE doesn't ship for
-        // these platforms in v1, but the const has to exist so the
-        // crate compiles. Backend will 404 for an unknown platform.
-        "unsupported"
+impl From<wizard_shared::asset_resolver::ArtifactHealth> for WizardArchiveHealth {
+    fn from(h: wizard_shared::asset_resolver::ArtifactHealth) -> Self {
+        WizardArchiveHealth {
+            tag: h.tag,
+            platform: h.target,
+            filename: h.filename,
+            size: h.size,
+            digest: h.digest,
+            uri: h.uri,
+        }
     }
 }
 
@@ -134,28 +120,10 @@ pub fn current_platform() -> &'static str {
 /// kicking the download so the progress bar has a denominator and
 /// the wizard can pre-validate the SHA256 digest format.
 pub async fn resolve(platform: &str, version: &str) -> Result<WizardArchiveHealth> {
-    let url = format!("{}/{}/health?version={}", proxy_base(), platform, version);
-    let client = reqwest::Client::builder()
-        .user_agent(concat!(
-            "roomler-tunnel-installer/",
-            env!("CARGO_PKG_VERSION")
-        ))
-        .timeout(Duration::from_secs(30))
-        .build()
-        .context("building reqwest client")?;
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .with_context(|| format!("GET {url}"))?;
-    if !resp.status().is_success() {
-        return Err(anyhow!(
-            "installer-health GET {url} returned {}",
-            resp.status()
-        ));
-    }
-    let health: WizardArchiveHealth = resp.json().await.context("parsing installer-health JSON")?;
-    Ok(health)
+    let health =
+        wizard_shared::asset_resolver::resolve(&proxy_base(), platform, version, USER_AGENT)
+            .await?;
+    Ok(health.into())
 }
 
 /// Stream the archive bytes to
@@ -168,52 +136,20 @@ pub async fn resolve(platform: &str, version: &str) -> Result<WizardArchiveHealt
 /// after both succeed.
 pub async fn download<F: FnMut(u64)>(
     health: &WizardArchiveHealth,
-    mut on_progress: F,
+    on_progress: F,
 ) -> Result<PathBuf> {
-    let dest_dir = std::env::temp_dir()
+    let dest = std::env::temp_dir()
         .join("roomler-tunnel-installer")
-        .join(&health.tag);
-    std::fs::create_dir_all(&dest_dir)
-        .with_context(|| format!("creating staging dir {}", dest_dir.display()))?;
-    let dest = dest_dir.join(&health.filename);
-
+        .join(&health.tag)
+        .join(&health.filename);
     let url = format!("{}{}", proxy_origin(), health.uri);
-    let client = reqwest::Client::builder()
-        .user_agent(concat!(
-            "roomler-tunnel-installer/",
-            env!("CARGO_PKG_VERSION")
-        ))
-        .timeout(Duration::from_secs(15 * 60)) // 15 min for slow corp networks
-        .build()
-        .context("building reqwest client")?;
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .with_context(|| format!("GET {url}"))?;
-    if !resp.status().is_success() {
-        return Err(anyhow!("CLI archive GET {url} returned {}", resp.status()));
-    }
-
-    use futures::StreamExt;
-    let mut file = tokio::fs::File::create(&dest)
-        .await
-        .with_context(|| format!("creating staging file {}", dest.display()))?;
-    let mut received: u64 = 0;
-    let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let bytes = chunk.context("reading CLI archive chunk")?;
-        use tokio::io::AsyncWriteExt;
-        file.write_all(&bytes)
-            .await
-            .with_context(|| format!("writing staging file {}", dest.display()))?;
-        received += bytes.len() as u64;
-        on_progress(received);
-    }
-    use tokio::io::AsyncWriteExt;
-    file.flush().await.context("flushing staging file")?;
-    drop(file);
-
+    let spec = wizard_shared::asset_resolver::DownloadSpec {
+        url: &url,
+        dest: &dest,
+        user_agent: USER_AGENT,
+        artifact_label: "CLI archive",
+    };
+    wizard_shared::asset_resolver::download(&spec, &NEVER_CANCELLED, on_progress).await?;
     Ok(dest)
 }
 
@@ -242,46 +178,11 @@ fn strip_cli_path_suffix(base: &str) -> String {
     base.to_string()
 }
 
-/// Verify a staged archive's SHA256 against the digest from
-/// [`WizardArchiveHealth`]. Returns `Ok(true)` on match, `Ok(false)`
-/// on mismatch, `Err` on malformed digest or read error.
-///
-/// Accepts `digest` either as `"sha256:<hex>"` (the canonical GitHub
-/// shape forwarded by the backend) or as bare hex. Hex is
-/// case-insensitive.
-pub fn verify_sha256(staged: &Path, expected_digest: &str) -> Result<bool> {
-    let hex = expected_digest
-        .strip_prefix("sha256:")
-        .unwrap_or(expected_digest);
-    if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(anyhow!(
-            "expected sha256 digest as 64 hex chars (optional sha256: prefix); got {expected_digest:?}"
-        ));
-    }
-    let bytes = std::fs::read(staged).with_context(|| format!("reading {}", staged.display()))?;
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    let actual = hasher.finalize();
-    let actual_hex = hex_encode(&actual);
-    Ok(actual_hex.eq_ignore_ascii_case(hex))
-}
-
-/// Lowercase hex encoder. The `hex` crate would suffice but inlining
-/// the 6-line helper saves a transitive dep + the `sha2` crate is
-/// already pulled in.
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        use std::fmt::Write;
-        let _ = write!(s, "{b:02x}");
-    }
-    s
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
+    use wizard_shared::asset_resolver::hex_encode;
 
     #[test]
     fn verify_sha256_matches_correct_hash() {
@@ -408,5 +309,39 @@ mod tests {
             ),
             "unexpected platform {plat:?}"
         );
+    }
+
+    #[test]
+    fn proxy_base_honours_legacy_wizard_env_fallback() {
+        // The legacy `ROOMLER_TUNNEL_WIZARD_PROXY_BASE` fallback at
+        // `proxy_base()` had NO coverage before P4a — lock it now
+        // (the P4a wrapper must preserve the 2-var chain verbatim).
+        // No other test in this crate touches these two vars, so the
+        // process-global env mutation can't race.
+        //
+        // SAFETY: single test mutating two vars exclusive to it;
+        // restored before the test returns.
+        unsafe {
+            std::env::remove_var("ROOMLER_TUNNEL_CLI_PROXY_BASE");
+            std::env::set_var(
+                "ROOMLER_TUNNEL_WIZARD_PROXY_BASE",
+                "https://legacy.local/api/tunnel-wizard/",
+            );
+        }
+        let via_legacy = proxy_base();
+        // Primary var wins over the legacy alias when both are set.
+        unsafe {
+            std::env::set_var(
+                "ROOMLER_TUNNEL_CLI_PROXY_BASE",
+                "https://primary.local/api/tunnel/installer",
+            );
+        }
+        let via_primary = proxy_base();
+        unsafe {
+            std::env::remove_var("ROOMLER_TUNNEL_CLI_PROXY_BASE");
+            std::env::remove_var("ROOMLER_TUNNEL_WIZARD_PROXY_BASE");
+        }
+        assert_eq!(via_legacy, "https://legacy.local/api/tunnel-wizard");
+        assert_eq!(via_primary, "https://primary.local/api/tunnel/installer");
     }
 }
