@@ -556,15 +556,16 @@ fn peer_presence_is_signaled() -> bool {
 /// Anything else (including unset) → false.
 #[cfg(all(feature = "system-context", target_os = "windows"))]
 fn system_swap_enabled() -> bool {
-    match std::env::var("ROOMLER_AGENT_ENABLE_SYSTEM_SWAP") {
-        Ok(v) => {
+    use tunnel_core::env::node_env;
+    match node_env("ENABLE_SYSTEM_SWAP") {
+        Some(v) => {
             let t = v.trim();
             t.eq_ignore_ascii_case("1")
                 || t.eq_ignore_ascii_case("true")
                 || t.eq_ignore_ascii_case("yes")
                 || t.eq_ignore_ascii_case("on")
         }
-        Err(_) => false,
+        None => false,
     }
 }
 

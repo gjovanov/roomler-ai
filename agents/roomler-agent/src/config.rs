@@ -8,7 +8,6 @@
 //! the file at mode 0600; on Linux/macOS we set that permission on write.
 
 use anyhow::{Context, Result};
-use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -386,8 +385,8 @@ fn default_auto_grant_session() -> bool {
 }
 
 pub fn default_config_path() -> Result<PathBuf> {
-    let dirs = ProjectDirs::from("live", "roomler", "roomler-agent")
-        .context("could not resolve a platform config directory")?;
+    let dirs =
+        crate::appdirs::project_dirs().context("could not resolve a platform config directory")?;
     Ok(dirs.config_dir().join("config.toml"))
 }
 
@@ -411,12 +410,7 @@ pub fn default_config_path() -> Result<PathBuf> {
 /// fallback used elsewhere in the crate).
 #[cfg(target_os = "windows")]
 pub fn machine_global_config_path() -> PathBuf {
-    let base = std::env::var_os("PROGRAMDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
-    base.join("roomler")
-        .join("roomler-agent")
-        .join("config.toml")
+    crate::appdirs::machine_global_dir().join("config.toml")
 }
 
 pub fn load(path: &PathBuf) -> Result<AgentConfig> {

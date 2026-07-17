@@ -265,16 +265,7 @@ pub fn crashes_dir_for(ctx: WriterContext) -> std::io::Result<PathBuf> {
 
 #[cfg(target_os = "windows")]
 fn supervisor_crashes_dir() -> std::io::Result<PathBuf> {
-    let programdata = std::env::var_os("ProgramData").ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "%PROGRAMDATA% env-var missing",
-        )
-    })?;
-    Ok(PathBuf::from(programdata)
-        .join("roomler")
-        .join("roomler-agent")
-        .join("crashes"))
+    Ok(crate::appdirs::machine_global_dir().join("crashes"))
 }
 
 #[cfg(not(target_os = "windows"))]

@@ -67,6 +67,17 @@ jobs:
           cargo build -p roomler-agent --release `
             --features "mf-encoder,scrap-capture,openh264-encoder,enigo-input,clipboard,viewer-indicator,system-context"
 
+      - name: Stage roomler-agent.exe compatibility alias (P3d Slice B)
+        shell: pwsh
+        run: |
+          # P3d Slice B renamed the daemon OUTPUT binary roomler-agent.exe ->
+          # roomlerd.exe. wix/main.wxs ships an INERT `AgentExeAlias` <File
+          # Source='target\release\roomler-agent.exe'>, so cargo-wix's harvest
+          # below needs that copy present. (This smoke's install-path assertion
+          # also verifies the alias lands as roomler-agent.exe.)
+          Copy-Item target\release\roomlerd.exe target\release\roomler-agent.exe -Force
+          Write-Host "Staged roomler-agent.exe alias next to roomlerd.exe for the WiX AgentExeAlias component"
+
       - name: Stage wintun.dll for the MSI bundle
         shell: pwsh
         run: |
