@@ -35,6 +35,11 @@ path = "src/main.rs"
 # a problem.
 roomler-agent = { path = "../roomler-agent" }
 
+# P4a: shared wizard mechanics (MSI runner today; asset resolver next)
+# extracted to the setup core; this legacy crate re-exports them
+# path-compatibly until P4c retires it.
+roomler-setup-core = { path = "../../crates/roomler-setup-core" }
+
 # Tauri 2.x runtime. NO `tray-icon` feature — the wizard is a
 # foreground window, exits on Finish/Cancel. `custom-protocol` is
 # REQUIRED for `cargo build --release` to embed the front-end assets
@@ -84,16 +89,9 @@ gethostname = "0.5"
 # `%LOCALAPPDATA%\roomler\roomler-installer\` on Windows).
 directories = { workspace = true }
 
-[target.'cfg(target_os = "windows")'.dependencies]
-# `OpenProcess` + `WaitForSingleObject` + `GetExitCodeProcess` +
-# `TerminateProcess` for the `msi_runner` module's synchronous wait
-# on msiexec (B3 fix from the rc.27/rc.28 plan critique). Reuses the
-# same windows-sys version + feature flags as the agent crate.
-windows-sys = { version = "0.59", features = [
-    "Win32_Foundation",
-    "Win32_System_Threading",
-    "Win32_UI_Shell",
-] }
+# (windows-sys dropped in P4a — its only consumer here was msi_runner,
+# which moved to roomler-setup-core along with the feature list it
+# actually uses.)
 
 [dev-dependencies]
 tempfile = { workspace = true }
