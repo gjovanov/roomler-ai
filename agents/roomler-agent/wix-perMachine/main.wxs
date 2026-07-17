@@ -14,10 +14,12 @@
   Differences vs the per-user main.wxs:
 
     1. InstallScope='perMachine'. Files land under %ProgramFiles%
-       \roomler-agent. UAC prompt fires on install + uninstall.
-       Operators on a managed fleet typically install perMachine
-       silently via group policy / Intune so the prompt is invisible
-       to end users.
+       \Roomler (P4b: renamed from roomler-agent — the node-stack
+       unification's ONE install folder; the cleanup-legacy-install
+       CA sweeps the vacated dir on upgrade). UAC prompt fires on
+       install + uninstall. Operators on a managed fleet typically
+       install perMachine silently via group policy / Intune so the
+       prompt is invisible to end users.
 
     2. Different UpgradeCode GUID. The per-user and per-machine MSIs
        see each other as completely separate products. To prevent
@@ -90,11 +92,13 @@
         <Property Id='DiskPrompt' Value='Roomler Agent Installation' />
 
         <Directory Id='TARGETDIR' Name='SourceDir'>
-            <!-- Per-Machine install under %ProgramFiles%\roomler-agent.
+            <!-- Per-Machine install under %ProgramFiles%\Roomler (P4b:
+                 renamed from roomler-agent; UpgradeCode unchanged, so
+                 MajorUpgrade still removes the old-folder product first).
                  Components can use the file itself as KeyPath; no HKCU
                  dance needed because ProgramFiles is system-scoped. -->
             <Directory Id='ProgramFiles64Folder'>
-                <Directory Id='APPLICATIONFOLDER' Name='roomler-agent'>
+                <Directory Id='APPLICATIONFOLDER' Name='Roomler'>
                     <!-- P3d Slice B: the daemon EXE is now `roomlerd.exe`. File
                          Id stays `roomler_agent_exe` so every <CustomAction
                          FileKey='roomler_agent_exe'> (RegisterService,
@@ -137,6 +141,35 @@
                             DiskId='1'
                             KeyPath='yes'
                             Source='target\release\roomler-agent.exe' />
+                    </Component>
+                    <!-- P4b: the tunnel CLI ships INSIDE the daemon MSI
+                         (node-stack unification Option A — the MSI is the
+                         one updater for the whole stack; daemon installs
+                         subsume the CLI). Same component appends the
+                         install dir to the SYSTEM PATH so `roomler` works
+                         in any new shell for every user. PATH lives and
+                         dies with the CLI file; Part='last' + implicit
+                         Permanent='no' removes only our segment on
+                         uninstall, and msiexec broadcasts WM_SETTINGCHANGE
+                         itself. The workflow builds
+                         target\release\roomler.exe via
+                         `cargo build -p roomler-tunnel [dash][dash]release`
+                         before cargo-wix runs. Keys off the file itself
+                         like its siblings (system-scoped dir). -->
+                    <Component Id='TunnelExe' Guid='833F7BA5-4323-403A-BBC5-B77C42E9F27A' Win64='yes'>
+                        <File
+                            Id='roomler_tunnel_cli_exe'
+                            Name='roomler.exe'
+                            DiskId='1'
+                            KeyPath='yes'
+                            Source='target\release\roomler.exe' />
+                        <Environment
+                            Id='TunnelPathEnvPerMachine'
+                            Name='PATH'
+                            Value='[APPLICATIONFOLDER]'
+                            Part='last'
+                            Action='set'
+                            System='yes' />
                     </Component>
                     <Component Id='LicenseTxt' Guid='7F506C34-8B4E-503D-9F6E-AF3D4F607B15' Win64='yes'>
                         <File
@@ -230,6 +263,8 @@
             <ComponentRef Id='AgentExe' />
             <!-- P3d Slice B: inert `roomler-agent.exe` compatibility alias. -->
             <ComponentRef Id='AgentExeAlias' />
+            <!-- P4b: tunnel CLI + system-PATH append. -->
+            <ComponentRef Id='TunnelExe' />
             <ComponentRef Id='LicenseTxt' />
             <ComponentRef Id='ReadmeTxt' />
             <ComponentRef Id='WintunDll' />
@@ -372,9 +407,17 @@
                 NOT (REMOVE="ALL")
             </Custom>
             <!--
-              rc.18: scrub the perUser flavour AFTER the new EXE lands
-              but BEFORE RegisterService (the new SCM service takes
-              over). Skip during uninstall.
+              rc.18: scrub stale artefacts AFTER the new EXE lands
+              (so we can shell out to it). NB both this and
+              RegisterService are After='InstallFiles'; WiX v3 breaks
+              the tie in DOCUMENT order, so RegisterService actually
+              runs FIRST (an earlier comment here claimed the
+              opposite). Ordering is immaterial: the helper's
+              CA-reachable step only sweeps the vacated pre-rename
+              install dir (P4b), and its cross-flavour arms — which
+              touch the other flavour's task/service namespace — are
+              never reached from the CA (same-flavour fast path; see
+              install_cleanup.rs module docs). Skip during uninstall.
             -->
             <Custom Action='CleanupLegacyPerUser' After='InstallFiles'>
                 NOT (REMOVE="ALL")

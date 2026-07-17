@@ -9,20 +9,25 @@ them.
 
 Installation
 ------------
-This installer placed `roomler-agent.exe` at:
+This installer placed the daemon `roomlerd.exe` (plus a
+`roomler-agent.exe` compatibility alias and the `roomler` tunnel CLI)
+at:
 
-    %LOCALAPPDATA%\Programs\roomler-agent\roomler-agent.exe
+    %LOCALAPPDATA%\Programs\Roomler\roomlerd.exe
+    %LOCALAPPDATA%\Programs\Roomler\roomler.exe
 
-No admin rights were required (per-user install, no UAC).
+The install directory is appended to your user PATH, so `roomler`
+and `roomlerd` work from any NEW terminal. No admin rights were
+required (per-user install, no UAC).
 
 Configuration is stored under `%APPDATA%\roomler-agent\` once you run
-`roomler-agent enroll`.
+the enroll step below.
 
 First-time setup
 ----------------
 Open PowerShell (no need to run as administrator) and run:
 
-    $agent = "$env:LOCALAPPDATA\Programs\roomler-agent\roomler-agent.exe"
+    $agent = "$env:LOCALAPPDATA\Programs\Roomler\roomlerd.exe"
 
     # 1. Generate an enrollment JWT in the admin UI at
     #    http://roomler.ai/ (Admin -> Agents -> New agent).
@@ -108,7 +113,7 @@ Two ways to get there:
       roomler-agent-<version>-x86_64-pc-windows-msvc.msi
       roomler-agent-<version>-perMachine-x86_64-pc-windows-msvc.msi
   The per-Machine MSI installs files under %ProgramFiles%
-  \roomler-agent and auto-registers the SCM service via a deferred
+  \Roomler and auto-registers the SCM service via a deferred
   custom action. UAC fires once during install. Single
   msiexec invocation, no elevated-PS follow-up. Recommended for
   managed-fleet deployments via group policy / Intune.
@@ -123,7 +128,7 @@ Two ways to get there:
   promote to service mode. Open an elevated PowerShell ("Terminal
   (Admin)"):
 
-    & "$env:LOCALAPPDATA\Programs\roomler-agent\roomler-agent.exe" `
+    & "$env:LOCALAPPDATA\Programs\Roomler\roomlerd.exe" `
         service install --as-service
 
 The SCM service supervises a per-session worker via WTSQueryUserToken
