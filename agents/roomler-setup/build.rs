@@ -4,13 +4,12 @@
 //
 // Also drops placeholder icons (`icons/icon.ico`, `icons/icon.png`)
 // at build time so a fresh `cargo build` works without committing
-// binary blobs. The CI release pipeline (`release-tunnel.yml`'s
-// wizard matrix) overwrites these with the real branded icons before
-// invoking `cargo build --release`.
+// binary blobs. The CI release pipeline (`release-setup.yml`) can
+// overwrite these with real branded icons before invoking
+// `cargo build --release`.
 //
-// Byte arrays mirror the agent installer's build.rs verbatim — same
-// 1×1 black .ico and 1×1 .png. See agents/roomler-installer/build.rs
-// for the original write-up.
+// Byte arrays are the smallest valid 1×1 black .ico and 1×1 .png
+// (inherited verbatim from the retired legacy wizards' build.rs).
 
 use std::fs;
 use std::path::Path;

@@ -1,8 +1,9 @@
 //! Tunnel-client install orchestrator (`cmd_install` with
 //! [`Role::TunnelClient`]).
 //!
-//! Relocated from `agents/roomler-tunnel-installer/src/
-//! install_orchestrator.rs` with the P4a adaptations: unified
+//! Relocated (P4a) from the legacy tunnel wizard's
+//! install_orchestrator.rs (crate retired in P4c-2) with these
+//! adaptations: unified
 //! `wizard_shared::progress::ProgressEvent` wire shape, mechanics via
 //! `wizard_shared::{asset_resolver, extract, integration,
 //! tunnel_enroll}` called directly with this app's identity
