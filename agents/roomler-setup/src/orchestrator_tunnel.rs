@@ -267,6 +267,9 @@ async fn run_install_inner(
         // Daemon-role concept ("the MSI also delivered the CLI") —
         // not applicable when the CLI IS the install.
         cli_included: None,
+        // roomler-desktop is a daemon-role companion; the tunnel role
+        // doesn't place it.
+        desktop_installed: None,
     })
 }
 
