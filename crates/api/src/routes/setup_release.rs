@@ -1,22 +1,16 @@
-//! `/api/setup/*` + legacy `/api/tunnel-wizard/*` — cached
-//! GitHub-Releases proxy for the installer-wizard EXEs. Renamed from
-//! `tunnel_wizard_release.rs` in P4b (node-stack unification).
+//! `/api/setup/*` — cached GitHub-Releases proxy for the unified
+//! `roomler-setup` wizard (tag `setup-v*`, asset prefix
+//! `roomler-setup-`) plus the terminal installers
+//! `/api/setup/install.{sh,ps1}`. Renamed from
+//! `tunnel_wizard_release.rs` in P4b; the legacy `/api/tunnel-wizard/*`
+//! family it also served was retired in P4c-2 (its release family
+//! stopped at tunnel-wizard-v0.3.0-rc.59 and had been 404ing off the
+//! release-page window for months).
 //!
-//! Two endpoint families share ONE release cache (same repo, same
-//! upstream fetch — the cache holds the mixed tag list and each
-//! family filters its own prefix):
-//!
-//!   - `GET /api/setup/{latest-release,{platform}/health,{platform}}`
-//!     — P4b: the unified `roomler-setup` wizard (tag `setup-v*`,
-//!     asset prefix `roomler-setup-`). Ships DARK until P4c tags the
-//!     first `setup-v*` release: latest-release returns a filtered
-//!     (empty) list, health/download 404 cleanly.
-//!   - `GET /api/tunnel-wizard/…` — the legacy
-//!     `roomler-tunnel-installer` wizard (tag `tunnel-wizard-v*`,
-//!     asset prefix `roomler-tunnel-installer-`). Wire behaviour
-//!     preserved verbatim until P4c retires the crate + routes (NB
-//!     its `latest-release` deliberately keeps returning the
-//!     UNFILTERED mixed list — behaviour-frozen).
+//! `GET /api/setup/{latest-release,{platform}/health,{platform}}` —
+//! latest-release returns the `setup-v*`-filtered list; health
+//! resolves a platform asset manifest; the bare platform route
+//! streams the artifact bytes.
 //!
 //! Parallel to [`crate::routes::tunnel_release`] (bare CLI tarball)
 //! and [`crate::routes::agent_release`] (agent MSIs).
@@ -48,13 +42,12 @@ const RELEASES_REPO: &str = "gjovanov/roomler-ai";
 const CACHE_TTL: Duration = Duration::from_secs(60 * 60);
 
 /// GitHub page size. 100 (the API max) rather than the old 30:
-/// `agent-v*` tags ship several times a day, so a rarely-tagged
-/// family (`tunnel-wizard-v*`, `setup-v*`) falls off a 30-deep first
-/// page within days — observed: tunnel-wizard-v0.3.0-rc.59
-/// (2026-05-25) was long gone from the top 30 by P4b, so the legacy
-/// health/download endpoints were already 404ing. One page of 100
-/// buys weeks of agent cadence; a per-family fetch is the P4c
-/// follow-up if that ever becomes insufficient.
+/// `agent-v*` tags ship several times a day, so the rarely-tagged
+/// `setup-v*` family falls off a 30-deep first page within days
+/// (observed with the retired tunnel-wizard family, whose last tag
+/// was long gone from the top 30 within weeks). One page of 100
+/// buys weeks of agent cadence; a per-family fetch is the follow-up
+/// if that ever becomes insufficient.
 const RELEASES_PER_PAGE: usize = 100;
 
 struct CacheEntry {
@@ -62,11 +55,11 @@ struct CacheEntry {
     payload: Vec<AgentRelease>,
 }
 
-pub struct LatestTunnelWizardReleaseCache {
+pub struct LatestSetupReleaseCache {
     inner: RwLock<Option<CacheEntry>>,
 }
 
-impl LatestTunnelWizardReleaseCache {
+impl LatestSetupReleaseCache {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             inner: RwLock::new(None),
@@ -95,79 +88,10 @@ pub struct InstallerHealth {
     pub uri: String,
 }
 
-/// `GET /api/tunnel-wizard/latest-release` — same wire shape as the
-/// CLI / agent latest-release endpoints. Returns ALL recent releases
-/// (mixed tag families) so a caller can grep for `tunnel-wizard-v*`
-/// themselves if needed.
-pub async fn latest_release(
-    State(state): State<AppState>,
-) -> Result<Json<Vec<AgentRelease>>, ApiError> {
-    let releases = ensure_releases_cached(&state).await?;
-    Ok(Json(releases))
-}
+// ─── /api/setup — the unified roomler-setup wizard ──────────────────────────
 
-/// `GET /api/tunnel-wizard/{platform}/health` — manifest for the
-/// wizard EXE matching the requested platform + version.
-pub async fn installer_health(
-    State(state): State<AppState>,
-    Path(platform): Path<String>,
-    Query(params): Query<InstallerQuery>,
-) -> Result<Json<InstallerHealth>, ApiError> {
-    let normalised = normalise_platform(&platform)?;
-    let releases = ensure_releases_cached(&state).await?;
-    let release =
-        pick_release_for(&releases, &params.version, "tunnel-wizard-v").ok_or_else(|| {
-            ApiError::NotFound(format!("no release matching version={}", params.version))
-        })?;
-    let asset = pick_wizard_asset(&release.assets, normalised).ok_or_else(|| {
-        ApiError::NotFound(format!(
-            "no wizard asset for platform {} in tag {}",
-            normalised, release.tag_name
-        ))
-    })?;
-    Ok(Json(InstallerHealth {
-        tag: release.tag_name.clone(),
-        platform: normalised.to_string(),
-        filename: asset.name.clone(),
-        size: asset.size,
-        digest: asset.digest.clone(),
-        uri: format!(
-            "/api/tunnel-wizard/{}?version={}",
-            normalised, params.version
-        ),
-    }))
-}
-
-/// `GET /api/tunnel-wizard/{platform}` — streams the wizard archive
-/// bytes. Content-Type derived from filename suffix.
-pub async fn installer_proxy(
-    State(state): State<AppState>,
-    Path(platform): Path<String>,
-    Query(params): Query<InstallerQuery>,
-) -> Result<Response, ApiError> {
-    let normalised = normalise_platform(&platform)?;
-    let releases = ensure_releases_cached(&state).await?;
-    let release =
-        pick_release_for(&releases, &params.version, "tunnel-wizard-v").ok_or_else(|| {
-            ApiError::NotFound(format!("no release matching version={}", params.version))
-        })?;
-    let asset = pick_wizard_asset(&release.assets, normalised).ok_or_else(|| {
-        ApiError::NotFound(format!(
-            "no wizard asset for platform {} in tag {}",
-            normalised, release.tag_name
-        ))
-    })?;
-
-    stream_asset(asset).await
-}
-
-// ─── /api/setup — the unified roomler-setup wizard (P4b, dark until P4c) ────
-
-/// `GET /api/setup/latest-release` — recent `setup-v*` releases ONLY.
-/// Unlike the legacy tunnel-wizard endpoint above (whose unfiltered
-/// mixed-list shape is behaviour-frozen until P4c), this filters
-/// server-side so the family is genuinely dark — an empty list, not
-/// a mixed one — until the first `setup-v*` tag exists.
+/// `GET /api/setup/latest-release` — recent `setup-v*` releases ONLY
+/// (filtered server-side from the mixed tag list the cache holds).
 pub async fn setup_latest_release(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<AgentRelease>>, ApiError> {
@@ -236,8 +160,7 @@ pub async fn setup_installer_proxy(
 }
 
 /// Pick the unified-wizard asset for a platform. Asset naming follows
-/// the (P4c) release-setup.yml matrix, mirroring the tunnel-wizard
-/// conventions with the `roomler-setup-` prefix:
+/// the release-setup.yml matrix with the `roomler-setup-` prefix:
 ///   - linux-x86_64 — `roomler-setup-*-x86_64-unknown-linux-gnu.tar.gz`
 ///   - macos — `roomler-setup-*-universal-apple-darwin.tar.gz`
 ///   - windows-x86_64 — `roomler-setup-*-x86_64-pc-windows-msvc.zip`
@@ -298,8 +221,7 @@ pub async fn install_script_ps1() -> Response {
 }
 
 /// Stream a release asset's bytes through the proxy with download
-/// headers. Shared by the legacy tunnel-wizard proxy and the P4b
-/// `/api/setup` proxy (extracted verbatim from the former).
+/// headers.
 async fn stream_asset(asset: &AgentReleaseAsset) -> Result<Response, ApiError> {
     let client = reqwest::Client::builder()
         .user_agent(concat!("roomler-ai-api/", env!("CARGO_PKG_VERSION")))
@@ -374,9 +296,7 @@ fn normalise_platform(s: &str) -> Result<&'static str, ApiError> {
 
 /// Pick a release for a given tag family. `version == "latest"`
 /// prefers stable over prerelease within the family; an explicit
-/// version matches with or without the family prefix. Generalised in
-/// P4b from the tunnel-wizard-only original so `/api/setup` reuses
-/// it with the `setup-v` prefix.
+/// version matches with or without the family prefix.
 fn pick_release_for<'a>(
     releases: &'a [AgentRelease],
     version: &str,
@@ -400,41 +320,8 @@ fn pick_release_for<'a>(
     }
 }
 
-/// Pick the wizard asset matching the requested platform. Asset
-/// naming conventions follow `release-tunnel.yml`'s wizard matrix:
-///   - linux-x86_64 — `roomler-tunnel-installer-*-x86_64-unknown-linux-gnu.tar.gz`
-///   - macos — `roomler-tunnel-installer-*-universal-apple-darwin.tar.gz`
-///   - windows-x86_64 — `roomler-tunnel-installer-*-x86_64-pc-windows-msvc.zip`
-///     (with `roomler-tunnel-installer.exe` inside).
-///
-/// The wizard's filename always starts with `roomler-tunnel-installer-`
-/// so the matcher can disambiguate from the CLI tarball, which uses
-/// `roomler-tunnel-` (no `installer-` segment).
-pub fn pick_wizard_asset<'a>(
-    assets: &'a [AgentReleaseAsset],
-    platform: &str,
-) -> Option<&'a AgentReleaseAsset> {
-    assets.iter().find(|a| {
-        let name = a.name.to_ascii_lowercase();
-        if name.ends_with(".sha256") {
-            return false;
-        }
-        if !name.starts_with("roomler-tunnel-installer-") {
-            return false;
-        }
-        match platform {
-            "linux-x86_64" => {
-                name.contains("x86_64-unknown-linux-gnu") && name.ends_with(".tar.gz")
-            }
-            "macos" => name.contains("universal-apple-darwin") && name.ends_with(".tar.gz"),
-            "windows-x86_64" => name.contains("x86_64-pc-windows-msvc") && name.ends_with(".zip"),
-            _ => false,
-        }
-    })
-}
-
 async fn ensure_releases_cached(state: &AppState) -> Result<Vec<AgentRelease>, ApiError> {
-    let cache = state.tunnel_wizard_release_cache.clone();
+    let cache = state.setup_release_cache.clone();
     {
         let g = cache.inner.read().await;
         if let Some(entry) = g.as_ref()
@@ -467,12 +354,12 @@ async fn ensure_releases_cached(state: &AppState) -> Result<Vec<AgentRelease>, A
             if let Some(entry) = g.as_ref() {
                 tracing::warn!(
                     status = %r.status(),
-                    "tunnel-wizard releases upstream returned non-success; serving stale cache"
+                    "setup releases upstream returned non-success; serving stale cache"
                 );
                 return Ok(entry.payload.clone());
             }
             return Err(ApiError::Internal(format!(
-                "tunnel-wizard releases upstream returned {}",
+                "setup releases upstream returned {}",
                 r.status()
             )));
         }
@@ -481,12 +368,12 @@ async fn ensure_releases_cached(state: &AppState) -> Result<Vec<AgentRelease>, A
             if let Some(entry) = g.as_ref() {
                 tracing::warn!(
                     %e,
-                    "tunnel-wizard releases upstream fetch errored; serving stale cache"
+                    "setup releases upstream fetch errored; serving stale cache"
                 );
                 return Ok(entry.payload.clone());
             }
             return Err(ApiError::Internal(format!(
-                "tunnel-wizard releases upstream fetch failed: {e}"
+                "setup releases upstream fetch failed: {e}"
             )));
         }
     };
@@ -536,7 +423,7 @@ mod tests {
         // The wizard EXE isn't packaged as a .deb (operators run it
         // interactively, not via dpkg). Reject the alias outright so
         // a confused caller gets a clear error instead of a 404 on
-        // pick_wizard_asset.
+        // pick_setup_asset.
         assert!(normalise_platform("linux-deb").is_err());
         assert!(normalise_platform("deb").is_err());
     }
@@ -548,86 +435,22 @@ mod tests {
     }
 
     #[test]
-    fn pick_wizard_asset_requires_installer_prefix() {
-        // CLI tarball matches the triple but lacks the `installer-`
-        // segment; wizard pick must refuse it so a misconfigured CI
-        // matrix can't accidentally serve the wrong binary as the
-        // wizard.
-        let assets = vec![
-            asset("roomler-tunnel-0.3.0-x86_64-pc-windows-msvc.zip"),
-            asset("roomler-tunnel-installer-0.3.0-x86_64-pc-windows-msvc.zip"),
-        ];
-        let picked = pick_wizard_asset(&assets, "windows-x86_64").unwrap();
-        assert!(picked.name.contains("installer"));
-    }
-
-    #[test]
-    fn pick_wizard_asset_matches_by_triple_and_suffix() {
-        let assets = vec![
-            asset("roomler-tunnel-installer-0.3.0-x86_64-unknown-linux-gnu.tar.gz"),
-            asset("roomler-tunnel-installer-0.3.0-x86_64-unknown-linux-gnu.tar.gz.sha256"),
-            asset("roomler-tunnel-installer-0.3.0-universal-apple-darwin.tar.gz"),
-            asset("roomler-tunnel-installer-0.3.0-x86_64-pc-windows-msvc.zip"),
-        ];
-        assert_eq!(
-            pick_wizard_asset(&assets, "linux-x86_64").unwrap().name,
-            "roomler-tunnel-installer-0.3.0-x86_64-unknown-linux-gnu.tar.gz"
-        );
-        assert_eq!(
-            pick_wizard_asset(&assets, "macos").unwrap().name,
-            "roomler-tunnel-installer-0.3.0-universal-apple-darwin.tar.gz"
-        );
-        assert_eq!(
-            pick_wizard_asset(&assets, "windows-x86_64").unwrap().name,
-            "roomler-tunnel-installer-0.3.0-x86_64-pc-windows-msvc.zip"
-        );
-    }
-
-    #[test]
-    fn pick_wizard_asset_skips_sha256_sidecars() {
-        let assets = vec![asset(
-            "roomler-tunnel-installer-0.3.0-x86_64-pc-windows-msvc.zip.sha256",
-        )];
-        assert!(pick_wizard_asset(&assets, "windows-x86_64").is_none());
-    }
-
-    #[test]
-    fn pick_release_latest_filters_to_tunnel_wizard_tags() {
-        let releases = vec![
-            release("agent-v0.3.0-rc.46", true, &[]),
-            release("tunnel-v0.3.0-rc.46", false, &[]),
-            release(
-                "tunnel-wizard-v0.3.0-rc.1",
-                false,
-                &["roomler-tunnel-installer-0.3.0-x86_64-pc-windows-msvc.zip"],
-            ),
-            release("tunnel-wizard-v0.3.0-rc.2-pre", true, &[]),
-        ];
-        let picked = pick_release_for(&releases, "latest", "tunnel-wizard-v").unwrap();
-        assert_eq!(picked.tag_name, "tunnel-wizard-v0.3.0-rc.1");
-    }
-
-    #[test]
     fn pick_release_latest_falls_back_to_prerelease_when_no_stable() {
         let releases = vec![
-            release("tunnel-wizard-v0.3.0-rc.1", true, &[]),
+            release("setup-v0.3.0-rc.1", true, &[]),
             release("agent-v0.3.0", false, &[]),
         ];
-        let picked = pick_release_for(&releases, "latest", "tunnel-wizard-v").unwrap();
-        assert_eq!(picked.tag_name, "tunnel-wizard-v0.3.0-rc.1");
+        let picked = pick_release_for(&releases, "latest", "setup-v").unwrap();
+        assert_eq!(picked.tag_name, "setup-v0.3.0-rc.1");
     }
 
     #[test]
     fn pick_release_specific_version_accepts_with_or_without_prefix() {
-        let releases = vec![release("tunnel-wizard-v0.3.0-rc.1", false, &[])];
-        assert!(pick_release_for(&releases, "0.3.0-rc.1", "tunnel-wizard-v").is_some());
-        assert!(
-            pick_release_for(&releases, "tunnel-wizard-v0.3.0-rc.1", "tunnel-wizard-v").is_some()
-        );
-        assert!(pick_release_for(&releases, "0.99.0", "tunnel-wizard-v").is_none());
+        let releases = vec![release("setup-v0.3.0-rc.1", false, &[])];
+        assert!(pick_release_for(&releases, "0.3.0-rc.1", "setup-v").is_some());
+        assert!(pick_release_for(&releases, "setup-v0.3.0-rc.1", "setup-v").is_some());
+        assert!(pick_release_for(&releases, "0.99.0", "setup-v").is_none());
     }
-
-    // ── P4b /api/setup family ─────────────────────────────────────
 
     #[test]
     fn pick_release_for_setup_prefix_ignores_other_families() {

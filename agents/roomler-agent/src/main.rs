@@ -2231,10 +2231,14 @@ fn peer_presence_status_cmd() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    //! Locks the contract that the rc.30 installer wizard's Done-page
-    //! snippet relies on. If any of these parses break, the snippet at
-    //! `agents/roomler-installer/src/front/index.html:182` becomes a
-    //! dead-code instruction in operator hands.
+    //! Locks the CLI parses that wizard Done-page snippets rely on:
+    //! the unified roomler-setup wizard surfaces
+    //! `roomler-agent disable-system-context`
+    //! (`agents/roomler-setup/src/front/index.html`, SystemContext
+    //! note), and the rc.30-era operator snippet still in field hands
+    //! used `enable-system-context` / `set-service-env-var`. If any of
+    //! these parses break, those instructions go dead in operator
+    //! hands.
 
     use super::*;
     use clap::Parser;

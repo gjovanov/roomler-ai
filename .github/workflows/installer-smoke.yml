@@ -25,7 +25,6 @@ on:
     branches: [master]
     paths:
       - 'agents/roomler-agent/**'
-      - 'agents/roomler-installer/**'
       - '.github/workflows/installer-smoke.yml'
   workflow_dispatch: {}
 

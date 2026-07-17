@@ -13,10 +13,8 @@ members = [
 
     "agents/roomler-agent",
     "agents/roomler-agent-tray",
-    "agents/roomler-installer",
     "agents/roomler-setup",
     "agents/roomler-tunnel",
-    "agents/roomler-tunnel-installer",
 ]
 exclude = [
     # Vendored upstream (kept verbatim except the H265 payloader fix);

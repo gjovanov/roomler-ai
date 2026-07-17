@@ -1,8 +1,9 @@
 //! Daemon-role install orchestrator (`cmd_install` with a daemon
 //! [`Role`]) + force-kill plumbing.
 //!
-//! Relocated from `agents/roomler-installer/src/install_orchestrator.rs`
-//! (the rc.28 W6b pipeline) with the P4a adaptations: unified
+//! Relocated (P4a) from the legacy agent wizard's
+//! install_orchestrator.rs (rc.28 W6b pipeline; crate retired in
+//! P4c-2) with these adaptations: unified
 //! `wizard_shared::progress::ProgressEvent` wire shape, mechanics via
 //! `wizard_shared::{asset_resolver, msi_runner}` called directly with
 //! this app's identity ([`crate::proxy`]), the process-wide statics in
