@@ -23,9 +23,9 @@ const DEFAULT_AGENT_BASE: &str = "https://roomler.ai/api/agent/installer";
 
 /// Default proxy base for the tunnel-CLI archive endpoint family.
 /// NB: `/api/tunnel/installer` serves the `roomler-tunnel` CLI
-/// tarball; `/api/tunnel-wizard` serves the wizard EXE itself —
-/// pointing here at the latter makes the wizard install ITSELF
-/// (rc.60 bug, fixed rc.61).
+/// tarball; the (P4c-2-retired) `/api/tunnel-wizard` family served
+/// the wizard EXE itself — pointing here at the latter made the
+/// wizard install ITSELF (rc.60 bug, fixed rc.61).
 const DEFAULT_TUNNEL_BASE: &str = "https://roomler.ai/api/tunnel/installer";
 
 /// Resolve the daemon-MSI proxy base at runtime. Env override
@@ -63,7 +63,9 @@ fn normalise(raw: &str) -> String {
 /// starts with the `/api/...` path, so concatenation must not double
 /// up. Strips the canonical `/api/agent/installer` and `/api/tunnel/
 /// installer` suffixes plus the legacy `/api/tunnel-wizard` alias
-/// (unifying the two per-wizard strip fns); anything else passes
+/// (retired server-side in P4c-2; the strip stays as paste-tolerance
+/// for old URLs, unifying the two per-wizard strip fns); anything
+/// else passes
 /// through unchanged (custom env var without the path segment — e.g.
 /// a staging proxy that injects the path internally).
 pub fn origin_of(base: &str) -> String {

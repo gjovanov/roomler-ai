@@ -5,9 +5,10 @@
 // `wizard_app` lib. Merges the two legacy SPA drivers:
 //
 //   - role cards + cross-flavour ack gate + force-kill flow from the
-//     agent wizard (agents/roomler-installer/src/front/app.js)
+//     legacy agent wizard's SPA
 //   - the {type, data} adjacently-tagged ProgressEvent handling from
-//     the tunnel wizard (agents/roomler-tunnel-installer/src/front/)
+//     the legacy tunnel wizard's SPA
+//   (both legacy wizard crates retired in P4c-2)
 //
 // plus two NET-NEW patterns:
 //   - `cmd_install_progress_replay` fast-forward on the Install step

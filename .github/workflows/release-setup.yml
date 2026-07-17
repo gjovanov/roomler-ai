@@ -6,15 +6,14 @@ name: Release roomler-setup
 #   - macOS universal (x86_64 + aarch64 lipo'd) — packaged as `.tar.gz`
 #   - Windows x86_64 (msvc + webview2 auto-bootstrap) — SIGNED EXE in a `.zip`
 #
-# The unified wizard supersedes the two legacy wizard EXEs
-# (roomler-installer = agent/daemon, roomler-tunnel-installer = tunnel CLI).
-# On Windows it offers all roles (daemon perMachine-SCM / perUser-task /
-# perMachine + tunnel-client); on Linux/macOS only the tunnel-client
-# role is functional (the daemon roles are MSI-only) — so the
-# Linux/macOS build replaces the legacy 3-platform tunnel wizard.
+# The unified wizard superseded the two legacy wizard EXEs, retired
+# in P4c-2 (roomler-installer = agent/daemon, roomler-tunnel-installer
+# = tunnel CLI). On Windows it offers all roles (daemon perMachine-SCM
+# / perUser-task / perMachine + tunnel-client); on Linux/macOS only
+# the tunnel-client role is functional (the daemon roles are MSI-only).
 #
-# Tag schema: `setup-v<workspace_version>` — a NEW family, INDEPENDENT
-# of agent-v* / tunnel-v* / tunnel-wizard-v*. Workspace Cargo.toml
+# Tag schema: `setup-v<workspace_version>` — a family INDEPENDENT
+# of agent-v* / tunnel-v*. Workspace Cargo.toml
 # version is the source of truth (validate-version enforces it). The
 # api's `/api/setup/<platform>` proxy (routes/setup_release.rs) serves
 # the published assets via its 1h cache; `pick_setup_asset` requires

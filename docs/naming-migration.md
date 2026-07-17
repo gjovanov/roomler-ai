@@ -76,10 +76,14 @@ rename — same shim, no behaviour change.
   wizard for the first time — new `release-setup.yml` (3-platform, Windows
   signed-EXE-in-`.zip`), tag `setup-v*`, so the `/api/setup/*` routes (dark since
   P4b) go live; the two legacy wizard crates keep building as the safety net.
-  **P4c-2** (gated on ≥1 real field onboarding via the unified wizard) atomically
-  deletes both legacy wizard crates + `release-tunnel-wizard.yml` + the
-  `roomler-installer` companions build. NB the tunnel CLI **self-update is KEPT** —
-  it's the sole updater for tunnel-only hosts (the daemon roles get `roomler.exe`
-  refreshed by the MSI; "one updater" is per-role, not literally one). Deferred to
-  a later cleanup: dropping the legacy `/api/tunnel-wizard` route +
-  `find_tunnel_binary`'s legacy fallback, once telemetry confirms no callers.
+  **P4c-2** (gate met: perMachine-SystemContext field onboarding via the unified
+  wizard at setup-v0.3.0-rc.197, 2026-07-17 — **DONE**) deleted both legacy wizard
+  crates + `release-tunnel-wizard.yml` + the installer-EXE half of the
+  release-agent.yml companions job (the desktop companion build stays) + the
+  legacy `/api/tunnel-wizard/*` route family (its health/download endpoints had
+  already been 404ing off the release-page window for months). NB the tunnel CLI
+  **self-update is KEPT** — it's the sole updater for tunnel-only hosts (the
+  daemon roles get `roomler.exe` refreshed by the MSI; "one updater" is per-role,
+  not literally one). Still deferred: dropping `find_tunnel_binary`'s
+  legacy-name (`roomler-tunnel(.exe)`) fallback once the fleet is fully on
+  renamed archives.
