@@ -97,9 +97,56 @@
           </table>
         </div>
       </section>
+
+      <!-- P6: declared, daemon-supervised tunnel routes. -->
+      <section id="tunnels-view">
+        <h2>Tunnels</h2>
+        <p class="muted small">
+          Declared routes are supervised by the device service: they come back
+          on every restart until removed.
+        </p>
+
+        <p id="tn-empty" class="muted small" hidden>
+          No declared routes yet — add one below.
+        </p>
+        <table id="tn-table" class="peers" hidden>
+          <thead>
+            <tr><th>ID</th><th>Kind</th><th>Local</th><th>Remote</th><th>Node</th><th>State</th><th></th></tr>
+          </thead>
+          <tbody id="tn-body"></tbody>
+        </table>
+
+        <details id="tn-add">
+          <summary>Add route</summary>
+          <form id="tn-form" autocomplete="off">
+            <label>Target agent id
+              <input id="tn-agent" type="text" placeholder="24-hex agent id" required />
+            </label>
+            <label>Local port
+              <input id="tn-local" type="number" min="1" max="65535" required />
+            </label>
+            <label>Remote (host:port — leave empty for SOCKS5)
+              <input id="tn-remote" type="text" placeholder="10.0.0.5:5432" />
+            </label>
+            <label>Transport
+              <select id="tn-transport">
+                <option value="" selected>auto</option>
+                <option value="quic">quic</option>
+                <option value="webrtc">webrtc</option>
+              </select>
+            </label>
+            <label>Route id (optional)
+              <input id="tn-id" type="text" placeholder="generated when empty" />
+            </label>
+            <button type="submit" class="primary">Add route</button>
+            <p id="tn-form-error" class="error small" hidden></p>
+          </form>
+        </details>
+      </section>
     </main>
     <script src="status.js"></script>
     <script src="consent.js"></script>
     <script src="devices.js"></script>
+    <script src="tunnels.js"></script>
   </body>
 </html>

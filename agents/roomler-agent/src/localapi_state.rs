@@ -82,6 +82,10 @@ pub struct DaemonState {
     /// `peers()` to populate `rtt_ms`. Empty on a node without the netstack
     /// pinger (no prober runs) → `rtt_ms` stays `None`.
     rtt_cache: RttCache,
+    /// P6: the declared-route reconciler backing the `Route*` verbs.
+    /// `None` in unit tests / states built without one — the verbs then
+    /// report empty/unsupported via the trait defaults' semantics.
+    routes: Option<crate::tunnel::route_reconciler::RouteReconciler>,
 }
 
 impl DaemonState {
@@ -114,7 +118,16 @@ impl DaemonState {
             pinger,
             tunnel_hub,
             rtt_cache,
+            routes: None,
         }
+    }
+
+    /// Attach the declared-route reconciler (P6) so the `Route*` verbs are
+    /// live. Separate from `new` to keep the constructor's existing call
+    /// sites (incl. tests) unchanged.
+    pub fn with_routes(mut self, routes: crate::tunnel::route_reconciler::RouteReconciler) -> Self {
+        self.routes = Some(routes);
+        self
     }
 
     /// Resolve a `ping` target — a literal overlay IP (either family) or a peer
@@ -290,6 +303,46 @@ impl LocalApiState for DaemonState {
 
     fn kill_flow(&self, id: &str) -> bool {
         self.tunnel_hub.kill_flow(id)
+    }
+
+    fn route_list(&self) -> Vec<tunnel_core::localapi::RouteInfo> {
+        self.routes.as_ref().map(|r| r.list()).unwrap_or_default()
+    }
+
+    async fn route_add(&self, route: tunnel_core::localapi::RouteDescriptor) -> Response {
+        let Some(routes) = self.routes.as_ref() else {
+            return Response::Error {
+                message: "declared routes are not available on this daemon".into(),
+            };
+        };
+        match routes.add(route).await {
+            Ok(route) => Response::RouteAdded { route },
+            Err(message) => Response::Error { message },
+        }
+    }
+
+    async fn route_remove(&self, id: &str) -> Response {
+        let Some(routes) = self.routes.as_ref() else {
+            return Response::Error {
+                message: "declared routes are not available on this daemon".into(),
+            };
+        };
+        match routes.remove(id).await {
+            Ok(ok) => Response::RouteRemoved { ok },
+            Err(message) => Response::Error { message },
+        }
+    }
+
+    async fn route_set_enabled(&self, id: &str, enabled: bool) -> Response {
+        let Some(routes) = self.routes.as_ref() else {
+            return Response::Error {
+                message: "declared routes are not available on this daemon".into(),
+            };
+        };
+        match routes.set_enabled(id, enabled).await {
+            Ok(ok) => Response::RouteUpdated { ok },
+            Err(message) => Response::Error { message },
+        }
     }
 }
 

@@ -1542,19 +1542,37 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     let rtt_cache: roomler_agent::localapi_state::RttCache =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let pinger_for_prober = netstack_pinger.clone();
+    // P6: the daemon-wide config-WRITE lock. Every daemon-side runtime
+    // writer of config.toml (route reconciler, clean-run promotion,
+    // graceful shutdown) holds it across load→mutate→save so one writer's
+    // full-struct save can't drop another's just-written field.
+    let cfg_write_lock: config::WriteLock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+    // P6: the declared-route reconciler — converges `[[tunnel_routes]]`
+    // from the loaded config into live hub flows, and backs the LocalAPI
+    // Route* verbs (persisting through the write lock).
+    let route_reconciler = roomler_agent::tunnel::route_reconciler::RouteReconciler::new(
+        tunnel_hub.clone(),
+        config_path.clone(),
+        cfg_write_lock.clone(),
+        cfg.tunnel_routes.clone(),
+    );
+    route_reconciler.spawn(shutdown_rx.clone());
     let localapi_state: std::sync::Arc<dyn tunnel_core::localapi::LocalApiState> =
-        std::sync::Arc::new(localapi_state::DaemonState::new(
-            cfg.agent_id.clone(),
-            cfg.machine_name.clone(),
-            tunnel_core::localapi::DaemonMode::Service,
-            (!cfg.tenant_id.is_empty()).then(|| cfg.tenant_id.clone()),
-            localapi_connected.clone(),
-            overlay_view_rx,
-            consent_broker.clone(),
-            netstack_pinger,
-            tunnel_hub.clone(),
-            rtt_cache.clone(),
-        ));
+        std::sync::Arc::new(
+            localapi_state::DaemonState::new(
+                cfg.agent_id.clone(),
+                cfg.machine_name.clone(),
+                tunnel_core::localapi::DaemonMode::Service,
+                (!cfg.tenant_id.is_empty()).then(|| cfg.tenant_id.clone()),
+                localapi_connected.clone(),
+                overlay_view_rx,
+                consent_broker.clone(),
+                netstack_pinger,
+                tunnel_hub.clone(),
+                rtt_cache.clone(),
+            )
+            .with_routes(route_reconciler),
+        );
     // P3b-3: the RTT prober — spawned only on a netstack node (pinger = Some).
     // Pings each carrier-reachable peer every RTT_PROBE_INTERVAL into rtt_cache;
     // exits on shutdown. A fresh `overlay_view_tx.subscribe()` receiver (the
@@ -1604,11 +1622,16 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         let path = config_path.clone();
         let mut shutdown = shutdown_rx.clone();
         let pkg = current_pkg.to_string();
+        let write_lock = cfg_write_lock.clone();
         async move {
             tokio::select! {
                 _ = tokio::time::sleep(std::time::Duration::from_secs(
                     config::CLEAN_RUN_THRESHOLD_SECS,
                 )) => {
+                    // P6: reload-modify-save under the daemon-wide write
+                    // lock so this save can't drop a route the LocalAPI
+                    // just persisted (and vice versa).
+                    let _write_guard = write_lock.lock().await;
                     match config::load(&path) {
                         Ok(mut current) => {
                             config::record_clean_run_at(&mut current, &pkg);
@@ -1702,10 +1725,16 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     // avoid clobbering any concurrent writes (clean_run_task may
     // have just promoted the version, in which case the unhealthy
     // flag is already false — load+save is a no-op).
-    if graceful_shutdown && let Ok(mut current) = config::load(config_path) {
-        config::mark_clean_shutdown(&mut current);
-        if let Err(e) = config::save(config_path, &current) {
-            tracing::warn!(error = %e, "could not mark clean shutdown");
+    if graceful_shutdown {
+        // P6: same daemon-wide write lock as the other runtime writers.
+        // The LocalAPI task is already aborted at this point, but the
+        // clean-run promotion task may still be mid-save.
+        let _write_guard = cfg_write_lock.lock().await;
+        if let Ok(mut current) = config::load(config_path) {
+            config::mark_clean_shutdown(&mut current);
+            if let Err(e) = config::save(config_path, &current) {
+                tracing::warn!(error = %e, "could not mark clean shutdown");
+            }
         }
     }
     Ok(())
