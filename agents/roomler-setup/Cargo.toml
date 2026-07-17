@@ -12,9 +12,9 @@ description = "Unified install + onboarding wizard for the Roomler daemon (Windo
 # `roomler_setup` would produce `roomler_setup-<hash>.exe` which UAC
 # refuses to launch from an unelevated `cargo test` with "os error
 # 740: The requested operation requires elevation". Same lesson as the
-# rc.28 agent wizard (lib `wizard_core`), the rc.59 tunnel wizard (lib
-# `tunnel_wizard_core`), and the P4a shared core (lib `wizard_shared`);
-# see agents/roomler-installer/Cargo.toml for the original write-up.
+# retired rc.28 agent wizard (lib `wizard_core`), the retired rc.59
+# tunnel wizard (lib `tunnel_wizard_core`), and the P4a shared core
+# (lib `wizard_shared`).
 name = "wizard_app"
 path = "src/lib.rs"
 
@@ -43,8 +43,8 @@ roomler-setup-core = { path = "../../crates/roomler-setup-core" }
 # detect_existing_install`, `jwt_introspect::parse_unverified`, and
 # `updater::spawn_installer_for_flavour_with_properties` directly as
 # lib calls. Transitively pulls the agent's heavy deps (webrtc-rs
-# etc.) — same trade-off the legacy wizards accepted; see
-# agents/roomler-installer/Cargo.toml for the rationale.
+# etc.) — same trade-off the legacy wizards accepted: a fatter EXE,
+# but the install pipeline stays lib-driven with no CLI shelling.
 roomler-agent = { path = "../roomler-agent" }
 
 # Lib dep on the tunnel CLI — the tunnel orchestrator reuses

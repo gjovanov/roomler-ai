@@ -401,8 +401,11 @@ mod content_disposition_tests {
     #[test]
     fn percent_itself_is_encoded() {
         // `%` is NOT an RFC 5987 attr-char, so a literal `%` in the
-        // source filename must come out as `%25`.
-        let (_, encoded) = sanitize_content_disposition_filename("50%off.txt");
+        // source filename must come out as `%25` — a name that LOOKS
+        // pre-encoded ("%50off.txt") double-encodes to "%2550off.txt"
+        // and round-trips back to the literal, closing the
+        // smuggle-a-percent-sequence hole.
+        let (_, encoded) = sanitize_content_disposition_filename("%50off.txt");
         assert!(encoded.contains("%2550off"));
     }
 }
