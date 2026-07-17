@@ -14,6 +14,7 @@
 
 #![allow(clippy::doc_lazy_continuation, clippy::doc_overindented_list_items)]
 
+pub mod asset_resolver;
 pub mod extract;
 pub mod integration;
 pub mod msi_runner;

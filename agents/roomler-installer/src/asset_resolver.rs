@@ -1,4 +1,12 @@
-//! MSI asset resolution + download.
+//! MSI asset resolution + download — legacy wrapper.
+//!
+//! P4a: the streaming mechanics moved to
+//! `wizard_shared::asset_resolver`; this wrapper keeps the wizard's
+//! identity — the `/api/agent/installer` proxy base + its env
+//! override, the `%TEMP%\roomler-installer` staging namespace, the
+//! historical `roomler-installer/<v>` User-Agent, and the
+//! `InstallerHealth` shape — so behaviour stays byte-identical while
+//! this legacy wizard ships. Retired with the crate in P4c.
 //!
 //! W4 in the rc.28 plan + BLOCKER-10 fix from the critique. The
 //! wizard hits roomler.ai's `/api/agent/installer/{flavour}` proxy
@@ -22,12 +30,23 @@
 //! domain. Local/staging testing only; production always uses
 //! `https://roomler.ai/api/agent/installer`.
 
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+
+pub use wizard_shared::asset_resolver::verify_sha256;
+
+/// Historical wire-visible User-Agent — preserved verbatim through
+/// the P4a extraction (the moved core fns take the UA as a
+/// parameter).
+const USER_AGENT: &str = concat!("roomler-installer/", env!("CARGO_PKG_VERSION"));
+
+/// Legacy wizards keep their step-boundary-only cancel granularity:
+/// the core `download` gained a mid-stream cancel check, and this
+/// never-true flag opts the shipped wizard out of it.
+static NEVER_CANCELLED: AtomicBool = AtomicBool::new(false);
 
 /// Default proxy base. Override via `ROOMLER_INSTALLER_PROXY_BASE`
 /// for staging / local-server testing.
@@ -69,29 +88,26 @@ pub struct InstallerHealth {
     pub uri: String,
 }
 
+impl From<wizard_shared::asset_resolver::ArtifactHealth> for InstallerHealth {
+    fn from(h: wizard_shared::asset_resolver::ArtifactHealth) -> Self {
+        InstallerHealth {
+            tag: h.tag,
+            flavour: h.target,
+            filename: h.filename,
+            size: h.size,
+            digest: h.digest,
+            uri: h.uri,
+        }
+    }
+}
+
 /// Fetch the JSON metadata for the matching MSI. Used by the wizard
 /// before kicking the download so the progress bar has a denominator
 /// and the wizard can pre-validate the SHA256 digest format.
 pub async fn resolve(flavour: &str, version: &str) -> Result<InstallerHealth> {
-    let url = format!("{}/{}/health?version={}", proxy_base(), flavour, version);
-    let client = reqwest::Client::builder()
-        .user_agent(concat!("roomler-installer/", env!("CARGO_PKG_VERSION")))
-        .timeout(Duration::from_secs(30))
-        .build()
-        .context("building reqwest client")?;
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .with_context(|| format!("GET {url}"))?;
-    if !resp.status().is_success() {
-        return Err(anyhow!(
-            "installer-health GET {url} returned {}",
-            resp.status()
-        ));
-    }
-    let health: InstallerHealth = resp.json().await.context("parsing installer-health JSON")?;
-    Ok(health)
+    let health =
+        wizard_shared::asset_resolver::resolve(&proxy_base(), flavour, version, USER_AGENT).await?;
+    Ok(health.into())
 }
 
 /// Stream the MSI bytes to `%TEMP%\roomler-installer\<tag>\<filename>`.
@@ -102,51 +118,19 @@ pub async fn resolve(flavour: &str, version: &str) -> Result<InstallerHealth> {
 /// Does NOT call `verify_sha256` itself — the caller chains them so
 /// the wizard's `cmd_install` orchestrator can emit a
 /// `DownloadVerified` ProgressEvent only after both succeed.
-pub async fn download<F: FnMut(u64)>(
-    health: &InstallerHealth,
-    mut on_progress: F,
-) -> Result<PathBuf> {
-    let dest_dir = std::env::temp_dir()
+pub async fn download<F: FnMut(u64)>(health: &InstallerHealth, on_progress: F) -> Result<PathBuf> {
+    let dest = std::env::temp_dir()
         .join("roomler-installer")
-        .join(&health.tag);
-    std::fs::create_dir_all(&dest_dir)
-        .with_context(|| format!("creating staging dir {}", dest_dir.display()))?;
-    let dest = dest_dir.join(&health.filename);
-
+        .join(&health.tag)
+        .join(&health.filename);
     let url = format!("{}{}", proxy_base_without_path_segment(), health.uri);
-    let client = reqwest::Client::builder()
-        .user_agent(concat!("roomler-installer/", env!("CARGO_PKG_VERSION")))
-        .timeout(Duration::from_secs(15 * 60)) // 15 min for slow networks
-        .build()
-        .context("building reqwest client")?;
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .with_context(|| format!("GET {url}"))?;
-    if !resp.status().is_success() {
-        return Err(anyhow!("installer GET {url} returned {}", resp.status()));
-    }
-
-    use futures::StreamExt;
-    let mut file = tokio::fs::File::create(&dest)
-        .await
-        .with_context(|| format!("creating staging file {}", dest.display()))?;
-    let mut received: u64 = 0;
-    let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let bytes = chunk.context("reading installer chunk")?;
-        use tokio::io::AsyncWriteExt;
-        file.write_all(&bytes)
-            .await
-            .with_context(|| format!("writing staging file {}", dest.display()))?;
-        received += bytes.len() as u64;
-        on_progress(received);
-    }
-    use tokio::io::AsyncWriteExt;
-    file.flush().await.context("flushing staging file")?;
-    drop(file);
-
+    let spec = wizard_shared::asset_resolver::DownloadSpec {
+        url: &url,
+        dest: &dest,
+        user_agent: USER_AGENT,
+        artifact_label: "installer",
+    };
+    wizard_shared::asset_resolver::download(&spec, &NEVER_CANCELLED, on_progress).await?;
     Ok(dest)
 }
 
@@ -168,46 +152,11 @@ fn strip_installer_path_suffix(base: &str) -> String {
         .unwrap_or_else(|| base.to_string())
 }
 
-/// Verify a staged MSI's SHA256 against the digest from
-/// [`InstallerHealth`]. Returns `Ok(true)` on match, `Ok(false)` on
-/// mismatch, `Err` on malformed digest or read error.
-///
-/// Accepts `digest` either as `"sha256:<hex>"` (the canonical GitHub
-/// shape forwarded by the rc.27 backend) or as bare hex. Hex is
-/// case-insensitive.
-pub fn verify_sha256(staged: &Path, expected_digest: &str) -> Result<bool> {
-    let hex = expected_digest
-        .strip_prefix("sha256:")
-        .unwrap_or(expected_digest);
-    if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(anyhow!(
-            "expected sha256 digest as 64 hex chars (optional sha256: prefix); got {expected_digest:?}"
-        ));
-    }
-    let bytes = std::fs::read(staged).with_context(|| format!("reading {}", staged.display()))?;
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    let actual = hasher.finalize();
-    let actual_hex = hex_encode(&actual);
-    Ok(actual_hex.eq_ignore_ascii_case(hex))
-}
-
-/// Lowercase hex encoder. `hex::encode` would suffice but we already
-/// have `sha2` and avoiding the extra dep for this 6-line helper
-/// keeps the build footprint trim.
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        use std::fmt::Write;
-        let _ = write!(s, "{b:02x}");
-    }
-    s
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
+    use wizard_shared::asset_resolver::hex_encode;
 
     #[test]
     fn verify_sha256_matches_correct_hash() {
@@ -307,5 +256,20 @@ mod tests {
     #[test]
     fn hex_encode_lowercase() {
         assert_eq!(hex_encode(&[0xde, 0xad, 0xbe, 0xef]), "deadbeef");
+    }
+
+    #[test]
+    fn installer_health_converts_from_unified_shape() {
+        let unified = wizard_shared::asset_resolver::ArtifactHealth {
+            tag: "agent-v0.3.0-rc.28".to_string(),
+            target: "permachine".to_string(),
+            filename: "roomler-agent-0.3.0-rc.28-perMachine-x86_64-pc-windows-msvc.msi".to_string(),
+            size: 123,
+            digest: None,
+            uri: "/api/agent/installer/permachine?version=latest".to_string(),
+        };
+        let legacy: InstallerHealth = unified.into();
+        assert_eq!(legacy.flavour, "permachine");
+        assert_eq!(legacy.tag, "agent-v0.3.0-rc.28");
     }
 }
