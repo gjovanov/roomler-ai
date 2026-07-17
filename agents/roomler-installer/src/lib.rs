@@ -11,9 +11,14 @@
 pub mod asset_resolver;
 pub mod commands;
 pub mod install_orchestrator;
-pub mod msi_runner;
 pub mod progress;
 pub mod wizard_state;
+
+// P4a: relocated to the shared wizard core (`crates/roomler-setup-core`);
+// re-exported here so `wizard_core::msi_runner::…` / `crate::msi_runner`
+// paths (commands, orchestrator) stay valid while this legacy wizard
+// ships. Retired with the whole crate in P4c.
+pub use wizard_shared::msi_runner;
 
 use std::sync::atomic::AtomicBool;
 

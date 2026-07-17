@@ -37,3 +37,28 @@ installed fleet.
 Remaining `ROOMLER_AGENT_*` reads (USE_FFMPEG, ENABLE_SYSTEM_SWAP, UNICODE_TEXT,
 VP9_FPS, ENCODER, HW_AUTO, …) migrate to `node_env` in P3 alongside the binary
 rename — same shim, no behaviour change.
+
+## Done (P3d — rc.194)
+
+- `[[bin]]` renames shipped: `roomlerd` / `roomler` / `roomler-desktop`
+  (packages/libs unchanged). WiX ships `roomler-agent.exe` alias; tunnel zip
+  ships `roomler-tunnel.exe` alias — both until the fleet crosses.
+- Service takeover `RoomlerAgentService` → `Roomler` (create-new → delete-legacy;
+  `resolved_service_name()` reads whichever exists). Scheduled Task + mutex same
+  pattern. All 46 env reads on `node_env` dual-read.
+- Config dirs: `appdirs` read-both (new `roomler` tree for fresh installs; upgraded
+  hosts keep the old `roomler-agent` tree — copy-never-move, enrollment-safe).
+
+## In flight (P4 — unified installer `roomler-setup`)
+
+- **P4a**: `crates/roomler-setup-core` (lib `wizard_shared`) extracted from the two
+  wizard crates — msi_runner / extract / integration / tunnel-enroll / asset_resolver
+  relocated once, legacy wizards re-export path-compatibly (byte-identical
+  behaviour); ONE unified `ProgressEvent` wire (tunnel tag style, live-union vocab)
+  consumed only by the new `agents/roomler-setup` app (role picker: daemon
+  perMachine-SCM / perUser-task / perMachine + tunnel-client).
+- **P4b**: role→action matrix; both wxs gain `roomler.exe`; folder rename
+  `roomler-agent\` → `Roomler\` (UpgradeCodes FROZEN); backend `setup_release.rs`
+  (tag `setup-v*`).
+- **P4c**: retire both wizard crates + `release-tunnel-wizard.yml`; `release-setup.yml`;
+  fold the tunnel CLI self-update into the roomlerd MSI (one updater).
