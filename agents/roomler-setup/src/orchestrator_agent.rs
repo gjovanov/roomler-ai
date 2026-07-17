@@ -421,6 +421,13 @@ async fn run_install_inner(
     // --- Step 8: done ----------------------------------------------------
     emit(on_event, ProgressEvent::Done);
 
+    // P4b (role→action composition): the MSI carries the `roomler`
+    // CLI, so a daemon install subsumes the tunnel client. Existence-
+    // check rather than assume — an old pre-P4b MSI served by a stale
+    // server degrades to cli_included=Some(false) and the SPA doesn't
+    // promise a CLI it didn't deliver.
+    let (cli_binary_path, cli_included, cli_path_updated) = cli_done_surface(wfx);
+
     Ok(DoneReport {
         principal_kind: "agent".to_string(),
         principal_id: agent_id,
@@ -428,11 +435,45 @@ async fn run_install_inner(
         tag: health.tag,
         role,
         flavour: Some(flavour_str),
-        binary_path: None,
+        binary_path: cli_binary_path,
         config_path: Some(config_path.display().to_string()),
-        path_updated: None,
+        path_updated: cli_path_updated,
         shortcut_created: None,
+        cli_included,
     })
+}
+
+/// Post-install probe for the MSI-carried tunnel CLI: derive the
+/// flavour's install dir (perUser `%LOCALAPPDATA%\Programs\Roomler`,
+/// perMachine `%ProgramFiles%\Roomler`) and check `roomler.exe`
+/// landed. `path_updated=Some(true)` piggybacks on the same check —
+/// the wxs `TunnelExe` component carries both the file AND the PATH
+/// append, so they land (or don't) together.
+#[cfg(target_os = "windows")]
+fn cli_done_surface(
+    flavour: WindowsInstallFlavour,
+) -> (Option<String>, Option<bool>, Option<bool>) {
+    let Some(dir) = roomler_agent::updater::install_dir_with_name(
+        flavour,
+        roomler_agent::updater::INSTALL_FOLDER_NAME,
+    ) else {
+        return (None, Some(false), None);
+    };
+    let cli = dir.join("roomler.exe");
+    if cli.is_file() {
+        (Some(cli.display().to_string()), Some(true), Some(true))
+    } else {
+        (None, Some(false), None)
+    }
+}
+
+/// Daemon installs are Windows-only (MSI); on other hosts the daemon
+/// orchestrator never runs a real install, so there is no CLI probe.
+#[cfg(not(target_os = "windows"))]
+fn cli_done_surface(
+    _flavour: WindowsInstallFlavour,
+) -> (Option<String>, Option<bool>, Option<bool>) {
+    (None, None, None)
 }
 
 /// Force-kill the currently-running msiexec. Returns `Ok(())` if a
