@@ -147,9 +147,17 @@ enum Command {
         /// Flow id to stop (as shown in the `flows` `ID` column).
         id: String,
     },
+    /// Manage DECLARED routes — daemon-supervised forwards / SOCKS5
+    /// listeners persisted in the daemon's config: they come back on
+    /// every daemon start (and reboot) until removed. The persistent
+    /// counterpart of the ephemeral `forward --daemon` flow (P6).
+    Route {
+        #[command(subcommand)]
+        action: RouteAction,
+    },
     /// Read a multi-forward config from disk and run all forwards as
-    /// persistent listeners. Auto-reconnects on transient failure.
-    /// T3 implements the operability layer; not yet wired.
+    /// persistent listeners. Superseded by daemon-supervised declared
+    /// routes — use `route add` instead; never wired.
     Run {},
     /// Probe path-MTU, ICE candidate reachability, and TURN-relay status
     /// against the named agent. Prints a structured diagnostic dump.
@@ -214,6 +222,58 @@ struct OutputFmt {
     json: bool,
 }
 
+/// `roomler route …` — declared-route management (P6). All verbs talk to
+/// the LOCAL daemon over the LocalAPI; the daemon persists changes into
+/// its own config and reconciles them into live flows.
+#[derive(Debug, Subcommand)]
+enum RouteAction {
+    /// Declare a supervised route. With `--remote` it's a static forward;
+    /// without, a SOCKS5 listener toward the node.
+    Add {
+        /// Target agent id (24-hex) to reach.
+        #[arg(long)]
+        agent: String,
+        /// Local loopback port to listen on.
+        #[arg(long)]
+        local: u16,
+        /// Forward target `host:port` (as reachable FROM the agent).
+        /// Omit for a SOCKS5 route.
+        #[arg(long)]
+        remote: Option<String>,
+        /// Transport preference: auto (default) | quic | webrtc.
+        #[arg(long, value_enum, default_value_t = CliTransport::Auto)]
+        transport: CliTransport,
+        /// Route id (slug shown in `route ls`); generated when omitted.
+        #[arg(long)]
+        id: Option<String>,
+        /// Declare disabled (enable later with `route enable`).
+        #[arg(long)]
+        disabled: bool,
+    },
+    /// Remove a declared route (kills its live flow, deletes it from the
+    /// daemon config).
+    Rm {
+        /// Route id (from `route ls`).
+        id: String,
+    },
+    /// List declared routes with their live state
+    /// (pending / active / backoff / failed / disabled).
+    Ls {
+        #[command(flatten)]
+        fmt: OutputFmt,
+    },
+    /// Enable a declared route (also clears a terminal `failed` state).
+    Enable {
+        /// Route id (from `route ls`).
+        id: String,
+    },
+    /// Disable a declared route without deleting it (kills its live flow).
+    Disable {
+        /// Route id (from `route ls`).
+        id: String,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -267,7 +327,34 @@ async fn main() -> Result<()> {
             }
         }
         Command::Kill { id } => localclient::kill(&id).await,
-        Command::Run {} => bail!("T3: multi-forward `run` not yet wired"),
+        Command::Route { action } => match action {
+            RouteAction::Add {
+                agent,
+                local,
+                remote,
+                transport,
+                id,
+                disabled,
+            } => {
+                localclient::route_add(
+                    id.unwrap_or_default(),
+                    &agent,
+                    local,
+                    remote,
+                    transport.as_word(),
+                    !disabled,
+                )
+                .await
+            }
+            RouteAction::Rm { id } => localclient::route_rm(&id).await,
+            RouteAction::Ls { fmt } => localclient::route_ls(fmt.json).await,
+            RouteAction::Enable { id } => localclient::route_set_enabled(&id, true).await,
+            RouteAction::Disable { id } => localclient::route_set_enabled(&id, false).await,
+        },
+        Command::Run {} => bail!(
+            "`run` was superseded by daemon-supervised declared routes — use `route add` \
+             (persisted in the daemon config, restarts with the daemon)"
+        ),
         Command::Diagnose { agent } => {
             bail!("T3: diagnose not yet wired (agent={:?})", agent);
         }

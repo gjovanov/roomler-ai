@@ -17,7 +17,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
 use tunnel_core::localapi::{
-    self, ConnectionType, DaemonMode, FlowInfo, FlowKind, NodeStatus, PeerInfo,
+    self, ConnectionType, DaemonMode, FlowInfo, FlowKind, NodeStatus, PeerInfo, RouteInfo,
+    RouteState,
 };
 
 /// Em-dash for an absent / null field — matches the tray's `devices.js`
@@ -140,6 +141,103 @@ pub async fn kill(id: &str) -> Result<()> {
         println!("killed flow {id}");
     } else {
         println!("no active flow with id {id}");
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Declared routes (P6)
+// ---------------------------------------------------------------------------
+
+/// `roomler route add …` — declare a daemon-supervised route. `remote`
+/// present ⇒ static forward; absent ⇒ SOCKS5 listener. The daemon
+/// persists it (config `[[tunnel_routes]]`) and reconciles it into a live
+/// flow; it comes back on every daemon start until `route rm`.
+pub async fn route_add(
+    id: String,
+    node: &str,
+    local: u16,
+    remote: Option<String>,
+    transport: &str,
+    enabled: bool,
+) -> Result<()> {
+    let kind = if remote.is_some() {
+        FlowKind::Forward
+    } else {
+        FlowKind::Socks5
+    };
+    let mut client = localapi::connect().await.map_err(daemon_err)?;
+    let eff = client
+        .route_add(localapi::RouteDescriptor {
+            id,
+            kind,
+            node: node.to_string(),
+            local,
+            remote,
+            transport: transport.to_string(),
+            enabled,
+        })
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
+    println!("route declared: {}", eff.id);
+    match &eff.remote {
+        Some(r) => println!(
+            "  127.0.0.1:{} → {r}  via node {}",
+            eff.local,
+            short_id(node)
+        ),
+        None => println!(
+            "  socks5 127.0.0.1:{} → node {} (per-connection target)",
+            eff.local,
+            short_id(node)
+        ),
+    }
+    if !eff.enabled {
+        println!("  declared DISABLED — `roomler route enable {}`", eff.id);
+    }
+    println!("  roomler route ls            # live state");
+    println!("  roomler route rm {}   # remove", eff.id);
+    Ok(())
+}
+
+/// `roomler route rm <id>` — remove a declared route (kills its live flow,
+/// deletes it from the daemon config).
+pub async fn route_rm(id: &str) -> Result<()> {
+    let mut client = localapi::connect().await.map_err(daemon_err)?;
+    if client.route_remove(id).await.map_err(|e| anyhow!("{e}"))? {
+        println!("removed route {id}");
+    } else {
+        println!("no declared route with id {id}");
+    }
+    Ok(())
+}
+
+/// `roomler route ls` — declared routes + live state.
+pub async fn route_ls(json: bool) -> Result<()> {
+    let mut client = localapi::connect().await.map_err(daemon_err)?;
+    let routes = client.route_list().await.map_err(daemon_err)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&routes)?);
+    } else {
+        print_routes(&routes);
+    }
+    Ok(())
+}
+
+/// `roomler route enable|disable <id>`.
+pub async fn route_set_enabled(id: &str, enabled: bool) -> Result<()> {
+    let mut client = localapi::connect().await.map_err(daemon_err)?;
+    if client
+        .route_set_enabled(id, enabled)
+        .await
+        .map_err(|e| anyhow!("{e}"))?
+    {
+        println!(
+            "route {id} {}",
+            if enabled { "enabled" } else { "disabled" }
+        );
+    } else {
+        println!("no declared route with id {id}");
     }
     Ok(())
 }
@@ -342,9 +440,108 @@ fn print_flows(flows: &[FlowInfo]) {
     }
 }
 
+fn print_routes(routes: &[RouteInfo]) {
+    if routes.is_empty() {
+        println!("No declared routes. Declare one with `roomler route add`.");
+        return;
+    }
+    println!(
+        "{:<14} {:<8} {:<10} {:>6} {:<24} {:<10} STATE",
+        "ID", "KIND", "NODE", "LOCAL", "REMOTE", "TRANSPORT"
+    );
+    for r in routes {
+        println!("{}", fmt_route_row(r));
+    }
+}
+
+/// One `route ls` table row — pure for unit tests.
+fn fmt_route_row(r: &RouteInfo) -> String {
+    let d = &r.route;
+    let kind = match d.kind {
+        FlowKind::Forward => "forward",
+        FlowKind::Socks5 => "socks5",
+    };
+    let transport = if d.transport.is_empty() {
+        "auto"
+    } else {
+        &d.transport
+    };
+    format!(
+        "{:<14} {:<8} {:<10} {:>6} {:<24} {:<10} {}",
+        d.id,
+        kind,
+        short_id(&d.node),
+        d.local,
+        d.remote.as_deref().unwrap_or(DASH),
+        transport,
+        route_state_word(&r.state),
+    )
+}
+
+/// Compact human word for a route's live state. `backoff`/`failed` carry
+/// their detail — that's what the operator acts on.
+fn route_state_word(s: &RouteState) -> String {
+    match s {
+        RouteState::Disabled => "disabled".into(),
+        RouteState::Pending => "pending".into(),
+        RouteState::Active { flow_id } => format!("active ({flow_id})"),
+        RouteState::Backoff {
+            next_retry_secs,
+            last_error,
+        } => format!("backoff {next_retry_secs}s: {last_error}"),
+        RouteState::Failed { reason } => format!("FAILED: {reason} (route enable to retry)"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn route_rows_render_each_state() {
+        fn info(state: RouteState) -> RouteInfo {
+            RouteInfo {
+                route: tunnel_core::localapi::RouteDescriptor {
+                    id: "pg-mars".into(),
+                    kind: FlowKind::Forward,
+                    node: "aabbccddeeff001122334455".into(),
+                    local: 15432,
+                    remote: Some("db:5432".into()),
+                    transport: String::new(),
+                    enabled: true,
+                },
+                state,
+            }
+        }
+        let active = fmt_route_row(&info(RouteState::Active {
+            flow_id: "fl-3".into(),
+        }));
+        assert!(active.contains("pg-mars"), "got {active}");
+        assert!(active.contains("forward"));
+        assert!(active.contains("db:5432"));
+        assert!(active.contains("auto"), "empty transport renders auto");
+        assert!(active.contains("active (fl-3)"));
+
+        let backoff = fmt_route_row(&info(RouteState::Backoff {
+            next_retry_secs: 12,
+            last_error: "port 15432 in use".into(),
+        }));
+        assert!(backoff.contains("backoff 12s: port 15432 in use"));
+
+        let failed = fmt_route_row(&info(RouteState::Failed {
+            reason: "revoked".into(),
+        }));
+        assert!(failed.contains("FAILED: revoked"));
+
+        // A socks5 route has no remote — the column shows the dash.
+        let mut socks = info(RouteState::Pending);
+        socks.route.kind = FlowKind::Socks5;
+        socks.route.remote = None;
+        let row = fmt_route_row(&socks);
+        assert!(row.contains("socks5"));
+        assert!(row.contains(DASH));
+        assert!(row.contains("pending"));
+    }
 
     #[test]
     fn human_bytes_steps() {
