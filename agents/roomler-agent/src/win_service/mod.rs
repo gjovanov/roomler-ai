@@ -44,8 +44,8 @@ use std::thread;
 use std::time::Duration;
 
 use windows_service::service::{
-    Service, ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl,
-    ServiceExitCode, ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
+    ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode,
+    ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
 };
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::service_dispatcher;
@@ -143,52 +143,28 @@ pub fn install(exe_path: &std::path::Path) -> Result<()> {
         account_name: None,
         account_password: None,
     };
-    let access = ServiceAccess::CHANGE_CONFIG | ServiceAccess::START | ServiceAccess::QUERY_STATUS;
-    let service = match manager.create_service(&service_info, access) {
+    let access = ServiceAccess::CHANGE_CONFIG;
+    match manager.create_service(&service_info, access) {
         Ok(s) => {
             let _ = s.set_description(SERVICE_DESCRIPTION);
-            s
         }
-        Err(windows_service::Error::Winapi(e)) if e.raw_os_error() == Some(1073) => {
-            // ERROR_SERVICE_EXISTS — earlier install/repair made it; (re)start below.
-            manager
-                .open_service(NEW_SERVICE_NAME, access)
-                .context("open_service(existing new)")?
-        }
+        // ERROR_SERVICE_EXISTS — an earlier install/repair already created it.
+        Err(windows_service::Error::Winapi(e)) if e.raw_os_error() == Some(1073) => {}
         Err(e) => return Err(anyhow::anyhow!(e).context("create_service")),
     };
-    // Start NEW + wait Running BEFORE retiring LEGACY. If it never comes up,
-    // return Err and leave LEGACY alone (belt: the old daemon keeps running).
-    start_and_wait_running(&service, Duration::from_secs(30))
-        .context("starting the new Roomler service")?;
-    // NEW is up -> retire the pre-rename service if it lingers (best-effort).
+    // Deliberately do NOT start the service from inside this deferred MSI custom
+    // action. Starting via the `create_service` handle mid-transaction fails at
+    // the SCM with error 87 ("parameter is incorrect") and leaves the service
+    // wedged (DISABLED / marked-for-deletion) — the P3d neo16 MSI smoke caught
+    // exactly this. The service is AutoStart and is brought up by the
+    // `DisableSystemContext` -> `environment::restart_service` action (which
+    // opens a FRESH SCM handle — the proven rc.190 path) or on next boot.
+    //
+    // Retire the pre-rename service. On a MajorUpgrade RemoveExistingProducts
+    // has usually already deleted it (tolerated as 1060 below); this is the belt
+    // for hosts where the old product's UnregisterService CA didn't fire.
     let _ = delete_service(LEGACY_SERVICE_NAME);
     Ok(())
-}
-
-/// Start the service if not already running and poll until `Running` (or
-/// timeout). Mirrors the bounded 100 ms poll shape of [`delete_service`]'s
-/// stop-wait loop, but waits for the `Running` transition instead.
-fn start_and_wait_running(service: &Service, timeout: Duration) -> Result<()> {
-    let st = service
-        .query_status()
-        .context("query_status before start")?;
-    if st.current_state != ServiceState::Running && st.current_state != ServiceState::StartPending {
-        service
-            .start(&[] as &[&std::ffi::OsStr])
-            .context("service.start()")?;
-    }
-    // Bounded poll in ~100 ms steps, same pattern as delete_service()'s stop loop.
-    let steps = (timeout.as_millis() / 100).max(1);
-    for _ in 0..steps {
-        std::thread::sleep(Duration::from_millis(100));
-        if let Ok(s) = service.query_status()
-            && s.current_state == ServiceState::Running
-        {
-            return Ok(());
-        }
-    }
-    anyhow::bail!("service did not reach Running within {timeout:?}")
 }
 
 /// Stop (best-effort) and delete a single named service. Tolerates
