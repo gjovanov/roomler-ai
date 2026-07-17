@@ -72,7 +72,14 @@ rename — same shim, no behaviour change.
   `/api/setup/*` routes (tag `setup-v*`, asset prefix `roomler-setup-`). Terminal
   installers `scripts/install.{sh,ps1}` served live at `/api/setup/install.{sh,ps1}`
   drive the wizard's steps headlessly per OS.
-- **P4c**: retire both wizard crates + `release-tunnel-wizard.yml`; `release-setup.yml`;
-  fold the tunnel CLI self-update into the roomlerd MSI (one updater); flip
-  `find_tunnel_binary`'s remaining legacy fallback + the legacy `/api/tunnel-wizard`
-  routes off once fleet telemetry confirms no callers.
+- **P4c** (split, ship-then-retire): **P4c-1** ships the unified `roomler-setup`
+  wizard for the first time — new `release-setup.yml` (3-platform, Windows
+  signed-EXE-in-`.zip`), tag `setup-v*`, so the `/api/setup/*` routes (dark since
+  P4b) go live; the two legacy wizard crates keep building as the safety net.
+  **P4c-2** (gated on ≥1 real field onboarding via the unified wizard) atomically
+  deletes both legacy wizard crates + `release-tunnel-wizard.yml` + the
+  `roomler-installer` companions build. NB the tunnel CLI **self-update is KEPT** —
+  it's the sole updater for tunnel-only hosts (the daemon roles get `roomler.exe`
+  refreshed by the MSI; "one updater" is per-role, not literally one). Deferred to
+  a later cleanup: dropping the legacy `/api/tunnel-wizard` route +
+  `find_tunnel_binary`'s legacy fallback, once telemetry confirms no callers.
