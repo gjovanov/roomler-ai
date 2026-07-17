@@ -123,18 +123,32 @@ async function probeAndRender() {
 }
 
 function wireGlobalListeners() {
-  // B9: single-instance plugin emits this when a second wizard EXE
-  // launch finds an in-flight install in the first process. Pop a
-  // snackbar; the new process exits silently on the Rust side.
-  listen("installer-already-running", () => {
-    showSnackbar("Wizard is already running — finish the current install first.");
-  });
-
+  // Wire the step handlers FIRST — the Next/Back buttons are critical,
+  // and NOTHING below may prevent them from being bound. (Regression
+  // 2026-07-17: the optional single-instance listener was wired first;
+  // when the `event:listen` capability was missing it threw the whole
+  // function aborted before these ran, so every Next button was dead.)
   wireWelcome();
   wireServer();
   wireToken();
   wireInstall();
   wireDone();
+
+  // B9: single-instance plugin emits this when a second wizard EXE
+  // launch finds an in-flight install in the first process. Pop a
+  // snackbar; the new process exits silently on the Rust side. Fully
+  // OPTIONAL + best-effort — guarded against both a synchronous throw
+  // and a rejected promise so a missing/denied event capability can
+  // never break wizard navigation.
+  try {
+    Promise.resolve(
+      listen("installer-already-running", () => {
+        showSnackbar("Wizard is already running — finish the current install first.");
+      }),
+    ).catch((e) => console.warn("single-instance listener unavailable:", e));
+  } catch (e) {
+    console.warn("single-instance listener unavailable:", e);
+  }
 }
 
 // ─── Render dispatch ───────────────────────────────────────────────────────
@@ -712,12 +726,19 @@ function renderDone() {
   // old pre-P4b MSI was served, so we don't promise a CLI we didn't
   // deliver.
   const cliIncluded = !isTunnel && done.cliIncluded === true;
-  document.getElementById("done-lead").textContent = isTunnel
-    ? "The tunnel client is installed, enrolled, and on PATH."
-    : cliIncluded
-      ? "The Roomler daemon is installed and enrolled. The roomler CLI " +
-        "came with it (managed by the daemon's updater from now on)."
-      : "The Roomler daemon is installed and enrolled.";
+  // GAP-A/P6: daemon roles also place the roomler-desktop GUI beside
+  // the daemon (best-effort; a stale server / download failure leaves
+  // it false, so we don't claim a desktop we didn't install).
+  const desktopInstalled = !isTunnel && done.desktopInstalled === true;
+  let lead;
+  if (isTunnel) {
+    lead = "The tunnel client is installed, enrolled, and on PATH.";
+  } else {
+    lead = "The Roomler daemon is installed and enrolled.";
+    if (cliIncluded) lead += " The roomler CLI came with it (managed by the daemon's updater).";
+    if (desktopInstalled) lead += " The roomler-desktop app is installed alongside it.";
+  }
+  document.getElementById("done-lead").textContent = lead;
 
   document.getElementById("done-principal-label").textContent =
     isTunnel ? "Tunnel client ID" : "Agent ID";

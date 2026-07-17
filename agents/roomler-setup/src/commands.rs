@@ -266,6 +266,11 @@ pub struct DoneReport {
     pub path_updated: Option<bool>,
     pub shortcut_created: Option<bool>,
     pub cli_included: Option<bool>,
+    /// GAP-A/P6: daemon roles place the `roomler-desktop` GUI
+    /// companion beside the daemon (it isn't in the MSI). `Some(true)`
+    /// placed, `Some(false)` best-effort failure / no server asset,
+    /// `None` for the tunnel role + non-Windows.
+    pub desktop_installed: Option<bool>,
 }
 
 /// Drive the full install pipeline end-to-end for the picked role:
@@ -418,6 +423,7 @@ mod tests {
             path_updated: Some(true),
             shortcut_created: Some(false),
             cli_included: None,
+            desktop_installed: None,
         };
         let json = serde_json::to_string(&r).unwrap();
         assert!(
@@ -434,6 +440,9 @@ mod tests {
         // P4b: camelCase lock for the composition flag.
         assert!(json.contains("cliIncluded"), "{json}");
         assert!(!json.contains("cli_included"), "{json}");
+        // GAP-A: camelCase lock for the desktop-companion flag.
+        assert!(json.contains("desktopInstalled"), "{json}");
+        assert!(!json.contains("desktop_installed"), "{json}");
         assert!(!json.contains("principal_kind"), "{json}");
         // Round-trips (Deserialize derive is part of the contract).
         let back: DoneReport = serde_json::from_str(&json).unwrap();

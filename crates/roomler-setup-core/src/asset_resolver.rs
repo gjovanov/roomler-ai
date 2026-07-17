@@ -169,6 +169,91 @@ pub async fn download<F: FnMut(u64)>(
     Ok(())
 }
 
+/// A companion asset located by [`find_release_asset`] — a binary
+/// served straight off a GitHub Release (e.g. the `roomler-desktop`
+/// GUI EXE) rather than through a health-manifest installer proxy.
+#[derive(Clone, Debug)]
+pub struct ReleaseAsset {
+    /// Download URL (GitHub `browser_download_url` from the
+    /// latest-release list).
+    pub url: String,
+    pub filename: String,
+    /// `"sha256:<hex>"` when the release carries the digest field.
+    pub digest: Option<String>,
+}
+
+// Deser-only mirrors of the `/api/*/latest-release` JSON. Local to
+// core (NO roomler-agent dep — D8 dep hygiene; core never links the
+// agent/tunnel crates).
+#[derive(Deserialize)]
+struct RelListEntry {
+    tag_name: String,
+    #[serde(default)]
+    draft: bool,
+    #[serde(default)]
+    assets: Vec<RelListAsset>,
+}
+#[derive(Deserialize)]
+struct RelListAsset {
+    name: String,
+    browser_download_url: String,
+    #[serde(default)]
+    digest: Option<String>,
+}
+
+/// GET a `.../latest-release` list and locate a companion asset: the
+/// first non-draft release whose tag starts with `tag_prefix`, and
+/// within it the first asset whose lower-cased name CONTAINS
+/// `name_contains` and ends with `suffix` (skipping `.sha256`
+/// sidecars). Returns `None` when nothing matches (older server /
+/// missing asset) so the caller degrades gracefully. Used by the
+/// daemon orchestrator to place `roomler-desktop` (GAP-A / P6) — the
+/// GUI companion isn't in the MSI, it's a standalone release EXE.
+pub async fn find_release_asset(
+    latest_release_url: &str,
+    tag_prefix: &str,
+    name_contains: &str,
+    suffix: &str,
+    user_agent: &str,
+) -> Result<Option<ReleaseAsset>> {
+    let client = reqwest::Client::builder()
+        .user_agent(user_agent)
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("building reqwest client")?;
+    let resp = client
+        .get(latest_release_url)
+        .send()
+        .await
+        .with_context(|| format!("GET {latest_release_url}"))?;
+    if !resp.status().is_success() {
+        return Err(anyhow!(
+            "GET {latest_release_url} returned {}",
+            resp.status()
+        ));
+    }
+    let releases: Vec<RelListEntry> = resp.json().await.context("parse latest-release list")?;
+    let nc = name_contains.to_ascii_lowercase();
+    let sfx = suffix.to_ascii_lowercase();
+    for rel in releases {
+        if rel.draft || !rel.tag_name.starts_with(tag_prefix) {
+            continue;
+        }
+        for a in rel.assets {
+            let lower = a.name.to_ascii_lowercase();
+            if lower.ends_with(".sha256") || !lower.contains(&nc) || !lower.ends_with(&sfx) {
+                continue;
+            }
+            return Ok(Some(ReleaseAsset {
+                url: a.browser_download_url,
+                filename: a.name,
+                digest: a.digest,
+            }));
+        }
+    }
+    Ok(None)
+}
+
 /// Detect the current platform string the backend understands. The
 /// wizard EXE runs on the same OS+arch as the CLI it's about to
 /// install, so the platform discriminator is whatever the wizard
