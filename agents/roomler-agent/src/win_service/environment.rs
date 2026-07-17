@@ -40,7 +40,7 @@ use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
 use windows_sys::Win32::System::Registry::{
     HKEY, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_MULTI_SZ, RegCloseKey,
-    RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
+    RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
 };
 
 use super::resolved_service_name;
@@ -229,6 +229,22 @@ pub fn read_service_env_var(name: &str) -> Result<Option<String>> {
 fn write_service_env(pairs: &[(String, String)]) -> Result<()> {
     let key = open_service_key(KEY_SET_VALUE)?;
     let wname = wide_with_nul(ENV_VALUE_NAME);
+    if pairs.is_empty() {
+        // No env overrides left: DELETE the `Environment` value rather than write
+        // an empty REG_MULTI_SZ. `encode_multi_sz(&[])` yields a single UTF-16
+        // null, but a valid (even empty) REG_MULTI_SZ needs a DOUBLE-null
+        // terminator — the SCM reads this value to build the service's env block,
+        // and a malformed one makes StartServiceW fail with error 87 ("parameter
+        // is incorrect"), permanently wedging the service. This was the P3d
+        // service-start bug: `disable-system-context`'s unset left an empty list.
+        // Deleting the value = the service simply has no env override. Tolerate
+        // "value absent" (ERROR_FILE_NOT_FOUND).
+        let rc = unsafe { RegDeleteValueW(key.0, wname.as_ptr()) };
+        if rc != ERROR_SUCCESS && rc != ERROR_FILE_NOT_FOUND {
+            anyhow::bail!("RegDeleteValueW(Environment) failed: error {rc}");
+        }
+        return Ok(());
+    }
     let encoded = encode_multi_sz(pairs);
     let bytes: Vec<u8> = encoded.iter().flat_map(|w| w.to_le_bytes()).collect();
     // SAFETY: bytes is a flat byte buffer; we pass the byte length.
