@@ -237,39 +237,52 @@ fn check_within(dest_dir: &Path, candidate: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Walk one level into `extracted_root` looking for the
-/// `roomler-tunnel` binary. The CLI archive layout is
-/// `<extracted_root>/roomler-tunnel-<version>-<target>/roomler-tunnel
-/// {.exe}`. Returns the full path to the binary.
+/// Walk one level into `extracted_root` looking for the tunnel CLI
+/// binary. The CLI archive layout is
+/// `<extracted_root>/roomler-tunnel-<version>-<target>/<binary>`,
+/// where `<binary>` has shipped under BOTH names since the P3d
+/// rename: `roomler{.exe}` (current) and `roomler-tunnel{.exe}`
+/// (compat alias). P4b flips the preference to the NEW name so
+/// installs land the end-state binary; the legacy name stays as a
+/// fallback so pre-P3d archives still resolve. Returns the full path
+/// to the binary.
 ///
 /// Tolerates the archive being unpacked flat (binary directly under
 /// `extracted_root`) for forward-compat with future layouts.
 pub fn find_tunnel_binary(extracted_root: &Path) -> Result<PathBuf> {
-    let binary_name = if cfg!(target_os = "windows") {
-        "roomler-tunnel.exe"
+    let candidate_names: [&str; 2] = if cfg!(target_os = "windows") {
+        ["roomler.exe", "roomler-tunnel.exe"]
     } else {
-        "roomler-tunnel"
+        ["roomler", "roomler-tunnel"]
     };
 
-    // Flat layout?
-    let flat = extracted_root.join(binary_name);
-    if flat.is_file() {
-        return Ok(flat);
+    // Flat layout? New name wins when both are present.
+    for name in candidate_names {
+        let flat = extracted_root.join(name);
+        if flat.is_file() {
+            return Ok(flat);
+        }
     }
 
-    // Single-subdir layout (the canonical one).
+    // Single-subdir layout (the canonical one). Within each subdir
+    // the new name wins; across subdirs, directory-iteration order
+    // decides (the canonical archive has exactly one subdir).
     for entry in fs::read_dir(extracted_root)
         .with_context(|| format!("readdir {}", extracted_root.display()))?
     {
         let entry = entry.context("reading dir entry")?;
-        let candidate = entry.path().join(binary_name);
-        if candidate.is_file() {
-            return Ok(candidate);
+        for name in candidate_names {
+            let candidate = entry.path().join(name);
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
         }
     }
 
     Err(anyhow!(
-        "could not locate {binary_name} under {}",
+        "could not locate {} (or legacy {}) under {}",
+        candidate_names[0],
+        candidate_names[1],
         extracted_root.display()
     ))
 }
@@ -431,5 +444,47 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let err = find_tunnel_binary(tmp.path()).unwrap_err();
         assert!(format!("{err}").contains("could not locate"));
+    }
+
+    // P4b: the archives ship BOTH names since P3d; the NEW name must
+    // win at every layout level so installs land the end-state binary.
+    #[test]
+    fn find_tunnel_binary_prefers_new_name_when_both_present() {
+        let (new_name, old_name) = if cfg!(target_os = "windows") {
+            ("roomler.exe", "roomler-tunnel.exe")
+        } else {
+            ("roomler", "roomler-tunnel")
+        };
+        // Flat layout.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join(new_name), b"new").unwrap();
+        std::fs::write(tmp.path().join(old_name), b"old").unwrap();
+        let found = find_tunnel_binary(tmp.path()).unwrap();
+        assert_eq!(found.file_name().unwrap(), new_name);
+        // Single-subdir layout.
+        let tmp = TempDir::new().unwrap();
+        let sub = tmp
+            .path()
+            .join("roomler-tunnel-0.3.0-rc.195-x86_64-pc-windows-msvc");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join(new_name), b"new").unwrap();
+        std::fs::write(sub.join(old_name), b"old").unwrap();
+        let found = find_tunnel_binary(tmp.path()).unwrap();
+        assert_eq!(found.file_name().unwrap(), new_name);
+    }
+
+    #[test]
+    fn find_tunnel_binary_finds_new_name_alone() {
+        let new_name = if cfg!(target_os = "windows") {
+            "roomler.exe"
+        } else {
+            "roomler"
+        };
+        let tmp = TempDir::new().unwrap();
+        let sub = tmp.path().join("some-archive-dir");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join(new_name), b"binary").unwrap();
+        let found = find_tunnel_binary(tmp.path()).unwrap();
+        assert_eq!(found.file_name().unwrap(), new_name);
     }
 }
