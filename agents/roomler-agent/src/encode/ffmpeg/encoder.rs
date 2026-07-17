@@ -66,6 +66,17 @@ const HEVC_ENCODER_NAMES: &[&str] = &["hevc_nvenc", "hevc_qsv", "hevc_amf"];
 /// on iGPU HW).
 const VP9_ENCODER_NAMES: &[&str] = &["vp9_qsv"];
 
+/// rc.190 — Codec dispatch order for AV1 (the `data-channel-av1`
+/// transport). HW-only, probe-gated by caps.rs — AV1 encode silicon:
+/// NVIDIA Ada+ (`av1_nvenc`; RTX 5090 in the fleet), Intel Arc/DG2+
+/// (`av1_qsv`; NOT the Gen12 Iris Xe/UHD iGPUs, which only DECODE AV1),
+/// AMD RDNA3+ (`av1_amf`). Hosts without any of these simply don't
+/// advertise the transport. Note the MF-AV1 NVENC known-issue
+/// (`ActivateObject` 0x8000FFFF on RTX 5090 Blackwell) is MF-specific —
+/// this path talks to the NVENC SDK via FFmpeg directly, and the probe
+/// protects us if it ever shares the failure.
+const AV1_ENCODER_NAMES: &[&str] = &["av1_nvenc", "av1_qsv", "av1_amf"];
+
 /// rc.86 — constant-quality target (lower = sharper, more bits).
 /// Default 22 is a good screen-content sweet spot for HEVC/VP9 — fine
 /// text edges stay crisp without a full lossless blow-out. Range
@@ -382,6 +393,37 @@ impl FfmpegEncoder {
     pub fn new_vp9_adaptive(width: u32, height: u32, fps: u32, maxrate_bps: usize) -> Result<Self> {
         Self::new_with_dispatch(
             VP9_ENCODER_NAMES,
+            width,
+            height,
+            fps.max(1) as i32,
+            maxrate_bps,
+        )
+    }
+
+    /// rc.190 — AV1 probe constructor (caps.rs). HW-only cascade
+    /// (`av1_nvenc` → `av1_qsv` → `av1_amf`); `Err` on hosts without AV1
+    /// encode silicon, which simply don't advertise `data-channel-av1`.
+    pub fn new_av1(width: u32, height: u32) -> Result<Self> {
+        let maxrate = ffmpeg_maxrate_bps(
+            width,
+            height,
+            DEFAULT_ENCODER_FPS as u32,
+            crate::encode::transport_is_constrained(),
+        );
+        Self::new_with_dispatch(
+            AV1_ENCODER_NAMES,
+            width,
+            height,
+            DEFAULT_ENCODER_FPS,
+            maxrate,
+        )
+    }
+
+    /// rc.190 — DataChannel-pump AV1 constructor. See
+    /// [`Self::new_hevc_adaptive`] for the fps/maxrate threading contract.
+    pub fn new_av1_adaptive(width: u32, height: u32, fps: u32, maxrate_bps: usize) -> Result<Self> {
+        Self::new_with_dispatch(
+            AV1_ENCODER_NAMES,
             width,
             height,
             fps.max(1) as i32,
@@ -871,6 +913,12 @@ mod tests {
 
     /// Verify the dispatch order matches RustDesk's pattern + our docs.
     /// Locks the order so a refactor doesn't accidentally reorder.
+    #[test]
+    fn av1_dispatch_order_is_nvenc_qsv_amf() {
+        // rc.190 — same vendor order as HEVC (NVIDIA → Intel → AMD).
+        assert_eq!(AV1_ENCODER_NAMES, &["av1_nvenc", "av1_qsv", "av1_amf"]);
+    }
+
     #[test]
     fn hevc_dispatch_order_is_nvenc_qsv_amf() {
         assert_eq!(HEVC_ENCODER_NAMES, &["hevc_nvenc", "hevc_qsv", "hevc_amf"]);

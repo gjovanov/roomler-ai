@@ -429,6 +429,14 @@ impl AgentPeer {
         // space when the controller downscales. 0 = no frame captured yet.
         // rc.183 — remote-cursor offset fix at non-native resolutions.
         let capture_native_dims = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // rc.190 — the dims the active pump ACTUALLY encodes (post
+        // `apply_target_resolution` + agent-side relay/SW caps), packed like
+        // `capture_native_dims`. The cursor pump derives its native→encoded
+        // scale from THIS (actual truth) instead of re-deriving from the
+        // controller's TargetResolution — which went stale the moment the
+        // agent-side caps could pick a smaller target than the controller
+        // asked for. 0 = no frame encoded yet (cursor stays native-space).
+        let encoded_dims = Arc::new(std::sync::atomic::AtomicU64::new(0));
         // rc.188 — viewer-rate feedback. The control handler packs the browser's
         // `rc:decodestat` (measured decoded fps + a "struggling" bit) into this
         // atomic; the DC video pumps swap+decode it once a second and feed
@@ -699,6 +707,83 @@ impl AgentPeer {
             });
         }
 
+        // rc.190 (B3) — stuck-session watchdog. Field incident NEO16
+        // 2026-07-16: ICE never nominated a pair ("pingAllCandidates called
+        // with no candidate pairs"), the PC sat in Connecting FOREVER (never
+        // transitioning to Failed), the hub kept the session row alive → the
+        // host showed "Being viewed by …" and every reconnect attempt got
+        // AgentBusy until the agent restarted. The rc.185 hub reap only
+        // fires when the controller's WS closed — a live browser tab
+        // retrying against a wedged session holds it open. This task ends
+        // the session when the peer (a) never reaches Connected within
+        // CONNECT_DEADLINE, or (b) sits in Disconnected past
+        // DISCONNECTED_GRACE. `Failed` needs no handling here — the
+        // state-change handler above already Terminates on it. Kill switch:
+        // `ROOMLER_AGENT_SESSION_WATCHDOG=0`.
+        {
+            let pc_watch = std::sync::Arc::downgrade(&pc);
+            let tx_watch = outbound.clone();
+            tokio::spawn(async move {
+                const CONNECT_DEADLINE: Duration = Duration::from_secs(45);
+                const DISCONNECTED_GRACE: Duration = Duration::from_secs(20);
+                if matches!(
+                    std::env::var("ROOMLER_AGENT_SESSION_WATCHDOG")
+                        .ok()
+                        .as_deref(),
+                    Some("0") | Some("false")
+                ) {
+                    return;
+                }
+                let started = std::time::Instant::now();
+                let mut connected_once = false;
+                let mut disconnected_since: Option<std::time::Instant> = None;
+                let mut tick = tokio::time::interval(Duration::from_secs(5));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tick.tick().await;
+                    // Session torn down normally → the Arc dropped; exit.
+                    let Some(pc) = pc_watch.upgrade() else { return };
+                    let state = pc.connection_state();
+                    if matches!(state, RTCPeerConnectionState::Connected) {
+                        connected_once = true;
+                    }
+                    if matches!(state, RTCPeerConnectionState::Disconnected) {
+                        disconnected_since.get_or_insert_with(std::time::Instant::now);
+                    } else {
+                        disconnected_since = None;
+                    }
+                    match session_watchdog_verdict(
+                        state,
+                        connected_once,
+                        started.elapsed(),
+                        disconnected_since.map(|t| t.elapsed()),
+                        CONNECT_DEADLINE,
+                        DISCONNECTED_GRACE,
+                    ) {
+                        WatchdogVerdict::Wait => {}
+                        WatchdogVerdict::Disarm => return,
+                        WatchdogVerdict::Kill => {
+                            warn!(
+                                session = %session_id,
+                                state = ?state,
+                                connected_once,
+                                elapsed_s = started.elapsed().as_secs(),
+                                "session watchdog: peer never became (or stopped being) usable — terminating stuck session"
+                            );
+                            let _ = tx_watch
+                                .send(ClientMsg::Terminate {
+                                    session_id,
+                                    reason: roomler_ai_remote_control::models::EndReason::Error,
+                                })
+                                .await;
+                            let _ = pc.close().await;
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+
         // Spawn the lock-screen monitor BEFORE wiring the data-channel
         // callback so the input handler can subscribe to LockState
         // transitions and drop input events early when the host is
@@ -722,6 +807,7 @@ impl AgentPeer {
         let quality_for_dc = quality_state.clone();
         let target_res_for_dc = target_resolution.clone();
         let native_dims_for_dc = capture_native_dims.clone();
+        let encoded_dims_for_dc = encoded_dims.clone();
         // rc.130 — the control DC handler forces an encoder keyframe on the
         // browser's `rc:keyframe` (sent when its decode queue backs up and it
         // drops deltas to resync). Same atomic the media pumps already poll.
@@ -736,6 +822,7 @@ impl AgentPeer {
             let quality_for_dc = quality_for_dc.clone();
             let target_res_for_dc = target_res_for_dc.clone();
             let native_dims_for_dc = native_dims_for_dc.clone();
+            let encoded_dims_for_dc = encoded_dims_for_dc.clone();
             let keyframe_for_dc = keyframe_for_dc.clone();
             let viewer_report_for_dc = viewer_report_for_dc.clone();
             let video_bytes_stash = video_bytes_dc_for_callback.clone();
@@ -761,9 +848,12 @@ impl AgentPeer {
                             viewer_report_for_dc,
                         )
                     }
-                    "cursor" => {
-                        attach_cursor_handler(dc, session_id, target_res_for_dc, native_dims_for_dc)
-                    }
+                    "cursor" => attach_cursor_handler(
+                        dc,
+                        session_id,
+                        native_dims_for_dc,
+                        encoded_dims_for_dc,
+                    ),
                     #[cfg(feature = "clipboard")]
                     "clipboard" => attach_clipboard_handler(dc, session_id),
                     "files" => attach_files_handler(dc, session_id),
@@ -842,6 +932,7 @@ impl AgentPeer {
             control_dc.clone(),
             pc.clone(),
             capture_native_dims,
+            encoded_dims,
             viewer_report,
         ));
 
@@ -1090,8 +1181,12 @@ async fn media_pump(
     // the cursor pump can scale the OS cursor position into the encoded
     // frame's space (rc.183). Packed w:h; 0 until the first frame.
     capture_native_dims: Arc<std::sync::atomic::AtomicU64>,
-    // rc.184 — browser keyframe-request count; forwarded to the DC pumps for
-    // the decode-pressure frame-skip. Only the DC pumps consume it.
+    // rc.190 — published each frame with the dims the pump ACTUALLY encodes
+    // (post apply_target_resolution + relay/SW caps); the cursor pump scales
+    // native→encoded from this. Packed w:h; 0 until the first frame.
+    encoded_dims: Arc<std::sync::atomic::AtomicU64>,
+    // rc.188 — packed viewer decode report (`rc:decodestat`); the DC pumps
+    // fold it into the viewer-rate fps cap. Only the DC pumps consume it.
     viewer_report: Arc<std::sync::atomic::AtomicU32>,
 ) {
     // `pc` is consumed only by the VP9-444 DC pump's per-session transport
@@ -1130,6 +1225,48 @@ async fn media_pump(
     // but `ROOMLER_AGENT_USE_FFMPEG=1` isn't set on this process
     // (caps probe wouldn't have advertised the transport, but a
     // mismatched / old controller could still ask for it).
+    // rc.190 — AV1 over DataChannel. Mirrors the HEVC block below; the
+    // caps probe only advertises `data-channel-av1` on hosts with AV1
+    // encode silicon, so reaching here with the feature off / FFmpeg
+    // unavailable means a mismatched or stale controller — fall through
+    // to the WebRTC track like every other unsatisfiable transport ask.
+    if matches!(negotiated_transport.as_deref(), Some("data-channel-av1")) {
+        #[cfg(feature = "ffmpeg-encoder")]
+        {
+            if crate::encode::ffmpeg::available() {
+                tracing::info!(
+                    %session_id,
+                    "media pump: AV1 over DataChannel (rc.190 — FFmpeg via vendor SDK)"
+                );
+                return media_pump_ffmpeg_dc(
+                    FfmpegDcCodec::Av1,
+                    session_id,
+                    video_bytes_dc,
+                    keyframe_requested,
+                    target_resolution,
+                    lock_state_rx,
+                    quality_state,
+                    control_dc.clone(),
+                    pc.clone(),
+                    capture_native_dims,
+                    encoded_dims,
+                    viewer_report,
+                )
+                .await;
+            }
+            tracing::warn!(
+                %session_id,
+                "negotiated_transport=data-channel-av1 but ROOMLER_AGENT_USE_FFMPEG isn't set — falling back to WebRTC video track"
+            );
+        }
+        #[cfg(not(feature = "ffmpeg-encoder"))]
+        {
+            tracing::warn!(
+                %session_id,
+                "negotiated_transport=data-channel-av1 but agent was built without `ffmpeg-encoder` feature — falling back to WebRTC video track"
+            );
+        }
+    }
     if matches!(negotiated_transport.as_deref(), Some("data-channel-hevc")) {
         #[cfg(feature = "ffmpeg-encoder")]
         {
@@ -1149,6 +1286,7 @@ async fn media_pump(
                     control_dc.clone(),
                     pc.clone(),
                     capture_native_dims,
+                    encoded_dims,
                     viewer_report,
                 )
                 .await;
@@ -1207,6 +1345,7 @@ async fn media_pump(
                         control_dc.clone(),
                         pc.clone(),
                         capture_native_dims,
+                        encoded_dims,
                         viewer_report,
                     )
                     .await;
@@ -1230,6 +1369,7 @@ async fn media_pump(
                 control_dc.clone(),
                 pc,
                 capture_native_dims,
+                encoded_dims,
                 viewer_report,
             )
             .await;
@@ -1438,6 +1578,13 @@ async fn media_pump(
             std::sync::atomic::Ordering::Relaxed,
         );
         let frame = apply_target_resolution(frame, *target_resolution.lock().unwrap());
+        // rc.190 — publish the dims we actually encode so the cursor pump
+        // scales from truth (this pump's auto-downscale mutates the shared
+        // target_resolution, so user-target == effective here).
+        encoded_dims.store(
+            pack_dims(frame.width, frame.height),
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         // Lock-screen overlay (M3 phase 3, Z-path). When the user-
         // context worker can't see the real desktop (input desktop
@@ -1561,33 +1708,9 @@ async fn media_pump(
                 // is comfortably under 12 ms / frame.
                 //
                 // rc.38 — preserve source aspect when picking the
-                // target. Pre-rc.38 used fixed 1920x1080 / 1280x720
-                // targets which stretch a 16:10 source (1920x1200
-                // panels, common on ThinkPads + ProBooks) into 16:9,
-                // visibly distorting the captured desktop and shifting
-                // the apparent positions of UI elements. Browsers also
-                // get a track-size jolt on the first→second-frame
-                // resolution flip that confuses `<video>.videoWidth`
-                // and lands clicks at the wrong OS coordinate.
-                // Aspect-preserving target eliminates both.
-                fn aspect_preserved_target(
-                    src_w: u32,
-                    src_h: u32,
-                    cap_long_edge: u32,
-                ) -> (u32, u32) {
-                    if src_w == 0 || src_h == 0 {
-                        return (cap_long_edge, cap_long_edge * 9 / 16);
-                    }
-                    let long = src_w.max(src_h);
-                    if long <= cap_long_edge {
-                        return (src_w, src_h);
-                    }
-                    let num = cap_long_edge as u64;
-                    let new_w = ((src_w as u64) * num / long as u64) as u32;
-                    let new_h = ((src_h as u64) * num / long as u64) as u32;
-                    // Encoders require even dims; round DOWN to nearest even.
-                    (new_w & !1, new_h & !1)
-                }
+                // target (see module-scope `aspect_preserved_target`;
+                // hoisted in rc.190 so the DC pumps' resolution caps
+                // share the exact same math).
                 let heavy_codec = chosen_codec == "h265" || chosen_codec == "av1";
                 let h264 = chosen_codec == "h264";
                 let above_1080p =
@@ -1918,7 +2041,9 @@ async fn media_pump_vp9_444_dc(
     pc: Arc<RTCPeerConnection>,
     // rc.183 — publish native pre-downscale dims for the cursor pump.
     capture_native_dims: Arc<std::sync::atomic::AtomicU64>,
-    // rc.184 — browser keyframe-request count for the decode-pressure skip.
+    // rc.190 — publish the ACTUAL encoded dims (post caps) for the cursor pump.
+    encoded_dims: Arc<std::sync::atomic::AtomicU64>,
+    // rc.188 — packed viewer decode report for the viewer-rate fps cap.
     viewer_report: Arc<std::sync::atomic::AtomicU32>,
 ) {
     // See `media_pump`: tracks lock-state transitions so we can
@@ -2027,6 +2152,9 @@ async fn media_pump_vp9_444_dc(
     // it can decode, via the frame-skip divisor below.
     let mut viewer_rate = crate::encode::viewer_rate::ViewerRateController::new(target_fps);
     let mut viewer_rate_window = std::time::Instant::now();
+    // rc.190 — one-shot (per value) log marker for the agent-side resolution
+    // caps, so the field log explains WHY the stream is smaller than asked.
+    let mut res_cap_logged: Option<TargetResolution> = None;
     let mut decode_skip_divisor: u32 = 1;
     let mut decode_skip_counter: u32 = 0;
     let mut frames_skipped_decode: u64 = 0;
@@ -2325,7 +2453,43 @@ async fn media_pump_vp9_444_dc(
             pack_dims(frame.width, frame.height),
             std::sync::atomic::Ordering::Relaxed,
         );
-        let frame = apply_target_resolution(frame, *target_resolution.lock().unwrap());
+        // rc.190 — compose the controller's request with the agent-side caps:
+        // B2 soft cap (libvpx is ALWAYS software — a 4K panel crawled at
+        // ~25 fps burning the host CPU, field GEAL8N6 2026-07-16) fills in
+        // when the controller left Native; B1 hard cap clamps everything on
+        // a constrained relay (a ~3 Mbps TURN-TCP path can't carry more).
+        let user_target = *target_resolution.lock().unwrap();
+        let effective_target = effective_target_resolution(
+            user_target,
+            frame.width,
+            frame.height,
+            if constrained_transport {
+                crate::encode::relay_res_cap_long_edge()
+            } else {
+                None
+            },
+            crate::encode::sw_res_cap_long_edge(),
+        );
+        if effective_target != user_target && res_cap_logged != Some(effective_target) {
+            info!(
+                %session_id,
+                ?user_target,
+                ?effective_target,
+                native_w = frame.width,
+                native_h = frame.height,
+                constrained = constrained_transport,
+                "VP9-444 DC pump: agent-side resolution cap engaged (relay/SW-encode)"
+            );
+            res_cap_logged = Some(effective_target);
+        }
+        let frame = apply_target_resolution(frame, effective_target);
+        // rc.190 — publish the ACTUAL encoded dims for the cursor pump's
+        // native→encoded scaling (the caps can pick a smaller target than
+        // the controller asked for, so TargetResolution alone is stale).
+        encoded_dims.store(
+            pack_dims(frame.width, frame.height),
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         // Lock-screen overlay (M3 phase 3, Z-path). Same logic as
         // the legacy track pump — when the user-context worker
@@ -2735,6 +2899,11 @@ async fn media_pump_vp9_444_dc(
 enum FfmpegDcCodec {
     Hevc,
     Vp9,
+    /// rc.190 — AV1 over `data-channel-av1`. HW-only (av1_nvenc/qsv/amf),
+    /// probe-gated in caps.rs; packets are raw OBU temporal units which
+    /// WebCodecs `av01.*` decodes without a description, same 13-byte DC
+    /// framing as HEVC/VP9.
+    Av1,
 }
 
 #[cfg(feature = "ffmpeg-encoder")]
@@ -2753,6 +2922,7 @@ impl FfmpegDcCodec {
         match self {
             Self::Hevc => FfmpegEncoder::new_hevc_adaptive(w, h, fps, maxrate_bps),
             Self::Vp9 => FfmpegEncoder::new_vp9_adaptive(w, h, fps, maxrate_bps),
+            Self::Av1 => FfmpegEncoder::new_av1_adaptive(w, h, fps, maxrate_bps),
         }
     }
 
@@ -2760,6 +2930,7 @@ impl FfmpegDcCodec {
         match self {
             Self::Hevc => "HEVC",
             Self::Vp9 => "VP9",
+            Self::Av1 => "AV1",
         }
     }
 
@@ -2769,12 +2940,14 @@ impl FfmpegDcCodec {
         match self {
             Self::Hevc => "h265",
             Self::Vp9 => "vp9",
+            Self::Av1 => "av1",
         }
     }
 
-    /// Chroma the FFmpeg path emits. Both `hevc_*` (Main profile) and
-    /// `vp9_qsv` (profile 0) are 4:2:0 8-bit — the 4:4:4 path stays on
-    /// libvpx SW (`media_pump_vp9_444_dc`), never this pump.
+    /// Chroma the FFmpeg path emits. `hevc_*` (Main profile), `vp9_qsv`
+    /// (profile 0) and `av1_*` (Main profile) are all 4:2:0 8-bit — the
+    /// 4:4:4 path stays on libvpx SW (`media_pump_vp9_444_dc`), never
+    /// this pump.
     fn wire_chroma(self) -> &'static str {
         "yuv420"
     }
@@ -2858,7 +3031,9 @@ async fn media_pump_ffmpeg_dc(
     pc: Arc<RTCPeerConnection>,
     // rc.183 — publish native pre-downscale dims for the cursor pump.
     capture_native_dims: Arc<std::sync::atomic::AtomicU64>,
-    // rc.184 — browser keyframe-request count for the decode-pressure skip.
+    // rc.190 — publish the ACTUAL encoded dims (post caps) for the cursor pump.
+    encoded_dims: Arc<std::sync::atomic::AtomicU64>,
+    // rc.188 — packed viewer decode report for the viewer-rate fps cap.
     viewer_report: Arc<std::sync::atomic::AtomicU32>,
 ) {
     use crate::encode::VideoEncoder;
@@ -2982,6 +3157,8 @@ async fn media_pump_ffmpeg_dc(
     let mut decode_skip_divisor: u32 = 1;
     let mut decode_skip_counter: u32 = 0;
     let mut frames_skipped_decode: u64 = 0;
+    // rc.190 — one-shot (per value) log marker for the relay resolution cap.
+    let mut res_cap_logged: Option<TargetResolution> = None;
     // rc.186 — encode-pressure: when the encoder saturates (heartbeat
     // avg_encode_ms high), scale the maxrate ceiling down so a weak sender
     // GPU stops thrashing (the dynamic `FFMPEG_FPS=30`). Stepped once per
@@ -3282,7 +3459,43 @@ async fn media_pump_ffmpeg_dc(
             pack_dims(frame.width, frame.height),
             std::sync::atomic::Ordering::Relaxed,
         );
-        let frame = apply_target_resolution(frame, *target_resolution.lock().unwrap());
+        // rc.190 — compose the controller's request with the B1 relay hard
+        // cap: a constrained TURN-TCP path (~3 Mbps ceiling) cannot carry a
+        // 2560×1600 HEVC stream without the blur↔crystallize AIMD sawtooth
+        // (field NEO16→PC50045 2026-07-16, target_bps pinned 1.8M↔3.0M).
+        // No SW soft cap here — this pump is HW-encode by construction.
+        let user_target = *target_resolution.lock().unwrap();
+        let effective_target = effective_target_resolution(
+            user_target,
+            frame.width,
+            frame.height,
+            if constrained {
+                crate::encode::relay_res_cap_long_edge()
+            } else {
+                None
+            },
+            None,
+        );
+        if effective_target != user_target && res_cap_logged != Some(effective_target) {
+            info!(
+                %session_id,
+                codec_label,
+                ?user_target,
+                ?effective_target,
+                native_w = frame.width,
+                native_h = frame.height,
+                "FFmpeg DC pump: agent-side relay resolution cap engaged"
+            );
+            res_cap_logged = Some(effective_target);
+        }
+        let frame = apply_target_resolution(frame, effective_target);
+        // rc.190 — publish the ACTUAL encoded dims for the cursor pump's
+        // native→encoded scaling (the relay cap can pick a smaller target
+        // than the controller asked for).
+        encoded_dims.store(
+            pack_dims(frame.width, frame.height),
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         // Lazily build / rebuild the encoder when the frame dims change.
         let (w, h) = (frame.width, frame.height);
@@ -3792,6 +4005,18 @@ fn attach_control_handler(
     // bounds a misbehaving/old controller to one forced IDR per gap so a
     // resync storm can't pile the LARGEST frames onto a congested link.
     let last_kf_request = Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
+    // rc.191 — display-match cleanup: restore the host's original display
+    // mode when the session's control channel closes (normal disconnect,
+    // browser tab gone, watchdog pc.close() — all funnel here). The
+    // CDS_FULLSCREEN temporary-change semantics additionally auto-restore
+    // if the agent PROCESS dies, so every exit path is covered. No-op when
+    // display-match never switched anything.
+    dc.on_close(Box::new(move || {
+        Box::pin(async move {
+            // Detach — restore is fire-and-forget (JoinHandle drop is fine).
+            drop(tokio::task::spawn_blocking(crate::display_match::restore));
+        })
+    }));
     dc.on_message(Box::new(move |msg| {
         let quality_state = quality_state.clone();
         let target_resolution = target_resolution.clone();
@@ -3989,6 +4214,45 @@ fn attach_control_handler(
                         std::sync::atomic::Ordering::Relaxed,
                     );
                 }
+                "rc:display-match" => {
+                    // rc.191 — viewer asked the host to switch its display to
+                    // the largest mode fitting the viewer's stage (opt-in
+                    // toggle; makes the whole pixel chain 1:1 — see
+                    // `display_match`). `{enable:false}` restores. Runs off
+                    // the callback thread: ChangeDisplaySettingsExW blocks.
+                    let enable = val
+                        .get("enable")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    let w = val.get("width").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                    let h = val.get("height").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                    tokio::task::spawn_blocking(move || {
+                        if !enable {
+                            crate::display_match::restore();
+                            tracing::info!("display-match: restored original mode");
+                            return;
+                        }
+                        if w == 0 || h == 0 {
+                            tracing::debug!("display-match: missing width/height — ignored");
+                            return;
+                        }
+                        match crate::display_match::apply(w, h) {
+                            Ok((mw, mh)) => tracing::info!(
+                                req_w = w,
+                                req_h = h,
+                                mode_w = mw,
+                                mode_h = mh,
+                                "display-match: switched host display mode"
+                            ),
+                            Err(e) => tracing::warn!(
+                                req_w = w,
+                                req_h = h,
+                                %e,
+                                "display-match: could not switch mode"
+                            ),
+                        }
+                    });
+                }
                 "rc:keyframe" => {
                     // Browser's decode queue backed up → it dropped deltas and
                     // needs a fresh IDR to resync. Force one (min-gap clamped).
@@ -4053,12 +4317,14 @@ fn attach_cursor_handler(
     dc: Arc<RTCDataChannel>,
     session_id: bson::oid::ObjectId,
     // Shared with the media pump so the streamed cursor position tracks
-    // the encoded frame's pixel space when the controller downscales
-    // (rc.183 remote-cursor offset fix). `target_resolution` = the
-    // controller-chosen encode target; `capture_native_dims` = the
-    // native pre-downscale dims the active pump publishes each frame.
-    target_resolution: Arc<std::sync::Mutex<TargetResolution>>,
+    // the encoded frame's pixel space when the stream is downscaled
+    // (rc.183 remote-cursor offset fix). `capture_native_dims` = the
+    // native pre-downscale dims the active pump publishes each frame;
+    // `encoded_dims` = the dims it ACTUALLY encodes (rc.190 — post
+    // controller preference AND agent-side relay/SW caps, so the scale
+    // reflects truth rather than re-deriving from TargetResolution).
     capture_native_dims: Arc<std::sync::atomic::AtomicU64>,
+    encoded_dims: Arc<std::sync::atomic::AtomicU64>,
 ) {
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as BASE64;
@@ -4120,9 +4386,9 @@ fn attach_cursor_handler(
                     // No-op (scale 1.0) at native resolution. The shape
                     // hotspot is bitmap-local and stays unscaled — the
                     // browser subtracts it after this multiply.
-                    let (sx, sy) = cursor_encode_scale(
+                    let (sx, sy) = cursor_scale_from_dims(
                         capture_native_dims.load(std::sync::atomic::Ordering::Relaxed),
-                        *target_resolution.lock().unwrap(),
+                        encoded_dims.load(std::sync::atomic::Ordering::Relaxed),
                     );
                     let msg = serde_json::json!({
                         "t": "cursor:pos",
@@ -4178,8 +4444,18 @@ fn apply_target_resolution(
         // than produce a mis-formatted downscale.
         return frame;
     }
-    let downscaled =
-        downscale_bgra_box(&frame.data, frame.width, frame.height, frame.stride, tw, th);
+    // rc.191 — filter selection by ratio. Box averaging is correct (and
+    // cheap) for big shrinks, but at near-native ratios it blends
+    // fractional neighbours into ClearType mush (field: relay 0.67× and
+    // fit 0.75× looked "blurred/pixely"). Lanczos-3 keeps edge contrast
+    // through those ratios at a few extra ms. Kill switch
+    // `ROOMLER_AGENT_LANCZOS=0` reverts to box everywhere.
+    let scale = (tw as f32 / frame.width as f32).min(th as f32 / frame.height as f32);
+    let downscaled = if scale > 0.55 && lanczos_enabled() {
+        downscale_bgra_lanczos3(&frame.data, frame.width, frame.height, frame.stride, tw, th)
+    } else {
+        downscale_bgra_box(&frame.data, frame.width, frame.height, frame.stride, tw, th)
+    };
     std::sync::Arc::new(crate::capture::Frame {
         width: tw,
         height: th,
@@ -4196,6 +4472,214 @@ fn apply_target_resolution(
     })
 }
 
+/// rc.38 — aspect-preserving downscale target: shrink `(src_w, src_h)` so its
+/// LONG edge is ≤ `cap_long_edge`, keeping aspect and rounding DOWN to even
+/// dims (encoders reject odd). Sources already within the cap return
+/// unchanged. Hoisted to module scope in rc.190 so the RTP pump's SW
+/// auto-downscale and the DC pumps' relay/SW resolution caps share the exact
+/// same math (fixed 16:9 targets stretched 16:10 panels — see the rc.38 note
+/// at the media_pump call site).
+fn aspect_preserved_target(src_w: u32, src_h: u32, cap_long_edge: u32) -> (u32, u32) {
+    if src_w == 0 || src_h == 0 {
+        return (cap_long_edge, cap_long_edge * 9 / 16);
+    }
+    let long = src_w.max(src_h);
+    if long <= cap_long_edge {
+        return (src_w, src_h);
+    }
+    let num = cap_long_edge as u64;
+    let new_w = ((src_w as u64) * num / long as u64) as u32;
+    let new_h = ((src_h as u64) * num / long as u64) as u32;
+    // Encoders require even dims; round DOWN to nearest even.
+    (new_w & !1, new_h & !1)
+}
+
+/// rc.190 — compose the controller-requested resolution with the agent-side
+/// caps, yielding the effective target for [`apply_target_resolution`].
+///
+/// Two cap tiers with different override semantics:
+/// - `hard_cap_long_edge` (the relay-TCP bandwidth cap, B1): PHYSICS. A
+///   ~3 Mbps TURN-TCP relay cannot carry a 2560×1600 stream without the
+///   blur↔crystallize AIMD sawtooth (field NEO16→PC50045 2026-07-16), so it
+///   clamps EVERYTHING — including an explicit controller pick — by taking
+///   whichever target has the smaller area.
+/// - `soft_cap_long_edge` (the SW-encoder speed cap, B2): a performance
+///   DEFAULT. It applies only when the controller left resolution at
+///   `Native`, mirroring the RTP pump's "operator can override via
+///   rc:resolution" contract — an explicit pick wins even above the cap.
+///
+/// rc.191 — linear scale ABOVE which a controller box request snaps to
+/// Native. Field 2026-07-16 (GEAL8N6@1920×1200 + Fit 1672×818): a
+/// near-1:1 NON-INTEGER resample is the worst case for any filter —
+/// text mush + "pixely" form aliasing — while saving almost no bits.
+/// Snapping to Native keeps the chain 1:1 (crisp) whenever the request
+/// is within ~15% of the source. Env `ROOMLER_AGENT_SNAP_NATIVE_PCT`
+/// (percent, default 85; `0` disables snapping).
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+fn snap_native_scale() -> f32 {
+    let pct = std::env::var("ROOMLER_AGENT_SNAP_NATIVE_PCT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(85);
+    (pct.min(100) as f32) / 100.0
+}
+
+/// rc.191 — resolve a controller `Fixed{w,h}` request as an ASPECT-PRESERVING
+/// bounding box against the native frame: scale the source uniformly by
+/// `min(box_w/native_w, box_h/native_h, 1.0)` and even-align. Two field bugs
+/// this kills (2026-07-16):
+///
+/// * Distortion — `apply_target_resolution` scaled to the EXACT requested
+///   dims, so a Fit request shaped like the viewer's stage (e.g. 1672×818)
+///   squashed a 16:9/16:10 source by up to ~20%. The controller's letterbox
+///   rendering means the browser handles a smaller-than-stage frame fine.
+/// * Near-native mush — when the uniform scale lands ≥ `snap_native_scale`,
+///   return Native instead: a 0.87× box resample destroys ClearType text for
+///   a ~13% pixel saving nobody asked for.
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+fn resolve_user_box(user: TargetResolution, native_w: u32, native_h: u32) -> TargetResolution {
+    let TargetResolution::Fixed { width, height } = user else {
+        return TargetResolution::Native;
+    };
+    if width == 0 || height == 0 || native_w == 0 || native_h == 0 {
+        return TargetResolution::Native;
+    }
+    let scale = (width as f32 / native_w as f32)
+        .min(height as f32 / native_h as f32)
+        .min(1.0);
+    let snap = snap_native_scale();
+    if snap > 0.0 && scale >= snap {
+        return TargetResolution::Native;
+    }
+    let w = ((native_w as f32 * scale) as u32) & !1;
+    let h = ((native_h as f32 * scale) as u32) & !1;
+    if w == 0 || h == 0 || (w, h) == (native_w, native_h) {
+        return TargetResolution::Native;
+    }
+    TargetResolution::Fixed {
+        width: w,
+        height: h,
+    }
+}
+
+/// Pure so the composition rules are unit-tested on the default build.
+/// Only the DC pumps (feature-gated) call it, hence the dead_code allow on
+/// the signalling-only build (tests don't count for liveness).
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+fn effective_target_resolution(
+    user: TargetResolution,
+    native_w: u32,
+    native_h: u32,
+    hard_cap_long_edge: Option<u32>,
+    soft_cap_long_edge: Option<u32>,
+) -> TargetResolution {
+    // rc.191 — controller boxes become aspect-preserving targets (with the
+    // near-native snap) BEFORE the cap tiers compose.
+    let user = resolve_user_box(user, native_w, native_h);
+    // Soft tier: only fills in for an absent controller preference.
+    let mut effective = match (user, soft_cap_long_edge) {
+        (TargetResolution::Native, Some(cap)) => {
+            let (w, h) = aspect_preserved_target(native_w, native_h, cap);
+            if (w, h) == (native_w, native_h) {
+                TargetResolution::Native
+            } else {
+                TargetResolution::Fixed {
+                    width: w,
+                    height: h,
+                }
+            }
+        }
+        _ => user,
+    };
+    // Hard tier: min-area against whatever the soft tier produced.
+    if let Some(cap) = hard_cap_long_edge {
+        let (cw, ch) = aspect_preserved_target(native_w, native_h, cap);
+        if (cw, ch) != (native_w, native_h) {
+            let cap_area = (cw as u64) * (ch as u64);
+            let keep = match effective {
+                TargetResolution::Native => false,
+                TargetResolution::Fixed { width, height } => {
+                    // apply_target_resolution caps Fixed at native, so
+                    // compare the POST-clamP area, not the raw request —
+                    // an oversized Fit request (bigger than native) is
+                    // really "native" and must not dodge the hard cap.
+                    let w = width.min(native_w);
+                    let h = height.min(native_h);
+                    (w as u64) * (h as u64) <= cap_area
+                }
+            };
+            if !keep {
+                effective = TargetResolution::Fixed {
+                    width: cw,
+                    height: ch,
+                };
+            }
+        }
+    }
+    effective
+}
+
+/// rc.190 (B3) — what the stuck-session watchdog should do this tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchdogVerdict {
+    /// Peer is fine (or not yet past a deadline) — keep watching.
+    Wait,
+    /// Peer is dead weight — Terminate the session + close the PC so the
+    /// hub frees the slot (fixes the "Being viewed" zombie + AgentBusy).
+    Kill,
+    /// Session ended through another path (Closed, or Failed which the
+    /// state-change handler already Terminates) — watchdog exits.
+    Disarm,
+}
+
+/// rc.190 (B3) — pure decision core of the stuck-session watchdog, split out
+/// so the deadline/state matrix is unit-tested on the default build.
+///
+/// * Never-connected: a peer that hasn't reached `Connected` within
+///   `connect_deadline` (ICE wedged pre-nomination — "pingAllCandidates
+///   called with no candidate pairs" — never transitions to `Failed`).
+/// * Disconnected-limbo: a formerly-usable peer parked in `Disconnected`
+///   past `disconnected_grace` (webrtc-rs may hover there without ever
+///   reaching `Failed`; short blips recover to `Connected` well inside the
+///   grace and are left alone).
+fn session_watchdog_verdict(
+    state: RTCPeerConnectionState,
+    connected_once: bool,
+    since_start: Duration,
+    disconnected_for: Option<Duration>,
+    connect_deadline: Duration,
+    disconnected_grace: Duration,
+) -> WatchdogVerdict {
+    match state {
+        RTCPeerConnectionState::Closed | RTCPeerConnectionState::Failed => WatchdogVerdict::Disarm,
+        RTCPeerConnectionState::Connected => WatchdogVerdict::Wait,
+        RTCPeerConnectionState::Disconnected => match disconnected_for {
+            Some(d) if d >= disconnected_grace => WatchdogVerdict::Kill,
+            _ => WatchdogVerdict::Wait,
+        },
+        // New / Connecting / Unspecified — only the never-connected
+        // deadline applies; once the session has been Connected, a return
+        // to Connecting (ICE restart) is given the same patience as
+        // Disconnected via its own state above.
+        _ => {
+            if !connected_once && since_start >= connect_deadline {
+                WatchdogVerdict::Kill
+            } else {
+                WatchdogVerdict::Wait
+            }
+        }
+    }
+}
+
 /// Pack `(width, height)` into one `u64` (hi 32 = w, lo 32 = h) so the
 /// media pumps can publish the current native capture dimensions to the
 /// cursor pump through a single lock-free `AtomicU64`. `0` means "no
@@ -4205,46 +4689,39 @@ fn pack_dims(w: u32, h: u32) -> u64 {
 }
 
 /// Per-axis scale factor the frame downscale applies to a captured frame,
-/// so the remote-cursor overlay lands on the right pixel when the
-/// controller selects a resolution below native.
+/// so the remote-cursor overlay lands on the right pixel when the stream
+/// is encoded below native resolution.
 ///
 /// The cursor DC streams the OS cursor position in **native** capture
-/// pixels (`GetCursorPos`), but the *video* frame is downscaled by
-/// [`apply_target_resolution`] before encode, so the browser sees the
-/// **encoded** dimensions (`mediaIntrinsicW/H`, read from the decoded
-/// frame) and computes the overlay as `pos.x * visibleW / mediaIntrinsicW`.
-/// When native ≠ encoded that overshoots by `native/encoded` (e.g.
-/// 1920/1280 = 1.5×) — the field-reported "mouse lands in a different
-/// place at non-original resolution" bug. Scaling `pos` by this factor on
-/// the agent puts the cursor in the same pixel space as the frame, so the
-/// browser math is correct with no viewer change.
+/// pixels (`GetCursorPos`), but the *video* frame may be downscaled before
+/// encode, so the browser sees the **encoded** dimensions
+/// (`mediaIntrinsicW/H`, read from the decoded frame) and computes the
+/// overlay as `pos.x * visibleW / mediaIntrinsicW`. When native ≠ encoded
+/// that overshoots by `native/encoded` (e.g. 1920/1280 = 1.5×) — the
+/// field-reported "mouse lands in a different place at non-original
+/// resolution" bug (rc.183). Scaling `pos` by this factor on the agent
+/// puts the cursor in the same pixel space as the frame, so the browser
+/// math is correct with no viewer change.
 ///
-/// Mirrors `apply_target_resolution`'s cap-at-native rule EXACTLY: a
-/// target ≥ native on both axes is a no-op there, so it must return
-/// `(1.0, 1.0)` here — a non-downscaled session is byte-for-byte
-/// unchanged. `(sx, sy)` are in `(0, 1]` for the normal (uniformly
-/// smaller) target.
-fn cursor_encode_scale(native_dims: u64, target: TargetResolution) -> (f32, f32) {
+/// rc.190 — computed from the two dims the pump PUBLISHES (native +
+/// actually-encoded) instead of re-deriving from `TargetResolution`. The
+/// agent-side relay/SW caps can encode smaller than the controller asked,
+/// so the ratio of published values is the only mapping that is correct by
+/// definition — whatever the pump did, this reflects it.
+fn cursor_scale_from_dims(native_dims: u64, encoded_dims: u64) -> (f32, f32) {
     let nw = (native_dims >> 32) as u32;
     let nh = (native_dims & 0xFFFF_FFFF) as u32;
-    if nw == 0 || nh == 0 {
-        // No native dims yet → don't scale (matches pre-fix behaviour
-        // until the first frame lands).
+    let ew = (encoded_dims >> 32) as u32;
+    let eh = (encoded_dims & 0xFFFF_FFFF) as u32;
+    if nw == 0 || nh == 0 || ew == 0 || eh == 0 {
+        // Either side unpublished (no frame yet) → don't scale (matches
+        // pre-rc.183 behaviour until the first frame lands).
         return (1.0, 1.0);
     }
-    match target {
-        TargetResolution::Native => (1.0, 1.0),
-        TargetResolution::Fixed { width, height } => {
-            // apply_target_resolution returns the frame untouched when
-            // `width >= nw && height >= nh` (or a zero dim) — the cursor
-            // stays native-space in that case too.
-            if width == 0 || height == 0 || (width >= nw && height >= nh) {
-                (1.0, 1.0)
-            } else {
-                (width as f32 / nw as f32, height as f32 / nh as f32)
-            }
-        }
+    if (ew, eh) == (nw, nh) {
+        return (1.0, 1.0);
     }
+    (ew as f32 / nw as f32, eh as f32 / nh as f32)
 }
 
 /// CPU box-filter downscale for BGRA frames. For each destination
@@ -4253,6 +4730,133 @@ fn cursor_encode_scale(native_dims: u64, target: TargetResolution) -> (f32, f32)
 /// on 4K→1080p on a modern laptop CPU; good enough for 30 fps and
 /// tolerable at 60 fps. GPU path via VideoProcessorMFT is the
 /// follow-up (deferred Tier C/1C.3 in the RustDesk-parity plan).
+/// rc.191 — kill switch for the Lanczos-3 near-native downscale path.
+/// `ROOMLER_AGENT_LANCZOS=0` (or `false`) reverts every downscale to the
+/// box filter without a rebuild.
+fn lanczos_enabled() -> bool {
+    !matches!(
+        std::env::var("ROOMLER_AGENT_LANCZOS").ok().as_deref(),
+        Some("0") | Some("false")
+    )
+}
+
+/// rc.191 — per-output-pixel Lanczos-3 tap table for one axis, in Q12
+/// fixed point. For downscaling the kernel is stretched by `src/dst`
+/// (support = 3·src/dst source pixels per output pixel); weights are
+/// normalised to sum exactly 4096 so flat fields round-trip losslessly.
+fn lanczos3_taps(src: u32, dst: u32) -> Vec<(i32, Vec<i32>)> {
+    const A: f32 = 3.0;
+    let ratio = src as f32 / dst as f32; // > 1 for downscale
+    let support = A * ratio.max(1.0);
+    let mut out = Vec::with_capacity(dst as usize);
+    for i in 0..dst {
+        let center = (i as f32 + 0.5) * ratio - 0.5;
+        let lo = (center - support).ceil() as i32;
+        let hi = (center + support).floor() as i32;
+        let lo_c = lo.max(0);
+        let hi_c = hi.min(src as i32 - 1);
+        let mut weights = Vec::with_capacity((hi_c - lo_c + 1) as usize);
+        let mut sum = 0.0f32;
+        let scale_inv = 1.0 / ratio.max(1.0);
+        for t in lo_c..=hi_c {
+            let x = (t as f32 - center) * scale_inv;
+            let w = if x.abs() < 1e-6 {
+                1.0
+            } else if x.abs() >= A {
+                0.0
+            } else {
+                let pix = std::f32::consts::PI * x;
+                (A * pix.sin() * (pix / A).sin()) / (pix * pix)
+            };
+            weights.push(w);
+            sum += w;
+        }
+        // Normalise → Q12 fixed point; distribute rounding residue onto the
+        // largest tap so the row sums to exactly 4096.
+        let mut fixed: Vec<i32> = weights
+            .iter()
+            .map(|w| ((w / sum) * 4096.0).round() as i32)
+            .collect();
+        let total: i32 = fixed.iter().sum();
+        if let Some(max_idx) = fixed
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, v)| **v)
+            .map(|(i, _)| i)
+        {
+            fixed[max_idx] += 4096 - total;
+        }
+        out.push((lo_c, fixed));
+    }
+    out
+}
+
+/// rc.191 — separable Lanczos-3 downscale for BGRA frames. The box filter
+/// below is right for BIG shrinks (≥2×, wide averaging is the correct
+/// anti-alias); at near-native ratios (relay 0.67×, fit 0.75-0.85×) it
+/// blends fractional neighbours into ClearType mush — the field
+/// "blurred/pixely text" report. Lanczos-3 keeps edge contrast through
+/// those ratios. Q12 integer accumulation (i32), horizontal pass into an
+/// i16 intermediate, vertical pass back to u8 with clamping (the kernel
+/// has negative lobes). Cost ≈ 10-20 ms for the 0.67-0.85× cases on a
+/// laptop core — inside a 30 fps budget; the >2× cases stay on box.
+fn downscale_bgra_lanczos3(
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+    src_stride: u32,
+    dst_w: u32,
+    dst_h: u32,
+) -> Vec<u8> {
+    let h_taps = lanczos3_taps(src_w, dst_w);
+    let v_taps = lanczos3_taps(src_h, dst_h);
+    // Horizontal pass: src_h rows × dst_w columns, Q12 >> 6 = Q6 stored in
+    // i16 (max |value| ≈ 255·4096·1.15 / 64 ≈ 18.8k — fits i16 with the
+    // ~15% negative-lobe overshoot headroom).
+    let mut mid = vec![0i16; (dst_w as usize) * (src_h as usize) * 4];
+    for y in 0..src_h as usize {
+        let row = y * src_stride as usize;
+        let mid_row = y * (dst_w as usize) * 4;
+        for (x, (lo, ws)) in h_taps.iter().enumerate() {
+            let mut acc = [0i32; 4];
+            for (k, w) in ws.iter().enumerate() {
+                let si = row + ((*lo as usize) + k) * 4;
+                acc[0] += w * src[si] as i32;
+                acc[1] += w * src[si + 1] as i32;
+                acc[2] += w * src[si + 2] as i32;
+                acc[3] += w * src[si + 3] as i32;
+            }
+            let di = mid_row + x * 4;
+            mid[di] = (acc[0] >> 6) as i16;
+            mid[di + 1] = (acc[1] >> 6) as i16;
+            mid[di + 2] = (acc[2] >> 6) as i16;
+            mid[di + 3] = (acc[3] >> 6) as i16;
+        }
+    }
+    // Vertical pass: Q6 · Q12 = Q18 → >> 18 back to u8, clamped.
+    let mut dst = vec![0u8; (dst_w as usize) * (dst_h as usize) * 4];
+    let mid_stride = (dst_w as usize) * 4;
+    for (y, (lo, ws)) in v_taps.iter().enumerate() {
+        let dst_row = y * mid_stride;
+        for x in 0..dst_w as usize {
+            let mut acc = [0i32; 4];
+            for (k, w) in ws.iter().enumerate() {
+                let si = ((*lo as usize) + k) * mid_stride + x * 4;
+                acc[0] += w * mid[si] as i32;
+                acc[1] += w * mid[si + 1] as i32;
+                acc[2] += w * mid[si + 2] as i32;
+                acc[3] += w * mid[si + 3] as i32;
+            }
+            let di = dst_row + x * 4;
+            dst[di] = ((acc[0] + (1 << 17)) >> 18).clamp(0, 255) as u8;
+            dst[di + 1] = ((acc[1] + (1 << 17)) >> 18).clamp(0, 255) as u8;
+            dst[di + 2] = ((acc[2] + (1 << 17)) >> 18).clamp(0, 255) as u8;
+            dst[di + 3] = ((acc[3] + (1 << 17)) >> 18).clamp(0, 255) as u8;
+        }
+    }
+    dst
+}
+
 fn downscale_bgra_box(
     src: &[u8],
     src_w: u32,
@@ -5496,78 +6100,391 @@ mod tests {
         );
     }
 
-    // rc.183 — remote-cursor downscale mapping. `cursor_encode_scale`
-    // must mirror `apply_target_resolution`'s cap-at-native rule so the
-    // streamed cursor position lands on the encoded frame's pixel space.
+    // rc.183/rc.190 — remote-cursor downscale mapping, now computed from the
+    // dims the pump PUBLISHES (native + actually-encoded) so the scale
+    // reflects whatever the pump really did (controller pick AND agent-side
+    // relay/SW caps alike).
     #[test]
-    fn cursor_encode_scale_identity_at_native_target() {
+    fn cursor_scale_identity_when_encoded_equals_native() {
         let native = super::pack_dims(1920, 1200);
-        assert_eq!(
-            super::cursor_encode_scale(native, super::TargetResolution::Native),
-            (1.0, 1.0)
-        );
+        assert_eq!(super::cursor_scale_from_dims(native, native), (1.0, 1.0));
     }
 
     #[test]
-    fn cursor_encode_scale_halves_at_half_resolution() {
+    fn cursor_scale_halves_at_half_resolution() {
         let native = super::pack_dims(1920, 1200);
-        let (sx, sy) = super::cursor_encode_scale(
-            native,
-            super::TargetResolution::Fixed {
-                width: 960,
-                height: 600,
-            },
-        );
+        let encoded = super::pack_dims(960, 600);
+        let (sx, sy) = super::cursor_scale_from_dims(native, encoded);
         assert!((sx - 0.5).abs() < 1e-6, "sx={sx}");
         assert!((sy - 0.5).abs() < 1e-6, "sy={sy}");
     }
 
     #[test]
-    fn cursor_encode_scale_fixes_1280_overshoot() {
-        // The field-reported case: 1920×1200 native, 1280×800 encode.
-        // A cursor at native x=1920 must map to encoded x=1280 (the
-        // frame's right edge), killing the prior 1.5× overshoot.
+    fn cursor_scale_fixes_1280_overshoot() {
+        // The rc.183 field case: 1920×1200 native, 1280×800 encode. A cursor
+        // at native x=1920 must map to encoded x=1280 (the frame's right
+        // edge), killing the prior 1.5× overshoot.
         let native = super::pack_dims(1920, 1200);
-        let (sx, _sy) = super::cursor_encode_scale(
-            native,
-            super::TargetResolution::Fixed {
-                width: 1280,
-                height: 800,
-            },
-        );
+        let encoded = super::pack_dims(1280, 800);
+        let (sx, _sy) = super::cursor_scale_from_dims(native, encoded);
         assert!((1920.0 * sx - 1280.0).abs() < 1.0, "1920*{sx} != ~1280");
     }
 
     #[test]
-    fn cursor_encode_scale_caps_at_native_no_upscale() {
-        // Target ≥ native on both axes → apply_target_resolution is a
-        // no-op, so the cursor must NOT be upscaled.
-        let native = super::pack_dims(1920, 1200);
+    fn cursor_scale_tracks_agent_side_relay_cap() {
+        // rc.190 regression: controller asked Native but the relay cap
+        // encoded 1280×800 from a 2560×1600 panel. The published encoded
+        // dims — not TargetResolution — must drive the scale.
+        let native = super::pack_dims(2560, 1600);
+        let encoded = super::pack_dims(1280, 800);
+        let (sx, sy) = super::cursor_scale_from_dims(native, encoded);
+        assert!((sx - 0.5).abs() < 1e-6, "sx={sx}");
+        assert!((sy - 0.5).abs() < 1e-6, "sy={sy}");
+    }
+
+    #[test]
+    fn cursor_scale_identity_before_first_frame() {
+        // Either side unpublished (0) must not scale.
+        let some = super::pack_dims(1280, 800);
+        assert_eq!(super::cursor_scale_from_dims(0, some), (1.0, 1.0));
+        assert_eq!(super::cursor_scale_from_dims(some, 0), (1.0, 1.0));
+    }
+
+    // rc.190 — agent-side resolution caps (B1 relay hard / B2 SW soft).
+    use super::TargetResolution as TR;
+
+    #[test]
+    fn aspect_preserved_target_shrinks_long_edge_even_dims() {
+        // 4K 16:9 capped at 1920 → exactly 1920×1080.
         assert_eq!(
-            super::cursor_encode_scale(
-                native,
-                super::TargetResolution::Fixed {
-                    width: 3840,
-                    height: 2160,
-                },
-            ),
-            (1.0, 1.0)
+            super::aspect_preserved_target(3840, 2160, 1920),
+            (1920, 1080)
+        );
+        // 16:10 panel capped at 1280 → 1280×800.
+        assert_eq!(
+            super::aspect_preserved_target(2560, 1600, 1280),
+            (1280, 800)
+        );
+        // Already within the cap → unchanged.
+        assert_eq!(super::aspect_preserved_target(1280, 720, 1920), (1280, 720));
+        // Odd results round DOWN to even (1366×768 → cap 1000: 1000×562.3 → 1000×562).
+        let (w, h) = super::aspect_preserved_target(1366, 768, 1000);
+        assert_eq!(w % 2, 0);
+        assert_eq!(h % 2, 0);
+    }
+
+    #[test]
+    fn caps_native_passthrough_when_no_caps() {
+        assert_eq!(
+            super::effective_target_resolution(TR::Native, 3840, 2160, None, None),
+            TR::Native
         );
     }
 
     #[test]
-    fn cursor_encode_scale_identity_before_first_frame() {
-        // native_dims == 0 (no frame captured yet) must not scale.
+    fn soft_cap_fills_in_for_native_only() {
+        // B2: libvpx at 4K + controller left Native → capped at 1920 long edge.
         assert_eq!(
-            super::cursor_encode_scale(
-                0,
-                super::TargetResolution::Fixed {
-                    width: 1280,
-                    height: 800,
-                },
-            ),
-            (1.0, 1.0)
+            super::effective_target_resolution(TR::Native, 3840, 2160, None, Some(1920)),
+            TR::Fixed {
+                width: 1920,
+                height: 1080
+            }
         );
+        // Explicit controller pick ABOVE the soft cap wins (operator override).
+        let user = TR::Fixed {
+            width: 2560,
+            height: 1440,
+        };
+        assert_eq!(
+            super::effective_target_resolution(user, 3840, 2160, None, Some(1920)),
+            user
+        );
+        // Native already within the soft cap → stays Native (no pointless Fixed).
+        assert_eq!(
+            super::effective_target_resolution(TR::Native, 1920, 1200, None, Some(1920)),
+            TR::Native
+        );
+    }
+
+    #[test]
+    fn hard_cap_clamps_native_and_oversized_picks() {
+        // B1: relay cap 1280 clamps Native on a 2560×1600 panel (the NEO16
+        // blur↔crystallize field case).
+        assert_eq!(
+            super::effective_target_resolution(TR::Native, 2560, 1600, Some(1280), None),
+            TR::Fixed {
+                width: 1280,
+                height: 800
+            }
+        );
+        // ...and clamps an explicit pick LARGER than the cap (link physics).
+        assert_eq!(
+            super::effective_target_resolution(
+                TR::Fixed {
+                    width: 1920,
+                    height: 1200
+                },
+                2560,
+                1600,
+                Some(1280),
+                None
+            ),
+            TR::Fixed {
+                width: 1280,
+                height: 800
+            }
+        );
+        // ...and an oversized Fit request (bigger than native = really
+        // native) can't dodge the cap.
+        assert_eq!(
+            super::effective_target_resolution(
+                TR::Fixed {
+                    width: 3000,
+                    height: 2000
+                },
+                2560,
+                1600,
+                Some(1280),
+                None
+            ),
+            TR::Fixed {
+                width: 1280,
+                height: 800
+            }
+        );
+    }
+
+    #[test]
+    fn hard_cap_keeps_smaller_user_pick() {
+        // A controller pick BELOW the relay cap is respected verbatim.
+        let user = TR::Fixed {
+            width: 960,
+            height: 600,
+        };
+        assert_eq!(
+            super::effective_target_resolution(user, 2560, 1600, Some(1280), None),
+            user
+        );
+    }
+
+    #[test]
+    fn hard_cap_noop_when_native_within_cap() {
+        // Small panel over relay → no cap engages.
+        assert_eq!(
+            super::effective_target_resolution(TR::Native, 1280, 720, Some(1280), None),
+            TR::Native
+        );
+    }
+
+    // rc.191 — aspect-preserving box resolve + near-native snap.
+    #[test]
+    fn user_box_preserves_source_aspect() {
+        // The field distortion case: stage-shaped Fit 1672×818 against a
+        // 16:9 source must NOT squash — uniform scale = min(0.87, 0.757).
+        let r = super::effective_target_resolution(
+            TR::Fixed {
+                width: 1672,
+                height: 818,
+            },
+            1920,
+            1080,
+            None,
+            None,
+        );
+        let TR::Fixed { width, height } = r else {
+            panic!("expected Fixed, got {r:?}");
+        };
+        // Aspect within a pixel of 16:9 after even-align.
+        let src_aspect = 1920.0 / 1080.0;
+        let out_aspect = width as f32 / height as f32;
+        assert!(
+            (out_aspect - src_aspect).abs() < 0.01,
+            "aspect distorted: {width}x{height}"
+        );
+        assert!(width <= 1672 && height <= 818, "must fit the box");
+    }
+
+    #[test]
+    fn near_native_box_snaps_to_native() {
+        // Within 15% of the source → 1:1 passthrough instead of a mushy
+        // 0.9× resample (needs ambient env unset — tests don't set it).
+        assert_eq!(
+            super::effective_target_resolution(
+                TR::Fixed {
+                    width: 1836,
+                    height: 1148
+                },
+                1920,
+                1200,
+                None,
+                None
+            ),
+            TR::Native
+        );
+        // A fullscreen-sized box ≥ native is Native outright.
+        assert_eq!(
+            super::effective_target_resolution(
+                TR::Fixed {
+                    width: 1920,
+                    height: 1200
+                },
+                1920,
+                1080,
+                None,
+                None
+            ),
+            TR::Native
+        );
+    }
+
+    #[test]
+    fn snapped_native_still_respects_hard_cap() {
+        // Snap must not dodge relay physics: near-native box on a relay
+        // session still clamps to the cap.
+        assert_eq!(
+            super::effective_target_resolution(
+                TR::Fixed {
+                    width: 1836,
+                    height: 1148
+                },
+                1920,
+                1200,
+                Some(1280),
+                None
+            ),
+            TR::Fixed {
+                width: 1280,
+                height: 800
+            }
+        );
+    }
+
+    #[test]
+    fn soft_then_hard_compose() {
+        // GEAL8N6-over-relay worst case: 4K panel, libvpx, constrained.
+        // Soft 1920 fills in for Native, then hard 1280 clamps further.
+        assert_eq!(
+            super::effective_target_resolution(TR::Native, 3840, 2160, Some(1280), Some(1920)),
+            TR::Fixed {
+                width: 1280,
+                height: 720
+            }
+        );
+    }
+
+    // rc.190 (B3) — stuck-session watchdog decision matrix.
+    use super::WatchdogVerdict as WV;
+    use std::time::Duration as D;
+    use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState as PS;
+
+    const DEADLINE: D = D::from_secs(45);
+    const GRACE: D = D::from_secs(20);
+
+    #[test]
+    fn watchdog_kills_never_connected_after_deadline() {
+        // The NEO16 field case: ICE wedged in Connecting, no Failed ever.
+        assert_eq!(
+            super::session_watchdog_verdict(
+                PS::Connecting,
+                false,
+                D::from_secs(46),
+                None,
+                DEADLINE,
+                GRACE
+            ),
+            WV::Kill
+        );
+        // …but waits patiently before the deadline.
+        assert_eq!(
+            super::session_watchdog_verdict(
+                PS::Connecting,
+                false,
+                D::from_secs(30),
+                None,
+                DEADLINE,
+                GRACE
+            ),
+            WV::Wait
+        );
+    }
+
+    #[test]
+    fn watchdog_never_kills_a_connected_peer() {
+        assert_eq!(
+            super::session_watchdog_verdict(
+                PS::Connected,
+                true,
+                D::from_secs(9999),
+                None,
+                DEADLINE,
+                GRACE
+            ),
+            WV::Wait
+        );
+    }
+
+    #[test]
+    fn watchdog_connecting_after_connected_is_not_the_never_connected_case() {
+        // ICE restart mid-session: state back to Connecting but
+        // connected_once=true → the connect deadline must NOT apply.
+        assert_eq!(
+            super::session_watchdog_verdict(
+                PS::Connecting,
+                true,
+                D::from_secs(9999),
+                None,
+                DEADLINE,
+                GRACE
+            ),
+            WV::Wait
+        );
+    }
+
+    #[test]
+    fn watchdog_kills_disconnected_limbo_after_grace() {
+        assert_eq!(
+            super::session_watchdog_verdict(
+                PS::Disconnected,
+                true,
+                D::from_secs(300),
+                Some(D::from_secs(21)),
+                DEADLINE,
+                GRACE
+            ),
+            WV::Kill
+        );
+        // A short blip inside the grace recovers on its own — leave it.
+        assert_eq!(
+            super::session_watchdog_verdict(
+                PS::Disconnected,
+                true,
+                D::from_secs(300),
+                Some(D::from_secs(5)),
+                DEADLINE,
+                GRACE
+            ),
+            WV::Wait
+        );
+    }
+
+    #[test]
+    fn watchdog_disarms_on_closed_and_failed() {
+        // Failed is already Terminated by the state-change handler; Closed
+        // is a normal teardown — either way the watchdog stands down.
+        for s in [PS::Closed, PS::Failed] {
+            assert_eq!(
+                super::session_watchdog_verdict(
+                    s,
+                    false,
+                    D::from_secs(9999),
+                    None,
+                    DEADLINE,
+                    GRACE
+                ),
+                WV::Disarm
+            );
+        }
     }
 
     #[test]

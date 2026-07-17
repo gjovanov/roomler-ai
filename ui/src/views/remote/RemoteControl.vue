@@ -321,6 +321,20 @@
       >
         <v-icon>{{ hevcOn ? 'mdi-video-vintage' : 'mdi-video' }}</v-icon>
       </v-btn>
+      <!-- rc.190 — AV1 over DataChannel toggle. Gated on the agent
+           advertising AV1 encode silicon + WebCodecs AV1 decode here. -->
+      <v-btn
+        icon
+        variant="text"
+        size="small"
+        :color="av1On ? 'primary' : undefined"
+        :disabled="!rc.av1Supported.value || !agentHasAv1"
+        :aria-label="av1On ? 'Disable AV1 DataChannel path' : 'Enable AV1 DataChannel path'"
+        :title="av1Tooltip"
+        @click="toggleAv1"
+      >
+        <v-icon>mdi-alpha-a-box{{ av1On ? '' : '-outline' }}</v-icon>
+      </v-btn>
       <!-- Low-latency (WebCodecs) toggle. Bypasses Chrome's <video>
            jitter-buffer floor (~80ms). Disabled when the browser
            lacks RTCRtpScriptTransform / VideoDecoder. -->
@@ -989,6 +1003,44 @@
               @click="toggleHevc"
             >
               HEVC {{ hevcOn ? 'ON' : 'OFF' }}
+            </v-btn>
+            <!-- rc.190 — AV1 over DataChannel toggle (drawer). -->
+            <v-btn
+              variant="tonal"
+              :color="av1On ? 'primary' : undefined"
+              :disabled="!rc.av1Supported.value || !agentHasAv1"
+              prepend-icon="mdi-alpha-a-box"
+              :title="av1Tooltip"
+              class="flex-grow-1"
+              @click="toggleAv1"
+            >
+              AV1 {{ av1On ? 'ON' : 'OFF' }}
+            </v-btn>
+            <!-- rc.190 — return to Auto transport (the default): pick the
+                 best HW×HW codec for this agent+viewer pair at Connect. -->
+            <v-btn
+              variant="tonal"
+              :color="transportAutoOn ? 'primary' : undefined"
+              prepend-icon="mdi-auto-fix"
+              :title="transportAutoTooltip"
+              class="flex-grow-1"
+              @click="setTransportAuto"
+            >
+              Auto {{ transportAutoOn ? 'ON' : 'OFF' }}
+            </v-btn>
+            <!-- rc.191 — Match remote display: the HOST switches its display
+                 mode to fit this window (1:1 pixels = sharpest text),
+                 restored on disconnect. Windows hosts only. -->
+            <v-btn
+              variant="tonal"
+              :color="displayMatchOn ? 'primary' : undefined"
+              :disabled="!agentSupportsDisplayMatch"
+              prepend-icon="mdi-monitor-screenshot"
+              :title="displayMatchTooltip"
+              class="flex-grow-1"
+              @click="toggleDisplayMatch"
+            >
+              1:1 Match {{ displayMatchOn ? 'ON' : 'OFF' }}
             </v-btn>
             <v-btn
               variant="tonal"
@@ -2148,6 +2200,52 @@ function toggleHevc() {
   rc.setVideoTransport(next)
 }
 
+// rc.190 — AV1 over DataChannel toggle. Same shape as toggleHevc. Gated
+// on the agent advertising AV1 encode silicon (only NVIDIA Ada+/RTX 40xx+,
+// Intel Arc, AMD RDNA3+ have it) AND WebCodecs AV1 decode here (dav1d SW
+// ships in Chromium, so the browser side is ~always true on Chrome).
+const av1On = computed<boolean>(() => rc.videoTransport.value === 'data-channel-av1')
+const agentHasAv1 = computed<boolean>(() => {
+  const caps = agent.value?.capabilities
+  // Caps not loaded yet → optimistic; the agent falls back to the WebRTC
+  // track if it can't honour the transport (same contract as HEVC).
+  if (!caps) return true
+  return (
+    (caps.transports ?? []).includes('data-channel-av1')
+    || (caps.hw_encoders ?? []).some((e) => e.startsWith('ffmpeg-av1_'))
+  )
+})
+const av1Tooltip = computed<string>(() => {
+  if (!rc.av1Supported.value) {
+    return 'AV1 over DataChannel requires WebCodecs AV1 decode — not supported in this browser'
+  }
+  if (!agentHasAv1.value) {
+    return 'This agent has no AV1 hardware encoder (needs NVIDIA RTX 40xx+, Intel Arc, or AMD RDNA3+) — AV1 unavailable'
+  }
+  return av1On.value
+    ? 'AV1 over DataChannel ON — best quality per bit at low bitrates (agent encodes via av1_nvenc/qsv/amf). Takes effect on next Connect.'
+    : 'AV1 over DataChannel OFF — click to switch to AV1 on next Connect.'
+})
+function toggleAv1() {
+  const next: RcVideoTransport = av1On.value ? 'webrtc' : 'data-channel-av1'
+  rc.setVideoTransport(next)
+}
+
+// rc.190 — Auto transport (the new default): at Connect the composable
+// ranks codecs by what's HARDWARE on BOTH ends (agent hw_encoders ×
+// this browser's MediaCapabilities) — AV1 > HEVC > VP9-HW > VP9-SW >
+// webrtc. Any explicit toggle above overrides; this button returns to
+// Auto.
+const transportAutoOn = computed<boolean>(() => rc.videoTransport.value === 'auto')
+const transportAutoTooltip = computed<string>(() =>
+  transportAutoOn.value
+    ? 'Transport AUTO — the best hardware-accelerated codec for this agent+viewer pair is picked at Connect'
+    : 'Click to let the viewer auto-pick the best hardware codec for this agent+viewer pair on next Connect',
+)
+function setTransportAuto() {
+  rc.setVideoTransport('auto')
+}
+
 // Opt-in "receive host audio" toggle. Same "takes effect on next
 // Connect" shape as the transport toggles above (the recvonly audio
 // transceiver + `audio_enabled` request flag are fixed at offer time),
@@ -2485,6 +2583,70 @@ function applyFitResolution() {
   rc.setResolution({ mode: 'fit', width: w, height: h })
 }
 
+// rc.191 — "Match remote display" toggle. When ON, the agent switches the
+// HOST's display to the largest mode fitting this viewer's stage (and
+// restores it on disconnect/toggle-off) — the RDP-style fix that makes the
+// pixel chain 1:1 so remote text is rendered AT the viewed size instead of
+// downscaled into mush. Opt-in (changing a host's display mode is
+// invasive), persisted per-agent, Windows hosts only (v1).
+const DISPLAY_MATCH_STORAGE_PREFIX = 'roomler-rc-display-match.v2:'
+const displayMatchOn = ref(false)
+const agentSupportsDisplayMatch = computed<boolean>(() => {
+  // Gate on OS — old agents just ignore the unknown control message, so
+  // there's no version gate needed (harmless no-op there).
+  return (agent.value?.os ?? '').toLowerCase().startsWith('win')
+})
+const displayMatchTooltip = computed<string>(() => {
+  if (!agentSupportsDisplayMatch.value) {
+    return 'Match remote display is available for Windows hosts only (v1)'
+  }
+  return displayMatchOn.value
+    ? 'Match remote display ON — the host switched its display mode to fit this window (restored on disconnect). Sharpest text.'
+    : 'Match remote display OFF — click to switch the HOST\'s display mode to fit this window (1:1 pixels, sharpest text). Restored on disconnect.'
+})
+function readStoredDisplayMatch(agentId: string): boolean {
+  try {
+    return globalThis.localStorage?.getItem(DISPLAY_MATCH_STORAGE_PREFIX + agentId) === '1'
+  } catch {
+    return false
+  }
+}
+function persistDisplayMatch(agentId: string, on: boolean) {
+  try {
+    if (on) globalThis.localStorage?.setItem(DISPLAY_MATCH_STORAGE_PREFIX + agentId, '1')
+    else globalThis.localStorage?.removeItem(DISPLAY_MATCH_STORAGE_PREFIX + agentId)
+  } catch {
+    /* best-effort */
+  }
+}
+/** Send the display-match request for the CURRENT stage size. */
+function sendDisplayMatchNow() {
+  const el = stageEl.value
+  if (!el) return
+  const rect = el.getBoundingClientRect()
+  const dpr = window.devicePixelRatio || 1
+  rc.sendDisplayMatch({
+    width: Math.max(160, Math.round(rect.width * dpr)),
+    height: Math.max(90, Math.round(rect.height * dpr)),
+  })
+}
+function toggleDisplayMatch() {
+  displayMatchOn.value = !displayMatchOn.value
+  persistDisplayMatch(agentId.value, displayMatchOn.value)
+  if (rc.phase.value === 'connected') {
+    if (displayMatchOn.value) sendDisplayMatchNow()
+    else rc.sendDisplayMatch(null)
+  }
+}
+// Restore the per-agent preference (route param is stable per mount).
+watch(
+  agentId,
+  (id) => {
+    if (id) displayMatchOn.value = readStoredDisplayMatch(id)
+  },
+  { immediate: true },
+)
+
 // ResizeObserver on the stage so Fit mode tracks viewport changes.
 // Debounced — drag-resize fires dozens of events per second and each
 // rc:resolution change rebuilds the encoder on the agent side.
@@ -2540,7 +2702,18 @@ const statsCodecLabel = computed(() => {
     // this suffix flips live. Empty from agents older than the field.
     const path =
       vi.transport === 'relay' ? ' · relay' : vi.transport === 'direct' ? ' · direct' : ''
-    return [codecName, chromaName, hw].filter(Boolean).join(' ') + enc + path
+    // rc.190 — the VIEWER half of the HW×HW story: whether THIS browser
+    // decodes the session's codec on fixed-function silicon
+    // (MediaCapabilities smooth+powerEfficient at transport-pick time).
+    // The agent-side `hw` above covers encode; a weak viewer grinding a
+    // codec in software is now visible instead of a mystery.
+    const dec =
+      rc.viewerDecodeHw.value === true
+        ? ' · dec HW'
+        : rc.viewerDecodeHw.value === false
+          ? ' · dec SW'
+          : ''
+    return [codecName, chromaName, hw].filter(Boolean).join(' ') + enc + path + dec
   }
   // Fallback when the agent hasn't sent video-info (legacy track /
   // libvpx VP9-444 path). Derive chroma from the USER's selection
@@ -3059,6 +3232,12 @@ watch(
       // stored width/height are from the previous session — re-emit
       // with the current window size so the agent uses today's dims.
       if (rc.resolution.value.mode === 'fit') applyFitResolution()
+      // rc.191 — re-assert the display-match preference each session (the
+      // agent restores its display mode on every disconnect, so an ON
+      // toggle must be re-sent per connect).
+      if (displayMatchOn.value && agentSupportsDisplayMatch.value) {
+        sendDisplayMatchNow()
+      }
     } else if (phase !== 'connected' && detachInput) {
       detachInput()
       detachInput = null

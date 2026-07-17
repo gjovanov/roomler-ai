@@ -174,6 +174,41 @@ pub(crate) fn relay_max_bps() -> u32 {
         .unwrap_or(3_000_000)
 }
 
+/// rc.190 (B1) — long-edge RESOLUTION cap for a constrained relay-TCP
+/// transport. `relay_max_bps` caps the bitrate at ~3 Mbps, but a 2560×1600
+/// stream at 3 Mbps starves into the blur↔crystallize AIMD sawtooth (field
+/// NEO16→PC50045 2026-07-16) — fewer pixels per bit is the actual fix, so the
+/// DC pumps also cap the encode resolution. Default 1280 long edge (≈1280×800
+/// at 3 Mbps is smooth); env `ROOMLER_AGENT_RELAY_MAX_EDGE`, `0` disables.
+/// Hard cap: clamps even an explicit controller pick (it's link physics).
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+pub(crate) fn relay_res_cap_long_edge() -> Option<u32> {
+    let v = std::env::var("ROOMLER_AGENT_RELAY_MAX_EDGE")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(1280);
+    (v > 0).then_some(v)
+}
+
+/// rc.190 (B2) — long-edge RESOLUTION cap for the SOFTWARE-encoded DC pump
+/// (libvpx). Mirrors the RTP pump's SW auto-downscale: a 4K panel through
+/// libvpx crawls (~25 fps at cpu-used 6, host CPU pinned — field GEAL8N6
+/// 2026-07-16). Default 1920 long edge; env `ROOMLER_AGENT_SW_MAX_EDGE`,
+/// `0` disables. Soft cap: fills in only when the controller left resolution
+/// at Native — an explicit rc:resolution pick wins ("operator can override",
+/// same contract as the RTP pump's auto-downscale).
+#[cfg_attr(not(feature = "vp9-444"), allow(dead_code))]
+pub(crate) fn sw_res_cap_long_edge() -> Option<u32> {
+    let v = std::env::var("ROOMLER_AGENT_SW_MAX_EDGE")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(1920);
+    (v > 0).then_some(v)
+}
+
 #[derive(Debug, Clone)]
 pub struct EncodedPacket {
     pub data: Vec<u8>,
@@ -563,12 +598,19 @@ mod tests {
         unsafe { std::env::remove_var("ROOMLER_AGENT_HW_AUTO") };
     }
 
+    // rc.191 — BOTH tests below read/write ROOMLER_AGENT_RELAY_MAX_KBPS;
+    // cargo's parallel runner interleaved them once the peer::tests grew
+    // (field flake 2026-07-16: the clamp test observed the reader test's
+    // mid-flight "4200" write). Serialise them on one lock.
+    static RELAY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn relay_max_bps_reads_env() {
+        let _guard = RELAY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Hermetic: save the prior value, exercise set/unset, then restore.
         // SAFETY: same reasoning as `hw_auto_disabled_reads_env` — no other
         // code in this crate touches ROOMLER_AGENT_RELAY_MAX_KBPS at test
-        // time, and this module's env-touching tests don't overlap on it.
+        // time, and the tests that do share RELAY_ENV_LOCK.
         let prior = std::env::var("ROOMLER_AGENT_RELAY_MAX_KBPS").ok();
 
         unsafe { std::env::remove_var("ROOMLER_AGENT_RELAY_MAX_KBPS") };
@@ -598,9 +640,10 @@ mod tests {
 
     #[test]
     fn relay_clamp_caps_vp9_444_target() {
-        // Pure logic (no env): the `x.min(relay_max_bps())` clamp the pump
-        // applies must pull a 0.20-bpp 2560×1600@30 VP9-444 target
-        // (12_441_600 bps) down to the 3 Mbps relay ceiling.
+        let _guard = RELAY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // The `x.min(relay_max_bps())` clamp the pump applies must pull a
+        // 0.20-bpp 2560×1600@30 VP9-444 target (12_441_600 bps) down to
+        // the 3 Mbps relay ceiling.
         let prior = std::env::var("ROOMLER_AGENT_RELAY_MAX_KBPS").ok();
         unsafe { std::env::remove_var("ROOMLER_AGENT_RELAY_MAX_KBPS") };
 
