@@ -712,12 +712,19 @@ function renderDone() {
   // old pre-P4b MSI was served, so we don't promise a CLI we didn't
   // deliver.
   const cliIncluded = !isTunnel && done.cliIncluded === true;
-  document.getElementById("done-lead").textContent = isTunnel
-    ? "The tunnel client is installed, enrolled, and on PATH."
-    : cliIncluded
-      ? "The Roomler daemon is installed and enrolled. The roomler CLI " +
-        "came with it (managed by the daemon's updater from now on)."
-      : "The Roomler daemon is installed and enrolled.";
+  // GAP-A/P6: daemon roles also place the roomler-desktop GUI beside
+  // the daemon (best-effort; a stale server / download failure leaves
+  // it false, so we don't claim a desktop we didn't install).
+  const desktopInstalled = !isTunnel && done.desktopInstalled === true;
+  let lead;
+  if (isTunnel) {
+    lead = "The tunnel client is installed, enrolled, and on PATH.";
+  } else {
+    lead = "The Roomler daemon is installed and enrolled.";
+    if (cliIncluded) lead += " The roomler CLI came with it (managed by the daemon's updater).";
+    if (desktopInstalled) lead += " The roomler-desktop app is installed alongside it.";
+  }
+  document.getElementById("done-lead").textContent = lead;
 
   document.getElementById("done-principal-label").textContent =
     isTunnel ? "Tunnel client ID" : "Agent ID";
