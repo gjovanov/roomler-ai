@@ -51,6 +51,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
+use tunnel_core::env::node_env_os;
 
 /// 2 GiB. SCTP DCs in webrtc-rs can carry larger payloads in theory
 /// but per-transfer >2 GB is outside the "drop a file" use case and
@@ -215,7 +216,7 @@ pub(crate) static STAGE_IN_PROGRAMDATA: std::sync::LazyLock<bool> =
         if cfg!(test) {
             return false;
         }
-        if std::env::var_os("ROOMLER_AGENT_STAGING_LEGACY_PER_DEST").is_some() {
+        if node_env_os("STAGING_LEGACY_PER_DEST").is_some() {
             tracing::info!(
                 "files: ROOMLER_AGENT_STAGING_LEGACY_PER_DEST set; reverting to per-dest staging"
             );
@@ -236,10 +237,7 @@ pub(crate) fn stage_in_programdata() -> bool {
 /// (matches the rc.21 download_dir() fallback shape).
 #[cfg(target_os = "windows")]
 pub(crate) fn staging_root_windows() -> PathBuf {
-    let pd = std::env::var_os("ProgramData")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("C:\\ProgramData"));
-    pd.join("roomler").join("roomler-agent").join("staging")
+    crate::appdirs::machine_global_dir().join("staging")
 }
 
 /// Compute the canonical staging dir path for an upload `id`. On
@@ -1950,10 +1948,7 @@ fn download_dir() -> Result<PathBuf> {
     // landed files there via the `files:complete { path }` reply.
     #[cfg(target_os = "windows")]
     {
-        let pd = std::env::var_os("ProgramData")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("C:\\ProgramData"));
-        let staging = pd.join("roomler").join("roomler-agent").join("uploads");
+        let staging = crate::appdirs::machine_global_dir().join("uploads");
         tracing::warn!(
             fallback_path = %staging.display(),
             "files: no user-accessible Downloads dir (Folder Redirection?); staging in PROGRAMDATA"

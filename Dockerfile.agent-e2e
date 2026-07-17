@@ -46,7 +46,11 @@ RUN apt-get update \
         libssl3 \
         libgcc-s1 \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /src/target/release/roomler-agent /usr/local/bin/roomler-agent
+# P3d Slice B: the built binary is now `roomlerd` (the [[bin]] output name).
+# This self-contained e2e image installs it under the legacy in-image path
+# `/usr/local/bin/roomler-agent` (the bootstrap + run scripts below invoke that
+# path); only the COPY SOURCE changes. The e2e image is not the field fleet.
+COPY --from=builder /src/target/release/roomlerd /usr/local/bin/roomler-agent
 
 # Bootstrap script. The Pod's StatefulSet sets `ROOMLER_E2E_SERVER`
 # (the in-cluster API URL) + `ROOMLER_E2E_TENANT_SLUG` + `ROOMLER_E2E_

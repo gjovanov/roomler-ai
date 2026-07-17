@@ -9,7 +9,13 @@ name = "roomler_agent"
 path = "src/lib.rs"
 
 [[bin]]
-name = "roomler-agent"
+# P3d Slice B: the OUTPUT binary is `roomlerd` (daemon). The package
+# (`roomler-agent`) + lib (`roomler_agent`) names are UNCHANGED — only
+# the emitted exe filename moves. CI stages a `roomler-agent.exe` alias
+# copy next to it so the installed field fleet (which references the old
+# name via the WiX AgentExe File + the tray spawn fallback) is never
+# orphaned. See wix/main.wxs `AgentExeAlias` + release-agent.yml Copy-Item.
+name = "roomlerd"
 path = "src/main.rs"
 
 [dependencies]
@@ -447,13 +453,17 @@ depends = "libc6, libxcb1, libxcb-shm0, libxcb-randr0, libasound2"
 section = "net"
 priority = "optional"
 assets = [
-    ["target/release/roomler-agent", "usr/bin/", "755"],
+    # P3d Slice B: installed binary is `roomlerd` (the [[bin]] output name).
+    ["target/release/roomlerd", "usr/bin/", "755"],
     # Bundled FFmpeg 8.1.2 (LGPL) for the ffmpeg-encoder HEVC backend. Populated
     # by the "Bundle FFmpeg" CI step (SONAME-named real files, $ORIGIN RPATH) so
     # the .deb is self-contained — stock Ubuntu ships an ABI-incompatible FFmpeg
     # 6.1. This glob is CI-only (the Linux .deb is never built locally).
     ["vendor-ffmpeg/*.so.*", "usr/lib/roomler-agent/", "644"],
-    ["packaging/linux/roomler-agent.service", "usr/lib/systemd/user/roomler-agent.service", "644"],
+    # P3d Slice B: systemd unit renamed roomler-agent.service -> roomler.service
+    # (ExecStart drives /usr/bin/roomlerd). The install DIR (usr/lib/roomler-agent,
+    # usr/share/doc/roomler-agent) stays as-is — out of scope for the rename.
+    ["packaging/linux/roomler.service", "usr/lib/systemd/user/roomler.service", "644"],
     ["packaging/linux/README.Debian", "usr/share/doc/roomler-agent/README.Debian", "644"],
 ]
 

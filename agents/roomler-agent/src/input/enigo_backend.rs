@@ -20,6 +20,7 @@ use std::sync::mpsc as std_mpsc;
 use std::thread;
 
 use super::{Button, InputInjector, InputMsg, WheelMode};
+use tunnel_core::env::node_env;
 
 pub struct EnigoInjector {
     tx: std_mpsc::Sender<InputMsg>,
@@ -204,13 +205,8 @@ fn map_button(b: Button) -> EnigoButton {
 /// resulting `bool` is then cheap to read from the hot input path.
 fn virtual_screen_enabled() -> bool {
     use std::sync::LazyLock;
-    static FLAG: LazyLock<bool> = LazyLock::new(|| {
-        super::parse_virtual_screen_flag(
-            std::env::var("ROOMLER_AGENT_VIRTUAL_SCREEN")
-                .ok()
-                .as_deref(),
-        )
-    });
+    static FLAG: LazyLock<bool> =
+        LazyLock::new(|| super::parse_virtual_screen_flag(node_env("VIRTUAL_SCREEN").as_deref()));
     *FLAG
 }
 

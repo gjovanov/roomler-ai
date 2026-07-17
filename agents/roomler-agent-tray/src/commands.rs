@@ -520,27 +520,36 @@ fn probe_service_state() -> (String, bool) {
     ("none".to_string(), false)
 }
 
-/// Resolve the agent's executable path. For a packaged install, the
-/// tray and agent ship in the same dir (per the MSI layout). For dev
+/// Resolve the agent daemon's executable path. For a packaged install, the
+/// tray and daemon ship in the same dir (per the MSI layout). For dev
 /// builds, fall back to PATH lookup.
+///
+/// P3d Slice B renamed the daemon OUTPUT binary `roomler-agent` -> `roomlerd`.
+/// Resolution prefers a sibling `roomlerd[.exe]` (so a fresh tray spawns the
+/// new daemon), then falls back to the legacy `roomler-agent[.exe]` (which the
+/// MSI still ships as the inert `AgentExeAlias`, so a mixed / in-flight install
+/// still resolves), then finally the bare new name relying on PATH.
 fn agent_exe_path() -> Result<PathBuf, String> {
-    let exe_name = if cfg!(windows) {
-        "roomler-agent.exe"
+    let (new_name, old_name) = if cfg!(windows) {
+        ("roomlerd.exe", "roomler-agent.exe")
     } else {
-        "roomler-agent"
+        ("roomlerd", "roomler-agent")
     };
-    // Prefer same dir as the tray (production layout).
+    // Prefer same dir as the tray (production layout): new name first, then
+    // the legacy alias so a mixed install still resolves.
     if let Ok(tray_exe) = std::env::current_exe()
         && let Some(dir) = tray_exe.parent()
     {
-        let candidate = dir.join(exe_name);
-        if candidate.exists() {
-            return Ok(candidate);
+        for name in [new_name, old_name] {
+            let candidate = dir.join(name);
+            if candidate.exists() {
+                return Ok(candidate);
+            }
         }
     }
-    // Fall back to bare name — relies on PATH (dev runs / Linux
-    // installs that put roomler-agent in /usr/bin).
-    Ok(PathBuf::from(exe_name))
+    // Fall back to the bare new name — relies on PATH (dev runs / Linux
+    // installs that put roomlerd in /usr/bin).
+    Ok(PathBuf::from(new_name))
 }
 
 fn open_path_in_explorer(path: &std::path::Path) -> Result<(), String> {
