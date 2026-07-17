@@ -123,18 +123,32 @@ async function probeAndRender() {
 }
 
 function wireGlobalListeners() {
-  // B9: single-instance plugin emits this when a second wizard EXE
-  // launch finds an in-flight install in the first process. Pop a
-  // snackbar; the new process exits silently on the Rust side.
-  listen("installer-already-running", () => {
-    showSnackbar("Wizard is already running — finish the current install first.");
-  });
-
+  // Wire the step handlers FIRST — the Next/Back buttons are critical,
+  // and NOTHING below may prevent them from being bound. (Regression
+  // 2026-07-17: the optional single-instance listener was wired first;
+  // when the `event:listen` capability was missing it threw the whole
+  // function aborted before these ran, so every Next button was dead.)
   wireWelcome();
   wireServer();
   wireToken();
   wireInstall();
   wireDone();
+
+  // B9: single-instance plugin emits this when a second wizard EXE
+  // launch finds an in-flight install in the first process. Pop a
+  // snackbar; the new process exits silently on the Rust side. Fully
+  // OPTIONAL + best-effort — guarded against both a synchronous throw
+  // and a rejected promise so a missing/denied event capability can
+  // never break wizard navigation.
+  try {
+    Promise.resolve(
+      listen("installer-already-running", () => {
+        showSnackbar("Wizard is already running — finish the current install first.");
+      }),
+    ).catch((e) => console.warn("single-instance listener unavailable:", e));
+  } catch (e) {
+    console.warn("single-instance listener unavailable:", e);
+  }
 }
 
 // ─── Render dispatch ───────────────────────────────────────────────────────
