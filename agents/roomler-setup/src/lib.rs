@@ -7,10 +7,10 @@
 //! elevation on Windows when run from a non-admin shell).
 //!
 //! One app, four roles (see [`role::Role`]): the three daemon roles
-//! drive the MSI pipeline relocated from `agents/roomler-installer`
-//! ([`orchestrator_agent`]); the tunnel-client role drives the
-//! archive pipeline relocated from `agents/roomler-tunnel-installer`
-//! ([`orchestrator_tunnel`]). Mechanics (asset resolver, MSI runner,
+//! drive the MSI pipeline ([`orchestrator_agent`]); the tunnel-client
+//! role drives the archive pipeline ([`orchestrator_tunnel`]) — both
+//! relocated (P4a) from the legacy wizard crates retired in P4c-2.
+//! Mechanics (asset resolver, MSI runner,
 //! extract, integration, enroll HTTP, unified ProgressEvent) come
 //! from `wizard_shared` (`crates/roomler-setup-core`); the agent- and
 //! tunnel-coupled calls stay here.

@@ -1,8 +1,7 @@
 //! Shared install-wizard machinery for the unified `roomler-setup`
-//! app — and, until P4c retires them, the two legacy wizard crates
-//! (`roomler-installer`, `roomler-tunnel-installer`), which re-export
-//! these modules through path-compatible shims so their behaviour
-//! stays byte-identical.
+//! app. (Through P4a-P4c-1 it also served the two legacy wizard
+//! crates via path-compatible shims, keeping their behaviour
+//! byte-identical until both were retired in P4c-2.)
 //!
 //! Layering rule (also spelled out in Cargo.toml): this crate is the
 //! EVENT-SHAPE-FREE mechanics layer. No `tauri`, no `roomler-agent`,

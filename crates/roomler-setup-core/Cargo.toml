@@ -12,9 +12,8 @@ description = "Shared install-wizard machinery for the unified roomler-setup app
 # `roomler_setup_core` would produce `roomler_setup_core-<hash>.exe`
 # which UAC refuses to launch from an unelevated `cargo test` with
 # "os error 740: The requested operation requires elevation". Same
-# lesson as the rc.28 agent wizard (lib `wizard_core`) and the rc.59
-# tunnel wizard (lib `tunnel_wizard_core`); see
-# agents/roomler-installer/Cargo.toml for the original write-up.
+# lesson as the retired rc.28 agent wizard (lib `wizard_core`) and
+# rc.59 tunnel wizard (lib `tunnel_wizard_core`).
 name = "wizard_shared"
 path = "src/lib.rs"
 

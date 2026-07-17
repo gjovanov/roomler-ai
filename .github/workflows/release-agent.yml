@@ -780,8 +780,8 @@ jobs:
             Write-Host "::notice::MSI within the P4b size budget."
           }
 
-      # Tray + installer wizard EXEs are built by the parallel
-      # `build-windows-companions` job below (they only need the agent's
+      # The desktop companion EXE is built by the parallel
+      # `build-windows-companions` job below (it only needs the agent's
       # DEFAULT feature graph — no vcpkg/FFmpeg/libvpx — and used to add
       # ~9 min of serial tail here).
 
@@ -839,16 +839,17 @@ jobs:
           retention-days: 30
 
   # ---------------------------------------------------------------------------
-  # 2b. Windows companions — tray + installer wizard EXEs, built in PARALLEL
-  #     with the MSI job. Both crates dep on roomler-agent with DEFAULT
-  #     features (`default = []`, signalling-only), so this job needs no
-  #     vcpkg / FFmpeg / libvpx / LLVM — precedent: release-tunnel-wizard.yml
-  #     builds Tauri 2 + the agent-default graph on a bare windows-latest.
-  #     The MSIs never contained these EXEs (they ship standalone), so the
-  #     split changes wall-clock only.
+  # 2b. Windows companion — the roomler-desktop EXE, built in PARALLEL with
+  #     the MSI job. The crate deps on roomler-agent with DEFAULT features
+  #     (`default = []`, signalling-only), so this job needs no vcpkg /
+  #     FFmpeg / libvpx / LLVM — Tauri 2 + the agent-default graph build on
+  #     a bare windows-latest. The MSIs never contained this EXE (it ships
+  #     standalone), so the split changes wall-clock only. (P4c-2 retired
+  #     the legacy roomler-installer wizard EXE this job also used to build
+  #     — the unified roomler-setup wizard ships via release-setup.yml.)
   # ---------------------------------------------------------------------------
   build-windows-companions:
-    name: Build tray + installer EXEs (Windows x86_64)
+    name: Build desktop companion EXE (Windows x86_64)
     needs: validate-version
     runs-on: windows-latest
     timeout-minutes: 60
@@ -903,32 +904,7 @@ jobs:
         env:
           WIN_CODESIGN_PFX_BASE64: ${{ secrets.WIN_CODESIGN_PFX_BASE64 }}
 
-      # rc.28: the installer wizard EXE. Ships as a plain
-      # Authenticode-signed `.exe` operators double-click; MSI bundling
-      # deferred. The lib target is named `wizard_core` (NOT
-      # `roomler_installer`) so cargo's test-binary names dodge Windows
-      # UAC's "installer detection" filename heuristic; the user-facing
-      # bin EXE keeps the marketing-friendly name.
-      - name: Build installer wizard EXE (release)
-        shell: pwsh
-        run: cargo build -p roomler-installer --release
-
-      - name: Locate + rename installer wizard EXE
-        id: locate_installer
-        shell: pwsh
-        run: |
-          $exe = "target/release/roomler-installer.exe"
-          if (-not (Test-Path $exe)) { throw "installer EXE not produced" }
-          $suffix = "-unsigned"
-          $signed = $env:WIN_CODESIGN_PFX_BASE64
-          if ($signed -and $signed.Length -gt 0) { $suffix = "" }
-          $dst = "roomler-installer-$env:VERSION-x86_64-pc-windows-msvc$suffix.exe"
-          Copy-Item $exe $dst
-          "artifact=$dst" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-        env:
-          WIN_CODESIGN_PFX_BASE64: ${{ secrets.WIN_CODESIGN_PFX_BASE64 }}
-
-      - name: Authenticode sign (tray + installer wizard)
+      - name: Authenticode sign (desktop companion)
         if: env.WIN_CODESIGN_PFX_BASE64 != ''
         shell: pwsh
         env:
@@ -940,51 +916,43 @@ jobs:
 
           $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" |
                       Sort-Object FullName -Descending | Select-Object -First 1
-          # rc.28: BLOCKER-10 fix from the plan critique — the installer
-          # wizard EXE MUST be signed so corporate ESET / Defender don't
-          # quarantine it as a "downloader trojan" (the EXE downloads
-          # MSIs + invokes msiexec, which trips every AV heuristic
-          # without a code-signing cert). Tray EXE signing is the
-          # zero-cost bonus.
+          # The desktop companion ships signed so SmartScreen / corporate
+          # AV don't flag an "Unknown publisher" EXE (signed since rc.28).
           & $signtool.FullName sign `
               /f $pfxPath `
               /p $env:WIN_CODESIGN_PASSWORD `
               /fd SHA256 `
               /tr http://timestamp.digicert.com `
               /td SHA256 `
-              "${{ steps.locate_tray.outputs.artifact }}" `
-              "${{ steps.locate_installer.outputs.artifact }}"
+              "${{ steps.locate_tray.outputs.artifact }}"
 
           Remove-Item $pfxPath -Force
 
       - name: Warn on unsigned build
         if: env.WIN_CODESIGN_PFX_BASE64 == ''
         shell: bash
-        run: echo "::warning::WIN_CODESIGN_PFX_BASE64 not set — tray + installer EXEs are unsigned. SmartScreen will flag 'Unknown publisher' and ESET may quarantine the installer."
+        run: echo "::warning::WIN_CODESIGN_PFX_BASE64 not set — the desktop companion EXE is unsigned. SmartScreen will flag 'Unknown publisher' and corporate AV may quarantine it."
         env:
           WIN_CODESIGN_PFX_BASE64: ${{ secrets.WIN_CODESIGN_PFX_BASE64 }}
 
-      - name: SHA256 checksum (both EXEs)
+      - name: SHA256 checksum (desktop companion)
         shell: pwsh
         run: |
           $files = @(
-            "${{ steps.locate_tray.outputs.artifact }}",
-            "${{ steps.locate_installer.outputs.artifact }}"
+            "${{ steps.locate_tray.outputs.artifact }}"
           )
           foreach ($f in $files) {
             $hash = (Get-FileHash -Algorithm SHA256 $f).Hash.ToLower()
             "$hash  $f" | Out-File -Encoding ascii "$f.sha256"
           }
 
-      - name: Upload artifacts (tray + installer)
+      - name: Upload artifacts (desktop companion)
         uses: actions/upload-artifact@v4
         with:
           name: windows-companions
           path: |
             ${{ steps.locate_tray.outputs.artifact }}
             ${{ steps.locate_tray.outputs.artifact }}.sha256
-            ${{ steps.locate_installer.outputs.artifact }}
-            ${{ steps.locate_installer.outputs.artifact }}.sha256
           retention-days: 30
 
   # ---------------------------------------------------------------------------
@@ -1281,10 +1249,10 @@ jobs:
       - name: Flatten artifact tree
         run: |
           mkdir -p release
-          # rc.18: include `.exe` so the tray companion EXE makes
+          # rc.18: include `.exe` so the desktop companion EXE makes
           # the GitHub Release alongside the agent MSI/.pkg/.deb.
           # `windows-msi` carries the two agent MSIs; `windows-companions`
-          # carries the tray + installer EXEs; flatten is extension-based
+          # carries the desktop EXE; flatten is extension-based
           # so both artifact dirs (+ all .sha256 files) land unchanged.
           find dist -type f \( -name '*.msi' -o -name '*.pkg' -o -name '*.deb' -o -name '*.exe' -o -name '*.sha256' \) \
             -exec mv {} release/ \;

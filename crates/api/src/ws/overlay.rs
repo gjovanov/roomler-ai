@@ -840,8 +840,8 @@ mod tests {
                 "turns:coturn.roomler.ai:443?transport=tcp".to_string(),
                 "turns:coturn.roomler.ai:5349?transport=tcp".to_string(),
             ],
-            username: "u".to_string(),
-            credential: "c".to_string(),
+            username: Some("u".to_string()),
+            credential: Some("c".to_string()),
         }];
         let out = rewrite_ice_hosts(servers, "coturn.roomler.ai", "94.130.141.74");
         assert_eq!(

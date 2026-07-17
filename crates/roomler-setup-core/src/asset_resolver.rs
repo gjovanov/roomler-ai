@@ -97,7 +97,7 @@ pub struct DownloadSpec<'a> {
     /// Absolute URL (proxy origin + `health.uri`), caller-composed.
     pub url: &'a str,
     /// Full staging path (the caller owns the temp-namespace
-    /// convention, e.g. `%TEMP%\roomler-installer\{tag}\{filename}`).
+    /// convention, e.g. `%TEMP%\roomler-setup\{tag}\{filename}`).
     pub dest: &'a Path,
     pub user_agent: &'a str,
     /// Label interpolated into error messages.
@@ -260,7 +260,7 @@ pub async fn find_release_asset(
 /// itself was compiled for.
 pub fn current_platform() -> &'static str {
     // Matches the backend's `normalise_platform` enum-shape used in
-    // both tunnel_release.rs and tunnel_wizard_release.rs.
+    // both tunnel_release.rs and setup_release.rs.
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     {
         "windows-x86_64"

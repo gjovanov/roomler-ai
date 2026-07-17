@@ -1,8 +1,9 @@
 //! Roomler Setup — the unified 5-step Tauri 2 wizard.
 //!
-//! ONE downloadable EXE replacing the two legacy wizards
-//! (`roomler-installer` for the daemon MSIs, `roomler-tunnel-installer`
-//! for the tunnel CLI). The operator picks a role on the Welcome step
+//! ONE downloadable EXE replacing the two legacy wizards retired in
+//! P4c-2 (`roomler-installer` drove the daemon MSIs,
+//! `roomler-tunnel-installer` the tunnel CLI). The operator picks a
+//! role on the Welcome step
 //! — three daemon flavours (Windows) or the tunnel client (any OS) —
 //! and the wizard drives the matching install pipeline end-to-end:
 //! detect → server + device → token → install (download / MSI or
