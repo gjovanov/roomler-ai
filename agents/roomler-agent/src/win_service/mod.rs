@@ -143,27 +143,37 @@ pub fn install(exe_path: &std::path::Path) -> Result<()> {
         account_name: None,
         account_password: None,
     };
+    // Clean slate BEFORE creating. Retire any prior NEW service (a leftover from
+    // an interrupted upgrade) AND the LEGACY service first, so create_service
+    // always writes a fresh registry entry — reusing a half-broken / marked-for-
+    // deletion NEW entry is what wedged the P3d neo16 smoke (StartServiceW then
+    // returned error 87). Deleting LEGACY first also frees its display name so
+    // the create can't hit ERROR_DUPLICATE_SERVICE_NAME during the migration
+    // overlap. Both tolerate "absent" (1060) / "marked-for-deletion" (1072).
+    let _ = delete_service(NEW_SERVICE_NAME);
+    let _ = delete_service(LEGACY_SERVICE_NAME);
+
     let access = ServiceAccess::CHANGE_CONFIG;
     match manager.create_service(&service_info, access) {
         Ok(s) => {
             let _ = s.set_description(SERVICE_DESCRIPTION);
         }
-        // ERROR_SERVICE_EXISTS — an earlier install/repair already created it.
-        Err(windows_service::Error::Winapi(e)) if e.raw_os_error() == Some(1073) => {}
+        // ERROR_SERVICE_EXISTS — a prior NEW service is still marked-for-deletion
+        // (a handle is open, e.g. services.msc), so we couldn't recreate it this
+        // cycle. It clears on reboot; the AutoStart service comes up then.
+        Err(windows_service::Error::Winapi(e)) if e.raw_os_error() == Some(1073) => {
+            tracing::warn!(
+                service = NEW_SERVICE_NAME,
+                "service exists + marked-for-deletion; clean recreate deferred to next boot"
+            );
+        }
         Err(e) => return Err(anyhow::anyhow!(e).context("create_service")),
     };
-    // Deliberately do NOT start the service from inside this deferred MSI custom
-    // action. Starting via the `create_service` handle mid-transaction fails at
-    // the SCM with error 87 ("parameter is incorrect") and leaves the service
-    // wedged (DISABLED / marked-for-deletion) — the P3d neo16 MSI smoke caught
-    // exactly this. The service is AutoStart and is brought up by the
-    // `DisableSystemContext` -> `environment::restart_service` action (which
-    // opens a FRESH SCM handle — the proven rc.190 path) or on next boot.
-    //
-    // Retire the pre-rename service. On a MajorUpgrade RemoveExistingProducts
-    // has usually already deleted it (tolerated as 1060 below); this is the belt
-    // for hosts where the old product's UnregisterService CA didn't fire.
-    let _ = delete_service(LEGACY_SERVICE_NAME);
+    // Do NOT start the service from inside this deferred MSI custom action.
+    // StartServiceW mid-transaction wedged the service (error 87) in the P3d
+    // neo16 smoke. The service is AutoStart and is brought up by the
+    // `DisableSystemContext` -> `environment::restart_service` action (a fresh
+    // SCM handle on a now-clean service — the proven rc.190 path) or on next boot.
     Ok(())
 }
 
