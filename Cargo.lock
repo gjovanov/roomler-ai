@@ -7256,6 +7256,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "roomler-setup"
+version = "0.3.0-rc.194"
+dependencies = [
+ "anyhow",
+ "directories",
+ "gethostname 0.5.0",
+ "roomler-agent",
+ "roomler-setup-core",
+ "roomler-tunnel",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-shell",
+ "tauri-plugin-single-instance",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml 0.9.12+spec-1.1.0",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "roomler-setup-core"
 version = "0.3.0-rc.194"
 dependencies = [
