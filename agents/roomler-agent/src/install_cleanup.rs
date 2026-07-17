@@ -27,11 +27,39 @@
 //!   interactive user directly).
 //! - `needs-attention.txt` sentinel in the user's config dir.
 //!
-//! ## Same-flavour fast path
+//! ## Vacated-dir sweep (P4b)
+//!
+//! P4b renamed the wxs `APPLICATIONFOLDER` from `roomler-agent` to
+//! `Roomler`, so every MajorUpgrade from ≤rc.194 vacates the old
+//! directory: the perMachine wxs has no `RemoveFolder` entries, and
+//! the perUser flavour leaves PendingFileRename residue whenever the
+//! running agent's EXE was locked during `RemoveFiles` (deleting the
+//! Scheduled Task does not kill the already-running process). The
+//! sweep removes known product files from the old-named directory
+//! for the TARGET flavour's scope, then the directory itself if
+//! empty. It runs BEFORE the same-flavour fast path — see below for
+//! why that is the only placement the MSI CA ever executes.
+//!
+//! ## Same-flavour fast path — and what the MSI CA actually reaches
 //!
 //! When the new install matches the existing install's flavour, this
-//! helper exits 0 immediately. Same-flavour upgrades go through WiX
-//! MajorUpgrade and don't need any cross-flavour scrubbing.
+//! helper exits 0 immediately (after the vacated-dir sweep).
+//! Same-flavour upgrades go through WiX MajorUpgrade and don't need
+//! any cross-flavour scrubbing.
+//!
+//! NB the flavour probe is `updater::current_install_flavour()`,
+//! which classifies **this process's own exe path**. The MSI custom
+//! actions shell the freshly-laid TARGET exe
+//! (`FileKey='roomler_agent_exe'`), so in CA context current ==
+//! target ALWAYS and the fast path fires on every CA invocation —
+//! including genuine cross-flavour switches. The cross-flavour arms
+//! below are therefore reachable ONLY via an operator manually
+//! running `cleanup-legacy-install` from an oppositely-scoped exe;
+//! the vacated-dir sweep is the single step with MSI-CA reach.
+//! (Switching the probe to the registry-based `install_detect` would
+//! make the arms CA-reachable but would also activate the user-data
+//! -dir deletion — config + enrollment trees — on fleet flows;
+//! deliberately NOT done in P4b.)
 //!
 //! ## Why a separate CLI subcommand
 //!
@@ -114,6 +142,13 @@ pub fn run_cleanup(target: TargetFlavour, dry_run: bool) -> Result<CleanupReport
 
     #[cfg(target_os = "windows")]
     {
+        // P4b: sweep the vacated pre-rename install dir FIRST. The
+        // same-flavour fast path below fires on EVERY MSI CA
+        // invocation (see the module docs), so anything placed after
+        // it never runs in CA context — this sweep is the one step
+        // the installer actually reaches.
+        cleanup_vacated_install_dir(target, &mut report, dry_run);
+
         // Same-flavour fast path: the new install matches what's
         // already on disk → no cross-flavour cleanup needed.
         let current = crate::updater::current_install_flavour();
@@ -150,32 +185,147 @@ pub fn run_cleanup(target: TargetFlavour, dry_run: bool) -> Result<CleanupReport
     Ok(report)
 }
 
+/// Filenames the MSIs have ever shipped into the install folder,
+/// plus the tunnel CLI pair. The vacated-dir sweep deletes ONLY
+/// these — never arbitrary files an operator parked there. The CLI
+/// pair (`roomler.exe` / `roomler-tunnel.exe`) is included even
+/// though pre-P4b MSIs never shipped it: in the OLD dir those can
+/// only be manually-copied tunnel CLIs (field-observed), they are
+/// OUR binaries in OUR dead directory, and a stale copy in a
+/// manually-PATH'd old dir is a version-skew hazard once the new
+/// dir's `roomler.exe` is authoritative.
+#[cfg(target_os = "windows")]
+const INSTALL_DIR_PRODUCT_FILES: &[&str] = &[
+    "roomlerd.exe",
+    "roomler-agent.exe",
+    "roomler.exe",
+    "roomler-tunnel.exe",
+    "wintun.dll",
+    "LICENSE.txt",
+    "README.txt",
+];
+
+/// P4b: sweep the VACATED pre-rename install directory for the
+/// TARGET flavour's scope (perUser →
+/// `%LOCALAPPDATA%\Programs\roomler-agent`, perMachine →
+/// `%ProgramFiles%\roomler-agent`).
+///
+/// Policy: conservative. Skip outright when the candidate IS the
+/// directory this process runs from (paranoia guard — impossible
+/// with the renamed wxs, but cheap insurance against a rebuilt
+/// old-name MSI invoking a new exe). Delete only
+/// [`INSTALL_DIR_PRODUCT_FILES`], then `remove_dir` NON-recursively:
+/// foreign content survives and is reported; locked files fail soft
+/// (the CA runs `Return='ignore'`; PendingFileRenameOperations
+/// clears them on the next reboot, after which a later invocation
+/// removes the then-empty dir).
+#[cfg(target_os = "windows")]
+fn cleanup_vacated_install_dir(target: TargetFlavour, report: &mut CleanupReport, dry_run: bool) {
+    let flavour = match target {
+        TargetFlavour::PerUser => crate::updater::WindowsInstallFlavour::PerUser,
+        TargetFlavour::PerMachine => crate::updater::WindowsInstallFlavour::PerMachine,
+    };
+    let Some(dir) =
+        crate::updater::install_dir_with_name(flavour, crate::updater::LEGACY_INSTALL_FOLDER_NAME)
+    else {
+        report
+            .skipped
+            .push("vacated-dir sweep: install root env var unset".to_string());
+        return;
+    };
+    if !dir.is_dir() {
+        report
+            .skipped
+            .push(format!("vacated dir {} not present", dir.display()));
+        return;
+    }
+    // Paranoia guard: never sweep the directory we are running from.
+    if let Ok(own) = std::env::current_exe()
+        && let Some(own_dir) = own.parent()
+        && same_dir(own_dir, &dir)
+    {
+        report.skipped.push(format!(
+            "vacated-dir sweep: {} is the running exe's own directory — skipped",
+            dir.display()
+        ));
+        return;
+    }
+    if dry_run {
+        report.removed.push(format!(
+            "[dry-run] sweep vacated install dir {} (known product files + rmdir-if-empty)",
+            dir.display()
+        ));
+        return;
+    }
+    for name in INSTALL_DIR_PRODUCT_FILES {
+        let file = dir.join(name);
+        if file.is_file() {
+            match std::fs::remove_file(&file) {
+                Ok(()) => report.removed.push(format!("stale {}", file.display())),
+                Err(e) => report
+                    .errors
+                    .push(format!("remove {}: {e}", file.display())),
+            }
+        }
+    }
+    match std::fs::remove_dir(&dir) {
+        Ok(()) => report
+            .removed
+            .push(format!("vacated install dir {}", dir.display())),
+        Err(e) => report.skipped.push(format!(
+            "vacated dir {} left in place (non-product files or locks): {e}",
+            dir.display()
+        )),
+    }
+}
+
+/// Case-insensitive same-directory check (Windows path semantics).
+/// Falls back to lossy-string comparison when canonicalize fails —
+/// the caller uses this as a skip-guard, so a false POSITIVE (skip
+/// the sweep) is the safe failure mode.
+#[cfg(target_os = "windows")]
+fn same_dir(a: &std::path::Path, b: &std::path::Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => a
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&b.to_string_lossy()),
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────
 // perMachine → cleanup perUser artifacts (we are installing perMachine
 // over a prior perUser install)
 // ──────────────────────────────────────────────────────────────────
 #[cfg(target_os = "windows")]
 fn cleanup_per_user_artifacts(report: &mut CleanupReport, dry_run: bool) {
-    // 1. Scheduled Task `RoomlerAgent` — registered by the perUser MSI's
-    //    `RegisterAutostart` custom action. perMachine MSI's CA runs as
-    //    SYSTEM so it can see + delete the task without impersonation.
-    if scheduled_task_exists("RoomlerAgent") {
-        if dry_run {
-            report
-                .removed
-                .push("[dry-run] schtasks /Delete /TN RoomlerAgent /F".to_string());
-        } else {
-            match delete_scheduled_task("RoomlerAgent") {
-                Ok(()) => report
+    // 1. Scheduled Task — registered by the perUser MSI's
+    //    `RegisterAutostart` custom action: `RoomlerAgent` pre-P3d,
+    //    `Roomler` since the P3d rename (P4b hygiene: both scrubbed).
+    //    perMachine MSI's CA runs as SYSTEM so it can see + delete
+    //    the task without impersonation. NB reachable via operator
+    //    CLI only — the MSI CA always exits through the same-flavour
+    //    fast path (module docs) — so this can never race the SAME
+    //    install's freshly-registered task.
+    for task_name in ["RoomlerAgent", "Roomler"] {
+        if scheduled_task_exists(task_name) {
+            if dry_run {
+                report
                     .removed
-                    .push("Scheduled Task RoomlerAgent".to_string()),
-                Err(e) => report.errors.push(format!("schtasks /Delete: {e}")),
+                    .push(format!("[dry-run] schtasks /Delete /TN {task_name} /F"));
+            } else {
+                match delete_scheduled_task(task_name) {
+                    Ok(()) => report.removed.push(format!("Scheduled Task {task_name}")),
+                    Err(e) => report
+                        .errors
+                        .push(format!("schtasks /Delete {task_name}: {e}")),
+                }
             }
+        } else {
+            report
+                .skipped
+                .push(format!("Scheduled Task {task_name} not present"));
         }
-    } else {
-        report
-            .skipped
-            .push("Scheduled Task RoomlerAgent not present".to_string());
     }
 
     // 2. Active-session user's data dirs. SYSTEM context can't see the
@@ -268,32 +418,33 @@ fn cleanup_per_user_artifacts(report: &mut CleanupReport, dry_run: bool) {
 // ──────────────────────────────────────────────────────────────────
 #[cfg(target_os = "windows")]
 fn cleanup_per_machine_artifacts(report: &mut CleanupReport, dry_run: bool) {
-    // 1. SCM service `RoomlerAgentService`. The perUser MSI's CA runs
-    //    Impersonated (user token). Service control requires admin —
-    //    so this is BEST-EFFORT. If the user isn't admin, sc fails and
-    //    we surface it as an error (the operator must manually
-    //    `sc delete RoomlerAgentService` from elevated PS).
-    if service_exists("RoomlerAgentService") {
-        if dry_run {
-            report
-                .removed
-                .push("[dry-run] sc stop + sc delete RoomlerAgentService".to_string());
-        } else {
-            // stop is best-effort (service may already be stopped).
-            let _ = run_quiet("sc", &["stop", "RoomlerAgentService"]);
-            match run_quiet("sc", &["delete", "RoomlerAgentService"]) {
-                Ok(()) => report
+    // 1. SCM service: `RoomlerAgentService` pre-P3d, `Roomler` since
+    //    the P3d rename (P4b hygiene: both scrubbed). The perUser
+    //    MSI's CA runs Impersonated (user token). Service control
+    //    requires admin — so this is BEST-EFFORT. If the user isn't
+    //    admin, sc fails and we surface it as an error (the operator
+    //    must manually `sc delete <name>` from elevated PS). NB
+    //    reachable via operator CLI only — the MSI CA always exits
+    //    through the same-flavour fast path (module docs).
+    for service_name in ["RoomlerAgentService", "Roomler"] {
+        if service_exists(service_name) {
+            if dry_run {
+                report
                     .removed
-                    .push("SCM service RoomlerAgentService".to_string()),
-                Err(e) => report
-                    .errors
-                    .push(format!("sc delete RoomlerAgentService: {e}")),
+                    .push(format!("[dry-run] sc stop + sc delete {service_name}"));
+            } else {
+                // stop is best-effort (service may already be stopped).
+                let _ = run_quiet("sc", &["stop", service_name]);
+                match run_quiet("sc", &["delete", service_name]) {
+                    Ok(()) => report.removed.push(format!("SCM service {service_name}")),
+                    Err(e) => report.errors.push(format!("sc delete {service_name}: {e}")),
+                }
             }
+        } else {
+            report
+                .skipped
+                .push(format!("SCM service {service_name} not present"));
         }
-    } else {
-        report
-            .skipped
-            .push("SCM service RoomlerAgentService not present".to_string());
     }
 
     // 2. Service log dir at %PROGRAMDATA%\roomler\<segment>\service-logs\.
@@ -438,5 +589,89 @@ mod tests {
         assert!(report.removed.is_empty());
         assert!(report.errors.is_empty());
         assert!(report.skipped.iter().any(|s| s.contains("non-Windows")));
+    }
+
+    // ── P4b vacated-dir sweep ─────────────────────────────────────
+
+    /// The sweep targets the LEGACY folder name under the flavour's
+    /// root. Env-var roots are always set on a real Windows session
+    /// (and the Windows CI runners), so suffix asserts are
+    /// host-state-independent.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn vacated_dir_derives_legacy_name_per_flavour() {
+        use crate::updater::{
+            LEGACY_INSTALL_FOLDER_NAME, WindowsInstallFlavour, install_dir_with_name,
+        };
+        let pu = install_dir_with_name(WindowsInstallFlavour::PerUser, LEGACY_INSTALL_FOLDER_NAME)
+            .expect("LOCALAPPDATA set");
+        assert!(
+            pu.ends_with(std::path::Path::new("Programs").join("roomler-agent")),
+            "unexpected perUser dir {}",
+            pu.display()
+        );
+        let pm = install_dir_with_name(
+            WindowsInstallFlavour::PerMachine,
+            LEGACY_INSTALL_FOLDER_NAME,
+        )
+        .expect("ProgramFiles set");
+        assert!(
+            pm.ends_with("roomler-agent"),
+            "unexpected perMachine dir {}",
+            pm.display()
+        );
+        assert!(
+            pm.to_string_lossy()
+                .to_lowercase()
+                .contains("program files"),
+            "perMachine dir must live under Program Files: {}",
+            pm.display()
+        );
+    }
+
+    /// Dry-run `run_cleanup` always records the sweep's verdict —
+    /// whichever branch it takes (dir present / absent / own-dir
+    /// guard), the report mentions the vacated dir. This is the lock
+    /// that the sweep sits BEFORE the same-flavour fast path (the
+    /// only placement the MSI CA ever executes).
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn dry_run_cleanup_reports_vacated_dir_sweep_before_fast_path() {
+        let report = run_cleanup(TargetFlavour::PerUser, true).unwrap();
+        assert!(
+            report
+                .removed
+                .iter()
+                .chain(report.skipped.iter())
+                .any(|s| s.contains("vacated")),
+            "sweep verdict missing from report: {}",
+            report.summary()
+        );
+        // ... and the fast path still fired after it (this test
+        // binary never runs from Program Files → current == PerUser
+        // == target).
+        assert!(
+            report
+                .skipped
+                .iter()
+                .any(|s| s.contains("same-flavour install")),
+            "fast path missing from report: {}",
+            report.summary()
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn same_dir_is_case_insensitive_and_rejects_distinct_dirs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let a = tmp.path().join("Alpha");
+        let b = tmp.path().join("beta");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        assert!(same_dir(&a, &a));
+        // Windows path semantics: differing case, same dir.
+        let a_upper = tmp.path().join("ALPHA");
+        assert!(same_dir(&a, &a_upper));
+        assert!(!same_dir(&a, &b));
     }
 }

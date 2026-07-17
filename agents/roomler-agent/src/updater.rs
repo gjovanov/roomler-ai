@@ -317,6 +317,41 @@ pub fn classify_install_flavour_from_path(p: &std::path::Path) -> WindowsInstall
     }
 }
 
+/// The MSI install folder name since P4b — both wxs files set
+/// `APPLICATIONFOLDER Name='Roomler'`.
+#[cfg(target_os = "windows")]
+pub(crate) const INSTALL_FOLDER_NAME: &str = "Roomler";
+
+/// The pre-P4b install folder name both MSI flavours used through
+/// rc.194. The `cleanup-legacy-install` vacated-dir sweep targets
+/// this after a rename-hop upgrade.
+#[cfg(target_os = "windows")]
+pub(crate) const LEGACY_INSTALL_FOLDER_NAME: &str = "roomler-agent";
+
+/// Resolve a flavour's MSI install directory for a given folder name:
+/// perUser → `%LOCALAPPDATA%\Programs\<name>`, perMachine →
+/// `%ProgramFiles%\<name>` (the same roots the two wxs files install
+/// under). Callers pass [`INSTALL_FOLDER_NAME`] to find the current
+/// install (post-install watcher fallback) or
+/// [`LEGACY_INSTALL_FOLDER_NAME`] to find the directory a rename-hop
+/// upgrade vacated (`install_cleanup` sweep). `None` when the root
+/// env var is unset (effectively never on a real Windows session).
+#[cfg(target_os = "windows")]
+pub(crate) fn install_dir_with_name(
+    flavour: WindowsInstallFlavour,
+    folder_name: &str,
+) -> Option<std::path::PathBuf> {
+    match flavour {
+        WindowsInstallFlavour::PerUser => std::env::var_os("LOCALAPPDATA").map(|root| {
+            std::path::PathBuf::from(root)
+                .join("Programs")
+                .join(folder_name)
+        }),
+        WindowsInstallFlavour::PerMachine => std::env::var_os("ProgramFiles")
+            .map(|root| std::path::PathBuf::from(root).join(folder_name)),
+    }
+}
+
 /// Pick the asset that matches this build's platform. Returns an
 /// explicit `None` when there's no match so the caller can log + skip
 /// rather than downloading something wrong.
