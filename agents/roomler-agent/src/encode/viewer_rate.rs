@@ -31,9 +31,10 @@
 //! `cargo test --lib`. The pump features are what USE it, hence the dead_code
 //! allow on the signalling-only build (mirrors `aimd` / `encode_pressure`).
 
-fn env_u32(key: &str, default: u32) -> u32 {
-    std::env::var(key)
-        .ok()
+use tunnel_core::env::node_env;
+
+fn env_u32(suffix: &str, default: u32) -> u32 {
+    node_env(suffix)
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(default)
 }
@@ -42,20 +43,20 @@ fn env_u32(key: &str, default: u32) -> u32 {
 /// slideshow; deeper relief is the (manual) resolution lever's job, not more
 /// fps shedding. Env `ROOMLER_AGENT_VIEWER_RATE_MIN_FPS` (default 12).
 fn min_fps() -> u32 {
-    env_u32("ROOMLER_AGENT_VIEWER_RATE_MIN_FPS", 12).max(1)
+    env_u32("VIEWER_RATE_MIN_FPS", 12).max(1)
 }
 
 /// fps step per adjustment — down on struggle, up on recovery.
 /// Env `ROOMLER_AGENT_VIEWER_RATE_STEP` (default 10).
 fn fps_step() -> u32 {
-    env_u32("ROOMLER_AGENT_VIEWER_RATE_STEP", 10).max(1)
+    env_u32("VIEWER_RATE_STEP", 10).max(1)
 }
 
 /// Consecutive clean windows before the cap probes back UP one step. Lazy so a
 /// viewer parked just under its ceiling doesn't oscillate every window.
 /// Env `ROOMLER_AGENT_VIEWER_RATE_RECOVER` (default 6).
 fn recover_windows() -> u32 {
-    env_u32("ROOMLER_AGENT_VIEWER_RATE_RECOVER", 6).max(1)
+    env_u32("VIEWER_RATE_RECOVER", 6).max(1)
 }
 
 /// Turns a stream of viewer decode reports into a send-fps cap for one DC pump.
@@ -86,7 +87,7 @@ impl ViewerRateController {
             // `false`) pins the cap at the capture rate (divisor 1, no shedding)
             // so a misbehaving field host reverts without a rebuild.
             enabled: !matches!(
-                std::env::var("ROOMLER_AGENT_VIEWER_RATE").ok().as_deref(),
+                node_env("VIEWER_RATE").as_deref(),
                 Some("0") | Some("false")
             ),
         }

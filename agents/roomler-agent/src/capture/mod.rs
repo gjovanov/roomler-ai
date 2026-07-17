@@ -265,7 +265,8 @@ pub fn open_default(_target_fps: u32, _downscale: DownscalePolicy) -> Box<dyn Sc
 /// WGC-specific regressions in the field without a rebuild.
 #[cfg(all(target_os = "windows", feature = "wgc-capture"))]
 fn capture_env_prefers_scrap() -> bool {
-    std::env::var("ROOMLER_AGENT_CAPTURE")
+    use tunnel_core::env::node_env;
+    node_env("CAPTURE")
         .map(|v| v.trim().eq_ignore_ascii_case("scrap"))
         .unwrap_or(false)
 }
@@ -276,15 +277,16 @@ fn capture_env_prefers_scrap() -> bool {
 /// (unset, `0`, garbage) falls back to the normal cascade.
 #[cfg(feature = "synthetic-frame-source")]
 fn synthetic_env_enabled() -> bool {
-    match std::env::var("ROOMLER_AGENT_SYNTHETIC_FRAMES") {
-        Ok(v) => {
+    use tunnel_core::env::node_env;
+    match node_env("SYNTHETIC_FRAMES") {
+        Some(v) => {
             let t = v.trim();
             t.eq_ignore_ascii_case("1")
                 || t.eq_ignore_ascii_case("true")
                 || t.eq_ignore_ascii_case("yes")
                 || t.eq_ignore_ascii_case("on")
         }
-        Err(_) => false,
+        None => false,
     }
 }
 

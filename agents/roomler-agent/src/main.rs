@@ -29,6 +29,9 @@ use roomler_agent::{
 };
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use tunnel_core::env::node_env;
+#[cfg(target_os = "linux")]
+use tunnel_core::env::node_env_os;
 
 #[derive(Debug, Parser)]
 #[command(name = "roomler-agent", version, about, long_about = None)]
@@ -592,11 +595,8 @@ async fn main() -> Result<()> {
         // The env var is also captured at first call inside the input
         // worker via LazyLock; this line is the canonical "is the
         // virtual-screen-aware path live?" data point.
-        let vscreen = roomler_agent::input::parse_virtual_screen_flag(
-            std::env::var("ROOMLER_AGENT_VIRTUAL_SCREEN")
-                .ok()
-                .as_deref(),
-        );
+        let vscreen =
+            roomler_agent::input::parse_virtual_screen_flag(node_env("VIRTUAL_SCREEN").as_deref());
         tracing::info!(
             virtual_screen_enabled = vscreen,
             "input mapping — rc.54 ROOMLER_AGENT_VIRTUAL_SCREEN gate (false = legacy enigo.main_display path; true = win32_monitors::primary virtual-screen offset)"
@@ -871,7 +871,7 @@ fn resolve_encoder_preference(
     if let Some(v) = cli.and_then(|s| from_str(s, "cli")) {
         return v;
     }
-    if let Ok(env_val) = std::env::var("ROOMLER_AGENT_ENCODER")
+    if let Some(env_val) = node_env("ENCODER")
         && let Some(v) = from_str(&env_val, "env")
     {
         return v;
@@ -1055,7 +1055,7 @@ async fn re_enroll_cmd(config_path: &PathBuf, enrollment_token: &str) -> Result<
 
 /// True if virtual-desktop mode was requested (`ROOMLER_AGENT_VIRTUAL_DESKTOP`).
 fn virtual_desktop_requested() -> bool {
-    std::env::var("ROOMLER_AGENT_VIRTUAL_DESKTOP")
+    node_env("VIRTUAL_DESKTOP")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }
@@ -1070,8 +1070,7 @@ fn maybe_start_virtual_desktop() -> Result<Option<virtual_desktop::VirtualDeskto
     if !virtual_desktop_requested() {
         return Ok(None);
     }
-    let startup = std::env::var("ROOMLER_AGENT_VIRTUAL_DESKTOP_STARTUP")
-        .ok()
+    let startup = node_env("VIRTUAL_DESKTOP_STARTUP")
         .map(|s| {
             s.split(',')
                 .map(|a| a.trim().to_string())
@@ -1080,10 +1079,9 @@ fn maybe_start_virtual_desktop() -> Result<Option<virtual_desktop::VirtualDeskto
         })
         .unwrap_or_default();
     let cfg = virtual_desktop::Config {
-        resolution: std::env::var("ROOMLER_AGENT_VIRTUAL_DESKTOP_RESOLUTION")
-            .unwrap_or_else(|_| "1920x1080".to_string()),
-        wm: std::env::var("ROOMLER_AGENT_VIRTUAL_DESKTOP_WM")
-            .unwrap_or_else(|_| "openbox".to_string()),
+        resolution: node_env("VIRTUAL_DESKTOP_RESOLUTION")
+            .unwrap_or_else(|| "1920x1080".to_string()),
+        wm: node_env("VIRTUAL_DESKTOP_WM").unwrap_or_else(|| "openbox".to_string()),
         startup,
     };
     let vd = virtual_desktop::start(&cfg).context("starting virtual desktop")?;
@@ -1102,7 +1100,7 @@ fn maybe_start_virtual_desktop() -> Result<Option<virtual_desktop::VirtualDeskto
     // overrides with an EXPLICIT `ROOMLER_AGENT_ICE_RELAY_TCP=0|1` (`=1` on a
     // cloud-NAT VM whose public IP isn't on a local iface; `=0` for WSL
     // mirrored-mode with native UDP).
-    let relay_forced = std::env::var_os("ROOMLER_AGENT_ICE_RELAY_TCP").is_some();
+    let relay_forced = node_env_os("ICE_RELAY_TCP").is_some();
     let host_public = roomler_agent::subnet_detect::host_has_public_ipv4();
     unsafe {
         std::env::set_var("DISPLAY", vd.display());
@@ -1110,7 +1108,7 @@ fn maybe_start_virtual_desktop() -> Result<Option<virtual_desktop::VirtualDeskto
             std::env::set_var("ROOMLER_AGENT_ICE_RELAY_TCP", "1");
         }
     }
-    let relay_over_tcp = std::env::var("ROOMLER_AGENT_ICE_RELAY_TCP").as_deref() == Ok("1");
+    let relay_over_tcp = node_env("ICE_RELAY_TCP").as_deref() == Some("1");
     tracing::info!(
         display = vd.display(),
         relay_over_tcp,
@@ -1204,8 +1202,8 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     // emergency in-field disable without a config reload.
     let browse_enabled = cfg.enable_remote_browse
         && !matches!(
-            std::env::var("ROOMLER_AGENT_DISABLE_BROWSE").as_deref(),
-            Ok("1") | Ok("true") | Ok("yes")
+            node_env("DISABLE_BROWSE").as_deref(),
+            Some("1") | Some("true") | Some("yes")
         );
     roomler_agent::files::set_remote_browse_enabled(browse_enabled);
     tracing::info!(browse_enabled, "file-DC remote browse capability");
@@ -1369,7 +1367,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     // task moves cfg out of scope. (Moving cfg lets signaling::run own
     // it for the lifetime of the loop without us having to clone the
     // tokens + URLs that the signaling code rewrites in place.)
-    let auto_update_enabled = std::env::var("ROOMLER_AGENT_AUTO_UPDATE")
+    let auto_update_enabled = node_env("AUTO_UPDATE")
         .map(|v| !matches!(v.as_str(), "0" | "false" | "no" | "off"))
         .unwrap_or(true);
     let update_interval = updater::resolve_check_interval(&cfg);
@@ -1464,11 +1462,8 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     // rc.58 — start the centralized log uploader BEFORE signaling
     // moves cfg out of scope. Default ON; opt out with
     // `ROOMLER_AGENT_LOGS_UPLOAD_DISABLED=1` per the rc.58 plan.
-    let logs_upload_disabled = roomler_agent::logs_upload::parse_disable_flag(
-        std::env::var("ROOMLER_AGENT_LOGS_UPLOAD_DISABLED")
-            .ok()
-            .as_deref(),
-    );
+    let logs_upload_disabled =
+        roomler_agent::logs_upload::parse_disable_flag(node_env("LOGS_UPLOAD_DISABLED").as_deref());
     if !logs_upload_disabled && let Some(rx) = logging::take_log_upload_receiver() {
         let host_hash = roomler_agent::logs_upload::hash_hostname(
             &roomler_agent::machine::hostname().unwrap_or_else(|_| "unknown".to_string()),
@@ -1746,9 +1741,9 @@ fn service_install_as_service() -> Result<()> {
     println!(
         "Service registered: {} ({}). Launching `sc start {}` will run the service \
          under LocalSystem; AutoStart fires on next boot.",
-        win_service::SERVICE_NAME,
+        win_service::NEW_SERVICE_NAME,
         win_service::SERVICE_DISPLAY_NAME,
-        win_service::SERVICE_NAME
+        win_service::NEW_SERVICE_NAME
     );
     Ok(())
 }
@@ -1764,7 +1759,7 @@ fn service_install_as_service() -> Result<()> {
 #[cfg(target_os = "windows")]
 fn service_uninstall_as_service() -> Result<()> {
     win_service::uninstall().context("deregistering RoomlerAgentService")?;
-    println!("Service deregistered ({}).", win_service::SERVICE_NAME);
+    println!("Service deregistered ({}).", win_service::NEW_SERVICE_NAME);
     Ok(())
 }
 
@@ -1776,7 +1771,7 @@ fn service_uninstall_as_service() -> Result<()> {
 #[cfg(target_os = "windows")]
 fn service_status_as_service() -> Result<()> {
     let status = win_service::status().context("querying SCM service status")?;
-    println!("{}: {:?}", win_service::SERVICE_NAME, status);
+    println!("{}: {:?}", win_service::NEW_SERVICE_NAME, status);
     Ok(())
 }
 
