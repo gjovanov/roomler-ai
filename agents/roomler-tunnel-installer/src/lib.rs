@@ -26,11 +26,15 @@
 pub mod asset_resolver;
 pub mod commands;
 pub mod enroll;
-pub mod extract;
 pub mod install_orchestrator;
-pub mod integration;
 pub mod progress;
 pub mod wizard_state;
+
+// P4a: relocated to the shared wizard core (`crates/roomler-setup-core`);
+// re-exported here so `tunnel_wizard_core::extract::…` /
+// `crate::integration` paths (orchestrator, commands) stay valid while
+// this legacy wizard ships. Retired with the whole crate in P4c.
+pub use wizard_shared::{extract, integration};
 
 use std::sync::atomic::AtomicBool;
 
