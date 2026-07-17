@@ -78,6 +78,22 @@ jobs:
           Copy-Item target\release\roomlerd.exe target\release\roomler-agent.exe -Force
           Write-Host "Staged roomler-agent.exe alias next to roomlerd.exe for the WiX AgentExeAlias component"
 
+      - name: Build tunnel CLI (roomler.exe) for the MSI bundle (P4b)
+        shell: pwsh
+        run: |
+          # P4b: wix/main.wxs UNCONDITIONALLY bundles a `TunnelExe`
+          # component from target\release\roomler.exe (the MSI carries
+          # the tunnel CLI — node-stack unification Option A), so the
+          # WiX `light` step needs the EXE present or it fails with
+          # LGHT0103, same failure mode as the wintun.dll staging
+          # below. Mirrors release-agent.yml's tunnel build step.
+          cargo build -p roomler-tunnel --release
+          if (-not (Test-Path target\release\roomler.exe)) {
+            Write-Host "::error::roomler.exe not produced — TunnelExe harvest would fail (LGHT0103)"
+            exit 1
+          }
+          Write-Host "Staged roomler.exe ($([math]::Round((Get-Item target\release\roomler.exe).Length/1MB,1)) MB) for the TunnelExe component"
+
       - name: Stage wintun.dll for the MSI bundle
         shell: pwsh
         run: |
@@ -201,38 +217,45 @@ jobs:
           Write-Host "Installed: $($found.DisplayName) $($found.DisplayVersion)"
           'INSTALLED_PRODUCT_CODE=' + $found.PSChildName | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Assert agent binary at expected install path
+      - name: Assert install payload at the canonical path (P4b)
         shell: pwsh
         run: |
-          # Per-User MSI installs under %LOCALAPPDATA%\roomler\ or
-          # %ProgramFiles%\roomler\ depending on the WiX install
-          # scope. We just verify roomler-agent.exe exists somewhere
-          # under either tree — the actual scope is determined by
-          # the WiX MSI authoring, not by the test.
-          $candidates = @(
-            (Join-Path $env:LOCALAPPDATA  'Programs\roomler-agent\roomler-agent.exe'),
-            (Join-Path $env:LOCALAPPDATA  'roomler\roomler-agent.exe'),
-            (Join-Path $env:ProgramFiles  'roomler-agent\roomler-agent.exe'),
-            (Join-Path $env:ProgramFiles  'roomler\roomler-agent.exe')
-          )
-          $found = $null
-          foreach ($c in $candidates) {
-            if (Test-Path $c) { $found = $c; break }
+          # P4b renamed the per-User install dir to
+          # %LOCALAPPDATA%\Programs\Roomler and added the tunnel CLI
+          # to the bundle. Assert the EXACT canonical layout (the old
+          # loose multi-candidate probe would silently pass on a
+          # regression back to the pre-rename dir): daemon + P3d alias
+          # + tunnel CLI + wintun must all land. Also assert the
+          # TunnelExe component's user-PATH append took (HKCU\
+          # Environment — MSI writes it for Environment System='no').
+          $installDir = Join-Path $env:LOCALAPPDATA 'Programs\Roomler'
+          $mustExist = @('roomlerd.exe', 'roomler-agent.exe', 'roomler.exe', 'wintun.dll')
+          $missing = @()
+          foreach ($f in $mustExist) {
+            $p = Join-Path $installDir $f
+            if (Test-Path $p) {
+              Write-Host "present: $p"
+            } else {
+              $missing += $p
+            }
           }
-          if (-not $found) {
-            Write-Host '--- Searching for roomler-agent.exe under common roots ---'
+          if ($missing.Count -gt 0) {
+            Write-Host '--- Searching for stray payloads under common roots ---'
             $roots = @(
               $env:LOCALAPPDATA,
-              $env:ProgramFiles,
-              (Join-Path $env:USERPROFILE 'AppData\Local')
+              $env:ProgramFiles
             ) | Where-Object { Test-Path $_ }
             foreach ($r in $roots) {
-              Get-ChildItem -Path $r -Filter 'roomler-agent.exe' -Recurse -ErrorAction SilentlyContinue |
+              Get-ChildItem -Path $r -Include 'roomlerd.exe','roomler-agent.exe' -Recurse -ErrorAction SilentlyContinue |
                 ForEach-Object { Write-Host "  found at: $($_.FullName)" }
             }
-            throw 'roomler-agent.exe not found at any expected install path after install'
+            throw "missing from $($installDir): $($missing -join ', ')"
           }
-          Write-Host "Agent binary present: $found"
+          $userPath = (Get-ItemProperty -Path 'HKCU:\Environment' -ErrorAction SilentlyContinue).PATH
+          if (-not ($userPath -and $userPath -match [regex]::Escape('Programs\Roomler'))) {
+            throw "user PATH does not contain Programs\Roomler after install (HKCU\Environment PATH = '$userPath')"
+          }
+          Write-Host "User PATH contains the install dir"
 
       - name: Uninstall the MSI (quiet)
         shell: pwsh
@@ -276,23 +299,28 @@ jobs:
           if ($stragglers.Count -gt 0) {
             throw "roomler-agent install record still present after uninstall: $($stragglers.DisplayName -join ', ')"
           }
-          # Pick the candidate paths from the install-assert step;
-          # none should exist after uninstall (best-effort — some
-          # config files may legitimately survive an uninstall by
-          # WiX's MajorUpgrade / `Permanent="yes"` rules, but the
-          # exe itself MUST be gone).
-          $candidates = @(
-            (Join-Path $env:LOCALAPPDATA  'Programs\roomler-agent\roomler-agent.exe'),
-            (Join-Path $env:LOCALAPPDATA  'roomler\roomler-agent.exe'),
-            (Join-Path $env:ProgramFiles  'roomler-agent\roomler-agent.exe'),
-            (Join-Path $env:ProgramFiles  'roomler\roomler-agent.exe')
-          )
-          foreach ($c in $candidates) {
-            if (Test-Path $c) {
-              throw "Agent binary still at $c after uninstall — MSI uninstaller is broken"
+          # P4b canonical layout: every component-managed payload must
+          # be gone from Programs\Roomler (all files are component-
+          # managed, and the wxs RemoveFolder pair drops the dir when
+          # empty), and the TunnelExe component's user-PATH append
+          # must have been removed (Environment Part='last' +
+          # implicit Permanent='no').
+          $installDir = Join-Path $env:LOCALAPPDATA 'Programs\Roomler'
+          foreach ($f in @('roomlerd.exe', 'roomler-agent.exe', 'roomler.exe', 'wintun.dll')) {
+            $p = Join-Path $installDir $f
+            if (Test-Path $p) {
+              throw "$f still at $p after uninstall — MSI uninstaller is broken"
             }
           }
-          Write-Host 'Uninstall left no traces of the agent binary or MSI registry record'
+          if (Test-Path $installDir) {
+            Write-Host "::warning::$installDir still exists (empty dir tolerated; component files verified gone)"
+            Get-ChildItem $installDir -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  leftover: $($_.FullName)" }
+          }
+          $userPath = (Get-ItemProperty -Path 'HKCU:\Environment' -ErrorAction SilentlyContinue).PATH
+          if ($userPath -and $userPath -match [regex]::Escape('Programs\Roomler')) {
+            throw "user PATH still contains Programs\Roomler after uninstall (HKCU\Environment PATH = '$userPath')"
+          }
+          Write-Host 'Uninstall left no traces: payload, install dir contents, PATH entry and MSI registry record all clean'
 
       - name: Upload MSI logs on failure
         if: failure()

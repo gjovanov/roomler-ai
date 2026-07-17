@@ -367,23 +367,46 @@ pub fn build_router(state: AppState) -> Router {
         );
 
     // `/api/tunnel-wizard/{latest-release,{platform}/health,{platform}}`
-    // — public GitHub-Releases proxy for the `roomler-tunnel-installer`
-    // Tauri 2 wizard EXE. Separate from `public_tunnel_release_routes`
-    // (which serves the bare CLI tarball) so the two release cadences
-    // can iterate independently — `tunnel-wizard-v*` tags don't have
-    // to bump every time `tunnel-v*` does.
+    // — public GitHub-Releases proxy for the LEGACY
+    // `roomler-tunnel-installer` Tauri 2 wizard EXE. Behaviour-frozen
+    // until P4c retires the crate + these routes.
     let public_tunnel_wizard_routes = Router::new()
         .route(
             "/latest-release",
-            get(routes::tunnel_wizard_release::latest_release),
+            get(routes::setup_release::latest_release),
         )
         .route(
             "/{platform}/health",
-            get(routes::tunnel_wizard_release::installer_health),
+            get(routes::setup_release::installer_health),
+        )
+        .route("/{platform}", get(routes::setup_release::installer_proxy));
+
+    // `/api/setup/{latest-release,{platform}/health,{platform}}` —
+    // P4b: public proxy for the UNIFIED `roomler-setup` wizard (tag
+    // `setup-v*`). Shares the tunnel-wizard release cache (one mixed
+    // list, per-family tag filtering); ships DARK — clean 404s /
+    // empty list — until P4c tags the first `setup-v*` release.
+    // NB `/install.sh` + `/install.ps1` are static segments — axum's
+    // matchit gives them precedence over the `/{platform}` param, so
+    // the script endpoints never shadow (or get shadowed by) the
+    // artifact proxy.
+    let public_setup_routes = Router::new()
+        .route(
+            "/latest-release",
+            get(routes::setup_release::setup_latest_release),
+        )
+        .route("/install.sh", get(routes::setup_release::install_script_sh))
+        .route(
+            "/install.ps1",
+            get(routes::setup_release::install_script_ps1),
+        )
+        .route(
+            "/{platform}/health",
+            get(routes::setup_release::setup_installer_health),
         )
         .route(
             "/{platform}",
-            get(routes::tunnel_wizard_release::installer_proxy),
+            get(routes::setup_release::setup_installer_proxy),
         );
 
     // TURN credentials (user-scoped, no tenant prefix)
@@ -407,6 +430,7 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/tunnel-client", public_tunnel_routes)
         .nest("/tunnel", public_tunnel_release_routes)
         .nest("/tunnel-wizard", public_tunnel_wizard_routes)
+        .nest("/setup", public_setup_routes)
         .nest("/turn", turn_routes)
         .nest("/log", log_routes)
         .nest("/tenant", tenant_routes)

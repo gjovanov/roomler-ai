@@ -15,11 +15,14 @@
 //!   CLI, delivered as an archive + PATH integration. The ONLY role
 //!   offered on non-Windows hosts.
 //!
-//! Role→action COMPOSITION (a daemon role ALSO delivering the CLI so
-//! the controlled host can dial out) is P4b — in P4a each role runs
-//! exactly one orchestrator: the three daemon roles map onto
-//! [`crate::orchestrator_agent`], the tunnel role onto
-//! [`crate::orchestrator_tunnel`].
+//! Role→action COMPOSITION (P4b): a daemon role ALSO delivers the
+//! CLI — not by running a second pipeline, but because the daemon
+//! MSIs carry `roomler.exe` (wxs `TunnelExe` component) + a PATH
+//! append since P4b. Each role therefore still runs exactly one
+//! orchestrator: the three daemon roles map onto
+//! [`crate::orchestrator_agent`] (which existence-checks the
+//! MSI-carried CLI and surfaces it via `DoneReport.cli_included`),
+//! the tunnel role onto [`crate::orchestrator_tunnel`].
 
 use serde::{Deserialize, Serialize};
 
