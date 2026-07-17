@@ -20,6 +20,15 @@ pub fn node_env(suffix: &str) -> Option<String> {
         .ok()
 }
 
+/// OsString twin of [`node_env`] for reads that must tolerate non-Unicode
+/// values (`std::env::var_os` semantics). Prefers `ROOMLER_NODE_<suffix>`
+/// and falls back to the legacy `ROOMLER_AGENT_<suffix>`. Returns `None` if
+/// neither is set.
+pub fn node_env_os(suffix: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(format!("ROOMLER_NODE_{suffix}"))
+        .or_else(|| std::env::var_os(format!("ROOMLER_AGENT_{suffix}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -70,6 +79,53 @@ mod tests {
         unsafe {
             std::env::remove_var(nk());
             std::env::remove_var(ak());
+        }
+    }
+
+    // A distinct unique suffix so this test can't race the String-variant one.
+    const S_OS: &str = "UNIFY_TEST_DUALREAD_OS";
+
+    fn nk_os() -> String {
+        format!("ROOMLER_NODE_{S_OS}")
+    }
+    fn ak_os() -> String {
+        format!("ROOMLER_AGENT_{S_OS}")
+    }
+
+    #[test]
+    fn os_prefers_node_then_falls_back_to_agent_then_none() {
+        // SAFETY (edition 2024): set/remove_var are `unsafe`; safe here because
+        // the suffix is unique to this test and there is no concurrent access.
+        unsafe {
+            std::env::remove_var(nk_os());
+            std::env::remove_var(ak_os());
+        }
+        assert_eq!(node_env_os(S_OS), None, "unset → None");
+
+        unsafe { std::env::set_var(ak_os(), "legacy") };
+        assert_eq!(
+            node_env_os(S_OS).as_deref(),
+            Some(std::ffi::OsStr::new("legacy")),
+            "legacy ROOMLER_AGENT_* is still honoured"
+        );
+
+        unsafe { std::env::set_var(nk_os(), "new") };
+        assert_eq!(
+            node_env_os(S_OS).as_deref(),
+            Some(std::ffi::OsStr::new("new")),
+            "ROOMLER_NODE_* wins when both are set"
+        );
+
+        unsafe { std::env::remove_var(nk_os()) };
+        assert_eq!(
+            node_env_os(S_OS).as_deref(),
+            Some(std::ffi::OsStr::new("legacy")),
+            "falls back to legacy after the new var is removed"
+        );
+
+        unsafe {
+            std::env::remove_var(nk_os());
+            std::env::remove_var(ak_os());
         }
     }
 }

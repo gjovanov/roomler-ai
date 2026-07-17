@@ -24,6 +24,7 @@ use roomler_ai_remote_control::signaling::{ClientMsg, ServerMsg};
 use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 
+use tunnel_core::env::node_env;
 use tunnel_core::localapi::OverlayView;
 use tunnel_core::overlay::WgKeypair;
 use tunnel_core::overlay::runtime::{OverlayEvent, OverlayRuntime, TunFactory};
@@ -88,8 +89,7 @@ pub fn maybe_start(
 /// `ROOMLER_AGENT_OVERLAY_NETSTACK_SOCKS`. `None` (the default) selects OS-TUN
 /// mode; a zero / unparseable value is treated as unset.
 fn netstack_socks_port() -> Option<u16> {
-    std::env::var("ROOMLER_AGENT_OVERLAY_NETSTACK_SOCKS")
-        .ok()
+    node_env("OVERLAY_NETSTACK_SOCKS")
         .and_then(|v| v.trim().parse::<u16>().ok())
         .filter(|p| *p != 0)
 }

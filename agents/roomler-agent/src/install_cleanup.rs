@@ -186,6 +186,12 @@ fn cleanup_per_user_artifacts(report: &mut CleanupReport, dry_run: bool) {
     {
         if let Some(profile_root) = crate::system_context::user_profile::active_user_profile_root()
         {
+            // Clean BOTH the legacy `roomler-agent` app segment AND the new
+            // `roomler` segment (the binary rename, `appdirs.rs`). A
+            // cross-flavour switch must scrub whichever segment the OTHER
+            // flavour landed on, so we enumerate both new-named and
+            // legacy-named trees rather than routing through `appdirs`
+            // (which resolves to only ONE segment per host).
             let candidates = [
                 profile_root
                     .join("AppData")
@@ -197,6 +203,16 @@ fn cleanup_per_user_artifacts(report: &mut CleanupReport, dry_run: bool) {
                     .join("Roaming")
                     .join("roomler")
                     .join("roomler-agent"),
+                profile_root
+                    .join("AppData")
+                    .join("Local")
+                    .join("roomler")
+                    .join("roomler"),
+                profile_root
+                    .join("AppData")
+                    .join("Roaming")
+                    .join("roomler")
+                    .join("roomler"),
             ];
             for path in candidates {
                 if path.exists() {
@@ -280,33 +296,39 @@ fn cleanup_per_machine_artifacts(report: &mut CleanupReport, dry_run: bool) {
             .push("SCM service RoomlerAgentService not present".to_string());
     }
 
-    // 2. Service log dir at %PROGRAMDATA%\roomler\roomler-agent\
-    //    service-logs\. ACL'd to SYSTEM at create time; the perUser
-    //    MSI's user-token CA may not be able to delete it.
+    // 2. Service log dir at %PROGRAMDATA%\roomler\<segment>\service-logs\.
+    //    ACL'd to SYSTEM at create time; the perUser MSI's user-token CA
+    //    may not be able to delete it. Scrub BOTH the legacy
+    //    `roomler-agent` segment AND the new `roomler` segment (binary
+    //    rename, `appdirs.rs`) so a cross-flavour switch doesn't leave the
+    //    other segment's tree behind. Not routed through `appdirs` (which
+    //    resolves to only ONE segment per host).
     if let Ok(program_data) = std::env::var("PROGRAMDATA") {
-        let path = PathBuf::from(program_data)
-            .join("roomler")
-            .join("roomler-agent")
-            .join("service-logs");
-        if path.exists() {
-            if dry_run {
-                report
-                    .removed
-                    .push(format!("[dry-run] rmdir /s {}", path.display()));
-            } else {
-                match std::fs::remove_dir_all(&path) {
-                    Ok(()) => report
+        for segment in ["roomler-agent", "roomler"] {
+            let path = PathBuf::from(&program_data)
+                .join("roomler")
+                .join(segment)
+                .join("service-logs");
+            if path.exists() {
+                if dry_run {
+                    report
                         .removed
-                        .push(format!("service log dir {}", path.display())),
-                    Err(e) => report
-                        .errors
-                        .push(format!("rmdir {}: {}", path.display(), e)),
+                        .push(format!("[dry-run] rmdir /s {}", path.display()));
+                } else {
+                    match std::fs::remove_dir_all(&path) {
+                        Ok(()) => report
+                            .removed
+                            .push(format!("service log dir {}", path.display())),
+                        Err(e) => report
+                            .errors
+                            .push(format!("rmdir {}: {}", path.display(), e)),
+                    }
                 }
+            } else {
+                report
+                    .skipped
+                    .push(format!("service log dir {} not present", path.display()));
             }
-        } else {
-            report
-                .skipped
-                .push(format!("service log dir {} not present", path.display()));
         }
     }
 }

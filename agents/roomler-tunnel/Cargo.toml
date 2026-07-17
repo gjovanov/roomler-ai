@@ -9,7 +9,11 @@ name = "roomler_tunnel"
 path = "src/lib.rs"
 
 [[bin]]
-name = "roomler-tunnel"
+# P3d Slice B: OUTPUT binary is `roomler` (the unified CLI). Package
+# (`roomler-tunnel`) + lib (`roomler_tunnel`) names UNCHANGED. CI stages a
+# `roomler-tunnel.exe` alias into the release zip so the deployed fleet's
+# self-updater (which extracts `roomler-tunnel.exe`) is never orphaned.
+name = "roomler"
 path = "src/main.rs"
 
 [dependencies]
@@ -96,7 +100,8 @@ signalling-only — server never sees the payload."""
 section = "net"
 priority = "optional"
 assets = [
-    ["target/release/roomler-tunnel", "usr/bin/", "755"],
+    # P3d Slice B: installed CLI binary is `roomler` (the [[bin]] output name).
+    ["target/release/roomler", "usr/bin/", "755"],
 ]
 
 # cargo-wix (Windows .msi)

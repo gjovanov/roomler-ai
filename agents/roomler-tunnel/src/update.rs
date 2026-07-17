@@ -154,19 +154,26 @@ fn verify_sha256(bytes: &[u8], expected: &str) -> Result<()> {
     Ok(())
 }
 
-/// Pull `roomler-tunnel.exe` out of the release zip.
+/// Pull the CLI exe out of the release zip. P3d Slice B renamed the OUTPUT
+/// binary `roomler-tunnel.exe` -> `roomler.exe`, but the CI ships BOTH names
+/// in the zip and a deployed (pre-rename) fleet self-updater may still be
+/// extracting `roomler-tunnel.exe`, so accept EITHER source entry. The on-disk
+/// replace target ([`replace_self`]) is driven by `current_exe()`, so whatever
+/// the running binary is named stays named — only the zip SOURCE entry name
+/// widens here.
 fn extract_windows_exe(zip_bytes: &[u8]) -> Result<Vec<u8>> {
     let mut archive =
         zip::ZipArchive::new(std::io::Cursor::new(zip_bytes)).context("open release zip")?;
     for i in 0..archive.len() {
         let mut f = archive.by_index(i).context("read zip entry")?;
-        if f.name().ends_with("roomler-tunnel.exe") {
+        let name = f.name();
+        if name.ends_with("roomler.exe") || name.ends_with("roomler-tunnel.exe") {
             let mut buf = Vec::with_capacity(f.size() as usize);
             std::io::Read::read_to_end(&mut f, &mut buf).context("read exe from zip")?;
             return Ok(buf);
         }
     }
-    bail!("roomler-tunnel.exe not found in the release archive");
+    bail!("neither roomler.exe nor roomler-tunnel.exe found in the release archive");
 }
 
 /// Replace the running executable with `new_exe` bytes. Windows lets a running

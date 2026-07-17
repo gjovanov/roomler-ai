@@ -5,7 +5,10 @@ edition.workspace = true
 description = "System-tray companion for roomler-agent — onboarding + status + service control."
 
 [[bin]]
-name = "roomler-agent-tray"
+# P3d Slice B: OUTPUT binary is `roomler-desktop` (the tray/desktop companion).
+# Package name (`roomler-agent-tray`) UNCHANGED. CI renames the release
+# artifact to `roomler-desktop-{VERSION}-{TRIPLE}.exe` accordingly.
+name = "roomler-desktop"
 path = "src/main.rs"
 
 [dependencies]

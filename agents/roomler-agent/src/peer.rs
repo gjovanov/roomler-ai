@@ -23,6 +23,7 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
+use tunnel_core::env::node_env;
 use webrtc::api::APIBuilder;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::data_channel::RTCDataChannel;
@@ -286,7 +287,7 @@ impl AgentPeer {
         // the TURNS/TCP relay (the vendored webrtc-ice TCP branch), a single
         // stable TCP connection that survives it — the same escape hatch the
         // tunnel uses on corp VPNs. Opt-in: the default path is unchanged.
-        let relay_tcp = std::env::var("ROOMLER_AGENT_ICE_RELAY_TCP")
+        let relay_tcp = node_env("ICE_RELAY_TCP")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         let mut config = RTCConfiguration {
@@ -3812,10 +3813,7 @@ async fn media_pump_ffmpeg_dc(
 #[cfg(feature = "vp9-444")]
 fn vp9_444_target_fps_from_env() -> u32 {
     const DEFAULT_FPS: u32 = 30;
-    match std::env::var("ROOMLER_AGENT_VP9_FPS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok())
-    {
+    match node_env("VP9_FPS").and_then(|v| v.trim().parse::<u32>().ok()) {
         Some(fps) if fps >= 45 => 60,
         Some(_) => 30,
         None => DEFAULT_FPS,
@@ -3838,10 +3836,7 @@ fn vp9_444_target_fps_from_env() -> u32 {
 /// internal pacer to 30 fps and was the root of the vp9_qsv ~15 fps field bug.
 #[cfg(feature = "ffmpeg-encoder")]
 fn ffmpeg_target_fps(constrained: bool) -> u32 {
-    if let Some(fps) = std::env::var("ROOMLER_AGENT_FFMPEG_FPS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok())
-    {
+    if let Some(fps) = node_env("FFMPEG_FPS").and_then(|v| v.trim().parse::<u32>().ok()) {
         return fps.clamp(1, 240);
     }
     if constrained { 30 } else { 60 }

@@ -92,11 +92,17 @@
                                 Type='integer'
                                 Value='1'
                                 KeyPath='yes' />
+                            <!-- P3d Slice B: the daemon EXE is now `roomlerd.exe`.
+                                 The File Id stays `roomler_agent_exe` so every
+                                 <CustomAction FileKey='roomler_agent_exe'> below
+                                 still resolves to THIS (the real daemon) file. The
+                                 component Id + Guid are unchanged for stable
+                                 component identity across upgrade. -->
                             <File
                                 Id='roomler_agent_exe'
-                                Name='roomler-agent.exe'
+                                Name='roomlerd.exe'
                                 DiskId='1'
-                                Source='target\release\roomler-agent.exe' />
+                                Source='target\release\roomlerd.exe' />
                             <RemoveFolder
                                 Id='RemoveAppFolder'
                                 Directory='APPLICATIONFOLDER'
@@ -105,6 +111,32 @@
                                 Id='RemoveProgramsFolder'
                                 Directory='ProgramsFolder'
                                 On='uninstall' />
+                        </Component>
+                        <!-- P3d Slice B: INERT compatibility alias. Ships a
+                             `roomler-agent.exe` copy (produced by the
+                             release-agent.yml `Copy-Item roomlerd.exe
+                             roomler-agent.exe` step before cargo-wix) alongside
+                             the renamed daemon so a mixed / in-flight fleet still
+                             resolves the old basename (tray spawn fallback, any
+                             field script hardcoding `roomler-agent.exe`). NO
+                             CustomAction targets this file — every FileKey stays
+                             on the primary `roomler_agent_exe`. Fresh unique GUID;
+                             HKCU RegistryValue KeyPath mirrors the sibling
+                             components so ICE38/ICE64 pass in the user-profile
+                             directory. -->
+                        <Component Id='AgentExeAlias' Guid='568CA8FA-D31E-46C6-A84E-E366EC837728'>
+                            <RegistryValue
+                                Root='HKCU'
+                                Key='Software\Roomler\Agent'
+                                Name='installed_exe_alias'
+                                Type='integer'
+                                Value='1'
+                                KeyPath='yes' />
+                            <File
+                                Id='roomler_agent_exe_alias'
+                                Name='roomler-agent.exe'
+                                DiskId='1'
+                                Source='target\release\roomler-agent.exe' />
                         </Component>
                         <Component Id='LicenseTxt' Guid='4B1D2E80-6F3C-4B2A-9E1D-7A2B3C4D5E6F'>
                             <RegistryValue
@@ -166,7 +198,7 @@
                             Id='AgentShortcut'
                             Name='Roomler Agent'
                             Description='Roomler AI remote-control agent (signalling)'
-                            Target='[APPLICATIONFOLDER]roomler-agent.exe'
+                            Target='[APPLICATIONFOLDER]roomlerd.exe'
                             Arguments='run'
                             WorkingDirectory='APPLICATIONFOLDER' />
                         <RemoveFolder Id='CleanupProgramMenuSubfolder' On='uninstall' />
@@ -193,6 +225,8 @@
             InstallDefault='local'
             Absent='disallow'>
             <ComponentRef Id='AgentExe' />
+            <!-- P3d Slice B: inert `roomler-agent.exe` compatibility alias. -->
+            <ComponentRef Id='AgentExeAlias' />
             <ComponentRef Id='LicenseTxt' />
             <ComponentRef Id='ReadmeTxt' />
             <ComponentRef Id='WintunDll' />

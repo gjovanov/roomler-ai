@@ -540,7 +540,7 @@ impl OverlayRuntime {
                     // hatch (an old peer's OS doesn't own its derived v6, so v6 to
                     // it blackholes; happy-eyeballs apps fall back, sequential apps
                     // may hang on it).
-                    answer_aaaa: std::env::var("ROOMLER_AGENT_DNS_AAAA").as_deref() != Ok("0"),
+                    answer_aaaa: crate::env::node_env("DNS_AAAA").as_deref() != Some("0"),
                 }));
                 // Point the OS resolver at us for `<magic_domain>` (reverted on Drop).
                 _dns_os_guard = Some(dns::configure_os(self_v4, &magic_domain).await);
