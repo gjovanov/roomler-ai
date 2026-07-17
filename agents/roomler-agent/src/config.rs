@@ -177,6 +177,22 @@ pub struct AgentConfig {
     /// routes are UNTRUSTED until approved, so this is safe to leave on.
     #[serde(default = "default_true")]
     pub advertise_local_subnets: bool,
+
+    /// P6: DECLARED, daemon-supervised tunnel routes (`[[tunnel_routes]]`).
+    /// Each enabled entry is reconciled into a live daemon flow on every
+    /// startup (and on change) by `tunnel::route_reconciler` — the
+    /// persistent counterpart of the ephemeral LocalAPI `CreateForward`
+    /// flows. The struct is `tunnel_core::localapi::RouteDescriptor`, one
+    /// type for wire + disk. Managed via `roomler route add/rm/...` or the
+    /// desktop Tunnels pane (the DAEMON writes this field — LocalAPI verbs
+    /// persist through the daemon's config-write lock); hand-editing the
+    /// TOML also works (picked up at the next daemon start).
+    ///
+    /// NB: a crash-rollback to a pre-P6 binary rewrites the config without
+    /// this field (no unknown-field preservation) — declared routes do not
+    /// survive an auto-rollback.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tunnel_routes: Vec<tunnel_core::localapi::RouteDescriptor>,
 }
 
 /// serde default for `advertise_local_subnets` — auto-detect is ON by default.
@@ -187,7 +203,7 @@ fn default_true() -> bool {
 /// Current schema version. Bumped whenever [`migrate`] gains a new
 /// step. Persisted into the config file by the migration so subsequent
 /// runs short-circuit the migration check.
-pub const CURRENT_SCHEMA_VERSION: &str = "0.3.0-rc.27";
+pub const CURRENT_SCHEMA_VERSION: &str = "0.3.0-rc.198";
 
 /// Apply schema migrations to `cfg` in place. Returns `true` when the
 /// caller should persist the mutated config via [`save`]. Safe to call
@@ -384,6 +400,23 @@ fn default_auto_grant_session() -> bool {
     true
 }
 
+/// Daemon-wide config-WRITE lock (P6). The daemon has several runtime
+/// writers of `config.toml` — the clean-run promotion task, the graceful
+/// shutdown path, and the route reconciler's LocalAPI verbs. Each does a
+/// reload-modify-save; interleaved unlocked, one writer's full-struct save
+/// silently drops another's just-written field. Every daemon-side runtime
+/// writer must hold this lock across its load→mutate→save. (Cross-PROCESS
+/// writers — tray, CLI, wizard — remain last-writer-wins on the file;
+/// [`save`]'s atomic rename keeps a torn file impossible either way.)
+pub type WriteLock = std::sync::Arc<tokio::sync::Mutex<()>>;
+
+/// A fully-populated config for unit tests in other modules (the route
+/// reconciler persists through real [`save`]/[`load`] round-trips).
+#[cfg(test)]
+pub fn test_fixture() -> AgentConfig {
+    tests::fixture()
+}
+
 pub fn default_config_path() -> Result<PathBuf> {
     let dirs =
         crate::appdirs::project_dirs().context("could not resolve a platform config directory")?;
@@ -427,17 +460,35 @@ pub fn save(path: &PathBuf, cfg: &AgentConfig) -> Result<()> {
             .with_context(|| format!("creating parent dir {}", parent.display()))?;
     }
     let serialised = toml::to_string_pretty(cfg).context("serialising config")?;
-    std::fs::write(path, serialised)
-        .with_context(|| format!("writing config to {}", path.display()))?;
 
-    // Tighten permissions on Unix — the file holds a bearer token.
+    // ATOMIC (P6 hardening): write a sibling temp file, then rename over
+    // the target. The file holds `agent_token` — a torn `fs::write`
+    // (power loss / crash mid-write) used to brick enrollment. `rename`
+    // within one directory is atomic on Unix and uses
+    // MOVEFILE_REPLACE_EXISTING semantics on Windows. The temp name is
+    // pid-suffixed so two PROCESSES (daemon + tray/CLI) can't collide on
+    // the temp file itself; last-writer-wins on the rename is the
+    // documented cross-process limitation.
+    let tmp = path.with_extension(format!("toml.tmp.{}", std::process::id()));
+    std::fs::write(&tmp, serialised)
+        .with_context(|| format!("writing config temp file {}", tmp.display()))?;
+
+    // Tighten permissions on Unix BEFORE the rename — the file holds a
+    // bearer token, and the temp file must never be world-readable even
+    // for an instant at the final path.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(path)?.permissions();
+        let mut perms = std::fs::metadata(&tmp)?.permissions();
         perms.set_mode(0o600);
-        std::fs::set_permissions(path, perms)?;
+        std::fs::set_permissions(&tmp, perms)?;
     }
+
+    std::fs::rename(&tmp, path).with_context(|| {
+        // Best-effort cleanup so failed saves don't accrete temp files.
+        let _ = std::fs::remove_file(&tmp);
+        format!("renaming config into place at {}", path.display())
+    })?;
     Ok(())
 }
 
@@ -495,7 +546,7 @@ mod tests {
         );
     }
 
-    fn fixture() -> AgentConfig {
+    pub(super) fn fixture() -> AgentConfig {
         AgentConfig {
             server_url: "https://example.invalid".into(),
             ws_url: None,
@@ -521,6 +572,7 @@ mod tests {
             overlay_advertised_routes: Vec::new(),
             advertise_routes: Vec::new(),
             advertise_local_subnets: true,
+            tunnel_routes: Vec::new(),
         }
     }
 
