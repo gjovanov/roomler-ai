@@ -264,6 +264,9 @@ async fn run_install_inner(
         config_path: Some(config_path.display().to_string()),
         path_updated: Some(integration_report.path_updated),
         shortcut_created: Some(integration_report.shortcut_created),
+        // Daemon-role concept ("the MSI also delivered the CLI") —
+        // not applicable when the CLI IS the install.
+        cli_included: None,
     })
 }
 

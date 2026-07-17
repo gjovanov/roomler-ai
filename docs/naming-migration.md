@@ -51,14 +51,28 @@ rename — same shim, no behaviour change.
 
 ## In flight (P4 — unified installer `roomler-setup`)
 
-- **P4a**: `crates/roomler-setup-core` (lib `wizard_shared`) extracted from the two
-  wizard crates — msi_runner / extract / integration / tunnel-enroll / asset_resolver
-  relocated once, legacy wizards re-export path-compatibly (byte-identical
-  behaviour); ONE unified `ProgressEvent` wire (tunnel tag style, live-union vocab)
-  consumed only by the new `agents/roomler-setup` app (role picker: daemon
-  perMachine-SCM / perUser-task / perMachine + tunnel-client).
-- **P4b**: role→action matrix; both wxs gain `roomler.exe`; folder rename
-  `roomler-agent\` → `Roomler\` (UpgradeCodes FROZEN); backend `setup_release.rs`
-  (tag `setup-v*`).
+- **P4a** (MERGED, #117): `crates/roomler-setup-core` (lib `wizard_shared`) extracted
+  from the two wizard crates — msi_runner / extract / integration / tunnel-enroll /
+  asset_resolver relocated once, legacy wizards re-export path-compatibly
+  (byte-identical behaviour); ONE unified `ProgressEvent` wire (tunnel tag style,
+  live-union vocab) consumed only by the new `agents/roomler-setup` app (role picker:
+  daemon perMachine-SCM / perUser-task / perMachine + tunnel-client).
+- **P4b** (this branch, VM-gated): install folder renamed `roomler-agent\` → `Roomler\`
+  in BOTH wxs (UpgradeCodes FROZEN — MajorUpgrade removes the old-folder product
+  first). Both MSIs now carry the tunnel CLI `roomler.exe` + a PATH append
+  (`TunnelExe` component) — Option A groundwork so a daemon install subsumes the CLI
+  and the roomlerd MSI is the one updater. The rename rides the existing
+  task/service/shortcut re-registration (all re-derive from `current_exe()`);
+  config/`machine_id` are out-of-tree so enrollment survives. New belts:
+  `cleanup-legacy-install` sweeps the vacated old-named dir (the only MSI-CA-reachable
+  step — the cross-flavour arms are fast-path-gated), and the post-install watcher
+  falls back to probing `…\Roomler\roomlerd.exe` so the rename hop reports
+  `SucceededVerified`. `find_tunnel_binary` prefers `roomler(.exe)` over the legacy
+  name. Backend `tunnel_wizard_release.rs` → `setup_release.rs` with dark
+  `/api/setup/*` routes (tag `setup-v*`, asset prefix `roomler-setup-`). Terminal
+  installers `scripts/install.{sh,ps1}` served live at `/api/setup/install.{sh,ps1}`
+  drive the wizard's steps headlessly per OS.
 - **P4c**: retire both wizard crates + `release-tunnel-wizard.yml`; `release-setup.yml`;
-  fold the tunnel CLI self-update into the roomlerd MSI (one updater).
+  fold the tunnel CLI self-update into the roomlerd MSI (one updater); flip
+  `find_tunnel_binary`'s remaining legacy fallback + the legacy `/api/tunnel-wizard`
+  routes off once fleet telemetry confirms no callers.

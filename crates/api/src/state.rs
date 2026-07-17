@@ -106,12 +106,15 @@ pub struct AppState {
     /// agent cache, separate instance so the two namespaces don't
     /// share their fetched payload (different tag prefixes).
     pub tunnel_release_cache: Arc<crate::routes::tunnel_release::LatestTunnelReleaseCache>,
-    /// 1h-TTL in-memory cache backing `/api/tunnel-wizard/{latest-release,
-    /// installer/{platform}}`. Separate from `tunnel_release_cache` so the
-    /// wizard's `tunnel-wizard-v*` tags don't pollute the CLI's
-    /// `tunnel-v*` lookups. Same lifecycle as the agent + CLI caches.
+    /// 1h-TTL in-memory cache backing the legacy `/api/tunnel-wizard/*`
+    /// AND the P4b `/api/setup/*` families (one mixed release list;
+    /// each family filters its own tag prefix — see
+    /// `routes::setup_release`, renamed from `tunnel_wizard_release`
+    /// in P4b). Separate from `tunnel_release_cache` so wizard tags
+    /// don't pollute the CLI's `tunnel-v*` lookups. Same lifecycle as
+    /// the agent + CLI caches.
     pub tunnel_wizard_release_cache:
-        Arc<crate::routes::tunnel_wizard_release::LatestTunnelWizardReleaseCache>,
+        Arc<crate::routes::setup_release::LatestTunnelWizardReleaseCache>,
 }
 
 impl AppState {
@@ -277,7 +280,7 @@ impl AppState {
             latest_release_cache: crate::routes::agent_release::LatestReleaseCache::new(),
             tunnel_release_cache: crate::routes::tunnel_release::LatestTunnelReleaseCache::new(),
             tunnel_wizard_release_cache:
-                crate::routes::tunnel_wizard_release::LatestTunnelWizardReleaseCache::new(),
+                crate::routes::setup_release::LatestTunnelWizardReleaseCache::new(),
         })
     }
 }
