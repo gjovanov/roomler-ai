@@ -124,6 +124,13 @@ struct FlowLive {
     /// `bytes_in`/`bytes_out` accumulate across WS reconnects; `active_flows`
     /// is the live connection gauge. Read by [`TunnelClientHub::flows_snapshot`].
     throughput: Arc<SessionThroughput>,
+    /// P6: set when the supervisor hit a PERMANENT open-failure (enrollment
+    /// revoked, cross-tenant) and exited its retry loop — retrying would
+    /// hammer the server with a doomed TunnelOpen every backoff tick
+    /// forever. Read by `flows_snapshot` (transport column shows `failed`)
+    /// and by the route reconciler, which turns it into the terminal
+    /// `RouteState::Failed` for a declared route.
+    fatal: Mutex<Option<String>>,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -193,7 +200,11 @@ impl TunnelClientHub {
             .iter()
             .map(|(id, h)| {
                 let status = *h.live.status.lock().unwrap();
-                let transport = if status == FlowStatus::Up {
+                let transport = if h.live.fatal.lock().unwrap().is_some() {
+                    // P6: supervisor stopped on a permanent failure — the
+                    // liveness column says so instead of a perpetual "down".
+                    "failed".to_string()
+                } else if status == FlowStatus::Up {
                     h.live
                         .transport
                         .lock()
@@ -286,6 +297,34 @@ impl TunnelClientHub {
         );
         info!(flow = %id, %node, local, ?pref, "created daemon socks5 listener");
         Ok(id)
+    }
+
+    /// Whether a flow with this id is registered (P6 — the route
+    /// reconciler's liveness check for its route→flow mapping).
+    pub fn has_flow(&self, id: &str) -> bool {
+        self.inner.flows.lock().unwrap().contains_key(id)
+    }
+
+    /// The flow's permanent-failure reason, if its supervisor stopped on
+    /// one (P6). `None` for a healthy/retrying flow or an unknown id.
+    pub fn flow_fatal(&self, id: &str) -> Option<String> {
+        self.inner
+            .flows
+            .lock()
+            .unwrap()
+            .get(id)
+            .and_then(|h| h.live.fatal.lock().unwrap().clone())
+    }
+
+    /// Whether the flow currently has an established session (status `Up`).
+    /// P6 — lets the route reconciler surface Active vs Pending.
+    pub fn flow_up(&self, id: &str) -> bool {
+        self.inner
+            .flows
+            .lock()
+            .unwrap()
+            .get(id)
+            .is_some_and(|h| *h.live.status.lock().unwrap() == FlowStatus::Up)
     }
 
     /// Abort + deregister a flow by id. Reaps the flow's demux entries (in case
@@ -553,11 +592,41 @@ async fn run_flow_supervisor(
                 backoff = RECONNECT_BACKOFF_MIN;
             }
             Err(e) => {
+                // P6: a PERMANENT failure (enrollment revoked, cross-tenant)
+                // can't heal by retrying — every retry is a doomed TunnelOpen
+                // against the server, forever (and reboot-surviving for a
+                // declared route). Record it and stop supervising; the
+                // operator re-creates the flow / re-enables the route after
+                // fixing the cause. Retryable errors keep today's backoff.
+                if let Some(reason) = permanent_session_error(&e) {
+                    warn!(flow = %flow_id, %reason, "tunnel session failed PERMANENTLY; supervisor stopping");
+                    *live.fatal.lock().unwrap() = Some(reason);
+                    return;
+                }
                 warn!(flow = %flow_id, %e, backoff_s = backoff.as_secs(), "tunnel session failed; retrying");
             }
         }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+    }
+}
+
+/// Classify a session error as PERMANENT (`Some(reason)`) or retryable
+/// (`None`). Conservative by design: only failure shapes that provably
+/// cannot heal without operator action match — `rc:tunnel.revoked` (admin
+/// revoked this daemon's enrollment; the driver bails with "tunnel
+/// revoked …") and the server's cross-tenant open rejection (the driver
+/// bails "server error during tunnel.open: cross_tenant: …"). Per-flow
+/// ACL denies are NOT here: they arrive as `TcpForwardReject` per
+/// connection while the session stays up, and a policy edit heals them
+/// live. Anything unrecognised stays retryable (the pre-P6 behaviour).
+fn permanent_session_error(e: &anyhow::Error) -> Option<String> {
+    let msg = format!("{e:#}");
+    let lower = msg.to_ascii_lowercase();
+    if lower.contains("revoked") || lower.contains("cross_tenant") {
+        Some(msg)
+    } else {
+        None
     }
 }
 
@@ -744,8 +813,10 @@ fn server_msg_kind(msg: &ServerMsg) -> &'static str {
     }
 }
 
-/// Parse + validate a target node (a 24-hex agent id).
-fn parse_node(node: &str) -> std::result::Result<ObjectId, String> {
+/// Parse + validate a target node (a 24-hex agent id). `pub(crate)` so the
+/// route reconciler validates a RouteAdd with the SAME rule the hub will
+/// apply at create time.
+pub(crate) fn parse_node(node: &str) -> std::result::Result<ObjectId, String> {
     ObjectId::parse_str(node).map_err(|_| format!("node must be a 24-hex agent id, got '{node}'"))
 }
 
@@ -769,8 +840,8 @@ fn transport_word(p: TransportPref) -> &'static str {
 
 /// Parse a `host:port` (robust to bracketed IPv6 `[::1]:80`). Mirrors the CLI's
 /// `forward::parse_remote` — kept local so the daemon doesn't depend on the CLI
-/// crate.
-fn parse_host_port(s: &str) -> Result<(String, u16)> {
+/// crate. `pub(crate)` for the route reconciler's RouteAdd validation.
+pub(crate) fn parse_host_port(s: &str) -> Result<(String, u16)> {
     if let Some(rest) = s.strip_prefix('[') {
         let close = rest
             .find(']')
