@@ -749,7 +749,7 @@ jobs:
         env:
           WIN_CODESIGN_PFX_BASE64: ${{ secrets.WIN_CODESIGN_PFX_BASE64 }}
 
-      - name: Verify MSI size budget (P4b: MSI carries the tunnel CLI)
+      - name: 'Verify MSI size budget (P4b: MSI carries the tunnel CLI)'
         # Budget history: rc.63 baseline 8 MB (pre-ffmpeg); rc.65's
         # Option B guard capped ffmpeg bloat at a 24 MB hard ceiling;
         # rc.194 measured 20.73 MB per flavour. P4b DELIBERATELY grows
