@@ -126,6 +126,74 @@ pub struct FlowInfo {
     pub bytes_out: u64,
 }
 
+/// A DECLARED, daemon-supervised route (P6). Unlike an ephemeral flow
+/// (created over the LocalAPI, gone when the daemon restarts), a route is
+/// persisted in the daemon's config (`[[tunnel_routes]]` — this struct IS
+/// the config-TOML shape, one type for wire + disk) and reconciled back
+/// into a live flow on every daemon start until removed or disabled.
+///
+/// `node` is REQUIRED in v1: daemon-side SOCKS5 needs a concrete target
+/// node (mesh-mode routes are a later slice, matching the CLI's own
+/// "--daemon socks5 requires --agent" bail).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct RouteDescriptor {
+    /// Operator-chosen slug, unique among routes. Empty on `RouteAdd` ⇒
+    /// the daemon generates one (returned in [`Response::RouteAdded`]).
+    #[serde(default)]
+    pub id: String,
+    pub kind: FlowKind,
+    /// Target node (hex agent id).
+    pub node: String,
+    /// Local loopback listen port.
+    pub local: u16,
+    /// `host:port` for a static forward; `None` for a SOCKS5 route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
+    /// `auto` (default) | `quic` | `webrtc`. Empty ⇒ `auto`.
+    #[serde(default)]
+    pub transport: String,
+    /// Soft-disable without deletion. Defaults true so a hand-written
+    /// config entry without the key is live.
+    #[serde(default = "route_enabled_default")]
+    pub enabled: bool,
+}
+
+fn route_enabled_default() -> bool {
+    true
+}
+
+/// Runtime state of a declared route, computed by the daemon's reconciler.
+/// `Failed` is TERMINAL: a permanent open-failure (enrollment revoked,
+/// cross-tenant, ACL policy deny) stops supervision for the route until an
+/// operator re-enables it — without this, a revoked route would hammer the
+/// server with a TunnelOpen every backoff tick, across reboots, forever.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum RouteState {
+    /// `enabled = false` — not supervised.
+    Disabled,
+    /// Declared and enabled; the reconciler hasn't (re)created its flow yet.
+    Pending,
+    /// Live flow exists.
+    Active { flow_id: String },
+    /// Flow creation failed retryably (port taken, WS down); the reconciler
+    /// retries with backoff.
+    Backoff {
+        next_retry_secs: u64,
+        last_error: String,
+    },
+    /// Permanent failure — requires operator re-enable (or remove).
+    Failed { reason: String },
+}
+
+/// A declared route joined with its live runtime state — the
+/// [`Request::RouteList`] row.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct RouteInfo {
+    pub route: RouteDescriptor,
+    pub state: RouteState,
+}
+
 /// One remote-control session awaiting an operator consent decision (rc.46).
 /// Surfaced by [`Request::ConsentPending`] so the desktop app renders its
 /// Approve/Deny modal over the LocalAPI instead of reading the daemon's private
@@ -194,6 +262,23 @@ pub enum Request {
     /// Stop + deregister a daemon flow by its id. Returns
     /// [`Response::FlowKilled`] (`ok=false` if the id was unknown).
     KillFlow { id: String },
+    /// Declared routes + their live runtime state (P6). Read-only.
+    RouteList,
+    /// Declare a new supervised route: the daemon persists it to config
+    /// (surviving restarts) and reconciles it into a live flow. Mutating —
+    /// the pipe/socket ACL is the trust boundary, same as
+    /// [`Request::CreateForward`]. Returns [`Response::RouteAdded`] with
+    /// the effective descriptor (id generated if empty).
+    RouteAdd { route: RouteDescriptor },
+    /// Remove a declared route by id: kills its live flow (if any) and
+    /// deletes it from config. Returns [`Response::RouteRemoved`]
+    /// (`ok=false` if the id was unknown).
+    RouteRemove { id: String },
+    /// Enable/disable a declared route by id without deleting it.
+    /// Disabling kills the live flow; enabling clears a terminal
+    /// `Failed` state and re-supervises. Returns
+    /// [`Response::RouteUpdated`].
+    RouteSetEnabled { id: String, enabled: bool },
 }
 
 /// A LocalAPI response. Adjacently tagged so a payload may be a struct
@@ -225,6 +310,22 @@ pub enum Response {
     },
     /// Result of [`Request::KillFlow`] — `ok=false` if the id wasn't found.
     FlowKilled {
+        ok: bool,
+    },
+    /// Declared routes + live state ([`Request::RouteList`]).
+    Routes(Vec<RouteInfo>),
+    /// A route was declared + persisted — carries the effective descriptor
+    /// (id filled in if the request left it empty).
+    RouteAdded {
+        route: RouteDescriptor,
+    },
+    /// Result of [`Request::RouteRemove`] — `ok=false` if the id was unknown.
+    RouteRemoved {
+        ok: bool,
+    },
+    /// Result of [`Request::RouteSetEnabled`] — `ok=false` if the id was
+    /// unknown.
+    RouteUpdated {
         ok: bool,
     },
     /// The verb couldn't be served (bad request, state unavailable).
@@ -311,6 +412,32 @@ pub trait LocalApiState: Send + Sync {
     fn kill_flow(&self, _id: &str) -> bool {
         false
     }
+    /// Declared routes + their live runtime state (P6). Default: none —
+    /// a node without a route reconciler has no declared routes.
+    fn route_list(&self) -> Vec<RouteInfo> {
+        Vec::new()
+    }
+    /// Declare + persist a supervised route (P6). Async — config I/O.
+    /// Default: unsupported.
+    async fn route_add(&self, _route: RouteDescriptor) -> Response {
+        Response::Error {
+            message: "declared routes are not supported on this node".into(),
+        }
+    }
+    /// Remove a declared route by id (P6). Async — config I/O. Default:
+    /// unsupported.
+    async fn route_remove(&self, _id: &str) -> Response {
+        Response::Error {
+            message: "declared routes are not supported on this node".into(),
+        }
+    }
+    /// Enable/disable a declared route by id (P6). Async — config I/O.
+    /// Default: unsupported.
+    async fn route_set_enabled(&self, _id: &str, _enabled: bool) -> Response {
+        Response::Error {
+            message: "declared routes are not supported on this node".into(),
+        }
+    }
 }
 
 /// Pure dispatch: map a [`Request`] to a [`Response`] over a state snapshot.
@@ -328,14 +455,18 @@ pub fn handle(req: &Request, state: &dyn LocalApiState) -> Response {
         Request::KillFlow { id } => Response::FlowKilled {
             ok: state.kill_flow(id),
         },
-        // `Ping` / `CreateForward` / `CreateSocks5` are async — intercepted in
-        // `serve_connection` before this sync dispatch runs. These arms only
-        // satisfy match exhaustiveness.
-        Request::Ping { .. } | Request::CreateForward { .. } | Request::CreateSocks5 { .. } => {
-            Response::Error {
-                message: "this verb must be served on the async path".into(),
-            }
-        }
+        Request::RouteList => Response::Routes(state.route_list()),
+        // `Ping` / `Create*` / the mutating `Route*` verbs are async —
+        // intercepted in `serve_connection` before this sync dispatch runs.
+        // These arms only satisfy match exhaustiveness.
+        Request::Ping { .. }
+        | Request::CreateForward { .. }
+        | Request::CreateSocks5 { .. }
+        | Request::RouteAdd { .. }
+        | Request::RouteRemove { .. }
+        | Request::RouteSetEnabled { .. } => Response::Error {
+            message: "this verb must be served on the async path".into(),
+        },
     }
 }
 
@@ -381,6 +512,11 @@ where
                 local,
                 transport,
             }) => state.create_socks5(&node, local, &transport).await,
+            Ok(Request::RouteAdd { route }) => state.route_add(route).await,
+            Ok(Request::RouteRemove { id }) => state.route_remove(&id).await,
+            Ok(Request::RouteSetEnabled { id, enabled }) => {
+                state.route_set_enabled(&id, enabled).await
+            }
             Ok(req) => handle(&req, state),
             Err(e) => Response::Error {
                 message: format!("bad request: {e}"),
@@ -929,6 +1065,50 @@ impl Client {
             other => Err(unexpected_response(other)),
         }
     }
+
+    /// `Request::RouteList` → declared routes + live state.
+    pub async fn route_list(&mut self) -> std::io::Result<Vec<RouteInfo>> {
+        match self.request(&Request::RouteList).await? {
+            Response::Routes(v) => Ok(v),
+            other => Err(unexpected_response(other)),
+        }
+    }
+
+    /// `Request::RouteAdd` → the effective persisted descriptor (id
+    /// generated if the request left it empty). A daemon
+    /// [`Response::Error`] (duplicate id/port, bad node, config write
+    /// failure) surfaces its message verbatim.
+    pub async fn route_add(&mut self, route: RouteDescriptor) -> std::io::Result<RouteDescriptor> {
+        match self.request(&Request::RouteAdd { route }).await? {
+            Response::RouteAdded { route } => Ok(route),
+            other => Err(unexpected_response(other)),
+        }
+    }
+
+    /// `Request::RouteRemove` → whether a route with that id existed.
+    pub async fn route_remove(&mut self, id: &str) -> std::io::Result<bool> {
+        match self
+            .request(&Request::RouteRemove { id: id.to_string() })
+            .await?
+        {
+            Response::RouteRemoved { ok } => Ok(ok),
+            other => Err(unexpected_response(other)),
+        }
+    }
+
+    /// `Request::RouteSetEnabled` → whether a route with that id existed.
+    pub async fn route_set_enabled(&mut self, id: &str, enabled: bool) -> std::io::Result<bool> {
+        match self
+            .request(&Request::RouteSetEnabled {
+                id: id.to_string(),
+                enabled,
+            })
+            .await?
+        {
+            Response::RouteUpdated { ok } => Ok(ok),
+            other => Err(unexpected_response(other)),
+        }
+    }
 }
 
 /// Map an error / mismatched response to an `io::Error` for the typed helpers.
@@ -1192,6 +1372,100 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Request>(r#"{"t":"peers"}"#).unwrap(),
             Request::Peers
+        );
+    }
+
+    #[tokio::test]
+    async fn route_verbs_dispatch_and_lock_wire_shape() {
+        let s = Mock;
+        // RouteList is sync — through `handle`; the Mock has no reconciler,
+        // so the default-impl empty list comes back.
+        assert!(matches!(
+            handle(&Request::RouteList, &s),
+            Response::Routes(ref v) if v.is_empty()
+        ));
+        // The mutating Route* verbs are async-path only; the sync arm errors.
+        assert!(matches!(
+            handle(&Request::RouteRemove { id: "r".into() }, &s),
+            Response::Error { .. }
+        ));
+        // Default trait impls report unsupported.
+        assert!(matches!(s.route_remove("r").await, Response::Error { .. }));
+
+        // Wire shape — locks the discriminators the CLI + desktop depend on.
+        let route = RouteDescriptor {
+            id: "pg-mars".into(),
+            kind: FlowKind::Forward,
+            node: "aabbcc".into(),
+            local: 15432,
+            remote: Some("db:5432".into()),
+            transport: "auto".into(),
+            enabled: true,
+        };
+        assert_eq!(
+            serde_json::to_string(&Request::RouteAdd {
+                route: route.clone()
+            })
+            .unwrap(),
+            r#"{"t":"route_add","d":{"route":{"id":"pg-mars","kind":"forward","node":"aabbcc","local":15432,"remote":"db:5432","transport":"auto","enabled":true}}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::RouteSetEnabled {
+                id: "pg-mars".into(),
+                enabled: false,
+            })
+            .unwrap(),
+            r#"{"t":"route_set_enabled","d":{"id":"pg-mars","enabled":false}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Response::RouteAdded {
+                route: route.clone()
+            })
+            .unwrap(),
+            r#"{"t":"route_added","d":{"route":{"id":"pg-mars","kind":"forward","node":"aabbcc","local":15432,"remote":"db:5432","transport":"auto","enabled":true}}}"#
+        );
+        let info = RouteInfo {
+            route,
+            state: RouteState::Backoff {
+                next_retry_secs: 30,
+                last_error: "bind: in use".into(),
+            },
+        };
+        let s = serde_json::to_string(&Response::Routes(vec![info.clone()])).unwrap();
+        assert!(
+            s.contains(r#""state":{"state":"backoff","next_retry_secs":30"#),
+            "got {s}"
+        );
+        assert_eq!(
+            serde_json::from_str::<Response>(&s).unwrap(),
+            Response::Routes(vec![info])
+        );
+        // A minimal hand-written config-style descriptor: id/remote/transport
+        // omitted, enabled defaults TRUE (a bare [[tunnel_routes]] entry is
+        // live), socks5 needs no remote.
+        assert_eq!(
+            serde_json::from_str::<RouteDescriptor>(
+                r#"{"kind":"socks5","node":"aabbcc","local":1080}"#
+            )
+            .unwrap(),
+            RouteDescriptor {
+                id: String::new(),
+                kind: FlowKind::Socks5,
+                node: "aabbcc".into(),
+                local: 1080,
+                remote: None,
+                transport: String::new(),
+                enabled: true,
+            }
+        );
+        // Terminal-state wire shape (the pane's re-enable affordance keys on
+        // "failed").
+        assert_eq!(
+            serde_json::to_string(&RouteState::Failed {
+                reason: "revoked".into()
+            })
+            .unwrap(),
+            r#"{"state":"failed","reason":"revoked"}"#
         );
     }
 
