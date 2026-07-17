@@ -137,6 +137,16 @@ pre {
   flex-direction: column;
   gap: 12px;
 }
+/* A step's `display: flex` OVERRIDES the `[hidden]` attribute's UA
+   `display: none`, so every section stayed visible stacked vertically
+   and render()'s per-step `hidden` toggle had no visual effect — the
+   wizard looked like one long scroll instead of discrete pages, and
+   Next appeared to do nothing (2026-07-17). `.step[hidden]`
+   (specificity 0,1,1) beats `.step` (0,1,0) → only the current step
+   renders → true step-pages. */
+.step[hidden] {
+  display: none;
+}
 
 .card {
   background: var(--bg-elevated);
