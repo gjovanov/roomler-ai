@@ -96,7 +96,7 @@ mod imp {
     use tokio::time::sleep;
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, WAIT_OBJECT_0};
     use windows_sys::Win32::System::Threading::{
-        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_TERMINATE,
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
         TerminateProcess, WaitForSingleObject,
     };
 
@@ -129,19 +129,34 @@ mod imp {
     unsafe impl Sync for MsiRunner {}
 
     impl MsiRunner {
-        /// Open SYNCHRONIZE | PROCESS_QUERY_INFORMATION |
-        /// PROCESS_TERMINATE access to a PID returned by
+        /// Open a MONITORING handle to a PID returned by
         /// `roomler_agent::updater::spawn_installer_inner`.
+        ///
+        /// Rights are `SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION`
+        /// ONLY — deliberately NOT the full `PROCESS_QUERY_INFORMATION`
+        /// or `PROCESS_TERMINATE`. A perMachine MSI is spawned via
+        /// `ShellExecuteExW verb=runas`, so msiexec self-elevates to
+        /// HIGH integrity while this wizard runs at MEDIUM integrity
+        /// (asInvoker manifest). Windows' mandatory-integrity policy
+        /// (`NO_WRITE_UP`, the default on a process object) then denies
+        /// a medium-IL caller the write-class rights `PROCESS_TERMINATE`
+        /// and full `PROCESS_QUERY_INFORMATION` on the elevated child —
+        /// `OpenProcess` fails with `ERROR_ACCESS_DENIED` (0x5). This
+        /// was the perMachine/SystemContext wizard-install failure found
+        /// by the first end-to-end click-through. `PROCESS_QUERY_LIMITED
+        /// _INFORMATION` exists precisely to be the cross-IL-safe query
+        /// right, and `SYNCHRONIZE` is read-class — both are granted
+        /// medium→high. `WaitForSingleObject` needs `SYNCHRONIZE`;
+        /// `GetExitCodeProcess` accepts `PROCESS_QUERY_LIMITED_INFORMATION`
+        /// (per its Win32 contract) — so monitoring works with these
+        /// reduced rights for BOTH the elevated (perMachine) and
+        /// non-elevated (perUser) msiexec. Force-kill re-opens its own
+        /// `PROCESS_TERMINATE` handle best-effort — see `terminate()`.
         pub fn attach(pid: u32) -> Result<Self, MsiRunnerError> {
             // SAFETY: standard Win32 OpenProcess call; we check the
             // return value for null and propagate.
-            let handle = unsafe {
-                OpenProcess(
-                    SYNCHRONIZE | PROCESS_QUERY_INFORMATION | PROCESS_TERMINATE,
-                    0,
-                    pid,
-                )
-            };
+            let handle =
+                unsafe { OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
             if handle.is_null() {
                 let err = unsafe { GetLastError() };
                 return Err(MsiRunnerError::OpenFailed { pid, error: err });
@@ -164,8 +179,8 @@ mod imp {
                 if r == WAIT_OBJECT_0 {
                     let mut code: u32 = 0;
                     // SAFETY: handle is valid;
-                    // PROCESS_QUERY_INFORMATION was requested in
-                    // attach().
+                    // PROCESS_QUERY_LIMITED_INFORMATION was requested in
+                    // attach() (GetExitCodeProcess accepts it).
                     let ok = unsafe { GetExitCodeProcess(self.handle, &mut code) };
                     if ok == 0 {
                         let err = unsafe { GetLastError() };
@@ -184,17 +199,39 @@ mod imp {
         /// "may leave partial install" UI before invoking this.
         /// No rollback is possible because the wizard holds no
         /// transactional handle.
+        ///
+        /// The monitoring handle from `attach()` deliberately lacks
+        /// `PROCESS_TERMINATE` (so attach can succeed cross-integrity —
+        /// see its docs), so we re-open a dedicated terminate handle by
+        /// PID here. This SUCCEEDS for a non-elevated (perUser) msiexec
+        /// but is EXPECTED to fail with `ERROR_ACCESS_DENIED` for an
+        /// elevated (perMachine) one — a medium-IL process cannot kill a
+        /// high-IL process, and no amount of handle juggling changes
+        /// that. The error propagates so the SPA can tell the operator
+        /// the elevated install must be cancelled from its own UAC
+        /// surface.
         pub fn terminate(&self) -> Result<(), MsiRunnerError> {
-            // SAFETY: handle is valid; PROCESS_TERMINATE was
-            // requested in attach(). Pass exit-code 1602 so a
-            // subsequent GetExitCodeProcess maps cleanly to
-            // MsiExitDecoded::UserCancel.
-            let ok = unsafe { TerminateProcess(self.handle, 1602) };
-            if ok == 0 {
+            // SAFETY: standard Win32 OpenProcess; null-checked.
+            let kill = unsafe { OpenProcess(PROCESS_TERMINATE, 0, self.pid) };
+            if kill.is_null() {
                 let err = unsafe { GetLastError() };
                 return Err(MsiRunnerError::TerminateFailed(err));
             }
-            Ok(())
+            // SAFETY: kill is a valid PROCESS_TERMINATE handle. Pass
+            // exit-code 1602 so a subsequent GetExitCodeProcess maps
+            // cleanly to MsiExitDecoded::UserCancel.
+            let ok = unsafe { TerminateProcess(kill, 1602) };
+            let term_err = if ok == 0 {
+                Some(unsafe { GetLastError() })
+            } else {
+                None
+            };
+            // SAFETY: kill is non-null.
+            unsafe { CloseHandle(kill) };
+            match term_err {
+                Some(err) => Err(MsiRunnerError::TerminateFailed(err)),
+                None => Ok(()),
+            }
         }
 
         /// PID of the attached msiexec process. Exposed so the
