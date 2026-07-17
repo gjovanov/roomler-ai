@@ -454,6 +454,61 @@ pub async fn cmd_get_pending_consents() -> Vec<ConsentRequest> {
     }
 }
 
+// ─── declared routes (P6 — the Tunnels pane) ───────────────────────
+
+/// Declared routes + live state for the Tunnels pane. NEVER errors —
+/// like [`cmd_get_pending_consents`], the pane shows its own zero-state
+/// when the daemon is down (an empty list is indistinguishable from
+/// "no routes", and the Devices section already surfaces daemon-down).
+#[tauri::command]
+pub async fn cmd_route_list() -> Vec<tunnel_core::localapi::RouteInfo> {
+    match localapi::connect().await {
+        Ok(mut c) => c.route_list().await.unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Declare a daemon-supervised route. The daemon validates + persists it
+/// (its config `[[tunnel_routes]]`) and reconciles it into a live flow;
+/// its error strings (bad node, duplicate port, config write failure)
+/// surface verbatim on the form. Returns the effective descriptor (id
+/// generated when the form left it blank).
+#[tauri::command]
+pub async fn cmd_route_add(
+    route: tunnel_core::localapi::RouteDescriptor,
+) -> Result<tunnel_core::localapi::RouteDescriptor, String> {
+    let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
+    client.route_add(route).await.map_err(|e| e.to_string())
+}
+
+/// Remove a declared route (kills its live flow, deletes it from the
+/// daemon config). `Ok(false)` when the id was unknown.
+#[tauri::command]
+pub async fn cmd_route_remove(id: String) -> Result<bool, String> {
+    let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
+    client.route_remove(&id).await.map_err(|e| e.to_string())
+}
+
+/// Enable/disable a declared route (enabling clears a terminal `failed`).
+#[tauri::command]
+pub async fn cmd_route_set_enabled(id: String, enabled: bool) -> Result<bool, String> {
+    let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
+    client
+        .route_set_enabled(&id, enabled)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// The shared connect-error mapping for the mutating route commands
+/// (mirrors [`cmd_ping`]'s wording so the two surfaces read the same).
+fn daemon_unreachable(e: std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        "device service not running".to_string()
+    } else {
+        format!("connecting to the device service: {e}")
+    }
+}
+
 // ─── helpers ───────────────────────────────────────────────────────
 
 /// Load the agent config from its default path. Returns `None` on
