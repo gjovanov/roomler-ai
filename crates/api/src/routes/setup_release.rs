@@ -1,21 +1,25 @@
-//! `/api/tunnel-wizard/{latest-release,installer/{platform}}` —
-//! cached GitHub-Releases proxy for the `roomler-tunnel-installer`
-//! Tauri 2 wizard EXE. Parallel to [`crate::routes::tunnel_release`]
-//! (which serves the bare CLI tarball); this endpoint family serves
-//! the wizard that downloads + installs the CLI.
+//! `/api/setup/*` + legacy `/api/tunnel-wizard/*` — cached
+//! GitHub-Releases proxy for the installer-wizard EXEs. Renamed from
+//! `tunnel_wizard_release.rs` in P4b (node-stack unification).
 //!
-//! Two endpoints downstream of the GitHub-Releases cache:
-//!   - `GET /api/tunnel-wizard/latest-release` → JSON list of recent
-//!     `tunnel-wizard-v*` tags (debug + diagnostics).
-//!   - `GET /api/tunnel-wizard/{platform}/health` → manifest (tag,
-//!     filename, size, digest, uri) for the platform's wizard EXE.
-//!   - `GET /api/tunnel-wizard/{platform}` → streams the wizard
-//!     archive bytes.
+//! Two endpoint families share ONE release cache (same repo, same
+//! upstream fetch — the cache holds the mixed tag list and each
+//! family filters its own prefix):
 //!
-//! Tag prefix: `tunnel-wizard-v*` — separate from `tunnel-v*` so the
-//! wizard can iterate independently of the CLI. Asset name filter
-//! matches `roomler-tunnel-installer-*` per the release-tunnel.yml
-//! wizard matrix.
+//!   - `GET /api/setup/{latest-release,{platform}/health,{platform}}`
+//!     — P4b: the unified `roomler-setup` wizard (tag `setup-v*`,
+//!     asset prefix `roomler-setup-`). Ships DARK until P4c tags the
+//!     first `setup-v*` release: latest-release returns a filtered
+//!     (empty) list, health/download 404 cleanly.
+//!   - `GET /api/tunnel-wizard/…` — the legacy
+//!     `roomler-tunnel-installer` wizard (tag `tunnel-wizard-v*`,
+//!     asset prefix `roomler-tunnel-installer-`). Wire behaviour
+//!     preserved verbatim until P4c retires the crate + routes (NB
+//!     its `latest-release` deliberately keeps returning the
+//!     UNFILTERED mixed list — behaviour-frozen).
+//!
+//! Parallel to [`crate::routes::tunnel_release`] (bare CLI tarball)
+//! and [`crate::routes::agent_release`] (agent MSIs).
 
 use axum::{
     Json,
@@ -43,7 +47,15 @@ const RELEASES_REPO: &str = "gjovanov/roomler-ai";
 /// per-tag (rare).
 const CACHE_TTL: Duration = Duration::from_secs(60 * 60);
 
-const RELEASES_PER_PAGE: usize = 30;
+/// GitHub page size. 100 (the API max) rather than the old 30:
+/// `agent-v*` tags ship several times a day, so a rarely-tagged
+/// family (`tunnel-wizard-v*`, `setup-v*`) falls off a 30-deep first
+/// page within days — observed: tunnel-wizard-v0.3.0-rc.59
+/// (2026-05-25) was long gone from the top 30 by P4b, so the legacy
+/// health/download endpoints were already 404ing. One page of 100
+/// buys weeks of agent cadence; a per-family fetch is the P4c
+/// follow-up if that ever becomes insufficient.
+const RELEASES_PER_PAGE: usize = 100;
 
 struct CacheEntry {
     fetched_at: Instant,
@@ -103,9 +115,10 @@ pub async fn installer_health(
 ) -> Result<Json<InstallerHealth>, ApiError> {
     let normalised = normalise_platform(&platform)?;
     let releases = ensure_releases_cached(&state).await?;
-    let release = pick_release(&releases, &params.version).ok_or_else(|| {
-        ApiError::NotFound(format!("no release matching version={}", params.version))
-    })?;
+    let release =
+        pick_release_for(&releases, &params.version, "tunnel-wizard-v").ok_or_else(|| {
+            ApiError::NotFound(format!("no release matching version={}", params.version))
+        })?;
     let asset = pick_wizard_asset(&release.assets, normalised).ok_or_else(|| {
         ApiError::NotFound(format!(
             "no wizard asset for platform {} in tag {}",
@@ -134,9 +147,10 @@ pub async fn installer_proxy(
 ) -> Result<Response, ApiError> {
     let normalised = normalise_platform(&platform)?;
     let releases = ensure_releases_cached(&state).await?;
-    let release = pick_release(&releases, &params.version).ok_or_else(|| {
-        ApiError::NotFound(format!("no release matching version={}", params.version))
-    })?;
+    let release =
+        pick_release_for(&releases, &params.version, "tunnel-wizard-v").ok_or_else(|| {
+            ApiError::NotFound(format!("no release matching version={}", params.version))
+        })?;
     let asset = pick_wizard_asset(&release.assets, normalised).ok_or_else(|| {
         ApiError::NotFound(format!(
             "no wizard asset for platform {} in tag {}",
@@ -144,6 +158,149 @@ pub async fn installer_proxy(
         ))
     })?;
 
+    stream_asset(asset).await
+}
+
+// ─── /api/setup — the unified roomler-setup wizard (P4b, dark until P4c) ────
+
+/// `GET /api/setup/latest-release` — recent `setup-v*` releases ONLY.
+/// Unlike the legacy tunnel-wizard endpoint above (whose unfiltered
+/// mixed-list shape is behaviour-frozen until P4c), this filters
+/// server-side so the family is genuinely dark — an empty list, not
+/// a mixed one — until the first `setup-v*` tag exists.
+pub async fn setup_latest_release(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<AgentRelease>>, ApiError> {
+    let releases = ensure_releases_cached(&state).await?;
+    let filtered: Vec<AgentRelease> = releases
+        .into_iter()
+        .filter(|r| r.tag_name.starts_with("setup-v"))
+        .collect();
+    Ok(Json(filtered))
+}
+
+/// `GET /api/setup/{platform}/health` — manifest for the unified
+/// wizard EXE matching the requested platform + version. 404s until
+/// P4c tags the first `setup-v*` release.
+pub async fn setup_installer_health(
+    State(state): State<AppState>,
+    Path(platform): Path<String>,
+    Query(params): Query<InstallerQuery>,
+) -> Result<Json<InstallerHealth>, ApiError> {
+    let normalised = normalise_platform(&platform)?;
+    let releases = ensure_releases_cached(&state).await?;
+    let release = pick_release_for(&releases, &params.version, "setup-v").ok_or_else(|| {
+        ApiError::NotFound(format!(
+            "no setup release matching version={}",
+            params.version
+        ))
+    })?;
+    let asset = pick_setup_asset(&release.assets, normalised).ok_or_else(|| {
+        ApiError::NotFound(format!(
+            "no setup asset for platform {} in tag {}",
+            normalised, release.tag_name
+        ))
+    })?;
+    Ok(Json(InstallerHealth {
+        tag: release.tag_name.clone(),
+        platform: normalised.to_string(),
+        filename: asset.name.clone(),
+        size: asset.size,
+        digest: asset.digest.clone(),
+        uri: format!("/api/setup/{}?version={}", normalised, params.version),
+    }))
+}
+
+/// `GET /api/setup/{platform}` — streams the unified wizard bytes.
+pub async fn setup_installer_proxy(
+    State(state): State<AppState>,
+    Path(platform): Path<String>,
+    Query(params): Query<InstallerQuery>,
+) -> Result<Response, ApiError> {
+    let normalised = normalise_platform(&platform)?;
+    let releases = ensure_releases_cached(&state).await?;
+    let release = pick_release_for(&releases, &params.version, "setup-v").ok_or_else(|| {
+        ApiError::NotFound(format!(
+            "no setup release matching version={}",
+            params.version
+        ))
+    })?;
+    let asset = pick_setup_asset(&release.assets, normalised).ok_or_else(|| {
+        ApiError::NotFound(format!(
+            "no setup asset for platform {} in tag {}",
+            normalised, release.tag_name
+        ))
+    })?;
+
+    stream_asset(asset).await
+}
+
+/// Pick the unified-wizard asset for a platform. Asset naming follows
+/// the (P4c) release-setup.yml matrix, mirroring the tunnel-wizard
+/// conventions with the `roomler-setup-` prefix:
+///   - linux-x86_64 — `roomler-setup-*-x86_64-unknown-linux-gnu.tar.gz`
+///   - macos — `roomler-setup-*-universal-apple-darwin.tar.gz`
+///   - windows-x86_64 — `roomler-setup-*-x86_64-pc-windows-msvc.zip`
+pub fn pick_setup_asset<'a>(
+    assets: &'a [AgentReleaseAsset],
+    platform: &str,
+) -> Option<&'a AgentReleaseAsset> {
+    assets.iter().find(|a| {
+        let name = a.name.to_ascii_lowercase();
+        if name.ends_with(".sha256") {
+            return false;
+        }
+        if !name.starts_with("roomler-setup-") {
+            return false;
+        }
+        match platform {
+            "linux-x86_64" => {
+                name.contains("x86_64-unknown-linux-gnu") && name.ends_with(".tar.gz")
+            }
+            "macos" => name.contains("universal-apple-darwin") && name.ends_with(".tar.gz"),
+            "windows-x86_64" => name.contains("x86_64-pc-windows-msvc") && name.ends_with(".zip"),
+            _ => false,
+        }
+    })
+}
+
+/// The terminal-driven installers (scripts/install.sh + install.ps1),
+/// embedded at COMPILE time so the API serves them with no runtime
+/// filesystem dependency. Canonical usage:
+///
+///   curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
+///       --role daemon --token <jwt>
+///
+/// and the PowerShell twin via `/api/setup/install.ps1`. These are the
+/// no-GUI equivalent of the roomler-setup wizard (same resolve →
+/// download → verify → install → enroll steps). Short cache so script
+/// fixes roll out within minutes of a web deploy.
+const INSTALL_SH: &str = include_str!("../../../../scripts/install.sh");
+const INSTALL_PS1: &str = include_str!("../../../../scripts/install.ps1");
+
+fn script_response(body: &'static str, content_type: &'static str) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", content_type)
+        .header("Cache-Control", "public, max-age=300")
+        .body(Body::from(body))
+        .unwrap_or_else(|_| Response::new(Body::from(body)))
+}
+
+/// `GET /api/setup/install.sh` — the Linux/macOS terminal installer.
+pub async fn install_script_sh() -> Response {
+    script_response(INSTALL_SH, "text/x-shellscript; charset=utf-8")
+}
+
+/// `GET /api/setup/install.ps1` — the Windows terminal installer.
+pub async fn install_script_ps1() -> Response {
+    script_response(INSTALL_PS1, "text/plain; charset=utf-8")
+}
+
+/// Stream a release asset's bytes through the proxy with download
+/// headers. Shared by the legacy tunnel-wizard proxy and the P4b
+/// `/api/setup` proxy (extracted verbatim from the former).
+async fn stream_asset(asset: &AgentReleaseAsset) -> Result<Response, ApiError> {
     let client = reqwest::Client::builder()
         .user_agent(concat!("roomler-ai-api/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(60))
@@ -215,22 +372,28 @@ fn normalise_platform(s: &str) -> Result<&'static str, ApiError> {
     }
 }
 
-fn pick_release<'a>(releases: &'a [AgentRelease], version: &str) -> Option<&'a AgentRelease> {
+/// Pick a release for a given tag family. `version == "latest"`
+/// prefers stable over prerelease within the family; an explicit
+/// version matches with or without the family prefix. Generalised in
+/// P4b from the tunnel-wizard-only original so `/api/setup` reuses
+/// it with the `setup-v` prefix.
+fn pick_release_for<'a>(
+    releases: &'a [AgentRelease],
+    version: &str,
+    tag_prefix: &str,
+) -> Option<&'a AgentRelease> {
     if version == "latest" {
         releases
             .iter()
-            .find(|r| !r.draft && !r.prerelease && r.tag_name.starts_with("tunnel-wizard-v"))
+            .find(|r| !r.draft && !r.prerelease && r.tag_name.starts_with(tag_prefix))
             .or_else(|| {
                 releases
                     .iter()
-                    .find(|r| !r.draft && r.tag_name.starts_with("tunnel-wizard-v"))
+                    .find(|r| !r.draft && r.tag_name.starts_with(tag_prefix))
             })
     } else {
-        let target_with_prefix = format!(
-            "tunnel-wizard-v{}",
-            version.trim_start_matches("tunnel-wizard-v")
-        );
-        let target_bare = version.trim_start_matches("tunnel-wizard-v");
+        let target_with_prefix = format!("{tag_prefix}{}", version.trim_start_matches(tag_prefix));
+        let target_bare = version.trim_start_matches(tag_prefix);
         releases.iter().find(|r| {
             r.tag_name == target_with_prefix || r.tag_name == target_bare || r.tag_name == version
         })
@@ -440,7 +603,7 @@ mod tests {
             ),
             release("tunnel-wizard-v0.3.0-rc.2-pre", true, &[]),
         ];
-        let picked = pick_release(&releases, "latest").unwrap();
+        let picked = pick_release_for(&releases, "latest", "tunnel-wizard-v").unwrap();
         assert_eq!(picked.tag_name, "tunnel-wizard-v0.3.0-rc.1");
     }
 
@@ -450,16 +613,84 @@ mod tests {
             release("tunnel-wizard-v0.3.0-rc.1", true, &[]),
             release("agent-v0.3.0", false, &[]),
         ];
-        let picked = pick_release(&releases, "latest").unwrap();
+        let picked = pick_release_for(&releases, "latest", "tunnel-wizard-v").unwrap();
         assert_eq!(picked.tag_name, "tunnel-wizard-v0.3.0-rc.1");
     }
 
     #[test]
     fn pick_release_specific_version_accepts_with_or_without_prefix() {
         let releases = vec![release("tunnel-wizard-v0.3.0-rc.1", false, &[])];
-        assert!(pick_release(&releases, "0.3.0-rc.1").is_some());
-        assert!(pick_release(&releases, "tunnel-wizard-v0.3.0-rc.1").is_some());
-        assert!(pick_release(&releases, "0.99.0").is_none());
+        assert!(pick_release_for(&releases, "0.3.0-rc.1", "tunnel-wizard-v").is_some());
+        assert!(
+            pick_release_for(&releases, "tunnel-wizard-v0.3.0-rc.1", "tunnel-wizard-v").is_some()
+        );
+        assert!(pick_release_for(&releases, "0.99.0", "tunnel-wizard-v").is_none());
+    }
+
+    // ── P4b /api/setup family ─────────────────────────────────────
+
+    #[test]
+    fn pick_release_for_setup_prefix_ignores_other_families() {
+        let releases = vec![
+            release("agent-v0.3.0-rc.195", false, &[]),
+            release("tunnel-wizard-v0.3.0-rc.59", false, &[]),
+            release(
+                "setup-v0.3.0-rc.200",
+                false,
+                &["roomler-setup-0.3.0-rc.200-x86_64-pc-windows-msvc.zip"],
+            ),
+        ];
+        let picked = pick_release_for(&releases, "latest", "setup-v").unwrap();
+        assert_eq!(picked.tag_name, "setup-v0.3.0-rc.200");
+        // Dark until the family exists: no setup-v tag → None (the
+        // handlers turn this into a clean 404).
+        let none = pick_release_for(&releases[..2], "latest", "setup-v");
+        assert!(none.is_none());
+    }
+
+    #[test]
+    fn pick_setup_asset_requires_setup_prefix_and_matches_triples() {
+        let assets = vec![
+            asset("roomler-tunnel-installer-0.3.0-x86_64-pc-windows-msvc.zip"),
+            asset("roomler-setup-0.3.0-x86_64-pc-windows-msvc.zip"),
+            asset("roomler-setup-0.3.0-x86_64-pc-windows-msvc.zip.sha256"),
+            asset("roomler-setup-0.3.0-x86_64-unknown-linux-gnu.tar.gz"),
+            asset("roomler-setup-0.3.0-universal-apple-darwin.tar.gz"),
+        ];
+        assert_eq!(
+            pick_setup_asset(&assets, "windows-x86_64").unwrap().name,
+            "roomler-setup-0.3.0-x86_64-pc-windows-msvc.zip"
+        );
+        assert_eq!(
+            pick_setup_asset(&assets, "linux-x86_64").unwrap().name,
+            "roomler-setup-0.3.0-x86_64-unknown-linux-gnu.tar.gz"
+        );
+        assert_eq!(
+            pick_setup_asset(&assets, "macos").unwrap().name,
+            "roomler-setup-0.3.0-universal-apple-darwin.tar.gz"
+        );
+        // The legacy wizard asset must never satisfy the setup pick.
+        let legacy_only = vec![asset(
+            "roomler-tunnel-installer-0.3.0-x86_64-pc-windows-msvc.zip",
+        )];
+        assert!(pick_setup_asset(&legacy_only, "windows-x86_64").is_none());
+    }
+
+    #[test]
+    fn embedded_install_scripts_look_right() {
+        // Shape locks on the compile-time-embedded terminal installers
+        // — a broken include path or an emptied script fails here, not
+        // in production.
+        assert!(INSTALL_SH.starts_with("#!/bin/sh"), "install.sh shebang");
+        assert!(INSTALL_SH.contains("/api/agent/latest-release"));
+        assert!(INSTALL_SH.contains("--role"));
+        assert!(INSTALL_PS1.contains("daemon-user"));
+        assert!(INSTALL_PS1.contains("/api/agent/installer/"));
+        assert!(INSTALL_PS1.contains("tunnel-client"));
+        // The served scripts must never embed a JWT (base64url JWTs
+        // start with "eyJ" — the {"typ"/{"alg" header).
+        assert!(!INSTALL_SH.contains("eyJ"));
+        assert!(!INSTALL_PS1.contains("eyJ"));
     }
 
     #[test]

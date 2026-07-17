@@ -543,14 +543,12 @@ jobs:
         #     STOP enforced by the next step at +12 MB)
         shell: pwsh
         # `overlay-l3` (Phase 3b): the overlay mesh (WireGuard + TUN). The
-        # binary compiles overlay in everywhere, but on Windows the TUN is
-        # Wintun, which LoadLibrary's a signed `wintun.dll` at runtime —
-        # NOT yet bundled in the MSI (follow-up: a `WintunDll` wxs
-        # component in both wix/ + wix-perMachine/ + a download step). So
-        # overlay on Windows degrades gracefully (SystemTun::up fails →
-        # the runtime logs + aborts → the agent runs normally) until that
-        # lands; Linux (/dev/net/tun) + macOS (utun) need no extra dep and
-        # work today. Default-OFF (config `overlay_enabled`).
+        # binary compiles overlay in everywhere; on Windows the TUN is
+        # Wintun, whose signed `wintun.dll` is LoadLibrary'd at runtime
+        # from the app dir — bundled into both MSIs via the `WintunDll`
+        # wxs component (staged by the wintun step below). Linux
+        # (/dev/net/tun) + macOS (utun) need no extra dep. Default-OFF
+        # (config `overlay_enabled`).
         # `full-hw` includes `audio` (via `full`) → cpal WASAPI loopback (no
         # extra lib on Windows) + audiopus (bundled libopus via CMake).
         env:
@@ -569,6 +567,25 @@ jobs:
           # builds below. Copy the freshly-built daemon to the legacy name.
           Copy-Item target\release\roomlerd.exe target\release\roomler-agent.exe -Force
           Write-Host "Staged roomler-agent.exe alias next to roomlerd.exe for the WiX AgentExeAlias component"
+
+      - name: Build tunnel CLI (roomler.exe) for the MSI bundle (P4b)
+        shell: pwsh
+        run: |
+          # P4b (node-stack unification Option A): both MSIs carry the
+          # tunnel CLI so daemon installs subsume it and the MSI becomes
+          # the ONE updater for the whole node stack. Default features —
+          # LOCKSTEP with release-tunnel.yml's Windows build so the
+          # MSI-carried copy matches the standalone-zip policy. Shares
+          # this job's target dir + cache; the differently-featured
+          # shared deps only cost rebuild time. Both wxs files reference
+          # target\release\roomler.exe at harvest time, so this MUST run
+          # before the two cargo-wix builds below.
+          cargo build -p roomler-tunnel --release
+          if (-not (Test-Path target\release\roomler.exe)) {
+            Write-Host "::error::roomler.exe not produced — the TunnelExe wxs component would fail the MSI harvest (LGHT0103)"
+            exit 1
+          }
+          Write-Host "Staged roomler.exe ($([math]::Round((Get-Item target\release\roomler.exe).Length/1MB,1)) MB) for the TunnelExe component"
 
       - name: Verify FFmpeg link via unit test
         # Runs ONLY the ffmpeg-encoder gated test, which calls into
@@ -732,32 +749,35 @@ jobs:
         env:
           WIN_CODESIGN_PFX_BASE64: ${{ secrets.WIN_CODESIGN_PFX_BASE64 }}
 
-      - name: Verify MSI size delta (rc.65 Option B budget)
-        # rc.63 baseline (last release before ffmpeg-encoder): 8.02 MB per-User + 8.02 MB per-Machine.
-        # rc.65 budget: +8 MB compressed = 16 MB ceiling. Hard fail at
-        # +12 MB = 20 MB to guard against accidentally bundling an
-        # unstripped FFmpeg (would land closer to +20 MB).
-        #
-        # Per the Option B plan critique: MSI > +8 MB compressed →
-        # regroup before rc.66. > +12 MB → STOP, the entire ffmpeg-next
-        # approach loses to direct-NVENC alternative.
+      - name: 'Verify MSI size budget (P4b: MSI carries the tunnel CLI)'
+        # Budget history: rc.63 baseline 8 MB (pre-ffmpeg); rc.65's
+        # Option B guard capped ffmpeg bloat at a 24 MB hard ceiling;
+        # rc.194 measured 20.73 MB per flavour. P4b DELIBERATELY grows
+        # the MSI: both flavours now bundle the tunnel CLI roomler.exe
+        # (~8 MB compressed; node-stack unification Option A) →
+        # expected ≈ 29 MB. The guard's job is unchanged in spirit:
+        # catch ACCIDENTAL bloat (unstripped FFmpeg, stray DLLs,
+        # debug info, duplicate payloads) on top of the deliberate
+        # scope — not the scope itself. Warn above baseline+2 so a
+        # creeping regression is visible one release early; hard-fail
+        # at 36 MB.
         shell: pwsh
         run: |
           $msiPerUser = (Get-Item "${{ steps.locate.outputs.artifact }}").Length / 1MB
           $msiPerMachine = (Get-Item "${{ steps.locate_pm.outputs.artifact }}").Length / 1MB
           $maxMsi = [math]::Max($msiPerUser, $msiPerMachine)
-          $rc63Baseline = 8.0
-          $deltaMB = $maxMsi - $rc63Baseline
+          $p4bBaseline = 29.0
+          $deltaMB = $maxMsi - $p4bBaseline
           Write-Host "::notice::per-User MSI = $([math]::Round($msiPerUser, 2)) MB"
           Write-Host "::notice::per-Machine MSI = $([math]::Round($msiPerMachine, 2)) MB"
-          Write-Host "::notice::rc.63 baseline = $rc63Baseline MB; delta = $([math]::Round($deltaMB, 2)) MB"
-          if ($maxMsi -gt 24) {
-            Write-Host "::error::MSI exceeds 24 MB hard ceiling ($([math]::Round($maxMsi, 2)) MB). Option B size budget violated. Investigate whether ffmpeg has dragged in unintended features."
+          Write-Host "::notice::P4b baseline = $p4bBaseline MB; delta = $([math]::Round($deltaMB, 2)) MB"
+          if ($maxMsi -gt 36) {
+            Write-Host "::error::MSI exceeds the 36 MB hard ceiling ($([math]::Round($maxMsi, 2)) MB). Investigate unintended payload growth (unstripped FFmpeg, extra DLLs, debug info)."
             exit 1
-          } elseif ($deltaMB -gt 8) {
-            Write-Host "::warning::MSI delta $([math]::Round($deltaMB, 2)) MB exceeds +8 MB target (still under 12 MB hard ceiling). Consider feature-stripping FFmpeg before rc.66."
+          } elseif ($deltaMB -gt 2) {
+            Write-Host "::warning::MSI is $([math]::Round($deltaMB, 2)) MB over the P4b baseline (still under the 36 MB ceiling). Re-baseline deliberately or investigate."
           } else {
-            Write-Host "::notice::MSI delta within +8 MB budget — Option B size target met."
+            Write-Host "::notice::MSI within the P4b size budget."
           }
 
       # Tray + installer wizard EXEs are built by the parallel

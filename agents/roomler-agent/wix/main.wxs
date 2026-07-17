@@ -7,8 +7,11 @@
 
   Install scope: per-user (InstallScope="perUser"). No UAC prompt and no
   admin rights required. Files land under
-  %LOCALAPPDATA%\Programs\roomler-agent\ and config / state stays under
-  %APPDATA%\roomler-agent\ (written by the `directories` crate at runtime).
+  %LOCALAPPDATA%\Programs\Roomler\ (P4b renamed the folder from
+  roomler-agent; the cleanup-legacy-install CA sweeps the vacated dir on
+  upgrade) and config / state stays under %APPDATA%\roomler-agent\
+  (written by the `directories` crate at runtime — deliberately NOT
+  renamed: machine_id derives from the config path).
 
   Autostart: registered automatically on every install + upgrade via the
   RegisterAutostart custom action below. The action shells out to
@@ -77,13 +80,16 @@
         <Property Id='DiskPrompt' Value='Roomler Agent Installation' />
 
         <Directory Id='TARGETDIR' Name='SourceDir'>
-            <!-- Per-user install under %LOCALAPPDATA%\Programs\roomler-agent.
+            <!-- Per-user install under %LOCALAPPDATA%\Programs\Roomler
+                 (P4b: renamed from roomler-agent — the node-stack
+                 unification's ONE install folder; UpgradeCode unchanged, so
+                 MajorUpgrade still removes the old-folder product first).
                  ICE38 requires components in a user-profile directory to use
                  an HKCU registry value as their KeyPath (not a file). ICE64
                  requires a RemoveFolder entry for every user-profile dir. -->
             <Directory Id='LocalAppDataFolder'>
                 <Directory Id='ProgramsFolder' Name='Programs'>
-                    <Directory Id='APPLICATIONFOLDER' Name='roomler-agent'>
+                    <Directory Id='APPLICATIONFOLDER' Name='Roomler'>
                         <Component Id='AgentExe' Guid='3A8C9F21-4E7D-4A8E-9F3B-8D1C2E7F5A62'>
                             <RegistryValue
                                 Root='HKCU'
@@ -137,6 +143,42 @@
                                 Name='roomler-agent.exe'
                                 DiskId='1'
                                 Source='target\release\roomler-agent.exe' />
+                        </Component>
+                        <!-- P4b: the tunnel CLI ships INSIDE the daemon MSI
+                             (node-stack unification Option A — the MSI is the
+                             one updater for the whole stack; daemon installs
+                             subsume the CLI). Same component also appends the
+                             install dir to the USER PATH so `roomler` works
+                             in any new shell — parity with the standalone
+                             tunnel wizard's PATH integration. PATH lives and
+                             dies with the CLI file; Part='last' + implicit
+                             Permanent='no' removes only our segment on
+                             uninstall, and msiexec broadcasts
+                             WM_SETTINGCHANGE itself. The workflow builds
+                             target\release\roomler.exe via
+                             `cargo build -p roomler-tunnel [dash][dash]release`
+                             before cargo-wix runs. HKCU KeyPath like siblings
+                             (ICE38, user-profile dir). -->
+                        <Component Id='TunnelExe' Guid='17E45A00-7EB6-44E0-97DB-2A6DB2D79683'>
+                            <RegistryValue
+                                Root='HKCU'
+                                Key='Software\Roomler\Agent'
+                                Name='installed_tunnel_cli'
+                                Type='integer'
+                                Value='1'
+                                KeyPath='yes' />
+                            <File
+                                Id='roomler_tunnel_cli_exe'
+                                Name='roomler.exe'
+                                DiskId='1'
+                                Source='target\release\roomler.exe' />
+                            <Environment
+                                Id='TunnelPathEnvPerUser'
+                                Name='PATH'
+                                Value='[APPLICATIONFOLDER]'
+                                Part='last'
+                                Action='set'
+                                System='no' />
                         </Component>
                         <Component Id='LicenseTxt' Guid='4B1D2E80-6F3C-4B2A-9E1D-7A2B3C4D5E6F'>
                             <RegistryValue
@@ -227,6 +269,8 @@
             <ComponentRef Id='AgentExe' />
             <!-- P3d Slice B: inert `roomler-agent.exe` compatibility alias. -->
             <ComponentRef Id='AgentExeAlias' />
+            <!-- P4b: tunnel CLI + user-PATH append. -->
+            <ComponentRef Id='TunnelExe' />
             <ComponentRef Id='LicenseTxt' />
             <ComponentRef Id='ReadmeTxt' />
             <ComponentRef Id='WintunDll' />
@@ -303,10 +347,17 @@
                 NOT (REMOVE="ALL")
             </Custom>
             <!--
-              rc.18: scrub the OTHER flavour's artefacts AFTER the
-              new EXE lands (so we can shell out to it) but BEFORE
-              RegisterAutostart (the freshly-registered Scheduled
-              Task is the live one). Skip during uninstall.
+              rc.18: scrub stale artefacts AFTER the new EXE lands
+              (so we can shell out to it). NB both this and
+              RegisterAutostart are After='InstallFiles'; WiX v3
+              breaks the tie in DOCUMENT order, so RegisterAutostart
+              actually runs FIRST (an earlier comment here claimed
+              the opposite). Ordering is immaterial: the helper's
+              CA-reachable step only sweeps the vacated pre-rename
+              install dir (P4b), and its cross-flavour arms — which
+              touch the other flavour's task/service namespace — are
+              never reached from the CA (same-flavour fast path; see
+              install_cleanup.rs module docs). Skip during uninstall.
             -->
             <Custom Action='CleanupLegacyPerMachine' After='InstallFiles'>
                 NOT (REMOVE="ALL")

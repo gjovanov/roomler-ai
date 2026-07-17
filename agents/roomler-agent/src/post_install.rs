@@ -38,7 +38,11 @@
 //! 5. Watcher polls the installer PID until it exits or 10 min
 //!    elapses.
 //! 6. Watcher waits 2 s for the FS to settle, runs `<own-path>
-//!    --version`, compares against the expected tag.
+//!    --version`, compares against the expected tag. Windows: when
+//!    the own-path probe can't verify (P4b renamed the install
+//!    folder, so a rename-hop watcher runs from the vacated dir),
+//!    it falls back to probing `…\Roomler\roomlerd.exe` for the
+//!    running flavour.
 //! 7. Watcher writes `last-install.json` and exits. The supervisor
 //!    relaunches the agent on next logon (Win Scheduled Task) or
 //!    immediately (systemd / launchd). The new binary then reads
@@ -209,9 +213,15 @@ pub fn watch(
     }
 
     // Installer exited 0 — give the FS a moment to settle, then
-    // run the new binary's `--version`. The watcher's own current_exe
-    // path IS the path the installer wrote to (msiexec replaced it
-    // while we were running; our memory map stayed valid).
+    // run the new binary's `--version`. Through rc.194 the watcher's
+    // own current_exe path was ALSO the path the installer wrote to
+    // (msiexec replaced the file in place while we were running; our
+    // memory map stayed valid). P4b renamed the install folder
+    // (`roomler-agent` → `Roomler`), so on the rename hop the watcher
+    // — spawned from the OLD directory — only ever sees the stale
+    // pending-delete binary at its own path; when that probe can't
+    // verify the expected version, fall back to the flavour-derived
+    // RENAMED directory.
     std::thread::sleep(POST_INSTALL_SETTLE);
     let exe = std::env::current_exe().ok();
     if let Some(p) = &exe {
@@ -229,6 +239,8 @@ pub fn watch(
                         "new binary at {} reports {version} but expected {expected_version}",
                         p.display()
                     );
+                    #[cfg(target_os = "windows")]
+                    try_renamed_dir_fallback(&mut outcome, &expected_version, Some(p));
                 }
             }
             Ok(out) => {
@@ -237,18 +249,74 @@ pub fn watch(
                     "new binary `--version` exited {}",
                     out.status.code().unwrap_or(-1)
                 );
+                #[cfg(target_os = "windows")]
+                try_renamed_dir_fallback(&mut outcome, &expected_version, Some(p));
             }
             Err(e) => {
                 outcome.status = InstallStatus::SucceededUnverified;
                 outcome.note = format!("could not exec new binary --version: {e}");
+                #[cfg(target_os = "windows")]
+                try_renamed_dir_fallback(&mut outcome, &expected_version, Some(p));
             }
         }
     } else {
         outcome.status = InstallStatus::SucceededUnverified;
         outcome.note = "could not resolve own current_exe path".into();
+        #[cfg(target_os = "windows")]
+        try_renamed_dir_fallback(&mut outcome, &expected_version, None);
     }
     let _ = write_outcome(&outcome);
     Ok(outcome)
+}
+
+/// P4b folder-rename fallback: probe the daemon at the RENAMED
+/// install directory for this flavour
+/// (`…\Roomler\roomlerd.exe`) when the own-path probe couldn't
+/// verify the expected version. On the rename-hop upgrade the
+/// watcher runs from the vacated `roomler-agent\` directory, so its
+/// own path never sees the freshly-installed binary. Record-only,
+/// like the rest of the watcher: a version match here upgrades the
+/// outcome to `SucceededVerified` with a rename-aware note; anything
+/// else leaves the own-path verdict untouched.
+#[cfg(target_os = "windows")]
+fn try_renamed_dir_fallback(
+    outcome: &mut InstallOutcome,
+    expected_version: &str,
+    own: Option<&std::path::Path>,
+) {
+    let Some(candidate) = renamed_daemon_candidate() else {
+        return;
+    };
+    if Some(candidate.as_path()) == own || !candidate.is_file() {
+        return;
+    }
+    if let Ok(out) = std::process::Command::new(&candidate)
+        .arg("--version")
+        .output()
+        && out.status.success()
+    {
+        let version = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if version_matches(&version, expected_version) {
+            outcome.new_binary_path = Some(candidate.display().to_string());
+            outcome.new_binary_version = Some(version.clone());
+            outcome.status = InstallStatus::SucceededVerified;
+            outcome.note = format!(
+                "new binary verified at renamed install dir {} ({version}); watcher ran from the pre-rename path",
+                candidate.display()
+            );
+        }
+    }
+}
+
+/// The daemon EXE path inside the post-P4b (`Roomler\`) install dir
+/// for the flavour the watcher itself runs under. Split out of
+/// [`try_renamed_dir_fallback`] so the pure path derivation is unit-
+/// testable without shelling anything.
+#[cfg(target_os = "windows")]
+fn renamed_daemon_candidate() -> Option<PathBuf> {
+    let flavour = crate::updater::current_install_flavour();
+    crate::updater::install_dir_with_name(flavour, crate::updater::INSTALL_FOLDER_NAME)
+        .map(|dir| dir.join("roomlerd.exe"))
 }
 
 /// Whether a `--version` line (e.g. "roomler-agent 0.1.50") contains
@@ -384,6 +452,27 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // P4b: pure path derivation behind the folder-rename fallback.
+    // LOCALAPPDATA / ProgramFiles are always set on a real Windows
+    // session (and on the Windows CI runners), so asserting suffixes
+    // is host-state-independent.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn renamed_daemon_candidate_targets_the_roomler_dir() {
+        let candidate = renamed_daemon_candidate().expect("install root env var set on Windows");
+        // The test binary never runs from Program Files, so the
+        // flavour classifies PerUser → LOCALAPPDATA\Programs\Roomler.
+        assert!(
+            candidate.ends_with(
+                std::path::Path::new("Programs")
+                    .join(crate::updater::INSTALL_FOLDER_NAME)
+                    .join("roomlerd.exe")
+            ),
+            "unexpected candidate {}",
+            candidate.display()
+        );
+    }
 
     #[test]
     fn version_matches_when_output_contains_triple() {
