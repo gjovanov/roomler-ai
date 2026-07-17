@@ -265,6 +265,44 @@ psql -h 127.0.0.1 -p 5432 -U <db-user> -d <db-name>
 
 The forward stays up until you press Ctrl-C. Each new `psql` connection opens a new flow to the agent — a fresh QUIC bidirectional stream (or, on the WebRTC fallback path, a `flow_id` over the existing DC pool) — with no per-connection ICE / relay setup.
 
+### Declared routes (daemon-supervised — P6)
+
+A foreground `forward` dies with its terminal, and even `forward --daemon`
+(an ephemeral daemon flow) is gone when the device service restarts. A
+**declared route** is persisted in the daemon's config
+(`[[tunnel_routes]]`) and reconciled back into a live flow on every
+daemon start — the set-and-forget form of the same forward:
+
+```powershell
+# Requires a local roomlerd (the device service) running on this host.
+roomler route add --agent <AGENT-CORP-hex> --local 5432 --remote db.intranet.corp:5432
+roomler route ls          # ID / KIND / NODE / LOCAL / REMOTE / TRANSPORT / STATE
+roomler route disable pg  # keep it declared, stop the listener
+roomler route enable pg   # also clears a terminal `failed` state
+roomler route rm pg       # remove entirely
+```
+
+Omit `--remote` for a supervised SOCKS5 listener toward the node. The
+`STATE` column shows the reconciler's view: `pending` → `active (fl-N)`,
+`backoff Ns: <error>` while flow creation retries (e.g. the port is
+taken), and `FAILED: <reason>` — terminal, reserved for failures that
+can't heal by retrying (enrollment revoked, cross-tenant); fix the cause
+and `route enable` to retry. The desktop app's **Tunnels** section shows
+and manages the same list.
+
+Notes:
+- The daemon writes the routes into its own `config.toml`; on
+  perMachine/SYSTEM installs that file lives under `%PROGRAMDATA%`, and
+  any *interactive* user of the host can manage routes through the
+  LocalAPI (same trust boundary as the existing ephemeral
+  `forward --daemon` / consent verbs — the logged-in user of an enrolled
+  host is its operator).
+- On Linux fleet hosts where `roomlerd` runs as a root systemd unit, the
+  LocalAPI socket is root-owned — prefix the CLI with `sudo`
+  (`sudo roomler route ls`).
+- Routes do not survive a crash-loop auto-rollback to a pre-P6 daemon
+  build (the older binary rewrites the config without the field).
+
 ---
 
 ## 7. Audit + diagnostics
