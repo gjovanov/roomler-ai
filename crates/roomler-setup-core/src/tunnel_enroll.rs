@@ -5,10 +5,11 @@
 //! which pairs it with a config-save call so the freshly-installed
 //! CLI binary finds its config on first run.
 //!
-//! Moved here (P4a) from `roomler-tunnel-installer/src/enroll.rs`;
-//! that crate keeps a path-compatible shim carrying the
-//! `roomler_tunnel`-coupled `write_config` half — this crate stays
-//! free of the tunnel dep. Original rationale for not calling
+//! Moved here (P4a) from the legacy tunnel wizard's enroll.rs (crate
+//! retired in P4c-2). The `roomler_tunnel`-coupled `write_config`
+//! half lives with the dep holders (the setup app's tunnel
+//! orchestrator) — this crate stays free of the tunnel dep.
+//! Original rationale for not calling
 //! `roomler-tunnel`'s private `enroll_cmd`:
 //!   - `enroll_cmd` is private to the CLI binary and prints to stdout
 //!     with `println!` — bad for a wizard-driven flow that needs
