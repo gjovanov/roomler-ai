@@ -35,7 +35,7 @@ use super::netmap::{PeerConfig, peer_config_from_netmap};
 use super::relay_link::{ReadyLink, RelayCoordinator};
 use super::tun::TunIo;
 use super::wg::{Carrier, QUIC_BUILD_TIMEOUT, WG_OVERHEAD, WgDevice, overlay_quic_enabled};
-use crate::localapi::{ConnectionType, OverlayView, PeerInfo};
+use crate::localapi::{ConnectionType, ExitNodeStatus, OverlayView, PeerInfo};
 use roomler_ai_remote_control::signaling::{ClientMsg, IceServer, NetmapPeer, OverlayNetworkInfo};
 
 /// rc.131/132/143 — direct LAN carrier context: one UDP socket per LAN
@@ -330,6 +330,8 @@ fn build_overlay_view(
         self_ip: (!self_ip.is_empty()).then(|| self_ip.to_string()),
         self_ip6: derived_v6_of(self_ip),
         peers,
+        // Set by `publish_view` from the runtime's exit-routing state (S4).
+        exit_node: None,
     }
 }
 
@@ -427,6 +429,62 @@ fn exit_peer_allowed_ips(exit: &NetmapPeer) -> Vec<super::router::Cidr> {
     cidrs
 }
 
+/// P5 — is the chosen exit peer ready to carry this node's default egress?
+/// `Ok((id, np, pubkey))` when it is present in the netmap, admin-APPROVED
+/// (`peer_is_approved_exit`), AND has a live carrier; else `Err(reason)` — the
+/// operator-facing split-tunnel reason surfaced in [`ExitNodeStatus`] (S4). Pure,
+/// so the reason mapping is unit-tested directly.
+fn exit_readiness(
+    selector: &str,
+    current_peers: &HashMap<ObjectId, NetmapPeer>,
+    by_node: &HashMap<ObjectId, Installed>,
+) -> Result<(ObjectId, NetmapPeer, [u8; 32]), &'static str> {
+    let id = resolve_exit_peer(selector, current_peers)
+        .ok_or("exit node not visible in the mesh yet")?;
+    let np = current_peers
+        .get(&id)
+        .ok_or("exit node not visible in the mesh yet")?;
+    if !peer_is_approved_exit(np) {
+        return Err("not an admin-approved exit node (no 0.0.0.0/0 approved)");
+    }
+    let inst = by_node
+        .get(&id)
+        .ok_or("exit node has no live carrier yet")?;
+    Ok((id, np.clone(), inst.pubkey))
+}
+
+/// P5 — the LocalAPI [`ExitNodeStatus`] for the daemon view (S4), or `None` when
+/// this node isn't an exit-node client. `active` mirrors the installed
+/// split-default; `withheld_reason` is surfaced only while inactive (a stale
+/// reason left on the state is suppressed once routing is active). Pure.
+fn exit_node_status(selector: Option<&str>, state: &ExitRoutingState) -> Option<ExitNodeStatus> {
+    let selector = selector?.to_string();
+    Some(ExitNodeStatus {
+        selector,
+        active: state.split_default_installed,
+        withheld_reason: if state.split_default_installed {
+            None
+        } else {
+            state.withheld_reason.clone()
+        },
+    })
+}
+
+/// S4 — record the split-tunnel WITHHELD reason on the state and log it ONCE per
+/// reason change (dedup on `state.withheld_reason`), so a persistently-withheld
+/// exit config doesn't spam the log every reconcile while still surfacing each
+/// distinct cause. The live reason is also exposed via [`ExitNodeStatus`] for
+/// `roomler status`.
+fn note_withheld(state: &mut ExitRoutingState, selector: &str, reason: &'static str) {
+    if state.withheld_reason.as_deref() != Some(reason) {
+        warn!(
+            exit = %selector, reason,
+            "overlay exit-node: default routing WITHHELD (split-tunnel safety) — egress stays on the local uplink"
+        );
+        state.withheld_reason = Some(reason.to_string());
+    }
+}
+
 /// P5 exit-node — live state of default-route capture, owned by [`run`]'s loop.
 #[derive(Default)]
 struct ExitRoutingState {
@@ -438,6 +496,10 @@ struct ExitRoutingState {
     exemptions: HashSet<IpAddr>,
     /// Whether the split-default (v4 `/1`s + v6 fail-closed) is installed.
     split_default_installed: bool,
+    /// S4 — why default routing is currently WITHHELD (the split-tunnel signal),
+    /// surfaced in [`ExitNodeStatus`]. `None` when active or not configured. Also
+    /// the dedup key for the withhold WARN (log only on a reason change).
+    withheld_reason: Option<String>,
 }
 
 impl OverlayRuntime {
@@ -520,6 +582,7 @@ impl OverlayRuntime {
         self_ip: &str,
         by_node: &HashMap<ObjectId, Installed>,
         current_peers: &HashMap<ObjectId, NetmapPeer>,
+        exit_status: Option<ExitNodeStatus>,
     ) {
         if let Some(tx) = &self.peer_view {
             // Capture both clocks together so `last_seen_ms` (absolute epoch-ms)
@@ -531,15 +594,13 @@ impl OverlayRuntime {
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
+            let mut view = build_overlay_view(self_ip, by_node, current_peers, now, epoch_now_ms);
+            // S4 — the exit-node routing status the runtime holds (the view
+            // builder is pure over peers, so this is grafted on after).
+            view.exit_node = exit_status;
             // send_replace never fails (unlike send) even if the receiver is
             // transiently absent, and keeps the value for the next borrow.
-            tx.send_replace(build_overlay_view(
-                self_ip,
-                by_node,
-                current_peers,
-                now,
-                epoch_now_ms,
-            ));
+            tx.send_replace(view);
         }
     }
 
@@ -704,15 +765,20 @@ impl OverlayRuntime {
             &direct_cooldown,
         )
         .await;
-        // Unification P1 — first LocalAPI view, so `roomler status` right after
-        // join isn't empty until the first sweep.
-        self.publish_view(&self_ip, &by_node, &current_peers);
-
         // P5 exit-node — default-route capture state, reconciled after every
         // carrier change. Inert unless this node has `exit_node` configured.
         let mut exit_state = ExitRoutingState::default();
         self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state)
             .await;
+
+        // Unification P1 — first LocalAPI view, so `roomler status` right after
+        // join isn't empty until the first sweep (carries the exit-node status).
+        self.publish_view(
+            &self_ip,
+            &by_node,
+            &current_peers,
+            exit_node_status(self.exit_node.as_deref(), &exit_state),
+        );
 
         // Phase 2 — steady state.
         loop {
@@ -734,13 +800,19 @@ impl OverlayRuntime {
                         &mut direct_cooldown, &mut direct_fail_count,
                         &mut relay_refresh_cooldown, &current_peers,
                     ).await;
-                    // A direct→relay fallback (or relay refresh) changed how we
-                    // reach a peer — refresh the LocalAPI view.
-                    self.publish_view(&self_ip, &by_node, &current_peers);
                     // A carrier flip may have changed the coturn worker set or
-                    // the exit peer's reachability — re-reconcile exit routing.
+                    // the exit peer's reachability — re-reconcile exit routing
+                    // FIRST, so the refreshed view carries the new exit status.
                     self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state)
                         .await;
+                    // A direct→relay fallback (or relay refresh) changed how we
+                    // reach a peer (and maybe the exit status) — refresh the view.
+                    self.publish_view(
+                        &self_ip,
+                        &by_node,
+                        &current_peers,
+                        exit_node_status(self.exit_node.as_deref(), &exit_state),
+                    );
                 },
                 // rc.146 — re-assert every installed peer's /32 on the overlay
                 // NIC (evict any competing route a full-tunnel VPN re-added, then
@@ -767,8 +839,8 @@ impl OverlayRuntime {
                         current_peers = peers.iter().map(|p| (p.node_id, p.clone())).collect();
                         if let Some(names) = &dns_names { sync_name_map(names, &current_peers).await; }
                         self.install_peers(&mut wg, &mut by_node, &mut relay, &tun, &peers, direct_ctx.as_ref(), &direct_cooldown).await;
-                        self.publish_view(&self_ip, &by_node, &current_peers);
                         self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
+                        self.publish_view(&self_ip, &by_node, &current_peers, exit_node_status(self.exit_node.as_deref(), &exit_state));
                     }
                     Some(OverlayEvent::NetmapDelta { upserts, removes }) => {
                         for p in &upserts { current_peers.insert(p.node_id, p.clone()); }
@@ -785,8 +857,8 @@ impl OverlayRuntime {
                             }
                         }
                         if let Some(names) = &dns_names { sync_name_map(names, &current_peers).await; }
-                        self.publish_view(&self_ip, &by_node, &current_peers);
                         self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
+                        self.publish_view(&self_ip, &by_node, &current_peers, exit_node_status(self.exit_node.as_deref(), &exit_state));
                     }
                     Some(OverlayEvent::RelayGrant { peer_node_id, ice_servers, pair_key }) => {
                         if let Some(r) = relay.as_mut()
@@ -795,8 +867,10 @@ impl OverlayRuntime {
                             self.install_ready(&mut wg, &mut by_node, &tun, link).await;
                             // A newly-installed relay carrier adds a coturn worker
                             // to exempt (and the exit peer may have just become
-                            // reachable) — reconcile exit routing.
+                            // reachable) — reconcile exit routing, then refresh
+                            // the view so `roomler status` reflects it.
                             self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
+                            self.publish_view(&self_ip, &by_node, &current_peers, exit_node_status(self.exit_node.as_deref(), &exit_state));
                         }
                     }
                     None => break,
@@ -1318,22 +1392,19 @@ impl OverlayRuntime {
         };
 
         // The chosen exit must be present, reachable-with-a-live-carrier, AND an
-        // admin-approved exit node. Any miss → withdraw the capture and wait.
-        let ready = resolve_exit_peer(selector, current_peers).and_then(|id| {
-            let np = current_peers.get(&id)?;
-            let inst = by_node.get(&id)?;
-            peer_is_approved_exit(np).then(|| (id, np.clone(), inst.pubkey))
-        });
-        let Some((exit_id, exit_np, exit_pubkey)) = ready else {
-            if state.active_peer.is_some()
-                || state.split_default_installed
-                || !state.exemptions.is_empty()
-            {
-                warn!(exit = %selector, "overlay exit-node: chosen exit not ready (absent / no carrier / not approved) — reverting default routing");
-                self.teardown_exit_routing(wg, tun, by_node, current_peers, state)
-                    .await;
+        // admin-approved exit node. Any miss → withdraw the capture, record the
+        // (distinct) split-tunnel reason for `roomler status`, and wait.
+        let (exit_id, exit_np, exit_pubkey) = match exit_readiness(selector, current_peers, by_node)
+        {
+            Ok(v) => v,
+            Err(reason) => {
+                if state.split_default_installed {
+                    self.teardown_exit_routing(wg, tun, by_node, current_peers, state)
+                        .await;
+                }
+                note_withheld(state, selector, reason);
+                return;
             }
-            return;
         };
 
         // Pin any exemptions we don't yet hold, BEFORE (re)installing the /1s —
@@ -1359,10 +1430,14 @@ impl OverlayRuntime {
         // already active, revert.
         if !want.iter().all(|ip| state.exemptions.contains(ip)) {
             if state.split_default_installed {
-                warn!(exit = %selector, "overlay exit-node: a required carrier exemption is missing — reverting default routing to keep the mesh reachable");
                 self.teardown_exit_routing(wg, tun, by_node, current_peers, state)
                     .await;
             }
+            note_withheld(
+                state,
+                selector,
+                "carrier-endpoint exemption unavailable (no original default route?)",
+            );
             return;
         }
 
@@ -1382,6 +1457,7 @@ impl OverlayRuntime {
         }
         state.split_default_installed = true;
         state.active_peer = Some(exit_id);
+        state.withheld_reason = None;
         info!(peer = %exit_id, exit = %selector, "overlay exit-node: default egress now routes through the exit peer (v4 captured; v6 fail-closed)");
     }
 
@@ -1899,5 +1975,75 @@ mod tests {
         assert!(strs.contains(&"128.0.0.0/1".to_string()));
         assert!(!strs.contains(&"0.0.0.0/0".to_string()));
         assert_eq!(strs.len(), 3);
+    }
+
+    #[test]
+    fn exit_readiness_reports_distinct_split_tunnel_reasons() {
+        let id = exit_oid(0x21);
+        let no_carriers: HashMap<ObjectId, Installed> = HashMap::new();
+
+        // Not in the mesh at all.
+        let empty: HashMap<ObjectId, NetmapPeer> = HashMap::new();
+        assert_eq!(
+            exit_readiness("jupiter", &empty, &no_carriers).unwrap_err(),
+            "exit node not visible in the mesh yet"
+        );
+
+        // Present, but not an admin-approved exit node (no /0 in its routes).
+        let mut subnet_only = HashMap::new();
+        subnet_only.insert(id, exit_np(id, "jupiter", vec!["192.168.1.0/24".into()]));
+        assert_eq!(
+            exit_readiness("jupiter", &subnet_only, &no_carriers).unwrap_err(),
+            "not an admin-approved exit node (no 0.0.0.0/0 approved)"
+        );
+
+        // Approved, but no live carrier yet.
+        let mut approved = HashMap::new();
+        approved.insert(id, exit_np(id, "jupiter", vec!["0.0.0.0/0".into()]));
+        assert_eq!(
+            exit_readiness("jupiter", &approved, &no_carriers).unwrap_err(),
+            "exit node has no live carrier yet"
+        );
+
+        // Approved + carriered → ready, yields the peer's pubkey.
+        let mut carriered = HashMap::new();
+        carriered.insert(
+            id,
+            Installed {
+                pubkey: [7u8; 32],
+                overlay_ip: Ipv4Addr::new(100, 64, 0, 1),
+                is_direct: true,
+                since: Instant::now(),
+                last_traffic: (0, 0),
+                bad_sweeps: 0,
+                last_rx_at: Instant::now(),
+                relay_local: None,
+                relay_dst: None,
+            },
+        );
+        let (rid, _np, pk) = exit_readiness("jupiter", &approved, &carriered).unwrap();
+        assert_eq!(rid, id);
+        assert_eq!(pk, [7u8; 32]);
+    }
+
+    #[test]
+    fn exit_node_status_reflects_active_and_withheld() {
+        let mut st = ExitRoutingState::default();
+        // Not configured (no selector) → no status at all.
+        assert!(exit_node_status(None, &st).is_none());
+        // Configured + withheld surfaces the reason.
+        st.withheld_reason = Some("exit node has no live carrier yet".into());
+        let w = exit_node_status(Some("jupiter"), &st).unwrap();
+        assert_eq!(w.selector, "jupiter");
+        assert!(!w.active);
+        assert_eq!(
+            w.withheld_reason.as_deref(),
+            Some("exit node has no live carrier yet")
+        );
+        // Active suppresses any lingering reason.
+        st.split_default_installed = true;
+        let a = exit_node_status(Some("jupiter"), &st).unwrap();
+        assert!(a.active);
+        assert!(a.withheld_reason.is_none());
     }
 }
