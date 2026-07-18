@@ -311,6 +311,10 @@ pub fn spawn_thread_watchdog(wd: Arc<Watchdog>) {
                          forcing exit({STALL_EXIT_CODE})",
                         stuck_for
                     );
+                    // P5/A2 — this exit bypasses RAII; drop any exit-node
+                    // split-default first so a stalled host doesn't stay
+                    // blackholed until the supervisor's restart reconciles it.
+                    crate::purge_exit_routes();
                     std::process::exit(STALL_EXIT_CODE);
                 }
             }
@@ -340,6 +344,10 @@ pub fn force_exit_on_stall(stalled: &[(&'static str, Duration)]) -> bool {
         &format!("pumps stalled ({summary})"),
         crate::crash_recorder::WriterContext::Worker,
     );
+
+    // P5/A2 — bypasses RAII; drop any exit-node split-default so the stall
+    // doesn't leave the host blackholed until the supervisor restarts it.
+    crate::purge_exit_routes();
 
     std::process::exit(STALL_EXIT_CODE);
 }

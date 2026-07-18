@@ -253,6 +253,10 @@ pub async fn run(
                 // supervisor's rc.53 code-7 fast-alarm fires on this
                 // FIRST exit (not after 8). Operator sees the
                 // structured error within <1 minute.
+                // P5/A2 — a fatal goodbye is a PERMANENT stop (the row is gone);
+                // no restart will run the boot reconciler, so drop any exit-node
+                // split-default now or the host stays blackholed until reboot.
+                crate::purge_exit_routes();
                 std::process::exit(watchdog::AGENT_DELETED_EXIT_CODE);
             }
             Err(ConnectError::ReplacedByNewer { message }) => {
@@ -290,6 +294,9 @@ pub async fn run(
                             "failed to write needs-attention sentinel for ReplacedByNewer escalation"
                         ),
                     }
+                    // P5/A2 — bypasses RAII; drop any exit-node split-default so
+                    // a duel-losing instance doesn't leave the host blackholed.
+                    crate::purge_exit_routes();
                     std::process::exit(watchdog::AGENT_DELETED_EXIT_CODE);
                 }
 
