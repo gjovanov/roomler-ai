@@ -348,15 +348,17 @@ fn derived_v6_of(overlay_ip: &str) -> Option<String> {
 /// routes via the overlay NIC + as the exit peer's WG `allowed_ips`) beats the
 /// host's `0.0.0.0/0` default by longest-prefix WITHOUT deleting it, so the OS
 /// default self-heals the instant the overlay routes go away (a crash / kill
-/// can't strand the host offline — see A2/D3 in the P5 plan).
-const SPLIT_DEFAULT_V4: [&str; 2] = ["0.0.0.0/1", "128.0.0.0/1"];
+/// can't strand the host offline — see A2/D3 in the P5 plan). `pub(crate)` so the
+/// crash-safety purge ([`super::tun::purge_split_default`]) removes EXACTLY what
+/// the installer installs — one source of truth, symmetric by construction.
+pub(crate) const SPLIT_DEFAULT_V4: [&str; 2] = ["0.0.0.0/1", "128.0.0.0/1"];
 /// P5 exit-node — the two IPv6 halves, installed via the overlay NIC as a
 /// FAIL-CLOSED measure: the crypto-router drops any non-derived-ULA v6
 /// destination, so routing `::/1` + `8000::/1` into the overlay blackholes ALL
 /// v6 internet egress. Without this a dual-stack host would send v4 through the
 /// exit but leak v6 straight out its uplink (silent AAAA deanonymisation). Full
 /// v6 exit egress is a follow-up (S3b); this is the minimum-safe stance (A5).
-const SPLIT_DEFAULT_V6: [&str; 2] = ["::/1", "8000::/1"];
+pub(crate) const SPLIT_DEFAULT_V6: [&str; 2] = ["::/1", "8000::/1"];
 
 /// P5 — resolve the operator's chosen exit-node selector (a [`NetmapPeer`]'s
 /// `name` or a node-id hex string) to a concrete node in the current netmap.

@@ -86,7 +86,7 @@ pub trait TunIo: Send + Sync {
 /// bridge logic stay device-free (and dependency-free) under plain
 /// `overlay`.
 #[cfg(feature = "overlay-l3")]
-pub use system::SystemTun;
+pub use system::{SystemTun, purge_split_default};
 
 #[cfg(feature = "overlay-l3")]
 mod system {
@@ -563,6 +563,64 @@ mod system {
     fn is_v6_cidr(cidr: &str) -> bool {
         cidr.contains(':')
     }
+
+    /// P5 exit-node crash-safety (A2) — synchronously delete the split-default
+    /// routes (the v4 + v6 `/1` halves) from the overlay NIC WITHOUT a live
+    /// [`SystemTun`]. Removes EXACTLY the
+    /// [`SPLIT_DEFAULT_V4`](crate::overlay::runtime::SPLIT_DEFAULT_V4) and
+    /// [`SPLIT_DEFAULT_V6`](crate::overlay::runtime::SPLIT_DEFAULT_V6) the
+    /// installer installs (one source of truth), scoped to the roomler NIC so it
+    /// never touches another VPN's `/1`.
+    ///
+    /// Two callers, both bypassing the runtime's RAII teardown:
+    ///
+    /// - the **boot-time reconciler** — heals a `/1` a crash / kill / unclean
+    ///   reboot left behind. Critical on Windows: Wintun's adapter persists by
+    ///   name across a crash, so a stale `0.0.0.0/1 interface=roomler` blackholes
+    ///   ALL egress to a dead NIC until the next clean run. (On Linux a
+    ///   `dev`-scoped route auto-culls when the TUN dies, but a kill mid-reroute
+    ///   can still leave one, so we heal there too.)
+    /// - the **pre-`process::exit` cleanup** on the paths that skip `Drop`
+    ///   (watchdog stall, self-update, agent-deleted).
+    ///
+    /// Best-effort (an absent route just errors, ignored); sync `std::process` so
+    /// it runs at boot and as a last gasp with no async runtime.
+    pub fn purge_split_default() {
+        for cidr in crate::overlay::runtime::SPLIT_DEFAULT_V4
+            .iter()
+            .chain(crate::overlay::runtime::SPLIT_DEFAULT_V6.iter())
+        {
+            purge_one(cidr);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn purge_one(cidr: &str) {
+        let mut args: Vec<&str> = Vec::new();
+        if is_v6_cidr(cidr) {
+            args.push("-6");
+        }
+        args.extend(["route", "del", cidr, "dev", IF_NAME]);
+        let _ = std::process::Command::new("ip").args(&args).output();
+    }
+
+    #[cfg(target_os = "windows")]
+    fn purge_one(cidr: &str) {
+        let family = if is_v6_cidr(cidr) { "ipv6" } else { "ipv4" };
+        let _ = std::process::Command::new("netsh")
+            .args([
+                "interface",
+                family,
+                "delete",
+                "route",
+                &format!("prefix={cidr}"),
+                &format!("interface={IF_NAME}"),
+            ])
+            .output();
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    fn purge_one(_cidr: &str) {}
 
     /// Assign this node's derived overlay IPv6 (`fd72:6f6f:6d6c::<v4>`, `/96`
     /// on-link) to the overlay NIC. Sync + best-effort (`up` isn't async): the
