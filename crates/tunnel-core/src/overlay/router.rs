@@ -104,6 +104,18 @@ impl Cidr {
     pub fn contains(&self, ip: Ipv4Addr) -> bool {
         (u32::from(ip) & Self::mask(self.prefix)) == self.base
     }
+
+    /// True for a **default route** — the `0.0.0.0/0` default OR either half of
+    /// the split-default (`0.0.0.0/1`, `128.0.0.0/1`). Any prefix ≤ 1 is exactly
+    /// one of these three (a `/1` masks to base `0` or `0x8000_0000`), and none
+    /// is ever a legitimate LAN subnet worth routing per-peer. The client-side
+    /// subnet-install path (P5/A1) drops these so an admin-approved exit-node
+    /// `0.0.0.0/0` never auto-installs a default route on every peer; opt-in
+    /// exit-node routing installs the split-default via a separate,
+    /// exemption-aware path.
+    pub fn is_default_route(&self) -> bool {
+        self.prefix <= 1
+    }
 }
 
 impl std::fmt::Display for Cidr {
@@ -238,6 +250,20 @@ mod tests {
         );
         assert!(Cidr::parse("bad").is_none());
         assert!(Cidr::parse("1.2.3.4/33").is_none());
+    }
+
+    #[test]
+    fn is_default_route_catches_default_and_split_halves() {
+        // The /0 default and both split-default /1 halves.
+        assert!(Cidr::parse("0.0.0.0/0").unwrap().is_default_route());
+        assert!(Cidr::parse("0.0.0.0/1").unwrap().is_default_route());
+        assert!(Cidr::parse("128.0.0.0/1").unwrap().is_default_route());
+        // Host bits in the input still canonicalize to a /1 half.
+        assert!(Cidr::parse("200.1.2.3/1").unwrap().is_default_route());
+        // Real LAN subnets are NOT default routes.
+        assert!(!Cidr::parse("192.168.1.0/24").unwrap().is_default_route());
+        assert!(!Cidr::parse("10.0.0.0/8").unwrap().is_default_route());
+        assert!(!Cidr::parse("0.0.0.0/2").unwrap().is_default_route());
     }
 
     #[test]
