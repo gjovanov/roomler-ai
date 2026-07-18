@@ -471,6 +471,8 @@ fn exit_node_status(selector: Option<&str>, state: &ExitRoutingState) -> Option<
         // AND v6 egress was enabled (v6 exemptions pinned). Otherwise v6 is
         // fail-closed even while v4 egress is active.
         v6_active: state.split_default_installed && state.v6_active == Some(true),
+        // S4b — DNS steered through the exit only while v4 egress is active.
+        dns_steered: state.split_default_installed && state.dns_steered,
     })
 }
 
@@ -510,6 +512,17 @@ struct ExitRoutingState {
     /// teardown. Independent of `split_default_installed` (v4) per BLOCKER-1 — v6
     /// never gates v4. Also the transition-log dedup key.
     v6_active: Option<bool>,
+    /// S4b — exit-node DNS steering context + state. `dns_magic_domain`: `Some` =
+    /// MagicDNS on (steer "." at the local resolver `dns_target` == self_v4, which
+    /// forwards to the network upstream via the exit); `None` = MagicDNS off (steer
+    /// "." at `dns_target` == the public upstream directly). `dns_bound`: the local
+    /// resolver bound :53 (only gates the MagicDNS-on steer — steering at a dead
+    /// resolver would blackhole ALL DNS). `dns_steered`: the "." catch-all steer is
+    /// currently installed (⇒ `split_default_installed`, locked by a debug-assert).
+    dns_magic_domain: Option<String>,
+    dns_target: Option<Ipv4Addr>,
+    dns_bound: bool,
+    dns_steered: bool,
 }
 
 impl OverlayRuntime {
@@ -716,21 +729,35 @@ impl OverlayRuntime {
         // domain, and keep the resolver's name→IP map synced with the netmap.
         // `None` when MagicDNS is off. `_dns_os_guard` reverts the OS DNS config
         // on runtime exit (WS disconnect / shutdown).
+        // P5/Phase2 DNS. Compute the upstream once — the resolver's forward target
+        // AND (when MagicDNS is off) the exit-DNS catch-all target. `dns_magic` is
+        // the normalised suffix, `None` when MagicDNS is off.
+        let dns_upstream = network
+            .nameservers
+            .iter()
+            .find_map(|s| dns::parse_upstream(s))
+            .unwrap_or_else(|| SocketAddr::from(([1, 1, 1, 1], 53)));
+        let dns_magic: Option<String> = network
+            .magic_domain
+            .as_deref()
+            .map(|d| d.trim_end_matches('.').to_ascii_lowercase())
+            .filter(|d| !d.is_empty());
         let mut _dns_os_guard: Option<dns::DnsOsGuard> = None;
-        let dns_names: Option<dns::NameMap> = match &network.magic_domain {
-            Some(domain) if !domain.is_empty() => {
-                let magic_domain = domain.trim_end_matches('.').to_ascii_lowercase();
-                let names: dns::NameMap = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
-                sync_name_map(&names, &current_peers).await;
-                let upstream = network
-                    .nameservers
-                    .iter()
-                    .find_map(|s| dns::parse_upstream(s))
-                    .unwrap_or_else(|| SocketAddr::from(([1, 1, 1, 1], 53)));
-                tokio::spawn(dns::run(dns::DnsConfig {
+        // P5 S4b — did the local resolver actually bind :53? Only meaningful when
+        // MagicDNS is on (else exit-DNS steers the public upstream directly). Gates
+        // the "." steer so we never point the OS at a dead resolver (→ a total DNS
+        // blackhole). Known before the first reconcile (awaited here), so there's
+        // no late-bind race to chase.
+        let mut dns_bound = false;
+        let dns_names: Option<dns::NameMap> = if let Some(magic_domain) = dns_magic.clone() {
+            let names: dns::NameMap = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+            sync_name_map(&names, &current_peers).await;
+            let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(dns::run(
+                dns::DnsConfig {
                     bind: SocketAddr::new(self_v4.into(), 53),
                     magic_domain: magic_domain.clone(),
-                    upstream,
+                    upstream: dns_upstream,
                     names: names.clone(),
                     // AAAA (derived overlay v6) default-on; ROOMLER_AGENT_DNS_AAAA=0
                     // reverts to A-only without a rebuild — the mixed-fleet escape
@@ -738,12 +765,21 @@ impl OverlayRuntime {
                     // it blackholes; happy-eyeballs apps fall back, sequential apps
                     // may hang on it).
                     answer_aaaa: crate::env::node_env("DNS_AAAA").as_deref() != Some("0"),
-                }));
-                // Point the OS resolver at us for `<magic_domain>` (reverted on Drop).
-                _dns_os_guard = Some(dns::configure_os(self_v4, &magic_domain).await);
-                Some(names)
-            }
-            _ => None,
+                },
+                bound_tx,
+            ));
+            // The bind is a local UDP bind — microseconds; bound the wait so a hung
+            // reactor can't stall the join. Timeout / send-error → not-bound.
+            dns_bound = tokio::time::timeout(Duration::from_secs(2), bound_rx)
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .unwrap_or(false);
+            // Point the OS resolver at us for `<magic_domain>` (reverted on Drop).
+            _dns_os_guard = Some(dns::configure_os(self_v4, &magic_domain).await);
+            Some(names)
+        } else {
+            None
         };
 
         let mut fallback = tokio::time::interval(FALLBACK_TICK);
@@ -777,7 +813,24 @@ impl OverlayRuntime {
         .await;
         // P5 exit-node — default-route capture state, reconciled after every
         // carrier change. Inert unless this node has `exit_node` configured.
-        let mut exit_state = ExitRoutingState::default();
+        // P5 S4b — DNS-steering context for this run (immutable): whether MagicDNS
+        // is on (→ steer "." at the LOCAL resolver `self_v4`, which forwards to the
+        // network upstream via the exit; else steer "." at the public upstream
+        // DIRECTLY), the catch-all target, and whether the local resolver bound.
+        let dns_target = if dns_magic.is_some() {
+            self_v4
+        } else {
+            match dns_upstream.ip() {
+                IpAddr::V4(v4) => v4,
+                IpAddr::V6(_) => Ipv4Addr::new(1, 1, 1, 1),
+            }
+        };
+        let mut exit_state = ExitRoutingState {
+            dns_magic_domain: dns_magic,
+            dns_target: Some(dns_target),
+            dns_bound,
+            ..Default::default()
+        };
         self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state)
             .await;
 
@@ -1501,6 +1554,31 @@ impl OverlayRuntime {
                 warn!(exit = %selector, "overlay exit-node: IPv6 egress WITHHELD (no v6 uplink to exempt the coordination server) — v6 stays fail-closed while v4 routes through the exit");
             }
         }
+
+        // S4b — exit-node DNS steering, coupled to the v4 split-default so DNS can
+        // never route to the exit while egress doesn't. Idempotent (`!dns_steered`).
+        // When MagicDNS is on, gated on a live local resolver (`dns_bound`, known
+        // before the first reconcile) — steering "." at a dead :53 would blackhole
+        // ALL DNS. A not-bound resolver is left unsteered (working local DNS beats a
+        // blackhole) and surfaced via `dns_steered=false` in `roomler status`.
+        if state.split_default_installed
+            && !state.dns_steered
+            && (state.dns_magic_domain.is_none() || state.dns_bound)
+            && let Some(target) = state.dns_target
+        {
+            if dns::steer_default_dns(target, state.dns_magic_domain.as_deref()).await {
+                state.dns_steered = true;
+                info!(exit = %selector, "overlay exit-node: DNS now steers all queries through the exit (no DNS leak)");
+            } else {
+                debug!(exit = %selector, "overlay exit-node: DNS steer command failed (resolvectl/NRPT unavailable?) — DNS NOT steered");
+            }
+        }
+        debug_assert!(
+            !state.dns_steered
+                || (state.split_default_installed
+                    && (state.dns_magic_domain.is_none() || state.dns_bound)),
+            "exit-node DNS steered without an active split-default + a live local resolver"
+        );
     }
 
     /// P5 exit-node — revert everything [`reconcile_exit_routing`] installed:
@@ -1522,6 +1600,7 @@ impl OverlayRuntime {
         if !state.split_default_installed
             && state.exemptions.is_empty()
             && state.active_peer.is_none()
+            && !state.dns_steered
         {
             return;
         }
@@ -1547,6 +1626,13 @@ impl OverlayRuntime {
         // S3b — stop routing global v6 to the (now former) exit; global v6 reverts
         // to the physical uplink once the `::/1` routes above are removed.
         wg.set_v6_exit(None);
+        // S4b — revert DNS steering (drop the "." catch-all). With MagicDNS on the
+        // P2 suffix rule stays, so overlay names keep resolving; otherwise the
+        // physical resolver is restored.
+        if state.dns_steered {
+            dns::unsteer_default_dns(state.dns_magic_domain.as_deref()).await;
+            state.dns_steered = false;
+        }
         state.split_default_installed = false;
         state.active_peer = None;
         state.v6_active = None;
@@ -2105,5 +2191,12 @@ mod tests {
         // Active but v6 fail-closed → v4 on, v6 off.
         st.v6_active = Some(false);
         assert!(!exit_node_status(Some("jupiter"), &st).unwrap().v6_active);
+        // S4b — DNS steered surfaces only while active.
+        st.dns_steered = true;
+        let d = exit_node_status(Some("jupiter"), &st).unwrap();
+        assert!(d.active && d.dns_steered);
+        // Not active → dns_steered is never reported true (masked like v6).
+        st.split_default_installed = false;
+        assert!(!exit_node_status(Some("jupiter"), &st).unwrap().dns_steered);
     }
 }
