@@ -101,6 +101,8 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         overlay_advertised_routes: Vec::new(),
         // P5: not an exit node until the operator opts in.
         overlay_exit_node_enabled: false,
+        // P5: not routing egress through a mesh exit node until configured.
+        overlay_exit_node: None,
         advertise_routes: Vec::new(),
         advertise_local_subnets: true,
         tunnel_routes: Vec::new(),

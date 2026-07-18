@@ -350,14 +350,23 @@ mod system {
         /// subnet a router-peer serves). Idempotent (delete-then-add on Windows;
         /// `ip route replace` on Linux). Low metric so it wins a colliding uplink
         /// route, mirroring the per-peer `/32` path.
+        ///
+        /// Dual-stack (P5): `cidr` may be IPv4 or IPv6 — the family is picked from
+        /// the string. Exit-node routing uses this for BOTH the v4 split-default
+        /// (`0.0.0.0/1` + `128.0.0.0/1`, which encapsulate to the exit peer) AND
+        /// the v6 fail-closed halves (`::/1` + `8000::/1`, which the crypto-router
+        /// drops because global v6 is unroutable over the overlay — so v6 can't
+        /// leak out the physical uplink while v4 egress is captured).
         async fn add_cidr_route(&self, cidr: &str) -> std::io::Result<()> {
+            let v6 = is_v6_cidr(cidr);
             #[cfg(target_os = "windows")]
             {
+                let family = if v6 { "ipv6" } else { "ipv4" };
                 let _ = run_cmd(
                     "netsh",
                     vec![
                         "interface".into(),
-                        "ipv4".into(),
+                        family.into(),
                         "delete".into(),
                         "route".into(),
                         format!("prefix={cidr}"),
@@ -369,7 +378,7 @@ mod system {
                     "netsh",
                     vec![
                         "interface".into(),
-                        "ipv4".into(),
+                        family.into(),
                         "add".into(),
                         "route".into(),
                         format!("prefix={cidr}"),
@@ -382,32 +391,34 @@ mod system {
             }
             #[cfg(target_os = "linux")]
             {
-                run_cmd(
-                    "ip",
-                    vec![
-                        "route".into(),
-                        "replace".into(),
-                        cidr.to_string(),
-                        "dev".into(),
-                        IF_NAME.into(),
-                    ],
-                )
-                .await
+                let mut args: Vec<String> = Vec::new();
+                if v6 {
+                    args.push("-6".into());
+                }
+                args.extend([
+                    "route".into(),
+                    "replace".into(),
+                    cidr.to_string(),
+                    "dev".into(),
+                    IF_NAME.into(),
+                ]);
+                run_cmd("ip", args).await
             }
             #[cfg(not(any(target_os = "windows", target_os = "linux")))]
             {
-                let _ = cidr;
+                let _ = (cidr, v6);
                 Ok(())
             }
         }
 
         async fn del_cidr_route(&self, cidr: &str) {
+            let v6 = is_v6_cidr(cidr);
             #[cfg(target_os = "windows")]
             let _ = run_cmd(
                 "netsh",
                 vec![
                     "interface".into(),
-                    "ipv4".into(),
+                    if v6 { "ipv6" } else { "ipv4" }.into(),
                     "delete".into(),
                     "route".into(),
                     format!("prefix={cidr}"),
@@ -416,19 +427,22 @@ mod system {
             )
             .await;
             #[cfg(target_os = "linux")]
-            let _ = run_cmd(
-                "ip",
-                vec![
+            {
+                let mut args: Vec<String> = Vec::new();
+                if v6 {
+                    args.push("-6".into());
+                }
+                args.extend([
                     "route".into(),
                     "del".into(),
                     cidr.to_string(),
                     "dev".into(),
                     IF_NAME.into(),
-                ],
-            )
-            .await;
+                ]);
+                let _ = run_cmd("ip", args).await;
+            }
             #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-            let _ = cidr;
+            let _ = (cidr, v6);
         }
 
         /// P5 — install a `/32` exemption for `ip` via the host's ORIGINAL default
@@ -540,6 +554,15 @@ mod system {
     const IF_NAME: &str = "roomler";
     #[cfg(target_os = "linux")]
     const IF_NAME: &str = "roomler0";
+
+    /// Is `cidr` an IPv6 CIDR? A colon only ever appears in the v6 textual form
+    /// (`"::/1"`, `"8000::/1"`, `"fd72:6f6f:6d6c::/96"`), never in a v4 one
+    /// (`"0.0.0.0/1"`) — so this cheap check picks the right OS route family for
+    /// [`TunIo::add_cidr_route`] / [`TunIo::del_cidr_route`] without pulling in a
+    /// parser. Pure, so it unit-tests directly.
+    fn is_v6_cidr(cidr: &str) -> bool {
+        cidr.contains(':')
+    }
 
     /// Assign this node's derived overlay IPv6 (`fd72:6f6f:6d6c::<v4>`, `/96`
     /// on-link) to the overlay NIC. Sync + best-effort (`up` isn't async): the
@@ -746,6 +769,19 @@ mod system {
 
     #[cfg(test)]
     mod tests {
+        #[test]
+        fn v6_cidr_detection_picks_route_family() {
+            use super::is_v6_cidr;
+            // v6 exit-node fail-closed halves + the derived-ULA prefix.
+            assert!(is_v6_cidr("::/1"));
+            assert!(is_v6_cidr("8000::/1"));
+            assert!(is_v6_cidr("fd72:6f6f:6d6c::/96"));
+            // v4 split-default halves + a normal subnet route.
+            assert!(!is_v6_cidr("0.0.0.0/1"));
+            assert!(!is_v6_cidr("128.0.0.0/1"));
+            assert!(!is_v6_cidr("192.168.1.0/24"));
+        }
+
         #[cfg(target_os = "linux")]
         #[test]
         fn linux_default_route_lowest_metric_skips_overlay() {
