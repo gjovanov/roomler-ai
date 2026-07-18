@@ -73,5 +73,12 @@ pub mod win_timer;
 /// none). Best-effort + scoped to the roomler NIC.
 pub fn purge_exit_routes() {
     #[cfg(feature = "overlay-l3")]
-    tunnel_core::overlay::tun::purge_split_default();
+    {
+        tunnel_core::overlay::tun::purge_split_default();
+        // S4b — also drop any leftover exit-node DNS steer. On Windows the `.`-root
+        // NRPT rule is machine-global and PERSISTS across a crash/reboot, so a stale
+        // rule pointing at a dead resolver would blackhole ALL DNS until removed —
+        // this boot/pre-exit purge is the load-bearing cleanup for it.
+        tunnel_core::overlay::dns::purge_exit_dns();
+    }
 }
