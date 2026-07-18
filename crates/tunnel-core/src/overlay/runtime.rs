@@ -17,8 +17,8 @@
 //! carriers + a mock TUN, and so the corp-NAT relay path can be added
 //! without reworking the runtime.
 
-use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -244,6 +244,20 @@ pub struct OverlayRuntime {
     /// IP + peers with connection type) for the daemon's LocalAPI. `None` in
     /// test / direct mode (nothing reads it there).
     peer_view: Option<watch::Sender<OverlayView>>,
+    /// P5 exit-node CLIENT opt-in — the mesh peer (its [`NetmapPeer::name`] or
+    /// node-id hex) this node routes ALL its internet egress through. `None` =
+    /// today's behaviour (no default routing). Only takes effect once the named
+    /// peer is present, reachable, has a live carrier, AND is an admin-approved
+    /// exit node (its netmap `routes` carry `0.0.0.0/0`). See
+    /// [`OverlayRuntime::reconcile_exit_routing`].
+    exit_node: Option<String>,
+    /// P5 exit-node — carrier-critical endpoint IPs that MUST stay on the
+    /// physical uplink (exempted from the split-default) for the mesh to survive
+    /// exit routing: the coordination server's resolved A-records, provided by
+    /// the agent (which knows `server_url`) BEFORE any `/1` is installed, so DNS
+    /// still worked when they were resolved. Coturn worker IPs are added
+    /// dynamically from live relay carriers. Empty unless `exit_node` is set.
+    exit_server_ips: Vec<IpAddr>,
 }
 
 /// Map the runtime's live carrier bookkeeping into the LocalAPI [`OverlayView`]
@@ -330,6 +344,100 @@ fn derived_v6_of(overlay_ip: &str) -> Option<String> {
         .map(|v4| super::router::derive_overlay_v6(v4).to_string())
 }
 
+/// P5 exit-node — the two IPv4 split-default halves. Installing these (as OS
+/// routes via the overlay NIC + as the exit peer's WG `allowed_ips`) beats the
+/// host's `0.0.0.0/0` default by longest-prefix WITHOUT deleting it, so the OS
+/// default self-heals the instant the overlay routes go away (a crash / kill
+/// can't strand the host offline — see A2/D3 in the P5 plan).
+const SPLIT_DEFAULT_V4: [&str; 2] = ["0.0.0.0/1", "128.0.0.0/1"];
+/// P5 exit-node — the two IPv6 halves, installed via the overlay NIC as a
+/// FAIL-CLOSED measure: the crypto-router drops any non-derived-ULA v6
+/// destination, so routing `::/1` + `8000::/1` into the overlay blackholes ALL
+/// v6 internet egress. Without this a dual-stack host would send v4 through the
+/// exit but leak v6 straight out its uplink (silent AAAA deanonymisation). Full
+/// v6 exit egress is a follow-up (S3b); this is the minimum-safe stance (A5).
+const SPLIT_DEFAULT_V6: [&str; 2] = ["::/1", "8000::/1"];
+
+/// P5 — resolve the operator's chosen exit-node selector (a [`NetmapPeer`]'s
+/// `name` or a node-id hex string) to a concrete node in the current netmap.
+/// Pure, so the name-vs-hex match is unit-tested directly. `None` when no peer
+/// matches (the chosen exit isn't in the mesh yet — reconcile defers rather than
+/// blackholing egress waiting for it).
+fn resolve_exit_peer(selector: &str, peers: &HashMap<ObjectId, NetmapPeer>) -> Option<ObjectId> {
+    let selector = selector.trim();
+    peers
+        .values()
+        .find(|np| np.name == selector || np.node_id.to_hex() == selector)
+        .map(|np| np.node_id)
+}
+
+/// P5 — is `peer` an admin-APPROVED exit node? The client only routes its
+/// default egress through a peer whose netmap `routes` carry a default route
+/// (`0.0.0.0/0`); the server only ever puts one there via the dedicated
+/// exit-node approval (A6), so this is the client-side half of the admin gate —
+/// naming a peer that wasn't approved as an exit node stays inert. Pure.
+fn peer_is_approved_exit(peer: &NetmapPeer) -> bool {
+    peer.routes
+        .iter()
+        .filter_map(|r| super::router::Cidr::parse(r))
+        .any(|c| c.is_default_route())
+}
+
+/// P5 — the carrier-critical endpoint IPs that MUST bypass the split-default
+/// (pinned via the ORIGINAL gateway) for the mesh to survive exit routing: the
+/// coordination server's resolved IPs, plus every live RELAY carrier's coturn
+/// worker IPs (both our own allocation `relay_local` and the peer's `relay_dst`).
+/// A DIRECT carrier is same-subnet / on-link (a connected route more specific
+/// than a `/1`), so it needs no exemption. Pure, so the set arithmetic is
+/// unit-tested against synthetic carriers.
+fn exit_exemption_set(
+    server_ips: &[IpAddr],
+    by_node: &HashMap<ObjectId, Installed>,
+) -> HashSet<IpAddr> {
+    let mut set: HashSet<IpAddr> = server_ips.iter().copied().collect();
+    for inst in by_node.values() {
+        if let Some(a) = inst.relay_local {
+            set.insert(a.ip());
+        }
+        if let Some(a) = inst.relay_dst {
+            set.insert(a.ip());
+        }
+    }
+    set
+}
+
+/// P5 — the exit peer's WG `allowed_ips` while it carries this node's default
+/// egress: its own real (non-default) advertised subnets UNIONed with the two
+/// v4 split-default halves, so packets to any non-overlay v4 destination
+/// encapsulate to it (the `/1`s) while its `/32` host route + any real subnets
+/// keep winning by longest-prefix for their own ranges. A peer that advertised
+/// only `0.0.0.0/0` yields exactly the two `/1`s. Pure.
+fn exit_peer_allowed_ips(exit: &NetmapPeer) -> Vec<super::router::Cidr> {
+    let mut cidrs: Vec<super::router::Cidr> = peer_config_from_netmap(exit)
+        .map(|c| c.subnets)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|c| !c.is_default_route())
+        .collect();
+    // unwrap: both are valid /1 CIDR literals (const-correct, covered by tests).
+    cidrs.push(super::router::Cidr::parse(SPLIT_DEFAULT_V4[0]).unwrap());
+    cidrs.push(super::router::Cidr::parse(SPLIT_DEFAULT_V4[1]).unwrap());
+    cidrs
+}
+
+/// P5 exit-node — live state of default-route capture, owned by [`run`]'s loop.
+#[derive(Default)]
+struct ExitRoutingState {
+    /// The exit peer currently carrying our egress, once chosen + reachable +
+    /// carriered + approved. `None` when inactive.
+    active_peer: Option<ObjectId>,
+    /// `/32` (host) exemptions currently pinned via the original gateway — so we
+    /// add only NEW ones per reconcile and revert exactly on teardown.
+    exemptions: HashSet<IpAddr>,
+    /// Whether the split-default (v4 `/1`s + v6 fail-closed) is installed.
+    split_default_installed: bool,
+}
+
 impl OverlayRuntime {
     /// Direct/test runtime: carriers come from `links`.
     pub fn new(
@@ -347,6 +455,8 @@ impl OverlayRuntime {
             mtu,
             advertised_routes: Vec::new(),
             peer_view: None,
+            exit_node: None,
+            exit_server_ips: Vec::new(),
         }
     }
 
@@ -366,12 +476,26 @@ impl OverlayRuntime {
             mtu,
             advertised_routes: Vec::new(),
             peer_view: None,
+            exit_node: None,
+            exit_server_ips: Vec::new(),
         }
     }
 
     /// Phase 1 — set the subnet routes this node advertises as a router.
     pub fn with_advertised_routes(mut self, routes: Vec<String>) -> Self {
         self.advertised_routes = routes;
+        self
+    }
+
+    /// P5 exit-node CLIENT opt-in — route this node's default internet egress
+    /// through `exit_node` (a peer's [`NetmapPeer::name`] or node-id hex).
+    /// `server_ips` are the coordination server's already-resolved IPs (the agent
+    /// resolves `server_url` before the mesh forms — while the uplink is still
+    /// clean — so they can be exempted from the split-default). Both `None` /
+    /// empty (test / non-exit nodes) leaves exit routing entirely inert.
+    pub fn with_exit_node(mut self, exit_node: Option<String>, server_ips: Vec<IpAddr>) -> Self {
+        self.exit_node = exit_node;
+        self.exit_server_ips = server_ips;
         self
     }
 
@@ -582,6 +706,12 @@ impl OverlayRuntime {
         // join isn't empty until the first sweep.
         self.publish_view(&self_ip, &by_node, &current_peers);
 
+        // P5 exit-node — default-route capture state, reconciled after every
+        // carrier change. Inert unless this node has `exit_node` configured.
+        let mut exit_state = ExitRoutingState::default();
+        self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state)
+            .await;
+
         // Phase 2 — steady state.
         loop {
             tokio::select! {
@@ -605,6 +735,10 @@ impl OverlayRuntime {
                     // A direct→relay fallback (or relay refresh) changed how we
                     // reach a peer — refresh the LocalAPI view.
                     self.publish_view(&self_ip, &by_node, &current_peers);
+                    // A carrier flip may have changed the coturn worker set or
+                    // the exit peer's reachability — re-reconcile exit routing.
+                    self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state)
+                        .await;
                 },
                 // rc.146 — re-assert every installed peer's /32 on the overlay
                 // NIC (evict any competing route a full-tunnel VPN re-added, then
@@ -615,6 +749,14 @@ impl OverlayRuntime {
                     for e in by_node.values() {
                         tun.add_peer_route(e.overlay_ip).await.ok();
                     }
+                    // P5 — re-assert the exit split-default on the same tight
+                    // cadence so a competing full-tunnel VPN default can't
+                    // reclaim egress (mirrors the per-peer /32 route war, A7).
+                    if exit_state.split_default_installed {
+                        for cidr in SPLIT_DEFAULT_V4.iter().chain(SPLIT_DEFAULT_V6.iter()) {
+                            tun.add_cidr_route(cidr).await.ok();
+                        }
+                    }
                 },
                 evt = events.recv() => match evt {
                     // Re-sync: install any newly-listed peers (deltas drive
@@ -624,6 +766,7 @@ impl OverlayRuntime {
                         if let Some(names) = &dns_names { sync_name_map(names, &current_peers).await; }
                         self.install_peers(&mut wg, &mut by_node, &mut relay, &tun, &peers, direct_ctx.as_ref(), &direct_cooldown).await;
                         self.publish_view(&self_ip, &by_node, &current_peers);
+                        self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
                     }
                     Some(OverlayEvent::NetmapDelta { upserts, removes }) => {
                         for p in &upserts { current_peers.insert(p.node_id, p.clone()); }
@@ -641,18 +784,29 @@ impl OverlayRuntime {
                         }
                         if let Some(names) = &dns_names { sync_name_map(names, &current_peers).await; }
                         self.publish_view(&self_ip, &by_node, &current_peers);
+                        self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
                     }
                     Some(OverlayEvent::RelayGrant { peer_node_id, ice_servers, pair_key }) => {
                         if let Some(r) = relay.as_mut()
                             && let Some(link) = r.on_grant(peer_node_id, ice_servers, pair_key).await
                         {
                             self.install_ready(&mut wg, &mut by_node, &tun, link).await;
+                            // A newly-installed relay carrier adds a coturn worker
+                            // to exempt (and the exit peer may have just become
+                            // reachable) — reconcile exit routing.
+                            self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
                         }
                     }
                     None => break,
                 },
             }
         }
+
+        // P5 — revert exit-node default routing on a clean exit (WS disconnect /
+        // shutdown). An UNCLEAN exit self-heals too (the OS default was never
+        // deleted); S3.5 adds the process::exit + boot-reconciler paths (A2).
+        self.teardown_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state)
+            .await;
 
         inbound.abort();
     }
@@ -1139,6 +1293,141 @@ impl OverlayRuntime {
             }
         }
     }
+
+    /// P5 exit-node — reconcile default-route capture toward the chosen exit
+    /// peer. No-op unless `exit_node` is configured. Idempotent + safe to call
+    /// after every carrier change: it pins any newly-needed carrier exemptions
+    /// FIRST, and only once EVERY required endpoint is exempted does it install
+    /// the split-default — so a missing exemption can never sever the very tunnel
+    /// that carries the mesh + coordination path (the load-bearing bootstrap
+    /// safety, R1/D3). Withdraws the capture (egress reverts to the never-deleted
+    /// OS default) if the chosen peer leaves, loses its carrier/approval, or an
+    /// exemption can't be pinned.
+    async fn reconcile_exit_routing(
+        &self,
+        wg: &mut WgDevice,
+        tun: &Arc<dyn TunIo>,
+        by_node: &HashMap<ObjectId, Installed>,
+        current_peers: &HashMap<ObjectId, NetmapPeer>,
+        state: &mut ExitRoutingState,
+    ) {
+        let Some(selector) = self.exit_node.as_deref() else {
+            return; // not an exit-node client — inert
+        };
+
+        // The chosen exit must be present, reachable-with-a-live-carrier, AND an
+        // admin-approved exit node. Any miss → withdraw the capture and wait.
+        let ready = resolve_exit_peer(selector, current_peers).and_then(|id| {
+            let np = current_peers.get(&id)?;
+            let inst = by_node.get(&id)?;
+            peer_is_approved_exit(np).then(|| (id, np.clone(), inst.pubkey))
+        });
+        let Some((exit_id, exit_np, exit_pubkey)) = ready else {
+            if state.active_peer.is_some()
+                || state.split_default_installed
+                || !state.exemptions.is_empty()
+            {
+                warn!(exit = %selector, "overlay exit-node: chosen exit not ready (absent / no carrier / not approved) — reverting default routing");
+                self.teardown_exit_routing(wg, tun, by_node, current_peers, state)
+                    .await;
+            }
+            return;
+        };
+
+        // Pin any exemptions we don't yet hold, BEFORE (re)installing the /1s —
+        // the coturn set grows as relay carriers appear, so re-run on churn.
+        let want = exit_exemption_set(&self.exit_server_ips, by_node);
+        for ip in &want {
+            if state.exemptions.contains(ip) {
+                continue;
+            }
+            match tun.add_host_exemption(*ip).await {
+                Ok(()) => {
+                    state.exemptions.insert(*ip);
+                    info!(%ip, "overlay exit-node: pinned carrier-endpoint exemption via the original uplink");
+                }
+                Err(e) => {
+                    warn!(%ip, %e, "overlay exit-node: FAILED to pin a carrier exemption — withholding default routing to avoid a self-wedge");
+                }
+            }
+        }
+
+        // Safety gate: never capture the default while a required endpoint is
+        // still exposed to it (the /1s would blackhole that carrier). If we were
+        // already active, revert.
+        if !want.iter().all(|ip| state.exemptions.contains(ip)) {
+            if state.split_default_installed {
+                warn!(exit = %selector, "overlay exit-node: a required carrier exemption is missing — reverting default routing to keep the mesh reachable");
+                self.teardown_exit_routing(wg, tun, by_node, current_peers, state)
+                    .await;
+            }
+            return;
+        }
+
+        if state.split_default_installed && state.active_peer == Some(exit_id) {
+            return; // already routing through this exit (route-guard re-asserts)
+        }
+
+        // Install (or move) the split-default toward the exit peer: the two v4
+        // /1 halves into its WG allowed_ips + as OS routes; the v6 halves as
+        // fail-closed blackholes (dropped by the crypto-router).
+        let allowed = exit_peer_allowed_ips(&exit_np);
+        wg.set_peer_subnets(exit_pubkey, &allowed);
+        for cidr in SPLIT_DEFAULT_V4.iter().chain(SPLIT_DEFAULT_V6.iter()) {
+            if let Err(e) = tun.add_cidr_route(cidr).await {
+                warn!(%cidr, %e, "overlay exit-node: split-default route not installed");
+            }
+        }
+        state.split_default_installed = true;
+        state.active_peer = Some(exit_id);
+        info!(peer = %exit_id, exit = %selector, "overlay exit-node: default egress now routes through the exit peer (v4 captured; v6 fail-closed)");
+    }
+
+    /// P5 exit-node — revert everything [`reconcile_exit_routing`] installed:
+    /// drop the split-default OS routes, reset the (former) exit peer's WG
+    /// `allowed_ips` back to its real subnets (so it keeps working as a normal /
+    /// subnet-router peer), and remove the carrier exemptions. Idempotent. NB:
+    /// `process::exit` paths (watchdog stall, self-update) bypass this — a
+    /// synchronous pre-exit cleanup + a boot-time stale-route reconciler are the
+    /// A2 follow-up (S3.5); the split-default self-heals regardless (the OS
+    /// default was never deleted).
+    async fn teardown_exit_routing(
+        &self,
+        wg: &mut WgDevice,
+        tun: &Arc<dyn TunIo>,
+        by_node: &HashMap<ObjectId, Installed>,
+        current_peers: &HashMap<ObjectId, NetmapPeer>,
+        state: &mut ExitRoutingState,
+    ) {
+        if !state.split_default_installed
+            && state.exemptions.is_empty()
+            && state.active_peer.is_none()
+        {
+            return;
+        }
+        for cidr in SPLIT_DEFAULT_V4.iter().chain(SPLIT_DEFAULT_V6.iter()) {
+            tun.del_cidr_route(cidr).await;
+        }
+        // Reset the former exit peer's allowed_ips to its real subnets, if it's
+        // still installed + in the netmap (else its Tunn is already gone).
+        if let Some(id) = state.active_peer
+            && let (Some(inst), Some(np)) = (by_node.get(&id), current_peers.get(&id))
+        {
+            let real: Vec<super::router::Cidr> = peer_config_from_netmap(np)
+                .map(|c| c.subnets)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|c| !c.is_default_route())
+                .collect();
+            wg.set_peer_subnets(inst.pubkey, &real);
+        }
+        for ip in state.exemptions.drain() {
+            tun.del_host_exemption(ip).await;
+        }
+        state.split_default_installed = false;
+        state.active_peer = None;
+        info!("overlay exit-node: default routing torn down; egress reverted to the local uplink");
+    }
 }
 
 #[cfg(test)]
@@ -1476,5 +1765,137 @@ mod tests {
             }
         }
         panic!("packet did not traverse the runtime in time");
+    }
+
+    // ---- P5 exit-node pure helpers ----
+
+    fn exit_oid(b: u8) -> ObjectId {
+        ObjectId::from_bytes([b, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+    }
+
+    fn exit_np(id: ObjectId, name: &str, routes: Vec<String>) -> NetmapPeer {
+        NetmapPeer {
+            node_id: id,
+            overlay_ip: "100.64.0.1".into(),
+            name: name.into(),
+            wg_public_key: String::new(),
+            endpoints: vec![],
+            relay_home: None,
+            reachable: true,
+            supports_quic: false,
+            routes,
+            agent_id: None,
+        }
+    }
+
+    #[test]
+    fn resolve_exit_peer_matches_name_or_hex() {
+        let a = exit_oid(0x0a);
+        let b = exit_oid(0x0b);
+        let mut peers = HashMap::new();
+        peers.insert(a, exit_np(a, "jupiter", vec![]));
+        peers.insert(b, exit_np(b, "zeus", vec![]));
+        // By name.
+        assert_eq!(resolve_exit_peer("jupiter", &peers), Some(a));
+        assert_eq!(resolve_exit_peer("zeus", &peers), Some(b));
+        // By node-id hex.
+        assert_eq!(resolve_exit_peer(&a.to_hex(), &peers), Some(a));
+        // Surrounding whitespace is tolerated.
+        assert_eq!(resolve_exit_peer("  jupiter  ", &peers), Some(a));
+        // Unknown selector → None (reconcile defers rather than blackholing).
+        assert_eq!(resolve_exit_peer("mars", &peers), None);
+    }
+
+    #[test]
+    fn peer_is_approved_exit_detects_default_route() {
+        // An admin-approved exit node carries 0.0.0.0/0 in its netmap routes.
+        assert!(peer_is_approved_exit(&exit_np(
+            exit_oid(1),
+            "x",
+            vec!["0.0.0.0/0".into()]
+        )));
+        // Exit node that is ALSO a subnet router.
+        assert!(peer_is_approved_exit(&exit_np(
+            exit_oid(1),
+            "x",
+            vec!["192.168.1.0/24".into(), "0.0.0.0/0".into()]
+        )));
+        // A plain subnet router is NOT an exit node.
+        assert!(!peer_is_approved_exit(&exit_np(
+            exit_oid(1),
+            "x",
+            vec!["192.168.1.0/24".into()]
+        )));
+        assert!(!peer_is_approved_exit(&exit_np(exit_oid(1), "x", vec![])));
+    }
+
+    #[test]
+    fn exit_exemption_set_unions_server_and_relay_workers() {
+        fn inst(is_direct: bool, relay: Option<(SocketAddr, SocketAddr)>) -> Installed {
+            Installed {
+                pubkey: [0u8; 32],
+                overlay_ip: Ipv4Addr::new(100, 64, 0, 1),
+                is_direct,
+                since: Instant::now(),
+                last_traffic: (0, 0),
+                bad_sweeps: 0,
+                last_rx_at: Instant::now(),
+                relay_local: relay.map(|(l, _)| l),
+                relay_dst: relay.map(|(_, d)| d),
+            }
+        }
+        let server: Vec<IpAddr> = vec![
+            "94.130.141.98".parse().unwrap(),
+            "94.130.141.99".parse().unwrap(),
+        ];
+        let mut by_node = HashMap::new();
+        // A relay carrier → BOTH its coturn worker IPs are exempted.
+        by_node.insert(
+            exit_oid(1),
+            inst(
+                false,
+                Some((
+                    "94.130.141.74:10850".parse().unwrap(),
+                    "5.9.157.226:12728".parse().unwrap(),
+                )),
+            ),
+        );
+        // A direct carrier → contributes NO exemption (same-subnet / on-link).
+        by_node.insert(exit_oid(2), inst(true, None));
+
+        let set = exit_exemption_set(&server, &by_node);
+        assert!(set.contains(&"94.130.141.98".parse::<IpAddr>().unwrap()));
+        assert!(set.contains(&"94.130.141.99".parse::<IpAddr>().unwrap()));
+        assert!(set.contains(&"94.130.141.74".parse::<IpAddr>().unwrap())); // relay_local
+        assert!(set.contains(&"5.9.157.226".parse::<IpAddr>().unwrap())); // relay_dst
+        // Exactly the 2 server + 2 relay IPs; the direct carrier added nothing.
+        assert_eq!(set.len(), 4);
+    }
+
+    #[test]
+    fn exit_peer_allowed_ips_preserves_real_subnets_and_appends_split_default() {
+        let kp = WgKeypair::generate();
+        let exit = NetmapPeer {
+            node_id: exit_oid(7),
+            overlay_ip: "100.64.0.7".into(),
+            name: "jupiter".into(),
+            wg_public_key: kp.public_base64(),
+            endpoints: vec![],
+            relay_home: None,
+            reachable: true,
+            supports_quic: false,
+            routes: vec!["192.168.5.0/24".into(), "0.0.0.0/0".into()],
+            agent_id: None,
+        };
+        let strs: Vec<String> = exit_peer_allowed_ips(&exit)
+            .iter()
+            .map(|c| c.to_string())
+            .collect();
+        // Real subnet preserved; both /1 halves appended; the bare /0 dropped.
+        assert!(strs.contains(&"192.168.5.0/24".to_string()));
+        assert!(strs.contains(&"0.0.0.0/1".to_string()));
+        assert!(strs.contains(&"128.0.0.0/1".to_string()));
+        assert!(!strs.contains(&"0.0.0.0/0".to_string()));
+        assert_eq!(strs.len(), 3);
     }
 }

@@ -175,6 +175,18 @@ pub struct AgentConfig {
     #[serde(default)]
     pub overlay_exit_node_enabled: bool,
 
+    /// P5 exit-node CLIENT opt-in: route THIS node's default internet egress
+    /// (`0.0.0.0/0`) through the named mesh peer — its [`overlay`] `NetmapPeer`
+    /// name or node-id hex — Tailscale "use exit node" style. `None` (default) =
+    /// normal routing (egress via the local uplink). Only takes effect when the
+    /// named peer is visible in the netmap, reachable with a live carrier, AND an
+    /// admin-approved exit node; the client then installs a split-default with
+    /// carrier-endpoint exemptions so the coordination + mesh path survives.
+    /// DISTINCT from [`overlay_exit_node_enabled`](Self::overlay_exit_node_enabled),
+    /// which makes THIS node OFFER to be an exit for others.
+    #[serde(default)]
+    pub overlay_exit_node: Option<String>,
+
     /// Tunnel mesh subnet-router — CIDRs this host advertises it can route for
     /// the SOCKS mesh (e.g. `["192.168.1.0/24"]`). Sent on `rc:agent.hello` as
     /// `advertised_routes`; an admin approves a subset (Admin → Agents → Subnet
@@ -606,6 +618,7 @@ mod tests {
             overlay_wg_secret_key: None,
             overlay_advertised_routes: Vec::new(),
             overlay_exit_node_enabled: false,
+            overlay_exit_node: None,
             advertise_routes: Vec::new(),
             advertise_local_subnets: true,
             tunnel_routes: Vec::new(),
