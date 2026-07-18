@@ -469,7 +469,7 @@ async fn connect_once(
     // peer, and tears down when this connection's `overlay_evt_tx` drops.
     #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
     let overlay_evt_tx =
-        crate::overlay::maybe_start(cfg, outbound_tx.clone(), overlay_view_tx.clone());
+        crate::overlay::maybe_start(cfg, outbound_tx.clone(), overlay_view_tx.clone()).await;
     // Without an overlay surface nothing publishes the view; keep the param
     // used so the LocalAPI wiring stays feature-agnostic in `run_cmd`.
     #[cfg(not(any(feature = "overlay-l3", feature = "overlay-netstack")))]
