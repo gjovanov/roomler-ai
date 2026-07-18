@@ -492,19 +492,22 @@ mod system {
                     };
                     #[cfg(target_os = "linux")]
                     {
-                        run_cmd(
-                            "ip",
-                            vec![
-                                "route".into(),
-                                "replace".into(),
-                                format!("{v4}/32"),
-                                "via".into(),
-                                gw.gateway.to_string(),
-                                "dev".into(),
-                                gw.interface.clone(),
-                            ],
-                        )
-                        .await
+                        let mut args: Vec<String> = vec![
+                            "route".into(),
+                            "replace".into(),
+                            format!("{v4}/32"),
+                            "via".into(),
+                            gw.gateway.to_string(),
+                            "dev".into(),
+                            gw.interface.clone(),
+                        ];
+                        // Carry `onlink` when the original default did, or the
+                        // kernel rejects a `via`-gateway not on a connected subnet
+                        // ("Nexthop has invalid gateway") — see OrigDefaultRoute.
+                        if gw.onlink {
+                            args.push("onlink".into());
+                        }
+                        run_cmd("ip", args).await
                     }
                     #[cfg(target_os = "windows")]
                     {
@@ -547,20 +550,20 @@ mod system {
                     };
                     #[cfg(target_os = "linux")]
                     {
-                        run_cmd(
-                            "ip",
-                            vec![
-                                "-6".into(),
-                                "route".into(),
-                                "replace".into(),
-                                format!("{v6}/128"),
-                                "via".into(),
-                                gw.gateway.to_string(),
-                                "dev".into(),
-                                gw.interface.clone(),
-                            ],
-                        )
-                        .await
+                        let mut args: Vec<String> = vec![
+                            "-6".into(),
+                            "route".into(),
+                            "replace".into(),
+                            format!("{v6}/128"),
+                            "via".into(),
+                            gw.gateway.to_string(),
+                            "dev".into(),
+                            gw.interface.clone(),
+                        ];
+                        if gw.onlink {
+                            args.push("onlink".into());
+                        }
+                        run_cmd("ip", args).await
                     }
                     #[cfg(target_os = "windows")]
                     {
@@ -606,9 +609,8 @@ mod system {
                         return;
                     };
                     #[cfg(target_os = "linux")]
-                    let _ = run_cmd(
-                        "ip",
-                        vec![
+                    {
+                        let mut args: Vec<String> = vec![
                             "route".into(),
                             "del".into(),
                             format!("{v4}/32"),
@@ -616,9 +618,12 @@ mod system {
                             gw.gateway.to_string(),
                             "dev".into(),
                             gw.interface.clone(),
-                        ],
-                    )
-                    .await;
+                        ];
+                        if gw.onlink {
+                            args.push("onlink".into());
+                        }
+                        let _ = run_cmd("ip", args).await;
+                    }
                     #[cfg(target_os = "windows")]
                     let _ = run_cmd(
                         "netsh",
@@ -638,9 +643,8 @@ mod system {
                         return;
                     };
                     #[cfg(target_os = "linux")]
-                    let _ = run_cmd(
-                        "ip",
-                        vec![
+                    {
+                        let mut args: Vec<String> = vec![
                             "-6".into(),
                             "route".into(),
                             "del".into(),
@@ -649,9 +653,12 @@ mod system {
                             gw.gateway.to_string(),
                             "dev".into(),
                             gw.interface.clone(),
-                        ],
-                    )
-                    .await;
+                        ];
+                        if gw.onlink {
+                            args.push("onlink".into());
+                        }
+                        let _ = run_cmd("ip", args).await;
+                    }
                     #[cfg(target_os = "windows")]
                     let _ = run_cmd(
                         "netsh",
@@ -857,6 +864,13 @@ mod system {
     struct OrigDefaultRoute {
         gateway: Ipv4Addr,
         interface: String,
+        /// P5 — the original default route was installed `onlink` (the gateway
+        /// isn't in any connected subnet, as on Hetzner + many clouds). A `/32`
+        /// carrier exemption via such a gateway MUST also carry `onlink`, or the
+        /// kernel rejects it with "Nexthop has invalid gateway" (found in the P5
+        /// field-test). Linux-only concept; Windows `netsh` resolves the next-hop.
+        #[cfg(target_os = "linux")]
+        onlink: bool,
     }
 
     /// Query the OS for the active IPv4 default route, picking the lowest-metric
@@ -910,11 +924,22 @@ mod system {
             if interface == IF_NAME {
                 continue; // never exempt via the overlay itself
             }
+            // `onlink` default routes (Hetzner + many clouds) force the same flag
+            // onto any `/32` exemption pinned via this gateway — see the struct doc.
+            let onlink = toks.contains(&"onlink");
             let metric = tok_after(&toks, "metric")
                 .and_then(|s| s.parse::<u32>().ok())
                 .unwrap_or(0);
             if best.as_ref().is_none_or(|(m, _)| metric < *m) {
-                best = Some((metric, OrigDefaultRoute { gateway, interface }));
+                best = Some((
+                    metric,
+                    OrigDefaultRoute {
+                        gateway,
+                        interface,
+                        #[cfg(target_os = "linux")]
+                        onlink,
+                    },
+                ));
             }
         }
         best.map(|(_, r)| r)
@@ -956,6 +981,11 @@ mod system {
     struct OrigDefaultRoute6 {
         gateway: Ipv6Addr,
         interface: String,
+        /// See [`OrigDefaultRoute::onlink`] — the v6 default is likewise often
+        /// `onlink` (a `fe80::` next-hop on a point-to-point uplink), so `/128`
+        /// exemptions via it need the flag too. Linux-only.
+        #[cfg(target_os = "linux")]
+        onlink: bool,
     }
 
     /// Query the OS for the active IPv6 default route (lowest-metric). `None` on
@@ -1009,11 +1039,20 @@ mod system {
             if interface == IF_NAME {
                 continue; // never exempt via the overlay itself
             }
+            let onlink = toks.contains(&"onlink");
             let metric = tok_after(&toks, "metric")
                 .and_then(|s| s.parse::<u32>().ok())
                 .unwrap_or(0);
             if best.as_ref().is_none_or(|(m, _)| metric < *m) {
-                best = Some((metric, OrigDefaultRoute6 { gateway, interface }));
+                best = Some((
+                    metric,
+                    OrigDefaultRoute6 {
+                        gateway,
+                        interface,
+                        #[cfg(target_os = "linux")]
+                        onlink,
+                    },
+                ));
             }
         }
         best.map(|(_, r)| r)
@@ -1080,6 +1119,20 @@ mod system {
             let out3 = "default via 100.64.0.1 dev roomler0 metric 1\n\
                         default via 192.168.1.1 dev eth0 metric 100\n";
             assert_eq!(parse_linux_default_route(out3).unwrap().interface, "eth0");
+            // Hetzner/cloud `onlink` default is captured so the exemption /32
+            // carries the flag (P5 field-test regression: without it the kernel
+            // rejects the /32 with "Nexthop has invalid gateway").
+            let r_onlink =
+                parse_linux_default_route("default via 172.31.1.1 dev eth0 proto static onlink\n")
+                    .unwrap();
+            assert_eq!(r_onlink.gateway, Ipv4Addr::new(172, 31, 1, 1));
+            assert!(r_onlink.onlink);
+            // A normal (non-onlink) default is not flagged.
+            assert!(
+                !parse_linux_default_route("default via 192.168.1.1 dev eth0\n")
+                    .unwrap()
+                    .onlink
+            );
             // No default route present.
             assert!(parse_linux_default_route("").is_none());
             assert!(parse_linux_default_route("10.0.0.0/8 dev eth0\n").is_none());
@@ -1120,6 +1173,15 @@ No       Manual    256  255.255.255.255/32          1  Loopback Pseudo-Interface
             assert_eq!(
                 parse_linux_default_route_v6(out2).unwrap().interface,
                 "eth0"
+            );
+            // An `onlink` v6 default (point-to-point uplink) is flagged so the
+            // /128 exemption carries the flag (P5 field-test regression).
+            assert!(
+                parse_linux_default_route_v6(
+                    "default via fe80::1 dev eth0 proto static metric 100 onlink pref medium\n"
+                )
+                .unwrap()
+                .onlink
             );
             // None present.
             assert!(parse_linux_default_route_v6("").is_none());
