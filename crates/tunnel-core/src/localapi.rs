@@ -71,6 +71,15 @@ pub struct ExitNodeStatus {
     /// back-compat with a daemon/CLI that predates v6 egress.
     #[serde(default)]
     pub v6_active: bool,
+    /// P5/S4b — `true` when the DEFAULT ("." catch-all) DNS namespace is steered
+    /// through the exit, so every non-overlay query resolves from the exit's
+    /// vantage (no DNS leak to the local ISP resolver). When `active` but this is
+    /// `false`, DNS is NOT steered — the local overlay resolver failed to bind, or
+    /// `resolvectl`/NRPT is unavailable — and queries may resolve via the local
+    /// uplink; surfaced so it's never a SILENT leak. Defaults false for back-compat
+    /// with a daemon/CLI that predates DNS steering.
+    #[serde(default)]
+    pub dns_steered: bool,
 }
 
 /// Snapshot of the local node.
