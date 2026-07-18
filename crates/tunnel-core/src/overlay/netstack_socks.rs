@@ -339,6 +339,7 @@ mod tests {
             self_ip: Some("100.64.0.1".into()),
             self_ip6: None,
             peers: vec![peer("NEO16", "100.64.0.2"), peer("pc50045", "100.64.0.4")],
+            exit_node: None,
         };
         assert_eq!(
             resolve_overlay_host(&view, "100.64.0.9"),
@@ -409,6 +410,7 @@ mod tests {
             self_ip: Some(a_ip.to_string()),
             self_ip6: None,
             peers: vec![peer("peerb", &b_ip.to_string())],
+            exit_node: None,
         });
         tokio::spawn(serve_socks5(handle_rx, view_rx, socks));
         (a, b, socks_addr, (handle_tx, view_tx))

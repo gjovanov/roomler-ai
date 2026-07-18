@@ -410,6 +410,18 @@ fn print_status(s: &NodeStatus) {
             "disconnected"
         }
     );
+    // P5/S4 — exit-node routing (only when this node is configured as a client).
+    if let Some(ex) = &s.exit_node {
+        let state = if ex.active {
+            "active".to_string()
+        } else {
+            format!(
+                "withheld — {}",
+                ex.withheld_reason.as_deref().unwrap_or("not ready")
+            )
+        };
+        println!("  exit node   {} ({state})", ex.selector);
+    }
 }
 
 fn print_peers(peers: &[PeerInfo], now_ms: u64) {

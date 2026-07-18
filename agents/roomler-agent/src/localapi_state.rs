@@ -175,6 +175,8 @@ impl LocalApiState for DaemonState {
             overlay_ip: self.overlay.borrow().self_ip.clone(),
             overlay_ip6: self.overlay.borrow().self_ip6.clone(),
             connected: self.connected.load(Ordering::Relaxed),
+            // P5/S4 — exit-node routing status the overlay runtime published.
+            exit_node: self.overlay.borrow().exit_node.clone(),
         }
     }
 
@@ -449,6 +451,7 @@ mod tests {
                 relay_local: Some("94.130.141.74:10850".into()),
                 relay_dst: Some("5.9.157.226:12728".into()),
             }],
+            exit_node: None,
         }
     }
 
