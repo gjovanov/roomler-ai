@@ -334,6 +334,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/{node_id}/approved-routes",
             put(routes::overlay_route::set_approved_routes),
+        )
+        .route(
+            "/{node_id}/exit-node",
+            put(routes::overlay_route::set_exit_node),
         );
 
     // Phase 2 MagicDNS — the tenant's overlay DNS domain + upstreams.
