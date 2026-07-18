@@ -45,6 +45,27 @@ pub enum DaemonMode {
     User,
 }
 
+/// P5 exit-node — this node's default-route-egress status (Tailscale "use exit
+/// node"). Published by the overlay runtime so `roomler status` / the desktop can
+/// show whether this node is routing its internet egress through a mesh peer and,
+/// crucially, WHY it isn't when it's configured but not active — the split-tunnel
+/// signal (S4): the client withholds default routing rather than self-wedge when
+/// the exit peer is absent / uncarriered / unapproved, or a carrier-endpoint
+/// exemption can't be pinned.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ExitNodeStatus {
+    /// The configured exit-node selector (a peer name or node-id hex).
+    pub selector: String,
+    /// `true` when the split-default is installed — this node's internet egress
+    /// currently routes through the exit peer.
+    pub active: bool,
+    /// Human-readable reason routing is NOT active while `active == false`
+    /// (e.g. "exit node not visible in the mesh yet", "not an approved exit
+    /// node", "carrier-endpoint exemption unavailable"). `None` when `active`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withheld_reason: Option<String>,
+}
+
 /// Snapshot of the local node.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct NodeStatus {
@@ -62,6 +83,11 @@ pub struct NodeStatus {
     pub overlay_ip6: Option<String>,
     /// Connected to the coordination server.
     pub connected: bool,
+    /// P5 exit-node routing status. `None` unless this node is configured as an
+    /// exit-node CLIENT (`overlay_exit_node`). Backward-compatible (older CLIs
+    /// ignore the extra field; a v4-only / non-exit daemon omits it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_node: Option<ExitNodeStatus>,
 }
 
 /// A peer device as this node currently sees it.
@@ -353,6 +379,10 @@ pub struct OverlayView {
     pub self_ip6: Option<String>,
     /// Peers as the runtime currently reaches them.
     pub peers: Vec<PeerInfo>,
+    /// P5 exit-node routing status (S4), filled by the overlay runtime. `None`
+    /// unless this node is configured as an exit-node client. The daemon copies
+    /// it verbatim into [`NodeStatus::exit_node`].
+    pub exit_node: Option<ExitNodeStatus>,
 }
 
 /// Read-only snapshot the daemon provides to [`handle`]. The daemon's impl
@@ -1136,6 +1166,7 @@ mod tests {
                 overlay_ip: Some("100.64.0.2".into()),
                 overlay_ip6: None,
                 connected: true,
+                exit_node: None,
             }
         }
         fn peers(&self) -> Vec<PeerInfo> {
