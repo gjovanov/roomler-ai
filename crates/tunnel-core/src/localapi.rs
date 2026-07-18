@@ -64,6 +64,13 @@ pub struct ExitNodeStatus {
     /// node", "carrier-endpoint exemption unavailable"). `None` when `active`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub withheld_reason: Option<String>,
+    /// P5/S3b — `true` when GLOBAL IPv6 egress ALSO routes through the exit. When
+    /// `active` but this is `false`, v6 is fail-closed (blackholed, never leaked)
+    /// — the exit is v6-incapable (e.g. Windows: WinNAT has no v6) or this host
+    /// has no v6 uplink to exempt the coordination server. Defaults false for
+    /// back-compat with a daemon/CLI that predates v6 egress.
+    #[serde(default)]
+    pub v6_active: bool,
 }
 
 /// Snapshot of the local node.

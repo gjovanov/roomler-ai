@@ -131,11 +131,94 @@ async fn setup(overlay_cidr: &str) -> bool {
         "ACCEPT".into(),
     ])
     .await;
+    // P5/S3b — IPv6 exit egress (best-effort; independent of the v4 result so a
+    // v4-only-uplink exit still reports v4 success). Clients keep v6 fail-closed
+    // until this succeeds on the exit.
+    setup_v6().await;
     nat_ok && fwd_out_ok && fwd_ret_ok
+}
+
+/// P5/S3b — enable IPv6 forwarding + MASQUERADE on an exit node (Linux). Best-
+/// effort + logged independently of v4: a v4-only uplink (no v6, no `ip6tables`)
+/// simply leaves v6 egress unavailable, and clients then stay v6-fail-closed.
+#[cfg(target_os = "linux")]
+async fn setup_v6() {
+    // Enable v6 forwarding. `accept_ra=2` so a host that forwards STILL accepts
+    // Router Advertisements — otherwise `forwarding=1` downgrades RA acceptance
+    // and a SLAAC/RA-configured uplink loses its OWN v6 default on the next RA,
+    // killing the egress this NAT depends on (v4's `ip_forward` has no such
+    // coupling). A static-v6 uplink is unaffected (no RA to lose). Leave both
+    // sysctls on at teardown — another service may rely on them.
+    let _ = run(vec![
+        "sysctl".into(),
+        "-w".into(),
+        "net.ipv6.conf.all.forwarding=1".into(),
+    ])
+    .await;
+    let _ = run(vec![
+        "sysctl".into(),
+        "-w".into(),
+        "net.ipv6.conf.all.accept_ra=2".into(),
+    ])
+    .await;
+    // MASQUERADE overlay-sourced v6 out the uplink. Source is the derived-v6
+    // `/96` ([`OVERLAY_ULA_V6_CIDR`]) — exactly the on-link prefix, so it can't
+    // over-broadly NAT a co-located non-overlay ULA (Docker/WSL2/other VPN).
+    let nat6_ok = run(vec![
+        "ip6tables".into(),
+        "-t".into(),
+        "nat".into(),
+        "-A".into(),
+        "POSTROUTING".into(),
+        "-s".into(),
+        super::router::OVERLAY_ULA_V6_CIDR.into(),
+        "-j".into(),
+        "MASQUERADE".into(),
+    ])
+    .await;
+    let fwd6_out_ok = run(vec![
+        "ip6tables".into(),
+        "-A".into(),
+        "FORWARD".into(),
+        "-i".into(),
+        IF_NAME.into(),
+        "-j".into(),
+        "ACCEPT".into(),
+    ])
+    .await;
+    let fwd6_ret_ok = run(vec![
+        "ip6tables".into(),
+        "-A".into(),
+        "FORWARD".into(),
+        "-o".into(),
+        IF_NAME.into(),
+        "-m".into(),
+        "conntrack".into(),
+        "--ctstate".into(),
+        "RELATED,ESTABLISHED".into(),
+        "-j".into(),
+        "ACCEPT".into(),
+    ])
+    .await;
+    if nat6_ok && fwd6_out_ok && fwd6_ret_ok {
+        info!("overlay: exit-node IPv6 forwarding + NAT enabled");
+    } else {
+        info!(
+            "overlay: IPv6 exit NAT not fully enabled (v4-only uplink / no ip6tables?) — \
+             clients routing through this exit stay v6-fail-closed"
+        );
+    }
 }
 
 #[cfg(target_os = "windows")]
 async fn setup(overlay_cidr: &str) -> bool {
+    // P5/S3b — WinNAT (`New-NetNat`) has NO IPv6 API, so a Windows exit node
+    // cannot NAT v6. Clients routing through a Windows exit stay v6-fail-closed
+    // (their global v6 is encapsulated but dropped here — never leaked). v6 exit
+    // egress is Linux-only; see docs/remote-control (S5).
+    info!(
+        "overlay: IPv6 exit NAT unavailable on Windows (WinNAT is v4-only); v6 stays fail-closed"
+    );
     // Forwarding on the overlay NIC. The LAN adapter's forwarding is normally
     // already on; enabling every interface is heavy-handed, so we do the roomler
     // NIC and rely on WinNAT for the address translation.
@@ -195,6 +278,38 @@ impl Drop for SubnetRouterGuard {
                 .args(["-D", "FORWARD", "-i", IF_NAME, "-j", "ACCEPT"])
                 .output();
             let _ = std::process::Command::new("iptables")
+                .args([
+                    "-D",
+                    "FORWARD",
+                    "-o",
+                    IF_NAME,
+                    "-m",
+                    "conntrack",
+                    "--ctstate",
+                    "RELATED,ESTABLISHED",
+                    "-j",
+                    "ACCEPT",
+                ])
+                .output();
+            // P5/S3b — mirror the v6 rules from `setup_v6` (idempotent `-D`;
+            // reverting an absent rule on a v4-only exit is a harmless no-op). The
+            // forwarding/accept_ra sysctls are left on, like v4's `ip_forward`.
+            let _ = std::process::Command::new("ip6tables")
+                .args([
+                    "-t",
+                    "nat",
+                    "-D",
+                    "POSTROUTING",
+                    "-s",
+                    super::router::OVERLAY_ULA_V6_CIDR,
+                    "-j",
+                    "MASQUERADE",
+                ])
+                .output();
+            let _ = std::process::Command::new("ip6tables")
+                .args(["-D", "FORWARD", "-i", IF_NAME, "-j", "ACCEPT"])
+                .output();
+            let _ = std::process::Command::new("ip6tables")
                 .args([
                     "-D",
                     "FORWARD",

@@ -467,6 +467,10 @@ fn exit_node_status(selector: Option<&str>, state: &ExitRoutingState) -> Option<
         } else {
             state.withheld_reason.clone()
         },
+        // S3b — global IPv6 also routes through the exit only when v4 is active
+        // AND v6 egress was enabled (v6 exemptions pinned). Otherwise v6 is
+        // fail-closed even while v4 egress is active.
+        v6_active: state.split_default_installed && state.v6_active == Some(true),
     })
 }
 
@@ -494,12 +498,18 @@ struct ExitRoutingState {
     /// `/32` (host) exemptions currently pinned via the original gateway — so we
     /// add only NEW ones per reconcile and revert exactly on teardown.
     exemptions: HashSet<IpAddr>,
-    /// Whether the split-default (v4 `/1`s + v6 fail-closed) is installed.
+    /// Whether the v4 split-default (`0.0.0.0/1`+`128.0.0.0/1`) is installed.
     split_default_installed: bool,
     /// S4 — why default routing is currently WITHHELD (the split-tunnel signal),
     /// surfaced in [`ExitNodeStatus`]. `None` when active or not configured. Also
     /// the dedup key for the withhold WARN (log only on a reason change).
     withheld_reason: Option<String>,
+    /// S3b — global IPv6 egress state: `None` = undecided; `Some(true)` = v6
+    /// routes through the exit; `Some(false)` = v6 fail-closed (no v6 uplink to
+    /// exempt the coordination server, or a Windows exit). Reset to `None` on
+    /// teardown. Independent of `split_default_installed` (v4) per BLOCKER-1 — v6
+    /// never gates v4. Also the transition-log dedup key.
+    v6_active: Option<bool>,
 }
 
 impl OverlayRuntime {
@@ -1425,10 +1435,18 @@ impl OverlayRuntime {
             }
         }
 
-        // Safety gate: never capture the default while a required endpoint is
-        // still exposed to it (the /1s would blackhole that carrier). If we were
-        // already active, revert.
-        if !want.iter().all(|ip| state.exemptions.contains(ip)) {
+        // BLOCKER-1 safety gate — the v4 split-default gates ONLY on the v4
+        // exemptions (server A-records + coturn workers). A v6-exemption failure
+        // (e.g. roomler.ai has an AAAA but this host has no v6 default route, so
+        // its `/128` can't pin) must NEVER withhold v4 exit — v6 is handled
+        // separately below and simply stays fail-closed. Without this split, a
+        // pure-v6 feature would regress shipped v4 the moment roomler.ai gained
+        // an AAAA.
+        let v4_ok = want
+            .iter()
+            .filter(|ip| ip.is_ipv4())
+            .all(|ip| state.exemptions.contains(ip));
+        if !v4_ok {
             if state.split_default_installed {
                 self.teardown_exit_routing(wg, tun, by_node, current_peers, state)
                     .await;
@@ -1441,24 +1459,48 @@ impl OverlayRuntime {
             return;
         }
 
-        if state.split_default_installed && state.active_peer == Some(exit_id) {
-            return; // already routing through this exit (route-guard re-asserts)
+        // Install (or move) the split-default toward the exit peer (idempotent):
+        // the two v4 /1 halves into its WG allowed_ips + as OS routes, plus the
+        // two v6 /1 halves as OS routes into the overlay NIC. The v6 halves either
+        // FORWARD (v6 egress) or blackhole (fail-closed) depending on `v6_exit`,
+        // set below — the routes themselves are identical either way.
+        if !(state.split_default_installed && state.active_peer == Some(exit_id)) {
+            let allowed = exit_peer_allowed_ips(&exit_np);
+            wg.set_peer_subnets(exit_pubkey, &allowed);
+            for cidr in SPLIT_DEFAULT_V4.iter().chain(SPLIT_DEFAULT_V6.iter()) {
+                if let Err(e) = tun.add_cidr_route(cidr).await {
+                    warn!(%cidr, %e, "overlay exit-node: split-default route not installed");
+                }
+            }
+            state.split_default_installed = true;
+            state.active_peer = Some(exit_id);
+            state.withheld_reason = None;
+            info!(peer = %exit_id, exit = %selector, "overlay exit-node: v4 default egress now routes through the exit peer");
         }
 
-        // Install (or move) the split-default toward the exit peer: the two v4
-        // /1 halves into its WG allowed_ips + as OS routes; the v6 halves as
-        // fail-closed blackholes (dropped by the crypto-router).
-        let allowed = exit_peer_allowed_ips(&exit_np);
-        wg.set_peer_subnets(exit_pubkey, &allowed);
-        for cidr in SPLIT_DEFAULT_V4.iter().chain(SPLIT_DEFAULT_V6.iter()) {
-            if let Err(e) = tun.add_cidr_route(cidr).await {
-                warn!(%cidr, %e, "overlay exit-node: split-default route not installed");
+        // S3b — global IPv6 egress, INDEPENDENT of v4 and re-asserted every
+        // reconcile so a `remove_peer`-clear during a relay↔direct carrier
+        // reinstall self-repairs (MAJOR-3). Enable only when EVERY v6 exemption
+        // (the coordination server's AAAA) is pinned, so the WS-over-v6 control
+        // channel stays direct (MAJOR-1). Otherwise `v6_exit=None` keeps the `::/1`
+        // routes as a fail-closed blackhole — v6 never leaks, and v4 is unaffected.
+        let v6_ok = want
+            .iter()
+            .filter(|ip| ip.is_ipv6())
+            .all(|ip| state.exemptions.contains(ip));
+        if v6_ok {
+            wg.set_v6_exit(Some(exit_pubkey));
+            if state.v6_active != Some(true) {
+                state.v6_active = Some(true);
+                info!(peer = %exit_id, "overlay exit-node: global IPv6 egress now routes through the exit peer");
+            }
+        } else {
+            wg.set_v6_exit(None);
+            if state.v6_active != Some(false) {
+                state.v6_active = Some(false);
+                warn!(exit = %selector, "overlay exit-node: IPv6 egress WITHHELD (no v6 uplink to exempt the coordination server) — v6 stays fail-closed while v4 routes through the exit");
             }
         }
-        state.split_default_installed = true;
-        state.active_peer = Some(exit_id);
-        state.withheld_reason = None;
-        info!(peer = %exit_id, exit = %selector, "overlay exit-node: default egress now routes through the exit peer (v4 captured; v6 fail-closed)");
     }
 
     /// P5 exit-node — revert everything [`reconcile_exit_routing`] installed:
@@ -1502,8 +1544,12 @@ impl OverlayRuntime {
         for ip in state.exemptions.drain() {
             tun.del_host_exemption(ip).await;
         }
+        // S3b — stop routing global v6 to the (now former) exit; global v6 reverts
+        // to the physical uplink once the `::/1` routes above are removed.
+        wg.set_v6_exit(None);
         state.split_default_installed = false;
         state.active_peer = None;
+        state.v6_active = None;
         info!("overlay exit-node: default routing torn down; egress reverted to the local uplink");
     }
 }
@@ -1922,9 +1968,12 @@ mod tests {
                 relay_dst: relay.map(|(_, d)| d),
             }
         }
+        // Server A + AAAA (S3b — the v6 AAAA rides the set too; reconcile
+        // partitions by family, and the v6 exemption keeps the WS-over-v6 direct).
         let server: Vec<IpAddr> = vec![
             "94.130.141.98".parse().unwrap(),
             "94.130.141.99".parse().unwrap(),
+            "2a01:4f8:c17:b8f::2".parse().unwrap(),
         ];
         let mut by_node = HashMap::new();
         // A relay carrier → BOTH its coturn worker IPs are exempted.
@@ -1944,10 +1993,11 @@ mod tests {
         let set = exit_exemption_set(&server, &by_node);
         assert!(set.contains(&"94.130.141.98".parse::<IpAddr>().unwrap()));
         assert!(set.contains(&"94.130.141.99".parse::<IpAddr>().unwrap()));
+        assert!(set.contains(&"2a01:4f8:c17:b8f::2".parse::<IpAddr>().unwrap())); // AAAA
         assert!(set.contains(&"94.130.141.74".parse::<IpAddr>().unwrap())); // relay_local
         assert!(set.contains(&"5.9.157.226".parse::<IpAddr>().unwrap())); // relay_dst
-        // Exactly the 2 server + 2 relay IPs; the direct carrier added nothing.
-        assert_eq!(set.len(), 4);
+        // Exactly the 3 server (2×A + 1×AAAA) + 2 relay IPs; direct added nothing.
+        assert_eq!(set.len(), 5);
     }
 
     #[test]
@@ -2040,10 +2090,20 @@ mod tests {
             w.withheld_reason.as_deref(),
             Some("exit node has no live carrier yet")
         );
-        // Active suppresses any lingering reason.
+        // Withheld → v6 is never "on".
+        assert!(!w.v6_active);
+        // Active but v6 undecided/fail-closed → active, v6 off.
         st.split_default_installed = true;
         let a = exit_node_status(Some("jupiter"), &st).unwrap();
         assert!(a.active);
         assert!(a.withheld_reason.is_none());
+        assert!(!a.v6_active);
+        // Active AND v6 enabled → both on.
+        st.v6_active = Some(true);
+        let a6 = exit_node_status(Some("jupiter"), &st).unwrap();
+        assert!(a6.active && a6.v6_active);
+        // Active but v6 fail-closed → v4 on, v6 off.
+        st.v6_active = Some(false);
+        assert!(!exit_node_status(Some("jupiter"), &st).unwrap().v6_active);
     }
 }
