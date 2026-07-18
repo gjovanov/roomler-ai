@@ -1109,8 +1109,28 @@ impl OverlayRuntime {
         pubkey: [u8; 32],
         subnets: &[super::router::Cidr],
     ) {
-        wg.set_peer_subnets(pubkey, subnets);
-        for c in subnets {
+        // P5/A1 — the generic subnet-install path NEVER installs a default route.
+        // Approving `0.0.0.0/0` on an exit node fans it into every peer's netmap
+        // `routes`; without this filter each client would install it here
+        // unconditionally — into the crypto-router's allowed_ips AND an OS default
+        // route — hijacking the whole fleet's egress with zero opt-in. Default
+        // routing toward a CHOSEN exit node is a separate, opt-in path
+        // (split-default `/1`s + carrier-endpoint exemptions) that never flows
+        // through this generic installer.
+        let filtered: Vec<super::router::Cidr> = subnets
+            .iter()
+            .copied()
+            .filter(|c| !c.is_default_route())
+            .collect();
+        if filtered.len() != subnets.len() {
+            warn!(
+                peer = %node_id,
+                "overlay: dropped advertised default route(s) from a peer's subnets \
+                 (exit-node routing is opt-in — a /0 is never auto-installed)"
+            );
+        }
+        wg.set_peer_subnets(pubkey, &filtered);
+        for c in &filtered {
             let cidr = c.to_string();
             if let Err(e) = tun.add_cidr_route(&cidr).await {
                 debug!(peer = %node_id, %cidr, %e, "overlay: subnet route not installed");
