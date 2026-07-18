@@ -64,6 +64,22 @@ pub trait TunIo: Send + Sync {
 
     /// Remove a CIDR route installed by [`add_cidr_route`]. Best-effort.
     async fn del_cidr_route(&self, _cidr: &str) {}
+
+    /// P5 exit-node — install a `/32` (host) **exemption** route for `ip` via the
+    /// host's ORIGINAL default gateway (captured at TUN bring-up), NOT via this
+    /// overlay device. When an exit-node client installs the split-default
+    /// (`0.0.0.0/1` + `128.0.0.0/1`) via the overlay, these longer-prefix `/32`s
+    /// keep the carrier-critical endpoints — the coordination server, the coturn
+    /// relay, and the exit peer's own WG endpoint — flowing over the real uplink,
+    /// so the default capture can never sever the very tunnel that carries it.
+    /// Default no-op (the in-memory mock, netstack, or when no default route was
+    /// discovered); best-effort — a failure is surfaced by the split-tunnel check.
+    async fn add_host_exemption(&self, _ip: std::net::IpAddr) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Remove a `/32` exemption installed by [`add_host_exemption`]. Best-effort.
+    async fn del_host_exemption(&self, _ip: std::net::IpAddr) {}
 }
 
 /// The real OS TUN device. Behind `overlay-l3` so the WG core + the
@@ -86,6 +102,13 @@ mod system {
     /// + write loops.
     pub struct SystemTun {
         dev: Arc<tun::AsyncDevice>,
+        /// P5 — the host's ORIGINAL default route (gateway + interface), captured
+        /// at bring-up BEFORE any overlay route can shadow it. Used to pin
+        /// exit-node carrier-endpoint exemption `/32`s via the real uplink (see
+        /// [`TunIo::add_host_exemption`]). `None` when discovery failed — the
+        /// split-tunnel check (S4) then surfaces a WARN rather than wedging.
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        orig_default: Option<OrigDefaultRoute>,
         /// WFP hard-permit guard. Holds a dynamic WFP session whose `Drop`
         /// reaps the `roomler`-adapter permit filters, so it must live as
         /// long as the device. `None` when disabled
@@ -179,8 +202,29 @@ mod system {
                 None
             };
 
+            // P5 — snapshot the host's original default route NOW, before any
+            // overlay route is installed, so exit-node exemptions can later pin
+            // carrier-critical endpoints via the real uplink.
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            let orig_default = {
+                let d = discover_default_route();
+                match &d {
+                    Some(r) => tracing::info!(
+                        gateway = %r.gateway, interface = %r.interface,
+                        "overlay: captured original default route (exit-node exemptions available)"
+                    ),
+                    None => tracing::warn!(
+                        "overlay: no original default route found; \
+                         exit-node carrier exemptions will be unavailable"
+                    ),
+                }
+                d
+            };
+
             Ok(Self {
                 dev,
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
+                orig_default,
                 #[cfg(windows)]
                 _wfp,
             })
@@ -386,6 +430,108 @@ mod system {
             #[cfg(not(any(target_os = "windows", target_os = "linux")))]
             let _ = cidr;
         }
+
+        /// P5 — install a `/32` exemption for `ip` via the host's ORIGINAL default
+        /// gateway (captured at bring-up), NOT the overlay NIC, so the exit-node
+        /// split-default can't capture this carrier-critical endpoint. `Err` when
+        /// no default route was discovered (the caller's split-tunnel check
+        /// surfaces it). IPv6 exemptions are deferred to the v6-egress slice.
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        async fn add_host_exemption(&self, ip: std::net::IpAddr) -> std::io::Result<()> {
+            let std::net::IpAddr::V4(v4) = ip else {
+                return Ok(()); // v6 handled by the v6-egress slice (S3b)
+            };
+            let Some(gw) = self.orig_default.as_ref() else {
+                return Err(std::io::Error::other(
+                    "no original default route captured; cannot exempt carrier endpoint",
+                ));
+            };
+            #[cfg(target_os = "linux")]
+            {
+                run_cmd(
+                    "ip",
+                    vec![
+                        "route".into(),
+                        "replace".into(),
+                        format!("{v4}/32"),
+                        "via".into(),
+                        gw.gateway.to_string(),
+                        "dev".into(),
+                        gw.interface.clone(),
+                    ],
+                )
+                .await
+            }
+            #[cfg(target_os = "windows")]
+            {
+                // delete-then-add (idempotent), matching the other route helpers.
+                let _ = run_cmd(
+                    "netsh",
+                    vec![
+                        "interface".into(),
+                        "ipv4".into(),
+                        "delete".into(),
+                        "route".into(),
+                        format!("prefix={v4}/32"),
+                        format!("interface={}", gw.interface),
+                    ],
+                )
+                .await;
+                run_cmd(
+                    "netsh",
+                    vec![
+                        "interface".into(),
+                        "ipv4".into(),
+                        "add".into(),
+                        "route".into(),
+                        format!("prefix={v4}/32"),
+                        format!("interface={}", gw.interface),
+                        format!("nexthop={}", gw.gateway),
+                        "metric=1".into(),
+                        "store=active".into(),
+                    ],
+                )
+                .await
+            }
+        }
+
+        /// Remove a `/32` exemption installed by [`Self::add_host_exemption`].
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        async fn del_host_exemption(&self, ip: std::net::IpAddr) {
+            let std::net::IpAddr::V4(v4) = ip else {
+                return;
+            };
+            let Some(gw) = self.orig_default.as_ref() else {
+                return;
+            };
+            #[cfg(target_os = "linux")]
+            let _ = run_cmd(
+                "ip",
+                vec![
+                    "route".into(),
+                    "del".into(),
+                    format!("{v4}/32"),
+                    "via".into(),
+                    gw.gateway.to_string(),
+                    "dev".into(),
+                    gw.interface.clone(),
+                ],
+            )
+            .await;
+            #[cfg(target_os = "windows")]
+            let _ = run_cmd(
+                "netsh",
+                vec![
+                    "interface".into(),
+                    "ipv4".into(),
+                    "delete".into(),
+                    "route".into(),
+                    format!("prefix={v4}/32"),
+                    format!("interface={}", gw.interface),
+                ],
+            )
+            .await;
+        }
     }
 
     /// The overlay NIC name we set in [`SystemTun::up`] — used to target
@@ -497,5 +643,148 @@ mod system {
         })
         .await
         .map_err(|e| std::io::Error::other(e.to_string()))?
+    }
+
+    /// The host's original default route — the gateway + interface that carried
+    /// its traffic BEFORE the overlay installed any route. Captured once in
+    /// [`SystemTun::up`]; used to pin exit-node exemption `/32`s via the real
+    /// uplink. `interface` is the Linux `dev` name / the Windows interface index.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[derive(Debug, Clone)]
+    struct OrigDefaultRoute {
+        gateway: Ipv4Addr,
+        interface: String,
+    }
+
+    /// Query the OS for the active IPv4 default route, picking the lowest-metric
+    /// one on a multi-homed host. `None` on any error or when there is none.
+    #[cfg(target_os = "linux")]
+    fn discover_default_route() -> Option<OrigDefaultRoute> {
+        let out = std::process::Command::new("ip")
+            .args(["-4", "route", "show", "default"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        parse_linux_default_route(&String::from_utf8_lossy(&out.stdout))
+    }
+
+    #[cfg(target_os = "windows")]
+    fn discover_default_route() -> Option<OrigDefaultRoute> {
+        let out = std::process::Command::new("netsh")
+            .args(["interface", "ipv4", "show", "route"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        parse_windows_default_route(&String::from_utf8_lossy(&out.stdout))
+    }
+
+    /// Parse `ip -4 route show default` → the lowest-metric default route. Pure
+    /// (OS-call-free) so it unit-tests against captured output. A default via our
+    /// own overlay NIC is ignored (never exempt via ourselves).
+    #[cfg(target_os = "linux")]
+    fn parse_linux_default_route(output: &str) -> Option<OrigDefaultRoute> {
+        fn tok_after<'a>(toks: &[&'a str], key: &str) -> Option<&'a str> {
+            toks.iter()
+                .position(|t| *t == key)
+                .and_then(|i| toks.get(i + 1).copied())
+        }
+        let mut best: Option<(u32, OrigDefaultRoute)> = None;
+        for line in output.lines() {
+            let line = line.trim();
+            if !line.starts_with("default") {
+                continue;
+            }
+            let toks: Vec<&str> = line.split_whitespace().collect();
+            let gateway = tok_after(&toks, "via").and_then(|s| s.parse::<Ipv4Addr>().ok());
+            let interface = tok_after(&toks, "dev").map(str::to_string);
+            let (Some(gateway), Some(interface)) = (gateway, interface) else {
+                continue;
+            };
+            if interface == IF_NAME {
+                continue; // never exempt via the overlay itself
+            }
+            let metric = tok_after(&toks, "metric")
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(0);
+            if best.as_ref().is_none_or(|(m, _)| metric < *m) {
+                best = Some((metric, OrigDefaultRoute { gateway, interface }));
+            }
+        }
+        best.map(|(_, r)| r)
+    }
+
+    /// Parse `netsh interface ipv4 show route` → the lowest-metric `0.0.0.0/0`
+    /// route (gateway + interface index). Pure so it unit-tests against captured
+    /// output. Rows whose gateway column is an interface NAME (on-link, no
+    /// gateway) are skipped — a real default route always carries a gateway.
+    #[cfg(target_os = "windows")]
+    fn parse_windows_default_route(output: &str) -> Option<OrigDefaultRoute> {
+        let mut best: Option<(u32, OrigDefaultRoute)> = None;
+        for line in output.lines() {
+            // Columns: Publish  Type  Met  Prefix  Idx  Gateway/Interface Name
+            let toks: Vec<&str> = line.split_whitespace().collect();
+            if toks.len() < 6 || toks[3] != "0.0.0.0/0" {
+                continue;
+            }
+            let Ok(metric) = toks[2].parse::<u32>() else {
+                continue; // header row ("Met")
+            };
+            let Ok(gateway) = toks[5].parse::<Ipv4Addr>() else {
+                continue; // on-link (interface name, not a gateway)
+            };
+            let interface = toks[4].to_string();
+            if best.as_ref().is_none_or(|(m, _)| metric < *m) {
+                best = Some((metric, OrigDefaultRoute { gateway, interface }));
+            }
+        }
+        best.map(|(_, r)| r)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn linux_default_route_lowest_metric_skips_overlay() {
+            use super::parse_linux_default_route;
+            use std::net::Ipv4Addr;
+            // Lowest metric wins on a multi-homed host.
+            let out = "default via 192.168.1.1 dev eth0 proto dhcp metric 100\n\
+                       default via 10.8.0.1 dev tun0 metric 50\n";
+            let r = parse_linux_default_route(out).unwrap();
+            assert_eq!(r.gateway, Ipv4Addr::new(10, 8, 0, 1));
+            assert_eq!(r.interface, "tun0");
+            // Missing metric == 0 == wins.
+            let r2 = parse_linux_default_route("default via 192.168.1.1 dev eth0\n").unwrap();
+            assert_eq!(r2.gateway, Ipv4Addr::new(192, 168, 1, 1));
+            // A default via our own overlay NIC is ignored.
+            let out3 = "default via 100.64.0.1 dev roomler0 metric 1\n\
+                        default via 192.168.1.1 dev eth0 metric 100\n";
+            assert_eq!(parse_linux_default_route(out3).unwrap().interface, "eth0");
+            // No default route present.
+            assert!(parse_linux_default_route("").is_none());
+            assert!(parse_linux_default_route("10.0.0.0/8 dev eth0\n").is_none());
+        }
+
+        #[cfg(target_os = "windows")]
+        #[test]
+        fn windows_default_route_lowest_metric_skips_headers_and_onlink() {
+            use super::parse_windows_default_route;
+            use std::net::Ipv4Addr;
+            let out = "\
+Publish  Type      Met  Prefix                    Idx  Gateway/Interface Name\r\n\
+-------  --------  ---  ------------------------  ---  ------------------------\r\n\
+No       Manual      0  0.0.0.0/0                   12  192.168.68.1\r\n\
+No       Manual    256  0.0.0.0/0                    5  10.0.0.1\r\n\
+No       Manual    256  255.255.255.255/32          1  Loopback Pseudo-Interface 1\r\n";
+            let r = parse_windows_default_route(out).unwrap();
+            assert_eq!(r.gateway, Ipv4Addr::new(192, 168, 68, 1));
+            assert_eq!(r.interface, "12");
+            // No default route present.
+            assert!(parse_windows_default_route("").is_none());
+        }
     }
 }
