@@ -11,7 +11,10 @@
 //! runs as a privileged service, so it has the rights.
 //!
 //! - **Linux:** `sysctl net.ipv4.ip_forward=1` + `iptables -t nat -A POSTROUTING
-//!   -s <overlay-cidr> -j MASQUERADE`.
+//!   -s <overlay-cidr> -j MASQUERADE`, plus `filter`/`FORWARD` ACCEPT rules for
+//!   the overlay interface — container hosts (Docker/containerd, the k8s fleet)
+//!   default the `FORWARD` chain policy to DROP, which silently swallows
+//!   forwarded packets despite `ip_forward=1` (P5/A4).
 //! - **Windows:** `Set-NetIPInterface -Forwarding Enabled` on the overlay NIC +
 //!   **WinNAT** `New-NetNat -InternalIPInterfaceAddressPrefix <overlay-cidr>` —
 //!   the modern, scriptable, no-reboot NAT engine (Win10 1607+/Server 2016+),
@@ -28,6 +31,12 @@ use tracing::{info, warn};
 /// WinNAT instance name (Windows only).
 #[cfg(target_os = "windows")]
 const NAT_NAME: &str = "roomler-overlay";
+
+/// Overlay TUN interface name on Linux — matches `tun.rs` / `dns.rs`. Used to
+/// scope the `filter`/`FORWARD` ACCEPT rules (P5/A4) to overlay-forwarded
+/// traffic only.
+#[cfg(target_os = "linux")]
+const IF_NAME: &str = "roomler0";
 
 /// RAII guard for the OS forwarding/NAT state. `Drop` reverts whatever `enable`
 /// installed. A guard with `active == false` (nothing advertised, or setup
@@ -47,11 +56,18 @@ pub async fn enable(overlay_cidr: &str, advertised_routes: &[String]) -> SubnetR
             active: false,
         };
     }
-    let active = setup(overlay_cidr).await;
-    if active {
+    let fully_ok = setup(overlay_cidr).await;
+    // Arm the guard on any platform where `setup` installs rules, so `Drop`
+    // reverts even a PARTIALLY-applied ruleset (each `-D` / `Remove-NetNat` is
+    // idempotent — reverting an absent rule is a harmless no-op). `fully_ok`
+    // only drives the log level. Previously `active = setup()`, which leaked the
+    // rules that DID apply whenever one of the (now multiple, P5/A4) commands
+    // failed.
+    let active = cfg!(any(target_os = "linux", target_os = "windows"));
+    if active && fully_ok {
         info!(%overlay_cidr, routes = ?advertised_routes,
             "overlay: subnet-router forwarding + NAT enabled");
-    } else {
+    } else if active {
         warn!(%overlay_cidr,
             "overlay: subnet-router forwarding/NAT not fully enabled (see prior errors)");
     }
@@ -64,14 +80,16 @@ pub async fn enable(overlay_cidr: &str, advertised_routes: &[String]) -> SubnetR
 #[cfg(target_os = "linux")]
 async fn setup(overlay_cidr: &str) -> bool {
     // Global forwarding (leave it on at teardown — another service may rely on
-    // it; we only remove our own NAT rule).
+    // it; we only remove our own rules).
     let _ = run(vec![
         "sysctl".into(),
         "-w".into(),
         "net.ipv4.ip_forward=1".into(),
     ])
     .await;
-    run(vec![
+    // NAT: masquerade overlay-sourced traffic out the host's uplink so the far
+    // side replies to the router itself (zero peer-side config).
+    let nat_ok = run(vec![
         "iptables".into(),
         "-t".into(),
         "nat".into(),
@@ -82,7 +100,38 @@ async fn setup(overlay_cidr: &str) -> bool {
         "-j".into(),
         "MASQUERADE".into(),
     ])
-    .await
+    .await;
+    // filter/FORWARD ACCEPT (P5/A4): container hosts (Docker/containerd — the
+    // k8s fleet mars/jupiter/zeus) default the FORWARD chain policy to DROP, so
+    // `ip_forward=1` + NAT alone silently drop forwarded packets. Explicitly
+    // accept overlay→uplink and the established return path. Needed by BOTH
+    // subnet-routers and exit nodes; the subnet-router path only ever "worked"
+    // on LANs whose upstream router had a permissive FORWARD policy.
+    let fwd_out_ok = run(vec![
+        "iptables".into(),
+        "-A".into(),
+        "FORWARD".into(),
+        "-i".into(),
+        IF_NAME.into(),
+        "-j".into(),
+        "ACCEPT".into(),
+    ])
+    .await;
+    let fwd_ret_ok = run(vec![
+        "iptables".into(),
+        "-A".into(),
+        "FORWARD".into(),
+        "-o".into(),
+        IF_NAME.into(),
+        "-m".into(),
+        "conntrack".into(),
+        "--ctstate".into(),
+        "RELATED,ESTABLISHED".into(),
+        "-j".into(),
+        "ACCEPT".into(),
+    ])
+    .await;
+    nat_ok && fwd_out_ok && fwd_ret_ok
 }
 
 #[cfg(target_os = "windows")]
@@ -139,6 +188,24 @@ impl Drop for SubnetRouterGuard {
                     &self.overlay_cidr,
                     "-j",
                     "MASQUERADE",
+                ])
+                .output();
+            // Mirror the P5/A4 FORWARD ACCEPT rules from `setup`.
+            let _ = std::process::Command::new("iptables")
+                .args(["-D", "FORWARD", "-i", IF_NAME, "-j", "ACCEPT"])
+                .output();
+            let _ = std::process::Command::new("iptables")
+                .args([
+                    "-D",
+                    "FORWARD",
+                    "-o",
+                    IF_NAME,
+                    "-m",
+                    "conntrack",
+                    "--ctstate",
+                    "RELATED,ESTABLISHED",
+                    "-j",
+                    "ACCEPT",
                 ])
                 .output();
         }

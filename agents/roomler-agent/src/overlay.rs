@@ -74,7 +74,8 @@ pub fn maybe_start(
     };
     let rt = OverlayRuntime::new_relay(keypair, outbound, tun_factory, OVERLAY_MTU)
         // Phase 1 — advertise this node's subnet routes (admin-gated server-side).
-        .with_advertised_routes(cfg.overlay_advertised_routes.clone())
+        // P5 — plus `0.0.0.0/0` when this node is configured as an exit node.
+        .with_advertised_routes(cfg.effective_overlay_advertised_routes())
         // Unification P1 — publish the live mesh view for the LocalAPI so
         // `roomler status` / `peers` see per-device connection types.
         .with_peer_view(peer_view);
