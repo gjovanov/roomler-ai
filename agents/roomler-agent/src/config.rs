@@ -161,6 +161,20 @@ pub struct AgentConfig {
     #[serde(default)]
     pub overlay_advertised_routes: Vec<String>,
 
+    /// P5 exit-node: when set, this node advertises `0.0.0.0/0` (the default
+    /// route) on the L3 overlay, offering to be an **exit node** — a mesh peer
+    /// can route ALL its internet egress through this host (Tailscale exit-node
+    /// style). Like every advertised route it stays admin-gated server-side (a
+    /// DISTINCT Admin → Subnet routes "Exit node" toggle, not a stray `/0`
+    /// checkbox in the CIDR grid) and no peer routes through it until BOTH this
+    /// flag AND the admin approval are set. The advertised `0.0.0.0/0` unions
+    /// with `overlay_advertised_routes` — see
+    /// [`AgentConfig::effective_overlay_advertised_routes`]. The egress
+    /// data-plane (NAT masquerade + FORWARD ACCEPT) engages automatically via
+    /// the existing subnet-router NAT once `/0` is advertised. Off by default.
+    #[serde(default)]
+    pub overlay_exit_node_enabled: bool,
+
     /// Tunnel mesh subnet-router — CIDRs this host advertises it can route for
     /// the SOCKS mesh (e.g. `["192.168.1.0/24"]`). Sent on `rc:agent.hello` as
     /// `advertised_routes`; an admin approves a subset (Admin → Agents → Subnet
@@ -193,6 +207,27 @@ pub struct AgentConfig {
     /// survive an auto-rollback.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tunnel_routes: Vec<tunnel_core::localapi::RouteDescriptor>,
+}
+
+impl AgentConfig {
+    /// P5 — the effective set of CIDRs advertised on the L3 overlay: the
+    /// configured [`overlay_advertised_routes`](Self::overlay_advertised_routes)
+    /// unioned with the default route `0.0.0.0/0` when this node is an exit node
+    /// ([`overlay_exit_node_enabled`](Self::overlay_exit_node_enabled)). This is
+    /// what feeds the overlay runtime's `with_advertised_routes` — so the
+    /// server sees `0.0.0.0/0` in `advertised_routes` and the admin UI offers
+    /// the exit-node toggle. Order-preserving; `/0` is appended last and only if
+    /// not already present (an operator may also list it explicitly).
+    pub fn effective_overlay_advertised_routes(&self) -> Vec<String> {
+        let mut routes = self.overlay_advertised_routes.clone();
+        if self.overlay_exit_node_enabled {
+            let default_route = "0.0.0.0/0".to_string();
+            if !routes.contains(&default_route) {
+                routes.push(default_route);
+            }
+        }
+        routes
+    }
 }
 
 /// serde default for `advertise_local_subnets` — auto-detect is ON by default.
@@ -570,10 +605,43 @@ mod tests {
             overlay_enabled: false,
             overlay_wg_secret_key: None,
             overlay_advertised_routes: Vec::new(),
+            overlay_exit_node_enabled: false,
             advertise_routes: Vec::new(),
             advertise_local_subnets: true,
             tunnel_routes: Vec::new(),
         }
+    }
+
+    #[test]
+    fn effective_overlay_routes_appends_default_route_for_exit_node() {
+        let mut cfg = fixture();
+        // Not an exit node → advertised routes pass through unchanged.
+        cfg.overlay_advertised_routes = vec!["192.168.1.0/24".into()];
+        assert_eq!(
+            cfg.effective_overlay_advertised_routes(),
+            vec!["192.168.1.0/24".to_string()]
+        );
+
+        // Exit node → 0.0.0.0/0 unioned in, appended last.
+        cfg.overlay_exit_node_enabled = true;
+        assert_eq!(
+            cfg.effective_overlay_advertised_routes(),
+            vec!["192.168.1.0/24".to_string(), "0.0.0.0/0".to_string()]
+        );
+
+        // An explicitly-listed /0 is not duplicated.
+        cfg.overlay_advertised_routes = vec!["0.0.0.0/0".into()];
+        assert_eq!(
+            cfg.effective_overlay_advertised_routes(),
+            vec!["0.0.0.0/0".to_string()]
+        );
+
+        // Pure exit node (no subnet routes) → just the default route.
+        cfg.overlay_advertised_routes = Vec::new();
+        assert_eq!(
+            cfg.effective_overlay_advertised_routes(),
+            vec!["0.0.0.0/0".to_string()]
+        );
     }
 
     #[test]
