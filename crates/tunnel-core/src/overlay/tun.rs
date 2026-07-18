@@ -91,6 +91,9 @@ pub use system::{SystemTun, purge_split_default};
 #[cfg(feature = "overlay-l3")]
 mod system {
     use std::net::Ipv4Addr;
+    // v6 exemptions + default-route discovery (S3b) are linux/windows-only.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    use std::net::Ipv6Addr;
     use std::sync::Arc;
 
     use async_trait::async_trait;
@@ -109,6 +112,13 @@ mod system {
         /// split-tunnel check (S4) then surfaces a WARN rather than wedging.
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         orig_default: Option<OrigDefaultRoute>,
+        /// P5/S3b — the host's ORIGINAL IPv6 default route (gateway + interface),
+        /// captured at bring-up. Pins v6 `/128` carrier exemptions (the
+        /// coordination server's AAAA) so the WS control channel stays direct
+        /// while global v6 routes through the exit. `None` when the host has no v6
+        /// default (v4-only uplink) — v6 egress then stays fail-closed.
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        orig_default_v6: Option<OrigDefaultRoute6>,
         /// WFP hard-permit guard. Holds a dynamic WFP session whose `Drop`
         /// reaps the `roomler`-adapter permit filters, so it must live as
         /// long as the device. `None` when disabled
@@ -221,10 +231,30 @@ mod system {
                 d
             };
 
+            // P5/S3b — likewise snapshot the original IPv6 default route (for v6
+            // `/128` carrier exemptions). `None` on a v4-only-uplink host — v6
+            // exit egress then stays fail-closed (never leaks).
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            let orig_default_v6 = {
+                let d = discover_default_route_v6();
+                match &d {
+                    Some(r) => tracing::info!(
+                        gateway = %r.gateway, interface = %r.interface,
+                        "overlay: captured original IPv6 default route (v6 exit exemptions available)"
+                    ),
+                    None => tracing::info!(
+                        "overlay: no IPv6 default route; v6 exit egress will stay fail-closed"
+                    ),
+                }
+                d
+            };
+
             Ok(Self {
                 dev,
                 #[cfg(any(target_os = "linux", target_os = "windows"))]
                 orig_default,
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
+                orig_default_v6,
                 #[cfg(windows)]
                 _wfp,
             })
@@ -445,106 +475,198 @@ mod system {
             let _ = (cidr, v6);
         }
 
-        /// P5 — install a `/32` exemption for `ip` via the host's ORIGINAL default
-        /// gateway (captured at bring-up), NOT the overlay NIC, so the exit-node
-        /// split-default can't capture this carrier-critical endpoint. `Err` when
-        /// no default route was discovered (the caller's split-tunnel check
-        /// surfaces it). IPv6 exemptions are deferred to the v6-egress slice.
+        /// P5 — install a host exemption for `ip` (a `/32` for v4, `/128` for v6)
+        /// via the host's ORIGINAL default gateway of the matching family (captured
+        /// at bring-up), NOT the overlay NIC, so the exit-node split-default can't
+        /// capture this carrier-critical endpoint. `Err` when no default route of
+        /// that family was discovered — the caller's exemption gate then withholds
+        /// that family's exit routing (v4 or v6) rather than wedging.
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         async fn add_host_exemption(&self, ip: std::net::IpAddr) -> std::io::Result<()> {
-            let std::net::IpAddr::V4(v4) = ip else {
-                return Ok(()); // v6 handled by the v6-egress slice (S3b)
-            };
-            let Some(gw) = self.orig_default.as_ref() else {
-                return Err(std::io::Error::other(
-                    "no original default route captured; cannot exempt carrier endpoint",
-                ));
-            };
-            #[cfg(target_os = "linux")]
-            {
-                run_cmd(
-                    "ip",
-                    vec![
-                        "route".into(),
-                        "replace".into(),
-                        format!("{v4}/32"),
-                        "via".into(),
-                        gw.gateway.to_string(),
-                        "dev".into(),
-                        gw.interface.clone(),
-                    ],
-                )
-                .await
-            }
-            #[cfg(target_os = "windows")]
-            {
-                // delete-then-add (idempotent), matching the other route helpers.
-                let _ = run_cmd(
-                    "netsh",
-                    vec![
-                        "interface".into(),
-                        "ipv4".into(),
-                        "delete".into(),
-                        "route".into(),
-                        format!("prefix={v4}/32"),
-                        format!("interface={}", gw.interface),
-                    ],
-                )
-                .await;
-                run_cmd(
-                    "netsh",
-                    vec![
-                        "interface".into(),
-                        "ipv4".into(),
-                        "add".into(),
-                        "route".into(),
-                        format!("prefix={v4}/32"),
-                        format!("interface={}", gw.interface),
-                        format!("nexthop={}", gw.gateway),
-                        "metric=1".into(),
-                        "store=active".into(),
-                    ],
-                )
-                .await
+            match ip {
+                std::net::IpAddr::V4(v4) => {
+                    let Some(gw) = self.orig_default.as_ref() else {
+                        return Err(std::io::Error::other(
+                            "no original IPv4 default route captured; cannot exempt carrier endpoint",
+                        ));
+                    };
+                    #[cfg(target_os = "linux")]
+                    {
+                        run_cmd(
+                            "ip",
+                            vec![
+                                "route".into(),
+                                "replace".into(),
+                                format!("{v4}/32"),
+                                "via".into(),
+                                gw.gateway.to_string(),
+                                "dev".into(),
+                                gw.interface.clone(),
+                            ],
+                        )
+                        .await
+                    }
+                    #[cfg(target_os = "windows")]
+                    {
+                        // delete-then-add (idempotent), like the other helpers.
+                        let _ = run_cmd(
+                            "netsh",
+                            vec![
+                                "interface".into(),
+                                "ipv4".into(),
+                                "delete".into(),
+                                "route".into(),
+                                format!("prefix={v4}/32"),
+                                format!("interface={}", gw.interface),
+                            ],
+                        )
+                        .await;
+                        run_cmd(
+                            "netsh",
+                            vec![
+                                "interface".into(),
+                                "ipv4".into(),
+                                "add".into(),
+                                "route".into(),
+                                format!("prefix={v4}/32"),
+                                format!("interface={}", gw.interface),
+                                format!("nexthop={}", gw.gateway),
+                                "metric=1".into(),
+                                "store=active".into(),
+                            ],
+                        )
+                        .await
+                    }
+                }
+                // P5/S3b — the IPv6 `/128` counterpart, via the original v6 gateway.
+                std::net::IpAddr::V6(v6) => {
+                    let Some(gw) = self.orig_default_v6.as_ref() else {
+                        return Err(std::io::Error::other(
+                            "no original IPv6 default route captured; cannot exempt v6 carrier endpoint",
+                        ));
+                    };
+                    #[cfg(target_os = "linux")]
+                    {
+                        run_cmd(
+                            "ip",
+                            vec![
+                                "-6".into(),
+                                "route".into(),
+                                "replace".into(),
+                                format!("{v6}/128"),
+                                "via".into(),
+                                gw.gateway.to_string(),
+                                "dev".into(),
+                                gw.interface.clone(),
+                            ],
+                        )
+                        .await
+                    }
+                    #[cfg(target_os = "windows")]
+                    {
+                        let _ = run_cmd(
+                            "netsh",
+                            vec![
+                                "interface".into(),
+                                "ipv6".into(),
+                                "delete".into(),
+                                "route".into(),
+                                format!("prefix={v6}/128"),
+                                format!("interface={}", gw.interface),
+                            ],
+                        )
+                        .await;
+                        run_cmd(
+                            "netsh",
+                            vec![
+                                "interface".into(),
+                                "ipv6".into(),
+                                "add".into(),
+                                "route".into(),
+                                format!("prefix={v6}/128"),
+                                format!("interface={}", gw.interface),
+                                format!("nexthop={}", gw.gateway),
+                                "metric=1".into(),
+                                "store=active".into(),
+                            ],
+                        )
+                        .await
+                    }
+                }
             }
         }
 
-        /// Remove a `/32` exemption installed by [`Self::add_host_exemption`].
+        /// Remove a host exemption installed by [`Self::add_host_exemption`]
+        /// (`/32` v4 or `/128` v6). Best-effort.
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         async fn del_host_exemption(&self, ip: std::net::IpAddr) {
-            let std::net::IpAddr::V4(v4) = ip else {
-                return;
-            };
-            let Some(gw) = self.orig_default.as_ref() else {
-                return;
-            };
-            #[cfg(target_os = "linux")]
-            let _ = run_cmd(
-                "ip",
-                vec![
-                    "route".into(),
-                    "del".into(),
-                    format!("{v4}/32"),
-                    "via".into(),
-                    gw.gateway.to_string(),
-                    "dev".into(),
-                    gw.interface.clone(),
-                ],
-            )
-            .await;
-            #[cfg(target_os = "windows")]
-            let _ = run_cmd(
-                "netsh",
-                vec![
-                    "interface".into(),
-                    "ipv4".into(),
-                    "delete".into(),
-                    "route".into(),
-                    format!("prefix={v4}/32"),
-                    format!("interface={}", gw.interface),
-                ],
-            )
-            .await;
+            match ip {
+                std::net::IpAddr::V4(v4) => {
+                    let Some(gw) = self.orig_default.as_ref() else {
+                        return;
+                    };
+                    #[cfg(target_os = "linux")]
+                    let _ = run_cmd(
+                        "ip",
+                        vec![
+                            "route".into(),
+                            "del".into(),
+                            format!("{v4}/32"),
+                            "via".into(),
+                            gw.gateway.to_string(),
+                            "dev".into(),
+                            gw.interface.clone(),
+                        ],
+                    )
+                    .await;
+                    #[cfg(target_os = "windows")]
+                    let _ = run_cmd(
+                        "netsh",
+                        vec![
+                            "interface".into(),
+                            "ipv4".into(),
+                            "delete".into(),
+                            "route".into(),
+                            format!("prefix={v4}/32"),
+                            format!("interface={}", gw.interface),
+                        ],
+                    )
+                    .await;
+                }
+                std::net::IpAddr::V6(v6) => {
+                    let Some(gw) = self.orig_default_v6.as_ref() else {
+                        return;
+                    };
+                    #[cfg(target_os = "linux")]
+                    let _ = run_cmd(
+                        "ip",
+                        vec![
+                            "-6".into(),
+                            "route".into(),
+                            "del".into(),
+                            format!("{v6}/128"),
+                            "via".into(),
+                            gw.gateway.to_string(),
+                            "dev".into(),
+                            gw.interface.clone(),
+                        ],
+                    )
+                    .await;
+                    #[cfg(target_os = "windows")]
+                    let _ = run_cmd(
+                        "netsh",
+                        vec![
+                            "interface".into(),
+                            "ipv6".into(),
+                            "delete".into(),
+                            "route".into(),
+                            format!("prefix={v6}/128"),
+                            format!("interface={}", gw.interface),
+                        ],
+                    )
+                    .await;
+                }
+            }
         }
     }
 
@@ -825,6 +947,106 @@ mod system {
         best.map(|(_, r)| r)
     }
 
+    /// P5/S3b — the host's original IPv6 default route: the v6 gateway + interface
+    /// that carried its v6 traffic before the overlay. Pins v6 `/128` exit
+    /// exemptions. `gateway` is frequently a link-local (`fe80::`) next-hop, which
+    /// is fine — the `interface` disambiguates it.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[derive(Debug, Clone)]
+    struct OrigDefaultRoute6 {
+        gateway: Ipv6Addr,
+        interface: String,
+    }
+
+    /// Query the OS for the active IPv6 default route (lowest-metric). `None` on
+    /// error or when the host has no v6 default (v4-only uplink).
+    #[cfg(target_os = "linux")]
+    fn discover_default_route_v6() -> Option<OrigDefaultRoute6> {
+        let out = std::process::Command::new("ip")
+            .args(["-6", "route", "show", "default"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        parse_linux_default_route_v6(&String::from_utf8_lossy(&out.stdout))
+    }
+
+    #[cfg(target_os = "windows")]
+    fn discover_default_route_v6() -> Option<OrigDefaultRoute6> {
+        let out = std::process::Command::new("netsh")
+            .args(["interface", "ipv6", "show", "route"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        parse_windows_default_route_v6(&String::from_utf8_lossy(&out.stdout))
+    }
+
+    /// Parse `ip -6 route show default` → the lowest-metric v6 default (gateway +
+    /// dev). Pure. A default via our own overlay NIC is ignored; a link-local
+    /// (`fe80::`) gateway is accepted (the dev disambiguates its zone).
+    #[cfg(target_os = "linux")]
+    fn parse_linux_default_route_v6(output: &str) -> Option<OrigDefaultRoute6> {
+        fn tok_after<'a>(toks: &[&'a str], key: &str) -> Option<&'a str> {
+            toks.iter()
+                .position(|t| *t == key)
+                .and_then(|i| toks.get(i + 1).copied())
+        }
+        let mut best: Option<(u32, OrigDefaultRoute6)> = None;
+        for line in output.lines() {
+            let line = line.trim();
+            if !line.starts_with("default") {
+                continue;
+            }
+            let toks: Vec<&str> = line.split_whitespace().collect();
+            let gateway = tok_after(&toks, "via").and_then(|s| s.parse::<Ipv6Addr>().ok());
+            let interface = tok_after(&toks, "dev").map(str::to_string);
+            let (Some(gateway), Some(interface)) = (gateway, interface) else {
+                continue;
+            };
+            if interface == IF_NAME {
+                continue; // never exempt via the overlay itself
+            }
+            let metric = tok_after(&toks, "metric")
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(0);
+            if best.as_ref().is_none_or(|(m, _)| metric < *m) {
+                best = Some((metric, OrigDefaultRoute6 { gateway, interface }));
+            }
+        }
+        best.map(|(_, r)| r)
+    }
+
+    /// Parse `netsh interface ipv6 show route` → the lowest-metric `::/0` route
+    /// (gateway + interface index). Pure. Rows whose gateway column isn't a v6
+    /// address (on-link — an interface name) are skipped; a `%zone` suffix on a
+    /// link-local gateway is stripped before parsing.
+    #[cfg(target_os = "windows")]
+    fn parse_windows_default_route_v6(output: &str) -> Option<OrigDefaultRoute6> {
+        let mut best: Option<(u32, OrigDefaultRoute6)> = None;
+        for line in output.lines() {
+            // Columns: Publish  Type  Met  Prefix  Idx  Gateway/Interface Name
+            let toks: Vec<&str> = line.split_whitespace().collect();
+            if toks.len() < 6 || toks[3] != "::/0" {
+                continue;
+            }
+            let Ok(metric) = toks[2].parse::<u32>() else {
+                continue; // header row ("Met")
+            };
+            let gw_str = toks[5].split('%').next().unwrap_or(toks[5]);
+            let Ok(gateway) = gw_str.parse::<Ipv6Addr>() else {
+                continue; // on-link (interface name, not a gateway)
+            };
+            let interface = toks[4].to_string();
+            if best.as_ref().is_none_or(|(m, _)| metric < *m) {
+                best = Some((metric, OrigDefaultRoute6 { gateway, interface }));
+            }
+        }
+        best.map(|(_, r)| r)
+    }
+
     #[cfg(test)]
     mod tests {
         #[test]
@@ -879,6 +1101,46 @@ No       Manual    256  255.255.255.255/32          1  Loopback Pseudo-Interface
             assert_eq!(r.interface, "12");
             // No default route present.
             assert!(parse_windows_default_route("").is_none());
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn linux_default_route_v6_lowest_metric_skips_overlay() {
+            use super::parse_linux_default_route_v6;
+            use std::net::Ipv6Addr;
+            // Lowest metric wins; a link-local gateway is accepted.
+            let out = "default via fe80::1 dev eth0 proto ra metric 1024 pref medium\n\
+                       default via 2a01:4f8::1 dev eth0 metric 100\n";
+            let r = parse_linux_default_route_v6(out).unwrap();
+            assert_eq!(r.gateway, "2a01:4f8::1".parse::<Ipv6Addr>().unwrap());
+            assert_eq!(r.interface, "eth0");
+            // A default via our own overlay NIC is ignored.
+            let out2 = "default via fe80::a dev roomler0 metric 1\n\
+                        default via fe80::1 dev eth0 metric 100\n";
+            assert_eq!(
+                parse_linux_default_route_v6(out2).unwrap().interface,
+                "eth0"
+            );
+            // None present.
+            assert!(parse_linux_default_route_v6("").is_none());
+            assert!(parse_linux_default_route_v6("2001:db8::/64 dev eth0\n").is_none());
+        }
+
+        #[cfg(target_os = "windows")]
+        #[test]
+        fn windows_default_route_v6_skips_headers_and_onlink() {
+            use super::parse_windows_default_route_v6;
+            use std::net::Ipv6Addr;
+            let out = "\
+Publish  Type      Met  Prefix                    Idx  Gateway/Interface Name\r\n\
+-------  --------  ---  ------------------------  ---  ------------------------\r\n\
+No       Manual      0  ::/0                        12  fe80::1\r\n\
+No       Manual    256  ::/0                         5  2a01:4f8::1\r\n\
+No       Manual    256  fe80::/64                    1  Loopback Pseudo-Interface 1\r\n";
+            let r = parse_windows_default_route_v6(out).unwrap();
+            assert_eq!(r.gateway, "fe80::1".parse::<Ipv6Addr>().unwrap());
+            assert_eq!(r.interface, "12");
+            assert!(parse_windows_default_route_v6("").is_none());
         }
     }
 }
