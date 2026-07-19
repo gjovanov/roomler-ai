@@ -132,5 +132,10 @@ them — is exactly the harness autonomous AI agents need:
   model, security, latency budget.
 - [`tunnel-install.md`](tunnel-install.md) — step-by-step tunnel install, enrollment, and
   corporate-network testing guide.
+- [`overlay-exit-nodes.md`](overlay-exit-nodes.md) — Tailscale-style exit nodes: route a
+  client's whole internet egress (v4+v6) through a mesh peer, with the self-wedge safety
+  model, DNS-leak steering, and crash-safety.
+- [`overlay-wfp.md`](overlay-wfp.md) — Windows-only: how the overlay survives a
+  Group-Policy-locked Defender Firewall via the Windows Filtering Platform.
 - [`architecture.md`](architecture.md) — the wider Roomler platform (chat, conferencing,
   rooms) that agent and tunnel plug into.
