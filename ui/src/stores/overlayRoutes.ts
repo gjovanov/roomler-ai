@@ -10,6 +10,10 @@ export interface OverlayNode {
   kind: 'agent' | 'tunnel_client'
   advertised_routes: string[]
   approved_routes: string[]
+  // P5 — admin has designated this node as an exit node (routes 0.0.0.0/0).
+  is_exit_node: boolean
+  // P5 — node advertised 0.0.0.0/0, so it's eligible to be toggled on.
+  can_be_exit_node: boolean
   online: boolean
   last_seen_at: string
 }
@@ -77,6 +81,22 @@ export const useOverlayRoutesStore = defineStore('overlayRoutes', () => {
     return updated
   }
 
+  // P5 — designate (or un-designate) a node as an exit node. The server adds/
+  // removes 0.0.0.0/0 in approved_routes and re-fans peers.
+  async function setExitNode(
+    tenantId: string,
+    nodeId: string,
+    enabled: boolean,
+  ): Promise<OverlayNode> {
+    const updated = await api.put<OverlayNode>(
+      `/tenant/${tenantId}/overlay-node/${nodeId}/exit-node`,
+      { enabled },
+    )
+    const idx = nodes.value.findIndex((n) => n.id === nodeId)
+    if (idx >= 0) nodes.value[idx] = updated
+    return updated
+  }
+
   async function fetchMagicDns(tenantId: string): Promise<MagicDnsSettings> {
     return await api.get<MagicDnsSettings>(`/tenant/${tenantId}/magic-dns`)
   }
@@ -97,6 +117,7 @@ export const useOverlayRoutesStore = defineStore('overlayRoutes', () => {
     error,
     fetchNodes,
     setApprovedRoutes,
+    setExitNode,
     fetchMagicDns,
     saveMagicDns,
   }

@@ -44,7 +44,7 @@
         v-else-if="advertisingNodes.length === 0"
         class="text-medium-emphasis"
       >
-        No node is advertising subnet routes yet.
+        No node is advertising subnet routes or offering to be an exit node yet.
       </p>
 
       <v-table v-else density="compact">
@@ -53,6 +53,7 @@
             <th>Node</th>
             <th>Overlay IP</th>
             <th>Advertised routes</th>
+            <th>Exit node</th>
             <th class="text-right">Actions</th>
           </tr>
         </thead>
@@ -79,6 +80,12 @@
               </div>
             </td>
             <td>
+              <span
+                v-if="n.advertised_routes.length === 0"
+                class="text-caption text-medium-emphasis"
+              >
+                —
+              </span>
               <v-checkbox
                 v-for="cidr in n.advertised_routes"
                 :key="cidr"
@@ -88,6 +95,24 @@
                 hide-details
                 @update:model-value="(v) => toggle(n.id, cidr, v)"
               />
+            </td>
+            <td>
+              <v-switch
+                :model-value="n.is_exit_node"
+                :disabled="!n.can_be_exit_node || exitSaving === n.id"
+                :loading="exitSaving === n.id"
+                color="warning"
+                density="compact"
+                hide-details
+                :label="n.is_exit_node ? 'Exit node' : (n.can_be_exit_node ? 'Off' : 'n/a')"
+                @update:model-value="(v) => toggleExitNode(n, v)"
+              />
+              <div
+                v-if="!n.can_be_exit_node"
+                class="text-caption text-medium-emphasis"
+              >
+                set overlay_exit_node_enabled in its config
+              </div>
             </td>
             <td class="text-right">
               <v-btn
@@ -122,9 +147,15 @@ const store = useOverlayRoutesStore()
 // nodeId → editable Set of approved CIDRs (seeded from the server state).
 const draft = reactive<Record<string, Set<string>>>({})
 const saving = ref<string | null>(null)
+const exitSaving = ref<string | null>(null)
 
+// Show nodes advertising subnet routes OR eligible to be an exit node (a pure
+// exit node advertises only 0.0.0.0/0, which the server filters out of
+// advertised_routes — so key off can_be_exit_node too).
 const advertisingNodes = computed(() =>
-  store.nodes.filter((n) => n.advertised_routes.length > 0),
+  store.nodes.filter(
+    (n) => n.advertised_routes.length > 0 || n.can_be_exit_node,
+  ),
 )
 
 function seedDraft() {
@@ -157,6 +188,15 @@ async function save(n: OverlayNode) {
     )
   } finally {
     saving.value = null
+  }
+}
+
+async function toggleExitNode(n: OverlayNode, enabled: boolean | null) {
+  exitSaving.value = n.id
+  try {
+    await store.setExitNode(props.tenantId, n.id, enabled === true)
+  } finally {
+    exitSaving.value = null
   }
 }
 
