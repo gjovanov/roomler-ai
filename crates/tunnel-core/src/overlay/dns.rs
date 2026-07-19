@@ -64,10 +64,18 @@ pub fn parse_upstream(s: &str) -> Option<SocketAddr> {
 /// Serve until the socket errors (or the task is dropped). Best-effort: a bind
 /// failure (needs :53 privileges + the address on the NIC) logs and returns, so
 /// the overlay keeps working without DNS.
-pub async fn run(cfg: DnsConfig) {
+pub async fn run(cfg: DnsConfig, bound: tokio::sync::oneshot::Sender<bool>) {
     let sock = match UdpSocket::bind(cfg.bind).await {
-        Ok(s) => Arc::new(s),
+        Ok(s) => {
+            // P5 S4b — tell the runtime the resolver is actually listening, so it
+            // only steers the "." catch-all at this address when there IS a live
+            // resolver. Steering "." at a dead :53 would blackhole ALL DNS (worse
+            // than the leak we're closing), so the exit-DNS steer is gated on this.
+            let _ = bound.send(true);
+            Arc::new(s)
+        }
         Err(e) => {
+            let _ = bound.send(false);
             warn!(bind = %cfg.bind, %e, "magicdns: bind failed; resolver off");
             return;
         }
@@ -375,6 +383,185 @@ async fn run_cmd(args: Vec<String>) -> bool {
     })
     .await
     .unwrap_or(false)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// P5 S4b — exit-node DNS steering (catch-all "." → the exit's egress)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// While an exit node carries this host's default egress, steer the DEFAULT ("."
+// catch-all) DNS namespace so every non-overlay query resolves through the exit
+// (no DNS leak to the local ISP resolver). Two shapes, one goal:
+//   • MagicDNS ON  → point "." at the LOCAL resolver (`self_v4`). It already
+//     forwards non-overlay queries to `nameservers`; that forward is captured by
+//     the split-default → egresses via the exit → resolves from the exit's
+//     vantage. The P2 suffix rule stays intact (more specific → overlay names
+//     still resolve locally). Linux just ADDS `~.`; Windows adds a `.`-root rule.
+//   • MagicDNS OFF → no local resolver, so point "." DIRECTLY at `nameservers[0]`
+//     (or 1.1.1.1). The query to that public resolver is itself captured by the
+//     split-default and egresses via the exit. No overlay names to preserve.
+// systemd-resolved routes a public name to the BEST-MATCHING routing domain
+// (most labels); an explicit `~.` on roomler0 is a match, so it wins over the
+// physical link's `DefaultRoute=yes` (which is only the no-match fallback) — no
+// physical-link demotion needed.
+
+/// Windows NRPT rule comment tag marking OUR catch-all rule, so the crash/boot
+/// purge removes exactly it (never a foreign `.`-namespace rule, e.g. a corp
+/// VPN's). Also the idempotent-clear selector on (re)steer.
+#[cfg(target_os = "windows")]
+const EXIT_DNS_NRPT_TAG: &str = "roomler-exit-dns";
+
+/// Steer the default ("." catch-all) namespace at `target`. `magic_domain`:
+/// `Some` = MagicDNS on (keep the P2 suffix split, just add `~.`); `None` =
+/// MagicDNS off (point roomler0's own DNS at `target`). Best-effort — `false`
+/// when the OS tool is unavailable (surfaced via `dns_steered=false`). Reverted
+/// by [`unsteer_default_dns`] / [`purge_exit_dns`].
+#[cfg(target_os = "windows")]
+pub async fn steer_default_dns(target: Ipv4Addr, _magic_domain: Option<&str>) -> bool {
+    // Idempotent: drop any stale roomler catch-all (tag-scoped) then add ours.
+    // The `.`-root namespace is NRPT's catch-all; the P2 `.<domain>` rule is more
+    // specific and still wins for overlay names.
+    let _ = run_cmd(vec![
+        "powershell".into(),
+        "-NoProfile".into(),
+        "-Command".into(),
+        format!(
+            "Get-DnsClientNrptRule | Where-Object {{ $_.Comment -eq '{EXIT_DNS_NRPT_TAG}' }} | \
+             Remove-DnsClientNrptRule -Force -ErrorAction SilentlyContinue"
+        ),
+    ])
+    .await;
+    run_cmd(vec![
+        "powershell".into(),
+        "-NoProfile".into(),
+        "-Command".into(),
+        format!(
+            "Add-DnsClientNrptRule -Namespace '.' -NameServers '{target}' -Comment '{EXIT_DNS_NRPT_TAG}'"
+        ),
+    ])
+    .await
+}
+
+#[cfg(target_os = "linux")]
+pub async fn steer_default_dns(target: Ipv4Addr, magic_domain: Option<&str>) -> bool {
+    match magic_domain {
+        // MagicDNS on: roomler0's DNS is already `self_v4` (== target) from the P2
+        // suffix config. ADD `~.` so ALL names route to the local resolver (an
+        // explicit `~.` is the best-match routing domain, beating the physical
+        // link's DefaultRoute), while `~<domain>` keeps winning for overlay names.
+        Some(domain) => {
+            run_cmd(vec![
+                "resolvectl".into(),
+                "domain".into(),
+                DNS_IF_NAME.into(),
+                format!("~{domain}"),
+                "~.".into(),
+            ])
+            .await
+        }
+        // MagicDNS off: no local resolver. Point roomler0's own DNS at the public
+        // upstream and make it the default route; the query to `target` is
+        // captured by the split-default and egresses via the exit.
+        None => {
+            let a = run_cmd(vec![
+                "resolvectl".into(),
+                "dns".into(),
+                DNS_IF_NAME.into(),
+                target.to_string(),
+            ])
+            .await;
+            let b = run_cmd(vec![
+                "resolvectl".into(),
+                "domain".into(),
+                DNS_IF_NAME.into(),
+                "~.".into(),
+            ])
+            .await;
+            a && b
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+pub async fn steer_default_dns(_target: Ipv4Addr, _magic_domain: Option<&str>) -> bool {
+    false
+}
+
+/// Revert [`steer_default_dns`]. `magic_domain` `Some` restores the P2 suffix-only
+/// routing domain (drops `~.`); `None` reverts the link entirely (no P2 config to
+/// preserve). Windows removes the tagged catch-all rule. Best-effort.
+#[cfg(target_os = "windows")]
+pub async fn unsteer_default_dns(_magic_domain: Option<&str>) -> bool {
+    run_cmd(vec![
+        "powershell".into(),
+        "-NoProfile".into(),
+        "-Command".into(),
+        format!(
+            "Get-DnsClientNrptRule | Where-Object {{ $_.Comment -eq '{EXIT_DNS_NRPT_TAG}' }} | \
+             Remove-DnsClientNrptRule -Force -ErrorAction SilentlyContinue"
+        ),
+    ])
+    .await
+}
+
+#[cfg(target_os = "linux")]
+pub async fn unsteer_default_dns(magic_domain: Option<&str>) -> bool {
+    match magic_domain {
+        Some(domain) => {
+            run_cmd(vec![
+                "resolvectl".into(),
+                "domain".into(),
+                DNS_IF_NAME.into(),
+                format!("~{domain}"),
+            ])
+            .await
+        }
+        None => {
+            run_cmd(vec![
+                "resolvectl".into(),
+                "revert".into(),
+                DNS_IF_NAME.into(),
+            ])
+            .await
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+pub async fn unsteer_default_dns(_magic_domain: Option<&str>) -> bool {
+    false
+}
+
+/// P5 S4b crash-safety (A2) — synchronously drop the exit-node catch-all steer.
+/// Windows: the `.`-root NRPT rule is machine-global and PERSISTS across a crash
+/// / reboot, so a stale rule pointing at a dead resolver would blackhole ALL DNS
+/// until removed — this is the load-bearing path. Linux: the roomler0 link config
+/// is link-scoped and dies with the interface, so `resolvectl revert roomler0` is
+/// mostly belt (a harmless no-op when roomler0 is already gone; the P2 suffix
+/// config re-applies when the resolver next comes up). Called from the crate-root
+/// `purge_exit_routes` at every pre-`process::exit` site AND at boot. Context-free
+/// (no `self_v4`/domain in hand) — hence the blanket revert on Linux. No-op off
+/// Windows/Linux.
+pub fn purge_exit_dns() {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!(
+                    "Get-DnsClientNrptRule | Where-Object {{ $_.Comment -eq '{EXIT_DNS_NRPT_TAG}' }} | \
+                     Remove-DnsClientNrptRule -Force -ErrorAction SilentlyContinue"
+                ),
+            ])
+            .output();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("resolvectl")
+            .args(["revert", DNS_IF_NAME])
+            .output();
+    }
 }
 
 #[cfg(test)]

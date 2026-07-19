@@ -576,6 +576,12 @@ impl WgDevice {
             if let (Some(src), Some(demux)) = (p.direct_src, &self.direct) {
                 demux.routes.lock().await.remove(&src);
             }
+            // P5/S3b — if this was the global-v6 exit peer, stop routing v6 to a
+            // now-dead pubkey (defensive; the reconcile re-asserts on its next
+            // pass if the peer is still the valid, reachable exit).
+            if self.router.v6_exit() == Some(*peer_public) {
+                self.router.set_v6_exit(None);
+            }
         }
     }
 
@@ -586,22 +592,45 @@ impl WgDevice {
         self.router.set_subnets(peer_public, subnets);
     }
 
+    /// P5/S3b exit-node — route this node's GLOBAL IPv6 egress through `pubkey`
+    /// (or `None` to clear → global v6 drops fail-closed). Set by the exit-routing
+    /// reconcile once the v6 carrier exemptions are pinned.
+    pub fn set_v6_exit(&mut self, pubkey: Option<[u8; 32]>) {
+        self.router.set_v6_exit(pubkey);
+    }
+
+    /// The current global-v6 exit peer's pubkey, if any — lets the reconcile
+    /// re-assert it (idempotent) after a `remove_peer` may have cleared it.
+    pub fn v6_exit(&self) -> Option<[u8; 32]> {
+        self.router.v6_exit()
+    }
+
     /// Number of installed peers.
     pub fn peer_count(&self) -> usize {
         self.peers.len()
     }
 
-    /// Encapsulate + send a raw IP packet (v4, or a derived-ULA v6 — see
-    /// [`Router::dst_of_ip_packet`]) to whichever peer owns its destination
-    /// overlay address. `false` if no route or no session.
+    /// Encapsulate + send a raw IP packet to whichever peer owns its destination.
+    /// v4 (or an overlay-internal derived-ULA v6 — see
+    /// [`Router::dst_of_ip_packet`]) routes on the v4 table. P5/S3b — a GLOBAL v6
+    /// destination ([`Router::is_global_v6_dst`]) routes to the configured
+    /// [`v6_exit`](Self::v6_exit) peer if set, else is dropped (fail-closed, no
+    /// leak). `false` if no route or no session.
     pub async fn send_ip_packet(&self, packet: &[u8]) -> bool {
-        let Some(dst) = Router::dst_of_ip_packet(packet) else {
-            return false;
-        };
-        let Some(pubkey) = self.router.route(&dst) else {
-            return false;
-        };
-        self.send_to_peer(&pubkey, packet).await
+        // v4 or an overlay-internal derived-ULA v6 → the v4 routing table.
+        if let Some(dst) = Router::dst_of_ip_packet(packet) {
+            let Some(pubkey) = self.router.route(&dst) else {
+                return false;
+            };
+            return self.send_to_peer(&pubkey, packet).await;
+        }
+        // A global (non-overlay) v6 destination → the v6 exit peer, if any.
+        if Router::is_global_v6_dst(packet).is_some()
+            && let Some(pubkey) = self.router.v6_exit()
+        {
+            return self.send_to_peer(&pubkey, packet).await;
+        }
+        false
     }
 
     /// Encapsulate + send `packet` to a specific peer. `false` if the

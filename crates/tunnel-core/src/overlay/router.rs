@@ -35,6 +35,14 @@ const OVERLAY_ULA_HEXTETS: [u16; 6] = [0xfd72, 0x6f6f, 0x6d6c, 0, 0, 0];
 /// peer traffic.
 pub const OVERLAY_V6_ONLINK_PREFIX: u8 = 96;
 
+/// P5 exit-node (S3b) — the overlay's IPv6 ULA as a CIDR string, used as the
+/// SOURCE scope for the exit node's v6 MASQUERADE (`ip6tables -t nat POSTROUTING
+/// -s <this> -j MASQUERADE`). Scoped to the derived-v6 `/96` (NOT the `/48` ULA
+/// block) so it exactly matches the on-link prefix every overlay node's derived
+/// v6 falls in ([`derive_overlay_v6`]) and can't over-broadly masquerade a
+/// co-located non-overlay ULA (Docker/WSL2/another VPN).
+pub const OVERLAY_ULA_V6_CIDR: &str = "fd72:6f6f:6d6c::/96";
+
 /// Derive a node's overlay IPv6 from its overlay IPv4: embed the 32-bit v4 in
 /// the low 32 bits of Roomler's ULA `/96` (`fd72:6f6f:6d6c::<v4>`). Deterministic
 /// and reversible ([`embedded_v4_of_overlay_v6`]), so a node self-derives its
@@ -104,6 +112,18 @@ impl Cidr {
     pub fn contains(&self, ip: Ipv4Addr) -> bool {
         (u32::from(ip) & Self::mask(self.prefix)) == self.base
     }
+
+    /// True for a **default route** — the `0.0.0.0/0` default OR either half of
+    /// the split-default (`0.0.0.0/1`, `128.0.0.0/1`). Any prefix ≤ 1 is exactly
+    /// one of these three (a `/1` masks to base `0` or `0x8000_0000`), and none
+    /// is ever a legitimate LAN subnet worth routing per-peer. The client-side
+    /// subnet-install path (P5/A1) drops these so an admin-approved exit-node
+    /// `0.0.0.0/0` never auto-installs a default route on every peer; opt-in
+    /// exit-node routing installs the split-default via a separate,
+    /// exemption-aware path.
+    pub fn is_default_route(&self) -> bool {
+        self.prefix <= 1
+    }
 }
 
 impl std::fmt::Display for Cidr {
@@ -121,6 +141,13 @@ impl std::fmt::Display for Cidr {
 pub struct Router {
     by_ip: HashMap<Ipv4Addr, [u8; 32]>,
     subnets: Vec<(Cidr, [u8; 32])>,
+    /// P5 exit-node (S3b) — when set, the pubkey of the peer that carries this
+    /// node's GLOBAL IPv6 egress. Any global-unicast v6 destination (that isn't
+    /// an overlay-internal derived ULA) encapsulates to it. `None` (default) =
+    /// global v6 is dropped ([`WgDevice::send_ip_packet`]) — the fail-closed
+    /// stance. A single Option rather than a v6 subnet table because P5 is
+    /// single-exit / all-global-v6-to-one-peer.
+    v6_exit: Option<[u8; 32]>,
 }
 
 impl Router {
@@ -137,6 +164,17 @@ impl Router {
     pub fn set_subnets(&mut self, pubkey: [u8; 32], cidrs: &[Cidr]) {
         self.subnets.retain(|(_, pk)| *pk != pubkey);
         self.subnets.extend(cidrs.iter().map(|c| (*c, pubkey)));
+    }
+
+    /// P5 exit-node (S3b) — set (or clear) the peer that carries this node's
+    /// global IPv6 egress. `None` restores the fail-closed drop of global v6.
+    pub fn set_v6_exit(&mut self, pubkey: Option<[u8; 32]>) {
+        self.v6_exit = pubkey;
+    }
+
+    /// The current global-v6 exit peer's pubkey, if any.
+    pub fn v6_exit(&self) -> Option<[u8; 32]> {
+        self.v6_exit
     }
 
     /// Drop the `/32` route for `ip` AND any subnet routes owned by the same
@@ -182,6 +220,24 @@ impl Router {
             }
             _ => None,
         }
+    }
+
+    /// P5 exit-node (S3b) — the GLOBAL-UNICAST IPv6 destination of a raw IP
+    /// packet, or `None` if it isn't one. "Global unicast" = `2000::/3`
+    /// (`seg0 & 0xe000 == 0x2000`), which by construction EXCLUDES our overlay
+    /// ULA (`fc00::/7`), any other ULA, link-local (`fe80::/10`), multicast
+    /// (`ff00::/8`), loopback, unspecified, and v4-mapped (`::ffff:0:0/96`). Only
+    /// such a global dst is routed to the [`v6_exit`](Self::v6_exit) peer; every
+    /// other non-overlay v6 is dropped fail-closed by the caller. Overlay-internal
+    /// (derived-ULA) v6 never reaches here — [`dst_of_ip_packet`](Self::dst_of_ip_packet)
+    /// resolves it to v4 first. Pure, so the classification is unit-tested directly.
+    pub fn is_global_v6_dst(packet: &[u8]) -> Option<Ipv6Addr> {
+        if packet.first()? >> 4 != 6 || packet.len() < 40 {
+            return None;
+        }
+        let dst = Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).ok()?);
+        // 2000::/3 — the IANA global-unicast range.
+        (dst.segments()[0] & 0xe000 == 0x2000).then_some(dst)
     }
 }
 
@@ -241,6 +297,20 @@ mod tests {
     }
 
     #[test]
+    fn is_default_route_catches_default_and_split_halves() {
+        // The /0 default and both split-default /1 halves.
+        assert!(Cidr::parse("0.0.0.0/0").unwrap().is_default_route());
+        assert!(Cidr::parse("0.0.0.0/1").unwrap().is_default_route());
+        assert!(Cidr::parse("128.0.0.0/1").unwrap().is_default_route());
+        // Host bits in the input still canonicalize to a /1 half.
+        assert!(Cidr::parse("200.1.2.3/1").unwrap().is_default_route());
+        // Real LAN subnets are NOT default routes.
+        assert!(!Cidr::parse("192.168.1.0/24").unwrap().is_default_route());
+        assert!(!Cidr::parse("10.0.0.0/8").unwrap().is_default_route());
+        assert!(!Cidr::parse("0.0.0.0/2").unwrap().is_default_route());
+    }
+
+    #[test]
     fn dst_of_ip_packet_reads_v4_header() {
         // Minimal IPv4 header: version/IHL=0x45, then 12 bytes, then
         // src (4) at offset 12, dst (4) at offset 16.
@@ -292,5 +362,41 @@ mod tests {
 
         // A truncated v6 header rejects.
         assert_eq!(Router::dst_of_ip_packet(&[0x60; 39]), None);
+    }
+
+    #[test]
+    fn is_global_v6_dst_only_matches_global_unicast() {
+        fn v6_pkt(dst: &str) -> [u8; 40] {
+            let mut p = [0u8; 40];
+            p[0] = 0x60;
+            p[24..40].copy_from_slice(&dst.parse::<Ipv6Addr>().unwrap().octets());
+            p
+        }
+        // Global unicast 2000::/3 → routed to the exit.
+        assert!(Router::is_global_v6_dst(&v6_pkt("2606:4700::1111")).is_some());
+        assert!(Router::is_global_v6_dst(&v6_pkt("2001:db8::1")).is_some());
+        assert!(Router::is_global_v6_dst(&v6_pkt("2002::1")).is_some()); // 6to4
+        // Overlay ULA, other ULA, link-local, multicast, loopback → dropped
+        // fail-closed (NOT sent to the exit).
+        assert!(Router::is_global_v6_dst(&v6_pkt("fd72:6f6f:6d6c::6440:1")).is_none());
+        assert!(Router::is_global_v6_dst(&v6_pkt("fd00::1")).is_none());
+        assert!(Router::is_global_v6_dst(&v6_pkt("fe80::1")).is_none());
+        assert!(Router::is_global_v6_dst(&v6_pkt("ff02::1")).is_none());
+        assert!(Router::is_global_v6_dst(&v6_pkt("::1")).is_none());
+        // A v4 packet, or a truncated v6 header → None.
+        let mut v4 = [0u8; 40];
+        v4[0] = 0x45;
+        assert!(Router::is_global_v6_dst(&v4).is_none());
+        assert!(Router::is_global_v6_dst(&[0x60u8; 39]).is_none());
+    }
+
+    #[test]
+    fn v6_exit_set_and_clear() {
+        let mut r = Router::new();
+        assert!(r.v6_exit().is_none());
+        r.set_v6_exit(Some([7u8; 32]));
+        assert_eq!(r.v6_exit(), Some([7u8; 32]));
+        r.set_v6_exit(None);
+        assert!(r.v6_exit().is_none());
     }
 }
