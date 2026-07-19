@@ -410,6 +410,31 @@ fn print_status(s: &NodeStatus) {
             "disconnected"
         }
     );
+    // P5/S4 — exit-node routing (only when this node is configured as a client).
+    // S3b — when active, also report whether global IPv6 rides the exit or is
+    // fail-closed (Windows exit / no v6 uplink). S4b — and whether DNS is steered
+    // through the exit (NOT steered = a DNS leak the operator should see).
+    if let Some(ex) = &s.exit_node {
+        let state = if ex.active {
+            let v6 = if ex.v6_active {
+                "v6 on"
+            } else {
+                "v6 fail-closed"
+            };
+            let dns = if ex.dns_steered {
+                "DNS steered"
+            } else {
+                "DNS NOT steered"
+            };
+            format!("active, {v6}, {dns}")
+        } else {
+            format!(
+                "withheld — {}",
+                ex.withheld_reason.as_deref().unwrap_or("not ready")
+            )
+        };
+        println!("  exit node   {} ({state})", ex.selector);
+    }
 }
 
 fn print_peers(peers: &[PeerInfo], now_ms: u64) {

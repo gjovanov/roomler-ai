@@ -42,7 +42,7 @@ const OVERLAY_MTU: u16 = 1280;
 /// the channel its control events arrive on. `None` when overlay is
 /// disabled or the node has no persisted WG key (generated at startup in
 /// `main`, so a missing one here means a misconfiguration).
-pub fn maybe_start(
+pub async fn maybe_start(
     cfg: &AgentConfig,
     outbound: mpsc::Sender<ClientMsg>,
     peer_view: watch::Sender<OverlayView>,
@@ -72,9 +72,22 @@ pub fn maybe_start(
         Some(port) => netstack_tun_factory(port, peer_view.subscribe())?,
         None => systun_tun_factory()?,
     };
+    // P5 exit-node client — resolve the coordination server's IPs NOW, while the
+    // uplink is still clean (before any split-default is installed), so exit
+    // routing can exempt them. Only when this node opts into an exit node.
+    let exit_server_ips = if cfg.overlay_exit_node.is_some() {
+        resolve_server_ips(&cfg.server_url).await
+    } else {
+        Vec::new()
+    };
+
     let rt = OverlayRuntime::new_relay(keypair, outbound, tun_factory, OVERLAY_MTU)
         // Phase 1 — advertise this node's subnet routes (admin-gated server-side).
-        .with_advertised_routes(cfg.overlay_advertised_routes.clone())
+        // P5 — plus `0.0.0.0/0` when this node is configured as an exit node.
+        .with_advertised_routes(cfg.effective_overlay_advertised_routes())
+        // P5 — route THIS node's default egress through a chosen exit peer (with
+        // carrier-endpoint exemptions), when `overlay_exit_node` is set.
+        .with_exit_node(cfg.overlay_exit_node.clone(), exit_server_ips)
         // Unification P1 — publish the live mesh view for the LocalAPI so
         // `roomler status` / `peers` see per-device connection types.
         .with_peer_view(peer_view);
@@ -83,6 +96,64 @@ pub fn maybe_start(
     tokio::spawn(rt.run(evt_rx, Vec::new()));
     info!("overlay: node runtime started (relay mode)");
     Some(evt_tx)
+}
+
+/// Resolve the coordination server's host (from `server_url`) to its current
+/// IPs. Exit-node routing exempts these from the split-default, and they MUST be
+/// resolved BEFORE any `0.0.0.0/1` is installed — once the default is captured,
+/// DNS to a remote resolver may itself be swallowed. Best-effort + timeout-bound:
+/// an empty result just means the runtime's exemption gate withholds default
+/// routing (fail-safe — never a wedge). roomler.ai sits behind nginx/HAProxy and
+/// may be multi-A, so every returned address is exempted.
+async fn resolve_server_ips(server_url: &str) -> Vec<std::net::IpAddr> {
+    use std::collections::HashSet;
+    use std::net::IpAddr;
+    use std::time::Duration;
+
+    // Host out of `scheme://host[:port][/path]` (server_url is never a v6 literal).
+    let authority = server_url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(server_url)
+        .split('/')
+        .next()
+        .unwrap_or("");
+    let host = authority
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(authority)
+        .trim();
+    if host.is_empty() {
+        return Vec::new();
+    }
+    match tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::lookup_host((host, 443u16)),
+    )
+    .await
+    {
+        Ok(Ok(addrs)) => {
+            let ips: Vec<IpAddr> = addrs
+                .map(|s| s.ip())
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+            info!(
+                %host,
+                count = ips.len(),
+                "overlay exit-node: resolved coordination-server IPs for carrier exemption"
+            );
+            ips
+        }
+        Ok(Err(e)) => {
+            warn!(%host, %e, "overlay exit-node: coordination-server DNS resolve failed; exit routing withholds until exemptions are known");
+            Vec::new()
+        }
+        Err(_) => {
+            warn!(%host, "overlay exit-node: coordination-server DNS resolve timed out; exit routing withholds");
+            Vec::new()
+        }
+    }
 }
 
 /// The loopback SOCKS5 port for **netstack mode**, from

@@ -1,6 +1,6 @@
 use bson::{DateTime, doc, oid::ObjectId};
 use mongodb::Database;
-use roomler_ai_remote_control::models::{AgentStatus, NodeRef, OverlayNode};
+use roomler_ai_remote_control::models::{AgentStatus, DEFAULT_ROUTE_V4, NodeRef, OverlayNode};
 
 use super::base::{BaseDao, DaoResult};
 
@@ -69,6 +69,8 @@ impl OverlayNodeDao {
             // admin acts, so a fresh node routes for no one.
             advertised_routes,
             approved_routes: Vec::new(),
+            // P5 — never an exit node until an admin toggles it on.
+            is_exit_node: false,
             status: AgentStatus::Online,
             last_seen_at: now,
             created_at: now,
@@ -188,6 +190,37 @@ impl OverlayNodeDao {
                 node_id,
                 doc! { "$set": {
                     "approved_routes": approved_routes,
+                    "updated_at": DateTime::now(),
+                } },
+            )
+            .await?;
+        self.base.find_by_id(node_id).await
+    }
+
+    /// P5 — designate (or un-designate) a node as an exit node. Sets the
+    /// `is_exit_node` flag AND adds/removes `0.0.0.0/0` in `approved_routes`
+    /// (the data-plane signal). The caller verifies tenant ownership and, when
+    /// enabling, that the node advertised `0.0.0.0/0`. This is the ONLY path
+    /// that puts a `/0` into `approved_routes` — the per-CIDR
+    /// [`Self::set_approved_routes`] rejects it.
+    pub async fn set_exit_node(&self, node_id: ObjectId, enabled: bool) -> DaoResult<OverlayNode> {
+        // Read-modify-write the approved list so we preserve any subnet CIDRs
+        // the node also routes while flipping just the default route.
+        let node = self.base.find_by_id(node_id).await?;
+        let mut approved: Vec<String> = node
+            .approved_routes
+            .into_iter()
+            .filter(|r| r != DEFAULT_ROUTE_V4)
+            .collect();
+        if enabled {
+            approved.push(DEFAULT_ROUTE_V4.to_string());
+        }
+        self.base
+            .update_by_id(
+                node_id,
+                doc! { "$set": {
+                    "is_exit_node": enabled,
+                    "approved_routes": &approved,
                     "updated_at": DateTime::now(),
                 } },
             )

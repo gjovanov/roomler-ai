@@ -1193,6 +1193,15 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         }
     }
 
+    // P5 exit-node crash-safety (A2) — boot-time stale-route reconciler. Purge
+    // any split-default (`/1`) route a PRIOR run left on the overlay NIC after a
+    // crash / kill / unclean reboot, BEFORE the overlay runtime can (re)install a
+    // fresh one. Runs regardless of `overlay_enabled` so a host whose exit
+    // routing was active when it died — then had overlay disabled — is still
+    // healed (else a persisted Windows Wintun `/1` blackholes egress to a dead
+    // NIC until reboot). No-op on non-`overlay-l3` builds.
+    roomler_agent::purge_exit_routes();
+
     let encoder_preference = resolve_encoder_preference(cli_encoder, cfg.encoder_preference);
 
     // Wire the file-DC v2 `files:dir` browse capability. Default
@@ -2027,6 +2036,10 @@ async fn self_update_cmd(check_only: bool) -> Result<()> {
             // the field-test host on 2026-05-10.
             updater::spawn_installer_with_watch(&installer_path, Some(&latest))
                 .context("spawning installer")?;
+            // P5/A2 — this process::exit bypasses RAII; drop any exit-node
+            // split-default so the update window can't blackhole egress (the new
+            // binary's boot reconciler heals it too, but close the gap now).
+            roomler_agent::purge_exit_routes();
             std::process::exit(0);
         }
         updater::CheckOutcome::Skipped(reason) => {

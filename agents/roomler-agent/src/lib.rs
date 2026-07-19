@@ -56,3 +56,29 @@ pub mod win32_monitors;
 pub mod win_service;
 #[cfg(target_os = "windows")]
 pub mod win_timer;
+
+/// P5 exit-node crash-safety (A2) — synchronously purge any leftover
+/// split-default routes from the overlay NIC. Called at agent startup (the
+/// boot-time reconciler: heal a `/1` a crash / kill / unclean reboot left
+/// behind) AND immediately before each `std::process::exit` that bypasses the
+/// runtime's RAII teardown (watchdog stall, self-update, agent-deleted) — those
+/// paths run NO destructors, so without this a Windows host keeps a stale
+/// `0.0.0.0/1` pointed at a dead Wintun adapter and blackholes all egress until
+/// reboot.
+///
+/// Lives at the crate root (always compiled) so the exit paths in `watchdog` /
+/// `signaling` / `main` can call it WITHOUT an overlay-feature gate — the
+/// `overlay` module itself is `cfg`-gated. No-op unless this is an `overlay-l3`
+/// build (only the OS-TUN surface installs OS routes; the userspace netstack has
+/// none). Best-effort + scoped to the roomler NIC.
+pub fn purge_exit_routes() {
+    #[cfg(feature = "overlay-l3")]
+    {
+        tunnel_core::overlay::tun::purge_split_default();
+        // S4b — also drop any leftover exit-node DNS steer. On Windows the `.`-root
+        // NRPT rule is machine-global and PERSISTS across a crash/reboot, so a stale
+        // rule pointing at a dead resolver would blackhole ALL DNS until removed —
+        // this boot/pre-exit purge is the load-bearing cleanup for it.
+        tunnel_core::overlay::dns::purge_exit_dns();
+    }
+}

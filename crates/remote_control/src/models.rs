@@ -822,8 +822,23 @@ pub struct OverlayNode {
     /// Phase 1 — the admin-APPROVED subset of `advertised_routes`, distributed
     /// to peers as the netmap `routes`. Empty = this node routes nothing for
     /// anyone. An admin manages this via the overlay-route approval UI.
+    ///
+    /// P5: a default route `0.0.0.0/0` here marks this node as an approved
+    /// exit node (clients infer exit-nodes from an approved `/0` in the
+    /// netmap). `/0` may ONLY enter this list via the exit-node toggle
+    /// (`set_exit_node`), never the per-CIDR approval grid — see
+    /// `set_approved_routes`'s `/0` guard — so an admin can't accidentally
+    /// route the whole internet with a mis-clicked checkbox.
     #[serde(default)]
     pub approved_routes: Vec<String>,
+    /// P5 — admin has designated this node as an exit node (routes
+    /// `0.0.0.0/0` for opted-in clients). Kept as an explicit flag for the
+    /// admin UI + approval semantics; the DATA-PLANE signal a client keys
+    /// off is still the approved `0.0.0.0/0` in the netmap. Toggling this
+    /// on requires the node to have advertised `0.0.0.0/0` and adds it to
+    /// `approved_routes`; toggling off removes it.
+    #[serde(default)]
+    pub is_exit_node: bool,
     pub status: AgentStatus,
     pub last_seen_at: DateTime,
     pub created_at: DateTime,
@@ -834,6 +849,11 @@ pub struct OverlayNode {
 impl OverlayNode {
     pub const COLLECTION: &'static str = "overlay_nodes";
 }
+
+/// P5 — the IPv4 default route. Its presence in a node's `approved_routes`
+/// is the wire signal that the node is an approved exit node; it may only be
+/// added via the exit-node toggle, never the per-CIDR approval grid.
+pub const DEFAULT_ROUTE_V4: &str = "0.0.0.0/0";
 
 /// IPAM authority for one tenant's overlay. One row per tenant. The
 /// allocator hands out host numbers monotonically from `next_host`
