@@ -1333,6 +1333,28 @@ impl OverlayRuntime {
             Some((conn, dst)) => (conn.local_addr().ok(), Some(*dst)),
             None => (None, None),
         };
+        // rc.199 — mutual coturn permission bootstrap for EVERY relay carrier
+        // (raw, QUIC, or QUIC-fallback-to-raw). coturn only relays a peer's
+        // datagrams to this allocation once it holds a *permission* for that
+        // peer's relayed address, and a permission is opened by SENDING to it
+        // (the webrtc-rs `turn` client lazily CreatePermission's the dst on the
+        // first `send_to`). The relay carrier uses a single WG initiator (the
+        // lexicographically-smaller pubkey), so without this the RESPONDER never
+        // sends first → its allocation never opens a permission for the initiator
+        // → coturn silently drops the WG handshake INIT → HANDSHAKE(REKEY_TIMEOUT)
+        // forever. This is exactly why the cross-NAT relay never completed in the
+        // field (P5 exit-node bring-up 2026-07-19: relay LINK ready + peer
+        // installed, yet the handshake timed out for every peer); the DIRECT path
+        // always worked precisely because it needs no coturn permission. Both
+        // ends build a carrier and send this stray `\x00`, so BOTH permissions are
+        // open before the handshake. `quic_relay` already does its own `\x00`
+        // internally (wg.rs); this covers the raw + QUIC-fallback paths, which
+        // previously shipped WITHOUT it (the wg.rs relay tests only passed because
+        // they do the bootstrap by hand). The 1-byte datagram is below WG's
+        // minimum message size, so boringtun ignores it.
+        if let Some((conn, dst)) = &link.relay_parts {
+            let _ = conn.send_to(b"\x00", *dst).await;
+        }
         let carrier = if overlay_quic_enabled() && link.supports_quic && link.relay_parts.is_some()
         {
             let (conn, dst) = link.relay_parts.clone().unwrap();
