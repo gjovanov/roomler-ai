@@ -11,7 +11,7 @@ use axum::{
     extract::{Path, State},
 };
 use bson::oid::ObjectId;
-use roomler_ai_remote_control::models::{AgentStatus, NodeRef, OverlayNode};
+use roomler_ai_remote_control::models::{AgentStatus, DEFAULT_ROUTE_V4, NodeRef, OverlayNode};
 use serde::{Deserialize, Serialize};
 
 use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
@@ -27,12 +27,18 @@ pub struct OverlayNodeResponse {
     pub advertised_routes: Vec<String>,
     /// Admin-approved subset actually distributed to peers.
     pub approved_routes: Vec<String>,
+    /// P5 — admin has designated this node as an exit node.
+    pub is_exit_node: bool,
+    /// P5 — the node advertised `0.0.0.0/0`, so it's ELIGIBLE to be toggled
+    /// on as an exit node (the toggle is gated on this).
+    pub can_be_exit_node: bool,
     pub online: bool,
     pub last_seen_at: String,
 }
 
 impl From<OverlayNode> for OverlayNodeResponse {
     fn from(n: OverlayNode) -> Self {
+        let can_be_exit_node = n.advertised_routes.iter().any(|r| r == DEFAULT_ROUTE_V4);
         Self {
             id: n.id.map(|i| i.to_hex()).unwrap_or_default(),
             name: n.name,
@@ -42,8 +48,20 @@ impl From<OverlayNode> for OverlayNodeResponse {
                 NodeRef::TunnelClient { .. } => "tunnel_client",
             },
             online: matches!(n.status, AgentStatus::Online),
-            advertised_routes: n.advertised_routes,
-            approved_routes: n.approved_routes,
+            // Surface only the SUBNET routes in the per-CIDR grid — the `/0`
+            // default is managed by the exit-node toggle, not a checkbox.
+            advertised_routes: n
+                .advertised_routes
+                .into_iter()
+                .filter(|r| r != DEFAULT_ROUTE_V4)
+                .collect(),
+            approved_routes: n
+                .approved_routes
+                .into_iter()
+                .filter(|r| r != DEFAULT_ROUTE_V4)
+                .collect(),
+            is_exit_node: n.is_exit_node,
+            can_be_exit_node,
             last_seen_at: n.last_seen_at.try_to_rfc3339_string().unwrap_or_default(),
         }
     }
@@ -110,8 +128,18 @@ pub async fn set_approved_routes(
         .ok_or_else(|| ApiError::NotFound("overlay node not found".into()))?;
 
     // Only routes the node advertised may be approved (dedup, preserve order).
+    // P5: the `0.0.0.0/0` default route is REJECTED here — it may only be
+    // approved via the exit-node toggle (`set_exit_node`), so a mis-clicked
+    // checkbox can never route a client's whole internet through this node.
     let mut approved: Vec<String> = Vec::new();
     for r in &body.approved_routes {
+        if r == DEFAULT_ROUTE_V4 {
+            return Err(ApiError::BadRequest(
+                "the default route 0.0.0.0/0 is managed by the exit-node toggle, \
+                 not per-CIDR approval"
+                    .into(),
+            ));
+        }
         if !node.advertised_routes.contains(r) {
             return Err(ApiError::BadRequest(format!(
                 "route {r} is not advertised by this node"
@@ -121,12 +149,66 @@ pub async fn set_approved_routes(
             approved.push(r.clone());
         }
     }
+    // Preserve an existing exit-node `/0` approval across a subnet-route edit
+    // (the grid never carries `/0`, so a naive replace would drop it).
+    if node.is_exit_node {
+        approved.push(DEFAULT_ROUTE_V4.to_string());
+    }
 
     let updated = state
         .overlay_nodes
         .set_approved_routes(nid, &approved)
         .await?;
     // Push the change to peers now, not on their next join.
+    crate::ws::overlay::refan_node(&state, &updated).await;
+    Ok(Json(updated.into()))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetExitNodeRequest {
+    pub enabled: bool,
+}
+
+/// PUT /api/tenant/{tenant_id}/overlay-node/{node_id}/exit-node — designate (or
+/// un-designate) a node as an exit node (P5). Enabling requires the node to have
+/// advertised `0.0.0.0/0`; it sets `is_exit_node` and adds `/0` to the node's
+/// `approved_routes` (the data-plane signal). Re-fanned to peers immediately.
+pub async fn set_exit_node(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path((tenant_id, node_id)): Path<(String, String)>,
+    Json(body): Json<SetExitNodeRequest>,
+) -> Result<Json<OverlayNodeResponse>, ApiError> {
+    let tid = ObjectId::parse_str(&tenant_id)
+        .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
+    let nid = ObjectId::parse_str(&node_id)
+        .map_err(|_| ApiError::BadRequest("Invalid node_id".to_string()))?;
+    if !state.tenants.is_member(tid, auth.user_id).await? {
+        return Err(ApiError::Forbidden("Not a member".to_string()));
+    }
+    let network = state.overlay_networks.get_or_create(tid).await?;
+    let network_id = network
+        .id
+        .ok_or_else(|| ApiError::Internal("overlay network missing _id".into()))?;
+    let nodes = state
+        .overlay_nodes
+        .list_active_in_network(tid, network_id)
+        .await?;
+    let node = nodes
+        .into_iter()
+        .find(|n| n.id == Some(nid))
+        .ok_or_else(|| ApiError::NotFound("overlay node not found".into()))?;
+
+    // Gate: can only become an exit node if it actually advertised `0.0.0.0/0`.
+    if body.enabled && !node.advertised_routes.iter().any(|r| r == DEFAULT_ROUTE_V4) {
+        return Err(ApiError::BadRequest(
+            "node has not advertised 0.0.0.0/0 — enable exit-node mode in its \
+             config first (overlay_exit_node_enabled), then re-join"
+                .into(),
+        ));
+    }
+
+    let updated = state.overlay_nodes.set_exit_node(nid, body.enabled).await?;
     crate::ws::overlay::refan_node(&state, &updated).await;
     Ok(Json(updated.into()))
 }
