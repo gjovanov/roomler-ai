@@ -1037,6 +1037,145 @@ mod tests {
         assert_eq!(got_a, pkt_ba);
     }
 
+    /// A `RelayConn` that models **coturn's PERMISSION rule**: an allocation
+    /// only receives datagrams from a peer address it has previously SENT to
+    /// (coturn installs a permission on send, then drops inbound from any peer
+    /// it has no permission for). A plain [`UdpRelayConn`] can't reproduce the
+    /// cross-NAT relay deadlock because it has no such gate — this can.
+    struct PermissionedRelayConn {
+        sock: UdpSocket,
+        permitted: std::sync::Mutex<std::collections::HashSet<std::net::SocketAddr>>,
+    }
+    impl PermissionedRelayConn {
+        fn new(sock: UdpSocket) -> Self {
+            Self {
+                sock,
+                permitted: std::sync::Mutex::new(std::collections::HashSet::new()),
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl RelayConn for PermissionedRelayConn {
+        async fn send_to(&self, buf: &[u8], dst: std::net::SocketAddr) -> std::io::Result<usize> {
+            // Sending to a peer opens (permits) it — exactly coturn's
+            // CreatePermission-on-send behaviour.
+            self.permitted.lock().unwrap().insert(dst);
+            self.sock.send_to(buf, dst).await
+        }
+        async fn recv_from(
+            &self,
+            buf: &mut [u8],
+        ) -> std::io::Result<(usize, std::net::SocketAddr)> {
+            loop {
+                let (n, src) = self.sock.recv_from(buf).await?;
+                if self.permitted.lock().unwrap().contains(&src) {
+                    return Ok((n, src));
+                }
+                // Unpermitted peer → coturn drops it. Keep waiting.
+            }
+        }
+        fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+            self.sock.local_addr()
+        }
+    }
+
+    /// rc.199 regression — reproduces the cross-NAT relay deadlock and proves
+    /// the mutual permission bootstrap fixes it. With coturn's permission model
+    /// (`PermissionedRelayConn`) and a SINGLE WG initiator (the relay's rule),
+    /// the passive responder never sends first → never permits the initiator →
+    /// coturn drops the INIT → `HANDSHAKE(REKEY_TIMEOUT)` forever. `install_ready`
+    /// now sends a stray `\x00` from BOTH ends before the handshake; here we
+    /// prove (1) it deadlocks WITHOUT the bootstrap and (2) completes WITH it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn relay_wg_deadlocks_without_permission_bootstrap_and_works_with_it() {
+        // ── (1) WITHOUT the bootstrap: single initiator deadlocks. ──
+        {
+            let a = WgKeypair::generate();
+            let b = WgKeypair::generate();
+            let sock_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let sock_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr_a = sock_a.local_addr().unwrap();
+            let addr_b = sock_b.local_addr().unwrap();
+            let conn_a: Arc<dyn RelayConn> = Arc::new(PermissionedRelayConn::new(sock_a));
+            let conn_b: Arc<dyn RelayConn> = Arc::new(PermissionedRelayConn::new(sock_b));
+            let a_init = a.public.to_bytes() < b.public.to_bytes();
+            let (mut dev_a, _rx_a) = WgDevice::new(a.secret.clone());
+            let (mut dev_b, _rx_b) = WgDevice::new(b.secret.clone());
+            // Single initiator (the smaller pubkey), exactly like install_ready.
+            dev_a.add_peer(
+                b.public.to_bytes(),
+                IP_B,
+                Carrier::relay(conn_a, addr_b),
+                a_init,
+            );
+            dev_b.add_peer(
+                a.public.to_bytes(),
+                IP_A,
+                Carrier::relay(conn_b, addr_a),
+                !a_init,
+            );
+            let initiator = if a_init { &dev_a } else { &dev_b };
+            let peer = if a_init {
+                b.public.to_bytes()
+            } else {
+                a.public.to_bytes()
+            };
+            // Must NOT connect: the responder's allocation never permits the
+            // initiator, so coturn drops every INIT.
+            let connected =
+                tokio::time::timeout(Duration::from_secs(3), wait_connected(initiator, &peer))
+                    .await
+                    .is_ok();
+            assert!(
+                !connected,
+                "single-initiator relay must DEADLOCK without the permission bootstrap"
+            );
+        }
+        // ── (2) WITH the mutual bootstrap: the handshake completes. ──
+        {
+            let a = WgKeypair::generate();
+            let b = WgKeypair::generate();
+            let sock_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let sock_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr_a = sock_a.local_addr().unwrap();
+            let addr_b = sock_b.local_addr().unwrap();
+            let conn_a: Arc<dyn RelayConn> = Arc::new(PermissionedRelayConn::new(sock_a));
+            let conn_b: Arc<dyn RelayConn> = Arc::new(PermissionedRelayConn::new(sock_b));
+            // The rc.199 fix: BOTH ends bootstrap their coturn permission before
+            // the handshake (what install_ready now does for every relay carrier).
+            conn_a.send_to(b"\x00", addr_b).await.unwrap();
+            conn_b.send_to(b"\x00", addr_a).await.unwrap();
+            let a_init = a.public.to_bytes() < b.public.to_bytes();
+            let (mut dev_a, _rx_a) = WgDevice::new(a.secret.clone());
+            let (mut dev_b, mut rx_b) = WgDevice::new(b.secret.clone());
+            // Register both, single initiator (exactly install_ready's rule).
+            dev_a.add_peer(
+                b.public.to_bytes(),
+                IP_B,
+                Carrier::relay(conn_a, addr_b),
+                a_init,
+            );
+            dev_b.add_peer(
+                a.public.to_bytes(),
+                IP_A,
+                Carrier::relay(conn_b, addr_a),
+                !a_init,
+            );
+            // A → B completes now that both permissions are open.
+            wait_connected(&dev_a, &b.public.to_bytes()).await;
+            let pkt = synthetic_ipv4(IP_A, IP_B, b"relay-after-bootstrap");
+            send_until_ok(&dev_a, &b.public.to_bytes(), &pkt).await;
+            let got = tokio::time::timeout(Duration::from_secs(15), rx_b.recv())
+                .await
+                .expect("B did not receive a decrypted packet after the bootstrap")
+                .expect("tun channel closed");
+            assert_eq!(
+                got, pkt,
+                "handshake + data must flow once both ends bootstrap"
+            );
+        }
+    }
+
     // ───────────── LIVE coturn smoke (two real TURN allocations) ─────────────
     //
     // Mirrors `relay::turn_tests::relay_against_real_coturn_udp`: two WG
