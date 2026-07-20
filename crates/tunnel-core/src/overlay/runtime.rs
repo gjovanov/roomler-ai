@@ -1181,6 +1181,7 @@ impl OverlayRuntime {
             // rc.135). Empty when the direct path is off.
             CarrierMode::Relay => Some(RelayCoordinator::new(
                 self.outbound.clone(),
+                self.keypair.public.to_bytes(),
                 direct_ctx
                     .as_ref()
                     .map(|c| c.endpoints.clone())
