@@ -38,6 +38,10 @@ pub struct PeerConfig {
     /// public IP here is a srflx dial candidate (a 1:1/cone-NAT'd peer whose NIC
     /// is private). Empty from a pre-Phase-B server or a peer with no srflx.
     pub srflx_endpoints: Vec<String>,
+    /// Phase C — the peer's probed NAT mapping type (`"cone"` / `"symmetric"`),
+    /// or `None` when unknown. The runtime skips the srflx punch only when BOTH
+    /// this peer and we are `"symmetric"`; any other combination attempts.
+    pub srflx_nat: Option<String>,
     /// rc.142 — the peer advertised it can carry WG over QUIC-over-TURN. The
     /// runtime only attempts the QUIC relay carrier when this is set (both
     /// ends must agree, else the pair falls back to raw relay).
@@ -62,6 +66,7 @@ pub fn peer_config_from_netmap(peer: &NetmapPeer) -> Option<PeerConfig> {
         endpoints: peer.endpoints.clone(),
         lan_endpoints: peer.lan_endpoints.clone(),
         srflx_endpoints: peer.srflx_endpoints.clone(),
+        srflx_nat: peer.srflx_nat.clone(),
         supports_quic: peer.supports_quic,
     })
 }
@@ -81,6 +86,7 @@ mod tests {
             endpoints: vec!["203.0.113.5:51820".into()],
             lan_endpoints: vec![],
             srflx_endpoints: vec![],
+            srflx_nat: None,
             relay_home: None,
             reachable,
             supports_quic: false,

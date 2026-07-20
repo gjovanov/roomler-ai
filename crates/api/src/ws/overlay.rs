@@ -94,8 +94,8 @@ pub async fn relay_overlay_msg_from_node(
             handle_overlay_endpoints(state, ident, candidates).await;
             None
         }
-        ClientMsg::OverlaySrflx { candidates } => {
-            handle_overlay_srflx(state, ident, candidates).await;
+        ClientMsg::OverlaySrflx { candidates, nat } => {
+            handle_overlay_srflx(state, ident, candidates, nat).await;
             None
         }
         ClientMsg::OverlayLeave {} => {
@@ -321,14 +321,20 @@ async fn handle_overlay_endpoints(state: &AppState, ident: NodeIdentity, candida
     fan_delta_to_peers(state, &updated, epoch, vec![upsert], vec![]).await;
 }
 
-/// NAT-traversal Phase B — the node trickled its server-reflexive (srflx)
-/// candidates. Store them in the SEPARATE `srflx_endpoints` bucket (so a relay
-/// trickle can't clobber them) → fan an upsert delta so peers learn the srflx
-/// and can dial this node directly through its NAT. Stored verbatim: the dial
-/// side already filters to public IPv4 (`direct::pick_public_endpoint`), and a
-/// peer only dials the srflx of an ACL-authorised netmap peer — same trust
-/// model as `endpoints`/`lan_endpoints`.
-async fn handle_overlay_srflx(state: &AppState, ident: NodeIdentity, candidates: Vec<String>) {
+/// NAT-traversal Phase B/C — the node trickled its server-reflexive (srflx)
+/// candidates (and, Phase C, its probed `nat` type). Store them in the SEPARATE
+/// `srflx_endpoints`/`srflx_nat` bucket (so a relay trickle can't clobber them)
+/// → fan an upsert delta so peers learn the srflx + NAT type and can dial this
+/// node directly through its NAT (skipping the punch only when both ends are
+/// symmetric). Stored verbatim: the dial side already filters to public IPv4
+/// (`direct::pick_public_endpoint`), and a peer only dials the srflx of an
+/// ACL-authorised netmap peer — same trust model as `endpoints`/`lan_endpoints`.
+async fn handle_overlay_srflx(
+    state: &AppState,
+    ident: NodeIdentity,
+    candidates: Vec<String>,
+    nat: Option<String>,
+) {
     let Some(self_node) = current_node(state, ident).await else {
         debug!(?ident, "overlay.srflx before join; ignoring");
         return;
@@ -336,7 +342,7 @@ async fn handle_overlay_srflx(state: &AppState, ident: NodeIdentity, candidates:
     let Some(self_id) = self_node.id else { return };
     if let Err(e) = state
         .overlay_nodes
-        .update_srflx_endpoints(self_id, &candidates)
+        .update_srflx_endpoints(self_id, &candidates, nat.as_deref())
         .await
     {
         warn!(%self_id, %e, "overlay.srflx: update failed");
@@ -345,6 +351,7 @@ async fn handle_overlay_srflx(state: &AppState, ident: NodeIdentity, candidates:
 
     let mut updated = self_node;
     updated.srflx_endpoints = candidates;
+    updated.srflx_nat = nat;
     let epoch = next_epoch();
     let upsert = to_netmap_peer(&updated);
     fan_delta_to_peers(state, &updated, epoch, vec![upsert], vec![]).await;
@@ -620,6 +627,9 @@ fn to_netmap_peer(node: &OverlayNode) -> NetmapPeer {
         // these to reach a 1:1/cone-NAT'd node directly. Empty until the node
         // gathers + trickles srflx (`rc:overlay.srflx`).
         srflx_endpoints: node.srflx_endpoints.clone(),
+        // Phase C — surface the node's probed NAT type so a dialer can skip a
+        // futile both-symmetric punch (VERBATIM, like srflx_endpoints).
+        srflx_nat: node.srflx_nat.clone(),
         relay_home: node.relay_home.clone(),
         reachable: true,
         supports_quic: node.supports_quic,

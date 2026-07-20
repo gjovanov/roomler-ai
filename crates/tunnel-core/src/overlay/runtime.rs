@@ -63,6 +63,21 @@ struct DirectCtx {
     /// peer reaches US on our per-interface PUBLIC socket, already advertised in
     /// `endpoints` since a public NIC IP passes `is_usable_lan_ipv4`).
     public_sock: Option<Arc<UdpSocket>>,
+    /// Phase C — the interface socket that owns our FIRST advertised srflx
+    /// candidate (`srflx_endpoints[0]`), paired with that candidate string. To
+    /// hole-punch a NAT'd peer we must dial its srflx from THIS socket, so our
+    /// outbound WG INITs ride the same NAT mapping we advertised (opening our
+    /// filter toward the peer). Distinct from `public_sock` (the Phase A
+    /// public-NIC dialer, an unbound `0.0.0.0` socket): a punch requires the
+    /// mapping-owning socket, not an arbitrary egress one. `None` when the srflx
+    /// tier is off or no public srflx was gathered. Set after the startup
+    /// srflx gather (which returns each candidate with its socket).
+    punch: Option<(String, Arc<UdpSocket>)>,
+    /// Phase C — OUR probed NAT mapping type (`"cone"` / `"symmetric"`), or
+    /// `None` when unknown. Set at the startup gather (probing the punch socket
+    /// against two STUN targets). `install_peers` reads it to skip a srflx punch
+    /// only when BOTH ends are symmetric.
+    my_nat: Option<String>,
 }
 
 /// CC1 (NAT-traversal plan) — per-peer direct-carrier failure bookkeeping, kept
@@ -84,12 +99,61 @@ struct DirectCooldowns {
     public: HashMap<ObjectId, Instant>,
     /// Public-direct consecutive-failure count.
     public_fails: HashMap<ObjectId, u32>,
+    /// Phase C — srflx hole-punch tier — `until`-instant per peer. Its OWN
+    /// counter so a punch failure (routine for stricter NATs) never poisons the
+    /// LAN or public-direct tiers (CC1). Escalates to a SHORTER deny than the
+    /// LAN/public 24 h ([`SRFLX_DENY_COOLDOWN`], 15 min) — NAT conditions change
+    /// when a host roams, so a permanent deny would wrongly outlive them.
+    srflx: HashMap<ObjectId, Instant>,
+    /// srflx consecutive-failure count.
+    srflx_fails: HashMap<ObjectId, u32>,
 }
 
 impl DirectCooldowns {
     /// Is `nid` currently cooling down on the given tier?
     fn cooling(map: &HashMap<ObjectId, Instant>, nid: &ObjectId, now: Instant) -> bool {
         map.get(nid).is_some_and(|&until| until > now)
+    }
+}
+
+/// Which carrier tier an installed peer is on. Direct tiers differ in cooldown
+/// bookkeeping (CC1 — a failure on one tier must never poison another) and, for
+/// the two off-link internet tiers, a WG-handshake completion deadline (Phase C
+/// — a punch that never establishes is torn down to relay; LAN is on-link and
+/// judged only by traffic, relay by its own hard-dead/one-way signals).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DirectTier {
+    /// Same-subnet LAN direct (rc.131-135) — on-link, no handshake deadline.
+    Lan,
+    /// Direct-to-public NIC (Phase A) — off-link; public cooldown + a loose
+    /// handshake deadline (the accept side may lag).
+    Public,
+    /// srflx hole-punch (Phase C) — off-link; srflx cooldown + a tight
+    /// handshake deadline (a cross-NAT punch works in a couple of INIT cycles
+    /// or won't at all).
+    Srflx,
+    /// coturn relay carrier — not a direct tier; the tx/rx + hard-dead relay
+    /// path governs it, so no handshake deadline here.
+    Relay,
+}
+
+impl DirectTier {
+    /// True for the direct tiers (everything but [`Relay`](Self::Relay)) — the
+    /// carriers whose failure bookkeeping is keyed by tier.
+    fn is_direct(self) -> bool {
+        !matches!(self, DirectTier::Relay)
+    }
+
+    /// Phase C — the WG-handshake completion deadline past which a
+    /// never-established carrier on this tier is torn down to relay.
+    /// [`Duration::MAX`] for LAN/Relay (no deadline). Only consulted for the
+    /// off-link `Public`/`Srflx` tiers.
+    fn handshake_deadline(self) -> Duration {
+        match self {
+            DirectTier::Srflx => SRFLX_HANDSHAKE_DEADLINE,
+            DirectTier::Public => PUBLIC_HANDSHAKE_DEADLINE,
+            _ => Duration::MAX,
+        }
     }
 }
 
@@ -122,16 +186,20 @@ struct Installed {
     /// whether a relay pair is same-worker (IPs equal) or cross-worker.
     relay_local: Option<std::net::SocketAddr>,
     relay_dst: Option<std::net::SocketAddr>,
-    /// Phase A — for a PUBLIC-DIRECT carrier, the peer's public `ip:port` we
-    /// dial (or that we accepted an inbound dial from). `None` for a same-LAN
-    /// direct carrier or a relay carrier. Two loads ride on this: (1) it marks
-    /// the carrier as the public-direct tier for the health sweep's tier-split
-    /// fallback (CC1), and (2) it is a MANDATORY exit-node exemption — a
-    /// public-direct dst is a real internet address reached via the default
-    /// route, NOT on-link like a same-LAN peer, so the split-default `/1`s would
-    /// capture the very path to the exit and self-wedge unless its IP is pinned
-    /// via the original gateway (see [`exit_exemption_set`]).
+    /// Phase A/C — for an OFF-LINK direct carrier (public-NIC dial OR srflx
+    /// punch), the peer's public `ip:port` we dial (or accepted an inbound dial
+    /// from). `None` for a same-LAN direct carrier or a relay carrier. It is a
+    /// MANDATORY exit-node exemption — an off-link public dst is a real internet
+    /// address reached via the default route, NOT on-link like a same-LAN peer,
+    /// so the split-default `/1`s would capture the very path to the exit and
+    /// self-wedge unless its IP is pinned via the original gateway (see
+    /// [`exit_exemption_set`]). Which tier (`Public` vs `Srflx`) it is comes
+    /// from [`tier`](Self::tier), not this field (both set it).
     public_direct_dst: Option<std::net::SocketAddr>,
+    /// Phase C — which carrier tier this is. Drives the health sweep's tier-split
+    /// cooldown (CC1) and the off-link handshake deadline. `Relay` for a coturn
+    /// carrier, `Lan`/`Public`/`Srflx` for the three direct tiers.
+    tier: DirectTier,
 }
 
 /// Grace after install before the fallback can fire — lets the bilateral
@@ -164,17 +232,54 @@ const DIRECT_MAX_FAILURES: u32 = 2;
 /// relay; a restart — or the peer genuinely landing on a real LAN in a later
 /// session — re-attempts direct.
 const DIRECT_DENY_COOLDOWN: Duration = Duration::from_secs(24 * 3600);
+/// Phase C — the WG-handshake completion deadline for a srflx punch carrier:
+/// past it with no session, the punch failed → tear down to relay. Tight —
+/// bilateral INIT retransmit is ~5 s, so ~2 cycles + jitter + RTT covers a
+/// genuine cross-NAT punch; longer just delays the relay fallback for a pair
+/// that can't punch (e.g. one side symmetric).
+const SRFLX_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(12);
+/// Phase C — the handshake deadline for a public-direct (Phase A) carrier.
+/// Looser than srflx: the accept side (a NAT'd client dialling a public exit)
+/// can lag, and public-NIC reachability rarely fails outright, so we don't rush
+/// it to relay. Still finite so a truly dead public dst can't zombie forever
+/// (closes the same latent Phase A gap the srflx work exposed).
+const PUBLIC_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(30);
+/// Phase C — srflx consecutive failures before the session-sticky deny. One
+/// more than the LAN/public [`DIRECT_MAX_FAILURES`] — a punch legitimately
+/// misses more often (timing/NAT), so give it an extra try before pinning.
+const SRFLX_MAX_FAILURES: u32 = 3;
+/// Phase C — the srflx deny cooldown once [`SRFLX_MAX_FAILURES`] is hit. Much
+/// SHORTER than the LAN/public 24 h: a punch failure reflects the CURRENT NAT
+/// pair, which changes when a host roams networks, so a day-long deny would
+/// wrongly outlive the condition. 15 min re-attempts within a session.
+const SRFLX_DENY_COOLDOWN: Duration = Duration::from_secs(15 * 60);
+/// Phase C (D8) — re-run the direct-upgrade evaluation every Nth fallback tick
+/// (6 × [`FALLBACK_TICK`] ≈ 30 s). A lapsed cooldown otherwise only matters when
+/// the next netmap happens to arrive, so a quiet mesh would never re-attempt
+/// direct after a fallback; this drives that retry (and Phase C punch
+/// convergence at large install skew) without a netmap.
+const REUPGRADE_EVERY_N_TICKS: u32 = 6;
 
-/// The cooldown to apply after a direct-carrier failure. Escalates to the
-/// session-sticky [`DIRECT_DENY_COOLDOWN`] once a peer has failed direct
-/// [`DIRECT_MAX_FAILURES`] times (a persistent false /24 match — a VPN client
-/// pool — rather than a transient blip). `fails` is the running failure count
-/// INCLUDING the current failure.
-fn direct_retry_cooldown(fails: u32) -> Duration {
-    if fails >= DIRECT_MAX_FAILURES {
-        DIRECT_DENY_COOLDOWN
-    } else {
-        DIRECT_COOLDOWN
+/// The cooldown to apply after a direct-carrier failure, keyed by tier (CC1).
+/// Escalates to the tier's session-sticky deny once a peer has failed that tier
+/// [`DIRECT_MAX_FAILURES`] / [`SRFLX_MAX_FAILURES`] times (a persistent false
+/// match — a VPN client pool for LAN, an unpunchable NAT pair for srflx —
+/// rather than a transient blip). `fails` is the running failure count INCLUDING
+/// the current failure.
+fn direct_retry_cooldown(tier: DirectTier, fails: u32) -> Duration {
+    let (max, deny) = match tier {
+        DirectTier::Srflx => (SRFLX_MAX_FAILURES, SRFLX_DENY_COOLDOWN),
+        _ => (DIRECT_MAX_FAILURES, DIRECT_DENY_COOLDOWN),
+    };
+    if fails >= max { deny } else { DIRECT_COOLDOWN }
+}
+
+/// The consecutive-failure count at which a tier escalates to its session-sticky
+/// deny (the `sticky` log/decision in the sweep). Mirrors [`direct_retry_cooldown`].
+fn direct_max_failures(tier: DirectTier) -> u32 {
+    match tier {
+        DirectTier::Srflx => SRFLX_MAX_FAILURES,
+        _ => DIRECT_MAX_FAILURES,
     }
 }
 /// rc.139 — a dead RELAY carrier (one-way, same `tx>rx` signal) is usually a
@@ -272,6 +377,86 @@ async fn sync_name_map(names: &dns::NameMap, peers: &HashMap<ObjectId, NetmapPee
         }
         if let Ok(ip) = p.overlay_ip.parse::<Ipv4Addr>() {
             map.insert(p.name.clone(), ip);
+        }
+    }
+}
+
+/// Phase C (D5) — the srflx keepalive / re-gather task. Every `interval`
+/// (jittered) it re-runs a STUN Binding on the PUNCH socket (through the demux
+/// STUN sink) to (a) hold the NAT mapping open on an idle link — WG keepalives
+/// only cover ACTIVE sessions — and (b) detect a CHANGED public mapping and
+/// re-advertise it, so a peer that joins later dials the live srflx, not a dead
+/// one.
+///
+/// The STUN target is PINNED (A4): re-resolved only after several consecutive
+/// failures, so a multi-worker DNS rotation can't masquerade as a mapping change
+/// and fan a network-wide re-trickle every tick. On failure the last-known
+/// advert is RETAINED (a transient STUN outage must not strip a working srflx).
+/// Re-trickles ONLY when the punch mapping (`[0]`) actually changes. Ends when
+/// the control channel closes (runtime gone).
+#[allow(clippy::too_many_arguments)]
+async fn run_srflx_keepalive(
+    punch_sock: Arc<UdpSocket>,
+    mut stun_rx: mpsc::Receiver<crate::transport::stun::StunInbound>,
+    mut stun_server: SocketAddr,
+    stun_urls: Vec<String>,
+    mut advertised: Vec<String>,
+    nat: Option<String>,
+    outbound: mpsc::Sender<ClientMsg>,
+    interval: Duration,
+) {
+    const RERESOLVE_AFTER: u32 = 3;
+    let mut failures: u32 = 0;
+    loop {
+        // Small jitter (≤25% of the interval) so a fleet doesn't STUN in
+        // lockstep; scaled to the interval so short test intervals stay quick.
+        let jitter =
+            Duration::from_millis(rand::random::<u64>() % (interval.as_millis() as u64 / 4 + 1));
+        tokio::time::sleep(interval + jitter).await;
+        match crate::transport::stun::srflx_query_via_sink(
+            &punch_sock,
+            &mut stun_rx,
+            stun_server,
+            SRFLX_ATTEMPT_TIMEOUT,
+        )
+        .await
+        {
+            Ok(mapped) => {
+                failures = 0;
+                let ep = mapped.to_string();
+                if advertised.first().map(String::as_str) != Some(ep.as_str()) {
+                    // Mapping changed → update the punch candidate `[0]` and
+                    // re-advertise (keeping any other multi-homed candidates).
+                    if advertised.is_empty() {
+                        advertised.push(ep.clone());
+                    } else {
+                        advertised[0] = ep.clone();
+                    }
+                    info!(new_srflx = %ep, "overlay: srflx mapping changed — re-advertising (Phase C keepalive)");
+                    if outbound
+                        .send(ClientMsg::OverlaySrflx {
+                            candidates: advertised.clone(),
+                            // Re-send our NAT type — the mapping changed, not the
+                            // NAT class — so the server never clears it.
+                            nat: nat.clone(),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break; // control channel closed → runtime gone
+                    }
+                }
+            }
+            Err(e) => {
+                failures += 1;
+                debug!(%e, failures, "overlay: srflx keepalive query failed — retaining last advert");
+                if failures >= RERESOLVE_AFTER {
+                    if let Some(fresh) = direct::resolve_stun_server(&stun_urls).await {
+                        stun_server = fresh;
+                    }
+                    failures = 0;
+                }
+            }
         }
     }
 }
@@ -699,7 +884,9 @@ impl OverlayRuntime {
         // rc.131 — direct LAN path: bind a shared UDP socket + discover our
         // LAN endpoint so a same-subnet peer dials us directly and skips the
         // relay. Off in Direct mode (the test/helper path) and when disabled.
-        let direct_ctx = self.setup_direct().await;
+        // `mut` — the srflx gather (below, after the first netmap) records the
+        // punch socket into it (Phase C).
+        let mut direct_ctx = self.setup_direct().await;
         let mut advertised = endpoints;
         if let Some(ctx) = &direct_ctx {
             advertised.extend(ctx.endpoints.iter().cloned());
@@ -784,42 +971,83 @@ impl OverlayRuntime {
         // rc.139 — peers whose stale relay was just refreshed (anti-ping-pong).
         let mut relay_refresh_cooldown: HashMap<ObjectId, Instant> = HashMap::new();
 
-        // NAT-traversal Phase B — gather our server-reflexive (srflx) candidates
-        // and advertise them, so a peer behind a DIFFERENT NAT can dial us at the
-        // public mapping our own STUN query opens. This MUST run BEFORE the eager
-        // demux below starts reading these sockets: the STUN reply rides the same
-        // socket the overlay traffic will use (that's the point — the NAT mapping
-        // has to match), so a demux recv loop would otherwise steal the response.
-        // Gated on the srflx tier + the server actually advertising a STUN
-        // endpoint; best-effort + time-bounded, so a slow/unreachable STUN server
-        // just leaves srflx unset this run (the node re-gathers on the next
-        // reconnect). WG keepalives hold the mapping open for the session, so a
-        // single startup gather suffices — an in-band periodic re-gather would
-        // need demux-routed STUN and is deferred.
-        if direct::srflx_enabled()
-            && let Some(ctx) = &direct_ctx
-            && !network.stun_urls.is_empty()
-        {
-            match direct::resolve_stun_server(&network.stun_urls).await {
-                Some(stun_server) => {
-                    let srflx = tokio::time::timeout(
-                        SRFLX_GATHER_BUDGET,
-                        direct::gather_srflx(&ctx.socks, stun_server, SRFLX_ATTEMPT_TIMEOUT),
-                    )
-                    .await
-                    .unwrap_or_default();
-                    if srflx.is_empty() {
-                        debug!(%stun_server, "overlay: srflx gather yielded no public candidate");
-                    } else {
-                        info!(?srflx, %stun_server, "overlay: advertising srflx candidates (NAT-traversal Phase B)");
-                        let _ = self
-                            .outbound
-                            .send(ClientMsg::OverlaySrflx { candidates: srflx })
-                            .await;
+        // NAT-traversal Phase B/C — gather our server-reflexive (srflx)
+        // candidates and advertise them, so a peer behind a DIFFERENT NAT can
+        // dial us at the public mapping our own STUN query opens, AND record the
+        // PUNCH SOCKET (the interface socket that owns our first candidate) so we
+        // dial a peer's srflx from it (Phase C hole-punch). This MUST run BEFORE
+        // the eager demux below starts reading these sockets: the STUN reply
+        // rides the same socket the overlay traffic will use (that's the point —
+        // the NAT mapping has to match), so a demux recv loop would otherwise
+        // steal the response. Best-effort + time-bounded, so a slow/unreachable
+        // STUN server just leaves srflx unset this run. WG keepalives hold the
+        // mapping for active sessions; Phase C's in-band keepalive (demux-routed
+        // STUN, chunk 2) refreshes an idle mapping + re-trickles on change.
+        // Captured for the Phase C keepalive task (chunk 2): the pinned STUN
+        // server it re-queries, the candidates it started from (so it only
+        // re-trickles on a CHANGE), and our probed NAT type (re-sent on each
+        // re-trickle so the server never clears it). Empty/None ⇒ no keepalive.
+        let mut srflx_stun_server: Option<SocketAddr> = None;
+        let mut srflx_advertised: Vec<String> = Vec::new();
+        let mut srflx_my_nat: Option<String> = None;
+        if direct::srflx_enabled() {
+            let socks = direct_ctx
+                .as_ref()
+                .map(|c| c.socks.clone())
+                .unwrap_or_default();
+            if !socks.is_empty() && !network.stun_urls.is_empty() {
+                match direct::resolve_stun_server(&network.stun_urls).await {
+                    Some(stun_server) => {
+                        srflx_stun_server = Some(stun_server);
+                        let pairs = tokio::time::timeout(
+                            SRFLX_GATHER_BUDGET,
+                            direct::gather_srflx(&socks, stun_server, SRFLX_ATTEMPT_TIMEOUT),
+                        )
+                        .await
+                        .unwrap_or_default();
+                        if pairs.is_empty() {
+                            debug!(%stun_server, "overlay: srflx gather yielded no public candidate");
+                        } else {
+                            // The FIRST pair is the punch socket: its candidate
+                            // is advertised at index 0, which the peer's dial-side
+                            // (`pick_public_endpoint`) picks first — so both ends
+                            // agree on the mapping to punch.
+                            let punch = pairs.first().cloned();
+                            // Phase C — probe OUR NAT type on the punch socket
+                            // (two distinct STUN targets), BEFORE its demux loop
+                            // starts (same socket-read race as the gather). A
+                            // peer skips the punch only when BOTH ends are
+                            // symmetric; `None` (unknown) stays optimistic.
+                            let my_nat = if let Some((_, ps)) = &punch {
+                                let targets =
+                                    direct::resolve_stun_targets(&network.stun_urls).await;
+                                direct::probe_nat_type(ps, &targets, SRFLX_ATTEMPT_TIMEOUT)
+                                    .await
+                                    .map(str::to_string)
+                            } else {
+                                None
+                            };
+                            srflx_my_nat = my_nat.clone();
+                            if let (Some(ctx), Some(first)) = (direct_ctx.as_mut(), punch) {
+                                ctx.punch = Some(first);
+                                ctx.my_nat = my_nat.clone();
+                            }
+                            let candidates: Vec<String> =
+                                pairs.into_iter().map(|(c, _)| c).collect();
+                            srflx_advertised = candidates.clone();
+                            info!(?candidates, ?my_nat, %stun_server, "overlay: advertising srflx candidates (NAT-traversal Phase B/C)");
+                            let _ = self
+                                .outbound
+                                .send(ClientMsg::OverlaySrflx {
+                                    candidates,
+                                    nat: my_nat,
+                                })
+                                .await;
+                        }
                     }
-                }
-                None => {
-                    debug!(urls = ?network.stun_urls, "overlay: no resolvable STUN server; srflx off this run");
+                    None => {
+                        debug!(urls = ?network.stun_urls, "overlay: no resolvable STUN server; srflx off this run");
+                    }
                 }
             }
         }
@@ -847,6 +1075,37 @@ impl OverlayRuntime {
         } else {
             None
         };
+
+        // Phase C (D5) — spawn the srflx keepalive/re-gather task. It re-queries
+        // the PINNED STUN server on the punch socket every interval (via the
+        // demux STUN sink wired just above) to hold an idle NAT mapping open and
+        // re-advertise a changed one. Only when: srflx tier on, a punch socket +
+        // STUN server resolved, an advert exists, and the interval isn't 0 (off).
+        let srflx_keepalive = {
+            let secs = direct::srflx_keepalive_secs();
+            match (
+                direct_ctx.as_ref().and_then(|c| c.punch.clone()),
+                srflx_stun_server,
+                wg.take_stun_events(),
+            ) {
+                (Some((_, punch_sock)), Some(stun_server), Some(stun_rx))
+                    if direct::srflx_enabled() && secs > 0 && !srflx_advertised.is_empty() =>
+                {
+                    Some(tokio::spawn(run_srflx_keepalive(
+                        punch_sock,
+                        stun_rx,
+                        stun_server,
+                        network.stun_urls.clone(),
+                        srflx_advertised.clone(),
+                        srflx_my_nat.clone(),
+                        self.outbound.clone(),
+                        Duration::from_secs(secs),
+                    )))
+                }
+                _ => None,
+            }
+        };
+
         // Latest netmap view (node_id → peer), so the fallback sweep can drive
         // the relay path for a downgraded peer without waiting for a netmap.
         let mut current_peers: HashMap<ObjectId, NetmapPeer> =
@@ -971,6 +1230,9 @@ impl OverlayRuntime {
             exit_node_status(self.exit_node.as_deref(), &exit_state),
         );
 
+        // Phase C (D8) — re-upgrade tick counter (see `REUPGRADE_EVERY_N_TICKS`).
+        let mut reupgrade_ticks: u32 = 0;
+
         // Phase 2 — steady state.
         loop {
             tokio::select! {
@@ -990,6 +1252,22 @@ impl OverlayRuntime {
                         &mut wg, &mut by_node, &mut relay, &tun,
                         &mut cooldowns, &mut relay_refresh_cooldown, &current_peers,
                     ).await;
+                    // D8 — periodic direct re-upgrade (~every 6th tick ≈ 30 s).
+                    // A lapsed cooldown only takes effect on the next netmap
+                    // otherwise; a quiet mesh would never re-attempt direct after
+                    // a fallback. Re-run the tier evaluation over the current
+                    // netmap — install_peers no-ops on already-direct peers and
+                    // won't re-request a relay it's already tracking, so this only
+                    // (a) retries a direct tier whose cooldown lapsed and (b)
+                    // drives Phase C punch convergence at large install skew.
+                    reupgrade_ticks = reupgrade_ticks.wrapping_add(1);
+                    if reupgrade_ticks.is_multiple_of(REUPGRADE_EVERY_N_TICKS) {
+                        let peers: Vec<NetmapPeer> = current_peers.values().cloned().collect();
+                        self.install_peers(
+                            &mut wg, &mut by_node, &mut relay, &tun,
+                            &peers, direct_ctx.as_ref(), &cooldowns,
+                        ).await;
+                    }
                     // A carrier flip may have changed the coturn worker set or
                     // the exit peer's reachability — re-reconcile exit routing
                     // FIRST, so the refreshed view carries the new exit status.
@@ -1036,7 +1314,7 @@ impl OverlayRuntime {
                     if let Some(inb) = maybe_init {
                         self.handle_direct_inbound(
                             &mut wg, &mut by_node, &mut relay, &tun,
-                            &current_peers, &cooldowns, inb,
+                            &current_peers, &mut cooldowns, inb,
                         ).await;
                         self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
                         self.publish_view(&self_ip, &by_node, &current_peers, exit_node_status(self.exit_node.as_deref(), &exit_state));
@@ -1095,6 +1373,10 @@ impl OverlayRuntime {
             .await;
 
         inbound.abort();
+        // Phase C — stop the srflx keepalive task (if any) on runtime exit.
+        if let Some(h) = srflx_keepalive {
+            h.abort();
+        }
     }
 
     /// rc.137/139 — find carriers that are one-way / dead and repair them.
@@ -1122,8 +1404,8 @@ impl OverlayRuntime {
         current_peers: &HashMap<ObjectId, NetmapPeer>,
     ) {
         let now = Instant::now();
-        // (node_id, was_direct, was_public_direct, hard_dead)
-        let mut dead: Vec<(ObjectId, bool, bool, bool)> = Vec::new();
+        // (node_id, tier, hard_dead)
+        let mut dead: Vec<(ObjectId, DirectTier, bool)> = Vec::new();
         for (nid, e) in by_node.iter_mut() {
             let Some((tx, rx)) = wg.peer_traffic(&e.pubkey) else {
                 continue;
@@ -1144,7 +1426,20 @@ impl OverlayRuntime {
             // by `relay_refresh_cooldown` below). Always `false` for a direct
             // carrier, so this only ever fast-paths a relay.
             let hard_dead = wg.peer_carrier_dead(&e.pubkey).unwrap_or(false);
-            // Warm-up grace: let the handshake + first packets flow.
+            // Phase C — off-link handshake deadline: a Srflx/Public carrier that
+            // never completed its WG handshake within the tier deadline is a
+            // zombie. Its tx/rx stay flat pre-handshake (handshake packets touch
+            // neither counter), so the rx-flat heuristic below can't see it, and
+            // boringtun stops even keepalives once the attempt expires (~90 s) —
+            // it would live forever. Tear it down → cooldown → relay. Once the
+            // handshake latches (`peer_handshake_done`) this can never fire again
+            // (the tx/rx heuristic governs the established carrier thereafter).
+            let punch_dead = matches!(e.tier, DirectTier::Public | DirectTier::Srflx)
+                && !wg.peer_handshake_done(&e.pubkey).unwrap_or(true)
+                && e.since.elapsed() > e.tier.handshake_deadline();
+            // Warm-up grace: let the handshake + first packets flow. (A blown
+            // punch deadline is > grace by construction, so it never lands in the
+            // grace window; a hard-dead relay conclusively skips it.)
             if !hard_dead && e.since.elapsed() < DIRECT_GRACE {
                 continue;
             }
@@ -1160,14 +1455,20 @@ impl OverlayRuntime {
                 // real peer to relay. (rx advancing, not just idle.) Clear the
                 // count on the carrier's OWN tier (CC1 — never cross-clear).
                 if e.is_direct && rx > last_rx {
-                    if e.public_direct_dst.is_some() {
-                        cooldowns.public_fails.remove(nid);
-                    } else {
-                        cooldowns.lan_fails.remove(nid);
+                    match e.tier {
+                        DirectTier::Srflx => {
+                            cooldowns.srflx_fails.remove(nid);
+                        }
+                        DirectTier::Public => {
+                            cooldowns.public_fails.remove(nid);
+                        }
+                        _ => {
+                            cooldowns.lan_fails.remove(nid);
+                        }
                     }
                 }
             }
-            if e.bad_sweeps >= BAD_SWEEPS_TO_FALLBACK || hard_dead {
+            if e.bad_sweeps >= BAD_SWEEPS_TO_FALLBACK || hard_dead || punch_dead {
                 // For a relay, hold off if we just refreshed it (anti-ping-pong).
                 if !e.is_direct
                     && relay_refresh_cooldown
@@ -1176,40 +1477,46 @@ impl OverlayRuntime {
                 {
                     continue;
                 }
-                dead.push((*nid, e.is_direct, e.public_direct_dst.is_some(), hard_dead));
+                dead.push((*nid, e.tier, hard_dead));
             }
         }
-        for (nid, was_direct, was_public_direct, hard_dead) in dead {
+        for (nid, tier, hard_dead) in dead {
             let Some(e) = by_node.remove(&nid) else {
                 continue;
             };
             wg.remove_peer(&e.pubkey).await;
             tun.del_peer_route(e.overlay_ip).await;
-            if was_direct {
+            if tier.is_direct() {
                 // Escalating cooldown on the carrier's OWN tier (CC1). LAN: the
                 // "same /24" was a VPN client pool, not a reachable LAN. Public:
                 // the peer's advertised public endpoint isn't actually reachable
-                // (host firewall / not truly public). Either way, after
-                // DIRECT_MAX_FAILURES consecutive failures pin this peer to relay
-                // for the session so a false match can't flap the working relay.
-                let (count_map, cooldown_map, tier) = if was_public_direct {
-                    (&mut cooldowns.public_fails, &mut cooldowns.public, "public")
-                } else {
-                    (&mut cooldowns.lan_fails, &mut cooldowns.lan, "LAN")
+                // (host firewall / not truly public). Srflx: the pair couldn't
+                // punch (one side symmetric / hostile filter). Either way, after
+                // that tier's max failures pin this peer to relay for the session
+                // (srflx: only 15 min — NAT conditions change on roam) so a false
+                // match can't flap the working relay.
+                let (count_map, cooldown_map, tier_name) = match tier {
+                    DirectTier::Srflx => {
+                        (&mut cooldowns.srflx_fails, &mut cooldowns.srflx, "srflx")
+                    }
+                    DirectTier::Public => {
+                        (&mut cooldowns.public_fails, &mut cooldowns.public, "public")
+                    }
+                    _ => (&mut cooldowns.lan_fails, &mut cooldowns.lan, "LAN"),
                 };
                 let fails = count_map.entry(nid).or_insert(0);
                 *fails += 1;
-                let sticky = *fails >= DIRECT_MAX_FAILURES;
-                cooldown_map.insert(nid, now + direct_retry_cooldown(*fails));
+                let sticky = *fails >= direct_max_failures(tier);
+                cooldown_map.insert(nid, now + direct_retry_cooldown(tier, *fails));
                 if sticky {
                     warn!(
-                        peer = %nid, tier, fails = *fails,
+                        peer = %nid, tier = tier_name, fails = *fails,
                         "overlay: direct carrier failed repeatedly — pinning this peer to relay for the session"
                     );
                 } else {
                     warn!(
-                        peer = %nid, tier,
-                        "overlay: direct carrier didn't establish (firewall / VPN / AP-isolation?) — falling back to relay"
+                        peer = %nid, tier = tier_name,
+                        "overlay: direct carrier didn't establish (firewall / VPN / AP-isolation / unpunchable NAT?) — falling back to relay"
                     );
                 }
             } else {
@@ -1227,11 +1534,12 @@ impl OverlayRuntime {
                 }
             }
             // (Re)request the relay now (don't wait for the next netmap). For a
-            // refresh we first forget the stale allocation so a fresh one is made.
+            // relay refresh we first forget the stale allocation so a fresh one
+            // is made; a direct→relay fall has no prior allocation to forget.
             if let (Some(coord), Some(np)) = (relay.as_mut(), current_peers.get(&nid))
                 && let Some(cfg) = peer_config_from_netmap(np)
             {
-                if !was_direct {
+                if !tier.is_direct() {
                     coord.forget(&nid);
                 }
                 coord.request(nid, cfg).await;
@@ -1320,6 +1628,11 @@ impl OverlayRuntime {
             my_ips,
             endpoints,
             public_sock,
+            // Set after the startup srflx gather (Phase C) once we know which
+            // interface socket owns our first advertised srflx candidate + the
+            // NAT-type probe on it.
+            punch: None,
+            my_nat: None,
         })
     }
 
@@ -1350,10 +1663,12 @@ impl OverlayRuntime {
             };
             // rc.136 + CC1 — suppress a direct TIER while this peer is cooling
             // down from a failure on THAT tier (treat as if no such endpoint →
-            // fall through). Expired entries lapse, so the tier is retried. LAN
-            // and public cooldowns are independent.
+            // fall through). Expired entries lapse, so the tier is retried. The
+            // LAN / public / srflx cooldowns are all independent (a punch
+            // failure never poisons the LAN or public-NIC tiers).
             let lan_cooling = DirectCooldowns::cooling(&cooldowns.lan, &np.node_id, now);
             let public_cooling = DirectCooldowns::cooling(&cooldowns.public, &np.node_id, now);
+            let srflx_cooling = DirectCooldowns::cooling(&cooldowns.srflx, &np.node_id, now);
             // A same-subnet LAN endpoint for this peer (highest-priority tier).
             let direct_dst = if lan_cooling {
                 None
@@ -1361,40 +1676,73 @@ impl OverlayRuntime {
                 direct_ctx
                     .and_then(|ctx| direct::pick_same_subnet_endpoint(&ctx.my_ips, &cfg.endpoints))
             };
-            // Phase A/B — a PUBLIC endpoint to dial over the shared egress
-            // socket: the peer's join-time NIC bucket (Phase A, dialable without
-            // STUN when the peer's NIC holds a public IP), else its srflx bucket
-            // (Phase B, the peer's public NAT mapping learned via STUN). Each
-            // sub-tier is independently flag-gated; both share the "public"
-            // cooldown tier and the `install_public_direct` dial path. Requires
-            // the egress socket + no public-tier cooldown. After LAN direct.
-            let public_dst = if public_cooling {
+            // Phase A — the peer's PUBLIC NIC endpoint (its join-time bucket),
+            // dialable WITHOUT STUN because the peer's NIC holds a public IP.
+            // Dialed over the shared `public_sock` (arbitrary egress is fine —
+            // the peer has no NAT filter). Gated by the flag + its cooldown +
+            // the egress socket.
+            let phase_a_dst = if public_cooling {
                 None
             } else {
                 direct_ctx.and_then(|ctx| {
-                    ctx.public_sock.as_ref().and_then(|_| {
-                        direct::public_direct_enabled()
-                            .then(|| direct::pick_public_endpoint(&ctx.my_ips, &cfg.lan_endpoints))
-                            .flatten()
-                            .or_else(|| {
-                                direct::srflx_enabled()
-                                    .then(|| {
-                                        direct::pick_public_endpoint(
-                                            &ctx.my_ips,
-                                            &cfg.srflx_endpoints,
-                                        )
-                                    })
-                                    .flatten()
-                            })
-                    })
+                    (direct::public_direct_enabled() && ctx.public_sock.is_some())
+                        .then(|| direct::pick_public_endpoint(&ctx.my_ips, &cfg.lan_endpoints))
+                        .flatten()
+                })
+            };
+            // Phase C — the peer's srflx (its STUN-learned public NAT mapping),
+            // dialed over the PUNCH socket (the one that owns OUR advertised
+            // srflx) so our INITs ride our advertised mapping and open our NAT's
+            // filter toward the peer — the mutual hole-punch. Distinct socket
+            // and cooldown from Phase A. Gated by the flag + its cooldown + a
+            // gathered punch socket, AND skipped when BOTH ends are symmetric
+            // (a punch can't work then — save the futile 12 s attempt + the
+            // strike; any cone/unknown side still attempts). Lowest direct tier.
+            let srflx_dst = if srflx_cooling {
+                None
+            } else {
+                direct_ctx.and_then(|ctx| {
+                    (direct::srflx_enabled()
+                        && ctx.punch.is_some()
+                        && direct::srflx_punch_worth_trying(
+                            ctx.my_nat.as_deref(),
+                            cfg.srflx_nat.as_deref(),
+                        ))
+                    .then(|| direct::pick_public_endpoint(&ctx.my_ips, &cfg.srflx_endpoints))
+                    .flatten()
                 })
             };
 
-            match by_node.get(&np.node_id).map(|e| (e.is_direct, e.pubkey)) {
-                Some((true, _)) => continue, // already direct (LAN or public)
-                Some((false, pk)) => {
-                    // Installed on RELAY — upgrade to a direct tier now that an
-                    // endpoint has appeared. LAN wins over public.
+            // Copy-out the installed carrier's shape (all Copy), so the by_node
+            // borrow ends before any mutation below.
+            let installed = by_node
+                .get(&np.node_id)
+                .map(|e| (e.is_direct, e.pubkey, e.tier, e.public_direct_dst));
+            match installed {
+                Some((true, pk, tier, inst_dst)) => {
+                    // D10 — a zombie srflx punch (installed but never handshook)
+                    // whose advertised srflx has since CHANGED: re-dial the fresh
+                    // mapping NOW, without booking a strike (the old dst is
+                    // known-stale — not evidence the pair can't punch). Otherwise
+                    // a srflx re-trickle sits ignored on an already-direct peer
+                    // until the handshake deadline tears it down (~100 s later),
+                    // and books a bogus strike doing so.
+                    if tier == DirectTier::Srflx
+                        && !wg.peer_handshake_done(&pk).unwrap_or(true)
+                        && let (Some(ctx), Some(fresh)) = (direct_ctx, srflx_dst)
+                        && inst_dst != Some(fresh)
+                    {
+                        info!(peer = %np.node_id, old = ?inst_dst, new = %fresh, "overlay: srflx changed under a pending punch — re-dialing fresh mapping");
+                        wg.remove_peer(&pk).await;
+                        self.install_srflx_direct(wg, by_node, tun, ctx, np.node_id, &cfg, fresh)
+                            .await;
+                    }
+                    continue; // already direct (LAN / public / srflx)
+                }
+                Some((false, pk, _, _)) => {
+                    // Installed on RELAY — upgrade to the best available direct
+                    // tier now that an endpoint has appeared: LAN > public-NIC >
+                    // srflx punch.
                     if let (Some(ctx), Some((local_ip, dst))) = (direct_ctx, direct_dst) {
                         info!(peer = %np.node_id, %dst, "overlay: upgrading relay peer to direct LAN carrier");
                         wg.remove_peer(&pk).await;
@@ -1403,13 +1751,21 @@ impl OverlayRuntime {
                         }
                         self.install_direct(wg, by_node, tun, ctx, np.node_id, &cfg, local_ip, dst)
                             .await;
-                    } else if let (Some(ctx), Some(dst)) = (direct_ctx, public_dst) {
+                    } else if let (Some(ctx), Some(dst)) = (direct_ctx, phase_a_dst) {
                         info!(peer = %np.node_id, %dst, "overlay: upgrading relay peer to direct-to-public carrier");
                         wg.remove_peer(&pk).await;
                         if let Some(r) = relay.as_mut() {
                             r.forget(&np.node_id);
                         }
                         self.install_public_direct(wg, by_node, tun, ctx, np.node_id, &cfg, dst)
+                            .await;
+                    } else if let (Some(ctx), Some(dst)) = (direct_ctx, srflx_dst) {
+                        info!(peer = %np.node_id, %dst, "overlay: upgrading relay peer to srflx hole-punch carrier");
+                        wg.remove_peer(&pk).await;
+                        if let Some(r) = relay.as_mut() {
+                            r.forget(&np.node_id);
+                        }
+                        self.install_srflx_direct(wg, by_node, tun, ctx, np.node_id, &cfg, dst)
                             .await;
                     }
                     continue;
@@ -1449,13 +1805,21 @@ impl OverlayRuntime {
                         }
                         self.install_direct(wg, by_node, tun, ctx, np.node_id, &cfg, local_ip, dst)
                             .await;
-                    } else if let (Some(ctx), Some(dst)) = (direct_ctx, public_dst) {
+                    } else if let (Some(ctx), Some(dst)) = (direct_ctx, phase_a_dst) {
                         // Phase A — peer's NIC is public: dial it directly, skip
                         // the relay. Same forget-the-pending-relay guard.
                         if let Some(r) = relay.as_mut() {
                             r.forget(&np.node_id);
                         }
                         self.install_public_direct(wg, by_node, tun, ctx, np.node_id, &cfg, dst)
+                            .await;
+                    } else if let (Some(ctx), Some(dst)) = (direct_ctx, srflx_dst) {
+                        // Phase C — both NAT'd: hole-punch the peer's srflx from
+                        // the punch socket, skip the relay.
+                        if let Some(r) = relay.as_mut() {
+                            r.forget(&np.node_id);
+                        }
+                        self.install_srflx_direct(wg, by_node, tun, ctx, np.node_id, &cfg, dst)
                             .await;
                     } else if let Some(coord) = relay.as_mut() {
                         if let Some(link) = coord.maybe_complete(np.node_id, &cfg) {
@@ -1512,6 +1876,7 @@ impl OverlayRuntime {
                 relay_local: None,
                 relay_dst: None,
                 public_direct_dst: None,
+                tier: DirectTier::Lan,
             },
         );
         if let Err(e) = tun.add_peer_route(cfg.overlay_ip).await {
@@ -1563,6 +1928,7 @@ impl OverlayRuntime {
                 relay_local: None,
                 relay_dst: None,
                 public_direct_dst: Some(dst),
+                tier: DirectTier::Public,
             },
         );
         if let Err(e) = tun.add_peer_route(cfg.overlay_ip).await {
@@ -1571,6 +1937,59 @@ impl OverlayRuntime {
         self.install_subnets(wg, tun, node_id, cfg.public_key, &cfg.subnets)
             .await;
         info!(peer = %node_id, overlay_ip = %cfg.overlay_ip, %dst, "overlay: direct-to-public carrier (NAT-traversal Phase A) — skipping relay");
+    }
+
+    /// Phase C — install a peer over the **srflx hole-punch** carrier: dial its
+    /// STUN-learned public mapping from the PUNCH socket (`ctx.punch`, the
+    /// interface socket that owns our own first advertised srflx), so our
+    /// outbound WG INITs ride the same NAT mapping we advertised — opening our
+    /// NAT's filter toward the peer's srflx while the peer's bilateral INITs open
+    /// theirs toward ours (the mutual hole-punch). This is the crux difference
+    /// from [`install_public_direct`], which dials via the arbitrary-egress
+    /// `public_sock`: a punch REQUIRES the mapping-owning socket. Records
+    /// `public_direct_dst` (off-link ⇒ exit-node exemption) and `tier = Srflx`
+    /// (its own cooldown + the tight handshake deadline). No punch socket (srflx
+    /// off / none gathered) ⇒ skip, and the caller falls through to relay.
+    #[allow(clippy::too_many_arguments)]
+    async fn install_srflx_direct(
+        &self,
+        wg: &mut WgDevice,
+        by_node: &mut HashMap<ObjectId, Installed>,
+        tun: &Arc<dyn TunIo>,
+        ctx: &DirectCtx,
+        node_id: ObjectId,
+        cfg: &PeerConfig,
+        dst: std::net::SocketAddr,
+    ) {
+        let Some((_, sock)) = ctx.punch.clone() else {
+            warn!(peer = %node_id, "overlay: srflx punch requested but no punch socket; skipping");
+            return;
+        };
+        wg.ensure_direct_demux(sock.clone());
+        wg.add_direct_peer(sock, cfg.public_key, cfg.overlay_ip, dst, true)
+            .await;
+        by_node.insert(
+            node_id,
+            Installed {
+                pubkey: cfg.public_key,
+                overlay_ip: cfg.overlay_ip,
+                is_direct: true,
+                since: Instant::now(),
+                last_traffic: (0, 0),
+                bad_sweeps: 0,
+                last_rx_at: Instant::now(),
+                relay_local: None,
+                relay_dst: None,
+                public_direct_dst: Some(dst),
+                tier: DirectTier::Srflx,
+            },
+        );
+        if let Err(e) = tun.add_peer_route(cfg.overlay_ip).await {
+            debug!(peer = %node_id, %e, "overlay: /32 peer route not installed (ok on clean hosts)");
+        }
+        self.install_subnets(wg, tun, node_id, cfg.public_key, &cfg.subnets)
+            .await;
+        info!(peer = %node_id, overlay_ip = %cfg.overlay_ip, %dst, "overlay: srflx hole-punch carrier (NAT-traversal Phase C) — skipping relay");
     }
 
     /// Phase A — act on an AUTHENTICATED inbound direct handshake initiation
@@ -1595,7 +2014,7 @@ impl OverlayRuntime {
         relay: &mut Option<RelayCoordinator>,
         tun: &Arc<dyn TunIo>,
         current_peers: &HashMap<ObjectId, NetmapPeer>,
-        cooldowns: &DirectCooldowns,
+        cooldowns: &mut DirectCooldowns,
         inb: super::wg::DirectInbound,
     ) {
         let Some(pubkey) = wg.authenticate_init(&inb.packet) else {
@@ -1621,14 +2040,35 @@ impl OverlayRuntime {
             return;
         }
 
-        // Anti-thrash: honour the matching tier's cooldown. A public source is
-        // the public-direct tier; a private source is a LAN roam.
+        // Classify the arriving source into a tier. A public source that
+        // matches this peer's advertised srflx is a hole-punch (Phase C); any
+        // other public source is a direct-to-public dial (Phase A); a private
+        // source is a same-LAN roam.
         let now = Instant::now();
         let is_public_src = matches!(inb.src, SocketAddr::V4(v4) if direct::is_public_v4(*v4.ip()));
-        let cooling = if is_public_src {
-            DirectCooldowns::cooling(&cooldowns.public, &node_id, now)
+        let src_str = inb.src.to_string();
+        let is_srflx_src = is_public_src && np.srflx_endpoints.iter().any(|e| e.trim() == src_str);
+        let tier = if is_srflx_src {
+            DirectTier::Srflx
+        } else if is_public_src {
+            DirectTier::Public
         } else {
-            DirectCooldowns::cooling(&cooldowns.lan, &node_id, now)
+            DirectTier::Lan
+        };
+
+        // Anti-thrash: honour the matching tier's cooldown — EXCEPT for a srflx
+        // punch (D9). An authenticated init that traversed BOTH NATs is proof the
+        // pair CAN punch right now, so it overrides the srflx cooldown (which
+        // exists only because punches routinely miss) and clears this peer's
+        // stale srflx strikes. The LAN/public gates are unchanged.
+        let cooling = match tier {
+            DirectTier::Srflx => {
+                cooldowns.srflx.remove(&node_id);
+                cooldowns.srflx_fails.remove(&node_id);
+                false
+            }
+            DirectTier::Public => DirectCooldowns::cooling(&cooldowns.public, &node_id, now),
+            _ => DirectCooldowns::cooling(&cooldowns.lan, &node_id, now),
         };
         if cooling {
             return;
@@ -1659,9 +2099,12 @@ impl OverlayRuntime {
                 last_rx_at: Instant::now(),
                 relay_local: None,
                 relay_dst: None,
-                // Only a PUBLIC inbound source is an exit-exemption / public
-                // tier; a private source is an on-link LAN roam (no exemption).
+                // Any OFF-LINK public inbound source is an exit-exemption; a
+                // private source is an on-link LAN roam (no exemption). The tier
+                // (Srflx punch vs Public dial vs Lan roam) drives cooldown +
+                // deadline.
                 public_direct_dst: is_public_src.then_some(inb.src),
+                tier,
             },
         );
         if let Err(e) = tun.add_peer_route(cfg.overlay_ip).await {
@@ -1671,7 +2114,7 @@ impl OverlayRuntime {
             .await;
         // Answer the init that triggered this, immediately.
         wg.feed_direct(inb.src, inb.sock.clone(), &inb.packet).await;
-        info!(peer = %node_id, src = %inb.src, public = is_public_src, "overlay: accepted authenticated inbound direct handshake (Phase A)");
+        info!(peer = %node_id, src = %inb.src, ?tier, "overlay: accepted authenticated inbound direct handshake");
     }
 
     /// Install a ready carrier as a WG peer, add its `/32` route, and record
@@ -1776,6 +2219,14 @@ impl OverlayRuntime {
                 relay_local,
                 relay_dst,
                 public_direct_dst: None,
+                // A relay carrier, or the loopback carrier used in Direct/test
+                // mode. Test loopback carriers are direct → Lan (no off-link
+                // handshake deadline); coturn carriers → Relay.
+                tier: if is_direct {
+                    DirectTier::Lan
+                } else {
+                    DirectTier::Relay
+                },
             },
         );
         // Host `/32` so overlay traffic to this peer beats any colliding
@@ -2060,18 +2511,266 @@ mod tests {
         // the normal 60 s retry, but once a peer hits DIRECT_MAX_FAILURES the
         // cooldown becomes session-sticky so it stops re-upgrading the working
         // relay to a direct carrier that can never complete.
-        // `direct_retry_cooldown(1) == DIRECT_COOLDOWN` only holds when
+        // `direct_retry_cooldown(_, 1) == DIRECT_COOLDOWN` only holds when
         // DIRECT_MAX_FAILURES >= 2, so this also guards that invariant (at least
         // one plain retry before the sticky pin).
-        assert_eq!(direct_retry_cooldown(1), DIRECT_COOLDOWN);
         assert_eq!(
-            direct_retry_cooldown(DIRECT_MAX_FAILURES),
+            direct_retry_cooldown(DirectTier::Public, 1),
+            DIRECT_COOLDOWN
+        );
+        assert_eq!(
+            direct_retry_cooldown(DirectTier::Public, DIRECT_MAX_FAILURES),
             DIRECT_DENY_COOLDOWN
         );
         assert_eq!(
-            direct_retry_cooldown(DIRECT_MAX_FAILURES + 3),
+            direct_retry_cooldown(DirectTier::Lan, DIRECT_MAX_FAILURES + 3),
             DIRECT_DENY_COOLDOWN
         );
+        // Phase C — the srflx tier has its OWN thresholds: one MORE plain retry
+        // (SRFLX_MAX_FAILURES = 3 > 2), and a SHORTER, non-24 h deny (NAT
+        // conditions change on roam).
+        assert_eq!(direct_retry_cooldown(DirectTier::Srflx, 1), DIRECT_COOLDOWN);
+        assert_eq!(
+            direct_retry_cooldown(DirectTier::Srflx, SRFLX_MAX_FAILURES - 1),
+            DIRECT_COOLDOWN,
+            "srflx gets an extra plain retry vs LAN/public"
+        );
+        assert_eq!(
+            direct_retry_cooldown(DirectTier::Srflx, SRFLX_MAX_FAILURES),
+            SRFLX_DENY_COOLDOWN
+        );
+        assert!(
+            SRFLX_DENY_COOLDOWN < DIRECT_DENY_COOLDOWN,
+            "srflx deny must be shorter than the LAN/public session-sticky deny"
+        );
+        // The deadlines are ordered srflx (tight) < public (loose), and LAN has
+        // none (a same-subnet carrier is judged only by traffic).
+        assert!(SRFLX_HANDSHAKE_DEADLINE < PUBLIC_HANDSHAKE_DEADLINE);
+        assert_eq!(DirectTier::Lan.handshake_deadline(), Duration::MAX);
+        assert_eq!(DirectTier::Relay.handshake_deadline(), Duration::MAX);
+        assert_eq!(direct_max_failures(DirectTier::Srflx), SRFLX_MAX_FAILURES);
+        assert_eq!(direct_max_failures(DirectTier::Public), DIRECT_MAX_FAILURES);
+    }
+
+    /// Phase C (D7 + CC1) — the health sweep tears down a zombie srflx punch (a
+    /// Srflx-tier carrier that never completed its WG handshake) once past the
+    /// srflx deadline, and books the failure ONLY on the srflx cooldown tier —
+    /// never poisoning the proven LAN or public-direct tiers.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sweep_tears_down_zombie_srflx_and_cools_only_srflx_tier() {
+        let kp = WgKeypair::generate();
+        let peer_kp = WgKeypair::generate();
+        let (out_tx, _out_rx) = mpsc::channel::<ClientMsg>(16);
+        let (tun_mock, _inj, _del) = MockTun::new();
+        let tf: TunFactory = {
+            let m = tun_mock.clone();
+            Box::new(move |_, _, _| Ok(m.clone() as Arc<dyn TunIo>))
+        };
+        let rt = OverlayRuntime::new_relay(kp.clone(), out_tx, tf, 1280);
+
+        // A direct peer dialing a DEAD destination → the handshake never
+        // completes → `peer_handshake_done` stays false (the zombie condition).
+        let (mut wg, _tun_rx) = WgDevice::new(kp.secret.clone());
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        wg.ensure_direct_demux(sock.clone());
+        let dead: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let overlay_ip = Ipv4Addr::new(100, 64, 0, 2);
+        wg.add_direct_peer(
+            sock.clone(),
+            peer_kp.public.to_bytes(),
+            overlay_ip,
+            dead,
+            true,
+        )
+        .await;
+        assert_eq!(
+            wg.peer_handshake_done(&peer_kp.public.to_bytes()),
+            Some(false),
+            "precondition: the punch never handshook"
+        );
+
+        let nid = ObjectId::from_bytes([5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let mut by_node = HashMap::new();
+        by_node.insert(
+            nid,
+            Installed {
+                pubkey: peer_kp.public.to_bytes(),
+                overlay_ip,
+                is_direct: true,
+                // Installed past the srflx handshake deadline (and the grace).
+                since: Instant::now()
+                    .checked_sub(Duration::from_secs(SRFLX_HANDSHAKE_DEADLINE.as_secs() + 3))
+                    .unwrap(),
+                last_traffic: (0, 0),
+                bad_sweeps: 0,
+                last_rx_at: Instant::now(),
+                relay_local: None,
+                relay_dst: None,
+                public_direct_dst: Some(dead),
+                tier: DirectTier::Srflx,
+            },
+        );
+
+        let tun: Arc<dyn TunIo> = tun_mock;
+        let mut cooldowns = DirectCooldowns::default();
+        let mut relay_refresh: HashMap<ObjectId, Instant> = HashMap::new();
+        let mut relay: Option<RelayCoordinator> = None;
+        let current_peers: HashMap<ObjectId, NetmapPeer> = HashMap::new();
+
+        rt.sweep_carrier_health(
+            &mut wg,
+            &mut by_node,
+            &mut relay,
+            &tun,
+            &mut cooldowns,
+            &mut relay_refresh,
+            &current_peers,
+        )
+        .await;
+
+        assert!(
+            !by_node.contains_key(&nid),
+            "the zombie srflx carrier is torn down"
+        );
+        assert!(
+            cooldowns.srflx.contains_key(&nid),
+            "the srflx cooldown is set"
+        );
+        assert_eq!(
+            cooldowns.srflx_fails.get(&nid),
+            Some(&1),
+            "one srflx strike"
+        );
+        assert!(
+            !cooldowns.lan.contains_key(&nid) && !cooldowns.lan_fails.contains_key(&nid),
+            "CC1: the LAN tier is NOT poisoned"
+        );
+        assert!(
+            !cooldowns.public.contains_key(&nid) && !cooldowns.public_fails.contains_key(&nid),
+            "CC1: the public-direct tier is NOT poisoned"
+        );
+    }
+
+    /// Minimal STUN Binding Success carrying an XOR-MAPPED-ADDRESS (IPv4), so a
+    /// keepalive test needs no real STUN server (RFC 5389 §15.2).
+    fn stun_success(txn: [u8; 12], ip: [u8; 4], port: u16) -> Vec<u8> {
+        const COOKIE: u32 = 0x2112_A442;
+        let cookie = COOKIE.to_be_bytes();
+        let xport = port ^ ((COOKIE >> 16) as u16);
+        let mut r = Vec::new();
+        r.extend_from_slice(&0x0101u16.to_be_bytes()); // Binding Success
+        r.extend_from_slice(&12u16.to_be_bytes()); // one 12-byte attribute
+        r.extend_from_slice(&cookie);
+        r.extend_from_slice(&txn);
+        r.extend_from_slice(&0x0020u16.to_be_bytes()); // XOR-MAPPED-ADDRESS
+        r.extend_from_slice(&8u16.to_be_bytes());
+        r.push(0);
+        r.push(0x01); // family IPv4
+        r.extend_from_slice(&xport.to_be_bytes());
+        r.extend_from_slice(&[
+            ip[0] ^ cookie[0],
+            ip[1] ^ cookie[1],
+            ip[2] ^ cookie[2],
+            ip[3] ^ cookie[3],
+        ]);
+        r
+    }
+
+    /// Phase C (D5) — the srflx keepalive re-advertises EXACTLY when the punch
+    /// mapping changes, and never on a query returning the same mapping. A demux
+    /// emulator feeds STUN replies into the sink as the real demux loop would.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn srflx_keepalive_retrickles_only_on_mapping_change() {
+        let punch = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = server.local_addr().unwrap();
+        let (sink_tx, sink_rx) = mpsc::channel::<crate::transport::stun::StunInbound>(16);
+
+        // Reply to the FIRST query with the initial advert (no change), and to
+        // every later query with a CHANGED mapping.
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let mut seen = 0u32;
+            loop {
+                let Ok((_n, _from)) = server.recv_from(&mut buf).await else {
+                    break;
+                };
+                let txn: [u8; 12] = buf[8..20].try_into().unwrap();
+                let port = if seen == 0 { 1111 } else { 2222 };
+                seen += 1;
+                let _ = sink_tx
+                    .send(crate::transport::stun::StunInbound {
+                        src: server_addr,
+                        packet: stun_success(txn, [203, 0, 113, 7], port),
+                    })
+                    .await;
+            }
+        });
+
+        let (out_tx, mut out_rx) = mpsc::channel::<ClientMsg>(16);
+        let advertised = vec!["203.0.113.7:1111".to_string()];
+        let task = tokio::spawn(run_srflx_keepalive(
+            punch,
+            sink_rx,
+            server_addr,
+            vec![],
+            advertised,
+            Some("cone".into()),
+            out_tx,
+            Duration::from_millis(60),
+        ));
+
+        // First tick: mapping == advert → NO trickle. Second tick: changed to
+        // :2222 → exactly one trickle with the new punch candidate at [0].
+        let msg = tokio::time::timeout(Duration::from_secs(3), out_rx.recv())
+            .await
+            .expect("expected a re-trickle")
+            .expect("channel closed");
+        match msg {
+            ClientMsg::OverlaySrflx { candidates, nat } => {
+                assert_eq!(candidates, vec!["203.0.113.7:2222".to_string()]);
+                // The NAT type rides every re-trickle (mapping changed, class
+                // didn't) so the server never clears it.
+                assert_eq!(nat.as_deref(), Some("cone"));
+            }
+            other => panic!("expected OverlaySrflx, got {other:?}"),
+        }
+        // No further trickle while the mapping stays :2222.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(400), out_rx.recv())
+                .await
+                .is_err(),
+            "must not re-trickle when the mapping is unchanged"
+        );
+        task.abort();
+    }
+
+    /// Phase C (D5) — a STUN outage must NOT strip a working advert: with no
+    /// reply arriving, the keepalive retains the last-known srflx (no trickle).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn srflx_keepalive_retains_advert_on_outage() {
+        let punch = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        // Hold the sender so the channel stays open; never feed it (outage).
+        let (_sink_tx, sink_rx) = mpsc::channel::<crate::transport::stun::StunInbound>(1);
+        let (out_tx, mut out_rx) = mpsc::channel::<ClientMsg>(4);
+        let dead: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let task = tokio::spawn(run_srflx_keepalive(
+            punch,
+            sink_rx,
+            dead,
+            vec![],
+            vec!["203.0.113.7:1111".to_string()],
+            Some("cone".into()),
+            out_tx,
+            Duration::from_millis(30),
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), out_rx.recv())
+                .await
+                .is_err(),
+            "a STUN outage must not produce a re-trickle"
+        );
+        task.abort();
     }
 
     #[test]
@@ -2093,6 +2792,7 @@ mod tests {
                 endpoints: vec![],
                 lan_endpoints: vec![],
                 srflx_endpoints: vec![],
+                srflx_nat: None,
                 relay_home: None,
                 reachable,
                 supports_quic: false,
@@ -2117,6 +2817,11 @@ mod tests {
                 relay_local: relay.map(|(l, _)| l),
                 relay_dst: relay.map(|(_, d)| d),
                 public_direct_dst: None,
+                tier: if is_direct {
+                    DirectTier::Lan
+                } else {
+                    DirectTier::Relay
+                },
             }
         }
 
@@ -2279,6 +2984,7 @@ mod tests {
             endpoints: vec![],
             lan_endpoints: vec![],
             srflx_endpoints: vec![],
+            srflx_nat: None,
             relay_home: None,
             reachable: true,
             supports_quic: false,
@@ -2397,6 +3103,7 @@ mod tests {
             endpoints: vec![],
             lan_endpoints: vec![],
             srflx_endpoints: vec![],
+            srflx_nat: None,
             relay_home: None,
             reachable: true,
             supports_quic: false,
@@ -2460,6 +3167,11 @@ mod tests {
                 relay_local: relay.map(|(l, _)| l),
                 relay_dst: relay.map(|(_, d)| d),
                 public_direct_dst: None,
+                tier: if is_direct {
+                    DirectTier::Lan
+                } else {
+                    DirectTier::Relay
+                },
             }
         }
         // Server A + AAAA (S3b — the v6 AAAA rides the set too; reconcile
@@ -2515,6 +3227,7 @@ mod tests {
                 relay_local: None,
                 relay_dst: None,
                 public_direct_dst: Some(pd),
+                tier: DirectTier::Public,
             },
         );
         let set = exit_exemption_set(&[], &by_node);
@@ -2536,6 +3249,7 @@ mod tests {
             endpoints: vec![],
             lan_endpoints: vec![],
             srflx_endpoints: vec![],
+            srflx_nat: None,
             relay_home: None,
             reachable: true,
             supports_quic: false,
@@ -2597,6 +3311,7 @@ mod tests {
                 relay_local: None,
                 relay_dst: None,
                 public_direct_dst: None,
+                tier: DirectTier::Lan,
             },
         );
         let (rid, _np, pk) = exit_readiness("jupiter", &approved, &carriered).unwrap();
