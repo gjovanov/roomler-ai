@@ -484,6 +484,7 @@ mod tests {
             subnets: vec![],
             endpoints: vec![],
             lan_endpoints: vec![],
+            srflx_endpoints: vec![],
             supports_quic: false,
         };
         coord.request(node, peer.clone()).await;
@@ -515,6 +516,7 @@ mod tests {
                     subnets: vec![],
                     endpoints: vec![],
                     lan_endpoints: vec![],
+                    srflx_endpoints: vec![],
                     supports_quic: false,
                 },
                 ice: None,
