@@ -267,6 +267,14 @@ impl Carrier {
 pub struct PeerStats {
     tx: AtomicU64,
     rx: AtomicU64,
+    /// Phase C — latched `true` the moment a WG handshake to this peer
+    /// completes (a session exists), for EITHER role (the responder establishes
+    /// on receiving the init, the initiator on receiving the response). The
+    /// srflx / public-direct health deadline reads this LOCK-FREE to tell a live
+    /// punch from a pre-handshake zombie — whose `tx`/`rx` counters stay flat
+    /// (handshake packets touch neither), so the rx-flat heuristic can't see it
+    /// and boringtun stops even keepalives once the attempt expires at ~90 s.
+    handshake: AtomicBool,
 }
 
 /// Demux routing table: a direct peer's source address → its `Tunn` + stats.
@@ -355,6 +363,15 @@ pub struct WgDevice {
     /// once by the runtime ([`take_direct_events`](Self::take_direct_events)).
     direct_events_tx: mpsc::Sender<DirectInbound>,
     direct_events_rx: Option<mpsc::Receiver<DirectInbound>>,
+    /// Phase C — STUN Binding responses forwarded by the demux loops (a
+    /// datagram carrying the STUN cookie that is not WG-shaped). The srflx
+    /// keepalive task's query rides a shared direct socket whose `recv_from`
+    /// the demux owns, so the response can't be read directly; it arrives here.
+    /// Cloned into each demux loop; the receiver is taken once by the runtime
+    /// ([`take_stun_events`](Self::take_stun_events)). Dropped harmlessly if
+    /// nobody took it (the srflx tier is off).
+    stun_events_tx: mpsc::Sender<crate::transport::stun::StunInbound>,
+    stun_events_rx: Option<mpsc::Receiver<crate::transport::stun::StunInbound>>,
 }
 
 impl Drop for WgDevice {
@@ -375,6 +392,7 @@ impl WgDevice {
         let public = PublicKey::from(&secret);
         let (tun_tx, tun_rx) = mpsc::channel(256);
         let (direct_events_tx, direct_events_rx) = mpsc::channel(16);
+        let (stun_events_tx, stun_events_rx) = mpsc::channel(16);
         (
             Self {
                 secret,
@@ -386,6 +404,8 @@ impl WgDevice {
                 direct: None,
                 direct_events_tx,
                 direct_events_rx: Some(direct_events_rx),
+                stun_events_tx,
+                stun_events_rx: Some(stun_events_rx),
             },
             tun_rx,
         )
@@ -397,6 +417,17 @@ impl WgDevice {
     /// (`try_send` in the demux) — harmless for tests that don't care.
     pub fn take_direct_events(&mut self) -> Option<mpsc::Receiver<DirectInbound>> {
         self.direct_events_rx.take()
+    }
+
+    /// Phase C — take the receiver for demux-routed STUN Binding responses (see
+    /// [`stun_events_tx`](Self::stun_events_tx) and
+    /// [`crate::transport::stun::StunInbound`]). `None` after the first take.
+    /// The srflx keepalive task owns it and matches responses to its own
+    /// queries by source + transaction id.
+    pub fn take_stun_events(
+        &mut self,
+    ) -> Option<mpsc::Receiver<crate::transport::stun::StunInbound>> {
+        self.stun_events_rx.take()
     }
 
     /// Phase A — the demux source address a SHARED-direct peer is currently
@@ -577,6 +608,7 @@ impl WgDevice {
             demux.routes.clone(),
             tun_tx,
             self.direct_events_tx.clone(),
+            self.stun_events_tx.clone(),
         ));
         demux.socks.push(sock);
         demux.tasks.push(task);
@@ -810,6 +842,23 @@ impl WgDevice {
     pub fn peer_carrier_dead(&self, peer_public: &[u8; 32]) -> Option<bool> {
         Some(self.peers.get(peer_public)?.carrier.is_dead())
     }
+
+    /// Phase C — LOCK-FREE: has the WG handshake to `peer_public` completed (a
+    /// session exists)? `None` if the peer is unknown. The health sweep reads
+    /// this to time out a srflx / public-direct punch carrier that NEVER
+    /// established — its `tx`/`rx` counters stay flat pre-handshake, so the
+    /// rx-flat heuristic can't detect it. Latched by `process_inbound` the
+    /// instant a session appears; never cleared for the carrier's life (a fresh
+    /// carrier gets a fresh `PeerStats`).
+    pub fn peer_handshake_done(&self, peer_public: &[u8; 32]) -> Option<bool> {
+        Some(
+            self.peers
+                .get(peer_public)?
+                .stats
+                .handshake
+                .load(Ordering::Relaxed),
+        )
+    }
 }
 
 /// Handle one inbound carrier datagram: decapsulate, echo any
@@ -853,6 +902,27 @@ async fn process_inbound(
         TunnResult::Done => {}
         TunnResult::Err(e) => debug!(?e, "wg decapsulate error"),
     }
+    // Phase C — latch "handshake completed" the moment this peer's session is
+    // live. `process_inbound` only runs on a packet FROM the peer, so a set flag
+    // means the peer reached us AND a session exists (the responder establishes
+    // on the init it just answered; the initiator on the response it just got) —
+    // exactly the "punch succeeded" signal the health deadline needs. Set-once;
+    // the Tunn lock is already held here (rc.137: never lock it from the sweep).
+    if !stats.handshake.load(Ordering::Relaxed) && t.time_since_last_handshake().is_some() {
+        stats.handshake.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Phase C — the WireGuard datagram shape: a 4-byte little-endian message type
+/// in `1..=4` (Init / Response / Cookie / Data), so bytes `1..4` are always
+/// zero. Used to EXCLUDE WG traffic from the STUN-cookie demux check — a WG data
+/// packet whose receiver-index bytes happen to equal the STUN magic cookie must
+/// still route as WG. A real STUN Binding message can never satisfy this (its
+/// big-endian 16-bit type puts `0x01` in byte 1), so the two classes are
+/// disjoint. Intentionally does NOT validate length/contents — it's only the
+/// exclusion half of the STUN discriminator.
+fn is_wg_shaped(pkt: &[u8]) -> bool {
+    pkt.len() >= 4 && matches!(pkt[0], 1..=4) && pkt[1] == 0 && pkt[2] == 0 && pkt[3] == 0
 }
 
 /// rc.134 — the shared direct-socket recv loop. Reads every datagram and
@@ -866,6 +936,7 @@ async fn run_direct_demux(
     routes: Arc<Mutex<DemuxRoutes>>,
     tun_tx: mpsc::Sender<Vec<u8>>,
     events: mpsc::Sender<DirectInbound>,
+    stun_events: mpsc::Sender<crate::transport::stun::StunInbound>,
 ) {
     let mut buf = vec![0u8; WG_BUF];
     // Phase A — per-source rate limit for forwarded unknown-source initiations
@@ -879,6 +950,24 @@ async fn run_direct_demux(
                 break;
             }
         };
+        // Phase C — demux-routed STUN. A datagram carrying the STUN magic
+        // cookie that is NOT WireGuard-shaped is a Binding response for the
+        // srflx keepalive task, whose query rides this shared socket (which the
+        // task can't `recv_from` itself). Forward it to the STUN sink and skip
+        // WG routing. The two shapes are DISJOINT — WG's 4-byte LE type header
+        // leaves bytes 1..4 == 0 while a real STUN Binding message always has
+        // 0x01 in byte 1 — so this never steals a WG datagram (and a WG data
+        // packet whose index bytes happen to equal the cookie is kept by the
+        // `is_wg_shaped` exclusion). Checked BEFORE the routes lookup so a STUN
+        // reply is never mistaken for peer traffic. `try_send` drops it if
+        // nobody took the receiver (srflx tier off) — harmless.
+        if crate::transport::stun::has_stun_cookie(&buf[..n]) && !is_wg_shaped(&buf[..n]) {
+            let _ = stun_events.try_send(crate::transport::stun::StunInbound {
+                src,
+                packet: buf[..n].to_vec(),
+            });
+            continue;
+        }
         // Clone the Arcs out under the routes lock, then release it before the
         // (potentially awaiting) process_inbound so the demux map stays
         // contended only briefly.
@@ -1015,6 +1104,50 @@ mod tests {
             .expect("B did not receive a decrypted packet in time")
             .expect("tun channel closed");
         assert_eq!(got, pkt, "decrypted IP packet must arrive intact");
+    }
+
+    /// Phase C — `peer_handshake_done` latches once the WG session establishes
+    /// (the lock-free signal the srflx/public health deadline reads). Unknown
+    /// peers report `None`; a fresh peer reports `Some(false)` until the
+    /// handshake completes, then `Some(true)` on BOTH the initiator and the
+    /// responder (each sets it from an inbound packet).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn peer_handshake_done_latches_on_session_establish() {
+        let a = WgKeypair::generate();
+        let b = WgKeypair::generate();
+        let sock_a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sock_b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr_a = sock_a.local_addr().unwrap();
+        let addr_b = sock_b.local_addr().unwrap();
+
+        let (mut dev_a, _rx_a) = WgDevice::new(a.secret.clone());
+        let (mut dev_b, _rx_b) = WgDevice::new(b.secret.clone());
+
+        // Unknown peer → None.
+        assert_eq!(dev_a.peer_handshake_done(&b.public.to_bytes()), None);
+
+        dev_a.add_peer(
+            b.public.to_bytes(),
+            IP_B,
+            Carrier::direct(sock_a.clone(), addr_b),
+            true,
+        );
+        dev_b.add_peer(
+            a.public.to_bytes(),
+            IP_A,
+            Carrier::direct(sock_b.clone(), addr_a),
+            false,
+        );
+
+        // Freshly added, pre-handshake → Some(false).
+        assert_eq!(dev_a.peer_handshake_done(&b.public.to_bytes()), Some(false));
+
+        wait_connected(&dev_a, &b.public.to_bytes()).await;
+        wait_connected(&dev_b, &a.public.to_bytes()).await;
+
+        // Both ends latch true (each established via an inbound packet).
+        assert_eq!(dev_a.peer_handshake_done(&b.public.to_bytes()), Some(true));
+        assert_eq!(dev_b.peer_handshake_done(&a.public.to_bytes()), Some(true));
     }
 
     /// rc.134 — one HUB device serves TWO peers over a SINGLE shared socket
@@ -1596,5 +1729,98 @@ mod tests {
             .expect("HUB never received the decrypted packet")
             .expect("tun channel closed");
         assert_eq!(got, pkt, "decrypted IP packet must arrive intact");
+    }
+
+    /// Phase C — the demux discriminates STUN Binding messages (→ the STUN
+    /// sink, for the srflx keepalive) from WireGuard traffic (unknown-source
+    /// inits → `direct_events`; everything else dropped), and a WG datagram
+    /// whose receiver-index bytes collide with the STUN magic cookie is NOT
+    /// mis-forwarded to the sink.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn demux_routes_stun_to_sink_and_wg_to_events() {
+        let hub = WgKeypair::generate();
+        let client = WgKeypair::generate();
+        let sock_hub = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let hub_addr = sock_hub.local_addr().unwrap();
+
+        let (mut dev_hub, _rx_hub) = WgDevice::new(hub.secret.clone());
+        dev_hub.ensure_direct_demux(sock_hub.clone());
+        let mut direct_events = dev_hub.take_direct_events().unwrap();
+        let mut stun_events = dev_hub.take_stun_events().unwrap();
+
+        // An external socket standing in for the STUN server / a peer.
+        let ext = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ext_addr = ext.local_addr().unwrap();
+
+        // (1) A STUN Binding message → the STUN sink, carrying its source.
+        let stun_msg = crate::transport::stun::encode_binding_request([7u8; 12]);
+        ext.send_to(&stun_msg, hub_addr).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(5), stun_events.recv())
+            .await
+            .expect("STUN datagram never reached the sink")
+            .expect("stun sink closed");
+        assert_eq!(got.src, ext_addr, "sink item carries the STUN source");
+        assert_eq!(
+            got.packet,
+            stun_msg.to_vec(),
+            "sink item is the STUN datagram"
+        );
+        assert!(
+            direct_events.try_recv().is_err(),
+            "a STUN datagram must NOT reach direct_events"
+        );
+
+        // (2) A WG-shaped datagram whose index bytes equal the STUN cookie is
+        // kept as WG (dropped here — unknown source, not an init), NOT sent to
+        // the sink. Follow it with a sentinel STUN; FIFO per socket guarantees
+        // the lookalike was handled first, so receiving the sentinel proves the
+        // lookalike went nowhere.
+        let mut wg_lookalike = vec![0u8; 48];
+        wg_lookalike[0] = 4; // Data type (LE 4-byte type → bytes 1..4 == 0)
+        wg_lookalike[4..8].copy_from_slice(&0x2112_A442u32.to_be_bytes()); // STUN cookie
+        ext.send_to(&wg_lookalike, hub_addr).await.unwrap();
+        let sentinel = crate::transport::stun::encode_binding_request([9u8; 12]);
+        ext.send_to(&sentinel, hub_addr).await.unwrap();
+        let got2 = tokio::time::timeout(Duration::from_secs(5), stun_events.recv())
+            .await
+            .expect("sentinel STUN never reached the sink")
+            .expect("stun sink closed");
+        assert_eq!(
+            got2.packet,
+            sentinel.to_vec(),
+            "sink got the sentinel, not the WG-cookie-lookalike"
+        );
+        assert!(
+            direct_events.try_recv().is_err(),
+            "a WG-shaped datagram must NOT reach direct_events from an unknown source"
+        );
+
+        // (3) A genuine unknown-source WG handshake init → direct_events, and
+        // NOT the STUN sink.
+        let (mut dev_client, _rx_client) = WgDevice::new(client.secret.clone());
+        let sock_client = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        dev_client.ensure_direct_demux(sock_client.clone());
+        dev_client
+            .add_direct_peer(
+                sock_client.clone(),
+                hub.public.to_bytes(),
+                IP_B,
+                hub_addr,
+                true,
+            )
+            .await;
+        let inb = tokio::time::timeout(Duration::from_secs(5), direct_events.recv())
+            .await
+            .expect("WG init never reached direct_events")
+            .expect("direct_events closed");
+        assert_eq!(
+            dev_hub.authenticate_init(&inb.packet),
+            Some(client.public.to_bytes()),
+            "the forwarded init authenticates to the client's key"
+        );
+        assert!(
+            stun_events.try_recv().is_err(),
+            "a WG init must NOT reach the STUN sink"
+        );
     }
 }

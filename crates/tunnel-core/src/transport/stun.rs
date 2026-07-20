@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
 
 /// STUN magic cookie (RFC 5389 §6).
 const MAGIC_COOKIE: u32 = 0x2112_A442;
@@ -120,6 +121,87 @@ pub async fn srflx_query(
     bail!("stun srflx query failed after 3 attempts: {last_err}")
 }
 
+/// Phase C — a STUN Binding response demux-routed off a shared overlay direct
+/// socket. That socket's `recv_from` is owned by the overlay demux loop (which
+/// dispatches WireGuard datagrams by source address), so the srflx keepalive
+/// task can't read the socket itself; the demux forwards STUN-shaped datagrams
+/// here instead. [`srflx_query_via_sink`] matches them by source + transaction
+/// id. `src` is the datagram's source (must equal the queried STUN server).
+#[derive(Debug, Clone)]
+pub struct StunInbound {
+    pub src: SocketAddr,
+    pub packet: Vec<u8>,
+}
+
+/// Phase C — cheap first-pass test that a datagram carries the STUN magic
+/// cookie in the canonical position (RFC 5389 §6): a ≥20-byte header with the
+/// cookie at bytes 4..8. This is NOT proof it's STUN — the caller must ALSO
+/// exclude the WireGuard message shape, which is disjoint from a real STUN
+/// Binding message (WG's 4-byte little-endian type header leaves bytes 1..4 == 0,
+/// whereas a STUN Binding message's big-endian 16-bit type always puts 0x01 in
+/// byte 1). The sink consumer then validates the transaction id, so a stray
+/// cookie-carrying junk datagram is rejected there.
+pub fn has_stun_cookie(pkt: &[u8]) -> bool {
+    pkt.len() >= 20 && pkt[4..8] == MAGIC_COOKIE.to_be_bytes()
+}
+
+/// Phase C — like [`srflx_query`] but the response arrives over `sink` (fed by
+/// the overlay demux loop) instead of a direct `recv_from`, because `sock` is a
+/// shared direct socket the caller doesn't own the read side of. Sends the
+/// Binding Request on `sock`, then drains `sink` for a response whose source is
+/// `stun_server` and whose transaction id matches, parsing the de-XORed public
+/// `ip:port`. Unrelated/stale sink items (another target, an old txn) are
+/// skipped within the attempt budget. Retries a few times (STUN rides UDP).
+pub async fn srflx_query_via_sink(
+    sock: &UdpSocket,
+    sink: &mut mpsc::Receiver<StunInbound>,
+    stun_server: SocketAddr,
+    attempt_timeout: Duration,
+) -> Result<SocketAddr> {
+    let mut last_err = String::from("no attempts made");
+    for _ in 0..3 {
+        let txn_id: [u8; 12] = rand::random();
+        let req = encode_binding_request(txn_id);
+        sock.send_to(&req, stun_server)
+            .await
+            .context("stun: send binding request (sink)")?;
+
+        let deadline = tokio::time::Instant::now() + attempt_timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                last_err = "stun: response timed out (sink)".into();
+                break;
+            }
+            match tokio::time::timeout(remaining, sink.recv()).await {
+                Ok(Some(StunInbound { src, packet })) => {
+                    // A response for a different target or an earlier attempt —
+                    // keep waiting within this attempt's remaining budget.
+                    if src != stun_server {
+                        continue;
+                    }
+                    if packet.len() < 20 || packet[8..20] != txn_id {
+                        continue;
+                    }
+                    if let Some(srflx) = parse_xor_mapped_address(&packet) {
+                        return Ok(srflx);
+                    }
+                    last_err = "stun: no XOR-MAPPED-ADDRESS in success response (sink)".into();
+                    break;
+                }
+                // The demux (and thus the sink sender) is gone — the device is
+                // shutting down; no point retrying.
+                Ok(None) => bail!("stun: sink closed"),
+                Err(_) => {
+                    last_err = "stun: response timed out (sink)".into();
+                    break;
+                }
+            }
+        }
+    }
+    bail!("stun srflx query (sink) failed after 3 attempts: {last_err}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,5 +277,76 @@ mod tests {
             .await
             .expect("query must succeed against fake server");
         assert_eq!(srflx, SocketAddr::from(([198, 51, 100, 7], 5000)));
+    }
+
+    #[test]
+    fn has_stun_cookie_matches_binding_rejects_short_and_uncookied() {
+        // A real Binding Success carries the cookie at bytes 4..8.
+        let resp = fake_success_response([0u8; 12], [192, 0, 2, 10], 4096);
+        assert!(has_stun_cookie(&resp));
+        // Too short to hold a header.
+        assert!(!has_stun_cookie(&[0x21, 0x12, 0xA4, 0x42]));
+        // Cookie corrupted → not STUN-shaped.
+        let mut no_cookie = resp.clone();
+        no_cookie[4] ^= 0xFF;
+        assert!(!has_stun_cookie(&no_cookie));
+    }
+
+    /// The demux-routed path: the response is delivered over a sink (as the
+    /// overlay demux loop does) rather than a direct `recv_from`. Exercises the
+    /// source + transaction-id matching, skipping a wrong-source and a
+    /// wrong-txn item before accepting the genuine one.
+    #[tokio::test]
+    async fn srflx_query_via_sink_matches_source_and_txn() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (_n, _from) = server.recv_from(&mut buf).await.unwrap();
+            let txn: [u8; 12] = buf[8..20].try_into().unwrap();
+            let good = fake_success_response(txn, [198, 51, 100, 7], 5000);
+            // (1) right txn but WRONG source → skipped.
+            let _ = tx
+                .send(StunInbound {
+                    src: "203.0.113.9:3478".parse().unwrap(),
+                    packet: good.clone(),
+                })
+                .await;
+            // (2) right source but WRONG txn → skipped.
+            let _ = tx
+                .send(StunInbound {
+                    src: server_addr,
+                    packet: fake_success_response([9u8; 12], [10, 0, 0, 1], 1),
+                })
+                .await;
+            // (3) right source + txn → accepted.
+            let _ = tx
+                .send(StunInbound {
+                    src: server_addr,
+                    packet: good,
+                })
+                .await;
+        });
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let srflx = srflx_query_via_sink(&client, &mut rx, server_addr, Duration::from_secs(2))
+            .await
+            .expect("sink query must succeed");
+        assert_eq!(srflx, SocketAddr::from(([198, 51, 100, 7], 5000)));
+    }
+
+    #[tokio::test]
+    async fn srflx_query_via_sink_times_out_when_sink_silent() {
+        // Hold the sender so the channel stays open (exercises the timeout
+        // path, not the sink-closed path); never feed it.
+        let (_tx, mut rx) = mpsc::channel::<StunInbound>(1);
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        assert!(
+            srflx_query_via_sink(&client, &mut rx, server, Duration::from_millis(40))
+                .await
+                .is_err()
+        );
     }
 }
