@@ -56,6 +56,15 @@ pub struct ReadyLink {
     /// rc.142 — the peer advertised QUIC-over-TURN support. `install_ready`
     /// only attempts the QUIC upgrade when this is set (both ends must agree).
     pub supports_quic: bool,
+    /// Phase D — this link is a v1 single-relay pair (anchor or dialer side).
+    /// `install_ready` MUST upgrade it to QUIC-over-relay REGARDLESS of the
+    /// `OVERLAY_QUIC` opt-in: a raw `Carrier::Relay` discards the recv source,
+    /// so an anchor can't reply to a symmetric dialer's coturn-observed port —
+    /// only the QUIC server consumes the observed path (plan BLOCKER 1). Safe
+    /// to force symmetrically: a single-relay link only exists when BOTH ends
+    /// advertised `supports_relay_single`, and every build that advertises it
+    /// carries this same force-QUIC rule, so the pair can't split QUIC/raw.
+    pub single_relay: bool,
     /// Phase 1 — approved subnet routes this peer is a router for; `install_ready`
     /// registers them in the router + installs OS routes.
     pub subnets: Vec<super::router::Cidr>,
@@ -320,7 +329,8 @@ impl RelayCoordinator {
     /// netmap) — we must not dial its LAN address as the "relay".
     fn try_build(&mut self, node_id: &ObjectId) -> Option<ReadyLink> {
         let a = self.allocated.get(node_id)?;
-        let dst: SocketAddr = if self.single_relay_role(&a.peer) == Some(true) {
+        let single_anchor = self.single_relay_role(&a.peer) == Some(true);
+        let dst: SocketAddr = if single_anchor {
             // Phase D ANCHOR: we hold the ONE allocation; the DIALER runs none
             // and advertises no relay, so dial its public IP — taken from its
             // srflx bucket (Phase C) — purely for the IP-only `\x00` permission
@@ -358,10 +368,11 @@ impl RelayCoordinator {
             carrier,
             relay_parts: Some((a.conn.clone(), dst)),
             supports_quic: a.peer.supports_quic,
+            single_relay: single_anchor,
             subnets: a.peer.subnets.clone(),
         };
         self.allocated.remove(node_id);
-        info!(peer = %node_id, %dst, "overlay relay: link ready");
+        info!(peer = %node_id, %dst, single_relay = single_anchor, "overlay relay: link ready");
         Some(link)
     }
 
@@ -394,6 +405,7 @@ impl RelayCoordinator {
             carrier,
             relay_parts: Some((conn, r)),
             supports_quic: peer.supports_quic,
+            single_relay: true,
             subnets: peer.subnets.clone(),
         };
         self.dialing.remove(node_id);
@@ -808,6 +820,11 @@ mod tests {
         assert!(
             link.supports_quic,
             "supports_quic carries through so install_ready runs the QUIC upgrade"
+        );
+        assert!(
+            link.single_relay,
+            "single_relay marks the link so install_ready FORCES the QUIC carrier \
+             (a raw relay can't reply to a symmetric dialer's observed port)"
         );
         let (_conn, dst) = link.relay_parts.expect("relay parts present");
         assert_eq!(
