@@ -187,6 +187,20 @@ pub fn srflx_enabled() -> bool {
     }
 }
 
+/// Phase C — the srflx keepalive/re-gather interval in seconds
+/// (`ROOMLER_NODE_OVERLAY_SRFLX_KEEPALIVE_SECS`, default 20). The task re-runs a
+/// STUN Binding on the punch socket every interval to (a) hold the NAT mapping
+/// open on an idle link and (b) detect + re-advertise a changed mapping. **`0`
+/// disables the task entirely** — the startup gather still advertises once, but
+/// there's no in-band refresh (the mapping then relies on WG keepalives for
+/// active links only). A malformed value falls back to the default.
+pub fn srflx_keepalive_secs() -> u64 {
+    match crate::env::node_env("OVERLAY_SRFLX_KEEPALIVE_SECS") {
+        Some(v) => v.trim().parse::<u64>().unwrap_or(20),
+        None => 20,
+    }
+}
+
 /// Phase A — a globally-routable IPv4: the address classes that can never be
 /// dialled across the internet are excluded (RFC1918 private, loopback,
 /// link-local, CGNAT/overlay `100.64/10`, `0/8`, multicast `224/4`, and
@@ -292,18 +306,26 @@ pub fn parse_stun_url(url: &str) -> Option<SocketAddr> {
 /// srflx `ip:port` strings to advertise; a socket whose query fails, times out,
 /// or maps to a non-public address (STUN server on the LAN, a hairpin) is
 /// skipped. v4-only.
+///
+/// Phase C — each candidate is returned WITH the interface socket it was
+/// gathered on. The overlay must later DIAL a peer's srflx from the socket that
+/// owns OUR advertised srflx (so our outbound INITs ride the same NAT mapping we
+/// advertised, opening our filter toward the peer — the hole-punch); pairing the
+/// candidate with its socket lets the caller pick that "punch socket". The first
+/// pair is the punch socket (its candidate is advertised at index 0, which the
+/// peer's dial-side picks first). Deduped by candidate string.
 pub async fn gather_srflx(
     socks: &[(Ipv4Addr, Arc<UdpSocket>)],
     stun_server: SocketAddr,
     attempt_timeout: Duration,
-) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
+) -> Vec<(String, Arc<UdpSocket>)> {
+    let mut out: Vec<(String, Arc<UdpSocket>)> = Vec::new();
     for (_ip, sock) in socks {
         match crate::transport::stun::srflx_query(sock, stun_server, attempt_timeout).await {
             Ok(SocketAddr::V4(srflx)) if is_public_v4(*srflx.ip()) => {
                 let ep = SocketAddr::V4(srflx).to_string();
-                if !out.contains(&ep) {
-                    out.push(ep);
+                if !out.iter().any(|(e, _)| e == &ep) {
+                    out.push((ep, sock.clone()));
                 }
             }
             Ok(other) => {
@@ -347,6 +369,87 @@ pub async fn resolve_stun_server(stun_urls: &[String]) -> Option<SocketAddr> {
         }
     }
     None
+}
+
+/// Phase C — resolve up to TWO DISTINCT STUN targets for the NAT-type probe.
+/// The probe compares our mapped address as two different servers see it: same
+/// ⇒ endpoint-independent mapping (cone — hole-punchable); different ⇒ symmetric
+/// (address/port-dependent — the peer can't predict our port). Prefers two
+/// DISTINCT IPs (the fleet resolves `coturn.roomler.ai` to several workers — the
+/// strongest test, catching address-dependent mapping); else falls back to two
+/// distinct ports on one IP (catches address-and-port-dependent mapping, the
+/// common symmetric). v4 only. 0-2 results; fewer than 2 ⇒ the caller can't
+/// classify (→ "unknown", stays optimistic and still attempts the punch).
+pub async fn resolve_stun_targets(stun_urls: &[String]) -> Vec<SocketAddr> {
+    let mut all: Vec<SocketAddr> = Vec::new();
+    for url in stun_urls {
+        if let Some(sa) = parse_stun_url(url) {
+            if !all.contains(&sa) {
+                all.push(sa);
+            }
+            continue;
+        }
+        let s = url.trim();
+        let s = s
+            .strip_prefix("stun:")
+            .or_else(|| s.strip_prefix("stuns:"))
+            .or_else(|| s.strip_prefix("turn:"))
+            .or_else(|| s.strip_prefix("turns:"))
+            .unwrap_or(s);
+        let hostport = s.split(['?', '#']).next().unwrap_or(s);
+        if let Ok(addrs) = lookup_host(hostport).await {
+            for a in addrs.filter(SocketAddr::is_ipv4) {
+                if !all.contains(&a) {
+                    all.push(a);
+                }
+            }
+        }
+    }
+    let mut out: Vec<SocketAddr> = Vec::new();
+    if let Some(&first) = all.first() {
+        out.push(first);
+        // Prefer a DIFFERENT IP; else any other distinct endpoint (diff port).
+        if let Some(&diff) = all
+            .iter()
+            .find(|a| a.ip() != first.ip())
+            .or_else(|| all.iter().find(|&&a| a != first))
+        {
+            out.push(diff);
+        }
+    }
+    out
+}
+
+/// Phase C — classify this node's NAT mapping by STUNning `sock` against TWO
+/// distinct `targets`. Endpoint-INDEPENDENT mapping (the same public `ip:port`
+/// from both) ⇒ `"cone"` (hole-punchable); a DIFFERENT mapping per target ⇒
+/// `"symmetric"` (not punchable). `None` when there are fewer than two targets
+/// or either query fails — the caller then advertises no NAT type and still
+/// ATTEMPTS the punch ("unknown" is optimistic). MUST run on the punch socket
+/// BEFORE its demux loop starts (same socket-read race as [`gather_srflx`]).
+pub async fn probe_nat_type(
+    sock: &UdpSocket,
+    targets: &[SocketAddr],
+    attempt_timeout: Duration,
+) -> Option<&'static str> {
+    if targets.len() < 2 {
+        return None;
+    }
+    let a = crate::transport::stun::srflx_query(sock, targets[0], attempt_timeout)
+        .await
+        .ok()?;
+    let b = crate::transport::stun::srflx_query(sock, targets[1], attempt_timeout)
+        .await
+        .ok()?;
+    Some(if a == b { "cone" } else { "symmetric" })
+}
+
+/// Phase C — should we ATTEMPT a srflx hole-punch given both ends' NAT types?
+/// Skip only when we're CONFIDENT it can't work: BOTH ends symmetric (neither
+/// can predict the other's per-destination port). Any `None`/"unknown" stays
+/// optimistic and attempts (the tight handshake deadline bounds a wasted try).
+pub fn srflx_punch_worth_trying(mine: Option<&str>, peer: Option<&str>) -> bool {
+    !(mine == Some("symmetric") && peer == Some("symmetric"))
 }
 
 #[cfg(test)]
@@ -575,9 +678,14 @@ mod tests {
         // A PUBLIC srflx reply is captured.
         let (pub_srv, _h1) = fake_stun_server([203, 0, 113, 9], 40000).await;
         let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let socks = vec![("127.0.0.1".parse().unwrap(), sock)];
+        let socks = vec![("127.0.0.1".parse().unwrap(), sock.clone())];
         let got = gather_srflx(&socks, pub_srv, Duration::from_millis(500)).await;
-        assert_eq!(got, vec!["203.0.113.9:40000".to_string()]);
+        assert_eq!(got.len(), 1, "one public srflx");
+        assert_eq!(got[0].0, "203.0.113.9:40000".to_string());
+        assert!(
+            Arc::ptr_eq(&got[0].1, &sock),
+            "candidate carries its own socket"
+        );
 
         // A PRIVATE srflx (STUN on the LAN / hairpin) is filtered out.
         let (priv_srv, _h2) = fake_stun_server([192, 168, 1, 5], 41000).await;
@@ -621,5 +729,86 @@ mod tests {
             .await,
             Some(want)
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_stun_targets_prefers_distinct_ips_else_ports() {
+        // Two IP-literal URLs on distinct IPs → both returned (strongest probe).
+        let t = resolve_stun_targets(&[
+            "stun:5.9.157.221:3478".to_string(),
+            "stun:94.130.141.98:3478".to_string(),
+        ])
+        .await;
+        assert_eq!(t.len(), 2);
+        assert_ne!(t[0].ip(), t[1].ip());
+        // Same IP, two ports → distinct-port fallback (still two targets).
+        let t2 = resolve_stun_targets(&[
+            "stun:5.9.157.221:3478".to_string(),
+            "stun:5.9.157.221:443".to_string(),
+        ])
+        .await;
+        assert_eq!(t2.len(), 2);
+        assert_eq!(t2[0].ip(), t2[1].ip());
+        assert_ne!(t2[0].port(), t2[1].port());
+        // A single target → len 1 (the caller can't classify).
+        assert_eq!(
+            resolve_stun_targets(&["stun:5.9.157.221:3478".to_string()])
+                .await
+                .len(),
+            1
+        );
+        // Empty → empty.
+        assert!(resolve_stun_targets(&[]).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn probe_nat_type_cone_vs_symmetric_else_none() {
+        // Cone: both servers observe the SAME public mapping.
+        let (a, _h1) = fake_stun_server([203, 0, 113, 9], 5000).await;
+        let (b, _h2) = fake_stun_server([203, 0, 113, 9], 5000).await;
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        assert_eq!(
+            probe_nat_type(&sock, &[a, b], Duration::from_millis(500)).await,
+            Some("cone")
+        );
+
+        // Symmetric: the two servers observe DIFFERENT ports.
+        let (c, _h3) = fake_stun_server([203, 0, 113, 9], 5000).await;
+        let (d, _h4) = fake_stun_server([203, 0, 113, 9], 6000).await;
+        let sock2 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        assert_eq!(
+            probe_nat_type(&sock2, &[c, d], Duration::from_millis(500)).await,
+            Some("symmetric")
+        );
+
+        // Fewer than two targets → can't classify.
+        let sock3 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        assert_eq!(
+            probe_nat_type(&sock3, &[a], Duration::from_millis(200)).await,
+            None
+        );
+        // A dead target → None (caller stays optimistic and attempts anyway).
+        let dead: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let sock4 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        assert_eq!(
+            probe_nat_type(&sock4, &[a, dead], Duration::from_millis(150)).await,
+            None
+        );
+    }
+
+    #[test]
+    fn srflx_punch_worth_trying_skips_only_both_symmetric() {
+        // Skip ONLY when both ends are confidently symmetric.
+        assert!(!srflx_punch_worth_trying(
+            Some("symmetric"),
+            Some("symmetric")
+        ));
+        // Any cone / unknown side → attempt.
+        assert!(srflx_punch_worth_trying(Some("symmetric"), Some("cone")));
+        assert!(srflx_punch_worth_trying(Some("cone"), Some("symmetric")));
+        assert!(srflx_punch_worth_trying(Some("cone"), Some("cone")));
+        assert!(srflx_punch_worth_trying(Some("symmetric"), None));
+        assert!(srflx_punch_worth_trying(None, Some("symmetric")));
+        assert!(srflx_punch_worth_trying(None, None));
     }
 }

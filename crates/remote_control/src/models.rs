@@ -817,6 +817,14 @@ pub struct OverlayNode {
     /// fresh srflx per connection, so a stale mapping never lingers.
     #[serde(default)]
     pub srflx_endpoints: Vec<String>,
+    /// NAT-traversal Phase C — the node's probed NAT mapping type (`"cone"` /
+    /// `"symmetric"`), trickled alongside its srflx via `rc:overlay.srflx` and
+    /// surfaced as `NetmapPeer.srflx_nat`. A dialer skips the punch only when
+    /// BOTH ends are `"symmetric"`. `None` = unknown (attempted, never skipped).
+    /// Reset on each (re)join with `srflx_endpoints` — a prior session's NAT
+    /// class is meaningless after a roam (A8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub srflx_nat: Option<String>,
     /// Preferred relay region/home, if any (Phase 5 multi-relay).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_home: Option<String>,
