@@ -166,47 +166,54 @@ pub fn public_direct_enabled() -> bool {
     }
 }
 
-/// NAT-traversal Phase B — opt-in gate for the **srflx** carrier tier
+/// NAT-traversal Phase B/C — gate for the **srflx** carrier tier
 /// (`ROOMLER_NODE_OVERLAY_SRFLX`; legacy `ROOMLER_AGENT_…` alias honoured).
-/// **Default OFF** per CC8, independent of the public-direct gate. Turns on the
-/// whole srflx tier: gathering + advertising this node's own server-reflexive
-/// candidates (via STUN), AND dialing a peer's advertised srflx (a 1:1/cone-NAT
-/// node whose NIC IP is private). Reuses Phase A's `public_sock` + demux +
-/// authenticated-inbound accept, so the egress socket + inbound receiver are
-/// wired whenever EITHER tier is on.
+/// **Default ON** since 2026-07-20 (field-proven: a cone↔cone pair hole-punches
+/// to a DIRECT carrier — mars↔zeus netns lab, 0% loss, ~0.6 ms, half the relay
+/// RTT). Turns on the whole srflx tier: gathering + advertising this node's own
+/// server-reflexive candidates (via STUN), AND dialing a peer's advertised srflx
+/// (a 1:1/cone-NAT node whose NIC IP is private). The tier FALLS THROUGH — a
+/// failed/both-symmetric punch degrades to the relay tier — so default-ON only
+/// adds a direct-connect fast path, never removes reachability. Set the env to
+/// `0`/`false`/`no`/`off` to disable.
 pub fn srflx_enabled() -> bool {
     match crate::env::node_env("OVERLAY_SRFLX") {
         Some(v) => {
             let t = v.trim();
-            t.eq_ignore_ascii_case("1")
-                || t.eq_ignore_ascii_case("true")
-                || t.eq_ignore_ascii_case("yes")
-                || t.eq_ignore_ascii_case("on")
+            !(t.eq_ignore_ascii_case("0")
+                || t.eq_ignore_ascii_case("false")
+                || t.eq_ignore_ascii_case("no")
+                || t.eq_ignore_ascii_case("off"))
         }
-        None => false,
+        None => true,
     }
 }
 
-/// NAT-traversal Phase D — opt-in gate for the **single-relay** carrier tier
+/// NAT-traversal Phase D — gate for the **single-relay** carrier tier
 /// (`ROOMLER_NODE_OVERLAY_RELAY_SINGLE`; legacy `ROOMLER_AGENT_…` alias
-/// honoured). **Default OFF** per CC8. When on (and both ends advertise the
-/// capability), a relay-tier pair uses ONE coturn allocation — the ANCHOR
+/// honoured). **Default ON** since 2026-07-20. When on (and both ends advertise
+/// the capability), a relay-tier pair uses ONE coturn allocation — the ANCHOR
 /// (smaller pubkey) allocates + runs the QUIC server + permits the dialer's IP;
 /// the DIALER (larger pubkey) sends raw UDP to the anchor's relayed address as a
 /// plain TURN peer (no allocation). This avoids the both-allocate coturn hairpin
-/// (field bug #2) and carries symmetric NAT (permissions are IP-only). v1 serves
-/// BOTH-UDP-OK pairs; UDP-blocked pairs stay on the both-allocate/TURNS path.
-/// Field-proven live (V-D1, 2026-07-20) before this gate ships default-ON.
+/// (the open REKEY_TIMEOUT relay bug) and carries symmetric NAT (permissions are
+/// IP-only). Field-proven in the full runtime (sym↔sym mars↔zeus netns lab,
+/// 2026-07-20: `single_relay=true` → QUIC-over-TURN up both ways → WG 0% loss);
+/// default-ON is net-positive since both-allocate was already broken cross-NAT.
+/// v1 serves BOTH-UDP-OK pairs; a UDP-blocked dialer (raw UDP can't reach
+/// coturn) stays dark on the relay tier — the documented v1 limitation, no worse
+/// than the broken both-allocate it replaces. Set `0`/`false`/`no`/`off` to
+/// disable.
 pub fn relay_single_enabled() -> bool {
     match crate::env::node_env("OVERLAY_RELAY_SINGLE") {
         Some(v) => {
             let t = v.trim();
-            t.eq_ignore_ascii_case("1")
-                || t.eq_ignore_ascii_case("true")
-                || t.eq_ignore_ascii_case("yes")
-                || t.eq_ignore_ascii_case("on")
+            !(t.eq_ignore_ascii_case("0")
+                || t.eq_ignore_ascii_case("false")
+                || t.eq_ignore_ascii_case("no")
+                || t.eq_ignore_ascii_case("off"))
         }
-        None => false,
+        None => true,
     }
 }
 

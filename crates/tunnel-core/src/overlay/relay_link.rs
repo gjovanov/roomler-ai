@@ -757,9 +757,10 @@ mod tests {
             supports_relay_single: sup,
             ..base_peer()
         };
-        // Off by default (flag captured from the unset env) → both-allocate,
-        // regardless of pubkeys.
-        let off = RelayCoordinator::new(tx.clone(), small, vec![]);
+        // Flag explicitly off → both-allocate, regardless of pubkeys (the gate
+        // now defaults ON, so force it off here to lock the disabled path).
+        let mut off = RelayCoordinator::new(tx.clone(), small, vec![]);
+        off.single_relay = false;
         assert_eq!(off.single_relay_role(&peer(large, true)), None);
 
         // Flag on + peer advertises → role decided purely by pubkey order, and
