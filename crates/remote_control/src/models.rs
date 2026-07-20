@@ -806,6 +806,17 @@ pub struct OverlayNode {
     /// change is picked up.
     #[serde(default)]
     pub lan_endpoints: Vec<String>,
+    /// NAT-traversal Phase B — the node's SERVER-REFLEXIVE (srflx) candidates:
+    /// its public `ip:port` as seen through its NAT, discovered by the node
+    /// querying STUN on its own traffic sockets and trickled up via
+    /// `rc:overlay.srflx`. A THIRD bucket, separate from `lan_endpoints` (public
+    /// NIC) and `endpoints` (relay), so no trickle clobbers another's provenance
+    /// (CC2). Surfaced VERBATIM in the netmap as `NetmapPeer.srflx_endpoints` so
+    /// a peer behind a different NAT can dial this node directly (1:1 / cone NAT
+    /// only). Reset to empty on each (re)join — the node re-gathers + re-trickles
+    /// fresh srflx per connection, so a stale mapping never lingers.
+    #[serde(default)]
+    pub srflx_endpoints: Vec<String>,
     /// Preferred relay region/home, if any (Phase 5 multi-relay).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_home: Option<String>,

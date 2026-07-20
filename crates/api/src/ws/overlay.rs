@@ -94,6 +94,10 @@ pub async fn relay_overlay_msg_from_node(
             handle_overlay_endpoints(state, ident, candidates).await;
             None
         }
+        ClientMsg::OverlaySrflx { candidates } => {
+            handle_overlay_srflx(state, ident, candidates).await;
+            None
+        }
         ClientMsg::OverlayLeave {} => {
             handle_overlay_leave(state, ident).await;
             None
@@ -265,6 +269,11 @@ async fn handle_overlay_join(
                 mtu: network.mtu,
                 magic_domain,
                 nameservers,
+                // NAT-traversal Phase B — the STUN endpoints a node queries to
+                // gather its srflx candidates, derived from the configured
+                // coturn workers (a `turn:host:port` UDP listener also answers
+                // STUN Binding). Empty when TURN is unconfigured → srflx inert.
+                stun_urls: stun_urls_from_turn(state),
             },
             peers,
             epoch,
@@ -307,6 +316,35 @@ async fn handle_overlay_endpoints(state: &AppState, ident: NodeIdentity, candida
 
     let mut updated = self_node;
     updated.endpoints = candidates;
+    let epoch = next_epoch();
+    let upsert = to_netmap_peer(&updated);
+    fan_delta_to_peers(state, &updated, epoch, vec![upsert], vec![]).await;
+}
+
+/// NAT-traversal Phase B — the node trickled its server-reflexive (srflx)
+/// candidates. Store them in the SEPARATE `srflx_endpoints` bucket (so a relay
+/// trickle can't clobber them) → fan an upsert delta so peers learn the srflx
+/// and can dial this node directly through its NAT. Stored verbatim: the dial
+/// side already filters to public IPv4 (`direct::pick_public_endpoint`), and a
+/// peer only dials the srflx of an ACL-authorised netmap peer — same trust
+/// model as `endpoints`/`lan_endpoints`.
+async fn handle_overlay_srflx(state: &AppState, ident: NodeIdentity, candidates: Vec<String>) {
+    let Some(self_node) = current_node(state, ident).await else {
+        debug!(?ident, "overlay.srflx before join; ignoring");
+        return;
+    };
+    let Some(self_id) = self_node.id else { return };
+    if let Err(e) = state
+        .overlay_nodes
+        .update_srflx_endpoints(self_id, &candidates)
+        .await
+    {
+        warn!(%self_id, %e, "overlay.srflx: update failed");
+        return;
+    }
+
+    let mut updated = self_node;
+    updated.srflx_endpoints = candidates;
     let epoch = next_epoch();
     let upsert = to_netmap_peer(&updated);
     fan_delta_to_peers(state, &updated, epoch, vec![upsert], vec![]).await;
@@ -577,6 +615,11 @@ fn to_netmap_peer(node: &OverlayNode) -> NetmapPeer {
         // host public IPs — indistinguishable from a real public-on-NIC endpoint
         // in the union. Empty for a client that advertised no public endpoint.
         lan_endpoints: node.lan_endpoints.clone(),
+        // NAT-traversal Phase B — surface the srflx bucket VERBATIM (its own
+        // provenance, like `lan_endpoints`): a peer behind a different NAT dials
+        // these to reach a 1:1/cone-NAT'd node directly. Empty until the node
+        // gathers + trickles srflx (`rc:overlay.srflx`).
+        srflx_endpoints: node.srflx_endpoints.clone(),
         relay_home: node.relay_home.clone(),
         reachable: true,
         supports_quic: node.supports_quic,
@@ -713,6 +756,48 @@ fn turn_url_host(u: &str) -> Option<String> {
     (!host.is_empty()).then(|| host.to_string())
 }
 
+/// `host:port` of a `turn:`/`turns:` url (strips scheme + `?query`), e.g.
+/// `turn:coturn.roomler.ai:3478?transport=udp` → `coturn.roomler.ai:3478`.
+/// `None` if there's no `host:port` pair.
+fn turn_url_host_port(u: &str) -> Option<String> {
+    let rest = u
+        .strip_prefix("turns:")
+        .or_else(|| u.strip_prefix("turn:"))?;
+    let hp = rest.split('?').next()?;
+    (!hp.is_empty() && hp.contains(':')).then(|| hp.to_string())
+}
+
+/// NAT-traversal Phase B — the STUN endpoints a joining node queries to gather
+/// its server-reflexive candidates, derived from the configured coturn workers.
+/// A coturn `turn:host:port` UDP listener also answers STUN Binding requests, so
+/// each UDP `turn:` URL maps to a `stun:host:port`. `turns:` (TLS) and
+/// `?transport=tcp` variants are skipped — plain STUN is UDP. Deduped. Empty
+/// when TURN isn't configured (dev), which leaves the srflx tier inert.
+fn stun_urls_from_turn(state: &AppState) -> Vec<String> {
+    match build_turn_config(&state.settings.turn) {
+        Some(cfg) => stun_urls_from_turn_urls(&cfg.urls),
+        None => Vec::new(),
+    }
+}
+
+/// Pure core of [`stun_urls_from_turn`] — testable without an `AppState`.
+fn stun_urls_from_turn_urls(turn_urls: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for u in turn_urls {
+        if u.starts_with("turns:") || u.contains("transport=tcp") {
+            continue;
+        }
+        let Some(hp) = turn_url_host_port(u) else {
+            continue;
+        };
+        let stun = format!("stun:{hp}");
+        if !out.contains(&stun) {
+            out.push(stun);
+        }
+    }
+    out
+}
+
 /// Short-TTL process cache of the resolved coturn worker IP set.
 ///
 /// The relay pin MUST be identical for BOTH ends of a pair — they co-locate on
@@ -833,6 +918,52 @@ mod tests {
             Some("coturn.roomler.ai")
         );
         assert_eq!(turn_url_host("stun:stun.l.google.com:19302"), None);
+    }
+
+    #[test]
+    fn turn_url_host_port_keeps_the_port() {
+        assert_eq!(
+            turn_url_host_port("turn:coturn.roomler.ai:3478?transport=udp").as_deref(),
+            Some("coturn.roomler.ai:3478")
+        );
+        assert_eq!(
+            turn_url_host_port("turn:coturn.roomler.ai:443").as_deref(),
+            Some("coturn.roomler.ai:443")
+        );
+        // No port → None (STUN needs an explicit endpoint).
+        assert_eq!(turn_url_host_port("turn:coturn.roomler.ai"), None);
+    }
+
+    #[test]
+    fn stun_urls_derives_udp_turn_only() {
+        // The full expansion `build_turn_config` produces from a plain base URL:
+        // UDP `turn:` on 3478 + 443, plus TCP + TLS variants. STUN wants only the
+        // UDP `turn:` listeners → two `stun:` URLs, deduped, TLS/TCP skipped.
+        let turn_urls = vec![
+            "turn:coturn.roomler.ai:3478".to_string(),
+            "turn:coturn.roomler.ai:443?transport=udp".to_string(),
+            "turn:coturn.roomler.ai:3478?transport=tcp".to_string(),
+            "turns:coturn.roomler.ai:5349?transport=tcp".to_string(),
+            "turns:coturn.roomler.ai:443?transport=udp".to_string(),
+            "turns:coturn.roomler.ai:443?transport=tcp".to_string(),
+        ];
+        assert_eq!(
+            stun_urls_from_turn_urls(&turn_urls),
+            vec![
+                "stun:coturn.roomler.ai:3478".to_string(),
+                "stun:coturn.roomler.ai:443".to_string(),
+            ]
+        );
+        // No TURN configured → empty (srflx tier inert).
+        assert!(stun_urls_from_turn_urls(&[]).is_empty());
+        // A same host:port on both UDP transports dedupes.
+        assert_eq!(
+            stun_urls_from_turn_urls(&[
+                "turn:1.2.3.4:3478".to_string(),
+                "turn:1.2.3.4:3478?transport=udp".to_string(),
+            ]),
+            vec!["stun:1.2.3.4:3478".to_string()]
+        );
     }
 
     #[test]

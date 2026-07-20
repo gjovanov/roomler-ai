@@ -33,6 +33,11 @@ pub struct PeerConfig {
     /// `lan_endpoints` bucket, no relay addresses mixed in). A public IP here
     /// is a direct-to-public dial candidate. Empty from a pre-Phase-A server.
     pub lan_endpoints: Vec<String>,
+    /// Phase B — the peer's server-reflexive (srflx) endpoints (server
+    /// `srflx_endpoints` bucket): its public NAT mapping learned via STUN. A
+    /// public IP here is a srflx dial candidate (a 1:1/cone-NAT'd peer whose NIC
+    /// is private). Empty from a pre-Phase-B server or a peer with no srflx.
+    pub srflx_endpoints: Vec<String>,
     /// rc.142 — the peer advertised it can carry WG over QUIC-over-TURN. The
     /// runtime only attempts the QUIC relay carrier when this is set (both
     /// ends must agree, else the pair falls back to raw relay).
@@ -56,6 +61,7 @@ pub fn peer_config_from_netmap(peer: &NetmapPeer) -> Option<PeerConfig> {
         subnets: peer.routes.iter().filter_map(|r| Cidr::parse(r)).collect(),
         endpoints: peer.endpoints.clone(),
         lan_endpoints: peer.lan_endpoints.clone(),
+        srflx_endpoints: peer.srflx_endpoints.clone(),
         supports_quic: peer.supports_quic,
     })
 }
@@ -74,6 +80,7 @@ mod tests {
             wg_public_key: pubkey_b64.into(),
             endpoints: vec!["203.0.113.5:51820".into()],
             lan_endpoints: vec![],
+            srflx_endpoints: vec![],
             relay_home: None,
             reachable,
             supports_quic: false,
