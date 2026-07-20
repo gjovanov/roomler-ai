@@ -209,6 +209,89 @@ pub(crate) fn sw_res_cap_long_edge() -> Option<u32> {
     (v > 0).then_some(v)
 }
 
+/// rc.199 — the "Smoother" priority resolution cap (long-edge px). Chosen
+/// BELOW the relay hard cap (1280) so that even a direct-but-weak path sheds
+/// pixels in exchange for frame-rate + latency when the operator explicitly
+/// picks Smoother. Default 1024 long edge; env `ROOMLER_AGENT_SMOOTH_MAX_EDGE`,
+/// `0` disables (falls back to native, subject to any independent SW soft cap).
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+pub(crate) fn smooth_res_cap_long_edge() -> Option<u32> {
+    let v = std::env::var("ROOMLER_AGENT_SMOOTH_MAX_EDGE")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(1024);
+    (v > 0).then_some(v)
+}
+
+/// rc.199 — the viewer "Priority" lever (`rc:priority` control message). A
+/// per-session dial the controller flips to trade resolution sharpness against
+/// motion smoothness. The control handler decodes the wire string to one of
+/// these u8 codes into a per-session atomic; both DC video pumps read it to
+/// resolve the relay resolution cap fed to `effective_target_resolution`.
+pub mod priority {
+    /// Default: honour the relay hard cap on a constrained (relay) path,
+    /// native on a direct path. The pre-rc.199 behaviour.
+    pub const BALANCED: u8 = 0;
+    /// The user-facing "Sharpness override": lift the relay cap entirely so
+    /// the encode stays at native long-edge even on a relay. Accepts possible
+    /// stutter on a slow link in exchange for 1:1 pixels (crisp text).
+    pub const SHARPER: u8 = 1;
+    /// Cap harder (see `smooth_res_cap_long_edge`) on EVERY path so the
+    /// encoder/decoder/link carry fewer pixels — favours frame-rate + latency.
+    pub const SMOOTHER: u8 = 2;
+
+    /// Decode the `rc:priority` `mode` wire string. Unknown values → `None`
+    /// (caller keeps the session's current dial).
+    pub fn from_wire(s: &str) -> Option<u8> {
+        match s {
+            "balanced" => Some(BALANCED),
+            "sharp" | "sharper" => Some(SHARPER),
+            "smooth" | "smoother" => Some(SMOOTHER),
+            _ => None,
+        }
+    }
+
+    /// Human label for logs.
+    pub fn label(v: u8) -> &'static str {
+        match v {
+            SHARPER => "sharper",
+            SMOOTHER => "smoother",
+            _ => "balanced",
+        }
+    }
+}
+
+/// rc.199 — resolve the relay resolution cap (long-edge px) a DC video pump
+/// feeds to `effective_target_resolution`, given the session's Priority dial
+/// (`priority::*`) and whether the pump detected a constrained (relay)
+/// transport. `None` = no relay cap (native, still subject to any independent
+/// SW soft cap on the libvpx pump). Replaces the inline
+/// `if constrained { relay_res_cap_long_edge() } else { None }` at both pumps.
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+pub(crate) fn priority_relay_cap(priority: u8, constrained: bool) -> Option<u32> {
+    match priority {
+        // Sharpness override — native even on a relay.
+        self::priority::SHARPER => None,
+        // Fewer pixels on every path.
+        self::priority::SMOOTHER => smooth_res_cap_long_edge(),
+        // Balanced (default + any unknown code): the link-physics hard cap
+        // only on a constrained path.
+        _ => {
+            if constrained {
+                relay_res_cap_long_edge()
+            } else {
+                None
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct EncodedPacket {
     pub data: Vec<u8>,
@@ -596,6 +679,43 @@ mod tests {
             );
         }
         unsafe { std::env::remove_var("ROOMLER_AGENT_HW_AUTO") };
+    }
+
+    #[test]
+    fn priority_from_wire_and_label_round_trip() {
+        assert_eq!(priority::from_wire("balanced"), Some(priority::BALANCED));
+        assert_eq!(priority::from_wire("sharp"), Some(priority::SHARPER));
+        assert_eq!(priority::from_wire("sharper"), Some(priority::SHARPER));
+        assert_eq!(priority::from_wire("smooth"), Some(priority::SMOOTHER));
+        assert_eq!(priority::from_wire("smoother"), Some(priority::SMOOTHER));
+        assert_eq!(priority::from_wire("nonsense"), None);
+        assert_eq!(priority::label(priority::BALANCED), "balanced");
+        assert_eq!(priority::label(priority::SHARPER), "sharper");
+        assert_eq!(priority::label(priority::SMOOTHER), "smoother");
+        // An out-of-range code decays to the safe default label.
+        assert_eq!(priority::label(99), "balanced");
+    }
+
+    #[test]
+    fn priority_relay_cap_resolves_per_dial() {
+        // Isolate from any operator env override so the defaults are asserted.
+        // SAFETY: single-threaded test; no other test in this crate reads or
+        // writes these two vars concurrently.
+        unsafe {
+            std::env::remove_var("ROOMLER_AGENT_RELAY_MAX_EDGE");
+            std::env::remove_var("ROOMLER_AGENT_SMOOTH_MAX_EDGE");
+        }
+        // Balanced: the link-physics hard cap only on a constrained path.
+        assert_eq!(priority_relay_cap(priority::BALANCED, true), Some(1280));
+        assert_eq!(priority_relay_cap(priority::BALANCED, false), None);
+        // Sharper is the override: native long-edge regardless of transport.
+        assert_eq!(priority_relay_cap(priority::SHARPER, true), None);
+        assert_eq!(priority_relay_cap(priority::SHARPER, false), None);
+        // Smoother sheds pixels on EVERY path.
+        assert_eq!(priority_relay_cap(priority::SMOOTHER, true), Some(1024));
+        assert_eq!(priority_relay_cap(priority::SMOOTHER, false), Some(1024));
+        // An unknown code is treated as Balanced (never uncapped by accident).
+        assert_eq!(priority_relay_cap(42, true), Some(1280));
     }
 
     // rc.191 — BOTH tests below read/write ROOMLER_AGENT_RELAY_MAX_KBPS;
