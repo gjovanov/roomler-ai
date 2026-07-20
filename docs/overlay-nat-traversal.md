@@ -17,13 +17,20 @@ order, and demotes to the next tier if it can't establish:
 |---|---|---|---|
 | LAN direct | UDP on the shared interface socket | peer shares one of our /24s | `ROOMLER_NODE_OVERLAY_DIRECT` (**on**) |
 | **A** direct-to-public | UDP via an unbound egress socket | peer's NIC holds a public IP | `ROOMLER_NODE_OVERLAY_PUBLIC_DIRECT` (**off**) |
-| **C** srflx hole-punch | UDP via the **punch socket** | both ends NAT'd (not both symmetric) | `ROOMLER_NODE_OVERLAY_SRFLX` (**off**) |
-| **D** relay | coturn TURN (raw or QUIC-over-TURN) | nothing direct works | always available |
+| **C** srflx hole-punch | UDP via the **punch socket** | both ends NAT'd (not both symmetric) | `ROOMLER_NODE_OVERLAY_SRFLX` (**on** since rc.200) |
+| **D** single-relay | ONE coturn allocation + a raw dialer, QUIC-over-TURN | nothing direct works | `ROOMLER_NODE_OVERLAY_RELAY_SINGLE` (**on** since rc.200) |
+| **D′** both-allocate relay | two coturn allocations (raw / QUIC) | single-relay off, or a mixed-capability pair | always available (fall-through) |
 
 LAN direct and the relay predate this work (rc.131–rc.135; the relay is the
-original path). **Phases A / C / D** are the NAT-traversal cascade. Each new
-tier is **flag-gated, default-OFF**, enabled per-host only after field-proving
-(the same arc the QUIC-over-TURN carrier followed).
+original path). **Phases A / C / D** are the NAT-traversal cascade. **C (srflx
+punch) and D (single-relay) shipped default-ON in agent rc.200** after being
+field-proven in a mars↔zeus netns NAT lab (cone↔cone → direct punch 0% loss
+~0.6 ms; sym↔sym → single-relay 0% loss ~1.3 ms). A is still default-OFF
+(public-on-NIC is rare and its own field arc). Each gate takes
+`0`/`false`/`no`/`off` to disable. Single-relay needs the QUIC carrier
+(`ReadyLink.single_relay` forces it): a raw relay carrier discards the recv
+source, so an anchor can't reply to a symmetric dialer's coturn-observed port —
+only quinn's server consumes it.
 
 The relay always works but is the worst option: it adds a hop's latency, a
 coturn dependency (dies on UDP-blocked / TLS-inspecting corp nets), and — for
