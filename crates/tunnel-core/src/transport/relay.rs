@@ -1302,15 +1302,25 @@ mod turn_tests {
     }
 
     /// LIVE Phase D V-D1: single-relay UDP against the production coturn cluster.
+    /// `ROOMLER_TEST_TURN_WORKER=<ip>` pins the anchor's allocation to ONE coturn
+    /// worker (its REST creds are worker-agnostic). Set it to a worker NOT on the
+    /// host running the test — else the dialer sends to a coturn worker IP that
+    /// is a SECONDARY IP on its OWN host, which routes via loopback and bypasses
+    /// the PREROUTING DNAT to the coturn pod (a co-location artifact, not a
+    /// real-world failure). On mars, pin to jupiter 5.9.157.221 or zeus
+    /// 5.9.157.226 so the raw dialer crosses the network into a real DNAT.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "hits live coturn; set ROOMLER_TEST_TURN_HOST + ROOMLER_TEST_TURN_SECRET"]
     async fn single_relay_against_real_coturn_udp() {
-        let Some((urls, user, cred)) =
-            live_coturn_creds(|h| vec![format!("turn:{h}:3478?transport=udp")])
-        else {
+        let worker = std::env::var("ROOMLER_TEST_TURN_WORKER").ok();
+        let Some((urls, user, cred)) = live_coturn_creds(|h| {
+            let target = worker.as_deref().unwrap_or(h);
+            vec![format!("turn:{target}:3478?transport=udp")]
+        }) else {
             eprintln!("SKIP single_relay_against_real_coturn_udp: env unset");
             return;
         };
+        eprintln!("single-relay: coturn urls={urls:?}");
         single_relay_quinn_roundtrip(&urls, &user, &cred).await;
     }
 }

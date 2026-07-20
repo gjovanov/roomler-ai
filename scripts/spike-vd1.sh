@@ -9,5 +9,9 @@ S=$(grep '^COTURN_AUTH_SECRET=' ~/k8s-cluster-multi/.env | cut -d= -f2- | tr -d 
 if [ -z "$S" ]; then echo "COTURN_AUTH_SECRET not found in ~/k8s-cluster-multi/.env" >&2; exit 1; fi
 export ROOMLER_TEST_TURN_HOST=coturn.roomler.ai
 export ROOMLER_TEST_TURN_SECRET="$S"
+# Pin the anchor to a NON-mars coturn worker (jupiter) so the raw dialer crosses
+# the network into a real PREROUTING DNAT instead of mars's own secondary IP
+# (same-host loopback bypasses the DNAT). Override with ROOMLER_TEST_TURN_WORKER.
+export ROOMLER_TEST_TURN_WORKER="${ROOMLER_TEST_TURN_WORKER:-5.9.157.221}"
 exec cargo test -p roomler-ai-tunnel-core --features overlay-l3 \
   single_relay_against_real_coturn_udp -- --ignored --nocapture
