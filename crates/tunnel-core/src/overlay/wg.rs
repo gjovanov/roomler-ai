@@ -267,6 +267,14 @@ impl Carrier {
 pub struct PeerStats {
     tx: AtomicU64,
     rx: AtomicU64,
+    /// Phase C — latched `true` the moment a WG handshake to this peer
+    /// completes (a session exists), for EITHER role (the responder establishes
+    /// on receiving the init, the initiator on receiving the response). The
+    /// srflx / public-direct health deadline reads this LOCK-FREE to tell a live
+    /// punch from a pre-handshake zombie — whose `tx`/`rx` counters stay flat
+    /// (handshake packets touch neither), so the rx-flat heuristic can't see it
+    /// and boringtun stops even keepalives once the attempt expires at ~90 s.
+    handshake: AtomicBool,
 }
 
 /// Demux routing table: a direct peer's source address → its `Tunn` + stats.
@@ -834,6 +842,23 @@ impl WgDevice {
     pub fn peer_carrier_dead(&self, peer_public: &[u8; 32]) -> Option<bool> {
         Some(self.peers.get(peer_public)?.carrier.is_dead())
     }
+
+    /// Phase C — LOCK-FREE: has the WG handshake to `peer_public` completed (a
+    /// session exists)? `None` if the peer is unknown. The health sweep reads
+    /// this to time out a srflx / public-direct punch carrier that NEVER
+    /// established — its `tx`/`rx` counters stay flat pre-handshake, so the
+    /// rx-flat heuristic can't detect it. Latched by `process_inbound` the
+    /// instant a session appears; never cleared for the carrier's life (a fresh
+    /// carrier gets a fresh `PeerStats`).
+    pub fn peer_handshake_done(&self, peer_public: &[u8; 32]) -> Option<bool> {
+        Some(
+            self.peers
+                .get(peer_public)?
+                .stats
+                .handshake
+                .load(Ordering::Relaxed),
+        )
+    }
 }
 
 /// Handle one inbound carrier datagram: decapsulate, echo any
@@ -876,6 +901,15 @@ async fn process_inbound(
         }
         TunnResult::Done => {}
         TunnResult::Err(e) => debug!(?e, "wg decapsulate error"),
+    }
+    // Phase C — latch "handshake completed" the moment this peer's session is
+    // live. `process_inbound` only runs on a packet FROM the peer, so a set flag
+    // means the peer reached us AND a session exists (the responder establishes
+    // on the init it just answered; the initiator on the response it just got) —
+    // exactly the "punch succeeded" signal the health deadline needs. Set-once;
+    // the Tunn lock is already held here (rc.137: never lock it from the sweep).
+    if !stats.handshake.load(Ordering::Relaxed) && t.time_since_last_handshake().is_some() {
+        stats.handshake.store(true, Ordering::Relaxed);
     }
 }
 
@@ -1070,6 +1104,50 @@ mod tests {
             .expect("B did not receive a decrypted packet in time")
             .expect("tun channel closed");
         assert_eq!(got, pkt, "decrypted IP packet must arrive intact");
+    }
+
+    /// Phase C — `peer_handshake_done` latches once the WG session establishes
+    /// (the lock-free signal the srflx/public health deadline reads). Unknown
+    /// peers report `None`; a fresh peer reports `Some(false)` until the
+    /// handshake completes, then `Some(true)` on BOTH the initiator and the
+    /// responder (each sets it from an inbound packet).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn peer_handshake_done_latches_on_session_establish() {
+        let a = WgKeypair::generate();
+        let b = WgKeypair::generate();
+        let sock_a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sock_b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr_a = sock_a.local_addr().unwrap();
+        let addr_b = sock_b.local_addr().unwrap();
+
+        let (mut dev_a, _rx_a) = WgDevice::new(a.secret.clone());
+        let (mut dev_b, _rx_b) = WgDevice::new(b.secret.clone());
+
+        // Unknown peer → None.
+        assert_eq!(dev_a.peer_handshake_done(&b.public.to_bytes()), None);
+
+        dev_a.add_peer(
+            b.public.to_bytes(),
+            IP_B,
+            Carrier::direct(sock_a.clone(), addr_b),
+            true,
+        );
+        dev_b.add_peer(
+            a.public.to_bytes(),
+            IP_A,
+            Carrier::direct(sock_b.clone(), addr_a),
+            false,
+        );
+
+        // Freshly added, pre-handshake → Some(false).
+        assert_eq!(dev_a.peer_handshake_done(&b.public.to_bytes()), Some(false));
+
+        wait_connected(&dev_a, &b.public.to_bytes()).await;
+        wait_connected(&dev_b, &a.public.to_bytes()).await;
+
+        // Both ends latch true (each established via an inbound packet).
+        assert_eq!(dev_a.peer_handshake_done(&b.public.to_bytes()), Some(true));
+        assert_eq!(dev_b.peer_handshake_done(&a.public.to_bytes()), Some(true));
     }
 
     /// rc.134 — one HUB device serves TWO peers over a SINGLE shared socket
