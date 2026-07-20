@@ -1734,15 +1734,18 @@ mod tests {
         // The anchor's quic_relay sends its own `\x00` to dialer_srflx →
         // installs the IP-only permission before the handshake; the dialer's
         // sends `\x00` to R → opens its path + reaches coturn (rc.199 bootstrap).
+        // min_datagram = 1312 = OVERLAY_MTU(1280) + WG_OVERHEAD(32) — the exact
+        // budget install_ready demands, so a pass here proves the live coturn
+        // QUIC datagram budget suffices for the production carrier.
         let (car_anchor, car_dialer) = tokio::join!(
             Carrier::quic_relay(
                 conn_anchor,
                 dialer_srflx,
                 true,
-                1280,
+                1312,
                 Duration::from_secs(15)
             ),
-            Carrier::quic_relay(conn_dialer, r_anchor, false, 1280, Duration::from_secs(15)),
+            Carrier::quic_relay(conn_dialer, r_anchor, false, 1312, Duration::from_secs(15)),
         );
         let car_anchor = car_anchor.expect("anchor: single-relay QUIC carrier over live coturn");
         let car_dialer = car_dialer.expect("dialer: single-relay QUIC carrier over live coturn");

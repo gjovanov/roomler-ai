@@ -1798,6 +1798,7 @@ impl OverlayRuntime {
                             carrier,
                             relay_parts: None,
                             supports_quic: cfg.supports_quic,
+                            single_relay: false,
                             subnets: cfg.subnets.clone(),
                         },
                     )
@@ -2182,8 +2183,17 @@ impl OverlayRuntime {
         if let Some((conn, dst)) = &link.relay_parts {
             let _ = conn.send_to(b"\x00", *dst).await;
         }
-        let carrier = if overlay_quic_enabled() && link.supports_quic && link.relay_parts.is_some()
-        {
+        // Phase D — a single-relay link FORCES the QUIC carrier, ignoring the
+        // `OVERLAY_QUIC` opt-in: a raw `Carrier::Relay` discards the recv source
+        // (wg.rs recv), so the anchor would reply to the dialer's ADVERTISED
+        // srflx port — wrong under a symmetric NAT (per-destination mapping) —
+        // and the handshake dies. Only quinn's server consumes the observed
+        // path. Symmetric on both ends: any build that advertises
+        // `supports_relay_single` carries this rule, so the pair can't split
+        // QUIC/raw (see `ReadyLink::single_relay`).
+        let want_quic = link.relay_parts.is_some()
+            && (link.single_relay || (overlay_quic_enabled() && link.supports_quic));
+        let carrier = if want_quic {
             let (conn, dst) = link.relay_parts.clone().unwrap();
             // Deterministic role: the lexicographically-smaller pubkey serves
             // (same rule as the WG relay initiator, so both ends agree on who
@@ -2203,7 +2213,11 @@ impl OverlayRuntime {
                     q
                 }
                 Err(e) => {
-                    warn!(peer = %link.node_id, %e, "overlay: QUIC carrier build failed; using raw relay");
+                    // For a single-relay link the raw fallback only carries for
+                    // cone-ish dialers (port-preserving mapping); a symmetric
+                    // dialer stays dark until the health sweep re-coordinates.
+                    warn!(peer = %link.node_id, %e, single_relay = link.single_relay,
+                          "overlay: QUIC carrier build failed; using raw relay");
                     link.carrier
                 }
             }
