@@ -196,6 +196,16 @@ const FALLBACK_TICK: Duration = Duration::from_secs(5);
 /// war. Cheap (a couple of route commands per peer) and 2 s bounds the capture
 /// window to a couple of dropped pings.
 const ROUTE_GUARD_TICK: Duration = Duration::from_secs(2);
+/// Phase B — per-socket STUN attempt timeout when gathering srflx candidates at
+/// startup. `srflx_query` retries a few times, so worst-case per socket is a
+/// small multiple of this; the whole gather is additionally bounded by
+/// [`SRFLX_GATHER_BUDGET`] so an unreachable STUN server can't stall the join.
+const SRFLX_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(700);
+/// Phase B — overall wall-clock cap on the startup srflx gather across all
+/// sockets. The common case (coturn reachable) resolves on the first attempt
+/// per socket in tens of ms; this only bounds the pathological all-unreachable
+/// case so the runtime never blocks the netmap→install path for long.
+const SRFLX_GATHER_BUDGET: Duration = Duration::from_secs(4);
 
 /// Overlay control events the runtime consumes, fed in from the node's
 /// signaling loop (the `ServerMsg::Overlay*` handlers forward these).
@@ -773,15 +783,58 @@ impl OverlayRuntime {
         let mut cooldowns = DirectCooldowns::default();
         // rc.139 — peers whose stale relay was just refreshed (anti-ping-pong).
         let mut relay_refresh_cooldown: HashMap<ObjectId, Instant> = HashMap::new();
-        // Phase A — receiver for AUTHENTICATED inbound direct handshakes (a
+
+        // NAT-traversal Phase B — gather our server-reflexive (srflx) candidates
+        // and advertise them, so a peer behind a DIFFERENT NAT can dial us at the
+        // public mapping our own STUN query opens. This MUST run BEFORE the eager
+        // demux below starts reading these sockets: the STUN reply rides the same
+        // socket the overlay traffic will use (that's the point — the NAT mapping
+        // has to match), so a demux recv loop would otherwise steal the response.
+        // Gated on the srflx tier + the server actually advertising a STUN
+        // endpoint; best-effort + time-bounded, so a slow/unreachable STUN server
+        // just leaves srflx unset this run (the node re-gathers on the next
+        // reconnect). WG keepalives hold the mapping open for the session, so a
+        // single startup gather suffices — an in-band periodic re-gather would
+        // need demux-routed STUN and is deferred.
+        if direct::srflx_enabled()
+            && let Some(ctx) = &direct_ctx
+            && !network.stun_urls.is_empty()
+        {
+            match direct::resolve_stun_server(&network.stun_urls).await {
+                Some(stun_server) => {
+                    let srflx = tokio::time::timeout(
+                        SRFLX_GATHER_BUDGET,
+                        direct::gather_srflx(&ctx.socks, stun_server, SRFLX_ATTEMPT_TIMEOUT),
+                    )
+                    .await
+                    .unwrap_or_default();
+                    if srflx.is_empty() {
+                        debug!(%stun_server, "overlay: srflx gather yielded no public candidate");
+                    } else {
+                        info!(?srflx, %stun_server, "overlay: advertising srflx candidates (NAT-traversal Phase B)");
+                        let _ = self
+                            .outbound
+                            .send(ClientMsg::OverlaySrflx { candidates: srflx })
+                            .await;
+                    }
+                }
+                None => {
+                    debug!(urls = ?network.stun_urls, "overlay: no resolvable STUN server; srflx off this run");
+                }
+            }
+        }
+
+        // Phase A/B — receiver for AUTHENTICATED inbound direct handshakes (a
         // NAT'd client dialing our public endpoint, or a known peer that roamed
-        // to a new ephemeral port — the field-observed stale-port race). Only
-        // wired when the public-direct tier is on (CC8 flag-gate); the demux
-        // loops for our own sockets are started EAGERLY here so an inbound INIT
-        // is read even before any peer is installed (an exit with no other
-        // direct peers would otherwise never spawn a recv loop for its public
-        // socket).
-        let mut direct_events = if direct_ctx.is_some() && direct::public_direct_enabled() {
+        // to a new ephemeral port — the field-observed stale-port race). Wired
+        // when EITHER public-dial tier is on (public-direct or srflx; CC8
+        // flag-gate); the demux loops for our own sockets are started EAGERLY
+        // here so an inbound INIT is read even before any peer is installed (an
+        // exit with no other direct peers would otherwise never spawn a recv
+        // loop for its public socket).
+        let mut direct_events = if direct_ctx.is_some()
+            && (direct::public_direct_enabled() || direct::srflx_enabled())
+        {
             if let Some(ctx) = &direct_ctx {
                 for (_ip, s) in &ctx.socks {
                     wg.ensure_direct_demux(s.clone());
@@ -1239,19 +1292,23 @@ impl OverlayRuntime {
             endpoints = ?endpoints,
             "overlay: advertising direct LAN endpoints (per-interface sockets; same-subnet peers dial direct)"
         );
-        // Phase A — a single unbound socket to DIAL peers' public endpoints
-        // (the OS picks egress per-destination). Best-effort: a bind failure
-        // just leaves the public-direct tier off (relay still works).
-        let public_sock = if direct::public_direct_enabled() {
+        // Phase A/B — a single unbound socket to DIAL peers' public endpoints
+        // (the OS picks egress per-destination). Shared by the public-direct
+        // tier (peer's public NIC) AND the srflx tier (peer's NAT mapping), so
+        // it's bound when EITHER is on. Best-effort: a bind failure just leaves
+        // both public-dial tiers off (relay still works).
+        let public_sock = if direct::public_direct_enabled() || direct::srflx_enabled() {
             match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await {
                 Ok(s) => {
                     info!(
-                        "overlay: public-direct tier ON — dialing peers' public endpoints (NAT-traversal Phase A)"
+                        public_direct = direct::public_direct_enabled(),
+                        srflx = direct::srflx_enabled(),
+                        "overlay: public-dial egress socket ON (NAT-traversal Phase A/B)"
                     );
                     Some(Arc::new(s))
                 }
                 Err(e) => {
-                    warn!(%e, "overlay: public-direct egress socket bind failed; tier off");
+                    warn!(%e, "overlay: public-dial egress socket bind failed; public/srflx tiers off");
                     None
                 }
             }
@@ -1304,17 +1361,32 @@ impl OverlayRuntime {
                 direct_ctx
                     .and_then(|ctx| direct::pick_same_subnet_endpoint(&ctx.my_ips, &cfg.endpoints))
             };
-            // Phase A — a PUBLIC endpoint from the peer's join-time NIC bucket,
-            // dialable directly (no STUN) when the peer's NIC holds a public IP.
-            // Requires the public-egress socket (public-direct tier on) and no
-            // public-tier cooldown. Second-priority, after LAN direct.
+            // Phase A/B — a PUBLIC endpoint to dial over the shared egress
+            // socket: the peer's join-time NIC bucket (Phase A, dialable without
+            // STUN when the peer's NIC holds a public IP), else its srflx bucket
+            // (Phase B, the peer's public NAT mapping learned via STUN). Each
+            // sub-tier is independently flag-gated; both share the "public"
+            // cooldown tier and the `install_public_direct` dial path. Requires
+            // the egress socket + no public-tier cooldown. After LAN direct.
             let public_dst = if public_cooling {
                 None
             } else {
                 direct_ctx.and_then(|ctx| {
-                    ctx.public_sock
-                        .as_ref()
-                        .and_then(|_| direct::pick_public_endpoint(&ctx.my_ips, &cfg.lan_endpoints))
+                    ctx.public_sock.as_ref().and_then(|_| {
+                        direct::public_direct_enabled()
+                            .then(|| direct::pick_public_endpoint(&ctx.my_ips, &cfg.lan_endpoints))
+                            .flatten()
+                            .or_else(|| {
+                                direct::srflx_enabled()
+                                    .then(|| {
+                                        direct::pick_public_endpoint(
+                                            &ctx.my_ips,
+                                            &cfg.srflx_endpoints,
+                                        )
+                                    })
+                                    .flatten()
+                            })
+                    })
                 })
             };
 
@@ -2020,6 +2092,7 @@ mod tests {
                 wg_public_key: String::new(),
                 endpoints: vec![],
                 lan_endpoints: vec![],
+                srflx_endpoints: vec![],
                 relay_home: None,
                 reachable,
                 supports_quic: false,
@@ -2194,6 +2267,7 @@ mod tests {
             mtu: 1280,
             magic_domain: None,
             nameservers: vec![],
+            stun_urls: vec![],
         }
     }
     fn peer(kp: &WgKeypair, ip: &str) -> NetmapPeer {
@@ -2204,6 +2278,7 @@ mod tests {
             wg_public_key: kp.public_base64(),
             endpoints: vec![],
             lan_endpoints: vec![],
+            srflx_endpoints: vec![],
             relay_home: None,
             reachable: true,
             supports_quic: false,
@@ -2321,6 +2396,7 @@ mod tests {
             wg_public_key: String::new(),
             endpoints: vec![],
             lan_endpoints: vec![],
+            srflx_endpoints: vec![],
             relay_home: None,
             reachable: true,
             supports_quic: false,
@@ -2459,6 +2535,7 @@ mod tests {
             wg_public_key: kp.public_base64(),
             endpoints: vec![],
             lan_endpoints: vec![],
+            srflx_endpoints: vec![],
             relay_home: None,
             reachable: true,
             supports_quic: false,
