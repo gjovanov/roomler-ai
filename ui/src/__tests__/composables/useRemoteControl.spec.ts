@@ -44,8 +44,12 @@ import {
   displayMatchWireMessage,
   pickAutoTransport,
   AV1_CODEC_STRING,
+  priorityWireMessage,
+  codecChoiceToSettings,
+  settingsToCodecChoice,
   type AutoTransportInputs,
   type KeyDecision,
+  type RcCodecChoice,
 } from '@/composables/useRemoteControl'
 import { codecMimeForShort } from '@/workers/rc-webcodecs-worker'
 import { parseFrameHeader, isKeyframe, shouldDecodeFrame } from '@/workers/rc-vp9-444-worker'
@@ -1959,5 +1963,111 @@ describe('decodeStatWireMessage (rc.188 viewer-rate feedback)', () => {
 
   it('caps absurd fps at 240 so the packed 16-bit agent field never overflows', () => {
     expect(decodeStatWireMessage(100000, true).fps).toBe(240)
+  })
+})
+
+describe('priorityWireMessage (rc.199 Priority dial)', () => {
+  it('builds the rc:priority envelope for each dial', () => {
+    expect(priorityWireMessage('balanced')).toEqual({ t: 'rc:priority', mode: 'balanced' })
+    expect(priorityWireMessage('sharper')).toEqual({ t: 'rc:priority', mode: 'sharper' })
+    expect(priorityWireMessage('smoother')).toEqual({ t: 'rc:priority', mode: 'smoother' })
+  })
+})
+
+describe('codecChoiceToSettings (rc.199 unified Codec picker)', () => {
+  it('maps every choice to a full transport/chroma/codec/render tuple', () => {
+    expect(codecChoiceToSettings('auto')).toEqual({
+      videoTransport: 'auto',
+      chroma: 'auto',
+      preferredCodec: null,
+      renderPath: 'webcodecs',
+    })
+    expect(codecChoiceToSettings('av1')).toEqual({
+      videoTransport: 'data-channel-av1',
+      chroma: 'auto',
+      preferredCodec: null,
+      renderPath: 'webcodecs',
+    })
+    expect(codecChoiceToSettings('hevc')).toEqual({
+      videoTransport: 'data-channel-hevc',
+      chroma: 'auto',
+      preferredCodec: null,
+      renderPath: 'webcodecs',
+    })
+    // The two VP9 choices share a transport and differ ONLY in chroma —
+    // 4:4:4 = crisp text, 4:2:0 = efficient.
+    expect(codecChoiceToSettings('vp9-444')).toEqual({
+      videoTransport: 'data-channel-vp9-444',
+      chroma: 'yuv444',
+      preferredCodec: null,
+      renderPath: 'webcodecs',
+    })
+    expect(codecChoiceToSettings('vp9-420')).toEqual({
+      videoTransport: 'data-channel-vp9-444',
+      chroma: 'yuv420',
+      preferredCodec: null,
+      renderPath: 'webcodecs',
+    })
+    // H.264 = the "max compatibility" choice: revives the RTP track +
+    // preferredCodec AND uses the plain <video> render path (not WebCodecs).
+    expect(codecChoiceToSettings('h264')).toEqual({
+      videoTransport: 'webrtc',
+      chroma: 'auto',
+      preferredCodec: 'h264',
+      renderPath: 'video',
+    })
+  })
+})
+
+describe('settingsToCodecChoice (rc.199 reverse map)', () => {
+  it('derives the picker value from the stored transport + chroma', () => {
+    expect(settingsToCodecChoice('auto', 'auto')).toBe('auto')
+    expect(settingsToCodecChoice('data-channel-av1', 'auto')).toBe('av1')
+    expect(settingsToCodecChoice('data-channel-hevc', 'auto')).toBe('hevc')
+    expect(settingsToCodecChoice('data-channel-vp9-444', 'yuv444')).toBe('vp9-444')
+    expect(settingsToCodecChoice('data-channel-vp9-444', 'yuv420')).toBe('vp9-420')
+    // Legacy vp9-444 sessions stored chroma 'auto' → read as the efficient
+    // 4:2:0 choice (never silently promoted to the heavier 4:4:4).
+    expect(settingsToCodecChoice('data-channel-vp9-444', 'auto')).toBe('vp9-420')
+    expect(settingsToCodecChoice('webrtc', 'auto')).toBe('h264')
+  })
+
+  it('round-trips every choice through settings and back', () => {
+    const choices: RcCodecChoice[] = ['auto', 'av1', 'hevc', 'vp9-444', 'vp9-420', 'h264']
+    for (const c of choices) {
+      const s = codecChoiceToSettings(c)
+      expect(settingsToCodecChoice(s.videoTransport, s.chroma)).toBe(c)
+    }
+  })
+})
+
+describe('parseControlInbound — rc:video-info native dims (rc.199)', () => {
+  it('parses native_w/native_h when the agent reports them', () => {
+    const parsed = parseControlInbound(
+      '{"t":"rc:video-info","codec":"vp9","encoder":"libvpx","hardware":false,"chroma":"yuv444","transport":"relay","native_w":2560,"native_h":1600}',
+    )
+    expect(parsed).toEqual({
+      kind: 'video_info',
+      info: {
+        codec: 'vp9',
+        encoder: 'libvpx',
+        hardware: false,
+        chroma: 'yuv444',
+        transport: 'relay',
+        native_w: 2560,
+        native_h: 1600,
+      },
+    })
+  })
+
+  it('defaults native dims to 0 for older agents that omit them (back-compat)', () => {
+    const parsed = parseControlInbound(
+      '{"t":"rc:video-info","codec":"h265","encoder":"hevc_nvenc","hardware":true,"chroma":"yuv420","transport":"direct"}',
+    )
+    expect(parsed?.kind).toBe('video_info')
+    if (parsed?.kind === 'video_info') {
+      expect(parsed.info.native_w).toBe(0)
+      expect(parsed.info.native_h).toBe(0)
+    }
   })
 })
