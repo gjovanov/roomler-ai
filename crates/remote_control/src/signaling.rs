@@ -587,8 +587,18 @@ pub enum ClientMsg {
     /// permitted peers, who may then dial this node directly through its NAT.
     /// Deliberately distinct from `rc:overlay.endpoints` (relay addresses):
     /// different lifecycle, different provenance, different bucket.
+    ///
+    /// `nat` (Phase C) is this node's probed NAT mapping type — `"cone"` (hole-
+    /// punchable) or `"symmetric"` (not) — or omitted when it couldn't be probed
+    /// ("unknown"). The server stores it alongside the srflx so peers can skip a
+    /// futile punch when BOTH ends are symmetric. Optional + omitted-when-None ⇒
+    /// a pre-Phase-C agent (rc.199, sends only `candidates`) still parses.
     #[serde(rename = "rc:overlay.srflx")]
-    OverlaySrflx { candidates: Vec<String> },
+    OverlaySrflx {
+        candidates: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        nat: Option<String>,
+    },
 
     /// Node leaves the overlay (graceful). Server marks it offline and
     /// pushes a `netmap_delta` removing it from peers.
@@ -1083,6 +1093,13 @@ pub struct NetmapPeer {
     /// stays inert.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub srflx_endpoints: Vec<String>,
+    /// Phase C — this peer's probed NAT mapping type (`"cone"` / `"symmetric"`),
+    /// or `None` when unknown. A dialer skips the srflx punch only when BOTH ends
+    /// are `"symmetric"` (neither can predict the other's per-destination port);
+    /// any other combination attempts. Optional + omitted-when-None ⇒ a
+    /// pre-Phase-C server/peer stays "unknown" (attempted, never skipped).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub srflx_nat: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_home: Option<String>,
     pub reachable: bool,
@@ -2077,16 +2094,39 @@ mod tests {
         // `srflx_endpoints` bucket.
         let e = ClientMsg::OverlaySrflx {
             candidates: vec!["198.51.100.7:41820".into()],
+            nat: Some("cone".into()),
         };
         let s = serde_json::to_string(&e).unwrap();
         assert!(s.contains(r#""t":"rc:overlay.srflx""#));
         assert!(s.contains(r#""candidates":["198.51.100.7:41820"]"#));
+        assert!(s.contains(r#""nat":"cone""#));
         match serde_json::from_str::<ClientMsg>(&s).unwrap() {
-            ClientMsg::OverlaySrflx { candidates } => {
+            ClientMsg::OverlaySrflx { candidates, nat } => {
                 assert_eq!(candidates, vec!["198.51.100.7:41820".to_string()]);
+                assert_eq!(nat.as_deref(), Some("cone"));
             }
             other => panic!("expected OverlaySrflx, got {other:?}"),
         }
+
+        // Phase C back-compat: a pre-Phase-C agent (rc.199) sends only
+        // `candidates` (no `nat`) → parses with nat = None; and a None nat is
+        // OMITTED on the wire (skip_serializing_if).
+        let legacy = r#"{"t":"rc:overlay.srflx","candidates":["1.2.3.4:5"]}"#;
+        match serde_json::from_str::<ClientMsg>(legacy).unwrap() {
+            ClientMsg::OverlaySrflx { candidates, nat } => {
+                assert_eq!(candidates, vec!["1.2.3.4:5".to_string()]);
+                assert_eq!(nat, None);
+            }
+            other => panic!("expected OverlaySrflx, got {other:?}"),
+        }
+        let none_nat = ClientMsg::OverlaySrflx {
+            candidates: vec!["1.2.3.4:5".into()],
+            nat: None,
+        };
+        assert!(
+            !serde_json::to_string(&none_nat).unwrap().contains("nat"),
+            "a None nat must be omitted on the wire"
+        );
     }
 
     #[test]
@@ -2125,6 +2165,7 @@ mod tests {
                 endpoints: vec!["203.0.113.9:51820".into()],
                 lan_endpoints: vec!["203.0.113.9:51820".into()],
                 srflx_endpoints: vec!["198.51.100.7:41820".into()],
+                srflx_nat: Some("cone".into()),
                 relay_home: None,
                 reachable: true,
                 supports_quic: true,
@@ -2223,6 +2264,31 @@ mod tests {
         p2.srflx_endpoints = vec!["198.51.100.7:41820".into()];
         let s2 = serde_json::to_string(&p2).unwrap();
         assert!(s2.contains(r#""srflx_endpoints":["198.51.100.7:41820"]"#));
+        assert_eq!(serde_json::from_str::<NetmapPeer>(&s2).unwrap(), p2);
+    }
+
+    /// Phase C — `srflx_nat` back-compat: a pre-Phase-C server/peer omits it →
+    /// defaults `None` (unknown ⇒ punch attempted, never skipped); `None` is
+    /// OMITTED on the wire; populated round-trips.
+    #[test]
+    fn netmap_peer_srflx_nat_default_and_skip() {
+        let json = r#"{
+            "node_id":"507f1f77bcf86cd799439011",
+            "overlay_ip":"100.64.0.4",
+            "wg_public_key":"cGVlcg==",
+            "reachable":true
+        }"#;
+        let p: NetmapPeer = serde_json::from_str(json).unwrap();
+        assert_eq!(p.srflx_nat, None);
+        let s = serde_json::to_string(&p).unwrap();
+        assert!(
+            !s.contains("srflx_nat"),
+            "a None srflx_nat must be omitted on the wire: {s}"
+        );
+        let mut p2 = p.clone();
+        p2.srflx_nat = Some("symmetric".into());
+        let s2 = serde_json::to_string(&p2).unwrap();
+        assert!(s2.contains(r#""srflx_nat":"symmetric""#));
         assert_eq!(serde_json::from_str::<NetmapPeer>(&s2).unwrap(), p2);
     }
 
