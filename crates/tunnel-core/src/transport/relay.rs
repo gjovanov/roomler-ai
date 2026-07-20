@@ -1151,4 +1151,166 @@ mod turn_tests {
         };
         two_relay_quinn_roundtrip(&urls, &user, &cred).await;
     }
+
+    // ───────────── Phase D: SINGLE-RELAY (one allocation + raw dialer) ─────────
+    //
+    // The Phase D primary mechanic: instead of BOTH peers allocating and coturn
+    // hairpinning between two of its own allocations (field bug #2, never
+    // carried), ONE peer (the ANCHOR) allocates R and the OTHER (the DIALER)
+    // sends RAW UDP to R as a plain TURN "peer" — no allocation, not a TURN
+    // client. coturn relays it to the anchor iff the anchor holds an IP-only
+    // permission for the dialer's IP (RFC 8656 §9), tagging it with the OBSERVED
+    // source; the anchor (a QUIC server) replies to that observed source. This
+    // handles symmetric NAT (varying port, same IP → permission still matches)
+    // and avoids the hairpin (one allocation). Proven here in-process against
+    // the webrtc-rs `turn` server (which mirrors coturn's IP-only permission
+    // check), and live against coturn by the `#[ignore]` test below.
+
+    /// In-process single-relay: anchor allocates + permits the dialer's IP; the
+    /// dialer is a plain `UdpRelayConn` (raw peer) running the QUIC client to R.
+    /// A datagram round-trips — the Phase D mechanic, no hairpin.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn single_relay_raw_dialer_quinn_roundtrip() {
+        use bytes::Bytes;
+
+        let (_server, turn_addr) = loopback_turn_server().await;
+
+        // ANCHOR allocates R.
+        let anchor_relay = allocate_turn_relay(turn_addr, USER.into(), PASS.into(), REALM.into())
+            .await
+            .expect("anchor TURN allocate");
+        let r_anchor = anchor_relay.local_addr().unwrap();
+
+        // DIALER is a plain UDP socket — NO allocation, a raw TURN peer.
+        let dialer_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dialer_addr = dialer_sock.local_addr().unwrap();
+
+        // ANCHOR permits the dialer's IP (a stray send installs the IP-only
+        // permission; the dialer's later inbound from the same IP / any port is
+        // then accepted — the symmetric-NAT-safe part).
+        anchor_relay.send_to(b"\x00", dialer_addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let anchor_sock = Arc::new(RelayUdpSocket::new(Arc::new(anchor_relay)).unwrap());
+        let dialer_sock =
+            Arc::new(RelayUdpSocket::new(Arc::new(UdpRelayConn(dialer_sock))).unwrap());
+
+        // Anchor = QUIC server (learns the dialer's observed source); dialer =
+        // client dialing R. (WG-over-QUIC-datagram carrier, insecure cert.)
+        let anchor = QuicPeer::server_over_relay_datagram(anchor_sock).expect("anchor quic server");
+        let dialer = QuicPeer::client_over_relay_datagram(dialer_sock).expect("dialer quic client");
+
+        let srv = tokio::spawn(async move {
+            let conn = anchor.accept().await.expect("incoming").expect("handshake");
+            let d = conn.read_datagram().await.expect("read datagram");
+            assert_eq!(&d[..], b"ping-single-relay");
+            conn.send_datagram(Bytes::from_static(b"pong-single-relay"))
+                .expect("send reply");
+            conn.closed().await;
+        });
+
+        let outcome = tokio::time::timeout(Duration::from_secs(15), async {
+            let conn = dialer
+                .connect(r_anchor)
+                .await
+                .expect("dialer connect to R (raw UDP)");
+            conn.send_datagram(Bytes::from_static(b"ping-single-relay"))
+                .expect("send datagram");
+            let reply = conn.read_datagram().await.expect("read reply");
+            assert_eq!(&reply[..], b"pong-single-relay");
+            conn.close(0u32.into(), b"done");
+        })
+        .await;
+        outcome.expect("single-relay round-trip timed out");
+        let _ = srv.await;
+    }
+
+    /// LIVE single-relay against the production coturn cluster: one allocation
+    /// (the anchor) + a RAW UDP dialer, round-tripping a QUIC datagram. This is
+    /// the Phase D V-D1 spike — it proves a raw external dialer reaches the
+    /// anchor's coturn-relayed address THROUGH the fleet's host DNAT/SNAT (the
+    /// path the both-allocate hairpin died in) and that the IP-only permission +
+    /// observed-source reply carry. Run on a fleet host (mars) with outbound
+    /// UDP/3478 to coturn:
+    ///   ROOMLER_TEST_TURN_HOST=coturn.roomler.ai \
+    ///   ROOMLER_TEST_TURN_SECRET=<coturn static-auth-secret> \
+    ///   cargo test -p roomler-ai-tunnel-core --features overlay-l3 --release \
+    ///     --ignored single_relay_against_real_coturn_udp -- --nocapture
+    async fn single_relay_quinn_roundtrip(urls: &[String], user: &str, cred: &str) {
+        use bytes::Bytes;
+
+        // ANCHOR allocates R via the real ICE cascade.
+        let anchor_relay = allocate_relay_from_ice(urls, user, cred)
+            .await
+            .expect("anchor relay allocate (live coturn)");
+        let r_anchor = anchor_relay.local_addr().unwrap();
+        eprintln!("single-relay: anchor R={r_anchor}");
+
+        // DIALER: a raw UDP socket. STUN coturn on it to learn its srflx so the
+        // anchor can permit the dialer's IP (coturn also answers STUN on the
+        // TURN UDP listener).
+        let dialer_sock = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+            .await
+            .unwrap();
+        let stun_hp = turn_udp_server(urls).expect("a udp turn server in the url list");
+        let stun_addr = tokio::net::lookup_host(&stun_hp)
+            .await
+            .unwrap()
+            .find(SocketAddr::is_ipv4)
+            .expect("resolve coturn");
+        let dialer_srflx =
+            crate::transport::stun::srflx_query(&dialer_sock, stun_addr, Duration::from_secs(3))
+                .await
+                .expect("dialer srflx (STUN via coturn)");
+        eprintln!("single-relay: dialer srflx={dialer_srflx}");
+
+        // ANCHOR permits the dialer's IP (IP-only permission ⇒ a symmetric
+        // dialer's varying port still matches).
+        anchor_relay.send_to(b"\x00", dialer_srflx).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let anchor_sock = Arc::new(RelayUdpSocket::new(Arc::new(anchor_relay)).unwrap());
+        let dialer_relay =
+            Arc::new(RelayUdpSocket::new(Arc::new(UdpRelayConn(dialer_sock))).unwrap());
+        let anchor = QuicPeer::server_over_relay_datagram(anchor_sock).expect("anchor quic server");
+        let dialer =
+            QuicPeer::client_over_relay_datagram(dialer_relay).expect("dialer quic client");
+
+        let srv = tokio::spawn(async move {
+            let conn = anchor.accept().await.expect("incoming").expect("handshake");
+            let d = conn.read_datagram().await.expect("read datagram");
+            assert_eq!(&d[..], b"ping-single-relay");
+            conn.send_datagram(Bytes::from_static(b"pong-single-relay"))
+                .expect("send reply");
+            conn.closed().await;
+        });
+
+        let outcome = tokio::time::timeout(Duration::from_secs(30), async {
+            let conn = dialer
+                .connect(r_anchor)
+                .await
+                .expect("dialer connect to R (raw UDP over live coturn)");
+            conn.send_datagram(Bytes::from_static(b"ping-single-relay"))
+                .expect("send datagram");
+            let reply = conn.read_datagram().await.expect("read reply");
+            assert_eq!(&reply[..], b"pong-single-relay");
+            conn.close(0u32.into(), b"done");
+        })
+        .await;
+        outcome.expect("single-relay round-trip over live coturn timed out");
+        let _ = srv.await;
+    }
+
+    /// LIVE Phase D V-D1: single-relay UDP against the production coturn cluster.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "hits live coturn; set ROOMLER_TEST_TURN_HOST + ROOMLER_TEST_TURN_SECRET"]
+    async fn single_relay_against_real_coturn_udp() {
+        let Some((urls, user, cred)) =
+            live_coturn_creds(|h| vec![format!("turn:{h}:3478?transport=udp")])
+        else {
+            eprintln!("SKIP single_relay_against_real_coturn_udp: env unset");
+            return;
+        };
+        single_relay_quinn_roundtrip(&urls, &user, &cred).await;
+    }
 }
