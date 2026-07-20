@@ -1046,6 +1046,19 @@ pub struct NetmapPeer {
     pub wg_public_key: String,
     #[serde(default)]
     pub endpoints: Vec<String>,
+    /// NAT-traversal Phase A — the peer's JOIN-TIME NIC-derived endpoints (the
+    /// server's `lan_endpoints` bucket, verbatim — NOT unioned with the relay
+    /// trickle like `endpoints`). A globally-routable address in here means the
+    /// peer's NIC itself holds a public IP (bare-metal / no NAT in front), so
+    /// any node can dial it directly without STUN — the *direct-to-public*
+    /// carrier tier. Provenance matters: `endpoints` also contains coturn
+    /// relayed addresses, and on this fleet the coturn worker IPs COLLIDE with
+    /// host public IPs (the workers run on the same hosts), so a "public and
+    /// not a coturn IP" heuristic over the union cannot distinguish them —
+    /// only the join-time bucket can. Empty from a pre-Phase-A server
+    /// (`#[serde(default)]`) → the public-direct tier stays inert.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lan_endpoints: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_home: Option<String>,
     pub reachable: bool,
@@ -2055,6 +2068,7 @@ mod tests {
                 name: "neo16".into(),
                 wg_public_key: "cGVlcg==".into(),
                 endpoints: vec!["203.0.113.9:51820".into()],
+                lan_endpoints: vec!["203.0.113.9:51820".into()],
                 relay_home: None,
                 reachable: true,
                 supports_quic: true,
@@ -2101,6 +2115,34 @@ mod tests {
         }"#;
         let p: NetmapPeer = serde_json::from_str(json).unwrap();
         assert!(p.agent_id.is_none());
+    }
+
+    /// Back-compat both directions for the Phase-A `lan_endpoints` field: a
+    /// pre-Phase-A server omits it → defaults empty (public-direct tier inert);
+    /// and an empty vec is OMITTED on the wire (`skip_serializing_if`), so a
+    /// Phase-A node talking to any consumer serialises byte-identically to
+    /// before unless the bucket is populated.
+    #[test]
+    fn netmap_peer_lan_endpoints_default_and_skip() {
+        let json = r#"{
+            "node_id":"507f1f77bcf86cd799439011",
+            "overlay_ip":"100.64.0.4",
+            "wg_public_key":"cGVlcg==",
+            "reachable":true
+        }"#;
+        let p: NetmapPeer = serde_json::from_str(json).unwrap();
+        assert!(p.lan_endpoints.is_empty());
+        let s = serde_json::to_string(&p).unwrap();
+        assert!(
+            !s.contains("lan_endpoints"),
+            "empty lan_endpoints must be omitted on the wire: {s}"
+        );
+        // Populated → serialised and round-trips.
+        let mut p2 = p.clone();
+        p2.lan_endpoints = vec!["5.9.157.226:41234".into()];
+        let s2 = serde_json::to_string(&p2).unwrap();
+        assert!(s2.contains(r#""lan_endpoints":["5.9.157.226:41234"]"#));
+        assert_eq!(serde_json::from_str::<NetmapPeer>(&s2).unwrap(), p2);
     }
 
     #[test]

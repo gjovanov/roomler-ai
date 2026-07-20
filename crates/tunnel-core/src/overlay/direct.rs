@@ -140,6 +140,67 @@ fn is_cgnat(ip: Ipv4Addr) -> bool {
     o[0] == 100 && (64..=127).contains(&o[1])
 }
 
+/// NAT-traversal Phase A — opt-in gate for the **direct-to-public** carrier
+/// tier (`ROOMLER_NODE_OVERLAY_PUBLIC_DIRECT`; legacy `ROOMLER_AGENT_…` alias
+/// honoured — see [`crate::env::node_env`]). **Default OFF** until
+/// field-proven, mirroring the QUIC gate's arc (CC8 in the NAT-traversal
+/// plan). Gates the whole tier: dialing a peer's public endpoint, AND the
+/// accept side (the runtime only wires the inbound-handshake receiver when this
+/// is on). The accept path doubles as a roaming fix for restarted same-LAN
+/// peers, but it rides this flag too so the fleet default stays byte-identical
+/// until the tier is field-proven per-host.
+pub fn public_direct_enabled() -> bool {
+    match crate::env::node_env("OVERLAY_PUBLIC_DIRECT") {
+        Some(v) => {
+            let t = v.trim();
+            t.eq_ignore_ascii_case("1")
+                || t.eq_ignore_ascii_case("true")
+                || t.eq_ignore_ascii_case("yes")
+                || t.eq_ignore_ascii_case("on")
+        }
+        None => false,
+    }
+}
+
+/// Phase A — a globally-routable IPv4: the address classes that can never be
+/// dialled across the internet are excluded (RFC1918 private, loopback,
+/// link-local, CGNAT/overlay `100.64/10`, `0/8`, multicast `224/4`, and
+/// `240/4` incl. broadcast). v4-only by design — v6 exit egress rides the v4
+/// carrier (CC7). NB the TEST-NET ranges (`203.0.113.0/24` etc.) are
+/// deliberately NOT excluded: they never appear on real NICs and double as
+/// "public" space in unit fixtures.
+pub fn is_public_v4(ip: Ipv4Addr) -> bool {
+    let o = ip.octets();
+    !(ip.is_private()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || is_cgnat(ip)
+        || o[0] == 0
+        || o[0] >= 240)
+}
+
+/// Phase A — from a peer's JOIN-TIME NIC endpoints (the netmap's
+/// `lan_endpoints` bucket), pick the first **public** one: the peer's NIC
+/// holds a public IP (bare-metal
+/// / no NAT in front), so we can dial it directly without STUN. Candidates
+/// equal to one of OUR OWN interface IPs are skipped (a same-host / stale
+/// record can't be a peer dial target; a genuinely same-subnet peer was
+/// already taken by the LAN tier, which runs first). `None` → the caller falls
+/// through to the passive stance or the relay.
+pub fn pick_public_endpoint(my_ips: &[Ipv4Addr], lan_endpoints: &[String]) -> Option<SocketAddr> {
+    for ep in lan_endpoints {
+        if let Ok(SocketAddr::V4(sa)) = ep.trim().parse::<SocketAddr>()
+            && is_public_v4(*sa.ip())
+            && !my_ips.contains(sa.ip())
+        {
+            return Some(SocketAddr::V4(sa));
+        }
+    }
+    None
+}
+
 /// Same-/24 test: two IPv4s share the top 24 bits. A strong, conservative
 /// signal of same-L2-segment reachability for home/office LANs (good enough
 /// for v1; a netmask-aware check is a refinement).
@@ -225,6 +286,58 @@ mod tests {
         // A same-subnet but CGNAT endpoint is rejected.
         let cgnat = vec!["100.64.0.110:51820".to_string()];
         assert!(pick_same_subnet_endpoint(&["100.64.0.103".parse().unwrap()], &cgnat).is_none());
+    }
+
+    #[test]
+    fn public_v4_classification() {
+        let public = ["5.9.157.226", "94.130.141.98", "203.0.113.9", "8.8.8.8"];
+        for p in public {
+            assert!(is_public_v4(p.parse().unwrap()), "{p} must classify public");
+        }
+        let not_public = [
+            "192.168.68.103", // RFC1918
+            "10.16.6.34",     // RFC1918
+            "172.16.0.1",     // RFC1918
+            "127.0.0.1",      // loopback
+            "169.254.1.2",    // link-local
+            "100.64.0.1",     // CGNAT / overlay
+            "0.0.0.0",        // unspecified
+            "0.1.2.3",        // 0/8
+            "224.0.0.1",      // multicast
+            "240.0.0.1",      // 240/4 reserved
+            "255.255.255.255",
+        ];
+        for p in not_public {
+            assert!(!is_public_v4(p.parse().unwrap()), "{p} must NOT be public");
+        }
+    }
+
+    #[test]
+    fn picks_first_public_endpoint_skipping_private_and_self() {
+        let my_ips: [Ipv4Addr; 2] = [
+            "94.130.141.98".parse().unwrap(),
+            "192.168.150.1".parse().unwrap(),
+        ];
+        // Peer join bucket: its LAN address, then its public NIC address.
+        let eps = vec![
+            "192.168.7.23:41000".to_string(), // peer's private LAN — not dialable x-net
+            "5.9.157.226:41234".to_string(),  // peer's public NIC — pick this
+        ];
+        assert_eq!(
+            pick_public_endpoint(&my_ips, &eps),
+            Some("5.9.157.226:41234".parse().unwrap())
+        );
+
+        // Our OWN public IP in a peer record is never a dial target.
+        let self_ep = vec!["94.130.141.98:41000".to_string()];
+        assert!(pick_public_endpoint(&my_ips, &self_ep).is_none());
+
+        // All-private bucket → None (NAT'd peer; passive/relay handles it).
+        let private_only = vec![
+            "192.168.7.23:41000".to_string(),
+            "10.0.0.5:41001".to_string(),
+        ];
+        assert!(pick_public_endpoint(&my_ips, &private_only).is_none());
     }
 
     #[test]
