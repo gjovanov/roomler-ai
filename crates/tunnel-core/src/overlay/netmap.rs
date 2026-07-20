@@ -75,10 +75,7 @@ pub fn peer_config_from_netmap(peer: &NetmapPeer) -> Option<PeerConfig> {
         srflx_endpoints: peer.srflx_endpoints.clone(),
         srflx_nat: peer.srflx_nat.clone(),
         supports_quic: peer.supports_quic,
-        // D1c wires this to `peer.supports_relay_single` once the NetmapPeer
-        // field + server population land; `false` until then keeps single-relay
-        // inert (both ends must advertise, so a mixed fleet stays both-allocate).
-        supports_relay_single: false,
+        supports_relay_single: peer.supports_relay_single,
     })
 }
 
@@ -101,6 +98,7 @@ mod tests {
             relay_home: None,
             reachable,
             supports_quic: false,
+            supports_relay_single: false,
             routes: vec![],
             agent_id: None,
         }

@@ -902,6 +902,10 @@ impl OverlayRuntime {
             // rc.142 — advertise the QUIC-over-TURN capability so the server
             // only tells a peer to attempt QUIC when BOTH ends support it.
             supports_quic: overlay_quic_enabled(),
+            // Phase D — advertise the single-relay capability (our OVERLAY_RELAY_SINGLE
+            // flag) so the server only lets a peer pick single-relay when BOTH ends
+            // opted in; a mixed pair stays on the both-allocate relay.
+            supports_relay_single: crate::overlay::direct::relay_single_enabled(),
             // Phase 1 — subnet routes we offer (admin must approve server-side).
             advertised_routes: self.advertised_routes.clone(),
         };
@@ -2797,6 +2801,7 @@ mod tests {
                 relay_home: None,
                 reachable,
                 supports_quic: false,
+                supports_relay_single: false,
                 routes: vec![],
                 agent_id: None,
             }
@@ -2989,6 +2994,7 @@ mod tests {
             relay_home: None,
             reachable: true,
             supports_quic: false,
+            supports_relay_single: false,
             routes: vec![],
             agent_id: None,
         }
@@ -3108,6 +3114,7 @@ mod tests {
             relay_home: None,
             reachable: true,
             supports_quic: false,
+            supports_relay_single: false,
             routes,
             agent_id: None,
         }
@@ -3254,6 +3261,7 @@ mod tests {
             relay_home: None,
             reachable: true,
             supports_quic: false,
+            supports_relay_single: false,
             routes: vec!["192.168.5.0/24".into(), "0.0.0.0/0".into()],
             agent_id: None,
         };
