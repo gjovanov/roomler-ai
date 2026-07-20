@@ -9,5 +9,5 @@ S=$(grep '^COTURN_AUTH_SECRET=' ~/k8s-cluster-multi/.env | cut -d= -f2- | tr -d 
 if [ -z "$S" ]; then echo "COTURN_AUTH_SECRET not found in ~/k8s-cluster-multi/.env" >&2; exit 1; fi
 export ROOMLER_TEST_TURN_HOST=coturn.roomler.ai
 export ROOMLER_TEST_TURN_SECRET="$S"
-exec cargo test -p roomler-ai-tunnel-core --features overlay-l3 --ignored \
-  single_relay_against_real_coturn_udp -- --nocapture
+exec cargo test -p roomler-ai-tunnel-core --features overlay-l3 \
+  single_relay_against_real_coturn_udp -- --ignored --nocapture
