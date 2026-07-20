@@ -1106,6 +1106,17 @@ pub struct OverlayNetworkInfo {
     /// the node's existing system resolvers.
     #[serde(default)]
     pub nameservers: Vec<String>,
+    /// NAT-traversal Phase B — STUN server URLs the node queries (on each of its
+    /// own traffic sockets) to discover its server-reflexive candidates — its
+    /// public `ip:port` as seen through the NAT. Lets a peer/exit behind a 1:1
+    /// (or cone) NAT become directly dialable without a relay. Typically the
+    /// same coturn workers used for TURN (a `turn:` host doubles as a STUN
+    /// server). The runtime has no per-peer ICE creds at join/`setup_direct`
+    /// time (those arrive only via `RelayGrant`), so the STUN endpoints must
+    /// ride the netmap itself. Empty → no srflx gathering (pre-Phase-B server,
+    /// or STUN disabled). `#[serde(default)]` for back-compat.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stun_urls: Vec<String>,
 }
 
 #[cfg(test)]
@@ -2061,6 +2072,7 @@ mod tests {
                 mtu: 1280,
                 magic_domain: Some("myorg.roomler.net".into()),
                 nameservers: vec!["1.1.1.1".into()],
+                stun_urls: vec!["stun:5.9.157.221:3478".into()],
             },
             peers: vec![NetmapPeer {
                 node_id,
@@ -2143,6 +2155,26 @@ mod tests {
         let s2 = serde_json::to_string(&p2).unwrap();
         assert!(s2.contains(r#""lan_endpoints":["5.9.157.226:41234"]"#));
         assert_eq!(serde_json::from_str::<NetmapPeer>(&s2).unwrap(), p2);
+    }
+
+    /// Phase B — `stun_urls` back-compat: a pre-Phase-B server omits it →
+    /// defaults empty (no srflx gathering); empty is skipped on the wire;
+    /// populated round-trips byte-for-byte.
+    #[test]
+    fn overlay_network_stun_urls_default_and_skip() {
+        let json = r#"{"cidr":"100.64.0.0/10","mtu":1280}"#;
+        let n: OverlayNetworkInfo = serde_json::from_str(json).unwrap();
+        assert!(n.stun_urls.is_empty());
+        let s = serde_json::to_string(&n).unwrap();
+        assert!(
+            !s.contains("stun_urls"),
+            "empty stun_urls must be omitted: {s}"
+        );
+        let mut n2 = n.clone();
+        n2.stun_urls = vec!["stun:5.9.157.221:3478".into()];
+        let s2 = serde_json::to_string(&n2).unwrap();
+        assert!(s2.contains(r#""stun_urls":["stun:5.9.157.221:3478"]"#));
+        assert_eq!(serde_json::from_str::<OverlayNetworkInfo>(&s2).unwrap(), n2);
     }
 
     #[test]

@@ -18,6 +18,10 @@
 //! are later follow-ups. See `docs/overlay-wfp.md` siblings.
 
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::net::UdpSocket;
 
 /// `ROOMLER_NODE_OVERLAY_DIRECT` (legacy `ROOMLER_AGENT_OVERLAY_DIRECT` still
 /// honoured — see [`crate::env::node_env`]) — default **ON**. Set
@@ -235,6 +239,62 @@ pub fn pick_same_subnet_endpoint(
     None
 }
 
+/// Phase B — parse a STUN endpoint from a `stun:` / `stuns:` URL (or a bare
+/// `host:port`) **when the host is an IPv4 literal**. Strips the scheme and any
+/// `?transport=…` / `#…` suffix. Returns `None` for a hostname (the caller
+/// resolves those via DNS — this stays sync + allocation-light) or a
+/// malformed / IPv6 value (v4-only, CC7). Coturn workers double as STUN
+/// servers, so a `turn:` URL's host also works if the scheme is stripped first.
+pub fn parse_stun_url(url: &str) -> Option<SocketAddr> {
+    let s = url.trim();
+    let s = s
+        .strip_prefix("stun:")
+        .or_else(|| s.strip_prefix("stuns:"))
+        .or_else(|| s.strip_prefix("turn:"))
+        .or_else(|| s.strip_prefix("turns:"))
+        .unwrap_or(s);
+    // Drop a `?transport=udp` query or `#frag`.
+    let s = s.split(['?', '#']).next().unwrap_or(s);
+    match s.parse::<SocketAddr>() {
+        Ok(sa @ SocketAddr::V4(_)) => Some(sa),
+        _ => None,
+    }
+}
+
+/// Phase B — discover this node's **server-reflexive** candidates by querying
+/// `stun_server` on EACH of its interface sockets. The query MUST ride the same
+/// socket the overlay traffic will later use, or the NAT mapping won't match
+/// (see [`crate::transport::stun`]) — so this takes the live `DirectCtx`
+/// sockets and MUST run BEFORE their demux recv loops start (else the STUN
+/// response races the loop's `recv`). Returns the deduped set of **public**
+/// srflx `ip:port` strings to advertise; a socket whose query fails, times out,
+/// or maps to a non-public address (STUN server on the LAN, a hairpin) is
+/// skipped. v4-only.
+pub async fn gather_srflx(
+    socks: &[(Ipv4Addr, Arc<UdpSocket>)],
+    stun_server: SocketAddr,
+    attempt_timeout: Duration,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (_ip, sock) in socks {
+        match crate::transport::stun::srflx_query(sock, stun_server, attempt_timeout).await {
+            Ok(SocketAddr::V4(srflx)) if is_public_v4(*srflx.ip()) => {
+                let ep = SocketAddr::V4(srflx).to_string();
+                if !out.contains(&ep) {
+                    out.push(ep);
+                }
+            }
+            Ok(other) => {
+                tracing::debug!(%other, "overlay: srflx candidate not public — skipping");
+            }
+            Err(e) => {
+                tracing::debug!(%e, "overlay: srflx query failed on a socket — skipping");
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -387,6 +447,102 @@ mod tests {
                 "192.168.68.103".parse::<Ipv4Addr>().unwrap(),
                 "192.168.68.110:58307".parse::<SocketAddr>().unwrap()
             )
+        );
+    }
+
+    #[test]
+    fn parse_stun_url_handles_schemes_and_rejects_hostnames() {
+        let want: SocketAddr = "5.9.157.221:3478".parse().unwrap();
+        assert_eq!(parse_stun_url("stun:5.9.157.221:3478"), Some(want));
+        assert_eq!(parse_stun_url("stuns:5.9.157.221:3478"), Some(want));
+        assert_eq!(
+            parse_stun_url("turn:5.9.157.221:3478?transport=udp"),
+            Some(want)
+        );
+        assert_eq!(parse_stun_url("5.9.157.221:3478"), Some(want));
+        assert_eq!(parse_stun_url("  stun:5.9.157.221:3478  "), Some(want));
+        // Hostnames need async DNS → the sync parser declines (caller resolves).
+        assert_eq!(parse_stun_url("stun:coturn.roomler.ai:3478"), None);
+        // IPv6 is out of scope (v4-only cascade).
+        assert_eq!(parse_stun_url("stun:[2a01:4f8::2]:3478"), None);
+        assert_eq!(parse_stun_url("garbage"), None);
+    }
+
+    /// Minimal STUN Binding Success carrying an XOR-MAPPED-ADDRESS (IPv4), so
+    /// the gather test needs no real STUN server. Mirrors RFC 5389 §15.2.
+    fn stun_success(txn: [u8; 12], ip: [u8; 4], port: u16) -> Vec<u8> {
+        const COOKIE: u32 = 0x2112_A442;
+        let cookie = COOKIE.to_be_bytes();
+        let xport = port ^ ((COOKIE >> 16) as u16);
+        let mut r = Vec::new();
+        r.extend_from_slice(&0x0101u16.to_be_bytes()); // Binding Success
+        r.extend_from_slice(&12u16.to_be_bytes()); // one 12-byte attribute
+        r.extend_from_slice(&cookie);
+        r.extend_from_slice(&txn);
+        r.extend_from_slice(&0x0020u16.to_be_bytes()); // XOR-MAPPED-ADDRESS
+        r.extend_from_slice(&8u16.to_be_bytes());
+        r.push(0);
+        r.push(0x01); // family IPv4
+        r.extend_from_slice(&xport.to_be_bytes());
+        r.extend_from_slice(&[
+            ip[0] ^ cookie[0],
+            ip[1] ^ cookie[1],
+            ip[2] ^ cookie[2],
+            ip[3] ^ cookie[3],
+        ]);
+        r
+    }
+
+    /// Spawn a fake STUN server that answers every Binding Request with a
+    /// success carrying `reply_ip:reply_port`. Returns its addr + the task
+    /// handle (kept alive by the caller for the test's duration).
+    async fn fake_stun_server(
+        reply_ip: [u8; 4],
+        reply_port: u16,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let srv = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr = srv.local_addr().unwrap();
+        let h = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((n, from)) = srv.recv_from(&mut buf).await {
+                if n >= 20 {
+                    let txn: [u8; 12] = buf[8..20].try_into().unwrap();
+                    let _ = srv
+                        .send_to(&stun_success(txn, reply_ip, reply_port), from)
+                        .await;
+                }
+            }
+        });
+        (addr, h)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gather_srflx_captures_public_filters_private_and_dead() {
+        // A PUBLIC srflx reply is captured.
+        let (pub_srv, _h1) = fake_stun_server([203, 0, 113, 9], 40000).await;
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let socks = vec![("127.0.0.1".parse().unwrap(), sock)];
+        let got = gather_srflx(&socks, pub_srv, Duration::from_millis(500)).await;
+        assert_eq!(got, vec!["203.0.113.9:40000".to_string()]);
+
+        // A PRIVATE srflx (STUN on the LAN / hairpin) is filtered out.
+        let (priv_srv, _h2) = fake_stun_server([192, 168, 1, 5], 41000).await;
+        let sock2 = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let socks2 = vec![("127.0.0.1".parse().unwrap(), sock2)];
+        assert!(
+            gather_srflx(&socks2, priv_srv, Duration::from_millis(500))
+                .await
+                .is_empty()
+        );
+
+        // A dead STUN server yields no candidates (fast timeout, no hang).
+        let dead: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let sock3 = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let socks3 = vec![("127.0.0.1".parse().unwrap(), sock3)];
+        assert!(
+            gather_srflx(&socks3, dead, Duration::from_millis(150))
+                .await
+                .is_empty()
         );
     }
 }

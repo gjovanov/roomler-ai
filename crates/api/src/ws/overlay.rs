@@ -265,6 +265,12 @@ async fn handle_overlay_join(
                 mtu: network.mtu,
                 magic_domain,
                 nameservers,
+                // NAT-traversal Phase B2 — derive the STUN endpoints from the
+                // configured coturn workers (a `turn:host:port` doubles as a
+                // STUN server). Empty for now → clients gather no srflx (the
+                // wire field + client gather primitive land in B1; the coturn
+                // derivation + client wiring in B2).
+                stun_urls: Vec::new(),
             },
             peers,
             epoch,

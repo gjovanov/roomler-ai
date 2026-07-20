@@ -2194,6 +2194,7 @@ mod tests {
             mtu: 1280,
             magic_domain: None,
             nameservers: vec![],
+            stun_urls: vec![],
         }
     }
     fn peer(kp: &WgKeypair, ip: &str) -> NetmapPeer {
