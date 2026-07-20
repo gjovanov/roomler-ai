@@ -187,6 +187,20 @@ pub fn srflx_enabled() -> bool {
     }
 }
 
+/// Phase C — the srflx keepalive/re-gather interval in seconds
+/// (`ROOMLER_NODE_OVERLAY_SRFLX_KEEPALIVE_SECS`, default 20). The task re-runs a
+/// STUN Binding on the punch socket every interval to (a) hold the NAT mapping
+/// open on an idle link and (b) detect + re-advertise a changed mapping. **`0`
+/// disables the task entirely** — the startup gather still advertises once, but
+/// there's no in-band refresh (the mapping then relies on WG keepalives for
+/// active links only). A malformed value falls back to the default.
+pub fn srflx_keepalive_secs() -> u64 {
+    match crate::env::node_env("OVERLAY_SRFLX_KEEPALIVE_SECS") {
+        Some(v) => v.trim().parse::<u64>().unwrap_or(20),
+        None => 20,
+    }
+}
+
 /// Phase A — a globally-routable IPv4: the address classes that can never be
 /// dialled across the internet are excluded (RFC1918 private, loopback,
 /// link-local, CGNAT/overlay `100.64/10`, `0/8`, multicast `224/4`, and

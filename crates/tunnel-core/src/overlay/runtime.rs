@@ -376,6 +376,81 @@ async fn sync_name_map(names: &dns::NameMap, peers: &HashMap<ObjectId, NetmapPee
     }
 }
 
+/// Phase C (D5) — the srflx keepalive / re-gather task. Every `interval`
+/// (jittered) it re-runs a STUN Binding on the PUNCH socket (through the demux
+/// STUN sink) to (a) hold the NAT mapping open on an idle link — WG keepalives
+/// only cover ACTIVE sessions — and (b) detect a CHANGED public mapping and
+/// re-advertise it, so a peer that joins later dials the live srflx, not a dead
+/// one.
+///
+/// The STUN target is PINNED (A4): re-resolved only after several consecutive
+/// failures, so a multi-worker DNS rotation can't masquerade as a mapping change
+/// and fan a network-wide re-trickle every tick. On failure the last-known
+/// advert is RETAINED (a transient STUN outage must not strip a working srflx).
+/// Re-trickles ONLY when the punch mapping (`[0]`) actually changes. Ends when
+/// the control channel closes (runtime gone).
+async fn run_srflx_keepalive(
+    punch_sock: Arc<UdpSocket>,
+    mut stun_rx: mpsc::Receiver<crate::transport::stun::StunInbound>,
+    mut stun_server: SocketAddr,
+    stun_urls: Vec<String>,
+    mut advertised: Vec<String>,
+    outbound: mpsc::Sender<ClientMsg>,
+    interval: Duration,
+) {
+    const RERESOLVE_AFTER: u32 = 3;
+    let mut failures: u32 = 0;
+    loop {
+        // Small jitter (≤25% of the interval) so a fleet doesn't STUN in
+        // lockstep; scaled to the interval so short test intervals stay quick.
+        let jitter =
+            Duration::from_millis(rand::random::<u64>() % (interval.as_millis() as u64 / 4 + 1));
+        tokio::time::sleep(interval + jitter).await;
+        match crate::transport::stun::srflx_query_via_sink(
+            &punch_sock,
+            &mut stun_rx,
+            stun_server,
+            SRFLX_ATTEMPT_TIMEOUT,
+        )
+        .await
+        {
+            Ok(mapped) => {
+                failures = 0;
+                let ep = mapped.to_string();
+                if advertised.first().map(String::as_str) != Some(ep.as_str()) {
+                    // Mapping changed → update the punch candidate `[0]` and
+                    // re-advertise (keeping any other multi-homed candidates).
+                    if advertised.is_empty() {
+                        advertised.push(ep.clone());
+                    } else {
+                        advertised[0] = ep.clone();
+                    }
+                    info!(new_srflx = %ep, "overlay: srflx mapping changed — re-advertising (Phase C keepalive)");
+                    if outbound
+                        .send(ClientMsg::OverlaySrflx {
+                            candidates: advertised.clone(),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break; // control channel closed → runtime gone
+                    }
+                }
+            }
+            Err(e) => {
+                failures += 1;
+                debug!(%e, failures, "overlay: srflx keepalive query failed — retaining last advert");
+                if failures >= RERESOLVE_AFTER {
+                    if let Some(fresh) = direct::resolve_stun_server(&stun_urls).await {
+                        stun_server = fresh;
+                    }
+                    failures = 0;
+                }
+            }
+        }
+    }
+}
+
 /// How the runtime obtains a carrier for each peer.
 enum CarrierMode {
     /// Direct/test: a stateless [`LinkFactory`] builds the carrier
@@ -898,6 +973,11 @@ impl OverlayRuntime {
         // STUN server just leaves srflx unset this run. WG keepalives hold the
         // mapping for active sessions; Phase C's in-band keepalive (demux-routed
         // STUN, chunk 2) refreshes an idle mapping + re-trickles on change.
+        // Captured for the Phase C keepalive task (chunk 2): the pinned STUN
+        // server it re-queries, and the candidates it started from (so it only
+        // re-trickles on a CHANGE). Empty/None ⇒ no keepalive spawned.
+        let mut srflx_stun_server: Option<SocketAddr> = None;
+        let mut srflx_advertised: Vec<String> = Vec::new();
         if direct::srflx_enabled() {
             let socks = direct_ctx
                 .as_ref()
@@ -906,6 +986,7 @@ impl OverlayRuntime {
             if !socks.is_empty() && !network.stun_urls.is_empty() {
                 match direct::resolve_stun_server(&network.stun_urls).await {
                     Some(stun_server) => {
+                        srflx_stun_server = Some(stun_server);
                         let pairs = tokio::time::timeout(
                             SRFLX_GATHER_BUDGET,
                             direct::gather_srflx(&socks, stun_server, SRFLX_ATTEMPT_TIMEOUT),
@@ -926,6 +1007,7 @@ impl OverlayRuntime {
                             }
                             let candidates: Vec<String> =
                                 pairs.into_iter().map(|(c, _)| c).collect();
+                            srflx_advertised = candidates.clone();
                             info!(?candidates, %stun_server, "overlay: advertising srflx candidates (NAT-traversal Phase B/C)");
                             let _ = self
                                 .outbound
@@ -963,6 +1045,36 @@ impl OverlayRuntime {
         } else {
             None
         };
+
+        // Phase C (D5) — spawn the srflx keepalive/re-gather task. It re-queries
+        // the PINNED STUN server on the punch socket every interval (via the
+        // demux STUN sink wired just above) to hold an idle NAT mapping open and
+        // re-advertise a changed one. Only when: srflx tier on, a punch socket +
+        // STUN server resolved, an advert exists, and the interval isn't 0 (off).
+        let srflx_keepalive = {
+            let secs = direct::srflx_keepalive_secs();
+            match (
+                direct_ctx.as_ref().and_then(|c| c.punch.clone()),
+                srflx_stun_server,
+                wg.take_stun_events(),
+            ) {
+                (Some((_, punch_sock)), Some(stun_server), Some(stun_rx))
+                    if direct::srflx_enabled() && secs > 0 && !srflx_advertised.is_empty() =>
+                {
+                    Some(tokio::spawn(run_srflx_keepalive(
+                        punch_sock,
+                        stun_rx,
+                        stun_server,
+                        network.stun_urls.clone(),
+                        srflx_advertised.clone(),
+                        self.outbound.clone(),
+                        Duration::from_secs(secs),
+                    )))
+                }
+                _ => None,
+            }
+        };
+
         // Latest netmap view (node_id → peer), so the fallback sweep can drive
         // the relay path for a downgraded peer without waiting for a netmap.
         let mut current_peers: HashMap<ObjectId, NetmapPeer> =
@@ -1230,6 +1342,10 @@ impl OverlayRuntime {
             .await;
 
         inbound.abort();
+        // Phase C — stop the srflx keepalive task (if any) on runtime exit.
+        if let Some(h) = srflx_keepalive {
+            h.abort();
+        }
     }
 
     /// rc.137/139 — find carriers that are one-way / dead and repair them.
@@ -2419,8 +2535,14 @@ mod tests {
         wg.ensure_direct_demux(sock.clone());
         let dead: SocketAddr = "127.0.0.1:9".parse().unwrap();
         let overlay_ip = Ipv4Addr::new(100, 64, 0, 2);
-        wg.add_direct_peer(sock.clone(), peer_kp.public.to_bytes(), overlay_ip, dead, true)
-            .await;
+        wg.add_direct_peer(
+            sock.clone(),
+            peer_kp.public.to_bytes(),
+            overlay_ip,
+            dead,
+            true,
+        )
+        .await;
         assert_eq!(
             wg.peer_handshake_done(&peer_kp.public.to_bytes()),
             Some(false),
@@ -2474,7 +2596,11 @@ mod tests {
             cooldowns.srflx.contains_key(&nid),
             "the srflx cooldown is set"
         );
-        assert_eq!(cooldowns.srflx_fails.get(&nid), Some(&1), "one srflx strike");
+        assert_eq!(
+            cooldowns.srflx_fails.get(&nid),
+            Some(&1),
+            "one srflx strike"
+        );
         assert!(
             !cooldowns.lan.contains_key(&nid) && !cooldowns.lan_fails.contains_key(&nid),
             "CC1: the LAN tier is NOT poisoned"
@@ -2483,6 +2609,123 @@ mod tests {
             !cooldowns.public.contains_key(&nid) && !cooldowns.public_fails.contains_key(&nid),
             "CC1: the public-direct tier is NOT poisoned"
         );
+    }
+
+    /// Minimal STUN Binding Success carrying an XOR-MAPPED-ADDRESS (IPv4), so a
+    /// keepalive test needs no real STUN server (RFC 5389 §15.2).
+    fn stun_success(txn: [u8; 12], ip: [u8; 4], port: u16) -> Vec<u8> {
+        const COOKIE: u32 = 0x2112_A442;
+        let cookie = COOKIE.to_be_bytes();
+        let xport = port ^ ((COOKIE >> 16) as u16);
+        let mut r = Vec::new();
+        r.extend_from_slice(&0x0101u16.to_be_bytes()); // Binding Success
+        r.extend_from_slice(&12u16.to_be_bytes()); // one 12-byte attribute
+        r.extend_from_slice(&cookie);
+        r.extend_from_slice(&txn);
+        r.extend_from_slice(&0x0020u16.to_be_bytes()); // XOR-MAPPED-ADDRESS
+        r.extend_from_slice(&8u16.to_be_bytes());
+        r.push(0);
+        r.push(0x01); // family IPv4
+        r.extend_from_slice(&xport.to_be_bytes());
+        r.extend_from_slice(&[
+            ip[0] ^ cookie[0],
+            ip[1] ^ cookie[1],
+            ip[2] ^ cookie[2],
+            ip[3] ^ cookie[3],
+        ]);
+        r
+    }
+
+    /// Phase C (D5) — the srflx keepalive re-advertises EXACTLY when the punch
+    /// mapping changes, and never on a query returning the same mapping. A demux
+    /// emulator feeds STUN replies into the sink as the real demux loop would.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn srflx_keepalive_retrickles_only_on_mapping_change() {
+        let punch = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = server.local_addr().unwrap();
+        let (sink_tx, sink_rx) = mpsc::channel::<crate::transport::stun::StunInbound>(16);
+
+        // Reply to the FIRST query with the initial advert (no change), and to
+        // every later query with a CHANGED mapping.
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let mut seen = 0u32;
+            loop {
+                let Ok((_n, _from)) = server.recv_from(&mut buf).await else {
+                    break;
+                };
+                let txn: [u8; 12] = buf[8..20].try_into().unwrap();
+                let port = if seen == 0 { 1111 } else { 2222 };
+                seen += 1;
+                let _ = sink_tx
+                    .send(crate::transport::stun::StunInbound {
+                        src: server_addr,
+                        packet: stun_success(txn, [203, 0, 113, 7], port),
+                    })
+                    .await;
+            }
+        });
+
+        let (out_tx, mut out_rx) = mpsc::channel::<ClientMsg>(16);
+        let advertised = vec!["203.0.113.7:1111".to_string()];
+        let task = tokio::spawn(run_srflx_keepalive(
+            punch,
+            sink_rx,
+            server_addr,
+            vec![],
+            advertised,
+            out_tx,
+            Duration::from_millis(60),
+        ));
+
+        // First tick: mapping == advert → NO trickle. Second tick: changed to
+        // :2222 → exactly one trickle with the new punch candidate at [0].
+        let msg = tokio::time::timeout(Duration::from_secs(3), out_rx.recv())
+            .await
+            .expect("expected a re-trickle")
+            .expect("channel closed");
+        match msg {
+            ClientMsg::OverlaySrflx { candidates } => {
+                assert_eq!(candidates, vec!["203.0.113.7:2222".to_string()])
+            }
+            other => panic!("expected OverlaySrflx, got {other:?}"),
+        }
+        // No further trickle while the mapping stays :2222.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(400), out_rx.recv())
+                .await
+                .is_err(),
+            "must not re-trickle when the mapping is unchanged"
+        );
+        task.abort();
+    }
+
+    /// Phase C (D5) — a STUN outage must NOT strip a working advert: with no
+    /// reply arriving, the keepalive retains the last-known srflx (no trickle).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn srflx_keepalive_retains_advert_on_outage() {
+        let punch = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        // Hold the sender so the channel stays open; never feed it (outage).
+        let (_sink_tx, sink_rx) = mpsc::channel::<crate::transport::stun::StunInbound>(1);
+        let (out_tx, mut out_rx) = mpsc::channel::<ClientMsg>(4);
+        let dead: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let task = tokio::spawn(run_srflx_keepalive(
+            punch,
+            sink_rx,
+            dead,
+            vec![],
+            vec!["203.0.113.7:1111".to_string()],
+            out_tx,
+            Duration::from_millis(30),
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), out_rx.recv())
+                .await
+                .is_err(),
+            "a STUN outage must not produce a re-trickle"
+        );
+        task.abort();
     }
 
     #[test]
