@@ -82,18 +82,17 @@
       >
         On {{ rc.currentDesktop.value }}
       </v-chip>
-      <!-- Mobile-only Row-2 trigger: opens the bottom-sheet that
-           holds Row 2's controls (Quality / Scale / Resolution /
-           Codec / Crystal-Clear / Low-Latency / clipboard / upload).
-           Hidden on `md` and above where Row 2 renders inline. -->
+      <!-- rc.199 — Settings gear (all viewports): opens the unified
+           Settings panel (Video / Display / Session). Replaces the old
+           mobile-only bottom-sheet trigger + the desktop inline Row 2. -->
       <v-btn
         icon="mdi-tune-variant"
         variant="text"
         size="small"
-        class="d-md-none mr-1"
+        class="mr-1"
         aria-label="Open viewer settings"
         title="Viewer settings"
-        @click="mobileSettingsOpen = true"
+        @click="settingsOpen = true"
       />
       <!-- Soft-keyboard toggle: mounts the MobileKeyboard component
            which surfaces a hidden textarea so the OS soft keyboard
@@ -133,248 +132,15 @@
       >
         <v-icon>mdi-keyboard-outline</v-icon>
       </v-btn>
-      <!-- Unmute affordance: only shown when the browser blocked
-           autoplay-with-sound for the received host-audio track (no
-           prior user gesture on the page). The click IS the gesture,
-           so it retries playback. Amber to stand out. -->
-      <v-btn
-        v-if="rc.audioAutoplayBlocked.value"
-        color="warning"
-        variant="flat"
-        size="small"
-        class="mr-1"
-        prepend-icon="mdi-volume-off"
-        aria-label="Unmute host audio (autoplay was blocked)"
-        title="Click to hear the host's audio — the browser blocked autoplay"
-        @click="onUnmuteAudio"
-      >
-        Unmute
-      </v-btn>
-      <v-btn
-        v-if="rc.phase.value === 'idle' || rc.phase.value === 'closed' || rc.phase.value === 'error'"
-        color="primary"
-        variant="flat"
-        prepend-icon="mdi-play"
-        :disabled="!canConnect"
-        @click="startSession"
-      >
-        Connect
-      </v-btn>
-      <v-btn
-        v-else
-        color="error"
-        variant="flat"
-        prepend-icon="mdi-stop"
-        @click="rc.disconnect()"
-      >
-        Disconnect
-      </v-btn>
-      <!-- Fullscreen: gated on (a) connected session AND (b) the
-           document supports the Fullscreen API. iOS Safari only
-           supports `webkitEnterFullscreen` on `<video>` elements,
-           and won't show overlay canvases (cursor / stats), so we
-           hide the button on iOS rather than pretend it works.
-           ESC exits natively. -->
-      <v-btn
-        v-if="rc.phase.value === 'connected' && fullscreenEnabled"
-        icon
-        variant="text"
-        size="small"
-        class="ml-1"
-        :aria-label="isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'"
-        :title="isFullscreen ? 'Exit fullscreen (Esc)' : 'Fullscreen'"
-        @click="toggleFullscreen"
-      >
-        <v-icon>{{ isFullscreen ? 'mdi-fullscreen-exit' : 'mdi-fullscreen' }}</v-icon>
-      </v-btn>
-    </v-toolbar>
-
-    <!-- ============================================================
-         Toolbar Row 2: session controls. Visible inline on `md+`,
-         collapsed into the bottom-sheet on `<md`. `flex-wrap: wrap`
-         lets it spill to a second row on borderline viewports
-         (~960-1100px) instead of pushing controls off-screen.
-         ============================================================ -->
-    <div class="rc-tools-row d-none d-md-flex align-center flex-wrap ga-2 px-2 py-1">
-      <v-select
-        v-model="quality"
-        :items="qualityOptions"
-        density="compact"
-        hide-details
-        variant="outlined"
-        style="max-width: 140px;"
-        prepend-inner-icon="mdi-quality-high"
-        aria-label="Quality preference"
-      />
-      <v-select
-        v-model="scaleMode"
-        :items="scaleOptions"
-        density="compact"
-        hide-details
-        variant="outlined"
-        style="max-width: 160px;"
-        prepend-inner-icon="mdi-image-size-select-actual"
-        aria-label="View scale"
-      />
-      <v-text-field
-        v-if="scaleMode === 'custom'"
-        v-model.number="scalePercent"
-        type="number"
-        min="5"
-        max="1000"
-        step="5"
-        density="compact"
-        hide-details
-        variant="outlined"
-        style="max-width: 110px;"
-        suffix="%"
-        aria-label="Custom scale percent"
-      />
-      <v-select
-        v-model="resolutionPresetValue"
-        :items="resolutionOptions"
-        density="compact"
-        hide-details
-        variant="outlined"
-        style="max-width: 190px;"
-        prepend-inner-icon="mdi-monitor-screenshot"
-        aria-label="Remote capture resolution"
-        :title="resolutionButtonTitle"
-      />
-      <!-- rc.35 — native source dims chip. Hides until the first frame
-           lands (composable populates mediaIntrinsicW/H + vp9_444Stats).
-           Warning color when the operator's custom target exceeds
-           native — clarifies that the agent will silently cap (no
-           upscale). Click opens the custom dialog so they can adjust. -->
-      <v-chip
-        v-if="nativeSourceLabel"
-        size="small"
-        :color="customTargetExceedsNative ? 'warning' : undefined"
-        :variant="customTargetExceedsNative ? 'tonal' : 'outlined'"
-        :prepend-icon="customTargetExceedsNative ? 'mdi-alert-circle-outline' : 'mdi-monitor'"
-        :title="customTargetExceedsNative
-          ? `Custom target exceeds agent native ${nativeSourceLabel} — agent caps at native (no upscale). Click to edit.`
-          : `Agent native source: ${nativeSourceLabel}`"
-        class="d-none d-md-inline-flex"
-        style="cursor: pointer;"
-        @click="customResolutionDialog = true"
-      >
-        Native {{ nativeSourceLabel }}
-      </v-chip>
-      <v-select
-        v-model="codecOverride"
-        :items="codecOptions"
-        density="compact"
-        hide-details
-        variant="outlined"
-        style="max-width: 160px;"
-        prepend-inner-icon="mdi-video-outline"
-        aria-label="Codec override"
-        :title="codecOverride == null
-          ? 'Agent picks the best available codec'
-          : `Forcing ${codecOverride.toUpperCase()} — takes effect on next Connect`"
-      />
-      <!-- Crystal-clear (VP9 4:4:4) toggle. Persists across reloads;
-           takes effect on next Connect. Disabled when the browser
-           lacks WebCodecs VideoDecoder vp09.01.10.08. -->
-      <v-btn
-        icon
-        variant="text"
-        size="small"
-        :color="vp9_444On ? 'primary' : undefined"
-        :disabled="!rc.vp9_444Supported.value"
-        :aria-label="vp9_444On ? 'Disable crystal-clear (VP9 4:4:4) path' : 'Enable crystal-clear (VP9 4:4:4) path'"
-        :title="vp9_444Tooltip"
-        @click="toggleVp9_444"
-      >
-        <v-icon>{{ vp9_444On ? 'mdi-format-color-fill' : 'mdi-format-color-marker-cancel' }}</v-icon>
-      </v-btn>
-      <!-- rc.63 — VP9 chroma format dropdown for the desktop inline
-           toolbar. Mirrors the same select that lives in the mobile
-           bottom-sheet at line ~740. Compact width to fit the icon
-           row. Disabled until Crystal-Clear is on (the setting only
-           applies to the data-channel-vp9-444 transport). -->
-      <v-select
-        v-model="vp9Chroma"
-        :items="vp9ChromaOptionsCompact"
-        :disabled="!vp9_444On"
-        density="compact"
-        hide-details
-        variant="outlined"
-        style="max-width: 130px;"
-        prepend-inner-icon="mdi-format-color-fill"
-        aria-label="VP9 chroma format"
-        :title="vp9ChromaHint"
-      />
-      <!-- rc.81 — HEVC over DataChannel toggle. Mutually exclusive
-           with Crystal-Clear (both write `videoTransport`). Disabled
-           when the browser lacks HW HEVC decode. -->
-      <v-btn
-        icon
-        variant="text"
-        size="small"
-        :color="hevcOn ? 'primary' : undefined"
-        :disabled="!rc.hevcSupported.value"
-        :aria-label="hevcOn ? 'Disable HEVC DataChannel path' : 'Enable HEVC DataChannel path'"
-        :title="hevcTooltip"
-        @click="toggleHevc"
-      >
-        <v-icon>{{ hevcOn ? 'mdi-video-vintage' : 'mdi-video' }}</v-icon>
-      </v-btn>
-      <!-- rc.190 — AV1 over DataChannel toggle. Gated on the agent
-           advertising AV1 encode silicon + WebCodecs AV1 decode here. -->
-      <v-btn
-        icon
-        variant="text"
-        size="small"
-        :color="av1On ? 'primary' : undefined"
-        :disabled="!rc.av1Supported.value || !agentHasAv1"
-        :aria-label="av1On ? 'Disable AV1 DataChannel path' : 'Enable AV1 DataChannel path'"
-        :title="av1Tooltip"
-        @click="toggleAv1"
-      >
-        <v-icon>mdi-alpha-a-box{{ av1On ? '' : '-outline' }}</v-icon>
-      </v-btn>
-      <!-- Low-latency (WebCodecs) toggle. Bypasses Chrome's <video>
-           jitter-buffer floor (~80ms). Disabled when the browser
-           lacks RTCRtpScriptTransform / VideoDecoder. -->
-      <v-btn
-        icon
-        variant="text"
-        size="small"
-        :color="webcodecsOn ? 'primary' : undefined"
-        :disabled="!rc.webcodecsSupported.value"
-        :aria-label="webcodecsOn ? 'Disable low-latency path' : 'Enable low-latency (WebCodecs) path'"
-        :title="webcodecsTooltip"
-        @click="toggleWebCodecs"
-      >
-        <v-icon>{{ webcodecsOn ? 'mdi-flash' : 'mdi-flash-outline' }}</v-icon>
-      </v-btn>
-      <!-- Opt-in "receive host audio" toggle. Adds a recvonly Opus
-           audio track on the next Connect; the host's system/desktop
-           audio plays through a hidden <audio> sink. Disabled while a
-           session is live (takes effect on next Connect) and when the
-           agent doesn't advertise 'opus' in its caps. -->
-      <v-btn
-        icon
-        variant="text"
-        size="small"
-        :color="audioOn ? 'primary' : undefined"
-        :disabled="sessionLive || !agentSupportsAudio"
-        :aria-label="audioOn ? 'Disable receiving host audio' : 'Enable receiving host audio'"
-        :title="audioTooltip"
-        @click="toggleAudio"
-      >
-        <v-icon>{{ audioOn ? 'mdi-volume-high' : 'mdi-volume-off' }}</v-icon>
-      </v-btn>
-      <!-- Connected-only tools: clipboard send/get + file upload.
-           Both DCs only open while connected, so the buttons are
-           hidden otherwise. -->
+      <!-- rc.199 — clipboard send / get: frequent connected-session
+           actions, kept on the toolbar (not the Settings panel) at
+           every viewport. Relocated here from the retired Row 2. -->
       <v-btn
         v-if="rc.phase.value === 'connected'"
         icon
         variant="text"
         size="small"
+        class="mr-1"
         :loading="clipboardBusy"
         aria-label="Send my clipboard to the remote host"
         title="Send my clipboard → remote"
@@ -387,6 +153,7 @@
         icon
         variant="text"
         size="small"
+        class="mr-1"
         :loading="clipboardBusy"
         aria-label="Get the remote host's clipboard"
         title="Get remote clipboard → me"
@@ -394,81 +161,8 @@
       >
         <v-icon>mdi-content-copy</v-icon>
       </v-btn>
-      <v-btn
-        v-if="rc.phase.value === 'connected'"
-        icon
-        variant="text"
-        size="small"
-        :loading="uploadBusy"
-        aria-label="Upload a file to the remote host"
-        title="Upload file → remote"
-        @click="fileInput?.click()"
-      >
-        <v-icon>mdi-upload</v-icon>
-      </v-btn>
-      <v-btn
-        v-if="rc.phase.value === 'connected'"
-        icon
-        variant="text"
-        size="small"
-        :disabled="!agentSupportsBrowse"
-        aria-label="Browse files on the remote host"
-        :title="
-          agentSupportsBrowse
-            ? 'Browse remote files (download)'
-            : isLegacyFileDc
-              ? 'Browse needs agent 0.3.0+ — upgrade host agent'
-              : 'Browse disabled by host config'
-        "
-        @click="filesDrawer = !filesDrawer"
-      >
-        <v-icon>mdi-folder-open</v-icon>
-      </v-btn>
-      <!-- Apps: list / focus / launch windows on the remote desktop
-           (virtual-desktop hosts). Shown only when the agent advertises
-           the `apps` capability; disabled if its first list reply said
-           the host has no manageable desktop. -->
-      <v-btn
-        v-if="rc.phase.value === 'connected' && agentSupportsApps"
-        icon
-        variant="text"
-        size="small"
-        class="d-none d-sm-inline-flex"
-        :disabled="rc.appsSupported.value === false"
-        aria-label="Remote apps"
-        :title="
-          rc.appsSupported.value === false
-            ? 'This agent has no manageable desktop'
-            : 'Apps — list / focus / launch remote windows'
-        "
-        @click="openAppsDialog"
-      >
-        <v-icon>mdi-apps</v-icon>
-      </v-btn>
-      <!-- rc.23 — open the agent log viewer. Diagnostic feature
-           added so operators can see what's happening on the host
-           (e.g. ESET interrupt logs, sync_data failures) without
-           RDP-ing in. Disabled until the control DC is open. -->
-      <v-btn
-        :disabled="rc.phase.value !== 'connected'"
-        icon
-        variant="text"
-        size="small"
-        class="d-none d-sm-inline-flex"
-        aria-label="Show agent log"
-        :title="
-          rc.phase.value === 'connected'
-            ? 'Show agent log (rc:logs-fetch)'
-            : 'Connect to view agent logs'
-        "
-        @click="openAgentLogDialog"
-      >
-        <v-icon>mdi-file-document-outline</v-icon>
-      </v-btn>
-      <!-- Transfers chip — shows count of in-progress + recently
-           finished uploads / downloads. Click to expand a popover
-           with per-row progress and cancel buttons. Hidden when
-           there are no transfers to keep the toolbar uncluttered. -->
+      <!-- Transfers chip — in-progress uploads/downloads popover.
+           Conditionally rendered so it never clutters the toolbar. -->
       <v-menu
         v-if="
           (rc.phase.value === 'connected' || rc.phase.value === 'reconnecting') &&
@@ -483,6 +177,7 @@
             icon
             variant="text"
             size="small"
+            class="mr-1"
             :aria-label="`${transfersInFlightCount} transfer(s) in progress`"
             :title="`Transfers (${transfersInFlightCount} active, ${rc.transfers.value.length} total)`"
           >
@@ -563,7 +258,62 @@
           </v-list>
         </v-card>
       </v-menu>
-    </div>
+      <!-- Unmute affordance: only shown when the browser blocked
+           autoplay-with-sound for the received host-audio track (no
+           prior user gesture on the page). The click IS the gesture,
+           so it retries playback. Amber to stand out. -->
+      <v-btn
+        v-if="rc.audioAutoplayBlocked.value"
+        color="warning"
+        variant="flat"
+        size="small"
+        class="mr-1"
+        prepend-icon="mdi-volume-off"
+        aria-label="Unmute host audio (autoplay was blocked)"
+        title="Click to hear the host's audio — the browser blocked autoplay"
+        @click="onUnmuteAudio"
+      >
+        Unmute
+      </v-btn>
+      <v-btn
+        v-if="rc.phase.value === 'idle' || rc.phase.value === 'closed' || rc.phase.value === 'error'"
+        color="primary"
+        variant="flat"
+        prepend-icon="mdi-play"
+        :disabled="!canConnect"
+        @click="startSession"
+      >
+        Connect
+      </v-btn>
+      <v-btn
+        v-else
+        color="error"
+        variant="flat"
+        prepend-icon="mdi-stop"
+        @click="rc.disconnect()"
+      >
+        Disconnect
+      </v-btn>
+      <!-- Fullscreen: gated on (a) connected session AND (b) the
+           document supports the Fullscreen API. iOS Safari only
+           supports `webkitEnterFullscreen` on `<video>` elements,
+           and won't show overlay canvases (cursor / stats), so we
+           hide the button on iOS rather than pretend it works.
+           ESC exits natively. -->
+      <v-btn
+        v-if="rc.phase.value === 'connected' && fullscreenEnabled"
+        icon
+        variant="text"
+        size="small"
+        class="ml-1"
+        :aria-label="isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'"
+        :title="isFullscreen ? 'Exit fullscreen (Esc)' : 'Fullscreen'"
+        @click="toggleFullscreen"
+      >
+        <v-icon>{{ isFullscreen ? 'mdi-fullscreen-exit' : 'mdi-fullscreen' }}</v-icon>
+      </v-btn>
+    </v-toolbar>
+
     <!-- File input (hidden); shared between Row 2 inline upload
          button and the bottom-sheet upload button. `multiple`
          lets the operator queue several files in one picker
@@ -905,33 +655,89 @@
       </v-card>
     </v-dialog>
 
-    <!-- Mobile settings bottom-sheet — holds Row 2's controls on `<md`
-         viewports where the inline row is hidden. Includes the
-         session-config toggles (Crystal-Clear, Low-Latency) and
-         the connected-only tools (clipboard send/get, upload) so
-         a phone operator never has to reach for a control that
-         isn't on screen. Ctrl-Alt-Del stays in the toolbar above. -->
-    <v-bottom-sheet v-model="mobileSettingsOpen" inset>
-      <v-card>
-        <v-card-title>Viewer settings</v-card-title>
-        <v-card-text class="d-flex flex-column ga-3">
+    <!-- ============================================================
+         rc.199 — unified Settings panel. ONE responsive surface for
+         every viewport (fullscreen on phones, a centred card on
+         desktop), opened by the toolbar gear. Replaces the duplicated
+         desktop Row 2 + the mobile bottom-sheet. Frequent actions
+         (fullscreen, Ctrl-Alt-Del, clipboard, disconnect, the stats
+         badge) stay on the toolbar; everything configurable lives here,
+         grouped: Video (host encode) / Display (viewer) / Session.
+         ============================================================ -->
+    <v-dialog v-model="settingsOpen" :fullscreen="mobile" :max-width="mobile ? undefined : 560" scrollable>
+      <v-card class="rc-settings-card">
+        <v-toolbar density="comfortable" color="surface">
+          <v-icon class="ml-3">mdi-tune-variant</v-icon>
+          <v-toolbar-title>Viewer settings</v-toolbar-title>
+          <v-spacer />
+          <v-btn icon variant="text" title="Close" aria-label="Close settings" @click="settingsOpen = false">
+            <v-icon>mdi-close</v-icon>
+          </v-btn>
+        </v-toolbar>
+        <v-card-text class="pa-3 pa-md-4">
+          <!-- A. VIDEO — host-side capture/encode; applies on next Connect -->
+          <div class="d-flex align-center ga-2 mb-3">
+            <v-icon size="small" color="primary">mdi-video-outline</v-icon>
+            <span class="text-subtitle-2 font-weight-medium">Video</span>
+            <v-chip size="x-small" variant="tonal" color="info" label>applies on next Connect</v-chip>
+          </div>
           <v-select
-            v-model="quality"
-            :items="qualityOptions"
-            density="compact"
-            hide-details
+            v-model="codecChoice"
+            :items="codecChoiceOptions"
+            item-title="title"
+            item-value="value"
+            density="comfortable"
             variant="outlined"
-            prepend-inner-icon="mdi-quality-high"
-            label="Quality preference"
+            hide-details="auto"
+            prepend-inner-icon="mdi-video-outline"
+            label="Codec"
+            class="mb-4"
           />
+          <v-select
+            v-model="resolutionPresetValue"
+            :items="resolutionOptions"
+            density="comfortable"
+            variant="outlined"
+            hide-details="auto"
+            prepend-inner-icon="mdi-monitor-screenshot"
+            label="Resolution"
+            :hint="resolutionSettingHint"
+            persistent-hint
+            class="mb-4"
+          />
+          <div class="text-caption text-medium-emphasis mb-1 ml-1">Priority</div>
+          <v-btn-toggle
+            v-model="priority"
+            mandatory
+            divided
+            color="primary"
+            variant="outlined"
+            density="comfortable"
+            class="mb-1 d-flex w-100"
+          >
+            <v-btn value="balanced" size="small" class="flex-grow-1">Balanced</v-btn>
+            <v-btn value="sharper" size="small" class="flex-grow-1">Sharper</v-btn>
+            <v-btn value="smoother" size="small" class="flex-grow-1">Smoother</v-btn>
+          </v-btn-toggle>
+          <div class="text-caption text-medium-emphasis mb-2 ml-1">{{ priorityHint }}</div>
+
+          <v-divider class="my-4" />
+
+          <!-- B. DISPLAY — viewer-side scaling; live -->
+          <div class="d-flex align-center ga-2 mb-3">
+            <v-icon size="small" color="primary">mdi-fit-to-screen-outline</v-icon>
+            <span class="text-subtitle-2 font-weight-medium">Display</span>
+            <v-chip size="x-small" variant="tonal" color="success" label>live</v-chip>
+          </div>
           <v-select
             v-model="scaleMode"
             :items="scaleOptions"
-            density="compact"
-            hide-details
+            density="comfortable"
             variant="outlined"
+            hide-details="auto"
             prepend-inner-icon="mdi-image-size-select-actual"
-            label="View scale"
+            label="Fit in my window"
+            class="mb-4"
           />
           <v-text-field
             v-if="scaleMode === 'custom'"
@@ -940,201 +746,97 @@
             min="5"
             max="1000"
             step="5"
-            density="compact"
-            hide-details
+            density="comfortable"
             variant="outlined"
+            hide-details
             suffix="%"
-            label="Custom scale"
+            label="Custom zoom"
+            class="mb-4"
           />
-          <v-select
-            v-model="resolutionPresetValue"
-            :items="resolutionOptions"
-            density="compact"
-            hide-details
-            variant="outlined"
-            prepend-inner-icon="mdi-monitor-screenshot"
-            label="Remote capture resolution"
-            :hint="nativeSourceLabel
-              ? (customTargetExceedsNative
-                ? `Agent native ${nativeSourceLabel} — custom target exceeds this; capped at native`
-                : `Agent native ${nativeSourceLabel}`)
-              : 'Native dimensions surface after the first decoded frame'"
-            persistent-hint
-          />
-          <v-select
-            v-model="codecOverride"
-            :items="codecOptions"
-            density="compact"
-            hide-details
-            variant="outlined"
-            prepend-inner-icon="mdi-video-outline"
-            label="Codec override"
-            :hint="codecOverride == null
-              ? 'Agent picks the best available codec'
-              : `Forcing ${codecOverride.toUpperCase()} - takes effect on next Connect`"
-            persistent-hint
-          />
-          <v-divider />
-          <!-- Session-config toggles. Side-by-side on phone since
-               they're each one tap and the icons make the meaning
-               obvious; the title on each is the full description. -->
-          <div class="d-flex ga-2 align-center flex-wrap">
-            <v-btn
-              variant="tonal"
-              :color="vp9_444On ? 'primary' : undefined"
-              :disabled="!rc.vp9_444Supported.value"
-              prepend-icon="mdi-format-color-fill"
-              :title="vp9_444Tooltip"
-              class="flex-grow-1"
-              @click="toggleVp9_444"
-            >
-              Crystal-Clear {{ vp9_444On ? 'ON' : 'OFF' }}
-            </v-btn>
-            <!-- rc.81 — HEVC over DataChannel toggle (mobile). Mutually
-                 exclusive with Crystal-Clear since both write
-                 `videoTransport`. -->
-            <v-btn
-              variant="tonal"
-              :color="hevcOn ? 'primary' : undefined"
-              :disabled="!rc.hevcSupported.value"
-              prepend-icon="mdi-video"
-              :title="hevcTooltip"
-              class="flex-grow-1"
-              @click="toggleHevc"
-            >
-              HEVC {{ hevcOn ? 'ON' : 'OFF' }}
-            </v-btn>
-            <!-- rc.190 — AV1 over DataChannel toggle (drawer). -->
-            <v-btn
-              variant="tonal"
-              :color="av1On ? 'primary' : undefined"
-              :disabled="!rc.av1Supported.value || !agentHasAv1"
-              prepend-icon="mdi-alpha-a-box"
-              :title="av1Tooltip"
-              class="flex-grow-1"
-              @click="toggleAv1"
-            >
-              AV1 {{ av1On ? 'ON' : 'OFF' }}
-            </v-btn>
-            <!-- rc.190 — return to Auto transport (the default): pick the
-                 best HW×HW codec for this agent+viewer pair at Connect. -->
-            <v-btn
-              variant="tonal"
-              :color="transportAutoOn ? 'primary' : undefined"
-              prepend-icon="mdi-auto-fix"
-              :title="transportAutoTooltip"
-              class="flex-grow-1"
-              @click="setTransportAuto"
-            >
-              Auto {{ transportAutoOn ? 'ON' : 'OFF' }}
-            </v-btn>
-            <!-- rc.191 — Match remote display: the HOST switches its display
-                 mode to fit this window (1:1 pixels = sharpest text),
-                 restored on disconnect. Windows hosts only. -->
-            <v-btn
-              variant="tonal"
-              :color="displayMatchOn ? 'primary' : undefined"
-              :disabled="!agentSupportsDisplayMatch"
-              prepend-icon="mdi-monitor-screenshot"
-              :title="displayMatchTooltip"
-              class="flex-grow-1"
-              @click="toggleDisplayMatch"
-            >
-              1:1 Match {{ displayMatchOn ? 'ON' : 'OFF' }}
-            </v-btn>
-            <v-btn
-              variant="tonal"
-              :color="webcodecsOn ? 'primary' : undefined"
-              :disabled="!rc.webcodecsSupported.value"
-              prepend-icon="mdi-flash"
-              :title="webcodecsTooltip"
-              class="flex-grow-1"
-              @click="toggleWebCodecs"
-            >
-              Low-Latency {{ webcodecsOn ? 'ON' : 'OFF' }}
-            </v-btn>
-            <!-- Opt-in "receive host audio" toggle (mobile). Disabled
-                 while a session is live + when the agent lacks 'opus'
-                 audio caps. Takes effect on next Connect. -->
-            <v-btn
-              variant="tonal"
-              :color="audioOn ? 'primary' : undefined"
-              :disabled="sessionLive || !agentSupportsAudio"
-              :prepend-icon="audioOn ? 'mdi-volume-high' : 'mdi-volume-off'"
-              :title="audioTooltip"
-              class="flex-grow-1"
-              @click="toggleAudio"
-            >
-              Audio {{ audioOn ? 'ON' : 'OFF' }}
-            </v-btn>
+          <v-btn
+            block
+            variant="tonal"
+            :color="displayMatchOn ? 'primary' : undefined"
+            :disabled="!agentSupportsDisplayMatch"
+            prepend-icon="mdi-monitor-screenshot"
+            :title="displayMatchTooltip"
+            @click="toggleDisplayMatch"
+          >
+            1:1 Match host display — {{ displayMatchOn ? 'ON' : 'OFF' }}
+          </v-btn>
+
+          <v-divider class="my-4" />
+
+          <!-- C. SESSION — host audio + connected-only tools -->
+          <div class="d-flex align-center ga-2 mb-3">
+            <v-icon size="small" color="primary">mdi-cog-outline</v-icon>
+            <span class="text-subtitle-2 font-weight-medium">Session</span>
           </div>
-          <!-- rc.62 — VP9 chroma format dropdown. Only meaningful when
-               Crystal-Clear is ON (data-channel-vp9-444). 'Auto' lets
-               the agent decide via its `ROOMLER_AGENT_VP9_CHROMA` env
-               var; 'High quality' forces 4:4:4 (sharpest text on small
-               ClearType, ~1.5× bandwidth); 'Standard' forces 4:2:0
-               (~30% lower bandwidth, slight ClearType softening).
-               Takes effect on next Connect. -->
-          <v-select
-            v-model="vp9Chroma"
-            :items="vp9ChromaOptions"
-            :disabled="!vp9_444On"
-            density="compact"
-            hide-details
-            variant="outlined"
-            prepend-inner-icon="mdi-format-color-fill"
-            label="VP9 chroma (Crystal-Clear)"
-            :hint="vp9ChromaHint"
-            persistent-hint
-          />
-          <!-- Connected-only tools. Hidden when no session is live —
-               the underlying DCs are closed so the actions would
-               silently fail. Each is a full-width button so it's
-               easy to tap on a phone. -->
+          <v-btn
+            block
+            variant="tonal"
+            :color="audioOn ? 'primary' : undefined"
+            :disabled="sessionLive || !agentSupportsAudio"
+            :prepend-icon="audioOn ? 'mdi-volume-high' : 'mdi-volume-off'"
+            :title="audioTooltip"
+            class="mb-2"
+            @click="toggleAudio"
+          >
+            Receive host audio — {{ audioOn ? 'ON' : 'OFF' }}
+          </v-btn>
           <template v-if="rc.phase.value === 'connected'">
-            <v-divider />
             <v-btn
-              variant="tonal"
-              prepend-icon="mdi-content-paste"
-              :loading="clipboardBusy"
-              @click="onSendClipboard"
-            >
-              Send my clipboard → remote
-            </v-btn>
-            <v-btn
-              variant="tonal"
-              prepend-icon="mdi-content-copy"
-              :loading="clipboardBusy"
-              @click="onGetClipboard"
-            >
-              Get remote clipboard → me
-            </v-btn>
-            <v-btn
+              block
               variant="tonal"
               prepend-icon="mdi-upload"
               :loading="uploadBusy"
+              class="mb-2"
               @click="fileInput?.click()"
             >
               Upload file → remote
             </v-btn>
-            <!-- Apps (mobile) — same shared dialog as the desktop toolbar. -->
+            <v-btn
+              block
+              variant="tonal"
+              prepend-icon="mdi-folder-open"
+              :disabled="!agentSupportsBrowse"
+              :title="
+                agentSupportsBrowse
+                  ? 'Browse remote files (download)'
+                  : isLegacyFileDc
+                    ? 'Browse needs agent 0.3.0+ — upgrade host agent'
+                    : 'Browse disabled by host config'
+              "
+              class="mb-2"
+              @click="filesDrawer = true; settingsOpen = false"
+            >
+              Browse remote files
+            </v-btn>
             <v-btn
               v-if="agentSupportsApps"
+              block
               variant="tonal"
               prepend-icon="mdi-apps"
               :disabled="rc.appsSupported.value === false"
-              @click="openAppsDialog"
+              class="mb-2"
+              @click="openAppsDialog(); settingsOpen = false"
             >
-              Apps
+              Remote apps
+            </v-btn>
+            <v-btn
+              block
+              variant="tonal"
+              prepend-icon="mdi-file-document-outline"
+              class="mb-2"
+              @click="openAgentLogDialog(); settingsOpen = false"
+            >
+              Agent logs
             </v-btn>
           </template>
         </v-card-text>
-        <v-card-actions>
-          <v-spacer />
-          <v-btn variant="text" @click="mobileSettingsOpen = false">Close</v-btn>
-        </v-card-actions>
       </v-card>
-    </v-bottom-sheet>
+    </v-dialog>
+
 
     <!-- rc.23 — agent log viewer. Opens via the mdi-file-document-outline
          toolbar button; shows the tail of the agent's rolling log file
@@ -1442,14 +1144,13 @@ import { useAuthStore } from '@/stores/auth'
 import {
   useRemoteControl,
   nextDirPath,
-  type RcQuality,
-  type RcPreferredCodec,
   type RcScaleMode,
   type RcResolutionSetting,
-  type RcRenderPath,
-  type RcVideoTransport,
+  type RcPriority,
+  type RcCodecChoice,
 } from '@/composables/useRemoteControl'
 import { useSnackbar } from '@/composables/useSnackbar'
+import { useDisplay } from 'vuetify'
 import MobileKeyboard from '@/components/remote/MobileKeyboard.vue'
 
 const route = useRoute()
@@ -1466,6 +1167,12 @@ const agent = ref<Agent | null>(null)
 // flips when the load lands.
 const rc = useRemoteControl(agent)
 const { showSuccess, showError } = useSnackbar()
+// rc.199 — Vuetify viewport helper; drives the Settings dialog's
+// fullscreen-on-phone behaviour so one panel serves every viewport.
+const { mobile } = useDisplay()
+// rc.199 — the single grouped Settings panel (gear button opens it at every
+// viewport, replacing the desktop inline Row 2 + the mobile bottom-sheet).
+const settingsOpen = ref(false)
 const clipboardBusy = ref(false)
 
 // Push the controller's local clipboard to the agent's OS clipboard.
@@ -1528,11 +1235,6 @@ const audioEl = ref<HTMLAudioElement | null>(null)
 const stageEl = ref<HTMLElement | null>(null)
 const cursorCanvas = ref<HTMLCanvasElement | null>(null)
 const fileInput = ref<HTMLInputElement | null>(null)
-// Mobile-only viewer settings bottom-sheet visibility. Wraps the
-// same Quality / Scale / Resolution / Codec selects shown inline on
-// `md and up` so phone operators retain access without losing the
-// rest of the toolbar to a 4-select overflow.
-const mobileSettingsOpen = ref(false)
 // Whether the on-screen soft keyboard is currently surfaced (Plan 4
 // phase 1). Toggled from the toolbar button; the MobileKeyboard
 // component focuses its hidden textarea on open, which causes iOS /
@@ -2072,32 +1774,6 @@ async function uploadMany(
 // (persists + pushes to agent). The v-select's inner value is
 // whatever the composable already holds, so reloads show the
 // restored preference without an extra effect.
-const qualityOptions = [
-  { title: 'Auto', value: 'auto' },
-  { title: 'Low', value: 'low' },
-  { title: 'High', value: 'high' },
-] as const
-const quality = computed<RcQuality>({
-  get: () => rc.quality.value,
-  set: (v: RcQuality) => rc.setQuality(v),
-})
-
-// Codec override: null = let the agent pick the best available. The
-// value is persisted via the composable (localStorage) so it survives
-// a page reload; it only takes effect on the next connect — live
-// sessions keep whatever SDP they negotiated at start.
-const codecOptions = [
-  { title: 'Codec: Auto', value: null },
-  { title: 'H.264', value: 'h264' },
-  { title: 'H.265 / HEVC', value: 'h265' },
-  { title: 'AV1', value: 'av1' },
-  { title: 'VP9', value: 'vp9' },
-] as const
-const codecOverride = computed<RcPreferredCodec | null>({
-  get: () => rc.preferredCodec.value,
-  set: (v: RcPreferredCodec | null) => rc.setPreferredCodec(v),
-})
-
 // Scale mode + custom percent. Proxy through a computed so the
 // composable stays the source of truth (persists across reloads).
 const scaleOptions = [
@@ -2129,7 +1805,6 @@ const videoIntrinsicH = rc.mediaIntrinsicH
 // true when the session is actively using the WebCodecs path (the
 // user opted in AND the browser supports it). We read `rc.renderPath`
 // directly so the UI state matches what the next Connect would do.
-const webcodecsOn = computed<boolean>(() => rc.renderPath.value === 'webcodecs')
 // Which element the viewer actually mounts — driven by the runtime
 // `webcodecsActive` flag that the composable flips to true ONLY when
 // the RTCRtpScriptTransform is successfully installed for this
@@ -2138,73 +1813,9 @@ const webcodecsOn = computed<boolean>(() => rc.renderPath.value === 'webcodecs')
 // transferControlToOffscreen throwing) flips to `<video>` transparently
 // instead of mounting an empty canvas.
 const isWebCodecsRender = computed<boolean>(() => rc.webcodecsActive.value)
-const webcodecsTooltip = computed<string>(() => {
-  if (!rc.webcodecsSupported.value) {
-    return 'Low-latency (WebCodecs) path requires Chrome 94+ — not supported in this browser'
-  }
-  return webcodecsOn.value
-    ? 'Low-latency (WebCodecs) ON — bypasses <video> jitter buffer. Takes effect on next Connect.'
-    : 'Low-latency (WebCodecs) OFF — using <video> render path'
-})
-function toggleWebCodecs() {
-  const next: RcRenderPath = webcodecsOn.value ? 'video' : 'webcodecs'
-  rc.setRenderPath(next)
-}
 
-// Phase Y.4: VP9 4:4:4 over DataChannel toggle. The composable's
-// `videoTransport` ref persists the choice across reloads;
-// `vp9_444Supported` is true only when the browser exposes
-// `VideoDecoder.isConfigSupported({codec:'vp09.01.10.08'})`. The
-// agent honours the preference only when its caps probe passed
-// (libvpx Vp9Encoder activated successfully at startup); otherwise
-// the session silently falls back to the legacy WebRTC video
-// transport. Takes effect on the next Connect — switching mid-
-// session would require tearing down + rebuilding the entire
-// PC, which is more disruptive than "reconnect to apply".
-const vp9_444On = computed<boolean>(
-  () => rc.videoTransport.value === 'data-channel-vp9-444',
-)
-const vp9_444Tooltip = computed<string>(() => {
-  if (!rc.vp9_444Supported.value) {
-    return 'Crystal-clear (VP9 4:4:4) requires WebCodecs VideoDecoder vp09.01.10.08 — not supported in this browser'
-  }
-  return vp9_444On.value
-    ? 'Crystal-clear (VP9 4:4:4) ON — bypasses Chrome\'s 4:2:0 video pipeline. Takes effect on next Connect.'
-    : 'Crystal-clear (VP9 4:4:4) OFF — using standard WebRTC video transport'
-})
-function toggleVp9_444() {
-  const next: RcVideoTransport = vp9_444On.value ? 'webrtc' : 'data-channel-vp9-444'
-  rc.setVideoTransport(next)
-}
-
-// rc.81 — HEVC over DataChannel toggle. Same shape as
-// `toggleVp9_444`; cycles `data-channel-hevc` ↔ `webrtc` on the
-// composable's `videoTransport`. Mutually exclusive with the
-// Crystal-Clear (VP9-444) toggle since both write the same ref —
-// flipping HEVC on overrides VP9-444 and vice-versa. The composable
-// auto-falls back to VP9-444 then webrtc if HEVC decode is
-// unsupported at session-establish time.
-const hevcOn = computed<boolean>(
-  () => rc.videoTransport.value === 'data-channel-hevc',
-)
-const hevcTooltip = computed<string>(() => {
-  if (!rc.hevcSupported.value) {
-    return 'HEVC over DataChannel requires WebCodecs VideoDecoder hev1.1.6.L153.B0 with a HW HEVC decoder — not supported in this browser'
-  }
-  return hevcOn.value
-    ? 'HEVC over DataChannel ON — agent encodes via NVENC/QSV/AMF (Option B). Takes effect on next Connect.'
-    : 'HEVC over DataChannel OFF — using current transport. Click to switch to HEVC on next Connect.'
-})
-function toggleHevc() {
-  const next: RcVideoTransport = hevcOn.value ? 'webrtc' : 'data-channel-hevc'
-  rc.setVideoTransport(next)
-}
-
-// rc.190 — AV1 over DataChannel toggle. Same shape as toggleHevc. Gated
-// on the agent advertising AV1 encode silicon (only NVIDIA Ada+/RTX 40xx+,
-// Intel Arc, AMD RDNA3+ have it) AND WebCodecs AV1 decode here (dav1d SW
-// ships in Chromium, so the browser side is ~always true on Chrome).
-const av1On = computed<boolean>(() => rc.videoTransport.value === 'data-channel-av1')
+// rc.190 — whether the AGENT has AV1 encode silicon (NVIDIA RTX 40xx+,
+// Intel Arc, AMD RDNA3+). Gates the AV1 option in the rc.199 Codec picker.
 const agentHasAv1 = computed<boolean>(() => {
   const caps = agent.value?.capabilities
   // Caps not loaded yet → optimistic; the agent falls back to the WebRTC
@@ -2215,37 +1826,6 @@ const agentHasAv1 = computed<boolean>(() => {
     || (caps.hw_encoders ?? []).some((e) => e.startsWith('ffmpeg-av1_'))
   )
 })
-const av1Tooltip = computed<string>(() => {
-  if (!rc.av1Supported.value) {
-    return 'AV1 over DataChannel requires WebCodecs AV1 decode — not supported in this browser'
-  }
-  if (!agentHasAv1.value) {
-    return 'This agent has no AV1 hardware encoder (needs NVIDIA RTX 40xx+, Intel Arc, or AMD RDNA3+) — AV1 unavailable'
-  }
-  return av1On.value
-    ? 'AV1 over DataChannel ON — best quality per bit at low bitrates (agent encodes via av1_nvenc/qsv/amf). Takes effect on next Connect.'
-    : 'AV1 over DataChannel OFF — click to switch to AV1 on next Connect.'
-})
-function toggleAv1() {
-  const next: RcVideoTransport = av1On.value ? 'webrtc' : 'data-channel-av1'
-  rc.setVideoTransport(next)
-}
-
-// rc.190 — Auto transport (the new default): at Connect the composable
-// ranks codecs by what's HARDWARE on BOTH ends (agent hw_encoders ×
-// this browser's MediaCapabilities) — AV1 > HEVC > VP9-HW > VP9-SW >
-// webrtc. Any explicit toggle above overrides; this button returns to
-// Auto.
-const transportAutoOn = computed<boolean>(() => rc.videoTransport.value === 'auto')
-const transportAutoTooltip = computed<string>(() =>
-  transportAutoOn.value
-    ? 'Transport AUTO — the best hardware-accelerated codec for this agent+viewer pair is picked at Connect'
-    : 'Click to let the viewer auto-pick the best hardware codec for this agent+viewer pair on next Connect',
-)
-function setTransportAuto() {
-  rc.setVideoTransport('auto')
-}
-
 // Opt-in "receive host audio" toggle. Same "takes effect on next
 // Connect" shape as the transport toggles above (the recvonly audio
 // transceiver + `audio_enabled` request flag are fixed at offer time),
@@ -2293,43 +1873,102 @@ function toggleAudio() {
   rc.setAudioEnabled(!audioOn.value)
 }
 
-// rc.62: VP9 chroma format dropdown. Selecting 'yuv420' or 'yuv444'
-// sends `chroma_pref` in the next `rc:session.request`; the agent's
-// VP9-444 encoder uses that instead of its env-var default. 'auto'
-// (the default) omits the field so the agent picks its own default.
-// Takes effect on Connect — mid-session encoder profile changes are
-// disruptive (full encoder rebuild + browser VideoDecoder.configure()
-// re-call) and deferred to a future rc.
-const vp9ChromaOptions = [
-  { title: 'Auto (agent default)', value: 'auto' },
-  { title: '4:4:4 — High quality (sharp text, ~1.5× bandwidth)', value: 'yuv444' },
-  { title: '4:2:0 — Standard (lower bandwidth, slight text softening)', value: 'yuv420' },
-] as const
-
-// rc.63 — short labels for the desktop inline toolbar where the
-// 190-px-wide v-select can't fit the descriptive option titles.
-const vp9ChromaOptionsCompact = [
-  { title: 'Auto', value: 'auto' },
-  { title: '4:4:4 (sharp)', value: 'yuv444' },
-  { title: '4:2:0 (low BW)', value: 'yuv420' },
-] as const
-
-const vp9Chroma = computed<'auto' | 'yuv420' | 'yuv444'>({
-  get: () => rc.vp9Chroma.value,
-  set: (v) => rc.setVp9Chroma(v),
+// ── rc.199 — unified Codec picker + Priority dial (Settings panel) ──
+// The Codec picker folds the four transport toggles + the codec-override +
+// VP9-chroma dropdowns into ONE choice. `rc.codecChoice` is a writable
+// computed in the composable (derives the value from transport+chroma; the
+// setter applies the full tuple through the existing setters), so this is a
+// thin binding.
+const codecChoice = rc.codecChoice
+// Per-choice availability + one-line "why". Reuses the same support flags the
+// old toggles gated on (`av1Supported`+`agentHasAv1`, `hevcSupported`,
+// `vp9_444Supported`); an unsupported choice is disabled with the reason as a
+// subtitle. `props` is spread onto the v-list-item Vuetify renders.
+const codecChoiceOptions = computed(() => {
+  const av1Ok = rc.av1Supported.value && agentHasAv1.value
+  const av1Reason = !rc.av1Supported.value
+    ? 'This browser can’t decode AV1'
+    : !agentHasAv1.value
+      ? 'This agent has no AV1 hardware encoder'
+      : 'Best quality per bit — needs HW on both ends'
+  const hevcReason = rc.hevcSupported.value
+    ? 'HW H.265 encode on the agent (NVENC/QSV/AMF)'
+    : 'This browser lacks a HW HEVC decoder'
+  const vp9Reason = rc.vp9_444Supported.value
+    ? 'Software VP9 — universally decodable'
+    : 'This browser can’t decode VP9 profile 1'
+  return [
+    {
+      title: 'Auto (recommended)',
+      value: 'auto',
+      props: { subtitle: 'Best hardware codec for this agent + browser, picked at Connect' },
+    },
+    {
+      title: 'AV1',
+      value: 'av1',
+      props: { disabled: !av1Ok, subtitle: av1Reason },
+    },
+    {
+      title: 'HEVC (H.265)',
+      value: 'hevc',
+      props: { disabled: !rc.hevcSupported.value, subtitle: hevcReason },
+    },
+    {
+      title: 'VP9 · crisp text (4:4:4)',
+      value: 'vp9-444',
+      props: { disabled: !rc.vp9_444Supported.value, subtitle: `Sharpest text, ~1.5× bitrate — ${vp9Reason}` },
+    },
+    {
+      title: 'VP9 · efficient (4:2:0)',
+      value: 'vp9-420',
+      props: { disabled: !rc.vp9_444Supported.value, subtitle: `Lower bitrate — ${vp9Reason}` },
+    },
+    {
+      title: 'H.264 · max compatibility',
+      value: 'h264',
+      props: { subtitle: 'Legacy WebRTC path — works everywhere, softer text' },
+    },
+  ] as { title: string; value: RcCodecChoice; props: { disabled?: boolean; subtitle: string } }[]
 })
 
-const vp9ChromaHint = computed<string>(() => {
-  if (!vp9_444On.value) return 'Enable Crystal-Clear first'
-  switch (vp9Chroma.value) {
-    case 'yuv420':
-      return 'VP9 profile 0 — ~30% lower bandwidth than 4:4:4. Takes effect on next Connect.'
-    case 'yuv444':
-      return 'VP9 profile 1 — sharpest text. Takes effect on next Connect.'
-    default:
-      return 'Agent picks (env var ROOMLER_AGENT_VP9_CHROMA — defaults to 4:4:4)'
-  }
+// Priority dial — the visible lever over the per-session relay resolution cap
+// (sent LIVE via rc:priority). Replaces the old Quality dropdown, which only
+// shadowed the agent's AIMD/REMB controller.
+const priority = computed<RcPriority>({
+  get: () => rc.priority.value,
+  set: (v: RcPriority) => rc.setPriority(v),
 })
+const priorityOptions = [
+  {
+    title: 'Balanced',
+    value: 'balanced',
+    props: { subtitle: 'Default — caps resolution on slow / relay links to stay smooth' },
+  },
+  {
+    title: 'Sharper',
+    value: 'sharper',
+    props: { subtitle: 'Full resolution even on a relay (crisp text; may stutter on a weak link)' },
+  },
+  {
+    title: 'Smoother',
+    value: 'smoother',
+    props: { subtitle: 'Fewer pixels for higher frame-rate + lower latency' },
+  },
+] as const
+const priorityHint = computed<string>(
+  () => priorityOptions.find((o) => o.value === priority.value)?.props.subtitle ?? '',
+)
+// Native-source hint for the Resolution select (reused from the retired
+// mobile sheet). Explains why a big custom target on a small-panel host
+// doesn't change anything, and surfaces the agent's native dims.
+const resolutionSettingHint = computed<string>(() => {
+  const native = nativeSourceLabel.value
+  if (!native) return 'Native dimensions surface after the first decoded frame'
+  return customTargetExceedsNative.value
+    ? `Agent native ${native} — custom target exceeds this; capped at native`
+    : `Agent native ${native}`
+})
+
 /** Bind callback for the webcodecs canvas ref. Vue calls this with
  *  the element (or null on unmount) — we forward to the composable's
  *  writable canvas ref so `pc.ontrack` can see it. */
@@ -2782,7 +2421,21 @@ const statsResolutionLabel = computed(() => {
       ? rc.vp9_444Stats.value.height
       : rc.mediaIntrinsicH.value
   if (!w || !h) return ''
-  return `${w}×${h}`
+  const base = `${w}×${h}`
+  // rc.199 — the "why is Original blurry?" answer. The agent reports its
+  // native panel dims in rc:video-info; when a RELAY session encodes below
+  // native it's the link-physics hard cap clamping even an explicit
+  // Original/Native pick. Surface it so the operator knows to switch
+  // Priority → Sharper (which lifts the cap; the suffix then disappears).
+  // Only shown for the relay-capped case — user-chosen fit/custom downscales
+  // aren't flagged (the Native chip already shows the source dims).
+  const vi = rc.videoInfo.value
+  const nw = vi?.native_w ?? 0
+  const nh = vi?.native_h ?? 0
+  if (nw > 0 && nh > 0 && vi?.transport === 'relay' && (w < nw || h < nh)) {
+    return `${base} · relay-limited (native ${nw}×${nh})`
+  }
+  return base
 })
 
 // Remote cursor overlay (1E.3). Requires both a position and a
@@ -3291,21 +2944,6 @@ onBeforeUnmount(() => {
 .remote-control-wrapper :deep(.rc-toolbar-primary .v-toolbar-title) {
   flex-shrink: 1;
   min-width: 0;
-}
-/* Row 2 (session controls): visible on `md+`, hidden on `<md`.
-   `flex-wrap: wrap` lets controls spill to a second visual line on
-   borderline desktops (~960-1100px) instead of overflowing the
-   toolbar. `border-bottom` separates it from the video stage. */
-.remote-control-wrapper .rc-tools-row {
-  background: rgb(var(--v-theme-surface));
-  border-bottom: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
-  min-height: 44px;
-}
-/* The v-select density="compact" inside the wrap row otherwise
-   forces a 56px tall input on touch devices, which makes the row
-   feel chunky. Trim to match the toolbar density. */
-.remote-control-wrapper .rc-tools-row :deep(.v-field) {
-  --v-field-padding-top: 4px;
 }
 /* The card wrapping `.remote-stage` provides Material elevation +
    rounded corners + theme-aware border. `overflow: hidden` clips
