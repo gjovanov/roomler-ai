@@ -444,6 +444,15 @@ impl AgentPeer {
         // viewer can actually sustain. Packing: `(fps & 0xFFFF) | (struggling <<
         // VIEWER_STRUGGLE_BIT)`; 0 = no signal this window (treated as clean).
         let viewer_report = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        // rc.199 — viewer "Priority" dial (`rc:priority`). The control handler
+        // decodes the wire mode into this per-session atomic; both DC video
+        // pumps read it to resolve the relay resolution cap they feed
+        // `effective_target_resolution` (balanced=link-physics cap on relay,
+        // sharper=native override, smoother=fewer pixels everywhere). Mirrors
+        // the `viewer_report` shared-atomic plumbing. 0 = balanced (default).
+        let priority = Arc::new(std::sync::atomic::AtomicU8::new(
+            crate::encode::priority::BALANCED,
+        ));
         // Phase Y.3 (docs/vp9-444-plan.md). When the browser opens a
         // `video-bytes` data channel — only happens when both sides
         // negotiated `data-channel-vp9-444` transport in caps — we
@@ -813,6 +822,7 @@ impl AgentPeer {
         // drops deltas to resync). Same atomic the media pumps already poll.
         let keyframe_for_dc = keyframe_requested.clone();
         let viewer_report_for_dc = viewer_report.clone();
+        let priority_for_dc = priority.clone();
         let video_bytes_dc_for_callback = video_bytes_dc.clone();
         let control_dc_for_callback = control_dc.clone();
         let lock_state_rx_for_dc = lock_state_rx.clone();
@@ -825,6 +835,7 @@ impl AgentPeer {
             let encoded_dims_for_dc = encoded_dims_for_dc.clone();
             let keyframe_for_dc = keyframe_for_dc.clone();
             let viewer_report_for_dc = viewer_report_for_dc.clone();
+            let priority_for_dc = priority_for_dc.clone();
             let video_bytes_stash = video_bytes_dc_for_callback.clone();
             let control_stash = control_dc_for_callback.clone();
             let lock_state_rx_for_input = lock_state_rx_for_dc.clone();
@@ -846,6 +857,7 @@ impl AgentPeer {
                             target_res_for_dc,
                             keyframe_for_dc,
                             viewer_report_for_dc,
+                            priority_for_dc,
                         )
                     }
                     "cursor" => attach_cursor_handler(
@@ -934,6 +946,7 @@ impl AgentPeer {
             capture_native_dims,
             encoded_dims,
             viewer_report,
+            priority,
         ));
 
         Ok(Self {
@@ -1188,6 +1201,10 @@ async fn media_pump(
     // rc.188 — packed viewer decode report (`rc:decodestat`); the DC pumps
     // fold it into the viewer-rate fps cap. Only the DC pumps consume it.
     viewer_report: Arc<std::sync::atomic::AtomicU32>,
+    // rc.199 — per-session Priority dial (`rc:priority`); forwarded to whichever
+    // DC pump this session routes to. Like `viewer_report`, only the DC pumps
+    // consume it (relay resolution cap), so the signalling-only build parks it.
+    priority: Arc<std::sync::atomic::AtomicU8>,
 ) {
     // `pc` is consumed only by the VP9-444 DC pump's per-session transport
     // detection (feature-gated); keep the signalling-only / non-vp9 build
@@ -1198,6 +1215,9 @@ async fn media_pump(
     // ffmpeg-encoder); keep the signalling-only build warning-clean.
     #[cfg(not(any(feature = "vp9-444", feature = "ffmpeg-encoder")))]
     let _ = &viewer_report;
+    // Same story for the Priority dial — DC-pump-only.
+    #[cfg(not(any(feature = "vp9-444", feature = "ffmpeg-encoder")))]
+    let _ = &priority;
     // Tracks the lock-state value seen on the previous loop iteration
     // so we can request an encoder keyframe on each transition. The
     // browser decoder otherwise has to wait for the next periodic
@@ -1251,6 +1271,7 @@ async fn media_pump(
                     capture_native_dims,
                     encoded_dims,
                     viewer_report,
+                    priority,
                 )
                 .await;
             }
@@ -1288,6 +1309,7 @@ async fn media_pump(
                     capture_native_dims,
                     encoded_dims,
                     viewer_report,
+                    priority,
                 )
                 .await;
             }
@@ -1371,6 +1393,7 @@ async fn media_pump(
                 capture_native_dims,
                 encoded_dims,
                 viewer_report,
+                priority,
             )
             .await;
         }
@@ -2045,6 +2068,9 @@ async fn media_pump_vp9_444_dc(
     encoded_dims: Arc<std::sync::atomic::AtomicU64>,
     // rc.188 — packed viewer decode report for the viewer-rate fps cap.
     viewer_report: Arc<std::sync::atomic::AtomicU32>,
+    // rc.199 — per-session Priority dial (`rc:priority`); resolves the relay
+    // resolution cap this pump feeds `effective_target_resolution`.
+    priority: Arc<std::sync::atomic::AtomicU8>,
 ) {
     // See `media_pump`: tracks lock-state transitions so we can
     // request a keyframe on the lock/unlock boundary.
@@ -2352,12 +2378,28 @@ async fn media_pump_vp9_444_dc(
             && encoder.is_some()
         {
             last_video_info_attempt = Some(std::time::Instant::now());
-            let payload =
-                video_info_payload("vp9", "libvpx", false, chroma_wire, constrained_transport);
-            let cdc = control_dc.lock().await.clone();
-            if let Some(cdc) = cdc {
-                if cdc.send_text(payload).await.is_ok() {
-                    video_info_sent = true;
+            // rc.199 — stamp the native capture dims so the browser can label
+            // a capped stream. The store lands LATER in this loop body than
+            // this block, so the first pass may still read 0; hold the badge
+            // (don't set `video_info_sent`) until they're known — one 500 ms
+            // retry closes the gap and the first delivered info carries dims.
+            let (native_w, native_h) =
+                unpack_dims(capture_native_dims.load(std::sync::atomic::Ordering::Relaxed));
+            if native_w > 0 {
+                let payload = video_info_payload(
+                    "vp9",
+                    "libvpx",
+                    false,
+                    chroma_wire,
+                    constrained_transport,
+                    native_w,
+                    native_h,
+                );
+                let cdc = control_dc.lock().await.clone();
+                if let Some(cdc) = cdc {
+                    if cdc.send_text(payload).await.is_ok() {
+                        video_info_sent = true;
+                    }
                 }
             }
         }
@@ -2463,11 +2505,14 @@ async fn media_pump_vp9_444_dc(
             user_target,
             frame.width,
             frame.height,
-            if constrained_transport {
-                crate::encode::relay_res_cap_long_edge()
-            } else {
-                None
-            },
+            // rc.199 — the relay cap is now Priority-resolved: Balanced keeps
+            // the link-physics hard cap on a relay, Sharper lifts it (native
+            // override), Smoother caps harder on every path. The SW soft cap
+            // below is independent (host-CPU protection, always applied).
+            crate::encode::priority_relay_cap(
+                priority.load(std::sync::atomic::Ordering::Relaxed),
+                constrained_transport,
+            ),
             crate::encode::sw_res_cap_long_edge(),
         );
         if effective_target != user_target && res_cap_logged != Some(effective_target) {
@@ -2979,9 +3024,15 @@ fn video_info_payload(
     hardware: bool,
     chroma: &str,
     constrained: bool,
+    // rc.199 — the native (pre-downscale) capture dims. The browser compares
+    // them against the ACTUAL decoded frame size to decide whether the stream
+    // is capped, and by transport ("relay") labels WHY. `0` (no frame yet) →
+    // the browser omits the annotation, so the field is backward-compatible.
+    native_w: u32,
+    native_h: u32,
 ) -> String {
     format!(
-        r#"{{"t":"rc:video-info","codec":"{codec}","encoder":"{encoder}","hardware":{hardware},"chroma":"{chroma}","transport":"{}"}}"#,
+        r#"{{"t":"rc:video-info","codec":"{codec}","encoder":"{encoder}","hardware":{hardware},"chroma":"{chroma}","transport":"{}","native_w":{native_w},"native_h":{native_h}}}"#,
         if constrained { "relay" } else { "direct" },
     )
 }
@@ -3035,6 +3086,9 @@ async fn media_pump_ffmpeg_dc(
     encoded_dims: Arc<std::sync::atomic::AtomicU64>,
     // rc.188 — packed viewer decode report for the viewer-rate fps cap.
     viewer_report: Arc<std::sync::atomic::AtomicU32>,
+    // rc.199 — per-session Priority dial (`rc:priority`); resolves the relay
+    // resolution cap this pump feeds `effective_target_resolution`.
+    priority: Arc<std::sync::atomic::AtomicU8>,
 ) {
     use crate::encode::VideoEncoder;
     use crate::encode::ffmpeg::FfmpegEncoder;
@@ -3295,17 +3349,26 @@ async fn media_pump_ffmpeg_dc(
             && let Some(enc_name) = encoder.as_ref().map(|e| e.name())
         {
             last_video_info_attempt = Some(std::time::Instant::now());
-            let payload = video_info_payload(
-                codec.wire_codec(),
-                enc_name,
-                true,
-                codec.wire_chroma(),
-                constrained,
-            );
-            let cdc = control_dc.lock().await.clone();
-            if let Some(cdc) = cdc {
-                if cdc.send_text(payload).await.is_ok() {
-                    video_info_sent = true;
+            // rc.199 — native dims for the browser's cap annotation; see the
+            // twin block in the VP9-444 pump. Hold the badge until they're
+            // known so the first delivered `rc:video-info` is never dimless.
+            let (native_w, native_h) =
+                unpack_dims(capture_native_dims.load(std::sync::atomic::Ordering::Relaxed));
+            if native_w > 0 {
+                let payload = video_info_payload(
+                    codec.wire_codec(),
+                    enc_name,
+                    true,
+                    codec.wire_chroma(),
+                    constrained,
+                    native_w,
+                    native_h,
+                );
+                let cdc = control_dc.lock().await.clone();
+                if let Some(cdc) = cdc {
+                    if cdc.send_text(payload).await.is_ok() {
+                        video_info_sent = true;
+                    }
                 }
             }
         }
@@ -3469,11 +3532,12 @@ async fn media_pump_ffmpeg_dc(
             user_target,
             frame.width,
             frame.height,
-            if constrained {
-                crate::encode::relay_res_cap_long_edge()
-            } else {
-                None
-            },
+            // rc.199 — Priority-resolved relay cap (see the VP9-444 pump). This
+            // HW-encode pump has no SW soft cap, so Sharper reaches full native.
+            crate::encode::priority_relay_cap(
+                priority.load(std::sync::atomic::Ordering::Relaxed),
+                constrained,
+            ),
             None,
         );
         if effective_target != user_target && res_cap_logged != Some(effective_target) {
@@ -3994,6 +4058,8 @@ fn attach_control_handler(
     // struggling bit via `viewer_rate::pack_report`); the DC video pumps swap+
     // decode it to drive the viewer-rate fps cap.
     viewer_report: Arc<std::sync::atomic::AtomicU32>,
+    // rc.199 — per-session Priority dial; the `rc:priority` match arm writes it.
+    priority: Arc<std::sync::atomic::AtomicU8>,
 ) {
     // Clone the Arc so the on_message closure can send replies
     // (e.g. rc:logs-fetch.reply) back over the same DC. Original
@@ -4022,6 +4088,7 @@ fn attach_control_handler(
         let target_resolution = target_resolution.clone();
         let keyframe_requested = keyframe_requested.clone();
         let viewer_report = viewer_report.clone();
+        let priority = priority.clone();
         let last_kf_request = last_kf_request.clone();
         let dc_for_reply = dc_for_reply.clone();
         Box::pin(async move {
@@ -4064,6 +4131,31 @@ fn attach_control_handler(
                             prev = quality::label(prev),
                             new = quality::label(q_val),
                             "control: rc:quality updated"
+                        );
+                    }
+                }
+                "rc:priority" => {
+                    // rc.199 — the viewer "Priority" dial. Decodes to a
+                    // per-session atomic both DC pumps read for the relay
+                    // resolution cap: balanced = link-physics cap on a relay,
+                    // sharper = native override (the "Sharpness" lever),
+                    // smoother = fewer pixels everywhere. Unknown values are
+                    // ignored so the dial simply stays where it was.
+                    let Some(mode_str) = val.get("mode").and_then(|v| v.as_str()) else {
+                        debug!(%session_id, "control: rc:priority missing mode field");
+                        return;
+                    };
+                    let Some(mode_val) = crate::encode::priority::from_wire(mode_str) else {
+                        debug!(%session_id, mode = mode_str, "control: rc:priority unknown value");
+                        return;
+                    };
+                    let prev = priority.swap(mode_val, std::sync::atomic::Ordering::Relaxed);
+                    if prev != mode_val {
+                        info!(
+                            %session_id,
+                            prev = crate::encode::priority::label(prev),
+                            new = crate::encode::priority::label(mode_val),
+                            "control: rc:priority updated"
                         );
                     }
                 }
@@ -4686,6 +4778,18 @@ fn session_watchdog_verdict(
 /// frame captured yet".
 fn pack_dims(w: u32, h: u32) -> u64 {
     ((w as u64) << 32) | (h as u64)
+}
+
+/// Inverse of `pack_dims`; `(0, 0)` when no frame has been captured yet.
+/// rc.199 — the DC video pumps read the native capture dims out of the
+/// `capture_native_dims` atomic to stamp `rc:video-info` so the browser can
+/// annotate the HUD ("1280×800 · relay-limited (native 2560×1600)").
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+fn unpack_dims(packed: u64) -> (u32, u32) {
+    ((packed >> 32) as u32, (packed & 0xFFFF_FFFF) as u32)
 }
 
 /// Per-axis scale factor the frame downscale applies to a captured frame,
@@ -6091,12 +6195,12 @@ mod tests {
     #[test]
     fn video_info_payload_wire_shape() {
         assert_eq!(
-            super::video_info_payload("h265", "hevc_nvenc", true, "yuv420", false),
-            r#"{"t":"rc:video-info","codec":"h265","encoder":"hevc_nvenc","hardware":true,"chroma":"yuv420","transport":"direct"}"#
+            super::video_info_payload("h265", "hevc_nvenc", true, "yuv420", false, 1920, 1080),
+            r#"{"t":"rc:video-info","codec":"h265","encoder":"hevc_nvenc","hardware":true,"chroma":"yuv420","transport":"direct","native_w":1920,"native_h":1080}"#
         );
         assert_eq!(
-            super::video_info_payload("vp9", "libvpx", false, "yuv444", true),
-            r#"{"t":"rc:video-info","codec":"vp9","encoder":"libvpx","hardware":false,"chroma":"yuv444","transport":"relay"}"#
+            super::video_info_payload("vp9", "libvpx", false, "yuv444", true, 2560, 1600),
+            r#"{"t":"rc:video-info","codec":"vp9","encoder":"libvpx","hardware":false,"chroma":"yuv444","transport":"relay","native_w":2560,"native_h":1600}"#
         );
     }
 

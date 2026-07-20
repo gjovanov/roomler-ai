@@ -96,6 +96,12 @@ export interface RcVideoInfo {
   hardware: boolean
   chroma: string
   transport: string
+  /** rc.199 — native (pre-downscale) capture dims. The viewer compares them
+   *  against the decoded frame size to tell whether the stream is capped and,
+   *  by `transport`, why ("· relay-limited"). `0` when the agent didn't report
+   *  them (older agents) — the badge then omits the annotation. */
+  native_w: number
+  native_h: number
 }
 
 /** rc.NEXT — remote app selection & launch (virtual-desktop hosts). The
@@ -176,6 +182,8 @@ export function parseControlInbound(data: unknown): RcControlInbound {
         hardware: obj.hardware === true,
         chroma: typeof obj.chroma === 'string' ? obj.chroma : '',
         transport: typeof obj.transport === 'string' ? obj.transport : '',
+        native_w: typeof obj.native_w === 'number' ? obj.native_w : 0,
+        native_h: typeof obj.native_h === 'number' ? obj.native_h : 0,
       },
     }
   }
@@ -1083,6 +1091,113 @@ export function pickAutoTransport(inputs: AutoTransportInputs): {
   return { transport: null, chromaOverride: null, reason: 'webrtc H.264 fallback' }
 }
 
+/** rc.199 — the viewer "Priority" dial (`rc:priority` control message). A
+ *  per-session lever that trades resolution sharpness against motion
+ *  smoothness; the agent reads it to resolve the relay resolution cap
+ *  (balanced = link-physics cap on a relay, sharper = native override / the
+ *  "Sharpness" lever, smoother = fewer pixels everywhere). */
+export type RcPriority = 'balanced' | 'sharper' | 'smoother'
+
+const PRIORITY_STORAGE_KEY = 'roomler-rc-priority'
+
+function readStoredPriority(): RcPriority {
+  try {
+    const raw = globalThis.localStorage?.getItem(PRIORITY_STORAGE_KEY)
+    if (raw === 'balanced' || raw === 'sharper' || raw === 'smoother') return raw
+  } catch {
+    /* privacy mode → default */
+  }
+  return 'balanced'
+}
+
+function persistPriority(p: RcPriority) {
+  try {
+    globalThis.localStorage?.setItem(PRIORITY_STORAGE_KEY, p)
+  } catch {
+    /* best-effort — swallow quota / privacy-mode errors */
+  }
+}
+
+/** Pure builder for the `rc:priority` control-DC envelope. Exported so the
+ *  unit tests can lock the wire shape the agent's `priority::from_wire`
+ *  parses. */
+export function priorityWireMessage(mode: RcPriority): { t: 'rc:priority'; mode: RcPriority } {
+  return { t: 'rc:priority', mode }
+}
+
+/** rc.199 — the single "Codec" picker that replaces the four transport
+ *  toggle buttons + the codec-override + VP9-chroma dropdowns. Each choice
+ *  maps to a full (transport, chroma, preferredCodec, renderPath) tuple so the
+ *  picker fully determines the previously-scattered controls. */
+export type RcCodecChoice = 'auto' | 'av1' | 'hevc' | 'vp9-444' | 'vp9-420' | 'h264'
+
+export interface CodecChoiceSettings {
+  videoTransport: RcVideoTransport
+  chroma: Vp9ChromaPref
+  preferredCodec: RcPreferredCodec | null
+  renderPath: RcRenderPath
+}
+
+/** Map a Codec-picker choice to the underlying settings. Pure + exported so
+ *  the tests lock it. `renderPath` is auto-managed here (this is what lets us
+ *  drop the old standalone WebCodecs toggle): everything uses the low-latency
+ *  WebCodecs path EXCEPT the explicit "H.264 · max compatibility" choice,
+ *  which uses the plain `<video>` element for the widest browser support. The
+ *  DC transports decode via the worker→canvas regardless of `renderPath`, so
+ *  setting it for them is harmless and keeps the mapping total. `setRenderPath`
+ *  clamps `webcodecs`→`video` on browsers without WebCodecs. */
+export function codecChoiceToSettings(choice: RcCodecChoice): CodecChoiceSettings {
+  switch (choice) {
+    case 'av1':
+      return { videoTransport: 'data-channel-av1', chroma: 'auto', preferredCodec: null, renderPath: 'webcodecs' }
+    case 'hevc':
+      return { videoTransport: 'data-channel-hevc', chroma: 'auto', preferredCodec: null, renderPath: 'webcodecs' }
+    case 'vp9-444':
+      return {
+        videoTransport: 'data-channel-vp9-444',
+        chroma: 'yuv444',
+        preferredCodec: null,
+        renderPath: 'webcodecs',
+      }
+    case 'vp9-420':
+      return {
+        videoTransport: 'data-channel-vp9-444',
+        chroma: 'yuv420',
+        preferredCodec: null,
+        renderPath: 'webcodecs',
+      }
+    case 'h264':
+      return { videoTransport: 'webrtc', chroma: 'auto', preferredCodec: 'h264', renderPath: 'video' }
+    case 'auto':
+    default:
+      return { videoTransport: 'auto', chroma: 'auto', preferredCodec: null, renderPath: 'webcodecs' }
+  }
+}
+
+/** Reverse of `codecChoiceToSettings` (for the picker's displayed value): map
+ *  the stored transport + chroma back to a choice. A `data-channel-vp9-444`
+ *  transport reads as 4:4:4 only when the chroma is explicitly `yuv444`;
+ *  otherwise (incl. the legacy `auto`) it reads as the 4:2:0 efficient choice.
+ *  Pure + exported for the round-trip test. */
+export function settingsToCodecChoice(
+  transport: RcVideoTransport,
+  chroma: Vp9ChromaPref,
+): RcCodecChoice {
+  switch (transport) {
+    case 'data-channel-av1':
+      return 'av1'
+    case 'data-channel-hevc':
+      return 'hevc'
+    case 'data-channel-vp9-444':
+      return chroma === 'yuv444' ? 'vp9-444' : 'vp9-420'
+    case 'webrtc':
+      return 'h264'
+    case 'auto':
+    default:
+      return 'auto'
+  }
+}
+
 /** rc.44 — clipboard chunking constants. The single-envelope
  *  `clipboard:write` shape sent a `text` field unbounded by length;
  *  on payloads >~50 KB this hit webrtc-rs's SCTP `max_message_size=
@@ -1460,6 +1575,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    *  the agent over the `control` data channel whenever the user changes
    *  it *or* the channel first opens. */
   const quality = ref<RcQuality>(readStoredQuality())
+  /** rc.199 — the viewer "Priority" dial (per-session; persisted). Sent to the
+   *  agent over the control DC on change and on channel open. Supersedes the
+   *  old Quality dropdown in the UI (which only shadowed AIMD/REMB); the
+   *  underlying `quality` ref + `rc:quality` sender are kept for back-compat. */
+  const priority = ref<RcPriority>(readStoredPriority())
   /** Optional codec override. `null` = let the agent pick from the full
    *  intersection; `'h265'` = only advertise H.265 + H.264 fallback to
    *  the agent so AV1 can't win. Useful for A/B comparisons
@@ -2209,6 +2329,44 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     vp9Chroma.value = c
     persistVp9Chroma(c)
   }
+
+  /** Send the current `rc:priority` dial over the control DC. Safe to call
+   *  while closed — no-op until open; the control `onopen` handler calls it so
+   *  a reload re-emits the stored dial without user action. */
+  function sendPriorityPreference() {
+    const ch = channels.control
+    if (!ch || ch.readyState !== 'open') return
+    try {
+      ch.send(JSON.stringify(priorityWireMessage(priority.value)))
+    } catch {
+      /* channel closed between check and send — drop */
+    }
+  }
+
+  /** Update the Priority dial, persist it, and push it to the agent. Unlike
+   *  the codec/transport picks, this takes effect LIVE — the agent re-resolves
+   *  the relay resolution cap on the next encoded frame. */
+  function setPriority(p: RcPriority) {
+    priority.value = p
+    persistPriority(p)
+    sendPriorityPreference()
+  }
+
+  /** The unified Codec picker as a computed over the four underlying refs.
+   *  `get` derives the current choice; `set` applies the full tuple through
+   *  the existing setters (so persistence + connect-time wiring are unchanged).
+   *  Takes effect on the next `connect()`, like the transport/chroma refs it
+   *  drives. */
+  const codecChoice = computed<RcCodecChoice>({
+    get: () => settingsToCodecChoice(videoTransport.value, vp9Chroma.value),
+    set: (choice) => {
+      const s = codecChoiceToSettings(choice)
+      setVideoTransport(s.videoTransport)
+      setVp9Chroma(s.chroma)
+      setPreferredCodec(s.preferredCodec)
+      setRenderPath(s.renderPath)
+    },
+  })
 
   /** Install the receiver transform EAGERLY (at pc.ontrack time) so
    *  Chrome routes encoded frames to the worker from the very first
@@ -3585,6 +3743,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     channels.control.onopen = () => {
       sendQualityPreference()
       sendResolutionPreference()
+      // rc.199 — re-emit the stored Priority dial so a reloaded session
+      // restores the operator's sharpness/smoothness choice without a click.
+      sendPriorityPreference()
     }
     // Agent → browser control messages. Recognised:
     //   - `rc:host_locked` (boolean) — the agent flips this on/off
@@ -5564,6 +5725,14 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
      *  selection. */
     vp9Chroma,
     setVp9Chroma,
+    /** rc.199 — the viewer "Priority" dial + its setter (live; sent over the
+     *  control DC). Balanced / Sharper (relay-cap override) / Smoother. */
+    priority,
+    setPriority,
+    /** rc.199 — the unified Codec picker (computed over transport+chroma+
+     *  preferredCodec+renderPath). Read for the picker's value; assign to
+     *  apply a choice. Replaces the 4 transport toggles + 2 dropdowns. */
+    codecChoice,
     vp9_444Supported,
     vp9_444Active,
     vp9_444FramesDecoded,
