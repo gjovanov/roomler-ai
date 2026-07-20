@@ -45,6 +45,7 @@ impl OverlayNodeDao {
         key_epoch: u32,
         endpoints: Vec<String>,
         supports_quic: bool,
+        supports_relay_single: bool,
         advertised_routes: Vec<String>,
     ) -> DaoResult<OverlayNode> {
         let now = DateTime::now();
@@ -70,6 +71,7 @@ impl OverlayNodeDao {
             srflx_nat: None,
             relay_home: None,
             supports_quic,
+            supports_relay_single,
             // Phase 1 — the node's claimed routes; nothing approved until an
             // admin acts, so a fresh node routes for no one.
             advertised_routes,
@@ -99,6 +101,7 @@ impl OverlayNodeDao {
         key_epoch: u32,
         endpoints: &[String],
         supports_quic: bool,
+        supports_relay_single: bool,
         advertised_routes: &[String],
     ) -> DaoResult<OverlayNode> {
         let node_ref_bson = bson::to_bson(node_ref).unwrap_or(bson::Bson::Null);
@@ -134,6 +137,9 @@ impl OverlayNodeDao {
                         // rc.142 — refresh the QUIC capability on each re-join
                         // (an operator may flip ROOMLER_AGENT_OVERLAY_QUIC).
                         "supports_quic": supports_quic,
+                        // Phase D — refresh the single-relay capability on each
+                        // re-join (an operator may flip OVERLAY_RELAY_SINGLE).
+                        "supports_relay_single": supports_relay_single,
                         "status": bson::to_bson(&AgentStatus::Online).unwrap(),
                         "last_seen_at": DateTime::now(),
                         "updated_at": DateTime::now(),
