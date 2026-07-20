@@ -994,7 +994,10 @@ impl OverlayRuntime {
         let mut srflx_stun_server: Option<SocketAddr> = None;
         let mut srflx_advertised: Vec<String> = Vec::new();
         let mut srflx_my_nat: Option<String> = None;
-        if direct::srflx_enabled() {
+        // Phase D — also gather+advertise our srflx when single-relay is on (even
+        // with srflx-direct off): a single-relay DIALER advertises no relay, so
+        // the ANCHOR permits its inbound by the IP it learns from our srflx.
+        if direct::srflx_gather_active() {
             let socks = direct_ctx
                 .as_ref()
                 .map(|c| c.socks.clone())

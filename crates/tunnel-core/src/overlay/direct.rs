@@ -210,6 +210,20 @@ pub fn relay_single_enabled() -> bool {
     }
 }
 
+/// Phase D — should this node GATHER + ADVERTISE its own srflx candidates? True
+/// when the srflx-direct tier is on OR single-relay is on. Single-relay needs it
+/// even with srflx-direct OFF: a single-relay DIALER (larger pubkey) runs no
+/// coturn allocation, so the ANCHOR can only permit its inbound by IP — and it
+/// learns that IP from the dialer's advertised srflx. So a node opting into
+/// single-relay MUST advertise its srflx (it may be the dialer for any
+/// larger-pubkey peer), else the anchor withholds forever. This gates ONLY the
+/// gather+advertise machinery — it does NOT turn on the srflx-direct DIAL tier
+/// (that stays [`srflx_enabled`], so single-relay can be field-tested in
+/// isolation: srflx advertised, direct-dial off ⇒ pairs fall to the relay tier).
+pub fn srflx_gather_active() -> bool {
+    srflx_enabled() || relay_single_enabled()
+}
+
 /// Phase C — the srflx keepalive/re-gather interval in seconds
 /// (`ROOMLER_NODE_OVERLAY_SRFLX_KEEPALIVE_SECS`, default 20). The task re-runs a
 /// STUN Binding on the punch socket every interval to (a) hold the NAT mapping
