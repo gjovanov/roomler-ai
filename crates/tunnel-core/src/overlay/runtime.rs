@@ -73,6 +73,11 @@ struct DirectCtx {
     /// tier is off or no public srflx was gathered. Set after the startup
     /// srflx gather (which returns each candidate with its socket).
     punch: Option<(String, Arc<UdpSocket>)>,
+    /// Phase C — OUR probed NAT mapping type (`"cone"` / `"symmetric"`), or
+    /// `None` when unknown. Set at the startup gather (probing the punch socket
+    /// against two STUN targets). `install_peers` reads it to skip a srflx punch
+    /// only when BOTH ends are symmetric.
+    my_nat: Option<String>,
 }
 
 /// CC1 (NAT-traversal plan) — per-peer direct-carrier failure bookkeeping, kept
@@ -389,12 +394,14 @@ async fn sync_name_map(names: &dns::NameMap, peers: &HashMap<ObjectId, NetmapPee
 /// advert is RETAINED (a transient STUN outage must not strip a working srflx).
 /// Re-trickles ONLY when the punch mapping (`[0]`) actually changes. Ends when
 /// the control channel closes (runtime gone).
+#[allow(clippy::too_many_arguments)]
 async fn run_srflx_keepalive(
     punch_sock: Arc<UdpSocket>,
     mut stun_rx: mpsc::Receiver<crate::transport::stun::StunInbound>,
     mut stun_server: SocketAddr,
     stun_urls: Vec<String>,
     mut advertised: Vec<String>,
+    nat: Option<String>,
     outbound: mpsc::Sender<ClientMsg>,
     interval: Duration,
 ) {
@@ -429,6 +436,9 @@ async fn run_srflx_keepalive(
                     if outbound
                         .send(ClientMsg::OverlaySrflx {
                             candidates: advertised.clone(),
+                            // Re-send our NAT type — the mapping changed, not the
+                            // NAT class — so the server never clears it.
+                            nat: nat.clone(),
                         })
                         .await
                         .is_err()
@@ -974,10 +984,12 @@ impl OverlayRuntime {
         // mapping for active sessions; Phase C's in-band keepalive (demux-routed
         // STUN, chunk 2) refreshes an idle mapping + re-trickles on change.
         // Captured for the Phase C keepalive task (chunk 2): the pinned STUN
-        // server it re-queries, and the candidates it started from (so it only
-        // re-trickles on a CHANGE). Empty/None ⇒ no keepalive spawned.
+        // server it re-queries, the candidates it started from (so it only
+        // re-trickles on a CHANGE), and our probed NAT type (re-sent on each
+        // re-trickle so the server never clears it). Empty/None ⇒ no keepalive.
         let mut srflx_stun_server: Option<SocketAddr> = None;
         let mut srflx_advertised: Vec<String> = Vec::new();
+        let mut srflx_my_nat: Option<String> = None;
         if direct::srflx_enabled() {
             let socks = direct_ctx
                 .as_ref()
@@ -1000,18 +1012,36 @@ impl OverlayRuntime {
                             // is advertised at index 0, which the peer's dial-side
                             // (`pick_public_endpoint`) picks first — so both ends
                             // agree on the mapping to punch.
-                            if let (Some(ctx), Some(first)) =
-                                (direct_ctx.as_mut(), pairs.first().cloned())
-                            {
+                            let punch = pairs.first().cloned();
+                            // Phase C — probe OUR NAT type on the punch socket
+                            // (two distinct STUN targets), BEFORE its demux loop
+                            // starts (same socket-read race as the gather). A
+                            // peer skips the punch only when BOTH ends are
+                            // symmetric; `None` (unknown) stays optimistic.
+                            let my_nat = if let Some((_, ps)) = &punch {
+                                let targets =
+                                    direct::resolve_stun_targets(&network.stun_urls).await;
+                                direct::probe_nat_type(ps, &targets, SRFLX_ATTEMPT_TIMEOUT)
+                                    .await
+                                    .map(str::to_string)
+                            } else {
+                                None
+                            };
+                            srflx_my_nat = my_nat.clone();
+                            if let (Some(ctx), Some(first)) = (direct_ctx.as_mut(), punch) {
                                 ctx.punch = Some(first);
+                                ctx.my_nat = my_nat.clone();
                             }
                             let candidates: Vec<String> =
                                 pairs.into_iter().map(|(c, _)| c).collect();
                             srflx_advertised = candidates.clone();
-                            info!(?candidates, %stun_server, "overlay: advertising srflx candidates (NAT-traversal Phase B/C)");
+                            info!(?candidates, ?my_nat, %stun_server, "overlay: advertising srflx candidates (NAT-traversal Phase B/C)");
                             let _ = self
                                 .outbound
-                                .send(ClientMsg::OverlaySrflx { candidates })
+                                .send(ClientMsg::OverlaySrflx {
+                                    candidates,
+                                    nat: my_nat,
+                                })
                                 .await;
                         }
                     }
@@ -1067,6 +1097,7 @@ impl OverlayRuntime {
                         stun_server,
                         network.stun_urls.clone(),
                         srflx_advertised.clone(),
+                        srflx_my_nat.clone(),
                         self.outbound.clone(),
                         Duration::from_secs(secs),
                     )))
@@ -1598,8 +1629,10 @@ impl OverlayRuntime {
             endpoints,
             public_sock,
             // Set after the startup srflx gather (Phase C) once we know which
-            // interface socket owns our first advertised srflx candidate.
+            // interface socket owns our first advertised srflx candidate + the
+            // NAT-type probe on it.
             punch: None,
+            my_nat: None,
         })
     }
 
@@ -1662,14 +1695,21 @@ impl OverlayRuntime {
             // srflx) so our INITs ride our advertised mapping and open our NAT's
             // filter toward the peer — the mutual hole-punch. Distinct socket
             // and cooldown from Phase A. Gated by the flag + its cooldown + a
-            // gathered punch socket. Lowest direct tier (after LAN + public-NIC).
+            // gathered punch socket, AND skipped when BOTH ends are symmetric
+            // (a punch can't work then — save the futile 12 s attempt + the
+            // strike; any cone/unknown side still attempts). Lowest direct tier.
             let srflx_dst = if srflx_cooling {
                 None
             } else {
                 direct_ctx.and_then(|ctx| {
-                    (direct::srflx_enabled() && ctx.punch.is_some())
-                        .then(|| direct::pick_public_endpoint(&ctx.my_ips, &cfg.srflx_endpoints))
-                        .flatten()
+                    (direct::srflx_enabled()
+                        && ctx.punch.is_some()
+                        && direct::srflx_punch_worth_trying(
+                            ctx.my_nat.as_deref(),
+                            cfg.srflx_nat.as_deref(),
+                        ))
+                    .then(|| direct::pick_public_endpoint(&ctx.my_ips, &cfg.srflx_endpoints))
+                    .flatten()
                 })
             };
 
@@ -2675,6 +2715,7 @@ mod tests {
             server_addr,
             vec![],
             advertised,
+            Some("cone".into()),
             out_tx,
             Duration::from_millis(60),
         ));
@@ -2686,8 +2727,11 @@ mod tests {
             .expect("expected a re-trickle")
             .expect("channel closed");
         match msg {
-            ClientMsg::OverlaySrflx { candidates } => {
-                assert_eq!(candidates, vec!["203.0.113.7:2222".to_string()])
+            ClientMsg::OverlaySrflx { candidates, nat } => {
+                assert_eq!(candidates, vec!["203.0.113.7:2222".to_string()]);
+                // The NAT type rides every re-trickle (mapping changed, class
+                // didn't) so the server never clears it.
+                assert_eq!(nat.as_deref(), Some("cone"));
             }
             other => panic!("expected OverlaySrflx, got {other:?}"),
         }
@@ -2716,6 +2760,7 @@ mod tests {
             dead,
             vec![],
             vec!["203.0.113.7:1111".to_string()],
+            Some("cone".into()),
             out_tx,
             Duration::from_millis(30),
         ));
@@ -2747,6 +2792,7 @@ mod tests {
                 endpoints: vec![],
                 lan_endpoints: vec![],
                 srflx_endpoints: vec![],
+                srflx_nat: None,
                 relay_home: None,
                 reachable,
                 supports_quic: false,
@@ -2938,6 +2984,7 @@ mod tests {
             endpoints: vec![],
             lan_endpoints: vec![],
             srflx_endpoints: vec![],
+            srflx_nat: None,
             relay_home: None,
             reachable: true,
             supports_quic: false,
@@ -3056,6 +3103,7 @@ mod tests {
             endpoints: vec![],
             lan_endpoints: vec![],
             srflx_endpoints: vec![],
+            srflx_nat: None,
             relay_home: None,
             reachable: true,
             supports_quic: false,
@@ -3201,6 +3249,7 @@ mod tests {
             endpoints: vec![],
             lan_endpoints: vec![],
             srflx_endpoints: vec![],
+            srflx_nat: None,
             relay_home: None,
             reachable: true,
             supports_quic: false,

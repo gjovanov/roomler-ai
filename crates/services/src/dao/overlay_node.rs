@@ -66,6 +66,8 @@ impl OverlayNodeDao {
             // Phase B — no srflx until the node gathers it (post-join, via STUN)
             // and trickles it up on `rc:overlay.srflx`.
             srflx_endpoints: Vec::new(),
+            // Phase C — NAT type is unknown until the node probes + trickles it.
+            srflx_nat: None,
             relay_home: None,
             supports_quic,
             // Phase 1 — the node's claimed routes; nothing approved until an
@@ -125,6 +127,10 @@ impl OverlayNodeDao {
                         // re-gathers + re-trickles fresh srflx this connection
                         // (a prior session's NAT mapping is meaningless now).
                         "srflx_endpoints": [],
+                        // Phase C (A8) — clear the stale NAT class in the SAME
+                        // $set (a prior session's NAT type is meaningless after
+                        // a roam); the node re-probes + re-trickles it.
+                        "srflx_nat": bson::Bson::Null,
                         // rc.142 — refresh the QUIC capability on each re-join
                         // (an operator may flip ROOMLER_AGENT_OVERLAY_QUIC).
                         "supports_quic": supports_quic,
@@ -171,19 +177,23 @@ impl OverlayNodeDao {
             .await
     }
 
-    /// Phase B — replace the node's server-reflexive (srflx) candidates. A
-    /// SEPARATE bucket from `endpoints` (relay) / `lan_endpoints` (public NIC)
-    /// so a srflx trickle never clobbers a relay/LAN address and vice-versa.
+    /// Phase B/C — replace the node's server-reflexive (srflx) candidates and
+    /// its probed NAT type. A SEPARATE bucket from `endpoints` (relay) /
+    /// `lan_endpoints` (public NIC) so a srflx trickle never clobbers a relay/LAN
+    /// address and vice-versa. `nat` (`Some("cone"|"symmetric")` / `None` when
+    /// unknown) is stored alongside so peers can skip a both-symmetric punch.
     pub async fn update_srflx_endpoints(
         &self,
         node_id: ObjectId,
         srflx_endpoints: &[String],
+        nat: Option<&str>,
     ) -> DaoResult<bool> {
         self.base
             .update_by_id(
                 node_id,
                 doc! { "$set": {
                     "srflx_endpoints": srflx_endpoints,
+                    "srflx_nat": nat.map(|s| s.to_string()),
                     "last_seen_at": DateTime::now(),
                     "updated_at": DateTime::now(),
                 } },
