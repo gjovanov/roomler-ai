@@ -1369,6 +1369,7 @@ async fn media_pump(
                         capture_native_dims,
                         encoded_dims,
                         viewer_report,
+                        priority,
                     )
                     .await;
                 }
