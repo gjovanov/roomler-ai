@@ -21,7 +21,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::net::UdpSocket;
+use tokio::net::{UdpSocket, lookup_host};
 
 /// `ROOMLER_NODE_OVERLAY_DIRECT` (legacy `ROOMLER_AGENT_OVERLAY_DIRECT` still
 /// honoured — see [`crate::env::node_env`]) — default **ON**. Set
@@ -166,6 +166,27 @@ pub fn public_direct_enabled() -> bool {
     }
 }
 
+/// NAT-traversal Phase B — opt-in gate for the **srflx** carrier tier
+/// (`ROOMLER_NODE_OVERLAY_SRFLX`; legacy `ROOMLER_AGENT_…` alias honoured).
+/// **Default OFF** per CC8, independent of the public-direct gate. Turns on the
+/// whole srflx tier: gathering + advertising this node's own server-reflexive
+/// candidates (via STUN), AND dialing a peer's advertised srflx (a 1:1/cone-NAT
+/// node whose NIC IP is private). Reuses Phase A's `public_sock` + demux +
+/// authenticated-inbound accept, so the egress socket + inbound receiver are
+/// wired whenever EITHER tier is on.
+pub fn srflx_enabled() -> bool {
+    match crate::env::node_env("OVERLAY_SRFLX") {
+        Some(v) => {
+            let t = v.trim();
+            t.eq_ignore_ascii_case("1")
+                || t.eq_ignore_ascii_case("true")
+                || t.eq_ignore_ascii_case("yes")
+                || t.eq_ignore_ascii_case("on")
+        }
+        None => false,
+    }
+}
+
 /// Phase A — a globally-routable IPv4: the address classes that can never be
 /// dialled across the internet are excluded (RFC1918 private, loopback,
 /// link-local, CGNAT/overlay `100.64/10`, `0/8`, multicast `224/4`, and
@@ -185,16 +206,17 @@ pub fn is_public_v4(ip: Ipv4Addr) -> bool {
         || o[0] >= 240)
 }
 
-/// Phase A — from a peer's JOIN-TIME NIC endpoints (the netmap's
-/// `lan_endpoints` bucket), pick the first **public** one: the peer's NIC
-/// holds a public IP (bare-metal
-/// / no NAT in front), so we can dial it directly without STUN. Candidates
-/// equal to one of OUR OWN interface IPs are skipped (a same-host / stale
-/// record can't be a peer dial target; a genuinely same-subnet peer was
-/// already taken by the LAN tier, which runs first). `None` → the caller falls
-/// through to the passive stance or the relay.
-pub fn pick_public_endpoint(my_ips: &[Ipv4Addr], lan_endpoints: &[String]) -> Option<SocketAddr> {
-    for ep in lan_endpoints {
+/// Pick the first **public** `ip:port` from a peer's candidate bucket — used
+/// for BOTH the Phase A public-NIC tier (the netmap's `lan_endpoints`, the
+/// peer's NIC holding a public IP, dialable without STUN) and the Phase B srflx
+/// tier (`srflx_endpoints`, the peer's public NAT mapping learned via STUN).
+/// Either way the address is globally routable, so the same public dial path
+/// (over `public_sock`) applies. Candidates equal to one of OUR OWN interface
+/// IPs are skipped (a same-host / stale record can't be a peer dial target; a
+/// genuinely same-subnet peer was already taken by the LAN tier, which runs
+/// first). `None` → the caller falls through to the next tier or the relay.
+pub fn pick_public_endpoint(my_ips: &[Ipv4Addr], candidates: &[String]) -> Option<SocketAddr> {
+    for ep in candidates {
         if let Ok(SocketAddr::V4(sa)) = ep.trim().parse::<SocketAddr>()
             && is_public_v4(*sa.ip())
             && !my_ips.contains(sa.ip())
@@ -293,6 +315,38 @@ pub async fn gather_srflx(
         }
     }
     out
+}
+
+/// Phase B — resolve the FIRST usable STUN server from the netmap's `stun_urls`
+/// to a concrete v4 `SocketAddr`. An IP-literal URL is parsed synchronously
+/// ([`parse_stun_url`], no DNS); a hostname URL (the fleet's
+/// `stun:coturn.roomler.ai:3478`) is resolved via DNS and the first IPv4 answer
+/// taken (v4-only, CC7). Tries each URL in order; `None` if none resolve to an
+/// IPv4 endpoint. Any single reachable STUN worker suffices — srflx doesn't need
+/// the coturn worker-pinning that the relay hairpin does.
+pub async fn resolve_stun_server(stun_urls: &[String]) -> Option<SocketAddr> {
+    for url in stun_urls {
+        // Fast path: an IP literal (or already-resolved worker) needs no DNS.
+        if let Some(sa) = parse_stun_url(url) {
+            return Some(sa);
+        }
+        // Hostname → DNS. Strip the scheme + any `?transport` / `#frag`, keep
+        // the `host:port` `lookup_host` needs.
+        let s = url.trim();
+        let s = s
+            .strip_prefix("stun:")
+            .or_else(|| s.strip_prefix("stuns:"))
+            .or_else(|| s.strip_prefix("turn:"))
+            .or_else(|| s.strip_prefix("turns:"))
+            .unwrap_or(s);
+        let hostport = s.split(['?', '#']).next().unwrap_or(s);
+        if let Ok(addrs) = lookup_host(hostport).await
+            && let Some(v4) = addrs.into_iter().find(SocketAddr::is_ipv4)
+        {
+            return Some(v4);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -543,6 +597,29 @@ mod tests {
             gather_srflx(&socks3, dead, Duration::from_millis(150))
                 .await
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_stun_server_prefers_ip_literals_and_skips_bad_entries() {
+        let want: SocketAddr = "5.9.157.221:3478".parse().unwrap();
+        // An IP-literal URL resolves synchronously — no DNS.
+        assert_eq!(
+            resolve_stun_server(&["stun:5.9.157.221:3478".to_string()]).await,
+            Some(want)
+        );
+        // Empty → None (srflx tier inert).
+        assert_eq!(resolve_stun_server(&[]).await, None);
+        // A malformed leading entry (no `host:port`, so `lookup_host` errors
+        // immediately without network I/O) is skipped → the usable IP literal
+        // behind it wins.
+        assert_eq!(
+            resolve_stun_server(&[
+                "not-a-host-port".to_string(),
+                "stun:5.9.157.221:3478".to_string(),
+            ])
+            .await,
+            Some(want)
         );
     }
 }

@@ -580,6 +580,16 @@ pub enum ClientMsg {
     #[serde(rename = "rc:overlay.endpoints")]
     OverlayEndpoints { candidates: Vec<String> },
 
+    /// Node trickles its server-reflexive (srflx) candidates — its public
+    /// `ip:port` discovered via STUN on its own traffic sockets (NAT-traversal
+    /// Phase B). The server stores them in a SEPARATE `srflx_endpoints` bucket
+    /// (so the relay-endpoint trickle can't clobber them) and fans a delta to
+    /// permitted peers, who may then dial this node directly through its NAT.
+    /// Deliberately distinct from `rc:overlay.endpoints` (relay addresses):
+    /// different lifecycle, different provenance, different bucket.
+    #[serde(rename = "rc:overlay.srflx")]
+    OverlaySrflx { candidates: Vec<String> },
+
     /// Node leaves the overlay (graceful). Server marks it offline and
     /// pushes a `netmap_delta` removing it from peers.
     #[serde(rename = "rc:overlay.leave")]
@@ -1059,6 +1069,20 @@ pub struct NetmapPeer {
     /// (`#[serde(default)]`) → the public-direct tier stays inert.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lan_endpoints: Vec<String>,
+    /// NAT-traversal Phase B — the peer's **server-reflexive** (srflx)
+    /// candidates: its public `ip:port` as seen through its NAT, discovered by
+    /// the peer querying a STUN server (`OverlayNetworkInfo.stun_urls`) on each
+    /// of its own traffic sockets and trickled up via `rc:overlay.srflx`. Lets a
+    /// node behind a 1:1 / cone NAT (e.g. a cloud exit whose NIC IP is private)
+    /// become directly dialable without a relay: a dialer sends its WireGuard
+    /// INIT here and the peer accepts it over the NAT mapping its own STUN query
+    /// opened. Kept in a SEPARATE bucket from `endpoints` (relay) and
+    /// `lan_endpoints` (public NIC) so each provenance stays distinct (CC2) and
+    /// the relay trickle can't clobber it. Empty from a pre-Phase-B server or a
+    /// node that gathered no public srflx (`#[serde(default)]`) → the srflx tier
+    /// stays inert.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub srflx_endpoints: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_home: Option<String>,
     pub reachable: bool,
@@ -2047,6 +2071,25 @@ mod tests {
     }
 
     #[test]
+    fn overlay_srflx_trickle_roundtrip() {
+        // Phase B — the srflx trickle is its own message tag, distinct from
+        // `rc:overlay.endpoints`, so the server routes it into the separate
+        // `srflx_endpoints` bucket.
+        let e = ClientMsg::OverlaySrflx {
+            candidates: vec!["198.51.100.7:41820".into()],
+        };
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(s.contains(r#""t":"rc:overlay.srflx""#));
+        assert!(s.contains(r#""candidates":["198.51.100.7:41820"]"#));
+        match serde_json::from_str::<ClientMsg>(&s).unwrap() {
+            ClientMsg::OverlaySrflx { candidates } => {
+                assert_eq!(candidates, vec!["198.51.100.7:41820".to_string()]);
+            }
+            other => panic!("expected OverlaySrflx, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn overlay_relay_request_uses_raw_hex_peer_id() {
         let peer = ObjectId::parse_str("507f1f77bcf86cd799439014").unwrap();
         let m = ClientMsg::OverlayRelayRequest { peer_node_id: peer };
@@ -2081,6 +2124,7 @@ mod tests {
                 wg_public_key: "cGVlcg==".into(),
                 endpoints: vec!["203.0.113.9:51820".into()],
                 lan_endpoints: vec!["203.0.113.9:51820".into()],
+                srflx_endpoints: vec!["198.51.100.7:41820".into()],
                 relay_home: None,
                 reachable: true,
                 supports_quic: true,
@@ -2154,6 +2198,31 @@ mod tests {
         p2.lan_endpoints = vec!["5.9.157.226:41234".into()];
         let s2 = serde_json::to_string(&p2).unwrap();
         assert!(s2.contains(r#""lan_endpoints":["5.9.157.226:41234"]"#));
+        assert_eq!(serde_json::from_str::<NetmapPeer>(&s2).unwrap(), p2);
+    }
+
+    /// Back-compat both directions for the Phase-B `srflx_endpoints` field: a
+    /// pre-Phase-B server omits it → defaults empty (srflx tier inert); an empty
+    /// vec is OMITTED on the wire (`skip_serializing_if`); populated round-trips.
+    #[test]
+    fn netmap_peer_srflx_endpoints_default_and_skip() {
+        let json = r#"{
+            "node_id":"507f1f77bcf86cd799439011",
+            "overlay_ip":"100.64.0.4",
+            "wg_public_key":"cGVlcg==",
+            "reachable":true
+        }"#;
+        let p: NetmapPeer = serde_json::from_str(json).unwrap();
+        assert!(p.srflx_endpoints.is_empty());
+        let s = serde_json::to_string(&p).unwrap();
+        assert!(
+            !s.contains("srflx_endpoints"),
+            "empty srflx_endpoints must be omitted on the wire: {s}"
+        );
+        let mut p2 = p.clone();
+        p2.srflx_endpoints = vec!["198.51.100.7:41820".into()];
+        let s2 = serde_json::to_string(&p2).unwrap();
+        assert!(s2.contains(r#""srflx_endpoints":["198.51.100.7:41820"]"#));
         assert_eq!(serde_json::from_str::<NetmapPeer>(&s2).unwrap(), p2);
     }
 
