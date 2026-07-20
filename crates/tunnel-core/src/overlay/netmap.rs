@@ -46,6 +46,13 @@ pub struct PeerConfig {
     /// runtime only attempts the QUIC relay carrier when this is set (both
     /// ends must agree, else the pair falls back to raw relay).
     pub supports_quic: bool,
+    /// Phase D (v1 single-relay) — the peer advertised it can run the
+    /// single-relay carrier: ONE anchor allocation + a raw dialer, instead of
+    /// today's both-allocate hairpin. The runtime picks single-relay only when
+    /// BOTH ends advertise this AND our `OVERLAY_RELAY_SINGLE` flag is on; else
+    /// the pair uses both-allocate. Wired to the `NetmapPeer` field in D1c —
+    /// `false` until then keeps a mixed fleet on the proven path.
+    pub supports_relay_single: bool,
 }
 
 /// Decode a netmap peer. `None` if the pubkey isn't valid base64/length
@@ -68,6 +75,10 @@ pub fn peer_config_from_netmap(peer: &NetmapPeer) -> Option<PeerConfig> {
         srflx_endpoints: peer.srflx_endpoints.clone(),
         srflx_nat: peer.srflx_nat.clone(),
         supports_quic: peer.supports_quic,
+        // D1c wires this to `peer.supports_relay_single` once the NetmapPeer
+        // field + server population land; `false` until then keeps single-relay
+        // inert (both ends must advertise, so a mixed fleet stays both-allocate).
+        supports_relay_single: false,
     })
 }
 
