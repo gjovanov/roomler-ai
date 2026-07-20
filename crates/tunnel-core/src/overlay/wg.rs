@@ -1319,13 +1319,21 @@ mod tests {
     }
 
     /// A `RelayConn` that models **coturn's PERMISSION rule**: an allocation
-    /// only receives datagrams from a peer address it has previously SENT to
+    /// only receives datagrams from a peer **IP** it has previously SENT to
     /// (coturn installs a permission on send, then drops inbound from any peer
     /// it has no permission for). A plain [`UdpRelayConn`] can't reproduce the
     /// cross-NAT relay deadlock because it has no such gate — this can.
+    ///
+    /// **Permissions are IP-only** (RFC 8656 §9 — the port is ignored; verified
+    /// in webrtc-rs `turn` client `permission.rs` + server `allocation/mod.rs`).
+    /// This is load-bearing for Phase D single-relay: a symmetric-NAT dialer's
+    /// source PORT varies per destination, but the anchor's permission (keyed by
+    /// the dialer's IP) still matches — so a permit installed by sending to one
+    /// port accepts inbound from the SAME IP on a DIFFERENT port. Keying by full
+    /// `SocketAddr` (the pre-fix bug) would wrongly drop it.
     struct PermissionedRelayConn {
         sock: UdpSocket,
-        permitted: std::sync::Mutex<std::collections::HashSet<std::net::SocketAddr>>,
+        permitted: std::sync::Mutex<std::collections::HashSet<std::net::IpAddr>>,
     }
     impl PermissionedRelayConn {
         fn new(sock: UdpSocket) -> Self {
@@ -1338,9 +1346,9 @@ mod tests {
     #[async_trait::async_trait]
     impl RelayConn for PermissionedRelayConn {
         async fn send_to(&self, buf: &[u8], dst: std::net::SocketAddr) -> std::io::Result<usize> {
-            // Sending to a peer opens (permits) it — exactly coturn's
-            // CreatePermission-on-send behaviour.
-            self.permitted.lock().unwrap().insert(dst);
+            // Sending to a peer opens (permits) its IP — exactly coturn's
+            // CreatePermission-on-send behaviour (IP-only, port ignored).
+            self.permitted.lock().unwrap().insert(dst.ip());
             self.sock.send_to(buf, dst).await
         }
         async fn recv_from(
@@ -1349,10 +1357,10 @@ mod tests {
         ) -> std::io::Result<(usize, std::net::SocketAddr)> {
             loop {
                 let (n, src) = self.sock.recv_from(buf).await?;
-                if self.permitted.lock().unwrap().contains(&src) {
+                if self.permitted.lock().unwrap().contains(&src.ip()) {
                     return Ok((n, src));
                 }
-                // Unpermitted peer → coturn drops it. Keep waiting.
+                // Unpermitted peer IP → coturn drops it. Keep waiting.
             }
         }
         fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
@@ -1457,6 +1465,99 @@ mod tests {
         }
     }
 
+    /// Phase D single-relay — WG completes over ONE coturn allocation with a RAW
+    /// dialer whose source PORT differs from the port the anchor permitted (the
+    /// symmetric-NAT-safe path). The ANCHOR (smaller pubkey) is the QUIC server
+    /// over a `PermissionedRelayConn` (its "allocation"), permitting only the
+    /// dialer's IP via a send to a DIFFERENT port (9); the DIALER (larger pubkey)
+    /// is the QUIC client over a plain `UdpRelayConn` (no allocation) dialing the
+    /// anchor's relayed addr. IP-only permission ⇒ the dialer's real-port traffic
+    /// is accepted and WG handshakes + data flows both ways — no both-allocate
+    /// hairpin, one permission. This is the wg-level guard for V-D1 (which proved
+    /// the same live over coturn).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wg_single_relay_symmetric_over_quic() {
+        use crate::transport::relay::UdpRelayConn;
+
+        // Anchor = smaller pubkey, dialer = larger (the single-relay role rule,
+        // which == install_ready's existing am_server/initiate rule, so v1 needs
+        // no role decoupling).
+        let (anchor, dialer) = {
+            let k1 = WgKeypair::generate();
+            let k2 = WgKeypair::generate();
+            if k1.public.to_bytes() < k2.public.to_bytes() {
+                (k1, k2)
+            } else {
+                (k2, k1)
+            }
+        };
+
+        let sock_anchor = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sock_dialer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let r_anchor = sock_anchor.local_addr().unwrap(); // relayed addr the dialer dials
+        let addr_dialer = sock_dialer.local_addr().unwrap();
+
+        // Anchor's "allocation" enforces IP-only permissions; the dialer is a
+        // plain raw socket (no allocation).
+        let conn_anchor: Arc<dyn RelayConn> = Arc::new(PermissionedRelayConn::new(sock_anchor));
+        let conn_dialer: Arc<dyn RelayConn> = Arc::new(UdpRelayConn(sock_dialer));
+
+        // The anchor permits the dialer's IP by sending its \x00 bootstrap to a
+        // DIFFERENT port than the dialer's real one (a live dummy socket, so no
+        // ICMP-unreachable poisons the anchor's recv on Windows) — modelling a
+        // symmetric NAT where coturn observes a port the advertised srflx didn't
+        // name. IP-only permission ⇒ the dialer's real-port traffic is still
+        // accepted (permit port ≠ accept port, same IP).
+        let _permit_dummy = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let permit_target = _permit_dummy.local_addr().unwrap();
+        assert_ne!(
+            permit_target.port(),
+            addr_dialer.port(),
+            "permit port must differ from the dialer's real port to prove IP-only"
+        );
+
+        // Anchor = QUIC server + WG initiator; dialer = QUIC client + responder.
+        // Build concurrently — the server's accept() blocks on the client's dial.
+        let (car_anchor, car_dialer) = tokio::join!(
+            Carrier::quic_relay(
+                conn_anchor,
+                permit_target,
+                true,
+                1312,
+                Duration::from_secs(10)
+            ),
+            Carrier::quic_relay(conn_dialer, r_anchor, false, 1312, Duration::from_secs(10)),
+        );
+        let car_anchor = car_anchor.expect("anchor: QUIC-over-single-relay carrier");
+        let car_dialer = car_dialer.expect("dialer: QUIC-over-single-relay carrier");
+
+        let (mut dev_anchor, mut rx_anchor) = WgDevice::new(anchor.secret.clone());
+        let (mut dev_dialer, mut rx_dialer) = WgDevice::new(dialer.secret.clone());
+
+        dev_anchor.add_peer(dialer.public.to_bytes(), IP_B, car_anchor, true);
+        dev_dialer.add_peer(anchor.public.to_bytes(), IP_A, car_dialer, false);
+
+        wait_connected(&dev_anchor, &dialer.public.to_bytes()).await;
+
+        // anchor → dialer
+        let pkt_ad = synthetic_ipv4(IP_A, IP_B, b"hello-single-relay");
+        send_until_ok(&dev_anchor, &dialer.public.to_bytes(), &pkt_ad).await;
+        let got_d = tokio::time::timeout(Duration::from_secs(15), rx_dialer.recv())
+            .await
+            .expect("dialer received no decrypted packet")
+            .expect("tun channel closed");
+        assert_eq!(got_d, pkt_ad);
+
+        // dialer → anchor (bidirectional over the single-relay carrier)
+        let pkt_da = synthetic_ipv4(IP_B, IP_A, b"reply-single-relay");
+        send_until_ok(&dev_dialer, &anchor.public.to_bytes(), &pkt_da).await;
+        let got_a = tokio::time::timeout(Duration::from_secs(15), rx_anchor.recv())
+            .await
+            .expect("anchor received no decrypted packet")
+            .expect("tun channel closed");
+        assert_eq!(got_a, pkt_da);
+    }
+
     // ───────────── LIVE coturn smoke (two real TURN allocations) ─────────────
     //
     // Mirrors `relay::turn_tests::relay_against_real_coturn_udp`: two WG
@@ -1553,6 +1654,124 @@ mod tests {
             return;
         };
         wg_over_two_live_allocations(&urls, &user, &cred).await;
+    }
+
+    /// Phase D single-relay LIVE — WG completes over ONE real coturn allocation
+    /// (the anchor) + a RAW-UDP dialer with NO allocation: the production
+    /// single-relay carrier, end to end over prod coturn. The anchor allocates on
+    /// a REMOTE worker (`ROOMLER_TEST_TURN_WORKER` — a worker that is NOT a local
+    /// IP of this host, so the dialer's packet crosses the real network + coturn's
+    /// PREROUTING DNAT rather than hair-pinning on loopback, the same-host artifact
+    /// V-D1 hit). The dialer STUN-discovers its own public srflx so the anchor can
+    /// install the IP-only coturn permission; both ends build QUIC-over-relay
+    /// carriers (anchor server, dialer client) and WG handshakes + round-trips a
+    /// packet BOTH ways. This is V-D1 (the raw-dialer QUIC round-trip, proven live
+    /// 2026-07-20) PLUS the WG layer — exactly the leg the both-allocate relay
+    /// carrier deadlocked on (`HANDSHAKE(REKEY_TIMEOUT)`), now over a single
+    /// allocation with one IP-only permission.
+    ///
+    /// Run on a host with UDP/3478 to the worker (e.g. mars → jupiter's worker):
+    ///   ROOMLER_TEST_TURN_HOST=coturn.roomler.ai \
+    ///   ROOMLER_TEST_TURN_SECRET=<coturn static-auth-secret> \
+    ///   ROOMLER_TEST_TURN_WORKER=5.9.157.221 \
+    ///   cargo test -p roomler-ai-tunnel-core --features overlay-l3 \
+    ///     --lib wg_single_relay_against_real_coturn_udp -- --ignored --nocapture
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "hits live coturn; set ROOMLER_TEST_TURN_HOST/SECRET + ROOMLER_TEST_TURN_WORKER"]
+    async fn wg_single_relay_against_real_coturn_udp() {
+        use crate::transport::relay::{UdpRelayConn, allocate_relay_from_ice};
+        use crate::transport::stun::srflx_query;
+
+        let Some(worker) = std::env::var("ROOMLER_TEST_TURN_WORKER").ok() else {
+            eprintln!(
+                "SKIP wg_single_relay_against_real_coturn_udp: ROOMLER_TEST_TURN_WORKER unset"
+            );
+            return;
+        };
+        // Creds are host-independent HMAC; pin the URL to the remote worker.
+        let Some((urls, user, cred)) =
+            live_coturn_creds(|_h| vec![format!("turn:{worker}:3478?transport=udp")])
+        else {
+            eprintln!("SKIP wg_single_relay_against_real_coturn_udp: TURN env unset");
+            return;
+        };
+        let worker_ip: std::net::IpAddr =
+            worker.parse().expect("ROOMLER_TEST_TURN_WORKER is an IP");
+        let stun_server = SocketAddr::new(worker_ip, 3478);
+
+        // Anchor = smaller pubkey (QUIC server + WG initiator, install_ready's
+        // rule); dialer = larger (QUIC client + WG responder).
+        let (anchor, dialer) = {
+            let k1 = WgKeypair::generate();
+            let k2 = WgKeypair::generate();
+            if k1.public.to_bytes() < k2.public.to_bytes() {
+                (k1, k2)
+            } else {
+                (k2, k1)
+            }
+        };
+
+        // Anchor: the SOLE real coturn allocation, on the remote worker.
+        let alloc = allocate_relay_from_ice(&urls, &user, &cred)
+            .await
+            .expect("anchor: live coturn allocation");
+        let r_anchor = alloc.local_addr().unwrap();
+        eprintln!("single-relay-wg: anchor R={r_anchor}");
+
+        // Dialer: a raw socket (NO allocation). Discover its public srflx so the
+        // anchor can permit its IP (IP-only); the QUIC dial reuses this same
+        // socket, so coturn observes the same source.
+        let dialer_sock = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let dialer_srflx = srflx_query(&dialer_sock, stun_server, Duration::from_secs(3))
+            .await
+            .expect("dialer: srflx via STUN on the worker");
+        eprintln!("single-relay-wg: dialer srflx={dialer_srflx}");
+
+        let conn_anchor: Arc<dyn RelayConn> = Arc::new(alloc);
+        let conn_dialer: Arc<dyn RelayConn> = Arc::new(UdpRelayConn(dialer_sock));
+
+        // Build concurrently (the server's accept() blocks on the client dial).
+        // The anchor's quic_relay sends its own `\x00` to dialer_srflx →
+        // installs the IP-only permission before the handshake; the dialer's
+        // sends `\x00` to R → opens its path + reaches coturn (rc.199 bootstrap).
+        let (car_anchor, car_dialer) = tokio::join!(
+            Carrier::quic_relay(
+                conn_anchor,
+                dialer_srflx,
+                true,
+                1280,
+                Duration::from_secs(15)
+            ),
+            Carrier::quic_relay(conn_dialer, r_anchor, false, 1280, Duration::from_secs(15)),
+        );
+        let car_anchor = car_anchor.expect("anchor: single-relay QUIC carrier over live coturn");
+        let car_dialer = car_dialer.expect("dialer: single-relay QUIC carrier over live coturn");
+
+        let (mut dev_anchor, mut rx_anchor) = WgDevice::new(anchor.secret.clone());
+        let (mut dev_dialer, mut rx_dialer) = WgDevice::new(dialer.secret.clone());
+        dev_anchor.add_peer(dialer.public.to_bytes(), IP_B, car_anchor, true);
+        dev_dialer.add_peer(anchor.public.to_bytes(), IP_A, car_dialer, false);
+
+        wait_connected(&dev_anchor, &dialer.public.to_bytes()).await;
+
+        // anchor → dialer
+        let pkt_ad = synthetic_ipv4(IP_A, IP_B, b"hello-single-relay-live");
+        send_until_ok(&dev_anchor, &dialer.public.to_bytes(), &pkt_ad).await;
+        let got_d = tokio::time::timeout(Duration::from_secs(30), rx_dialer.recv())
+            .await
+            .expect("dialer received no packet over live coturn")
+            .expect("tun channel closed");
+        assert_eq!(got_d, pkt_ad);
+
+        // dialer → anchor (bidirectional over the single allocation)
+        let pkt_da = synthetic_ipv4(IP_B, IP_A, b"reply-single-relay-live");
+        send_until_ok(&dev_dialer, &anchor.public.to_bytes(), &pkt_da).await;
+        let got_a = tokio::time::timeout(Duration::from_secs(30), rx_anchor.recv())
+            .await
+            .expect("anchor received no packet over live coturn")
+            .expect("tun channel closed");
+        assert_eq!(got_a, pkt_da);
+        eprintln!("single-relay-wg: bidirectional WG over ONE live coturn allocation OK");
     }
 
     // rc.181 — a `RelayConn` whose `send_to` always hard-errors, mirroring a

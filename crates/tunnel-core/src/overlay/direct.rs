@@ -187,6 +187,43 @@ pub fn srflx_enabled() -> bool {
     }
 }
 
+/// NAT-traversal Phase D — opt-in gate for the **single-relay** carrier tier
+/// (`ROOMLER_NODE_OVERLAY_RELAY_SINGLE`; legacy `ROOMLER_AGENT_…` alias
+/// honoured). **Default OFF** per CC8. When on (and both ends advertise the
+/// capability), a relay-tier pair uses ONE coturn allocation — the ANCHOR
+/// (smaller pubkey) allocates + runs the QUIC server + permits the dialer's IP;
+/// the DIALER (larger pubkey) sends raw UDP to the anchor's relayed address as a
+/// plain TURN peer (no allocation). This avoids the both-allocate coturn hairpin
+/// (field bug #2) and carries symmetric NAT (permissions are IP-only). v1 serves
+/// BOTH-UDP-OK pairs; UDP-blocked pairs stay on the both-allocate/TURNS path.
+/// Field-proven live (V-D1, 2026-07-20) before this gate ships default-ON.
+pub fn relay_single_enabled() -> bool {
+    match crate::env::node_env("OVERLAY_RELAY_SINGLE") {
+        Some(v) => {
+            let t = v.trim();
+            t.eq_ignore_ascii_case("1")
+                || t.eq_ignore_ascii_case("true")
+                || t.eq_ignore_ascii_case("yes")
+                || t.eq_ignore_ascii_case("on")
+        }
+        None => false,
+    }
+}
+
+/// Phase D — should this node GATHER + ADVERTISE its own srflx candidates? True
+/// when the srflx-direct tier is on OR single-relay is on. Single-relay needs it
+/// even with srflx-direct OFF: a single-relay DIALER (larger pubkey) runs no
+/// coturn allocation, so the ANCHOR can only permit its inbound by IP — and it
+/// learns that IP from the dialer's advertised srflx. So a node opting into
+/// single-relay MUST advertise its srflx (it may be the dialer for any
+/// larger-pubkey peer), else the anchor withholds forever. This gates ONLY the
+/// gather+advertise machinery — it does NOT turn on the srflx-direct DIAL tier
+/// (that stays [`srflx_enabled`], so single-relay can be field-tested in
+/// isolation: srflx advertised, direct-dial off ⇒ pairs fall to the relay tier).
+pub fn srflx_gather_active() -> bool {
+    srflx_enabled() || relay_single_enabled()
+}
+
 /// Phase C — the srflx keepalive/re-gather interval in seconds
 /// (`ROOMLER_NODE_OVERLAY_SRFLX_KEEPALIVE_SECS`, default 20). The task re-runs a
 /// STUN Binding on the punch socket every interval to (a) hold the NAT mapping

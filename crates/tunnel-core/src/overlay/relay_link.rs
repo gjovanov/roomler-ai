@@ -101,17 +101,54 @@ pub struct RelayCoordinator {
     /// from the netmap and forced peers onto relay (field 2026-06-27). Every
     /// trickle now carries `lan ∪ current relays`.
     lan_endpoints: Vec<String>,
+    /// Phase D — this node's WG public key, used to decide the v1 single-relay
+    /// role per peer: the lexicographically-SMALLER pubkey is the ANCHOR (owns
+    /// the one allocation + QUIC-serves), the larger is the DIALER (no
+    /// allocation, raw-dials the anchor's `R`). Pure function of the two
+    /// pubkeys ⇒ both ends agree with no coordination message.
+    my_public_key: [u8; 32],
+    /// Phase D — our end of the single-relay opt-in, captured once from
+    /// [`relay_single_enabled`](super::direct::relay_single_enabled). A link
+    /// goes single-relay only when this AND the peer's advertised support are
+    /// both set (a mixed pair must stay on both-allocate, never deadlock).
+    single_relay: bool,
+    /// Phase D — v1 single-relay DIALER links awaiting the anchor's advertised
+    /// relay `R`. We hold NO allocation for these (the anchor owns the sole
+    /// relay); each becomes a raw [`UdpRelayConn`](crate::transport::relay::UdpRelayConn)
+    /// carrier the moment the anchor's `R` lands in the netmap. Keyed like
+    /// `pending`/`allocated` so [`forget`](Self::forget) prunes it and
+    /// [`is_tracking`](Self::is_tracking) sees it.
+    dialing: HashMap<ObjectId, PeerConfig>,
 }
 
 impl RelayCoordinator {
-    pub fn new(outbound: tokio::sync::mpsc::Sender<ClientMsg>, lan_endpoints: Vec<String>) -> Self {
+    pub fn new(
+        outbound: tokio::sync::mpsc::Sender<ClientMsg>,
+        my_public_key: [u8; 32],
+        lan_endpoints: Vec<String>,
+    ) -> Self {
         Self {
             outbound,
             pending: HashMap::new(),
             allocated: HashMap::new(),
             advertised: HashMap::new(),
             lan_endpoints,
+            my_public_key,
+            single_relay: super::direct::relay_single_enabled(),
+            dialing: HashMap::new(),
         }
+    }
+
+    /// v1 single-relay role for this peer, or `None` for the both-allocate path
+    /// (today's default): either single-relay is off on our side or the peer
+    /// didn't advertise support (BOTH are required so a mixed pair can't
+    /// deadlock). `Some(true)` = ANCHOR (smaller pubkey: allocate the one relay,
+    /// advertise `R`, QUIC-serve); `Some(false)` = DIALER (larger pubkey: no
+    /// allocation, raw-dial the anchor's `R`, QUIC-connect). Pure function of the
+    /// two pubkeys ⇒ both ends agree without any coordination message.
+    fn single_relay_role(&self, peer: &PeerConfig) -> Option<bool> {
+        (self.single_relay && peer.supports_relay_single)
+            .then(|| self.my_public_key < peer.public_key)
     }
 
     /// LAN endpoints ∪ every current relay address — the full candidate set the
@@ -122,14 +159,27 @@ impl RelayCoordinator {
         eps
     }
 
-    /// Already coordinating a link to this peer (pending or allocated)?
+    /// Already coordinating a link to this peer (pending, allocated, or a
+    /// single-relay dialer awaiting the anchor's `R`)?
     pub fn is_tracking(&self, node_id: &ObjectId) -> bool {
-        self.pending.contains_key(node_id) || self.allocated.contains_key(node_id)
+        self.pending.contains_key(node_id)
+            || self.allocated.contains_key(node_id)
+            || self.dialing.contains_key(node_id)
     }
 
     /// Kick off a relay link: ask the server for coturn creds + the pair_key.
+    ///
+    /// Phase D — a v1 single-relay DIALER (larger pubkey) skips this entirely:
+    /// it allocates NOTHING and needs no creds (the ANCHOR owns the sole relay),
+    /// so it's just tracked; [`maybe_complete`](Self::maybe_complete) builds its
+    /// raw carrier once the anchor advertises `R`.
     pub async fn request(&mut self, node_id: ObjectId, peer: PeerConfig) {
         if self.is_tracking(&node_id) {
+            return;
+        }
+        if self.single_relay_role(&peer) == Some(false) {
+            debug!(peer = %node_id, "overlay relay: single-relay dialer — awaiting anchor R (no alloc, no creds)");
+            self.dialing.insert(node_id, peer);
             return;
         }
         if self
@@ -175,6 +225,12 @@ impl RelayCoordinator {
     /// A fresh netmap view arrived. Refresh the peer config; if we've already
     /// allocated, the peer's relayed address may now be known — build.
     pub fn maybe_complete(&mut self, node_id: ObjectId, peer: &PeerConfig) -> Option<ReadyLink> {
+        // Phase D — a single-relay DIALER holds no allocation: build the raw
+        // carrier to the anchor's `R` the moment it appears in the netmap.
+        if let Some(slot) = self.dialing.get_mut(&node_id) {
+            *slot = peer.clone();
+            return self.try_build_dialer(&node_id);
+        }
         if let Some(a) = self.allocated.get_mut(&node_id) {
             a.peer = peer.clone();
             return self.try_build(&node_id);
@@ -264,18 +320,36 @@ impl RelayCoordinator {
     /// netmap) — we must not dial its LAN address as the "relay".
     fn try_build(&mut self, node_id: &ObjectId) -> Option<ReadyLink> {
         let a = self.allocated.get(node_id)?;
-        let our_worker_ip = a.conn.local_addr().ok().map(|s| s.ip());
-        let parsed: Vec<SocketAddr> = a
-            .peer
-            .endpoints
-            .iter()
-            .filter_map(|e| e.parse().ok())
-            .collect();
-        let dst: SocketAddr = parsed
-            .iter()
-            .find(|s| Some(s.ip()) == our_worker_ip)
-            .or_else(|| parsed.iter().find(|s| !is_lan_addr(s.ip())))
-            .copied()?;
+        let dst: SocketAddr = if self.single_relay_role(&a.peer) == Some(true) {
+            // Phase D ANCHOR: we hold the ONE allocation; the DIALER runs none
+            // and advertises no relay, so dial its public IP — taken from its
+            // srflx bucket (Phase C) — purely for the IP-only `\x00` permission
+            // `install_ready` opens. The port may be "wrong" under a symmetric
+            // NAT: harmless, since the permit is IP-only and `quic_relay`'s
+            // server `accept()`s the dialer's REAL connection. WITHHOLD (retry
+            // next netmap) until the dialer advertises a srflx — single-relay's
+            // anchor therefore depends on Phase C srflx being on for the dialer.
+            a.peer
+                .srflx_endpoints
+                .iter()
+                .filter_map(|e| e.parse().ok())
+                .find(|s: &SocketAddr| !is_lan_addr(s.ip()))?
+        } else {
+            // Both-allocate: dial the peer's relayed addr on OUR worker, else any
+            // public. NEVER LAN (see the fn doc).
+            let our_worker_ip = a.conn.local_addr().ok().map(|s| s.ip());
+            let parsed: Vec<SocketAddr> = a
+                .peer
+                .endpoints
+                .iter()
+                .filter_map(|e| e.parse().ok())
+                .collect();
+            parsed
+                .iter()
+                .find(|s| Some(s.ip()) == our_worker_ip)
+                .or_else(|| parsed.iter().find(|s| !is_lan_addr(s.ip())))
+                .copied()?
+        };
         let carrier = Carrier::relay(a.conn.clone(), dst);
         let link = ReadyLink {
             node_id: *node_id,
@@ -291,6 +365,42 @@ impl RelayCoordinator {
         Some(link)
     }
 
+    /// Phase D DIALER build: we hold NO allocation. Bind a fresh raw socket,
+    /// wrap it as a [`UdpRelayConn`](crate::transport::relay::UdpRelayConn), and
+    /// dial the anchor's advertised relay `R` — its single public, non-LAN
+    /// endpoint (srflx lives in a separate bucket, so the public entry in
+    /// `endpoints` IS `R`). `install_ready` then sends the `\x00` that opens our
+    /// NAT toward `R` and QUIC-connects (`am_server = false` by pubkey). `None`
+    /// until the anchor advertises `R` (retry next netmap).
+    fn try_build_dialer(&mut self, node_id: &ObjectId) -> Option<ReadyLink> {
+        let peer = self.dialing.get(node_id)?;
+        let r: SocketAddr = peer
+            .endpoints
+            .iter()
+            .filter_map(|e| e.parse().ok())
+            .find(|s: &SocketAddr| !is_lan_addr(s.ip()))?;
+        // Fresh raw socket, NO TURN allocation. Bind via std (sync) then adopt
+        // into the tokio reactor without awaiting, so this stays on the sync
+        // build path (`maybe_complete` is not async).
+        let std_sock = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+        std_sock.set_nonblocking(true).ok()?;
+        let sock = tokio::net::UdpSocket::from_std(std_sock).ok()?;
+        let conn: Arc<dyn RelayConn> = Arc::new(crate::transport::relay::UdpRelayConn(sock));
+        let carrier = Carrier::relay(conn.clone(), r);
+        let link = ReadyLink {
+            node_id: *node_id,
+            public_key: peer.public_key,
+            overlay_ip: peer.overlay_ip,
+            carrier,
+            relay_parts: Some((conn, r)),
+            supports_quic: peer.supports_quic,
+            subnets: peer.subnets.clone(),
+        };
+        self.dialing.remove(node_id);
+        info!(peer = %node_id, %r, "overlay relay: single-relay dialer link ready (raw → anchor R)");
+        Some(link)
+    }
+
     /// Drop all state for a peer (it left the netmap), including the relay
     /// we advertised for it — so when the peer's WG carrier is torn down
     /// (`wg.remove_peer`) and the underlying allocation closes, we stop
@@ -301,6 +411,7 @@ impl RelayCoordinator {
         self.pending.remove(node_id);
         self.allocated.remove(node_id);
         self.advertised.remove(node_id);
+        self.dialing.remove(node_id);
     }
 }
 
@@ -406,6 +517,23 @@ mod tests {
         }
     }
 
+    /// A minimal peer for the coordinator tests — override the fields a test
+    /// cares about with `..base_peer()`.
+    fn base_peer() -> PeerConfig {
+        PeerConfig {
+            public_key: [1u8; 32],
+            overlay_ip: Ipv4Addr::new(100, 64, 0, 9),
+            name: String::new(),
+            subnets: vec![],
+            endpoints: vec![],
+            lan_endpoints: vec![],
+            srflx_endpoints: vec![],
+            srflx_nat: None,
+            supports_quic: false,
+            supports_relay_single: false,
+        }
+    }
+
     #[test]
     fn turn_creds_picks_the_authed_entry() {
         let servers = vec![
@@ -475,19 +603,9 @@ mod tests {
     #[tokio::test]
     async fn request_is_idempotent_and_sends_one_relay_request() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        let mut coord = RelayCoordinator::new(tx, vec![]);
+        let mut coord = RelayCoordinator::new(tx, [0u8; 32], vec![]);
         let node = ObjectId::new();
-        let peer = PeerConfig {
-            public_key: [1u8; 32],
-            overlay_ip: Ipv4Addr::new(100, 64, 0, 9),
-            name: String::new(),
-            subnets: vec![],
-            endpoints: vec![],
-            lan_endpoints: vec![],
-            srflx_endpoints: vec![],
-            srflx_nat: None,
-            supports_quic: false,
-        };
+        let peer = base_peer();
         coord.request(node, peer.clone()).await;
         coord.request(node, peer).await; // de-duped
         assert!(coord.is_tracking(&node));
@@ -504,7 +622,7 @@ mod tests {
         // we advertised for it, or the next `OverlayEndpoints` trickle keeps
         // carrying a now-dead allocation and the peer dials it forever.
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        let mut coord = RelayCoordinator::new(tx, vec!["192.168.68.5:51820".into()]);
+        let mut coord = RelayCoordinator::new(tx, [0u8; 32], vec!["192.168.68.5:51820".into()]);
         let node = ObjectId::new();
         coord.advertised.insert(node, "94.130.141.74:11085".into());
         coord.pending.insert(
@@ -512,14 +630,7 @@ mod tests {
             PendingPeer {
                 peer: PeerConfig {
                     public_key: [2u8; 32],
-                    overlay_ip: Ipv4Addr::new(100, 64, 0, 9),
-                    name: String::new(),
-                    subnets: vec![],
-                    endpoints: vec![],
-                    lan_endpoints: vec![],
-                    srflx_endpoints: vec![],
-                    srflx_nat: None,
-                    supports_quic: false,
+                    ..base_peer()
                 },
                 ice: None,
                 pair_key: None,
@@ -607,7 +718,7 @@ mod tests {
     #[test]
     fn all_endpoints_unions_lan_and_relays() {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        let mut coord = RelayCoordinator::new(tx, vec!["192.168.68.5:51820".into()]);
+        let mut coord = RelayCoordinator::new(tx, [0u8; 32], vec!["192.168.68.5:51820".into()]);
         coord
             .advertised
             .insert(ObjectId::new(), "94.130.141.74:11085".into());
@@ -620,5 +731,121 @@ mod tests {
             eps.contains(&"94.130.141.74:11085".to_string()),
             "relay included"
         );
+    }
+
+    // ───────────────── Phase D — v1 single-relay role split ─────────────────
+
+    #[test]
+    fn single_relay_role_is_symmetric_by_pubkey() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let small = [0x00u8; 32];
+        let large = [0xFFu8; 32];
+        let peer = |pk: [u8; 32], sup: bool| PeerConfig {
+            public_key: pk,
+            supports_relay_single: sup,
+            ..base_peer()
+        };
+        // Off by default (flag captured from the unset env) → both-allocate,
+        // regardless of pubkeys.
+        let off = RelayCoordinator::new(tx.clone(), small, vec![]);
+        assert_eq!(off.single_relay_role(&peer(large, true)), None);
+
+        // Flag on + peer advertises → role decided purely by pubkey order, and
+        // the two ends are mirror images (one anchor, one dialer).
+        let mut anchor = RelayCoordinator::new(tx.clone(), small, vec![]);
+        anchor.single_relay = true;
+        assert_eq!(
+            anchor.single_relay_role(&peer(large, true)),
+            Some(true),
+            "smaller pubkey ⇒ ANCHOR"
+        );
+        let mut dialer = RelayCoordinator::new(tx, large, vec![]);
+        dialer.single_relay = true;
+        assert_eq!(
+            dialer.single_relay_role(&peer(small, true)),
+            Some(false),
+            "larger pubkey ⇒ DIALER"
+        );
+        // Flag on but the peer doesn't advertise support → both-allocate (a
+        // mixed-build pair must never split into anchor/dialer and deadlock).
+        assert_eq!(
+            anchor.single_relay_role(&peer(large, false)),
+            None,
+            "peer flag off ⇒ both-allocate"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_relay_dialer_tracks_without_request_and_builds_raw_to_anchor_r() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        // We are the DIALER: our pubkey is LARGER than the peer's, so the role
+        // resolves to Some(false).
+        let mut coord = RelayCoordinator::new(tx, [0xFFu8; 32], vec![]);
+        coord.single_relay = true; // same-module: force the opt-in on for the test
+        let node = ObjectId::new();
+        let anchor_r = "94.130.141.74:11085"; // the anchor's advertised relay R
+        let peer = PeerConfig {
+            public_key: [0x00u8; 32], // smaller than ours ⇒ the peer is the anchor
+            // The anchor's endpoints = LAN ∪ R; the sole PUBLIC one is R.
+            endpoints: vec!["192.168.1.5:51820".into(), anchor_r.into()],
+            supports_quic: true,
+            supports_relay_single: true,
+            ..base_peer()
+        };
+        // request() must NOT hit the wire for a dialer (it allocates nothing and
+        // asks for no creds — the anchor owns the relay).
+        coord.request(node, peer.clone()).await;
+        assert!(coord.is_tracking(&node), "dialer link is tracked");
+        assert!(
+            rx.try_recv().is_err(),
+            "a single-relay dialer sends NO OverlayRelayRequest"
+        );
+        // maybe_complete builds a raw carrier dialing the anchor's R (never LAN).
+        let link = coord
+            .maybe_complete(node, &peer)
+            .expect("dialer link ready once R is known");
+        assert_eq!(link.public_key, [0x00u8; 32]);
+        assert!(
+            link.supports_quic,
+            "supports_quic carries through so install_ready runs the QUIC upgrade"
+        );
+        let (_conn, dst) = link.relay_parts.expect("relay parts present");
+        assert_eq!(
+            dst,
+            anchor_r.parse().unwrap(),
+            "dialer dials the anchor's R, not its LAN endpoint"
+        );
+        assert!(
+            !coord.is_tracking(&node),
+            "a built link leaves the dialing set"
+        );
+    }
+
+    #[test]
+    fn single_relay_anchor_dst_uses_dialer_srflx_or_withholds() {
+        // The anchor's dst-selection from `try_build`, isolated: it dials the
+        // DIALER's public srflx IP (for the IP-only permit), never LAN, and
+        // WITHHOLDS (None) when the dialer has advertised no srflx yet.
+        let pick = |srflx: &[&str]| -> Option<SocketAddr> {
+            srflx
+                .iter()
+                .filter_map(|e| e.parse().ok())
+                .find(|s: &SocketAddr| !is_lan_addr(s.ip()))
+        };
+        assert_eq!(
+            pick(&["203.0.113.9:40000"]),
+            Some("203.0.113.9:40000".parse().unwrap()),
+            "public srflx ⇒ permit that IP"
+        );
+        assert_eq!(
+            pick(&["192.168.1.9:40000", "203.0.113.9:41000"]),
+            Some("203.0.113.9:41000".parse().unwrap()),
+            "skip LAN, take the public srflx"
+        );
+        assert!(
+            pick(&["192.168.1.9:40000"]).is_none(),
+            "only LAN ⇒ withhold"
+        );
+        assert!(pick(&[]).is_none(), "no srflx advertised ⇒ withhold");
     }
 }

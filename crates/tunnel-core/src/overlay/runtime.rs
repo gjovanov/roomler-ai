@@ -902,6 +902,10 @@ impl OverlayRuntime {
             // rc.142 — advertise the QUIC-over-TURN capability so the server
             // only tells a peer to attempt QUIC when BOTH ends support it.
             supports_quic: overlay_quic_enabled(),
+            // Phase D — advertise the single-relay capability (our OVERLAY_RELAY_SINGLE
+            // flag) so the server only lets a peer pick single-relay when BOTH ends
+            // opted in; a mixed pair stays on the both-allocate relay.
+            supports_relay_single: crate::overlay::direct::relay_single_enabled(),
             // Phase 1 — subnet routes we offer (admin must approve server-side).
             advertised_routes: self.advertised_routes.clone(),
         };
@@ -990,7 +994,10 @@ impl OverlayRuntime {
         let mut srflx_stun_server: Option<SocketAddr> = None;
         let mut srflx_advertised: Vec<String> = Vec::new();
         let mut srflx_my_nat: Option<String> = None;
-        if direct::srflx_enabled() {
+        // Phase D — also gather+advertise our srflx when single-relay is on (even
+        // with srflx-direct off): a single-relay DIALER advertises no relay, so
+        // the ANCHOR permits its inbound by the IP it learns from our srflx.
+        if direct::srflx_gather_active() {
             let socks = direct_ctx
                 .as_ref()
                 .map(|c| c.socks.clone())
@@ -1181,6 +1188,7 @@ impl OverlayRuntime {
             // rc.135). Empty when the direct path is off.
             CarrierMode::Relay => Some(RelayCoordinator::new(
                 self.outbound.clone(),
+                self.keypair.public.to_bytes(),
                 direct_ctx
                     .as_ref()
                     .map(|c| c.endpoints.clone())
@@ -2796,6 +2804,7 @@ mod tests {
                 relay_home: None,
                 reachable,
                 supports_quic: false,
+                supports_relay_single: false,
                 routes: vec![],
                 agent_id: None,
             }
@@ -2988,6 +2997,7 @@ mod tests {
             relay_home: None,
             reachable: true,
             supports_quic: false,
+            supports_relay_single: false,
             routes: vec![],
             agent_id: None,
         }
@@ -3107,6 +3117,7 @@ mod tests {
             relay_home: None,
             reachable: true,
             supports_quic: false,
+            supports_relay_single: false,
             routes,
             agent_id: None,
         }
@@ -3253,6 +3264,7 @@ mod tests {
             relay_home: None,
             reachable: true,
             supports_quic: false,
+            supports_relay_single: false,
             routes: vec!["192.168.5.0/24".into(), "0.0.0.0/0".into()],
             agent_id: None,
         };
