@@ -75,6 +75,7 @@ pub async fn relay_overlay_msg_from_node(
             key_epoch,
             endpoints,
             supports_quic,
+            supports_relay_single,
             advertised_routes,
             ..
         } => {
@@ -85,6 +86,7 @@ pub async fn relay_overlay_msg_from_node(
                 key_epoch,
                 endpoints,
                 supports_quic,
+                supports_relay_single,
                 advertised_routes,
             )
             .await;
@@ -120,6 +122,7 @@ async fn handle_overlay_join(
     key_epoch: u32,
     endpoints: Vec<String>,
     supports_quic: bool,
+    supports_relay_single: bool,
     advertised_routes: Vec<String>,
 ) {
     let node_ref = ident.node_ref();
@@ -171,6 +174,7 @@ async fn handle_overlay_join(
                     key_epoch,
                     &endpoints,
                     supports_quic,
+                    supports_relay_single,
                     &advertised_routes,
                 )
                 .await
@@ -209,6 +213,7 @@ async fn handle_overlay_join(
                     key_epoch,
                     endpoints,
                     supports_quic,
+                    supports_relay_single,
                     advertised_routes,
                 )
                 .await
@@ -633,6 +638,9 @@ fn to_netmap_peer(node: &OverlayNode) -> NetmapPeer {
         relay_home: node.relay_home.clone(),
         reachable: true,
         supports_quic: node.supports_quic,
+        // Phase D — surface the node's single-relay capability so a peer only
+        // picks single-relay when both ends advertise it (else both-allocate).
+        supports_relay_single: node.supports_relay_single,
         // Phase 1 — only the admin-APPROVED routes reach peers.
         routes: node.approved_routes.clone(),
         // P3b-3 — expose the backing agent id (bridging overlay-node-id →
