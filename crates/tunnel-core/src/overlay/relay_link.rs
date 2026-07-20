@@ -483,6 +483,7 @@ mod tests {
             name: String::new(),
             subnets: vec![],
             endpoints: vec![],
+            lan_endpoints: vec![],
             supports_quic: false,
         };
         coord.request(node, peer.clone()).await;
@@ -513,6 +514,7 @@ mod tests {
                     name: String::new(),
                     subnets: vec![],
                     endpoints: vec![],
+                    lan_endpoints: vec![],
                     supports_quic: false,
                 },
                 ice: None,

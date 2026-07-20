@@ -23,9 +23,9 @@ use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use boringtun::noise::{Tunn, TunnResult};
+use boringtun::noise::{Packet, Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
 use bytes::Bytes;
 use tokio::net::UdpSocket;
@@ -273,6 +273,30 @@ pub struct PeerStats {
 /// One shared map drives the single direct-socket recv loop (rc.134).
 type DemuxRoutes = HashMap<SocketAddr, (Arc<Mutex<Tunn>>, Arc<PeerStats>)>;
 
+/// Phase A — a WireGuard **handshake initiation** that arrived on a shared
+/// direct socket from a source address NO demux route matches. Two real cases
+/// produce this: a NAT'd peer dialling our advertised PUBLIC endpoint (its
+/// NAT'd source can't be known in advance — the direct-to-public accept), and
+/// an already-known peer that restarted/roamed onto a new ephemeral port (the
+/// field-observed stale-port race: its 148-byte init arrived and was silently
+/// dropped, so the handshake died until the "restart the exit last" workaround).
+/// The demux can't act on it — it has no `&mut WgDevice` — so it forwards the
+/// packet to the runtime's select loop, which authenticates it (a probe `Tunn`
+/// performs the full Noise-IK validation; `parse_handshake_anon` alone is NOT
+/// proof of identity) and only then installs/re-points the peer.
+pub struct DirectInbound {
+    pub src: SocketAddr,
+    pub sock: Arc<UdpSocket>,
+    pub packet: Vec<u8>,
+}
+
+/// Phase A — min interval between forwarded unknown-source initiations from
+/// the SAME source, and the cap on tracked sources. WG retransmits an
+/// unanswered init every ~5 s, so 2 s forwards every genuine attempt while a
+/// junk flood collapses to ≤1 event per source per 2 s (and ≤64 sources).
+const UNKNOWN_INIT_MIN_INTERVAL: Duration = Duration::from_secs(2);
+const UNKNOWN_INIT_MAX_SOURCES: usize = 64;
+
 /// One installed peer: its `Tunn`, its carrier, and the background tasks
 /// that pump it. Dropping aborts the tasks.
 struct Peer {
@@ -326,6 +350,11 @@ pub struct WgDevice {
     /// rc.134 — the shared direct-LAN socket + demux loop, lazily created on
     /// the first direct peer (`ensure_direct_demux`). `None` until then.
     direct: Option<DirectDemux>,
+    /// Phase A — unknown-source handshake initiations forwarded by the demux
+    /// loops. The sender is cloned into each demux loop; the receiver is taken
+    /// once by the runtime ([`take_direct_events`](Self::take_direct_events)).
+    direct_events_tx: mpsc::Sender<DirectInbound>,
+    direct_events_rx: Option<mpsc::Receiver<DirectInbound>>,
 }
 
 impl Drop for WgDevice {
@@ -345,6 +374,7 @@ impl WgDevice {
     pub fn new(secret: StaticSecret) -> (Self, mpsc::Receiver<Vec<u8>>) {
         let public = PublicKey::from(&secret);
         let (tun_tx, tun_rx) = mpsc::channel(256);
+        let (direct_events_tx, direct_events_rx) = mpsc::channel(16);
         (
             Self {
                 secret,
@@ -354,9 +384,74 @@ impl WgDevice {
                 tun_tx,
                 next_index: 1,
                 direct: None,
+                direct_events_tx,
+                direct_events_rx: Some(direct_events_rx),
             },
             tun_rx,
         )
+    }
+
+    /// Phase A — take the receiver for unknown-source handshake initiations
+    /// (see [`DirectInbound`]). `None` after the first take. A device whose
+    /// receiver is never taken just drops events once the small channel fills
+    /// (`try_send` in the demux) — harmless for tests that don't care.
+    pub fn take_direct_events(&mut self) -> Option<mpsc::Receiver<DirectInbound>> {
+        self.direct_events_rx.take()
+    }
+
+    /// Phase A — the demux source address a SHARED-direct peer is currently
+    /// registered under (`None` for relay/dedicated-socket peers or unknown
+    /// pubkeys). Lets the runtime tell a duplicate event for an
+    /// already-current source from a genuine roam to a new one.
+    pub fn direct_src_of(&self, peer_public: &[u8; 32]) -> Option<SocketAddr> {
+        self.peers.get(peer_public)?.direct_src
+    }
+
+    /// Phase A — EXTRACT + AUTHENTICATE a WireGuard handshake INITIATION with
+    /// no per-peer state, returning the initiator's static public key **only if
+    /// the init is cryptographically genuine**. Used by the runtime before it
+    /// acts on a [`DirectInbound`] (installs / re-points a peer's carrier to the
+    /// packet's source), so a forger can't hijack a peer's route.
+    ///
+    /// Two steps, because they prove different things:
+    /// 1. `parse_handshake_anon` decrypts the *claimed* static — but a forger
+    ///    who copies a victim's PUBLIC key (public data) can craft an init that
+    ///    parses to that key (the encrypted-static key derives from the
+    ///    initiator's own ephemeral + our public static, both attacker-known).
+    ///    So the parsed key is a CLAIM, not proof.
+    /// 2. A throwaway [`Tunn`] built with that claimed key decapsulates the
+    ///    init: WireGuard also AEAD-seals the timestamp under a key derived from
+    ///    `DH(our_static_priv, initiator_static_pub)`. Only the holder of the
+    ///    claimed key's PRIVATE half computes the matching
+    ///    `DH(initiator_static_priv, our_static_pub)`; a forger cannot, so the
+    ///    timestamp open fails and `decapsulate` returns `Done`/`Err`. A genuine
+    ///    init yields a `WriteToNetwork` handshake RESPONSE ⇒ authenticated.
+    ///
+    /// The probe Tunn's response is discarded; the real installed Tunn re-runs
+    /// the same init and emits the response that reaches the peer (each Tunn has
+    /// independent anti-replay state, so the re-run isn't rejected).
+    pub fn authenticate_init(&self, init: &[u8]) -> Option<[u8; 32]> {
+        let claimed = {
+            let Ok(Packet::HandshakeInit(hi)) = Tunn::parse_incoming_packet(init) else {
+                return None;
+            };
+            boringtun::noise::handshake::parse_handshake_anon(&self.secret, &self.public, &hi)
+                .ok()?
+                .peer_static_public
+        };
+        let mut probe = Tunn::new(
+            self.secret.clone(),
+            PublicKey::from(claimed),
+            None,
+            None,
+            0,
+            None,
+        );
+        let mut out = vec![0u8; WG_BUF];
+        match probe.decapsulate(None, init, &mut out) {
+            TunnResult::WriteToNetwork(_) => Some(claimed),
+            _ => None,
+        }
     }
 
     /// This node's public key.
@@ -477,9 +572,34 @@ impl WgDevice {
         {
             return;
         }
-        let task = tokio::spawn(run_direct_demux(sock.clone(), demux.routes.clone(), tun_tx));
+        let task = tokio::spawn(run_direct_demux(
+            sock.clone(),
+            demux.routes.clone(),
+            tun_tx,
+            self.direct_events_tx.clone(),
+        ));
         demux.socks.push(sock);
         demux.tasks.push(task);
+    }
+
+    /// Phase A — process ONE datagram for an already-registered direct route
+    /// (the runtime calls this right after installing/re-pointing a peer from a
+    /// [`DirectInbound`] event, so the very initiation that triggered the event
+    /// is answered immediately instead of waiting ~5 s for the initiator's
+    /// retransmit). No-op if `src` has no route (nothing was installed).
+    pub async fn feed_direct(&self, src: SocketAddr, sock: Arc<UdpSocket>, packet: &[u8]) {
+        let Some(demux) = &self.direct else {
+            return;
+        };
+        let entry = demux.routes.lock().await.get(&src).cloned();
+        let Some((tunn, stats)) = entry else {
+            return;
+        };
+        let reply = Carrier::Direct { sock, dst: src };
+        let mut buf = packet.to_vec();
+        let n = buf.len();
+        let mut t = tunn.lock().await;
+        process_inbound(&mut t, n, &mut buf, &reply, &self.tun_tx, &stats).await;
     }
 
     /// rc.134 — install a peer reached over the SHARED direct socket. Its
@@ -745,8 +865,12 @@ async fn run_direct_demux(
     sock: Arc<UdpSocket>,
     routes: Arc<Mutex<DemuxRoutes>>,
     tun_tx: mpsc::Sender<Vec<u8>>,
+    events: mpsc::Sender<DirectInbound>,
 ) {
     let mut buf = vec![0u8; WG_BUF];
+    // Phase A — per-source rate limit for forwarded unknown-source initiations
+    // (local to this loop task: no lock needed, one map per interface socket).
+    let mut recent_unknown: HashMap<SocketAddr, Instant> = HashMap::new();
     loop {
         let (n, src) = match sock.recv_from(&mut buf).await {
             Ok(v) => v,
@@ -760,8 +884,32 @@ async fn run_direct_demux(
         // contended only briefly.
         let entry = routes.lock().await.get(&src).cloned();
         let Some((tunn, stats)) = entry else {
-            // No direct peer for this source — a peer not yet registered, or
-            // stray noise. Drop it.
+            // Phase A — an UNKNOWN source is no longer unconditionally dropped:
+            // if the datagram is a well-formed WG handshake INITIATION, forward
+            // it to the runtime (a NAT'd peer dialling our public endpoint, or
+            // a known peer that restarted onto a new port — the stale-port
+            // race). The runtime authenticates before acting; rate-limited so
+            // a junk flood can't churn the channel. Anything else from an
+            // unknown source stays dropped.
+            if matches!(
+                Tunn::parse_incoming_packet(&buf[..n]),
+                Ok(Packet::HandshakeInit(_))
+            ) {
+                if recent_unknown.len() >= UNKNOWN_INIT_MAX_SOURCES {
+                    recent_unknown.retain(|_, t| t.elapsed() < UNKNOWN_INIT_MIN_INTERVAL);
+                }
+                let fresh = recent_unknown
+                    .get(&src)
+                    .is_none_or(|t| t.elapsed() >= UNKNOWN_INIT_MIN_INTERVAL);
+                if fresh && recent_unknown.len() < UNKNOWN_INIT_MAX_SOURCES {
+                    recent_unknown.insert(src, Instant::now());
+                    let _ = events.try_send(DirectInbound {
+                        src,
+                        sock: sock.clone(),
+                        packet: buf[..n].to_vec(),
+                    });
+                }
+            }
             continue;
         };
         let reply = Carrier::Direct {
@@ -1342,5 +1490,111 @@ mod tests {
         // not a session death — so the sweep keeps using the rx-flat heuristic.
         let _ = carrier.send(b"x").await;
         assert!(!carrier.is_dead());
+    }
+
+    /// Phase A — `authenticate_init` extracts + AUTHENTICATES an inbound
+    /// handshake initiation with no per-peer state: it must accept a genuine
+    /// init (yielding the initiator's real key), and reject one sealed to a
+    /// DIFFERENT responder (a forger can't have produced it) plus any garbage.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn authenticate_init_accepts_genuine_rejects_misaddressed_and_garbage() {
+        let a = WgKeypair::generate();
+        let b = WgKeypair::generate();
+        let c = WgKeypair::generate();
+        let (dev_b, _rx_b) = WgDevice::new(b.secret.clone());
+        let (dev_c, _rx_c) = WgDevice::new(c.secret.clone());
+
+        // A genuine init from A, sealed to B's static public key.
+        let mut tunn_ab = Tunn::new(a.secret.clone(), b.public, None, None, 1, None);
+        let mut buf = vec![0u8; WG_BUF];
+        let init = match tunn_ab.format_handshake_initiation(&mut buf, false) {
+            TunnResult::WriteToNetwork(bytes) => bytes.to_vec(),
+            _ => panic!("expected a handshake initiation"),
+        };
+
+        // B is the intended responder → authenticates it, recovering A's key.
+        assert_eq!(dev_b.authenticate_init(&init), Some(a.public.to_bytes()));
+        // C is NOT the intended responder → the init's DHs don't resolve under
+        // C's secret, so the timestamp AEAD fails ⇒ rejected.
+        assert_eq!(dev_c.authenticate_init(&init), None);
+        // Garbage (right-length + short) is rejected, never panics.
+        assert_eq!(dev_b.authenticate_init(&[0u8; 148]), None);
+        assert_eq!(dev_b.authenticate_init(b"short"), None);
+    }
+
+    /// Phase A CORE — a CLIENT dials a HUB's endpoint and the HUB, which never
+    /// dials back (`initiate=false`), completes the handshake purely by
+    /// ACCEPTING the inbound init its demux forwarded as a [`DirectInbound`]
+    /// event (the exit-side accept: the HUB can't know a NAT'd client's source
+    /// ahead of time). Proves single-initiator direct works + data flows.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn public_direct_single_initiator_accept_via_inbound_event() {
+        let hub = WgKeypair::generate();
+        let client = WgKeypair::generate();
+        let sock_hub = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sock_client = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let hub_addr = sock_hub.local_addr().unwrap();
+        let client_addr = sock_client.local_addr().unwrap();
+
+        let (mut dev_hub, mut rx_hub) = WgDevice::new(hub.secret.clone());
+        let (mut dev_client, _rx_client) = WgDevice::new(client.secret.clone());
+
+        // HUB: start the demux loop eagerly (as the runtime does when the tier
+        // is on) and take the inbound-init receiver.
+        dev_hub.ensure_direct_demux(sock_hub.clone());
+        let mut events = dev_hub.take_direct_events().unwrap();
+
+        // CLIENT dials HUB (initiate=true), keyed by HUB's addr (IP_B = hub).
+        dev_client.ensure_direct_demux(sock_client.clone());
+        dev_client
+            .add_direct_peer(
+                sock_client.clone(),
+                hub.public.to_bytes(),
+                IP_B,
+                hub_addr,
+                true,
+            )
+            .await;
+
+        // HUB receives the init as an event from CLIENT's (unregistered) source.
+        let inb = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("no inbound-init event")
+            .expect("event channel closed");
+        assert_eq!(inb.src, client_addr, "event carries the client's source");
+        assert_eq!(
+            dev_hub.authenticate_init(&inb.packet),
+            Some(client.public.to_bytes()),
+            "the forwarded init authenticates to the client's key"
+        );
+
+        // HUB installs the client direct (initiate=false — it only responds),
+        // keyed by the init's source, then feeds the init so the response goes
+        // out immediately (IP_A = client).
+        dev_hub
+            .add_direct_peer(
+                inb.sock.clone(),
+                client.public.to_bytes(),
+                IP_A,
+                inb.src,
+                false,
+            )
+            .await;
+        dev_hub
+            .feed_direct(inb.src, inb.sock.clone(), &inb.packet)
+            .await;
+
+        // Both ends complete the handshake single-initiator.
+        wait_connected(&dev_client, &hub.public.to_bytes()).await;
+        wait_connected(&dev_hub, &client.public.to_bytes()).await;
+
+        // CLIENT → HUB data arrives decrypted.
+        let pkt = synthetic_ipv4(IP_A, IP_B, b"hello-public-direct");
+        send_until_ok(&dev_client, &hub.public.to_bytes(), &pkt).await;
+        let got = tokio::time::timeout(Duration::from_secs(15), rx_hub.recv())
+            .await
+            .expect("HUB never received the decrypted packet")
+            .expect("tun channel closed");
+        assert_eq!(got, pkt, "decrypted IP packet must arrive intact");
     }
 }

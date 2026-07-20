@@ -53,6 +53,44 @@ struct DirectCtx {
     socks: Vec<(Ipv4Addr, Arc<UdpSocket>)>,
     my_ips: Vec<Ipv4Addr>,
     endpoints: Vec<String>,
+    /// Phase A (`public_direct_enabled`) — a single `0.0.0.0:0` socket used to
+    /// DIAL a peer's public endpoint. Unbound to any interface so the OS routing
+    /// table picks the egress NIC for each public destination (a per-interface
+    /// socket bound to a private LAN IP would need us to know which NIC holds
+    /// the default route on a multi-homed host). Its demux loop catches the
+    /// exit's replies (keyed by the exit's public source). `None` when the
+    /// public-direct tier is off. We do NOT advertise this socket's address (a
+    /// peer reaches US on our per-interface PUBLIC socket, already advertised in
+    /// `endpoints` since a public NIC IP passes `is_usable_lan_ipv4`).
+    public_sock: Option<Arc<UdpSocket>>,
+}
+
+/// CC1 (NAT-traversal plan) — per-peer direct-carrier failure bookkeeping, kept
+/// **split by tier** so a failing public-direct attempt can NEVER poison the
+/// proven same-LAN direct path (or vice-versa). Each tier has its own retry
+/// cooldown + consecutive-failure count; the escalation rule
+/// ([`direct_retry_cooldown`]) is shared. The original code threaded two bare
+/// maps; folding the second tier into a struct keeps the hot-path signatures
+/// from growing another pair of args.
+#[derive(Default)]
+struct DirectCooldowns {
+    /// Same-LAN direct tier (rc.136) — `until`-instant per peer.
+    lan: HashMap<ObjectId, Instant>,
+    /// Same-LAN direct consecutive-failure count (VPN-pool false /24 detector).
+    lan_fails: HashMap<ObjectId, u32>,
+    /// Public-direct tier (Phase A) — `until`-instant per peer. A firewalled /
+    /// unreachable public endpoint escalates to the session-sticky deny exactly
+    /// like the LAN tier, but on its OWN counter.
+    public: HashMap<ObjectId, Instant>,
+    /// Public-direct consecutive-failure count.
+    public_fails: HashMap<ObjectId, u32>,
+}
+
+impl DirectCooldowns {
+    /// Is `nid` currently cooling down on the given tier?
+    fn cooling(map: &HashMap<ObjectId, Instant>, nid: &ObjectId, now: Instant) -> bool {
+        map.get(nid).is_some_and(|&until| until > now)
+    }
 }
 
 /// An installed peer carrier + the bookkeeping the direct→relay fallback
@@ -84,6 +122,16 @@ struct Installed {
     /// whether a relay pair is same-worker (IPs equal) or cross-worker.
     relay_local: Option<std::net::SocketAddr>,
     relay_dst: Option<std::net::SocketAddr>,
+    /// Phase A — for a PUBLIC-DIRECT carrier, the peer's public `ip:port` we
+    /// dial (or that we accepted an inbound dial from). `None` for a same-LAN
+    /// direct carrier or a relay carrier. Two loads ride on this: (1) it marks
+    /// the carrier as the public-direct tier for the health sweep's tier-split
+    /// fallback (CC1), and (2) it is a MANDATORY exit-node exemption — a
+    /// public-direct dst is a real internet address reached via the default
+    /// route, NOT on-link like a same-LAN peer, so the split-default `/1`s would
+    /// capture the very path to the exit and self-wedge unless its IP is pinned
+    /// via the original gateway (see [`exit_exemption_set`]).
+    public_direct_dst: Option<std::net::SocketAddr>,
 }
 
 /// Grace after install before the fallback can fire — lets the bilateral
@@ -389,10 +437,13 @@ fn peer_is_approved_exit(peer: &NetmapPeer) -> bool {
 
 /// P5 — the carrier-critical endpoint IPs that MUST bypass the split-default
 /// (pinned via the ORIGINAL gateway) for the mesh to survive exit routing: the
-/// coordination server's resolved IPs, plus every live RELAY carrier's coturn
-/// worker IPs (both our own allocation `relay_local` and the peer's `relay_dst`).
-/// A DIRECT carrier is same-subnet / on-link (a connected route more specific
-/// than a `/1`), so it needs no exemption. Pure, so the set arithmetic is
+/// coordination server's resolved IPs, every live RELAY carrier's coturn worker
+/// IPs (both our own allocation `relay_local` and the peer's `relay_dst`), AND
+/// (Phase A) every PUBLIC-DIRECT carrier's peer address. A SAME-LAN direct
+/// carrier is on-link (a connected route more specific than a `/1`), so it needs
+/// no exemption — but a public-direct carrier crosses the internet via the
+/// default route, so without pinning its dst the split-default would swallow the
+/// path to the exit itself and self-wedge. Pure, so the set arithmetic is
 /// unit-tested against synthetic carriers.
 fn exit_exemption_set(
     server_ips: &[IpAddr],
@@ -404,6 +455,9 @@ fn exit_exemption_set(
             set.insert(a.ip());
         }
         if let Some(a) = inst.relay_dst {
+            set.insert(a.ip());
+        }
+        if let Some(a) = inst.public_direct_dst {
             set.insert(a.ip());
         }
     }
@@ -710,15 +764,36 @@ impl OverlayRuntime {
 
         // node_id → installed carrier (pubkey/IP/kind/install-time).
         let mut by_node: HashMap<ObjectId, Installed> = HashMap::new();
-        // rc.136 — peers whose DIRECT carrier just failed: don't retry direct
-        // until the Instant (they stay on relay). Auto-expires → direct retried.
-        let mut direct_cooldown: HashMap<ObjectId, Instant> = HashMap::new();
-        // Per-peer consecutive direct-failure count. Escalates the cooldown to
-        // session-sticky after DIRECT_MAX_FAILURES so a VPN-pool false /24 match
-        // can't flap the working relay forever (see `direct_retry_cooldown`).
-        let mut direct_fail_count: HashMap<ObjectId, u32> = HashMap::new();
+        // rc.136 + CC1 — peers whose DIRECT carrier just failed: don't retry
+        // that tier until its `until` Instant (they stay on relay). Split by
+        // tier (LAN / public) so a public-direct failure never poisons the
+        // proven same-LAN path; each tier auto-expires → direct retried, and
+        // escalates to a session-sticky deny after DIRECT_MAX_FAILURES (a
+        // VPN-pool false /24, or a persistently-firewalled public endpoint).
+        let mut cooldowns = DirectCooldowns::default();
         // rc.139 — peers whose stale relay was just refreshed (anti-ping-pong).
         let mut relay_refresh_cooldown: HashMap<ObjectId, Instant> = HashMap::new();
+        // Phase A — receiver for AUTHENTICATED inbound direct handshakes (a
+        // NAT'd client dialing our public endpoint, or a known peer that roamed
+        // to a new ephemeral port — the field-observed stale-port race). Only
+        // wired when the public-direct tier is on (CC8 flag-gate); the demux
+        // loops for our own sockets are started EAGERLY here so an inbound INIT
+        // is read even before any peer is installed (an exit with no other
+        // direct peers would otherwise never spawn a recv loop for its public
+        // socket).
+        let mut direct_events = if direct_ctx.is_some() && direct::public_direct_enabled() {
+            if let Some(ctx) = &direct_ctx {
+                for (_ip, s) in &ctx.socks {
+                    wg.ensure_direct_demux(s.clone());
+                }
+                if let Some(ps) = &ctx.public_sock {
+                    wg.ensure_direct_demux(ps.clone());
+                }
+            }
+            wg.take_direct_events()
+        } else {
+            None
+        };
         // Latest netmap view (node_id → peer), so the fallback sweep can drive
         // the relay path for a downgraded peer without waiting for a netmap.
         let mut current_peers: HashMap<ObjectId, NetmapPeer> =
@@ -808,7 +883,7 @@ impl OverlayRuntime {
             &tun,
             &first_peers,
             direct_ctx.as_ref(),
-            &direct_cooldown,
+            &cooldowns,
         )
         .await;
         // P5 exit-node — default-route capture state, reconciled after every
@@ -860,8 +935,7 @@ impl OverlayRuntime {
                 _ = fallback.tick() => {
                     self.sweep_carrier_health(
                         &mut wg, &mut by_node, &mut relay, &tun,
-                        &mut direct_cooldown, &mut direct_fail_count,
-                        &mut relay_refresh_cooldown, &current_peers,
+                        &mut cooldowns, &mut relay_refresh_cooldown, &current_peers,
                     ).await;
                     // A carrier flip may have changed the coturn worker set or
                     // the exit peer's reachability — re-reconcile exit routing
@@ -895,19 +969,39 @@ impl OverlayRuntime {
                         }
                     }
                 },
+                // Phase A — an authenticated inbound direct handshake initiation
+                // forwarded by a demux loop (a NAT'd client dialing our public
+                // endpoint, or a peer roaming to a new port). `pending()` when
+                // the public-direct tier is off, so this branch is inert on the
+                // fleet default.
+                maybe_init = async {
+                    match direct_events.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending::<Option<super::wg::DirectInbound>>().await,
+                    }
+                } => {
+                    if let Some(inb) = maybe_init {
+                        self.handle_direct_inbound(
+                            &mut wg, &mut by_node, &mut relay, &tun,
+                            &current_peers, &cooldowns, inb,
+                        ).await;
+                        self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
+                        self.publish_view(&self_ip, &by_node, &current_peers, exit_node_status(self.exit_node.as_deref(), &exit_state));
+                    }
+                },
                 evt = events.recv() => match evt {
                     // Re-sync: install any newly-listed peers (deltas drive
                     // removals; a full diff/prune is a later refinement).
                     Some(OverlayEvent::Netmap { peers, .. }) => {
                         current_peers = peers.iter().map(|p| (p.node_id, p.clone())).collect();
                         if let Some(names) = &dns_names { sync_name_map(names, &current_peers).await; }
-                        self.install_peers(&mut wg, &mut by_node, &mut relay, &tun, &peers, direct_ctx.as_ref(), &direct_cooldown).await;
+                        self.install_peers(&mut wg, &mut by_node, &mut relay, &tun, &peers, direct_ctx.as_ref(), &cooldowns).await;
                         self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
                         self.publish_view(&self_ip, &by_node, &current_peers, exit_node_status(self.exit_node.as_deref(), &exit_state));
                     }
                     Some(OverlayEvent::NetmapDelta { upserts, removes }) => {
                         for p in &upserts { current_peers.insert(p.node_id, p.clone()); }
-                        self.install_peers(&mut wg, &mut by_node, &mut relay, &tun, &upserts, direct_ctx.as_ref(), &direct_cooldown).await;
+                        self.install_peers(&mut wg, &mut by_node, &mut relay, &tun, &upserts, direct_ctx.as_ref(), &cooldowns).await;
                         for node_id in removes {
                             current_peers.remove(&node_id);
                             if let Some(e) = by_node.remove(&node_id) {
@@ -970,14 +1064,13 @@ impl OverlayRuntime {
         by_node: &mut HashMap<ObjectId, Installed>,
         relay: &mut Option<RelayCoordinator>,
         tun: &Arc<dyn TunIo>,
-        direct_cooldown: &mut HashMap<ObjectId, Instant>,
-        direct_fail_count: &mut HashMap<ObjectId, u32>,
+        cooldowns: &mut DirectCooldowns,
         relay_refresh_cooldown: &mut HashMap<ObjectId, Instant>,
         current_peers: &HashMap<ObjectId, NetmapPeer>,
     ) {
         let now = Instant::now();
-        // (node_id, was_direct, hard_dead)
-        let mut dead: Vec<(ObjectId, bool, bool)> = Vec::new();
+        // (node_id, was_direct, was_public_direct, hard_dead)
+        let mut dead: Vec<(ObjectId, bool, bool, bool)> = Vec::new();
         for (nid, e) in by_node.iter_mut() {
             let Some((tx, rx)) = wg.peer_traffic(&e.pubkey) else {
                 continue;
@@ -1011,9 +1104,14 @@ impl OverlayRuntime {
                 // A direct carrier that's actually RECEIVING is genuinely
                 // healthy → clear its strike count so old failures don't
                 // accumulate across a long healthy period and prematurely pin a
-                // real-LAN peer to relay. (rx advancing, not just idle.)
+                // real peer to relay. (rx advancing, not just idle.) Clear the
+                // count on the carrier's OWN tier (CC1 — never cross-clear).
                 if e.is_direct && rx > last_rx {
-                    direct_fail_count.remove(nid);
+                    if e.public_direct_dst.is_some() {
+                        cooldowns.public_fails.remove(nid);
+                    } else {
+                        cooldowns.lan_fails.remove(nid);
+                    }
                 }
             }
             if e.bad_sweeps >= BAD_SWEEPS_TO_FALLBACK || hard_dead {
@@ -1025,33 +1123,40 @@ impl OverlayRuntime {
                 {
                     continue;
                 }
-                dead.push((*nid, e.is_direct, hard_dead));
+                dead.push((*nid, e.is_direct, e.public_direct_dst.is_some(), hard_dead));
             }
         }
-        for (nid, was_direct, hard_dead) in dead {
+        for (nid, was_direct, was_public_direct, hard_dead) in dead {
             let Some(e) = by_node.remove(&nid) else {
                 continue;
             };
             wg.remove_peer(&e.pubkey).await;
             tun.del_peer_route(e.overlay_ip).await;
             if was_direct {
-                // Escalating cooldown: after DIRECT_MAX_FAILURES consecutive
-                // failures, pin this peer to relay for the session — the "same
-                // /24" was a VPN client pool, not a reachable LAN, so retrying
-                // direct just flaps the working relay.
-                let fails = direct_fail_count.entry(nid).or_insert(0);
+                // Escalating cooldown on the carrier's OWN tier (CC1). LAN: the
+                // "same /24" was a VPN client pool, not a reachable LAN. Public:
+                // the peer's advertised public endpoint isn't actually reachable
+                // (host firewall / not truly public). Either way, after
+                // DIRECT_MAX_FAILURES consecutive failures pin this peer to relay
+                // for the session so a false match can't flap the working relay.
+                let (count_map, cooldown_map, tier) = if was_public_direct {
+                    (&mut cooldowns.public_fails, &mut cooldowns.public, "public")
+                } else {
+                    (&mut cooldowns.lan_fails, &mut cooldowns.lan, "LAN")
+                };
+                let fails = count_map.entry(nid).or_insert(0);
                 *fails += 1;
                 let sticky = *fails >= DIRECT_MAX_FAILURES;
-                direct_cooldown.insert(nid, now + direct_retry_cooldown(*fails));
+                cooldown_map.insert(nid, now + direct_retry_cooldown(*fails));
                 if sticky {
                     warn!(
-                        peer = %nid, fails = *fails,
-                        "overlay: direct LAN carrier failed repeatedly (VPN client-isolation / AP-isolation?) — pinning this peer to relay for the session"
+                        peer = %nid, tier, fails = *fails,
+                        "overlay: direct carrier failed repeatedly — pinning this peer to relay for the session"
                     );
                 } else {
                     warn!(
-                        peer = %nid,
-                        "overlay: direct LAN carrier didn't establish (VPN / AP-isolation / firewall?) — falling back to relay"
+                        peer = %nid, tier,
+                        "overlay: direct carrier didn't establish (firewall / VPN / AP-isolation?) — falling back to relay"
                     );
                 }
             } else {
@@ -1134,10 +1239,30 @@ impl OverlayRuntime {
             endpoints = ?endpoints,
             "overlay: advertising direct LAN endpoints (per-interface sockets; same-subnet peers dial direct)"
         );
+        // Phase A — a single unbound socket to DIAL peers' public endpoints
+        // (the OS picks egress per-destination). Best-effort: a bind failure
+        // just leaves the public-direct tier off (relay still works).
+        let public_sock = if direct::public_direct_enabled() {
+            match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await {
+                Ok(s) => {
+                    info!(
+                        "overlay: public-direct tier ON — dialing peers' public endpoints (NAT-traversal Phase A)"
+                    );
+                    Some(Arc::new(s))
+                }
+                Err(e) => {
+                    warn!(%e, "overlay: public-direct egress socket bind failed; tier off");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         Some(DirectCtx {
             socks,
             my_ips,
             endpoints,
+            public_sock,
         })
     }
 
@@ -1159,33 +1284,45 @@ impl OverlayRuntime {
         tun: &Arc<dyn TunIo>,
         peers: &[NetmapPeer],
         direct_ctx: Option<&DirectCtx>,
-        direct_cooldown: &HashMap<ObjectId, Instant>,
+        cooldowns: &DirectCooldowns,
     ) {
+        let now = Instant::now();
         for np in peers {
             let Some(cfg) = peer_config_from_netmap(np) else {
                 continue;
             };
-            // rc.136 — suppress direct while this peer is cooling down from a
-            // failed direct carrier (treat as if it had no same-subnet endpoint
-            // → relay). Expired entries fall through, so direct is retried.
-            let in_cooldown = direct_cooldown
-                .get(&np.node_id)
-                .is_some_and(|&until| until > Instant::now());
-            // A same-subnet direct endpoint for this peer, if any (Relay mode +
-            // direct enabled + not cooling down + the peer advertised one on
-            // one of our subnets).
-            let direct_dst = if in_cooldown {
+            // rc.136 + CC1 — suppress a direct TIER while this peer is cooling
+            // down from a failure on THAT tier (treat as if no such endpoint →
+            // fall through). Expired entries lapse, so the tier is retried. LAN
+            // and public cooldowns are independent.
+            let lan_cooling = DirectCooldowns::cooling(&cooldowns.lan, &np.node_id, now);
+            let public_cooling = DirectCooldowns::cooling(&cooldowns.public, &np.node_id, now);
+            // A same-subnet LAN endpoint for this peer (highest-priority tier).
+            let direct_dst = if lan_cooling {
                 None
             } else {
                 direct_ctx
                     .and_then(|ctx| direct::pick_same_subnet_endpoint(&ctx.my_ips, &cfg.endpoints))
             };
+            // Phase A — a PUBLIC endpoint from the peer's join-time NIC bucket,
+            // dialable directly (no STUN) when the peer's NIC holds a public IP.
+            // Requires the public-egress socket (public-direct tier on) and no
+            // public-tier cooldown. Second-priority, after LAN direct.
+            let public_dst = if public_cooling {
+                None
+            } else {
+                direct_ctx.and_then(|ctx| {
+                    ctx.public_sock
+                        .as_ref()
+                        .and_then(|_| direct::pick_public_endpoint(&ctx.my_ips, &cfg.lan_endpoints))
+                })
+            };
 
             match by_node.get(&np.node_id).map(|e| (e.is_direct, e.pubkey)) {
-                Some((true, _)) => continue, // already direct
+                Some((true, _)) => continue, // already direct (LAN or public)
                 Some((false, pk)) => {
-                    // Installed on RELAY — upgrade to direct now that a
-                    // same-subnet endpoint has appeared (re-evaluation).
+                    // Installed on RELAY — upgrade to a direct tier now that an
+                    // endpoint has appeared. LAN wins over public.
                     if let (Some(ctx), Some((local_ip, dst))) = (direct_ctx, direct_dst) {
                         info!(peer = %np.node_id, %dst, "overlay: upgrading relay peer to direct LAN carrier");
                         wg.remove_peer(&pk).await;
@@ -1193,6 +1330,14 @@ impl OverlayRuntime {
                             r.forget(&np.node_id);
                         }
                         self.install_direct(wg, by_node, tun, ctx, np.node_id, &cfg, local_ip, dst)
+                            .await;
+                    } else if let (Some(ctx), Some(dst)) = (direct_ctx, public_dst) {
+                        info!(peer = %np.node_id, %dst, "overlay: upgrading relay peer to direct-to-public carrier");
+                        wg.remove_peer(&pk).await;
+                        if let Some(r) = relay.as_mut() {
+                            r.forget(&np.node_id);
+                        }
+                        self.install_public_direct(wg, by_node, tun, ctx, np.node_id, &cfg, dst)
                             .await;
                     }
                     continue;
@@ -1224,13 +1369,21 @@ impl OverlayRuntime {
                 }
                 CarrierMode::Relay => {
                     if let (Some(ctx), Some((local_ip, dst))) = (direct_ctx, direct_dst) {
-                        // Same-subnet → direct, skip the relay. Forget any
+                        // Same-subnet → LAN direct, skip the relay. Forget any
                         // pending relay request so a late grant can't later
                         // clobber the direct carrier.
                         if let Some(r) = relay.as_mut() {
                             r.forget(&np.node_id);
                         }
                         self.install_direct(wg, by_node, tun, ctx, np.node_id, &cfg, local_ip, dst)
+                            .await;
+                    } else if let (Some(ctx), Some(dst)) = (direct_ctx, public_dst) {
+                        // Phase A — peer's NIC is public: dial it directly, skip
+                        // the relay. Same forget-the-pending-relay guard.
+                        if let Some(r) = relay.as_mut() {
+                            r.forget(&np.node_id);
+                        }
+                        self.install_public_direct(wg, by_node, tun, ctx, np.node_id, &cfg, dst)
                             .await;
                     } else if let Some(coord) = relay.as_mut() {
                         if let Some(link) = coord.maybe_complete(np.node_id, &cfg) {
@@ -1286,6 +1439,7 @@ impl OverlayRuntime {
                 last_rx_at: Instant::now(),
                 relay_local: None,
                 relay_dst: None,
+                public_direct_dst: None,
             },
         );
         if let Err(e) = tun.add_peer_route(cfg.overlay_ip).await {
@@ -1296,6 +1450,156 @@ impl OverlayRuntime {
         self.install_subnets(wg, tun, node_id, cfg.public_key, &cfg.subnets)
             .await;
         info!(peer = %node_id, overlay_ip = %cfg.overlay_ip, %dst, "overlay: direct LAN carrier (same subnet) — skipping relay");
+    }
+
+    /// Phase A — install a peer over the **direct-to-public** carrier: dial its
+    /// public NIC endpoint over the shared `public_sock` (a `0.0.0.0` socket, so
+    /// the OS picks the egress NIC per-destination), demuxed by source like any
+    /// direct peer. Bilateral init (a direct carrier initiates on both ends,
+    /// `install_ready` semantics — the peer either dials us back symmetrically
+    /// or, if NAT'd, accepts our dial and replies over the mapping our INIT
+    /// opened). Records `public_direct_dst` so the health sweep tiers it and the
+    /// exit-node exemption pins its IP (never self-wedge).
+    #[allow(clippy::too_many_arguments)]
+    async fn install_public_direct(
+        &self,
+        wg: &mut WgDevice,
+        by_node: &mut HashMap<ObjectId, Installed>,
+        tun: &Arc<dyn TunIo>,
+        ctx: &DirectCtx,
+        node_id: ObjectId,
+        cfg: &PeerConfig,
+        dst: std::net::SocketAddr,
+    ) {
+        let Some(sock) = ctx.public_sock.clone() else {
+            warn!(peer = %node_id, "overlay: public-direct requested but no egress socket; skipping");
+            return;
+        };
+        wg.ensure_direct_demux(sock.clone());
+        wg.add_direct_peer(sock, cfg.public_key, cfg.overlay_ip, dst, true)
+            .await;
+        by_node.insert(
+            node_id,
+            Installed {
+                pubkey: cfg.public_key,
+                overlay_ip: cfg.overlay_ip,
+                is_direct: true,
+                since: Instant::now(),
+                last_traffic: (0, 0),
+                bad_sweeps: 0,
+                last_rx_at: Instant::now(),
+                relay_local: None,
+                relay_dst: None,
+                public_direct_dst: Some(dst),
+            },
+        );
+        if let Err(e) = tun.add_peer_route(cfg.overlay_ip).await {
+            debug!(peer = %node_id, %e, "overlay: /32 peer route not installed (ok on clean hosts)");
+        }
+        self.install_subnets(wg, tun, node_id, cfg.public_key, &cfg.subnets)
+            .await;
+        info!(peer = %node_id, overlay_ip = %cfg.overlay_ip, %dst, "overlay: direct-to-public carrier (NAT-traversal Phase A) — skipping relay");
+    }
+
+    /// Phase A — act on an AUTHENTICATED inbound direct handshake initiation
+    /// forwarded by a demux loop ([`super::wg::DirectInbound`]): a NAT'd client
+    /// dialing our advertised public endpoint (the exit-side accept — we can't
+    /// know its NAT'd source ahead of time), or a known peer that restarted /
+    /// roamed onto a new ephemeral port. Installs (or re-points) that peer onto
+    /// a direct carrier bound to the arriving socket + source, then feeds the
+    /// very init back in so the response goes out immediately (no ~5 s wait for
+    /// the initiator's retransmit).
+    ///
+    /// Safety: `wg.authenticate_init` cryptographically proves the sender holds
+    /// the claimed key's private half (a forger copying a public key fails), so
+    /// this can't be used to hijack a healthy peer's route. Only a pubkey that
+    /// maps to a CURRENT netmap peer (server-ACL-authorised) is acted on. A peer
+    /// cooling down on the matching tier is left on relay (anti-thrash).
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_direct_inbound(
+        &self,
+        wg: &mut WgDevice,
+        by_node: &mut HashMap<ObjectId, Installed>,
+        relay: &mut Option<RelayCoordinator>,
+        tun: &Arc<dyn TunIo>,
+        current_peers: &HashMap<ObjectId, NetmapPeer>,
+        cooldowns: &DirectCooldowns,
+        inb: super::wg::DirectInbound,
+    ) {
+        let Some(pubkey) = wg.authenticate_init(&inb.packet) else {
+            return; // unparseable / forged — drop
+        };
+        // Map the authenticated key to a current, ACL-authorised netmap peer.
+        let Some(np) = current_peers
+            .values()
+            .find(|p| super::decode_public(&p.wg_public_key).is_some_and(|k| k == pubkey))
+        else {
+            debug!(src = %inb.src, "overlay: authenticated inbound init from a non-netmap peer — dropping");
+            return;
+        };
+        let Some(cfg) = peer_config_from_netmap(np) else {
+            return;
+        };
+        let node_id = np.node_id;
+
+        // Already direct on THIS exact source → nothing to change; just answer
+        // the init (it may be a keepalive-driven rehandshake).
+        if wg.direct_src_of(&pubkey) == Some(inb.src) {
+            wg.feed_direct(inb.src, inb.sock.clone(), &inb.packet).await;
+            return;
+        }
+
+        // Anti-thrash: honour the matching tier's cooldown. A public source is
+        // the public-direct tier; a private source is a LAN roam.
+        let now = Instant::now();
+        let is_public_src = matches!(inb.src, SocketAddr::V4(v4) if direct::is_public_v4(*v4.ip()));
+        let cooling = if is_public_src {
+            DirectCooldowns::cooling(&cooldowns.public, &node_id, now)
+        } else {
+            DirectCooldowns::cooling(&cooldowns.lan, &node_id, now)
+        };
+        if cooling {
+            return;
+        }
+
+        // Re-point: drop any existing carrier (relay or direct-on-another-src)
+        // and any pending relay request, then install direct on the arriving
+        // socket keyed by the init's source. `initiate = false` — the peer
+        // already initiated; we only need to respond.
+        if let Some(old) = by_node.remove(&node_id) {
+            wg.remove_peer(&old.pubkey).await;
+        }
+        if let Some(r) = relay.as_mut() {
+            r.forget(&node_id);
+        }
+        wg.ensure_direct_demux(inb.sock.clone());
+        wg.add_direct_peer(inb.sock.clone(), pubkey, cfg.overlay_ip, inb.src, false)
+            .await;
+        by_node.insert(
+            node_id,
+            Installed {
+                pubkey,
+                overlay_ip: cfg.overlay_ip,
+                is_direct: true,
+                since: Instant::now(),
+                last_traffic: (0, 0),
+                bad_sweeps: 0,
+                last_rx_at: Instant::now(),
+                relay_local: None,
+                relay_dst: None,
+                // Only a PUBLIC inbound source is an exit-exemption / public
+                // tier; a private source is an on-link LAN roam (no exemption).
+                public_direct_dst: is_public_src.then_some(inb.src),
+            },
+        );
+        if let Err(e) = tun.add_peer_route(cfg.overlay_ip).await {
+            debug!(peer = %node_id, %e, "overlay: /32 peer route not installed (ok on clean hosts)");
+        }
+        self.install_subnets(wg, tun, node_id, pubkey, &cfg.subnets)
+            .await;
+        // Answer the init that triggered this, immediately.
+        wg.feed_direct(inb.src, inb.sock.clone(), &inb.packet).await;
+        info!(peer = %node_id, src = %inb.src, public = is_public_src, "overlay: accepted authenticated inbound direct handshake (Phase A)");
     }
 
     /// Install a ready carrier as a WG peer, add its `/32` route, and record
@@ -1399,6 +1703,7 @@ impl OverlayRuntime {
                 last_rx_at: Instant::now(),
                 relay_local,
                 relay_dst,
+                public_direct_dst: None,
             },
         );
         // Host `/32` so overlay traffic to this peer beats any colliding
@@ -1714,6 +2019,7 @@ mod tests {
                 name: name.into(),
                 wg_public_key: String::new(),
                 endpoints: vec![],
+                lan_endpoints: vec![],
                 relay_home: None,
                 reachable,
                 supports_quic: false,
@@ -1737,6 +2043,7 @@ mod tests {
                 last_rx_at,
                 relay_local: relay.map(|(l, _)| l),
                 relay_dst: relay.map(|(_, d)| d),
+                public_direct_dst: None,
             }
         }
 
@@ -1896,6 +2203,7 @@ mod tests {
             name: String::new(),
             wg_public_key: kp.public_base64(),
             endpoints: vec![],
+            lan_endpoints: vec![],
             relay_home: None,
             reachable: true,
             supports_quic: false,
@@ -2012,6 +2320,7 @@ mod tests {
             name: name.into(),
             wg_public_key: String::new(),
             endpoints: vec![],
+            lan_endpoints: vec![],
             relay_home: None,
             reachable: true,
             supports_quic: false,
@@ -2074,6 +2383,7 @@ mod tests {
                 last_rx_at: Instant::now(),
                 relay_local: relay.map(|(l, _)| l),
                 relay_dst: relay.map(|(_, d)| d),
+                public_direct_dst: None,
             }
         }
         // Server A + AAAA (S3b — the v6 AAAA rides the set too; reconcile
@@ -2108,6 +2418,37 @@ mod tests {
         assert_eq!(set.len(), 5);
     }
 
+    /// Phase A never-self-wedge: a PUBLIC-DIRECT carrier's peer IP MUST be
+    /// exempted (it's a real internet dst reached via the default route, unlike
+    /// an on-link LAN peer), or the split-default `/1`s would swallow the path
+    /// to the very exit that carries egress.
+    #[test]
+    fn exit_exemption_set_includes_public_direct_dst() {
+        let pd: std::net::SocketAddr = "5.9.157.226:41234".parse().unwrap();
+        let mut by_node = HashMap::new();
+        by_node.insert(
+            exit_oid(9),
+            Installed {
+                pubkey: [1u8; 32],
+                overlay_ip: Ipv4Addr::new(100, 64, 0, 9),
+                is_direct: true,
+                since: Instant::now(),
+                last_traffic: (0, 0),
+                bad_sweeps: 0,
+                last_rx_at: Instant::now(),
+                relay_local: None,
+                relay_dst: None,
+                public_direct_dst: Some(pd),
+            },
+        );
+        let set = exit_exemption_set(&[], &by_node);
+        assert!(
+            set.contains(&pd.ip()),
+            "a public-direct peer IP must be exempted from the split-default"
+        );
+        assert_eq!(set.len(), 1);
+    }
+
     #[test]
     fn exit_peer_allowed_ips_preserves_real_subnets_and_appends_split_default() {
         let kp = WgKeypair::generate();
@@ -2117,6 +2458,7 @@ mod tests {
             name: "jupiter".into(),
             wg_public_key: kp.public_base64(),
             endpoints: vec![],
+            lan_endpoints: vec![],
             relay_home: None,
             reachable: true,
             supports_quic: false,
@@ -2177,6 +2519,7 @@ mod tests {
                 last_rx_at: Instant::now(),
                 relay_local: None,
                 relay_dst: None,
+                public_direct_dst: None,
             },
         );
         let (rid, _np, pk) = exit_readiness("jupiter", &approved, &carriered).unwrap();
