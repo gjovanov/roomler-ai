@@ -568,6 +568,15 @@ fn to_netmap_peer(node: &OverlayNode) -> NetmapPeer {
         // `lan_endpoints` separate and unioning here lets a same-subnet peer
         // always find the LAN candidate (field fix 2026-06-27).
         endpoints: union_endpoints(&node.lan_endpoints, &node.endpoints),
+        // NAT-traversal Phase A — surface the join-time NIC bucket VERBATIM
+        // (NOT unioned with the relay trickle). A globally-routable address in
+        // here tells a peer this node's NIC holds a public IP, so it can be
+        // dialed directly without STUN (the direct-to-public tier). It must stay
+        // separate from `endpoints` because that union also carries coturn
+        // relayed addresses, and on this fleet the coturn worker IPs are the
+        // host public IPs — indistinguishable from a real public-on-NIC endpoint
+        // in the union. Empty for a client that advertised no public endpoint.
+        lan_endpoints: node.lan_endpoints.clone(),
         relay_home: node.relay_home.clone(),
         reachable: true,
         supports_quic: node.supports_quic,
