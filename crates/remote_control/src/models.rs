@@ -833,6 +833,12 @@ pub struct OverlayNode {
     /// only attempted when both ends support it (no silent QUIC/raw split).
     #[serde(default)]
     pub supports_quic: bool,
+    /// Phase D — the node advertised (on JOIN) that it can run the v1
+    /// single-relay carrier (one anchor allocation + a raw dialer). Echoed
+    /// per-peer in the netmap so single-relay is only chosen when both ends
+    /// support it (a mismatch would split the pair into anchor/dialer).
+    #[serde(default)]
+    pub supports_relay_single: bool,
     /// Phase 1 — subnet CIDRs this node CLAIMS it can route for peers (from its
     /// `--advertise-routes` config, refreshed on each join). Untrusted until an
     /// admin approves; see `approved_routes`.

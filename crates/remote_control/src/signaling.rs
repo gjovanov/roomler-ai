@@ -567,6 +567,13 @@ pub enum ClientMsg {
         /// advertise it (a QUIC/raw split would silently break the pair).
         #[serde(default)]
         supports_quic: bool,
+        /// Phase D — the node can carry WG over the v1 single-relay carrier (ONE
+        /// anchor allocation + a raw dialer, `ROOMLER_NODE_OVERLAY_RELAY_SINGLE=1`).
+        /// Persisted + echoed per-peer like `supports_quic`, so single-relay is
+        /// only chosen when BOTH ends advertise it (a mixed pair stays on the
+        /// both-allocate relay). Absent from a pre-Phase-D node ⇒ `false`.
+        #[serde(default)]
+        supports_relay_single: bool,
         /// Phase 1 — subnet CIDRs this node offers to route for peers
         /// (`--advertise-routes` / config). The server stores them as *claimed*
         /// routes; an admin must **approve** each before it's distributed in the
@@ -1109,6 +1116,13 @@ pub struct NetmapPeer {
     /// leave one side on QUIC and the other on raw (which wouldn't decapsulate).
     #[serde(default)]
     pub supports_quic: bool,
+    /// Phase D — this peer advertised it can run the v1 single-relay carrier
+    /// (one anchor allocation + a raw dialer). The runtime picks single-relay
+    /// only when both ends set this AND the local `OVERLAY_RELAY_SINGLE` flag is
+    /// on, so a mismatch can't split a pair into anchor/dialer and deadlock.
+    /// Absent from a pre-Phase-D server/peer ⇒ `false` (both-allocate).
+    #[serde(default)]
+    pub supports_relay_single: bool,
     /// Phase 1 — subnet routes this peer is an **approved** router for (CIDR
     /// strings like `"192.168.1.0/24"`). A receiving node installs each CIDR
     /// into its router (allowed_ips) + OS route table pointing at this peer, so
@@ -2043,6 +2057,7 @@ mod tests {
             mtu: 1280,
             endpoints: vec!["203.0.113.5:51820".into()],
             supports_quic: true,
+            supports_relay_single: true,
             advertised_routes: vec!["192.168.1.0/24".into()],
         };
         let s = serde_json::to_string(&m).unwrap();
@@ -2053,6 +2068,7 @@ mod tests {
                 mtu,
                 supported,
                 supports_quic,
+                supports_relay_single,
                 advertised_routes,
                 ..
             } => {
@@ -2060,6 +2076,10 @@ mod tests {
                 assert_eq!(mtu, 1280);
                 assert!(supported.iter().any(|t| t == "wireguard-v1"));
                 assert!(supports_quic, "supports_quic must round-trip");
+                assert!(
+                    supports_relay_single,
+                    "supports_relay_single must round-trip"
+                );
                 assert_eq!(advertised_routes, vec!["192.168.1.0/24".to_string()]);
             }
             other => panic!("expected OverlayJoin, got {other:?}"),
@@ -2169,6 +2189,7 @@ mod tests {
                 relay_home: None,
                 reachable: true,
                 supports_quic: true,
+                supports_relay_single: true,
                 routes: vec!["10.0.0.0/24".into()],
                 agent_id: Some(agent_id),
             }],
