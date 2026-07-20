@@ -292,18 +292,26 @@ pub fn parse_stun_url(url: &str) -> Option<SocketAddr> {
 /// srflx `ip:port` strings to advertise; a socket whose query fails, times out,
 /// or maps to a non-public address (STUN server on the LAN, a hairpin) is
 /// skipped. v4-only.
+///
+/// Phase C — each candidate is returned WITH the interface socket it was
+/// gathered on. The overlay must later DIAL a peer's srflx from the socket that
+/// owns OUR advertised srflx (so our outbound INITs ride the same NAT mapping we
+/// advertised, opening our filter toward the peer — the hole-punch); pairing the
+/// candidate with its socket lets the caller pick that "punch socket". The first
+/// pair is the punch socket (its candidate is advertised at index 0, which the
+/// peer's dial-side picks first). Deduped by candidate string.
 pub async fn gather_srflx(
     socks: &[(Ipv4Addr, Arc<UdpSocket>)],
     stun_server: SocketAddr,
     attempt_timeout: Duration,
-) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
+) -> Vec<(String, Arc<UdpSocket>)> {
+    let mut out: Vec<(String, Arc<UdpSocket>)> = Vec::new();
     for (_ip, sock) in socks {
         match crate::transport::stun::srflx_query(sock, stun_server, attempt_timeout).await {
             Ok(SocketAddr::V4(srflx)) if is_public_v4(*srflx.ip()) => {
                 let ep = SocketAddr::V4(srflx).to_string();
-                if !out.contains(&ep) {
-                    out.push(ep);
+                if !out.iter().any(|(e, _)| e == &ep) {
+                    out.push((ep, sock.clone()));
                 }
             }
             Ok(other) => {
@@ -575,9 +583,14 @@ mod tests {
         // A PUBLIC srflx reply is captured.
         let (pub_srv, _h1) = fake_stun_server([203, 0, 113, 9], 40000).await;
         let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let socks = vec![("127.0.0.1".parse().unwrap(), sock)];
+        let socks = vec![("127.0.0.1".parse().unwrap(), sock.clone())];
         let got = gather_srflx(&socks, pub_srv, Duration::from_millis(500)).await;
-        assert_eq!(got, vec!["203.0.113.9:40000".to_string()]);
+        assert_eq!(got.len(), 1, "one public srflx");
+        assert_eq!(got[0].0, "203.0.113.9:40000".to_string());
+        assert!(
+            Arc::ptr_eq(&got[0].1, &sock),
+            "candidate carries its own socket"
+        );
 
         // A PRIVATE srflx (STUN on the LAN / hairpin) is filtered out.
         let (priv_srv, _h2) = fake_stun_server([192, 168, 1, 5], 41000).await;
