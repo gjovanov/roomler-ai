@@ -109,6 +109,36 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
     })
 }
 
+/// rc.204 — re-enrolling a machine that already has a config must NOT reset
+/// operator state. Pre-rc.204, enroll wrote a wholesale-fresh [`AgentConfig`]:
+/// a wizard re-install silently flipped `overlay_enabled` back to `false` (the
+/// node dropped out of the overlay mesh on its next restart), dropped
+/// `overlay_wg_secret_key` (forcing a WG key rotation on the next
+/// overlay-enabled start), and wiped `tunnel_routes` / forward ACLs /
+/// advertised routes / encoder preference (field-observed on NEO16,
+/// 2026-07-21: the P4 wizard field-proofs re-enrolled the box and it fell out
+/// of the mesh unnoticed). Keep the EXISTING config as the base — it carries
+/// every operator-owned knob, including ones this function has never heard of
+/// — and take only the enrollment-owned identity fields from the fresh one.
+///
+/// `ws_url` intentionally follows the FRESH config (i.e. resets to `None`): a
+/// pinned override derived for the OLD server would break the new enrollment's
+/// signaling connection, and the default derivation from `server_url` is
+/// correct in every ordinary setup.
+pub fn preserve_operator_config(fresh: AgentConfig, existing: AgentConfig) -> AgentConfig {
+    AgentConfig {
+        server_url: fresh.server_url,
+        ws_url: fresh.ws_url,
+        agent_token: fresh.agent_token,
+        agent_id: fresh.agent_id,
+        tenant_id: fresh.tenant_id,
+        machine_id: fresh.machine_id,
+        machine_name: fresh.machine_name,
+        config_schema_version: fresh.config_schema_version,
+        ..existing
+    }
+}
+
 /// Strip the trailing slash and force the scheme to `https://` if the
 /// caller supplied `http://`. Any other scheme (or a bare host) is
 /// returned trimmed but otherwise untouched — `https://` URLs stay
@@ -236,5 +266,60 @@ mod tests {
         // accidentally rewrite these.
         assert_eq!(normalize_server_url("roomler.ai"), "roomler.ai");
         assert_eq!(normalize_server_url("file:///tmp/foo"), "file:///tmp/foo");
+    }
+
+    /// rc.204 — a re-enroll over an existing config preserves every
+    /// operator-owned knob (overlay opt-in + WG key, routes, ACL posture,
+    /// encoder preference, declared tunnel routes) and takes ONLY the
+    /// enrollment-owned identity fields from the fresh config.
+    #[test]
+    fn preserve_operator_config_keeps_operator_state_and_takes_identity() {
+        let mut existing = crate::config::test_fixture();
+        existing.overlay_enabled = true;
+        existing.overlay_wg_secret_key = Some("OLD-WG-KEY".into());
+        existing.overlay_advertised_routes = vec!["192.168.1.0/24".into()];
+        existing.advertise_routes = vec!["10.9.0.0/16".into()];
+        existing.encoder_preference = crate::config::EncoderPreferenceChoice::Software;
+        existing.auto_grant_session = false;
+        existing.last_known_good_version = Some("0.3.0-rc.199".into());
+
+        let mut fresh = crate::config::test_fixture();
+        fresh.server_url = "https://roomler.ai".into();
+        fresh.agent_token = "NEW-TOKEN".into();
+        fresh.agent_id = "NEW-AGENT-ID".into();
+        fresh.tenant_id = "NEW-TENANT".into();
+        fresh.machine_id = "NEW-MID".into();
+        fresh.machine_name = "renamed-host".into();
+        fresh.config_schema_version = Some("9".into());
+
+        let merged = preserve_operator_config(fresh, existing);
+
+        // Identity comes from the fresh enrollment…
+        assert_eq!(merged.server_url, "https://roomler.ai");
+        assert_eq!(merged.agent_token, "NEW-TOKEN");
+        assert_eq!(merged.agent_id, "NEW-AGENT-ID");
+        assert_eq!(merged.tenant_id, "NEW-TENANT");
+        assert_eq!(merged.machine_id, "NEW-MID");
+        assert_eq!(merged.machine_name, "renamed-host");
+        assert_eq!(merged.config_schema_version.as_deref(), Some("9"));
+
+        // …and the operator state survives the re-enroll.
+        assert!(merged.overlay_enabled, "overlay opt-in must survive");
+        assert_eq!(
+            merged.overlay_wg_secret_key.as_deref(),
+            Some("OLD-WG-KEY"),
+            "the WG identity must survive (no forced key rotation)"
+        );
+        assert_eq!(merged.overlay_advertised_routes, vec!["192.168.1.0/24"]);
+        assert_eq!(merged.advertise_routes, vec!["10.9.0.0/16"]);
+        assert!(matches!(
+            merged.encoder_preference,
+            crate::config::EncoderPreferenceChoice::Software
+        ));
+        assert!(!merged.auto_grant_session);
+        assert_eq!(
+            merged.last_known_good_version.as_deref(),
+            Some("0.3.0-rc.199")
+        );
     }
 }
