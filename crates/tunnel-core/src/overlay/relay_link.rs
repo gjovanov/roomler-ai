@@ -39,8 +39,36 @@ use tracing::{debug, info, warn};
 
 use super::netmap::PeerConfig;
 use super::wg::Carrier;
+use crate::transport::derp::DerpMux;
 use crate::transport::relay::{RelayConn, allocate_relay_from_ice};
 use roomler_ai_remote_control::signaling::{ClientMsg, IceServer};
+
+/// Which relay carrier a [`ReadyLink`] rides. `install_ready` gates the
+/// QUIC-over-relay upgrade on `Turn`: a `Derp` link is RAW WG over the
+/// pubkey-addressed `/derp` WS relay — v1 never rides QUIC-over-DERP (QUIC over
+/// a reliable TCP/WS is double-reliable, HOL-on-HOL). The pubkey pinning makes
+/// the raw carrier correct (the recv-source discard can never be wrong).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayKind {
+    /// A coturn TURN allocation (single-relay or both-allocate).
+    Turn,
+    /// The DERP `/derp` WS relay (both-UDP-blocked pair).
+    Derp,
+}
+
+/// The relay carrier tier chosen for a peer at the relay tier. A 3-way split so
+/// the both-UDP-blocked `(false,false)` case (→ [`RelayStrategy::Derp`]) is
+/// distinct from "peer doesn't support single-relay" (→
+/// [`RelayStrategy::BothAllocate`]) — the old `Option<bool>` conflated them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayStrategy {
+    /// v1 single-relay: `true` = ANCHOR (allocate), `false` = DIALER (raw-dial).
+    SingleRelay(bool),
+    /// DERP: both UDP-blocked, both advertise it, our flag on + WS present.
+    Derp,
+    /// The both-allocate fall-through (two coturn allocations).
+    BothAllocate,
+}
 
 /// A peer link whose carrier is ready to install.
 pub struct ReadyLink {
@@ -73,6 +101,11 @@ pub struct ReadyLink {
     /// a socket nobody dials. Both ends compute this role from the same
     /// symmetric inputs, so they can't disagree.
     pub single_relay: Option<bool>,
+    /// Phase D — which relay carrier this link rides. `Turn` (default) allows the
+    /// QUIC-over-relay upgrade; `Derp` forces raw WG over the `/derp` WS relay
+    /// and gates QUIC OFF (A2). Direct/test links are `Turn` (QUIC is separately
+    /// gated off for them by `relay_parts.is_none()`).
+    pub relay_kind: RelayKind,
     /// Phase 1 — approved subnet routes this peer is a router for; `install_ready`
     /// registers them in the router + installs OS routes.
     pub subnets: Vec<super::router::Cidr>,
@@ -145,18 +178,31 @@ pub struct RelayCoordinator {
     /// `pending`/`allocated` so [`forget`](Self::forget) prunes it and
     /// [`is_tracking`](Self::is_tracking) sees it.
     dialing: HashMap<ObjectId, PeerConfig>,
-    /// Phase D — the single-relay role each TRACKED link was established with
-    /// ([`single_relay_role`](Self::single_relay_role)'s value at request time).
-    /// `maybe_complete` recomputes the role from every fresh netmap and, if it
-    /// changed, `forget`s the link so the caller re-establishes with the correct
-    /// role. The role can change because it depends on the peer's
-    /// `srflx_endpoints`, which arrive on a LATER `rc:overlay.srflx` trickle than
-    /// the join: during that window a UDP-capable peer briefly looks UDP-blocked,
-    /// so both ends can compute "dialer" and deadlock. The role is otherwise
-    /// frozen once tracked (`request` early-returns on `is_tracking`,
-    /// `maybe_complete` never re-decides), so without this recompute the pair
-    /// would never heal.
-    roles: HashMap<ObjectId, Option<bool>>,
+    /// Phase D (DERP) — both-UDP-blocked links awaiting their symmetric DERP
+    /// carrier. We hold NO coturn allocation and make NO server round-trip (both
+    /// ends dial the `/derp` WS); each becomes a [`DerpConn`] carrier built off
+    /// [`derp_mux`](Self::derp_mux) the moment the peer is tracked. Keyed like
+    /// `dialing` so `forget`/`is_tracking` see it.
+    derping: HashMap<ObjectId, PeerConfig>,
+    /// Phase D — our end of the DERP opt-in ([`derp_enabled`](super::direct::derp_enabled),
+    /// default-OFF). A link goes DERP only when this is set, the peer advertises
+    /// `supports_derp`, both ends are UDP-blocked, AND `derp_mux` is present.
+    derp: bool,
+    /// Phase D — this node's single `/derp` WS demux, if the DERP tier is on and
+    /// the WS is up. `try_build_derp` vends a per-peer [`DerpConn`] from it.
+    /// `None` disables DERP (falls through to both-allocate).
+    derp_mux: Option<Arc<DerpMux>>,
+    /// Phase D — the relay STRATEGY each TRACKED link was established with
+    /// ([`relay_strategy`](Self::relay_strategy)'s value at request time).
+    /// `maybe_complete` recomputes it from every fresh netmap and, if it changed,
+    /// `forget`s the link so the caller re-establishes with the correct strategy.
+    /// It can change because it depends on the peer's `srflx_endpoints`, which
+    /// arrive on a LATER `rc:overlay.srflx` trickle than the join: during that
+    /// window a UDP-capable peer briefly looks UDP-blocked, so both ends can pick
+    /// "dialer" (single-relay) or "DERP" and deadlock. The strategy is otherwise
+    /// frozen once tracked (`request` early-returns on `is_tracking`), so without
+    /// this recompute the pair would never heal.
+    roles: HashMap<ObjectId, RelayStrategy>,
 }
 
 impl RelayCoordinator {
@@ -165,6 +211,7 @@ impl RelayCoordinator {
         my_public_key: [u8; 32],
         my_udp_relay_ok: bool,
         lan_endpoints: Vec<String>,
+        derp_mux: Option<Arc<DerpMux>>,
     ) -> Self {
         Self {
             outbound,
@@ -176,6 +223,9 @@ impl RelayCoordinator {
             single_relay: super::direct::relay_single_enabled(),
             my_udp_relay_ok,
             dialing: HashMap::new(),
+            derping: HashMap::new(),
+            derp: super::direct::derp_enabled(),
+            derp_mux,
             roles: HashMap::new(),
         }
     }
@@ -204,16 +254,45 @@ impl RelayCoordinator {
     /// * both UDP-blocked → no raw-UDP dialer exists → `None` (single-relay can't
     ///   carry this pair; it falls through to both-allocate today, DERP later)
     fn single_relay_role(&self, peer: &PeerConfig) -> Option<bool> {
-        if !(self.single_relay && peer.supports_relay_single) {
-            return None;
+        match self.relay_strategy(peer) {
+            RelayStrategy::SingleRelay(anchor) => Some(anchor),
+            _ => None,
         }
+    }
+
+    /// The relay carrier tier for this peer: single-relay (with anchor/dialer
+    /// role), DERP, or the both-allocate fall-through.
+    ///
+    /// Single-relay wins when both ends advertise it AND ≥1 side is UDP-capable
+    /// (a raw-UDP dialer must exist). If neither side is UDP-capable — the
+    /// `(false, false)` arm — single-relay CAN'T carry the pair (two anchors, no
+    /// dialer), and we fall to **DERP** when both ends advertise `supports_derp`,
+    /// our `OVERLAY_DERP` flag is on, and our `/derp` WS (`derp_mux`) is up.
+    /// Everything else is both-allocate. Both ends read the same symmetric inputs
+    /// (our UDP-capability from the srflx gather, the peer's from its
+    /// `srflx_endpoints`), so they always agree on the tier.
+    fn relay_strategy(&self, peer: &PeerConfig) -> RelayStrategy {
         let peer_udp_ok = !peer.srflx_endpoints.is_empty();
-        match (self.my_udp_relay_ok, peer_udp_ok) {
-            (true, false) => Some(false), // peer is UDP-blocked → it anchors, we dial
-            (false, true) => Some(true),  // we're UDP-blocked → we anchor
-            (true, true) => Some(self.my_public_key < peer.public_key), // tie-break
-            (false, false) => None,       // neither can raw-UDP-dial → not single-relay
+        if self.single_relay && peer.supports_relay_single {
+            match (self.my_udp_relay_ok, peer_udp_ok) {
+                (true, false) => return RelayStrategy::SingleRelay(false), // peer blocked → it anchors, we dial
+                (false, true) => return RelayStrategy::SingleRelay(true), // we're blocked → we anchor
+                (true, true) => {
+                    return RelayStrategy::SingleRelay(self.my_public_key < peer.public_key);
+                } // tie-break
+                (false, false) => {} // neither can raw-UDP-dial → try DERP below
+            }
         }
+        // DERP — the ONLY tier that serves a both-UDP-blocked pair.
+        if self.derp
+            && self.derp_mux.is_some()
+            && peer.supports_derp
+            && !self.my_udp_relay_ok
+            && !peer_udp_ok
+        {
+            return RelayStrategy::Derp;
+        }
+        RelayStrategy::BothAllocate
     }
 
     /// LAN endpoints ∪ every current relay address — the full candidate set the
@@ -230,26 +309,41 @@ impl RelayCoordinator {
         self.pending.contains_key(node_id)
             || self.allocated.contains_key(node_id)
             || self.dialing.contains_key(node_id)
+            || self.derping.contains_key(node_id)
     }
 
-    /// Kick off a relay link: ask the server for coturn creds + the pair_key.
+    /// Kick off a relay link. The strategy decides the mechanics:
     ///
-    /// Phase D — a v1 single-relay DIALER (larger pubkey) skips this entirely:
-    /// it allocates NOTHING and needs no creds (the ANCHOR owns the sole relay),
-    /// so it's just tracked; [`maybe_complete`](Self::maybe_complete) builds its
-    /// raw carrier once the anchor advertises `R`.
+    /// - **single-relay DIALER** (larger-pubkey / UDP-capable-vs-blocked-peer):
+    ///   allocates NOTHING, needs no creds — just tracked; `maybe_complete`
+    ///   builds its raw carrier once the anchor advertises `R`.
+    /// - **DERP** (both UDP-blocked): allocates NOTHING and makes NO server
+    ///   round-trip — both ends dial the `/derp` WS; tracked, then built
+    ///   symmetrically off `derp_mux`.
+    /// - **single-relay ANCHOR / both-allocate**: asks the server for coturn
+    ///   creds + the `pair_key`.
     pub async fn request(&mut self, node_id: ObjectId, peer: PeerConfig) {
         if self.is_tracking(&node_id) {
             return;
         }
-        // Compute the role ONCE and remember it, so `maybe_complete` can detect a
-        // later flip (the peer's srflx propagating) and re-establish — see `roles`.
-        let role = self.single_relay_role(&peer);
-        if role == Some(false) {
-            debug!(peer = %node_id, "overlay relay: single-relay dialer — awaiting anchor R (no alloc, no creds)");
-            self.roles.insert(node_id, role);
-            self.dialing.insert(node_id, peer);
-            return;
+        // Compute the strategy ONCE and remember it, so `maybe_complete` can
+        // detect a later flip (the peer's srflx propagating) and re-establish —
+        // see `roles`.
+        let strat = self.relay_strategy(&peer);
+        match strat {
+            RelayStrategy::SingleRelay(false) => {
+                debug!(peer = %node_id, "overlay relay: single-relay dialer — awaiting anchor R (no alloc, no creds)");
+                self.roles.insert(node_id, strat);
+                self.dialing.insert(node_id, peer);
+                return;
+            }
+            RelayStrategy::Derp => {
+                debug!(peer = %node_id, "overlay relay: DERP link (both UDP-blocked) — no alloc, no creds");
+                self.roles.insert(node_id, strat);
+                self.derping.insert(node_id, peer);
+                return;
+            }
+            RelayStrategy::SingleRelay(true) | RelayStrategy::BothAllocate => {}
         }
         if self
             .outbound
@@ -262,7 +356,7 @@ impl RelayCoordinator {
             warn!(peer = %node_id, "overlay relay: control channel closed; cannot request");
             return;
         }
-        self.roles.insert(node_id, role);
+        self.roles.insert(node_id, strat);
         self.pending.insert(
             node_id,
             PendingPeer {
@@ -302,12 +396,18 @@ impl RelayCoordinator {
         // role differs from the one we tracked, drop the link; the caller's
         // `!is_tracking` path then re-`request`s it with the correct role.
         if self.is_tracking(&node_id) {
-            let fresh_role = self.single_relay_role(peer);
-            if self.roles.get(&node_id) != Some(&fresh_role) {
-                debug!(peer = %node_id, ?fresh_role, "overlay relay: single-relay role changed (srflx settled) — re-establishing");
+            let fresh = self.relay_strategy(peer);
+            if self.roles.get(&node_id) != Some(&fresh) {
+                debug!(peer = %node_id, ?fresh, "overlay relay: strategy changed (srflx settled) — re-establishing");
                 self.forget(&node_id);
                 return None;
             }
+        }
+        // Phase D (DERP) — both-UDP-blocked link: build the symmetric DERP
+        // carrier off our `/derp` WS. No allocation, no server round-trip.
+        if let Some(slot) = self.derping.get_mut(&node_id) {
+            *slot = peer.clone();
+            return self.try_build_derp(&node_id);
         }
         // Phase D — a single-relay DIALER holds no allocation: build the raw
         // carrier to the anchor's `R` the moment it appears in the netmap.
@@ -444,6 +544,7 @@ impl RelayCoordinator {
             relay_parts: Some((a.conn.clone(), dst)),
             supports_quic: a.peer.supports_quic,
             single_relay: single_anchor.then_some(true),
+            relay_kind: RelayKind::Turn,
             subnets: a.peer.subnets.clone(),
         };
         self.allocated.remove(node_id);
@@ -481,10 +582,44 @@ impl RelayCoordinator {
             relay_parts: Some((conn, r)),
             supports_quic: peer.supports_quic,
             single_relay: Some(false),
+            relay_kind: RelayKind::Turn,
             subnets: peer.subnets.clone(),
         };
         self.dialing.remove(node_id);
         info!(peer = %node_id, %r, "overlay relay: single-relay dialer link ready (raw → anchor R)");
+        Some(link)
+    }
+
+    /// Phase D (DERP) build: we hold NO allocation. Vend a per-peer
+    /// [`DerpConn`](crate::transport::derp::DerpConn) off our `/derp` WS demux
+    /// and wrap it as a RAW [`Carrier::relay`] — no QUIC (`relay_kind: Derp`
+    /// gates it off), no anchor/dialer asymmetry (`single_relay: None`). The
+    /// carrier is symmetric: both ends dial out to the relay, and the WG
+    /// handshake single-initiator (smaller pubkey) is applied by `install_ready`.
+    /// `None` if the DERP WS isn't up (no `derp_mux`).
+    fn try_build_derp(&mut self, node_id: &ObjectId) -> Option<ReadyLink> {
+        let peer = self.derping.get(node_id)?.clone();
+        let mux = self.derp_mux.as_ref()?;
+        let derp_conn = mux.conn_for(peer.public_key);
+        // A stable synthetic peer addr (the DERP carrier is pubkey-addressed and
+        // discards this `dst`; it exists only so the carrier has a consistent
+        // remote — and, for a future QUIC-over-DERP path, a valid one).
+        let dst = derp_conn.synth_peer();
+        let conn: Arc<dyn RelayConn> = Arc::new(derp_conn);
+        let carrier = Carrier::relay(conn.clone(), dst);
+        let link = ReadyLink {
+            node_id: *node_id,
+            public_key: peer.public_key,
+            overlay_ip: peer.overlay_ip,
+            carrier,
+            relay_parts: Some((conn, dst)),
+            supports_quic: false, // DERP raw v1: never QUIC-over-DERP (A2)
+            single_relay: None,   // symmetric — no anchor/dialer role
+            relay_kind: RelayKind::Derp,
+            subnets: peer.subnets.clone(),
+        };
+        self.derping.remove(node_id);
+        info!(peer = %node_id, "overlay relay: DERP link ready (raw WG over /derp)");
         Some(link)
     }
 
@@ -499,6 +634,7 @@ impl RelayCoordinator {
         self.allocated.remove(node_id);
         self.advertised.remove(node_id);
         self.dialing.remove(node_id);
+        self.derping.remove(node_id);
         self.roles.remove(node_id);
     }
 }
@@ -619,6 +755,7 @@ mod tests {
             srflx_nat: None,
             supports_quic: false,
             supports_relay_single: false,
+            supports_derp: false,
         }
     }
 
@@ -691,7 +828,7 @@ mod tests {
     #[tokio::test]
     async fn request_is_idempotent_and_sends_one_relay_request() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        let mut coord = RelayCoordinator::new(tx, [0u8; 32], true, vec![]);
+        let mut coord = RelayCoordinator::new(tx, [0u8; 32], true, vec![], None);
         let node = ObjectId::new();
         let peer = base_peer();
         coord.request(node, peer.clone()).await;
@@ -711,7 +848,7 @@ mod tests {
         // carrying a now-dead allocation and the peer dials it forever.
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let mut coord =
-            RelayCoordinator::new(tx, [0u8; 32], true, vec!["192.168.68.5:51820".into()]);
+            RelayCoordinator::new(tx, [0u8; 32], true, vec!["192.168.68.5:51820".into()], None);
         let node = ObjectId::new();
         coord.advertised.insert(node, "94.130.141.74:11085".into());
         coord.pending.insert(
@@ -808,7 +945,7 @@ mod tests {
     fn all_endpoints_unions_lan_and_relays() {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let mut coord =
-            RelayCoordinator::new(tx, [0u8; 32], true, vec!["192.168.68.5:51820".into()]);
+            RelayCoordinator::new(tx, [0u8; 32], true, vec!["192.168.68.5:51820".into()], None);
         coord
             .advertised
             .insert(ObjectId::new(), "94.130.141.74:11085".into());
@@ -844,13 +981,13 @@ mod tests {
         };
         // Helper: a coordinator with the flag forced on and a given UDP status.
         let coord = |pk: [u8; 32], udp_ok: bool| {
-            let mut c = RelayCoordinator::new(tx.clone(), pk, udp_ok, vec![]);
+            let mut c = RelayCoordinator::new(tx.clone(), pk, udp_ok, vec![], None);
             c.single_relay = true;
             c
         };
 
         // Flag off → both-allocate regardless (gate defaults ON, so force off).
-        let mut off = RelayCoordinator::new(tx.clone(), small, true, vec![]);
+        let mut off = RelayCoordinator::new(tx.clone(), small, true, vec![], None);
         off.single_relay = false;
         assert_eq!(off.single_relay_role(&peer(large, true, true)), None);
 
@@ -908,7 +1045,7 @@ mod tests {
         // We are UDP-capable and our pubkey is LARGER; the peer is also
         // UDP-capable (has a srflx endpoint), so the tie-break makes US the
         // DIALER (Some(false)).
-        let mut coord = RelayCoordinator::new(tx, [0xFFu8; 32], true, vec![]);
+        let mut coord = RelayCoordinator::new(tx, [0xFFu8; 32], true, vec![], None);
         coord.single_relay = true; // same-module: force the opt-in on for the test
         let node = ObjectId::new();
         let anchor_r = "94.130.141.74:11085"; // the anchor's advertised relay R
@@ -969,7 +1106,7 @@ mod tests {
         // deadlock (both sides picked "dialer") forever.
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         // We are UDP-OK with the SMALLER pubkey.
-        let mut coord = RelayCoordinator::new(tx, [0x00u8; 32], true, vec![]);
+        let mut coord = RelayCoordinator::new(tx, [0x00u8; 32], true, vec![], None);
         coord.single_relay = true;
         let node = ObjectId::new();
         // Peer: larger pubkey, advertises single-relay, NO srflx yet → looks
@@ -1006,6 +1143,98 @@ mod tests {
         assert!(
             matches!(rx.try_recv(), Ok(ClientMsg::OverlayRelayRequest { .. })),
             "re-established as anchor ⇒ sends a coturn-creds request"
+        );
+    }
+
+    // ───────────────────── Phase D — DERP tier selection ─────────────────────
+
+    #[test]
+    fn relay_strategy_falls_to_derp_only_when_both_udp_blocked() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mux = DerpMux::new([9u8; 32]).0;
+        // A coordinator with single-relay + DERP forced to a given state.
+        let mk = |derp_on: bool, my_udp_ok: bool, m: Option<Arc<DerpMux>>| {
+            let mut c = RelayCoordinator::new(tx.clone(), [0x00u8; 32], my_udp_ok, vec![], m);
+            c.single_relay = true;
+            c.derp = derp_on;
+            c
+        };
+        let peer = |derp: bool, udp: bool| PeerConfig {
+            public_key: [0xFFu8; 32],
+            supports_relay_single: true,
+            supports_derp: derp,
+            srflx_endpoints: if udp {
+                vec!["203.0.113.9:40000".into()]
+            } else {
+                vec![]
+            },
+            ..base_peer()
+        };
+        // Both UDP-blocked + both advertise DERP + flag on + WS present ⇒ DERP.
+        assert_eq!(
+            mk(true, false, Some(mux.clone())).relay_strategy(&peer(true, false)),
+            RelayStrategy::Derp
+        );
+        // DERP flag off ⇒ both-allocate (single-relay can't: both UDP-blocked).
+        assert_eq!(
+            mk(false, false, Some(mux.clone())).relay_strategy(&peer(true, false)),
+            RelayStrategy::BothAllocate
+        );
+        // No `/derp` WS present ⇒ both-allocate.
+        assert_eq!(
+            mk(true, false, None).relay_strategy(&peer(true, false)),
+            RelayStrategy::BothAllocate
+        );
+        // Peer doesn't advertise DERP ⇒ both-allocate.
+        assert_eq!(
+            mk(true, false, Some(mux.clone())).relay_strategy(&peer(false, false)),
+            RelayStrategy::BothAllocate
+        );
+        // A UDP-capable side exists ⇒ single-relay wins over DERP (we're blocked,
+        // the peer is UDP-OK ⇒ we anchor). DERP is strictly the both-blocked tier.
+        assert_eq!(
+            mk(true, false, Some(mux)).relay_strategy(&peer(true, true)),
+            RelayStrategy::SingleRelay(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn derp_link_tracks_without_request_and_builds_symmetric_carrier() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mux = DerpMux::new([0x00u8; 32]).0;
+        // We are UDP-BLOCKED; DERP on + WS present.
+        let mut coord = RelayCoordinator::new(tx, [0x00u8; 32], false, vec![], Some(mux));
+        coord.single_relay = true;
+        coord.derp = true;
+        let node = ObjectId::new();
+        // Peer: UDP-blocked (no srflx), advertises single-relay + DERP.
+        let peer = PeerConfig {
+            public_key: [0xFFu8; 32],
+            supports_relay_single: true,
+            supports_derp: true,
+            srflx_endpoints: vec![],
+            ..base_peer()
+        };
+        // A DERP link makes NO server round-trip (both ends dial the `/derp` WS).
+        coord.request(node, peer.clone()).await;
+        assert!(coord.is_tracking(&node), "DERP link is tracked");
+        assert!(
+            rx.try_recv().is_err(),
+            "a DERP link sends NO OverlayRelayRequest"
+        );
+        // maybe_complete builds the symmetric DERP carrier immediately.
+        let link = coord.maybe_complete(node, &peer).expect("DERP link ready");
+        assert_eq!(link.public_key, [0xFFu8; 32]);
+        assert_eq!(link.relay_kind, RelayKind::Derp);
+        assert_eq!(
+            link.single_relay, None,
+            "DERP is symmetric — no anchor/dialer role"
+        );
+        assert!(!link.supports_quic, "DERP raw v1 never rides QUIC (A2)");
+        assert!(link.relay_parts.is_some(), "DERP carrier has relay parts");
+        assert!(
+            !coord.is_tracking(&node),
+            "a built link leaves the derping set"
         );
     }
 

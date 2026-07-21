@@ -32,10 +32,11 @@ use super::WgKeypair;
 use super::direct;
 use super::dns;
 use super::netmap::{PeerConfig, peer_config_from_netmap};
-use super::relay_link::{ReadyLink, RelayCoordinator};
+use super::relay_link::{ReadyLink, RelayCoordinator, RelayKind};
 use super::tun::TunIo;
 use super::wg::{Carrier, QUIC_BUILD_TIMEOUT, WG_OVERHEAD, WgDevice, overlay_quic_enabled};
 use crate::localapi::{ConnectionType, ExitNodeStatus, OverlayView, PeerInfo};
+use crate::transport::derp::DerpMux;
 use roomler_ai_remote_control::signaling::{ClientMsg, IceServer, NetmapPeer, OverlayNetworkInfo};
 
 /// rc.131/132/143 — direct LAN carrier context: one UDP socket per LAN
@@ -502,6 +503,12 @@ pub struct OverlayRuntime {
     /// still worked when they were resolved. Coturn worker IPs are added
     /// dynamically from live relay carriers. Empty unless `exit_node` is set.
     exit_server_ips: Vec<IpAddr>,
+    /// Phase D (DERP) — this node's single `/derp` WS demux, if the agent
+    /// opened one (DERP on + WS up). Handed to [`RelayCoordinator`] so a
+    /// both-UDP-blocked pair can build a `DerpConn` carrier. `None` = no DERP
+    /// (the coordinator falls through to both-allocate). Set via
+    /// [`with_derp_mux`](Self::with_derp_mux).
+    derp_mux: Option<Arc<DerpMux>>,
 }
 
 /// Map the runtime's live carrier bookkeeping into the LocalAPI [`OverlayView`]
@@ -794,6 +801,7 @@ impl OverlayRuntime {
             peer_view: None,
             exit_node: None,
             exit_server_ips: Vec::new(),
+            derp_mux: None,
         }
     }
 
@@ -815,12 +823,23 @@ impl OverlayRuntime {
             peer_view: None,
             exit_node: None,
             exit_server_ips: Vec::new(),
+            derp_mux: None,
         }
     }
 
     /// Phase 1 — set the subnet routes this node advertises as a router.
     pub fn with_advertised_routes(mut self, routes: Vec<String>) -> Self {
         self.advertised_routes = routes;
+        self
+    }
+
+    /// Phase D (DERP) — attach the node's `/derp` WS demux. The agent builds it
+    /// (it owns `server_url` + the token + `tokio_tungstenite`), opens the WS,
+    /// and hands the connected [`DerpMux`] here so the relay coordinator can
+    /// vend `DerpConn` carriers for both-UDP-blocked peers. `None` (the default)
+    /// leaves DERP inert.
+    pub fn with_derp_mux(mut self, derp_mux: Option<Arc<DerpMux>>) -> Self {
+        self.derp_mux = derp_mux;
         self
     }
 
@@ -907,6 +926,10 @@ impl OverlayRuntime {
             // flag) so the server only lets a peer pick single-relay when BOTH ends
             // opted in; a mixed pair stays on the both-allocate relay.
             supports_relay_single: crate::overlay::direct::relay_single_enabled(),
+            // Phase D (DERP) — advertise the DERP capability (our OVERLAY_DERP
+            // flag) so a both-UDP-blocked pair only picks DERP when BOTH ends
+            // opted in. Default-OFF until field-proven.
+            supports_derp: crate::overlay::direct::derp_enabled(),
             // Phase 1 — subnet routes we offer (admin must approve server-side).
             advertised_routes: self.advertised_routes.clone(),
         };
@@ -1209,6 +1232,9 @@ impl OverlayRuntime {
                     .as_ref()
                     .map(|c| c.endpoints.clone())
                     .unwrap_or_default(),
+                // Phase D — hand the coordinator our `/derp` WS demux (if the
+                // agent opened one) so a both-UDP-blocked pair can go DERP.
+                self.derp_mux.clone(),
             )),
             CarrierMode::Direct(_) => None,
         };
@@ -1815,6 +1841,7 @@ impl OverlayRuntime {
                             relay_parts: None,
                             supports_quic: cfg.supports_quic,
                             single_relay: None,
+                            relay_kind: RelayKind::Turn,
                             subnets: cfg.subnets.clone(),
                         },
                     )
@@ -2207,7 +2234,16 @@ impl OverlayRuntime {
         // path. Symmetric on both ends: any build that advertises
         // `supports_relay_single` carries this rule, so the pair can't split
         // QUIC/raw (see `ReadyLink::single_relay`).
+        //
+        // A DERP link (`relay_kind == Derp`) is explicitly EXCLUDED from QUIC:
+        // it's raw WG over the pubkey-addressed WS relay, and the pubkey pinning
+        // makes the raw recv-source discard correct. QUIC-over-DERP would be
+        // QUIC-over-TCP (double-reliable, HOL-on-HOL) and is untested — v1 stays
+        // raw (A2). The gate below is belt-and-suspenders: a DERP link already
+        // sets `single_relay: None` + `supports_quic: false`, but the explicit
+        // `Turn` check keeps a future field-add from silently upgrading it.
         let want_quic = link.relay_parts.is_some()
+            && link.relay_kind == RelayKind::Turn
             && (link.single_relay.is_some() || (overlay_quic_enabled() && link.supports_quic));
         let carrier = if want_quic {
             let (conn, dst) = link.relay_parts.clone().unwrap();
@@ -2845,6 +2881,7 @@ mod tests {
                 reachable,
                 supports_quic: false,
                 supports_relay_single: false,
+                supports_derp: false,
                 routes: vec![],
                 agent_id: None,
             }
@@ -3038,6 +3075,7 @@ mod tests {
             reachable: true,
             supports_quic: false,
             supports_relay_single: false,
+            supports_derp: false,
             routes: vec![],
             agent_id: None,
         }
@@ -3158,6 +3196,7 @@ mod tests {
             reachable: true,
             supports_quic: false,
             supports_relay_single: false,
+            supports_derp: false,
             routes,
             agent_id: None,
         }
@@ -3305,6 +3344,7 @@ mod tests {
             reachable: true,
             supports_quic: false,
             supports_relay_single: false,
+            supports_derp: false,
             routes: vec!["192.168.5.0/24".into(), "0.0.0.0/0".into()],
             agent_id: None,
         };
