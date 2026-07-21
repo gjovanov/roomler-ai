@@ -2,7 +2,7 @@
 name = "roomler-agent-tray"
 version.workspace = true
 edition.workspace = true
-description = "System-tray companion for roomler-agent — onboarding + status + service control."
+description = "Roomler desktop — tray-resident control surface: overview, devices, tunnels, settings, onboarding, consent."
 
 [[bin]]
 # P3d Slice B: OUTPUT binary is `roomler-desktop` (the tray/desktop companion).

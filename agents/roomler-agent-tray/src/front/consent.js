@@ -3,8 +3,8 @@
 // Polls the tray backend for `.pending` markers the agent drops when a remote
 // session is awaiting a decision, renders an Approve/Deny modal, and writes the
 // operator's choice through the existing cmd_consent_approve / cmd_consent_deny
-// commands. Self-contained: it creates its own modal DOM so it can be dropped
-// onto any page (status / onboarding / settings) via a single <script> tag.
+// commands. Self-contained: it creates its own modal DOM (no dependency on the
+// app shell) and overlays whichever view is active.
 //
 // The Rust-side watcher brings the window forward when a new marker appears;
 // this loop does the rendering and the decision.

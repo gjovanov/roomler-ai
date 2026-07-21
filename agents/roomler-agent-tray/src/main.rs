@@ -5,25 +5,27 @@
 // every module-level doc-comment in the crate.
 #![allow(clippy::doc_lazy_continuation, clippy::doc_overindented_list_items)]
 
-//! Roomler Agent Tray — small Tauri 2 companion app.
+//! Roomler desktop (`roomler-desktop`) — the node stack's control
+//! surface. Tauri 2, lives in the system tray, one window with a
+//! sidebar SPA (`src/front/`): Overview / Devices / Tunnels /
+//! Settings / Onboarding + the remote-control consent modal.
 //!
-//! Provides the onboarding GUI (paste enrollment token + device name)
-//! + a status window (service running, agent version, attention
-//! sentinel) + a system-tray icon with a right-click menu (Open
-//! Status / Onboarding / Check for Updates / Open Logs Folder /
-//! Quit Tray).
-//!
-//! Architecture (per rc.18 plan):
-//! - The tray is a **thin orchestration layer**.
+//! Architecture:
+//! - The desktop app is a **thin client**: live node/peer/flow/route
+//!   state comes from the running daemon over the LocalAPI
+//!   (`tunnel_core::localapi::Client`); consent decisions go the same
+//!   way (P2b — the daemon owns the profile-correct sentinel dir).
 //! - Enrollment goes through `roomler_agent::enrollment::enroll` as a
 //!   direct lib call (no subprocess).
-//! - Service control / self-update / consent decisions shell out to
-//!   the agent CLI (`roomler-agent service install`, `roomler-agent
-//!   self-update`, `roomler-agent consent ...`).
-//! - No socket / HTTP IPC — file sentinel pattern (already used by
-//!   the agent's own ConsentBroker + needs-attention.txt) suffices.
+//! - Service control / self-update shell out to the daemon CLI
+//!   (`roomlerd service install`, `roomlerd self-update`).
+//! - Closing the window HIDES it (close-to-hide below) — the tray icon
+//!   and the consent watcher must outlive the window, since surfacing
+//!   consent prompts is this app's safety-relevant job.
 //!
-//! See `agents/roomler-agent-tray/Cargo.toml` for the dep wiring.
+//! See `agents/roomler-agent-tray/Cargo.toml` for the dep wiring (the
+//! package keeps its historical name; the output binary is
+//! `roomler-desktop` since P3d).
 
 #![cfg_attr(
     all(not(debug_assertions), target_os = "windows"),
@@ -49,11 +51,21 @@ fn main() {
         .try_init();
 
     tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             // Second invocation: focus the existing window instead
             // of starting a new tray. Prevents "10 trays running"
             // when an operator double-clicks the launcher.
             if let Some(window) = app.get_webview_window("main") {
+                // Deep-link: `roomler-desktop --view=<name>` routes the SPA
+                // to that view (shortcuts / scripts / smoke tests). The name
+                // is whitelisted to ascii-alphanumeric before it goes near
+                // eval; the router maps anything unknown to Overview.
+                if let Some(view) = args.iter().find_map(|a| a.strip_prefix("--view="))
+                    && !view.is_empty()
+                    && view.chars().all(|c| c.is_ascii_alphanumeric())
+                {
+                    let _ = window.eval(format!("window.location.hash = '#/{view}'"));
+                }
                 let _ = window.show();
                 let _ = window.set_focus();
             }
@@ -82,7 +94,18 @@ fn main() {
             commands::cmd_route_add,
             commands::cmd_route_remove,
             commands::cmd_route_set_enabled,
+            commands::cmd_flows,
         ])
+        .on_window_event(|window, event| {
+            // Close-to-hide: the window is a view over a resident tray app.
+            // Letting the close destroy the last window would exit the
+            // process (Tauri default) and take the consent watcher down with
+            // it — remote-control prompts would silently stop surfacing.
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
         .setup(|app| {
             // Install the tray icon + menu. The main window starts
             // hidden (visible:false in tauri.conf.json); operator
@@ -97,7 +120,7 @@ fn main() {
             Ok(())
         })
         .run(tauri::generate_context!())
-        .expect("error while running roomler-agent-tray");
+        .expect("error while running roomler-desktop");
 }
 
 /// Ask the daemon (over the LocalAPI) which sessions await consent; when a NEW
