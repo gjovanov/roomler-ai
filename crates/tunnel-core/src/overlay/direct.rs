@@ -219,23 +219,28 @@ pub fn relay_single_enabled() -> bool {
 
 /// Phase D (DERP) — is the pubkey-addressed `/derp` relay carrier ENABLED?
 /// (`ROOMLER_NODE_OVERLAY_DERP`; legacy `ROOMLER_AGENT_…` alias honoured.)
-/// **Default OFF** — DERP is the last-resort carrier for two BOTH-UDP-blocked
-/// peers (a strict corp firewall that permits only TCP/TLS-443), which no other
-/// tier can serve; both peers dial OUT to the relay over WSS:443 and WG rides
-/// end-to-end. Only chosen when this is on, both ends advertise `supports_derp`,
-/// AND both are UDP-blocked (the single-relay `(false,false)` arm). Off until
-/// field-proven, then flipped default-ON like the other tiers. Set
-/// `1`/`true`/`yes`/`on` to enable.
+/// **Default ON** since 2026-07-21 (field-proven). DERP is the last-resort
+/// carrier for two BOTH-UDP-blocked peers (a strict corp firewall that permits
+/// only TCP/TLS-443), which no other tier can serve; both peers dial OUT to the
+/// relay over WSS:443 and WG rides end-to-end. Only CHOSEN when both ends
+/// advertise `supports_derp` AND both are UDP-blocked (the single-relay
+/// `(false,false)` arm), so a UDP-capable pair never touches it — default-ON
+/// just means an overlay node keeps a `/derp` WS available in case a
+/// both-UDP-blocked peer appears. Field-proven 2026-07-21 (mars↔zeus netns,
+/// both UDP+coturn-TCP-blocked → WG over `/derp` at 0% loss, ~2.7 ms). Set
+/// `0`/`false`/`no`/`off` to disable. (Follow-up: open the `/derp` WS lazily —
+/// only when this node is itself UDP-blocked — so UDP-capable nodes don't hold
+/// an idle WS.)
 pub fn derp_enabled() -> bool {
     match crate::env::node_env("OVERLAY_DERP") {
         Some(v) => {
             let t = v.trim();
-            t.eq_ignore_ascii_case("1")
-                || t.eq_ignore_ascii_case("true")
-                || t.eq_ignore_ascii_case("yes")
-                || t.eq_ignore_ascii_case("on")
+            !(t.eq_ignore_ascii_case("0")
+                || t.eq_ignore_ascii_case("false")
+                || t.eq_ignore_ascii_case("no")
+                || t.eq_ignore_ascii_case("off"))
         }
-        None => false,
+        None => true,
     }
 }
 
