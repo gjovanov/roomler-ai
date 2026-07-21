@@ -3,150 +3,423 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Roomler Agent</title>
+    <title>Roomler</title>
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
-    <header>
-      <h1>Roomler Agent</h1>
-      <nav>
-        <a href="#index.html" class="active">Status</a>
-        <a href="#enrollment.html">Onboarding</a>
-        <a href="#settings.html">Settings</a>
+    <!-- ── Sidebar ─────────────────────────────────────────────────── -->
+    <aside id="sidebar">
+      <div class="brand">
+        <div class="brand-mark">R</div>
+        <div>
+          <div class="brand-name">Roomler</div>
+          <div class="brand-version" id="brand-version"></div>
+        </div>
+      </div>
+
+      <nav id="nav">
+        <a href="#/overview" data-view="overview">
+          <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path>
+            <polyline points="9 22 9 12 15 12 15 22"></polyline>
+          </svg>
+          Overview
+        </a>
+        <a href="#/devices" data-view="devices">
+          <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect>
+            <line x1="8" y1="21" x2="16" y2="21"></line>
+            <line x1="12" y1="17" x2="12" y2="21"></line>
+          </svg>
+          Devices
+        </a>
+        <a href="#/tunnels" data-view="tunnels">
+          <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <polyline points="17 1 21 5 17 9"></polyline>
+            <path d="M3 11V9a4 4 0 0 1 4-4h14"></path>
+            <polyline points="7 23 3 19 7 15"></polyline>
+            <path d="M21 13v2a4 4 0 0 1-4 4H3"></path>
+          </svg>
+          Tunnels
+        </a>
+        <a href="#/settings" data-view="settings">
+          <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="3"></circle>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+          </svg>
+          Settings
+        </a>
+        <a href="#/onboarding" data-view="onboarding">
+          <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"></path>
+          </svg>
+          Onboarding
+        </a>
       </nav>
-    </header>
-    <main id="status-view">
-      <section id="status-loading">
-        <p class="muted">Loading status…</p>
-      </section>
-      <section id="status-content" hidden>
-        <!-- enrolled banner -->
-        <div id="enrolled-banner" class="banner banner-ok" hidden>
-          <strong>Enrolled</strong>
-          <span class="muted" id="banner-device-name"></span>
+
+      <div id="conn-indicator">
+        <span class="dot dot-off" id="conn-dot"></span>
+        <span id="conn-label">Connecting…</span>
+      </div>
+    </aside>
+
+    <!-- ── Content pane ────────────────────────────────────────────── -->
+    <main id="content">
+      <!-- Overview -->
+      <section id="view-overview" class="view" hidden>
+        <div class="view-head"><h2>Overview</h2></div>
+        <p class="view-sub">This device and its place in your Roomler network.</p>
+
+        <div id="ov-not-enrolled" class="banner banner-warn" hidden>
+          <div>
+            <strong>Not enrolled</strong>
+            <p class="muted small" style="margin: 4px 0 8px">
+              This device isn't part of a Roomler network yet. Enroll it with a
+              token from a tenant admin.
+            </p>
+            <button type="button" class="primary" id="ov-btn-onboard">Set up this device</button>
+          </div>
         </div>
-        <div id="not-enrolled-banner" class="banner banner-warn" hidden>
-          <strong>Not enrolled</strong>
-          <button type="button" class="primary" onclick="window.location.hash = '#enrollment.html'">Onboard this device</button>
-        </div>
-        <div id="attention-banner" class="banner banner-error" hidden>
+
+        <div id="ov-attention" class="banner banner-error" hidden>
           <strong>Attention required</strong>
-          <p class="muted" id="attention-path"></p>
+          <span class="muted small" id="ov-attention-path"></span>
         </div>
 
-        <!-- status grid -->
-        <dl class="kv">
-          <dt>Agent version</dt>
-          <dd id="kv-version">—</dd>
-          <dt>Service</dt>
-          <dd id="kv-service">—</dd>
-          <dt>Server</dt>
-          <dd id="kv-server">—</dd>
-          <dt>Agent ID</dt>
-          <dd id="kv-agent-id" class="mono">—</dd>
-          <dt>Tenant ID</dt>
-          <dd id="kv-tenant-id" class="mono">—</dd>
-          <dt>Config schema</dt>
-          <dd id="kv-schema">—</dd>
-          <dt>Log directory</dt>
-          <dd id="kv-log-dir" class="mono small">—</dd>
-        </dl>
-
-        <!-- actions -->
-        <div class="actions">
-          <button type="button" id="btn-check-update">Check for Updates</button>
-          <button type="button" id="btn-apply-update" hidden>Install update</button>
-          <button type="button" id="btn-open-logs">Open Logs Folder</button>
-          <button type="button" id="btn-open-config">Open Config Folder</button>
-          <button type="button" id="btn-service-install">Install Service</button>
+        <div class="card">
+          <div class="card-title-row">
+            <h3>This device</h3>
+            <span id="ov-enrolled-chip" class="chip chip-muted">…</span>
+          </div>
+          <dl class="kv">
+            <dt>Device name</dt>
+            <dd id="ov-name">—</dd>
+            <dt>Overlay IP</dt>
+            <dd id="ov-ip" class="mono">—</dd>
+            <dt>Server</dt>
+            <dd id="ov-server" class="mono">—</dd>
+            <dt>Server link</dt>
+            <dd id="ov-link">—</dd>
+            <dt>Service</dt>
+            <dd id="ov-service">—</dd>
+            <dt>App version</dt>
+            <dd id="ov-app-version" class="mono">—</dd>
+            <dt>Service version</dt>
+            <dd id="ov-daemon-version" class="mono">—</dd>
+            <dt>Network</dt>
+            <dd id="ov-counts">—</dd>
+          </dl>
         </div>
-        <pre id="action-output" class="output" hidden></pre>
+
+        <div class="card" id="ov-exit-card" hidden>
+          <div class="card-title-row">
+            <h3>Exit node</h3>
+            <span id="ov-exit-chip" class="chip chip-muted">…</span>
+          </div>
+          <dl class="kv">
+            <dt>Routing via</dt>
+            <dd id="ov-exit-selector" class="mono">—</dd>
+            <dt>Status</dt>
+            <dd id="ov-exit-status">—</dd>
+          </dl>
+        </div>
+
+        <div class="card">
+          <h3>Updates</h3>
+          <div class="actions" style="margin-top: 0">
+            <button type="button" id="btn-check-update">Check for updates</button>
+            <button type="button" id="btn-apply-update" class="primary" hidden>Install update</button>
+          </div>
+          <pre id="action-output" class="output" hidden></pre>
+        </div>
       </section>
 
-      <!-- Devices (unification P2): this node + its overlay peers, read live
-           from the running daemon over the LocalAPI (cmd_device_view). -->
-      <section id="devices-view">
-        <h2 class="muted small">Devices</h2>
-        <p id="devices-loading" class="muted small">Loading devices…</p>
+      <!-- Devices -->
+      <section id="view-devices" class="view" hidden>
+        <div class="view-head"><h2>Devices</h2></div>
+        <p class="view-sub">
+          Devices in your network and how this one reaches them, live from the
+          device service.
+        </p>
 
         <div id="devices-unavailable" class="banner banner-warn" hidden>
           <div>
             <strong>Device service not running</strong>
-            <p class="muted small">The Roomler agent isn't running on this machine, so live device state is unavailable.</p>
+            <p class="muted small" style="margin: 4px 0 0">
+              The Roomler service isn't running on this machine, so live device
+              state is unavailable.
+            </p>
           </div>
         </div>
 
-        <div id="devices-self" hidden>
-          <dl class="kv">
-            <dt>This device</dt>
-            <dd id="dv-self-name" class="mono">—</dd>
-            <dt>Overlay IP</dt>
-            <dd id="dv-self-ip" class="mono">—</dd>
-            <dt>Server link</dt>
-            <dd id="dv-self-conn">—</dd>
-            <dt>Device version</dt>
-            <dd id="dv-self-version" class="mono small">—</dd>
-          </dl>
-
-          <p id="dv-peers-empty" class="muted small" hidden></p>
-          <table id="dv-peers-table" class="peers" hidden>
-            <thead>
-              <tr><th>Device</th><th>Overlay IP</th><th>Overlay IPv6</th><th>Connection</th><th>RTT</th><th>Ping</th></tr>
-            </thead>
-            <tbody id="dv-peers-body"></tbody>
-          </table>
+        <div id="devices-content" hidden>
+          <div class="card">
+            <p id="dv-peers-empty" class="muted small" style="margin: 0" hidden></p>
+            <div class="tbl-wrap">
+              <table id="dv-peers-table" class="tbl" hidden>
+                <thead>
+                  <tr>
+                    <th>Device</th>
+                    <th>Overlay IP</th>
+                    <th>Connection</th>
+                    <th>Ping</th>
+                  </tr>
+                </thead>
+                <tbody id="dv-peers-body"></tbody>
+              </table>
+            </div>
+          </div>
         </div>
       </section>
 
-      <!-- P6: declared, daemon-supervised tunnel routes. -->
-      <section id="tunnels-view">
-        <h2>Tunnels</h2>
-        <p class="muted small">
-          Declared routes are supervised by the device service: they come back
+      <!-- Tunnels -->
+      <section id="view-tunnels" class="view" hidden>
+        <div class="view-head"><h2>Tunnels</h2></div>
+        <p class="view-sub">
+          Declared routes are supervised by the device service — they come back
           on every restart until removed.
         </p>
 
-        <p id="tn-empty" class="muted small" hidden>
-          No declared routes yet — add one below.
-        </p>
-        <table id="tn-table" class="peers" hidden>
-          <thead>
-            <tr><th>ID</th><th>Kind</th><th>Local</th><th>Remote</th><th>Node</th><th>State</th><th></th></tr>
-          </thead>
-          <tbody id="tn-body"></tbody>
-        </table>
+        <div class="card">
+          <h3>Declared routes</h3>
+          <p id="tn-empty" class="muted small" style="margin: 0" hidden>
+            No declared routes yet — add one below.
+          </p>
+          <div class="tbl-wrap">
+            <table id="tn-table" class="tbl" hidden>
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>Kind</th>
+                  <th>Local</th>
+                  <th>Remote</th>
+                  <th>Device</th>
+                  <th>State</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody id="tn-body"></tbody>
+            </table>
+          </div>
 
-        <details id="tn-add">
-          <summary>Add route</summary>
-          <form id="tn-form" autocomplete="off">
-            <label>Target agent id
-              <input id="tn-agent" type="text" placeholder="24-hex agent id" required />
-            </label>
-            <label>Local port
-              <input id="tn-local" type="number" min="1" max="65535" required />
-            </label>
-            <label>Remote (host:port — leave empty for SOCKS5)
-              <input id="tn-remote" type="text" placeholder="10.0.0.5:5432" />
-            </label>
-            <label>Transport
-              <select id="tn-transport">
-                <option value="" selected>auto</option>
-                <option value="quic">quic</option>
-                <option value="webrtc">webrtc</option>
-              </select>
-            </label>
-            <label>Route id (optional)
-              <input id="tn-id" type="text" placeholder="generated when empty" />
-            </label>
-            <button type="submit" class="primary">Add route</button>
-            <p id="tn-form-error" class="error small" hidden></p>
+          <details id="tn-add">
+            <summary>Add route…</summary>
+            <form id="tn-form" class="form-narrow" autocomplete="off">
+              <label>Target device
+                <select id="tn-node"></select>
+              </label>
+              <input
+                id="tn-custom-node"
+                type="text"
+                placeholder="24-hex agent id"
+                spellcheck="false"
+                hidden
+              />
+              <label>Local port
+                <input id="tn-local" type="number" min="1" max="65535" required />
+              </label>
+              <label>Remote (host:port — leave empty for SOCKS5)
+                <input id="tn-remote" type="text" placeholder="10.0.0.5:5432" spellcheck="false" />
+              </label>
+              <label>Transport
+                <select id="tn-transport">
+                  <option value="" selected>auto</option>
+                  <option value="quic">quic</option>
+                  <option value="webrtc">webrtc</option>
+                </select>
+              </label>
+              <label>Route id (optional)
+                <input id="tn-id" type="text" placeholder="generated when empty" spellcheck="false" />
+              </label>
+              <div class="actions">
+                <button type="submit" class="primary">Add route</button>
+              </div>
+              <p id="tn-form-error" class="error small" hidden></p>
+            </form>
+          </details>
+        </div>
+
+        <div class="card" id="tn-flows-card" hidden>
+          <h3>Live forwards</h3>
+          <div class="tbl-wrap">
+            <table id="tn-flows-table" class="tbl">
+              <thead>
+                <tr>
+                  <th>Kind</th>
+                  <th>Local</th>
+                  <th>Target</th>
+                  <th>Device</th>
+                  <th>Transport</th>
+                  <th>Conns</th>
+                  <th>Traffic</th>
+                </tr>
+              </thead>
+              <tbody id="tn-flows-body"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- Settings -->
+      <section id="view-settings" class="view" hidden>
+        <div class="view-head"><h2>Settings</h2></div>
+        <p class="view-sub">Device identity, service management and file locations.</p>
+
+        <div id="st-split-banner" class="banner banner-warn" hidden>
+          <div>
+            <strong>Two configurations found</strong>
+            <p class="muted small" style="margin: 4px 0 0">
+              Both a machine-wide and a per-user configuration exist on this
+              machine. The service uses the one shown under Files below — the
+              other copy is likely stale and worth removing.
+            </p>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>Device name</h3>
+          <form id="rename-form" class="form-narrow" autocomplete="off">
+            <input
+              type="text"
+              id="rename-input"
+              placeholder="(loading current name…)"
+              spellcheck="false"
+              autocapitalize="off"
+            />
+            <div class="actions">
+              <button type="submit" class="primary">Rename device</button>
+            </div>
           </form>
-        </details>
+          <p class="muted small">
+            Takes effect on the next reconnect — the service re-announces itself
+            with the new name.
+          </p>
+          <p class="muted small scm-hint" hidden>
+            This device runs a machine-wide service — changing this needs
+            administrator rights (run the desktop app elevated, or use the
+            <span class="mono">roomlerd</span> CLI from an elevated shell).
+          </p>
+        </div>
+
+        <div class="card">
+          <h3>Re-enrollment</h3>
+          <form id="re-enroll-form" class="form-narrow" autocomplete="off">
+            <label for="re-token">New enrollment token</label>
+            <textarea
+              id="re-token"
+              rows="4"
+              spellcheck="false"
+              autocapitalize="off"
+              placeholder="eyJ…"
+            ></textarea>
+            <div class="actions">
+              <button type="submit">Re-enroll with new token</button>
+            </div>
+          </form>
+          <p class="muted small">
+            Used when this device's token has been revoked. Server URL and device
+            name are preserved.
+          </p>
+          <p class="muted small scm-hint" hidden>
+            This device runs a machine-wide service — changing this needs
+            administrator rights (run the desktop app elevated, or use the
+            <span class="mono">roomlerd</span> CLI from an elevated shell).
+          </p>
+        </div>
+
+        <div class="card">
+          <h3>Background service</h3>
+          <dl class="kv">
+            <dt>Status</dt>
+            <dd id="st-service">—</dd>
+          </dl>
+          <div class="actions">
+            <button type="button" id="btn-service-install">Install auto-start</button>
+            <button type="button" id="btn-service-uninstall" class="danger">Remove auto-start</button>
+          </div>
+          <p class="muted small">
+            Auto-start runs the device service at login (per-user install).
+            Machine-wide service installs are managed by the Roomler Setup
+            installer.
+          </p>
+        </div>
+
+        <div class="card">
+          <h3>Files</h3>
+          <dl class="kv">
+            <dt>Logs</dt>
+            <dd id="st-log-dir" class="mono small">—</dd>
+            <dt>Configuration</dt>
+            <dd id="st-config-dir" class="mono small">—</dd>
+          </dl>
+          <div class="actions">
+            <button type="button" id="btn-open-logs">Open logs folder</button>
+            <button type="button" id="btn-open-config">Open config folder</button>
+          </div>
+        </div>
+
+        <div id="settings-result" class="banner" hidden></div>
+      </section>
+
+      <!-- Onboarding -->
+      <section id="view-onboarding" class="view" hidden>
+        <div class="view-head"><h2>Onboarding</h2></div>
+        <p class="view-sub">
+          Enroll this device into a Roomler network. Ask a tenant admin for an
+          enrollment token (Admin → Devices → Generate enrollment token) — it is
+          single-use and expires after 10 minutes.
+        </p>
+
+        <div class="card form-narrow">
+          <form id="enroll-form" autocomplete="off">
+            <label for="server">Server URL</label>
+            <input
+              type="text"
+              id="server"
+              name="server"
+              value="https://roomler.ai"
+              spellcheck="false"
+              autocapitalize="off"
+              required
+            />
+
+            <label for="device-name">Device name</label>
+            <input
+              type="text"
+              id="device-name"
+              name="device-name"
+              placeholder="will default to this machine's hostname"
+              spellcheck="false"
+              autocapitalize="off"
+              required
+            />
+
+            <label for="token">Enrollment token</label>
+            <textarea
+              id="token"
+              name="token"
+              rows="5"
+              placeholder="eyJ…"
+              spellcheck="false"
+              autocapitalize="off"
+              required
+            ></textarea>
+
+            <div class="actions">
+              <button type="submit" id="btn-enroll" class="primary">Enroll this device</button>
+            </div>
+          </form>
+          <div id="enroll-result" class="banner" hidden></div>
+        </div>
       </section>
     </main>
-    <script src="status.js"></script>
-    <script src="consent.js"></script>
+
+    <script src="app.js"></script>
+    <script src="overview.js"></script>
     <script src="devices.js"></script>
     <script src="tunnels.js"></script>
+    <script src="settings.js"></script>
+    <script src="onboarding.js"></script>
+    <script src="consent.js"></script>
   </body>
 </html>
