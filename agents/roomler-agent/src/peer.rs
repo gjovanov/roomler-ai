@@ -1094,8 +1094,16 @@ async fn detect_constrained_transport(
     let ice = dtls.ice_transport();
     for _ in 0..30 {
         if let Some(pair) = ice.get_selected_candidate_pair().await {
-            let relay = pair.local().typ == RTCIceCandidateType::Relay
-                || pair.remote().typ == RTCIceCandidateType::Relay;
+            let local = pair.local();
+            let remote = pair.remote();
+            // Loopback-TURN corp-relay (Phase 3): a relay candidate at a
+            // loopback/overlay address is the local agent's own fast TURN (the
+            // loopback-TURN), NOT the capped far coturn — so it must not count
+            // as constrained. A public relay (real coturn) still does.
+            let relay = (local.typ == RTCIceCandidateType::Relay
+                && !crate::encode::relay_addr_is_fast_local(&local.address))
+                || (remote.typ == RTCIceCandidateType::Relay
+                    && !crate::encode::relay_addr_is_fast_local(&remote.address));
             // Relay-escape — log the ADDRESSES, not just the types: a
             // "direct" Srflx↔Prflx pair whose remote is the router's WAN IP
             // is a NAT hairpin, while a 192.168.x remote is the true LAN
@@ -1103,12 +1111,12 @@ async fn detect_constrained_transport(
             info!(
                 %session_id,
                 relay,
-                local_typ = ?pair.local().typ,
-                local_proto = ?pair.local().protocol,
-                local_addr = %format!("{}:{}", pair.local().address, pair.local().port),
-                remote_typ = ?pair.remote().typ,
-                remote_proto = ?pair.remote().protocol,
-                remote_addr = %format!("{}:{}", pair.remote().address, pair.remote().port),
+                local_typ = ?local.typ,
+                local_proto = ?local.protocol,
+                local_addr = %format!("{}:{}", local.address, local.port),
+                remote_typ = ?remote.typ,
+                remote_proto = ?remote.protocol,
+                remote_addr = %format!("{}:{}", remote.address, remote.port),
                 "per-session ICE path detected (adaptive bitrate)"
             );
             return relay;
@@ -1141,16 +1149,23 @@ async fn current_pair_is_relay(
     let dtls = sctp.transport();
     let ice = dtls.ice_transport();
     let pair = ice.get_selected_candidate_pair().await?;
-    let relay = pair.local().typ == RTCIceCandidateType::Relay
-        || pair.remote().typ == RTCIceCandidateType::Relay;
+    let local = pair.local();
+    let remote = pair.remote();
+    // Loopback-TURN corp-relay (Phase 3): a loopback/overlay relay is the local
+    // agent's own fast TURN, not the capped far coturn — see
+    // `relay_addr_is_fast_local`. Mirrors `detect_constrained_transport`.
+    let relay = (local.typ == RTCIceCandidateType::Relay
+        && !crate::encode::relay_addr_is_fast_local(&local.address))
+        || (remote.typ == RTCIceCandidateType::Relay
+            && !crate::encode::relay_addr_is_fast_local(&remote.address));
     if relay != previous {
         info!(
             %session_id,
             was_relay = previous,
             now_relay = relay,
-            local_addr = %format!("{}:{}", pair.local().address, pair.local().port),
-            remote_typ = ?pair.remote().typ,
-            remote_addr = %format!("{}:{}", pair.remote().address, pair.remote().port),
+            local_addr = %format!("{}:{}", local.address, local.port),
+            remote_typ = ?remote.typ,
+            remote_addr = %format!("{}:{}", remote.address, remote.port),
             "transport path changed mid-session — updating bitrate clamp (relay-escape)"
         );
     }
