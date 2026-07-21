@@ -13,6 +13,8 @@ pub mod config;
 pub mod consent;
 pub mod crash_recorder;
 pub mod crash_uploader;
+#[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
+pub mod derp;
 pub mod display_match;
 pub mod displays;
 #[cfg(target_os = "windows")]
