@@ -839,6 +839,12 @@ pub struct OverlayNode {
     /// support it (a mismatch would split the pair into anchor/dialer).
     #[serde(default)]
     pub supports_relay_single: bool,
+    /// Phase D (DERP) — the node advertised (on JOIN) that it can carry WG over
+    /// the pubkey-addressed `/derp` relay, the last-resort carrier for two
+    /// BOTH-UDP-blocked peers. Echoed per-peer in the netmap so DERP is only
+    /// chosen when both ends support it. Absent on a pre-DERP row ⇒ `false`.
+    #[serde(default)]
+    pub supports_derp: bool,
     /// Phase 1 — subnet CIDRs this node CLAIMS it can route for peers (from its
     /// `--advertise-routes` config, refreshed on each join). Untrusted until an
     /// admin approves; see `approved_routes`.

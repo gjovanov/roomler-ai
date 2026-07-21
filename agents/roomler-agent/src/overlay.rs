@@ -81,6 +81,19 @@ pub async fn maybe_start(
         Vec::new()
     };
 
+    // Phase D (DERP) — when enabled, open the persistent `/derp` WS and hand its
+    // demux to the runtime, so a both-UDP-blocked peer pair can carry WG over
+    // the pubkey-addressed relay (both dial OUT over TCP/TLS-443). Default-OFF.
+    let derp_mux = if tunnel_core::overlay::direct::derp_enabled() {
+        let (mux, outbound_rx) =
+            tunnel_core::transport::derp::DerpMux::new(keypair.public.to_bytes());
+        crate::derp::spawn(&cfg.ws_url(), &cfg.agent_token, &mux, outbound_rx);
+        info!("overlay derp: /derp carrier enabled (both-UDP-blocked tier)");
+        Some(mux)
+    } else {
+        None
+    };
+
     let rt = OverlayRuntime::new_relay(keypair, outbound, tun_factory, OVERLAY_MTU)
         // Phase 1 — advertise this node's subnet routes (admin-gated server-side).
         // P5 — plus `0.0.0.0/0` when this node is configured as an exit node.
@@ -88,6 +101,8 @@ pub async fn maybe_start(
         // P5 — route THIS node's default egress through a chosen exit peer (with
         // carrier-endpoint exemptions), when `overlay_exit_node` is set.
         .with_exit_node(cfg.overlay_exit_node.clone(), exit_server_ips)
+        // Phase D — attach the `/derp` demux (present only when DERP is enabled).
+        .with_derp_mux(derp_mux)
         // Unification P1 — publish the live mesh view for the LocalAPI so
         // `roomler status` / `peers` see per-device connection types.
         .with_peer_view(peer_view);
