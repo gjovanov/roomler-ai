@@ -1030,6 +1030,138 @@ mod turn_tests {
         let _ = srv.await;
     }
 
+    /// Phase-0 spike for the **loopback-TURN corp-relay** plan
+    /// (`~/.claude/plans/roomler-loopback-turn-corp-relay.md`).
+    ///
+    /// The make-or-break unknown: will TWO **webrtc-rs** peers (the browser
+    /// and the remote agent both speak webrtc-rs' TURN client) converge on a
+    /// RELAY path through a TURN server WE host in-process — auto-handling the
+    /// relay-to-relay TURN permission dance — the way Option 2 needs? The QUIC
+    /// test above proves a hosted TURN + two raw allocations relay end-to-end
+    /// (with a MANUAL `\x00` permission bootstrap); this proves the same over
+    /// webrtc-rs' ICE agent, which must install those permissions itself.
+    ///
+    /// `ice_transport_policy = Relay` forces BOTH peers to use only the TURN,
+    /// so a DataChannel message arriving == the self-hosted relay path worked.
+    /// A loopback relay address stands in for the agent's overlay IP (routing
+    /// to the overlay IP is proven separately by the netstack UDP mesh).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn webrtc_peers_relay_through_self_hosted_turn() {
+        use tokio::sync::mpsc;
+        use webrtc::api::APIBuilder;
+        use webrtc::api::interceptor_registry::register_default_interceptors;
+        use webrtc::api::media_engine::MediaEngine;
+        use webrtc::data_channel::data_channel_message::DataChannelMessage;
+        use webrtc::ice_transport::ice_candidate::RTCIceCandidate;
+        use webrtc::ice_transport::ice_server::RTCIceServer;
+        use webrtc::peer_connection::configuration::RTCConfiguration;
+        use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy;
+
+        let (_server, turn_addr) = loopback_turn_server().await;
+
+        // Build a fresh webrtc-rs API (same recipe as the agent's peer.rs).
+        let build_pc = || async {
+            let mut engine = MediaEngine::default();
+            engine.register_default_codecs().unwrap();
+            let mut registry = webrtc::interceptor::registry::Registry::new();
+            registry = register_default_interceptors(registry, &mut engine).unwrap();
+            let api = APIBuilder::new()
+                .with_media_engine(engine)
+                .with_interceptor_registry(registry)
+                .build();
+            let config = RTCConfiguration {
+                ice_servers: vec![RTCIceServer {
+                    // Plain `turn:` UDP only — webrtc-rs silently drops
+                    // turns:/?transport=tcp (memory: webrtc-rs TURN-URL gap).
+                    urls: vec![format!("turn:{turn_addr}")],
+                    username: USER.to_owned(),
+                    credential: PASS.to_owned(),
+                }],
+                // Force the relay path so success == the hosted TURN carried it.
+                ice_transport_policy: RTCIceTransportPolicy::Relay,
+                ..Default::default()
+            };
+            Arc::new(api.new_peer_connection(config).await.unwrap())
+        };
+
+        let pc_a = build_pc().await;
+        let pc_b = build_pc().await;
+
+        // In-process trickle ICE both directions.
+        let pc_b_ice = pc_b.clone();
+        pc_a.on_ice_candidate(Box::new(move |c: Option<RTCIceCandidate>| {
+            let pc_b = pc_b_ice.clone();
+            Box::pin(async move {
+                if let Some(c) = c
+                    && let Ok(init) = c.to_json()
+                {
+                    let _ = pc_b.add_ice_candidate(init).await;
+                }
+            })
+        }));
+        let pc_a_ice = pc_a.clone();
+        pc_b.on_ice_candidate(Box::new(move |c: Option<RTCIceCandidate>| {
+            let pc_a = pc_a_ice.clone();
+            Box::pin(async move {
+                if let Some(c) = c
+                    && let Ok(init) = c.to_json()
+                {
+                    let _ = pc_a.add_ice_candidate(init).await;
+                }
+            })
+        }));
+
+        // B receives the inbound DataChannel and forwards its first message.
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        pc_b.on_data_channel(Box::new(
+            move |dc: Arc<webrtc::data_channel::RTCDataChannel>| {
+                let tx = tx.clone();
+                Box::pin(async move {
+                    dc.on_message(Box::new(move |msg: DataChannelMessage| {
+                        let tx = tx.clone();
+                        let s = String::from_utf8_lossy(&msg.data).to_string();
+                        Box::pin(async move {
+                            let _ = tx.send(s);
+                        })
+                    }));
+                })
+            },
+        ));
+
+        // A opens the DataChannel (before the offer, so it's in the SDP) and
+        // sends once it's open.
+        let dc_a = pc_a.create_data_channel("spike", None).await.unwrap();
+        let dc_send = dc_a.clone();
+        dc_a.on_open(Box::new(move || {
+            let dc = dc_send.clone();
+            Box::pin(async move {
+                let _ = dc.send_text("relay-spike".to_owned()).await;
+            })
+        }));
+
+        // Offer / answer.
+        let offer = pc_a.create_offer(None).await.unwrap();
+        pc_a.set_local_description(offer.clone()).await.unwrap();
+        pc_b.set_remote_description(offer).await.unwrap();
+        let answer = pc_b.create_answer(None).await.unwrap();
+        pc_b.set_local_description(answer.clone()).await.unwrap();
+        pc_a.set_remote_description(answer).await.unwrap();
+
+        // The whole point: does the relay-to-relay pair converge + carry data
+        // through OUR hosted TURN, with webrtc-rs installing the permissions?
+        let got = tokio::time::timeout(Duration::from_secs(25), rx.recv())
+            .await
+            .expect("webrtc-rs relay-through-self-hosted-TURN TIMED OUT (permission dance or pair selection failed — the spike's kill signal)")
+            .expect("data channel closed before the message arrived");
+        assert_eq!(
+            got, "relay-spike",
+            "DataChannel message round-tripped over the self-hosted TURN relay"
+        );
+
+        pc_a.close().await.unwrap();
+        pc_b.close().await.unwrap();
+    }
+
     // ───────────── LIVE coturn smokes (Phase 3 e2e, ignored) ─────────────
     //
     // These exercise the REAL [`allocate_relay_from_ice`] entry against the
