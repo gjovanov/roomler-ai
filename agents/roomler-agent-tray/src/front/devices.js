@@ -1,23 +1,18 @@
 /*
- * Devices view (unification P2). Polls `cmd_device_view` and paints this node
- * + its overlay peers with their connection type — the Tailscale-style "which
- * of my devices is reachable, and how" list.
+ * Devices view: the network's peers with their live connection type — the
+ * Tailscale-style "which of my devices is reachable, and how" table.
  *
- * No bundler (see status.js header); pure ES2020; `window.__TAURI__.core.invoke`
- * via `withGlobalTauri`. Peer-supplied strings (names, IPs from OTHER devices)
- * are written with textContent only — never innerHTML — so a hostile device
- * name can't inject markup.
+ * Renders from the central store (`cmd_device_view`, polled by app.js).
+ * Peer-supplied strings (names, IPs from OTHER devices) are written with
+ * textContent only — never innerHTML — so a hostile device name can't
+ * inject markup.
  */
 (function () {
-  const invoke = (name, payload) => window.__TAURI__.core.invoke(name, payload || {});
-  function $(id) { return document.getElementById(id); }
-  function show(el) { if (el) el.hidden = false; }
-  function hide(el) { if (el) el.hidden = true; }
-  function setText(id, t) { const el = $(id); if (el) el.textContent = t; }
+  'use strict';
+  const { $, invoke, show, hide, fmtRelative, on } = window.Roomler;
 
   // Wire values are snake_case (ConnectionType serde); map to a label + a CSS
-  // badge class. `tunnel` is forward-compat — the agent daemon doesn't emit it
-  // until the tunnel-client folds in (P3).
+  // badge class.
   const CONN = {
     direct: 'Direct',
     relay: 'Relay',
@@ -27,55 +22,26 @@
   };
 
   // Last ping outcome per target (overlay IP / name). The peers table repaints
-  // every 2s (replaceChildren), so results are kept here and re-rendered rather
-  // than living only in the transient DOM.
+  // every 2 s (replaceChildren), so results are kept here and re-rendered
+  // rather than living only in the transient DOM.
   const pingResults = new Map();
 
-  async function refresh() {
-    let view;
-    try {
-      view = await invoke('cmd_device_view');
-    } catch (err) {
-      // cmd_device_view is never-fail by contract; a throw here is unexpected.
-      console.error('cmd_device_view failed', err);
-      return;
-    }
-    paint(view);
-  }
-
   function paint(view) {
-    hide($('devices-loading'));
-
-    // Zero-state 1 — the daemon's LocalAPI wasn't reachable (agent not running).
+    // Zero-state 1 — the daemon's LocalAPI wasn't reachable (service down).
     if (!view.available) {
       show($('devices-unavailable'));
-      hide($('devices-self'));
+      hide($('devices-content'));
       return;
     }
     hide($('devices-unavailable'));
-    show($('devices-self'));
+    show($('devices-content'));
 
     const s = view.status || {};
-    setText('dv-self-name', s.name || '—');
-    // Both families when the daemon publishes the derived v6.
-    setText(
-      'dv-self-ip',
-      s.overlay_ip
-        ? s.overlay_ip6
-          ? `${s.overlay_ip} · ${s.overlay_ip6}`
-          : s.overlay_ip
-        : '(no overlay IP)',
-    );
-    setText('dv-self-conn', s.connected ? 'connected' : 'disconnected');
-    setText('dv-self-version', s.version || '—');
-
     const body = $('dv-peers-body');
-    body.replaceChildren();
-
     const peers = view.peers || [];
+
     if (peers.length === 0) {
-      // Zero-state 2/3 — connected-but-no-peers (overlay off / alone) vs the
-      // WS being down (peers are hidden until re-synced).
+      // Zero-state 2/3 — connected-but-no-peers vs the WS being down.
       hide($('dv-peers-table'));
       const empty = $('dv-peers-empty');
       empty.textContent = s.connected
@@ -87,32 +53,43 @@
 
     hide($('dv-peers-empty'));
     show($('dv-peers-table'));
-    for (const p of peers) {
-      body.appendChild(peerRow(p));
-    }
+    body.replaceChildren(...peers.map(peerRow));
   }
 
   function peerRow(p) {
     const tr = document.createElement('tr');
     tr.appendChild(nameCell(p));
-    tr.appendChild(textCell(p.overlay_ip || '—', 'mono'));
-    tr.appendChild(textCell(p.overlay_ip6 || '—', 'mono'));
-    tr.appendChild(badgeCell(p.connection));
-    tr.appendChild(textCell(p.rtt_ms != null ? `${p.rtt_ms} ms` : '—'));
+    tr.appendChild(ipCell(p));
+    tr.appendChild(badgeCell(p));
     tr.appendChild(pingCell(p));
     return tr;
   }
 
-  // A live ICMP ping button per peer — resolves the peer by overlay IP (or name)
-  // and pings it over the userspace netstack via `cmd_ping`. The result (RTT or a
-  // failure with the daemon's message as a tooltip) persists across repaints via
-  // `pingResults`. Disabled for a peer with no address to target.
+  // v4 with the derived v6 as a second line — one column instead of two, so
+  // the table fits the window's minimum width without truncation.
+  function ipCell(p) {
+    const td = document.createElement('td');
+    td.className = 'mono';
+    td.appendChild(document.createTextNode(p.overlay_ip || '—'));
+    if (p.overlay_ip6) {
+      const sub = document.createElement('div');
+      sub.className = 'muted small mono';
+      sub.textContent = p.overlay_ip6;
+      td.appendChild(sub);
+    }
+    return td;
+  }
+
+  // A live ICMP ping button per peer — resolves the peer by overlay IP (or
+  // name) and pings it over the userspace netstack via `cmd_ping`. The result
+  // (RTT, or a failure with the daemon's message as a tooltip) persists across
+  // repaints via `pingResults`. Disabled for a peer with no address to target.
   function pingCell(p) {
     const td = document.createElement('td');
     td.className = 'ping-cell';
     const target = p.overlay_ip || p.name;
     const btn = document.createElement('button');
-    btn.className = 'ping-btn';
+    btn.className = 'sm';
     btn.textContent = 'Ping';
     const out = document.createElement('span');
     out.className = 'ping-result';
@@ -144,7 +121,7 @@
     out.removeAttribute('title');
     try {
       const r = await invoke('cmd_ping', { target });
-      const text = `${Number(r.rtt_ms).toFixed(1)} ms`;
+      const text = Number(r.rtt_ms).toFixed(1) + ' ms';
       pingResults.set(target, { ok: true, text });
       out.classList.add('ok');
       out.textContent = text;
@@ -160,36 +137,48 @@
     }
   }
 
-  function textCell(text, cls) {
-    const td = document.createElement('td');
-    td.textContent = text;
-    if (cls) td.className = cls;
-    return td;
-  }
-
+  // Name + online dot, with data-freshness as a second line ("active 5m
+  // ago") — last_seen_ms is only published for peers with a live carrier,
+  // so it reads as "how fresh is this row", not an offline timestamp.
   function nameCell(p) {
     const td = document.createElement('td');
     const dot = document.createElement('span');
     dot.className = 'dot ' + (p.online ? 'dot-on' : 'dot-off');
     td.appendChild(dot);
     td.appendChild(document.createTextNode(' ' + (p.name || '(unnamed)')));
+    if (p.last_seen_ms != null) {
+      const sub = document.createElement('div');
+      sub.className = 'muted small';
+      sub.textContent = 'active ' + fmtRelative(p.last_seen_ms);
+      td.appendChild(sub);
+    }
     return td;
   }
 
-  function badgeCell(conn) {
-    const key = String(conn || 'offline').toLowerCase();
+  // Connection badge with the live RTT beside it ("Direct · 4 ms").
+  function badgeCell(p) {
+    const key = String(p.connection || 'offline').toLowerCase();
     const td = document.createElement('td');
+    td.className = 'ping-cell';
     const span = document.createElement('span');
     span.className = 'badge badge-' + key;
     span.textContent = CONN[key] || key;
+    // For a relay peer the daemon reports both coturn-relayed endpoints
+    // (rc.187) — surface them as a tooltip for same-vs-cross-worker triage.
+    if (p.relay_local || p.relay_dst) {
+      span.title = 'relay ' + (p.relay_local || '?') + ' → ' + (p.relay_dst || '?');
+    }
     td.appendChild(span);
+    if (p.rtt_ms != null) {
+      const rtt = document.createElement('span');
+      rtt.className = 'muted small';
+      rtt.textContent = ' · ' + p.rtt_ms + ' ms';
+      td.appendChild(rtt);
+    }
     return td;
   }
 
   document.addEventListener('DOMContentLoaded', () => {
-    void refresh();
-    // Peers change as carriers come up / fall back; 2s keeps the view live
-    // without hammering the local pipe.
-    setInterval(refresh, 2000);
+    on('deviceView', paint);
   });
 })();
