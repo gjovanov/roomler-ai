@@ -6,6 +6,11 @@
 > a NAT'd node reaches another without a relay hop. The Windows-firewall piece
 > is [`docs/overlay-wfp.md`](./overlay-wfp.md); the exit-node routing on top of
 > a carrier is [`docs/overlay-exit-nodes.md`](./overlay-exit-nodes.md).
+>
+> For the **end-to-end picture with diagrams** — control plane vs data plane,
+> every tier as a sequence diagram, and which one wins inside vs outside a
+> corporate VPN — see
+> [`docs/overlay-communication.md`](./overlay-communication.md).
 
 ## The carrier cascade
 
@@ -18,7 +23,8 @@ order, and demotes to the next tier if it can't establish:
 | LAN direct | UDP on the shared interface socket | peer shares one of our /24s | `ROOMLER_NODE_OVERLAY_DIRECT` (**on**) |
 | **A** direct-to-public | UDP via an unbound egress socket | peer's NIC holds a public IP | `ROOMLER_NODE_OVERLAY_PUBLIC_DIRECT` (**off**) |
 | **C** srflx hole-punch | UDP via the **punch socket** | both ends NAT'd (not both symmetric) | `ROOMLER_NODE_OVERLAY_SRFLX` (**on** since rc.200) |
-| **D** single-relay | ONE coturn allocation + a raw dialer, QUIC-over-TURN | nothing direct works | `ROOMLER_NODE_OVERLAY_RELAY_SINGLE` (**on** since rc.200) |
+| **D** single-relay | ONE coturn allocation + a raw dialer, QUIC-over-TURN | nothing direct works **and ≥1 side is UDP-capable** | `ROOMLER_NODE_OVERLAY_RELAY_SINGLE` (**on** since rc.200) |
+| **D″** DERP | `/derp` WSS on `roomler.ai:443`, pubkey-addressed, raw WG | **both** ends UDP-blocked (TCP-only net) | `ROOMLER_NODE_OVERLAY_DERP` (**on** since rc.203) |
 | **D′** both-allocate relay | two coturn allocations (raw / QUIC) | single-relay off, or a mixed-capability pair | always available (fall-through) |
 
 LAN direct and the relay predate this work (rc.131–rc.135; the relay is the
@@ -158,24 +164,36 @@ and public escalate to a 24 h session-sticky deny after 2 failures (a false /24
 pair, which changes when a host roams, so a day-long deny would wrongly outlive
 it.
 
-## Phase D: the relay (and why DERP, eventually)
+## Phase D: the relay tiers
 
-The relay is coturn TURN, optionally upgraded to QUIC-over-TURN. It always works
-for the **single-relay** case (peer → coturn relayed addr → allocation owner),
-which the fleet's remote-desktop media already proves.
+The relay is coturn TURN, optionally upgraded to QUIC-over-TURN. **Single-relay**
+(peer → coturn relayed addr → allocation owner) is the primary path and needs
+only ONE allocation, which sidesteps the both-allocate hairpin entirely.
 
-The open problem is the exit-node / cross-NAT case where **both** ends allocate
-and coturn must hairpin between two of its own allocations — it never carried in
-the field. The mutual permission bootstrap (PR #124, the stray `\x00` from both
-ends) was necessary but not sufficient; a raw-UDP single-relay dialer also fails
-for **symmetric** NAT (coturn sees a different source port than STUN reported).
-The planned fix is a **DERP-style** pubkey-keyed relay: both peers dial *out*
-(NAT-agnostic for any NAT type, including symmetric), the relay maps
-`pubkey → connection` and forwards ciphertext. It reuses the existing
-QUIC-over-TURN plumbing and sidesteps every coturn trap (permissions, the 300 s
-refresh, srflx-must-be-permitted, symmetric port mismatch, the hairpin, worker
-pinning). Phase C serves cone↔cone directly; symmetric pairs are what Phase D
-must cover.
+The role split is by **UDP capability, not pubkey**: the UDP-blocked side becomes
+the **anchor** (it can still allocate over the TURNS/TCP-443 fallback) and the
+UDP-capable side becomes the raw-UDP **dialer**. The signal is simply whether the
+peer advertised `srflx_endpoints` — a successful STUN round-trip *is* proof that
+raw UDP to coturn works, so both ends compute the same roles with no extra wire
+field. Pubkey order is only the tie-break when both are UDP-capable.
+
+That leaves exactly one pair the tier cannot serve: **both** ends UDP-blocked —
+there is no side left to be the raw-UDP dialer. That case is now covered by
+**DERP** (tier D″, shipped default-ON in rc.203): a pubkey-addressed WebSocket
+relay at `/derp` on `roomler.ai:443` where **both** peers dial *out* over
+TCP/TLS, so no UDP, no inbound reachability, and no coturn permission model is
+involved at all. It is NAT-type agnostic by construction. Because a `DerpConn` is
+pinned to one peer pubkey, raw WireGuard rides it correctly — unlike single-relay,
+which must force QUIC so the anchor can reply to a symmetric dialer's
+coturn-observed port. Full protocol, security model, and diagrams:
+[`docs/overlay-communication.md`](./overlay-communication.md).
+
+The historic cross-NAT `REKEY_TIMEOUT` on the **both-allocate** fall-through was
+root-caused (live coturn diagnostics) as a **worker co-location** failure — the
+two allocations landing on *different* coturn workers — not a defect in the
+carrier itself: relay-to-relay hairpin and full WG over two same-worker
+allocations both verify green. Single-relay avoids it by using one allocation;
+DERP avoids coturn entirely.
 
 ## NAT lab (for field-validating Phase C)
 
