@@ -193,6 +193,29 @@ pub(crate) fn relay_res_cap_long_edge() -> Option<u32> {
     (v > 0).then_some(v)
 }
 
+/// Loopback-TURN corp-relay (Phase 3): is a relay candidate's ADDRESS the local
+/// agent's own fast TURN rather than the far capped coturn? The loopback-TURN
+/// hands out its relay candidates on loopback (127.0.0.0/8, ::1) or the overlay
+/// CGNAT/ULA range (100.64.0.0/10, fc00::/7); a real coturn relay lives at a
+/// public IP. When `true` the relay classifier ([`crate::peer`]) must NOT flag
+/// the pair as constrained — the whole point of routing a corp-Chrome viewer
+/// through the local overlay TURN is full-quality video, not the coturn caps.
+/// A public relay address (real coturn) still returns `false` ⇒ still capped.
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+pub(crate) fn relay_addr_is_fast_local(addr: &str) -> bool {
+    match addr.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => {
+            let o = v4.octets();
+            v4.is_loopback() || (o[0] == 100 && (64..=127).contains(&o[1]))
+        }
+        Ok(std::net::IpAddr::V6(v6)) => v6.is_loopback() || (v6.segments()[0] & 0xfe00) == 0xfc00,
+        Err(_) => false,
+    }
+}
+
 /// rc.190 (B2) — long-edge RESOLUTION cap for the SOFTWARE-encoded DC pump
 /// (libvpx). Mirrors the RTP pump's SW auto-downscale: a 4K panel through
 /// libvpx crawls (~25 fps at cpu-used 6, host CPU pinned — field GEAL8N6
@@ -774,5 +797,25 @@ mod tests {
             Some(v) => unsafe { std::env::set_var("ROOMLER_AGENT_RELAY_MAX_KBPS", v) },
             None => unsafe { std::env::remove_var("ROOMLER_AGENT_RELAY_MAX_KBPS") },
         }
+    }
+
+    /// Loopback-TURN corp-relay (Phase 3): the relay-address predicate. The local
+    /// agent's own fast TURN (loopback / overlay relay addresses) must NOT be
+    /// treated as a capped relay; a public coturn relay still must be.
+    #[test]
+    fn relay_addr_fast_local_excludes_loopback_and_overlay() {
+        // Loopback + overlay CGNAT (100.64.0.0/10) + overlay ULA (fc00::/7).
+        assert!(relay_addr_is_fast_local("127.0.0.1"));
+        assert!(relay_addr_is_fast_local("::1"));
+        assert!(relay_addr_is_fast_local("100.64.0.7"));
+        assert!(relay_addr_is_fast_local("100.127.255.255"));
+        assert!(relay_addr_is_fast_local("fd00::1"));
+        // Public / other-private / garbage → still capped (not fast-local).
+        assert!(!relay_addr_is_fast_local("100.63.255.255")); // below /10
+        assert!(!relay_addr_is_fast_local("100.128.0.0")); // above /10
+        assert!(!relay_addr_is_fast_local("8.8.8.8"));
+        assert!(!relay_addr_is_fast_local("192.168.1.10"));
+        assert!(!relay_addr_is_fast_local("2001:4860:4860::8888"));
+        assert!(!relay_addr_is_fast_local("garbage"));
     }
 }
