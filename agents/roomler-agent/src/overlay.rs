@@ -27,7 +27,7 @@ use tracing::{info, warn};
 use tunnel_core::env::node_env;
 use tunnel_core::localapi::OverlayView;
 use tunnel_core::overlay::WgKeypair;
-use tunnel_core::overlay::runtime::{OverlayEvent, OverlayRuntime, TunFactory};
+use tunnel_core::overlay::runtime::{DerpMuxFactory, OverlayEvent, OverlayRuntime, TunFactory};
 #[cfg(feature = "overlay-l3")]
 use tunnel_core::overlay::tun::SystemTun;
 use tunnel_core::overlay::tun::TunIo;
@@ -81,15 +81,22 @@ pub async fn maybe_start(
         Vec::new()
     };
 
-    // Phase D (DERP) — when enabled, open the persistent `/derp` WS and hand its
-    // demux to the runtime, so a both-UDP-blocked peer pair can carry WG over
-    // the pubkey-addressed relay (both dial OUT over TCP/TLS-443). Default-OFF.
-    let derp_mux = if tunnel_core::overlay::direct::derp_enabled() {
-        let (mux, outbound_rx) =
-            tunnel_core::transport::derp::DerpMux::new(keypair.public.to_bytes());
-        crate::derp::spawn(&cfg.ws_url(), &cfg.agent_token, &mux, outbound_rx);
-        info!("overlay derp: /derp carrier enabled (both-UDP-blocked tier)");
-        Some(mux)
+    // Phase D (DERP) — when enabled, provide a factory that opens the persistent
+    // `/derp` WS. The runtime calls it LAZILY — only if THIS node is UDP-blocked
+    // (its srflx gather found nothing) — so a UDP-capable node (which can never
+    // be in a both-UDP-blocked pair) never holds an idle `/derp` WS. When
+    // called, it builds the demux, opens the WS (both peers dial OUT over
+    // TCP/TLS-443), and returns the mux. Default-ON since rc.203.
+    let derp_factory: Option<DerpMuxFactory> = if tunnel_core::overlay::direct::derp_enabled() {
+        let ws_url = cfg.ws_url();
+        let token = cfg.agent_token.clone();
+        let pubkey = keypair.public.to_bytes();
+        Some(Box::new(move || {
+            let (mux, outbound_rx) = tunnel_core::transport::derp::DerpMux::new(pubkey);
+            crate::derp::spawn(&ws_url, &token, &mux, outbound_rx);
+            info!("overlay derp: /derp carrier opened (node UDP-blocked; both-UDP-blocked tier)");
+            mux
+        }))
     } else {
         None
     };
@@ -101,8 +108,9 @@ pub async fn maybe_start(
         // P5 — route THIS node's default egress through a chosen exit peer (with
         // carrier-endpoint exemptions), when `overlay_exit_node` is set.
         .with_exit_node(cfg.overlay_exit_node.clone(), exit_server_ips)
-        // Phase D — attach the `/derp` demux (present only when DERP is enabled).
-        .with_derp_mux(derp_mux)
+        // Phase D — LAZY `/derp`: the runtime opens the WS via this factory only
+        // if the node is itself UDP-blocked (else no idle WS).
+        .with_derp_mux_factory(derp_factory)
         // Unification P1 — publish the live mesh view for the LocalAPI so
         // `roomler status` / `peers` see per-device connection types.
         .with_peer_view(peer_view);
