@@ -1,31 +1,46 @@
 /*
- * Settings page. Two flows:
- *   - Rename device (cmd_set_device_name)
- *   - Re-enrol with a new token (cmd_re_enroll)
+ * Settings view: device rename, re-enrollment, background-service management
+ * and file locations. Status data comes from the central store; mutations go
+ * through the matching cmd_* commands. Results are rendered with textContent
+ * (no innerHTML) into the shared banner slot.
  */
 (function () {
-  const invoke = (name, payload) => window.__TAURI__.core.invoke(name, payload || {});
+  'use strict';
+  const { $, invoke, show, hide, setText, on, refreshStatus } = window.Roomler;
 
-  function $(id) { return document.getElementById(id); }
-
-  function showResult(html, isError) {
+  function showResult(text, isError) {
     const el = $('settings-result');
     el.hidden = false;
-    el.className = isError ? 'banner banner-error' : 'banner banner-ok';
-    el.innerHTML = html;
+    el.textContent = text;
+    el.className = 'banner ' + (isError ? 'banner-error' : 'banner-ok');
   }
 
-  async function loadCurrentName() {
-    try {
-      const s = await invoke('cmd_status');
-      if (s.device_name) $('rename-input').value = s.device_name;
-    } catch (e) {
-      console.warn('cmd_status failed', e);
+  function paintStatus(s) {
+    const rename = $('rename-input');
+    if (rename && !rename.matches(':focus') && s.device_name && !rename.value) {
+      rename.value = s.device_name;
     }
+    setText(
+      'st-service',
+      s.service_kind === 'scmService'
+        ? 'System service' + (s.service_running ? ' · running' : ' · stopped')
+        : s.service_kind === 'scheduledTask'
+          ? 'Per-user auto-start' + (s.service_running ? ' · running' : '')
+          : 'not installed',
+    );
+    setText('st-log-dir', s.log_dir);
+    setText('st-config-dir', s.config_dir);
+    if (s.config_split) show($('st-split-banner'));
+    else hide($('st-split-banner'));
+    // Rename/re-enroll write the machine-wide config under an SCM install,
+    // which an unelevated desktop app can't do — say so up front instead of
+    // only failing on submit.
+    const isScm = s.service_kind === 'scmService';
+    document.querySelectorAll('.scm-hint').forEach((el) => { el.hidden = !isScm; });
   }
 
   document.addEventListener('DOMContentLoaded', () => {
-    void loadCurrentName();
+    on('status', paintStatus);
 
     $('rename-form').addEventListener('submit', async (ev) => {
       ev.preventDefault();
@@ -33,9 +48,10 @@
       if (!name) return;
       try {
         await invoke('cmd_set_device_name', { name });
-        showResult(`Device name updated to <strong>${escape(name)}</strong>.`, false);
+        showResult('Device name updated to “' + name + '”.', false);
+        void refreshStatus();
       } catch (e) {
-        showResult(`Rename failed: ${escape(String(e))}`, true);
+        showResult('Rename failed: ' + e, true);
       }
     });
 
@@ -45,19 +61,50 @@
       if (!token) return;
       try {
         await invoke('cmd_re_enroll', { token });
-        showResult('Re-enrolment succeeded. Reload the Status page.', false);
+        showResult('Re-enrollment succeeded.', false);
         $('re-token').value = '';
+        void refreshStatus();
       } catch (e) {
-        showResult(`Re-enrolment failed: ${escape(String(e))}`, true);
+        showResult('Re-enrollment failed: ' + e, true);
+      }
+    });
+
+    $('btn-service-install').addEventListener('click', async () => {
+      // false = per-user auto-start (Scheduled Task on Windows). Machine-wide
+      // SCM installs are the Roomler Setup installer's job, not the desktop's.
+      try {
+        await invoke('cmd_service_install', { asService: false });
+        showResult('Auto-start installed.', false);
+        void refreshStatus();
+      } catch (e) {
+        showResult('Install failed: ' + e, true);
+      }
+    });
+
+    $('btn-service-uninstall').addEventListener('click', async () => {
+      try {
+        await invoke('cmd_service_uninstall', { asService: false });
+        showResult('Auto-start removed.', false);
+        void refreshStatus();
+      } catch (e) {
+        showResult('Removal failed: ' + e, true);
+      }
+    });
+
+    $('btn-open-logs').addEventListener('click', async () => {
+      try {
+        await invoke('cmd_open_log_dir');
+      } catch (e) {
+        showResult('Could not open the logs folder: ' + e, true);
+      }
+    });
+
+    $('btn-open-config').addEventListener('click', async () => {
+      try {
+        await invoke('cmd_open_config_dir');
+      } catch (e) {
+        showResult('Could not open the config folder: ' + e, true);
       }
     });
   });
-
-  function escape(s) {
-    return s
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;');
-  }
 })();
