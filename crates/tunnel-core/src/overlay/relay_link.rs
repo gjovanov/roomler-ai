@@ -145,6 +145,18 @@ pub struct RelayCoordinator {
     /// `pending`/`allocated` so [`forget`](Self::forget) prunes it and
     /// [`is_tracking`](Self::is_tracking) sees it.
     dialing: HashMap<ObjectId, PeerConfig>,
+    /// Phase D — the single-relay role each TRACKED link was established with
+    /// ([`single_relay_role`](Self::single_relay_role)'s value at request time).
+    /// `maybe_complete` recomputes the role from every fresh netmap and, if it
+    /// changed, `forget`s the link so the caller re-establishes with the correct
+    /// role. The role can change because it depends on the peer's
+    /// `srflx_endpoints`, which arrive on a LATER `rc:overlay.srflx` trickle than
+    /// the join: during that window a UDP-capable peer briefly looks UDP-blocked,
+    /// so both ends can compute "dialer" and deadlock. The role is otherwise
+    /// frozen once tracked (`request` early-returns on `is_tracking`,
+    /// `maybe_complete` never re-decides), so without this recompute the pair
+    /// would never heal.
+    roles: HashMap<ObjectId, Option<bool>>,
 }
 
 impl RelayCoordinator {
@@ -164,6 +176,7 @@ impl RelayCoordinator {
             single_relay: super::direct::relay_single_enabled(),
             my_udp_relay_ok,
             dialing: HashMap::new(),
+            roles: HashMap::new(),
         }
     }
 
@@ -229,8 +242,12 @@ impl RelayCoordinator {
         if self.is_tracking(&node_id) {
             return;
         }
-        if self.single_relay_role(&peer) == Some(false) {
+        // Compute the role ONCE and remember it, so `maybe_complete` can detect a
+        // later flip (the peer's srflx propagating) and re-establish — see `roles`.
+        let role = self.single_relay_role(&peer);
+        if role == Some(false) {
             debug!(peer = %node_id, "overlay relay: single-relay dialer — awaiting anchor R (no alloc, no creds)");
+            self.roles.insert(node_id, role);
             self.dialing.insert(node_id, peer);
             return;
         }
@@ -245,6 +262,7 @@ impl RelayCoordinator {
             warn!(peer = %node_id, "overlay relay: control channel closed; cannot request");
             return;
         }
+        self.roles.insert(node_id, role);
         self.pending.insert(
             node_id,
             PendingPeer {
@@ -277,6 +295,20 @@ impl RelayCoordinator {
     /// A fresh netmap view arrived. Refresh the peer config; if we've already
     /// allocated, the peer's relayed address may now be known — build.
     pub fn maybe_complete(&mut self, node_id: ObjectId, peer: &PeerConfig) -> Option<ReadyLink> {
+        // Phase D — the single-relay role can FLIP after we commit: the peer's
+        // `srflx_endpoints` (its UDP-capable signal) arrive on a later trickle
+        // than its join, so during that window a UDP-capable peer looks
+        // UDP-blocked and both ends can pick "dialer" → deadlock. If the fresh
+        // role differs from the one we tracked, drop the link; the caller's
+        // `!is_tracking` path then re-`request`s it with the correct role.
+        if self.is_tracking(&node_id) {
+            let fresh_role = self.single_relay_role(peer);
+            if self.roles.get(&node_id) != Some(&fresh_role) {
+                debug!(peer = %node_id, ?fresh_role, "overlay relay: single-relay role changed (srflx settled) — re-establishing");
+                self.forget(&node_id);
+                return None;
+            }
+        }
         // Phase D — a single-relay DIALER holds no allocation: build the raw
         // carrier to the anchor's `R` the moment it appears in the netmap.
         if let Some(slot) = self.dialing.get_mut(&node_id) {
@@ -467,6 +499,7 @@ impl RelayCoordinator {
         self.allocated.remove(node_id);
         self.advertised.remove(node_id);
         self.dialing.remove(node_id);
+        self.roles.remove(node_id);
     }
 }
 
@@ -923,6 +956,56 @@ mod tests {
         assert!(
             !coord.is_tracking(&node),
             "a built link leaves the dialing set"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_relay_role_flip_on_late_srflx_re_establishes() {
+        // Regression: the role depends on the peer's srflx, which arrives on a
+        // LATER trickle than the join. During that window a UDP-capable peer
+        // looks UDP-blocked, so we (UDP-OK) pick "dialer" for it. When its srflx
+        // finally lands the role flips; `maybe_complete` must FORGET the
+        // stale-role link so the caller re-establishes — else the pair can
+        // deadlock (both sides picked "dialer") forever.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        // We are UDP-OK with the SMALLER pubkey.
+        let mut coord = RelayCoordinator::new(tx, [0x00u8; 32], true, vec![]);
+        coord.single_relay = true;
+        let node = ObjectId::new();
+        // Peer: larger pubkey, advertises single-relay, NO srflx yet → looks
+        // UDP-blocked → we compute ourselves the DIALER.
+        let blocked = PeerConfig {
+            public_key: [0xFFu8; 32],
+            supports_relay_single: true,
+            srflx_endpoints: vec![],
+            ..base_peer()
+        };
+        coord.request(node, blocked.clone()).await;
+        assert!(coord.is_tracking(&node), "tracked as dialer");
+        assert!(
+            rx.try_recv().is_err(),
+            "a dialer sends no coturn-creds request"
+        );
+
+        // The peer's srflx propagates → it's UDP-capable → the role flips to
+        // ANCHOR (both UDP-OK, our pubkey smaller). maybe_complete must forget.
+        let unblocked = PeerConfig {
+            srflx_endpoints: vec!["203.0.113.9:40000".into()],
+            ..blocked.clone()
+        };
+        assert!(coord.maybe_complete(node, &unblocked).is_none());
+        assert!(
+            !coord.is_tracking(&node),
+            "the stale-role link is forgotten so the caller re-establishes"
+        );
+
+        // Re-request with the settled peer establishes us as the ANCHOR (asks
+        // the server for creds → pending, no longer a dialer).
+        coord.request(node, unblocked).await;
+        assert!(coord.is_tracking(&node));
+        assert!(
+            matches!(rx.try_recv(), Ok(ClientMsg::OverlayRelayRequest { .. })),
+            "re-established as anchor ⇒ sends a coturn-creds request"
         );
     }
 
