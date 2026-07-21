@@ -47,6 +47,8 @@ import {
   priorityWireMessage,
   codecChoiceToSettings,
   settingsToCodecChoice,
+  parseLocalRelayDescriptor,
+  localRelayIceServer,
   type AutoTransportInputs,
   type KeyDecision,
   type RcCodecChoice,
@@ -2069,5 +2071,64 @@ describe('parseControlInbound — rc:video-info native dims (rc.199)', () => {
       expect(parsed.info.native_w).toBe(0)
       expect(parsed.info.native_h).toBe(0)
     }
+  })
+})
+
+describe('parseLocalRelayDescriptor (Phase 2 loopback-TURN corp-relay)', () => {
+  it('accepts a well-formed descriptor', () => {
+    expect(
+      parseLocalRelayDescriptor({
+        turn_port: 47990,
+        overlay_ip: '100.64.0.5',
+        username: '1700000600:uid',
+        credential: 'abc',
+      }),
+    ).toEqual({
+      turn_port: 47990,
+      overlay_ip: '100.64.0.5',
+      username: '1700000600:uid',
+      credential: 'abc',
+    })
+  })
+
+  it('rejects malformed / missing / out-of-range blobs (untrusted loopback JSON)', () => {
+    const base = { turn_port: 47990, overlay_ip: 'x', username: 'u', credential: 'c' }
+    expect(parseLocalRelayDescriptor(null)).toBeNull()
+    expect(parseLocalRelayDescriptor('nope')).toBeNull()
+    expect(parseLocalRelayDescriptor({})).toBeNull()
+    expect(parseLocalRelayDescriptor({ ...base, turn_port: 0 })).toBeNull()
+    expect(parseLocalRelayDescriptor({ ...base, turn_port: 70000 })).toBeNull()
+    expect(parseLocalRelayDescriptor({ ...base, turn_port: 1.5 })).toBeNull()
+    expect(parseLocalRelayDescriptor({ ...base, overlay_ip: '' })).toBeNull()
+    expect(parseLocalRelayDescriptor({ ...base, username: 5 })).toBeNull()
+    expect(parseLocalRelayDescriptor({ ...base, credential: undefined })).toBeNull()
+  })
+})
+
+describe('localRelayIceServer (Phase 2)', () => {
+  it('builds the loopback turn: ICE server from a descriptor', () => {
+    expect(
+      localRelayIceServer({
+        turn_port: 47990,
+        overlay_ip: '100.64.0.5',
+        username: '1700000600:uid',
+        credential: 'abc',
+      }),
+    ).toEqual({
+      urls: ['turn:127.0.0.1:47990'],
+      username: '1700000600:uid',
+      credential: 'abc',
+    })
+  })
+
+  it('always dials loopback (never the overlay IP — that is the remote agent entry)', () => {
+    const s = localRelayIceServer({
+      turn_port: 12345,
+      overlay_ip: '100.64.9.9',
+      username: 'u',
+      credential: 'c',
+    })
+    expect(s.urls[0]).toBe('turn:127.0.0.1:12345')
+    expect(s.urls[0]).not.toContain('100.64')
   })
 })
