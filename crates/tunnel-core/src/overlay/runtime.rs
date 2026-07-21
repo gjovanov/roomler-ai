@@ -503,13 +503,26 @@ pub struct OverlayRuntime {
     /// still worked when they were resolved. Coturn worker IPs are added
     /// dynamically from live relay carriers. Empty unless `exit_node` is set.
     exit_server_ips: Vec<IpAddr>,
-    /// Phase D (DERP) — this node's single `/derp` WS demux, if the agent
-    /// opened one (DERP on + WS up). Handed to [`RelayCoordinator`] so a
-    /// both-UDP-blocked pair can build a `DerpConn` carrier. `None` = no DERP
-    /// (the coordinator falls through to both-allocate). Set via
-    /// [`with_derp_mux`](Self::with_derp_mux).
-    derp_mux: Option<Arc<DerpMux>>,
+    /// Phase D (DERP) — a factory that OPENS this node's `/derp` WS + returns
+    /// its demux, called LAZILY by [`run`](Self::run) only when the node is
+    /// itself UDP-blocked (its srflx gather found nothing). A UDP-capable node
+    /// can never be in a both-UDP-blocked pair, so it never needs DERP — this
+    /// way it doesn't hold an idle `/derp` WS. `None` (no factory / not called)
+    /// ⇒ no DERP; the coordinator falls through to both-allocate. Set via
+    /// [`with_derp_mux_factory`](Self::with_derp_mux_factory).
+    derp_mux_factory: Option<DerpMuxFactory>,
 }
+
+/// Opens the node's `/derp` WS (the agent owns `server_url` + the token +
+/// `tokio_tungstenite`) and returns the connected [`DerpMux`]. Boxed +
+/// agent-provided so `tunnel-core` stays WebSocket-free; [`OverlayRuntime::run`]
+/// calls it AT MOST ONCE, and only for a UDP-blocked node (lazy `/derp`).
+///
+/// `Send + Sync`: the `run` future keeps `&self` alive across awaits and is
+/// spawned onto the multi-thread runtime, so `OverlayRuntime` (and thus this
+/// factory) must be `Sync`. The agent's closure captures only `Sync` values
+/// (`String` server-url/token + the 32-byte pubkey), so it satisfies both.
+pub type DerpMuxFactory = Box<dyn FnOnce() -> Arc<DerpMux> + Send + Sync>;
 
 /// Map the runtime's live carrier bookkeeping into the LocalAPI [`OverlayView`]
 /// — the daemon-internal shape the `roomler status` / `peers` verbs read. Pure
@@ -801,7 +814,7 @@ impl OverlayRuntime {
             peer_view: None,
             exit_node: None,
             exit_server_ips: Vec::new(),
-            derp_mux: None,
+            derp_mux_factory: None,
         }
     }
 
@@ -823,7 +836,7 @@ impl OverlayRuntime {
             peer_view: None,
             exit_node: None,
             exit_server_ips: Vec::new(),
-            derp_mux: None,
+            derp_mux_factory: None,
         }
     }
 
@@ -833,13 +846,14 @@ impl OverlayRuntime {
         self
     }
 
-    /// Phase D (DERP) — attach the node's `/derp` WS demux. The agent builds it
-    /// (it owns `server_url` + the token + `tokio_tungstenite`), opens the WS,
-    /// and hands the connected [`DerpMux`] here so the relay coordinator can
-    /// vend `DerpConn` carriers for both-UDP-blocked peers. `None` (the default)
-    /// leaves DERP inert.
-    pub fn with_derp_mux(mut self, derp_mux: Option<Arc<DerpMux>>) -> Self {
-        self.derp_mux = derp_mux;
+    /// Phase D (DERP) — attach a factory that opens the node's `/derp` WS. The
+    /// runtime calls it LAZILY, only when this node is itself UDP-blocked, so a
+    /// UDP-capable node never opens an idle `/derp` WS. The factory (agent-side,
+    /// owning `server_url`/token/`tokio_tungstenite`) creates the [`DerpMux`],
+    /// opens the WS, and returns the mux for the relay coordinator to vend
+    /// `DerpConn` carriers. `None` (the default) leaves DERP inert.
+    pub fn with_derp_mux_factory(mut self, factory: Option<DerpMuxFactory>) -> Self {
+        self.derp_mux_factory = factory;
         self
     }
 
@@ -900,7 +914,7 @@ impl OverlayRuntime {
     /// `OverlayJoin`, waits for the first full netmap (which yields the
     /// node's overlay IP), brings up the TUN + inbound writer, then
     /// steady-state pumps TUN traffic and applies netmap deltas.
-    pub async fn run(self, mut events: mpsc::Receiver<OverlayEvent>, endpoints: Vec<String>) {
+    pub async fn run(mut self, mut events: mpsc::Receiver<OverlayEvent>, endpoints: Vec<String>) {
         // rc.131 — direct LAN path: bind a shared UDP socket + discover our
         // LAN endpoint so a same-subnet peer dials us directly and skips the
         // relay. Off in Direct mode (the test/helper path) and when disabled.
@@ -1215,6 +1229,18 @@ impl OverlayRuntime {
         // skip it (routes are freshly installed by `install_peers` below).
         let mut route_guard = tokio::time::interval(ROUTE_GUARD_TICK);
         route_guard.tick().await;
+        // Phase D — LAZY `/derp`: open the WS (via the agent-provided factory)
+        // ONLY for a relay-mode node that is itself UDP-blocked — i.e. its srflx
+        // gather found nothing (`srflx_advertised.is_empty()`). A UDP-capable
+        // node can never be in a both-UDP-blocked pair, so it never needs DERP
+        // and shouldn't hold an idle `/derp` WS. The factory is `FnOnce`, so
+        // `take()` it; a reconnect re-runs `run` and re-decides from the fresh
+        // gather (a node that became UDP-blocked opens `/derp` then).
+        let derp_mux = if matches!(self.mode, CarrierMode::Relay) && srflx_advertised.is_empty() {
+            self.derp_mux_factory.take().map(|f| f())
+        } else {
+            None
+        };
         let mut relay = match self.mode {
             // Pass our LAN endpoints so the relay-endpoint trickle re-includes
             // them (the server replaces, so they'd otherwise be clobbered —
@@ -1232,9 +1258,7 @@ impl OverlayRuntime {
                     .as_ref()
                     .map(|c| c.endpoints.clone())
                     .unwrap_or_default(),
-                // Phase D — hand the coordinator our `/derp` WS demux (if the
-                // agent opened one) so a both-UDP-blocked pair can go DERP.
-                self.derp_mux.clone(),
+                derp_mux,
             )),
             CarrierMode::Direct(_) => None,
         };
