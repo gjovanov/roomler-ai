@@ -118,13 +118,16 @@ impl DirectCooldowns {
 }
 
 /// Which carrier tier an installed peer is on. Direct tiers differ in cooldown
-/// bookkeeping (CC1 — a failure on one tier must never poison another) and, for
-/// the two off-link internet tiers, a WG-handshake completion deadline (Phase C
-/// — a punch that never establishes is torn down to relay; LAN is on-link and
-/// judged only by traffic, relay by its own hard-dead/one-way signals).
+/// bookkeeping (CC1 — a failure on one tier must never poison another) and
+/// each direct tier carries a WG-handshake completion deadline (a carrier that
+/// never establishes is torn down to relay; relay itself is governed by its
+/// own hard-dead/one-way signals).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum DirectTier {
-    /// Same-subnet LAN direct (rc.131-135) — on-link, no handshake deadline.
+    /// Same-subnet LAN direct (rc.131-135) — on-link. rc.204: gets a TIGHT
+    /// handshake deadline too — pre-handshake tx/rx stay flat, so without a
+    /// deadline a false LAN match (stale endpoint, AP isolation, VPN-captured
+    /// reply path) was a PERMANENT zombie with no relay fallback.
     Lan,
     /// Direct-to-public NIC (Phase A) — off-link; public cooldown + a loose
     /// handshake deadline (the accept side may lag).
@@ -153,7 +156,10 @@ impl DirectTier {
         match self {
             DirectTier::Srflx => SRFLX_HANDSHAKE_DEADLINE,
             DirectTier::Public => PUBLIC_HANDSHAKE_DEADLINE,
-            _ => Duration::MAX,
+            // rc.204 — LAN gets a deadline too (see the variant doc): on-link
+            // handshakes complete in milliseconds or not at all.
+            DirectTier::Lan => LAN_HANDSHAKE_DEADLINE,
+            DirectTier::Relay => Duration::MAX,
         }
     }
 }
@@ -245,6 +251,16 @@ const SRFLX_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(12);
 /// it to relay. Still finite so a truly dead public dst can't zombie forever
 /// (closes the same latent Phase A gap the srflx work exposed).
 const PUBLIC_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(30);
+/// rc.204 — LAN handshake deadline. On-link, so a genuine same-subnet
+/// handshake completes in milliseconds; one that hasn't completed by this
+/// window is a false LAN match (stale/foreign endpoint, Wi-Fi AP isolation, a
+/// VPN-captured reply path). Pre-rc.204 the LAN tier had NO deadline, and a
+/// never-handshaken carrier's tx/rx stay flat, so the rx-flat heuristic never
+/// fired either — the pair was a permanent zombie with no relay fallback
+/// (field-observed 2026-07-21: every LAN pair wedged in
+/// `HANDSHAKE(REKEY_TIMEOUT)` while boringtun gave up after ~90 s). As tight
+/// as srflx: it either establishes near-instantly or never will.
+const LAN_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(12);
 /// Phase C — srflx consecutive failures before the session-sticky deny. One
 /// more than the LAN/public [`DIRECT_MAX_FAILURES`] — a punch legitimately
 /// misses more often (timing/NAT), so give it an extra try before pinning.
@@ -1500,16 +1516,22 @@ impl OverlayRuntime {
             // by `relay_refresh_cooldown` below). Always `false` for a direct
             // carrier, so this only ever fast-paths a relay.
             let hard_dead = wg.peer_carrier_dead(&e.pubkey).unwrap_or(false);
-            // Phase C — off-link handshake deadline: a Srflx/Public carrier that
-            // never completed its WG handshake within the tier deadline is a
-            // zombie. Its tx/rx stay flat pre-handshake (handshake packets touch
-            // neither counter), so the rx-flat heuristic below can't see it, and
-            // boringtun stops even keepalives once the attempt expires (~90 s) —
-            // it would live forever. Tear it down → cooldown → relay. Once the
-            // handshake latches (`peer_handshake_done`) this can never fire again
-            // (the tx/rx heuristic governs the established carrier thereafter).
-            let punch_dead = matches!(e.tier, DirectTier::Public | DirectTier::Srflx)
-                && !wg.peer_handshake_done(&e.pubkey).unwrap_or(true)
+            // Phase C (+ rc.204) — direct-tier handshake deadline: a direct
+            // carrier that never completed its WG handshake within the tier
+            // deadline is a zombie. Its tx/rx stay flat pre-handshake
+            // (handshake packets touch neither counter), so the rx-flat
+            // heuristic below can't see it, and boringtun stops even
+            // keepalives once the attempt expires (~90 s) — it would live
+            // forever. Tear it down → cooldown → relay. Once the handshake
+            // latches (`peer_handshake_done`) this can never fire again (the
+            // tx/rx heuristic governs the established carrier thereafter).
+            // rc.204 extends this to the LAN tier — a false same-subnet match
+            // (stale endpoint / AP isolation / VPN-captured replies) was a
+            // PERMANENT zombie before, with no fallback to relay.
+            let punch_dead = matches!(
+                e.tier,
+                DirectTier::Public | DirectTier::Srflx | DirectTier::Lan
+            ) && !wg.peer_handshake_done(&e.pubkey).unwrap_or(true)
                 && e.since.elapsed() > e.tier.handshake_deadline();
             // Warm-up grace: let the handshake + first packets flow. (A blown
             // punch deadline is > grace by construction, so it never lands in the
@@ -1744,11 +1766,19 @@ impl OverlayRuntime {
             let public_cooling = DirectCooldowns::cooling(&cooldowns.public, &np.node_id, now);
             let srflx_cooling = DirectCooldowns::cooling(&cooldowns.srflx, &np.node_id, now);
             // A same-subnet LAN endpoint for this peer (highest-priority tier).
+            // rc.204 — scan the provenance-pure `lan_endpoints` bucket (the
+            // peer's join-time NIC sockets), NOT the `endpoints` union: the
+            // union also carries the peer's trickled coturn-RELAYED addresses,
+            // and on this fleet the coturn workers ride the hosts' own public
+            // IPs, so a fleet host same-/24-matched a peer's *relay allocation*
+            // and "LAN"-dialed coturn forever (field-observed 2026-07-21: mars
+            // dialing NEO16's relayed 94.130.141.74:* as a LAN endpoint).
             let direct_dst = if lan_cooling {
                 None
             } else {
-                direct_ctx
-                    .and_then(|ctx| direct::pick_same_subnet_endpoint(&ctx.my_ips, &cfg.endpoints))
+                direct_ctx.and_then(|ctx| {
+                    direct::pick_same_subnet_endpoint(&ctx.my_ips, &cfg.lan_endpoints)
+                })
             };
             // Phase A — the peer's PUBLIC NIC endpoint (its join-time bucket),
             // dialable WITHOUT STUN because the peer's NIC holds a public IP.
@@ -2649,10 +2679,17 @@ mod tests {
             SRFLX_DENY_COOLDOWN < DIRECT_DENY_COOLDOWN,
             "srflx deny must be shorter than the LAN/public session-sticky deny"
         );
-        // The deadlines are ordered srflx (tight) < public (loose), and LAN has
-        // none (a same-subnet carrier is judged only by traffic).
+        // The deadlines are ordered srflx/LAN (tight) < public (loose); relay
+        // has none (governed by its own hard-dead/one-way signals). rc.204 —
+        // LAN gained a deadline: a false same-subnet match must demote, not
+        // zombie forever.
         assert!(SRFLX_HANDSHAKE_DEADLINE < PUBLIC_HANDSHAKE_DEADLINE);
-        assert_eq!(DirectTier::Lan.handshake_deadline(), Duration::MAX);
+        assert!(LAN_HANDSHAKE_DEADLINE < PUBLIC_HANDSHAKE_DEADLINE);
+        assert!(
+            LAN_HANDSHAKE_DEADLINE > DIRECT_GRACE,
+            "a blown LAN deadline must land past the warm-up grace"
+        );
+        assert_eq!(DirectTier::Lan.handshake_deadline(), LAN_HANDSHAKE_DEADLINE);
         assert_eq!(DirectTier::Relay.handshake_deadline(), Duration::MAX);
         assert_eq!(direct_max_failures(DirectTier::Srflx), SRFLX_MAX_FAILURES);
         assert_eq!(direct_max_failures(DirectTier::Public), DIRECT_MAX_FAILURES);
@@ -2755,6 +2792,176 @@ mod tests {
             !cooldowns.public.contains_key(&nid) && !cooldowns.public_fails.contains_key(&nid),
             "CC1: the public-direct tier is NOT poisoned"
         );
+    }
+
+    /// rc.204 — the health sweep tears down a zombie LAN carrier (a Lan-tier
+    /// carrier that never completed its WG handshake) once past the LAN
+    /// deadline, and books the failure ONLY on the LAN cooldown tier. Before
+    /// rc.204 the LAN tier had no handshake deadline: pre-handshake tx/rx stay
+    /// flat, so the rx-flat heuristic never fired and a false same-subnet match
+    /// was a PERMANENT zombie with no relay fallback (field-observed
+    /// 2026-07-21: every LAN pair wedged in `HANDSHAKE(REKEY_TIMEOUT)`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sweep_tears_down_zombie_lan_and_cools_only_lan_tier() {
+        let kp = WgKeypair::generate();
+        let peer_kp = WgKeypair::generate();
+        let (out_tx, _out_rx) = mpsc::channel::<ClientMsg>(16);
+        let (tun_mock, _inj, _del) = MockTun::new();
+        let tf: TunFactory = {
+            let m = tun_mock.clone();
+            Box::new(move |_, _, _| Ok(m.clone() as Arc<dyn TunIo>))
+        };
+        let rt = OverlayRuntime::new_relay(kp.clone(), out_tx, tf, 1280);
+
+        // A LAN carrier dialing a DEAD destination → the handshake never
+        // completes → `peer_handshake_done` stays false (the zombie condition).
+        let (mut wg, _tun_rx) = WgDevice::new(kp.secret.clone());
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        wg.ensure_direct_demux(sock.clone());
+        let dead: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let overlay_ip = Ipv4Addr::new(100, 64, 0, 3);
+        wg.add_direct_peer(
+            sock.clone(),
+            peer_kp.public.to_bytes(),
+            overlay_ip,
+            dead,
+            true,
+        )
+        .await;
+        assert_eq!(
+            wg.peer_handshake_done(&peer_kp.public.to_bytes()),
+            Some(false),
+            "precondition: the LAN carrier never handshook"
+        );
+
+        let nid = ObjectId::from_bytes([6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let mut by_node = HashMap::new();
+        by_node.insert(
+            nid,
+            Installed {
+                pubkey: peer_kp.public.to_bytes(),
+                overlay_ip,
+                is_direct: true,
+                // Installed past the LAN handshake deadline (and the grace).
+                since: Instant::now()
+                    .checked_sub(Duration::from_secs(LAN_HANDSHAKE_DEADLINE.as_secs() + 3))
+                    .unwrap(),
+                last_traffic: (0, 0),
+                bad_sweeps: 0,
+                last_rx_at: Instant::now(),
+                relay_local: None,
+                relay_dst: None,
+                public_direct_dst: None,
+                tier: DirectTier::Lan,
+            },
+        );
+
+        let tun: Arc<dyn TunIo> = tun_mock;
+        let mut cooldowns = DirectCooldowns::default();
+        let mut relay_refresh: HashMap<ObjectId, Instant> = HashMap::new();
+        let mut relay: Option<RelayCoordinator> = None;
+        let current_peers: HashMap<ObjectId, NetmapPeer> = HashMap::new();
+
+        rt.sweep_carrier_health(
+            &mut wg,
+            &mut by_node,
+            &mut relay,
+            &tun,
+            &mut cooldowns,
+            &mut relay_refresh,
+            &current_peers,
+        )
+        .await;
+
+        assert!(
+            !by_node.contains_key(&nid),
+            "the zombie LAN carrier is torn down"
+        );
+        assert!(cooldowns.lan.contains_key(&nid), "the LAN cooldown is set");
+        assert_eq!(cooldowns.lan_fails.get(&nid), Some(&1), "one LAN strike");
+        assert!(
+            !cooldowns.srflx.contains_key(&nid) && !cooldowns.srflx_fails.contains_key(&nid),
+            "CC1: the srflx tier is NOT poisoned"
+        );
+        assert!(
+            !cooldowns.public.contains_key(&nid) && !cooldowns.public_fails.contains_key(&nid),
+            "CC1: the public-direct tier is NOT poisoned"
+        );
+    }
+
+    /// rc.204 — the same-subnet LAN tier must scan ONLY the provenance-pure
+    /// `lan_endpoints` bucket. The `endpoints` union also carries the peer's
+    /// trickled coturn-RELAYED addresses, and on this fleet the coturn workers
+    /// ride the hosts' own public IPs — pre-rc.204 a fleet host same-/24
+    /// matched a peer's *relay allocation* and "LAN"-dialed coturn forever.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lan_tier_scans_only_the_pure_lan_endpoint_bucket() {
+        let kp = WgKeypair::generate();
+        let peer_kp = WgKeypair::generate();
+        let (out_tx, _out_rx) = mpsc::channel::<ClientMsg>(16);
+        let (tun_mock, _inj, _del) = MockTun::new();
+        let tf: TunFactory = {
+            let m = tun_mock.clone();
+            Box::new(move |_, _, _| Ok(m.clone() as Arc<dyn TunIo>))
+        };
+        let rt = OverlayRuntime::new_relay(kp.clone(), out_tx, tf, 1280);
+        let (mut wg, _tun_rx) = WgDevice::new(kp.secret.clone());
+        let tun: Arc<dyn TunIo> = tun_mock;
+
+        // Our side: one "interface" at 10.1.2.9 (the socket itself is bound to
+        // loopback — nothing needs to actually flow in this test).
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let my_ip: Ipv4Addr = "10.1.2.9".parse().unwrap();
+        let ctx = DirectCtx {
+            socks: vec![(my_ip, sock)],
+            my_ips: vec![my_ip],
+            endpoints: vec!["10.1.2.9:41000".into()],
+            public_sock: None,
+            punch: None,
+            my_nat: None,
+        };
+        let cooldowns = DirectCooldowns::default();
+        let mut relay: Option<RelayCoordinator> = None;
+        let mut by_node = HashMap::new();
+
+        // A same-/24 address present ONLY in the `endpoints` union (the shape
+        // of a trickled relay allocation) must NOT produce a LAN carrier.
+        let mut tainted = peer(&peer_kp, "100.64.0.7");
+        tainted.endpoints = vec!["10.1.2.3:1000".into()];
+        rt.install_peers(
+            &mut wg,
+            &mut by_node,
+            &mut relay,
+            &tun,
+            std::slice::from_ref(&tainted),
+            Some(&ctx),
+            &cooldowns,
+        )
+        .await;
+        assert!(
+            by_node.is_empty(),
+            "an endpoints-union (relay-tainted) address must not become a LAN carrier"
+        );
+
+        // The SAME address in the pure `lan_endpoints` bucket → LAN carrier.
+        let mut lan_peer = peer(&peer_kp, "100.64.0.7");
+        lan_peer.node_id = tainted.node_id;
+        lan_peer.lan_endpoints = vec!["10.1.2.3:1000".into()];
+        rt.install_peers(
+            &mut wg,
+            &mut by_node,
+            &mut relay,
+            &tun,
+            std::slice::from_ref(&lan_peer),
+            Some(&ctx),
+            &cooldowns,
+        )
+        .await;
+        let inst = by_node
+            .get(&lan_peer.node_id)
+            .expect("the pure-bucket LAN candidate installs a LAN carrier");
+        assert_eq!(inst.tier, DirectTier::Lan);
+        assert!(inst.is_direct);
     }
 
     /// Minimal STUN Binding Success carrying an XOR-MAPPED-ADDRESS (IPv4), so a
