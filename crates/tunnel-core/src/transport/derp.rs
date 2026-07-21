@@ -83,6 +83,16 @@ fn synth_addr(pk: &DerpPubKey) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(ip), port)
 }
 
+impl DerpConn {
+    /// This conn's stable synthetic PEER address — the placeholder `dst` a
+    /// [`Carrier::relay`](crate::overlay::wg::Carrier) is built with. The DERP
+    /// carrier discards it on recv (pubkey-pinned), so it only needs to be
+    /// consistent and valid.
+    pub fn synth_peer(&self) -> SocketAddr {
+        self.synth_peer
+    }
+}
+
 #[async_trait]
 impl RelayConn for DerpConn {
     async fn send_to(&self, buf: &[u8], _dst: SocketAddr) -> io::Result<usize> {
