@@ -525,7 +525,7 @@ async fn resolve_tenant_and_machine(
 }
 
 /// Fetch the joined `OverlayNode` row for an identity (post-join ops).
-async fn current_node(state: &AppState, ident: NodeIdentity) -> Option<OverlayNode> {
+pub(crate) async fn current_node(state: &AppState, ident: NodeIdentity) -> Option<OverlayNode> {
     let (tenant_id, machine_id, _name) = resolve_tenant_and_machine(state, ident).await?;
     state
         .overlay_nodes
