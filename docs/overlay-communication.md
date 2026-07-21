@@ -306,7 +306,9 @@ to avoid it.
 
 ## 5. Inside vs outside a VPN — what each network actually permits
 
-Measured from a real corporate VPN host (2026-07-21, via `coturn_test.html`):
+The **corp VPN** column is measured — a real corporate VPN host probing the
+fleet's coturn on 2026-07-21 via `coturn_test.html`. The other two columns are
+the characteristic shape of those networks, not a single measurement.
 
 | Transport | Open internet | Typical corp VPN | Strict TCP-only firewall |
 |---|---|---|---|
