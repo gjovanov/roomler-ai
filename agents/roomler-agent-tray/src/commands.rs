@@ -10,9 +10,9 @@ use roomler_agent::config::{self, AgentConfig};
 use roomler_agent::enrollment::{self, EnrollInputs};
 use roomler_agent::{logging, notify};
 use serde::Serialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use tunnel_core::localapi::{self, ConsentRequest, NodeStatus, PeerInfo};
+use tunnel_core::localapi::{self, ConsentRequest, FlowInfo, NodeStatus, PeerInfo};
 
 /// What the SPA shows on the status page. Returned from
 /// [`cmd_status`]. All fields are JSON-friendly primitives so the
@@ -31,6 +31,11 @@ pub struct StatusReport {
     pub attention: Option<String>,
     pub log_dir: String,
     pub config_dir: String,
+    /// Both a machine-global AND a per-user config exist — a split-brain
+    /// install (e.g. an old per-user enrollment left behind under an SCM
+    /// service). The Settings view surfaces it so the stale copy gets
+    /// cleaned up instead of silently shadowing.
+    pub config_split: bool,
 }
 
 /// Read current agent config + probe service state for the status view. Never
@@ -52,8 +57,9 @@ pub async fn cmd_status() -> StatusReport {
 /// The blocking status-probe body — run on the blocking pool by [`cmd_status`],
 /// and directly by the (already-async, user-triggered) enroll commands.
 fn status_report() -> StatusReport {
-    let cfg = load_optional_config();
     let (service_kind, service_running) = probe_service_state();
+    let is_scm = service_kind == "scmService";
+    let cfg = load_optional_config(is_scm);
     let attention = if notify::has_attention() {
         notify::attention_path().map(|p| p.to_string_lossy().into_owned())
     } else {
@@ -70,49 +76,115 @@ fn status_report() -> StatusReport {
         service_running,
         service_kind,
         attention,
-        log_dir: resolve_log_dir_string(),
-        config_dir: resolve_config_dir_string(),
+        log_dir: resolve_log_dir_string(is_scm),
+        config_dir: resolve_config_dir_string(is_scm),
+        config_split: config_split_detected(),
     }
 }
 
-/// The agent log directory as a path. `logging::log_dir()` only works IN the
-/// agent process (its `LOG_DIR` OnceLock); the tray never runs that setup, so
-/// it computes the default path directly. (For a SYSTEM/SCM service the real
-/// logs live under the service account's profile — this is the interactive
-/// user's dir; good enough for "open a folder", exact SCM-service-log routing
-/// is a follow-up.)
-fn resolve_log_dir_path() -> Option<PathBuf> {
+/// The daemon log directory to show / open. `logging::log_dir()` only works IN
+/// the agent process (its `LOG_DIR` OnceLock); the desktop app never runs that
+/// setup, so it computes the path directly. An SCM/SYSTEM service writes to the
+/// deterministic machine-global dir (`win_service::default_log_dir` =
+/// `%PROGRAMDATA%\...\service-logs`) — used exactly when an SCM service is the
+/// registered flavour. Keyed on the flavour, NOT dir-existence: a
+/// flavour-switched box can carry a stale (SYSTEM-ACL'd, undeletable) service
+/// dir forever, which must not shadow the per-user daemon's real logs.
+fn resolve_log_dir_path(is_scm: bool) -> Option<PathBuf> {
+    #[cfg(windows)]
+    if is_scm && let Some(service_logs) = roomler_agent::win_service::default_log_dir() {
+        return Some(service_logs);
+    }
+    #[cfg(not(windows))]
+    let _ = is_scm;
     logging::log_dir().or_else(logging::resolve_log_dir)
 }
 
-fn resolve_log_dir_string() -> String {
-    resolve_log_dir_path()
+fn resolve_log_dir_string(is_scm: bool) -> String {
+    resolve_log_dir_path(is_scm)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| "(unknown)".to_string())
 }
 
-/// The config directory to show / open. Prefers the machine-global
-/// (`%PROGRAMDATA%`) config a perMachine SCM service uses WHEN it exists (that's
-/// what the SYSTEM service actually reads, and it's world-readable), else the
-/// perUser config. Fixes the tray showing the wrong (perUser) folder for an SCM
-/// install.
-fn resolve_config_dir_path() -> Option<PathBuf> {
+/// The config file the daemon on this host actually reads. Mirrors the role
+/// rung of the daemon's own `pick_config_path` ladder: only a machine-wide
+/// (SCM/SystemContext) service reads the machine-global `%PROGRAMDATA%` config
+/// — a per-user daemon reads the per-user default ALWAYS, so a stale
+/// machine-global file left behind by an old perMachine install must never
+/// shadow it. Pure decision in [`choose_config_path`] so the precedence is
+/// locked by a test.
+fn active_config_path(is_scm: bool) -> Result<PathBuf, String> {
+    let default = config::default_config_path().map_err(|e| format!("Config path: {e}"))?;
     #[cfg(windows)]
     {
         let mg = config::machine_global_config_path();
-        if mg.exists() {
-            return mg.parent().map(|p| p.to_path_buf());
-        }
+        let mg_exists = mg.exists();
+        Ok(choose_config_path(is_scm, mg_exists, mg, default))
     }
-    config::default_config_path()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+    #[cfg(not(windows))]
+    {
+        let _ = is_scm;
+        Ok(default)
+    }
 }
 
-fn resolve_config_dir_string() -> String {
-    resolve_config_dir_path()
+/// Machine-global only for an SCM-service flavour AND when the file exists
+/// (an SCM install briefly runs on a per-user config until the daemon
+/// self-heals it to machine-global); per-user in every other case.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn choose_config_path(
+    is_scm: bool,
+    machine_global_exists: bool,
+    machine_global: PathBuf,
+    default: PathBuf,
+) -> PathBuf {
+    if is_scm && machine_global_exists {
+        machine_global
+    } else {
+        default
+    }
+}
+
+/// Both configs present ⇒ split-brain (see `StatusReport::config_split`).
+fn config_split_detected() -> bool {
+    #[cfg(windows)]
+    {
+        let per_user = config::default_config_path()
+            .map(|p| p.exists())
+            .unwrap_or(false);
+        per_user && config::machine_global_config_path().exists()
+    }
+    #[cfg(not(windows))]
+    false
+}
+
+/// The config directory to show / open — the parent of [`active_config_path`].
+fn resolve_config_dir_path(is_scm: bool) -> Option<PathBuf> {
+    active_config_path(is_scm)
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+}
+
+fn resolve_config_dir_string(is_scm: bool) -> String {
+    resolve_config_dir_path(is_scm)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| "(unknown)".to_string())
+}
+
+/// Contextualise a config-save failure: writing the machine-global config from
+/// a non-elevated desktop app is expected to be denied — say so instead of
+/// leaving a bare os-error.
+fn explain_save_error(err: impl std::fmt::Display, path: &Path, machine_global: bool) -> String {
+    if machine_global {
+        format!(
+            "Saving config at {}: {err}. This is the machine-wide configuration — \
+             administrator rights are required (run the desktop app elevated, or \
+             use the `roomlerd` CLI from an elevated shell).",
+            path.display()
+        )
+    } else {
+        format!("Saving config at {}: {err}", path.display())
+    }
 }
 
 /// What the "Devices" page renders (unification P2). Read from the running
@@ -248,14 +320,22 @@ pub async fn cmd_enroll(
 }
 
 /// Refresh the token using an existing config. Mirrors the CLI's
-/// `re-enroll --token` subcommand.
+/// `re-enroll --token` subcommand. Targets the config the daemon
+/// actually reads (machine-global first) — writing the per-user copy
+/// under an SCM install would silently change nothing.
 #[tauri::command]
 pub async fn cmd_re_enroll(token: String) -> Result<StatusReport, String> {
     let trimmed = token.trim().to_string();
     if trimmed.is_empty() {
         return Err("Enrollment token is empty".to_string());
     }
-    let path = config::default_config_path().map_err(|e| format!("Config path: {e}"))?;
+    // The flavour probe shells out to the agent CLI — keep it off the async
+    // runtime's worker thread.
+    let is_scm = tokio::task::spawn_blocking(|| probe_service_state().0 == "scmService")
+        .await
+        .unwrap_or(false);
+    let path = active_config_path(is_scm)?;
+    let machine_global = cfg!(windows) && path == config::machine_global_config_path();
     let existing = config::load(&path).map_err(|e| format!("Loading config: {e}"))?;
     let cfg = enrollment::enroll(EnrollInputs {
         server_url: &existing.server_url,
@@ -265,23 +345,34 @@ pub async fn cmd_re_enroll(token: String) -> Result<StatusReport, String> {
     })
     .await
     .map_err(|e| format!("Re-enrollment failed: {e:#}"))?;
-    config::save(&path, &cfg).map_err(|e| format!("Saving config: {e}"))?;
+    config::save(&path, &cfg).map_err(|e| explain_save_error(e, &path, machine_global))?;
     Ok(status_report())
 }
 
 /// Update the device name on the persisted config. Effective on next
 /// WS reconnect — the agent re-sends `rc:agent.hello` with the new
-/// name. Doesn't touch the agent process itself.
+/// name. Doesn't touch the agent process itself. Targets the config the
+/// daemon actually reads. ASYNC + blocking-pool because the flavour
+/// probe + final status report both shell out to the agent CLI (the
+/// cmd_status lesson: sync commands run on the UI thread).
 #[tauri::command]
-pub fn cmd_set_device_name(name: String) -> Result<StatusReport, String> {
+pub async fn cmd_set_device_name(name: String) -> Result<StatusReport, String> {
+    tokio::task::spawn_blocking(move || set_device_name_blocking(name))
+        .await
+        .map_err(|e| format!("task join: {e}"))?
+}
+
+fn set_device_name_blocking(name: String) -> Result<StatusReport, String> {
     let trimmed = name.trim().to_string();
     if trimmed.is_empty() {
         return Err("Device name is empty".to_string());
     }
-    let path = config::default_config_path().map_err(|e| format!("Config path: {e}"))?;
+    let is_scm = probe_service_state().0 == "scmService";
+    let path = active_config_path(is_scm)?;
+    let machine_global = cfg!(windows) && path == config::machine_global_config_path();
     let mut cfg = config::load(&path).map_err(|e| format!("Loading config: {e}"))?;
     cfg.machine_name = trimmed;
-    config::save(&path, &cfg).map_err(|e| format!("Saving config: {e}"))?;
+    config::save(&path, &cfg).map_err(|e| explain_save_error(e, &path, machine_global))?;
     Ok(status_report())
 }
 
@@ -387,22 +478,40 @@ pub fn cmd_service_status(as_service: bool) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// Open the agent's log directory in the OS file manager. Uses the
-/// platform's default open verb (Explorer / Finder / xdg-open).
+/// Open the daemon's log directory in the OS file manager. ASYNC because
+/// resolving the directory probes the service flavour (shells out to the
+/// daemon CLI) — that must stay off the UI thread.
 #[tauri::command]
-pub fn cmd_open_log_dir() -> Result<(), String> {
-    let path = resolve_log_dir_path().ok_or_else(|| "log dir not resolvable".to_string())?;
-    // Create it if the agent hasn't written a log here yet, so the folder opens
-    // instead of failing.
+pub async fn cmd_open_log_dir() -> Result<(), String> {
+    tokio::task::spawn_blocking(open_log_dir_blocking)
+        .await
+        .map_err(|e| format!("task join: {e}"))?
+}
+
+/// The blocking body — also called from the tray menu (via its own
+/// blocking-pool spawn in `tray.rs`).
+pub fn open_log_dir_blocking() -> Result<(), String> {
+    let is_scm = probe_service_state().0 == "scmService";
+    let path = resolve_log_dir_path(is_scm).ok_or_else(|| "log dir not resolvable".to_string())?;
+    // Create it if the daemon hasn't written a log here yet, so the folder
+    // opens instead of failing. Best-effort: an SCM service-logs dir is
+    // SYSTEM-created and already exists on a live install.
     let _ = std::fs::create_dir_all(&path);
     open_path_in_explorer(&path)
 }
 
-/// Open the agent's config directory in the OS file manager.
+/// Open the daemon's config directory in the OS file manager. ASYNC for the
+/// same flavour-probe reason as [`cmd_open_log_dir`].
 #[tauri::command]
-pub fn cmd_open_config_dir() -> Result<(), String> {
-    let dir = resolve_config_dir_path().ok_or_else(|| "config dir not resolvable".to_string())?;
-    open_path_in_explorer(&dir)
+pub async fn cmd_open_config_dir() -> Result<(), String> {
+    tokio::task::spawn_blocking(|| {
+        let is_scm = probe_service_state().0 == "scmService";
+        let dir = resolve_config_dir_path(is_scm)
+            .ok_or_else(|| "config dir not resolvable".to_string())?;
+        open_path_in_explorer(&dir)
+    })
+    .await
+    .map_err(|e| format!("task join: {e}"))?
 }
 
 /// Approve a pending operator-consent prompt over the LocalAPI (P2b). The daemon
@@ -499,6 +608,20 @@ pub async fn cmd_route_set_enabled(id: String, enabled: bool) -> Result<bool, St
         .map_err(|e| e.to_string())
 }
 
+/// Live forwards / SOCKS5 listeners with their per-flow byte counters —
+/// the "watch its live bytes" surface (unification §4.3). Covers BOTH
+/// daemon-supervised routes (each active route is backed by a flow) and
+/// ephemeral CLI-created flows. NEVER errors (mirrors [`cmd_route_list`]):
+/// daemon down ⇒ empty list, and the Devices section already surfaces
+/// daemon-down explicitly.
+#[tauri::command]
+pub async fn cmd_flows() -> Vec<FlowInfo> {
+    match localapi::connect().await {
+        Ok(mut c) => c.flows().await.unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// The shared connect-error mapping for the mutating route commands
 /// (mirrors [`cmd_ping`]'s wording so the two surfaces read the same).
 fn daemon_unreachable(e: std::io::Error) -> String {
@@ -511,13 +634,16 @@ fn daemon_unreachable(e: std::io::Error) -> String {
 
 // ─── helpers ───────────────────────────────────────────────────────
 
-/// Load the agent config from its default path. Returns `None` on
-/// "no config yet" (operator hasn't enrolled), which is the natural
-/// pre-enrollment state. Errors during parse are also collapsed to
-/// `None` — the status view shows "not enrolled" and the operator
-/// re-onboards.
-fn load_optional_config() -> Option<AgentConfig> {
-    let path = config::default_config_path().ok()?;
+/// Load the agent config from the path the daemon actually reads
+/// ([`active_config_path`]). Returns `None` on "no config yet" (operator
+/// hasn't enrolled), which is the natural pre-enrollment state. Errors
+/// during parse are also collapsed to `None` — the status view shows
+/// "not enrolled" and the operator re-onboards. Pre-overhaul this read
+/// ONLY the per-user path, so an SCM-service install (machine-global
+/// config, no per-user copy) showed "Not enrolled" while the service ran
+/// enrolled.
+fn load_optional_config(is_scm: bool) -> Option<AgentConfig> {
+    let path = active_config_path(is_scm).ok()?;
     if !path.exists() {
         return None;
     }
@@ -638,5 +764,52 @@ fn open_path_in_explorer(path: &std::path::Path) -> Result<(), String> {
             "Don't know how to open {} on this platform",
             path.display()
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The split-brain lock: machine-global is read ONLY under an SCM
+    /// flavour — a stale `%PROGRAMDATA%` config from an old perMachine
+    /// install must never shadow a per-user daemon's real config, and an
+    /// SCM install falls back to per-user until the daemon self-heals the
+    /// machine-global copy into place.
+    #[test]
+    fn choose_config_prefers_machine_global_only_for_scm() {
+        let mg = PathBuf::from("mg/config.toml");
+        let user = PathBuf::from("user/config.toml");
+        assert_eq!(
+            choose_config_path(true, true, mg.clone(), user.clone()),
+            mg,
+            "SCM flavour + machine-global present must read machine-global"
+        );
+        assert_eq!(
+            choose_config_path(true, false, mg.clone(), user.clone()),
+            user,
+            "SCM flavour before self-heal falls back to per-user"
+        );
+        assert_eq!(
+            choose_config_path(false, true, mg.clone(), user.clone()),
+            user,
+            "a per-user daemon never reads a (stale) machine-global config"
+        );
+        assert_eq!(choose_config_path(false, false, mg, user.clone()), user);
+    }
+
+    #[test]
+    fn save_error_mentions_elevation_only_for_machine_global() {
+        let p = Path::new("C:/ProgramData/roomler/config.toml");
+        let elevated = explain_save_error("denied", p, true);
+        assert!(
+            elevated.contains("administrator"),
+            "machine-global failures must explain the elevation requirement: {elevated}"
+        );
+        let user = explain_save_error("denied", p, false);
+        assert!(
+            !user.contains("administrator"),
+            "per-user failures must not claim elevation is needed: {user}"
+        );
     }
 }
