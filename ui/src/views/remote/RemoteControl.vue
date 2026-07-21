@@ -82,6 +82,22 @@
       >
         On {{ rc.currentDesktop.value }}
       </v-chip>
+      <!-- Live stats (codec · bitrate · fps · resolution). Relocated here
+           from over the video (2026-07-21) so it never hides a maximized
+           remote window's caption buttons. Desktop only (md+) — the toolbar
+           has no spare width on phones; the resolution pill still carries the
+           `relay-limited (native …)` cue. Shown once media is flowing. -->
+      <div
+        v-if="rc.phase.value === 'connected' && rc.hasMedia.value && (statsCodecLabel || rc.vp9_444Active.value || rc.hevcActive.value)"
+        class="stats-readout d-none d-md-flex mr-2"
+        role="status"
+        aria-live="polite"
+      >
+        <span class="stats-pill">{{ statsCodecLabel }}</span>
+        <span class="stats-pill">{{ statsBitrateLabel }}</span>
+        <span class="stats-pill">{{ statsFpsLabel }}</span>
+        <span v-if="statsResolutionLabel" class="stats-pill">{{ statsResolutionLabel }}</span>
+      </div>
       <!-- rc.199 — Settings gear (all viewports): opens the unified
            Settings panel (Video / Display / Session). Replaces the old
            mobile-only bottom-sheet trigger + the desktop inline Row 2. -->
@@ -503,21 +519,10 @@
           :class="`scale-${rc.scaleMode.value}`"
           :style="videoScaleStyle"
         />
-        <!-- Live stats readout: codec + bitrate + fps. Populated from
-             RTCPeerConnection.getStats() every 500 ms inside the
-             composable. Pill format keeps it unobtrusive over the
-             video content. Hidden until at least the codec is known. -->
-        <div
-          v-if="rc.hasMedia.value && (statsCodecLabel || rc.vp9_444Active.value || rc.hevcActive.value)"
-          class="stats-readout"
-          role="status"
-          aria-live="polite"
-        >
-          <span class="stats-pill">{{ statsCodecLabel }}</span>
-          <span class="stats-pill">{{ statsBitrateLabel }}</span>
-          <span class="stats-pill">{{ statsFpsLabel }}</span>
-          <span v-if="statsResolutionLabel" class="stats-pill">{{ statsResolutionLabel }}</span>
-        </div>
+        <!-- Live stats readout (codec + bitrate + fps + resolution) moved
+             OUT of the video canvas into the toolbar (2026-07-21) — over the
+             video it covered a maximized remote window's caption/close
+             buttons. See the `.stats-readout` block in the toolbar above. -->
         <div v-if="!rc.hasMedia.value" class="no-media-overlay">
           <v-icon size="72" color="grey-lighten-1">mdi-video-off</v-icon>
           <p class="text-body-1 mt-3">Connected — waiting for agent to publish a video track.</p>
@@ -3142,14 +3147,22 @@ onBeforeUnmount(() => {
   text-align: center;
   padding: 24px;
 }
+/* Live stats pills — inline in the toolbar (2026-07-21). Previously
+   absolute-positioned over the video canvas, where they covered a
+   maximized remote window's caption buttons. */
 .stats-readout {
-  position: absolute;
-  top: 8px;
-  right: 8px;
   display: flex;
   gap: 6px;
-  pointer-events: none;
-  z-index: 3;
+  align-items: center;
+  min-width: 0;
+}
+/* The resolution pill can grow long ("… · relay-limited (native 2560×1600)");
+   let it ellipsize rather than push the toolbar's Connect/fullscreen off. */
+.stats-readout .stats-pill:last-child {
+  max-width: 34ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .stats-pill {
   background: rgba(0, 0, 0, 0.55);
