@@ -76,6 +76,7 @@ pub async fn relay_overlay_msg_from_node(
             endpoints,
             supports_quic,
             supports_relay_single,
+            supports_derp,
             advertised_routes,
             ..
         } => {
@@ -87,6 +88,7 @@ pub async fn relay_overlay_msg_from_node(
                 endpoints,
                 supports_quic,
                 supports_relay_single,
+                supports_derp,
                 advertised_routes,
             )
             .await;
@@ -123,6 +125,7 @@ async fn handle_overlay_join(
     endpoints: Vec<String>,
     supports_quic: bool,
     supports_relay_single: bool,
+    supports_derp: bool,
     advertised_routes: Vec<String>,
 ) {
     let node_ref = ident.node_ref();
@@ -175,6 +178,7 @@ async fn handle_overlay_join(
                     &endpoints,
                     supports_quic,
                     supports_relay_single,
+                    supports_derp,
                     &advertised_routes,
                 )
                 .await
@@ -214,6 +218,7 @@ async fn handle_overlay_join(
                     endpoints,
                     supports_quic,
                     supports_relay_single,
+                    supports_derp,
                     advertised_routes,
                 )
                 .await
@@ -525,7 +530,7 @@ async fn resolve_tenant_and_machine(
 }
 
 /// Fetch the joined `OverlayNode` row for an identity (post-join ops).
-async fn current_node(state: &AppState, ident: NodeIdentity) -> Option<OverlayNode> {
+pub(crate) async fn current_node(state: &AppState, ident: NodeIdentity) -> Option<OverlayNode> {
     let (tenant_id, machine_id, _name) = resolve_tenant_and_machine(state, ident).await?;
     state
         .overlay_nodes
@@ -641,6 +646,9 @@ fn to_netmap_peer(node: &OverlayNode) -> NetmapPeer {
         // Phase D — surface the node's single-relay capability so a peer only
         // picks single-relay when both ends advertise it (else both-allocate).
         supports_relay_single: node.supports_relay_single,
+        // Phase D (DERP) — surface the node's DERP capability so a both-UDP-blocked
+        // pair only picks DERP when both ends advertise it.
+        supports_derp: node.supports_derp,
         // Phase 1 — only the admin-APPROVED routes reach peers.
         routes: node.approved_routes.clone(),
         // P3b-3 — expose the backing agent id (bridging overlay-node-id →

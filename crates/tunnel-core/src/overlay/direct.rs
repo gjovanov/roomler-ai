@@ -217,6 +217,28 @@ pub fn relay_single_enabled() -> bool {
     }
 }
 
+/// Phase D (DERP) — is the pubkey-addressed `/derp` relay carrier ENABLED?
+/// (`ROOMLER_NODE_OVERLAY_DERP`; legacy `ROOMLER_AGENT_…` alias honoured.)
+/// **Default OFF** — DERP is the last-resort carrier for two BOTH-UDP-blocked
+/// peers (a strict corp firewall that permits only TCP/TLS-443), which no other
+/// tier can serve; both peers dial OUT to the relay over WSS:443 and WG rides
+/// end-to-end. Only chosen when this is on, both ends advertise `supports_derp`,
+/// AND both are UDP-blocked (the single-relay `(false,false)` arm). Off until
+/// field-proven, then flipped default-ON like the other tiers. Set
+/// `1`/`true`/`yes`/`on` to enable.
+pub fn derp_enabled() -> bool {
+    match crate::env::node_env("OVERLAY_DERP") {
+        Some(v) => {
+            let t = v.trim();
+            t.eq_ignore_ascii_case("1")
+                || t.eq_ignore_ascii_case("true")
+                || t.eq_ignore_ascii_case("yes")
+                || t.eq_ignore_ascii_case("on")
+        }
+        None => false,
+    }
+}
+
 /// Phase D — should this node GATHER + ADVERTISE its own srflx candidates? True
 /// when the srflx-direct tier is on OR single-relay is on. Single-relay needs it
 /// even with srflx-direct OFF: a single-relay DIALER (larger pubkey) runs no
