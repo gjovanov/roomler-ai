@@ -390,11 +390,21 @@ pub async fn gather_srflx(
 /// taken (v4-only, CC7). Tries each URL in order; `None` if none resolve to an
 /// IPv4 endpoint. Any single reachable STUN worker suffices — srflx doesn't need
 /// the coturn worker-pinning that the relay hairpin does.
-pub async fn resolve_stun_server(stun_urls: &[String]) -> Option<SocketAddr> {
+pub async fn resolve_stun_server(stun_urls: &[String], exclude: &[Ipv4Addr]) -> Option<SocketAddr> {
+    // Never STUN a coturn worker that is one of THIS host's own IPs: on the
+    // fleet the coturn workers ARE the hosts (mars `.74`, jupiter `.221`, zeus
+    // `.226`), so a co-located host STUNning its own worker hairpins on the
+    // local host DNAT and gets no public mapping back → the node falsely reads
+    // as UDP-blocked (empty srflx). Real clients are never co-located with
+    // coturn, so this only ever prunes the fleet's self-referential target.
+    let usable = |sa: &SocketAddr| !matches!(sa, SocketAddr::V4(v4) if exclude.contains(v4.ip()));
     for url in stun_urls {
         // Fast path: an IP literal (or already-resolved worker) needs no DNS.
         if let Some(sa) = parse_stun_url(url) {
-            return Some(sa);
+            if usable(&sa) {
+                return Some(sa);
+            }
+            continue;
         }
         // Hostname → DNS. Strip the scheme + any `?transport` / `#frag`, keep
         // the `host:port` `lookup_host` needs.
@@ -407,7 +417,7 @@ pub async fn resolve_stun_server(stun_urls: &[String]) -> Option<SocketAddr> {
             .unwrap_or(s);
         let hostport = s.split(['?', '#']).next().unwrap_or(s);
         if let Ok(addrs) = lookup_host(hostport).await
-            && let Some(v4) = addrs.into_iter().find(SocketAddr::is_ipv4)
+            && let Some(v4) = addrs.into_iter().filter(SocketAddr::is_ipv4).find(usable)
         {
             return Some(v4);
         }
@@ -424,11 +434,15 @@ pub async fn resolve_stun_server(stun_urls: &[String]) -> Option<SocketAddr> {
 /// distinct ports on one IP (catches address-and-port-dependent mapping, the
 /// common symmetric). v4 only. 0-2 results; fewer than 2 ⇒ the caller can't
 /// classify (→ "unknown", stays optimistic and still attempts the punch).
-pub async fn resolve_stun_targets(stun_urls: &[String]) -> Vec<SocketAddr> {
+pub async fn resolve_stun_targets(stun_urls: &[String], exclude: &[Ipv4Addr]) -> Vec<SocketAddr> {
+    // Same self-referential-worker skip as `resolve_stun_server` (see its doc):
+    // a fleet host co-located with a coturn worker must not probe against its
+    // own IP, or the NAT-type probe hairpins on the local host DNAT.
+    let usable = |sa: &SocketAddr| !matches!(sa, SocketAddr::V4(v4) if exclude.contains(v4.ip()));
     let mut all: Vec<SocketAddr> = Vec::new();
     for url in stun_urls {
         if let Some(sa) = parse_stun_url(url) {
-            if !all.contains(&sa) {
+            if usable(&sa) && !all.contains(&sa) {
                 all.push(sa);
             }
             continue;
@@ -443,7 +457,7 @@ pub async fn resolve_stun_targets(stun_urls: &[String]) -> Vec<SocketAddr> {
         let hostport = s.split(['?', '#']).next().unwrap_or(s);
         if let Ok(addrs) = lookup_host(hostport).await {
             for a in addrs.filter(SocketAddr::is_ipv4) {
-                if !all.contains(&a) {
+                if usable(&a) && !all.contains(&a) {
                     all.push(a);
                 }
             }
@@ -757,52 +771,95 @@ mod tests {
         let want: SocketAddr = "5.9.157.221:3478".parse().unwrap();
         // An IP-literal URL resolves synchronously — no DNS.
         assert_eq!(
-            resolve_stun_server(&["stun:5.9.157.221:3478".to_string()]).await,
+            resolve_stun_server(&["stun:5.9.157.221:3478".to_string()], &[]).await,
             Some(want)
         );
         // Empty → None (srflx tier inert).
-        assert_eq!(resolve_stun_server(&[]).await, None);
+        assert_eq!(resolve_stun_server(&[], &[]).await, None);
         // A malformed leading entry (no `host:port`, so `lookup_host` errors
         // immediately without network I/O) is skipped → the usable IP literal
         // behind it wins.
         assert_eq!(
-            resolve_stun_server(&[
-                "not-a-host-port".to_string(),
-                "stun:5.9.157.221:3478".to_string(),
-            ])
+            resolve_stun_server(
+                &[
+                    "not-a-host-port".to_string(),
+                    "stun:5.9.157.221:3478".to_string(),
+                ],
+                &[]
+            )
             .await,
             Some(want)
+        );
+        // A worker CO-LOCATED with this host (its IP is in `exclude`) is skipped
+        // → the next worker wins. Prevents a fleet host from STUNning itself.
+        assert_eq!(
+            resolve_stun_server(
+                &[
+                    "stun:94.130.141.74:3478".to_string(),
+                    "stun:5.9.157.221:3478".to_string(),
+                ],
+                &["94.130.141.74".parse().unwrap()],
+            )
+            .await,
+            Some(want)
+        );
+        // ALL targets co-located → None (correctly: this host truly can't STUN a
+        // NON-self worker, so it has no usable srflx from this set).
+        assert_eq!(
+            resolve_stun_server(
+                &["stun:94.130.141.74:3478".to_string()],
+                &["94.130.141.74".parse().unwrap()],
+            )
+            .await,
+            None
         );
     }
 
     #[tokio::test]
     async fn resolve_stun_targets_prefers_distinct_ips_else_ports() {
         // Two IP-literal URLs on distinct IPs → both returned (strongest probe).
-        let t = resolve_stun_targets(&[
-            "stun:5.9.157.221:3478".to_string(),
-            "stun:94.130.141.98:3478".to_string(),
-        ])
+        let t = resolve_stun_targets(
+            &[
+                "stun:5.9.157.221:3478".to_string(),
+                "stun:94.130.141.98:3478".to_string(),
+            ],
+            &[],
+        )
         .await;
         assert_eq!(t.len(), 2);
         assert_ne!(t[0].ip(), t[1].ip());
         // Same IP, two ports → distinct-port fallback (still two targets).
-        let t2 = resolve_stun_targets(&[
-            "stun:5.9.157.221:3478".to_string(),
-            "stun:5.9.157.221:443".to_string(),
-        ])
+        let t2 = resolve_stun_targets(
+            &[
+                "stun:5.9.157.221:3478".to_string(),
+                "stun:5.9.157.221:443".to_string(),
+            ],
+            &[],
+        )
         .await;
         assert_eq!(t2.len(), 2);
         assert_eq!(t2[0].ip(), t2[1].ip());
         assert_ne!(t2[0].port(), t2[1].port());
         // A single target → len 1 (the caller can't classify).
         assert_eq!(
-            resolve_stun_targets(&["stun:5.9.157.221:3478".to_string()])
+            resolve_stun_targets(&["stun:5.9.157.221:3478".to_string()], &[])
                 .await
                 .len(),
             1
         );
         // Empty → empty.
-        assert!(resolve_stun_targets(&[]).await.is_empty());
+        assert!(resolve_stun_targets(&[], &[]).await.is_empty());
+        // A co-located worker is excluded → only the non-self target remains.
+        let t3 = resolve_stun_targets(
+            &[
+                "stun:94.130.141.74:3478".to_string(),
+                "stun:5.9.157.221:3478".to_string(),
+            ],
+            &["94.130.141.74".parse().unwrap()],
+        )
+        .await;
+        assert_eq!(t3.len(), 1);
+        assert_eq!(t3[0].ip().to_string(), "5.9.157.221");
     }
 
     #[tokio::test]
