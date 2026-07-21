@@ -257,9 +257,16 @@ impl LocalApiState for DaemonState {
 
     async fn ping(&self, target: &str, timeout_ms: u64, prefer_v6: bool) -> Response {
         let Some(pinger) = self.pinger.clone() else {
+            // rc.204 — say what to do in BOTH non-netstack shapes: an OS-TUN
+            // node pings peers with the system `ping` (the old message sent
+            // operators chasing netstack when the overlay was simply off).
             return Response::Error {
-                message: "ping requires netstack mode (this node isn't running the userspace \
-                          stack)"
+                message: "roomler ping uses the userspace netstack, which this node isn't \
+                          running. On an OS-TUN node, use the system `ping <overlay-ip>` \
+                          instead (check `roomler status` / `roomler peers` for the IPs). If \
+                          the overlay isn't up at all, set `overlay_enabled = true` in the \
+                          node's config.toml and restart the daemon; for netstack mode, set \
+                          ROOMLER_AGENT_OVERLAY_NETSTACK_SOCKS=<port>."
                     .into(),
             };
         };
