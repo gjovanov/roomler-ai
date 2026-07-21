@@ -145,6 +145,21 @@ fn choose_config_path(
     }
 }
 
+/// Is `path` the machine-global config? (`machine_global_config_path` is
+/// Windows-only — a `cfg!(windows) &&` runtime check would still fail to
+/// COMPILE the call on Linux CI.)
+fn is_machine_global(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        path == config::machine_global_config_path()
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        false
+    }
+}
+
 /// Both configs present ⇒ split-brain (see `StatusReport::config_split`).
 fn config_split_detected() -> bool {
     #[cfg(windows)]
@@ -335,7 +350,7 @@ pub async fn cmd_re_enroll(token: String) -> Result<StatusReport, String> {
         .await
         .unwrap_or(false);
     let path = active_config_path(is_scm)?;
-    let machine_global = cfg!(windows) && path == config::machine_global_config_path();
+    let machine_global = is_machine_global(&path);
     let existing = config::load(&path).map_err(|e| format!("Loading config: {e}"))?;
     let cfg = enrollment::enroll(EnrollInputs {
         server_url: &existing.server_url,
@@ -369,7 +384,7 @@ fn set_device_name_blocking(name: String) -> Result<StatusReport, String> {
     }
     let is_scm = probe_service_state().0 == "scmService";
     let path = active_config_path(is_scm)?;
-    let machine_global = cfg!(windows) && path == config::machine_global_config_path();
+    let machine_global = is_machine_global(&path);
     let mut cfg = config::load(&path).map_err(|e| format!("Loading config: {e}"))?;
     cfg.machine_name = trimmed;
     config::save(&path, &cfg).map_err(|e| explain_save_error(e, &path, machine_global))?;
