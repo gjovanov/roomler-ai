@@ -15,6 +15,7 @@ pub mod derp;
 pub mod quic;
 pub mod relay;
 pub mod stun;
+pub mod turn_host;
 pub mod webrtc_dc;
 pub mod wireguard;
 
