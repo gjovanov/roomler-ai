@@ -1266,6 +1266,76 @@ mod tests {
         );
     }
 
+    /// DERP carrier: two nodes carry WG over a pubkey-addressed relay with NO
+    /// UDP anywhere (the both-UDP-blocked tier). Mirrors
+    /// `wg_handshake_and_data_over_relay_conn`, but each side's `RelayConn` is a
+    /// `DerpConn` fed by a `DerpMux`, and a mock in-process relay plays the
+    /// server (`crate::ws::derp`): read a node's outbound `[dst||payload]`,
+    /// deliver `[src||payload]` to the dst's mux. Proves RAW WG rides DERP both
+    /// ways — the pubkey pinning makes the recv-source discard harmless.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wg_handshake_and_data_over_derp() {
+        use crate::transport::derp::DerpMux;
+
+        let a = WgKeypair::generate();
+        let b = WgKeypair::generate();
+        let a_pk = a.public.to_bytes();
+        let b_pk = b.public.to_bytes();
+
+        let (mux_a, mut a_out) = DerpMux::new(a_pk);
+        let (mux_b, mut b_out) = DerpMux::new(b_pk);
+
+        // Mock relay A→B: A frames [B||payload]; deliver to B as [A||payload].
+        {
+            let mux_b = Arc::clone(&mux_b);
+            tokio::spawn(async move {
+                while let Some(frame) = a_out.recv().await {
+                    let mut out = a_pk.to_vec();
+                    out.extend_from_slice(&frame[32..]);
+                    mux_b.deliver(&out);
+                }
+            });
+        }
+        // Mock relay B→A.
+        {
+            let mux_a = Arc::clone(&mux_a);
+            tokio::spawn(async move {
+                while let Some(frame) = b_out.recv().await {
+                    let mut out = b_pk.to_vec();
+                    out.extend_from_slice(&frame[32..]);
+                    mux_a.deliver(&out);
+                }
+            });
+        }
+
+        let conn_a: Arc<dyn RelayConn> = Arc::new(mux_a.conn_for(b_pk));
+        let conn_b: Arc<dyn RelayConn> = Arc::new(mux_b.conn_for(a_pk));
+
+        let (mut dev_a, _rx_a) = WgDevice::new(a.secret.clone());
+        let (mut dev_b, mut rx_b) = WgDevice::new(b.secret.clone());
+
+        // Synthetic dsts — `DerpConn` is pubkey-addressed and ignores them.
+        let dst_b: SocketAddr = "100.64.0.2:51820".parse().unwrap();
+        let dst_a: SocketAddr = "100.64.0.1:51820".parse().unwrap();
+
+        dev_a.add_peer(b_pk, IP_B, Carrier::relay(conn_a, dst_b), true);
+        dev_b.add_peer(a_pk, IP_A, Carrier::relay(conn_b, dst_a), false);
+
+        wait_connected(&dev_a, &b_pk).await;
+
+        let pkt = synthetic_ipv4(IP_A, IP_B, b"hello-over-derp");
+        send_until_ok(&dev_a, &b_pk, &pkt).await;
+
+        let got = tokio::time::timeout(Duration::from_secs(15), rx_b.recv())
+            .await
+            .expect("B did not receive a decrypted packet over DERP in time")
+            .expect("tun channel closed");
+        assert_eq!(
+            got, pkt,
+            "decrypted IP packet must arrive over the DERP carrier"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn wg_handshake_and_data_over_quic_relay() {
         use crate::transport::relay::UdpRelayConn;
