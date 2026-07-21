@@ -1151,4 +1151,97 @@ mod turn_tests {
         };
         two_relay_quinn_roundtrip(&urls, &user, &cred).await;
     }
+
+    /// ROOT-CAUSE DIAG for the both-allocate `REKEY_TIMEOUT`: does coturn relay
+    /// data between TWO of its OWN allocations on the SAME worker (the
+    /// intra-worker "relay-to-relay hairpin")? both-allocate needs A's
+    /// allocation to relay a datagram to B's allocation; single-relay never does
+    /// (one allocation + a raw dialer), which is why single-relay carries where
+    /// both-allocate deadlocks. Pins BOTH allocations to `ROOMLER_TEST_TURN_WORKER`
+    /// (an off-host worker, else the sender hairpins on the local host DNAT) and
+    /// sends RAW datagrams both ways — no QUIC/WG, so a failure is coturn's, not
+    /// a handshake-timing artifact.
+    ///
+    ///   ROOMLER_TEST_TURN_HOST=coturn.roomler.ai \
+    ///   ROOMLER_TEST_TURN_SECRET=<secret> ROOMLER_TEST_TURN_WORKER=5.9.157.221 \
+    ///   cargo test -p roomler-ai-tunnel-core --features overlay-l3 \
+    ///     --lib relay_to_relay_hairpin_against_real_coturn -- --ignored --nocapture
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "hits live coturn; set ROOMLER_TEST_TURN_HOST/SECRET + ROOMLER_TEST_TURN_WORKER"]
+    async fn relay_to_relay_hairpin_against_real_coturn() {
+        let Some(worker) = std::env::var("ROOMLER_TEST_TURN_WORKER").ok() else {
+            eprintln!("SKIP relay_to_relay_hairpin: ROOMLER_TEST_TURN_WORKER unset");
+            return;
+        };
+        let Some((urls, user, cred)) =
+            live_coturn_creds(|_h| vec![format!("turn:{worker}:3478?transport=udp")])
+        else {
+            eprintln!("SKIP relay_to_relay_hairpin: TURN env unset");
+            return;
+        };
+
+        let a = allocate_relay_from_ice(&urls, &user, &cred)
+            .await
+            .expect("alloc A (live coturn)");
+        let b = allocate_relay_from_ice(&urls, &user, &cred)
+            .await
+            .expect("alloc B (live coturn)");
+        let r_a = a.local_addr().unwrap();
+        let r_b = b.local_addr().unwrap();
+        eprintln!("hairpin: worker={worker} R_a={r_a} R_b={r_b}");
+        assert_ne!(r_a, r_b, "two allocations get distinct relay addrs");
+
+        // Mutual permission: each permits the other's relayed IP (the worker's
+        // own IP). This is exactly what both-allocate's `\x00` bootstrap does.
+        a.send_to(b"\x00", r_b).await.unwrap();
+        b.send_to(b"\x00", r_a).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        // A's allocation → B's allocation (the hairpin). Retry a few times since
+        // the permission may still be settling on the worker.
+        let mut buf = [0u8; 128];
+        let mut ab_ok = false;
+        for _ in 0..5 {
+            a.send_to(b"hairpin-A-to-B", r_b).await.unwrap();
+            if let Ok(Ok((n, src))) =
+                tokio::time::timeout(Duration::from_secs(2), b.recv_from(&mut buf)).await
+            {
+                eprintln!(
+                    "A->B OK: {n}B from {src}: {:?}",
+                    std::str::from_utf8(&buf[..n])
+                );
+                ab_ok = true;
+                break;
+            }
+        }
+        if !ab_ok {
+            eprintln!("A->B FAIL: coturn did NOT relay from allocation A to allocation B");
+        }
+
+        let mut buf2 = [0u8; 128];
+        let mut ba_ok = false;
+        for _ in 0..5 {
+            b.send_to(b"hairpin-B-to-A", r_a).await.unwrap();
+            if let Ok(Ok((n, src))) =
+                tokio::time::timeout(Duration::from_secs(2), a.recv_from(&mut buf2)).await
+            {
+                eprintln!("B->A OK: {n}B from {src}");
+                ba_ok = true;
+                break;
+            }
+        }
+        if !ba_ok {
+            eprintln!("B->A FAIL: coturn did NOT relay from allocation B to allocation A");
+        }
+
+        eprintln!(
+            "VERDICT: relay-to-relay hairpin A->B={ab_ok} B->A={ba_ok} — \
+             if false, coturn blocks self-allocation relay ⇒ both-allocate can't \
+             carry on one worker (single-relay is the only single-coturn path)"
+        );
+        assert!(
+            ab_ok && ba_ok,
+            "coturn relay-to-relay hairpin must flow both ways for both-allocate to work"
+        );
+    }
 }
