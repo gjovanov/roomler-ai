@@ -23,7 +23,9 @@ use crate::error::{Error, Result};
 use crate::models::{AuditKind, ConsentMode, EndReason, OsKind, SessionPhase};
 use crate::permissions::Permissions;
 use crate::session::{ClientTx, LiveSession};
-use crate::signaling::{AgentCloseReason, ClientMsg, Role, ServerMsg};
+use crate::signaling::{
+    AgentCloseReason, ClientMsg, IceServer, LocalRelayDescriptor, Role, ServerMsg,
+};
 use crate::turn_creds::{TurnConfig, ice_servers_for_session};
 
 const SERVER_TX_CAPACITY: usize = 64;
@@ -32,6 +34,27 @@ const SERVER_TX_CAPACITY: usize = 64;
 /// mail / tap a push, so it's far longer than the 30 s on-host prompt
 /// ([`DEFAULT_CONSENT_TIMEOUT`]). Also bounds the `ConsentRequest` link TTL.
 const ASYNC_CONSENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Loopback-TURN corp-relay (Phase 2) guard. The overlay assigns node IPs from
+/// the RFC 6598 CGNAT range 100.64.0.0/10 (v4) or a ULA `fc00::/7` (v6, derived
+/// from the v4). The Hub only appends a controller-supplied `local_relay` TURN
+/// entry to the REMOTE agent's ICE servers when its address is inside that
+/// range — so a malicious controller can't coerce the agent's TURN client into
+/// probing an arbitrary host. (Media is DTLS-E2E regardless, but keeping the
+/// agent pointed only at overlay IPs bounds the blast radius to its own mesh.)
+fn is_overlay_relay_ip(ip: &str) -> bool {
+    match ip.parse::<std::net::IpAddr>() {
+        // 100.64.0.0/10 == 100.64.0.0 – 100.127.255.255
+        Ok(std::net::IpAddr::V4(v4)) => {
+            let o = v4.octets();
+            o[0] == 100 && (64..=127).contains(&o[1])
+        }
+        // fc00::/7 — the overlay's ULA space (today the agent hands out its v4
+        // overlay IP; this keeps a future v6 relay from being rejected).
+        Ok(std::net::IpAddr::V6(v6)) => (v6.segments()[0] & 0xfe00) == 0xfc00,
+        Err(_) => false,
+    }
+}
 
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -329,6 +352,7 @@ impl Hub {
         audio_enabled: bool,
         consent_mode: ConsentMode,
         override_reason: Option<String>,
+        local_relay: Option<LocalRelayDescriptor>,
     ) -> Result<ObjectId> {
         // rc.185 — self-heal the fast connect→disconnect race. A controller
         // that connects then drops before teardown completes can leave an
@@ -379,7 +403,7 @@ impl Hub {
         };
 
         let session_id = ObjectId::new();
-        let (live, waiter) = LiveSession::new(
+        let (mut live, waiter) = LiveSession::new(
             session_id,
             agent_id,
             agent_org,
@@ -387,6 +411,10 @@ impl Hub {
             permissions,
             controller_tx.clone(),
         );
+        // Loopback-TURN corp-relay (Phase 2): remember the controller's local
+        // agent TURN descriptor so `forward_offer` can hand the REMOTE agent a
+        // relay it reaches over the overlay. Validated at use, not here.
+        live.local_relay = local_relay;
         self.inner
             .sessions
             .insert(session_id, Arc::new(Mutex::new(live)));
@@ -541,13 +569,42 @@ impl Hub {
 
     /// Forward controller's SDP offer to the agent.
     pub fn forward_offer(&self, session_id: ObjectId, sdp: String) -> Result<()> {
-        let agent_id = self.with_session(session_id, |s| Ok(s.agent_id))?;
+        let (agent_id, local_relay) =
+            self.with_session(session_id, |s| Ok((s.agent_id, s.local_relay.clone())))?;
         let user_id = self.controller_for(session_id).unwrap_or_default();
-        let ice = ice_servers_for_session(
+        let mut ice = ice_servers_for_session(
             &user_id.to_hex(),
             &session_id.to_hex(),
             self.inner.turn.as_ref(),
         );
+        // Loopback-TURN corp-relay (Phase 2): if the controller forwarded its
+        // local agent's TURN descriptor, hand the REMOTE agent a relay it can
+        // reach over the overlay (WFP-permitted, corp-traversal proven). This is
+        // the SdpOffer→agent push — the one place the remote agent learns its
+        // ICE servers — so it's where the overlay relay must be added. The IP is
+        // validated inside the CGNAT overlay range so a controller can't coerce
+        // the agent's TURN client into probing an arbitrary host.
+        if let Some(lr) = local_relay {
+            if is_overlay_relay_ip(&lr.overlay_ip) && lr.turn_port != 0 {
+                info!(
+                    session = %session_id.to_hex(),
+                    relay = %format!("turn:{}:{}", lr.overlay_ip, lr.turn_port),
+                    "loopback-TURN: adding local-agent overlay relay to agent ICE"
+                );
+                ice.push(IceServer {
+                    urls: vec![format!("turn:{}:{}", lr.overlay_ip, lr.turn_port)],
+                    username: Some(lr.username),
+                    credential: Some(lr.credential),
+                });
+            } else {
+                warn!(
+                    session = %session_id.to_hex(),
+                    overlay_ip = %lr.overlay_ip,
+                    turn_port = lr.turn_port,
+                    "loopback-TURN: rejecting local_relay (not an overlay address)"
+                );
+            }
+        }
         let agent_tx = self.agent_tx(agent_id)?;
         agent_tx
             .try_send(ServerMsg::SdpOffer {
@@ -769,6 +826,10 @@ impl Hub {
                     // Ignored here — the Hub can't validate admin; the API gate
                     // validates the wire field and re-supplies it via `ctx`.
                     override_reason: _,
+                    // Loopback-TURN corp-relay (Phase 2): the descriptor is a
+                    // self-minted local-agent TURN; safe to pass through (the
+                    // media is DTLS-E2E), overlay-IP-validated in forward_offer.
+                    local_relay,
                 },
             ) => {
                 // Forward browser codec caps verbatim to the agent in
@@ -794,6 +855,7 @@ impl Hub {
                     audio_enabled,
                     ctx.consent_mode,
                     ctx.override_reason.clone(),
+                    local_relay,
                 )?;
                 Ok(())
             }
@@ -870,6 +932,7 @@ mod tests {
             false, // audio_enabled
             ConsentMode::Prompt,
             None, // override_reason
+            None, // local_relay
         );
         assert!(matches!(res, Err(Error::AgentOffline(_))));
     }
@@ -894,6 +957,7 @@ mod tests {
                 false, // audio_enabled
                 ConsentMode::Prompt,
                 None, // override_reason
+                None, // local_relay
             )
             .unwrap();
 
@@ -939,6 +1003,7 @@ mod tests {
                 false,
                 ConsentMode::Prompt,
                 None,
+                None, // local_relay
             )
             .unwrap();
         drop(ctl_rx_a); // controller gone → the session's controller_tx.is_closed()
@@ -958,6 +1023,7 @@ mod tests {
             false,
             ConsentMode::Prompt,
             None,
+            None, // local_relay
         );
         assert!(
             res_b.is_ok(),
@@ -997,11 +1063,134 @@ mod tests {
             false,
             ConsentMode::Prompt,
             None,
+            None, // local_relay
         );
         assert!(
             matches!(res_c, Err(Error::AgentBusy)),
             "a live session must still occupy the slot, got {res_c:?}"
         );
+    }
+
+    /// Loopback-TURN corp-relay (Phase 2): a session that forwarded a local
+    /// agent's overlay TURN descriptor must have `forward_offer` append
+    /// `turn:{overlay_ip}:{port}` to the REMOTE agent's ICE servers (the
+    /// SdpOffer→agent push) — this is what lets the corp-Chrome viewer relay
+    /// through the local agent's overlay instead of the capped far coturn.
+    #[tokio::test]
+    async fn forward_offer_appends_overlay_local_relay_to_agent_ice() {
+        let hub = test_hub().await;
+        let agent_id = ObjectId::new();
+        let (_agent_tx, _cancel, mut agent_rx) =
+            hub.register_agent(agent_id, ObjectId::new(), ObjectId::new(), OsKind::Linux, 3);
+        let (ctl_tx, _ctl_rx) = mpsc::channel(8);
+        let sid = hub
+            .create_session(
+                agent_id,
+                ObjectId::new(),
+                "Goran".into(),
+                ctl_tx,
+                Permissions::default(),
+                Vec::new(),
+                None,
+                None,
+                false,
+                ConsentMode::Prompt,
+                None,
+                Some(LocalRelayDescriptor {
+                    turn_port: 47989,
+                    overlay_ip: "100.64.0.9".into(),
+                    username: "1700000600:uid".into(),
+                    credential: "abcd1234".into(),
+                }),
+            )
+            .unwrap();
+
+        hub.forward_offer(sid, "v=0".into()).unwrap();
+
+        // Drain the agent queue; the SdpOffer must carry the overlay relay.
+        let mut turn_urls: Vec<String> = Vec::new();
+        while let Ok(msg) = agent_rx.try_recv() {
+            if let ServerMsg::SdpOffer { ice_servers, .. } = msg {
+                turn_urls = ice_servers
+                    .iter()
+                    .flat_map(|s| s.urls.iter().cloned())
+                    .filter(|u| u.starts_with("turn:"))
+                    .collect();
+            }
+        }
+        assert_eq!(
+            turn_urls,
+            vec!["turn:100.64.0.9:47989".to_string()],
+            "forward_offer must append the local-agent overlay relay to the agent's ICE"
+        );
+    }
+
+    /// The overlay-range guard: a non-overlay `local_relay` (e.g. a public IP a
+    /// malicious controller injected) must NOT be forwarded to the agent's TURN
+    /// client — the agent should never be pointed at an arbitrary host.
+    #[tokio::test]
+    async fn forward_offer_rejects_non_overlay_local_relay() {
+        let hub = test_hub().await;
+        let agent_id = ObjectId::new();
+        let (_agent_tx, _cancel, mut agent_rx) =
+            hub.register_agent(agent_id, ObjectId::new(), ObjectId::new(), OsKind::Linux, 3);
+        let (ctl_tx, _ctl_rx) = mpsc::channel(8);
+        let sid = hub
+            .create_session(
+                agent_id,
+                ObjectId::new(),
+                "Goran".into(),
+                ctl_tx,
+                Permissions::default(),
+                Vec::new(),
+                None,
+                None,
+                false,
+                ConsentMode::Prompt,
+                None,
+                Some(LocalRelayDescriptor {
+                    turn_port: 47989,
+                    overlay_ip: "8.8.8.8".into(), // public — must be rejected
+                    username: "u".into(),
+                    credential: "c".into(),
+                }),
+            )
+            .unwrap();
+
+        hub.forward_offer(sid, "v=0".into()).unwrap();
+
+        let mut saw_turn = false;
+        while let Ok(msg) = agent_rx.try_recv() {
+            if let ServerMsg::SdpOffer { ice_servers, .. } = msg {
+                saw_turn = ice_servers
+                    .iter()
+                    .flat_map(|s| s.urls.iter())
+                    .any(|u| u.starts_with("turn:"));
+            }
+        }
+        assert!(
+            !saw_turn,
+            "a non-overlay relay must be rejected, not forwarded to the agent's TURN client"
+        );
+    }
+
+    #[test]
+    fn overlay_relay_ip_predicate_covers_cgnat_and_ula() {
+        // 100.64.0.0/10 — the overlay's CGNAT v4 space.
+        assert!(is_overlay_relay_ip("100.64.0.1"));
+        assert!(is_overlay_relay_ip("100.100.5.5"));
+        assert!(is_overlay_relay_ip("100.127.255.255"));
+        // Just outside the /10.
+        assert!(!is_overlay_relay_ip("100.63.255.255"));
+        assert!(!is_overlay_relay_ip("100.128.0.0"));
+        // Other private / public / loopback / garbage.
+        assert!(!is_overlay_relay_ip("192.168.1.1"));
+        assert!(!is_overlay_relay_ip("8.8.8.8"));
+        assert!(!is_overlay_relay_ip("127.0.0.1"));
+        assert!(!is_overlay_relay_ip("not-an-ip"));
+        // fc00::/7 ULA (future overlay v6) accepted; public v6 rejected.
+        assert!(is_overlay_relay_ip("fd00::1"));
+        assert!(!is_overlay_relay_ip("2001:4860:4860::8888"));
     }
 
     // ─── rc.53 Phase 2b: Hub displacement notify-then-close ──────────
