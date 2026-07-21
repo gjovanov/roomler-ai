@@ -1076,7 +1076,6 @@ mod turn_tests {
                     urls: vec![format!("turn:{turn_addr}")],
                     username: USER.to_owned(),
                     credential: PASS.to_owned(),
-                    ..Default::default()
                 }],
                 // Force the relay path so success == the hosted TURN carried it.
                 ice_transport_policy: RTCIceTransportPolicy::Relay,
