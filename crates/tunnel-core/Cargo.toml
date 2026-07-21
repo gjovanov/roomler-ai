@@ -61,6 +61,11 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rcgen = { version = "0.13", default-features = false, features = ["ring"] }
 sha2 = { workspace = true }
 hex = { workspace = true }
+# HMAC-SHA1 for the loopback-TURN host's coturn-REST credential minting +
+# stateless validation (transport::turn_host). Matches the keying the server's
+# remote_control::turn_creds uses so the cred SHAPE is identical.
+hmac = { workspace = true }
+sha1 = { workspace = true }
 
 # STUN transaction-id entropy (Phase 2 srflx candidate gathering). A
 # workspace dep already in the tree; ring/quinn pull it transitively.
