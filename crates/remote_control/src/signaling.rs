@@ -258,6 +258,15 @@ pub enum ClientMsg {
         /// and is recorded as `AuditKind::AdminOverride`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         override_reason: Option<String>,
+        /// Loopback-TURN corp-relay (Phase 2). When the controller's browser
+        /// discovered a local-agent TURN via its loopback probe, it forwards the
+        /// descriptor here so the Hub appends `turn:{overlay_ip}:{turn_port}` to
+        /// the REMOTE agent's ICE servers — letting a corp-Chrome viewer that
+        /// can't punch direct relay through the local agent's overlay instead of
+        /// the capped far coturn. `#[serde(default)]` → older controllers that
+        /// omit it get today's behaviour. See [`LocalRelayDescriptor`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        local_relay: Option<LocalRelayDescriptor>,
     },
 
     /// Controller sends an SDP offer (after consent granted).
@@ -1056,6 +1065,33 @@ pub struct IceServer {
     pub credential: Option<String>,
 }
 
+/// Loopback-TURN corp-relay descriptor (loopback-TURN Phase 2). Minted + served
+/// by the controller host's LOCAL enrolled agent on its loopback probe endpoint
+/// (`http://127.0.0.1:47989/rc-local-turn`); the browser forwards it verbatim in
+/// [`ClientMsg::SessionRequest::local_relay`] so the Hub can append
+/// `turn:{overlay_ip}:{turn_port}` to the REMOTE agent's ICE servers. The media
+/// then relays through the local agent's overlay (WFP-permitted, corp-traversal
+/// proven) instead of the capped far coturn — the whole point of the feature.
+///
+/// One type, three hops: the agent SERIALIZES it (loopback response), the
+/// browser parses + re-emits it (`LocalRelayDescriptor` in `useRemoteControl.ts`,
+/// same snake_case field names so the JSON round-trips unchanged), and the Hub
+/// DESERIALIZES it here. WebRTC media is DTLS-E2E, so a relay only ever moves
+/// ciphertext — the server is a dumb pass-through of the descriptor.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct LocalRelayDescriptor {
+    /// UDP port the local agent's TURN server listens on (loopback + overlay).
+    pub turn_port: u16,
+    /// The local agent's assigned overlay IP (100.64.x.y) — the relay-candidate
+    /// address the remote agent routes to over the roomler adapter. The Hub
+    /// validates this is inside the overlay range before trusting it.
+    pub overlay_ip: String,
+    /// coturn-REST username (`{expiry}:{user_id}`) minted by the local agent.
+    pub username: String,
+    /// coturn-REST credential (hex HMAC-SHA1 over `username`) matching it.
+    pub credential: String,
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Overlay network supporting types (rc:overlay.*)
 // ────────────────────────────────────────────────────────────────────────────
@@ -1273,6 +1309,7 @@ mod tests {
             chroma_pref: None,
             audio_enabled: false,
             override_reason: None,
+            local_relay: None,
         };
         let s = serde_json::to_string(&req).unwrap();
         assert!(!s.contains("$oid"));
@@ -1294,9 +1331,50 @@ mod tests {
             chroma_pref: None,
             audio_enabled: true,
             override_reason: None,
+            local_relay: None,
         };
         let s = serde_json::to_string(&req_with_t).unwrap();
         assert!(s.contains("\"preferred_transport\":\"data-channel-vp9-444\""));
+
+        // Loopback-TURN corp-relay (Phase 2): a set `local_relay` round-trips
+        // with the browser's snake_case field names, and the default None is
+        // skipped so the wire stays compatible with older controllers.
+        assert!(
+            !s.contains("local_relay"),
+            "None local_relay must be skipped"
+        );
+        let req_lr = ClientMsg::SessionRequest {
+            agent_id,
+            permissions: Permissions::VIEW,
+            browser_caps: vec![],
+            preferred_transport: None,
+            chroma_pref: None,
+            audio_enabled: false,
+            override_reason: None,
+            local_relay: Some(LocalRelayDescriptor {
+                turn_port: 47989,
+                overlay_ip: "100.64.0.7".into(),
+                username: "1700000600:507f1f77bcf86cd799439012".into(),
+                credential: "deadbeef".into(),
+            }),
+        };
+        let s = serde_json::to_string(&req_lr).unwrap();
+        assert!(
+            s.contains("\"local_relay\":{"),
+            "set local_relay serialises: {s}"
+        );
+        assert!(s.contains("\"turn_port\":47989"));
+        assert!(s.contains("\"overlay_ip\":\"100.64.0.7\""));
+        // Round-trips back to the same descriptor.
+        let back: ClientMsg = serde_json::from_str(&s).unwrap();
+        match back {
+            ClientMsg::SessionRequest { local_relay, .. } => {
+                let d = local_relay.expect("local_relay present");
+                assert_eq!(d.turn_port, 47989);
+                assert_eq!(d.overlay_ip, "100.64.0.7");
+            }
+            _ => panic!("expected SessionRequest"),
+        }
     }
 
     #[test]

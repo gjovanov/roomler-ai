@@ -1603,6 +1603,18 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         }
     });
 
+    // Loopback-TURN corp-relay (Phase 2b): when opted in via
+    // ROOMLER_AGENT_LOCAL_TURN, serve the browser's loopback probe with a
+    // descriptor for a locally-hosted TURN bound to this host's overlay IP — so
+    // a co-located corp-Chrome controller (which can't punch direct) relays
+    // through the overlay instead of the capped far coturn. Default-OFF; inert
+    // without an overlay IP. Spawned before `cfg` moves into the signaling task.
+    roomler_agent::rc_local_turn::spawn(
+        overlay_view_tx.subscribe(),
+        cfg.agent_id.clone(),
+        shutdown_rx.clone(),
+    );
+
     let sig_task = tokio::spawn({
         let rx = shutdown_rx.clone();
         let connected = localapi_connected.clone();

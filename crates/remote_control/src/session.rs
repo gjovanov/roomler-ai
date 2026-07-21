@@ -12,7 +12,7 @@ use crate::consent::ConsentSlot;
 use crate::error::{Error, Result};
 use crate::models::{EndReason, SessionPhase, SessionStats};
 use crate::permissions::Permissions;
-use crate::signaling::ServerMsg;
+use crate::signaling::{LocalRelayDescriptor, ServerMsg};
 
 /// Channel used to push messages to a connected client (agent or controller).
 /// The WS layer owns the receiving half and forwards to the socket.
@@ -37,6 +37,13 @@ pub struct LiveSession {
 
     /// The active controller's tx. None if disconnected.
     pub controller_tx: Option<ClientTx>,
+
+    /// Loopback-TURN corp-relay (Phase 2). Set from the controller's
+    /// `rc:session.request` when its browser discovered a local-agent TURN; the
+    /// Hub reads it back in `forward_offer` to append `turn:{overlay_ip}:{port}`
+    /// to the REMOTE agent's ICE servers. `None` for every session that didn't
+    /// forward one (the default). See [`LocalRelayDescriptor`].
+    pub local_relay: Option<LocalRelayDescriptor>,
 }
 
 impl LiveSession {
@@ -62,6 +69,7 @@ impl LiveSession {
             consent_slot: Some(slot),
             watchers: HashMap::new(),
             controller_tx: Some(controller_tx),
+            local_relay: None,
         };
         (s, waiter)
     }
