@@ -914,7 +914,7 @@ async fn enroll_cmd(
     let machine_id = machine::derive_machine_id(&target_path);
     tracing::info!(%machine_id, machine_global, "derived machine fingerprint");
 
-    let cfg = enrollment::enroll(enrollment::EnrollInputs {
+    let fresh = enrollment::enroll(enrollment::EnrollInputs {
         server_url: server,
         enrollment_token,
         machine_id: &machine_id,
@@ -922,6 +922,22 @@ async fn enroll_cmd(
     })
     .await
     .context("enrollment failed")?;
+
+    // rc.204 — a RE-enroll over an existing install must not reset operator
+    // state: keep the existing config as the base (overlay opt-in + WG key,
+    // declared tunnel routes, ACL posture, encoder preference, …) and take
+    // only the enrollment-owned identity fields from the fresh one. A fresh
+    // machine (no config at the target path) writes the fresh config as-is.
+    let cfg = match config::load(&target_path) {
+        Ok(existing) => {
+            tracing::info!(
+                path = %target_path.display(),
+                "existing config found — preserving operator settings across re-enroll"
+            );
+            enrollment::preserve_operator_config(fresh, existing)
+        }
+        Err(_) => fresh,
+    };
 
     // rc.52: a machine-global write needs admin (%PROGRAMDATA% +, on
     // the installer path, an ACL-restricted parent dir). On a
