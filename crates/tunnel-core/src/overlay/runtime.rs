@@ -1189,6 +1189,12 @@ impl OverlayRuntime {
             CarrierMode::Relay => Some(RelayCoordinator::new(
                 self.outbound.clone(),
                 self.keypair.public.to_bytes(),
+                // Phase D — we can be the raw-UDP single-relay DIALER only if our
+                // own srflx gather succeeded (proof raw UDP to coturn works). A
+                // UDP-blocked host gathered none ⇒ it can only be the ANCHOR
+                // (TURNS/TCP allocation). The peer's equivalent is read off the
+                // netmap's `srflx_endpoints`, so the role choice is symmetric.
+                !srflx_advertised.is_empty(),
                 direct_ctx
                     .as_ref()
                     .map(|c| c.endpoints.clone())
@@ -1798,7 +1804,7 @@ impl OverlayRuntime {
                             carrier,
                             relay_parts: None,
                             supports_quic: cfg.supports_quic,
-                            single_relay: false,
+                            single_relay: None,
                             subnets: cfg.subnets.clone(),
                         },
                     )
@@ -2192,13 +2198,21 @@ impl OverlayRuntime {
         // `supports_relay_single` carries this rule, so the pair can't split
         // QUIC/raw (see `ReadyLink::single_relay`).
         let want_quic = link.relay_parts.is_some()
-            && (link.single_relay || (overlay_quic_enabled() && link.supports_quic));
+            && (link.single_relay.is_some() || (overlay_quic_enabled() && link.supports_quic));
         let carrier = if want_quic {
             let (conn, dst) = link.relay_parts.clone().unwrap();
-            // Deterministic role: the lexicographically-smaller pubkey serves
-            // (same rule as the WG relay initiator, so both ends agree on who
-            // dials vs accepts).
-            let am_server = self.keypair.public.to_bytes() < link.public_key;
+            // QUIC role. For a SINGLE-RELAY link the ANCHOR must serve — its
+            // allocation is the rendezvous, and only the server-on-the-
+            // allocation replies to coturn's observed sources. With UDP-aware
+            // anchor selection the anchor may hold the LARGER pubkey, so the
+            // pubkey rule would invert the roles and deadlock (the anchor
+            // would QUIC-connect toward the dialer's srflx, which that
+            // socket's NAT filter drops). Both-allocate keeps the pubkey rule
+            // (deterministic, both ends agree; either allocation can serve).
+            let am_server = match link.single_relay {
+                Some(anchor) => anchor,
+                None => self.keypair.public.to_bytes() < link.public_key,
+            };
             match Carrier::quic_relay(
                 conn,
                 dst,
@@ -2209,14 +2223,14 @@ impl OverlayRuntime {
             .await
             {
                 Ok(q) => {
-                    info!(peer = %link.node_id, %dst, "overlay: QUIC-over-TURN carrier up");
+                    info!(peer = %link.node_id, %dst, am_server, "overlay: QUIC-over-TURN carrier up");
                     q
                 }
                 Err(e) => {
                     // For a single-relay link the raw fallback only carries for
                     // cone-ish dialers (port-preserving mapping); a symmetric
                     // dialer stays dark until the health sweep re-coordinates.
-                    warn!(peer = %link.node_id, %e, single_relay = link.single_relay,
+                    warn!(peer = %link.node_id, %e, single_relay = ?link.single_relay,
                           "overlay: QUIC carrier build failed; using raw relay");
                     link.carrier
                 }
