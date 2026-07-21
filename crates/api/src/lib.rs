@@ -452,6 +452,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(rate_limited_api)
         .merge(health)
         .route("/ws", get(ws::handler::ws_upgrade))
+        .route("/derp", get(ws::derp::derp_upgrade))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(state)

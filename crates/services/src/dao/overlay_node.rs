@@ -46,6 +46,7 @@ impl OverlayNodeDao {
         endpoints: Vec<String>,
         supports_quic: bool,
         supports_relay_single: bool,
+        supports_derp: bool,
         advertised_routes: Vec<String>,
     ) -> DaoResult<OverlayNode> {
         let now = DateTime::now();
@@ -72,6 +73,7 @@ impl OverlayNodeDao {
             relay_home: None,
             supports_quic,
             supports_relay_single,
+            supports_derp,
             // Phase 1 — the node's claimed routes; nothing approved until an
             // admin acts, so a fresh node routes for no one.
             advertised_routes,
@@ -102,6 +104,7 @@ impl OverlayNodeDao {
         endpoints: &[String],
         supports_quic: bool,
         supports_relay_single: bool,
+        supports_derp: bool,
         advertised_routes: &[String],
     ) -> DaoResult<OverlayNode> {
         let node_ref_bson = bson::to_bson(node_ref).unwrap_or(bson::Bson::Null);
@@ -140,6 +143,9 @@ impl OverlayNodeDao {
                         // Phase D — refresh the single-relay capability on each
                         // re-join (an operator may flip OVERLAY_RELAY_SINGLE).
                         "supports_relay_single": supports_relay_single,
+                        // Phase D (DERP) — refresh the DERP capability on each
+                        // re-join (an operator may flip OVERLAY_DERP).
+                        "supports_derp": supports_derp,
                         "status": bson::to_bson(&AgentStatus::Online).unwrap(),
                         "last_seen_at": DateTime::now(),
                         "updated_at": DateTime::now(),

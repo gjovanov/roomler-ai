@@ -53,6 +53,11 @@ pub struct PeerConfig {
     /// the pair uses both-allocate. Wired to the `NetmapPeer` field in D1c —
     /// `false` until then keeps a mixed fleet on the proven path.
     pub supports_relay_single: bool,
+    /// Phase D (DERP) — the peer advertised it can carry WG over the
+    /// pubkey-addressed `/derp` relay. The runtime falls to DERP only when BOTH
+    /// ends advertise this AND both are UDP-blocked AND our `OVERLAY_DERP` flag
+    /// is on; else the `(false,false)` pair stays on both-allocate.
+    pub supports_derp: bool,
 }
 
 /// Decode a netmap peer. `None` if the pubkey isn't valid base64/length
@@ -76,6 +81,7 @@ pub fn peer_config_from_netmap(peer: &NetmapPeer) -> Option<PeerConfig> {
         srflx_nat: peer.srflx_nat.clone(),
         supports_quic: peer.supports_quic,
         supports_relay_single: peer.supports_relay_single,
+        supports_derp: peer.supports_derp,
     })
 }
 
@@ -99,6 +105,7 @@ mod tests {
             reachable,
             supports_quic: false,
             supports_relay_single: false,
+            supports_derp: false,
             routes: vec![],
             agent_id: None,
         }
