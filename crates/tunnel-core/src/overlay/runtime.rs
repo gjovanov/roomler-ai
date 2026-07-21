@@ -400,6 +400,7 @@ async fn run_srflx_keepalive(
     mut stun_rx: mpsc::Receiver<crate::transport::stun::StunInbound>,
     mut stun_server: SocketAddr,
     stun_urls: Vec<String>,
+    own_ips: Vec<Ipv4Addr>,
     mut advertised: Vec<String>,
     nat: Option<String>,
     outbound: mpsc::Sender<ClientMsg>,
@@ -451,7 +452,7 @@ async fn run_srflx_keepalive(
                 failures += 1;
                 debug!(%e, failures, "overlay: srflx keepalive query failed — retaining last advert");
                 if failures >= RERESOLVE_AFTER {
-                    if let Some(fresh) = direct::resolve_stun_server(&stun_urls).await {
+                    if let Some(fresh) = direct::resolve_stun_server(&stun_urls, &own_ips).await {
                         stun_server = fresh;
                     }
                     failures = 0;
@@ -1002,8 +1003,12 @@ impl OverlayRuntime {
                 .as_ref()
                 .map(|c| c.socks.clone())
                 .unwrap_or_default();
+            // Our own interface IPs — excluded as STUN targets so a fleet host
+            // co-located with a coturn worker doesn't STUN itself (→ hairpin →
+            // false UDP-blocked). See `direct::resolve_stun_server`.
+            let own_ips: Vec<Ipv4Addr> = socks.iter().map(|(ip, _)| *ip).collect();
             if !socks.is_empty() && !network.stun_urls.is_empty() {
-                match direct::resolve_stun_server(&network.stun_urls).await {
+                match direct::resolve_stun_server(&network.stun_urls, &own_ips).await {
                     Some(stun_server) => {
                         srflx_stun_server = Some(stun_server);
                         let pairs = tokio::time::timeout(
@@ -1027,7 +1032,8 @@ impl OverlayRuntime {
                             // symmetric; `None` (unknown) stays optimistic.
                             let my_nat = if let Some((_, ps)) = &punch {
                                 let targets =
-                                    direct::resolve_stun_targets(&network.stun_urls).await;
+                                    direct::resolve_stun_targets(&network.stun_urls, &own_ips)
+                                        .await;
                                 direct::probe_nat_type(ps, &targets, SRFLX_ATTEMPT_TIMEOUT)
                                     .await
                                     .map(str::to_string)
@@ -1103,6 +1109,10 @@ impl OverlayRuntime {
                         stun_rx,
                         stun_server,
                         network.stun_urls.clone(),
+                        direct_ctx
+                            .as_ref()
+                            .map(|c| c.socks.iter().map(|(ip, _)| *ip).collect())
+                            .unwrap_or_default(),
                         srflx_advertised.clone(),
                         srflx_my_nat.clone(),
                         self.outbound.clone(),
@@ -2750,6 +2760,7 @@ mod tests {
             sink_rx,
             server_addr,
             vec![],
+            vec![], // own_ips (co-located-worker exclusion — none in this test)
             advertised,
             Some("cone".into()),
             out_tx,
@@ -2795,6 +2806,7 @@ mod tests {
             sink_rx,
             dead,
             vec![],
+            vec![], // own_ips
             vec!["203.0.113.7:1111".to_string()],
             Some("cone".into()),
             out_tx,
