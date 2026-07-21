@@ -1656,6 +1656,33 @@ mod tests {
         wg_over_two_live_allocations(&urls, &user, &cred).await;
     }
 
+    /// ROOT-CAUSE DIAG for the both-allocate `REKEY_TIMEOUT`: full WG over TWO
+    /// allocations pinned to the SAME worker (`ROOMLER_TEST_TURN_WORKER`). The
+    /// raw relay-to-relay hairpin already flows (see relay.rs
+    /// `relay_to_relay_hairpin_against_real_coturn`), so if THIS passes the
+    /// both-allocate CARRIER is sound when both allocations co-locate — meaning
+    /// the field REKEY is the two ends landing on DIFFERENT workers (worker-pin
+    /// miss / cross-worker drop), not a carrier bug. If it REKEYs even pinned,
+    /// there's a WG-layer both-allocate bug the single-allocation single-relay
+    /// path sidesteps. Set HOST/SECRET + WORKER (off-host).
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "hits live coturn; set ROOMLER_TEST_TURN_HOST/SECRET + ROOMLER_TEST_TURN_WORKER"]
+    async fn wg_both_allocate_pinned_against_real_coturn() {
+        let Some(worker) = std::env::var("ROOMLER_TEST_TURN_WORKER").ok() else {
+            eprintln!("SKIP wg_both_allocate_pinned: ROOMLER_TEST_TURN_WORKER unset");
+            return;
+        };
+        let Some((urls, user, cred)) =
+            live_coturn_creds(|_h| vec![format!("turn:{worker}:3478?transport=udp")])
+        else {
+            eprintln!("SKIP wg_both_allocate_pinned: env unset");
+            return;
+        };
+        eprintln!("wg_both_allocate_pinned: both allocations pinned to {worker}");
+        wg_over_two_live_allocations(&urls, &user, &cred).await;
+        eprintln!("wg_both_allocate_pinned: WG round-tripped over two SAME-worker allocations OK");
+    }
+
     /// Phase D single-relay LIVE — WG completes over ONE real coturn allocation
     /// (the anchor) + a RAW-UDP dialer with NO allocation: the production
     /// single-relay carrier, end to end over prod coturn. The anchor allocates on
