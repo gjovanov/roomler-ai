@@ -3,14 +3,16 @@
 //! layer).
 //!
 //! Menu items:
-//!   - Open Status        — show the main window (status SPA)
-//!   - Onboarding…        — show the main window navigated to the
-//!                           enrollment SPA
+//!   - Open Roomler       — show the main window (Overview view)
+//!   - Onboarding…        — show the main window on the Onboarding view
 //!   - Check for Updates  — invoke `cmd_check_update` and surface
-//!                           the result in a system dialog
+//!                           the result in the Overview's update panel
 //!   - Open Logs Folder   — invoke `cmd_open_log_dir`
-//!   - Quit Tray          — exit the tray process; agent keeps
-//!                           running unaffected.
+//!   - Quit                — exit the desktop app; the device service
+//!                           keeps running unaffected.
+//!
+//! Navigation: the SPA is one page with a hash router (`app.js`), so
+//! `show_window` navigates by evaluating `location.hash = '#/<view>'`.
 
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
@@ -18,7 +20,7 @@ use tauri::{AppHandle, Manager, Runtime};
 
 pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     // Build the menu. IDs are inspected in `on_menu_event` below.
-    let open_status = MenuItem::with_id(app, "open_status", "Open Status", true, None::<&str>)?;
+    let open_status = MenuItem::with_id(app, "open_status", "Open Roomler", true, None::<&str>)?;
     let onboarding = MenuItem::with_id(app, "onboarding", "Onboarding…", true, None::<&str>)?;
     let check_updates_item = MenuItem::with_id(
         app,
@@ -28,7 +30,7 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         None::<&str>,
     )?;
     let open_logs = MenuItem::with_id(app, "open_logs", "Open Logs Folder", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", "Quit Tray", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
         &[
@@ -41,15 +43,19 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     )?;
 
     let _tray = TrayIconBuilder::with_id("roomler-agent-tray")
-        .tooltip("Roomler Agent")
+        .tooltip("Roomler")
         .menu(&menu)
         .show_menu_on_left_click(false) // left-click brings up the main window; right-click is the menu
         .on_menu_event(|app, event| match event.id.as_ref() {
-            "open_status" => show_window(app, "index.html"),
-            "onboarding" => show_window(app, "enrollment.html"),
+            "open_status" => show_window(app, "/overview"),
+            "onboarding" => show_window(app, "/onboarding"),
             "check_updates" => check_updates(app),
             "open_logs" => {
-                let _ = crate::commands::cmd_open_log_dir();
+                // The resolve probes the service flavour (CLI spawns) — keep
+                // it off the menu/UI thread.
+                tauri::async_runtime::spawn_blocking(|| {
+                    let _ = crate::commands::open_log_dir_blocking();
+                });
             }
             "quit" => {
                 app.exit(0);
@@ -66,13 +72,16 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
                 ..
             } = event
             {
-                show_window(tray.app_handle(), "index.html");
+                show_window(tray.app_handle(), "/overview");
             }
         })
         .build(app)?;
     Ok(())
 }
 
+/// Show + focus the main window and route the SPA to `path` (a hash-router
+/// path like `/overview`). The router treats an unknown hash as `/overview`,
+/// so a stale path can't strand the window on a blank page.
 fn show_window<R: Runtime>(app: &AppHandle<R>, path: &str) {
     if let Some(window) = app.get_webview_window("main") {
         // Navigate (no-op when already on the same path).
