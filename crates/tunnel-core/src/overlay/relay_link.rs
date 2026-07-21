@@ -56,15 +56,23 @@ pub struct ReadyLink {
     /// rc.142 — the peer advertised QUIC-over-TURN support. `install_ready`
     /// only attempts the QUIC upgrade when this is set (both ends must agree).
     pub supports_quic: bool,
-    /// Phase D — this link is a v1 single-relay pair (anchor or dialer side).
-    /// `install_ready` MUST upgrade it to QUIC-over-relay REGARDLESS of the
-    /// `OVERLAY_QUIC` opt-in: a raw `Carrier::Relay` discards the recv source,
-    /// so an anchor can't reply to a symmetric dialer's coturn-observed port —
-    /// only the QUIC server consumes the observed path (plan BLOCKER 1). Safe
-    /// to force symmetrically: a single-relay link only exists when BOTH ends
-    /// advertised `supports_relay_single`, and every build that advertises it
-    /// carries this same force-QUIC rule, so the pair can't split QUIC/raw.
-    pub single_relay: bool,
+    /// Phase D — this link's v1 single-relay role: `None` = not single-relay
+    /// (both-allocate / direct), `Some(true)` = ANCHOR, `Some(false)` = DIALER.
+    ///
+    /// `install_ready` uses it for TWO things. (1) Force the QUIC-over-relay
+    /// upgrade REGARDLESS of the `OVERLAY_QUIC` opt-in: a raw `Carrier::Relay`
+    /// discards the recv source, so an anchor can't reply to a symmetric
+    /// dialer's coturn-observed port — only the QUIC server consumes the
+    /// observed path (plan BLOCKER 1). (2) Pick the QUIC role: the ANCHOR must
+    /// be the QUIC SERVER — its allocation is the rendezvous, and only the
+    /// server-on-the-allocation replies to observed sources. With UDP-aware
+    /// anchor selection the anchor may hold the LARGER pubkey, so the old
+    /// pubkey-based `am_server` would invert the roles: the anchor would
+    /// QUIC-connect toward the dialer's advertised srflx (dropped — that
+    /// socket's NAT filter never opened toward `R`) while the dialer serves on
+    /// a socket nobody dials. Both ends compute this role from the same
+    /// symmetric inputs, so they can't disagree.
+    pub single_relay: Option<bool>,
     /// Phase 1 — approved subnet routes this peer is a router for; `install_ready`
     /// registers them in the router + installs OS routes.
     pub subnets: Vec<super::router::Cidr>,
@@ -403,7 +411,7 @@ impl RelayCoordinator {
             carrier,
             relay_parts: Some((a.conn.clone(), dst)),
             supports_quic: a.peer.supports_quic,
-            single_relay: single_anchor,
+            single_relay: single_anchor.then_some(true),
             subnets: a.peer.subnets.clone(),
         };
         self.allocated.remove(node_id);
@@ -440,7 +448,7 @@ impl RelayCoordinator {
             carrier,
             relay_parts: Some((conn, r)),
             supports_quic: peer.supports_quic,
-            single_relay: true,
+            single_relay: Some(false),
             subnets: peer.subnets.clone(),
         };
         self.dialing.remove(node_id);
@@ -899,10 +907,12 @@ mod tests {
             link.supports_quic,
             "supports_quic carries through so install_ready runs the QUIC upgrade"
         );
-        assert!(
+        assert_eq!(
             link.single_relay,
-            "single_relay marks the link so install_ready FORCES the QUIC carrier \
-             (a raw relay can't reply to a symmetric dialer's observed port)"
+            Some(false),
+            "the link carries the DIALER role: install_ready FORCES the QUIC \
+             carrier AND makes us the QUIC CLIENT (the anchor serves on its \
+             allocation — only the server-side consumes observed sources)"
         );
         let (_conn, dst) = link.relay_parts.expect("relay parts present");
         assert_eq!(
