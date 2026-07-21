@@ -1118,6 +1118,27 @@ function persistPriority(p: RcPriority) {
   }
 }
 
+/** loopback-TURN corp-relay opt-in (Phase 2; default OFF while it beds in —
+ *  the plan's Phase-4 gating). When on, `connect()` probes the local agent's
+ *  loopback TURN and, if present, relays through it. */
+const LOCAL_RELAY_STORAGE_KEY = 'roomler-rc-local-relay'
+
+function readStoredLocalRelay(): boolean {
+  try {
+    return globalThis.localStorage?.getItem(LOCAL_RELAY_STORAGE_KEY) === '1'
+  } catch {
+    return false
+  }
+}
+
+function persistLocalRelay(on: boolean) {
+  try {
+    globalThis.localStorage?.setItem(LOCAL_RELAY_STORAGE_KEY, on ? '1' : '0')
+  } catch {
+    /* best-effort */
+  }
+}
+
 /** Pure builder for the `rc:priority` control-DC envelope. Exported so the
  *  unit tests can lock the wire shape the agent's `priority::from_wire`
  *  parses. */
@@ -1195,6 +1216,60 @@ export function settingsToCodecChoice(
     case 'auto':
     default:
       return 'auto'
+  }
+}
+
+/** loopback-TURN corp-relay (Phase 2 — plan
+ *  `~/.claude/plans/roomler-loopback-turn-corp-relay.md`). The corp host's
+ *  local enrolled agent hosts a TURN server (`tunnel-core::transport::
+ *  turn_host::LocalTurnHost`) + a loopback HTTP endpoint that returns this
+ *  descriptor. The browser — loopback is never firewall-blocked, unlike its
+ *  direct/coturn UDP — probes the endpoint, uses `turn:127.0.0.1:{turn_port}`
+ *  as an ICE server, AND forwards the whole descriptor to the server so the Hub
+ *  adds `turn:{overlay_ip}:{turn_port}` to the REMOTE agent's ICE servers. The
+ *  media then relays through the local agent's overlay (WFP-permitted) instead
+ *  of the capped far coturn. */
+export interface LocalRelayDescriptor {
+  turn_port: number
+  overlay_ip: string
+  username: string
+  credential: string
+}
+
+/** Fixed loopback port the agent serves its local-relay descriptor on. The
+ *  browser probes `http://127.0.0.1:{LOCAL_RELAY_PROBE_PORT}/rc-local-turn`; no
+ *  response (no local agent, feature off, Private-Network-Access blocked, or
+ *  timeout) makes the probe a graceful no-op. */
+export const LOCAL_RELAY_PROBE_PORT = 47989
+
+/** Validate an untrusted JSON blob from the loopback probe into a
+ *  [`LocalRelayDescriptor`], or `null`. Pure + exported for tests. */
+export function parseLocalRelayDescriptor(raw: unknown): LocalRelayDescriptor | null {
+  if (raw === null || typeof raw !== 'object') return null
+  const o = raw as Record<string, unknown>
+  const { turn_port, overlay_ip, username, credential } = o
+  if (
+    typeof turn_port !== 'number' ||
+    !Number.isInteger(turn_port) ||
+    turn_port <= 0 ||
+    turn_port > 65535 ||
+    typeof overlay_ip !== 'string' ||
+    overlay_ip.length === 0 ||
+    typeof username !== 'string' ||
+    typeof credential !== 'string'
+  ) {
+    return null
+  }
+  return { turn_port, overlay_ip, username, credential }
+}
+
+/** The browser's ICE-server entry for the loopback TURN (dialled over loopback,
+ *  never firewalled). Pure + exported for tests. */
+export function localRelayIceServer(desc: LocalRelayDescriptor): IceServer {
+  return {
+    urls: [`turn:127.0.0.1:${desc.turn_port}`],
+    username: desc.username,
+    credential: desc.credential,
   }
 }
 
@@ -1580,6 +1655,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    *  old Quality dropdown in the UI (which only shadowed AIMD/REMB); the
    *  underlying `quality` ref + `rc:quality` sender are kept for back-compat. */
   const priority = ref<RcPriority>(readStoredPriority())
+  /** loopback-TURN corp-relay opt-in (Phase 2; default OFF). When on,
+   *  `connect()` probes the local agent's loopback TURN and relays through it
+   *  if present — bypasses the capped far-coturn relay on corp networks. */
+  const localRelayEnabled = ref<boolean>(readStoredLocalRelay())
   /** Optional codec override. `null` = let the agent pick from the full
    *  intersection; `'h265'` = only advertise H.265 + H.264 fallback to
    *  the agent so AV1 can't win. Useful for A/B comparisons
@@ -2350,6 +2429,35 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     priority.value = p
     persistPriority(p)
     sendPriorityPreference()
+  }
+
+  /** Toggle the loopback-TURN corp-relay opt-in (Phase 2). Takes effect on the
+   *  next `connect()`. */
+  function setLocalRelayEnabled(on: boolean) {
+    localRelayEnabled.value = on
+    persistLocalRelay(on)
+  }
+
+  /** Probe the local enrolled agent's loopback TURN endpoint. Returns its
+   *  descriptor, or `null` on any failure (no local agent, feature off,
+   *  Private-Network-Access blocked, non-2xx, timeout) — all graceful, so a
+   *  host WITHOUT a local agent silently keeps the normal coturn path. Loopback
+   *  fetch is exempt from mixed-content blocking; the agent's endpoint must
+   *  answer the PNA CORS preflight for HTTPS→localhost on newer Chrome. */
+  async function probeLocalRelay(): Promise<LocalRelayDescriptor | null> {
+    const ctl = new AbortController()
+    const timer = setTimeout(() => ctl.abort(), 800)
+    try {
+      const res = await fetch(`http://127.0.0.1:${LOCAL_RELAY_PROBE_PORT}/rc-local-turn`, {
+        signal: ctl.signal,
+      })
+      if (!res.ok) return null
+      return parseLocalRelayDescriptor(await res.json())
+    } catch {
+      return null
+    } finally {
+      clearTimeout(timer)
+    }
   }
 
   /** The unified Codec picker as a computed over the four underlying refs.
@@ -3241,6 +3349,23 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       iceServers = [{ urls: ['stun:stun.l.google.com:19302'] }]
     }
 
+    // loopback-TURN corp-relay (Phase 2): if opted-in AND this host runs a
+    // local enrolled agent serving a loopback TURN, prepend it as an ICE server
+    // (loopback is never firewall-blocked, unlike this corp browser's direct/
+    // coturn UDP) and forward its descriptor to the server (below) so the REMOTE
+    // agent relays through it too. Graceful no-op on any host without one.
+    let localRelay: LocalRelayDescriptor | null = null
+    if (localRelayEnabled.value) {
+      localRelay = await probeLocalRelay()
+      if (localRelay) {
+        iceServers = [localRelayIceServer(localRelay), ...iceServers]
+        console.info(
+          '[rc] local-relay TURN discovered on this host — relaying via local agent overlay',
+          localRelay.overlay_ip,
+        )
+      }
+    }
+
     pc = new RTCPeerConnection({
       iceServers: iceServers as RTCIceServer[],
       bundlePolicy: 'max-bundle',
@@ -3982,6 +4107,13 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       agent_id: agentId,
       permissions,
       browser_caps: browserCaps,
+    }
+    // loopback-TURN corp-relay (Phase 2): forward the probed descriptor so the
+    // Hub adds `turn:{overlay_ip}:{turn_port}` to the REMOTE agent's ICE servers
+    // — it reaches that TURN over the overlay (WFP-permitted). Absent → the Hub
+    // pushes nothing extra, so old servers/agents are unaffected.
+    if (localRelay) {
+      requestPayload.local_relay = localRelay
     }
     if (preferredTransport) {
       requestPayload.preferred_transport = preferredTransport
@@ -5733,6 +5865,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
      *  preferredCodec+renderPath). Read for the picker's value; assign to
      *  apply a choice. Replaces the 4 transport toggles + 2 dropdowns. */
     codecChoice,
+    /** loopback-TURN corp-relay opt-in (Phase 2, default OFF) + its setter.
+     *  When on, `connect()` probes the local agent's loopback TURN and relays
+     *  through it — bypasses the capped far-coturn relay on corp networks. */
+    localRelayEnabled,
+    setLocalRelayEnabled,
     vp9_444Supported,
     vp9_444Active,
     vp9_444FramesDecoded,
