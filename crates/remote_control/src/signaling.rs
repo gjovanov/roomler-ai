@@ -574,6 +574,13 @@ pub enum ClientMsg {
         /// both-allocate relay). Absent from a pre-Phase-D node ⇒ `false`.
         #[serde(default)]
         supports_relay_single: bool,
+        /// Phase D (DERP) — the node can carry WG over the pubkey-addressed
+        /// `/derp` WS relay (`ROOMLER_NODE_OVERLAY_DERP=1`), the last-resort
+        /// carrier for two BOTH-UDP-blocked peers. Persisted + echoed per-peer
+        /// like `supports_relay_single`, so DERP is only chosen when BOTH ends
+        /// advertise it. Absent from a pre-DERP node ⇒ `false`.
+        #[serde(default)]
+        supports_derp: bool,
         /// Phase 1 — subnet CIDRs this node offers to route for peers
         /// (`--advertise-routes` / config). The server stores them as *claimed*
         /// routes; an admin must **approve** each before it's distributed in the
@@ -1123,6 +1130,12 @@ pub struct NetmapPeer {
     /// Absent from a pre-Phase-D server/peer ⇒ `false` (both-allocate).
     #[serde(default)]
     pub supports_relay_single: bool,
+    /// Phase D (DERP) — this peer advertised it can carry WG over the
+    /// pubkey-addressed `/derp` relay. The runtime falls to DERP only when BOTH
+    /// ends set this AND both are UDP-blocked (the single-relay `(false,false)`
+    /// arm) AND the local `OVERLAY_DERP` flag is on. Pre-DERP peer ⇒ `false`.
+    #[serde(default)]
+    pub supports_derp: bool,
     /// Phase 1 — subnet routes this peer is an **approved** router for (CIDR
     /// strings like `"192.168.1.0/24"`). A receiving node installs each CIDR
     /// into its router (allowed_ips) + OS route table pointing at this peer, so
@@ -2058,6 +2071,7 @@ mod tests {
             endpoints: vec!["203.0.113.5:51820".into()],
             supports_quic: true,
             supports_relay_single: true,
+            supports_derp: true,
             advertised_routes: vec!["192.168.1.0/24".into()],
         };
         let s = serde_json::to_string(&m).unwrap();
@@ -2069,6 +2083,7 @@ mod tests {
                 supported,
                 supports_quic,
                 supports_relay_single,
+                supports_derp,
                 advertised_routes,
                 ..
             } => {
@@ -2080,6 +2095,7 @@ mod tests {
                     supports_relay_single,
                     "supports_relay_single must round-trip"
                 );
+                assert!(supports_derp, "supports_derp must round-trip");
                 assert_eq!(advertised_routes, vec!["192.168.1.0/24".to_string()]);
             }
             other => panic!("expected OverlayJoin, got {other:?}"),
@@ -2190,6 +2206,7 @@ mod tests {
                 reachable: true,
                 supports_quic: true,
                 supports_relay_single: true,
+                supports_derp: true,
                 routes: vec!["10.0.0.0/24".into()],
                 agent_id: Some(agent_id),
             }],
