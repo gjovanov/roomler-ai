@@ -1,3 +1,4 @@
+pub mod derp;
 pub mod dispatcher;
 pub mod handler;
 pub mod overlay;
