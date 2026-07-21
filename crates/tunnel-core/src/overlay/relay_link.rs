@@ -56,15 +56,23 @@ pub struct ReadyLink {
     /// rc.142 — the peer advertised QUIC-over-TURN support. `install_ready`
     /// only attempts the QUIC upgrade when this is set (both ends must agree).
     pub supports_quic: bool,
-    /// Phase D — this link is a v1 single-relay pair (anchor or dialer side).
-    /// `install_ready` MUST upgrade it to QUIC-over-relay REGARDLESS of the
-    /// `OVERLAY_QUIC` opt-in: a raw `Carrier::Relay` discards the recv source,
-    /// so an anchor can't reply to a symmetric dialer's coturn-observed port —
-    /// only the QUIC server consumes the observed path (plan BLOCKER 1). Safe
-    /// to force symmetrically: a single-relay link only exists when BOTH ends
-    /// advertised `supports_relay_single`, and every build that advertises it
-    /// carries this same force-QUIC rule, so the pair can't split QUIC/raw.
-    pub single_relay: bool,
+    /// Phase D — this link's v1 single-relay role: `None` = not single-relay
+    /// (both-allocate / direct), `Some(true)` = ANCHOR, `Some(false)` = DIALER.
+    ///
+    /// `install_ready` uses it for TWO things. (1) Force the QUIC-over-relay
+    /// upgrade REGARDLESS of the `OVERLAY_QUIC` opt-in: a raw `Carrier::Relay`
+    /// discards the recv source, so an anchor can't reply to a symmetric
+    /// dialer's coturn-observed port — only the QUIC server consumes the
+    /// observed path (plan BLOCKER 1). (2) Pick the QUIC role: the ANCHOR must
+    /// be the QUIC SERVER — its allocation is the rendezvous, and only the
+    /// server-on-the-allocation replies to observed sources. With UDP-aware
+    /// anchor selection the anchor may hold the LARGER pubkey, so the old
+    /// pubkey-based `am_server` would invert the roles: the anchor would
+    /// QUIC-connect toward the dialer's advertised srflx (dropped — that
+    /// socket's NAT filter never opened toward `R`) while the dialer serves on
+    /// a socket nobody dials. Both ends compute this role from the same
+    /// symmetric inputs, so they can't disagree.
+    pub single_relay: Option<bool>,
     /// Phase 1 — approved subnet routes this peer is a router for; `install_ready`
     /// registers them in the router + installs OS routes.
     pub subnets: Vec<super::router::Cidr>,
@@ -110,17 +118,26 @@ pub struct RelayCoordinator {
     /// from the netmap and forced peers onto relay (field 2026-06-27). Every
     /// trickle now carries `lan ∪ current relays`.
     lan_endpoints: Vec<String>,
-    /// Phase D — this node's WG public key, used to decide the v1 single-relay
-    /// role per peer: the lexicographically-SMALLER pubkey is the ANCHOR (owns
-    /// the one allocation + QUIC-serves), the larger is the DIALER (no
-    /// allocation, raw-dials the anchor's `R`). Pure function of the two
-    /// pubkeys ⇒ both ends agree with no coordination message.
+    /// Phase D — this node's WG public key, the tie-break for the single-relay
+    /// role when BOTH ends are UDP-capable (smaller pubkey = ANCHOR). Pure
+    /// function of the two pubkeys ⇒ both ends agree with no coordination
+    /// message. See [`single_relay_role`](Self::single_relay_role).
     my_public_key: [u8; 32],
     /// Phase D — our end of the single-relay opt-in, captured once from
     /// [`relay_single_enabled`](super::direct::relay_single_enabled). A link
     /// goes single-relay only when this AND the peer's advertised support are
     /// both set (a mixed pair must stay on both-allocate, never deadlock).
     single_relay: bool,
+    /// Phase D — can THIS node reach coturn over raw UDP (so it can be the
+    /// single-relay DIALER, which raw-UDP-dials the anchor's `R`)? Derived from
+    /// whether our own srflx gather succeeded (`!srflx_advertised.is_empty()`):
+    /// a successful UDP STUN round-trip to a coturn worker is proof that raw UDP
+    /// to coturn works. A UDP-blocked host (corp / TLS-inspecting net) gathers
+    /// no srflx and sets this `false` — it can still be the ANCHOR (allocates
+    /// over the TURNS/TCP Tier-3 fallback), just never the raw-UDP dialer. The
+    /// PEER's equivalent is read symmetrically off the netmap as
+    /// `!peer.srflx_endpoints.is_empty()`, so both ends compute the same role.
+    my_udp_relay_ok: bool,
     /// Phase D — v1 single-relay DIALER links awaiting the anchor's advertised
     /// relay `R`. We hold NO allocation for these (the anchor owns the sole
     /// relay); each becomes a raw [`UdpRelayConn`](crate::transport::relay::UdpRelayConn)
@@ -134,6 +151,7 @@ impl RelayCoordinator {
     pub fn new(
         outbound: tokio::sync::mpsc::Sender<ClientMsg>,
         my_public_key: [u8; 32],
+        my_udp_relay_ok: bool,
         lan_endpoints: Vec<String>,
     ) -> Self {
         Self {
@@ -144,20 +162,45 @@ impl RelayCoordinator {
             lan_endpoints,
             my_public_key,
             single_relay: super::direct::relay_single_enabled(),
+            my_udp_relay_ok,
             dialing: HashMap::new(),
         }
     }
 
-    /// v1 single-relay role for this peer, or `None` for the both-allocate path
-    /// (today's default): either single-relay is off on our side or the peer
-    /// didn't advertise support (BOTH are required so a mixed pair can't
-    /// deadlock). `Some(true)` = ANCHOR (smaller pubkey: allocate the one relay,
-    /// advertise `R`, QUIC-serve); `Some(false)` = DIALER (larger pubkey: no
-    /// allocation, raw-dial the anchor's `R`, QUIC-connect). Pure function of the
-    /// two pubkeys ⇒ both ends agree without any coordination message.
+    /// v1 single-relay role for this peer, or `None` for the both-allocate path:
+    /// single-relay is off on our side, the peer didn't advertise support, or
+    /// neither end can be the raw-UDP dialer.
+    ///
+    /// `Some(true)` = ANCHOR (allocate the one relay — over UDP, or the TURNS/TCP
+    /// Tier-3 fallback if we're UDP-blocked — advertise `R`, QUIC-serve);
+    /// `Some(false)` = DIALER (no allocation, raw-UDP-dial the anchor's `R`,
+    /// QUIC-connect).
+    ///
+    /// **The DIALER must be UDP-capable** (its raw socket sends straight to
+    /// coturn), while the ANCHOR only needs an allocation, which coturn grants
+    /// over TURNS/TCP too. So the role is chosen by UDP capability first, pubkey
+    /// only as a tie-break — this is what lets a UDP-blocked corp host (e.g. one
+    /// behind a TLS-inspecting VPN) reach a UDP-capable peer: the corp host
+    /// anchors over TCP:443, the peer raw-dials, and coturn bridges the two legs.
+    /// Both ends read the same `(udp_ok_a, udp_ok_b)` — our own from the srflx
+    /// gather, the peer's from `srflx_endpoints` in the netmap — so the decision
+    /// is symmetric with no extra wire:
+    /// * we UDP-OK, peer UDP-blocked → peer anchors, WE dial → `Some(false)`
+    /// * we UDP-blocked, peer UDP-OK → WE anchor → `Some(true)`
+    /// * both UDP-OK → smaller pubkey anchors (deterministic tie-break)
+    /// * both UDP-blocked → no raw-UDP dialer exists → `None` (single-relay can't
+    ///   carry this pair; it falls through to both-allocate today, DERP later)
     fn single_relay_role(&self, peer: &PeerConfig) -> Option<bool> {
-        (self.single_relay && peer.supports_relay_single)
-            .then(|| self.my_public_key < peer.public_key)
+        if !(self.single_relay && peer.supports_relay_single) {
+            return None;
+        }
+        let peer_udp_ok = !peer.srflx_endpoints.is_empty();
+        match (self.my_udp_relay_ok, peer_udp_ok) {
+            (true, false) => Some(false), // peer is UDP-blocked → it anchors, we dial
+            (false, true) => Some(true),  // we're UDP-blocked → we anchor
+            (true, true) => Some(self.my_public_key < peer.public_key), // tie-break
+            (false, false) => None,       // neither can raw-UDP-dial → not single-relay
+        }
     }
 
     /// LAN endpoints ∪ every current relay address — the full candidate set the
@@ -368,7 +411,7 @@ impl RelayCoordinator {
             carrier,
             relay_parts: Some((a.conn.clone(), dst)),
             supports_quic: a.peer.supports_quic,
-            single_relay: single_anchor,
+            single_relay: single_anchor.then_some(true),
             subnets: a.peer.subnets.clone(),
         };
         self.allocated.remove(node_id);
@@ -405,7 +448,7 @@ impl RelayCoordinator {
             carrier,
             relay_parts: Some((conn, r)),
             supports_quic: peer.supports_quic,
-            single_relay: true,
+            single_relay: Some(false),
             subnets: peer.subnets.clone(),
         };
         self.dialing.remove(node_id);
@@ -615,7 +658,7 @@ mod tests {
     #[tokio::test]
     async fn request_is_idempotent_and_sends_one_relay_request() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        let mut coord = RelayCoordinator::new(tx, [0u8; 32], vec![]);
+        let mut coord = RelayCoordinator::new(tx, [0u8; 32], true, vec![]);
         let node = ObjectId::new();
         let peer = base_peer();
         coord.request(node, peer.clone()).await;
@@ -634,7 +677,8 @@ mod tests {
         // we advertised for it, or the next `OverlayEndpoints` trickle keeps
         // carrying a now-dead allocation and the peer dials it forever.
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        let mut coord = RelayCoordinator::new(tx, [0u8; 32], vec!["192.168.68.5:51820".into()]);
+        let mut coord =
+            RelayCoordinator::new(tx, [0u8; 32], true, vec!["192.168.68.5:51820".into()]);
         let node = ObjectId::new();
         coord.advertised.insert(node, "94.130.141.74:11085".into());
         coord.pending.insert(
@@ -730,7 +774,8 @@ mod tests {
     #[test]
     fn all_endpoints_unions_lan_and_relays() {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        let mut coord = RelayCoordinator::new(tx, [0u8; 32], vec!["192.168.68.5:51820".into()]);
+        let mut coord =
+            RelayCoordinator::new(tx, [0u8; 32], true, vec!["192.168.68.5:51820".into()]);
         coord
             .advertised
             .insert(ObjectId::new(), "94.130.141.74:11085".into());
@@ -748,52 +793,89 @@ mod tests {
     // ───────────────── Phase D — v1 single-relay role split ─────────────────
 
     #[test]
-    fn single_relay_role_is_symmetric_by_pubkey() {
+    fn single_relay_role_by_udp_capability_then_pubkey() {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let small = [0x00u8; 32];
         let large = [0xFFu8; 32];
-        let peer = |pk: [u8; 32], sup: bool| PeerConfig {
+        // `sup` = peer advertises single-relay; `udp` = peer is UDP-capable
+        // (has a srflx endpoint — the raw-UDP-dialer signal).
+        let peer = |pk: [u8; 32], sup: bool, udp: bool| PeerConfig {
             public_key: pk,
             supports_relay_single: sup,
+            srflx_endpoints: if udp {
+                vec!["203.0.113.9:40000".into()]
+            } else {
+                vec![]
+            },
             ..base_peer()
         };
-        // Flag explicitly off → both-allocate, regardless of pubkeys (the gate
-        // now defaults ON, so force it off here to lock the disabled path).
-        let mut off = RelayCoordinator::new(tx.clone(), small, vec![]);
-        off.single_relay = false;
-        assert_eq!(off.single_relay_role(&peer(large, true)), None);
+        // Helper: a coordinator with the flag forced on and a given UDP status.
+        let coord = |pk: [u8; 32], udp_ok: bool| {
+            let mut c = RelayCoordinator::new(tx.clone(), pk, udp_ok, vec![]);
+            c.single_relay = true;
+            c
+        };
 
-        // Flag on + peer advertises → role decided purely by pubkey order, and
-        // the two ends are mirror images (one anchor, one dialer).
-        let mut anchor = RelayCoordinator::new(tx.clone(), small, vec![]);
-        anchor.single_relay = true;
+        // Flag off → both-allocate regardless (gate defaults ON, so force off).
+        let mut off = RelayCoordinator::new(tx.clone(), small, true, vec![]);
+        off.single_relay = false;
+        assert_eq!(off.single_relay_role(&peer(large, true, true)), None);
+
+        // Peer doesn't advertise → both-allocate (no anchor/dialer split).
         assert_eq!(
-            anchor.single_relay_role(&peer(large, true)),
-            Some(true),
-            "smaller pubkey ⇒ ANCHOR"
-        );
-        let mut dialer = RelayCoordinator::new(tx, large, vec![]);
-        dialer.single_relay = true;
-        assert_eq!(
-            dialer.single_relay_role(&peer(small, true)),
-            Some(false),
-            "larger pubkey ⇒ DIALER"
-        );
-        // Flag on but the peer doesn't advertise support → both-allocate (a
-        // mixed-build pair must never split into anchor/dialer and deadlock).
-        assert_eq!(
-            anchor.single_relay_role(&peer(large, false)),
+            coord(small, true).single_relay_role(&peer(large, false, true)),
             None,
             "peer flag off ⇒ both-allocate"
         );
+
+        // Both UDP-capable → smaller pubkey anchors (deterministic tie-break).
+        assert_eq!(
+            coord(small, true).single_relay_role(&peer(large, true, true)),
+            Some(true),
+            "both UDP-OK, smaller pubkey ⇒ ANCHOR"
+        );
+        assert_eq!(
+            coord(large, true).single_relay_role(&peer(small, true, true)),
+            Some(false),
+            "both UDP-OK, larger pubkey ⇒ DIALER"
+        );
+
+        // UDP-capability OVERRIDES pubkey: the UDP-blocked side always anchors,
+        // even when its pubkey is the LARGER one (would be dialer under the old
+        // rule) — this is the PC50045 corp-host path.
+        assert_eq!(
+            coord(large, false).single_relay_role(&peer(small, true, true)),
+            Some(true),
+            "we're UDP-blocked (larger pubkey) ⇒ we still ANCHOR"
+        );
+        assert_eq!(
+            coord(small, true).single_relay_role(&peer(large, true, false)),
+            Some(false),
+            "peer is UDP-blocked (larger pubkey) ⇒ peer anchors, WE dial"
+        );
+
+        // Both UDP-blocked → no raw-UDP dialer exists → not single-relay.
+        assert_eq!(
+            coord(small, false).single_relay_role(&peer(large, true, false)),
+            None,
+            "both UDP-blocked ⇒ single-relay can't carry (→ both-allocate/DERP)"
+        );
+
+        // Symmetry: the two ends of a mixed (UDP-OK ↔ UDP-blocked) pair compute
+        // mirror roles (exactly one anchor), regardless of pubkey order.
+        let a_ok_dialer = coord(large, true).single_relay_role(&peer(small, true, false));
+        let b_blocked_anchor = coord(small, false).single_relay_role(&peer(large, true, true));
+        assert_eq!(a_ok_dialer, Some(false));
+        assert_eq!(b_blocked_anchor, Some(true));
     }
 
     #[tokio::test]
     async fn single_relay_dialer_tracks_without_request_and_builds_raw_to_anchor_r() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        // We are the DIALER: our pubkey is LARGER than the peer's, so the role
-        // resolves to Some(false).
-        let mut coord = RelayCoordinator::new(tx, [0xFFu8; 32], vec![]);
+        // We are UDP-capable and our pubkey is LARGER; the peer is also
+        // UDP-capable (has a srflx endpoint), so the tie-break makes US the
+        // DIALER (Some(false)).
+        let mut coord = RelayCoordinator::new(tx, [0xFFu8; 32], true, vec![]);
         coord.single_relay = true; // same-module: force the opt-in on for the test
         let node = ObjectId::new();
         let anchor_r = "94.130.141.74:11085"; // the anchor's advertised relay R
@@ -801,6 +883,9 @@ mod tests {
             public_key: [0x00u8; 32], // smaller than ours ⇒ the peer is the anchor
             // The anchor's endpoints = LAN ∪ R; the sole PUBLIC one is R.
             endpoints: vec!["192.168.1.5:51820".into(), anchor_r.into()],
+            // Peer is UDP-capable (has srflx) so this is the both-UDP-OK
+            // tie-break case, not the UDP-blocked-peer override.
+            srflx_endpoints: vec!["198.51.100.7:41000".into()],
             supports_quic: true,
             supports_relay_single: true,
             ..base_peer()
@@ -822,10 +907,12 @@ mod tests {
             link.supports_quic,
             "supports_quic carries through so install_ready runs the QUIC upgrade"
         );
-        assert!(
+        assert_eq!(
             link.single_relay,
-            "single_relay marks the link so install_ready FORCES the QUIC carrier \
-             (a raw relay can't reply to a symmetric dialer's observed port)"
+            Some(false),
+            "the link carries the DIALER role: install_ready FORCES the QUIC \
+             carrier AND makes us the QUIC CLIENT (the anchor serves on its \
+             allocation — only the server-side consumes observed sources)"
         );
         let (_conn, dst) = link.relay_parts.expect("relay parts present");
         assert_eq!(
