@@ -1189,6 +1189,12 @@ impl OverlayRuntime {
             CarrierMode::Relay => Some(RelayCoordinator::new(
                 self.outbound.clone(),
                 self.keypair.public.to_bytes(),
+                // Phase D — we can be the raw-UDP single-relay DIALER only if our
+                // own srflx gather succeeded (proof raw UDP to coturn works). A
+                // UDP-blocked host gathered none ⇒ it can only be the ANCHOR
+                // (TURNS/TCP allocation). The peer's equivalent is read off the
+                // netmap's `srflx_endpoints`, so the role choice is symmetric.
+                !srflx_advertised.is_empty(),
                 direct_ctx
                     .as_ref()
                     .map(|c| c.endpoints.clone())
