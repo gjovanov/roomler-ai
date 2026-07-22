@@ -219,11 +219,26 @@ impl LocalApiState for DaemonState {
         // daemon's real profile even under SystemContext, where the interactive-
         // user tray reading the dir directly would look in the WRONG profile (the
         // P2b bug fix). Same parse the tray's cmd_get_pending_consents used to do.
+        //
+        // P2b review L2: the scan is bounded. Only the daemon writes here, so
+        // dozens of pendings would already be a bug — but this fn runs on every
+        // tray/CLI poll (~750 ms cadence), and an unbounded read-parse loop over
+        // a corrupted / adversarially stuffed directory must not turn the
+        // LocalAPI thread into an I/O grinder.
+        const MAX_PENDING_SCAN: usize = 64;
         let Ok(entries) = std::fs::read_dir(self.consent.sentinel_dir()) else {
             return Vec::new(); // dir not created yet ⇒ nothing pending
         };
         let mut out = Vec::new();
         for entry in entries.flatten() {
+            if out.len() >= MAX_PENDING_SCAN {
+                tracing::warn!(
+                    cap = MAX_PENDING_SCAN,
+                    "localapi: consent_pending hit the scan cap — sentinel dir has \
+                     implausibly many pending entries, truncating the listing"
+                );
+                break;
+            }
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("pending") {
                 continue;
@@ -518,6 +533,53 @@ mod tests {
             st.ping("peer", 0, false).await,
             Response::Error { .. }
         ));
+    }
+
+    #[test]
+    fn consent_pending_scan_is_bounded() {
+        let (_tx, rx) = watch::channel(view());
+        let broker = consent_broker("cap");
+        let dir = broker.sentinel_dir().to_path_buf();
+        // Stuff the dir well past the cap with well-formed pending sentinels
+        // (only the daemon writes here in production — this simulates a
+        // corrupted / adversarially stuffed directory).
+        for i in 0..80u32 {
+            let req = tunnel_core::localapi::ConsentRequest {
+                session_id: format!("{i:024x}"),
+                controller_name: "x".into(),
+                permissions: "VIEW_SCREEN".into(),
+                timeout_secs: 30,
+            };
+            std::fs::write(
+                dir.join(format!("{i:024x}.pending")),
+                serde_json::to_string(&req).unwrap(),
+            )
+            .unwrap();
+        }
+        let st = DaemonState::new(
+            "aid".into(),
+            "host".into(),
+            DaemonMode::Service,
+            None,
+            Arc::new(AtomicBool::new(true)),
+            rx,
+            broker,
+            None,
+            crate::tunnel::client_mgr::TunnelClientHub::new("test".into()),
+            empty_rtt_cache(),
+        );
+        let pending = st.consent_pending();
+        assert!(
+            pending.len() <= 64,
+            "consent_pending scan must be capped at 64, got {}",
+            pending.len()
+        );
+        assert!(
+            pending.len() >= 60,
+            "the cap should still return a full page, got {}",
+            pending.len()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
