@@ -192,6 +192,13 @@ enum Command {
         #[command(flatten)]
         fmt: OutputFmt,
     },
+    /// Rename this device via the running daemon: the daemon persists the new
+    /// name to its OWN config (profile-correct even under a SYSTEM service —
+    /// no elevation needed) and announces it on the next server reconnect.
+    Rename {
+        /// The new device name (trimmed; max 64 characters).
+        name: String,
+    },
     /// ICMP-ping an overlay peer (by name or IP) over the userspace netstack —
     /// the OS-free reachability probe. Only meaningful when the local daemon runs
     /// in netstack mode (a locked-down host with no OS route to the mesh).
@@ -367,6 +374,7 @@ async fn main() -> Result<()> {
         Command::Status { fmt } => localclient::status(fmt.json).await,
         Command::Peers { fmt } => localclient::peers(fmt.json).await,
         Command::Flows { fmt } => localclient::flows(fmt.json).await,
+        Command::Rename { name } => localclient::rename(&name).await,
         Command::Ping {
             target,
             timeout_ms,
