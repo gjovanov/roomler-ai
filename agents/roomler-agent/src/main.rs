@@ -229,12 +229,13 @@ enum Command {
     },
     /// Approve or deny a pending operator-consent prompt for a remote-
     /// control session. Used when the agent's `auto_grant_session` is
-    /// `false` (org-controlled fleets). The agent watches a sentinel
-    /// directory under `<log_dir>/consent/` for `<session>.approve` /
-    /// `.deny` files; this subcommand creates one in the right place.
-    /// 30 s timeout from the agent's POV, after which the broker
-    /// auto-denies. Read the agent's log line to find the session id
-    /// awaiting approval.
+    /// `false` (org-controlled fleets). Prefers the running device
+    /// service over its LocalAPI (works regardless of which profile the
+    /// service runs under — incl. SYSTEM/SCM installs); falls back to a
+    /// sentinel file under `<log_dir>/consent/` in THIS profile when no
+    /// service is listening (console-run agent). 30 s timeout from the
+    /// agent's POV, after which the broker auto-denies. Read the
+    /// agent's log line to find the session id awaiting approval.
     Consent {
         /// Hex `session_id` from the agent's log line
         /// "operator consent required" — typically a 24-character
@@ -652,7 +653,7 @@ async fn main() -> Result<()> {
             session,
             approve,
             deny,
-        } => consent_cmd(&session, approve, deny),
+        } => consent_cmd(&session, approve, deny).await,
         Command::SelfUpdate { check_only } => self_update_cmd(check_only).await,
         Command::EnableSystemContext { no_restart } => enable_system_context_cmd(no_restart),
         Command::DisableSystemContext { no_restart } => disable_system_context_cmd(no_restart),
@@ -770,12 +771,53 @@ fn sweep_old_versions_cmd(dry_run: bool, flavour: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// Drop a sentinel file under the agent's consent dir so a running
-/// agent's `ConsentBroker::run_prompt` poll resolves on the next
-/// 250ms tick. Pure path-and-write — no IPC with the agent process
-/// is needed because the broker watches the directory.
-fn consent_cmd(session_hex: &str, approve: bool, deny: bool) -> Result<()> {
+/// Answer a pending operator-consent prompt.
+///
+/// P2b security-review M2: prefer the RUNNING daemon over a direct sentinel
+/// write. The daemon owns the profile-correct sentinel dir — under a
+/// SYSTEM/SCM install, a sentinel written from an interactive user's shell
+/// lands in the WRONG profile and the service never sees it (the decision
+/// was silently inert). The LocalAPI path reaches the daemon's own broker
+/// and rides its live-prompt gating (decisions are honored only while the
+/// session is actively being prompted — no pre-approval).
+///
+/// The direct filesystem write survives as an explicit FALLBACK for a
+/// console-run agent in THIS profile when no daemon is listening on the
+/// local pipe/socket.
+async fn consent_cmd(session_hex: &str, approve: bool, deny: bool) -> Result<()> {
     let kind = roomler_agent::consent::SentinelKind::from_flags(approve, deny)?;
+    let allow = matches!(kind, roomler_agent::consent::SentinelKind::Approve);
+
+    match tunnel_core::localapi::connect().await {
+        Ok(mut client) => {
+            let ok = client
+                .consent_decide(session_hex, allow)
+                .await
+                .context("asking the device service to record the decision")?;
+            if !ok {
+                anyhow::bail!(
+                    "the device service rejected the decision — no live consent prompt \
+                     for session {session_hex} (or the id is not a 24-char hex ObjectId)"
+                );
+            }
+            println!(
+                "operator consent {} for session {} (recorded by the device service)",
+                if allow { "APPROVED" } else { "DENIED" },
+                session_hex
+            );
+            return Ok(());
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "device service not reachable — falling back to a sentinel file in this \
+                 user's profile (only a console-run agent in the SAME profile will see it)"
+            );
+        }
+        Err(e) => {
+            return Err(anyhow::Error::from(e).context("connecting to the device service"));
+        }
+    }
+
     let dir = roomler_agent::consent::ConsentBroker::default_sentinel_dir()
         .context("resolving consent sentinel dir")?;
     // `Mode::AutoGrant` here is irrelevant — we're not running the
