@@ -129,10 +129,27 @@ impl ConsentBroker {
     /// Build a new broker. `sentinel_dir` is created if absent. On
     /// Unix the directory is `chmod 700` to match `config.toml`'s
     /// 0600 posture (the sentinel files leak only "yes/no" decisions,
-    /// but the convention is "agent state lives at 700").
+    /// but the convention is "agent state lives at 700"). On Windows the
+    /// dir inherits the owning profile's ACL (SYSTEM profile ⇒
+    /// SYSTEM+Administrators only); the LocalAPI pipe SDDL is the enforced
+    /// decision boundary — an explicit DACL here is future hardening
+    /// (P2b review M1).
     pub fn new(mode: Mode, sentinel_dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&sentinel_dir)
             .with_context(|| format!("creating sentinel dir {}", sentinel_dir.display()))?;
+        // P2b review L3: consent decisions are FILES in this directory —
+        // refuse to operate through a symlink, which would let whoever
+        // planted it redirect sentinel writes into (or read prompts from)
+        // a directory they control. `create_dir_all` above succeeds on a
+        // pre-existing symlink-to-dir, so check the link itself.
+        let meta = std::fs::symlink_metadata(&sentinel_dir)
+            .with_context(|| format!("inspecting sentinel dir {}", sentinel_dir.display()))?;
+        if meta.file_type().is_symlink() {
+            anyhow::bail!(
+                "consent sentinel dir {} is a symlink — refusing to use it",
+                sentinel_dir.display()
+            );
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -390,6 +407,25 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("roomler-consent-{name}-{nanos}"))
+    }
+
+    /// P2b review L3: a symlinked sentinel dir would let whoever planted the
+    /// link redirect decision files into a directory they control.
+    #[cfg(unix)]
+    #[test]
+    fn new_refuses_symlinked_sentinel_dir() {
+        let base = fixture_dir("symlink");
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let err = ConsentBroker::new(Mode::AutoGrant, link);
+        assert!(err.is_err(), "symlinked sentinel dir must be refused");
+
+        // A regular dir at the same depth keeps working.
+        assert!(ConsentBroker::new(Mode::AutoGrant, real).is_ok());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
