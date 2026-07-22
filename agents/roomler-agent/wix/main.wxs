@@ -118,32 +118,14 @@
                                 Directory='ProgramsFolder'
                                 On='uninstall' />
                         </Component>
-                        <!-- P3d Slice B: INERT compatibility alias. Ships a
-                             `roomler-agent.exe` copy (produced by the
-                             release-agent.yml `Copy-Item roomlerd.exe
-                             roomler-agent.exe` step before cargo-wix) alongside
-                             the renamed daemon so a mixed / in-flight fleet still
-                             resolves the old basename (tray spawn fallback, any
-                             field script hardcoding `roomler-agent.exe`). NO
-                             CustomAction targets this file — every FileKey stays
-                             on the primary `roomler_agent_exe`. Fresh unique GUID;
-                             HKCU RegistryValue KeyPath mirrors the sibling
-                             components so ICE38/ICE64 pass in the user-profile
-                             directory. -->
-                        <Component Id='AgentExeAlias' Guid='568CA8FA-D31E-46C6-A84E-E366EC837728'>
-                            <RegistryValue
-                                Root='HKCU'
-                                Key='Software\Roomler\Agent'
-                                Name='installed_exe_alias'
-                                Type='integer'
-                                Value='1'
-                                KeyPath='yes' />
-                            <File
-                                Id='roomler_agent_exe_alias'
-                                Name='roomler-agent.exe'
-                                DiskId='1'
-                                Source='target\release\roomler-agent.exe' />
-                        </Component>
+                        <!-- P3d Slice C (retired Slice B's alias): the inert
+                             `roomler-agent.exe` copy (`AgentExeAlias`, GUID
+                             568CA8FA…) is no longer shipped — the whole live
+                             fleet crossed rc.194 (verified against prod agents
+                             2026-07-22), and every in-tree consumer resolves
+                             `roomlerd.exe` first with a code-level fallback
+                             (tray `agent_exe_path`). MajorUpgrade removes the
+                             stale alias file from upgraded installs. -->
                         <!-- P4b: the tunnel CLI ships INSIDE the daemon MSI
                              (node-stack unification Option A — the MSI is the
                              one updater for the whole stack; daemon installs
@@ -267,8 +249,6 @@
             InstallDefault='local'
             Absent='disallow'>
             <ComponentRef Id='AgentExe' />
-            <!-- P3d Slice B: inert `roomler-agent.exe` compatibility alias. -->
-            <ComponentRef Id='AgentExeAlias' />
             <!-- P4b: tunnel CLI + user-PATH append. -->
             <ComponentRef Id='TunnelExe' />
             <ComponentRef Id='LicenseTxt' />

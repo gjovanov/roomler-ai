@@ -66,17 +66,6 @@ jobs:
           cargo build -p roomler-agent --release `
             --features "mf-encoder,scrap-capture,openh264-encoder,enigo-input,clipboard,viewer-indicator,system-context"
 
-      - name: Stage roomler-agent.exe compatibility alias (P3d Slice B)
-        shell: pwsh
-        run: |
-          # P3d Slice B renamed the daemon OUTPUT binary roomler-agent.exe ->
-          # roomlerd.exe. wix/main.wxs ships an INERT `AgentExeAlias` <File
-          # Source='target\release\roomler-agent.exe'>, so cargo-wix's harvest
-          # below needs that copy present. (This smoke's install-path assertion
-          # also verifies the alias lands as roomler-agent.exe.)
-          Copy-Item target\release\roomlerd.exe target\release\roomler-agent.exe -Force
-          Write-Host "Staged roomler-agent.exe alias next to roomlerd.exe for the WiX AgentExeAlias component"
-
       - name: Build tunnel CLI (roomler.exe) for the MSI bundle (P4b)
         shell: pwsh
         run: |
@@ -223,12 +212,14 @@ jobs:
           # %LOCALAPPDATA%\Programs\Roomler and added the tunnel CLI
           # to the bundle. Assert the EXACT canonical layout (the old
           # loose multi-candidate probe would silently pass on a
-          # regression back to the pre-rename dir): daemon + P3d alias
+          # regression back to the pre-rename dir): daemon
           # + tunnel CLI + wintun must all land. Also assert the
           # TunnelExe component's user-PATH append took (HKCU\
           # Environment — MSI writes it for Environment System='no').
+          # P3d Slice C: the roomler-agent.exe alias is retired — the MSI
+          # ships only the canonical names now.
           $installDir = Join-Path $env:LOCALAPPDATA 'Programs\Roomler'
-          $mustExist = @('roomlerd.exe', 'roomler-agent.exe', 'roomler.exe', 'wintun.dll')
+          $mustExist = @('roomlerd.exe', 'roomler.exe', 'wintun.dll')
           $missing = @()
           foreach ($f in $mustExist) {
             $p = Join-Path $installDir $f
