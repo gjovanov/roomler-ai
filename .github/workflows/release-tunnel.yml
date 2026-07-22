@@ -119,10 +119,11 @@ jobs:
           version="${{ needs.validate-version.outputs.version }}"
           name="roomler-tunnel-${version}-x86_64-unknown-linux-gnu"
           mkdir -p "/tmp/${name}"
-          # Ship BOTH the new `roomler` and a legacy `roomler-tunnel` alias so a
-          # tarball-based fetch of either name keeps working (P3d Slice B).
+          # P3d Slice C: the legacy `roomler-tunnel` in-archive alias is retired —
+          # every live consumer (rc.194+ self-update, roomler-setup's
+          # find_tunnel_binary, install.sh) resolves the new `roomler` name first.
+          # Archive NAME keeps the roomler-tunnel-… prefix (frozen contract).
           cp target/release/roomler "/tmp/${name}/"
-          cp target/release/roomler "/tmp/${name}/roomler-tunnel"
           cp LICENSE README.md "/tmp/${name}/" 2>/dev/null || true
           (cd /tmp && tar czf "${name}.tar.gz" "${name}")
           sha256sum "/tmp/${name}.tar.gz" | awk '{print $1"  "$2}' > "/tmp/${name}.tar.gz.sha256"
@@ -199,9 +200,9 @@ jobs:
           version="${{ needs.validate-version.outputs.version }}"
           name="roomler-tunnel-${version}-universal-apple-darwin"
           mkdir -p "/tmp/${name}"
-          # Ship BOTH the new `roomler` and a legacy `roomler-tunnel` alias.
+          # P3d Slice C: legacy `roomler-tunnel` in-archive alias retired
+          # (see the Linux tarball step for the rationale).
           cp target/release-universal/roomler "/tmp/${name}/"
-          cp target/release-universal/roomler "/tmp/${name}/roomler-tunnel"
           cp LICENSE README.md "/tmp/${name}/" 2>/dev/null || true
           (cd /tmp && tar czf "${name}.tar.gz" "${name}")
           shasum -a 256 "/tmp/${name}.tar.gz" | awk '{print $1"  "$2}' > "/tmp/${name}.tar.gz.sha256"
@@ -241,16 +242,6 @@ jobs:
       - name: Build roomler-tunnel (release)
         shell: pwsh
         run: cargo build -p roomler-tunnel --release
-      - name: Stage roomler-tunnel.exe compatibility alias (P3d Slice B)
-        shell: pwsh
-        run: |
-          # P3d Slice B renamed the CLI OUTPUT binary roomler-tunnel.exe ->
-          # roomler.exe. The deployed fleet's self-updater extracts
-          # `roomler-tunnel.exe` from this zip, so ship BOTH names: copy the
-          # freshly-built roomler.exe to the legacy name and let the Pack step
-          # below include both. `update.rs::extract_windows_exe` accepts either.
-          Copy-Item target\release\roomler.exe target\release\roomler-tunnel.exe -Force
-          Write-Host "Staged roomler-tunnel.exe alias next to roomler.exe"
       - name: Pack zip
         id: zip
         shell: pwsh
@@ -258,11 +249,13 @@ jobs:
           $version = "${{ needs.validate-version.outputs.version }}"
           $name = "roomler-tunnel-$version-x86_64-pc-windows-msvc"
           New-Item -ItemType Directory -Path "$env:RUNNER_TEMP\$name" -Force | Out-Null
-          # Ship BOTH the new `roomler.exe` and the legacy `roomler-tunnel.exe`
-          # (the deployed fleet's updater extracts the latter). Zip asset name
+          # P3d Slice C: legacy `roomler-tunnel.exe` in-zip alias retired — rc.194+
+          # self-updaters and the setup wizard both extract `roomler.exe` first.
+          # (A pre-rc.194 CLI waking from dormancy can still RUN; only its
+          # self-update would need a manual refresh — none live in the fleet,
+          # verified against prod tunnel_clients 2026-07-22.) Zip asset name
           # keeps the `roomler-tunnel-…zip` prefix (updater/proxy prefix-agnostic).
           Copy-Item target\release\roomler.exe "$env:RUNNER_TEMP\$name\"
-          Copy-Item target\release\roomler-tunnel.exe "$env:RUNNER_TEMP\$name\"
           if (Test-Path LICENSE) { Copy-Item LICENSE "$env:RUNNER_TEMP\$name\" }
           if (Test-Path README.md) { Copy-Item README.md "$env:RUNNER_TEMP\$name\" }
           Compress-Archive -Path "$env:RUNNER_TEMP\$name\*" -DestinationPath "$name.zip"
@@ -312,7 +305,7 @@ jobs:
             **Install / download:**
             - Linux x86_64: `.tar.gz` or `.deb`
             - macOS universal (x86_64 + aarch64): `.tar.gz`
-            - Windows x86_64: `.zip` containing `roomler-tunnel.exe`
+            - Windows x86_64: `.zip` containing `roomler.exe`
 
             **First-use:**
             1. Extract the archive.
