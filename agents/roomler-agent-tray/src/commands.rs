@@ -364,15 +364,38 @@ pub async fn cmd_re_enroll(token: String) -> Result<StatusReport, String> {
     Ok(status_report())
 }
 
-/// Update the device name on the persisted config. Effective on next
-/// WS reconnect — the agent re-sends `rc:agent.hello` with the new
-/// name. Doesn't touch the agent process itself. Targets the config the
-/// daemon actually reads. ASYNC + blocking-pool because the flavour
-/// probe + final status report both shell out to the agent CLI (the
-/// cmd_status lesson: sync commands run on the UI thread).
+/// Update the device name. Effective on next WS reconnect — the agent
+/// re-sends `rc:agent.hello` with the new name.
+///
+/// Prefers the RUNNING daemon's `SetDeviceName` LocalAPI verb: the daemon
+/// writes ITS OWN config, which is profile-correct AND needs no elevation
+/// even for a machine-global SCM install (the split-brain fix's final
+/// piece — an unelevated desktop app can't write `%PROGRAMDATA%` itself).
+/// Falls back to the direct file write when no daemon is listening or it
+/// predates the verb.
 #[tauri::command]
 pub async fn cmd_set_device_name(name: String) -> Result<StatusReport, String> {
-    tokio::task::spawn_blocking(move || set_device_name_blocking(name))
+    let trimmed = name.trim().to_string();
+    if trimmed.is_empty() {
+        return Err("Device name is empty".to_string());
+    }
+    // Daemon not running ⇒ skip to the direct write (the only path left).
+    if let Ok(mut client) = localapi::connect().await {
+        match client.set_device_name(&trimmed).await {
+            Ok(_) => {
+                return tokio::task::spawn_blocking(status_report)
+                    .await
+                    .map_err(|e| format!("task join: {e}"));
+            }
+            Err(e) => {
+                // Old daemon without the verb (or a daemon-side failure) —
+                // fall back to the direct write so a legacy install still
+                // renames; the write path reports its own honest errors.
+                tracing::warn!(%e, "daemon rename verb unavailable — using direct config write");
+            }
+        }
+    }
+    tokio::task::spawn_blocking(move || set_device_name_blocking(trimmed))
         .await
         .map_err(|e| format!("task join: {e}"))?
 }
