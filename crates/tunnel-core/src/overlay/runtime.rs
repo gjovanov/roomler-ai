@@ -179,12 +179,15 @@ struct Installed {
     /// Consecutive sweeps where we sent but received nothing (tx grew, rx
     /// flat). A few in a row ⇒ the direct carrier is one-way / dead.
     bad_sweeps: u32,
-    /// Monotonic instant the peer's rx IP-packet count last advanced — a real
-    /// "last seen from this peer" (P3b-3). Seeded to `since` at install;
-    /// advanced by `sweep_carrier_health` whenever rx climbs. Converted to an
+    /// Monotonic instant we last HEARD from this peer — a real "last seen"
+    /// (P3b-3). Seeded to `since` at install; advanced by `sweep_carrier_health`
+    /// whenever the keepalive-inclusive `rx_any` liveness counter climbed since
+    /// the previous sweep (rc.206 — NOT the IP-data `rx`, which stays flat on an
+    /// idle-but-alive link whose only inbound is keepalives). Converted to an
     /// absolute epoch-ms `last_seen_ms` in `build_overlay_view`. Sweep cadence
     /// (`FALLBACK_TICK`, ~5 s) sets the granularity — fine for a human
-    /// "Ns/Nm ago" column, and passive keepalives keep it fresh for live peers.
+    /// "Ns/Nm ago" column, and passive keepalives now keep it fresh for live
+    /// peers (which is also what the rx-staleness watchdog relies on).
     last_rx_at: Instant,
     /// rc.187 — for a RELAY carrier: our own coturn-relayed address (the worker
     /// we allocated on) and the peer's relayed address we dial. `None` for a
@@ -216,6 +219,19 @@ const DIRECT_GRACE: Duration = Duration::from_secs(8);
 /// 5 s tick that's ~15 s of one-way traffic — long enough to ignore a blip,
 /// short enough that a VPN/AP-isolation break doesn't stay dark for long.
 const BAD_SWEEPS_TO_FALLBACK: u32 = 3;
+/// rc.206 — the "silent zombie" backstop. An *established* carrier that stops
+/// RECEIVING is dead even when it also stopped SENDING: a healthy peer emits a
+/// WireGuard persistent-keepalive every ~25 s (`wg::KEEPALIVE_SECS`), so no
+/// inbound packet for this long means the underlying path died AND boringtun
+/// gave up re-handshaking (it stops emitting anything once a rekey attempt
+/// expires ~90 s). With no tx either, the `tx>last_tx && rx==last_rx` heuristic
+/// reads that as "just idle — no judgment" and never tears the carrier down —
+/// observed in the field as an 8-hour "direct" carrier stuck at 100 % loss with
+/// a frozen last-seen. This absolute rx-staleness deadline catches it regardless
+/// of tx. 90 s = ~3–4 missed keepalives: comfortably past a transient blip, well
+/// short of the multi-hour zombie. A false trip only forces a (cheap) rebuild,
+/// which re-establishes if the path actually recovered.
+const RX_STALE_DEADLINE: Duration = Duration::from_secs(90);
 /// After a direct carrier fails, don't retry direct for this peer for this
 /// long — it stays on relay, then re-attempts direct (auto-recovers when the
 /// blocking condition clears, e.g. the VPN disconnects).
@@ -1323,6 +1339,12 @@ impl OverlayRuntime {
         // Phase C (D8) — re-upgrade tick counter (see `REUPGRADE_EVERY_N_TICKS`).
         let mut reupgrade_ticks: u32 = 0;
 
+        // rc.206 — serializes the DETACHED route-guard re-assert (see the
+        // `route_guard.tick()` arm): an owned `try_lock` drops any tick whose
+        // predecessor batch is still running, so a slow Windows `netsh` sweep
+        // never stacks concurrent delete-then-add mutations on the same prefix.
+        let route_reassert_lock = Arc::new(tokio::sync::Mutex::new(()));
+
         // Phase 2 — steady state.
         loop {
             tokio::select! {
@@ -1378,12 +1400,42 @@ impl OverlayRuntime {
                 // keeps our packets off the WG device, so the carrier's traffic
                 // counters can't detect it — only a periodic re-assert can.
                 _ = route_guard.tick() => {
-                    for e in by_node.values() {
-                        tun.add_peer_route(e.overlay_ip).await.ok();
+                    // rc.206 — DETACH the per-peer /32 re-assert (the head-of-line
+                    // bulk on Windows: N peers × `route`/`netsh` delete-then-add,
+                    // ~0.3–2 s each) off the select! loop. Awaiting it INLINE
+                    // stalled the `tun.read_packet()` arm above (select! doesn't
+                    // re-poll a sibling arm while the chosen handler awaits), so
+                    // outbound packets piled unread in the wintun ring → ~1.8 s
+                    // Windows RTT (lossless, just delayed) vs Linux's ~40 ms (one
+                    // fast `ip route replace`). The owned `try_lock` drops a tick
+                    // whose predecessor is still running (a slow batch must never
+                    // stack concurrent delete-then-add on the same prefix) and
+                    // releases on task end/panic. Worst case a since-removed peer
+                    // leaves a harmless dangling /32 to a dead overlay IP (traffic
+                    // there drops anyway; `store=active` clears on reboot).
+                    if let Ok(guard) = route_reassert_lock.clone().try_lock_owned() {
+                        let tun2 = tun.clone();
+                        let ips: Vec<Ipv4Addr> =
+                            by_node.values().map(|e| e.overlay_ip).collect();
+                        tokio::spawn(async move {
+                            let _guard = guard;
+                            for ip in ips {
+                                tun2.add_peer_route(ip).await.ok();
+                            }
+                        });
                     }
-                    // P5 — re-assert the exit split-default on the same tight
-                    // cadence so a competing full-tunnel VPN default can't
-                    // reclaim egress (mirrors the per-peer /32 route war, A7).
+                    // P5 — the exit split-default /1 re-assert stays INLINE (NOT
+                    // detached): a background task with a stale `split` snapshot
+                    // could re-install a /1 that `teardown_exit_routing` (running
+                    // on THIS loop) had just purged, black-holing the host's whole
+                    // egress with no exit carrier to forward it — and the
+                    // edge-triggered teardown would never heal it (self-wedge).
+                    // Inline keeps it mutually exclusive with teardown. It's ≤4
+                    // route calls and fires only on exit-node clients
+                    // (`split_default_installed` is false everywhere else →
+                    // skipped), so it isn't the latency bulk. Mirrors the per-peer
+                    // /32 war (A7): a competing full-tunnel VPN default can't
+                    // reclaim egress.
                     if exit_state.split_default_installed {
                         for cidr in SPLIT_DEFAULT_V4.iter().chain(SPLIT_DEFAULT_V6.iter()) {
                             tun.add_cidr_route(cidr).await.ok();
@@ -1494,19 +1546,24 @@ impl OverlayRuntime {
         current_peers: &HashMap<ObjectId, NetmapPeer>,
     ) {
         let now = Instant::now();
-        // (node_id, tier, hard_dead)
-        let mut dead: Vec<(ObjectId, DirectTier, bool)> = Vec::new();
+        // (node_id, tier, hard_dead, rx_stale)
+        let mut dead: Vec<(ObjectId, DirectTier, bool, bool)> = Vec::new();
         for (nid, e) in by_node.iter_mut() {
             let Some((tx, rx)) = wg.peer_traffic(&e.pubkey) else {
                 continue;
             };
             let (last_tx, last_rx) = e.last_traffic;
             e.last_traffic = (tx, rx);
-            // P3b-3: rx advancing = a packet arrived FROM this peer → a real
-            // "last seen". Advance BEFORE the warm-up `continue` so a freshly
-            // installed peer's first inbound packets already register. Reuses
-            // the same lock-free `(tx,rx)` snapshot the health check reads.
-            if rx > last_rx {
+            // P3b-3 / rc.206 — "last heard from this peer" advances on ANY
+            // authenticated inbound packet, INCLUDING content-free WG keepalives.
+            // The IP-data `rx` counter alone froze on a mostly-idle-but-alive
+            // carrier (its only inbound is keepalives → `TunnResult::Done`, which
+            // never touches `rx`), so the rx-staleness watchdog below would have
+            // reaped a healthy idle link. `peer_take_rx_any` drains the
+            // keepalive-inclusive liveness counter (single-consumer; the sweep is
+            // the only reader). Advance BEFORE the warm-up `continue` so a freshly
+            // installed peer's first inbound already registers.
+            if wg.peer_take_rx_any(&e.pubkey) > 0 {
                 e.last_rx_at = now;
             }
             // rc.181 — a relay carrier whose underlying send hard-errored (a
@@ -1533,6 +1590,20 @@ impl OverlayRuntime {
                 DirectTier::Public | DirectTier::Srflx | DirectTier::Lan
             ) && !wg.peer_handshake_done(&e.pubkey).unwrap_or(true)
                 && e.since.elapsed() > e.tier.handshake_deadline();
+            // rc.206 — silent-zombie backstop (see RX_STALE_DEADLINE). An
+            // ESTABLISHED carrier (handshake latched — so `punch_dead`, which
+            // only fires PRE-handshake, can never catch it) whose inbound packet
+            // count has stayed frozen past the deadline is dead: a live peer's
+            // persistent-keepalives would have kept advancing `last_rx_at`. This
+            // is independent of tx, so it catches the no-tx-AND-no-rx zombie the
+            // `tx>last_tx && rx==last_rx` heuristic below misreads as benign idle
+            // (boringtun stops emitting once its rekey attempts expire → tx also
+            // flatlines → the heuristic's strike counter even resets). Covers a
+            // relay carrier too — a silently-dropped coturn allocation stops
+            // delivering with no send-error for `hard_dead` to observe.
+            let rx_stale = wg.peer_handshake_done(&e.pubkey).unwrap_or(false)
+                && e.since.elapsed() >= DIRECT_GRACE
+                && now.saturating_duration_since(e.last_rx_at) > RX_STALE_DEADLINE;
             // Warm-up grace: let the handshake + first packets flow. (A blown
             // punch deadline is > grace by construction, so it never lands in the
             // grace window; a hard-dead relay conclusively skips it.)
@@ -1564,7 +1635,7 @@ impl OverlayRuntime {
                     }
                 }
             }
-            if e.bad_sweeps >= BAD_SWEEPS_TO_FALLBACK || hard_dead || punch_dead {
+            if e.bad_sweeps >= BAD_SWEEPS_TO_FALLBACK || hard_dead || punch_dead || rx_stale {
                 // For a relay, hold off if we just refreshed it (anti-ping-pong).
                 if !e.is_direct
                     && relay_refresh_cooldown
@@ -1573,10 +1644,10 @@ impl OverlayRuntime {
                 {
                     continue;
                 }
-                dead.push((*nid, e.tier, hard_dead));
+                dead.push((*nid, e.tier, hard_dead, rx_stale));
             }
         }
-        for (nid, tier, hard_dead) in dead {
+        for (nid, tier, hard_dead, rx_stale) in dead {
             let Some(e) = by_node.remove(&nid) else {
                 continue;
             };
@@ -1609,6 +1680,18 @@ impl OverlayRuntime {
                         peer = %nid, tier = tier_name, fails = *fails,
                         "overlay: direct carrier failed repeatedly — pinning this peer to relay for the session"
                     );
+                } else if rx_stale {
+                    // rc.206 — an ESTABLISHED direct carrier that went silent
+                    // (peer roamed / NAT rebind / path died mid-session), not a
+                    // never-punched one. Distinct message so field logs separate
+                    // "died" from "never established". A re-upgrade re-punches
+                    // once the cooldown clears; the fail count usually clears on
+                    // the first receiving sweep after that, so a one-off death
+                    // doesn't march toward the sticky pin.
+                    warn!(
+                        peer = %nid, tier = tier_name,
+                        "overlay: established direct carrier went silent (no keepalive within the rx-stale deadline — peer roamed / NAT rebind / path died) — rebuilding via relay"
+                    );
                 } else {
                     warn!(
                         peer = %nid, tier = tier_name,
@@ -1621,6 +1704,14 @@ impl OverlayRuntime {
                     warn!(
                         peer = %nid,
                         "overlay: relay carrier send hard-errored (TURNS/TCP reset / QUIC-over-TURN lost) — re-allocating"
+                    );
+                } else if rx_stale {
+                    // rc.206 — a relay carrier that stopped delivering with no
+                    // send-error to trip `hard_dead` (silently-dropped coturn
+                    // allocation / a dead worker the send path can't detect).
+                    warn!(
+                        peer = %nid,
+                        "overlay: relay carrier went silent (no keepalive within the rx-stale deadline — coturn allocation dropped?) — re-allocating"
                     );
                 } else {
                     warn!(
@@ -2886,6 +2977,199 @@ mod tests {
         assert!(
             !cooldowns.public.contains_key(&nid) && !cooldowns.public_fails.contains_key(&nid),
             "CC1: the public-direct tier is NOT poisoned"
+        );
+    }
+
+    /// rc.206 — the silent-zombie backstop. An ESTABLISHED direct carrier whose
+    /// inbound packets stop (peer roamed / NAT rebind / path died mid-session)
+    /// goes tx-flat AND rx-flat once boringtun gives up re-handshaking, so the
+    /// `tx>last_tx && rx==last_rx` heuristic reads it as benign idle and
+    /// `punch_dead` can't fire (the handshake already latched). Pre-rc.206 it
+    /// lived forever — field-observed as an 8-hour "direct" carrier at 100 %
+    /// loss with a frozen last-seen. The absolute `last_rx_at` staleness deadline
+    /// tears it down and re-requests via relay.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sweep_tears_down_established_carrier_gone_silent() {
+        let kp = WgKeypair::generate();
+        let peer_kp = WgKeypair::generate();
+        let (out_tx, _out_rx) = mpsc::channel::<ClientMsg>(16);
+        let (tun_mock, _inj, _del) = MockTun::new();
+        let tf: TunFactory = {
+            let m = tun_mock.clone();
+            Box::new(move |_, _, _| Ok(m.clone() as Arc<dyn TunIo>))
+        };
+        let rt = OverlayRuntime::new_relay(kp.clone(), out_tx, tf, 1280);
+
+        let (mut wg, _tun_rx) = WgDevice::new(kp.secret.clone());
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        wg.ensure_direct_demux(sock.clone());
+        let dst: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let overlay_ip = Ipv4Addr::new(100, 64, 0, 2);
+        wg.add_direct_peer(
+            sock.clone(),
+            peer_kp.public.to_bytes(),
+            overlay_ip,
+            dst,
+            true,
+        )
+        .await;
+        // Latch the handshake so this is an ESTABLISHED carrier: `punch_dead`
+        // (which fires only PRE-handshake) can't be the reason it's reaped —
+        // isolating the rx-staleness trigger.
+        wg.test_latch_handshake_done(&peer_kp.public.to_bytes());
+        assert_eq!(
+            wg.peer_handshake_done(&peer_kp.public.to_bytes()),
+            Some(true),
+            "precondition: the carrier is established"
+        );
+        // Pin `last_traffic` to the current snapshot so the tx/rx-delta heuristic
+        // takes its else-branch (no strike accrues) — only rx-staleness can be
+        // the trigger for this teardown.
+        let snap = wg.peer_traffic(&peer_kp.public.to_bytes()).unwrap();
+
+        let nid = ObjectId::from_bytes([6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        // Installed (and last received) well past the rx-stale deadline — hence
+        // also past DIRECT_GRACE.
+        let stale = Instant::now()
+            .checked_sub(RX_STALE_DEADLINE + Duration::from_secs(5))
+            .unwrap();
+        let mut by_node = HashMap::new();
+        by_node.insert(
+            nid,
+            Installed {
+                pubkey: peer_kp.public.to_bytes(),
+                overlay_ip,
+                is_direct: true,
+                since: stale,
+                last_traffic: snap,
+                bad_sweeps: 0,
+                last_rx_at: stale,
+                relay_local: None,
+                relay_dst: None,
+                public_direct_dst: Some(dst),
+                tier: DirectTier::Srflx,
+            },
+        );
+
+        let tun: Arc<dyn TunIo> = tun_mock;
+        let mut cooldowns = DirectCooldowns::default();
+        let mut relay_refresh: HashMap<ObjectId, Instant> = HashMap::new();
+        let mut relay: Option<RelayCoordinator> = None;
+        let current_peers: HashMap<ObjectId, NetmapPeer> = HashMap::new();
+
+        rt.sweep_carrier_health(
+            &mut wg,
+            &mut by_node,
+            &mut relay,
+            &tun,
+            &mut cooldowns,
+            &mut relay_refresh,
+            &current_peers,
+        )
+        .await;
+
+        assert!(
+            !by_node.contains_key(&nid),
+            "the silent established carrier is torn down via rx-staleness"
+        );
+        assert!(
+            cooldowns.srflx.contains_key(&nid),
+            "the failure books on the carrier's own tier → relay fallback"
+        );
+    }
+
+    /// rc.206 — the rx-staleness backstop must NOT reap a HEALTHY but IDLE
+    /// carrier. A live peer's only inbound on a quiet link is WG persistent-
+    /// keepalives, which advance the keepalive-inclusive `rx_any` counter but
+    /// NOT the IP-data `rx`. This locks that the sweep refreshes a stale
+    /// `last_rx_at` from a keepalive (drained via `peer_take_rx_any`) so the
+    /// carrier survives — the false premise the reviewer caught, now a real test
+    /// (the earlier version injected a fresh `last_rx_at` keepalives never move).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sweep_keeps_established_idle_carrier_heard_via_keepalive() {
+        let kp = WgKeypair::generate();
+        let peer_kp = WgKeypair::generate();
+        let (out_tx, _out_rx) = mpsc::channel::<ClientMsg>(16);
+        let (tun_mock, _inj, _del) = MockTun::new();
+        let tf: TunFactory = {
+            let m = tun_mock.clone();
+            Box::new(move |_, _, _| Ok(m.clone() as Arc<dyn TunIo>))
+        };
+        let rt = OverlayRuntime::new_relay(kp.clone(), out_tx, tf, 1280);
+
+        let (mut wg, _tun_rx) = WgDevice::new(kp.secret.clone());
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        wg.ensure_direct_demux(sock.clone());
+        let dst: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let overlay_ip = Ipv4Addr::new(100, 64, 0, 2);
+        wg.add_direct_peer(
+            sock.clone(),
+            peer_kp.public.to_bytes(),
+            overlay_ip,
+            dst,
+            true,
+        )
+        .await;
+        wg.test_latch_handshake_done(&peer_kp.public.to_bytes());
+        // Simulate a persistent-keepalive landing THIS interval: `rx_any` bumps
+        // but the IP-data `rx` does NOT (a keepalive decapsulates to Done). The
+        // sweep must read that as "heard" and refresh an otherwise-stale
+        // `last_rx_at` — the exact case the pre-rc.206 `rx`-only signal missed.
+        wg.test_bump_rx_any(&peer_kp.public.to_bytes());
+        let snap = wg.peer_traffic(&peer_kp.public.to_bytes()).unwrap();
+
+        let nid = ObjectId::from_bytes([7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        // `last_rx_at` last advanced > 90 s ago (looks silent) — but the keepalive
+        // above proves the carrier is alive, so the sweep must NOT reap it.
+        let old = Instant::now()
+            .checked_sub(RX_STALE_DEADLINE + Duration::from_secs(5))
+            .unwrap();
+        let mut by_node = HashMap::new();
+        by_node.insert(
+            nid,
+            Installed {
+                pubkey: peer_kp.public.to_bytes(),
+                overlay_ip,
+                is_direct: true,
+                since: old,
+                last_traffic: snap,
+                bad_sweeps: 0,
+                last_rx_at: old,
+                relay_local: None,
+                relay_dst: None,
+                public_direct_dst: Some(dst),
+                tier: DirectTier::Srflx,
+            },
+        );
+
+        let tun: Arc<dyn TunIo> = tun_mock;
+        let mut cooldowns = DirectCooldowns::default();
+        let mut relay_refresh: HashMap<ObjectId, Instant> = HashMap::new();
+        let mut relay: Option<RelayCoordinator> = None;
+        let current_peers: HashMap<ObjectId, NetmapPeer> = HashMap::new();
+
+        rt.sweep_carrier_health(
+            &mut wg,
+            &mut by_node,
+            &mut relay,
+            &tun,
+            &mut cooldowns,
+            &mut relay_refresh,
+            &current_peers,
+        )
+        .await;
+
+        assert!(
+            by_node.contains_key(&nid),
+            "an idle carrier heard from via keepalive must survive the sweep"
+        );
+        assert!(
+            by_node.get(&nid).unwrap().last_rx_at > old,
+            "the sweep refreshed last_rx_at from the keepalive (rx_any), not rx"
+        );
+        assert!(
+            cooldowns.srflx.is_empty() && cooldowns.srflx_fails.is_empty(),
+            "no failure is booked for a healthy carrier"
         );
     }
 
