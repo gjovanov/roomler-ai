@@ -18,11 +18,18 @@ export interface Role {
 export const useRoleStore = defineStore('roles', () => {
   const roles = ref<Role[]>([])
   const loading = ref(false)
+  // List-level error surface (sibling-store convention); dialog-level save
+  // errors stay local to the section so the dialog can stay open.
+  const error = ref<string | null>(null)
 
   async function fetchRoles(tenantId: string) {
     loading.value = true
+    error.value = null
     try {
       roles.value = await api.get<Role[]>(`/tenant/${tenantId}/role`)
+    } catch (e) {
+      error.value = (e as Error).message
+      roles.value = []
     } finally {
       loading.value = false
     }
@@ -38,7 +45,13 @@ export const useRoleStore = defineStore('roles', () => {
     await api.put(`/tenant/${tenantId}/role/${roleId}`, payload)
     const idx = roles.value.findIndex((r) => r.id === roleId)
     if (idx !== -1) {
-      Object.assign(roles.value[idx], payload)
+      // Only mirror keys the server actually received: an `undefined` value
+      // is dropped from the JSON body (field left unchanged server-side), so
+      // copying it locally would fake a change that never happened.
+      const defined = Object.fromEntries(
+        Object.entries(payload).filter(([, v]) => v !== undefined),
+      )
+      Object.assign(roles.value[idx], defined)
     }
   }
 
@@ -63,6 +76,7 @@ export const useRoleStore = defineStore('roles', () => {
   return {
     roles,
     loading,
+    error,
     fetchRoles,
     createRole,
     updateRole,
