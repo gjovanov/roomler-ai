@@ -68,6 +68,17 @@ pub async fn flows(json: bool) -> Result<()> {
     Ok(())
 }
 
+/// `roomler rename <name>` — persist a new device name through the running
+/// daemon (it writes its OWN config, so this works unelevated even when the
+/// daemon is a SYSTEM service). Announced on the next server reconnect. An old
+/// daemon that predates the verb reports a clean error.
+pub async fn rename(name: &str) -> Result<()> {
+    let mut client = localapi::connect().await.map_err(daemon_err)?;
+    let effective = client.set_device_name(name).await.map_err(daemon_err)?;
+    println!("device renamed to \u{201c}{effective}\u{201d} — announced on the next reconnect");
+    Ok(())
+}
+
 /// `roomler ping <target> [-6] [--timeout-ms N]` — ICMP-ping an overlay peer (by
 /// name or IP) over the userspace netstack: the OS-free reachability probe for a
 /// locked-down host with no OS route to the mesh. Meaningful on a netstack node;
