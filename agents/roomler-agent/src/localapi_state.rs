@@ -52,7 +52,9 @@ pub trait NetstackPinger: Send + Sync {
 /// `watch` borrow + an atomic load.
 pub struct DaemonState {
     node_id: String,
-    name: String,
+    /// Mutable so a LocalAPI rename is reflected in `status()` immediately
+    /// (the server-side name still updates on the next reconnect's hello).
+    name: Mutex<String>,
     version: String,
     mode: DaemonMode,
     tenant_id: Option<String>,
@@ -86,6 +88,10 @@ pub struct DaemonState {
     /// `None` in unit tests / states built without one — the verbs then
     /// report empty/unsupported via the trait defaults' semantics.
     routes: Option<crate::tunnel::route_reconciler::RouteReconciler>,
+    /// The daemon's resolved config path + the daemon-wide write lock, backing
+    /// the `SetDeviceName` verb. `None` in unit tests / states built without a
+    /// persist target — the verb then reports unsupported.
+    config_persist: Option<(std::path::PathBuf, crate::config::WriteLock)>,
 }
 
 impl DaemonState {
@@ -108,7 +114,7 @@ impl DaemonState {
     ) -> Self {
         Self {
             node_id,
-            name,
+            name: Mutex::new(name),
             version: env!("CARGO_PKG_VERSION").to_string(),
             mode,
             tenant_id,
@@ -119,6 +125,7 @@ impl DaemonState {
             tunnel_hub,
             rtt_cache,
             routes: None,
+            config_persist: None,
         }
     }
 
@@ -127,6 +134,20 @@ impl DaemonState {
     /// sites (incl. tests) unchanged.
     pub fn with_routes(mut self, routes: crate::tunnel::route_reconciler::RouteReconciler) -> Self {
         self.routes = Some(routes);
+        self
+    }
+
+    /// Attach the config write path + the daemon-wide write lock so the
+    /// `SetDeviceName` verb can persist — the daemon writes ITS OWN config
+    /// (profile-correct under SYSTEM, where an unelevated desktop app's direct
+    /// file write is denied). Same load→mutate→save-under-lock discipline as
+    /// the route reconciler (P6).
+    pub fn with_config_persist(
+        mut self,
+        path: std::path::PathBuf,
+        lock: crate::config::WriteLock,
+    ) -> Self {
+        self.config_persist = Some((path, lock));
         self
     }
 
@@ -166,7 +187,7 @@ impl LocalApiState for DaemonState {
     fn status(&self) -> NodeStatus {
         NodeStatus {
             node_id: self.node_id.clone(),
-            name: self.name.clone(),
+            name: self.name.lock().map(|n| n.clone()).unwrap_or_default(),
             version: self.version.clone(),
             mode: self.mode,
             tenant_id: self.tenant_id.clone(),
@@ -341,6 +362,52 @@ impl LocalApiState for DaemonState {
         };
         match routes.add(route).await {
             Ok(route) => Response::RouteAdded { route },
+            Err(message) => Response::Error { message },
+        }
+    }
+
+    async fn set_device_name(&self, name: &str) -> Response {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Response::Error {
+                message: "device name is empty".into(),
+            };
+        }
+        if trimmed.len() > 64 {
+            return Response::Error {
+                message: "device name is too long (max 64 characters)".into(),
+            };
+        }
+        let Some((path, lock)) = self.config_persist.as_ref() else {
+            return Response::Error {
+                message: "renaming is not supported on this node".into(),
+            };
+        };
+        // Same discipline as the route reconciler: hold the daemon-wide write
+        // lock across load→mutate→save so a concurrent config writer (route
+        // add, graceful shutdown) can't have its field dropped by our
+        // full-struct save. Load FRESH — the boot-time snapshot may be stale.
+        let _guard = lock.lock().await;
+        let path = path.clone();
+        let new_name = trimmed.to_string();
+        let saved = tokio::task::spawn_blocking(move || {
+            let mut cfg = crate::config::load(&path)
+                .map_err(|e| format!("loading config for rename: {e:#}"))?;
+            cfg.machine_name = new_name.clone();
+            crate::config::save(&path, &cfg)
+                .map_err(|e| format!("saving renamed config: {e:#}"))?;
+            Ok::<String, String>(new_name)
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("rename task join: {e}")));
+        match saved {
+            Ok(name) => {
+                if let Ok(mut live) = self.name.lock() {
+                    live.clone_from(&name);
+                }
+                tracing::info!(%name, "localapi: device renamed (announced on next reconnect)");
+                Response::DeviceNameSet { name }
+            }
             Err(message) => Response::Error { message },
         }
     }
@@ -580,6 +647,68 @@ mod tests {
             pending.len()
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn set_device_name_persists_and_updates_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = crate::config::test_fixture();
+        cfg.machine_name = "old-name".into();
+        crate::config::save(&path, &cfg).unwrap();
+
+        let (_tx, rx) = watch::channel(view());
+        let st = DaemonState::new(
+            "aid".into(),
+            "old-name".into(),
+            DaemonMode::Service,
+            None,
+            Arc::new(AtomicBool::new(true)),
+            rx,
+            consent_broker("rename"),
+            None,
+            crate::tunnel::client_mgr::TunnelClientHub::new("test".into()),
+            empty_rtt_cache(),
+        )
+        .with_config_persist(path.clone(), Arc::new(tokio::sync::Mutex::new(())));
+
+        // Rejections: empty + oversized names never touch the config.
+        assert!(matches!(
+            st.set_device_name("   ").await,
+            Response::Error { .. }
+        ));
+        assert!(matches!(
+            st.set_device_name(&"x".repeat(80)).await,
+            Response::Error { .. }
+        ));
+        assert_eq!(crate::config::load(&path).unwrap().machine_name, "old-name");
+
+        // Happy path: trimmed, persisted, and live in status() immediately.
+        match st.set_device_name("  new-name  ").await {
+            Response::DeviceNameSet { name } => assert_eq!(name, "new-name"),
+            other => panic!("expected DeviceNameSet, got {other:?}"),
+        }
+        assert_eq!(st.status().name, "new-name");
+        assert_eq!(crate::config::load(&path).unwrap().machine_name, "new-name");
+
+        // Without a persist target the verb is a clean unsupported error.
+        let (_tx2, rx2) = watch::channel(view());
+        let bare = DaemonState::new(
+            "aid".into(),
+            "n".into(),
+            DaemonMode::Service,
+            None,
+            Arc::new(AtomicBool::new(true)),
+            rx2,
+            consent_broker("rename2"),
+            None,
+            crate::tunnel::client_mgr::TunnelClientHub::new("test".into()),
+            empty_rtt_cache(),
+        );
+        assert!(matches!(
+            bare.set_device_name("x").await,
+            Response::Error { .. }
+        ));
     }
 
     #[test]

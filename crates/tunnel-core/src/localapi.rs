@@ -321,6 +321,14 @@ pub enum Request {
     /// `Failed` state and re-supervises. Returns
     /// [`Response::RouteUpdated`].
     RouteSetEnabled { id: String, enabled: bool },
+    /// Rename this device: the daemon persists the new `machine_name` to ITS
+    /// OWN config file — profile-correct by construction (under a SYSTEM/SCM
+    /// install the machine-global config is writable by the daemon but NOT by
+    /// an unelevated desktop app / CLI doing a direct file write). Mutating —
+    /// the pipe/socket ACL is the trust boundary, like [`Request::RouteAdd`].
+    /// The new name is announced on the next server reconnect. Returns
+    /// [`Response::DeviceNameSet`] with the effective (trimmed) name.
+    SetDeviceName { name: String },
 }
 
 /// A LocalAPI response. Adjacently tagged so a payload may be a struct
@@ -369,6 +377,11 @@ pub enum Response {
     /// unknown.
     RouteUpdated {
         ok: bool,
+    },
+    /// The device was renamed + persisted ([`Request::SetDeviceName`]) —
+    /// carries the effective (trimmed) name.
+    DeviceNameSet {
+        name: String,
     },
     /// The verb couldn't be served (bad request, state unavailable).
     Error {
@@ -484,6 +497,14 @@ pub trait LocalApiState: Send + Sync {
             message: "declared routes are not supported on this node".into(),
         }
     }
+    /// Rename this device — persist the new name to the daemon's own config
+    /// (async — config I/O). Default: unsupported, so existing impls / mocks
+    /// and the read-only contract are undisturbed; the agent daemon overrides.
+    async fn set_device_name(&self, _name: &str) -> Response {
+        Response::Error {
+            message: "renaming is not supported on this node".into(),
+        }
+    }
 }
 
 /// Pure dispatch: map a [`Request`] to a [`Response`] over a state snapshot.
@@ -510,7 +531,8 @@ pub fn handle(req: &Request, state: &dyn LocalApiState) -> Response {
         | Request::CreateSocks5 { .. }
         | Request::RouteAdd { .. }
         | Request::RouteRemove { .. }
-        | Request::RouteSetEnabled { .. } => Response::Error {
+        | Request::RouteSetEnabled { .. }
+        | Request::SetDeviceName { .. } => Response::Error {
             message: "this verb must be served on the async path".into(),
         },
     }
@@ -563,6 +585,7 @@ where
             Ok(Request::RouteSetEnabled { id, enabled }) => {
                 state.route_set_enabled(&id, enabled).await
             }
+            Ok(Request::SetDeviceName { name }) => state.set_device_name(&name).await,
             Ok(req) => handle(&req, state),
             Err(e) => Response::Error {
                 message: format!("bad request: {e}"),
@@ -1155,6 +1178,22 @@ impl Client {
             other => Err(unexpected_response(other)),
         }
     }
+
+    /// `Request::SetDeviceName` → the effective (trimmed) name the daemon
+    /// persisted. An old daemon that predates the verb answers with a
+    /// bad-request [`Response::Error`], which surfaces here as `Err` — callers
+    /// with a legacy direct-file path can fall back on that.
+    pub async fn set_device_name(&mut self, name: &str) -> std::io::Result<String> {
+        match self
+            .request(&Request::SetDeviceName {
+                name: name.to_string(),
+            })
+            .await?
+        {
+            Response::DeviceNameSet { name } => Ok(name),
+            other => Err(unexpected_response(other)),
+        }
+    }
 }
 
 /// Map an error / mismatched response to an `io::Error` for the typed helpers.
@@ -1420,6 +1459,31 @@ mod tests {
             serde_json::from_str::<Request>(r#"{"t":"peers"}"#).unwrap(),
             Request::Peers
         );
+    }
+
+    #[tokio::test]
+    async fn set_device_name_wire_shape_and_default_unsupported() {
+        // Wire lock: adjacently tagged, snake_case.
+        assert_eq!(
+            serde_json::to_string(&Request::SetDeviceName { name: "neo".into() }).unwrap(),
+            r#"{"t":"set_device_name","d":{"name":"neo"}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Response::DeviceNameSet { name: "neo".into() }).unwrap(),
+            r#"{"t":"device_name_set","d":{"name":"neo"}}"#
+        );
+        // Trait default: unsupported — a node without a config writer (mocks,
+        // non-daemon impls) answers with a clean Error, and the sync `handle`
+        // path refuses it (async-only verb).
+        let s = Mock;
+        assert!(matches!(
+            s.set_device_name("neo").await,
+            Response::Error { .. }
+        ));
+        assert!(matches!(
+            handle(&Request::SetDeviceName { name: "neo".into() }, &s),
+            Response::Error { .. }
+        ));
     }
 
     #[tokio::test]
