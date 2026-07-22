@@ -1638,7 +1638,10 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
                 tunnel_hub.clone(),
                 rtt_cache.clone(),
             )
-            .with_routes(route_reconciler),
+            .with_routes(route_reconciler)
+            // The rename verb persists through the daemon's own resolved
+            // config path + the P6 write lock (profile-correct under SYSTEM).
+            .with_config_persist(config_path.clone(), cfg_write_lock.clone()),
         );
     // P3b-3: the RTT prober — spawned only on a netstack node (pinger = Some).
     // Pings each carrier-reachable peer every RTT_PROBE_INTERVAL into rtt_cache;
