@@ -555,19 +555,6 @@ jobs:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
         run: cargo build -p roomler-agent --release --features "full-hw,vp9-444,system-context,ffmpeg-encoder,overlay-l3,overlay-netstack"
 
-      - name: Stage roomler-agent.exe compatibility alias (P3d Slice B)
-        shell: pwsh
-        run: |
-          # P3d Slice B renamed the daemon OUTPUT binary roomler-agent.exe ->
-          # roomlerd.exe. Both wix/ + wix-perMachine/ ship an INERT
-          # `AgentExeAlias` <File Source='target\release\roomler-agent.exe'>
-          # so a mixed / in-flight fleet still resolves the old basename (tray
-          # spawn fallback, field scripts). cargo-wix reads that Source at
-          # harvest time, so the alias copy MUST exist before the two MSI
-          # builds below. Copy the freshly-built daemon to the legacy name.
-          Copy-Item target\release\roomlerd.exe target\release\roomler-agent.exe -Force
-          Write-Host "Staged roomler-agent.exe alias next to roomlerd.exe for the WiX AgentExeAlias component"
-
       - name: Build tunnel CLI (roomler.exe) for the MSI bundle (P4b)
         shell: pwsh
         run: |
