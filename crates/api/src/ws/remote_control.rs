@@ -233,6 +233,13 @@ pub async fn handle_agent_socket(
         tunnel_orig_sessions,
     )
     .await;
+    // P7 flap resilience: also terminate every tunnel session TARGETING this
+    // agent — its per-connection tunnel peers died with this socket, so a
+    // reconnected agent instance rejects every forward on them forever.
+    // Terminating pushes the clients to re-open with fresh state. (A session
+    // opened against a REPLACING connection during the handoff window may be
+    // killed too; its flow supervisor re-opens it within seconds.)
+    crate::ws::tunnel::terminate_sessions_targeting_agent(&state, agent_id).await;
 
     // If this agent was an overlay node, mark it offline + drop it from
     // peers' netmaps (best-effort; it re-syncs on its next join).
