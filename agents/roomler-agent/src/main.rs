@@ -2128,6 +2128,26 @@ async fn self_update_cmd(check_only: bool) -> Result<()> {
 /// any failure so a failed smoke check fails the release build.
 async fn encoder_smoke_cmd(pref_raw: &str, codec_raw: &str) -> Result<()> {
     use roomler_agent::encode::{open_default, open_for_codec};
+
+    // The CI release lane runs `encoder-smoke` on the freshly built EXE, so
+    // assert the FFmpeg link contract here instead of paying a separate
+    // `cargo test --release --features ...` compile in the workflow (rc.208
+    // measured that step at 5m33s per tag: dev-dep tokio-test enables
+    // tokio/test-util, dragging the whole tokio subgraph into a test-graph
+    // rebuild). Keep the >= 61 floor in LOCKSTEP with the
+    // `libavcodec_version_is_ffmpeg_7_or_newer` unit test in encode::ffmpeg.
+    #[cfg(feature = "ffmpeg-encoder")]
+    {
+        let v = roomler_agent::encode::ffmpeg::linked_libavcodec_version();
+        let major = (v >> 16) & 0xFF;
+        let raw = format!("0x{v:06X}");
+        tracing::info!(libavcodec_major = major, raw = %raw, "encoder smoke: FFmpeg link check");
+        anyhow::ensure!(
+            major >= 61,
+            "linked libavcodec {major} too old; need FFmpeg 7+ (libavcodec 61+) for hevc_qsv + vp9_qsv (raw {raw})"
+        );
+    }
+
     let pref = encode::EncoderPreference::from_str(pref_raw)
         .map_err(|e| anyhow::anyhow!("bad encoder preference {pref_raw:?}: {e}"))?;
     let w = 640u32;
