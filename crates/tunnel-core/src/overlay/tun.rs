@@ -265,6 +265,36 @@ mod system {
         _wfp: Option<crate::overlay::wfp::WfpGuard>,
     }
 
+    /// rc.209 — bounded retry-with-backoff around a fallible create. Returns the
+    /// first `Ok`; otherwise the LAST `Err` after `attempts` tries. Sleeps
+    /// `backoff` between attempts (never after the final one), and calls
+    /// `on_retry(attempt, &err)` before each backoff (for logging). Extracted so
+    /// the Wintun-adapter retry policy — the fix for the transient
+    /// device-install-mutex "Access is denied" on a rapid restart — is
+    /// unit-tested without a real device. `attempts` is clamped to ≥1.
+    fn retry_create<T, E>(
+        attempts: usize,
+        backoff: std::time::Duration,
+        mut f: impl FnMut() -> Result<T, E>,
+        mut on_retry: impl FnMut(usize, &E),
+    ) -> Result<T, E> {
+        let attempts = attempts.max(1);
+        let mut last_err = None;
+        for attempt in 1..=attempts {
+            match f() {
+                Ok(t) => return Ok(t),
+                Err(e) => {
+                    if attempt < attempts {
+                        on_retry(attempt, &e);
+                        std::thread::sleep(backoff);
+                    }
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.expect("attempts >= 1 ⇒ f ran at least once"))
+    }
+
     impl SystemTun {
         /// Create the device, assign `self_ip` with `netmask`, set `mtu`,
         /// and bring it up. `netmask` is the overlay *network* mask (e.g.
@@ -294,8 +324,34 @@ mod system {
             #[cfg(target_os = "linux")]
             config.tun_name("roomler0");
 
-            let dev =
-                tun::create_as_async(&config).map_err(|e| std::io::Error::other(e.to_string()))?;
+            // rc.209 — Wintun's `WintunCreateAdapter` can transiently fail with
+            // "device installation mutex: Access is denied" when a PRIOR adapter
+            // (from a rapid service restart / MSI upgrade) hasn't fully released
+            // its device-install lock yet — the overlay then aborts and the node
+            // won't join the mesh until the next reconnect. The old adapter
+            // releases within ~a second, so retry a few times with a short
+            // backoff (Windows only; the create is reliable elsewhere → one
+            // attempt). No added latency on the normal path (first attempt wins);
+            // the backoff sleeps ONLY on the transient-failure path, which is
+            // exactly when waiting is correct. Blocking sleep is fine here — this
+            // is the one-time TUN bring-up, same as the metric-pin `netsh` below.
+            #[cfg(target_os = "windows")]
+            const CREATE_ATTEMPTS: usize = 5;
+            #[cfg(not(target_os = "windows"))]
+            const CREATE_ATTEMPTS: usize = 1;
+            let dev = retry_create(
+                CREATE_ATTEMPTS,
+                std::time::Duration::from_millis(400),
+                || tun::create_as_async(&config).map_err(|e| std::io::Error::other(e.to_string())),
+                |attempt, e| {
+                    tracing::warn!(
+                        attempt,
+                        error = %e,
+                        "overlay: TUN adapter create failed; retrying after backoff \
+                         (a prior adapter may not have released after a rapid restart)"
+                    );
+                },
+            )?;
             let dev = Arc::new(dev);
 
             // Pin the overlay NIC to the lowest interface metric so its routes
@@ -1176,6 +1232,81 @@ mod system {
 
     #[cfg(test)]
     mod tests {
+        use std::cell::Cell;
+        use std::time::Duration;
+
+        /// rc.209 — the Wintun create-retry policy: succeed as soon as a try
+        /// returns `Ok`, without running further attempts or sleeping.
+        #[test]
+        fn retry_create_succeeds_after_transient_failures() {
+            let calls = Cell::new(0);
+            let retries = Cell::new(0);
+            // Fails twice (mutex not released yet), succeeds on the 3rd try.
+            let r: Result<&str, &str> = super::retry_create(
+                5,
+                Duration::ZERO,
+                || {
+                    let n = calls.get() + 1;
+                    calls.set(n);
+                    if n < 3 {
+                        Err("device installation mutex: Access is denied")
+                    } else {
+                        Ok("adapter")
+                    }
+                },
+                |_a, _e| retries.set(retries.get() + 1),
+            );
+            assert_eq!(r, Ok("adapter"));
+            assert_eq!(calls.get(), 3, "stopped the instant a try succeeded");
+            assert_eq!(
+                retries.get(),
+                2,
+                "logged a retry before each of the 2 backoffs"
+            );
+        }
+
+        /// rc.209 — exhausting every attempt returns the LAST error (so the
+        /// caller still surfaces a real failure after a genuinely-broken create).
+        #[test]
+        fn retry_create_exhausts_and_returns_last_error() {
+            let calls = Cell::new(0);
+            let retries = Cell::new(0);
+            let r: Result<&str, String> = super::retry_create(
+                4,
+                Duration::ZERO,
+                || {
+                    let n = calls.get() + 1;
+                    calls.set(n);
+                    Err(format!("attempt {n} failed"))
+                },
+                |_a, _e| retries.set(retries.get() + 1),
+            );
+            assert_eq!(r, Err("attempt 4 failed".to_string()));
+            assert_eq!(calls.get(), 4, "ran every attempt");
+            assert_eq!(
+                retries.get(),
+                3,
+                "backed off between attempts, not after the last"
+            );
+        }
+
+        /// `attempts` is clamped to ≥1 — a 0 still runs the closure once.
+        #[test]
+        fn retry_create_runs_at_least_once() {
+            let calls = Cell::new(0);
+            let r: Result<u8, ()> = super::retry_create(
+                0,
+                Duration::ZERO,
+                || {
+                    calls.set(calls.get() + 1);
+                    Ok(7)
+                },
+                |_a, _e| {},
+            );
+            assert_eq!(r, Ok(7));
+            assert_eq!(calls.get(), 1);
+        }
+
         #[test]
         fn v6_cidr_detection_picks_route_family() {
             use super::is_v6_cidr;
