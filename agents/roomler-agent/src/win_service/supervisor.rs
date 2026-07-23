@@ -27,8 +27,8 @@
 
 #![cfg(target_os = "windows")]
 
-use anyhow::{Context, Result, bail};
-use std::ffi::OsStr;
+use anyhow::{Context, Result, anyhow, bail};
+use std::ffi::{OsStr, c_void};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -37,6 +37,11 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_NO_TOKEN, FALSE, GetLastError, HANDLE, INVALID_HANDLE_VALUE, STILL_ACTIVE,
     WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
+use windows_sys::Win32::Security::{
+    DuplicateTokenEx, GetTokenInformation, SecurityImpersonation, TOKEN_ALL_ACCESS,
+    TOKEN_ELEVATION_TYPE, TOKEN_LINKED_TOKEN, TokenElevationType, TokenElevationTypeLimited,
+    TokenLinkedToken, TokenPrimary,
 };
 use windows_sys::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
 use windows_sys::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
@@ -261,6 +266,178 @@ pub unsafe fn spawn_in_session(token: HANDLE, exe: &Path, args: &[&str]) -> Resu
         thread: OwnedHandle(pi.hThread),
         pid: pi.dwProcessId,
     })
+}
+
+/// Parse the `ROOMLER_AGENT_ELEVATE_WORKER` value. **Default ON**
+/// (field-proven on an interactive-admin box, 2026-07-23): the
+/// user-context worker is spawned with the interactive admin's ELEVATED
+/// linked token so the overlay's Wintun adapter (a privileged device
+/// install) can be created. Only an explicit disable value — `0` /
+/// `false` / `no` / `off` (case-insensitive) — is the kill-switch;
+/// unset / truthy / empty / anything unrecognised keeps the default ON.
+///
+/// "Default ON" is safe fleet-wide because the elevation is a no-op for
+/// anyone who can't use it: [`elevated_primary_token`] only elevates a
+/// `TokenElevationTypeLimited` (a UAC-split administrator) and returns
+/// `None` for standard users / already-`Full` tokens → the caller spawns
+/// with the original token, exactly as before. So flipping the default
+/// changes behaviour ONLY on an interactive split-token-admin box whose
+/// worker isn't already SYSTEM (i.e. not running SystemContext) — exactly
+/// the hosts that need it — and there it also closes the UIPI gap
+/// (high-IL input can reach elevated foreground apps). The kill-switch
+/// reverts any box to the pre-existing filtered-token behaviour without
+/// a rebuild. Pure over its input so it's unit-testable.
+fn parse_elevate_flag(val: Option<&str>) -> bool {
+    match val {
+        Some(v) => {
+            let t = v.trim();
+            // Explicit kill-switch only; everything else (truthy, empty,
+            // or an unrecognised value) keeps the default ON.
+            !(t.eq_ignore_ascii_case("0")
+                || t.eq_ignore_ascii_case("false")
+                || t.eq_ignore_ascii_case("no")
+                || t.eq_ignore_ascii_case("off"))
+        }
+        None => true,
+    }
+}
+
+/// Should the supervisor spawn the user-context worker with the
+/// interactive admin's ELEVATED linked token?
+///
+/// **Why this exists:** the overlay's L3 TUN is a Wintun adapter, and
+/// `WintunCreateAdapter` is a privileged device install. The default
+/// user-context worker runs with the interactive user's UAC-**filtered**
+/// (medium-IL) token — even for an administrator — so on a workstation
+/// with someone logged in, overlay bring-up fails with
+/// `WintunCreateAdapter … "device installation mutex: Access is denied"`
+/// and the node never joins the mesh. (Headless / lock-screen hosts are
+/// unaffected: their worker already runs as SYSTEM.) The heavyweight
+/// SystemContext SYSTEM-swap works around it, but it runs the worker
+/// under the LocalSystem profile — wrong `%APPDATA%`/`%USERPROFILE%` for
+/// every user-profile lookup. Spawning with the user's *linked elevated*
+/// token instead keeps the worker as the **same user** (correct profile)
+/// while granting the integrity level Wintun needs — and, as a bonus,
+/// lets input injection reach elevated foreground apps (the UIPI gap).
+///
+/// **Default ON** (field-proven 2026-07-23); disable per-host with
+/// `ROOMLER_AGENT_ELEVATE_WORKER=0`. The elevation is inert unless the
+/// interactive user is a UAC-split administrator, so the default only
+/// engages on the hosts that need it — see [`parse_elevate_flag`].
+fn worker_elevation_requested() -> bool {
+    use tunnel_core::env::node_env;
+    parse_elevate_flag(node_env("ELEVATE_WORKER").as_deref())
+}
+
+/// `GetTokenInformation(TokenElevationType)` → one of
+/// `TokenElevationType{Default,Full,Limited}`. `Default` = UAC off or a
+/// standard user (no split token); `Full` = already elevated (built-in
+/// Administrator, UAC off + admin, or an already-high-IL caller);
+/// `Limited` = a UAC-split administrator running with the filtered token
+/// (the only case with a distinct elevated linked token to fetch).
+///
+/// # Safety
+/// `token` must be a valid, live Win32 token handle with `TOKEN_QUERY`
+/// access (the WTSQueryUserToken result qualifies).
+unsafe fn token_elevation_type(token: HANDLE) -> Result<TOKEN_ELEVATION_TYPE> {
+    let mut ty: TOKEN_ELEVATION_TYPE = 0;
+    let mut ret_len: u32 = 0;
+    // SAFETY: `&mut ty` is a valid out-buffer of exactly the declared
+    // size; `&mut ret_len` receives the bytes written. Caller guarantees
+    // `token` is a live queryable handle.
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevationType,
+            &mut ty as *mut TOKEN_ELEVATION_TYPE as *mut c_void,
+            std::mem::size_of::<TOKEN_ELEVATION_TYPE>() as u32,
+            &mut ret_len,
+        )
+    };
+    if ok == 0 {
+        // SAFETY: GetLastError is a thread-local read.
+        let err = unsafe { GetLastError() };
+        bail!("GetTokenInformation(TokenElevationType) failed: win32 error {err}");
+    }
+    Ok(ty)
+}
+
+/// Resolve the interactive user's ELEVATED primary token, when there is
+/// one to resolve. Returns:
+/// * `Ok(Some(primary))` — the caller is a UAC-split administrator; the
+///   returned owned handle is a **primary** token duplicated from the
+///   full linked token, ready for `CreateProcessAsUserW`.
+/// * `Ok(None)` — nothing to elevate to (standard user, or the token is
+///   already `Full`). The caller spawns with the original token
+///   unchanged; no regression.
+///
+/// The linked token belongs to the SAME logon (hence the same Terminal
+/// Services session) as `user_token`, so — unlike the winlogon SYSTEM
+/// path — no `SetTokenInformation(TokenSessionId)` re-bind is needed.
+///
+/// # Safety
+/// `user_token` must be a valid, live Win32 user token (typically the
+/// `WTSQueryUserToken` result). Handles obtained here are wrapped in
+/// [`OwnedHandle`] so every path closes them.
+unsafe fn elevated_primary_token(user_token: HANDLE) -> Result<Option<OwnedHandle>> {
+    // SAFETY: forwarded contract on `user_token`.
+    let etype = unsafe { token_elevation_type(user_token) }?;
+    if etype != TokenElevationTypeLimited {
+        // Standard user (Default) → nothing to elevate to. Already Full →
+        // the caller's token can create Wintun as-is. Either way, spawn
+        // with the original token.
+        return Ok(None);
+    }
+
+    // Fetch the FULL (elevated) linked token of this split-token admin.
+    let mut linked = TOKEN_LINKED_TOKEN {
+        LinkedToken: std::ptr::null_mut(),
+    };
+    let mut ret_len: u32 = 0;
+    // SAFETY: `&mut linked` is a valid out-buffer of the declared size;
+    // the API writes an owned HANDLE into `linked.LinkedToken`.
+    let ok = unsafe {
+        GetTokenInformation(
+            user_token,
+            TokenLinkedToken,
+            &mut linked as *mut TOKEN_LINKED_TOKEN as *mut c_void,
+            std::mem::size_of::<TOKEN_LINKED_TOKEN>() as u32,
+            &mut ret_len,
+        )
+    };
+    if ok == 0 {
+        // SAFETY: GetLastError is a thread-local read.
+        let err = unsafe { GetLastError() };
+        bail!("GetTokenInformation(TokenLinkedToken) failed: win32 error {err}");
+    }
+    // Own the linked handle so it's closed even if the dup below fails.
+    let linked_owned = OwnedHandle::new(linked.LinkedToken)
+        .ok_or_else(|| anyhow!("TokenLinkedToken returned a null/invalid handle"))?;
+
+    // The linked token is an impersonation token; CreateProcessAsUserW
+    // needs a PRIMARY token — duplicate it. (Mirrors the winlogon path's
+    // DuplicateTokenEx(TokenPrimary).)
+    let mut dup: HANDLE = std::ptr::null_mut();
+    // SAFETY: `linked_owned.raw()` is a valid token; null attributes are
+    // documented-OK; the out-handle is checked + wrapped below.
+    let ok = unsafe {
+        DuplicateTokenEx(
+            linked_owned.raw(),
+            TOKEN_ALL_ACCESS,
+            std::ptr::null(),
+            SecurityImpersonation,
+            TokenPrimary,
+            &mut dup as *mut HANDLE,
+        )
+    };
+    if ok == 0 {
+        // SAFETY: GetLastError is a thread-local read.
+        let err = unsafe { GetLastError() };
+        bail!("DuplicateTokenEx(linked elevated token) failed: win32 error {err}");
+    }
+    let primary =
+        OwnedHandle::new(dup).ok_or_else(|| anyhow!("DuplicateTokenEx returned a null handle"))?;
+    Ok(Some(primary))
 }
 
 /// Owned process + thread handles from a successful CreateProcess.
@@ -953,16 +1130,50 @@ pub fn run(
             (SpawnDecision::SpawnIn(sid), true) if current.is_none() => {
                 match query_user_token(sid) {
                     Ok(Some(token)) => {
-                        // SAFETY: `token` is a fresh, owned Win32 user
-                        // token from WTSQueryUserToken; valid until the
-                        // OwnedHandle drops at end of this scope. The
-                        // CreateProcessAsUserW call inside duplicates
-                        // any handles it needs.
-                        match unsafe { spawn_in_session(token.raw(), &worker_exe, &args_borrow) } {
+                        // rc.206 — spawn with the interactive admin's
+                        // ELEVATED linked token so the overlay's Wintun
+                        // adapter (a privileged device install) succeeds
+                        // without the heavier SystemContext SYSTEM-swap.
+                        // Default-on; kill-switch ROOMLER_AGENT_ELEVATE_
+                        // WORKER=0. Falls back to the filtered `token` for
+                        // standard users / already-elevated / any failure
+                        // (no regression). `elevated` (when Some) owns the
+                        // duplicated primary token and MUST outlive the
+                        // spawn call below — hence the outer binding.
+                        let elevated = if worker_elevation_requested() {
+                            // SAFETY: `token.raw()` is a live user token
+                            // from WTSQueryUserToken, valid for this scope.
+                            match unsafe { elevated_primary_token(token.raw()) } {
+                                Ok(t) => t,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = %e,
+                                        session_id = sid,
+                                        "supervisor: elevated-token resolution failed; \
+                                         spawning with the standard user token"
+                                    );
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        // Prefer the elevated token when we resolved one.
+                        let (spawn_handle, is_elevated) = match &elevated {
+                            Some(t) => (t.raw(), true),
+                            None => (token.raw(), false),
+                        };
+                        // SAFETY: `spawn_handle` is a live primary/user
+                        // token — either the WTSQueryUserToken result or
+                        // its duplicated elevated linked token; both
+                        // OwnedHandles outlive this call. CreateProcessAsUserW
+                        // duplicates any handles it needs.
+                        match unsafe { spawn_in_session(spawn_handle, &worker_exe, &args_borrow) } {
                             Ok(p) => {
                                 tracing::info!(
                                     pid = p.pid,
                                     session_id = sid,
+                                    elevated = is_elevated,
                                     "supervisor: spawned worker"
                                 );
                                 current = Some(ActiveWorker {
@@ -1175,6 +1386,34 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn elevate_flag_defaults_on_with_explicit_kill_switch() {
+        // Default ON: unset, truthy, empty, or any unrecognised value all
+        // keep elevation enabled (the elevation itself is still inert for
+        // non-split-token users — see elevated_primary_token).
+        for v in [
+            None,
+            Some("1"),
+            Some("true"),
+            Some("on"),
+            Some("Yes"),
+            Some(""),
+            Some("  "),
+            Some("2"),
+            Some("enabled"),
+        ] {
+            assert!(parse_elevate_flag(v), "{v:?} should keep elevation ON");
+        }
+        // Only an explicit disable value (case-insensitive, whitespace-
+        // tolerant) is the kill-switch → OFF.
+        for v in ["0", "false", "FALSE", "No", "off", " off ", "\tfalse\n"] {
+            assert!(
+                !parse_elevate_flag(Some(v)),
+                "{v:?} must disable elevation (kill-switch)"
+            );
+        }
+    }
 
     #[test]
     fn decide_spawn_idles_when_no_active_session_and_no_stream() {
