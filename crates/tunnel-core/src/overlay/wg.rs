@@ -562,9 +562,22 @@ impl WgDevice {
             let mut tick = tokio::time::interval(Duration::from_millis(TIMER_TICK_MS));
             loop {
                 tick.tick().await;
-                let mut t = timer_tunn.lock().await;
-                if let TunnResult::WriteToNetwork(b) = t.update_timers(&mut buf) {
-                    let _ = timer_carrier.send(b).await;
+                // rc.211 — capture the handshake/keepalive bytes UNDER the
+                // lock, then RELEASE it before the carrier send. Holding the
+                // per-peer Tunn lock across `carrier.send().await` (a slow
+                // relay/QUIC send under churn) stalls every other task that
+                // needs the same Tunn — including the SHARED direct recv loop,
+                // which then stops reading the socket and the OS drops inbound
+                // UDP for ALL direct peers.
+                let out = {
+                    let mut t = timer_tunn.lock().await;
+                    match t.update_timers(&mut buf) {
+                        TunnResult::WriteToNetwork(b) => Some(b.to_vec()),
+                        _ => None,
+                    }
+                };
+                if let Some(b) = out {
+                    let _ = timer_carrier.send(&b).await;
                 }
             }
         });
@@ -585,11 +598,16 @@ impl WgDevice {
         if initiate {
             tokio::spawn(async move {
                 let mut buf = vec![0u8; WG_BUF];
-                let mut t = tunn.lock().await;
-                if let TunnResult::WriteToNetwork(b) =
-                    t.format_handshake_initiation(&mut buf, false)
-                {
-                    let _ = carrier.send(b).await;
+                // rc.211 — same lock-then-send split as the timer tasks.
+                let out = {
+                    let mut t = tunn.lock().await;
+                    match t.format_handshake_initiation(&mut buf, false) {
+                        TunnResult::WriteToNetwork(b) => Some(b.to_vec()),
+                        _ => None,
+                    }
+                };
+                if let Some(b) = out {
+                    let _ = carrier.send(&b).await;
                 }
             });
         }
@@ -646,7 +664,7 @@ impl WgDevice {
         let Some((tunn, stats)) = entry else {
             return;
         };
-        let reply = Carrier::Direct { sock, dst: src };
+        let reply = Arc::new(Carrier::Direct { sock, dst: src });
         let mut buf = packet.to_vec();
         let n = buf.len();
         let mut t = tunn.lock().await;
@@ -725,9 +743,22 @@ impl WgDevice {
             let mut tick = tokio::time::interval(Duration::from_millis(TIMER_TICK_MS));
             loop {
                 tick.tick().await;
-                let mut t = timer_tunn.lock().await;
-                if let TunnResult::WriteToNetwork(b) = t.update_timers(&mut buf) {
-                    let _ = timer_carrier.send(b).await;
+                // rc.211 — capture the handshake/keepalive bytes UNDER the
+                // lock, then RELEASE it before the carrier send. Holding the
+                // per-peer Tunn lock across `carrier.send().await` (a slow
+                // relay/QUIC send under churn) stalls every other task that
+                // needs the same Tunn — including the SHARED direct recv loop,
+                // which then stops reading the socket and the OS drops inbound
+                // UDP for ALL direct peers.
+                let out = {
+                    let mut t = timer_tunn.lock().await;
+                    match t.update_timers(&mut buf) {
+                        TunnResult::WriteToNetwork(b) => Some(b.to_vec()),
+                        _ => None,
+                    }
+                };
+                if let Some(b) = out {
+                    let _ = timer_carrier.send(&b).await;
                 }
             }
         });
@@ -737,11 +768,16 @@ impl WgDevice {
             let ic = carrier.clone();
             tokio::spawn(async move {
                 let mut buf = vec![0u8; WG_BUF];
-                let mut t = it.lock().await;
-                if let TunnResult::WriteToNetwork(b) =
-                    t.format_handshake_initiation(&mut buf, false)
-                {
-                    let _ = ic.send(b).await;
+                // rc.211 — same lock-then-send split as the timer tasks.
+                let out = {
+                    let mut t = it.lock().await;
+                    match t.format_handshake_initiation(&mut buf, false) {
+                        TunnResult::WriteToNetwork(b) => Some(b.to_vec()),
+                        _ => None,
+                    }
+                };
+                if let Some(b) = out {
+                    let _ = ic.send(&b).await;
                 }
             });
         }
@@ -928,21 +964,29 @@ impl WgDevice {
             return false;
         };
         let mut buf = vec![0u8; WG_BUF];
-        let mut t = peer.tunn.lock().await;
-        match t.encapsulate(packet, &mut buf) {
-            TunnResult::WriteToNetwork(b) => {
-                let ok = peer.carrier.send(b).await.is_ok();
+        // rc.211 — encapsulate UNDER the lock, send AFTER releasing it (see the
+        // timer tasks): never hold the Tunn lock across a carrier send.
+        let out = {
+            let mut t = peer.tunn.lock().await;
+            match t.encapsulate(packet, &mut buf) {
+                TunnResult::WriteToNetwork(b) => Some(b.to_vec()),
+                TunnResult::Done => None,
+                TunnResult::Err(e) => {
+                    warn!(?e, "wg encapsulate error");
+                    None
+                }
+                _ => None,
+            }
+        };
+        match out {
+            Some(b) => {
+                let ok = peer.carrier.send(&b).await.is_ok();
                 if ok {
                     peer.stats.tx.fetch_add(1, Ordering::Relaxed);
                 }
                 ok
             }
-            TunnResult::Done => false,
-            TunnResult::Err(e) => {
-                warn!(?e, "wg encapsulate error");
-                false
-            }
-            _ => false,
+            None => false,
         }
     }
 
@@ -1040,7 +1084,7 @@ async fn process_inbound(
     t: &mut Tunn,
     n: usize,
     buf: &mut [u8],
-    carrier: &Carrier,
+    carrier: &Arc<Carrier>,
     tun_tx: &mpsc::Sender<Vec<u8>>,
     stats: &PeerStats,
 ) {
@@ -1061,19 +1105,29 @@ async fn process_inbound(
     }
     match res {
         TunnResult::WriteToNetwork(b) => {
-            let _ = carrier.send(b).await;
-            // A handshake step can complete a session with queued data;
-            // boringtun signals more to flush by returning WriteToNetwork
-            // on empty-datagram decapsulate calls. Drain until Done.
+            // rc.211 — collect the handshake response + any flushed follow-ups
+            // (each needs `t` to decapsulate; a handshake step can complete a
+            // session with queued data, which boringtun signals by returning
+            // WriteToNetwork on empty-datagram decapsulate calls — drain until
+            // Done), then SEND them OFF this call path. Sending inline held the
+            // caller (the SHARED direct recv loop, or a per-peer recv task) and
+            // this peer's Tunn lock across a possibly-slow carrier send, so the
+            // recv loop stopped reading the socket and the OS dropped inbound
+            // UDP for every direct peer.
+            let mut outs: Vec<Vec<u8>> = vec![b.to_vec()];
             loop {
                 let mut flush = vec![0u8; WG_BUF];
                 match t.decapsulate(None, &[], &mut flush) {
-                    TunnResult::WriteToNetwork(b2) => {
-                        let _ = carrier.send(b2).await;
-                    }
+                    TunnResult::WriteToNetwork(b2) => outs.push(b2.to_vec()),
                     _ => break,
                 }
             }
+            let c = carrier.clone();
+            tokio::spawn(async move {
+                for b in outs {
+                    let _ = c.send(&b).await;
+                }
+            });
         }
         TunnResult::WriteToTunnelV4(pkt, _) => {
             stats.rx.fetch_add(1, Ordering::Relaxed);
@@ -1185,10 +1239,10 @@ async fn run_direct_demux(
             }
             continue;
         };
-        let reply = Carrier::Direct {
+        let reply = Arc::new(Carrier::Direct {
             sock: sock.clone(),
             dst: src,
-        };
+        });
         let mut t = tunn.lock().await;
         process_inbound(&mut t, n, &mut buf, &reply, &tun_tx, &stats).await;
     }
