@@ -166,6 +166,36 @@ pub fn public_direct_enabled() -> bool {
     }
 }
 
+/// rc.208 — gate for **make-before-break** carrier upgrades
+/// (`ROOMLER_NODE_OVERLAY_MBB`; legacy `ROOMLER_AGENT_…` alias honoured).
+/// **Default OFF** until field-proven on the netns NAT lab, mirroring every
+/// other carrier-tier gate's arc.
+///
+/// When ON, a relay→direct UPGRADE installs the candidate direct carrier as a
+/// SHADOW PROBE (its own `Tunn`, in `WgDevice::probes`) while the working relay
+/// keeps routing, and only cuts over once the probe's handshake latches (proof
+/// the direct path works both ways). If the probe never latches within the
+/// tier's deadline it is dropped and the relay is untouched — so a peer that can
+/// only ever relay (same-NAT AP-isolation / no hairpin) never suffers the
+/// ~15–38 s freeze the old break-before-make upgrade caused every re-upgrade
+/// tick (it tore the relay down, gambled on an unreachable direct path, then
+/// re-established relay). Off ⇒ the pre-rc.208 destructive upgrade, byte-for-
+/// byte. Only the OUTBOUND upgrade is covered in rc.208; the inbound-accept path
+/// (`handle_direct_inbound`) stays destructive (documented follow-up) — harmless
+/// for the symmetric-block case, where no direct packets cross either way.
+pub fn make_before_break_enabled() -> bool {
+    match crate::env::node_env("OVERLAY_MBB") {
+        Some(v) => {
+            let t = v.trim();
+            t.eq_ignore_ascii_case("1")
+                || t.eq_ignore_ascii_case("true")
+                || t.eq_ignore_ascii_case("yes")
+                || t.eq_ignore_ascii_case("on")
+        }
+        None => false,
+    }
+}
+
 /// NAT-traversal Phase B/C — gate for the **srflx** carrier tier
 /// (`ROOMLER_NODE_OVERLAY_SRFLX`; legacy `ROOMLER_AGENT_…` alias honoured).
 /// **Default ON** since 2026-07-20 (field-proven: a cone↔cone pair hole-punches
