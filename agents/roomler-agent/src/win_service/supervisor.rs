@@ -268,22 +268,37 @@ pub unsafe fn spawn_in_session(token: HANDLE, exe: &Path, args: &[&str]) -> Resu
     })
 }
 
-/// Parse the `ROOMLER_AGENT_ELEVATE_WORKER` value. **Opt-in**: only an
-/// explicit truthy value (`1` / `true` / `yes` / `on`, case-insensitive)
-/// enables spawning the user-context worker with the interactive admin's
-/// ELEVATED linked token. Unset / anything else → `false`, i.e. the
-/// pre-existing filtered-token behaviour on every fleet host until an
-/// operator opts a box in. Pure over its input so it's unit-testable.
+/// Parse the `ROOMLER_AGENT_ELEVATE_WORKER` value. **Default ON**
+/// (field-proven on an interactive-admin box, 2026-07-23): the
+/// user-context worker is spawned with the interactive admin's ELEVATED
+/// linked token so the overlay's Wintun adapter (a privileged device
+/// install) can be created. Only an explicit disable value — `0` /
+/// `false` / `no` / `off` (case-insensitive) — is the kill-switch;
+/// unset / truthy / empty / anything unrecognised keeps the default ON.
+///
+/// "Default ON" is safe fleet-wide because the elevation is a no-op for
+/// anyone who can't use it: [`elevated_primary_token`] only elevates a
+/// `TokenElevationTypeLimited` (a UAC-split administrator) and returns
+/// `None` for standard users / already-`Full` tokens → the caller spawns
+/// with the original token, exactly as before. So flipping the default
+/// changes behaviour ONLY on an interactive split-token-admin box whose
+/// worker isn't already SYSTEM (i.e. not running SystemContext) — exactly
+/// the hosts that need it — and there it also closes the UIPI gap
+/// (high-IL input can reach elevated foreground apps). The kill-switch
+/// reverts any box to the pre-existing filtered-token behaviour without
+/// a rebuild. Pure over its input so it's unit-testable.
 fn parse_elevate_flag(val: Option<&str>) -> bool {
     match val {
         Some(v) => {
             let t = v.trim();
-            t.eq_ignore_ascii_case("1")
-                || t.eq_ignore_ascii_case("true")
-                || t.eq_ignore_ascii_case("yes")
-                || t.eq_ignore_ascii_case("on")
+            // Explicit kill-switch only; everything else (truthy, empty,
+            // or an unrecognised value) keeps the default ON.
+            !(t.eq_ignore_ascii_case("0")
+                || t.eq_ignore_ascii_case("false")
+                || t.eq_ignore_ascii_case("no")
+                || t.eq_ignore_ascii_case("off"))
         }
-        None => false,
+        None => true,
     }
 }
 
@@ -305,9 +320,10 @@ fn parse_elevate_flag(val: Option<&str>) -> bool {
 /// while granting the integrity level Wintun needs — and, as a bonus,
 /// lets input injection reach elevated foreground apps (the UIPI gap).
 ///
-/// Opt-in via `ROOMLER_AGENT_ELEVATE_WORKER=1`, mirroring how the
-/// SystemContext swap was introduced (`ROOMLER_AGENT_ENABLE_SYSTEM_SWAP`).
-/// Default OFF → zero behaviour change on any host that doesn't set it.
+/// **Default ON** (field-proven 2026-07-23); disable per-host with
+/// `ROOMLER_AGENT_ELEVATE_WORKER=0`. The elevation is inert unless the
+/// interactive user is a UAC-split administrator, so the default only
+/// engages on the hosts that need it — see [`parse_elevate_flag`].
 fn worker_elevation_requested() -> bool {
     use tunnel_core::env::node_env;
     parse_elevate_flag(node_env("ELEVATE_WORKER").as_deref())
@@ -1114,12 +1130,12 @@ pub fn run(
             (SpawnDecision::SpawnIn(sid), true) if current.is_none() => {
                 match query_user_token(sid) {
                     Ok(Some(token)) => {
-                        // rc.206 — optionally spawn with the interactive
-                        // admin's ELEVATED linked token so the overlay's
-                        // Wintun adapter (a privileged device install)
-                        // succeeds without the heavier SystemContext
-                        // SYSTEM-swap. Opt-in via ROOMLER_AGENT_ELEVATE_
-                        // WORKER; falls back to the filtered `token` for
+                        // rc.206 — spawn with the interactive admin's
+                        // ELEVATED linked token so the overlay's Wintun
+                        // adapter (a privileged device install) succeeds
+                        // without the heavier SystemContext SYSTEM-swap.
+                        // Default-on; kill-switch ROOMLER_AGENT_ELEVATE_
+                        // WORKER=0. Falls back to the filtered `token` for
                         // standard users / already-elevated / any failure
                         // (no regression). `elevated` (when Some) owns the
                         // duplicated primary token and MUST outlive the
@@ -1372,23 +1388,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn elevate_flag_is_opt_in_and_case_insensitive() {
-        // Truthy set (case-insensitive, whitespace-tolerant).
-        for v in ["1", "true", "TRUE", "Yes", "on", " on ", "\tTrue\n"] {
-            assert!(parse_elevate_flag(Some(v)), "{v:?} should enable elevation");
+    fn elevate_flag_defaults_on_with_explicit_kill_switch() {
+        // Default ON: unset, truthy, empty, or any unrecognised value all
+        // keep elevation enabled (the elevation itself is still inert for
+        // non-split-token users — see elevated_primary_token).
+        for v in [
+            None,
+            Some("1"),
+            Some("true"),
+            Some("on"),
+            Some("Yes"),
+            Some(""),
+            Some("  "),
+            Some("2"),
+            Some("enabled"),
+        ] {
+            assert!(parse_elevate_flag(v), "{v:?} should keep elevation ON");
         }
-        // Everything else — including unset — leaves the pre-existing
-        // filtered-token behaviour (opt-in, no fleet-wide change).
-        for v in ["0", "false", "no", "off", "", "  ", "2", "enabled", "y"] {
+        // Only an explicit disable value (case-insensitive, whitespace-
+        // tolerant) is the kill-switch → OFF.
+        for v in ["0", "false", "FALSE", "No", "off", " off ", "\tfalse\n"] {
             assert!(
                 !parse_elevate_flag(Some(v)),
-                "{v:?} must NOT enable elevation"
+                "{v:?} must disable elevation (kill-switch)"
             );
         }
-        assert!(
-            !parse_elevate_flag(None),
-            "unset must NOT enable elevation (opt-in default)"
-        );
     }
 
     #[test]
