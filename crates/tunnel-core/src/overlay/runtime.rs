@@ -354,6 +354,82 @@ const FALLBACK_TICK: Duration = Duration::from_secs(5);
 /// war. Cheap (a couple of route commands per peer) and 2 s bounds the capture
 /// window to a couple of dropped pings.
 const ROUTE_GUARD_TICK: Duration = Duration::from_secs(2);
+/// rc.211 — loop-stall watchdog threshold. While ANY steady-state select! arm's
+/// handler awaits, the `tun.read_packet()` data-plane arm is NOT re-polled, so
+/// outbound packets queue for the handler's full duration (the field-observed
+/// 1–2 s RTT plateaus on a churny Windows host). Every arm and the expensive
+/// sub-calls inside the fat ones are timed via [`warn_if_slow`]; anything over
+/// this threshold is named in the log. Permanent telemetry: two `Instant` reads
+/// per arm, and the only way a head-of-line regression gets caught in the field.
+const LOOP_STALL_WARN_MS: u128 = 250;
+
+/// rc.211 — log a named steady-loop stall (see [`LOOP_STALL_WARN_MS`]).
+fn warn_if_slow(stage: &'static str, t0: Instant) {
+    let ms = t0.elapsed().as_millis();
+    if ms > LOOP_STALL_WARN_MS {
+        warn!(
+            stage,
+            ms, "overlay: steady-loop handler stalled the data plane (outbound queued this long)"
+        );
+    }
+}
+
+/// rc.211 — a finished OFF-LOOP QUIC-over-TURN carrier build (see
+/// [`RelayBuildQueue`]). `quic: None` = the QUIC handshake failed/timed out →
+/// the commit installs the link's already-built raw relay carrier (today's
+/// fallback semantics, unchanged — just no longer blocking the loop).
+struct BuiltRelay {
+    epoch: u64,
+    link: ReadyLink,
+    quic: Option<Arc<Carrier>>,
+}
+
+/// rc.211 — bookkeeping for OFF-LOOP relay carrier builds. The QUIC-over-TURN
+/// rendezvous (`Carrier::quic_relay`, capped at [`QUIC_BUILD_TIMEOUT`] = 8 s)
+/// used to run INLINE on the steady-state select! loop — the field-proven
+/// head-of-line stall behind the 1–2 s overlay RTT plateaus (the S1 watchdog
+/// named it five times at 8.06 s in one 150 s run). `install_ready` now spawns
+/// the build and the completion is committed by a dedicated select! arm.
+///
+/// Guards (adversarial-review C2/C3):
+/// * `in_flight` maps node → the epoch stamped at spawn; a completion commits
+///   ONLY if its epoch is still current, so any invalidating event (peer
+///   removed, direct carrier installed / `coord.forget`) simply removes the
+///   entry and the stale build is dropped on arrival — immune to the
+///   forget→re-request ABA a plain "is building" set would have.
+/// * `install_peers`' relay-coordination branch checks `in_flight` so it never
+///   spawns a DUPLICATE coordination for a peer whose carrier is mid-build
+///   (post-`try_build` the coordinator no longer tracks the peer, so
+///   `!is_tracking` alone would re-request during the 8 s window).
+struct RelayBuildQueue {
+    in_flight: HashMap<ObjectId, u64>,
+    epoch: u64,
+    tx: mpsc::Sender<BuiltRelay>,
+}
+
+impl RelayBuildQueue {
+    /// Stamp a new build for `node` (invalidates any prior in-flight build).
+    fn stamp(&mut self, node: ObjectId) -> u64 {
+        self.epoch += 1;
+        self.in_flight.insert(node, self.epoch);
+        self.epoch
+    }
+    /// Invalidate any in-flight build for `node` (peer removed / went direct /
+    /// coordinator forgotten) — its completion will be dropped on arrival.
+    fn invalidate(&mut self, node: &ObjectId) {
+        self.in_flight.remove(node);
+    }
+    /// `true` iff `built` is still the CURRENT build for its peer; clears the
+    /// entry either way (the completion consumes the slot).
+    fn take_if_current(&mut self, built: &BuiltRelay) -> bool {
+        if self.in_flight.get(&built.link.node_id) == Some(&built.epoch) {
+            self.in_flight.remove(&built.link.node_id);
+            true
+        } else {
+            false
+        }
+    }
+}
 /// Phase B — per-socket STUN attempt timeout when gathering srflx candidates at
 /// startup. `srflx_query` retries a few times, so worst-case per socket is a
 /// small multiple of this; the whole gather is additionally bounded by
@@ -1318,6 +1394,14 @@ impl OverlayRuntime {
             )),
             CarrierMode::Direct(_) => None,
         };
+        // rc.211 — off-loop relay carrier builds (see `RelayBuildQueue`).
+        // Created before the FIRST install so the startup batch can spawn too.
+        let (built_tx, mut built_rx) = mpsc::channel::<BuiltRelay>(16);
+        let mut relay_bq = RelayBuildQueue {
+            in_flight: HashMap::new(),
+            epoch: 0,
+            tx: built_tx,
+        };
         self.install_peers(
             &mut wg,
             &mut by_node,
@@ -1327,6 +1411,7 @@ impl OverlayRuntime {
             direct_ctx.as_ref(),
             &cooldowns,
             &mut upgrade_probes,
+            &mut relay_bq,
         )
         .await;
         // P5 exit-node — default-route capture state, reconciled after every
@@ -1374,8 +1459,34 @@ impl OverlayRuntime {
         loop {
             tokio::select! {
                 read = tun.read_packet() => match read {
-                    Ok(pkt) => { let _ = wg.send_ip_packet(&pkt).await; }
+                    Ok(pkt) => {
+                        let t0 = Instant::now();
+                        let _ = wg.send_ip_packet(&pkt).await;
+                        warn_if_slow("send_ip_packet", t0);
+                    }
                     Err(e) => { debug!(%e, "overlay: TUN read ended; runtime exiting"); break; }
+                },
+                // rc.211 — commit a finished OFF-LOOP relay carrier build (the
+                // spawned QUIC-over-TURN rendezvous — see `RelayBuildQueue`).
+                // The install half is µs. A STALE completion (peer removed /
+                // went direct / superseded mid-build) is dropped; the next
+                // netmap/sweep tick re-coordinates cleanly.
+                built = built_rx.recv() => {
+                    if let Some(built) = built {
+                        let t_arm = Instant::now();
+                        if relay_bq.take_if_current(&built) && current_peers.contains_key(&built.link.node_id) {
+                            let BuiltRelay { link, quic, .. } = built;
+                            self.install_built(&mut wg, &mut by_node, &tun, link, quic).await;
+                            // Same tail as a synchronous relay install: a new
+                            // coturn worker may need an exit exemption, and the
+                            // LocalAPI view must reflect the new carrier.
+                            self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
+                            self.publish_view(&self_ip, &by_node, &current_peers, exit_node_status(self.exit_node.as_deref(), &exit_state));
+                        } else {
+                            debug!(peer = %built.link.node_id, "overlay: dropping stale off-loop carrier build (peer removed/superseded mid-build)");
+                        }
+                        warn_if_slow("arm:relay_build_commit", t_arm);
+                    }
                 },
                 // rc.136 — direct→relay fallback sweep. A DIRECT carrier whose
                 // handshake never completes (or dies mid-session) means the LAN
@@ -1385,18 +1496,23 @@ impl OverlayRuntime {
                 // switch the peer to relay (with a cooldown so the next netmap
                 // doesn't immediately re-upgrade it to direct).
                 _ = fallback.tick() => {
+                    let t_arm = Instant::now();
+                    let t0 = Instant::now();
                     self.sweep_carrier_health(
                         &mut wg, &mut by_node, &mut relay, &tun,
                         &mut cooldowns, &mut relay_refresh_cooldown, &current_peers,
                     ).await;
+                    warn_if_slow("sweep_carrier_health", t0);
                     // rc.208 — make-before-break: promote any upgrade probe whose
                     // handshake latched (cut over to direct, drop the relay) and
                     // expire any that missed its deadline (keep the relay). Inert
                     // when the feature is off / no probes are in flight.
+                    let t0 = Instant::now();
                     self.sweep_upgrade_probes(
                         &mut wg, &mut by_node, &mut relay, &tun,
                         &mut upgrade_probes, &mut cooldowns,
                     ).await;
+                    warn_if_slow("sweep_upgrade_probes", t0);
                     // D8 — periodic direct re-upgrade (~every 6th tick ≈ 30 s).
                     // A lapsed cooldown only takes effect on the next netmap
                     // otherwise; a quiet mesh would never re-attempt direct after
@@ -1408,16 +1524,21 @@ impl OverlayRuntime {
                     reupgrade_ticks = reupgrade_ticks.wrapping_add(1);
                     if reupgrade_ticks.is_multiple_of(REUPGRADE_EVERY_N_TICKS) {
                         let peers: Vec<NetmapPeer> = current_peers.values().cloned().collect();
+                        let t0 = Instant::now();
                         self.install_peers(
                             &mut wg, &mut by_node, &mut relay, &tun,
                             &peers, direct_ctx.as_ref(), &cooldowns, &mut upgrade_probes,
+                            &mut relay_bq,
                         ).await;
+                        warn_if_slow("install_peers(reupgrade)", t0);
                     }
                     // A carrier flip may have changed the coturn worker set or
                     // the exit peer's reachability — re-reconcile exit routing
                     // FIRST, so the refreshed view carries the new exit status.
+                    let t0 = Instant::now();
                     self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state)
                         .await;
+                    warn_if_slow("reconcile_exit_routing(sweep)", t0);
                     // A direct→relay fallback (or relay refresh) changed how we
                     // reach a peer (and maybe the exit status) — refresh the view.
                     self.publish_view(
@@ -1426,6 +1547,7 @@ impl OverlayRuntime {
                         &current_peers,
                         exit_node_status(self.exit_node.as_deref(), &exit_state),
                     );
+                    warn_if_slow("arm:fallback_sweep", t_arm);
                 },
                 // rc.146 — re-assert every installed peer's /32 on the overlay
                 // NIC (evict any competing route a full-tunnel VPN re-added, then
@@ -1470,9 +1592,11 @@ impl OverlayRuntime {
                     // /32 war (A7): a competing full-tunnel VPN default can't
                     // reclaim egress.
                     if exit_state.split_default_installed {
+                        let t0 = Instant::now();
                         for cidr in SPLIT_DEFAULT_V4.iter().chain(SPLIT_DEFAULT_V6.iter()) {
                             tun.add_cidr_route(cidr).await.ok();
                         }
+                        warn_if_slow("arm:route_guard(exit /1)", t0);
                     }
                 },
                 // Phase A — an authenticated inbound direct handshake initiation
@@ -1487,27 +1611,37 @@ impl OverlayRuntime {
                     }
                 } => {
                     if let Some(inb) = maybe_init {
+                        let t_arm = Instant::now();
                         self.handle_direct_inbound(
                             &mut wg, &mut by_node, &mut relay, &tun,
-                            &current_peers, &mut cooldowns, &mut upgrade_probes, inb,
+                            &current_peers, &mut cooldowns, &mut upgrade_probes,
+                            &mut relay_bq, inb,
                         ).await;
                         self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
                         self.publish_view(&self_ip, &by_node, &current_peers, exit_node_status(self.exit_node.as_deref(), &exit_state));
+                        warn_if_slow("arm:direct_inbound", t_arm);
                     }
                 },
                 evt = events.recv() => match evt {
                     // Re-sync: install any newly-listed peers (deltas drive
                     // removals; a full diff/prune is a later refinement).
                     Some(OverlayEvent::Netmap { peers, .. }) => {
+                        let t_arm = Instant::now();
                         current_peers = peers.iter().map(|p| (p.node_id, p.clone())).collect();
                         if let Some(names) = &dns_names { sync_name_map(names, &current_peers).await; }
-                        self.install_peers(&mut wg, &mut by_node, &mut relay, &tun, &peers, direct_ctx.as_ref(), &cooldowns, &mut upgrade_probes).await;
+                        let t0 = Instant::now();
+                        self.install_peers(&mut wg, &mut by_node, &mut relay, &tun, &peers, direct_ctx.as_ref(), &cooldowns, &mut upgrade_probes, &mut relay_bq).await;
+                        warn_if_slow("install_peers(netmap)", t0);
                         self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
                         self.publish_view(&self_ip, &by_node, &current_peers, exit_node_status(self.exit_node.as_deref(), &exit_state));
+                        warn_if_slow("arm:netmap", t_arm);
                     }
                     Some(OverlayEvent::NetmapDelta { upserts, removes }) => {
+                        let t_arm = Instant::now();
                         for p in &upserts { current_peers.insert(p.node_id, p.clone()); }
-                        self.install_peers(&mut wg, &mut by_node, &mut relay, &tun, &upserts, direct_ctx.as_ref(), &cooldowns, &mut upgrade_probes).await;
+                        let t0 = Instant::now();
+                        self.install_peers(&mut wg, &mut by_node, &mut relay, &tun, &upserts, direct_ctx.as_ref(), &cooldowns, &mut upgrade_probes, &mut relay_bq).await;
+                        warn_if_slow("install_peers(delta)", t0);
                         for node_id in removes {
                             current_peers.remove(&node_id);
                             if let Some(e) = by_node.remove(&node_id) {
@@ -1518,6 +1652,9 @@ impl OverlayRuntime {
                             if let Some(r) = relay.as_mut() {
                                 r.forget(&node_id);
                             }
+                            // rc.211 — drop any in-flight off-loop relay build
+                            // for the removed peer (stale on arrival).
+                            relay_bq.invalidate(&node_id);
                             // rc.208 — drop any in-flight make-before-break probe
                             // for a removed peer (its shadow carrier + demux reg).
                             if let Some(pr) = upgrade_probes.remove(&node_id) {
@@ -1527,19 +1664,27 @@ impl OverlayRuntime {
                         if let Some(names) = &dns_names { sync_name_map(names, &current_peers).await; }
                         self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
                         self.publish_view(&self_ip, &by_node, &current_peers, exit_node_status(self.exit_node.as_deref(), &exit_state));
+                        warn_if_slow("arm:netmap_delta", t_arm);
                     }
                     Some(OverlayEvent::RelayGrant { peer_node_id, ice_servers, pair_key }) => {
-                        if let Some(r) = relay.as_mut()
-                            && let Some(link) = r.on_grant(peer_node_id, ice_servers, pair_key).await
-                        {
-                            self.install_ready(&mut wg, &mut by_node, &tun, link).await;
-                            // A newly-installed relay carrier adds a coturn worker
-                            // to exempt (and the exit peer may have just become
-                            // reachable) — reconcile exit routing, then refresh
-                            // the view so `roomler status` reflects it.
-                            self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
-                            self.publish_view(&self_ip, &by_node, &current_peers, exit_node_status(self.exit_node.as_deref(), &exit_state));
+                        let t_arm = Instant::now();
+                        if let Some(r) = relay.as_mut() {
+                            let t0 = Instant::now();
+                            let link = r.on_grant(peer_node_id, ice_servers, pair_key).await;
+                            warn_if_slow("on_grant(dns+turn-allocate)", t0);
+                            if let Some(link) = link {
+                                let t0 = Instant::now();
+                                self.install_ready(&mut wg, &mut by_node, &tun, link, &mut relay_bq).await;
+                                warn_if_slow("install_ready(spawn-or-sync)", t0);
+                                // A newly-installed relay carrier adds a coturn worker
+                                // to exempt (and the exit peer may have just become
+                                // reachable) — reconcile exit routing, then refresh
+                                // the view so `roomler status` reflects it.
+                                self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
+                                self.publish_view(&self_ip, &by_node, &current_peers, exit_node_status(self.exit_node.as_deref(), &exit_state));
+                            }
                         }
+                        warn_if_slow("arm:relay_grant", t_arm);
                     }
                     None => break,
                 },
@@ -1881,6 +2026,7 @@ impl OverlayRuntime {
         direct_ctx: Option<&DirectCtx>,
         cooldowns: &DirectCooldowns,
         upgrade_probes: &mut HashMap<ObjectId, UpgradeProbe>,
+        relay_bq: &mut RelayBuildQueue,
     ) {
         let now = Instant::now();
         // rc.208 — make-before-break: probe a relay→direct upgrade instead of
@@ -2040,6 +2186,9 @@ impl OverlayRuntime {
                         if let Some(r) = relay.as_mut() {
                             r.forget(&np.node_id);
                         }
+                        // rc.211 — a direct carrier supersedes any relay build
+                        // still in flight for this peer; drop it on arrival.
+                        relay_bq.invalidate(&np.node_id);
                         self.install_direct(wg, by_node, tun, ctx, np.node_id, &cfg, local_ip, dst)
                             .await;
                     } else if let (Some(ctx), Some(dst)) = (direct_ctx, phase_a_dst) {
@@ -2048,6 +2197,9 @@ impl OverlayRuntime {
                         if let Some(r) = relay.as_mut() {
                             r.forget(&np.node_id);
                         }
+                        // rc.211 — a direct carrier supersedes any relay build
+                        // still in flight for this peer; drop it on arrival.
+                        relay_bq.invalidate(&np.node_id);
                         self.install_public_direct(wg, by_node, tun, ctx, np.node_id, &cfg, dst)
                             .await;
                     } else if let (Some(ctx), Some(dst)) = (direct_ctx, srflx_dst) {
@@ -2056,6 +2208,9 @@ impl OverlayRuntime {
                         if let Some(r) = relay.as_mut() {
                             r.forget(&np.node_id);
                         }
+                        // rc.211 — a direct carrier supersedes any relay build
+                        // still in flight for this peer; drop it on arrival.
+                        relay_bq.invalidate(&np.node_id);
                         self.install_srflx_direct(wg, by_node, tun, ctx, np.node_id, &cfg, dst)
                             .await;
                     }
@@ -2085,6 +2240,7 @@ impl OverlayRuntime {
                             relay_kind: RelayKind::Turn,
                             subnets: cfg.subnets.clone(),
                         },
+                        relay_bq,
                     )
                     .await;
                 }
@@ -2096,6 +2252,9 @@ impl OverlayRuntime {
                         if let Some(r) = relay.as_mut() {
                             r.forget(&np.node_id);
                         }
+                        // rc.211 — a direct carrier supersedes any relay build
+                        // still in flight for this peer; drop it on arrival.
+                        relay_bq.invalidate(&np.node_id);
                         self.install_direct(wg, by_node, tun, ctx, np.node_id, &cfg, local_ip, dst)
                             .await;
                     } else if let (Some(ctx), Some(dst)) = (direct_ctx, phase_a_dst) {
@@ -2104,6 +2263,9 @@ impl OverlayRuntime {
                         if let Some(r) = relay.as_mut() {
                             r.forget(&np.node_id);
                         }
+                        // rc.211 — a direct carrier supersedes any relay build
+                        // still in flight for this peer; drop it on arrival.
+                        relay_bq.invalidate(&np.node_id);
                         self.install_public_direct(wg, by_node, tun, ctx, np.node_id, &cfg, dst)
                             .await;
                     } else if let (Some(ctx), Some(dst)) = (direct_ctx, srflx_dst) {
@@ -2112,11 +2274,23 @@ impl OverlayRuntime {
                         if let Some(r) = relay.as_mut() {
                             r.forget(&np.node_id);
                         }
+                        // rc.211 — a direct carrier supersedes any relay build
+                        // still in flight for this peer; drop it on arrival.
+                        relay_bq.invalidate(&np.node_id);
                         self.install_srflx_direct(wg, by_node, tun, ctx, np.node_id, &cfg, dst)
                             .await;
                     } else if let Some(coord) = relay.as_mut() {
+                        // rc.211 — a carrier for this peer is mid-BUILD off-loop:
+                        // post-`try_build` the coordinator no longer tracks it, so
+                        // without this guard `!is_tracking` would re-`request` a
+                        // DUPLICATE coordination during the 8 s QUIC window.
+                        if relay_bq.in_flight.contains_key(&np.node_id) {
+                            continue;
+                        }
                         if let Some(link) = coord.maybe_complete(np.node_id, &cfg) {
-                            self.install_ready(wg, by_node, tun, link).await;
+                            let t0 = Instant::now();
+                            self.install_ready(wg, by_node, tun, link, relay_bq).await;
+                            warn_if_slow("install_ready(maybe_complete)", t0);
                         } else if !coord.is_tracking(&np.node_id) {
                             // Both ends pick the same coturn worker from the
                             // server's symmetric pair_key (in the grant), so no
@@ -2445,6 +2619,7 @@ impl OverlayRuntime {
         current_peers: &HashMap<ObjectId, NetmapPeer>,
         cooldowns: &mut DirectCooldowns,
         upgrade_probes: &mut HashMap<ObjectId, UpgradeProbe>,
+        relay_bq: &mut RelayBuildQueue,
         inb: crate::overlay::wg::DirectInbound,
     ) {
         let Some(pubkey) = wg.authenticate_init(&inb.packet) else {
@@ -2559,6 +2734,9 @@ impl OverlayRuntime {
         if let Some(r) = relay.as_mut() {
             r.forget(&node_id);
         }
+        // rc.211 — the direct carrier installed below supersedes any relay
+        // build still in flight for this peer; drop it on arrival.
+        relay_bq.invalidate(&node_id);
         // rc.208 — if a stale probe lingers for this peer (feature toggled off
         // mid-session, or a direct-on-another-src re-point), discard it so it
         // can't later promote over the carrier we install here.
@@ -2606,6 +2784,7 @@ impl OverlayRuntime {
         by_node: &mut HashMap<ObjectId, Installed>,
         tun: &Arc<dyn TunIo>,
         link: ReadyLink,
+        relay_bq: &mut RelayBuildQueue,
     ) {
         // Handshake direction. RELAY carriers use a deterministic single
         // initiator (the lexicographically smaller pubkey dials; both ends
@@ -2626,13 +2805,7 @@ impl OverlayRuntime {
         // permission fresh. On ANY handshake failure/timeout we fall back to the
         // already-built raw relay carrier, so the upgrade can only improve —
         // never break — the link.
-        // rc.187 — capture the relay endpoints for `peers` visibility BEFORE the
-        // carrier is (maybe) upgraded to QUIC. `relay_parts` is `Some` for any
-        // relay carrier (raw or QUIC-over-TURN), `None` for a direct link.
-        let (relay_local, relay_dst) = match &link.relay_parts {
-            Some((conn, dst)) => (conn.local_addr().ok(), Some(*dst)),
-            None => (None, None),
-        };
+        //
         // rc.199 — mutual coturn permission bootstrap for EVERY relay carrier
         // (raw, QUIC, or QUIC-fallback-to-raw). coturn only relays a peer's
         // datagrams to this allocation once it holds a *permission* for that
@@ -2674,8 +2847,17 @@ impl OverlayRuntime {
         let want_quic = link.relay_parts.is_some()
             && link.relay_kind == RelayKind::Turn
             && (link.single_relay.is_some() || (overlay_quic_enabled() && link.supports_quic));
-        let carrier = if want_quic {
-            let (conn, dst) = link.relay_parts.clone().unwrap();
+        if want_quic {
+            // rc.211 — the QUIC-over-TURN rendezvous (up to QUIC_BUILD_TIMEOUT
+            // = 8 s) runs OFF-LOOP: awaiting it here head-of-line-blocked the
+            // `tun.read_packet()` arm for its full duration — the field-proven
+            // 1–2 s overlay RTT plateaus (S1 watchdog: five 8.06 s stalls named
+            // `install_ready(quic-build)` in one 150 s run on a churny host).
+            // The spawned build sends its result to the `built_rx` select! arm,
+            // which commits via `install_built` (µs). `quic_relay` sends the
+            // `\x00` permission bootstrap itself; on failure the builder sends
+            // one for the raw fallback (mirrors the pre-split inline probe).
+            //
             // QUIC role. For a SINGLE-RELAY link the ANCHOR must serve — its
             // allocation is the rendezvous, and only the server-on-the-
             // allocation replies to coturn's observed sources. With UDP-aware
@@ -2684,36 +2866,66 @@ impl OverlayRuntime {
             // would QUIC-connect toward the dialer's srflx, which that
             // socket's NAT filter drops). Both-allocate keeps the pubkey rule
             // (deterministic, both ends agree; either allocation can serve).
+            let (conn, dst) = link.relay_parts.clone().unwrap();
             let am_server = match link.single_relay {
                 Some(anchor) => anchor,
                 None => self.keypair.public.to_bytes() < link.public_key,
             };
-            match Carrier::quic_relay(
-                conn,
-                dst,
-                am_server,
-                self.mtu as usize + WG_OVERHEAD,
-                QUIC_BUILD_TIMEOUT,
-            )
-            .await
-            {
-                Ok(q) => {
-                    info!(peer = %link.node_id, %dst, am_server, "overlay: QUIC-over-TURN carrier up");
-                    q
-                }
-                Err(e) => {
-                    // For a single-relay link the raw fallback only carries for
-                    // cone-ish dialers (port-preserving mapping); a symmetric
-                    // dialer stays dark until the health sweep re-coordinates.
-                    warn!(peer = %link.node_id, %e, single_relay = ?link.single_relay,
-                          "overlay: QUIC carrier build failed; using raw relay");
-                    link.carrier
-                }
-            }
-        } else {
-            link.carrier
-        };
+            let min_datagram = self.mtu as usize + WG_OVERHEAD;
+            let epoch = relay_bq.stamp(link.node_id);
+            let tx = relay_bq.tx.clone();
+            tokio::spawn(async move {
+                let quic = match Carrier::quic_relay(
+                    conn.clone(),
+                    dst,
+                    am_server,
+                    min_datagram,
+                    QUIC_BUILD_TIMEOUT,
+                )
+                .await
+                {
+                    Ok(q) => {
+                        info!(peer = %link.node_id, %dst, am_server, "overlay: QUIC-over-TURN carrier up");
+                        Some(q)
+                    }
+                    Err(e) => {
+                        // For a single-relay link the raw fallback only carries
+                        // for cone-ish dialers (port-preserving mapping); a
+                        // symmetric dialer stays dark until the health sweep
+                        // re-coordinates.
+                        warn!(peer = %link.node_id, %e, single_relay = ?link.single_relay,
+                              "overlay: QUIC carrier build failed; using raw relay");
+                        // Permission bootstrap for the raw fallback (the QUIC
+                        // attempt sent its own, but re-assert — it's 1 byte).
+                        let _ = conn.send_to(b"\x00", dst).await;
+                        None
+                    }
+                };
+                // Receiver dropped ⇒ runtime exited; the build is moot.
+                let _ = tx.send(BuiltRelay { epoch, link, quic }).await;
+            });
+            return;
+        }
+        self.install_built(wg, by_node, tun, link, None).await;
+    }
 
+    /// rc.211 — commit an already-BUILT relay/test carrier as a WG peer: the
+    /// µs-fast install half of the old `install_ready` (`wg.add_peer` + `/32`
+    /// route + subnets + bookkeeping). `quic: Some` = the off-loop QUIC build
+    /// succeeded; `None` = raw carrier (no-QUIC link, or QUIC fallback).
+    async fn install_built(
+        &self,
+        wg: &mut WgDevice,
+        by_node: &mut HashMap<ObjectId, Installed>,
+        tun: &Arc<dyn TunIo>,
+        link: ReadyLink,
+        quic: Option<Arc<Carrier>>,
+    ) {
+        let (relay_local, relay_dst) = match &link.relay_parts {
+            Some((conn, dst)) => (conn.local_addr().ok(), Some(*dst)),
+            None => (None, None),
+        };
+        let carrier = quic.unwrap_or_else(|| link.carrier.clone());
         let initiate = carrier.is_direct() || self.keypair.public.to_bytes() < link.public_key;
         let is_direct = carrier.is_direct();
         wg.add_peer(link.public_key, link.overlay_ip, carrier, initiate);
@@ -3015,6 +3227,71 @@ mod tests {
     use std::time::Duration;
     use tokio::net::UdpSocket;
     use tokio::sync::Mutex;
+
+    /// rc.211 — a fresh off-loop build queue for tests. The receiver is
+    /// dropped: these tests exercise direct/LAN paths that never spawn a
+    /// QUIC build, and a send into a closed channel is simply ignored.
+    fn test_relay_bq() -> RelayBuildQueue {
+        let (tx, _rx) = mpsc::channel(4);
+        RelayBuildQueue {
+            in_flight: HashMap::new(),
+            epoch: 0,
+            tx,
+        }
+    }
+
+    /// rc.211 — the off-loop build queue's staleness guards. (a) A completion
+    /// commits only while its epoch is current; (b) `invalidate` (peer removed /
+    /// went direct) drops the in-flight build on arrival; (c) re-`stamp` for the
+    /// same peer supersedes the old build — the ABA case a plain "is building"
+    /// set would get wrong (old completion must NOT commit, new one must).
+    #[tokio::test]
+    async fn relay_build_queue_epoch_guards() {
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let dst: SocketAddr = sock.local_addr().unwrap();
+        let mk = |node, epoch| BuiltRelay {
+            epoch,
+            link: ReadyLink {
+                node_id: node,
+                public_key: [0u8; 32],
+                overlay_ip: std::net::Ipv4Addr::new(100, 64, 0, 9),
+                carrier: Arc::new(Carrier::Direct {
+                    sock: sock.clone(),
+                    dst,
+                }),
+                relay_parts: None,
+                supports_quic: false,
+                single_relay: None,
+                relay_kind: RelayKind::Turn,
+                subnets: vec![],
+            },
+            quic: None,
+        };
+        let mut bq = test_relay_bq();
+        let n = ObjectId::from_bytes([9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+
+        // (a) current epoch commits, and the slot is consumed.
+        let e1 = bq.stamp(n);
+        assert!(bq.in_flight.contains_key(&n));
+        assert!(bq.take_if_current(&mk(n, e1)));
+        assert!(!bq.in_flight.contains_key(&n), "commit consumes the slot");
+        assert!(
+            !bq.take_if_current(&mk(n, e1)),
+            "a second arrival of the same build is stale"
+        );
+
+        // (b) invalidate → the completion is dropped on arrival.
+        let e2 = bq.stamp(n);
+        bq.invalidate(&n);
+        assert!(!bq.take_if_current(&mk(n, e2)));
+
+        // (c) ABA: re-stamp supersedes — the OLD build must not commit, the
+        // NEW one must.
+        let e3 = bq.stamp(n);
+        let e4 = bq.stamp(n);
+        assert!(!bq.take_if_current(&mk(n, e3)), "superseded build is stale");
+        assert!(bq.take_if_current(&mk(n, e4)), "current build commits");
+    }
 
     #[test]
     fn direct_cooldown_escalates_to_sticky_after_repeated_failures() {
@@ -3511,6 +3788,7 @@ mod tests {
             &current_peers,
             &mut cooldowns,
             &mut probes,
+            &mut test_relay_bq(),
             inb,
         )
         .await;
@@ -3542,6 +3820,7 @@ mod tests {
             &current_peers,
             &mut cooldowns,
             &mut probes2,
+            &mut test_relay_bq(),
             inb2,
         )
         .await;
@@ -3799,6 +4078,7 @@ mod tests {
             Some(&ctx),
             &cooldowns,
             &mut HashMap::new(),
+            &mut test_relay_bq(),
         )
         .await;
         assert!(
@@ -3819,6 +4099,7 @@ mod tests {
             Some(&ctx),
             &cooldowns,
             &mut HashMap::new(),
+            &mut test_relay_bq(),
         )
         .await;
         let inst = by_node
