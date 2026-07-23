@@ -267,6 +267,15 @@ impl Carrier {
 pub struct PeerStats {
     tx: AtomicU64,
     rx: AtomicU64,
+    /// rc.206 — count of authenticated inbound packets from this peer since the
+    /// health sweep last drained it (`peer_take_rx_any`): data, a handshake step,
+    /// OR a content-free persistent-keepalive. A keepalive decapsulates to
+    /// `TunnResult::Done` and never touches `rx`, so this — not `rx` — is the
+    /// LIVENESS signal the sweep drives `last_rx_at` off. A mostly-idle-but-alive
+    /// carrier's only inbound is keepalives; keying "last heard" on the IP-data
+    /// `rx` would freeze it and the rx-staleness watchdog would reap a healthy
+    /// link. Single-consumer: only the sweep reads (and zeroes) it.
+    rx_any: AtomicU64,
     /// Phase C — latched `true` the moment a WG handshake to this peer
     /// completes (a session exists), for EITHER role (the responder establishes
     /// on receiving the init, the initiator on receiving the response). The
@@ -834,6 +843,20 @@ impl WgDevice {
         ))
     }
 
+    /// rc.206 — consume and return how many authenticated inbound packets we've
+    /// heard from this peer since the last call (see `PeerStats::rx_any`),
+    /// resetting the counter to 0. The health sweep calls this once per peer per
+    /// tick: a non-zero result means the carrier is genuinely alive — even if the
+    /// only inbound was content-free keepalives — so it advances `last_rx_at`
+    /// (which the rx-staleness watchdog reads). Returns 0 for an unknown peer.
+    /// Single-consumer by contract: only the sweep calls it (the swap resets it).
+    pub fn peer_take_rx_any(&self, peer_public: &[u8; 32]) -> u64 {
+        match self.peers.get(peer_public) {
+            Some(p) => p.stats.rx_any.swap(0, Ordering::Relaxed),
+            None => 0,
+        }
+    }
+
     /// rc.181 — `true` if `peer_public`'s carrier has latched a hard send error
     /// (a TURNS/TCP reset or a lost QUIC-over-TURN connection); `false` for a
     /// healthy or direct carrier; `None` if the peer is unknown. Lock-free. The
@@ -859,6 +882,30 @@ impl WgDevice {
                 .load(Ordering::Relaxed),
         )
     }
+
+    /// Test-only: latch `peer_public`'s handshake-done flag true without a live
+    /// two-device session. The health-sweep tests that exercise the
+    /// ESTABLISHED-carrier paths (rc.206 rx-staleness) need `peer_handshake_done`
+    /// to read `Some(true)`, which otherwise requires a full handshake dance over
+    /// real sockets (see `peer_handshake_done_latches_on_session_establish`).
+    /// This flips only the latch the sweep reads; nothing else about the peer.
+    #[cfg(test)]
+    pub fn test_latch_handshake_done(&self, peer_public: &[u8; 32]) {
+        if let Some(p) = self.peers.get(peer_public) {
+            p.stats.handshake.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Test-only: simulate an authenticated inbound packet (e.g. a keepalive)
+    /// from `peer_public` by bumping its `rx_any` liveness counter, so the sweep
+    /// tests can exercise the "heard-within-deadline → survives" path (rc.206)
+    /// without driving a live session's keepalive traffic.
+    #[cfg(test)]
+    pub fn test_bump_rx_any(&self, peer_public: &[u8; 32]) {
+        if let Some(p) = self.peers.get(peer_public) {
+            p.stats.rx_any.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Handle one inbound carrier datagram: decapsulate, echo any
@@ -875,7 +922,19 @@ async fn process_inbound(
     // Decapsulate writes into a separate scratch buffer so the borrow on
     // the result doesn't alias the inbound `buf`.
     let mut out = vec![0u8; WG_BUF];
-    match t.decapsulate(None, &buf[..n], &mut out) {
+    let res = t.decapsulate(None, &buf[..n], &mut out);
+    // rc.206 — a non-empty inbound datagram that passed WG decapsulation (data, a
+    // handshake step, OR a content-free persistent-keepalive → `Done`) proves we
+    // HEARD from this peer: the liveness signal the health sweep keys rx-staleness
+    // on. `rx` (below) advances only on delivered IP DATA, so a keepalive-only
+    // idle link would look silent. Guard on `n > 0`: an EMPTY datagram also
+    // decapsulates to `Done` (boringtun's poll-for-queued-output shape — what the
+    // flush loop below relies on), but a 0-byte UDP payload is never a real WG
+    // packet, so it must not count as liveness. `Err` (replay / garbage) isn't.
+    if n > 0 && !matches!(res, TunnResult::Err(_)) {
+        stats.rx_any.fetch_add(1, Ordering::Relaxed);
+    }
+    match res {
         TunnResult::WriteToNetwork(b) => {
             let _ = carrier.send(b).await;
             // A handshake step can complete a session with queued data;
