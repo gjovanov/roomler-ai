@@ -1672,14 +1672,19 @@ pub(crate) async fn terminate_sessions_targeting_agent(state: &AppState, agent_i
             .map(|e| e.value().clone());
         if let Some(tx) = tx {
             info!(%agent_id, session_id = %sid, "target agent WS dropped — terminating tunnel session");
-            send_msg(
-                &tx,
-                ServerMsg::TunnelTerminate {
-                    session_id: sid,
-                    reason: CloseReason::ServerTerminated,
-                },
-            )
-            .await;
+            // try_send, not send: this runs on the AGENT's WS teardown path,
+            // and an awaited send on a wedged client channel (blackholed
+            // socket, full cap-256 buffer) would stall unregister +
+            // mark_status(offline) behind an unrelated client. A dropped
+            // push is fine — the client still heals via the session-gone
+            // reject on its next forward.
+            let msg = ServerMsg::TunnelTerminate {
+                session_id: sid,
+                reason: CloseReason::ServerTerminated,
+            };
+            if let Err(e) = tx.try_send(msg) {
+                debug!(%agent_id, session_id = %sid, %e, "terminate push dropped (client channel full/closed)");
+            }
         }
     }
 }

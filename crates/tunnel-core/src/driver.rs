@@ -762,6 +762,17 @@ async fn dispatch_loop(
                         flow_id,
                         "agent no longer knows this session (WS reconnect after a network flap?) — ending session to re-open"
                     );
+                    // Best-effort: tell the server we consider the session
+                    // dead so it reaps its entry + relays teardown to the
+                    // agent now, instead of carrying a zombie entry until
+                    // our WS drops. Idempotent if the server's own
+                    // terminate push raced us.
+                    let _ = sink
+                        .send(ClientMsg::TunnelTerminate {
+                            session_id,
+                            reason: CloseReason::IoError,
+                        })
+                        .await;
                     return;
                 }
             }
@@ -811,6 +822,17 @@ async fn dispatch_loop(
                         flow_id,
                         "agent no longer knows this session (WS reconnect after a network flap?) — ending session to re-open"
                     );
+                    // Best-effort: tell the server we consider the session
+                    // dead so it reaps its entry + relays teardown to the
+                    // agent now, instead of carrying a zombie entry until
+                    // our WS drops. Idempotent if the server's own
+                    // terminate push raced us.
+                    let _ = sink
+                        .send(ClientMsg::TunnelTerminate {
+                            session_id,
+                            reason: CloseReason::IoError,
+                        })
+                        .await;
                     return;
                 }
             }
@@ -1031,6 +1053,16 @@ async fn run_quic_session(
             // transport.
             err = conn.closed() => {
                 warn!(%err, "QUIC connection lost; ending quic session to reconnect");
+                // Best-effort server-side reap (see the dispatch loops'
+                // session-gone exit) — without it an old server carries a
+                // zombie session entry until our WS drops, and the
+                // standalone CLI's zombie WS would idle until then.
+                let _ = sink
+                    .send(ClientMsg::TunnelTerminate {
+                        session_id,
+                        reason: CloseReason::IoError,
+                    })
+                    .await;
                 break;
             }
         };
@@ -1307,6 +1339,14 @@ async fn quic_dispatch_loop(
                         flow_id,
                         "agent no longer knows this session (WS reconnect after a network flap?) — ending quic session to re-open"
                     );
+                    // Best-effort server-side reap — see the identical
+                    // comment in the WebRTC dispatch loop.
+                    let _ = sink
+                        .send(ClientMsg::TunnelTerminate {
+                            session_id,
+                            reason: CloseReason::IoError,
+                        })
+                        .await;
                     return;
                 }
             }
@@ -1353,6 +1393,17 @@ async fn quic_dispatch_loop(
                         flow_id,
                         "agent no longer knows this session (WS reconnect after a network flap?) — ending session to re-open"
                     );
+                    // Best-effort: tell the server we consider the session
+                    // dead so it reaps its entry + relays teardown to the
+                    // agent now, instead of carrying a zombie entry until
+                    // our WS drops. Idempotent if the server's own
+                    // terminate push raced us.
+                    let _ = sink
+                        .send(ClientMsg::TunnelTerminate {
+                            session_id,
+                            reason: CloseReason::IoError,
+                        })
+                        .await;
                     return;
                 }
             }
