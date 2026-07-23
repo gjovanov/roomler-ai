@@ -2883,6 +2883,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         console.info(
           '[rc] hevc first frame', msg.width, 'x', msg.height,
           '| coded', msg.coded, 'display', msg.display, 'visible', msg.visible,
+          '| crop', msg.crop, 'rewrapped', msg.rewrapped,
         )
       } else if (msg.type === 'decoder-configured') {
         console.info('[rc] hevc decoder configured', msg.codec)
