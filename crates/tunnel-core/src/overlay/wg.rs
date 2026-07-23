@@ -361,6 +361,15 @@ pub struct WgDevice {
     secret: StaticSecret,
     public: PublicKey,
     peers: HashMap<[u8; 32], Peer>,
+    /// Make-before-break (rc.208) — shadow direct-carrier probes. A relay→direct
+    /// UPGRADE installs the candidate direct carrier HERE (its own `Tunn`, keyed
+    /// by the same pubkey as its active relay peer in `peers`), so routing stays
+    /// on the working relay until the probe's handshake latches. Promoted into
+    /// `peers` on success, dropped on the deadline — the active carrier never
+    /// stalls (the freeze the destructive break-before-make upgrade caused on a
+    /// peer that can only relay). Empty unless the feature is on + an upgrade is
+    /// in flight.
+    probes: HashMap<[u8; 32], Peer>,
     router: Router,
     tun_tx: mpsc::Sender<Vec<u8>>,
     next_index: u32,
@@ -407,6 +416,7 @@ impl WgDevice {
                 secret,
                 public,
                 peers: HashMap::new(),
+                probes: HashMap::new(),
                 router: Router::new(),
                 tun_tx,
                 next_index: 1,
@@ -657,9 +667,31 @@ impl WgDevice {
         dst: SocketAddr,
         initiate: bool,
     ) {
+        if let Some(peer) = self
+            .make_direct_peer(sock, peer_public, overlay_ip, dst, initiate)
+            .await
+        {
+            self.router.upsert(overlay_ip, peer_public);
+            self.peers.insert(peer_public, peer);
+        }
+    }
+
+    /// Build a direct-carrier [`Peer`] (fresh `Tunn` + demux registration +
+    /// keepalive/retransmit timer task; a handshake init when `initiate`).
+    /// Shared by [`add_direct_peer`] (installs into the routing `peers` map) and
+    /// [`start_direct_probe`] (installs into the shadow `probes` map). `None` if
+    /// the direct demux hasn't been set up — `ensure_direct_demux` must precede.
+    async fn make_direct_peer(
+        &mut self,
+        sock: Arc<UdpSocket>,
+        peer_public: [u8; 32],
+        overlay_ip: Ipv4Addr,
+        dst: SocketAddr,
+        initiate: bool,
+    ) -> Option<Peer> {
         let Some(demux) = &self.direct else {
-            warn!("wg: add_direct_peer before ensure_direct_demux; ignoring");
-            return;
+            warn!("wg: make_direct_peer before ensure_direct_demux; ignoring");
+            return None;
         };
         // Send from the interface-bound socket that shares the peer's subnet
         // (rc.143) — forces egress out the right NIC past a full-tunnel VPN.
@@ -700,30 +732,123 @@ impl WgDevice {
             }
         });
 
-        self.router.upsert(overlay_ip, peer_public);
-        self.peers.insert(
-            peer_public,
-            Peer {
-                tunn: tunn.clone(),
-                carrier: carrier.clone(),
-                overlay_ip,
-                tasks: vec![timer_task],
-                stats,
-                direct_src: Some(dst),
-            },
-        );
-
         if initiate {
+            let it = tunn.clone();
+            let ic = carrier.clone();
             tokio::spawn(async move {
                 let mut buf = vec![0u8; WG_BUF];
-                let mut t = tunn.lock().await;
+                let mut t = it.lock().await;
                 if let TunnResult::WriteToNetwork(b) =
                     t.format_handshake_initiation(&mut buf, false)
                 {
-                    let _ = carrier.send(b).await;
+                    let _ = ic.send(b).await;
                 }
             });
         }
+
+        Some(Peer {
+            tunn,
+            carrier,
+            overlay_ip,
+            tasks: vec![timer_task],
+            stats,
+            direct_src: Some(dst),
+        })
+    }
+
+    /// Make-before-break (rc.208) — start a shadow direct-carrier PROBE for a
+    /// peer that currently has an ACTIVE carrier (typically relay). The probe
+    /// gets its own `Tunn` toward `dst`, but is held in `probes` (NOT the routing
+    /// `peers` map), so the peer's traffic keeps flowing over its active carrier,
+    /// untouched. Promote with [`promote_direct_probe`] once
+    /// [`probe_handshake_done`] latches (proof the direct path works BOTH ways),
+    /// or drop it with [`drop_direct_probe`] on the tier deadline — the active
+    /// carrier never stalls. Idempotent: replaces any prior probe for this peer.
+    ///
+    /// `initiate` ⇒ send a handshake init now (the OUTBOUND upgrade — we dial the
+    /// peer). `false` ⇒ don't initiate (the INBOUND accept — the peer already
+    /// sent us an init; the caller answers it via [`feed_direct`] on the probe's
+    /// `dst`, which the probe registered in the demux).
+    pub async fn start_direct_probe(
+        &mut self,
+        sock: Arc<UdpSocket>,
+        peer_public: [u8; 32],
+        overlay_ip: Ipv4Addr,
+        dst: SocketAddr,
+        initiate: bool,
+    ) {
+        self.drop_direct_probe(&peer_public).await;
+        if let Some(peer) = self
+            .make_direct_peer(sock, peer_public, overlay_ip, dst, initiate)
+            .await
+        {
+            // Deliberately NOT added to the router — routing stays on the active
+            // (relay) peer in `peers` until this probe is promoted.
+            self.probes.insert(peer_public, peer);
+        }
+    }
+
+    /// Make-before-break — has the shadow probe for `peer_public` completed its
+    /// WG handshake? A latched handshake means our INIT reached the peer AND its
+    /// response reached us, so the direct path is proven BIDIRECTIONAL. `None`
+    /// when no probe is in flight.
+    pub fn probe_handshake_done(&self, peer_public: &[u8; 32]) -> Option<bool> {
+        Some(
+            self.probes
+                .get(peer_public)?
+                .stats
+                .handshake
+                .load(Ordering::Relaxed),
+        )
+    }
+
+    /// Make-before-break — is a shadow probe in flight for `peer_public`?
+    pub fn has_direct_probe(&self, peer_public: &[u8; 32]) -> bool {
+        self.probes.contains_key(peer_public)
+    }
+
+    /// Make-before-break — promote a latched probe to the ACTIVE carrier: the
+    /// probe `Tunn` replaces the peer's current carrier in the routing `peers`
+    /// map, and the old carrier is dropped (its `Peer::drop` aborts the recv/
+    /// timer tasks). The probe's demux registration stays — it is the active
+    /// carrier's inbound now. `false` if there was no probe. The caller updates
+    /// its own per-peer bookkeeping and forgets the now-unused relay allocation.
+    pub fn promote_direct_probe(&mut self, peer_public: &[u8; 32]) -> bool {
+        if let Some(probe) = self.probes.remove(peer_public) {
+            self.router.upsert(probe.overlay_ip, *peer_public);
+            // Insert replaces + drops the old (relay) peer; Drop aborts its task.
+            self.peers.insert(*peer_public, probe);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Make-before-break — discard the shadow probe for `peer_public` (handshake
+    /// never latched within the deadline ⇒ the direct path is unreachable).
+    /// Un-registers its demux entry and aborts its timer task; the ACTIVE carrier
+    /// is untouched, so there is no stall. No-op if there is no probe.
+    pub async fn drop_direct_probe(&mut self, peer_public: &[u8; 32]) {
+        if let Some(probe) = self.probes.remove(peer_public)
+            && let (Some(src), Some(demux)) = (probe.direct_src, &self.direct)
+        {
+            demux.routes.lock().await.remove(&src);
+        }
+    }
+
+    /// Test-only: latch a probe's handshake-done flag without a live two-device
+    /// session (mirrors [`test_latch_handshake_done`] for the shadow map).
+    #[cfg(test)]
+    pub fn test_latch_probe_handshake_done(&self, peer_public: &[u8; 32]) {
+        if let Some(p) = self.probes.get(peer_public) {
+            p.stats.handshake.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Test-only: number of shadow probes currently in flight.
+    #[cfg(test)]
+    pub fn probe_count(&self) -> usize {
+        self.probes.len()
     }
 
     /// Remove a peer (drops its `Tunn` + aborts its tasks + clears its
@@ -1069,6 +1194,31 @@ async fn run_direct_demux(
     }
 }
 
+/// Test-only: build a genuine WG handshake INITIATION from `initiator_secret`,
+/// sealed to `responder_public`, so a [`WgDevice`] holding that responder key
+/// `authenticate_init`s it (recovering the initiator's public key). Used by the
+/// runtime's inbound-accept tests, which live in `runtime.rs` and can't reach
+/// boringtun's `Tunn` directly.
+#[cfg(test)]
+pub(crate) fn test_genuine_init(
+    initiator_secret: &StaticSecret,
+    responder_public: [u8; 32],
+) -> Vec<u8> {
+    let mut tunn = Tunn::new(
+        initiator_secret.clone(),
+        PublicKey::from(responder_public),
+        None,
+        None,
+        1,
+        None,
+    );
+    let mut buf = vec![0u8; WG_BUF];
+    match tunn.format_handshake_initiation(&mut buf, false) {
+        TunnResult::WriteToNetwork(b) => b.to_vec(),
+        _ => panic!("expected a handshake initiation"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Phase 2 proof: two userspace WG devices complete a handshake and
@@ -1096,6 +1246,58 @@ mod tests {
         p[16..20].copy_from_slice(&dst.octets());
         p[20..].copy_from_slice(payload);
         p
+    }
+
+    /// rc.208 make-before-break primitives — a shadow probe is isolated from the
+    /// routing `peers` map until PROMOTED, and dropping a probe never disturbs
+    /// the active carrier.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn direct_probe_is_isolated_from_routing_until_promoted() {
+        let kp = WgKeypair::generate();
+        let peer = WgKeypair::generate();
+        let (mut dev, _rx) = WgDevice::new(kp.secret.clone());
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        dev.ensure_direct_demux(sock.clone());
+        let pk = peer.public.to_bytes();
+        let overlay_ip = Ipv4Addr::new(100, 64, 0, 3);
+        let dst: SocketAddr = "127.0.0.1:9".parse().unwrap();
+
+        dev.start_direct_probe(sock, pk, overlay_ip, dst, true)
+            .await;
+        assert!(dev.has_direct_probe(&pk));
+        assert_eq!(dev.probe_count(), 1);
+        assert_eq!(dev.probe_handshake_done(&pk), Some(false));
+        // The probe is NOT in the routing map — traffic still can't reach the
+        // peer over it (routing stays on the active/relay carrier).
+        assert!(
+            dev.peer_traffic(&pk).is_none(),
+            "a probe must not join routing before it is promoted"
+        );
+
+        // The direct handshake completes → promote to the ACTIVE carrier.
+        dev.test_latch_probe_handshake_done(&pk);
+        assert_eq!(dev.probe_handshake_done(&pk), Some(true));
+        assert!(dev.promote_direct_probe(&pk));
+        assert_eq!(dev.probe_count(), 0, "promoted out of the shadow map");
+        assert!(!dev.has_direct_probe(&pk));
+        assert!(
+            dev.peer_traffic(&pk).is_some(),
+            "the promoted probe is now the active routing carrier"
+        );
+
+        // A later probe that fails is dropped WITHOUT disturbing the active
+        // carrier (distinct dst so the demux keys don't alias).
+        let sock2 = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let dst2: SocketAddr = "127.0.0.1:10".parse().unwrap();
+        dev.start_direct_probe(sock2, pk, overlay_ip, dst2, true)
+            .await;
+        assert_eq!(dev.probe_count(), 1);
+        dev.drop_direct_probe(&pk).await;
+        assert_eq!(dev.probe_count(), 0);
+        assert!(
+            dev.peer_traffic(&pk).is_some(),
+            "the active carrier survives an unrelated probe drop"
+        );
     }
 
     /// Poll `is_connected` until the handshake completes or we give up.
