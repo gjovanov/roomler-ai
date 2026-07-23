@@ -758,23 +758,28 @@ impl WgDevice {
 
     /// Make-before-break (rc.208) — start a shadow direct-carrier PROBE for a
     /// peer that currently has an ACTIVE carrier (typically relay). The probe
-    /// gets its own `Tunn` and sends a handshake init toward `dst`, but is held
-    /// in `probes` (NOT the routing `peers` map), so the peer's traffic keeps
-    /// flowing over its active carrier, untouched. Promote with
-    /// [`promote_direct_probe`] once [`probe_handshake_done`] latches (proof the
-    /// direct path works BOTH ways), or drop it with [`drop_direct_probe`] on the
-    /// tier deadline — the active carrier never stalls. Idempotent: replaces any
-    /// prior probe for this peer.
+    /// gets its own `Tunn` toward `dst`, but is held in `probes` (NOT the routing
+    /// `peers` map), so the peer's traffic keeps flowing over its active carrier,
+    /// untouched. Promote with [`promote_direct_probe`] once
+    /// [`probe_handshake_done`] latches (proof the direct path works BOTH ways),
+    /// or drop it with [`drop_direct_probe`] on the tier deadline — the active
+    /// carrier never stalls. Idempotent: replaces any prior probe for this peer.
+    ///
+    /// `initiate` ⇒ send a handshake init now (the OUTBOUND upgrade — we dial the
+    /// peer). `false` ⇒ don't initiate (the INBOUND accept — the peer already
+    /// sent us an init; the caller answers it via [`feed_direct`] on the probe's
+    /// `dst`, which the probe registered in the demux).
     pub async fn start_direct_probe(
         &mut self,
         sock: Arc<UdpSocket>,
         peer_public: [u8; 32],
         overlay_ip: Ipv4Addr,
         dst: SocketAddr,
+        initiate: bool,
     ) {
         self.drop_direct_probe(&peer_public).await;
         if let Some(peer) = self
-            .make_direct_peer(sock, peer_public, overlay_ip, dst, true)
+            .make_direct_peer(sock, peer_public, overlay_ip, dst, initiate)
             .await
         {
             // Deliberately NOT added to the router — routing stays on the active
@@ -1189,6 +1194,31 @@ async fn run_direct_demux(
     }
 }
 
+/// Test-only: build a genuine WG handshake INITIATION from `initiator_secret`,
+/// sealed to `responder_public`, so a [`WgDevice`] holding that responder key
+/// `authenticate_init`s it (recovering the initiator's public key). Used by the
+/// runtime's inbound-accept tests, which live in `runtime.rs` and can't reach
+/// boringtun's `Tunn` directly.
+#[cfg(test)]
+pub(crate) fn test_genuine_init(
+    initiator_secret: &StaticSecret,
+    responder_public: [u8; 32],
+) -> Vec<u8> {
+    let mut tunn = Tunn::new(
+        initiator_secret.clone(),
+        PublicKey::from(responder_public),
+        None,
+        None,
+        1,
+        None,
+    );
+    let mut buf = vec![0u8; WG_BUF];
+    match tunn.format_handshake_initiation(&mut buf, false) {
+        TunnResult::WriteToNetwork(b) => b.to_vec(),
+        _ => panic!("expected a handshake initiation"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Phase 2 proof: two userspace WG devices complete a handshake and
@@ -1232,7 +1262,8 @@ mod tests {
         let overlay_ip = Ipv4Addr::new(100, 64, 0, 3);
         let dst: SocketAddr = "127.0.0.1:9".parse().unwrap();
 
-        dev.start_direct_probe(sock, pk, overlay_ip, dst).await;
+        dev.start_direct_probe(sock, pk, overlay_ip, dst, true)
+            .await;
         assert!(dev.has_direct_probe(&pk));
         assert_eq!(dev.probe_count(), 1);
         assert_eq!(dev.probe_handshake_done(&pk), Some(false));
@@ -1258,7 +1289,8 @@ mod tests {
         // carrier (distinct dst so the demux keys don't alias).
         let sock2 = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let dst2: SocketAddr = "127.0.0.1:10".parse().unwrap();
-        dev.start_direct_probe(sock2, pk, overlay_ip, dst2).await;
+        dev.start_direct_probe(sock2, pk, overlay_ip, dst2, true)
+            .await;
         assert_eq!(dev.probe_count(), 1);
         dev.drop_direct_probe(&pk).await;
         assert_eq!(dev.probe_count(), 0);

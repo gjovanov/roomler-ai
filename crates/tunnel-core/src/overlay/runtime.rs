@@ -1483,13 +1483,13 @@ impl OverlayRuntime {
                 maybe_init = async {
                     match direct_events.as_mut() {
                         Some(rx) => rx.recv().await,
-                        None => std::future::pending::<Option<super::wg::DirectInbound>>().await,
+                        None => std::future::pending::<Option<crate::overlay::wg::DirectInbound>>().await,
                     }
                 } => {
                     if let Some(inb) = maybe_init {
                         self.handle_direct_inbound(
                             &mut wg, &mut by_node, &mut relay, &tun,
-                            &current_peers, &mut cooldowns, inb,
+                            &current_peers, &mut cooldowns, &mut upgrade_probes, inb,
                         ).await;
                         self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
                         self.publish_view(&self_ip, &by_node, &current_peers, exit_node_status(self.exit_node.as_deref(), &exit_state));
@@ -2150,7 +2150,8 @@ impl OverlayRuntime {
         now: Instant,
     ) {
         wg.ensure_direct_demux(sock.clone());
-        wg.start_direct_probe(sock, cfg.public_key, cfg.overlay_ip, dst)
+        // Outbound upgrade: WE dial the peer, so initiate the handshake.
+        wg.start_direct_probe(sock, cfg.public_key, cfg.overlay_ip, dst, true)
             .await;
         upgrade_probes.insert(
             node_id,
@@ -2420,7 +2421,7 @@ impl OverlayRuntime {
     }
 
     /// Phase A — act on an AUTHENTICATED inbound direct handshake initiation
-    /// forwarded by a demux loop ([`super::wg::DirectInbound`]): a NAT'd client
+    /// forwarded by a demux loop ([`crate::overlay::wg::DirectInbound`]): a NAT'd client
     /// dialing our advertised public endpoint (the exit-side accept — we can't
     /// know its NAT'd source ahead of time), or a known peer that restarted /
     /// roamed onto a new ephemeral port. Installs (or re-points) that peer onto
@@ -2434,6 +2435,7 @@ impl OverlayRuntime {
     /// maps to a CURRENT netmap peer (server-ACL-authorised) is acted on. A peer
     /// cooling down on the matching tier is left on relay (anti-thrash).
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     async fn handle_direct_inbound(
         &self,
         wg: &mut WgDevice,
@@ -2442,7 +2444,8 @@ impl OverlayRuntime {
         tun: &Arc<dyn TunIo>,
         current_peers: &HashMap<ObjectId, NetmapPeer>,
         cooldowns: &mut DirectCooldowns,
-        inb: super::wg::DirectInbound,
+        upgrade_probes: &mut HashMap<ObjectId, UpgradeProbe>,
+        inb: crate::overlay::wg::DirectInbound,
     ) {
         let Some(pubkey) = wg.authenticate_init(&inb.packet) else {
             return; // unparseable / forged — drop
@@ -2472,6 +2475,7 @@ impl OverlayRuntime {
         // other public source is a direct-to-public dial (Phase A); a private
         // source is a same-LAN roam.
         let now = Instant::now();
+        let make_before_break = super::direct::make_before_break_enabled();
         let is_public_src = matches!(inb.src, SocketAddr::V4(v4) if direct::is_public_v4(*v4.ip()));
         let src_str = inb.src.to_string();
         let is_srflx_src = is_public_src && np.srflx_endpoints.iter().any(|e| e.trim() == src_str);
@@ -2501,6 +2505,50 @@ impl OverlayRuntime {
             return;
         }
 
+        // rc.208 make-before-break (inbound): when enabled and the peer is
+        // currently on RELAY, accept the peer's direct init as a SHADOW PROBE
+        // (its own `Tunn` in `WgDevice::probes`) and answer the init on it via
+        // `feed_direct`, WITHOUT tearing down the relay. `sweep_upgrade_probes`
+        // cuts over only once the probe's handshake latches (proof our response
+        // reached the peer AND its follow-up reached us — the reverse direction
+        // works). If it never latches, the probe is dropped and the relay is
+        // untouched — so a peer whose direct init reaches us over a path that
+        // can't carry OUR reply (one-way) doesn't cost us the relay.
+        if make_before_break {
+            // A retransmitted init while we're already probing this src → just
+            // answer it and let the in-flight probe keep converging.
+            if wg.has_direct_probe(&pubkey) {
+                wg.feed_direct(inb.src, inb.sock.clone(), &inb.packet).await;
+                return;
+            }
+            // Only probe when there's a working relay to protect. A fresh peer
+            // (nothing installed) or one already on direct-via-another-src falls
+            // through to the destructive re-point — no relay is at risk there.
+            if by_node.get(&node_id).is_some_and(|e| !e.is_direct) {
+                wg.ensure_direct_demux(inb.sock.clone());
+                // Inbound: DON'T initiate — the peer already sent the init; we
+                // answer it on the probe via `feed_direct` below.
+                wg.start_direct_probe(inb.sock.clone(), pubkey, cfg.overlay_ip, inb.src, false)
+                    .await;
+                wg.feed_direct(inb.src, inb.sock.clone(), &inb.packet).await;
+                upgrade_probes.insert(
+                    node_id,
+                    UpgradeProbe {
+                        pubkey,
+                        overlay_ip: cfg.overlay_ip,
+                        dst: inb.src,
+                        tier,
+                        since: now,
+                    },
+                );
+                info!(
+                    peer = %node_id, src = %inb.src, ?tier,
+                    "overlay: make-before-break — accepted inbound direct handshake as a PROBE (relay held)"
+                );
+                return;
+            }
+        }
+
         // Re-point: drop any existing carrier (relay or direct-on-another-src)
         // and any pending relay request, then install direct on the arriving
         // socket keyed by the init's source. `initiate = false` — the peer
@@ -2510,6 +2558,12 @@ impl OverlayRuntime {
         }
         if let Some(r) = relay.as_mut() {
             r.forget(&node_id);
+        }
+        // rc.208 — if a stale probe lingers for this peer (feature toggled off
+        // mid-session, or a direct-on-another-src re-point), discard it so it
+        // can't later promote over the carrier we install here.
+        if upgrade_probes.remove(&node_id).is_some() {
+            wg.drop_direct_probe(&pubkey).await;
         }
         wg.ensure_direct_demux(inb.sock.clone());
         wg.add_direct_peer(inb.sock.clone(), pubkey, cfg.overlay_ip, inb.src, false)
@@ -3242,7 +3296,8 @@ mod tests {
         let dead: SocketAddr = "127.0.0.1:9".parse().unwrap();
         let overlay_ip = Ipv4Addr::new(100, 64, 0, 7);
         let pk = peer_kp.public.to_bytes();
-        wg.start_direct_probe(sock, pk, overlay_ip, dead).await;
+        wg.start_direct_probe(sock, pk, overlay_ip, dead, true)
+            .await;
 
         let nid = ObjectId::from_bytes([9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         let mut by_node = HashMap::new();
@@ -3392,6 +3447,115 @@ mod tests {
             cooldowns.srflx_fails.is_empty(),
             "no strike while the probe is still pending"
         );
+    }
+
+    /// rc.208 make-before-break INBOUND — an authenticated direct init arriving
+    /// while the peer is on RELAY is accepted as a SHADOW PROBE (relay held), not
+    /// a destructive re-point. With the feature OFF (the default) the same init
+    /// tears the relay down and installs direct immediately.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mbb_inbound_accepts_init_as_probe_and_holds_relay() {
+        let our = WgKeypair::generate();
+        let peer_kp = WgKeypair::generate();
+        let (out_tx, _out_rx) = mpsc::channel::<ClientMsg>(16);
+        let (tun_mock, _inj, _del) = MockTun::new();
+        let tf: TunFactory = {
+            let m = tun_mock.clone();
+            Box::new(move |_, _, _| Ok(m.clone() as Arc<dyn TunIo>))
+        };
+        let rt = OverlayRuntime::new_relay(our.clone(), out_tx, tf, 1280);
+        let tun: Arc<dyn TunIo> = tun_mock;
+
+        // A private (LAN) source → tier Lan, no cooldown gating.
+        let src: SocketAddr = "192.168.50.9:41000".parse().unwrap();
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let np = peer(&peer_kp, "100.64.0.7");
+        let nid = np.node_id;
+        let mut current_peers = HashMap::new();
+        current_peers.insert(nid, np);
+        let relay_installed = || Installed {
+            pubkey: peer_kp.public.to_bytes(),
+            overlay_ip: Ipv4Addr::new(100, 64, 0, 7),
+            is_direct: false,
+            since: Instant::now(),
+            last_traffic: (0, 0),
+            bad_sweeps: 0,
+            last_rx_at: Instant::now(),
+            relay_local: None,
+            relay_dst: None,
+            public_direct_dst: None,
+            tier: DirectTier::Relay,
+        };
+        let mut cooldowns = DirectCooldowns::default();
+        let mut relay: Option<RelayCoordinator> = None;
+
+        // Serialize env mutation (the CI overlay-l3 suite runs --test-threads=1).
+        let key = "ROOMLER_NODE_OVERLAY_MBB";
+        let restore = std::env::var(key).ok();
+
+        // ── MBB ON: accept as a probe, hold the relay ──
+        unsafe { std::env::set_var(key, "1") };
+        let (mut wg, _rx) = WgDevice::new(our.secret.clone());
+        let mut by_node = HashMap::from([(nid, relay_installed())]);
+        let mut probes = HashMap::new();
+        let inb = crate::overlay::wg::DirectInbound {
+            src,
+            sock: sock.clone(),
+            packet: crate::overlay::wg::test_genuine_init(&peer_kp.secret, our.public.to_bytes()),
+        };
+        rt.handle_direct_inbound(
+            &mut wg,
+            &mut by_node,
+            &mut relay,
+            &tun,
+            &current_peers,
+            &mut cooldowns,
+            &mut probes,
+            inb,
+        )
+        .await;
+        assert_eq!(
+            wg.probe_count(),
+            1,
+            "inbound init accepted as a shadow probe"
+        );
+        assert!(probes.contains_key(&nid), "the probe is recorded");
+        let inst = by_node.get(&nid).expect("still tracked");
+        assert!(!inst.is_direct, "the RELAY carrier is HELD, not destroyed");
+        assert_eq!(inst.tier, DirectTier::Relay);
+
+        // ── MBB OFF: the same init destructively re-points to direct ──
+        unsafe { std::env::set_var(key, "0") };
+        let (mut wg2, _rx2) = WgDevice::new(our.secret.clone());
+        let mut by_node2 = HashMap::from([(nid, relay_installed())]);
+        let mut probes2 = HashMap::new();
+        let inb2 = crate::overlay::wg::DirectInbound {
+            src,
+            sock: sock.clone(),
+            packet: crate::overlay::wg::test_genuine_init(&peer_kp.secret, our.public.to_bytes()),
+        };
+        rt.handle_direct_inbound(
+            &mut wg2,
+            &mut by_node2,
+            &mut relay,
+            &tun,
+            &current_peers,
+            &mut cooldowns,
+            &mut probes2,
+            inb2,
+        )
+        .await;
+        assert_eq!(wg2.probe_count(), 0, "MBB off → no probe");
+        assert!(probes2.is_empty());
+        assert!(
+            by_node2.get(&nid).expect("tracked").is_direct,
+            "MBB off → destructive re-point to a DIRECT carrier (pre-rc.208)"
+        );
+
+        match restore {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        };
     }
 
     /// rc.206 — the silent-zombie backstop. An ESTABLISHED direct carrier whose
