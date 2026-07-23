@@ -62,7 +62,7 @@ webrtc-ice = { path = "crates/vendored/webrtc-ice" }
 webrtc = { path = "crates/vendored/webrtc" }
 
 [workspace.package]
-version = "0.3.0-rc.208"
+version = "0.3.0-rc.209"
 edition = "2024"
 authors = ["Goran Jovanov <goran.jovanov@gmail.com>"]
 license = "MIT"
