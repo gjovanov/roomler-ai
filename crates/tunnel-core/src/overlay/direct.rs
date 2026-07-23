@@ -166,33 +166,38 @@ pub fn public_direct_enabled() -> bool {
     }
 }
 
-/// rc.208 — gate for **make-before-break** carrier upgrades
+/// Gate for **make-before-break** carrier upgrades
 /// (`ROOMLER_NODE_OVERLAY_MBB`; legacy `ROOMLER_AGENT_…` alias honoured).
-/// **Default OFF** until field-proven on the netns NAT lab, mirroring every
-/// other carrier-tier gate's arc.
+/// **Default ON since rc.210** — field-proven 2026-07-25 on the netns NAT lab
+/// (mars↔zeus, the false-same-/24-LAN-match freeze scenario): MBB=1 held the
+/// relay while a doomed direct upgrade was probed then dropped it ("kept relay
+/// (no stall)"), where MBB=0 tore the relay down ("upgrading relay peer to
+/// direct LAN carrier"). Disable per-host with `ROOMLER_NODE_OVERLAY_MBB=0`
+/// (kill-switch): only an explicit `0`/`false`/`no`/`off` turns it back off;
+/// unset / truthy / anything else keeps the default ON.
 ///
-/// When ON, a relay→direct UPGRADE installs the candidate direct carrier as a
-/// SHADOW PROBE (its own `Tunn`, in `WgDevice::probes`) while the working relay
-/// keeps routing, and only cuts over once the probe's handshake latches (proof
-/// the direct path works both ways). If the probe never latches within the
-/// tier's deadline it is dropped and the relay is untouched — so a peer that can
-/// only ever relay (same-NAT AP-isolation / no hairpin) never suffers the
-/// ~15–38 s freeze the old break-before-make upgrade caused every re-upgrade
-/// tick (it tore the relay down, gambled on an unreachable direct path, then
-/// re-established relay). Off ⇒ the pre-rc.208 destructive upgrade, byte-for-
-/// byte. Only the OUTBOUND upgrade is covered in rc.208; the inbound-accept path
-/// (`handle_direct_inbound`) stays destructive (documented follow-up) — harmless
-/// for the symmetric-block case, where no direct packets cross either way.
+/// A relay→direct UPGRADE installs the candidate direct carrier as a SHADOW
+/// PROBE (its own `Tunn`, in `WgDevice::probes`) while the working relay keeps
+/// routing, and only cuts over once the probe's handshake latches (proof the
+/// direct path works both ways). If the probe never latches within the tier's
+/// deadline it is dropped and the relay is untouched — so a peer that can only
+/// ever relay (same-NAT AP-isolation / no hairpin) never suffers the ~15–38 s
+/// freeze the old break-before-make upgrade caused every re-upgrade tick (it
+/// tore the relay down, gambled on an unreachable direct path, then
+/// re-established relay). `=0` ⇒ the pre-rc.208 destructive upgrade, byte-for-
+/// byte. Covers BOTH the outbound upgrade AND the inbound-accept path
+/// (`handle_direct_inbound`) since rc.209.
 pub fn make_before_break_enabled() -> bool {
     match crate::env::node_env("OVERLAY_MBB") {
         Some(v) => {
             let t = v.trim();
-            t.eq_ignore_ascii_case("1")
-                || t.eq_ignore_ascii_case("true")
-                || t.eq_ignore_ascii_case("yes")
-                || t.eq_ignore_ascii_case("on")
+            // Explicit kill-switch only; everything else keeps the default ON.
+            !(t.eq_ignore_ascii_case("0")
+                || t.eq_ignore_ascii_case("false")
+                || t.eq_ignore_ascii_case("no")
+                || t.eq_ignore_ascii_case("off"))
         }
-        None => false,
+        None => true,
     }
 }
 
@@ -570,6 +575,38 @@ pub fn srflx_punch_worth_trying(mine: Option<&str>, peer: Option<&str>) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// rc.210 — make-before-break is DEFAULT-ON with an explicit kill-switch.
+    /// (Serialises env mutation; the overlay-l3 suite runs `--test-threads=1`.)
+    #[test]
+    fn make_before_break_defaults_on_with_kill_switch() {
+        let n = "ROOMLER_NODE_OVERLAY_MBB";
+        let a = "ROOMLER_AGENT_OVERLAY_MBB";
+        let (rn, ra) = (std::env::var(n).ok(), std::env::var(a).ok());
+        unsafe {
+            std::env::remove_var(n);
+            std::env::remove_var(a);
+        }
+        assert!(make_before_break_enabled(), "unset → default ON");
+        for v in ["1", "true", "on", "yes", "", "  ", "anything"] {
+            unsafe { std::env::set_var(n, v) };
+            assert!(make_before_break_enabled(), "{v:?} → ON");
+        }
+        for v in ["0", "false", "FALSE", "No", "off", " off "] {
+            unsafe { std::env::set_var(n, v) };
+            assert!(!make_before_break_enabled(), "{v:?} → kill-switch OFF");
+        }
+        unsafe {
+            match rn {
+                Some(v) => std::env::set_var(n, v),
+                None => std::env::remove_var(n),
+            }
+            match ra {
+                Some(v) => std::env::set_var(a, v),
+                None => std::env::remove_var(a),
+            }
+        }
+    }
 
     #[test]
     fn cgnat_and_lan_classification() {
