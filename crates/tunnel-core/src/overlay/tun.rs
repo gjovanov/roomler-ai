@@ -100,6 +100,143 @@ mod system {
 
     use super::TunIo;
 
+    // rc.208 — `AsyncDevice::tun_luid` (the wintun interface LUID) for the
+    // IP Helper route ops; also used by the WFP guard in `up()`.
+    #[cfg(target_os = "windows")]
+    use tun::AbstractDeviceExt as _;
+
+    /// `(address, prefix_len)` from a `"addr/len"` CIDR string (v4 or v6).
+    #[cfg(windows)]
+    fn parse_cidr(s: &str) -> Option<(std::net::IpAddr, u8)> {
+        let (ip, len) = s.split_once('/')?;
+        Some((ip.parse().ok()?, len.parse().ok()?))
+    }
+
+    #[cfg(all(test, windows))]
+    mod winroute_tests {
+        use super::parse_cidr;
+        use std::net::IpAddr;
+
+        #[test]
+        fn parse_cidr_v4_v6_and_rejects_junk() {
+            let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+            assert_eq!(parse_cidr("0.0.0.0/1"), Some((ip("0.0.0.0"), 1)));
+            assert_eq!(parse_cidr("128.0.0.0/1"), Some((ip("128.0.0.0"), 1)));
+            assert_eq!(parse_cidr("100.64.0.2/32"), Some((ip("100.64.0.2"), 32)));
+            assert_eq!(parse_cidr("::/1"), Some((ip("::"), 1)));
+            assert_eq!(parse_cidr("8000::/1"), Some((ip("8000::"), 1)));
+            assert_eq!(parse_cidr("no-slash"), None);
+            assert_eq!(parse_cidr("1.2.3.4/999"), None); // prefix > u8::MAX
+            assert_eq!(parse_cidr("not-an-ip/8"), None);
+        }
+    }
+
+    /// rc.208 — Windows overlay route ops via the IP Helper API instead of
+    /// spawning `route.exe`/`netsh`. A netsh route add/delete costs ~0.3–2 s
+    /// (process spawn + servicing), and firing 8 peers × delete-then-add every
+    /// 2 s (the route-guard) periodically stalled the Windows overlay DATA plane
+    /// for ~2 s — the field-observed ~1.8 s RTT (raw internet to the same host:
+    /// ~40 ms). `CreateIpForwardEntry2` / `DeleteIpForwardEntry2` are in-memory
+    /// FIB calls (~µs), so the stall disappears. Routes are on-link `/N`s on the
+    /// wintun adapter (looked up by LUID via `AsyncDevice::tun_luid`).
+    #[cfg(windows)]
+    mod winroute {
+        use std::net::{IpAddr, Ipv4Addr};
+        use windows_sys::Win32::Foundation::{ERROR_OBJECT_ALREADY_EXISTS, NO_ERROR};
+        use windows_sys::Win32::NetworkManagement::IpHelper::{
+            CreateIpForwardEntry2, DeleteIpForwardEntry2, FreeMibTable, GetIpForwardTable2,
+            InitializeIpForwardEntry, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2,
+        };
+        use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
+        use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6, SOCKADDR_INET};
+
+        /// A zeroed `SOCKADDR_INET` carrying `ip`'s family + address only.
+        fn sockaddr(ip: IpAddr) -> SOCKADDR_INET {
+            // SAFETY: SOCKADDR_INET is a POD union; zero it, then write the
+            // active v4/v6 arm's family + address (the documented init pattern).
+            unsafe {
+                let mut sa: SOCKADDR_INET = std::mem::zeroed();
+                match ip {
+                    IpAddr::V4(v4) => {
+                        sa.Ipv4.sin_family = AF_INET;
+                        sa.Ipv4.sin_addr.S_un.S_addr = u32::from_ne_bytes(v4.octets());
+                    }
+                    IpAddr::V6(v6) => {
+                        sa.Ipv6.sin6_family = AF_INET6;
+                        sa.Ipv6.sin6_addr.u.Byte = v6.octets();
+                    }
+                }
+                sa
+            }
+        }
+
+        /// A route row for `dest/plen` on `luid`, next-hop unspecified (on-link).
+        fn make_row(luid: u64, dest: IpAddr, plen: u8, metric: u32) -> MIB_IPFORWARD_ROW2 {
+            // SAFETY: InitializeIpForwardEntry fills a zeroed row with valid
+            // defaults; we override the LUID / prefix / next-hop / metric.
+            unsafe {
+                let mut r: MIB_IPFORWARD_ROW2 = std::mem::zeroed();
+                InitializeIpForwardEntry(&mut r);
+                r.InterfaceLuid = NET_LUID_LH { Value: luid };
+                r.DestinationPrefix.Prefix = sockaddr(dest);
+                r.DestinationPrefix.PrefixLength = plen;
+                let mut nh: SOCKADDR_INET = std::mem::zeroed();
+                nh.si_family = if dest.is_ipv4() { AF_INET } else { AF_INET6 };
+                r.NextHop = nh;
+                r.Metric = metric;
+                r
+            }
+        }
+
+        /// Add (idempotent) an on-link route `dest/plen` via `luid`.
+        pub fn add(luid: u64, dest: IpAddr, plen: u8, metric: u32) -> std::io::Result<()> {
+            let r = make_row(luid, dest, plen, metric);
+            // SAFETY: `r` is a fully-initialised row; the API copies it.
+            let rc = unsafe { CreateIpForwardEntry2(&r) };
+            if rc == NO_ERROR || rc == ERROR_OBJECT_ALREADY_EXISTS {
+                Ok(())
+            } else {
+                Err(std::io::Error::from_raw_os_error(rc as i32))
+            }
+        }
+
+        /// Delete our `dest/plen` route on `luid` (best-effort — a missing route
+        /// is fine).
+        pub fn del(luid: u64, dest: IpAddr, plen: u8) {
+            let r = make_row(luid, dest, plen, 0);
+            // SAFETY: `r` carries the LUID + prefix the API matches on.
+            unsafe { DeleteIpForwardEntry2(&r) };
+        }
+
+        /// Evict any `dest/plen` route on an interface OTHER than `ours` — the
+        /// full-tunnel-VPN route war (Check Point installs a competing `/32` per
+        /// overlay peer). Snapshots the v4 FIB (in-memory, ~µs) and deletes the
+        /// competing entries so our wintun route wins.
+        pub fn evict_competing_v4(ours: u64, dest: Ipv4Addr, plen: u8) {
+            let want = u32::from_ne_bytes(dest.octets());
+            // SAFETY: GetIpForwardTable2 allocates a snapshot we iterate then
+            // free; every union read is guarded by the `si_family` check.
+            unsafe {
+                let mut table: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+                if GetIpForwardTable2(AF_INET, &mut table) != NO_ERROR || table.is_null() {
+                    return;
+                }
+                let n = (*table).NumEntries as usize;
+                let rows = std::slice::from_raw_parts((*table).Table.as_ptr(), n);
+                for r in rows {
+                    if r.DestinationPrefix.PrefixLength == plen
+                        && r.DestinationPrefix.Prefix.si_family == AF_INET
+                        && r.DestinationPrefix.Prefix.Ipv4.sin_addr.S_un.S_addr == want
+                        && r.InterfaceLuid.Value != ours
+                    {
+                        DeleteIpForwardEntry2(r);
+                    }
+                }
+                FreeMibTable(table as *const core::ffi::c_void);
+            }
+        }
+    }
+
     /// A live OS TUN device. `tun::AsyncDevice::{recv,send}` take `&self`,
     /// so a single `Arc<AsyncDevice>` backs the bridge's concurrent read
     /// + write loops.
@@ -188,7 +325,6 @@ mod system {
             // matters on hosts where the firewall is the blocker.
             #[cfg(windows)]
             let _wfp = if crate::overlay::wfp::wfp_enabled() {
-                use tun::AbstractDeviceExt as _;
                 let luid = dev.tun_luid();
                 match crate::overlay::wfp::WfpGuard::install(luid) {
                     Ok(g) => {
@@ -292,38 +428,24 @@ mod system {
         async fn add_peer_route(&self, peer: Ipv4Addr) -> std::io::Result<()> {
             #[cfg(target_os = "windows")]
             {
-                // A full-tunnel VPN (Check Point Endpoint) installs a competing
-                // `/32` for each overlay peer via its own NIC at metric 1, which
-                // swallows overlay traffic. The overlay OWNS 100.64.0.0/10, so
-                // any non-wintun route for a peer is wrong by construction:
-                // evict ALL `/32`s for this IP (cross-interface `route delete`),
-                // then (re-)add ours via the wintun at a low metric so it wins
-                // even if the VPN re-adds later. `route delete` erroring (no
-                // such route on first install) is expected → ignored.
-                let _ = run_cmd(
-                    "route",
-                    vec![
-                        "delete".into(),
-                        peer.to_string(),
-                        "mask".into(),
-                        "255.255.255.255".into(),
-                    ],
-                )
-                .await;
-                run_cmd(
-                    "netsh",
-                    vec![
-                        "interface".into(),
-                        "ipv4".into(),
-                        "add".into(),
-                        "route".into(),
-                        format!("prefix={peer}/32"),
-                        format!("interface={IF_NAME}"),
-                        "metric=1".into(),
-                        "store=active".into(),
-                    ],
-                )
-                .await
+                // rc.208 — IP Helper instead of `route.exe`/`netsh` (see
+                // `winroute`). A full-tunnel VPN (Check Point Endpoint) installs a
+                // competing `/32` for each overlay peer via its own NIC at metric
+                // 1, which swallows overlay traffic. The overlay OWNS
+                // 100.64.0.0/10, so any non-wintun `/32` for a peer is wrong by
+                // construction: evict competing `/32`s on OTHER interfaces, then
+                // (re-)add ours on the wintun so it wins even if the VPN re-adds
+                // later. Both calls are in-memory FIB ops (~µs), so they no longer
+                // head-of-line-stall the data plane.
+                let luid = self.dev.tun_luid();
+                winroute::evict_competing_v4(luid, peer, 32);
+                // The metric MUST stay constant here: `add` is idempotent and
+                // SKIPS on ALREADY_EXISTS, and nothing else writes routes on our
+                // private wintun LUID (eviction only touches FOREIGN LUIDs), so a
+                // re-assert of an already-present route is a legitimate no-op. If
+                // the per-peer metric ever becomes dynamic, this path would need a
+                // delete-first like `add_cidr_route`, else the change is masked.
+                winroute::add(luid, std::net::IpAddr::V4(peer), 32, 1)
             }
             #[cfg(target_os = "linux")]
             {
@@ -348,18 +470,7 @@ mod system {
 
         async fn del_peer_route(&self, peer: Ipv4Addr) {
             #[cfg(target_os = "windows")]
-            let _ = run_cmd(
-                "netsh",
-                vec![
-                    "interface".into(),
-                    "ipv4".into(),
-                    "delete".into(),
-                    "route".into(),
-                    format!("prefix={peer}/32"),
-                    format!("interface={IF_NAME}"),
-                ],
-            )
-            .await;
+            winroute::del(self.dev.tun_luid(), std::net::IpAddr::V4(peer), 32);
             #[cfg(target_os = "linux")]
             let _ = run_cmd(
                 "ip",
@@ -391,33 +502,15 @@ mod system {
             let v6 = is_v6_cidr(cidr);
             #[cfg(target_os = "windows")]
             {
-                let family = if v6 { "ipv6" } else { "ipv4" };
-                let _ = run_cmd(
-                    "netsh",
-                    vec![
-                        "interface".into(),
-                        family.into(),
-                        "delete".into(),
-                        "route".into(),
-                        format!("prefix={cidr}"),
-                        format!("interface={IF_NAME}"),
-                    ],
-                )
-                .await;
-                run_cmd(
-                    "netsh",
-                    vec![
-                        "interface".into(),
-                        family.into(),
-                        "add".into(),
-                        "route".into(),
-                        format!("prefix={cidr}"),
-                        format!("interface={IF_NAME}"),
-                        "metric=1".into(),
-                        "store=active".into(),
-                    ],
-                )
-                .await
+                // rc.208 — IP Helper (see `winroute`); mirrors the old
+                // netsh delete-then-add on OUR interface, but in-memory (~µs).
+                let _ = v6;
+                let (addr, plen) = parse_cidr(cidr).ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad cidr")
+                })?;
+                let luid = self.dev.tun_luid();
+                winroute::del(luid, addr, plen);
+                winroute::add(luid, addr, plen, 1)
             }
             #[cfg(target_os = "linux")]
             {
@@ -444,18 +537,13 @@ mod system {
         async fn del_cidr_route(&self, cidr: &str) {
             let v6 = is_v6_cidr(cidr);
             #[cfg(target_os = "windows")]
-            let _ = run_cmd(
-                "netsh",
-                vec![
-                    "interface".into(),
-                    if v6 { "ipv6" } else { "ipv4" }.into(),
-                    "delete".into(),
-                    "route".into(),
-                    format!("prefix={cidr}"),
-                    format!("interface={IF_NAME}"),
-                ],
-            )
-            .await;
+            {
+                // rc.208 — IP Helper (see `winroute`).
+                let _ = v6;
+                if let Some((addr, plen)) = parse_cidr(cidr) {
+                    winroute::del(self.dev.tun_luid(), addr, plen);
+                }
+            }
             #[cfg(target_os = "linux")]
             {
                 let mut args: Vec<String> = Vec::new();
