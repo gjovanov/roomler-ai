@@ -65,6 +65,17 @@ pub enum RejectKind {
     AgentError,
 }
 
+/// Reject reason the agent sends when a forward names a `session_id` it
+/// doesn't know. Canonical signal that the agent lost its tunnel-session
+/// state: its per-connection peer maps die with the WS, so after a network
+/// flap + reconnect EVERY forward on a pre-flap session gets this reject,
+/// forever. Tunnel clients match on it (`RejectKind::AgentError` + this
+/// substring) and treat it as session death — end the session so the flow
+/// supervisor re-opens with fresh state instead of failing every local
+/// connection. Wire-stable: the string predates the client-side match, so
+/// rejects from older agents match too. Do not reword.
+pub const REJECT_REASON_SESSION_GONE: &str = "tunnel session not open on agent";
+
 /// Half-close direction in `TcpHalfClose`. SMTP / HTTP-1.1-long-poll /
 /// some legacy protocols rely on this.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
