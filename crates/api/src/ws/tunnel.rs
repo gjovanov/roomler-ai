@@ -270,6 +270,11 @@ pub async fn handle_tunnel_client_socket(
                 }
                 if let Some(s) = session.take() {
                     state.tunnel_clients_by_session.remove(&s.tunnel_session_id);
+                    unindex_session_target(
+                        &state.tunnel_sessions_by_target_agent,
+                        s.agent_id,
+                        s.tunnel_session_id,
+                    );
                     audit_peer_close(&state, &s, &orig).await;
                 }
             }
@@ -388,6 +393,11 @@ pub async fn handle_tunnel_client_socket(
 
     if let Some(s) = session {
         state.tunnel_clients_by_session.remove(&s.tunnel_session_id);
+        unindex_session_target(
+            &state.tunnel_sessions_by_target_agent,
+            s.agent_id,
+            s.tunnel_session_id,
+        );
         // Best-effort: tell the agent the peer is gone so it tears
         // down its side.
         let _ = state.rc_hub.send_to_agent(
@@ -619,6 +629,14 @@ async fn handle_tunnel_open(
     state
         .tunnel_clients_by_session
         .insert(tunnel_session_id, orig.outbound_tx.clone());
+    // P7 flap resilience: index the session by its TARGET agent so
+    // `terminate_sessions_targeting_agent` can kill it the moment that
+    // agent's WS drops (the agent's tunnel peers die with its socket).
+    state
+        .tunnel_sessions_by_target_agent
+        .entry(agent_id)
+        .or_default()
+        .insert(tunnel_session_id);
 
     // 5. Audit the open. RelayMode is "Direct" until ICE finishes —
     // T2.7 updates this after candidate selection.
@@ -1571,6 +1589,11 @@ pub(crate) async fn relay_tunnel_client_msg_from_agent(
                     },
                 );
                 state.tunnel_clients_by_session.remove(&s.tunnel_session_id);
+                unindex_session_target(
+                    &state.tunnel_sessions_by_target_agent,
+                    s.agent_id,
+                    s.tunnel_session_id,
+                );
                 audit_peer_close(state, &s, orig).await;
                 None
             } else {
@@ -1594,6 +1617,11 @@ pub(crate) async fn teardown_agent_originated_sessions(
 ) {
     for (_session_id, s) in sessions {
         state.tunnel_clients_by_session.remove(&s.tunnel_session_id);
+        unindex_session_target(
+            &state.tunnel_sessions_by_target_agent,
+            s.agent_id,
+            s.tunnel_session_id,
+        );
         let _ = state.rc_hub.send_to_agent(
             s.agent_id,
             ServerMsg::TunnelTerminate {
@@ -1602,5 +1630,61 @@ pub(crate) async fn teardown_agent_originated_sessions(
             },
         );
         audit_peer_close(state, &s, orig).await;
+    }
+}
+
+/// Drop one session from the by-target-agent index (see
+/// `AppState::tunnel_sessions_by_target_agent`), tidying away the agent's
+/// entry once its set is empty. The guard is dropped before `remove_if` so
+/// the two DashMap operations never overlap on the same shard.
+fn unindex_session_target(
+    index: &dashmap::DashMap<ObjectId, std::collections::HashSet<ObjectId>>,
+    agent_id: ObjectId,
+    session_id: ObjectId,
+) {
+    if let Some(mut set) = index.get_mut(&agent_id) {
+        set.remove(&session_id);
+    }
+    index.remove_if(&agent_id, |_, set| set.is_empty());
+}
+
+/// P7 flap resilience: when an agent's WS drops, every tunnel session
+/// TARGETING it is dead — the agent's per-connection tunnel peers died with
+/// its socket, so even after it reconnects it will reject every forward on
+/// those sessions with "tunnel session not open on agent", forever. Push
+/// `rc:tunnel.terminate` to each such session's client so its flow
+/// supervisor re-opens promptly instead of discovering the corpse one
+/// rejected flow at a time. Clients ack with their own `TunnelTerminate`,
+/// which runs the normal per-connection teardown + audit; the global
+/// reply-channel entry is left for that ack path (pre-P7 clients without
+/// the ack still end their session on our terminate, and their entry is
+/// swept on their own disconnect, exactly as today).
+pub(crate) async fn terminate_sessions_targeting_agent(state: &AppState, agent_id: ObjectId) {
+    let Some((_, session_ids)) = state.tunnel_sessions_by_target_agent.remove(&agent_id) else {
+        return;
+    };
+    for sid in session_ids {
+        // Clone the tx out of the map guard before awaiting — holding a
+        // DashMap ref across an await point can deadlock the shard.
+        let tx = state
+            .tunnel_clients_by_session
+            .get(&sid)
+            .map(|e| e.value().clone());
+        if let Some(tx) = tx {
+            info!(%agent_id, session_id = %sid, "target agent WS dropped — terminating tunnel session");
+            // try_send, not send: this runs on the AGENT's WS teardown path,
+            // and an awaited send on a wedged client channel (blackholed
+            // socket, full cap-256 buffer) would stall unregister +
+            // mark_status(offline) behind an unrelated client. A dropped
+            // push is fine — the client still heals via the session-gone
+            // reject on its next forward.
+            let msg = ServerMsg::TunnelTerminate {
+                session_id: sid,
+                reason: CloseReason::ServerTerminated,
+            };
+            if let Err(e) = tx.try_send(msg) {
+                debug!(%agent_id, session_id = %sid, %e, "terminate push dropped (client channel full/closed)");
+            }
+        }
     }
 }
