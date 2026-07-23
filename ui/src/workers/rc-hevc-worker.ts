@@ -202,20 +202,27 @@ function initDecoder() {
       // at offset (0,0). `drawImage` honours visibleRect, so we were painting
       // only the top-left region. The coded pixels ARE the whole desktop, so
       // re-wrap the frame with visibleRect = the full coded rect and render
-      // THAT. Intel hevc_qsv is unaffected (visibleRect already == coded), so
-      // the re-wrap is a no-op there. (rc.100 first moved to codedWidth for the
-      // reported intrinsic; rc.102 also overrides the crop drawImage honours.)
-      const codedW = frame.codedWidth || frame.displayWidth
-      const codedH = frame.codedHeight || frame.displayHeight
+      // THAT. (rc.100 first moved to codedWidth for the reported intrinsic;
+      // rc.102 also overrides the crop drawImage honours.)
+      //
+      // A SMALL top-left crop is NOT that bug, though — it is a legitimate
+      // encoder alignment crop, and the rewrap must NOT override it. Field
+      // DESKTOP-V6FJE58 (hevc_qsv, 1920×1080 — the first non-mod-16-height
+      // sender): QSV pads HEVC to its row alignment, coding 1920×1088 with a
+      // conformance window hiding 8 rows of pooled-surface junk that changes
+      // per frame. Rendering the coded rect painted the junk — a purple/blue
+      // band flickering on every arriving frame during window drags. Every
+      // earlier QSV host had a mod-16 panel (1200/1600/2160 → no crop), which
+      // is why qsv looked "unaffected". `classifyCrop` separates the cases.
+      const fallbackW = frame.codedWidth || frame.displayWidth
+      const fallbackH = frame.codedHeight || frame.displayHeight
       const vr = frame.visibleRect
+      const crop = classifyCrop(frame.codedWidth, frame.codedHeight, vr)
       let render: VideoFrame = frame
       let rewrapped = false
-      if (
-        frame.codedWidth > 0 &&
-        frame.codedHeight > 0 &&
-        vr &&
-        (vr.width !== frame.codedWidth || vr.height !== frame.codedHeight)
-      ) {
+      let renderW = fallbackW
+      let renderH = fallbackH
+      if (crop === 'spurious') {
         try {
           render = new VideoFrame(frame, {
             visibleRect: { x: 0, y: 0, width: frame.codedWidth, height: frame.codedHeight },
@@ -224,6 +231,11 @@ function initDecoder() {
         } catch {
           render = frame // re-wrap rejected → fall back to the cropped frame
         }
+      } else if (crop === 'alignment' && vr) {
+        // Trust the conformance window: drawImage honours visibleRect
+        // natively, so no rewrap — paint (and report) the visible dims.
+        renderW = vr.width
+        renderH = vr.height
       }
       // Capture the one-shot diagnostic BEFORE paintFrame() calls close()
       // (a closed VideoFrame reports 0/null — rc.100 logged {0,0} this way).
@@ -231,22 +243,23 @@ function initDecoder() {
       // rc.187 — post dims on frame 1 AND whenever the decoded size changes
       // (the agent's viewer-adaptive resolution downscales mid-session), so the
       // composable's cursor mapping never divides by a stale intrinsic.
-      if (codedW !== lastPostedW || codedH !== lastPostedH) {
-        lastPostedW = codedW
-        lastPostedH = codedH
+      if (renderW !== lastPostedW || renderH !== lastPostedH) {
+        lastPostedW = renderW
+        lastPostedH = renderH
         firstFrameMsg = {
           type: 'first-frame',
-          width: codedW,
-          height: codedH,
+          width: renderW,
+          height: renderH,
           coded: { w: frame.codedWidth, h: frame.codedHeight },
           display: { w: frame.displayWidth, h: frame.displayHeight },
           visible: vr ? { x: vr.x, y: vr.y, w: vr.width, h: vr.height } : null,
+          crop,
           rewrapped,
         }
       }
-      statsLastWidth = codedW
-      statsLastHeight = codedH
-      paintFrame(render, codedW, codedH)
+      statsLastWidth = renderW
+      statsLastHeight = renderH
+      paintFrame(render, renderW, renderH)
       if (rewrapped) frame.close() // paintFrame closed `render`; close the original too
       if (firstFrameMsg) {
         workerScope.postMessage(firstFrameMsg)
@@ -427,8 +440,9 @@ function paintFrame(frame: VideoFrame, w: number, h: number): void {
     if (canvas.height !== h) canvas.height = h
     // rc.100 — pass the explicit dest rect. The bare `drawImage(frame, 0, 0)`
     // uses the frame's `displayWidth/Height` as its natural size, which is
-    // exactly the shrunken value we're routing around; an explicit dest of
-    // the coded size keeps the output at full resolution.
+    // exactly the shrunken value we're routing around on the NVDEC-bug path;
+    // an explicit dest of the render size (coded for the rewrapped spurious
+    // case, visible for a trusted alignment crop) keeps the output 1:1.
     ctx.drawImage(frame, 0, 0, w, h)
   } catch {
     /* canvas lost mid-teardown */
@@ -499,4 +513,39 @@ export function isKeyframe(flags: number): boolean {
  *  field LAPTOP-P2TU89GB hevc_qsv failure (async-encoder DC-open race). */
 export function shouldDecodeFrame(hasSeenKeyframe: boolean, isKey: boolean): boolean {
   return hasSeenKeyframe || isKey
+}
+
+/** Crop classification for a decoded HEVC frame — pure for vitest.
+ *
+ *  - `exact`: no conformance window (visibleRect == coded size), or the
+ *    frame carries no usable geometry — render as-is.
+ *  - `alignment`: a REAL encoder alignment crop — origin (0,0) and less
+ *    than one CTU (64 px) smaller than the coded size on BOTH axes. HEVC
+ *    encoders pad the picture to their block alignment and crop the excess:
+ *    Intel QSV codes a 1920×1080 desktop as 1920×1088 with an 8-row bottom
+ *    crop whose padding rows are pooled-surface junk. TRUST it — `drawImage`
+ *    honours the visibleRect natively. (Field DESKTOP-V6FJE58: painting the
+ *    coded rect instead showed the junk as a purple/blue band flickering on
+ *    every frame while dragging windows.)
+ *  - `spurious`: anything else — a drastically smaller visible rect or an
+ *    offset origin is the Chrome NVDEC misreported-geometry bug (field
+ *    GORAN-XMG-NEO16: coded 2560×1600, visible 1280×720). The coded pixels
+ *    are the whole desktop → re-wrap and render the full coded rect.
+ *
+ *  An alignment pad can never reach 64: aligning to any of 8/16/32/64 pads
+ *  by at most alignment−1 px, so a ≥64 deficit means the visible picture is
+ *  genuinely smaller than the coded surface — NVDEC-bug territory. */
+export function classifyCrop(
+  codedW: number,
+  codedH: number,
+  vr: { x: number; y: number; width: number; height: number } | null | undefined,
+): 'exact' | 'alignment' | 'spurious' {
+  if (!vr || codedW <= 0 || codedH <= 0) return 'exact'
+  if (vr.width === codedW && vr.height === codedH) return 'exact'
+  const dw = codedW - vr.width
+  const dh = codedH - vr.height
+  if (vr.x === 0 && vr.y === 0 && dw >= 0 && dh >= 0 && dw < 64 && dh < 64) {
+    return 'alignment'
+  }
+  return 'spurious'
 }
