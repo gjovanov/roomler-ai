@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use bson::oid::ObjectId;
 use dashmap::DashMap;
 use mongodb::Database;
@@ -85,6 +87,14 @@ pub struct AppState {
     pub tunnel_audit: Arc<TunnelAuditDao>,
     /// Per-tunnel-session WS outbound channels. See [`TunnelClientOutbound`].
     pub tunnel_clients_by_session: TunnelClientOutbound,
+    /// P7 flap resilience: which tunnel sessions TARGET a given agent —
+    /// `agent_id → {tunnel_session_id}`. Maintained by `ws::tunnel`'s open +
+    /// teardown paths and drained by
+    /// [`crate::ws::tunnel::terminate_sessions_targeting_agent`] when the
+    /// agent's WS drops: the agent's per-connection tunnel peers died with
+    /// its socket, so every session targeting it is unrecoverable and its
+    /// client must re-open rather than forward into a corpse forever.
+    pub tunnel_sessions_by_target_agent: Arc<DashMap<ObjectId, HashSet<ObjectId>>>,
 
     // Overlay-network subsystem (Tailscale-style L3 mesh)
     pub overlay_networks: Arc<OverlayNetworkDao>,
@@ -276,6 +286,7 @@ impl AppState {
             tunnel_policies,
             tunnel_audit,
             tunnel_clients_by_session: Arc::new(DashMap::new()),
+            tunnel_sessions_by_target_agent: Arc::new(DashMap::new()),
             overlay_networks,
             overlay_nodes,
             overlay_nodes_by_id: Arc::new(DashMap::new()),

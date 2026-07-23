@@ -1066,7 +1066,7 @@ async fn handle_server_msg(
                     session_id,
                     flow_id,
                     kind: roomler_ai_remote_control::signaling::RejectKind::AgentError,
-                    reason: "tunnel session not open on agent".into(),
+                    reason: roomler_ai_remote_control::signaling::REJECT_REASON_SESSION_GONE.into(),
                 };
                 let _ = outbound_tx.send(reply).await;
                 return Ok(());
@@ -1124,7 +1124,7 @@ async fn handle_server_msg(
                     session_id,
                     flow_id,
                     kind: roomler_ai_remote_control::signaling::RejectKind::AgentError,
-                    reason: "tunnel session not open on agent".into(),
+                    reason: roomler_ai_remote_control::signaling::REJECT_REASON_SESSION_GONE.into(),
                 };
                 let _ = outbound_tx.send(reply).await;
                 return Ok(());
