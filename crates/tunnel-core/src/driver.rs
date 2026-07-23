@@ -20,7 +20,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use bson::oid::ObjectId;
 use roomler_ai_remote_control::signaling::{
-    ClientMsg, CloseReason, Direction, IceServer, RejectKind, ServerMsg, TunnelRole,
+    ClientMsg, CloseReason, Direction, IceServer, REJECT_REASON_SESSION_GONE, RejectKind,
+    ServerMsg, TunnelRole,
 };
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, oneshot};
@@ -40,6 +41,18 @@ use crate::transport::{TRANSPORT_QUIC_V1, TRANSPORT_WEBRTC_DC_V1};
 /// agent's dial timeout in the relay case. Shared by the TCP session driver and
 /// the UDP relay (`crate::udp`).
 pub const FLOW_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// True when a forward reject is the agent's canonical "I don't know this
+/// session" signal (see [`REJECT_REASON_SESSION_GONE`]): the agent lost its
+/// per-connection tunnel state (its WS reconnected after a network flap), so
+/// this session can never carry another flow — every future forward would
+/// get the same reject. The dispatch loops treat it as session death so the
+/// flow supervisor re-opens with fresh state instead of failing every local
+/// connection forever. Substring match so a wrapped/prefixed reason from an
+/// older or newer agent still qualifies.
+fn is_session_gone_reject(kind: RejectKind, reason: &str) -> bool {
+    kind == RejectKind::AgentError && reason.contains(REJECT_REASON_SESSION_GONE)
+}
 
 /// Reply registry: per-flow oneshot for the server's accept/reject. Shared
 /// across the TCP session driver and the UDP relay so flow-ids stay a single
@@ -738,10 +751,18 @@ async fn dispatch_loop(
                 kind,
                 reason,
             } if sid == session_id => {
+                let session_gone = is_session_gone_reject(kind, &reason);
                 if let Some(tx) = reply_registry.lock().await.remove(&flow_id) {
                     let _ = tx.send(ForwardReply::Reject { kind, reason });
                 } else {
                     warn!(flow_id, ?kind, %reason, "reject for unknown flow_id");
+                }
+                if session_gone {
+                    warn!(
+                        flow_id,
+                        "agent no longer knows this session (WS reconnect after a network flap?) — ending session to re-open"
+                    );
+                    return;
                 }
             }
             ServerMsg::TcpHalfClose {
@@ -779,10 +800,18 @@ async fn dispatch_loop(
                 kind,
                 reason,
             } if sid == session_id => {
+                let session_gone = is_session_gone_reject(kind, &reason);
                 if let Some(tx) = reply_registry.lock().await.remove(&flow_id) {
                     let _ = tx.send(ForwardReply::Reject { kind, reason });
                 } else {
                     warn!(flow_id, ?kind, %reason, "udp reject for unknown flow_id");
+                }
+                if session_gone {
+                    warn!(
+                        flow_id,
+                        "agent no longer knows this session (WS reconnect after a network flap?) — ending session to re-open"
+                    );
+                    return;
                 }
             }
             ServerMsg::UdpClosed {
@@ -798,6 +827,14 @@ async fn dispatch_loop(
                 reason,
             } if sid == session_id => {
                 info!(?reason, "rc:tunnel.terminate — peer torn down by server");
+                // Ack with our own terminate (mirroring the Revoked arm) so
+                // the server runs its normal per-connection teardown + audit
+                // for this session instead of carrying a zombie entry until
+                // our WS drops. Server handling is idempotent; pre-P7 servers
+                // already accept client terminates for unknown sessions.
+                let _ = sink
+                    .send(ClientMsg::TunnelTerminate { session_id, reason })
+                    .await;
                 return;
             }
             ServerMsg::TunnelRevoked { reason } => {
@@ -983,6 +1020,17 @@ async fn run_quic_session(
             // `run_forward` reconnects instead of accepting into a dead socket.
             _ = &mut dispatcher_task => {
                 warn!("control channel closed; ending quic session to reconnect");
+                break;
+            }
+            // P7 flap resilience: the QUIC connection itself died (quinn's
+            // keepalive/idle-timeout noticed the peer is gone — agent-side
+            // network flap, silent carrier death). The WS control plane can
+            // outlive it, so without this arm the session would keep
+            // accepting local connections whose flows can never open. End
+            // the session; the flow supervisor re-opens with a fresh
+            // transport.
+            err = conn.closed() => {
+                warn!(%err, "QUIC connection lost; ending quic session to reconnect");
                 break;
             }
         };
@@ -1248,10 +1296,18 @@ async fn quic_dispatch_loop(
                 kind,
                 reason,
             } if sid == session_id => {
+                let session_gone = is_session_gone_reject(kind, &reason);
                 if let Some(tx) = reply_registry.lock().await.remove(&flow_id) {
                     let _ = tx.send(ForwardReply::Reject { kind, reason });
                 } else {
                     warn!(flow_id, ?kind, %reason, "reject for unknown flow_id");
+                }
+                if session_gone {
+                    warn!(
+                        flow_id,
+                        "agent no longer knows this session (WS reconnect after a network flap?) — ending quic session to re-open"
+                    );
+                    return;
                 }
             }
             ServerMsg::TcpHalfClose {
@@ -1286,10 +1342,18 @@ async fn quic_dispatch_loop(
                 kind,
                 reason,
             } if sid == session_id => {
+                let session_gone = is_session_gone_reject(kind, &reason);
                 if let Some(tx) = reply_registry.lock().await.remove(&flow_id) {
                     let _ = tx.send(ForwardReply::Reject { kind, reason });
                 } else {
                     warn!(flow_id, ?kind, %reason, "udp reject for unknown flow_id");
+                }
+                if session_gone {
+                    warn!(
+                        flow_id,
+                        "agent no longer knows this session (WS reconnect after a network flap?) — ending session to re-open"
+                    );
+                    return;
                 }
             }
             ServerMsg::UdpClosed {
@@ -1305,6 +1369,14 @@ async fn quic_dispatch_loop(
                 reason,
             } if sid == session_id => {
                 info!(?reason, "rc:tunnel.terminate — peer torn down by server");
+                // Ack with our own terminate (mirroring the Revoked arm) so
+                // the server runs its normal per-connection teardown + audit
+                // for this session instead of carrying a zombie entry until
+                // our WS drops. Server handling is idempotent; pre-P7 servers
+                // already accept client terminates for unknown sessions.
+                let _ = sink
+                    .send(ClientMsg::TunnelTerminate { session_id, reason })
+                    .await;
                 return;
             }
             ServerMsg::TunnelRevoked { reason } => {
@@ -1633,5 +1705,96 @@ mod tests {
             ClientMsg::TcpClosed { flow_id: f, .. } => assert_eq!(f, flow_id),
             other => panic!("expected TcpClosed, got {other:?}"),
         }
+    }
+
+    /// Test source that yields `ServerMsg`s from an mpsc channel, standing in
+    /// for the CLI's `WsSource` / the daemon's per-session demux receiver.
+    struct MockSource {
+        rx: mpsc::Receiver<ServerMsg>,
+    }
+
+    #[async_trait]
+    impl crate::signaling_link::TunnelSignalingSource for MockSource {
+        async fn recv(&mut self) -> Option<ServerMsg> {
+            self.rx.recv().await
+        }
+    }
+
+    /// P7 flap resilience: the agent's canonical "tunnel session not open on
+    /// agent" reject (`RejectKind::AgentError` + `REJECT_REASON_SESSION_GONE`)
+    /// must END the dispatch loop — the agent lost its session state on a WS
+    /// reconnect and will reject every future forward, so the session fn has
+    /// to return and let the flow supervisor re-open. An ordinary reject
+    /// (here: `DialFailed`) must NOT end the loop; those are per-flow
+    /// failures on a healthy session. Locks the session-death signature.
+    #[tokio::test]
+    async fn quic_dispatch_loop_exits_on_session_gone_reject() {
+        let session_id = ObjectId::new();
+        let (src_tx, src_rx) = mpsc::channel::<ServerMsg>(8);
+        let (sink_tx, _sink_rx) = mpsc::unbounded_channel();
+        let source: Box<dyn crate::signaling_link::TunnelSignalingSource> =
+            Box::new(MockSource { rx: src_rx });
+        let sink: Arc<dyn TunnelSignalingSink> = Arc::new(MockSink { tx: sink_tx });
+        let reply_registry: ReplyRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let active_flows: ActiveFlows = Arc::new(Mutex::new(HashMap::new()));
+
+        let (tx1, rx1) = oneshot::channel();
+        let (tx2, rx2) = oneshot::channel();
+        reply_registry.lock().await.insert(1, tx1);
+        reply_registry.lock().await.insert(2, tx2);
+
+        let loop_task = tokio::spawn(quic_dispatch_loop(
+            source,
+            session_id,
+            Arc::clone(&reply_registry),
+            active_flows,
+            sink,
+        ));
+
+        // An ordinary reject is delivered to its flow and the loop survives.
+        src_tx
+            .send(ServerMsg::TcpForwardReject {
+                session_id,
+                flow_id: 1,
+                kind: RejectKind::DialFailed,
+                reason: "connection refused".into(),
+            })
+            .await
+            .unwrap();
+        match tokio::time::timeout(Duration::from_secs(2), rx1)
+            .await
+            .expect("reply for flow 1")
+            .expect("oneshot delivered")
+        {
+            ForwardReply::Reject { kind, .. } => assert_eq!(kind, RejectKind::DialFailed),
+            ForwardReply::Accept { .. } => panic!("expected reject for flow 1"),
+        }
+        assert!(
+            !loop_task.is_finished(),
+            "an ordinary reject must not end the dispatch loop"
+        );
+
+        // The session-gone reject is delivered AND ends the loop.
+        src_tx
+            .send(ServerMsg::TcpForwardReject {
+                session_id,
+                flow_id: 2,
+                kind: RejectKind::AgentError,
+                reason: REJECT_REASON_SESSION_GONE.into(),
+            })
+            .await
+            .unwrap();
+        match tokio::time::timeout(Duration::from_secs(2), rx2)
+            .await
+            .expect("reply for flow 2")
+            .expect("oneshot delivered")
+        {
+            ForwardReply::Reject { kind, .. } => assert_eq!(kind, RejectKind::AgentError),
+            ForwardReply::Accept { .. } => panic!("expected reject for flow 2"),
+        }
+        tokio::time::timeout(Duration::from_secs(2), loop_task)
+            .await
+            .expect("dispatch loop must exit on the session-gone reject")
+            .expect("loop task must not panic");
     }
 }
