@@ -13,6 +13,16 @@ on:
   push:
     tags:
       - 'agent-v*'
+  schedule:
+    # Weekly cache-seed rehearsal (Mon 03:17 UTC) — an artifacts-only run
+    # on master whose Swatinem saves land on the MASTER ref, the only ref
+    # tag builds can restore from (see the save-if comments below). Keeps
+    # the seed alive across toolchain bumps (which rotate the cache env
+    # hash and orphan every prior seed — exactly what left tag builds
+    # fully cold from 2026-07-15 to rc.208) and the 7-day unused-cache
+    # expiry. seed-release-caches.yml additionally dispatches the same
+    # rehearsal immediately when rust-toolchain.toml or this file changes.
+    - cron: '17 3 * * 1'
   workflow_dispatch:
     inputs:
       version:
@@ -46,7 +56,26 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+          # Grep the [workspace.package] table for the declared version.
+          cargo_version=$(awk '
+            /^\[workspace\.package\]/ {in_section=1; next}
+            /^\[/ {in_section=0}
+            in_section && /^version[[:space:]]*=/ {
+              gsub(/"/, "", $3)
+              print $3
+              exit
+            }
+          ' Cargo.toml)
+          echo "Cargo.toml workspace version: ${cargo_version}"
+
+          if [[ "$GITHUB_EVENT_NAME" == "schedule" ]]; then
+            # Weekly cache-seed rehearsal: no tag, no inputs. Build whatever
+            # master currently is, artifacts-only — the run exists for its
+            # master-ref Swatinem saves, which every tag build restores.
+            version="${cargo_version}"
+            tag="agent-v${version}"
+            is_release=false
+          elif [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
             tag="${GITHUB_REF_NAME}"
             version="${tag#agent-v}"
             is_release=true
@@ -61,19 +90,6 @@ jobs:
           fi
 
           echo "Resolved: version=${version} tag=${tag} is_release=${is_release}"
-
-          # Grep the [workspace.package] table for the declared version.
-          cargo_version=$(awk '
-            /^\[workspace\.package\]/ {in_section=1; next}
-            /^\[/ {in_section=0}
-            in_section && /^version[[:space:]]*=/ {
-              gsub(/"/, "", $3)
-              print $3
-              exit
-            }
-          ' Cargo.toml)
-
-          echo "Cargo.toml workspace version: ${cargo_version}"
 
           if [[ "${cargo_version}" != "${version}" ]]; then
             echo "::error::Version mismatch: requested ${version} but Cargo.toml has ${cargo_version}"
@@ -574,31 +590,13 @@ jobs:
           }
           Write-Host "Staged roomler.exe ($([math]::Round((Get-Item target\release\roomler.exe).Length/1MB,1)) MB) for the TunnelExe component"
 
-      - name: Verify FFmpeg link via unit test
-        # Runs ONLY the ffmpeg-encoder gated test, which calls into
-        # ffmpeg-next's FFI to assert libavcodec version is FFmpeg 7+.
-        # This is the load-bearing verification step for rc.65: if the
-        # link is wrong or symbols don't match, this test fails before
-        # MSI packaging starts.
-        #
-        # --release + the SAME feature set as the `Build agent` step above
-        # (keep the two in LOCKSTEP) so cargo reuses the release dep
-        # artifacts instead of recompiling the whole graph in debug — the
-        # old form (debug, `ffmpeg-encoder` only) cost ~7-9 min per tag.
-        # Not a total reuse: dev-dep tokio-test enables tokio/test-util, so
-        # the tokio-downstream subgraph rebuilds once in the test graph;
-        # the expensive rest (windows-rs, ring, ffmpeg-sys bindgen, C
-        # codec builds) is reused.
-        shell: pwsh
-        env:
-          RUST_LOG: roomler_agent=debug,info
-          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-        run: |
-          cargo test -p roomler-agent --lib --release --features "full-hw,vp9-444,system-context,ffmpeg-encoder,overlay-l3,overlay-netstack" encode::ffmpeg::tests::libavcodec_version_is_ffmpeg_7_or_newer -- --nocapture
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "::error::FFmpeg link verification failed. ffmpeg-next + the vendored FFmpeg version pair is incompatible — re-pin one of them (agents/roomler-agent/Cargo.toml, or re-vendor via vendor-ffmpeg-windows.yml)."
-            exit 1
-          }
+      # The rc.65 "Verify FFmpeg link via unit test" step is GONE: even in
+      # --release with the exact build feature set, `cargo test` cost 5m33s
+      # per tag (dev-dep tokio-test enables tokio/test-util → the tokio
+      # subgraph rebuilds in the test graph). The same libavcodec >= 61
+      # assert now runs inside `encoder-smoke` below on the already-built
+      # EXE — a link/version failure still fails this job before MSI
+      # packaging, at zero compile cost.
 
       - name: Stage vpx.dll alongside agent binary (if not statically linked)
         shell: pwsh
@@ -642,7 +640,7 @@ jobs:
             Write-Host "  $($dll.Name) ($([math]::Round($dll.Length / 1KB, 0)) KB)"
           }
 
-      - name: Encoder smoke test (MF cascade → openh264 fallback)
+      - name: Encoder smoke test (FFmpeg link check + MF cascade → openh264 fallback)
         shell: pwsh
         env:
           RUST_LOG: roomler_agent=debug,info
@@ -654,6 +652,11 @@ jobs:
           # surfaces STREAM_CHANGE notifications and per-frame byte counts
           # so regressions in the MF drain path are visible in CI output.
           # P3d Slice B: daemon EXE is now roomlerd.exe.
+          # Under ffmpeg-encoder, encoder-smoke FIRST asserts the linked
+          # libavcodec is >= 61 (FFmpeg 7+) — the load-bearing replacement
+          # for the deleted 5m33s cargo-test link-verify step. On failure:
+          # re-pin ffmpeg-next in agents/roomler-agent/Cargo.toml or
+          # re-vendor via vendor-ffmpeg-windows.yml.
           & "target\release\roomlerd.exe" encoder-smoke --encoder hardware
 
       - name: Stage wintun.dll for the overlay TUN (overlay-l3 MSI bundle)
