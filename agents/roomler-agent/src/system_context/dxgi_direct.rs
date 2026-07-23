@@ -75,7 +75,9 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
 };
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT,
+};
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, DXGI_ADAPTER_FLAG, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_ERROR_ACCESS_LOST,
     DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, IDXGIAdapter, IDXGIAdapter1, IDXGIFactory1,
@@ -84,6 +86,7 @@ use windows::Win32::Graphics::Dxgi::{
 use windows::core::Interface;
 
 use super::dxgi_dup::{BackendBail, DxgiCapture, DxgiFrame};
+use crate::fp16;
 
 /// Map a `windows::core::Error` HRESULT to the capture pump's typed bail.
 /// Mirrors the scrap backend's `io::ErrorKind`-based table so both DXGI
@@ -122,6 +125,12 @@ pub struct DxgiDirectBackend {
     staging_w: u32,
     staging_h: u32,
     staging_fmt: DXGI_FORMAT,
+    /// rc.207 — half-bits → sRGB-u8 table for FP16 (scRGB) desktops (ACM /
+    /// HDR). Built lazily on the first FP16 frame; None on plain BGRA8
+    /// desktops. See [`crate::fp16`] for the field incident that motivated
+    /// accepting FP16 here instead of bailing to the scrap path (which reads
+    /// FP16 surfaces as BGRA8 → purple 2×-zoomed garbage).
+    lut: Option<Box<[u8; 65536]>>,
 }
 
 impl DxgiDirectBackend {
@@ -129,10 +138,15 @@ impl DxgiDirectBackend {
     /// a D3D11 device on it, and start Desktop Duplication on that output.
     ///
     /// Returns `BackendBail::HardError` when no adapter owns a primary
-    /// output, the desktop format isn't BGRA8 (HDR — out of scope; let the
-    /// caller fall to scrap/GDI), or any DXGI call fails for a non-typed
-    /// reason. The capture pump treats a `HardError` here as "try the next
-    /// backend" (scrap, then GDI).
+    /// output, the desktop format is neither BGRA8 nor FP16 (10-bit etc. —
+    /// out of scope; let the caller fall to scrap/GDI), or any DXGI call
+    /// fails for a non-typed reason. The capture pump treats a `HardError`
+    /// here as "try the next backend" (scrap, then GDI). FP16 (scRGB — the
+    /// ACM/HDR desktop composition format) is ACCEPTED since rc.207 and
+    /// converted to sRGB BGRA8 per frame via [`crate::fp16`] — critically,
+    /// this backend must own that case because the scrap fallback misreads
+    /// FP16 surfaces as BGRA8 (field DESKTOP-V6FJE58: purple 2×-zoomed
+    /// flicker on every recomposited frame).
     pub fn primary() -> Result<Self, BackendBail> {
         unsafe {
             let factory: IDXGIFactory1 = CreateDXGIFactory1().map_err(map_dxgi_err)?;
@@ -161,20 +175,37 @@ impl DxgiDirectBackend {
             let width = desc.ModeDesc.Width;
             let height = desc.ModeDesc.Height;
 
-            if desc.ModeDesc.Format != DXGI_FORMAT_B8G8R8A8_UNORM {
-                // HDR / 10-bit desktops surface as R10G10B10A2 etc. We only
-                // emit BGRA8 frames; bail so the pump falls to scrap/GDI
-                // (neither of which handles HDR either — out of scope here).
+            let desktop_fmt = desc.ModeDesc.Format;
+            let fp16 = desktop_fmt == DXGI_FORMAT_R16G16B16A16_FLOAT;
+            if desktop_fmt != DXGI_FORMAT_B8G8R8A8_UNORM && !fp16 {
+                // 10-bit scanout (R10G10B10A2) and other exotic formats stay
+                // out of scope — bail so the pump falls to scrap/GDI. FP16 is
+                // handled below (rc.207): it's what ACM/HDR desktops hand out,
+                // and the scrap fallback misreads it as BGRA8 (purple garbage),
+                // so the direct backend must own that case.
                 return Err(BackendBail::HardError(io::Error::other(format!(
-                    "DXGI-direct: desktop format {:?} is not BGRA8 — falling back",
-                    desc.ModeDesc.Format.0
+                    "DXGI-direct: desktop format {:?} is not BGRA8/FP16 — falling back",
+                    desktop_fmt.0
                 ))));
+            }
+            if fp16 {
+                // Loud on purpose: this is the observable marker that a host
+                // composites in scRGB (Settings → Display → Advanced display →
+                // "Automatically manage color for apps", or true HDR). Costs a
+                // few ms/frame of CPU convert; turning ACM/HDR off on the host
+                // removes it. Field: DESKTOP-V6FJE58 purple-flicker incident.
+                tracing::warn!(
+                    width,
+                    height,
+                    "DXGI-direct: FP16 (scRGB) desktop detected — ACM/HDR is ON; converting to sRGB on CPU (disable 'Automatically manage color for apps' on this host to avoid the convert cost)"
+                );
             }
 
             tracing::info!(
                 adapter = %adapter_name,
                 width,
                 height,
+                fp16,
                 "DXGI-direct: bound Desktop Duplication to the primary-output adapter (hybrid-GPU fix)"
             );
 
@@ -187,7 +218,8 @@ impl DxgiDirectBackend {
                 staging: None,
                 staging_w: 0,
                 staging_h: 0,
-                staging_fmt: DXGI_FORMAT_B8G8R8A8_UNORM,
+                staging_fmt: desktop_fmt,
+                lut: None,
             })
         }
     }
@@ -280,22 +312,49 @@ impl DxgiDirectBackend {
         let h = self.height as usize;
         let stride = w * 4;
         let mut bytes = vec![0u8; stride * h];
-        // SAFETY: mapped.pData points to at least RowPitch*height bytes;
-        // we copy min(stride, RowPitch) per row into a stride*height buf,
-        // so neither side is over-read / over-written. RowPitch >= stride
-        // always (driver pads rows up), so copy_w == stride in practice.
-        unsafe {
-            let src_ptr = mapped.pData as *const u8;
-            let row_pitch = mapped.RowPitch as usize;
-            let copy_w = stride.min(row_pitch);
-            for y in 0..h {
-                std::ptr::copy_nonoverlapping(
-                    src_ptr.add(y * row_pitch),
-                    bytes.as_mut_ptr().add(y * stride),
-                    copy_w,
-                );
+        if self.staging_fmt == DXGI_FORMAT_R16G16B16A16_FLOAT {
+            // rc.207 — FP16 (scRGB) desktop: convert each RGBA16F row (8 B/px)
+            // to BGRA8 through the half→sRGB LUT. `ensure_staging` keeps
+            // `staging_fmt` in sync with the ACTUAL acquired texture, so an
+            // ACM toggle mid-session flips this branch on the next frame.
+            let lut = self.lut.get_or_insert_with(fp16::build_half_to_srgb_lut);
+            // SAFETY: mapped.pData points to at least RowPitch*height bytes;
+            // each row slice is bounded by min(w, RowPitch/8) pixels so we
+            // never over-read a row (RowPitch >= w*8 in practice — driver
+            // pads rows up), and the dst row is exactly `stride` bytes.
+            unsafe {
+                let src_ptr = mapped.pData as *const u8;
+                let row_pitch = mapped.RowPitch as usize;
+                let px = w.min(row_pitch / 8);
+                for y in 0..h {
+                    let src_row = std::slice::from_raw_parts(src_ptr.add(y * row_pitch), px * 8);
+                    fp16::convert_row_rgba16f_to_bgra8(
+                        src_row,
+                        &mut bytes[y * stride..(y + 1) * stride],
+                        px,
+                        lut,
+                    );
+                }
+                self.context.Unmap(staging, 0);
             }
-            self.context.Unmap(staging, 0);
+        } else {
+            // SAFETY: mapped.pData points to at least RowPitch*height bytes;
+            // we copy min(stride, RowPitch) per row into a stride*height buf,
+            // so neither side is over-read / over-written. RowPitch >= stride
+            // always (driver pads rows up), so copy_w == stride in practice.
+            unsafe {
+                let src_ptr = mapped.pData as *const u8;
+                let row_pitch = mapped.RowPitch as usize;
+                let copy_w = stride.min(row_pitch);
+                for y in 0..h {
+                    std::ptr::copy_nonoverlapping(
+                        src_ptr.add(y * row_pitch),
+                        bytes.as_mut_ptr().add(y * stride),
+                        copy_w,
+                    );
+                }
+                self.context.Unmap(staging, 0);
+            }
         }
 
         Ok(DxgiFrame {
@@ -348,7 +407,14 @@ impl DxgiCapture for DxgiDirectBackend {
     }
 
     fn kind(&self) -> &'static str {
-        "dxgi-direct"
+        // Distinct name so the capture-timing heartbeat (`backend=` field in
+        // agent_logs) shows fleet-wide which hosts are paying the FP16
+        // convert — the observable half of the rc.207 ACM/HDR fix.
+        if self.staging_fmt == DXGI_FORMAT_R16G16B16A16_FLOAT {
+            "dxgi-direct-fp16"
+        } else {
+            "dxgi-direct"
+        }
     }
 }
 
