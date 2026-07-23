@@ -55,7 +55,7 @@ import {
 } from '@/composables/useRemoteControl'
 import { codecMimeForShort } from '@/workers/rc-webcodecs-worker'
 import { parseFrameHeader, isKeyframe, shouldDecodeFrame } from '@/workers/rc-vp9-444-worker'
-import { shouldDecodeFrame as shouldDecodeFrameHevc } from '@/workers/rc-hevc-worker'
+import { shouldDecodeFrame as shouldDecodeFrameHevc, classifyCrop } from '@/workers/rc-hevc-worker'
 
 function keyEvent(code: string, mods: Partial<{ ctrl: boolean; alt: boolean; meta: boolean; shift: boolean }> = {}): KeyboardEvent {
   return {
@@ -1408,6 +1408,51 @@ describe('leading-delta keyframe gate (rc.103)', () => {
       })
     })
   }
+})
+
+describe('classifyCrop — HEVC conformance-window handling', () => {
+  // Locks the DESKTOP-V6FJE58 fix: QSV codes a 1920×1080 desktop as
+  // 1920×1088 + an 8-row bottom crop (alignment padding = per-frame junk).
+  // The NVDEC-bug rewrap (rc.102) must NOT override that legit crop — doing
+  // so painted the junk rows as a purple/blue band flickering during drags.
+  const rect = (width: number, height: number, x = 0, y = 0) => ({ x, y, width, height })
+
+  it('trusts the QSV 1080p alignment crop (coded 1088 → visible 1080)', () => {
+    expect(classifyCrop(1920, 1088, rect(1920, 1080))).toBe('alignment')
+  })
+
+  it('still rewraps the NVDEC misreported-geometry bug (2560×1600 → 1280×720)', () => {
+    expect(classifyCrop(2560, 1600, rect(1280, 720))).toBe('spurious')
+  })
+
+  it('reports exact when visibleRect equals the coded size', () => {
+    expect(classifyCrop(1920, 1200, rect(1920, 1200))).toBe('exact')
+  })
+
+  it('reports exact when geometry is missing (closed/exotic frames)', () => {
+    expect(classifyCrop(0, 0, rect(1920, 1080))).toBe('exact')
+    expect(classifyCrop(1920, 1080, null)).toBe('exact')
+  })
+
+  it('treats an offset-origin crop as spurious (alignment crops anchor at 0,0)', () => {
+    expect(classifyCrop(1920, 1088, rect(1912, 1080, 8, 0))).toBe('spurious')
+  })
+
+  it('draws the alignment boundary at one CTU (64px)', () => {
+    // 63 = largest possible alignment pad (dim ≡ 1 mod 64); a ≥64 deficit
+    // can only be a genuinely smaller picture → NVDEC-bug territory.
+    expect(classifyCrop(1920, 1088, rect(1920, 1025))).toBe('alignment')
+    expect(classifyCrop(1920, 1088, rect(1920, 1024))).toBe('spurious')
+    expect(classifyCrop(1920, 1088, rect(1856, 1080))).toBe('spurious')
+  })
+
+  it('requires BOTH axes inside the alignment band', () => {
+    expect(classifyCrop(2560, 1600, rect(2560, 720))).toBe('spurious')
+  })
+
+  it('treats a visible rect LARGER than coded as spurious (defensive rewrap)', () => {
+    expect(classifyCrop(1920, 1080, rect(1920, 1088))).toBe('spurious')
+  })
 })
 
 describe('RC_RECONNECT_LADDER_MS', () => {
