@@ -17,10 +17,14 @@
 //!     preflight so an HTTPS page may read a loopback resource;
 //!   * a [`LocalTurnHost`] kept in sync with the overlay's assigned self-IP.
 //!
-//! Default-OFF: gated on `ROOMLER_AGENT_LOCAL_TURN` (loopback-TURN Phase 4
-//! posture — inert on the fleet until a field test opts a host in; the browser
-//! side is independently opt-in). Compiles in the default build; without an
-//! overlay IP the probe simply answers 503 and no TURN is hosted.
+//! Default-ON since rc.220 (the DERP precedent: fallbacks must be armed
+//! BEFORE the network that needs them — nobody runs an elevated
+//! `set-service-env-var` from inside a UDP-blocked corp VPN). Hosting the
+//! TURN + probe is inert infrastructure: nothing uses it until the BROWSER
+//! opts in (`localRelayEnabled`, still default-OFF pending the first real
+//! UDP-blocked field proof). `ROOMLER_AGENT_LOCAL_TURN=0` disables. Compiles
+//! in the default build; without an overlay IP the probe answers 503 and no
+//! TURN is hosted.
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
@@ -53,18 +57,19 @@ const ALLOWED_ORIGINS: &[&str] = &[
     "http://localhost:5173",
 ];
 
-/// `true` when the operator opted this host in via `ROOMLER_AGENT_LOCAL_TURN`.
-/// Default-OFF.
+/// Default-ON (rc.220); `ROOMLER_AGENT_LOCAL_TURN=0` (or `false`/`no`/`off`)
+/// disables — the DERP-style escape-hatch convention.
 pub fn enabled() -> bool {
-    matches!(
+    !matches!(
         std::env::var("ROOMLER_AGENT_LOCAL_TURN").ok().as_deref(),
-        Some("1" | "true" | "yes" | "on")
+        Some("0" | "false" | "no" | "off")
     )
 }
 
-/// Spawn the loopback-TURN probe server + host supervisor when [`enabled`].
-/// A cheap no-op otherwise (the common case). `agent_id` is used as the minted
-/// credential's user-id (opaque; the host both mints and validates statelessly).
+/// Spawn the loopback-TURN probe server + host supervisor when [`enabled`]
+/// (default-ON; no-op only when the operator set the `=0` escape). `agent_id`
+/// is used as the minted credential's user-id (opaque; the host both mints
+/// and validates statelessly).
 pub fn spawn(
     overlay_view: watch::Receiver<OverlayView>,
     agent_id: String,
