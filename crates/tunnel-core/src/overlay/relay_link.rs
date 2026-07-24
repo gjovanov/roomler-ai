@@ -35,6 +35,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bson::oid::ObjectId;
 use tokio::net::lookup_host;
@@ -206,6 +207,15 @@ pub struct RelayCoordinator {
     /// frozen once tracked (`request` early-returns on `is_tracking`), so without
     /// this recompute the pair would never heal.
     roles: HashMap<ObjectId, RelayStrategy>,
+    /// P7 — per-peer force-DERP pins from the server's `OverlayForceDerp`
+    /// escalation push (sustained TURN churn on the pair). While a pin is
+    /// unexpired, [`relay_strategy`](Self::relay_strategy) returns
+    /// [`RelayStrategy::Derp`] for the peer FIRST — before the UDP-capability
+    /// split — so `maybe_complete`'s strategy-flip recompute can't thrash the
+    /// pinned pair back to a TURN tier on the next srflx trickle. Expiry is
+    /// lazy (checked on read); after it, the normal strategy resumes on the
+    /// next establishment cycle.
+    forced_derp_until: HashMap<ObjectId, Instant>,
 }
 
 impl RelayCoordinator {
@@ -230,7 +240,81 @@ impl RelayCoordinator {
             derp: super::direct::derp_enabled(),
             derp_mux,
             roles: HashMap::new(),
+            forced_derp_until: HashMap::new(),
         }
+    }
+
+    /// P7 — does this coordinator hold a live `/derp` mux? The runtime checks
+    /// before a force-DERP conversion and lazily opens one when absent.
+    pub fn has_derp_mux(&self) -> bool {
+        self.derp_mux.is_some()
+    }
+
+    /// P7 — hand the coordinator a lazily-opened `/derp` mux (a UDP-capable
+    /// node skips the startup open and only needs one when the server
+    /// force-pins a pair onto DERP). First mux wins; a second call is a no-op
+    /// (per-peer `DerpConn`s vend from the original).
+    pub fn set_derp_mux(&mut self, mux: Arc<DerpMux>) {
+        if self.derp_mux.is_none() {
+            self.derp_mux = Some(mux);
+        }
+    }
+
+    /// P7 — is `node_id` currently force-pinned to DERP (unexpired pin)?
+    fn forced_derp_active(&self, node_id: &ObjectId) -> bool {
+        self.forced_derp_until
+            .get(node_id)
+            .is_some_and(|until| Instant::now() < *until)
+    }
+
+    /// P7 — apply a server `OverlayForceDerp` push: pin the pair to DERP for
+    /// `ttl` and reconcile whatever coordination slot the peer occupies into
+    /// `derping`. Returns a [`ReadyLink`] when the DERP carrier is buildable
+    /// right now; a peer with NO slot (untracked, or currently INSTALLED on a
+    /// churning TURN carrier) is stamp-only — the pin flips the strategy on
+    /// its next (re)establishment cycle, which the health sweep drives within
+    /// ~15 s for a dead carrier.
+    ///
+    /// The caller must ensure a `/derp` mux exists first ([`has_derp_mux`] /
+    /// [`set_derp_mux`]); without one the pin is refused (a pinned peer with
+    /// no mux would park in `derping` unreachable until expiry).
+    pub fn force_derp(&mut self, node_id: ObjectId, ttl: Duration) -> Option<ReadyLink> {
+        if self.derp_mux.is_none() {
+            warn!(peer = %node_id, "overlay relay: force-derp push but no /derp mux — ignoring");
+            return None;
+        }
+        // Lazy hygiene: drop expired pins so the map tracks only live ones.
+        self.forced_derp_until
+            .retain(|_, until| Instant::now() < *until);
+        self.forced_derp_until.insert(node_id, Instant::now() + ttl);
+        info!(
+            peer = %node_id, ttl_s = ttl.as_secs(),
+            "overlay relay: pair force-pinned to DERP (server escalation — TURN churn)"
+        );
+        let peer_cfg = if let Some(pp) = self.pending.remove(&node_id) {
+            Some(pp.peer)
+        } else if let Some(p) = self.dialing.remove(&node_id) {
+            Some(p)
+        } else if let Some(a) = self.allocated.remove(&node_id) {
+            // Dropping the allocation releases the churning TURN client (its
+            // `Drop` closes the allocation); the advertised relay address dies
+            // with it, so prune it from the trickle set too.
+            self.advertised.remove(&node_id);
+            Some(a.peer)
+        } else {
+            None
+        };
+        match peer_cfg {
+            Some(peer) => {
+                self.roles.insert(node_id, RelayStrategy::Derp);
+                self.derping.insert(node_id, peer);
+            }
+            None if self.derping.contains_key(&node_id) => {
+                self.roles.insert(node_id, RelayStrategy::Derp);
+            }
+            None => return None, // stamp-only: pin governs the next cycle
+        }
+        self.try_build_derp(&node_id)
     }
 
     /// v1 single-relay role for this peer, or `None` for the both-allocate path:
@@ -256,8 +340,8 @@ impl RelayCoordinator {
     /// * both UDP-OK → smaller pubkey anchors (deterministic tie-break)
     /// * both UDP-blocked → no raw-UDP dialer exists → `None` (single-relay can't
     ///   carry this pair; it falls through to both-allocate today, DERP later)
-    fn single_relay_role(&self, peer: &PeerConfig) -> Option<bool> {
-        match self.relay_strategy(peer) {
+    fn single_relay_role(&self, node_id: &ObjectId, peer: &PeerConfig) -> Option<bool> {
+        match self.relay_strategy(node_id, peer) {
             RelayStrategy::SingleRelay(anchor) => Some(anchor),
             _ => None,
         }
@@ -274,7 +358,16 @@ impl RelayCoordinator {
     /// Everything else is both-allocate. Both ends read the same symmetric inputs
     /// (our UDP-capability from the srflx gather, the peer's from its
     /// `srflx_endpoints`), so they always agree on the tier.
-    fn relay_strategy(&self, peer: &PeerConfig) -> RelayStrategy {
+    fn relay_strategy(&self, node_id: &ObjectId, peer: &PeerConfig) -> RelayStrategy {
+        // P7 — a server force-DERP pin wins over every capability-derived
+        // tier while unexpired (checked FIRST so the strategy-flip recompute
+        // in `maybe_complete` can't thrash a pinned pair back onto the
+        // broken TURN tier). Still gated on the peer's `supports_derp` and a
+        // live mux — the server only escalates when both ends advertised
+        // support, so these normally hold; they keep a stale pin harmless.
+        if self.forced_derp_active(node_id) && self.derp_mux.is_some() && peer.supports_derp {
+            return RelayStrategy::Derp;
+        }
         let peer_udp_ok = !peer.srflx_endpoints.is_empty();
         if self.single_relay && peer.supports_relay_single {
             match (self.my_udp_relay_ok, peer_udp_ok) {
@@ -332,7 +425,7 @@ impl RelayCoordinator {
         // Compute the strategy ONCE and remember it, so `maybe_complete` can
         // detect a later flip (the peer's srflx propagating) and re-establish —
         // see `roles`.
-        let strat = self.relay_strategy(&peer);
+        let strat = self.relay_strategy(&node_id, &peer);
         match strat {
             RelayStrategy::SingleRelay(false) => {
                 debug!(peer = %node_id, "overlay relay: single-relay dialer — awaiting anchor R (no alloc, no creds)");
@@ -434,7 +527,7 @@ impl RelayCoordinator {
         // role differs from the one we tracked, drop the link; the caller's
         // `!is_tracking` path then re-`request`s it with the correct role.
         if self.is_tracking(&node_id) {
-            let fresh = self.relay_strategy(peer);
+            let fresh = self.relay_strategy(&node_id, peer);
             if self.roles.get(&node_id) != Some(&fresh) {
                 debug!(peer = %node_id, ?fresh, "overlay relay: strategy changed (srflx settled) — re-establishing");
                 self.forget(&node_id);
@@ -538,7 +631,7 @@ impl RelayCoordinator {
     /// netmap) — we must not dial its LAN address as the "relay".
     fn try_build(&mut self, node_id: &ObjectId) -> Option<ReadyLink> {
         let a = self.allocated.get(node_id)?;
-        let single_anchor = self.single_relay_role(&a.peer) == Some(true);
+        let single_anchor = self.single_relay_role(node_id, &a.peer) == Some(true);
         let dst: SocketAddr = if single_anchor {
             // Phase D ANCHOR: we hold the ONE allocation; the DIALER runs none
             // and advertises no relay, so dial its public IP — taken from its
@@ -777,6 +870,13 @@ mod tests {
 
     /// A minimal peer for the coordinator tests — override the fields a test
     /// cares about with `..base_peer()`.
+    /// P7 — a fixed node id for strategy-signature calls (the forced-DERP pin
+    /// is keyed by node id; these tests exercise the capability-derived path,
+    /// so any id without a pin works).
+    fn test_nid() -> ObjectId {
+        ObjectId::from_bytes([0x42; 12])
+    }
+
     fn base_peer() -> PeerConfig {
         PeerConfig {
             public_key: [1u8; 32],
@@ -1023,23 +1123,26 @@ mod tests {
         // Flag off → both-allocate regardless (gate defaults ON, so force off).
         let mut off = RelayCoordinator::new(tx.clone(), small, true, vec![], None);
         off.single_relay = false;
-        assert_eq!(off.single_relay_role(&peer(large, true, true)), None);
+        assert_eq!(
+            off.single_relay_role(&test_nid(), &peer(large, true, true)),
+            None
+        );
 
         // Peer doesn't advertise → both-allocate (no anchor/dialer split).
         assert_eq!(
-            coord(small, true).single_relay_role(&peer(large, false, true)),
+            coord(small, true).single_relay_role(&test_nid(), &peer(large, false, true)),
             None,
             "peer flag off ⇒ both-allocate"
         );
 
         // Both UDP-capable → smaller pubkey anchors (deterministic tie-break).
         assert_eq!(
-            coord(small, true).single_relay_role(&peer(large, true, true)),
+            coord(small, true).single_relay_role(&test_nid(), &peer(large, true, true)),
             Some(true),
             "both UDP-OK, smaller pubkey ⇒ ANCHOR"
         );
         assert_eq!(
-            coord(large, true).single_relay_role(&peer(small, true, true)),
+            coord(large, true).single_relay_role(&test_nid(), &peer(small, true, true)),
             Some(false),
             "both UDP-OK, larger pubkey ⇒ DIALER"
         );
@@ -1048,27 +1151,29 @@ mod tests {
         // even when its pubkey is the LARGER one (would be dialer under the old
         // rule) — this is the PC50045 corp-host path.
         assert_eq!(
-            coord(large, false).single_relay_role(&peer(small, true, true)),
+            coord(large, false).single_relay_role(&test_nid(), &peer(small, true, true)),
             Some(true),
             "we're UDP-blocked (larger pubkey) ⇒ we still ANCHOR"
         );
         assert_eq!(
-            coord(small, true).single_relay_role(&peer(large, true, false)),
+            coord(small, true).single_relay_role(&test_nid(), &peer(large, true, false)),
             Some(false),
             "peer is UDP-blocked (larger pubkey) ⇒ peer anchors, WE dial"
         );
 
         // Both UDP-blocked → no raw-UDP dialer exists → not single-relay.
         assert_eq!(
-            coord(small, false).single_relay_role(&peer(large, true, false)),
+            coord(small, false).single_relay_role(&test_nid(), &peer(large, true, false)),
             None,
             "both UDP-blocked ⇒ single-relay can't carry (→ both-allocate/DERP)"
         );
 
         // Symmetry: the two ends of a mixed (UDP-OK ↔ UDP-blocked) pair compute
         // mirror roles (exactly one anchor), regardless of pubkey order.
-        let a_ok_dialer = coord(large, true).single_relay_role(&peer(small, true, false));
-        let b_blocked_anchor = coord(small, false).single_relay_role(&peer(large, true, true));
+        let a_ok_dialer =
+            coord(large, true).single_relay_role(&test_nid(), &peer(small, true, false));
+        let b_blocked_anchor =
+            coord(small, false).single_relay_role(&test_nid(), &peer(large, true, true));
         assert_eq!(a_ok_dialer, Some(false));
         assert_eq!(b_blocked_anchor, Some(true));
     }
@@ -1206,28 +1311,28 @@ mod tests {
         };
         // Both UDP-blocked + both advertise DERP + flag on + WS present ⇒ DERP.
         assert_eq!(
-            mk(true, false, Some(mux.clone())).relay_strategy(&peer(true, false)),
+            mk(true, false, Some(mux.clone())).relay_strategy(&test_nid(), &peer(true, false)),
             RelayStrategy::Derp
         );
         // DERP flag off ⇒ both-allocate (single-relay can't: both UDP-blocked).
         assert_eq!(
-            mk(false, false, Some(mux.clone())).relay_strategy(&peer(true, false)),
+            mk(false, false, Some(mux.clone())).relay_strategy(&test_nid(), &peer(true, false)),
             RelayStrategy::BothAllocate
         );
         // No `/derp` WS present ⇒ both-allocate.
         assert_eq!(
-            mk(true, false, None).relay_strategy(&peer(true, false)),
+            mk(true, false, None).relay_strategy(&test_nid(), &peer(true, false)),
             RelayStrategy::BothAllocate
         );
         // Peer doesn't advertise DERP ⇒ both-allocate.
         assert_eq!(
-            mk(true, false, Some(mux.clone())).relay_strategy(&peer(false, false)),
+            mk(true, false, Some(mux.clone())).relay_strategy(&test_nid(), &peer(false, false)),
             RelayStrategy::BothAllocate
         );
         // A UDP-capable side exists ⇒ single-relay wins over DERP (we're blocked,
         // the peer is UDP-OK ⇒ we anchor). DERP is strictly the both-blocked tier.
         assert_eq!(
-            mk(true, false, Some(mux)).relay_strategy(&peer(true, true)),
+            mk(true, false, Some(mux)).relay_strategy(&test_nid(), &peer(true, true)),
             RelayStrategy::SingleRelay(true)
         );
     }
@@ -1298,5 +1403,128 @@ mod tests {
             "only LAN ⇒ withhold"
         );
         assert!(pick(&[]).is_none(), "no srflx advertised ⇒ withhold");
+    }
+
+    /// P7 — the forced pin beats every capability-derived tier while
+    /// unexpired (so `maybe_complete`'s strategy recompute can't thrash a
+    /// pinned pair), and lapses back to the normal strategy on expiry.
+    #[tokio::test]
+    async fn forced_derp_pin_beats_single_relay_and_expires() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mux = DerpMux::new([0x00u8; 32]).0;
+        // BOTH ends UDP-capable ⇒ the natural strategy is SingleRelay.
+        let mut coord = RelayCoordinator::new(tx, [0x00u8; 32], true, vec![], Some(mux));
+        coord.single_relay = true;
+        coord.derp = true;
+        let node = ObjectId::new();
+        let peer = PeerConfig {
+            public_key: [0xFFu8; 32],
+            supports_relay_single: true,
+            supports_derp: true,
+            srflx_endpoints: vec!["203.0.113.9:40000".into()],
+            ..base_peer()
+        };
+        assert_eq!(
+            coord.relay_strategy(&node, &peer),
+            RelayStrategy::SingleRelay(true),
+            "natural tier before the pin"
+        );
+        assert!(coord.force_derp(node, Duration::from_secs(60)).is_none());
+        assert_eq!(
+            coord.relay_strategy(&node, &peer),
+            RelayStrategy::Derp,
+            "pin wins over SingleRelay"
+        );
+        // Another peer is unaffected.
+        assert_eq!(
+            coord.relay_strategy(&ObjectId::new(), &peer),
+            RelayStrategy::SingleRelay(true)
+        );
+        // Expiry: back-date the pin ⇒ the natural strategy resumes.
+        coord
+            .forced_derp_until
+            .insert(node, Instant::now() - Duration::from_secs(1));
+        assert_eq!(
+            coord.relay_strategy(&node, &peer),
+            RelayStrategy::SingleRelay(true),
+            "expired pin lapses to the natural tier"
+        );
+    }
+
+    /// P7 — `force_derp` reconciles every coordination slot into `derping`
+    /// (and builds when possible), is stamp-only for an untracked peer, and
+    /// refuses without a mux.
+    #[tokio::test]
+    async fn force_derp_reconciles_slots() {
+        let mk = || {
+            let (tx2, _rx2) = tokio::sync::mpsc::channel::<ClientMsg>(8);
+            let mux = DerpMux::new([0x00u8; 32]).0;
+            let mut c = RelayCoordinator::new(tx2, [0x00u8; 32], true, vec![], Some(mux));
+            c.single_relay = true;
+            c.derp = true;
+            c
+        };
+        let peer = PeerConfig {
+            public_key: [0xFFu8; 32],
+            supports_relay_single: true,
+            supports_derp: true,
+            srflx_endpoints: vec!["203.0.113.9:40000".into()],
+            ..base_peer()
+        };
+
+        // pending → derping, and the DERP link builds immediately.
+        let mut c = mk();
+        let n = ObjectId::new();
+        c.pending.insert(
+            n,
+            PendingPeer {
+                peer: peer.clone(),
+                ice: None,
+                pair_key: None,
+            },
+        );
+        let link = c.force_derp(n, Duration::from_secs(60)).expect("built");
+        assert_eq!(link.relay_kind, RelayKind::Derp);
+        assert!(c.pending.is_empty() && c.derping.is_empty());
+
+        // dialing → derping.
+        let mut c = mk();
+        c.dialing.insert(n, peer.clone());
+        let link = c.force_derp(n, Duration::from_secs(60)).expect("built");
+        assert_eq!(link.relay_kind, RelayKind::Derp);
+        assert!(c.dialing.is_empty());
+
+        // allocated → derping; the dead relay leaves the advertised set.
+        let mut c = mk();
+        let sock = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+        sock.set_nonblocking(true).unwrap();
+        let conn: Arc<dyn RelayConn> = Arc::new(crate::transport::relay::UdpRelayConn(
+            tokio::net::UdpSocket::from_std(sock).unwrap(),
+        ));
+        c.advertised.insert(n, "203.0.113.1:3478".into());
+        c.allocated.insert(
+            n,
+            Allocated {
+                conn,
+                peer: peer.clone(),
+            },
+        );
+        let link = c.force_derp(n, Duration::from_secs(60)).expect("built");
+        assert_eq!(link.relay_kind, RelayKind::Derp);
+        assert!(
+            !c.advertised.contains_key(&n),
+            "dead relay pruned from the trickle set"
+        );
+
+        // Untracked peer ⇒ stamp-only (pin governs the next cycle).
+        let mut c = mk();
+        assert!(c.force_derp(n, Duration::from_secs(60)).is_none());
+        assert!(c.forced_derp_active(&n), "pin stamped");
+
+        // No mux ⇒ refused, no pin.
+        let (tx3, _rx3) = tokio::sync::mpsc::channel::<ClientMsg>(8);
+        let mut bare = RelayCoordinator::new(tx3, [0x00u8; 32], true, vec![], None);
+        assert!(bare.force_derp(n, Duration::from_secs(60)).is_none());
+        assert!(!bare.forced_derp_active(&n), "no mux ⇒ no pin");
     }
 }

@@ -471,6 +471,14 @@ impl RelayAllocQueue {
         self.in_flight.insert(node, self.epoch);
         self.epoch
     }
+    /// P7 — drop any in-flight allocate for `node` so its completion is
+    /// discarded on arrival. Used by the force-DERP conversion: a stale
+    /// `AllocDone` landing after the pair re-cycled into `pending` would
+    /// otherwise commit a TURN link inside the forced window (the orphan
+    /// coturn allocation idles out at the server's TTL).
+    fn invalidate(&mut self, node: &ObjectId) {
+        self.in_flight.remove(node);
+    }
     /// `true` iff `done` is still the CURRENT allocate for its peer; clears
     /// the entry either way (the completion consumes the slot).
     fn take_if_current(&mut self, done: &AllocDone) -> bool {
@@ -517,6 +525,12 @@ pub enum OverlayEvent {
         ice_servers: Vec<IceServer>,
         pair_key: String,
     },
+    /// P7 — server-pushed per-pair DERP escalation: the server observed
+    /// sustained TURN churn for this pair and tells BOTH ends to pin it onto
+    /// the DERP carrier for `ttl_ms`. Pushed (never grant-borne) because the
+    /// single-relay DIALER never sends a relay_request and so never sees a
+    /// grant.
+    ForceDerp { peer_node_id: ObjectId, ttl_ms: u64 },
 }
 
 /// Builds the WG carrier for a peer. Production wires a direct UDP socket
@@ -857,6 +871,11 @@ fn exit_exemption_set(
             set.insert(a.ip());
         }
     }
+    // P7 — a DERP carrier's `relay_parts` hold SYNTHETIC `127.x.y.z`
+    // placeholder addresses (pubkey-derived, non-routable); they must never
+    // become exemption routes via the physical gateway. DERP's real transport
+    // is the server WS, whose IPs are already in `server_ips`.
+    set.retain(|ip| !ip.is_loopback());
     set
 }
 
@@ -1124,6 +1143,10 @@ impl OverlayRuntime {
             // flag) so a both-UDP-blocked pair only picks DERP when BOTH ends
             // opted in. Default-OFF until field-proven.
             supports_derp: crate::overlay::direct::derp_enabled(),
+            // P7 — this build honors the server's per-pair `OverlayForceDerp`
+            // escalation push. Same local flag as `supports_derp` (a node with
+            // DERP disabled can't be force-pinned onto it).
+            supports_forced_derp: crate::overlay::direct::derp_enabled(),
             // Phase 1 — subnet routes we offer (admin must approve server-side).
             advertised_routes: self.advertised_routes.clone(),
         };
@@ -1143,6 +1166,7 @@ impl OverlayRuntime {
                 }) => break (self_ip, network, peers),
                 Some(OverlayEvent::NetmapDelta { .. }) => continue, // pre-netmap; ignore
                 Some(OverlayEvent::RelayGrant { .. }) => continue,  // pre-netmap; ignore
+                Some(OverlayEvent::ForceDerp { .. }) => continue,   // pre-netmap; ignore
                 None => return,
             }
         };
@@ -1416,12 +1440,18 @@ impl OverlayRuntime {
         // Phase D — LAZY `/derp`: open the WS (via the agent-provided factory)
         // ONLY for a relay-mode node that is itself UDP-blocked — i.e. its srflx
         // gather found nothing (`srflx_advertised.is_empty()`). A UDP-capable
-        // node can never be in a both-UDP-blocked pair, so it never needs DERP
-        // and shouldn't hold an idle `/derp` WS. The factory is `FnOnce`, so
-        // `take()` it; a reconnect re-runs `run` and re-decides from the fresh
-        // gather (a node that became UDP-blocked opens `/derp` then).
+        // node can never be in a both-UDP-blocked pair, so it doesn't hold an
+        // idle `/derp` WS. The factory is `FnOnce`, so `take()` it; a reconnect
+        // re-runs `run` and re-decides from the fresh gather.
+        //
+        // P7 — the factory is RETAINED (moved into a local, not consumed at
+        // startup unless needed): a UDP-capable node can now be force-pinned
+        // onto DERP mid-run by the server's `OverlayForceDerp` push, and the
+        // handler invokes the factory at-most-once THEN — see the ForceDerp
+        // arm.
+        let mut derp_factory = self.derp_mux_factory.take();
         let derp_mux = if matches!(self.mode, CarrierMode::Relay) && srflx_advertised.is_empty() {
-            self.derp_mux_factory.take().map(|f| f())
+            derp_factory.take().map(|f| f())
         } else {
             None
         };
@@ -1837,6 +1867,32 @@ impl OverlayRuntime {
                             }
                         }
                         warn_if_slow("arm:relay_grant", t_arm);
+                    }
+                    Some(OverlayEvent::ForceDerp { peer_node_id, ttl_ms }) => {
+                        let t_arm = Instant::now();
+                        if let Some(r) = relay.as_mut() {
+                            // P7 — a UDP-capable node skipped the startup
+                            // `/derp` open; lazily invoke the retained factory
+                            // (at-most-once) before pinning.
+                            if !r.has_derp_mux()
+                                && let Some(f) = derp_factory.take()
+                            {
+                                r.set_derp_mux(f());
+                            }
+                            // Supersede any in-flight off-loop ALLOCATE — a
+                            // stale AllocDone must not resurrect a TURN link
+                            // inside the forced window.
+                            alloc_q.invalidate(&peer_node_id);
+                            let link = r.force_derp(peer_node_id, Duration::from_millis(ttl_ms));
+                            if let Some(link) = link {
+                                let t0 = Instant::now();
+                                self.install_ready(&mut wg, &mut by_node, &tun, link, &mut relay_bq).await;
+                                warn_if_slow("install_ready(spawn-or-sync)", t0);
+                                self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
+                                self.publish_view(&self_ip, &by_node, &current_peers, exit_node_status(self.exit_node.as_deref(), &exit_state));
+                            }
+                        }
+                        warn_if_slow("arm:force_derp", t_arm);
                     }
                     None => break,
                 },
