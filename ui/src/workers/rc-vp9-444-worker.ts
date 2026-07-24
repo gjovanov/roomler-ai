@@ -115,12 +115,18 @@ let stallSince = 0 // 0 = no active stall; else the lastOutputMs the stall start
 function noteChunkForStallCheck(): void {
   if (!configured || framesDecoded === 0 || stallSince !== 0 || lastOutputMs === 0) return
   const now = performance.now()
-  if (now - lastOutputMs > STALL_GAP_MS && (decoder?.decodeQueueSize ?? 0) > 0) {
+  // 2026-07-24 round 3 — fire even with an EMPTY queue: during a gate wedge
+  // the deltas are dropped before decode() so the queue sits at 0, and the
+  // original queue>0 requirement made the detector silent for exactly the
+  // freeze it was built to catch (field: round-1 freezes with zero console
+  // output). `gated` says whether the keyframe gate was armed at the time.
+  if (now - lastOutputMs > STALL_GAP_MS) {
     stallSince = lastOutputMs
     workerScope.postMessage({
       type: 'decode-stall',
       gapMs: Math.round(now - lastOutputMs),
       queue: decoder?.decodeQueueSize ?? 0,
+      gated: !sawKeyframe,
     })
   }
 }
@@ -292,6 +298,7 @@ function initDecoder() {
     workerScope.postMessage({
       type: 'decoder-configured',
       codec: activeCodec,
+      pref: decodePref,
     })
   } catch (err) {
     workerScope.postMessage({
