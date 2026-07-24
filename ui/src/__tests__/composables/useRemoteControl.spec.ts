@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterAll } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, afterAll } from 'vitest'
 
 // Pure helpers exported for testing. We can't import the full composable
 // here without mocking the WS store; the helpers below are self-contained
@@ -49,6 +49,7 @@ import {
   settingsToCodecChoice,
   parseLocalRelayDescriptor,
   localRelayIceServer,
+  storedDecodePref,
   type AutoTransportInputs,
   type KeyDecision,
   type RcCodecChoice,
@@ -2175,5 +2176,24 @@ describe('localRelayIceServer (Phase 2)', () => {
     })
     expect(s.urls[0]).toBe('turn:127.0.0.1:12345')
     expect(s.urls[0]).not.toContain('100.64')
+  })
+})
+
+describe('storedDecodePref (2026-07-24 decode-stall A/B)', () => {
+  afterEach(() => {
+    localStorage.removeItem('roomler-rc-decode-pref')
+  })
+
+  it('maps the localStorage values to VideoDecoder hardwareAcceleration', () => {
+    localStorage.setItem('roomler-rc-decode-pref', 'software')
+    expect(storedDecodePref()).toBe('prefer-software')
+    localStorage.setItem('roomler-rc-decode-pref', 'hardware')
+    expect(storedDecodePref()).toBe('prefer-hardware')
+  })
+
+  it('defaults to no-preference (unset or garbage)', () => {
+    expect(storedDecodePref()).toBe('no-preference')
+    localStorage.setItem('roomler-rc-decode-pref', 'banana')
+    expect(storedDecodePref()).toBe('no-preference')
   })
 })
