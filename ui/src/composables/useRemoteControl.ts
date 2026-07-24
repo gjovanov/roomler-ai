@@ -2696,6 +2696,57 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    *  label, the worker's VideoDecoder just gets a different codec
    *  string. Only one DC video transport is active per session, so the
    *  shared worker/stats plumbing can't collide. */
+  // ── 2026-07-24 freeze triangulation (round 3) ─────────────────────────────
+  // Field: 3-5 s video freezes with a SILENT console — the worker-side stall
+  // detector needs chunks to arrive to run at all, so silence is ambiguous
+  // between "bytes stopped arriving" (network/SCTP) and "the main thread was
+  // blocked so nothing was forwarded" (jank). These two detectors split that:
+
+  /** Network-side delivery-gap detector. `dc.onmessage` runs on the main
+   *  thread as bytes come off SCTP; a multi-second silence here (logged once,
+   *  on resume) means bytes were NOT arriving → network/SCTP layer. */
+  let lastVideoDcMsgMs = 0
+  function noteVideoDcDelivery() {
+    const now = performance.now()
+    if (lastVideoDcMsgMs > 0 && now - lastVideoDcMsgMs > 1500) {
+      console.warn(
+        '[rc] video DC delivery gap',
+        Math.round(now - lastVideoDcMsgMs),
+        'ms — no video bytes arrived from the network for this long',
+      )
+    }
+    lastVideoDcMsgMs = now
+  }
+
+  /** Self-measuring main-thread jank detector. A 250 ms interval whose tick
+   *  arrives late by >1.5 s means the main thread (which also forwards DC
+   *  chunks to the worker) was blocked that long → the freeze is page jank,
+   *  not network and not the decoder. */
+  let jankTimer: ReturnType<typeof setInterval> | null = null
+  let jankLastTickMs = 0
+  function startJankDetector() {
+    if (jankTimer) return
+    jankLastTickMs = performance.now()
+    jankTimer = setInterval(() => {
+      const now = performance.now()
+      const gap = now - jankLastTickMs
+      if (gap > 1500) {
+        console.warn(
+          '[rc] MAIN-THREAD STALL ~',
+          Math.round(gap),
+          'ms — the page (and DC→worker chunk forwarding) was blocked this long',
+        )
+      }
+      jankLastTickMs = now
+    }, 250)
+  }
+  function stopJankDetector() {
+    if (jankTimer) {
+      clearInterval(jankTimer)
+      jankTimer = null
+    }
+  }
+
   function startVp9_444Path(codecOverride?: string): Worker | null {
     if (vp9_444Worker) return vp9_444Worker
     if (!pc) return null
@@ -2726,7 +2777,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         vp9_444FramesDecoded.value = Math.max(vp9_444FramesDecoded.value, 1)
         console.info('[rc] vp9-444 first frame', msg.width, 'x', msg.height)
       } else if (msg.type === 'decoder-configured') {
-        console.info('[rc] vp9-444 decoder configured', msg.codec)
+        // `pref` (round 3) = the hardwareAcceleration ACTUALLY passed to
+        // configure() — proves whether the roomler-rc-decode-pref A/B took.
+        console.info('[rc] vp9-444 decoder configured', msg.codec, 'hwAccel:', msg.pref ?? 'no-preference')
       } else if (msg.type === 'decoder-error'
         || msg.type === 'decoder-configure-error'
         || msg.type === 'decode-error') {
@@ -2743,6 +2796,15 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         stopVp9_444Path()
       } else if (msg.type === 'frame-rejected') {
         console.warn('[rc] vp9-444 frame rejected', msg)
+      } else if (msg.type === 'awaiting-keyframe') {
+        // Round 3 — parity with the HEVC handler: these worker messages were
+        // silently dropped on the VP9 path, hiding gate activity from the
+        // console during field freezes.
+        console.info('[rc] vp9-444 awaiting keyframe — dropped', msg.dropped, 'delta(s) while gated')
+      } else if (msg.type === 'keyframe-acquired') {
+        console.info('[rc] vp9-444 keyframe acquired (dropped', msg.droppedBefore, 'delta(s) before it)')
+      } else if (msg.type === 'backlog-drop') {
+        console.warn('[rc] vp9-444 backlog drop — decode queue', msg.queue, '— gate re-armed, resync IDR requested (total dropped', msg.dropped, ')')
       } else if (msg.type === 'decode-stall') {
         // 2026-07-24 — frames are arriving but the decoder produced no
         // output for gapMs with work queued: a decoder/GPU-process stall,
@@ -2826,8 +2888,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       return null
     }
     dc.binaryType = 'arraybuffer'
+    lastVideoDcMsgMs = 0 // fresh path — don't count the setup silence as a gap
+    startJankDetector()
     dc.onmessage = (ev) => {
       if (!(ev.data instanceof ArrayBuffer)) return
+      noteVideoDcDelivery()
       try {
         worker.postMessage({ type: 'chunk', bytes: ev.data }, [ev.data])
       } catch (err) {
@@ -2914,7 +2979,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
           '| crop', msg.crop, 'rewrapped', msg.rewrapped,
         )
       } else if (msg.type === 'decoder-configured') {
-        console.info('[rc] hevc decoder configured', msg.codec)
+        // `pref` (round 3) — see the vp9-444 handler.
+        console.info('[rc] hevc decoder configured', msg.codec, 'hwAccel:', msg.pref ?? 'no-preference')
       } else if (msg.type === 'decoder-error'
         || msg.type === 'decoder-configure-error'
         || msg.type === 'decode-error') {
@@ -2934,6 +3000,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         console.info('[rc] hevc awaiting keyframe — dropped', msg.dropped, 'leading delta(s)')
       } else if (msg.type === 'keyframe-acquired') {
         console.info('[rc] hevc first keyframe acquired (dropped', msg.droppedBefore, 'leading delta(s))')
+      } else if (msg.type === 'backlog-drop') {
+        // Round 3 — was silently dropped; parity with the vp9-444 handler.
+        console.warn('[rc] hevc backlog drop — decode queue', msg.queue, '— gate re-armed, resync IDR requested (total dropped', msg.dropped, ')')
       } else if (msg.type === 'decode-stall') {
         // 2026-07-24 — see the vp9-444 handler: decoder/GPU-process stall
         // marker (frames arriving, work queued, no output for gapMs).
@@ -2990,8 +3059,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       return null
     }
     dc.binaryType = 'arraybuffer'
+    lastVideoDcMsgMs = 0 // fresh path — don't count the setup silence as a gap
+    startJankDetector()
     dc.onmessage = (ev) => {
       if (!(ev.data instanceof ArrayBuffer)) return
+      noteVideoDcDelivery()
       try {
         worker.postMessage({ type: 'chunk', bytes: ev.data }, [ev.data])
       } catch (err) {
@@ -3267,6 +3339,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
 
   function teardown() {
     stopStatsPoll()
+    stopJankDetector()
     lastBacklogDrops = 0
     stopWebCodecsPath()
     stopVp9_444Path()
