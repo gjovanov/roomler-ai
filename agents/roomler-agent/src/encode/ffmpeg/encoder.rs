@@ -37,6 +37,20 @@ use tunnel_core::env::node_env;
 /// IDRs can be emitted regardless of this setting.
 const KEYFRAME_INTERVAL: i32 = 240;
 
+/// rc.219 — vp9_qsv-only SHORT GOP. Field-proven (2026-07-24, PC50045 Iris
+/// Xe): vp9_qsv CANNOT force keyframes at runtime — `frame.set_kind(I)` is
+/// ignored AND the `forced_idr=1` option is accepted-but-ineffective
+/// (rc.217 logs: the option in the accepted dict, yet every browser resync
+/// still waited ~1 s of `kf_pending` and only an encoder REBUILD produced a
+/// key-flagged frame). So for vp9_qsv the ONLY reliable resync source is a
+/// NATURAL keyframe — make them frequent: 60 frames = 1 s at 60 fps (~5 s
+/// at the 12 fps viewer-rate shed floor). VP9 keyframe overhead at this
+/// cadence is a few percent of the stream; the browser's keyframe gate then
+/// self-heals off natural keys and the pump's force-ignored rebuild fallback
+/// becomes a true last resort instead of the primary (hiccuping) mechanism.
+/// hevc_qsv / nvenc honour runtime forcing and keep [`KEYFRAME_INTERVAL`].
+const VP9_QSV_KEYFRAME_INTERVAL: i32 = 60;
+
 /// Phase B — default fps for the non-DC-pump constructors (`new_hevc` /
 /// `new_vp9`), which serve the caps probe + the legacy REMB-adaptive WebRTC
 /// track path. The DataChannel pump threads its real per-session `target_fps`
@@ -554,7 +568,14 @@ impl FfmpegEncoder {
             // monotonic_us / 1000.
             enc.set_time_base((1, TIME_BASE_DEN));
             enc.set_frame_rate(Some((fps, 1)));
-            enc.set_gop(KEYFRAME_INTERVAL as u32);
+            // rc.219 — vp9_qsv can't force keyframes at runtime, so it gets
+            // the short natural-key GOP instead (see the const's doc).
+            let gop = if name == "vp9_qsv" {
+                VP9_QSV_KEYFRAME_INTERVAL
+            } else {
+                KEYFRAME_INTERVAL
+            };
+            enc.set_gop(gop as u32);
             enc.set_max_b_frames(0); // low-latency: no B-frames
             Ok(enc)
         };
