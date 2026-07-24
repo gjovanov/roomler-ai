@@ -65,15 +65,22 @@ fn is_session_gone_reject(kind: RejectKind, reason: &str) -> bool {
             || reason.contains(REJECT_REASON_SESSION_MISMATCH))
 }
 
-/// After this many CONSECUTIVE forward-open timeouts on one session — with no
-/// successful open or reply of any kind in between — the session is presumed
-/// wedged: the far side silently stopped answering (a lost-reply relay, or an
-/// agent that forgot us without even sending a reject). End the session so the
-/// flow supervisor re-opens. Small enough to self-heal fast (≈N ×
-/// `FLOW_OPEN_TIMEOUT` of user-visible failure), large enough that one stray
-/// timeout on an otherwise-live route can't trip it. This is the backstop for
-/// the silent variant that [`is_session_gone_reject`] (a *reply*-driven
-/// signal) can't see.
+/// After this many **TCP** forward-open timeouts on one session with NO reply
+/// of any kind (accept or reject) in between, the session is presumed wedged:
+/// the far side silently stopped answering (a lost-reply relay, or an agent
+/// that forgot us without even sending a reject). End the session so the flow
+/// supervisor re-opens. This is the backstop for the silent variant that
+/// [`is_session_gone_reject`] (a *reply*-driven signal) can't see.
+///
+/// Semantics + limits, precisely (a reply of any kind resets the streak):
+/// - Isolated timeouts *interleaved with* successful replies never accumulate
+///   — a live route can't trip it.
+/// - A genuine ≥`FLOW_OPEN_TIMEOUT` control-plane brownout with ≥N *parallel*
+///   opens can trip it in one round; that's correct — the control plane was
+///   provably dead for that window — and the cost is one ~1 s re-open.
+/// - UDP-ASSOCIATE opens (`crate::udp`) are NOT counted; a purely-UDP silent
+///   wedge isn't covered here (its amnesia *rejects* still self-heal via the
+///   dispatch loop). TCP is the observed/motivating case.
 const MAX_CONSECUTIVE_FLOW_TIMEOUTS: u32 = 3;
 
 /// Record one forward-open timeout; returns true once the consecutive count
@@ -632,9 +639,14 @@ async fn run_webrtc_session(
         });
     }
 
-    // Reached only when the dispatcher exited (control channel gone). Return so
-    // `run_forward` reconnects; the sink's WS writer rides the WS teardown, and
-    // in-flight per-flow tasks finish or die with the connection.
+    // The loop broke on one of the non-accept arms. If it was a
+    // `session_dead` / (elsewhere) `conn.closed()` break the dispatcher is
+    // STILL running — abort it so it drops its `sink` clone. On the standalone
+    // CLI that sink clone keeps `outbound_tx` (and thus the WS keepalive)
+    // alive, so an un-aborted dispatcher would pin the old WS + peer + TURN
+    // allocation open forever, leaking one set per re-open (F1). A no-op when
+    // the dispatcher already exited (the control-channel-closed arm).
+    dispatcher_task.abort();
     Ok(())
 }
 
@@ -1247,8 +1259,12 @@ async fn run_quic_session(
         });
     }
 
-    // Reached only when the dispatcher exited — return so `run_forward`
-    // reconnects (the QUIC endpoint + conn drop here, closing the connection).
+    // Abort the dispatcher if a non-accept arm broke the loop while it was
+    // still running (`session_dead` / `conn.closed()`) so it releases its
+    // `sink` clone — else the standalone CLI's WS keepalive pins the old WS +
+    // peer + TURN allocation open per re-open (F1). No-op when the
+    // control-channel-closed arm already ended it.
+    dispatcher_task.abort();
     Ok(SessionOutcome::Completed)
 }
 
