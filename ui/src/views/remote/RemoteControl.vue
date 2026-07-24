@@ -789,6 +789,23 @@
           >
             Receive host audio — {{ audioOn ? 'ON' : 'OFF' }}
           </v-btn>
+          <!-- loopback-TURN corp-relay assist (browser half; default-OFF).
+               Surfaces the localStorage opt-in as a one-click toggle so the
+               UDP-blocked-corp field test doesn't need DevTools. The agent
+               half is default-ON (hosts the TURN whenever an overlay IP
+               exists); this flag is what makes the browser probe + inject it. -->
+          <v-btn
+            block
+            variant="tonal"
+            :color="localRelayOn ? 'primary' : undefined"
+            :disabled="sessionLive"
+            :prepend-icon="localRelayOn ? 'mdi-lan-connect' : 'mdi-lan-disconnect'"
+            :title="localRelayTooltip"
+            class="mb-2"
+            @click="toggleLocalRelay"
+          >
+            Corp relay assist — {{ localRelayOn ? 'ON' : 'OFF' }}
+          </v-btn>
           <template v-if="rc.phase.value === 'connected'">
             <v-btn
               block
@@ -1876,6 +1893,24 @@ const audioTooltip = computed<string>(() => {
 })
 function toggleAudio() {
   rc.setAudioEnabled(!audioOn.value)
+}
+
+// loopback-TURN corp-relay assist (browser half). Mirrors the audio
+// toggle's next-Connect semantics: the probe + ICE injection happen in
+// connect(), so a mid-session flip would look like it did nothing —
+// disable while live. Reads the composable's persisted opt-in
+// (localStorage `roomler-rc-local-relay`).
+const localRelayOn = computed<boolean>(() => rc.localRelayEnabled.value)
+const localRelayTooltip = computed<string>(() => {
+  if (sessionLive.value) {
+    return 'Corp relay assist — disconnect to change (takes effect on next Connect)'
+  }
+  return localRelayOn.value
+    ? 'Corp relay assist ON — when a direct path can\'t form (UDP-blocked corporate network), relay through this device\'s local agent over the overlay instead of the capped far relay. Takes effect on next Connect.'
+    : 'Corp relay assist OFF — click to relay through this device\'s local agent when direct fails (needs an enrolled agent with an overlay on this machine). Takes effect on next Connect.'
+})
+function toggleLocalRelay() {
+  rc.setLocalRelayEnabled(!localRelayOn.value)
 }
 
 // ── rc.199 — unified Codec picker + Priority dial (Settings panel) ──
