@@ -41,6 +41,10 @@ type InitCanvasMessage = {
    *  `hev1.1.6.L120.90` (L4.0) for 4K or `hev1.1.6.L150.90` (L5.0)
    *  for 4K60. Tests may override. */
   codec?: string
+  /** 2026-07-24 decode-stall A/B — optional `VideoDecoder.hardwareAcceleration`
+   *  override from the composable (localStorage `roomler-rc-decode-pref`).
+   *  Unset → `'no-preference'`, today's behaviour. */
+  decodePref?: 'prefer-software' | 'prefer-hardware' | 'no-preference'
 }
 type ChunkMessage = { type: 'chunk'; bytes: ArrayBuffer }
 type CloseMessage = { type: 'close' }
@@ -117,6 +121,44 @@ function requestKeyframeResync(): void {
   workerScope.postMessage({ type: 'request-keyframe' })
 }
 
+// 2026-07-24 decode-stall telemetry + A/B (mirrors rc-vp9-444-worker — see
+// its comment for the field story): report a one-shot `decode-stall` when
+// chunks keep arriving while the decoder has produced no output for
+// STALL_GAP_MS with work queued, and `decode-stall-recovered` (true gap) once
+// output resumes. `decodePref` is the composable's localStorage A/B override
+// for `hardwareAcceleration` (NOTE: HEVC has no SW decoder in Chromium —
+// prefer-software here fails configure() and the composable's existing
+// fallback path takes over; the A/B is meaningful on the VP9/AV1 workers).
+const STALL_GAP_MS = 1500
+let decodePref: 'prefer-software' | 'prefer-hardware' | 'no-preference' = 'no-preference'
+let lastOutputMs = 0
+let stallSince = 0 // 0 = no active stall
+
+function noteChunkForStallCheck(): void {
+  if (!configured || framesDecoded === 0 || stallSince !== 0 || lastOutputMs === 0) return
+  const now = performance.now()
+  if (now - lastOutputMs > STALL_GAP_MS && (decoder?.decodeQueueSize ?? 0) > 0) {
+    stallSince = lastOutputMs
+    workerScope.postMessage({
+      type: 'decode-stall',
+      gapMs: Math.round(now - lastOutputMs),
+      queue: decoder?.decodeQueueSize ?? 0,
+    })
+  }
+}
+
+function noteOutputForStallCheck(): void {
+  const now = performance.now()
+  if (stallSince !== 0) {
+    workerScope.postMessage({
+      type: 'decode-stall-recovered',
+      gapMs: Math.round(now - stallSince),
+    })
+    stallSince = 0
+  }
+  lastOutputMs = now
+}
+
 /** Rolling-window stats for the HUD, matching the VP9-444 worker so
  *  the composable can consume both with the same message shape. */
 let statsBytesInWindow = 0
@@ -174,12 +216,20 @@ workerScope.onmessage = (e) => {
     if (typeof msg.codec === 'string' && msg.codec.length > 0) {
       activeCodec = msg.codec
     }
+    if (
+      msg.decodePref === 'prefer-software'
+      || msg.decodePref === 'prefer-hardware'
+      || msg.decodePref === 'no-preference'
+    ) {
+      decodePref = msg.decodePref
+    }
     initDecoder()
   } else if (msg.type === 'chunk') {
     framesReceived++
     const u8 = new Uint8Array(msg.bytes)
     statsBytesInWindow += u8.byteLength
     statsBytesTotal += u8.byteLength
+    noteChunkForStallCheck()
     consumeBytes(u8)
     maybeEmitStats()
   } else if (msg.type === 'close') {
@@ -193,6 +243,7 @@ function initDecoder() {
     output: (frame) => {
       framesDecoded++
       statsFramesInWindow++
+      noteOutputForStallCheck()
       // rc.100/rc.102 — Chrome's NVDEC HEVC decode mis-reports the picture
       // geometry for our hevc_nvenc stream (field GORAN-XMG-NEO16, RTX 5090):
       // the agent encodes a FULL 2560×1600 desktop (proven by the FFmpeg DC
@@ -294,7 +345,9 @@ function initDecoder() {
     decoder.configure({
       codec: activeCodec,
       optimizeForLatency: true,
-      hardwareAcceleration: 'no-preference',
+      // 2026-07-24 — `decodePref` (localStorage A/B) can override for the
+      // decode-stall field diagnosis; defaults to 'no-preference'.
+      hardwareAcceleration: decodePref,
     } as VideoDecoderConfig)
     configured = true
     workerScope.postMessage({
