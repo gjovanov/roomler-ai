@@ -224,6 +224,21 @@ fn encoder_options(
         if let Some(v) = lowlat_knob("FFMPEG_QSV_ASYNC_DEPTH", "1") {
             lowlat.push(("async_depth".into(), v));
         }
+        // rc.217 — `forced_idr=1` (NOTE: underscore — qsv spelling, vs
+        // nvenc's `forced-idr`): the qsv mirror of the rc.98 NVENC fix.
+        // Field 2026-07-24 (NEO16 viewing PC50045): vp9_qsv IGNORED runtime
+        // keyframe forcing via `frame.set_kind(I)` — browser resync requests
+        // and the 4 s backstop produced NO key-flagged packet, wedging the
+        // viewer's keyframe gate until an encoder rebuild happened to emit a
+        // real IDR (hevc_qsv honours bare pict_type, vp9_qsv evidently
+        // needs the option). In the tier-protected `lowlat` group (not
+        // `base`): the option dict is ALL-OR-NOTHING, so if some qsv build
+        // rejects `forced_idr` we fall back to the quality tier instead of
+        // losing global_quality/maxrate wholesale. Env-escapable like the
+        // other knobs; the peer.rs rebuild fallback stays as the net.
+        if let Some(v) = lowlat_knob("FFMPEG_QSV_FORCED_IDR", "1") {
+            lowlat.push(("forced_idr".into(), v));
+        }
     } else if name.contains("amf") {
         // AMD AMF: constant-QP-ish via qp_i/qp_p, latency-tuned VBR,
         // capped burst.
