@@ -1883,7 +1883,30 @@ impl OverlayRuntime {
                             // stale AllocDone must not resurrect a TURN link
                             // inside the forced window.
                             alloc_q.invalidate(&peer_node_id);
-                            let link = r.force_derp(peer_node_id, Duration::from_millis(ttl_ms));
+                            let mut link = r.force_derp(peer_node_id, Duration::from_millis(ttl_ms));
+                            // rc.222 — stamp-only + an INSTALLED TURN relay for
+                            // the pair: tear it down NOW and rebuild under the
+                            // pin. The server just certified the pair's TURN
+                            // broken, and a half-dead (one-way) relay keeps rx
+                            // alive, so the liveness sweep would never cycle it
+                            // (the field-observed ZOMBIE wedge). Direct
+                            // carriers are left alone — the escalation is about
+                            // the TURN tier.
+                            if link.is_none()
+                                && by_node.get(&peer_node_id).is_some_and(|e| !e.is_direct)
+                                && let Some(e) = by_node.remove(&peer_node_id)
+                            {
+                                wg.remove_peer(&e.pubkey).await;
+                                tun.del_peer_route(e.overlay_ip).await;
+                                r.forget(&peer_node_id);
+                                if let Some(cfg) = current_peers
+                                    .get(&peer_node_id)
+                                    .and_then(peer_config_from_netmap)
+                                {
+                                    r.request(peer_node_id, cfg.clone()).await;
+                                    link = r.maybe_complete(peer_node_id, &cfg);
+                                }
+                            }
                             if let Some(link) = link {
                                 let t0 = Instant::now();
                                 self.install_ready(&mut wg, &mut by_node, &tun, link, &mut relay_bq).await;
