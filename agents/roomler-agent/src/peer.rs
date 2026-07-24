@@ -1166,7 +1166,12 @@ const KEYFRAME_BACKSTOP: Duration = Duration::from_secs(4);
 /// key-flagged packet within this window, REBUILD the encoder. Honouring
 /// encoders (nvenc, hevc_qsv) deliver the flagged key in <100 ms and never
 /// trip this; only force-ignoring encoders pay the ~10-50 ms rebuild.
-#[cfg(feature = "ffmpeg-encoder")]
+///
+/// Mirrored in the libvpx VP9-444 pump for parity — libvpx force flags are
+/// synchronous (the next encode IS the keyframe) so it should never fire
+/// there; the mirror just guarantees NO pump can wedge on an unanswered
+/// force, whatever encoder quirk ships next.
+#[cfg(any(feature = "vp9-444", feature = "ffmpeg-encoder"))]
 const KEYFRAME_FORCE_REBUILD_AFTER: Duration = Duration::from_secs(1);
 
 #[cfg(any(feature = "vp9-444", feature = "ffmpeg-encoder"))]
@@ -2235,6 +2240,11 @@ async fn media_pump_vp9_444_dc(
     // (whose first frames are IDRs anyway) doesn't double-fire.
     let mut last_key_sent = std::time::Instant::now();
     let mut kf_backstop_logged = false;
+    // Force-ignored fallback parity (see [`KEYFRAME_FORCE_REBUILD_AFTER`]) —
+    // libvpx force flags are synchronous, so this should never fire here;
+    // mirrored from the ffmpeg pump so no pump can wedge on an unanswered
+    // force.
+    let mut kf_pending_since: Option<std::time::Instant> = None;
 
     // rc.39 — agent-side scene-change keyframe trigger. Heuristic:
     // after each encode, if the latest delta packet's size exceeds
@@ -2667,6 +2677,24 @@ async fn media_pump_vp9_444_dc(
                 }
             }
         }
+        // Force-ignored fallback parity — checked BEFORE the `enc` borrow so
+        // the rebuild can drop the encoder (see [`KEYFRAME_FORCE_REBUILD_AFTER`];
+        // the ffmpeg pump's block is the field-proven original). `continue`
+        // lets the next iteration's dims-mismatch check reconstruct; the fresh
+        // encoder's first frame is a guaranteed key-flagged IDR.
+        if let Some(t) = kf_pending_since
+            && t.elapsed() >= KEYFRAME_FORCE_REBUILD_AFTER
+        {
+            warn!(
+                %session_id,
+                pending_ms = t.elapsed().as_millis() as u64,
+                "VP9-444 DC pump: encoder ignored forced keyframe — rebuilding to emit a guaranteed IDR"
+            );
+            encoder = None;
+            encoder_dims = None;
+            kf_pending_since = None;
+            continue;
+        }
         let enc = encoder.as_mut().unwrap();
         let mut force_keyframe_this_iter = false;
         if keyframe_requested.swap(false, std::sync::atomic::Ordering::Relaxed) {
@@ -2688,6 +2716,11 @@ async fn media_pump_vp9_444_dc(
                     "VP9-444 DC pump: keyframe backstop engaged (no IDR sent for 4s — bounding viewer resync wait)"
                 );
             }
+        }
+        // Force-ignored fallback parity — arm on the first unanswered force;
+        // the send loop clears it when a key-flagged frame actually goes out.
+        if force_keyframe_this_iter && kf_pending_since.is_none() {
+            kf_pending_since = Some(std::time::Instant::now());
         }
 
         // rc.188 — viewer-rate fps cap (mirror of the media_pump_ffmpeg_dc
@@ -2966,9 +2999,11 @@ async fn media_pump_vp9_444_dc(
                 Ok(()) => {
                     // Backstop bookkeeping: only a key frame that actually
                     // entered the send queue counts (a shed one didn't reach
-                    // the viewer).
+                    // the viewer). Also answers any pending forced-keyframe
+                    // request (the force-ignored fallback stands down).
                     if p.is_keyframe {
                         last_key_sent = std::time::Instant::now();
+                        kf_pending_since = None;
                     }
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
