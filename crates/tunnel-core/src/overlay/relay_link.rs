@@ -647,20 +647,28 @@ impl RelayCoordinator {
                 .filter_map(|e| e.parse().ok())
                 .find(|s: &SocketAddr| !is_lan_addr(s.ip()))?
         } else {
-            // Both-allocate: dial the peer's relayed addr on OUR worker, else any
-            // public. NEVER LAN (see the fn doc).
+            // Both-allocate: dial the peer's relayed addr on OUR worker — and
+            // ONLY that. WITHHOLD (retry next netmap) until it appears.
+            //
+            // The old "else any public endpoint" fallback predates the rc.127
+            // deterministic worker pin and could grab the peer's HOST public
+            // IP as the "relay" dst. Field 2026-07-24: a web-deploy rejoin
+            // wiped the peer's relay advert (rehydrate resets `endpoints` to
+            // the join's LAN candidates), the fallback dialed the peer's host
+            // address as if it were coturn, and the result was an outbound-
+            // blackhole ZOMBIE carrier — its rx stayed alive on the peer's
+            // healthy inbound leg, so the liveness sweep never cycled it and
+            // the pair wedged permanently (which also starved the P7 churn
+            // counter of the re-requests it feeds on). Both ends pin to one
+            // worker from the shared `pair_key`, so the peer's true relay
+            // MUST be on our worker; anything else in `endpoints` is a host
+            // address, never a relay. NEVER LAN (see the fn doc).
             let our_worker_ip = a.conn.local_addr().ok().map(|s| s.ip());
-            let parsed: Vec<SocketAddr> = a
-                .peer
+            a.peer
                 .endpoints
                 .iter()
                 .filter_map(|e| e.parse().ok())
-                .collect();
-            parsed
-                .iter()
-                .find(|s| Some(s.ip()) == our_worker_ip)
-                .or_else(|| parsed.iter().find(|s| !is_lan_addr(s.ip())))
-                .copied()?
+                .find(|s: &SocketAddr| Some(s.ip()) == our_worker_ip)?
         };
         let carrier = Carrier::relay(a.conn.clone(), dst);
         let link = ReadyLink {
@@ -1526,5 +1534,67 @@ mod tests {
         let mut bare = RelayCoordinator::new(tx3, [0x00u8; 32], true, vec![], None);
         assert!(bare.force_derp(n, Duration::from_secs(60)).is_none());
         assert!(!bare.forced_derp_active(&n), "no mux ⇒ no pin");
+    }
+
+    /// rc.222 — the both-allocate dst is SAME-WORKER ONLY. A peer whose
+    /// endpoints carry no address on our allocation's worker (e.g. its relay
+    /// advert was wiped by a rejoin, leaving only host/public addresses)
+    /// WITHHOLDS — never dials a host IP as the "relay" (the field-proven
+    /// zombie-carrier wedge: an outbound-blackhole dst whose rx stays alive
+    /// on the peer's healthy inbound leg, so the sweep never cycles it).
+    #[tokio::test]
+    async fn try_build_withholds_without_same_worker_relay() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<ClientMsg>(8);
+        let mut c = RelayCoordinator::new(tx, [0x00u8; 32], true, vec![], None);
+        let n = ObjectId::new();
+        let mk_conn = || -> (Arc<dyn RelayConn>, SocketAddr) {
+            let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            sock.set_nonblocking(true).unwrap();
+            let local = sock.local_addr().unwrap();
+            (
+                Arc::new(crate::transport::relay::UdpRelayConn(
+                    tokio::net::UdpSocket::from_std(sock).unwrap(),
+                )),
+                local,
+            )
+        };
+
+        // Peer advertises ONLY a public host address (no relay on our worker)
+        // ⇒ WITHHOLD: no link, the allocation stays parked for the next netmap.
+        let (conn, _local) = mk_conn();
+        c.allocated.insert(
+            n,
+            Allocated {
+                conn,
+                peer: PeerConfig {
+                    public_key: [0xFFu8; 32],
+                    endpoints: vec!["203.0.113.7:33969".into()],
+                    ..base_peer()
+                },
+            },
+        );
+        assert!(
+            c.try_build(&n).is_none(),
+            "host/public endpoint must never become the relay dst"
+        );
+        assert!(c.allocated.contains_key(&n), "still parked for retry");
+
+        // Peer's relayed address on OUR worker (same IP as our allocation's
+        // local socket) ⇒ build.
+        let (conn2, local2) = mk_conn();
+        let dst = format!("{}:45555", local2.ip());
+        c.allocated.insert(
+            n,
+            Allocated {
+                conn: conn2,
+                peer: PeerConfig {
+                    public_key: [0xFFu8; 32],
+                    endpoints: vec!["203.0.113.7:33969".into(), dst.clone()],
+                    ..base_peer()
+                },
+            },
+        );
+        let link = c.try_build(&n).expect("same-worker relay dst builds");
+        assert_eq!(link.relay_parts.unwrap().1, dst.parse().unwrap());
     }
 }
