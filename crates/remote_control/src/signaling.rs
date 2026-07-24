@@ -601,6 +601,13 @@ pub enum ClientMsg {
         /// advertise it. Absent from a pre-DERP node ⇒ `false`.
         #[serde(default)]
         supports_derp: bool,
+        /// P7 (corp-DERP fallback) — the node honors the server's
+        /// [`ServerMsg::OverlayForceDerp`] per-pair escalation push (it can pin
+        /// a churning TURN pair onto the DERP carrier mid-run). The capability
+        /// flag — not a version — gates the server: it only escalates a pair
+        /// when BOTH ends advertise this. Absent from a pre-P7 node ⇒ `false`.
+        #[serde(default)]
+        supports_forced_derp: bool,
         /// Phase 1 — subnet CIDRs this node offers to route for peers
         /// (`--advertise-routes` / config). The server stores them as *claimed*
         /// routes; an admin must **approve** each before it's distributed in the
@@ -1064,6 +1071,27 @@ pub enum ServerMsg {
         #[serde(with = "oid_hex")]
         peer_node_id: ObjectId,
         pair_key: String,
+    },
+
+    /// P7 (corp-DERP fallback) — the server observed sustained TURN-relay
+    /// churn for this pair (repeated grant→re-request cycles: a corp
+    /// middlebox RST-ing the TURNS/TCP control socket kills every
+    /// allocation) and escalates it to the DERP carrier. Pushed to **BOTH**
+    /// ends of the pair — this must NOT ride the relay grant, because the
+    /// single-relay DIALER never sends a `relay_request` and so never sees a
+    /// grant. Each end pins the pair to `RelayStrategy::Derp` for `ttl_ms`;
+    /// the pin governs (re)establishment only — an already-healthy carrier
+    /// is left alone, and LAN/direct upgrades keep working (DERP is a
+    /// fallback tier, not a destination). Only sent when BOTH ends
+    /// advertised `supports_forced_derp` + `supports_derp`, so a mixed-
+    /// version pair can never split tiers.
+    #[serde(rename = "rc:overlay.force_derp")]
+    OverlayForceDerp {
+        #[serde(with = "oid_hex")]
+        peer_node_id: ObjectId,
+        /// How long the pin lasts, in ms (server-side TTL mirrored so both
+        /// ends expire together).
+        ttl_ms: u64,
     },
 }
 
@@ -2161,6 +2189,7 @@ mod tests {
             supports_quic: true,
             supports_relay_single: true,
             supports_derp: true,
+            supports_forced_derp: true,
             advertised_routes: vec!["192.168.1.0/24".into()],
         };
         let s = serde_json::to_string(&m).unwrap();
@@ -2173,6 +2202,7 @@ mod tests {
                 supports_quic,
                 supports_relay_single,
                 supports_derp,
+                supports_forced_derp,
                 advertised_routes,
                 ..
             } => {
@@ -2185,9 +2215,50 @@ mod tests {
                     "supports_relay_single must round-trip"
                 );
                 assert!(supports_derp, "supports_derp must round-trip");
+                assert!(
+                    supports_forced_derp,
+                    "supports_forced_derp must round-trip (P7)"
+                );
                 assert_eq!(advertised_routes, vec!["192.168.1.0/24".to_string()]);
             }
             other => panic!("expected OverlayJoin, got {other:?}"),
+        }
+        // P7 back-compat lock: a pre-P7 join (no supports_forced_derp key)
+        // parses with the flag defaulted false.
+        let legacy = r#"{"t":"rc:overlay.join","wg_public_key":"cHVia2V5","mtu":1280}"#;
+        match serde_json::from_str::<ClientMsg>(legacy).unwrap() {
+            ClientMsg::OverlayJoin {
+                supports_forced_derp,
+                ..
+            } => assert!(!supports_forced_derp, "absent flag must default false"),
+            other => panic!("expected OverlayJoin, got {other:?}"),
+        }
+    }
+
+    /// P7 — `rc:overlay.force_derp` wire-format lock: hex node id + ttl_ms
+    /// round-trip, and the tag string is stable.
+    #[test]
+    fn overlay_force_derp_roundtrip() {
+        let id = ObjectId::new();
+        let m = ServerMsg::OverlayForceDerp {
+            peer_node_id: id,
+            ttl_ms: 1_800_000,
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(r#""t":"rc:overlay.force_derp""#));
+        assert!(
+            s.contains(&id.to_hex()),
+            "node id must serialize as raw hex"
+        );
+        match serde_json::from_str::<ServerMsg>(&s).unwrap() {
+            ServerMsg::OverlayForceDerp {
+                peer_node_id,
+                ttl_ms,
+            } => {
+                assert_eq!(peer_node_id, id);
+                assert_eq!(ttl_ms, 1_800_000);
+            }
+            other => panic!("expected OverlayForceDerp, got {other:?}"),
         }
     }
 
