@@ -1153,6 +1153,22 @@ const TRANSPORT_RECHECK_INTERVAL: Duration = Duration::from_secs(5);
 #[cfg(any(feature = "vp9-444", feature = "ffmpeg-encoder"))]
 const KEYFRAME_BACKSTOP: Duration = Duration::from_secs(4);
 
+/// Force-ignored fallback (2026-07-24 field, the 14.5 s freeze): `vp9_qsv`
+/// ignores runtime keyframe forcing (`pict_type=I` on the input frame — the
+/// rc.98 class of bug; NVENC needed `forced-idr=1`, `hevc_qsv` honours the
+/// pict_type, `vp9_qsv` evidently does neither), so a browser resync request
+/// AND the [`KEYFRAME_BACKSTOP`] both fire uselessly: no key-FLAGGED packet
+/// ever comes out, the browser's keyframe gate keeps dropping every delta
+/// (field trace: 296 deltas dropped over 14.5 s while the browser begged at
+/// 4 req/s), and recovery only happened when an AIMD bitrate move rebuilt the
+/// encoder — whose FIRST frame is a guaranteed flagged IDR. This fallback
+/// makes that recovery deterministic: if a forced keyframe hasn't produced a
+/// key-flagged packet within this window, REBUILD the encoder. Honouring
+/// encoders (nvenc, hevc_qsv) deliver the flagged key in <100 ms and never
+/// trip this; only force-ignoring encoders pay the ~10-50 ms rebuild.
+#[cfg(feature = "ffmpeg-encoder")]
+const KEYFRAME_FORCE_REBUILD_AFTER: Duration = Duration::from_secs(1);
+
 #[cfg(any(feature = "vp9-444", feature = "ffmpeg-encoder"))]
 async fn current_pair_is_relay(
     pc: &Arc<RTCPeerConnection>,
@@ -3274,6 +3290,10 @@ async fn media_pump_ffmpeg_dc(
     // (whose first frames are IDRs anyway) doesn't double-fire.
     let mut last_key_sent = std::time::Instant::now();
     let mut kf_backstop_logged = false;
+    // Force-ignored fallback — Some(when the oldest unanswered forced-keyframe
+    // request was made); cleared when a key-flagged packet enters the send
+    // queue. See [`KEYFRAME_FORCE_REBUILD_AFTER`].
+    let mut kf_pending_since: Option<std::time::Instant> = None;
     // rc.190 — one-shot (per value) log marker for the relay resolution cap.
     let mut res_cap_logged: Option<TargetResolution> = None;
     // rc.186 — encode-pressure: when the encoder saturates (heartbeat
@@ -3729,6 +3749,29 @@ async fn media_pump_ffmpeg_dc(
             }
         }
 
+        // Force-ignored fallback — see [`KEYFRAME_FORCE_REBUILD_AFTER`]. Arm
+        // on the first unanswered force; the send loop clears it when a
+        // key-flagged packet actually goes out. If the encoder sat on the
+        // force past the window (vp9_qsv ignores pict_type=I), rebuild it —
+        // the fresh encoder's first frame is a guaranteed flagged IDR, which
+        // is exactly what the browser's keyframe gate is starving for.
+        if force_keyframe_this_iter && kf_pending_since.is_none() {
+            kf_pending_since = Some(std::time::Instant::now());
+        }
+        if let Some(t) = kf_pending_since
+            && t.elapsed() >= KEYFRAME_FORCE_REBUILD_AFTER
+        {
+            warn!(
+                %session_id,
+                codec_label,
+                pending_ms = t.elapsed().as_millis() as u64,
+                "FFmpeg DC pump: encoder ignored forced keyframe — rebuilding to emit a guaranteed IDR (vp9_qsv-class runtime-force bug)"
+            );
+            encoder = None;
+            encoder_dims = None;
+            kf_pending_since = None;
+        }
+
         // rc.188 — viewer-rate fps cap. Once a second, fold the browser's
         // measured decode report (`rc:decodestat`: decoded fps + a struggling
         // bit) into a send-fps cap and derive the frame-skip divisor; then drop
@@ -3875,9 +3918,11 @@ async fn media_pump_ffmpeg_dc(
                 Ok(()) => {
                     // Backstop bookkeeping: only a key frame that actually
                     // entered the send queue counts (a shed one didn't reach
-                    // the viewer).
+                    // the viewer). Also answers any pending forced-keyframe
+                    // request (the force-ignored fallback stands down).
                     if pkt.is_keyframe {
                         last_key_sent = std::time::Instant::now();
+                        kf_pending_since = None;
                     }
                     if resync_pending {
                         // First frame through after a drop burst — make the
