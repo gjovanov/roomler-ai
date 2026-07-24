@@ -77,6 +77,7 @@ pub async fn relay_overlay_msg_from_node(
             supports_quic,
             supports_relay_single,
             supports_derp,
+            supports_forced_derp,
             advertised_routes,
             ..
         } => {
@@ -89,6 +90,7 @@ pub async fn relay_overlay_msg_from_node(
                 supports_quic,
                 supports_relay_single,
                 supports_derp,
+                supports_forced_derp,
                 advertised_routes,
             )
             .await;
@@ -126,6 +128,7 @@ async fn handle_overlay_join(
     supports_quic: bool,
     supports_relay_single: bool,
     supports_derp: bool,
+    supports_forced_derp: bool,
     advertised_routes: Vec<String>,
 ) {
     let node_ref = ident.node_ref();
@@ -179,6 +182,7 @@ async fn handle_overlay_join(
                     supports_quic,
                     supports_relay_single,
                     supports_derp,
+                    supports_forced_derp,
                     &advertised_routes,
                 )
                 .await
@@ -219,6 +223,7 @@ async fn handle_overlay_join(
                     supports_quic,
                     supports_relay_single,
                     supports_derp,
+                    supports_forced_derp,
                     advertised_routes,
                 )
                 .await
@@ -305,6 +310,13 @@ async fn handle_overlay_join(
         )
         .await;
     }
+
+    // P7 — a node that restarted mid-escalation lost its client-side DERP pin
+    // (it lives in process memory); re-push any unexpired forced pairs so it
+    // can't resume the broken TURN tier against a still-pinned peer. This is
+    // the ONLY re-delivery path a single-relay DIALER has — it never sends a
+    // relay_request, so it can't pick the pin back up reactively.
+    repush_forced_pairs_on_join(state, &self_node).await;
 }
 
 /// Trickle: update the node's candidates → fan an upsert delta so peers
@@ -408,12 +420,57 @@ async fn handle_overlay_relay_request(
     };
 
     let pair_key = pair_key(self_id, peer_node_id);
+
+    // P7 — forced-DERP escalation: a request that lands shortly after a prior
+    // grant for the same pair means that grant's carrier already died (the
+    // corp-middlebox TURN-churn signature). Count those grant→re-request
+    // cycles; past the threshold, push `rc:overlay.force_derp` to BOTH ends
+    // (never grant-borne — the single-relay DIALER never requests, so it
+    // would never see a grant field) and skip the TURN grant entirely. Gated
+    // on BOTH ends advertising the capability, so a mixed-version pair can
+    // never split tiers.
+    let pair_supports_forced_derp = forced_derp_enabled()
+        && self_node.supports_forced_derp
+        && self_node.supports_derp
+        && peer.supports_forced_derp
+        && peer.supports_derp;
+    if pair_supports_forced_derp && note_relay_request(state, &pair_key) {
+        tracing::info!(
+            %pair_key, requester = %self_id, peer = %peer_node_id,
+            "overlay relay: TURN churn threshold — escalating pair to forced DERP"
+        );
+        let ttl_ms = FORCED_DERP_TTL.as_millis() as u64;
+        send_to_node(
+            state,
+            &self_node,
+            ServerMsg::OverlayForceDerp {
+                peer_node_id: peer.id.unwrap_or(peer_node_id),
+                ttl_ms,
+            },
+        )
+        .await;
+        send_to_node(
+            state,
+            &peer,
+            ServerMsg::OverlayForceDerp {
+                peer_node_id: self_id,
+                ttl_ms,
+            },
+        )
+        .await;
+        return;
+    }
+
     // Both ends derive identical creds from the symmetric pair_key, AND the
     // broker pins them to a single deterministic coturn worker (see
     // `overlay_ice_servers`) so the relay-to-relay leg is an intra-worker
     // hairpin that never crosses mars's dual-public-IP SNAT.
     let ice_servers = overlay_ice_servers(state, &pair_key).await;
 
+    // P7 — arm the churn detector: a re-request for this pair arriving after
+    // this grant (past the dedup gap) counts as one churn cycle. Armed before
+    // the send so `pair_key` can move into the grant.
+    note_grant_sent(state, &pair_key);
     send_to_node(
         state,
         &self_node,
@@ -424,6 +481,179 @@ async fn handle_overlay_relay_request(
         },
     )
     .await;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// P7 — forced-DERP escalation (per-pair TURN-churn tracking)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Sliding window a pair's churn cycles are counted within.
+const CHURN_WINDOW: Duration = Duration::from_secs(600);
+/// Grant→re-request cycles inside [`CHURN_WINDOW`] that trigger escalation.
+/// At the client's ~30 s teardown/re-request cadence this is ~2 min of
+/// sustained churn — fast enough to matter, slow enough that a transient
+/// blip never escalates.
+const CHURN_CYCLES_TO_ESCALATE: u32 = 3;
+/// How long an escalated pair stays pinned to DERP (server TTL, mirrored to
+/// both clients in `ttl_ms`). Stands alone — a forced pair stops sending
+/// relay_requests, so nothing refreshes it; expiry simply lets the next
+/// establishment cycle try TURN again.
+const FORCED_DERP_TTL: Duration = Duration::from_secs(1800);
+/// A request arriving within this gap of the pair's last grant is a client
+/// retry/duplicate, not a died-carrier cycle.
+const CYCLE_MIN_GAP: Duration = Duration::from_secs(5);
+/// Hard cap on tracked pairs — a `retain` sweep drops stale entries past it
+/// (reset-on-access TTLs alone never evict idle keys).
+const CHURN_MAP_CAP: usize = 10_000;
+
+/// P7 — per-pair TURN-relay churn state (see `AppState::relay_pair_churn`).
+#[derive(Debug, Default)]
+pub struct PairChurn {
+    /// Completed grant→re-request cycles inside the current window.
+    cycles: u32,
+    /// When the current counting window opened.
+    window_start: Option<Instant>,
+    /// When the last TURN grant for this pair was sent; a re-request after it
+    /// (past [`CYCLE_MIN_GAP`]) = one churn cycle. Cleared once consumed so a
+    /// burst of retries counts once per grant.
+    last_grant_at: Option<Instant>,
+    /// While unexpired, the pair is escalated (mirrors the client-side pin).
+    forced_until: Option<Instant>,
+}
+
+/// P7 — is this pair currently under an unexpired forced-DERP TTL?
+fn forced_active(pc: &PairChurn, now: Instant) -> bool {
+    pc.forced_until.is_some_and(|t| now < t)
+}
+
+/// P7 — pure decision core: note a relay_request for a pair at `now`.
+/// Returns `true` when the pair should be (or already is) escalated — the
+/// caller then pushes `force_derp` to both ends instead of granting. Kept
+/// state-free of `AppState` so the threshold arithmetic is unit-tested
+/// directly.
+pub(crate) fn churn_note_request(pc: &mut PairChurn, now: Instant) -> bool {
+    if forced_active(pc, now) {
+        // Mid-TTL re-request = a client that restarted and lost its pin;
+        // re-escalate it (the peer keeps its own pin).
+        return true;
+    }
+    pc.forced_until = None;
+    let Some(granted) = pc.last_grant_at else {
+        // No grant on record (fresh pair / post-restart / post-expiry first
+        // contact) — a first request is never churn.
+        return false;
+    };
+    if now.duration_since(granted) < CYCLE_MIN_GAP {
+        return false; // client retry burst, not a died carrier
+    }
+    pc.last_grant_at = None; // consume: one cycle per grant
+    match pc.window_start {
+        Some(ws) if now.duration_since(ws) <= CHURN_WINDOW => pc.cycles += 1,
+        _ => {
+            pc.window_start = Some(now);
+            pc.cycles = 1;
+        }
+    }
+    if pc.cycles >= CHURN_CYCLES_TO_ESCALATE {
+        pc.forced_until = Some(now + FORCED_DERP_TTL);
+        pc.cycles = 0;
+        pc.window_start = None;
+        return true;
+    }
+    false
+}
+
+/// P7 — kill-switch: `ROOMLER__OVERLAY__FORCED_DERP=0|false` disables the
+/// escalation entirely (default ON — it is additionally gated on both ends'
+/// advertised capability and the churn threshold).
+fn forced_derp_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("ROOMLER__OVERLAY__FORCED_DERP").as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        )
+    })
+}
+
+/// P7 — record + decide for a live request (the impure wrapper around
+/// [`churn_note_request`]), with the size-capped stale sweep.
+fn note_relay_request(state: &AppState, pair_key: &str) -> bool {
+    let now = Instant::now();
+    if state.relay_pair_churn.len() > CHURN_MAP_CAP {
+        state.relay_pair_churn.retain(|_, pc| {
+            forced_active(pc, now)
+                || pc
+                    .window_start
+                    .is_some_and(|ws| now.duration_since(ws) <= CHURN_WINDOW)
+                || pc
+                    .last_grant_at
+                    .is_some_and(|g| now.duration_since(g) <= CHURN_WINDOW)
+        });
+    }
+    let mut entry = state
+        .relay_pair_churn
+        .entry(pair_key.to_string())
+        .or_default();
+    churn_note_request(entry.value_mut(), now)
+}
+
+/// P7 — arm the cycle detector after sending a TURN grant.
+fn note_grant_sent(state: &AppState, pair_key: &str) {
+    if let Some(mut pc) = state.relay_pair_churn.get_mut(pair_key) {
+        pc.last_grant_at = Some(Instant::now());
+    } else {
+        state.relay_pair_churn.insert(
+            pair_key.to_string(),
+            PairChurn {
+                last_grant_at: Some(Instant::now()),
+                ..Default::default()
+            },
+        );
+    }
+}
+
+/// P7 — on (re)join, re-push any unexpired forced-DERP pins involving this
+/// node (its in-process pin died with the old process; the single-relay
+/// DIALER has no reactive path to relearn it). Scans the pair map — tiny in
+/// practice (forced pairs are rare + capped).
+async fn repush_forced_pairs_on_join(state: &AppState, node: &OverlayNode) {
+    if !forced_derp_enabled() || !node.supports_forced_derp || !node.supports_derp {
+        return;
+    }
+    let Some(self_id) = node.id else { return };
+    let self_hex = self_id.to_hex();
+    let now = Instant::now();
+    let peers: Vec<(ObjectId, u64)> = state
+        .relay_pair_churn
+        .iter()
+        .filter_map(|e| {
+            // Remaining (not full) TTL, so both ends keep expiring together.
+            let remaining = e.value().forced_until?.checked_duration_since(now)?;
+            let (a, b) = e.key().split_once(':')?;
+            let peer = if a == self_hex {
+                ObjectId::parse_str(b).ok()?
+            } else if b == self_hex {
+                ObjectId::parse_str(a).ok()?
+            } else {
+                return None;
+            };
+            Some((peer, remaining.as_millis() as u64))
+        })
+        .collect();
+    for (peer_id, ttl_ms) in peers {
+        tracing::info!(node = %self_id, peer = %peer_id, ttl_ms,
+            "overlay relay: re-pushing forced-DERP pin on rejoin");
+        send_to_node(
+            state,
+            node,
+            ServerMsg::OverlayForceDerp {
+                peer_node_id: peer_id,
+                ttl_ms,
+            },
+        )
+        .await;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1039,5 +1269,68 @@ mod tests {
         assert_eq!(pick_worker_idx(key, vec![v6, a]).unwrap(), a);
         assert!(pick_worker_idx(key, vec![v6]).is_none());
         assert!(pick_worker_idx(key, vec![]).is_none());
+    }
+
+    /// P7 — the churn detector's arithmetic: only grant→re-request cycles
+    /// count, retry bursts and restart-storms don't, the threshold escalates,
+    /// and a mid-TTL request re-escalates without re-counting.
+    #[test]
+    fn churn_cycles_escalate_and_restarts_do_not() {
+        let t0 = Instant::now();
+        let mut pc = PairChurn::default();
+
+        // A request with NO prior grant (fresh pair / agent restart) never
+        // counts — a crash-looping agent can re-request forever harmlessly.
+        assert!(!churn_note_request(&mut pc, t0));
+        assert_eq!(pc.cycles, 0);
+
+        // grant → quick retry inside the dedup gap: not a cycle.
+        pc.last_grant_at = Some(t0);
+        assert!(!churn_note_request(&mut pc, t0 + Duration::from_secs(2)));
+        assert_eq!(pc.cycles, 0);
+
+        // Three real grant→re-request cycles ⇒ escalate on the third. (The
+        // reassignments below model `note_grant_sent` arming the detector.)
+        pc.last_grant_at = Some(t0);
+        assert!(!churn_note_request(&mut pc, t0 + Duration::from_secs(30)));
+        assert_eq!(pc.cycles, 1);
+        // One cycle per grant: a second re-request without a new grant is inert.
+        assert!(!churn_note_request(&mut pc, t0 + Duration::from_secs(40)));
+        assert_eq!(pc.cycles, 1);
+        pc.last_grant_at = Some(t0 + Duration::from_secs(45));
+        assert!(!churn_note_request(&mut pc, t0 + Duration::from_secs(75)));
+        assert_eq!(pc.cycles, 2);
+        pc.last_grant_at = Some(t0 + Duration::from_secs(80));
+        assert!(
+            churn_note_request(&mut pc, t0 + Duration::from_secs(110)),
+            "third cycle inside the window must escalate"
+        );
+        assert!(pc.forced_until.is_some(), "TTL stamped");
+
+        // Mid-TTL request (a restarted end re-requesting): re-escalate.
+        assert!(churn_note_request(&mut pc, t0 + Duration::from_secs(120)));
+
+        // Past the TTL: back to normal counting (first request post-expiry
+        // has no grant on record ⇒ not churn).
+        let after = t0 + Duration::from_secs(110) + FORCED_DERP_TTL + Duration::from_secs(1);
+        assert!(!churn_note_request(&mut pc, after));
+        assert_eq!(pc.cycles, 0);
+    }
+
+    /// P7 — cycles outside the sliding window don't accumulate.
+    #[test]
+    fn churn_window_resets_stale_counts() {
+        let t0 = Instant::now();
+        let mut pc = PairChurn {
+            last_grant_at: Some(t0),
+            ..Default::default()
+        };
+        assert!(!churn_note_request(&mut pc, t0 + Duration::from_secs(30)));
+        assert_eq!(pc.cycles, 1);
+        // Next cycle lands AFTER the window: the count restarts at 1.
+        let late = t0 + CHURN_WINDOW + Duration::from_secs(60);
+        pc.last_grant_at = Some(late - Duration::from_secs(30));
+        assert!(!churn_note_request(&mut pc, late));
+        assert_eq!(pc.cycles, 1, "stale window must reset, not accumulate");
     }
 }
