@@ -36,6 +36,10 @@ type InitCanvasMessage = {
    *  WebCodecs, so it overrides with VP9 profile 0 (vp09.00.10.08,
    *  4:2:0) just to exercise the wire+DC+decoder mechanics. */
   codec?: string
+  /** 2026-07-24 decode-stall A/B — optional `VideoDecoder.hardwareAcceleration`
+   *  override from the composable (localStorage `roomler-rc-decode-pref`).
+   *  Unset → `'no-preference'`, today's behaviour. */
+  decodePref?: 'prefer-software' | 'prefer-hardware' | 'no-preference'
 }
 type ChunkMessage = { type: 'chunk'; bytes: ArrayBuffer }
 type CloseMessage = { type: 'close' }
@@ -92,6 +96,45 @@ function requestKeyframeResync(): void {
   if (now - lastKeyframeReqMs < 250) return
   lastKeyframeReqMs = now
   workerScope.postMessage({ type: 'request-keyframe' })
+}
+
+// 2026-07-24 decode-stall telemetry — field: NEO16 viewing PC50045 hits 3-5 s
+// mid-session stalls where bytes keep ARRIVING (Mbps > 0) but the decoder
+// produces NO output, then a catch-up burst (queued frames flushing) — on
+// both HEVC and VP9, with the agent proven healthy. That shape points at the
+// decoder/GPU-process layer, not transport and not the resync gate. Track the
+// output-callback cadence: if chunks keep landing while output has been
+// silent > STALL_GAP_MS with work queued, report a one-shot `decode-stall`
+// (and `decode-stall-recovered` with the true gap once output resumes) so the
+// console pins the layer during field repros.
+const STALL_GAP_MS = 1500
+let decodePref: 'prefer-software' | 'prefer-hardware' | 'no-preference' = 'no-preference'
+let lastOutputMs = 0
+let stallSince = 0 // 0 = no active stall; else the lastOutputMs the stall started from
+
+function noteChunkForStallCheck(): void {
+  if (!configured || framesDecoded === 0 || stallSince !== 0 || lastOutputMs === 0) return
+  const now = performance.now()
+  if (now - lastOutputMs > STALL_GAP_MS && (decoder?.decodeQueueSize ?? 0) > 0) {
+    stallSince = lastOutputMs
+    workerScope.postMessage({
+      type: 'decode-stall',
+      gapMs: Math.round(now - lastOutputMs),
+      queue: decoder?.decodeQueueSize ?? 0,
+    })
+  }
+}
+
+function noteOutputForStallCheck(): void {
+  const now = performance.now()
+  if (stallSince !== 0) {
+    workerScope.postMessage({
+      type: 'decode-stall-recovered',
+      gapMs: Math.round(now - stallSince),
+    })
+    stallSince = 0
+  }
+  lastOutputMs = now
 }
 
 /** Rolling-window stats for the HUD. Computed in the worker so the
@@ -160,12 +203,20 @@ workerScope.onmessage = (e) => {
     if (typeof msg.codec === 'string' && msg.codec.length > 0) {
       activeCodec = msg.codec
     }
+    if (
+      msg.decodePref === 'prefer-software'
+      || msg.decodePref === 'prefer-hardware'
+      || msg.decodePref === 'no-preference'
+    ) {
+      decodePref = msg.decodePref
+    }
     initDecoder()
   } else if (msg.type === 'chunk') {
     framesReceived++
     const u8 = new Uint8Array(msg.bytes)
     statsBytesInWindow += u8.byteLength
     statsBytesTotal += u8.byteLength
+    noteChunkForStallCheck()
     consumeBytes(u8)
     maybeEmitStats()
   } else if (msg.type === 'close') {
@@ -179,6 +230,7 @@ function initDecoder() {
     output: (frame) => {
       framesDecoded++
       statsFramesInWindow++
+      noteOutputForStallCheck()
       // Snapshot dims BEFORE paintFrame — it calls frame.close() in a
       // finally block, after which displayWidth/displayHeight return 0.
       const w = frame.displayWidth
@@ -231,7 +283,10 @@ function initDecoder() {
       // 2026-05-21, RTX 5090 + UHD 630). `'no-preference'` lets
       // Chromium pick HW decode where it genuinely exists and SW
       // otherwise — the actual silent-fallback behaviour we want.
-      hardwareAcceleration: 'no-preference',
+      // 2026-07-24 — `decodePref` (localStorage A/B) can override to
+      // prefer-software/-hardware for the decode-stall field diagnosis;
+      // defaults to 'no-preference' (unchanged behaviour).
+      hardwareAcceleration: decodePref,
     } as VideoDecoderConfig)
     configured = true
     workerScope.postMessage({

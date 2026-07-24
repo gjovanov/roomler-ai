@@ -1263,6 +1263,27 @@ export function parseLocalRelayDescriptor(raw: unknown): LocalRelayDescriptor | 
   return { turn_port, overlay_ip, username, credential }
 }
 
+/** 2026-07-24 decode-stall A/B — experimental override for the DC decode
+ *  workers' `VideoDecoder.hardwareAcceleration`. localStorage
+ *  `roomler-rc-decode-pref`: `'software'` | `'hardware'` | unset
+ *  (`no-preference`, today's behaviour). Field context: NEO16 viewing PC50045
+ *  hits 3-5 s mid-session decoder stalls (Mbps > 0, decoded fps → 0, then a
+ *  catch-up burst) on BOTH HEVC and VP9 with the agent proven healthy —
+ *  suspect Chrome's GPU-process decode on the hybrid-GPU laptop. Setting
+ *  `'software'` A/Bs that theory on VP9/AV1 (HEVC has no SW decoder in
+ *  Chromium — prefer-software there fails configure() and the existing
+ *  fallback path takes over). Pure + exported for tests. */
+export function storedDecodePref(): 'prefer-software' | 'prefer-hardware' | 'no-preference' {
+  try {
+    const raw = globalThis.localStorage?.getItem('roomler-rc-decode-pref')
+    if (raw === 'software') return 'prefer-software'
+    if (raw === 'hardware') return 'prefer-hardware'
+  } catch {
+    /* privacy mode → default */
+  }
+  return 'no-preference'
+}
+
 /** The browser's ICE-server entry for the loopback TURN (dialled over loopback,
  *  never firewalled). Pure + exported for tests. */
 export function localRelayIceServer(desc: LocalRelayDescriptor): IceServer {
@@ -2722,6 +2743,13 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         stopVp9_444Path()
       } else if (msg.type === 'frame-rejected') {
         console.warn('[rc] vp9-444 frame rejected', msg)
+      } else if (msg.type === 'decode-stall') {
+        // 2026-07-24 — frames are arriving but the decoder produced no
+        // output for gapMs with work queued: a decoder/GPU-process stall,
+        // NOT transport and NOT the resync gate. Field-diagnosis marker.
+        console.warn('[rc] vp9-444 DECODE STALL — no decoder output for', msg.gapMs, 'ms; queue', msg.queue)
+      } else if (msg.type === 'decode-stall-recovered') {
+        console.warn('[rc] vp9-444 decode stall recovered after', msg.gapMs, 'ms')
       } else if (msg.type === 'frame-decoded') {
         // Worker emits this for every decoded frame after the first.
         // Driven by the worker's `output` callback, used by tests +
@@ -2779,7 +2807,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     try {
       const synthetic = new OffscreenCanvas(2, 2)
       worker.postMessage(
-        { type: 'init-canvas', canvas: synthetic, codec: workerCodec },
+        { type: 'init-canvas', canvas: synthetic, codec: workerCodec, decodePref: storedDecodePref() },
         [synthetic],
       )
     } catch (err) {
@@ -2906,6 +2934,12 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         console.info('[rc] hevc awaiting keyframe — dropped', msg.dropped, 'leading delta(s)')
       } else if (msg.type === 'keyframe-acquired') {
         console.info('[rc] hevc first keyframe acquired (dropped', msg.droppedBefore, 'leading delta(s))')
+      } else if (msg.type === 'decode-stall') {
+        // 2026-07-24 — see the vp9-444 handler: decoder/GPU-process stall
+        // marker (frames arriving, work queued, no output for gapMs).
+        console.warn('[rc] hevc DECODE STALL — no decoder output for', msg.gapMs, 'ms; queue', msg.queue)
+      } else if (msg.type === 'decode-stall-recovered') {
+        console.warn('[rc] hevc decode stall recovered after', msg.gapMs, 'ms')
       } else if (msg.type === 'frame-decoded') {
         hevcFramesDecoded.value++
       } else if (msg.type === 'stats') {
@@ -2935,7 +2969,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     try {
       const synthetic = new OffscreenCanvas(2, 2)
       worker.postMessage(
-        { type: 'init-canvas', canvas: synthetic },
+        { type: 'init-canvas', canvas: synthetic, decodePref: storedDecodePref() },
         [synthetic],
       )
     } catch (err) {
