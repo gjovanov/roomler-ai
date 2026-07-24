@@ -1174,6 +1174,18 @@ const KEYFRAME_BACKSTOP: Duration = Duration::from_secs(4);
 #[cfg(any(feature = "vp9-444", feature = "ffmpeg-encoder"))]
 const KEYFRAME_FORCE_REBUILD_AFTER: Duration = Duration::from_secs(1);
 
+/// rc.217 churn guard for the force-ignored rebuild. Field regression
+/// (2026-07-24, vp9_qsv): every viewer backlog event requested an IDR, the
+/// ignored force tripped a rebuild ~1 s later, and the rebuild's own big IDR
+/// re-spiked the viewer's decoder → another backlog → another rebuild —
+/// "freezes every ~2 s", worse than the original bug. At most ONE forced
+/// rebuild per this window; while cooling down an unanswered force is
+/// abandoned (the next request re-arms). The real fix is `forced_idr=1` on
+/// the qsv option set (encoder.rs) making forces work without any rebuild;
+/// this bounds the blast radius wherever that still fails.
+#[cfg(any(feature = "vp9-444", feature = "ffmpeg-encoder"))]
+const KEYFRAME_FORCE_REBUILD_COOLDOWN: Duration = Duration::from_secs(10);
+
 #[cfg(any(feature = "vp9-444", feature = "ffmpeg-encoder"))]
 async fn current_pair_is_relay(
     pc: &Arc<RTCPeerConnection>,
@@ -2245,6 +2257,7 @@ async fn media_pump_vp9_444_dc(
     // mirrored from the ffmpeg pump so no pump can wedge on an unanswered
     // force.
     let mut kf_pending_since: Option<std::time::Instant> = None;
+    let mut last_force_rebuild: Option<std::time::Instant> = None;
 
     // rc.39 — agent-side scene-change keyframe trigger. Heuristic:
     // after each encode, if the latest delta packet's size exceeds
@@ -2681,19 +2694,26 @@ async fn media_pump_vp9_444_dc(
         // the rebuild can drop the encoder (see [`KEYFRAME_FORCE_REBUILD_AFTER`];
         // the ffmpeg pump's block is the field-proven original). `continue`
         // lets the next iteration's dims-mismatch check reconstruct; the fresh
-        // encoder's first frame is a guaranteed key-flagged IDR.
+        // encoder's first frame is a guaranteed key-flagged IDR. Cooldown-
+        // guarded (rc.217) so a repeatedly-ignored force can never churn
+        // rebuilds — see [`KEYFRAME_FORCE_REBUILD_COOLDOWN`].
         if let Some(t) = kf_pending_since
             && t.elapsed() >= KEYFRAME_FORCE_REBUILD_AFTER
         {
-            warn!(
-                %session_id,
-                pending_ms = t.elapsed().as_millis() as u64,
-                "VP9-444 DC pump: encoder ignored forced keyframe — rebuilding to emit a guaranteed IDR"
-            );
-            encoder = None;
-            encoder_dims = None;
+            if last_force_rebuild.is_none_or(|r| r.elapsed() >= KEYFRAME_FORCE_REBUILD_COOLDOWN) {
+                warn!(
+                    %session_id,
+                    pending_ms = t.elapsed().as_millis() as u64,
+                    "VP9-444 DC pump: encoder ignored forced keyframe — rebuilding to emit a guaranteed IDR"
+                );
+                encoder = None;
+                encoder_dims = None;
+                last_force_rebuild = Some(std::time::Instant::now());
+                kf_pending_since = None;
+                continue;
+            }
+            // Cooling down — abandon this force (the next request re-arms).
             kf_pending_since = None;
-            continue;
         }
         let enc = encoder.as_mut().unwrap();
         let mut force_keyframe_this_iter = false;
@@ -3329,6 +3349,7 @@ async fn media_pump_ffmpeg_dc(
     // request was made); cleared when a key-flagged packet enters the send
     // queue. See [`KEYFRAME_FORCE_REBUILD_AFTER`].
     let mut kf_pending_since: Option<std::time::Instant> = None;
+    let mut last_force_rebuild: Option<std::time::Instant> = None;
     // rc.190 — one-shot (per value) log marker for the relay resolution cap.
     let mut res_cap_logged: Option<TargetResolution> = None;
     // rc.186 — encode-pressure: when the encoder saturates (heartbeat
@@ -3796,14 +3817,21 @@ async fn media_pump_ffmpeg_dc(
         if let Some(t) = kf_pending_since
             && t.elapsed() >= KEYFRAME_FORCE_REBUILD_AFTER
         {
-            warn!(
-                %session_id,
-                codec_label,
-                pending_ms = t.elapsed().as_millis() as u64,
-                "FFmpeg DC pump: encoder ignored forced keyframe — rebuilding to emit a guaranteed IDR (vp9_qsv-class runtime-force bug)"
-            );
-            encoder = None;
-            encoder_dims = None;
+            if last_force_rebuild.is_none_or(|r| r.elapsed() >= KEYFRAME_FORCE_REBUILD_COOLDOWN) {
+                warn!(
+                    %session_id,
+                    codec_label,
+                    pending_ms = t.elapsed().as_millis() as u64,
+                    "FFmpeg DC pump: encoder ignored forced keyframe — rebuilding to emit a guaranteed IDR (vp9_qsv-class runtime-force bug)"
+                );
+                encoder = None;
+                encoder_dims = None;
+                last_force_rebuild = Some(std::time::Instant::now());
+            }
+            // Answered-by-rebuild or cooling down — either way stop tracking
+            // this force; the next request re-arms. Prevents the rebuild→
+            // IDR-burst→backlog→request→rebuild churn loop (rc.217 field
+            // regression: "freezes every ~2s" on vp9_qsv).
             kf_pending_since = None;
         }
 
@@ -4517,7 +4545,13 @@ fn attach_control_handler(
                 "rc:keyframe" => {
                     // Browser's decode queue backed up → it dropped deltas and
                     // needs a fresh IDR to resync. Force one (min-gap clamped).
-                    const MIN_KF_GAP: Duration = Duration::from_millis(200);
+                    // rc.217 — 200 ms → 500 ms: with the #166 worker retrying
+                    // at ~4 req/s while gated AND runtime forces now actually
+                    // producing IDRs (qsv forced_idr), the old gap allowed up
+                    // to 5 big IDRs/s onto a struggling viewer — feeding the
+                    // very backlog the resync was meant to clear. 2 IDRs/s is
+                    // plenty for resync and halves the burst load.
+                    const MIN_KF_GAP: Duration = Duration::from_millis(500);
                     let now = std::time::Instant::now();
                     let mut guard = last_kf_request.lock().unwrap();
                     let allow = guard
