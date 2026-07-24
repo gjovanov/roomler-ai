@@ -149,9 +149,8 @@ impl DirectTier {
     }
 
     /// Phase C — the WG-handshake completion deadline past which a
-    /// never-established carrier on this tier is torn down to relay.
-    /// [`Duration::MAX`] for LAN/Relay (no deadline). Only consulted for the
-    /// off-link `Public`/`Srflx` tiers.
+    /// never-established carrier on this tier is torn down (direct tiers →
+    /// relay fallback; relay tier → re-coordinate).
     fn handshake_deadline(self) -> Duration {
         match self {
             DirectTier::Srflx => SRFLX_HANDSHAKE_DEADLINE,
@@ -159,7 +158,18 @@ impl DirectTier {
             // rc.204 — LAN gets a deadline too (see the variant doc): on-link
             // handshakes complete in milliseconds or not at all.
             DirectTier::Lan => LAN_HANDSHAKE_DEADLINE,
-            DirectTier::Relay => Duration::MAX,
+            // rc.223 — the RELAY tier gets one as well. A relay carrier that
+            // never completes its handshake evaded EVERY detector (field
+            // 2026-07-24, neo16 on a UDP-hostile network): `punch_dead` was
+            // direct-only, `rx_stale` requires a latched handshake,
+            // `hard_dead` needs a send error (sends into a TURNS/TCP
+            // allocation "succeed"), and pre-handshake data advances neither
+            // tx nor rx, so `bad_sweeps` never counts — an IMMORTAL zombie
+            // that also starved the P7 churn counter (no teardown → no
+            // re-request → no forced-DERP escalation). Generous deadline: the
+            // handshake needs BOTH ends' allocations installed, and the
+            // peer's own grant cycle can lag ours by tens of seconds.
+            DirectTier::Relay => RELAY_HANDSHAKE_DEADLINE,
         }
     }
 }
@@ -287,6 +297,14 @@ const SRFLX_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(12);
 /// it to relay. Still finite so a truly dead public dst can't zombie forever
 /// (closes the same latent Phase A gap the srflx work exposed).
 const PUBLIC_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(30);
+/// rc.223 — RELAY handshake deadline (see `handshake_deadline`'s Relay arm:
+/// the never-handshaked relay was an immortal zombie invisible to every other
+/// detector). Generous: the handshake needs both ends' allocations up, and
+/// the peer's grant/allocate cycle can lag ours; a teardown just
+/// re-coordinates (rate-limited by `RELAY_REFRESH_COOLDOWN`), and each
+/// re-request feeds the P7 churn counter toward the forced-DERP escalation —
+/// exactly the intended cascade on a network where TURN can't carry data.
+const RELAY_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(45);
 /// rc.204 — LAN handshake deadline. On-link, so a genuine same-subnet
 /// handshake completes in milliseconds; one that hasn't completed by this
 /// window is a false LAN match (stale/foreign endpoint, Wi-Fi AP isolation, a
@@ -2002,11 +2020,12 @@ impl OverlayRuntime {
             // tx/rx heuristic governs the established carrier thereafter).
             // rc.204 extends this to the LAN tier — a false same-subnet match
             // (stale endpoint / AP isolation / VPN-captured replies) was a
-            // PERMANENT zombie before, with no fallback to relay.
-            let punch_dead = matches!(
-                e.tier,
-                DirectTier::Public | DirectTier::Srflx | DirectTier::Lan
-            ) && !wg.peer_handshake_done(&e.pubkey).unwrap_or(true)
+            // PERMANENT zombie before, with no fallback to relay. rc.223
+            // extends it to the RELAY tier (every tier now has a finite
+            // deadline — see `RELAY_HANDSHAKE_DEADLINE`): a never-handshaked
+            // relay was invisible to every other detector here and wedged the
+            // pair for good on UDP-hostile networks.
+            let punch_dead = !wg.peer_handshake_done(&e.pubkey).unwrap_or(true)
                 && e.since.elapsed() > e.tier.handshake_deadline();
             // rc.206 — silent-zombie backstop (see RX_STALE_DEADLINE). An
             // ESTABLISHED carrier (handshake latched — so `punch_dead`, which
@@ -3603,18 +3622,29 @@ mod tests {
             SRFLX_DENY_COOLDOWN < DIRECT_DENY_COOLDOWN,
             "srflx deny must be shorter than the LAN/public session-sticky deny"
         );
-        // The deadlines are ordered srflx/LAN (tight) < public (loose); relay
-        // has none (governed by its own hard-dead/one-way signals). rc.204 —
-        // LAN gained a deadline: a false same-subnet match must demote, not
-        // zombie forever.
+        // The deadlines are ordered srflx/LAN (tight) < public (loose) <
+        // relay (loosest — needs BOTH ends' allocations, and the peer's grant
+        // cycle can lag). rc.204 — LAN gained a deadline: a false same-subnet
+        // match must demote, not zombie forever. rc.223 — RELAY gained one
+        // too: a never-handshaked relay was invisible to every other detector
+        // (pre-handshake traffic advances neither tx nor rx) and wedged the
+        // pair for good — while also starving the P7 churn counter.
         assert!(SRFLX_HANDSHAKE_DEADLINE < PUBLIC_HANDSHAKE_DEADLINE);
         assert!(LAN_HANDSHAKE_DEADLINE < PUBLIC_HANDSHAKE_DEADLINE);
+        assert!(PUBLIC_HANDSHAKE_DEADLINE < RELAY_HANDSHAKE_DEADLINE);
         assert!(
             LAN_HANDSHAKE_DEADLINE > DIRECT_GRACE,
             "a blown LAN deadline must land past the warm-up grace"
         );
+        assert!(
+            RELAY_HANDSHAKE_DEADLINE > DIRECT_GRACE,
+            "a blown relay deadline must land past the warm-up grace"
+        );
         assert_eq!(DirectTier::Lan.handshake_deadline(), LAN_HANDSHAKE_DEADLINE);
-        assert_eq!(DirectTier::Relay.handshake_deadline(), Duration::MAX);
+        assert_eq!(
+            DirectTier::Relay.handshake_deadline(),
+            RELAY_HANDSHAKE_DEADLINE
+        );
         assert_eq!(direct_max_failures(DirectTier::Srflx), SRFLX_MAX_FAILURES);
         assert_eq!(direct_max_failures(DirectTier::Public), DIRECT_MAX_FAILURES);
     }
