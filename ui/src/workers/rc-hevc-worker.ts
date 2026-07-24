@@ -380,6 +380,16 @@ function emitFrame(): void {
   // <video>. Drop deltas until the IDR (right behind them) arrives.
   if (!shouldDecodeFrame(sawKeyframe, isKey)) {
     framesSkippedAwaitingKey++
+    // 2026-07-24 freeze fix — keep re-requesting the resync IDR while gated.
+    // The backlog branch below fires the request exactly ONCE (it re-arms the
+    // gate, so it can never fire again for this wedge); if that single
+    // control-DC message was lost — or the natural GOP IDR is far away
+    // because the viewer-rate cap shed the encode rate (240-frame GOP at
+    // 12 fps = 20 s) or the screen went static (frame-counted GOP never
+    // advances) — the decoder sat wedged on a stale frame indefinitely
+    // (field: "old screen for 30+ s", NEO16 viewing PC50045). The 250 ms
+    // debounce + the agent's MIN_KF_GAP clamp bound this to ~4 req/s.
+    requestKeyframeResync()
     // One-shot + periodic diagnostic so the field log shows the gate
     // engaged (and how many deltas it ate) without flooding.
     if (framesSkippedAwaitingKey === 1 || framesSkippedAwaitingKey % 60 === 0) {
