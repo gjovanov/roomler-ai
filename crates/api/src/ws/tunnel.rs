@@ -33,7 +33,10 @@ use bson::{DateTime, oid::ObjectId};
 use futures::{SinkExt, StreamExt, stream::SplitSink};
 use roomler_ai_remote_control::{
     models::{AgentStatus, OsKind, RelayMode, TunnelAuditEvent, TunnelAuditKind},
-    signaling::{ClientMsg, CloseReason, RejectKind, ServerMsg},
+    signaling::{
+        ClientMsg, CloseReason, REJECT_REASON_NO_SESSION, REJECT_REASON_SESSION_MISMATCH,
+        RejectKind, ServerMsg,
+    },
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -812,7 +815,7 @@ async fn handle_forward_request(
                 request_session_id,
                 flow_id,
                 RejectKind::AgentError,
-                "no open session (send rc:tunnel.open first)".into(),
+                REJECT_REASON_NO_SESSION.into(),
             ),
         )
         .await;
@@ -826,7 +829,7 @@ async fn handle_forward_request(
                 request_session_id,
                 flow_id,
                 RejectKind::AgentError,
-                "session_id mismatch".into(),
+                REJECT_REASON_SESSION_MISMATCH.into(),
             ),
         )
         .await;
