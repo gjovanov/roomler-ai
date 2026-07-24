@@ -431,6 +431,57 @@ impl RelayBuildQueue {
         }
     }
 }
+
+/// rc.218 — a finished OFF-LOOP relay ALLOCATE (see [`RelayAllocQueue`]).
+/// `conn: None` = every TURN candidate failed/timed out → the commit arm
+/// `forget`s the peer so the next netmap/sweep tick re-requests cleanly
+/// (replacing the old park-in-`pending`-forever, which left a peer whose one
+/// allocate failed PERMANENTLY blocked — nothing ever cleared `pending`).
+struct AllocDone {
+    epoch: u64,
+    node_id: ObjectId,
+    conn: Option<Arc<dyn crate::transport::relay::RelayConn>>,
+}
+
+/// rc.218 — bookkeeping for OFF-LOOP relay allocates. rc.211 moved the
+/// QUIC-over-TURN build off-loop and flagged `on_grant`'s inline DNS + TURN
+/// allocate (UDP 5 s → TURNS/TCP 6 s caps per candidate) as "next in line if
+/// it ever fires in the field" — it did: pc50045's rc.213–216 logs still show
+/// `stalled the data plane` from exactly this await on its hostile corp path.
+/// The `RelayGrant` arm now stashes the creds (`grant_accept`, sync), spawns
+/// [`RelayCoordinator::allocate_for_pair`], and a dedicated select! arm
+/// commits the result (`commit_alloc`, µs). Same epoch-token ABA guard as
+/// [`RelayBuildQueue`], but with NO per-site invalidation plumbing: LAST GRANT
+/// WINS (every grant re-stamps, superseding any in-flight allocate), a stale
+/// completion drops on epoch mismatch, and `commit_alloc` requiring the peer
+/// still in `pending` drops the forgotten-not-re-requested case (the orphan
+/// coturn allocation idles out at the server's TTL). While an allocate is in
+/// flight the peer stays in `pending`, so `is_tracking` keeps deduping
+/// re-requests exactly as before.
+struct RelayAllocQueue {
+    in_flight: HashMap<ObjectId, u64>,
+    epoch: u64,
+    tx: mpsc::Sender<AllocDone>,
+}
+
+impl RelayAllocQueue {
+    /// Stamp a new allocate for `node` (supersedes any prior in-flight one).
+    fn stamp(&mut self, node: ObjectId) -> u64 {
+        self.epoch += 1;
+        self.in_flight.insert(node, self.epoch);
+        self.epoch
+    }
+    /// `true` iff `done` is still the CURRENT allocate for its peer; clears
+    /// the entry either way (the completion consumes the slot).
+    fn take_if_current(&mut self, done: &AllocDone) -> bool {
+        if self.in_flight.get(&done.node_id) == Some(&done.epoch) {
+            self.in_flight.remove(&done.node_id);
+            true
+        } else {
+            false
+        }
+    }
+}
 /// Phase B — per-socket STUN attempt timeout when gathering srflx candidates at
 /// startup. `srflx_query` retries a few times, so worst-case per socket is a
 /// small multiple of this; the whole gather is additionally bounded by
@@ -1403,6 +1454,13 @@ impl OverlayRuntime {
             epoch: 0,
             tx: built_tx,
         };
+        // rc.218 — off-loop relay ALLOCATES (see `RelayAllocQueue`).
+        let (alloc_tx, mut alloc_rx) = mpsc::channel::<AllocDone>(16);
+        let mut alloc_q = RelayAllocQueue {
+            in_flight: HashMap::new(),
+            epoch: 0,
+            tx: alloc_tx,
+        };
         self.install_peers(
             &mut wg,
             &mut by_node,
@@ -1538,6 +1596,45 @@ impl OverlayRuntime {
                             debug!(peer = %built.link.node_id, "overlay: dropping stale off-loop carrier build (peer removed/superseded mid-build)");
                         }
                         warn_if_slow("arm:relay_build_commit", t_arm);
+                    }
+                },
+                // rc.218 — commit a finished OFF-LOOP relay ALLOCATE (the
+                // spawned DNS + TURN allocate — see `RelayAllocQueue`). Success
+                // advertises + tries to build (µs, on-loop by design: the
+                // `OverlayEndpoints` trickle reads coordinator state); failure
+                // FORGETS the peer so the next netmap/sweep tick re-requests —
+                // the old inline path parked a failed peer in `pending`
+                // forever, with nothing to ever retry it.
+                done = alloc_rx.recv() => {
+                    if let Some(done) = done {
+                        let t_arm = Instant::now();
+                        if alloc_q.take_if_current(&done) {
+                            if let Some(r) = relay.as_mut() {
+                                match done.conn {
+                                    Some(conn) => {
+                                        let link = r.commit_alloc(done.node_id, conn).await;
+                                        if let Some(link) = link {
+                                            let t0 = Instant::now();
+                                            self.install_ready(&mut wg, &mut by_node, &tun, link, &mut relay_bq).await;
+                                            warn_if_slow("install_ready(spawn-or-sync)", t0);
+                                            // Same tail as the old inline grant path: a
+                                            // newly-installed relay carrier adds a coturn
+                                            // worker to exempt, and the LocalAPI view must
+                                            // reflect the new carrier.
+                                            self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
+                                            self.publish_view(&self_ip, &by_node, &current_peers, exit_node_status(self.exit_node.as_deref(), &exit_state));
+                                        }
+                                    }
+                                    None => {
+                                        warn!(peer = %done.node_id, "overlay relay: off-loop allocate failed — dropping coordination (re-requested next tick)");
+                                        r.forget(&done.node_id);
+                                    }
+                                }
+                            }
+                        } else {
+                            debug!(peer = %done.node_id, "overlay: dropping stale off-loop allocate (peer superseded mid-allocate)");
+                        }
+                        warn_if_slow("arm:relay_alloc_commit", t_arm);
                     }
                 },
                 // rc.136 — direct→relay fallback sweep. A DIRECT carrier whose
@@ -1721,19 +1818,22 @@ impl OverlayRuntime {
                     Some(OverlayEvent::RelayGrant { peer_node_id, ice_servers, pair_key }) => {
                         let t_arm = Instant::now();
                         if let Some(r) = relay.as_mut() {
-                            let t0 = Instant::now();
-                            let link = r.on_grant(peer_node_id, ice_servers, pair_key).await;
-                            warn_if_slow("on_grant(dns+turn-allocate)", t0);
-                            if let Some(link) = link {
-                                let t0 = Instant::now();
-                                self.install_ready(&mut wg, &mut by_node, &tun, link, &mut relay_bq).await;
-                                warn_if_slow("install_ready(spawn-or-sync)", t0);
-                                // A newly-installed relay carrier adds a coturn worker
-                                // to exempt (and the exit peer may have just become
-                                // reachable) — reconcile exit routing, then refresh
-                                // the view so `roomler status` reflects it.
-                                self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
-                                self.publish_view(&self_ip, &by_node, &current_peers, exit_node_status(self.exit_node.as_deref(), &exit_state));
+                            // rc.218 — the DNS + TURN allocate no longer runs
+                            // inline (it stalled the data plane for seconds on a
+                            // hostile corp path — see `RelayAllocQueue`). Stash
+                            // the creds sync, spawn the allocate, and let the
+                            // `alloc_rx` arm commit the result. LAST GRANT WINS:
+                            // re-stamping supersedes any in-flight allocate for
+                            // this peer (its completion drops on epoch mismatch),
+                            // and `grant_accept` requiring a `pending` slot drops
+                            // grants for peers already torn down.
+                            if let Some((ice, pair_key)) = r.grant_accept(peer_node_id, ice_servers, pair_key) {
+                                let epoch = alloc_q.stamp(peer_node_id);
+                                let tx = alloc_q.tx.clone();
+                                tokio::spawn(async move {
+                                    let conn = RelayCoordinator::allocate_for_pair(&ice, &pair_key).await;
+                                    let _ = tx.send(AllocDone { epoch, node_id: peer_node_id, conn }).await;
+                                });
                             }
                         }
                         warn_if_slow("arm:relay_grant", t_arm);
@@ -3347,6 +3447,43 @@ mod tests {
         let e4 = bq.stamp(n);
         assert!(!bq.take_if_current(&mk(n, e3)), "superseded build is stale");
         assert!(bq.take_if_current(&mk(n, e4)), "current build commits");
+    }
+
+    /// rc.218 — the off-loop ALLOCATE queue's epoch semantics: last grant
+    /// wins (re-stamp supersedes), commits consume the slot, stale
+    /// completions drop. Mirrors `relay_build_queue_epoch_guards` minus the
+    /// invalidate case (the alloc queue deliberately has no per-site
+    /// invalidation — see the `RelayAllocQueue` doc).
+    #[tokio::test]
+    async fn relay_alloc_queue_epoch_guards() {
+        let (tx, _rx) = mpsc::channel::<AllocDone>(4);
+        let mut q = RelayAllocQueue {
+            in_flight: HashMap::new(),
+            epoch: 0,
+            tx,
+        };
+        let n = ObjectId::from_bytes([7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let mk = |node, epoch| AllocDone {
+            epoch,
+            node_id: node,
+            conn: None,
+        };
+
+        // (a) current epoch commits, and the slot is consumed.
+        let e1 = q.stamp(n);
+        assert!(q.take_if_current(&mk(n, e1)));
+        assert!(!q.in_flight.contains_key(&n), "commit consumes the slot");
+        assert!(
+            !q.take_if_current(&mk(n, e1)),
+            "a second arrival of the same allocate is stale"
+        );
+
+        // (b) last grant wins: the superseded allocate must not commit, the
+        // newest must.
+        let e2 = q.stamp(n);
+        let e3 = q.stamp(n);
+        assert!(!q.take_if_current(&mk(n, e2)), "superseded allocate stale");
+        assert!(q.take_if_current(&mk(n, e3)), "current allocate commits");
     }
 
     #[test]
