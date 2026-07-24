@@ -1171,8 +1171,17 @@ const KEYFRAME_BACKSTOP: Duration = Duration::from_secs(4);
 /// synchronous (the next encode IS the keyframe) so it should never fire
 /// there; the mirror just guarantees NO pump can wedge on an unanswered
 /// force, whatever encoder quirk ships next.
+/// rc.219 — widened 1 s → 2.5 s. Field-proven (rc.217 logs): vp9_qsv accepts
+/// `forced_idr=1` but STILL never key-flags a runtime-forced frame — every
+/// resync waited the full window and paid a rebuild (at the cooldown rate, a
+/// hiccup every ~10 s under sustained struggle). rc.219 instead gives
+/// vp9_qsv a SHORT natural GOP (60 frames — see
+/// `encode::ffmpeg::VP9_QSV_KEYFRAME_INTERVAL`), so a natural key normally
+/// answers the force well inside this window and the rebuild becomes a true
+/// last resort. Honouring encoders answer in <100 ms, so the wider window
+/// costs them nothing.
 #[cfg(any(feature = "vp9-444", feature = "ffmpeg-encoder"))]
-const KEYFRAME_FORCE_REBUILD_AFTER: Duration = Duration::from_secs(1);
+const KEYFRAME_FORCE_REBUILD_AFTER: Duration = Duration::from_millis(2500);
 
 /// rc.217 churn guard for the force-ignored rebuild. Field regression
 /// (2026-07-24, vp9_qsv): every viewer backlog event requested an IDR, the
