@@ -20,11 +20,11 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use bson::oid::ObjectId;
 use roomler_ai_remote_control::signaling::{
-    ClientMsg, CloseReason, Direction, IceServer, REJECT_REASON_SESSION_GONE, RejectKind,
-    ServerMsg, TunnelRole,
+    ClientMsg, CloseReason, Direction, IceServer, REJECT_REASON_NO_SESSION,
+    REJECT_REASON_SESSION_GONE, REJECT_REASON_SESSION_MISMATCH, RejectKind, ServerMsg, TunnelRole,
 };
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, Notify, oneshot};
 use tracing::{debug, error, info, warn};
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_server::RTCIceServer;
@@ -51,7 +51,43 @@ pub const FLOW_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 /// connection forever. Substring match so a wrapped/prefixed reason from an
 /// older or newer agent still qualifies.
 fn is_session_gone_reject(kind: RejectKind, reason: &str) -> bool {
-    kind == RejectKind::AgentError && reason.contains(REJECT_REASON_SESSION_GONE)
+    // All three reasons are `AgentError` session-death signals: the agent
+    // forgot the session ([`REJECT_REASON_SESSION_GONE`]), or the SERVER holds
+    // no session / a different one for this connection
+    // ([`REJECT_REASON_NO_SESSION`] / [`REJECT_REASON_SESSION_MISMATCH`] —
+    // field 2026-07-25: a forward route zombied at rc.223 precisely because
+    // these two server reasons weren't matched, so the session never ended
+    // and the supervisor never re-opened). `contains` so a wrapped/prefixed
+    // reason from another hop still qualifies.
+    kind == RejectKind::AgentError
+        && (reason.contains(REJECT_REASON_SESSION_GONE)
+            || reason.contains(REJECT_REASON_NO_SESSION)
+            || reason.contains(REJECT_REASON_SESSION_MISMATCH))
+}
+
+/// After this many CONSECUTIVE forward-open timeouts on one session — with no
+/// successful open or reply of any kind in between — the session is presumed
+/// wedged: the far side silently stopped answering (a lost-reply relay, or an
+/// agent that forgot us without even sending a reject). End the session so the
+/// flow supervisor re-opens. Small enough to self-heal fast (≈N ×
+/// `FLOW_OPEN_TIMEOUT` of user-visible failure), large enough that one stray
+/// timeout on an otherwise-live route can't trip it. This is the backstop for
+/// the silent variant that [`is_session_gone_reject`] (a *reply*-driven
+/// signal) can't see.
+const MAX_CONSECUTIVE_FLOW_TIMEOUTS: u32 = 3;
+
+/// Record one forward-open timeout; returns true once the consecutive count
+/// reaches [`MAX_CONSECUTIVE_FLOW_TIMEOUTS`] (⇒ end the session).
+fn record_flow_timeout(streak: &std::sync::atomic::AtomicU32) -> bool {
+    streak.fetch_add(1, Ordering::Relaxed) + 1 >= MAX_CONSECUTIVE_FLOW_TIMEOUTS
+}
+
+/// Reset the consecutive-timeout streak — called when a forward reply of ANY
+/// kind arrives (accept OR reject), which proves the control plane still
+/// round-trips end to end, so the wedge this backstop targets (total silence)
+/// isn't happening.
+fn record_flow_progress(streak: &std::sync::atomic::AtomicU32) {
+    streak.store(0, Ordering::Relaxed);
 }
 
 /// Reply registry: per-flow oneshot for the server's accept/reject. Shared
@@ -442,6 +478,9 @@ async fn run_webrtc_session(
 
     let flow_counter = Arc::new(AtomicU32::new(1));
     let rr_counter = Arc::new(AtomicUsize::new(0));
+    // P7 backstop — see the identical block + rationale in `run_quic_session`.
+    let flow_timeout_streak = Arc::new(AtomicU32::new(0));
+    let session_dead = Arc::new(Notify::new());
 
     loop {
         let (mut tcp, peer_addr) = tokio::select! {
@@ -457,6 +496,18 @@ async fn run_webrtc_session(
             // reconnects instead of accepting into a dead socket.
             _ = &mut dispatcher_task => {
                 warn!("control channel closed; ending session to reconnect");
+                break;
+            }
+            // P7 backstop: repeated forward-open timeouts with no reply — the
+            // far side went silent. End + re-open (see `run_quic_session`).
+            _ = session_dead.notified() => {
+                warn!("forward opens timing out repeatedly (far side silent) — ending session to re-open");
+                let _ = sink
+                    .send(ClientMsg::TunnelTerminate {
+                        session_id,
+                        reason: CloseReason::IoError,
+                    })
+                    .await;
                 break;
             }
         };
@@ -516,6 +567,8 @@ async fn run_webrtc_session(
         let target = target.clone();
         let flow_counter_for_udp = Arc::clone(&flow_counter);
         let session = Arc::clone(&session);
+        let flow_timeout_streak = Arc::clone(&flow_timeout_streak);
+        let session_dead = Arc::clone(&session_dead);
         tokio::spawn(async move {
             // Resolve the destination: the static `--remote`, or the
             // per-connection SOCKS5 request (userspace mode). A SOCKS5
@@ -565,6 +618,8 @@ async fn run_webrtc_session(
                 active_flows,
                 demuxes,
                 socks,
+                flow_timeout_streak,
+                session_dead,
             )
             .await
             {
@@ -604,6 +659,9 @@ async fn handle_local_connection(
     // SOCKS5 mode — send the CONNECT reply on this stream once the agent
     // accepts/rejects the forward (userspace mode); `false` for static forwards.
     socks: bool,
+    // P7 backstop — see `handle_local_connection_quic`.
+    flow_timeout_streak: Arc<std::sync::atomic::AtomicU32>,
+    session_dead: Arc<Notify>,
 ) -> Result<()> {
     // Send the request.
     sink.send(ClientMsg::TcpForwardRequest {
@@ -617,14 +675,26 @@ async fn handle_local_connection(
 
     // Wait for reply.
     let reply = match tokio::time::timeout(FLOW_OPEN_TIMEOUT, reply_rx).await {
-        Ok(Ok(r)) => r,
+        Ok(Ok(r)) => {
+            record_flow_progress(&flow_timeout_streak);
+            r
+        }
         Ok(Err(_canceled)) => {
             reply_registry.lock().await.remove(&flow_id);
             bail!("reply oneshot dropped — dispatcher exited?");
         }
         Err(_) => {
             reply_registry.lock().await.remove(&flow_id);
-            warn!(flow_id, "TcpForwardRequest timed out");
+            if record_flow_timeout(&flow_timeout_streak) {
+                warn!(
+                    flow_id,
+                    streak = MAX_CONSECUTIVE_FLOW_TIMEOUTS,
+                    "forward opens timed out repeatedly — signalling session death"
+                );
+                session_dead.notify_one();
+            } else {
+                warn!(flow_id, "TcpForwardRequest timed out");
+            }
             bail!("forward request timed out after {FLOW_OPEN_TIMEOUT:?}");
         }
     };
@@ -1028,6 +1098,10 @@ async fn run_quic_session(
         .with_context(|| format!("binding 127.0.0.1:{local}"))?;
     info!(local = %listener.local_addr()?, "listening for local TCP connections (quic-v1)");
     let flow_counter = Arc::new(AtomicU32::new(1));
+    // P7 backstop: shared consecutive-forward-timeout streak + a "session is
+    // wedged" signal the per-connection tasks fire when it trips.
+    let flow_timeout_streak = Arc::new(AtomicU32::new(0));
+    let session_dead = Arc::new(Notify::new());
 
     loop {
         let (mut tcp, peer_addr) = tokio::select! {
@@ -1042,6 +1116,20 @@ async fn run_quic_session(
             // `run_forward` reconnects instead of accepting into a dead socket.
             _ = &mut dispatcher_task => {
                 warn!("control channel closed; ending quic session to reconnect");
+                break;
+            }
+            // P7 backstop: forwards have timed out MAX_CONSECUTIVE_FLOW_TIMEOUTS
+            // times with no reply of any kind — the far side went silent (lost
+            // reply, or an agent that forgot us without sending a reject, which
+            // the reply-driven session-gone signal can't catch). End + re-open.
+            _ = session_dead.notified() => {
+                warn!("forward opens timing out repeatedly (far side silent) — ending quic session to re-open");
+                let _ = sink
+                    .send(ClientMsg::TunnelTerminate {
+                        session_id,
+                        reason: CloseReason::IoError,
+                    })
+                    .await;
                 break;
             }
             // P7 flap resilience: the QUIC connection itself died (quinn's
@@ -1091,6 +1179,8 @@ async fn run_quic_session(
         let conn = Arc::clone(&conn);
         let flow_counter_for_udp = Arc::clone(&flow_counter);
         let session = Arc::clone(&session);
+        let flow_timeout_streak = Arc::clone(&flow_timeout_streak);
+        let session_dead = Arc::clone(&session_dead);
         tokio::spawn(async move {
             // Resolve the destination: static `--remote`, or the per-connection
             // SOCKS5 request (userspace mode). UDP ASSOCIATE forks off the UDP
@@ -1137,6 +1227,8 @@ async fn run_quic_session(
                 active_flows,
                 socks,
                 session,
+                flow_timeout_streak,
+                session_dead,
             )
             .await
             {
@@ -1465,6 +1557,10 @@ async fn handle_local_connection_quic(
     active_flows: ActiveFlows,
     socks: bool,
     session: Arc<SessionThroughput>,
+    // P7 backstop: shared across the session's flows — reset on any reply,
+    // incremented on timeout; `session_dead` is fired when the streak trips.
+    flow_timeout_streak: Arc<std::sync::atomic::AtomicU32>,
+    session_dead: Arc<Notify>,
 ) -> Result<()> {
     // Request the forward.
     sink.send(ClientMsg::TcpForwardRequest {
@@ -1478,14 +1574,26 @@ async fn handle_local_connection_quic(
 
     // Await accept/reject.
     let reply = match tokio::time::timeout(FLOW_OPEN_TIMEOUT, reply_rx).await {
-        Ok(Ok(r)) => r,
+        Ok(Ok(r)) => {
+            record_flow_progress(&flow_timeout_streak);
+            r
+        }
         Ok(Err(_canceled)) => {
             reply_registry.lock().await.remove(&flow_id);
             bail!("reply oneshot dropped — dispatcher exited?");
         }
         Err(_) => {
             reply_registry.lock().await.remove(&flow_id);
-            warn!(flow_id, "TcpForwardRequest timed out");
+            if record_flow_timeout(&flow_timeout_streak) {
+                warn!(
+                    flow_id,
+                    streak = MAX_CONSECUTIVE_FLOW_TIMEOUTS,
+                    "forward opens timed out repeatedly — signalling session death"
+                );
+                session_dead.notify_one();
+            } else {
+                warn!(flow_id, "TcpForwardRequest timed out");
+            }
             bail!("forward request timed out after {FLOW_OPEN_TIMEOUT:?}");
         }
     };
@@ -1714,6 +1822,8 @@ mod tests {
                 active_flows,
                 false,
                 Arc::new(SessionThroughput::default()),
+                Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                Arc::new(Notify::new()),
             )
             .await
         });
@@ -1847,5 +1957,76 @@ mod tests {
             .await
             .expect("dispatch loop must exit on the session-gone reject")
             .expect("loop task must not panic");
+    }
+
+    /// The session-death matcher must fire for ALL THREE `AgentError`
+    /// session-death reasons — the agent's `SESSION_GONE` plus the two SERVER
+    /// reasons added 2026-07-25 (`NO_SESSION`, `SESSION_MISMATCH`) whose
+    /// absence left the pcon-mssql forward route zombied at rc.223 — including
+    /// a wrapped/prefixed form, and must NOT fire for ordinary per-flow
+    /// rejects (dial failure, ACL deny) or an unrelated AgentError.
+    #[test]
+    fn session_death_reject_matcher() {
+        for reason in [
+            REJECT_REASON_SESSION_GONE,
+            REJECT_REASON_NO_SESSION,
+            REJECT_REASON_SESSION_MISMATCH,
+        ] {
+            assert!(
+                is_session_gone_reject(RejectKind::AgentError, reason),
+                "session-death reason {reason:?} must match"
+            );
+        }
+        assert!(
+            is_session_gone_reject(
+                RejectKind::AgentError,
+                &format!("relay: {REJECT_REASON_NO_SESSION}")
+            ),
+            "a wrapped session-death reason must still match (contains)"
+        );
+        // Ordinary per-flow failures on a HEALTHY session must NOT end it.
+        assert!(!is_session_gone_reject(
+            RejectKind::DialFailed,
+            "connection refused"
+        ));
+        assert!(!is_session_gone_reject(
+            RejectKind::AclDenied,
+            "dst not in allowlist"
+        ));
+        assert!(!is_session_gone_reject(
+            RejectKind::AgentError,
+            "DC pool not ready on agent"
+        ));
+    }
+
+    /// The consecutive-forward-timeout backstop trips at exactly
+    /// `MAX_CONSECUTIVE_FLOW_TIMEOUTS`, and any reply (`record_flow_progress`)
+    /// resets the streak so intermittent single timeouts never accumulate to a
+    /// spurious session kill.
+    #[test]
+    fn consecutive_flow_timeout_backstop() {
+        use std::sync::atomic::AtomicU32;
+        let streak = AtomicU32::new(0);
+        // The first MAX-1 timeouts are non-fatal.
+        for i in 1..MAX_CONSECUTIVE_FLOW_TIMEOUTS {
+            assert!(
+                !record_flow_timeout(&streak),
+                "timeout {i} of {MAX_CONSECUTIVE_FLOW_TIMEOUTS} must not be fatal"
+            );
+        }
+        // A reply resets the streak.
+        record_flow_progress(&streak);
+        // So the count has to climb from scratch again.
+        for i in 1..MAX_CONSECUTIVE_FLOW_TIMEOUTS {
+            assert!(
+                !record_flow_timeout(&streak),
+                "post-reset timeout {i} must not be fatal"
+            );
+        }
+        // Reaching the threshold is fatal.
+        assert!(
+            record_flow_timeout(&streak),
+            "the {MAX_CONSECUTIVE_FLOW_TIMEOUTS}th consecutive timeout must be fatal"
+        );
     }
 }
