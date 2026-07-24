@@ -318,6 +318,12 @@ function emitFrame(): void {
   // rc.103 — gate on the first keyframe (see `sawKeyframe` note above).
   if (!shouldDecodeFrame(sawKeyframe, isKey)) {
     framesSkippedAwaitingKey++
+    // 2026-07-24 freeze fix — keep re-requesting the resync IDR while gated
+    // (mirrors the HEVC worker; see its comment for the full field story).
+    // The backlog branch fires the request once then re-arms the gate; a lost
+    // request or a far-away GOP boundary left the decoder wedged on a stale
+    // frame. Debounced + agent-clamped to ~4 req/s.
+    requestKeyframeResync()
     if (framesSkippedAwaitingKey === 1 || framesSkippedAwaitingKey % 60 === 0) {
       workerScope.postMessage({
         type: 'awaiting-keyframe',

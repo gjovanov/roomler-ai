@@ -1139,6 +1139,20 @@ async fn detect_constrained_transport(
 #[cfg(any(feature = "vp9-444", feature = "ffmpeg-encoder"))]
 const TRANSPORT_RECHECK_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Freeze-wedge backstop (2026-07-24 field, NEO16 viewing PC50045): if no
+/// key-flagged frame has been handed to the send task for this long while
+/// frames keep encoding, force an IDR. The browser's decode workers re-arm
+/// their keyframe gate on a backlog drop and then wait for a resync IDR; the
+/// encoders' GOP is counted in ENCODED FRAMES (240), so at a shed encode rate
+/// (viewer-rate cap 12 fps → 20 s/GOP) — or on a static screen where capture
+/// dedup encodes almost nothing — the natural IDR can be tens of seconds (or
+/// forever) away, and a lost `rc:keyframe` request left the viewer wedged on a
+/// stale frame. This bounds ANY missed-resync wedge to ~4 s regardless of the
+/// browser build. At full 60 fps it matches the natural 240-frame cadence, so
+/// healthy sessions see no extra IDR load.
+#[cfg(any(feature = "vp9-444", feature = "ffmpeg-encoder"))]
+const KEYFRAME_BACKSTOP: Duration = Duration::from_secs(4);
+
 #[cfg(any(feature = "vp9-444", feature = "ffmpeg-encoder"))]
 async fn current_pair_is_relay(
     pc: &Arc<RTCPeerConnection>,
@@ -2200,6 +2214,11 @@ async fn media_pump_vp9_444_dc(
     let mut decode_skip_divisor: u32 = 1;
     let mut decode_skip_counter: u32 = 0;
     let mut frames_skipped_decode: u64 = 0;
+    // Freeze-wedge backstop — when the last key-flagged frame entered the
+    // send queue (see [`KEYFRAME_BACKSTOP`]). Starts "now" so a fresh session
+    // (whose first frames are IDRs anyway) doesn't double-fire.
+    let mut last_key_sent = std::time::Instant::now();
+    let mut kf_backstop_logged = false;
 
     // rc.39 — agent-side scene-change keyframe trigger. Heuristic:
     // after each encode, if the latest delta packet's size exceeds
@@ -2638,6 +2657,22 @@ async fn media_pump_vp9_444_dc(
             enc.request_keyframe();
             force_keyframe_this_iter = true;
         }
+        // Freeze-wedge backstop — see [`KEYFRAME_BACKSTOP`]. Only reachable
+        // while frames are being encoded, so an idle/static screen doesn't
+        // spray IDRs; the FIRST frame after a static stretch becomes one,
+        // which is exactly the resync-on-activity guarantee a gated viewer
+        // needs.
+        if last_key_sent.elapsed() >= KEYFRAME_BACKSTOP {
+            enc.request_keyframe();
+            force_keyframe_this_iter = true;
+            if !kf_backstop_logged {
+                kf_backstop_logged = true;
+                info!(
+                    %session_id,
+                    "VP9-444 DC pump: keyframe backstop engaged (no IDR sent for 4s — bounding viewer resync wait)"
+                );
+            }
+        }
 
         // rc.188 — viewer-rate fps cap (mirror of the media_pump_ffmpeg_dc
         // block). Once a second, fold the browser's measured decode report
@@ -2912,7 +2947,14 @@ async fn media_pump_vp9_444_dc(
             let ts_us = start.elapsed().as_micros() as u64;
             let wire = bytes::Bytes::from(frame_video_bytes(&p.data, p.is_keyframe, ts_us));
             match send_tx.try_send(wire) {
-                Ok(()) => {}
+                Ok(()) => {
+                    // Backstop bookkeeping: only a key frame that actually
+                    // entered the send queue counts (a shed one didn't reach
+                    // the viewer).
+                    if p.is_keyframe {
+                        last_key_sent = std::time::Instant::now();
+                    }
+                }
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                     frames_skipped_backpressure += 1;
                     keyframe_requested.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -3227,6 +3269,11 @@ async fn media_pump_ffmpeg_dc(
     let mut decode_skip_divisor: u32 = 1;
     let mut decode_skip_counter: u32 = 0;
     let mut frames_skipped_decode: u64 = 0;
+    // Freeze-wedge backstop — when the last key-flagged packet entered the
+    // send queue (see [`KEYFRAME_BACKSTOP`]). Starts "now" so a fresh session
+    // (whose first frames are IDRs anyway) doesn't double-fire.
+    let mut last_key_sent = std::time::Instant::now();
+    let mut kf_backstop_logged = false;
     // rc.190 — one-shot (per value) log marker for the relay resolution cap.
     let mut res_cap_logged: Option<TargetResolution> = None;
     // rc.186 — encode-pressure: when the encoder saturates (heartbeat
@@ -3662,6 +3709,26 @@ async fn media_pump_ffmpeg_dc(
             force_keyframe_this_iter = true;
         }
 
+        // Freeze-wedge backstop — see [`KEYFRAME_BACKSTOP`]. Only reachable
+        // while frames are being encoded, so an idle/static screen doesn't
+        // spray IDRs; the FIRST frame after a static stretch becomes one,
+        // which is exactly the resync-on-activity guarantee a gated viewer
+        // needs.
+        if last_key_sent.elapsed() >= KEYFRAME_BACKSTOP
+            && let Some(enc) = encoder.as_mut()
+        {
+            enc.request_keyframe();
+            force_keyframe_this_iter = true;
+            if !kf_backstop_logged {
+                kf_backstop_logged = true;
+                info!(
+                    %session_id,
+                    codec_label,
+                    "FFmpeg DC pump: keyframe backstop engaged (no IDR sent for 4s — bounding viewer resync wait)"
+                );
+            }
+        }
+
         // rc.188 — viewer-rate fps cap. Once a second, fold the browser's
         // measured decode report (`rc:decodestat`: decoded fps + a struggling
         // bit) into a send-fps cap and derive the frame-skip divisor; then drop
@@ -3806,6 +3873,12 @@ async fn media_pump_ffmpeg_dc(
             ));
             match send_tx.try_send(wire) {
                 Ok(()) => {
+                    // Backstop bookkeeping: only a key frame that actually
+                    // entered the send queue counts (a shed one didn't reach
+                    // the viewer).
+                    if pkt.is_keyframe {
+                        last_key_sent = std::time::Instant::now();
+                    }
                     if resync_pending {
                         // First frame through after a drop burst — make the
                         // NEXT one a keyframe so the browser resyncs the
