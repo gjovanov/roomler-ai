@@ -355,8 +355,9 @@ const FALLBACK_TICK: Duration = Duration::from_secs(5);
 /// window to a couple of dropped pings.
 const ROUTE_GUARD_TICK: Duration = Duration::from_secs(2);
 /// rc.211 — loop-stall watchdog threshold. While ANY steady-state select! arm's
-/// handler awaits, the `tun.read_packet()` data-plane arm is NOT re-polled, so
-/// outbound packets queue for the handler's full duration (the field-observed
+/// handler awaits, the outbound TUN-packet arm (rc.213: an mpsc fed by the
+/// dedicated reader task) is NOT re-polled, so outbound packets queue for the
+/// handler's full duration (the field-observed
 /// 1–2 s RTT plateaus on a churny Windows host). Every arm and the expensive
 /// sub-calls inside the fat ones are timed via [`warn_if_slow`]; anything over
 /// this threshold is named in the log. Permanent telemetry: two `Instant` reads
@@ -1455,16 +1456,67 @@ impl OverlayRuntime {
         // never stacks concurrent delete-then-add mutations on the same prefix.
         let route_reassert_lock = Arc::new(tokio::sync::Mutex::new(()));
 
+        // rc.213 — dedicated outbound TUN reader (the Windows 1–2 s batching
+        // fix). `tokio::select!` DROPS every losing arm's future each
+        // iteration; a dropped `tun.read_packet()` future on Windows leaves its
+        // blocking-pool thread parked in `WaitForMultipleObjects(INFINITE)` on
+        // wintun's read event as a ZOMBIE waiter. The event releases ONE waiter
+        // per edge, so an accumulated zombie usually swallows it and the live
+        // read future starves — outbound packets then only left the ring when a
+        // periodic arm (route guard 2 s / fallback 5 s) woke the loop and a
+        // FRESH read future's `try_receive` drained the backlog. Field-proven
+        // on neo16: mars-side tcpdump showed every overlay packet arriving in
+        // bursts on exactly the union of those two timer grids (sub-ms aligned;
+        // RTT sequence {2,2,1,1,2,2} s ⇒ the measured ~1.65 s averages) while
+        // the raw wire RTT was 43 ms — and the rc.211 handler watchdog stayed
+        // silent throughout, because the delay was future-PENDING time, which
+        // no handler timer sees. A PERSISTENT reader task is never cancelled,
+        // so exactly one event waiter exists and every edge lands on it; the
+        // loop consumes via an mpsc arm, whose `recv()` is cancel-safe by
+        // contract. Linux never suffered (level-triggered epoll on the tun fd,
+        // no blocking-pool waiters) and shares the structure harmlessly.
+        let (tun_pkt_tx, mut tun_pkt_rx) = mpsc::channel::<Vec<u8>>(512);
+        let reader_tun = tun.clone();
+        let tun_reader = tokio::spawn(async move {
+            loop {
+                match reader_tun.read_packet().await {
+                    Ok(pkt) => {
+                        // Reader-side twin of `warn_if_slow`: a slow send here
+                        // means the channel is FULL — the steady loop stopped
+                        // consuming for long enough to queue 512 packets. The
+                        // handler watchdog times executing handlers; this catches
+                        // the complementary failure (loop wedged/starved between
+                        // polls), which rc.211's telemetry was blind to.
+                        let t0 = Instant::now();
+                        if tun_pkt_tx.send(pkt).await.is_err() {
+                            break; // runtime loop gone
+                        }
+                        let ms = t0.elapsed().as_millis();
+                        if ms > LOOP_STALL_WARN_MS {
+                            warn!(
+                                ms,
+                                "overlay: steady loop backpressured the TUN reader (outbound queue full)"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        debug!(%e, "overlay: TUN read ended; reader exiting");
+                        break;
+                    }
+                }
+            }
+        });
+
         // Phase 2 — steady state.
         loop {
             tokio::select! {
-                read = tun.read_packet() => match read {
-                    Ok(pkt) => {
+                read = tun_pkt_rx.recv() => match read {
+                    Some(pkt) => {
                         let t0 = Instant::now();
                         let _ = wg.send_ip_packet(&pkt).await;
                         warn_if_slow("send_ip_packet", t0);
                     }
-                    Err(e) => { debug!(%e, "overlay: TUN read ended; runtime exiting"); break; }
+                    None => { debug!("overlay: TUN reader ended; runtime exiting"); break; }
                 },
                 // rc.211 — commit a finished OFF-LOOP relay carrier build (the
                 // spawned QUIC-over-TURN rendezvous — see `RelayBuildQueue`).
@@ -1558,7 +1610,7 @@ impl OverlayRuntime {
                     // rc.206 — DETACH the per-peer /32 re-assert (the head-of-line
                     // bulk on Windows: N peers × `route`/`netsh` delete-then-add,
                     // ~0.3–2 s each) off the select! loop. Awaiting it INLINE
-                    // stalled the `tun.read_packet()` arm above (select! doesn't
+                    // stalled the outbound TUN-packet arm above (select! doesn't
                     // re-poll a sibling arm while the chosen handler awaits), so
                     // outbound packets piled unread in the wintun ring → ~1.8 s
                     // Windows RTT (lossless, just delayed) vs Linux's ~40 ms (one
@@ -1698,6 +1750,10 @@ impl OverlayRuntime {
             .await;
 
         inbound.abort();
+        // rc.213 — stop the dedicated outbound TUN reader; aborting drops its
+        // in-flight `read_packet()` future, and the TUN `Arc` it holds drops
+        // with the task, so session teardown isn't kept alive by the reader.
+        tun_reader.abort();
         // Phase C — stop the srflx keepalive task (if any) on runtime exit.
         if let Some(h) = srflx_keepalive {
             h.abort();
