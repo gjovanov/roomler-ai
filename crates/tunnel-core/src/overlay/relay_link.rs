@@ -21,13 +21,16 @@
 //! 1. peer appears → [`request`](RelayCoordinator::request) sends
 //!    `rc:overlay.relay_request`.
 //! 2. `rc:overlay.relay_grant` (coturn creds + `pair_key`) →
-//!    [`on_grant`](RelayCoordinator::on_grant): allocate immediately, pinned
-//!    to the deterministic worker, and advertise our relayed address.
+//!    [`grant_accept`](RelayCoordinator::grant_accept) stashes the creds and
+//!    hands the runtime an alloc job; the runtime SPAWNS
+//!    [`allocate_for_pair`] (DNS + TURN allocate — seconds on a hostile corp
+//!    path, so never inline on the steady loop — rc.218) and commits the
+//!    result back on-loop via
+//!    [`commit_alloc`](RelayCoordinator::commit_alloc): advertise our relayed
+//!    address, move to `allocated`, try to build.
 //! 3. the peer's relayed address arrives in a netmap delta →
 //!    [`maybe_complete`](RelayCoordinator::maybe_complete): build the
 //!    `Carrier::relay` dialing it.
-//!
-//! **Still field-pending.**
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -368,22 +371,57 @@ impl RelayCoordinator {
         debug!(peer = %node_id, "overlay relay: requested coturn creds");
     }
 
-    /// Got coturn creds + `pair_key`. Allocate immediately, pinned to the
-    /// deterministic worker (identical on both ends — no dependence on the
-    /// peer's advertised endpoint), advertise our relayed address, and try to
-    /// build the carrier.
-    pub async fn on_grant(
+    /// Got coturn creds + `pair_key` — the SYNC half of the old `on_grant`
+    /// (rc.218). Stash them into the pending slot and return the inputs the
+    /// runtime needs to run [`allocate_for_pair`] OFF-LOOP (the DNS + TURN
+    /// allocate takes seconds on a hostile corp path — pc50045's rc.213-216
+    /// logs still showed `stalled the data plane` from exactly this await).
+    /// `None` for a grant we never requested (or already tore down). The peer
+    /// STAYS in `pending` while the spawned allocate runs, so `is_tracking`
+    /// keeps deduping re-requests; [`commit_alloc`] (success) or a
+    /// [`forget`](Self::forget) on failure resolves it.
+    pub fn grant_accept(
         &mut self,
         node_id: ObjectId,
         ice_servers: Vec<IceServer>,
         pair_key: String,
+    ) -> Option<(Vec<IceServer>, String)> {
+        let pp = self.pending.get_mut(&node_id)?;
+        pp.ice = Some(ice_servers.clone());
+        pp.pair_key = Some(pair_key.clone());
+        Some((ice_servers, pair_key))
+    }
+
+    /// Commit a finished off-loop allocate (rc.218): advertise our relayed
+    /// address (the `OverlayEndpoints` trickle reads coordinator state, so this
+    /// half MUST run on-loop), move the peer to `allocated`, and try to build.
+    /// `None` (dropping the allocation — it idles out at coturn's TTL) when the
+    /// peer left `pending` mid-allocate: a strategy flip or teardown raced the
+    /// spawned task; the runtime's epoch guard already drops the
+    /// forget→re-request ABA case before this is called.
+    pub async fn commit_alloc(
+        &mut self,
+        node_id: ObjectId,
+        conn: Arc<dyn RelayConn>,
     ) -> Option<ReadyLink> {
-        {
-            let pp = self.pending.get_mut(&node_id)?;
-            pp.ice = Some(ice_servers);
-            pp.pair_key = Some(pair_key);
+        let peer = self.pending.get(&node_id)?.peer.clone();
+        if let Ok(own) = conn.local_addr() {
+            info!(peer = %node_id, %own, "overlay relay: allocated");
+            // Per-peer (not append-only) so this replaces any prior relay we
+            // allocated for the same peer across a churn cycle — see the
+            // `advertised` field doc. A peer reads `endpoints[0]`, so a stale
+            // relay must never outlive its allocation here.
+            self.advertised.insert(node_id, own.to_string());
+            let _ = self
+                .outbound
+                .send(ClientMsg::OverlayEndpoints {
+                    candidates: self.all_endpoints(),
+                })
+                .await;
         }
-        self.allocate_and_store(node_id).await
+        self.pending.remove(&node_id);
+        self.allocated.insert(node_id, Allocated { conn, peer });
+        self.try_build(&node_id)
     }
 
     /// A fresh netmap view arrived. Refresh the peer config; if we've already
@@ -425,41 +463,37 @@ impl RelayCoordinator {
         None
     }
 
-    /// Allocate this peer's relay pinned to the deterministic worker,
-    /// advertise it, move it to `allocated`, and try to build the carrier.
-    async fn allocate_and_store(&mut self, node_id: ObjectId) -> Option<ReadyLink> {
-        let (ice, peer, pair_key) = {
-            let pp = self.pending.get(&node_id)?;
-            (pp.ice.clone()?, pp.peer.clone(), pp.pair_key.clone()?)
-        };
+    /// The spawnable allocate phase (rc.218): deterministic same-worker pick
+    /// (both ends derive the identical worker from the shared `pair_key`, with
+    /// NO dependence on the peer's racy advertised endpoint) + the TURN
+    /// allocate. Needs nothing from the coordinator — only the grant's creds —
+    /// so the runtime runs it in a `tokio::spawn` and the steady loop never
+    /// waits on DNS or coturn (UDP 5 s → TURNS/TCP 6 s caps per candidate on a
+    /// hostile corp path).
+    pub(crate) async fn allocate_for_pair(
+        ice: &[IceServer],
+        pair_key: &str,
+    ) -> Option<Arc<dyn RelayConn>> {
         // Deterministic same-worker pick: both ends derive the identical
-        // worker from the shared pair_key, with NO dependence on the peer's
-        // (racy) advertised endpoint.
-        let pin = pick_worker(&pair_key, &ice).await;
-        let conn = self.allocate(&ice, pin).await?;
-        if let Ok(own) = conn.local_addr() {
-            info!(peer = %node_id, %own, pinned = pin.is_some(), "overlay relay: allocated");
-            // Per-peer (not append-only) so this replaces any prior relay we
-            // allocated for the same peer across a churn cycle — see the
-            // `advertised` field doc. A peer reads `endpoints[0]`, so a stale
-            // relay must never outlive its allocation here.
-            self.advertised.insert(node_id, own.to_string());
-            let _ = self
-                .outbound
-                .send(ClientMsg::OverlayEndpoints {
-                    candidates: self.all_endpoints(),
-                })
-                .await;
+        // worker from the shared pair_key.
+        let pin = pick_worker(pair_key, ice).await;
+        let conn = Self::allocate_pinned(ice, pin).await;
+        if conn.is_some() {
+            debug!(
+                pinned = pin.is_some(),
+                "overlay relay: off-loop allocate finished"
+            );
         }
-        self.pending.remove(&node_id);
-        self.allocated.insert(node_id, Allocated { conn, peer });
-        self.try_build(&node_id)
+        conn
     }
 
     /// Allocate a coturn relay. With `pin = Some(ip)` that worker is tried
     /// first (UDP, then TURNS/TCP for UDP-blocked corp hosts), so the
     /// relay-to-relay path becomes an intra-worker hairpin.
-    async fn allocate(&self, ice: &[IceServer], pin: Option<IpAddr>) -> Option<Arc<dyn RelayConn>> {
+    ///
+    /// Associated (no `&self`, rc.218) so the spawned [`allocate_for_pair`]
+    /// can run it without touching coordinator state.
+    async fn allocate_pinned(ice: &[IceServer], pin: Option<IpAddr>) -> Option<Arc<dyn RelayConn>> {
         let (urls, user, cred) = turn_creds(ice)?;
         let urls = match pin {
             Some(ip) => {
