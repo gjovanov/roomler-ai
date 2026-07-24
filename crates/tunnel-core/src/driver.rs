@@ -499,8 +499,12 @@ async fn run_webrtc_session(
                 break;
             }
             // P7 backstop: repeated forward-open timeouts with no reply — the
-            // far side went silent. End + re-open (see `run_quic_session`).
+            // far side went silent. End + re-open (see `run_quic_session`,
+            // incl. the stale-permit re-check).
             _ = session_dead.notified() => {
+                if flow_timeout_streak.load(Ordering::Relaxed) < MAX_CONSECUTIVE_FLOW_TIMEOUTS {
+                    continue;
+                }
                 warn!("forward opens timing out repeatedly (far side silent) — ending session to re-open");
                 let _ = sink
                     .send(ClientMsg::TunnelTerminate {
@@ -1122,7 +1126,13 @@ async fn run_quic_session(
             // times with no reply of any kind — the far side went silent (lost
             // reply, or an agent that forgot us without sending a reject, which
             // the reply-driven session-gone signal can't catch). End + re-open.
+            // The AtomicU32 is authoritative: `notify_one` may have stored a
+            // permit that a later reply's streak-reset made stale, so re-check
+            // and ignore a stale wakeup rather than kill a now-healthy session.
             _ = session_dead.notified() => {
+                if flow_timeout_streak.load(Ordering::Relaxed) < MAX_CONSECUTIVE_FLOW_TIMEOUTS {
+                    continue;
+                }
                 warn!("forward opens timing out repeatedly (far side silent) — ending quic session to re-open");
                 let _ = sink
                     .send(ClientMsg::TunnelTerminate {
