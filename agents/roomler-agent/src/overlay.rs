@@ -336,6 +336,14 @@ pub fn intercept(evt_tx: &mpsc::Sender<OverlayEvent>, msg: ServerMsg) -> Option<
             ice_servers,
             pair_key,
         },
+        // P7 — server-pushed per-pair DERP escalation (corp TURN churn).
+        ServerMsg::OverlayForceDerp {
+            peer_node_id,
+            ttl_ms,
+        } => OverlayEvent::ForceDerp {
+            peer_node_id,
+            ttl_ms,
+        },
         other => return Some(other),
     };
     if evt_tx.try_send(evt).is_err() {
