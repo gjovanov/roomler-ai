@@ -109,6 +109,10 @@ pub struct AppState {
     /// sender for that node's live `/derp` WS. The pubkey-addressed forwarding
     /// map for the both-UDP-blocked carrier tier. See [`crate::ws::derp`].
     pub derp_registry: crate::ws::derp::DerpRegistry,
+    /// P7 — per-pair TURN-relay churn state for the forced-DERP escalation,
+    /// keyed by the symmetric `pair_key`. Manual TTL (checked on access) +
+    /// a size-capped retain sweep — see [`crate::ws::overlay::PairChurn`].
+    pub relay_pair_churn: Arc<DashMap<String, crate::ws::overlay::PairChurn>>,
 
     /// 1h-TTL in-memory cache backing `/api/agent/latest-release`.
     /// All agents share this single cache; one upstream GitHub fetch
@@ -291,6 +295,7 @@ impl AppState {
             overlay_nodes,
             overlay_nodes_by_id: Arc::new(DashMap::new()),
             derp_registry: Arc::new(DashMap::new()),
+            relay_pair_churn: Arc::new(DashMap::new()),
             latest_release_cache: crate::routes::agent_release::LatestReleaseCache::new(),
             tunnel_release_cache: crate::routes::tunnel_release::LatestTunnelReleaseCache::new(),
             setup_release_cache: crate::routes::setup_release::LatestSetupReleaseCache::new(),

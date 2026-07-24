@@ -845,6 +845,12 @@ pub struct OverlayNode {
     /// chosen when both ends support it. Absent on a pre-DERP row ⇒ `false`.
     #[serde(default)]
     pub supports_derp: bool,
+    /// P7 — the node advertised (on JOIN) that it honors the server's per-pair
+    /// `rc:overlay.force_derp` escalation push. The broker only escalates a
+    /// churning pair when BOTH ends carry this, so a mixed-version pair can
+    /// never split tiers. Absent on a pre-P7 row ⇒ `false`.
+    #[serde(default)]
+    pub supports_forced_derp: bool,
     /// Phase 1 — subnet CIDRs this node CLAIMS it can route for peers (from its
     /// `--advertise-routes` config, refreshed on each join). Untrusted until an
     /// admin approves; see `approved_routes`.
