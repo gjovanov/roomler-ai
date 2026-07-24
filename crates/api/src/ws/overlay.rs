@@ -467,6 +467,10 @@ async fn handle_overlay_relay_request(
     // hairpin that never crosses mars's dual-public-IP SNAT.
     let ice_servers = overlay_ice_servers(state, &pair_key).await;
 
+    // P7 — arm the churn detector: a re-request for this pair arriving after
+    // this grant (past the dedup gap) counts as one churn cycle. Armed before
+    // the send so `pair_key` can move into the grant.
+    note_grant_sent(state, &pair_key);
     send_to_node(
         state,
         &self_node,
@@ -477,9 +481,6 @@ async fn handle_overlay_relay_request(
         },
     )
     .await;
-    // P7 — arm the churn detector: a re-request for this pair arriving after
-    // this grant (past the dedup gap) counts as one churn cycle.
-    note_grant_sent(state, &pair_key);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
