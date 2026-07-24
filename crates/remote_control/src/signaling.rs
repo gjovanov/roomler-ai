@@ -76,6 +76,22 @@ pub enum RejectKind {
 /// rejects from older agents match too. Do not reword.
 pub const REJECT_REASON_SESSION_GONE: &str = "tunnel session not open on agent";
 
+/// Reject reason the SERVER sends when it holds NO tunnel session for the
+/// connection a forward arrived on (the client sent `TcpForwardRequest`
+/// before/without a live `TunnelOpen`, or the server tore the session down —
+/// e.g. an agent-disconnect teardown — while the client kept forwarding).
+/// Same session-death class as [`REJECT_REASON_SESSION_GONE`] but raised one
+/// hop earlier, at the server: clients match it too and re-open. Wire-stable,
+/// do not reword. Emitted at `crates/api/src/ws/tunnel.rs` (handle_forward_request).
+pub const REJECT_REASON_NO_SESSION: &str = "no open session (send rc:tunnel.open first)";
+
+/// Reject reason the SERVER sends when a forward's `session_id` doesn't match
+/// the session currently open on that connection — the client is still
+/// forwarding on a stale session id after the server rebuilt/replaced it.
+/// Also session-death: re-opening yields a fresh id both sides agree on.
+/// Wire-stable, do not reword. Emitted at `crates/api/src/ws/tunnel.rs`.
+pub const REJECT_REASON_SESSION_MISMATCH: &str = "session_id mismatch";
+
 /// Half-close direction in `TcpHalfClose`. SMTP / HTTP-1.1-long-poll /
 /// some legacy protocols rely on this.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
