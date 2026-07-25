@@ -100,6 +100,19 @@ pub(crate) enum ClipboardCmd {
         text: String,
         reply: oneshot::Sender<Result<()>>,
     },
+    /// v2.2 — read the host clipboard's NATIVE formats (RTF + html +
+    /// text). `Ok(None)` when no RTF is present (the html/text lanes
+    /// cover that). Windows-only in practice — elsewhere always None.
+    ReadNative {
+        reply: oneshot::Sender<Result<Option<NativePayload>>>,
+    },
+    /// v2.2 — write RTF + html + text to the host clipboard (html+text
+    /// in one arboard transaction, RTF appended via
+    /// `set_without_clear`). Windows-only; an error elsewhere.
+    WriteNative {
+        payload: Box<NativePayload>,
+        reply: oneshot::Sender<Result<()>>,
+    },
     /// v2 — install the change watcher (replaces any existing one).
     /// The worker switches from blocking `recv()` to a tick loop and
     /// pushes [`ClipboardChange`]s into `tx` when the HOST clipboard
@@ -191,6 +204,12 @@ impl Clipboard {
                         Some(ClipboardCmd::WriteHtml { html, text, reply }) => {
                             let _ =
                                 reply.send(worker_write_html(&mut cb, &html, &text, &mut marks));
+                        }
+                        Some(ClipboardCmd::ReadNative { reply }) => {
+                            let _ = reply.send(worker_read_native(&mut cb));
+                        }
+                        Some(ClipboardCmd::WriteNative { payload, reply }) => {
+                            let _ = reply.send(worker_write_native(&mut cb, &payload, &mut marks));
                         }
                         Some(ClipboardCmd::Watch { events, tx }) => {
                             watch = Some(install_watcher(&mut cb, events, tx));
@@ -298,6 +317,50 @@ impl Clipboard {
             .map_err(|_| anyhow::anyhow!("clipboard worker dropped reply"))?
     }
 
+    /// v2.2 — read the native formats (RTF + alternates); `None` when
+    /// the clipboard holds no RTF.
+    pub async fn read_native(&self) -> Result<Option<NativePayload>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(ClipboardCmd::ReadNative { reply: reply_tx })
+            .map_err(|_| anyhow::anyhow!("clipboard worker gone"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("clipboard worker dropped reply"))?
+    }
+
+    /// v2.2 — write RTF + html + text (Windows).
+    pub async fn write_native(&self, payload: NativePayload) -> Result<()> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(ClipboardCmd::WriteNative {
+                payload: Box::new(payload),
+                reply: reply_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("clipboard worker gone"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("clipboard worker dropped reply"))?
+    }
+
+    /// v2.2 — the process-shared clipboard worker. One worker (and one
+    /// set of echo self-marks) serves every consumer — the per-session
+    /// DC handlers AND the loopback bridge — so a bridge write is
+    /// never echoed back by a concurrently-subscribed session watcher.
+    /// `None` when the OS clipboard is unavailable (headless).
+    pub fn shared() -> Option<Clipboard> {
+        static SHARED: std::sync::OnceLock<Option<Clipboard>> = std::sync::OnceLock::new();
+        SHARED
+            .get_or_init(|| match Clipboard::new() {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::warn!(%e, "clipboard: shared worker init failed — clipboard disabled");
+                    None
+                }
+            })
+            .clone()
+    }
+
     /// v2 — install the change watcher (replaces any existing one).
     /// Changes arrive on `tx`; the worker drops pushes when the
     /// channel is full and retries on the next tick.
@@ -336,6 +399,9 @@ pub(crate) struct WatchEvents {
     pub text: bool,
     pub image: bool,
     pub html: bool,
+    /// v2.2 — RTF-bearing native events (Windows only; needs the
+    /// viewer side to run a loopback bridge to consume them).
+    pub native: bool,
 }
 
 /// A PNG-encoded clipboard image (the wire form on the clipboard DC).
@@ -356,12 +422,47 @@ pub struct HtmlPayload {
     pub text: String,
 }
 
+/// v2.2 — NATIVE clipboard content: RTF (the only format that carries
+/// a document's EMBEDDED images as self-contained bytes) plus the
+/// html/text alternates. Only reachable through an agent — no browser
+/// API exposes RTF — which is what the loopback clipboard bridge is
+/// for. `rtf` is required (else the html/text lanes suffice); `html`
+/// and `text` may be empty.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct NativePayload {
+    /// Raw RTF bytes (Windows "Rich Text Format" registered format).
+    #[serde(with = "base64_bytes")]
+    pub rtf: Vec<u8>,
+    #[serde(default)]
+    pub html: String,
+    #[serde(default)]
+    pub text: String,
+}
+
+/// Serde adapter: `Vec<u8>` ⇄ base64 string (the bridge's JSON body).
+mod base64_bytes {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+
+    pub fn serialize<S: serde::Serializer>(v: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&STANDARD.encode(v))
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let s: String = serde::Deserialize::deserialize(d)?;
+        STANDARD
+            .decode(s.as_bytes())
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 /// Host-clipboard change pushed to a [`ClipboardCmd::Watch`] subscriber.
 #[derive(Debug)]
 pub(crate) enum ClipboardChange {
     Text(String),
     Image(PngImage),
     Html(HtmlPayload),
+    Native(Box<NativePayload>),
 }
 
 /// Watcher tick cadence. Windows gets a fast tick because the
@@ -393,6 +494,11 @@ struct SelfMarks {
     /// last wrote (the OS re-wraps CF_HTML, so hashing our input
     /// would never match what a later tick reads).
     html_hash: u64,
+    /// v2.2 — FNV of the RTF bytes we last wrote. Custom registered
+    /// formats round-trip verbatim (no OS re-wrap), so the input hash
+    /// matches a later tick's read.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    native_hash: u64,
 }
 
 struct WatcherState {
@@ -403,6 +509,8 @@ struct WatcherState {
     last_text_hash: u64,
     last_img_hash: u64,
     last_html_hash: u64,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    last_native_hash: u64,
     /// Set when `try_send` hit a full channel or a read failed
     /// transiently — the next tick bypasses the unchanged-seq early
     /// exit and re-attempts.
@@ -574,6 +682,84 @@ fn worker_write_html(
     Ok(())
 }
 
+/// v2.2 — Windows RTF access via clipboard-win's raw API (arboard has
+/// no custom-format surface). The "Rich Text Format" registered id is
+/// process-stable; the open guard retries briefly against other apps
+/// holding the clipboard.
+#[cfg(windows)]
+fn read_rtf_raw() -> Option<Vec<u8>> {
+    let fmt = clipboard_win::register_format("Rich Text Format")?;
+    let _guard = clipboard_win::Clipboard::new_attempts(10).ok()?;
+    let mut out = Vec::new();
+    match clipboard_win::raw::get_vec(fmt.get(), &mut out) {
+        Ok(_) if !out.is_empty() && out.len() <= CLIPBOARD_NATIVE_MAX_BYTES => Some(out),
+        _ => None,
+    }
+}
+
+/// Append RTF to the CURRENT clipboard contents (no clear — the
+/// html/text formats written moments earlier stay). Second transaction
+/// after the arboard write; the tiny between-open race is acceptable
+/// (worst case: a concurrent copy wins, which is the right outcome).
+#[cfg(windows)]
+fn append_rtf_raw(rtf: &[u8]) -> Result<()> {
+    let fmt = clipboard_win::register_format("Rich Text Format")
+        .ok_or_else(|| anyhow::anyhow!("RegisterClipboardFormat failed"))?;
+    let _guard = clipboard_win::Clipboard::new_attempts(10)
+        .map_err(|e| anyhow::anyhow!("open clipboard for RTF append: {e}"))?;
+    clipboard_win::raw::set_without_clear(fmt.get(), rtf)
+        .map_err(|e| anyhow::anyhow!("set RTF: {e}"))
+}
+
+fn worker_read_native(cb: &mut arboard::Clipboard) -> Result<Option<NativePayload>> {
+    #[cfg(windows)]
+    {
+        let Some(rtf) = read_rtf_raw() else {
+            return Ok(None);
+        };
+        let html = cb.get().html().unwrap_or_default();
+        let text = cb.get_text().map(|t| host_to_wire(&t)).unwrap_or_default();
+        if rtf.len() + html.len() + text.len() > CLIPBOARD_NATIVE_MAX_BYTES {
+            return Ok(None);
+        }
+        Ok(Some(NativePayload { rtf, html, text }))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = cb;
+        Ok(None)
+    }
+}
+
+fn worker_write_native(
+    cb: &mut arboard::Clipboard,
+    payload: &NativePayload,
+    marks: &mut SelfMarks,
+) -> Result<()> {
+    #[cfg(windows)]
+    {
+        if payload.rtf.is_empty() {
+            anyhow::bail!("native write without RTF — use the html/text lanes");
+        }
+        // html+text first (one arboard transaction, clears the board),
+        // then append the RTF format.
+        if !payload.html.is_empty() {
+            worker_write_html(cb, &payload.html, &payload.text, marks)?;
+        } else {
+            worker_write_text(cb, &payload.text, marks)?;
+        }
+        append_rtf_raw(&payload.rtf)?;
+        marks.native_hash = fnv1a64(&payload.rtf);
+        marks.seq = win_clipboard_seq().unwrap_or(0);
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (cb, payload, marks);
+        anyhow::bail!("native clipboard formats are Windows-only")
+    }
+}
+
 /// Build the initial watcher state: snapshot the CURRENT clipboard so
 /// pre-existing content is never pushed on subscribe — only changes
 /// from here on.
@@ -598,6 +784,7 @@ fn install_watcher(
     #[cfg(not(windows))]
     let events = WatchEvents {
         image: false,
+        native: false,
         ..events
     };
     let text_hash = match cb.get_text() {
@@ -613,6 +800,12 @@ fn install_watcher(
         }
         Err(_) => 0,
     };
+    // Snapshot current RTF too (Windows) so pre-existing native
+    // content isn't pushed on subscribe.
+    #[cfg(windows)]
+    let native_hash = read_rtf_raw().map(|r| fnv1a64(&r)).unwrap_or(0);
+    #[cfg(not(windows))]
+    let native_hash = 0;
     WatcherState {
         events,
         tx,
@@ -621,6 +814,7 @@ fn install_watcher(
         last_text_hash: text_hash,
         last_img_hash: 0,
         last_html_hash: html_hash,
+        last_native_hash: native_hash,
         retry: false,
     }
 }
@@ -645,9 +839,38 @@ fn watch_tick(cb: &mut arboard::Clipboard, w: &mut WatcherState, marks: &SelfMar
         // Sequence number unavailable → hash polling below still works.
     }
     w.retry = false;
-    // v2.1 — richest format wins: html (carries a text alt) beats
-    // plain text beats image. A Word/browser copy has html+text; the
-    // html event lets the far side write BOTH formats.
+    // v2.2 — richest format wins, native (RTF) on top: only RTF
+    // carries a document's EMBEDDED images. Below it: html (carries a
+    // text alt) beats plain text beats image.
+    #[cfg(windows)]
+    if w.events.native
+        && let Some(rtf) = read_rtf_raw()
+    {
+        let h = fnv1a64(&rtf);
+        if h == w.last_native_hash || h == marks.native_hash {
+            w.last_native_hash = h;
+            return;
+        }
+        let html = cb.get().html().unwrap_or_default();
+        let text = cb.get_text().map(|t| host_to_wire(&t)).unwrap_or_default();
+        if rtf.len() + html.len() + text.len() > CLIPBOARD_NATIVE_MAX_BYTES {
+            w.last_native_hash = h;
+            return;
+        }
+        match w
+            .tx
+            .try_send(ClipboardChange::Native(Box::new(NativePayload {
+                rtf,
+                html,
+                text,
+            }))) {
+            Ok(()) => w.last_native_hash = h,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => w.retry = true,
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+        }
+        return;
+    }
+    // v2.1 — html (carries a text alt) beats plain text beats image.
     if w.events.html
         && let Ok(html) = cb.get().html()
         && !html.is_empty()
@@ -868,6 +1091,20 @@ pub(crate) enum ClipboardIncoming {
     /// bytes, writes html+text atomically, then acks with the `id`.
     #[serde(rename = "clipboard:html-end")]
     HtmlEnd { id: String },
+    /// v2.2 — NATIVE write header. Binary frames totalling
+    /// `rtf_bytes + html_bytes + text_bytes` follow (rtf, then html
+    /// UTF-8, then text UTF-8), terminated by `clipboard:native-end`.
+    #[serde(rename = "clipboard:native-begin")]
+    NativeBegin {
+        id: String,
+        rtf_bytes: u64,
+        html_bytes: u64,
+        text_bytes: u64,
+    },
+    /// v2.2 — NATIVE write trailer; the agent splits and writes
+    /// RTF + html + text, then acks with the `id`.
+    #[serde(rename = "clipboard:native-end")]
+    NativeEnd { id: String },
 }
 
 /// Hard ceiling on the total reassembled clipboard payload — both
@@ -993,6 +1230,13 @@ pub const MAX_IMAGE_PIXELS: u64 = 4096 * 4096;
 /// gives generous headroom while bounding memory + DC head-of-line.
 pub const CLIPBOARD_HTML_MAX_BYTES: usize = 4 * 1024 * 1024;
 
+/// v2.2 — cap on a NATIVE clipboard payload (RTF + html + text
+/// combined) on the wire and through the loopback bridge. RTF embeds
+/// images as hex (≈2× the binary size), so a Word selection with a
+/// few pictures runs to megabytes; 16 MiB bounds memory + DC
+/// head-of-line while covering real documents.
+pub const CLIPBOARD_NATIVE_MAX_BYTES: usize = 16 * 1024 * 1024;
+
 /// Binary frame size for agent → browser image sends. 64 KiB matches
 /// the folder-zip download pump (field-proven; Chrome's inbound SCTP
 /// message cap is 256 KiB). The browser → agent direction uses 16 KiB
@@ -1094,6 +1338,7 @@ pub(crate) struct RichRx {
 enum RichRxKind {
     Image { w: u32, h: u32 },
     Html { html_bytes: usize },
+    Native { rtf_bytes: usize, html_bytes: usize },
 }
 
 struct RichRxInFlight {
@@ -1108,6 +1353,7 @@ struct RichRxInFlight {
 pub(crate) enum RichPayload {
     Image(PngImage),
     Html(HtmlPayload),
+    Native(Box<NativePayload>),
 }
 
 impl RichRx {
@@ -1180,6 +1426,34 @@ impl RichRx {
         Ok(())
     }
 
+    pub(crate) fn begin_native(
+        &mut self,
+        id: String,
+        rtf_bytes: u64,
+        html_bytes: u64,
+        text_bytes: u64,
+    ) -> Result<(), String> {
+        let total = rtf_bytes
+            .saturating_add(html_bytes)
+            .saturating_add(text_bytes);
+        if rtf_bytes == 0 || total > CLIPBOARD_NATIVE_MAX_BYTES as u64 {
+            return Err(format!(
+                "clipboard native payload {total} bytes outside the (0, {CLIPBOARD_NATIVE_MAX_BYTES}] cap"
+            ));
+        }
+        self.replace_dangling();
+        self.in_flight = Some(RichRxInFlight {
+            id,
+            kind: RichRxKind::Native {
+                rtf_bytes: rtf_bytes as usize,
+                html_bytes: html_bytes as usize,
+            },
+            declared: total as usize,
+            buf: Vec::with_capacity(total as usize),
+        });
+        Ok(())
+    }
+
     pub(crate) fn frame(&mut self, data: &[u8]) -> Result<(), String> {
         let Some(f) = self.in_flight.as_mut() else {
             return Err("binary frame with no rich transfer in flight".into());
@@ -1216,6 +1490,22 @@ impl RichRx {
                 let text = String::from_utf8(text_raw.to_vec())
                     .map_err(|_| format!("rich transfer {id}: text is not valid UTF-8"))?;
                 Ok(RichPayload::Html(HtmlPayload { html, text }))
+            }
+            RichRxKind::Native {
+                rtf_bytes,
+                html_bytes,
+            } => {
+                let (rtf_raw, rest) = f.buf.split_at(rtf_bytes.min(f.buf.len()));
+                let (html_raw, text_raw) = rest.split_at(html_bytes.min(rest.len()));
+                let html = String::from_utf8(html_raw.to_vec())
+                    .map_err(|_| format!("rich transfer {id}: html is not valid UTF-8"))?;
+                let text = String::from_utf8(text_raw.to_vec())
+                    .map_err(|_| format!("rich transfer {id}: text is not valid UTF-8"))?;
+                Ok(RichPayload::Native(Box::new(NativePayload {
+                    rtf: rtf_raw.to_vec(),
+                    html,
+                    text,
+                })))
             }
         }
     }
@@ -1690,14 +1980,14 @@ mod tests {
     fn expect_image(p: RichPayload) -> PngImage {
         match p {
             RichPayload::Image(img) => img,
-            RichPayload::Html(_) => panic!("expected image payload"),
+            other => panic!("expected image payload, got {other:?}"),
         }
     }
 
     fn expect_html(p: RichPayload) -> HtmlPayload {
         match p {
             RichPayload::Html(h) => h,
-            RichPayload::Image(_) => panic!("expected html payload"),
+            other => panic!("expected html payload, got {other:?}"),
         }
     }
 
@@ -1812,6 +2102,85 @@ mod tests {
         rx.frame(&[0xff, 0xfe]).unwrap();
         let err = rx.end("h2").unwrap_err();
         assert!(err.contains("UTF-8"), "got: {err}");
+    }
+
+    // ── v2.2: native (RTF) lane ────────────────────────────────────────
+
+    #[test]
+    fn parse_incoming_native_begin_end() {
+        let m: ClipboardIncoming = serde_json::from_str(
+            r#"{"t":"clipboard:native-begin","id":"cb-n1","rtf_bytes":10,"html_bytes":4,"text_bytes":2}"#,
+        )
+        .unwrap();
+        match m {
+            ClipboardIncoming::NativeBegin {
+                id,
+                rtf_bytes,
+                html_bytes,
+                text_bytes,
+            } => {
+                assert_eq!(
+                    (id.as_str(), rtf_bytes, html_bytes, text_bytes),
+                    ("cb-n1", 10, 4, 2)
+                );
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        let m: ClipboardIncoming =
+            serde_json::from_str(r#"{"t":"clipboard:native-end","id":"cb-n1"}"#).unwrap();
+        match m {
+            ClipboardIncoming::NativeEnd { id } => assert_eq!(id, "cb-n1"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rich_rx_native_splits_three_ways() {
+        let mut rx = RichRx::new();
+        let rtf = br"{\rtf1 hi}";
+        rx.begin_native("n1".into(), rtf.len() as u64, 4, 2)
+            .unwrap();
+        let mut combined = rtf.to_vec();
+        combined.extend_from_slice(b"<b>x");
+        combined.extend_from_slice(b"hi");
+        rx.frame(&combined[..7]).unwrap();
+        rx.frame(&combined[7..]).unwrap();
+        match rx.end("n1").unwrap() {
+            RichPayload::Native(p) => {
+                assert_eq!(p.rtf, rtf.to_vec());
+                assert_eq!(p.html, "<b>x");
+                assert_eq!(p.text, "hi");
+            }
+            other => panic!("expected native, got {other:?}"),
+        }
+        // Zero rtf_bytes and over-cap totals are rejected at begin.
+        assert!(rx.begin_native("n2".into(), 0, 4, 2).is_err());
+        assert!(
+            rx.begin_native("n3".into(), CLIPBOARD_NATIVE_MAX_BYTES as u64, 1, 0)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn native_payload_serde_base64_roundtrip() {
+        // The bridge's JSON body: rtf travels base64; html/text default
+        // to empty when omitted.
+        let p = NativePayload {
+            rtf: vec![0x7b, 0x5c, 0x72, 0x74, 0x66, 0xff],
+            html: "<i>x</i>".into(),
+            text: "x".into(),
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(json.contains("\"rtf\":\"e1xydGb/\""), "got: {json}");
+        let back: NativePayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.rtf, p.rtf);
+        assert_eq!(back.html, p.html);
+        assert_eq!(back.text, p.text);
+        let sparse: NativePayload = serde_json::from_str(r#"{"rtf":"AQI="}"#).unwrap();
+        assert_eq!(sparse.rtf, vec![1, 2]);
+        assert_eq!(sparse.html, "");
+        assert_eq!(sparse.text, "");
+        assert!(serde_json::from_str::<NativePayload>(r#"{"rtf":"not base64!!"}"#).is_err());
     }
 
     // ── v2.1: html parse locks + event hash ────────────────────────────
