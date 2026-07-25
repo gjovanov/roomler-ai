@@ -143,7 +143,7 @@
         size="small"
         class="mr-1"
         aria-label="Send Ctrl+Alt+Del to remote"
-        title="Send Ctrl+Alt+Del"
+        title="Send Ctrl+Alt+Del (Ctrl+Alt+End over the viewer does the same)"
         @click="rc.sendCtrlAltDel()"
       >
         <v-icon>mdi-keyboard-outline</v-icon>
@@ -323,7 +323,7 @@
         size="small"
         class="ml-1"
         :aria-label="isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'"
-        :title="isFullscreen ? 'Exit fullscreen (Esc)' : 'Fullscreen'"
+        :title="isFullscreen ? 'Exit fullscreen (hold Esc)' : fullscreenButtonTooltip"
         @click="toggleFullscreen"
       >
         <v-icon>{{ isFullscreen ? 'mdi-fullscreen-exit' : 'mdi-fullscreen' }}</v-icon>
@@ -559,6 +559,23 @@
         >
           <div class="cursor-arrow" />
           <div class="cursor-chip">{{ controllerInitials }}</div>
+        </div>
+        <!-- Keyboard-lock affordances. Plain divs INSIDE the fullscreen
+             element (.video-frame) — Vuetify snackbars teleport to
+             <body>, which is invisible in fullscreen. pointer-events:
+             none so they never eat clicks meant for the remote. -->
+        <div v-if="shortcutOverlayVisible" class="kb-lock-toast">
+          <v-icon size="small" class="mr-2">mdi-keyboard-variant</v-icon>
+          Shortcuts now go to the remote host — hold Esc to exit fullscreen.
+          Ctrl+Alt+End sends Ctrl+Alt+Del.
+        </div>
+        <div
+          v-else-if="isFullscreen && rc.keyboardLockActive.value"
+          class="kb-lock-pill"
+          title="System shortcuts (Alt+Tab, Win, Ctrl+W) go to the remote host. Hold Esc to exit fullscreen."
+        >
+          <v-icon size="x-small" class="mr-1">mdi-keyboard-variant</v-icon>
+          <span>remote keys</span>
         </div>
       </div>
     </div>
@@ -1183,6 +1200,7 @@ import { useAuthStore } from '@/stores/auth'
 import {
   useRemoteControl,
   nextDirPath,
+  isKeyboardLockSupported,
   type RcScaleMode,
   type RcResolutionSetting,
   type RcPriority,
@@ -2122,6 +2140,13 @@ const fullscreenEnabled = computed<boolean>(() => {
   return document.fullscreenEnabled === true
 })
 const isFullscreen = ref(false)
+// Advertise the keyboard-lock upgrade on Chromium; other browsers get
+// the plain label (fullscreen still works, shortcuts stay local).
+const fullscreenButtonTooltip = computed<string>(() =>
+  isKeyboardLockSupported()
+    ? 'Fullscreen — system shortcuts (Alt+Tab, Win, Ctrl+W) go to the remote'
+    : 'Fullscreen',
+)
 function toggleFullscreen() {
   const el = stageEl.value
   if (!el) return
@@ -2131,8 +2156,34 @@ function toggleFullscreen() {
     void el.requestFullscreen().catch(() => { /* user gesture / API missing; ignore */ })
   }
 }
+// Keyboard-lock affordances: a 4 s toast on entering locked
+// fullscreen + a persistent subtle pill while locked. Both live
+// INSIDE .video-frame (the fullscreen element) — Vuetify snackbars
+// teleport to <body>, which is invisible in fullscreen.
+const shortcutOverlayVisible = ref(false)
+let shortcutOverlayTimer: ReturnType<typeof setTimeout> | null = null
 function onFullscreenChange() {
   isFullscreen.value = document.fullscreenElement !== null
+  if (isFullscreen.value) {
+    // Engage Keyboard Lock so Alt+Tab / Win / Ctrl+W go to the
+    // REMOTE. Not awaited inline — a hung lock() promise must degrade
+    // to legacy behavior, never block the fullscreen transition.
+    void rc.enableKeyboardLock().then((ok) => {
+      if (!ok) return
+      shortcutOverlayVisible.value = true
+      if (shortcutOverlayTimer) clearTimeout(shortcutOverlayTimer)
+      shortcutOverlayTimer = setTimeout(() => {
+        shortcutOverlayVisible.value = false
+      }, 4000)
+    })
+  } else {
+    rc.disableKeyboardLock()
+    shortcutOverlayVisible.value = false
+    if (shortcutOverlayTimer) {
+      clearTimeout(shortcutOverlayTimer)
+      shortcutOverlayTimer = null
+    }
+  }
 }
 
 // Inline style for the <video> element. In `original` and `custom`
@@ -3023,6 +3074,13 @@ onBeforeUnmount(() => {
   document.removeEventListener('fullscreenchange', onFullscreenChange)
   window.removeEventListener('paste', onWindowPasteForDrawer)
   window.removeEventListener('keydown', onWindowKeyDownForDrawer)
+  // Defensive: exitFullscreen fires fullscreenchange → disable, but a
+  // teardown that never sees that event must still release the lock.
+  rc.disableKeyboardLock()
+  if (shortcutOverlayTimer) {
+    clearTimeout(shortcutOverlayTimer)
+    shortcutOverlayTimer = null
+  }
   // Exit fullscreen on unmount so navigating away doesn't leave the
   // browser in a weird fullscreen state.
   if (document.fullscreenElement) void document.exitFullscreen().catch(() => {})
@@ -3248,6 +3306,40 @@ onBeforeUnmount(() => {
   color: #fff;
   text-align: center;
   padding: 24px;
+}
+/* Keyboard-lock affordances (locked fullscreen). Inside .video-frame
+   so they survive fullscreen; never intercept pointer events. */
+.kb-lock-toast {
+  position: absolute;
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  max-width: min(90%, 640px);
+  background: rgba(0, 0, 0, 0.75);
+  color: rgba(255, 255, 255, 0.95);
+  font-size: 13px;
+  line-height: 1.35;
+  padding: 8px 14px;
+  border-radius: 999px;
+  pointer-events: none;
+  z-index: 30;
+}
+.kb-lock-pill {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  display: flex;
+  align-items: center;
+  background: rgba(0, 0, 0, 0.45);
+  color: rgba(255, 255, 255, 0.85);
+  font: 500 11px/1 ui-monospace, "SF Mono", Menlo, monospace;
+  padding: 4px 8px;
+  border-radius: 999px;
+  opacity: 0.45;
+  pointer-events: none;
+  z-index: 30;
 }
 /* Live stats pills — inline in the toolbar (2026-07-21). Previously
    absolute-positioned over the video canvas, where they covered a
