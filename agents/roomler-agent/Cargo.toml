@@ -170,8 +170,16 @@ ffmpeg-next = { version = "8.1", optional = true }
 # behind `clipboard` so builds without the clipboard DC handler
 # (signalling-only CI images, future trimmed-down deployments) don't
 # pay for the dep. Pulls x11rb on Linux which we already have from
-# enigo so the transitive dep graph stays small.
-arboard = { workspace = true, optional = true }
+# enigo so the transitive dep graph stays small. `image-data` unlocks
+# get_image/set_image (raw RGBA) for clipboard protocol v2 — on
+# Windows it only adds windows-sys Gdi (already compiled), on Linux
+# the pure-Rust `image` crate.
+arboard = { workspace = true, optional = true, features = ["image-data"] }
+
+# PNG encode/decode for clipboard protocol v2 image payloads (the
+# wire format is PNG; arboard speaks raw RGBA). Pure Rust, small,
+# already in the lockfile transitively.
+png = { version = "0.18", optional = true }
 
 # Used by the media pump to wrap encoded NALUs in webrtc Sample.data.
 bytes = "1"
@@ -229,6 +237,12 @@ libc = "0.2"
 # API (CreateService / DeleteService / QueryServiceStatus). Compatible
 # with the `windows = "0.58"` crate already pulled in by mf-encoder etc.
 windows-service = "0.7"
+
+# GetClipboardSequenceNumber wrapper for the clipboard-v2 change
+# watcher (`raw::seq_num()`): 1 cheap syscall per 200 ms tick, no
+# clipboard open. Already compiled transitively by arboard on Windows,
+# so this adds zero new code to the build.
+clipboard-win = { version = "5", optional = true }
 
 # Raw Win32 FFI for the M2 worker-supervisor: WTSGetActiveConsoleSessionId,
 # WTSQueryUserToken, CreateProcessAsUserW, CreateEnvironmentBlock. Going
@@ -320,11 +334,14 @@ vp9-444 = ["dep:env-libvpx-sys", "dep:dcv-color-primitives"]
 vp9-444-bindgen = ["env-libvpx-sys/generate"]
 # Enables the enigo-based input injection backend.
 enigo-input = ["dep:enigo"]
-# Enables the clipboard data-channel handler — round-trip text
-# between browser and agent via the `clipboard` DC. Cross-platform
-# via arboard (Win32 / XClipboard / NSPasteboard). No system deps
-# on Windows; Linux pulls x11rb which we already use for enigo.
-clipboard = ["dep:arboard"]
+# Enables the clipboard data-channel handler — round-trip text +
+# PNG images between browser and agent via the `clipboard` DC, plus
+# the v2 change watcher for auto-sync. Cross-platform via arboard
+# (Win32 / XClipboard / NSPasteboard). No system deps on Windows;
+# Linux pulls x11rb which we already use for enigo. `dep:clipboard-win`
+# is Windows-target-only (same pattern as mf-encoder's `dep:windows`);
+# enabling it here is a no-op on other platforms.
+clipboard = ["dep:arboard", "dep:png", "dep:clipboard-win"]
 # Enables the Windows viewer-indicator overlay — topmost layered
 # click-through window drawn on the controlled host to signal "someone
 # is watching". Excluded from screen capture via SetWindowDisplayAffinity
