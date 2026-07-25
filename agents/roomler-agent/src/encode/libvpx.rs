@@ -245,29 +245,32 @@ impl Vp9Encoder {
         cfg.g_error_resilient = 0;
         cfg.g_bit_depth = vpx::vpx_bit_depth::VPX_BITS_8;
         cfg.g_input_bit_depth = 8;
-        cfg.kf_mode = vpx::vpx_kf_mode::VPX_KF_AUTO;
-        cfg.kf_min_dist = 0;
-        // rc.38 — scale kf_max_dist with target_fps so time-between-IDRs
-        // stays roughly constant (~3 s) regardless of the actual
-        // encoder frame rate. Field-observed on the field-test host (rc.36): with
-        // target_fps=60 but encoder-bound at 17 actual fps, a 240-frame
-        // kf_max_dist meant ~14 s between IDRs and visible "blur takes
-        // >1s to clear" on window-uncover events. KEYFRAME_INTERVAL
-        // is kept as a sanity floor in case target_fps is somehow zero.
-        // rc.171 — keyframe interval is now env-tunable (default keeps the
-        // historical ~3 s). A short periodic IDR re-sharpens screen-content
-        // text that per-frame deltas can't always afford to code crisply on a
-        // constrained link. The reliable SCTP DataChannel doesn't NEED periodic
-        // IDRs for loss recovery (on-demand `request_keyframe` covers first
-        // frame / late joiner / resync), so on a very slow relay — where each
-        // IDR is a costly burst — an operator can lengthen the interval via
-        // `ROOMLER_AGENT_VP9_KF_SECONDS` to trade text crispness for smoothness.
-        let kf_seconds = kf_seconds_from_env();
-        // Allow the knob to go up to a ~60 s backstop (the old 240-frame
-        // KEYFRAME_INTERVAL was an ~8 s cap tuned for the lossy RTP path).
-        let kf_cap = target_fps.saturating_mul(60).max(KEYFRAME_INTERVAL);
-        let kf_max_dist = target_fps.saturating_mul(kf_seconds).clamp(60, kf_cap);
-        cfg.kf_max_dist = kf_max_dist;
+        // rc.234 — periodic IDRs are OFF by default. The rc.171 theory was
+        // that a short periodic IDR (~3 s) "re-sharpens" screen-content text;
+        // the field showed the exact inverse (2026-07-25, NEO16 viewing
+        // PC50045/REGAL: "text blurs every ~3 s then stabilizes"): under the
+        // rate cap each periodic keyframe QP-starves and IS the blur event,
+        // while the deltas are what progressively re-sharpen static text.
+        // The reliable SCTP DataChannel needs no periodic IDRs — first frame,
+        // late join, and resync are all ON-DEMAND (`request_keyframe` is
+        // synchronous on libvpx). `ROOMLER_AGENT_VP9_KF_SECONDS=<1..60>`
+        // restores a periodic cadence for operators who prefer the old
+        // behaviour (rc.38/rc.171 history in git).
+        match kf_seconds_from_env() {
+            Some(kf_seconds) => {
+                cfg.kf_mode = vpx::vpx_kf_mode::VPX_KF_AUTO;
+                cfg.kf_min_dist = 0;
+                // Knob cap ~60 s (the old 240-frame KEYFRAME_INTERVAL stays
+                // as a sanity floor in case target_fps is somehow zero).
+                let kf_cap = target_fps.saturating_mul(60).max(KEYFRAME_INTERVAL);
+                cfg.kf_max_dist = target_fps.saturating_mul(kf_seconds).clamp(60, kf_cap);
+            }
+            None => {
+                cfg.kf_mode = vpx::vpx_kf_mode::VPX_KF_DISABLED;
+                cfg.kf_min_dist = 0;
+                cfg.kf_max_dist = 0;
+            }
+        }
         // Real-time-friendly buffer sizing: 1s buffer at target bitrate
         // with a 0.5s initial / optimal floor. Matches RustDesk's defaults.
         cfg.rc_buf_sz = 1000;
@@ -723,22 +726,18 @@ pub(crate) fn cpu_used_from_env() -> c_int {
 }
 
 /// Seconds between periodic keyframes (IDRs) on the reliable-DC VP9 path.
-/// Default 3 s (unchanged from the historical value) — a periodic full-quality
-/// refresh keeps screen-content TEXT crisp: on a bitrate-constrained link the
-/// per-frame deltas can't always afford to sharply re-code text edges, and the
-/// IDR re-sharpens them (field: text editors looked soft with a longer
-/// interval). The DataChannel is reliable, so IDRs aren't needed for loss
-/// recovery — but they ARE a cheap quality lever, so we keep the short default
-/// and expose the interval as a knob. Trade-off: on a very slow relay each IDR
-/// is a costly burst (a brief pause), so `ROOMLER_AGENT_VP9_KF_SECONDS` lets an
-/// operator lengthen it (up to 60 s) to favour smoothness over text crispness.
-pub(crate) fn kf_seconds_from_env() -> u32 {
-    const DEFAULT_KF_SECONDS: u32 = 3;
+///
+/// rc.234 — `None` (the default, env unset) disables periodic IDRs
+/// entirely: on the reliable DataChannel keys are on-demand only, and the
+/// field proved the old ~3 s default was the "text blurs every ~3 s"
+/// pulse the operator reported (each periodic key QP-starves under the
+/// rate cap; deltas do the re-sharpening). Setting
+/// `ROOMLER_AGENT_VP9_KF_SECONDS=<1..60>` restores a periodic cadence.
+pub(crate) fn kf_seconds_from_env() -> Option<u32> {
     node_env("VP9_KF_SECONDS")
         .and_then(|v| v.trim().parse::<u32>().ok())
         .filter(|s| *s > 0)
-        .unwrap_or(DEFAULT_KF_SECONDS)
-        .clamp(1, 60)
+        .map(|s| s.clamp(1, 60))
 }
 
 /// Read the `ROOMLER_AGENT_VP9_RC_MODE` env var. Default `cbr` (pre-
