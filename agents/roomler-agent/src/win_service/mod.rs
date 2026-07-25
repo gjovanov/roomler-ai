@@ -86,9 +86,8 @@ fn service_present(name: &str) -> bool {
 pub const SERVICE_DISPLAY_NAME: &str = "Roomler";
 
 /// One-line description shown in services.msc properties dialog.
-pub const SERVICE_DESCRIPTION: &str = "Native remote-control agent for the Roomler AI platform. Maintains an outbound \
-     WebSocket connection to the configured Roomler server and serves WebRTC peers \
-     directly to authorised browser controllers. Managed by the Roomler MSI.";
+pub const SERVICE_DESCRIPTION: &str = "Roomler Daemon — keeps this device on your private Roomler mesh network and \
+     available for secure remote control.";
 
 /// Argument the SCM passes when starting the service. The agent's
 /// `service-run` subcommand handler dispatches to [`run_in_dispatcher`]
