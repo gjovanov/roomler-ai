@@ -711,6 +711,29 @@ to-activate, so the browser never sees a bait-and-switch.
   worker on the first closure-captured clone release; dropped the
   `Drop` impl and rely on Sender refcount to end the `rx.recv()`
   loop naturally.
+- **Clipboard protocol v2** (0.3.0-rc.227): auto-sync without the
+  toolbar buttons. Additive messages on the same DC, gated by
+  `AgentCaps.clipboard = ["ack","events","images"]`:
+  `clipboard:write` gained an optional `id` → the agent acks with
+  `clipboard:write-ack {id,bytes}` after the OS write (the browser
+  gates its deferred Ctrl+V on this — fixes the stale-paste race
+  where the keystroke on the unordered input DC beat the write);
+  `clipboard:subscribe {events}` installs a host-side change watcher
+  (Windows: `GetClipboardSequenceNumber` at 200 ms, one syscall when
+  idle; elsewhere 1 Hz text-hash poll) that pushes `clipboard:event`
+  / `clipboard:event-chunk` / image streams; PNG images flow both
+  directions as `clipboard:img-begin` + binary frames (16 KiB up /
+  64 KiB down) + `clipboard:img-end`, capped at 8 MiB and 4096×4096
+  (header-checked pre-alloc). Wire text is canonical LF; the agent
+  converts to the host convention (CRLF on Windows — LF-only text
+  in `CF_UNICODETEXT` mis-renders in classic Win32 apps). Echo
+  suppression: agent-side self-marks (post-write seq + FNV-1a-64
+  content hashes) × browser-side echo gate, both hashing identical
+  canonical bytes. The session's CLIPBOARD permission bit is now
+  actually enforced (deny → `clipboard:error` stub handler). The
+  browser's local→remote triggers are focus/visibility/2 s-focused
+  poll/paste-intent; Settings → Session has the persisted
+  "Clipboard auto-sync" toggle (default ON).
 - **File DC** (0.1.33): browser drag/pick → `files:begin` →
   64 KiB ArrayBuffer chunks with `bufferedAmount` back-pressure →
   `files:end` → agent writes into the controlled host's Downloads
