@@ -453,11 +453,9 @@ maintainer = "Goran Jovanov <goran.jovanov@gmail.com>"
 copyright = "2026, Goran Jovanov <goran.jovanov@gmail.com>"
 license-file = ["../../LICENSE", "0"]
 extended-description = """\
-Native remote-control agent for the Roomler AI platform. Runs on the \
-controlled host, maintains an outbound WebSocket connection to the \
-Roomler API for signalling, and serves a WebRTC peer directly to the \
-browser controller (video + input over P2P — the server never sees \
-raw pixels or keystrokes)."""
+Roomler Daemon — keeps this device on your private Roomler mesh network \
+and available for secure remote control. Media and input flow directly \
+peer-to-peer; the server never sees raw pixels or keystrokes."""
 # The agent binary is built on ubuntu-22.04 (glibc 2.34) and links libvpx.so.7.
 # The CI "Bundle FFmpeg" step ships FFmpeg 8.1.2's libav* AND libvpx.so.7 inside
 # usr/lib/roomler-agent (binary RPATH + $ORIGIN), so the .deb is self-contained
