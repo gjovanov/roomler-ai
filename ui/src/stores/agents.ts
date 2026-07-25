@@ -73,8 +73,10 @@ export interface AgentCapabilities {
    *  gate the deferred Ctrl+V), 'events' (agent pushes host clipboard
    *  changes after `clipboard:subscribe`), 'images' (PNG payloads both
    *  directions), 'html' (v2.1 — CF_HTML + text alt round-trip:
-   *  formatted text, tables, web-hosted images survive the paste).
-   *  Empty / unset on older agents — the browser falls back to the v1
+   *  formatted text, tables, web-hosted images survive the paste),
+   *  'native' (v2.2 — RTF with EMBEDDED images; needs the viewer's
+   *  own local agent bridge to reach its RTF clipboard). Empty /
+   *  unset on older agents — the browser falls back to the v1
    *  button-driven text-only flow. Mirrors `AgentCaps.clipboard` in
    *  `crates/remote_control/src/models.rs`. */
   clipboard?: string[]

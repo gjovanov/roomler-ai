@@ -1296,7 +1296,26 @@ async function onGetClipboard() {
   try {
     const content = await rc.getAgentClipboardRich()
     try {
-      if (content.kind === 'image') {
+      if (content.kind === 'native') {
+        // v2.2 — full fidelity: write RTF (embedded images) to this
+        // machine's clipboard via the local bridge. Fall back to the
+        // html/text alternates if the bridge write fails.
+        const ok = await rc.writeLocalNativeClipboard(content)
+        if (ok) {
+          showSuccess('Copied remote clipboard (full fidelity — RTF with images)')
+        } else if (content.html) {
+          await globalThis.navigator.clipboard.write([
+            new ClipboardItem({
+              'text/html': new Blob([content.html], { type: 'text/html' }),
+              'text/plain': new Blob([content.text], { type: 'text/plain' }),
+            }),
+          ])
+          showSuccess(`Copied remote clipboard (formatted, ${content.text.length} chars)`)
+        } else {
+          await globalThis.navigator.clipboard.writeText(content.text)
+          showSuccess(`Copied remote clipboard (${content.text.length} chars)`)
+        }
+      } else if (content.kind === 'image') {
         await globalThis.navigator.clipboard.write([
           new ClipboardItem({ 'image/png': content.blob }),
         ])
