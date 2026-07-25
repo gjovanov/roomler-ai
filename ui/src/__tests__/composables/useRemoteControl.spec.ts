@@ -44,6 +44,7 @@ import {
   nextReconnectDelayMs,
   nextDirPath,
   parseControlInbound,
+  layoutSetWireMessage,
   parseAppsListReply,
   parseAppsActionReply,
   appsListWireMessage,
@@ -2319,6 +2320,59 @@ describe('parseControlInbound — rc:video-info native dims (rc.199)', () => {
       expect(parsed.info.native_w).toBe(0)
       expect(parsed.info.native_h).toBe(0)
     }
+  })
+})
+
+describe('parseControlInbound — rc:layout (rc.227)', () => {
+  it('parses a well-formed layout snapshot', () => {
+    const r = parseControlInbound(
+      '{"t":"rc:layout","active_hkl":"04070407","active":"de-DE","installed":[{"hkl":"04070407","tag":"de-DE"},{"hkl":"08820402","tag":"bg-BG"}]}',
+    )
+    expect(r).toEqual({
+      kind: 'layout',
+      activeHkl: '04070407',
+      activeTag: 'de-DE',
+      installed: [
+        { hkl: '04070407', tag: 'de-DE' },
+        { hkl: '08820402', tag: 'bg-BG' },
+      ],
+    })
+  })
+
+  it('defaults a missing installed list to [] and filters malformed entries', () => {
+    const r = parseControlInbound('{"t":"rc:layout","active_hkl":"04090409","active":"en-US"}')
+    expect(r).toEqual({
+      kind: 'layout',
+      activeHkl: '04090409',
+      activeTag: 'en-US',
+      installed: [],
+    })
+    const r2 = parseControlInbound(
+      '{"t":"rc:layout","active_hkl":"04090409","active":"en-US","installed":[{"hkl":"ok-missing-tag"},{"hkl":"04070407","tag":"de-DE"},7,null]}',
+    )
+    expect(r2?.kind).toBe('layout')
+    if (r2?.kind === 'layout') {
+      expect(r2.installed).toEqual([{ hkl: '04070407', tag: 'de-DE' }])
+    }
+  })
+
+  it('rejects snapshots missing the active fields', () => {
+    expect(parseControlInbound('{"t":"rc:layout","active":"en-US"}')).toBeNull()
+    expect(parseControlInbound('{"t":"rc:layout","active_hkl":"04090409"}')).toBeNull()
+  })
+})
+
+describe('layoutSetWireMessage (rc.227)', () => {
+  it('builds the wire shape the agent control arm validates', () => {
+    expect(layoutSetWireMessage('04070407')).toEqual({ t: 'rc:layout.set', hkl: '04070407' })
+    expect(layoutSetWireMessage('ABCDEF01')).toEqual({ t: 'rc:layout.set', hkl: 'ABCDEF01' })
+  })
+
+  it('refuses anything that is not 1-16 hex digits', () => {
+    expect(layoutSetWireMessage('')).toBeNull()
+    expect(layoutSetWireMessage('xyz')).toBeNull()
+    expect(layoutSetWireMessage('0407 0407')).toBeNull()
+    expect(layoutSetWireMessage('0123456789abcdef0')).toBeNull()
   })
 })
 

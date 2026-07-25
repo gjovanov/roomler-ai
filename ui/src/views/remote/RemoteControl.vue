@@ -82,6 +82,20 @@
       >
         On {{ rc.currentDesktop.value }}
       </v-chip>
+      <!-- rc.227 — remote keyboard-layout chip. Self-gating: old agents /
+           non-Windows hosts never send rc:layout, so remoteLayout stays
+           null and the chip doesn't render. Hidden on phones (secondary
+           status; the Settings picker remains reachable). -->
+      <v-chip
+        v-if="rc.phase.value === 'connected' && rc.remoteLayout.value"
+        size="small"
+        variant="tonal"
+        prepend-icon="mdi-keyboard-settings-outline"
+        class="mr-2 d-none d-sm-inline-flex"
+        :title="`Remote keyboard layout: ${remoteLayoutLabel(rc.remoteLayout.value.activeTag)}. Typing auto-switches it when needed; pick manually in Settings.`"
+      >
+        {{ rc.remoteLayout.value.activeTag }}
+      </v-chip>
       <!-- Live stats (codec · bitrate · fps · resolution). Relocated here
            from over the video (2026-07-21) so it never hides a maximized
            remote window's caption buttons. Desktop only (md+) — the toolbar
@@ -840,6 +854,26 @@
           >
             Clipboard auto-sync — {{ clipboardAutoSyncOn ? 'ON' : 'OFF' }}
           </v-btn>
+          <!-- rc.227 — manual remote-layout picker. Caps-gated ('set') AND
+               self-gated on a received rc:layout (needs the installed
+               list). Bound to REPORTED state: a lost/refused switch snaps
+               visibly back — the user just clicks again. -->
+          <v-select
+            v-if="agentLayoutCaps.includes('set') && rc.remoteLayout.value"
+            :model-value="rc.remoteLayout.value.activeHkl"
+            :items="remoteLayoutItems"
+            item-title="title"
+            item-value="value"
+            density="comfortable"
+            variant="outlined"
+            hide-details="auto"
+            prepend-inner-icon="mdi-keyboard-settings-outline"
+            label="Remote keyboard layout"
+            hint="Switches the HOST's active layout (like pressing Alt+Shift there). Typing usually auto-switches; use this if an app doesn't follow."
+            persistent-hint
+            class="mb-2"
+            @update:model-value="onRemoteLayoutPick"
+          />
           <template v-if="rc.phase.value === 'connected'">
             <v-btn
               block
@@ -1989,6 +2023,29 @@ watch(
     }
   },
 )
+
+// ── rc.227 — remote keyboard-layout chip + manual picker ──
+const agentLayoutCaps = computed<string[]>(() => agent.value?.capabilities?.layout ?? [])
+/** Pretty layout label via Intl.DisplayNames ("bg-BG" → "Bulgarian
+ *  (Bulgaria)" in the viewer's language); raw tag on failure (the
+ *  agent falls back to a hex LANGID for layouts the OS can't name). */
+function remoteLayoutLabel(tag: string): string {
+  try {
+    const name = new Intl.DisplayNames([navigator.language], { type: 'language' }).of(tag)
+    return name && name !== tag ? `${name} (${tag})` : tag
+  } catch {
+    return tag
+  }
+}
+const remoteLayoutItems = computed(() =>
+  (rc.remoteLayout.value?.installed ?? []).map((e) => ({
+    value: e.hkl,
+    title: remoteLayoutLabel(e.tag),
+  })),
+)
+function onRemoteLayoutPick(hkl: unknown) {
+  if (typeof hkl === 'string' && hkl) rc.setRemoteLayout(hkl)
+}
 
 // ── rc.199 — unified Codec picker + Priority dial (Settings panel) ──
 // The Codec picker folds the four transport toggles + the codec-override +

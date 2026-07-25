@@ -65,6 +65,13 @@ pub mod enigo_backend;
 #[cfg(all(target_os = "windows", feature = "enigo-input"))]
 pub mod win_text;
 
+// rc.227 — keyboard-layout awareness: per-char auto-switch (the programmatic
+// ALT+SHIFT that fixes "typing is dead until I flip the remote layout"),
+// rc:layout status snapshots for the viewer chip/picker, and the
+// rc:layout.set manual-switch handler.
+#[cfg(all(target_os = "windows", feature = "enigo-input"))]
+pub mod layout;
+
 #[cfg(all(
     feature = "system-context",
     target_os = "windows",
