@@ -119,6 +119,13 @@ pub struct PeerInfo {
     pub overlay_ip6: Option<String>,
     pub online: bool,
     pub connection: ConnectionType,
+    /// P8-cosmetics — a make-before-break direct-upgrade probe is currently in
+    /// flight for this (relay-carried) peer: the CLI renders `upgrading`
+    /// instead of `relay`, so a snapshot taken mid-transition reads as what it
+    /// is rather than contradicting observed latency. `false` from older
+    /// daemons (serde default) and for non-relay peers.
+    #[serde(default)]
+    pub upgrading: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rtt_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1233,6 +1240,7 @@ mod tests {
                     overlay_ip6: None,
                     online: true,
                     connection: ConnectionType::Tunnel,
+                    upgrading: false,
                     rtt_ms: Some(52),
                     last_seen_ms: Some(1000),
                     agent_id: Some("6a074fe5ef3ba556ab041966".into()),
@@ -1246,6 +1254,7 @@ mod tests {
                     overlay_ip6: None,
                     online: true,
                     connection: ConnectionType::Direct,
+                    upgrading: false,
                     rtt_ms: Some(3),
                     last_seen_ms: Some(1200),
                     agent_id: None,
