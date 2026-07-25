@@ -923,6 +923,38 @@ impl AgentPeer {
             });
         }
 
+        // rc.227 — layout emitter: forwards `input::layout` snapshots
+        // (active + installed keyboard layouts) as `rc:layout` over
+        // the control DC so the viewer can render the layout chip +
+        // manual picker. UNLIKE the host-locked emitter above, the
+        // layout watch sender is PROCESS-GLOBAL and never closes, so
+        // `rx.changed()` alone would keep this task alive forever —
+        // one leaked emitter per session. The send-failure break is
+        // the session-scoped exit.
+        #[cfg(all(target_os = "windows", feature = "enigo-input"))]
+        {
+            let mut rx = crate::input::layout::subscribe();
+            let stash = control_dc.clone();
+            tokio::spawn(async move {
+                // Warm-start with the last-known snapshot (None until
+                // the first input event of the process).
+                let initial = rx.borrow().clone();
+                if let Some(s) = initial
+                    && !emit_layout(&stash, &s).await
+                {
+                    return;
+                }
+                while rx.changed().await.is_ok() {
+                    let snap = rx.borrow().clone();
+                    if let Some(s) = snap
+                        && !emit_layout(&stash, &s).await
+                    {
+                        return;
+                    }
+                }
+            });
+        }
+
         // Start the capture→encode→track pump. The pump is self-regulating:
         // with no capture backend compiled in, open_default returns a Noop
         // that parks forever, producing no samples. Phase Y.3:
@@ -4253,6 +4285,46 @@ async fn emit_host_locked(
     }
 }
 
+/// rc.227 — push one keyboard-layout snapshot to the viewer over the
+/// control DC. Returns `false` when the DC is gone (the emitter task
+/// uses that as its session-scoped exit — the layout watch channel is
+/// process-global and never closes on its own). A not-yet-stashed DC
+/// returns `true` (keep waiting for it to open).
+#[cfg(all(target_os = "windows", feature = "enigo-input"))]
+async fn emit_layout(
+    stash: &Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
+    snap: &crate::input::layout::LayoutSnapshot,
+) -> bool {
+    let dc = {
+        let guard = stash.lock().await;
+        match guard.as_ref() {
+            Some(dc) => dc.clone(),
+            None => return true,
+        }
+    };
+    // json! (not format!) — the tags are dynamic strings.
+    let payload = serde_json::json!({
+        "t": "rc:layout",
+        "active_hkl": snap.active_hkl,
+        "active": snap.active_tag,
+        "installed": snap
+            .installed
+            .iter()
+            .map(|(hkl, tag)| serde_json::json!({ "hkl": hkl, "tag": tag }))
+            .collect::<Vec<_>>(),
+    });
+    let Ok(s) = serde_json::to_string(&payload) else {
+        return true;
+    };
+    match dc.send_text(s).await {
+        Ok(_) => true,
+        Err(e) => {
+            debug!(%e, "rc:layout send failed (control DC closed?) — stopping layout emitter");
+            false
+        }
+    }
+}
+
 /// `control` data-channel handler. Parses JSON `rc:*` envelopes and
 /// applies them. Today the only message is `rc:quality` (mutating the
 /// shared atomic that the media pump polls before each encode); future
@@ -4606,6 +4678,28 @@ fn attach_control_handler(
                             debug!(%session_id, %e, "control: rc:apps.* reply serialise failed");
                         }
                     }
+                }
+                #[cfg(all(target_os = "windows", feature = "enigo-input"))]
+                "rc:layout.set" => {
+                    // rc.227 — the viewer's manual layout picker. Value is
+                    // an opaque 8-hex HKL string the agent itself reported
+                    // in `rc:layout`; request_set_layout re-validates it
+                    // against the CURRENT installed list before activating
+                    // (never activates arbitrary wire input) and re-samples
+                    // — the resulting `rc:layout` push is the implicit ack.
+                    // Non-Windows / non-enigo builds compile this arm out →
+                    // the catch-all debug-drops it, same as old agents.
+                    let Some(hkl) = val.get("hkl").and_then(|v| v.as_str()) else {
+                        debug!(%session_id, "control: rc:layout.set missing hkl — dropped");
+                        return;
+                    };
+                    if hkl.is_empty() || hkl.len() > 16 || !hkl.bytes().all(|b| b.is_ascii_hexdigit())
+                    {
+                        debug!(%session_id, "control: rc:layout.set malformed hkl — dropped");
+                        return;
+                    }
+                    info!(%session_id, hkl, "control: rc:layout.set — switching remote keyboard layout");
+                    crate::input::layout::request_set_layout(hkl.to_string());
                 }
                 other => {
                     debug!(%session_id, t = other, "control: unknown message type");
