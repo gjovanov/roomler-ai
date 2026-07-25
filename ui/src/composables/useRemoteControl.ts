@@ -1752,6 +1752,50 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    * always-false matches the pre-overlay behaviour for those agents.
    */
   const hostLocked = ref(false)
+  /** True while `navigator.keyboard.lock()` is active (locked
+   *  fullscreen). Drives the aggressive preventDefault policy in
+   *  `attachInput` (every forwarded key suppresses its local default
+   *  so Alt+Tab / Win / Ctrl+W act on the remote) and relaxes the
+   *  pointer-inside gates on the Ctrl+V/Ctrl+C interceptors + the
+   *  SAS chord. */
+  const keyboardLockActive = ref(false)
+
+  /** Engage the Keyboard Lock API (call on entering fullscreen).
+   *  Resolves `true` when the lock took. Never awaited inline by the
+   *  fullscreenchange handler — a hung promise must degrade to legacy
+   *  behavior, not block. */
+  async function enableKeyboardLock(): Promise<boolean> {
+    if (!isKeyboardLockSupported()) return false
+    const kb = (globalThis.navigator as Navigator & {
+      keyboard?: { lock?: (k?: string[]) => Promise<void>; unlock?: () => void }
+    }).keyboard
+    try {
+      // No args = capture ALL capturable keys, incl. Alt+Tab, Win,
+      // Ctrl+W, Escape. (Esc stays exitable via press-and-hold —
+      // browser-level gesture, not cancellable by pages.)
+      await kb!.lock!()
+      keyboardLockActive.value = true
+      return true
+    } catch {
+      // Permissions-policy iframe, non-secure context, platform quirk.
+      keyboardLockActive.value = false
+      return false
+    }
+  }
+
+  /** Release the Keyboard Lock (fullscreen exit / disconnect /
+   *  unmount). Idempotent. */
+  function disableKeyboardLock() {
+    try {
+      const kb = (globalThis.navigator as Navigator & {
+        keyboard?: { unlock?: () => void }
+      }).keyboard
+      kb?.unlock?.()
+    } catch {
+      /* noop */
+    }
+    keyboardLockActive.value = false
+  }
   /** rc.87 — the agent's real encoder (codec/encoder/hardware/chroma),
    *  reported over the control DC by the FFmpeg DC pump. Null until
    *  the agent sends `rc:video-info` (legacy track + libvpx paths
@@ -5200,7 +5244,13 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     }
 
     function isCtrlVOverViewer(ev: KeyboardEvent): boolean {
-      if (!pointerInside) return false
+      // Locked fullscreen counts as "over the viewer": pointerInside
+      // is driven by pointerenter/leave on the surface and can be
+      // stale right after entering fullscreen via the toolbar button
+      // (which sits OUTSIDE the fullscreen target). Without this, the
+      // locked-mode preventDefault-everything policy would suppress
+      // the paste event and degrade Ctrl+V to a stale-clipboard flush.
+      if (!pointerInside && !keyboardLockActive.value) return false
       if (ev.code !== 'KeyV') return false
       if (!(ev.ctrlKey || ev.metaKey)) return false
       // If focus is in an INPUT / TEXTAREA / contenteditable element,
@@ -5220,7 +5270,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
      *  carve-out for page-text-field focus so the operator's normal
      *  copy-from-form-field doesn't get hijacked. */
     function isCtrlCOverViewer(ev: KeyboardEvent): boolean {
-      if (!pointerInside) return false
+      // Same locked-fullscreen carve-out as isCtrlVOverViewer.
+      if (!pointerInside && !keyboardLockActive.value) return false
       if (ev.code !== 'KeyC') return false
       if (!(ev.ctrlKey || ev.metaKey)) return false
       const target = ev.target as Element | null
@@ -5285,6 +5336,25 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     }
 
     function onKey(ev: KeyboardEvent, down: boolean) {
+      // Ctrl+Alt+End (RDP convention) / literal Ctrl+Alt+Del →
+      // canonical SAS sequence via sendCtrlAltDel(). Swallow BOTH key
+      // directions so no stray End/Delete HID events reach the host;
+      // `ev.repeat` guard fires the SAS exactly once per held chord.
+      // Gated on driving intent: pointer over the viewer OR locked
+      // fullscreen (where pointerInside can be stale until the first
+      // boundary event). Must run BEFORE the Ctrl+V deferral — the
+      // chords are disjoint but the ordering keeps this hot path
+      // first-match.
+      if (
+        isRemoteSasChord(ev, (k) => ev.getModifierState(k)) &&
+        (pointerInside || keyboardLockActive.value)
+      ) {
+        ev.preventDefault()
+        ev.stopPropagation()
+        if (down && !ev.repeat) sendCtrlAltDel()
+        return
+      }
+
       // Ctrl+V deferral path. Keep preventDefault on keydown so the
       // subsequent `paste` event fires (and so the browser doesn't
       // run a default for the V key). Skip the normal sendInput path
@@ -5327,7 +5397,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         // doesn't ALSO see the Ctrl+V and trigger its own
         // keyboard-activation. Capture-phase keydown means we run
         // before the focused element's bubble-phase handlers.
-        if (pointerInside) ev.stopPropagation()
+        if (pointerInside || keyboardLockActive.value) ev.stopPropagation()
         // keyup with a pending deferral: don't emit a stray V-up.
         // The flush path emits both down + up together.
         return
@@ -5335,14 +5405,14 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
 
       const action = decideKeyAction(ev, down, (k) => ev.getModifierState(k))
       if (action.kind === 'drop') return
-      if (shouldPreventDefault(ev, pointerInside)) ev.preventDefault()
+      if (shouldPreventDefault(ev, pointerInside, keyboardLockActive.value)) ev.preventDefault()
       // rc.18: stop propagation when pointer is over viewer so a
       // focused page button / nav-drawer item doesn't ALSO see this
       // keystroke and fire its own keyboard-activation `@click`. The
       // capture-phase registration of this listener (see below) means
       // stopPropagation here cuts the bubble path before any focused
-      // descendant runs its handler.
-      if (pointerInside) ev.stopPropagation()
+      // descendant runs its handler. Locked fullscreen counts too.
+      if (pointerInside || keyboardLockActive.value) ev.stopPropagation()
       if (action.kind === 'text') {
         sendInput({ t: 'key_text', text: action.text })
       } else {
@@ -5475,6 +5545,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       if (pendingCtrlV?.timer) clearTimeout(pendingCtrlV.timer)
       pendingCtrlV = null
       if (rafHandle !== null) cancelAnimationFrame(rafHandle)
+      // A disconnect while fullscreen must not leave the Keyboard
+      // Lock dangling (the stage may stay fullscreen briefly).
+      disableKeyboardLock()
     }
   }
 
@@ -6633,6 +6706,12 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
      *  keyboard's special-key toolbar). See [`sendKey`] for the
      *  bitfield encoding. */
     sendKey,
+    /** Keyboard Lock (locked fullscreen): flag + engage/release.
+     *  The view calls enable on fullscreenchange-enter (never awaited
+     *  inline) and disable on exit/unmount. */
+    keyboardLockActive,
+    enableKeyboardLock,
+    disableKeyboardLock,
     sendClipboardToAgent,
     getAgentClipboard,
     /** v2 — text-or-image read (falls back to text-only on old
@@ -6849,7 +6928,7 @@ function browserButton(n: number): 'left' | 'right' | 'middle' | 'back' | 'forwa
 }
 
 /** Decide whether to `preventDefault` on a keyboard event in the remote
- *  viewer. Two categories:
+ *  viewer. Three categories:
  *
  *  1. Unconditionally: `Tab` (would otherwise move focus out of the
  *     video and away from our key listeners) and plain `Backspace`
@@ -6860,12 +6939,27 @@ function browserButton(n: number): 'left' | 'right' | 'middle' | 'back' | 'forwa
  *     all, Ctrl+C/V/X clipboard, Ctrl+Z/Y undo/redo, Ctrl+F find,
  *     Ctrl+S save, Ctrl+P print, Ctrl+R reload). Outside the video
  *     the controller keeps normal browser UX — Ctrl+T to open a tab,
- *     Ctrl+W to close it, etc.
+ *     Ctrl+W to close it, etc. — when NOT keyboard-locked.
+ *
+ *  3. Locked fullscreen (`keyboardLocked` — the Keyboard Lock API is
+ *     active): suppress the local default for EVERY forwarded key so
+ *     Alt+Tab / Win / Ctrl+W / Ctrl+T / F-keys act on the REMOTE.
+ *     Escape is safe to suppress here — exiting fullscreen under
+ *     Keyboard Lock is the browser's press-AND-HOLD gesture, which
+ *     preventDefault cannot cancel; short Esc taps forward cleanly.
+ *     IME events never reach this decision (`decideKeyAction` drops
+ *     them first in `onKey`).
  *
  *  Ctrl+Alt+Del is reserved by the OS and cannot be intercepted by the
- *  browser — it's exposed via the dedicated toolbar button instead.
+ *  browser — it's exposed via the dedicated toolbar button plus the
+ *  RDP-convention Ctrl+Alt+End chord (see [`isRemoteSasChord`]).
  *  Exported so unit tests can lock the policy. */
-export function shouldPreventDefault(ev: KeyboardEvent, pointerInside: boolean): boolean {
+export function shouldPreventDefault(
+  ev: KeyboardEvent,
+  pointerInside: boolean,
+  keyboardLocked = false,
+): boolean {
+  if (keyboardLocked) return true
   if (ev.code === 'Tab') return true
   if (ev.code === 'Backspace' && !ev.ctrlKey && !ev.altKey && !ev.metaKey) return true
   if (!pointerInside) return false
@@ -6881,6 +6975,41 @@ export function shouldPreventDefault(ev: KeyboardEvent, pointerInside: boolean):
     default:
       return false
   }
+}
+
+/** RDP-convention secure-attention chord: Ctrl+Alt+End sends
+ *  Ctrl+Alt+Del to the remote (the literal chord is OS-reserved and
+ *  never reaches the page on Windows viewers; on Linux/macOS viewers
+ *  it CAN arrive, so accept it too). AltGraph carve-out: German and
+ *  other AltGr layouts report ctrlKey+altKey while typing — AltGr+End
+ *  must not fire a SAS. Meta excluded so Win+Ctrl+Alt combos don't
+ *  trigger. Exported for the spec's chord matrix. */
+export function isRemoteSasChord(
+  ev: Pick<KeyboardEvent, 'code' | 'ctrlKey' | 'altKey' | 'metaKey'>,
+  getModifierState: (key: string) => boolean = () => false,
+): boolean {
+  if (!ev.ctrlKey || !ev.altKey || ev.metaKey) return false
+  if (getModifierState('AltGraph')) return false
+  return ev.code === 'End' || ev.code === 'Delete'
+}
+
+/** Structural shape of the (Chromium-only) Keyboard Lock API —
+ *  lib.dom.d.ts doesn't ship it. */
+type KeyboardLockApi = {
+  lock?: (keyCodes?: string[]) => Promise<void>
+  unlock?: () => void
+}
+
+/** Feature-detect `navigator.keyboard.lock` (Chromium in a secure
+ *  context). Firefox/Safari return false and the viewer degrades to
+ *  the pointer-inside preventDefault policy. Injectable nav for
+ *  tests. */
+export function isKeyboardLockSupported(
+  nav: { keyboard?: KeyboardLockApi } | undefined = typeof navigator === 'undefined'
+    ? undefined
+    : (navigator as Navigator & { keyboard?: KeyboardLockApi }),
+): boolean {
+  return !!nav?.keyboard && typeof nav.keyboard.lock === 'function'
 }
 
 /**

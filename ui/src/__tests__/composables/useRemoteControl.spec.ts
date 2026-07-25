@@ -13,6 +13,8 @@ import {
   inspectBrowserVideoCodecs,
   base64ToBytes,
   shouldPreventDefault,
+  isRemoteSasChord,
+  isKeyboardLockSupported,
   filterCapsByPreference,
   resolutionWireMessage,
   isWebCodecsSupported,
@@ -713,10 +715,12 @@ describe('shouldPreventDefault', () => {
     }
   })
 
-  it('lets untouched Ctrl+T / Ctrl+W through even when pointer inside', () => {
+  it('lets untouched Ctrl+T / Ctrl+W through even when pointer inside (NOT keyboard-locked)', () => {
     // Explicitly NOT in the intercept list — these are still the user's
-    // own browser tab/window controls. Forwarding them to the remote
-    // over the input DC is fine, but we don't want to also preventDefault.
+    // own browser tab/window controls when the keyboard is unlocked.
+    // Forwarding them to the remote over the input DC is fine, but we
+    // don't want to also preventDefault. (Locked fullscreen flips this
+    // — see the keyboardLocked suite below.)
     expect(shouldPreventDefault(keyEvent('KeyT', { ctrl: true }), true)).toBe(false)
     expect(shouldPreventDefault(keyEvent('KeyW', { ctrl: true }), true)).toBe(false)
   })
@@ -724,6 +728,83 @@ describe('shouldPreventDefault', () => {
   it('does not intercept a bare letter keypress without modifiers', () => {
     expect(shouldPreventDefault(keyEvent('KeyA'), true)).toBe(false)
     expect(shouldPreventDefault(keyEvent('KeyZ', { shift: true }), true)).toBe(false)
+  })
+
+  it('explicit keyboardLocked=false behaves exactly like the two-arg form', () => {
+    // Default-param regression guard: every call above relies on the
+    // third parameter defaulting to false.
+    expect(shouldPreventDefault(keyEvent('KeyW', { ctrl: true }), true, false)).toBe(false)
+    expect(shouldPreventDefault(keyEvent('KeyA'), true, false)).toBe(false)
+  })
+
+  it('keyboardLocked=true suppresses the local default for EVERY key', () => {
+    // Locked fullscreen (Keyboard Lock API active): Alt+Tab, Win,
+    // Ctrl+W/T, F-keys, Escape and bare letters all forward to the
+    // remote — nothing may run a local browser default. pointerInside
+    // is irrelevant in this mode (it can be stale right after
+    // entering fullscreen via the toolbar button).
+    for (const inside of [true, false]) {
+      expect(shouldPreventDefault(keyEvent('KeyW', { ctrl: true }), inside, true)).toBe(true)
+      expect(shouldPreventDefault(keyEvent('KeyT', { ctrl: true }), inside, true)).toBe(true)
+      expect(shouldPreventDefault(keyEvent('F5'), inside, true)).toBe(true)
+      expect(shouldPreventDefault(keyEvent('Escape'), inside, true)).toBe(true)
+      expect(shouldPreventDefault(keyEvent('KeyA'), inside, true)).toBe(true)
+      expect(shouldPreventDefault(keyEvent('MetaLeft', { meta: true }), inside, true)).toBe(true)
+      expect(shouldPreventDefault(keyEvent('Tab'), inside, true)).toBe(true)
+      expect(shouldPreventDefault(keyEvent('AltLeft', { alt: true }), inside, true)).toBe(true)
+    }
+  })
+})
+
+describe('isRemoteSasChord', () => {
+  function chord(
+    code: string,
+    mods: { ctrl?: boolean; alt?: boolean; meta?: boolean } = {},
+  ): Pick<KeyboardEvent, 'code' | 'ctrlKey' | 'altKey' | 'metaKey'> {
+    return {
+      code,
+      ctrlKey: mods.ctrl ?? false,
+      altKey: mods.alt ?? false,
+      metaKey: mods.meta ?? false,
+    }
+  }
+
+  it('accepts Ctrl+Alt+End (RDP convention) and the literal Ctrl+Alt+Delete', () => {
+    expect(isRemoteSasChord(chord('End', { ctrl: true, alt: true }))).toBe(true)
+    expect(isRemoteSasChord(chord('Delete', { ctrl: true, alt: true }))).toBe(true)
+  })
+
+  it('rejects partial chords and other keys', () => {
+    expect(isRemoteSasChord(chord('End', { ctrl: true }))).toBe(false)
+    expect(isRemoteSasChord(chord('End', { alt: true }))).toBe(false)
+    expect(isRemoteSasChord(chord('End'))).toBe(false)
+    expect(isRemoteSasChord(chord('KeyE', { ctrl: true, alt: true }))).toBe(false)
+  })
+
+  it('rejects when Meta is also held (Win+Ctrl+Alt combos)', () => {
+    expect(isRemoteSasChord(chord('End', { ctrl: true, alt: true, meta: true }))).toBe(false)
+  })
+
+  it('AltGraph carve-out: AltGr+End must not fire a SAS', () => {
+    // German & co. AltGr layouts report ctrlKey+altKey on AltGr.
+    expect(
+      isRemoteSasChord(chord('End', { ctrl: true, alt: true }), (k) => k === 'AltGraph'),
+    ).toBe(false)
+  })
+})
+
+describe('isKeyboardLockSupported', () => {
+  it('false without a navigator or a keyboard object', () => {
+    expect(isKeyboardLockSupported(undefined)).toBe(false)
+    expect(isKeyboardLockSupported({})).toBe(false)
+  })
+
+  it('false when keyboard exists but lock is missing (non-Chromium)', () => {
+    expect(isKeyboardLockSupported({ keyboard: {} })).toBe(false)
+  })
+
+  it('true when keyboard.lock is a function (Chromium secure context)', () => {
+    expect(isKeyboardLockSupported({ keyboard: { lock: async () => {} } })).toBe(true)
   })
 })
 
