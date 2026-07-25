@@ -23,6 +23,13 @@ import {
   CLIPBOARD_CHUNK_BYTES,
   CLIPBOARD_MAX_BYTES,
   CLIPBOARD_SINGLE_ENVELOPE_THRESHOLD_BYTES,
+  CLIPBOARD_IMAGE_MAX_BYTES,
+  CLIPBOARD_IMG_FRAME_BYTES,
+  normalizeClipboardText,
+  hashClipboardBytes,
+  hashClipboardText,
+  createClipboardEchoGate,
+  buildClipboardImageFrames,
   VP9_444_DC_LABEL,
   VP9_444_DC_OPTIONS,
   readStoredAudioEnabled,
@@ -1081,22 +1088,32 @@ describe('sendClipboardWriteOverDc (rc.44)', () => {
     }
   }
 
-  it('uses single-envelope clipboard:write for small ASCII text', () => {
+  it('uses single-envelope clipboard:write for small ASCII text (with a v2 id)', () => {
     const { ch, sent } = makeStubDc()
-    const n = sendClipboardWriteOverDc(ch, 'hello world')
-    expect(n).toBe(1)
+    const res = sendClipboardWriteOverDc(ch, 'hello world')
+    expect(res.envelopes).toBe(1)
     expect(sent.length).toBe(1)
     const parsed = JSON.parse(sent[0])
     expect(parsed.t).toBe('clipboard:write')
     expect(parsed.text).toBe('hello world')
-    expect(parsed.id).toBeUndefined()
+    // v2 — every write carries an id so v2 agents can ack it. Old
+    // agents ignore the unknown field (no deny_unknown_fields).
+    expect(typeof parsed.id).toBe('string')
+    expect(parsed.id).toBe(res.id)
+  })
+
+  it('sends the text RAW — CRLF preserved for v1 agents that write verbatim', () => {
+    const { ch, sent } = makeStubDc()
+    sendClipboardWriteOverDc(ch, 'line1\r\nline2')
+    const parsed = JSON.parse(sent[0])
+    expect(parsed.text).toBe('line1\r\nline2')
   })
 
   it('uses single-envelope clipboard:write right at the threshold', () => {
     const { ch, sent } = makeStubDc()
     const text = 'a'.repeat(CLIPBOARD_SINGLE_ENVELOPE_THRESHOLD_BYTES)
-    const n = sendClipboardWriteOverDc(ch, text)
-    expect(n).toBe(1)
+    const res = sendClipboardWriteOverDc(ch, text)
+    expect(res.envelopes).toBe(1)
     const parsed = JSON.parse(sent[0])
     expect(parsed.t).toBe('clipboard:write')
   })
@@ -1104,14 +1121,15 @@ describe('sendClipboardWriteOverDc (rc.44)', () => {
   it('switches to clipboard:write-chunk when above the threshold', () => {
     const { ch, sent } = makeStubDc()
     const text = 'a'.repeat(CLIPBOARD_SINGLE_ENVELOPE_THRESHOLD_BYTES + 1)
-    const n = sendClipboardWriteOverDc(ch, text)
-    expect(n).toBeGreaterThanOrEqual(1)
-    expect(sent.length).toBe(n)
+    const res = sendClipboardWriteOverDc(ch, text)
+    expect(res.envelopes).toBeGreaterThanOrEqual(1)
+    expect(sent.length).toBe(res.envelopes)
     const first = JSON.parse(sent[0])
     expect(first.t).toBe('clipboard:write-chunk')
     expect(typeof first.id).toBe('string')
+    expect(first.id).toBe(res.id)
     expect(first.seq).toBe(0)
-    expect(first.last).toBe(n === 1)
+    expect(first.last).toBe(res.envelopes === 1)
   })
 
   it('chunked envelopes share an id and have sequential seq + final last=true', () => {
@@ -1165,6 +1183,109 @@ describe('sendClipboardWriteOverDc (rc.44)', () => {
       // budget aggressively under that for headroom.
       expect(enc.encode(s).byteLength).toBeLessThan(16 * 1024)
     }
+  })
+})
+
+describe('normalizeClipboardText (clipboard v2)', () => {
+  it('converts CRLF and lone CR to LF', () => {
+    expect(normalizeClipboardText('a\r\nb\r\nc')).toBe('a\nb\nc')
+    expect(normalizeClipboardText('a\rb')).toBe('a\nb')
+    expect(normalizeClipboardText('mixed\r\nand\rand\nend\r')).toBe('mixed\nand\nand\nend\n')
+  })
+
+  it('passes through CR-free text untouched', () => {
+    expect(normalizeClipboardText('plain\ntext')).toBe('plain\ntext')
+    expect(normalizeClipboardText('')).toBe('')
+  })
+})
+
+describe('clipboard FNV-1a 64 hashes (clipboard v2)', () => {
+  it('matches the published FNV-1a 64 vectors the agent locks too', () => {
+    // Same vectors as clipboard::tests::fnv1a64_matches_published_vectors
+    // in agents/roomler-agent/src/clipboard.rs — echo suppression
+    // silently breaks if either side drifts.
+    expect(hashClipboardBytes(new Uint8Array(0))).toBe('cbf29ce484222325')
+    expect(hashClipboardBytes(new TextEncoder().encode('a'))).toBe('af63dc4c8601ec8c')
+    expect(hashClipboardBytes(new TextEncoder().encode('foobar'))).toBe('85944171f73967e8')
+  })
+
+  it('hashClipboardText canonicalizes before hashing (CRLF == LF)', () => {
+    expect(hashClipboardText('l1\r\nl2')).toBe(hashClipboardText('l1\nl2'))
+    expect(hashClipboardText('l1\rl2')).toBe(hashClipboardText('l1\nl2'))
+    expect(hashClipboardText('l1\nl2')).not.toBe(hashClipboardText('l1l2'))
+  })
+})
+
+describe('createClipboardEchoGate (clipboard v2)', () => {
+  it('suppresses re-pushing applied and pushed content', () => {
+    const gate = createClipboardEchoGate()
+    const h1 = hashClipboardText('from remote')
+    const h2 = hashClipboardText('from local')
+    expect(gate.shouldPush(h1)).toBe(true)
+    gate.recordApplied(h1)
+    expect(gate.shouldPush(h1)).toBe(false)
+    expect(gate.knows(h1)).toBe(true)
+    gate.recordPushed(h2)
+    expect(gate.shouldPush(h2)).toBe(false)
+    expect(gate.knows(h2)).toBe(true)
+    // Fresh content still passes.
+    expect(gate.shouldPush(hashClipboardText('brand new'))).toBe(true)
+  })
+
+  it('never pushes the empty hash and resets cleanly', () => {
+    const gate = createClipboardEchoGate()
+    expect(gate.shouldPush('')).toBe(false)
+    expect(gate.knows('')).toBe(false)
+    const h = hashClipboardText('x')
+    gate.recordApplied(h)
+    gate.reset()
+    expect(gate.knows(h)).toBe(false)
+    expect(gate.shouldPush(h)).toBe(true)
+  })
+})
+
+describe('buildClipboardImageFrames (clipboard v2)', () => {
+  it('frames a PNG into begin / ≤16KiB binary chunks / end sharing one id', () => {
+    const png = new Uint8Array(CLIPBOARD_IMG_FRAME_BYTES * 2 + 123)
+    for (let i = 0; i < png.length; i++) png[i] = i & 0xff
+    const { id, begin, frames, end } = buildClipboardImageFrames(png, 640, 480)
+    expect(frames.length).toBe(3)
+    for (const f of frames) {
+      expect(f.byteLength).toBeLessThanOrEqual(CLIPBOARD_IMG_FRAME_BYTES)
+    }
+    // Byte-total + content preserved across frames.
+    const total = frames.reduce((a, f) => a + f.byteLength, 0)
+    expect(total).toBe(png.length)
+    const joined = new Uint8Array(total)
+    let off = 0
+    for (const f of frames) {
+      joined.set(f, off)
+      off += f.byteLength
+    }
+    expect(joined).toEqual(png)
+    // Wire shapes the agent's ClipboardIncoming parses.
+    const b = JSON.parse(begin)
+    expect(b).toEqual({
+      t: 'clipboard:img-begin',
+      id,
+      w: 640,
+      h: 480,
+      bytes: png.length,
+      format: 'png',
+    })
+    const e = JSON.parse(end)
+    expect(e).toEqual({ t: 'clipboard:img-end', id })
+  })
+
+  it('single-frame image below the frame size', () => {
+    const png = new Uint8Array(100)
+    const { frames } = buildClipboardImageFrames(png, 2, 2)
+    expect(frames.length).toBe(1)
+    expect(frames[0].byteLength).toBe(100)
+  })
+
+  it('image byte cap constant matches the agent side', () => {
+    expect(CLIPBOARD_IMAGE_MAX_BYTES).toBe(8 * 1024 * 1024)
   })
 })
 

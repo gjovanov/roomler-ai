@@ -1346,14 +1346,31 @@ export function chunkClipboardText(text: string): string[] {
  *  single-envelope `clipboard:write` for back-compat with older
  *  agents; above, splits into `clipboard:write-chunk` envelopes
  *  carrying a shared transaction id. Caller owns try/catch — this
- *  function may throw if the DC closes mid-burst. Returns the
- *  number of envelopes actually sent (1 for single, ≥1 for chunked). */
-export function sendClipboardWriteOverDc(ch: RTCDataChannel, text: string): number {
+ *  function may throw if the DC closes mid-burst.
+ *
+ *  v2 — every envelope (single included) now carries an `id`; v2
+ *  agents reply `clipboard:write-ack {id}` once the OS clipboard
+ *  write completes, which the caller can await via
+ *  `awaitClipboardAck` to gate a deferred Ctrl+V. Old agents ignore
+ *  the unknown field (no `deny_unknown_fields` on their serde enum).
+ *  The text goes on the wire RAW — never canonicalized — because v1
+ *  agents write it to the OS clipboard verbatim (stripping CRLF here
+ *  would regress Windows-host pastes through them; v2 agents
+ *  normalize server-side). Returns the envelope count + the id. */
+export function sendClipboardWriteOverDc(
+  ch: RTCDataChannel,
+  text: string,
+): { envelopes: number; id: string } {
   const enc = new TextEncoder()
   const byteLen = enc.encode(text).length
+  const id =
+    'cb-' +
+    Date.now().toString(36) +
+    '-' +
+    Math.random().toString(36).slice(2, 10)
   if (byteLen <= CLIPBOARD_SINGLE_ENVELOPE_THRESHOLD_BYTES) {
-    ch.send(JSON.stringify({ t: 'clipboard:write', text }))
-    return 1
+    ch.send(JSON.stringify({ t: 'clipboard:write', text, id }))
+    return { envelopes: 1, id }
   }
   // Truncate at the 1 MB cap; warn so the user knows. The agent
   // rejects oversized writes anyway via `clipboard:error`, but
@@ -1372,11 +1389,6 @@ export function sendClipboardWriteOverDc(ch: RTCDataChannel, text: string): numb
     )
   }
   const chunks = chunkClipboardText(payload)
-  const id =
-    'cb-' +
-    Date.now().toString(36) +
-    '-' +
-    Math.random().toString(36).slice(2, 10)
   chunks.forEach((chunk, i) => {
     ch.send(
       JSON.stringify({
@@ -1388,7 +1400,153 @@ export function sendClipboardWriteOverDc(ch: RTCDataChannel, text: string): numb
       }),
     )
   })
-  return chunks.length
+  return { envelopes: chunks.length, id }
+}
+
+// ── Clipboard protocol v2: auto-sync helpers ────────────────────────────────
+
+/** Hard cap on a PNG clipboard image on the wire, both directions.
+ *  Mirrors the agent's `CLIPBOARD_IMAGE_MAX_BYTES`. */
+export const CLIPBOARD_IMAGE_MAX_BYTES = 8 * 1024 * 1024
+/** Binary frame size for browser → agent image sends. Matches the
+ *  files-DC upload pump: webrtc-rs's inbound SCTP `max_message_size`
+ *  is 65536 and 64 KiB frames sat exactly on the boundary, so 16 KiB.
+ *  (The agent sends 64 KiB frames the other way — Chrome's inbound
+ *  cap is 256 KiB.) */
+export const CLIPBOARD_IMG_FRAME_BYTES = 16 * 1024
+/** How long the deferred Ctrl+V waits for `clipboard:write-ack`
+ *  before flushing anyway (agent wedged / reply lost). */
+export const CLIPBOARD_ACK_TIMEOUT_MS = 1000
+/** Focused-tab polling cadence for local→remote text sync. Chrome has
+ *  no `clipboardchange` event in stable, so change detection is
+ *  focus/visibility triggers + this poll. Text-only — image reads are
+ *  event-driven (focus/paste) to avoid hashing megabytes per tick. */
+export const CLIPBOARD_SYNC_POLL_MS = 2000
+/** Throttle between consecutive local→remote sync attempts. */
+const CLIPBOARD_SYNC_MIN_INTERVAL_MS = 300
+
+/** Canonicalize text for HASHING (CRLF / lone CR → LF). Never applied
+ *  to outbound wire text — see [`sendClipboardWriteOverDc`]. Both
+ *  sides of the echo gate hash this canonical form; the agent's
+ *  `host_to_wire` produces the same bytes. */
+export function normalizeClipboardText(text: string): string {
+  if (!text.includes('\r')) return text
+  return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+}
+
+/** FNV-1a 64 over raw bytes, as a 16-hex-digit string. Locks the same
+ *  published vectors as the agent's `clipboard::fnv1a64` — echo
+ *  suppression silently breaks if either side drifts. */
+export function hashClipboardBytes(bytes: Uint8Array): string {
+  let h = 0xcbf29ce484222325n
+  const prime = 0x100000001b3n
+  const mask = 0xffffffffffffffffn
+  for (let i = 0; i < bytes.length; i++) {
+    h ^= BigInt(bytes[i])
+    h = (h * prime) & mask
+  }
+  return h.toString(16).padStart(16, '0')
+}
+
+/** Hash text content for the echo gate: canonicalize, then FNV-1a 64
+ *  over the UTF-8 bytes. */
+export function hashClipboardText(text: string): string {
+  return hashClipboardBytes(new TextEncoder().encode(normalizeClipboardText(text)))
+}
+
+/** Echo-suppression gate for bidirectional auto-sync. Remembers the
+ *  hash of the last content APPLIED locally (came from the remote)
+ *  and the last content PUSHED to the remote; either one re-surfacing
+ *  as a local "change" is an echo and must not be re-pushed — else
+ *  remote-change → local-write → local-"change" → push-back loops
+ *  forever. The agent holds the mirror-image gate (`SelfMarks`). */
+export interface ClipboardEchoGate {
+  recordApplied(hash: string): void
+  recordPushed(hash: string): void
+  /** True when the hash matches either remembered side. */
+  knows(hash: string): boolean
+  /** True when the content is new to the gate (and non-empty). */
+  shouldPush(hash: string): boolean
+  reset(): void
+}
+
+export function createClipboardEchoGate(): ClipboardEchoGate {
+  let lastApplied = ''
+  let lastPushed = ''
+  return {
+    recordApplied(hash: string) {
+      lastApplied = hash
+    },
+    recordPushed(hash: string) {
+      lastPushed = hash
+    },
+    knows(hash: string) {
+      return hash !== '' && (hash === lastApplied || hash === lastPushed)
+    },
+    shouldPush(hash: string) {
+      return hash !== '' && hash !== lastApplied && hash !== lastPushed
+    },
+    reset() {
+      lastApplied = ''
+      lastPushed = ''
+    },
+  }
+}
+
+/** Build the wire frames for one browser → agent image transfer:
+ *  a `clipboard:img-begin` JSON header, ≤16 KiB binary PNG frames,
+ *  and the `clipboard:img-end` trailer, all sharing one id. Exported
+ *  for tests — the locked invariants are frame size ≤
+ *  [`CLIPBOARD_IMG_FRAME_BYTES`], total bytes preserved, and the
+ *  begin/end shapes the agent's `ClipboardIncoming` parses. */
+export function buildClipboardImageFrames(
+  png: Uint8Array<ArrayBuffer>,
+  w: number,
+  h: number,
+): { id: string; begin: string; frames: Uint8Array<ArrayBuffer>[]; end: string } {
+  const id =
+    'cb-img-' +
+    Date.now().toString(36) +
+    '-' +
+    Math.random().toString(36).slice(2, 10)
+  const frames: Uint8Array<ArrayBuffer>[] = []
+  for (let off = 0; off < png.length; off += CLIPBOARD_IMG_FRAME_BYTES) {
+    frames.push(png.subarray(off, Math.min(off + CLIPBOARD_IMG_FRAME_BYTES, png.length)))
+  }
+  return {
+    id,
+    begin: JSON.stringify({
+      t: 'clipboard:img-begin',
+      id,
+      w,
+      h,
+      bytes: png.length,
+      format: 'png',
+    }),
+    frames,
+    end: JSON.stringify({ t: 'clipboard:img-end', id }),
+  }
+}
+
+/** Clipboard auto-sync opt-out. Default ON — only an explicit '0'
+ *  disables (the feature is the whole point of clipboard v2; users
+ *  who want the old button-driven flow flip the Settings toggle). */
+const CLIPBOARD_AUTO_SYNC_STORAGE_KEY = 'roomler-rc-clipboard-auto'
+
+function readStoredClipboardAutoSync(): boolean {
+  try {
+    return globalThis.localStorage?.getItem(CLIPBOARD_AUTO_SYNC_STORAGE_KEY) !== '0'
+  } catch {
+    return true
+  }
+}
+
+function persistClipboardAutoSync(on: boolean) {
+  try {
+    globalThis.localStorage?.setItem(CLIPBOARD_AUTO_SYNC_STORAGE_KEY, on ? '1' : '0')
+  } catch {
+    /* best-effort */
+  }
 }
 
 /** Chrome 148+ regressed `RTCRtpScriptTransform`: the transform attaches,
@@ -1556,6 +1714,15 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     const files = agent?.value?.capabilities?.files
     return Array.isArray(files) && files.includes('resume')
   })
+  /** Clipboard protocol-v2 capability gates (see AgentCaps.clipboard).
+   *  Empty on old agents → v1 button-driven text-only flow. */
+  const clipboardCaps: ComputedRef<string[]> = computed(() => {
+    const c = agent?.value?.capabilities?.clipboard
+    return Array.isArray(c) ? c : []
+  })
+  const supportsClipboardAck = computed(() => clipboardCaps.value.includes('ack'))
+  const supportsClipboardEvents = computed(() => clipboardCaps.value.includes('events'))
+  const supportsClipboardImages = computed(() => clipboardCaps.value.includes('images'))
   const error = ref<string | null>(null)
   const sessionId = ref<string | null>(null)
   /**
@@ -1883,6 +2050,302 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     { resolve: (text: string) => void; reject: (err: Error) => void; timer: ReturnType<typeof setTimeout> }
   >()
   let nextClipboardReqId = 1
+
+  // ---- Clipboard v2: auto-sync engine ----------------------------------
+  // Bidirectional clipboard sync without the manual toolbar buttons.
+  // Local → remote: focus/visibility/poll/paste triggers read the local
+  // clipboard and push changes over the DC. Remote → local: the agent
+  // pushes clipboard:event / img streams after clipboard:subscribe.
+  // The echo gate (+ the agent's SelfMarks) breaks the infinite loop
+  // both directions independently.
+  const clipboardAutoSyncEnabled = ref(readStoredClipboardAutoSync())
+  /** Latched true when clipboard-read permission is DENIED (not on
+   *  transient focus races — see handleClipboardReadDenied). The view
+   *  shows a one-shot snackbar + Settings hint; manual buttons keep
+   *  working via their own gesture-anchored reads. */
+  const clipboardSyncBlocked = ref(false)
+  const clipboardEchoGate = createClipboardEchoGate()
+
+  /** Write-acks: id → settle. Resolved by clipboard:write-ack,
+   *  clipboard:error{id}, or the timeout — always resolves (void), the
+   *  waiter just proceeds. */
+  const pendingClipboardAcks = new Map<
+    string,
+    { onSettle: () => void; timer: ReturnType<typeof setTimeout> }
+  >()
+  function awaitClipboardAck(id: string, timeoutMs: number): Promise<void> {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        pendingClipboardAcks.delete(id)
+        resolve()
+      }, timeoutMs)
+      pendingClipboardAcks.set(id, {
+        onSettle: () => {
+          clearTimeout(timer)
+          pendingClipboardAcks.delete(id)
+          resolve()
+        },
+        timer,
+      })
+    })
+  }
+  function settleClipboardAck(id: unknown) {
+    if (typeof id !== 'string') return
+    pendingClipboardAcks.get(id)?.onSettle()
+  }
+
+  /** Rich reads (accept:["image"]) that may resolve as an image
+   *  stream instead of clipboard:content. Keyed by the same req_id
+   *  namespace as pendingClipboardReads. */
+  const pendingClipboardImageReads = new Map<
+    number,
+    { resolve: (img: { blob: Blob; w: number; h: number }) => void; reject: (err: Error) => void }
+  >()
+
+  type RemoteClipContent =
+    | { kind: 'text'; text: string }
+    | { kind: 'image'; blob: Blob; w: number; h: number }
+  /** Latest remote change that arrived while this tab was unfocused
+   *  (clipboard writes need document focus). Applied on refocus unless
+   *  the operator copied something new locally in the meantime —
+   *  local wins then (last-writer-wins approximation, no clocks). */
+  let pendingRemoteApply: RemoteClipContent | null = null
+
+  async function writeRemoteContentToLocalClipboard(content: RemoteClipContent): Promise<void> {
+    try {
+      if (content.kind === 'text') {
+        await globalThis.navigator.clipboard.writeText(content.text)
+        clipboardEchoGate.recordApplied(hashClipboardText(content.text))
+      } else {
+        await globalThis.navigator.clipboard.write([
+          new ClipboardItem({ 'image/png': content.blob }),
+        ])
+        // Chrome re-encodes PNGs on write — read back and hash what a
+        // later local read will actually see, else the echo gate
+        // false-negatives and we push the image straight back.
+        try {
+          const items = await globalThis.navigator.clipboard.read()
+          for (const item of items) {
+            if (item.types.includes('image/png')) {
+              const back = await item.getType('image/png')
+              clipboardEchoGate.recordApplied(
+                hashClipboardBytes(new Uint8Array(await back.arrayBuffer())),
+              )
+              break
+            }
+          }
+        } catch {
+          /* best-effort — the agent-side seq/self-marks still hold */
+        }
+      }
+    } catch (e) {
+      // Focus lost between check and write, or permission denied —
+      // drop; the next remote change re-pushes.
+      console.debug('[rc] clipboard apply failed', e)
+    }
+  }
+
+  function applyRemoteClipboard(content: RemoteClipContent) {
+    if (!clipboardAutoSyncEnabled.value) return
+    if (!globalThis.document.hasFocus()) {
+      pendingRemoteApply = content // latest wins
+      return
+    }
+    void writeRemoteContentToLocalClipboard(content)
+  }
+
+  function handleClipboardReadDenied(e: unknown) {
+    // NotAllowedError also fires on focus races ("Document is not
+    // focused" — DevTools focus, window switch mid-await). Only latch
+    // the blocked state when the permission is truly denied.
+    void (async () => {
+      try {
+        const status = await globalThis.navigator.permissions.query({
+          name: 'clipboard-read' as PermissionName,
+        })
+        if (status.state === 'denied') clipboardSyncBlocked.value = true
+      } catch {
+        /* permissions API unavailable — stay optimistic, retry later */
+      }
+    })()
+    console.debug('[rc] clipboard read blocked', e)
+  }
+
+  async function pngDimensions(blob: Blob): Promise<{ w: number; h: number } | null> {
+    try {
+      const bmp = await createImageBitmap(blob)
+      const d = { w: bmp.width, h: bmp.height }
+      bmp.close()
+      return d
+    } catch {
+      return null
+    }
+  }
+
+  async function pushLocalImageToRemote(ch: RTCDataChannel): Promise<boolean> {
+    let items: ClipboardItems
+    try {
+      items = await globalThis.navigator.clipboard.read()
+    } catch (e) {
+      // DataError = clipboard holds no readable data (e.g. files) —
+      // a transient skip, NOT a permission problem.
+      if (e instanceof DOMException && e.name === 'NotAllowedError') {
+        handleClipboardReadDenied(e)
+      }
+      return false
+    }
+    for (const item of items) {
+      if (!item.types.includes('image/png')) continue
+      let blob: Blob
+      try {
+        blob = await item.getType('image/png')
+      } catch {
+        return false
+      }
+      if (blob.size === 0 || blob.size > CLIPBOARD_IMAGE_MAX_BYTES) return false
+      const png = new Uint8Array(await blob.arrayBuffer())
+      const hash = hashClipboardBytes(png)
+      if (!clipboardEchoGate.shouldPush(hash)) return false
+      const dims = await pngDimensions(blob)
+      if (!dims) return false
+      try {
+        const { begin, frames, end } = buildClipboardImageFrames(png, dims.w, dims.h)
+        ch.send(begin)
+        for (const frame of frames) {
+          while (ch.bufferedAmount > 4 * 1024 * 1024) {
+            await new Promise((r) => setTimeout(r, 20))
+            if (ch.readyState !== 'open') return false
+          }
+          ch.send(frame)
+        }
+        ch.send(end)
+        clipboardEchoGate.recordPushed(hash)
+        return true
+      } catch {
+        return false
+      }
+    }
+    return false
+  }
+
+  let clipboardPushInFlight = false
+  let lastClipboardSyncAttempt = 0
+  async function syncLocalClipboardToRemote(
+    reason: 'focus' | 'visible' | 'poll' | 'paste-intent' | 'connect',
+  ): Promise<void> {
+    if (!clipboardAutoSyncEnabled.value || clipboardSyncBlocked.value) return
+    if (phase.value !== 'connected') return
+    const ch = channels.clipboard
+    if (!ch || ch.readyState !== 'open') return
+    if (!globalThis.document.hasFocus()) return
+    if (clipboardPushInFlight) return
+    const now = Date.now()
+    if (now - lastClipboardSyncAttempt < CLIPBOARD_SYNC_MIN_INTERVAL_MS) return
+    lastClipboardSyncAttempt = now
+    clipboardPushInFlight = true
+    try {
+      // Focus-conflict rule: refocusing with a stashed remote change —
+      // local wins ONLY if the operator copied something new while
+      // away (its hash is unknown to the gate); else the stash applies.
+      const stashed = pendingRemoteApply
+      pendingRemoteApply = null
+      let text = ''
+      try {
+        text = await globalThis.navigator.clipboard.readText()
+      } catch (e) {
+        handleClipboardReadDenied(e)
+        return
+      }
+      if (normalizeClipboardText(text) !== '') {
+        const hash = hashClipboardText(text)
+        if (clipboardEchoGate.shouldPush(hash)) {
+          try {
+            // RAW text on the wire — see sendClipboardWriteOverDc.
+            sendClipboardWriteOverDc(ch, text)
+            clipboardEchoGate.recordPushed(hash)
+          } catch {
+            /* DC hiccup — the next trigger retries */
+          }
+          return
+        }
+      } else if (supportsClipboardImages.value && reason !== 'poll') {
+        // Image push is event-driven only: polling clipboard.read()
+        // every 2 s would fetch + hash up to 8 MiB per tick.
+        const pushed = await pushLocalImageToRemote(ch)
+        if (pushed) return
+      }
+      if (stashed) await writeRemoteContentToLocalClipboard(stashed)
+    } finally {
+      clipboardPushInFlight = false
+    }
+  }
+
+  function sendClipboardSubscription(on: boolean) {
+    const ch = channels.clipboard
+    if (!ch || ch.readyState !== 'open' || !supportsClipboardEvents.value) return
+    try {
+      ch.send(
+        JSON.stringify(
+          on
+            ? {
+                t: 'clipboard:subscribe',
+                events: supportsClipboardImages.value ? ['text', 'image'] : ['text'],
+              }
+            : { t: 'clipboard:unsubscribe' },
+        ),
+      )
+    } catch {
+      /* DC closing */
+    }
+  }
+
+  function onWindowFocusClipboard() {
+    void syncLocalClipboardToRemote('focus')
+  }
+  function onVisibilityClipboard() {
+    if (globalThis.document.visibilityState === 'visible') {
+      void syncLocalClipboardToRemote('visible')
+    }
+  }
+  let clipboardSyncPollTimer: ReturnType<typeof setInterval> | null = null
+  let clipboardSyncTriggersOn = false
+  function startClipboardSyncTriggers() {
+    if (clipboardSyncTriggersOn) return
+    clipboardSyncTriggersOn = true
+    globalThis.window.addEventListener('focus', onWindowFocusClipboard)
+    globalThis.document.addEventListener('visibilitychange', onVisibilityClipboard)
+    clipboardSyncPollTimer = setInterval(() => {
+      if (globalThis.document.hasFocus()) void syncLocalClipboardToRemote('poll')
+    }, CLIPBOARD_SYNC_POLL_MS)
+  }
+  function stopClipboardSyncTriggers() {
+    if (!clipboardSyncTriggersOn) return
+    clipboardSyncTriggersOn = false
+    globalThis.window.removeEventListener('focus', onWindowFocusClipboard)
+    globalThis.document.removeEventListener('visibilitychange', onVisibilityClipboard)
+    if (clipboardSyncPollTimer) {
+      clearInterval(clipboardSyncPollTimer)
+      clipboardSyncPollTimer = null
+    }
+  }
+
+  function setClipboardAutoSyncEnabled(on: boolean) {
+    clipboardAutoSyncEnabled.value = on
+  }
+  watch(clipboardAutoSyncEnabled, (on) => {
+    persistClipboardAutoSync(on)
+    if (on) {
+      sendClipboardSubscription(true)
+      if (channels.clipboard?.readyState === 'open') {
+        startClipboardSyncTriggers()
+        void syncLocalClipboardToRemote('focus')
+      }
+    } else {
+      sendClipboardSubscription(false)
+      stopClipboardSyncTriggers()
+      pendingRemoteApply = null
+    }
+  })
 
   // ---- File-DC registry (shared across all `files` channel transfers) ----
   // The `files` DC carries multiple concurrent kinds of work in 0.3.0+:
@@ -3638,6 +4101,24 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // stricter policy.
     channels.cursor = pc.createDataChannel('cursor', { ordered: true })
     channels.clipboard = pc.createDataChannel('clipboard', { ordered: true })
+    // v2 — the clipboard DC carries binary PNG frames; without an
+    // explicit binaryType some browsers deliver Blobs (the files DC
+    // defends both, the video DCs pin arraybuffer — same here).
+    channels.clipboard.binaryType = 'arraybuffer'
+    channels.clipboard.onopen = () => {
+      if (clipboardAutoSyncEnabled.value) {
+        // Subscribe to host clipboard changes (v2 agents only — the
+        // gate is inside sendClipboardSubscription) and start the
+        // local→remote triggers. Re-fires automatically on the fresh
+        // DC after a reconnect.
+        sendClipboardSubscription(true)
+        startClipboardSyncTriggers()
+        void syncLocalClipboardToRemote('connect')
+      }
+    }
+    channels.clipboard.onclose = () => {
+      stopClipboardSyncTriggers()
+    }
     channels.files = pc.createDataChannel('files', { ordered: true })
 
     // Persistent listener on the `files` DC. Demuxes every control
@@ -3874,18 +4355,144 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // are keyed by the req_id we stamp on outbound `clipboard:read`
     // messages so interleaved reads resolve independently.
     const pendingClipboardReadChunks = new Map<number, string>()
+    // v2 — chunked change-event reassembly (keyed by event_id) and the
+    // inbound agent→browser image stream (one at a time; the agent
+    // serializes them). A 15 s inactivity timer drops half streams.
+    const pendingClipboardEventChunks = new Map<string, string>()
+    let inboundClipImage: {
+      id: string
+      w: number
+      h: number
+      declared: number
+      chunks: BlobPart[]
+      received: number
+      reqId: number | null
+      timer: ReturnType<typeof setTimeout>
+    } | null = null
+    const dropInboundClipImage = () => {
+      if (inboundClipImage) {
+        clearTimeout(inboundClipImage.timer)
+        inboundClipImage = null
+      }
+    }
+    const armInboundClipImageTimer = () => {
+      if (!inboundClipImage) return
+      clearTimeout(inboundClipImage.timer)
+      inboundClipImage.timer = setTimeout(() => {
+        console.debug('[rc] clipboard image stream timed out; dropping')
+        dropInboundClipImage()
+      }, 15_000)
+    }
     channels.clipboard.onmessage = (ev) => {
-      if (typeof ev.data !== 'string') return
+      if (typeof ev.data !== 'string') {
+        // v2 — binary PNG frame for the announced inbound image.
+        if (!inboundClipImage) return
+        const data = ev.data as ArrayBuffer | Blob
+        const size = data instanceof Blob ? data.size : data.byteLength
+        if (inboundClipImage.received + size > inboundClipImage.declared) {
+          console.debug('[rc] clipboard image stream overflowed declared bytes; dropping')
+          dropInboundClipImage()
+          return
+        }
+        inboundClipImage.chunks.push(data)
+        inboundClipImage.received += size
+        armInboundClipImageTimer()
+        return
+      }
       let msg: {
         t?: string
         req_id?: number | null
+        id?: string
         text?: string
         message?: string
         last?: boolean
+        kind?: string
+        event_id?: string
+        seq?: number
+        w?: number
+        h?: number
+        bytes?: number
       }
       try {
         msg = JSON.parse(ev.data)
       } catch {
+        return
+      }
+      if (msg.t === 'clipboard:write-ack') {
+        settleClipboardAck(msg.id)
+        return
+      }
+      if (msg.t === 'clipboard:event') {
+        if (msg.kind === 'text' && typeof msg.text === 'string') {
+          applyRemoteClipboard({ kind: 'text', text: msg.text })
+        }
+        return
+      }
+      if (msg.t === 'clipboard:event-chunk') {
+        const eventId = typeof msg.event_id === 'string' ? msg.event_id : null
+        if (eventId == null) return
+        const chunk = typeof msg.text === 'string' ? msg.text : ''
+        const acc = (pendingClipboardEventChunks.get(eventId) ?? '') + chunk
+        if (acc.length > CLIPBOARD_MAX_BYTES) {
+          pendingClipboardEventChunks.delete(eventId)
+          return
+        }
+        if (msg.last === true) {
+          pendingClipboardEventChunks.delete(eventId)
+          applyRemoteClipboard({ kind: 'text', text: acc })
+        } else {
+          pendingClipboardEventChunks.set(eventId, acc)
+        }
+        return
+      }
+      if (msg.t === 'clipboard:img-begin') {
+        const declared = typeof msg.bytes === 'number' ? msg.bytes : 0
+        if (
+          typeof msg.id !== 'string' ||
+          declared <= 0 ||
+          declared > CLIPBOARD_IMAGE_MAX_BYTES
+        ) {
+          return
+        }
+        dropInboundClipImage()
+        inboundClipImage = {
+          id: msg.id,
+          w: typeof msg.w === 'number' ? msg.w : 0,
+          h: typeof msg.h === 'number' ? msg.h : 0,
+          declared,
+          chunks: [],
+          received: 0,
+          reqId: typeof msg.req_id === 'number' ? msg.req_id : null,
+          timer: setTimeout(() => dropInboundClipImage(), 15_000),
+        }
+        return
+      }
+      if (msg.t === 'clipboard:img-end') {
+        if (!inboundClipImage || inboundClipImage.id !== msg.id) return
+        const img = inboundClipImage
+        clearTimeout(img.timer)
+        inboundClipImage = null
+        if (img.received !== img.declared) {
+          console.debug('[rc] clipboard image stream incomplete; dropping')
+          return
+        }
+        const blob = new Blob(img.chunks, { type: 'image/png' })
+        if (img.reqId != null) {
+          // Answer to a rich read — resolve it (and cancel the text
+          // side of the same req_id).
+          const rich = pendingClipboardImageReads.get(img.reqId)
+          if (rich) {
+            pendingClipboardImageReads.delete(img.reqId)
+            const textPending = pendingClipboardReads.get(img.reqId)
+            if (textPending) {
+              clearTimeout(textPending.timer)
+              pendingClipboardReads.delete(img.reqId)
+            }
+            rich.resolve({ blob, w: img.w, h: img.h })
+            return
+          }
+        }
+        applyRemoteClipboard({ kind: 'image', blob, w: img.w, h: img.h })
         return
       }
       if (msg.t === 'clipboard:content') {
@@ -3928,8 +4535,17 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
           pending.resolve(acc)
         }
       } else if (msg.t === 'clipboard:error') {
+        // v2 — a failed id-stamped write settles its ack waiter (the
+        // deferred Ctrl+V flushes; pasting the old content beats
+        // hanging the keystroke on a write that will never land).
+        settleClipboardAck(msg.id)
         const reqId = typeof msg.req_id === 'number' ? msg.req_id : null
         if (reqId == null) return
+        const rich = pendingClipboardImageReads.get(reqId)
+        if (rich) {
+          pendingClipboardImageReads.delete(reqId)
+          rich.reject(new Error(msg.message || 'agent clipboard error'))
+        }
         const pending = pendingClipboardReads.get(reqId)
         if (!pending) return
         clearTimeout(pending.timer)
@@ -4278,6 +4894,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
 
   onBeforeUnmount(() => {
     disconnect()
+    // Defensive — disconnect() closes the DC which stops the triggers
+    // via onclose, but a DC that never opened has no onclose to fire.
+    stopClipboardSyncTriggers()
   })
 
   /**
@@ -4626,6 +5245,17 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
      *  button — keeps the operator's intent reachable.
      */
     function scheduleClipboardMirror() {
+      // v2 — when change events are flowing, the agent pushes the
+      // fresh copy the instant its clipboard changes; the delayed
+      // read-back mirror is redundant (and its writeText would fight
+      // the event's own apply).
+      if (
+        clipboardAutoSyncEnabled.value &&
+        supportsClipboardEvents.value &&
+        !clipboardSyncBlocked.value
+      ) {
+        return
+      }
       const delayMs = 25
       setTimeout(() => {
         // Fire-and-forget. We deliberately don't await in the
@@ -4756,13 +5386,39 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       if (text) {
         const ch = channels.clipboard
         if (ch && ch.readyState === 'open') {
+          const hash = hashClipboardText(text)
+          if (clipboardEchoGate.knows(hash)) {
+            // v2 — auto-sync already delivered this exact content to
+            // the host; skip the redundant write and paste now.
+            flushPendingCtrlV()
+            return
+          }
           try {
             // rc.44 — `sendClipboardWriteOverDc` picks the legacy
             // single-envelope shape for ≤12 KB texts (back-compat
             // with older agents) or splits into `clipboard:write-chunk`
             // envelopes for larger texts to stay under the SCTP
             // `max_message_size` ceiling.
-            sendClipboardWriteOverDc(ch, text)
+            const { id } = sendClipboardWriteOverDc(ch, text)
+            clipboardEchoGate.recordPushed(hash)
+            if (supportsClipboardAck.value) {
+              // v2 — flush the deferred keystroke only after the agent
+              // confirms the OS clipboard write. Without this gate the
+              // keystroke (unordered input DC) routinely beat the
+              // write (ordered clipboard DC + worker-thread hop) and
+              // the remote app pasted the STALE clipboard — the field
+              // -reported multiline corruption. The 50 ms empty-
+              // clipboard timer must not fire in between: the ack
+              // path owns the flush now.
+              if (pendingCtrlV?.timer) {
+                clearTimeout(pendingCtrlV.timer)
+                pendingCtrlV.timer = null
+              }
+              void awaitClipboardAck(id, CLIPBOARD_ACK_TIMEOUT_MS).then(() =>
+                flushPendingCtrlV(),
+              )
+              return
+            }
           } catch {
             /* dropped — host clipboard stays unchanged but we still
                forward the keystroke; remote app pastes whatever was
@@ -4839,7 +5495,15 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     }
     try {
       // rc.44 — chunks large payloads to avoid SCTP `ErrChunk`.
-      sendClipboardWriteOverDc(ch, text)
+      const { id } = sendClipboardWriteOverDc(ch, text)
+      clipboardEchoGate.recordPushed(hashClipboardText(text))
+      // v2 — wait for the agent's write-ack so the button's success
+      // toast reflects the OS clipboard actually being written (1 s
+      // timeout fallback keeps old agents on the fire-and-forget
+      // semantics).
+      if (supportsClipboardAck.value) {
+        await awaitClipboardAck(id, CLIPBOARD_ACK_TIMEOUT_MS)
+      }
       return true
     } catch {
       return false
@@ -4871,6 +5535,67 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       } catch (e) {
         clearTimeout(timer)
         pendingClipboardReads.delete(reqId)
+        reject(e instanceof Error ? e : new Error(String(e)))
+      }
+    })
+  }
+
+  /** v2 — rich clipboard read: like [`getAgentClipboard`] but also
+   *  accepts an IMAGE reply when the host clipboard holds one and the
+   *  agent advertises the `images` cap. Resolves with a tagged union;
+   *  `{kind:'text', text:''}` means the host clipboard is empty.
+   *  Falls back to the text-only read against old agents. */
+  async function getAgentClipboardRich(): Promise<
+    { kind: 'text'; text: string } | { kind: 'image'; blob: Blob; w: number; h: number }
+  > {
+    if (!supportsClipboardImages.value) {
+      const text = await getAgentClipboard()
+      return { kind: 'text', text }
+    }
+    const ch = channels.clipboard
+    if (!ch || ch.readyState !== 'open') {
+      throw new Error('clipboard channel not open')
+    }
+    const reqId = nextClipboardReqId++
+    return new Promise((resolve, reject) => {
+      // 15 s (vs the text read's 5 s): an 8 MiB PNG at a constrained
+      // relay can legitimately take a while.
+      const timer = setTimeout(() => {
+        cleanup()
+        reject(new Error('agent did not respond to clipboard:read within 15s'))
+      }, 15_000)
+      function cleanup() {
+        clearTimeout(timer)
+        pendingClipboardReads.delete(reqId)
+        pendingClipboardImageReads.delete(reqId)
+      }
+      pendingClipboardReads.set(reqId, {
+        resolve: (text) => {
+          cleanup()
+          resolve({ kind: 'text', text })
+        },
+        reject: (e) => {
+          cleanup()
+          reject(e)
+        },
+        timer,
+      })
+      pendingClipboardImageReads.set(reqId, {
+        resolve: (img) => {
+          cleanup()
+          resolve({ kind: 'image', ...img })
+        },
+        reject: (e) => {
+          cleanup()
+          reject(e)
+        },
+      })
+      try {
+        ch.send(
+          JSON.stringify({ t: 'clipboard:read', req_id: reqId, accept: ['text', 'image'] }),
+        )
+      } catch (e) {
+        cleanup()
         reject(e instanceof Error ? e : new Error(String(e)))
       }
     })
@@ -5910,6 +6635,17 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     sendKey,
     sendClipboardToAgent,
     getAgentClipboard,
+    /** v2 — text-or-image read (falls back to text-only on old
+     *  agents). The Get-clipboard button uses this when the agent
+     *  advertises the `images` cap. */
+    getAgentClipboardRich,
+    /** v2 — clipboard auto-sync toggle (persisted; default ON) +
+     *  the permission-blocked latch the view surfaces as a snackbar. */
+    clipboardAutoSyncEnabled,
+    setClipboardAutoSyncEnabled,
+    clipboardSyncBlocked,
+    supportsClipboardEvents,
+    supportsClipboardImages,
     sendCtrlAltDel,
     uploadFile,
     uploadFiles,
