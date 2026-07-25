@@ -769,6 +769,33 @@ to-activate, so the browser never sees a bait-and-switch.
   Desktop Duplication, BitBlt, third-party tools), so the controller
   doesn't see a recursive picture-frame in the RTP stream.
 
+### 18.3.1 Keyboard-layout auto-switch + rc:layout (0.3.0-rc.227)
+
+The "typing is dead until I press ALT+SHIFT on the remote" fix
+(viewer German, remote Cyrillic-BG). `win_text::type_text` resolves
+each char against the remote's ACTIVE layout; unreachable chars used
+to drop straight to VK_PACKET (which conhost ignores). Now
+`input::layout` (Windows + enigo-input):
+
+- **Per-char auto-switch**: unreachable on the active layout → find an
+  installed non-IME layout that CAN produce it (last-good-first) →
+  post `WM_INPUTLANGCHANGEREQUEST` to the foreground window (the OS's
+  own ALT+SHIFT) → verify-poll ≤100 ms → inject real VK+scancode under
+  the new layout. Verify timeout → VK_PACKET + 3 s cooldown; ≤8
+  switches/call. Kill switch `ROOMLER_AGENT_AUTO_LAYOUT=0`. Switch
+  logs carry a script class only — never the char (passwords).
+- **`rc:layout`** (control DC, agent→browser): active + installed
+  layouts as opaque 8-hex HKL strings + BCP-47 tags, published on
+  change (sampled on key events + every 32nd mouse event, on the
+  injector thread — the desktop-bound one under SYSTEM-context).
+  Drives the viewer's layout chip. The emitter task exits on DC
+  send-failure (the layout watch is process-global and never closes).
+- **`rc:layout.set {hkl}`** (control DC, browser→agent): the Settings
+  picker. Validated against the CURRENT installed list (never
+  activates arbitrary wire input); runs on a fresh desktop-rebound
+  thread; the re-sampled `rc:layout` push is the implicit ack.
+- **Caps**: `AgentCaps.layout = ["report","set"]` gates the UI.
+
 ### 18.4 Input fix — Windows VK path (0.1.34)
 
 `hid_to_key` previously mapped letters/digits to `Key::Unicode(c)`.

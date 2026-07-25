@@ -87,7 +87,9 @@ fn send(inputs: &[INPUT]) {
 /// Decompose a `VkKeyScanExW` result into `(vk, shift, ctrl, alt)`, or `None`
 /// when the character isn't reachable on the layout (`-1`) or maps to no key.
 /// Pulled out as a pure fn so the bit math is unit-testable without the OS.
-fn decode_vk_scan(res: i16) -> Option<(u16, bool, bool, bool)> {
+/// `pub(super)` so `layout::resolve_layout_for_char` scans candidate layouts
+/// with exactly the same reachability semantics as the injection path.
+pub(super) fn decode_vk_scan(res: i16) -> Option<(u16, bool, bool, bool)> {
     if res == -1 {
         return None;
     }
@@ -175,16 +177,25 @@ fn capslock_on(fg_tid: u32) -> bool {
 }
 
 /// Type `text` into the foreground window. Per character: real VK+scancode when
-/// the active layout can produce it (legacy-console-compatible), else Unicode.
+/// the active layout can produce it (legacy-console-compatible); when it can't
+/// but ANOTHER installed layout can, auto-switch the foreground layout (rc.227
+/// — the programmatic ALT+SHIFT, see `input::layout`) and inject under it;
+/// else Unicode (VK_PACKET).
 pub(super) fn type_text(text: &str) {
     // The active layout is the FOREGROUND thread's — that's what interprets the
-    // injected scancodes. Read it (and the thread id) once per call.
+    // injected scancodes. Read hwnd + tid + layout once per call; the hwnd is
+    // needed by the auto-switch (WM_INPUTLANGCHANGEREQUEST targets it). A
+    // focus change mid-string leaves them stale — the switch verify then
+    // times out into the cooldown, and the char degrades to Unicode.
     // SAFETY: GetForegroundWindow may return null (no foreground); GetKeyboard-
     // Layout(0) then returns the calling thread's layout, a safe default.
-    let (hkl, fg_tid): (HKL, u32) = unsafe {
-        let tid = GetWindowThreadProcessId(GetForegroundWindow(), std::ptr::null_mut());
-        (GetKeyboardLayout(tid), tid)
+    let (fg_hwnd, fg_tid): (windows_sys::Win32::Foundation::HWND, u32) = unsafe {
+        let hwnd = GetForegroundWindow();
+        let tid = GetWindowThreadProcessId(hwnd, std::ptr::null_mut());
+        (hwnd, tid)
     };
+    // SAFETY: plain read of the thread's active layout.
+    let mut hkl: HKL = unsafe { GetKeyboardLayout(fg_tid) };
     // rc.123 — scancode injection is subject to the TARGET's CapsLock (unlike the
     // old KEYEVENTF_UNICODE path, which ignored it). REGAL-112500982 had CapsLock
     // toggled ON → every injected letter came out with inverted case. VkKeyScanExW
@@ -193,6 +204,7 @@ pub(super) fn type_text(text: &str) {
     // and the Unicode fallback are unaffected. Hosts with CapsLock off (e.g.
     // PC50045) read `false` here → no change.
     let caps = capslock_on(fg_tid);
+    let mut switches_this_call: u32 = 0;
     for c in text.chars() {
         match c {
             '\n' | '\r' => tap_vk(VK_RETURN, false, false, false, hkl),
@@ -201,22 +213,84 @@ pub(super) fn type_text(text: &str) {
             _ => {
                 let mut buf = [0u16; 2];
                 let units = c.encode_utf16(&mut buf);
-                let decoded = if units.len() == 1 {
-                    // SAFETY: single UTF-16 unit + valid layout handle.
-                    decode_vk_scan(unsafe { VkKeyScanExW(units[0], hkl) })
-                } else {
-                    None // astral (emoji) — never a single VK
-                };
-                match decoded {
-                    Some((vk, shift, ctrl, alt)) => {
-                        let shift = if caps && c.is_alphabetic() {
-                            !shift
+                if units.len() != 1 {
+                    // Astral (emoji) — never a single VK on any layout.
+                    send_unicode(c);
+                    continue;
+                }
+                let unit = units[0];
+                // SAFETY: single UTF-16 unit + valid layout handle.
+                if let Some((vk, shift, ctrl, alt)) =
+                    decode_vk_scan(unsafe { VkKeyScanExW(unit, hkl) })
+                {
+                    // Reachable on the ACTIVE layout — the common case,
+                    // and the inherent hysteresis: it never triggers a
+                    // switch, so same-script runs are switch-free.
+                    let shift = if caps && c.is_alphabetic() {
+                        !shift
+                    } else {
+                        shift
+                    };
+                    tap_vk(vk, shift, ctrl, alt, hkl);
+                    continue;
+                }
+                // rc.227 — char unreachable on the active layout. The old
+                // behavior (VK_PACKET) is dropped by conhost/legacy apps;
+                // when another INSTALLED layout can produce the char,
+                // switch the foreground layout to it — exactly what the
+                // operator used to do manually with ALT+SHIFT.
+                if !super::layout::auto_layout_enabled()
+                    || switches_this_call >= super::layout::MAX_SWITCHES_PER_CALL
+                    || super::layout::cooldown_active()
+                {
+                    send_unicode(c);
+                    continue;
+                }
+                match super::layout::resolve_layout_for_char(unit, hkl) {
+                    None => send_unicode(c), // reachable nowhere (e.g. 'ä', no German layout)
+                    Some(candidate) => {
+                        if super::layout::switch_active_layout(fg_hwnd, fg_tid, candidate) {
+                            let from = hkl;
+                            hkl = candidate;
+                            super::layout::record_good_layout(candidate);
+                            switches_this_call += 1;
+                            if super::layout::should_log_switch() {
+                                // Privacy: NEVER the literal char — script
+                                // class only (lock-screen passwords flow
+                                // through here).
+                                tracing::info!(
+                                    from = %super::layout::format_hkl(from),
+                                    to = %super::layout::format_hkl(candidate),
+                                    script = super::layout::script_class(c),
+                                    "layout auto-switch OK"
+                                );
+                            }
+                            // Publish the new state so the viewer chip
+                            // flips immediately.
+                            super::layout::sample_active_layout();
+                            match decode_vk_scan(unsafe { VkKeyScanExW(unit, hkl) }) {
+                                Some((vk, shift, ctrl, alt)) => {
+                                    let shift = if caps && c.is_alphabetic() {
+                                        !shift
+                                    } else {
+                                        shift
+                                    };
+                                    tap_vk(vk, shift, ctrl, alt, hkl);
+                                }
+                                // Shouldn't happen (resolve proved it) —
+                                // defensive fallback.
+                                None => send_unicode(c),
+                            }
                         } else {
-                            shift
-                        };
-                        tap_vk(vk, shift, ctrl, alt, hkl);
+                            super::layout::arm_cooldown();
+                            tracing::warn!(
+                                from = %super::layout::format_hkl(hkl),
+                                to = %super::layout::format_hkl(candidate),
+                                "layout auto-switch: foreground app ignored WM_INPUTLANGCHANGEREQUEST — Unicode fallback + cooldown"
+                            );
+                            send_unicode(c);
+                        }
                     }
-                    None => send_unicode(c),
                 }
             }
         }
