@@ -397,7 +397,12 @@ async fn connect_once(
         cfg.ws_url(),
         urlencode(&cfg.agent_token)
     );
-    info!(%url, "connecting to signaling server");
+    // Log the endpoint WITHOUT the token: the URL carries the long-lived agent
+    // JWT (a 1-year credential), and this line lands in the rolling log a user
+    // might paste into a chat / issue (field 2026-07-25 — a controller shared a
+    // log with the full token in it). The token itself never adds diagnostic
+    // value here; `{server}/ws (role=agent)` is enough to see WHERE we dial.
+    info!(server = %cfg.ws_url(), "connecting to signaling server (role=agent)");
 
     // rc.58: wrap `connect_async` in a hard timeout. A hung TLS
     // handshake (rustls refusing renegotiation against an LB that
