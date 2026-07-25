@@ -5383,12 +5383,13 @@ fn attach_clipboard_handler(
         }));
         return;
     }
-    let cb = match crate::clipboard::Clipboard::new() {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(%session_id, %e, "clipboard: init failed — DC will no-op");
-            return;
-        }
+    // v2.2 — the process-SHARED clipboard worker (also used by the
+    // loopback bridge): one set of echo self-marks process-wide, so a
+    // bridge write on this host is never echoed back to a session
+    // subscriber watching the same clipboard.
+    let Some(cb) = crate::clipboard::Clipboard::shared() else {
+        warn!(%session_id, "clipboard: init failed — DC will no-op");
+        return;
     };
     // rc.44 — per-session reassembler for `clipboard:write-chunk`
     // envelopes. Shared across all on_message callbacks via the Arc.
@@ -5560,6 +5561,28 @@ fn attach_clipboard_handler(
                     }
                 }
                 crate::clipboard::ClipboardIncoming::Read { req_id, accept } => {
+                    // v2.2 — native-first rich read: only RTF carries a
+                    // document's embedded images, so it outranks html.
+                    if accept.iter().any(|a| a == "native") {
+                        match cb.read_native().await {
+                            Ok(Some(payload)) => {
+                                info!(%session_id, rtf_bytes = payload.rtf.len(), "clipboard: read native from host");
+                                send_clipboard_native(
+                                    &dc,
+                                    session_id,
+                                    payload,
+                                    req_id,
+                                    &img_tx_lock,
+                                )
+                                .await;
+                                return;
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                debug!(%session_id, %e, "clipboard: native read failed — falling through");
+                            }
+                        }
+                    }
                     // v2.1 — html-first rich read: an html-holding
                     // clipboard also carries a text alt, so html must
                     // be offered BEFORE the plain-text reply.
@@ -5689,6 +5712,7 @@ fn attach_clipboard_handler(
                     let want_text = events.is_empty() || events.iter().any(|e| e == "text");
                     let want_image = events.iter().any(|e| e == "image");
                     let want_html = events.iter().any(|e| e == "html");
+                    let want_native = events.iter().any(|e| e == "native");
                     let (tx, mut rx) =
                         tokio::sync::mpsc::channel::<crate::clipboard::ClipboardChange>(4);
                     if let Err(e) = cb.watch(
@@ -5696,13 +5720,14 @@ fn attach_clipboard_handler(
                             text: want_text,
                             image: want_image,
                             html: want_html,
+                            native: want_native,
                         },
                         tx,
                     ) {
                         warn!(%session_id, %e, "clipboard: subscribe failed (worker gone)");
                         return;
                     }
-                    info!(%session_id, text = want_text, image = want_image, html = want_html, "clipboard: change subscription installed");
+                    info!(%session_id, text = want_text, image = want_image, html = want_html, native = want_native, "clipboard: change subscription installed");
                     let dc_for_events = dc.clone();
                     let img_lock_for_events = img_tx_lock.clone();
                     let handle = tokio::spawn(async move {
@@ -5734,6 +5759,16 @@ fn attach_clipboard_handler(
                                         &dc_for_events,
                                         session_id,
                                         payload,
+                                        None,
+                                        &img_lock_for_events,
+                                    )
+                                    .await;
+                                }
+                                crate::clipboard::ClipboardChange::Native(payload) => {
+                                    send_clipboard_native(
+                                        &dc_for_events,
+                                        session_id,
+                                        *payload,
                                         None,
                                         &img_lock_for_events,
                                     )
@@ -5815,8 +5850,36 @@ fn attach_clipboard_handler(
                         }
                     }
                 }
+                crate::clipboard::ClipboardIncoming::NativeBegin {
+                    id,
+                    rtf_bytes,
+                    html_bytes,
+                    text_bytes,
+                } => {
+                    let res = {
+                        let mut rx = rich_rx.lock().expect("clipboard rich_rx poisoned");
+                        rx.begin_native(id.clone(), rtf_bytes, html_bytes, text_bytes)
+                    };
+                    match res {
+                        Ok(()) => {
+                            debug!(%session_id, %id, rtf_bytes, html_bytes, text_bytes, "clipboard: native write begin")
+                        }
+                        Err(reason) => {
+                            warn!(%session_id, %id, %reason, "clipboard: native begin rejected");
+                            let reply = serde_json::json!({
+                                "t": "clipboard:error",
+                                "message": reason,
+                                "id": id,
+                            });
+                            if let Ok(s) = serde_json::to_string(&reply) {
+                                let _ = dc.send_text(s).await;
+                            }
+                        }
+                    }
+                }
                 crate::clipboard::ClipboardIncoming::ImgEnd { id }
-                | crate::clipboard::ClipboardIncoming::HtmlEnd { id } => {
+                | crate::clipboard::ClipboardIncoming::HtmlEnd { id }
+                | crate::clipboard::ClipboardIncoming::NativeEnd { id } => {
                     finish_rich_write(&dc, session_id, &cb, &rich_rx, &id).await;
                 }
             }
@@ -5860,6 +5923,16 @@ async fn finish_rich_write(
                 Err(e) => Err(format!("{e}")),
             }
         }
+        Ok(crate::clipboard::RichPayload::Native(payload)) => {
+            let bytes = payload.rtf.len() + payload.html.len() + payload.text.len();
+            match cb.write_native(*payload).await {
+                Ok(()) => {
+                    info!(%session_id, id, bytes, "clipboard: wrote native (RTF) to host");
+                    Ok(bytes)
+                }
+                Err(e) => Err(format!("{e}")),
+            }
+        }
         Err(reason) => Err(reason),
     };
     let reply = match result {
@@ -5878,6 +5951,71 @@ async fn finish_rich_write(
         }
     };
     if let Ok(s) = serde_json::to_string(&reply) {
+        let _ = dc.send_text(s).await;
+    }
+}
+
+/// v2.2 — stream one NATIVE payload (RTF + html + text) to the
+/// browser: `clipboard:native-begin` header, 64 KiB binary frames
+/// (rtf, then html UTF-8, then text UTF-8), `clipboard:native-end`
+/// trailer. Same serialization lock + backpressure as images/html.
+#[cfg(feature = "clipboard")]
+async fn send_clipboard_native(
+    dc: &Arc<RTCDataChannel>,
+    session_id: bson::oid::ObjectId,
+    payload: crate::clipboard::NativePayload,
+    req_id: Option<u64>,
+    tx_lock: &tokio::sync::Mutex<()>,
+) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NATIVE_TX_SEQ: AtomicU64 = AtomicU64::new(0);
+    const BACKPRESSURE_HIGH: usize = 4 * 1024 * 1024;
+    const BACKPRESSURE_MAX_SPINS: u32 = 750;
+
+    let _guard = tx_lock.lock().await;
+    let id = format!("anative-{}", NATIVE_TX_SEQ.fetch_add(1, Ordering::Relaxed));
+    let rtf_bytes = payload.rtf.len();
+    let html_bytes = payload.html.len();
+    let text_bytes = payload.text.len();
+    debug!(%session_id, %id, rtf_bytes, html_bytes, text_bytes, ?req_id, "clipboard: sending native");
+    let begin = serde_json::json!({
+        "t": "clipboard:native-begin",
+        "id": id,
+        "rtf_bytes": rtf_bytes as u64,
+        "html_bytes": html_bytes as u64,
+        "text_bytes": text_bytes as u64,
+        "req_id": req_id,
+    });
+    let Ok(s) = serde_json::to_string(&begin) else {
+        return;
+    };
+    if dc.send_text(s).await.is_err() {
+        return;
+    }
+    let mut combined = Vec::with_capacity(rtf_bytes + html_bytes + text_bytes);
+    combined.extend_from_slice(&payload.rtf);
+    combined.extend_from_slice(payload.html.as_bytes());
+    combined.extend_from_slice(payload.text.as_bytes());
+    for chunk in combined.chunks(crate::clipboard::IMG_FRAME_BYTES_TX) {
+        let mut spins = 0u32;
+        while dc.buffered_amount().await > BACKPRESSURE_HIGH {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            spins += 1;
+            if spins > BACKPRESSURE_MAX_SPINS {
+                debug!(%session_id, %id, "clipboard: backpressure stall; abandoning native send");
+                return;
+            }
+        }
+        if dc.send(&Bytes::copy_from_slice(chunk)).await.is_err() {
+            debug!(%session_id, %id, "clipboard: DC closed mid-native-send; abandoning");
+            return;
+        }
+    }
+    let end = serde_json::json!({
+        "t": "clipboard:native-end",
+        "id": id,
+    });
+    if let Ok(s) = serde_json::to_string(&end) {
         let _ = dc.send_text(s).await;
     }
 }
