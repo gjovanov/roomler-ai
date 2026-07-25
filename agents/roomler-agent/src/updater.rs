@@ -787,14 +787,22 @@ pub fn spawn_installer_with_watch(
 ///   `InstallScope='perUser'` doesn't require elevation, so silent
 ///   install works from any user-token process (Scheduled Task,
 ///   interactive shell).
-/// - **perMachine**: `/qb!` (basic UI, no Cancel). The MSI's
-///   `InstallScope='perMachine'` REQUIRES elevation; `/qn` would
-///   suppress the UAC prompt and the install would silently fail
-///   (the 2026-05-10 the field-test host field repro). `/qb!` shows a minimal
-///   progress dialog while still allowing UAC to prompt when the
-///   caller is non-elevated. Pair with [`spawn_installer_inner`]'s
-///   `ShellExecuteExW`-with-`runas` path so the elevation actually
-///   happens.
+/// - **perMachine**: ALSO `/qn` since rc.236. History: rc.18 chose
+///   `/qb!` because a perMachine MSI spawned non-elevated with `/qn`
+///   silently fails (2026-05-10 field repro — msiexec can't raise
+///   UAC in silent mode). That rationale is obsolete: every
+///   perMachine spawn now goes through `spawn_msiexec_elevated`
+///   (`ShellExecuteExW` verb=runas), so elevation happens BEFORE
+///   msiexec runs and `/qn` has no UAC left to suppress. And `/qb!`
+///   turned out to be the root cause of the 5/5-reproduced
+///   self-update wedge (rc.226→rc.235 on the dev host): upgrading
+///   over the RUNNING service trips FilesInUse (MSI error 1607,
+///   confirmed via /l*v — the server loops on `SELECT Message FROM
+///   Error WHERE Error = 1607`), and basic UI can neither display
+///   nor auto-answer that dialog → msiexec sits at "Gathering
+///   required information…" forever. `/qn` lets Windows Installer
+///   auto-resolve FilesInUse via RestartManager — the exact manual
+///   recovery that worked 4/4.
 ///
 /// Both flavours append `/l*v <installer>.log` — a verbose MSI log
 /// next to the staged installer. Three field wedges (rc.226, rc.228,
@@ -808,7 +816,7 @@ pub fn msiexec_argv(installer: &std::path::Path, flavour: WindowsInstallFlavour)
     let path = installer.to_string_lossy().into_owned();
     let ui = match flavour {
         WindowsInstallFlavour::PerUser => "/qn",
-        WindowsInstallFlavour::PerMachine => "/qb!",
+        WindowsInstallFlavour::PerMachine => "/qn",
     };
     let log = format!("{path}.log");
     vec![
@@ -1159,7 +1167,7 @@ pub fn spawn_msiexec_elevated(argv: &[String]) -> Result<u32> {
     sei.lpVerb = verb_w.as_ptr();
     sei.lpFile = file_w.as_ptr();
     sei.lpParameters = params_w.as_ptr();
-    sei.nShow = 1; // SW_SHOWNORMAL — the /qb! UI is allowed to draw
+    sei.nShow = 1; // SW_SHOWNORMAL — harmless under /qn (no UI to draw)
 
     // SAFETY: all required fields populated above; passing a valid
     // pointer to a stack-allocated struct.
@@ -1912,15 +1920,19 @@ mod tests {
     }
 
     #[test]
-    fn msiexec_argv_per_machine_uses_qb_bang() {
-        // perMachine MSI requires UAC; /qn would suppress the UAC
-        // prompt and silently fail (field bug the field-test host 2026-05-10).
-        // /qb! shows minimal progress UI but allows UAC to surface.
+    fn msiexec_argv_per_machine_uses_qn() {
+        // rc.236: /qn, NOT /qb!. Basic UI can't display or answer the
+        // FilesInUse dialog (MSI error 1607) raised when upgrading
+        // over the running service → the 5/5-reproduced self-update
+        // wedge. Elevation is handled by ShellExecuteExW(runas)
+        // BEFORE msiexec runs, so /qn has no UAC to suppress — the
+        // original rc.18 reason for /qb! no longer applies. Locks
+        // against a well-meaning revert.
         let argv = msiexec_argv(
             std::path::Path::new(r"C:\Temp\roomler-agent-perMachine.msi"),
             WindowsInstallFlavour::PerMachine,
         );
-        assert_eq!(argv[2], "/qb!");
+        assert_eq!(argv[2], "/qn");
         // Other args identical to perUser shape.
         assert_eq!(argv[0], "/i");
         assert_eq!(argv[3], "/norestart");
@@ -1960,7 +1972,7 @@ mod tests {
 
     #[test]
     fn msiexec_argv_with_properties_appends_kv() {
-        // Operator-supplied properties land AFTER the base /i path /qb!
+        // Operator-supplied properties land AFTER the base /i path /qn
         // /norestart shape. Locks the wire format for the WiX CA's
         // condition (`ENABLE_SYSTEM_CONTEXT="1"`).
         let argv = msiexec_argv_with_properties(
@@ -1970,7 +1982,7 @@ mod tests {
         );
         // Base shape preserved.
         assert_eq!(argv[0], "/i");
-        assert_eq!(argv[2], "/qb!");
+        assert_eq!(argv[2], "/qn");
         assert_eq!(argv[3], "/norestart");
         assert_eq!(argv[4], "/l*v");
         // Property appended verbatim after the base argv (incl. the
