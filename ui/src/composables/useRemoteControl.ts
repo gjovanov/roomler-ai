@@ -1505,24 +1505,38 @@ export interface ClipboardEchoGate {
 }
 
 export function createClipboardEchoGate(): ClipboardEchoGate {
-  let lastApplied = ''
-  let lastPushed = ''
+  // Small rings, not single slots: one clipboard state can surface as
+  // SEVERAL hashes (v2.1 — an html payload is seen as its combined
+  // html+text hash by rich reads and as its plain-text-alt hash by
+  // readText polling; both must be remembered or the poll re-pushes
+  // the alt forever). 4 is plenty: a state contributes ≤2 hashes and
+  // anything older refers to overwritten clipboard content.
+  const MAX = 4
+  const applied: string[] = []
+  const pushed: string[] = []
+  const remember = (list: string[], hash: string) => {
+    if (hash === '') return
+    const i = list.indexOf(hash)
+    if (i !== -1) list.splice(i, 1)
+    list.push(hash)
+    if (list.length > MAX) list.shift()
+  }
   return {
     recordApplied(hash: string) {
-      lastApplied = hash
+      remember(applied, hash)
     },
     recordPushed(hash: string) {
-      lastPushed = hash
+      remember(pushed, hash)
     },
     knows(hash: string) {
-      return hash !== '' && (hash === lastApplied || hash === lastPushed)
+      return hash !== '' && (applied.includes(hash) || pushed.includes(hash))
     },
     shouldPush(hash: string) {
-      return hash !== '' && hash !== lastApplied && hash !== lastPushed
+      return hash !== '' && !applied.includes(hash) && !pushed.includes(hash)
     },
     reset() {
-      lastApplied = ''
-      lastPushed = ''
+      applied.length = 0
+      pushed.length = 0
     },
   }
 }
@@ -1559,6 +1573,65 @@ export function buildClipboardImageFrames(
     }),
     frames,
     end: JSON.stringify({ t: 'clipboard:img-end', id }),
+  }
+}
+
+/** v2.1 — cap on an html+text clipboard payload on the wire, both
+ *  directions. Mirrors the agent's `CLIPBOARD_HTML_MAX_BYTES`. */
+export const CLIPBOARD_HTML_MAX_BYTES = 4 * 1024 * 1024
+
+/** v2.1 — combined echo-gate hash for html clipboard content: FNV over
+ *  html bytes + 0x1F separator + canonical text bytes (mirrors the
+ *  agent's `html_event_hash` construction; each side hashes its own
+ *  reads, so only per-side self-consistency is load-bearing). */
+export function hashClipboardHtml(html: string, text: string): string {
+  const enc = new TextEncoder()
+  const h = enc.encode(html)
+  const t = enc.encode(normalizeClipboardText(text))
+  const combined = new Uint8Array(h.length + 1 + t.length)
+  combined.set(h, 0)
+  combined[h.length] = 0x1f
+  combined.set(t, h.length + 1)
+  return hashClipboardBytes(combined)
+}
+
+/** v2.1 — build the wire frames for one browser → agent html transfer:
+ *  `clipboard:html-begin` header, ≤16 KiB binary frames (html UTF-8
+ *  bytes then the plain-text alt), `clipboard:html-end` trailer, one
+ *  shared id. Returns null when the combined payload exceeds the cap.
+ *  Exported for tests. */
+export function buildClipboardHtmlFrames(
+  html: string,
+  text: string,
+): { id: string; begin: string; frames: Uint8Array<ArrayBuffer>[]; end: string } | null {
+  const enc = new TextEncoder()
+  const htmlBytes = enc.encode(html)
+  const textBytes = enc.encode(text)
+  if (htmlBytes.length === 0 || htmlBytes.length + textBytes.length > CLIPBOARD_HTML_MAX_BYTES) {
+    return null
+  }
+  const combined = new Uint8Array(htmlBytes.length + textBytes.length)
+  combined.set(htmlBytes, 0)
+  combined.set(textBytes, htmlBytes.length)
+  const id =
+    'cb-html-' +
+    Date.now().toString(36) +
+    '-' +
+    Math.random().toString(36).slice(2, 10)
+  const frames: Uint8Array<ArrayBuffer>[] = []
+  for (let off = 0; off < combined.length; off += CLIPBOARD_IMG_FRAME_BYTES) {
+    frames.push(combined.subarray(off, Math.min(off + CLIPBOARD_IMG_FRAME_BYTES, combined.length)))
+  }
+  return {
+    id,
+    begin: JSON.stringify({
+      t: 'clipboard:html-begin',
+      id,
+      html_bytes: htmlBytes.length,
+      text_bytes: textBytes.length,
+    }),
+    frames,
+    end: JSON.stringify({ t: 'clipboard:html-end', id }),
   }
 }
 
@@ -1757,6 +1830,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   const supportsClipboardAck = computed(() => clipboardCaps.value.includes('ack'))
   const supportsClipboardEvents = computed(() => clipboardCaps.value.includes('events'))
   const supportsClipboardImages = computed(() => clipboardCaps.value.includes('images'))
+  const supportsClipboardHtml = computed(() => clipboardCaps.value.includes('html'))
   const error = ref<string | null>(null)
   const sessionId = ref<string | null>(null)
   /**
@@ -2182,17 +2256,25 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     pendingClipboardAcks.get(id)?.onSettle()
   }
 
-  /** Rich reads (accept:["image"]) that may resolve as an image
-   *  stream instead of clipboard:content. Keyed by the same req_id
-   *  namespace as pendingClipboardReads. */
-  const pendingClipboardImageReads = new Map<
+  /** Rich reads (accept:["image","html"]) that may resolve as an
+   *  image/html stream instead of clipboard:content. Keyed by the
+   *  same req_id namespace as pendingClipboardReads. */
+  const pendingClipboardRichReads = new Map<
     number,
-    { resolve: (img: { blob: Blob; w: number; h: number }) => void; reject: (err: Error) => void }
+    {
+      resolve: (
+        content:
+          | { kind: 'image'; blob: Blob; w: number; h: number }
+          | { kind: 'html'; html: string; text: string },
+      ) => void
+      reject: (err: Error) => void
+    }
   >()
 
   type RemoteClipContent =
     | { kind: 'text'; text: string }
     | { kind: 'image'; blob: Blob; w: number; h: number }
+    | { kind: 'html'; html: string; text: string }
   /** Latest remote change that arrived while this tab was unfocused
    *  (clipboard writes need document focus). Applied on refocus unless
    *  the operator copied something new locally in the meantime —
@@ -2204,6 +2286,35 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       if (content.kind === 'text') {
         await globalThis.navigator.clipboard.writeText(content.text)
         clipboardEchoGate.recordApplied(hashClipboardText(content.text))
+      } else if (content.kind === 'html') {
+        // v2.1 — both formats in one ClipboardItem: rich-aware local
+        // paste targets take the html, plain editors the text alt.
+        await globalThis.navigator.clipboard.write([
+          new ClipboardItem({
+            'text/html': new Blob([content.html], { type: 'text/html' }),
+            'text/plain': new Blob([content.text], { type: 'text/plain' }),
+          }),
+        ])
+        // Read back — Chrome re-serializes CF_HTML on write; hash what
+        // a later local read will actually see so the echo gate holds.
+        try {
+          const items = await globalThis.navigator.clipboard.read()
+          for (const item of items) {
+            if (item.types.includes('text/html')) {
+              const backHtml = await (await item.getType('text/html')).text()
+              const backText = item.types.includes('text/plain')
+                ? await (await item.getType('text/plain')).text()
+                : ''
+              clipboardEchoGate.recordApplied(hashClipboardHtml(backHtml, backText))
+              // The text alt may surface alone via readText-based
+              // polling — record it too so it isn't re-pushed.
+              if (backText) clipboardEchoGate.recordPushed(hashClipboardText(backText))
+              break
+            }
+          }
+        } catch {
+          clipboardEchoGate.recordApplied(hashClipboardHtml(content.html, content.text))
+        }
       } else {
         await globalThis.navigator.clipboard.write([
           new ClipboardItem({ 'image/png': content.blob }),
@@ -2268,6 +2379,75 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     } catch {
       return null
     }
+  }
+
+  /** v2.1 — stream pre-built rich frames (html or image) with SCTP
+   *  backpressure. Returns false when the DC dies mid-stream. */
+  async function sendRichFramesOverDc(
+    ch: RTCDataChannel,
+    built: { begin: string; frames: Uint8Array<ArrayBuffer>[]; end: string },
+  ): Promise<boolean> {
+    try {
+      ch.send(built.begin)
+      for (const frame of built.frames) {
+        while (ch.bufferedAmount > 4 * 1024 * 1024) {
+          await new Promise((r) => setTimeout(r, 20))
+          if (ch.readyState !== 'open') return false
+        }
+        ch.send(frame)
+      }
+      ch.send(built.end)
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  /** v2.1 — read the local clipboard's text/html (one clipboard.read())
+   *  and push it as an html transfer. Returns true when the change was
+   *  HANDLED (pushed, or recognized as an echo) — the caller then skips
+   *  the plain-text fallback. `textHash` is the readText-derived hash
+   *  that triggered the sync; recorded alongside the combined hash so
+   *  later readText polls don't re-push the text alt. */
+  async function pushLocalHtmlToRemote(ch: RTCDataChannel, textHash: string): Promise<boolean> {
+    let items: ClipboardItems
+    try {
+      items = await globalThis.navigator.clipboard.read()
+    } catch (e) {
+      if (e instanceof DOMException && e.name === 'NotAllowedError') {
+        handleClipboardReadDenied(e)
+      }
+      return false
+    }
+    for (const item of items) {
+      if (!item.types.includes('text/html')) continue
+      let html = ''
+      let text = ''
+      try {
+        html = await (await item.getType('text/html')).text()
+        if (item.types.includes('text/plain')) {
+          text = await (await item.getType('text/plain')).text()
+        }
+      } catch {
+        return false
+      }
+      if (!html) return false
+      const combinedHash = hashClipboardHtml(html, text)
+      if (!clipboardEchoGate.shouldPush(combinedHash)) {
+        // Known rich content (we applied or pushed it) resurfacing via
+        // a fresh readText hash — remember the alt so the caller and
+        // future polls stay quiet.
+        clipboardEchoGate.recordPushed(textHash)
+        return true
+      }
+      const built = buildClipboardHtmlFrames(html, text)
+      if (!built) return false // oversized html → plain-text fallback
+      if (!(await sendRichFramesOverDc(ch, built))) return false
+      clipboardEchoGate.recordPushed(combinedHash)
+      clipboardEchoGate.recordPushed(textHash)
+      return true
+    }
+    return false // no html on the clipboard → plain-text fallback
   }
 
   async function pushLocalImageToRemote(ch: RTCDataChannel): Promise<boolean> {
@@ -2347,6 +2527,13 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       if (normalizeClipboardText(text) !== '') {
         const hash = hashClipboardText(text)
         if (clipboardEchoGate.shouldPush(hash)) {
+          // v2.1 — new content detected via the cheap readText. Prefer
+          // the RICH form when the agent takes html: one clipboard.read()
+          // per actual change (not per poll tick).
+          if (supportsClipboardHtml.value) {
+            const handled = await pushLocalHtmlToRemote(ch, hash)
+            if (handled) return
+          }
           try {
             // RAW text on the wire — see sendClipboardWriteOverDc.
             sendClipboardWriteOverDc(ch, text)
@@ -2377,7 +2564,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
           on
             ? {
                 t: 'clipboard:subscribe',
-                events: supportsClipboardImages.value ? ['text', 'image'] : ['text'],
+                events: [
+                  'text',
+                  ...(supportsClipboardImages.value ? ['image'] : []),
+                  ...(supportsClipboardHtml.value ? ['html'] : []),
+                ],
               }
             : { t: 'clipboard:unsubscribe' },
         ),
@@ -4462,47 +4653,68 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // messages so interleaved reads resolve independently.
     const pendingClipboardReadChunks = new Map<number, string>()
     // v2 — chunked change-event reassembly (keyed by event_id) and the
-    // inbound agent→browser image stream (one at a time; the agent
-    // serializes them). A 15 s inactivity timer drops half streams.
+    // inbound agent→browser rich stream (image OR html — one at a
+    // time; the agent serializes them). A 15 s inactivity timer drops
+    // half streams.
     const pendingClipboardEventChunks = new Map<string, string>()
-    let inboundClipImage: {
+    let inboundClipRich: {
       id: string
+      kind: 'image' | 'html'
       w: number
       h: number
+      htmlBytes: number
       declared: number
       chunks: BlobPart[]
       received: number
       reqId: number | null
       timer: ReturnType<typeof setTimeout>
     } | null = null
-    const dropInboundClipImage = () => {
-      if (inboundClipImage) {
-        clearTimeout(inboundClipImage.timer)
-        inboundClipImage = null
+    const dropInboundClipRich = () => {
+      if (inboundClipRich) {
+        clearTimeout(inboundClipRich.timer)
+        inboundClipRich = null
       }
     }
-    const armInboundClipImageTimer = () => {
-      if (!inboundClipImage) return
-      clearTimeout(inboundClipImage.timer)
-      inboundClipImage.timer = setTimeout(() => {
-        console.debug('[rc] clipboard image stream timed out; dropping')
-        dropInboundClipImage()
+    const armInboundClipRichTimer = () => {
+      if (!inboundClipRich) return
+      clearTimeout(inboundClipRich.timer)
+      inboundClipRich.timer = setTimeout(() => {
+        console.debug('[rc] clipboard rich stream timed out; dropping')
+        dropInboundClipRich()
       }, 15_000)
+    }
+    /** Resolve a completed rich stream: answer to a rich read (req_id)
+     *  or unsolicited change event → apply locally. */
+    const finishInboundClipRich = (content: RemoteClipContent, reqId: number | null) => {
+      if (reqId != null && content.kind !== 'text') {
+        const rich = pendingClipboardRichReads.get(reqId)
+        if (rich) {
+          pendingClipboardRichReads.delete(reqId)
+          const textPending = pendingClipboardReads.get(reqId)
+          if (textPending) {
+            clearTimeout(textPending.timer)
+            pendingClipboardReads.delete(reqId)
+          }
+          rich.resolve(content)
+          return
+        }
+      }
+      applyRemoteClipboard(content)
     }
     channels.clipboard.onmessage = (ev) => {
       if (typeof ev.data !== 'string') {
-        // v2 — binary PNG frame for the announced inbound image.
-        if (!inboundClipImage) return
+        // v2 — binary frame for the announced inbound rich stream.
+        if (!inboundClipRich) return
         const data = ev.data as ArrayBuffer | Blob
         const size = data instanceof Blob ? data.size : data.byteLength
-        if (inboundClipImage.received + size > inboundClipImage.declared) {
-          console.debug('[rc] clipboard image stream overflowed declared bytes; dropping')
-          dropInboundClipImage()
+        if (inboundClipRich.received + size > inboundClipRich.declared) {
+          console.debug('[rc] clipboard rich stream overflowed declared bytes; dropping')
+          dropInboundClipRich()
           return
         }
-        inboundClipImage.chunks.push(data)
-        inboundClipImage.received += size
-        armInboundClipImageTimer()
+        inboundClipRich.chunks.push(data)
+        inboundClipRich.received += size
+        armInboundClipRichTimer()
         return
       }
       let msg: {
@@ -4518,6 +4730,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         w?: number
         h?: number
         bytes?: number
+        html_bytes?: number
+        text_bytes?: number
       }
       try {
         msg = JSON.parse(ev.data)
@@ -4560,45 +4774,70 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         ) {
           return
         }
-        dropInboundClipImage()
-        inboundClipImage = {
+        dropInboundClipRich()
+        inboundClipRich = {
           id: msg.id,
+          kind: 'image',
           w: typeof msg.w === 'number' ? msg.w : 0,
           h: typeof msg.h === 'number' ? msg.h : 0,
+          htmlBytes: 0,
           declared,
           chunks: [],
           received: 0,
           reqId: typeof msg.req_id === 'number' ? msg.req_id : null,
-          timer: setTimeout(() => dropInboundClipImage(), 15_000),
+          timer: setTimeout(() => dropInboundClipRich(), 15_000),
         }
         return
       }
-      if (msg.t === 'clipboard:img-end') {
-        if (!inboundClipImage || inboundClipImage.id !== msg.id) return
-        const img = inboundClipImage
-        clearTimeout(img.timer)
-        inboundClipImage = null
-        if (img.received !== img.declared) {
-          console.debug('[rc] clipboard image stream incomplete; dropping')
+      if (msg.t === 'clipboard:html-begin') {
+        const htmlBytes = typeof msg.html_bytes === 'number' ? msg.html_bytes : 0
+        const textBytes = typeof msg.text_bytes === 'number' ? msg.text_bytes : 0
+        const declared = htmlBytes + textBytes
+        if (
+          typeof msg.id !== 'string' ||
+          htmlBytes <= 0 ||
+          declared > CLIPBOARD_HTML_MAX_BYTES
+        ) {
           return
         }
-        const blob = new Blob(img.chunks, { type: 'image/png' })
-        if (img.reqId != null) {
-          // Answer to a rich read — resolve it (and cancel the text
-          // side of the same req_id).
-          const rich = pendingClipboardImageReads.get(img.reqId)
-          if (rich) {
-            pendingClipboardImageReads.delete(img.reqId)
-            const textPending = pendingClipboardReads.get(img.reqId)
-            if (textPending) {
-              clearTimeout(textPending.timer)
-              pendingClipboardReads.delete(img.reqId)
-            }
-            rich.resolve({ blob, w: img.w, h: img.h })
-            return
-          }
+        dropInboundClipRich()
+        inboundClipRich = {
+          id: msg.id,
+          kind: 'html',
+          w: 0,
+          h: 0,
+          htmlBytes,
+          declared,
+          chunks: [],
+          received: 0,
+          reqId: typeof msg.req_id === 'number' ? msg.req_id : null,
+          timer: setTimeout(() => dropInboundClipRich(), 15_000),
         }
-        applyRemoteClipboard({ kind: 'image', blob, w: img.w, h: img.h })
+        return
+      }
+      if (msg.t === 'clipboard:img-end' || msg.t === 'clipboard:html-end') {
+        if (!inboundClipRich || inboundClipRich.id !== msg.id) return
+        const rich = inboundClipRich
+        clearTimeout(rich.timer)
+        inboundClipRich = null
+        if (rich.received !== rich.declared) {
+          console.debug('[rc] clipboard rich stream incomplete; dropping')
+          return
+        }
+        if (rich.kind === 'image') {
+          const blob = new Blob(rich.chunks, { type: 'image/png' })
+          finishInboundClipRich({ kind: 'image', blob, w: rich.w, h: rich.h }, rich.reqId)
+        } else {
+          // html — decode the combined bytes and split at the declared
+          // html length (both halves are UTF-8 strings).
+          void new Blob(rich.chunks).arrayBuffer().then((buf) => {
+            const bytes = new Uint8Array(buf)
+            const dec = new TextDecoder('utf-8')
+            const html = dec.decode(bytes.subarray(0, rich.htmlBytes))
+            const text = dec.decode(bytes.subarray(rich.htmlBytes))
+            finishInboundClipRich({ kind: 'html', html, text }, rich.reqId)
+          })
+        }
         return
       }
       if (msg.t === 'clipboard:content') {
@@ -4647,9 +4886,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         settleClipboardAck(msg.id)
         const reqId = typeof msg.req_id === 'number' ? msg.req_id : null
         if (reqId == null) return
-        const rich = pendingClipboardImageReads.get(reqId)
+        const rich = pendingClipboardRichReads.get(reqId)
         if (rich) {
-          pendingClipboardImageReads.delete(reqId)
+          pendingClipboardRichReads.delete(reqId)
           rich.reject(new Error(msg.message || 'agent clipboard error'))
         }
         const pending = pendingClipboardReads.get(reqId)
@@ -5524,6 +5763,41 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       // Text path: mirror to host clipboard so the remote app's
       // paste sees the right content, then emit the Ctrl+V keystroke.
       const text = dt.getData('text') ?? ''
+      // v2.1 — rich paste: the paste event exposes text/html
+      // SYNCHRONOUSLY (no clipboard.read() needed). When the agent
+      // takes html, ship both formats so the remote app pastes
+      // formatting (tables, bold, web images), ack-gated like text.
+      const html = dt.getData('text/html') ?? ''
+      if (html && supportsClipboardHtml.value) {
+        const ch = channels.clipboard
+        if (ch && ch.readyState === 'open') {
+          const combinedHash = hashClipboardHtml(html, text)
+          if (clipboardEchoGate.knows(combinedHash)) {
+            flushPendingCtrlV()
+            return
+          }
+          const built = buildClipboardHtmlFrames(html, text)
+          if (built) {
+            if (pendingCtrlV?.timer) {
+              clearTimeout(pendingCtrlV.timer)
+              pendingCtrlV.timer = null
+            }
+            void (async () => {
+              const ok = await sendRichFramesOverDc(ch, built)
+              if (ok) {
+                clipboardEchoGate.recordPushed(combinedHash)
+                if (text) clipboardEchoGate.recordPushed(hashClipboardText(text))
+                if (supportsClipboardAck.value) {
+                  await awaitClipboardAck(built.id, CLIPBOARD_ACK_TIMEOUT_MS)
+                }
+              }
+              flushPendingCtrlV()
+            })()
+            return
+          }
+          // Oversized html → fall through to the plain-text path.
+        }
+      }
       if (text) {
         const ch = channels.clipboard
         if (ch && ch.readyState === 'open') {
@@ -5685,14 +5959,21 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   }
 
   /** v2 — rich clipboard read: like [`getAgentClipboard`] but also
-   *  accepts an IMAGE reply when the host clipboard holds one and the
-   *  agent advertises the `images` cap. Resolves with a tagged union;
-   *  `{kind:'text', text:''}` means the host clipboard is empty.
-   *  Falls back to the text-only read against old agents. */
+   *  accepts an IMAGE or HTML reply when the host clipboard holds one
+   *  and the agent advertises the matching cap. Resolves with a tagged
+   *  union; `{kind:'text', text:''}` means the host clipboard is
+   *  empty. Falls back to the text-only read against old agents. */
   async function getAgentClipboardRich(): Promise<
-    { kind: 'text'; text: string } | { kind: 'image'; blob: Blob; w: number; h: number }
+    | { kind: 'text'; text: string }
+    | { kind: 'image'; blob: Blob; w: number; h: number }
+    | { kind: 'html'; html: string; text: string }
   > {
-    if (!supportsClipboardImages.value) {
+    const accept = [
+      'text',
+      ...(supportsClipboardImages.value ? ['image'] : []),
+      ...(supportsClipboardHtml.value ? ['html'] : []),
+    ]
+    if (accept.length === 1) {
       const text = await getAgentClipboard()
       return { kind: 'text', text }
     }
@@ -5711,7 +5992,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       function cleanup() {
         clearTimeout(timer)
         pendingClipboardReads.delete(reqId)
-        pendingClipboardImageReads.delete(reqId)
+        pendingClipboardRichReads.delete(reqId)
       }
       pendingClipboardReads.set(reqId, {
         resolve: (text) => {
@@ -5724,10 +6005,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         },
         timer,
       })
-      pendingClipboardImageReads.set(reqId, {
-        resolve: (img) => {
+      pendingClipboardRichReads.set(reqId, {
+        resolve: (content) => {
           cleanup()
-          resolve({ kind: 'image', ...img })
+          resolve(content)
         },
         reject: (e) => {
           cleanup()
@@ -5735,9 +6016,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         },
       })
       try {
-        ch.send(
-          JSON.stringify({ t: 'clipboard:read', req_id: reqId, accept: ['text', 'image'] }),
-        )
+        ch.send(JSON.stringify({ t: 'clipboard:read', req_id: reqId, accept }))
       } catch (e) {
         cleanup()
         reject(e instanceof Error ? e : new Error(String(e)))
@@ -6800,6 +7079,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     clipboardSyncBlocked,
     supportsClipboardEvents,
     supportsClipboardImages,
+    supportsClipboardHtml,
     sendCtrlAltDel,
     uploadFile,
     uploadFiles,
