@@ -363,13 +363,21 @@ fn fmt_peer_row(p: &PeerInfo, now_ms: u64) -> String {
     } else {
         p.name.clone()
     };
+    // P8-cosmetics — a relay peer with a make-before-break direct probe in
+    // flight renders as `upgrading`: a snapshot taken mid-transition reads as
+    // what it is instead of contradicting the latency the user just measured.
+    let conn = if p.upgrading && matches!(p.connection, ConnectionType::Relay) {
+        "upgrading".to_string()
+    } else {
+        connection_label(p.connection).to_string()
+    };
     format!(
-        "{} {:<20} {:<16} {:<26} {:<8} {:>7} {}",
+        "{} {:<20} {:<16} {:<26} {:<9} {:>7} {}",
         up_glyph(p.online),
         name,
         opt(p.overlay_ip.as_deref()),
         opt(p.overlay_ip6.as_deref()),
-        connection_label(p.connection),
+        conn,
         rtt,
         fmt_last_seen(p.last_seen_ms, now_ms),
     )
@@ -450,7 +458,7 @@ fn print_status(s: &NodeStatus) {
 
 fn print_peers(peers: &[PeerInfo], now_ms: u64) {
     println!(
-        "  {:<20} {:<16} {:<26} {:<8} {:>7} LAST SEEN",
+        "  {:<20} {:<16} {:<26} {:<9} {:>7} LAST SEEN",
         "NAME", "OVERLAY IP", "OVERLAY IP6", "CONN", "RTT"
     );
     if peers.is_empty() {
@@ -613,6 +621,7 @@ mod tests {
             overlay_ip6: Some("fd72:6f6f:6d6c::6440:1".into()),
             online: true,
             connection: ConnectionType::Tunnel,
+            upgrading: false,
             rtt_ms: Some(52),
             last_seen_ms: Some(now - 3_000),
             agent_id: None,
@@ -635,6 +644,7 @@ mod tests {
             overlay_ip6: None,
             online: false,
             connection: ConnectionType::Offline,
+            upgrading: false,
             rtt_ms: None,
             last_seen_ms: None,
             agent_id: None,
@@ -657,6 +667,7 @@ mod tests {
             overlay_ip6: None,
             online: true,
             connection: ConnectionType::Direct,
+            upgrading: false,
             rtt_ms: None,
             last_seen_ms: None,
             agent_id: None,
