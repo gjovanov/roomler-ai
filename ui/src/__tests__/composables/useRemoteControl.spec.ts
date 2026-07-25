@@ -66,6 +66,9 @@ import {
   settingsToCodecChoice,
   parseLocalRelayDescriptor,
   localRelayIceServer,
+  LOCAL_RELAY_PROBE_PORT,
+  LOCAL_RELAY_PROBE_PORTS,
+  clipboardBridgeUrl,
   storedDecodePref,
   type AutoTransportInputs,
   type KeyDecision,
@@ -2515,6 +2518,22 @@ describe('layoutSetWireMessage (rc.227)', () => {
     expect(layoutSetWireMessage('xyz')).toBeNull()
     expect(layoutSetWireMessage('0407 0407')).toBeNull()
     expect(layoutSetWireMessage('0123456789abcdef0')).toBeNull()
+  })
+})
+
+describe('loopback discovery port range (v2.2 multi-agent)', () => {
+  it('the candidate range starts at the primary port and is contiguous', () => {
+    expect(LOCAL_RELAY_PROBE_PORTS[0]).toBe(LOCAL_RELAY_PROBE_PORT)
+    for (let i = 1; i < LOCAL_RELAY_PROBE_PORTS.length; i++) {
+      expect(LOCAL_RELAY_PROBE_PORTS[i]).toBe(LOCAL_RELAY_PROBE_PORTS[i - 1] + 1)
+    }
+    // Must match the agent's PROBE_PORT_COUNT = 5.
+    expect(LOCAL_RELAY_PROBE_PORTS.length).toBe(5)
+  })
+
+  it('clipboardBridgeUrl builds a loopback URL for any candidate port', () => {
+    expect(clipboardBridgeUrl(47989)).toBe('http://127.0.0.1:47989/rc-clipboard')
+    expect(clipboardBridgeUrl(47990)).toBe('http://127.0.0.1:47990/rc-clipboard')
   })
 })
 
