@@ -379,6 +379,21 @@ const REUPGRADE_EVERY_N_TICKS: u32 = 6;
 fn direct_retry_cooldown(tier: DirectTier, fails: u32) -> Duration {
     let (max, deny) = match tier {
         DirectTier::Srflx => (SRFLX_MAX_FAILURES, SRFLX_DENY_COOLDOWN),
+        // P8 — the LAN tier NEVER escalates while make-before-break is on:
+        // a LAN retry is a zero-disruption shadow probe (one UDP dial + a
+        // 12 s handshake attempt from an already-bound socket; the relay
+        // keeps routing), so giving up only delays convergence. Field
+        // 2026-07-25: after a hibernate wake-up, both ends' 2-strike denies
+        // de-synchronized their probe windows and two willing same-desk
+        // peers missed each other for hours. With a fixed 60 s spacing on
+        // BOTH ends, bilateral punch alignment is guaranteed within ~1-2
+        // cycles (dial pinholes outlive the probe window). The pre-MBB
+        // escalation is kept when MBB is env-disabled — there a retry
+        // still tears down the working relay, and the VPN-pool false-/24
+        // flap the deny was built for (rc.204) would return.
+        DirectTier::Lan if super::direct::make_before_break_enabled() => {
+            return DIRECT_COOLDOWN;
+        }
         _ => (DIRECT_MAX_FAILURES, DIRECT_DENY_COOLDOWN),
     };
     if fails >= max { deny } else { DIRECT_COOLDOWN }
@@ -386,9 +401,12 @@ fn direct_retry_cooldown(tier: DirectTier, fails: u32) -> Duration {
 
 /// The consecutive-failure count at which a tier escalates to its session-sticky
 /// deny (the `sticky` log/decision in the sweep). Mirrors [`direct_retry_cooldown`].
+/// P8 — `u32::MAX` for the LAN tier under MBB: it never sticks (see
+/// [`direct_retry_cooldown`]).
 fn direct_max_failures(tier: DirectTier) -> u32 {
     match tier {
         DirectTier::Srflx => SRFLX_MAX_FAILURES,
+        DirectTier::Lan if super::direct::make_before_break_enabled() => u32::MAX,
         _ => DIRECT_MAX_FAILURES,
     }
 }
@@ -401,6 +419,21 @@ const RELAY_REFRESH_COOLDOWN: Duration = Duration::from_secs(30);
 /// How often the carrier-health sweep runs. Cheap (lock-free atomic reads), so
 /// a tighter cadence is fine and makes detection quicker.
 const FALLBACK_TICK: Duration = Duration::from_secs(5);
+/// P8 — resume-from-suspend detection threshold: across one sweep interval,
+/// wall-clock advancing this much MORE than the monotonic clock means the host
+/// slept in between (monotonic clocks exclude suspend on Windows and Linux —
+/// QPC and CLOCK_MONOTONIC both stop). Well above any NTP step correction.
+const RESUME_SKEW_THRESHOLD: Duration = Duration::from_secs(120);
+
+/// P8 — did the host suspend between two sweep samples? Pure (tested with
+/// synthetic deltas). On resume every installed carrier is dead (NAT
+/// mappings/firewall pinholes expired, peers tore their ends down while we
+/// slept) and every cooldown is stale evidence — the caller drops both and
+/// re-coordinates from scratch, exactly like a fresh session but without
+/// losing the WS or the TUN.
+fn resumed_from_suspend(mono_elapsed: Duration, wall_elapsed: Duration) -> bool {
+    wall_elapsed > mono_elapsed + RESUME_SKEW_THRESHOLD
+}
 /// How often to re-assert per-peer `/32` routes on the overlay NIC (rc.146).
 /// A full-tunnel VPN (Check Point) keeps re-installing a competing `/32` for
 /// each overlay IP via its own NIC that swallows overlay traffic; the route
@@ -1601,6 +1634,10 @@ impl OverlayRuntime {
         // never stacks concurrent delete-then-add mutations on the same prefix.
         let route_reassert_lock = Arc::new(tokio::sync::Mutex::new(()));
 
+        // P8 — resume-from-suspend detector state (see `resumed_from_suspend`):
+        // one (monotonic, wall) sample per sweep tick.
+        let mut resume_probe = (Instant::now(), SystemTime::now());
+
         // rc.213 — dedicated outbound TUN reader (the Windows 1–2 s batching
         // fix). `tokio::select!` DROPS every losing arm's future each
         // iteration; a dropped `tun.read_packet()` future on Windows leaves its
@@ -1733,6 +1770,47 @@ impl OverlayRuntime {
                 // doesn't immediately re-upgrade it to direct).
                 _ = fallback.tick() => {
                     let t_arm = Instant::now();
+                    // P8 — resume-from-suspend: wall-vs-monotonic skew across
+                    // the tick means the host slept. Every installed carrier is
+                    // dead (NAT/pinhole state expired; peers tore their ends
+                    // down while we slept) and every cooldown is stale
+                    // evidence — drop both and re-coordinate NOW instead of
+                    // letting the sweeps discover the corpses one deadline at
+                    // a time (field 2026-07-25: a hibernate wake-up left the
+                    // mesh relay-wedged for hours).
+                    let (prev_mono, prev_wall) = resume_probe;
+                    let wall_elapsed = SystemTime::now()
+                        .duration_since(prev_wall)
+                        .unwrap_or_default();
+                    let mono_elapsed = prev_mono.elapsed();
+                    resume_probe = (Instant::now(), SystemTime::now());
+                    if resumed_from_suspend(mono_elapsed, wall_elapsed) {
+                        warn!(
+                            slept_s = wall_elapsed.as_secs(),
+                            "overlay: resume from suspend — dropping all carriers + cooldowns for fresh re-coordination"
+                        );
+                        let nids: Vec<ObjectId> = by_node.keys().copied().collect();
+                        for nid in nids {
+                            if let Some(e) = by_node.remove(&nid) {
+                                wg.remove_peer(&e.pubkey).await;
+                                tun.del_peer_route(e.overlay_ip).await;
+                            }
+                            if let Some(r) = relay.as_mut() {
+                                r.forget(&nid);
+                            }
+                            alloc_q.invalidate(&nid);
+                            relay_bq.invalidate(&nid);
+                        }
+                        cooldowns = DirectCooldowns::default();
+                        relay_refresh_cooldown.clear();
+                        let peers_now: Vec<NetmapPeer> = current_peers.values().cloned().collect();
+                        self.install_peers(
+                            &mut wg, &mut by_node, &mut relay, &tun, &peers_now,
+                            direct_ctx.as_ref(), &cooldowns, &mut upgrade_probes, &mut relay_bq,
+                        ).await;
+                        self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
+                        self.publish_view(&self_ip, &by_node, &current_peers, exit_node_status(self.exit_node.as_deref(), &exit_state));
+                    }
                     let t0 = Instant::now();
                     self.sweep_carrier_health(
                         &mut wg, &mut by_node, &mut relay, &tun,
@@ -2404,6 +2482,16 @@ impl OverlayRuntime {
                         && direct::srflx_punch_worth_trying(
                             ctx.my_nat.as_deref(),
                             cfg.srflx_nat.as_deref(),
+                        )
+                        // P8 — same-NAT pair with a LAN candidate: the punch
+                        // is a hairpin that consumer NATs won't do; the LAN
+                        // tier is the one that works. Skip the futile 12 s
+                        // attempt on every tick.
+                        && !direct::srflx_hairpin_pointless(
+                            ctx.punch.as_ref().map(|(s, _)| s.as_str()),
+                            &cfg.srflx_endpoints,
+                            direct::pick_same_subnet_endpoint(&ctx.my_ips, &cfg.lan_endpoints)
+                                .is_some(),
                         ))
                     .then(|| direct::pick_public_endpoint(&ctx.my_ips, &cfg.srflx_endpoints))
                     .flatten()
@@ -3661,9 +3749,11 @@ mod tests {
             direct_retry_cooldown(DirectTier::Public, DIRECT_MAX_FAILURES),
             DIRECT_DENY_COOLDOWN
         );
+        // P8 — LAN under MBB (the default) never escalates; the sticky pin is
+        // Public/srflx-only now (see `lan_tier_never_escalates_under_mbb`).
         assert_eq!(
             direct_retry_cooldown(DirectTier::Lan, DIRECT_MAX_FAILURES + 3),
-            DIRECT_DENY_COOLDOWN
+            DIRECT_COOLDOWN
         );
         // Phase C — the srflx tier has its OWN thresholds: one MORE plain retry
         // (SRFLX_MAX_FAILURES = 3 > 2), and a SHORTER, non-24 h deny (NAT
@@ -3683,6 +3773,51 @@ mod tests {
         // outlast the plain retry cooldown so escalation still means something.
         assert!(SRFLX_DENY_COOLDOWN <= DIRECT_DENY_COOLDOWN);
         assert!(DIRECT_DENY_COOLDOWN > DIRECT_COOLDOWN * 5);
+    }
+
+    /// P8 — with MBB on (the default), the LAN tier NEVER escalates to a
+    /// deny: shadow probes are free, so the retry cadence stays fixed at the
+    /// plain cooldown no matter the strike count; and the sticky threshold is
+    /// unreachable. (Env untouched — MBB defaults on; the kill-switch path is
+    /// covered by direct.rs's env-serialised test.)
+    #[test]
+    fn lan_tier_never_escalates_under_mbb() {
+        assert!(super::super::direct::make_before_break_enabled());
+        for fails in [0, 1, 2, 10, 1000] {
+            assert_eq!(
+                direct_retry_cooldown(DirectTier::Lan, fails),
+                DIRECT_COOLDOWN,
+                "LAN retry spacing must stay fixed at fails={fails}"
+            );
+        }
+        assert_eq!(direct_max_failures(DirectTier::Lan), u32::MAX);
+        // Public keeps the escalation (probing a dead public endpoint across
+        // the internet forever is a different cost profile).
+        assert_eq!(
+            direct_retry_cooldown(DirectTier::Public, DIRECT_MAX_FAILURES),
+            DIRECT_DENY_COOLDOWN
+        );
+    }
+
+    /// P8 — the resume detector: fires only when wall-clock outran the
+    /// monotonic clock by more than the threshold (suspend), not on NTP-step
+    /// noise or ordinary ticks.
+    #[test]
+    fn resume_detector_fires_on_suspend_skew_only() {
+        let tick = Duration::from_secs(5);
+        assert!(!resumed_from_suspend(tick, tick), "ordinary tick");
+        assert!(
+            !resumed_from_suspend(tick, tick + Duration::from_secs(60)),
+            "NTP step below threshold"
+        );
+        assert!(
+            resumed_from_suspend(tick, tick + Duration::from_secs(3600)),
+            "an hour of sleep must fire"
+        );
+        assert!(
+            !resumed_from_suspend(Duration::from_secs(3600), Duration::from_secs(3600)),
+            "long but consistent gap (loop stalled, no sleep) must not fire"
+        );
     }
 
     /// rc.225 — an endpoint change wipes every tier's cooldown + strike count
