@@ -506,6 +506,16 @@ async fn connect_once(
     // `rc:sdp.offer` time where the AgentPeer + (optional) audio pump
     // are built.
     let mut pending_audio: HashMap<bson::oid::ObjectId, bool> = HashMap::new();
+    // Clipboard-v2 hardening: session permission bitfield from
+    // `rc:request`, consumed at `rc:sdp.offer` time so the AgentPeer's
+    // DC handlers can enforce it (today: the clipboard handler).
+    // Missing entry (test harness skipped rc:request) → the
+    // `Permissions` default (VIEW | INPUT | CLIPBOARD), which matches
+    // pre-v2 behavior.
+    let mut pending_permissions: HashMap<
+        bson::oid::ObjectId,
+        roomler_ai_remote_control::permissions::Permissions,
+    > = HashMap::new();
     // T2.10d: one `AgentTunnelPeer` per active `roomler-tunnel`
     // session. Distinct map from `peers` (remote-control sessions)
     // because the namespaces don't overlap and the lifecycles
@@ -625,6 +635,7 @@ async fn connect_once(
                                 &mut pending_transports,
                                 &mut pending_chroma,
                                 &mut pending_audio,
+                                &mut pending_permissions,
                                 &mut tunnel_peers,
                                 &mut tunnel_quic_peers,
                                 &outbound_tx,
@@ -672,6 +683,10 @@ async fn handle_server_msg(
     pending_transports: &mut HashMap<bson::oid::ObjectId, Option<String>>,
     pending_chroma: &mut HashMap<bson::oid::ObjectId, Option<String>>,
     pending_audio: &mut HashMap<bson::oid::ObjectId, bool>,
+    pending_permissions: &mut HashMap<
+        bson::oid::ObjectId,
+        roomler_ai_remote_control::permissions::Permissions,
+    >,
     tunnel_peers: &mut HashMap<bson::oid::ObjectId, Arc<crate::tunnel::peer::AgentTunnelPeer>>,
     tunnel_quic_peers: &mut HashMap<
         bson::oid::ObjectId,
@@ -739,6 +754,10 @@ async fn handle_server_msg(
             // above.
             let audio_negotiated = audio_enabled && !our_caps.audio.is_empty();
             pending_audio.insert(session_id, audio_negotiated);
+            // Clipboard-v2 hardening — stash the session's permission
+            // bitfield so the SdpOffer handler can hand it to the
+            // AgentPeer's DC handlers for enforcement.
+            pending_permissions.insert(session_id, permissions);
             info!(
                 %session_id, %controller_user_id, %controller_name,
                 ?permissions, consent_timeout_secs,
@@ -878,6 +897,11 @@ async fn handle_server_msg(
             // Missing (session skipped rc:request in a test harness) →
             // no audio track, the safe default.
             let audio_enabled = pending_audio.remove(&session_id).unwrap_or(false);
+            // Pull the session permissions stashed by the Request
+            // handler. Missing (harness skipped rc:request) → the
+            // Permissions default (VIEW | INPUT | CLIPBOARD) so those
+            // flows behave exactly as pre-v2.
+            let permissions = pending_permissions.remove(&session_id).unwrap_or_default();
 
             let peer = match AgentPeer::new(
                 session_id,
@@ -888,6 +912,7 @@ async fn handle_server_msg(
                 negotiated_transport,
                 chroma_pref,
                 audio_enabled,
+                permissions,
             )
             .await
             {
@@ -961,6 +986,7 @@ async fn handle_server_msg(
             pending_codecs.remove(&session_id);
             pending_transports.remove(&session_id);
             pending_audio.remove(&session_id);
+            pending_permissions.remove(&session_id);
             indicator.hide_session(session_id.to_hex());
         }
 
@@ -1002,6 +1028,7 @@ async fn handle_server_msg(
             pending_transports.clear();
             pending_chroma.clear();
             pending_audio.clear();
+            pending_permissions.clear();
             return match reason {
                 AgentCloseReason::AgentDeleted | AgentCloseReason::PolicyRejected => {
                     Err(ConnectError::FatalGoodbye { reason, message })

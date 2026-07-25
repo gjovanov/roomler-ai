@@ -1,41 +1,51 @@
 //! Clipboard data-channel handler.
 //!
-//! Round-trip text clipboard between the browser controller and the
-//! agent host over the WebRTC `clipboard` data channel (reliable +
-//! ordered). Today text-only — images / HTML / files are out of scope
-//! for the first pass; the file-transfer DC has its own MEDIUM Known
-//! Issue that's still open.
+//! Round-trip clipboard content between the browser controller and
+//! the agent host over the WebRTC `clipboard` data channel (a
+//! reliable, ordered DC). Protocol v2 (0.3.0-rc.227+) carries text
+//! AND PNG images, write-acks, and unsolicited change events for
+//! auto-sync; every v2 element is additive so v1 peers interoperate
+//! untouched.
 //!
-//! Wire protocol (JSON on the `clipboard` DC):
+//! Wire protocol (JSON control frames + raw binary image frames):
 //!
 //! ```text
-//! // Browser -> Agent (single-envelope — used for texts ≤12 KB UTF-8)
-//! { "t": "clipboard:write", "text": "hello" }
-//! { "t": "clipboard:read" }
-//!
-//! // Browser -> Agent (chunked — rc.44+ — used for texts > 12 KB UTF-8)
+//! // Browser -> Agent
+//! { "t": "clipboard:write", "text": "hello", "id": "cb-…"? }        // id v2: requests an ack
 //! { "t": "clipboard:write-chunk", "id": "abc123", "seq": 0, "text": "...", "last": false }
-//! { "t": "clipboard:write-chunk", "id": "abc123", "seq": 1, "text": "...", "last": true }
+//! { "t": "clipboard:read", "req_id": 42?, "accept": ["text","image"]? }
+//! { "t": "clipboard:subscribe", "events": ["text","image"] }        // v2 auto-sync
+//! { "t": "clipboard:unsubscribe" }                                  // v2
+//! { "t": "clipboard:img-begin", "id": "cb-…", "w": 1920, "h": 1080,
+//!   "bytes": 123456, "format": "png" }                              // v2, then ≤16 KiB binary frames
+//! { "t": "clipboard:img-end", "id": "cb-…" }                        // v2
 //!
-//! // Agent -> Browser (single-envelope — texts ≤12 KB UTF-8)
+//! // Agent -> Browser
 //! { "t": "clipboard:content", "text": "hello", "req_id": Option<u64> }
-//! { "t": "clipboard:error",   "message": "reason", "req_id": Option<u64> }
-//!
-//! // Agent -> Browser (chunked — rc.44+ — texts > 12 KB UTF-8)
-//! { "t": "clipboard:content-chunk", "req_id": Option<u64>, "seq": 0, "text": "...", "last": false }
-//! { "t": "clipboard:content-chunk", "req_id": Option<u64>, "seq": 1, "text": "...", "last": true }
+//! { "t": "clipboard:content-chunk", "req_id": …, "seq": 0, "text": "...", "last": false }
+//! { "t": "clipboard:write-ack", "id": "cb-…", "bytes": 5 }          // v2, only for id-stamped writes
+//! { "t": "clipboard:event", "kind": "text", "text": "..." }         // v2, after subscribe
+//! { "t": "clipboard:event-chunk", "event_id": "ev-1", "seq": 0, "text": "...", "last": false }
+//! { "t": "clipboard:img-begin", "id": "aimg-0", "w": …, "h": …, "bytes": …,
+//!   "format": "png", "req_id": Option<u64> }                        // v2, then 64 KiB binary frames
+//! { "t": "clipboard:img-end", "id": "aimg-0", "bytes": … }          // v2
+//! { "t": "clipboard:error", "message": "reason", "req_id": Option<u64>, "id": Option<String> }
 //! ```
 //!
 //! `req_id` round-trips an optional u64 from the read request so the
-//! browser can pair responses to its requests if it interleaves
-//! multiple reads. Omitted on unsolicited change notifications (not
-//! emitted today — the browser drives all reads explicitly to avoid
-//! privacy surprises on the controlled host).
+//! browser can pair responses to its requests. On an image reply it
+//! distinguishes "answer to your read" (present) from "unsolicited
+//! change event" (absent). Text is canonical LF on the wire; the
+//! worker converts to the host's convention (`CRLF` on Windows) on
+//! every write and back on every read — see [`host_to_wire`] /
+//! [`wire_to_host`]. Change events are pushed only after an explicit
+//! `clipboard:subscribe`, and the CLIPBOARD permission bit gates the
+//! whole DC (enforced in `peer.rs::attach_clipboard_handler`).
 //!
 //! rc.44 — chunked variants. The single-envelope `clipboard:write`
 //! shape sent a `text` field unbounded by length, which on payloads
-//! >~50 KB hit webrtc-rs's SCTP `max_message_size=65536` default and
-//! threw `failed to handle_inbound: ErrChunk`, killing the data
+//! over ~50 KB hit webrtc-rs's SCTP `max_message_size=65536` default
+//! and threw `failed to handle_inbound: ErrChunk`, killing the data
 //! channel + session (a third field-test host field repro 2026-05-19, every 1-2 min
 //! sessions). The chunked variants cap each envelope at ~14 KB to
 //! stay well under the SCTP ceiling; the receiver reassembles by
@@ -67,6 +77,27 @@ pub(crate) enum ClipboardCmd {
         text: String,
         reply: oneshot::Sender<Result<()>>,
     },
+    /// v2 — read the host clipboard as a PNG image. `Ok(None)` when
+    /// the clipboard holds no image content.
+    ReadImage {
+        reply: oneshot::Sender<Result<Option<PngImage>>>,
+    },
+    /// v2 — decode the PNG and place it on the host clipboard.
+    WriteImage {
+        png: Vec<u8>,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    /// v2 — install the change watcher (replaces any existing one).
+    /// The worker switches from blocking `recv()` to a tick loop and
+    /// pushes [`ClipboardChange`]s into `tx` when the HOST clipboard
+    /// changes. Fire-and-forget: no reply.
+    Watch {
+        events: WatchEvents,
+        tx: tokio::sync::mpsc::Sender<ClipboardChange>,
+    },
+    /// v2 — remove the change watcher (browser unsubscribed or the
+    /// DC closed). Fire-and-forget.
+    Unwatch,
     /// Kept as an affordance for future deterministic shutdowns (e.g.
     /// a test harness that wants to join the worker). Today the
     /// `Clipboard` handle has no Drop impl — dropping the last
@@ -106,21 +137,53 @@ impl Clipboard {
                         return;
                     }
                 };
-                while let Ok(cmd) = rx.recv() {
+                // Content the worker itself last wrote (remote-initiated
+                // writes) — the change watcher compares against these so
+                // a browser-originated write is never echoed back to the
+                // browser as a "host change".
+                let mut marks = SelfMarks::default();
+                let mut watch: Option<WatcherState> = None;
+                loop {
+                    // Block indefinitely when nothing is watching (the
+                    // pre-v2 behavior — zero idle wakeups); poll at the
+                    // tick cadence while a watcher is installed.
+                    let cmd = if watch.is_some() {
+                        match rx.recv_timeout(WATCH_TICK) {
+                            Ok(c) => Some(c),
+                            Err(std_mpsc::RecvTimeoutError::Timeout) => None,
+                            Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
+                        }
+                    } else {
+                        match rx.recv() {
+                            Ok(c) => Some(c),
+                            Err(_) => break,
+                        }
+                    };
                     match cmd {
-                        ClipboardCmd::Read { reply } => {
-                            let res = cb
-                                .get_text()
-                                .map_err(|e| anyhow::anyhow!("clipboard get_text: {e}"));
-                            let _ = reply.send(res);
+                        Some(ClipboardCmd::Read { reply }) => {
+                            let _ = reply.send(worker_read_text(&mut cb));
                         }
-                        ClipboardCmd::Write { text, reply } => {
-                            let res = cb
-                                .set_text(text)
-                                .map_err(|e| anyhow::anyhow!("clipboard set_text: {e}"));
-                            let _ = reply.send(res);
+                        Some(ClipboardCmd::Write { text, reply }) => {
+                            let _ = reply.send(worker_write_text(&mut cb, &text, &mut marks));
                         }
-                        ClipboardCmd::Shutdown => break,
+                        Some(ClipboardCmd::ReadImage { reply }) => {
+                            let _ = reply.send(worker_read_image(&mut cb));
+                        }
+                        Some(ClipboardCmd::WriteImage { png, reply }) => {
+                            let _ = reply.send(worker_write_image(&mut cb, &png, &mut marks));
+                        }
+                        Some(ClipboardCmd::Watch { events, tx }) => {
+                            watch = Some(install_watcher(&mut cb, events, tx));
+                        }
+                        Some(ClipboardCmd::Unwatch) => {
+                            watch = None;
+                        }
+                        Some(ClipboardCmd::Shutdown) => break,
+                        None => {
+                            if let Some(w) = watch.as_mut() {
+                                watch_tick(&mut cb, w, &marks);
+                            }
+                        }
                     }
                 }
             })
@@ -161,15 +224,409 @@ impl Clipboard {
             .await
             .map_err(|_| anyhow::anyhow!("clipboard worker dropped reply"))?
     }
+
+    /// v2 — read the host clipboard as a PNG image. `Ok(None)` when
+    /// the clipboard holds no image content.
+    pub async fn read_image(&self) -> Result<Option<PngImage>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(ClipboardCmd::ReadImage { reply: reply_tx })
+            .map_err(|_| anyhow::anyhow!("clipboard worker gone"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("clipboard worker dropped reply"))?
+    }
+
+    /// v2 — decode `png` and place it on the host clipboard.
+    pub async fn write_image(&self, png: Vec<u8>) -> Result<()> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(ClipboardCmd::WriteImage {
+                png,
+                reply: reply_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("clipboard worker gone"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("clipboard worker dropped reply"))?
+    }
+
+    /// v2 — install the change watcher (replaces any existing one).
+    /// Changes arrive on `tx`; the worker drops pushes when the
+    /// channel is full and retries on the next tick.
+    pub(crate) fn watch(
+        &self,
+        events: WatchEvents,
+        tx: tokio::sync::mpsc::Sender<ClipboardChange>,
+    ) -> Result<()> {
+        self.tx
+            .send(ClipboardCmd::Watch { events, tx })
+            .map_err(|_| anyhow::anyhow!("clipboard worker gone"))
+    }
+
+    /// v2 — remove the change watcher. Idempotent, fire-and-forget.
+    pub(crate) fn unwatch(&self) {
+        let _ = self.tx.send(ClipboardCmd::Unwatch);
+    }
 }
 
 // No Drop impl. `Clipboard` is `Clone` (the Sender is Arc'd internally);
 // a Drop-sends-Shutdown would fire on every clone drop, including the
 // first, killing the worker prematurely. With no Drop, the worker
 // exits naturally when all Sender clones are dropped and `rx.recv()`
-// returns `Err(RecvError)` — which ends the `while let Ok(cmd) ...`
-// loop. `ClipboardCmd::Shutdown` is still honoured for deterministic
-// shutdowns inside the test suite.
+// returns `Err(RecvError)` — which ends the worker loop. `ClipboardCmd::
+// Shutdown` is still honoured for deterministic shutdowns inside the
+// test suite.
+
+// ── Clipboard protocol v2: change watcher + images ──────────────────────────
+
+/// Which change kinds a [`ClipboardCmd::Watch`] subscription wants
+/// pushed. Image watching is honoured on Windows only (no cheap
+/// change signal elsewhere — see [`watch_tick`]).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct WatchEvents {
+    pub text: bool,
+    pub image: bool,
+}
+
+/// A PNG-encoded clipboard image (the wire form on the clipboard DC).
+#[derive(Debug, Clone)]
+pub struct PngImage {
+    pub w: u32,
+    pub h: u32,
+    pub png: Vec<u8>,
+}
+
+/// Host-clipboard change pushed to a [`ClipboardCmd::Watch`] subscriber.
+#[derive(Debug)]
+pub(crate) enum ClipboardChange {
+    Text(String),
+    Image(PngImage),
+}
+
+/// Watcher tick cadence. Windows gets a fast tick because the
+/// unchanged-path is a single `GetClipboardSequenceNumber` syscall
+/// (no clipboard open); elsewhere every tick reads + hashes the text,
+/// so poll at 1 Hz.
+#[cfg(windows)]
+const WATCH_TICK: std::time::Duration = std::time::Duration::from_millis(200);
+#[cfg(not(windows))]
+const WATCH_TICK: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// Content the worker itself last wrote to the OS clipboard. The
+/// change watcher treats matching state as "our own write" and stays
+/// silent — one half of the echo-suppression loop (the browser holds
+/// the other half in its `createClipboardEchoGate`).
+#[derive(Default)]
+struct SelfMarks {
+    /// `GetClipboardSequenceNumber` observed right after our own write.
+    #[cfg(windows)]
+    seq: u32,
+    /// FNV-1a of the canonical (LF) text we last wrote.
+    text_hash: u64,
+    /// FNV-1a of the deterministic re-encode of the image we last
+    /// wrote (our own encoder — byte-identical to what a later
+    /// [`watch_tick`] re-encode produces, unlike the browser's PNG
+    /// bytes which come from a different encoder).
+    img_hash: u64,
+}
+
+struct WatcherState {
+    events: WatchEvents,
+    tx: tokio::sync::mpsc::Sender<ClipboardChange>,
+    #[cfg(windows)]
+    last_seen_seq: u32,
+    last_text_hash: u64,
+    last_img_hash: u64,
+    /// Set when `try_send` hit a full channel or a read failed
+    /// transiently — the next tick bypasses the unchanged-seq early
+    /// exit and re-attempts.
+    retry: bool,
+}
+
+/// `GetClipboardSequenceNumber` via clipboard-win. `None` when the
+/// calling thread's window station denies clipboard access.
+#[cfg(windows)]
+fn win_clipboard_seq() -> Option<u32> {
+    clipboard_win::raw::seq_num().map(|n| n.get())
+}
+
+/// FNV-1a 64 over raw bytes. Mirrors the browser-side
+/// `hashClipboardText` / `hashClipboardBytes` helpers in
+/// `useRemoteControl.ts` — both sides hash identical canonical bytes,
+/// which is what makes cross-side echo suppression sound.
+pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+fn worker_read_text(cb: &mut arboard::Clipboard) -> Result<String> {
+    match cb.get_text() {
+        // Canonicalize to wire form (LF) so browser-side hashing and
+        // display are host-convention-free.
+        Ok(t) => Ok(host_to_wire(&t)),
+        // Clipboard holds no text (image / files / empty). Not an
+        // error on the wire: an empty `clipboard:content` lets a rich
+        // read fall through to the image path, and old UIs surface
+        // "empty clipboard" instead of a scary error toast.
+        Err(arboard::Error::ContentNotAvailable) => Ok(String::new()),
+        Err(e) => Err(anyhow::anyhow!("clipboard get_text: {e}")),
+    }
+}
+
+fn worker_write_text(
+    cb: &mut arboard::Clipboard,
+    wire_text: &str,
+    marks: &mut SelfMarks,
+) -> Result<()> {
+    // Hash the canonical form BEFORE host conversion — the watcher
+    // hashes `host_to_wire(get_text())`, which round-trips back to
+    // exactly these bytes.
+    let canonical_hash = fnv1a64(host_to_wire(wire_text).as_bytes());
+    cb.set_text(wire_to_host(wire_text))
+        .map_err(|e| anyhow::anyhow!("clipboard set_text: {e}"))?;
+    marks.text_hash = canonical_hash;
+    #[cfg(windows)]
+    {
+        marks.seq = win_clipboard_seq().unwrap_or(0);
+    }
+    Ok(())
+}
+
+fn worker_read_image(cb: &mut arboard::Clipboard) -> Result<Option<PngImage>> {
+    let img = match cb.get_image() {
+        Ok(i) => i,
+        Err(arboard::Error::ContentNotAvailable) => return Ok(None),
+        Err(e) => return Err(anyhow::anyhow!("clipboard get_image: {e}")),
+    };
+    let (w, h) = (img.width as u32, img.height as u32);
+    if u64::from(w) * u64::from(h) > MAX_IMAGE_PIXELS {
+        anyhow::bail!("clipboard image {w}x{h} exceeds the {MAX_IMAGE_PIXELS}-pixel cap");
+    }
+    let png = rgba_to_png(w, h, &img.bytes)?;
+    if png.len() > CLIPBOARD_IMAGE_MAX_BYTES {
+        anyhow::bail!(
+            "clipboard image PNG is {} bytes (cap {CLIPBOARD_IMAGE_MAX_BYTES})",
+            png.len()
+        );
+    }
+    Ok(Some(PngImage { w, h, png }))
+}
+
+fn worker_write_image(
+    cb: &mut arboard::Clipboard,
+    png_bytes: &[u8],
+    marks: &mut SelfMarks,
+) -> Result<()> {
+    let (w, h, rgba) = png_to_rgba(png_bytes)?;
+    cb.set_image(arboard::ImageData {
+        width: w as usize,
+        height: h as usize,
+        bytes: std::borrow::Cow::Borrowed(&rgba),
+    })
+    .map_err(|e| anyhow::anyhow!("clipboard set_image: {e}"))?;
+    // Echo mark: hash our own deterministic re-encode of the pixels we
+    // just wrote — matches what watch_tick would produce when it reads
+    // this image back. (The inbound browser PNG hashes differently —
+    // different encoder.) Belt-and-suspenders next to the seq mark:
+    // catches the coalesced-seq race where another app also touched
+    // the clipboard between our write and the next tick.
+    if let Ok(reenc) = rgba_to_png(w, h, &rgba) {
+        marks.img_hash = fnv1a64(&reenc);
+    }
+    #[cfg(windows)]
+    {
+        marks.seq = win_clipboard_seq().unwrap_or(0);
+    }
+    Ok(())
+}
+
+/// Build the initial watcher state: snapshot the CURRENT clipboard so
+/// pre-existing content is never pushed on subscribe — only changes
+/// from here on.
+fn install_watcher(
+    cb: &mut arboard::Clipboard,
+    events: WatchEvents,
+    tx: tokio::sync::mpsc::Sender<ClipboardChange>,
+) -> WatcherState {
+    // Image watching needs the Windows sequence-number gate to bound
+    // `get_image` calls; without it (non-Windows, or a window station
+    // that denies clipboard access) fall back to text-only watching.
+    #[cfg(windows)]
+    let events = if events.image && win_clipboard_seq().is_none() {
+        tracing::warn!("clipboard: no sequence-number access — image watching disabled");
+        WatchEvents {
+            image: false,
+            ..events
+        }
+    } else {
+        events
+    };
+    #[cfg(not(windows))]
+    let events = WatchEvents {
+        image: false,
+        ..events
+    };
+    let text_hash = match cb.get_text() {
+        Ok(t) => fnv1a64(host_to_wire(&t).as_bytes()),
+        Err(_) => 0,
+    };
+    WatcherState {
+        events,
+        tx,
+        #[cfg(windows)]
+        last_seen_seq: win_clipboard_seq().unwrap_or(0),
+        last_text_hash: text_hash,
+        last_img_hash: 0,
+        retry: false,
+    }
+}
+
+/// One watcher tick. Cheap when nothing changed (Windows: one
+/// syscall; elsewhere: one text read + hash). Text wins over image
+/// when both are present.
+fn watch_tick(cb: &mut arboard::Clipboard, w: &mut WatcherState, marks: &SelfMarks) {
+    #[cfg(windows)]
+    {
+        if let Some(seq) = win_clipboard_seq() {
+            if !w.retry && seq == w.last_seen_seq {
+                return;
+            }
+            w.last_seen_seq = seq;
+            if seq != 0 && seq == marks.seq {
+                // The change was our own write — swallow.
+                w.retry = false;
+                return;
+            }
+        }
+        // Sequence number unavailable → hash polling below still works.
+    }
+    w.retry = false;
+    let text = match cb.get_text() {
+        Ok(t) => host_to_wire(&t),
+        Err(arboard::Error::ContentNotAvailable) => String::new(),
+        Err(_) => {
+            // Transient (another process holds the clipboard open) —
+            // re-attempt next tick even if the seq doesn't move again.
+            w.retry = true;
+            return;
+        }
+    };
+    if !text.is_empty() {
+        if !w.events.text {
+            return;
+        }
+        let h = fnv1a64(text.as_bytes());
+        if h == w.last_text_hash || h == marks.text_hash {
+            w.last_text_hash = h;
+            return;
+        }
+        if text.len() > MAX_CLIPBOARD_BYTES {
+            // Too big to auto-push; remember it so we don't re-read
+            // every tick. Explicit reads still serve it (chunked).
+            w.last_text_hash = h;
+            return;
+        }
+        match w.tx.try_send(ClipboardChange::Text(text)) {
+            Ok(()) => w.last_text_hash = h,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => w.retry = true,
+            // Forwarder task gone — an Unwatch is on its way; stay quiet.
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+        }
+        return;
+    }
+    // Empty text — maybe an image. Windows-only: the seq gate above
+    // bounds how often we pay for a full image read + PNG encode.
+    #[cfg(windows)]
+    if w.events.image {
+        let img = match cb.get_image() {
+            Ok(i) => i,
+            Err(_) => return,
+        };
+        let (iw, ih) = (img.width as u32, img.height as u32);
+        if u64::from(iw) * u64::from(ih) > MAX_IMAGE_PIXELS {
+            return;
+        }
+        let Ok(png) = rgba_to_png(iw, ih, &img.bytes) else {
+            return;
+        };
+        if png.len() > CLIPBOARD_IMAGE_MAX_BYTES {
+            return;
+        }
+        let h = fnv1a64(&png);
+        if h == w.last_img_hash || h == marks.img_hash {
+            w.last_img_hash = h;
+            return;
+        }
+        match w
+            .tx
+            .try_send(ClipboardChange::Image(PngImage { w: iw, h: ih, png }))
+        {
+            Ok(()) => w.last_img_hash = h,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => w.retry = true,
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+        }
+    }
+}
+
+// ── Line-ending canonicalization (clipboard protocol v2) ────────────────────
+//
+// The wire format is canonical LF. The browser normalizes CRLF/CR → LF
+// before sending and before hashing (its echo-suppression gate compares
+// content hashes); the agent mirrors that on every OS-clipboard
+// boundary. Without this, LF-only multiline text written verbatim into
+// the Win32 clipboard violates the CF_UNICODETEXT CRLF convention —
+// classic edit controls, cmd.exe and several editors mis-render it
+// (lines run together / split oddly), which presented in the field as
+// "pasted lines in the wrong order". It also makes hash-based echo
+// suppression sound: both sides hash the same canonical bytes.
+
+/// Canonicalize host-clipboard text to wire form: `\r\n` → `\n`,
+/// lone `\r` → `\n`. Applied to every `get_text` result before it is
+/// sent, hashed or compared.
+pub(crate) fn host_to_wire(text: &str) -> String {
+    if !text.contains('\r') {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\r' {
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            out.push('\n');
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Expand canonical LF to CRLF for the Windows clipboard. Idempotent —
+/// input is canonicalized first, so pre-existing `\r\n` sequences come
+/// out as exactly one `\r\n`.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn lf_to_crlf(text: &str) -> String {
+    host_to_wire(text).replace('\n', "\r\n")
+}
+
+/// Convert wire text (canonical LF) to the host's clipboard line-ending
+/// convention before `set_text`: CRLF on Windows, canonical LF elsewhere.
+pub(crate) fn wire_to_host(text: &str) -> String {
+    #[cfg(windows)]
+    {
+        lf_to_crlf(text)
+    }
+    #[cfg(not(windows))]
+    {
+        host_to_wire(text)
+    }
+}
 
 /// Incoming clipboard DC message shape. Parsed from the JSON payload
 /// the browser sends; the handler in `peer.rs` dispatches on the `t`
@@ -178,7 +635,16 @@ impl Clipboard {
 #[serde(tag = "t")]
 pub(crate) enum ClipboardIncoming {
     #[serde(rename = "clipboard:write")]
-    Write { text: String },
+    Write {
+        text: String,
+        /// v2 — optional browser-assigned write id. When present the
+        /// agent replies `clipboard:write-ack { id, bytes }` after the
+        /// OS clipboard write succeeds (the browser gates its deferred
+        /// Ctrl+V keystroke on that ack). Old browsers omit it → no
+        /// ack, exact v1 behavior.
+        #[serde(default)]
+        id: Option<String>,
+    },
     #[serde(rename = "clipboard:write-chunk")]
     WriteChunk {
         id: String,
@@ -190,7 +656,42 @@ pub(crate) enum ClipboardIncoming {
     Read {
         #[serde(default)]
         req_id: Option<u64>,
+        /// v2 — content kinds the browser can handle in the reply.
+        /// `["text","image"]` lets the agent answer an image-holding
+        /// clipboard with `clipboard:img-begin` + binary frames.
+        /// Empty (old browsers) means text-only replies.
+        #[serde(default)]
+        accept: Vec<String>,
     },
+    /// v2 — start pushing unsolicited `clipboard:event` /
+    /// `clipboard:img-begin` messages when the HOST clipboard changes.
+    /// `events` lists the kinds the browser wants (`"text"`,
+    /// `"image"`); image watching is honoured on Windows only.
+    #[serde(rename = "clipboard:subscribe")]
+    Subscribe {
+        #[serde(default)]
+        events: Vec<String>,
+    },
+    /// v2 — stop pushing change events (toggle flipped off). Also
+    /// implied by the DC closing.
+    #[serde(rename = "clipboard:unsubscribe")]
+    Unsubscribe,
+    /// v2 — image write header. Binary frames totalling `bytes` bytes
+    /// of PNG follow on the same DC, terminated by `clipboard:img-end`
+    /// with the matching `id`.
+    #[serde(rename = "clipboard:img-begin")]
+    ImgBegin {
+        id: String,
+        w: u32,
+        h: u32,
+        bytes: u64,
+        #[serde(default)]
+        format: String,
+    },
+    /// v2 — image write trailer; the agent decodes the accumulated PNG
+    /// and writes it to the OS clipboard, then acks with the `id`.
+    #[serde(rename = "clipboard:img-end")]
+    ImgEnd { id: String },
 }
 
 /// Hard ceiling on the total reassembled clipboard payload — both
@@ -297,6 +798,212 @@ impl WriteReassembler {
 /// boundaries so reassembly via plain string concatenation always
 /// yields the original. The agent's `clipboard:content-chunk`
 /// emitter uses this; tests lock the boundary handling.
+/// Hard ceiling on a PNG image payload on the clipboard DC, both
+/// directions. Above this the agent refuses inbound transfers and the
+/// watcher skips auto-pushing (explicit reads get an error). 8 MiB
+/// comfortably covers 4K screenshots (typically 1–4 MiB as PNG) while
+/// bounding memory and DC head-of-line blocking.
+pub const CLIPBOARD_IMAGE_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// Decompression-bomb guard: reject images whose HEADER declares more
+/// pixels than a 4096×4096 canvas before allocating the RGBA buffer
+/// (that's already 64 MiB at 4 B/px; a crafted 20000×20000 PNG would
+/// otherwise balloon to 1.6 GB from a few KB on the wire).
+pub const MAX_IMAGE_PIXELS: u64 = 4096 * 4096;
+
+/// Binary frame size for agent → browser image sends. 64 KiB matches
+/// the folder-zip download pump (field-proven; Chrome's inbound SCTP
+/// message cap is 256 KiB). The browser → agent direction uses 16 KiB
+/// frames instead — webrtc-rs's inbound `max_message_size` is 65536
+/// and 64 KiB frames sat exactly on that boundary (see the files-DC
+/// pump comment in `useRemoteControl.ts`).
+pub(crate) const IMG_FRAME_BYTES_TX: usize = 64 * 1024;
+
+/// Encode raw RGBA8 pixels to PNG (the clipboard-DC wire format for
+/// images). Runs on the clipboard worker thread — blocking there is
+/// fine.
+pub(crate) fn rgba_to_png(w: u32, h: u32, rgba: &[u8]) -> Result<Vec<u8>> {
+    let expected = (w as usize)
+        .checked_mul(h as usize)
+        .and_then(|p| p.checked_mul(4))
+        .ok_or_else(|| anyhow::anyhow!("image dimensions overflow"))?;
+    if rgba.len() != expected {
+        anyhow::bail!(
+            "rgba buffer is {} bytes, expected {expected} for {w}x{h}",
+            rgba.len()
+        );
+    }
+    let mut out = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut out, w, h);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut writer = enc.write_header().context("png write_header")?;
+        writer
+            .write_image_data(rgba)
+            .context("png write_image_data")?;
+    }
+    Ok(out)
+}
+
+/// Decode a PNG into RGBA8. Enforces [`MAX_IMAGE_PIXELS`] from the
+/// header BEFORE allocating the pixel buffer (bomb guard). Non-RGBA
+/// color types are expanded (palette → RGB, 16-bit → 8-bit) and
+/// padded to RGBA with opaque alpha.
+pub(crate) fn png_to_rgba(png_bytes: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(png_bytes));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder.read_info().context("png read_info")?;
+    let info = reader.info();
+    let (w, h) = (info.width, info.height);
+    if w == 0 || h == 0 {
+        anyhow::bail!("png has a zero dimension");
+    }
+    if u64::from(w) * u64::from(h) > MAX_IMAGE_PIXELS {
+        anyhow::bail!("png {w}x{h} exceeds the {MAX_IMAGE_PIXELS}-pixel cap");
+    }
+    let out_size = reader
+        .output_buffer_size()
+        .ok_or_else(|| anyhow::anyhow!("png output size overflows"))?;
+    let mut buf = vec![0u8; out_size];
+    let out = reader.next_frame(&mut buf).context("png next_frame")?;
+    buf.truncate(out.buffer_size());
+    let rgba = match out.color_type {
+        png::ColorType::Rgba => buf,
+        png::ColorType::Rgb => {
+            let mut v = Vec::with_capacity(buf.len() / 3 * 4);
+            for px in buf.chunks_exact(3) {
+                v.extend_from_slice(px);
+                v.push(0xff);
+            }
+            v
+        }
+        png::ColorType::Grayscale => {
+            let mut v = Vec::with_capacity(buf.len() * 4);
+            for &g in &buf {
+                v.extend_from_slice(&[g, g, g, 0xff]);
+            }
+            v
+        }
+        png::ColorType::GrayscaleAlpha => {
+            let mut v = Vec::with_capacity(buf.len() * 2);
+            for px in buf.chunks_exact(2) {
+                v.extend_from_slice(&[px[0], px[0], px[0], px[1]]);
+            }
+            v
+        }
+        other => anyhow::bail!("unsupported png color type after expand: {other:?}"),
+    };
+    Ok((w, h, rgba))
+}
+
+/// Reassembles an inbound browser → agent image transfer: a
+/// `clipboard:img-begin` header, raw binary PNG frames, then a
+/// `clipboard:img-end` trailer. One transfer in flight at a time — a
+/// new begin replaces (drops) a dangling one. Byte twin of
+/// [`WriteReassembler`]; rejections mirror its reason-string contract.
+#[derive(Default)]
+pub(crate) struct ImageRx {
+    in_flight: Option<ImageRxInFlight>,
+}
+
+struct ImageRxInFlight {
+    id: String,
+    w: u32,
+    h: u32,
+    declared: usize,
+    buf: Vec<u8>,
+}
+
+impl ImageRx {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn begin(
+        &mut self,
+        id: String,
+        w: u32,
+        h: u32,
+        bytes: u64,
+        format: &str,
+    ) -> Result<(), String> {
+        if !format.eq_ignore_ascii_case("png") {
+            return Err(format!(
+                "unsupported clipboard image format {format:?} (png only)"
+            ));
+        }
+        if bytes == 0 || bytes > CLIPBOARD_IMAGE_MAX_BYTES as u64 {
+            return Err(format!(
+                "clipboard image {bytes} bytes outside the (0, {CLIPBOARD_IMAGE_MAX_BYTES}] cap"
+            ));
+        }
+        if w == 0 || h == 0 || u64::from(w) * u64::from(h) > MAX_IMAGE_PIXELS {
+            return Err(format!(
+                "clipboard image dims {w}x{h} outside the {MAX_IMAGE_PIXELS}-pixel cap"
+            ));
+        }
+        if let Some(stale) = self.in_flight.take() {
+            // The browser serializes transfers; a dangling one means it
+            // gave up mid-stream (reload / error). Replace it.
+            tracing::debug!(stale = %stale.id, "clipboard: replacing dangling image transfer");
+        }
+        self.in_flight = Some(ImageRxInFlight {
+            id,
+            w,
+            h,
+            declared: bytes as usize,
+            buf: Vec::with_capacity(bytes as usize),
+        });
+        Ok(())
+    }
+
+    pub(crate) fn frame(&mut self, data: &[u8]) -> Result<(), String> {
+        let Some(f) = self.in_flight.as_mut() else {
+            return Err("binary frame with no image transfer in flight".into());
+        };
+        if f.buf.len() + data.len() > f.declared {
+            let id = f.id.clone();
+            self.in_flight = None;
+            return Err(format!(
+                "image transfer {id} overflowed its declared length"
+            ));
+        }
+        f.buf.extend_from_slice(data);
+        Ok(())
+    }
+
+    pub(crate) fn end(&mut self, id: &str) -> Result<PngImage, String> {
+        let Some(f) = self.in_flight.take() else {
+            return Err("img-end with no image transfer in flight".into());
+        };
+        if f.id != id {
+            return Err(format!(
+                "img-end id {id:?} does not match in-flight {:?}",
+                f.id
+            ));
+        }
+        if f.buf.len() != f.declared {
+            return Err(format!(
+                "image transfer {id} ended at {} of {} declared bytes",
+                f.buf.len(),
+                f.declared
+            ));
+        }
+        Ok(PngImage {
+            w: f.w,
+            h: f.h,
+            png: f.buf,
+        })
+    }
+
+    /// Test-only visibility.
+    #[cfg(test)]
+    pub(crate) fn is_in_flight(&self) -> bool {
+        self.in_flight.is_some()
+    }
+}
+
 pub(crate) fn split_into_chunks(text: &str) -> Vec<&str> {
     if text.len() <= CHUNK_BYTES {
         // Even a string with all 4-byte UTF-8 codepoints fits in one
@@ -342,7 +1049,7 @@ mod tests {
         let m: ClipboardIncoming =
             serde_json::from_str(r#"{"t":"clipboard:write","text":"hi"}"#).unwrap();
         match m {
-            ClipboardIncoming::Write { text } => assert_eq!(text, "hi"),
+            ClipboardIncoming::Write { text, .. } => assert_eq!(text, "hi"),
             other => panic!("unexpected: {other:?}"),
         }
     }
@@ -352,7 +1059,7 @@ mod tests {
         let m: ClipboardIncoming =
             serde_json::from_str(r#"{"t":"clipboard:read","req_id":42}"#).unwrap();
         match m {
-            ClipboardIncoming::Read { req_id } => assert_eq!(req_id, Some(42)),
+            ClipboardIncoming::Read { req_id, .. } => assert_eq!(req_id, Some(42)),
             other => panic!("unexpected: {other:?}"),
         }
     }
@@ -361,7 +1068,7 @@ mod tests {
     fn parse_incoming_read_without_req_id() {
         let m: ClipboardIncoming = serde_json::from_str(r#"{"t":"clipboard:read"}"#).unwrap();
         match m {
-            ClipboardIncoming::Read { req_id } => assert_eq!(req_id, None),
+            ClipboardIncoming::Read { req_id, .. } => assert_eq!(req_id, None),
             other => panic!("unexpected: {other:?}"),
         }
     }
@@ -524,6 +1231,306 @@ mod tests {
         // `clipboard:content-chunk { text: "", last: true }` once).
         let chunks = split_into_chunks("");
         assert_eq!(chunks, vec![""]);
+    }
+
+    // ── v2: parse locks for the additive fields + new variants ─────────
+
+    #[test]
+    fn parse_incoming_write_with_id() {
+        let m: ClipboardIncoming =
+            serde_json::from_str(r#"{"t":"clipboard:write","text":"hi","id":"cb-7"}"#).unwrap();
+        match m {
+            ClipboardIncoming::Write { text, id } => {
+                assert_eq!(text, "hi");
+                assert_eq!(id.as_deref(), Some("cb-7"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_incoming_write_without_id_stays_v1_compatible() {
+        let m: ClipboardIncoming =
+            serde_json::from_str(r#"{"t":"clipboard:write","text":"hi"}"#).unwrap();
+        match m {
+            ClipboardIncoming::Write { id, .. } => assert!(id.is_none()),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_incoming_read_with_accept() {
+        let m: ClipboardIncoming =
+            serde_json::from_str(r#"{"t":"clipboard:read","req_id":1,"accept":["text","image"]}"#)
+                .unwrap();
+        match m {
+            ClipboardIncoming::Read { req_id, accept } => {
+                assert_eq!(req_id, Some(1));
+                assert_eq!(accept, vec!["text", "image"]);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_incoming_read_without_accept_stays_v1_compatible() {
+        let m: ClipboardIncoming = serde_json::from_str(r#"{"t":"clipboard:read"}"#).unwrap();
+        match m {
+            ClipboardIncoming::Read { accept, .. } => assert!(accept.is_empty()),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_incoming_subscribe_unsubscribe() {
+        let m: ClipboardIncoming =
+            serde_json::from_str(r#"{"t":"clipboard:subscribe","events":["text","image"]}"#)
+                .unwrap();
+        match m {
+            ClipboardIncoming::Subscribe { events } => assert_eq!(events, vec!["text", "image"]),
+            other => panic!("unexpected: {other:?}"),
+        }
+        let m: ClipboardIncoming =
+            serde_json::from_str(r#"{"t":"clipboard:unsubscribe"}"#).unwrap();
+        assert!(matches!(m, ClipboardIncoming::Unsubscribe));
+    }
+
+    #[test]
+    fn parse_incoming_img_begin_end() {
+        let m: ClipboardIncoming = serde_json::from_str(
+            r#"{"t":"clipboard:img-begin","id":"cb-1","w":2,"h":3,"bytes":99,"format":"png"}"#,
+        )
+        .unwrap();
+        match m {
+            ClipboardIncoming::ImgBegin {
+                id,
+                w,
+                h,
+                bytes,
+                format,
+            } => {
+                assert_eq!(
+                    (id.as_str(), w, h, bytes, format.as_str()),
+                    ("cb-1", 2, 3, 99, "png")
+                );
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        let m: ClipboardIncoming =
+            serde_json::from_str(r#"{"t":"clipboard:img-end","id":"cb-1"}"#).unwrap();
+        match m {
+            ClipboardIncoming::ImgEnd { id } => assert_eq!(id, "cb-1"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    // ── v2: line-ending canonicalization ───────────────────────────────
+
+    #[test]
+    fn host_to_wire_normalizes_all_conventions() {
+        assert_eq!(host_to_wire("a\r\nb\r\nc"), "a\nb\nc");
+        assert_eq!(host_to_wire("a\rb"), "a\nb");
+        assert_eq!(host_to_wire("a\nb"), "a\nb");
+        assert_eq!(
+            host_to_wire("mixed\r\nand\rand\nend\r"),
+            "mixed\nand\nand\nend\n"
+        );
+        assert_eq!(host_to_wire(""), "");
+        // No CR at all → passthrough (fast path).
+        assert_eq!(host_to_wire("plain"), "plain");
+    }
+
+    #[test]
+    fn lf_to_crlf_is_idempotent() {
+        assert_eq!(lf_to_crlf("a\nb"), "a\r\nb");
+        assert_eq!(
+            lf_to_crlf("a\r\nb"),
+            "a\r\nb",
+            "existing CRLF must not double"
+        );
+        assert_eq!(lf_to_crlf(lf_to_crlf("x\ny\nz").as_str()), "x\r\ny\r\nz");
+        // Lone CR is normalized too, not passed through.
+        assert_eq!(lf_to_crlf("a\rb"), "a\r\nb");
+    }
+
+    #[test]
+    fn wire_to_host_matches_platform_convention() {
+        let out = wire_to_host("l1\nl2");
+        #[cfg(windows)]
+        assert_eq!(out, "l1\r\nl2");
+        #[cfg(not(windows))]
+        assert_eq!(out, "l1\nl2");
+    }
+
+    // ── v2: FNV-1a 64 (cross-side echo-suppression hash) ───────────────
+
+    #[test]
+    fn fnv1a64_matches_published_vectors() {
+        // Standard FNV-1a 64 test vectors — the browser-side
+        // `hashClipboardText`/`hashClipboardBytes` in useRemoteControl.ts
+        // lock the SAME values; if either side changes, echo
+        // suppression silently breaks.
+        assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a64(b"foobar"), 0x85944171f73967e8);
+    }
+
+    // ── v2: PNG codec ──────────────────────────────────────────────────
+
+    #[test]
+    fn png_roundtrip_2x2_rgba() {
+        let rgba: Vec<u8> = vec![
+            255, 0, 0, 255, /* */ 0, 255, 0, 128, //
+            0, 0, 255, 255, /* */ 255, 255, 255, 0,
+        ];
+        let png = rgba_to_png(2, 2, &rgba).unwrap();
+        let (w, h, back) = png_to_rgba(&png).unwrap();
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(back, rgba);
+    }
+
+    #[test]
+    fn rgba_to_png_rejects_wrong_buffer_len() {
+        let err = rgba_to_png(2, 2, &[0u8; 3]).unwrap_err();
+        assert!(err.to_string().contains("expected"), "got: {err}");
+    }
+
+    #[test]
+    fn png_to_rgba_rejects_garbage() {
+        assert!(png_to_rgba(b"not a png at all").is_err());
+    }
+
+    #[test]
+    fn png_to_rgba_rejects_decompression_bomb_before_alloc() {
+        // Hand-craft a PNG whose IHDR declares 20000x20000 RGBA
+        // (400 MPx — a 1.6 GB output buffer) followed by EMPTY
+        // IDAT/IEND chunks. png 0.18's `read_info` parses this header
+        // happily (its own byte limit only fires later, at frame
+        // decode), so without OUR header-stage pixel cap the
+        // `vec![0u8; output_buffer_size]` allocation would balloon to
+        // 1.6 GB from a 70-byte wire payload. The cap must fire first.
+        fn crc32(data: &[u8]) -> u32 {
+            let mut crc: u32 = 0xffff_ffff;
+            for &b in data {
+                crc ^= u32::from(b);
+                for _ in 0..8 {
+                    crc = if crc & 1 != 0 {
+                        (crc >> 1) ^ 0xedb8_8320
+                    } else {
+                        crc >> 1
+                    };
+                }
+            }
+            !crc
+        }
+        let mut png_bytes: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        let mut ihdr: Vec<u8> = Vec::new();
+        ihdr.extend_from_slice(b"IHDR");
+        ihdr.extend_from_slice(&20000u32.to_be_bytes()); // width
+        ihdr.extend_from_slice(&20000u32.to_be_bytes()); // height
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]); // 8-bit RGBA, no interlace
+        png_bytes.extend_from_slice(&13u32.to_be_bytes());
+        png_bytes.extend_from_slice(&ihdr);
+        png_bytes.extend_from_slice(&crc32(&ihdr).to_be_bytes());
+        for tag in [b"IDAT", b"IEND"] {
+            png_bytes.extend_from_slice(&0u32.to_be_bytes());
+            png_bytes.extend_from_slice(tag);
+            png_bytes.extend_from_slice(&crc32(tag).to_be_bytes());
+        }
+        let err = png_to_rgba(&png_bytes).unwrap_err();
+        assert!(
+            err.to_string().contains("pixel cap"),
+            "must fail on the header cap, got: {err}"
+        );
+    }
+
+    #[test]
+    fn png_to_rgba_expands_rgb_to_opaque_rgba() {
+        // Encode a 1x2 RGB (no alpha) PNG with the png crate directly,
+        // then decode through our helper — alpha must come back 255.
+        let rgb: Vec<u8> = vec![10, 20, 30, 40, 50, 60];
+        let mut buf = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut buf, 1, 2);
+            enc.set_color(png::ColorType::Rgb);
+            enc.set_depth(png::BitDepth::Eight);
+            let mut w = enc.write_header().unwrap();
+            w.write_image_data(&rgb).unwrap();
+        }
+        let (w, h, rgba) = png_to_rgba(&buf).unwrap();
+        assert_eq!((w, h), (1, 2));
+        assert_eq!(rgba, vec![10, 20, 30, 255, 40, 50, 60, 255]);
+    }
+
+    // ── v2: inbound image reassembler ──────────────────────────────────
+
+    #[test]
+    fn image_rx_happy_path() {
+        let mut rx = ImageRx::new();
+        rx.begin("i1".into(), 2, 2, 6, "png").unwrap();
+        rx.frame(&[1, 2, 3]).unwrap();
+        rx.frame(&[4, 5, 6]).unwrap();
+        let img = rx.end("i1").unwrap();
+        assert_eq!((img.w, img.h), (2, 2));
+        assert_eq!(img.png, vec![1, 2, 3, 4, 5, 6]);
+        assert!(!rx.is_in_flight());
+    }
+
+    #[test]
+    fn image_rx_rejects_bad_begin() {
+        let mut rx = ImageRx::new();
+        assert!(rx.begin("i".into(), 2, 2, 6, "jpeg").is_err(), "png only");
+        assert!(rx.begin("i".into(), 2, 2, 0, "png").is_err(), "zero bytes");
+        assert!(
+            rx.begin(
+                "i".into(),
+                2,
+                2,
+                CLIPBOARD_IMAGE_MAX_BYTES as u64 + 1,
+                "png"
+            )
+            .is_err(),
+            "over byte cap"
+        );
+        assert!(
+            rx.begin("i".into(), 100_000, 100_000, 6, "png").is_err(),
+            "over pixel cap"
+        );
+        assert!(!rx.is_in_flight());
+    }
+
+    #[test]
+    fn image_rx_rejects_overflow_and_drops_transfer() {
+        let mut rx = ImageRx::new();
+        rx.begin("i1".into(), 2, 2, 4, "png").unwrap();
+        assert!(rx.frame(&[1, 2, 3, 4, 5]).is_err(), "over declared length");
+        assert!(!rx.is_in_flight(), "overflow must drop the transfer");
+        assert!(rx.frame(&[1]).is_err(), "no transfer in flight");
+    }
+
+    #[test]
+    fn image_rx_rejects_mismatched_end() {
+        let mut rx = ImageRx::new();
+        rx.begin("i1".into(), 2, 2, 2, "png").unwrap();
+        rx.frame(&[1, 2]).unwrap();
+        assert!(rx.end("other").is_err(), "id mismatch");
+        assert!(!rx.is_in_flight());
+
+        rx.begin("i2".into(), 2, 2, 4, "png").unwrap();
+        rx.frame(&[1, 2]).unwrap();
+        let err = rx.end("i2").unwrap_err();
+        assert!(err.contains("2 of 4"), "length mismatch surfaces: {err}");
+    }
+
+    #[test]
+    fn image_rx_new_begin_replaces_dangling_transfer() {
+        let mut rx = ImageRx::new();
+        rx.begin("stale".into(), 2, 2, 100, "png").unwrap();
+        rx.frame(&[9; 10]).unwrap();
+        rx.begin("fresh".into(), 1, 1, 2, "png").unwrap();
+        rx.frame(&[7, 8]).unwrap();
+        let img = rx.end("fresh").unwrap();
+        assert_eq!(img.png, vec![7, 8]);
     }
 
     /// The clipboard worker init may fail on headless CI runners that
