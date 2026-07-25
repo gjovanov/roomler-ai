@@ -128,6 +128,20 @@ pub struct AgentCaps {
     /// v1 button-driven text-only flow.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub clipboard: Vec<String>,
+    /// Keyboard-layout integration (Windows hosts with input
+    /// injection). Recognised values:
+    ///
+    /// * `"report"` — the agent pushes `rc:layout` snapshots (active +
+    ///   installed layouts) over the control DC.
+    /// * `"set"` — the agent accepts `rc:layout.set {hkl}` manual
+    ///   switches from the viewer's layout picker.
+    ///
+    /// Empty / unset (older agents, non-Windows hosts, builds without
+    /// `enigo-input`) → the browser hides all layout UI. The per-char
+    /// auto-switch itself is agent-local and needs no browser
+    /// involvement.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layout: Vec<String>,
 }
 
 /// How consent is obtained before a controller may drive a device. Resolved
