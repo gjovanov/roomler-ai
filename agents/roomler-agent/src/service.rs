@@ -279,7 +279,7 @@ mod windows {
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
     <Author>roomlerd</Author>
-    <Description>Roomler AI remote-control agent — auto-start on logon, restart on failure.</Description>
+    <Description>Roomler Daemon — keeps this device on your private Roomler mesh network and available for secure remote control (auto-start on logon, restart on failure).</Description>
     <URI>\Roomler</URI>
   </RegistrationInfo>
   <Triggers>
@@ -514,7 +514,7 @@ mod linux {
         let exe_str = exe.to_string_lossy();
         let unit = format!(
             "[Unit]\n\
-             Description=Roomler AI remote-control agent\n\
+             Description=Roomler Daemon — keeps this device on your private Roomler mesh network and available for secure remote control\n\
              After=graphical-session.target\n\
              PartOf=graphical-session.target\n\
              \n\
