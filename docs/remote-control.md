@@ -734,6 +734,20 @@ to-activate, so the browser never sees a bait-and-switch.
   browser's local→remote triggers are focus/visibility/2 s-focused
   poll/paste-intent; Settings → Session has the persisted
   "Clipboard auto-sync" toggle (default ON).
+- **Clipboard v2.1 — html lane** (0.3.0-rc.229, caps += `"html"`):
+  formatted text survives the round-trip. `clipboard:html-begin
+  {id, html_bytes, text_bytes}` + binary frames (html UTF-8 then the
+  plain-text alt) + `clipboard:html-end`, both directions, 4 MiB
+  combined cap; the agent writes CF_HTML + CF_UNICODETEXT in ONE
+  transaction via `arboard::set_html` (paste targets pick the richest
+  they understand), the browser writes a two-format `ClipboardItem`.
+  Watcher priority: html > text > image (html carries its own text
+  alt). Echo marks hash the READ-BACK (the OS re-wraps CF_HTML);
+  the browser echo gate became a 4-entry ring because one html state
+  surfaces as two hashes (combined + text-alt via readText polling).
+  Covers formatting, tables and WEB-HOSTED images; images EMBEDDED in
+  local documents (Word ⌘A copies) are only reachable via native RTF
+  — that's the planned local-agent rich-clipboard bridge (Tier 2).
 - **File DC** (0.1.33): browser drag/pick → `files:begin` →
   64 KiB ArrayBuffer chunks with `bufferedAmount` back-pressure →
   `files:end` → agent writes into the controlled host's Downloads
