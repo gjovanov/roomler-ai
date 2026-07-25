@@ -66,16 +66,37 @@ pub fn enabled() -> bool {
     )
 }
 
-/// Spawn the loopback-TURN probe server + host supervisor when [`enabled`]
-/// (default-ON; no-op only when the operator set the `=0` escape). `agent_id`
-/// is used as the minted credential's user-id (opaque; the host both mints
-/// and validates statelessly).
+/// v2.2 — the loopback CLIPBOARD BRIDGE half (`/rc-clipboard`): lets the
+/// roomler.ai page on THIS machine read/write the machine's NATIVE clipboard
+/// formats (RTF with embedded images) that no browser API exposes. Default-ON;
+/// `ROOMLER_AGENT_CLIPBOARD_BRIDGE=0` disables. Only meaningful on builds with
+/// the `clipboard` feature — the routes 404 otherwise.
+///
+/// Trust model (same as the TURN probe): loopback-only bind + strict
+/// browser-origin allowlist (CORS/PNA — a foreign page's fetch gets no ACAO
+/// header, so the browser blocks the read and preflight-blocks the write) +
+/// the fact that any LOCAL process could already read the OS clipboard
+/// directly, so no new privilege is exposed to the machine itself.
+pub fn bridge_enabled() -> bool {
+    cfg!(feature = "clipboard")
+        && !matches!(
+            std::env::var("ROOMLER_AGENT_CLIPBOARD_BRIDGE")
+                .ok()
+                .as_deref(),
+            Some("0" | "false" | "no" | "off")
+        )
+}
+
+/// Spawn the loopback probe server when either half wants it (TURN relay
+/// assist and/or the clipboard bridge; each half is route-gated inside).
+/// `agent_id` is used as the minted TURN credential's user-id (opaque; the
+/// host both mints and validates statelessly).
 pub fn spawn(
     overlay_view: watch::Receiver<OverlayView>,
     agent_id: String,
     shutdown: watch::Receiver<bool>,
 ) {
-    if !enabled() {
+    if !enabled() && !bridge_enabled() {
         return;
     }
     tokio::spawn(serve(overlay_view, agent_id, shutdown));
@@ -143,9 +164,12 @@ async fn serve(
     // credential handed to the two relay endpoints.
     let secret: Vec<u8> = rand::random::<[u8; 32]>().to_vec();
 
+    let turn_on = enabled();
     let mut overlay_view = overlay_view;
     let mut host: Option<LocalTurnHost> = None;
-    reconcile_host(&mut host, overlay_self_ip(&overlay_view), &secret).await;
+    if turn_on {
+        reconcile_host(&mut host, overlay_self_ip(&overlay_view), &secret).await;
+    }
 
     loop {
         tokio::select! {
@@ -158,7 +182,9 @@ async fn serve(
                 if changed.is_err() {
                     break; // sender dropped — agent is going away
                 }
-                reconcile_host(&mut host, overlay_self_ip(&overlay_view), &secret).await;
+                if turn_on {
+                    reconcile_host(&mut host, overlay_self_ip(&overlay_view), &secret).await;
+                }
             }
             accept = listener.accept() => {
                 let Ok((stream, _peer)) = accept else { continue };
@@ -192,7 +218,7 @@ async fn handle_conn<S>(mut stream: S, descriptor: Option<LocalRelayDescriptor>)
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let Some(head) = read_head(&mut stream).await else {
+    let Some((head, leftover)) = read_head(&mut stream).await else {
         return;
     };
     let (verb, path, origin) = parse_request_head(&head);
@@ -207,6 +233,24 @@ where
             },
             None => status_response(503, "Service Unavailable", allow),
         },
+        // v2.2 — the clipboard bridge. Feature- and env-gated; foreign
+        // origins get no CORS headers so their reads/writes are
+        // browser-blocked.
+        "GET" if path.starts_with("/rc-clipboard") => {
+            if bridge_enabled() {
+                bridge_read_response(allow).await
+            } else {
+                status_response(404, "Not Found", allow)
+            }
+        }
+        "POST" if path.starts_with("/rc-clipboard") => {
+            if bridge_enabled() {
+                let body = read_body(&mut stream, leftover, content_length(&head)).await;
+                bridge_write_response(allow, body).await
+            } else {
+                status_response(404, "Not Found", allow)
+            }
+        }
         _ => status_response(404, "Not Found", allow),
     };
 
@@ -215,10 +259,18 @@ where
 }
 
 /// Read the request head (up to the blank line) with a timeout + size cap.
-async fn read_head<S: AsyncRead + Unpin>(stream: &mut S) -> Option<String> {
+/// Returns the head text plus any body bytes that arrived in the same reads.
+async fn read_head<S: AsyncRead + Unpin>(stream: &mut S) -> Option<(String, Vec<u8>)> {
     let mut buf = Vec::with_capacity(1024);
     let mut tmp = [0u8; 1024];
     loop {
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let leftover = buf.split_off(pos + 4);
+            return Some((String::from_utf8_lossy(&buf).into_owned(), leftover));
+        }
+        if buf.len() > MAX_HEAD {
+            break;
+        }
         let n = match tokio::time::timeout(READ_TIMEOUT, stream.read(&mut tmp)).await {
             Ok(Ok(0)) => break,        // EOF
             Ok(Ok(n)) => n,            // got bytes
@@ -226,11 +278,106 @@ async fn read_head<S: AsyncRead + Unpin>(stream: &mut S) -> Option<String> {
             Err(_) => return None,     // timeout
         };
         buf.extend_from_slice(&tmp[..n]);
-        if buf.ends_with(b"\r\n\r\n") || buf.len() > MAX_HEAD {
-            break;
+    }
+    Some((String::from_utf8_lossy(&buf).into_owned(), Vec::new()))
+}
+
+/// v2.2 — cap on a bridge POST body: base64(16 MiB RTF) + JSON overhead.
+const MAX_BODY: usize = 24 * 1024 * 1024;
+
+/// The head's Content-Length, when present and sane.
+fn content_length(head: &str) -> Option<usize> {
+    head.lines().find_map(|l| {
+        let (name, val) = l.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case("content-length")
+            .then(|| val.trim().parse::<usize>().ok())
+            .flatten()
+    })
+}
+
+/// Read the remaining POST body (`leftover` already buffered by
+/// [`read_head`]) up to Content-Length, bounded by [`MAX_BODY`] + the
+/// same read timeout per chunk.
+async fn read_body<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    mut body: Vec<u8>,
+    declared: Option<usize>,
+) -> Option<Vec<u8>> {
+    let declared = declared?;
+    if declared > MAX_BODY {
+        return None;
+    }
+    let mut tmp = [0u8; 16 * 1024];
+    while body.len() < declared {
+        let n = match tokio::time::timeout(READ_TIMEOUT, stream.read(&mut tmp)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => n,
+            Ok(Err(_)) => return None,
+            Err(_) => return None,
+        };
+        body.extend_from_slice(&tmp[..n]);
+        if body.len() > MAX_BODY {
+            return None;
         }
     }
-    Some(String::from_utf8_lossy(&buf).into_owned())
+    (body.len() >= declared).then(|| {
+        body.truncate(declared);
+        body
+    })
+}
+
+/// `GET /rc-clipboard` — the machine's native clipboard as JSON
+/// (`NativePayload`: base64 RTF + html + text), 204 when it holds no
+/// RTF (the browser's own clipboard API covers the rest).
+#[cfg(feature = "clipboard")]
+async fn bridge_read_response(allow: Option<&str>) -> String {
+    let Some(cb) = crate::clipboard::Clipboard::shared() else {
+        return status_response(503, "Service Unavailable", allow);
+    };
+    match cb.read_native().await {
+        Ok(Some(payload)) => match serde_json::to_string(&payload) {
+            Ok(body) => json_response(allow, &body),
+            Err(_) => status_response(500, "Internal Server Error", allow),
+        },
+        Ok(None) => status_response(204, "No Content", allow),
+        Err(_) => status_response(500, "Internal Server Error", allow),
+    }
+}
+
+#[cfg(not(feature = "clipboard"))]
+async fn bridge_read_response(allow: Option<&str>) -> String {
+    status_response(404, "Not Found", allow)
+}
+
+/// `POST /rc-clipboard` — write the JSON `NativePayload` to the
+/// machine's clipboard (RTF + html + text in native formats).
+#[cfg(feature = "clipboard")]
+async fn bridge_write_response(allow: Option<&str>, body: Option<Vec<u8>>) -> String {
+    let Some(body) = body else {
+        return status_response(400, "Bad Request", allow);
+    };
+    let Ok(payload) = serde_json::from_slice::<crate::clipboard::NativePayload>(&body) else {
+        return status_response(400, "Bad Request", allow);
+    };
+    if payload.rtf.is_empty()
+        || payload.rtf.len() + payload.html.len() + payload.text.len()
+            > crate::clipboard::CLIPBOARD_NATIVE_MAX_BYTES
+    {
+        return status_response(400, "Bad Request", allow);
+    }
+    let Some(cb) = crate::clipboard::Clipboard::shared() else {
+        return status_response(503, "Service Unavailable", allow);
+    };
+    match cb.write_native(payload).await {
+        Ok(()) => status_response(204, "No Content", allow),
+        Err(_) => status_response(500, "Internal Server Error", allow),
+    }
+}
+
+#[cfg(not(feature = "clipboard"))]
+async fn bridge_write_response(allow: Option<&str>, _body: Option<Vec<u8>>) -> String {
+    status_response(404, "Not Found", allow)
 }
 
 /// Extract `(verb, path, origin)` from a raw request head. Tolerant of garbage
@@ -272,7 +419,7 @@ fn preflight_response(allow: Option<&str>) -> String {
     format!(
         "HTTP/1.1 204 No Content\r\n\
          {cors}\
-         Access-Control-Allow-Methods: GET, OPTIONS\r\n\
+         Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
          Access-Control-Allow-Headers: *\r\n\
          Access-Control-Max-Age: 600\r\n\
          Content-Length: 0\r\n\
@@ -351,7 +498,43 @@ mod tests {
         assert!(r.starts_with("HTTP/1.1 204"));
         assert!(r.contains("Access-Control-Allow-Origin: https://roomler.ai\r\n"));
         assert!(r.contains("Access-Control-Allow-Private-Network: true\r\n"));
-        assert!(r.contains("Access-Control-Allow-Methods: GET, OPTIONS\r\n"));
+        assert!(r.contains("Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"));
+    }
+
+    #[test]
+    fn content_length_parses_case_insensitively_and_rejects_garbage() {
+        let head = "POST /rc-clipboard HTTP/1.1\r\ncontent-length: 42\r\n\r\n";
+        assert_eq!(content_length(head), Some(42));
+        let head = "POST /rc-clipboard HTTP/1.1\r\nContent-Length: nope\r\n\r\n";
+        assert_eq!(content_length(head), None);
+        assert_eq!(content_length("GET / HTTP/1.1\r\n\r\n"), None);
+    }
+
+    #[tokio::test]
+    async fn read_head_splits_leftover_body_bytes() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let payload = b"POST /rc-clipboard HTTP/1.1\r\nContent-Length: 9\r\n\r\n{\"x\":1}ab";
+        tokio::io::AsyncWriteExt::write_all(&mut client, payload)
+            .await
+            .unwrap();
+        drop(client);
+        let (head, leftover) = read_head(&mut server).await.unwrap();
+        assert!(head.ends_with("\r\n\r\n"));
+        assert_eq!(leftover, b"{\"x\":1}ab");
+        // read_body completes from the leftover alone.
+        let body = read_body(&mut server, leftover, Some(9)).await.unwrap();
+        assert_eq!(body, b"{\"x\":1}ab");
+    }
+
+    #[tokio::test]
+    async fn read_body_rejects_oversized_declarations() {
+        let (_client, mut server) = tokio::io::duplex(64);
+        assert!(
+            read_body(&mut server, Vec::new(), Some(MAX_BODY + 1))
+                .await
+                .is_none()
+        );
+        assert!(read_body(&mut server, Vec::new(), None).await.is_none());
     }
 
     #[test]

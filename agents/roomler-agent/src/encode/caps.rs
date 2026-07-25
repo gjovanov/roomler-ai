@@ -340,14 +340,20 @@ fn compute_caps() -> AgentCaps {
     // clipboard no-ops the DC exactly as v1 did). The browser gates
     // its auto-sync engine + image paths on these values.
     let clipboard: Vec<String> = if cfg!(feature = "clipboard") {
-        vec![
+        let mut c: Vec<String> = vec![
             "ack".into(),
             "events".into(),
             "images".into(),
             // v2.1 — html lane: formatted text + web-hosted images
             // survive the round-trip (CF_HTML / text/html both ways).
             "html".into(),
-        ]
+        ];
+        // v2.2 — native lane (RTF with embedded images). Windows-only:
+        // the RTF read/write rides clipboard-win's raw format API.
+        if cfg!(target_os = "windows") {
+            c.push("native".into());
+        }
+        c
     } else {
         Vec::new()
     };
