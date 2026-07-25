@@ -1270,11 +1270,19 @@ export interface LocalRelayDescriptor {
   credential: string
 }
 
-/** Fixed loopback port the agent serves its local-relay descriptor on. The
- *  browser probes `http://127.0.0.1:{LOCAL_RELAY_PROBE_PORT}/rc-local-turn`; no
- *  response (no local agent, feature off, Private-Network-Access blocked, or
- *  timeout) makes the probe a graceful no-op. */
+/** Primary loopback port the agent serves its descriptor + clipboard
+ *  bridge on. The browser probes `http://127.0.0.1:{port}/rc-local-turn`
+ *  (+ `/rc-clipboard`); no response (no local agent, feature off,
+ *  Private-Network-Access blocked, timeout) makes the probe a graceful
+ *  no-op. */
 export const LOCAL_RELAY_PROBE_PORT = 47989
+/** Candidate discovery ports. A host can run MORE THAN ONE agent
+ *  (e.g. a Windows agent + a WSL agent under mirrored networking,
+ *  sharing the Windows loopback) — each binds a distinct port from
+ *  this range, so the browser must probe the whole range rather than
+ *  a single fixed port. MUST match the agent's `PROBE_PORT` +
+ *  `PROBE_PORT_COUNT` in `rc_local_turn.rs`. */
+export const LOCAL_RELAY_PROBE_PORTS = [47989, 47990, 47991, 47992, 47993]
 
 /** Validate an untrusted JSON blob from the loopback probe into a
  *  [`LocalRelayDescriptor`], or `null`. Pure + exported for tests. */
@@ -1646,7 +1654,9 @@ export const CLIPBOARD_NATIVE_MAX_BYTES = 16 * 1024 * 1024
  *  routes are the bridge half). Only an enrolled local agent with the
  *  clipboard feature answers; everything else times out → graceful
  *  fallback to the browser-reachable lanes. */
-export const LOCAL_CLIPBOARD_BRIDGE_URL = `http://127.0.0.1:${LOCAL_RELAY_PROBE_PORT}/rc-clipboard`
+export function clipboardBridgeUrl(port: number): string {
+  return `http://127.0.0.1:${port}/rc-clipboard`
+}
 
 /** Uint8Array → base64 (chunked — a spread over megabytes of bytes
  *  blows the arg-count/stack limit). Inverse of [`base64ToBytes`].
@@ -1930,6 +1940,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    *  viewer reads native RTF locally and ships it, and writes remote
    *  RTF back to the local clipboard — the Word↔Word fidelity path. */
   const localClipboardBridge = ref<boolean | null>(null)
+  /** The discovery port the local Windows-native bridge answered on
+   *  (a host with several agents binds distinct ports from the
+   *  candidate range). Null until the probe finds one. */
+  const localClipboardBridgePort = ref<number | null>(null)
   const error = ref<string | null>(null)
   const sessionId = ref<string | null>(null)
   /**
@@ -2396,29 +2410,35 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   async function probeLocalClipboardBridge(): Promise<void> {
     if (!supportsClipboardNative.value) {
       localClipboardBridge.value = false
+      localClipboardBridgePort.value = null
       return
     }
-    const ctrl = new AbortController()
-    const timer = setTimeout(() => ctrl.abort(), 1500)
-    try {
-      const res = await fetch(LOCAL_CLIPBOARD_BRIDGE_URL, {
-        method: 'GET',
-        signal: ctrl.signal,
-      })
-      // 204 (no RTF) and 200 (RTF present) both prove the bridge is
-      // there — but a bare 204 also comes from a NON-Windows agent that
-      // can never serve RTF. Gate on the Windows-only capability header
-      // (Access-Control-Expose-Headers makes it readable cross-origin)
-      // so a Linux/mac viewer of a Windows host doesn't falsely opt in
-      // and stream RTF its local bridge can't write.
-      const reachable = res.ok || res.status === 204
-      localClipboardBridge.value =
-        reachable && res.headers.get('x-roomler-clipboard-native') === '1'
-    } catch {
-      localClipboardBridge.value = false
-    } finally {
-      clearTimeout(timer)
+    // Walk the candidate range: a host with several agents binds
+    // distinct ports, and only the WINDOWS-native one carries the
+    // `x-roomler-clipboard-native` header (Access-Control-Expose-
+    // Headers'd for cross-origin reads). Gating on it means a WSL /
+    // Linux agent answering earlier in the range is skipped and the
+    // Windows agent found on the next port. First match wins.
+    for (const port of LOCAL_RELAY_PROBE_PORTS) {
+      const ctrl = new AbortController()
+      const timer = setTimeout(() => ctrl.abort(), 1200)
+      try {
+        const res = await fetch(clipboardBridgeUrl(port), { method: 'GET', signal: ctrl.signal })
+        const reachable = res.ok || res.status === 204
+        if (reachable && res.headers.get('x-roomler-clipboard-native') === '1') {
+          localClipboardBridge.value = true
+          localClipboardBridgePort.value = port
+          return
+        }
+        // Reachable but not native (a non-Windows agent) → keep walking.
+      } catch {
+        // Nothing on this port (connection refused = fast) → next.
+      } finally {
+        clearTimeout(timer)
+      }
     }
+    localClipboardBridge.value = false
+    localClipboardBridgePort.value = null
   }
 
   /** Read the local machine's native clipboard (RTF + alternates) via
@@ -2426,11 +2446,12 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   async function readLocalNativeClipboard(): Promise<
     { rtf: Uint8Array<ArrayBuffer>; html: string; text: string } | null
   > {
-    if (localClipboardBridge.value !== true) return null
+    const port = localClipboardBridgePort.value
+    if (localClipboardBridge.value !== true || port == null) return null
     const ctrl = new AbortController()
     const timer = setTimeout(() => ctrl.abort(), 5000)
     try {
-      const res = await fetch(LOCAL_CLIPBOARD_BRIDGE_URL, { method: 'GET', signal: ctrl.signal })
+      const res = await fetch(clipboardBridgeUrl(port), { method: 'GET', signal: ctrl.signal })
       if (res.status === 204 || !res.ok) return null
       return parseNativeClipPayload(await res.json())
     } catch {
@@ -2447,11 +2468,12 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     html: string
     text: string
   }): Promise<boolean> {
-    if (localClipboardBridge.value !== true) return false
+    const port = localClipboardBridgePort.value
+    if (localClipboardBridge.value !== true || port == null) return false
     const ctrl = new AbortController()
     const timer = setTimeout(() => ctrl.abort(), 8000)
     try {
-      const res = await fetch(LOCAL_CLIPBOARD_BRIDGE_URL, {
+      const res = await fetch(clipboardBridgeUrl(port), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -3468,19 +3490,25 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    *  fetch is exempt from mixed-content blocking; the agent's endpoint must
    *  answer the PNA CORS preflight for HTTPS→localhost on newer Chrome. */
   async function probeLocalRelay(): Promise<LocalRelayDescriptor | null> {
-    const ctl = new AbortController()
-    const timer = setTimeout(() => ctl.abort(), 800)
-    try {
-      const res = await fetch(`http://127.0.0.1:${LOCAL_RELAY_PROBE_PORT}/rc-local-turn`, {
-        signal: ctl.signal,
-      })
-      if (!res.ok) return null
-      return parseLocalRelayDescriptor(await res.json())
-    } catch {
-      return null
-    } finally {
-      clearTimeout(timer)
+    // Walk the candidate range — with multiple agents on the host the
+    // descriptor may be served on a fallback port. First valid
+    // descriptor wins (any agent's local TURN works for the relay).
+    for (const port of LOCAL_RELAY_PROBE_PORTS) {
+      const ctl = new AbortController()
+      const timer = setTimeout(() => ctl.abort(), 800)
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}/rc-local-turn`, { signal: ctl.signal })
+        if (res.ok) {
+          const desc = parseLocalRelayDescriptor(await res.json())
+          if (desc) return desc
+        }
+      } catch {
+        // Nothing on this port → next.
+      } finally {
+        clearTimeout(timer)
+      }
     }
+    return null
   }
 
   /** The unified Codec picker as a computed over the four underlying refs.
@@ -4376,6 +4404,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     videoInfo.value = null
     remoteLayout.value = null
     localClipboardBridge.value = null
+    localClipboardBridgePort.value = null
   }
 
   // Phase 5 — admin break-glass reason for the NEXT `connect()`. The UI sets it
