@@ -749,6 +749,18 @@ to-activate, so the browser never sees a bait-and-switch.
   `Tab` + bare `Backspace` are globally intercepted.
   Ctrl+Alt+Del is exposed as a dedicated toolbar button — the
   OS reserves the real chord, the browser can't catch it.
+- **Keyboard Lock (0.3.0-rc.227)** — the §10 design intent is now
+  implemented: entering fullscreen calls `navigator.keyboard.lock()`
+  (no args = all capturable keys) and `shouldPreventDefault` flips to
+  suppress-everything, so Alt+Tab / Win / Ctrl+W / Ctrl+T / F-keys
+  act on the REMOTE. Hold-Esc exits fullscreen (browser gesture,
+  not cancellable); short Esc taps forward. Chromium-only,
+  feature-detected; other browsers keep the pointer-inside policy.
+  A toast + subtle pill INSIDE `.video-frame` (Vuetify overlays
+  teleport to `<body>` and vanish in fullscreen) advertise the mode.
+  **Ctrl+Alt+End** (RDP convention; plus the literal chord on
+  Linux/macOS viewers) triggers `sendCtrlAltDel()` — AltGr carve-out,
+  repeat-guarded, gated on pointer-over-viewer OR locked fullscreen.
 - **Viewer-indicator overlay** (`viewer-indicator` feature, Windows
   only): topmost layered click-through window on the controlled
   host with a 6 px red border + "Being viewed by: …" caption.
