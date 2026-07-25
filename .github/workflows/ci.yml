@@ -94,7 +94,13 @@ jobs:
         #     ~25 frames behind a non-zero default g_lag_in_frames.
         #   - caps probe assertions: detect_advertises_vp9_444_*
         #     locks the rc:agent.hello advertisement contract.
-        run: cargo test -p roomler-agent --features vp9-444,vp9-444-bindgen --lib
+        #   - clipboard-v2 tests (parse locks, CRLF canonicalization,
+        #     PNG codec, ImageRx, FNV vectors): `clipboard` was never
+        #     in any CI feature lane before v2 — the module is
+        #     `#![cfg(feature = "clipboard")]`, so without it here the
+        #     whole suite silently never ran. arboard/png are pure
+        #     Rust on Linux (X11 headers already installed above).
+        run: cargo test -p roomler-agent --features vp9-444,vp9-444-bindgen,clipboard --lib
 
       # Overlay L3 (Phase 3) feature gate. `overlay-l3` pulls the `tun`
       # crate (Wintun on Windows / /dev/net/tun on Linux) + the TUN↔WG

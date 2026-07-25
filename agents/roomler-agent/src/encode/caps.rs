@@ -333,6 +333,18 @@ fn compute_caps() -> AgentCaps {
         apps.push("launch".into());
     }
 
+    // Clipboard protocol-v2 flags. Advertised purely on feature
+    // presence (like `supports_clipboard`): the handlers for ack /
+    // subscribe / image framing are compiled in with the `clipboard`
+    // feature and degrade at runtime (a headless host without a
+    // clipboard no-ops the DC exactly as v1 did). The browser gates
+    // its auto-sync engine + image paths on these values.
+    let clipboard: Vec<String> = if cfg!(feature = "clipboard") {
+        vec!["ack".into(), "events".into(), "images".into()]
+    } else {
+        Vec::new()
+    };
+
     AgentCaps {
         hw_encoders,
         codecs,
@@ -345,6 +357,7 @@ fn compute_caps() -> AgentCaps {
         vp9_chroma,
         audio,
         apps,
+        clipboard,
     }
 }
 
