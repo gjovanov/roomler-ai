@@ -795,6 +795,14 @@ pub fn spawn_installer_with_watch(
 ///   caller is non-elevated. Pair with [`spawn_installer_inner`]'s
 ///   `ShellExecuteExW`-with-`runas` path so the elevation actually
 ///   happens.
+///
+/// Both flavours append `/l*v <installer>.log` — a verbose MSI log
+/// next to the staged installer. Three field wedges (rc.226, rc.228,
+/// rc.232 self-updates on the dev host: msiexec alive but never
+/// exiting, service left stopped) were undiagnosable because silent
+/// installs leave no trace; the log names the exact action a wedged
+/// run was in. The staging dir is recycled per update, so the log
+/// doesn't accumulate.
 #[cfg(any(target_os = "windows", test))]
 pub fn msiexec_argv(installer: &std::path::Path, flavour: WindowsInstallFlavour) -> Vec<String> {
     let path = installer.to_string_lossy().into_owned();
@@ -802,11 +810,14 @@ pub fn msiexec_argv(installer: &std::path::Path, flavour: WindowsInstallFlavour)
         WindowsInstallFlavour::PerUser => "/qn",
         WindowsInstallFlavour::PerMachine => "/qb!",
     };
+    let log = format!("{path}.log");
     vec![
         "/i".to_string(),
         path,
         ui.to_string(),
         "/norestart".to_string(),
+        "/l*v".to_string(),
+        log,
     ]
 }
 
@@ -1895,7 +1906,9 @@ mod tests {
         assert_eq!(argv[1], r"C:\Temp\roomler-agent.msi");
         assert_eq!(argv[2], "/qn");
         assert_eq!(argv[3], "/norestart");
-        assert_eq!(argv.len(), 4);
+        assert_eq!(argv[4], "/l*v");
+        assert_eq!(argv[5], r"C:\Temp\roomler-agent.msi.log");
+        assert_eq!(argv.len(), 6);
     }
 
     #[test]
@@ -1959,9 +1972,11 @@ mod tests {
         assert_eq!(argv[0], "/i");
         assert_eq!(argv[2], "/qb!");
         assert_eq!(argv[3], "/norestart");
-        // Property appended verbatim, no shell-quoting.
-        assert_eq!(argv[4], "ENABLE_SYSTEM_CONTEXT=1");
-        assert_eq!(argv.len(), 5);
+        assert_eq!(argv[4], "/l*v");
+        // Property appended verbatim after the base argv (incl. the
+        // verbose-log pair), no shell-quoting.
+        assert_eq!(argv[6], "ENABLE_SYSTEM_CONTEXT=1");
+        assert_eq!(argv.len(), 7);
     }
 
     #[test]
@@ -1999,7 +2014,7 @@ mod tests {
             WindowsInstallFlavour::PerMachine,
             &[("A", "1"), ("B", "two"), ("C", "3")],
         );
-        let tail: Vec<&String> = argv.iter().skip(4).collect();
+        let tail: Vec<&String> = argv.iter().skip(6).collect();
         assert_eq!(tail[0], "A=1");
         assert_eq!(tail[1], "B=two");
         assert_eq!(tail[2], "C=3");

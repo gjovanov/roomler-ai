@@ -36,14 +36,22 @@
 //! 4. Updater exits the parent agent so the OS releases its EXE
 //!    file lock.
 //! 5. Watcher polls the installer PID until it exits or 10 min
-//!    elapses.
+//!    elapses. **Windows wedge recovery**: on timeout the watcher
+//!    kills the wedged msiexec (plus any leftover msiexec worker
+//!    holding the machine-wide `_MSIExecute` mutex) and re-runs the
+//!    staged installer ONCE — the exact manual recovery that worked
+//!    3/3 in the field (rc.226/rc.228/rc.232 self-update wedges).
 //! 6. Watcher waits 2 s for the FS to settle, runs `<own-path>
 //!    --version`, compares against the expected tag. Windows: when
 //!    the own-path probe can't verify (P4b renamed the install
 //!    folder, so a rename-hop watcher runs from the vacated dir),
 //!    it falls back to probing `…\Roomler\roomlerd.exe` for the
 //!    running flavour.
-//! 7. Watcher writes `last-install.json` and exits. The supervisor
+//! 7. Watcher writes `last-install.json` and exits. Windows
+//!    perMachine: as a last act the watcher runs `sc start` on the
+//!    SCM service — every observed wedge left the service STOPPED
+//!    (the MSI never reached StartServices), and a host that stays
+//!    down is worse than any install verdict. The supervisor
 //!    relaunches the agent on next logon (Win Scheduled Task) or
 //!    immediately (systemd / launchd). The new binary then reads
 //!    `last-install.json` at startup to surface the outcome.
@@ -181,47 +189,64 @@ pub fn watch(
     let _ = write_outcome(&outcome);
 
     let exit = wait_for_pid(installer_pid, INSTALLER_BUDGET);
-    outcome.finished_unix = Some(unix_now());
     match exit {
         WaitOutcome::Exited(code) => {
             outcome.installer_exit_code = Some(code);
             if code != 0 {
                 outcome.status = InstallStatus::InstallerFailed;
                 outcome.note = format!("installer exited with {code}");
-                let _ = write_outcome(&outcome);
                 tracing::error!(exit = code, "installer failed");
-                return Ok(outcome);
+            } else {
+                verify_new_binary(&mut outcome, &expected_version);
             }
         }
         WaitOutcome::Timeout => {
-            outcome.status = InstallStatus::Timeout;
-            outcome.note = format!(
-                "installer did not exit within {}s",
-                INSTALLER_BUDGET.as_secs()
+            // Windows: this is the field-reproduced msiexec wedge
+            // (client alive forever, service left stopped). Kill it
+            // and retry the staged installer once — see the module
+            // docs, step 5.
+            #[cfg(target_os = "windows")]
+            recover_wedged_install(
+                installer_pid,
+                &installer_path,
+                &expected_version,
+                &mut outcome,
             );
-            let _ = write_outcome(&outcome);
-            tracing::error!("installer timed out");
-            return Ok(outcome);
+            #[cfg(not(target_os = "windows"))]
+            {
+                outcome.status = InstallStatus::Timeout;
+                outcome.note = format!(
+                    "installer did not exit within {}s",
+                    INSTALLER_BUDGET.as_secs()
+                );
+                tracing::error!("installer timed out");
+            }
         }
         WaitOutcome::Error(e) => {
             outcome.status = InstallStatus::Timeout;
             outcome.note = format!("waiting for installer pid: {e}");
-            let _ = write_outcome(&outcome);
             tracing::error!(error = %e, "installer wait failed");
-            return Ok(outcome);
         }
     }
+    outcome.finished_unix = Some(unix_now());
+    // Last act on Windows perMachine: whatever the verdict, never
+    // leave the host's SCM service stopped.
+    #[cfg(target_os = "windows")]
+    ensure_service_running(&mut outcome);
+    let _ = write_outcome(&outcome);
+    Ok(outcome)
+}
 
-    // Installer exited 0 — give the FS a moment to settle, then
-    // run the new binary's `--version`. Through rc.194 the watcher's
-    // own current_exe path was ALSO the path the installer wrote to
-    // (msiexec replaced the file in place while we were running; our
-    // memory map stayed valid). P4b renamed the install folder
-    // (`roomler-agent` → `Roomler`), so on the rename hop the watcher
-    // — spawned from the OLD directory — only ever sees the stale
-    // pending-delete binary at its own path; when that probe can't
-    // verify the expected version, fall back to the flavour-derived
-    // RENAMED directory.
+/// Installer exited 0 — give the FS a moment to settle, then run the
+/// new binary's `--version`. Through rc.194 the watcher's own
+/// current_exe path was ALSO the path the installer wrote to (msiexec
+/// replaced the file in place while we were running; our memory map
+/// stayed valid). P4b renamed the install folder (`roomler-agent` →
+/// `Roomler`), so on the rename hop the watcher — spawned from the OLD
+/// directory — only ever sees the stale pending-delete binary at its
+/// own path; when that probe can't verify the expected version, fall
+/// back to the flavour-derived RENAMED directory.
+fn verify_new_binary(outcome: &mut InstallOutcome, expected_version: &str) {
     std::thread::sleep(POST_INSTALL_SETTLE);
     let exe = std::env::current_exe().ok();
     if let Some(p) = &exe {
@@ -230,7 +255,7 @@ pub fn watch(
             Ok(out) if out.status.success() => {
                 let version = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 outcome.new_binary_version = Some(version.clone());
-                if version_matches(&version, &expected_version) {
+                if version_matches(&version, expected_version) {
                     outcome.status = InstallStatus::SucceededVerified;
                     outcome.note = format!("new binary at {} reports {version}", p.display());
                 } else {
@@ -240,7 +265,7 @@ pub fn watch(
                         p.display()
                     );
                     #[cfg(target_os = "windows")]
-                    try_renamed_dir_fallback(&mut outcome, &expected_version, Some(p));
+                    try_renamed_dir_fallback(outcome, expected_version, Some(p));
                 }
             }
             Ok(out) => {
@@ -250,23 +275,160 @@ pub fn watch(
                     out.status.code().unwrap_or(-1)
                 );
                 #[cfg(target_os = "windows")]
-                try_renamed_dir_fallback(&mut outcome, &expected_version, Some(p));
+                try_renamed_dir_fallback(outcome, expected_version, Some(p));
             }
             Err(e) => {
                 outcome.status = InstallStatus::SucceededUnverified;
                 outcome.note = format!("could not exec new binary --version: {e}");
                 #[cfg(target_os = "windows")]
-                try_renamed_dir_fallback(&mut outcome, &expected_version, Some(p));
+                try_renamed_dir_fallback(outcome, expected_version, Some(p));
             }
         }
     } else {
         outcome.status = InstallStatus::SucceededUnverified;
         outcome.note = "could not resolve own current_exe path".into();
         #[cfg(target_os = "windows")]
-        try_renamed_dir_fallback(&mut outcome, &expected_version, None);
+        try_renamed_dir_fallback(outcome, expected_version, None);
     }
-    let _ = write_outcome(&outcome);
-    Ok(outcome)
+}
+
+/// Windows wedge recovery: the initial msiexec sat past
+/// [`INSTALLER_BUDGET`] without exiting. Field pattern (3/3 on the
+/// dev host, rc.226→rc.232): the client msiexec is alive but inert,
+/// the service is already stopped, and a manual "kill every msiexec,
+/// re-run the staged MSI" recovered every single time — the re-run
+/// completes in under a minute. Automate exactly that, once.
+///
+/// The population sweep (not just our PID) matters: the Windows
+/// Installer service's own msiexec worker can outlive the client and
+/// keep the machine-wide `_MSIExecute` mutex held, which would wedge
+/// the retry the same way. Killing mid-transaction is safe here
+/// because the retry re-enters Windows Installer, which rolls back /
+/// completes any suspended state before installing (observed in all
+/// three manual recoveries).
+#[cfg(target_os = "windows")]
+fn recover_wedged_install(
+    wedged_pid: u32,
+    installer_path: &std::path::Path,
+    expected_version: &str,
+    outcome: &mut InstallOutcome,
+) {
+    tracing::error!(
+        wedged_pid,
+        budget_s = INSTALLER_BUDGET.as_secs(),
+        "installer wedged — killing msiexec and retrying the staged installer once"
+    );
+    outcome.note = format!(
+        "installer wedged (no exit in {}s); killing msiexec and retrying once",
+        INSTALLER_BUDGET.as_secs()
+    );
+    let _ = write_outcome(outcome);
+
+    run_recovery_cmd("taskkill", &["/F", "/T", "/PID", &wedged_pid.to_string()]);
+    std::thread::sleep(Duration::from_secs(5));
+    run_recovery_cmd("taskkill", &["/F", "/IM", "msiexec.exe"]);
+    std::thread::sleep(Duration::from_secs(5));
+
+    let retry_pid = match crate::updater::spawn_installer_inner(installer_path) {
+        Ok(pid) => pid,
+        Err(e) => {
+            outcome.status = InstallStatus::Timeout;
+            outcome.note = format!("installer wedged; retry spawn failed: {e:#}");
+            tracing::error!(error = %e, "retry spawn after wedge failed");
+            return;
+        }
+    };
+    outcome.installer_pid = retry_pid;
+    let _ = write_outcome(outcome);
+    match wait_for_pid(retry_pid, INSTALLER_BUDGET) {
+        WaitOutcome::Exited(0) => {
+            outcome.installer_exit_code = Some(0);
+            verify_new_binary(outcome, expected_version);
+            outcome.note = format!(
+                "recovered by kill+retry after initial {}s wedge; {}",
+                INSTALLER_BUDGET.as_secs(),
+                outcome.note
+            );
+            tracing::info!("retry after wedge succeeded");
+        }
+        WaitOutcome::Exited(code) => {
+            outcome.installer_exit_code = Some(code);
+            outcome.status = InstallStatus::InstallerFailed;
+            outcome.note = format!("retry after wedge exited with {code}");
+            tracing::error!(exit = code, "retry after wedge failed");
+        }
+        WaitOutcome::Timeout => {
+            run_recovery_cmd("taskkill", &["/F", "/T", "/PID", &retry_pid.to_string()]);
+            outcome.status = InstallStatus::Timeout;
+            outcome.note = format!(
+                "retry also wedged (no exit in {}s); killed — see the msiexec /l*v log next to the MSI",
+                INSTALLER_BUDGET.as_secs()
+            );
+            tracing::error!("retry after wedge also timed out");
+        }
+        WaitOutcome::Error(e) => {
+            outcome.status = InstallStatus::Timeout;
+            outcome.note = format!("waiting for retry installer pid: {e}");
+            tracing::error!(error = %e, "retry installer wait failed");
+        }
+    }
+}
+
+/// Spawn a recovery shell-out, log its exit code, never fail the
+/// watcher on it. taskkill exit codes are informational here (128 =
+/// no such process — already gone, which is fine).
+#[cfg(target_os = "windows")]
+fn run_recovery_cmd(cmd: &str, args: &[&str]) {
+    match std::process::Command::new(cmd).args(args).output() {
+        Ok(out) => {
+            tracing::info!(cmd, ?args, code = out.status.code(), "recovery command ran");
+        }
+        Err(e) => {
+            tracing::warn!(cmd, ?args, error = %e, "recovery command failed to spawn");
+        }
+    }
+}
+
+/// Make sure the perMachine SCM service is running before the watcher
+/// exits. Every observed wedge left the service STOPPED (msiexec never
+/// reached StartServices), and nothing else restarts it until a
+/// reboot. `sc start` is effectively idempotent for our purpose:
+/// 1056 (already running) and 1060 (no such service — perUser /
+/// attended flavours never register one) are success-equivalent.
+#[cfg(target_os = "windows")]
+fn ensure_service_running(outcome: &mut InstallOutcome) {
+    if crate::updater::current_install_flavour()
+        != crate::updater::WindowsInstallFlavour::PerMachine
+    {
+        return;
+    }
+    let name = crate::win_service::NEW_SERVICE_NAME;
+    match std::process::Command::new("sc")
+        .args(["start", name])
+        .output()
+    {
+        Ok(out) => {
+            // sc.exe exits with the raw win32 error code.
+            let code = out.status.code().unwrap_or(-1);
+            let verdict = match code {
+                0 => "started",
+                1056 => "already running",
+                1060 => "not installed (non-SCM flavour)",
+                1058 => "disabled — not starting",
+                _ => "start attempt failed",
+            };
+            tracing::info!(service = name, code, verdict, "post-install service check");
+            if !outcome.note.is_empty() {
+                outcome.note.push_str("; ");
+            }
+            outcome
+                .note
+                .push_str(&format!("service {name}: {verdict} (sc exit {code})"));
+        }
+        Err(e) => {
+            tracing::warn!(service = name, error = %e, "sc start failed to spawn");
+        }
+    }
 }
 
 /// P4b folder-rename fallback: probe the daemon at the RENAMED

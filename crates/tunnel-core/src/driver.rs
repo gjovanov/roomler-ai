@@ -1798,6 +1798,15 @@ mod tests {
         let agent_addr = agent.local_addr().unwrap();
         let token = "client-glue-token".to_string();
         let token_a = token.clone();
+        // Keep the agent-side Connection + Endpoint alive until the
+        // client has drained the echo: run_flow_quic hands the tail
+        // bytes + FIN to quinn's send buffer and returns, and if the
+        // task then drops `conn`/`agent` the implicit CONNECTION_CLOSE
+        // races delivery. On a loaded CI runner the close wins → the
+        // client's read_to_end comes back short (the every-other-run
+        // CI flake on this test). Production is immune — real call
+        // sites pump flows on a session-long connection.
+        let (agent_done_tx, agent_done_rx) = oneshot::channel::<()>();
         tokio::spawn(async move {
             let conn = agent.accept().await.unwrap().unwrap();
             quic::server_authenticate(&conn, &token_a).await.unwrap();
@@ -1807,6 +1816,8 @@ mod tests {
                 .unwrap();
             let stats = Arc::new(crate::forward::FlowStats::default());
             run_flow_quic(dst_tcp, send, recv, flow_id, stats).await;
+            let _ = agent_done_rx.await;
+            drop((conn, agent));
         });
 
         // Client: connect + authenticate (cert pinned to the agent's fp).
@@ -1881,6 +1892,9 @@ mod tests {
             &echoed, b"ping over client quic",
             "bytes must round-trip the local TCP ↔ QUIC ↔ agent ↔ dst loop"
         );
+        // Echo fully read — the agent task may now release its
+        // Connection/Endpoint.
+        let _ = agent_done_tx.send(());
 
         glue.await.unwrap().expect("glue returns Ok");
         // After the flow ends the glue emits TcpClosed for audit.
