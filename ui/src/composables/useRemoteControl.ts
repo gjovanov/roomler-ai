@@ -1635,6 +1635,95 @@ export function buildClipboardHtmlFrames(
   }
 }
 
+/** v2.2 — cap on a NATIVE clipboard payload (RTF + html + text) on
+ *  the wire and through the bridge. Mirrors the agent's
+ *  `CLIPBOARD_NATIVE_MAX_BYTES`. RTF hex-encodes embedded images at
+ *  ~2× their binary size, so real documents run to megabytes. */
+export const CLIPBOARD_NATIVE_MAX_BYTES = 16 * 1024 * 1024
+
+/** v2.2 — the loopback clipboard bridge on the VIEWER machine's own
+ *  agent (same fixed port as the TURN probe; the `/rc-clipboard`
+ *  routes are the bridge half). Only an enrolled local agent with the
+ *  clipboard feature answers; everything else times out → graceful
+ *  fallback to the browser-reachable lanes. */
+export const LOCAL_CLIPBOARD_BRIDGE_URL = `http://127.0.0.1:${LOCAL_RELAY_PROBE_PORT}/rc-clipboard`
+
+/** Uint8Array → base64 (chunked — a spread over megabytes of bytes
+ *  blows the arg-count/stack limit). Inverse of [`base64ToBytes`].
+ *  Exported for tests. */
+export function bytesToBase64(bytes: Uint8Array): string {
+  let bin = ''
+  const CHUNK = 0x8000
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    bin += String.fromCharCode(...bytes.subarray(i, Math.min(i + CHUNK, bytes.length)))
+  }
+  return btoa(bin)
+}
+
+/** v2.2 — validate an untrusted bridge GET body into the native
+ *  payload shape. Pure + exported for tests. */
+export function parseNativeClipPayload(
+  raw: unknown,
+): { rtf: Uint8Array<ArrayBuffer>; html: string; text: string } | null {
+  if (raw === null || typeof raw !== 'object') return null
+  const o = raw as Record<string, unknown>
+  if (typeof o.rtf !== 'string' || o.rtf.length === 0) return null
+  let rtf: Uint8Array<ArrayBuffer>
+  try {
+    rtf = base64ToBytes(o.rtf) as Uint8Array<ArrayBuffer>
+  } catch {
+    return null
+  }
+  const html = typeof o.html === 'string' ? o.html : ''
+  const text = typeof o.text === 'string' ? o.text : ''
+  if (rtf.length === 0 || rtf.length + html.length + text.length > CLIPBOARD_NATIVE_MAX_BYTES) {
+    return null
+  }
+  return { rtf, html, text }
+}
+
+/** v2.2 — build the wire frames for one browser → agent NATIVE
+ *  transfer: `clipboard:native-begin` header, ≤16 KiB binary frames
+ *  (rtf ++ html UTF-8 ++ text UTF-8), `clipboard:native-end` trailer.
+ *  Null when the combined payload exceeds the cap. Exported for
+ *  tests. */
+export function buildClipboardNativeFrames(
+  rtf: Uint8Array<ArrayBuffer>,
+  html: string,
+  text: string,
+): { id: string; begin: string; frames: Uint8Array<ArrayBuffer>[]; end: string } | null {
+  const enc = new TextEncoder()
+  const htmlBytes = enc.encode(html)
+  const textBytes = enc.encode(text)
+  const total = rtf.length + htmlBytes.length + textBytes.length
+  if (rtf.length === 0 || total > CLIPBOARD_NATIVE_MAX_BYTES) return null
+  const combined = new Uint8Array(total)
+  combined.set(rtf, 0)
+  combined.set(htmlBytes, rtf.length)
+  combined.set(textBytes, rtf.length + htmlBytes.length)
+  const id =
+    'cb-native-' +
+    Date.now().toString(36) +
+    '-' +
+    Math.random().toString(36).slice(2, 10)
+  const frames: Uint8Array<ArrayBuffer>[] = []
+  for (let off = 0; off < combined.length; off += CLIPBOARD_IMG_FRAME_BYTES) {
+    frames.push(combined.subarray(off, Math.min(off + CLIPBOARD_IMG_FRAME_BYTES, combined.length)))
+  }
+  return {
+    id,
+    begin: JSON.stringify({
+      t: 'clipboard:native-begin',
+      id,
+      rtf_bytes: rtf.length,
+      html_bytes: htmlBytes.length,
+      text_bytes: textBytes.length,
+    }),
+    frames,
+    end: JSON.stringify({ t: 'clipboard:native-end', id }),
+  }
+}
+
 /** Clipboard auto-sync opt-out. Default ON — only an explicit '0'
  *  disables (the feature is the whole point of clipboard v2; users
  *  who want the old button-driven flow flip the Settings toggle). */
@@ -1831,6 +1920,16 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   const supportsClipboardEvents = computed(() => clipboardCaps.value.includes('events'))
   const supportsClipboardImages = computed(() => clipboardCaps.value.includes('images'))
   const supportsClipboardHtml = computed(() => clipboardCaps.value.includes('html'))
+  /** v2.2 — the REMOTE agent can read/write RTF (embedded images).
+   *  Needed for the full-fidelity path, but only usable when the
+   *  VIEWER also has a local bridge (see `localClipboardBridge`). */
+  const supportsClipboardNative = computed(() => clipboardCaps.value.includes('native'))
+  /** v2.2 — whether THIS machine's local agent exposes the loopback
+   *  clipboard bridge. Probed once per connect (loopback is never
+   *  firewalled); null until probed, then true/false. When true, the
+   *  viewer reads native RTF locally and ships it, and writes remote
+   *  RTF back to the local clipboard — the Word↔Word fidelity path. */
+  const localClipboardBridge = ref<boolean | null>(null)
   const error = ref<string | null>(null)
   const sessionId = ref<string | null>(null)
   /**
@@ -2265,7 +2364,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       resolve: (
         content:
           | { kind: 'image'; blob: Blob; w: number; h: number }
-          | { kind: 'html'; html: string; text: string },
+          | { kind: 'html'; html: string; text: string }
+          | { kind: 'native'; rtf: Uint8Array<ArrayBuffer>; html: string; text: string },
       ) => void
       reject: (err: Error) => void
     }
@@ -2275,14 +2375,123 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     | { kind: 'text'; text: string }
     | { kind: 'image'; blob: Blob; w: number; h: number }
     | { kind: 'html'; html: string; text: string }
+    | { kind: 'native'; rtf: Uint8Array<ArrayBuffer>; html: string; text: string }
   /** Latest remote change that arrived while this tab was unfocused
    *  (clipboard writes need document focus). Applied on refocus unless
    *  the operator copied something new locally in the meantime —
    *  local wins then (last-writer-wins approximation, no clocks). */
   let pendingRemoteApply: RemoteClipContent | null = null
 
+  /** v2.2 — the full fidelity path is available only when the REMOTE
+   *  agent speaks native AND THIS machine has a local bridge to reach
+   *  its own RTF clipboard. */
+  const canUseNativeClipboard = computed(
+    () => supportsClipboardNative.value && localClipboardBridge.value === true,
+  )
+
+  /** Probe the local agent's clipboard bridge once (loopback, ~1.5 s
+   *  timeout). A local enrolled agent with the clipboard feature
+   *  answers; anything else (no agent, feature off, PNA-blocked)
+   *  leaves the flag false and the viewer stays on the DC lanes. */
+  async function probeLocalClipboardBridge(): Promise<void> {
+    if (!supportsClipboardNative.value) {
+      localClipboardBridge.value = false
+      return
+    }
+    const ctrl = new AbortController()
+    const timer = setTimeout(() => ctrl.abort(), 1500)
+    try {
+      const res = await fetch(LOCAL_CLIPBOARD_BRIDGE_URL, {
+        method: 'GET',
+        signal: ctrl.signal,
+      })
+      // 204 (no RTF) and 200 (RTF present) both prove the bridge is
+      // there — but a bare 204 also comes from a NON-Windows agent that
+      // can never serve RTF. Gate on the Windows-only capability header
+      // (Access-Control-Expose-Headers makes it readable cross-origin)
+      // so a Linux/mac viewer of a Windows host doesn't falsely opt in
+      // and stream RTF its local bridge can't write.
+      const reachable = res.ok || res.status === 204
+      localClipboardBridge.value =
+        reachable && res.headers.get('x-roomler-clipboard-native') === '1'
+    } catch {
+      localClipboardBridge.value = false
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  /** Read the local machine's native clipboard (RTF + alternates) via
+   *  the bridge. Null when the bridge is absent or holds no RTF. */
+  async function readLocalNativeClipboard(): Promise<
+    { rtf: Uint8Array<ArrayBuffer>; html: string; text: string } | null
+  > {
+    if (localClipboardBridge.value !== true) return null
+    const ctrl = new AbortController()
+    const timer = setTimeout(() => ctrl.abort(), 5000)
+    try {
+      const res = await fetch(LOCAL_CLIPBOARD_BRIDGE_URL, { method: 'GET', signal: ctrl.signal })
+      if (res.status === 204 || !res.ok) return null
+      return parseNativeClipPayload(await res.json())
+    } catch {
+      return null
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  /** Write RTF + alternates to the local machine's clipboard via the
+   *  bridge. Returns true on success. */
+  async function writeLocalNativeClipboard(content: {
+    rtf: Uint8Array<ArrayBuffer>
+    html: string
+    text: string
+  }): Promise<boolean> {
+    if (localClipboardBridge.value !== true) return false
+    const ctrl = new AbortController()
+    const timer = setTimeout(() => ctrl.abort(), 8000)
+    try {
+      const res = await fetch(LOCAL_CLIPBOARD_BRIDGE_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          rtf: bytesToBase64(content.rtf),
+          html: content.html,
+          text: content.text,
+        }),
+        signal: ctrl.signal,
+      })
+      return res.ok || res.status === 204
+    } catch {
+      return false
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
   async function writeRemoteContentToLocalClipboard(content: RemoteClipContent): Promise<void> {
     try {
+      if (content.kind === 'native') {
+        // v2.2 — full fidelity: write RTF (embedded images) to the
+        // local clipboard via the bridge. Fall back to the html lane
+        // if the bridge write fails.
+        const ok = await writeLocalNativeClipboard(content)
+        if (ok) {
+          clipboardEchoGate.recordApplied(hashClipboardBytes(content.rtf))
+          if (content.text) clipboardEchoGate.recordPushed(hashClipboardText(content.text))
+          return
+        }
+        if (content.html) {
+          await writeRemoteContentToLocalClipboard({
+            kind: 'html',
+            html: content.html,
+            text: content.text,
+          })
+        } else if (content.text) {
+          await writeRemoteContentToLocalClipboard({ kind: 'text', text: content.text })
+        }
+        return
+      }
       if (content.kind === 'text') {
         await globalThis.navigator.clipboard.writeText(content.text)
         clipboardEchoGate.recordApplied(hashClipboardText(content.text))
@@ -2401,6 +2610,29 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     } catch {
       return false
     }
+  }
+
+  /** v2.2 — read the local machine's native RTF via the bridge and
+   *  push it as a native transfer (full fidelity, embedded images).
+   *  Returns true when HANDLED (pushed or recognized as an echo);
+   *  false → the caller falls back to the html/text lanes. `textHash`
+   *  is the readText hash that triggered the sync — recorded so later
+   *  polls don't re-push the text alt. */
+  async function pushLocalNativeToRemote(ch: RTCDataChannel, textHash: string): Promise<boolean> {
+    const native = await readLocalNativeClipboard()
+    if (!native) return false // no RTF locally → html/text fallback
+    const rtfHash = hashClipboardBytes(native.rtf)
+    if (!clipboardEchoGate.shouldPush(rtfHash)) {
+      clipboardEchoGate.recordPushed(textHash)
+      return true
+    }
+    const built = buildClipboardNativeFrames(native.rtf, native.html, native.text)
+    if (!built) return false // oversized → html/text fallback
+    if (!(await sendRichFramesOverDc(ch, built))) return false
+    clipboardEchoGate.recordPushed(rtfHash)
+    clipboardEchoGate.recordPushed(textHash)
+    if (native.html) clipboardEchoGate.recordPushed(hashClipboardHtml(native.html, native.text))
+    return true
   }
 
   /** v2.1 — read the local clipboard's text/html (one clipboard.read())
@@ -2527,6 +2759,13 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       if (normalizeClipboardText(text) !== '') {
         const hash = hashClipboardText(text)
         if (clipboardEchoGate.shouldPush(hash)) {
+          // v2.2 — richest available: when both ends can do native and
+          // this machine has a local bridge, ship RTF (embedded
+          // images). One bridge GET per actual change, not per tick.
+          if (canUseNativeClipboard.value && reason !== 'poll') {
+            const handled = await pushLocalNativeToRemote(ch, hash)
+            if (handled) return
+          }
           // v2.1 — new content detected via the cheap readText. Prefer
           // the RICH form when the agent takes html: one clipboard.read()
           // per actual change (not per poll tick).
@@ -2568,6 +2807,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
                   'text',
                   ...(supportsClipboardImages.value ? ['image'] : []),
                   ...(supportsClipboardHtml.value ? ['html'] : []),
+                  // Only ask for native events if we can actually apply
+                  // them (local bridge present) — else the remote would
+                  // ship megabytes of RTF we'd only downgrade to html.
+                  ...(canUseNativeClipboard.value ? ['native'] : []),
                 ],
               }
             : { t: 'clipboard:unsubscribe' },
@@ -4132,6 +4375,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     currentDesktop.value = 'Default'
     videoInfo.value = null
     remoteLayout.value = null
+    localClipboardBridge.value = null
   }
 
   // Phase 5 — admin break-glass reason for the NEXT `connect()`. The UI sets it
@@ -4404,13 +4648,18 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     channels.clipboard.binaryType = 'arraybuffer'
     channels.clipboard.onopen = () => {
       if (clipboardAutoSyncEnabled.value) {
-        // Subscribe to host clipboard changes (v2 agents only — the
-        // gate is inside sendClipboardSubscription) and start the
-        // local→remote triggers. Re-fires automatically on the fresh
-        // DC after a reconnect.
-        sendClipboardSubscription(true)
-        startClipboardSyncTriggers()
-        void syncLocalClipboardToRemote('connect')
+        // v2.2 — probe the local bridge FIRST (it decides whether we
+        // ask the remote for native events), then subscribe + start
+        // the local→remote triggers. The probe is a ~1.5 s loopback
+        // fetch; subscribing after it means the `native` event opt-in
+        // reflects real availability. Re-fires on the fresh DC after a
+        // reconnect.
+        void probeLocalClipboardBridge().finally(() => {
+          if (channels.clipboard?.readyState !== 'open') return
+          sendClipboardSubscription(true)
+          startClipboardSyncTriggers()
+          void syncLocalClipboardToRemote('connect')
+        })
       }
     }
     channels.clipboard.onclose = () => {
@@ -4659,9 +4908,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     const pendingClipboardEventChunks = new Map<string, string>()
     let inboundClipRich: {
       id: string
-      kind: 'image' | 'html'
+      kind: 'image' | 'html' | 'native'
       w: number
       h: number
+      rtfBytes: number
       htmlBytes: number
       declared: number
       chunks: BlobPart[]
@@ -4732,6 +4982,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         bytes?: number
         html_bytes?: number
         text_bytes?: number
+        rtf_bytes?: number
       }
       try {
         msg = JSON.parse(ev.data)
@@ -4780,6 +5031,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
           kind: 'image',
           w: typeof msg.w === 'number' ? msg.w : 0,
           h: typeof msg.h === 'number' ? msg.h : 0,
+          rtfBytes: 0,
           htmlBytes: 0,
           declared,
           chunks: [],
@@ -4806,6 +5058,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
           kind: 'html',
           w: 0,
           h: 0,
+          rtfBytes: 0,
           htmlBytes,
           declared,
           chunks: [],
@@ -4815,7 +5068,45 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         }
         return
       }
-      if (msg.t === 'clipboard:img-end' || msg.t === 'clipboard:html-end') {
+      if (msg.t === 'clipboard:native-begin') {
+        const rtfBytes = typeof msg.rtf_bytes === 'number' ? msg.rtf_bytes : 0
+        const htmlBytes = typeof msg.html_bytes === 'number' ? msg.html_bytes : 0
+        const textBytes = typeof msg.text_bytes === 'number' ? msg.text_bytes : 0
+        const declared = rtfBytes + htmlBytes + textBytes
+        // All three lengths must be non-negative and the rtf+html split
+        // must fall inside the declared total, else the native-end
+        // reassembly would mis-slice on a malformed/hostile header.
+        if (
+          typeof msg.id !== 'string' ||
+          rtfBytes <= 0 ||
+          htmlBytes < 0 ||
+          textBytes < 0 ||
+          rtfBytes + htmlBytes > declared ||
+          declared > CLIPBOARD_NATIVE_MAX_BYTES
+        ) {
+          return
+        }
+        dropInboundClipRich()
+        inboundClipRich = {
+          id: msg.id,
+          kind: 'native',
+          w: 0,
+          h: 0,
+          rtfBytes,
+          htmlBytes,
+          declared,
+          chunks: [],
+          received: 0,
+          reqId: typeof msg.req_id === 'number' ? msg.req_id : null,
+          timer: setTimeout(() => dropInboundClipRich(), 15_000),
+        }
+        return
+      }
+      if (
+        msg.t === 'clipboard:img-end' ||
+        msg.t === 'clipboard:html-end' ||
+        msg.t === 'clipboard:native-end'
+      ) {
         if (!inboundClipRich || inboundClipRich.id !== msg.id) return
         const rich = inboundClipRich
         clearTimeout(rich.timer)
@@ -4827,7 +5118,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         if (rich.kind === 'image') {
           const blob = new Blob(rich.chunks, { type: 'image/png' })
           finishInboundClipRich({ kind: 'image', blob, w: rich.w, h: rich.h }, rich.reqId)
-        } else {
+        } else if (rich.kind === 'html') {
           // html — decode the combined bytes and split at the declared
           // html length (both halves are UTF-8 strings).
           void new Blob(rich.chunks).arrayBuffer().then((buf) => {
@@ -4836,6 +5127,17 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
             const html = dec.decode(bytes.subarray(0, rich.htmlBytes))
             const text = dec.decode(bytes.subarray(rich.htmlBytes))
             finishInboundClipRich({ kind: 'html', html, text }, rich.reqId)
+          })
+        } else {
+          // native — split rtf ++ html ++ text at the declared lengths
+          // (rtf is raw bytes; html/text are UTF-8 strings).
+          void new Blob(rich.chunks).arrayBuffer().then((buf) => {
+            const bytes = new Uint8Array(buf) as Uint8Array<ArrayBuffer>
+            const dec = new TextDecoder('utf-8')
+            const rtf = bytes.slice(0, rich.rtfBytes) as Uint8Array<ArrayBuffer>
+            const html = dec.decode(bytes.subarray(rich.rtfBytes, rich.rtfBytes + rich.htmlBytes))
+            const text = dec.decode(bytes.subarray(rich.rtfBytes + rich.htmlBytes))
+            finishInboundClipRich({ kind: 'native', rtf, html, text }, rich.reqId)
           })
         }
         return
@@ -5768,6 +6070,53 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       // takes html, ship both formats so the remote app pastes
       // formatting (tables, bold, web images), ack-gated like text.
       const html = dt.getData('text/html') ?? ''
+      // v2.2 — full fidelity via the local bridge: read the machine's
+      // RTF (embedded images the paste event can't carry) and ship it,
+      // ack-gated. Only when both ends support native AND a local
+      // bridge is present; else fall through to html/text.
+      if (html && canUseNativeClipboard.value) {
+        const ch = channels.clipboard
+        if (ch && ch.readyState === 'open') {
+          if (pendingCtrlV?.timer) {
+            clearTimeout(pendingCtrlV.timer)
+            pendingCtrlV.timer = null
+          }
+          void (async () => {
+            let sent = false
+            const native = await readLocalNativeClipboard()
+            if (native) {
+              const rtfHash = hashClipboardBytes(native.rtf)
+              if (clipboardEchoGate.knows(rtfHash)) {
+                flushPendingCtrlV()
+                return
+              }
+              const built = buildClipboardNativeFrames(native.rtf, native.html, native.text)
+              if (built && (await sendRichFramesOverDc(ch, built))) {
+                clipboardEchoGate.recordPushed(rtfHash)
+                if (text) clipboardEchoGate.recordPushed(hashClipboardText(text))
+                if (supportsClipboardAck.value) {
+                  await awaitClipboardAck(built.id, CLIPBOARD_ACK_TIMEOUT_MS)
+                }
+                sent = true
+              }
+            }
+            // Bridge had no RTF / oversized / failed → html fallback
+            // (still ack-gated) so the paste isn't downgraded to text.
+            if (!sent && supportsClipboardHtml.value) {
+              const built = buildClipboardHtmlFrames(html, text)
+              if (built && (await sendRichFramesOverDc(ch, built))) {
+                clipboardEchoGate.recordPushed(hashClipboardHtml(html, text))
+                if (text) clipboardEchoGate.recordPushed(hashClipboardText(text))
+                if (supportsClipboardAck.value) {
+                  await awaitClipboardAck(built.id, CLIPBOARD_ACK_TIMEOUT_MS)
+                }
+              }
+            }
+            flushPendingCtrlV()
+          })()
+          return
+        }
+      }
       if (html && supportsClipboardHtml.value) {
         const ch = channels.clipboard
         if (ch && ch.readyState === 'open') {
@@ -5967,11 +6316,13 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     | { kind: 'text'; text: string }
     | { kind: 'image'; blob: Blob; w: number; h: number }
     | { kind: 'html'; html: string; text: string }
+    | { kind: 'native'; rtf: Uint8Array<ArrayBuffer>; html: string; text: string }
   > {
     const accept = [
       'text',
       ...(supportsClipboardImages.value ? ['image'] : []),
       ...(supportsClipboardHtml.value ? ['html'] : []),
+      ...(canUseNativeClipboard.value ? ['native'] : []),
     ]
     if (accept.length === 1) {
       const text = await getAgentClipboard()
@@ -7080,6 +7431,16 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     supportsClipboardEvents,
     supportsClipboardImages,
     supportsClipboardHtml,
+    /** v2.2 — remote agent speaks RTF, and whether this machine has a
+     *  local bridge to reach its own RTF clipboard (the Word↔Word
+     *  full-fidelity path). `canUseNativeClipboard` = both true. */
+    supportsClipboardNative,
+    localClipboardBridge,
+    canUseNativeClipboard,
+    /** v2.2 — write a native (RTF) payload to THIS machine's clipboard
+     *  via the local bridge. Used by the manual Get button so the view
+     *  doesn't need bridge access. Returns true on success. */
+    writeLocalNativeClipboard,
     sendCtrlAltDel,
     uploadFile,
     uploadFiles,

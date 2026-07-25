@@ -28,6 +28,7 @@ import {
   CLIPBOARD_IMAGE_MAX_BYTES,
   CLIPBOARD_IMG_FRAME_BYTES,
   CLIPBOARD_HTML_MAX_BYTES,
+  CLIPBOARD_NATIVE_MAX_BYTES,
   normalizeClipboardText,
   hashClipboardBytes,
   hashClipboardText,
@@ -35,6 +36,9 @@ import {
   createClipboardEchoGate,
   buildClipboardImageFrames,
   buildClipboardHtmlFrames,
+  buildClipboardNativeFrames,
+  parseNativeClipPayload,
+  bytesToBase64,
   VP9_444_DC_LABEL,
   VP9_444_DC_OPTIONS,
   readStoredAudioEnabled,
@@ -1397,6 +1401,70 @@ describe('clipboard html helpers (v2.1)', () => {
     const built = buildClipboardHtmlFrames(html, 'alt')
     expect(built).not.toBeNull()
     expect(built!.frames.length).toBeGreaterThanOrEqual(3)
+  })
+})
+
+describe('clipboard native (RTF) helpers (v2.2)', () => {
+  it('bytesToBase64 round-trips through base64ToBytes incl. high bytes', () => {
+    const bytes = new Uint8Array([0x7b, 0x5c, 0x72, 0x74, 0x66, 0x00, 0xff, 0x80])
+    expect(base64ToBytes(bytesToBase64(bytes))).toEqual(bytes)
+    // Chunk-boundary correctness: > 0x8000 bytes.
+    const big = new Uint8Array(0x8000 + 123)
+    for (let i = 0; i < big.length; i++) big[i] = i & 0xff
+    expect(base64ToBytes(bytesToBase64(big))).toEqual(big)
+  })
+
+  it('parseNativeClipPayload validates and decodes base64 rtf', () => {
+    const p = parseNativeClipPayload({ rtf: bytesToBase64(new Uint8Array([1, 2, 3])), html: '<b>x</b>', text: 'x' })
+    expect(p).not.toBeNull()
+    expect(Array.from(p!.rtf)).toEqual([1, 2, 3])
+    expect(p!.html).toBe('<b>x</b>')
+    expect(p!.text).toBe('x')
+    // Missing / empty / non-object rtf → null; html+text default to ''.
+    expect(parseNativeClipPayload({ html: 'x' })).toBeNull()
+    expect(parseNativeClipPayload({ rtf: '' })).toBeNull()
+    expect(parseNativeClipPayload(null)).toBeNull()
+    const sparse = parseNativeClipPayload({ rtf: bytesToBase64(new Uint8Array([9])) })
+    expect(sparse).not.toBeNull()
+    expect(sparse!.html).toBe('')
+    expect(sparse!.text).toBe('')
+  })
+
+  it('buildClipboardNativeFrames frames rtf++html++text at declared lengths', () => {
+    const rtf = new Uint8Array([0x7b, 0x5c, 0x72, 0x74, 0x66, 0x31]) // {\rtf1
+    const html = '<b>b</b>'
+    const text = 'b'
+    const built = buildClipboardNativeFrames(rtf, html, text)
+    expect(built).not.toBeNull()
+    const enc = new TextEncoder()
+    const begin = JSON.parse(built!.begin)
+    expect(begin).toEqual({
+      t: 'clipboard:native-begin',
+      id: built!.id,
+      rtf_bytes: rtf.length,
+      html_bytes: enc.encode(html).length,
+      text_bytes: enc.encode(text).length,
+    })
+    expect(JSON.parse(built!.end)).toEqual({ t: 'clipboard:native-end', id: built!.id })
+    const total = built!.frames.reduce((a, f) => a + f.byteLength, 0)
+    expect(total).toBe(rtf.length + enc.encode(html).length + enc.encode(text).length)
+    const joined = new Uint8Array(total)
+    let off = 0
+    for (const f of built!.frames) {
+      joined.set(f, off)
+      off += f.byteLength
+    }
+    expect(Array.from(joined.subarray(0, rtf.length))).toEqual(Array.from(rtf))
+    const dec = new TextDecoder('utf-8')
+    expect(dec.decode(joined.subarray(rtf.length, rtf.length + enc.encode(html).length))).toBe(html)
+    expect(dec.decode(joined.subarray(rtf.length + enc.encode(html).length))).toBe(text)
+  })
+
+  it('refuses empty rtf and oversized native payloads', () => {
+    expect(buildClipboardNativeFrames(new Uint8Array(0), '<b/>', 't')).toBeNull()
+    const big = new Uint8Array(CLIPBOARD_NATIVE_MAX_BYTES + 1)
+    big[0] = 1
+    expect(buildClipboardNativeFrames(big, '', '')).toBeNull()
   })
 })
 
