@@ -37,9 +37,20 @@ use tracing::{info, warn};
 use tunnel_core::localapi::OverlayView;
 use tunnel_core::transport::turn_host::LocalTurnHost;
 
-/// Fixed loopback port the browser probes. MUST match `LOCAL_RELAY_PROBE_PORT`
+/// Primary loopback discovery port. MUST match `LOCAL_RELAY_PROBE_PORT`
 /// in `ui/src/composables/useRemoteControl.ts`.
 pub const PROBE_PORT: u16 = 47989;
+/// How many consecutive ports (from [`PROBE_PORT`]) form the candidate
+/// range the server tries and the browser probes. A host running N
+/// agents needs ≥N free ports here; 5 covers the realistic
+/// Windows+WSL (+ a stray) co-tenancy. MUST match the browser's
+/// `LOCAL_RELAY_PROBE_PORTS`.
+pub const PROBE_PORT_COUNT: u16 = 5;
+
+/// The candidate discovery ports, `PROBE_PORT ..= PROBE_PORT+COUNT-1`.
+fn probe_ports() -> impl Iterator<Item = u16> + Clone {
+    (0..PROBE_PORT_COUNT).map(|i| PROBE_PORT + i)
+}
 
 /// TTL of a minted relay credential (handed to the browser + remote agent).
 const CRED_TTL: Duration = Duration::from_secs(3600);
@@ -155,48 +166,57 @@ async fn serve(
     agent_id: String,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    // Bind with retry (rc.231 self-heal, mirroring the LocalAPI pipe's
-    // rc.158 fix). During an MSI upgrade the OLD worker still holds
-    // 47989 for a few seconds while the NEW worker starts; a single
-    // bind attempt loses that race and the probe (TURN relay assist +
-    // the v2.2 clipboard bridge) stays dead until a clean restart —
-    // which silently broke Tier-2 clipboard field-testing after every
-    // agent upgrade. Retry across the handover window instead.
+    // Bind the FIRST FREE port in the candidate range (rc.232), not a
+    // single fixed port. A host can run MORE THAN ONE agent — e.g.
+    // NEO16's Windows agent + a WSL agent under Win11 mirrored
+    // networking, which share the Windows loopback and both want 47989
+    // — so a fixed port deadlocks: whoever loses gets "address in use"
+    // FOREVER (the earlier bind-retry only covered the transient
+    // MSI-upgrade handover, not a persistent co-tenant). Walking the
+    // range lets each agent bind a distinct port; the browser probes
+    // the whole range and (for the clipboard bridge) gates on the
+    // Windows-only capability header, so it naturally skips a WSL
+    // agent answering on 47989 and finds the Windows agent on 47990.
+    // The outer retry still covers the handover window.
     let listener = {
-        let mut listener = None;
-        for attempt in 1..=BIND_MAX_ATTEMPTS {
-            match TcpListener::bind((Ipv4Addr::LOCALHOST, PROBE_PORT)).await {
-                Ok(l) => {
-                    if attempt > 1 {
-                        info!(
-                            port = PROBE_PORT,
-                            attempt, "loopback probe: bound after retry"
-                        );
+        let mut bound: Option<TcpListener> = None;
+        'retry: for attempt in 1..=BIND_MAX_ATTEMPTS {
+            for port in probe_ports() {
+                if let Ok(l) = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await {
+                    if attempt > 1 || port != PROBE_PORT {
+                        info!(port, attempt, "loopback probe: bound (range walk)");
                     }
-                    listener = Some(l);
-                    break;
+                    bound = Some(l);
+                    break 'retry;
                 }
-                Err(e) if attempt == BIND_MAX_ATTEMPTS => {
-                    warn!(port = PROBE_PORT, error = %e, attempts = attempt, "loopback probe: bind failed after retries; disabled");
-                }
-                Err(_) => {
-                    // Wait out the handover, but bail promptly on shutdown.
-                    tokio::select! {
-                        _ = tokio::time::sleep(BIND_RETRY_DELAY) => {}
-                        _ = shutdown.changed() => {
-                            if *shutdown.borrow() { return; }
-                        }
-                    }
+            }
+            if attempt == BIND_MAX_ATTEMPTS {
+                warn!(
+                    ports = ?probe_ports().collect::<Vec<_>>(),
+                    attempts = attempt,
+                    "loopback probe: no free port in the candidate range after retries; disabled"
+                );
+                break;
+            }
+            // Whole range busy — wait out the handover, bail on shutdown.
+            tokio::select! {
+                _ = tokio::time::sleep(BIND_RETRY_DELAY) => {}
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() { return; }
                 }
             }
         }
-        match listener {
+        match bound {
             Some(l) => l,
             None => return,
         }
     };
+    let bound_port = listener
+        .local_addr()
+        .map(|a| a.port())
+        .unwrap_or(PROBE_PORT);
     info!(
-        port = PROBE_PORT,
+        port = bound_port,
         "loopback-TURN: probe on 127.0.0.1 (ROOMLER_AGENT_LOCAL_TURN)"
     );
 
