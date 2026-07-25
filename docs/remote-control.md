@@ -747,7 +747,29 @@ to-activate, so the browser never sees a bait-and-switch.
   surfaces as two hashes (combined + text-alt via readText polling).
   Covers formatting, tables and WEB-HOSTED images; images EMBEDDED in
   local documents (Word ⌘A copies) are only reachable via native RTF
-  — that's the planned local-agent rich-clipboard bridge (Tier 2).
+  — that's the local-agent rich-clipboard bridge (v2.2 below).
+- **Clipboard v2.2 — native (RTF) lane + loopback bridge** (caps +=
+  `"native"`, Windows agents). Full Word↔Word fidelity, EMBEDDED
+  images included. The browser Clipboard API can't see RTF, so the
+  VIEWER machine's own enrolled agent serves it over a loopback HTTP
+  bridge — `GET/POST /rc-clipboard` on the EXISTING corp-relay-assist
+  probe (`127.0.0.1:47989`, `rc_local_turn.rs`): GET → `NativePayload`
+  JSON (base64 RTF + html + text, 204 when no RTF), POST → native
+  write. The browser probes it once per connect; when present AND the
+  remote agent advertises `native`, `syncLocalClipboardToRemote` reads
+  local RTF and ships it as a `clipboard:native-begin` / binary frames
+  (rtf ++ html ++ text) / `native-end` stream, 16 MiB cap; the remote
+  agent writes it via clipboard-win raw `register_format("Rich Text
+  Format")` + `set_without_clear` (html+text via arboard first, RTF
+  appended without clearing). Remote→local applies through the bridge
+  POST. Echo suppression: ONE process-shared clipboard worker
+  (`Clipboard::shared()`) so a bridge write is never re-pushed by a
+  co-hosted session watcher; RTF-byte hashes marked on both apply and
+  push. Trust model = the TURN probe's: loopback-only bind + strict
+  browser-origin CORS/PNA allowlist + no capability a local process
+  doesn't already have (any local app can write the OS clipboard).
+  Escape `ROOMLER_AGENT_CLIPBOARD_BRIDGE=0`. Without a local bridge
+  (no viewer-side agent) the flow degrades to the v2.1 html lane.
 - **File DC** (0.1.33): browser drag/pick → `files:begin` →
   64 KiB ArrayBuffer chunks with `bufferedAmount` back-pressure →
   `files:end` → agent writes into the controlled host's Downloads
