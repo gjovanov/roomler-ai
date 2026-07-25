@@ -47,6 +47,75 @@ pub trait NetstackPinger: Send + Sync {
     async fn ping(&self, dst: IpAddr, timeout: Duration) -> Result<Duration, String>;
 }
 
+/// P8-cosmetics — OS-level ICMP pinger for OS-TUN nodes, so the `peers` RTT
+/// column is populated everywhere (it was netstack-only before — "— by-design
+/// on OS-TUN"). Shells the platform `ping` once per probe and parses ping's
+/// OWN reported round-trip (subprocess spawn cost never pollutes the number).
+/// The overlay ICMP path is exactly what a user's own `ping 100.64.x.y`
+/// exercises, so the column now shows the same truth they'd measure.
+pub struct OsPinger;
+
+#[async_trait]
+impl NetstackPinger for OsPinger {
+    async fn ping(&self, dst: IpAddr, timeout: Duration) -> Result<Duration, String> {
+        let target = dst.to_string();
+        let mut cmd = tokio::process::Command::new("ping");
+        #[cfg(windows)]
+        {
+            let ms = timeout.as_millis().max(100).to_string();
+            cmd.args(["-n", "1", "-w", &ms, &target]);
+            // CREATE_NO_WINDOW — never flash a console under an interactive
+            // session (the prober runs every 15 s).
+            cmd.creation_flags(0x0800_0000);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let secs = timeout.as_secs().max(1).to_string();
+            cmd.args(["-c", "1", "-W", &secs, &target]);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let ms = timeout.as_millis().max(1000).to_string();
+            cmd.args(["-c", "1", "-W", &ms, &target]);
+        }
+        cmd.stdin(std::process::Stdio::null());
+        let out = tokio::time::timeout(timeout + Duration::from_secs(2), cmd.output())
+            .await
+            .map_err(|_| "ping subprocess timed out".to_string())?
+            .map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            return Err("no reply".into());
+        }
+        parse_ping_ms(&String::from_utf8_lossy(&out.stdout))
+            .map(Duration::from_millis)
+            .ok_or_else(|| "no rtt in ping output".into())
+    }
+}
+
+/// Locale-tolerant extraction of the round-trip from `ping` output: the
+/// integer immediately before the first standalone-ish "ms" ("time=4ms",
+/// "Zeit=4ms", "time<1ms", "time=0.523 ms" ⇒ 4 / 4 / 1 / 0). Pure.
+pub(crate) fn parse_ping_ms(s: &str) -> Option<u64> {
+    for (idx, _) in s.match_indices("ms") {
+        let head = s[..idx].trim_end();
+        let num: String = head
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        if num.is_empty() {
+            continue; // "ms" inside a word ("streams") — keep scanning
+        }
+        if let Ok(v) = num.split('.').next().unwrap_or("").parse::<u64>() {
+            return Some(v);
+        }
+    }
+    None
+}
+
 /// Live daemon state behind the LocalAPI. Built once in `run_cmd`, wrapped in an
 /// `Arc<dyn LocalApiState>` for the listener; reads are cheap clones off a
 /// `watch` borrow + an atomic load.
@@ -211,9 +280,10 @@ impl LocalApiState for DaemonState {
         // P3b-3: overlay a peer as `Tunnel` when its WG carrier is down and the
         // daemon reaches its backing agent via a live tunnel flow.
         apply_tunnel_override(&mut peers, &self.tunnel_hub.active_flow_agent_ids());
-        // P3b-3: fill `rtt_ms` from the ICMP prober cache (netstack nodes only).
+        // P3b-3: fill `rtt_ms` from the ICMP prober cache (netstack nodes via
+        // the userspace pinger; OS-TUN nodes via `OsPinger` since P8-cosmetics).
         // A stale entry (peer stopped answering) is dropped so the column fades
-        // to "—" rather than lying. Empty cache (no prober) → all stay `None`.
+        // to "—" rather than lying. Empty cache (prober warming up) → `None`.
         if let Ok(cache) = self.rtt_cache.lock()
             && !cache.is_empty()
         {
@@ -523,6 +593,31 @@ mod tests {
     use std::net::Ipv4Addr;
     use tunnel_core::localapi::ConnectionType;
 
+    /// P8-cosmetics — the locale-tolerant ping-output parse: English, German,
+    /// sub-millisecond, and Linux fractional forms all yield the right integer;
+    /// output without a real measurement yields None.
+    #[test]
+    fn parse_ping_ms_is_locale_tolerant() {
+        assert_eq!(
+            parse_ping_ms("Reply from 100.64.0.1: bytes=32 time=4ms TTL=128"),
+            Some(4)
+        );
+        assert_eq!(
+            parse_ping_ms("Antwort von 100.64.0.1: Bytes=32 Zeit=101ms TTL=128"),
+            Some(101)
+        );
+        assert_eq!(
+            parse_ping_ms("Reply from 100.64.0.1: bytes=32 time<1ms TTL=128"),
+            Some(1)
+        );
+        assert_eq!(
+            parse_ping_ms("64 bytes from 100.64.0.14: icmp_seq=1 ttl=64 time=0.523 ms"),
+            Some(0)
+        );
+        assert_eq!(parse_ping_ms("Request timed out."), None);
+        assert_eq!(parse_ping_ms("streams and other ms-free words"), None);
+    }
+
     fn view() -> OverlayView {
         OverlayView {
             self_ip: Some("100.64.0.2".into()),
@@ -534,6 +629,7 @@ mod tests {
                 overlay_ip6: Some("fd72:6f6f:6d6c::6440:1".into()),
                 online: true,
                 connection: ConnectionType::Relay,
+                upgrading: false,
                 rtt_ms: None,
                 last_seen_ms: None,
                 agent_id: None,
@@ -818,6 +914,7 @@ mod tests {
                 overlay_ip6: None,
                 online: true,
                 connection: conn,
+                upgrading: false,
                 rtt_ms: None,
                 last_seen_ms: None,
                 agent_id: agent.map(|s| s.into()),
