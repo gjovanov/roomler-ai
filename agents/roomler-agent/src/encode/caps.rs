@@ -340,7 +340,14 @@ fn compute_caps() -> AgentCaps {
     // clipboard no-ops the DC exactly as v1 did). The browser gates
     // its auto-sync engine + image paths on these values.
     let clipboard: Vec<String> = if cfg!(feature = "clipboard") {
-        vec!["ack".into(), "events".into(), "images".into()]
+        vec![
+            "ack".into(),
+            "events".into(),
+            "images".into(),
+            // v2.1 — html lane: formatted text + web-hosted images
+            // survive the round-trip (CF_HTML / text/html both ways).
+            "html".into(),
+        ]
     } else {
         Vec::new()
     };
