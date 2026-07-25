@@ -46,7 +46,7 @@ use windows_sys::Win32::Security::{
 use windows_sys::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
 use windows_sys::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
 use windows_sys::Win32::System::Threading::{
-    CREATE_NEW_CONSOLE, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, GetExitCodeProcess,
+    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, GetExitCodeProcess,
     PROCESS_INFORMATION, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
 };
 
@@ -247,7 +247,15 @@ pub unsafe fn spawn_in_session(token: HANDLE, exe: &Path, args: &[&str]) -> Resu
             std::ptr::null_mut(), // process security attributes
             std::ptr::null_mut(), // thread security attributes
             FALSE,                // inherit handles
-            CREATE_UNICODE_ENVIRONMENT | CREATE_NEW_CONSOLE,
+            // CREATE_NO_WINDOW (not CREATE_NEW_CONSOLE): the worker is a
+            // background service child — its logs go to the rolling file, not
+            // a console. CREATE_NEW_CONSOLE popped a visible console window on
+            // the user's desktop on every (re)start / update (field 2026-07-25:
+            // "why do I see an Admin PowerShell with logs?"). The interactive
+            // desktop attach for GUI (`winsta0\default` in STARTUPINFO above,
+            // for the consent tray / MessageBox) is independent of console
+            // allocation, so hiding the console keeps those working.
+            CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
             env.raw,
             std::ptr::null(), // current directory — let the user's profile decide
             &si,
