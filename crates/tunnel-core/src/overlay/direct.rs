@@ -572,9 +572,66 @@ pub fn srflx_punch_worth_trying(mine: Option<&str>, peer: Option<&str>) -> bool 
     !(mine == Some("symmetric") && peer == Some("symmetric"))
 }
 
+/// P8 — is a srflx punch toward this peer a pointless HAIRPIN? `true` when
+/// every srflx candidate the peer advertises maps to the SAME public IP as our
+/// own srflx (both ends behind one NAT — the punch would need router
+/// hairpinning, which consumer NATs rarely do) AND the peer also advertises a
+/// LAN candidate on one of our subnets (the tier that actually works for a
+/// same-site pair). Saves the futile 12 s attempt + its probe noise on every
+/// re-upgrade tick. A same-IP pair WITHOUT a usable LAN candidate still tries
+/// — on an isolated segment the hairpin may be all there is. Pure.
+pub fn srflx_hairpin_pointless(
+    my_srflx: Option<&str>,
+    peer_srflx: &[String],
+    peer_has_lan_candidate: bool,
+) -> bool {
+    if !peer_has_lan_candidate || peer_srflx.is_empty() {
+        return false;
+    }
+    let Some(my_ip) = my_srflx
+        .and_then(|s| s.parse::<SocketAddr>().ok())
+        .map(|s| s.ip())
+    else {
+        return false;
+    };
+    peer_srflx
+        .iter()
+        .all(|e| e.parse::<SocketAddr>().ok().map(|s| s.ip()) == Some(my_ip))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P8 — the hairpin skip: all-peer-srflx-on-our-IP + a LAN candidate ⇒
+    /// pointless; any differing IP, no LAN candidate, or unknown own srflx ⇒
+    /// still worth trying.
+    #[test]
+    fn srflx_hairpin_pointless_cases() {
+        let mine = Some("37.63.112.129:58770");
+        let same = vec!["37.63.112.129:63669".to_string()];
+        let mixed = vec![
+            "37.63.112.129:63669".to_string(),
+            "203.0.113.9:40000".to_string(),
+        ];
+        assert!(srflx_hairpin_pointless(mine, &same, true));
+        assert!(
+            !srflx_hairpin_pointless(mine, &same, false),
+            "no LAN candidate ⇒ the hairpin may be all there is"
+        );
+        assert!(
+            !srflx_hairpin_pointless(mine, &mixed, true),
+            "a differing srflx IP ⇒ a real cross-NAT punch exists"
+        );
+        assert!(
+            !srflx_hairpin_pointless(None, &same, true),
+            "own srflx unknown"
+        );
+        assert!(
+            !srflx_hairpin_pointless(mine, &[], true),
+            "peer has no srflx"
+        );
+    }
 
     /// rc.210 — make-before-break is DEFAULT-ON with an explicit kill-switch.
     /// (Serialises env mutation; the overlay-l3 suite runs `--test-threads=1`.)
