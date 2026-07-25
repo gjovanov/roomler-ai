@@ -48,6 +48,11 @@ const READ_TIMEOUT: Duration = Duration::from_secs(2);
 /// Overall per-connection lifetime bound (head + body + write). Covers
 /// the v2.2 POST body read whose per-read timeout doesn't cap the total.
 const CONN_DEADLINE: Duration = Duration::from_secs(30);
+/// Probe-port bind retry (self-heals the MSI-upgrade handover, where
+/// the exiting old worker briefly still holds 47989). 15 × 2 s ≈ 30 s
+/// of coverage — well past the few-second worker overlap.
+const BIND_MAX_ATTEMPTS: u32 = 15;
+const BIND_RETRY_DELAY: Duration = Duration::from_secs(2);
 /// Cap on the request head we buffer (a browser probe head is ~a few hundred B).
 const MAX_HEAD: usize = 16 * 1024;
 
@@ -150,11 +155,44 @@ async fn serve(
     agent_id: String,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, PROBE_PORT)).await {
-        Ok(l) => l,
-        Err(e) => {
-            warn!(port = PROBE_PORT, error = %e, "loopback-TURN: cannot bind probe port; disabled");
-            return;
+    // Bind with retry (rc.231 self-heal, mirroring the LocalAPI pipe's
+    // rc.158 fix). During an MSI upgrade the OLD worker still holds
+    // 47989 for a few seconds while the NEW worker starts; a single
+    // bind attempt loses that race and the probe (TURN relay assist +
+    // the v2.2 clipboard bridge) stays dead until a clean restart —
+    // which silently broke Tier-2 clipboard field-testing after every
+    // agent upgrade. Retry across the handover window instead.
+    let listener = {
+        let mut listener = None;
+        for attempt in 1..=BIND_MAX_ATTEMPTS {
+            match TcpListener::bind((Ipv4Addr::LOCALHOST, PROBE_PORT)).await {
+                Ok(l) => {
+                    if attempt > 1 {
+                        info!(
+                            port = PROBE_PORT,
+                            attempt, "loopback probe: bound after retry"
+                        );
+                    }
+                    listener = Some(l);
+                    break;
+                }
+                Err(e) if attempt == BIND_MAX_ATTEMPTS => {
+                    warn!(port = PROBE_PORT, error = %e, attempts = attempt, "loopback probe: bind failed after retries; disabled");
+                }
+                Err(_) => {
+                    // Wait out the handover, but bail promptly on shutdown.
+                    tokio::select! {
+                        _ = tokio::time::sleep(BIND_RETRY_DELAY) => {}
+                        _ = shutdown.changed() => {
+                            if *shutdown.borrow() { return; }
+                        }
+                    }
+                }
+            }
+        }
+        match listener {
+            Some(l) => l,
+            None => return,
         }
     };
     info!(
