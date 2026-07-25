@@ -31,11 +31,20 @@ use crate::capture::{DirtyRect, Frame, PixelFormat};
 use crate::encode::{EncodedPacket, VideoEncoder};
 use tunnel_core::env::node_env;
 
-/// Initial GOP interval — every Nth frame is forced IDR. Matches libvpx
-/// VP9-444 cadence in `encode::libvpx`. The DC framing path's
-/// anti-IDR-storm coalescer (rc.74+) bounds the actual rate at which
-/// IDRs can be emitted regardless of this setting.
-const KEYFRAME_INTERVAL: i32 = 240;
+/// rc.234 — natural-GOP interval for encoders that HONOUR runtime keyframe
+/// forcing (hevc_nvenc/qsv/amf, av1_*): effectively NEVER. These encoders'
+/// only live media consumers are the reliable-DC pumps, where periodic IDRs
+/// serve no transport purpose — every needed key (DC-open, browser resync,
+/// lock transition) is forced on demand — and each routine IDR QP-starves
+/// under the maxrate cap, painting the field-reported "text blurs every few
+/// seconds then re-sharpens" pulse (2026-07-25, NEO16 viewing PC50045 /
+/// REGAL; the old value was 240 ≈ 4-6 s at real rates, stacked on the 4 s
+/// pump backstop metronome removed in the same round). 64800 stays under
+/// Intel Media SDK's u16 `GopPicSize` ceiling (65535) — at 60 fps that is
+/// ~18 min, i.e. "on-demand only" in practice. The legacy RTP-track
+/// constructors share this value, but that path's live codecs (H.264 via
+/// openh264/MF) don't come through here; the caps probe doesn't care.
+const KEYFRAME_INTERVAL: i32 = 64800;
 
 /// rc.219 — vp9_qsv-only SHORT GOP. Field-proven (2026-07-24, PC50045 Iris
 /// Xe): vp9_qsv CANNOT force keyframes at runtime — `frame.set_kind(I)` is
@@ -168,6 +177,13 @@ fn encoder_options(
     let mut base: Vec<(String, String)> = Vec::new();
     let mut lowlat: Vec<(String, String)> = Vec::new();
     let cap = maxrate_bps.to_string();
+    // rc.234 — HRD window = 2× the ceiling (was 1×). With bufsize == maxrate
+    // any transient (a resync IDR, a window-uncover burst, a vp9_qsv natural
+    // key) had a one-second bit budget and QP-collapsed into visible blur
+    // that the following deltas then slowly repaired. 2× lets the transient
+    // spend real bits; the AVERAGE stays bounded by `maxrate`, and actual
+    // congestion is owned by the DC send channel + AIMD, not the HRD.
+    let buf = maxrate_bps.saturating_mul(2).to_string();
     let cq_s = cq.to_string();
     let preset = node_env("FFMPEG_PRESET");
     let tune = node_env("FFMPEG_TUNE");
@@ -211,7 +227,7 @@ fn encoder_options(
         base.push(("forced-idr".into(), "1".into()));
         base.push(("spatial-aq".into(), "1".into()));
         base.push(("maxrate".into(), cap.clone()));
-        base.push(("bufsize".into(), cap.clone()));
+        base.push(("bufsize".into(), buf.clone()));
         // rc.130 — `delay=0`: emit each packet with ZERO output-queue delay.
         // NVENC's default output delay (~surfaces−1, ≈4 frames) is the
         // typing-latency bug: with change-driven DXGI capture a keystroke's
@@ -231,7 +247,7 @@ fn encoder_options(
         }
         base.push(("low_power".into(), "1".into()));
         base.push(("maxrate".into(), cap.clone()));
-        base.push(("bufsize".into(), cap.clone()));
+        base.push(("bufsize".into(), buf.clone()));
         // rc.130 — `async_depth=1`: cap QSV's in-flight pipeline to one frame
         // so it emits immediately instead of buffering ~4 (low_power VDENC
         // respects it). Same typing-latency fix as NVENC `delay=0`.
@@ -260,7 +276,7 @@ fn encoder_options(
         base.push(("qp_i".into(), cq_s.clone()));
         base.push(("qp_p".into(), cq_s.clone()));
         base.push(("maxrate".into(), cap.clone()));
-        base.push(("bufsize".into(), cap.clone()));
+        base.push(("bufsize".into(), buf.clone()));
         // rc.130 — `query_timeout=1`: minimise the output-poll block (AMF's
         // low-latency lever alongside vbr_latency).
         if let Some(v) = lowlat_knob("FFMPEG_AMF_QUERY_TIMEOUT", "1") {

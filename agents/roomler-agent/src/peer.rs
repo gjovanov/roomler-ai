@@ -1176,17 +1176,24 @@ async fn detect_constrained_transport(
 #[cfg(any(feature = "vp9-444", feature = "ffmpeg-encoder"))]
 const TRANSPORT_RECHECK_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Freeze-wedge backstop (2026-07-24 field, NEO16 viewing PC50045): if no
-/// key-flagged frame has been handed to the send task for this long while
-/// frames keep encoding, force an IDR. The browser's decode workers re-arm
-/// their keyframe gate on a backlog drop and then wait for a resync IDR; the
-/// encoders' GOP is counted in ENCODED FRAMES (240), so at a shed encode rate
-/// (viewer-rate cap 12 fps → 20 s/GOP) — or on a static screen where capture
-/// dedup encodes almost nothing — the natural IDR can be tens of seconds (or
-/// forever) away, and a lost `rc:keyframe` request left the viewer wedged on a
-/// stale frame. This bounds ANY missed-resync wedge to ~4 s regardless of the
-/// browser build. At full 60 fps it matches the natural 240-frame cadence, so
-/// healthy sessions see no extra IDR load.
+/// Unanswered-force retry window (rc.234 — was the rc.214 "freeze-wedge
+/// backstop"). If a forced keyframe (`kf_pending_since` armed) has gone
+/// unanswered for this long, re-issue the force — insurance against a force
+/// swallowed across an encoder-rebuild boundary. Honouring encoders answer
+/// in <100 ms so this fires ~never; the force-ignored rebuild fallback
+/// ([`KEYFRAME_FORCE_REBUILD_AFTER`]) remains the real net for vp9_qsv.
+///
+/// HISTORY — the rc.214 form fired UNCONDITIONALLY whenever 4 s passed
+/// without a key-flagged frame while frames flowed. With the 60 ms idle
+/// keepalive frames ALWAYS flow, so the "wedge insurance" was in practice a
+/// 4-second IDR METRONOME on every DC session — and each metronome IDR
+/// QP-starves under the maxrate cap, painting the field-reported "text
+/// blurs every ~3 s then re-sharpens" pulse (2026-07-25, NEO16 viewing
+/// PC50045/REGAL) on every codec. Wedge safety is preserved without the
+/// metronome: rc:keyframe rides the RELIABLE control DC (can't be lost in
+/// transit), every force arms `kf_pending_since`, this retry covers a
+/// swallowed force, and the rebuild fallback covers force-ignoring
+/// encoders.
 #[cfg(any(feature = "vp9-444", feature = "ffmpeg-encoder"))]
 const KEYFRAME_BACKSTOP: Duration = Duration::from_secs(4);
 
@@ -1217,8 +1224,17 @@ const KEYFRAME_BACKSTOP: Duration = Duration::from_secs(4);
 /// answers the force well inside this window and the rebuild becomes a true
 /// last resort. Honouring encoders answer in <100 ms, so the wider window
 /// costs them nothing.
+///
+/// rc.234 — widened again 2.5 s → 6.5 s: the 60-frame vp9_qsv GOP is counted
+/// in ENCODED frames, and the viewer-rate skip divisor stretches it — at the
+/// 12 fps shed floor a natural key is up to ~5 s away, so 2.5 s ALWAYS
+/// rebuilt before the natural key could answer (field 2026-07-25, REGAL:
+/// "rebuilding to emit a guarantee" cycling every ~11-13 s with
+/// pending_ms≈2500 — each rebuild an IDR + rate-control cold start = a blur
+/// pulse). 6.5 s lets the natural key win; honouring encoders still answer
+/// in <100 ms and never reach it.
 #[cfg(any(feature = "vp9-444", feature = "ffmpeg-encoder"))]
-const KEYFRAME_FORCE_REBUILD_AFTER: Duration = Duration::from_millis(2500);
+const KEYFRAME_FORCE_REBUILD_AFTER: Duration = Duration::from_millis(6500);
 
 /// rc.217 churn guard for the force-ignored rebuild. Field regression
 /// (2026-07-24, vp9_qsv): every viewer backlog event requested an IDR, the
@@ -2293,10 +2309,7 @@ async fn media_pump_vp9_444_dc(
     let mut decode_skip_divisor: u32 = 1;
     let mut decode_skip_counter: u32 = 0;
     let mut frames_skipped_decode: u64 = 0;
-    // Freeze-wedge backstop — when the last key-flagged frame entered the
-    // send queue (see [`KEYFRAME_BACKSTOP`]). Starts "now" so a fresh session
-    // (whose first frames are IDRs anyway) doesn't double-fire.
-    let mut last_key_sent = std::time::Instant::now();
+    // Unanswered-force retry marker (see [`KEYFRAME_BACKSTOP`]).
     let mut kf_backstop_logged = false;
     // Force-ignored fallback parity (see [`KEYFRAME_FORCE_REBUILD_AFTER`]) —
     // libvpx force flags are synchronous, so this should never fire here;
@@ -2346,6 +2359,15 @@ async fn media_pump_vp9_444_dc(
     const SCENE_CHANGE_MIN_BYTES: usize = 150_000;
     const SCENE_CHANGE_MIN_INTERVAL: Duration = Duration::from_millis(1500);
     let mut last_scene_change_kf_at: Option<std::time::Instant> = None;
+    // rc.234 — the forced scene-change IDR is OFF by default: with periodic
+    // IDRs gone (VPX_KF_DISABLED + the request-gated retry) it was the last
+    // remaining routine IDR source, and each forced IDR under the rate cap
+    // repainted the "blur pulse on every scroll / window switch" the whole
+    // rc.234 round exists to kill. The encoder codes an uncovered region as
+    // intra blocks within the same budget anyway. The DETECTOR stays live —
+    // the rc.45 cpu-used motion boost rides it. `ROOMLER_AGENT_SCENE_KF=1`
+    // restores the rc.39/43 forcing.
+    let scene_kf_enabled = node_env("SCENE_KF").as_deref() == Some("1");
 
     // rc.45 — dynamic cpu-used boost during motion. the field-test host field
     // test 2026-05-18 (rc.43) confirmed scene-change keyframe cascade
@@ -2767,19 +2789,20 @@ async fn media_pump_vp9_444_dc(
             enc.request_keyframe();
             force_keyframe_this_iter = true;
         }
-        // Freeze-wedge backstop — see [`KEYFRAME_BACKSTOP`]. Only reachable
-        // while frames are being encoded, so an idle/static screen doesn't
-        // spray IDRs; the FIRST frame after a static stretch becomes one,
-        // which is exactly the resync-on-activity guarantee a gated viewer
-        // needs.
-        if last_key_sent.elapsed() >= KEYFRAME_BACKSTOP {
+        // Unanswered-force retry — see [`KEYFRAME_BACKSTOP`]. rc.234: gated
+        // on an ARMED pending force (a real resync need), NOT wall-clock
+        // since the last IDR — the old unconditional form was a 4 s IDR
+        // metronome (the field "text blurs every ~3 s" pulse). The arm
+        // below keeps the pending clock's ORIGIN (is_none guard), so this
+        // retry never delays the force-ignored rebuild fallback.
+        if kf_pending_since.is_some_and(|t| t.elapsed() >= KEYFRAME_BACKSTOP) {
             enc.request_keyframe();
             force_keyframe_this_iter = true;
             if !kf_backstop_logged {
                 kf_backstop_logged = true;
                 info!(
                     %session_id,
-                    "VP9-444 DC pump: keyframe backstop engaged (no IDR sent for 4s — bounding viewer resync wait)"
+                    "VP9-444 DC pump: keyframe force retry engaged (unanswered for 4s)"
                 );
             }
         }
@@ -2944,8 +2967,10 @@ async fn media_pump_vp9_444_dc(
                     "VP9-444 scene-change candidate suppressed (rate-limit cooldown active)"
                 );
             } else {
-                keyframe_requested.store(true, std::sync::atomic::Ordering::Relaxed);
-                scene_change_keyframes += 1;
+                if scene_kf_enabled {
+                    keyframe_requested.store(true, std::sync::atomic::Ordering::Relaxed);
+                    scene_change_keyframes += 1;
+                }
                 last_scene_change_kf_at = Some(now);
 
                 // rc.45 — piggyback motion-cpu-used boost on every
@@ -3063,12 +3088,10 @@ async fn media_pump_vp9_444_dc(
             let wire = bytes::Bytes::from(frame_video_bytes(&p.data, p.is_keyframe, ts_us));
             match send_tx.try_send(wire) {
                 Ok(()) => {
-                    // Backstop bookkeeping: only a key frame that actually
-                    // entered the send queue counts (a shed one didn't reach
-                    // the viewer). Also answers any pending forced-keyframe
-                    // request (the force-ignored fallback stands down).
+                    // A key frame that actually entered the send queue
+                    // answers any pending forced-keyframe request (the
+                    // force-ignored fallback and the retry stand down).
                     if p.is_keyframe {
-                        last_key_sent = std::time::Instant::now();
                         kf_pending_since = None;
                     }
                 }
@@ -3386,10 +3409,7 @@ async fn media_pump_ffmpeg_dc(
     let mut decode_skip_divisor: u32 = 1;
     let mut decode_skip_counter: u32 = 0;
     let mut frames_skipped_decode: u64 = 0;
-    // Freeze-wedge backstop — when the last key-flagged packet entered the
-    // send queue (see [`KEYFRAME_BACKSTOP`]). Starts "now" so a fresh session
-    // (whose first frames are IDRs anyway) doesn't double-fire.
-    let mut last_key_sent = std::time::Instant::now();
+    // Unanswered-force retry marker (see [`KEYFRAME_BACKSTOP`]).
     let mut kf_backstop_logged = false;
     // Force-ignored fallback — Some(when the oldest unanswered forced-keyframe
     // request was made); cleared when a key-flagged packet enters the send
@@ -3831,12 +3851,13 @@ async fn media_pump_ffmpeg_dc(
             force_keyframe_this_iter = true;
         }
 
-        // Freeze-wedge backstop — see [`KEYFRAME_BACKSTOP`]. Only reachable
-        // while frames are being encoded, so an idle/static screen doesn't
-        // spray IDRs; the FIRST frame after a static stretch becomes one,
-        // which is exactly the resync-on-activity guarantee a gated viewer
-        // needs.
-        if last_key_sent.elapsed() >= KEYFRAME_BACKSTOP
+        // Unanswered-force retry — see [`KEYFRAME_BACKSTOP`]. rc.234: gated
+        // on an ARMED pending force (a real resync need), NOT wall-clock
+        // since the last IDR — the old unconditional form was a 4 s IDR
+        // metronome (the field "text blurs every ~3 s" pulse on every
+        // codec). The arm below keeps the pending clock's ORIGIN (is_none
+        // guard), so this retry never delays the rebuild fallback.
+        if kf_pending_since.is_some_and(|t| t.elapsed() >= KEYFRAME_BACKSTOP)
             && let Some(enc) = encoder.as_mut()
         {
             enc.request_keyframe();
@@ -3846,7 +3867,7 @@ async fn media_pump_ffmpeg_dc(
                 info!(
                     %session_id,
                     codec_label,
-                    "FFmpeg DC pump: keyframe backstop engaged (no IDR sent for 4s — bounding viewer resync wait)"
+                    "FFmpeg DC pump: keyframe force retry engaged (unanswered for 4s)"
                 );
             }
         }
@@ -4025,12 +4046,10 @@ async fn media_pump_ffmpeg_dc(
             ));
             match send_tx.try_send(wire) {
                 Ok(()) => {
-                    // Backstop bookkeeping: only a key frame that actually
-                    // entered the send queue counts (a shed one didn't reach
-                    // the viewer). Also answers any pending forced-keyframe
-                    // request (the force-ignored fallback stands down).
+                    // A key frame that actually entered the send queue
+                    // answers any pending forced-keyframe request (the
+                    // force-ignored fallback and the retry stand down).
                     if pkt.is_keyframe {
-                        last_key_sent = std::time::Instant::now();
                         kf_pending_since = None;
                     }
                     if resync_pending {
