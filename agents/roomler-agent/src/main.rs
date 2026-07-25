@@ -1643,11 +1643,18 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
             // config path + the P6 write lock (profile-correct under SYSTEM).
             .with_config_persist(config_path.clone(), cfg_write_lock.clone()),
         );
-    // P3b-3: the RTT prober — spawned only on a netstack node (pinger = Some).
-    // Pings each carrier-reachable peer every RTT_PROBE_INTERVAL into rtt_cache;
-    // exits on shutdown. A fresh `overlay_view_tx.subscribe()` receiver (the
-    // original moved into DaemonState).
-    if let Some(pinger) = pinger_for_prober {
+    // P3b-3: the RTT prober. Pings each carrier-reachable peer every
+    // RTT_PROBE_INTERVAL into rtt_cache; exits on shutdown. A fresh
+    // `overlay_view_tx.subscribe()` receiver (the original moved into
+    // DaemonState). P8-cosmetics — no longer netstack-only: an OS-TUN node
+    // probes over the OS ICMP path (`OsPinger`), so the `peers` RTT column is
+    // populated everywhere instead of "— by-design on OS-TUN".
+    {
+        let pinger: std::sync::Arc<dyn roomler_agent::localapi_state::NetstackPinger> =
+            match pinger_for_prober {
+                Some(p) => p,
+                None => std::sync::Arc::new(roomler_agent::localapi_state::OsPinger),
+            };
         roomler_agent::localapi_state::spawn_rtt_prober(
             pinger,
             overlay_view_tx.subscribe(),

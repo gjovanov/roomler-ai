@@ -325,6 +325,7 @@ mod tests {
             overlay_ip6: None,
             online: true,
             connection: ConnectionType::Direct,
+            upgrading: false,
             rtt_ms: None,
             last_seen_ms: None,
             agent_id: None,
