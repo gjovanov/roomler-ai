@@ -86,6 +86,13 @@ pub(super) fn dispatch_for_external(enigo: &mut Enigo, msg: InputMsg) -> Result<
 fn dispatch(enigo: &mut Enigo, msg: InputMsg) -> Result<()> {
     match msg {
         InputMsg::MouseMove { x, y, mon } => {
+            // rc.227 — coarse layout sampling (every 32nd event) so a
+            // layout change surfaces on the viewer chip within ~a
+            // second of mouse activity. Runs on this injector thread —
+            // the only thread guaranteed desktop-bound under the
+            // SYSTEM-context worker.
+            #[cfg(target_os = "windows")]
+            super::layout::maybe_sample_coarse();
             let (px, py) = to_pixels(enigo, x, y, mon);
             enigo
                 .move_mouse(px, py, Coordinate::Abs)
@@ -99,6 +106,8 @@ fn dispatch(enigo: &mut Enigo, msg: InputMsg) -> Result<()> {
             y,
             mon,
         } => {
+            #[cfg(target_os = "windows")]
+            super::layout::maybe_sample_coarse();
             // Move first so the click hits the intended target even if
             // earlier MouseMove events were coalesced away.
             let (px, py) = to_pixels(enigo, x, y, mon);
@@ -133,6 +142,11 @@ fn dispatch(enigo: &mut Enigo, msg: InputMsg) -> Result<()> {
             down,
             mods: _,
         } => {
+            // rc.227 — exact layout sampling on key events (cheap: 2
+            // syscalls + 1 atomic when unchanged). Catches the remote
+            // user's own ALT+SHIFT within one event.
+            #[cfg(target_os = "windows")]
+            super::layout::sample_active_layout();
             let direction = if down {
                 Direction::Press
             } else {
@@ -149,6 +163,8 @@ fn dispatch(enigo: &mut Enigo, msg: InputMsg) -> Result<()> {
             }
         }
         InputMsg::KeyText { text } => {
+            #[cfg(target_os = "windows")]
+            super::layout::sample_active_layout();
             // rc.122 — on Windows, inject printable text as real virtual keys
             // (scancode) instead of enigo.text()'s KEYEVENTF_UNICODE, which the
             // legacy console (Windows PowerShell 5.1 / cmd in conhost) silently
