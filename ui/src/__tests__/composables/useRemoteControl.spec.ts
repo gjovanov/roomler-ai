@@ -27,11 +27,14 @@ import {
   CLIPBOARD_SINGLE_ENVELOPE_THRESHOLD_BYTES,
   CLIPBOARD_IMAGE_MAX_BYTES,
   CLIPBOARD_IMG_FRAME_BYTES,
+  CLIPBOARD_HTML_MAX_BYTES,
   normalizeClipboardText,
   hashClipboardBytes,
   hashClipboardText,
+  hashClipboardHtml,
   createClipboardEchoGate,
   buildClipboardImageFrames,
+  buildClipboardHtmlFrames,
   VP9_444_DC_LABEL,
   VP9_444_DC_OPTIONS,
   readStoredAudioEnabled,
@@ -1323,6 +1326,77 @@ describe('createClipboardEchoGate (clipboard v2)', () => {
     gate.reset()
     expect(gate.knows(h)).toBe(false)
     expect(gate.shouldPush(h)).toBe(true)
+  })
+
+  it('remembers several hashes per side (v2.1 — html combined + text alt)', () => {
+    // One html clipboard state surfaces as TWO hashes: the combined
+    // html+text hash (rich reads) and the text-alt hash (readText
+    // polling). Both must stay suppressed or the poll re-pushes the
+    // alt forever.
+    const gate = createClipboardEchoGate()
+    const combined = hashClipboardHtml('<b>x</b>', 'x')
+    const alt = hashClipboardText('x')
+    gate.recordPushed(combined)
+    gate.recordPushed(alt)
+    expect(gate.shouldPush(combined)).toBe(false)
+    expect(gate.shouldPush(alt)).toBe(false)
+    // A third and fourth hash don't evict the first two (ring of 4).
+    gate.recordPushed(hashClipboardText('y'))
+    gate.recordPushed(hashClipboardText('z'))
+    expect(gate.knows(combined)).toBe(true)
+    expect(gate.knows(alt)).toBe(true)
+  })
+})
+
+describe('clipboard html helpers (v2.1)', () => {
+  it('hashClipboardHtml separates halves and canonicalizes only the text', () => {
+    expect(hashClipboardHtml('ab', 'c')).not.toBe(hashClipboardHtml('a', 'bc'))
+    expect(hashClipboardHtml('<p>x</p>', 'l1\r\nl2')).toBe(hashClipboardHtml('<p>x</p>', 'l1\nl2'))
+    expect(hashClipboardHtml('<p>x</p>', 't')).not.toBe(hashClipboardHtml('<p>y</p>', 't'))
+  })
+
+  it('buildClipboardHtmlFrames frames html-then-text with declared byte lengths', () => {
+    const html = '<b>bold ümlaut</b>'
+    const text = 'bold ümlaut'
+    const built = buildClipboardHtmlFrames(html, text)
+    expect(built).not.toBeNull()
+    const enc = new TextEncoder()
+    const begin = JSON.parse(built!.begin)
+    expect(begin).toEqual({
+      t: 'clipboard:html-begin',
+      id: built!.id,
+      html_bytes: enc.encode(html).length,
+      text_bytes: enc.encode(text).length,
+    })
+    expect(JSON.parse(built!.end)).toEqual({ t: 'clipboard:html-end', id: built!.id })
+    // Frame bytes reassemble to html-bytes ++ text-bytes.
+    const total = built!.frames.reduce((a, f) => a + f.byteLength, 0)
+    expect(total).toBe(enc.encode(html).length + enc.encode(text).length)
+    for (const f of built!.frames) {
+      expect(f.byteLength).toBeLessThanOrEqual(CLIPBOARD_IMG_FRAME_BYTES)
+    }
+    const joined = new Uint8Array(total)
+    let off = 0
+    for (const f of built!.frames) {
+      joined.set(f, off)
+      off += f.byteLength
+    }
+    const dec = new TextDecoder('utf-8')
+    expect(dec.decode(joined.subarray(0, enc.encode(html).length))).toBe(html)
+    expect(dec.decode(joined.subarray(enc.encode(html).length))).toBe(text)
+  })
+
+  it('refuses empty html and oversized payloads', () => {
+    expect(buildClipboardHtmlFrames('', 'text')).toBeNull()
+    const big = 'x'.repeat(CLIPBOARD_HTML_MAX_BYTES + 1)
+    expect(buildClipboardHtmlFrames(big, '')).toBeNull()
+  })
+
+  it('splits large html across multiple frames', () => {
+    const html = '<i>' + 'a'.repeat(CLIPBOARD_IMG_FRAME_BYTES * 2) + '</i>'
+    const built = buildClipboardHtmlFrames(html, 'alt')
+    expect(built).not.toBeNull()
+    expect(built!.frames.length).toBeGreaterThanOrEqual(3)
   })
 })
 

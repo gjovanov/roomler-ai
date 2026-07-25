@@ -87,6 +87,19 @@ pub(crate) enum ClipboardCmd {
         png: Vec<u8>,
         reply: oneshot::Sender<Result<()>>,
     },
+    /// v2.1 — read the host clipboard as HTML (+ its plain-text alt).
+    /// `Ok(None)` when the clipboard holds no HTML content.
+    ReadHtml {
+        reply: oneshot::Sender<Result<Option<HtmlPayload>>>,
+    },
+    /// v2.1 — write HTML + plain-text alternate to the host clipboard
+    /// atomically (one clipboard transaction, both formats — a paste
+    /// target picks the richest it understands).
+    WriteHtml {
+        html: String,
+        text: String,
+        reply: oneshot::Sender<Result<()>>,
+    },
     /// v2 — install the change watcher (replaces any existing one).
     /// The worker switches from blocking `recv()` to a tick loop and
     /// pushes [`ClipboardChange`]s into `tx` when the HOST clipboard
@@ -172,6 +185,13 @@ impl Clipboard {
                         Some(ClipboardCmd::WriteImage { png, reply }) => {
                             let _ = reply.send(worker_write_image(&mut cb, &png, &mut marks));
                         }
+                        Some(ClipboardCmd::ReadHtml { reply }) => {
+                            let _ = reply.send(worker_read_html(&mut cb));
+                        }
+                        Some(ClipboardCmd::WriteHtml { html, text, reply }) => {
+                            let _ =
+                                reply.send(worker_write_html(&mut cb, &html, &text, &mut marks));
+                        }
                         Some(ClipboardCmd::Watch { events, tx }) => {
                             watch = Some(install_watcher(&mut cb, events, tx));
                         }
@@ -251,6 +271,33 @@ impl Clipboard {
             .map_err(|_| anyhow::anyhow!("clipboard worker dropped reply"))?
     }
 
+    /// v2.1 — read the host clipboard as HTML (+ plain-text alt);
+    /// `None` when it holds no HTML.
+    pub async fn read_html(&self) -> Result<Option<HtmlPayload>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(ClipboardCmd::ReadHtml { reply: reply_tx })
+            .map_err(|_| anyhow::anyhow!("clipboard worker gone"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("clipboard worker dropped reply"))?
+    }
+
+    /// v2.1 — write HTML + plain-text alternate atomically.
+    pub async fn write_html(&self, html: String, text: String) -> Result<()> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(ClipboardCmd::WriteHtml {
+                html,
+                text,
+                reply: reply_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("clipboard worker gone"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("clipboard worker dropped reply"))?
+    }
+
     /// v2 — install the change watcher (replaces any existing one).
     /// Changes arrive on `tx`; the worker drops pushes when the
     /// channel is full and retries on the next tick.
@@ -282,11 +329,13 @@ impl Clipboard {
 
 /// Which change kinds a [`ClipboardCmd::Watch`] subscription wants
 /// pushed. Image watching is honoured on Windows only (no cheap
-/// change signal elsewhere — see [`watch_tick`]).
+/// change signal elsewhere — see [`watch_tick`]); text + html work
+/// everywhere arboard does.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct WatchEvents {
     pub text: bool,
     pub image: bool,
+    pub html: bool,
 }
 
 /// A PNG-encoded clipboard image (the wire form on the clipboard DC).
@@ -297,11 +346,22 @@ pub struct PngImage {
     pub png: Vec<u8>,
 }
 
+/// v2.1 — HTML clipboard content + its plain-text alternate. The pair
+/// travels together so the receiving side writes BOTH formats in one
+/// clipboard transaction (rich-aware paste targets pick the HTML,
+/// plain editors the text).
+#[derive(Debug, Clone)]
+pub struct HtmlPayload {
+    pub html: String,
+    pub text: String,
+}
+
 /// Host-clipboard change pushed to a [`ClipboardCmd::Watch`] subscriber.
 #[derive(Debug)]
 pub(crate) enum ClipboardChange {
     Text(String),
     Image(PngImage),
+    Html(HtmlPayload),
 }
 
 /// Watcher tick cadence. Windows gets a fast tick because the
@@ -329,6 +389,10 @@ struct SelfMarks {
     /// [`watch_tick`] re-encode produces, unlike the browser's PNG
     /// bytes which come from a different encoder).
     img_hash: u64,
+    /// v2.1 — [`html_event_hash`] of the READ-BACK of the html we
+    /// last wrote (the OS re-wraps CF_HTML, so hashing our input
+    /// would never match what a later tick reads).
+    html_hash: u64,
 }
 
 struct WatcherState {
@@ -338,6 +402,7 @@ struct WatcherState {
     last_seen_seq: u32,
     last_text_hash: u64,
     last_img_hash: u64,
+    last_html_hash: u64,
     /// Set when `try_send` hit a full channel or a read failed
     /// transiently — the next tick bypasses the unchanged-seq early
     /// exit and re-attempts.
@@ -445,6 +510,70 @@ fn worker_write_image(
     Ok(())
 }
 
+/// v2.1 — combined dedup hash for an html+text clipboard state. Both
+/// the self-marks (post-write read-back) and the watcher tick hash the
+/// SAME reading of the same clipboard, so echo suppression holds even
+/// though the OS re-wraps CF_HTML on every write. The 0x1F separator
+/// prevents (html="ab", text="c") colliding with (html="a", text="bc").
+pub(crate) fn html_event_hash(html: &str, text: &str) -> u64 {
+    let mut bytes = Vec::with_capacity(html.len() + text.len() + 1);
+    bytes.extend_from_slice(html.as_bytes());
+    bytes.push(0x1f);
+    bytes.extend_from_slice(host_to_wire(text).as_bytes());
+    fnv1a64(&bytes)
+}
+
+fn worker_read_html(cb: &mut arboard::Clipboard) -> Result<Option<HtmlPayload>> {
+    let html = match cb.get().html() {
+        Ok(h) => h,
+        Err(arboard::Error::ContentNotAvailable) => return Ok(None),
+        Err(e) => return Err(anyhow::anyhow!("clipboard get html: {e}")),
+    };
+    if html.is_empty() || html.len() > CLIPBOARD_HTML_MAX_BYTES {
+        return Ok(None);
+    }
+    // The plain-text alternate rides along so the receiving side can
+    // write both formats. Missing text (html-only producers) → empty.
+    let text = match cb.get_text() {
+        Ok(t) => host_to_wire(&t),
+        Err(_) => String::new(),
+    };
+    Ok(Some(HtmlPayload { html, text }))
+}
+
+fn worker_write_html(
+    cb: &mut arboard::Clipboard,
+    html: &str,
+    wire_text: &str,
+    marks: &mut SelfMarks,
+) -> Result<()> {
+    let text_host = wire_to_host(wire_text);
+    let alt = if text_host.is_empty() {
+        None
+    } else {
+        Some(text_host.as_str())
+    };
+    // One clipboard transaction, both formats (arboard wraps the
+    // CF_HTML header on Windows; text/html target on X11; NSPasteboard
+    // html type on macOS).
+    cb.set_html(html, alt)
+        .map_err(|e| anyhow::anyhow!("clipboard set_html: {e}"))?;
+    marks.text_hash = fnv1a64(host_to_wire(wire_text).as_bytes());
+    // Echo mark from the READ-BACK — the OS re-wraps CF_HTML, so a
+    // later tick reads different bytes than our input; hash what the
+    // tick will actually see. Read-back failure → mark from the input
+    // (better than nothing; the Windows seq mark still guards).
+    marks.html_hash = match cb.get().html() {
+        Ok(back) => html_event_hash(&back, wire_text),
+        Err(_) => html_event_hash(html, wire_text),
+    };
+    #[cfg(windows)]
+    {
+        marks.seq = win_clipboard_seq().unwrap_or(0);
+    }
+    Ok(())
+}
+
 /// Build the initial watcher state: snapshot the CURRENT clipboard so
 /// pre-existing content is never pushed on subscribe — only changes
 /// from here on.
@@ -475,6 +604,15 @@ fn install_watcher(
         Ok(t) => fnv1a64(host_to_wire(&t).as_bytes()),
         Err(_) => 0,
     };
+    // Snapshot current html too — otherwise the first tick after
+    // subscribe would push pre-existing rich content.
+    let html_hash = match cb.get().html() {
+        Ok(h) => {
+            let text = cb.get_text().map(|t| host_to_wire(&t)).unwrap_or_default();
+            html_event_hash(&h, &text)
+        }
+        Err(_) => 0,
+    };
     WatcherState {
         events,
         tx,
@@ -482,6 +620,7 @@ fn install_watcher(
         last_seen_seq: win_clipboard_seq().unwrap_or(0),
         last_text_hash: text_hash,
         last_img_hash: 0,
+        last_html_hash: html_hash,
         retry: false,
     }
 }
@@ -506,6 +645,30 @@ fn watch_tick(cb: &mut arboard::Clipboard, w: &mut WatcherState, marks: &SelfMar
         // Sequence number unavailable → hash polling below still works.
     }
     w.retry = false;
+    // v2.1 — richest format wins: html (carries a text alt) beats
+    // plain text beats image. A Word/browser copy has html+text; the
+    // html event lets the far side write BOTH formats.
+    if w.events.html
+        && let Ok(html) = cb.get().html()
+        && !html.is_empty()
+        && html.len() <= CLIPBOARD_HTML_MAX_BYTES
+    {
+        let text = cb.get_text().map(|t| host_to_wire(&t)).unwrap_or_default();
+        let h = html_event_hash(&html, &text);
+        if h == w.last_html_hash || h == marks.html_hash {
+            w.last_html_hash = h;
+            return;
+        }
+        match w
+            .tx
+            .try_send(ClipboardChange::Html(HtmlPayload { html, text }))
+        {
+            Ok(()) => w.last_html_hash = h,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => w.retry = true,
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+        }
+        return;
+    }
     let text = match cb.get_text() {
         Ok(t) => host_to_wire(&t),
         Err(arboard::Error::ContentNotAvailable) => String::new(),
@@ -692,6 +855,19 @@ pub(crate) enum ClipboardIncoming {
     /// and writes it to the OS clipboard, then acks with the `id`.
     #[serde(rename = "clipboard:img-end")]
     ImgEnd { id: String },
+    /// v2.1 — HTML write header. Binary frames totalling
+    /// `html_bytes + text_bytes` follow (html UTF-8 first, then the
+    /// plain-text alt), terminated by `clipboard:html-end`.
+    #[serde(rename = "clipboard:html-begin")]
+    HtmlBegin {
+        id: String,
+        html_bytes: u64,
+        text_bytes: u64,
+    },
+    /// v2.1 — HTML write trailer; the agent splits the accumulated
+    /// bytes, writes html+text atomically, then acks with the `id`.
+    #[serde(rename = "clipboard:html-end")]
+    HtmlEnd { id: String },
 }
 
 /// Hard ceiling on the total reassembled clipboard payload — both
@@ -811,6 +987,12 @@ pub const CLIPBOARD_IMAGE_MAX_BYTES: usize = 8 * 1024 * 1024;
 /// otherwise balloon to 1.6 GB from a few KB on the wire).
 pub const MAX_IMAGE_PIXELS: u64 = 4096 * 4096;
 
+/// v2.1 — cap on an HTML clipboard payload (html + text alt combined)
+/// on the wire, both directions. Chrome's sanitized copies inline
+/// styles aggressively (a big table can reach hundreds of KB); 4 MiB
+/// gives generous headroom while bounding memory + DC head-of-line.
+pub const CLIPBOARD_HTML_MAX_BYTES: usize = 4 * 1024 * 1024;
+
 /// Binary frame size for agent → browser image sends. 64 KiB matches
 /// the folder-zip download pump (field-proven; Chrome's inbound SCTP
 /// message cap is 256 KiB). The browser → agent direction uses 16 KiB
@@ -897,30 +1079,51 @@ pub(crate) fn png_to_rgba(png_bytes: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
     Ok((w, h, rgba))
 }
 
-/// Reassembles an inbound browser → agent image transfer: a
-/// `clipboard:img-begin` header, raw binary PNG frames, then a
-/// `clipboard:img-end` trailer. One transfer in flight at a time — a
-/// new begin replaces (drops) a dangling one. Byte twin of
+/// Reassembles an inbound browser → agent RICH transfer (image OR
+/// html): a `clipboard:img-begin`/`clipboard:html-begin` header, raw
+/// binary frames, then the matching `-end` trailer. One transfer in
+/// flight at a time — the browser serializes them, so anonymous
+/// binary frames always belong to the last announced header; a new
+/// begin replaces (drops) a dangling one. Byte twin of
 /// [`WriteReassembler`]; rejections mirror its reason-string contract.
 #[derive(Default)]
-pub(crate) struct ImageRx {
-    in_flight: Option<ImageRxInFlight>,
+pub(crate) struct RichRx {
+    in_flight: Option<RichRxInFlight>,
 }
 
-struct ImageRxInFlight {
+enum RichRxKind {
+    Image { w: u32, h: u32 },
+    Html { html_bytes: usize },
+}
+
+struct RichRxInFlight {
     id: String,
-    w: u32,
-    h: u32,
+    kind: RichRxKind,
     declared: usize,
     buf: Vec<u8>,
 }
 
-impl ImageRx {
+/// Completed inbound rich payload from [`RichRx::end`].
+#[derive(Debug)]
+pub(crate) enum RichPayload {
+    Image(PngImage),
+    Html(HtmlPayload),
+}
+
+impl RichRx {
     pub(crate) fn new() -> Self {
         Self::default()
     }
 
-    pub(crate) fn begin(
+    fn replace_dangling(&mut self) {
+        if let Some(stale) = self.in_flight.take() {
+            // The browser serializes transfers; a dangling one means it
+            // gave up mid-stream (reload / error). Replace it.
+            tracing::debug!(stale = %stale.id, "clipboard: replacing dangling rich transfer");
+        }
+    }
+
+    pub(crate) fn begin_image(
         &mut self,
         id: String,
         w: u32,
@@ -943,58 +1146,78 @@ impl ImageRx {
                 "clipboard image dims {w}x{h} outside the {MAX_IMAGE_PIXELS}-pixel cap"
             ));
         }
-        if let Some(stale) = self.in_flight.take() {
-            // The browser serializes transfers; a dangling one means it
-            // gave up mid-stream (reload / error). Replace it.
-            tracing::debug!(stale = %stale.id, "clipboard: replacing dangling image transfer");
-        }
-        self.in_flight = Some(ImageRxInFlight {
+        self.replace_dangling();
+        self.in_flight = Some(RichRxInFlight {
             id,
-            w,
-            h,
+            kind: RichRxKind::Image { w, h },
             declared: bytes as usize,
             buf: Vec::with_capacity(bytes as usize),
         });
         Ok(())
     }
 
+    pub(crate) fn begin_html(
+        &mut self,
+        id: String,
+        html_bytes: u64,
+        text_bytes: u64,
+    ) -> Result<(), String> {
+        let total = html_bytes.saturating_add(text_bytes);
+        if html_bytes == 0 || total > CLIPBOARD_HTML_MAX_BYTES as u64 {
+            return Err(format!(
+                "clipboard html payload {total} bytes outside the (0, {CLIPBOARD_HTML_MAX_BYTES}] cap"
+            ));
+        }
+        self.replace_dangling();
+        self.in_flight = Some(RichRxInFlight {
+            id,
+            kind: RichRxKind::Html {
+                html_bytes: html_bytes as usize,
+            },
+            declared: total as usize,
+            buf: Vec::with_capacity(total as usize),
+        });
+        Ok(())
+    }
+
     pub(crate) fn frame(&mut self, data: &[u8]) -> Result<(), String> {
         let Some(f) = self.in_flight.as_mut() else {
-            return Err("binary frame with no image transfer in flight".into());
+            return Err("binary frame with no rich transfer in flight".into());
         };
         if f.buf.len() + data.len() > f.declared {
             let id = f.id.clone();
             self.in_flight = None;
-            return Err(format!(
-                "image transfer {id} overflowed its declared length"
-            ));
+            return Err(format!("rich transfer {id} overflowed its declared length"));
         }
         f.buf.extend_from_slice(data);
         Ok(())
     }
 
-    pub(crate) fn end(&mut self, id: &str) -> Result<PngImage, String> {
+    pub(crate) fn end(&mut self, id: &str) -> Result<RichPayload, String> {
         let Some(f) = self.in_flight.take() else {
-            return Err("img-end with no image transfer in flight".into());
+            return Err("end with no rich transfer in flight".into());
         };
         if f.id != id {
-            return Err(format!(
-                "img-end id {id:?} does not match in-flight {:?}",
-                f.id
-            ));
+            return Err(format!("end id {id:?} does not match in-flight {:?}", f.id));
         }
         if f.buf.len() != f.declared {
             return Err(format!(
-                "image transfer {id} ended at {} of {} declared bytes",
+                "rich transfer {id} ended at {} of {} declared bytes",
                 f.buf.len(),
                 f.declared
             ));
         }
-        Ok(PngImage {
-            w: f.w,
-            h: f.h,
-            png: f.buf,
-        })
+        match f.kind {
+            RichRxKind::Image { w, h } => Ok(RichPayload::Image(PngImage { w, h, png: f.buf })),
+            RichRxKind::Html { html_bytes } => {
+                let (html_raw, text_raw) = f.buf.split_at(html_bytes.min(f.buf.len()));
+                let html = String::from_utf8(html_raw.to_vec())
+                    .map_err(|_| format!("rich transfer {id}: html is not valid UTF-8"))?;
+                let text = String::from_utf8(text_raw.to_vec())
+                    .map_err(|_| format!("rich transfer {id}: text is not valid UTF-8"))?;
+                Ok(RichPayload::Html(HtmlPayload { html, text }))
+            }
+        }
     }
 
     /// Test-only visibility.
@@ -1462,27 +1685,47 @@ mod tests {
         assert_eq!(rgba, vec![10, 20, 30, 255, 40, 50, 60, 255]);
     }
 
-    // ── v2: inbound image reassembler ──────────────────────────────────
+    // ── v2/v2.1: inbound rich reassembler (image + html) ───────────────
+
+    fn expect_image(p: RichPayload) -> PngImage {
+        match p {
+            RichPayload::Image(img) => img,
+            RichPayload::Html(_) => panic!("expected image payload"),
+        }
+    }
+
+    fn expect_html(p: RichPayload) -> HtmlPayload {
+        match p {
+            RichPayload::Html(h) => h,
+            RichPayload::Image(_) => panic!("expected html payload"),
+        }
+    }
 
     #[test]
-    fn image_rx_happy_path() {
-        let mut rx = ImageRx::new();
-        rx.begin("i1".into(), 2, 2, 6, "png").unwrap();
+    fn rich_rx_image_happy_path() {
+        let mut rx = RichRx::new();
+        rx.begin_image("i1".into(), 2, 2, 6, "png").unwrap();
         rx.frame(&[1, 2, 3]).unwrap();
         rx.frame(&[4, 5, 6]).unwrap();
-        let img = rx.end("i1").unwrap();
+        let img = expect_image(rx.end("i1").unwrap());
         assert_eq!((img.w, img.h), (2, 2));
         assert_eq!(img.png, vec![1, 2, 3, 4, 5, 6]);
         assert!(!rx.is_in_flight());
     }
 
     #[test]
-    fn image_rx_rejects_bad_begin() {
-        let mut rx = ImageRx::new();
-        assert!(rx.begin("i".into(), 2, 2, 6, "jpeg").is_err(), "png only");
-        assert!(rx.begin("i".into(), 2, 2, 0, "png").is_err(), "zero bytes");
+    fn rich_rx_image_rejects_bad_begin() {
+        let mut rx = RichRx::new();
         assert!(
-            rx.begin(
+            rx.begin_image("i".into(), 2, 2, 6, "jpeg").is_err(),
+            "png only"
+        );
+        assert!(
+            rx.begin_image("i".into(), 2, 2, 0, "png").is_err(),
+            "zero bytes"
+        );
+        assert!(
+            rx.begin_image(
                 "i".into(),
                 2,
                 2,
@@ -1493,44 +1736,124 @@ mod tests {
             "over byte cap"
         );
         assert!(
-            rx.begin("i".into(), 100_000, 100_000, 6, "png").is_err(),
+            rx.begin_image("i".into(), 100_000, 100_000, 6, "png")
+                .is_err(),
             "over pixel cap"
         );
         assert!(!rx.is_in_flight());
     }
 
     #[test]
-    fn image_rx_rejects_overflow_and_drops_transfer() {
-        let mut rx = ImageRx::new();
-        rx.begin("i1".into(), 2, 2, 4, "png").unwrap();
+    fn rich_rx_rejects_overflow_and_drops_transfer() {
+        let mut rx = RichRx::new();
+        rx.begin_image("i1".into(), 2, 2, 4, "png").unwrap();
         assert!(rx.frame(&[1, 2, 3, 4, 5]).is_err(), "over declared length");
         assert!(!rx.is_in_flight(), "overflow must drop the transfer");
         assert!(rx.frame(&[1]).is_err(), "no transfer in flight");
     }
 
     #[test]
-    fn image_rx_rejects_mismatched_end() {
-        let mut rx = ImageRx::new();
-        rx.begin("i1".into(), 2, 2, 2, "png").unwrap();
+    fn rich_rx_rejects_mismatched_end() {
+        let mut rx = RichRx::new();
+        rx.begin_image("i1".into(), 2, 2, 2, "png").unwrap();
         rx.frame(&[1, 2]).unwrap();
         assert!(rx.end("other").is_err(), "id mismatch");
         assert!(!rx.is_in_flight());
 
-        rx.begin("i2".into(), 2, 2, 4, "png").unwrap();
+        rx.begin_image("i2".into(), 2, 2, 4, "png").unwrap();
         rx.frame(&[1, 2]).unwrap();
         let err = rx.end("i2").unwrap_err();
         assert!(err.contains("2 of 4"), "length mismatch surfaces: {err}");
     }
 
     #[test]
-    fn image_rx_new_begin_replaces_dangling_transfer() {
-        let mut rx = ImageRx::new();
-        rx.begin("stale".into(), 2, 2, 100, "png").unwrap();
+    fn rich_rx_new_begin_replaces_dangling_transfer() {
+        let mut rx = RichRx::new();
+        rx.begin_image("stale".into(), 2, 2, 100, "png").unwrap();
         rx.frame(&[9; 10]).unwrap();
-        rx.begin("fresh".into(), 1, 1, 2, "png").unwrap();
-        rx.frame(&[7, 8]).unwrap();
-        let img = rx.end("fresh").unwrap();
-        assert_eq!(img.png, vec![7, 8]);
+        rx.begin_html("fresh".into(), 5, 2).unwrap();
+        rx.frame(b"<b>xy").unwrap();
+        rx.frame(b"hi").unwrap();
+        let p = expect_html(rx.end("fresh").unwrap());
+        assert_eq!(p.html, "<b>xy");
+        assert_eq!(p.text, "hi");
+    }
+
+    #[test]
+    fn rich_rx_html_happy_path_splits_on_declared_lengths() {
+        let mut rx = RichRx::new();
+        let html = "<b>bold</b> und ümlaut";
+        let text = "bold und ümlaut";
+        rx.begin_html("h1".into(), html.len() as u64, text.len() as u64)
+            .unwrap();
+        // Feed across an arbitrary boundary (mid-multibyte is fine —
+        // the split happens at declared lengths on the full buffer).
+        let combined = [html.as_bytes(), text.as_bytes()].concat();
+        rx.frame(&combined[..10]).unwrap();
+        rx.frame(&combined[10..]).unwrap();
+        let p = expect_html(rx.end("h1").unwrap());
+        assert_eq!(p.html, html);
+        assert_eq!(p.text, text);
+        assert!(!rx.is_in_flight());
+    }
+
+    #[test]
+    fn rich_rx_html_rejects_bad_begin_and_bad_utf8() {
+        let mut rx = RichRx::new();
+        assert!(rx.begin_html("h".into(), 0, 5).is_err(), "zero html bytes");
+        assert!(
+            rx.begin_html("h".into(), CLIPBOARD_HTML_MAX_BYTES as u64, 1)
+                .is_err(),
+            "combined size over the cap"
+        );
+        assert!(!rx.is_in_flight());
+        // Invalid UTF-8 in the html half is rejected at end().
+        rx.begin_html("h2".into(), 2, 0).unwrap();
+        rx.frame(&[0xff, 0xfe]).unwrap();
+        let err = rx.end("h2").unwrap_err();
+        assert!(err.contains("UTF-8"), "got: {err}");
+    }
+
+    // ── v2.1: html parse locks + event hash ────────────────────────────
+
+    #[test]
+    fn parse_incoming_html_begin_end() {
+        let m: ClipboardIncoming = serde_json::from_str(
+            r#"{"t":"clipboard:html-begin","id":"cb-9","html_bytes":120,"text_bytes":30}"#,
+        )
+        .unwrap();
+        match m {
+            ClipboardIncoming::HtmlBegin {
+                id,
+                html_bytes,
+                text_bytes,
+            } => {
+                assert_eq!((id.as_str(), html_bytes, text_bytes), ("cb-9", 120, 30));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        let m: ClipboardIncoming =
+            serde_json::from_str(r#"{"t":"clipboard:html-end","id":"cb-9"}"#).unwrap();
+        match m {
+            ClipboardIncoming::HtmlEnd { id } => assert_eq!(id, "cb-9"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn html_event_hash_separates_html_from_text_and_canonicalizes() {
+        // Separator prevents boundary collisions…
+        assert_ne!(html_event_hash("ab", "c"), html_event_hash("a", "bc"));
+        // …and the text half is canonicalized like every other text
+        // hash (CRLF == LF), while the html half is hashed verbatim.
+        assert_eq!(
+            html_event_hash("<p>x</p>", "l1\r\nl2"),
+            html_event_hash("<p>x</p>", "l1\nl2")
+        );
+        assert_ne!(
+            html_event_hash("<p>x</p>", "t"),
+            html_event_hash("<p>y</p>", "t")
+        );
     }
 
     /// The clipboard worker init may fail on headless CI runners that
