@@ -806,6 +806,23 @@
           >
             Corp relay assist — {{ localRelayOn ? 'ON' : 'OFF' }}
           </v-btn>
+          <!-- Clipboard auto-sync (v2). Live-effective (not gated on
+               sessionLive) — the composable subscribes/unsubscribes on
+               flip. Old agents: local→remote still auto-pushes; the
+               remote→local half needs the events cap (tooltip says so). -->
+          <v-btn
+            block
+            variant="tonal"
+            :color="clipboardAutoSyncOn ? 'primary' : undefined"
+            :prepend-icon="
+              clipboardAutoSyncOn ? 'mdi-clipboard-flow' : 'mdi-clipboard-off-outline'
+            "
+            :title="clipboardAutoSyncTooltip"
+            class="mb-2"
+            @click="toggleClipboardAutoSync"
+          >
+            Clipboard auto-sync — {{ clipboardAutoSyncOn ? 'ON' : 'OFF' }}
+          </v-btn>
           <template v-if="rc.phase.value === 'connected'">
             <v-btn
               block
@@ -1217,19 +1234,29 @@ async function onSendClipboard() {
   }
 }
 
-// Pull the agent's clipboard text and copy it into the controller's
-// local clipboard. The round-trip goes: button click → send
-// `clipboard:read` on the DC → await `clipboard:content` → paste
-// into `navigator.clipboard.writeText`. 5 s timeout inside the
-// composable; we render the error as a snackbar.
+// Pull the agent's clipboard and copy it into the controller's local
+// clipboard. v2 agents answer with text OR an image (rich read —
+// `accept:["text","image"]`); old agents text only. The button click
+// anchors the `navigator.clipboard.write*` user-gesture permission.
 async function onGetClipboard() {
   if (clipboardBusy.value) return
   clipboardBusy.value = true
   try {
-    const text = await rc.getAgentClipboard()
+    const content = await rc.getAgentClipboardRich()
     try {
-      await globalThis.navigator.clipboard.writeText(text)
-      showSuccess(`Copied remote clipboard (${text.length} chars)`)
+      if (content.kind === 'image') {
+        await globalThis.navigator.clipboard.write([
+          new ClipboardItem({ 'image/png': content.blob }),
+        ])
+        showSuccess(`Copied remote image (${content.w}×${content.h})`)
+      } else {
+        await globalThis.navigator.clipboard.writeText(content.text)
+        showSuccess(
+          content.text.length > 0
+            ? `Copied remote clipboard (${content.text.length} chars)`
+            : 'Remote clipboard is empty',
+        )
+      }
     } catch (e) {
       showError(`Could not write to your clipboard: ${(e as Error).message}`)
     }
@@ -1912,6 +1939,38 @@ const localRelayTooltip = computed<string>(() => {
 function toggleLocalRelay() {
   rc.setLocalRelayEnabled(!localRelayOn.value)
 }
+
+// ── Clipboard auto-sync (v2) — Settings toggle + blocked-permission hint ──
+// Live-effective (no reconnect needed): the composable's watcher
+// subscribes/unsubscribes + starts/stops the local triggers on flip.
+const clipboardAutoSyncOn = computed<boolean>(() => rc.clipboardAutoSyncEnabled.value)
+const clipboardAutoSyncTooltip = computed<string>(() => {
+  if (!clipboardAutoSyncOn.value) {
+    return 'Clipboard auto-sync OFF — use the toolbar buttons to send/get the clipboard manually.'
+  }
+  const base =
+    'Clipboard auto-sync ON — text and images you copy on either side sync automatically while this tab is focused. Turn off to use the manual toolbar buttons only.'
+  return rc.supportsClipboardEvents.value
+    ? base
+    : base +
+        ' This agent is older — remote→local auto-sync needs an agent upgrade; local→remote still syncs.'
+})
+function toggleClipboardAutoSync() {
+  rc.setClipboardAutoSyncEnabled(!clipboardAutoSyncOn.value)
+}
+// One-shot hint when Chrome denies clipboard-read for the auto-sync
+// engine (the latch only fires on a REAL permission denial, not focus
+// races). Manual buttons keep working — their reads are gesture-anchored.
+watch(
+  () => rc.clipboardSyncBlocked.value,
+  (blocked) => {
+    if (blocked) {
+      showError(
+        'Clipboard auto-sync needs clipboard permission — click the clipboard icon in Chrome\'s address bar, or use the manual toolbar buttons.',
+      )
+    }
+  },
+)
 
 // ── rc.199 — unified Codec picker + Priority dial (Settings panel) ──
 // The Codec picker folds the four transport toggles + the codec-override +
@@ -2754,6 +2813,14 @@ async function loadAgent() {
 
 function startSession() {
   if (!agent.value) return
+  // Surface Chrome's clipboard-read permission prompt UNDER the
+  // Connect click gesture (auto-sync's later background reads can't
+  // prompt as nicely). Fire-and-forget throwaway read — the result
+  // is discarded; a denial just leaves auto-sync to its blocked-latch
+  // flow.
+  if (rc.clipboardAutoSyncEnabled.value) {
+    void globalThis.navigator.clipboard?.readText?.().catch(() => {})
+  }
   rc.connect(agent.value.id)
 }
 
