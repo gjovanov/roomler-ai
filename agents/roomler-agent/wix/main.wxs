@@ -55,7 +55,7 @@
         <Package
             Id='*'
             Keywords='Installer'
-            Description='Roomler AI remote-control agent'
+            Description='Roomler Daemon — private mesh network + secure remote control'
             Manufacturer='Goran Jovanov'
             InstallerVersion='450'
             Languages='1033'
@@ -221,7 +221,7 @@
                         <Shortcut
                             Id='AgentShortcut'
                             Name='Roomler Agent'
-                            Description='Roomler AI remote-control agent (signalling)'
+                            Description='Roomler Daemon — private mesh network + secure remote control'
                             Target='[APPLICATIONFOLDER]roomlerd.exe'
                             Arguments='run'
                             WorkingDirectory='APPLICATIONFOLDER' />
@@ -241,7 +241,7 @@
         <Feature
             Id='Complete'
             Title='Roomler Agent'
-            Description='The Roomler AI remote-control agent.'
+            Description='Roomler Daemon — keeps this device on your private Roomler mesh network and available for secure remote control.'
             Display='expand'
             Level='1'
             ConfigurableDirectory='APPLICATIONFOLDER'
