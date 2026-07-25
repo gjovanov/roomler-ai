@@ -832,6 +832,7 @@ fn build_overlay_view(
     self_ip: &str,
     by_node: &HashMap<ObjectId, Installed>,
     current_peers: &HashMap<ObjectId, NetmapPeer>,
+    probing: &HashMap<ObjectId, UpgradeProbe>,
     now: Instant,
     epoch_now_ms: u64,
 ) -> OverlayView {
@@ -859,6 +860,10 @@ fn build_overlay_view(
                 overlay_ip6: derived_v6_of(&np.overlay_ip),
                 online: np.reachable,
                 connection,
+                // P8-cosmetics — a relay-carried peer with an MBB probe in
+                // flight renders as `upgrading` in the CLI, so a snapshot
+                // taken mid-transition reads as what it is.
+                upgrading: connection == ConnectionType::Relay && probing.contains_key(&np.node_id),
                 rtt_ms: None,
                 last_seen_ms,
                 // P3b-3 — carry the backing agent id (hex) so the daemon can join
@@ -1177,6 +1182,7 @@ impl OverlayRuntime {
         self_ip: &str,
         by_node: &HashMap<ObjectId, Installed>,
         current_peers: &HashMap<ObjectId, NetmapPeer>,
+        probing: &HashMap<ObjectId, UpgradeProbe>,
         exit_status: Option<ExitNodeStatus>,
     ) {
         if let Some(tx) = &self.peer_view {
@@ -1189,7 +1195,8 @@ impl OverlayRuntime {
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
-            let mut view = build_overlay_view(self_ip, by_node, current_peers, now, epoch_now_ms);
+            let mut view =
+                build_overlay_view(self_ip, by_node, current_peers, probing, now, epoch_now_ms);
             // S4 — the exit-node routing status the runtime holds (the view
             // builder is pure over peers, so this is grafted on after).
             view.exit_node = exit_status;
@@ -1622,6 +1629,7 @@ impl OverlayRuntime {
             &self_ip,
             &by_node,
             &current_peers,
+            &upgrade_probes,
             exit_node_status(self.exit_node.as_deref(), &exit_state),
         );
 
@@ -1715,7 +1723,7 @@ impl OverlayRuntime {
                             // coturn worker may need an exit exemption, and the
                             // LocalAPI view must reflect the new carrier.
                             self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
-                            self.publish_view(&self_ip, &by_node, &current_peers, exit_node_status(self.exit_node.as_deref(), &exit_state));
+                            self.publish_view(&self_ip, &by_node, &current_peers, &upgrade_probes, exit_node_status(self.exit_node.as_deref(), &exit_state));
                         } else {
                             debug!(peer = %built.link.node_id, "overlay: dropping stale off-loop carrier build (peer removed/superseded mid-build)");
                         }
@@ -1746,7 +1754,7 @@ impl OverlayRuntime {
                                             // worker to exempt, and the LocalAPI view must
                                             // reflect the new carrier.
                                             self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
-                                            self.publish_view(&self_ip, &by_node, &current_peers, exit_node_status(self.exit_node.as_deref(), &exit_state));
+                                            self.publish_view(&self_ip, &by_node, &current_peers, &upgrade_probes, exit_node_status(self.exit_node.as_deref(), &exit_state));
                                         }
                                     }
                                     None => {
@@ -1809,7 +1817,7 @@ impl OverlayRuntime {
                             direct_ctx.as_ref(), &cooldowns, &mut upgrade_probes, &mut relay_bq,
                         ).await;
                         self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
-                        self.publish_view(&self_ip, &by_node, &current_peers, exit_node_status(self.exit_node.as_deref(), &exit_state));
+                        self.publish_view(&self_ip, &by_node, &current_peers, &upgrade_probes, exit_node_status(self.exit_node.as_deref(), &exit_state));
                     }
                     let t0 = Instant::now();
                     self.sweep_carrier_health(
@@ -1859,6 +1867,7 @@ impl OverlayRuntime {
                         &self_ip,
                         &by_node,
                         &current_peers,
+                        &upgrade_probes,
                         exit_node_status(self.exit_node.as_deref(), &exit_state),
                     );
                     warn_if_slow("arm:fallback_sweep", t_arm);
@@ -1932,7 +1941,7 @@ impl OverlayRuntime {
                             &mut relay_bq, inb,
                         ).await;
                         self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
-                        self.publish_view(&self_ip, &by_node, &current_peers, exit_node_status(self.exit_node.as_deref(), &exit_state));
+                        self.publish_view(&self_ip, &by_node, &current_peers, &upgrade_probes, exit_node_status(self.exit_node.as_deref(), &exit_state));
                         warn_if_slow("arm:direct_inbound", t_arm);
                     }
                 },
@@ -1959,7 +1968,7 @@ impl OverlayRuntime {
                         self.install_peers(&mut wg, &mut by_node, &mut relay, &tun, &peers, direct_ctx.as_ref(), &cooldowns, &mut upgrade_probes, &mut relay_bq).await;
                         warn_if_slow("install_peers(netmap)", t0);
                         self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
-                        self.publish_view(&self_ip, &by_node, &current_peers, exit_node_status(self.exit_node.as_deref(), &exit_state));
+                        self.publish_view(&self_ip, &by_node, &current_peers, &upgrade_probes, exit_node_status(self.exit_node.as_deref(), &exit_state));
                         warn_if_slow("arm:netmap", t_arm);
                     }
                     Some(OverlayEvent::NetmapDelta { upserts, removes }) => {
@@ -1998,7 +2007,7 @@ impl OverlayRuntime {
                         }
                         if let Some(names) = &dns_names { sync_name_map(names, &current_peers).await; }
                         self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
-                        self.publish_view(&self_ip, &by_node, &current_peers, exit_node_status(self.exit_node.as_deref(), &exit_state));
+                        self.publish_view(&self_ip, &by_node, &current_peers, &upgrade_probes, exit_node_status(self.exit_node.as_deref(), &exit_state));
                         warn_if_slow("arm:netmap_delta", t_arm);
                     }
                     Some(OverlayEvent::RelayGrant { peer_node_id, ice_servers, pair_key }) => {
@@ -2068,7 +2077,7 @@ impl OverlayRuntime {
                                 self.install_ready(&mut wg, &mut by_node, &tun, link, &mut relay_bq).await;
                                 warn_if_slow("install_ready(spawn-or-sync)", t0);
                                 self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
-                                self.publish_view(&self_ip, &by_node, &current_peers, exit_node_status(self.exit_node.as_deref(), &exit_state));
+                                self.publish_view(&self_ip, &by_node, &current_peers, &upgrade_probes, exit_node_status(self.exit_node.as_deref(), &exit_state));
                             }
                         }
                         warn_if_slow("arm:force_derp", t_arm);
@@ -4909,9 +4918,32 @@ mod tests {
         current.insert(b, np(b, "pending-peer", "100.64.0.3", true)); // no carrier
         current.insert(o, np(o, "offline-peer", "100.64.0.4", false));
 
-        let view = build_overlay_view("100.64.0.9", &by_node, &current, now, epoch_now_ms);
+        // P8-cosmetics — an in-flight MBB probe marks the RELAY peer (and only
+        // it) as `upgrading`; a probe entry for the DIRECT peer is ignored
+        // (the marker is a relay-tier transition signal).
+        let mut probes: HashMap<ObjectId, UpgradeProbe> = HashMap::new();
+        let dummy_probe = || UpgradeProbe {
+            pubkey: [0u8; 32],
+            overlay_ip: Ipv4Addr::new(100, 64, 0, 2),
+            dst: "192.168.68.1:51820".parse().unwrap(),
+            tier: DirectTier::Lan,
+            since: now,
+        };
+        probes.insert(r, dummy_probe());
+        probes.insert(d, dummy_probe());
+
+        let view = build_overlay_view("100.64.0.9", &by_node, &current, &probes, now, epoch_now_ms);
         assert_eq!(view.self_ip.as_deref(), Some("100.64.0.9"));
         assert_eq!(view.peers.len(), 4);
+        assert!(
+            view.peers[1].upgrading,
+            "relay peer with a probe ⇒ upgrading"
+        );
+        assert!(
+            !view.peers[0].upgrading,
+            "direct peer never shows upgrading"
+        );
+        assert!(!view.peers[2].upgrading && !view.peers[3].upgrading);
         // Sorted by node_id hex → 01,02,03,04.
         assert_eq!(view.peers[0].connection, ConnectionType::Direct);
         assert_eq!(view.peers[0].name, "direct-peer");
