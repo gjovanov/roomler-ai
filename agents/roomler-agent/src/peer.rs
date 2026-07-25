@@ -5406,7 +5406,7 @@ fn attach_clipboard_handler(
     // (so anonymous binary frames always belong to the last announced
     // header), and the change-watcher forwarder task handle for
     // unsubscribe / DC-close teardown.
-    let image_rx = Arc::new(std::sync::Mutex::new(crate::clipboard::ImageRx::new()));
+    let rich_rx = Arc::new(std::sync::Mutex::new(crate::clipboard::RichRx::new()));
     let img_tx_lock = Arc::new(tokio::sync::Mutex::new(()));
     let watch_task: Arc<std::sync::Mutex<Option<JoinHandle<()>>>> =
         Arc::new(std::sync::Mutex::new(None));
@@ -5437,7 +5437,7 @@ fn attach_clipboard_handler(
         let dc = dc_for_handler.clone();
         let cb = cb.clone();
         let reassembler = reassembler.clone();
-        let image_rx = image_rx.clone();
+        let rich_rx = rich_rx.clone();
         let img_tx_lock = img_tx_lock.clone();
         let watch_task = watch_task.clone();
         Box::pin(async move {
@@ -5446,7 +5446,7 @@ fn attach_clipboard_handler(
             // `clipboard:img-begin` control frame).
             if !msg.is_string {
                 let res = {
-                    let mut rx = image_rx.lock().expect("clipboard image_rx poisoned");
+                    let mut rx = rich_rx.lock().expect("clipboard rich_rx poisoned");
                     rx.frame(&msg.data)
                 };
                 if let Err(reason) = res {
@@ -5560,6 +5560,29 @@ fn attach_clipboard_handler(
                     }
                 }
                 crate::clipboard::ClipboardIncoming::Read { req_id, accept } => {
+                    // v2.1 — html-first rich read: an html-holding
+                    // clipboard also carries a text alt, so html must
+                    // be offered BEFORE the plain-text reply.
+                    if accept.iter().any(|a| a == "html") {
+                        match cb.read_html().await {
+                            Ok(Some(payload)) => {
+                                info!(%session_id, html_bytes = payload.html.len(), text_bytes = payload.text.len(), "clipboard: read html from host");
+                                send_clipboard_html(
+                                    &dc,
+                                    session_id,
+                                    payload,
+                                    req_id,
+                                    &img_tx_lock,
+                                )
+                                .await;
+                                return;
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                debug!(%session_id, %e, "clipboard: html read failed — falling through to text");
+                            }
+                        }
+                    }
                     match cb.read().await {
                         Ok(text) if !text.is_empty() => {
                             let bytes = text.len();
@@ -5665,19 +5688,21 @@ fn attach_clipboard_handler(
                     // the browser always sends an explicit list.
                     let want_text = events.is_empty() || events.iter().any(|e| e == "text");
                     let want_image = events.iter().any(|e| e == "image");
+                    let want_html = events.iter().any(|e| e == "html");
                     let (tx, mut rx) =
                         tokio::sync::mpsc::channel::<crate::clipboard::ClipboardChange>(4);
                     if let Err(e) = cb.watch(
                         crate::clipboard::WatchEvents {
                             text: want_text,
                             image: want_image,
+                            html: want_html,
                         },
                         tx,
                     ) {
                         warn!(%session_id, %e, "clipboard: subscribe failed (worker gone)");
                         return;
                     }
-                    info!(%session_id, text = want_text, image = want_image, "clipboard: change subscription installed");
+                    info!(%session_id, text = want_text, image = want_image, html = want_html, "clipboard: change subscription installed");
                     let dc_for_events = dc.clone();
                     let img_lock_for_events = img_tx_lock.clone();
                     let handle = tokio::spawn(async move {
@@ -5699,6 +5724,16 @@ fn attach_clipboard_handler(
                                         &dc_for_events,
                                         session_id,
                                         img,
+                                        None,
+                                        &img_lock_for_events,
+                                    )
+                                    .await;
+                                }
+                                crate::clipboard::ClipboardChange::Html(payload) => {
+                                    send_clipboard_html(
+                                        &dc_for_events,
+                                        session_id,
+                                        payload,
                                         None,
                                         &img_lock_for_events,
                                     )
@@ -5734,8 +5769,8 @@ fn attach_clipboard_handler(
                     format,
                 } => {
                     let res = {
-                        let mut rx = image_rx.lock().expect("clipboard image_rx poisoned");
-                        rx.begin(id.clone(), w, h, bytes, &format)
+                        let mut rx = rich_rx.lock().expect("clipboard rich_rx poisoned");
+                        rx.begin_image(id.clone(), w, h, bytes, &format)
                     };
                     match res {
                         Ok(()) => {
@@ -5754,41 +5789,21 @@ fn attach_clipboard_handler(
                         }
                     }
                 }
-                crate::clipboard::ClipboardIncoming::ImgEnd { id } => {
-                    let assembled = {
-                        let mut rx = image_rx.lock().expect("clipboard image_rx poisoned");
-                        rx.end(&id)
+                crate::clipboard::ClipboardIncoming::HtmlBegin {
+                    id,
+                    html_bytes,
+                    text_bytes,
+                } => {
+                    let res = {
+                        let mut rx = rich_rx.lock().expect("clipboard rich_rx poisoned");
+                        rx.begin_html(id.clone(), html_bytes, text_bytes)
                     };
-                    match assembled {
-                        Ok(img) => {
-                            let bytes = img.png.len();
-                            match cb.write_image(img.png).await {
-                                Ok(()) => {
-                                    info!(%session_id, %id, bytes, "clipboard: wrote image to host");
-                                    let reply = serde_json::json!({
-                                        "t": "clipboard:write-ack",
-                                        "id": id,
-                                        "bytes": bytes,
-                                    });
-                                    if let Ok(s) = serde_json::to_string(&reply) {
-                                        let _ = dc.send_text(s).await;
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!(%session_id, %id, %e, "clipboard: image write failed");
-                                    let reply = serde_json::json!({
-                                        "t": "clipboard:error",
-                                        "message": format!("{e}"),
-                                        "id": id,
-                                    });
-                                    if let Ok(s) = serde_json::to_string(&reply) {
-                                        let _ = dc.send_text(s).await;
-                                    }
-                                }
-                            }
+                    match res {
+                        Ok(()) => {
+                            debug!(%session_id, %id, html_bytes, text_bytes, "clipboard: html write begin")
                         }
                         Err(reason) => {
-                            warn!(%session_id, %id, %reason, "clipboard: image end rejected");
+                            warn!(%session_id, %id, %reason, "clipboard: html begin rejected");
                             let reply = serde_json::json!({
                                 "t": "clipboard:error",
                                 "message": reason,
@@ -5800,9 +5815,135 @@ fn attach_clipboard_handler(
                         }
                     }
                 }
+                crate::clipboard::ClipboardIncoming::ImgEnd { id }
+                | crate::clipboard::ClipboardIncoming::HtmlEnd { id } => {
+                    finish_rich_write(&dc, session_id, &cb, &rich_rx, &id).await;
+                }
             }
         })
     }));
+}
+
+/// Complete an inbound rich transfer (`clipboard:img-end` /
+/// `clipboard:html-end`): reassemble, write to the OS clipboard in the
+/// payload's native shape, ack (or error) with the transfer id.
+#[cfg(feature = "clipboard")]
+async fn finish_rich_write(
+    dc: &Arc<RTCDataChannel>,
+    session_id: bson::oid::ObjectId,
+    cb: &crate::clipboard::Clipboard,
+    rich_rx: &Arc<std::sync::Mutex<crate::clipboard::RichRx>>,
+    id: &str,
+) {
+    let assembled = {
+        let mut rx = rich_rx.lock().expect("clipboard rich_rx poisoned");
+        rx.end(id)
+    };
+    let result: Result<usize, String> = match assembled {
+        Ok(crate::clipboard::RichPayload::Image(img)) => {
+            let bytes = img.png.len();
+            match cb.write_image(img.png).await {
+                Ok(()) => {
+                    info!(%session_id, id, bytes, "clipboard: wrote image to host");
+                    Ok(bytes)
+                }
+                Err(e) => Err(format!("{e}")),
+            }
+        }
+        Ok(crate::clipboard::RichPayload::Html(payload)) => {
+            let bytes = payload.html.len() + payload.text.len();
+            match cb.write_html(payload.html, payload.text).await {
+                Ok(()) => {
+                    info!(%session_id, id, bytes, "clipboard: wrote html to host");
+                    Ok(bytes)
+                }
+                Err(e) => Err(format!("{e}")),
+            }
+        }
+        Err(reason) => Err(reason),
+    };
+    let reply = match result {
+        Ok(bytes) => serde_json::json!({
+            "t": "clipboard:write-ack",
+            "id": id,
+            "bytes": bytes,
+        }),
+        Err(message) => {
+            warn!(%session_id, id, %message, "clipboard: rich write failed");
+            serde_json::json!({
+                "t": "clipboard:error",
+                "message": message,
+                "id": id,
+            })
+        }
+    };
+    if let Ok(s) = serde_json::to_string(&reply) {
+        let _ = dc.send_text(s).await;
+    }
+}
+
+/// v2.1 — stream one HTML payload (+ its text alt) to the browser:
+/// `clipboard:html-begin` header, 64 KiB binary frames (html bytes
+/// then text bytes), `clipboard:html-end` trailer. `req_id` present ⇒
+/// answers a rich read; absent ⇒ unsolicited change event. Shares the
+/// image sender's serialization lock so anonymous binary frames always
+/// belong to the last announced header.
+#[cfg(feature = "clipboard")]
+async fn send_clipboard_html(
+    dc: &Arc<RTCDataChannel>,
+    session_id: bson::oid::ObjectId,
+    payload: crate::clipboard::HtmlPayload,
+    req_id: Option<u64>,
+    tx_lock: &tokio::sync::Mutex<()>,
+) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static HTML_TX_SEQ: AtomicU64 = AtomicU64::new(0);
+    const BACKPRESSURE_HIGH: usize = 4 * 1024 * 1024;
+    const BACKPRESSURE_MAX_SPINS: u32 = 750;
+
+    let _guard = tx_lock.lock().await;
+    let id = format!("ahtml-{}", HTML_TX_SEQ.fetch_add(1, Ordering::Relaxed));
+    let html_bytes = payload.html.len();
+    let text_bytes = payload.text.len();
+    debug!(%session_id, %id, html_bytes, text_bytes, ?req_id, "clipboard: sending html");
+    let begin = serde_json::json!({
+        "t": "clipboard:html-begin",
+        "id": id,
+        "html_bytes": html_bytes as u64,
+        "text_bytes": text_bytes as u64,
+        "req_id": req_id,
+    });
+    let Ok(s) = serde_json::to_string(&begin) else {
+        return;
+    };
+    if dc.send_text(s).await.is_err() {
+        return;
+    }
+    let mut combined = Vec::with_capacity(html_bytes + text_bytes);
+    combined.extend_from_slice(payload.html.as_bytes());
+    combined.extend_from_slice(payload.text.as_bytes());
+    for chunk in combined.chunks(crate::clipboard::IMG_FRAME_BYTES_TX) {
+        let mut spins = 0u32;
+        while dc.buffered_amount().await > BACKPRESSURE_HIGH {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            spins += 1;
+            if spins > BACKPRESSURE_MAX_SPINS {
+                debug!(%session_id, %id, "clipboard: backpressure stall; abandoning html send");
+                return;
+            }
+        }
+        if dc.send(&Bytes::copy_from_slice(chunk)).await.is_err() {
+            debug!(%session_id, %id, "clipboard: DC closed mid-html-send; abandoning");
+            return;
+        }
+    }
+    let end = serde_json::json!({
+        "t": "clipboard:html-end",
+        "id": id,
+    });
+    if let Ok(s) = serde_json::to_string(&end) {
+        let _ = dc.send_text(s).await;
+    }
 }
 
 /// Send one host-clipboard text change to the browser: a single
