@@ -147,6 +147,12 @@ export type RcControlInbound =
   | { kind: 'apps_list_reply'; id: string | null; reply: RcAppsListReply }
   | { kind: 'apps_focus_reply'; id: string | null; reply: RcAppsActionReply }
   | { kind: 'apps_launch_reply'; id: string | null; reply: RcAppsActionReply }
+  | {
+      kind: 'layout'
+      activeHkl: string
+      activeTag: string
+      installed: { hkl: string; tag: string }[]
+    }
   | null
 
 export function parseControlInbound(data: unknown): RcControlInbound {
@@ -233,7 +239,35 @@ export function parseControlInbound(data: unknown): RcControlInbound {
   if (obj.t === 'rc:apps.launch.reply') {
     return { kind: 'apps_launch_reply', id: strOrNull(obj.id), reply: parseAppsActionReply(obj) }
   }
+  // rc.227 — keyboard-layout snapshot from the agent (Windows hosts).
+  // Defensive filtering: malformed installed entries are dropped, a
+  // missing list degrades to [] (chip still renders from the active
+  // fields; the picker just has no options).
+  if (obj.t === 'rc:layout' && typeof obj.active_hkl === 'string' && typeof obj.active === 'string') {
+    const installed = Array.isArray(obj.installed)
+      ? obj.installed
+          .filter((e): e is Record<string, unknown> => typeof e === 'object' && e !== null)
+          .filter((e) => typeof e.hkl === 'string' && typeof e.tag === 'string')
+          .map((e) => ({ hkl: e.hkl as string, tag: e.tag as string }))
+      : []
+    return {
+      kind: 'layout',
+      activeHkl: obj.active_hkl,
+      activeTag: obj.active,
+      installed,
+    }
+  }
   return null
+}
+
+/** Pure builder for the `rc:layout.set` control-DC envelope — the
+ *  viewer's manual layout switch. `hkl` must be the opaque hex string
+ *  the agent itself reported in `rc:layout.installed[].hkl`; anything
+ *  else returns null (never sent). Exported so tests lock the wire
+ *  shape the agent's control-handler arm validates. */
+export function layoutSetWireMessage(hkl: string): { t: 'rc:layout.set'; hkl: string } | null {
+  if (!/^[0-9a-fA-F]{1,16}$/.test(hkl)) return null
+  return { t: 'rc:layout.set', hkl }
 }
 
 function strOrNull(v: unknown): string | null {
@@ -1752,6 +1786,16 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    * always-false matches the pre-overlay behaviour for those agents.
    */
   const hostLocked = ref(false)
+  /** rc.227 — the remote host's keyboard-layout state, pushed by
+   *  Windows agents as `rc:layout` over the control DC (on change;
+   *  first snapshot arrives with the first input event). Null on old
+   *  agents / non-Windows hosts — the layout chip + picker self-hide.
+   *  `installed` entries are `(opaque 8-hex HKL, BCP-47 tag)`. */
+  const remoteLayout = ref<{
+    activeHkl: string
+    activeTag: string
+    installed: { hkl: string; tag: string }[]
+  } | null>(null)
   /** True while `navigator.keyboard.lock()` is active (locked
    *  fullscreen). Drives the aggressive preventDefault policy in
    *  `attachInput` (every forwarded key suppresses its local default
@@ -2865,6 +2909,23 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     }
   }
 
+  /** rc.227 — ask the agent to switch the HOST's active keyboard
+   *  layout (the Settings picker). `hkl` must come from
+   *  `remoteLayout.installed[].hkl`. No explicit ack: the agent's
+   *  re-sampled `rc:layout` push updates `remoteLayout`, and a
+   *  lost/refused switch visibly snaps the picker back. */
+  function setRemoteLayout(hkl: string) {
+    const ch = channels.control
+    if (!ch || ch.readyState !== 'open') return
+    const msg = layoutSetWireMessage(hkl)
+    if (!msg) return
+    try {
+      ch.send(JSON.stringify(msg))
+    } catch {
+      /* channel closed between check and send — drop */
+    }
+  }
+
   /** Update the controller's remote-resolution preference and push to
    *  the agent. For `fit` + `custom`, `width`/`height` are required;
    *  for `original`, they're ignored. Persisted per-agent so the
@@ -3879,6 +3940,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     hostLocked.value = false
     currentDesktop.value = 'Default'
     videoInfo.value = null
+    remoteLayout.value = null
   }
 
   // Phase 5 — admin break-glass reason for the NEXT `connect()`. The UI sets it
@@ -4676,6 +4738,15 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         hostLocked.value = parsed.locked
       } else if (parsed?.kind === 'desktop_changed') {
         currentDesktop.value = parsed.name
+      } else if (parsed?.kind === 'layout') {
+        // rc.227 — keyboard-layout snapshot; drives the toolbar chip
+        // + the Settings picker. Old agents never send it → the ref
+        // stays null and the UI self-hides.
+        remoteLayout.value = {
+          activeHkl: parsed.activeHkl,
+          activeTag: parsed.activeTag,
+          installed: parsed.installed,
+        }
       } else if (parsed?.kind === 'video_info') {
         // rc.87 — the agent told us its real encoder. Drives the
         // honest stats badge (replaces the hardcoded "VP9 4:4:4 SW").
@@ -6712,6 +6783,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     keyboardLockActive,
     enableKeyboardLock,
     disableKeyboardLock,
+    /** rc.227 — remote keyboard-layout state (null on old agents /
+     *  non-Windows hosts) + the manual switch sender. */
+    remoteLayout,
+    setRemoteLayout,
     sendClipboardToAgent,
     getAgentClipboard,
     /** v2 — text-or-image read (falls back to text-only on old

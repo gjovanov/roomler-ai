@@ -76,6 +76,12 @@ export interface AgentCapabilities {
    *  back to the v1 button-driven text-only flow. Mirrors
    *  `AgentCaps.clipboard` in `crates/remote_control/src/models.rs`. */
   clipboard?: string[]
+  /** rc.227 — keyboard-layout integration (Windows hosts). Known
+   *  values: 'report' (agent pushes rc:layout snapshots over the
+   *  control DC), 'set' (agent accepts rc:layout.set manual switches).
+   *  Empty / unset on older agents / non-Windows hosts — the browser
+   *  hides the layout chip + picker. Mirrors `AgentCaps.layout`. */
+  layout?: string[]
 }
 
 export interface Agent {

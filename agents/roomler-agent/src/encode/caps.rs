@@ -345,6 +345,16 @@ fn compute_caps() -> AgentCaps {
         Vec::new()
     };
 
+    // Keyboard-layout integration (rc.227) — status reporting +
+    // manual set ride the control DC; both are Windows-only code in
+    // `input::layout` behind enigo-input. The browser gates its
+    // layout chip + picker on these.
+    let layout: Vec<String> = if cfg!(all(target_os = "windows", feature = "enigo-input")) {
+        vec!["report".into(), "set".into()]
+    } else {
+        Vec::new()
+    };
+
     AgentCaps {
         hw_encoders,
         codecs,
@@ -358,6 +368,7 @@ fn compute_caps() -> AgentCaps {
         audio,
         apps,
         clipboard,
+        layout,
     }
 }
 
