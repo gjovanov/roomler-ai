@@ -69,6 +69,13 @@ export interface AgentCapabilities {
    *  agents or non-VD hosts — the browser hides the Apps menu. Mirrors
    *  `AgentCaps.apps` in `crates/remote_control/src/models.rs`. */
   apps?: string[]
+  /** Clipboard-DC protocol v2. Known values: 'ack' (write-ack replies
+   *  gate the deferred Ctrl+V), 'events' (agent pushes host clipboard
+   *  changes after `clipboard:subscribe`), 'images' (PNG payloads both
+   *  directions). Empty / unset on older agents — the browser falls
+   *  back to the v1 button-driven text-only flow. Mirrors
+   *  `AgentCaps.clipboard` in `crates/remote_control/src/models.rs`. */
+  clipboard?: string[]
 }
 
 export interface Agent {

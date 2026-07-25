@@ -259,6 +259,11 @@ impl AgentPeer {
         // feature is compiled in; underscored-through otherwise so the
         // default-feature build doesn't warn on the unused binding.
         #[cfg_attr(not(feature = "audio"), allow(unused_variables))] audio_enabled: bool,
+        // Session permission bitfield from `rc:request` (v2 — enforced
+        // per-DC; today the clipboard handler consumes it). Only read
+        // when the `clipboard` feature is compiled in.
+        #[cfg_attr(not(feature = "clipboard"), allow(unused_variables))]
+        permissions: roomler_ai_remote_control::permissions::Permissions,
     ) -> Result<Self> {
         let mut engine = MediaEngine::default();
         engine
@@ -867,7 +872,7 @@ impl AgentPeer {
                         encoded_dims_for_dc,
                     ),
                     #[cfg(feature = "clipboard")]
-                    "clipboard" => attach_clipboard_handler(dc, session_id),
+                    "clipboard" => attach_clipboard_handler(dc, session_id, permissions),
                     "files" => attach_files_handler(dc, session_id),
                     "video-bytes" => {
                         // Phase Y.3 stash. The media pump (when caps
@@ -5246,7 +5251,44 @@ fn attach_log_only(dc: Arc<RTCDataChannel>, session_id: bson::oid::ObjectId) {
 /// and leave the DC as a no-op (browser reads time out, writes are
 /// silently dropped — no worse than pre-0.1.33).
 #[cfg(feature = "clipboard")]
-fn attach_clipboard_handler(dc: Arc<RTCDataChannel>, session_id: bson::oid::ObjectId) {
+fn attach_clipboard_handler(
+    dc: Arc<RTCDataChannel>,
+    session_id: bson::oid::ObjectId,
+    permissions: roomler_ai_remote_control::permissions::Permissions,
+) {
+    use roomler_ai_remote_control::permissions::Permissions;
+    // Session-permission gate (v2 hardening — the CLIPBOARD bit existed
+    // since day one but was never enforced agent-side). Deny → a stub
+    // handler that answers every request with an error and never
+    // touches the OS clipboard.
+    if !permissions.contains(Permissions::CLIPBOARD) {
+        info!(%session_id, "clipboard: session lacks CLIPBOARD permission — all requests will be rejected");
+        let dc_for_handler = dc.clone();
+        dc.on_message(Box::new(move |msg| {
+            let dc = dc_for_handler.clone();
+            Box::pin(async move {
+                if !msg.is_string {
+                    return;
+                }
+                // Best-effort correlation ids for the error reply; old
+                // UIs drop `clipboard:error` without a req_id, which is
+                // an acceptable silent deny.
+                let v: Option<serde_json::Value> = std::str::from_utf8(&msg.data)
+                    .ok()
+                    .and_then(|s| serde_json::from_str(s).ok());
+                let reply = serde_json::json!({
+                    "t": "clipboard:error",
+                    "message": "CLIPBOARD permission not granted for this session",
+                    "req_id": v.as_ref().and_then(|v| v.get("req_id")).cloned(),
+                    "id": v.as_ref().and_then(|v| v.get("id")).cloned(),
+                });
+                if let Ok(s) = serde_json::to_string(&reply) {
+                    let _ = dc.send_text(s).await;
+                }
+            })
+        }));
+        return;
+    }
     let cb = match crate::clipboard::Clipboard::new() {
         Ok(c) => c,
         Err(e) => {
@@ -5266,12 +5308,58 @@ fn attach_clipboard_handler(dc: Arc<RTCDataChannel>, session_id: bson::oid::Obje
     let reassembler = Arc::new(std::sync::Mutex::new(
         crate::clipboard::WriteReassembler::new(),
     ));
+    // v2 — inbound image reassembly, serialized outbound image sends
+    // (so anonymous binary frames always belong to the last announced
+    // header), and the change-watcher forwarder task handle for
+    // unsubscribe / DC-close teardown.
+    let image_rx = Arc::new(std::sync::Mutex::new(crate::clipboard::ImageRx::new()));
+    let img_tx_lock = Arc::new(tokio::sync::Mutex::new(()));
+    let watch_task: Arc<std::sync::Mutex<Option<JoinHandle<()>>>> =
+        Arc::new(std::sync::Mutex::new(None));
+
+    // DC close → tear down the watcher + forwarder so the arboard
+    // worker stops ticking and the task doesn't outlive the session.
+    {
+        let cb = cb.clone();
+        let watch_task = watch_task.clone();
+        dc.on_close(Box::new(move || {
+            let cb = cb.clone();
+            let watch_task = watch_task.clone();
+            Box::pin(async move {
+                cb.unwatch();
+                let old = watch_task
+                    .lock()
+                    .expect("clipboard watch_task poisoned")
+                    .take();
+                if let Some(h) = old {
+                    h.abort();
+                }
+            })
+        }));
+    }
+
     let dc_for_handler = dc.clone();
     dc.on_message(Box::new(move |msg| {
         let dc = dc_for_handler.clone();
         let cb = cb.clone();
         let reassembler = reassembler.clone();
+        let image_rx = image_rx.clone();
+        let img_tx_lock = img_tx_lock.clone();
+        let watch_task = watch_task.clone();
         Box::pin(async move {
+            // v2 — binary frames are PNG chunks for the in-flight
+            // browser → agent image transfer (announced by a preceding
+            // `clipboard:img-begin` control frame).
+            if !msg.is_string {
+                let res = {
+                    let mut rx = image_rx.lock().expect("clipboard image_rx poisoned");
+                    rx.frame(&msg.data)
+                };
+                if let Err(reason) = res {
+                    debug!(%session_id, %reason, "clipboard: dropped binary frame");
+                }
+                return;
+            }
             let Ok(text) = std::str::from_utf8(&msg.data) else {
                 debug!(%session_id, bytes = msg.data.len(), "clipboard: non-UTF8 payload ignored");
                 return;
@@ -5285,15 +5373,33 @@ fn attach_clipboard_handler(dc: Arc<RTCDataChannel>, session_id: bson::oid::Obje
                 }
             };
             match parsed {
-                crate::clipboard::ClipboardIncoming::Write { text } => {
+                crate::clipboard::ClipboardIncoming::Write { text, id } => {
                     let bytes = text.len();
                     match cb.write(text).await {
-                        Ok(()) => info!(%session_id, bytes, "clipboard: wrote to host"),
+                        Ok(()) => {
+                            info!(%session_id, bytes, "clipboard: wrote to host");
+                            // v2 ack — only when the browser stamped an
+                            // id (old UIs don't, and never see acks).
+                            // The browser gates its deferred Ctrl+V
+                            // keystroke on this so the remote app pastes
+                            // the NEW clipboard, not the stale one.
+                            if let Some(id) = id {
+                                let reply = serde_json::json!({
+                                    "t": "clipboard:write-ack",
+                                    "id": id,
+                                    "bytes": bytes,
+                                });
+                                if let Ok(s) = serde_json::to_string(&reply) {
+                                    let _ = dc.send_text(s).await;
+                                }
+                            }
+                        }
                         Err(e) => {
                             warn!(%session_id, %e, "clipboard: write failed");
                             let reply = serde_json::json!({
                                 "t": "clipboard:error",
                                 "message": format!("{e}"),
+                                "id": id,
                             });
                             if let Ok(s) = serde_json::to_string(&reply) {
                                 let _ = dc.send_text(s).await;
@@ -5319,12 +5425,26 @@ fn attach_clipboard_handler(dc: Arc<RTCDataChannel>, session_id: bson::oid::Obje
                         crate::clipboard::WriteChunkOutcome::Complete(full_text) => {
                             let bytes = full_text.len();
                             match cb.write(full_text).await {
-                                Ok(()) => info!(%session_id, id=%id, bytes, chunks=seq + 1, "clipboard: wrote chunked payload to host"),
+                                Ok(()) => {
+                                    info!(%session_id, id=%id, bytes, chunks=seq + 1, "clipboard: wrote chunked payload to host");
+                                    // v2 ack, keyed by the chunk id the
+                                    // browser already assigns. Old UIs
+                                    // drop the unknown `t` silently.
+                                    let reply = serde_json::json!({
+                                        "t": "clipboard:write-ack",
+                                        "id": id,
+                                        "bytes": bytes,
+                                    });
+                                    if let Ok(s) = serde_json::to_string(&reply) {
+                                        let _ = dc.send_text(s).await;
+                                    }
+                                }
                                 Err(e) => {
                                     warn!(%session_id, id=%id, %e, "clipboard: chunked write failed");
                                     let reply = serde_json::json!({
                                         "t": "clipboard:error",
                                         "message": format!("{e}"),
+                                        "id": id,
                                     });
                                     if let Ok(s) = serde_json::to_string(&reply) {
                                         let _ = dc.send_text(s).await;
@@ -5337,6 +5457,7 @@ fn attach_clipboard_handler(dc: Arc<RTCDataChannel>, session_id: bson::oid::Obje
                             let reply = serde_json::json!({
                                 "t": "clipboard:error",
                                 "message": reason,
+                                "id": id,
                             });
                             if let Ok(s) = serde_json::to_string(&reply) {
                                 let _ = dc.send_text(s).await;
@@ -5344,64 +5465,359 @@ fn attach_clipboard_handler(dc: Arc<RTCDataChannel>, session_id: bson::oid::Obje
                         }
                     }
                 }
-                crate::clipboard::ClipboardIncoming::Read { req_id } => match cb.read().await {
-                    Ok(text) => {
-                        let bytes = text.len();
-                        if bytes <= crate::clipboard::CHUNK_BYTES {
-                            // Single envelope — back-compat path for
-                            // browsers that don't yet handle
-                            // `clipboard:content-chunk`. Small payloads
-                            // (most common case) fit inside a single
-                            // SCTP message comfortably.
-                            info!(%session_id, bytes, "clipboard: read from host (single envelope)");
-                            let reply = serde_json::json!({
-                                "t": "clipboard:content",
-                                "text": text,
-                                "req_id": req_id,
-                            });
-                            if let Ok(s) = serde_json::to_string(&reply) {
-                                let _ = dc.send_text(s).await;
-                            }
-                        } else {
-                            // Large payload — chunk it so each
-                            // envelope stays under the SCTP ceiling.
-                            // Browser reassembles by `req_id` until
-                            // `last: true`.
-                            let chunks = crate::clipboard::split_into_chunks(&text);
-                            let total = chunks.len();
-                            info!(%session_id, bytes, chunks = total, "clipboard: read from host (chunked)");
-                            for (i, chunk) in chunks.iter().enumerate() {
+                crate::clipboard::ClipboardIncoming::Read { req_id, accept } => {
+                    match cb.read().await {
+                        Ok(text) if !text.is_empty() => {
+                            let bytes = text.len();
+                            if bytes <= crate::clipboard::CHUNK_BYTES {
+                                // Single envelope — back-compat path for
+                                // browsers that don't yet handle
+                                // `clipboard:content-chunk`. Small payloads
+                                // (most common case) fit inside a single
+                                // SCTP message comfortably.
+                                info!(%session_id, bytes, "clipboard: read from host (single envelope)");
                                 let reply = serde_json::json!({
-                                    "t": "clipboard:content-chunk",
+                                    "t": "clipboard:content",
+                                    "text": text,
                                     "req_id": req_id,
-                                    "seq": i as u32,
-                                    "text": chunk,
-                                    "last": i + 1 == total,
                                 });
                                 if let Ok(s) = serde_json::to_string(&reply) {
-                                    if dc.send_text(s).await.is_err() {
+                                    let _ = dc.send_text(s).await;
+                                }
+                            } else {
+                                // Large payload — chunk it so each
+                                // envelope stays under the SCTP ceiling.
+                                // Browser reassembles by `req_id` until
+                                // `last: true`.
+                                let chunks = crate::clipboard::split_into_chunks(&text);
+                                let total = chunks.len();
+                                info!(%session_id, bytes, chunks = total, "clipboard: read from host (chunked)");
+                                for (i, chunk) in chunks.iter().enumerate() {
+                                    let reply = serde_json::json!({
+                                        "t": "clipboard:content-chunk",
+                                        "req_id": req_id,
+                                        "seq": i as u32,
+                                        "text": chunk,
+                                        "last": i + 1 == total,
+                                    });
+                                    if let Ok(s) = serde_json::to_string(&reply)
+                                        && dc.send_text(s).await.is_err()
+                                    {
                                         debug!(%session_id, "clipboard: DC closed mid-chunk-send; abandoning");
                                         break;
                                     }
                                 }
                             }
                         }
-                    }
-                    Err(e) => {
-                        warn!(%session_id, %e, "clipboard: read failed");
-                        let reply = serde_json::json!({
-                            "t": "clipboard:error",
-                            "message": format!("{e}"),
-                            "req_id": req_id,
-                        });
-                        if let Ok(s) = serde_json::to_string(&reply) {
-                            let _ = dc.send_text(s).await;
+                        Ok(_empty) => {
+                            // v2 rich read — no text on the clipboard.
+                            // Offer an image when the browser said it can
+                            // take one; otherwise (and for old UIs, whose
+                            // `accept` is empty) reply empty content.
+                            if accept.iter().any(|a| a == "image") {
+                                match cb.read_image().await {
+                                    Ok(Some(img)) => {
+                                        info!(%session_id, w = img.w, h = img.h, bytes = img.png.len(), "clipboard: read image from host");
+                                        send_clipboard_image(
+                                            &dc,
+                                            session_id,
+                                            img,
+                                            req_id,
+                                            &img_tx_lock,
+                                        )
+                                        .await;
+                                        return;
+                                    }
+                                    Ok(None) => {}
+                                    Err(e) => {
+                                        warn!(%session_id, %e, "clipboard: image read failed");
+                                        let reply = serde_json::json!({
+                                            "t": "clipboard:error",
+                                            "message": format!("{e}"),
+                                            "req_id": req_id,
+                                        });
+                                        if let Ok(s) = serde_json::to_string(&reply) {
+                                            let _ = dc.send_text(s).await;
+                                        }
+                                        return;
+                                    }
+                                }
+                            }
+                            info!(%session_id, "clipboard: read from host (empty)");
+                            let reply = serde_json::json!({
+                                "t": "clipboard:content",
+                                "text": "",
+                                "req_id": req_id,
+                            });
+                            if let Ok(s) = serde_json::to_string(&reply) {
+                                let _ = dc.send_text(s).await;
+                            }
+                        }
+                        Err(e) => {
+                            warn!(%session_id, %e, "clipboard: read failed");
+                            let reply = serde_json::json!({
+                                "t": "clipboard:error",
+                                "message": format!("{e}"),
+                                "req_id": req_id,
+                            });
+                            if let Ok(s) = serde_json::to_string(&reply) {
+                                let _ = dc.send_text(s).await;
+                            }
                         }
                     }
-                },
+                }
+                crate::clipboard::ClipboardIncoming::Subscribe { events } => {
+                    // Empty events list (defensive) means text-only —
+                    // the browser always sends an explicit list.
+                    let want_text = events.is_empty() || events.iter().any(|e| e == "text");
+                    let want_image = events.iter().any(|e| e == "image");
+                    let (tx, mut rx) =
+                        tokio::sync::mpsc::channel::<crate::clipboard::ClipboardChange>(4);
+                    if let Err(e) = cb.watch(
+                        crate::clipboard::WatchEvents {
+                            text: want_text,
+                            image: want_image,
+                        },
+                        tx,
+                    ) {
+                        warn!(%session_id, %e, "clipboard: subscribe failed (worker gone)");
+                        return;
+                    }
+                    info!(%session_id, text = want_text, image = want_image, "clipboard: change subscription installed");
+                    let dc_for_events = dc.clone();
+                    let img_lock_for_events = img_tx_lock.clone();
+                    let handle = tokio::spawn(async move {
+                        let mut event_seq: u64 = 0;
+                        while let Some(change) = rx.recv().await {
+                            event_seq += 1;
+                            match change {
+                                crate::clipboard::ClipboardChange::Text(text) => {
+                                    send_clipboard_text_event(
+                                        &dc_for_events,
+                                        session_id,
+                                        &text,
+                                        event_seq,
+                                    )
+                                    .await;
+                                }
+                                crate::clipboard::ClipboardChange::Image(img) => {
+                                    send_clipboard_image(
+                                        &dc_for_events,
+                                        session_id,
+                                        img,
+                                        None,
+                                        &img_lock_for_events,
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+                    });
+                    let old = watch_task
+                        .lock()
+                        .expect("clipboard watch_task poisoned")
+                        .replace(handle);
+                    if let Some(h) = old {
+                        h.abort();
+                    }
+                }
+                crate::clipboard::ClipboardIncoming::Unsubscribe => {
+                    cb.unwatch();
+                    let old = watch_task
+                        .lock()
+                        .expect("clipboard watch_task poisoned")
+                        .take();
+                    if let Some(h) = old {
+                        h.abort();
+                    }
+                    info!(%session_id, "clipboard: change subscription removed");
+                }
+                crate::clipboard::ClipboardIncoming::ImgBegin {
+                    id,
+                    w,
+                    h,
+                    bytes,
+                    format,
+                } => {
+                    let res = {
+                        let mut rx = image_rx.lock().expect("clipboard image_rx poisoned");
+                        rx.begin(id.clone(), w, h, bytes, &format)
+                    };
+                    match res {
+                        Ok(()) => {
+                            debug!(%session_id, %id, w, h, bytes, "clipboard: image write begin")
+                        }
+                        Err(reason) => {
+                            warn!(%session_id, %id, %reason, "clipboard: image begin rejected");
+                            let reply = serde_json::json!({
+                                "t": "clipboard:error",
+                                "message": reason,
+                                "id": id,
+                            });
+                            if let Ok(s) = serde_json::to_string(&reply) {
+                                let _ = dc.send_text(s).await;
+                            }
+                        }
+                    }
+                }
+                crate::clipboard::ClipboardIncoming::ImgEnd { id } => {
+                    let assembled = {
+                        let mut rx = image_rx.lock().expect("clipboard image_rx poisoned");
+                        rx.end(&id)
+                    };
+                    match assembled {
+                        Ok(img) => {
+                            let bytes = img.png.len();
+                            match cb.write_image(img.png).await {
+                                Ok(()) => {
+                                    info!(%session_id, %id, bytes, "clipboard: wrote image to host");
+                                    let reply = serde_json::json!({
+                                        "t": "clipboard:write-ack",
+                                        "id": id,
+                                        "bytes": bytes,
+                                    });
+                                    if let Ok(s) = serde_json::to_string(&reply) {
+                                        let _ = dc.send_text(s).await;
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(%session_id, %id, %e, "clipboard: image write failed");
+                                    let reply = serde_json::json!({
+                                        "t": "clipboard:error",
+                                        "message": format!("{e}"),
+                                        "id": id,
+                                    });
+                                    if let Ok(s) = serde_json::to_string(&reply) {
+                                        let _ = dc.send_text(s).await;
+                                    }
+                                }
+                            }
+                        }
+                        Err(reason) => {
+                            warn!(%session_id, %id, %reason, "clipboard: image end rejected");
+                            let reply = serde_json::json!({
+                                "t": "clipboard:error",
+                                "message": reason,
+                                "id": id,
+                            });
+                            if let Ok(s) = serde_json::to_string(&reply) {
+                                let _ = dc.send_text(s).await;
+                            }
+                        }
+                    }
+                }
             }
         })
     }));
+}
+
+/// Send one host-clipboard text change to the browser: a single
+/// `clipboard:event` when it fits one envelope, else
+/// `clipboard:event-chunk`s keyed by a per-subscription event id.
+#[cfg(feature = "clipboard")]
+async fn send_clipboard_text_event(
+    dc: &Arc<RTCDataChannel>,
+    session_id: bson::oid::ObjectId,
+    text: &str,
+    event_seq: u64,
+) {
+    let bytes = text.len();
+    if bytes <= crate::clipboard::CHUNK_BYTES {
+        debug!(%session_id, bytes, "clipboard: pushing text change");
+        let msg = serde_json::json!({
+            "t": "clipboard:event",
+            "kind": "text",
+            "text": text,
+        });
+        if let Ok(s) = serde_json::to_string(&msg) {
+            let _ = dc.send_text(s).await;
+        }
+        return;
+    }
+    let chunks = crate::clipboard::split_into_chunks(text);
+    let total = chunks.len();
+    let event_id = format!("ev-{event_seq}");
+    debug!(%session_id, bytes, chunks = total, %event_id, "clipboard: pushing text change (chunked)");
+    for (i, chunk) in chunks.iter().enumerate() {
+        let msg = serde_json::json!({
+            "t": "clipboard:event-chunk",
+            "event_id": event_id,
+            "seq": i as u32,
+            "text": chunk,
+            "last": i + 1 == total,
+        });
+        if let Ok(s) = serde_json::to_string(&msg)
+            && dc.send_text(s).await.is_err()
+        {
+            debug!(%session_id, "clipboard: DC closed mid-event-send; abandoning");
+            return;
+        }
+    }
+}
+
+/// Stream one PNG image to the browser: `clipboard:img-begin` header,
+/// 64 KiB binary frames under SCTP backpressure, `clipboard:img-end`
+/// trailer. `req_id` present ⇒ answers a rich read; absent ⇒
+/// unsolicited change event. `tx_lock` serializes image streams so the
+/// anonymous binary frames always belong to the last announced header.
+#[cfg(feature = "clipboard")]
+async fn send_clipboard_image(
+    dc: &Arc<RTCDataChannel>,
+    session_id: bson::oid::ObjectId,
+    img: crate::clipboard::PngImage,
+    req_id: Option<u64>,
+    tx_lock: &tokio::sync::Mutex<()>,
+) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static IMG_TX_SEQ: AtomicU64 = AtomicU64::new(0);
+    const BACKPRESSURE_HIGH: usize = 4 * 1024 * 1024;
+    // 20 ms × 750 = 15 s of sustained full buffer → the DC is wedged
+    // (or the viewer is gone); abandon rather than hold the tx_lock
+    // forever.
+    const BACKPRESSURE_MAX_SPINS: u32 = 750;
+
+    let _guard = tx_lock.lock().await;
+    let id = format!("aimg-{}", IMG_TX_SEQ.fetch_add(1, Ordering::Relaxed));
+    let bytes = img.png.len();
+    debug!(%session_id, %id, w = img.w, h = img.h, bytes, ?req_id, "clipboard: sending image");
+    let begin = serde_json::json!({
+        "t": "clipboard:img-begin",
+        "id": id,
+        "w": img.w,
+        "h": img.h,
+        "bytes": bytes as u64,
+        "format": "png",
+        "req_id": req_id,
+    });
+    let Ok(s) = serde_json::to_string(&begin) else {
+        return;
+    };
+    if dc.send_text(s).await.is_err() {
+        return;
+    }
+    for chunk in img.png.chunks(crate::clipboard::IMG_FRAME_BYTES_TX) {
+        let mut spins = 0u32;
+        while dc.buffered_amount().await > BACKPRESSURE_HIGH {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            spins += 1;
+            if spins > BACKPRESSURE_MAX_SPINS {
+                debug!(%session_id, %id, "clipboard: backpressure stall; abandoning image send");
+                return;
+            }
+        }
+        if dc.send(&Bytes::copy_from_slice(chunk)).await.is_err() {
+            debug!(%session_id, %id, "clipboard: DC closed mid-image-send; abandoning");
+            return;
+        }
+    }
+    let end = serde_json::json!({
+        "t": "clipboard:img-end",
+        "id": id,
+        "bytes": bytes as u64,
+    });
+    if let Ok(s) = serde_json::to_string(&end) {
+        let _ = dc.send_text(s).await;
+    }
 }
 
 /// Wire the `files` DC to a per-session file-transfer handler. Strings
