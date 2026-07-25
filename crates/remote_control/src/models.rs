@@ -105,6 +105,29 @@ pub struct AgentCaps {
     /// agents, non-VD hosts) → the browser hides the Apps menu.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub apps: Vec<String>,
+    /// Clipboard-DC protocol-v2 capability list. Extends the coarse
+    /// `supports_clipboard` bool (kept for older browsers) with
+    /// per-feature flags. Recognised values:
+    ///
+    /// * `"ack"`    — the agent replies `clipboard:write-ack` to
+    ///   `clipboard:write` / `clipboard:write-chunk` payloads that
+    ///   carry an `id`, letting the browser gate its deferred Ctrl+V
+    ///   keystroke on the host clipboard actually being written.
+    /// * `"events"` — the agent accepts `clipboard:subscribe` and
+    ///   pushes unsolicited `clipboard:event` / `clipboard:img-begin`
+    ///   messages when the host clipboard changes (host→browser
+    ///   auto-sync). Change *watching* for images is Windows-only;
+    ///   text watching works everywhere arboard does.
+    /// * `"images"` — the agent understands PNG image payloads on the
+    ///   clipboard DC in both directions (`clipboard:img-begin` /
+    ///   binary frames / `clipboard:img-end`, and `accept:["image"]`
+    ///   on `clipboard:read`).
+    ///
+    /// Empty / unset (older agents, builds without the `clipboard`
+    /// feature) deserialises to `[]`; browsers then fall back to the
+    /// v1 button-driven text-only flow.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub clipboard: Vec<String>,
 }
 
 /// How consent is obtained before a controller may drive a device. Resolved
