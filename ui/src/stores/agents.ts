@@ -72,9 +72,11 @@ export interface AgentCapabilities {
   /** Clipboard-DC protocol v2. Known values: 'ack' (write-ack replies
    *  gate the deferred Ctrl+V), 'events' (agent pushes host clipboard
    *  changes after `clipboard:subscribe`), 'images' (PNG payloads both
-   *  directions). Empty / unset on older agents — the browser falls
-   *  back to the v1 button-driven text-only flow. Mirrors
-   *  `AgentCaps.clipboard` in `crates/remote_control/src/models.rs`. */
+   *  directions), 'html' (v2.1 — CF_HTML + text alt round-trip:
+   *  formatted text, tables, web-hosted images survive the paste).
+   *  Empty / unset on older agents — the browser falls back to the v1
+   *  button-driven text-only flow. Mirrors `AgentCaps.clipboard` in
+   *  `crates/remote_control/src/models.rs`. */
   clipboard?: string[]
   /** rc.227 — keyboard-layout integration (Windows hosts). Known
    *  values: 'report' (agent pushes rc:layout snapshots over the

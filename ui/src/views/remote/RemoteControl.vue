@@ -1301,6 +1301,16 @@ async function onGetClipboard() {
           new ClipboardItem({ 'image/png': content.blob }),
         ])
         showSuccess(`Copied remote image (${content.w}×${content.h})`)
+      } else if (content.kind === 'html') {
+        // v2.1 — both formats: rich paste targets take the html,
+        // plain editors the text alt.
+        await globalThis.navigator.clipboard.write([
+          new ClipboardItem({
+            'text/html': new Blob([content.html], { type: 'text/html' }),
+            'text/plain': new Blob([content.text], { type: 'text/plain' }),
+          }),
+        ])
+        showSuccess(`Copied remote clipboard (formatted, ${content.text.length} chars)`)
       } else {
         await globalThis.navigator.clipboard.writeText(content.text)
         showSuccess(
