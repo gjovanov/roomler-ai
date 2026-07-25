@@ -1,5 +1,5 @@
 [Unit]
-Description=Roomler AI remote-control agent
+Description=Roomler Daemon — keeps this device on your private Roomler mesh network and available for secure remote control
 Documentation=https://roomler.ai/
 # An interactive user session is required for scrap capture (XShm needs a
 # display) and enigo input injection (both run on the user's X server).
