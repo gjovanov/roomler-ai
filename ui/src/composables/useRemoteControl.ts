@@ -2401,13 +2401,19 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     const ctrl = new AbortController()
     const timer = setTimeout(() => ctrl.abort(), 1500)
     try {
-      // 204 (no RTF) and 200 (RTF present) both prove the bridge is
-      // there; only a network/timeout/opaque failure means "no bridge".
       const res = await fetch(LOCAL_CLIPBOARD_BRIDGE_URL, {
         method: 'GET',
         signal: ctrl.signal,
       })
-      localClipboardBridge.value = res.ok || res.status === 204
+      // 204 (no RTF) and 200 (RTF present) both prove the bridge is
+      // there — but a bare 204 also comes from a NON-Windows agent that
+      // can never serve RTF. Gate on the Windows-only capability header
+      // (Access-Control-Expose-Headers makes it readable cross-origin)
+      // so a Linux/mac viewer of a Windows host doesn't falsely opt in
+      // and stream RTF its local bridge can't write.
+      const reachable = res.ok || res.status === 204
+      localClipboardBridge.value =
+        reachable && res.headers.get('x-roomler-clipboard-native') === '1'
     } catch {
       localClipboardBridge.value = false
     } finally {
@@ -5067,9 +5073,15 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         const htmlBytes = typeof msg.html_bytes === 'number' ? msg.html_bytes : 0
         const textBytes = typeof msg.text_bytes === 'number' ? msg.text_bytes : 0
         const declared = rtfBytes + htmlBytes + textBytes
+        // All three lengths must be non-negative and the rtf+html split
+        // must fall inside the declared total, else the native-end
+        // reassembly would mis-slice on a malformed/hostile header.
         if (
           typeof msg.id !== 'string' ||
           rtfBytes <= 0 ||
+          htmlBytes < 0 ||
+          textBytes < 0 ||
+          rtfBytes + htmlBytes > declared ||
           declared > CLIPBOARD_NATIVE_MAX_BYTES
         ) {
           return
