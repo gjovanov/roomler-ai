@@ -115,6 +115,35 @@ impl DirectCooldowns {
     fn cooling(map: &HashMap<ObjectId, Instant>, nid: &ObjectId, now: Instant) -> bool {
         map.get(nid).is_some_and(|&until| until > now)
     }
+
+    /// rc.225 — clear EVERY tier's cooldown + strike count for one peer. Fired
+    /// when the peer's advertised direct endpoints CHANGE in the netmap (its
+    /// daemon restarted / it roamed — new ports or a new address): the old
+    /// failures were measured against dial conditions that no longer exist, so
+    /// holding the deny converts a healed pair into a stuck one. Field
+    /// 2026-07-25: sequential service restarts could NEVER recover LAN-direct —
+    /// each freshly-restarted side dialed a peer whose sticky deny (burned
+    /// against the pre-restart endpoints) stopped it dialing back, so the
+    /// bilateral UDP punch never happened and the pair sat on the ~100 ms
+    /// relay/DERP tier indefinitely.
+    fn reset_peer(&mut self, nid: &ObjectId) {
+        self.lan.remove(nid);
+        self.lan_fails.remove(nid);
+        self.public.remove(nid);
+        self.public_fails.remove(nid);
+        self.srflx.remove(nid);
+        self.srflx_fails.remove(nid);
+    }
+}
+
+/// rc.225 — did a netmap upsert change the peer's DIRECT-dial endpoints (its
+/// LAN addresses or srflx mappings)? Deliberately ignores `endpoints` (the
+/// relay-advert bucket — it churns on every re-allocation and says nothing
+/// about direct reachability). A `true` here resets the peer's direct-tier
+/// cooldowns ([`DirectCooldowns::reset_peer`]): new ports/addresses = new dial
+/// conditions, so the old strike counts are stale evidence. Pure.
+fn direct_endpoints_changed(old: &NetmapPeer, new: &NetmapPeer) -> bool {
+    old.lan_endpoints != new.lan_endpoints || old.srflx_endpoints != new.srflx_endpoints
 }
 
 /// Which carrier tier an installed peer is on. Direct tiers differ in cooldown
@@ -279,12 +308,22 @@ const DIRECT_COOLDOWN: Duration = Duration::from_secs(60);
 /// gets `DIRECT_MAX_FAILURES` attempts; a direct carrier that later proves
 /// healthy clears the strike count.
 const DIRECT_MAX_FAILURES: u32 = 2;
-/// The session-sticky "give up on direct for this peer" cooldown, applied once a
-/// peer hits [`DIRECT_MAX_FAILURES`]. Long enough to outlive any agent session
-/// (agents cycle well under a day), so the peer stays pinned to the working
-/// relay; a restart — or the peer genuinely landing on a real LAN in a later
-/// session — re-attempts direct.
-const DIRECT_DENY_COOLDOWN: Duration = Duration::from_secs(24 * 3600);
+/// The sticky "give up on direct for this peer" cooldown, applied once a peer
+/// hits [`DIRECT_MAX_FAILURES`].
+///
+/// rc.225 — was 24 h ("session-sticky"), which predates make-before-break: a
+/// direct retry then meant tearing down the working relay, so retrying a
+/// hopeless peer was expensive and the deny had to outlive the session. With
+/// MBB default-on (rc.210) a retry is a SHADOW probe — the relay keeps
+/// routing and a failed probe costs nothing — so a permanent deny only has
+/// downside: it converts transient turbulence (a VPN flap, a firewall being
+/// fixed, a roam) into an hours-long 100 ms pin on a pair whose LAN works
+/// again (field 2026-07-25: restart/VPN churn left same-desk pairs stuck on
+/// the relay tier with no path back). 15 min matches [`SRFLX_DENY_COOLDOWN`]:
+/// long enough to stop the relay↔direct flap the deny exists for, short
+/// enough that healed conditions get re-tried the same sitting; an
+/// endpoint-change ([`direct_endpoints_changed`]) still resets it instantly.
+const DIRECT_DENY_COOLDOWN: Duration = Duration::from_secs(15 * 60);
 /// Phase C — the WG-handshake completion deadline for a srflx punch carrier:
 /// past it with no session, the punch failed → tear down to relay. Tight —
 /// bilateral INIT retransmit is ~5 s, so ~2 cycles + jitter + RTT covers a
@@ -1824,7 +1863,19 @@ impl OverlayRuntime {
                     // removals; a full diff/prune is a later refinement).
                     Some(OverlayEvent::Netmap { peers, .. }) => {
                         let t_arm = Instant::now();
+                        let old_peers = std::mem::take(&mut current_peers);
                         current_peers = peers.iter().map(|p| (p.node_id, p.clone())).collect();
+                        // rc.225 — a peer whose direct endpoints changed gets a
+                        // clean slate: its old strike counts were measured
+                        // against dial conditions that no longer exist.
+                        for p in &peers {
+                            if let Some(old) = old_peers.get(&p.node_id)
+                                && direct_endpoints_changed(old, p)
+                            {
+                                cooldowns.reset_peer(&p.node_id);
+                                debug!(peer = %p.node_id, "overlay: peer's direct endpoints changed — cleared its direct-tier cooldowns");
+                            }
+                        }
                         if let Some(names) = &dns_names { sync_name_map(names, &current_peers).await; }
                         let t0 = Instant::now();
                         self.install_peers(&mut wg, &mut by_node, &mut relay, &tun, &peers, direct_ctx.as_ref(), &cooldowns, &mut upgrade_probes, &mut relay_bq).await;
@@ -1835,7 +1886,16 @@ impl OverlayRuntime {
                     }
                     Some(OverlayEvent::NetmapDelta { upserts, removes }) => {
                         let t_arm = Instant::now();
-                        for p in &upserts { current_peers.insert(p.node_id, p.clone()); }
+                        for p in &upserts {
+                            // rc.225 — endpoint change ⇒ clean cooldown slate
+                            // (see the Netmap arm / `direct_endpoints_changed`).
+                            if let Some(old) = current_peers.insert(p.node_id, p.clone())
+                                && direct_endpoints_changed(&old, p)
+                            {
+                                cooldowns.reset_peer(&p.node_id);
+                                debug!(peer = %p.node_id, "overlay: peer's direct endpoints changed — cleared its direct-tier cooldowns");
+                            }
+                        }
                         let t0 = Instant::now();
                         self.install_peers(&mut wg, &mut by_node, &mut relay, &tun, &upserts, direct_ctx.as_ref(), &cooldowns, &mut upgrade_probes, &mut relay_bq).await;
                         warn_if_slow("install_peers(delta)", t0);
@@ -3618,9 +3678,99 @@ mod tests {
             direct_retry_cooldown(DirectTier::Srflx, SRFLX_MAX_FAILURES),
             SRFLX_DENY_COOLDOWN
         );
+        // rc.225 — the LAN/public deny is TTL-bounded now (MBB shadow probes
+        // make retries free); srflx stays ≤ it, and both must comfortably
+        // outlast the plain retry cooldown so escalation still means something.
+        assert!(SRFLX_DENY_COOLDOWN <= DIRECT_DENY_COOLDOWN);
+        assert!(DIRECT_DENY_COOLDOWN > DIRECT_COOLDOWN * 5);
+    }
+
+    /// rc.225 — an endpoint change wipes every tier's cooldown + strike count
+    /// for that peer (and only that peer), and the change predicate reacts to
+    /// LAN/srflx buckets but NOT the churny relay-advert bucket.
+    #[test]
+    fn endpoint_change_resets_direct_cooldowns() {
+        let now = Instant::now();
+        let a = ObjectId::from_bytes([1; 12]);
+        let b = ObjectId::from_bytes([2; 12]);
+        let mut cd = DirectCooldowns::default();
+        for nid in [a, b] {
+            cd.lan.insert(nid, now + DIRECT_DENY_COOLDOWN);
+            cd.lan_fails.insert(nid, 3);
+            cd.public.insert(nid, now + DIRECT_DENY_COOLDOWN);
+            cd.public_fails.insert(nid, 2);
+            cd.srflx.insert(nid, now + SRFLX_DENY_COOLDOWN);
+            cd.srflx_fails.insert(nid, 3);
+        }
+        cd.reset_peer(&a);
+        assert!(!DirectCooldowns::cooling(&cd.lan, &a, now));
+        assert!(!DirectCooldowns::cooling(&cd.public, &a, now));
+        assert!(!DirectCooldowns::cooling(&cd.srflx, &a, now));
+        assert!(!cd.lan_fails.contains_key(&a), "strike count cleared");
         assert!(
-            SRFLX_DENY_COOLDOWN < DIRECT_DENY_COOLDOWN,
-            "srflx deny must be shorter than the LAN/public session-sticky deny"
+            DirectCooldowns::cooling(&cd.lan, &b, now),
+            "other peers untouched"
+        );
+        assert_eq!(cd.lan_fails.get(&b), Some(&3));
+
+        let mk = |lan: &[&str], srflx: &[&str], relay: &[&str]| NetmapPeer {
+            node_id: a,
+            overlay_ip: "100.64.0.9".into(),
+            name: "t".into(),
+            wg_public_key: String::new(),
+            endpoints: relay.iter().map(|s| s.to_string()).collect(),
+            lan_endpoints: lan.iter().map(|s| s.to_string()).collect(),
+            srflx_endpoints: srflx.iter().map(|s| s.to_string()).collect(),
+            srflx_nat: None,
+            relay_home: None,
+            reachable: true,
+            supports_quic: false,
+            supports_relay_single: false,
+            supports_derp: false,
+            routes: vec![],
+            agent_id: None,
+        };
+        let base = mk(
+            &["192.168.68.126:51573"],
+            &["37.63.112.129:58770"],
+            &["94.130.141.74:1"],
+        );
+        assert!(
+            !direct_endpoints_changed(&base, &base.clone()),
+            "identical ⇒ no reset"
+        );
+        assert!(
+            direct_endpoints_changed(
+                &base,
+                &mk(
+                    &["192.168.68.126:60001"],
+                    &["37.63.112.129:58770"],
+                    &["94.130.141.74:1"]
+                )
+            ),
+            "LAN port change (daemon restart) ⇒ reset"
+        );
+        assert!(
+            direct_endpoints_changed(
+                &base,
+                &mk(
+                    &["192.168.68.126:51573"],
+                    &["37.63.112.129:60002"],
+                    &["94.130.141.74:1"]
+                )
+            ),
+            "srflx change (roam / NAT rebind) ⇒ reset"
+        );
+        assert!(
+            !direct_endpoints_changed(
+                &base,
+                &mk(
+                    &["192.168.68.126:51573"],
+                    &["37.63.112.129:58770"],
+                    &["5.9.157.226:9"]
+                )
+            ),
+            "relay-advert churn must NOT reset (it changes on every re-allocation)"
         );
         // The deadlines are ordered srflx/LAN (tight) < public (loose) <
         // relay (loosest — needs BOTH ends' allocations, and the peer's grant
