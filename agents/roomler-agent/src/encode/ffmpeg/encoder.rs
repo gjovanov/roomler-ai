@@ -1117,6 +1117,11 @@ impl VideoEncoder for FfmpegEncoder {
             // marked applied). The fresh encoder's first frame is an IDR
             // (`frame_count == 0` path in `build_av_frame`), so the browser
             // resyncs cleanly across the swap.
+            // P4 — re-resolve the vp9_qsv gop/low_power for the rebuild. The
+            // verdict is a process-stable OnceLock, so this reproduces exactly
+            // the config the encoder was originally built with (and it's what
+            // the P4 release build's E0061 caught this call site missing).
+            let (qsv_gop, qsv_low_power) = Self::vp9_qsv_runtime_config();
             match Self::build_encoder(
                 self.encoder_name,
                 self.width,
@@ -1124,6 +1129,8 @@ impl VideoEncoder for FfmpegEncoder {
                 self.fps,
                 target,
                 self.cq,
+                qsv_low_power,
+                qsv_gop,
             ) {
                 Ok(enc) => {
                     self.encoder = enc;
