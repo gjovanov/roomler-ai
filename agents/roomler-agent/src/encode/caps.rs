@@ -233,6 +233,45 @@ fn compute_caps() -> AgentCaps {
                 );
             }
         }
+
+        // P2 (Parsec-class plan) — H.264 over DataChannel: the fourth codec
+        // joins the reliable-DC + WebCodecs + canvas pipeline (the RTP track
+        // + <video> path stays as the universal fallback for old agents /
+        // non-WebCodecs browsers). HW-only cascade like HEVC/AV1; the
+        // bitstream is Annex-B with in-band SPS/PPS (FFmpeg default without
+        // GLOBAL_HEADER — the exact contract the HEVC path already ships and
+        // WebCodecs decodes description-less). The "h264" codec entry is
+        // already pushed by the openh264/MF blocks above — only the
+        // transport + hw_encoders entries are new. Escape hatch
+        // ROOMLER_AGENT_DC_H264=0 stops the advertisement without a rebuild
+        // (browsers then negotiate the legacy RTP H.264 path).
+        if tunnel_core::env::node_env("DC_H264").as_deref() != Some("0") {
+            let start_h264 = std::time::Instant::now();
+            match crate::encode::ffmpeg::FfmpegEncoder::new_h264(PROBE_WIDTH, PROBE_HEIGHT) {
+                Ok(enc) => {
+                    let name = enc.name();
+                    drop(enc);
+                    tracing::info!(
+                        encoder = name,
+                        elapsed_ms = start_h264.elapsed().as_millis(),
+                        "caps probe: ffmpeg H.264 encoder activates — advertising data-channel-h264"
+                    );
+                    transports.push("data-channel-h264".into());
+                    hw_encoders.push(format!("ffmpeg-{name}"));
+                }
+                Err(e) => {
+                    tracing::info!(
+                        %e,
+                        elapsed_ms = start_h264.elapsed().as_millis(),
+                        "caps probe: ffmpeg H.264 HW encoder not available — H.264 sessions stay on the RTP track"
+                    );
+                }
+            }
+        } else {
+            tracing::info!(
+                "caps probe: data-channel-h264 advertisement disabled (ROOMLER_AGENT_DC_H264=0)"
+            );
+        }
     }
 
     #[cfg(feature = "vp9-444")]
