@@ -115,6 +115,33 @@ pub fn h264_cq_adjust(encoder_name: &str, cq: u32) -> u32 {
     }
 }
 
+/// P4 — vp9_qsv runtime-forced-IDR verdict → `(long_gop, low_power)`.
+/// `verdict` = `Some((honors_lp1, honors_lp0))` from the startup probe
+/// (does the encoder emit a key-flagged packet after a runtime force, per
+/// `low_power` mode?), `None` when the probe is disabled or never ran.
+/// `forced_lp` = the `ROOMLER_AGENT_QSV_LOW_POWER` operator override.
+///
+/// The long GOP (on-demand-only keys — kills the residual ~1 Hz natural-key
+/// pulse on VP9-over-DC Intel hosts) is granted ONLY for a mode the probe
+/// MEASURED as honouring runtime forcing; everything else keeps the rc.219
+/// containment (60-frame natural GOP + VDEnc). Preference order when both
+/// modes honour: low_power=1 (the Iris Xe fps-unlock path).
+pub fn vp9_qsv_config(verdict: Option<(bool, bool)>, forced_lp: Option<bool>) -> (bool, bool) {
+    if let Some(lp) = forced_lp {
+        let honors = match (verdict, lp) {
+            (Some((h1, _)), true) => h1,
+            (Some((_, h0)), false) => h0,
+            (None, _) => false,
+        };
+        return (honors, lp);
+    }
+    match verdict {
+        Some((true, _)) => (true, true),
+        Some((false, true)) => (true, false),
+        Some((false, false)) | None => (false, true),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,6 +202,37 @@ mod tests {
         assert_eq!(codec_rate_factor_pct("HEVC"), 100);
         assert_eq!(codec_rate_factor_pct("VP9"), 100);
         assert_eq!(codec_rate_factor_pct("AV1"), 100);
+    }
+
+    #[test]
+    fn qsv_config_grants_long_gop_only_for_a_measured_honouring_mode() {
+        // Unprobed → rc.219 containment.
+        assert_eq!(vp9_qsv_config(None, None), (false, true));
+        // Both modes honour → prefer low_power.
+        assert_eq!(vp9_qsv_config(Some((true, true)), None), (true, true));
+        // Only VDEnc honours.
+        assert_eq!(vp9_qsv_config(Some((true, false)), None), (true, true));
+        // Only VME (low_power=0) honours → long GOP on VME.
+        assert_eq!(vp9_qsv_config(Some((false, true)), None), (true, false));
+        // Neither honours → containment.
+        assert_eq!(vp9_qsv_config(Some((false, false)), None), (false, true));
+    }
+
+    #[test]
+    fn qsv_config_operator_override_wins_on_mode_but_not_on_gop_safety() {
+        // Forced VME on a host whose VME honours → long GOP.
+        assert_eq!(
+            vp9_qsv_config(Some((false, true)), Some(false)),
+            (true, false)
+        );
+        // Forced VDEnc on a host whose VDEnc ignores → containment GOP, VDEnc.
+        assert_eq!(
+            vp9_qsv_config(Some((false, true)), Some(true)),
+            (false, true)
+        );
+        // Forced anything without a verdict → containment GOP in that mode.
+        assert_eq!(vp9_qsv_config(None, Some(false)), (false, false));
+        assert_eq!(vp9_qsv_config(None, Some(true)), (false, true));
     }
 
     #[test]
