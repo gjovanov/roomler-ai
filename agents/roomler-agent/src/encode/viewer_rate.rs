@@ -73,6 +73,23 @@ fn recover_windows() -> u32 {
     env_u32("VIEWER_RATE_RECOVER", 3).max(1)
 }
 
+/// Slow-start recovery climb (shelf item, 2026-07-27). Only the FIRST probe
+/// after a struggle is lazy (`recover` clean windows — confirmation the
+/// struggle really ended); once climbing, every further clean window probes
+/// again and each probe takes the larger of `step_up` and HALF THE REMAINING
+/// GAP to the capture rate. Deep clamps recover in a handful of windows
+/// (12→36→56→60 at 60 capture: ~5 s where the additive climb took ~9 s)
+/// while the ceiling-parked oscillation guard is preserved — a re-struggle
+/// drops out of slow-start and the next climb needs full confirmation again.
+/// Env `ROOMLER_AGENT_VIEWER_RATE_SLOW_START=0` restores the pure additive
+/// climb.
+fn slow_start_enabled() -> bool {
+    !matches!(
+        node_env("VIEWER_RATE_SLOW_START").as_deref(),
+        Some("0") | Some("false")
+    )
+}
+
 /// Turns a stream of viewer decode reports into a send-fps cap for one DC pump.
 /// Step it once per ~1 s observation window with `(reported_fps, struggling)`.
 pub struct ViewerRateController {
@@ -86,6 +103,12 @@ pub struct ViewerRateController {
     /// P6 — recovery climb step (defaults to `step`; env-tunable separately).
     step_up: u32,
     recover: u32,
+    /// Slow-start state: true while a recovery climb is in progress (between
+    /// the first post-struggle probe and reaching the capture rate). While
+    /// climbing, probes fire every clean window instead of every `recover`.
+    climbing: bool,
+    /// Env kill for the slow-start climb (`VIEWER_RATE_SLOW_START=0`).
+    slow_start: bool,
     enabled: bool,
 }
 
@@ -101,6 +124,8 @@ impl ViewerRateController {
             step,
             step_up: fps_step_up(step),
             recover: recover_windows(),
+            climbing: false,
+            slow_start: slow_start_enabled(),
             // Kill switch — default ON; `ROOMLER_AGENT_VIEWER_RATE=0` (or
             // `false`) pins the cap at the capture rate (divisor 1, no shedding)
             // so a misbehaving field host reverts without a rebuild.
@@ -138,11 +163,30 @@ impl ViewerRateController {
             let target = managed.min(self.cap_fps).saturating_sub(self.step);
             self.cap_fps = target.clamp(self.min_fps, self.capture_fps);
             self.clean_streak = 0;
+            // A re-struggle ends any climb: the next one needs full
+            // confirmation (`recover` clean windows) again.
+            self.climbing = false;
         } else {
             self.clean_streak += 1;
-            if self.clean_streak >= self.recover {
-                self.cap_fps = (self.cap_fps + self.step_up).min(self.capture_fps);
+            // Slow-start: only the FIRST probe after a struggle is lazy;
+            // while climbing, every clean window probes again.
+            let need = if self.climbing && self.slow_start {
+                1
+            } else {
+                self.recover
+            };
+            if self.clean_streak >= need {
+                let up = if self.slow_start {
+                    // Half the remaining gap, floored at step_up, so deep
+                    // clamps close fast and the climb still terminates.
+                    self.step_up
+                        .max(self.capture_fps.saturating_sub(self.cap_fps) / 2)
+                } else {
+                    self.step_up
+                };
+                self.cap_fps = (self.cap_fps + up).min(self.capture_fps);
                 self.clean_streak = 0;
+                self.climbing = self.cap_fps < self.capture_fps;
             }
         }
         self.divisor()
@@ -183,7 +227,9 @@ pub fn unpack_report(raw: u32) -> (u32, bool) {
 mod tests {
     use super::*;
 
-    // Deterministic controller regardless of ambient env.
+    // Deterministic controller regardless of ambient env. `slow_start` is
+    // pinned OFF here so these tests keep locking the pure additive climb;
+    // the slow-start behaviour has its own fixture + tests below.
     fn ctrl(capture_fps: u32) -> ViewerRateController {
         ViewerRateController {
             cap_fps: capture_fps,
@@ -193,6 +239,24 @@ mod tests {
             step: 10,
             step_up: 10,
             recover: 6,
+            climbing: false,
+            slow_start: false,
+            enabled: true,
+        }
+    }
+
+    // Slow-start fixture at the shipped defaults (recover 3, step_up 2×step).
+    fn ctrl_ss(capture_fps: u32) -> ViewerRateController {
+        ViewerRateController {
+            cap_fps: capture_fps,
+            capture_fps,
+            clean_streak: 0,
+            min_fps: 12,
+            step: 10,
+            step_up: 20,
+            recover: 3,
+            climbing: false,
+            slow_start: true,
             enabled: true,
         }
     }
@@ -288,6 +352,48 @@ mod tests {
         assert_eq!(c.observe(5, true, 60), 1);
         assert_eq!(c.observe(5, true, 60), 1);
         assert_eq!(c.cap_fps(), 60);
+    }
+
+    #[test]
+    fn slow_start_recovers_a_deep_clamp_in_five_windows() {
+        let mut c = ctrl_ss(60);
+        // Hard struggle: managed 5 → clamp floors at min_fps 12.
+        c.observe(5, true, 60);
+        assert_eq!(c.cap_fps(), 12);
+        // Confirmation phase: the first probe is still lazy (recover=3).
+        c.observe(12, false, 60);
+        c.observe(12, false, 60);
+        assert_eq!(c.cap_fps(), 12, "held until the streak confirms");
+        // w3: first probe = max(step_up 20, gap 48/2 = 24) → 36, climbing.
+        c.observe(12, false, 60);
+        assert_eq!(c.cap_fps(), 36);
+        // w4: climbing → probe EVERY window: max(20, 24/2) = 20 → 56.
+        c.observe(36, false, 60);
+        assert_eq!(c.cap_fps(), 56);
+        // w5: max(20, 4/2) = 20, capped at capture → 60, climb over.
+        c.observe(56, false, 60);
+        assert_eq!(c.cap_fps(), 60);
+        assert_eq!(c.divisor(), 1);
+    }
+
+    #[test]
+    fn restruggle_mid_climb_requires_full_confirmation_again() {
+        let mut c = ctrl_ss(60);
+        c.observe(5, true, 60); // cap 12
+        for _ in 0..3 {
+            c.observe(12, false, 60);
+        }
+        assert_eq!(c.cap_fps(), 36, "climb started");
+        // The climb overshot the viewer → it struggles again.
+        c.observe(30, true, 60);
+        assert_eq!(c.cap_fps(), 20); // 30.min(36) - 10
+        // Two clean windows do NOT probe — the climb latch was reset and
+        // the first probe is lazy again (oscillation guard).
+        c.observe(20, false, 60);
+        c.observe(20, false, 60);
+        assert_eq!(c.cap_fps(), 20);
+        c.observe(20, false, 60);
+        assert_eq!(c.cap_fps(), 40, "third clean window probes (gap 40/2 = 20)");
     }
 
     #[test]
