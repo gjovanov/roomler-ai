@@ -284,6 +284,29 @@ pub struct PeerStats {
     /// (handshake packets touch neither), so the rx-flat heuristic can't see it
     /// and boringtun stops even keepalives once the attempt expires at ~90 s.
     handshake: AtomicBool,
+    /// P3 PR-B — mono-ms (against [`wg_epoch`]) when `handshake` first
+    /// latched; 0 = not yet (stamps are `max(1)`-floored so 0 stays the unset
+    /// sentinel). Stamped in `process_inbound` — the RECV path, the instant
+    /// the session appears — so the PathMonitor's probe-latch quality credit
+    /// gets a REAL latency; the health sweep only observes the latch at its
+    /// 5 s tick, and that quantization would be worse than no number at all
+    /// (why PR-A passed `None`).
+    handshake_at: AtomicU64,
+}
+
+/// P3 PR-B — process-monotonic epoch for [`PeerStats::handshake_at`] stamps.
+/// Initialized when the first [`WgDevice`] is built — before any probe can
+/// start — so every stamp and every probe-start `Instant` is ≥ the epoch and
+/// `latch_ms − start_ms` can never wrap.
+static WG_EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+fn wg_epoch() -> Instant {
+    *WG_EPOCH.get_or_init(Instant::now)
+}
+
+/// Milliseconds of `wg_epoch()` elapsed — the `handshake_at` clock.
+fn mono_ms_now() -> u64 {
+    wg_epoch().elapsed().as_millis() as u64
 }
 
 /// Demux routing table: a direct peer's source address → its `Tunn` + stats.
@@ -534,6 +557,8 @@ impl WgDevice {
     /// receiver for decrypted inbound IP packets (the TUN bridge / tests
     /// drain it).
     pub fn new(secret: StaticSecret) -> (Self, mpsc::Receiver<Vec<u8>>) {
+        // P3 PR-B — pin the handshake_at epoch before any probe can exist.
+        wg_epoch();
         let public = PublicKey::from(&secret);
         let (tun_tx, tun_rx) = mpsc::channel(256);
         let (direct_events_tx, direct_events_rx) = mpsc::channel(16);
@@ -1045,6 +1070,29 @@ impl WgDevice {
         self.probes.contains_key(peer_public)
     }
 
+    /// P3 PR-B — the probe's REAL latch latency: ms between `since` (the
+    /// probe start the runtime recorded) and the instant `process_inbound`
+    /// latched its handshake. `None` while unlatched or with no probe in
+    /// flight. Read BEFORE [`promote_direct_probe`](Self::promote_direct_probe)
+    /// — the promote moves the probe out of the probes map.
+    pub fn probe_handshake_latency_ms(
+        &self,
+        peer_public: &[u8; 32],
+        since: Instant,
+    ) -> Option<u64> {
+        let at = self
+            .probes
+            .get(peer_public)?
+            .stats
+            .handshake_at
+            .load(Ordering::Relaxed);
+        if at == 0 {
+            return None;
+        }
+        let since_ms = since.saturating_duration_since(wg_epoch()).as_millis() as u64;
+        Some(at.saturating_sub(since_ms))
+    }
+
     /// Make-before-break — promote a latched probe to the ACTIVE carrier: the
     /// probe `Tunn` replaces the peer's current carrier in the routing `peers`
     /// map, and the old carrier is dropped (its `Peer::drop` aborts the recv/
@@ -1089,6 +1137,9 @@ impl WgDevice {
     pub fn test_latch_probe_handshake_done(&self, peer_public: &[u8; 32]) {
         if let Some(p) = self.probes.get(peer_public) {
             p.stats.handshake.store(true, Ordering::Relaxed);
+            p.stats
+                .handshake_at
+                .store(mono_ms_now().max(1), Ordering::Relaxed);
         }
     }
 
@@ -1229,6 +1280,9 @@ impl WgDevice {
     pub fn test_latch_handshake_done(&self, peer_public: &[u8; 32]) {
         if let Some(p) = self.peers.get(peer_public) {
             p.stats.handshake.store(true, Ordering::Relaxed);
+            p.stats
+                .handshake_at
+                .store(mono_ms_now().max(1), Ordering::Relaxed);
         }
     }
 
@@ -1315,6 +1369,11 @@ async fn process_inbound(
     // the Tunn lock is already held here (rc.137: never lock it from the sweep).
     if !stats.handshake.load(Ordering::Relaxed) && t.time_since_last_handshake().is_some() {
         stats.handshake.store(true, Ordering::Relaxed);
+        // P3 PR-B — stamp the latch instant (recv-path precision; the sweep's
+        // 5 s tick only OBSERVES it later). `max(1)`: 0 is the unset sentinel.
+        stats
+            .handshake_at
+            .store(mono_ms_now().max(1), Ordering::Relaxed);
     }
 }
 
