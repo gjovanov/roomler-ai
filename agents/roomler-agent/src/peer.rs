@@ -1450,6 +1450,44 @@ async fn media_pump(
             );
         }
     }
+    if matches!(negotiated_transport.as_deref(), Some("data-channel-h264")) {
+        #[cfg(feature = "ffmpeg-encoder")]
+        {
+            if crate::encode::ffmpeg::available() {
+                tracing::info!(
+                    %session_id,
+                    "media pump: H.264 over DataChannel (P2 — FFmpeg via vendor SDK)"
+                );
+                return media_pump_ffmpeg_dc(
+                    FfmpegDcCodec::H264,
+                    session_id,
+                    video_bytes_dc,
+                    keyframe_requested,
+                    target_resolution,
+                    lock_state_rx,
+                    quality_state,
+                    control_dc.clone(),
+                    pc.clone(),
+                    capture_native_dims,
+                    encoded_dims,
+                    viewer_report,
+                    priority,
+                )
+                .await;
+            }
+            tracing::warn!(
+                %session_id,
+                "negotiated_transport=data-channel-h264 but ROOMLER_AGENT_USE_FFMPEG isn't set — falling back to WebRTC video track"
+            );
+        }
+        #[cfg(not(feature = "ffmpeg-encoder"))]
+        {
+            tracing::warn!(
+                %session_id,
+                "negotiated_transport=data-channel-h264 but agent was built without `ffmpeg-encoder` feature — falling back to WebRTC video track"
+            );
+        }
+    }
     // Y.3 fork: route to the DC pump when the session negotiated VP9
     // 4:4:4 over the `video-bytes` channel. Falls through to the
     // legacy track-based pump otherwise — including when the feature
@@ -3147,6 +3185,13 @@ enum FfmpegDcCodec {
     /// WebCodecs `av01.*` decodes without a description, same 13-byte DC
     /// framing as HEVC/VP9.
     Av1,
+    /// P2 (Parsec-class plan) — H.264 over `data-channel-h264`. HW-only
+    /// (h264_nvenc/qsv/amf), probe-gated in caps.rs; Annex-B with in-band
+    /// SPS/PPS which WebCodecs `avc1.*` decodes without a description
+    /// (same registry contract as the `hev1` path), same 13-byte framing.
+    /// Gives H.264 the reliable-DC + canvas pipeline instead of the RTP
+    /// track + `<video>` jitter buffer.
+    H264,
 }
 
 #[cfg(feature = "ffmpeg-encoder")]
@@ -3166,6 +3211,7 @@ impl FfmpegDcCodec {
             Self::Hevc => FfmpegEncoder::new_hevc_adaptive(w, h, fps, maxrate_bps),
             Self::Vp9 => FfmpegEncoder::new_vp9_adaptive(w, h, fps, maxrate_bps),
             Self::Av1 => FfmpegEncoder::new_av1_adaptive(w, h, fps, maxrate_bps),
+            Self::H264 => FfmpegEncoder::new_h264_adaptive(w, h, fps, maxrate_bps),
         }
     }
 
@@ -3174,6 +3220,7 @@ impl FfmpegDcCodec {
             Self::Hevc => "HEVC",
             Self::Vp9 => "VP9",
             Self::Av1 => "AV1",
+            Self::H264 => "H264",
         }
     }
 
@@ -3184,6 +3231,7 @@ impl FfmpegDcCodec {
             Self::Hevc => "h265",
             Self::Vp9 => "vp9",
             Self::Av1 => "av1",
+            Self::H264 => "h264",
         }
     }
 
