@@ -69,6 +69,13 @@ pub mod viewer_rate;
 #[cfg_attr(not(feature = "ffmpeg-encoder"), allow(dead_code))]
 pub mod encode_pressure;
 
+// P3 (Parsec-class plan) — transport/codec-aware rate-profile helpers:
+// persisted-flip rebuild decision (FlipTracker), per-codec maxrate factor
+// (H.264 ×1.5 — text-sharpness field fix), H.264 CQ adjustment. Pure
+// (unit-tested on the default build); only the ffmpeg DC pump USES it.
+#[cfg_attr(not(feature = "ffmpeg-encoder"), allow(dead_code))]
+pub mod rate_profile;
+
 // ---------------------------------------------------------------------
 // Shared helpers usable by every backend.
 // ---------------------------------------------------------------------
