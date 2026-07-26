@@ -136,16 +136,25 @@ pub async fn run(
     // publishes the live agent-WS egress into it + demuxes client-bound replies.
     tunnel_hub: crate::tunnel::client_mgr::TunnelClientHub,
 ) -> Result<()> {
+    // Overlay "Disconnect" control → this channel → the connect_once
+    // loop, which tears the session down (peer close + ClientMsg::Terminate).
+    // Created once; the receiver is polled inside connect_once across
+    // reconnects. A `kill_tx` clone is retained below for the whole loop
+    // so the channel never fully closes — a closed receiver would busy-
+    // spin the select! — even when the overlay is disabled.
+    let (kill_tx, mut kill_rx) = mpsc::channel::<bson::oid::ObjectId>(4);
     // One overlay handle, reused across reconnects. Failing to bring up
     // the indicator is non-fatal — the session still works, the user
     // just doesn't get the visual "you're being watched" cue.
-    let indicator = match ViewerIndicator::new() {
+    let indicator = match ViewerIndicator::new(kill_tx.clone()) {
         Ok(v) => v,
         Err(e) => {
             warn!(%e, "viewer-indicator init failed; continuing without overlay");
             ViewerIndicator::disabled()
         }
     };
+    // Keep the sender alive for the loop's lifetime (see above).
+    let _kill_keepalive = kill_tx;
     // Operator-consent broker: created in `run_cmd` and passed in (P2b), so the
     // LocalAPI shares the SAME instance and its live `pending` set. Lives across
     // reconnects, so a sentinel dropped while the WS was down is still honoured.
@@ -174,6 +183,7 @@ pub async fn run(
             connected.clone(),
             overlay_view_tx.clone(),
             tunnel_hub.clone(),
+            &mut kill_rx,
         )
         .await
         {
@@ -391,6 +401,9 @@ async fn connect_once(
     connected: Arc<AtomicBool>,
     overlay_view_tx: tokio::sync::watch::Sender<OverlayView>,
     tunnel_hub: crate::tunnel::client_mgr::TunnelClientHub,
+    // Overlay "Disconnect" → session ObjectId to tear down. Borrowed
+    // (not owned) so the same receiver survives across reconnects.
+    kill_rx: &mut mpsc::Receiver<bson::oid::ObjectId>,
 ) -> Result<(), ConnectError> {
     let url = format!(
         "{}?token={}&role=agent",
@@ -603,6 +616,30 @@ async fn connect_once(
                 if let Err(e) = send_msg(&mut ws, &outbound_msg).await {
                     warn!(%e, "failed to flush peer-originated message");
                 }
+                watchdog::tick("signaling");
+            }
+            Some(sid) = kill_rx.recv() => {
+                // Viewee clicked "Disconnect" in the on-screen overlay.
+                // Close the local peer and tell the server, which notifies
+                // the browser and echoes ServerMsg::Terminate back; that
+                // handler is idempotent, so the echo re-running is safe.
+                info!(session_id = %sid, "viewee requested disconnect via overlay badge");
+                if let Some(peer) = peers.remove(&sid) {
+                    peer.close().await;
+                }
+                pending_codecs.remove(&sid);
+                pending_transports.remove(&sid);
+                pending_audio.remove(&sid);
+                pending_permissions.remove(&sid);
+                let _ = send_msg(
+                    &mut ws,
+                    &ClientMsg::Terminate {
+                        session_id: sid,
+                        reason: EndReason::AgentHangup,
+                    },
+                )
+                .await;
+                indicator.hide_session(sid.to_hex());
                 watchdog::tick("signaling");
             }
             maybe_msg = ws.next() => match maybe_msg {
