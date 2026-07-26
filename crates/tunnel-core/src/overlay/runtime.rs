@@ -493,52 +493,57 @@ struct BuiltRelay {
     quic: Option<Arc<Carrier>>,
 }
 
-/// rc.211 — bookkeeping for OFF-LOOP relay carrier builds. The QUIC-over-TURN
-/// rendezvous (`Carrier::quic_relay`, capped at [`QUIC_BUILD_TIMEOUT`] = 8 s)
-/// used to run INLINE on the steady-state select! loop — the field-proven
-/// head-of-line stall behind the 1–2 s overlay RTT plateaus (the S1 watchdog
-/// named it five times at 8.06 s in one 150 s run). `install_ready` now spawns
-/// the build and the completion is committed by a dedicated select! arm.
+/// P2 (rc.211 + rc.218 merged) — epoch-token ABA bookkeeping for OFF-LOOP work,
+/// generic over the completion payload. One instance per off-loop pipeline:
 ///
-/// Guards (adversarial-review C2/C3):
 /// * `in_flight` maps node → the epoch stamped at spawn; a completion commits
 ///   ONLY if its epoch is still current, so any invalidating event (peer
 ///   removed, direct carrier installed / `coord.forget`) simply removes the
-///   entry and the stale build is dropped on arrival — immune to the
-///   forget→re-request ABA a plain "is building" set would have.
-/// * `install_peers`' relay-coordination branch checks `in_flight` so it never
-///   spawns a DUPLICATE coordination for a peer whose carrier is mid-build
-///   (post-`try_build` the coordinator no longer tracks the peer, so
-///   `!is_tracking` alone would re-request during the 8 s window).
-struct RelayBuildQueue {
+///   entry and the stale completion is dropped on arrival — immune to the
+///   forget→re-request ABA a plain "is in flight" set would have.
+/// * Call sites that would start duplicate work consult `in_flight` first
+///   (see the per-alias docs below for each pipeline's specifics).
+struct EpochQueue<T> {
     in_flight: HashMap<ObjectId, u64>,
     epoch: u64,
-    tx: mpsc::Sender<BuiltRelay>,
+    tx: mpsc::Sender<T>,
 }
 
-impl RelayBuildQueue {
-    /// Stamp a new build for `node` (invalidates any prior in-flight build).
+impl<T> EpochQueue<T> {
+    /// Stamp new in-flight work for `node` (supersedes any prior stamp).
     fn stamp(&mut self, node: ObjectId) -> u64 {
         self.epoch += 1;
         self.in_flight.insert(node, self.epoch);
         self.epoch
     }
-    /// Invalidate any in-flight build for `node` (peer removed / went direct /
-    /// coordinator forgotten) — its completion will be dropped on arrival.
+    /// Invalidate any in-flight work for `node` — its completion will be
+    /// dropped on arrival.
     fn invalidate(&mut self, node: &ObjectId) {
         self.in_flight.remove(node);
     }
-    /// `true` iff `built` is still the CURRENT build for its peer; clears the
-    /// entry either way (the completion consumes the slot).
-    fn take_if_current(&mut self, built: &BuiltRelay) -> bool {
-        if self.in_flight.get(&built.link.node_id) == Some(&built.epoch) {
-            self.in_flight.remove(&built.link.node_id);
+    /// `true` iff `(node, epoch)` is still the CURRENT work for its peer;
+    /// clears the entry either way (the completion consumes the slot).
+    fn take_if_current(&mut self, node: &ObjectId, epoch: u64) -> bool {
+        if self.in_flight.get(node) == Some(&epoch) {
+            self.in_flight.remove(node);
             true
         } else {
             false
         }
     }
 }
+
+/// rc.211 — OFF-LOOP relay carrier builds. The QUIC-over-TURN rendezvous
+/// (`Carrier::quic_relay`, capped at [`QUIC_BUILD_TIMEOUT`] = 8 s) used to run
+/// INLINE on the steady-state select! loop — the field-proven head-of-line
+/// stall behind the 1–2 s overlay RTT plateaus (the S1 watchdog named it five
+/// times at 8.06 s in one 150 s run). `install_ready` spawns the build and the
+/// completion is committed by a dedicated select! arm. `install_peers`' relay-
+/// coordination branch checks `in_flight` so it never spawns a DUPLICATE
+/// coordination for a peer whose carrier is mid-build (post-`try_build` the
+/// coordinator no longer tracks the peer, so `!is_tracking` alone would
+/// re-request during the 8 s window).
+type RelayBuildQueue = EpochQueue<BuiltRelay>;
 
 /// rc.218 — a finished OFF-LOOP relay ALLOCATE (see [`RelayAllocQueue`]).
 /// `conn: None` = every TURN candidate failed/timed out → the commit arm
@@ -551,53 +556,24 @@ struct AllocDone {
     conn: Option<Arc<dyn crate::transport::relay::RelayConn>>,
 }
 
-/// rc.218 — bookkeeping for OFF-LOOP relay allocates. rc.211 moved the
-/// QUIC-over-TURN build off-loop and flagged `on_grant`'s inline DNS + TURN
-/// allocate (UDP 5 s → TURNS/TCP 6 s caps per candidate) as "next in line if
-/// it ever fires in the field" — it did: pc50045's rc.213–216 logs still show
-/// `stalled the data plane` from exactly this await on its hostile corp path.
-/// The `RelayGrant` arm now stashes the creds (`grant_accept`, sync), spawns
+/// rc.218 — OFF-LOOP relay allocates. rc.211 moved the QUIC-over-TURN build
+/// off-loop and flagged `on_grant`'s inline DNS + TURN allocate (UDP 5 s →
+/// TURNS/TCP 6 s caps per candidate) as "next in line if it ever fires in the
+/// field" — it did: pc50045's rc.213–216 logs still show `stalled the data
+/// plane` from exactly this await on its hostile corp path. The `RelayGrant`
+/// arm stashes the creds (`grant_accept`, sync), spawns
 /// [`RelayCoordinator::allocate_for_pair`], and a dedicated select! arm
-/// commits the result (`commit_alloc`, µs). Same epoch-token ABA guard as
-/// [`RelayBuildQueue`], but with NO per-site invalidation plumbing: LAST GRANT
-/// WINS (every grant re-stamps, superseding any in-flight allocate), a stale
+/// commits the result (`commit_alloc`, µs). Same epoch-token ABA guard, with
+/// NO per-site invalidation plumbing except the P7 force-DERP conversion
+/// (`invalidate` — a stale `AllocDone` landing after the pair re-cycled into
+/// `pending` would otherwise commit a TURN link inside the forced window; the
+/// orphan coturn allocation idles out at the server's TTL): LAST GRANT WINS
+/// (every grant re-stamps, superseding any in-flight allocate), a stale
 /// completion drops on epoch mismatch, and `commit_alloc` requiring the peer
-/// still in `pending` drops the forgotten-not-re-requested case (the orphan
-/// coturn allocation idles out at the server's TTL). While an allocate is in
-/// flight the peer stays in `pending`, so `is_tracking` keeps deduping
-/// re-requests exactly as before.
-struct RelayAllocQueue {
-    in_flight: HashMap<ObjectId, u64>,
-    epoch: u64,
-    tx: mpsc::Sender<AllocDone>,
-}
-
-impl RelayAllocQueue {
-    /// Stamp a new allocate for `node` (supersedes any prior in-flight one).
-    fn stamp(&mut self, node: ObjectId) -> u64 {
-        self.epoch += 1;
-        self.in_flight.insert(node, self.epoch);
-        self.epoch
-    }
-    /// P7 — drop any in-flight allocate for `node` so its completion is
-    /// discarded on arrival. Used by the force-DERP conversion: a stale
-    /// `AllocDone` landing after the pair re-cycled into `pending` would
-    /// otherwise commit a TURN link inside the forced window (the orphan
-    /// coturn allocation idles out at the server's TTL).
-    fn invalidate(&mut self, node: &ObjectId) {
-        self.in_flight.remove(node);
-    }
-    /// `true` iff `done` is still the CURRENT allocate for its peer; clears
-    /// the entry either way (the completion consumes the slot).
-    fn take_if_current(&mut self, done: &AllocDone) -> bool {
-        if self.in_flight.get(&done.node_id) == Some(&done.epoch) {
-            self.in_flight.remove(&done.node_id);
-            true
-        } else {
-            false
-        }
-    }
-}
+/// still in `pending` drops the forgotten-not-re-requested case. While an
+/// allocate is in flight the peer stays in `pending`, so `is_tracking` keeps
+/// deduping re-requests exactly as before.
+type RelayAllocQueue = EpochQueue<AllocDone>;
 /// Phase B — per-socket STUN attempt timeout when gathering srflx candidates at
 /// startup. `srflx_query` retries a few times, so worst-case per socket is a
 /// small multiple of this; the whole gather is additionally bounded by
@@ -1757,7 +1733,7 @@ impl OverlayRuntime {
                 built = built_rx.recv() => {
                     if let Some(built) = built {
                         let t_arm = Instant::now();
-                        if relay_bq.take_if_current(&built) && current_peers.contains_key(&built.link.node_id) {
+                        if relay_bq.take_if_current(&built.link.node_id, built.epoch) && current_peers.contains_key(&built.link.node_id) {
                             let BuiltRelay { link, quic, .. } = built;
                             self.install_built(&mut wg, &mut by_node, &tun, link, quic).await;
                             // Same tail as a synchronous relay install: a new
@@ -1781,7 +1757,7 @@ impl OverlayRuntime {
                 done = alloc_rx.recv() => {
                     if let Some(done) = done {
                         let t_arm = Instant::now();
-                        if alloc_q.take_if_current(&done) {
+                        if alloc_q.take_if_current(&done.node_id, done.epoch) {
                             if let Some(r) = relay.as_mut() {
                                 match done.conn {
                                     Some(conn) => {
@@ -3702,64 +3678,46 @@ mod tests {
         }
     }
 
-    /// rc.211 — the off-loop build queue's staleness guards. (a) A completion
-    /// commits only while its epoch is current; (b) `invalidate` (peer removed /
-    /// went direct) drops the in-flight build on arrival; (c) re-`stamp` for the
-    /// same peer supersedes the old build — the ABA case a plain "is building"
-    /// set would get wrong (old completion must NOT commit, new one must).
+    /// rc.211 (P2: generic `EpochQueue`) — the off-loop queue's staleness
+    /// guards. (a) A completion commits only while its epoch is current;
+    /// (b) `invalidate` (peer removed / went direct) drops the in-flight work
+    /// on arrival; (c) re-`stamp` for the same peer supersedes — the ABA case
+    /// a plain "is in flight" set would get wrong (old completion must NOT
+    /// commit, new one must). Exercised through the `RelayBuildQueue` alias;
+    /// `RelayAllocQueue` is the same generic (its extra semantics — last
+    /// grant wins, no per-site invalidation — are call-site policy, not
+    /// queue mechanics).
     #[tokio::test]
     async fn relay_build_queue_epoch_guards() {
-        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let dst: SocketAddr = sock.local_addr().unwrap();
-        let mk = |node, epoch| BuiltRelay {
-            epoch,
-            link: ReadyLink {
-                node_id: node,
-                public_key: [0u8; 32],
-                overlay_ip: std::net::Ipv4Addr::new(100, 64, 0, 9),
-                carrier: Arc::new(Carrier::Direct {
-                    sock: sock.clone(),
-                    dst,
-                }),
-                relay_parts: None,
-                supports_quic: false,
-                single_relay: None,
-                relay_kind: RelayKind::Turn,
-                subnets: vec![],
-            },
-            quic: None,
-        };
         let mut bq = test_relay_bq();
         let n = ObjectId::from_bytes([9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
 
         // (a) current epoch commits, and the slot is consumed.
         let e1 = bq.stamp(n);
         assert!(bq.in_flight.contains_key(&n));
-        assert!(bq.take_if_current(&mk(n, e1)));
+        assert!(bq.take_if_current(&n, e1));
         assert!(!bq.in_flight.contains_key(&n), "commit consumes the slot");
         assert!(
-            !bq.take_if_current(&mk(n, e1)),
+            !bq.take_if_current(&n, e1),
             "a second arrival of the same build is stale"
         );
 
         // (b) invalidate → the completion is dropped on arrival.
         let e2 = bq.stamp(n);
         bq.invalidate(&n);
-        assert!(!bq.take_if_current(&mk(n, e2)));
+        assert!(!bq.take_if_current(&n, e2));
 
         // (c) ABA: re-stamp supersedes — the OLD build must not commit, the
         // NEW one must.
         let e3 = bq.stamp(n);
         let e4 = bq.stamp(n);
-        assert!(!bq.take_if_current(&mk(n, e3)), "superseded build is stale");
-        assert!(bq.take_if_current(&mk(n, e4)), "current build commits");
+        assert!(!bq.take_if_current(&n, e3), "superseded build is stale");
+        assert!(bq.take_if_current(&n, e4), "current build commits");
     }
 
-    /// rc.218 — the off-loop ALLOCATE queue's epoch semantics: last grant
-    /// wins (re-stamp supersedes), commits consume the slot, stale
-    /// completions drop. Mirrors `relay_build_queue_epoch_guards` minus the
-    /// invalidate case (the alloc queue deliberately has no per-site
-    /// invalidation — see the `RelayAllocQueue` doc).
+    /// rc.218 — the ALLOCATE queue rides the same generic: last grant wins
+    /// (re-stamp supersedes), commits consume the slot, stale completions
+    /// drop.
     #[tokio::test]
     async fn relay_alloc_queue_epoch_guards() {
         let (tx, _rx) = mpsc::channel::<AllocDone>(4);
@@ -3769,18 +3727,13 @@ mod tests {
             tx,
         };
         let n = ObjectId::from_bytes([7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-        let mk = |node, epoch| AllocDone {
-            epoch,
-            node_id: node,
-            conn: None,
-        };
 
         // (a) current epoch commits, and the slot is consumed.
         let e1 = q.stamp(n);
-        assert!(q.take_if_current(&mk(n, e1)));
+        assert!(q.take_if_current(&n, e1));
         assert!(!q.in_flight.contains_key(&n), "commit consumes the slot");
         assert!(
-            !q.take_if_current(&mk(n, e1)),
+            !q.take_if_current(&n, e1),
             "a second arrival of the same allocate is stale"
         );
 
@@ -3788,8 +3741,8 @@ mod tests {
         // newest must.
         let e2 = q.stamp(n);
         let e3 = q.stamp(n);
-        assert!(!q.take_if_current(&mk(n, e2)), "superseded allocate stale");
-        assert!(q.take_if_current(&mk(n, e3)), "current allocate commits");
+        assert!(!q.take_if_current(&n, e2), "superseded allocate stale");
+        assert!(q.take_if_current(&n, e3), "current allocate commits");
     }
 
     #[test]
