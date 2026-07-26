@@ -736,6 +736,19 @@ export function diagHudEnabled(): boolean {
   }
 }
 
+/** P2 — restore the LEGACY H.264 mapping (RTP track + `<video>`) for the
+ *  explicit H.264 codec choice. Escape hatch for the `data-channel-h264`
+ *  rollout; see `codecChoiceToSettings`. */
+const H264_RTP_STORAGE_KEY = 'roomler-rc-h264-rtp'
+
+export function storedH264Rtp(): boolean {
+  try {
+    return globalThis.localStorage?.getItem(H264_RTP_STORAGE_KEY) === '1'
+  } catch {
+    return false
+  }
+}
+
 /** P1 — one stats-window of per-hop pipeline diagnostics (worker hops + the
  *  main thread's long-task pressure). Consumed by the diag HUD. */
 export type RcDecodeDiag = {
@@ -782,6 +795,7 @@ export type RcVideoTransport =
   | 'data-channel-vp9-444'
   | 'data-channel-hevc'
   | 'data-channel-av1'
+  | 'data-channel-h264'
 
 /** rc.190.1 — key bumped as a ONE-TIME migration to the new Auto
  *  default (same rationale as the resolution-prefix bump: transports
@@ -1104,10 +1118,73 @@ export async function isVp9HwDecodeSupported(): Promise<boolean> {
   }
 }
 
+/** P2 (Parsec-class plan) — H.264-over-DC codec-string probe ladder.
+ *  Declared-max levels (a smaller stream decodes under them — the rc.94
+ *  HEVC L93→L153 lesson): High@L5.2 (4K60), High@L5.1, High@L4.2. The
+ *  agent ships Annex-B with in-band SPS/PPS; per the WebCodecs AVC
+ *  registry an `avc1.*` config WITHOUT `description` means Annex-B —
+ *  the same description-less contract the `hev1` path has shipped for
+ *  months. */
+export const H264_DC_CODEC_CANDIDATES = ['avc1.640034', 'avc1.640033', 'avc1.64002A'] as const
+
+/** P2 — first Annex-B avc1 codec string this browser's VideoDecoder
+ *  accepts, or null when none (→ the caller stays on the RTP track). */
+export async function isH264DcDecodeSupported(): Promise<string | null> {
+  const g = globalThis as unknown as {
+    VideoDecoder?: { isConfigSupported?: (cfg: { codec: string }) => Promise<{ supported?: boolean }> }
+  }
+  const isConfigSupported = g.VideoDecoder?.isConfigSupported
+  if (typeof isConfigSupported !== 'function') return null
+  for (const codec of H264_DC_CODEC_CANDIDATES) {
+    try {
+      const res = await isConfigSupported({ codec })
+      if (res?.supported === true) return codec
+    } catch {
+      /* try the next level down */
+    }
+  }
+  return null
+}
+
+/** P2 — HARDWARE-and-smooth H.264 decode probe (MediaCapabilities
+ *  `smooth` + `powerEfficient`, same contract as the HEVC/AV1 HW probes).
+ *  H.264 HW decode is near-universal, but the gate keeps the auto-rank
+ *  honest on exotic viewers. */
+export async function isH264HwDecodeSupported(): Promise<boolean> {
+  const mc = (
+    navigator as Navigator & {
+      mediaCapabilities?: {
+        decodingInfo?: (cfg: unknown) => Promise<{
+          supported?: boolean
+          smooth?: boolean
+          powerEfficient?: boolean
+        }>
+      }
+    }
+  ).mediaCapabilities
+  if (typeof mc?.decodingInfo !== 'function') return false
+  try {
+    const info = await mc.decodingInfo({
+      type: 'file',
+      video: {
+        contentType: 'video/mp4; codecs="avc1.64002A"',
+        width: 1920,
+        height: 1200,
+        bitrate: 8_000_000,
+        framerate: 60,
+      },
+    })
+    return info.supported === true && info.smooth === true && info.powerEfficient === true
+  } catch {
+    return false
+  }
+}
+
 /** rc.190 — inputs to the pure transport auto-rank. `agentTransports` /
  *  `agentHwEncoders` come from `Agent.capabilities` (the agent's caps
  *  probe truth); the `viewer*` bits are this browser's MediaCapabilities
- *  probes. */
+ *  probes. P2 adds `viewerH264Hw` (HW decode AND an accepted Annex-B
+ *  avc1 config — see `isH264DcDecodeSupported`). */
 export interface AutoTransportInputs {
   agentTransports: string[]
   agentHwEncoders: string[]
@@ -1115,6 +1192,7 @@ export interface AutoTransportInputs {
   viewerHevcHw: boolean
   viewerVp9Hw: boolean
   viewerVp9Decodable: boolean
+  viewerH264Hw: boolean
 }
 
 /** rc.190 — pure HW×HW transport rank for `videoTransport === 'auto'`.
@@ -1127,9 +1205,13 @@ export interface AutoTransportInputs {
  *    1. AV1-DC   — agent HW av1 encoder  × viewer HW AV1 decode
  *    2. HEVC-DC  — agent HW hevc encoder × viewer HW HEVC decode
  *    3. VP9-DC 4:2:0 — agent HW vp9 encoder (vp9_qsv) × viewer HW VP9
- *    4. VP9-DC 4:2:0 — agent libvpx SW encode (the agent's rc.190 SW cap
+ *    4. H264-DC  — agent HW h264 encoder × viewer HW H.264 decode (P2:
+ *       HW×HW beats the SW-encode tier below on CPU cost and its ≤1920
+ *       cap; H.264's poorer compression only matters on constrained
+ *       links, which the relay clamps already govern)
+ *    5. VP9-DC 4:2:0 — agent libvpx SW encode (the agent's rc.190 SW cap
  *       keeps it ≤1920 long edge) × viewer HW VP9 decode
- *    5. webrtc   — the REMB-adaptive H.264 track (universal fallback)
+ *    6. webrtc   — the REMB-adaptive H.264 track (universal fallback)
  *  Returns the transport (null = webrtc) + a chroma override ('yuv420'
  *  for the VP9 picks so the fallback never lands on software-decoded
  *  profile 1). Exported for vitest. */
@@ -1146,6 +1228,10 @@ export function pickAutoTransport(inputs: AutoTransportInputs): {
   const hasHevcDc = t.includes('data-channel-hevc') || enc.some((e) => e.startsWith('ffmpeg-hevc_'))
   const hasVp9Dc = t.includes('data-channel-vp9-444') || enc.includes('libvpx-vp9-444-sw')
   const agentVp9Hw = enc.includes('ffmpeg-vp9_qsv')
+  // P2 — transport-advertisement ONLY (no hw_encoders fallback like AV1/HEVC:
+  // `ffmpeg-h264_*` entries and the transport shipped in the same release, so
+  // there are no older agent rows with the encoder but not the transport).
+  const hasH264Dc = t.includes('data-channel-h264')
 
   if (hasAv1Dc && inputs.viewerAv1Hw) {
     return {
@@ -1166,6 +1252,13 @@ export function pickAutoTransport(inputs: AutoTransportInputs): {
       transport: 'data-channel-vp9-444',
       chromaOverride: 'yuv420',
       reason: 'VP9 4:2:0: HW encode (vp9_qsv) + HW decode here',
+    }
+  }
+  if (hasH264Dc && inputs.viewerH264Hw) {
+    return {
+      transport: 'data-channel-h264',
+      chromaOverride: null,
+      reason: 'H.264-DC: HW encode on agent + HW decode here (beats the SW-encode tier)',
     }
   }
   if (hasVp9Dc && inputs.viewerVp9Decodable) {
@@ -1249,12 +1342,21 @@ export interface CodecChoiceSettings {
 /** Map a Codec-picker choice to the underlying settings. Pure + exported so
  *  the tests lock it. `renderPath` is auto-managed here (this is what lets us
  *  drop the old standalone WebCodecs toggle): everything uses the low-latency
- *  WebCodecs path EXCEPT the explicit "H.264 · max compatibility" choice,
- *  which uses the plain `<video>` element for the widest browser support. The
- *  DC transports decode via the worker→canvas regardless of `renderPath`, so
- *  setting it for them is harmless and keeps the mapping total. `setRenderPath`
- *  clamps `webcodecs`→`video` on browsers without WebCodecs. */
-export function codecChoiceToSettings(choice: RcCodecChoice): CodecChoiceSettings {
+ *  WebCodecs path. The DC transports decode via the worker→canvas regardless
+ *  of `renderPath`, so setting it for them is harmless and keeps the mapping
+ *  total. `setRenderPath` clamps `webcodecs`→`video` on browsers without
+ *  WebCodecs.
+ *
+ *  P2 — the explicit H.264 choice now maps to `data-channel-h264` (the same
+ *  reliable-DC + WebCodecs pipeline as the other three codecs; connect()
+ *  falls back to the legacy RTP track when the agent doesn't advertise it or
+ *  this browser rejects Annex-B avc1). `opts.h264Rtp` (localStorage
+ *  `roomler-rc-h264-rtp=1`, threaded by the caller to keep this pure)
+ *  restores the legacy RTP + `<video>` mapping outright. */
+export function codecChoiceToSettings(
+  choice: RcCodecChoice,
+  opts?: { h264Rtp?: boolean },
+): CodecChoiceSettings {
   switch (choice) {
     case 'av1':
       return { videoTransport: 'data-channel-av1', chroma: 'auto', preferredCodec: null, renderPath: 'webcodecs' }
@@ -1275,7 +1377,15 @@ export function codecChoiceToSettings(choice: RcCodecChoice): CodecChoiceSetting
         renderPath: 'webcodecs',
       }
     case 'h264':
-      return { videoTransport: 'webrtc', chroma: 'auto', preferredCodec: 'h264', renderPath: 'video' }
+      if (opts?.h264Rtp) {
+        return { videoTransport: 'webrtc', chroma: 'auto', preferredCodec: 'h264', renderPath: 'video' }
+      }
+      return {
+        videoTransport: 'data-channel-h264',
+        chroma: 'auto',
+        preferredCodec: 'h264',
+        renderPath: 'webcodecs',
+      }
     case 'auto':
     default:
       return { videoTransport: 'auto', chroma: 'auto', preferredCodec: null, renderPath: 'webcodecs' }
@@ -1298,6 +1408,7 @@ export function settingsToCodecChoice(
       return 'hevc'
     case 'data-channel-vp9-444':
       return chroma === 'yuv444' ? 'vp9-444' : 'vp9-420'
+    case 'data-channel-h264':
     case 'webrtc':
       return 'h264'
     case 'auto':
@@ -3576,7 +3687,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   const codecChoice = computed<RcCodecChoice>({
     get: () => settingsToCodecChoice(videoTransport.value, vp9Chroma.value),
     set: (choice) => {
-      const s = codecChoiceToSettings(choice)
+      const s = codecChoiceToSettings(choice, { h264Rtp: storedH264Rtp() })
       setVideoTransport(s.videoTransport)
       setVp9Chroma(s.chroma)
       setPreferredCodec(s.preferredCodec)
@@ -5561,6 +5672,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // so the fallback lands on VP9 profile 0 (hardware-decoded), overriding
     // the user's chroma choice for the fallback session only.
     let chromaOverride: string | null = null
+    // P2 — the avc1 codec string the H.264-DC worker should configure with
+    // (probe-ladder result); null when H.264-DC isn't in play.
+    let h264DcCodec: string | null = null
     viewerDecodeHw.value = null
     if (videoTransport.value === 'auto') {
       // rc.190 (A3) — HW×HW auto-rank. A codec is only smooth when it's
@@ -5569,11 +5683,13 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       // agent's advertised encoders with this browser's MediaCapabilities
       // and pick the best pair; explicit user picks skip this entirely.
       const caps = agent?.value?.capabilities
-      const [av1Hw, hevcHw, vp9Hw, vp9Dec] = await Promise.all([
+      const [av1Hw, hevcHw, vp9Hw, vp9Dec, h264Hw, h264Codec] = await Promise.all([
         isAv1HwDecodeSupported(),
         isHevcHwDecodeSupported(),
         isVp9HwDecodeSupported(),
         isVp9_444DecodeSupported(),
+        isH264HwDecodeSupported(),
+        isH264DcDecodeSupported(),
       ])
       vp9_444Supported.value = vp9Dec
       const pick = pickAutoTransport({
@@ -5583,9 +5699,13 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         viewerHevcHw: hevcHw,
         viewerVp9Hw: vp9Hw,
         viewerVp9Decodable: vp9Dec,
+        // P2 — H.264-DC needs both the HW-smooth verdict AND an accepted
+        // Annex-B avc1 config (the worker configures with the latter).
+        viewerH264Hw: h264Hw && h264Codec !== null,
       })
       preferredTransport = pick.transport
       chromaOverride = pick.chromaOverride
+      if (pick.transport === 'data-channel-h264') h264DcCodec = h264Codec
       viewerDecodeHw.value =
         pick.transport === 'data-channel-av1'
           ? av1Hw
@@ -5593,8 +5713,31 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
             ? hevcHw
             : pick.transport === 'data-channel-vp9-444'
               ? vp9Hw
-              : null
+              : pick.transport === 'data-channel-h264'
+                ? h264Hw
+                : null
       console.info(`[rc] auto transport → ${pick.transport ?? 'webrtc'} (${pick.reason})`)
+    } else if (videoTransport.value === 'data-channel-h264') {
+      // P2 — explicit H.264 pick. Prefer the DC + WebCodecs pipeline when
+      // BOTH ends support it: the agent must advertise the transport (old
+      // agents don't → the legacy RTP track + <video> is exactly what they
+      // will send), and this browser must accept a description-less
+      // Annex-B avc1 config (probe ladder). On either miss we stay on the
+      // RTP path silently — same behaviour as before P2.
+      const h264Caps = agent?.value?.capabilities
+      const agentHasH264Dc = (h264Caps?.transports ?? []).includes('data-channel-h264')
+      const codec = agentHasH264Dc ? await isH264DcDecodeSupported() : null
+      if (agentHasH264Dc && codec) {
+        preferredTransport = 'data-channel-h264'
+        h264DcCodec = codec
+        viewerDecodeHw.value = await isH264HwDecodeSupported()
+      } else {
+        console.info(
+          agentHasH264Dc
+            ? '[rc] data-channel-h264 dropped — WebCodecs Annex-B avc1 decode unsupported here. Falling back to the RTP track.'
+            : '[rc] data-channel-h264 not advertised by this agent — using the legacy RTP track.',
+        )
+      }
     } else if (videoTransport.value === 'data-channel-av1') {
       // rc.190 — explicit AV1 pick. Chromium always has dav1d SW decode,
       // so gate only on decodability; the badge surfaces HW vs SW truth.
@@ -5675,6 +5818,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       // (13-byte length-prefix framing; the worker's VideoDecoder just
       // gets the AV1 codec string). No separate worker file needed.
       startVp9_444Path(AV1_CODEC_STRING)
+    } else if (preferredTransport === 'data-channel-h264') {
+      // P2 — H.264 rides the same worker via the avc1 codec override
+      // (the AV1 precedent). The probe ladder already picked the codec
+      // string this browser accepts.
+      startVp9_444Path(h264DcCodec ?? H264_DC_CODEC_CANDIDATES[0])
     }
 
     // Kick off the rc:* handshake. browser_caps lets the agent pick
