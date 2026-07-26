@@ -154,6 +154,144 @@ fn direct_endpoints_changed(old: &NetmapPeer, new: &NetmapPeer) -> bool {
 // rule that can kill a carrier). Glob-imported so this module — and its test
 // module's `use super::*` — reads them unchanged.
 use super::lifecycle::*;
+// P3 PR-A — the PathMonitor (measured path selection) runs in SHADOW next to
+// the legacy cooldown machinery below: fed the same evidence, asked the same
+// questions, compared, never obeyed. See `PathShadow`.
+use super::path;
+
+/// P3 PR-A — the shadow harness around [`path::PathMonitor`]: the monitor +
+/// the divergence bookkeeping the 48 h soak gate reads. Owned by
+/// [`OverlayRuntime`] behind a `std::sync::Mutex` so the sweep/install
+/// surfaces (whose signatures are frozen by the timer-parity tests) can feed
+/// it through `&self`; every access goes through [`OverlayRuntime::shadow`],
+/// which locks, runs a SYNC closure, and drops the guard — the guard can
+/// never be held across an await by construction.
+struct PathShadow {
+    mode: path::PathMonMode,
+    mon: path::PathMonitor,
+    stats: path::ShadowStats,
+    /// Per-peer divergence-warn rate limit (1/min/peer).
+    last_div_log: HashMap<ObjectId, Instant>,
+    /// Last 10-minute summary emission.
+    last_summary: Instant,
+    /// Harmful-class ledger: (peer, tier) the monitor refused while legacy
+    /// proceeded. If legacy then PROVES the tier (probe latch / healthy rx)
+    /// within [`SHADOW_HARM_WINDOW`], the refusal was harmful — the
+    /// acceptance gate requires zero of these.
+    refused: HashMap<(ObjectId, DirectTier), Instant>,
+}
+
+/// A monitor refusal contradicted by a legacy establishment within this
+/// window counts as the HARMFUL divergence class.
+const SHADOW_HARM_WINDOW: Duration = Duration::from_secs(60);
+/// Shadow summary cadence.
+const SHADOW_SUMMARY_EVERY: Duration = Duration::from_secs(600);
+
+impl PathShadow {
+    fn new() -> Self {
+        Self {
+            mode: path::PathMonMode::parse(crate::env::node_env("OVERLAY_PATHMON").as_deref()),
+            mon: path::PathMonitor::default(),
+            stats: path::ShadowStats::default(),
+            last_div_log: HashMap::new(),
+            last_summary: Instant::now(),
+            refused: HashMap::new(),
+        }
+    }
+
+    /// The tier a comparable action commits to, if any.
+    fn action_tier(a: path::PathAction) -> Option<DirectTier> {
+        match a {
+            path::PathAction::Install(t) | path::PathAction::Probe(t) => Some(t),
+            path::PathAction::Keep | path::PathAction::Relay => None,
+        }
+    }
+
+    /// Record one legacy-vs-monitor comparison. `None` = "refuse / no
+    /// decision" (the inbound gate's shape). Divergences are counted, fed to
+    /// the harmful ledger, and warn-logged at most once per minute per peer.
+    fn compare(
+        &mut self,
+        surface: &'static str,
+        peer: &ObjectId,
+        legacy: Option<path::PathAction>,
+        monitor: Option<path::PathAction>,
+        now: Instant,
+    ) {
+        self.stats.decisions += 1;
+        let diverged = match (legacy, monitor) {
+            (Some(l), Some(m)) => path::classify(l, m) == path::DivergenceClass::Diverged,
+            (l, m) => l != m,
+        };
+        if !diverged {
+            return;
+        }
+        self.stats.diverged += 1;
+        // Harmful ledger: legacy commits to a tier the monitor currently
+        // holds ineligible (whatever the monitor proposed instead).
+        if let Some(t) = legacy.and_then(Self::action_tier)
+            && monitor.and_then(Self::action_tier) != Some(t)
+            && !self.mon.eligible(peer, t, now)
+        {
+            self.refused.insert((*peer, t), now);
+        }
+        if self
+            .last_div_log
+            .get(peer)
+            .is_none_or(|&t| now.duration_since(t) >= Duration::from_secs(60))
+        {
+            self.last_div_log.insert(*peer, now);
+            info!(
+                %surface, peer = %peer, ?legacy, ?monitor,
+                "overlay pathmon[shadow]: decision divergence (legacy authoritative; rate-limited 1/min/peer)"
+            );
+        }
+    }
+
+    /// Legacy PROVED a tier for this peer (probe latched / direct carrier
+    /// genuinely receiving) — grade any recent refusal as harmful.
+    fn establishment(&mut self, peer: &ObjectId, tier: DirectTier, now: Instant) {
+        if let Some(at) = self.refused.remove(&(*peer, tier))
+            && now.duration_since(at) <= SHADOW_HARM_WINDOW
+        {
+            self.stats.harmful += 1;
+            warn!(
+                peer = %peer, ?tier,
+                "overlay pathmon[shadow]: HARMFUL divergence — monitor refused a tier legacy then proved within 60 s"
+            );
+        }
+    }
+
+    /// Model-bug tripwire: right after the monitor booked a failure on a
+    /// tier, that tier must be ineligible (the penalty math guarantees it).
+    fn assert_ineligible(&mut self, peer: &ObjectId, tier: DirectTier, now: Instant) {
+        if self.mon.eligible(peer, tier, now) {
+            self.stats.post_death_eligible += 1;
+            warn!(
+                peer = %peer, ?tier,
+                "overlay pathmon[shadow]: MODEL BUG — tier still eligible immediately after its failure booked"
+            );
+        }
+    }
+
+    /// The 10-minute rolling summary (driven from the 5 s health sweep).
+    fn maybe_summary(&mut self, now: Instant) {
+        if now.duration_since(self.last_summary) < SHADOW_SUMMARY_EVERY {
+            return;
+        }
+        self.last_summary = now;
+        // Expire stale refusals so the ledger can't grow unbounded.
+        self.refused
+            .retain(|_, &mut at| now.duration_since(at) <= SHADOW_HARM_WINDOW);
+        info!(
+            decisions = self.stats.decisions,
+            diverged = self.stats.diverged,
+            harmful = self.stats.harmful,
+            post_death_eligible = self.stats.post_death_eligible,
+            "overlay pathmon[shadow]: 10-min summary (soak gate: steady <0.1% diverged, harmful = 0)"
+        );
+    }
+}
 
 /// An installed peer carrier + the bookkeeping the direct→relay fallback
 /// (rc.136/137) needs.
@@ -688,6 +826,13 @@ pub struct OverlayRuntime {
     /// ⇒ no DERP; the coordinator falls through to both-allocate. Set via
     /// [`with_derp_mux_factory`](Self::with_derp_mux_factory).
     derp_mux_factory: Option<DerpMuxFactory>,
+    /// P3 PR-A — the shadow [`path::PathMonitor`] + divergence bookkeeping.
+    /// Behind a Mutex (not a field of the loop) because the feed sites are
+    /// `&self` methods whose signatures are frozen by the timer-parity tests;
+    /// accessed ONLY through [`Self::shadow`] (sync closure — the guard
+    /// cannot cross an await). Uncontended: the overlay loop is the only
+    /// caller.
+    path_shadow: std::sync::Mutex<PathShadow>,
 }
 
 /// Opens the node's `/derp` WS (the agent owns `server_url` + the token +
@@ -1002,6 +1147,7 @@ impl OverlayRuntime {
             exit_node: None,
             exit_server_ips: Vec::new(),
             derp_mux_factory: None,
+            path_shadow: std::sync::Mutex::new(PathShadow::new()),
         }
     }
 
@@ -1024,7 +1170,21 @@ impl OverlayRuntime {
             exit_node: None,
             exit_server_ips: Vec::new(),
             derp_mux_factory: None,
+            path_shadow: std::sync::Mutex::new(PathShadow::new()),
         }
+    }
+
+    /// P3 PR-A — run a SYNC closure against the shadow monitor, or nothing at
+    /// all when `ROOMLER_NODE_OVERLAY_PATHMON=off`. The lock/drop pair lives
+    /// entirely inside this call, so no caller can hold the guard across an
+    /// await; the closure being `FnOnce(&mut PathShadow) -> R` (not async)
+    /// makes that structural.
+    fn shadow<R>(&self, f: impl FnOnce(&mut PathShadow) -> R) -> Option<R> {
+        let mut s = self.path_shadow.lock().unwrap_or_else(|p| p.into_inner());
+        if s.mode == path::PathMonMode::Off {
+            return None;
+        }
+        Some(f(&mut s))
     }
 
     /// Phase 1 — set the subnet routes this node advertises as a router.
@@ -1727,6 +1887,9 @@ impl OverlayRuntime {
                         }
                         cooldowns = DirectCooldowns::default();
                         relay_refresh_cooldown.clear();
+                        // P3 PR-A — same clean slate in the monitor (probe
+                        // bookkeeping survives, like `upgrade_probes` does).
+                        self.shadow(|s| s.mon.on_resume());
                         let peers_now: Vec<NetmapPeer> = current_peers.values().cloned().collect();
                         self.install_peers(
                             &mut wg, &mut by_node, &mut relay, &tun, &peers_now,
@@ -1883,6 +2046,9 @@ impl OverlayRuntime {
                                 && direct_endpoints_changed(old, p)
                             {
                                 cooldowns.reset_peer(&p.node_id);
+                                // P3 PR-A — same clean slate in the monitor
+                                // (penalties, strikes AND quality — F1).
+                                self.shadow(|s| s.mon.on_endpoint_change(&p.node_id));
                                 debug!(peer = %p.node_id, "overlay: peer's direct endpoints changed — cleared its direct-tier cooldowns");
                             }
                         }
@@ -1903,6 +2069,9 @@ impl OverlayRuntime {
                                 && direct_endpoints_changed(&old, p)
                             {
                                 cooldowns.reset_peer(&p.node_id);
+                                // P3 PR-A — same clean slate in the monitor
+                                // (penalties, strikes AND quality — F1).
+                                self.shadow(|s| s.mon.on_endpoint_change(&p.node_id));
                                 debug!(peer = %p.node_id, "overlay: peer's direct endpoints changed — cleared its direct-tier cooldowns");
                             }
                         }
@@ -1911,6 +2080,8 @@ impl OverlayRuntime {
                         warn_if_slow("install_peers(delta)", t0);
                         for node_id in removes {
                             current_peers.remove(&node_id);
+                            // P3 PR-A — drop the monitor's per-peer state.
+                            self.shadow(|s| s.mon.on_peer_removed(&node_id));
                             if let Some(e) = by_node.remove(&node_id) {
                                 wg.remove_peer(&e.pubkey).await;
                                 tun.del_peer_route(e.overlay_ip).await;
@@ -1958,6 +2129,10 @@ impl OverlayRuntime {
                     }
                     Some(OverlayEvent::ForceDerp { peer_node_id, ttl_ms }) => {
                         let t_arm = Instant::now();
+                        // P3 PR-A — annotate the pinned window in the monitor
+                        // (relay-Q resets; direct decisions unaffected — the
+                        // pin stays a server-side OVERRIDE, never scored).
+                        self.shadow(|s| s.mon.on_forced_derp(&peer_node_id, Duration::from_millis(ttl_ms), Instant::now()));
                         if let Some(r) = relay.as_mut() {
                             // P7 — a UDP-capable node skipped the startup
                             // `/derp` open; lazily invoke the retained factory
@@ -2055,6 +2230,9 @@ impl OverlayRuntime {
         current_peers: &HashMap<ObjectId, NetmapPeer>,
     ) {
         let now = Instant::now();
+        // P3 PR-A — the shadow monitor consumes the same env read the legacy
+        // escalation table does, at the same moment.
+        let mbb = super::direct::make_before_break_enabled();
         let mut dead: Vec<(ObjectId, DirectTier, DeathReason)> = Vec::new();
         for (nid, e) in by_node.iter_mut() {
             let Some((tx, rx)) = wg.peer_traffic(&e.pubkey) else {
@@ -2071,7 +2249,8 @@ impl OverlayRuntime {
             // keepalive-inclusive liveness counter (single-consumer; the sweep is
             // the only reader). Advance BEFORE building the tick inputs so a
             // freshly installed peer's first inbound already registers.
-            if wg.peer_take_rx_any(&e.pubkey) > 0 {
+            let heard = wg.peer_take_rx_any(&e.pubkey) > 0;
+            if heard {
                 e.last_rx_at = now;
             }
             // The peer exists (peer_traffic answered just above, no await in
@@ -2100,6 +2279,26 @@ impl OverlayRuntime {
                     .get(nid)
                     .is_some_and(|&until| until > now),
             });
+            // P3 PR-A — feed the sweep's evidence to the shadow monitor:
+            // heard-this-sweep (Q credit), a stored one-way strike (Q debit),
+            // and the strike-clear (a direct carrier genuinely receiving also
+            // grades any recent monitor refusal of this tier as harmful).
+            {
+                let tier = e.tier;
+                let old_bad = e.bad_sweeps;
+                self.shadow(|s| {
+                    if heard {
+                        s.mon.on_heard(nid, tier);
+                    }
+                    if v.bad_sweeps > old_bad {
+                        s.mon.on_bad_sweep(nid, tier);
+                    }
+                    if v.clear_tier_strikes {
+                        s.mon.on_healthy_rx(nid, tier);
+                        s.establishment(nid, tier, now);
+                    }
+                });
+            }
             e.bad_sweeps = v.bad_sweeps;
             if v.clear_tier_strikes {
                 // Clear the count on the carrier's OWN tier (CC1 — never
@@ -2125,6 +2324,19 @@ impl OverlayRuntime {
             let Some(e) = by_node.remove(&nid) else {
                 continue;
             };
+            // P3 PR-A — a death is path-selection evidence: the monitor books
+            // the strike + suppression penalty (≡ the cooldown insert below)
+            // and slams the tier's quality. The tripwire then proves the
+            // penalty math actually made the tier ineligible — the sweep-
+            // surface half of the shadow comparison (a full decide() compare
+            // happens at the next install_peers walk, which is where legacy
+            // itself re-selects).
+            self.shadow(|s| {
+                s.mon.on_death(&nid, tier, reason, mbb, now);
+                if tier.is_direct() {
+                    s.assert_ineligible(&nid, tier, now);
+                }
+            });
             wg.remove_peer(&e.pubkey).await;
             tun.del_peer_route(e.overlay_ip).await;
             if tier.is_direct() {
@@ -2213,6 +2425,8 @@ impl OverlayRuntime {
                 coord.request(nid, cfg).await;
             }
         }
+        // P3 PR-A — the 10-min shadow summary rides the 5 s sweep cadence.
+        self.shadow(|s| s.maybe_summary(now));
     }
 
     /// rc.131 — bind the shared direct-carrier socket + discover our LAN
@@ -2342,6 +2556,15 @@ impl OverlayRuntime {
             let lan_cooling = DirectCooldowns::cooling(&cooldowns.lan, &np.node_id, now);
             let public_cooling = DirectCooldowns::cooling(&cooldowns.public, &np.node_id, now);
             let srflx_cooling = DirectCooldowns::cooling(&cooldowns.srflx, &np.node_id, now);
+            // P3 PR-A — each tier's candidate is computed UNGATED first (the
+            // exact legacy expression minus the cooldown check — all pure
+            // endpoint/flag/hairpin reads), then the cooldown gate derives the
+            // legacy dst from it. The ungated triple is what the shadow
+            // monitor sees as AVAILABILITY: cooling is the monitor's own
+            // penalty plane, so gating its inputs by the legacy cooldowns
+            // would make the comparison circular. (PR-B extracts this walk
+            // into `resolve_direct_candidates`.)
+            //
             // A same-subnet LAN endpoint for this peer (highest-priority tier).
             // rc.204 — scan the provenance-pure `lan_endpoints` bucket (the
             // peer's join-time NIC sockets), NOT the `endpoints` union: the
@@ -2350,27 +2573,18 @@ impl OverlayRuntime {
             // IPs, so a fleet host same-/24-matched a peer's *relay allocation*
             // and "LAN"-dialed coturn forever (field-observed 2026-07-21: mars
             // dialing NEO16's relayed 94.130.141.74:* as a LAN endpoint).
-            let direct_dst = if lan_cooling {
-                None
-            } else {
-                direct_ctx.and_then(|ctx| {
-                    direct::pick_same_subnet_endpoint(&ctx.my_ips, &cfg.lan_endpoints)
-                })
-            };
+            let lan_candidate = direct_ctx
+                .and_then(|ctx| direct::pick_same_subnet_endpoint(&ctx.my_ips, &cfg.lan_endpoints));
             // Phase A — the peer's PUBLIC NIC endpoint (its join-time bucket),
             // dialable WITHOUT STUN because the peer's NIC holds a public IP.
             // Dialed over the shared `public_sock` (arbitrary egress is fine —
             // the peer has no NAT filter). Gated by the flag + its cooldown +
             // the egress socket.
-            let phase_a_dst = if public_cooling {
-                None
-            } else {
-                direct_ctx.and_then(|ctx| {
-                    (direct::public_direct_enabled() && ctx.public_sock.is_some())
-                        .then(|| direct::pick_public_endpoint(&ctx.my_ips, &cfg.lan_endpoints))
-                        .flatten()
-                })
-            };
+            let public_candidate = direct_ctx.and_then(|ctx| {
+                (direct::public_direct_enabled() && ctx.public_sock.is_some())
+                    .then(|| direct::pick_public_endpoint(&ctx.my_ips, &cfg.lan_endpoints))
+                    .flatten()
+            });
             // Phase C — the peer's srflx (its STUN-learned public NAT mapping),
             // dialed over the PUNCH socket (the one that owns OUR advertised
             // srflx) so our INITs ride our advertised mapping and open our NAT's
@@ -2379,36 +2593,67 @@ impl OverlayRuntime {
             // gathered punch socket, AND skipped when BOTH ends are symmetric
             // (a punch can't work then — save the futile 12 s attempt + the
             // strike; any cone/unknown side still attempts). Lowest direct tier.
-            let srflx_dst = if srflx_cooling {
+            let srflx_candidate = direct_ctx.and_then(|ctx| {
+                (direct::srflx_enabled()
+                    && ctx.punch.is_some()
+                    && direct::srflx_punch_worth_trying(
+                        ctx.my_nat.as_deref(),
+                        cfg.srflx_nat.as_deref(),
+                    )
+                    // P8 — same-NAT pair with a LAN candidate: the punch
+                    // is a hairpin that consumer NATs won't do; the LAN
+                    // tier is the one that works. Skip the futile 12 s
+                    // attempt on every tick.
+                    && !direct::srflx_hairpin_pointless(
+                        ctx.punch.as_ref().map(|(s, _)| s.as_str()),
+                        &cfg.srflx_endpoints,
+                        direct::pick_same_subnet_endpoint(&ctx.my_ips, &cfg.lan_endpoints)
+                            .is_some(),
+                    ))
+                .then(|| direct::pick_public_endpoint(&ctx.my_ips, &cfg.srflx_endpoints))
+                .flatten()
+            });
+            let direct_dst = if lan_cooling { None } else { lan_candidate };
+            let phase_a_dst = if public_cooling {
                 None
             } else {
-                direct_ctx.and_then(|ctx| {
-                    (direct::srflx_enabled()
-                        && ctx.punch.is_some()
-                        && direct::srflx_punch_worth_trying(
-                            ctx.my_nat.as_deref(),
-                            cfg.srflx_nat.as_deref(),
-                        )
-                        // P8 — same-NAT pair with a LAN candidate: the punch
-                        // is a hairpin that consumer NATs won't do; the LAN
-                        // tier is the one that works. Skip the futile 12 s
-                        // attempt on every tick.
-                        && !direct::srflx_hairpin_pointless(
-                            ctx.punch.as_ref().map(|(s, _)| s.as_str()),
-                            &cfg.srflx_endpoints,
-                            direct::pick_same_subnet_endpoint(&ctx.my_ips, &cfg.lan_endpoints)
-                                .is_some(),
-                        ))
-                    .then(|| direct::pick_public_endpoint(&ctx.my_ips, &cfg.srflx_endpoints))
-                    .flatten()
-                })
+                public_candidate
             };
+            let srflx_dst = if srflx_cooling { None } else { srflx_candidate };
 
             // Copy-out the installed carrier's shape (all Copy), so the by_node
             // borrow ends before any mutation below.
             let installed = by_node
                 .get(&np.node_id)
                 .map(|e| (e.is_direct, e.pubkey, e.tier, e.public_direct_dst));
+            // P3 PR-A — the shadow monitor's answer to the SAME question this
+            // walk is about to answer, computed up-front; every decision exit
+            // below records the legacy outcome against it (`record`). Legacy
+            // stays authoritative — this is instrumentation only. Inert in
+            // Direct/test carrier mode and when the monitor is off.
+            let avail = path::TierAvailability {
+                lan: lan_candidate.is_some(),
+                public: public_candidate.is_some(),
+                srflx: srflx_candidate.is_some(),
+            };
+            let incumbent = match installed {
+                Some((true, _, tier, _)) => path::Incumbent::Direct(tier),
+                Some((false, _, _, _)) => path::Incumbent::Relay,
+                None => path::Incumbent::None,
+            };
+            let monitor_action = matches!(self.mode, CarrierMode::Relay)
+                .then(|| {
+                    self.shadow(|s| {
+                        s.mon
+                            .decide(&np.node_id, incumbent, avail, make_before_break, now)
+                    })
+                })
+                .flatten();
+            let record = |surface: &'static str, legacy: path::PathAction| {
+                if let Some(m) = monitor_action {
+                    self.shadow(|s| s.compare(surface, &np.node_id, Some(legacy), Some(m), now));
+                }
+            };
             match installed {
                 Some((true, pk, tier, inst_dst)) => {
                     // D10 — a zombie srflx punch (installed but never handshook)
@@ -2423,10 +2668,19 @@ impl OverlayRuntime {
                         && let (Some(ctx), Some(fresh)) = (direct_ctx, srflx_dst)
                         && inst_dst != Some(fresh)
                     {
+                        record(
+                            "install_peers:d10",
+                            path::PathAction::Install(DirectTier::Srflx),
+                        );
                         info!(peer = %np.node_id, old = ?inst_dst, new = %fresh, "overlay: srflx changed under a pending punch — re-dialing fresh mapping");
                         wg.remove_peer(&pk).await;
                         self.install_srflx_direct(wg, by_node, tun, ctx, np.node_id, &cfg, fresh)
                             .await;
+                    } else {
+                        // P3 PR-A (F14) — the already-direct fall-through IS a
+                        // decision (keep the incumbent); record it so the
+                        // shadow compare covers this arm too.
+                        record("install_peers:keep_direct", path::PathAction::Keep);
                     }
                     continue; // already direct (LAN / public / srflx)
                 }
@@ -2470,6 +2724,7 @@ impl OverlayRuntime {
                             })
                         };
                         if let Some((sock, dst, tier)) = probe_target {
+                            record("install_peers:upgrade", path::PathAction::Probe(tier));
                             self.start_upgrade_probe(
                                 wg,
                                 upgrade_probes,
@@ -2481,6 +2736,11 @@ impl OverlayRuntime {
                                 now,
                             )
                             .await;
+                        } else {
+                            // P3 PR-A — no probe target (all tiers cooling /
+                            // unavailable, or one already in flight) = keep
+                            // the relay; record the decision.
+                            record("install_peers:upgrade", path::PathAction::Keep);
                         }
                         continue;
                     }
@@ -2489,6 +2749,10 @@ impl OverlayRuntime {
                     // path. Kept as the default until make-before-break is
                     // field-proven per-host.
                     if let (Some(ctx), Some((local_ip, dst))) = (direct_ctx, direct_dst) {
+                        record(
+                            "install_peers:upgrade",
+                            path::PathAction::Install(DirectTier::Lan),
+                        );
                         info!(peer = %np.node_id, %dst, "overlay: upgrading relay peer to direct LAN carrier");
                         wg.remove_peer(&pk).await;
                         if let Some(r) = relay.as_mut() {
@@ -2500,6 +2764,10 @@ impl OverlayRuntime {
                         self.install_direct(wg, by_node, tun, ctx, np.node_id, &cfg, local_ip, dst)
                             .await;
                     } else if let (Some(ctx), Some(dst)) = (direct_ctx, phase_a_dst) {
+                        record(
+                            "install_peers:upgrade",
+                            path::PathAction::Install(DirectTier::Public),
+                        );
                         info!(peer = %np.node_id, %dst, "overlay: upgrading relay peer to direct-to-public carrier");
                         wg.remove_peer(&pk).await;
                         if let Some(r) = relay.as_mut() {
@@ -2511,6 +2779,10 @@ impl OverlayRuntime {
                         self.install_public_direct(wg, by_node, tun, ctx, np.node_id, &cfg, dst)
                             .await;
                     } else if let (Some(ctx), Some(dst)) = (direct_ctx, srflx_dst) {
+                        record(
+                            "install_peers:upgrade",
+                            path::PathAction::Install(DirectTier::Srflx),
+                        );
                         info!(peer = %np.node_id, %dst, "overlay: upgrading relay peer to srflx hole-punch carrier");
                         wg.remove_peer(&pk).await;
                         if let Some(r) = relay.as_mut() {
@@ -2521,6 +2793,9 @@ impl OverlayRuntime {
                         relay_bq.invalidate(&np.node_id);
                         self.install_srflx_direct(wg, by_node, tun, ctx, np.node_id, &cfg, dst)
                             .await;
+                    } else {
+                        // P3 PR-A — nothing dialable: the relay stays.
+                        record("install_peers:upgrade", path::PathAction::Keep);
                     }
                     continue;
                 }
@@ -2554,6 +2829,10 @@ impl OverlayRuntime {
                 }
                 CarrierMode::Relay => {
                     if let (Some(ctx), Some((local_ip, dst))) = (direct_ctx, direct_dst) {
+                        record(
+                            "install_peers:fresh",
+                            path::PathAction::Install(DirectTier::Lan),
+                        );
                         // Same-subnet → LAN direct, skip the relay. Forget any
                         // pending relay request so a late grant can't later
                         // clobber the direct carrier.
@@ -2566,6 +2845,10 @@ impl OverlayRuntime {
                         self.install_direct(wg, by_node, tun, ctx, np.node_id, &cfg, local_ip, dst)
                             .await;
                     } else if let (Some(ctx), Some(dst)) = (direct_ctx, phase_a_dst) {
+                        record(
+                            "install_peers:fresh",
+                            path::PathAction::Install(DirectTier::Public),
+                        );
                         // Phase A — peer's NIC is public: dial it directly, skip
                         // the relay. Same forget-the-pending-relay guard.
                         if let Some(r) = relay.as_mut() {
@@ -2577,6 +2860,10 @@ impl OverlayRuntime {
                         self.install_public_direct(wg, by_node, tun, ctx, np.node_id, &cfg, dst)
                             .await;
                     } else if let (Some(ctx), Some(dst)) = (direct_ctx, srflx_dst) {
+                        record(
+                            "install_peers:fresh",
+                            path::PathAction::Install(DirectTier::Srflx),
+                        );
                         // Phase C — both NAT'd: hole-punch the peer's srflx from
                         // the punch socket, skip the relay.
                         if let Some(r) = relay.as_mut() {
@@ -2588,6 +2875,10 @@ impl OverlayRuntime {
                         self.install_srflx_direct(wg, by_node, tun, ctx, np.node_id, &cfg, dst)
                             .await;
                     } else if let Some(coord) = relay.as_mut() {
+                        // P3 PR-A — every sub-case below (mid-build, complete,
+                        // request, tracking) is the same decision: the relay
+                        // tier carries this peer.
+                        record("install_peers:fresh", path::PathAction::Relay);
                         // rc.211 — a carrier for this peer is mid-BUILD off-loop:
                         // post-`try_build` the coordinator no longer tracks it, so
                         // without this guard `!is_tracking` would re-`request` a
@@ -2631,6 +2922,9 @@ impl OverlayRuntime {
         tier: DirectTier,
         now: Instant,
     ) {
+        // P3 PR-A — mirror the probe start (per-peer serialization + the
+        // global cap + the F2 LAN attempt marker live in the monitor).
+        self.shadow(|s| s.mon.on_probe_started(&node_id, tier, now));
         wg.ensure_direct_demux(sock.clone());
         // Outbound upgrade: WE dial the peer, so initiate the handshake.
         wg.start_direct_probe(sock, cfg.public_key, cfg.overlay_ip, dst, true)
@@ -2671,6 +2965,8 @@ impl OverlayRuntime {
             return;
         }
         let now = Instant::now();
+        // P3 PR-A — same env read the legacy escalation table uses.
+        let mbb = super::direct::make_before_break_enabled();
         let mut settled: Vec<ObjectId> = Vec::new();
         for (nid, p) in upgrade_probes.iter() {
             // P2 — the promote/expire/wait decision is the pure
@@ -2685,6 +2981,21 @@ impl OverlayRuntime {
                 // drops the old relay carrier; forget its coturn allocation and
                 // retag `by_node` as the direct tier.
                 if wg.promote_direct_probe(&p.pubkey) {
+                    // P3 PR-A — the latch is the tier's proof: Q credit +
+                    // strike clear in the monitor (≡ the `*_fails.remove`
+                    // below), and any recent monitor refusal of this tier
+                    // grades as harmful. Latency lands with PR-B's
+                    // `handshake_at` timestamp — `None` deducts nothing.
+                    self.shadow(|s| {
+                        s.mon.on_probe_result(
+                            nid,
+                            p.tier,
+                            path::ProbeOutcome::Latched { latency_ms: None },
+                            mbb,
+                            now,
+                        );
+                        s.establishment(nid, p.tier, now);
+                    });
                     if let Some(r) = relay.as_mut() {
                         r.forget(nid);
                     }
@@ -2722,6 +3033,10 @@ impl OverlayRuntime {
                         peer = %nid, overlay_ip = %p.overlay_ip, tier = ?p.tier,
                         "overlay: make-before-break — direct carrier promoted (relay held throughout; zero stall)"
                     );
+                } else {
+                    // P3 PR-A — probe slot vanished under us (abnormal): free
+                    // the monitor's mirror without booking a verdict.
+                    self.shadow(|s| s.mon.on_probe_aborted(nid));
                 }
                 settled.push(*nid);
             } else if verdict == ProbeVerdict::Expire {
@@ -2730,6 +3045,16 @@ impl OverlayRuntime {
                 // mirrors `sweep_carrier_health`'s direct→relay bookkeeping so a
                 // repeatedly-failing tier still escalates to its sticky deny and
                 // stops re-probing).
+                //
+                // P3 PR-A — the expiry books the monitor's strike + penalty (≡
+                // the cooldown insert below); F1: NO quality event (the
+                // penalty already encodes the failure). Tripwire: the tier
+                // must be ineligible immediately after.
+                self.shadow(|s| {
+                    s.mon
+                        .on_probe_result(nid, p.tier, path::ProbeOutcome::Expired, mbb, now);
+                    s.assert_ineligible(nid, p.tier, now);
+                });
                 wg.drop_direct_probe(&p.pubkey).await;
                 let (count_map, cooldown_map, tier_name) = match p.tier {
                     DirectTier::Srflx => {
@@ -2777,6 +3102,11 @@ impl OverlayRuntime {
             warn!(peer = %node_id, %local_ip, "overlay: no socket bound for the matching LAN interface; skipping direct");
             return;
         };
+        // P3 PR-A — record the install (switch time + the F2 LAN marker).
+        self.shadow(|s| {
+            s.mon
+                .on_installed(&node_id, DirectTier::Lan, Instant::now())
+        });
         wg.ensure_direct_demux(sock.clone());
         wg.add_direct_peer(sock.clone(), cfg.public_key, cfg.overlay_ip, dst, true)
             .await;
@@ -2829,6 +3159,11 @@ impl OverlayRuntime {
             warn!(peer = %node_id, "overlay: public-direct requested but no egress socket; skipping");
             return;
         };
+        // P3 PR-A — record the install (switch time).
+        self.shadow(|s| {
+            s.mon
+                .on_installed(&node_id, DirectTier::Public, Instant::now())
+        });
         wg.ensure_direct_demux(sock.clone());
         wg.add_direct_peer(sock, cfg.public_key, cfg.overlay_ip, dst, true)
             .await;
@@ -2882,6 +3217,11 @@ impl OverlayRuntime {
             warn!(peer = %node_id, "overlay: srflx punch requested but no punch socket; skipping");
             return;
         };
+        // P3 PR-A — record the install (switch time).
+        self.shadow(|s| {
+            s.mon
+                .on_installed(&node_id, DirectTier::Srflx, Instant::now())
+        });
         wg.ensure_direct_demux(sock.clone());
         wg.add_direct_peer(sock, cfg.public_key, cfg.overlay_ip, dst, true)
             .await;
@@ -2977,6 +3317,25 @@ impl OverlayRuntime {
             DirectTier::Lan
         };
 
+        // P3 PR-A — the monitor's inbound decision (evidence feed + its own
+        // D9 clear + eligibility gate), against the PRE-mutation incumbent.
+        // Every legacy exit below records its outcome against it; legacy
+        // stays authoritative.
+        let incumbent = match by_node.get(&node_id) {
+            Some(e) if e.is_direct => path::Incumbent::Direct(e.tier),
+            Some(_) => path::Incumbent::Relay,
+            None => path::Incumbent::None,
+        };
+        let monitor_inbound = self.shadow(|s| {
+            s.mon
+                .inbound_init(&node_id, tier, incumbent, make_before_break, now)
+        });
+        let record_inbound = |legacy: Option<path::PathAction>| {
+            if let Some(m) = monitor_inbound {
+                self.shadow(|s| s.compare("inbound", &node_id, legacy, m, now));
+            }
+        };
+
         // Anti-thrash: honour the matching tier's cooldown — EXCEPT for a srflx
         // punch (D9). An authenticated init that traversed BOTH NATs is proof the
         // pair CAN punch right now, so it overrides the srflx cooldown (which
@@ -2992,6 +3351,7 @@ impl OverlayRuntime {
             _ => DirectCooldowns::cooling(&cooldowns.lan, &node_id, now),
         };
         if cooling {
+            record_inbound(None);
             return;
         }
 
@@ -3008,6 +3368,7 @@ impl OverlayRuntime {
             // A retransmitted init while we're already probing this src → just
             // answer it and let the in-flight probe keep converging.
             if wg.has_direct_probe(&pubkey) {
+                record_inbound(Some(path::PathAction::Keep));
                 wg.feed_direct(inb.src, inb.sock.clone(), &inb.packet).await;
                 return;
             }
@@ -3015,6 +3376,8 @@ impl OverlayRuntime {
             // (nothing installed) or one already on direct-via-another-src falls
             // through to the destructive re-point — no relay is at risk there.
             if by_node.get(&node_id).is_some_and(|e| !e.is_direct) {
+                record_inbound(Some(path::PathAction::Probe(tier)));
+                self.shadow(|s| s.mon.on_probe_started(&node_id, tier, now));
                 wg.ensure_direct_demux(inb.sock.clone());
                 // Inbound: DON'T initiate — the peer already sent the init; we
                 // answer it on the probe via `feed_direct` below.
@@ -3043,6 +3406,8 @@ impl OverlayRuntime {
         // and any pending relay request, then install direct on the arriving
         // socket keyed by the init's source. `initiate = false` — the peer
         // already initiated; we only need to respond.
+        record_inbound(Some(path::PathAction::Install(tier)));
+        self.shadow(|s| s.mon.on_installed(&node_id, tier, now));
         if let Some(old) = by_node.remove(&node_id) {
             wg.remove_peer(&old.pubkey).await;
         }
@@ -3056,6 +3421,8 @@ impl OverlayRuntime {
         // mid-session, or a direct-on-another-src re-point), discard it so it
         // can't later promote over the carrier we install here.
         if upgrade_probes.remove(&node_id).is_some() {
+            // P3 PR-A — free the monitor's probe mirror without a verdict.
+            self.shadow(|s| s.mon.on_probe_aborted(&node_id));
             wg.drop_direct_probe(&pubkey).await;
         }
         wg.ensure_direct_demux(inb.sock.clone());
@@ -3101,6 +3468,15 @@ impl OverlayRuntime {
         link: ReadyLink,
         relay_bq: &mut RelayBuildQueue,
     ) {
+        // P3 PR-A — a relay install is a switch too (production mode only:
+        // the Direct/test carrier mode funnels loopback links through here,
+        // which aren't relay-tier decisions).
+        if matches!(self.mode, CarrierMode::Relay) {
+            self.shadow(|s| {
+                s.mon
+                    .on_installed(&link.node_id, DirectTier::Relay, Instant::now())
+            });
+        }
         // Handshake direction. RELAY carriers use a deterministic single
         // initiator (the lexicographically smaller pubkey dials; both ends
         // compute it identically) — fine because the relay forwards both ways.
@@ -3663,6 +4039,21 @@ mod tests {
         // outlast the plain retry cooldown so escalation still means something.
         assert!(SRFLX_DENY_COOLDOWN <= DIRECT_DENY_COOLDOWN);
         assert!(DIRECT_DENY_COOLDOWN > DIRECT_COOLDOWN * 5);
+    }
+
+    /// P3 PR-A — the shadow monitor's suppression table must mirror the
+    /// legacy cooldown constants EXACTLY until PR-E deletes the legacy side;
+    /// a drift here would silently skew the shadow comparison the 48 h soak
+    /// gate reads. (The monitor's numbers are pinned by its own parity-curve
+    /// tests too — this cross-check catches someone editing only one side.)
+    #[test]
+    fn pathmon_constants_mirror_legacy_cooldowns() {
+        assert_eq!(path::H_ORDINARY, DIRECT_COOLDOWN);
+        assert_eq!(path::H_ESCALATED, DIRECT_DENY_COOLDOWN);
+        assert_eq!(path::H_ESCALATED, SRFLX_DENY_COOLDOWN);
+        assert_eq!(path::MAX_FAILURES_LAN_PUBLIC, DIRECT_MAX_FAILURES);
+        assert_eq!(path::MAX_FAILURES_SRFLX, SRFLX_MAX_FAILURES);
+        assert_eq!(path::LAN_PROBE_SPACING, DIRECT_COOLDOWN);
     }
 
     /// P8 — with MBB on (the default), the LAN tier NEVER escalates to a
