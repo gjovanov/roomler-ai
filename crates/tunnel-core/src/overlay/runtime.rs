@@ -5,12 +5,15 @@
 //! WireGuard peer per entry), brings up the TUN, and pumps packets
 //! between the TUN and the [`WgDevice`](super::wg::WgDevice).
 //!
-//! The runtime **owns** the `WgDevice` and runs a single `select!` loop:
-//! a TUN read (→ `send_ip_packet`) and a netmap event (→ `add_peer` /
-//! `remove_peer`) never run concurrently, so the `&`/`&mut` borrows don't
-//! collide and no interior mutability is needed. Only the inbound writer
-//! (decrypted `tun_rx` → TUN) is a separate task — it never touches the
-//! device.
+//! The runtime **owns** the `WgDevice` and runs a single `select!` loop of
+//! pure CONTROL work (netmap installs, carrier health sweeps, relay
+//! coordination, route guard). The DATA PLANE is fully off-loop (P1/S6):
+//! outbound rides the persistent TUN reader task → mpsc → the dedicated
+//! outbound pump (a [`WgSender`](super::wg::WgSender) clone — the shared
+//! send half of the device, single-writer/multi-reader); inbound rides the
+//! per-peer recv tasks / shared demux → mpsc → the inbound writer task.
+//! No control handler can therefore ever delay a packet; `warn_if_slow`
+//! remains as the tripwire against re-coupling.
 //!
 //! Carrier construction (direct UDP vs coturn relay) is delegated to a
 //! [`LinkFactory`] so this orchestration is testable with loopback
@@ -444,26 +447,41 @@ fn resumed_from_suspend(mono_elapsed: Duration, wall_elapsed: Duration) -> bool 
 /// war. Cheap (a couple of route commands per peer) and 2 s bounds the capture
 /// window to a couple of dropped pings.
 const ROUTE_GUARD_TICK: Duration = Duration::from_secs(2);
-/// rc.211 — loop-stall watchdog threshold. While ANY steady-state select! arm's
-/// handler awaits, the outbound TUN-packet arm (rc.213: an mpsc fed by the
-/// dedicated reader task) is NOT re-polled, so outbound packets queue for the
-/// handler's full duration (the field-observed
-/// 1–2 s RTT plateaus on a churny Windows host). Every arm and the expensive
-/// sub-calls inside the fat ones are timed via [`warn_if_slow`]; anything over
-/// this threshold is named in the log. Permanent telemetry: two `Instant` reads
-/// per arm, and the only way a head-of-line regression gets caught in the field.
+/// P1 (S6) — outbound TUN→pump queue depth. Sized for a full burst of
+/// in-flight packets between the reader and the pump; the reader-side
+/// backpressure warn fires if the pump ever lets it fill.
+const OUTBOUND_QUEUE_PKTS: usize = 512;
+
+/// rc.211 (re-scoped by P1/S6) — slow-handler watchdog threshold. Since P1 the
+/// data plane runs entirely off-loop (reader → outbound pump → carriers), so a
+/// slow select! arm can no longer delay packets — a trip here now means
+/// CONTROL-PLANE convergence is late (carrier repair, netmap install,
+/// inbound-init answering — the last still latency-relevant at the ~5 s WG
+/// init retransmit). The same threshold guards the pump's per-packet send
+/// (`pump:send_ip_packet`) and the reader-side backpressure twin, where a trip
+/// IS a data-plane incident (a wedged carrier send). Permanent telemetry: this
+/// is the tripwire that catches anyone re-coupling work onto the pump or
+/// fattening a control arm.
 const LOOP_STALL_WARN_MS: u128 = 250;
 
-/// rc.211 — log a named steady-loop stall (see [`LOOP_STALL_WARN_MS`]).
+/// rc.211 — log a named slow handler / slow send (see [`LOOP_STALL_WARN_MS`]).
 fn warn_if_slow(stage: &'static str, t0: Instant) {
     let ms = t0.elapsed().as_millis();
     if ms > LOOP_STALL_WARN_MS {
         warn!(
             stage,
-            ms, "overlay: steady-loop handler stalled the data plane (outbound queued this long)"
+            ms,
+            "overlay: handler ran long (control-plane latency; data plane unaffected unless stage is pump:*)"
         );
     }
 }
+
+/// P1 (S6) test hook — when non-zero, the Netmap arm sleeps this long at its
+/// top (async — the arm is genuinely busy on the loop for the duration).
+/// Lets `control_stall_does_not_delay_outbound` prove a fat control arm can
+/// no longer delay outbound packets. Zero (inert) outside tests.
+#[cfg(test)]
+static TEST_NETMAP_STALL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// rc.211 — a finished OFF-LOOP QUIC-over-TURN carrier build (see
 /// [`RelayBuildQueue`]). `quic: None` = the QUIC handshake failed/timed out →
@@ -1665,27 +1683,27 @@ impl OverlayRuntime {
         // loop consumes via an mpsc arm, whose `recv()` is cancel-safe by
         // contract. Linux never suffered (level-triggered epoll on the tun fd,
         // no blocking-pool waiters) and shares the structure harmlessly.
-        let (tun_pkt_tx, mut tun_pkt_rx) = mpsc::channel::<Vec<u8>>(512);
+        let (tun_pkt_tx, tun_pkt_rx) = mpsc::channel::<Vec<u8>>(OUTBOUND_QUEUE_PKTS);
         let reader_tun = tun.clone();
         let tun_reader = tokio::spawn(async move {
             loop {
                 match reader_tun.read_packet().await {
                     Ok(pkt) => {
                         // Reader-side twin of `warn_if_slow`: a slow send here
-                        // means the channel is FULL — the steady loop stopped
-                        // consuming for long enough to queue 512 packets. The
-                        // handler watchdog times executing handlers; this catches
-                        // the complementary failure (loop wedged/starved between
-                        // polls), which rc.211's telemetry was blind to.
+                        // means the channel is FULL — since P1 the consumer is
+                        // the dedicated outbound PUMP, so a full queue indicts
+                        // the send path itself (a wedged carrier send), not
+                        // the control loop. Complements the pump's per-packet
+                        // timer, which can't see future-PENDING time.
                         let t0 = Instant::now();
                         if tun_pkt_tx.send(pkt).await.is_err() {
-                            break; // runtime loop gone
+                            break; // outbound pump gone
                         }
                         let ms = t0.elapsed().as_millis();
                         if ms > LOOP_STALL_WARN_MS {
                             warn!(
                                 ms,
-                                "overlay: steady loop backpressured the TUN reader (outbound queue full)"
+                                "overlay: outbound pump backpressured the TUN reader (send queue full — carrier send path wedged?)"
                             );
                         }
                     }
@@ -1697,16 +1715,39 @@ impl OverlayRuntime {
             }
         });
 
-        // Phase 2 — steady state.
+        // P1 (S6) — the dedicated OUTBOUND PUMP: TUN packets → encapsulate →
+        // carrier, in its own task via the shared [`WgSender`], so NO control
+        // work on the select! loop can ever delay an outbound packet again
+        // (the structural close of the rc.206→rc.218 inline-await arc; the
+        // loop below is pure control plane). Pump death is FATAL, never
+        // respawned: it only exits when the TUN reader died (`recv()` →
+        // `None` — the same condition the pre-P1 loop arm broke on) or on a
+        // panic in the send path (respawning would just re-panic on the next
+        // packet); either way the loop breaks and the agent's WS lifecycle
+        // rebuilds the whole runtime.
+        let sender = wg.sender();
+        let mut outbound_pump = tokio::spawn(async move {
+            let mut rx = tun_pkt_rx;
+            while let Some(pkt) = rx.recv().await {
+                let t0 = Instant::now();
+                let _ = sender.send_ip_packet(&pkt).await;
+                // >250 ms here is now PURE send-path latency (a wedged
+                // carrier send), un-polluted by loop scheduling.
+                warn_if_slow("pump:send_ip_packet", t0);
+            }
+            debug!("overlay: TUN reader ended; outbound pump exiting");
+        });
+
+        // Phase 2 — steady state. Control plane ONLY (P1): the data plane
+        // runs reader → pump → carriers / demux → inbound writer, entirely
+        // off-loop.
         loop {
             tokio::select! {
-                read = tun_pkt_rx.recv() => match read {
-                    Some(pkt) => {
-                        let t0 = Instant::now();
-                        let _ = wg.send_ip_packet(&pkt).await;
-                        warn_if_slow("send_ip_packet", t0);
-                    }
-                    None => { debug!("overlay: TUN reader ended; runtime exiting"); break; }
+                // P1 (S6) — the pump ending is the session-fatal signal the
+                // TUN-reader `None` used to be.
+                _ = &mut outbound_pump => {
+                    debug!("overlay: outbound pump ended; runtime exiting");
+                    break;
                 },
                 // rc.211 — commit a finished OFF-LOOP relay carrier build (the
                 // spawned QUIC-over-TURN rendezvous — see `RelayBuildQueue`).
@@ -1950,6 +1991,13 @@ impl OverlayRuntime {
                     // removals; a full diff/prune is a later refinement).
                     Some(OverlayEvent::Netmap { peers, .. }) => {
                         let t_arm = Instant::now();
+                        #[cfg(test)]
+                        {
+                            let stall = TEST_NETMAP_STALL_MS.load(std::sync::atomic::Ordering::Relaxed);
+                            if stall > 0 {
+                                tokio::time::sleep(Duration::from_millis(stall)).await;
+                            }
+                        }
                         let old_peers = std::mem::take(&mut current_peers);
                         current_peers = peers.iter().map(|p| (p.node_id, p.clone())).collect();
                         // rc.225 — a peer whose direct endpoints changed gets a
@@ -2098,6 +2146,9 @@ impl OverlayRuntime {
         // in-flight `read_packet()` future, and the TUN `Arc` it holds drops
         // with the task, so session teardown isn't kept alive by the reader.
         tun_reader.abort();
+        // P1 (S6) — and the outbound pump (it would end on its own once the
+        // reader's channel closes, but an abort makes teardown prompt).
+        outbound_pump.abort();
         // Phase C — stop the srflx keepalive task (if any) on runtime exit.
         if let Some(h) = srflx_keepalive {
             h.abort();
@@ -5169,6 +5220,209 @@ mod tests {
             }
         }
         panic!("packet did not traverse the runtime in time");
+    }
+
+    /// P1 (S6) — the permanent RE-COUPLING TRIPWIRE. A fat control arm (a
+    /// 2 s Netmap handler, via [`TEST_NETMAP_STALL_MS`]) must not delay
+    /// outbound packets: the data plane runs on the dedicated pump, off the
+    /// select! loop. Pre-P1 this fails by construction — the outbound arm
+    /// shared the loop, so every packet injected during the stall queued for
+    /// its full duration (one >2 s inter-arrival gap at the receiver);
+    /// post-P1 the MAX GAP stays bounded. (A delivered-count assertion can't
+    /// discriminate: the mpsc buffers the burst either way — the gap is the
+    /// signal.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn control_stall_does_not_delay_outbound() {
+        let a = WgKeypair::generate();
+        let b = WgKeypair::generate();
+
+        let sock_a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sock_b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr_a = sock_a.local_addr().unwrap();
+        let addr_b = sock_b.local_addr().unwrap();
+
+        let (out_a, mut out_a_rx) = mpsc::channel::<ClientMsg>(16);
+        let (out_b, mut out_b_rx) = mpsc::channel::<ClientMsg>(16);
+        let (evt_a, evt_a_rx) = mpsc::channel::<OverlayEvent>(16);
+        let (evt_b, evt_b_rx) = mpsc::channel::<OverlayEvent>(16);
+
+        let (mock_a, inject_a, _del_a) = MockTun::new();
+        let (mock_b, _inj_b, mut del_b) = MockTun::new();
+        let tf_a: TunFactory = {
+            let m = mock_a.clone();
+            Box::new(move |_, _, _| Ok(m.clone() as Arc<dyn TunIo>))
+        };
+        let tf_b: TunFactory = {
+            let m = mock_b.clone();
+            Box::new(move |_, _, _| Ok(m.clone() as Arc<dyn TunIo>))
+        };
+
+        let rt_a = OverlayRuntime::new(
+            a.clone(),
+            out_a,
+            Arc::new(LoopbackLinks {
+                sock: sock_a,
+                dst: addr_b,
+            }),
+            tf_a,
+            1280,
+        );
+        let rt_b = OverlayRuntime::new(
+            b.clone(),
+            out_b,
+            Arc::new(LoopbackLinks {
+                sock: sock_b,
+                dst: addr_a,
+            }),
+            tf_b,
+            1280,
+        );
+        tokio::spawn(rt_a.run(evt_a_rx, vec![]));
+        tokio::spawn(rt_b.run(evt_b_rx, vec![]));
+        assert!(matches!(
+            out_a_rx.recv().await,
+            Some(ClientMsg::OverlayJoin { .. })
+        ));
+        assert!(matches!(
+            out_b_rx.recv().await,
+            Some(ClientMsg::OverlayJoin { .. })
+        ));
+
+        let netmap_a = OverlayEvent::Netmap {
+            self_ip: "100.64.0.1".into(),
+            network: net(),
+            peers: vec![peer(&b, "100.64.0.2")],
+        };
+        evt_a.send(netmap_a).await.unwrap();
+        evt_b
+            .send(OverlayEvent::Netmap {
+                self_ip: "100.64.0.2".into(),
+                network: net(),
+                peers: vec![peer(&a, "100.64.0.1")],
+            })
+            .await
+            .unwrap();
+
+        // Establish the session (first round-trip), then drain any handshake-
+        // era straggler deliveries so the measurement starts clean.
+        let pkt = synthetic_ipv4(IP_A, IP_B, b"stall-probe");
+        let mut established = false;
+        for _ in 0..100 {
+            let _ = inject_a.send(pkt.clone());
+            if tokio::time::timeout(Duration::from_millis(150), del_b.recv())
+                .await
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                established = true;
+                break;
+            }
+        }
+        assert!(established, "session did not establish in time");
+        while tokio::time::timeout(Duration::from_millis(300), del_b.recv())
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+        {}
+
+        // Arm the 2 s stall and hand A a DUPLICATE netmap (same peer ⇒ the
+        // already-installed carrier is kept — the arm just sits busy).
+        TEST_NETMAP_STALL_MS.store(2000, std::sync::atomic::Ordering::Relaxed);
+        evt_a
+            .send(OverlayEvent::Netmap {
+                self_ip: "100.64.0.1".into(),
+                network: net(),
+                peers: vec![peer(&b, "100.64.0.2")],
+            })
+            .await
+            .unwrap();
+        // Let the loop pick the netmap arm up before measuring.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Collect delivery instants at B while injecting 40 packets at 50 ms
+        // across the stall window.
+        let collector = tokio::spawn(async move {
+            let mut arrivals: Vec<Instant> = Vec::new();
+            while arrivals.len() < 40 {
+                match tokio::time::timeout(Duration::from_secs(1), del_b.recv()).await {
+                    Ok(Some(_)) => arrivals.push(Instant::now()),
+                    _ => break,
+                }
+            }
+            arrivals
+        });
+        for _ in 0..40 {
+            let _ = inject_a.send(pkt.clone());
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let arrivals = collector.await.unwrap();
+        TEST_NETMAP_STALL_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+
+        assert!(
+            arrivals.len() >= 35,
+            "expected ≥35/40 deliveries over an established loopback session, got {}",
+            arrivals.len()
+        );
+        let max_gap = arrivals
+            .windows(2)
+            .map(|w| w[1].duration_since(w[0]))
+            .max()
+            .unwrap_or_default();
+        assert!(
+            max_gap < Duration::from_millis(500),
+            "outbound delayed by a control-arm stall: max inter-arrival gap {max_gap:?} \
+             (pre-P1 the 2 s Netmap stall produces a >2 s gap here)"
+        );
+    }
+
+    /// P1 (S6) — pump death is session-fatal, never respawned: when the TUN
+    /// dies (inject sender dropped ⇒ `read_packet` errors ⇒ reader exits ⇒
+    /// the pump's channel closes ⇒ the pump ends), the runtime loop must
+    /// exit — same disposition the pre-P1 outbound arm had on reader death.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn runtime_exits_when_outbound_pump_dies() {
+        let a = WgKeypair::generate();
+        let sock_a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let dst = sock_a.local_addr().unwrap();
+
+        let (out_a, mut out_a_rx) = mpsc::channel::<ClientMsg>(16);
+        let (evt_a, evt_a_rx) = mpsc::channel::<OverlayEvent>(16);
+        let (mock_a, inject_a, _del_a) = MockTun::new();
+        let tf_a: TunFactory = {
+            let m = mock_a.clone();
+            Box::new(move |_, _, _| Ok(m.clone() as Arc<dyn TunIo>))
+        };
+        let rt_a = OverlayRuntime::new(
+            a.clone(),
+            out_a,
+            Arc::new(LoopbackLinks { sock: sock_a, dst }),
+            tf_a,
+            1280,
+        );
+        let run = tokio::spawn(rt_a.run(evt_a_rx, vec![]));
+        assert!(matches!(
+            out_a_rx.recv().await,
+            Some(ClientMsg::OverlayJoin { .. })
+        ));
+        // Reach steady state (TUN up, reader + pump spawned).
+        evt_a
+            .send(OverlayEvent::Netmap {
+                self_ip: "100.64.0.1".into(),
+                network: net(),
+                peers: vec![],
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Kill the TUN: reader errors out → pump ends → loop breaks.
+        drop(inject_a);
+        tokio::time::timeout(Duration::from_secs(10), run)
+            .await
+            .expect("runtime must exit once the outbound pump dies")
+            .unwrap();
     }
 
     // ---- P5 exit-node pure helpers ----
