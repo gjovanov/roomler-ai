@@ -149,6 +149,61 @@ fn direct_endpoints_changed(old: &NetmapPeer, new: &NetmapPeer) -> bool {
     old.lan_endpoints != new.lan_endpoints || old.srflx_endpoints != new.srflx_endpoints
 }
 
+/// P3 PR-B — one peer's direct-tier candidates (extracted verbatim from
+/// `install_peers`, where PR-A computed them inline). UNGATED by the legacy
+/// cooldowns: the caller applies those on top, and the ungated triple is the
+/// PathMonitor's AVAILABILITY input. Endpoint / feature-flag / hairpin checks
+/// are eligibility, never score. Pure reads.
+struct DirectCandidates {
+    /// Same-subnet LAN endpoint (highest-priority tier): (our matching
+    /// interface IP, the peer's dst). rc.204 — scans the provenance-pure
+    /// `lan_endpoints` bucket (the peer's join-time NIC sockets), NOT the
+    /// `endpoints` union: the union also carries the peer's trickled
+    /// coturn-RELAYED addresses, and on this fleet the coturn workers ride
+    /// the hosts' own public IPs, so a fleet host same-/24-matched a peer's
+    /// *relay allocation* and "LAN"-dialed coturn forever (field-observed
+    /// 2026-07-21: mars dialing NEO16's relayed 94.130.141.74:* as a LAN
+    /// endpoint).
+    lan: Option<(Ipv4Addr, std::net::SocketAddr)>,
+    /// Phase A — the peer's PUBLIC NIC endpoint (its join-time bucket),
+    /// dialable WITHOUT STUN because the peer's NIC holds a public IP.
+    /// Dialed over the shared `public_sock` (arbitrary egress is fine — the
+    /// peer has no NAT filter). Gated by the feature flag + the egress
+    /// socket's existence.
+    public: Option<std::net::SocketAddr>,
+    /// Phase C — the peer's srflx (its STUN-learned public NAT mapping),
+    /// dialed over the PUNCH socket (the one that owns OUR advertised srflx)
+    /// so our INITs ride our advertised mapping and open our NAT's filter
+    /// toward the peer — the mutual hole-punch. Skipped when BOTH ends are
+    /// symmetric (a punch can't work — save the futile 12 s attempt + the
+    /// strike) and for the P8 same-NAT hairpin with a LAN candidate present.
+    /// Lowest direct tier.
+    srflx: Option<std::net::SocketAddr>,
+}
+
+fn resolve_direct_candidates(direct_ctx: Option<&DirectCtx>, cfg: &PeerConfig) -> DirectCandidates {
+    let lan = direct_ctx
+        .and_then(|ctx| direct::pick_same_subnet_endpoint(&ctx.my_ips, &cfg.lan_endpoints));
+    let public = direct_ctx.and_then(|ctx| {
+        (direct::public_direct_enabled() && ctx.public_sock.is_some())
+            .then(|| direct::pick_public_endpoint(&ctx.my_ips, &cfg.lan_endpoints))
+            .flatten()
+    });
+    let srflx = direct_ctx.and_then(|ctx| {
+        (direct::srflx_enabled()
+            && ctx.punch.is_some()
+            && direct::srflx_punch_worth_trying(ctx.my_nat.as_deref(), cfg.srflx_nat.as_deref())
+            && !direct::srflx_hairpin_pointless(
+                ctx.punch.as_ref().map(|(s, _)| s.as_str()),
+                &cfg.srflx_endpoints,
+                direct::pick_same_subnet_endpoint(&ctx.my_ips, &cfg.lan_endpoints).is_some(),
+            ))
+        .then(|| direct::pick_public_endpoint(&ctx.my_ips, &cfg.srflx_endpoints))
+        .flatten()
+    });
+    DirectCandidates { lan, public, srflx }
+}
+
 // P2 — `DirectTier`, the lifecycle deadlines/constants, and the carrier/probe
 // transition fns live in the sibling `lifecycle` module (one place for every
 // rule that can kill a carrier). Glob-imported so this module — and its test
@@ -208,17 +263,23 @@ impl PathShadow {
     }
 
     /// Record one legacy-vs-monitor comparison. `None` = "refuse / no
-    /// decision" (the inbound gate's shape). Divergences are counted, fed to
-    /// the harmful ledger, and warn-logged at most once per minute per peer.
+    /// decision" (the inbound gate's shape). Divergences are counted (per
+    /// trigger class too — P3 PR-B: a reupgrade-tick divergence is a
+    /// SCHEDULING disagreement, a netmap/delta one a selection disagreement,
+    /// so the soak reads them separately), fed to the harmful ledger, and
+    /// warn-logged at most once per minute per peer.
     fn compare(
         &mut self,
         surface: &'static str,
+        trigger: &'static str,
         peer: &ObjectId,
         legacy: Option<path::PathAction>,
         monitor: Option<path::PathAction>,
         now: Instant,
     ) {
         self.stats.decisions += 1;
+        let class = self.stats.by_class.entry(trigger).or_insert((0, 0));
+        class.0 += 1;
         let diverged = match (legacy, monitor) {
             (Some(l), Some(m)) => path::classify(l, m) == path::DivergenceClass::Diverged,
             (l, m) => l != m,
@@ -227,6 +288,7 @@ impl PathShadow {
             return;
         }
         self.stats.diverged += 1;
+        class.1 += 1;
         // Harmful ledger: legacy commits to a tier the monitor currently
         // holds ineligible (whatever the monitor proposed instead).
         if let Some(t) = legacy.and_then(Self::action_tier)
@@ -288,6 +350,7 @@ impl PathShadow {
             diverged = self.stats.diverged,
             harmful = self.stats.harmful,
             post_death_eligible = self.stats.post_death_eligible,
+            classes = %self.stats.classes_line(),
             "overlay pathmon[shadow]: 10-min summary (soak gate: steady <0.1% diverged, harmful = 0)"
         );
     }
@@ -1651,6 +1714,7 @@ impl OverlayRuntime {
             &cooldowns,
             &mut upgrade_probes,
             &mut relay_bq,
+            "initial",
         )
         .await;
         // P5 exit-node — default-route capture state, reconciled after every
@@ -1894,6 +1958,7 @@ impl OverlayRuntime {
                         self.install_peers(
                             &mut wg, &mut by_node, &mut relay, &tun, &peers_now,
                             direct_ctx.as_ref(), &cooldowns, &mut upgrade_probes, &mut relay_bq,
+                            "resume",
                         ).await;
                         self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
                         self.publish_view(&self_ip, &by_node, &current_peers, &upgrade_probes, exit_node_status(self.exit_node.as_deref(), &exit_state));
@@ -1929,7 +1994,7 @@ impl OverlayRuntime {
                         self.install_peers(
                             &mut wg, &mut by_node, &mut relay, &tun,
                             &peers, direct_ctx.as_ref(), &cooldowns, &mut upgrade_probes,
-                            &mut relay_bq,
+                            &mut relay_bq, "reupgrade",
                         ).await;
                         warn_if_slow("install_peers(reupgrade)", t0);
                     }
@@ -2054,7 +2119,7 @@ impl OverlayRuntime {
                         }
                         if let Some(names) = &dns_names { sync_name_map(names, &current_peers).await; }
                         let t0 = Instant::now();
-                        self.install_peers(&mut wg, &mut by_node, &mut relay, &tun, &peers, direct_ctx.as_ref(), &cooldowns, &mut upgrade_probes, &mut relay_bq).await;
+                        self.install_peers(&mut wg, &mut by_node, &mut relay, &tun, &peers, direct_ctx.as_ref(), &cooldowns, &mut upgrade_probes, &mut relay_bq, "netmap").await;
                         warn_if_slow("install_peers(netmap)", t0);
                         self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
                         self.publish_view(&self_ip, &by_node, &current_peers, &upgrade_probes, exit_node_status(self.exit_node.as_deref(), &exit_state));
@@ -2076,7 +2141,7 @@ impl OverlayRuntime {
                             }
                         }
                         let t0 = Instant::now();
-                        self.install_peers(&mut wg, &mut by_node, &mut relay, &tun, &upserts, direct_ctx.as_ref(), &cooldowns, &mut upgrade_probes, &mut relay_bq).await;
+                        self.install_peers(&mut wg, &mut by_node, &mut relay, &tun, &upserts, direct_ctx.as_ref(), &cooldowns, &mut upgrade_probes, &mut relay_bq, "delta").await;
                         warn_if_slow("install_peers(delta)", t0);
                         for node_id in removes {
                             current_peers.remove(&node_id);
@@ -2539,6 +2604,7 @@ impl OverlayRuntime {
         cooldowns: &DirectCooldowns,
         upgrade_probes: &mut HashMap<ObjectId, UpgradeProbe>,
         relay_bq: &mut RelayBuildQueue,
+        trigger: &'static str,
     ) {
         let now = Instant::now();
         // rc.208 — make-before-break: probe a relay→direct upgrade instead of
@@ -2556,70 +2622,16 @@ impl OverlayRuntime {
             let lan_cooling = DirectCooldowns::cooling(&cooldowns.lan, &np.node_id, now);
             let public_cooling = DirectCooldowns::cooling(&cooldowns.public, &np.node_id, now);
             let srflx_cooling = DirectCooldowns::cooling(&cooldowns.srflx, &np.node_id, now);
-            // P3 PR-A — each tier's candidate is computed UNGATED first (the
-            // exact legacy expression minus the cooldown check — all pure
-            // endpoint/flag/hairpin reads), then the cooldown gate derives the
-            // legacy dst from it. The ungated triple is what the shadow
-            // monitor sees as AVAILABILITY: cooling is the monitor's own
-            // penalty plane, so gating its inputs by the legacy cooldowns
-            // would make the comparison circular. (PR-B extracts this walk
-            // into `resolve_direct_candidates`.)
-            //
-            // A same-subnet LAN endpoint for this peer (highest-priority tier).
-            // rc.204 — scan the provenance-pure `lan_endpoints` bucket (the
-            // peer's join-time NIC sockets), NOT the `endpoints` union: the
-            // union also carries the peer's trickled coturn-RELAYED addresses,
-            // and on this fleet the coturn workers ride the hosts' own public
-            // IPs, so a fleet host same-/24-matched a peer's *relay allocation*
-            // and "LAN"-dialed coturn forever (field-observed 2026-07-21: mars
-            // dialing NEO16's relayed 94.130.141.74:* as a LAN endpoint).
-            let lan_candidate = direct_ctx
-                .and_then(|ctx| direct::pick_same_subnet_endpoint(&ctx.my_ips, &cfg.lan_endpoints));
-            // Phase A — the peer's PUBLIC NIC endpoint (its join-time bucket),
-            // dialable WITHOUT STUN because the peer's NIC holds a public IP.
-            // Dialed over the shared `public_sock` (arbitrary egress is fine —
-            // the peer has no NAT filter). Gated by the flag + its cooldown +
-            // the egress socket.
-            let public_candidate = direct_ctx.and_then(|ctx| {
-                (direct::public_direct_enabled() && ctx.public_sock.is_some())
-                    .then(|| direct::pick_public_endpoint(&ctx.my_ips, &cfg.lan_endpoints))
-                    .flatten()
-            });
-            // Phase C — the peer's srflx (its STUN-learned public NAT mapping),
-            // dialed over the PUNCH socket (the one that owns OUR advertised
-            // srflx) so our INITs ride our advertised mapping and open our NAT's
-            // filter toward the peer — the mutual hole-punch. Distinct socket
-            // and cooldown from Phase A. Gated by the flag + its cooldown + a
-            // gathered punch socket, AND skipped when BOTH ends are symmetric
-            // (a punch can't work then — save the futile 12 s attempt + the
-            // strike; any cone/unknown side still attempts). Lowest direct tier.
-            let srflx_candidate = direct_ctx.and_then(|ctx| {
-                (direct::srflx_enabled()
-                    && ctx.punch.is_some()
-                    && direct::srflx_punch_worth_trying(
-                        ctx.my_nat.as_deref(),
-                        cfg.srflx_nat.as_deref(),
-                    )
-                    // P8 — same-NAT pair with a LAN candidate: the punch
-                    // is a hairpin that consumer NATs won't do; the LAN
-                    // tier is the one that works. Skip the futile 12 s
-                    // attempt on every tick.
-                    && !direct::srflx_hairpin_pointless(
-                        ctx.punch.as_ref().map(|(s, _)| s.as_str()),
-                        &cfg.srflx_endpoints,
-                        direct::pick_same_subnet_endpoint(&ctx.my_ips, &cfg.lan_endpoints)
-                            .is_some(),
-                    ))
-                .then(|| direct::pick_public_endpoint(&ctx.my_ips, &cfg.srflx_endpoints))
-                .flatten()
-            });
-            let direct_dst = if lan_cooling { None } else { lan_candidate };
-            let phase_a_dst = if public_cooling {
-                None
-            } else {
-                public_candidate
-            };
-            let srflx_dst = if srflx_cooling { None } else { srflx_candidate };
+            // P3 PR-B — the ungated candidate walk lives in
+            // `resolve_direct_candidates`; the legacy cooldown gates apply on
+            // top here, and the ungated triple is the shadow monitor's
+            // AVAILABILITY input (cooling is the monitor's own penalty plane,
+            // so gating its inputs by the legacy cooldowns would make the
+            // comparison circular).
+            let cands = resolve_direct_candidates(direct_ctx, &cfg);
+            let direct_dst = if lan_cooling { None } else { cands.lan };
+            let phase_a_dst = if public_cooling { None } else { cands.public };
+            let srflx_dst = if srflx_cooling { None } else { cands.srflx };
 
             // Copy-out the installed carrier's shape (all Copy), so the by_node
             // borrow ends before any mutation below.
@@ -2632,9 +2644,9 @@ impl OverlayRuntime {
             // stays authoritative — this is instrumentation only. Inert in
             // Direct/test carrier mode and when the monitor is off.
             let avail = path::TierAvailability {
-                lan: lan_candidate.is_some(),
-                public: public_candidate.is_some(),
-                srflx: srflx_candidate.is_some(),
+                lan: cands.lan.is_some(),
+                public: cands.public.is_some(),
+                srflx: cands.srflx.is_some(),
             };
             let incumbent = match installed {
                 Some((true, _, tier, _)) => path::Incumbent::Direct(tier),
@@ -2651,7 +2663,9 @@ impl OverlayRuntime {
                 .flatten();
             let record = |surface: &'static str, legacy: path::PathAction| {
                 if let Some(m) = monitor_action {
-                    self.shadow(|s| s.compare(surface, &np.node_id, Some(legacy), Some(m), now));
+                    self.shadow(|s| {
+                        s.compare(surface, trigger, &np.node_id, Some(legacy), Some(m), now)
+                    });
                 }
             };
             match installed {
@@ -2977,6 +2991,12 @@ impl OverlayRuntime {
                 p.tier,
             );
             if verdict == ProbeVerdict::Promote {
+                // P3 PR-B — read the probe's REAL latch latency (recv-path
+                // `handshake_at` stamp minus the probe start) BEFORE the
+                // promote moves the probe out of the probes map.
+                let latency_ms = wg
+                    .probe_handshake_latency_ms(&p.pubkey, p.since)
+                    .map(|ms| ms as f64);
                 // Bidirectional direct proven → cut over. `promote_direct_probe`
                 // drops the old relay carrier; forget its coturn allocation and
                 // retag `by_node` as the direct tier.
@@ -2984,13 +3004,12 @@ impl OverlayRuntime {
                     // P3 PR-A — the latch is the tier's proof: Q credit +
                     // strike clear in the monitor (≡ the `*_fails.remove`
                     // below), and any recent monitor refusal of this tier
-                    // grades as harmful. Latency lands with PR-B's
-                    // `handshake_at` timestamp — `None` deducts nothing.
+                    // grades as harmful.
                     self.shadow(|s| {
                         s.mon.on_probe_result(
                             nid,
                             p.tier,
-                            path::ProbeOutcome::Latched { latency_ms: None },
+                            path::ProbeOutcome::Latched { latency_ms },
                             mbb,
                             now,
                         );
@@ -3332,7 +3351,7 @@ impl OverlayRuntime {
         });
         let record_inbound = |legacy: Option<path::PathAction>| {
             if let Some(m) = monitor_inbound {
-                self.shadow(|s| s.compare("inbound", &node_id, legacy, m, now));
+                self.shadow(|s| s.compare("inbound", "inbound", &node_id, legacy, m, now));
             }
         };
 
@@ -4519,6 +4538,29 @@ mod tests {
         );
     }
 
+    /// P3 PR-B — the probe's REAL latch latency is measured from the PROBE
+    /// START (the runtime's `since`), not the process epoch, and reads `None`
+    /// while unlatched. Locks the `handshake_at` plumbing the PathMonitor's
+    /// latch Q credit consumes (pre-PR-B the sweep's 5 s tick quantization
+    /// made any number worse than none).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn probe_latency_measures_from_probe_start() {
+        let (_rt, wg, _tun, _by_node, _probes, _nid, pk) =
+            mbb_fixture(DirectTier::Srflx, Instant::now()).await;
+        let since = Instant::now() - Duration::from_millis(200);
+        assert_eq!(
+            wg.probe_handshake_latency_ms(&pk, since),
+            None,
+            "unlatched probe has no latency"
+        );
+        wg.test_latch_probe_handshake_done(&pk);
+        let ms = wg.probe_handshake_latency_ms(&pk, since).expect("latched");
+        assert!(
+            (200..10_000).contains(&ms),
+            "latency runs from probe start (the back-dated since sets a ~200 ms floor), got {ms}"
+        );
+    }
+
     /// Make-before-break — a probe that never latches within the tier deadline is
     /// dropped and the RELAY is left untouched (the whole point: no stall on a
     /// peer that can only relay). The failure books ONE strike on the probed
@@ -4947,6 +4989,7 @@ mod tests {
             &cooldowns,
             &mut HashMap::new(),
             &mut test_relay_bq(),
+            "test",
         )
         .await;
         assert!(
@@ -4968,6 +5011,7 @@ mod tests {
             &cooldowns,
             &mut HashMap::new(),
             &mut test_relay_bq(),
+            "test",
         )
         .await;
         let inst = by_node
