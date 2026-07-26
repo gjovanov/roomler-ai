@@ -1,0 +1,40 @@
+# P5 (consolidation invariant I5) — the substance of the webrtc-ice fork,
+# extracted so the vendored tree shrinks to a mechanical patch. Dep shapes
+# deliberately MIRROR the vendored webrtc-ice's (same versions + feature
+# lists) so the workspace keeps resolving ONE `util::Conn` / one rustls —
+# the single-instance guarantee `turn::client::Client` interop depends on.
+[package]
+name = "tcp-turn-conn"
+version.workspace = true
+edition.workspace = true
+description = "TURNS-over-TLS-over-TCP util::Conn adapter (STUN/ChannelData de-framing + native-certs-first TLS) for TURN relay clients on UDP-blocked corporate networks."
+
+[dependencies]
+async-trait = { workspace = true }
+log = "0.4"
+tokio = { version = "1", default-features = false, features = [
+    "io-util",
+    "net",
+    "sync",
+] }
+
+[dependencies.tokio-rustls]
+version = "0.26"
+default-features = false
+features = ["logging", "tls12", "ring"]
+
+[dependencies.webpki-roots]
+version = "0.26"
+
+# Native OS cert store first, then Mozilla's bundle — load-bearing on
+# corporate TLS-inspection endpoints (private CA in the OS store) while
+# keeping sparse-store direct-internet hosts working. See
+# `tls_client_config` in src/lib.rs.
+[dependencies.rustls-native-certs]
+version = "0.8"
+
+[dependencies.util]
+version = "0.10.0"
+features = ["conn", "vnet", "sync"]
+default-features = false
+package = "webrtc-util"
