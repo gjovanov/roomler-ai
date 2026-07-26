@@ -94,6 +94,139 @@ impl EncodePressure {
     pub fn ewma_ms(&self) -> f32 {
         self.ewma_ms
     }
+
+    /// Classify the current pressure for the resolution tier tracker
+    /// (shelf item 2026-07-27, "encode-bound auto-downscale"). Computed here
+    /// because the EWMA + thresholds live here:
+    ///
+    /// * `Down` — the bitrate lever is EXHAUSTED (factor at the floor) and
+    ///   the encoder is still saturated → shrinking pixels is the only lever
+    ///   left.
+    /// * `Up` — the encoder has DEEP headroom: factor fully recovered and
+    ///   the EWMA is low enough that ~2.5× the work (one tier up ≈ 1.8-2.3×
+    ///   the pixels) would still sit under `high_ms`. The predictive margin
+    ///   is what prevents the down↔up ping-pong: "recovered at 1080p" is not
+    ///   enough, it must be *fast* at 1080p.
+    /// * `Hold` — anything in between.
+    pub fn tier_signal(&self) -> TierSignal {
+        const UP_HEADROOM: f32 = 2.5;
+        if !self.enabled || self.ewma_ms <= 0.0 {
+            return TierSignal::Hold;
+        }
+        if self.factor <= FACTOR_FLOOR + 1e-3 && self.ewma_ms > self.high_ms {
+            TierSignal::Down
+        } else if self.factor >= 1.0 - 1e-3 && self.ewma_ms * UP_HEADROOM < self.high_ms {
+            TierSignal::Up
+        } else {
+            TierSignal::Hold
+        }
+    }
+}
+
+/// Pressure classification for [`DownscaleTier`]. See
+/// [`EncodePressure::tier_signal`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TierSignal {
+    Down,
+    Up,
+    Hold,
+}
+
+/// Long-edge caps per tier: native → ~1440p-class → ~1080p-class floor.
+/// Fed to `effective_target_resolution`'s SOFT slot, so an explicit
+/// controller-side Fixed pick always wins (the auto tier only shapes
+/// `Native`/auto sessions) and the relay hard cap still composes after.
+pub const TIER_LONG_EDGES: [Option<u32>; 3] = [None, Some(2560), Some(1920)];
+
+/// Consecutive saturated heartbeat windows (≈2 s each) before stepping a
+/// tier DOWN — ≈10 s of bitrate-floor saturation.
+pub const TIER_DOWN_WINDOWS: u32 = 5;
+
+/// Consecutive deep-headroom windows before stepping back UP — ≈60 s of
+/// proven-fast encode at the smaller resolution.
+pub const TIER_UP_WINDOWS: u32 = 30;
+
+/// Minimum spacing between ANY two tier changes. Each change is an encoder
+/// rebuild + IDR + a wire dims change; churn is worse than either steady
+/// state.
+pub const TIER_CHANGE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Resolution tier tracker layered on [`EncodePressure`] (the docstring's
+/// "fps / resolution tiers can layer on later" — this is that layer, for
+/// GEAL8N6-class hosts whose 4K panel saturates the encoder even at the
+/// bitrate floor). Pure: step once per heartbeat window with the current
+/// [`TierSignal`]; emits `Some(new_long_edge_cap)` exactly when the tier
+/// changes. Kill switch `ROOMLER_AGENT_AUTO_DOWNSCALE=0`.
+pub struct DownscaleTier {
+    tier: usize,
+    down_run: u32,
+    up_run: u32,
+    last_change: Option<std::time::Instant>,
+    enabled: bool,
+}
+
+impl DownscaleTier {
+    pub fn new() -> Self {
+        Self {
+            tier: 0,
+            down_run: 0,
+            up_run: 0,
+            last_change: None,
+            enabled: !matches!(
+                node_env("AUTO_DOWNSCALE").as_deref(),
+                Some("0") | Some("false")
+            ),
+        }
+    }
+
+    /// Current cap (`None` = native).
+    pub fn cap(&self) -> Option<u32> {
+        TIER_LONG_EDGES[self.tier]
+    }
+
+    /// Fold one heartbeat window's signal. Returns the NEW cap when the tier
+    /// steps, `None` when it holds.
+    pub fn observe(&mut self, signal: TierSignal, now: std::time::Instant) -> Option<Option<u32>> {
+        if !self.enabled {
+            return None;
+        }
+        match signal {
+            TierSignal::Down => {
+                self.down_run += 1;
+                self.up_run = 0;
+            }
+            TierSignal::Up => {
+                self.up_run += 1;
+                self.down_run = 0;
+            }
+            TierSignal::Hold => {
+                self.down_run = 0;
+                self.up_run = 0;
+            }
+        }
+        let cooled = self
+            .last_change
+            .is_none_or(|t| now.duration_since(t) >= TIER_CHANGE_COOLDOWN);
+        if self.down_run >= TIER_DOWN_WINDOWS && self.tier + 1 < TIER_LONG_EDGES.len() && cooled {
+            self.tier += 1;
+            self.down_run = 0;
+            self.last_change = Some(now);
+            return Some(self.cap());
+        }
+        if self.up_run >= TIER_UP_WINDOWS && self.tier > 0 && cooled {
+            self.tier -= 1;
+            self.up_run = 0;
+            self.last_change = Some(now);
+            return Some(self.cap());
+        }
+        None
+    }
+}
+
+impl Default for DownscaleTier {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Default for EncodePressure {
@@ -177,5 +310,119 @@ mod tests {
         assert_eq!(c.observe(200.0), 1.0);
         assert_eq!(c.observe(200.0), 1.0);
         assert_eq!(c.factor(), 1.0);
+    }
+
+    fn pressure(ewma_ms: f32, factor: f32) -> EncodePressure {
+        EncodePressure {
+            ewma_ms,
+            factor,
+            high_ms: 25.0,
+            low_ms: 15.0,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn tier_signal_classifies_the_three_states() {
+        // Bitrate lever exhausted + still saturated → Down.
+        assert_eq!(pressure(40.0, FACTOR_FLOOR).tier_signal(), TierSignal::Down);
+        // Saturated but the factor still has room → Hold (bitrate lever first).
+        assert_eq!(pressure(40.0, 0.8).tier_signal(), TierSignal::Hold);
+        // Fully recovered AND deep headroom (9 × 2.5 = 22.5 < 25) → Up.
+        assert_eq!(pressure(9.0, 1.0).tier_signal(), TierSignal::Up);
+        // Recovered but merely "ok" (12 × 2.5 = 30 > 25) → Hold, not Up —
+        // the predictive margin that stops the down↔up ping-pong.
+        assert_eq!(pressure(12.0, 1.0).tier_signal(), TierSignal::Hold);
+        // No samples yet → Hold.
+        assert_eq!(pressure(0.0, 1.0).tier_signal(), TierSignal::Hold);
+    }
+
+    fn tier() -> DownscaleTier {
+        DownscaleTier {
+            tier: 0,
+            down_run: 0,
+            up_run: 0,
+            last_change: None,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn sustained_saturation_steps_down_one_tier_then_cooldown_blocks() {
+        let mut t = tier();
+        let now = std::time::Instant::now();
+        for _ in 0..(TIER_DOWN_WINDOWS - 1) {
+            assert_eq!(t.observe(TierSignal::Down, now), None);
+        }
+        assert_eq!(t.observe(TierSignal::Down, now), Some(Some(2560)));
+        // Still saturated at the smaller res — cooldown blocks the next step.
+        for _ in 0..(TIER_DOWN_WINDOWS * 2) {
+            assert_eq!(t.observe(TierSignal::Down, now), None);
+        }
+        // After the cooldown the STILL-saturated run fires immediately —
+        // FlipTracker semantics: the cooldown defers a persisted condition,
+        // it doesn't demand 5 fresh windows of re-confirmation (the run was
+        // continuous throughout; a Hold window would have reset it).
+        let later = now + TIER_CHANGE_COOLDOWN + std::time::Duration::from_secs(1);
+        assert_eq!(t.observe(TierSignal::Down, later), Some(Some(1920)));
+        // 1080p-class is the floor — never steps below.
+        let much_later = later + TIER_CHANGE_COOLDOWN + std::time::Duration::from_secs(1);
+        for _ in 0..(TIER_DOWN_WINDOWS * 3) {
+            assert_eq!(t.observe(TierSignal::Down, much_later), None);
+        }
+        assert_eq!(t.cap(), Some(1920));
+    }
+
+    #[test]
+    fn a_hold_window_resets_both_runs() {
+        let mut t = tier();
+        let now = std::time::Instant::now();
+        for _ in 0..(TIER_DOWN_WINDOWS - 1) {
+            t.observe(TierSignal::Down, now);
+        }
+        t.observe(TierSignal::Hold, now); // saturation not consecutive
+        for _ in 0..(TIER_DOWN_WINDOWS - 1) {
+            assert_eq!(t.observe(TierSignal::Down, now), None);
+        }
+        assert_eq!(t.observe(TierSignal::Down, now), Some(Some(2560)));
+    }
+
+    #[test]
+    fn sustained_deep_headroom_steps_back_up() {
+        let mut t = DownscaleTier {
+            tier: 2,
+            down_run: 0,
+            up_run: 0,
+            last_change: None,
+            enabled: true,
+        };
+        let now = std::time::Instant::now();
+        for _ in 0..(TIER_UP_WINDOWS - 1) {
+            assert_eq!(t.observe(TierSignal::Up, now), None);
+        }
+        assert_eq!(t.observe(TierSignal::Up, now), Some(Some(2560)));
+        // Native requires another full run + cooldown.
+        let later = now + TIER_CHANGE_COOLDOWN + std::time::Duration::from_secs(1);
+        for _ in 0..(TIER_UP_WINDOWS - 1) {
+            assert_eq!(t.observe(TierSignal::Up, later), None);
+        }
+        assert_eq!(t.observe(TierSignal::Up, later), Some(None));
+        assert_eq!(t.cap(), None);
+    }
+
+    #[test]
+    fn disabled_tier_never_steps() {
+        let mut t = DownscaleTier {
+            tier: 0,
+            down_run: 0,
+            up_run: 0,
+            last_change: None,
+            enabled: false,
+        };
+        let now = std::time::Instant::now();
+        for _ in 0..(TIER_DOWN_WINDOWS * 4) {
+            assert_eq!(t.observe(TierSignal::Down, now), None);
+        }
+        assert_eq!(t.cap(), None);
     }
 }
