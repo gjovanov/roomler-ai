@@ -72,6 +72,7 @@ import {
   storedDecodePref,
   storedCtxMode,
   storedPerFrameMsg,
+  storedFlowParams,
   diagHudEnabled,
   type AutoTransportInputs,
   type KeyDecision,
@@ -80,7 +81,17 @@ import {
 import { codecMimeForShort } from '@/workers/rc-webcodecs-worker'
 import { parseFrameHeader, isKeyframe, shouldDecodeFrame } from '@/workers/rc-vp9-444-worker'
 import { shouldDecodeFrame as shouldDecodeFrameHevc, classifyCrop } from '@/workers/rc-hevc-worker'
-import { HopStats, ctxOptionsFor, normalizeCtxMode, round1 } from '@/workers/rc-hop-stats'
+import {
+  HopStats,
+  StruggleWindow,
+  ctxOptionsFor,
+  normalizeCtxMode,
+  normalizeIntKnob,
+  round1,
+  DEFAULT_MAX_DECODE_QUEUE,
+  DEFAULT_STRUGGLE_QUEUE,
+  DEFAULT_STRUGGLE_WINDOWS,
+} from '@/workers/rc-hop-stats'
 
 function keyEvent(code: string, mods: Partial<{ ctrl: boolean; alt: boolean; meta: boolean; shift: boolean }> = {}): KeyboardEvent {
   return {
@@ -2767,5 +2778,76 @@ describe('P1 — viewer diagnosis localStorage knobs', () => {
     expect(diagHudEnabled()).toBe(false)
     localStorage.setItem('roomler-rc-diag-hud', '1')
     expect(diagHudEnabled()).toBe(true)
+  })
+})
+
+describe('P6 — flow-control knobs + sustained-window struggle rule', () => {
+  afterEach(() => {
+    localStorage.removeItem('roomler-rc-max-queue')
+    localStorage.removeItem('roomler-rc-struggle-queue')
+    localStorage.removeItem('roomler-rc-struggle-windows')
+  })
+
+  it('storedFlowParams defaults match the pre-P6 baked constants', () => {
+    expect(storedFlowParams()).toEqual({
+      maxQueue: DEFAULT_MAX_DECODE_QUEUE,
+      struggleQueue: DEFAULT_STRUGGLE_QUEUE,
+      struggleWindows: DEFAULT_STRUGGLE_WINDOWS,
+    })
+    // Lock the actual values too — these ARE the wire behaviour.
+    expect(storedFlowParams()).toEqual({ maxQueue: 4, struggleQueue: 2, struggleWindows: 2 })
+  })
+
+  it('storedFlowParams honours the localStorage overrides with clamps', () => {
+    localStorage.setItem('roomler-rc-max-queue', '8')
+    localStorage.setItem('roomler-rc-struggle-queue', '0')
+    localStorage.setItem('roomler-rc-struggle-windows', '1')
+    expect(storedFlowParams()).toEqual({ maxQueue: 8, struggleQueue: 0, struggleWindows: 1 })
+    // Out-of-range clamps instead of trusting the raw value.
+    localStorage.setItem('roomler-rc-max-queue', '9999')
+    localStorage.setItem('roomler-rc-struggle-windows', '0')
+    const clamped = storedFlowParams()
+    expect(clamped.maxQueue).toBe(60)
+    expect(clamped.struggleWindows).toBe(1)
+    // Garbage falls back to the defaults.
+    localStorage.setItem('roomler-rc-max-queue', 'banana')
+    expect(storedFlowParams().maxQueue).toBe(DEFAULT_MAX_DECODE_QUEUE)
+  })
+
+  it('normalizeIntKnob parses, truncates, clamps, and defaults', () => {
+    expect(normalizeIntKnob('7', 4, 1, 60)).toBe(7)
+    expect(normalizeIntKnob(7.9, 4, 1, 60)).toBe(7)
+    expect(normalizeIntKnob('0', 4, 1, 60)).toBe(1)
+    expect(normalizeIntKnob('-3', 4, 1, 60)).toBe(1)
+    expect(normalizeIntKnob('999', 4, 1, 60)).toBe(60)
+    expect(normalizeIntKnob(null, 4, 1, 60)).toBe(4)
+    expect(normalizeIntKnob(undefined, 4, 1, 60)).toBe(4)
+    expect(normalizeIntKnob('', 4, 1, 60)).toBe(4)
+    expect(normalizeIntKnob('banana', 4, 1, 60)).toBe(4)
+    expect(normalizeIntKnob(Number.NaN, 4, 1, 60)).toBe(4)
+  })
+
+  it('StruggleWindow needs the configured consecutive run and resets on one clean window', () => {
+    const w = new StruggleWindow(2)
+    expect(w.observe(true)).toBe(false) // 1st bad window — not yet
+    expect(w.observe(true)).toBe(true) // 2nd consecutive — asserted
+    expect(w.observe(true)).toBe(true) // stays asserted while the run continues
+    expect(w.observe(false)).toBe(false) // one clean window resets immediately
+    expect(w.observe(true)).toBe(false) // streak restarts from zero
+    w.observe(true)
+    w.reset() // teardown: fresh connection starts clean
+    expect(w.observe(true)).toBe(false)
+  })
+
+  it('StruggleWindow with windows=1 reproduces the legacy instantaneous rule', () => {
+    const w = new StruggleWindow(1)
+    expect(w.observe(true)).toBe(true)
+    expect(w.observe(false)).toBe(false)
+    expect(w.observe(true)).toBe(true)
+  })
+
+  it('StruggleWindow sanitizes a nonsense windows count to 1', () => {
+    expect(new StruggleWindow(0).observe(true)).toBe(true)
+    expect(new StruggleWindow(Number.NaN).observe(true)).toBe(true)
   })
 })
