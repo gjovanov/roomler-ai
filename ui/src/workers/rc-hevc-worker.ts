@@ -33,6 +33,15 @@
  * payload size remain.
  */
 
+import {
+  HopStats,
+  ctxOptionsFor,
+  epochNowMs,
+  normalizeCtxMode,
+  round1,
+  type CtxMode,
+} from './rc-hop-stats'
+
 type InitCanvasMessage = {
   type: 'init-canvas'
   canvas: OffscreenCanvas
@@ -45,8 +54,20 @@ type InitCanvasMessage = {
    *  override from the composable (localStorage `roomler-rc-decode-pref`).
    *  Unset → `'no-preference'`, today's behaviour. */
   decodePref?: 'prefer-software' | 'prefer-hardware' | 'no-preference'
+  /** P1 — 2D-context A/B mode (localStorage `roomler-rc-ctx-mode`).
+   *  Remembered across the idempotent visible-canvas re-init. */
+  ctxMode?: string
+  /** P1 — restore the legacy per-decoded-frame `frame-decoded` postMessage
+   *  (localStorage `roomler-rc-per-frame-msg`). Default OFF — see the
+   *  vp9-444 worker's comment. */
+  perFrameMsg?: boolean
 }
-type ChunkMessage = { type: 'chunk'; bytes: ArrayBuffer }
+type ChunkMessage = {
+  type: 'chunk'
+  bytes: ArrayBuffer
+  /** P1 — main-thread epoch timestamp for the main→worker forwarding hop. */
+  sentAt?: number
+}
 type CloseMessage = { type: 'close' }
 type IncomingMessage = InitCanvasMessage | ChunkMessage | CloseMessage
 
@@ -155,6 +176,12 @@ function noteChunkForStallCheck(): void {
 
 function noteOutputForStallCheck(): void {
   const now = performance.now()
+  // P1 — max inter-output gap per stats window (sub-stall stutter that the
+  // 1500 ms stall detector never sees).
+  if (lastOutputMs > 0) {
+    const gap = now - lastOutputMs
+    if (gap > outGapMaxMs) outGapMaxMs = gap
+  }
   if (stallSince !== 0) {
     workerScope.postMessage({
       type: 'decode-stall-recovered',
@@ -180,6 +207,16 @@ let lastPostedH = 0
 let statsLastEmitMs: number = (typeof performance !== 'undefined' ? performance.now() : Date.now())
 const STATS_EMIT_INTERVAL_MS = 1000
 
+// P1 — per-hop instrumentation (see rc-hop-stats.ts + the vp9-444 worker's
+// mirror). Folded into the 1 s stats message; zero extra message cadence.
+let ctxMode: CtxMode = 'opaque-desync'
+let perFrameMsg = false
+const paintStats = new HopStats()
+const fwdStats = new HopStats()
+const decodeStats = new HopStats()
+let outGapMaxMs = 0
+const pendingDecodeAt = new Map<number, number>()
+
 function maybeEmitStats(): void {
   const now = (typeof performance !== 'undefined' ? performance.now() : Date.now())
   const elapsed = now - statsLastEmitMs
@@ -197,7 +234,13 @@ function maybeEmitStats(): void {
     bytesReceivedTotal: statsBytesTotal,
     decodeQueueSize: decoder?.decodeQueueSize ?? 0,
     framesDroppedBacklog,
+    paint: paintStats.snapshotAndReset(),
+    fwd: fwdStats.snapshotAndReset(),
+    decode: decodeStats.snapshotAndReset(),
+    outGapMaxMs: round1(outGapMaxMs),
+    ctxMode,
   })
+  outGapMaxMs = 0
   statsBytesInWindow = 0
   statsFramesInWindow = 0
   statsLastEmitMs = now
@@ -218,7 +261,10 @@ workerScope.onmessage = (e) => {
   if (!msg) return
   if (msg.type === 'init-canvas') {
     canvas = msg.canvas
-    ctx = canvas.getContext('2d')
+    // P1 — ctx mode sticks across the idempotent visible-canvas re-init.
+    if (msg.ctxMode !== undefined) ctxMode = normalizeCtxMode(msg.ctxMode)
+    if (typeof msg.perFrameMsg === 'boolean') perFrameMsg = msg.perFrameMsg
+    ctx = canvas.getContext('2d', ctxOptionsFor(ctxMode))
     if (typeof msg.codec === 'string' && msg.codec.length > 0) {
       activeCodec = msg.codec
     }
@@ -232,6 +278,7 @@ workerScope.onmessage = (e) => {
     initDecoder()
   } else if (msg.type === 'chunk') {
     framesReceived++
+    if (typeof msg.sentAt === 'number') fwdStats.add(epochNowMs() - msg.sentAt)
     const u8 = new Uint8Array(msg.bytes)
     statsBytesInWindow += u8.byteLength
     statsBytesTotal += u8.byteLength
@@ -250,6 +297,12 @@ function initDecoder() {
       framesDecoded++
       statsFramesInWindow++
       noteOutputForStallCheck()
+      // P1 — submit→output latency (queue + decoder time).
+      const submittedAt = pendingDecodeAt.get(frame.timestamp)
+      if (submittedAt !== undefined) {
+        decodeStats.add(performance.now() - submittedAt)
+        pendingDecodeAt.delete(frame.timestamp)
+      }
       // rc.100/rc.102 — Chrome's NVDEC HEVC decode mis-reports the picture
       // geometry for our hevc_nvenc stream (field GORAN-XMG-NEO16, RTX 5090):
       // the agent encodes a FULL 2560×1600 desktop (proven by the FFmpeg DC
@@ -316,11 +369,15 @@ function initDecoder() {
       }
       statsLastWidth = renderW
       statsLastHeight = renderH
+      const paintT0 = performance.now()
       paintFrame(render, renderW, renderH)
+      paintStats.add(performance.now() - paintT0)
       if (rewrapped) frame.close() // paintFrame closed `render`; close the original too
       if (firstFrameMsg) {
         workerScope.postMessage(firstFrameMsg)
-      } else {
+      } else if (perFrameMsg) {
+        // P1 — legacy per-frame counter message, OFF by default (see the
+        // vp9-444 worker); the 1 s stats message carries framesDecodedTotal.
         workerScope.postMessage({ type: 'frame-decoded', count: framesDecoded })
       }
       maybeEmitStats()
@@ -491,6 +548,10 @@ function emitFrame(): void {
       timestamp: ts,
       data: payload,
     })
+    // P1 — record the submission time for the submit→output hop (bounded;
+    // see the vp9-444 worker's mirror).
+    if (pendingDecodeAt.size > 240) pendingDecodeAt.clear()
+    pendingDecodeAt.set(ts, performance.now())
     decoder.decode(chunk)
   } catch (err) {
     workerScope.postMessage({
@@ -540,6 +601,12 @@ function teardown(): void {
   sawKeyframe = false
   framesSkippedAwaitingKey = 0
   framesDroppedBacklog = 0
+  // P1 — drop the hop-instrumentation state with the session.
+  pendingDecodeAt.clear()
+  paintStats.snapshotAndReset()
+  fwdStats.snapshotAndReset()
+  decodeStats.snapshotAndReset()
+  outGapMaxMs = 0
   assembler.headerHave = 0
   assembler.payloadBuf = null
   assembler.payloadHave = 0
