@@ -6,6 +6,10 @@ members = [
     "crates/services",
     "crates/remote_control",
     "crates/tunnel-core",
+    # P5 — the webrtc-ice fork's substance (TURNS/TCP Conn adapter), extracted
+    # so the vendored tree is a mechanical patch. Consumed by tunnel-core AND
+    # (via path dep) the vendored webrtc-ice's gather arm.
+    "crates/tcp-turn-conn",
     "crates/roomler-setup-core",
 
     "crates/api",
