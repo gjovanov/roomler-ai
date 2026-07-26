@@ -1,14 +1,14 @@
 # Vendored copy of webrtc-ice 0.12.0 from crates.io.
-# Upstream is verbatim EXCEPT:
+# Upstream is verbatim EXCEPT (P5 — the delta IS
+# `crates/vendored/webrtc-ice.patch`; re-derive with
+# `scripts/revendor-webrtc-ice.sh`, drift-checked in CI):
 #   - src/agent/agent_gather.rs: patched gather_candidates_relay to add
-#     a TURNS-over-TLS-over-TCP branch (was a NOT_PLANNED TODO upstream).
-#   - src/agent/mod.rs: declares tcp_turn_conn submodule.
-#   - src/agent/tcp_turn_conn.rs: NEW — Conn-trait adapter that frames a
-#     tokio_rustls::TlsStream<TcpStream> as one STUN/ChannelData frame
-#     per recv_from() call, matching what turn::client expects.
-#   - this Cargo.toml: tokio-rustls + webpki-roots added; pinned to the
-#     same versions our workspace already resolves (rustls 0.23.36) to
-#     avoid feature-unification fights.
+#     a TURNS-over-TLS-over-TCP branch (was a NOT_PLANNED TODO upstream),
+#     using the workspace `tcp-turn-conn` crate's Conn adapter.
+#   - src/agent/agent_selector.rs: per-attempt STUN build failures
+#     downgraded log::error!→debug! with greppable targets (2026-05-18
+#     field log-flood fix; not session-fatal — ICE keeps trying pairs).
+#   - this Cargo.toml: the `tcp-turn-conn` path dependency below.
 
 [package]
 edition = "2021"
@@ -90,24 +90,11 @@ features = [
 [dependencies.turn]
 version = "0.9.0"
 
-[dependencies.tokio-rustls]
-version = "0.26"
-default-features = false
-features = ["logging", "tls12", "ring"]
-
-[dependencies.webpki-roots]
-version = "0.26"
-
-# Loads the OS-native cert store at runtime. On corporate Windows
-# endpoints with TLS inspection enabled, IT pushes a private CA into
-# the Windows cert store so browsers + reqwest (Schannel) trust the
-# MITM proxy. The Mozilla `webpki-roots` bundle does NOT include
-# those private CAs, so TURNS/TCP would fail with `UnknownIssuer`
-# against an intercepted endpoint. We extend our RootCertStore with
-# native certs first, then add Mozilla's bundle so direct-internet
-# hosts also keep working.
-[dependencies.rustls-native-certs]
-version = "0.8"
+# VENDOR PATCH (P5): the TURNS-over-TLS-over-TCP Conn adapter the patched
+# gather arm uses. Path dep into the workspace — legal for a
+# [patch.crates-io]-resolved, workspace-excluded crate.
+[dependencies.tcp-turn-conn]
+path = "../../tcp-turn-conn"
 
 [dependencies.url]
 version = "2"
