@@ -37,19 +37,29 @@ use tracing::{info, warn};
 use tunnel_core::localapi::OverlayView;
 use tunnel_core::transport::turn_host::LocalTurnHost;
 
-/// Primary loopback discovery port. MUST match `LOCAL_RELAY_PROBE_PORT`
-/// in `ui/src/composables/useRemoteControl.ts`.
+/// Primary loopback discovery port (legacy well-known). MUST match
+/// `LOCAL_RELAY_PROBE_PORT` in `ui/src/composables/useRemoteControl.ts`.
 pub const PROBE_PORT: u16 = 47989;
-/// How many consecutive ports (from [`PROBE_PORT`]) form the candidate
-/// range the server tries and the browser probes. A host running N
-/// agents needs ≥N free ports here; 5 covers the realistic
-/// Windows+WSL (+ a stray) co-tenancy. MUST match the browser's
-/// `LOCAL_RELAY_PROBE_PORTS`.
-pub const PROBE_PORT_COUNT: u16 = 5;
+/// Fallback band base. `47989+` sits right at the edge of where
+/// Hyper-V / WSL2-mirrored / HNS reserve their large port pools (a
+/// ~2500-port block around 46000-48500 was found on a WSL-mirrored
+/// host — invisible to `netstat` AND `netsh excludedportrange`, so
+/// the whole primary band was unbindable). This band lives in the
+/// quiet region WELL BELOW that zone, which those stacks don't touch,
+/// so the range-walk always has a free port to fall to. MUST match
+/// the browser's `LOCAL_RELAY_PROBE_PORTS`.
+pub const PROBE_PORT_FALLBACK: u16 = 41989;
+/// Ports per band. A host running N agents needs ≥N free ports per
+/// band; 5 covers realistic Windows+WSL (+ a stray) co-tenancy.
+pub const PROBE_PORT_BAND: u16 = 5;
 
-/// The candidate discovery ports, `PROBE_PORT ..= PROBE_PORT+COUNT-1`.
+/// The candidate discovery ports: the primary band first (unchanged
+/// behaviour on normal hosts), then the fallback band for hosts whose
+/// Hyper-V/WSL/HNS reservations swallow the primary.
 fn probe_ports() -> impl Iterator<Item = u16> + Clone {
-    (0..PROBE_PORT_COUNT).map(|i| PROBE_PORT + i)
+    (0..PROBE_PORT_BAND)
+        .map(|i| PROBE_PORT + i)
+        .chain((0..PROBE_PORT_BAND).map(|i| PROBE_PORT_FALLBACK + i))
 }
 
 /// TTL of a minted relay credential (handed to the browser + remote agent).
