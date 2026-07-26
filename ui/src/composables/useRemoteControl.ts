@@ -447,7 +447,29 @@ export interface RcCursor {
   /** ImageBitmap cache by shape id. Pure side-effect: decoding a
    *  shape on receive means the paint loop can hand it straight to
    *  canvas.drawImage without per-frame decode cost. */
-  shapes: Map<number, { bitmap: ImageBitmap; hotspotX: number; hotspotY: number }>
+  shapes: Map<
+    number,
+    {
+      bitmap: ImageBitmap
+      hotspotX: number
+      hotspotY: number
+      /** CSS `cursor` keyword when the agent identified this shape as a
+       *  standard system cursor ("text", "default", "pointer", …), so
+       *  the view renders the viewer's native OS cursor instead of the
+       *  bitmap. Absent for app-custom cursors. */
+      css?: string
+    }
+  >
+}
+
+/** Derive the CSS `cursor` keyword to apply to the video surface for
+ *  the current remote cursor: the css of the shape referenced by the
+ *  current position, or null when the cursor is hidden or the active
+ *  shape is an app-custom bitmap (→ the canvas overlay renders it). */
+export function remoteCursorCssFor(state: RcCursor): string | null {
+  const pos = state.pos
+  if (!pos) return null
+  return state.shapes.get(pos.id)?.css ?? null
 }
 
 interface IceServer {
@@ -4543,8 +4565,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       // Mutate the Map in place + replace the ref to trigger Vue
       // reactivity (shallowRef would be nicer; ref + new object
       // reference works today).
+      const cssKw = typeof msg.css === 'string' ? msg.css : undefined
       const shapes = new Map(cursor.value.shapes)
-      shapes.set(id, { bitmap, hotspotX: hx, hotspotY: hy })
+      shapes.set(id, { bitmap, hotspotX: hx, hotspotY: hy, css: cssKw })
       cursor.value = { ...cursor.value, shapes }
     } catch {
       /* decode failed — skip this shape update */

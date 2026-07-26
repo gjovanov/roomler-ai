@@ -118,8 +118,11 @@ mod windows_impl {
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CURSOR_SHOWING, CURSORINFO, CURSORINFO_FLAGS, GetCursorInfo, GetIconInfo, HCURSOR, HICON,
-        ICONINFO,
+        ICONINFO, IDC_APPSTARTING, IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_HELP, IDC_IBEAM, IDC_NO,
+        IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, IDC_UPARROW, IDC_WAIT,
+        LoadCursorW,
     };
+    use windows::core::PCWSTR;
 
     /// Matches the module-level `CursorTick` but with the shape always
     /// carried (the outer [`super::CursorTracker`] filters by
@@ -135,13 +138,26 @@ mod windows_impl {
         /// Cached shapes by HCURSOR handle. Windows recycles handles
         /// within a session so this stays small (~10 entries).
         shapes: HashMap<u64, CursorInfo>,
+        /// Handles of the standard stock cursors → their CSS `cursor`
+        /// keyword. Loaded once; `GetCursorInfo` reports the same shared
+        /// HCURSOR when an app selects a stock cursor, so a handle match
+        /// lets the browser render the viewer's real OS cursor.
+        system_cursors: HashMap<u64, &'static str>,
     }
 
     impl WindowsCursorTracker {
         pub(super) fn new() -> Self {
             Self {
                 shapes: HashMap::new(),
+                system_cursors: load_system_cursors(),
             }
+        }
+
+        /// Map a live HCURSOR to a CSS cursor keyword when it is one of
+        /// the standard stock cursors, else `None` (app-custom cursor →
+        /// the streamed bitmap is used).
+        fn classify(&self, hcursor: HCURSOR) -> Option<&'static str> {
+            self.system_cursors.get(&handle_to_id(hcursor)).copied()
         }
 
         pub(super) fn poll(&mut self) -> Option<RawCursorTick> {
@@ -161,23 +177,31 @@ mod windows_impl {
                     return None;
                 }
                 let shape_id = handle_to_id(ci.hCursor);
+                // Classify the live cursor against the stock set so the
+                // browser can render the viewer's real OS cursor for
+                // standard shapes (I-beam, arrow, hand, resize, …). The
+                // hint is cached with the shape (same HCURSOR → same
+                // type) and set even on the fallback, so a stock cursor
+                // GetDIBits can't decode still renders natively.
+                let css = self.classify(ci.hCursor);
                 let shape = if let Some(cached) = self.shapes.get(&shape_id) {
                     Some(cached.clone())
-                } else if let Some(info) = extract_shape(ci.hCursor) {
+                } else if let Some(mut info) = extract_shape(ci.hCursor) {
+                    info.css = css;
                     self.shapes.insert(shape_id, info.clone());
                     Some(info)
                 } else {
-                    // extract_shape failed for this HCURSOR (I-beam
-                    // variants, custom app cursors, or bitmaps
-                    // GetDIBits can't decode). Without a shape the
-                    // browser hides the canvas overlay and the
-                    // controller sees the cursor "disappear". Fall
-                    // back to a hardcoded white-with-black-outline
-                    // arrow so the position indicator is always
-                    // visible — better UX than a vanishing cursor.
-                    // Cache under this shape_id so we don't rebuild
-                    // the fallback on every poll.
-                    let fallback = synthetic_arrow();
+                    // extract_shape failed for this HCURSOR (unusual mask
+                    // bitmaps, custom app cursors, or bitmaps GetDIBits
+                    // can't decode). Without a shape the browser hides
+                    // the canvas overlay and the controller sees the
+                    // cursor "disappear". Fall back to a hardcoded
+                    // black-outline arrow so the position indicator is
+                    // always visible — better UX than a vanishing
+                    // cursor. Cache under this shape_id so we don't
+                    // rebuild the fallback on every poll.
+                    let mut fallback = synthetic_arrow();
+                    fallback.css = css;
                     self.shapes.insert(shape_id, fallback.clone());
                     Some(fallback)
                 };
@@ -193,6 +217,42 @@ mod windows_impl {
 
     fn handle_to_id(h: HCURSOR) -> u64 {
         h.0 as usize as u64
+    }
+
+    /// Load the process-shared handles of the standard stock cursors and
+    /// map each to its CSS `cursor` keyword. Stock cursors are shared
+    /// system resources, so `LoadCursorW` returns the same handle the
+    /// active window selected via `SetCursor` — a handle match therefore
+    /// identifies the cursor TYPE without inspecting pixels. App-custom
+    /// cursors never match and fall through to the bitmap path.
+    fn load_system_cursors() -> HashMap<u64, &'static str> {
+        let table: &[(PCWSTR, &'static str)] = &[
+            (IDC_ARROW, "default"),
+            (IDC_IBEAM, "text"),
+            (IDC_HAND, "pointer"),
+            (IDC_WAIT, "wait"),
+            (IDC_APPSTARTING, "progress"),
+            (IDC_CROSS, "crosshair"),
+            (IDC_SIZEWE, "ew-resize"),
+            (IDC_SIZENS, "ns-resize"),
+            (IDC_SIZENESW, "nesw-resize"),
+            (IDC_SIZENWSE, "nwse-resize"),
+            (IDC_SIZEALL, "move"),
+            (IDC_NO, "not-allowed"),
+            (IDC_HELP, "help"),
+            (IDC_UPARROW, "default"),
+        ];
+        let mut map = HashMap::with_capacity(table.len());
+        for (idc, css) in table {
+            unsafe {
+                if let Ok(h) = LoadCursorW(None, *idc)
+                    && !h.is_invalid()
+                {
+                    map.insert(handle_to_id(h), *css);
+                }
+            }
+        }
+        map
     }
 
     /// Decode a cursor's shape into an ARGB bitmap + hotspot. Returns
@@ -299,6 +359,7 @@ mod windows_impl {
                 hotspot_x: icon_info.xHotspot as i32,
                 hotspot_y: icon_info.yHotspot as i32,
                 bgra,
+                css: None,
             })
         }
     }
@@ -332,7 +393,17 @@ mod windows_impl {
             //   AND=1, XOR=0 → transparent
             //   AND=0, XOR=0 → opaque black
             //   AND=0, XOR=1 → opaque white
-            //   AND=1, XOR=1 → invert (approx. opaque white)
+            //   AND=1, XOR=1 → invert
+            //
+            // A static frame can't XOR-invert against the live
+            // background, so the invert region — which for the classic
+            // I-beam IS the whole glyph — is rendered as opaque BLACK
+            // (its body) rather than the old opaque WHITE that produced
+            // a solid white "I". A white outline is added afterwards so
+            // the black glyph stays visible on dark backgrounds too.
+            // (System cursors also carry a `css` keyword now, so the
+            // browser renders the native OS cursor for the common case
+            // and only falls back to this bitmap for odd app cursors.)
             let pixel_count = (width * height) as usize;
             let mut out = vec![0u8; pixel_count * 4];
             let xor_offset = pixel_count * 4;
@@ -346,15 +417,15 @@ mod windows_impl {
                     (true, false) => {
                         // Transparent. Already zeroed.
                     }
-                    (false, false) => {
-                        // Black outline.
+                    (false, false) | (true, true) => {
+                        // Opaque black: the outline AND the invert body.
                         out[out_idx] = 0;
                         out[out_idx + 1] = 0;
                         out[out_idx + 2] = 0;
                         out[out_idx + 3] = 255;
                     }
-                    (false, true) | (true, true) => {
-                        // White fill / invert.
+                    (false, true) => {
+                        // Opaque white fill.
                         out[out_idx] = 255;
                         out[out_idx + 1] = 255;
                         out[out_idx + 2] = 255;
@@ -362,6 +433,9 @@ mod windows_impl {
                     }
                 }
             }
+            // Keep the black glyph visible on dark backgrounds by
+            // haloing it in white (reuses the colour-path helper).
+            add_white_outline_to_opaque_black(&mut out, width, height);
 
             Some(CursorInfo {
                 width,
@@ -369,6 +443,7 @@ mod windows_impl {
                 hotspot_x: icon_info.xHotspot as i32,
                 hotspot_y: icon_info.yHotspot as i32,
                 bgra: out,
+                css: None,
             })
         }
     }
@@ -579,6 +654,7 @@ mod windows_impl {
             hotspot_x: 0,
             hotspot_y: 0,
             bgra,
+            css: None,
         }
     }
 
@@ -586,4 +662,34 @@ mod windows_impl {
     // non-Windows builds.
     #[allow(dead_code)]
     fn _unused_hbitmap_import(_h: HBITMAP) {}
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn stock_cursors_map_to_css_keywords() {
+            let map = load_system_cursors();
+            // Arrow + I-beam resolve on any interactive desktop; the
+            // values must be the CSS keywords the browser applies.
+            assert!(!map.is_empty(), "no stock cursors loaded");
+            assert!(map.values().any(|v| *v == "text"), "missing text");
+            assert!(map.values().any(|v| *v == "default"), "missing default");
+        }
+
+        #[test]
+        fn ibeam_handle_classifies_as_text() {
+            let tracker = WindowsCursorTracker::new();
+            let ibeam = unsafe { LoadCursorW(None, IDC_IBEAM) }.expect("load IDC_IBEAM");
+            assert_eq!(tracker.classify(ibeam), Some("text"));
+        }
+
+        #[test]
+        fn custom_handle_is_unclassified() {
+            let tracker = WindowsCursorTracker::new();
+            // A handle that is not one of the stock cursors → None, so
+            // the browser uses the streamed bitmap.
+            assert_eq!(tracker.classify(HCURSOR(std::ptr::null_mut())), None);
+        }
+    }
 }
