@@ -149,62 +149,11 @@ fn direct_endpoints_changed(old: &NetmapPeer, new: &NetmapPeer) -> bool {
     old.lan_endpoints != new.lan_endpoints || old.srflx_endpoints != new.srflx_endpoints
 }
 
-/// Which carrier tier an installed peer is on. Direct tiers differ in cooldown
-/// bookkeeping (CC1 — a failure on one tier must never poison another) and
-/// each direct tier carries a WG-handshake completion deadline (a carrier that
-/// never establishes is torn down to relay; relay itself is governed by its
-/// own hard-dead/one-way signals).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum DirectTier {
-    /// Same-subnet LAN direct (rc.131-135) — on-link. rc.204: gets a TIGHT
-    /// handshake deadline too — pre-handshake tx/rx stay flat, so without a
-    /// deadline a false LAN match (stale endpoint, AP isolation, VPN-captured
-    /// reply path) was a PERMANENT zombie with no relay fallback.
-    Lan,
-    /// Direct-to-public NIC (Phase A) — off-link; public cooldown + a loose
-    /// handshake deadline (the accept side may lag).
-    Public,
-    /// srflx hole-punch (Phase C) — off-link; srflx cooldown + a tight
-    /// handshake deadline (a cross-NAT punch works in a couple of INIT cycles
-    /// or won't at all).
-    Srflx,
-    /// coturn relay carrier — not a direct tier; the tx/rx + hard-dead relay
-    /// path governs it, so no handshake deadline here.
-    Relay,
-}
-
-impl DirectTier {
-    /// True for the direct tiers (everything but [`Relay`](Self::Relay)) — the
-    /// carriers whose failure bookkeeping is keyed by tier.
-    fn is_direct(self) -> bool {
-        !matches!(self, DirectTier::Relay)
-    }
-
-    /// Phase C — the WG-handshake completion deadline past which a
-    /// never-established carrier on this tier is torn down (direct tiers →
-    /// relay fallback; relay tier → re-coordinate).
-    fn handshake_deadline(self) -> Duration {
-        match self {
-            DirectTier::Srflx => SRFLX_HANDSHAKE_DEADLINE,
-            DirectTier::Public => PUBLIC_HANDSHAKE_DEADLINE,
-            // rc.204 — LAN gets a deadline too (see the variant doc): on-link
-            // handshakes complete in milliseconds or not at all.
-            DirectTier::Lan => LAN_HANDSHAKE_DEADLINE,
-            // rc.223 — the RELAY tier gets one as well. A relay carrier that
-            // never completes its handshake evaded EVERY detector (field
-            // 2026-07-24, neo16 on a UDP-hostile network): `punch_dead` was
-            // direct-only, `rx_stale` requires a latched handshake,
-            // `hard_dead` needs a send error (sends into a TURNS/TCP
-            // allocation "succeed"), and pre-handshake data advances neither
-            // tx nor rx, so `bad_sweeps` never counts — an IMMORTAL zombie
-            // that also starved the P7 churn counter (no teardown → no
-            // re-request → no forced-DERP escalation). Generous deadline: the
-            // handshake needs BOTH ends' allocations installed, and the
-            // peer's own grant cycle can lag ours by tens of seconds.
-            DirectTier::Relay => RELAY_HANDSHAKE_DEADLINE,
-        }
-    }
-}
+// P2 — `DirectTier`, the lifecycle deadlines/constants, and the carrier/probe
+// transition fns live in the sibling `lifecycle` module (one place for every
+// rule that can kill a carrier). Glob-imported so this module — and its test
+// module's `use super::*` — reads them unchanged.
+use super::lifecycle::*;
 
 /// An installed peer carrier + the bookkeeping the direct→relay fallback
 /// (rc.136/137) needs.
@@ -274,26 +223,6 @@ struct UpgradeProbe {
     since: Instant,
 }
 
-/// Grace after install before the fallback can fire — lets the bilateral
-/// handshake + first packets flow before we judge the carrier.
-const DIRECT_GRACE: Duration = Duration::from_secs(8);
-/// Consecutive bad sweeps (sent, received nothing) before falling back. At the
-/// 5 s tick that's ~15 s of one-way traffic — long enough to ignore a blip,
-/// short enough that a VPN/AP-isolation break doesn't stay dark for long.
-const BAD_SWEEPS_TO_FALLBACK: u32 = 3;
-/// rc.206 — the "silent zombie" backstop. An *established* carrier that stops
-/// RECEIVING is dead even when it also stopped SENDING: a healthy peer emits a
-/// WireGuard persistent-keepalive every ~25 s (`wg::KEEPALIVE_SECS`), so no
-/// inbound packet for this long means the underlying path died AND boringtun
-/// gave up re-handshaking (it stops emitting anything once a rekey attempt
-/// expires ~90 s). With no tx either, the `tx>last_tx && rx==last_rx` heuristic
-/// reads that as "just idle — no judgment" and never tears the carrier down —
-/// observed in the field as an 8-hour "direct" carrier stuck at 100 % loss with
-/// a frozen last-seen. This absolute rx-staleness deadline catches it regardless
-/// of tx. 90 s = ~3–4 missed keepalives: comfortably past a transient blip, well
-/// short of the multi-hour zombie. A false trip only forces a (cheap) rebuild,
-/// which re-establishes if the path actually recovered.
-const RX_STALE_DEADLINE: Duration = Duration::from_secs(90);
 /// After a direct carrier fails, don't retry direct for this peer for this
 /// long — it stays on relay, then re-attempts direct (auto-recovers when the
 /// blocking condition clears, e.g. the VPN disconnects).
@@ -327,36 +256,6 @@ const DIRECT_MAX_FAILURES: u32 = 2;
 /// enough that healed conditions get re-tried the same sitting; an
 /// endpoint-change ([`direct_endpoints_changed`]) still resets it instantly.
 const DIRECT_DENY_COOLDOWN: Duration = Duration::from_secs(15 * 60);
-/// Phase C — the WG-handshake completion deadline for a srflx punch carrier:
-/// past it with no session, the punch failed → tear down to relay. Tight —
-/// bilateral INIT retransmit is ~5 s, so ~2 cycles + jitter + RTT covers a
-/// genuine cross-NAT punch; longer just delays the relay fallback for a pair
-/// that can't punch (e.g. one side symmetric).
-const SRFLX_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(12);
-/// Phase C — the handshake deadline for a public-direct (Phase A) carrier.
-/// Looser than srflx: the accept side (a NAT'd client dialling a public exit)
-/// can lag, and public-NIC reachability rarely fails outright, so we don't rush
-/// it to relay. Still finite so a truly dead public dst can't zombie forever
-/// (closes the same latent Phase A gap the srflx work exposed).
-const PUBLIC_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(30);
-/// rc.223 — RELAY handshake deadline (see `handshake_deadline`'s Relay arm:
-/// the never-handshaked relay was an immortal zombie invisible to every other
-/// detector). Generous: the handshake needs both ends' allocations up, and
-/// the peer's grant/allocate cycle can lag ours; a teardown just
-/// re-coordinates (rate-limited by `RELAY_REFRESH_COOLDOWN`), and each
-/// re-request feeds the P7 churn counter toward the forced-DERP escalation —
-/// exactly the intended cascade on a network where TURN can't carry data.
-const RELAY_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(45);
-/// rc.204 — LAN handshake deadline. On-link, so a genuine same-subnet
-/// handshake completes in milliseconds; one that hasn't completed by this
-/// window is a false LAN match (stale/foreign endpoint, Wi-Fi AP isolation, a
-/// VPN-captured reply path). Pre-rc.204 the LAN tier had NO deadline, and a
-/// never-handshaken carrier's tx/rx stay flat, so the rx-flat heuristic never
-/// fired either — the pair was a permanent zombie with no relay fallback
-/// (field-observed 2026-07-21: every LAN pair wedged in
-/// `HANDSHAKE(REKEY_TIMEOUT)` while boringtun gave up after ~90 s). As tight
-/// as srflx: it either establishes near-instantly or never will.
-const LAN_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(12);
 /// Phase C — srflx consecutive failures before the session-sticky deny. One
 /// more than the LAN/public [`DIRECT_MAX_FAILURES`] — a punch legitimately
 /// misses more often (timing/NAT), so give it an extra try before pinning.
@@ -2156,8 +2055,7 @@ impl OverlayRuntime {
         current_peers: &HashMap<ObjectId, NetmapPeer>,
     ) {
         let now = Instant::now();
-        // (node_id, tier, hard_dead, rx_stale)
-        let mut dead: Vec<(ObjectId, DirectTier, bool, bool)> = Vec::new();
+        let mut dead: Vec<(ObjectId, DirectTier, DeathReason)> = Vec::new();
         for (nid, e) in by_node.iter_mut() {
             let Some((tx, rx)) = wg.peer_traffic(&e.pubkey) else {
                 continue;
@@ -2168,97 +2066,62 @@ impl OverlayRuntime {
             // authenticated inbound packet, INCLUDING content-free WG keepalives.
             // The IP-data `rx` counter alone froze on a mostly-idle-but-alive
             // carrier (its only inbound is keepalives → `TunnResult::Done`, which
-            // never touches `rx`), so the rx-staleness watchdog below would have
-            // reaped a healthy idle link. `peer_take_rx_any` drains the
+            // never touches `rx`), so the rx-staleness rule would have reaped a
+            // healthy idle link. `peer_take_rx_any` drains the
             // keepalive-inclusive liveness counter (single-consumer; the sweep is
-            // the only reader). Advance BEFORE the warm-up `continue` so a freshly
-            // installed peer's first inbound already registers.
+            // the only reader). Advance BEFORE building the tick inputs so a
+            // freshly installed peer's first inbound already registers.
             if wg.peer_take_rx_any(&e.pubkey) > 0 {
                 e.last_rx_at = now;
             }
-            // rc.181 — a relay carrier whose underlying send hard-errored (a
-            // TURNS/TCP reset, or a lost QUIC-over-TURN connection) is dead
-            // NOW. Skip BOTH the warm-up grace and the multi-sweep rx-flat
-            // heuristic for it and re-allocate on this tick (still rate-limited
-            // by `relay_refresh_cooldown` below). Always `false` for a direct
-            // carrier, so this only ever fast-paths a relay.
-            let hard_dead = wg.peer_carrier_dead(&e.pubkey).unwrap_or(false);
-            // Phase C (+ rc.204) — direct-tier handshake deadline: a direct
-            // carrier that never completed its WG handshake within the tier
-            // deadline is a zombie. Its tx/rx stay flat pre-handshake
-            // (handshake packets touch neither counter), so the rx-flat
-            // heuristic below can't see it, and boringtun stops even
-            // keepalives once the attempt expires (~90 s) — it would live
-            // forever. Tear it down → cooldown → relay. Once the handshake
-            // latches (`peer_handshake_done`) this can never fire again (the
-            // tx/rx heuristic governs the established carrier thereafter).
-            // rc.204 extends this to the LAN tier — a false same-subnet match
-            // (stale endpoint / AP isolation / VPN-captured replies) was a
-            // PERMANENT zombie before, with no fallback to relay. rc.223
-            // extends it to the RELAY tier (every tier now has a finite
-            // deadline — see `RELAY_HANDSHAKE_DEADLINE`): a never-handshaked
-            // relay was invisible to every other detector here and wedged the
-            // pair for good on UDP-hostile networks.
-            let punch_dead = !wg.peer_handshake_done(&e.pubkey).unwrap_or(true)
-                && e.since.elapsed() > e.tier.handshake_deadline();
-            // rc.206 — silent-zombie backstop (see RX_STALE_DEADLINE). An
-            // ESTABLISHED carrier (handshake latched — so `punch_dead`, which
-            // only fires PRE-handshake, can never catch it) whose inbound packet
-            // count has stayed frozen past the deadline is dead: a live peer's
-            // persistent-keepalives would have kept advancing `last_rx_at`. This
-            // is independent of tx, so it catches the no-tx-AND-no-rx zombie the
-            // `tx>last_tx && rx==last_rx` heuristic below misreads as benign idle
-            // (boringtun stops emitting once its rekey attempts expire → tx also
-            // flatlines → the heuristic's strike counter even resets). Covers a
-            // relay carrier too — a silently-dropped coturn allocation stops
-            // delivering with no send-error for `hard_dead` to observe.
-            let rx_stale = wg.peer_handshake_done(&e.pubkey).unwrap_or(false)
-                && e.since.elapsed() >= DIRECT_GRACE
-                && now.saturating_duration_since(e.last_rx_at) > RX_STALE_DEADLINE;
-            // Warm-up grace: let the handshake + first packets flow. (A blown
-            // punch deadline is > grace by construction, so it never lands in the
-            // grace window; a hard-dead relay conclusively skips it.)
-            if !hard_dead && e.since.elapsed() < DIRECT_GRACE {
+            // The peer exists (peer_traffic answered just above, no await in
+            // between), so the latch read always answers too — the `else` is
+            // unreachable belt-and-braces.
+            let Some(handshake_done) = wg.peer_handshake_done(&e.pubkey) else {
                 continue;
-            }
-            // Sent this interval but received nothing back ⇒ suspect. (If we
-            // didn't send either, the link is just idle — no judgment.)
-            if tx > last_tx && rx == last_rx {
-                e.bad_sweeps += 1;
-            } else {
-                e.bad_sweeps = 0;
-                // A direct carrier that's actually RECEIVING is genuinely
-                // healthy → clear its strike count so old failures don't
-                // accumulate across a long healthy period and prematurely pin a
-                // real peer to relay. (rx advancing, not just idle.) Clear the
-                // count on the carrier's OWN tier (CC1 — never cross-clear).
-                if e.is_direct && rx > last_rx {
-                    match e.tier {
-                        DirectTier::Srflx => {
-                            cooldowns.srflx_fails.remove(nid);
-                        }
-                        DirectTier::Public => {
-                            cooldowns.public_fails.remove(nid);
-                        }
-                        _ => {
-                            cooldowns.lan_fails.remove(nid);
-                        }
+            };
+            // P2 — every rule that can kill this carrier lives in ONE pure
+            // transition (`lifecycle::carrier_tick`): the per-tier handshake
+            // deadline (Phase C / rc.204 / rc.223), the rc.206 rx-staleness
+            // backstop, the rc.137 one-way counter, the rc.181 hard-dead fast
+            // path, the warm-up grace, and the relay refresh holdoff. This
+            // loop only gathers inputs and applies the verdict.
+            let v = carrier_tick(&HealthInputs {
+                tier: e.tier,
+                is_direct: e.is_direct,
+                hard_dead: wg.peer_carrier_dead(&e.pubkey).unwrap_or(false),
+                handshake_done,
+                since_install: e.since.elapsed(),
+                since_last_rx: now.saturating_duration_since(e.last_rx_at),
+                traffic: (tx, rx),
+                last_traffic: (last_tx, last_rx),
+                bad_sweeps: e.bad_sweeps,
+                relay_refresh_held: relay_refresh_cooldown
+                    .get(nid)
+                    .is_some_and(|&until| until > now),
+            });
+            e.bad_sweeps = v.bad_sweeps;
+            if v.clear_tier_strikes {
+                // Clear the count on the carrier's OWN tier (CC1 — never
+                // cross-clear) so old failures don't accumulate across a long
+                // healthy period and prematurely pin a real peer to relay.
+                match e.tier {
+                    DirectTier::Srflx => {
+                        cooldowns.srflx_fails.remove(nid);
+                    }
+                    DirectTier::Public => {
+                        cooldowns.public_fails.remove(nid);
+                    }
+                    _ => {
+                        cooldowns.lan_fails.remove(nid);
                     }
                 }
             }
-            if e.bad_sweeps >= BAD_SWEEPS_TO_FALLBACK || hard_dead || punch_dead || rx_stale {
-                // For a relay, hold off if we just refreshed it (anti-ping-pong).
-                if !e.is_direct
-                    && relay_refresh_cooldown
-                        .get(nid)
-                        .is_some_and(|&until| until > now)
-                {
-                    continue;
-                }
-                dead.push((*nid, e.tier, hard_dead, rx_stale));
+            if let Some(reason) = v.death {
+                dead.push((*nid, e.tier, reason));
             }
         }
-        for (nid, tier, hard_dead, rx_stale) in dead {
+        for (nid, tier, reason) in dead {
             let Some(e) = by_node.remove(&nid) else {
                 continue;
             };
@@ -2286,12 +2149,17 @@ impl OverlayRuntime {
                 *fails += 1;
                 let sticky = *fails >= direct_max_failures(tier);
                 cooldown_map.insert(nid, now + direct_retry_cooldown(tier, *fails));
+                // P2 — the (reason, tier, sticky)→string mapping is NOT 1:1
+                // and is deliberately preserved verbatim: on the direct side
+                // `HandshakeDeadline` and `OneWay` share the "didn't
+                // establish" line (the pre-P2 tuple only carried
+                // hard_dead/rx_stale), with sticky > RxStale > else priority.
                 if sticky {
                     warn!(
                         peer = %nid, tier = tier_name, fails = *fails,
                         "overlay: direct carrier failed repeatedly — pinning this peer to relay for the session"
                     );
-                } else if rx_stale {
+                } else if reason == DeathReason::RxStale {
                     // rc.206 — an ESTABLISHED direct carrier that went silent
                     // (peer roamed / NAT rebind / path died mid-session), not a
                     // never-punched one. Distinct message so field logs separate
@@ -2311,12 +2179,14 @@ impl OverlayRuntime {
                 }
             } else {
                 relay_refresh_cooldown.insert(nid, now + RELAY_REFRESH_COOLDOWN);
-                if hard_dead {
+                // P2 — relay side: HardDead > RxStale > else ("one-way" covers
+                // both OneWay and a relay HandshakeDeadline, as pre-P2).
+                if reason == DeathReason::HardDead {
                     warn!(
                         peer = %nid,
                         "overlay: relay carrier send hard-errored (TURNS/TCP reset / QUIC-over-TURN lost) — re-allocating"
                     );
-                } else if rx_stale {
+                } else if reason == DeathReason::RxStale {
                     // rc.206 — a relay carrier that stopped delivering with no
                     // send-error to trip `hard_dead` (silently-dropped coturn
                     // allocation / a dead worker the send path can't detect).
@@ -2803,7 +2673,14 @@ impl OverlayRuntime {
         let now = Instant::now();
         let mut settled: Vec<ObjectId> = Vec::new();
         for (nid, p) in upgrade_probes.iter() {
-            if wg.probe_handshake_done(&p.pubkey) == Some(true) {
+            // P2 — the promote/expire/wait decision is the pure
+            // `lifecycle::probe_tick`; this loop executes the disposition.
+            let verdict = probe_tick(
+                wg.probe_handshake_done(&p.pubkey) == Some(true),
+                now.duration_since(p.since),
+                p.tier,
+            );
+            if verdict == ProbeVerdict::Promote {
                 // Bidirectional direct proven → cut over. `promote_direct_probe`
                 // drops the old relay carrier; forget its coturn allocation and
                 // retag `by_node` as the direct tier.
@@ -2847,7 +2724,7 @@ impl OverlayRuntime {
                     );
                 }
                 settled.push(*nid);
-            } else if now.duration_since(p.since) > p.tier.handshake_deadline() {
+            } else if verdict == ProbeVerdict::Expire {
                 // Probe never latched within the deadline → direct unreachable.
                 // Drop it, KEEP the relay, book the failure on the tier (CC1 —
                 // mirrors `sweep_carrier_health`'s direct→relay bookkeeping so a
