@@ -142,6 +142,94 @@ pub fn vp9_qsv_config(verdict: Option<(bool, bool)>, forced_lp: Option<bool>) ->
     }
 }
 
+/// Real frames since the last settle that make a motion episode "a burst"
+/// worth an idle-settle resync IDR. A window-drag produces hundreds; a caret
+/// blink, a clock tick, or a couple of keystrokes produce 1-3 and must NOT
+/// qualify. Env `ROOMLER_AGENT_SETTLE_KF_MIN_BURST` overrides; `0` restores
+/// the legacy rc.187 fire-on-every-settle behaviour.
+pub const SETTLE_KF_MIN_BURST: u32 = 10;
+
+/// Minimum spacing between settle IDRs — a scroll-pause-scroll pattern
+/// re-settles every second or two and shouldn't pay an IDR each time.
+pub const SETTLE_KF_MIN_GAP: Duration = Duration::from_secs(5);
+
+/// Gate for the rc.187 idle-settle keyframe (field 2026-07-27, NEO16 viewing
+/// PC55331): the settle IDR fired 60 ms after EVERY real frame, and a
+/// blinking text caret (Windows default ~530 ms toggle) produces a real frame
+/// per toggle — a ~2 Hz forced-IDR metronome, visible as text pulsing
+/// blur→crystal on every codec (worst on av1_nvenc, whose budget-capped IDRs
+/// are coarsest relative to their refinement). rc.187's actual purpose — a
+/// standalone resync frame after MOTION where a viewer may have dropped
+/// frames — only needs the IDR after a real burst, so: fire on the first
+/// settle of an episode only if the episode carried `min_burst`+ real frames
+/// AND the last settle IDR is `min_gap` in the past. Isolated blips ride as
+/// ordinary tiny deltas (which is all they ever were).
+#[derive(Debug)]
+pub struct SettleKeyframeGate {
+    min_burst: u32,
+    min_gap: Duration,
+    /// Real frames in the current motion episode (reset at each settle).
+    burst: u32,
+    /// One decision per episode: set at the first settle, cleared by the
+    /// next real frame. Keeps the 60 ms keepalive ticks from re-deciding.
+    decided_this_episode: bool,
+    last_fired: Option<Instant>,
+}
+
+impl SettleKeyframeGate {
+    pub fn new(min_burst: u32, min_gap: Duration) -> Self {
+        Self {
+            min_burst,
+            min_gap,
+            burst: 0,
+            decided_this_episode: false,
+            last_fired: None,
+        }
+    }
+
+    /// Defaults + the `ROOMLER_AGENT_SETTLE_KF_MIN_BURST` override. `0` =
+    /// legacy (fire on the first settle of every episode, no cooldown).
+    pub fn from_env() -> Self {
+        let min_burst = tunnel_core::env::node_env("SETTLE_KF_MIN_BURST")
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(SETTLE_KF_MIN_BURST);
+        let min_gap = if min_burst == 0 {
+            Duration::ZERO
+        } else {
+            SETTLE_KF_MIN_GAP
+        };
+        Self::new(min_burst, min_gap)
+    }
+
+    /// A real (damage-carrying) frame arrived — the episode continues.
+    pub fn note_real_frame(&mut self) {
+        self.burst = self.burst.saturating_add(1);
+        self.decided_this_episode = false;
+    }
+
+    /// Call on every idle-keepalive tick. Returns `Some(burst)` exactly when
+    /// this settle should carry the resync IDR (the burst size is for the
+    /// log); `None` otherwise. The first tick of a settle consumes the
+    /// episode's burst and decides; later ticks are no-ops.
+    pub fn should_fire_on_settle(&mut self, now: Instant) -> Option<u32> {
+        if self.decided_this_episode {
+            return None;
+        }
+        self.decided_this_episode = true;
+        let burst = std::mem::take(&mut self.burst);
+        if burst < self.min_burst {
+            return None;
+        }
+        if let Some(t) = self.last_fired
+            && now.duration_since(t) < self.min_gap
+        {
+            return None;
+        }
+        self.last_fired = Some(now);
+        Some(burst)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,5 +330,89 @@ mod tests {
         assert_eq!(h264_cq_adjust("h264_amf", 10), 10);
         assert_eq!(h264_cq_adjust("hevc_qsv", 22), 22);
         assert_eq!(h264_cq_adjust("vp9_qsv", 22), 22);
+    }
+
+    fn gate() -> SettleKeyframeGate {
+        SettleKeyframeGate::new(SETTLE_KF_MIN_BURST, SETTLE_KF_MIN_GAP)
+    }
+
+    #[test]
+    fn caret_blink_never_fires_a_settle_keyframe() {
+        // The field pattern: one real frame per caret toggle (~530 ms), a
+        // settle 60 ms later, repeated forever. Pre-gate this forced ~2 IDRs
+        // per second; the gate must fire ZERO.
+        let mut g = gate();
+        let mut now = t0();
+        for _ in 0..20 {
+            g.note_real_frame(); // the toggle's single damage frame
+            assert_eq!(g.should_fire_on_settle(now), None); // settle +60 ms
+            // keepalive ticks between toggles decide nothing further
+            assert_eq!(g.should_fire_on_settle(now), None);
+            now += Duration::from_millis(530);
+        }
+    }
+
+    #[test]
+    fn a_drag_burst_fires_exactly_once_on_the_first_settle() {
+        let mut g = gate();
+        let now = t0();
+        for _ in 0..60 {
+            g.note_real_frame(); // 1 s of real motion
+        }
+        assert_eq!(g.should_fire_on_settle(now), Some(60)); // first settle → IDR
+        assert_eq!(g.should_fire_on_settle(now), None); // 60 ms later: nothing
+        assert_eq!(g.should_fire_on_settle(now), None);
+    }
+
+    #[test]
+    fn typing_trickle_below_the_burst_threshold_stays_quiet() {
+        let mut g = gate();
+        let now = t0();
+        for _ in 0..(SETTLE_KF_MIN_BURST - 1) {
+            g.note_real_frame();
+        }
+        assert_eq!(g.should_fire_on_settle(now), None);
+        // The undersized burst is consumed, not accumulated: another small
+        // trickle still doesn't reach the threshold.
+        for _ in 0..(SETTLE_KF_MIN_BURST - 1) {
+            g.note_real_frame();
+        }
+        assert_eq!(g.should_fire_on_settle(now), None);
+    }
+
+    #[test]
+    fn cooldown_suppresses_a_second_burst_settle() {
+        let mut g = gate();
+        let now = t0();
+        for _ in 0..30 {
+            g.note_real_frame();
+        }
+        assert_eq!(g.should_fire_on_settle(now), Some(30));
+        // Scroll-pause-scroll 2 s later: burst qualifies, cooldown blocks.
+        let later = now + Duration::from_secs(2);
+        for _ in 0..30 {
+            g.note_real_frame();
+        }
+        assert_eq!(g.should_fire_on_settle(later), None);
+        // Past the cooldown a fresh burst fires again.
+        let after = now + SETTLE_KF_MIN_GAP + Duration::from_secs(1);
+        for _ in 0..30 {
+            g.note_real_frame();
+        }
+        assert_eq!(g.should_fire_on_settle(after), Some(30));
+    }
+
+    #[test]
+    fn legacy_hatch_min_burst_zero_fires_every_episode() {
+        // min_burst 0 + zero gap = rc.187 behaviour: first settle of EVERY
+        // episode fires, keepalive ticks after it don't.
+        let mut g = SettleKeyframeGate::new(0, Duration::ZERO);
+        let mut now = t0();
+        for _ in 0..5 {
+            g.note_real_frame();
+            assert!(g.should_fire_on_settle(now).is_some());
+            assert_eq!(g.should_fire_on_settle(now), None); // same episode
+            now += Duration::from_millis(530);
+        }
     }
 }

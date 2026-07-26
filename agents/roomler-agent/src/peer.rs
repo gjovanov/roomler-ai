@@ -2276,10 +2276,14 @@ async fn media_pump_vp9_444_dc(
     let mut encoder_dims: Option<(u32, u32)> = None;
     let mut last_capture_at = std::time::Instant::now();
     let mut last_good_frame: Option<std::sync::Arc<crate::capture::Frame>> = None;
-    // rc.187 — stale-frame fix (see media_pump_ffmpeg_dc): the first idle
-    // keepalive after motion settles forces a keyframe so a viewer that dropped
-    // frames during the motion resyncs to the settled state.
-    let mut idle_keyframe_sent = false;
+    // rc.187 stale-frame fix, burst-gated 2026-07-27 (see
+    // rate_profile::SettleKeyframeGate): the first idle keepalive after a
+    // MOTION BURST settles forces a keyframe so a viewer that dropped frames
+    // mid-motion resyncs. Isolated blips no longer qualify — a blinking text
+    // caret (~530 ms toggle) counted as "motion" and forced a ~2 Hz IDR
+    // metronome (field NEO16→PC55331 2026-07-27: text pulsing blur→crystal
+    // every half second on all codecs).
+    let mut settle_kf = crate::encode::rate_profile::SettleKeyframeGate::from_env();
     // rc.130 — 60 ms (was 1 s), matching the FFmpeg pump. libvpx is synchronous
     // (g_lag_in_frames=0) so there's no encoder-output queue to drain here, but
     // the faster keepalive still feeds the browser decoder more tightly and
@@ -2626,20 +2630,27 @@ async fn media_pump_vp9_444_dc(
                 last_capture_at = std::time::Instant::now();
                 let arc = std::sync::Arc::new(f);
                 last_good_frame = Some(arc.clone());
-                // Motion resumed — the next settle owes the viewer a keyframe.
-                idle_keyframe_sent = false;
+                // Motion continues — the settle gate counts the episode.
+                settle_kf.note_real_frame();
                 arc
             }
             Ok(None) => {
                 if last_capture_at.elapsed() >= IDLE_KEEPALIVE {
                     if let Some(ref f) = last_good_frame {
                         last_capture_at = std::time::Instant::now();
-                        // rc.187 — first keepalive after settle = keyframe, so a
-                        // viewer that dropped frames mid-motion resyncs to the
-                        // settled state instead of freezing on the old position.
-                        if !idle_keyframe_sent {
+                        // rc.187 (burst-gated) — first keepalive after a real
+                        // motion burst settles = keyframe, so a viewer that
+                        // dropped frames mid-motion resyncs to the settled
+                        // state instead of freezing on the old position.
+                        if let Some(burst) =
+                            settle_kf.should_fire_on_settle(std::time::Instant::now())
+                        {
                             keyframe_requested.store(true, std::sync::atomic::Ordering::Relaxed);
-                            idle_keyframe_sent = true;
+                            tracing::info!(
+                                %session_id,
+                                burst,
+                                "idle-settle keyframe (motion burst ended)"
+                            );
                         }
                         f.clone()
                     } else {
@@ -3412,11 +3423,15 @@ async fn media_pump_ffmpeg_dc(
     // timeBeginPeriod(1) landed but didn't move fps).
     let mut last_capture_at = std::time::Instant::now();
     let mut last_good_frame: Option<std::sync::Arc<crate::capture::Frame>> = None;
-    // rc.187 — stale-frame fix. `false` while real frames flow; the FIRST idle
-    // keepalive after motion settles forces a keyframe so a viewer that dropped
-    // frames during the motion (backpressure / decode backlog) can resync to
-    // the settled state instead of freezing on the pre-settle position.
-    let mut idle_keyframe_sent = false;
+    // rc.187 stale-frame fix, burst-gated 2026-07-27 (see
+    // rate_profile::SettleKeyframeGate): the FIRST idle keepalive after a
+    // MOTION BURST settles forces a keyframe so a viewer that dropped frames
+    // during the motion (backpressure / decode backlog) can resync to the
+    // settled state. Isolated blips no longer qualify — a blinking caret
+    // (~530 ms) counted as "motion" and forced a ~2 Hz IDR metronome (field
+    // NEO16→PC55331 2026-07-27: blur→crystal text pulse on all codecs,
+    // most visible on av1_nvenc).
+    let mut settle_kf = crate::encode::rate_profile::SettleKeyframeGate::from_env();
     // rc.130 — 60 ms (was 1 s). Doubles as the SPARSE-INPUT DRAIN. With the
     // HW encoder's output queue capped to ~1 frame (encoder.rs delay=0 /
     // async_depth=1), re-feeding the last good frame here flushes the held
@@ -3741,8 +3756,8 @@ async fn media_pump_ffmpeg_dc(
                 last_good_frame = Some(arc.clone());
                 last_capture_at = std::time::Instant::now();
                 frames_captured += 1;
-                // Motion resumed — the next settle owes the viewer a keyframe.
-                idle_keyframe_sent = false;
+                // Motion continues — the settle gate counts the episode.
+                settle_kf.note_real_frame();
                 arc
             }
             Ok(None) => {
@@ -3754,15 +3769,22 @@ async fn media_pump_ffmpeg_dc(
                     && let Some(ref f) = last_good_frame
                 {
                     last_capture_at = std::time::Instant::now();
-                    // rc.187 — the FIRST keepalive after the screen settles is
-                    // a KEYFRAME. `keyframe_requested` is consumed by the force
-                    // block below (which also exempts it from the decode
-                    // frame-skip), so this settled frame lands as a fresh IDR
-                    // any viewer can decode standalone — fixing the "window
-                    // shows the old position after a drag" freeze.
-                    if !idle_keyframe_sent {
+                    // rc.187 (burst-gated) — the FIRST keepalive after a real
+                    // motion burst settles is a KEYFRAME. `keyframe_requested`
+                    // is consumed by the force block below (which also exempts
+                    // it from the decode frame-skip), so this settled frame
+                    // lands as a fresh IDR any viewer can decode standalone —
+                    // fixing the "window shows the old position after a drag"
+                    // freeze without paying an IDR for every caret blink.
+                    if let Some(burst) = settle_kf.should_fire_on_settle(std::time::Instant::now())
+                    {
                         keyframe_requested.store(true, std::sync::atomic::Ordering::SeqCst);
-                        idle_keyframe_sent = true;
+                        tracing::info!(
+                            %session_id,
+                            codec_label,
+                            burst,
+                            "idle-settle keyframe (motion burst ended)"
+                        );
                     }
                     f.clone()
                 } else {
