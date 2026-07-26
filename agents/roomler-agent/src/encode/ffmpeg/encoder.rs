@@ -100,6 +100,15 @@ const VP9_ENCODER_NAMES: &[&str] = &["vp9_qsv"];
 /// protects us if it ever shares the failure.
 const AV1_ENCODER_NAMES: &[&str] = &["av1_nvenc", "av1_qsv", "av1_amf"];
 
+/// P2 (Parsec-class plan) — Codec dispatch order for H.264 over the
+/// `data-channel-h264` transport. HW-only by construction (openh264 SW
+/// stays on the legacy RTP-track path): H.264 encode silicon is the most
+/// universally present of the four codecs (every NVENC generation, every
+/// QSV generation, every AMF generation). Probe-gated in caps.rs like
+/// HEVC/AV1 — hosts without H.264 HW simply don't advertise the transport
+/// and explicit H.264 picks stay on the RTP track + `<video>` fallback.
+const H264_ENCODER_NAMES: &[&str] = &["h264_nvenc", "h264_qsv", "h264_amf"];
+
 /// rc.86 — constant-quality target (lower = sharper, more bits).
 /// Default 22 is a good screen-content sweet spot for HEVC/VP9 — fine
 /// text edges stay crisp without a full lossless blow-out. Range
@@ -469,6 +478,49 @@ impl FfmpegEncoder {
     pub fn new_av1_adaptive(width: u32, height: u32, fps: u32, maxrate_bps: usize) -> Result<Self> {
         Self::new_with_dispatch(
             AV1_ENCODER_NAMES,
+            width,
+            height,
+            fps.max(1) as i32,
+            maxrate_bps,
+        )
+    }
+
+    /// P2 — H.264 probe constructor (caps.rs). HW-only cascade
+    /// (`h264_nvenc` → `h264_qsv` → `h264_amf`); `Err` on hosts without
+    /// H.264 encode silicon, which don't advertise `data-channel-h264`.
+    pub fn new_h264(width: u32, height: u32) -> Result<Self> {
+        let maxrate = ffmpeg_maxrate_bps(
+            width,
+            height,
+            DEFAULT_ENCODER_FPS as u32,
+            crate::encode::transport_is_constrained(),
+        );
+        Self::new_with_dispatch(
+            H264_ENCODER_NAMES,
+            width,
+            height,
+            DEFAULT_ENCODER_FPS,
+            maxrate,
+        )
+    }
+
+    /// P2 — DataChannel-pump H.264 constructor. See
+    /// [`Self::new_hevc_adaptive`] for the fps/maxrate threading contract.
+    /// The name-substring-keyed `encoder_options` gives h264_nvenc/qsv/amf
+    /// the same cq/maxrate/bufsize/forced-idr/low-latency knobs as their
+    /// HEVC siblings, and the GOP site gives them `KEYFRAME_INTERVAL`
+    /// (they honour runtime forced IDR → on-demand-only keys like
+    /// HEVC/AV1). The bitstream is Annex-B with in-band SPS/PPS (FFmpeg
+    /// default without `GLOBAL_HEADER` — the same contract the HEVC path
+    /// ships and WebCodecs decodes description-less).
+    pub fn new_h264_adaptive(
+        width: u32,
+        height: u32,
+        fps: u32,
+        maxrate_bps: usize,
+    ) -> Result<Self> {
+        Self::new_with_dispatch(
+            H264_ENCODER_NAMES,
             width,
             height,
             fps.max(1) as i32,

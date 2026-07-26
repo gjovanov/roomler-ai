@@ -2587,9 +2587,11 @@ const statsCodecLabel = computed(() => {
   if (vi && (rc.vp9_444Active.value || rc.hevcActive.value)) {
     const codecName = vi.codec.toLowerCase() === 'h265'
       ? 'H.265'
-      : vi.codec.toLowerCase() === 'vp9'
-        ? 'VP9'
-        : vi.codec.toUpperCase()
+      : vi.codec.toLowerCase() === 'h264'
+        ? 'H.264'
+        : vi.codec.toLowerCase() === 'vp9'
+          ? 'VP9'
+          : vi.codec.toUpperCase()
     const chromaName = vi.chroma === 'yuv444' ? '4:4:4' : vi.chroma === 'yuv420' ? '4:2:0' : ''
     const hw = vi.hardware ? 'HW' : 'SW'
     const enc = vi.encoder ? ` (${vi.encoder})` : ''
