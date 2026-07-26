@@ -703,6 +703,19 @@ to-activate, so the browser never sees a bait-and-switch.
   ~30 Hz; browser paints the real OS cursor bitmap on an overlay
   canvas. Synthetic initials-badge is the fallback when no shape has
   been cached yet.
+  **Native OS cursor (current):** `cursor:shape` gained an optional
+  `css` keyword — the agent matches the live `HCURSOR` against the
+  stock `IDC_*` set and, for standard cursors (I-beam→`text`,
+  arrow→`default`, hand→`pointer`, resize variants…), tells the browser
+  to render the viewer's real OS cursor via CSS `cursor:` on the video
+  surface (zero-latency, pixel-perfect) instead of the streamed bitmap;
+  app-custom cursors still use the bitmap (whose monochrome I-beam path
+  now renders black + white-outline rather than the old solid-white
+  blob). The WGC backend's in-video cursor bake-in
+  (`SetIsCursorCaptureEnabled`) is disabled by default
+  (`ROOMLER_AGENT_WGC_CURSOR=1` re-enables) so the low-latency overlay /
+  CSS cursor is the single source with no double cursor. Additive +
+  back-compat: old browsers ignore `css` and draw the bitmap.
 - **Clipboard DC** (0.1.32): thread-pinned `arboard::Clipboard` worker;
   JSON protocol `clipboard:read` / `clipboard:write` /
   `clipboard:content` / `clipboard:error` with `req_id` round-trip
@@ -798,12 +811,27 @@ to-activate, so the browser never sees a bait-and-switch.
   Linux/macOS viewers) triggers `sendCtrlAltDel()` — AltGr carve-out,
   repeat-guarded, gated on pointer-over-viewer OR locked fullscreen.
 - **Viewer-indicator overlay** (`viewer-indicator` feature, Windows
-  only): topmost layered click-through window on the controlled
-  host with a 6 px red border + "Being viewed by: …" caption.
-  `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` keeps the
-  overlay out of every screen-capture path (our WGC backend, DXGI
-  Desktop Duplication, BitBlt, third-party tools), so the controller
-  doesn't see a recursive picture-frame in the RTP stream.
+  only): originally one click-through window with a 6 px red border +
+  "Being viewed by: …" caption. **Current design** = two topmost,
+  capture-excluded windows. A **thin 2 px red border**, always on while
+  a session is active (the passive "someone is watching" cue). A
+  separate **interactive badge** — hidden until the viewee parks the
+  pointer at the top edge for ~1.2 s (RDP / RustDesk-style reveal),
+  **draggable** so it can be moved off content that needs reading,
+  auto-hiding ~2.5 s after the pointer leaves — shows the controller's
+  **initials avatar + display name** and a **Disconnect** button.
+  Clicking Disconnect sends the session's `ObjectId` through an
+  in-process channel to the signaling `select!`, which closes the peer
+  and emits `ClientMsg::Terminate {reason: AgentHangup}`; the server
+  tears the session down, notifies the browser, and echoes `Terminate`
+  back (the agent handler is idempotent). The overlay label is the
+  controller's real `display_name`, resolved server-side at WS connect
+  (fallback: login username). `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`
+  keeps BOTH windows out of every screen-capture path (our WGC backend,
+  DXGI Desktop Duplication, BitBlt, third-party tools), so neither the
+  border nor the Disconnect button leaks into the RTP stream — and the
+  viewer's injected input can't intentionally target what it can't see.
+  Primary-monitor + DPI-naive today.
 
 ### 18.3.1 Keyboard-layout auto-switch + rc:layout (0.3.0-rc.227)
 
