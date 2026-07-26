@@ -4891,6 +4891,13 @@ fn attach_cursor_handler(
                             "hx": shape.hotspot_x,
                             "hy": shape.hotspot_y,
                             "bgra": b64,
+                            // Optional CSS `cursor` keyword for stock
+                            // system cursors ("text", "default", …);
+                            // null for app-custom cursors. Lets the
+                            // browser render the viewer's native OS
+                            // cursor instead of this bitmap. Additive —
+                            // old browsers ignore it.
+                            "css": shape.css,
                         });
                         if let Ok(s) = serde_json::to_string(&msg) {
                             let _ = dc.send_text(s).await;
