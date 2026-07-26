@@ -69,7 +69,7 @@ use std::time::Duration;
 /// each tier carries a WG-handshake completion deadline (a carrier that never
 /// establishes is torn down; direct tiers fall back to relay, the relay tier
 /// re-coordinates).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum DirectTier {
     /// Same-subnet LAN direct (rc.131-135) — on-link. rc.204: gets a TIGHT
     /// handshake deadline too — pre-handshake tx/rx stay (near-)flat, so
