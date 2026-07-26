@@ -459,6 +459,7 @@
         ref="stageEl"
         class="video-frame"
         :class="[`scale-${rc.scaleMode.value}`, { 'drag-over': isDragOver }]"
+        :style="{ cursor: remoteCursorCss ?? 'none' }"
         tabindex="0"
         @pointermove="onStagePointerMove"
         @pointerleave="cursorVisible = false"
@@ -572,7 +573,7 @@
              hasn't advertised yet or to mark additional controllers
              in multi-watcher sessions. -->
         <div
-          v-if="!remoteCursorVisible && cursorVisible && controllerInitials"
+          v-if="!remoteCursorVisible && !remoteCursorCss && cursorVisible && controllerInitials"
           class="cursor-badge"
           :style="{ transform: `translate(${cursorX}px, ${cursorY}px)` }"
         >
@@ -1241,6 +1242,7 @@ import {
   nextDirPath,
   isKeyboardLockSupported,
   diagHudEnabled,
+  remoteCursorCssFor,
   type RcScaleMode,
   type RcResolutionSetting,
   type RcPriority,
@@ -2700,9 +2702,18 @@ const statsResolutionLabel = computed(() => {
 
 // Remote cursor overlay (1E.3). Requires both a position and a
 // matching shape bitmap; hides during paint if either is missing.
+// When the agent tags the active cursor as a standard system cursor,
+// render the viewer's real OS cursor via CSS (zero-latency, native)
+// on `.video-frame` instead of the streamed bitmap. Null → app-custom
+// cursor (or hidden) → fall back to the canvas overlay / badge.
+const remoteCursorCss = computed(() => remoteCursorCssFor(rc.cursor.value))
+
 const remoteCursorVisible = computed(() => {
   const pos = rc.cursor.value.pos
   if (!pos) return false
+  // A known system cursor renders natively via remoteCursorCss, so
+  // suppress the canvas bitmap overlay in that case.
+  if (remoteCursorCss.value) return false
   return rc.cursor.value.shapes.has(pos.id)
 })
 
