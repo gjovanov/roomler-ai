@@ -13,14 +13,6 @@ pub(crate) mod agent_internal;
 pub mod agent_selector;
 pub mod agent_stats;
 pub mod agent_transport;
-// VENDOR PATCH: TCP/TLS Conn-adapter for relay candidate gathering.
-// See module docs for the RFC framing notes + upstream context.
-// `pub` (not `pub(crate)`) so `tunnel-core`'s QUIC-over-TURN Tier-3 path
-// can reuse `TcpTurnConn` to allocate a TURNS/TCP relay for quinn on
-// UDP-blocked corp nets (the same adapter this crate's relay-gather uses).
-pub mod tcp_turn_conn;
-#[cfg(test)]
-mod tcp_turn_conn_test;
 
 use std::collections::HashMap;
 use std::future::Future;
