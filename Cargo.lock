@@ -7282,6 +7282,7 @@ dependencies = [
  "sha2",
  "smoltcp",
  "socket2 0.5.10",
+ "tcp-turn-conn",
  "thiserror 2.0.18",
  "tokio",
  "tokio-test",
@@ -7289,7 +7290,6 @@ dependencies = [
  "tun",
  "turn",
  "webrtc",
- "webrtc-ice",
  "webrtc-util",
  "windows-sys 0.61.2",
 ]
@@ -8977,6 +8977,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tcp-turn-conn"
+version = "0.3.0-rc.246"
+dependencies = [
+ "async-trait",
+ "log",
+ "rustls-native-certs",
+ "tokio",
+ "tokio-rustls",
+ "webpki-roots 0.26.11",
+ "webrtc-util",
+]
+
+[[package]]
 name = "tempfile"
 version = "3.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10432,18 +10445,16 @@ dependencies = [
  "log",
  "portable-atomic",
  "rand 0.8.6",
- "rustls-native-certs",
  "serde",
  "serde_json",
  "stun",
+ "tcp-turn-conn",
  "thiserror 1.0.69",
  "tokio",
- "tokio-rustls",
  "turn",
  "url",
  "uuid",
  "waitgroup",
- "webpki-roots 0.26.11",
  "webrtc-mdns",
  "webrtc-util",
 ]

@@ -838,7 +838,10 @@ impl Agent {
                                 return Ok(());
                             }
                         };
-                        let adapter = match super::tcp_turn_conn::TcpTurnConn::connect_tls(
+                        // VENDOR PATCH: the adapter lives in the workspace's
+                        // `tcp-turn-conn` crate (P5 extraction — the fork's
+                        // whole substance in one auditable place).
+                        let adapter = match tcp_turn_conn::TcpTurnConn::connect_tls(
                             tcp,
                             &turn_host_for_sni,
                         )
