@@ -40,12 +40,13 @@ use tokio::sync::mpsc;
 // renamed to `util`; we use the real name here).
 use turn::client::{Client, ClientConfig};
 use webrtc_util::conn::Conn as UtilConn;
-// Tier 3 (TURNS/TCP): the vendored `webrtc-ice`'s field-proven `util::Conn`
-// adapter over TLS-over-TCP to coturn. `webrtc-ice` resolves to
-// `crates/vendored/webrtc-ice` via the root `[patch.crates-io]`, and its
-// `util` is the SAME `webrtc-util 0.10` `turn` 0.9 uses — so a
-// `TcpTurnConn` is accepted as `ClientConfig.conn` with no type bridging.
-use webrtc_ice::agent::tcp_turn_conn::TcpTurnConn;
+// Tier 3 (TURNS/TCP): the field-proven `util::Conn` adapter over
+// TLS-over-TCP to coturn. P5 — lives in the workspace `tcp-turn-conn`
+// crate (extracted from the vendored `webrtc-ice`; tunnel-core no longer
+// depends on the fork). Its `util` is the SAME `webrtc-util 0.10` `turn`
+// 0.9 uses — so a `TcpTurnConn` is accepted as `ClientConfig.conn` with
+// no type bridging.
+use tcp_turn_conn::TcpTurnConn;
 
 /// A relayed datagram connection — the subset of a TURN-relayed
 /// `util::Conn` that [`RelayUdpSocket`] needs. Phase 3b implements this
