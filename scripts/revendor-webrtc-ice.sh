@@ -45,6 +45,11 @@ trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/upstream"
 curl -sfL "https://static.crates.io/crates/webrtc-ice/webrtc-ice-$VER.crate" |
     tar xz -C "$TMP/upstream" --strip-components=1
+# The tarball ships a Cargo.lock, but upstream's own .gitignore (also in the
+# tarball) excludes it — so the TRACKED vendored tree can never carry one
+# (and under [patch.crates-io] the workspace lockfile governs anyway).
+# Strip it so tree == upstream+patch holds on a clean checkout.
+rm -f "$TMP/upstream/Cargo.lock"
 
 case "$MODE" in
 regen)
