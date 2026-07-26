@@ -3499,6 +3499,15 @@ async fn media_pump_ffmpeg_dc(
     // heartbeat; applied to the ceiling every frame. 1.0 = full quality.
     let mut encode_pressure = crate::encode::encode_pressure::EncodePressure::new();
     let mut encode_factor: f32 = 1.0;
+    // 2026-07-27 shelf item — encode-bound auto-downscale: when the bitrate
+    // lever is exhausted (factor at floor) and the encoder is STILL
+    // saturated, step the resolution tier down (native → ~1440p → ~1080p);
+    // step back up only after sustained deep headroom. Rides the SOFT slot
+    // of `effective_target_resolution`, so an explicit controller Fixed pick
+    // always wins and the relay hard cap still composes after. Kill:
+    // `ROOMLER_AGENT_AUTO_DOWNSCALE=0`.
+    let mut downscale_tier = crate::encode::encode_pressure::DownscaleTier::new();
+    let mut auto_res_cap: Option<u32> = None;
     // rc.88 — per-stage timing accumulators (µs since last heartbeat) so
     // the field log localises the bottleneck: capture vs encode vs send.
     let mut capture_us: u64 = 0;
@@ -3853,7 +3862,9 @@ async fn media_pump_ffmpeg_dc(
                 priority.load(std::sync::atomic::Ordering::Relaxed),
                 constrained,
             ),
-            None,
+            // 2026-07-27 — encode-bound auto-downscale tier (soft slot: an
+            // explicit controller Fixed pick bypasses it by construction).
+            auto_res_cap,
         );
         if effective_target != user_target && res_cap_logged != Some(effective_target) {
             info!(
@@ -4224,6 +4235,23 @@ async fn media_pump_ffmpeg_dc(
             // next frame on (throttles a saturating encoder, restores when it
             // recovers).
             encode_factor = encode_pressure.observe(avg_encode_ms as f32);
+            // 2026-07-27 — fold this window into the resolution tier. Fires
+            // rarely (≥10 s saturated-at-floor down / ≥60 s deep-headroom
+            // up, 60 s cooldown); the dims change lands via the per-frame
+            // effective_target_resolution → dim-change encoder rebuild.
+            if let Some(new_cap) =
+                downscale_tier.observe(encode_pressure.tier_signal(), std::time::Instant::now())
+            {
+                auto_res_cap = new_cap;
+                tracing::info!(
+                    %session_id,
+                    codec_label,
+                    cap_long_edge = ?auto_res_cap,
+                    ewma_encode_ms = encode_pressure.ewma_ms(),
+                    encode_factor,
+                    "encode-bound auto-downscale tier change"
+                );
+            }
             info!(
                 %session_id,
                 codec_label,
