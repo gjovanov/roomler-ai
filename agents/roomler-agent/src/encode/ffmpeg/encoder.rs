@@ -22,7 +22,7 @@
 //! - Profile: Main 8-bit 4:2:0 (matches RustDesk; broadest browser
 //!   WebCodecs support per the pre-flight spike)
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context as _, Result, anyhow};
 use ffmpeg_next::{codec, format, frame, util};
@@ -59,6 +59,14 @@ const KEYFRAME_INTERVAL: i32 = 64800;
 /// becomes a true last resort instead of the primary (hiccuping) mechanism.
 /// hevc_qsv / nvenc honour runtime forcing and keep [`KEYFRAME_INTERVAL`].
 const VP9_QSV_KEYFRAME_INTERVAL: i32 = 60;
+
+/// P4 — cached per-host verdict from the startup vp9_qsv IDR probe:
+/// `(honors_low_power, honors_vme)` — does a runtime-forced keyframe
+/// actually come out key-flagged, per `low_power` mode? Written once by
+/// [`FfmpegEncoder::probe_and_cache_vp9_qsv_idr`] (caps.rs startup);
+/// consulted by every vp9_qsv open via `vp9_qsv_runtime_config`. Unset →
+/// the rc.219 containment (GOP 60 + VDEnc).
+static VP9_QSV_IDR_VERDICT: OnceLock<(bool, bool)> = OnceLock::new();
 
 /// Phase B — default fps for the non-DC-pump constructors (`new_hevc` /
 /// `new_vp9`), which serve the caps probe + the legacy REMB-adaptive WebRTC
@@ -203,6 +211,7 @@ fn encoder_options(
     name: &str,
     maxrate_bps: usize,
     cq: u32,
+    qsv_low_power: bool,
 ) -> (Vec<(String, String)>, Vec<(String, String)>, String) {
     // P3 — H.264 codes text visibly softer than HEVC at equal nominal
     // quality numbers; give the h264_* encoders a 2-step sharper CQ off the
@@ -274,13 +283,20 @@ fn encoder_options(
         }
     } else if name.contains("qsv") {
         // Intel QSV: ICQ-style quality via `global_quality`; `maxrate`
-        // caps the burst. `low_power` uses the fixed-function VDENC path
-        // (faster, lower power — the Iris Xe fps-unlock path).
+        // caps the burst. `low_power=1` uses the fixed-function VDENC path
+        // (faster, lower power — the Iris Xe fps-unlock path). P4 — the
+        // value is now caller-chosen: the vp9_qsv IDR probe measures BOTH
+        // modes and `vp9_qsv_runtime_config` may pick low_power=0 (VME)
+        // when only that mode honours runtime forced keyframes. HEVC/H.264
+        // qsv callers keep low_power=1 (unchanged).
         base.push(("global_quality".into(), cq_s.clone()));
         if let Some(p) = preset.as_deref() {
             base.push(("preset".into(), p.into()));
         }
-        base.push(("low_power".into(), "1".into()));
+        base.push((
+            "low_power".into(),
+            if qsv_low_power { "1" } else { "0" }.into(),
+        ));
         base.push(("maxrate".into(), cap.clone()));
         base.push(("bufsize".into(), buf.clone()));
         // rc.130 — `async_depth=1`: cap QSV's in-flight pipeline to one frame
@@ -554,6 +570,137 @@ impl FfmpegEncoder {
         )
     }
 
+    /// P4 — resolve the (gop, low_power) a vp9_qsv open should use from the
+    /// cached probe verdict + the `ROOMLER_AGENT_QSV_LOW_POWER` override.
+    /// Mapping lives in `encode::rate_profile::vp9_qsv_config` (pure,
+    /// default-build tested); falls back to the rc.219 containment (GOP 60 +
+    /// VDEnc) when unprobed.
+    fn vp9_qsv_runtime_config() -> (i32, bool) {
+        let forced_lp = node_env("QSV_LOW_POWER").and_then(|v| match v.trim() {
+            "0" => Some(false),
+            "1" => Some(true),
+            _ => None,
+        });
+        let (long_gop, low_power) = crate::encode::rate_profile::vp9_qsv_config(
+            VP9_QSV_IDR_VERDICT.get().copied(),
+            forced_lp,
+        );
+        (
+            if long_gop {
+                KEYFRAME_INTERVAL
+            } else {
+                VP9_QSV_KEYFRAME_INTERVAL
+            },
+            low_power,
+        )
+    }
+
+    /// P4 — explicit-config vp9_qsv constructor for the IDR probe. Bypasses
+    /// `vp9_qsv_runtime_config` (the probe must not consult the verdict it
+    /// is in the middle of producing).
+    fn new_vp9_qsv_probe(width: u32, height: u32, low_power: bool, gop: i32) -> Result<Self> {
+        ffmpeg_next::init().context("ffmpeg_next::init failed")?;
+        let cq = ffmpeg_cq();
+        let encoder =
+            Self::build_encoder("vp9_qsv", width, height, 30, 3_000_000, cq, low_power, gop)?;
+        let plane_pixels = (width as usize) * (height as usize);
+        Ok(Self {
+            encoder_name: "vp9_qsv",
+            width,
+            height,
+            encoder,
+            frame_count: 0,
+            force_keyframe: false,
+            nv12_y: vec![0u8; plane_pixels],
+            nv12_uv: vec![0u8; plane_pixels / 2],
+            fps: 30,
+            cq,
+            maxrate_bps: 3_000_000,
+            supports_dynamic_bitrate: false,
+        })
+    }
+
+    /// P4 — startup probe (caps.rs): for each `low_power` mode, open vp9_qsv
+    /// with an effectively-infinite GOP (so any post-frame-0 key must be
+    /// FORCED — guards against a natural key faking a pass), feed synthetic
+    /// frames, force a keyframe, and check whether a key-flagged packet
+    /// comes out. Caches the per-host verdict for every later open. Returns
+    /// the verdict for logging; ~100-300 ms per mode, once per process.
+    pub fn probe_and_cache_vp9_qsv_idr() -> Option<(bool, bool)> {
+        if let Some(v) = VP9_QSV_IDR_VERDICT.get() {
+            return Some(*v);
+        }
+        let honors_lp1 = Self::vp9_qsv_idr_probe_variant(true);
+        let honors_lp0 = Self::vp9_qsv_idr_probe_variant(false);
+        let v = (honors_lp1, honors_lp0);
+        let _ = VP9_QSV_IDR_VERDICT.set(v);
+        Some(v)
+    }
+
+    fn vp9_qsv_idr_probe_variant(low_power: bool) -> bool {
+        const W: u32 = 480;
+        const H: u32 = 270;
+        let mk = |i: u32| -> Arc<Frame> {
+            // Mid-gray with one moving bright pixel so every frame has a
+            // real (tiny) delta to code.
+            let mut data = vec![128u8; (W * H * 4) as usize];
+            let px = (i as usize * 5227) % ((W * H) as usize);
+            data[px * 4] = 255;
+            Arc::new(Frame {
+                width: W,
+                height: H,
+                stride: W * 4,
+                pixel_format: PixelFormat::Bgra,
+                data,
+                monotonic_us: i as u64 * 33_333,
+                monitor: 0,
+                dirty_rects: Vec::new(),
+            })
+        };
+        let mut enc = match Self::new_vp9_qsv_probe(W, H, low_power, KEYFRAME_INTERVAL) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::debug!(low_power, %e, "vp9_qsv IDR probe: variant failed to open");
+                return false;
+            }
+        };
+        // Warm-up. Frame 0 is the natural stream-start key; anything AFTER
+        // it flagged key means the long-GOP override isn't holding and a
+        // later "forced" key would prove nothing → unusable, fail closed.
+        for i in 0..4 {
+            match enc.encode_sync(&mk(i)) {
+                Ok(pkts) => {
+                    if i > 0 && pkts.iter().any(|p| p.is_keyframe) {
+                        tracing::debug!(
+                            low_power,
+                            "vp9_qsv IDR probe: spurious natural key during warm-up — failing closed"
+                        );
+                        return false;
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(low_power, %e, "vp9_qsv IDR probe: warm-up encode failed");
+                    return false;
+                }
+            }
+        }
+        enc.request_keyframe();
+        for i in 4..12 {
+            match enc.encode_sync(&mk(i)) {
+                Ok(pkts) => {
+                    if pkts.iter().any(|p| p.is_keyframe) {
+                        return true;
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(low_power, %e, "vp9_qsv IDR probe: post-force encode failed");
+                    return false;
+                }
+            }
+        }
+        false
+    }
+
     fn new_with_dispatch(
         names: &[&'static str],
         width: u32,
@@ -574,10 +721,23 @@ impl FfmpegEncoder {
         // env-overridable; `fps` + `maxrate_bps` come from the caller
         // (Phase B threads the DC pump's real per-session values).
         let cq = ffmpeg_cq();
+        // P4 — vp9_qsv GOP/low_power from the cached startup IDR-probe
+        // verdict (containment defaults when unprobed); ignored by every
+        // other candidate name.
+        let (qsv_gop, qsv_low_power) = Self::vp9_qsv_runtime_config();
 
         let mut last_err: Option<anyhow::Error> = None;
         for name in names {
-            match Self::build_encoder(name, width, height, fps, maxrate_bps, cq) {
+            match Self::build_encoder(
+                name,
+                width,
+                height,
+                fps,
+                maxrate_bps,
+                cq,
+                qsv_low_power,
+                qsv_gop,
+            ) {
                 Ok(encoder) => {
                     tracing::info!(
                         encoder = name,
@@ -629,6 +789,8 @@ impl FfmpegEncoder {
         fps: i32,
         maxrate_bps: usize,
         cq: u32,
+        qsv_low_power: bool,
+        qsv_gop: i32,
     ) -> Result<codec::encoder::Video> {
         let codec = codec::encoder::find_by_name(name)
             .ok_or_else(|| anyhow!("ffmpeg encoder not registered: {}", name))?;
@@ -662,10 +824,13 @@ impl FfmpegEncoder {
             // monotonic_us / 1000.
             enc.set_time_base((1, TIME_BASE_DEN));
             enc.set_frame_rate(Some((fps, 1)));
-            // rc.219 — vp9_qsv can't force keyframes at runtime, so it gets
-            // the short natural-key GOP instead (see the const's doc).
+            // rc.219 — vp9_qsv defaults to the short natural-key GOP
+            // (runtime forcing historically ignored). P4 — the caller now
+            // threads the PROBED per-host value (`vp9_qsv_runtime_config`):
+            // hosts whose vp9_qsv measurably honours runtime forced IDRs
+            // get KEYFRAME_INTERVAL (on-demand-only keys) instead.
             let gop = if name == "vp9_qsv" {
-                VP9_QSV_KEYFRAME_INTERVAL
+                qsv_gop
             } else {
                 KEYFRAME_INTERVAL
             };
@@ -674,7 +839,7 @@ impl FfmpegEncoder {
             Ok(enc)
         };
 
-        let (base, lowlat, opt_summary) = encoder_options(name, maxrate_bps, cq);
+        let (base, lowlat, opt_summary) = encoder_options(name, maxrate_bps, cq, qsv_low_power);
 
         // TIERED open. The encoder's option dict is ALL-OR-NOTHING: if the
         // driver rejects any single private option, the WHOLE dict is
@@ -865,9 +1030,11 @@ impl FfmpegEncoder {
     }
 }
 
-#[async_trait::async_trait]
-impl VideoEncoder for FfmpegEncoder {
-    async fn encode(&mut self, frame: Arc<Frame>) -> Result<Vec<EncodedPacket>> {
+impl FfmpegEncoder {
+    /// P4 — the synchronous encode body (the async trait fn below never
+    /// awaits); extracted so the startup vp9_qsv IDR probe can drive the
+    /// encoder without an executor.
+    pub(crate) fn encode_sync(&mut self, frame: &Frame) -> Result<Vec<EncodedPacket>> {
         if frame.width != self.width || frame.height != self.height {
             return Err(anyhow!(
                 "frame size {}x{} doesn't match encoder size {}x{} — re-create the encoder on resolution change",
@@ -878,7 +1045,7 @@ impl VideoEncoder for FfmpegEncoder {
             ));
         }
 
-        self.convert_bgra_to_nv12(&frame)?;
+        self.convert_bgra_to_nv12(frame)?;
         let av = self.build_av_frame(frame.monotonic_us)?;
         self.encoder
             .send_frame(&av)
@@ -888,6 +1055,13 @@ impl VideoEncoder for FfmpegEncoder {
         self.frame_count += 1;
 
         self.drain_packets()
+    }
+}
+
+#[async_trait::async_trait]
+impl VideoEncoder for FfmpegEncoder {
+    async fn encode(&mut self, frame: Arc<Frame>) -> Result<Vec<EncodedPacket>> {
+        self.encode_sync(&frame)
     }
 
     fn request_keyframe(&mut self) {
