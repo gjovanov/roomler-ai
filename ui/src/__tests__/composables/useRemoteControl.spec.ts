@@ -70,6 +70,9 @@ import {
   LOCAL_RELAY_PROBE_PORTS,
   clipboardBridgeUrl,
   storedDecodePref,
+  storedCtxMode,
+  storedPerFrameMsg,
+  diagHudEnabled,
   type AutoTransportInputs,
   type KeyDecision,
   type RcCodecChoice,
@@ -77,6 +80,7 @@ import {
 import { codecMimeForShort } from '@/workers/rc-webcodecs-worker'
 import { parseFrameHeader, isKeyframe, shouldDecodeFrame } from '@/workers/rc-vp9-444-worker'
 import { shouldDecodeFrame as shouldDecodeFrameHevc, classifyCrop } from '@/workers/rc-hevc-worker'
+import { HopStats, ctxOptionsFor, normalizeCtxMode, round1 } from '@/workers/rc-hop-stats'
 
 function keyEvent(code: string, mods: Partial<{ ctrl: boolean; alt: boolean; meta: boolean; shift: boolean }> = {}): KeyboardEvent {
   return {
@@ -2612,5 +2616,88 @@ describe('storedDecodePref (2026-07-24 decode-stall A/B)', () => {
     expect(storedDecodePref()).toBe('no-preference')
     localStorage.setItem('roomler-rc-decode-pref', 'banana')
     expect(storedDecodePref()).toBe('no-preference')
+  })
+})
+
+describe('P1 — hop-stats helpers (rc-hop-stats)', () => {
+  it('HopStats accumulates avg/max per window and resets on snapshot', () => {
+    const s = new HopStats()
+    s.add(1)
+    s.add(2)
+    s.add(6)
+    const w = s.snapshotAndReset()
+    expect(w).toEqual({ avgMs: 3, maxMs: 6, n: 3 })
+    // Window reset — an empty follow-up window reads zeros.
+    expect(s.snapshotAndReset()).toEqual({ avgMs: 0, maxMs: 0, n: 0 })
+  })
+
+  it('HopStats rounds to 0.1 ms', () => {
+    const s = new HopStats()
+    s.add(0.14)
+    s.add(0.14)
+    const w = s.snapshotAndReset()
+    expect(w.avgMs).toBe(0.1)
+    expect(w.maxMs).toBe(0.1)
+  })
+
+  it('HopStats ignores garbage samples (NaN / negative / Infinity)', () => {
+    const s = new HopStats()
+    s.add(Number.NaN)
+    s.add(-5)
+    s.add(Number.POSITIVE_INFINITY)
+    s.add(2)
+    expect(s.snapshotAndReset()).toEqual({ avgMs: 2, maxMs: 2, n: 1 })
+  })
+
+  it('ctxOptionsFor maps the A/B modes (legacy = no options object)', () => {
+    expect(ctxOptionsFor('legacy')).toBeUndefined()
+    expect(ctxOptionsFor('opaque')).toEqual({ alpha: false })
+    expect(ctxOptionsFor('opaque-desync')).toEqual({ alpha: false, desynchronized: true })
+  })
+
+  it('normalizeCtxMode defaults unknown values to opaque-desync', () => {
+    expect(normalizeCtxMode('legacy')).toBe('legacy')
+    expect(normalizeCtxMode('opaque')).toBe('opaque')
+    expect(normalizeCtxMode('opaque-desync')).toBe('opaque-desync')
+    expect(normalizeCtxMode(null)).toBe('opaque-desync')
+    expect(normalizeCtxMode('banana')).toBe('opaque-desync')
+  })
+
+  it('round1 rounds to one decimal', () => {
+    expect(round1(1.24)).toBe(1.2)
+    expect(round1(1.25)).toBe(1.3)
+    expect(round1(0)).toBe(0)
+  })
+})
+
+describe('P1 — viewer diagnosis localStorage knobs', () => {
+  afterEach(() => {
+    localStorage.removeItem('roomler-rc-ctx-mode')
+    localStorage.removeItem('roomler-rc-per-frame-msg')
+    localStorage.removeItem('roomler-rc-diag-hud')
+  })
+
+  it('storedCtxMode defaults to opaque-desync and honours the A/B values', () => {
+    expect(storedCtxMode()).toBe('opaque-desync')
+    localStorage.setItem('roomler-rc-ctx-mode', 'legacy')
+    expect(storedCtxMode()).toBe('legacy')
+    localStorage.setItem('roomler-rc-ctx-mode', 'opaque')
+    expect(storedCtxMode()).toBe('opaque')
+    localStorage.setItem('roomler-rc-ctx-mode', 'banana')
+    expect(storedCtxMode()).toBe('opaque-desync')
+  })
+
+  it('storedPerFrameMsg is OFF unless explicitly "1"', () => {
+    expect(storedPerFrameMsg()).toBe(false)
+    localStorage.setItem('roomler-rc-per-frame-msg', '1')
+    expect(storedPerFrameMsg()).toBe(true)
+    localStorage.setItem('roomler-rc-per-frame-msg', 'true')
+    expect(storedPerFrameMsg()).toBe(false)
+  })
+
+  it('diagHudEnabled is OFF unless explicitly "1"', () => {
+    expect(diagHudEnabled()).toBe(false)
+    localStorage.setItem('roomler-rc-diag-hud', '1')
+    expect(diagHudEnabled()).toBe(true)
   })
 })

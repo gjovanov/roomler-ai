@@ -2,6 +2,7 @@ import { ref, watch, onBeforeUnmount, computed, type Ref, type ComputedRef } fro
 import { useWsStore } from '@/stores/ws'
 import { api } from '@/api/client'
 import type { Agent } from '@/stores/agents'
+import { normalizeCtxMode, type CtxMode, type HopWindow } from '@/workers/rc-hop-stats'
 
 /**
  * Remote-control session state machine driven from the controller browser.
@@ -695,6 +696,58 @@ function persistRenderPath(p: RcRenderPath) {
   } catch {
     /* best-effort */
   }
+}
+
+// P1 (Parsec-class plan) — viewer-pipeline diagnosis knobs. All localStorage,
+// all per-viewer, all live-flippable without a redeploy:
+//  - roomler-rc-ctx-mode: 2D-context A/B ('legacy' | 'opaque' |
+//    'opaque-desync'; default opaque-desync — alpha:false enables the opaque
+//    compositor fast path, desynchronized requests the low-latency swap
+//    chain).
+//  - roomler-rc-per-frame-msg=1: restore the legacy per-decoded-frame
+//    worker→main message + reactive increment (default OFF — it was ~60
+//    messages + 60 Vue triggers per second of pure overhead).
+//  - roomler-rc-diag-hud=1: render the per-hop diagnostics row in the HUD.
+const CTX_MODE_STORAGE_KEY = 'roomler-rc-ctx-mode'
+const PER_FRAME_MSG_STORAGE_KEY = 'roomler-rc-per-frame-msg'
+const DIAG_HUD_STORAGE_KEY = 'roomler-rc-diag-hud'
+
+export function storedCtxMode(): CtxMode {
+  try {
+    return normalizeCtxMode(globalThis.localStorage?.getItem(CTX_MODE_STORAGE_KEY))
+  } catch {
+    return 'opaque-desync'
+  }
+}
+
+export function storedPerFrameMsg(): boolean {
+  try {
+    return globalThis.localStorage?.getItem(PER_FRAME_MSG_STORAGE_KEY) === '1'
+  } catch {
+    return false
+  }
+}
+
+export function diagHudEnabled(): boolean {
+  try {
+    return globalThis.localStorage?.getItem(DIAG_HUD_STORAGE_KEY) === '1'
+  } catch {
+    return false
+  }
+}
+
+/** P1 — one stats-window of per-hop pipeline diagnostics (worker hops + the
+ *  main thread's long-task pressure). Consumed by the diag HUD. */
+export type RcDecodeDiag = {
+  paint: HopWindow | null
+  fwd: HopWindow | null
+  decode: HopWindow | null
+  outGapMaxMs: number
+  queue: number
+  droppedTotal: number
+  ctxMode: string
+  longTasksPerSec: number
+  longTaskMsPerSec: number
 }
 
 /** Feature-detect WebCodecs + RTCRtpScriptTransform. Returns true only
@@ -2310,6 +2363,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    *  happens for verification. */
   const hevcCanvasEl = ref<HTMLCanvasElement | null>(null)
 
+  /** P1 — latest per-hop diagnostics window from the active decode worker
+   *  (null until the first stats window on a DC path). */
+  const decodeDiag = ref<RcDecodeDiag | null>(null)
+
   let pc: RTCPeerConnection | null = null
   /** Data channels we open proactively (per docs §5). Labels match the
    *  agent's expected routing: input/control/clipboard/files. */
@@ -3769,11 +3826,83 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       }
       jankLastTickMs = now
     }, 250)
+    startLongTaskObserver()
   }
   function stopJankDetector() {
     if (jankTimer) {
       clearInterval(jankTimer)
       jankTimer = null
+    }
+    stopLongTaskObserver()
+  }
+
+  // P1 — main-thread long-task accounting. Counts blocking tasks ≥50 ms
+  // while a DC path is active; snapshotted into `decodeDiag` on each worker
+  // stats window so main-thread jank sits next to the worker's hop timings
+  // (the number that decides whether the fps ceiling is main-thread-bound).
+  let longTaskObserver: PerformanceObserver | null = null
+  let longTaskCount = 0
+  let longTaskMs = 0
+  let longTaskWindowStartMs = 0
+  function startLongTaskObserver() {
+    if (longTaskObserver) return
+    try {
+      longTaskObserver = new PerformanceObserver((list) => {
+        for (const e of list.getEntries()) {
+          longTaskCount++
+          longTaskMs += e.duration
+        }
+      })
+      longTaskObserver.observe({ type: 'longtask', buffered: false })
+      longTaskWindowStartMs = performance.now()
+    } catch {
+      longTaskObserver = null // 'longtask' unsupported — diag shows zeros
+    }
+  }
+  function stopLongTaskObserver() {
+    try {
+      longTaskObserver?.disconnect()
+    } catch {
+      /* ignore */
+    }
+    longTaskObserver = null
+    longTaskCount = 0
+    longTaskMs = 0
+    longTaskWindowStartMs = 0
+  }
+  function snapshotLongTasks(): { perSec: number; msPerSec: number } {
+    const now = performance.now()
+    const elapsedSec =
+      longTaskWindowStartMs > 0 ? Math.max(0.2, (now - longTaskWindowStartMs) / 1000) : 1
+    const perSec = Math.round((longTaskCount / elapsedSec) * 10) / 10
+    const msPerSec = Math.round((longTaskMs / elapsedSec) * 10) / 10
+    longTaskCount = 0
+    longTaskMs = 0
+    longTaskWindowStartMs = now
+    return { perSec, msPerSec }
+  }
+
+  /** P1 — fold one worker stats window into `decodeDiag` for the diag HUD. */
+  function updateDecodeDiag(m: {
+    paint?: HopWindow
+    fwd?: HopWindow
+    decode?: HopWindow
+    outGapMaxMs?: number
+    decodeQueueSize?: number
+    framesDroppedBacklog?: number
+    ctxMode?: string
+  }) {
+    const lt = snapshotLongTasks()
+    decodeDiag.value = {
+      paint: m.paint ?? null,
+      fwd: m.fwd ?? null,
+      decode: m.decode ?? null,
+      outGapMaxMs: typeof m.outGapMaxMs === 'number' ? m.outGapMaxMs : 0,
+      queue: typeof m.decodeQueueSize === 'number' ? m.decodeQueueSize : 0,
+      droppedTotal: typeof m.framesDroppedBacklog === 'number' ? m.framesDroppedBacklog : 0,
+      ctxMode: typeof m.ctxMode === 'string' ? m.ctxMode : 'legacy',
+      longTasksPerSec: lt.perSec,
+      longTaskMsPerSec: lt.msPerSec,
     }
   }
 
@@ -3860,6 +3989,12 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
           bytesReceivedTotal?: number
           framesDroppedBacklog?: number
           decodeQueueSize?: number
+          framesDecodedTotal?: number
+          paint?: HopWindow
+          fwd?: HopWindow
+          decode?: HopWindow
+          outGapMaxMs?: number
+          ctxMode?: string
         }
         vp9_444Stats.value = {
           bitrateBps: typeof m.bitrateBps === 'number' ? m.bitrateBps : 0,
@@ -3868,6 +4003,12 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
           height: typeof m.height === 'number' ? m.height : 0,
           bytesReceivedTotal: typeof m.bytesReceivedTotal === 'number' ? m.bytesReceivedTotal : 0,
         }
+        // P1 — the per-frame `frame-decoded` message is off by default; keep
+        // the diagnostics counter monotonic from the 1 s window total.
+        if (typeof m.framesDecodedTotal === 'number') {
+          vp9_444FramesDecoded.value = Math.max(vp9_444FramesDecoded.value, m.framesDecodedTotal)
+        }
+        updateDecodeDiag(m)
         // rc.188 — feed the agent this viewer's real decode rate so it caps fps.
         handleDecoderStats(m)
       }
@@ -3899,7 +4040,14 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     try {
       const synthetic = new OffscreenCanvas(2, 2)
       worker.postMessage(
-        { type: 'init-canvas', canvas: synthetic, codec: workerCodec, decodePref: storedDecodePref() },
+        {
+          type: 'init-canvas',
+          canvas: synthetic,
+          codec: workerCodec,
+          decodePref: storedDecodePref(),
+          ctxMode: storedCtxMode(),
+          perFrameMsg: storedPerFrameMsg(),
+        },
         [synthetic],
       )
     } catch (err) {
@@ -3924,7 +4072,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       if (!(ev.data instanceof ArrayBuffer)) return
       noteVideoDcDelivery()
       try {
-        worker.postMessage({ type: 'chunk', bytes: ev.data }, [ev.data])
+        // P1 — sentAt stamps the main→worker forwarding hop (epoch-absolute).
+        worker.postMessage(
+          { type: 'chunk', bytes: ev.data, sentAt: performance.timeOrigin + performance.now() },
+          [ev.data],
+        )
       } catch (err) {
         console.warn('[rc] vp9-444 worker post failed', err)
       }
@@ -4050,6 +4202,12 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
           bytesReceivedTotal?: number
           framesDroppedBacklog?: number
           decodeQueueSize?: number
+          framesDecodedTotal?: number
+          paint?: HopWindow
+          fwd?: HopWindow
+          decode?: HopWindow
+          outGapMaxMs?: number
+          ctxMode?: string
         }
         hevcStats.value = {
           bitrateBps: typeof m.bitrateBps === 'number' ? m.bitrateBps : 0,
@@ -4058,6 +4216,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
           height: typeof m.height === 'number' ? m.height : 0,
           bytesReceivedTotal: typeof m.bytesReceivedTotal === 'number' ? m.bytesReceivedTotal : 0,
         }
+        // P1 — see the vp9-444 handler.
+        if (typeof m.framesDecodedTotal === 'number') {
+          hevcFramesDecoded.value = Math.max(hevcFramesDecoded.value, m.framesDecodedTotal)
+        }
+        updateDecodeDiag(m)
         // rc.188 — feed the agent this viewer's real decode rate so it caps fps.
         handleDecoderStats(m)
       }
@@ -4068,7 +4231,13 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     try {
       const synthetic = new OffscreenCanvas(2, 2)
       worker.postMessage(
-        { type: 'init-canvas', canvas: synthetic, decodePref: storedDecodePref() },
+        {
+          type: 'init-canvas',
+          canvas: synthetic,
+          decodePref: storedDecodePref(),
+          ctxMode: storedCtxMode(),
+          perFrameMsg: storedPerFrameMsg(),
+        },
         [synthetic],
       )
     } catch (err) {
@@ -4095,7 +4264,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       if (!(ev.data instanceof ArrayBuffer)) return
       noteVideoDcDelivery()
       try {
-        worker.postMessage({ type: 'chunk', bytes: ev.data }, [ev.data])
+        // P1 — sentAt stamps the main→worker forwarding hop (epoch-absolute).
+        worker.postMessage(
+          { type: 'chunk', bytes: ev.data, sentAt: performance.timeOrigin + performance.now() },
+          [ev.data],
+        )
       } catch (err) {
         console.warn('[rc] hevc worker post failed', err)
       }
@@ -7551,6 +7724,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     hevcFramesDecoded,
     hevcStats,
     hevcCanvasEl,
+    /** P1 — per-hop pipeline diagnostics for the diag HUD
+     *  (localStorage roomler-rc-diag-hud=1). */
+    decodeDiag,
   }
 }
 

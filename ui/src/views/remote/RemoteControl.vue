@@ -111,6 +111,11 @@
         <span class="stats-pill">{{ statsBitrateLabel }}</span>
         <span class="stats-pill">{{ statsFpsLabel }}</span>
         <span v-if="statsResolutionLabel" class="stats-pill">{{ statsResolutionLabel }}</span>
+        <!-- P1 — per-hop pipeline diagnostics (paint / fwd / decode ms,
+             output gap, queue, drops, main-thread long tasks). Opt-in via
+             localStorage roomler-rc-diag-hud=1; the numbers that decide
+             whether an fps ceiling is paint-, decode-, or main-thread-bound. -->
+        <span v-if="showDiagHud && diagLabel" class="stats-pill">{{ diagLabel }}</span>
       </div>
       <!-- rc.199 — Settings gear (all viewports): opens the unified
            Settings panel (Video / Display / Session). Replaces the old
@@ -1235,6 +1240,7 @@ import {
   useRemoteControl,
   nextDirPath,
   isKeyboardLockSupported,
+  diagHudEnabled,
   type RcScaleMode,
   type RcResolutionSetting,
   type RcPriority,
@@ -2201,6 +2207,22 @@ function bindVp9_444Canvas(el: Element | unknown) {
 // the DC + spun up the HEVC worker. Drives the template's HEVC
 // canvas mount.
 const isHevcRender = computed<boolean>(() => rc.hevcActive.value)
+
+// P1 — per-hop diagnostics pill (opt-in localStorage roomler-rc-diag-hud=1).
+// Read once at mount: flipping the flag is a reload-scoped A/B, matching the
+// other roomler-rc-* diagnosis knobs.
+const showDiagHud = diagHudEnabled()
+const diagLabel = computed(() => {
+  const d = rc.decodeDiag.value
+  if (!d) return ''
+  const hop = (w: { avgMs: number; maxMs: number } | null) =>
+    w ? `${w.avgMs}/${w.maxMs}` : '–'
+  return (
+    `paint ${hop(d.paint)} · fwd ${hop(d.fwd)} · dec ${hop(d.decode)}`
+    + ` · gap ${d.outGapMaxMs} · q ${d.queue} · drop ${d.droppedTotal}`
+    + ` · long ${d.longTasksPerSec}/${d.longTaskMsPerSec}ms · ${d.ctxMode}`
+  )
+})
 /** Bind callback for the HEVC canvas. Same `transferControlToOffscreen`
  *  pattern as the VP9-444 canvas — composable's `hevcCanvasEl`
  *  watcher fires once the ref lands. */
