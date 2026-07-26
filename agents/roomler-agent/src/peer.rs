@@ -3371,6 +3371,17 @@ async fn media_pump_ffmpeg_dc(
     // and follows a mid-session renomination (see the block at the loop top).
     let mut constrained = detect_constrained_transport(&pc, session_id).await;
     let mut last_transport_check = std::time::Instant::now();
+    // P3 — persisted-flip rebuild: a relay↔direct renomination that holds for
+    // 2 consecutive rechecks (and outside the 60 s cooldown) rebuilds the
+    // encoder AND reopens the capturer at the new profile fps — pre-P3 a
+    // session that STARTED relayed stayed at 30 fps forever after upgrading
+    // to direct (fps was baked into the capture pacer at pump start). The
+    // live AIMD ceiling clamp still follows EVERY flip immediately; the
+    // tracker only gates the heavyweight rebuild. Escape hatch
+    // `ROOMLER_AGENT_RATE_PROFILE_REBUILD=0` restores the AIMD-only
+    // behaviour.
+    let mut flip_tracker = crate::encode::rate_profile::FlipTracker::new(constrained);
+    let rate_profile_rebuild = node_env("RATE_PROFILE_REBUILD").as_deref() != Some("0");
 
     // rc.93 — target fps. Pre-rc.93 this was hardcoded 30, which capped the
     // scrap backend's internal pacer (`scrap_backend::next_frame` sleeps to
@@ -3379,8 +3390,9 @@ async fn media_pump_ffmpeg_dc(
     // pump floor and hits ~55 fps; HW encode (vp9_qsv/hevc_qsv ~4-6 ms)
     // easily sustains that. Phase B: default 60 on a direct link, 30 on a
     // constrained relay (which can't sustain 60 fps of HEVC without shedding);
-    // an explicit env override wins either way.
-    let target_fps: u32 = ffmpeg_target_fps(constrained);
+    // an explicit env override wins either way. P3 — `mut`: the persisted-flip
+    // rebuild retargets it mid-session.
+    let mut target_fps: u32 = ffmpeg_target_fps(constrained);
     let downscale = crate::capture::DownscalePolicy::Never;
     info!(
         %session_id,
@@ -3569,22 +3581,50 @@ async fn media_pump_ffmpeg_dc(
         // selected ICE pair every TRANSPORT_RECHECK_INTERVAL and follow a
         // mid-session renomination. A flip flows into `ceiling` (recomputed
         // per frame from `constrained`) → the AIMD clamps/unclamps live.
-        // `target_fps` + the send-queue depth stay as chosen at pump start
-        // (fps is baked into the capture pacer — a relay→direct upgrade
-        // keeps 30 fps until reconnect, documented trade-off). Also refresh
-        // the browser stats badge so the operator SEES the path flip.
+        // P3 — a flip that PERSISTS (FlipTracker: 2 consecutive checks, ≥60 s
+        // since the last rebuild) additionally rebuilds the encoder and
+        // reopens the capturer at the new profile fps, so a relay→direct
+        // upgrade no longer stays parked at 30 fps for the session's life.
+        // The send-queue depth stays pump-lifetime (bounded channel is fixed
+        // at construction — the fps/maxrate/bufsize are the levers that
+        // matter). Also refresh the browser stats badge on every flip.
         if last_transport_check.elapsed() >= TRANSPORT_RECHECK_INTERVAL {
             last_transport_check = std::time::Instant::now();
             if !crate::encode::transport_is_constrained() {
                 let relay_now = current_pair_is_relay(&pc, session_id, constrained).await;
-                if let Some(relay) = relay_now
-                    && relay != constrained
-                {
-                    constrained = relay;
-                    // Badge-truth: the retry block below re-sends video-info
-                    // with the new transport (single send path, no lost
-                    // refresh when the control DC hiccups).
-                    video_info_sent = false;
+                if let Some(relay) = relay_now {
+                    if relay != constrained {
+                        constrained = relay;
+                        // Badge-truth: the retry block below re-sends
+                        // video-info with the new transport (single send
+                        // path, no lost refresh when the control DC hiccups).
+                        video_info_sent = false;
+                    }
+                    if rate_profile_rebuild
+                        && let Some(nc) = flip_tracker.observe(relay, std::time::Instant::now())
+                    {
+                        let new_fps = ffmpeg_target_fps(nc);
+                        if new_fps != target_fps {
+                            info!(
+                                %session_id,
+                                codec_label,
+                                old_fps = target_fps,
+                                new_fps,
+                                constrained = nc,
+                                "FFmpeg DC pump: transport flip persisted — reopening capture + rebuilding encoder at the new rate profile"
+                            );
+                            target_fps = new_fps;
+                            // Reopen the capture pacer at the new rate (the
+                            // scrap backend sleeps to 1000/target_fps — an
+                            // encoder-only rebuild would stay capped by the
+                            // old pacing), then force the encoder rebuild;
+                            // its first frame is a key-flagged IDR so the
+                            // viewer resyncs cleanly.
+                            capturer = capture::open_default(target_fps, downscale);
+                            encoder = None;
+                            encoder_dims = None;
+                        }
+                    }
                 }
             }
         }
@@ -3819,10 +3859,17 @@ async fn media_pump_ffmpeg_dc(
         // Phase B — per-resolution, per-session (relay-aware) maxrate ceiling.
         // Recomputed each frame (cheap) so a dim change or a mid-session env
         // tweak re-seeds it; the AIMD starts at this ceiling and tracks the
-        // link down from it. Also the initial maxrate the encoder is built with.
-        let base_ceiling =
-            crate::encode::ffmpeg::encoder::ffmpeg_maxrate_bps(w, h, target_fps, constrained)
-                as u32;
+        // link down from it. Also the initial maxrate the encoder is built
+        // with. P3 — codec-factor-aware: H.264 gets a 150% band (equal text
+        // sharpness needs ~1.5× the bits of HEVC/AV1); the relay clamp still
+        // applies after the factor inside the fn.
+        let base_ceiling = crate::encode::ffmpeg::encoder::ffmpeg_maxrate_bps_scaled(
+            w,
+            h,
+            target_fps,
+            constrained,
+            crate::encode::rate_profile::codec_rate_factor_pct(codec.label()),
+        ) as u32;
         // rc.186 — apply the encode-pressure factor. When the encoder is
         // saturating (factor < 1.0) this feeds a lower ceiling to both the
         // encoder rebuild AND the AIMD (which propagates it to the running
