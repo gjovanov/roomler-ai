@@ -2588,19 +2588,24 @@ describe('layoutSetWireMessage (rc.227)', () => {
   })
 })
 
-describe('loopback discovery port range (v2.2 multi-agent)', () => {
-  it('the candidate range starts at the primary port and is contiguous', () => {
+describe('loopback discovery port range (v2.2 multi-agent + reservation fallback)', () => {
+  it('probes the primary band first, then the fallback band', () => {
+    // Primary band leads (unchanged behaviour on normal hosts).
     expect(LOCAL_RELAY_PROBE_PORTS[0]).toBe(LOCAL_RELAY_PROBE_PORT)
-    for (let i = 1; i < LOCAL_RELAY_PROBE_PORTS.length; i++) {
-      expect(LOCAL_RELAY_PROBE_PORTS[i]).toBe(LOCAL_RELAY_PROBE_PORTS[i - 1] + 1)
+    expect(LOCAL_RELAY_PROBE_PORTS.slice(0, 5)).toEqual([47989, 47990, 47991, 47992, 47993])
+    // Fallback band (below the Hyper-V/WSL/HNS reservation zone) for
+    // hosts whose primary band is swallowed by a port-pool reservation.
+    expect(LOCAL_RELAY_PROBE_PORTS.slice(5)).toEqual([41989, 41990, 41991, 41992, 41993])
+    expect(LOCAL_RELAY_PROBE_PORTS.length).toBe(10)
+    // Each band is contiguous and 5 wide (matches agent PROBE_PORT_BAND).
+    for (const band of [LOCAL_RELAY_PROBE_PORTS.slice(0, 5), LOCAL_RELAY_PROBE_PORTS.slice(5)]) {
+      for (let i = 1; i < band.length; i++) expect(band[i]).toBe(band[i - 1] + 1)
     }
-    // Must match the agent's PROBE_PORT_COUNT = 5.
-    expect(LOCAL_RELAY_PROBE_PORTS.length).toBe(5)
   })
 
   it('clipboardBridgeUrl builds a loopback URL for any candidate port', () => {
     expect(clipboardBridgeUrl(47989)).toBe('http://127.0.0.1:47989/rc-clipboard')
-    expect(clipboardBridgeUrl(47990)).toBe('http://127.0.0.1:47990/rc-clipboard')
+    expect(clipboardBridgeUrl(41989)).toBe('http://127.0.0.1:41989/rc-clipboard')
   })
 })
 
