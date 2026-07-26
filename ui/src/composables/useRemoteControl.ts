@@ -1440,13 +1440,17 @@ export interface LocalRelayDescriptor {
  *  Private-Network-Access blocked, timeout) makes the probe a graceful
  *  no-op. */
 export const LOCAL_RELAY_PROBE_PORT = 47989
-/** Candidate discovery ports. A host can run MORE THAN ONE agent
- *  (e.g. a Windows agent + a WSL agent under mirrored networking,
- *  sharing the Windows loopback) — each binds a distinct port from
- *  this range, so the browser must probe the whole range rather than
- *  a single fixed port. MUST match the agent's `PROBE_PORT` +
- *  `PROBE_PORT_COUNT` in `rc_local_turn.rs`. */
-export const LOCAL_RELAY_PROBE_PORTS = [47989, 47990, 47991, 47992, 47993]
+/** Candidate discovery ports, two bands. A host can run MORE THAN ONE
+ *  agent (Windows + WSL under mirrored networking, sharing the Windows
+ *  loopback), so the browser probes a range not a single port. The
+ *  FALLBACK band (`41989+`) covers hosts whose Hyper-V/WSL/HNS
+ *  reservations swallow the whole primary band (`47989+` sits at the
+ *  edge of that reservation zone; the fallback lives well below it).
+ *  First match wins. MUST match the agent's `PROBE_PORT` +
+ *  `PROBE_PORT_FALLBACK` + `PROBE_PORT_BAND` in `rc_local_turn.rs`. */
+export const LOCAL_RELAY_PROBE_PORTS = [
+  47989, 47990, 47991, 47992, 47993, 41989, 41990, 41991, 41992, 41993,
+]
 
 /** Validate an untrusted JSON blob from the loopback probe into a
  *  [`LocalRelayDescriptor`], or `null`. Pure + exported for tests. */
