@@ -2238,6 +2238,7 @@ describe('pickAutoTransport (rc.190 HW×HW codec auto-rank)', () => {
     viewerHevcHw: false,
     viewerVp9Hw: false,
     viewerVp9Decodable: false,
+    viewerH264Hw: false,
     ...over,
   })
 
@@ -2296,6 +2297,57 @@ describe('pickAutoTransport (rc.190 HW×HW codec auto-rank)', () => {
     )
     expect(r.transport).toBe('data-channel-vp9-444')
     expect(r.chromaOverride).toBe('yuv420')
+  })
+
+  it('P2 — H.264-DC HW×HW slots ABOVE the VP9 SW-encode tier', () => {
+    // Agent with H.264 HW but no HEVC/AV1/vp9_qsv (old NVIDIA/AMD class):
+    // H.264-DC must beat the ≤1920-capped libvpx SW fallback.
+    const r = pickAutoTransport(
+      base({
+        agentTransports: ['data-channel-vp9-444', 'data-channel-h264'],
+        agentHwEncoders: ['ffmpeg-h264_nvenc', 'libvpx-vp9-444-sw'],
+        viewerVp9Hw: true,
+        viewerVp9Decodable: true,
+        viewerH264Hw: true,
+      }),
+    )
+    expect(r.transport).toBe('data-channel-h264')
+    expect(r.chromaOverride).toBeNull()
+  })
+
+  it('P2 — VP9 HW×HW still beats H.264-DC (better compression at parity)', () => {
+    const r = pickAutoTransport(
+      base({
+        agentTransports: ['data-channel-vp9-444', 'data-channel-h264'],
+        agentHwEncoders: ['ffmpeg-vp9_qsv', 'ffmpeg-h264_qsv', 'libvpx-vp9-444-sw'],
+        viewerVp9Hw: true,
+        viewerVp9Decodable: true,
+        viewerH264Hw: true,
+      }),
+    )
+    expect(r.transport).toBe('data-channel-vp9-444')
+  })
+
+  it('P2 — H.264-DC needs the TRANSPORT advertisement (no hw_encoders fallback)', () => {
+    // ffmpeg-h264_* entries and the transport ship in the same release —
+    // an encoder label without the transport must NOT light the path.
+    const r = pickAutoTransport(
+      base({
+        agentHwEncoders: ['ffmpeg-h264_nvenc'],
+        viewerH264Hw: true,
+      }),
+    )
+    expect(r.transport).toBeNull()
+  })
+
+  it('P2 — H.264-DC skipped when the viewer lacks HW H.264 decode', () => {
+    const r = pickAutoTransport(
+      base({
+        agentTransports: ['data-channel-h264'],
+        viewerH264Hw: false,
+      }),
+    )
+    expect(r.transport).toBeNull()
   })
 
   it('nothing decodable / nothing advertised → webrtc (null)', () => {
@@ -2408,9 +2460,18 @@ describe('codecChoiceToSettings (rc.199 unified Codec picker)', () => {
       preferredCodec: null,
       renderPath: 'webcodecs',
     })
-    // H.264 = the "max compatibility" choice: revives the RTP track +
-    // preferredCodec AND uses the plain <video> render path (not WebCodecs).
+    // P2 — H.264 now defaults to the DC + WebCodecs pipeline (connect()
+    // falls back to the RTP track when either end can't do DC-H.264).
     expect(codecChoiceToSettings('h264')).toEqual({
+      videoTransport: 'data-channel-h264',
+      chroma: 'auto',
+      preferredCodec: 'h264',
+      renderPath: 'webcodecs',
+    })
+  })
+
+  it('P2 — the h264Rtp escape hatch restores the legacy RTP + <video> mapping', () => {
+    expect(codecChoiceToSettings('h264', { h264Rtp: true })).toEqual({
       videoTransport: 'webrtc',
       chroma: 'auto',
       preferredCodec: 'h264',
@@ -2430,6 +2491,8 @@ describe('settingsToCodecChoice (rc.199 reverse map)', () => {
     // 4:2:0 choice (never silently promoted to the heavier 4:4:4).
     expect(settingsToCodecChoice('data-channel-vp9-444', 'auto')).toBe('vp9-420')
     expect(settingsToCodecChoice('webrtc', 'auto')).toBe('h264')
+    // P2 — both H.264 transports read back as the single picker choice.
+    expect(settingsToCodecChoice('data-channel-h264', 'auto')).toBe('h264')
   })
 
   it('round-trips every choice through settings and back', () => {
