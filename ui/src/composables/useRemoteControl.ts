@@ -2,7 +2,16 @@ import { ref, watch, onBeforeUnmount, computed, type Ref, type ComputedRef } fro
 import { useWsStore } from '@/stores/ws'
 import { api } from '@/api/client'
 import type { Agent } from '@/stores/agents'
-import { normalizeCtxMode, type CtxMode, type HopWindow } from '@/workers/rc-hop-stats'
+import {
+  normalizeCtxMode,
+  normalizeIntKnob,
+  StruggleWindow,
+  DEFAULT_MAX_DECODE_QUEUE,
+  DEFAULT_STRUGGLE_QUEUE,
+  DEFAULT_STRUGGLE_WINDOWS,
+  type CtxMode,
+  type HopWindow,
+} from '@/workers/rc-hop-stats'
 
 /**
  * Remote-control session state machine driven from the controller browser.
@@ -725,6 +734,47 @@ export function storedPerFrameMsg(): boolean {
     return globalThis.localStorage?.getItem(PER_FRAME_MSG_STORAGE_KEY) === '1'
   } catch {
     return false
+  }
+}
+
+// P6 (Parsec-class plan) — flow-control knobs for the field-tuning round.
+// All localStorage, all default to today's baked values; proven values get
+// baked as the new defaults in a follow-up (one constant per field round):
+//  - roomler-rc-max-queue: worker decode-queue depth above which deltas are
+//    dropped + an IDR resync is requested (default 4, clamp 1..60).
+//  - roomler-rc-struggle-queue: queue depth that makes a 1 s stats window
+//    "bad" for the struggling rule (default 2, clamp 0..59).
+//  - roomler-rc-struggle-windows: consecutive bad windows before the
+//    struggling bit is sent to the agent (default 2; 1 = the legacy
+//    instantaneous rule, clamp 1..10).
+const MAX_QUEUE_STORAGE_KEY = 'roomler-rc-max-queue'
+const STRUGGLE_QUEUE_STORAGE_KEY = 'roomler-rc-struggle-queue'
+const STRUGGLE_WINDOWS_STORAGE_KEY = 'roomler-rc-struggle-windows'
+
+export interface RcFlowParams {
+  maxQueue: number
+  struggleQueue: number
+  struggleWindows: number
+}
+
+/** Read the P6 flow-control knobs (pure + exported so the defaults and
+ *  clamps are locked by unit tests). Read once per composable — a knob
+ *  change needs a page refresh, like every other `roomler-rc-*` knob. */
+export function storedFlowParams(): RcFlowParams {
+  let mq: string | null = null
+  let sq: string | null = null
+  let sw: string | null = null
+  try {
+    mq = globalThis.localStorage?.getItem(MAX_QUEUE_STORAGE_KEY) ?? null
+    sq = globalThis.localStorage?.getItem(STRUGGLE_QUEUE_STORAGE_KEY) ?? null
+    sw = globalThis.localStorage?.getItem(STRUGGLE_WINDOWS_STORAGE_KEY) ?? null
+  } catch {
+    /* privacy mode → defaults */
+  }
+  return {
+    maxQueue: normalizeIntKnob(mq, DEFAULT_MAX_DECODE_QUEUE, 1, 60),
+    struggleQueue: normalizeIntKnob(sq, DEFAULT_STRUGGLE_QUEUE, 0, 59),
+    struggleWindows: normalizeIntKnob(sw, DEFAULT_STRUGGLE_WINDOWS, 1, 10),
   }
 }
 
@@ -3210,6 +3260,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   // `struggling` bit sent to the agent (see `sendDecodeStat`). Reset in
   // teardown so a fresh connection doesn't see a stale total.
   let lastBacklogDrops = 0
+  // P6 — flow-control knobs + the sustained-window struggle fold. One bad
+  // window no longer trips the agent's fps clamp (which costs ~20 s of lazy
+  // recovery); the run must persist `struggleWindows` consecutive windows.
+  const flowParams = storedFlowParams()
+  const struggleWindow = new StruggleWindow(flowParams.struggleWindows)
   let statsPrevBytes = 0
   let statsPrevTsMs = 0
 
@@ -3465,12 +3520,15 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     const delta = Math.max(0, drops - lastBacklogDrops)
     lastBacklogDrops = drops
     const queue = typeof m.decodeQueueSize === 'number' ? m.decodeQueueSize : 0
-    // Struggling = we dropped frames this window, OR the queue is deep enough
-    // that we're about to (drop fires at queue > MAX_DECODE_QUEUE = 4). `> 2`
-    // gives the agent a ~2-frame head start to cap fps and avoid the drop
-    // entirely, without firing on a healthy viewer's transient 1-2 frame blip.
-    const struggling = delta > 0 || queue > 2
-    sendDecodeStat(typeof m.fps === 'number' ? m.fps : 0, struggling)
+    // A window is "bad" when we dropped frames to a backlog, OR the queue is
+    // deep enough that we're about to (the worker drops at queue > maxQueue).
+    // P6 — the struggling bit needs a SUSTAINED run of bad windows (default
+    // 2 consecutive; `roomler-rc-struggle-windows=1` restores the legacy
+    // instantaneous rule). P1's field read showed a healthy viewer parks at
+    // queue 0, so a single-window blip (a big IDR landing, a GPU hiccup) was
+    // a false positive that cost ~20 s of lazily-recovered reduced fps.
+    const bad = delta > 0 || queue > flowParams.struggleQueue
+    sendDecodeStat(typeof m.fps === 'number' ? m.fps : 0, struggleWindow.observe(bad))
   }
 
   /** Update the controller's quality preference, persist it, and push
@@ -4162,6 +4220,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
           decodePref: storedDecodePref(),
           ctxMode: storedCtxMode(),
           perFrameMsg: storedPerFrameMsg(),
+          maxQueue: flowParams.maxQueue,
         },
         [synthetic],
       )
@@ -4352,6 +4411,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
           decodePref: storedDecodePref(),
           ctxMode: storedCtxMode(),
           perFrameMsg: storedPerFrameMsg(),
+          maxQueue: flowParams.maxQueue,
         },
         [synthetic],
       )
@@ -4659,6 +4719,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     stopStatsPoll()
     stopJankDetector()
     lastBacklogDrops = 0
+    struggleWindow.reset()
     stopWebCodecsPath()
     stopVp9_444Path()
     stopHevcPath()
