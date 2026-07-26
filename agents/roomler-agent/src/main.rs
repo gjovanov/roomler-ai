@@ -1526,6 +1526,11 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         }
     });
 
+    // 2026-07-27 — heal GPU clocks a crashed predecessor left pinned: the
+    // session-scoped pin resets on Drop, but a SIGKILL'd/crashed agent never
+    // runs Drop. No-op unless `ROOMLER_AGENT_GPU_CLOCK_PIN` is enabled.
+    roomler_agent::gpu_clock::reset_stale_pins();
+
     // rc.58 — start the centralized log uploader BEFORE signaling
     // moves cfg out of scope. Default ON; opt out with
     // `ROOMLER_AGENT_LOGS_UPLOAD_DISABLED=1` per the rc.58 plan.
