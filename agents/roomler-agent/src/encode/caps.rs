@@ -165,6 +165,29 @@ fn compute_caps() -> AgentCaps {
                         "caps probe: ffmpeg VP9 (vp9_qsv) encoder activates — runtime peer dispatch will prefer it over libvpx SW on data-channel-vp9-444 sessions"
                     );
                     hw_encoders.push(format!("ffmpeg-{name}"));
+                    // P4 — measure whether THIS host's vp9_qsv honours
+                    // runtime forced IDRs, per low_power mode. Hosts that
+                    // do get GOP 64800 + on-demand-only keys (kills the
+                    // residual ~1 Hz natural-key pulse on VP9-over-DC);
+                    // hosts that don't keep the rc.219 containment. Escape
+                    // hatch ROOMLER_AGENT_VP9_QSV_IDR_PROBE=0.
+                    if tunnel_core::env::node_env("VP9_QSV_IDR_PROBE").as_deref() != Some("0") {
+                        let t_idr = std::time::Instant::now();
+                        if let Some((lp1, lp0)) =
+                            crate::encode::ffmpeg::FfmpegEncoder::probe_and_cache_vp9_qsv_idr()
+                        {
+                            tracing::info!(
+                                honors_low_power = lp1,
+                                honors_vme = lp0,
+                                elapsed_ms = t_idr.elapsed().as_millis(),
+                                "caps probe: vp9_qsv runtime-IDR verdict (either true → long GOP + on-demand keys; both false → GOP-60 containment)"
+                            );
+                        }
+                    } else {
+                        tracing::info!(
+                            "caps probe: vp9_qsv IDR probe disabled (ROOMLER_AGENT_VP9_QSV_IDR_PROBE=0) — keeping GOP-60 containment"
+                        );
+                    }
                 }
                 Err(e) => {
                     tracing::info!(
