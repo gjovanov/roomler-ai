@@ -487,6 +487,10 @@ async fn connect_once(
     #[cfg(not(any(feature = "overlay-l3", feature = "overlay-netstack")))]
     let _ = &overlay_view_tx;
     let mut peers: HashMap<bson::oid::ObjectId, AgentPeer> = HashMap::new();
+    // 2026-07-27 — this connect iteration starts with a fresh session map;
+    // release any GPU-clock pin a previous iteration left engaged (its
+    // sessions died with the old map).
+    crate::gpu_clock::on_sessions_changed(0);
     // Codec selected for each pending session (computed from the
     // browser∩agent intersection when `rc:session.request` arrives, read
     // at `rc:sdp.offer` time to drive the track + encoder). Entries are
@@ -963,6 +967,9 @@ async fn handle_server_msg(
             .await
             .map_err(|e| ConnectError::Transient(e.context("sending answer")))?;
             peers.insert(session_id, peer);
+            // 2026-07-27 — first live session engages the GPU-clock pin
+            // (opt-in, `ROOMLER_AGENT_GPU_CLOCK_PIN`; no-op otherwise).
+            crate::gpu_clock::on_sessions_changed(peers.len());
             info!(%session_id, "rc:sdp.answer sent; peer is live");
         }
 
@@ -984,6 +991,9 @@ async fn handle_server_msg(
             if let Some(peer) = peers.remove(&session_id) {
                 peer.close().await;
             }
+            // 2026-07-27 — last session gone → release the GPU-clock pin
+            // (Drop resets the locked clocks).
+            crate::gpu_clock::on_sessions_changed(peers.len());
             // Drop any orphaned pending-codec / transport entry for
             // this session so the maps don't accumulate under long-
             // running agents (e.g. sessions cancelled before SDP is

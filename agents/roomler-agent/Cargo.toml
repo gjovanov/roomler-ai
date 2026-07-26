@@ -56,6 +56,9 @@ tracing-appender = "0.2"
 
 # Errors
 anyhow = { workspace = true }
+# GPU-clock session pin (gpu_clock.rs): NVML is dlopen'd at runtime, never
+# linked — this is just the cross-platform dlopen mechanism.
+libloading = "0.8"
 thiserror = { workspace = true }
 
 # Hashing (for machine_id derivation)

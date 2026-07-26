@@ -7049,6 +7049,7 @@ dependencies = [
  "if-addrs",
  "ipnet",
  "libc",
+ "libloading 0.8.9",
  "openh264",
  "openh264-sys2",
  "png 0.18.1",
