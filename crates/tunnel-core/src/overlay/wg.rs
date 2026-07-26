@@ -355,6 +355,131 @@ struct DirectDemux {
     tasks: Vec<JoinHandle<()>>,
 }
 
+/// P1 (S6) — the send-relevant triple of one routed peer, mirrored from
+/// [`Peer`] into the shared [`SendState`] so the outbound pump task can
+/// encapsulate + send without touching the loop-owned [`WgDevice`].
+#[derive(Clone)]
+struct SendPeer {
+    tunn: Arc<Mutex<Tunn>>,
+    carrier: Arc<Carrier>,
+    stats: Arc<PeerStats>,
+}
+
+/// P1 (S6) — everything the outbound data path needs, shared between the
+/// loop-owned [`WgDevice`] (sole writer, via its `&mut self` mutators) and
+/// the outbound pump task (reader). The [`Router`] lives HERE — single
+/// source of truth; the device reaches it through the lock.
+struct SendState {
+    router: Router,
+    /// Mirror of `WgDevice::peers`' send triples, maintained at the same
+    /// mutation choke points ([`WgDevice::send_install`] /
+    /// [`WgDevice::send_uninstall`]). Key-set equality with `peers` is
+    /// debug-asserted after every mutator.
+    peers: HashMap<[u8; 32], SendPeer>,
+}
+
+/// P1 (S6) — cloneable send half of the WG device, handed to the runtime's
+/// dedicated outbound pump task so the select! loop carries NO data-plane
+/// work (the structural fix behind the rc.206→rc.218 inline-await arc).
+///
+/// Lock discipline: this is a **std** `RwLock` deliberately (not tokio, not
+/// ArcSwap) — the std guard is `!Send`, so holding it across an `.await`
+/// inside the spawned (hence `Send`) pump future is a COMPILE ERROR. Guards
+/// live in tight sync blocks, always dropped before the encapsulate/send
+/// awaits. Lock poisoning ⇒ panic ⇒ the pump's JoinHandle resolves ⇒ the
+/// runtime loop exits ⇒ the agent's WS lifecycle rebuilds the session (the
+/// same disposition as a TUN death).
+///
+/// Accepted micro-race (by design): the pump may clone a [`SendPeer`]
+/// immediately before the loop removes/replaces that peer and send ≤1 packet
+/// into the just-torn-down carrier — indistinguishable from the existing
+/// best-effort drop semantics, and the `Arc`s keep the socket alive for the
+/// in-flight send. On an MBB promote the whole triple is swapped under one
+/// write lock, so the pump sees the complete old carrier or the complete new
+/// one, never a mix.
+#[derive(Clone)]
+pub struct WgSender(Arc<std::sync::RwLock<SendState>>);
+
+impl WgSender {
+    fn new() -> Self {
+        Self(Arc::new(std::sync::RwLock::new(SendState {
+            router: Router::new(),
+            peers: HashMap::new(),
+        })))
+    }
+
+    /// Encapsulate + send a raw IP packet to whichever peer owns its
+    /// destination. v4 (or an overlay-internal derived-ULA v6 — see
+    /// [`Router::dst_of_ip_packet`]) routes on the v4 table. P5/S3b — a GLOBAL
+    /// v6 destination ([`Router::is_global_v6_dst`]) routes to the configured
+    /// v6-exit peer if set, else is dropped (fail-closed, no leak). `false` if
+    /// no route or no session.
+    pub async fn send_ip_packet(&self, packet: &[u8]) -> bool {
+        // Route lookup + triple clone in ONE tight read-guard block; the
+        // guard is dropped before any await (enforced by !Send — see above).
+        let sp = {
+            let g = self.0.read().unwrap();
+            let pubkey = if let Some(dst) = Router::dst_of_ip_packet(packet) {
+                // v4 or derived-ULA v6 → the v4 routing table (a miss is
+                // final — no fall-through to the v6 exit).
+                g.router.route(&dst)
+            } else if Router::is_global_v6_dst(packet).is_some() {
+                g.router.v6_exit()
+            } else {
+                None
+            };
+            pubkey.and_then(|pk| g.peers.get(&pk).cloned())
+        };
+        match sp {
+            Some(sp) => sp.send(packet).await,
+            None => false,
+        }
+    }
+
+    /// Encapsulate + send `packet` to a specific peer. `false` if the peer is
+    /// unknown, the handshake hasn't completed (boringtun queues the packet
+    /// and emits a handshake initiation instead), or the carrier send failed.
+    pub async fn send_to_peer(&self, peer_public: &[u8; 32], packet: &[u8]) -> bool {
+        let sp = { self.0.read().unwrap().peers.get(peer_public).cloned() };
+        match sp {
+            Some(sp) => sp.send(packet).await,
+            None => false,
+        }
+    }
+}
+
+impl SendPeer {
+    /// The single encapsulate-and-send implementation (moved verbatim from
+    /// the pre-P1 `WgDevice::send_to_peer`).
+    async fn send(&self, packet: &[u8]) -> bool {
+        let mut buf = vec![0u8; WG_BUF];
+        // rc.211 — encapsulate UNDER the lock, send AFTER releasing it (see
+        // the timer tasks): never hold the Tunn lock across a carrier send.
+        let out = {
+            let mut t = self.tunn.lock().await;
+            match t.encapsulate(packet, &mut buf) {
+                TunnResult::WriteToNetwork(b) => Some(b.to_vec()),
+                TunnResult::Done => None,
+                TunnResult::Err(e) => {
+                    warn!(?e, "wg encapsulate error");
+                    None
+                }
+                _ => None,
+            }
+        };
+        match out {
+            Some(b) => {
+                let ok = self.carrier.send(&b).await.is_ok();
+                if ok {
+                    self.stats.tx.fetch_add(1, Ordering::Relaxed);
+                }
+                ok
+            }
+            None => false,
+        }
+    }
+}
+
 /// A node's userspace WireGuard device: one static keypair, N peers,
 /// and the `overlay_ip → pubkey` routing table.
 pub struct WgDevice {
@@ -370,7 +495,9 @@ pub struct WgDevice {
     /// peer that can only relay). Empty unless the feature is on + an upgrade is
     /// in flight.
     probes: HashMap<[u8; 32], Peer>,
-    router: Router,
+    /// P1 (S6) — the shared send half (Router + send-triple mirror). This
+    /// device is the SOLE writer; the outbound pump reads. See [`WgSender`].
+    send: WgSender,
     tun_tx: mpsc::Sender<Vec<u8>>,
     next_index: u32,
     /// rc.134 — the shared direct-LAN socket + demux loop, lazily created on
@@ -417,7 +544,7 @@ impl WgDevice {
                 public,
                 peers: HashMap::new(),
                 probes: HashMap::new(),
-                router: Router::new(),
+                send: WgSender::new(),
                 tun_tx,
                 next_index: 1,
                 direct: None,
@@ -509,6 +636,71 @@ impl WgDevice {
         self.public
     }
 
+    /// P1 (S6) — clone the send half for the runtime's outbound pump task.
+    pub fn sender(&self) -> WgSender {
+        self.send.clone()
+    }
+
+    /// P1 (S6) — install/replace a peer's send triple + host route in the
+    /// shared [`SendState`], under ONE write lock so the pump sees either the
+    /// complete old entry or the complete new one, never a mix (the MBB
+    /// promote swaps Tunn + carrier together). One of the two choke points
+    /// every routing mutator must go through (with [`send_uninstall`]) — the
+    /// ONLY code allowed to touch both `peers` and the mirror.
+    fn send_install(
+        &mut self,
+        peer_public: [u8; 32],
+        overlay_ip: Ipv4Addr,
+        tunn: Arc<Mutex<Tunn>>,
+        carrier: Arc<Carrier>,
+        stats: Arc<PeerStats>,
+    ) {
+        let mut g = self.send.0.write().unwrap();
+        g.router.upsert(overlay_ip, peer_public);
+        g.peers.insert(
+            peer_public,
+            SendPeer {
+                tunn,
+                carrier,
+                stats,
+            },
+        );
+    }
+
+    /// P1 (S6) — remove a peer's send triple + host route (+ clear the
+    /// v6-exit pin if it pointed at this peer), under one write lock. The
+    /// second mutation choke point (see [`send_install`]).
+    fn send_uninstall(&mut self, peer_public: &[u8; 32], overlay_ip: &Ipv4Addr) {
+        let mut g = self.send.0.write().unwrap();
+        g.router.remove(overlay_ip);
+        g.peers.remove(peer_public);
+        // P5/S3b — if this was the global-v6 exit peer, stop routing v6 to a
+        // now-dead pubkey (defensive; the reconcile re-asserts on its next
+        // pass if the peer is still the valid, reachable exit).
+        if g.router.v6_exit() == Some(*peer_public) {
+            g.router.set_v6_exit(None);
+        }
+    }
+
+    /// P1 (S6) — the send mirror must track `peers` key-for-key; a mutator
+    /// that forgets its choke-point call would silently route the pump on
+    /// stale state. No-op in release builds.
+    fn debug_assert_send_synced(&self) {
+        #[cfg(debug_assertions)]
+        {
+            let g = self.send.0.read().unwrap();
+            debug_assert_eq!(
+                g.peers.len(),
+                self.peers.len(),
+                "send mirror out of sync with peers (len)"
+            );
+            debug_assert!(
+                self.peers.keys().all(|k| g.peers.contains_key(k)),
+                "send mirror out of sync with peers (keys)"
+            );
+        }
+    }
+
     /// Install a peer and spawn its recv + timer tasks. `initiate` ⇒
     /// proactively send a handshake initiation now (the dialing side);
     /// the other end reacts to the inbound init.
@@ -582,7 +774,6 @@ impl WgDevice {
             }
         });
 
-        self.router.upsert(overlay_ip, peer_public);
         self.peers.insert(
             peer_public,
             Peer {
@@ -590,10 +781,18 @@ impl WgDevice {
                 carrier: carrier.clone(),
                 overlay_ip,
                 tasks: vec![recv_task, timer_task],
-                stats,
+                stats: stats.clone(),
                 direct_src: None,
             },
         );
+        self.send_install(
+            peer_public,
+            overlay_ip,
+            tunn.clone(),
+            carrier.clone(),
+            stats,
+        );
+        self.debug_assert_send_synced();
 
         if initiate {
             tokio::spawn(async move {
@@ -689,8 +888,11 @@ impl WgDevice {
             .make_direct_peer(sock, peer_public, overlay_ip, dst, initiate)
             .await
         {
-            self.router.upsert(overlay_ip, peer_public);
+            let (tunn, carrier, stats) =
+                (peer.tunn.clone(), peer.carrier.clone(), peer.stats.clone());
             self.peers.insert(peer_public, peer);
+            self.send_install(peer_public, overlay_ip, tunn, carrier, stats);
+            self.debug_assert_send_synced();
         }
     }
 
@@ -851,9 +1053,18 @@ impl WgDevice {
     /// its own per-peer bookkeeping and forgets the now-unused relay allocation.
     pub fn promote_direct_probe(&mut self, peer_public: &[u8; 32]) -> bool {
         if let Some(probe) = self.probes.remove(peer_public) {
-            self.router.upsert(probe.overlay_ip, *peer_public);
+            let overlay_ip = probe.overlay_ip;
+            let (tunn, carrier, stats) = (
+                probe.tunn.clone(),
+                probe.carrier.clone(),
+                probe.stats.clone(),
+            );
             // Insert replaces + drops the old (relay) peer; Drop aborts its task.
             self.peers.insert(*peer_public, probe);
+            // P1 (S6) — swap the pump's view atomically: the whole triple
+            // replaces the old one under a single write lock.
+            self.send_install(*peer_public, overlay_ip, tunn, carrier, stats);
+            self.debug_assert_send_synced();
             true
         } else {
             false
@@ -894,15 +1105,10 @@ impl WgDevice {
     /// routing table.
     pub async fn remove_peer(&mut self, peer_public: &[u8; 32]) {
         if let Some(p) = self.peers.remove(peer_public) {
-            self.router.remove(&p.overlay_ip);
+            self.send_uninstall(peer_public, &p.overlay_ip);
+            self.debug_assert_send_synced();
             if let (Some(src), Some(demux)) = (p.direct_src, &self.direct) {
                 demux.routes.lock().await.remove(&src);
-            }
-            // P5/S3b — if this was the global-v6 exit peer, stop routing v6 to a
-            // now-dead pubkey (defensive; the reconcile re-asserts on its next
-            // pass if the peer is still the valid, reachable exit).
-            if self.router.v6_exit() == Some(*peer_public) {
-                self.router.set_v6_exit(None);
             }
         }
     }
@@ -911,20 +1117,25 @@ impl WgDevice {
     /// those CIDRs are encapsulated to it (longest-prefix after the host `/32`s).
     /// Replaces any previously-set subnets for the peer; empty clears them.
     pub fn set_peer_subnets(&mut self, peer_public: [u8; 32], subnets: &[super::router::Cidr]) {
-        self.router.set_subnets(peer_public, subnets);
+        self.send
+            .0
+            .write()
+            .unwrap()
+            .router
+            .set_subnets(peer_public, subnets);
     }
 
     /// P5/S3b exit-node — route this node's GLOBAL IPv6 egress through `pubkey`
     /// (or `None` to clear → global v6 drops fail-closed). Set by the exit-routing
     /// reconcile once the v6 carrier exemptions are pinned.
     pub fn set_v6_exit(&mut self, pubkey: Option<[u8; 32]>) {
-        self.router.set_v6_exit(pubkey);
+        self.send.0.write().unwrap().router.set_v6_exit(pubkey);
     }
 
     /// The current global-v6 exit peer's pubkey, if any — lets the reconcile
     /// re-assert it (idempotent) after a `remove_peer` may have cleared it.
     pub fn v6_exit(&self) -> Option<[u8; 32]> {
-        self.router.v6_exit()
+        self.send.0.read().unwrap().router.v6_exit()
     }
 
     /// Number of installed peers.
@@ -933,61 +1144,17 @@ impl WgDevice {
     }
 
     /// Encapsulate + send a raw IP packet to whichever peer owns its destination.
-    /// v4 (or an overlay-internal derived-ULA v6 — see
-    /// [`Router::dst_of_ip_packet`]) routes on the v4 table. P5/S3b — a GLOBAL v6
-    /// destination ([`Router::is_global_v6_dst`]) routes to the configured
-    /// [`v6_exit`](Self::v6_exit) peer if set, else is dropped (fail-closed, no
-    /// leak). `false` if no route or no session.
+    /// P1 (S6) — delegates to the shared [`WgSender`] so this is structurally
+    /// the SAME implementation the outbound pump runs (one send path).
     pub async fn send_ip_packet(&self, packet: &[u8]) -> bool {
-        // v4 or an overlay-internal derived-ULA v6 → the v4 routing table.
-        if let Some(dst) = Router::dst_of_ip_packet(packet) {
-            let Some(pubkey) = self.router.route(&dst) else {
-                return false;
-            };
-            return self.send_to_peer(&pubkey, packet).await;
-        }
-        // A global (non-overlay) v6 destination → the v6 exit peer, if any.
-        if Router::is_global_v6_dst(packet).is_some()
-            && let Some(pubkey) = self.router.v6_exit()
-        {
-            return self.send_to_peer(&pubkey, packet).await;
-        }
-        false
+        self.send.send_ip_packet(packet).await
     }
 
     /// Encapsulate + send `packet` to a specific peer. `false` if the
-    /// peer is unknown, the handshake hasn't completed (boringtun
-    /// returns `Done`, queuing nothing — the caller retries), or the
-    /// carrier send failed.
+    /// peer is unknown, the handshake hasn't completed, or the carrier send
+    /// failed. P1 (S6) — delegates to the shared [`WgSender`].
     pub async fn send_to_peer(&self, peer_public: &[u8; 32], packet: &[u8]) -> bool {
-        let Some(peer) = self.peers.get(peer_public) else {
-            return false;
-        };
-        let mut buf = vec![0u8; WG_BUF];
-        // rc.211 — encapsulate UNDER the lock, send AFTER releasing it (see the
-        // timer tasks): never hold the Tunn lock across a carrier send.
-        let out = {
-            let mut t = peer.tunn.lock().await;
-            match t.encapsulate(packet, &mut buf) {
-                TunnResult::WriteToNetwork(b) => Some(b.to_vec()),
-                TunnResult::Done => None,
-                TunnResult::Err(e) => {
-                    warn!(?e, "wg encapsulate error");
-                    None
-                }
-                _ => None,
-            }
-        };
-        match out {
-            Some(b) => {
-                let ok = peer.carrier.send(&b).await.is_ok();
-                if ok {
-                    peer.stats.tx.fetch_add(1, Ordering::Relaxed);
-                }
-                ok
-            }
-            None => false,
-        }
+        self.send.send_to_peer(peer_public, packet).await
     }
 
     /// Whether a WG session to `peer_public` has completed a handshake.
@@ -1351,6 +1518,73 @@ mod tests {
         assert!(
             dev.peer_traffic(&pk).is_some(),
             "the active carrier survives an unrelated probe drop"
+        );
+    }
+
+    /// P1 (S6) — the shared send half must track every routing mutation:
+    /// add routes, promote swaps the pump's view to the probe's carrier
+    /// atomically, remove unroutes. Observed from the OUTSIDE via a
+    /// [`WgSender`] clone (exactly what the outbound pump holds) and real
+    /// loopback sockets — bytes land where the CURRENT carrier points.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn send_table_tracks_add_remove_and_promote() {
+        let kp = WgKeypair::generate();
+        let peer = WgKeypair::generate();
+        let (mut dev, _rx) = WgDevice::new(kp.secret.clone());
+        let sender = dev.sender();
+        let pk = peer.public.to_bytes();
+        let ip = Ipv4Addr::new(100, 64, 0, 7);
+        let pkt = synthetic_ipv4(Ipv4Addr::new(100, 64, 0, 1), ip, b"send-table");
+        let mut buf = [0u8; 2048];
+
+        // No route yet — the sender drops.
+        assert!(
+            !sender.send_ip_packet(&pkt).await,
+            "unrouted before add_peer"
+        );
+
+        // add_peer → routed. The first send emits the handshake INIT (boringtun
+        // queues the data packet pre-session), observed at the old carrier dst.
+        let old_listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let old_dst = old_listener.local_addr().unwrap();
+        let out_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        dev.add_peer(pk, ip, Carrier::direct(out_sock, old_dst), false);
+        assert!(
+            sender.send_ip_packet(&pkt).await,
+            "routed after add_peer (emits the init)"
+        );
+        let n = tokio::time::timeout(Duration::from_secs(5), old_listener.recv(&mut buf))
+            .await
+            .expect("old carrier dst must receive the sender's emission")
+            .unwrap();
+        assert!(n > 0);
+
+        // Shadow probe → latch → promote: the pump's view swaps to the probe's
+        // carrier under one write lock — the next emission lands at the PROBE
+        // dst (fresh Tunn ⇒ a fresh init), not the old one.
+        let probe_listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let probe_dst = probe_listener.local_addr().unwrap();
+        let demux_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        dev.ensure_direct_demux(demux_sock.clone());
+        dev.start_direct_probe(demux_sock, pk, ip, probe_dst, false)
+            .await;
+        dev.test_latch_probe_handshake_done(&pk);
+        assert!(dev.promote_direct_probe(&pk));
+        assert!(
+            sender.send_ip_packet(&pkt).await,
+            "still routed after promote"
+        );
+        let n = tokio::time::timeout(Duration::from_secs(5), probe_listener.recv(&mut buf))
+            .await
+            .expect("post-promote emission must land at the probe dst")
+            .unwrap();
+        assert!(n > 0);
+
+        // remove_peer → unrouted again (route + triple gone in one uninstall).
+        dev.remove_peer(&pk).await;
+        assert!(
+            !sender.send_ip_packet(&pkt).await,
+            "unrouted after remove_peer"
         );
     }
 
