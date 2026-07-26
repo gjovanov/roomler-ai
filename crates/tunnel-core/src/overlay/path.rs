@@ -775,6 +775,27 @@ pub(crate) struct ShadowStats {
     /// immediately after its own death/expiry penalty booked (must be 0 —
     /// the penalty math guarantees ineligibility right after booking).
     pub(crate) post_death_eligible: u64,
+    /// P3 PR-B — `(decisions, diverged)` per trigger class
+    /// (netmap / delta / reupgrade / resume / initial / inbound): the
+    /// scheduler comparison as its own divergence class. A reupgrade-tick
+    /// divergence means the monitor would have SCHEDULED differently; a
+    /// netmap/delta one that it would have SELECTED differently — the soak
+    /// gate reads them separately.
+    pub(crate) by_class: HashMap<&'static str, (u64, u64)>,
+}
+
+impl ShadowStats {
+    /// Compact, sorted `class:decisions/diverged` rendering for the 10-min
+    /// summary log line.
+    pub(crate) fn classes_line(&self) -> String {
+        let mut cls: Vec<String> = self
+            .by_class
+            .iter()
+            .map(|(k, (d, v))| format!("{k}:{d}/{v}"))
+            .collect();
+        cls.sort();
+        cls.join(",")
+    }
 }
 
 #[cfg(test)]
