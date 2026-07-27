@@ -632,9 +632,22 @@ fn to_agent_response(
     a: roomler_ai_remote_control::models::Agent,
 ) -> AgentResponse {
     let id = a.id.map(|i| i.to_hex()).unwrap_or_default();
-    let is_online =
+    // S6 — the rc-hub only knows agents whose WS lands on THIS pod. For
+    // listings, an agent heartbeating within the last 90 s counts as
+    // online even when its socket lives on the other pod (heartbeats
+    // update `last_seen_at` in Mongo every 30 s). Hub-local presence
+    // still wins instantly for the common case.
+    let hub_online =
         a.id.map(|i| state.rc_hub.is_agent_online(i))
             .unwrap_or(false);
+    let recently_seen = a
+        .last_seen_at
+        .map(|t| {
+            let age_ms = bson::DateTime::now().timestamp_millis() - t.timestamp_millis();
+            age_ms < 90_000
+        })
+        .unwrap_or(false);
+    let is_online = hub_online || recently_seen;
     AgentResponse {
         id,
         tenant_id: a.tenant_id.to_hex(),

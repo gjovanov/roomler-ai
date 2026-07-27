@@ -16,6 +16,24 @@ pub struct NotifyParams {
 }
 
 /// Create a notification for a single user and send it via WebSocket.
+/// S6 — cross-pod connectivity check for the offline push/email dedupe.
+/// Local sockets win (fast path); otherwise consult the Redis online
+/// registry so a user whose WS lives on the OTHER pod isn't spammed
+/// with push+email for every mention. Registry unavailable → treat as
+/// offline (matches the pre-S6 single-pod behaviour of "not here = not
+/// connected").
+async fn user_online_anywhere(state: &AppState, user_id: &ObjectId) -> bool {
+    if state.ws_storage.is_connected(user_id) {
+        return true;
+    }
+    if let Some(pubsub) = &state.redis_pubsub {
+        if let Ok(online) = pubsub.online_anywhere(&user_id.to_hex()).await {
+            return online;
+        }
+    }
+    false
+}
+
 async fn create_and_send_notification(
     state: &AppState,
     params: &NotifyParams,
@@ -178,7 +196,7 @@ pub async fn notify_mentions(
 
         create_and_send_notification(state, &params, *user_id).await;
 
-        if !state.ws_storage.is_connected(user_id) {
+        if !user_online_anywhere(state, user_id).await {
             spawn_mention_email(
                 state,
                 *user_id,
@@ -237,7 +255,7 @@ pub async fn notify_call_started(
 
         create_and_send_notification(state, &params, *uid).await;
 
-        if !state.ws_storage.is_connected(uid) {
+        if !user_online_anywhere(state, uid).await {
             offline_ids.push(*uid);
         }
     }
