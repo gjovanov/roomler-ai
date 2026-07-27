@@ -640,13 +640,10 @@ fn to_agent_response(
     let hub_online =
         a.id.map(|i| state.rc_hub.is_agent_online(i))
             .unwrap_or(false);
-    let recently_seen = a
-        .last_seen_at
-        .map(|t| {
-            let age_ms = bson::DateTime::now().timestamp_millis() - t.timestamp_millis();
-            age_ms < 90_000
-        })
-        .unwrap_or(false);
+    let recently_seen = {
+        let age_ms = bson::DateTime::now().timestamp_millis() - a.last_seen_at.timestamp_millis();
+        age_ms < 90_000
+    };
     let is_online = hub_online || recently_seen;
     AgentResponse {
         id,
