@@ -203,12 +203,78 @@ fn migrate_dir(old: &Path, new: &Path) -> Option<String> {
             old.display(),
             new.display()
         )),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            // Field finding (NEO16, 2026-07-27): renaming the TOP dir was
+            // denied by an external ROOT-handle (an AV / indexer
+            // directory-watch — no roomler process held anything, ACLs
+            // were Full, and every CHILD renamed fine). Fall back to
+            // moving the children individually; that dodges the
+            // root-handle without needing the watcher gone.
+            Some(migrate_children(old, new, &e))
+        }
         Err(e) => Some(format!(
             "migration failed ({} -> {}): {e} — read-both fallback stays in charge",
             old.display(),
             new.display()
         )),
     }
+}
+
+/// Per-child fallback for a root-locked legacy dir. `config.toml` moves
+/// LAST, and any mid-way failure rolls the already-moved entries back —
+/// so the tree is always either wholly OLD or wholly NEW (a half-empty
+/// NEW tree would win the NEW-first resolution and strand the enrolled
+/// config in the abandoned OLD one).
+fn migrate_children(old: &Path, new: &Path, root_err: &std::io::Error) -> String {
+    let Ok(entries) = std::fs::read_dir(old) else {
+        return format!(
+            "migration failed ({} -> {}): {root_err} (and the legacy dir is unreadable)",
+            old.display(),
+            new.display()
+        );
+    };
+    let mut children: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    // config.toml last: the enrollment must be the final thing to leave
+    // the old tree.
+    children.sort_by_key(|p| p.file_name().is_some_and(|f| f == "config.toml"));
+    if let Err(e) = std::fs::create_dir_all(new) {
+        return format!("migration failed (create {}): {e}", new.display());
+    }
+    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for src in &children {
+        let Some(name) = src.file_name() else {
+            continue;
+        };
+        let dst = new.join(name);
+        match std::fs::rename(src, &dst) {
+            Ok(()) => moved.push((src.clone(), dst)),
+            Err(e) => {
+                // Roll back so the OLD tree stays complete (best-effort;
+                // a rollback failure is noted and read-both still covers
+                // the pieces that DID move — they're identical content).
+                let mut rolled_back = true;
+                for (orig, dstp) in moved.iter().rev() {
+                    if std::fs::rename(dstp, orig).is_err() {
+                        rolled_back = false;
+                    }
+                }
+                return format!(
+                    "per-child migration of {} aborted at {} ({e}); rolled back: {rolled_back} \
+                     (root rename was denied: {root_err})",
+                    old.display(),
+                    src.display()
+                );
+            }
+        }
+    }
+    let _ = std::fs::remove_dir(old);
+    format!(
+        "migrated legacy tree {} -> {} per-child ({} entries; the root dir itself was \
+         locked by another process: {root_err})",
+        old.display(),
+        new.display(),
+        moved.len()
+    )
 }
 
 #[cfg(test)]
@@ -269,6 +335,49 @@ mod tests {
         let note = migrate_dir(&old, &new).expect("both-present produces a note");
         assert!(note.contains("left in place"), "{note}");
         assert!(old.join("stale.txt").exists(), "nothing may be deleted");
+    }
+
+    #[test]
+    fn migrate_children_moves_everything_and_drops_old_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old = tmp.path().join("roomler-agent");
+        let new = tmp.path().join("roomler");
+        std::fs::create_dir_all(old.join("service-logs")).unwrap();
+        std::fs::write(old.join("config.toml"), b"agent_token = \"x\"").unwrap();
+        std::fs::write(old.join("service-logs").join("a.log"), b"l").unwrap();
+
+        let err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "root locked");
+        let note = migrate_children(&old, &new, &err);
+        assert!(note.contains("per-child"), "{note}");
+        assert!(!old.exists(), "emptied legacy root must be removed");
+        assert_eq!(
+            std::fs::read_to_string(new.join("config.toml")).unwrap(),
+            "agent_token = \"x\""
+        );
+        assert!(new.join("service-logs").join("a.log").exists());
+    }
+
+    #[test]
+    fn migrate_children_rolls_back_on_midway_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old = tmp.path().join("roomler-agent");
+        let new = tmp.path().join("roomler");
+        std::fs::create_dir_all(old.join("crashes")).unwrap();
+        std::fs::write(old.join("config.toml"), b"tok").unwrap();
+        // Pre-create a CONFLICTING non-empty destination for `crashes` so
+        // its rename fails mid-way (rename onto a non-empty dir errors).
+        std::fs::create_dir_all(new.join("crashes").join("blocker")).unwrap();
+
+        let err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "root locked");
+        let note = migrate_children(&old, &new, &err);
+        assert!(note.contains("aborted"), "{note}");
+        // config.toml sorted LAST → it never left the old tree before the
+        // failure, and anything that did move was rolled back.
+        assert!(
+            old.join("config.toml").exists(),
+            "the enrollment must still be in the OLD tree: {note}"
+        );
+        assert!(old.join("crashes").exists());
     }
 
     #[test]
