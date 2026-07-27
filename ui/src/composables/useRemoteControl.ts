@@ -63,6 +63,107 @@ export const RC_RECONNECT_LADDER_MS = [250, 500, 1000, 2000, 4000, 8000] as cons
 export const RC_RECONNECT_STEADY_MS = 8000
 
 /**
+ * S3 viewer resilience — detection constants. All exported so the
+ * decision tables below are unit-lockable.
+ *
+ * - `RC_PC_DISCONNECTED_GRACE_MS`: how long the peer connection may sit
+ *   in `'disconnected'` before we treat it as a failure and re-create
+ *   the session. ICE flaps recover in ~1-2 s; a VPN flip on the host
+ *   never does — 4 s separates the two without a visible false-positive
+ *   window.
+ * - `RC_SIGNALING_TIMEOUT_MS`: max time in `'requesting'` or
+ *   `'negotiating'` before the attempt is abandoned and the ladder
+ *   advances. `awaiting_consent` is exempt — the SERVER owns that
+ *   timeout (consent_timeout), and a human on a Prompt-mode org device
+ *   may legitimately take longer than any client-side number.
+ * - Watchdog: ticks every `RC_WATCHDOG_TICK_MS` while connected. After
+ *   `RC_STALL_PROBE_TICKS` ticks with zero media progress it sends ONE
+ *   `rc:keyframe` probe — a static remote desktop legitimately produces
+ *   no frames, so flat counters alone must NOT trigger a reconnect; a
+ *   live agent answers the probe with an IDR within a tick. Only if the
+ *   counters stay flat through `RC_STALL_FAIL_TICKS` (probe unanswered)
+ *   is the pipe declared dead.
+ */
+export const RC_PC_DISCONNECTED_GRACE_MS = 4000
+export const RC_SIGNALING_TIMEOUT_MS = 15000
+export const RC_WATCHDOG_TICK_MS = 1000
+export const RC_STALL_PROBE_TICKS = 6
+export const RC_STALL_FAIL_TICKS = 10
+
+/**
+ * Sub-`connected` health surfaced while `phase === 'connected'`:
+ * the session is still up but something is wrong. Priority order
+ * (highest wins): transport_unstable (pc left 'connected'),
+ * media_stalled (probe outstanding, no frames), signalling_offline
+ * (WS down — media may still flow P2P, but no renegotiation is
+ * possible).
+ */
+export type RcDegradedReason =
+  | 'transport_unstable'
+  | 'media_stalled'
+  | 'signalling_offline'
+
+/**
+ * `rc:terminate` reasons that auto-re-create the session instead of
+ * closing the viewer. `agent_disconnect` is the reported VPN/agent-WS
+ * displacement symptom; `error` covers transient agent-side failures.
+ * Everything deliberate (hangups, denials, admin, idle) stays
+ * terminal. Consent-loop note: a retry against a Prompt-mode org
+ * device re-prompts its owner ONCE — an unanswered prompt ends in
+ * `consent_timeout`, which is terminal, so the loop self-limits.
+ */
+export function isRetryableTerminateReason(reason: unknown): boolean {
+  return reason === 'agent_disconnect' || reason === 'error'
+}
+
+/**
+ * `rc:error` codes that advance the reconnect ladder instead of
+ * killing it. Only honoured while a reconnect cycle is active — a
+ * user-initiated first connect hitting `agent_offline` should fail
+ * fast and honestly. `agent_busy`: the old session's slot hasn't
+ * freed yet (max_simultaneous_sessions=1). `agent_offline`: agent WS
+ * mid-flap. `session_not_found`: stale state from the session we
+ * already abandoned.
+ */
+export function isRetryableRcErrorCode(code: unknown): boolean {
+  return code === 'agent_busy' || code === 'agent_offline' || code === 'session_not_found'
+}
+
+/**
+ * Session-gate for inbound rc:* handlers: a message carrying a
+ * session_id is only accepted when it matches the CURRENT session.
+ * Messages without one (pre-session errors) always pass. Before this
+ * gate, a stale `rc:terminate` from an abandoned session could kill
+ * the fresh session that replaced it.
+ */
+export function sessionGateAllows(
+  msgSessionId: unknown,
+  currentSessionId: string | null,
+): boolean {
+  if (typeof msgSessionId !== 'string' || msgSessionId.length === 0) return true
+  return currentSessionId !== null && msgSessionId === currentSessionId
+}
+
+/** Stall decision table — see the constants docblock above. */
+export function nextStallAction(stallTicks: number): 'none' | 'probe' | 'reconnect' {
+  if (stallTicks >= RC_STALL_FAIL_TICKS) return 'reconnect'
+  if (stallTicks === RC_STALL_PROBE_TICKS) return 'probe'
+  return 'none'
+}
+
+/** Degraded classification — pure so the priority order is testable. */
+export function classifyDegraded(inp: {
+  pcState: string | null
+  wsConnected: boolean
+  stallTicks: number
+}): RcDegradedReason | null {
+  if (inp.pcState === 'disconnected') return 'transport_unstable'
+  if (inp.stallTicks >= RC_STALL_PROBE_TICKS) return 'media_stalled'
+  if (!inp.wsConnected) return 'signalling_offline'
+  return null
+}
+
+/**
  * Parse an inbound `control` data-channel message into a typed
  * value. Returns `null` for any non-JSON, non-string, or unknown
  * envelope shape so the caller can no-op silently. Recognised
@@ -2199,6 +2300,109 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   let lastConnectArgs: { agentId: string; permissions: string } | null = null
   const reconnectAttempt = ref(0)
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+
+  // ── S3 viewer resilience state ──────────────────────────────────
+  /** Sub-connected health; null = fully healthy (or not connected). */
+  const degraded = ref<RcDegradedReason | null>(null)
+  /** Armed when pc hits 'disconnected'; fires scheduleReconnect if it
+   *  hasn't recovered within RC_PC_DISCONNECTED_GRACE_MS. */
+  let pcDisconnectedTimer: ReturnType<typeof setTimeout> | null = null
+  /** Abandons a 'requesting'/'negotiating' attempt that hangs. */
+  let signalingTimer: ReturnType<typeof setTimeout> | null = null
+  /** 1 Hz media-progress watchdog (runs only while connected). */
+  let watchdogTimer: ReturnType<typeof setInterval> | null = null
+  let stallTicks = 0
+  let lastMediaProgress = { rtpBytes: 0, vp9Frames: 0, hevcFrames: 0 }
+
+  function clearPcDisconnectedTimer() {
+    if (pcDisconnectedTimer !== null) {
+      clearTimeout(pcDisconnectedTimer)
+      pcDisconnectedTimer = null
+    }
+  }
+
+  function clearSignalingTimeout() {
+    if (signalingTimer !== null) {
+      clearTimeout(signalingTimer)
+      signalingTimer = null
+    }
+  }
+
+  /** (Re-)arm the signalling stuck-detector. Covers 'requesting'
+   *  (no rc:session.created yet) and 'negotiating' (SDP exchange
+   *  through pc-connected). NOT 'awaiting_consent' — the server owns
+   *  that timeout. */
+  function armSignalingTimeout() {
+    clearSignalingTimeout()
+    signalingTimer = setTimeout(() => {
+      signalingTimer = null
+      if (phase.value === 'requesting' || phase.value === 'negotiating') {
+        console.warn('[rc] signalling stuck in', phase.value, '— retrying')
+        if (lastConnectArgs) scheduleReconnect()
+        else failWith('connection timed out')
+      }
+    }, RC_SIGNALING_TIMEOUT_MS)
+  }
+
+  function stopMediaWatchdog() {
+    if (watchdogTimer !== null) {
+      clearInterval(watchdogTimer)
+      watchdogTimer = null
+    }
+    stallTicks = 0
+    lastMediaProgress = { rtpBytes: 0, vp9Frames: 0, hevcFrames: 0 }
+    degraded.value = null
+  }
+
+  /**
+   * Detect the silent-wedge failure mode: pc still reports
+   * 'connected' but no media has advanced for seconds (agent-side
+   * pipeline death, WS displacement with a zombie peer, one-way
+   * network failure). Progress = ANY of: inbound RTP bytes (classic
+   * <video> + WebCodecs paths), VP9-444 DC frames, HEVC DC frames.
+   * Static desktops legitimately go flat → probe with rc:keyframe
+   * first (see nextStallAction) and only reconnect when the probe
+   * goes unanswered.
+   */
+  function startMediaWatchdog() {
+    if (watchdogTimer !== null) return
+    stallTicks = 0
+    lastMediaProgress = { rtpBytes: statsPrevBytes, vp9Frames: 0, hevcFrames: 0 }
+    watchdogTimer = setInterval(() => {
+      if (phase.value !== 'connected') return
+      const cur = {
+        rtpBytes: statsPrevBytes,
+        vp9Frames: vp9_444FramesDecoded.value,
+        hevcFrames: hevcFramesDecoded.value,
+      }
+      // No hasMedia special-case: a session that reached 'connected'
+      // but never produced a track/frame is just as dead as one that
+      // stalled mid-flight — both count ticks toward probe/reconnect.
+      const advanced =
+        cur.rtpBytes > lastMediaProgress.rtpBytes
+        || cur.vp9Frames > lastMediaProgress.vp9Frames
+        || cur.hevcFrames > lastMediaProgress.hevcFrames
+      lastMediaProgress = cur
+      if (advanced) {
+        stallTicks = 0
+      } else {
+        stallTicks++
+      }
+      degraded.value = classifyDegraded({
+        pcState: pc?.connectionState ?? null,
+        wsConnected: ws.status === 'connected',
+        stallTicks,
+      })
+      const action = nextStallAction(stallTicks)
+      if (action === 'probe') {
+        console.info('[rc] media stalled', stallTicks, 's — probing with rc:keyframe')
+        requestKeyframe()
+      } else if (action === 'reconnect') {
+        console.warn('[rc] media stalled', stallTicks, 's, keyframe probe unanswered — re-creating session')
+        scheduleReconnect()
+      }
+    }, RC_WATCHDOG_TICK_MS)
+  }
   /**
    * Whether the agent has signalled (over the `control` data channel)
    * that the host's input desktop has transitioned to `winsta0\Winlogon`
@@ -4591,12 +4795,21 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
 
   function installRcHandlers() {
     ws.onRcMessage('rc:session.created', (msg) => {
+      // Only accept while we actually have a request in flight — a
+      // late/stale create must not resurrect an abandoned attempt.
+      if (phase.value !== 'requesting') return
       sessionId.value = msg.session_id
       phase.value = 'awaiting_consent'
+      // Consent is human-paced on Prompt-mode devices; the SERVER owns
+      // that timeout (consent_timeout). Ours only covers requesting/
+      // negotiating.
+      clearSignalingTimeout()
     })
     ws.onRcMessage('rc:ready', async (msg) => {
       if (!pc) return
+      if (!sessionGateAllows(msg.session_id, sessionId.value)) return
       phase.value = 'negotiating'
+      armSignalingTimeout()
       try {
         const offer = await pc.createOffer()
         await pc.setLocalDescription(offer)
@@ -4611,6 +4824,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     })
     ws.onRcMessage('rc:sdp.answer', async (msg) => {
       if (!pc) return
+      if (!sessionGateAllows(msg.session_id, sessionId.value)) return
       try {
         await pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp })
         remoteDescriptionSet = true
@@ -4629,6 +4843,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     })
     ws.onRcMessage('rc:ice', async (msg) => {
       if (!pc || !msg.candidate) return
+      if (!sessionGateAllows(msg.session_id, sessionId.value)) return
       const init = msg.candidate as RTCIceCandidateInit
       if (!remoteDescriptionSet) {
         pendingRemoteIce.push(init)
@@ -4641,6 +4856,27 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       }
     })
     ws.onRcMessage('rc:terminate', (msg) => {
+      // While the ladder timer is pending every terminate refers to a
+      // session we already abandoned — ignore.
+      if (phase.value === 'reconnecting') return
+      if (!sessionGateAllows(msg.session_id, sessionId.value)) return
+      // Involuntary endings (agent WS displacement — the classic
+      // "host joined a VPN" symptom — or a transient agent error)
+      // auto-re-create the session instead of dumping the operator
+      // to a dead viewer. Deliberate endings stay terminal.
+      if (
+        isRetryableTerminateReason(msg.reason)
+        && lastConnectArgs
+        && phase.value !== 'idle'
+        && phase.value !== 'closed'
+        && phase.value !== 'error'
+      ) {
+        console.info('[rc] session ended (', msg.reason, ') — auto-reconnecting')
+        // Server already ended the session — don't send a redundant
+        // terminate for it.
+        scheduleReconnect({ notifyServer: false })
+        return
+      }
       phase.value = 'closed'
       if (msg.reason) {
         // Reason is informational; UI surfaces it when non-nominal.
@@ -4651,6 +4887,19 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       teardown()
     })
     ws.onRcMessage('rc:error', (msg) => {
+      // Ladder pending → errors are stale fallout from the abandoned
+      // session (e.g. session_not_found for our own hangup). Ignore.
+      if (phase.value === 'reconnecting') return
+      if (!sessionGateAllows(msg.session_id, sessionId.value)) return
+      // Mid-ladder transients (agent_busy while the old slot frees,
+      // agent_offline while the agent WS flaps back) advance the
+      // ladder instead of killing it. First-connect errors still fail
+      // fast — reconnectAttempt is 0 outside a reconnect cycle.
+      if (isRetryableRcErrorCode(msg.code) && reconnectAttempt.value > 0 && lastConnectArgs) {
+        console.info('[rc] transient signalling error (', msg.code, ') — retrying')
+        scheduleReconnect({ notifyServer: false })
+        return
+      }
       failWith(msg.message || msg.code || 'signalling error')
     })
   }
@@ -4699,7 +4948,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    * lingering ICE / track listeners don't fire on the dead PC while
    * the timer is pending.
    */
-  function scheduleReconnect() {
+  function scheduleReconnect(opts?: { notifyServer?: boolean }) {
     // Replace any prior schedule.
     if (reconnectTimer !== null) {
       clearTimeout(reconnectTimer)
@@ -4710,6 +4959,20 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       failWith('peer connection failed')
       return
     }
+    // Free the agent's session slot BEFORE retrying: the default
+    // max_simultaneous_sessions is 1, and the agent only notices a
+    // dead peer on its own timeout — without this hangup the fresh
+    // request bounces off `agent_busy` for many seconds. Skipped
+    // (notifyServer: false) when the trigger was the server ending
+    // the session itself.
+    if (opts?.notifyServer !== false && sessionId.value) {
+      ws.sendRaw({
+        t: 'rc:terminate',
+        session_id: sessionId.value,
+        reason: 'controller_hangup',
+      })
+    }
+    sessionId.value = null
     const attemptIdx = reconnectAttempt.value
     // rc.23 — nextReconnectDelayMs always returns a positive delay
     // now; the loop only exits when the operator clicks Disconnect
@@ -4724,22 +4987,50 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     teardown()
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null
-      const args = lastConnectArgs
-      if (!args) return
-      // `connect()` resets phase / sessionId on entry; the early-
-      // return guard for non-{idle,closed,error} states is OK
-      // because we set 'reconnecting' which falls outside those.
-      // We `await` via .catch so a synchronous throw inside connect
-      // chains into another reconnect attempt instead of bubbling
-      // unhandled.
-      void connect(args.agentId, args.permissions, /* isReconnect */ true).catch(() => {
-        scheduleReconnect()
-      })
+      fireReconnectAttempt()
     }, delay)
   }
 
+  /** The body of a ladder retry. Split out of the timer callback so
+   *  the ws.status watcher can fast-path it the moment signalling
+   *  comes back instead of sitting out the remaining backoff. */
+  function fireReconnectAttempt() {
+    const args = lastConnectArgs
+    if (!args) return
+    // `connect()` resets phase / sessionId on entry; the early-
+    // return guard for non-{idle,closed,error} states is OK
+    // because we set 'reconnecting' which falls outside those.
+    // We `await` via .catch so a synchronous throw inside connect
+    // chains into another reconnect attempt instead of bubbling
+    // unhandled.
+    void connect(args.agentId, args.permissions, /* isReconnect */ true).catch(() => {
+      scheduleReconnect()
+    })
+  }
+
+  // Signalling transport watch: the moment the WS comes back while a
+  // ladder timer is pending, retry immediately — the backoff exists to
+  // pace attempts against a dead server, not to penalise a recovered
+  // one. (Attempts fired while the WS is down send into the void and
+  // get re-laddered by the signalling timeout, so this also shortens
+  // the worst case after a laptop wake.)
+  watch(
+    () => ws.status,
+    (s) => {
+      if (s === 'connected' && phase.value === 'reconnecting' && reconnectTimer !== null) {
+        clearTimeout(reconnectTimer)
+        reconnectTimer = null
+        console.info('[rc] signalling restored — retrying immediately')
+        fireReconnectAttempt()
+      }
+    },
+  )
+
   function teardown() {
     stopStatsPoll()
+    stopMediaWatchdog()
+    clearPcDisconnectedTimer()
+    clearSignalingTimeout()
     stopJankDetector()
     lastBacklogDrops = 0
     struggleWindow.reset()
@@ -4994,13 +5285,32 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         // straight to attempt 4 and use a 4 s first delay instead of
         // 250 ms.
         cancelReconnect()
+        // A recovered ICE flap lands back here — stand down the
+        // sustained-'disconnected' fuse and the negotiation timeout,
+        // and start watching media progress.
+        clearPcDisconnectedTimer()
+        clearSignalingTimeout()
+        startMediaWatchdog()
+      } else if (state === 'disconnected') {
+        // Transient ICE flaps recover on their own within ~1-2 s; a
+        // host that jumped onto a VPN never does. Arm a one-shot
+        // fuse instead of ignoring the state outright (the pre-S3
+        // behaviour, which left the viewer frozen at "connected"
+        // until the much slower media watchdog / agent timeout).
+        if (pcDisconnectedTimer === null) {
+          pcDisconnectedTimer = setTimeout(() => {
+            pcDisconnectedTimer = null
+            if (pc?.connectionState === 'disconnected') {
+              console.warn('[rc] peer sat in \'disconnected\' past grace — re-creating session')
+              scheduleReconnect()
+            }
+          }, RC_PC_DISCONNECTED_GRACE_MS)
+        }
       } else if (state === 'failed') {
         // M3 hand-off / desktop transition / network blip. Replace
         // the previous immediate-failWith with the auto-reconnect
         // ladder so the operator doesn't have to F5 + reconnect
-        // every time the host briefly goes dark. Only 'failed'
-        // triggers retry; 'disconnected' is transient (ICE
-        // checking) and recovers on its own.
+        // every time the host briefly goes dark.
         scheduleReconnect()
       } else if (state === 'closed' && phase.value !== 'error' && phase.value !== 'closed' && phase.value !== 'reconnecting') {
         // Clean up the data channels + stream too; otherwise they leak
@@ -5644,6 +5954,18 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       // restores the operator's sharpness/smoothness choice without a click.
       sendPriorityPreference()
     }
+    // The control DC closing while the session still reports
+    // 'connected' means the transport died under us (SCTP teardown
+    // races pc.connectionState by seconds in Chrome). Every other
+    // exit path — disconnect(), failWith(), scheduleReconnect() —
+    // moves `phase` off 'connected' BEFORE teardown closes the
+    // channels, so this only fires on genuine mid-session death.
+    channels.control.onclose = () => {
+      if (phase.value === 'connected') {
+        console.warn('[rc] control channel closed mid-session — re-creating session')
+        scheduleReconnect()
+      }
+    }
     // Agent → browser control messages. Recognised:
     //   - `rc:host_locked` (boolean) — the agent flips this on/off
     //     as `lock_state.rs` observes desktop transitions (0.2.3+).
@@ -5965,6 +6287,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     }
     ws.sendRaw(requestPayload)
     overrideReason.value = ''
+    // Abandon-and-retry if the server never answers the request (WS
+    // died mid-send, pod restart, ...). Cleared by rc:session.created.
+    armSignalingTimeout()
   }
 
   function disconnect() {
@@ -7793,6 +8118,15 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
      * `phase === 'reconnecting'`.
      */
     reconnectAttempt,
+    /**
+     * S3 — sub-connected health. Non-null while `phase ===
+     * 'connected'` but something is off: 'transport_unstable' (pc
+     * left 'connected'), 'media_stalled' (keyframe probe
+     * outstanding), 'signalling_offline' (WS down; media may still
+     * flow P2P). The viewer renders a warning chip from this instead
+     * of a dishonest solid-green "connected".
+     */
+    degraded,
     /**
      * Whether the host has signalled (via the `rc:host_locked`
      * control-DC message) that its input desktop has transitioned

@@ -40,6 +40,12 @@
         <template v-if="rc.phase.value === 'reconnecting'">
           Reconnecting (attempt {{ rc.reconnectAttempt.value }})…
         </template>
+        <!-- S3 honest badge: connected-but-degraded gets a warning
+             chip naming the problem instead of a dishonest solid
+             green "connected". -->
+        <template v-else-if="rc.phase.value === 'connected' && rc.degraded.value">
+          {{ degradedLabel }}
+        </template>
         <template v-else>{{ rc.phase.value }}</template>
       </v-chip>
       <!-- Host-locked indicator. Shown only during a live session
@@ -452,6 +458,45 @@
       >
         <v-progress-circular indeterminate size="64" />
         <p class="text-body-1 mt-4">{{ phaseLabel }}</p>
+      </div>
+
+      <!-- S3 — previously the 'reconnecting' and 'error' phases fell
+           through every v-else-if and rendered a BLANK stage. -->
+      <div v-else-if="rc.phase.value === 'reconnecting'" class="empty-state">
+        <v-progress-circular indeterminate size="64" color="warning" />
+        <p class="text-body-1 mt-4">
+          Connection lost — reconnecting (attempt {{ rc.reconnectAttempt.value }})…
+        </p>
+        <p class="text-caption text-medium-emphasis">
+          The session re-creates itself automatically. This can take a few
+          seconds while the device comes back.
+        </p>
+        <p v-if="agent && !agent.is_online" class="text-caption text-warning">
+          The device currently reports offline — retries continue until it
+          returns.
+        </p>
+        <v-btn variant="tonal" size="small" class="mt-3" @click="rc.disconnect()">
+          Cancel
+        </v-btn>
+      </div>
+
+      <div v-else-if="rc.phase.value === 'error'" class="empty-state">
+        <v-icon size="96" color="error">mdi-connection</v-icon>
+        <p class="text-body-1 mt-2">The session could not continue.</p>
+        <p v-if="rc.error.value" class="text-caption text-medium-emphasis">
+          {{ rc.error.value }}
+        </p>
+        <v-btn
+          color="primary"
+          variant="flat"
+          size="small"
+          class="mt-3"
+          prepend-icon="mdi-refresh"
+          :disabled="!canConnect"
+          @click="startSession"
+        >
+          Try again
+        </v-btn>
       </div>
 
       <div
@@ -2870,11 +2915,20 @@ const canConnect = computed(() => !!agent.value)
 const statusColor = computed(() => (agent.value?.is_online ? 'success' : 'grey'))
 const phaseColor = computed(() => {
   switch (rc.phase.value) {
-    case 'connected': return 'success'
+    case 'connected': return rc.degraded.value ? 'warning' : 'success'
     case 'reconnecting': return 'warning'
     case 'error': return 'error'
     case 'closed': return 'grey'
     default: return 'info'
+  }
+})
+// S3 — human wording for the sub-connected health states.
+const degradedLabel = computed(() => {
+  switch (rc.degraded.value) {
+    case 'transport_unstable': return 'connected · unstable link'
+    case 'media_stalled': return 'connected · video stalled'
+    case 'signalling_offline': return 'connected · server link down'
+    default: return 'connected'
   }
 })
 const phaseLabel = computed(() => {
@@ -2982,6 +3036,28 @@ async function loadAgent() {
   }
   agent.value = agentStore.agents.find((a) => a.id === agentId.value) || null
 }
+
+// S3 — keep the toolbar online-dot honest. The mount-time snapshot
+// went stale the moment the page outlived one heartbeat; now the
+// agent row re-fetches every 30 s while the page is open, plus
+// immediately when the session enters 'reconnecting'/'error' (the
+// operator's next question is "is the device even online?").
+const AGENT_STATUS_POLL_MS = 30_000
+let agentStatusTimer: ReturnType<typeof setInterval> | null = null
+async function refreshAgentStatus() {
+  try {
+    await agentStore.fetchAgents(tenantId.value)
+    agent.value = agentStore.agents.find((a) => a.id === agentId.value) || null
+  } catch {
+    /* transient — keep the previous snapshot */
+  }
+}
+watch(
+  () => rc.phase.value,
+  (p) => {
+    if (p === 'reconnecting' || p === 'error') void refreshAgentStatus()
+  },
+)
 
 function startSession() {
   if (!agent.value) return
@@ -3180,6 +3256,7 @@ watch(
 
 onMounted(() => {
   void loadAgent()
+  agentStatusTimer = setInterval(() => void refreshAgentStatus(), AGENT_STATUS_POLL_MS)
   document.addEventListener('fullscreenchange', onFullscreenChange)
   // Drawer-scope Ctrl+V / Ctrl+C handlers attached at window-level
   // (not on the drawer element) so they fire regardless of which
@@ -3190,6 +3267,10 @@ onMounted(() => {
   window.addEventListener('keydown', onWindowKeyDownForDrawer)
 })
 onBeforeUnmount(() => {
+  if (agentStatusTimer !== null) {
+    clearInterval(agentStatusTimer)
+    agentStatusTimer = null
+  }
   if (detachInput) detachInput()
   stopFitResizeObserver()
   document.removeEventListener('fullscreenchange', onFullscreenChange)
