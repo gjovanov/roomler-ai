@@ -1242,6 +1242,36 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         };
     let mut cfg = config::load(config_path).context("loading config")?;
 
+    // S2 — env→config bridge: publish the config-backed fallbacks for the
+    // operator-grade env knobs BEFORE anything reads them (the auto-update
+    // gate below and every overlay/tunnel runtime consult
+    // `tunnel_core::env::node_env`, whose precedence is env — either
+    // prefix — > these fallbacks > built-in default). Bools map to the
+    // "1"/"0" strings every read-site parser already accepts.
+    {
+        let mut fallbacks = std::collections::HashMap::new();
+        let pairs: [(&str, Option<bool>); 8] = [
+            ("OVERLAY_QUIC", cfg.overlay_quic),
+            ("OVERLAY_DIRECT", cfg.overlay_direct),
+            ("OVERLAY_DERP", cfg.overlay_derp),
+            ("OVERLAY_MBB", cfg.overlay_mbb),
+            ("LOCAL_TURN", cfg.local_turn),
+            ("DNS_AAAA", cfg.dns_aaaa),
+            ("AUTO_UPDATE", cfg.auto_update),
+            ("LOGS_UPLOAD_DISABLED", cfg.logs_upload_disabled),
+        ];
+        for (suffix, value) in pairs {
+            if let Some(v) = value {
+                fallbacks.insert(suffix.to_string(), if v { "1" } else { "0" }.to_string());
+            }
+        }
+        if !fallbacks.is_empty() {
+            tracing::info!(keys = ?fallbacks.keys().collect::<Vec<_>>(),
+                "config-backed env fallbacks registered");
+            tunnel_core::env::register_config_fallbacks(fallbacks);
+        }
+    }
+
     // rc.18: run explicit config-schema migration. New fields default
     // via serde at deserialize time, but the on-disk file isn't
     // rewritten — operators reading config.toml would see partial

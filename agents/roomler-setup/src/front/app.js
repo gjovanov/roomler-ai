@@ -342,6 +342,23 @@ function renderServer() {
   document.getElementById("device-name").value = state.device;
   const valid = /^https?:\/\/[^\s]+$/i.test(state.server) && state.device.length > 0;
   document.getElementById("server-continue").disabled = !valid;
+  // S2: the advanced section holds daemon config keys — meaningless for
+  // the tunnel-client role.
+  document.getElementById("advanced-wrap").hidden = state.role === "tunnel-client";
+}
+
+// S2 — gather the advanced daemon options for cmd_install. `null` for
+// the tunnel-client role (the section is hidden there; the Rust side
+// ignores it anyway).
+function gatherAdvanced() {
+  if (state.role === "tunnel-client") return null;
+  return {
+    overlayEnabled: document.getElementById("adv-overlay").checked,
+    advertiseLocalSubnets: document.getElementById("adv-local-subnets").checked,
+    autoGrantSession: document.getElementById("adv-auto-grant").checked,
+    overlayAdvertisedRoutes: document.getElementById("adv-overlay-routes").value.trim(),
+    advertiseRoutes: document.getElementById("adv-tunnel-routes").value.trim(),
+  };
 }
 
 // ─── Step 3: Enrollment token ──────────────────────────────────────────────
@@ -547,6 +564,7 @@ async function runInstall() {
       server: state.server,
       token: state.token,
       deviceName: state.device,
+      advanced: gatherAdvanced(),
       onEvent: channel,
     });
     console.log("[runInstall] cmd_install returned:", report);

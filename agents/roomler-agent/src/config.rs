@@ -72,6 +72,46 @@ pub struct AgentConfig {
     #[serde(default = "default_auto_grant_session")]
     pub auto_grant_session: bool,
 
+    // ─── S2: env-bridged operator knobs ──────────────────────────────────
+    // Each mirrors an env var read through `tunnel_core::env::node_env`
+    // (precedence: env — either prefix — > this config key > built-in
+    // default). `None` keeps the default. All are applied at daemon
+    // startup, so changes take effect on the next service restart.
+    /// QUIC-over-TURN overlay carrier (`ROOMLER_NODE_OVERLAY_QUIC`).
+    /// Built-in default: off.
+    #[serde(default)]
+    pub overlay_quic: Option<bool>,
+    /// Direct (LAN / hole-punched) overlay carriers
+    /// (`ROOMLER_NODE_OVERLAY_DIRECT`). Built-in default: on.
+    #[serde(default)]
+    pub overlay_direct: Option<bool>,
+    /// DERP (WS-relay) overlay fallback tier (`ROOMLER_NODE_OVERLAY_DERP`).
+    /// Built-in default: on.
+    #[serde(default)]
+    pub overlay_derp: Option<bool>,
+    /// Make-before-break carrier upgrades (`ROOMLER_NODE_OVERLAY_MBB`).
+    /// Built-in default: on.
+    #[serde(default)]
+    pub overlay_mbb: Option<bool>,
+    /// Loopback-TURN corp-relay for co-located controllers
+    /// (`ROOMLER_AGENT_LOCAL_TURN`). Built-in default: on.
+    #[serde(default)]
+    pub local_turn: Option<bool>,
+    /// MagicDNS AAAA answers for derived overlay v6
+    /// (`ROOMLER_AGENT_DNS_AAAA`). Built-in default: on.
+    #[serde(default)]
+    pub dns_aaaa: Option<bool>,
+    /// The periodic self-updater (`ROOMLER_AGENT_AUTO_UPDATE`).
+    /// Built-in default: on. Disabling also ignores web-pushed
+    /// forced updates.
+    #[serde(default)]
+    pub auto_update: Option<bool>,
+    /// Disable the centralized log uploader
+    /// (`ROOMLER_AGENT_LOGS_UPLOAD_DISABLED`). `Some(true)` = uploads
+    /// OFF. Built-in default: uploads on.
+    #[serde(default)]
+    pub logs_upload_disabled: Option<bool>,
+
     /// Most recent version that ran for at least
     /// `CLEAN_RUN_THRESHOLD` seconds before exiting cleanly (or
     /// crashing — the threshold is what gates updates here, not exit
@@ -611,6 +651,14 @@ mod tests {
             update_check_interval_h: None,
             enable_remote_browse: true,
             auto_grant_session: true,
+            overlay_quic: None,
+            overlay_direct: None,
+            overlay_derp: None,
+            overlay_mbb: None,
+            local_turn: None,
+            dns_aaaa: None,
+            auto_update: None,
+            logs_upload_disabled: None,
             last_known_good_version: None,
             crash_count: 0,
             last_crash_unix: 0,
