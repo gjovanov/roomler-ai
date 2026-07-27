@@ -3749,6 +3749,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "02296996cb8796d7c6e3bc2d9211b7802812d36999a51bb754123ead7d37d026"
 
 [[package]]
+name = "humantime"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15cdd26707701c53297e2fa6afb323d55fbc1d0810c3aec078ae3ef0424c3c15"
+
+[[package]]
 name = "hyper"
 version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3780,6 +3786,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "rustls",
+ "rustls-native-certs",
  "tokio",
  "tokio-rustls",
  "tower-service",
@@ -4195,6 +4202,15 @@ name = "itertools"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
+dependencies = [
+ "either",
+]
+
+[[package]]
+name = "itertools"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
 dependencies = [
  "either",
 ]
@@ -5565,6 +5581,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "object_store"
+version = "0.12.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fbfbfff40aeccab00ec8a910b57ca8ecf4319b335c542f2edcd19dd25a1e2a00"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "form_urlencoded",
+ "futures",
+ "http 1.4.1",
+ "http-body-util",
+ "humantime",
+ "hyper",
+ "itertools 0.14.0",
+ "md-5",
+ "parking_lot 0.12.5",
+ "percent-encoding",
+ "quick-xml 0.38.4",
+ "rand 0.9.4",
+ "reqwest 0.12.28",
+ "ring",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "url",
+ "walkdir",
+ "wasm-bindgen-futures",
+ "web-time",
+]
+
+[[package]]
 name = "oboe"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6228,7 +6280,7 @@ checksum = "092791278e026273c1b65bbdcfbba3a300f2994c896bd01ab01da613c29c46f1"
 dependencies = [
  "base64 0.22.1",
  "indexmap 2.14.0",
- "quick-xml",
+ "quick-xml 0.39.4",
  "serde",
  "time 0.3.47",
 ]
@@ -6493,6 +6545,16 @@ name = "quick-error"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a993555f31e5a609f617c12db6250dedcac1b0a85076912c436e6fc9b2c8e6a3"
+
+[[package]]
+name = "quick-xml"
+version = "0.38.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b66c2058c55a409d601666cffe35f04333cf1013010882cec174a7467cd4e21c"
+dependencies = [
+ "memchr",
+ "serde",
+]
 
 [[package]]
 name = "quick-xml"
@@ -6905,6 +6967,9 @@ dependencies = [
  "native-tls",
  "percent-encoding",
  "pin-project-lite",
+ "quinn",
+ "rustls",
+ "rustls-native-certs",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -6912,6 +6977,7 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-native-tls",
+ "tokio-rustls",
  "tokio-util",
  "tower",
  "tower-http",
@@ -7025,7 +7091,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-agent"
-version = "0.3.0-rc.254"
+version = "0.3.0-rc.255"
 dependencies = [
  "anyhow",
  "arboard",
@@ -7080,7 +7146,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-agent-tray"
-version = "0.3.0-rc.254"
+version = "0.3.0-rc.255"
 dependencies = [
  "anyhow",
  "gethostname 0.5.0",
@@ -7100,13 +7166,14 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-api"
-version = "0.3.0-rc.254"
+version = "0.3.0-rc.255"
 dependencies = [
  "anyhow",
  "async-trait",
  "axum",
  "base64 0.22.1",
  "bson",
+ "bytes",
  "chrono",
  "dashmap",
  "dotenvy",
@@ -7118,6 +7185,7 @@ dependencies = [
  "mediasoup",
  "mongodb",
  "nanoid",
+ "object_store",
  "redis",
  "reqwest 0.12.28",
  "roomler-ai-config",
@@ -7143,7 +7211,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-config"
-version = "0.3.0-rc.254"
+version = "0.3.0-rc.255"
 dependencies = [
  "config",
  "serde",
@@ -7152,7 +7220,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-db"
-version = "0.3.0-rc.254"
+version = "0.3.0-rc.255"
 dependencies = [
  "bson",
  "chrono",
@@ -7167,7 +7235,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-remote-control"
-version = "0.3.0-rc.254"
+version = "0.3.0-rc.255"
 dependencies = [
  "base64 0.22.1",
  "bitflags 2.11.1",
@@ -7187,7 +7255,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-services"
-version = "0.3.0-rc.254"
+version = "0.3.0-rc.255"
 dependencies = [
  "anyhow",
  "argon2",
@@ -7228,7 +7296,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-tests"
-version = "0.3.0-rc.254"
+version = "0.3.0-rc.255"
 dependencies = [
  "anyhow",
  "axum",
@@ -7259,7 +7327,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-tunnel-core"
-version = "0.3.0-rc.254"
+version = "0.3.0-rc.255"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7297,7 +7365,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-setup"
-version = "0.3.0-rc.254"
+version = "0.3.0-rc.255"
 dependencies = [
  "anyhow",
  "directories",
@@ -7322,7 +7390,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-setup-core"
-version = "0.3.0-rc.254"
+version = "0.3.0-rc.255"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -7345,7 +7413,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-tunnel"
-version = "0.3.0-rc.254"
+version = "0.3.0-rc.255"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8979,7 +9047,7 @@ dependencies = [
 
 [[package]]
 name = "tcp-turn-conn"
-version = "0.3.0-rc.254"
+version = "0.3.0-rc.255"
 dependencies = [
  "async-trait",
  "log",
