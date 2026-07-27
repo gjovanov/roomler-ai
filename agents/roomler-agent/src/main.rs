@@ -558,7 +558,45 @@ async fn main() -> Result<()> {
     #[cfg(target_os = "windows")]
     let _timer_guard = win_timer::TimerResolutionGuard::request_1ms();
 
+    // S1b — one-shot legacy-tree migration (`roomler-agent` → `roomler`).
+    // MUST run before `logging::init` (log files open inside the tree) and
+    // before ANY appdirs consumer (segment decisions are OnceLock-cached per
+    // process). Skipped while the desktop companion is running — it may hold
+    // open handles in the tree; the read-both resolution keeps everything
+    // working until the next start retries.
+    #[cfg(target_os = "windows")]
+    let companion_running = roomler_agent::companion::desktop_running();
+    #[cfg(not(target_os = "windows"))]
+    let companion_running = false;
+    roomler_agent::appdirs::migrate_legacy_trees(companion_running);
+
+    let cli = Cli::parse();
+
+    // S1b — the SCM service host and the SystemContext worker log into the
+    // machine-global `service-logs` dir (the one the desktop app has always
+    // advertised — it was EMPTY until now because ProjectDirs resolves SYSTEM
+    // processes into the invisible systemprofile). Must precede logging::init.
+    #[cfg(target_os = "windows")]
+    {
+        if matches!(cli.command, Some(Command::ServiceRun)) {
+            logging::set_service_logging(logging::ServiceLogRole::Host);
+        }
+        #[cfg(feature = "system-context")]
+        if matches!(cli.command, Some(Command::Run { .. }) | None) {
+            use roomler_agent::system_context::worker_role;
+            if matches!(
+                worker_role::probe_self(),
+                Ok(worker_role::WorkerRole::SystemContext)
+            ) {
+                logging::set_service_logging(logging::ServiceLogRole::Worker);
+            }
+        }
+    }
+
     logging::init();
+    for note in roomler_agent::appdirs::migration_notes() {
+        tracing::info!(%note, "appdirs legacy-tree migration");
+    }
     if let Some(dir) = logging::log_dir() {
         tracing::debug!(log_dir = %dir.display(), "persistent file logging active");
     }
@@ -604,7 +642,6 @@ async fn main() -> Result<()> {
         );
     }
 
-    let cli = Cli::parse();
     let config_path = resolve_config_path(cli.config.clone())?;
 
     let cmd = cli.command.unwrap_or(Command::Run { encoder: None });
@@ -1105,7 +1142,7 @@ async fn re_enroll_cmd(config_path: &PathBuf, enrollment_token: &str) -> Result<
     .context("re-enrollment failed")?;
 
     config::save(config_path, &new_cfg).context("saving updated config")?;
-    notify::clear_attention();
+    notify::clear_all_attention();
     println!("Re-enrollment successful. Agent id: {}", new_cfg.agent_id);
     println!("Run `roomler-agent run` (or wait for the supervisor to relaunch) to reconnect.");
     Ok(())
@@ -1390,12 +1427,15 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
                 if let Err(e) = updater::spawn_installer_with_watch(&installer_path, Some(&latest))
                 {
                     tracing::error!(error = %e, "rollback installer spawn failed");
-                    let _ = notify::raise_attention(&rollback_attention_msg(
-                        current_pkg,
-                        &target,
-                        cfg.crash_count,
-                        Some(&format!("automatic install failed: {e}")),
-                    ));
+                    let _ = notify::raise_attention_with_reason(
+                        notify::REASON_ROLLBACK,
+                        &rollback_attention_msg(
+                            current_pkg,
+                            &target,
+                            cfg.crash_count,
+                            Some(&format!("automatic install failed: {e}")),
+                        ),
+                    );
                 } else {
                     // Installer is running, agent is about to exit.
                     // The post-install watcher (spawned by
@@ -1407,23 +1447,24 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
             }
             updater::CheckOutcome::Skipped(reason) => {
                 tracing::error!(%reason, "rollback fetch skipped — operator action required");
-                let _ = notify::raise_attention(&rollback_attention_msg(
-                    current_pkg,
-                    &target,
-                    cfg.crash_count,
-                    Some(&reason),
-                ));
+                let _ = notify::raise_attention_with_reason(
+                    notify::REASON_ROLLBACK,
+                    &rollback_attention_msg(current_pkg, &target, cfg.crash_count, Some(&reason)),
+                );
             }
             updater::CheckOutcome::UpToDate { .. } => {
                 tracing::warn!(
                     "rollback target reports as up-to-date — odd state, raising sentinel"
                 );
-                let _ = notify::raise_attention(&rollback_attention_msg(
-                    current_pkg,
-                    &target,
-                    cfg.crash_count,
-                    Some("target version reports as up-to-date — manual investigation needed"),
-                ));
+                let _ = notify::raise_attention_with_reason(
+                    notify::REASON_ROLLBACK,
+                    &rollback_attention_msg(
+                        current_pkg,
+                        &target,
+                        cfg.crash_count,
+                        Some("target version reports as up-to-date — manual investigation needed"),
+                    ),
+                );
             }
         }
     }
@@ -1632,6 +1673,16 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     let netstack_pinger = roomler_agent::overlay::netstack_pinger();
     #[cfg(not(feature = "overlay-netstack"))]
     let netstack_pinger: Option<std::sync::Arc<dyn localapi_state::NetstackPinger>> = None;
+    // S1b — ONE pinger for BOTH the interactive `Ping` verb and the RTT
+    // prober: netstack when the userspace stack runs, OS ICMP fallback
+    // otherwise. The verb previously got the raw Option (no fallback)
+    // while the prober had one — so the desktop's per-device Ping button
+    // errored on EVERY OS-TUN node ("Ping failed" for all devices, the
+    // reported field bug) even though the RTT column populated fine.
+    let pinger: std::sync::Arc<dyn localapi_state::NetstackPinger> = match netstack_pinger {
+        Some(p) => p,
+        None => std::sync::Arc::new(localapi_state::OsPinger),
+    };
     // P3b-2 PR-C: the tunnel-client hub, created ONCE here (stable across WS
     // reconnects) and SHARED between the LocalAPI's DaemonState (create/kill/
     // flows verbs) and the signaling loop (publish the live egress + demux).
@@ -1643,7 +1694,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     // `DaemonState` for the `ping` verb.
     let rtt_cache: roomler_agent::localapi_state::RttCache =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-    let pinger_for_prober = netstack_pinger.clone();
+    let pinger_for_prober = pinger.clone();
     // P6: the daemon-wide config-WRITE lock. Every daemon-side runtime
     // writer of config.toml (route reconciler, clean-run promotion,
     // graceful shutdown) holds it across load→mutate→save so one writer's
@@ -1669,7 +1720,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
                 localapi_connected.clone(),
                 overlay_view_rx,
                 consent_broker.clone(),
-                netstack_pinger,
+                Some(pinger.clone()),
                 tunnel_hub.clone(),
                 rtt_cache.clone(),
             )
@@ -1684,19 +1735,12 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     // DaemonState). P8-cosmetics — no longer netstack-only: an OS-TUN node
     // probes over the OS ICMP path (`OsPinger`), so the `peers` RTT column is
     // populated everywhere instead of "— by-design on OS-TUN".
-    {
-        let pinger: std::sync::Arc<dyn roomler_agent::localapi_state::NetstackPinger> =
-            match pinger_for_prober {
-                Some(p) => p,
-                None => std::sync::Arc::new(roomler_agent::localapi_state::OsPinger),
-            };
-        roomler_agent::localapi_state::spawn_rtt_prober(
-            pinger,
-            overlay_view_tx.subscribe(),
-            rtt_cache,
-            shutdown_rx.clone(),
-        );
-    }
+    roomler_agent::localapi_state::spawn_rtt_prober(
+        pinger_for_prober,
+        overlay_view_tx.subscribe(),
+        rtt_cache,
+        shutdown_rx.clone(),
+    );
     let localapi_task = tokio::spawn({
         let shutdown = shutdown_rx.clone();
         async move {
