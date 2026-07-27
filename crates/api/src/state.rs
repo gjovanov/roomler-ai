@@ -70,6 +70,13 @@ pub struct AppState {
     pub push: Option<Arc<PushService>>,
     pub push_subscriptions: Arc<PushSubscriptionDao>,
     pub redis_pubsub: Option<Arc<RedisPubSub>>,
+    /// True while the Redis pub/sub subscriber holds a live subscription —
+    /// flipped by `RedisPubSub::subscribe_with_reconnect` (started in
+    /// `main.rs`), read by `/health/ready`.
+    pub redis_sub_alive: Arc<std::sync::atomic::AtomicBool>,
+    /// File-storage backend for uploads + export artifacts (local disk or
+    /// S3/MinIO, picked from `s3.enabled` at startup). See [`crate::storage`].
+    pub storage: Arc<crate::storage::FileStorage>,
 
     // Remote-control subsystem
     pub agents: Arc<AgentDao>,
@@ -191,6 +198,8 @@ impl AppState {
             None
         };
 
+        let storage = Arc::new(crate::storage::FileStorage::from_settings(&settings.s3)?);
+
         let redis_pubsub = match RedisPubSub::new(&settings.redis.url).await {
             Ok(ps) => Some(Arc::new(ps)),
             Err(e) => {
@@ -279,6 +288,8 @@ impl AppState {
             push,
             push_subscriptions,
             redis_pubsub,
+            redis_sub_alive: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            storage,
             agents,
             remote_sessions,
             remote_audit,

@@ -261,6 +261,9 @@ fn test_settings() -> Settings {
             url: "redis://127.0.0.1:6379".to_string(),
         },
         s3: roomler_ai_config::S3Settings {
+            // Tests run on the local-disk backend — the file_tests suite
+            // must pass without a MinIO container.
+            enabled: false,
             endpoint: "http://localhost:9000".to_string(),
             access_key: "minioadmin".to_string(),
             secret_key: "minioadmin".to_string(),

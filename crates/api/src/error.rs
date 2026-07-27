@@ -16,6 +16,7 @@ pub enum ApiError {
     Conflict(String),
     Internal(String),
     Validation(String),
+    ServiceUnavailable(String),
 }
 
 impl std::fmt::Display for ApiError {
@@ -28,6 +29,7 @@ impl std::fmt::Display for ApiError {
             ApiError::Conflict(msg) => write!(f, "Conflict: {msg}"),
             ApiError::Internal(msg) => write!(f, "Internal error: {msg}"),
             ApiError::Validation(msg) => write!(f, "Validation: {msg}"),
+            ApiError::ServiceUnavailable(msg) => write!(f, "Service unavailable: {msg}"),
         }
     }
 }
@@ -59,6 +61,9 @@ impl IntoResponse for ApiError {
             ApiError::Conflict(msg) => (StatusCode::CONFLICT, "conflict", msg),
             ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, "internal", msg),
             ApiError::Validation(msg) => (StatusCode::UNPROCESSABLE_ENTITY, "validation", msg),
+            ApiError::ServiceUnavailable(msg) => {
+                (StatusCode::SERVICE_UNAVAILABLE, "service_unavailable", msg)
+            }
         };
 
         let body = ErrorResponse {

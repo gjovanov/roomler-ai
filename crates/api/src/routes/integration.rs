@@ -49,10 +49,9 @@ pub async fn recognize_file(
     let recognition = state.recognition.clone();
     let files_dao = Arc::clone(&state.files);
     let task_store = Arc::clone(state.tasks.store());
+    let storage = Arc::clone(&state.storage);
 
-    let upload_dir = std::env::var("ROOMLER_UPLOAD_DIR")
-        .unwrap_or_else(|_| "/tmp/roomler-ai-uploads".to_string());
-    let file_path = std::path::PathBuf::from(upload_dir).join(&file.storage_key);
+    let storage_key = file.storage_key.clone();
     let content_type = file.content_type.clone();
 
     state.tasks.spawn_task(task_id, async move {
@@ -61,7 +60,8 @@ pub async fn recognize_file(
             .await
             .map_err(|e| format!("{}", e))?;
 
-        let file_bytes = tokio::fs::read(&file_path)
+        let file_bytes = storage
+            .get(&storage_key)
             .await
             .map_err(|e| format!("Failed to read file: {}", e))?;
 
@@ -149,6 +149,7 @@ pub async fn export_conversation_pdf(
     let messages_dao = Arc::clone(&state.messages);
     let users_dao = Arc::clone(&state.users);
     let task_store = Arc::clone(state.tasks.store());
+    let storage = Arc::clone(&state.storage);
 
     state.tasks.spawn_task(task_id, async move {
         let params = roomler_ai_services::dao::base::PaginationParams {
@@ -189,25 +190,17 @@ pub async fn export_conversation_pdf(
         let bytes =
             roomler_ai_services::export::pdf::export_conversation(&result.items, &user_map)?;
 
-        let export_dir = std::env::var("ROOMLER_UPLOAD_DIR")
-            .unwrap_or_else(|_| "/tmp/roomler-ai-uploads".to_string());
-        let export_dir = std::path::PathBuf::from(export_dir).join("exports");
-        tokio::fs::create_dir_all(&export_dir)
-            .await
-            .map_err(|e| format!("Failed to create export dir: {}", e))?;
-
+        // Persist through the storage backend; `file_path` on the task record
+        // is the storage KEY (see routes/export.rs for the same convention).
         let file_name = format!("conversation-export-{}.pdf", task_id.to_hex());
-        let file_path = export_dir.join(&file_name);
-        tokio::fs::write(&file_path, &bytes)
+        let storage_key = format!("exports/{}", file_name);
+        storage
+            .put(&storage_key, bytes)
             .await
-            .map_err(|e| format!("Failed to write PDF: {}", e))?;
+            .map_err(|e| format!("Failed to store PDF: {}", e))?;
 
         task_store
-            .complete(
-                task_id,
-                Some(file_path.to_string_lossy().to_string()),
-                Some(file_name),
-            )
+            .complete(task_id, Some(storage_key), Some(file_name))
             .await
             .map_err(|e| format!("{}", e))?;
 

@@ -40,6 +40,21 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // Stripe half-configuration is a silent checkout-killer: with a secret
+    // key but empty price ids, every valid-plan checkout errors (prod hit
+    // exactly this — empty ROOMLER__STRIPE__PRICE_PRO/BUSINESS in the
+    // configmap). Loud at startup; the checkout path also refuses cleanly
+    // (StripeError::PriceNotConfigured).
+    if !settings.stripe.secret_key.is_empty()
+        && (settings.stripe.price_pro.is_empty() || settings.stripe.price_business.is_empty())
+    {
+        error!(
+            "Stripe secret key is set but price_pro/price_business is empty — \
+             checkout WILL fail; set ROOMLER__STRIPE__PRICE_PRO and \
+             ROOMLER__STRIPE__PRICE_BUSINESS."
+        );
+    }
+
     info!(
         "Starting Roomler2 API on {}:{}",
         settings.app.host, settings.app.port
@@ -134,35 +149,69 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // One-off migration: a pre-S0 pod wrote uploads to the (ephemeral) local
+    // dir; when the S3 backend is enabled, sweep whatever survived up to S3
+    // so those file records resolve again. No-op on the local backend.
+    {
+        let storage = app_state.storage.clone();
+        tokio::spawn(async move { storage.migrate_local_to_s3().await });
+    }
+
     // Start Redis Pub/Sub subscriber for cross-instance WS delivery
-    if app_state.redis_pubsub.is_some() {
+    if let Some(pubsub) = &app_state.redis_pubsub {
         let (redis_tx, _) = tokio::sync::broadcast::channel::<String>(1024);
         let ws_storage = app_state.ws_storage.clone();
         let mut redis_rx = redis_tx.subscribe();
+        let own_instance = pubsub.instance_id().to_string();
 
-        // Start the Redis subscriber (spawns a background task internally)
-        if let Err(e) = RedisPubSub::subscribe(&settings.redis.url, redis_tx).await {
-            error!("Failed to start Redis Pub/Sub subscriber: {}", e);
-        } else {
-            // Forward Redis messages to local WS connections
-            tokio::spawn(async move {
-                while let Ok(payload) = redis_rx.recv().await {
-                    if let Ok(envelope) = serde_json::from_str::<serde_json::Value>(&payload)
-                        && let (Some(user_ids_val), Some(message)) =
+        // Subscriber with reconnect-and-backoff; flips `redis_sub_alive`
+        // for `/health/ready`.
+        RedisPubSub::subscribe_with_reconnect(
+            settings.redis.url.clone(),
+            redis_tx,
+            app_state.redis_sub_alive.clone(),
+        );
+
+        // Forward Redis messages to local WS connections
+        tokio::spawn(async move {
+            loop {
+                match redis_rx.recv().await {
+                    Ok(payload) => {
+                        let Ok(envelope) = serde_json::from_str::<serde_json::Value>(&payload)
+                        else {
+                            continue;
+                        };
+                        // Self-echo guard: this instance already delivered
+                        // locally at publish time — re-delivering here
+                        // doubles every event on its origin pod.
+                        if envelope["origin"].as_str() == Some(own_instance.as_str()) {
+                            continue;
+                        }
+                        if let (Some(user_ids_val), Some(message)) =
                             (envelope["user_ids"].as_array(), envelope.get("message"))
-                    {
-                        let ids: Vec<ObjectId> = user_ids_val
-                            .iter()
-                            .filter_map(|v| v.as_str().and_then(|s| ObjectId::parse_str(s).ok()))
-                            .collect();
-                        // Deliver to local connections only (no re-publish to Redis)
-                        dispatcher::broadcast(&ws_storage, &ids, message).await;
+                        {
+                            let ids: Vec<ObjectId> = user_ids_val
+                                .iter()
+                                .filter_map(|v| {
+                                    v.as_str().and_then(|s| ObjectId::parse_str(s).ok())
+                                })
+                                .collect();
+                            // Deliver to local connections only (no re-publish to Redis)
+                            dispatcher::broadcast(&ws_storage, &ids, message).await;
+                        }
                     }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        // Slow consumer: events were dropped, keep forwarding
+                        // (the old `while let Ok` silently KILLED forwarding
+                        // on the first lag).
+                        tracing::warn!("Redis Pub/Sub forwarder lagged; dropped {n} events");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
-                error!("Redis Pub/Sub forwarding task ended unexpectedly");
-            });
-            info!("Redis Pub/Sub cross-instance WS delivery enabled");
-        }
+            }
+            error!("Redis Pub/Sub forwarding task ended (channel closed)");
+        });
+        info!("Redis Pub/Sub cross-instance WS delivery enabled");
     }
 
     // Build router
