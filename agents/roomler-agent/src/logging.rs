@@ -124,7 +124,13 @@ pub fn init() {
     // else in `tunnel_core` is debug/trace and stays suppressed; the
     // chatty `webrtc_sctp` / `webrtc_ice` targets stay at warn.
     let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("roomler_agent=info,tunnel_core=info,warn"))
+        // S1b follow-up: `roomlerd=info` — events emitted from the BIN
+        // (target = the binary crate name) were silently capped at warn,
+        // hiding the migration notes + DPI/timer diagnostics the code
+        // clearly intended to be visible.
+        .unwrap_or_else(|_| {
+            EnvFilter::new("roomler_agent=info,roomlerd=info,tunnel_core=info,warn")
+        })
         // rc.181 — silence the `turn` crate's periodic refresh-failure warns
         // (`refresh allocation/permissions failed`, target `turn::client::relay_conn`).
         // Now that the overlay re-allocates a dead relay carrier on the send-error
