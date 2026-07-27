@@ -341,6 +341,26 @@ fn service_main_inner() -> Result<()> {
         .set_service_status(running_status())
         .context("set_service_status(Running)")?;
 
+    // S1a — refresh the roomler-desktop companion from the SYSTEM side.
+    // This host runs as LocalSystem, so it can write %ProgramFiles%\Roomler
+    // even for the plain-SCM flavour whose worker runs user-context (and
+    // therefore skips the swap itself). Detached thread + its own small
+    // runtime: service_main is sync and must not block on a download.
+    {
+        let _ = thread::Builder::new()
+            .name("roomler-svc-companion".into())
+            .spawn(|| {
+                if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    rt.block_on(crate::companion::refresh_if_stale(
+                        crate::companion::RespawnContext::SystemService,
+                    ));
+                }
+            });
+    }
+
     // Resolve the worker binary path once. `current_exe` is the same
     // EXE the SCM launched (the service host); we relaunch it with
     // a `run` subcommand to drive the existing user-mode signaling /

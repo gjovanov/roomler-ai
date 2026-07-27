@@ -239,6 +239,16 @@ pub fn build_router(state: AppState) -> Router {
             "/enroll-token",
             post(routes::remote_control::issue_enrollment_token),
         )
+        // S1a — operator-forced self-update: bulk (static segment wins over
+        // the `{agent_id}` param below) + per-agent.
+        .route(
+            "/update",
+            post(routes::remote_control::trigger_agents_update),
+        )
+        .route(
+            "/{agent_id}/update",
+            post(routes::remote_control::trigger_agent_update),
+        )
         .route(
             "/{agent_id}",
             get(routes::remote_control::get_agent)
