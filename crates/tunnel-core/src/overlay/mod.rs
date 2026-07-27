@@ -39,6 +39,7 @@ pub mod netstack;
 pub mod netstack_socks;
 pub(crate) mod path;
 pub mod relay_link;
+pub(crate) mod route_events;
 pub mod router;
 pub mod runtime;
 pub mod tun;
