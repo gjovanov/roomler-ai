@@ -273,6 +273,8 @@ impl LocalApiState for DaemonState {
                 .config_persist
                 .as_ref()
                 .map(|(p, _)| p.display().to_string()),
+            // S2 — MagicDNS status the overlay runtime published.
+            dns: self.overlay.borrow().dns.clone(),
         }
     }
 
@@ -512,6 +514,98 @@ impl LocalApiState for DaemonState {
         }
     }
 
+    /// S2 — the editable config surface. Values come from a FRESH load of
+    /// the daemon's own config file, so pending not-yet-restarted edits
+    /// show (the boot-time snapshot would lie after a `ConfigSet`).
+    async fn config_entries(&self) -> Response {
+        let Some((path, lock)) = self.config_persist.as_ref() else {
+            return Response::Error {
+                message: "config editing is not available on this daemon".into(),
+            };
+        };
+        let _guard = lock.lock().await;
+        let path = path.clone();
+        let loaded = tokio::task::spawn_blocking(move || {
+            crate::config::load(&path).map_err(|e| format!("loading config: {e:#}"))
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("config load task join: {e}")));
+        match loaded {
+            Ok(cfg) => Response::ConfigEntries(crate::config_surface::entries(&cfg)),
+            Err(message) => Response::Error { message },
+        }
+    }
+
+    /// S2 — set/clear one editable key. Same write discipline as
+    /// [`set_device_name`](Self::set_device_name): daemon-wide write lock
+    /// across load→validate→save so a concurrent config writer can't have
+    /// its field dropped by our full-struct save. Validation is
+    /// per-key in [`crate::config_surface::apply`]; a validation error
+    /// leaves the file untouched.
+    async fn config_set(&self, key: &str, value: Option<&str>) -> Response {
+        let Some((path, lock)) = self.config_persist.as_ref() else {
+            return Response::Error {
+                message: "config editing is not available on this daemon".into(),
+            };
+        };
+        let _guard = lock.lock().await;
+        let path = path.clone();
+        let key = key.to_string();
+        let value = value.map(str::to_string);
+        let saved = tokio::task::spawn_blocking(move || {
+            let mut cfg =
+                crate::config::load(&path).map_err(|e| format!("loading config: {e:#}"))?;
+            crate::config_surface::apply(&mut cfg, &key, value.as_deref())?;
+            crate::config::save(&path, &cfg).map_err(|e| format!("saving config: {e:#}"))?;
+            crate::config_surface::entry_for(&cfg, &key)
+                .ok_or_else(|| format!("unknown config key {key:?}"))
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("config set task join: {e}")));
+        match saved {
+            Ok(entry) => {
+                tracing::info!(key = %entry.key, value = ?entry.value,
+                    "localapi: config key updated (takes effect on restart)");
+                Response::ConfigUpdated { entry }
+            }
+            Err(message) => Response::Error { message },
+        }
+    }
+
+    /// S2 — bounded log tail for the desktop's log viewer. The daemon
+    /// resolves the source from ITS OWN perspective (role-correct dirs,
+    /// SYSTEM-profile paths the desktop can't even read), caps the
+    /// response, and the client polls `size` for follow.
+    async fn tail_log(&self, source: &str, max_bytes: Option<u64>) -> Response {
+        const CAP_MAX: u64 = 64 * 1024;
+        const CAP_DEFAULT: u64 = 32 * 1024;
+        let cap = max_bytes.unwrap_or(CAP_DEFAULT).clamp(512, CAP_MAX);
+        let source = source.to_string();
+        tokio::task::spawn_blocking(move || {
+            let Some(path) = crate::logging::tail_source_path(&source) else {
+                return Response::Error {
+                    message: format!(
+                        "no log file for source {source:?} (expected daemon | service | panic)"
+                    ),
+                };
+            };
+            match crate::logging::read_tail(&path, cap) {
+                Ok((size, content)) => Response::LogTail {
+                    path: path.display().to_string(),
+                    size,
+                    content,
+                },
+                Err(e) => Response::Error {
+                    message: format!("reading {}: {e}", path.display()),
+                },
+            }
+        })
+        .await
+        .unwrap_or_else(|e| Response::Error {
+            message: format!("log tail task join: {e}"),
+        })
+    }
+
     /// S1b — archive the STALE config copy on a split-config host (the
     /// desktop's "Two configurations found" banner finally gets a button).
     /// The daemon is the only safe actor: it knows which copy it LOADED and
@@ -739,6 +833,7 @@ mod tests {
                 relay_dst: Some("5.9.157.226:12728".into()),
             }],
             exit_node: None,
+            dns: None,
         }
     }
 

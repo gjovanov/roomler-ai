@@ -285,6 +285,101 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (y, m, d)
 }
 
+/// S2 — resolve a `TailLog` source name to a concrete log file, from
+/// THIS process's perspective (the daemon serves the verb, so `daemon`
+/// is its own active rolling log):
+/// * `daemon`  — [`active_log_path`] (role-correct: a SystemContext
+///   worker resolves its service-logs file);
+/// * `service` — the newest SCM-host/service file in the machine-global
+///   `service-logs` dir (Windows; elsewhere = the daemon log);
+/// * `panic`   — the newest `panic-*` dump across the log dirs.
+///
+/// `None` = the source has no file yet (never errored, service never
+/// logged) or the name is unknown — the verb maps both to a clean error.
+pub fn tail_source_path(source: &str) -> Option<PathBuf> {
+    match source {
+        // `or_else`: in a process that never ran `init()` (the tray's
+        // direct-file fallback) `active_log_path` is None — probe the
+        // default dir for the newest daemon rolling file instead.
+        "daemon" => active_log_path().or_else(|| {
+            let dir = resolve_log_dir()?;
+            newest_file_matching(&[dir], |name| {
+                name.starts_with("roomlerd.log") || name.starts_with("roomler-agent.log")
+            })
+        }),
+        "service" => {
+            #[cfg(target_os = "windows")]
+            {
+                let dir = crate::appdirs::machine_global_dir().join("service-logs");
+                newest_file_matching(&[dir], |name| {
+                    name.starts_with("roomlerd-service.log") || name.starts_with("roomlerd.log")
+                })
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                // No SCM split off Windows — the daemon log IS the service log.
+                active_log_path()
+            }
+        }
+        "panic" => {
+            let mut dirs: Vec<PathBuf> = Vec::new();
+            if let Some(d) = log_dir().or_else(resolve_log_dir) {
+                dirs.push(d);
+            }
+            #[cfg(target_os = "windows")]
+            dirs.push(crate::appdirs::machine_global_dir().join("service-logs"));
+            newest_file_matching(&dirs, |name| name.starts_with("panic-"))
+        }
+        _ => None,
+    }
+}
+
+/// Newest (by mtime) plain file across `dirs` whose basename satisfies
+/// `pred`. Missing dirs are skipped; empty result = `None`.
+fn newest_file_matching(dirs: &[PathBuf], pred: impl Fn(&str) -> bool) -> Option<PathBuf> {
+    let mut best: Option<(SystemTime, PathBuf)> = None;
+    for dir in dirs {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if !pred(&name) {
+                continue;
+            }
+            let Ok(md) = e.metadata() else { continue };
+            if !md.is_file() {
+                continue;
+            }
+            let mt = md.modified().unwrap_or(UNIX_EPOCH);
+            if best.as_ref().is_none_or(|(t, _)| mt > *t) {
+                best = Some((mt, e.path()));
+            }
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+/// S2 — read the last ≤`cap` bytes of `path` as lossy UTF-8, starting on
+/// a line boundary when the cut landed mid-line. Returns the file's
+/// TOTAL size alongside (the client polls it to detect growth).
+pub fn read_tail(path: &Path, cap: u64) -> std::io::Result<(u64, String)> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    let size = f.metadata()?.len();
+    let start = size.saturating_sub(cap);
+    f.seek(SeekFrom::Start(start))?;
+    let mut buf = Vec::with_capacity(cap.min(size) as usize);
+    f.read_to_end(&mut buf)?;
+    let mut content = String::from_utf8_lossy(&buf).into_owned();
+    if start > 0
+        && let Some(nl) = content.find('\n')
+    {
+        content.drain(..=nl);
+    }
+    Ok((size, content))
+}
+
 /// Compute the default log directory PATH — purely, without the `LOG_DIR`
 /// `OnceLock` (which is only set by [`init`], so it's `None` in any process
 /// that didn't run the agent's logging setup, e.g. the tray). The tray uses
@@ -426,6 +521,42 @@ mod tests {
         // calls fall through the `GUARD.get().is_some()` early return.
         init();
         init();
+    }
+
+    #[test]
+    fn read_tail_caps_and_starts_on_line_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.log");
+        std::fs::write(&p, "first line\nsecond line\nthird line\n").unwrap();
+        // Big cap → whole file, untouched.
+        let (size, all) = read_tail(&p, 4096).unwrap();
+        assert_eq!(size, 34);
+        assert_eq!(all, "first line\nsecond line\nthird line\n");
+        // Small cap that cuts mid-"second" → tail starts at "third".
+        let (size, tail) = read_tail(&p, 15).unwrap();
+        assert_eq!(size, 34);
+        assert_eq!(tail, "third line\n");
+        // Unknown tail source resolves to nothing (→ clean verb error).
+        assert!(tail_source_path("nope").is_none());
+    }
+
+    #[test]
+    fn newest_file_matching_picks_latest_and_skips_missing_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("panic-1.txt");
+        let new = dir.path().join("panic-2.txt");
+        std::fs::write(&old, "old").unwrap();
+        std::fs::write(&new, "new").unwrap();
+        let past = SystemTime::now() - Duration::from_secs(3600);
+        // Force distinct mtimes (same-second writes are common on CI).
+        let f = std::fs::File::options().append(true).open(&old).unwrap();
+        f.set_modified(past).unwrap();
+        drop(f);
+        let got = newest_file_matching(
+            &[dir.path().join("missing"), dir.path().to_path_buf()],
+            |n| n.starts_with("panic-"),
+        );
+        assert_eq!(got.as_deref(), Some(new.as_path()));
     }
 
     #[test]

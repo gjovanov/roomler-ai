@@ -199,6 +199,15 @@ enum Command {
         /// The new device name (trimmed; max 64 characters).
         name: String,
     },
+    /// Read / edit this device's advanced configuration via the running
+    /// daemon (S2 config surface): overlay knobs, subnet routes, update
+    /// policy, encoder preference. The daemon validates per key and
+    /// persists to its OWN config (profile-correct even under a SYSTEM
+    /// service). Changes take effect on the next daemon restart.
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
     /// ICMP-ping an overlay peer (by name or IP) over the userspace netstack —
     /// the OS-free reachability probe. Only meaningful when the local daemon runs
     /// in netstack mode (a locked-down host with no OS route to the mesh).
@@ -227,6 +236,32 @@ struct OutputFmt {
     /// Emit raw JSON instead of a human-readable table.
     #[arg(long)]
     json: bool,
+}
+
+/// `roomler config …` — the S2 editable config surface. All verbs talk
+/// to the LOCAL daemon over the LocalAPI; secrets are excluded by
+/// construction and every change is restart-to-apply.
+#[derive(Debug, Subcommand)]
+enum ConfigAction {
+    /// List every editable key with its current value and type.
+    Ls {
+        #[command(flatten)]
+        fmt: OutputFmt,
+    },
+    /// Set one key. Value formats: `true`/`false` for switches,
+    /// comma-separated CIDRs for route lists, a JSON document for the
+    /// structured keys (`forward_acl`, `virtual_desktop_apps`).
+    Set {
+        /// Config key (as shown by `config ls`).
+        key: String,
+        /// The new value.
+        value: String,
+    },
+    /// Clear one key back to its built-in default.
+    Clear {
+        /// Config key (as shown by `config ls`).
+        key: String,
+    },
 }
 
 /// `roomler route …` — declared-route management (P6). All verbs talk to
@@ -375,6 +410,11 @@ async fn main() -> Result<()> {
         Command::Peers { fmt } => localclient::peers(fmt.json).await,
         Command::Flows { fmt } => localclient::flows(fmt.json).await,
         Command::Rename { name } => localclient::rename(&name).await,
+        Command::Config { action } => match action {
+            ConfigAction::Ls { fmt } => localclient::config_ls(fmt.json).await,
+            ConfigAction::Set { key, value } => localclient::config_set(&key, Some(&value)).await,
+            ConfigAction::Clear { key } => localclient::config_set(&key, None).await,
+        },
         Command::Ping {
             target,
             timeout_ms,

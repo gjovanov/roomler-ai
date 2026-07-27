@@ -297,15 +297,26 @@ pub async fn cmd_install(
     server: String,
     token: String,
     device_name: String,
+    advanced: Option<crate::orchestrator_agent::AdvancedOptions>,
     on_event: tauri::ipc::Channel<wizard_shared::progress::ProgressEvent>,
 ) -> Result<DoneReport, String> {
     match role {
         Role::TunnelClient => {
+            // Advanced options are daemon-config keys — the SPA hides the
+            // section for this role; ignore whatever arrives.
             crate::orchestrator_tunnel::run_install(role, server, token, device_name, on_event)
                 .await
         }
         Role::DaemonSystem | Role::DaemonUser | Role::DaemonMachine => {
-            crate::orchestrator_agent::run_install(role, server, token, device_name, on_event).await
+            crate::orchestrator_agent::run_install(
+                role,
+                server,
+                token,
+                device_name,
+                advanced.unwrap_or_default(),
+                on_event,
+            )
+            .await
         }
     }
 }
