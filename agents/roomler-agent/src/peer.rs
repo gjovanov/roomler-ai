@@ -7989,8 +7989,10 @@ mod overlay_tier_tests {
         // Escape hatch: overlay remote, detection disabled → false fast,
         // no daemon required (this also keeps the test hermetic on hosts
         // where a real daemon happens to be running).
-        std::env::set_var("ROOMLER_AGENT_OVERLAY_TIER_DETECT", "0");
+        // SAFETY: no other test touches this var (set_var is unsafe in
+        // edition 2024 because of cross-thread env races).
+        unsafe { std::env::set_var("ROOMLER_AGENT_OVERLAY_TIER_DETECT", "0") };
         assert!(!overlay_remote_is_relay_tier("100.64.0.29", sid).await);
-        std::env::remove_var("ROOMLER_AGENT_OVERLAY_TIER_DETECT");
+        unsafe { std::env::remove_var("ROOMLER_AGENT_OVERLAY_TIER_DETECT") };
     }
 }
