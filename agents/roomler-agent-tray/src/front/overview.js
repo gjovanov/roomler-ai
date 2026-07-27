@@ -17,7 +17,13 @@
     else show($('ov-not-enrolled'));
     if (s.attention) {
       show($('ov-attention'));
+      // S1b: show WHAT needs attention, not just where the sentinel sits.
+      setText('ov-attention-msg', s.attention_message || '(no details recorded)');
       setText('ov-attention-path', s.attention);
+      // Re-enrolling fixes every reason except a failed rollback (that one
+      // needs an operator to sort the broken-binary state out first).
+      const reenroll = $('ov-attention-reenroll');
+      if (reenroll) reenroll.hidden = s.attention_reason === 'rollback_failed';
     } else {
       hide($('ov-attention'));
     }
@@ -114,6 +120,7 @@
     on('deviceView', paintDeviceView);
 
     $('ov-btn-onboard').addEventListener('click', () => navigate('onboarding'));
+    $('ov-attention-reenroll').addEventListener('click', () => navigate('onboarding'));
 
     $('btn-check-update').addEventListener('click', async () => {
       pushOutput('Checking for updates…');

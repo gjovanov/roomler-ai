@@ -126,10 +126,13 @@
       out.classList.add('ok');
       out.textContent = text;
     } catch (err) {
+      // S1b: surface a short reason inline — the tooltip-only error hid
+      // WHY every ping "failed" during the netstack-only-verb era.
       const msg = String(err);
-      pingResults.set(target, { ok: false, text: 'failed', title: msg });
+      const short = msg.length > 60 ? msg.slice(0, 57) + '…' : msg;
+      pingResults.set(target, { ok: false, text: 'failed — ' + short, title: msg });
       out.classList.add('err');
-      out.textContent = 'failed';
+      out.textContent = 'failed — ' + short;
       out.title = msg;
     } finally {
       btn.textContent = label;
