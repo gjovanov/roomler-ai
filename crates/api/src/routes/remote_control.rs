@@ -133,6 +133,19 @@ pub async fn enroll_agent(
                 .await?
         }
         None => {
+            // S5 — plan device cap. Only a NEW row consumes a slot; a
+            // known machine rehydrates in place above regardless of the
+            // cap (re-enrolling your existing fleet must never brick).
+            let tenant = state.tenants.base.find_by_id(tid).await?;
+            let max = tenant.plan.limits().max_devices as u64;
+            let used = state.agents.count_active_for_tenant(tid).await?;
+            if used >= max {
+                return Err(ApiError::Forbidden(format!(
+                    "Device limit reached for the {:?} plan ({used} of {max} devices used). \
+                     Upgrade the plan or remove a device first.",
+                    tenant.plan
+                )));
+            }
             state
                 .agents
                 .create(
