@@ -48,6 +48,12 @@ export const useNotificationStore = defineStore('notifications', () => {
   }
 
   function addFromWs(notification: Notification) {
+    // Dedupe by id: the server's Redis pub/sub path can re-deliver an event
+    // this client already received (self-echo / multi-instance overlap), and
+    // a duplicate would double both the list entry and the unread badge.
+    if (notifications.value.some((n) => n.id === notification.id)) {
+      return
+    }
     notifications.value.unshift(notification)
     if (!notification.is_read) {
       unreadCount.value++
