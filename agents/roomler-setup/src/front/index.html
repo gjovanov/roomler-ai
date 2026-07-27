@@ -110,6 +110,38 @@
         </label>
       </div>
 
+      <!-- S2: optional daemon config, folded into the enrolled config.toml.
+           Hidden for the tunnel-client role (these are daemon keys); every
+           value stays editable later in the desktop app's Settings. -->
+      <details id="advanced-wrap" class="card">
+        <summary>Advanced options (optional)</summary>
+        <label class="field checkline">
+          <input id="adv-overlay" type="checkbox">
+          <span>Join the overlay network (private mesh between your devices)</span>
+        </label>
+        <label class="field checkline">
+          <input id="adv-local-subnets" type="checkbox" checked>
+          <span>Advertise directly-connected subnets (admin approval required before use)</span>
+        </label>
+        <label class="field checkline">
+          <input id="adv-auto-grant" type="checkbox" checked>
+          <span>Auto-approve incoming remote-control sessions on this device</span>
+        </label>
+        <label class="field">
+          <span>Overlay subnet routes</span>
+          <input id="adv-overlay-routes" type="text" spellcheck="false"
+                 placeholder="192.168.1.0/24, 10.0.0.0/8">
+          <small class="muted">Comma-separated CIDRs this node offers to route
+          for overlay peers. Leave empty unless this is a subnet router.</small>
+        </label>
+        <label class="field">
+          <span>Tunnel subnet routes</span>
+          <input id="adv-tunnel-routes" type="text" spellcheck="false"
+                 placeholder="192.168.1.0/24">
+          <small class="muted">Comma-separated CIDRs for the tunnel/SOCKS mesh.</small>
+        </label>
+      </details>
+
       <footer class="actions">
         <button id="server-back" class="secondary">← Back</button>
         <button id="server-continue" disabled>Continue →</button>

@@ -90,7 +90,9 @@ const ALLOWED_ORIGINS: &[&str] = &[
 /// disables — the DERP-style escape-hatch convention.
 pub fn enabled() -> bool {
     !matches!(
-        std::env::var("ROOMLER_AGENT_LOCAL_TURN").ok().as_deref(),
+        // S2: dual-prefix + config-fallback read (was a direct
+        // ROOMLER_AGENT_LOCAL_TURN-only env::var).
+        tunnel_core::env::node_env("LOCAL_TURN").as_deref(),
         Some("0" | "false" | "no" | "off")
     )
 }
