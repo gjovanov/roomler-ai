@@ -107,6 +107,14 @@ struct ConnectedGuard(Arc<AtomicBool>);
 impl ConnectedGuard {
     fn mark(flag: Arc<AtomicBool>) -> Self {
         flag.store(true, Ordering::Relaxed);
+        // S1b — a healthy authenticated connect resolves (almost) every
+        // attention reason by definition: auth works, no goodbye, no live
+        // duel. Clear stale sentinels in BOTH locations so the desktop's
+        // "Attention required" banner can't outlive the condition (the old
+        // code cleared only after a same-process auth-failure streak, so
+        // e.g. test-artifact sentinels stuck forever). `rollback_failed`
+        // is deliberately spared — see `clear_attention_on_healthy_connect`.
+        crate::notify::clear_attention_on_healthy_connect();
         Self(flag)
     }
 }
@@ -219,7 +227,7 @@ pub async fn run(
                               \troomler-agent re-enroll --token <new-jwt>\n\n\
                               with a fresh enrollment JWT from the admin UI \
                               to restore service.";
-                    match notify::raise_attention(msg) {
+                    match notify::raise_attention_with_reason(notify::REASON_AUTH, msg) {
                         Ok(path) => warn!(
                             path = %path.display(),
                             "wrote needs-attention sentinel"
@@ -247,7 +255,10 @@ pub async fn run(
                      \troomler-agent re-enroll --token <new-jwt>\n\n\
                      then restart the service (or wait for the supervisor to relaunch)."
                 );
-                match notify::raise_attention_machine_aware(&body) {
+                match notify::raise_attention_machine_aware_with_reason(
+                    notify::REASON_GOODBYE,
+                    &body,
+                ) {
                     Ok(path) => warn!(
                         path = %path.display(),
                         ?reason,
@@ -293,7 +304,10 @@ pub async fn run(
                          JWT to mint a new agent_id.",
                         recent_replacements.len()
                     );
-                    match notify::raise_attention_machine_aware(&body) {
+                    match notify::raise_attention_machine_aware_with_reason(
+                        notify::REASON_DUPLICATE,
+                        &body,
+                    ) {
                         Ok(path) => warn!(
                             path = %path.display(),
                             displacements = recent_replacements.len(),

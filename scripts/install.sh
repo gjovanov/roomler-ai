@@ -167,6 +167,13 @@ install_daemon_macos() {
     say "installing the roomlerd daemon (.pkg — sudo required; postinstall loads the LaunchAgent)"
     sudo installer -pkg "$pkg" -target /
 
+    # S1b: the app bundle deliberately kept its legacy internals through the
+    # roomlerd rename — its binary may be `roomler-agent`, not `roomlerd`.
+    # Probing both fixes the previously-broken macOS enroll step.
+    if [ ! -x "$daemon_bin" ]; then
+        daemon_bin="/Applications/roomler-agent.app/Contents/MacOS/roomler-agent"
+    fi
+
     enroll_daemon "$daemon_bin"
 
     # postinstall already bootstrapped com.roomler.agent into the console

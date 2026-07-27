@@ -3343,10 +3343,14 @@ mod tests {
             "staging root must live under ProgramData: {}",
             root.display()
         );
+        // S1b: either segment is valid — `roomler` on fresh/migrated
+        // machines, legacy `roomler-agent` pre-migration.
         assert!(
             s.ends_with("roomler\\roomler-agent\\staging")
-                || s.ends_with("roomler/roomler-agent/staging"),
-            "staging root must end in roomler\\roomler-agent\\staging: {}",
+                || s.ends_with("roomler/roomler-agent/staging")
+                || s.ends_with("roomler\\roomler\\staging")
+                || s.ends_with("roomler/roomler/staging"),
+            "staging root must end in roomler\\<segment>\\staging: {}",
             root.display()
         );
     }

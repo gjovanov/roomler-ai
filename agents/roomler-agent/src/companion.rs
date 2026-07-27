@@ -165,9 +165,10 @@ fn pick_desktop_asset(
 
 /// Is `roomler-desktop.exe` currently running? `tasklist` image-name
 /// filter — the image name appears verbatim in the table regardless of
-/// UI locale.
+/// UI locale. `pub`: the S1b appdirs migration skips while the desktop
+/// runs (it may hold open handles inside the tree being moved).
 #[cfg(target_os = "windows")]
-fn desktop_running() -> bool {
+pub fn desktop_running() -> bool {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     std::process::Command::new("tasklist")
