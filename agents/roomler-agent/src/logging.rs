@@ -60,6 +60,41 @@ static LOG_UPLOAD_RX: OnceLock<Mutex<Option<mpsc::Receiver<LogLine>>>> = OnceLoc
 /// is pruned on startup (one-shot, not a background task).
 const KEEP_DAYS: u64 = 14;
 
+/// S1b — service-mode log routing. The machine-global `service-logs`
+/// dir has been ADVERTISED by the desktop app since M1 but nothing ever
+/// wrote there: `ProjectDirs` resolves the SCM host / SystemContext
+/// worker into the SYSTEM profile
+/// (`C:\Windows\System32\config\systemprofile\…`), invisible to
+/// operators. When a role is set BEFORE [`init`], the file appender
+/// writes into `%PROGRAMDATA%\roomler\<segment>\service-logs` instead,
+/// with a per-role basename so the host and the worker (both possibly
+/// live at once) never contend for one rolling file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceLogRole {
+    /// The SCM service host process (`roomlerd service-run`).
+    Host,
+    /// The SystemContext (LocalSystem) worker.
+    Worker,
+}
+
+static SERVICE_ROLE: OnceLock<ServiceLogRole> = OnceLock::new();
+
+/// Route this process's file logs into the machine-global
+/// `service-logs` dir. Call BEFORE [`init`]; later calls are no-ops.
+pub fn set_service_logging(role: ServiceLogRole) {
+    let _ = SERVICE_ROLE.set(role);
+}
+
+/// The rolling-log basename for this process. The Host gets its own
+/// (`roomlerd-service.log`) so two SYSTEM processes never append the
+/// same daily file; everything else keeps `roomlerd.log`.
+fn log_basename() -> &'static str {
+    match SERVICE_ROLE.get() {
+        Some(ServiceLogRole::Host) => "roomlerd-service.log",
+        _ => "roomlerd.log",
+    }
+}
+
 /// Initialise tracing subscribers. Always installs a stdout layer; adds
 /// a daily-rolling file layer + panic hook when the platform log dir
 /// is writeable. Infallible — file logging failure falls back to
@@ -124,8 +159,10 @@ pub fn init() {
         && std::fs::create_dir_all(d).is_ok()
     {
         prune_old_logs(d, KEEP_DAYS);
-        // P3d Slice B: write under the new `roomlerd.log` basename.
-        let appender = tracing_appender::rolling::daily(d, "roomlerd.log");
+        // P3d Slice B: write under the new `roomlerd.log` basename
+        // (S1b: `roomlerd-service.log` for the SCM host — see
+        // [`ServiceLogRole`]).
+        let appender = tracing_appender::rolling::daily(d, log_basename());
         let (nb, guard) = tracing_appender::non_blocking(appender);
         let _ = GUARD.set(guard);
         let file = fmt::layer()
@@ -191,7 +228,15 @@ pub fn active_log_path() -> Option<PathBuf> {
     // Format unix seconds → YYYY-MM-DD without pulling chrono.
     // tracing-appender uses UTC by default; mirror that.
     let date = format_utc_date(today);
-    for base in ["roomlerd.log", "roomler-agent.log"] {
+    // Own basename first so the Host process's crash sidecars attach the
+    // Host log tail; then the standard + legacy names.
+    let mut bases = vec![log_basename()];
+    for b in ["roomlerd.log", "roomlerd-service.log", "roomler-agent.log"] {
+        if !bases.contains(&b) {
+            bases.push(b);
+        }
+    }
+    for base in bases {
         let dated = dir.join(format!("{base}.{date}"));
         if dated.exists() {
             return Some(dated);
@@ -238,7 +283,14 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 /// `OnceLock` (which is only set by [`init`], so it's `None` in any process
 /// that didn't run the agent's logging setup, e.g. the tray). The tray uses
 /// this so "Open Logs Folder" resolves a real path instead of failing.
+///
+/// S1b: with a [`ServiceLogRole`] set, resolves to the machine-global
+/// `service-logs` dir instead of the per-profile data dir.
 pub fn resolve_log_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    if SERVICE_ROLE.get().is_some() {
+        return Some(crate::appdirs::machine_global_dir().join("service-logs"));
+    }
     let dirs = crate::appdirs::project_dirs()?;
     Some(dirs.data_local_dir().join("logs"))
 }
@@ -278,6 +330,7 @@ fn prune_old_logs_at(dir: &Path, cutoff: SystemTime) {
         let name = entry.file_name();
         let lossy = name.to_string_lossy();
         let is_ours = lossy.starts_with("roomlerd.log")
+            || lossy.starts_with("roomlerd-service.log")
             || lossy.starts_with("roomler-agent.log")
             || lossy.starts_with("panic-");
         if is_ours && mtime < cutoff {

@@ -446,35 +446,67 @@ mod linux {
     use super::*;
     use std::process::Command;
 
-    pub const UNIT: &str = "roomler-agent.service";
+    /// S1b — the canonical unit name, matching what the .deb ships
+    /// (`usr/lib/systemd/user/roomler.service`, ExecStart=/usr/bin/roomlerd).
+    /// Pre-S1b `roomlerd service install` only knew the legacy name below and
+    /// couldn't SEE the packaged unit — so a .deb host that also ran
+    /// `service install` ended up with TWO enabled units (double-start).
+    pub const UNIT: &str = "roomler.service";
+    /// Legacy unit name written by pre-S1b `service install` runs.
+    const LEGACY_UNIT: &str = "roomler-agent.service";
+
+    /// Which unit name is in force on this host: the canonical name when its
+    /// unit file exists (or on a fresh host), the legacy name only when ONLY
+    /// the legacy unit file exists.
+    fn resolved_unit() -> &'static str {
+        if unit_file_present_for(UNIT) {
+            UNIT
+        } else if unit_file_present_for(LEGACY_UNIT) {
+            LEGACY_UNIT
+        } else {
+            UNIT
+        }
+    }
 
     pub fn install() -> Result<()> {
-        // Assume the .deb already dropped the unit at
-        // /usr/lib/systemd/user/roomler-agent.service. Fall back to a
-        // user-local drop-in when running out of cargo.
-        if !unit_file_present() {
+        // Prefer the packaged unit; fall back to a user-local drop-in
+        // (under the CANONICAL name) when running out of cargo.
+        let unit = resolved_unit();
+        if unit == UNIT && !unit_file_present_for(UNIT) {
             install_user_unit_file()?;
         }
         systemctl(&["--user", "daemon-reload"])?;
-        systemctl(&["--user", "enable", "--now", UNIT])?;
+        systemctl(&["--user", "enable", "--now", unit])?;
+        // Kill the double-start hazard: when enabling the canonical unit,
+        // best-effort disable a stray legacy one.
+        if unit == UNIT {
+            let _ = systemctl(&["--user", "disable", "--now", LEGACY_UNIT]);
+        }
         Ok(())
     }
 
     pub fn uninstall() -> Result<()> {
         // Ignore non-zero exit — disabling a non-enabled unit is fine.
+        // Both names, so an upgraded host is fully cleaned.
         let _ = systemctl(&["--user", "disable", "--now", UNIT]);
+        let _ = systemctl(&["--user", "disable", "--now", LEGACY_UNIT]);
         Ok(())
     }
 
     pub fn status() -> Result<AutostartStatus> {
-        let output = Command::new("systemctl")
-            .args(["--user", "is-enabled", UNIT])
-            .output();
-        match output {
-            Ok(o) if o.status.success() => Ok(AutostartStatus::Installed),
-            Ok(_) => Ok(AutostartStatus::NotInstalled),
-            Err(_) => Ok(AutostartStatus::Unknown),
+        // Either name counts as installed (an upgraded host may still run
+        // the legacy-named unit until its next `service install`).
+        for unit in [UNIT, LEGACY_UNIT] {
+            let output = Command::new("systemctl")
+                .args(["--user", "is-enabled", unit])
+                .output();
+            match output {
+                Ok(o) if o.status.success() => return Ok(AutostartStatus::Installed),
+                Ok(_) => {}
+                Err(_) => return Ok(AutostartStatus::Unknown),
+            }
         }
+        Ok(AutostartStatus::NotInstalled)
     }
 
     fn systemctl(args: &[&str]) -> Result<()> {
@@ -494,19 +526,24 @@ mod linux {
         Ok(())
     }
 
-    fn unit_file_present() -> bool {
+    fn unit_file_present_for(name: &str) -> bool {
         let candidates = [
-            "/usr/lib/systemd/user/roomler-agent.service",
-            "/usr/local/lib/systemd/user/roomler-agent.service",
-            "/etc/systemd/user/roomler-agent.service",
+            format!("/usr/lib/systemd/user/{name}"),
+            format!("/usr/local/lib/systemd/user/{name}"),
+            format!("/etc/systemd/user/{name}"),
         ];
         candidates.iter().any(|p| std::path::Path::new(p).exists())
-            || user_unit_path().map(|p| p.exists()).unwrap_or(false)
+            || user_unit_path_for(name)
+                .map(|p| p.exists())
+                .unwrap_or(false)
     }
 
     fn user_unit_path() -> Option<std::path::PathBuf> {
-        directories::BaseDirs::new()
-            .map(|d| d.config_dir().join("systemd/user/roomler-agent.service"))
+        user_unit_path_for(UNIT)
+    }
+
+    fn user_unit_path_for(name: &str) -> Option<std::path::PathBuf> {
+        directories::BaseDirs::new().map(|d| d.config_dir().join("systemd/user").join(name))
     }
 
     fn install_user_unit_file() -> Result<()> {
