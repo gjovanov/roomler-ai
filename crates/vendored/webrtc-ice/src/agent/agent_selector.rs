@@ -351,9 +351,15 @@ impl ControllingSelector for AgentInternal {
                 // arrived before this pair's own check completed, the
                 // triggered check's success must also honour the controlling
                 // agent's latest nomination, not only a cold start.
-                // Escape hatch: ROOMLER_ICE_FOLLOW_RENOMINATION=0.
+                // Default-OFF (2026-07-27 field): following renominations let Chrome
+                // steer the agent onto a half-blackholed pair (browser-TUN-host ×
+                // agent-srflx validates one-way through the home-NAT masquerade;
+                // the reverse direction routes into the TUN with a physical
+                // source) — SCTP died ~4 s in, every session. Opt-in via
+                // ROOMLER_ICE_FOLLOW_RENOMINATION=1 until the follow policy
+                // validates pair liveness both ways.
                 let follow_renomination =
-                    std::env::var("ROOMLER_ICE_FOLLOW_RENOMINATION").as_deref() != Ok("0");
+                    std::env::var("ROOMLER_ICE_FOLLOW_RENOMINATION").as_deref() == Ok("1");
                 let already_selected = {
                     let selected = self.agent_conn.get_selected_pair();
                     selected
@@ -563,10 +569,15 @@ impl ControlledSelector for AgentInternal {
                     // stale pair (field 2026-07-27, NEO16→WINHOST-C: video pinned
                     // to the overlay pair through carrier churn while the
                     // nominated srflx pair sat idle).
-                    // Escape hatch: ROOMLER_ICE_FOLLOW_RENOMINATION=0 restores
-                    // first-nomination-wins.
+                    // Default-OFF (2026-07-27 field): following renominations let
+                    // Chrome steer the agent onto a half-blackholed pair
+                    // (browser-TUN-host × agent-srflx validates one-way through
+                    // the home-NAT masquerade; the reverse direction routes into
+                    // the TUN with a physical source) — SCTP died ~4 s in, every
+                    // session. Opt-in via ROOMLER_ICE_FOLLOW_RENOMINATION=1 until
+                    // the follow policy validates pair liveness both ways.
                     let follow_renomination =
-                        std::env::var("ROOMLER_ICE_FOLLOW_RENOMINATION").as_deref() != Ok("0");
+                        std::env::var("ROOMLER_ICE_FOLLOW_RENOMINATION").as_deref() == Ok("1");
                     let already_selected = {
                         let selected = self.agent_conn.get_selected_pair();
                         selected.as_ref().is_some_and(|s| {
