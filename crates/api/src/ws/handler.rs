@@ -303,6 +303,17 @@ async fn handle_socket(socket: WebSocket, state: AppState, user_id: ObjectId, us
             .await;
     }
 
+    // Resolve a human-friendly display name for this controller once per
+    // connection. It's the identity shown to the viewee — the "Being
+    // viewed by" overlay caption + its initials avatar — and in owner
+    // approval notifications. The JWT only carries the login username, so
+    // look up the profile's display_name here, falling back to the
+    // username when it's unset.
+    let controller_display = match state.users.base.find_by_id(user_id).await {
+        Ok(u) if !u.display_name.trim().is_empty() => u.display_name,
+        _ => username,
+    };
+
     while let Some(msg) = receiver.next().await {
         match msg {
             Ok(Message::Text(text)) => {
@@ -310,7 +321,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, user_id: ObjectId, us
                     &state,
                     &user_id,
                     &connection_id,
-                    &username,
+                    &controller_display,
                     &rc_controller_tx,
                     &text,
                 )

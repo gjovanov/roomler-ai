@@ -74,6 +74,7 @@ import {
   storedPerFrameMsg,
   storedFlowParams,
   diagHudEnabled,
+  remoteCursorCssFor,
   type AutoTransportInputs,
   type KeyDecision,
   type RcCodecChoice,
@@ -2849,5 +2850,40 @@ describe('P6 — flow-control knobs + sustained-window struggle rule', () => {
   it('StruggleWindow sanitizes a nonsense windows count to 1', () => {
     expect(new StruggleWindow(0).observe(true)).toBe(true)
     expect(new StruggleWindow(Number.NaN).observe(true)).toBe(true)
+  })
+})
+
+describe('remoteCursorCssFor', () => {
+  const shape = (css?: string) => ({
+    bitmap: {} as ImageBitmap,
+    hotspotX: 0,
+    hotspotY: 0,
+    css,
+  })
+
+  it('returns the css keyword of the shape at the current position', () => {
+    const state = {
+      pos: { x: 10, y: 20, id: 7 },
+      shapes: new Map([[7, shape('text')]]),
+    }
+    expect(remoteCursorCssFor(state)).toBe('text')
+  })
+
+  it('returns null when the cursor is hidden (no pos)', () => {
+    const state = { pos: null, shapes: new Map([[7, shape('text')]]) }
+    expect(remoteCursorCssFor(state)).toBeNull()
+  })
+
+  it('returns null for an app-custom shape carrying no css', () => {
+    const state = {
+      pos: { x: 0, y: 0, id: 3 },
+      shapes: new Map([[3, shape(undefined)]]),
+    }
+    expect(remoteCursorCssFor(state)).toBeNull()
+  })
+
+  it('returns null when the shape for the current id is not cached yet', () => {
+    const state = { pos: { x: 0, y: 0, id: 9 }, shapes: new Map() }
+    expect(remoteCursorCssFor(state)).toBeNull()
   })
 })

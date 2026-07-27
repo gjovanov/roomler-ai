@@ -77,6 +77,13 @@ pub struct CursorInfo {
     pub hotspot_y: i32,
     /// 32-bit BGRA pixels, top-down (row 0 = top).
     pub bgra: Vec<u8>,
+    /// Standard OS system-cursor CSS keyword (`"text"`, `"default"`,
+    /// `"pointer"`, `"ew-resize"`, …) when the active cursor matches a
+    /// known `IDC_*` handle, else `None` for app-custom cursors. Lets
+    /// the browser render the viewer's real native cursor instead of
+    /// the streamed bitmap (zero-latency, exactly the OS cursor).
+    /// Cross-platform field; only the Windows tracker populates it today.
+    pub css: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
