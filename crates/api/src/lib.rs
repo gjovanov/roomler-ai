@@ -3,6 +3,7 @@ pub mod extractors;
 pub mod middleware;
 pub mod routes;
 pub mod state;
+pub mod storage;
 pub mod ws;
 
 use axum::{
@@ -442,8 +443,13 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/tenant/{tenant_id}/magic-dns", magic_dns_routes)
         .nest("/tenant/{tenant_id}/session", remote_session_routes);
 
-    // Health check
-    let health = Router::new().route("/health", get(health_check));
+    // Health check. `/health` stays a cheap process-alive 200 (liveness /
+    // startup probes — must NOT flap on dependency blips or k8s restarts the
+    // pod during a Redis outage); `/health/ready` checks the dependencies
+    // (readiness probe + operators).
+    let health = Router::new()
+        .route("/health", get(health_check))
+        .route("/health/ready", get(readiness_check));
 
     // Apply rate limiting only to API routes (not health/ws which need unrestricted access)
     let rate_limited_api = Router::new().nest("/api", api).layer(governor_layer);
@@ -463,4 +469,59 @@ async fn health_check() -> axum::Json<serde_json::Value> {
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
     }))
+}
+
+/// Readiness: 200 only when Mongo answers a ping, the Redis publisher
+/// round-trips a PING, and the pub/sub subscriber currently holds a live
+/// subscription. 503 otherwise, with per-check detail in the body. A pod
+/// that booted without Redis (`redis_pubsub: None`) reports not-ready —
+/// cross-instance delivery is silently broken in that state and the old
+/// static 200 hid it.
+async fn readiness_check(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    use std::time::Duration;
+
+    let mongo_ok = tokio::time::timeout(
+        Duration::from_secs(2),
+        state.db.run_command(bson::doc! { "ping": 1 }),
+    )
+    .await
+    .map(|r| r.is_ok())
+    .unwrap_or(false);
+
+    let (redis_ok, subscriber_ok) = match &state.redis_pubsub {
+        Some(pubsub) => {
+            let ok = tokio::time::timeout(Duration::from_secs(2), pubsub.ping())
+                .await
+                .map(|r| r.is_ok())
+                .unwrap_or(false);
+            (
+                ok,
+                state
+                    .redis_sub_alive
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
+        }
+        None => (false, false),
+    };
+
+    let ready = mongo_ok && redis_ok && subscriber_ok;
+    let status = if ready {
+        axum::http::StatusCode::OK
+    } else {
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        axum::Json(serde_json::json!({
+            "status": if ready { "ready" } else { "not_ready" },
+            "checks": {
+                "mongo": mongo_ok,
+                "redis": redis_ok,
+                "redis_subscriber": subscriber_ok,
+            },
+            "version": env!("CARGO_PKG_VERSION"),
+        })),
+    )
 }

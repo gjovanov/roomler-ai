@@ -49,6 +49,8 @@ pub enum StripeError {
     NoBillingAccount,
     #[error("Invalid plan: {0}")]
     InvalidPlan(String),
+    #[error("Stripe price id for plan '{0}' is not configured")]
+    PriceNotConfigured(String),
     #[error("Stripe API error: {0}")]
     ApiError(String),
     #[error("Invalid webhook signature")]
@@ -93,6 +95,17 @@ impl StripeService {
             "business" => self.settings.price_business.clone(),
             _ => return Err(StripeError::InvalidPlan(plan.to_string())),
         };
+
+        // Refuse a blank price id BEFORE any Stripe call — otherwise the
+        // request forwards `line_items[0][price]=""` and surfaces as an
+        // opaque 500 "Stripe API error". Empty price ids in the prod
+        // configmap were exactly the live "payment not working" failure;
+        // this turns the misconfiguration into a clear, actionable error
+        // (and main.rs warns about it at startup).
+        if price_id.trim().is_empty() {
+            warn!(plan, "checkout refused: Stripe price id is not configured");
+            return Err(StripeError::PriceNotConfigured(plan.to_string()));
+        }
 
         let collection = db.collection::<Tenant>(Tenant::COLLECTION);
         let tenant = collection

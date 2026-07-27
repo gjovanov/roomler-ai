@@ -49,6 +49,7 @@ pub async fn export_conversation(
     let messages_dao = Arc::clone(&state.messages);
     let users_dao = Arc::clone(&state.users);
     let task_store = Arc::clone(state.tasks.store());
+    let storage = Arc::clone(&state.storage);
 
     state.tasks.spawn_task(task_id, async move {
         // Fetch all messages in room (up to 10000)
@@ -93,26 +94,18 @@ pub async fn export_conversation(
             roomler_ai_services::export::excel::export_conversation(&result.items, &user_map)
                 .map_err(|e| format!("Excel export failed: {}", e))?;
 
-        // Write to temp file
-        let export_dir = std::env::var("ROOMLER_UPLOAD_DIR")
-            .unwrap_or_else(|_| "/tmp/roomler-ai-uploads".to_string());
-        let export_dir = std::path::PathBuf::from(export_dir).join("exports");
-        tokio::fs::create_dir_all(&export_dir)
-            .await
-            .map_err(|e| format!("Failed to create export dir: {}", e))?;
-
+        // Persist the artifact through the storage backend; `file_path` on
+        // the task record is the storage KEY (pre-S0 records hold absolute
+        // local paths — the download route's Local backend resolves both).
         let file_name = format!("conversation-export-{}.xlsx", task_id.to_hex());
-        let file_path = export_dir.join(&file_name);
-        tokio::fs::write(&file_path, &bytes)
+        let storage_key = format!("exports/{}", file_name);
+        storage
+            .put(&storage_key, bytes)
             .await
-            .map_err(|e| format!("Failed to write export file: {}", e))?;
+            .map_err(|e| format!("Failed to store export file: {}", e))?;
 
         task_store
-            .complete(
-                task_id,
-                Some(file_path.to_string_lossy().to_string()),
-                Some(file_name),
-            )
+            .complete(task_id, Some(storage_key), Some(file_name))
             .await
             .map_err(|e| format!("Failed to complete task: {}", e))?;
 
