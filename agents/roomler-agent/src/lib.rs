@@ -11,6 +11,7 @@ pub mod capture;
 pub mod clipboard;
 pub mod companion;
 pub mod config;
+pub mod config_surface;
 pub mod consent;
 pub mod crash_recorder;
 pub mod crash_uploader;

@@ -37,6 +37,16 @@ test.describe('Authentication', () => {
     await expect(page).toHaveURL(/\/landing/)
   })
 
+  test('protected deep-link redirects to login, not landing (S2)', async ({ page }) => {
+    // A real target (e.g. the desktop app's "View screen" remote URL)
+    // must land on the sign-in form with the path stashed for
+    // redirect-back — the landing page would strand the link.
+    await page.goto('/tenant/000000000000000000000000/agent/000000000000000000000000/remote')
+    await expect(page).toHaveURL(/\/login/)
+    const stashed = await page.evaluate(() => sessionStorage.getItem('pending_redirect'))
+    expect(stashed).toContain('/agent/000000000000000000000000/remote')
+  })
+
   test('navigate between login and register', async ({ page }) => {
     await page.goto('/login')
     await page.getByRole('link', { name: /register/i }).click()

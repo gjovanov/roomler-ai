@@ -62,7 +62,33 @@
     tr.appendChild(ipCell(p));
     tr.appendChild(badgeCell(p));
     tr.appendChild(pingCell(p));
+    tr.appendChild(viewCell(p));
     return tr;
+  }
+
+  // S2 — "View screen" deep-link for agent-backed peers: opens the
+  // browser remote-control viewer. The URL is built RUST-side from this
+  // device's own configured server origin + the validated agent id, so
+  // a hostile peer name can't steer the browser anywhere.
+  function viewCell(p) {
+    const td = document.createElement('td');
+    if (!p.agent_id) return td;
+    const btn = document.createElement('button');
+    btn.className = 'sm';
+    btn.textContent = 'View screen';
+    btn.title = 'Open the remote-control viewer in your browser (sign-in required)';
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      try {
+        await invoke('cmd_open_remote', { agentId: p.agent_id });
+      } catch (err) {
+        btn.title = String(err);
+      } finally {
+        btn.disabled = false;
+      }
+    });
+    td.appendChild(btn);
+    return td;
   }
 
   // v4 with the derived v6 as a second line — one column instead of two, so

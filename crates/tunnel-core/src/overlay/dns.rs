@@ -270,6 +270,14 @@ pub struct DnsOsGuard {
     active: bool,
 }
 
+impl DnsOsGuard {
+    /// S2 — did the OS split-DNS steer actually take? (Rendered in the
+    /// desktop's DNS section + `roomler status`.)
+    pub fn active(&self) -> bool {
+        self.active
+    }
+}
+
 /// Route `magic_domain` queries to our `resolver_ip` at the OS level. Returns a
 /// guard that reverts on `Drop`.
 pub async fn configure_os(resolver_ip: Ipv4Addr, magic_domain: &str) -> DnsOsGuard {

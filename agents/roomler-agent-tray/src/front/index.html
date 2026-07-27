@@ -114,6 +114,10 @@
             <dd id="ov-daemon-version" class="mono">—</dd>
             <dt>Network</dt>
             <dd id="ov-counts">—</dd>
+            <!-- S2: MagicDNS status — row hidden unless the overlay
+                 publishes a magic domain for this tenant. -->
+            <dt id="ov-dns-label" hidden>MagicDNS</dt>
+            <dd id="ov-dns" class="mono small" hidden>—</dd>
           </dl>
         </div>
 
@@ -169,6 +173,7 @@
                     <th>Overlay IP</th>
                     <th>Connection</th>
                     <th>Ping</th>
+                    <th></th>
                   </tr>
                 </thead>
                 <tbody id="dv-peers-body"></tbody>
@@ -344,6 +349,19 @@
           </p>
         </div>
 
+        <!-- S2: the daemon's editable config surface (ConfigGet/ConfigSet).
+             Rows are built entirely by settings.js from cmd_config_entries —
+             per-key editors keyed on the entry's `kind`. -->
+        <div class="card">
+          <h3>Device configuration</h3>
+          <p class="muted small" style="margin: 0 0 8px">
+            Advanced per-device options (overlay, subnet routes, updates,
+            encoder). Changes are saved to this device's configuration and
+            take effect after the service restarts.
+          </p>
+          <div id="cfg-rows"><p class="muted small">Loading…</p></div>
+        </div>
+
         <div class="card">
           <h3>Files</h3>
           <dl class="kv">
@@ -356,6 +374,36 @@
             <button type="button" id="btn-open-logs">Open logs folder</button>
             <button type="button" id="btn-open-config">Open config folder</button>
           </div>
+        </div>
+
+        <!-- S2: bounded log viewer (LocalAPI TailLog). The service resolves
+             role-correct files the desktop can't even read itself. -->
+        <div class="card">
+          <h3>Service log</h3>
+          <div class="actions">
+            <select id="log-source">
+              <option value="daemon" selected>Device service</option>
+              <option value="service">Service host</option>
+              <option value="panic">Crash dumps</option>
+            </select>
+            <input
+              type="text"
+              id="log-filter"
+              placeholder="filter, e.g. ERROR"
+              spellcheck="false"
+              style="flex: 1"
+            />
+            <button type="button" id="btn-log-refresh">Refresh</button>
+            <label class="muted small" style="display: inline-flex; align-items: center; gap: 4px">
+              <input type="checkbox" id="log-follow" /> Follow
+            </label>
+          </div>
+          <p id="log-path" class="muted small mono" style="margin: 6px 0 4px">—</p>
+          <pre
+            id="log-view"
+            class="mono small"
+            style="max-height: 280px; overflow: auto; white-space: pre-wrap; margin: 0"
+          >(press Refresh to load)</pre>
         </div>
 
         <div id="settings-result" class="banner" hidden></div>

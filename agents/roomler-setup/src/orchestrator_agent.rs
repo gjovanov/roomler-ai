@@ -53,6 +53,75 @@ use wizard_shared::progress::{ProgressEvent, replay_log};
 use crate::commands::DoneReport;
 use crate::role::Role;
 
+/// S2 — optional advanced daemon options from the wizard's collapsed
+/// "Advanced options" section, written into the enrolled config.toml
+/// right where the orchestrator saves it. `None`/empty fields keep the
+/// agent's defaults; route lists are validated BEFORE the MSI runs so a
+/// typo can't burn the single-use enrollment token.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AdvancedOptions {
+    pub overlay_enabled: Option<bool>,
+    pub advertise_local_subnets: Option<bool>,
+    pub auto_grant_session: Option<bool>,
+    /// Comma-separated CIDRs → `overlay_advertised_routes`.
+    pub overlay_advertised_routes: Option<String>,
+    /// Comma-separated CIDRs → `advertise_routes` (tunnel/SOCKS mesh).
+    pub advertise_routes: Option<String>,
+}
+
+impl AdvancedOptions {
+    /// The two free-text route lists, with empties normalised away —
+    /// shared by pre-MSI validation and the post-enroll apply.
+    fn route_fields(&self) -> [(&'static str, Option<&str>); 2] {
+        fn norm(v: &Option<String>) -> Option<&str> {
+            v.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        }
+        [
+            (
+                "overlay_advertised_routes",
+                norm(&self.overlay_advertised_routes),
+            ),
+            ("advertise_routes", norm(&self.advertise_routes)),
+        ]
+    }
+
+    /// Fail fast on bad route CIDRs (called pre-MSI). Bool options
+    /// can't be invalid.
+    fn validate(&self) -> Result<(), String> {
+        for (key, val) in self.route_fields() {
+            if let Some(v) = val {
+                roomler_agent::config_surface::validate_cidr_list(v)
+                    .map_err(|e| format!("advanced option {key}: {e}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Write the selected options into the freshly-enrolled config via
+    /// the same per-key registry the desktop editor uses.
+    fn apply_to(&self, cfg: &mut roomler_agent::config::AgentConfig) -> Result<(), String> {
+        use roomler_agent::config_surface::apply;
+        let bools = [
+            ("overlay_enabled", self.overlay_enabled),
+            ("advertise_local_subnets", self.advertise_local_subnets),
+            ("auto_grant_session", self.auto_grant_session),
+        ];
+        for (key, val) in bools {
+            if let Some(v) = val {
+                apply(cfg, key, Some(if v { "true" } else { "false" }))
+                    .map_err(|e| format!("advanced option {key}: {e}"))?;
+            }
+        }
+        for (key, val) in self.route_fields() {
+            if let Some(v) = val {
+                apply(cfg, key, Some(v)).map_err(|e| format!("advanced option {key}: {e}"))?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Drive a full daemon install end-to-end. Streams ProgressEvent over
 /// the channel; mirrors every emit into the replay log.
 pub async fn run_install(
@@ -60,6 +129,7 @@ pub async fn run_install(
     server: String,
     token: String,
     device_name: String,
+    advanced: AdvancedOptions,
     on_event: Channel<ProgressEvent>,
 ) -> Result<DoneReport, String> {
     // Reset state for a fresh run. CANCEL_REQUESTED stays cleared
@@ -71,7 +141,7 @@ pub async fn run_install(
 
     // Outer Result so we can always clear INSTALL_IN_PROGRESS on
     // any exit path.
-    let outcome = run_install_inner(role, server, token, device_name, &on_event).await;
+    let outcome = run_install_inner(role, server, token, device_name, advanced, &on_event).await;
 
     crate::INSTALL_IN_PROGRESS.store(false, Ordering::SeqCst);
     crate::ACTIVE_MSI_PID.store(0, Ordering::SeqCst);
@@ -98,9 +168,15 @@ async fn run_install_inner(
     server: String,
     token: String,
     device_name: String,
+    advanced: AdvancedOptions,
     on_event: &Channel<ProgressEvent>,
 ) -> Result<DoneReport, String> {
     emit(on_event, ProgressEvent::Started);
+
+    // S2 — validate the advanced route lists FIRST: a CIDR typo must
+    // fail here, before the MSI runs and before the single-use
+    // enrollment token is burned.
+    advanced.validate()?;
 
     // --- Role → flavour (was: parse_flavour on the SPA string) ----------
     let flavour_str = role
@@ -403,9 +479,12 @@ async fn run_install_inner(
         machine_id: &machine_id,
         machine_name: &device_name,
     };
-    let cfg = roomler_agent::enrollment::enroll(inputs)
+    let mut cfg = roomler_agent::enrollment::enroll(inputs)
         .await
         .map_err(|e| format!("enrollment: {e}"))?;
+    // S2 — fold the wizard's advanced options into the enrolled config
+    // before it's written (route lists already validated pre-MSI).
+    advanced.apply_to(&mut cfg)?;
     let agent_id = cfg.agent_id.clone();
     let tenant_id = cfg.tenant_id.clone();
     roomler_agent::config::save(&config_path, &cfg)

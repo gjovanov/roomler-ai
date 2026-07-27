@@ -348,3 +348,19 @@ button.secondary:hover:not(:disabled) {
   from { opacity: 0; transform: translate(-50%, 10px); }
   to { opacity: 1; transform: translate(-50%, 0); }
 }
+
+/* S2: advanced-options collapsible on the Server step */
+details.card > summary {
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 0.9rem;
+  user-select: none;
+}
+details.card[open] > summary { margin-bottom: 12px; }
+.field.checkline {
+  display: flex;
+  flex-direction: row;
+  align-items: baseline;
+  gap: 8px;
+}
+.field.checkline > span { font-weight: 400; }
