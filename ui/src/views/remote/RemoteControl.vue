@@ -14,7 +14,7 @@
       <v-btn
         icon="mdi-arrow-left"
         variant="text"
-        :to="{ name: 'admin-agents', params: { tenantId } }"
+        :to="{ name: 'devices', params: { tenantId } }"
         aria-label="Back to Agents"
       />
       <v-toolbar-title class="d-flex align-center text-truncate">
