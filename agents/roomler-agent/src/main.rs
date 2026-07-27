@@ -1438,6 +1438,36 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         .map(|v| !matches!(v.as_str(), "0" | "false" | "no" | "off"))
         .unwrap_or(true);
     let update_interval = updater::resolve_check_interval(&cfg);
+    // S1a — forced-update trigger channel (rc:agent.update → run_periodic).
+    // When auto-update is disabled the receiver is dropped below and
+    // triggers report undeliverable.
+    let update_trigger_rx = updater::install_update_trigger();
+
+    // S1a — bring the roomler-desktop companion EXE up to this daemon's
+    // version (it ships outside both MSIs, so self-updates never touched
+    // it). Spawn-and-forget; every failure path logs + retries next start.
+    // A user-context worker on a perMachine install can't write
+    // %ProgramFiles% and skips — the SCM host hook covers that flavour.
+    {
+        // A SystemContext worker (LocalSystem) exists only under the
+        // `system-context` feature; every other build of `run` executes
+        // in a user session.
+        #[cfg(all(target_os = "windows", feature = "system-context"))]
+        let respawn_ctx = {
+            use roomler_agent::system_context::worker_role;
+            if matches!(
+                worker_role::probe_self(),
+                Ok(worker_role::WorkerRole::SystemContext)
+            ) {
+                roomler_agent::companion::RespawnContext::SystemService
+            } else {
+                roomler_agent::companion::RespawnContext::UserSession
+            }
+        };
+        #[cfg(not(all(target_os = "windows", feature = "system-context")))]
+        let respawn_ctx = roomler_agent::companion::RespawnContext::UserSession;
+        tokio::spawn(roomler_agent::companion::refresh_if_stale(respawn_ctx));
+    }
 
     // Install the liveness watchdog. Pumps tick after every iteration;
     // the scan loop force-exits via std::process::exit(STALL_EXIT_CODE)
@@ -1771,7 +1801,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         Some(tokio::spawn({
             let rx = shutdown_rx.clone();
             let tx = shutdown_tx.clone();
-            async move { updater::run_periodic(rx, tx, update_interval).await }
+            async move { updater::run_periodic(rx, tx, update_interval, update_trigger_rx).await }
         }))
     } else {
         tracing::info!("auto-update disabled via ROOMLER_AGENT_AUTO_UPDATE");

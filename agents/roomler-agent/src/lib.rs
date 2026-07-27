@@ -9,6 +9,7 @@ pub mod audio;
 pub mod capture;
 #[cfg(feature = "clipboard")]
 pub mod clipboard;
+pub mod companion;
 pub mod config;
 pub mod consent;
 pub mod crash_recorder;

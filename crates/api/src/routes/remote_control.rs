@@ -321,6 +321,172 @@ pub async fn delete_agent(
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Forced self-update (S1a)
+// ────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, Default)]
+pub struct TriggerUpdateRequest {
+    /// Optional release tag to pin (e.g. `agent-v0.3.0-rc.260`); omitted =
+    /// latest. Forwarded verbatim to the agent.
+    #[serde(default)]
+    pub pin: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TriggerUpdateResult {
+    pub agent_id: String,
+    /// Whether the message reached a live agent WS. `false` = offline (or a
+    /// full outbound queue); offline agents pick the release up on their own
+    /// periodic check anyway.
+    pub delivered: bool,
+}
+
+/// POST /api/tenant/{tid}/agent/{agent_id}/update — push `rc:agent.update`
+/// to one agent. MANAGE_AGENTS. Pre-S1a agents ignore the unknown message
+/// (decode-and-drop, same contract as `rc:goodbye`).
+pub async fn trigger_agent_update(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path((tenant_id, agent_id)): Path<(String, String)>,
+    // Body is required (send `{}` for defaults) — plain `Json` keeps us off
+    // axum 0.8's `OptionalFromRequest` surface, which the codebase doesn't
+    // use anywhere else.
+    Json(body): Json<TriggerUpdateRequest>,
+) -> Result<Json<TriggerUpdateResult>, ApiError> {
+    let tid = ObjectId::parse_str(&tenant_id)
+        .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
+    let aid = ObjectId::parse_str(&agent_id)
+        .map_err(|_| ApiError::BadRequest("Invalid agent_id".to_string()))?;
+
+    require_permission(
+        &state,
+        tid,
+        auth.user_id,
+        permissions::MANAGE_AGENTS,
+        "MANAGE_AGENTS",
+    )
+    .await?;
+
+    // Tenant-scope the target (404 for a foreign agent id).
+    let _ = state.agents.find_in_tenant(tid, aid).await?;
+
+    let pin = body.pin;
+    let delivered = state
+        .rc_hub
+        .send_to_agent(
+            aid,
+            roomler_ai_remote_control::signaling::ServerMsg::UpdateNow { pin: pin.clone() },
+        )
+        .is_ok();
+    tracing::info!(
+        admin = %auth.user_id, agent = %aid, ?pin, delivered,
+        "operator-triggered agent self-update"
+    );
+    Ok(Json(TriggerUpdateResult {
+        agent_id: aid.to_hex(),
+        delivered,
+    }))
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct BulkTriggerUpdateRequest {
+    /// Explicit targets (hex agent ids). Omitted/empty = every agent in the
+    /// tenant.
+    #[serde(default)]
+    pub agent_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub pin: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BulkTriggerUpdateResponse {
+    pub results: Vec<TriggerUpdateResult>,
+    pub requested: usize,
+    pub delivered: usize,
+}
+
+/// POST /api/tenant/{tid}/agent/update — push `rc:agent.update` to selected
+/// (or all) agents in the tenant. MANAGE_AGENTS. Fleet-side stampede control
+/// is the agents' own 5-min install-storm cooldown + the release proxy cache.
+pub async fn trigger_agents_update(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(tenant_id): Path<String>,
+    Json(body): Json<BulkTriggerUpdateRequest>,
+) -> Result<Json<BulkTriggerUpdateResponse>, ApiError> {
+    let tid = ObjectId::parse_str(&tenant_id)
+        .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
+
+    require_permission(
+        &state,
+        tid,
+        auth.user_id,
+        permissions::MANAGE_AGENTS,
+        "MANAGE_AGENTS",
+    )
+    .await?;
+
+    let target_ids: Vec<ObjectId> = match body.agent_ids {
+        Some(ids) if !ids.is_empty() => {
+            let mut out = Vec::with_capacity(ids.len());
+            for id in ids {
+                let aid = ObjectId::parse_str(&id)
+                    .map_err(|_| ApiError::BadRequest(format!("Invalid agent_id: {id}")))?;
+                // Tenant-scope every explicit target.
+                let _ = state.agents.find_in_tenant(tid, aid).await?;
+                out.push(aid);
+            }
+            out
+        }
+        _ => {
+            let page = state
+                .agents
+                .list_for_tenant(
+                    tid,
+                    &PaginationParams {
+                        page: 1,
+                        per_page: 1000,
+                        before: None,
+                    },
+                )
+                .await?;
+            page.items.into_iter().filter_map(|a| a.id).collect()
+        }
+    };
+
+    let mut results = Vec::with_capacity(target_ids.len());
+    let mut delivered = 0usize;
+    for aid in &target_ids {
+        let ok = state
+            .rc_hub
+            .send_to_agent(
+                *aid,
+                roomler_ai_remote_control::signaling::ServerMsg::UpdateNow {
+                    pin: body.pin.clone(),
+                },
+            )
+            .is_ok();
+        if ok {
+            delivered += 1;
+        }
+        results.push(TriggerUpdateResult {
+            agent_id: aid.to_hex(),
+            delivered: ok,
+        });
+    }
+    tracing::info!(
+        admin = %auth.user_id, tenant = %tid,
+        requested = target_ids.len(), delivered, pin = ?body.pin,
+        "operator-triggered bulk agent self-update"
+    );
+    Ok(Json(BulkTriggerUpdateResponse {
+        requested: results.len(),
+        delivered,
+        results,
+    }))
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Sessions
 // ────────────────────────────────────────────────────────────────────────────
 
