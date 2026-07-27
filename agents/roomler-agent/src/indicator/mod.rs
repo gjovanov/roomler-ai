@@ -27,6 +27,14 @@
 
 use anyhow::Result;
 
+/// Channel the overlay's "Disconnect" control uses to ask the signaling
+/// loop to tear down a session, identified by its `ObjectId`. Created
+/// once in `run()` and handed to [`ViewerIndicator::new`]; the receiver
+/// is polled by `connect_once`'s `select!`. `run()` retains its own
+/// clone so the channel never fully closes (which would busy-spin the
+/// select!) even when the overlay is disabled.
+pub type KillSender = tokio::sync::mpsc::Sender<bson::oid::ObjectId>;
+
 /// A handle to the viewer-indicator worker. Cheap to clone; multiple
 /// sessions sharing one handle is the common case (one worker, many
 /// concurrent sessions → one combined label).
@@ -38,12 +46,14 @@ pub struct ViewerIndicator {
 impl ViewerIndicator {
     /// Spin up the worker. On Windows with the `viewer-indicator`
     /// feature this creates a background thread that owns a layered,
-    /// click-through overlay window. Everywhere else this is a no-op
-    /// constructor — the returned handle accepts `show_session` /
-    /// `hide_session` calls and drops them.
-    pub fn new() -> Result<Self> {
+    /// click-through overlay window (a thin always-on border) plus a
+    /// reveal-on-hover badge carrying the viewer's initials + a
+    /// "Disconnect" control that fires through `kill_tx`. Everywhere
+    /// else this is a no-op constructor — the returned handle accepts
+    /// `show_session` / `hide_session` calls and drops them.
+    pub fn new(kill_tx: KillSender) -> Result<Self> {
         Ok(Self {
-            inner: Inner::new()?,
+            inner: Inner::new(kill_tx)?,
         })
     }
 
@@ -88,7 +98,10 @@ struct Inner;
 
 #[cfg(not(all(target_os = "windows", feature = "viewer-indicator")))]
 impl Inner {
-    fn new() -> Result<Self> {
+    fn new(_kill_tx: KillSender) -> Result<Self> {
+        // Drop the sender: `run()` retains its own clone to keep the
+        // channel open, so the signaling `select!` never busy-spins on a
+        // fully-closed receiver even without a real overlay here.
         Ok(Self)
     }
     fn disabled() -> Self {
@@ -96,4 +109,78 @@ impl Inner {
     }
     fn show(&self, _session_id: String, _controller_name: String) {}
     fn hide(&self, _session_id: String) {}
+}
+
+/// Compute a 1–2 character initials label from a controller's display
+/// name for the overlay badge. "Goran Jovanov" → "GJ", "gjovanov" →
+/// "GJ", "alice" → "AL", "" → "?". Splits on whitespace + common
+/// separators, takes the first letter of the first two tokens (or the
+/// first two letters of a single token), uppercased. Pure + platform-
+/// agnostic so it's unit-tested in the default CI.
+#[cfg_attr(
+    not(all(target_os = "windows", feature = "viewer-indicator")),
+    allow(dead_code)
+)]
+pub(crate) fn initials_of(name: &str) -> String {
+    let tokens: Vec<&str> = name
+        .split(|c: char| c.is_whitespace() || matches!(c, '.' | '_' | '-' | ','))
+        .filter(|t| !t.is_empty())
+        .collect();
+    let mut out = String::new();
+    match tokens.as_slice() {
+        [] => {}
+        [single] => {
+            for c in single.chars().take(2) {
+                out.extend(c.to_uppercase());
+            }
+        }
+        [first, second, ..] => {
+            if let Some(c) = first.chars().next() {
+                out.extend(c.to_uppercase());
+            }
+            if let Some(c) = second.chars().next() {
+                out.extend(c.to_uppercase());
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push('?');
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::initials_of;
+
+    #[test]
+    fn initials_two_tokens() {
+        assert_eq!(initials_of("Goran Jovanov"), "GJ");
+        assert_eq!(initials_of("goran jovanov"), "GJ");
+    }
+
+    #[test]
+    fn initials_separators() {
+        assert_eq!(initials_of("goran.jovanov"), "GJ");
+        assert_eq!(initials_of("goran_jovanov"), "GJ");
+        assert_eq!(initials_of("goran-jovanov"), "GJ");
+    }
+
+    #[test]
+    fn initials_single_token() {
+        assert_eq!(initials_of("gjovanov"), "GJ");
+        assert_eq!(initials_of("alice"), "AL");
+        assert_eq!(initials_of("x"), "X");
+    }
+
+    #[test]
+    fn initials_three_tokens_uses_first_two() {
+        assert_eq!(initials_of("Jean Luc Picard"), "JL");
+    }
+
+    #[test]
+    fn initials_empty_is_placeholder() {
+        assert_eq!(initials_of(""), "?");
+        assert_eq!(initials_of("   "), "?");
+    }
 }
