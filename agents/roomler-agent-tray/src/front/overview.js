@@ -56,6 +56,7 @@
       setText('ov-link', 'service offline');
       setText('ov-daemon-version', '—');
       setText('ov-ip', '—');
+      paintDns(null);
       paintCounts(dv);
       return;
     }
@@ -72,7 +73,31 @@
         : '(no overlay IP)',
     );
     paintExit(st.exit_node);
+    paintDns(st.dns);
     paintCounts(dv);
+  }
+
+  // S2 — MagicDNS status: hidden unless the overlay publishes a magic
+  // domain; the two failure states (resolver down / OS steer failed) are
+  // spelled out so name-resolution complaints never need log spelunking.
+  function paintDns(dns) {
+    const label = $('ov-dns-label');
+    const dd = $('ov-dns');
+    if (!label || !dd) return;
+    if (!dns) {
+      label.hidden = true;
+      dd.hidden = true;
+      return;
+    }
+    label.hidden = false;
+    dd.hidden = false;
+    const health = !dns.resolver_bound
+      ? 'resolver DOWN'
+      : !dns.os_steer_active
+        ? 'OS steer failed'
+        : 'active';
+    dd.textContent =
+      dns.magic_domain + ' · ' + health + (dns.answer_aaaa ? '' : ' · AAAA off');
   }
 
   function paintCounts(dv) {
