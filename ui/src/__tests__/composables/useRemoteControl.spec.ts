@@ -49,6 +49,16 @@ import {
   decideKeyAction,
   RC_RECONNECT_LADDER_MS,
   nextReconnectDelayMs,
+  RC_PC_DISCONNECTED_GRACE_MS,
+  RC_SIGNALING_TIMEOUT_MS,
+  RC_WATCHDOG_TICK_MS,
+  RC_STALL_PROBE_TICKS,
+  RC_STALL_FAIL_TICKS,
+  isRetryableTerminateReason,
+  isRetryableRcErrorCode,
+  sessionGateAllows,
+  nextStallAction,
+  classifyDegraded,
   nextDirPath,
   parseControlInbound,
   layoutSetWireMessage,
@@ -2885,5 +2895,150 @@ describe('remoteCursorCssFor', () => {
   it('returns null when the shape for the current id is not cached yet', () => {
     const state = { pos: { x: 0, y: 0, id: 9 }, shapes: new Map() }
     expect(remoteCursorCssFor(state)).toBeNull()
+  })
+})
+
+// ─── S3 viewer resilience — decision-table locks ────────────────────
+//
+// The reconnect machinery itself lives inside the composable (needs a
+// live WS store + PeerConnection), but every DECISION it takes routes
+// through the pure helpers below. Locking the tables locks the
+// behaviour: which endings auto-reconnect, which signalling errors
+// advance the ladder vs kill it, which messages a stale session may
+// still deliver, and when a flat frame counter probes vs re-creates.
+
+describe('S3 resilience: isRetryableTerminateReason', () => {
+  it('auto-reconnects on involuntary endings only', () => {
+    expect(isRetryableTerminateReason('agent_disconnect')).toBe(true)
+    expect(isRetryableTerminateReason('error')).toBe(true)
+  })
+
+  it('stays terminal on every deliberate ending', () => {
+    for (const r of [
+      'controller_hangup',
+      'agent_hangup',
+      'user_denied',
+      'consent_timeout',
+      'admin_terminated',
+      'idle_timeout',
+    ]) {
+      expect(isRetryableTerminateReason(r)).toBe(false)
+    }
+  })
+
+  it('treats unknown/missing reasons as terminal (fail-safe)', () => {
+    expect(isRetryableTerminateReason(undefined)).toBe(false)
+    expect(isRetryableTerminateReason(null)).toBe(false)
+    expect(isRetryableTerminateReason('')).toBe(false)
+    expect(isRetryableTerminateReason('some_future_reason')).toBe(false)
+  })
+})
+
+describe('S3 resilience: isRetryableRcErrorCode', () => {
+  it('advances the ladder on the three mid-reconnect transients', () => {
+    expect(isRetryableRcErrorCode('agent_busy')).toBe(true)
+    expect(isRetryableRcErrorCode('agent_offline')).toBe(true)
+    expect(isRetryableRcErrorCode('session_not_found')).toBe(true)
+  })
+
+  it('fails fast on everything else', () => {
+    expect(isRetryableRcErrorCode('forbidden')).toBe(false)
+    expect(isRetryableRcErrorCode('invalid_token')).toBe(false)
+    expect(isRetryableRcErrorCode(undefined)).toBe(false)
+    expect(isRetryableRcErrorCode('')).toBe(false)
+  })
+})
+
+describe('S3 resilience: sessionGateAllows', () => {
+  it('accepts messages carrying the current session id', () => {
+    expect(sessionGateAllows('abc123', 'abc123')).toBe(true)
+  })
+
+  it('drops messages from a different (stale) session', () => {
+    expect(sessionGateAllows('old111', 'new222')).toBe(false)
+  })
+
+  it('drops session-scoped messages when no session is active', () => {
+    expect(sessionGateAllows('abc123', null)).toBe(false)
+  })
+
+  it('passes messages without a session id (pre-session errors)', () => {
+    expect(sessionGateAllows(null, 'abc123')).toBe(true)
+    expect(sessionGateAllows(undefined, null)).toBe(true)
+    expect(sessionGateAllows('', 'abc123')).toBe(true)
+  })
+
+  it('never matches non-string ids', () => {
+    expect(sessionGateAllows(123 as unknown, '123')).toBe(true) // non-string → treated as absent
+  })
+})
+
+describe('S3 resilience: nextStallAction', () => {
+  it('does nothing below the probe threshold', () => {
+    for (let t = 0; t < RC_STALL_PROBE_TICKS; t++) {
+      expect(nextStallAction(t)).toBe('none')
+    }
+  })
+
+  it('probes exactly ONCE, at the probe threshold', () => {
+    expect(nextStallAction(RC_STALL_PROBE_TICKS)).toBe('probe')
+    // Between probe and fail: waiting for the IDR, no re-probe spam.
+    for (let t = RC_STALL_PROBE_TICKS + 1; t < RC_STALL_FAIL_TICKS; t++) {
+      expect(nextStallAction(t)).toBe('none')
+    }
+  })
+
+  it('re-creates the session once the probe goes unanswered', () => {
+    expect(nextStallAction(RC_STALL_FAIL_TICKS)).toBe('reconnect')
+    expect(nextStallAction(RC_STALL_FAIL_TICKS + 5)).toBe('reconnect')
+  })
+
+  it('keeps a real grace window between probe and fail', () => {
+    // A live agent needs time to answer the keyframe probe before we
+    // declare the pipe dead — at least 2 ticks.
+    expect(RC_STALL_FAIL_TICKS - RC_STALL_PROBE_TICKS).toBeGreaterThanOrEqual(2)
+  })
+})
+
+describe('S3 resilience: classifyDegraded', () => {
+  const healthy = { pcState: 'connected', wsConnected: true, stallTicks: 0 }
+
+  it('is null while fully healthy', () => {
+    expect(classifyDegraded(healthy)).toBeNull()
+  })
+
+  it('ranks transport instability above everything', () => {
+    expect(
+      classifyDegraded({ pcState: 'disconnected', wsConnected: false, stallTicks: 99 }),
+    ).toBe('transport_unstable')
+  })
+
+  it('reports a media stall only once the probe threshold is reached', () => {
+    expect(classifyDegraded({ ...healthy, stallTicks: RC_STALL_PROBE_TICKS - 1 })).toBeNull()
+    expect(classifyDegraded({ ...healthy, stallTicks: RC_STALL_PROBE_TICKS })).toBe('media_stalled')
+  })
+
+  it('reports signalling-offline as the lowest-priority reason', () => {
+    expect(classifyDegraded({ ...healthy, wsConnected: false })).toBe('signalling_offline')
+    expect(
+      classifyDegraded({ pcState: 'connected', wsConnected: false, stallTicks: RC_STALL_PROBE_TICKS }),
+    ).toBe('media_stalled')
+  })
+})
+
+describe('S3 resilience: timing constants', () => {
+  it('keeps the pc-disconnected fuse longer than a normal ICE flap', () => {
+    // ICE flaps resolve in ~1-2 s; anything shorter than 3 s would
+    // false-positive on every desktop transition.
+    expect(RC_PC_DISCONNECTED_GRACE_MS).toBeGreaterThanOrEqual(3000)
+    expect(RC_PC_DISCONNECTED_GRACE_MS).toBeLessThanOrEqual(8000)
+  })
+
+  it('gives signalling more headroom than the whole reconnect first-step ladder', () => {
+    expect(RC_SIGNALING_TIMEOUT_MS).toBeGreaterThanOrEqual(10_000)
+  })
+
+  it('watchdog cadence stays at 1 Hz so tick counts read as seconds', () => {
+    expect(RC_WATCHDOG_TICK_MS).toBe(1000)
   })
 })
