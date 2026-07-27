@@ -167,6 +167,19 @@ describe('useNotificationStore', () => {
       store.addFromWs(makeNotification({ id: 'n1', is_read: true }))
       expect(store.unreadCount).toBe(0)
     })
+
+    it('should drop duplicate deliveries of the same notification id', () => {
+      const store = useNotificationStore()
+      store.notifications = []
+      store.unreadCount = 0
+
+      const notif = makeNotification({ id: 'n1', is_read: false })
+      store.addFromWs(notif)
+      store.addFromWs(makeNotification({ id: 'n1', is_read: false }))
+
+      expect(store.notifications.length).toBe(1)
+      expect(store.unreadCount).toBe(1)
+    })
   })
 
   describe('setUnreadCount', () => {

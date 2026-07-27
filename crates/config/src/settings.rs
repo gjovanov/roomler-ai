@@ -97,6 +97,13 @@ pub struct RedisSettings {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct S3Settings {
+    /// Opt-in switch for the S3/MinIO file backend. The other `s3.*`
+    /// fields have always had localhost-MinIO defaults, so their mere
+    /// presence can't signal intent — without this flag uploads stay on
+    /// the local-disk backend (pod-ephemeral in k8s). Prod sets
+    /// `ROOMLER__S3__ENABLED=true`.
+    #[serde(default)]
+    pub enabled: bool,
     pub endpoint: String,
     pub access_key: String,
     pub secret_key: String,
@@ -202,6 +209,7 @@ impl Settings {
             .set_default("jwt.refresh_token_ttl_secs", 2_592_000)?
             .set_default("jwt.issuer", "roomler-ai")?
             .set_default("redis.url", "redis://127.0.0.1:6379")?
+            .set_default("s3.enabled", false)?
             .set_default("s3.endpoint", "http://localhost:9000")?
             .set_default("s3.access_key", "minioadmin")?
             .set_default("s3.secret_key", "minioadmin")?
