@@ -1,7 +1,7 @@
 <template>
   <v-card>
     <v-card-title class="d-flex align-center">
-      <span>Tunnel Clients</span>
+      <span>Tunnel clients</span>
       <v-spacer />
       <v-btn
         prepend-icon="mdi-key-plus"
@@ -10,7 +10,7 @@
         size="small"
         @click="openEnrollDialog"
       >
-        Issue enrollment token
+        Enroll tunnel client
       </v-btn>
     </v-card-title>
 
@@ -27,9 +27,9 @@
       </v-alert>
 
       <p v-if="!store.loading && store.clients.length === 0" class="text-medium-emphasis">
-        No tunnel clients enrolled yet. Issue an enrollment token and run
-        <code>roomler-tunnel enroll&nbsp;--server&nbsp;…&nbsp;--token&nbsp;…&nbsp;--name&nbsp;"My laptop"</code>
-        on the laptop you want to enroll.
+        No tunnel clients enrolled yet. Click "Enroll tunnel client" for a
+        one-line installer per platform — the laptop appears here as soon as
+        it enrolls.
       </p>
 
       <div
@@ -75,54 +75,25 @@
       </v-table>
     </v-card-text>
 
-    <!-- Issue-enrollment-token dialog. The token is displayed once;
-         we never persist or re-show it (single-use, 10 min TTL). -->
-    <v-dialog v-model="enrollDialog" max-width="640">
-      <v-card>
-        <v-card-title>Enrollment token</v-card-title>
-        <v-card-text>
-          <v-alert v-if="issuing" type="info" variant="tonal" class="mb-4">
-            Generating…
-          </v-alert>
-          <template v-else-if="issuedToken">
-            <p class="mb-2">
-              Paste this command on the laptop that should be enrolled. The
-              token expires in {{ Math.round(issuedToken.expires_in / 60) }} minutes
-              and may only be used once.
-            </p>
-            <v-textarea
-              :model-value="enrollCommand"
-              readonly
-              variant="outlined"
-              rows="3"
-              class="mb-2"
-              auto-grow
-            />
-            <v-btn
-              prepend-icon="mdi-content-copy"
-              size="small"
-              variant="tonal"
-              @click="copyCommand"
-            >
-              Copy command
-            </v-btn>
-          </template>
-          <v-alert v-else-if="issueError" type="error" variant="tonal">
-            {{ issueError }}
-          </v-alert>
-        </v-card-text>
-        <v-card-actions>
-          <v-spacer />
-          <v-btn @click="enrollDialog = false">Close</v-btn>
-        </v-card-actions>
-      </v-card>
-    </v-dialog>
+    <!-- S4 — unified enrollment dialog (token + per-OS install commands
+         derived from THIS origin; the old dialog hardcoded the prod URL
+         and the retired roomler-tunnel binary name). -->
+    <EnrollmentDialog
+      :model-value="enrollDialog"
+      kind="tunnel"
+      :token="issuedToken?.enrollment_token ?? null"
+      :expires-in="issuedToken?.expires_in ?? null"
+      :loading="issuing"
+      :error="issueError"
+      @update:model-value="(v: boolean) => { if (!v) closeEnrollDialog() }"
+    />
   </v-card>
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { onMounted, ref } from 'vue'
 import { useTunnelClientStore, type TunnelEnrollmentToken } from '@/stores/tunnelClients'
+import EnrollmentDialog from '@/components/enroll/EnrollmentDialog.vue'
 
 const props = defineProps<{ tenantId: string }>()
 
@@ -132,11 +103,6 @@ const enrollDialog = ref(false)
 const issuing = ref(false)
 const issuedToken = ref<TunnelEnrollmentToken | null>(null)
 const issueError = ref<string | null>(null)
-
-const enrollCommand = computed(() => {
-  if (!issuedToken.value) return ''
-  return `roomler-tunnel enroll --server https://roomler.ai --token ${issuedToken.value.enrollment_token} --name "My laptop"`
-})
 
 async function openEnrollDialog() {
   enrollDialog.value = true
@@ -152,10 +118,9 @@ async function openEnrollDialog() {
   }
 }
 
-function copyCommand() {
-  navigator.clipboard.writeText(enrollCommand.value).catch(() => {
-    issueError.value = 'Could not copy to clipboard — select and copy manually.'
-  })
+function closeEnrollDialog() {
+  enrollDialog.value = false
+  issuedToken.value = null
 }
 
 function statusColor(status: string) {

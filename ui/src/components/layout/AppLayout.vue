@@ -27,21 +27,58 @@
 
       <v-divider />
 
-      <!-- Navigation -->
-      <v-list density="compact" nav>
+      <!-- Navigation — S4 pivot IA: fleet first (Devices), then the
+           overlay/tunnel Network group, then collaboration (Rooms), with
+           the Admin residue last. Two-level via v-list-group; leaf items
+           are real routes. -->
+      <v-list v-if="tenantId" v-model:opened="openGroups" density="compact" nav>
         <v-list-item
-          v-for="item in navItems"
-          :key="item.to"
-          :to="item.to"
-          :prepend-icon="item.icon"
-          :title="item.title"
+          :to="`/tenant/${tenantId}`"
+          prepend-icon="mdi-view-dashboard"
+          :title="$t('nav.dashboard')"
+          exact
         />
+        <v-list-item
+          :to="`/tenant/${tenantId}/devices`"
+          prepend-icon="mdi-monitor-multiple"
+          :title="$t('nav.devices')"
+        />
+        <v-list-group value="network">
+          <template #activator="{ props: groupProps }">
+            <v-list-item v-bind="groupProps" prepend-icon="mdi-lan" :title="$t('nav.network')" />
+          </template>
+          <v-list-item :to="`/tenant/${tenantId}/network/machines`" prepend-icon="mdi-server-network" :title="$t('nav.machines')" />
+          <v-list-item :to="`/tenant/${tenantId}/network/tunnel-clients`" prepend-icon="mdi-tunnel" :title="$t('nav.tunnelClients')" />
+          <v-list-item :to="`/tenant/${tenantId}/network/acl`" prepend-icon="mdi-shield-key" :title="$t('nav.tunnelAcl')" />
+          <v-list-item :to="`/tenant/${tenantId}/network/subnet-routes`" prepend-icon="mdi-lan-connect" :title="$t('nav.subnetRoutes')" />
+          <v-list-item :to="`/tenant/${tenantId}/network/dns`" prepend-icon="mdi-dns" :title="$t('nav.magicDns')" />
+        </v-list-group>
+        <v-list-group value="rooms">
+          <template #activator="{ props: groupProps }">
+            <v-list-item v-bind="groupProps" prepend-icon="mdi-forum" :title="$t('nav.collaboration')" />
+          </template>
+          <v-list-item :to="`/tenant/${tenantId}/rooms`" prepend-icon="mdi-pound" :title="$t('nav.rooms')" />
+          <v-list-item :to="`/tenant/${tenantId}/explore`" prepend-icon="mdi-compass" :title="$t('nav.explore')" />
+          <v-list-item :to="`/tenant/${tenantId}/files`" prepend-icon="mdi-folder" :title="$t('nav.files')" />
+          <v-list-item :to="`/tenant/${tenantId}/invites`" prepend-icon="mdi-account-plus" :title="$t('nav.invites')" />
+        </v-list-group>
+        <v-list-group value="admin">
+          <template #activator="{ props: groupProps }">
+            <v-list-item v-bind="groupProps" prepend-icon="mdi-cog" :title="$t('nav.admin')" />
+          </template>
+          <v-list-item :to="`/tenant/${tenantId}/admin/settings`" prepend-icon="mdi-tune" :title="$t('nav.settings')" />
+          <v-list-item :to="`/tenant/${tenantId}/admin/members`" prepend-icon="mdi-account-group" :title="$t('nav.members')" />
+          <v-list-item :to="`/tenant/${tenantId}/admin/roles`" prepend-icon="mdi-shield-account" :title="$t('nav.roles')" />
+          <v-list-item :to="`/tenant/${tenantId}/admin/tasks`" prepend-icon="mdi-progress-clock" :title="$t('nav.tasks')" />
+          <v-list-item :to="`/tenant/${tenantId}/admin/audit-log`" prepend-icon="mdi-clipboard-text-clock" :title="$t('nav.auditLog')" />
+          <v-list-item :to="`/tenant/${tenantId}/billing`" prepend-icon="mdi-credit-card" :title="$t('nav.billing')" />
+        </v-list-group>
       </v-list>
 
       <!-- Rooms with unread badges -->
       <v-divider v-if="!rail && roomStore.rooms.length > 0" />
       <v-list v-if="!rail && roomStore.rooms.length > 0" density="compact" nav>
-        <v-list-subheader>Rooms</v-list-subheader>
+        <v-list-subheader>Your rooms</v-list-subheader>
         <v-list-item
           v-for="room in roomStore.rooms"
           :key="room.id"
@@ -275,6 +312,9 @@ function returnToCall() {
 // drawer covering the page until they explicitly close it.
 const drawer = ref(!mobile.value)
 const rail = ref(false)
+// S4 nav groups — Collaboration starts open (the day-to-day pages);
+// Network/Admin start collapsed. The user's toggles win afterwards.
+const openGroups = ref<string[]>(['rooms'])
 const showNotifications = ref(false)
 const showSearch = ref(false)
 
@@ -306,19 +346,6 @@ function joinCallFromSnackbar() {
 }
 
 const tenantId = computed(() => tenantStore.current?.id || '')
-
-const navItems = computed(() => {
-  if (!tenantId.value) return []
-  const base = `/tenant/${tenantId.value}`
-  return [
-    { icon: 'mdi-view-dashboard', title: 'Dashboard', to: base },
-    { icon: 'mdi-pound', title: 'Rooms', to: `${base}/rooms` },
-    { icon: 'mdi-compass', title: 'Explore', to: `${base}/explore` },
-    { icon: 'mdi-folder', title: 'Files', to: `${base}/files` },
-    { icon: 'mdi-account-plus', title: 'Invites', to: `${base}/invites` },
-    { icon: 'mdi-credit-card', title: 'Billing', to: `${base}/billing` },
-  ]
-})
 
 const settingsRoute = computed(() =>
   tenantId.value ? `/tenant/${tenantId.value}/admin` : '/',
