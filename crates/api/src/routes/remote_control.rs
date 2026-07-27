@@ -348,7 +348,10 @@ pub async fn trigger_agent_update(
     State(state): State<AppState>,
     auth: AuthUser,
     Path((tenant_id, agent_id)): Path<(String, String)>,
-    body: Option<Json<TriggerUpdateRequest>>,
+    // Body is required (send `{}` for defaults) — plain `Json` keeps us off
+    // axum 0.8's `OptionalFromRequest` surface, which the codebase doesn't
+    // use anywhere else.
+    Json(body): Json<TriggerUpdateRequest>,
 ) -> Result<Json<TriggerUpdateResult>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
@@ -367,7 +370,7 @@ pub async fn trigger_agent_update(
     // Tenant-scope the target (404 for a foreign agent id).
     let _ = state.agents.find_in_tenant(tid, aid).await?;
 
-    let pin = body.and_then(|Json(b)| b.pin);
+    let pin = body.pin;
     let delivered = state
         .rc_hub
         .send_to_agent(
@@ -409,7 +412,7 @@ pub async fn trigger_agents_update(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
-    body: Option<Json<BulkTriggerUpdateRequest>>,
+    Json(body): Json<BulkTriggerUpdateRequest>,
 ) -> Result<Json<BulkTriggerUpdateResponse>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
@@ -423,7 +426,6 @@ pub async fn trigger_agents_update(
     )
     .await?;
 
-    let Json(body) = body.unwrap_or_default();
     let target_ids: Vec<ObjectId> = match body.agent_ids {
         Some(ids) if !ids.is_empty() => {
             let mut out = Vec::with_capacity(ids.len());
