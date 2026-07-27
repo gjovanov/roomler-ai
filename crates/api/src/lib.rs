@@ -190,11 +190,14 @@ pub fn build_router(state: AppState) -> Router {
         .route("/callback/{provider}", get(routes::oauth::oauth_callback));
 
     // Stripe routes
+    // S5 — the webhook route is NOT here: Stripe's retry bursts must
+    // never hit the per-IP governor (a 429'd delivery marks the endpoint
+    // failing on their side). It's mounted un-governed in the outer
+    // router below; its own HMAC signature check is the auth.
     let stripe_routes = Router::new()
         .route("/plans", get(routes::stripe::get_plans))
         .route("/checkout", post(routes::stripe::create_checkout))
-        .route("/portal", post(routes::stripe::create_portal))
-        .route("/webhook", post(routes::stripe::webhook));
+        .route("/portal", post(routes::stripe::create_portal));
 
     // Giphy proxy routes
     let giphy_routes = Router::new()
@@ -467,6 +470,10 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .merge(rate_limited_api)
         .merge(health)
+        // S5 — Stripe webhook outside the governor (signature-authed;
+        // retry bursts from Stripe's fixed IPs would trip the per-IP
+        // limiter and mark the endpoint failing on their dashboard).
+        .route("/api/stripe/webhook", post(routes::stripe::webhook))
         .route("/ws", get(ws::handler::ws_upgrade))
         .route("/derp", get(ws::derp::derp_upgrade))
         .layer(TraceLayer::new_for_http())
