@@ -469,7 +469,9 @@ fn config_set_blocking(
 /// S7 — the embedded web window's label. The main tray window keeps its
 /// close-to-hide behavior; a window with THIS label is destroyed on
 /// close (see `main.rs`) so it never lingers as a hidden WebView2
-/// process holding memory.
+/// process holding memory. Windows-only, like [`open_web_window`] — the
+/// other platforms open the default browser instead.
+#[cfg(windows)]
 pub const WEB_WINDOW_LABEL: &str = "roomler-web";
 
 /// S7 — open (or focus + navigate) the embedded WebView2 window on the
@@ -477,6 +479,7 @@ pub const WEB_WINDOW_LABEL: &str = "roomler-web";
 /// outside the app's capability set — the page gets no `__TAURI__` IPC,
 /// it's a plain Chromium view; sign-in persists in the webview profile
 /// between opens.
+#[cfg(windows)]
 pub fn open_web_window<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     url: &str,
