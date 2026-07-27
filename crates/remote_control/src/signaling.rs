@@ -835,6 +835,22 @@ pub enum ServerMsg {
         message: String,
     },
 
+    /// S1a — operator-triggered forced self-update ("Update now" in the
+    /// admin UI, single or bulk). The agent runs one update cycle
+    /// immediately — the same download/verify/install path as its
+    /// periodic updater, still honouring the 5-min install-storm
+    /// cooldown. Back-compat mirrors `Goodbye`: pre-S1a agents fail to
+    /// decode the unknown tag in their `Err(e) => debug!` decoder branch
+    /// and ignore it — no WS disruption.
+    #[serde(rename = "rc:agent.update")]
+    UpdateNow {
+        /// Optional release tag to install (e.g. `agent-v0.3.0-rc.260`);
+        /// `None` = latest. Pinning bypasses the is-newer check (the
+        /// admin explicitly chose a version).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pin: Option<String>,
+    },
+
     // ─── server → tunnel-client / agent (rc:tunnel.*) ────────────────
     /// Server → client: peer-channel is up. `dc_pool_size` confirms
     /// the negotiated DC pool size (8 in v1) so the client knows
@@ -2275,6 +2291,32 @@ mod tests {
                 assert_eq!(ttl_ms, 1_800_000);
             }
             other => panic!("expected OverlayForceDerp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_update_now_roundtrip() {
+        // pin omitted entirely when None (wire-compat lock: old servers /
+        // agents never see a null field).
+        let m = ServerMsg::UpdateNow { pin: None };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(r#""t":"rc:agent.update""#));
+        assert!(!s.contains("pin"), "pin must be omitted when None: {s}");
+        match serde_json::from_str::<ServerMsg>(&s).unwrap() {
+            ServerMsg::UpdateNow { pin } => assert_eq!(pin, None),
+            other => panic!("expected UpdateNow, got {other:?}"),
+        }
+
+        let m = ServerMsg::UpdateNow {
+            pin: Some("agent-v0.3.0-rc.260".to_string()),
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(r#""pin":"agent-v0.3.0-rc.260""#));
+        match serde_json::from_str::<ServerMsg>(&s).unwrap() {
+            ServerMsg::UpdateNow { pin } => {
+                assert_eq!(pin.as_deref(), Some("agent-v0.3.0-rc.260"))
+            }
+            other => panic!("expected UpdateNow, got {other:?}"),
         }
     }
 

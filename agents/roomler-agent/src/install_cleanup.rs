@@ -200,6 +200,12 @@ const INSTALL_DIR_PRODUCT_FILES: &[&str] = &[
     "roomler-agent.exe",
     "roomler.exe",
     "roomler-tunnel.exe",
+    // S1a — the desktop companion + its refresh sidecars live beside the
+    // daemon (placed by the wizard / companion-refresh, not the MSI);
+    // without these entries the vacated-dir sweep strands a stale copy.
+    "roomler-desktop.exe",
+    "roomler-desktop.exe.version",
+    "roomler-desktop.exe.old",
     "wintun.dll",
     "LICENSE.txt",
     "README.txt",

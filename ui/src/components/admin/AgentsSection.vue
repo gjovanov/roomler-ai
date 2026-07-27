@@ -4,6 +4,16 @@
       <span>Remote-Control Agents</span>
       <v-spacer />
       <v-btn
+        prepend-icon="mdi-update"
+        variant="tonal"
+        size="small"
+        class="mr-2 d-none d-sm-inline-flex"
+        :disabled="agentStore.agents.length === 0"
+        @click="updateAllDialogOpen = true"
+      >
+        Update all
+      </v-btn>
+      <v-btn
         prepend-icon="mdi-key-plus"
         color="primary"
         variant="flat"
@@ -24,6 +34,18 @@
         class="mb-4"
       >
         {{ agentStore.error }}
+      </v-alert>
+
+      <!-- S1a — forced-update feedback (delivered / offline counts). -->
+      <v-alert
+        v-if="updateNotice"
+        type="info"
+        variant="tonal"
+        closable
+        @click:close="updateNotice = null"
+        class="mb-4"
+      >
+        {{ updateNotice }}
       </v-alert>
 
       <div
@@ -66,6 +88,17 @@
                 :disabled="!a.is_online"
                 :to="{ name: 'agent-remote', params: { tenantId, agentId: a.id } }"
                 :aria-label="`Connect to agent ${a.name}`"
+              />
+              <v-btn
+                icon="mdi-update"
+                size="small"
+                variant="text"
+                color="primary"
+                :disabled="updateBusy === a.id"
+                :loading="updateBusy === a.id"
+                @click="triggerUpdate(a)"
+                :aria-label="`Update agent ${a.name} now`"
+                title="Update agent now"
               />
               <v-btn
                 icon="mdi-alert-circle-outline"
@@ -244,6 +277,18 @@
                 :aria-label="`Copy agent ID for ${a.name}`"
                 :title="copiedAgentId === a.id ? 'Copied!' : 'Copy agent ID'"
               />
+              <v-btn
+                icon="mdi-update"
+                size="x-small"
+                variant="text"
+                color="primary"
+                class="ml-1"
+                :disabled="updateBusy === a.id"
+                :loading="updateBusy === a.id"
+                @click="triggerUpdate(a)"
+                :aria-label="`Update agent ${a.name} now`"
+                title="Update agent now"
+              />
               <v-spacer />
               <v-chip size="x-small" :color="statusColor(a)" variant="flat">
                 {{ a.is_online ? 'Online' : a.status }}
@@ -417,6 +462,28 @@
     :agent-id="logsTarget?.id ?? ''"
     :agent-name="logsTarget?.name ?? ''"
   />
+
+  <!-- S1a — Update-all confirmation -->
+  <v-dialog v-model="updateAllDialogOpen" max-width="480">
+    <v-card>
+      <v-card-title>Update all agents?</v-card-title>
+      <v-card-text>
+        Pushes an immediate self-update to every agent in this tenant
+        ({{ agentStore.agents.length }} total,
+        {{ agentStore.agents.filter((a) => a.is_online).length }} online).
+        Each agent downloads the latest release, installs it, and restarts —
+        active remote-control sessions on updating agents will drop for a few
+        seconds. Offline agents update on their next periodic check.
+      </v-card-text>
+      <v-card-actions>
+        <v-spacer />
+        <v-btn variant="text" @click="updateAllDialogOpen = false">Cancel</v-btn>
+        <v-btn color="primary" variant="flat" @click="doUpdateAll" :loading="updatingAll">
+          Update all
+        </v-btn>
+      </v-card-actions>
+    </v-card>
+  </v-dialog>
 
   <!-- Delete confirmation -->
   <v-dialog v-model="deleteDialogOpen" max-width="440">
@@ -614,6 +681,42 @@ let copiedAgentIdTimer: ReturnType<typeof setTimeout> | null = null
 const deleteDialogOpen = ref(false)
 const deleteTarget = ref<Agent | null>(null)
 const deleting = ref(false)
+
+// S1a — operator-forced self-update. Per-row busy id + a transient
+// notice rendered in the info alert at the top of the card.
+const updateBusy = ref<string | null>(null)
+const updateNotice = ref<string | null>(null)
+const updateAllDialogOpen = ref(false)
+const updatingAll = ref(false)
+
+async function triggerUpdate(a: Agent) {
+  updateBusy.value = a.id
+  try {
+    const delivered = await agentStore.triggerUpdate(props.tenantId, a.id)
+    updateNotice.value = delivered
+      ? `Update pushed to ${a.name} — it will download, install, and restart shortly.`
+      : `${a.name} is offline — it will update on its next periodic check instead.`
+  } catch (e) {
+    agentStore.error = (e as Error).message
+  } finally {
+    updateBusy.value = null
+  }
+}
+
+async function doUpdateAll() {
+  updatingAll.value = true
+  try {
+    const res = await agentStore.triggerUpdateAll(props.tenantId)
+    updateNotice.value =
+      `Update pushed to ${res.delivered} of ${res.requested} agents — ` +
+      `offline agents update on their next periodic check.`
+    updateAllDialogOpen.value = false
+  } catch (e) {
+    agentStore.error = (e as Error).message
+  } finally {
+    updatingAll.value = false
+  }
+}
 
 // Crash-reports modal state (Task 9 Phase 3). Re-fetches on open via
 // the dialog's own watcher; no caching here.
