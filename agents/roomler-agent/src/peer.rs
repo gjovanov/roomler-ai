@@ -1156,7 +1156,7 @@ async fn detect_constrained_transport(
                 remote_addr = %format!("{}:{}", remote.address, remote.port),
                 "per-session ICE path detected (adaptive bitrate)"
             );
-            return relay;
+            return relay || overlay_remote_is_relay_tier(&remote.address, session_id).await;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -1267,6 +1267,7 @@ async fn current_pair_is_relay(
         && !crate::encode::relay_addr_is_fast_local(&local.address))
         || (remote.typ == RTCIceCandidateType::Relay
             && !crate::encode::relay_addr_is_fast_local(&remote.address));
+    let relay = relay || overlay_remote_is_relay_tier(&remote.address, session_id).await;
     if relay != previous {
         info!(
             %session_id,
@@ -1279,6 +1280,86 @@ async fn current_pair_is_relay(
         );
     }
     Some(relay)
+}
+
+/// Overlay-aware constrained detection (2026-07-27, WINHOST-C field): a
+/// nominated pair whose REMOTE lives on the overlay is only as good as the
+/// overlay CARRIER underneath it. A relay-tier carrier (coturn / DERP) has
+/// WAN RTT + churn but masquerades as a "direct" host↔host pair — the pump
+/// then firehoses unclamped into a relay pipe and collapses (live capture:
+/// 821 kbps / 17 fps with 1.5–7.5 s decode stalls). This also closes the same
+/// blind spot in the loopback-TURN fast-local exemption: a local-relay pair
+/// still EGRESSES over the overlay carrier, so it must clamp when that
+/// carrier is relay-tier.
+///
+/// Asks the local daemon over LocalAPI (`Request::Peers`, the `roomler peers`
+/// verb) which tier currently carries the peer that owns the remote address.
+/// Anything other than a live `Direct` carrier counts as constrained —
+/// `Relay`/`Tunnel` are capped paths, `Blocked`/`Offline` mean the carrier is
+/// mid-churn (the media pair is about to feel it).
+///
+/// Fail-OPEN by design: hatch off, non-overlay remote, daemon unreachable,
+/// peer unknown, or a slow pipe (>400 ms) → `false`, i.e. exactly today's
+/// behaviour — a broken LocalAPI can never degrade a healthy direct session.
+/// Escape hatch: `ROOMLER_AGENT_OVERLAY_TIER_DETECT=0`.
+#[cfg(any(feature = "vp9-444", feature = "ffmpeg-encoder"))]
+async fn overlay_remote_is_relay_tier(remote_addr: &str, session_id: bson::oid::ObjectId) -> bool {
+    use tunnel_core::localapi::ConnectionType;
+
+    if std::env::var("ROOMLER_AGENT_OVERLAY_TIER_DETECT").as_deref() == Ok("0") {
+        return false;
+    }
+    if !addr_is_overlay_range(remote_addr) {
+        return false;
+    }
+    let query = async {
+        let mut client = tunnel_core::localapi::connect().await.ok()?;
+        let peers = client.peers().await.ok()?;
+        peers.into_iter().find(|p| {
+            p.overlay_ip.as_deref() == Some(remote_addr)
+                || p.overlay_ip6.as_deref() == Some(remote_addr)
+        })
+    };
+    match tokio::time::timeout(Duration::from_millis(400), query).await {
+        Ok(Some(peer)) => {
+            let constrained = !matches!(peer.connection, ConnectionType::Direct);
+            if constrained {
+                info!(
+                    %session_id,
+                    peer = %peer.name,
+                    carrier = ?peer.connection,
+                    upgrading = peer.upgrading,
+                    rtt_ms = ?peer.rtt_ms,
+                    "overlay carrier under the nominated pair is not direct — treating transport as constrained"
+                );
+            }
+            constrained
+        }
+        // Peer unknown / daemon not running — nothing to learn, fail open.
+        Ok(None) => false,
+        // LocalAPI slower than the media pump can afford — fail open.
+        Err(_) => false,
+    }
+}
+
+/// True when an ICE candidate address string is inside the Roomler overlay
+/// ranges: CGNAT `100.64.0.0/10` (v4) or the mesh ULA `fd72:6f6f:6d6c::/48`
+/// (v6, the exact prefix the runtime derives peer v6 addresses from — NOT all
+/// of fc00::/7, so a user's own VPN ULA never triggers a daemon query).
+/// mDNS names and garbage don't parse → `false`.
+#[cfg(any(feature = "vp9-444", feature = "ffmpeg-encoder"))]
+fn addr_is_overlay_range(addr: &str) -> bool {
+    match addr.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => {
+            let o = v4.octets();
+            o[0] == 100 && (o[1] & 0b1100_0000) == 0b0100_0000
+        }
+        Ok(std::net::IpAddr::V6(v6)) => {
+            let s = v6.segments();
+            s[0] == 0xfd72 && s[1] == 0x6f6f && s[2] == 0x6d6c
+        }
+        Err(_) => false,
+    }
 }
 
 /// Per-session media pump. Captures frames, encodes to the negotiated
@@ -7877,5 +7958,39 @@ mod video_bytes_wire_tests {
         let out = frame_video_bytes(&[], true, 1);
         assert_eq!(out.len(), 13);
         assert_eq!(&out[0..4], &[0, 0, 0, 0]);
+    }
+}
+
+#[cfg(all(test, any(feature = "vp9-444", feature = "ffmpeg-encoder")))]
+mod overlay_tier_tests {
+    use super::*;
+
+    #[test]
+    fn overlay_range_matches_cgnat_v4_and_mesh_ula_only() {
+        // In range: the overlay CGNAT /10 and the exact mesh ULA /48.
+        assert!(addr_is_overlay_range("100.64.0.29"));
+        assert!(addr_is_overlay_range("100.127.255.254"));
+        assert!(addr_is_overlay_range("fd72:6f6f:6d6c::6440:1d"));
+        // Out of range: LAN, CGNAT neighbours, foreign ULA (fc00::/7 is NOT
+        // enough — only our /48 may trigger a daemon query), mDNS, garbage.
+        assert!(!addr_is_overlay_range("192.168.5.10"));
+        assert!(!addr_is_overlay_range("100.63.255.255"));
+        assert!(!addr_is_overlay_range("100.128.0.1"));
+        assert!(!addr_is_overlay_range("fd00:dead:beef::1"));
+        assert!(!addr_is_overlay_range("a1b2c3d4-e5f6.local"));
+        assert!(!addr_is_overlay_range(""));
+    }
+
+    #[tokio::test]
+    async fn tier_query_fails_open_for_non_overlay_remote_and_hatch() {
+        let sid = bson::oid::ObjectId::new();
+        // Non-overlay remote: must return false without touching LocalAPI.
+        assert!(!overlay_remote_is_relay_tier("203.0.113.9", sid).await);
+        // Escape hatch: overlay remote, detection disabled → false fast,
+        // no daemon required (this also keeps the test hermetic on hosts
+        // where a real daemon happens to be running).
+        std::env::set_var("ROOMLER_AGENT_OVERLAY_TIER_DETECT", "0");
+        assert!(!overlay_remote_is_relay_tier("100.64.0.29", sid).await);
+        std::env::remove_var("ROOMLER_AGENT_OVERLAY_TIER_DETECT");
     }
 }
