@@ -103,6 +103,14 @@ impl TunnelClientDao {
             .await
     }
 
+    /// S5 — active (non-tombstoned) tunnel clients in the tenant, for
+    /// the plan cap check at enrollment.
+    pub async fn count_active_for_tenant(&self, tenant_id: ObjectId) -> DaoResult<u64> {
+        self.base
+            .count(doc! { "tenant_id": tenant_id, "deleted_at": null })
+            .await
+    }
+
     pub async fn find_in_tenant(
         &self,
         tenant_id: ObjectId,
