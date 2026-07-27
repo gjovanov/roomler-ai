@@ -82,6 +82,16 @@ pub fn parse_xor_mapped_address(resp: &[u8]) -> Option<SocketAddr> {
 /// Response (source + transaction-id checked), and returns the de-XORed
 /// public `ip:port`. Retries a few times since STUN rides UDP. Run this
 /// on the SAME socket the QUIC endpoint will use so the mapping matches.
+///
+/// 2026-07-27 — foreign datagrams are DRAINED within the attempt budget,
+/// not charged as failures (the same shape [`srflx_query_via_sink`] always
+/// had). This socket is shared with the single-relay TURN dialer by design,
+/// and TURN responses are STUN-format with their own transaction ids: under
+/// relay churn a single `recv_from` per attempt read three foreign packets
+/// and gave up (`transaction-id mismatch` ×3) while the genuine reply sat
+/// unread — silently killing the srflx tier for the daemon lifetime (field
+/// NEO16 + DESKTOP-69T5HUD: every WAN peer relay-locked; raw STUN to the
+/// same workers answered in 40 ms).
 pub async fn srflx_query(
     socket: &UdpSocket,
     stun_server: SocketAddr,
@@ -97,25 +107,50 @@ pub async fn srflx_query(
             .context("stun: send binding request")?;
 
         let mut buf = [0u8; 512];
-        match tokio::time::timeout(attempt_timeout, socket.recv_from(&mut buf)).await {
-            Ok(Ok((n, from))) => {
-                if from != stun_server {
-                    last_err = format!("stun: reply from unexpected source {from}");
-                    continue;
-                }
-                let resp = &buf[..n];
-                // Confirm the transaction id echoes ours (bytes 8..20).
-                if resp.len() < 20 || resp[8..20] != txn_id {
-                    last_err = "stun: transaction-id mismatch".into();
-                    continue;
-                }
-                if let Some(srflx) = parse_xor_mapped_address(resp) {
-                    return Ok(srflx);
-                }
-                last_err = "stun: no XOR-MAPPED-ADDRESS in success response".into();
+        let deadline = tokio::time::Instant::now() + attempt_timeout;
+        // Foreign datagrams drained this attempt — surfaced in the timeout
+        // error so a churn-saturated socket is visible in the field log.
+        let mut foreign: u32 = 0;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                last_err =
+                    format!("stun: response timed out ({foreign} foreign datagrams drained)");
+                break;
             }
-            Ok(Err(e)) => last_err = format!("stun: recv error: {e}"),
-            Err(_) => last_err = "stun: response timed out".into(),
+            match tokio::time::timeout(remaining, socket.recv_from(&mut buf)).await {
+                Ok(Ok((n, from))) => {
+                    // Not our server — a WG/TURN/probe datagram on the shared
+                    // socket. Skip it and keep waiting within this attempt.
+                    if from != stun_server {
+                        foreign += 1;
+                        continue;
+                    }
+                    let resp = &buf[..n];
+                    // A different transaction (e.g. a TURN allocate response —
+                    // same server, same STUN wire format, different txn id).
+                    // Skip; ours may still be in flight.
+                    if resp.len() < 20 || resp[8..20] != txn_id {
+                        foreign += 1;
+                        continue;
+                    }
+                    if let Some(srflx) = parse_xor_mapped_address(resp) {
+                        return Ok(srflx);
+                    }
+                    // OUR transaction but no XOR-MAPPED-ADDRESS: a resend
+                    // won't parse differently — charge the attempt.
+                    last_err = "stun: no XOR-MAPPED-ADDRESS in success response".into();
+                    break;
+                }
+                Ok(Err(e)) => {
+                    last_err = format!("stun: recv error: {e}");
+                    break;
+                }
+                Err(_) => {
+                    last_err = "stun: response timed out".into();
+                    break;
+                }
+            }
         }
     }
     bail!("stun srflx query failed after 3 attempts: {last_err}")
@@ -276,6 +311,38 @@ mod tests {
         let srflx = srflx_query(&client, server_addr, Duration::from_secs(2))
             .await
             .expect("query must succeed against fake server");
+        assert_eq!(srflx, SocketAddr::from(([198, 51, 100, 7], 5000)));
+    }
+
+    /// The field bug (2026-07-27, NEO16/DESKTOP-69T5HUD WAN relay-lock): the
+    /// gather socket is shared with the TURN dialer, whose responses are
+    /// STUN-format with foreign transaction ids. One foreign datagram per
+    /// attempt used to consume the WHOLE attempt (three churn packets = dead
+    /// gather); they must be drained within the attempt budget instead.
+    #[tokio::test]
+    async fn srflx_query_drains_foreign_datagrams_within_the_attempt() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (_n, from) = server.recv_from(&mut buf).await.unwrap();
+            let txn: [u8; 12] = buf[8..20].try_into().unwrap();
+            // Three foreign STUN-shaped datagrams first — a TURN allocate
+            // response looks exactly like this from the demux's viewpoint:
+            // right server, right cookie, WRONG transaction id.
+            for _ in 0..3 {
+                let foreign = fake_success_response([0xEE; 12], [203, 0, 113, 9], 1234);
+                server.send_to(&foreign, from).await.unwrap();
+            }
+            // The genuine reply arrives after the churn burst.
+            let resp = fake_success_response(txn, [198, 51, 100, 7], 5000);
+            server.send_to(&resp, from).await.unwrap();
+        });
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let srflx = srflx_query(&client, server_addr, Duration::from_secs(2))
+            .await
+            .expect("foreign datagrams must not consume attempts");
         assert_eq!(srflx, SocketAddr::from(([198, 51, 100, 7], 5000)));
     }
 
