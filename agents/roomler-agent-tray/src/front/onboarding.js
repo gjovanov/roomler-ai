@@ -82,27 +82,87 @@
     el.appendChild(box);
   }
 
+  // S1b: whether the view is in re-enroll mode (device already enrolled).
+  // Re-enroll is a TOKEN refresh: server URL + device name are locked to
+  // the current enrollment and the daemon-honest `cmd_re_enroll` runs
+  // (targeting the config the daemon actually reads) — the old path ran a
+  // FULL fresh enroll into the per-user file, which on SCM installs
+  // manufactured the split-config the Settings banner warns about.
+  let enrolledMode = false;
+
+  function showReEnrolled() {
+    const el = resultSlot();
+    el.className = 'banner banner-ok';
+    const head = document.createElement('strong');
+    head.textContent = 'Re-enrolled — token refreshed.';
+    el.appendChild(head);
+    const actions = document.createElement('div');
+    actions.className = 'actions';
+    const done = document.createElement('button');
+    done.type = 'button';
+    done.textContent = 'Go to Overview';
+    done.addEventListener('click', () => navigate('overview'));
+    actions.appendChild(done);
+    el.appendChild(actions);
+  }
+
   document.addEventListener('DOMContentLoaded', () => {
     void prefillDeviceName();
 
-    // An already-enrolled device rarely wants this view — hint via the label.
     on('status', (s) => {
+      enrolledMode = !!s.enrolled;
       const btn = $('btn-enroll');
-      if (btn) btn.textContent = s.enrolled ? 'Re-enroll this device' : 'Enroll this device';
+      if (btn) btn.textContent = enrolledMode ? 'Re-enroll this device' : 'Enroll this device';
+      const note = $('onboard-reenroll-note');
+      if (note) note.hidden = !enrolledMode;
+      const server = $('server');
+      const name = $('device-name');
+      if (server) {
+        server.disabled = enrolledMode;
+        if (enrolledMode && s.server_url) server.value = s.server_url;
+      }
+      if (name) {
+        name.disabled = enrolledMode;
+        if (enrolledMode && s.device_name && !name.matches(':focus')) {
+          name.value = s.device_name;
+        }
+      }
     });
 
     $('enroll-form').addEventListener('submit', async (ev) => {
       ev.preventDefault();
+      const token = $('token').value.trim();
+      const btn = $('btn-enroll');
+      const label = btn.textContent;
+
+      if (enrolledMode) {
+        if (!token) {
+          showError('Paste a fresh enrollment token.');
+          return;
+        }
+        btn.disabled = true;
+        btn.textContent = 'Re-enrolling…';
+        try {
+          await invoke('cmd_re_enroll', { token });
+          $('token').value = '';
+          showReEnrolled();
+          void refreshStatus();
+        } catch (e) {
+          showError('Re-enrollment failed: ' + e);
+        } finally {
+          btn.disabled = false;
+          btn.textContent = label;
+        }
+        return;
+      }
+
       const server = $('server').value.trim();
       const deviceName = $('device-name').value.trim();
-      const token = $('token').value.trim();
       if (!server || !deviceName || !token) {
         showError('Fill all three fields.');
         return;
       }
-      const btn = $('btn-enroll');
       btn.disabled = true;
-      const label = btn.textContent;
       btn.textContent = 'Enrolling…';
       try {
         const s = await invoke('cmd_enroll', { server, token, deviceName });
