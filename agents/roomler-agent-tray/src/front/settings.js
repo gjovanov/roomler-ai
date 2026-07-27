@@ -1,12 +1,13 @@
 /*
- * Settings view: device rename, re-enrollment, background-service management
- * and file locations. Status data comes from the central store; mutations go
- * through the matching cmd_* commands. Results are rendered with textContent
- * (no innerHTML) into the shared banner slot.
+ * Settings view: device rename, background-service management, split-config
+ * cleanup and file locations (re-enrollment moved to Onboarding in S1b).
+ * Status data comes from the central store; mutations go through the
+ * matching cmd_* commands. Results are rendered with textContent (no
+ * innerHTML) into the shared banner slot.
  */
 (function () {
   'use strict';
-  const { $, invoke, show, hide, setText, on, refreshStatus } = window.Roomler;
+  const { $, invoke, show, hide, setText, on, navigate, refreshStatus } = window.Roomler;
 
   function showResult(text, isError) {
     const el = $('settings-result');
@@ -32,6 +33,12 @@
     setText('st-config-dir', s.config_dir);
     if (s.config_split) show($('st-split-banner'));
     else hide($('st-split-banner'));
+    // S1b: when the daemon is reachable it reports the config file it
+    // actually LOADED — authoritative over the flavour-guess above.
+    const dv = window.Roomler.get && window.Roomler.get('deviceView');
+    if (dv && dv.available && dv.status && dv.status.config_path) {
+      setText('st-config-dir', dv.status.config_path);
+    }
     // Rename/re-enroll write the machine-wide config under an SCM install,
     // which an unelevated desktop app can't do — say so up front instead of
     // only failing on submit.
@@ -55,17 +62,22 @@
       }
     });
 
-    $('re-enroll-form').addEventListener('submit', async (ev) => {
-      ev.preventDefault();
-      const token = $('re-token').value.trim();
-      if (!token) return;
+    // S1b: enrollment consolidated into Onboarding — this card just links.
+    $('btn-goto-onboarding').addEventListener('click', () => navigate('onboarding'));
+
+    // S1b: the split-config banner's cleanup action — the DAEMON archives
+    // the stale copy (identity-guarded, never deletes).
+    $('btn-config-cleanup').addEventListener('click', async () => {
+      const btn = $('btn-config-cleanup');
+      btn.disabled = true;
       try {
-        await invoke('cmd_re_enroll', { token });
-        showResult('Re-enrollment succeeded.', false);
-        $('re-token').value = '';
+        const detail = await invoke('cmd_config_cleanup');
+        showResult('Cleaned up: ' + detail, false);
         void refreshStatus();
       } catch (e) {
-        showResult('Re-enrollment failed: ' + e, true);
+        showResult('Cleanup not performed: ' + e, true);
+      } finally {
+        btn.disabled = false;
       }
     });
 
