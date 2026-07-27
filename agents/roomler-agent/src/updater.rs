@@ -545,7 +545,9 @@ pub fn pick_latest_release(mut releases: Vec<GithubRelease>) -> Option<GithubRel
 /// Download an asset to a temp file and return the path. Verifies the
 /// downloaded size against the asset metadata + the minimum plausible
 /// size so we don't run a ~200 byte HTML error page as an installer.
-async fn download_asset(asset: &GithubAsset) -> Result<PathBuf> {
+/// `pub(crate)`: the S1a companion-refresh (`crate::companion`) reuses
+/// the same verified-download plumbing for `roomler-desktop.exe`.
+pub(crate) async fn download_asset(asset: &GithubAsset) -> Result<PathBuf> {
     let client = reqwest::Client::builder()
         .user_agent(concat!("roomler-agent/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(600))
@@ -625,7 +627,7 @@ pub(crate) fn verify_sha256(bytes: &[u8], digest: &str) -> Result<()> {
 /// limit insulation isn't needed and the round-trip via our backend
 /// would just add latency to a path that's already on the slow side
 /// of the agent's failure recovery.
-async fn fetch_release_by_tag(tag: &str) -> Result<GithubRelease> {
+pub(crate) async fn fetch_release_by_tag(tag: &str) -> Result<GithubRelease> {
     let url = format!("https://api.github.com/repos/{RELEASES_REPO}/releases/tags/{tag}");
     let client = reqwest::Client::builder()
         .user_agent(concat!("roomler-agent/", env!("CARGO_PKG_VERSION")))
@@ -1264,14 +1266,84 @@ pub(crate) fn resolve_check_interval_with(
     CHECK_INTERVAL
 }
 
+/// S1a — process-wide forced-update trigger. The WS handler
+/// (`rc:agent.update`) calls [`request_update_now`]; the periodic loop
+/// consumes the channel. A `OnceLock` (not a threaded parameter) so the
+/// signaling stack's signatures stay untouched — one updater per
+/// process makes the singleton honest.
+static UPDATE_TRIGGER: std::sync::OnceLock<tokio::sync::mpsc::Sender<Option<String>>> =
+    std::sync::OnceLock::new();
+
+/// Create the forced-update trigger channel and register its sender.
+/// Called once from `run_cmd`; the returned receiver goes to
+/// [`run_periodic`]. When auto-update is disabled the receiver is
+/// simply dropped and [`request_update_now`] reports `false`.
+pub fn install_update_trigger() -> tokio::sync::mpsc::Receiver<Option<String>> {
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    let _ = UPDATE_TRIGGER.set(tx);
+    rx
+}
+
+/// Request an immediate update cycle (server-pushed `rc:agent.update`).
+/// `pin` = optional release tag; `None` = latest. Returns `false` when
+/// nothing is listening (auto-update disabled, trigger not installed)
+/// or the small queue is full.
+pub fn request_update_now(pin: Option<String>) -> bool {
+    match UPDATE_TRIGGER.get() {
+        Some(tx) => tx.try_send(pin).is_ok(),
+        None => false,
+    }
+}
+
+/// Act on a check outcome: log, and on `UpdateReady` spawn the
+/// installer + signal shutdown. Returns `true` when the loop should
+/// exit (installer running, agent about to be replaced). Shared by the
+/// periodic and forced paths.
+fn act_on_outcome(outcome: CheckOutcome, shutdown_tx: &tokio::sync::watch::Sender<bool>) -> bool {
+    match outcome {
+        CheckOutcome::UpToDate { current, latest } => {
+            tracing::info!(current = %current, latest = %latest, "up to date");
+            false
+        }
+        CheckOutcome::UpdateReady {
+            current,
+            latest,
+            installer_path,
+        } => {
+            tracing::warn!(
+                current = %current,
+                latest = %latest,
+                path = %installer_path.display(),
+                "new release available — spawning installer and exiting"
+            );
+            if let Err(e) = spawn_installer_with_watch(&installer_path, Some(&latest)) {
+                tracing::error!(error = %e, "installer spawn failed; will retry next cycle");
+                return false;
+            }
+            let _ = shutdown_tx.send(true);
+            true
+        }
+        CheckOutcome::Skipped(reason) => {
+            tracing::info!(reason = %reason, "update check skipped");
+            false
+        }
+    }
+}
+
 /// Periodic update loop. Returns only on shutdown. Runs `check_once`
 /// immediately, then on a fixed cadence. On `UpdateReady` the loop
 /// spawns the installer and sends `true` on the shutdown channel so
 /// the rest of the agent tears down cleanly.
+///
+/// `trigger_rx` (S1a) delivers operator-forced cycles pushed over the
+/// WS (`rc:agent.update`): those bypass the transfer-defer gate (the
+/// operator asked NOW; a warn is logged if transfers are active) but
+/// still honour the install-storm cooldown marker.
 pub async fn run_periodic(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     interval: Duration,
+    mut trigger_rx: tokio::sync::mpsc::Receiver<Option<String>>,
 ) {
     let mut first = true;
     let mut consecutive_defers: u32 = 0;
@@ -1309,15 +1381,52 @@ pub async fn run_periodic(
         } else {
             interval
         };
+        let mut forced: Option<Option<String>> = None;
         if !first || skip_first_check {
             tokio::select! {
                 _ = tokio::time::sleep(next_interval) => {},
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() { return; }
                 },
+                maybe = trigger_rx.recv() => {
+                    // Sender lives in the process-wide OnceLock, so None
+                    // (channel closed) is unreachable in practice; guard
+                    // anyway so a closed channel can't hot-loop us.
+                    if let Some(pin) = maybe {
+                        forced = Some(pin);
+                    }
+                },
             }
         }
         first = false;
+
+        // S1a — operator-forced cycle (rc:agent.update). Bypasses the
+        // transfer-defer gate (explicit operator intent) but keeps the
+        // install-storm cooldown; a pinned tag skips the is-newer check
+        // (pin_version semantics — the admin chose the version).
+        if let Some(pin) = forced {
+            if recent_update_attempt(STARTUP_UPDATE_COOLDOWN) {
+                tracing::info!(
+                    "forced update suppressed by recent-install cooldown; try again shortly"
+                );
+                continue;
+            }
+            let active = crate::files::active_transfer_count();
+            if active > 0 {
+                tracing::warn!(
+                    active,
+                    "forced update proceeding despite in-flight file transfers"
+                );
+            }
+            let outcome = match pin {
+                Some(tag) => pin_version(&tag).await,
+                None => check_once().await,
+            };
+            if act_on_outcome(outcome, &shutdown_tx) {
+                return;
+            }
+            continue;
+        }
 
         // rc.19 gate: don't fire an installer while file transfers
         // are in flight. Pair with resumable transfers — even with
@@ -1354,31 +1463,8 @@ pub async fn run_periodic(
         }
 
         let outcome = check_once().await;
-        match outcome {
-            CheckOutcome::UpToDate { current, latest } => {
-                tracing::info!(current = %current, latest = %latest, "up to date");
-            }
-            CheckOutcome::UpdateReady {
-                current,
-                latest,
-                installer_path,
-            } => {
-                tracing::warn!(
-                    current = %current,
-                    latest = %latest,
-                    path = %installer_path.display(),
-                    "new release available — spawning installer and exiting"
-                );
-                if let Err(e) = spawn_installer_with_watch(&installer_path, Some(&latest)) {
-                    tracing::error!(error = %e, "installer spawn failed; will retry next cycle");
-                    continue;
-                }
-                let _ = shutdown_tx.send(true);
-                return;
-            }
-            CheckOutcome::Skipped(reason) => {
-                tracing::info!(reason = %reason, "update check skipped");
-            }
+        if act_on_outcome(outcome, &shutdown_tx) {
+            return;
         }
     }
 }

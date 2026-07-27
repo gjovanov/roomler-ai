@@ -1382,6 +1382,21 @@ async fn handle_server_msg(
             }
         }
 
+        // S1a — operator-triggered forced self-update from the web UI.
+        // Hand the request to the updater loop's trigger channel; the
+        // actual check/download/install runs there (same gates as the
+        // periodic path: 5-min install-storm cooldown; transfer-defer
+        // is bypassed with a warn because the operator asked NOW).
+        ServerMsg::UpdateNow { pin } => {
+            info!(?pin, "rc:agent.update — operator-triggered self-update");
+            if !crate::updater::request_update_now(pin) {
+                warn!(
+                    "update trigger dropped — auto-updater not running \
+                     (ROOMLER_AGENT_AUTO_UPDATE=0?) or a trigger is already queued"
+                );
+            }
+        }
+
         // Remaining tunnel-flow `ServerMsg` variants
         // (TunnelOpened / TcpForwardAccept / TcpForwardReject /
         // TcpHalfClose / TcpClosed / TunnelRevoked) target the
