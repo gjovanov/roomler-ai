@@ -103,7 +103,9 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     if !startup_leader {
-        info!("Startup maintenance lease held elsewhere — skipping stale-call reset + thread migration");
+        info!(
+            "Startup maintenance lease held elsewhere — skipping stale-call reset + thread migration"
+        );
     }
 
     // Clean up ALL stale calls — no calls can be active at server startup

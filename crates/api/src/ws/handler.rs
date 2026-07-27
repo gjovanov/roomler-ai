@@ -655,7 +655,10 @@ async fn handle_media_join(
         if call_live {
             match state.room_manager.create_room(rid).await {
                 Ok(_) => {
-                    info!(?rid, "media:join re-created live conference room on this pod");
+                    info!(
+                        ?rid,
+                        "media:join re-created live conference room on this pod"
+                    );
                     room_exists = true;
                 }
                 Err(e) => {
