@@ -895,10 +895,22 @@ async fn tunnel_enroll_enforces_free_plan_cap() {
 
     for i in 1..=3 {
         let resp = enroll(format!("tcap-mach-{i}")).await;
-        assert_eq!(resp.status().as_u16(), 200, "tunnel client {i} should enroll");
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "tunnel client {i} should enroll"
+        );
     }
     let resp = enroll("tcap-mach-4".to_string()).await;
-    assert_eq!(resp.status().as_u16(), 403, "4th tunnel client must hit the cap");
+    assert_eq!(
+        resp.status().as_u16(),
+        403,
+        "4th tunnel client must hit the cap"
+    );
     let resp = enroll("tcap-mach-2".to_string()).await;
-    assert_eq!(resp.status().as_u16(), 200, "re-enroll rehydrates, never capped");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "re-enroll rehydrates, never capped"
+    );
 }
