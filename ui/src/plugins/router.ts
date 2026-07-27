@@ -114,6 +114,29 @@ const routes: RouteRecordRaw[] = [
             component: () => import('@/views/invite/InviteManageView.vue'),
           },
           {
+            // S4 pivot — the fleet page, promoted out of Admin. The old
+            // `admin-agents` path redirects here (below).
+            path: 'devices',
+            name: 'devices',
+            component: () => import('@/views/devices/DevicesView.vue'),
+          },
+          {
+            // S4 pivot — the overlay/tunnel network group, promoted out
+            // of Admin (Tailscale-style IA). Sections stay child routes
+            // (bookmarkable, back/forward-friendly), same pattern as
+            // Admin.
+            path: 'network',
+            redirect: { name: 'network-machines' },
+            component: () => import('@/views/network/NetworkPanel.vue'),
+            children: [
+              { path: 'machines',       name: 'network-machines',       props: true, component: () => import('@/components/network/MachinesSection.vue') },
+              { path: 'tunnel-clients', name: 'network-tunnel-clients', props: true, component: () => import('@/components/admin/TunnelClientsSection.vue') },
+              { path: 'acl',            name: 'network-acl',            props: true, component: () => import('@/components/admin/TunnelPoliciesSection.vue') },
+              { path: 'subnet-routes',  name: 'network-subnet-routes',  props: true, component: () => import('@/components/admin/OverlaySubnetRoutesSection.vue') },
+              { path: 'dns',            name: 'network-dns',            props: true, component: () => import('@/components/admin/MagicDnsSection.vue') },
+            ],
+          },
+          {
             path: 'admin',
             // Parent-level redirect: hitting `/tenant/{id}/admin` goes
             // straight to the Settings child without leaving an
@@ -130,13 +153,16 @@ const routes: RouteRecordRaw[] = [
               { path: 'settings',  name: 'admin-settings',  props: true, component: () => import('@/components/admin/SettingsSection.vue') },
               { path: 'members',   name: 'admin-members',   props: true, component: () => import('@/components/admin/MembersSection.vue') },
               { path: 'roles',     name: 'admin-roles',     props: true, component: () => import('@/components/admin/RolesSection.vue') },
-              { path: 'agents',    name: 'admin-agents',    props: true, component: () => import('@/components/admin/AgentsSection.vue') },
-              { path: 'tunnel-clients', name: 'admin-tunnel-clients', props: true, component: () => import('@/components/admin/TunnelClientsSection.vue') },
-              { path: 'tunnel-policies', name: 'admin-tunnel-policies', props: true, component: () => import('@/components/admin/TunnelPoliciesSection.vue') },
-              { path: 'subnet-routes', name: 'admin-subnet-routes', props: true, component: () => import('@/components/admin/OverlaySubnetRoutesSection.vue') },
-              { path: 'magic-dns', name: 'admin-magic-dns', props: true, component: () => import('@/components/admin/MagicDnsSection.vue') },
               { path: 'tasks',     name: 'admin-tasks',     props: true, component: () => import('@/components/admin/TasksSection.vue') },
               { path: 'audit-log', name: 'admin-audit-log', props: true, component: () => import('@/components/admin/AuditSection.vue') },
+              // S4 — the fleet/network sections moved out of Admin; the
+              // old paths 301 to their new homes (named redirects keep
+              // the :tenantId param). Old bookmarks + docs keep working.
+              { path: 'agents',          redirect: { name: 'devices' } },
+              { path: 'tunnel-clients',  redirect: { name: 'network-tunnel-clients' } },
+              { path: 'tunnel-policies', redirect: { name: 'network-acl' } },
+              { path: 'subnet-routes',   redirect: { name: 'network-subnet-routes' } },
+              { path: 'magic-dns',       redirect: { name: 'network-dns' } },
             ],
           },
           {

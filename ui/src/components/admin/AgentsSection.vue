@@ -1,7 +1,7 @@
 <template>
   <v-card>
     <v-card-title class="d-flex align-center">
-      <span>Remote-Control Agents</span>
+      <span>Devices</span>
       <v-spacer />
       <v-btn
         prepend-icon="mdi-update"
@@ -20,7 +20,7 @@
         size="small"
         @click="openEnrollDialog"
       >
-        Issue enrollment token
+        Enroll device
       </v-btn>
     </v-card-title>
 
@@ -393,59 +393,26 @@
 
       <div v-else class="text-center pa-4 pa-md-6 pa-lg-8 text-medium-emphasis">
         <v-icon size="64" color="grey-lighten-1" class="mb-2">mdi-desktop-classic</v-icon>
-        <p class="mb-2">No agents enrolled yet.</p>
+        <p class="mb-2">No devices enrolled yet.</p>
         <p class="text-body-2">
-          Issue an enrollment token, run <code>roomler-agent --enroll &lt;token&gt;</code>
-          on a machine, and it will appear here.
+          Click "Enroll device" for a one-line installer per platform — the
+          machine appears here as soon as it enrolls.
         </p>
       </div>
     </v-card-text>
   </v-card>
 
-  <!-- Enrollment token dialog -->
-  <v-dialog v-model="enrollDialogOpen" max-width="560" persistent>
-    <v-card>
-      <v-card-title>Enroll a new agent</v-card-title>
-      <v-card-text>
-        <div v-if="enrollLoading" class="d-flex justify-center pa-4">
-          <v-progress-circular indeterminate />
-        </div>
-        <div v-else-if="enrollToken">
-          <p class="text-body-2 mb-3">
-            Share this token with the machine you want to enroll. It is single-use
-            and expires in {{ Math.round(enrollToken.expires_in / 60) }} minutes.
-          </p>
-          <v-textarea
-            :model-value="enrollToken.enrollment_token"
-            readonly
-            variant="outlined"
-            density="compact"
-            rows="4"
-            class="font-family-monospace"
-            @click="copyTokenToClipboard"
-          />
-          <v-alert
-            v-if="copied"
-            type="success"
-            variant="tonal"
-            density="compact"
-            class="mt-2"
-          >
-            Copied to clipboard
-          </v-alert>
-          <p class="text-body-2 mt-3 mb-1">On the target machine:</p>
-          <pre class="bg-grey-lighten-4 pa-2 rounded text-caption">roomler-agent --enroll &lt;token&gt;</pre>
-        </div>
-        <div v-else-if="enrollError" class="text-error">
-          {{ enrollError }}
-        </div>
-      </v-card-text>
-      <v-card-actions>
-        <v-spacer />
-        <v-btn variant="text" @click="closeEnrollDialog">Close</v-btn>
-      </v-card-actions>
-    </v-card>
-  </v-dialog>
+  <!-- S4 — unified enrollment dialog (token + per-OS install commands
+       derived from this origin; template map vitest-locked). -->
+  <EnrollmentDialog
+    :model-value="enrollDialogOpen"
+    kind="agent"
+    :token="enrollToken?.enrollment_token ?? null"
+    :expires-in="enrollToken?.expires_in ?? null"
+    :loading="enrollLoading"
+    :error="enrollError"
+    @update:model-value="(v: boolean) => { if (!v) closeEnrollDialog() }"
+  />
 
   <!-- Crash reports modal -->
   <AgentCrashesDialog
@@ -628,6 +595,7 @@ import {
 import { codecChips } from './agentCodecChips'
 import AgentCrashesDialog from './AgentCrashesDialog.vue'
 import AgentLogsDialog from './AgentLogsDialog.vue'
+import EnrollmentDialog from '@/components/enroll/EnrollmentDialog.vue'
 
 const props = defineProps<{ tenantId: string }>()
 
@@ -669,7 +637,6 @@ const enrollDialogOpen = ref(false)
 const enrollLoading = ref(false)
 const enrollToken = ref<EnrollmentToken | null>(null)
 const enrollError = ref<string | null>(null)
-const copied = ref(false)
 
 // Per-row copy-feedback for the agent-id copy button. Holds the id
 // of the last-copied agent for 2 s so the row's mdi-content-copy
@@ -786,7 +753,6 @@ async function openEnrollDialog() {
   enrollLoading.value = true
   enrollToken.value = null
   enrollError.value = null
-  copied.value = false
   try {
     enrollToken.value = await agentStore.issueEnrollmentToken(props.tenantId)
   } catch (e) {
@@ -799,17 +765,6 @@ async function openEnrollDialog() {
 function closeEnrollDialog() {
   enrollDialogOpen.value = false
   enrollToken.value = null
-  copied.value = false
-}
-
-async function copyTokenToClipboard() {
-  if (!enrollToken.value) return
-  try {
-    await navigator.clipboard.writeText(enrollToken.value.enrollment_token)
-    copied.value = true
-  } catch {
-    // ignore — user can copy manually
-  }
 }
 
 /**
