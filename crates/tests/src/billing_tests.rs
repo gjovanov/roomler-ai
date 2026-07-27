@@ -445,7 +445,7 @@ async fn webhook_subscription_deleted_reverts_to_free() {
             }
         });
         let payload_bytes = serde_json::to_vec(&payload).unwrap();
-        let timestamp = "1234567891";
+        let timestamp = now_ts();
         let signed_payload = format!("{}.{}", timestamp, String::from_utf8_lossy(&payload_bytes));
         let sig = compute_hmac_sha256("whsec_test_secret_for_billing_tests", &signed_payload);
         let sig_header = format!("t={},v1={}", timestamp, sig);
@@ -536,7 +536,7 @@ async fn webhook_subscription_updated_sets_status() {
             }
         });
         let payload_bytes = serde_json::to_vec(&payload).unwrap();
-        let timestamp = "1234567892";
+        let timestamp = now_ts();
         let signed_payload = format!("{}.{}", timestamp, String::from_utf8_lossy(&payload_bytes));
         let sig = compute_hmac_sha256("whsec_test_secret_for_billing_tests", &signed_payload);
         let sig_header = format!("t={},v1={}", timestamp, sig);
@@ -624,7 +624,7 @@ async fn webhook_invoice_payment_failed_sets_past_due() {
             }
         });
         let payload_bytes = serde_json::to_vec(&payload).unwrap();
-        let timestamp = "1234567893";
+        let timestamp = now_ts();
         let signed_payload = format!("{}.{}", timestamp, String::from_utf8_lossy(&payload_bytes));
         let sig = compute_hmac_sha256("whsec_test_secret_for_billing_tests", &signed_payload);
         let sig_header = format!("t={},v1={}", timestamp, sig);
