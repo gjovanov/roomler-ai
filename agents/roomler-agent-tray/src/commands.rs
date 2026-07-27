@@ -400,6 +400,148 @@ pub async fn cmd_config_cleanup() -> Result<String, String> {
     }
 }
 
+/// S2 — the editable config surface (key + current value + editor
+/// metadata). Daemon-verb first (the daemon reads its OWN config, which
+/// is profile-correct under SCM/SystemContext); direct-file fallback
+/// reads the tray's active config so the editor still renders when the
+/// daemon is down.
+#[tauri::command]
+pub async fn cmd_config_entries() -> Result<Vec<localapi::ConfigEntry>, String> {
+    if let Ok(mut client) = localapi::connect().await
+        && let Ok(entries) = client.config_entries().await
+    {
+        return Ok(entries);
+    }
+    tokio::task::spawn_blocking(|| {
+        let is_scm = probe_service_state().0 == "scmService";
+        let path = active_config_path(is_scm)?;
+        let cfg = config::load(&path).map_err(|e| format!("Loading config: {e}"))?;
+        Ok(roomler_agent::config_surface::entries(&cfg))
+    })
+    .await
+    .map_err(|e| format!("task join: {e}"))?
+}
+
+/// S2 — set (`value` present) or clear (`value` null) one editable
+/// config key. Daemon-verb first, same rationale as
+/// [`cmd_set_device_name`]; the direct-file fallback runs the SAME
+/// per-key validator (`config_surface::apply`), so a validation error
+/// reads identically on both paths and nothing skips validation.
+/// Changes take effect on the next daemon restart.
+#[tauri::command]
+pub async fn cmd_config_set(
+    key: String,
+    value: Option<String>,
+) -> Result<localapi::ConfigEntry, String> {
+    let mut daemon_err: Option<String> = None;
+    if let Ok(mut client) = localapi::connect().await {
+        match client.config_set(&key, value.as_deref()).await {
+            Ok(entry) => return Ok(entry),
+            Err(e) => daemon_err = Some(e.to_string()),
+        }
+    }
+    let direct = tokio::task::spawn_blocking(move || config_set_blocking(key, value))
+        .await
+        .map_err(|e| format!("task join: {e}"))?;
+    // Prefer the daemon's message when the direct path ALSO failed — it
+    // names the real gate (validation text, or why the verb refused).
+    match (direct, daemon_err) {
+        (Ok(entry), _) => Ok(entry),
+        (Err(_), Some(de)) => Err(de),
+        (Err(fe), None) => Err(fe),
+    }
+}
+
+fn config_set_blocking(
+    key: String,
+    value: Option<String>,
+) -> Result<localapi::ConfigEntry, String> {
+    let is_scm = probe_service_state().0 == "scmService";
+    let path = active_config_path(is_scm)?;
+    let machine_global = is_machine_global(&path);
+    let mut cfg = config::load(&path).map_err(|e| format!("Loading config: {e}"))?;
+    roomler_agent::config_surface::apply(&mut cfg, &key, value.as_deref())?;
+    config::save(&path, &cfg).map_err(|e| explain_save_error(e, &path, machine_global))?;
+    roomler_agent::config_surface::entry_for(&cfg, &key)
+        .ok_or_else(|| format!("unknown config key {key:?}"))
+}
+
+/// S2 — open the browser remote-control viewer for one of THIS tenant's
+/// agent-backed devices (`{server}/tenant/{tid}/agent/{aid}/remote`).
+/// The URL is constructed ONLY from this device's own configured server
+/// origin + hex-validated ids — never from peer-supplied strings — so a
+/// hostile device name can't steer the browser to a foreign site.
+#[tauri::command]
+pub async fn cmd_open_remote(app: tauri::AppHandle, agent_id: String) -> Result<(), String> {
+    use tauri_plugin_shell::ShellExt;
+    let aid = agent_id.trim().to_ascii_lowercase();
+    if aid.len() != 24 || !aid.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("invalid agent id".to_string());
+    }
+    let url = tokio::task::spawn_blocking(move || {
+        let is_scm = probe_service_state().0 == "scmService";
+        let path = active_config_path(is_scm)?;
+        let cfg = config::load(&path).map_err(|e| format!("Loading config: {e}"))?;
+        let tid = cfg.tenant_id.trim().to_ascii_lowercase();
+        if tid.len() != 24 || !tid.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("this device's config has no valid tenant id".to_string());
+        }
+        let server = cfg.server_url.trim().trim_end_matches('/').to_string();
+        if !server.starts_with("https://") && !server.starts_with("http://") {
+            return Err("this device's config has no valid server URL".to_string());
+        }
+        Ok(format!("{server}/tenant/{tid}/agent/{aid}/remote"))
+    })
+    .await
+    .map_err(|e| format!("task join: {e}"))??;
+    // shell::open is deprecated in favour of tauri-plugin-opener, but the
+    // shell plugin is already shipped + initialised here; not worth a new
+    // plugin dependency for one deep-link call.
+    #[allow(deprecated)]
+    app.shell()
+        .open(&url, None)
+        .map_err(|e| format!("opening browser: {e}"))
+}
+
+/// S2 — what [`cmd_tail_log`] returns to the log-viewer card.
+#[derive(Debug, Serialize)]
+pub struct LogTailReport {
+    pub path: String,
+    pub size: u64,
+    pub content: String,
+}
+
+/// S2 — bounded tail of a daemon log (`daemon` / `service` / `panic`).
+/// Daemon-verb first (role-correct paths, incl. SYSTEM-profile files
+/// this app can't read); direct-file fallback covers a stopped daemon
+/// for the files that ARE readable (per-user + `service-logs`).
+#[tauri::command]
+pub async fn cmd_tail_log(source: String, max_bytes: Option<u64>) -> Result<LogTailReport, String> {
+    if let Ok(mut client) = localapi::connect().await
+        && let Ok((path, size, content)) = client.tail_log(&source, max_bytes).await
+    {
+        return Ok(LogTailReport {
+            path,
+            size,
+            content,
+        });
+    }
+    tokio::task::spawn_blocking(move || {
+        let path = roomler_agent::logging::tail_source_path(&source)
+            .ok_or_else(|| format!("no log file found for source {source:?}"))?;
+        let cap = max_bytes.unwrap_or(32 * 1024).clamp(512, 64 * 1024);
+        let (size, content) = roomler_agent::logging::read_tail(&path, cap)
+            .map_err(|e| format!("reading {}: {e}", path.display()))?;
+        Ok(LogTailReport {
+            path: path.display().to_string(),
+            size,
+            content,
+        })
+    })
+    .await
+    .map_err(|e| format!("task join: {e}"))?
+}
+
 /// Update the device name. Effective on next WS reconnect — the agent
 /// re-sends `rc:agent.hello` with the new name.
 ///
