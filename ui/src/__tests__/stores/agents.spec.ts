@@ -99,6 +99,27 @@ describe('useAgentStore', () => {
     expect(s.agents[0]!.name).toBe('New')
   })
 
+  it('triggerUpdate POSTs the per-agent update path and returns delivered', async () => {
+    const store = useAgentStore()
+    mockApi.post.mockResolvedValueOnce({ agent_id: 'a1', delivered: true })
+
+    const delivered = await store.triggerUpdate(TENANT_ID, 'a1')
+
+    expect(mockApi.post).toHaveBeenCalledWith(`/tenant/${TENANT_ID}/agent/a1/update`, {})
+    expect(delivered).toBe(true)
+  })
+
+  it('triggerUpdateAll POSTs the bulk update path and returns counts', async () => {
+    const store = useAgentStore()
+    mockApi.post.mockResolvedValueOnce({ requested: 3, delivered: 2, results: [] })
+
+    const res = await store.triggerUpdateAll(TENANT_ID)
+
+    expect(mockApi.post).toHaveBeenCalledWith(`/tenant/${TENANT_ID}/agent/update`, {})
+    expect(res.requested).toBe(3)
+    expect(res.delivered).toBe(2)
+  })
+
   it('deleteAgent removes from list and decrements total', async () => {
     mockApi.delete.mockResolvedValueOnce({ deleted: true })
     const s = useAgentStore()
