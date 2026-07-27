@@ -146,6 +146,9 @@ fn stripe_err(e: roomler_ai_services::stripe::StripeError) -> ApiError {
             ApiError::BadRequest("No billing account for this tenant".to_string())
         }
         StripeError::InvalidPlan(p) => ApiError::BadRequest(format!("Invalid plan: {p}")),
+        StripeError::PriceNotConfigured(p) => ApiError::ServiceUnavailable(format!(
+            "Payments are not configured on this server (missing Stripe price id for plan '{p}')"
+        )),
         StripeError::InvalidSignature => {
             ApiError::Unauthorized("Invalid webhook signature".to_string())
         }
