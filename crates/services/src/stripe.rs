@@ -29,6 +29,11 @@ pub struct PlanInfo {
 
 #[derive(Debug, Deserialize)]
 pub struct StripeEvent {
+    /// Stripe event id (`evt_…`) — the S5 dedup key. `default` so a
+    /// hand-rolled test payload without an id still parses (dedup is
+    /// skipped for empty ids).
+    #[serde(default)]
+    pub id: String,
     #[serde(rename = "type")]
     pub event_type: String,
     pub data: StripeEventData,
@@ -283,6 +288,12 @@ impl StripeService {
 
     // ---- Plans (static) --------------------------------------------------
 
+    /// S5 pivot — feature copy leads with the fleet (devices / private
+    /// network), collaboration rides along. Prices are per user per
+    /// month and match the LIVE Stripe Prices created 2026-07-27
+    /// ($8 Pro / $16 Business) — the ids stay `free`/`pro`/`business`
+    /// (stored in tenant docs + matched in the webhook; renaming needs a
+    /// migration, display copy is the thing to change).
     pub fn get_plans() -> Vec<PlanInfo> {
         vec![
             PlanInfo {
@@ -290,9 +301,11 @@ impl StripeService {
                 name: "Free".into(),
                 price_cents: 0,
                 features: vec![
-                    "10 members".into(),
-                    "5 channels".into(),
-                    "5K message history".into(),
+                    "3 devices, remote desktop access".into(),
+                    "Private network (overlay mesh)".into(),
+                    "3 tunnel clients".into(),
+                    "1 concurrent remote session".into(),
+                    "Chat: 10 members, 5 channels".into(),
                     "100 MB storage".into(),
                 ],
                 limits: Plan::Free.limits(),
@@ -302,12 +315,12 @@ impl StripeService {
                 name: "Pro".into(),
                 price_cents: 800,
                 features: vec![
-                    "Unlimited members".into(),
-                    "Unlimited channels".into(),
-                    "Full history".into(),
-                    "10 GB storage".into(),
-                    "Video (10 participants)".into(),
-                    "Cloud integrations".into(),
+                    "30 devices, remote desktop access".into(),
+                    "Exit nodes + MagicDNS".into(),
+                    "30 tunnel clients".into(),
+                    "5 concurrent remote sessions".into(),
+                    "Unlimited members + channels, full history".into(),
+                    "10 GB storage, video calls (10)".into(),
                 ],
                 limits: Plan::Pro.limits(),
             },
@@ -316,11 +329,11 @@ impl StripeService {
                 name: "Business".into(),
                 price_cents: 1600,
                 features: vec![
-                    "Everything in Pro".into(),
-                    "100 GB storage".into(),
-                    "Video (100 participants)".into(),
-                    "AI doc recognition".into(),
-                    "Recordings".into(),
+                    "300 devices, remote desktop access".into(),
+                    "Everything in Pro, unlimited sessions".into(),
+                    "300 tunnel clients".into(),
+                    "100 GB storage, video (100) + recordings".into(),
+                    "AI document recognition".into(),
                     "Priority support".into(),
                 ],
                 limits: Plan::Business.limits(),
@@ -330,11 +343,32 @@ impl StripeService {
 
     // ---- Webhook processing ----------------------------------------------
 
-    /// Verify the Stripe webhook signature using HMAC-SHA256.
+    /// S5 hardening — replayed signatures older (or newer) than this are
+    /// rejected even when the HMAC checks out. Stripe's own SDKs default
+    /// to the same 5-minute window.
+    const SIGNATURE_TOLERANCE_SECS: i64 = 300;
+
+    /// Verify the Stripe webhook signature using HMAC-SHA256, including
+    /// the replay-window check against the current clock.
     pub fn verify_signature(
         webhook_secret: &str,
         payload: &[u8],
         sig_header: &str,
+    ) -> Result<(), StripeError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        Self::verify_signature_at(webhook_secret, payload, sig_header, now)
+    }
+
+    /// The clock-injected body of [`verify_signature`] so the replay
+    /// window is unit-testable without sleeping.
+    pub fn verify_signature_at(
+        webhook_secret: &str,
+        payload: &[u8],
+        sig_header: &str,
+        now_unix: i64,
     ) -> Result<(), StripeError> {
         use hmac::{Hmac, Mac};
         use sha2::Sha256;
@@ -357,6 +391,16 @@ impl StripeService {
             return Err(StripeError::InvalidSignature);
         }
 
+        // S5 — replay window: a valid-HMAC header from outside the
+        // tolerance is a replay (or a badly skewed clock) — reject.
+        let ts: i64 = timestamp
+            .parse()
+            .map_err(|_| StripeError::InvalidSignature)?;
+        if (now_unix - ts).abs() > Self::SIGNATURE_TOLERANCE_SECS {
+            warn!(ts, now_unix, "stripe webhook signature outside tolerance");
+            return Err(StripeError::InvalidSignature);
+        }
+
         // Build the signed payload: "{timestamp}.{body}"
         let signed_payload = format!("{timestamp}.{}", String::from_utf8_lossy(payload));
 
@@ -372,12 +416,51 @@ impl StripeService {
         }
     }
 
+    /// S5 — idempotency gate: record the Stripe event id in
+    /// `stripe_events` (unique `_id`, 30-day TTL via `processed_at`). A
+    /// duplicate insert means this exact event was already processed —
+    /// Stripe retries deliveries, and a replayed `checkout.session.
+    /// completed` must not re-run the billing writes. Empty id (hand-
+    /// rolled test payloads) skips dedup. Fail-open on unexpected DB
+    /// errors: dropping a live billing event is worse than double-
+    /// processing one.
+    async fn first_time_seeing(&self, db: &mongodb::Database, event_id: &str) -> bool {
+        if event_id.is_empty() {
+            return true;
+        }
+        let coll = db.collection::<bson::Document>("stripe_events");
+        match coll
+            .insert_one(doc! { "_id": event_id, "processed_at": DateTime::now() })
+            .await
+        {
+            Ok(_) => true,
+            Err(e) => {
+                let dup = matches!(
+                    *e.kind,
+                    mongodb::error::ErrorKind::Write(mongodb::error::WriteFailure::WriteError(
+                        ref we
+                    )) if we.code == 11000
+                );
+                if dup {
+                    info!(event_id, "duplicate Stripe event skipped");
+                    false
+                } else {
+                    warn!(event_id, error = %e, "stripe_events insert failed — processing anyway");
+                    true
+                }
+            }
+        }
+    }
+
     /// Handle a verified webhook event, updating tenant billing state.
     pub async fn handle_webhook_event(
         &self,
         db: &mongodb::Database,
         event: &StripeEvent,
     ) -> Result<(), StripeError> {
+        if !self.first_time_seeing(db, &event.id).await {
+            return Ok(());
+        }
         let obj = &event.data.object;
 
         match event.event_type.as_str() {
@@ -402,19 +485,37 @@ impl StripeService {
                 };
 
                 let collection = db.collection::<Tenant>(Tenant::COLLECTION);
+                // S5 — Stripe does not guarantee event ordering: when
+                // `customer.subscription.updated` (which carries
+                // current_period_end) lands BEFORE this event, the old
+                // whole-subdoc overwrite wiped period_end back to null.
+                // Read-merge-write: keep any billing facts already
+                // recorded, only fill what checkout knows. (Whole-subdoc
+                // $set stays — dotted paths fail on `billing: null`
+                // tenants with Mongo error 28; live repro 2026-07-27.)
+                let existing_billing = collection
+                    .find_one(doc! { "_id": tenant_id })
+                    .await?
+                    .and_then(|t| t.billing);
+                let merged = BillingInfo {
+                    customer_id: Some(customer_id.to_string()),
+                    subscription_id: Some(subscription_id.to_string()),
+                    current_period_end: existing_billing
+                        .as_ref()
+                        .and_then(|b| b.current_period_end),
+                    status: SubscriptionStatus::Active,
+                    cancel_at_period_end: existing_billing
+                        .as_ref()
+                        .map(|b| b.cancel_at_period_end)
+                        .unwrap_or(false),
+                };
                 collection
                     .update_one(
                         doc! { "_id": tenant_id },
                         doc! {
                             "$set": {
                                 "plan": bson::to_bson(&plan).unwrap_or_default(),
-                                "billing": bson::to_bson(&BillingInfo {
-                                    customer_id: Some(customer_id.to_string()),
-                                    subscription_id: Some(subscription_id.to_string()),
-                                    current_period_end: None,
-                                    status: SubscriptionStatus::Active,
-                                    cancel_at_period_end: false,
-                                }).unwrap_or_default(),
+                                "billing": bson::to_bson(&merged).unwrap_or_default(),
                                 "updated_at": DateTime::now(),
                             }
                         },
@@ -521,5 +622,47 @@ impl StripeService {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    fn header_for(secret: &str, payload: &[u8], ts: i64) -> String {
+        let signed = format!("{ts}.{}", String::from_utf8_lossy(payload));
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(signed.as_bytes());
+        format!("t={ts},v1={}", hex::encode(mac.finalize().into_bytes()))
+    }
+
+    #[test]
+    fn signature_replay_window_enforced() {
+        let secret = "whsec_test";
+        let body = br#"{"id":"evt_1","type":"noop"}"#;
+        let now = 1_800_000_000i64;
+
+        // Fresh signature: accepted.
+        let h = header_for(secret, body, now - 10);
+        assert!(StripeService::verify_signature_at(secret, body, &h, now).is_ok());
+
+        // Inside the 5-minute window: accepted.
+        let h = header_for(secret, body, now - 290);
+        assert!(StripeService::verify_signature_at(secret, body, &h, now).is_ok());
+
+        // Replayed from outside the window: rejected even though the
+        // HMAC itself is valid.
+        let h = header_for(secret, body, now - 400);
+        assert!(StripeService::verify_signature_at(secret, body, &h, now).is_err());
+
+        // Future-dated beyond tolerance (badly skewed clock): rejected.
+        let h = header_for(secret, body, now + 400);
+        assert!(StripeService::verify_signature_at(secret, body, &h, now).is_err());
+
+        // Wrong secret: rejected.
+        let h = header_for("other", body, now);
+        assert!(StripeService::verify_signature_at(secret, body, &h, now).is_err());
     }
 }

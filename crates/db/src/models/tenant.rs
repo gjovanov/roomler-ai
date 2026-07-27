@@ -135,8 +135,30 @@ impl Tenant {
     pub const COLLECTION: &'static str = "tenants";
 }
 
+/// S5 pivot — the plan matrix is per-user priced with DEVICE caps
+/// (Tailscale-style): the fleet limits lead, the collaboration limits
+/// ride along. Serialized into `/api/stripe/plans`, snapshot-locked by
+/// `crates/tests/src/billing_tests.rs` + `ui/e2e/billing.spec.ts` (update
+/// them in tandem with any change here).
 #[derive(Debug, Serialize)]
 pub struct PlanLimits {
+    // ── Fleet (primary) ─────────────────────────────────────────────
+    /// Enrolled remote-control devices (`agents` rows, tombstones
+    /// excluded). Enforced at agent enrollment.
+    pub max_devices: u32,
+    /// Enrolled tunnel clients. Enforced at tunnel enrollment.
+    pub max_tunnel_clients: u32,
+    /// Overlay mesh membership (private network between the tenant's
+    /// nodes). On for every plan — it's the product's spine.
+    pub overlay_mesh: bool,
+    /// Exit nodes (route a node's whole egress through a mesh peer).
+    pub exit_nodes: bool,
+    /// MagicDNS (tenant overlay DNS domain).
+    pub magic_dns: bool,
+    /// Concurrent remote-control sessions per tenant. Advisory in S5
+    /// (surfaced in the matrix; enforcement is a follow-up).
+    pub max_concurrent_sessions: u32,
+    // ── Collaboration (bundled) ─────────────────────────────────────
     pub max_members: u32,
     pub max_channels: u32,
     pub max_message_history: i64,
@@ -151,6 +173,12 @@ impl Plan {
     pub fn limits(&self) -> PlanLimits {
         match self {
             Plan::Free => PlanLimits {
+                max_devices: 3,
+                max_tunnel_clients: 3,
+                overlay_mesh: true,
+                exit_nodes: false,
+                magic_dns: false,
+                max_concurrent_sessions: 1,
                 max_members: 10,
                 max_channels: 5,
                 max_message_history: 5_000,
@@ -161,6 +189,12 @@ impl Plan {
                 recordings: false,
             },
             Plan::Pro => PlanLimits {
+                max_devices: 30,
+                max_tunnel_clients: 30,
+                overlay_mesh: true,
+                exit_nodes: true,
+                magic_dns: true,
+                max_concurrent_sessions: 5,
                 max_members: u32::MAX,
                 max_channels: u32::MAX,
                 max_message_history: -1,
@@ -171,6 +205,12 @@ impl Plan {
                 recordings: false,
             },
             Plan::Business | Plan::Enterprise => PlanLimits {
+                max_devices: 300,
+                max_tunnel_clients: 300,
+                overlay_mesh: true,
+                exit_nodes: true,
+                magic_dns: true,
+                max_concurrent_sessions: u32::MAX,
                 max_members: u32::MAX,
                 max_channels: u32::MAX,
                 max_message_history: -1,
