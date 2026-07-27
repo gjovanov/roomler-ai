@@ -110,6 +110,30 @@ pub struct NodeStatus {
     /// Additive; absent from older daemons.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_path: Option<String>,
+    /// S2 — MagicDNS status, copied verbatim from [`OverlayView::dns`].
+    /// `None` when the overlay is off, MagicDNS is off for the tenant, or
+    /// the daemon predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns: Option<DnsStatus>,
+}
+
+/// S2 — the MagicDNS state the overlay runtime publishes: what the
+/// desktop's DNS section and `roomler status` render. Tenant-level
+/// domain administration stays server-side (web admin); these are the
+/// per-node facts.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct DnsStatus {
+    /// The magic domain in effect (e.g. `tenant.roomler.net`).
+    pub magic_domain: String,
+    /// The local resolver bound `<overlay-ip>:53` (the split-DNS target).
+    pub resolver_bound: bool,
+    /// The OS was successfully pointed at our resolver for the magic
+    /// domain (split-DNS steer active; reverted on daemon exit).
+    pub os_steer_active: bool,
+    /// Upstream resolver non-overlay queries forward to.
+    pub upstream: String,
+    /// AAAA (derived overlay IPv6) answers are enabled.
+    pub answer_aaaa: bool,
 }
 
 /// A peer device as this node currently sees it.
@@ -352,6 +376,50 @@ pub enum Request {
     /// the pipe/socket ACL is the trust boundary, like
     /// [`Request::SetDeviceName`]. Returns [`Response::ConfigCleaned`].
     ConfigCleanupStale,
+    /// S2 — list every EDITABLE config key with its current value +
+    /// editor metadata (the daemon reads its own config file, so pending
+    /// not-yet-restarted edits show). Secrets are excluded by
+    /// construction. Returns [`Response::ConfigEntries`].
+    ConfigGet,
+    /// S2 — set (or clear, `value: None`) one editable config key. The
+    /// daemon validates per key, persists through its own config path +
+    /// write lock (profile-correct under SYSTEM), and echoes the updated
+    /// entry. Mutating — the pipe/socket ACL is the trust boundary.
+    /// Returns [`Response::ConfigUpdated`] or [`Response::Error`].
+    ConfigSet {
+        key: String,
+        #[serde(default)]
+        value: Option<String>,
+    },
+    /// S2 — read the tail of one of the daemon's log files. `source` is
+    /// `daemon` (this process's active rolling log), `service` (the
+    /// machine-global SCM host log), or `panic` (the newest panic dump).
+    /// `max_bytes` is clamped daemon-side (≤64 KiB) — bounded response,
+    /// poll-based follow (no streaming). Returns [`Response::LogTail`].
+    TailLog {
+        source: String,
+        #[serde(default)]
+        max_bytes: Option<u64>,
+    },
+}
+
+/// One editable config entry (S2 config surface). Values travel as
+/// strings — bools as `"true"`/`"false"`, lists comma-separated,
+/// structured keys as JSON; `kind` tells the client which editor to
+/// render. Secrets are never in this surface.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ConfigEntry {
+    pub key: String,
+    /// Current value; `None` = unset (built-in default applies).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    /// Editor hint: `bool` | `tribool` (unset/on/off) | `string` |
+    /// `enum:<a|b|c>` | `list` (comma-separated) | `json`.
+    pub kind: String,
+    /// The change only takes effect after a daemon restart.
+    pub restart_required: bool,
+    /// One-line operator help.
+    pub description: String,
 }
 
 /// A LocalAPI response. Adjacently tagged so a payload may be a struct
@@ -413,6 +481,22 @@ pub enum Response {
         ok: bool,
         detail: String,
     },
+    /// The editable config surface ([`Request::ConfigGet`]).
+    ConfigEntries(Vec<ConfigEntry>),
+    /// One key was set/cleared + persisted ([`Request::ConfigSet`]) —
+    /// echoes the updated entry (normalized value + restart flag).
+    ConfigUpdated {
+        entry: ConfigEntry,
+    },
+    /// The tail of a daemon log file ([`Request::TailLog`]). `size` is
+    /// the file's TOTAL size — a client polls it to detect growth and
+    /// re-request; `content` starts on a line boundary when the tail cut
+    /// mid-line (lossy UTF-8).
+    LogTail {
+        path: String,
+        size: u64,
+        content: String,
+    },
     /// The verb couldn't be served (bad request, state unavailable).
     Error {
         message: String,
@@ -442,6 +526,10 @@ pub struct OverlayView {
     /// unless this node is configured as an exit-node client. The daemon copies
     /// it verbatim into [`NodeStatus::exit_node`].
     pub exit_node: Option<ExitNodeStatus>,
+    /// S2 — MagicDNS status, filled by the overlay runtime after its DNS
+    /// bring-up. `None` when MagicDNS is off. The daemon copies it
+    /// verbatim into [`NodeStatus::dns`].
+    pub dns: Option<DnsStatus>,
 }
 
 /// Read-only snapshot the daemon provides to [`handle`]. The daemon's impl
@@ -543,6 +631,27 @@ pub trait LocalApiState: Send + Sync {
             message: "config cleanup is not supported on this node".into(),
         }
     }
+    /// S2 — list the editable config surface (async — reads the config
+    /// file). Default: unsupported; the agent daemon overrides.
+    async fn config_entries(&self) -> Response {
+        Response::Error {
+            message: "config editing is not supported on this node".into(),
+        }
+    }
+    /// S2 — set/clear one editable config key (async — config I/O).
+    /// Default: unsupported; the agent daemon overrides.
+    async fn config_set(&self, _key: &str, _value: Option<&str>) -> Response {
+        Response::Error {
+            message: "config editing is not supported on this node".into(),
+        }
+    }
+    /// S2 — tail a daemon log file (async — file I/O). Default:
+    /// unsupported; the agent daemon overrides.
+    async fn tail_log(&self, _source: &str, _max_bytes: Option<u64>) -> Response {
+        Response::Error {
+            message: "log tailing is not supported on this node".into(),
+        }
+    }
 }
 
 /// Pure dispatch: map a [`Request`] to a [`Response`] over a state snapshot.
@@ -571,7 +680,10 @@ pub fn handle(req: &Request, state: &dyn LocalApiState) -> Response {
         | Request::RouteRemove { .. }
         | Request::RouteSetEnabled { .. }
         | Request::SetDeviceName { .. }
-        | Request::ConfigCleanupStale => Response::Error {
+        | Request::ConfigCleanupStale
+        | Request::ConfigGet
+        | Request::ConfigSet { .. }
+        | Request::TailLog { .. } => Response::Error {
             message: "this verb must be served on the async path".into(),
         },
     }
@@ -626,6 +738,9 @@ where
             }
             Ok(Request::SetDeviceName { name }) => state.set_device_name(&name).await,
             Ok(Request::ConfigCleanupStale) => state.config_cleanup_stale().await,
+            Ok(Request::ConfigGet) => state.config_entries().await,
+            Ok(Request::ConfigSet { key, value }) => state.config_set(&key, value.as_deref()).await,
+            Ok(Request::TailLog { source, max_bytes }) => state.tail_log(&source, max_bytes).await,
             Ok(req) => handle(&req, state),
             Err(e) => Response::Error {
                 message: format!("bad request: {e}"),
@@ -1245,6 +1360,59 @@ impl Client {
             other => Err(unexpected_response(other)),
         }
     }
+
+    /// S2 — fetch the editable config surface (key + current value +
+    /// editor metadata). An older daemon answers with a clean `Error`
+    /// (surfaced as `Err`) so callers can hide the editor.
+    pub async fn config_entries(&mut self) -> std::io::Result<Vec<ConfigEntry>> {
+        match self.request(&Request::ConfigGet).await? {
+            Response::ConfigEntries(entries) => Ok(entries),
+            other => Err(unexpected_response(other)),
+        }
+    }
+
+    /// S2 — set (`Some(value)`) or clear (`None`) one editable config
+    /// key; the daemon validates + persists and echoes the updated entry.
+    pub async fn config_set(
+        &mut self,
+        key: &str,
+        value: Option<&str>,
+    ) -> std::io::Result<ConfigEntry> {
+        match self
+            .request(&Request::ConfigSet {
+                key: key.to_string(),
+                value: value.map(str::to_string),
+            })
+            .await?
+        {
+            Response::ConfigUpdated { entry } => Ok(entry),
+            other => Err(unexpected_response(other)),
+        }
+    }
+
+    /// S2 — tail one of the daemon's log files (`daemon` / `service` /
+    /// `panic`). Returns `(path, total_size, content)`; poll `size` to
+    /// detect growth. An older daemon answers with a clean `Error`.
+    pub async fn tail_log(
+        &mut self,
+        source: &str,
+        max_bytes: Option<u64>,
+    ) -> std::io::Result<(String, u64, String)> {
+        match self
+            .request(&Request::TailLog {
+                source: source.to_string(),
+                max_bytes,
+            })
+            .await?
+        {
+            Response::LogTail {
+                path,
+                size,
+                content,
+            } => Ok((path, size, content)),
+            other => Err(unexpected_response(other)),
+        }
+    }
 }
 
 /// Map an error / mismatched response to an `io::Error` for the typed helpers.
@@ -1274,6 +1442,7 @@ mod tests {
                 connected: true,
                 exit_node: None,
                 config_path: None,
+                dns: None,
             }
         }
         fn peers(&self) -> Vec<PeerInfo> {
@@ -1536,6 +1705,65 @@ mod tests {
         ));
         assert!(matches!(
             handle(&Request::SetDeviceName { name: "neo".into() }, &s),
+            Response::Error { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn config_verbs_wire_shape_and_default_unsupported() {
+        // Wire lock: adjacently tagged, snake_case; unset `value` is
+        // omitted on the wire (both directions), a set value is a plain
+        // string.
+        assert_eq!(
+            serde_json::to_string(&Request::ConfigGet).unwrap(),
+            r#"{"t":"config_get"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::ConfigSet {
+                key: "overlay_quic".into(),
+                value: Some("true".into()),
+            })
+            .unwrap(),
+            r#"{"t":"config_set","d":{"key":"overlay_quic","value":"true"}}"#
+        );
+        // Clearing a key: `value` may be omitted entirely by old/terse
+        // clients — serde(default) maps that to None.
+        assert_eq!(
+            serde_json::from_str::<Request>(r#"{"t":"config_set","d":{"key":"overlay_quic"}}"#)
+                .unwrap(),
+            Request::ConfigSet {
+                key: "overlay_quic".into(),
+                value: None,
+            }
+        );
+        let entry = ConfigEntry {
+            key: "overlay_quic".into(),
+            value: None,
+            kind: "tribool".into(),
+            restart_required: true,
+            description: "d".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&Response::ConfigUpdated {
+                entry: entry.clone()
+            })
+            .unwrap(),
+            r#"{"t":"config_updated","d":{"entry":{"key":"overlay_quic","kind":"tribool","restart_required":true,"description":"d"}}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Response::ConfigEntries(vec![])).unwrap(),
+            r#"{"t":"config_entries","d":[]}"#
+        );
+        // Trait defaults: unsupported on non-daemon impls; the sync
+        // `handle` path refuses both (async-only verbs).
+        let s = Mock;
+        assert!(matches!(s.config_entries().await, Response::Error { .. }));
+        assert!(matches!(
+            s.config_set("overlay_quic", None).await,
+            Response::Error { .. }
+        ));
+        assert!(matches!(
+            handle(&Request::ConfigGet, &s),
             Response::Error { .. }
         ));
     }

@@ -169,13 +169,27 @@ const router = createRouter({
 router.beforeEach((to, _from, next) => {
   const token = localStorage.getItem('access_token')
   if (to.meta.auth && !token) {
-    next({ name: 'landing' })
+    if (to.fullPath === '/' || to.fullPath === '') {
+      // Bare root: first-visit marketing page, nothing to return to.
+      next({ name: 'landing' })
+    } else {
+      // S2: remember the protected deep-link (e.g. the desktop app's
+      // "View screen" → /tenant/{tid}/agent/{aid}/remote) and go
+      // straight to login — the landing page would strand the link.
+      // Consumed by the guest guard below and the login/OAuth handlers.
+      sessionStorage.setItem('pending_redirect', to.fullPath)
+      next({ name: 'login' })
+    }
   } else if (to.meta.guest && token) {
     // After login/register, check for pending invite
     const pendingInvite = sessionStorage.getItem('pending_invite_code')
+    const pendingRedirect = sessionStorage.getItem('pending_redirect')
     if (pendingInvite) {
       sessionStorage.removeItem('pending_invite_code')
       next({ name: 'invite', params: { code: pendingInvite } })
+    } else if (pendingRedirect && pendingRedirect.startsWith('/')) {
+      sessionStorage.removeItem('pending_redirect')
+      next(pendingRedirect)
     } else {
       next({ name: 'dashboard' })
     }
