@@ -124,18 +124,31 @@ impl StripeService {
             self.create_customer(email, &tenant_id.to_hex()).await?
         };
 
-        // Persist customer_id if it was just created
+        // Persist customer_id if it was just created. Tenants that never
+        // checked out carry an explicit `billing: null`, and a dotted
+        // `billing.customer_id` $set fails on those with Mongo error 28
+        // ("Cannot create field 'customer_id' in element {billing: null}")
+        // — live repro 2026-07-27 on the first real prod checkout. Set the
+        // whole subdocument in that case (mirrors the webhook path).
         if tenant
             .billing
             .as_ref()
             .and_then(|b| b.customer_id.as_ref())
             .is_none()
         {
+            let update = if tenant.billing.is_some() {
+                doc! { "$set": { "billing.customer_id": &customer_id } }
+            } else {
+                doc! { "$set": { "billing": bson::to_bson(&BillingInfo {
+                    customer_id: Some(customer_id.clone()),
+                    subscription_id: None,
+                    current_period_end: None,
+                    status: SubscriptionStatus::Active,
+                    cancel_at_period_end: false,
+                }).unwrap_or_default() } }
+            };
             collection
-                .update_one(
-                    doc! { "_id": tenant_id },
-                    doc! { "$set": { "billing.customer_id": &customer_id } },
-                )
+                .update_one(doc! { "_id": tenant_id }, update)
                 .await?;
         }
 

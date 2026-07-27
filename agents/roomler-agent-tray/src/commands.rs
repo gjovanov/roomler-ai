@@ -29,6 +29,11 @@ pub struct StatusReport {
     pub service_running: bool,
     pub service_kind: String, // "scheduledTask" | "scmService" | "none"
     pub attention: Option<String>,
+    /// S1b — the sentinel's human message + machine reason, so the
+    /// Overview can say WHAT needs attention (and offer a re-enroll
+    /// action) instead of just printing a file path.
+    pub attention_message: Option<String>,
+    pub attention_reason: Option<String>,
     pub log_dir: String,
     pub config_dir: String,
     /// Both a machine-global AND a per-user config exist — a split-brain
@@ -60,11 +65,13 @@ fn status_report() -> StatusReport {
     let (service_kind, service_running) = probe_service_state();
     let is_scm = service_kind == "scmService";
     let cfg = load_optional_config(is_scm);
-    let attention = if notify::has_attention() {
-        notify::attention_path().map(|p| p.to_string_lossy().into_owned())
-    } else {
-        None
-    };
+    // S1b — read BOTH sentinel locations (per-user + machine-global) and
+    // parse message/reason; the old path-only read missed a SystemContext
+    // host's machine-global sentinel entirely.
+    let attention_info = notify::read_any_attention();
+    let attention = attention_info
+        .as_ref()
+        .map(|i| i.path.to_string_lossy().into_owned());
     StatusReport {
         enrolled: cfg.is_some(),
         agent_id: cfg.as_ref().map(|c| c.agent_id.clone()),
@@ -76,6 +83,8 @@ fn status_report() -> StatusReport {
         service_running,
         service_kind,
         attention,
+        attention_message: attention_info.as_ref().map(|i| i.message.clone()),
+        attention_reason: attention_info.and_then(|i| i.reason),
         log_dir: resolve_log_dir_string(is_scm),
         config_dir: resolve_config_dir_string(is_scm),
         config_split: config_split_detected(),
@@ -320,7 +329,17 @@ pub async fn cmd_enroll(
     if trimmed_name.is_empty() {
         return Err("Device name is empty".to_string());
     }
-    let path = config::default_config_path().map_err(|e| format!("Config path: {e}"))?;
+    // S1b — target the config the daemon actually READS. The old
+    // unconditional per-user write meant "re-enroll" via Onboarding on an
+    // SCM install landed in a file the daemon ignores — manufacturing the
+    // exact split-brain the Settings banner warns about.
+    let is_scm = tokio::task::spawn_blocking(|| probe_service_state().0 == "scmService")
+        .await
+        .unwrap_or(false);
+    let path = match active_config_path(is_scm) {
+        Ok(p) => p,
+        Err(_) => config::default_config_path().map_err(|e| format!("Config path: {e}"))?,
+    };
     let machine_id = roomler_agent::machine::derive_machine_id(&path);
     let cfg = enrollment::enroll(EnrollInputs {
         server_url: &server,
@@ -362,6 +381,23 @@ pub async fn cmd_re_enroll(token: String) -> Result<StatusReport, String> {
     .map_err(|e| format!("Re-enrollment failed: {e:#}"))?;
     config::save(&path, &cfg).map_err(|e| explain_save_error(e, &path, machine_global))?;
     Ok(status_report())
+}
+
+/// S1b — ask the RUNNING daemon to archive the stale config copy (the
+/// split-config banner's button). Daemon-only by design: it knows which
+/// copy it loaded, guards on matching identity, and has the rights an
+/// unelevated desktop app lacks for `%PROGRAMDATA%`. Ok carries the
+/// human detail ("archived … -> …"); Err carries why nothing was done.
+#[tauri::command]
+pub async fn cmd_config_cleanup() -> Result<String, String> {
+    let mut client = localapi::connect()
+        .await
+        .map_err(|e| format!("daemon unreachable: {e}"))?;
+    match client.config_cleanup_stale().await {
+        Ok((true, detail)) => Ok(detail),
+        Ok((false, detail)) => Err(detail),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// Update the device name. Effective on next WS reconnect — the agent

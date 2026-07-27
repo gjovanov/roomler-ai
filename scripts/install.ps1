@@ -94,10 +94,13 @@ if ($machineRole -and -not $DownloadOnly -and -not (Test-Elevated)) {
     throw "role '$Role' installs the perMachine MSI -- run this script from an ELEVATED PowerShell (Terminal (Admin))."
 }
 
-# Pre-rendered hint fragment for enroll commands (perMachine flavours
-# write the machine-global config, which needs the flag + elevation).
+# Pre-rendered hint fragment for enroll commands. S1b: ONLY the
+# SystemContext flavour reads the machine-global config -- a plain-SCM
+# daemon's worker runs user-context and reads the per-user file, so
+# writing machine-global for 'daemon-machine' left the daemon
+# UNENROLLED while the desktop app said "Enrolled" (field bug).
 $mgFlag = ''
-if ($machineRole) { $mgFlag = ' --machine-global' }
+if ($Role -eq 'daemon-system') { $mgFlag = ' --machine-global' }
 
 Say "roomler install.ps1 -- role=$Role server=$Server"
 
@@ -145,7 +148,9 @@ function Install-Daemon {
 
     Say "enrolling this machine as '$Name' against $Server (token is single-use, never echoed)"
     $enrollArgs = @('enroll', '--server', $Server, '--token', $Token, '--name', $Name)
-    if ($machineRole) { $enrollArgs += '--machine-global' }
+    # S1b: machine-global is the SystemContext flavour's config source only
+    # (see the $mgFlag comment above).
+    if ($Role -eq 'daemon-system') { $enrollArgs += '--machine-global' }
     & $daemon @enrollArgs
     if ($LASTEXITCODE -ne 0) { throw "enrollment failed (exit $LASTEXITCODE)" }
 

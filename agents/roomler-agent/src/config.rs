@@ -569,8 +569,13 @@ mod tests {
         let p = machine_global_config_path();
         let s = p.to_string_lossy().to_lowercase();
         assert!(s.contains("roomler"), "path missing roomler: {s}");
+        // S1b: appdirs resolves the NEW `roomler` segment on fresh/migrated
+        // machines and the legacy `roomler-agent` on pre-migration hosts —
+        // both are valid; the old exact-tail assertion failed on any clean
+        // Windows box.
         assert!(
-            s.ends_with(r"roomler\roomler-agent\config.toml"),
+            s.ends_with(r"roomler\roomler-agent\config.toml")
+                || s.ends_with(r"roomler\roomler\config.toml"),
             "unexpected tail: {s}"
         );
         // Distinct from the perUser default (which is under %APPDATA%).
