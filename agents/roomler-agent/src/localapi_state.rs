@@ -267,6 +267,12 @@ impl LocalApiState for DaemonState {
             connected: self.connected.load(Ordering::Relaxed),
             // P5/S4 — exit-node routing status the overlay runtime published.
             exit_node: self.overlay.borrow().exit_node.clone(),
+            // S1b — the config file this daemon actually loaded, so the
+            // desktop stops guessing which copy is live.
+            config_path: self
+                .config_persist
+                .as_ref()
+                .map(|(p, _)| p.display().to_string()),
         }
     }
 
@@ -503,6 +509,102 @@ impl LocalApiState for DaemonState {
         match routes.set_enabled(id, enabled).await {
             Ok(ok) => Response::RouteUpdated { ok },
             Err(message) => Response::Error { message },
+        }
+    }
+
+    /// S1b — archive the STALE config copy on a split-config host (the
+    /// desktop's "Two configurations found" banner finally gets a button).
+    /// The daemon is the only safe actor: it knows which copy it LOADED and
+    /// has the rights to touch `%PROGRAMDATA%`. Guards:
+    ///   * a second copy must actually exist,
+    ///   * the daemon must be connected (proves the live copy's token works),
+    ///   * both copies must parse and carry the SAME `agent_id` (a different
+    ///     id = a second enrollment — refused, an operator must decide),
+    ///   * the stale copy is renamed aside (`config.toml.stale-<ts>`), never
+    ///     deleted.
+    async fn config_cleanup_stale(&self) -> Response {
+        let Some((live_path, lock)) = self.config_persist.as_ref() else {
+            return Response::Error {
+                message: "config cleanup is not available on this daemon".into(),
+            };
+        };
+        // Candidate copies: the per-user default + (Windows) machine-global.
+        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+        if let Ok(p) = crate::config::default_config_path() {
+            candidates.push(p);
+        }
+        #[cfg(target_os = "windows")]
+        candidates.push(crate::config::machine_global_config_path());
+        let stale: Vec<_> = candidates
+            .into_iter()
+            .filter(|p| p != live_path && p.exists())
+            .collect();
+        let Some(stale_path) = stale.first().cloned() else {
+            return Response::ConfigCleaned {
+                ok: false,
+                detail: "no stale config copy present".into(),
+            };
+        };
+        if !self.connected.load(Ordering::Relaxed) {
+            return Response::Error {
+                message: "refusing cleanup while disconnected — the live config's \
+                          token isn't proven working"
+                    .into(),
+            };
+        }
+        let _guard = lock.lock().await;
+        let live = match crate::config::load(live_path) {
+            Ok(c) => c,
+            Err(e) => {
+                return Response::Error {
+                    message: format!("live config unreadable: {e:#}"),
+                };
+            }
+        };
+        let stale_cfg = match crate::config::load(&stale_path) {
+            Ok(c) => c,
+            Err(e) => {
+                return Response::Error {
+                    message: format!("stale config unreadable ({}): {e:#}", stale_path.display()),
+                };
+            }
+        };
+        if live.agent_id.is_empty() || live.agent_id != stale_cfg.agent_id {
+            return Response::Error {
+                message: format!(
+                    "refusing cleanup: the copies carry different identities \
+                     (live agent_id {} vs {} in {}) — that's a second enrollment, \
+                     not a stale duplicate",
+                    live.agent_id,
+                    stale_cfg.agent_id,
+                    stale_path.display()
+                ),
+            };
+        }
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let archived = stale_path.with_extension(format!("toml.stale-{ts}"));
+        match std::fs::rename(&stale_path, &archived) {
+            Ok(()) => {
+                tracing::info!(
+                    stale = %stale_path.display(),
+                    archived = %archived.display(),
+                    "localapi: archived stale config copy"
+                );
+                Response::ConfigCleaned {
+                    ok: true,
+                    detail: format!(
+                        "archived {} -> {}",
+                        stale_path.display(),
+                        archived.display()
+                    ),
+                }
+            }
+            Err(e) => Response::Error {
+                message: format!("archiving {} failed: {e}", stale_path.display()),
+            },
         }
     }
 }

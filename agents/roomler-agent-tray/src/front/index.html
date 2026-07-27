@@ -40,7 +40,7 @@
             <polyline points="7 23 3 19 7 15"></polyline>
             <path d="M21 13v2a4 4 0 0 1-4 4H3"></path>
           </svg>
-          Tunnels
+          Routes
         </a>
         <a href="#/settings" data-view="settings">
           <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -83,7 +83,13 @@
 
         <div id="ov-attention" class="banner banner-error" hidden>
           <strong>Attention required</strong>
+          <p class="small" id="ov-attention-msg" style="margin: 4px 0; white-space: pre-wrap"></p>
           <span class="muted small" id="ov-attention-path"></span>
+          <div class="actions" style="margin-top: 6px">
+            <button type="button" class="primary" id="ov-attention-reenroll" hidden>
+              Re-enroll this device…
+            </button>
+          </div>
         </div>
 
         <div class="card">
@@ -174,7 +180,7 @@
 
       <!-- Tunnels -->
       <section id="view-tunnels" class="view" hidden>
-        <div class="view-head"><h2>Tunnels</h2></div>
+        <div class="view-head"><h2>Routes</h2></div>
         <p class="view-sub">
           Declared routes are supervised by the device service — they come back
           on every restart until removed.
@@ -271,7 +277,14 @@
             <p class="muted small" style="margin: 4px 0 0">
               Both a machine-wide and a per-user configuration exist on this
               machine. The service uses the one shown under Files below — the
-              other copy is likely stale and worth removing.
+              other copy is likely stale.
+            </p>
+            <div class="actions" style="margin-top: 6px">
+              <button type="button" id="btn-config-cleanup">Clean up the stale copy</button>
+            </div>
+            <p class="muted small" style="margin: 4px 0 0">
+              The device service archives the stale file (never deletes) —
+              only when both copies carry the same device identity.
             </p>
           </div>
         </div>
@@ -301,30 +314,17 @@
           </p>
         </div>
 
+        <!-- S1b: enrollment lives in ONE place now — Onboarding handles both
+             fresh enroll and token refresh. This card is just the pointer. -->
         <div class="card">
-          <h3>Re-enrollment</h3>
-          <form id="re-enroll-form" class="form-narrow" autocomplete="off">
-            <label for="re-token">New enrollment token</label>
-            <textarea
-              id="re-token"
-              rows="4"
-              spellcheck="false"
-              autocapitalize="off"
-              placeholder="eyJ…"
-            ></textarea>
-            <div class="actions">
-              <button type="submit">Re-enroll with new token</button>
-            </div>
-          </form>
-          <p class="muted small">
-            Used when this device's token has been revoked. Server URL and device
-            name are preserved.
+          <h3>Enrollment</h3>
+          <p class="muted small" style="margin: 0 0 8px">
+            Need a new token (revoked/expired)? Re-enrollment moved to the
+            Onboarding view — server URL and device name are preserved there.
           </p>
-          <p class="muted small scm-hint" hidden>
-            This device runs a machine-wide service — changing this needs
-            administrator rights (run the desktop app elevated, or use the
-            <span class="mono">roomlerd</span> CLI from an elevated shell).
-          </p>
+          <div class="actions">
+            <button type="button" id="btn-goto-onboarding">Open Onboarding</button>
+          </div>
         </div>
 
         <div class="card">
@@ -371,6 +371,11 @@
         </p>
 
         <div class="card form-narrow">
+          <!-- S1b: shown in re-enroll mode (device already enrolled). -->
+          <div id="onboard-reenroll-note" class="banner banner-warn" hidden>
+            This device is already enrolled — submitting refreshes its token.
+            Server URL and device name are locked to the current enrollment.
+          </div>
           <form id="enroll-form" autocomplete="off">
             <label for="server">Server URL</label>
             <input
