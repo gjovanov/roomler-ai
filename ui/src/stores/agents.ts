@@ -267,6 +267,28 @@ export const useAgentStore = defineStore('agents', () => {
     }
   }
 
+  /** S1a — push an immediate self-update to one agent (`rc:agent.update`).
+   *  Returns whether the message reached a live agent WS; offline agents
+   *  pick the release up on their own periodic check. MANAGE_AGENTS. */
+  async function triggerUpdate(tenantId: string, agentId: string): Promise<boolean> {
+    const resp = await api.post<{ agent_id: string; delivered: boolean }>(
+      `/tenant/${tenantId}/agent/${agentId}/update`,
+      {},
+    )
+    return resp.delivered
+  }
+
+  /** S1a — push an immediate self-update to every agent in the tenant
+   *  (or a selected subset via `agent_ids`). MANAGE_AGENTS. */
+  async function triggerUpdateAll(
+    tenantId: string,
+  ): Promise<{ requested: number; delivered: number }> {
+    return api.post<{ requested: number; delivered: number }>(
+      `/tenant/${tenantId}/agent/update`,
+      {},
+    )
+  }
+
   async function deleteAgent(tenantId: string, agentId: string) {
     await api.delete(`/tenant/${tenantId}/agent/${agentId}`)
     agents.value = agents.value.filter((a) => a.id !== agentId)
@@ -318,6 +340,8 @@ export const useAgentStore = defineStore('agents', () => {
     updateOwner,
     tenantMembers,
     fetchTenantMembers,
+    triggerUpdate,
+    triggerUpdateAll,
     deleteAgent,
     fetchCrashes,
     fetchLogs,
