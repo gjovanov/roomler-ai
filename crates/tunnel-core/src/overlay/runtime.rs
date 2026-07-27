@@ -38,7 +38,7 @@ use super::netmap::{PeerConfig, peer_config_from_netmap};
 use super::relay_link::{ReadyLink, RelayCoordinator, RelayKind};
 use super::tun::TunIo;
 use super::wg::{Carrier, QUIC_BUILD_TIMEOUT, WG_OVERHEAD, WgDevice, overlay_quic_enabled};
-use crate::localapi::{ConnectionType, ExitNodeStatus, OverlayView, PeerInfo};
+use crate::localapi::{ConnectionType, DnsStatus, ExitNodeStatus, OverlayView, PeerInfo};
 use crate::transport::derp::DerpMux;
 use roomler_ai_remote_control::signaling::{ClientMsg, IceServer, NetmapPeer, OverlayNetworkInfo};
 
@@ -896,6 +896,10 @@ pub struct OverlayRuntime {
     /// cannot cross an await). Uncontended: the overlay loop is the only
     /// caller.
     path_shadow: std::sync::Mutex<PathShadow>,
+    /// S2 — the MagicDNS bring-up outcome, set once by [`run`](Self::run)
+    /// after the resolver/OS-steer attempt and grafted onto every
+    /// published [`OverlayView`]. `None` when MagicDNS is off.
+    dns_status: Option<DnsStatus>,
 }
 
 /// Opens the node's `/derp` WS (the agent owns `server_url` + the token +
@@ -984,8 +988,10 @@ fn build_overlay_view(
         self_ip: (!self_ip.is_empty()).then(|| self_ip.to_string()),
         self_ip6: derived_v6_of(self_ip),
         peers,
-        // Set by `publish_view` from the runtime's exit-routing state (S4).
+        // Set by `publish_view` from the runtime's exit-routing state (S4)
+        // and DNS bring-up state (S2).
         exit_node: None,
+        dns: None,
     }
 }
 
@@ -1211,6 +1217,7 @@ impl OverlayRuntime {
             exit_server_ips: Vec::new(),
             derp_mux_factory: None,
             path_shadow: std::sync::Mutex::new(PathShadow::new()),
+            dns_status: None,
         }
     }
 
@@ -1234,6 +1241,7 @@ impl OverlayRuntime {
             exit_server_ips: Vec::new(),
             derp_mux_factory: None,
             path_shadow: std::sync::Mutex::new(PathShadow::new()),
+            dns_status: None,
         }
     }
 
@@ -1316,6 +1324,8 @@ impl OverlayRuntime {
             // S4 — the exit-node routing status the runtime holds (the view
             // builder is pure over peers, so this is grafted on after).
             view.exit_node = exit_status;
+            // S2 — ditto for the DNS bring-up outcome.
+            view.dns = self.dns_status.clone();
             // send_replace never fails (unlike send) even if the receiver is
             // transiently absent, and keeps the value for the next borrow.
             tx.send_replace(view);
@@ -1643,6 +1653,16 @@ impl OverlayRuntime {
         } else {
             None
         };
+        // S2 — record the DNS bring-up outcome for the LocalAPI view
+        // (`roomler status` / the desktop's DNS section). `answer_aaaa`
+        // recomputes the same expression the resolver was configured with.
+        self.dns_status = dns_magic.clone().map(|magic_domain| DnsStatus {
+            magic_domain,
+            resolver_bound: dns_bound,
+            os_steer_active: _dns_os_guard.as_ref().is_some_and(|g| g.active()),
+            upstream: dns_upstream.to_string(),
+            answer_aaaa: crate::env::node_env("DNS_AAAA").as_deref() != Some("0"),
+        });
 
         let mut fallback = tokio::time::interval(FALLBACK_TICK);
         // rc.146 — re-assert per-peer /32 routes so a full-tunnel VPN can't keep

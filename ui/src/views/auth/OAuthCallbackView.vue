@@ -39,7 +39,15 @@ onMounted(async () => {
     auth.token = token
     await auth.fetchMe()
     ws.connect(token)
-    router.push({ name: 'dashboard' })
+    // S2: honor a protected deep-link stashed by the router guard
+    // (parity with the password login path).
+    const pendingRedirect = sessionStorage.getItem('pending_redirect')
+    if (pendingRedirect && pendingRedirect.startsWith('/')) {
+      sessionStorage.removeItem('pending_redirect')
+      router.push(pendingRedirect)
+    } else {
+      router.push({ name: 'dashboard' })
+    }
   } catch (e) {
     error.value = 'Failed to complete OAuth login'
     localStorage.removeItem('access_token')

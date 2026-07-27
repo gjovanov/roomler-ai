@@ -96,6 +96,10 @@ fn main() {
             commands::cmd_route_set_enabled,
             commands::cmd_flows,
             commands::cmd_config_cleanup,
+            commands::cmd_config_entries,
+            commands::cmd_config_set,
+            commands::cmd_tail_log,
+            commands::cmd_open_remote,
         ])
         .on_window_event(|window, event| {
             // Close-to-hide: the window is a view over a resident tray app.

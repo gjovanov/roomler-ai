@@ -253,6 +253,53 @@ pub async fn route_set_enabled(id: &str, enabled: bool) -> Result<()> {
     Ok(())
 }
 
+/// `roomler config ls` — the S2 editable config surface: key, current
+/// value, type. The daemon reads its own config file, so
+/// pending not-yet-restarted edits show.
+pub async fn config_ls(json: bool) -> Result<()> {
+    let mut client = localapi::connect().await.map_err(daemon_err)?;
+    let entries = client.config_entries().await.map_err(daemon_err)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&entries)?);
+        return Ok(());
+    }
+    let key_w = entries
+        .iter()
+        .map(|e| e.key.len())
+        .max()
+        .unwrap_or(3)
+        .max(3);
+    println!("{:key_w$}  {:9}  VALUE", "KEY", "TYPE");
+    for e in &entries {
+        let value = match &e.value {
+            Some(v) if !v.is_empty() => v.clone(),
+            _ => "(default)".to_string(),
+        };
+        println!("{:key_w$}  {:9}  {value}", e.key, e.kind);
+    }
+    println!(
+        "\nchanges take effect on the next daemon restart — `roomler config set <key> <value>`"
+    );
+    Ok(())
+}
+
+/// `roomler config set <key> <value>` / `config clear <key>` — the
+/// daemon validates per key + persists; the echoed entry confirms the
+/// stored value. Validation errors come back verbatim.
+pub async fn config_set(key: &str, value: Option<&str>) -> Result<()> {
+    let mut client = localapi::connect().await.map_err(daemon_err)?;
+    let entry = client
+        .config_set(key, value)
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
+    match &entry.value {
+        Some(v) if !v.is_empty() => println!("{} = {v}", entry.key),
+        _ => println!("{} cleared (built-in default applies)", entry.key),
+    }
+    println!("takes effect on the next daemon restart");
+    Ok(())
+}
+
 /// Map a LocalAPI connect/IO error to a user-facing one. A missing daemon is an
 /// *expected* state, so `NotFound` collapses to a single clean line with **no**
 /// `.source()` chain (the raw "The system cannot find the file specified" /
@@ -453,6 +500,27 @@ fn print_status(s: &NodeStatus) {
             )
         };
         println!("  exit node   {} ({state})", ex.selector);
+    }
+    // S2 — MagicDNS status (only when the tenant has a magic domain and the
+    // overlay published it). "resolver down" / "OS steer failed" are the two
+    // states worth an operator's eye.
+    if let Some(dns) = &s.dns {
+        let health = if !dns.resolver_bound {
+            "resolver DOWN"
+        } else if !dns.os_steer_active {
+            "resolver up, OS steer FAILED"
+        } else {
+            "active"
+        };
+        let aaaa = if dns.answer_aaaa {
+            "AAAA on"
+        } else {
+            "AAAA off"
+        };
+        println!(
+            "  magicdns    {} ({health}, {aaaa}, upstream {})",
+            dns.magic_domain, dns.upstream
+        );
     }
 }
 
