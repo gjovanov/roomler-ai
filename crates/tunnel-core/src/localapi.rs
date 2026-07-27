@@ -104,6 +104,12 @@ pub struct NodeStatus {
     /// ignore the extra field; a v4-only / non-exit daemon omits it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_node: Option<ExitNodeStatus>,
+    /// S1b — the config file this daemon actually LOADED. Ends the desktop's
+    /// guessing game about which of the per-user / machine-global copies is
+    /// live (their resolution ladders disagreed for plain-SCM installs).
+    /// Additive; absent from older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_path: Option<String>,
 }
 
 /// A peer device as this node currently sees it.
@@ -336,6 +342,16 @@ pub enum Request {
     /// The new name is announced on the next server reconnect. Returns
     /// [`Response::DeviceNameSet`] with the effective (trimmed) name.
     SetDeviceName { name: String },
+    /// S1b — archive the STALE config copy on a host carrying both a
+    /// per-user and a machine-global `config.toml` (the desktop's
+    /// "Two configurations found" banner). The DAEMON does the work —
+    /// it knows which copy it loaded and has the rights (an unelevated
+    /// desktop app can't touch `%PROGRAMDATA%`). Guarded: both copies
+    /// must parse, carry the SAME agent identity, and the stale copy is
+    /// renamed aside (`config.toml.stale-<ts>`), never deleted. Mutating —
+    /// the pipe/socket ACL is the trust boundary, like
+    /// [`Request::SetDeviceName`]. Returns [`Response::ConfigCleaned`].
+    ConfigCleanupStale,
 }
 
 /// A LocalAPI response. Adjacently tagged so a payload may be a struct
@@ -389,6 +405,13 @@ pub enum Response {
     /// carries the effective (trimmed) name.
     DeviceNameSet {
         name: String,
+    },
+    /// Result of [`Request::ConfigCleanupStale`] — `ok=true` means the
+    /// stale copy was archived; `detail` explains either outcome
+    /// (archived-to path, or why nothing was touched).
+    ConfigCleaned {
+        ok: bool,
+        detail: String,
     },
     /// The verb couldn't be served (bad request, state unavailable).
     Error {
@@ -512,6 +535,14 @@ pub trait LocalApiState: Send + Sync {
             message: "renaming is not supported on this node".into(),
         }
     }
+    /// S1b — archive the stale config copy on a split-config host
+    /// (async — config I/O). Default: unsupported; the agent daemon
+    /// overrides.
+    async fn config_cleanup_stale(&self) -> Response {
+        Response::Error {
+            message: "config cleanup is not supported on this node".into(),
+        }
+    }
 }
 
 /// Pure dispatch: map a [`Request`] to a [`Response`] over a state snapshot.
@@ -539,7 +570,8 @@ pub fn handle(req: &Request, state: &dyn LocalApiState) -> Response {
         | Request::RouteAdd { .. }
         | Request::RouteRemove { .. }
         | Request::RouteSetEnabled { .. }
-        | Request::SetDeviceName { .. } => Response::Error {
+        | Request::SetDeviceName { .. }
+        | Request::ConfigCleanupStale => Response::Error {
             message: "this verb must be served on the async path".into(),
         },
     }
@@ -593,6 +625,7 @@ where
                 state.route_set_enabled(&id, enabled).await
             }
             Ok(Request::SetDeviceName { name }) => state.set_device_name(&name).await,
+            Ok(Request::ConfigCleanupStale) => state.config_cleanup_stale().await,
             Ok(req) => handle(&req, state),
             Err(e) => Response::Error {
                 message: format!("bad request: {e}"),
@@ -1201,6 +1234,17 @@ impl Client {
             other => Err(unexpected_response(other)),
         }
     }
+
+    /// S1b — ask the daemon to archive the stale config copy on a
+    /// split-config host. Returns `(ok, detail)`; an older daemon
+    /// answers with a clean `Error` (surfaced as `Err`) so callers can
+    /// fall back to showing the manual instructions.
+    pub async fn config_cleanup_stale(&mut self) -> std::io::Result<(bool, String)> {
+        match self.request(&Request::ConfigCleanupStale).await? {
+            Response::ConfigCleaned { ok, detail } => Ok((ok, detail)),
+            other => Err(unexpected_response(other)),
+        }
+    }
 }
 
 /// Map an error / mismatched response to an `io::Error` for the typed helpers.
@@ -1229,6 +1273,7 @@ mod tests {
                 overlay_ip6: None,
                 connected: true,
                 exit_node: None,
+                config_path: None,
             }
         }
         fn peers(&self) -> Vec<PeerInfo> {
