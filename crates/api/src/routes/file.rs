@@ -7,8 +7,6 @@ use axum::{
 use bson::oid::ObjectId;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::path::PathBuf;
-use tokio::io::AsyncReadExt;
 
 use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
 use roomler_ai_db::models::{FileContext, FileContextType};
@@ -137,28 +135,17 @@ async fn do_upload(
     let (filename, content_type, bytes) = file_data;
     let size = bytes.len() as u64;
 
-    let upload_dir = upload_dir();
-    tokio::fs::create_dir_all(&upload_dir)
-        .await
-        .map_err(|e| ApiError::Internal(format!("Failed to create upload dir: {}", e)))?;
-
     let storage_key = format!(
         "{}/room/{}/{}",
         tid.to_hex(),
         rid.to_hex(),
         uuid::Uuid::new_v4()
     );
-    let file_path = upload_dir.join(&storage_key);
-
-    if let Some(parent) = file_path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|e| ApiError::Internal(format!("Failed to create dirs: {}", e)))?;
-    }
-
-    tokio::fs::write(&file_path, &bytes)
+    state
+        .storage
+        .put(&storage_key, bytes)
         .await
-        .map_err(|e| ApiError::Internal(format!("Failed to write file: {}", e)))?;
+        .map_err(|e| ApiError::Internal(format!("Failed to store file: {}", e)))?;
 
     let context = FileContext {
         context_type: FileContextType::Room,
@@ -175,7 +162,7 @@ async fn do_upload(
             filename,
             content_type,
             size,
-            "local".to_string(),
+            state.storage.backend_name().to_string(),
             storage_key,
             String::new(),
         )
@@ -289,15 +276,21 @@ pub async fn download(
     }
 
     let file = state.files.base.find_by_id_in_tenant(tid, fid).await?;
-    let file_path = upload_dir().join(&file.storage_key);
-
-    let mut contents = Vec::new();
-    let mut f = tokio::fs::File::open(&file_path)
+    let contents = state
+        .storage
+        .get(&file.storage_key)
         .await
-        .map_err(|_| ApiError::NotFound("File not found on disk".to_string()))?;
-    f.read_to_end(&mut contents)
-        .await
-        .map_err(|e| ApiError::Internal(format!("Failed to read file: {}", e)))?;
+        .map_err(|e| match e {
+            // tolerate-404: records whose bytes were lost on a pre-S0
+            // pod-ephemeral /tmp (wiped on every deploy) resolve to a clear
+            // 404 rather than a 500.
+            crate::storage::StorageError::NotFound => {
+                ApiError::NotFound("File content is no longer available on the server".to_string())
+            }
+            crate::storage::StorageError::Other(msg) => {
+                ApiError::Internal(format!("Failed to read file: {}", msg))
+            }
+        })?;
 
     // Sanitize the stored filename before it lands in a response
     // header. `Response::builder()…unwrap()` panics if any header
@@ -471,10 +464,4 @@ pub async fn upload_room(
 
     let resp = do_upload(&state, tid, rid, auth.user_id, data).await?;
     Ok(Json(resp))
-}
-
-fn upload_dir() -> PathBuf {
-    let dir = std::env::var("ROOMLER_UPLOAD_DIR")
-        .unwrap_or_else(|_| "/tmp/roomler-ai-uploads".to_string());
-    PathBuf::from(dir)
 }

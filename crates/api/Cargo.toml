@@ -54,3 +54,8 @@ base64.workspace = true
 async-trait.workspace = true
 nanoid.workspace = true
 ipnet = "2" # subnet-route CIDR validation for the mesh subnet-router admin API
+# S3/MinIO file-storage backend (uploads + export artifacts). `aws` feature =
+# the AmazonS3 implementation; MinIO speaks the same dialect via a custom
+# endpoint + path-style addressing. See `src/storage.rs`.
+object_store = { version = "0.12", features = ["aws"] }
+bytes = "1"

@@ -6,7 +6,6 @@ use axum::{
 };
 use bson::oid::ObjectId;
 use serde::Serialize;
-use tokio::io::AsyncReadExt;
 
 use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
 use roomler_ai_services::dao::base::PaginationParams;
@@ -106,13 +105,18 @@ pub async fn download(
         .ok_or_else(|| ApiError::NotFound("Task has no file".to_string()))?;
     let file_name = task.file_name.unwrap_or_else(|| "download".to_string());
 
-    let mut contents = Vec::new();
-    let mut f = tokio::fs::File::open(&file_path)
-        .await
-        .map_err(|_| ApiError::NotFound("File not found on disk".to_string()))?;
-    f.read_to_end(&mut contents)
-        .await
-        .map_err(|e| ApiError::Internal(format!("Failed to read file: {}", e)))?;
+    // `file_path` is a storage key for post-S0 tasks and an absolute local
+    // path for legacy ones; the storage backend resolves both (legacy paths
+    // on the S3 backend miss → 404, the accepted answer for artifacts that
+    // lived on the wiped pod-ephemeral /tmp).
+    let contents = state.storage.get(&file_path).await.map_err(|e| match e {
+        crate::storage::StorageError::NotFound => {
+            ApiError::NotFound("Export file is no longer available".to_string())
+        }
+        crate::storage::StorageError::Other(msg) => {
+            ApiError::Internal(format!("Failed to read file: {}", msg))
+        }
+    })?;
 
     // Determine content type from file name
     let content_type = if file_name.ends_with(".xlsx") {
