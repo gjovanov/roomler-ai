@@ -16,11 +16,25 @@
   },
   "nav": {
     "dashboard": "Dashboard",
+    "devices": "Devices",
+    "network": "Network",
+    "machines": "Machines",
+    "tunnelClients": "Tunnel clients",
+    "tunnelAcl": "Tunnel ACL",
+    "subnetRoutes": "Subnet routes",
+    "magicDns": "MagicDNS",
+    "collaboration": "Collaboration",
     "rooms": "Rooms",
     "explore": "Explore",
     "files": "Files",
+    "invites": "Invites",
     "admin": "Admin",
-    "settings": "Settings"
+    "settings": "Settings",
+    "members": "Members",
+    "roles": "Roles",
+    "tasks": "Tasks",
+    "auditLog": "Audit log",
+    "billing": "Billing"
   },
   "room": {
     "create": "Create Room",
