@@ -147,6 +147,15 @@
     $('ov-btn-onboard').addEventListener('click', () => navigate('onboarding'));
     $('ov-attention-reenroll').addEventListener('click', () => navigate('onboarding'));
 
+    // S7 — the embedded Roomler web window (WebView2 on Windows).
+    $('ov-btn-open-web').addEventListener('click', async () => {
+      try {
+        await invoke('cmd_open_roomler');
+      } catch (e) {
+        pushOutput('Could not open Roomler: ' + e);
+      }
+    });
+
     $('btn-check-update').addEventListener('click', async () => {
       pushOutput('Checking for updates…');
       try {
