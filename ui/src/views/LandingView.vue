@@ -8,6 +8,7 @@
       </v-toolbar-title>
       <v-spacer />
       <v-btn variant="text" href="#features" class="d-none d-sm-inline-flex">Features</v-btn>
+      <v-btn variant="text" href="#download" class="d-none d-sm-inline-flex">Download</v-btn>
       <v-btn variant="text" href="#pricing" class="d-none d-sm-inline-flex">Pricing</v-btn>
       <v-btn variant="outlined" color="primary" :to="{ name: 'login' }" class="mx-2">Log In</v-btn>
       <v-btn color="primary" :to="{ name: 'register' }" class="d-none d-sm-inline-flex">Get Started Free</v-btn>
@@ -18,42 +19,69 @@
     <section class="hero-section">
       <v-container>
         <v-row align="center" justify="center">
-          <v-col cols="12" md="8" class="text-center">
-            <h1 class="text-h4 text-md-h2 font-weight-bold mb-4">Where teams connect, collaborate,<br/>and create — <span class="text-primary">in real time</span></h1>
-            <p class="text-body-1 text-md-h6 landing-muted mb-6 mb-md-8">Rooms for chat and calls, threaded messaging, HD video conferencing, file sharing, and AI-powered document recognition — all in one platform.</p>
+          <v-col cols="12" md="9" class="text-center">
+            <h1 class="text-h4 text-md-h2 font-weight-bold mb-4">Every device you own,<br/><span class="text-primary">one secure network</span></h1>
+            <p class="text-body-1 text-md-h6 landing-muted mb-6 mb-md-8">Remote desktop from any browser, a private WireGuard-style mesh between your machines, and tunnels into the networks you care about — with team chat and video conferencing included.</p>
             <div class="d-flex flex-wrap justify-center ga-3">
               <v-btn color="primary" size="large" :to="{ name: 'register' }" class="px-6">Start Free</v-btn>
-              <v-btn variant="outlined" size="large" href="#pricing" class="px-6">View Plans</v-btn>
+              <v-btn variant="outlined" size="large" href="#download" class="px-6">Download</v-btn>
             </div>
           </v-col>
         </v-row>
       </v-container>
     </section>
 
-    <!-- Trust bar -->
-    <section class="trust-section py-4 py-md-8">
+    <!-- Capability strip (honest, no fabricated stats) -->
+    <section class="trust-section py-4 py-md-6">
       <v-container>
-        <p class="text-center text-body-2 landing-muted mb-4">Trusted by teams who value real-time collaboration</p>
-        <v-row justify="center" align="center">
-          <v-col v-for="stat in stats" :key="stat.label" cols="6" sm="3" class="text-center">
-            <div class="text-h4 font-weight-bold text-primary">{{ stat.value }}</div>
-            <div class="text-body-2 landing-muted">{{ stat.label }}</div>
-          </v-col>
-        </v-row>
+        <div class="d-flex flex-wrap justify-center ga-2">
+          <v-chip v-for="c in capabilities" :key="c" variant="tonal" color="primary" size="small">{{ c }}</v-chip>
+        </div>
       </v-container>
     </section>
 
-    <!-- Features -->
+    <!-- Pillars -->
     <section id="features" class="features-section py-8 py-md-16">
       <v-container>
-        <h2 class="text-h4 text-md-h3 text-center font-weight-bold mb-2">Everything your team needs</h2>
-        <p class="text-center text-body-1 landing-muted mb-6 mb-md-12">From quick messages to deep collaboration</p>
-        <v-row>
-          <v-col v-for="feature in features" :key="feature.title" cols="12" sm="6" md="4">
-            <v-card variant="outlined" class="feature-card pa-4 pa-md-6 h-100" rounded="lg">
-              <v-icon :color="feature.color" size="48" class="mb-4">{{ feature.icon }}</v-icon>
-              <h3 class="text-h6 font-weight-bold mb-2">{{ feature.title }}</h3>
-              <p class="text-body-2 landing-muted">{{ feature.description }}</p>
+        <div v-for="(pillar, pi) in pillars" :key="pillar.title" :class="pi > 0 ? 'mt-10 mt-md-16' : ''">
+          <h2 class="text-h4 text-md-h3 text-center font-weight-bold mb-2">{{ pillar.title }}</h2>
+          <p class="text-center text-body-1 landing-muted mb-6 mb-md-10">{{ pillar.subtitle }}</p>
+          <v-row>
+            <v-col v-for="feature in pillar.features" :key="feature.title" cols="12" sm="6" md="4">
+              <v-card variant="outlined" class="feature-card pa-4 pa-md-6 h-100" rounded="lg">
+                <v-icon :color="feature.color" size="48" class="mb-4">{{ feature.icon }}</v-icon>
+                <h3 class="text-h6 font-weight-bold mb-2">{{ feature.title }}</h3>
+                <p class="text-body-2 landing-muted">{{ feature.description }}</p>
+              </v-card>
+            </v-col>
+          </v-row>
+        </div>
+      </v-container>
+    </section>
+
+    <!-- Download / install -->
+    <section id="download" class="download-section py-8 py-md-16">
+      <v-container>
+        <h2 class="text-h4 text-md-h3 text-center font-weight-bold mb-2">Set up a device in minutes</h2>
+        <p class="text-center text-body-1 landing-muted mb-6 mb-md-12">Run the graphical installer or paste one command. Enrollment tokens come from your workspace (Devices → Enroll device).</p>
+        <v-row justify="center">
+          <v-col v-for="os in downloads" :key="os.os" cols="12" md="4">
+            <v-card variant="outlined" class="pa-4 pa-md-6 h-100 d-flex flex-column" rounded="lg">
+              <div class="d-flex align-center mb-3">
+                <v-icon size="32" class="mr-2" color="primary">{{ os.icon }}</v-icon>
+                <h3 class="text-h6 font-weight-bold">{{ os.title }}</h3>
+              </div>
+              <v-btn
+                :href="os.wizardUrl"
+                color="primary"
+                variant="tonal"
+                prepend-icon="mdi-download"
+                class="mb-4 align-self-start"
+              >
+                Roomler Setup
+              </v-btn>
+              <p class="text-body-2 landing-muted mb-1">Or from a terminal:</p>
+              <pre class="install-cmd text-caption pa-2 rounded flex-grow-1">{{ os.command }}</pre>
             </v-card>
           </v-col>
         </v-row>
@@ -63,22 +91,22 @@
     <!-- Pricing -->
     <section id="pricing" class="pricing-section py-8 py-md-16">
       <v-container>
-        <h2 class="text-h4 text-md-h3 text-center font-weight-bold mb-2">Simple, transparent pricing</h2>
-        <p class="text-center text-body-1 landing-muted mb-6 mb-md-12">Start free, upgrade when you need more</p>
+        <h2 class="text-h4 text-md-h3 text-center font-weight-bold mb-2">Simple, per-user pricing</h2>
+        <p class="text-center text-body-1 landing-muted mb-6 mb-md-12">Every plan includes the private network and remote desktop. Start free, upgrade for more devices.</p>
         <v-row justify="center">
-          <v-col v-for="plan in plans" :key="plan.name" cols="12" sm="6" md="4">
+          <v-col v-for="plan in plans" :key="plan.id" cols="12" sm="6" md="4">
             <v-card
-              :variant="plan.popular ? 'elevated' : 'outlined'"
-              :elevation="plan.popular ? 8 : 0"
+              :variant="plan.id === 'pro' ? 'elevated' : 'outlined'"
+              :elevation="plan.id === 'pro' ? 8 : 0"
               class="pa-4 pa-md-6 h-100 d-flex flex-column"
               rounded="lg"
-              :class="{ 'border-primary': plan.popular }"
+              :class="{ 'border-primary': plan.id === 'pro' }"
             >
-              <v-chip v-if="plan.popular" color="primary" size="small" class="mb-4 align-self-start">Most Popular</v-chip>
+              <v-chip v-if="plan.id === 'pro'" color="primary" size="small" class="mb-4 align-self-start">Most Popular</v-chip>
               <h3 class="text-h5 font-weight-bold">{{ plan.name }}</h3>
               <div class="my-4">
-                <span class="text-h3 font-weight-bold">${{ plan.price }}</span>
-                <span v-if="plan.price > 0" class="text-body-2 landing-muted">/user/mo</span>
+                <span class="text-h3 font-weight-bold">${{ plan.price_cents / 100 }}</span>
+                <span v-if="plan.price_cents > 0" class="text-body-2 landing-muted">/user/mo</span>
                 <span v-else class="text-body-2 landing-muted">forever</span>
               </div>
               <v-divider class="mb-4" />
@@ -86,14 +114,14 @@
                 <v-list-item v-for="f in plan.features" :key="f" :title="f" prepend-icon="mdi-check" />
               </v-list>
               <v-btn
-                :color="plan.popular ? 'primary' : undefined"
-                :variant="plan.popular ? 'flat' : 'outlined'"
+                :color="plan.id === 'pro' ? 'primary' : undefined"
+                :variant="plan.id === 'pro' ? 'flat' : 'outlined'"
                 block
                 size="large"
                 :to="{ name: 'register' }"
                 class="mt-4"
               >
-                {{ plan.price === 0 ? 'Get Started Free' : 'Start Free Trial' }}
+                {{ plan.price_cents === 0 ? 'Get Started Free' : 'Start Now' }}
               </v-btn>
             </v-card>
           </v-col>
@@ -106,8 +134,8 @@
       <v-container>
         <v-row justify="center">
           <v-col cols="12" md="8" class="text-center">
-            <h2 class="text-h4 text-md-h3 font-weight-bold mb-4 text-white">Ready to bring your team together?</h2>
-            <p class="text-body-1 cta-subtitle mb-6 mb-md-8">Join thousands of teams already collaborating on Roomler.</p>
+            <h2 class="text-h4 text-md-h3 font-weight-bold mb-4 text-white">Take your devices with you</h2>
+            <p class="text-body-1 cta-subtitle mb-6 mb-md-8">Free for up to 3 devices — remote desktop, private mesh, tunnels, chat and calls.</p>
             <v-btn color="white" size="large" :to="{ name: 'register' }" class="px-6 text-primary">Create Your Workspace — Free</v-btn>
           </v-col>
         </v-row>
@@ -120,19 +148,19 @@
         <v-row>
           <v-col cols="12" sm="4">
             <div class="text-h6 font-weight-bold mb-2">Roomler</div>
-            <p class="text-body-2 landing-muted">Real-time collaboration for modern teams.</p>
+            <p class="text-body-2 landing-muted">Remote access, private networking, and collaboration for your devices and your team.</p>
           </v-col>
           <v-col cols="6" sm="2">
             <div class="text-subtitle-2 font-weight-bold mb-2">Product</div>
-            <div class="text-body-2 landing-muted mb-1">Features</div>
-            <div class="text-body-2 landing-muted mb-1">Pricing</div>
-            <div class="text-body-2 landing-muted mb-1">Security</div>
+            <a href="#features" class="text-body-2 landing-muted mb-1 d-block text-decoration-none">Features</a>
+            <a href="#download" class="text-body-2 landing-muted mb-1 d-block text-decoration-none">Download</a>
+            <a href="#pricing" class="text-body-2 landing-muted mb-1 d-block text-decoration-none">Pricing</a>
           </v-col>
           <v-col cols="6" sm="2">
-            <div class="text-subtitle-2 font-weight-bold mb-2">Company</div>
-            <div class="text-body-2 landing-muted mb-1">About</div>
-            <div class="text-body-2 landing-muted mb-1">Blog</div>
-            <div class="text-body-2 landing-muted mb-1">Careers</div>
+            <div class="text-subtitle-2 font-weight-bold mb-2">Install</div>
+            <a href="/api/setup/windows" class="text-body-2 landing-muted mb-1 d-block text-decoration-none">Windows</a>
+            <a href="/api/setup/macos" class="text-body-2 landing-muted mb-1 d-block text-decoration-none">macOS</a>
+            <a href="/api/setup/linux" class="text-body-2 landing-muted mb-1 d-block text-decoration-none">Linux</a>
           </v-col>
           <v-col cols="12" sm="4">
             <div class="text-subtitle-2 font-weight-bold mb-2">Legal</div>
@@ -148,93 +176,145 @@
   </v-theme-provider>
 </template>
 
-<script setup>
-const stats = [
-  { value: '10K+', label: 'Active Teams' },
-  { value: '1M+', label: 'Messages Daily' },
-  { value: '99.9%', label: 'Uptime' },
-  { value: '4.8/5', label: 'User Rating' },
+<script setup lang="ts">
+import { onMounted, ref } from 'vue'
+import { useRoute } from 'vue-router'
+import { enrollCommands } from '@/utils/enrollCommands'
+
+const route = useRoute()
+
+const capabilities = [
+  'Remote desktop',
+  'Private mesh network',
+  'Tunnels & SOCKS5',
+  'Exit nodes',
+  'MagicDNS',
+  'Chat & video included',
 ]
 
-const features = [
+// Pivot order: remote access first, the private network second,
+// collaboration as the included bonus.
+const pillars = [
   {
-    icon: 'mdi-pound',
-    title: 'Organized Rooms',
-    description: 'Create rooms for every team, project, or topic. Chat and call in the same space with flexible room settings.',
-    color: '#009688',
+    title: 'Reach any of your devices',
+    subtitle: 'A TeamViewer-style remote desktop that lives in your browser',
+    features: [
+      {
+        icon: 'mdi-monitor-eye',
+        title: 'Remote desktop in the browser',
+        description: 'Hardware-encoded H.264/HEVC/VP9 with sub-100 ms input latency. No viewer install — any Chromium browser is the controller.',
+        color: '#009688',
+      },
+      {
+        icon: 'mdi-shield-lock-outline',
+        title: 'Works behind strict networks',
+        description: 'Direct peer-to-peer when possible; TURN relays and WebSocket fallbacks punch through corporate firewalls and full-tunnel VPNs.',
+        color: '#ef5350',
+      },
+      {
+        icon: 'mdi-monitor-multiple',
+        title: 'Fleet management built in',
+        description: 'Enroll unattended machines, push updates from the web, transfer files and clipboard, and audit every session.',
+        color: '#009688',
+      },
+    ],
   },
   {
-    icon: 'mdi-message-text-outline',
-    title: 'Threaded Chat',
-    description: 'Rich messaging with threads, reactions, mentions, pins, and file attachments — nothing gets lost.',
-    color: '#ef5350',
+    title: 'Your own private network',
+    subtitle: 'A Tailscale-style overlay mesh between everything you enroll',
+    features: [
+      {
+        icon: 'mdi-lan',
+        title: 'WireGuard-style mesh',
+        description: 'Every device gets a stable private address. Traffic flows directly between machines with NAT hole-punching and encrypted end to end.',
+        color: '#ef5350',
+      },
+      {
+        icon: 'mdi-router-network',
+        title: 'Subnet routers & exit nodes',
+        description: 'Expose a whole LAN through one machine, or route all your traffic through a trusted exit node when you travel.',
+        color: '#009688',
+      },
+      {
+        icon: 'mdi-dns-outline',
+        title: 'MagicDNS & tunnels',
+        description: 'Reach machines by name, forward ports, and run SOCKS5 tunnels into networks only one of your devices can see.',
+        color: '#ef5350',
+      },
+    ],
   },
   {
-    icon: 'mdi-video-outline',
-    title: 'HD Video Conferencing',
-    description: 'Built-in WebRTC SFU for crystal-clear video meetings with screen sharing and recording.',
-    color: '#009688',
-  },
-  {
-    icon: 'mdi-file-document-outline',
-    title: 'File Sharing & AI',
-    description: 'Upload files, sync with cloud storage, and let AI recognize and categorize your documents.',
-    color: '#ef5350',
-  },
-  {
-    icon: 'mdi-account-group-outline',
-    title: 'Multi-Tenant Workspaces',
-    description: 'Isolated workspaces with roles, permissions, and invite links for secure collaboration.',
-    color: '#009688',
-  },
-  {
-    icon: 'mdi-cloud-outline',
-    title: 'Cloud Integrations',
-    description: 'Connect Google Drive, OneDrive, and Dropbox. Export conversations to Excel and PDF.',
-    color: '#ef5350',
+    title: 'Collaboration included',
+    subtitle: 'The team layer is part of every plan — not an add-on',
+    features: [
+      {
+        icon: 'mdi-pound',
+        title: 'Rooms, chat & threads',
+        description: 'Organized rooms with threaded messaging, reactions, mentions and file attachments.',
+        color: '#009688',
+      },
+      {
+        icon: 'mdi-video-outline',
+        title: 'HD video conferencing',
+        description: 'Built-in SFU for crystal-clear meetings with screen sharing and recordings.',
+        color: '#ef5350',
+      },
+      {
+        icon: 'mdi-file-document-outline',
+        title: 'Files, cloud & AI',
+        description: 'File sharing with cloud-storage sync and AI-powered document recognition.',
+        color: '#009688',
+      },
+    ],
   },
 ]
 
-const plans = [
-  {
-    name: 'Free',
-    price: 0,
-    popular: false,
-    features: [
-      '10 members',
-      '5 rooms',
-      '5K message history',
-      '100 MB storage',
-      'Basic chat & DMs',
-    ],
-  },
-  {
-    name: 'Pro',
-    price: 8,
-    popular: true,
-    features: [
-      'Unlimited members',
-      'Unlimited rooms',
-      'Full message history',
-      '10 GB storage',
-      'Video conferencing (10)',
-      'Cloud integrations',
-    ],
-  },
-  {
-    name: 'Business',
-    price: 16,
-    popular: false,
-    features: [
-      'Everything in Pro',
-      '100 GB storage',
-      'Video (100 participants)',
-      'AI doc recognition',
-      'Recordings',
-      'Priority support',
-    ],
-  },
-]
+// One-line installs — same vitest-locked template source the in-app
+// enrollment dialog uses (token placeholder until they have one).
+const osMeta: Record<string, { icon: string; wizard: string }> = {
+  windows: { icon: 'mdi-microsoft-windows', wizard: '/api/setup/windows' },
+  linux: { icon: 'mdi-linux', wizard: '/api/setup/linux' },
+  macos: { icon: 'mdi-apple', wizard: '/api/setup/macos' },
+}
+const downloads = enrollCommands('agent', window.location.origin, null).map((os) => ({
+  os: os.os,
+  title: os.title,
+  icon: osMeta[os.os]!.icon,
+  wizardUrl: osMeta[os.os]!.wizard,
+  command: os.blocks[0]!.command,
+}))
+
+interface LandingPlan {
+  id: string
+  name: string
+  price_cents: number
+  features: string[]
+}
+
+// Static fallback mirrors the server matrix so the page renders even if
+// the API is briefly unreachable; replaced by /api/stripe/plans (the
+// single source of truth) as soon as the fetch lands.
+const plans = ref<LandingPlan[]>([
+  { id: 'free', name: 'Free', price_cents: 0, features: ['3 devices', 'Private network (overlay mesh)', 'Chat: 10 members'] },
+  { id: 'pro', name: 'Pro', price_cents: 800, features: ['30 devices', 'Exit nodes + MagicDNS', 'Unlimited members'] },
+  { id: 'business', name: 'Business', price_cents: 1600, features: ['300 devices', 'Everything in Pro', 'Priority support'] },
+])
+
+onMounted(async () => {
+  try {
+    const resp = await fetch('/api/stripe/plans')
+    if (resp.ok) {
+      const live = (await resp.json()) as LandingPlan[]
+      if (Array.isArray(live) && live.length > 0) plans.value = live
+    }
+  } catch {
+    // fallback copy stays
+  }
+  // The /pricing route renders this same view — land on the plans.
+  if (route.name === 'pricing') {
+    document.getElementById('pricing')?.scrollIntoView({ behavior: 'auto' })
+  }
+})
 </script>
 
 <style scoped>
@@ -291,6 +371,19 @@ const plans = [
 
 .features-section {
   background: #ffffff;
+}
+
+.download-section {
+  background: linear-gradient(180deg, #ffffff 0%, #f5faf9 100%);
+}
+
+.install-cmd {
+  background: #1a1a2e;
+  color: #e0f2f1;
+  font-family: monospace;
+  white-space: pre-wrap;
+  word-break: break-all;
+  margin: 0;
 }
 
 .feature-card {
