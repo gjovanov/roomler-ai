@@ -20,6 +20,47 @@ use crate::util::*;
 
 const STUN_GATHER_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Roomler patch (media dodges the overlay): type-preference slot for host
+/// candidates whose interface IP sits inside the Roomler overlay ranges.
+/// Chosen BELOW server-reflexive (100) and ABOVE relay (0), so ICE prefers a
+/// working real-path pair (srflx↔srflx, ~free of overlay weather) over
+/// tunnelling media through the mesh, while overlay-host pairs stay available
+/// as a fallback tier when real-path checks fail (corp UDP-block etc.).
+/// Pair priority is 2^32*MIN(G,D)+2*MAX(G,D)+(G>D?1:0) — sinking OUR
+/// candidate's advertised priority sinks every pair containing it on both
+/// ends, so an agent-side-only change reorders the browser's choice too.
+const OVERLAY_HOST_TYPE_PREFERENCE: u32 = 90;
+
+/// Returns a `priority` override for a host candidate on `ip`, or 0 (meaning
+/// "no override — compute the RFC 8445 value") for non-overlay interfaces.
+/// Escape hatch: `ROOMLER_ICE_OVERLAY_HOST_DEPRIORITIZE=0` restores upstream
+/// behaviour for every interface.
+fn overlay_host_priority_override(ip: &std::net::IpAddr, component: u16) -> u32 {
+    if std::env::var("ROOMLER_ICE_OVERLAY_HOST_DEPRIORITIZE").as_deref() == Ok("0") {
+        return 0;
+    }
+    if !is_roomler_overlay_ip(ip) {
+        return 0;
+    }
+    (1 << 24) * OVERLAY_HOST_TYPE_PREFERENCE + (1 << 8) * 65535 + (256 - u32::from(component))
+}
+
+/// The Roomler overlay addresses: CGNAT 100.64.0.0/10 (v4) and the mesh ULA
+/// fd72:6f6f:6d6c::/48 (v6). Matching by range (not interface name) keeps the
+/// check OS-independent and immune to adapter renames.
+fn is_roomler_overlay_ip(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            o[0] == 100 && (o[1] & 0b1100_0000) == 0b0100_0000
+        }
+        std::net::IpAddr::V6(v6) => {
+            let s = v6.segments();
+            s[0] == 0xfd72 && s[1] == 0x6f6f && s[2] == 0x6d6c
+        }
+    }
+}
+
 pub(crate) struct GatherCandidatesInternalParams {
     pub(crate) udp_network: UDPNetwork,
     pub(crate) candidate_types: Vec<CandidateType>,
@@ -326,6 +367,7 @@ impl Agent {
                         port,
                         component: COMPONENT_RTP,
                         conn: Some(conn),
+                        priority: overlay_host_priority_override(&ip, COMPONENT_RTP),
                         ..CandidateBaseConfig::default()
                     },
                     ..CandidateHostConfig::default()
@@ -459,6 +501,7 @@ impl Agent {
                     port,
                     conn: Some(conn.clone()),
                     component: COMPONENT_RTP,
+                    priority: overlay_host_priority_override(&candidate_ip, COMPONENT_RTP),
                     ..Default::default()
                 },
                 tcp_type: TcpType::Unspecified,
@@ -1001,5 +1044,50 @@ impl Agent {
         }
 
         wg.wait().await;
+    }
+}
+
+#[cfg(test)]
+mod overlay_priority_tests {
+    use std::net::IpAddr;
+
+    use super::*;
+
+    /// One test fn on purpose: the escape-hatch assertion mutates process env,
+    /// and cargo runs #[test] fns in parallel threads.
+    #[test]
+    fn overlay_host_candidates_sink_below_srflx_but_stay_above_relay() {
+        let overlay_v4: IpAddr = "100.64.0.29".parse().unwrap();
+        let overlay_v4_hi: IpAddr = "100.127.255.254".parse().unwrap();
+        let overlay_v6: IpAddr = "fd72:6f6f:6d6c::6440:1d".parse().unwrap();
+        let lan_v4: IpAddr = "192.168.5.10".parse().unwrap();
+        let below_cgnat: IpAddr = "100.63.255.255".parse().unwrap();
+        let above_cgnat: IpAddr = "100.128.0.1".parse().unwrap();
+        let other_ula: IpAddr = "fd00:dead:beef::1".parse().unwrap();
+
+        std::env::remove_var("ROOMLER_ICE_OVERLAY_HOST_DEPRIORITIZE");
+
+        let p = overlay_host_priority_override(&overlay_v4, COMPONENT_RTP);
+        assert_ne!(p, 0, "overlay v4 host must get an override");
+        assert_eq!(p, overlay_host_priority_override(&overlay_v4_hi, COMPONENT_RTP));
+        assert_eq!(p, overlay_host_priority_override(&overlay_v6, COMPONENT_RTP));
+
+        // Ordering locks: below every srflx candidate (type pref 100), above
+        // every relay candidate (type pref 0).
+        let srflx_floor = 100u32 << 24;
+        let relay_ceiling = (1u32 << 24) - 1 + (65535 << 8) + 255;
+        assert!(p < srflx_floor, "override {p} must rank below srflx floor {srflx_floor}");
+        assert!(p > relay_ceiling, "override {p} must rank above relay ceiling {relay_ceiling}");
+
+        // Non-overlay interfaces keep the upstream computed priority (0 = no
+        // override).
+        for ip in [&lan_v4, &below_cgnat, &above_cgnat, &other_ula] {
+            assert_eq!(overlay_host_priority_override(ip, COMPONENT_RTP), 0, "{ip} must not be overridden");
+        }
+
+        // Escape hatch restores upstream behaviour everywhere.
+        std::env::set_var("ROOMLER_ICE_OVERLAY_HOST_DEPRIORITIZE", "0");
+        assert_eq!(overlay_host_priority_override(&overlay_v4, COMPONENT_RTP), 0);
+        std::env::remove_var("ROOMLER_ICE_OVERLAY_HOST_DEPRIORITIZE");
     }
 }
