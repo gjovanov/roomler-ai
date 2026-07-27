@@ -1650,6 +1650,16 @@ impl OverlayRuntime {
         // skip it (routes are freshly installed by `install_peers` below).
         let mut route_guard = tokio::time::interval(ROUTE_GUARD_TICK);
         route_guard.tick().await;
+        // P4 — event-driven route guard: subscribe to OS route-table changes
+        // (NotifyRouteChange2 / `ip monitor route`) so an erased route is
+        // re-asserted within milliseconds instead of at the next 2 s tick.
+        // The tick above KEEPS running as the backstop until the P4 demotion
+        // gate (a fleet soak proving the subscription catches every erase
+        // first); `None` (env-disabled / platform-unavailable) = pre-P4
+        // behaviour exactly. Waves are rate-limited: our own re-asserts feed
+        // the subscription back (see `route_events` module doc).
+        let mut route_watch = super::route_events::spawn_route_watch();
+        let mut last_route_wave: Option<Instant> = None;
         // Phase D — LAZY `/derp`: open the WS (via the agent-provided factory)
         // ONLY for a relay-mode node that is itself UDP-blocked — i.e. its srflx
         // gather found nothing (`srflx_advertised.is_empty()`). A UDP-capable
@@ -2064,6 +2074,59 @@ impl OverlayRuntime {
                             tun.add_cidr_route(cidr).await.ok();
                         }
                         warn_if_slow("arm:route_guard(exit /1)", t0);
+                    }
+                },
+                // P4 — OS route-table change → re-assert NOW (same body as the
+                // 2 s tick above: detached /32 wave + inline exit /1). Rate-
+                // limited to one wave per ROUTE_WAVE_MIN_INTERVAL because our
+                // own re-asserts feed the subscription back; anything erased
+                // inside the quiet window is the tick's job (which is why the
+                // tick stays until the P4 demotion gate). Inert (`pending`)
+                // when the subscription is off/unavailable.
+                maybe_route_evt = async {
+                    match route_watch.as_mut() {
+                        Some(w) => w.recv().await,
+                        None => std::future::pending::<Option<String>>().await,
+                    }
+                } => {
+                    match maybe_route_evt {
+                        Some(first) => {
+                            let burst = route_watch.as_mut().map(|w| w.drain()).unwrap_or(0);
+                            let due = last_route_wave
+                                .is_none_or(|t| t.elapsed() >= super::route_events::ROUTE_WAVE_MIN_INTERVAL);
+                            if due {
+                                last_route_wave = Some(Instant::now());
+                                let first_short: String = first.chars().take(120).collect();
+                                info!(
+                                    events = burst + 1, first = %first_short,
+                                    "overlay: route-table change — re-asserting peer routes now (P4 event-driven; 2 s tick remains the backstop)"
+                                );
+                                if let Ok(guard) = route_reassert_lock.clone().try_lock_owned() {
+                                    let tun2 = tun.clone();
+                                    let ips: Vec<Ipv4Addr> =
+                                        by_node.values().map(|e| e.overlay_ip).collect();
+                                    tokio::spawn(async move {
+                                        let _guard = guard;
+                                        for ip in ips {
+                                            tun2.add_peer_route(ip).await.ok();
+                                        }
+                                    });
+                                }
+                                // P5 exit /1 — INLINE for the same teardown-
+                                // mutual-exclusion reason as the tick arm.
+                                if exit_state.split_default_installed {
+                                    let t0 = Instant::now();
+                                    for cidr in SPLIT_DEFAULT_V4.iter().chain(SPLIT_DEFAULT_V6.iter()) {
+                                        tun.add_cidr_route(cidr).await.ok();
+                                    }
+                                    warn_if_slow("arm:route_events(exit /1)", t0);
+                                }
+                            }
+                        }
+                        None => {
+                            debug!("overlay: route-event subscription ended — route guard falls back to tick-only");
+                            route_watch = None;
+                        }
                     }
                 },
                 // Phase A — an authenticated inbound direct handshake initiation
