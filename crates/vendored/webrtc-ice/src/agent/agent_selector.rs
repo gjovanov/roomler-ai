@@ -346,7 +346,23 @@ impl ControllingSelector for AgentInternal {
                     pending_request.is_use_candidate,
                     selected_pair_is_none
                 );
-                if pending_request.is_use_candidate && selected_pair_is_none {
+                // Roomler patch (follow renomination): mirror of the
+                // handle_binding_request policy — when the USE-CANDIDATE
+                // arrived before this pair's own check completed, the
+                // triggered check's success must also honour the controlling
+                // agent's latest nomination, not only a cold start.
+                // Escape hatch: ROOMLER_ICE_FOLLOW_RENOMINATION=0.
+                let follow_renomination =
+                    std::env::var("ROOMLER_ICE_FOLLOW_RENOMINATION").as_deref() != Ok("0");
+                let already_selected = {
+                    let selected = self.agent_conn.get_selected_pair();
+                    selected
+                        .as_ref()
+                        .is_some_and(|s| s.local.equal(&*p.local) && s.remote.equal(&*p.remote))
+                };
+                if pending_request.is_use_candidate
+                    && (selected_pair_is_none || (follow_renomination && !already_selected))
+                {
                     self.set_selected_pair(Some(Arc::clone(&p))).await;
                 }
             } else {
@@ -533,7 +549,33 @@ impl ControlledSelector for AgentInternal {
                     // previously sent by this pair produced a successful response and
                     // generated a valid pair (Section 7.2.5.3.2).  The agent sets the
                     // nominated flag value of the valid pair to true.
-                    if self.agent_conn.get_selected_pair().is_none() {
+                    //
+                    // Roomler patch (follow renomination): upstream only set the
+                    // selected pair when NONE was set, pinning the controlled
+                    // agent to the FIRST nominated pair for the connection's
+                    // lifetime. Browsers renominate deliberately when they
+                    // switch transports (ICE renomination semantics) — e.g.
+                    // Chrome moving off a deprioritized overlay-TUN host pair
+                    // onto the real-path srflx pair. Follow the controlling
+                    // agent's most recent nomination so both directions ride
+                    // the pair it chose; without this the browser switches its
+                    // send path while the agent keeps streaming media over the
+                    // stale pair (field 2026-07-27, NEO16→69T5HUD: video pinned
+                    // to the overlay pair through carrier churn while the
+                    // nominated srflx pair sat idle).
+                    // Escape hatch: ROOMLER_ICE_FOLLOW_RENOMINATION=0 restores
+                    // first-nomination-wins.
+                    let follow_renomination =
+                        std::env::var("ROOMLER_ICE_FOLLOW_RENOMINATION").as_deref() != Ok("0");
+                    let already_selected = {
+                        let selected = self.agent_conn.get_selected_pair();
+                        selected.as_ref().is_some_and(|s| {
+                            s.local.equal(&*p.local) && s.remote.equal(&*p.remote)
+                        })
+                    };
+                    if self.agent_conn.get_selected_pair().is_none()
+                        || (follow_renomination && !already_selected)
+                    {
                         self.set_selected_pair(Some(Arc::clone(&p))).await;
                     }
                     self.send_binding_success(m, local, remote).await;
