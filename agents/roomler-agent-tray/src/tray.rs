@@ -20,7 +20,10 @@ use tauri::{AppHandle, Manager, Runtime};
 
 pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     // Build the menu. IDs are inspected in `on_menu_event` below.
-    let open_status = MenuItem::with_id(app, "open_status", "Open Roomler", true, None::<&str>)?;
+    let open_status = MenuItem::with_id(app, "open_status", "Device status", true, None::<&str>)?;
+    // S7 — the embedded web-app window (WebView2 on Windows; browser
+    // elsewhere). Distinct from the LOCAL status window above.
+    let open_web = MenuItem::with_id(app, "open_web", "Open Roomler…", true, None::<&str>)?;
     let onboarding = MenuItem::with_id(app, "onboarding", "Onboarding…", true, None::<&str>)?;
     let check_updates_item = MenuItem::with_id(
         app,
@@ -35,6 +38,7 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         app,
         &[
             &open_status,
+            &open_web,
             &onboarding,
             &check_updates_item,
             &open_logs,
@@ -48,6 +52,7 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         .show_menu_on_left_click(false) // left-click brings up the main window; right-click is the menu
         .on_menu_event(|app, event| match event.id.as_ref() {
             "open_status" => show_window(app, "/overview"),
+            "open_web" => open_roomler_web(app),
             "onboarding" => show_window(app, "/onboarding"),
             "check_updates" => check_updates(app),
             "open_logs" => {
@@ -89,6 +94,24 @@ fn show_window<R: Runtime>(app: &AppHandle<R>, path: &str) {
         let _ = window.show();
         let _ = window.set_focus();
     }
+}
+
+/// S7 — resolve the server origin OFF the menu thread (config load +
+/// service-flavour probe spawn), then open the web window ON the main
+/// thread (window creation is main-thread-only on Windows).
+fn open_roomler_web<R: Runtime>(app: &AppHandle<R>) {
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || match crate::commands::server_origin_blocking() {
+        Ok(url) => {
+            let app2 = app.clone();
+            let _ = app.run_on_main_thread(move || {
+                if let Err(e) = crate::commands::open_web_or_browser(&app2, &url) {
+                    tracing::warn!(%e, "open roomler web failed");
+                }
+            });
+        }
+        Err(e) => tracing::warn!(%e, "open roomler web: no server origin"),
+    });
 }
 
 fn check_updates<R: Runtime>(app: &AppHandle<R>) {
