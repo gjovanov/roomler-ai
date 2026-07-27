@@ -70,11 +70,22 @@ pub(crate) fn parse_msi_version(v: &str) -> MsiVersion {
     )
 }
 
-/// Map the running agent's Cargo semver (e.g. `0.3.0-rc.99`) to the MSI
-/// 4-tuple the release pipeline assigns it (`0.3.0.99`) — the rc number
-/// lands in the 4th field. This MUST mirror how the build derives the
-/// MSI `DisplayVersion`, or the strictly-older comparison misfires. A
-/// final (non-rc) release maps the 4th field to 0.
+/// Map the running agent's Cargo semver to the MSI version tuple the
+/// release pipeline assigns it. This MUST mirror release-agent.yml's
+/// `msi_version` derivation or the strictly-older comparison misfires:
+///
+/// * rc build `MAJOR.MINOR.0-rc.N` → MSI `MAJOR.MINOR.N` (the rc in the
+///   3rd field — Windows Installer IGNORES the 4th field for upgrade
+///   comparison, which is why the pipeline moved it; the workflow hard-
+///   fails rc builds with patch != 0).
+/// * final `MAJOR.MINOR.PATCH` → MSI `MAJOR.MINOR.65535` (outranks every
+///   rc of that minor).
+///
+/// Pre-scheme-change products registered the legacy `MAJOR.MINOR.0.N`
+/// DisplayVersion; those parse to `(maj, min, 0, N)` and correctly rank
+/// BELOW any new-scheme runner — old-scheme leftovers are sweepable.
+/// The (unbuildable) patched-rc shape falls back to the legacy 4th-field
+/// mapping so a weird local build still compares sanely.
 pub(crate) fn own_msi_version(semver: &str) -> MsiVersion {
     let (core, pre) = match semver.split_once('-') {
         Some((c, p)) => (c, Some(p)),
@@ -84,8 +95,13 @@ pub(crate) fn own_msi_version(semver: &str) -> MsiVersion {
     let major = it.next().unwrap_or(0);
     let minor = it.next().unwrap_or(0);
     let patch = it.next().unwrap_or(0);
-    let rc = pre.and_then(parse_rc_number).unwrap_or(0);
-    (major, minor, patch, rc)
+    match pre.map(parse_rc_number) {
+        Some(Some(rc)) if patch == 0 => (major, minor, rc, 0),
+        Some(Some(rc)) => (major, minor, patch, rc),
+        // Unknown pre-release label: legacy mapping (rc treated as 0).
+        Some(None) => (major, minor, patch, 0),
+        None => (major, minor, 65535, 0),
+    }
 }
 
 /// Parse the `N` out of an `rc.N` / `rc-N` / `rcN` pre-release suffix.
@@ -242,17 +258,18 @@ mod tests {
     }
 
     #[test]
-    fn own_version_maps_rc_into_fourth_field() {
-        assert_eq!(own_msi_version("0.3.0-rc.99"), (0, 3, 0, 99));
-        assert_eq!(own_msi_version("0.3.0-rc.83"), (0, 3, 0, 83));
-        // Final release → 4th field 0 (mirrors the build).
-        assert_eq!(own_msi_version("0.3.0"), (0, 3, 0, 0));
+    fn own_version_mirrors_the_pipeline_msi_mapping() {
+        // rc → MAJOR.MINOR.RC (3rd field), matching release-agent.yml.
+        assert_eq!(own_msi_version("0.3.0-rc.99"), (0, 3, 99, 0));
+        assert_eq!(own_msi_version("0.3.0-rc.254"), (0, 3, 254, 0));
+        // Final release → MAJOR.MINOR.65535 (outranks every rc).
+        assert_eq!(own_msi_version("0.3.0"), (0, 3, 65535, 0));
         // The own-mapping and the DisplayVersion parse agree, so an
         // installed product's tuple equals the running tuple → kept.
-        assert_eq!(
-            own_msi_version("0.3.0-rc.99"),
-            parse_msi_version("0.3.0.99")
-        );
+        assert_eq!(own_msi_version("0.3.0-rc.99"), parse_msi_version("0.3.99"));
+        // Legacy old-scheme products (rc in the 4th field) rank below
+        // any new-scheme runner — sweepable leftovers, by design.
+        assert!(parse_msi_version("0.3.0.99") < own_msi_version("0.3.0-rc.99"));
     }
 
     /// The exact field pile-up: eight perMachine versions, running
@@ -303,12 +320,11 @@ mod tests {
             ),
         ];
         let plan = plan_obsolete_uninstalls("0.3.0-rc.99", Flavour::PerMachine, &products);
-        assert_eq!(plan.len(), 7, "seven older versions targeted");
-        assert!(
-            plan.iter()
-                .all(|p| p.version.as_deref() != Some("0.3.0.99")),
-            "the running version must never be in the uninstall plan"
-        );
+        // Under the MAJOR.MINOR.RC scheme every legacy-scheme product —
+        // including the legacy registration of rc.99 itself — ranks
+        // below the running build and is swept. Self-protection lives
+        // on the NEW-scheme DisplayVersion, covered below.
+        assert_eq!(plan.len(), 8, "all legacy-scheme versions targeted");
         // Spot-check a couple that MUST be swept.
         assert!(
             plan.iter()
@@ -320,13 +336,31 @@ mod tests {
         );
     }
 
+    /// Self-protection under the current pipeline scheme: the running
+    /// build's own product registers DisplayVersion `MAJOR.MINOR.RC`
+    /// and compares equal → never planned.
+    #[test]
+    fn keeps_own_new_scheme_registration() {
+        let products = vec![
+            prod(Flavour::PerMachine, "0.3.99", "{SELF-NEW}"),
+            prod(Flavour::PerMachine, "0.3.98", "{OLDER-NEW}"),
+            prod(Flavour::PerMachine, "0.3.0.99", "{SELF-LEGACY}"),
+        ];
+        let plan = plan_obsolete_uninstalls("0.3.0-rc.99", Flavour::PerMachine, &products);
+        assert_eq!(plan.len(), 2);
+        assert!(
+            plan.iter().all(|p| p.product_code != "{SELF-NEW}"),
+            "the running version's own product must never be planned"
+        );
+    }
+
     #[test]
     fn never_removes_a_newer_version() {
         // Running rc.99, but somehow rc.100 is also installed — the
         // sweep must not downgrade-remove the newer one.
         let products = vec![
-            prod(Flavour::PerMachine, "0.3.0.99", "{AAAA}"),
-            prod(Flavour::PerMachine, "0.3.0.100", "{BBBB}"),
+            prod(Flavour::PerMachine, "0.3.99", "{AAAA}"),
+            prod(Flavour::PerMachine, "0.3.100", "{BBBB}"),
         ];
         let plan = plan_obsolete_uninstalls("0.3.0-rc.99", Flavour::PerMachine, &products);
         assert!(plan.is_empty(), "neither self nor a newer build is swept");
@@ -337,9 +371,9 @@ mod tests {
         // Running perMachine; perUser leftovers are out of scope (a
         // SYSTEM service can't cleanly uninstall a per-user product).
         let products = vec![
-            prod(Flavour::PerUser, "0.3.0.83", "{USER-OLD}"),
-            prod(Flavour::PerMachine, "0.3.0.83", "{MACH-OLD}"),
-            prod(Flavour::PerMachine, "0.3.0.99", "{MACH-SELF}"),
+            prod(Flavour::PerUser, "0.3.83", "{USER-OLD}"),
+            prod(Flavour::PerMachine, "0.3.83", "{MACH-OLD}"),
+            prod(Flavour::PerMachine, "0.3.99", "{MACH-SELF}"),
         ];
         let plan = plan_obsolete_uninstalls("0.3.0-rc.99", Flavour::PerMachine, &products);
         assert_eq!(plan.len(), 1);
