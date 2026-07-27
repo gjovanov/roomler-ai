@@ -359,10 +359,10 @@ async fn handle_socket(socket: WebSocket, state: AppState, user_id: ObjectId, us
 
     // S6 — mirror into the cross-pod online registry (advisory; the 30 s
     // heartbeat in main.rs re-asserts it and the 90 s TTL self-heals).
-    if let Some(pubsub) = &state.redis_pubsub {
-        if let Err(e) = pubsub.online_add(&user_id.to_hex()).await {
-            tracing::debug!("online-registry add failed: {e}");
-        }
+    if let Some(pubsub) = &state.redis_pubsub
+        && let Err(e) = pubsub.online_add(&user_id.to_hex()).await
+    {
+        tracing::debug!("online-registry add failed: {e}");
     }
 
     // Register this tab with the remote-control Hub so `rc:*` replies find us.
@@ -433,12 +433,11 @@ async fn handle_socket(socket: WebSocket, state: AppState, user_id: ObjectId, us
 
     // S6 — drop this pod's online-registry claim once the user's LAST
     // local connection is gone (other pods' claims are theirs to clear).
-    if !state.ws_storage.is_connected(&user_id) {
-        if let Some(pubsub) = &state.redis_pubsub {
-            if let Err(e) = pubsub.online_remove(&user_id.to_hex()).await {
-                tracing::debug!("online-registry remove failed: {e}");
-            }
-        }
+    if !state.ws_storage.is_connected(&user_id)
+        && let Some(pubsub) = &state.redis_pubsub
+        && let Err(e) = pubsub.online_remove(&user_id.to_hex()).await
+    {
+        tracing::debug!("online-registry remove failed: {e}");
     }
 
     if let Some(room_id) = state.room_manager.get_connection_room(&connection_id) {

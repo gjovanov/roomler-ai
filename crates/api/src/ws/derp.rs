@@ -104,13 +104,13 @@ pub async fn derp_upgrade(
     // S6 — DERP relays are pod-local: two mesh peers only meet if their
     // /derp sockets land on the SAME pod, so the LB hashes on `tid` and
     // the server rejects a present-but-wrong claim.
-    if let Some(t) = &params.tid {
-        if t != &claims.tenant_id {
-            return Response::builder()
-                .status(403)
-                .body("tid does not match token tenant".into())
-                .unwrap();
-        }
+    if let Some(t) = &params.tid
+        && t != &claims.tenant_id
+    {
+        return Response::builder()
+            .status(403)
+            .body("tid does not match token tenant".into())
+            .unwrap();
     }
     let agent_id = match ObjectId::parse_str(&claims.sub) {
         Ok(id) => id,

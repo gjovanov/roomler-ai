@@ -26,10 +26,10 @@ async fn user_online_anywhere(state: &AppState, user_id: &ObjectId) -> bool {
     if state.ws_storage.is_connected(user_id) {
         return true;
     }
-    if let Some(pubsub) = &state.redis_pubsub {
-        if let Ok(online) = pubsub.online_anywhere(&user_id.to_hex()).await {
-            return online;
-        }
+    if let Some(pubsub) = &state.redis_pubsub
+        && let Ok(online) = pubsub.online_anywhere(&user_id.to_hex()).await
+    {
+        return online;
     }
     false
 }
