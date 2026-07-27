@@ -139,6 +139,15 @@ test.describe('Billing & Subscription', () => {
         cloud_integrations: boolean
         ai_recognition: boolean
         recordings: boolean
+        // S5 pivot — per-user pricing with device caps; kept in
+        // lockstep with crates/db tenant.rs::Plan::limits and
+        // crates/tests/src/billing_tests.rs.
+        max_devices: number
+        max_tunnel_clients: number
+        overlay_mesh: boolean
+        exit_nodes: boolean
+        magic_dns: boolean
+        max_concurrent_sessions: number
       }
     }>
 
@@ -155,6 +164,12 @@ test.describe('Billing & Subscription', () => {
     expect(free.limits.cloud_integrations).toBe(false)
     expect(free.limits.ai_recognition).toBe(false)
     expect(free.limits.recordings).toBe(false)
+    expect(free.limits.max_devices).toBe(3)
+    expect(free.limits.max_tunnel_clients).toBe(3)
+    expect(free.limits.overlay_mesh).toBe(true)
+    expect(free.limits.exit_nodes).toBe(false)
+    expect(free.limits.magic_dns).toBe(false)
+    expect(free.limits.max_concurrent_sessions).toBe(1)
 
     // Pro plan
     const pro = plans.find((p) => p.id === 'pro')!
@@ -163,6 +178,11 @@ test.describe('Billing & Subscription', () => {
     expect(pro.price_cents).toBe(800)
     expect(pro.limits.video_max_participants).toBe(10)
     expect(pro.limits.cloud_integrations).toBe(true)
+    expect(pro.limits.max_devices).toBe(30)
+    expect(pro.limits.max_tunnel_clients).toBe(30)
+    expect(pro.limits.exit_nodes).toBe(true)
+    expect(pro.limits.magic_dns).toBe(true)
+    expect(pro.limits.max_concurrent_sessions).toBe(5)
 
     // Business plan
     const biz = plans.find((p) => p.id === 'business')!
@@ -172,6 +192,10 @@ test.describe('Billing & Subscription', () => {
     expect(biz.limits.video_max_participants).toBe(100)
     expect(biz.limits.ai_recognition).toBe(true)
     expect(biz.limits.recordings).toBe(true)
+    expect(biz.limits.max_devices).toBe(300)
+    expect(biz.limits.max_tunnel_clients).toBe(300)
+    expect(biz.limits.exit_nodes).toBe(true)
+    expect(biz.limits.magic_dns).toBe(true)
   })
 
   test('checkout endpoint requires authentication', async () => {
