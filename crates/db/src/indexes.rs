@@ -172,6 +172,19 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> 
     )
     .await?;
 
+    // S5 — Stripe webhook idempotency ledger: `_id` = the Stripe event
+    // id (natural unique key), rows expire after 30 days (Stripe stops
+    // retrying long before that).
+    create_indexes(
+        db,
+        "stripe_events",
+        vec![index_ttl(
+            bson::doc! { "processed_at": 1 },
+            30 * 24 * 60 * 60,
+        )],
+    )
+    .await?;
+
     // Notifications
     create_indexes(
         db,

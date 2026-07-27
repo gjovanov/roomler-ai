@@ -120,6 +120,18 @@ pub async fn enroll_tunnel_client(
                 .await?
         }
         None => {
+            // S5 — plan tunnel-client cap. Mirrors the device cap in
+            // `enroll_agent`: only NEW rows consume a slot.
+            let tenant = state.tenants.base.find_by_id(tid).await?;
+            let max = tenant.plan.limits().max_tunnel_clients as u64;
+            let used = state.tunnel_clients.count_active_for_tenant(tid).await?;
+            if used >= max {
+                return Err(ApiError::Forbidden(format!(
+                    "Tunnel-client limit reached for the {:?} plan ({used} of {max} used). \
+                     Upgrade the plan or remove a tunnel client first.",
+                    tenant.plan
+                )));
+            }
             state
                 .tunnel_clients
                 .create(

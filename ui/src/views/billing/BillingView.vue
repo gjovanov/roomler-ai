@@ -62,6 +62,12 @@
           </div>
           <v-divider class="mb-4" />
           <v-list density="compact" class="flex-grow-1 bg-transparent">
+            <!-- S5 pivot — fleet limits lead the card. -->
+            <v-list-item title="Devices" :subtitle="plan.limits.max_devices >= 4294967295 ? 'Unlimited' : String(plan.limits.max_devices)" prepend-icon="mdi-monitor-multiple" />
+            <v-list-item title="Tunnel Clients" :subtitle="plan.limits.max_tunnel_clients >= 4294967295 ? 'Unlimited' : String(plan.limits.max_tunnel_clients)" prepend-icon="mdi-tunnel" />
+            <v-list-item title="Exit Nodes" :subtitle="plan.limits.exit_nodes ? 'Yes' : 'No'" :prepend-icon="plan.limits.exit_nodes ? 'mdi-check-circle' : 'mdi-close-circle'" />
+            <v-list-item title="MagicDNS" :subtitle="plan.limits.magic_dns ? 'Yes' : 'No'" :prepend-icon="plan.limits.magic_dns ? 'mdi-check-circle' : 'mdi-close-circle'" />
+            <v-list-item title="Concurrent Sessions" :subtitle="plan.limits.max_concurrent_sessions >= 4294967295 ? 'Unlimited' : String(plan.limits.max_concurrent_sessions)" prepend-icon="mdi-monitor-eye" />
             <v-list-item title="Members" :subtitle="plan.limits.max_members >= 4294967295 ? 'Unlimited' : String(plan.limits.max_members)" prepend-icon="mdi-account-group" />
             <v-list-item title="Channels" :subtitle="plan.limits.max_channels >= 4294967295 ? 'Unlimited' : String(plan.limits.max_channels)" prepend-icon="mdi-pound" />
             <v-list-item title="Video Participants" :subtitle="plan.limits.video_max_participants === 0 ? 'None' : String(plan.limits.video_max_participants)" prepend-icon="mdi-video" />
@@ -111,6 +117,14 @@ interface PlanInfo {
   name: string
   price_cents: number
   limits: {
+    // S5 pivot — fleet limits (kept in lockstep with the server's
+    // Plan::limits + billing_tests.rs + billing.spec.ts).
+    max_devices: number
+    max_tunnel_clients: number
+    overlay_mesh: boolean
+    exit_nodes: boolean
+    magic_dns: boolean
+    max_concurrent_sessions: number
     max_members: number
     max_channels: number
     max_message_history: number
