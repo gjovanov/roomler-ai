@@ -42,9 +42,13 @@ pub async fn broadcast_with_redis(
     // Local broadcast (same instance)
     broadcast(ws_storage, user_ids, message).await;
 
-    // Cross-instance broadcast via Redis Pub/Sub
+    // Cross-instance broadcast via Redis Pub/Sub. `origin` lets the
+    // subscriber loop drop envelopes this instance published itself —
+    // local delivery already happened above, so without the guard every
+    // event double-delivers on its origin pod.
     if let Some(pubsub) = redis_pubsub {
         let envelope = serde_json::json!({
+            "origin": pubsub.instance_id(),
             "user_ids": user_ids.iter().map(|id| id.to_hex()).collect::<Vec<_>>(),
             "message": message,
         });
