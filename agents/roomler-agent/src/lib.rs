@@ -23,6 +23,7 @@ pub mod encode;
 pub mod enrollment;
 pub mod files;
 pub mod fp16;
+pub mod gpu_clock;
 pub mod indicator;
 pub mod input;
 pub mod install_cleanup;
