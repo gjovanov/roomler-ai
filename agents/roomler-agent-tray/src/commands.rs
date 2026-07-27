@@ -466,14 +466,104 @@ fn config_set_blocking(
         .ok_or_else(|| format!("unknown config key {key:?}"))
 }
 
-/// S2 — open the browser remote-control viewer for one of THIS tenant's
-/// agent-backed devices (`{server}/tenant/{tid}/agent/{aid}/remote`).
-/// The URL is constructed ONLY from this device's own configured server
-/// origin + hex-validated ids — never from peer-supplied strings — so a
-/// hostile device name can't steer the browser to a foreign site.
+/// S7 — the embedded web window's label. The main tray window keeps its
+/// close-to-hide behavior; a window with THIS label is destroyed on
+/// close (see `main.rs`) so it never lingers as a hidden WebView2
+/// process holding memory.
+pub const WEB_WINDOW_LABEL: &str = "roomler-web";
+
+/// S7 — open (or focus + navigate) the embedded WebView2 window on the
+/// Roomler web app. The URL is an EXTERNAL origin, which Tauri keeps
+/// outside the app's capability set — the page gets no `__TAURI__` IPC,
+/// it's a plain Chromium view; sign-in persists in the webview profile
+/// between opens.
+pub fn open_web_window<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    url: &str,
+) -> Result<(), String> {
+    use tauri::Manager;
+    let parsed: tauri::Url = url.parse().map_err(|e| format!("invalid URL: {e}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("only http(s) URLs can be opened".to_string());
+    }
+    if let Some(existing) = app.get_webview_window(WEB_WINDOW_LABEL) {
+        // Reuse the window (and its signed-in session): navigate in place.
+        existing
+            .navigate(parsed)
+            .map_err(|e| format!("navigating the Roomler window: {e}"))?;
+        let _ = existing.show();
+        let _ = existing.set_focus();
+        return Ok(());
+    }
+    tauri::WebviewWindowBuilder::new(app, WEB_WINDOW_LABEL, tauri::WebviewUrl::External(parsed))
+        .title("Roomler")
+        .inner_size(1280.0, 800.0)
+        .build()
+        .map_err(|e| format!("opening the Roomler window: {e}"))?;
+    Ok(())
+}
+
+/// S7 — hybrid open policy: the in-app WebView2 window on Windows
+/// (Chromium: the full WebRTC/WebCodecs viewer works), the default
+/// browser elsewhere (WebKitGTK has no usable WebRTC; macOS WKWebView
+/// loses the Chrome-tuned worker paths) and as the fallback when the
+/// webview can't start (e.g. WebView2 runtime missing).
+pub fn open_web_or_browser<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    url: &str,
+) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        match open_web_window(app, url) {
+            Ok(()) => return Ok(()),
+            Err(e) => tracing::warn!(%e, "webview window failed — falling back to the browser"),
+        }
+    }
+    // shell::open is deprecated in favour of tauri-plugin-opener, but the
+    // shell plugin is already shipped + initialised here; not worth a new
+    // plugin dependency for the fallback path.
+    #[allow(deprecated)]
+    {
+        use tauri_plugin_shell::ShellExt;
+        app.shell()
+            .open(url, None)
+            .map_err(|e| format!("opening browser: {e}"))
+    }
+}
+
+/// The configured server origin (normalised, validated) — the target for
+/// the S7 "Open Roomler" entry points. Blocking (config load + service
+/// probe): call from the blocking pool.
+pub fn server_origin_blocking() -> Result<String, String> {
+    let is_scm = probe_service_state().0 == "scmService";
+    let path = active_config_path(is_scm)?;
+    let cfg = config::load(&path)
+        .map_err(|_| "This device isn't enrolled yet — no server to open.".to_string())?;
+    let server = cfg.server_url.trim().trim_end_matches('/').to_string();
+    if !server.starts_with("https://") && !server.starts_with("http://") {
+        return Err("this device's config has no valid server URL".to_string());
+    }
+    Ok(server)
+}
+
+/// S7 — open the Roomler web app (this device's configured server) in
+/// the embedded window / browser.
+#[tauri::command]
+pub async fn cmd_open_roomler(app: tauri::AppHandle) -> Result<(), String> {
+    let url = tokio::task::spawn_blocking(server_origin_blocking)
+        .await
+        .map_err(|e| format!("task join: {e}"))??;
+    open_web_or_browser(&app, &url)
+}
+
+/// S2/S7 — open the remote-control viewer for one of THIS tenant's
+/// agent-backed devices (`{server}/tenant/{tid}/agent/{aid}/remote`) —
+/// in-app on Windows, default browser elsewhere. The URL is constructed
+/// ONLY from this device's own configured server origin + hex-validated
+/// ids — never from peer-supplied strings — so a hostile device name
+/// can't steer the view to a foreign site.
 #[tauri::command]
 pub async fn cmd_open_remote(app: tauri::AppHandle, agent_id: String) -> Result<(), String> {
-    use tauri_plugin_shell::ShellExt;
     let aid = agent_id.trim().to_ascii_lowercase();
     if aid.len() != 24 || !aid.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err("invalid agent id".to_string());
@@ -494,13 +584,7 @@ pub async fn cmd_open_remote(app: tauri::AppHandle, agent_id: String) -> Result<
     })
     .await
     .map_err(|e| format!("task join: {e}"))??;
-    // shell::open is deprecated in favour of tauri-plugin-opener, but the
-    // shell plugin is already shipped + initialised here; not worth a new
-    // plugin dependency for one deep-link call.
-    #[allow(deprecated)]
-    app.shell()
-        .open(&url, None)
-        .map_err(|e| format!("opening browser: {e}"))
+    open_web_or_browser(&app, &url)
 }
 
 /// S2 — what [`cmd_tail_log`] returns to the log-viewer card.

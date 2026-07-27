@@ -100,13 +100,21 @@ fn main() {
             commands::cmd_config_set,
             commands::cmd_tail_log,
             commands::cmd_open_remote,
+            commands::cmd_open_roomler,
         ])
         .on_window_event(|window, event| {
-            // Close-to-hide: the window is a view over a resident tray app.
-            // Letting the close destroy the last window would exit the
+            // Close-to-hide: the MAIN window is a view over a resident tray
+            // app. Letting its close destroy the last window would exit the
             // process (Tauri default) and take the consent watcher down with
             // it — remote-control prompts would silently stop surfacing.
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+            //
+            // S7: label-gated — the embedded Roomler web window must really
+            // close (default destroy), else it becomes a hidden WebView2
+            // zombie holding memory. The main window stays alive, so window
+            // count never hits zero and the app keeps running.
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event
+                && window.label() == "main"
+            {
                 api.prevent_close();
                 let _ = window.hide();
             }
