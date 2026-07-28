@@ -11,10 +11,13 @@ use axum::{
     extract::DefaultBodyLimit,
     routing::{delete, get, post, put},
 };
-use state::AppState;
-use tower_governor::{
-    GovernorLayer, governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor,
+use middleware::{
+    auth_rate_limit::{AuthRateLimitState, AuthRateLimiter},
+    client_ip::TrustedProxyIpKeyExtractor,
 };
+use state::AppState;
+use std::sync::Arc;
+use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
 use tower_http::{
     cors::{Any, CorsLayer},
     trace::TraceLayer,
@@ -39,30 +42,58 @@ fn build_cors_layer(origins: &[String]) -> CorsLayer {
 pub fn build_router(state: AppState) -> Router {
     let cors = build_cors_layer(&state.settings.app.cors_origins);
 
-    // Rate limiting per IP. Defaults to 1 token/sec, burst 60
-    // (sustained 60 req/min) — production. The e2e overlay bumps
-    // both values via ROOMLER__APP__RATE_LIMIT_PER_SEC /
-    // ROOMLER__APP__RATE_LIMIT_BURST so a Playwright Job's single
-    // pod IP doesn't trip 429s during the suite.
+    // Capacity limiting for `/api`, keyed on the client address.
+    //
+    // `per_millisecond` (like `per_second`) takes the interval that
+    // replenishes ONE token, not a rate — so the req/s setting is converted
+    // by `rate_limit_period_ms` rather than passed straight through. Feeding
+    // a rate into `per_second` is what made prod 10x stricter instead of 10x
+    // looser on 2026-07-28.
+    //
+    // The key comes from `TrustedProxyIpKeyExtractor`, not `SmartIpKeyExtractor`:
+    // the latter believes a client-supplied `X-Forwarded-For`, which is a
+    // one-header bypass of the whole limiter.
     let governor_conf = GovernorConfigBuilder::default()
-        .per_second(state.settings.app.rate_limit_per_sec)
+        .per_millisecond(state.settings.app.rate_limit_period_ms())
         .burst_size(state.settings.app.rate_limit_burst)
-        .key_extractor(SmartIpKeyExtractor)
+        .key_extractor(TrustedProxyIpKeyExtractor {
+            trusted_hops: state.settings.app.rate_limit_trusted_hops,
+        })
         .finish()
-        .unwrap();
+        .expect("rate limit period is clamped non-zero, so the config is valid");
     let governor_layer = GovernorLayer {
         config: governor_conf.into(),
     };
 
-    // Auth routes (no tenant prefix)
-    let auth_routes = Router::new()
+    // Brute-force gate for the credential endpoints, keyed on
+    // (client address, account) so it can be strict without locking out
+    // everyone sharing an address.
+    let auth_rate_limit_state = AuthRateLimitState {
+        limiter: Arc::new(AuthRateLimiter::new(
+            state.settings.app.auth_rate_limit_period_ms(),
+            state.settings.app.auth_rate_limit_burst,
+        )),
+        trusted_hops: state.settings.app.rate_limit_trusted_hops,
+    };
+
+    // Credential endpoints — the ones worth guessing at, so they carry the
+    // per-(address, account) brute-force gate on top of the general limiter.
+    let credential_routes = Router::new()
         .route("/register", post(routes::auth::register))
         .route("/login", post(routes::auth::login))
-        .route("/logout", post(routes::auth::logout))
         .route("/refresh", post(routes::auth::refresh))
+        .layer(axum::middleware::from_fn_with_state(
+            auth_rate_limit_state,
+            middleware::auth_rate_limit::auth_rate_limit,
+        ));
+
+    // Auth routes (no tenant prefix)
+    let auth_routes = Router::new()
+        .route("/logout", post(routes::auth::logout))
         .route("/activate", post(routes::auth::activate))
         .route("/me", get(routes::auth::me))
-        .route("/me", put(routes::auth::me));
+        .route("/me", put(routes::auth::me))
+        .merge(credential_routes);
 
     // Tenant routes
     let tenant_routes = Router::new()
