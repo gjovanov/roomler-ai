@@ -52,14 +52,40 @@ kubectl -n "$NS" set image deploy/roomler2 "roomler2=registry.roomler.ai/roomler
 kubectl -n "$NS" rollout status deploy/roomler2 --timeout=300s >> "$LOG" 2>&1 || fail_hard "e2e stack failed to roll to $PRODTAG"
 note "e2e stack on $PRODTAG"
 
-# ── 3. port-forwards (fresh each run; pods may have rolled) ──────────
+# ── 3. SELF-HEALING port-forwards ────────────────────────────────────
+# A bare `kubectl port-forward` is a single TCP proxy that dies under a
+# long run (connection-reset after ~10-15 min of churn) — the first dry
+# run cascaded into a 269/160 retry storm when the forward dropped
+# mid-suite. Wrap each in a respawn supervisor so a drop self-heals
+# within ~1 s; Playwright's 2× retry absorbs the brief blip. The
+# supervisor PIDs are killed in the cleanup trap.
+PF_PIDS=()
+supervise_pf() { # $1 = svc:localport:remoteport
+  local spec="$1" svc lp rp
+  IFS=: read -r svc lp rp <<< "$spec"
+  (
+    while true; do
+      kubectl -n "$NS" port-forward --address 127.0.0.1 "svc/$svc" "$lp:$rp" >> "$OUT/pf-$svc.log" 2>&1
+      echo "[pf $svc] restarting ($(date -u +%H:%M:%SZ))" >> "$OUT/pf-$svc.log"
+      sleep 1
+    done
+  ) &
+  PF_PIDS+=("$!")
+}
+kill_pf() { for p in "${PF_PIDS[@]:-}"; do kill "$p" 2>/dev/null; done; pkill -f "kubectl.*port-forward.*$NS" 2>/dev/null; }
+trap 'kill_pf' EXIT
+
 pkill -f "kubectl.*port-forward.*$NS" 2>/dev/null
 sleep 1
-setsid -f kubectl -n "$NS" port-forward --address 127.0.0.1 svc/roomler2 "$APP_PORT:80" > "$OUT/pf-app.log" 2>&1
-setsid -f kubectl -n "$NS" port-forward --address 127.0.0.1 svc/mailpit "$MAIL_PORT:8025" > "$OUT/pf-mail.log" 2>&1
-sleep 3
-curl -sf -o /dev/null "http://127.0.0.1:$APP_PORT/health" || fail_hard "app port-forward dead"
-curl -sf -o /dev/null "http://127.0.0.1:$MAIL_PORT/api/v1/info" || fail_hard "mailpit port-forward dead"
+supervise_pf "roomler2:$APP_PORT:80"
+supervise_pf "mailpit:$MAIL_PORT:8025"
+# Wait for both to come up (supervisor may need a restart cycle on a fresh roll).
+for _ in $(seq 1 20); do
+  curl -sf -o /dev/null "http://127.0.0.1:$APP_PORT/health" && break
+  sleep 1
+done
+curl -sf -o /dev/null "http://127.0.0.1:$APP_PORT/health" || fail_hard "app port-forward never came up"
+curl -sf -o /dev/null "http://127.0.0.1:$MAIL_PORT/api/v1/info" || fail_hard "mailpit port-forward never came up"
 
 # ── 4. run the suite ─────────────────────────────────────────────────
 WORK="$OUT/ui-work"
@@ -72,7 +98,7 @@ docker run --rm --network host -v "$WORK:/work" -w /work \
   -e "E2E_MAILPIT_URL=http://127.0.0.1:$MAIL_PORT" \
   "$PW_IMG" bash -lc "npm i --no-audit --no-fund --loglevel=error && npx playwright test --reporter=line --timeout=60000" >> "$LOG" 2>&1
 RC=$?
-pkill -f "kubectl.*port-forward.*$NS" 2>/dev/null
+kill_pf  # stop the supervisors (the EXIT trap also covers abnormal exits)
 
 # ── 5. triage against the expected-failures baseline ─────────────────
 CLEAN=$(sed -e 's/\x1b\[[0-9;]*[A-Za-z]//g' "$LOG" | tr '\r' '\n')
