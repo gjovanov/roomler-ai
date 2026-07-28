@@ -35,20 +35,28 @@ const FOLLOW_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(3
 /// idle (field 2026-07-28: video on an 89 ms churn relay while the 11 ms
 /// srflx pair carried nothing; TeamViewer on the same host was smooth).
 ///
-/// v2 follows only when it cannot be the poison case:
-/// - the new pair's REMOTE parses to a real-path (non-overlay-range) IP —
-///   upgrading onto srflx/public pairs is always safe; or
+/// v2 follows only when it cannot be the poison case; v2.1 (rc.268) adds the
+/// UPWARD-ONLY gate after field thrash:
+/// - the new pair's REMOTE parses to a real-path (non-overlay-range) IP AND
+///   the new pair's priority is STRICTLY greater than the current one —
+///   upgrading onto srflx/public pairs is safe, but equal-priority siblings
+///   are not a migration. Field (rc.267, DESKTOP-69T5HUD): the agent gathers
+///   one srflx candidate per STUN server (7 sockets, equal priority); Chrome
+///   aggressively nominated each in turn and v2 followed every one — 7
+///   selection switches in one second, each changing the sending socket
+///   (fresh NAT flow) — visible as 1–2 s delivery gaps. Strict `>` makes
+///   sibling nominations no-ops while host→srflx still migrates; or
 /// - the currently selected pair is STALE (no inbound for
-///   [`FOLLOW_STALE_AFTER`]) — any nominated pair beats riding a dead one.
+///   [`FOLLOW_STALE_AFTER`]) — any nominated pair beats riding a dead one,
+///   equal/lower priority included.
 ///
 /// Unparseable remotes (mDNS names) are conservatively treated as
 /// overlay-possible. Env overrides: `ROOMLER_ICE_FOLLOW_RENOMINATION=0`
 /// never follows (rc.262 semantics), `=1` always follows (rc.260 semantics).
-fn should_follow_renomination(
-    new_remote_addr: &str,
-    current: &CandidatePair,
-) -> bool {
-    let new_remote_is_real_path = new_remote_addr
+fn should_follow_renomination(new_pair: &CandidatePair, current: &CandidatePair) -> bool {
+    let new_remote_is_real_path = new_pair
+        .remote
+        .address()
         .parse::<std::net::IpAddr>()
         .map(|ip| !crate::agent::agent_gather::is_roomler_overlay_ip(&ip))
         .unwrap_or(false);
@@ -57,8 +65,11 @@ fn should_follow_renomination(
         .map(|elapsed| elapsed > FOLLOW_STALE_AFTER)
         .unwrap_or(false);
     follow_renomination_policy(
-        std::env::var("ROOMLER_ICE_FOLLOW_RENOMINATION").ok().as_deref(),
+        std::env::var("ROOMLER_ICE_FOLLOW_RENOMINATION")
+            .ok()
+            .as_deref(),
         new_remote_is_real_path,
+        new_pair.priority() > current.priority(),
         current_stale,
     )
 }
@@ -67,12 +78,13 @@ fn should_follow_renomination(
 fn follow_renomination_policy(
     env: Option<&str>,
     new_remote_is_real_path: bool,
+    new_prio_higher: bool,
     current_stale: bool,
 ) -> bool {
     match env {
         Some("0") => false,
         Some("1") => true,
-        _ => new_remote_is_real_path || current_stale,
+        _ => (new_remote_is_real_path && new_prio_higher) || current_stale,
     }
 }
 
@@ -136,19 +148,21 @@ mod follow_renomination_tests {
     use super::follow_renomination_policy;
 
     #[test]
-    fn v2_policy_matrix() {
-        // Default: real-path remotes always followed; overlay remotes only
-        // as a failover off a stale pair (poison-pair exclusion).
-        assert!(follow_renomination_policy(None, true, false));
-        assert!(follow_renomination_policy(None, true, true));
-        assert!(!follow_renomination_policy(None, false, false));
-        assert!(follow_renomination_policy(None, false, true));
+    fn v2_1_policy_matrix() {
+        // args: (env, new_remote_is_real_path, new_prio_higher, current_stale)
+        // Default: real-path remotes followed ONLY upward (strictly higher
+        // pair priority); overlay remotes only as failover off a stale pair.
+        assert!(follow_renomination_policy(None, true, true, false)); // host→srflx upgrade
+        assert!(!follow_renomination_policy(None, true, false, false)); // equal-prio sibling: NO thrash
+        assert!(!follow_renomination_policy(None, false, true, false)); // overlay remote, healthy current
+        assert!(follow_renomination_policy(None, false, false, true)); // stale failover, any pair
+        assert!(follow_renomination_policy(None, true, false, true)); // stale failover, sibling ok
         // Env pins: 0 = never (rc.262), 1 = always (rc.260).
-        assert!(!follow_renomination_policy(Some("0"), true, true));
-        assert!(follow_renomination_policy(Some("1"), false, false));
-        // Garbage env falls back to the v2 rule.
-        assert!(follow_renomination_policy(Some("x"), true, false));
-        assert!(!follow_renomination_policy(Some("x"), false, false));
+        assert!(!follow_renomination_policy(Some("0"), true, true, true));
+        assert!(follow_renomination_policy(Some("1"), false, false, false));
+        // Garbage env falls back to the v2.1 rule.
+        assert!(follow_renomination_policy(Some("x"), true, true, false));
+        assert!(!follow_renomination_policy(Some("x"), true, false, false));
     }
 }
 
@@ -500,7 +514,7 @@ impl ControllingSelector for AgentInternal {
                     let selected = self.agent_conn.get_selected_pair();
                     selected
                         .as_ref()
-                        .is_some_and(|s| should_follow_renomination(&p.remote.address(), s))
+                        .is_some_and(|s| should_follow_renomination(&p, s))
                 };
                 let already_selected = {
                     let selected = self.agent_conn.get_selected_pair();
@@ -724,7 +738,7 @@ impl ControlledSelector for AgentInternal {
                         let selected = self.agent_conn.get_selected_pair();
                         selected
                             .as_ref()
-                            .is_some_and(|s| should_follow_renomination(&p.remote.address(), s))
+                            .is_some_and(|s| should_follow_renomination(&p, s))
                     };
                     let already_selected = {
                         let selected = self.agent_conn.get_selected_pair();
