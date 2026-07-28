@@ -91,9 +91,11 @@ pub(crate) enum PathMonMode {
     Off,
     /// Fed + compared + logged; legacy stays authoritative (PR-A default).
     Shadow,
-    /// Decisions consumed (PR-C+). Until that wiring lands this behaves
-    /// exactly like [`Shadow`](Self::Shadow) — documented so an early opt-in
-    /// can't silently change behaviour.
+    /// PR-C — decisions CONSUMED: the monitor's `decide`/`inbound_init`
+    /// verdicts gate `install_peers` and the inbound accept, while the legacy
+    /// cooldown state keeps being written as the safety rail (flipping back
+    /// to `shadow` is seamless). Pilot hosts opt in via env; the fleet
+    /// default stays `shadow` until PR-D.
     On,
 }
 
@@ -659,7 +661,19 @@ impl PathMonitor {
         }
         let state = self.peers.get(peer);
         if state.is_some_and(|p| p.probe.is_some()) {
-            return PathAction::Keep; // one probe per peer, structural
+            // One probe per peer, structural. An installed incumbent keeps
+            // carrying traffic while the probe runs; a FRESH peer (no
+            // carrier at all) must not sit carrierless waiting on it —
+            // PR-C: ride relay for the working carrier (P9's carrier-first
+            // principle) and let the probe promote over it when it latches.
+            // Soak #1 Class A caught legacy racing a fresh direct install
+            // over a dangling probe here (a sweep death leaves
+            // `upgrade_probes` intact and the fresh walk ignored it, so a
+            // late promote could clobber the fresh carrier).
+            return match incumbent {
+                Incumbent::None => PathAction::Relay,
+                _ => PathAction::Keep,
+            };
         }
 
         let lan_spaced_out = state
@@ -794,6 +808,14 @@ pub(crate) struct ShadowStats {
     /// immediately after its own death/expiry penalty booked (must be 0 —
     /// the penalty math guarantees ineligibility right after booking).
     pub(crate) post_death_eligible: u64,
+    /// PR-C (soak #1 finding) — D10 re-dials, counted but NOT compared: a
+    /// zombie-srflx re-dial refreshes the DIAL TARGET of the current tier
+    /// (Srflx→Srflx), so it is not a tier-selection event and comparing it
+    /// against `decide()` was a PR-A over-inclusion (50+/host/45 h of false
+    /// "divergence" in soak #1). The re-dial stays execution-layer
+    /// permanently — even a post-PR-E authoritative monitor doesn't own
+    /// dial-target freshness.
+    pub(crate) d10_redials: u64,
     /// P3 PR-B — `(decisions, diverged)` per trigger class
     /// (netmap / delta / reupgrade / resume / initial / inbound): the
     /// scheduler comparison as its own divergence class. A reupgrade-tick
