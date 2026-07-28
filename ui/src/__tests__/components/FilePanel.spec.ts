@@ -7,25 +7,25 @@ import * as directives from 'vuetify/directives'
 
 // Polyfill APIs missing from jsdom
 beforeAll(() => {
-  global.ResizeObserver = class {
+  globalThis.ResizeObserver = class {
     observe() {}
     unobserve() {}
     disconnect() {}
   } as unknown as typeof ResizeObserver
 
-  if (!global.IntersectionObserver) {
-    global.IntersectionObserver = class {
+  if (!globalThis.IntersectionObserver) {
+    globalThis.IntersectionObserver = class {
       observe() {}
       unobserve() {}
       disconnect() {}
     } as unknown as typeof IntersectionObserver
   }
 
-  if (!global.cancelAnimationFrame) {
-    global.cancelAnimationFrame = vi.fn()
+  if (!globalThis.cancelAnimationFrame) {
+    globalThis.cancelAnimationFrame = vi.fn()
   }
-  if (!global.requestAnimationFrame) {
-    global.requestAnimationFrame = vi.fn((cb: FrameRequestCallback) => {
+  if (!globalThis.requestAnimationFrame) {
+    globalThis.requestAnimationFrame = vi.fn((cb: FrameRequestCallback) => {
       cb(0)
       return 0
     })

@@ -4,11 +4,12 @@ use crate::fixtures::test_app::TestApp;
 async fn preflight_options_returns_cors_headers() {
     let app = TestApp::spawn().await;
 
-    // Send a preflight OPTIONS request with typical CORS headers
+    // Preflight from the FRONTEND origin (the fixture's frontend_url) —
+    // the tightened default allows exactly that origin.
     let resp = app
         .client
         .request(reqwest::Method::OPTIONS, app.url("/api/auth/login"))
-        .header("Origin", "http://example.com")
+        .header("Origin", "http://localhost:5173")
         .header("Access-Control-Request-Method", "POST")
         .header(
             "Access-Control-Request-Headers",
@@ -18,7 +19,6 @@ async fn preflight_options_returns_cors_headers() {
         .await
         .unwrap();
 
-    // Default config has empty cors_origins -> fully permissive (Any)
     let status = resp.status().as_u16();
     assert!(
         status == 200 || status == 204,
@@ -41,9 +41,52 @@ async fn preflight_options_returns_cors_headers() {
     );
 }
 
+/// Tightened default (2026-07-28): with no cors_origins configured the
+/// server allows ONLY the frontend's own origin — no more Any fallback.
 #[tokio::test]
-async fn cors_allows_any_origin_by_default() {
+async fn cors_default_allows_only_frontend_origin() {
     let app = TestApp::spawn().await;
+
+    // The frontend origin is allowed and echoed back exactly.
+    let resp = app
+        .client
+        .get(app.url("/health"))
+        .header("Origin", "http://localhost:5173")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("access-control-allow-origin")
+            .expect("frontend origin must be allowed")
+            .to_str()
+            .unwrap(),
+        "http://localhost:5173"
+    );
+
+    // A random foreign origin gets NO allow-origin header.
+    let resp = app
+        .client
+        .get(app.url("/health"))
+        .header("Origin", "http://random-origin.example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    assert!(
+        resp.headers().get("access-control-allow-origin").is_none(),
+        "foreign origin must not be allowed under the tightened default"
+    );
+}
+
+/// The permissive escape hatch survives: an explicit "*" keeps Any.
+#[tokio::test]
+async fn cors_star_stays_permissive() {
+    let app = TestApp::spawn_with_settings(|settings| {
+        settings.app.cors_origins = vec!["*".to_string()];
+    })
+    .await;
 
     let resp = app
         .client
@@ -52,19 +95,14 @@ async fn cors_allows_any_origin_by_default() {
         .send()
         .await
         .unwrap();
-
     assert_eq!(resp.status().as_u16(), 200);
-
-    let allow_origin = resp
-        .headers()
-        .get("access-control-allow-origin")
-        .expect("Expected Access-Control-Allow-Origin header")
-        .to_str()
-        .unwrap();
-
     assert_eq!(
-        allow_origin, "*",
-        "Default CORS should allow any origin (*)"
+        resp.headers()
+            .get("access-control-allow-origin")
+            .expect("explicit \"*\" must stay permissive")
+            .to_str()
+            .unwrap(),
+        "*"
     );
 }
 
