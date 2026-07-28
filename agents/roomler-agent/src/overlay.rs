@@ -90,10 +90,11 @@ pub async fn maybe_start(
     let derp_factory: Option<DerpMuxFactory> = if tunnel_core::overlay::direct::derp_enabled() {
         let ws_url = cfg.ws_url();
         let token = cfg.agent_token.clone();
+        let tenant = cfg.tenant_id.clone();
         let pubkey = keypair.public.to_bytes();
         Some(Box::new(move || {
             let (mux, outbound_rx) = tunnel_core::transport::derp::DerpMux::new(pubkey);
-            crate::derp::spawn(&ws_url, &token, &mux, outbound_rx);
+            crate::derp::spawn(&ws_url, &token, &tenant, &mux, outbound_rx);
             info!("overlay derp: /derp carrier opened (node UDP-blocked; both-UDP-blocked tier)");
             mux
         }))
