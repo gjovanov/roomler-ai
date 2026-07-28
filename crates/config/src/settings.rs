@@ -55,6 +55,12 @@ pub struct AppSettings {
     pub static_dir: Option<String>,
     pub cors_origins: Vec<String>,
     pub frontend_url: String,
+    /// Deployment environment label (`"development"` default). Setting it to
+    /// `"production"` arms hard-fail guards — currently: refusing to boot
+    /// while `jwt.secret` is still the built-in default. Prod sets
+    /// `ROOMLER__APP__ENVIRONMENT=production` in the configmap.
+    #[serde(default = "default_environment")]
+    pub environment: String,
     /// Sustained per-client-IP rate for `/api`, in **requests per second**.
     /// Default 1. The e2e overlay bumps this so a Playwright Job's single
     /// pod IP doesn't trip 429s during the suite.
@@ -103,6 +109,9 @@ impl AppSettings {
     }
 }
 
+fn default_environment() -> String {
+    "development".to_string()
+}
 fn default_rate_limit_per_sec() -> u64 {
     1
 }
@@ -266,6 +275,7 @@ impl Settings {
             .set_default("app.host", "0.0.0.0")?
             .set_default("app.port", 3000)?
             .set_default("app.cors_origins", Vec::<String>::new())?
+            .set_default("app.environment", "development")?
             .set_default("app.frontend_url", "http://localhost:5173")?
             .set_default("app.rate_limit_per_sec", 1)?
             .set_default("app.rate_limit_burst", 60)?
@@ -354,6 +364,7 @@ mod rate_limit_tests {
             static_dir: None,
             cors_origins: vec![],
             frontend_url: "http://localhost".into(),
+            environment: "development".into(),
             rate_limit_per_sec: per_sec,
             rate_limit_burst: 60,
             rate_limit_trusted_hops: 1,
