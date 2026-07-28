@@ -98,10 +98,32 @@ impl FlipTracker {
 
 /// Per-codec maxrate ceiling factor, in percent. Keyed by the pump's
 /// `FfmpegDcCodec::label()` vocabulary ("HEVC" / "VP9" / "AV1" / "H264").
+///
+/// Built-ins (2026-07-28 field, NEO16→WINHOST-C/UHD 620): H264 keeps
+/// its 150 % band (equal text sharpness genuinely needs ~1.5× the bits);
+/// HEVC moves 100 → **125** — the "HEVC needs ⅔ the bits of H.264"
+/// efficiency assumption fails for desktop drag-motion on realtime QSV
+/// presets, and the starved band was the measured reason H.264 looked
+/// visibly smoother than HEVC on the same direct path (13.1 vs 8.7 Mbps;
+/// encode times were fine for both).
+///
+/// Operator override per codec: `ROOMLER_NODE_RATE_FACTOR_<LABEL>` (legacy
+/// `ROOMLER_AGENT_` prefix + the `rate_factor_*` config keys accepted via
+/// [`tunnel_core::env::node_env`]). Clamped to 50–400; garbage falls back
+/// to the built-in. The pump re-reads per frame, so a REAL env var applies
+/// live; config-key changes need a service restart (set-once fallback map).
 pub fn codec_rate_factor_pct(codec_label: &str) -> usize {
-    match codec_label {
+    let builtin: usize = match codec_label {
         "H264" => 150,
+        "HEVC" => 125,
         _ => 100,
+    };
+    match tunnel_core::env::node_env(&format!("RATE_FACTOR_{codec_label}")) {
+        Some(v) => match v.trim().parse::<usize>() {
+            Ok(pct) => pct.clamp(50, 400),
+            Err(_) => builtin,
+        },
+        None => builtin,
     }
 }
 
@@ -284,12 +306,31 @@ mod tests {
         assert_eq!(f.observe(true, after), Some(true));
     }
 
+    /// One test fn on purpose: the override assertions mutate process env
+    /// and cargo runs #[test] fns in parallel threads.
     #[test]
-    fn codec_factor_boosts_h264_only() {
+    fn codec_factor_defaults_and_env_override() {
+        // Built-in matrix (2026-07-28: HEVC 100 → 125, field-measured).
         assert_eq!(codec_rate_factor_pct("H264"), 150);
-        assert_eq!(codec_rate_factor_pct("HEVC"), 100);
+        assert_eq!(codec_rate_factor_pct("HEVC"), 125);
         assert_eq!(codec_rate_factor_pct("VP9"), 100);
         assert_eq!(codec_rate_factor_pct("AV1"), 100);
+
+        // SAFETY: no other test in this crate touches these vars (set_var
+        // is unsafe in edition 2024 because of cross-thread env races).
+        unsafe { std::env::set_var("ROOMLER_AGENT_RATE_FACTOR_HEVC", "140") };
+        assert_eq!(codec_rate_factor_pct("HEVC"), 140);
+        // Clamped to 50–400.
+        unsafe { std::env::set_var("ROOMLER_AGENT_RATE_FACTOR_HEVC", "10") };
+        assert_eq!(codec_rate_factor_pct("HEVC"), 50);
+        unsafe { std::env::set_var("ROOMLER_AGENT_RATE_FACTOR_HEVC", "9000") };
+        assert_eq!(codec_rate_factor_pct("HEVC"), 400);
+        // Garbage falls back to the built-in.
+        unsafe { std::env::set_var("ROOMLER_AGENT_RATE_FACTOR_HEVC", "fast") };
+        assert_eq!(codec_rate_factor_pct("HEVC"), 125);
+        unsafe { std::env::remove_var("ROOMLER_AGENT_RATE_FACTOR_HEVC") };
+        // Other codecs untouched by the HEVC var.
+        assert_eq!(codec_rate_factor_pct("H264"), 150);
     }
 
     #[test]

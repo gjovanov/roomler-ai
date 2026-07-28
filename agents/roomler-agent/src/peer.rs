@@ -1306,7 +1306,9 @@ async fn current_pair_is_relay(
 async fn overlay_remote_is_relay_tier(remote_addr: &str, session_id: bson::oid::ObjectId) -> bool {
     use tunnel_core::localapi::ConnectionType;
 
-    if std::env::var("ROOMLER_AGENT_OVERLAY_TIER_DETECT").as_deref() == Ok("0") {
+    // node_env: accepts ROOMLER_NODE_/ROOMLER_AGENT_ prefixes + the
+    // `overlay_tier_detect` config key via the S2 fallback map.
+    if tunnel_core::env::node_env("OVERLAY_TIER_DETECT").as_deref() == Some("0") {
         return false;
     }
     if !addr_is_overlay_range(remote_addr) {
