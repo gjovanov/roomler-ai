@@ -156,8 +156,15 @@ impl Router {
     }
 
     /// Install / replace the host route for `ip` → `pubkey`.
-    pub fn upsert(&mut self, ip: Ipv4Addr, pubkey: [u8; 32]) {
-        self.by_ip.insert(ip, pubkey);
+    ///
+    /// Returns the pubkey the address previously pointed at when that was a
+    /// DIFFERENT peer — an overlay-IP REASSIGNMENT. The server recycles a
+    /// removed device's address to the tenant's pool, so this is expected after
+    /// the old owner is gone, but seeing it while the old owner is still
+    /// installed means two peers claim one address and the caller should say so
+    /// loudly.
+    pub fn upsert(&mut self, ip: Ipv4Addr, pubkey: [u8; 32]) -> Option<[u8; 32]> {
+        self.by_ip.insert(ip, pubkey).filter(|prev| *prev != pubkey)
     }
 
     /// Phase 1 — replace `pubkey`'s advertised subnet routes (empty clears them).
@@ -177,15 +184,21 @@ impl Router {
         self.v6_exit
     }
 
-    /// Drop the `/32` route for `ip` AND any subnet routes owned by the same
-    /// peer; returns the pubkey the host route pointed at (if any) so the caller
-    /// can also drop the matching `Tunn`.
-    pub fn remove(&mut self, ip: &Ipv4Addr) -> Option<[u8; 32]> {
-        let pk = self.by_ip.remove(ip);
-        if let Some(pk) = pk {
-            self.subnets.retain(|(_, p)| *p != pk);
-        }
-        pk
+    /// Drop EVERY route owned by `pubkey` — its `/32` host route(s) AND its
+    /// subnet routes. `true` if anything was removed.
+    ///
+    /// Keyed by PUBKEY, never by IP. Overlay addresses are RECYCLED: the server
+    /// returns a removed device's host number to the tenant's pool, so by the
+    /// time a stale peer is reaped `by_ip[its_ip]` may already point at the
+    /// address's NEW owner. Removing by IP then deleted the LIVE peer's host
+    /// route — and, because the old code fed the *returned* pubkey to
+    /// `subnets.retain`, the live peer's subnet routes with it — blackholing
+    /// that address with no self-heal until the process restarted.
+    pub fn remove_by_pubkey(&mut self, pubkey: &[u8; 32]) -> bool {
+        let before = self.by_ip.len() + self.subnets.len();
+        self.by_ip.retain(|_, pk| pk != pubkey);
+        self.subnets.retain(|(_, pk)| pk != pubkey);
+        before != self.by_ip.len() + self.subnets.len()
     }
 
     /// Which peer owns the overlay destination `ip`? Exact `/32` first, else the
@@ -250,11 +263,50 @@ mod tests {
         let mut r = Router::new();
         let ip = Ipv4Addr::new(100, 64, 0, 7);
         let key = [9u8; 32];
-        r.upsert(ip, key);
+        assert_eq!(
+            r.upsert(ip, key),
+            None,
+            "nothing displaced on a fresh insert"
+        );
         assert_eq!(r.route(&ip), Some(key));
         assert_eq!(r.route(&Ipv4Addr::new(100, 64, 0, 8)), None);
-        assert_eq!(r.remove(&ip), Some(key));
+        assert!(r.remove_by_pubkey(&key));
         assert_eq!(r.route(&ip), None);
+        assert!(!r.remove_by_pubkey(&key), "second removal is a no-op");
+    }
+
+    /// Overlay addresses are recycled between machines, so reaping a stale peer
+    /// must not touch the routes the address's NEW owner installed. Removing by
+    /// IP used to delete both the live peer's `/32` AND its subnets.
+    #[test]
+    fn remove_by_pubkey_leaves_a_recycled_ip_with_its_new_owner() {
+        let (old, new) = ([1u8; 32], [2u8; 32]);
+        let ip = Ipv4Addr::new(100, 64, 0, 5);
+        let mut r = Router::new();
+        r.upsert(ip, old);
+        r.set_subnets(old, &[Cidr::parse("192.168.7.0/24").unwrap()]);
+
+        // The server released `ip` and handed it to a different machine.
+        assert_eq!(
+            r.upsert(ip, new),
+            Some(old),
+            "a reassignment surfaces the displaced peer"
+        );
+        r.set_subnets(new, &[Cidr::parse("10.9.0.0/16").unwrap()]);
+
+        // …and only NOW is the stale peer reaped.
+        assert!(r.remove_by_pubkey(&old));
+        assert_eq!(r.route(&ip), Some(new), "the live peer keeps its /32");
+        assert_eq!(
+            r.route(&Ipv4Addr::new(10, 9, 1, 1)),
+            Some(new),
+            "…and its subnets"
+        );
+        assert_eq!(
+            r.route(&Ipv4Addr::new(192, 168, 7, 1)),
+            None,
+            "the stale peer's subnets are gone"
+        );
     }
 
     #[test]
@@ -276,8 +328,8 @@ mod tests {
         // Unknown → None.
         assert_eq!(r.route(&Ipv4Addr::new(10, 0, 0, 1)), None);
 
-        // Removing gw's /32 also drops its /16; other's /24 survives.
-        assert_eq!(r.remove(&Ipv4Addr::new(100, 64, 0, 1)), Some(gw));
+        // Removing gw also drops its /16; other's /24 survives.
+        assert!(r.remove_by_pubkey(&gw));
         assert_eq!(r.route(&Ipv4Addr::new(192, 168, 2, 5)), None);
         assert_eq!(r.route(&Ipv4Addr::new(192, 168, 1, 9)), Some(other));
     }
