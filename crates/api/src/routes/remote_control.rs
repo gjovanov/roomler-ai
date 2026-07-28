@@ -11,7 +11,7 @@ use axum::{
 use bson::{DateTime, oid::ObjectId};
 use roomler_ai_db::models::role::permissions;
 use roomler_ai_remote_control::{
-    models::{AccessPolicy, AgentStatus, OsKind, RemoteAuditEvent, RemoteSession},
+    models::{AccessPolicy, AgentStatus, NodeRef, OsKind, RemoteAuditEvent, RemoteSession},
     permissions::Permissions,
     signaling::IceServer,
     turn_creds::ice_servers_for,
@@ -26,7 +26,11 @@ const ENROLLMENT_TTL_SECS: u64 = 600; // 10 minutes per §11.1
 /// Require a `role::permissions` bit for `user_id` in `tenant_id`. Doubles as
 /// the membership check — `get_member_permissions` returns `Forbidden` for a
 /// non-member. `owner` always passes via the `ADMINISTRATOR` bypass in `has`.
-async fn require_permission(
+///
+/// `pub(crate)` so the sibling device-management surfaces in the same subsystem
+/// (`routes::overlay_route`, `routes::tunnel`) gate their destructive endpoints
+/// on the same `MANAGE_AGENTS` bit rather than re-deriving the check.
+pub(crate) async fn require_permission(
     state: &AppState,
     tenant_id: ObjectId,
     user_id: ObjectId,
@@ -305,6 +309,12 @@ pub async fn update_agent(
     Ok(Json(serde_json::json!({ "updated": true })))
 }
 
+/// DELETE /api/tenant/{tid}/agent/{agent_id} — remove a device from the fleet.
+///
+/// Cascades to the overlay: the agent's mesh node is evicted (peers get a
+/// `removes` delta) and its overlay IP goes back to the tenant's free pool for
+/// reuse. The agent binary stays installed on the host and may be enrolled
+/// again — but it comes back as a NEW mesh node with a fresh address.
 pub async fn delete_agent(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -324,13 +334,36 @@ pub async fn delete_agent(
     )
     .await?;
 
+    // Read first: gives a real 404 for a bogus agent id (`soft_delete` returns
+    // a bool the handler used to discard, so deleting a nonexistent agent
+    // reported `{"deleted": true}`), and yields the machine_id the overlay node
+    // is keyed by.
+    let agent = state.agents.find_in_tenant(tid, aid).await?;
+
+    // Release the overlay lease BEFORE the soft-delete and BEFORE the kick. The
+    // kick tears down the WS, whose teardown calls `handle_overlay_leave` — with
+    // the node already tombstoned that is a clean no-op instead of a second
+    // `removes` fan racing the release's compare-and-swap.
+    let released = crate::ws::overlay::release_overlay_node_for(
+        &state,
+        tid,
+        &agent.machine_id,
+        &NodeRef::Agent { agent_id: aid },
+        "agent_delete",
+    )
+    .await;
+
     state.agents.soft_delete(tid, aid).await?;
     // rc.53: admin-driven kick — no tx identity to thread through;
     // pass None to force unconditional removal (the identity gate is
     // only for the displaced-handler unregister race, not for
     // operator kicks).
     state.rc_hub.unregister_agent(aid, None); // kick any live WS
-    Ok(Json(serde_json::json!({ "deleted": true })))
+    Ok(Json(serde_json::json!({
+        "deleted": true,
+        "overlay_released": released.is_some(),
+        "overlay_ip": released.as_ref().map(|r| r.overlay_ip.clone()),
+    })))
 }
 
 // ────────────────────────────────────────────────────────────────────────────

@@ -405,7 +405,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/enroll-token",
             post(routes::tunnel::issue_tunnel_enrollment_token),
-        );
+        )
+        // matchit gives the static `/enroll-token` above precedence over this
+        // parameterised segment, so there is no shadowing.
+        .route("/{client_id}", delete(routes::tunnel::delete_tunnel_client));
     let tunnel_policy_routes = Router::new()
         .route(
             "/",
@@ -428,6 +431,11 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/{node_id}/exit-node",
             put(routes::overlay_route::set_exit_node),
+        )
+        // Evict a node from the mesh + release its address back to the pool.
+        .route(
+            "/{node_id}",
+            delete(routes::overlay_route::evict_overlay_node),
         );
 
     // Phase 2 MagicDNS — the tenant's overlay DNS domain + upstreams.
