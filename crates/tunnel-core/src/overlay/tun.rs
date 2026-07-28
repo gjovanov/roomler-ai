@@ -295,6 +295,121 @@ mod system {
         Err(last_err.expect("attempts >= 1 ⇒ f ran at least once"))
     }
 
+    /// P9 — is the Windows net-hygiene pass disabled? Only an explicit
+    /// `0`/`false`/`no`/`off` disables (`ROOMLER_NODE_TUN_HYGIENE`); unset /
+    /// anything else keeps the default ON. Pure so the parse is testable.
+    #[cfg(windows)]
+    fn hygiene_disabled(v: Option<&str>) -> bool {
+        matches!(
+            v.map(|s| s.trim().to_ascii_lowercase()),
+            Some(t) if t == "0" || t == "false" || t == "no" || t == "off"
+        )
+    }
+
+    /// P9 — one-shot Windows network hygiene at TUN bring-up (call site in
+    /// [`SystemTun::up`]). Two consumer-box gaps, both field-hit 2026-07-28:
+    ///
+    /// * **Inbound-allow firewall rule for THIS binary's UDP** (the WG socket
+    ///   on the PHYSICAL adapters): a fresh install has none — a Windows
+    ///   *service* never gets the interactive "Allow access?" prompt — so
+    ///   unsolicited WG dials (LAN direct, srflx punch) die at the Public
+    ///   profile's default-deny. A home laptop could not accept LAN-direct
+    ///   until exactly this rule was added by hand. Rule name carries the exe
+    ///   stem so `roomlerd` and the `roomler` tunnel client don't fight;
+    ///   delete+add keeps the recorded program path current across upgrades.
+    /// * **`NetworkCategory=Private` for the roomler adapter**: belt and
+    ///   braces for hosts where the WFP hard-permit could not install
+    ///   (GPO-locked) — an Unidentified-network TUN otherwise lands in the
+    ///   Public profile.
+    ///
+    /// Detached thread: netsh/PowerShell are slow and the connection-profile
+    /// registration can lag the adapter by seconds — bring-up must not block.
+    /// Every step best-effort (an unelevated tunnel client simply can't do
+    /// this; the overlay still runs — relay-side — without it).
+    #[cfg(windows)]
+    fn spawn_windows_net_hygiene() {
+        if hygiene_disabled(crate::env::node_env("TUN_HYGIENE").as_deref()) {
+            tracing::info!("overlay: Windows net hygiene disabled via ROOMLER_NODE_TUN_HYGIENE");
+            return;
+        }
+        std::thread::spawn(|| {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            // 1) Inbound-allow for this binary's UDP, all profiles.
+            if let Ok(exe) = std::env::current_exe() {
+                let stem = exe
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "roomler".into());
+                let rule = format!("Roomler UDP-In ({stem})");
+                let exe = exe.to_string_lossy().to_string();
+                // Delete first (stale program path from a moved install), then
+                // add — idempotent end state, current path always recorded.
+                let _ = std::process::Command::new("netsh")
+                    .args([
+                        "advfirewall",
+                        "firewall",
+                        "delete",
+                        "rule",
+                        &format!("name={rule}"),
+                    ])
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .output();
+                match std::process::Command::new("netsh")
+                    .args([
+                        "advfirewall",
+                        "firewall",
+                        "add",
+                        "rule",
+                        &format!("name={rule}"),
+                        "dir=in",
+                        "action=allow",
+                        "protocol=udp",
+                        &format!("program={exe}"),
+                    ])
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .output()
+                {
+                    Ok(o) if o.status.success() => {
+                        tracing::info!(rule = %rule, "overlay: firewall inbound-UDP allow installed for this binary")
+                    }
+                    Ok(o) => tracing::debug!(
+                        rule = %rule, status = %o.status,
+                        "overlay: firewall rule add failed (unelevated?)"
+                    ),
+                    Err(e) => tracing::debug!(rule = %rule, %e, "overlay: netsh unavailable"),
+                }
+            }
+            // 2) roomler adapter → Private profile (registration lags the
+            //    adapter, so retry over ~12 s before giving up quietly).
+            for attempt in 1..=6u32 {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                let ok = std::process::Command::new("powershell")
+                    .args([
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-Command",
+                        &format!(
+                            "Set-NetConnectionProfile -InterfaceAlias '{IF_NAME}' \
+                             -NetworkCategory Private -ErrorAction Stop"
+                        ),
+                    ])
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .output()
+                    .map(|o| o.status.success())
+                    .unwrap_or(false);
+                if ok {
+                    tracing::info!(attempt, "overlay: roomler adapter profile set to Private");
+                    return;
+                }
+            }
+            tracing::debug!(
+                "overlay: could not set the roomler adapter profile to Private \
+                 (unelevated, or no connection profile registered)"
+            );
+        });
+    }
+
     impl SystemTun {
         /// Create the device, assign `self_ip` with `netmask`, set `mtu`,
         /// and bring it up. `netmask` is the overlay *network* mask (e.g.
@@ -403,6 +518,12 @@ mod system {
                 tracing::info!("overlay: WFP permit disabled via ROOMLER_AGENT_WFP_PERMIT");
                 None
             };
+
+            // P9 — consumer-box hygiene: the daemon's inbound-UDP firewall
+            // allow (WG on the physical NICs) + the adapter's Private profile.
+            // Fire-and-forget; see `spawn_windows_net_hygiene`.
+            #[cfg(windows)]
+            spawn_windows_net_hygiene();
 
             // P5 — snapshot the host's original default route NOW, before any
             // overlay route is installed, so exit-node exemptions can later pin
@@ -1234,6 +1355,21 @@ mod system {
     mod tests {
         use std::cell::Cell;
         use std::time::Duration;
+
+        /// P9 — the net-hygiene kill-switch parse: only an explicit falsy
+        /// value disables; unset / anything else keeps the default ON.
+        #[cfg(windows)]
+        #[test]
+        fn hygiene_kill_switch_parse() {
+            use super::hygiene_disabled;
+            assert!(!hygiene_disabled(None));
+            assert!(!hygiene_disabled(Some("1")));
+            assert!(!hygiene_disabled(Some("weird")));
+            assert!(hygiene_disabled(Some("0")));
+            assert!(hygiene_disabled(Some(" FALSE ")));
+            assert!(hygiene_disabled(Some("no")));
+            assert!(hygiene_disabled(Some("off")));
+        }
 
         /// rc.209 — the Wintun create-retry policy: succeed as soon as a try
         /// returns `Ok`, without running further attempts or sleeping.
