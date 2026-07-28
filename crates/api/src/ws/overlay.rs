@@ -26,6 +26,7 @@
 //! tenant+network-scoped query, so the cross-tenant gate is structural);
 //! Phase 4 swaps in `policy::evaluate_overlay`.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -254,10 +255,14 @@ async fn handle_overlay_join(
     };
 
     let epoch = next_epoch();
+    // P9 — presence: ghost rows (clean-leave Offline, or an agent whose
+    // heartbeat went stale) ship `reachable = false` in the FULL netmap
+    // instead of resurrecting as dialable peers on every rejoin.
+    let reach = reachability(state, &all).await;
     let peers: Vec<NetmapPeer> = all
         .iter()
         .filter(|n| n.id != self_node.id)
-        .map(to_netmap_peer)
+        .map(|n| to_netmap_peer(n, is_reachable(&reach, n)))
         .collect();
 
     // Phase 2 MagicDNS — carry the tenant's DNS suffix + upstreams so the node
@@ -296,8 +301,8 @@ async fn handle_overlay_join(
     )
     .await;
 
-    // Upsert delta → every peer.
-    let upsert = to_netmap_peer(&self_node);
+    // Upsert delta → every peer. The joiner is live by construction.
+    let upsert = to_netmap_peer(&self_node, true);
     for peer in all.iter().filter(|n| n.id != self_node.id) {
         send_to_node(
             state,
@@ -339,7 +344,7 @@ async fn handle_overlay_endpoints(state: &AppState, ident: NodeIdentity, candida
     let mut updated = self_node;
     updated.endpoints = candidates;
     let epoch = next_epoch();
-    let upsert = to_netmap_peer(&updated);
+    let upsert = to_netmap_peer(&updated, true);
     fan_delta_to_peers(state, &updated, epoch, vec![upsert], vec![]).await;
 }
 
@@ -375,7 +380,7 @@ async fn handle_overlay_srflx(
     updated.srflx_endpoints = candidates;
     updated.srflx_nat = nat;
     let epoch = next_epoch();
-    let upsert = to_netmap_peer(&updated);
+    let upsert = to_netmap_peer(&updated, true);
     fan_delta_to_peers(state, &updated, epoch, vec![upsert], vec![]).await;
 }
 
@@ -665,7 +670,10 @@ async fn repush_forced_pairs_on_join(state: &AppState, node: &OverlayNode) {
 /// approving/revoking its subnet `routes`), so peers pick it up immediately
 /// instead of waiting for the next join. Best-effort.
 pub(crate) async fn refan_node(state: &AppState, node: &OverlayNode) {
-    let upsert = to_netmap_peer(node);
+    // P9 — an out-of-band refan (admin route approval) can target a node
+    // that is currently offline; carry its real presence, not a blanket true.
+    let reach = reachability(state, std::slice::from_ref(node)).await;
+    let upsert = to_netmap_peer(node, is_reachable(&reach, node));
     fan_delta_to_peers(state, node, next_epoch(), vec![upsert], vec![]).await;
 }
 
@@ -837,10 +845,71 @@ async fn unique_node_name(
     format!("{base}-{}", next_epoch())
 }
 
-/// Phase 1 reachability is structural (same tenant + network), so every
-/// peer the node receives is `reachable = true`. Phase 4 sets this from
-/// `policy::evaluate_overlay`.
-fn to_netmap_peer(node: &OverlayNode) -> NetmapPeer {
+/// P9 — how stale a backing agent's heartbeat may be before its overlay row
+/// ships `reachable = false`. Heartbeats refresh `agents.last_seen_at` every
+/// ~30 s ([`roomler_ai_services::dao::AgentDao::touch_heartbeat`]); 120 s =
+/// four missed beats, tolerant of a transient stall but killing day-old
+/// ghosts on the first netmap that carries them.
+const NODE_STALE_AFTER_MS: i64 = 120_000;
+
+/// P9 — presence for the netmap: `reachable = false` for a row that cleanly
+/// left (status `Offline` — the leave handler's mark) or whose backing
+/// agent's heartbeat went stale. Peers render such rows `offline` and stop
+/// burning dials / probes / REKEY handshakes on them (field 2026-07-28: a
+/// dead duplicate enrollment sat "blocked" in every netmap for a day while
+/// both sides hammered its stale endpoints — full netmaps resurrected it as
+/// dialable on every rejoin, undoing the leave-time remove delta).
+/// Tunnel-client rows have no heartbeat trail — status alone decides (a pod
+/// crash can leave one Online-but-gone until its next clean leave; a
+/// periodic stale-sweep is the v2). FAIL-OPEN: a freshness-query error reads
+/// as "everything reachable" — a DB blip must not mark the fleet offline.
+async fn reachability(state: &AppState, nodes: &[OverlayNode]) -> HashMap<ObjectId, bool> {
+    let agent_ids: Vec<ObjectId> = nodes
+        .iter()
+        .filter_map(|n| match &n.node_ref {
+            NodeRef::Agent { agent_id } => Some(*agent_id),
+            NodeRef::TunnelClient { .. } => None,
+        })
+        .collect();
+    let fresh = match state
+        .agents
+        .last_seen_fresh(&agent_ids, NODE_STALE_AFTER_MS)
+        .await
+    {
+        Ok(m) => Some(m),
+        Err(e) => {
+            warn!(%e, "overlay: agent freshness query failed; failing open");
+            None
+        }
+    };
+    nodes
+        .iter()
+        .filter_map(|n| {
+            let id = n.id?;
+            let up = matches!(n.status, AgentStatus::Online)
+                && match &n.node_ref {
+                    NodeRef::Agent { agent_id } => fresh
+                        .as_ref()
+                        .map(|m| m.get(agent_id).copied().unwrap_or(false))
+                        .unwrap_or(true),
+                    NodeRef::TunnelClient { .. } => true,
+                };
+            Some((id, up))
+        })
+        .collect()
+}
+
+/// The `reachable` a node's netmap row ships, from a [`reachability`] map.
+/// Fail-open for a row that somehow missed the map (no `_id`).
+fn is_reachable(reach: &HashMap<ObjectId, bool>, node: &OverlayNode) -> bool {
+    node.id.and_then(|i| reach.get(&i)).copied().unwrap_or(true)
+}
+
+/// Structural fields come from the row; `reachable` is the caller's presence
+/// verdict ([`reachability`] for peer lists; `true` for a node's OWN upsert —
+/// the sender of a live WS message is reachable by construction). Phase 4
+/// additionally sets this from `policy::evaluate_overlay`.
+fn to_netmap_peer(node: &OverlayNode, reachable: bool) -> NetmapPeer {
     NetmapPeer {
         node_id: node.id.unwrap_or_default(),
         overlay_ip: node.overlay_ip.clone(),
@@ -871,7 +940,7 @@ fn to_netmap_peer(node: &OverlayNode) -> NetmapPeer {
         // futile both-symmetric punch (VERBATIM, like srflx_endpoints).
         srflx_nat: node.srflx_nat.clone(),
         relay_home: node.relay_home.clone(),
-        reachable: true,
+        reachable,
         supports_quic: node.supports_quic,
         // Phase D — surface the node's single-relay capability so a peer only
         // picks single-relay when both ends advertise it (else both-allocate).
