@@ -23,24 +23,61 @@ use tower_http::{
     trace::TraceLayer,
 };
 
-fn build_cors_layer(origins: &[String]) -> CorsLayer {
-    if origins.is_empty() || origins.iter().any(|o| o == "*") {
-        CorsLayer::new()
+fn build_cors_layer(origins: &[String], frontend_url: &str) -> CorsLayer {
+    // Explicit "*" = the operator deliberately chose permissive mode.
+    if origins.iter().any(|o| o == "*") {
+        tracing::warn!("CORS is configured fully permissive (cors_origins contains \"*\")");
+        return CorsLayer::new()
             .allow_origin(Any)
             .allow_methods(Any)
-            .allow_headers(Any)
-    } else {
-        let allowed: Vec<_> = origins.iter().filter_map(|o| o.parse().ok()).collect();
-        CorsLayer::new()
-            .allow_origin(allowed)
-            .allow_methods(Any)
-            .allow_headers(Any)
-            .allow_credentials(true)
+            .allow_headers(Any);
     }
+
+    let mut allowed: Vec<axum::http::HeaderValue> =
+        origins.iter().filter_map(|o| o.parse().ok()).collect();
+    // Tightened default (2026-07-28, closes the "Any-origin fallback"
+    // Known Issue): with no cors_origins configured, allow only the
+    // frontend's own origin instead of every origin. Same-origin app
+    // traffic never needed CORS; native clients (agent, tunnel CLI,
+    // desktop) don't enforce it — so nothing legitimate relied on Any.
+    if origins.is_empty()
+        && let Ok(v) = frontend_url.trim_end_matches('/').parse()
+    {
+        allowed.push(v);
+    }
+    if allowed.is_empty() {
+        // Nothing parseable — fail open rather than brick every browser
+        // client, but say so loudly.
+        tracing::warn!("CORS origin list resolved empty; falling back to permissive");
+        return CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(Any)
+            .allow_headers(Any);
+    }
+    // NOTE: with allow_credentials(true), tower-http (0.6+) rejects
+    // wildcard methods/headers at request time — the old
+    // `.allow_methods(Any)` here is why the two cors_tests sat in the
+    // known-failing baseline. Enumerate instead.
+    use axum::http::{Method, header};
+    CorsLayer::new()
+        .allow_origin(allowed)
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE, header::ACCEPT])
+        .allow_credentials(true)
 }
 
 pub fn build_router(state: AppState) -> Router {
-    let cors = build_cors_layer(&state.settings.app.cors_origins);
+    let cors = build_cors_layer(
+        &state.settings.app.cors_origins,
+        &state.settings.app.frontend_url,
+    );
 
     // Capacity limiting for `/api`, keyed on the client address.
     //
