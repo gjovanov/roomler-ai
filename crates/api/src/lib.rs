@@ -76,12 +76,17 @@ pub fn build_router(state: AppState) -> Router {
         trusted_hops: state.settings.app.rate_limit_trusted_hops,
     };
 
-    // Credential endpoints — the ones worth guessing at, so they carry the
+    // Password endpoints — the ones actually worth guessing at — carry the
     // per-(address, account) brute-force gate on top of the general limiter.
+    //
+    // `/refresh` is deliberately NOT here: a refresh token is a signed,
+    // high-entropy secret rather than something guessable, so the gate would
+    // buy nothing, and refreshes carry no account field to key on. Every
+    // refresh from one address would share a single bucket, which turns a
+    // token-expiry stampede in a shared office into a self-inflicted outage.
     let credential_routes = Router::new()
         .route("/register", post(routes::auth::register))
         .route("/login", post(routes::auth::login))
-        .route("/refresh", post(routes::auth::refresh))
         .layer(axum::middleware::from_fn_with_state(
             auth_rate_limit_state,
             middleware::auth_rate_limit::auth_rate_limit,
@@ -90,6 +95,7 @@ pub fn build_router(state: AppState) -> Router {
     // Auth routes (no tenant prefix)
     let auth_routes = Router::new()
         .route("/logout", post(routes::auth::logout))
+        .route("/refresh", post(routes::auth::refresh))
         .route("/activate", post(routes::auth::activate))
         .route("/me", get(routes::auth::me))
         .route("/me", put(routes::auth::me))
