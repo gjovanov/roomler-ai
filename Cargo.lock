@@ -7322,6 +7322,7 @@ dependencies = [
  "roomler-ai-api",
  "roomler-ai-config",
  "roomler-ai-db",
+ "roomler-ai-remote-control",
  "roomler-ai-services",
  "serde",
  "serde_json",
