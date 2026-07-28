@@ -55,16 +55,52 @@ pub struct AppSettings {
     pub static_dir: Option<String>,
     pub cors_origins: Vec<String>,
     pub frontend_url: String,
-    /// Per-IP rate limit refill rate (tokens/sec). Default 1 — i.e.
-    /// sustained 60 req/min. The e2e overlay bumps this so a
-    /// Playwright Job's single pod IP doesn't trip 429s during
-    /// the suite.
+    /// Sustained per-client-IP rate for `/api`, in **requests per second**.
+    /// Default 1. The e2e overlay bumps this so a Playwright Job's single
+    /// pod IP doesn't trip 429s during the suite.
+    ///
+    /// Note this is a *rate*, not an interval — see [`Self::rate_limit_period_ms`]
+    /// for why that distinction is a trap worth spelling out.
     #[serde(default = "default_rate_limit_per_sec")]
     pub rate_limit_per_sec: u64,
-    /// Per-IP rate limit burst cap. Default 60 — sustains the
-    /// per-second refill above. Bumped in e2e for the same reason.
+    /// Per-IP burst cap for `/api`. Default 60. This is the real headroom
+    /// for a page load: a SPA fans out to many endpoints at once, and every
+    /// client behind one NAT shares the bucket.
     #[serde(default = "default_rate_limit_burst")]
     pub rate_limit_burst: u32,
+    /// How many reverse proxies *we* control append to `X-Forwarded-For`
+    /// before a request reaches axum. Everything further left in that header
+    /// is client-supplied and must not be trusted. Prod chain is
+    /// docker-nginx (sets the client IP) → pod-nginx (appends its peer), so
+    /// exactly 1 hop is ours.
+    #[serde(default = "default_rate_limit_trusted_hops")]
+    pub rate_limit_trusted_hops: usize,
+    /// Sustained auth-endpoint attempts per minute, per (client IP, account).
+    /// Deliberately far stricter than the general `/api` limit: this is the
+    /// brute-force gate, and it must not depend on starving the whole API.
+    #[serde(default = "default_auth_rate_limit_per_min")]
+    pub auth_rate_limit_per_min: u32,
+    /// Burst cap for the auth limiter, per (client IP, account).
+    #[serde(default = "default_auth_rate_limit_burst")]
+    pub auth_rate_limit_burst: u32,
+}
+
+impl AppSettings {
+    /// Replenish interval, in milliseconds, for one `/api` token.
+    ///
+    /// `tower_governor`'s builder takes the interval that replenishes ONE
+    /// cell (`per_second(n)` is `Duration::from_secs(n)`), **not** a rate —
+    /// so passing a req/s number straight into `per_second` silently makes
+    /// the limit *n* times stricter. Prod hit exactly that on 2026-07-28.
+    /// Convert here instead, and clamp: the builder rejects a zero period.
+    pub fn rate_limit_period_ms(&self) -> u64 {
+        (1000 / self.rate_limit_per_sec.max(1)).max(1)
+    }
+
+    /// Replenish interval, in milliseconds, for one auth-endpoint token.
+    pub fn auth_rate_limit_period_ms(&self) -> u64 {
+        (60_000 / u64::from(self.auth_rate_limit_per_min.max(1))).max(1)
+    }
 }
 
 fn default_rate_limit_per_sec() -> u64 {
@@ -72,6 +108,15 @@ fn default_rate_limit_per_sec() -> u64 {
 }
 fn default_rate_limit_burst() -> u32 {
     60
+}
+fn default_rate_limit_trusted_hops() -> usize {
+    1
+}
+fn default_auth_rate_limit_per_min() -> u32 {
+    10
+}
+fn default_auth_rate_limit_burst() -> u32 {
+    20
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -224,6 +269,9 @@ impl Settings {
             .set_default("app.frontend_url", "http://localhost:5173")?
             .set_default("app.rate_limit_per_sec", 1)?
             .set_default("app.rate_limit_burst", 60)?
+            .set_default("app.rate_limit_trusted_hops", 1)?
+            .set_default("app.auth_rate_limit_per_min", 10)?
+            .set_default("app.auth_rate_limit_burst", 20)?
             .set_default("database.url", "mongodb://localhost:27019")?
             .set_default("database.name", "roomler-ai")?
             .set_default("jwt.secret", "change-me-in-production")?
@@ -292,6 +340,52 @@ impl Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self::load().expect("Failed to load default settings")
+    }
+}
+
+#[cfg(test)]
+mod rate_limit_tests {
+    use super::AppSettings;
+
+    fn app(per_sec: u64, auth_per_min: u32) -> AppSettings {
+        AppSettings {
+            host: "0.0.0.0".into(),
+            port: 3000,
+            static_dir: None,
+            cors_origins: vec![],
+            frontend_url: "http://localhost".into(),
+            rate_limit_per_sec: per_sec,
+            rate_limit_burst: 60,
+            rate_limit_trusted_hops: 1,
+            auth_rate_limit_per_min: auth_per_min,
+            auth_rate_limit_burst: 20,
+        }
+    }
+
+    /// The whole point of the helper: a req/s number must become a
+    /// *shorter* interval, never a longer one. Passing 10 straight into
+    /// `per_second` took prod from 1 req/s down to 0.1 req/s on 2026-07-28.
+    #[test]
+    fn higher_rate_means_shorter_period() {
+        assert_eq!(app(1, 10).rate_limit_period_ms(), 1000);
+        assert_eq!(app(10, 10).rate_limit_period_ms(), 100);
+        assert_eq!(app(100, 10).rate_limit_period_ms(), 10);
+        assert!(app(50, 10).rate_limit_period_ms() < app(5, 10).rate_limit_period_ms());
+    }
+
+    /// The builder rejects a zero period, so both ends must clamp.
+    #[test]
+    fn period_never_zero() {
+        assert_eq!(app(0, 0).rate_limit_period_ms(), 1000);
+        assert_eq!(app(5000, 0).rate_limit_period_ms(), 1);
+        assert_eq!(app(1, 0).auth_rate_limit_period_ms(), 60_000);
+        assert_eq!(app(1, 120_000).auth_rate_limit_period_ms(), 1);
+    }
+
+    #[test]
+    fn auth_period_matches_per_minute() {
+        assert_eq!(app(1, 10).auth_rate_limit_period_ms(), 6_000);
+        assert_eq!(app(1, 60).auth_rate_limit_period_ms(), 1_000);
     }
 }
 
