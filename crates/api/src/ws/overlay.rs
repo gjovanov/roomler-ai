@@ -27,16 +27,18 @@
 //! Phase 4 swaps in `policy::evaluate_overlay`.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use bson::{DateTime, oid::ObjectId};
 use roomler_ai_remote_control::{
-    models::{AgentStatus, NodeRef, OverlayNode},
+    models::{AgentStatus, NodeRef, OverlayNode, overlay_ip},
     signaling::{ClientMsg, IceServer, NetmapPeer, OverlayNetworkInfo, ServerMsg},
     turn_creds,
 };
+use roomler_ai_services::dao::base::DaoError;
 use tokio::net::lookup_host;
 use tracing::{debug, warn};
 
@@ -156,10 +158,13 @@ async fn handle_overlay_join(
         return;
     };
 
-    // Rehydrate-on-rejoin (keeps the leased IP) or allocate a fresh one.
+    // Rehydrate-on-rejoin (keeps the leased IP) or allocate a fresh one. The
+    // lookup is LIVE-scoped: a machine that was removed from the fleet had its
+    // node tombstoned and its host number recycled, so it must come back as a
+    // brand-new node with a fresh lease rather than reviving the tombstone.
     let self_node = match state
         .overlay_nodes
-        .find_by_tenant_and_machine(tenant_id, &machine_id)
+        .find_live_by_tenant_and_machine(tenant_id, &machine_id)
         .await
     {
         Ok(Some(existing)) => {
@@ -198,42 +203,63 @@ async fn handle_overlay_join(
         Ok(None) => {
             // Fresh node — a per-network-unique name from the base label.
             let name = unique_node_name(state, tenant_id, network_id, &base_name, None).await;
-            let host = match state.overlay_networks.allocate_host(network_id).await {
-                Ok(h) => h,
-                Err(e) => {
-                    warn!(%tenant_id, %e, "overlay.join: IPAM allocate failed");
+            // Bounded retry: a `DuplicateKey` here means the address we were
+            // handed is somehow already held by a live row (a poisoned free
+            // pool). Before the retry this logged and returned, silently
+            // locking the device out of the overlay for the daemon's lifetime;
+            // now the bad entry is already consumed off the pool and the next
+            // allocate gets a clean one.
+            const CREATE_ATTEMPTS: usize = 3;
+            let mut created = None;
+            for attempt in 1..=CREATE_ATTEMPTS {
+                let host = match state.overlay_networks.allocate_host(network_id).await {
+                    Ok(h) => h,
+                    Err(e) => {
+                        warn!(%tenant_id, %e, "overlay.join: IPAM allocate failed");
+                        return;
+                    }
+                };
+                let Some(ip) = overlay_ip(&network.cidr, host) else {
+                    warn!(%tenant_id, cidr = %network.cidr, host, "overlay.join: bad CIDR/host");
                     return;
+                };
+                match state
+                    .overlay_nodes
+                    .create(
+                        tenant_id,
+                        node_ref.clone(),
+                        network_id,
+                        machine_id.clone(),
+                        name.clone(),
+                        ip.clone(),
+                        wg_public_key.clone(),
+                        key_epoch,
+                        endpoints.clone(),
+                        supports_quic,
+                        supports_relay_single,
+                        supports_derp,
+                        supports_forced_derp,
+                        advertised_routes.clone(),
+                    )
+                    .await
+                {
+                    Ok(n) => {
+                        created = Some(n);
+                        break;
+                    }
+                    Err(DaoError::DuplicateKey(e)) if attempt < CREATE_ATTEMPTS => {
+                        warn!(%tenant_id, overlay_ip = %ip, attempt, %e,
+                            "overlay.join: allocated address is already taken; re-allocating");
+                    }
+                    Err(e) => {
+                        warn!(%tenant_id, %e, "overlay.join: node create failed");
+                        return;
+                    }
                 }
-            };
-            let Some(overlay_ip) = overlay_ip(&network.cidr, host) else {
-                warn!(%tenant_id, cidr = %network.cidr, host, "overlay.join: bad CIDR/host");
-                return;
-            };
-            match state
-                .overlay_nodes
-                .create(
-                    tenant_id,
-                    node_ref,
-                    network_id,
-                    machine_id,
-                    name,
-                    overlay_ip,
-                    wg_public_key,
-                    key_epoch,
-                    endpoints,
-                    supports_quic,
-                    supports_relay_single,
-                    supports_derp,
-                    supports_forced_derp,
-                    advertised_routes,
-                )
-                .await
-            {
-                Ok(n) => n,
-                Err(e) => {
-                    warn!(%tenant_id, %e, "overlay.join: node create failed");
-                    return;
-                }
+            }
+            match created {
+                Some(n) => n,
+                None => return,
             }
         }
         Err(e) => {
@@ -677,6 +703,158 @@ pub(crate) async fn refan_node(state: &AppState, node: &OverlayNode) {
     fan_delta_to_peers(state, node, next_epoch(), vec![upsert], vec![]).await;
 }
 
+/// What a successful [`release_overlay_node`] freed — for the route responses
+/// and the operator-facing log line.
+pub(crate) struct ReleasedNode {
+    pub node_id: ObjectId,
+    pub name: String,
+    pub overlay_ip: String,
+    /// `false` when the host number could NOT be returned to the pool (CIDR
+    /// drift, or the pool is at its cap). The release still succeeded — the
+    /// address just leaks out of the `/10` instead of being recycled.
+    pub host_recycled: bool,
+}
+
+/// Release ONE overlay node: evict it from the mesh and return its host number
+/// to the tenant's free pool. The single writer behind every removal path
+/// (agent DELETE, admin evict, tunnel-client DELETE).
+///
+/// Idempotent — `None` means the node was already released and the caller must
+/// do nothing further.
+///
+/// THE ORDER IS LOAD-BEARING:
+///
+/// 1. Read the peer list FIRST, while the node is still live. Afterwards it is
+///    gone from `list_active_in_network`.
+///
+/// 2. CAS-tombstone via [`OverlayNodeDao::release`]. Winning that CAS is the
+///    release TOKEN: only the winner proceeds, so two concurrent removal paths
+///    can never both pool the same host number.
+///
+/// 3. Return the host to the pool ONLY AFTER the tombstone commits. NEVER
+///    before — a crash between "pooled" and "tombstoned" would hand the address
+///    to a second joiner while the first row still holds it, and the unique
+///    `(tenant, network, overlay_ip)` index would then lock that joiner out of
+///    the overlay for good. A crash in this order merely LEAKS one host number
+///    out of a 4.2 M-address `/10`.
+///
+/// 4. Fan `removes` to the pinned peers, and to the released node itself so a
+///    prune-aware client tears its carriers down instead of squatting an
+///    address that is now recyclable.
+pub(crate) async fn release_overlay_node(
+    state: &AppState,
+    node: &OverlayNode,
+    reason: &str,
+) -> Option<ReleasedNode> {
+    let node_id = node.id?;
+
+    // 1 — peers, read while the node is still live.
+    let peers = state
+        .overlay_nodes
+        .list_active_in_network(node.tenant_id, node.network_id)
+        .await
+        .unwrap_or_default();
+
+    // 2 — CAS. Losing it means someone else already released this node: do NOT
+    //     re-fan and do NOT re-pool.
+    let before = match state.overlay_nodes.release(node_id).await {
+        Ok(Some(b)) => b,
+        Ok(None) => {
+            debug!(%node_id, "overlay release: already released; no-op");
+            return None;
+        }
+        Err(e) => {
+            warn!(%node_id, %e, "overlay release: tombstone failed");
+            return None;
+        }
+    };
+
+    // 3 — pool the host. Best-effort: a failure leaks, never conflicts.
+    let host = state
+        .overlay_networks
+        .base
+        .find_by_id(before.network_id)
+        .await
+        .ok()
+        .and_then(|net| net.host_of_ip(&before.overlay_ip));
+    let host_recycled = match host {
+        Some(h) => state
+            .overlay_networks
+            .release_host(before.network_id, h)
+            .await
+            .unwrap_or(false),
+        None => {
+            warn!(%node_id, ip = %before.overlay_ip,
+                "overlay release: address is not derivable from the network CIDR; not recycling");
+            false
+        }
+    };
+
+    // 4 — tell the peers, then the node itself.
+    let epoch = next_epoch();
+    fan_delta_to(state, &peers, Some(node_id), epoch, vec![], vec![node_id]).await;
+    send_to_node(
+        state,
+        &before,
+        ServerMsg::OverlayNetmapDelta {
+            epoch,
+            upserts: vec![],
+            removes: vec![node_id],
+        },
+    )
+    .await;
+
+    // Drop any DERP registration this node holds. Already inert (it is keyed by
+    // pubkey and no peer carries this node's key any more, and `handle_derp_socket`
+    // resolves through the live-only `current_node`), but tidy.
+    if let Ok(pk) = BASE64.decode(&before.wg_public_key)
+        && let Ok(pk) = <[u8; 32]>::try_from(pk.as_slice())
+    {
+        state.derp_registry.remove(&(before.network_id, pk));
+    }
+
+    tracing::info!(
+        tenant_id = %before.tenant_id, %node_id, name = %before.name,
+        overlay_ip = %before.overlay_ip, host_recycled, reason,
+        "overlay node released"
+    );
+
+    Some(ReleasedNode {
+        node_id,
+        name: before.name,
+        overlay_ip: before.overlay_ip,
+        host_recycled,
+    })
+}
+
+/// Release the live overlay node backing `expect` on `machine_id`, if any.
+///
+/// Resolves via the indexed `(tenant_id, machine_id)` lookup and THEN verifies
+/// `node_ref`: an agent and a tunnel-client on the same box share a
+/// `machine_id`, and the unique index means only ONE of them can own the
+/// overlay node — so deleting the agent must not release a node the
+/// still-enrolled tunnel-client owns.
+pub(crate) async fn release_overlay_node_for(
+    state: &AppState,
+    tenant_id: ObjectId,
+    machine_id: &str,
+    expect: &NodeRef,
+    reason: &str,
+) -> Option<ReleasedNode> {
+    let node = state
+        .overlay_nodes
+        .find_live_by_tenant_and_machine(tenant_id, machine_id)
+        .await
+        .ok()
+        .flatten()?;
+    if &node.node_ref != expect {
+        debug!(%tenant_id, machine_id,
+            "overlay release: the node on this machine belongs to another role; skipping");
+        return None;
+    }
+    release_overlay_node(state, &node, reason).await
+}
+
 /// Fan a delta to every active peer of `self_node` in its network.
 async fn fan_delta_to_peers(
     state: &AppState,
@@ -696,7 +874,24 @@ async fn fan_delta_to_peers(
             return;
         }
     };
-    for peer in peers.iter().filter(|n| n.id != self_node.id) {
+    fan_delta_to(state, &peers, self_node.id, epoch, upserts, removes).await;
+}
+
+/// Fan a delta to an EXPLICIT peer list, skipping `exclude`.
+///
+/// Split out of [`fan_delta_to_peers`] for the release path, which must read
+/// its peers BEFORE the node is tombstoned — afterwards the released node is
+/// gone from `list_active_in_network`. Pinning the list makes that ordering
+/// visible in the code instead of implied, and saves a round-trip.
+async fn fan_delta_to(
+    state: &AppState,
+    peers: &[OverlayNode],
+    exclude: Option<ObjectId>,
+    epoch: u64,
+    upserts: Vec<NetmapPeer>,
+    removes: Vec<ObjectId>,
+) {
+    for peer in peers.iter().filter(|n| n.id != exclude) {
         send_to_node(
             state,
             peer,
@@ -768,11 +963,16 @@ async fn resolve_tenant_and_machine(
 }
 
 /// Fetch the joined `OverlayNode` row for an identity (post-join ops).
+///
+/// Live-only, so every post-join handler (endpoints, srflx, leave,
+/// relay_request, DERP registration) silently no-ops for a RELEASED node — which
+/// is correct: the release already fanned its `removes`. The `deleted_at` filter
+/// below is redundant now that the lookup is scoped; kept as belt and braces.
 pub(crate) async fn current_node(state: &AppState, ident: NodeIdentity) -> Option<OverlayNode> {
     let (tenant_id, machine_id, _name) = resolve_tenant_and_machine(state, ident).await?;
     state
         .overlay_nodes
-        .find_by_tenant_and_machine(tenant_id, &machine_id)
+        .find_live_by_tenant_and_machine(tenant_id, &machine_id)
         .await
         .ok()
         .flatten()
@@ -985,16 +1185,6 @@ fn union_endpoints(lan: &[String], rest: &[String]) -> Vec<String> {
         }
     }
     out
-}
-
-/// `base_cidr` + host number → dotted overlay IP. e.g.
-/// `("100.64.0.0/10", 7) → "100.64.0.7"`. No `ipnet` needed — the host
-/// number is added to the network base address as a `u32`.
-fn overlay_ip(cidr: &str, host: u32) -> Option<String> {
-    let (base, _prefix) = cidr.split_once('/')?;
-    let base: Ipv4Addr = base.parse().ok()?;
-    let addr = Ipv4Addr::from(u32::from(base).checked_add(host)?);
-    Some(addr.to_string())
 }
 
 /// Symmetric per-pair key so both ends mint identical coturn creds.
@@ -1210,19 +1400,10 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 mod tests {
     use super::*;
 
-    #[test]
-    fn overlay_ip_adds_host_to_cgnat_base() {
-        assert_eq!(
-            overlay_ip("100.64.0.0/10", 7).as_deref(),
-            Some("100.64.0.7")
-        );
-        assert_eq!(
-            overlay_ip("100.64.0.0/10", 256).as_deref(),
-            Some("100.64.1.0")
-        );
-        assert_eq!(overlay_ip("10.0.0.0/8", 1).as_deref(), Some("10.0.0.1"));
-        assert!(overlay_ip("not-a-cidr", 1).is_none());
-    }
+    // `overlay_ip` and its inverse `overlay_host` now live in
+    // `roomler_ai_remote_control::models` (the free pool needs the inverse, and
+    // the model crate is shared with `services` and the agent). Their tests —
+    // including the round-trip that pins the two together — moved with them.
 
     #[test]
     fn pair_key_is_symmetric() {

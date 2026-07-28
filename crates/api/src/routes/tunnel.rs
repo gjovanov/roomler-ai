@@ -15,13 +15,17 @@ use axum::{
     http::StatusCode,
 };
 use bson::oid::ObjectId;
+use roomler_ai_db::models::role::permissions;
 use roomler_ai_remote_control::models::{
-    AgentStatus, DestinationRule, OsKind, PolicySubject, PolicyTarget,
+    AgentStatus, DestinationRule, NodeRef, OsKind, PolicySubject, PolicyTarget,
 };
 use roomler_ai_services::dao::base::PaginationParams;
 use serde::{Deserialize, Serialize};
 
-use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
+use crate::{
+    error::ApiError, extractors::auth::AuthUser, routes::remote_control::require_permission,
+    state::AppState,
+};
 
 /// 10 minutes — same TTL as the agent enrollment token (see plan
 /// §"Security model"; matches `ENROLLMENT_TTL_SECS` in
@@ -282,6 +286,59 @@ pub async fn list_tunnel_clients(
         "page": page.page,
         "per_page": page.per_page,
         "total_pages": page.total_pages,
+    })))
+}
+
+/// DELETE /api/tenant/{tenant_id}/tunnel-client/{client_id} — remove a tunnel
+/// client from the fleet.
+///
+/// The mirror of `remote_control::delete_agent`: evicts the client's overlay
+/// node (peers get a `removes` delta, its address returns to the tenant pool)
+/// and soft-deletes the client row. Revocation of a LIVE connection rides the
+/// existing 60 s `spawn_revocation_check` sweep in `ws::tunnel`, which closes
+/// the socket once it sees `deleted_at`.
+///
+/// Gated on `MANAGE_AGENTS` — the device-management bit; there is no separate
+/// tunnel-client permission and minting one would mean a role migration.
+pub async fn delete_tunnel_client(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path((tenant_id, client_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let tid = ObjectId::parse_str(&tenant_id)
+        .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
+    let cid = ObjectId::parse_str(&client_id)
+        .map_err(|_| ApiError::BadRequest("Invalid client_id".to_string()))?;
+
+    require_permission(
+        &state,
+        tid,
+        auth.user_id,
+        permissions::MANAGE_AGENTS,
+        "MANAGE_AGENTS",
+    )
+    .await?;
+
+    // Read first — tenant-scopes the target and 404s a bogus id.
+    let client = state.tunnel_clients.find_in_tenant(tid, cid).await?;
+
+    let released = crate::ws::overlay::release_overlay_node_for(
+        &state,
+        tid,
+        &client.machine_id,
+        &NodeRef::TunnelClient {
+            tunnel_client_id: cid,
+        },
+        "tunnel_client_delete",
+    )
+    .await;
+
+    state.tunnel_clients.soft_delete(tid, cid).await?;
+
+    Ok(Json(serde_json::json!({
+        "deleted": true,
+        "overlay_released": released.is_some(),
+        "overlay_ip": released.as_ref().map(|r| r.overlay_ip.clone()),
     })))
 }
 
