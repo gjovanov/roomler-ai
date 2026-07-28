@@ -100,6 +100,31 @@ jobs:
           Copy-Item $dll target\release\wintun.dll -Force
           Write-Host "Staged wintun.dll ($([math]::Round((Get-Item target\release\wintun.dll).Length/1KB,0)) KB) for the MSI bundle"
 
+      - name: Stage VC++ runtime DLLs for the MSI bundle
+        shell: pwsh
+        run: |
+          # wix/main.wxs UNCONDITIONALLY bundles a `VcRedistCrt` component
+          # (app-local Microsoft.VC14x.CRT so fresh machines without the
+          # VC++ redistributable can run roomlerd.exe -- field report
+          # 2026-07-28) from target\release\*.dll, so the WiX `light`
+          # step needs the DLLs present or it fails with LGHT0103.
+          # Mirrors release-agent.yml's staging step.
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) { Write-Host "::error::vswhere.exe not found on the runner"; exit 1 }
+          $vsRoot = & $vswhere -latest -products * -property installationPath
+          $crtDir = Get-ChildItem -Directory "$vsRoot\VC\Redist\MSVC\*\x64\Microsoft.VC14*.CRT" -ErrorAction SilentlyContinue |
+                    Sort-Object FullName | Select-Object -Last 1
+          if (-not $crtDir) { Write-Host "::error::no Microsoft.VC14x.CRT redist folder under $vsRoot"; exit 1 }
+          $expected = @('concrt140.dll', 'msvcp140.dll', 'msvcp140_1.dll', 'msvcp140_2.dll',
+                        'msvcp140_atomic_wait.dll', 'msvcp140_codecvt_ids.dll', 'vccorlib140.dll',
+                        'vcruntime140.dll', 'vcruntime140_1.dll')
+          foreach ($n in $expected) {
+            $src = Join-Path $crtDir.FullName $n
+            if (-not (Test-Path $src)) { Write-Host "::error::$n missing from $($crtDir.FullName) -- VcRedistCrt harvest would fail (LGHT0103)"; exit 1 }
+            Copy-Item $src target\release\ -Force
+          }
+          Write-Host "Staged $($expected.Count) VC++ runtime DLLs from $($crtDir.FullName)"
+
       - name: Build per-User MSI
         shell: pwsh
         env:
@@ -219,7 +244,10 @@ jobs:
           # P3d Slice C: the roomler-agent.exe alias is retired — the MSI
           # ships only the canonical names now.
           $installDir = Join-Path $env:LOCALAPPDATA 'Programs\Roomler'
-          $mustExist = @('roomlerd.exe', 'roomler.exe', 'wintun.dll')
+          # msvcp140/vcruntime140* lock the app-local VcRedistCrt component
+          # (fresh machines without the VC++ redist -- 2026-07-28 fix).
+          $mustExist = @('roomlerd.exe', 'roomler.exe', 'wintun.dll',
+                         'msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')
           $missing = @()
           foreach ($f in $mustExist) {
             $p = Join-Path $installDir $f
@@ -296,7 +324,7 @@ jobs:
           # must have been removed (Environment Part='last' +
           # implicit Permanent='no').
           $installDir = Join-Path $env:LOCALAPPDATA 'Programs\Roomler'
-          foreach ($f in @('roomlerd.exe', 'roomler-agent.exe', 'roomler.exe', 'wintun.dll')) {
+          foreach ($f in @('roomlerd.exe', 'roomler-agent.exe', 'roomler.exe', 'wintun.dll', 'msvcp140.dll', 'vcruntime140_1.dll')) {
             $p = Join-Path $installDir $f
             if (Test-Path $p) {
               throw "$f still at $p after uninstall — MSI uninstaller is broken"

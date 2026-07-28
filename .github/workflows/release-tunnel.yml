@@ -241,6 +241,14 @@ jobs:
           save-if: ${{ github.ref_type != 'tag' }}
       - name: Build roomler-tunnel (release)
         shell: pwsh
+        # Static CRT: the standalone zip's roomler.exe runs from any
+        # dir on arbitrary fresh machines -- it must not assume the
+        # MSVC runtime (vcruntime140.dll) exists there (field report
+        # 2026-07-28). Pure-Rust graph, so +crt-static is safe. The
+        # MSI-carried copy stays dynamic (release-agent.yml) -- it
+        # sits beside the MSI's app-local CRT DLLs.
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
         run: cargo build -p roomler-tunnel --release
       - name: Pack zip
         id: zip

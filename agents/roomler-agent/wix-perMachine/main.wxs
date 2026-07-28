@@ -190,6 +190,34 @@
                             Source='target\release\wintun.dll' />
                     </Component>
 
+                    <!-- App-local Microsoft VC++ 2015-2022 x64 runtime (the
+                         full Microsoft.VC14x.CRT folder). The release
+                         roomlerd.exe links the CRT dynamically (its C++
+                         encoder objects; the vcpkg static-md policy keeps
+                         /MD), so a fresh Windows box without any VC++
+                         redistributable popped "vcruntime140_1.dll was not
+                         found" on the first daemon run (field report
+                         2026-07-28, install.ps1 daemon-machine enroll). The
+                         EXE dir is first in the DLL search path (service
+                         mode included), so shipping the DLLs here makes the
+                         install self-contained for roomlerd.exe, roomler.exe
+                         AND the roomler-desktop companion placed beside
+                         them. Staged into target\release by the workflow's
+                         VC++ runtime step. One component for the whole set;
+                         Guid='*' keyed off msvcp140.dll like the WintunDll
+                         pattern. -->
+                    <Component Id='VcRedistCrt' Guid='*' Win64='yes'>
+                        <File Id='crt_msvcp140' Name='msvcp140.dll' DiskId='1' KeyPath='yes' Source='target\release\msvcp140.dll' />
+                        <File Id='crt_concrt140' Name='concrt140.dll' DiskId='1' Source='target\release\concrt140.dll' />
+                        <File Id='crt_msvcp140_1' Name='msvcp140_1.dll' DiskId='1' Source='target\release\msvcp140_1.dll' />
+                        <File Id='crt_msvcp140_2' Name='msvcp140_2.dll' DiskId='1' Source='target\release\msvcp140_2.dll' />
+                        <File Id='crt_msvcp140_atomic_wait' Name='msvcp140_atomic_wait.dll' DiskId='1' Source='target\release\msvcp140_atomic_wait.dll' />
+                        <File Id='crt_msvcp140_codecvt_ids' Name='msvcp140_codecvt_ids.dll' DiskId='1' Source='target\release\msvcp140_codecvt_ids.dll' />
+                        <File Id='crt_vccorlib140' Name='vccorlib140.dll' DiskId='1' Source='target\release\vccorlib140.dll' />
+                        <File Id='crt_vcruntime140' Name='vcruntime140.dll' DiskId='1' Source='target\release\vcruntime140.dll' />
+                        <File Id='crt_vcruntime140_1' Name='vcruntime140_1.dll' DiskId='1' Source='target\release\vcruntime140_1.dll' />
+                    </Component>
+
                     <!--
                       M3 A1: enable SendSAS() from LocalSystem services so the
                       SYSTEM-context worker can deliver Ctrl+Alt+Del to the
@@ -254,6 +282,7 @@
             <ComponentRef Id='LicenseTxt' />
             <ComponentRef Id='ReadmeTxt' />
             <ComponentRef Id='WintunDll' />
+            <ComponentRef Id='VcRedistCrt' />
             <ComponentRef Id='SoftwareSASRegistry' />
         </Feature>
 
