@@ -111,6 +111,40 @@ pub struct AgentConfig {
     /// OFF. Built-in default: uploads on.
     #[serde(default)]
     pub logs_upload_disabled: Option<bool>,
+    /// Per-codec maxrate ceiling factor overrides, percent (50–400).
+    /// (`ROOMLER_NODE_RATE_FACTOR_H264` etc.) Built-ins: H264 150,
+    /// HEVC 125, VP9 100, AV1 100.
+    #[serde(default)]
+    pub rate_factor_h264: Option<u32>,
+    #[serde(default)]
+    pub rate_factor_hevc: Option<u32>,
+    #[serde(default)]
+    pub rate_factor_vp9: Option<u32>,
+    #[serde(default)]
+    pub rate_factor_av1: Option<u32>,
+    /// Media-ICE follow-renomination policy
+    /// (`ROOMLER_ICE_FOLLOW_RENOMINATION`, raw env in the vendored
+    /// webrtc-ice — bridged via a set_var-if-unset shim in `run_cmd`).
+    /// `None`/"auto" = built-in upward-only+stale policy (rc.268);
+    /// `Some(true)`/"always" = legacy follow-everything (rc.260 —
+    /// thrash-prone, diagnostics only); `Some(false)`/"never" = pin to
+    /// first nomination (rc.262 semantics).
+    #[serde(default)]
+    pub ice_follow_renomination: Option<bool>,
+    /// Warm-standby keepalive pings on validated-but-unselected media
+    /// ICE pairs (`ROOMLER_ICE_WARM_STANDBY`, vendored-crate raw env —
+    /// same shim). Built-in default: on.
+    #[serde(default)]
+    pub ice_warm_standby: Option<bool>,
+    /// Deprioritize overlay-TUN host candidates in media ICE
+    /// (`ROOMLER_ICE_OVERLAY_HOST_DEPRIORITIZE`, vendored-crate raw
+    /// env — same shim). Built-in default: on.
+    #[serde(default)]
+    pub ice_overlay_host_deprioritize: Option<bool>,
+    /// Overlay-carrier-aware constrained detection in the media pumps
+    /// (`ROOMLER_AGENT_OVERLAY_TIER_DETECT`). Built-in default: on.
+    #[serde(default)]
+    pub overlay_tier_detect: Option<bool>,
 
     /// Most recent version that ran for at least
     /// `CLEAN_RUN_THRESHOLD` seconds before exiting cleanly (or
@@ -659,6 +693,14 @@ mod tests {
             dns_aaaa: None,
             auto_update: None,
             logs_upload_disabled: None,
+            rate_factor_h264: None,
+            rate_factor_hevc: None,
+            rate_factor_vp9: None,
+            rate_factor_av1: None,
+            ice_follow_renomination: None,
+            ice_warm_standby: None,
+            ice_overlay_host_deprioritize: None,
+            overlay_tier_detect: None,
             last_known_good_version: None,
             crash_count: 0,
             last_crash_unix: 0,
