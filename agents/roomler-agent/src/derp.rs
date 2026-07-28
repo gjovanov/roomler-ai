@@ -50,13 +50,19 @@ fn derp_url_from_ws(ws_url: &str) -> String {
 pub fn spawn(
     ws_url: &str,
     agent_token: &str,
+    tenant_id: &str,
     mux: &Arc<DerpMux>,
     outbound_rx: mpsc::Receiver<Vec<u8>>,
 ) {
+    // S6 — `tid` = tenant-affinity key for the front LB. DERP relays are
+    // pod-local, so both mesh peers must land on the SAME pod; hashing
+    // every /derp socket by tenant guarantees it. Pre-S6 servers ignore
+    // the param.
     let full_url = format!(
-        "{}?token={}&role=agent",
+        "{}?token={}&role=agent&tid={}",
         derp_url_from_ws(ws_url),
-        crate::signaling::urlencode(agent_token)
+        crate::signaling::urlencode(agent_token),
+        crate::signaling::urlencode(tenant_id)
     );
     let reg_frame = mux.registration_frame();
     let weak = Arc::downgrade(mux);
