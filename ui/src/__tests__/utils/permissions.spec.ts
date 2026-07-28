@@ -6,6 +6,7 @@ import {
   DEFAULT_MEMBER,
   PERMISSION_FLAGS,
   PERMISSION_GROUPS,
+  canSeeFleetNav,
   describePermissions,
   hasPermission,
 } from '@/utils/permissions'
@@ -109,5 +110,33 @@ describe('permission catalog', () => {
       'Moderation',
       'Remote control',
     ])
+  })
+})
+
+describe('canSeeFleetNav (Devices + Network nav gating)', () => {
+  const MANAGE_AGENTS = 1 << 24
+  const REMOTE_CONTROL = 1 << 25
+
+  it('fails OPEN while the membership has not loaded (null mask)', () => {
+    expect(canSeeFleetNav(null, false)).toBe(true)
+  })
+
+  it('shows for either fleet permission alone', () => {
+    expect(canSeeFleetNav(MANAGE_AGENTS, false)).toBe(true)
+    expect(canSeeFleetNav(REMOTE_CONTROL, false)).toBe(true)
+  })
+
+  it('shows for ADMINISTRATOR and for the tenant owner regardless of mask', () => {
+    expect(canSeeFleetNav(ADMINISTRATOR, false)).toBe(true)
+    expect(canSeeFleetNav(0, true)).toBe(true)
+  })
+
+  it('hides for a plain member (default member mask has no fleet bits)', () => {
+    expect(canSeeFleetNav(DEFAULT_MEMBER, false)).toBe(false)
+    expect(canSeeFleetNav(0, false)).toBe(false)
+  })
+
+  it('DEFAULT_ADMIN sees fleet nav (sanity vs the role preset)', () => {
+    expect(canSeeFleetNav(DEFAULT_ADMIN, false)).toBe(true)
   })
 })

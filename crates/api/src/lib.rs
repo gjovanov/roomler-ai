@@ -71,10 +71,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/{tenant_id}", get(routes::tenant::get));
 
     // Member routes (under tenant)
-    let member_routes = Router::new().route(
-        "/",
-        get(routes::user::list_members).post(routes::invite::add_member),
-    );
+    let member_routes = Router::new()
+        .route(
+            "/",
+            get(routes::user::list_members).post(routes::invite::add_member),
+        )
+        .route("/me", get(routes::user::my_membership));
 
     // Room routes (under tenant) — replaces channel + conference
     let room_routes = Router::new()

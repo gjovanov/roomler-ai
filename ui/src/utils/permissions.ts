@@ -140,3 +140,21 @@ export function hasPermission(mask: number, flag: number): boolean {
 export function describePermissions(mask: number): string[] {
   return PERMISSION_FLAGS.filter((f) => (mask & f.bit) !== 0).map((f) => f.label)
 }
+
+/**
+ * Nav-gating predicate for the fleet surfaces (Devices page + Network
+ * group). Deliberately FAIL-OPEN: while the membership hasn't loaded yet
+ * (`mask === null` — first paint, endpoint hiccup, older server without
+ * /member/me) the nav stays visible; the server still enforces every
+ * action, so the worst case of failing open is a visible link to a page
+ * whose actions 403. Failing closed would hide navigation behind a
+ * network round-trip on every load.
+ */
+export function canSeeFleetNav(mask: number | null, isOwner: boolean): boolean {
+  if (mask === null) return true
+  if (isOwner) return true
+  return (
+    hasPermission(mask, byKeys(['MANAGE_AGENTS'])) ||
+    hasPermission(mask, byKeys(['REMOTE_CONTROL']))
+  )
+}
