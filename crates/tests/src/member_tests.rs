@@ -216,3 +216,65 @@ async fn create_message_with_everyone_mention() {
     );
     assert_eq!(msg["content"].as_str().unwrap(), "Attention @everyone!");
 }
+
+/// Deferred-S4 — GET /api/tenant/{tid}/member/me powers client-side nav
+/// gating (Devices + Network groups). Locks: owner flag, mask presence,
+/// plain member lacking fleet bits, and non-member 403.
+#[tokio::test]
+async fn member_me_reports_permissions_owner_and_403s_outsiders() {
+    let app = TestApp::spawn().await;
+    let t = app.seed_tenant("permme").await;
+
+    const ADMINISTRATOR: u64 = 1 << 23;
+    const MANAGE_AGENTS: u64 = 1 << 24;
+    const REMOTE_CONTROL: u64 = 1 << 25;
+
+    // Tenant creator: owner + a mask that grants the fleet surfaces.
+    let resp = app
+        .auth_get(
+            &format!("/api/tenant/{}/member/me", t.tenant_id),
+            &t.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let json: Value = resp.json().await.unwrap();
+    assert_eq!(json["is_owner"].as_bool(), Some(true));
+    let admin_perms = json["permissions"].as_u64().unwrap();
+    assert!(
+        admin_perms & (ADMINISTRATOR | MANAGE_AGENTS | REMOTE_CONTROL) != 0,
+        "tenant creator must hold ADMINISTRATOR or fleet bits, got {admin_perms:#x}"
+    );
+
+    // Plain member: not owner, no fleet bits (nav hides Devices/Network).
+    let resp = app
+        .auth_get(
+            &format!("/api/tenant/{}/member/me", t.tenant_id),
+            &t.member.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let json: Value = resp.json().await.unwrap();
+    assert_eq!(json["is_owner"].as_bool(), Some(false));
+    let member_perms = json["permissions"].as_u64().unwrap();
+    assert_eq!(
+        member_perms & (ADMINISTRATOR | MANAGE_AGENTS | REMOTE_CONTROL),
+        0,
+        "plain member must not hold admin/fleet bits, got {member_perms:#x}"
+    );
+
+    // A user from another tenant is not a member here → 403.
+    let other = app.seed_tenant("permme2").await;
+    let resp = app
+        .auth_get(
+            &format!("/api/tenant/{}/member/me", t.tenant_id),
+            &other.member.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 403);
+}
