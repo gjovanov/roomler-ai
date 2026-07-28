@@ -171,6 +171,78 @@ describe('api client', () => {
       expect(mockRouter.push).toHaveBeenCalledWith({ name: 'login' })
     })
 
+    // Regression guard for the 2026-07-28 prod incident: `/api` was rate
+    // limited hard enough that ordinary use drew 429s, and a throttled
+    // session was being logged out and bounced to a login page that was
+    // itself throttled.
+    it('should NOT log out or redirect on 429', async () => {
+      localStorage.setItem('access_token', 'still-valid')
+      mockFetch.mockResolvedValueOnce(mockJsonResponse(429, {}, false))
+
+      await expect(api.get('/tenant/123/room')).rejects.toThrow()
+
+      expect(localStorage.getItem('access_token')).toBe('still-valid')
+      expect(mockRouter.push).not.toHaveBeenCalled()
+    })
+
+    it('should surface the server message on 429 when there is one', async () => {
+      mockFetch.mockResolvedValueOnce(
+        mockJsonResponse(429, { error: 'too_many_requests', message: 'Try again in 6s.' }, false),
+      )
+
+      await expect(api.post('/auth/login', {})).rejects.toThrow()
+
+      expect(mockShowError).toHaveBeenCalledWith('Try again in 6s.')
+    })
+
+    it('should fall back to Retry-After on a 429 with no message', async () => {
+      mockFetch.mockResolvedValueOnce({
+        ok: false,
+        status: 429,
+        headers: {
+          get: (name: string) =>
+            name === 'content-type' ? 'application/json' : name === 'retry-after' ? '12' : null,
+        },
+        json: () => Promise.resolve({}),
+        blob: () => Promise.resolve(new Blob()),
+      })
+
+      await expect(api.get('/test')).rejects.toThrow()
+
+      expect(mockShowError).toHaveBeenCalledWith('Too many requests. Try again in 12s.')
+    })
+
+    // A throttled refresh says nothing about session validity, so the
+    // session must survive it — otherwise being rate limited logs you out.
+    it('should keep the session when the token refresh is throttled', async () => {
+      localStorage.setItem('access_token', 'expired-token')
+      localStorage.setItem('refresh_token', 'refresh-token')
+      mockFetch
+        .mockResolvedValueOnce(mockJsonResponse(401, {}, false)) // original request
+        .mockResolvedValueOnce(mockJsonResponse(429, {}, false)) // refresh throttled
+
+      await expect(api.get('/tenant/123/room')).rejects.toThrow()
+
+      expect(localStorage.getItem('access_token')).toBe('expired-token')
+      expect(localStorage.getItem('refresh_token')).toBe('refresh-token')
+      expect(mockRouter.push).not.toHaveBeenCalled()
+    })
+
+    // ...but a genuine rejection still logs out, so the fix above doesn't
+    // strand a dead session.
+    it('should still log out when the token refresh is rejected', async () => {
+      localStorage.setItem('access_token', 'expired-token')
+      localStorage.setItem('refresh_token', 'refresh-token')
+      mockFetch
+        .mockResolvedValueOnce(mockJsonResponse(401, {}, false)) // original request
+        .mockResolvedValueOnce(mockJsonResponse(401, {}, false)) // refresh rejected
+
+      await expect(api.get('/tenant/123/room')).rejects.toThrow()
+
+      expect(localStorage.getItem('access_token')).toBeNull()
+      expect(mockRouter.push).toHaveBeenCalledWith({ name: 'login' })
+    })
+
     it('should NOT redirect on 401 for auth paths', async () => {
       mockFetch.mockResolvedValueOnce(mockJsonResponse(401, { error: 'Invalid credentials' }, false))
 
