@@ -17,6 +17,86 @@ use crate::control::*;
 use crate::priority::*;
 use crate::use_candidate::*;
 
+/// Roomler patch (follow-renomination v2, 2026-07-28): how long the currently
+/// selected pair may go without ANY inbound before a renomination onto an
+/// overlay-remote pair is accepted as a failover. Live pairs see STUN consent
+/// checks and media continuously, so 3 s of silence means the pair is dying.
+const FOLLOW_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Whether the controlled/controlling agent should switch its selected pair
+/// to a newly (re)nominated one.
+///
+/// rc.260 (follow everything) died in the field: Chrome nominates a
+/// half-blackholed mongrel pair early — its remote is the controller's
+/// overlay-TUN host candidate, whose reverse leg routes into the TUN with a
+/// physical source — and following it killed SCTP ~4 s into every session.
+/// rc.262 (never follow) survives but pins media to the first-nominated
+/// overlay pair even when a clean real-path srflx pair sits validated and
+/// idle (field 2026-07-28: video on an 89 ms churn relay while the 11 ms
+/// srflx pair carried nothing; TeamViewer on the same host was smooth).
+///
+/// v2 follows only when it cannot be the poison case:
+/// - the new pair's REMOTE parses to a real-path (non-overlay-range) IP —
+///   upgrading onto srflx/public pairs is always safe; or
+/// - the currently selected pair is STALE (no inbound for
+///   [`FOLLOW_STALE_AFTER`]) — any nominated pair beats riding a dead one.
+///
+/// Unparseable remotes (mDNS names) are conservatively treated as
+/// overlay-possible. Env overrides: `ROOMLER_ICE_FOLLOW_RENOMINATION=0`
+/// never follows (rc.262 semantics), `=1` always follows (rc.260 semantics).
+fn should_follow_renomination(
+    new_remote_addr: &str,
+    current: &CandidatePair,
+) -> bool {
+    let new_remote_is_real_path = new_remote_addr
+        .parse::<std::net::IpAddr>()
+        .map(|ip| !crate::agent::agent_gather::is_roomler_overlay_ip(&ip))
+        .unwrap_or(false);
+    let current_stale = std::time::SystemTime::now()
+        .duration_since(current.remote.last_received())
+        .map(|elapsed| elapsed > FOLLOW_STALE_AFTER)
+        .unwrap_or(false);
+    follow_renomination_policy(
+        std::env::var("ROOMLER_ICE_FOLLOW_RENOMINATION").ok().as_deref(),
+        new_remote_is_real_path,
+        current_stale,
+    )
+}
+
+/// Pure decision core of [`should_follow_renomination`] — unit-tested.
+fn follow_renomination_policy(
+    env: Option<&str>,
+    new_remote_is_real_path: bool,
+    current_stale: bool,
+) -> bool {
+    match env {
+        Some("0") => false,
+        Some("1") => true,
+        _ => new_remote_is_real_path || current_stale,
+    }
+}
+
+#[cfg(test)]
+mod follow_renomination_tests {
+    use super::follow_renomination_policy;
+
+    #[test]
+    fn v2_policy_matrix() {
+        // Default: real-path remotes always followed; overlay remotes only
+        // as a failover off a stale pair (poison-pair exclusion).
+        assert!(follow_renomination_policy(None, true, false));
+        assert!(follow_renomination_policy(None, true, true));
+        assert!(!follow_renomination_policy(None, false, false));
+        assert!(follow_renomination_policy(None, false, true));
+        // Env pins: 0 = never (rc.262), 1 = always (rc.260).
+        assert!(!follow_renomination_policy(Some("0"), true, true));
+        assert!(follow_renomination_policy(Some("1"), false, false));
+        // Garbage env falls back to the v2 rule.
+        assert!(follow_renomination_policy(Some("x"), true, false));
+        assert!(!follow_renomination_policy(Some("x"), false, false));
+    }
+}
+
 #[async_trait]
 trait ControllingSelector {
     async fn start(&self);
@@ -358,8 +438,15 @@ impl ControllingSelector for AgentInternal {
                 // source) — SCTP died ~4 s in, every session. Opt-in via
                 // ROOMLER_ICE_FOLLOW_RENOMINATION=1 until the follow policy
                 // validates pair liveness both ways.
-                let follow_renomination =
-                    std::env::var("ROOMLER_ICE_FOLLOW_RENOMINATION").as_deref() == Ok("1");
+                // v2 (2026-07-28): policy in should_follow_renomination() —
+                // real-path remotes always, overlay remotes only off a stale
+                // pair. Env: 0=never (rc.262), 1=always (rc.260).
+                let follow_renomination = {
+                    let selected = self.agent_conn.get_selected_pair();
+                    selected
+                        .as_ref()
+                        .is_some_and(|s| should_follow_renomination(&p.remote.address(), s))
+                };
                 let already_selected = {
                     let selected = self.agent_conn.get_selected_pair();
                     selected
@@ -576,8 +663,13 @@ impl ControlledSelector for AgentInternal {
                     // the TUN with a physical source) — SCTP died ~4 s in, every
                     // session. Opt-in via ROOMLER_ICE_FOLLOW_RENOMINATION=1 until
                     // the follow policy validates pair liveness both ways.
-                    let follow_renomination =
-                        std::env::var("ROOMLER_ICE_FOLLOW_RENOMINATION").as_deref() == Ok("1");
+                    // v2 (2026-07-28): see should_follow_renomination().
+                    let follow_renomination = {
+                        let selected = self.agent_conn.get_selected_pair();
+                        selected
+                            .as_ref()
+                            .is_some_and(|s| should_follow_renomination(&p.remote.address(), s))
+                    };
                     let already_selected = {
                         let selected = self.agent_conn.get_selected_pair();
                         selected.as_ref().is_some_and(|s| {
