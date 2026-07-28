@@ -82,7 +82,7 @@ class MockWebSocket {
 
 let mockWsInstance: MockWebSocket
 
-// Replace global WebSocket with our mock class.
+// Replace globalThis WebSocket with our mock class.
 // We use a subclass so `new WebSocket(url)` works with Reflect.construct.
 const OriginalMockWebSocket = MockWebSocket
 const WebSocketProxy = new Proxy(OriginalMockWebSocket, {

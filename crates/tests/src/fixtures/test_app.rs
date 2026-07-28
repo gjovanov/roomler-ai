@@ -249,6 +249,7 @@ fn test_settings() -> Settings {
             static_dir: None,
             cors_origins: vec![],
             frontend_url: "http://localhost:5173".to_string(),
+            environment: "development".to_string(),
         },
         database: roomler_ai_config::DatabaseSettings {
             url: "mongodb://localhost:27019".to_string(),
