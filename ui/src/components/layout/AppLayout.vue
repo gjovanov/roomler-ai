@@ -39,11 +39,12 @@
           exact
         />
         <v-list-item
+          v-if="showFleetNav"
           :to="`/tenant/${tenantId}/devices`"
           prepend-icon="mdi-monitor-multiple"
           :title="$t('nav.devices')"
         />
-        <v-list-group value="network">
+        <v-list-group v-if="showFleetNav" value="network">
           <template #activator="{ props: groupProps }">
             <v-list-item v-bind="groupProps" prepend-icon="mdi-lan" :title="$t('nav.network')" />
           </template>
@@ -252,6 +253,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { useTheme, useDisplay } from 'vuetify'
 import { useAuth } from '@/composables/useAuth'
 import { useTenantStore } from '@/stores/tenant'
+import { canSeeFleetNav } from '@/utils/permissions'
 import { useRoomStore } from '@/stores/rooms'
 import { useNotificationStore } from '@/stores/notification'
 import { useConferenceStore } from '@/stores/conference'
@@ -352,8 +354,21 @@ const tenantId = computed(() => tenantStore.current?.id || '')
 // front LB re-routes this session onto the tenant's pod.
 watch(
   () => tenantStore.current?.id ?? null,
-  (tid) => wsStore.setTenantAffinity(tid),
+  (tid) => {
+    wsStore.setTenantAffinity(tid)
+    // Deferred-S4 — the caller's own permission mask drives fleet-nav
+    // visibility. Fail-open: nav shows until the fetch lands (see
+    // canSeeFleetNav); the server still enforces every action.
+    if (tid) void tenantStore.fetchMyMembership(tid)
+  },
   { immediate: true },
+)
+
+// Gate the Devices page + Network group on fleet permissions
+// (MANAGE_AGENTS / REMOTE_CONTROL / ADMINISTRATOR / owner). Collab +
+// Admin groups stay visible for every member.
+const showFleetNav = computed(() =>
+  canSeeFleetNav(tenantStore.myPermissions, tenantStore.isOwner),
 )
 
 const settingsRoute = computed(() =>
