@@ -680,6 +680,36 @@ jobs:
           Copy-Item $dll target\release\wintun.dll -Force
           Write-Host "Staged wintun.dll ($([math]::Round((Get-Item target\release\wintun.dll).Length/1KB,0)) KB) for the MSI bundle"
 
+      - name: Stage VC++ runtime DLLs alongside agent binary (app-local CRT)
+        shell: pwsh
+        run: |
+          # Both wxs files bundle a `VcRedistCrt` component (the full
+          # Microsoft.VC14x.CRT x64 folder) so the install is
+          # self-contained on machines without any VC++ 2015-2022
+          # redistributable -- a fresh Windows box otherwise pops
+          # "vcruntime140_1.dll was not found" the moment install.ps1
+          # (or the operator) runs the freshly installed roomlerd.exe,
+          # which links the CRT dynamically via its C++ encoder objects
+          # (field report 2026-07-28). The DLLs come from the runner's
+          # own VS installation; fail loudly if any expected name is
+          # absent (the WiX harvest would die with LGHT0103 later
+          # anyway). Mirrored in installer-smoke.yml.
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) { Write-Host "::error::vswhere.exe not found on the runner"; exit 1 }
+          $vsRoot = & $vswhere -latest -products * -property installationPath
+          $crtDir = Get-ChildItem -Directory "$vsRoot\VC\Redist\MSVC\*\x64\Microsoft.VC14*.CRT" -ErrorAction SilentlyContinue |
+                    Sort-Object FullName | Select-Object -Last 1
+          if (-not $crtDir) { Write-Host "::error::no Microsoft.VC14x.CRT redist folder under $vsRoot"; exit 1 }
+          $expected = @('concrt140.dll', 'msvcp140.dll', 'msvcp140_1.dll', 'msvcp140_2.dll',
+                        'msvcp140_atomic_wait.dll', 'msvcp140_codecvt_ids.dll', 'vccorlib140.dll',
+                        'vcruntime140.dll', 'vcruntime140_1.dll')
+          foreach ($n in $expected) {
+            $src = Join-Path $crtDir.FullName $n
+            if (-not (Test-Path $src)) { Write-Host "::error::$n missing from $($crtDir.FullName) -- VcRedistCrt harvest would fail (LGHT0103)"; exit 1 }
+            Copy-Item $src target\release\ -Force
+          }
+          Write-Host "Staged $($expected.Count) VC++ runtime DLLs from $($crtDir.FullName)"
+
       - name: Build MSI (per-User)
         shell: pwsh
         run: |
@@ -874,6 +904,15 @@ jobs:
       # icon-prep step. Released as a plain EXE.
       - name: Build tray binary (release)
         shell: pwsh
+        # Static CRT: the desktop companion ships as a raw standalone EXE
+        # (placed beside roomlerd.exe by install.ps1 / the wizard), so it
+        # must not assume the MSVC runtime exists on the host -- a fresh
+        # Windows box without the VC++ redist pops a loader dialog
+        # otherwise (field report 2026-07-28). The tray graph is pure
+        # Rust (agent DEFAULT features, no vcpkg /MD libs), so
+        # +crt-static is safe; link-verified against the Tauri 2 stack.
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
         run: cargo build -p roomler-agent-tray --release
 
       - name: Locate + rename tray EXE
