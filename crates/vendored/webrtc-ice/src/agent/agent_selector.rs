@@ -76,6 +76,61 @@ fn follow_renomination_policy(
     }
 }
 
+/// Roomler patch (warm standby, 2026-07-28): cadence for pinging validated
+/// pairs that are NOT the selected one. Upstream keepalives only the selected
+/// pair, so every other validated pair's NAT mapping expires minutes after it
+/// goes idle (field, WINHOST-C: the agent's srflx mapping died within
+/// ~4–13 min of media settling on the overlay-host pair — killing the exact
+/// real-path fallback needed when the overlay carrier stalls). A controlled
+/// binding request never carries USE-CANDIDATE, so a warm ping can't change
+/// anyone's selection; the peer's success response refreshes the far-side
+/// mapping too.
+const WARM_STANDBY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+impl AgentInternal {
+    /// Ping succeeded-but-unselected pairs whose local candidate has been
+    /// idle past [`WARM_STANDBY_INTERVAL`]. Self-gating rides the LOCAL
+    /// candidate's `last_sent` — standby pairs own distinct local candidates
+    /// (srflx vs host), so selected-pair traffic doesn't mask them, and our
+    /// own ping refreshes it, bounding the cadence. Capped at 4 pairs per
+    /// tick. Hatch: `ROOMLER_ICE_WARM_STANDBY=0`.
+    async fn warm_standby_pairs(&self) {
+        if std::env::var("ROOMLER_ICE_WARM_STANDBY").as_deref() == Ok("0") {
+            return;
+        }
+        let selected = self.agent_conn.get_selected_pair();
+        let standby: Vec<_> = {
+            let checklist = self.agent_conn.checklist.lock().await;
+            checklist
+                .iter()
+                .filter(|p| p.state.load(Ordering::SeqCst) == CandidatePairState::Succeeded as u8)
+                .filter(|p| {
+                    selected
+                        .as_ref()
+                        .is_none_or(|s| !(s.local.equal(&*p.local) && s.remote.equal(&*p.remote)))
+                })
+                .filter(|p| {
+                    std::time::SystemTime::now()
+                        .duration_since(p.local.last_sent())
+                        .map(|idle| idle > WARM_STANDBY_INTERVAL)
+                        .unwrap_or(true)
+                })
+                .take(4)
+                .map(|p| (p.local.clone(), p.remote.clone()))
+                .collect()
+        };
+        for (local, remote) in standby {
+            log::trace!(
+                "[{}]: warm-standby ping {} -> {}",
+                self.get_name(),
+                local,
+                remote
+            );
+            ControlledSelector::ping_candidate(self, &local, &remote).await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod follow_renomination_tests {
     use super::follow_renomination_policy;
@@ -537,6 +592,7 @@ impl ControlledSelector for AgentInternal {
             if self.validate_selected_pair().await {
                 log::trace!("[{}]: checking keepalive", self.get_name());
                 self.check_keepalive().await;
+                self.warm_standby_pairs().await;
             }
         } else {
             self.ping_all_candidates().await;
