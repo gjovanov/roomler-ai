@@ -340,6 +340,38 @@ jobs:
           }
           Write-Host 'Uninstall left no traces: payload, install dir contents, PATH entry and MSI registry record all clean'
 
+      - name: Compile per-Machine MSI (wxs lint, no install)
+        shell: pwsh
+        env:
+          SMOKE_VERSION: 0.0.0-smoke.1
+        run: |
+          # The release pipeline builds the per-Machine flavour by
+          # file-swapping wix-perMachine/main.wxs over wix/main.wxs
+          # (cargo-wix auto-discovers every wxs under wix/), and until
+          # now NOTHING validated that file before the agent-v* tag run
+          # -- the first rc.266 tag burned on a per-Machine-only
+          # LGHT0368 that this smoke never compiled. Mirror the swap
+          # and compile it here (candle + light + ICE = the actual
+          # gate); no install, the flavour needs elevation semantics
+          # this job doesn't exercise. Clear target\wix first: both
+          # flavours emit the SAME output filename, and the per-User
+          # MSI at $env:MSI_PATH was already installed + uninstalled
+          # above, so clobbering is fine but a stale file would make
+          # the produced-MSI assert vacuous.
+          Remove-Item target\wix\*.msi -Force -ErrorAction SilentlyContinue
+          $wixDir = "agents\roomler-agent\wix"
+          $pmSrc  = "agents\roomler-agent\wix-perMachine\main.wxs"
+          Copy-Item "$wixDir\main.wxs" "$wixDir\main.wxs.bak" -Force
+          Copy-Item $pmSrc "$wixDir\main.wxs" -Force
+          try {
+            cargo wix -p roomler-agent --nocapture --no-build --install-version $env:SMOKE_VERSION
+          } finally {
+            Move-Item "$wixDir\main.wxs.bak" "$wixDir\main.wxs" -Force
+          }
+          $msi = Get-ChildItem 'target/wix/*.msi' | Select-Object -First 1
+          if (-not $msi) { throw 'per-Machine MSI not produced by cargo-wix' }
+          Write-Host "per-Machine MSI compiles clean: $($msi.Name) ($([math]::Round($msi.Length / 1MB, 2)) MiB)"
+
       - name: Upload MSI logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
