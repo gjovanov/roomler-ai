@@ -74,6 +74,10 @@ import {
   priorityWireMessage,
   codecChoiceToSettings,
   settingsToCodecChoice,
+  CODEC_STORAGE_PREFIX,
+  readStoredCodecChoice,
+  persistCodecChoice,
+  codecConnectAction,
   parseLocalRelayDescriptor,
   localRelayIceServer,
   LOCAL_RELAY_PROBE_PORT,
@@ -2523,6 +2527,55 @@ describe('settingsToCodecChoice (rc.199 reverse map)', () => {
       const s = codecChoiceToSettings(c)
       expect(settingsToCodecChoice(s.videoTransport, s.chroma)).toBe(c)
     }
+  })
+})
+
+describe('per-agent codec override (2026-07-28)', () => {
+  const A = 'agent-aaa'
+  const B = 'agent-bbb'
+  beforeEach(() => {
+    globalThis.localStorage?.removeItem(CODEC_STORAGE_PREFIX + A)
+    globalThis.localStorage?.removeItem(CODEC_STORAGE_PREFIX + B)
+  })
+
+  it('round-trips an explicit choice per agent', () => {
+    persistCodecChoice(A, 'h264')
+    expect(readStoredCodecChoice(A)).toBe('h264')
+    expect(readStoredCodecChoice(B)).toBeNull()
+  })
+
+  it('auto (or null) clears the override via removeItem', () => {
+    persistCodecChoice(A, 'hevc')
+    persistCodecChoice(A, 'auto')
+    expect(globalThis.localStorage?.getItem(CODEC_STORAGE_PREFIX + A)).toBeNull()
+    persistCodecChoice(B, 'av1')
+    persistCodecChoice(B, null)
+    expect(readStoredCodecChoice(B)).toBeNull()
+  })
+
+  it('ignores garbage and a stored literal auto', () => {
+    globalThis.localStorage?.setItem(CODEC_STORAGE_PREFIX + A, 'mpeg2')
+    expect(readStoredCodecChoice(A)).toBeNull()
+    globalThis.localStorage?.setItem(CODEC_STORAGE_PREFIX + A, 'auto')
+    expect(readStoredCodecChoice(A)).toBeNull()
+  })
+
+  it('isolates overrides between agents', () => {
+    persistCodecChoice(A, 'h264')
+    persistCodecChoice(B, 'vp9-444')
+    expect(readStoredCodecChoice(A)).toBe('h264')
+    expect(readStoredCodecChoice(B)).toBe('vp9-444')
+    persistCodecChoice(A, 'auto')
+    expect(readStoredCodecChoice(A)).toBeNull()
+    expect(readStoredCodecChoice(B)).toBe('vp9-444')
+  })
+
+  it('connect precedence: fresh pick beats stored override beats nothing', () => {
+    // rc.190 guard transplanted: a pre-connect pick wins and gets persisted.
+    expect(codecConnectAction(true, 'hevc')).toBe('persist-pick')
+    expect(codecConnectAction(true, null)).toBe('persist-pick')
+    expect(codecConnectAction(false, 'hevc')).toBe('apply-stored')
+    expect(codecConnectAction(false, null)).toBe('none')
   })
 })
 
