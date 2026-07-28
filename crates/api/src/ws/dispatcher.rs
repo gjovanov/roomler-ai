@@ -58,6 +58,34 @@ pub async fn broadcast_with_redis(
     }
 }
 
+/// S6 — broadcast to EVERY connected user on EVERY instance.
+///
+/// `broadcast_with_redis` ships an explicit recipient list computed by
+/// the publisher; for presence fan-out that list was the PUBLISHING
+/// pod's `all_user_ids()`, so users whose sockets live on the other pod
+/// never heard about it. This variant marks the envelope
+/// `"broadcast": true` — each subscriber delivers to its OWN local
+/// user set instead of the origin's snapshot.
+pub async fn broadcast_all_with_redis(
+    ws_storage: &WsStorage,
+    redis_pubsub: &Option<Arc<RedisPubSub>>,
+    message: &serde_json::Value,
+) {
+    let local_users = ws_storage.all_user_ids();
+    broadcast(ws_storage, &local_users, message).await;
+
+    if let Some(pubsub) = redis_pubsub {
+        let envelope = serde_json::json!({
+            "origin": pubsub.instance_id(),
+            "broadcast": true,
+            "message": message,
+        });
+        if let Err(e) = pubsub.publish(&envelope.to_string()).await {
+            tracing::error!("Failed to publish broadcast to Redis Pub/Sub: {}", e);
+        }
+    }
+}
+
 /// Sends a JSON message to a specific user locally AND via Redis for cross-instance delivery.
 pub async fn send_to_user_with_redis(
     ws_storage: &WsStorage,
