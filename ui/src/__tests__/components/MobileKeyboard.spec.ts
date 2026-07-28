@@ -4,8 +4,8 @@ import MobileKeyboard from '@/components/remote/MobileKeyboard.vue'
 
 beforeAll(() => {
   // jsdom-friendly stubs the component reaches for during focus.
-  if (!global.requestAnimationFrame) {
-    global.requestAnimationFrame = ((cb: FrameRequestCallback) => {
+  if (!globalThis.requestAnimationFrame) {
+    globalThis.requestAnimationFrame = ((cb: FrameRequestCallback) => {
       cb(0)
       return 0
     }) as typeof requestAnimationFrame

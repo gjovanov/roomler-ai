@@ -26,14 +26,19 @@ async fn main() -> anyhow::Result<()> {
     // Load config
     let settings = Settings::load()?;
 
-    // Loud, non-fatal warning if the JWT secret is still the built-in
-    // default ("change-me-in-production"). The default is fine for
-    // `cargo run` against localhost, but any reachable deployment must
-    // override `ROOMLER__JWT__SECRET` — otherwise any user can forge
-    // tokens. Hard-fail gated on an explicit `app.environment=production`
-    // setting is a follow-up; warning here matches the existing posture
-    // in CLAUDE.md "Known Issues".
+    // The built-in JWT secret ("change-me-in-production") lets anyone forge
+    // tokens. In development that's a loud warning; with
+    // `app.environment=production` (prod configmap sets
+    // ROOMLER__APP__ENVIRONMENT=production) it's a REFUSAL to boot — a
+    // production deployment on the default secret is strictly worse than
+    // downtime.
     if settings.jwt.secret == "change-me-in-production" {
+        if settings.app.environment == "production" {
+            anyhow::bail!(
+                "Refusing to start: app.environment=production but the JWT secret \
+                 is still the built-in default — set ROOMLER__JWT__SECRET."
+            );
+        }
         error!(
             "JWT secret is the built-in default \"change-me-in-production\" — \
              set ROOMLER__JWT__SECRET before exposing this server."

@@ -1,0 +1,16 @@
+# Substrings matched (grep -F) against failing-spec lines from the nightly
+# e2e sweep. A failing spec containing NONE of these lines is a REGRESSION.
+# Keep this list justified — every entry is a failure we UNDERSTAND:
+#
+# Conference specs need mediasoup RTC UDP ports, which the port-forward
+# topology can't carry (only :80 is forwarded).
+e2e/conference-chat.spec.ts
+e2e/conference-multi.spec.ts
+e2e/conference.spec.ts
+# rc-vp9-444 needs an agent built with the vp9-444 feature lane attached to
+# the stack — not part of the nightly topology.
+e2e/rc-vp9-444.spec.ts
+# Containerized Chromium intercepts accounts.google.com navigations before
+# Playwright routing sees them (the identical GitHub-redirect test passes;
+# the server's 307 Location was verified correct directly). 2026-07-28.
+clicking Google OAuth button redirects to Google
