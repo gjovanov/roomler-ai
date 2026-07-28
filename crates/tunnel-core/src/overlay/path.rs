@@ -636,7 +636,12 @@ impl PathMonitor {
     /// * a probe in flight (this peer, or the global cap) → `Keep`;
     /// * relay incumbent + an eligible direct tier → `Probe` (MBB) /
     ///   `Install` (destructive mode);
-    /// * fresh peer → `Install` best eligible direct tier, else `Relay`;
+    /// * fresh peer + LAN best under MBB → `Probe(Lan)` (P9 — a same-/24
+    ///   candidate is only a HINT: vendor-default subnets false-match across
+    ///   sites, so the unproven LAN dial must not preempt the working-carrier
+    ///   walk; the executor probes LAN and installs the next-best tier / relay
+    ///   in the same pass; cap-full → `Relay`);
+    /// * fresh peer otherwise → `Install` best eligible direct tier, else `Relay`;
     /// * relay incumbent + nothing eligible → `Keep`.
     ///
     /// "Best" = highest `S` among eligible+available, tie-broken by legacy
@@ -690,6 +695,20 @@ impl PathMonitor {
                 }
             }
             (Incumbent::Relay, None) => PathAction::Keep,
+            // P9 — fresh-LAN is probe-first under MBB: a same-/24 candidate is
+            // only a HINT (192.168.68.0/24 Deco, 192.168.1.0/24 … false-match
+            // across sites; field 2026-07-28: fresh installs burned the 12 s
+            // LAN deadline with NO carrier, repeatedly, against corp peers
+            // advertising another city's 192.168.68.x). Probe the LAN, take
+            // the next-best tier / relay for the working carrier meanwhile.
+            // Cap-full → Relay: the carrier comes first, the probe can wait
+            // for the relay→direct upgrade arm once a slot frees.
+            (Incumbent::None, Some((DirectTier::Lan, _))) if mbb => {
+                if self.probes_in_flight >= PROBE_CAP {
+                    return PathAction::Relay;
+                }
+                PathAction::Probe(DirectTier::Lan)
+            }
             (Incumbent::None, Some((tier, _))) => PathAction::Install(tier),
             (Incumbent::None, None) => PathAction::Relay,
             (Incumbent::Direct(_), _) => unreachable!("handled above"),
@@ -1007,8 +1026,14 @@ mod tests {
         let m = PathMonitor::default();
         let a = oid(1);
         let now = Instant::now();
+        // P9 — LAN-best on a FRESH peer probes first under MBB (the same-/24
+        // candidate is unproven); the destructive walk survives with MBB off.
         assert_eq!(
             m.decide(&a, Incumbent::None, all_avail(), true, now),
+            PathAction::Probe(DirectTier::Lan)
+        );
+        assert_eq!(
+            m.decide(&a, Incumbent::None, all_avail(), false, now),
             PathAction::Install(DirectTier::Lan)
         );
         let no_lan = TierAvailability {
@@ -1126,16 +1151,49 @@ mod tests {
             PathAction::Keep,
             "global cap blocks new Probe proposals"
         );
-        // …but NOT a fresh install (no probe involved).
+        // P9 — a fresh-LAN peer under MBB is probe-first, so the cap applies
+        // to it too: cap-full falls back to Relay (carrier first), never to a
+        // destructive unproven-LAN install.
         assert_eq!(
             m.decide(&fresh, Incumbent::None, all_avail(), true, now),
-            PathAction::Install(DirectTier::Lan)
+            PathAction::Relay
         );
         m.on_peer_removed(&oid(100));
         assert_eq!(
             m.decide(&fresh, Incumbent::Relay, all_avail(), true, now),
             PathAction::Probe(DirectTier::Lan),
             "freeing one slot unblocks"
+        );
+    }
+
+    /// P9 — a fresh peer whose best tier is LAN probes first under MBB (the
+    /// same-/24 candidate is unproven — vendor-default subnets false-match
+    /// across sites); destructive mode (MBB env-off) and non-LAN best tiers
+    /// keep the legacy fresh `Install`.
+    #[test]
+    fn fresh_lan_probes_first_under_mbb() {
+        let m = PathMonitor::default();
+        let a = oid(7);
+        let now = Instant::now();
+        assert_eq!(
+            m.decide(&a, Incumbent::None, all_avail(), true, now),
+            PathAction::Probe(DirectTier::Lan),
+            "fresh + LAN best + MBB → shadow probe, not a destructive install"
+        );
+        assert_eq!(
+            m.decide(&a, Incumbent::None, all_avail(), false, now),
+            PathAction::Install(DirectTier::Lan),
+            "MBB env-off keeps the destructive fresh install"
+        );
+        let no_lan = TierAvailability {
+            lan: false,
+            public: true,
+            srflx: true,
+        };
+        assert_eq!(
+            m.decide(&a, Incumbent::None, no_lan, true, now),
+            PathAction::Install(DirectTier::Public),
+            "non-LAN best tiers keep the fresh Install"
         );
     }
 
