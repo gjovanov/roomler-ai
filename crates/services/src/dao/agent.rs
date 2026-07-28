@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use bson::{DateTime, doc, oid::ObjectId};
 use mongodb::Database;
 use roomler_ai_remote_control::models::{
@@ -185,6 +187,29 @@ impl AgentDao {
                 doc! { "$set": { "last_seen_at": DateTime::now() } },
             )
             .await
+    }
+
+    /// P9 — batched heartbeat freshness for the overlay netmap's presence
+    /// check: which of `ids` heartbeated within `within_ms`? One `$in` query;
+    /// ids missing from the result read STALE (an orphaned overlay row must
+    /// not look dialable).
+    pub async fn last_seen_fresh(
+        &self,
+        ids: &[ObjectId],
+        within_ms: i64,
+    ) -> DaoResult<HashMap<ObjectId, bool>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let cutoff = DateTime::from_millis(DateTime::now().timestamp_millis() - within_ms);
+        let rows = self
+            .base
+            .find_many(doc! { "_id": { "$in": ids.to_vec() } }, None)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|a| a.id.map(|id| (id, a.last_seen_at > cutoff)))
+            .collect())
     }
 
     pub async fn update_access_policy(
