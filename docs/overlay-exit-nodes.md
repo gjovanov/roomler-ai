@@ -82,6 +82,15 @@ This is distinct from the offer flag: `overlay_exit_node` is the client saying
 and only installs default routing when the peer is **present + carriered +
 admin-approved** (its netmap carries `/0`).
 
+> **Prefer the node-id hex for long-lived configs.** A *name* is not a stable
+> identity: removing a device from the fleet releases its MagicDNS name back to
+> the network, so the same label can later belong to a different machine — and
+> following it would silently move this host's entire internet egress. Once a
+> name selector has resolved, the agent PINS that node for the daemon's
+> lifetime; if the label later resolves elsewhere it withholds default routing
+> and reports `exit-node name now resolves to a DIFFERENT machine` in
+> `roomler status`. A node-id hex selector is unambiguous and never drifts.
+
 ## How it works end-to-end
 
 ```

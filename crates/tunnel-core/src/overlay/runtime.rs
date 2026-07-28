@@ -746,6 +746,39 @@ fn prefix_of_cidr(cidr: &str) -> Option<u8> {
         .and_then(|(_, p)| p.trim().parse().ok())
 }
 
+/// Whether a teardown should also drop the peer's OS `/32`. `Keep` is for a
+/// RE-INSTALL of the SAME node (a WG key rotation): the route is about to be
+/// re-added for the same address, so dropping it only flaps the host route —
+/// and on Windows every add/del is a slow IP-Helper round-trip.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PeerRoute {
+    Drop,
+    Keep,
+}
+
+/// Drop a peer's OS `/32` — UNLESS the address is still claimed by ANOTHER
+/// installed peer.
+///
+/// Overlay addresses are RECYCLED: the server returns a removed device's host
+/// number to the tenant's pool, so by the time we reap a stale peer its address
+/// may already belong to a live one. Deleting the route unconditionally would
+/// blackhole the new owner with nothing to re-install it (`install_peers` skips
+/// a node that is already in `by_node`).
+///
+/// Call AFTER the removed peer is out of `by_node`, so the scan sees only
+/// survivors.
+async fn del_peer_route_if_unowned(
+    tun: &Arc<dyn TunIo>,
+    by_node: &HashMap<ObjectId, Installed>,
+    ip: Ipv4Addr,
+) {
+    if by_node.values().any(|e| e.overlay_ip == ip) {
+        debug!(%ip, "overlay: keeping the OS route — the address was recycled to a live peer");
+        return;
+    }
+    tun.del_peer_route(ip).await;
+}
+
 /// Phase 2 MagicDNS — rebuild the resolver's `name → overlay-IP` map from the
 /// current netmap peers (named peers only). Called after each netmap change.
 async fn sync_name_map(names: &dns::NameMap, peers: &HashMap<ObjectId, NetmapPeer>) {
@@ -1036,6 +1069,19 @@ fn resolve_exit_peer(selector: &str, peers: &HashMap<ObjectId, NetmapPeer>) -> O
         .map(|np| np.node_id)
 }
 
+/// P5 — did a NAME selector drift to a DIFFERENT machine than the one it first
+/// resolved to?
+///
+/// A name is not a stable identity: removing a device releases its MagicDNS name
+/// back to the network, so the same label can later belong to another machine.
+/// Following it would silently redirect this host's ENTIRE internet egress. Once
+/// we have captured the default route through a named peer we refuse to follow
+/// the label elsewhere without operator action; a node-id hex selector is
+/// unambiguous by construction and never drifts. Pure.
+fn exit_selector_drifted(pinned: Option<ObjectId>, selector: &str, resolved: ObjectId) -> bool {
+    selector.trim() != resolved.to_hex() && pinned.is_some_and(|p| p != resolved)
+}
+
 /// P5 — is `peer` an admin-APPROVED exit node? The client only routes its
 /// default egress through a peer whose netmap `routes` carry a default route
 /// (`0.0.0.0/0`); the server only ever puts one there via the dedicated
@@ -1195,6 +1241,13 @@ struct ExitRoutingState {
     dns_target: Option<Ipv4Addr>,
     dns_bound: bool,
     dns_steered: bool,
+    /// The node a NAME selector first resolved to, this process lifetime.
+    /// Overlay names are RELEASED when a device is removed and can be taken by a
+    /// different machine, so once we have routed our whole egress through one we
+    /// refuse to follow the same label elsewhere — see
+    /// [`exit_selector_drifted`]. `None` for a hex selector (unambiguous) or
+    /// before the first successful resolution.
+    pinned_exit: Option<ObjectId>,
 }
 
 impl OverlayRuntime {
@@ -1970,15 +2023,15 @@ impl OverlayRuntime {
                         );
                         let nids: Vec<ObjectId> = by_node.keys().copied().collect();
                         for nid in nids {
-                            if let Some(e) = by_node.remove(&nid) {
-                                wg.remove_peer(&e.pubkey).await;
-                                tun.del_peer_route(e.overlay_ip).await;
-                            }
-                            if let Some(r) = relay.as_mut() {
-                                r.forget(&nid);
-                            }
-                            alloc_q.invalidate(&nid);
-                            relay_bq.invalidate(&nid);
+                            // Through the shared teardown: this used to leave
+                            // `upgrade_probes` populated, so a later
+                            // `promote_direct_probe` could re-upsert a STALE
+                            // probe.overlay_ip and hijack a recycled address.
+                            self.remove_peer_state(
+                                nid, &mut wg, &mut by_node, &tun, &mut relay,
+                                &mut relay_bq, Some(&mut alloc_q), &mut upgrade_probes,
+                                PeerRoute::Drop,
+                            ).await;
                         }
                         cooldowns = DirectCooldowns::default();
                         relay_refresh_cooldown.clear();
@@ -2201,6 +2254,50 @@ impl OverlayRuntime {
                                 debug!(peer = %p.node_id, "overlay: peer's direct endpoints changed — cleared its direct-tier cooldowns");
                             }
                         }
+                        // The full netmap is AUTHORITATIVE: anything we still
+                        // hold that it does not list is gone — it left while we
+                        // were disconnected, or an admin evicted it. Before
+                        // this, only deltas drove removals, so a peer that
+                        // vanished unseen kept its Tunn, its crypto-route and
+                        // its OS /32 until the process exited. Now that the
+                        // server RECYCLES overlay addresses, that stale entry
+                        // blackholes the address's NEW owner the moment it is
+                        // finally reaped. This arm is also the RECONNECT path (a
+                        // WS re-join replies with a full netmap), which is
+                        // exactly when a peer is most likely to have vanished
+                        // unseen.
+                        //
+                        // MEMBERSHIP, not presence: P9 ghost rows are still
+                        // LISTED (with `reachable = false`), so they are not
+                        // pruned — an offline peer keeps its carrier and comes
+                        // back without a rebuild. Only a peer the server dropped
+                        // from the netmap entirely — released, or ACL'd out — is
+                        // torn down here.
+                        //
+                        // Collect first: the diff holds borrows of `by_node`,
+                        // `upgrade_probes` and `current_peers` that must end
+                        // before the loop takes them mutably.
+                        let mut vanished: Vec<ObjectId> = by_node
+                            .keys()
+                            .chain(upgrade_probes.keys())
+                            .filter(|id| !current_peers.contains_key(id))
+                            .copied()
+                            .collect();
+                        vanished.sort_unstable();
+                        vanished.dedup();
+                        if !vanished.is_empty() {
+                            info!(pruned = vanished.len(), listed = current_peers.len(),
+                                "overlay: full netmap prune");
+                        }
+                        // Prune BEFORE install_peers so a stale peer and the new
+                        // owner of its address are never both installed.
+                        for nid in vanished {
+                            self.evict_peer(
+                                nid, &mut wg, &mut by_node, &tun, &mut relay, &mut relay_bq,
+                                &mut alloc_q, &mut upgrade_probes, &mut current_peers,
+                                &mut cooldowns, &mut relay_refresh_cooldown,
+                            ).await;
+                        }
                         if let Some(names) = &dns_names { sync_name_map(names, &current_peers).await; }
                         let t0 = Instant::now();
                         self.install_peers(&mut wg, &mut by_node, &mut relay, &tun, &peers, direct_ctx.as_ref(), &cooldowns, &mut upgrade_probes, &mut relay_bq, "netmap").await;
@@ -2228,25 +2325,11 @@ impl OverlayRuntime {
                         self.install_peers(&mut wg, &mut by_node, &mut relay, &tun, &upserts, direct_ctx.as_ref(), &cooldowns, &mut upgrade_probes, &mut relay_bq, "delta").await;
                         warn_if_slow("install_peers(delta)", t0);
                         for node_id in removes {
-                            current_peers.remove(&node_id);
-                            // P3 PR-A — drop the monitor's per-peer state.
-                            self.shadow(|s| s.mon.on_peer_removed(&node_id));
-                            if let Some(e) = by_node.remove(&node_id) {
-                                wg.remove_peer(&e.pubkey).await;
-                                tun.del_peer_route(e.overlay_ip).await;
-                                info!(peer = %node_id, "overlay: peer removed");
-                            }
-                            if let Some(r) = relay.as_mut() {
-                                r.forget(&node_id);
-                            }
-                            // rc.211 — drop any in-flight off-loop relay build
-                            // for the removed peer (stale on arrival).
-                            relay_bq.invalidate(&node_id);
-                            // rc.208 — drop any in-flight make-before-break probe
-                            // for a removed peer (its shadow carrier + demux reg).
-                            if let Some(pr) = upgrade_probes.remove(&node_id) {
-                                wg.drop_direct_probe(&pr.pubkey).await;
-                            }
+                            self.evict_peer(
+                                node_id, &mut wg, &mut by_node, &tun, &mut relay, &mut relay_bq,
+                                &mut alloc_q, &mut upgrade_probes, &mut current_peers,
+                                &mut cooldowns, &mut relay_refresh_cooldown,
+                            ).await;
                         }
                         if let Some(names) = &dns_names { sync_name_map(names, &current_peers).await; }
                         self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
@@ -2309,7 +2392,7 @@ impl OverlayRuntime {
                                 && let Some(e) = by_node.remove(&peer_node_id)
                             {
                                 wg.remove_peer(&e.pubkey).await;
-                                tun.del_peer_route(e.overlay_ip).await;
+                                del_peer_route_if_unowned(&tun, &by_node, e.overlay_ip).await;
                                 r.forget(&peer_node_id);
                                 if let Some(cfg) = current_peers
                                     .get(&peer_node_id)
@@ -2487,7 +2570,11 @@ impl OverlayRuntime {
                 }
             });
             wg.remove_peer(&e.pubkey).await;
-            tun.del_peer_route(e.overlay_ip).await;
+            // A carrier REPAIR, not an eviction (the relay is re-requested
+            // below), so it deliberately does NOT go through `evict_peer` —
+            // forgetting the cooldowns/probe here would undo proven behaviour.
+            // It does need the recycled-address guard.
+            del_peer_route_if_unowned(tun, by_node, e.overlay_ip).await;
             if tier.is_direct() {
                 // Escalating cooldown on the carrier's OWN tier (CC1). LAN: the
                 // "same /24" was a VPN client pool, not a reachable LAN. Public:
@@ -2667,6 +2754,94 @@ impl OverlayRuntime {
         })
     }
 
+    /// Tear one peer's carrier down: WG peer, crypto-routes, OS `/32`, relay
+    /// coordination, queued builds/allocations and any in-flight upgrade probe.
+    ///
+    /// THE single teardown for every eviction path (delta `removes`, the
+    /// full-netmap prune, resume-from-suspend) so the three can't drift apart.
+    /// Returns the removed [`Installed`], if the peer was installed at all.
+    ///
+    /// `by_node.remove` happens FIRST so [`del_peer_route_if_unowned`] sees only
+    /// survivors when it decides whether the OS route is still claimed.
+    #[allow(clippy::too_many_arguments)]
+    async fn remove_peer_state(
+        &self,
+        node_id: ObjectId,
+        wg: &mut WgDevice,
+        by_node: &mut HashMap<ObjectId, Installed>,
+        tun: &Arc<dyn TunIo>,
+        relay: &mut Option<RelayCoordinator>,
+        relay_bq: &mut RelayBuildQueue,
+        alloc_q: Option<&mut RelayAllocQueue>,
+        upgrade_probes: &mut HashMap<ObjectId, UpgradeProbe>,
+        os_route: PeerRoute,
+    ) -> Option<Installed> {
+        let removed = by_node.remove(&node_id);
+        if let Some(e) = &removed {
+            wg.remove_peer(&e.pubkey).await;
+            if os_route == PeerRoute::Drop {
+                del_peer_route_if_unowned(tun, by_node, e.overlay_ip).await;
+            }
+        }
+        if let Some(r) = relay.as_mut() {
+            r.forget(&node_id);
+        }
+        // rc.211 — drop any in-flight off-loop relay build (stale on arrival).
+        relay_bq.invalidate(&node_id);
+        if let Some(q) = alloc_q {
+            q.invalidate(&node_id);
+        }
+        // rc.208 — drop any in-flight make-before-break probe (its shadow
+        // carrier + demux registration).
+        if let Some(pr) = upgrade_probes.remove(&node_id) {
+            wg.drop_direct_probe(&pr.pubkey).await;
+        }
+        removed
+    }
+
+    /// A full EVICTION: [`Self::remove_peer_state`] plus the netmap/monitor/
+    /// cooldown bookkeeping that only makes sense when the peer is GONE (as
+    /// opposed to being re-installed).
+    #[allow(clippy::too_many_arguments)]
+    async fn evict_peer(
+        &self,
+        node_id: ObjectId,
+        wg: &mut WgDevice,
+        by_node: &mut HashMap<ObjectId, Installed>,
+        tun: &Arc<dyn TunIo>,
+        relay: &mut Option<RelayCoordinator>,
+        relay_bq: &mut RelayBuildQueue,
+        alloc_q: &mut RelayAllocQueue,
+        upgrade_probes: &mut HashMap<ObjectId, UpgradeProbe>,
+        current_peers: &mut HashMap<ObjectId, NetmapPeer>,
+        cooldowns: &mut DirectCooldowns,
+        relay_refresh_cooldown: &mut HashMap<ObjectId, Instant>,
+    ) {
+        current_peers.remove(&node_id);
+        // P3 PR-A — drop the monitor's per-peer state.
+        self.shadow(|s| s.mon.on_peer_removed(&node_id));
+        let removed = self
+            .remove_peer_state(
+                node_id,
+                wg,
+                by_node,
+                tun,
+                relay,
+                relay_bq,
+                Some(alloc_q),
+                upgrade_probes,
+                PeerRoute::Drop,
+            )
+            .await;
+        // These two are keyed by node id and were never pruned, so a long-lived
+        // daemon accumulated an entry per peer that ever churned.
+        cooldowns.reset_peer(&node_id);
+        relay_refresh_cooldown.remove(&node_id);
+        if removed.is_some() {
+            info!(peer = %node_id, "overlay: peer removed");
+        }
+    }
+
     /// Reconcile the netmap into installed peers. NOT-yet-installed: Direct
     /// mode → build the loopback/test carrier; Relay mode → a DIRECT LAN
     /// carrier when the peer advertises a same-subnet endpoint (rc.131/134 — N
@@ -2730,6 +2905,37 @@ impl OverlayRuntime {
             let installed = by_node
                 .get(&np.node_id)
                 .map(|e| (e.is_direct, e.pubkey, e.tier, e.public_direct_dst));
+            // The node's WG identity CHANGED under a stable node_id: the daemon
+            // rotated its key, or the netmap row is the stale remains of a
+            // different machine. Either way everything we hold — Tunn,
+            // crypto-route, demux registration, relay coordination, in-flight
+            // probe — is keyed to the OLD key and is dead. Tear it down and fall
+            // through to a clean install; without this the already-installed
+            // short-circuits below kept the orphaned peer alive AND kept the old
+            // key accepted inbound forever.
+            let installed = match installed {
+                Some((_, pk, _, _)) if pk != cfg.public_key => {
+                    warn!(peer = %np.node_id, overlay_ip = %cfg.overlay_ip,
+                        "overlay: peer's WG public key changed — reinstalling its carrier");
+                    // No alloc_q here (install_peers doesn't take one) and none
+                    // needed: `relay.forget` inside makes a landing `AllocDone`
+                    // a no-op for this node.
+                    self.remove_peer_state(
+                        np.node_id,
+                        wg,
+                        by_node,
+                        tun,
+                        relay,
+                        relay_bq,
+                        None,
+                        upgrade_probes,
+                        PeerRoute::Keep,
+                    )
+                    .await;
+                    None
+                }
+                other => other,
+            };
             // P3 PR-A — the shadow monitor's answer to the SAME question this
             // walk is about to answer, computed up-front; every decision exit
             // below records the legacy outcome against it (`record`). Legacy
@@ -3969,6 +4175,24 @@ impl OverlayRuntime {
             }
         };
 
+        // A NAME selector that now resolves somewhere else. Overlay names are
+        // released on device removal and reusable, so following the label would
+        // hand this host's whole internet egress to a machine the operator never
+        // chose. Fail closed and say what to do about it.
+        if exit_selector_drifted(state.pinned_exit, selector, exit_id) {
+            if state.split_default_installed {
+                self.teardown_exit_routing(wg, tun, by_node, current_peers, state)
+                    .await;
+            }
+            note_withheld(
+                state,
+                selector,
+                "exit-node name now resolves to a DIFFERENT machine — set overlay_exit_node to the node-id hex to pin it",
+            );
+            return;
+        }
+        state.pinned_exit = Some(exit_id);
+
         // Pin any exemptions we don't yet hold, BEFORE (re)installing the /1s —
         // the coturn set grows as relay carriers appear, so re-run on churn.
         let want = exit_exemption_set(&self.exit_server_ips, by_node);
@@ -4804,6 +5028,208 @@ mod tests {
             !cooldowns.public.contains_key(&nid) && !cooldowns.public_fails.contains_key(&nid),
             "CC1: the public-direct tier is NOT poisoned"
         );
+    }
+
+    /// A `TunIo` that records every peer-route add/remove, so the tests can
+    /// assert what actually reached the OS routing table. `MockTun` takes the
+    /// no-op default `add_peer_route`/`del_peer_route`, which makes route calls
+    /// unobservable.
+    struct RouteRecordingTun {
+        routes: std::sync::Mutex<Vec<(&'static str, Ipv4Addr)>>,
+    }
+    impl RouteRecordingTun {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                routes: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+        fn calls(&self) -> Vec<(&'static str, Ipv4Addr)> {
+            self.routes.lock().unwrap().clone()
+        }
+    }
+    #[async_trait]
+    impl TunIo for RouteRecordingTun {
+        async fn read_packet(&self) -> io::Result<Vec<u8>> {
+            // Never yields — the prune tests drive the helpers directly.
+            std::future::pending().await
+        }
+        async fn write_packet(&self, _packet: &[u8]) -> io::Result<()> {
+            Ok(())
+        }
+        async fn add_peer_route(&self, ip: Ipv4Addr) -> io::Result<()> {
+            self.routes.lock().unwrap().push(("add", ip));
+            Ok(())
+        }
+        async fn del_peer_route(&self, ip: Ipv4Addr) {
+            self.routes.lock().unwrap().push(("del", ip));
+        }
+    }
+
+    /// The off-loop ALLOCATE queue's test twin (see `test_relay_bq`).
+    fn test_alloc_q() -> RelayAllocQueue {
+        let (tx, _rx) = mpsc::channel(4);
+        RelayAllocQueue {
+            in_flight: HashMap::new(),
+            epoch: 0,
+            tx,
+        }
+    }
+
+    /// Build an `Installed` for a peer whose carrier details don't matter.
+    fn installed_at(pubkey: [u8; 32], overlay_ip: Ipv4Addr) -> Installed {
+        Installed {
+            pubkey,
+            overlay_ip,
+            is_direct: true,
+            since: Instant::now(),
+            last_traffic: (0, 0),
+            bad_sweeps: 0,
+            last_rx_at: Instant::now(),
+            relay_local: None,
+            relay_dst: None,
+            public_direct_dst: None,
+            tier: DirectTier::Lan,
+        }
+    }
+
+    /// The full netmap is authoritative: a peer it no longer lists loses its WG
+    /// identity, its crypto-route and its OS `/32`. Before the prune, only a
+    /// delta `removes` could evict — so a peer that vanished while this client
+    /// was disconnected stayed installed (and kept accepting inbound) forever.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn full_netmap_prune_tears_down_a_vanished_peer() {
+        let kp = WgKeypair::generate();
+        let gone_kp = WgKeypair::generate();
+        let (out_tx, _out_rx) = mpsc::channel::<ClientMsg>(16);
+        let tun_rec = RouteRecordingTun::new();
+        let tf: TunFactory = {
+            let m = tun_rec.clone();
+            Box::new(move |_, _, _| Ok(m.clone() as Arc<dyn TunIo>))
+        };
+        let rt = OverlayRuntime::new_relay(kp.clone(), out_tx, tf, 1280);
+
+        let (mut wg, _tun_rx) = WgDevice::new(kp.secret.clone());
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        wg.ensure_direct_demux(sock.clone());
+        let dead: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let gone_pk = gone_kp.public.to_bytes();
+        wg.add_direct_peer(sock.clone(), gone_pk, IP_A, dead, true)
+            .await;
+
+        let nid = ObjectId::from_bytes([7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let mut by_node = HashMap::from([(nid, installed_at(gone_pk, IP_A))]);
+        let tun: Arc<dyn TunIo> = tun_rec.clone();
+        let mut relay: Option<RelayCoordinator> = None;
+        let mut relay_bq = test_relay_bq();
+        let mut alloc_q = test_alloc_q();
+        let mut upgrade_probes: HashMap<ObjectId, UpgradeProbe> = HashMap::new();
+        // The peer is NOT in the incoming netmap — i.e. it vanished.
+        let mut current_peers: HashMap<ObjectId, NetmapPeer> = HashMap::new();
+        let mut cooldowns = DirectCooldowns::default();
+        let mut relay_refresh: HashMap<ObjectId, Instant> = HashMap::new();
+
+        rt.evict_peer(
+            nid,
+            &mut wg,
+            &mut by_node,
+            &tun,
+            &mut relay,
+            &mut relay_bq,
+            &mut alloc_q,
+            &mut upgrade_probes,
+            &mut current_peers,
+            &mut cooldowns,
+            &mut relay_refresh,
+        )
+        .await;
+
+        assert!(!by_node.contains_key(&nid), "the carrier is gone");
+        assert!(
+            wg.peer_handshake_done(&gone_pk).is_none(),
+            "the WG peer (and its inbound acceptance) is gone"
+        );
+        assert_eq!(
+            tun_rec.calls(),
+            vec![("del", IP_A)],
+            "the OS /32 is dropped — nobody else claims it"
+        );
+    }
+
+    /// …but a vanished peer whose address was RECYCLED to a live node must not
+    /// take that node's OS route with it. This is the blackhole the release
+    /// feature would otherwise introduce.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prune_keeps_the_os_route_of_a_recycled_overlay_ip() {
+        let kp = WgKeypair::generate();
+        let stale_kp = WgKeypair::generate();
+        let live_kp = WgKeypair::generate();
+        let (out_tx, _out_rx) = mpsc::channel::<ClientMsg>(16);
+        let tun_rec = RouteRecordingTun::new();
+        let tf: TunFactory = {
+            let m = tun_rec.clone();
+            Box::new(move |_, _, _| Ok(m.clone() as Arc<dyn TunIo>))
+        };
+        let rt = OverlayRuntime::new_relay(kp.clone(), out_tx, tf, 1280);
+
+        let (mut wg, _tun_rx) = WgDevice::new(kp.secret.clone());
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        wg.ensure_direct_demux(sock.clone());
+        let dead: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let stale_pk = stale_kp.public.to_bytes();
+        let live_pk = live_kp.public.to_bytes();
+        // Both hold IP_A: the server released it from `stale` and handed it to
+        // `live`, and only now do we get around to reaping `stale`.
+        wg.add_direct_peer(sock.clone(), stale_pk, IP_A, dead, true)
+            .await;
+        wg.add_direct_peer(sock.clone(), live_pk, IP_A, dead, true)
+            .await;
+
+        let stale_nid = ObjectId::from_bytes([8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let live_nid = ObjectId::from_bytes([9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let mut by_node = HashMap::from([
+            (stale_nid, installed_at(stale_pk, IP_A)),
+            (live_nid, installed_at(live_pk, IP_A)),
+        ]);
+        let tun: Arc<dyn TunIo> = tun_rec.clone();
+        let mut relay: Option<RelayCoordinator> = None;
+        let mut relay_bq = test_relay_bq();
+        let mut alloc_q = test_alloc_q();
+        let mut upgrade_probes: HashMap<ObjectId, UpgradeProbe> = HashMap::new();
+        let mut current_peers: HashMap<ObjectId, NetmapPeer> = HashMap::new();
+        let mut cooldowns = DirectCooldowns::default();
+        let mut relay_refresh: HashMap<ObjectId, Instant> = HashMap::new();
+
+        rt.evict_peer(
+            stale_nid,
+            &mut wg,
+            &mut by_node,
+            &tun,
+            &mut relay,
+            &mut relay_bq,
+            &mut alloc_q,
+            &mut upgrade_probes,
+            &mut current_peers,
+            &mut cooldowns,
+            &mut relay_refresh,
+        )
+        .await;
+
+        assert!(by_node.contains_key(&live_nid), "the live peer survives");
+        assert!(
+            tun_rec.calls().is_empty(),
+            "the OS /32 is KEPT — the address now belongs to the live peer, got {:?}",
+            tun_rec.calls()
+        );
+        assert!(
+            wg.peer_handshake_done(&live_pk).is_some(),
+            "the live peer's WG identity is untouched"
+        );
+        assert!(
+            wg.peer_handshake_done(&stale_pk).is_none(),
+            "…and the stale one is gone"
+        );
+        // The crypto-route still resolves IP_A, and to the LIVE peer.
+        assert_eq!(wg.test_route(&IP_A), Some(live_pk));
     }
 
     /// rc.208 make-before-break test scaffold: a peer currently on RELAY with a
@@ -6262,6 +6688,31 @@ mod tests {
         assert_eq!(resolve_exit_peer("  jupiter  ", &peers), Some(a));
         // Unknown selector → None (reconcile defers rather than blackholing).
         assert_eq!(resolve_exit_peer("mars", &peers), None);
+    }
+
+    /// Names are recycled between machines now, so a NAME selector that starts
+    /// resolving elsewhere must not silently move this host's whole egress. A
+    /// hex selector can't drift and a first resolution isn't drift.
+    #[test]
+    fn exit_selector_drifted_only_fires_for_a_name_that_moved() {
+        let a = exit_oid(0x31);
+        let b = exit_oid(0x32);
+        assert!(
+            !exit_selector_drifted(None, "jupiter", a),
+            "first resolution is not drift"
+        );
+        assert!(
+            !exit_selector_drifted(Some(a), "jupiter", a),
+            "same machine is not drift"
+        );
+        assert!(
+            exit_selector_drifted(Some(a), "jupiter", b),
+            "the name moved to another machine"
+        );
+        assert!(
+            !exit_selector_drifted(Some(a), &b.to_hex(), b),
+            "a hex selector is unambiguous — never drift"
+        );
     }
 
     #[test]
