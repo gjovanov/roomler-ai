@@ -336,6 +336,26 @@ impl AgentInternal {
         );
 
         if let Some(p) = p {
+            // Roomler patch (observability, 2026-07-28): selection changes at
+            // WARN — the agent's default tracing filter uploads `warn`-level
+            // events from this target fleet-wide, so which path media rides
+            // (and every mid-session migration) becomes visible in the
+            // centralized logs instead of needing browser-side getStats
+            // forensics. One line per actual change, never per tick.
+            let prev = self.agent_conn.get_selected_pair();
+            let changed = prev
+                .as_ref()
+                .is_none_or(|o| !(o.local.equal(&*p.local) && o.remote.equal(&*p.remote)));
+            if changed {
+                log::warn!(
+                    "[{}]: selected pair changed: {} -> {}",
+                    self.get_name(),
+                    prev.as_ref()
+                        .map(|o| o.to_string())
+                        .unwrap_or_else(|| "(none)".to_owned()),
+                    p
+                );
+            }
             p.nominated.store(true, Ordering::SeqCst);
             self.agent_conn.selected_pair.store(Some(p));
 
