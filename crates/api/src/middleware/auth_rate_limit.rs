@@ -108,9 +108,9 @@ pub struct AuthRateLimitState {
 /// account rather than per address.
 ///
 /// Matches `LoginRequest`/`RegisterRequest`, which accept either a username
-/// or an email. Case-folded so `Alice` and `alice` share one budget. Requests
-/// with no account field (`/auth/refresh`) fall back to an empty account,
-/// which simply keys them on the address.
+/// or an email. Case-folded so `Alice` and `alice` share one budget. A body
+/// with no account field falls back to an empty account, which simply keys
+/// the request on the address.
 fn account_key(body: &Bytes) -> String {
     let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) else {
         return String::new();
