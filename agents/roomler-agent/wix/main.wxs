@@ -210,6 +210,40 @@
                                 DiskId='1'
                                 Source='target\release\wintun.dll' />
                         </Component>
+                        <!-- App-local Microsoft VC++ 2015-2022 x64 runtime
+                             (the full Microsoft.VC14x.CRT folder). The release
+                             roomlerd.exe links the CRT dynamically (its C++
+                             encoder objects; the vcpkg static-md policy keeps
+                             /MD), so a fresh Windows box without any VC++
+                             redistributable popped "vcruntime140_1.dll was
+                             not found" on the first daemon run (field report
+                             2026-07-28). The EXE dir is first in the DLL
+                             search path, so shipping the DLLs here makes the
+                             install self-contained for roomlerd.exe,
+                             roomler.exe AND the roomler-desktop companion
+                             placed beside them. Staged into target\release by
+                             the workflow's VC++ runtime step. One component
+                             for the whole set (the DLLs ship and upgrade as a
+                             unit); HKCU KeyPath like siblings (ICE38,
+                             user-profile dir). -->
+                        <Component Id='VcRedistCrt' Guid='F120B201-E45A-422D-80FE-A5C0B77AF8EC'>
+                            <RegistryValue
+                                Root='HKCU'
+                                Key='Software\Roomler\Agent'
+                                Name='installed_vcredist_crt'
+                                Type='integer'
+                                Value='1'
+                                KeyPath='yes' />
+                            <File Id='crt_concrt140' Name='concrt140.dll' DiskId='1' Source='target\release\concrt140.dll' />
+                            <File Id='crt_msvcp140' Name='msvcp140.dll' DiskId='1' Source='target\release\msvcp140.dll' />
+                            <File Id='crt_msvcp140_1' Name='msvcp140_1.dll' DiskId='1' Source='target\release\msvcp140_1.dll' />
+                            <File Id='crt_msvcp140_2' Name='msvcp140_2.dll' DiskId='1' Source='target\release\msvcp140_2.dll' />
+                            <File Id='crt_msvcp140_atomic_wait' Name='msvcp140_atomic_wait.dll' DiskId='1' Source='target\release\msvcp140_atomic_wait.dll' />
+                            <File Id='crt_msvcp140_codecvt_ids' Name='msvcp140_codecvt_ids.dll' DiskId='1' Source='target\release\msvcp140_codecvt_ids.dll' />
+                            <File Id='crt_vccorlib140' Name='vccorlib140.dll' DiskId='1' Source='target\release\vccorlib140.dll' />
+                            <File Id='crt_vcruntime140' Name='vcruntime140.dll' DiskId='1' Source='target\release\vcruntime140.dll' />
+                            <File Id='crt_vcruntime140_1' Name='vcruntime140_1.dll' DiskId='1' Source='target\release\vcruntime140_1.dll' />
+                        </Component>
                     </Directory>
                 </Directory>
             </Directory>
@@ -254,6 +288,7 @@
             <ComponentRef Id='LicenseTxt' />
             <ComponentRef Id='ReadmeTxt' />
             <ComponentRef Id='WintunDll' />
+            <ComponentRef Id='VcRedistCrt' />
             <ComponentRef Id='ApplicationShortcut' />
         </Feature>
 

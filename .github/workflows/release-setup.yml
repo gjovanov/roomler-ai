@@ -243,6 +243,15 @@ jobs:
           save-if: ${{ github.ref_type != 'tag' }}
       - name: Build wizard (release)
         shell: pwsh
+        # Static CRT: the wizard is a double-click EXE extracted from a
+        # zip onto arbitrary fresh machines -- it must not assume the
+        # MSVC runtime (vcruntime140*.dll) exists there (field report
+        # 2026-07-28: loader dialog on a box without the VC++ redist).
+        # The wizard graph is pure Rust (agent DEFAULT features, no
+        # vcpkg /MD libs), so +crt-static is safe; link-verified
+        # against the Tauri 2 stack.
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
         run: cargo build -p roomler-setup --release
       - name: Authenticode sign the wizard EXE
         # Sign BEFORE zipping so the zipped EXE the operator extracts is
