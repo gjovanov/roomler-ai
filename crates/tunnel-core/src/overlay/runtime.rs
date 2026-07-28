@@ -350,6 +350,7 @@ impl PathShadow {
             diverged = self.stats.diverged,
             harmful = self.stats.harmful,
             post_death_eligible = self.stats.post_death_eligible,
+            d10_redials = self.stats.d10_redials,
             classes = %self.stats.classes_line(),
             "overlay pathmon[shadow]: 10-min summary (soak gate: steady <0.1% diverged, harmful = 0)"
         );
@@ -2759,6 +2760,49 @@ impl OverlayRuntime {
                     });
                 }
             };
+            // P3 PR-C — ON mode: the monitor's decision is AUTHORITATIVE. It
+            // gates the legacy walk below instead of duplicating it: for a
+            // committed single-tier action only that tier stays dialable, so
+            // the same install/probe machinery executes exactly the monitor's
+            // choice; Keep/Relay clear every direct tier (fall through to
+            // relay / no-op). Two deliberate exemptions:
+            // * already-direct incumbents keep their dsts — the D10 re-dial
+            //   is execution-layer (dial-target freshness, not selection);
+            // * P9 probe-first fresh-LAN keeps ALL dsts — the walk needs the
+            //   LAN candidate for the probe AND the fallback tiers for the
+            //   working carrier, exactly like legacy.
+            // The legacy cooldown state keeps being written throughout (the
+            // shadow-revert safety rail); `record` still runs, so pilot
+            // volume shows in the summaries (compares are monitor-vs-monitor
+            // there — the fleet's shadow mode carries the real divergence
+            // telemetry until PR-D).
+            let pathmon_on = monitor_action.is_some()
+                && self
+                    .shadow(|s| s.mode == path::PathMonMode::On)
+                    .unwrap_or(false);
+            let (direct_dst, phase_a_dst, srflx_dst) = if pathmon_on {
+                match (incumbent, monitor_action) {
+                    (path::Incumbent::Direct(_), _) => (direct_dst, phase_a_dst, srflx_dst),
+                    (path::Incumbent::None, Some(path::PathAction::Probe(DirectTier::Lan))) => {
+                        (direct_dst, phase_a_dst, srflx_dst)
+                    }
+                    (_, Some(path::PathAction::Probe(DirectTier::Lan)))
+                    | (_, Some(path::PathAction::Install(DirectTier::Lan))) => {
+                        (direct_dst, None, None)
+                    }
+                    (_, Some(path::PathAction::Probe(DirectTier::Public)))
+                    | (_, Some(path::PathAction::Install(DirectTier::Public))) => {
+                        (None, phase_a_dst, None)
+                    }
+                    (_, Some(path::PathAction::Probe(DirectTier::Srflx)))
+                    | (_, Some(path::PathAction::Install(DirectTier::Srflx))) => {
+                        (None, None, srflx_dst)
+                    }
+                    _ => (None, None, None),
+                }
+            } else {
+                (direct_dst, phase_a_dst, srflx_dst)
+            };
             match installed {
                 Some((true, pk, tier, inst_dst)) => {
                     // D10 — a zombie srflx punch (installed but never handshook)
@@ -2773,10 +2817,12 @@ impl OverlayRuntime {
                         && let (Some(ctx), Some(fresh)) = (direct_ctx, srflx_dst)
                         && inst_dst != Some(fresh)
                     {
-                        record(
-                            "install_peers:d10",
-                            path::PathAction::Install(DirectTier::Srflx),
-                        );
+                        // P3 PR-C (soak #1 finding) — a D10 re-dial refreshes
+                        // the DIAL TARGET of the current tier (Srflx→Srflx),
+                        // so it is NOT a tier-selection event: counted, never
+                        // compared (PR-A's compare here produced 50+/host/45 h
+                        // of false "divergence"). Permanently execution-layer.
+                        self.shadow(|s| s.stats.d10_redials += 1);
                         info!(peer = %np.node_id, old = ?inst_dst, new = %fresh, "overlay: srflx changed under a pending punch — re-dialing fresh mapping");
                         wg.remove_peer(&pk).await;
                         self.install_srflx_direct(wg, by_node, tun, ctx, np.node_id, &cfg, fresh)
@@ -3526,7 +3572,20 @@ impl OverlayRuntime {
             DirectTier::Public => DirectCooldowns::cooling(&cooldowns.public, &node_id, now),
             _ => DirectCooldowns::cooling(&cooldowns.lan, &node_id, now),
         };
-        if cooling {
+        // P3 PR-C — ON mode: the monitor's inbound verdict is the gate (its
+        // penalty plane replaces the legacy cooldown check; D9 and the Q
+        // evidence were already fed inside `inbound_init`). The legacy
+        // cooldown state was still consulted above and keeps being written
+        // by the sweeps — the shadow-revert safety rail.
+        let refuse = match (
+            self.shadow(|s| s.mode == path::PathMonMode::On)
+                .unwrap_or(false),
+            monitor_inbound,
+        ) {
+            (true, Some(verdict)) => verdict.is_none(),
+            _ => cooling,
+        };
+        if refuse {
             record_inbound(None);
             return;
         }
@@ -4232,6 +4291,168 @@ mod tests {
         assert_eq!(path::LAN_PROBE_SPACING, DIRECT_COOLDOWN);
     }
 
+    /// P3 PR-C (soak #1 Class A) — ON mode: a FRESH peer with a probe already
+    /// in flight must NOT get a destructive direct install raced over the
+    /// probe (legacy did exactly that: a sweep death leaves `upgrade_probes`
+    /// dangling and the fresh walk ignored it, so a late promote could
+    /// clobber the fresh carrier); the monitor rides relay until the probe
+    /// settles. Shadow mode preserves the legacy behaviour bit-for-bit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn on_mode_fresh_with_probe_in_flight_rides_relay_not_installing() {
+        for (mode, expect_install) in [
+            (path::PathMonMode::On, false),
+            (path::PathMonMode::Shadow, true),
+        ] {
+            let kp = WgKeypair::generate();
+            let peer_kp = WgKeypair::generate();
+            let (out_tx, _out_rx) = mpsc::channel::<ClientMsg>(16);
+            let (tun_mock, _inj, _del) = MockTun::new();
+            let tf: TunFactory = {
+                let m = tun_mock.clone();
+                Box::new(move |_, _, _| Ok(m.clone() as Arc<dyn TunIo>))
+            };
+            let rt = OverlayRuntime::new_relay(kp.clone(), out_tx, tf, 1280);
+            rt.path_shadow.lock().unwrap().mode = mode;
+            let (mut wg, _tun_rx) = WgDevice::new(kp.secret.clone());
+            let tun: Arc<dyn TunIo> = tun_mock;
+            let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let my_ip: Ipv4Addr = "10.1.2.9".parse().unwrap();
+            let ctx = DirectCtx {
+                socks: vec![(my_ip, sock)],
+                my_ips: vec![my_ip],
+                endpoints: vec![],
+                public_sock: None,
+                punch: None,
+                my_nat: None,
+            };
+            let cooldowns = DirectCooldowns::default();
+            let mut relay: Option<RelayCoordinator> = None;
+            let mut by_node = HashMap::new();
+            let mut upgrade_probes = HashMap::new();
+            let mut lan_peer = peer(&peer_kp, "100.64.0.7");
+            lan_peer.lan_endpoints = vec!["10.1.2.3:1000".into()];
+
+            // The Class-A shape: a probe survives its peer's carrier death.
+            let probe_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            wg.start_direct_probe(
+                probe_sock,
+                peer_kp.public.to_bytes(),
+                "100.64.0.7".parse().unwrap(),
+                "127.0.0.1:9".parse().unwrap(),
+                false,
+            )
+            .await;
+            rt.path_shadow.lock().unwrap().mon.on_probe_started(
+                &lan_peer.node_id,
+                DirectTier::Srflx,
+                Instant::now(),
+            );
+
+            rt.install_peers(
+                &mut wg,
+                &mut by_node,
+                &mut relay,
+                &tun,
+                std::slice::from_ref(&lan_peer),
+                Some(&ctx),
+                &cooldowns,
+                &mut upgrade_probes,
+                &mut test_relay_bq(),
+                "test",
+            )
+            .await;
+            assert_eq!(
+                by_node.contains_key(&lan_peer.node_id),
+                expect_install,
+                "mode {mode:?}: fresh install while a probe is in flight"
+            );
+        }
+    }
+
+    /// P3 PR-C — ON mode: the upgrade arm probes only what the monitor holds
+    /// ELIGIBLE. A monitor-penalized LAN tier (its suppression plane — the
+    /// legacy cooldowns stay EMPTY here) yields Keep → no probe; shadow mode
+    /// still probes per legacy precedence, proving the gate flipped the
+    /// behaviour and nothing else.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn on_mode_upgrade_arm_respects_monitor_penalty() {
+        for (mode, expect_probe) in [
+            (path::PathMonMode::On, false),
+            (path::PathMonMode::Shadow, true),
+        ] {
+            let kp = WgKeypair::generate();
+            let peer_kp = WgKeypair::generate();
+            let (out_tx, _out_rx) = mpsc::channel::<ClientMsg>(16);
+            let (tun_mock, _inj, _del) = MockTun::new();
+            let tf: TunFactory = {
+                let m = tun_mock.clone();
+                Box::new(move |_, _, _| Ok(m.clone() as Arc<dyn TunIo>))
+            };
+            let rt = OverlayRuntime::new_relay(kp.clone(), out_tx, tf, 1280);
+            rt.path_shadow.lock().unwrap().mode = mode;
+            let (mut wg, _tun_rx) = WgDevice::new(kp.secret.clone());
+            let tun: Arc<dyn TunIo> = tun_mock;
+            let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let my_ip: Ipv4Addr = "10.1.2.9".parse().unwrap();
+            let ctx = DirectCtx {
+                socks: vec![(my_ip, sock)],
+                my_ips: vec![my_ip],
+                endpoints: vec![],
+                public_sock: None,
+                punch: None,
+                my_nat: None,
+            };
+            let cooldowns = DirectCooldowns::default();
+            let mut relay: Option<RelayCoordinator> = None;
+            let mut by_node = HashMap::new();
+            let mut upgrade_probes = HashMap::new();
+            let mut lan_peer = peer(&peer_kp, "100.64.0.7");
+            lan_peer.lan_endpoints = vec!["10.1.2.3:1000".into()];
+            by_node.insert(
+                lan_peer.node_id,
+                Installed {
+                    pubkey: peer_kp.public.to_bytes(),
+                    overlay_ip: "100.64.0.7".parse().unwrap(),
+                    is_direct: false,
+                    since: Instant::now(),
+                    last_traffic: (0, 0),
+                    bad_sweeps: 0,
+                    last_rx_at: Instant::now(),
+                    relay_local: None,
+                    relay_dst: None,
+                    public_direct_dst: None,
+                    tier: DirectTier::Relay,
+                },
+            );
+            rt.path_shadow.lock().unwrap().mon.on_death(
+                &lan_peer.node_id,
+                DirectTier::Lan,
+                DeathReason::HandshakeDeadline,
+                true,
+                Instant::now(),
+            );
+
+            rt.install_peers(
+                &mut wg,
+                &mut by_node,
+                &mut relay,
+                &tun,
+                std::slice::from_ref(&lan_peer),
+                Some(&ctx),
+                &cooldowns,
+                &mut upgrade_probes,
+                &mut test_relay_bq(),
+                "test",
+            )
+            .await;
+            assert_eq!(
+                upgrade_probes.contains_key(&lan_peer.node_id),
+                expect_probe,
+                "mode {mode:?}: upgrade probe against a monitor-penalized tier"
+            );
+        }
+    }
+
     /// P8 — with MBB on (the default), the LAN tier NEVER escalates to a
     /// deny: shadow probes are free, so the retry cadence stays fixed at the
     /// plain cooldown no matter the strike count; and the sticky threshold is
@@ -4713,9 +4934,13 @@ mod tests {
         );
         wg.test_latch_probe_handshake_done(&pk);
         let ms = wg.probe_handshake_latency_ms(&pk, since).expect("latched");
+        // PR-C — floor at 170, not 200: Windows quantizes Instant deltas to
+        // the ~15.6 ms timer resolution, so the 200 ms back-date can measure
+        // as low as ~185 (field-flaked on pristine master 2026-07-28).
         assert!(
-            (200..10_000).contains(&ms),
-            "latency runs from probe start (the back-dated since sets a ~200 ms floor), got {ms}"
+            (170..10_000).contains(&ms),
+            "latency runs from probe start (the back-dated since sets a ~200 ms floor, \
+             minus Windows timer quantization), got {ms}"
         );
     }
 
