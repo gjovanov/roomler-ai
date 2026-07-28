@@ -274,6 +274,7 @@ fn test_settings() -> Settings {
             num_workers: 1,
             listen_ip: "0.0.0.0".to_string(),
             announced_ip: "127.0.0.1".to_string(),
+            announced_ip_map: None,
             rtc_min_port: 40000,
             rtc_max_port: 40100,
         },

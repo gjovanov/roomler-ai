@@ -7,6 +7,11 @@ use tracing::{error, info, warn};
 
 const CHANNEL_NAME: &str = "roomler:ws";
 
+/// TTL on `roomler:online:<uid>` keys. Refreshed by each pod's 30 s
+/// heartbeat while the user has local connections — 3× headroom so a
+/// single missed beat (GC pause, Redis blip) doesn't flap presence.
+const ONLINE_TTL_SECS: u64 = 90;
+
 /// Manages Redis Pub/Sub for cross-instance WebSocket event distribution.
 ///
 /// Each application instance publishes WS events to a shared Redis channel.
@@ -59,6 +64,62 @@ impl RedisPubSub {
         let mut conn = self.publisher.clone();
         redis::cmd("PING").query_async::<String>(&mut conn).await?;
         Ok(())
+    }
+
+    // ── S6 cross-pod online registry ────────────────────────────────
+    //
+    // `WsStorage::is_connected` only sees THIS pod's sockets. With two
+    // pods, the offline-dedupe in `routes/helpers.rs` would push+email
+    // every user whose WS lives on the other pod. Each pod mirrors its
+    // local user set into Redis: one SET per user
+    // (`roomler:online:<uid>`) whose members are instance ids, with a
+    // key TTL refreshed by a 30 s heartbeat — so a crashed pod's
+    // entries age out within `ONLINE_TTL_SECS` instead of leaking
+    // forever. The registry is advisory (dedupe/UX), not authoritative
+    // presence: a ≤90 s stale window on pod crash is acceptable.
+
+    fn online_key(user_id_hex: &str) -> String {
+        format!("roomler:online:{user_id_hex}")
+    }
+
+    /// Mark a user online from this instance (idempotent) and refresh
+    /// the key's TTL.
+    pub async fn online_add(&self, user_id_hex: &str) -> Result<(), redis::RedisError> {
+        let mut conn = self.publisher.clone();
+        let key = Self::online_key(user_id_hex);
+        redis::pipe()
+            .cmd("SADD")
+            .arg(&key)
+            .arg(&self.instance_id)
+            .ignore()
+            .cmd("EXPIRE")
+            .arg(&key)
+            .arg(ONLINE_TTL_SECS)
+            .ignore()
+            .query_async::<()>(&mut conn)
+            .await
+    }
+
+    /// Remove this instance's membership when the user's LAST local
+    /// connection closes. Redis drops the set key automatically once
+    /// its final member is removed.
+    pub async fn online_remove(&self, user_id_hex: &str) -> Result<(), redis::RedisError> {
+        let mut conn = self.publisher.clone();
+        redis::cmd("SREM")
+            .arg(Self::online_key(user_id_hex))
+            .arg(&self.instance_id)
+            .query_async::<()>(&mut conn)
+            .await
+    }
+
+    /// Whether ANY instance currently claims this user online.
+    pub async fn online_anywhere(&self, user_id_hex: &str) -> Result<bool, redis::RedisError> {
+        let mut conn = self.publisher.clone();
+        let n: i64 = redis::cmd("EXISTS")
+            .arg(Self::online_key(user_id_hex))
+            .query_async(&mut conn)
+            .await?;
+        Ok(n > 0)
     }
 
     /// Spawn the subscriber task with reconnect-and-backoff. Before S0 a

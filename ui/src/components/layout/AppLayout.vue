@@ -247,7 +247,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useTheme, useDisplay } from 'vuetify'
 import { useAuth } from '@/composables/useAuth'
@@ -346,6 +346,15 @@ function joinCallFromSnackbar() {
 }
 
 const tenantId = computed(() => tenantStore.current?.id || '')
+
+// S6 — keep the WS's tenant-affinity key in sync with the active
+// tenant. The store redials the socket when it actually changes so the
+// front LB re-routes this session onto the tenant's pod.
+watch(
+  () => tenantStore.current?.id ?? null,
+  (tid) => wsStore.setTenantAffinity(tid),
+  { immediate: true },
+)
 
 const settingsRoute = computed(() =>
   tenantId.value ? `/tenant/${tenantId.value}/admin` : '/',

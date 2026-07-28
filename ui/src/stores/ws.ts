@@ -30,14 +30,57 @@ export const useWsStore = defineStore('ws', () => {
   type RcHandler = (msg: any) => void
   const rcHandlers = new Map<string, RcHandler>()
 
+  // S6 — tenant-affinity key. Carried as `tid=` on the WS URL so the
+  // front load-balancer hashes this connection onto the pod that owns
+  // the active tenant (rc-hub / tunnel-hub / mediasoup are pod-local).
+  // The server validates membership; other-tenant notifications still
+  // arrive via the Redis fan-out, so a multi-tenant user loses nothing.
+  let affinityTid: string | null = null
+  let lastToken: string | null = null
+
+  function wsUrl(token: string): string {
+    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
+    // In dev mode, connect directly to the API server to bypass Vite proxy (which doesn't relay WS frames)
+    const wsHost = import.meta.env.DEV ? 'localhost:5001' : location.host
+    const tidParam = affinityTid ? `&tid=${affinityTid}` : ''
+    return `${protocol}//${wsHost}/ws?token=${token}${tidParam}`
+  }
+
+  /**
+   * Set (or clear) the tenant-affinity key. When it actually changes
+   * while a socket is live, the connection re-dials immediately so the
+   * LB can re-route it. Deliberately NOT `disconnect()` — that would
+   * wipe the rc/media handler registrations that outlive a reconnect;
+   * this path mirrors a transient drop instead (handlers intact).
+   */
+  function setTenantAffinity(tid: string | null) {
+    if (tid === affinityTid) return
+    affinityTid = tid
+    if (socket && socket.readyState <= WebSocket.OPEN && lastToken) {
+      const token = lastToken
+      const old = socket
+      // This close is intentional — detach the handlers so the normal
+      // onclose auto-reconnect (3 s) doesn't race our immediate redial.
+      old.onclose = null
+      old.onmessage = null
+      old.onerror = null
+      socket = null
+      cleanup()
+      try {
+        old.close()
+      } catch {
+        /* ignore */
+      }
+      connect(token)
+    }
+  }
+
   function connect(token: string) {
     if (socket && socket.readyState <= WebSocket.OPEN) return
 
     status.value = 'connecting'
-    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
-    // In dev mode, connect directly to the API server to bypass Vite proxy (which doesn't relay WS frames)
-    const wsHost = import.meta.env.DEV ? 'localhost:5001' : location.host
-    socket = new WebSocket(`${protocol}//${wsHost}/ws?token=${token}`)
+    lastToken = token
+    socket = new WebSocket(wsUrl(token))
 
     socket.onopen = () => {
       status.value = 'connected'
@@ -251,6 +294,7 @@ export const useWsStore = defineStore('ws', () => {
     status,
     connect,
     disconnect,
+    setTenantAffinity,
     send,
     sendRaw,
     sendTyping,
