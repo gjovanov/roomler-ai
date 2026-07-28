@@ -116,6 +116,11 @@ pub fn codec_rate_factor_pct(codec_label: &str) -> usize {
     let builtin: usize = match codec_label {
         "H264" => 150,
         "HEVC" => 125,
+        // VP9 (vp9_qsv 4:2:0 HW) joins HEVC at 125 (2026-07-28 field: same
+        // realtime-preset starvation class vs the H264 band; AV1 stays 100 —
+        // its realtime efficiency is genuinely better and no field signal
+        // says otherwise yet).
+        "VP9" => 125,
         _ => 100,
     };
     match tunnel_core::env::node_env(&format!("RATE_FACTOR_{codec_label}")) {
@@ -313,7 +318,7 @@ mod tests {
         // Built-in matrix (2026-07-28: HEVC 100 → 125, field-measured).
         assert_eq!(codec_rate_factor_pct("H264"), 150);
         assert_eq!(codec_rate_factor_pct("HEVC"), 125);
-        assert_eq!(codec_rate_factor_pct("VP9"), 100);
+        assert_eq!(codec_rate_factor_pct("VP9"), 125);
         assert_eq!(codec_rate_factor_pct("AV1"), 100);
 
         // SAFETY: no other test in this crate touches these vars (set_var
