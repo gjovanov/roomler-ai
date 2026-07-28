@@ -48,7 +48,7 @@ fn overlay_host_priority_override(ip: &std::net::IpAddr, component: u16) -> u32 
 /// The Roomler overlay addresses: CGNAT 100.64.0.0/10 (v4) and the mesh ULA
 /// fd72:6f6f:6d6c::/48 (v6). Matching by range (not interface name) keeps the
 /// check OS-independent and immune to adapter renames.
-fn is_roomler_overlay_ip(ip: &std::net::IpAddr) -> bool {
+pub(crate) fn is_roomler_overlay_ip(ip: &std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => {
             let o = v4.octets();
