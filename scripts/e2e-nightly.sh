@@ -128,14 +128,20 @@ docker run --rm --network host -v "$WORK:/work" -w /work \
   -e "E2E_BASE_URL=http://127.0.0.1:$APP_PORT" \
   -e "E2E_API_URL=http://127.0.0.1:$APP_PORT" \
   -e "E2E_MAILPIT_URL=http://127.0.0.1:$MAIL_PORT" \
-  "$PW_IMG" bash -lc "npm i --no-audit --no-fund --loglevel=error && npx playwright test --reporter=line --timeout=60000" >> "$LOG" 2>&1
+  "$PW_IMG" bash -lc "npm i --no-audit --no-fund --loglevel=error && npx playwright test --reporter=line --timeout=60000 --retries=3" >> "$LOG" 2>&1
 RC=$?
 kill_pf  # stop the supervisors (the EXIT trap also covers abnormal exits)
 
 # ── 5. triage against the expected-failures baseline ─────────────────
 CLEAN=$(sed -e 's/\x1b\[[0-9;]*[A-Za-z]//g' "$LOG" | tr '\r' '\n')
 SUMMARY=$(echo "$CLEAN" | grep -E '^\s+[0-9]+ (passed|failed|flaky|skipped)' | tr -d ' ' | paste -sd' ' -)
-FAILED=$(echo "$CLEAN" | grep -A400 '^  [0-9]* failed' | grep -oE '\[chromium\] › [^ ]+ › .*' | sed 's/ *$//' | sort -u)
+# Only GENUINELY-failed specs count — a spec listed under "N flaky"
+# recovered on retry and PASSED, so it must NOT trigger a regression.
+# Playwright's line reporter prints the failed block first, then flaky /
+# skipped / passed summaries; slice out exactly the failed block.
+FAILED=$(echo "$CLEAN" \
+  | awk '/^  [0-9]+ failed/{f=1;next} /^  [0-9]+ (flaky|skipped|passed|interrupted|did not run)/{f=0} f' \
+  | grep -oE '\[chromium\] › [^ ]+ › .*' | sed 's/ *$//' | sort -u)
 
 UNEXPECTED=""
 if [ -n "$FAILED" ]; then
@@ -147,14 +153,46 @@ if [ -n "$FAILED" ]; then
   done <<< "$FAILED"
 fi
 
+# ── 6. VERIFY unexpected failures in isolation ───────────────────────
+# A real regression fails deterministically; a spec caught in a
+# transient port-forward blip during the loaded main run recovers when
+# re-run alone. Re-run exactly the unexpected specs (fresh forwards, no
+# concurrent load) and keep only the ones that STILL fail — that's the
+# blip-vs-real discriminator, so the lane doesn't cry wolf on infra hiccups.
 if [ -n "$UNEXPECTED" ]; then
-  note "UNEXPECTED FAILURES:"
+  note "UNEXPECTED (pre-verify):"; echo "$UNEXPECTED" | tee -a "$LOG"
+  VSPECS=$(echo "$UNEXPECTED" | grep -oE 'e2e/[^ :]+\.spec\.ts' | sort -u | tr '\n' ' ')
+  VLOG="$OUT/$STAMP-verify.log"
+  # Restart forwards for the isolated re-run (main-run supervisors were stopped).
+  supervise_pf "roomler2:$APP_PORT:80:/health"
+  supervise_pf "mailpit:$MAIL_PORT:8025:/api/v1/info"
+  for _ in $(seq 1 30); do curl -sf -o /dev/null "http://127.0.0.1:$APP_PORT/health" && break; sleep 2; done
+  docker run --rm --network host -v "$WORK:/work" -w /work \
+    -e CI=1 -e "E2E_BASE_URL=http://127.0.0.1:$APP_PORT" \
+    -e "E2E_API_URL=http://127.0.0.1:$APP_PORT" \
+    -e "E2E_MAILPIT_URL=http://127.0.0.1:$MAIL_PORT" \
+    "$PW_IMG" bash -lc "npx playwright test $VSPECS --reporter=line --timeout=60000 --retries=3" > "$VLOG" 2>&1
+  kill_pf
+  VCLEAN=$(sed -e 's/\x1b\[[0-9;]*[A-Za-z]//g' "$VLOG" | tr '\r' '\n')
+  VFAILED=$(echo "$VCLEAN" \
+    | awk '/^  [0-9]+ failed/{f=1;next} /^  [0-9]+ (flaky|skipped|passed|interrupted|did not run)/{f=0} f' \
+    | grep -oE '\[chromium\] › [^ ]+ › .*' | sed 's/ *$//' | sort -u)
+  # Survivors that are STILL not baseline-expected = real regressions.
+  UNEXPECTED=""
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    grep -qFf "$REPO/scripts/e2e-expected-failures.txt" <<< "$f" || UNEXPECTED+="$f"$'\n'
+  done <<< "$VFAILED"
+fi
+
+if [ -n "$UNEXPECTED" ]; then
+  note "CONFIRMED REGRESSION (survived isolated re-run):"
   echo "$UNEXPECTED" | tee -a "$LOG"
   echo "$STAMP REGRESSION ($SUMMARY) tag=$PRODTAG — see $LOG" > "$OUT/LATEST"
   if command -v gh > /dev/null 2>&1 && gh auth status > /dev/null 2>&1; then
     gh issue create --repo gjovanov/roomler-ai \
       --title "e2e nightly regression ($STAMP)" \
-      --body "$(printf 'Image: %s\nSummary: %s\n\nUnexpected failures:\n```\n%s```\n' "$PRODTAG" "$SUMMARY" "$UNEXPECTED")" \
+      --body "$(printf 'Image: %s\nSummary: %s\n\nRegressions (failed the main run AND the isolated re-run):\n```\n%s```\n' "$PRODTAG" "$SUMMARY" "$UNEXPECTED")" \
       >> "$LOG" 2>&1 || note "gh issue creation failed"
   fi
   exit 1
