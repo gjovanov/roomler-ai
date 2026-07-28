@@ -681,7 +681,18 @@ impl WgDevice {
         stats: Arc<PeerStats>,
     ) {
         let mut g = self.send.0.write().unwrap();
-        g.router.upsert(overlay_ip, peer_public);
+        if let Some(prev) = g.router.upsert(overlay_ip, peer_public) {
+            // Expected once, right after the server recycled a removed device's
+            // address to a new machine and we haven't reaped the old peer yet.
+            // If it repeats, two live peers are claiming one overlay address.
+            let short = |k: &[u8; 32]| format!("{:02x}{:02x}{:02x}{:02x}", k[0], k[1], k[2], k[3]);
+            tracing::warn!(
+                %overlay_ip,
+                prev = %short(&prev),
+                now = %short(&peer_public),
+                "overlay: overlay IP reassigned to a different peer"
+            );
+        }
         g.peers.insert(
             peer_public,
             SendPeer {
@@ -695,9 +706,13 @@ impl WgDevice {
     /// P1 (S6) — remove a peer's send triple + host route (+ clear the
     /// v6-exit pin if it pointed at this peer), under one write lock. The
     /// second mutation choke point (see [`send_install`]).
-    fn send_uninstall(&mut self, peer_public: &[u8; 32], overlay_ip: &Ipv4Addr) {
+    ///
+    /// Routes are dropped BY PUBKEY, not by the peer's address: overlay IPs are
+    /// recycled between machines, so `by_ip[overlay_ip]` may already belong to
+    /// the address's new owner by the time this peer is reaped.
+    fn send_uninstall(&mut self, peer_public: &[u8; 32]) {
         let mut g = self.send.0.write().unwrap();
-        g.router.remove(overlay_ip);
+        g.router.remove_by_pubkey(peer_public);
         g.peers.remove(peer_public);
         // P5/S3b — if this was the global-v6 exit peer, stop routing v6 to a
         // now-dead pubkey (defensive; the reconcile re-asserts on its next
@@ -1149,6 +1164,13 @@ impl WgDevice {
         self.probes.len()
     }
 
+    /// Which peer the crypto-router currently resolves `ip` to — so the
+    /// recycled-address tests can assert the routing table directly.
+    #[cfg(test)]
+    pub fn test_route(&self, ip: &Ipv4Addr) -> Option<[u8; 32]> {
+        self.send.0.read().unwrap().router.route(ip)
+    }
+
     /// Remove a peer (drops its `Tunn` + aborts its tasks + clears its
     /// route). Used when the netmap drops a peer (ACL change / leave) or to
     /// re-install it with a different carrier (relay→direct upgrade, rc.134).
@@ -1156,7 +1178,7 @@ impl WgDevice {
     /// routing table.
     pub async fn remove_peer(&mut self, peer_public: &[u8; 32]) {
         if let Some(p) = self.peers.remove(peer_public) {
-            self.send_uninstall(peer_public, &p.overlay_ip);
+            self.send_uninstall(peer_public);
             self.debug_assert_send_synced();
             if let (Some(src), Some(demux)) = (p.direct_src, &self.direct) {
                 demux.routes.lock().await.remove(&src);
