@@ -203,10 +203,13 @@
                          install self-contained for roomlerd.exe, roomler.exe
                          AND the roomler-desktop companion placed beside
                          them. Staged into target\release by the workflow's
-                         VC++ runtime step. One component for the whole set;
-                         Guid='*' keyed off msvcp140.dll like the WintunDll
-                         pattern. -->
-                    <Component Id='VcRedistCrt' Guid='*' Win64='yes'>
+                         VC++ runtime step. One component for the whole set,
+                         keyed off msvcp140.dll. NB the GUID must be EXPLICIT:
+                         Guid='*' is only legal on multi-file components when
+                         every non-keypath file is unversioned, and all nine
+                         CRT DLLs carry versions (light fails with LGHT0368
+                         otherwise; burned the first rc.266 tag run). -->
+                    <Component Id='VcRedistCrt' Guid='6CB601C1-A505-49D9-97D9-C3015DDCF990' Win64='yes'>
                         <File Id='crt_msvcp140' Name='msvcp140.dll' DiskId='1' KeyPath='yes' Source='target\release\msvcp140.dll' />
                         <File Id='crt_concrt140' Name='concrt140.dll' DiskId='1' Source='target\release\concrt140.dll' />
                         <File Id='crt_msvcp140_1' Name='msvcp140_1.dll' DiskId='1' Source='target\release\msvcp140_1.dll' />
