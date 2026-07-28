@@ -2006,7 +2006,7 @@ impl OverlayRuntime {
                     let t0 = Instant::now();
                     self.sweep_upgrade_probes(
                         &mut wg, &mut by_node, &mut relay, &tun,
-                        &mut upgrade_probes, &mut cooldowns,
+                        &mut upgrade_probes, &mut cooldowns, &mut relay_bq,
                     ).await;
                     warn_if_slow("sweep_upgrade_probes", t0);
                     // D8 — periodic direct re-upgrade (~every 6th tick ≈ 30 s).
@@ -2694,6 +2694,14 @@ impl OverlayRuntime {
         // tearing the relay down speculatively. Read once per call.
         let make_before_break = super::direct::make_before_break_enabled();
         for np in peers {
+            // P9 — presence: never dial / probe / relay-request a peer the
+            // server marked unreachable (ghost enrollment, stale heartbeat,
+            // clean leave). An already-installed carrier is left alone — the
+            // data plane outlives a control-plane hiccup and the health sweep
+            // owns its lifecycle; removal still arrives via the leave delta.
+            if !np.reachable {
+                continue;
+            }
             let Some(cfg) = peer_config_from_netmap(np) else {
                 continue;
             };
@@ -2925,7 +2933,60 @@ impl OverlayRuntime {
                     .await;
                 }
                 CarrierMode::Relay => {
-                    if let (Some(ctx), Some((local_ip, dst))) = (direct_ctx, direct_dst) {
+                    // P9 — fresh-install LAN is PROBE-FIRST under make-before-
+                    // break: a same-/24 match is only a HINT the peer is on
+                    // this LAN. Two sites on a vendor-default subnet
+                    // (192.168.68.0/24 Deco, 192.168.1.0/24 …) false-match, and
+                    // the "same subnet" dial is then dead air — field
+                    // 2026-07-28: corp peers advertised another city's
+                    // 192.168.68.x and every fresh install burned the 12 s LAN
+                    // deadline with NO carrier, repeatedly. So: shadow-probe
+                    // the LAN candidate and keep walking the fallback chain
+                    // (public → srflx → relay) for the working carrier in the
+                    // SAME pass; `sweep_upgrade_probes` cuts over the moment
+                    // the probe latches (ms on a genuine LAN) and books CC1 if
+                    // it never does. The destructive install remains when
+                    // nothing else is dialable (airgapped pure-LAN mesh — a
+                    // wrong guess costs nothing there) and when MBB is
+                    // env-disabled.
+                    let lan_probe_first = make_before_break
+                        && direct_dst.is_some()
+                        && (phase_a_dst.is_some() || srflx_dst.is_some() || relay.is_some());
+                    let mut lan_probing = false;
+                    if lan_probe_first {
+                        if wg.has_direct_probe(&cfg.public_key) {
+                            // In flight from an earlier pass — walk the
+                            // fallback chain quietly (the monitor holds Keep
+                            // while a probe runs; no compare on this pass).
+                            lan_probing = true;
+                        } else if let (Some(ctx), Some((local_ip, dst))) = (direct_ctx, direct_dst)
+                            && let Some(sock) = ctx
+                                .socks
+                                .iter()
+                                .find(|(ip, _)| *ip == local_ip)
+                                .map(|(_, s)| s.clone())
+                        {
+                            record(
+                                "install_peers:fresh",
+                                path::PathAction::Probe(DirectTier::Lan),
+                            );
+                            self.start_upgrade_probe(
+                                wg,
+                                upgrade_probes,
+                                np.node_id,
+                                &cfg,
+                                sock,
+                                dst,
+                                DirectTier::Lan,
+                                now,
+                            )
+                            .await;
+                            lan_probing = true;
+                        }
+                    }
+                    if !lan_probing
+                        && let (Some(ctx), Some((local_ip, dst))) = (direct_ctx, direct_dst)
+                    {
                         record(
                             "install_peers:fresh",
                             path::PathAction::Install(DirectTier::Lan),
@@ -2942,10 +3003,12 @@ impl OverlayRuntime {
                         self.install_direct(wg, by_node, tun, ctx, np.node_id, &cfg, local_ip, dst)
                             .await;
                     } else if let (Some(ctx), Some(dst)) = (direct_ctx, phase_a_dst) {
-                        record(
-                            "install_peers:fresh",
-                            path::PathAction::Install(DirectTier::Public),
-                        );
+                        if !lan_probing {
+                            record(
+                                "install_peers:fresh",
+                                path::PathAction::Install(DirectTier::Public),
+                            );
+                        }
                         // Phase A — peer's NIC is public: dial it directly, skip
                         // the relay. Same forget-the-pending-relay guard.
                         if let Some(r) = relay.as_mut() {
@@ -2957,10 +3020,12 @@ impl OverlayRuntime {
                         self.install_public_direct(wg, by_node, tun, ctx, np.node_id, &cfg, dst)
                             .await;
                     } else if let (Some(ctx), Some(dst)) = (direct_ctx, srflx_dst) {
-                        record(
-                            "install_peers:fresh",
-                            path::PathAction::Install(DirectTier::Srflx),
-                        );
+                        if !lan_probing {
+                            record(
+                                "install_peers:fresh",
+                                path::PathAction::Install(DirectTier::Srflx),
+                            );
+                        }
                         // Phase C — both NAT'd: hole-punch the peer's srflx from
                         // the punch socket, skip the relay.
                         if let Some(r) = relay.as_mut() {
@@ -2975,7 +3040,9 @@ impl OverlayRuntime {
                         // P3 PR-A — every sub-case below (mid-build, complete,
                         // request, tracking) is the same decision: the relay
                         // tier carries this peer.
-                        record("install_peers:fresh", path::PathAction::Relay);
+                        if !lan_probing {
+                            record("install_peers:fresh", path::PathAction::Relay);
+                        }
                         // rc.211 — a carrier for this peer is mid-BUILD off-loop:
                         // post-`try_build` the coordinator no longer tracks it, so
                         // without this guard `!is_tracking` would re-`request` a
@@ -3049,6 +3116,7 @@ impl OverlayRuntime {
     /// DROP it (keep the relay, book a tier failure — CC1, like the health
     /// sweep's fallback). The active carrier never stalls either way. No-op when
     /// no probes are in flight.
+    #[allow(clippy::too_many_arguments)]
     async fn sweep_upgrade_probes(
         &self,
         wg: &mut WgDevice,
@@ -3057,6 +3125,7 @@ impl OverlayRuntime {
         tun: &Arc<dyn TunIo>,
         upgrade_probes: &mut HashMap<ObjectId, UpgradeProbe>,
         cooldowns: &mut DirectCooldowns,
+        relay_bq: &mut RelayBuildQueue,
     ) {
         if upgrade_probes.is_empty() {
             return;
@@ -3101,6 +3170,11 @@ impl OverlayRuntime {
                     if let Some(r) = relay.as_mut() {
                         r.forget(nid);
                     }
+                    // P9 — a fresh-install LAN probe can latch while the
+                    // fallback relay build is still in flight; drop that build
+                    // so its late completion can't clobber the direct carrier
+                    // (same rc.211 rule as the destructive installs).
+                    relay_bq.invalidate(nid);
                     let off_link = matches!(p.tier, DirectTier::Public | DirectTier::Srflx);
                     by_node.insert(
                         *nid,
@@ -4602,6 +4676,7 @@ mod tests {
             &tun,
             &mut upgrade_probes,
             &mut cooldowns,
+            &mut test_relay_bq(),
         )
         .await;
 
@@ -4668,6 +4743,7 @@ mod tests {
             &tun,
             &mut upgrade_probes,
             &mut cooldowns,
+            &mut test_relay_bq(),
         )
         .await;
 
@@ -4704,6 +4780,7 @@ mod tests {
             &tun,
             &mut upgrade_probes,
             &mut cooldowns,
+            &mut test_relay_bq(),
         )
         .await;
 
@@ -5102,6 +5179,151 @@ mod tests {
             .expect("the pure-bucket LAN candidate installs a LAN carrier");
         assert_eq!(inst.tier, DirectTier::Lan);
         assert!(inst.is_direct);
+    }
+
+    /// P9 — a FRESH peer with a same-/24 candidate must NOT install the
+    /// unproven LAN carrier destructively when a fallback tier exists: a
+    /// false-subnet match (vendor-default /24s collide across sites) otherwise
+    /// burns the whole LAN handshake deadline with NO carrier at all, on every
+    /// retry (field 2026-07-28). The LAN candidate becomes a shadow PROBE and
+    /// the working carrier comes from the fallback walk (here: srflx) in the
+    /// SAME pass. The airgap case (nothing else dialable, `relay = None`) in
+    /// `lan_tier_scans_only_the_pure_lan_endpoint_bucket` keeps the
+    /// destructive install.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fresh_lan_probes_first_when_fallback_exists() {
+        let kp = WgKeypair::generate();
+        let peer_kp = WgKeypair::generate();
+        let (out_tx, _out_rx) = mpsc::channel::<ClientMsg>(16);
+        let (tun_mock, _inj, _del) = MockTun::new();
+        let tf: TunFactory = {
+            let m = tun_mock.clone();
+            Box::new(move |_, _, _| Ok(m.clone() as Arc<dyn TunIo>))
+        };
+        let rt = OverlayRuntime::new_relay(kp.clone(), out_tx, tf, 1280);
+        let (mut wg, _tun_rx) = WgDevice::new(kp.secret.clone());
+        let tun: Arc<dyn TunIo> = tun_mock;
+
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let punch_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let my_ip: Ipv4Addr = "10.1.2.9".parse().unwrap();
+        let ctx = DirectCtx {
+            socks: vec![(my_ip, sock)],
+            my_ips: vec![my_ip],
+            endpoints: vec!["10.1.2.9:41000".into()],
+            public_sock: None,
+            punch: Some(("93.184.216.90:5555".into(), punch_sock)),
+            my_nat: None,
+        };
+        let cooldowns = DirectCooldowns::default();
+        let mut relay: Option<RelayCoordinator> = None;
+        let mut by_node = HashMap::new();
+        let mut upgrade_probes = HashMap::new();
+
+        // Same-/24 LAN candidate (possibly a false match) + a srflx fallback.
+        let mut p = peer(&peer_kp, "100.64.0.7");
+        p.lan_endpoints = vec!["10.1.2.3:1000".into()];
+        p.srflx_endpoints = vec!["93.184.216.34:4444".into()];
+        rt.install_peers(
+            &mut wg,
+            &mut by_node,
+            &mut relay,
+            &tun,
+            std::slice::from_ref(&p),
+            Some(&ctx),
+            &cooldowns,
+            &mut upgrade_probes,
+            &mut test_relay_bq(),
+            "test",
+        )
+        .await;
+
+        let probe = upgrade_probes
+            .get(&p.node_id)
+            .expect("the LAN candidate is a shadow probe, not the carrier");
+        assert_eq!(probe.tier, DirectTier::Lan);
+        assert_eq!(probe.dst.to_string(), "10.1.2.3:1000");
+        assert_eq!(wg.probe_count(), 1, "one shadow probe in flight");
+        let inst = by_node
+            .get(&p.node_id)
+            .expect("the working carrier comes from the fallback walk");
+        assert_eq!(
+            inst.tier,
+            DirectTier::Srflx,
+            "srflx fallback carries while the LAN probe runs"
+        );
+        assert!(inst.is_direct);
+
+        // A second pass with the probe in flight must not duplicate it.
+        rt.install_peers(
+            &mut wg,
+            &mut by_node,
+            &mut relay,
+            &tun,
+            std::slice::from_ref(&p),
+            Some(&ctx),
+            &cooldowns,
+            &mut upgrade_probes,
+            &mut test_relay_bq(),
+            "test",
+        )
+        .await;
+        assert_eq!(wg.probe_count(), 1, "no duplicate probe on re-entry");
+    }
+
+    /// P9 — a peer the server marked `reachable = false` (ghost enrollment /
+    /// stale heartbeat / clean leave) is never dialed: no carrier install, no
+    /// shadow probe, no relay request — even with perfectly dialable
+    /// candidates on the row.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unreachable_peer_is_never_dialed() {
+        let kp = WgKeypair::generate();
+        let peer_kp = WgKeypair::generate();
+        let (out_tx, _out_rx) = mpsc::channel::<ClientMsg>(16);
+        let (tun_mock, _inj, _del) = MockTun::new();
+        let tf: TunFactory = {
+            let m = tun_mock.clone();
+            Box::new(move |_, _, _| Ok(m.clone() as Arc<dyn TunIo>))
+        };
+        let rt = OverlayRuntime::new_relay(kp.clone(), out_tx, tf, 1280);
+        let (mut wg, _tun_rx) = WgDevice::new(kp.secret.clone());
+        let tun: Arc<dyn TunIo> = tun_mock;
+
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let my_ip: Ipv4Addr = "10.1.2.9".parse().unwrap();
+        let ctx = DirectCtx {
+            socks: vec![(my_ip, sock)],
+            my_ips: vec![my_ip],
+            endpoints: vec!["10.1.2.9:41000".into()],
+            public_sock: None,
+            punch: None,
+            my_nat: None,
+        };
+        let cooldowns = DirectCooldowns::default();
+        let mut relay: Option<RelayCoordinator> = None;
+        let mut by_node = HashMap::new();
+        let mut upgrade_probes = HashMap::new();
+
+        let mut p = peer(&peer_kp, "100.64.0.9");
+        p.lan_endpoints = vec!["10.1.2.3:1000".into()];
+        p.reachable = false;
+        rt.install_peers(
+            &mut wg,
+            &mut by_node,
+            &mut relay,
+            &tun,
+            std::slice::from_ref(&p),
+            Some(&ctx),
+            &cooldowns,
+            &mut upgrade_probes,
+            &mut test_relay_bq(),
+            "test",
+        )
+        .await;
+
+        assert!(by_node.is_empty(), "no carrier for an unreachable peer");
+        assert!(upgrade_probes.is_empty(), "no shadow probe either");
+        assert_eq!(wg.probe_count(), 0);
     }
 
     /// Minimal STUN Binding Success carrying an XOR-MAPPED-ADDRESS (IPv4), so a
