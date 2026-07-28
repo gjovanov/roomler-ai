@@ -112,6 +112,46 @@ const KEYS: &[(&str, &str, &str)] = &[
         "Disable centralized diagnostic-log upload. Built-in default: uploads on.",
     ),
     (
+        "rate_factor_h264",
+        "string",
+        "H.264 maxrate ceiling factor, % (50-400). Env: ROOMLER_NODE_RATE_FACTOR_H264. Empty = built-in 150. Restart required.",
+    ),
+    (
+        "rate_factor_hevc",
+        "string",
+        "HEVC maxrate ceiling factor, % (50-400). Env: ROOMLER_NODE_RATE_FACTOR_HEVC. Empty = built-in 125. Restart required.",
+    ),
+    (
+        "rate_factor_vp9",
+        "string",
+        "VP9 maxrate ceiling factor, % (50-400). Env: ROOMLER_NODE_RATE_FACTOR_VP9. Empty = built-in 100. Restart required.",
+    ),
+    (
+        "rate_factor_av1",
+        "string",
+        "AV1 maxrate ceiling factor, % (50-400). Env: ROOMLER_NODE_RATE_FACTOR_AV1. Empty = built-in 100. Restart required.",
+    ),
+    (
+        "ice_follow_renomination",
+        "enum:auto|always|never",
+        "Media-ICE nomination-follow policy. auto (empty) = upward-only + stale-failover (recommended); always = legacy follow-everything (thrash-prone, diagnostics only); never = pin to first nomination. Env: ROOMLER_ICE_FOLLOW_RENOMINATION.",
+    ),
+    (
+        "ice_warm_standby",
+        "tribool",
+        "Keepalive pings on validated-but-unselected media ICE pairs (keeps the real-path fallback's NAT mapping alive). Built-in default: on. Env: ROOMLER_ICE_WARM_STANDBY.",
+    ),
+    (
+        "ice_overlay_host_deprioritize",
+        "tribool",
+        "Rank overlay-TUN host candidates below srflx in media ICE (media prefers the real path). Built-in default: on. Env: ROOMLER_ICE_OVERLAY_HOST_DEPRIORITIZE.",
+    ),
+    (
+        "overlay_tier_detect",
+        "tribool",
+        "Clamp media bitrate when the overlay carrier under a nominated pair is relay-tier. Built-in default: on. Env: ROOMLER_NODE_OVERLAY_TIER_DETECT.",
+    ),
+    (
         "forward_acl",
         "json",
         "Agent-side allowlist for tunnel forwards (JSON: {\"enabled\": bool, \"allowlist\": [...]}).",
@@ -176,6 +216,16 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "dns_aaaa" => cfg.dns_aaaa.map(fmt_bool),
         "auto_update" => cfg.auto_update.map(fmt_bool),
         "logs_upload_disabled" => cfg.logs_upload_disabled.map(fmt_bool),
+        "rate_factor_h264" => cfg.rate_factor_h264.map(|p| p.to_string()),
+        "rate_factor_hevc" => cfg.rate_factor_hevc.map(|p| p.to_string()),
+        "rate_factor_vp9" => cfg.rate_factor_vp9.map(|p| p.to_string()),
+        "rate_factor_av1" => cfg.rate_factor_av1.map(|p| p.to_string()),
+        "ice_follow_renomination" => cfg
+            .ice_follow_renomination
+            .map(|b| if b { "always" } else { "never" }.to_string()),
+        "ice_warm_standby" => cfg.ice_warm_standby.map(fmt_bool),
+        "ice_overlay_host_deprioritize" => cfg.ice_overlay_host_deprioritize.map(fmt_bool),
+        "overlay_tier_detect" => cfg.overlay_tier_detect.map(fmt_bool),
         "forward_acl" => serde_json::to_string(&cfg.forward_acl).ok(),
         "virtual_desktop_apps" => serde_json::to_string(&cfg.virtual_desktop_apps).ok(),
         _ => None,
@@ -237,6 +287,28 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "dns_aaaa" => cfg.dns_aaaa = parse_tribool(value)?,
         "auto_update" => cfg.auto_update = parse_tribool(value)?,
         "logs_upload_disabled" => cfg.logs_upload_disabled = parse_tribool(value)?,
+        "rate_factor_h264" => cfg.rate_factor_h264 = parse_rate_factor(key, value)?,
+        "rate_factor_hevc" => cfg.rate_factor_hevc = parse_rate_factor(key, value)?,
+        "rate_factor_vp9" => cfg.rate_factor_vp9 = parse_rate_factor(key, value)?,
+        "rate_factor_av1" => cfg.rate_factor_av1 = parse_rate_factor(key, value)?,
+        "ice_follow_renomination" => {
+            cfg.ice_follow_renomination =
+                match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+                    None | Some("") | Some("auto") => None,
+                    Some("always") => Some(true),
+                    Some("never") => Some(false),
+                    Some(other) => {
+                        return Err(format!(
+                            "ice_follow_renomination must be auto|always|never (got {other:?})"
+                        ));
+                    }
+                }
+        }
+        "ice_warm_standby" => cfg.ice_warm_standby = parse_tribool(value)?,
+        "ice_overlay_host_deprioritize" => {
+            cfg.ice_overlay_host_deprioritize = parse_tribool(value)?
+        }
+        "overlay_tier_detect" => cfg.overlay_tier_detect = parse_tribool(value)?,
         "forward_acl" => {
             cfg.forward_acl = match value.map(str::trim).filter(|s| !s.is_empty()) {
                 None => Default::default(),
@@ -254,6 +326,23 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         other => return Err(format!("unknown or non-editable config key {other:?}")),
     }
     Ok(())
+}
+
+/// Shared parse/validate for the four `rate_factor_*` keys: empty clears
+/// (built-in applies), numeric must be 50–400 %.
+fn parse_rate_factor(key: &str, value: Option<&str>) -> Result<Option<u32>, String> {
+    match value.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(None),
+        Some(v) => {
+            let pct: u32 = v
+                .parse()
+                .map_err(|_| format!("{key} must be a number (got {v:?})"))?;
+            if !(50..=400).contains(&pct) {
+                return Err(format!("{key} must be between 50 and 400 (percent)"));
+            }
+            Ok(Some(pct))
+        }
+    }
 }
 
 fn fmt_bool(b: bool) -> String {
@@ -354,6 +443,76 @@ mod tests {
         apply(&mut cfg, "overlay_quic", None).unwrap();
         assert_eq!(cfg.overlay_quic, None);
         assert!(apply(&mut cfg, "overlay_quic", Some("maybe")).is_err());
+    }
+
+    #[test]
+    fn rate_factor_set_echo_clear_and_validate() {
+        let mut cfg = crate::config::test_fixture();
+        for key in [
+            "rate_factor_h264",
+            "rate_factor_hevc",
+            "rate_factor_vp9",
+            "rate_factor_av1",
+        ] {
+            apply(&mut cfg, key, Some("120")).unwrap();
+            assert_eq!(
+                entry_for(&cfg, key).unwrap().value.as_deref(),
+                Some("120"),
+                "set/echo for {key}"
+            );
+            assert!(apply(&mut cfg, key, Some("49")).is_err(), "{key} below 50");
+            assert!(
+                apply(&mut cfg, key, Some("401")).is_err(),
+                "{key} above 400"
+            );
+            assert!(apply(&mut cfg, key, Some("fast")).is_err(), "{key} garbage");
+            // Failed applies never partially wrote:
+            assert_eq!(entry_for(&cfg, key).unwrap().value.as_deref(), Some("120"));
+            apply(&mut cfg, key, None).unwrap();
+            assert_eq!(entry_for(&cfg, key).unwrap().value, None, "clear {key}");
+        }
+    }
+
+    #[test]
+    fn ice_follow_renomination_enum_set_echo_clear() {
+        let mut cfg = crate::config::test_fixture();
+        apply(&mut cfg, "ice_follow_renomination", Some("always")).unwrap();
+        assert_eq!(cfg.ice_follow_renomination, Some(true));
+        assert_eq!(
+            entry_for(&cfg, "ice_follow_renomination")
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("always")
+        );
+        apply(&mut cfg, "ice_follow_renomination", Some("never")).unwrap();
+        assert_eq!(cfg.ice_follow_renomination, Some(false));
+        apply(&mut cfg, "ice_follow_renomination", Some("auto")).unwrap();
+        assert_eq!(cfg.ice_follow_renomination, None);
+        assert_eq!(
+            entry_for(&cfg, "ice_follow_renomination").unwrap().value,
+            None
+        );
+        assert!(apply(&mut cfg, "ice_follow_renomination", Some("on")).is_err());
+    }
+
+    #[test]
+    fn ice_and_overlay_hatch_tribools_set_echo_clear() {
+        let mut cfg = crate::config::test_fixture();
+        for key in [
+            "ice_warm_standby",
+            "ice_overlay_host_deprioritize",
+            "overlay_tier_detect",
+        ] {
+            apply(&mut cfg, key, Some("off")).unwrap();
+            assert_eq!(
+                entry_for(&cfg, key).unwrap().value.as_deref(),
+                Some("false"),
+                "set/echo for {key}"
+            );
+            apply(&mut cfg, key, None).unwrap();
+            assert_eq!(entry_for(&cfg, key).unwrap().value, None, "clear {key}");
+        }
     }
 
     #[test]
