@@ -124,7 +124,7 @@ const KEYS: &[(&str, &str, &str)] = &[
     (
         "rate_factor_vp9",
         "string",
-        "VP9 maxrate ceiling factor, % (50-400). Env: ROOMLER_NODE_RATE_FACTOR_VP9. Empty = built-in 100. Restart required.",
+        "VP9 maxrate ceiling factor, % (50-400). Env: ROOMLER_NODE_RATE_FACTOR_VP9. Empty = built-in 125. Restart required.",
     ),
     (
         "rate_factor_av1",
