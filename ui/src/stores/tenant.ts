@@ -19,10 +19,36 @@ interface Tenant {
   billing?: TenantBilling
 }
 
+interface MyMembership {
+  permissions: number
+  is_owner: boolean
+}
+
 export const useTenantStore = defineStore('tenant', () => {
   const tenants = ref<Tenant[]>([])
   const current = ref<Tenant | null>(null)
   const loading = ref(false)
+  /** The caller's permission mask in the ACTIVE tenant (null until the
+   *  /member/me fetch lands — consumers must fail open on null). */
+  const myPermissions = ref<number | null>(null)
+  const isOwner = ref(false)
+
+  /**
+   * Load the caller's own membership for `tenantId`. Resets to the
+   * unknown state first so a tenant switch never shows the previous
+   * tenant's mask. 403/404/older-server → stays null (fail-open).
+   */
+  async function fetchMyMembership(tenantId: string) {
+    myPermissions.value = null
+    isOwner.value = false
+    try {
+      const m = await api.get<MyMembership>(`/tenant/${tenantId}/member/me`)
+      myPermissions.value = m.permissions
+      isOwner.value = m.is_owner
+    } catch {
+      /* fail open — nav gating treats null as "show" */
+    }
+  }
 
   async function fetchTenants() {
     loading.value = true
@@ -47,5 +73,15 @@ export const useTenantStore = defineStore('tenant', () => {
     current.value = tenant
   }
 
-  return { tenants, current, loading, fetchTenants, createTenant, setCurrent }
+  return {
+    tenants,
+    current,
+    loading,
+    myPermissions,
+    isOwner,
+    fetchTenants,
+    fetchMyMembership,
+    createTenant,
+    setCurrent,
+  }
 })
