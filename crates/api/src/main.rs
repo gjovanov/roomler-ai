@@ -283,7 +283,14 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     info!("Listening on {}", addr);
 
-    axum::serve(listener, app).await?;
+    // `with_connect_info` so the rate limiter has a peer address to fall back
+    // on when `X-Forwarded-For` is absent or too short to trust (a request
+    // that did not come through our proxy chain).
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
 }
