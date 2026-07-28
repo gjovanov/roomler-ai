@@ -758,6 +758,57 @@ function persistResolution(agentId: string, s: RcResolutionSetting) {
   }
 }
 
+/** Per-agent codec override (2026-07-28): an explicit Codec-picker choice on
+ *  agent X sticks for X across sessions; "Auto" clears X's override so the
+ *  global (per-browser) default applies again. Restored in `connect()` via
+ *  the persist-FREE apply path — restoring through the `codecChoice` setter
+ *  would rewrite the four GLOBAL keys and silently turn one agent's override
+ *  into every agent's default. */
+export const CODEC_STORAGE_PREFIX = 'roomler-rc-codec.v1:'
+
+const CODEC_CHOICE_VALUES = ['auto', 'av1', 'hevc', 'vp9-444', 'vp9-420', 'h264'] as const
+
+export function readStoredCodecChoice(agentId: string): RcCodecChoice | null {
+  try {
+    const raw = globalThis.localStorage?.getItem(CODEC_STORAGE_PREFIX + agentId)
+    if (
+      raw &&
+      raw !== 'auto' &&
+      (CODEC_CHOICE_VALUES as readonly string[]).includes(raw)
+    ) {
+      return raw as RcCodecChoice
+    }
+  } catch {
+    /* privacy mode → no override */
+  }
+  return null
+}
+
+export function persistCodecChoice(agentId: string, choice: RcCodecChoice | null) {
+  try {
+    if (choice == null || choice === 'auto') {
+      globalThis.localStorage?.removeItem(CODEC_STORAGE_PREFIX + agentId)
+    } else {
+      globalThis.localStorage?.setItem(CODEC_STORAGE_PREFIX + agentId, choice)
+    }
+  } catch {
+    /* best-effort */
+  }
+}
+
+/** Pure decision core for the connect-time pick-vs-restore precedence
+ *  (mirrors the rc.190 resolution guard) — unit-tested. Returns what
+ *  `connect()` should do: persist the fresh user pick, apply the stored
+ *  override, or leave the global default alone. */
+export function codecConnectAction(
+  userPickedThisSession: boolean,
+  stored: RcCodecChoice | null,
+): 'persist-pick' | 'apply-stored' | 'none' {
+  if (userPickedThisSession) return 'persist-pick'
+  if (stored) return 'apply-stored'
+  return 'none'
+}
+
 /** Translate an `RcResolutionSetting` into the exact JSON shape the
  *  agent's control-DC handler expects. Returns `null` when the
  *  setting is invalid (fit/custom with no dims) — the caller drops
@@ -2584,6 +2635,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   const resolution = ref<RcResolutionSetting>({ mode: 'original' })
   // Tracks the last agentId we loaded + persist under. Set in connect().
   let resolutionAgentId: string | null = null
+  /** Per-agent codec override bookkeeping — set in connect(), cleared in
+   *  disconnect() so an idle post-session global pick can't silently write
+   *  the last agent's override. */
+  let codecAgentId: string | null = null
+  let codecUserPickedThisSession = false
   // rc.190 (A1) — true once the USER changed resolution this session, so
   // connect()'s per-agent restore doesn't clobber a pre-connect pick.
   let resolutionUserPickedThisSession = false
@@ -3971,7 +4027,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    *  `get` derives the current choice; `set` applies the full tuple through
    *  the existing setters (so persistence + connect-time wiring are unchanged).
    *  Takes effect on the next `connect()`, like the transport/chroma refs it
-   *  drives. */
+   *  drives. Also records the pick per agent once `codecAgentId` is known
+   *  ("auto" clears that agent's override). */
   const codecChoice = computed<RcCodecChoice>({
     get: () => settingsToCodecChoice(videoTransport.value, vp9Chroma.value),
     set: (choice) => {
@@ -3980,8 +4037,24 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       setVp9Chroma(s.chroma)
       setPreferredCodec(s.preferredCodec)
       setRenderPath(s.renderPath)
+      codecUserPickedThisSession = true
+      if (codecAgentId) persistCodecChoice(codecAgentId, choice)
     },
   })
+
+  /** Persist-free twin of the `codecChoice` setter, used ONLY by the
+   *  connect-time per-agent restore: writes the four refs directly so a
+   *  stored override for agent X never leaks into the four GLOBAL
+   *  localStorage keys (which stay the cross-agent default). Mirrors
+   *  `setRenderPath`'s webcodecs-support fallback. */
+  function applyCodecChoiceSettings(choice: RcCodecChoice) {
+    const s = codecChoiceToSettings(choice, { h264Rtp: storedH264Rtp() })
+    videoTransport.value = s.videoTransport
+    vp9Chroma.value = s.chroma
+    preferredCodec.value = s.preferredCodec
+    renderPath.value =
+      s.renderPath === 'webcodecs' && !webcodecsSupported.value ? 'video' : s.renderPath
+  }
 
   /** Install the receiver transform EAGERLY (at pc.ontrack time) so
    *  Chrome routes encoded frames to the worker from the very first
@@ -5119,6 +5192,25 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       persistResolution(agentId, resolution.value)
     } else {
       resolution.value = readStoredResolution(agentId)
+    }
+
+    // Per-agent codec override — same shape as the resolution block above,
+    // including its rc.190 guard: a pick made BEFORE connect wins over the
+    // stored override (and is persisted now that the agent is known); the
+    // restore path is persist-FREE so agent X's override never rewrites the
+    // global default other agents inherit.
+    codecAgentId = agentId
+    switch (
+      codecConnectAction(codecUserPickedThisSession, readStoredCodecChoice(agentId))
+    ) {
+      case 'persist-pick':
+        persistCodecChoice(agentId, codecChoice.value)
+        break
+      case 'apply-stored':
+        applyCodecChoiceSettings(readStoredCodecChoice(agentId) as RcCodecChoice)
+        break
+      case 'none':
+        break
     }
 
     // Inspect what video codecs this browser can decode so the agent
@@ -6299,6 +6391,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // we just sent.
     cancelReconnect()
     lastConnectArgs = null
+    // End of this agent's session: later picker changes are global-only
+    // until the next connect() names an agent again.
+    codecAgentId = null
+    codecUserPickedThisSession = false
     if (sessionId.value && pc) {
       ws.sendRaw({
         t: 'rc:terminate',
