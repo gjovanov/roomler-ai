@@ -162,13 +162,14 @@ MongoDB native driver (not Mongoose). Models live in `crates/db/src/models/` exc
 - Tests spawn real Axum servers on random ports
 - Requires MongoDB on `localhost:27019` and Redis on `localhost:6379`
 - 163+ tests across 24 modules: auth, tenant, room, message, reaction, recording, file, invite, role, notification, push, giphy, oauth, call, pagination, rate_limit, cors, billing, multi_tenancy, channel_crud, pdf_export, conference_message, **remote_control, agent** (full rc:* round-trip drives the agent library in-process against a TestApp)
-- 5 known pre-existing failures (CORS tower-http upgrade, role dedup, rate-limit timing) — reproducible on pristine master and unrelated to recent work
+- 7 known pre-existing failures on the build host (CORS tower-http upgrade ×2, role dedup, rate-limit timing, agent_e2e concurrent_sessions + terminate_clears, conference call_leave) — reproducible on pristine master and unrelated to recent work; the last three are environmental to that box
 
 **E2E tests** (`ui/e2e/`):
 - Playwright 1.58 with Chromium (fake media stream devices for WebRTC)
 - 24 spec files: auth, channels, chat, chat-multi, chat-pagination, chat-reactions, chat-threads, conference (4 specs), connection-status, dashboard, files, invite, mention, notifications, oauth, profile, room-fixes, room-management, websocket, 404
 - Fixtures in `ui/e2e/fixtures/test-helpers.ts`
-- Base URL: `http://localhost:5000` (or E2E_BASE_URL env var)
+- Base URL: `http://localhost:5000` (or E2E_BASE_URL env var); the fixtures ALSO call the API directly — set `E2E_API_URL` (defaults to the dev port `http://localhost:5001`) or every API-driven spec fails with ECONNREFUSED. Mailpit-driven specs need `E2E_MAILPIT_URL`.
+- **No CI lane** — the suite only runs when driven manually. Build-host recipe (first run 2026-07-28, 142/160 passed): a standing e2e stack lives in the `roomler-ai-e2e` namespace (deploy-repo `k8s/overlays/e2e`, applied manually with `kubectl apply -k` — NOT ArgoCD-managed; bump its `newTag` in lockstep with the image you want to validate). Then `kubectl -n roomler-ai-e2e port-forward svc/roomler2 18080:80` (+ `svc/mailpit 18025:8025`), copy `ui/` to a scratch dir **minus `e2e/video/`** (the record-intro spec uses bun-only JSON-import syntax and kills collection under node), and run `docker run --rm --network host -v <scratch>:/work -w /work -e CI=1 -e E2E_BASE_URL=http://127.0.0.1:18080 -e E2E_API_URL=http://127.0.0.1:18080 mcr.microsoft.com/playwright:v<matching>-jammy bash -lc "npm i && npx playwright test --reporter=line"`. Expected environmental failures in that topology: conference specs (mediasoup RTC ports aren't forwarded), email flows (unless Mailpit is forwarded), rc-vp9-444 (needs the agent feature lane).
 
 **Unit tests** (`ui/src/`):
 - Vitest with jsdom environment, 259 tests across 16 files
