@@ -2694,6 +2694,14 @@ impl OverlayRuntime {
         // tearing the relay down speculatively. Read once per call.
         let make_before_break = super::direct::make_before_break_enabled();
         for np in peers {
+            // P9 — presence: never dial / probe / relay-request a peer the
+            // server marked unreachable (ghost enrollment, stale heartbeat,
+            // clean leave). An already-installed carrier is left alone — the
+            // data plane outlives a control-plane hiccup and the health sweep
+            // owns its lifecycle; removal still arrives via the leave delta.
+            if !np.reachable {
+                continue;
+            }
             let Some(cfg) = peer_config_from_netmap(np) else {
                 continue;
             };
@@ -5261,6 +5269,61 @@ mod tests {
         )
         .await;
         assert_eq!(wg.probe_count(), 1, "no duplicate probe on re-entry");
+    }
+
+    /// P9 — a peer the server marked `reachable = false` (ghost enrollment /
+    /// stale heartbeat / clean leave) is never dialed: no carrier install, no
+    /// shadow probe, no relay request — even with perfectly dialable
+    /// candidates on the row.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unreachable_peer_is_never_dialed() {
+        let kp = WgKeypair::generate();
+        let peer_kp = WgKeypair::generate();
+        let (out_tx, _out_rx) = mpsc::channel::<ClientMsg>(16);
+        let (tun_mock, _inj, _del) = MockTun::new();
+        let tf: TunFactory = {
+            let m = tun_mock.clone();
+            Box::new(move |_, _, _| Ok(m.clone() as Arc<dyn TunIo>))
+        };
+        let rt = OverlayRuntime::new_relay(kp.clone(), out_tx, tf, 1280);
+        let (mut wg, _tun_rx) = WgDevice::new(kp.secret.clone());
+        let tun: Arc<dyn TunIo> = tun_mock;
+
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let my_ip: Ipv4Addr = "10.1.2.9".parse().unwrap();
+        let ctx = DirectCtx {
+            socks: vec![(my_ip, sock)],
+            my_ips: vec![my_ip],
+            endpoints: vec!["10.1.2.9:41000".into()],
+            public_sock: None,
+            punch: None,
+            my_nat: None,
+        };
+        let cooldowns = DirectCooldowns::default();
+        let mut relay: Option<RelayCoordinator> = None;
+        let mut by_node = HashMap::new();
+        let mut upgrade_probes = HashMap::new();
+
+        let mut p = peer(&peer_kp, "100.64.0.9");
+        p.lan_endpoints = vec!["10.1.2.3:1000".into()];
+        p.reachable = false;
+        rt.install_peers(
+            &mut wg,
+            &mut by_node,
+            &mut relay,
+            &tun,
+            std::slice::from_ref(&p),
+            Some(&ctx),
+            &cooldowns,
+            &mut upgrade_probes,
+            &mut test_relay_bq(),
+            "test",
+        )
+        .await;
+
+        assert!(by_node.is_empty(), "no carrier for an unreachable peer");
+        assert!(upgrade_probes.is_empty(), "no shadow probe either");
+        assert_eq!(wg.probe_count(), 0);
     }
 
     /// Minimal STUN Binding Success carrying an XOR-MAPPED-ADDRESS (IPv4), so a
