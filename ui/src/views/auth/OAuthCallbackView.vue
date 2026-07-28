@@ -33,6 +33,24 @@ onMounted(async () => {
     return
   }
 
+  // Pre-validate the token with a RAW fetch, outside the api client.
+  // Rationale: with an invalid/expired token, `auth.fetchMe()` swallows
+  // the failure (internal catch → logout) and the api client's 401
+  // handler navigates to /login — the user gets silently bounced and
+  // this view's error alert never renders (e2e oauth.spec locks the
+  // intended behavior: show "Failed to complete OAuth login" here).
+  const tokenOk = await fetch('/api/auth/me', {
+    headers: { Authorization: `Bearer ${token}` },
+  })
+    .then((r) => r.ok)
+    .catch(() => false)
+  if (!tokenOk) {
+    error.value = 'Failed to complete OAuth login'
+    localStorage.removeItem('access_token')
+    auth.token = null
+    return
+  }
+
   try {
     // Store the token and fetch user info
     localStorage.setItem('access_token', token)
