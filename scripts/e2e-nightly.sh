@@ -25,7 +25,12 @@ REPO="${REPO:-$HOME/roomler-ai}"
 DEPLOY_REPO="${DEPLOY_REPO:-$HOME/roomler-ai-deploy}"
 OUT="${OUT:-$HOME/e2e-nightly}"
 NS=roomler-ai-e2e
-PW_IMG="${PW_IMG:-mcr.microsoft.com/playwright:v1.58.2-jammy}"
+# Derive the Playwright container from the version pinned in package.json —
+# the browser binary path is version-locked, so a hardcoded tag silently
+# breaks the whole run on every @playwright/test bump ("Executable doesn't
+# exist… update docker image as well"). Falls back if the parse fails.
+PW_VER="$(grep -oE '"@playwright/test":[[:space:]]*"[^"]+"' "$REPO/ui/package.json" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+PW_IMG="${PW_IMG:-mcr.microsoft.com/playwright:v${PW_VER:-1.62.0}-jammy}"
 APP_PORT=18080
 MAIL_PORT=18025
 
