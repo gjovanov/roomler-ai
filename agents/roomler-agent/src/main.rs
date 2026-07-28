@@ -1250,7 +1250,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     // "1"/"0" strings every read-site parser already accepts.
     {
         let mut fallbacks = std::collections::HashMap::new();
-        let pairs: [(&str, Option<bool>); 8] = [
+        let pairs: [(&str, Option<bool>); 9] = [
             ("OVERLAY_QUIC", cfg.overlay_quic),
             ("OVERLAY_DIRECT", cfg.overlay_direct),
             ("OVERLAY_DERP", cfg.overlay_derp),
@@ -1259,16 +1259,71 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
             ("DNS_AAAA", cfg.dns_aaaa),
             ("AUTO_UPDATE", cfg.auto_update),
             ("LOGS_UPLOAD_DISABLED", cfg.logs_upload_disabled),
+            ("OVERLAY_TIER_DETECT", cfg.overlay_tier_detect),
         ];
         for (suffix, value) in pairs {
             if let Some(v) = value {
                 fallbacks.insert(suffix.to_string(), if v { "1" } else { "0" }.to_string());
             }
         }
+        // Numeric knobs ride the same map as their decimal strings.
+        let numeric: [(&str, Option<u32>); 4] = [
+            ("RATE_FACTOR_H264", cfg.rate_factor_h264),
+            ("RATE_FACTOR_HEVC", cfg.rate_factor_hevc),
+            ("RATE_FACTOR_VP9", cfg.rate_factor_vp9),
+            ("RATE_FACTOR_AV1", cfg.rate_factor_av1),
+        ];
+        for (suffix, value) in numeric {
+            if let Some(v) = value {
+                fallbacks.insert(suffix.to_string(), v.to_string());
+            }
+        }
         if !fallbacks.is_empty() {
             tracing::info!(keys = ?fallbacks.keys().collect::<Vec<_>>(),
                 "config-backed env fallbacks registered");
             tunnel_core::env::register_config_fallbacks(fallbacks);
+        }
+    }
+
+    // ICE env bridge: the media-ICE hatches live in the VENDORED webrtc-ice
+    // crate, which reads raw `ROOMLER_ICE_*` env vars (it cannot depend on
+    // tunnel-core's `node_env` — dependency cycle), so the config fallback
+    // map above never reaches them. Bridge config → process env here, but
+    // only when the operator hasn't set the var (machine/user env wins —
+    // note: per-service SCM Environment-block vars do NOT reach the default
+    // user-context worker's token env block, only SystemContext workers, so
+    // on default hosts these config keys are effectively authoritative).
+    // SAFETY: same precedent as the DISPLAY/ICE_RELAY_TCP set_var block in
+    // virtual-desktop startup — runs before any session/ICE task exists.
+    {
+        let ice_keys: [(&str, Option<String>); 3] = [
+            (
+                "ROOMLER_ICE_FOLLOW_RENOMINATION",
+                cfg.ice_follow_renomination
+                    .map(|b| if b { "1" } else { "0" }.to_string()),
+            ),
+            (
+                "ROOMLER_ICE_WARM_STANDBY",
+                cfg.ice_warm_standby
+                    .map(|b| if b { "1" } else { "0" }.to_string()),
+            ),
+            (
+                "ROOMLER_ICE_OVERLAY_HOST_DEPRIORITIZE",
+                cfg.ice_overlay_host_deprioritize
+                    .map(|b| if b { "1" } else { "0" }.to_string()),
+            ),
+        ];
+        let mut set = 0u32;
+        for (var, value) in ice_keys {
+            if let Some(v) = value
+                && std::env::var_os(var).is_none()
+            {
+                unsafe { std::env::set_var(var, &v) };
+                set += 1;
+            }
+        }
+        if set > 0 {
+            tracing::info!(count = set, "ice env bridge: set vars from config");
         }
     }
 
