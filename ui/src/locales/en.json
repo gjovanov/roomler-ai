@@ -4,6 +4,7 @@
   },
   "auth": {
     "login": "Login",
+    "orLoginWith": "Or login with",
     "register": "Register",
     "logout": "Logout",
     "email": "Email",
