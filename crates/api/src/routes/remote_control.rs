@@ -633,14 +633,21 @@ fn to_agent_response(
 ) -> AgentResponse {
     let id = a.id.map(|i| i.to_hex()).unwrap_or_default();
     // S6 — the rc-hub only knows agents whose WS lands on THIS pod. For
-    // listings, an agent heartbeating within the last 90 s counts as
-    // online even when its socket lives on the other pod (heartbeats
-    // update `last_seen_at` in Mongo every 30 s). Hub-local presence
-    // still wins instantly for the common case.
+    // listings, an agent whose Mongo row says `status: Online` with a
+    // heartbeat in the last 90 s counts as online even when its socket
+    // lives on the other pod (hello sets Online, heartbeats bump
+    // `last_seen_at` every 30 s, a clean WS close marks Offline, and a
+    // crashed agent ages out via the 90 s window). The status gate keeps
+    // a freshly-enrolled never-connected agent (status: Offline,
+    // last_seen_at = enrollment time) honestly offline. Hub-local
+    // presence still wins instantly for the common case.
     let hub_online =
         a.id.map(|i| state.rc_hub.is_agent_online(i))
             .unwrap_or(false);
-    let recently_seen = {
+    let recently_seen = matches!(
+        a.status,
+        roomler_ai_remote_control::models::AgentStatus::Online
+    ) && {
         let age_ms = bson::DateTime::now().timestamp_millis() - a.last_seen_at.timestamp_millis();
         age_ms < 90_000
     };
