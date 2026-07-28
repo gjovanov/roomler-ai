@@ -116,8 +116,39 @@ pub struct MediasoupSettings {
     pub num_workers: u32,
     pub listen_ip: String,
     pub announced_ip: String,
+    /// S6 — per-node announced-IP override for multi-pod hostNetwork
+    /// deployments: `"<node_ip>=<public_ip>,<node_ip>=<public_ip>"`.
+    /// One Deployment can't template a per-node env value, so the pod
+    /// gets its own node IP via the Downward API (`ROOMLER__POD_HOST_IP`,
+    /// status.hostIP) and picks its public announced IP from this map.
+    /// Absent / no match → `announced_ip` as before.
+    #[serde(default)]
+    pub announced_ip_map: Option<String>,
     pub rtc_min_port: u16,
     pub rtc_max_port: u16,
+}
+
+impl MediasoupSettings {
+    /// Resolve the effective announced IP for this pod: exact
+    /// `announced_ip_map` match on `pod_host_ip` wins, else the static
+    /// `announced_ip` (empty → None, mediasoup announces the listen IP).
+    pub fn resolve_announced_ip(&self, pod_host_ip: Option<&str>) -> Option<String> {
+        if let (Some(map), Some(host_ip)) = (&self.announced_ip_map, pod_host_ip) {
+            for pair in map.split(',') {
+                if let Some((node, public)) = pair.split_once('=')
+                    && node.trim() == host_ip.trim()
+                    && !public.trim().is_empty()
+                {
+                    return Some(public.trim().to_string());
+                }
+            }
+        }
+        if self.announced_ip.is_empty() {
+            None
+        } else {
+            Some(self.announced_ip.clone())
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -261,5 +292,68 @@ impl Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self::load().expect("Failed to load default settings")
+    }
+}
+
+#[cfg(test)]
+mod s6_tests {
+    use super::MediasoupSettings;
+
+    fn ms(announced: &str, map: Option<&str>) -> MediasoupSettings {
+        MediasoupSettings {
+            num_workers: 1,
+            listen_ip: "0.0.0.0".into(),
+            announced_ip: announced.into(),
+            announced_ip_map: map.map(|s| s.to_string()),
+            rtc_min_port: 40000,
+            rtc_max_port: 49999,
+        }
+    }
+
+    #[test]
+    fn announced_ip_map_matches_pod_host() {
+        let s = ms(
+            "5.9.157.221",
+            Some("10.10.30.11=5.9.157.221,10.10.20.11=5.9.157.226"),
+        );
+        assert_eq!(
+            s.resolve_announced_ip(Some("10.10.20.11")).as_deref(),
+            Some("5.9.157.226")
+        );
+        assert_eq!(
+            s.resolve_announced_ip(Some("10.10.30.11")).as_deref(),
+            Some("5.9.157.221")
+        );
+    }
+
+    #[test]
+    fn announced_ip_map_falls_back_to_static() {
+        let s = ms("5.9.157.221", Some("10.10.30.11=5.9.157.221"));
+        // Unknown node → static value.
+        assert_eq!(
+            s.resolve_announced_ip(Some("192.168.1.1")).as_deref(),
+            Some("5.9.157.221")
+        );
+        // No pod host ip (non-k8s run) → static value.
+        assert_eq!(s.resolve_announced_ip(None).as_deref(), Some("5.9.157.221"));
+        // No map at all → static value.
+        let s2 = ms("1.2.3.4", None);
+        assert_eq!(
+            s2.resolve_announced_ip(Some("10.10.30.11")).as_deref(),
+            Some("1.2.3.4")
+        );
+        // Empty static + no match → None (mediasoup announces listen ip).
+        let s3 = ms("", None);
+        assert_eq!(s3.resolve_announced_ip(Some("10.10.30.11")), None);
+    }
+
+    #[test]
+    fn announced_ip_map_tolerates_whitespace_and_junk() {
+        let s = ms("", Some(" 10.10.30.11 = 5.9.157.221 ,junk,also=,x"));
+        assert_eq!(
+            s.resolve_announced_ip(Some("10.10.30.11")).as_deref(),
+            Some("5.9.157.221")
+        );
+        assert_eq!(s.resolve_announced_ip(Some("also")), None);
     }
 }

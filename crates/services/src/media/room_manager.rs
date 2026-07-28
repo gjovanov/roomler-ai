@@ -88,11 +88,15 @@ impl RoomManager {
             .parse()
             .unwrap_or_else(|_| "0.0.0.0".parse().unwrap());
 
-        let announced_ip = if settings.announced_ip.is_empty() {
-            None
-        } else {
-            Some(settings.announced_ip.clone())
-        };
+        // S6 — multi-pod: each pod may need a different public announced
+        // IP (it rides its node's DNAT). `ROOMLER__POD_HOST_IP` is
+        // injected via the Downward API (status.hostIP); single-pod
+        // deployments without the map behave exactly as before.
+        let pod_host_ip = std::env::var("ROOMLER__POD_HOST_IP").ok();
+        let announced_ip = settings.resolve_announced_ip(pod_host_ip.as_deref());
+        if let Some(ip) = &announced_ip {
+            tracing::info!(announced_ip = %ip, pod_host_ip = ?pod_host_ip, "mediasoup announced IP resolved");
+        }
 
         Self {
             rooms: DashMap::new(),

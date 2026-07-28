@@ -252,8 +252,16 @@ async fn run_session(
 ) -> Result<SessionOutcome> {
     // ────────────── WS connect ─────────────────────────────────────
     let ws_base = derive_ws_url(&cfg.server_url)?;
+    // S6 — `tid` = tenant-affinity hint for the front LB (co-locates
+    // this tunnel client with its tenant's agents on one pod; the
+    // tunnel-hub is pod-local). Extracted from our own JWT; the server
+    // re-validates against the verified claims, and pre-S6 servers
+    // ignore the param.
+    let tid_param = tenant_id_from_jwt(&cfg.tunnel_client_token)
+        .map(|t| format!("&tid={t}"))
+        .unwrap_or_default();
     let ws_url = format!(
-        "{ws_base}?role=tunnel-client&token={}",
+        "{ws_base}?role=tunnel-client&token={}{tid_param}",
         urlencoding_lite(&cfg.tunnel_client_token)
     );
     info!(%ws_base, "connecting websocket");
@@ -353,6 +361,29 @@ pub(crate) fn parse_remote(s: &str) -> Result<(String, u16)> {
     Ok((host.to_string(), port))
 }
 
+/// S6 — best-effort extraction of the `tenant_id` claim from OUR OWN
+/// JWT, used only as the LB affinity hint (`tid=`). No signature check:
+/// the server re-validates the hint against the VERIFIED claims and
+/// rejects a mismatch, so a garbled value can only mis-route, never
+/// escalate. Returns `None` on any parse hiccup (param simply omitted;
+/// the LB then pins the connection to the legacy pod).
+fn tenant_id_from_jwt(token: &str) -> Option<String> {
+    use base64::Engine as _;
+    let payload_b64 = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload_b64)
+        .ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    // Only forward a plausible ObjectId hex — anything else would just
+    // 403 at the server.
+    let t = v.get("tenant_id")?.as_str()?;
+    if t.len() == 24 && t.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some(t.to_string())
+    } else {
+        None
+    }
+}
+
 /// Tiny URL-encoder for the JWT in the query string. We only need
 /// to escape characters that appear in JWTs (`.`, `-`, `_` are safe
 /// per JWT spec; we just guard against future drift). Avoids pulling
@@ -432,5 +463,36 @@ mod tests {
     #[test]
     fn urlencoding_lite_encodes_space() {
         assert_eq!(urlencoding_lite("a b"), "a%20b");
+    }
+
+    fn fake_jwt(payload_json: &str) -> String {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        format!(
+            "{}.{}.sig",
+            b64.encode(r#"{"alg":"HS256"}"#),
+            b64.encode(payload_json)
+        )
+    }
+
+    #[test]
+    fn tenant_id_from_jwt_extracts_hex_oid() {
+        let jwt = fake_jwt(r#"{"sub":"x","tenant_id":"64b1f0aa12cd34ef56ab78cd"}"#);
+        assert_eq!(
+            tenant_id_from_jwt(&jwt).as_deref(),
+            Some("64b1f0aa12cd34ef56ab78cd")
+        );
+    }
+
+    #[test]
+    fn tenant_id_from_jwt_rejects_non_oid_and_garbage() {
+        // Non-hex / wrong length values are dropped (would 403 server-side).
+        let jwt = fake_jwt(r#"{"tenant_id":"not-an-object-id"}"#);
+        assert_eq!(tenant_id_from_jwt(&jwt), None);
+        // Missing claim.
+        let jwt2 = fake_jwt(r#"{"sub":"x"}"#);
+        assert_eq!(tenant_id_from_jwt(&jwt2), None);
+        // Not a JWT at all.
+        assert_eq!(tenant_id_from_jwt("hello"), None);
     }
 }
