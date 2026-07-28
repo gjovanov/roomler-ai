@@ -86,6 +86,43 @@ function Assert-Sha256([string]$File, [string]$Digest) {
     Say ("sha256 verified: " + (Split-Path -Leaf $File))
 }
 
+# The release roomlerd.exe links the MSVC runtime dynamically (its C++
+# encoder objects), and pre-rc.266 MSIs ship no app-local CRT: on a fresh
+# Windows box without any VC++ 2015-2022 x64 redistributable the first
+# daemon run dies with a loader dialog ("vcruntime140_1.dll was not
+# found" -- field report 2026-07-28). rc.266+ MSIs carry the CRT beside
+# the EXEs, but the installer proxy caches releases for ~1h and older
+# MSIs stay in the wild -- so best-effort heal the machine here: quietly
+# install the official redist when it is missing and we are elevated,
+# otherwise warn with the one-liner fix and continue.
+function Ensure-VcRuntime {
+    $sys32 = Join-Path $env:SystemRoot 'System32'
+    $missing = @()
+    foreach ($n in @('vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll', 'msvcp140_1.dll')) {
+        if (-not (Test-Path (Join-Path $sys32 $n))) { $missing += $n }
+    }
+    if ($missing.Count -eq 0) { return }
+    Say ("VC++ 2015-2022 x64 runtime is missing or incomplete (no " + ($missing -join ', ') + ")")
+    if (-not (Test-Elevated)) {
+        Warn "cannot install the VC++ runtime without elevation. If the daemon fails to start with a"
+        Warn "missing-DLL error, run this in an ELEVATED PowerShell, then re-run this installer:"
+        Warn "  winget install --id Microsoft.VCRedist.2015+.x64 -e"
+        return
+    }
+    $redist = Join-Path $stage 'vc_redist.x64.exe'
+    Say "downloading the Microsoft VC++ runtime (aka.ms/vs/17/release/vc_redist.x64.exe)"
+    Invoke-WebRequest -UseBasicParsing 'https://aka.ms/vs/17/release/vc_redist.x64.exe' -OutFile $redist
+    Say "installing the VC++ runtime (quiet)"
+    $p = Start-Process -FilePath $redist -ArgumentList '/install', '/quiet', '/norestart' -Wait -PassThru
+    if ($p.ExitCode -eq 1638) {
+        Warn "vc_redist reports a newer runtime is already registered (exit 1638) -- continuing"
+    } elseif ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+        throw "vc_redist.x64.exe exited $($p.ExitCode)"
+    } else {
+        Say "VC++ runtime installed"
+    }
+}
+
 $stage = Join-Path $env:TEMP ("roomler-install-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
 New-Item -ItemType Directory -Path $stage -Force | Out-Null
 
@@ -107,6 +144,7 @@ Say "roomler install.ps1 -- role=$Role server=$Server"
 # --- daemon roles: MSI (carries roomlerd + the roomler CLI) -----------------
 
 function Install-Daemon {
+    if (-not $DownloadOnly) { Ensure-VcRuntime }
     $flavour = 'permachine'
     if ($Role -eq 'daemon-user') { $flavour = 'peruser' }
     Say "resolving the $flavour MSI via $Server/api/agent/installer/$flavour/health"
