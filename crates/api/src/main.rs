@@ -77,8 +77,39 @@ async fn main() -> anyhow::Result<()> {
     // Build app state (async: spawns mediasoup workers)
     let app_state = AppState::new(db.clone(), settings.clone()).await?;
 
+    // S6 — leader-gate the startup maintenance below. With two pods, a
+    // restarting pod must NOT reset `in_progress` calls that are live on
+    // the OTHER pod's mediasoup. A short Mongo lease elects exactly one
+    // maintenance runner per window: the filtered upsert succeeds for one
+    // pod (fresh insert, or expired-lease takeover) and fails with a
+    // duplicate-key / zero-match for everyone else. A skipped reset is
+    // healed by the media:join get-or-create belt in ws/handler.rs.
+    let startup_leader = {
+        let locks = db.collection::<bson::Document>("locks");
+        let now = bson::DateTime::now();
+        let lease_until = bson::DateTime::from_millis(now.timestamp_millis() + 120_000);
+        match locks
+            .update_one(
+                bson::doc! { "_id": "startup_maintenance", "expires_at": { "$lt": now } },
+                bson::doc! { "$set": { "expires_at": lease_until } },
+            )
+            .upsert(true)
+            .await
+        {
+            Ok(r) => r.modified_count > 0 || r.upserted_id.is_some(),
+            // Concurrent upsert loser (E11000 on _id) or Mongo hiccup —
+            // either way, someone else owns maintenance this window.
+            Err(_) => false,
+        }
+    };
+    if !startup_leader {
+        info!(
+            "Startup maintenance lease held elsewhere — skipping stale-call reset + thread migration"
+        );
+    }
+
     // Clean up ALL stale calls — no calls can be active at server startup
-    {
+    if startup_leader {
         let rooms_coll = db.collection::<bson::Document>("rooms");
         let result = rooms_coll
             .update_many(
@@ -99,7 +130,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Fix thread metadata for existing thread roots with null metadata
     // (bug: MongoDB $inc fails on null subdocuments, so reply_count was never set)
-    {
+    if startup_leader {
         let msgs_coll = db.collection::<bson::Document>("messages");
         // Count replies per thread parent and rebuild metadata
         use futures::TryStreamExt;
@@ -187,6 +218,17 @@ async fn main() -> anyhow::Result<()> {
                         if envelope["origin"].as_str() == Some(own_instance.as_str()) {
                             continue;
                         }
+                        // S6 broadcast envelopes (presence fan-out): the
+                        // publisher can't know OUR user set, so it flags
+                        // the envelope and each pod delivers to its own
+                        // local connections.
+                        if envelope["broadcast"].as_bool() == Some(true) {
+                            if let Some(message) = envelope.get("message") {
+                                let ids = ws_storage.all_user_ids();
+                                dispatcher::broadcast(&ws_storage, &ids, message).await;
+                            }
+                            continue;
+                        }
                         if let (Some(user_ids_val), Some(message)) =
                             (envelope["user_ids"].as_array(), envelope.get("message"))
                         {
@@ -212,6 +254,25 @@ async fn main() -> anyhow::Result<()> {
             error!("Redis Pub/Sub forwarding task ended (channel closed)");
         });
         info!("Redis Pub/Sub cross-instance WS delivery enabled");
+
+        // S6 — online-registry heartbeat: re-assert this pod's local
+        // users in Redis every 30 s (TTL 90 s). Heals missed SREMs on
+        // abnormal disconnects and lets a crashed pod's claims age out.
+        let hb_pubsub = pubsub.clone();
+        let hb_storage = app_state.ws_storage.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                for uid in hb_storage.all_user_ids() {
+                    if let Err(e) = hb_pubsub.online_add(&uid.to_hex()).await {
+                        tracing::debug!("online-registry heartbeat failed: {e}");
+                        break; // Redis down — retry whole set next tick.
+                    }
+                }
+            }
+        });
     }
 
     // Build router

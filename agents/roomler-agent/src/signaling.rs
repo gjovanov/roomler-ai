@@ -419,10 +419,15 @@ async fn connect_once(
     // (not owned) so the same receiver survives across reconnects.
     kill_rx: &mut mpsc::Receiver<bson::oid::ObjectId>,
 ) -> Result<(), ConnectError> {
+    // S6 — `tid` is the tenant-affinity key the server-front LB hashes
+    // on, co-locating this agent's WS with its tenant's controllers on
+    // one pod (the rc-hub is pod-local). Server validates it against
+    // the JWT's tenant claim; pre-S6 servers just ignore the param.
     let url = format!(
-        "{}?token={}&role=agent",
+        "{}?token={}&role=agent&tid={}",
         cfg.ws_url(),
-        urlencode(&cfg.agent_token)
+        urlencode(&cfg.agent_token),
+        urlencode(&cfg.tenant_id)
     );
     // Log the endpoint WITHOUT the token: the URL carries the long-lived agent
     // JWT (a 1-year credential), and this line lands in the rolling log a user

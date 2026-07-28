@@ -27,6 +27,25 @@ pub struct WsParams {
     /// browser behaviour. Set to `"agent"` by the native remote-control agent.
     #[serde(default)]
     pub role: Option<String>,
+    /// S6 — optional tenant-affinity key. The front load-balancer hashes
+    /// on it so one tenant's users, agents, tunnel clients and DERP
+    /// sockets co-locate on one pod (the in-memory rc-hub / tunnel-hub /
+    /// mediasoup state is pod-local). The SERVER only validates it:
+    /// agent/tunnel JWTs carry `tenant_id` → must match; user JWTs carry
+    /// no tenant claim → validated via a `tenant_members` lookup.
+    /// Absent = legacy client → accepted (the LB pins those to pod 1).
+    #[serde(default)]
+    pub tid: Option<String>,
+}
+
+/// Validate a claimed affinity `tid` against a token-derived tenant id.
+/// `None` (param absent) is always fine — validation only rejects a
+/// PRESENT-but-wrong claim (mis-routed or forged affinity key).
+fn tid_matches_claim(tid: &Option<String>, claim_tenant_hex: &str) -> bool {
+    match tid {
+        None => true,
+        Some(t) => t == claim_tenant_hex,
+    }
 }
 
 pub async fn ws_upgrade(
@@ -35,13 +54,18 @@ pub async fn ws_upgrade(
     ws: WebSocketUpgrade,
 ) -> Response {
     match params.role.as_deref() {
-        Some("agent") => ws_upgrade_agent(state, params.token, ws),
-        Some("tunnel-client") => ws_upgrade_tunnel_client(state, params.token, ws),
-        _ => ws_upgrade_user(state, params.token, ws),
+        Some("agent") => ws_upgrade_agent(state, params.token, params.tid, ws),
+        Some("tunnel-client") => ws_upgrade_tunnel_client(state, params.token, params.tid, ws),
+        _ => ws_upgrade_user(state, params.token, params.tid, ws).await,
     }
 }
 
-fn ws_upgrade_user(state: AppState, token: String, ws: WebSocketUpgrade) -> Response {
+async fn ws_upgrade_user(
+    state: AppState,
+    token: String,
+    tid: Option<String>,
+    ws: WebSocketUpgrade,
+) -> Response {
     let claims = match state.auth.verify_access_token(&token) {
         Ok(c) => c,
         Err(_) => {
@@ -61,12 +85,41 @@ fn ws_upgrade_user(state: AppState, token: String, ws: WebSocketUpgrade) -> Resp
                 .unwrap();
         }
     };
+
+    // S6 — user JWTs carry no tenant claim, so a present `tid` is
+    // validated against `tenant_members`. Rejecting a non-member claim
+    // matters: `tid` is attacker-choosable in the URL, and accepting an
+    // arbitrary value would let a user steer their affinity onto any
+    // tenant's pod (harmless for data access — every route re-checks
+    // membership — but it would poison the co-location guarantee).
+    if let Some(t) = &tid {
+        let tenant_ok = match ObjectId::parse_str(t) {
+            Ok(tenant_oid) => state
+                .tenants
+                .is_member(tenant_oid, user_id)
+                .await
+                .unwrap_or(false),
+            Err(_) => false,
+        };
+        if !tenant_ok {
+            return Response::builder()
+                .status(403)
+                .body("Not a member of the claimed tenant".into())
+                .unwrap();
+        }
+    }
+
     let username = claims.username.clone();
 
     ws.on_upgrade(move |socket| handle_socket(socket, state, user_id, username))
 }
 
-fn ws_upgrade_tunnel_client(state: AppState, token: String, ws: WebSocketUpgrade) -> Response {
+fn ws_upgrade_tunnel_client(
+    state: AppState,
+    token: String,
+    tid: Option<String>,
+    ws: WebSocketUpgrade,
+) -> Response {
     let claims = match state.auth.verify_tunnel_client_token(&token) {
         Ok(c) => c,
         Err(_) => {
@@ -76,6 +129,14 @@ fn ws_upgrade_tunnel_client(state: AppState, token: String, ws: WebSocketUpgrade
                 .unwrap();
         }
     };
+
+    // S6 — a present affinity key must match the token's tenant.
+    if !tid_matches_claim(&tid, &claims.tenant_id) {
+        return Response::builder()
+            .status(403)
+            .body("tid does not match token tenant".into())
+            .unwrap();
+    }
 
     let tunnel_client_id = match ObjectId::parse_str(&claims.sub) {
         Ok(id) => id,
@@ -149,7 +210,12 @@ fn ws_upgrade_tunnel_client(state: AppState, token: String, ws: WebSocketUpgrade
     })
 }
 
-fn ws_upgrade_agent(state: AppState, token: String, ws: WebSocketUpgrade) -> Response {
+fn ws_upgrade_agent(
+    state: AppState,
+    token: String,
+    tid: Option<String>,
+    ws: WebSocketUpgrade,
+) -> Response {
     let claims = match state.auth.verify_agent_token(&token) {
         Ok(c) => c,
         Err(_) => {
@@ -159,6 +225,14 @@ fn ws_upgrade_agent(state: AppState, token: String, ws: WebSocketUpgrade) -> Res
                 .unwrap();
         }
     };
+
+    // S6 — a present affinity key must match the token's tenant.
+    if !tid_matches_claim(&tid, &claims.tenant_id) {
+        return Response::builder()
+            .status(403)
+            .body("tid does not match token tenant".into())
+            .unwrap();
+    }
 
     let agent_id = match ObjectId::parse_str(&claims.sub) {
         Ok(id) => id,
@@ -283,6 +357,14 @@ async fn handle_socket(socket: WebSocket, state: AppState, user_id: ObjectId, us
         .ws_storage
         .add(user_id, connection_id.clone(), sender.clone());
 
+    // S6 — mirror into the cross-pod online registry (advisory; the 30 s
+    // heartbeat in main.rs re-asserts it and the 90 s TTL self-heals).
+    if let Some(pubsub) = &state.redis_pubsub
+        && let Err(e) = pubsub.online_add(&user_id.to_hex()).await
+    {
+        tracing::debug!("online-registry add failed: {e}");
+    }
+
     // Register this tab with the remote-control Hub so `rc:*` replies find us.
     // Each browser tab gets its own controller tx; the Hub routes by tx, not
     // by user id, so multiple tabs don't cross signals.
@@ -348,6 +430,15 @@ async fn handle_socket(socket: WebSocket, state: AppState, user_id: ObjectId, us
         .unregister_controller(user_id, &rc_controller_tx);
     rc_pump.abort();
     state.ws_storage.remove(&user_id, &connection_id, &sender);
+
+    // S6 — drop this pod's online-registry claim once the user's LAST
+    // local connection is gone (other pods' claims are theirs to clear).
+    if !state.ws_storage.is_connected(&user_id)
+        && let Some(pubsub) = &state.redis_pubsub
+        && let Err(e) = pubsub.online_remove(&user_id.to_hex()).await
+    {
+        tracing::debug!("online-registry remove failed: {e}");
+    }
 
     if let Some(room_id) = state.room_manager.get_connection_room(&connection_id) {
         let remaining_conns = state
@@ -465,7 +556,6 @@ async fn handle_client_message(
                 .and_then(|d| d.get("presence"))
                 .and_then(|p| p.as_str())
             {
-                let all_users = state.ws_storage.all_user_ids();
                 let event = serde_json::json!({
                     "type": "presence:update",
                     "data": {
@@ -473,10 +563,13 @@ async fn handle_client_message(
                         "presence": presence,
                     }
                 });
-                super::dispatcher::broadcast_with_redis(
+                // S6 — broadcast-flag envelope: each pod delivers to its
+                // OWN local users. The previous recipient list was this
+                // pod's `all_user_ids()`, which silently excluded every
+                // user connected to the other pod.
+                super::dispatcher::broadcast_all_with_redis(
                     &state.ws_storage,
                     &state.redis_pubsub,
-                    &all_users,
                     &event,
                 )
                 .await;
@@ -542,8 +635,37 @@ async fn handle_media_join(
         }
     };
 
-    let room_exists = state.room_manager.has_room(&rid);
+    let mut room_exists = state.room_manager.has_room(&rid);
     debug!(?user_id, %connection_id, ?rid, room_exists, "media:join room check");
+    if !room_exists {
+        // S6 belt — get-or-create: `call/start` builds the mediasoup room
+        // on whichever pod served that HTTP request. If this pod doesn't
+        // hold it but Mongo says the conference is live (in_progress),
+        // create it locally instead of hard-failing. This also heals a
+        // call whose owning pod restarted (startup reset is leader-gated
+        // now, so a live-elsewhere call is no longer force-ended).
+        let call_live = state
+            .rooms
+            .base
+            .find_by_id(rid)
+            .await
+            .map(|r| r.conference_status.as_deref() == Some("in_progress"))
+            .unwrap_or(false);
+        if call_live {
+            match state.room_manager.create_room(rid).await {
+                Ok(_) => {
+                    info!(
+                        ?rid,
+                        "media:join re-created live conference room on this pod"
+                    );
+                    room_exists = true;
+                }
+                Err(e) => {
+                    warn!(?rid, %e, "media:join get-or-create failed");
+                }
+            }
+        }
+    }
     if !room_exists {
         send_media_error(state, user_id, "Room does not exist").await;
         return;
