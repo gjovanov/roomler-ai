@@ -15,8 +15,10 @@
 
 use std::net::{IpAddr, SocketAddr};
 
-use axum::extract::ConnectInfo;
-use http::{HeaderMap, Request};
+use axum::{
+    extract::ConnectInfo,
+    http::{HeaderMap, Request},
+};
 use tower_governor::{GovernorError, key_extractor::KeyExtractor};
 
 const X_FORWARDED_FOR: &str = "x-forwarded-for";
