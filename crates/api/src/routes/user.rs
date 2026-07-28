@@ -133,3 +133,45 @@ pub async fn update_profile(
 
     Ok(Json(serde_json::json!({ "updated": true })))
 }
+
+#[derive(Debug, Serialize)]
+pub struct MyMembershipResponse {
+    /// Combined permission bitmask across all the caller's roles in this
+    /// tenant (`role::permissions` flags OR-ed). Value stays < 2^27, so it
+    /// is safe as a plain JSON number.
+    pub permissions: u64,
+    /// Whether the caller is the tenant's owner. Owners may hold no explicit
+    /// role, so the UI treats this as an implicit all-permissions grant.
+    pub is_owner: bool,
+}
+
+/// GET /api/tenant/{tenant_id}/member/me — the caller's own effective
+/// permissions in this tenant. Purely informational for the client (nav
+/// gating, disabled buttons); every mutating route still enforces its own
+/// permission check server-side.
+pub async fn my_membership(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(tenant_id): Path<String>,
+) -> Result<Json<MyMembershipResponse>, ApiError> {
+    let tid = ObjectId::parse_str(&tenant_id)
+        .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
+
+    // Non-members get the DAO's Forbidden straight through.
+    let permissions = state
+        .tenants
+        .get_member_permissions(tid, auth.user_id)
+        .await?;
+    let is_owner = state
+        .tenants
+        .base
+        .find_by_id(tid)
+        .await
+        .map(|t| t.owner_id == auth.user_id)
+        .unwrap_or(false);
+
+    Ok(Json(MyMembershipResponse {
+        permissions,
+        is_owner,
+    }))
+}
