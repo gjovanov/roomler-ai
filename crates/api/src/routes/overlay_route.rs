@@ -6,15 +6,21 @@
 //! re-fan the node's netmap entry so peers pick up the routes immediately
 //! instead of waiting for the next join.
 
+use std::collections::HashSet;
+
 use axum::{
     Json,
     extract::{Path, State},
 };
-use bson::oid::ObjectId;
+use bson::{doc, oid::ObjectId};
+use roomler_ai_db::models::role::permissions;
 use roomler_ai_remote_control::models::{AgentStatus, DEFAULT_ROUTE_V4, NodeRef, OverlayNode};
 use serde::{Deserialize, Serialize};
 
-use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
+use crate::{
+    error::ApiError, extractors::auth::AuthUser, routes::remote_control::require_permission,
+    state::AppState,
+};
 
 #[derive(Debug, Serialize)]
 pub struct OverlayNodeResponse {
@@ -33,11 +39,17 @@ pub struct OverlayNodeResponse {
     /// on as an exit node (the toggle is gated on this).
     pub can_be_exit_node: bool,
     pub online: bool,
+    /// The backing agent / tunnel-client is still enrolled, so evicting this
+    /// node from the mesh does NOT keep it out — the device rejoins on its next
+    /// connect and takes a NEW overlay address. `false` means the device is
+    /// gone and the eviction is permanent. The admin UI branches its confirm
+    /// copy on this, so it must not be guessed.
+    pub will_rejoin: bool,
     pub last_seen_at: String,
 }
 
-impl From<OverlayNode> for OverlayNodeResponse {
-    fn from(n: OverlayNode) -> Self {
+impl OverlayNodeResponse {
+    fn from_node(n: OverlayNode, will_rejoin: bool) -> Self {
         let can_be_exit_node = n.advertised_routes.iter().any(|r| r == DEFAULT_ROUTE_V4);
         Self {
             id: n.id.map(|i| i.to_hex()).unwrap_or_default(),
@@ -48,6 +60,7 @@ impl From<OverlayNode> for OverlayNodeResponse {
                 NodeRef::TunnelClient { .. } => "tunnel_client",
             },
             online: matches!(n.status, AgentStatus::Online),
+            will_rejoin,
             // Surface only the SUBNET routes in the per-CIDR grid — the `/0`
             // default is managed by the exit-node toggle, not a checkbox.
             advertised_routes: n
@@ -64,6 +77,70 @@ impl From<OverlayNode> for OverlayNodeResponse {
             can_be_exit_node,
             last_seen_at: n.last_seen_at.try_to_rfc3339_string().unwrap_or_default(),
         }
+    }
+}
+
+impl From<OverlayNode> for OverlayNodeResponse {
+    /// `will_rejoin: true` — the single-node responses (route approval, exit-node
+    /// toggle) act on a node that is live by construction, and removal now
+    /// cascades from the device to its node, so a live node cannot outlive its
+    /// backing agent / tunnel-client. Only the LIST endpoint resolves this for
+    /// real, because pre-cascade fleets can still hold nodes whose device was
+    /// deleted before the release feature existed.
+    fn from(n: OverlayNode) -> Self {
+        Self::from_node(n, true)
+    }
+}
+
+/// Resolve `will_rejoin` for a batch of nodes in two queries: a node rejoins iff
+/// its backing agent / tunnel-client row is still live.
+async fn resolve_will_rejoin(
+    state: &AppState,
+    tenant_id: ObjectId,
+    nodes: &[OverlayNode],
+) -> HashSet<ObjectId> {
+    let mut agent_ids = Vec::new();
+    let mut client_ids = Vec::new();
+    for n in nodes {
+        match n.node_ref {
+            NodeRef::Agent { agent_id } => agent_ids.push(agent_id),
+            NodeRef::TunnelClient { tunnel_client_id } => client_ids.push(tunnel_client_id),
+        }
+    }
+    let mut live = HashSet::new();
+    if !agent_ids.is_empty()
+        && let Ok(rows) = state
+            .agents
+            .base
+            .find_many(
+                doc! { "_id": { "$in": &agent_ids }, "tenant_id": tenant_id, "deleted_at": null },
+                None,
+            )
+            .await
+    {
+        live.extend(rows.into_iter().filter_map(|a| a.id));
+    }
+    if !client_ids.is_empty()
+        && let Ok(rows) = state
+            .tunnel_clients
+            .base
+            .find_many(
+                doc! { "_id": { "$in": &client_ids }, "tenant_id": tenant_id, "deleted_at": null },
+                None,
+            )
+            .await
+    {
+        live.extend(rows.into_iter().filter_map(|c| c.id));
+    }
+    live
+}
+
+/// The id of whatever device backs this node — the key `resolve_will_rejoin`
+/// returns liveness under.
+fn backing_device_id(n: &OverlayNode) -> ObjectId {
+    match n.node_ref {
+        NodeRef::Agent { agent_id } => agent_id,
+        NodeRef::TunnelClient { tunnel_client_id } => tunnel_client_id,
     }
 }
 
@@ -92,7 +169,14 @@ pub async fn list_overlay_nodes(
         .overlay_nodes
         .list_active_in_network(tid, network_id)
         .await?;
-    let items: Vec<OverlayNodeResponse> = nodes.into_iter().map(Into::into).collect();
+    let live_devices = resolve_will_rejoin(&state, tid, &nodes).await;
+    let items: Vec<OverlayNodeResponse> = nodes
+        .into_iter()
+        .map(|n| {
+            let will_rejoin = live_devices.contains(&backing_device_id(&n));
+            OverlayNodeResponse::from_node(n, will_rejoin)
+        })
+        .collect();
     Ok(Json(serde_json::json!({ "items": items })))
 }
 
@@ -211,6 +295,76 @@ pub async fn set_exit_node(
     let updated = state.overlay_nodes.set_exit_node(nid, body.enabled).await?;
     crate::ws::overlay::refan_node(&state, &updated).await;
     Ok(Json(updated.into()))
+}
+
+#[derive(Debug, Serialize)]
+pub struct EvictOverlayNodeResponse {
+    pub released: bool,
+    pub node_id: String,
+    pub name: String,
+    /// The address returned to the tenant's pool.
+    pub overlay_ip: String,
+    /// `false` when the host number could not be recycled (CIDR drift, or the
+    /// pool is at its cap). The node is still evicted; the address just leaks.
+    pub host_recycled: bool,
+}
+
+/// DELETE /api/tenant/{tenant_id}/overlay-node/{node_id} — evict a node from the
+/// overlay mesh and release its address back to the tenant's pool.
+///
+/// This is "force a new lease", NOT "ban": it does not touch the backing agent /
+/// tunnel-client, so a still-enrolled device rejoins on its next connect and is
+/// handed a DIFFERENT overlay IP (and reappears as a new node id — its MagicDNS
+/// name comes back unchanged, since the tombstone no longer holds it). To remove
+/// a device for good, delete the agent or tunnel client. There is deliberately
+/// no per-machine overlay denylist today.
+pub async fn evict_overlay_node(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path((tenant_id, node_id)): Path<(String, String)>,
+) -> Result<Json<EvictOverlayNodeResponse>, ApiError> {
+    let tid = ObjectId::parse_str(&tenant_id)
+        .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
+    let nid = ObjectId::parse_str(&node_id)
+        .map_err(|_| ApiError::BadRequest("Invalid node_id".to_string()))?;
+    require_permission(
+        &state,
+        tid,
+        auth.user_id,
+        permissions::MANAGE_AGENTS,
+        "MANAGE_AGENTS",
+    )
+    .await?;
+
+    let network = state.overlay_networks.get_or_create(tid).await?;
+    let network_id = network
+        .id
+        .ok_or_else(|| ApiError::Internal("overlay network missing _id".into()))?;
+    // Scope the lookup to the tenant's network — cross-tenant-safe by
+    // construction, and an already-released node is simply absent (404).
+    let nodes = state
+        .overlay_nodes
+        .list_active_in_network(tid, network_id)
+        .await?;
+    let node = nodes
+        .into_iter()
+        .find(|n| n.id == Some(nid))
+        .ok_or_else(|| ApiError::NotFound("overlay node not found".into()))?;
+
+    let released = crate::ws::overlay::release_overlay_node(&state, &node, "admin_evict")
+        .await
+        .ok_or_else(|| ApiError::NotFound("overlay node not found".into()))?;
+
+    tracing::info!(admin = %auth.user_id, tenant = %tid, node = %nid,
+        overlay_ip = %released.overlay_ip, "admin evicted an overlay node");
+
+    Ok(Json(EvictOverlayNodeResponse {
+        released: true,
+        node_id: released.node_id.to_hex(),
+        name: released.name,
+        overlay_ip: released.overlay_ip,
+        host_recycled: released.host_recycled,
+    }))
 }
 
 // ────────────────────────────────────────────────────────────────────────────

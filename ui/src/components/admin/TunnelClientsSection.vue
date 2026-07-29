@@ -42,6 +42,9 @@
       <v-table v-else-if="store.clients.length > 0" density="compact">
         <thead>
           <tr>
+            <!-- Actions leftmost: a right-hand actions column falls off narrow
+                 viewports (same fix as AgentsSection). -->
+            <th class="text-center" style="width: 56px"></th>
             <th>Name</th>
             <th>Status</th>
             <th>OS</th>
@@ -51,6 +54,16 @@
         </thead>
         <tbody>
           <tr v-for="c in store.clients" :key="c.id">
+            <td class="text-center">
+              <v-btn
+                icon="mdi-delete"
+                color="error"
+                size="small"
+                variant="text"
+                :aria-label="`Remove tunnel client ${c.name}`"
+                @click="confirmDelete(c)"
+              />
+            </td>
             <td>
               <div class="font-weight-medium">{{ c.name }}</div>
               <div class="text-caption text-medium-emphasis">{{ c.machine_id }}</div>
@@ -87,17 +100,82 @@
       :error="issueError"
       @update:model-value="(v: boolean) => { if (!v) closeEnrollDialog() }"
     />
+
+    <v-dialog v-model="deleteDialogOpen" max-width="540">
+      <v-card>
+        <v-card-title>Remove this tunnel client from the tenant?</v-card-title>
+        <v-card-text>
+          <p class="font-weight-medium mb-3">{{ deleteTarget?.name }}</p>
+          <ul class="text-body-2 mb-3 ps-4">
+            <li>
+              It is evicted from the overlay mesh immediately — peers drop its
+              routes, and its live tunnel connection is closed.
+            </li>
+            <li>
+              Its overlay address is released back to this tenant's pool and may
+              later be assigned to a <strong>different</strong> machine.
+            </li>
+            <li>
+              The client stays installed on the host. It can be enrolled again,
+              but it comes back with a <strong>new overlay address and a new
+              name</strong>, so mesh forwards that named it stop resolving.
+            </li>
+          </ul>
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" @click="deleteDialogOpen = false">Cancel</v-btn>
+          <v-btn color="error" variant="flat" :loading="deleting" @click="performDelete">
+            Remove tunnel client
+          </v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
   </v-card>
 </template>
 
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
-import { useTunnelClientStore, type TunnelEnrollmentToken } from '@/stores/tunnelClients'
+import {
+  useTunnelClientStore,
+  type TunnelClient,
+  type TunnelEnrollmentToken,
+} from '@/stores/tunnelClients'
 import EnrollmentDialog from '@/components/enroll/EnrollmentDialog.vue'
+import { useSnackbar } from '@/composables/useSnackbar'
 
 const props = defineProps<{ tenantId: string }>()
 
 const store = useTunnelClientStore()
+const { showSuccess } = useSnackbar()
+
+const deleteDialogOpen = ref(false)
+const deleteTarget = ref<TunnelClient | null>(null)
+const deleting = ref(false)
+
+function confirmDelete(c: TunnelClient) {
+  deleteTarget.value = c
+  deleteDialogOpen.value = true
+}
+
+async function performDelete() {
+  const target = deleteTarget.value
+  if (!target) return
+  deleting.value = true
+  try {
+    const res = await store.deleteTunnelClient(props.tenantId, target.id)
+    showSuccess(
+      res.overlay_ip
+        ? `${target.name} removed — ${res.overlay_ip} is back in the pool.`
+        : `${target.name} removed.`,
+    )
+    deleteDialogOpen.value = false
+  } catch (e) {
+    store.error = (e as Error).message
+  } finally {
+    deleting.value = false
+  }
+}
 
 const enrollDialog = ref(false)
 const issuing = ref(false)

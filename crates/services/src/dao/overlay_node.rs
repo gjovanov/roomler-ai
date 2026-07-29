@@ -1,5 +1,6 @@
 use bson::{DateTime, doc, oid::ObjectId};
 use mongodb::Database;
+use mongodb::options::ReturnDocument;
 use roomler_ai_remote_control::models::{AgentStatus, DEFAULT_ROUTE_V4, NodeRef, OverlayNode};
 
 use super::base::{BaseDao, DaoResult};
@@ -18,16 +19,31 @@ impl OverlayNodeDao {
         }
     }
 
-    /// Locate a node by `(tenant_id, machine_id)` regardless of
-    /// soft-delete state — the join path calls this first and rehydrates
-    /// (keeping the leased overlay IP) instead of allocating a new one.
-    pub async fn find_by_tenant_and_machine(
+    /// Locate the LIVE overlay node for `(tenant_id, machine_id)`. The join
+    /// path calls this first and rehydrates (keeping the leased overlay IP)
+    /// instead of allocating a new one.
+    ///
+    /// Scoped to `deleted_at: null` because removal tombstones IN PLACE: a
+    /// released machine keeps its row as the forensic record, and re-enrolling
+    /// the SAME machine must NOT revive it — removal is FINAL, so the device
+    /// comes back as a brand-new node with a fresh IP and a freshly-deduped
+    /// name.
+    ///
+    /// The scoping is MANDATORY, not cosmetic: the `(tenant_id, machine_id)`
+    /// unique index is partial on live rows, so several tombstones may share a
+    /// `machine_id` alongside one live row, and an unscoped `find_one` would
+    /// return an arbitrary one of them — making a live node look absent.
+    pub async fn find_live_by_tenant_and_machine(
         &self,
         tenant_id: ObjectId,
         machine_id: &str,
     ) -> DaoResult<Option<OverlayNode>> {
         self.base
-            .find_one(doc! { "tenant_id": tenant_id, "machine_id": machine_id })
+            .find_one(doc! {
+                "tenant_id": tenant_id,
+                "machine_id": machine_id,
+                "deleted_at": null,
+            })
             .await
     }
 
@@ -92,9 +108,13 @@ impl OverlayNodeDao {
         self.base.find_by_id(id).await
     }
 
-    /// Re-join: clear `deleted_at`, refresh the WG key + endpoints +
-    /// node_ref, mark Online. Keeps the existing `overlay_ip`. Returns
-    /// the updated row.
+    /// Re-join: refresh the WG key + endpoints + node_ref, mark Online. Keeps
+    /// the existing `overlay_ip`. Returns the updated row.
+    ///
+    /// Only ever reached for a LIVE row (the lookup is
+    /// [`Self::find_live_by_tenant_and_machine`]), so the `deleted_at: Null` in
+    /// the `$set` below is a vestigial no-op — kept as belt-and-braces in case
+    /// the lookup is ever widened.
     #[allow(clippy::too_many_arguments)]
     pub async fn rehydrate(
         &self,
@@ -160,6 +180,46 @@ impl OverlayNodeDao {
             )
             .await?;
         self.base.find_by_id(node_id).await
+    }
+
+    /// Compare-and-swap tombstone: mark the node released ONLY if it is still
+    /// live, returning the PRE-image (so the caller can recover the overlay IP
+    /// it was holding). `None` ⇒ someone else already released it — a
+    /// double-clicked evict, or an evict racing the agent DELETE — and the
+    /// caller must do nothing further.
+    ///
+    /// Winning this CAS is the release TOKEN: it is what keeps a host number
+    /// from being returned to the free pool twice, which would hand two live
+    /// nodes the same overlay IP.
+    ///
+    /// `overlay_ip`, `name`, `wg_public_key`, `machine_id` and `node_ref` are
+    /// deliberately KEPT — the tombstone is the record of who held an address,
+    /// which matters precisely because addresses now recycle. Uniqueness on the
+    /// IP and the name is scoped to live rows, so a tombstone holds neither.
+    pub async fn release(&self, node_id: ObjectId) -> DaoResult<Option<OverlayNode>> {
+        let now = DateTime::now();
+        Ok(self
+            .base
+            .collection()
+            .find_one_and_update(
+                doc! { "_id": node_id, "deleted_at": null },
+                doc! { "$set": {
+                    // `Unenrolled`, not `Offline`: an offline node is coming
+                    // back, a released one is not.
+                    "status": bson::to_bson(&AgentStatus::Unenrolled).unwrap(),
+                    // Revoke the ADMIN GRANTS. Not strictly required — a
+                    // re-enroll creates a fresh row with both empty, and the
+                    // approval surface only lists live nodes — but a future
+                    // "restore node" action must never silently reinstate
+                    // exit-node authority.
+                    "approved_routes": Vec::<String>::new(),
+                    "is_exit_node": false,
+                    "deleted_at": now,
+                    "updated_at": now,
+                } },
+            )
+            .return_document(ReturnDocument::Before)
+            .await?)
     }
 
     /// All active (non-deleted) nodes in a network — the netmap source.

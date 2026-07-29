@@ -11,6 +11,7 @@ path = "src/lib.rs"
 roomler-ai-config = { path = "../config" }
 roomler-ai-db = { path = "../db" }
 roomler-ai-services = { path = "../services" }
+roomler-ai-remote-control = { path = "../remote_control" }
 roomler-ai-api = { path = "../api" }
 roomler-agent = { path = "../../agents/roomler-agent" }
 webrtc.workspace = true
