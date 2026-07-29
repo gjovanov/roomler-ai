@@ -1,5 +1,12 @@
 <template>
-  <div class="mention-list" v-if="items.length">
+  <!-- v-show (not v-if) so the root element ALWAYS exists at the first
+       synchronous render. TipTap's VueRenderer captures the popup content
+       once as `el.firstElementChild` and hands that reference to tippy; a
+       v-if that's false at t0 makes firstElementChild null → tippy gets no
+       content and never recovers when items populate on a later render
+       (the headless-container mention:66 breakage, #246). v-show keeps the
+       hide-when-empty behavior while giving tippy a stable anchor. -->
+  <div class="mention-list" v-show="items.length">
     <button
       v-for="(item, index) in items"
       :key="item.id"
