@@ -25,6 +25,14 @@ export interface TunnelEnrollmentToken {
   jti: string
 }
 
+// Matches the `delete_tunnel_client` handler's JSON.
+export interface DeletedTunnelClient {
+  deleted: boolean
+  overlay_released: boolean
+  // `null` when the client never joined the overlay.
+  overlay_ip: string | null
+}
+
 interface TunnelClientListResponse {
   items: TunnelClient[]
   total: number
@@ -65,6 +73,21 @@ export const useTunnelClientStore = defineStore('tunnelClients', () => {
     )
   }
 
+  // Remove a tunnel client from the fleet. The server evicts its overlay node
+  // first — peers get a `removes` delta and its overlay address goes back to the
+  // tenant's pool, so it may later be assigned to a different machine.
+  async function deleteTunnelClient(
+    tenantId: string,
+    clientId: string,
+  ): Promise<DeletedTunnelClient> {
+    const res = await api.delete<DeletedTunnelClient>(
+      `/tenant/${tenantId}/tunnel-client/${clientId}`,
+    )
+    clients.value = clients.value.filter((c) => c.id !== clientId)
+    total.value = Math.max(0, total.value - 1)
+    return res
+  }
+
   return {
     clients,
     total,
@@ -72,5 +95,6 @@ export const useTunnelClientStore = defineStore('tunnelClients', () => {
     error,
     fetchTunnelClients,
     issueEnrollmentToken,
+    deleteTunnelClient,
   }
 })

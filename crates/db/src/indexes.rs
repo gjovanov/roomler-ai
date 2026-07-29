@@ -293,24 +293,53 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> 
     .await?;
 
     // Overlay nodes — virtual-LAN membership above agents/tunnel_clients.
-    // Same (tenant_id, machine_id) rehydrate contract as agents; the
-    // (tenant_id, network_id, overlay_ip) unique index guarantees no two
-    // live nodes share an overlay address. The (tenant_id, network_id,
-    // deleted_at) index backs the netmap build query.
+    //
+    // All three unique indexes are scoped to LIVE rows, because removing a
+    // device from the fleet TOMBSTONES its node in place (keeping the address
+    // and name as the forensic record of who held them) and returns the host
+    // number to `overlay_networks.free_hosts` for reuse. A non-scoped unique
+    // index would let a tombstone go on holding its IP and its name forever,
+    // which is exactly the leak the release feature exists to close.
+    //
+    // The filter is `$type: "null"`, NOT `{deleted_at: null}`: equality-to-null
+    // in Mongo also matches ABSENT, whereas `$type` matches only an explicit
+    // BSON null. `OverlayNode.deleted_at` is declared without
+    // `skip_serializing_if`/`serde(default)`, so it is written on every insert
+    // and required on every read — "absent" is unreachable and `$type` is
+    // exact. Tradeoff: a `$type`-filtered partial index is NOT usable by the
+    // planner for a `{deleted_at: null}` query predicate. That is fine — these
+    // three enforce uniqueness; the plain (tenant_id, network_id, deleted_at)
+    // index below is what serves the netmap build query.
     create_indexes(
         db,
         "overlay_nodes",
         vec![
-            index_unique(bson::doc! { "tenant_id": 1, "machine_id": 1 }),
-            index_unique(bson::doc! { "tenant_id": 1, "network_id": 1, "overlay_ip": 1 }),
+            // Rehydrate key. Many tombstones per machine (a machine can be
+            // removed and re-enrolled repeatedly, taking a fresh lease each
+            // time) must coexist with AT MOST ONE live row.
+            index_unique_partial(
+                bson::doc! { "tenant_id": 1, "machine_id": 1 },
+                bson::doc! { "deleted_at": { "$type": "null" } },
+            ),
+            // No two LIVE nodes share an overlay address.
+            index_unique_partial(
+                bson::doc! { "tenant_id": 1, "network_id": 1, "overlay_ip": 1 },
+                bson::doc! { "deleted_at": { "$type": "null" } },
+            ),
             index(bson::doc! { "tenant_id": 1, "network_id": 1, "deleted_at": 1 }),
-            // Phase 0 — per-network-unique node name (MagicDNS). Partial so the
-            // empty names on pre-Phase-0 rows (backfilled on next rejoin) don't
-            // collide.
+            // Phase 0 — per-network-unique node name (MagicDNS). The `name > ""`
+            // half keeps the empty names on pre-Phase-0 rows (backfilled on next
+            // rejoin) from colliding; the `deleted_at` half releases the name on
+            // removal so the next device can take it.
             index_unique_partial(
                 bson::doc! { "tenant_id": 1, "network_id": 1, "name": 1 },
-                bson::doc! { "name": { "$gt": "" } },
+                bson::doc! { "$and": [
+                    { "name": { "$gt": "" } },
+                    { "deleted_at": { "$type": "null" } },
+                ] },
             ),
+            // Backs the by-node_ref lookups on the removal paths.
+            index(bson::doc! { "tenant_id": 1, "node_ref.id": 1 }),
         ],
     )
     .await?;
