@@ -42,6 +42,8 @@ mod notification_tests;
 #[cfg(test)]
 mod oauth_tests;
 #[cfg(test)]
+mod overlay_tests;
+#[cfg(test)]
 mod pagination_tests;
 #[cfg(test)]
 mod pdf_export_tests;

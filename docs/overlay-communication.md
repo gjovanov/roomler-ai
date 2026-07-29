@@ -88,6 +88,61 @@ The data plane is always **WireGuard**: a userspace boringtun tunnel presenting
 a `roomler0` TUN on `100.64.0.0/10` (CGNAT range, Tailscale convention) at MTU
 1280. Only the *envelope* under WireGuard changes between tiers.
 
+### Address leases — allocation and release
+
+Each tenant has one `overlay_networks` row: a CIDR (`100.64.0.0/10`), a
+monotonic `next_host` cursor, and `free_hosts`, a pool of **recycled** host
+numbers. On `rc:overlay.join` the server looks the machine up by
+`(tenant_id, machine_id)`:
+
+- **a live node** → rehydrate it; the lease is unchanged.
+- **no live node** → `allocate_host` pops the head of `free_hosts` (FIFO, so an
+  address gets the longest possible cool-down before reuse) and falls back to
+  bumping `next_host` when the pool is empty. Both branches are single atomic
+  `find_one_and_update`s, so concurrent joiners can never be handed the same
+  number.
+
+The IPv6 address is **derived**, never allocated: `derive_overlay_v6` embeds the
+v4 in the low 32 bits of the pinned ULA `fd72:6f6f:6d6c::/96`. There is one
+allocator, and freeing the v4 frees both.
+
+**Removal releases the lease.** All three removal paths — `DELETE …/agent/{id}`,
+`DELETE …/overlay-node/{id}` (admin evict), `DELETE …/tunnel-client/{id}` — go
+through one writer, and the order is load-bearing:
+
+1. read the peer list while the node is still live;
+2. **compare-and-swap** the node's `deleted_at` (winning that CAS is the release
+   *token* — only the winner proceeds, so two concurrent removals can't pool one
+   host twice);
+3. return the host number to `free_hosts`;
+4. fan `rc:overlay.netmap_delta { removes: [node_id] }` to those peers, and to
+   the released node itself.
+
+Pooling *before* the tombstone would hand the address to a second joiner while
+the old row still held it, and the unique index would lock that joiner out of
+the overlay permanently. In this order a crash merely leaks one host number out
+of a 4.2 M-address `/10`.
+
+The node row is **tombstoned, not deleted**: its address, name and pubkey stay
+as the record of who held them — which matters precisely because addresses now
+recycle. The three unique indexes on `overlay_nodes` are scoped to live rows, so
+a tombstone holds neither its address nor its MagicDNS name.
+
+Two consequences worth knowing:
+
+- **Removal is final.** A removed machine that re-enrolls comes back as a *new*
+  node with a fresh address and a fresh name; the tombstone is never revived.
+- **Evict is "force a new lease", not "ban".** It doesn't touch the backing
+  agent / tunnel client, so a still-enrolled device rejoins on its next connect
+  with a *different* address. To remove a device for good, delete it. There is
+  deliberately no per-machine overlay denylist.
+
+Because addresses are reused, the client keys every routing teardown by
+**pubkey**, never by address, drops an OS `/32` only when no surviving peer
+still claims it, and prunes anything the full netmap no longer lists. A *name*
+in `overlay_exit_node` is pinned to the node it first resolved to — see
+`docs/overlay-exit-nodes.md`.
+
 ---
 
 ## 2. What a "carrier" is

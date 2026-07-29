@@ -33,6 +33,7 @@ impl OverlayNetworkDao {
             cidr: OverlayNetwork::DEFAULT_CIDR.to_string(),
             // Host 0 is the network address — start handing out from 1.
             next_host: 1,
+            free_hosts: Vec::new(),
             mtu: OverlayNetwork::DEFAULT_MTU,
             created_at: now,
             updated_at: now,
@@ -50,10 +51,38 @@ impl OverlayNetworkDao {
         }
     }
 
-    /// Atomically claim the next host number for `network_id`, returning
-    /// the value that was current BEFORE the increment (i.e. the host to
-    /// assign). Monotonic; never recycled while node rows live.
+    /// Claim a host number for `network_id`. Prefers a RECYCLED host from the
+    /// tenant's free pool (FIFO — oldest release first, so an address gets the
+    /// longest cool-down before reuse); falls back to bumping the monotonic
+    /// `next_host` cursor when the pool is empty.
+    ///
+    /// Both branches are single atomic `find_one_and_update`s, so N concurrent
+    /// joiners can never be handed the same host: MongoDB serialises updates to
+    /// one document, and each racer gets its OWN pre-image — racer A sees
+    /// `[7, 9]` and takes 7 while racer B sees `[9]` and takes 9.
     pub async fn allocate_host(&self, network_id: ObjectId) -> DaoResult<u32> {
+        // 1) The pool. `free_hosts.0: {$exists: true}` is the "array is
+        //    non-empty" test — an empty pool simply fails to match and we fall
+        //    through to the cursor.
+        let popped = self
+            .base
+            .collection()
+            .find_one_and_update(
+                doc! { "_id": network_id, "free_hosts.0": { "$exists": true } },
+                doc! {
+                    "$pop": { "free_hosts": -1 },
+                    "$set": { "updated_at": DateTime::now() },
+                },
+            )
+            .return_document(ReturnDocument::Before)
+            .await?;
+        if let Some(before) = popped
+            && let Some(host) = before.free_hosts.first().copied()
+        {
+            return Ok(host);
+        }
+
+        // 2) Pool empty — bump the cursor.
         let before = self
             .base
             .collection()
@@ -65,5 +94,51 @@ impl OverlayNetworkDao {
             .await?
             .ok_or(DaoError::NotFound)?;
         Ok(before.next_host)
+    }
+
+    /// Return a host number to the tenant's free pool so a future join can
+    /// recycle it. `true` when the pool actually accepted it.
+    ///
+    /// `$addToSet` (not `$push`) is deliberate: a double release — an admin
+    /// evicting a node at the same moment the agent DELETE fires — would
+    /// otherwise seed the pool with a duplicate, hand two live nodes the same
+    /// overlay IP, and trip the unique `(tenant_id, network_id, overlay_ip)`
+    /// index on the second `create`, locking that device out of the overlay
+    /// permanently. The caller's compare-and-swap tombstone makes that
+    /// unreachable; this is the second layer.
+    ///
+    /// A rejected release is never an error for the caller: the host simply
+    /// LEAKS out of a 4.2 M-address `/10`.
+    pub async fn release_host(&self, network_id: ObjectId, host: u32) -> DaoResult<bool> {
+        // Host 0 is the network address and was never issued.
+        if host == 0 {
+            return Ok(false);
+        }
+        let mut filter = doc! {
+            "_id": network_id,
+            // Only recycle a host the cursor actually issued. Guards against a
+            // CIDR edit making the ip→host inverse meaningless.
+            "next_host": { "$gt": host as i64 },
+        };
+        // Size cap: the element at index MAX being absent ⇒ len <= MAX.
+        filter.insert(
+            format!("free_hosts.{}", OverlayNetwork::MAX_FREE_HOSTS),
+            doc! { "$exists": false },
+        );
+
+        // NOT via `BaseDao::update_one`: that helper builds an empty
+        // `$setOnInsert` when the update carries no `$set`, which Mongo rejects.
+        let res = self
+            .base
+            .collection()
+            .update_one(
+                filter,
+                doc! {
+                    "$addToSet": { "free_hosts": host as i64 },
+                    "$set": { "updated_at": DateTime::now() },
+                },
+            )
+            .await?;
+        Ok(res.modified_count > 0)
     }
 }
