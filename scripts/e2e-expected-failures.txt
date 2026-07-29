@@ -14,16 +14,7 @@ e2e/rc-vp9-444.spec.ts
 # Playwright routing sees them (the identical GitHub-redirect test passes;
 # the server's 307 Location was verified correct directly). 2026-07-28.
 clicking Google OAuth button redirects to Google
-# Quarantined 2026-07-29 (tracking: issue #246). conference-list:76 was FIXED
-# (stale post-S4 selector — getByText('Rooms').first() matched the nav leaf,
-# now scoped to the dashboard card) and removed from this list.
-#
-# mention:66 remains: the tippy suggestion popup OPENS (.tippy-box/.tippy-content
-# present) but renders EMPTY in the headless-container Chromium — the MentionList
-# VueRenderer content element never populates even with a query (@ev → still 0
-# items), so `.mention-list` is absent. NOT an app regression (the items list is
-# never empty — everyone/here always present) and NOT CSP; the feature works in
-# real browsers. Root-cause is a headless-only VueRenderer/tippy rendering quirk.
-# Fixing it requires an app-side rework of MessageEditor's suggestion render
-# (its own build/deploy/verify cycle); tracked in #246. Remove when done.
-mention autocomplete shows room members
+# (Both specs quarantined 2026-07-29 under #246 are now FIXED and removed:
+#  conference-list:76 — stale post-S4 selector, re-scoped to the dashboard
+#  card (#248); mention:66 — v-if→v-show stable tippy anchor in MentionList
+#  (#250, v20260729-135328). Kept here as a marker in case either regresses.)
