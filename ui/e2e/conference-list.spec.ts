@@ -76,14 +76,20 @@ test.describe('Room List', () => {
   test('dashboard room card links to rooms page', async ({ page }) => {
     await page.goto(`/tenant/${tenantId}`)
 
-    // The room card should be clickable
-    const roomCard = page.getByText('Rooms').first()
+    // The dashboard's Rooms stat card is a router-link (<v-card :to>
+    // rendering an <a href=".../rooms">) inside <main>. Target it by
+    // its href and scope to main — a bare getByText('Rooms').first()
+    // matches the nav-drawer "Rooms" leaf (DOM-order before main) since
+    // the S4 IA pivot, which isn't the "dashboard room card" this test
+    // is about and click-hangs.
+    // The dashboard has more than one link to /rooms (the Rooms stat
+    // card + a quick-action button); the stat card is first in DOM.
+    const roomCard = page.locator(`main a[href$="/tenant/${tenantId}/rooms"]`).first()
     await expect(roomCard).toBeVisible({ timeout: 10000 })
+    await expect(roomCard).toContainText('Rooms')
 
-    // Click the card area
     await roomCard.click()
 
-    // Should navigate to rooms list
     await expect(page).toHaveURL(new RegExp(`/tenant/${tenantId}/rooms`), {
       timeout: 10000,
     })
