@@ -820,8 +820,13 @@ pub struct OverlayNode {
     /// Phase 0 (Tailscale-style names).
     #[serde(default)]
     pub name: String,
-    /// Leased overlay address, e.g. `"100.64.0.7"`. Stable for the row's
-    /// life; reclaimed only on hard-delete.
+    /// Leased overlay address, e.g. `"100.64.0.7"`. Stable for as long as the
+    /// row is LIVE. On release (device removed from the fleet) the row is
+    /// tombstoned and the host number goes back to `OverlayNetwork.free_hosts`
+    /// for reuse — the address is KEPT here as the forensic record of who held
+    /// it, which matters precisely because addresses now recycle. The
+    /// `(tenant_id, network_id, overlay_ip)` unique index is scoped to live
+    /// rows, so a tombstone holds nothing.
     pub overlay_ip: String,
     /// base64-encoded Curve25519 public key (WireGuard static key).
     pub wg_public_key: String,
@@ -929,10 +934,11 @@ impl OverlayNode {
 /// added via the exit-node toggle, never the per-CIDR approval grid.
 pub const DEFAULT_ROUTE_V4: &str = "0.0.0.0/0";
 
-/// IPAM authority for one tenant's overlay. One row per tenant. The
-/// allocator hands out host numbers monotonically from `next_host`
-/// (atomic `$inc`), so leases are stable and never recycled while the
-/// node row lives.
+/// IPAM authority for one tenant's overlay. One row per tenant. The allocator
+/// prefers a RECYCLED host from `free_hosts` (returned when a device is removed
+/// from the fleet) and otherwise hands out the next number from the monotonic
+/// `next_host` cursor (atomic `$inc`). A lease is stable for as long as its node
+/// row is live.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct OverlayNetwork {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
@@ -941,8 +947,19 @@ pub struct OverlayNetwork {
     /// CGNAT range per the Tailscale convention, e.g. `"100.64.0.0/10"`.
     pub cidr: String,
     /// Monotonic host cursor — the next host number to hand out. `1` for
-    /// a fresh network (host `0` is the network address, reserved).
+    /// a fresh network (host `0` is the network address, reserved). Only
+    /// bumped when [`free_hosts`](Self::free_hosts) is empty.
     pub next_host: u32,
+    /// Host numbers RECYCLED from removed devices, oldest release first. A
+    /// join pops the head before touching `next_host`, so a released address
+    /// gets the longest possible cool-down before it is handed out again.
+    ///
+    /// `#[serde(default)]` is LOAD-BEARING: every `overlay_networks` row
+    /// written before the release feature lacks this field, and without the
+    /// default they would all fail to deserialize — taking the entire overlay
+    /// down on the first `get_or_create`.
+    #[serde(default)]
+    pub free_hosts: Vec<u32>,
     /// Path MTU for the overlay. 1280 leaves headroom for the WG +
     /// carrier (UDP/relay) overhead under a 1500-byte underlay.
     pub mtu: u16,
@@ -956,4 +973,101 @@ impl OverlayNetwork {
     pub const DEFAULT_CIDR: &'static str = "100.64.0.0/10";
     /// Default overlay MTU.
     pub const DEFAULT_MTU: u16 = 1280;
+    /// Ceiling on [`free_hosts`](Self::free_hosts). A `u32` array element costs
+    /// ~9 bytes of BSON, so the 16 MB document cap is ~1.7 M entries — this cap
+    /// sits far below it. Past the cap a release is DROPPED and the host leaks
+    /// out of a 4.2 M-address `/10`: a leak, never a conflict.
+    pub const MAX_FREE_HOSTS: usize = 65_536;
+
+    /// This network's dotted address for `host`. See [`overlay_ip`].
+    pub fn host_ip(&self, host: u32) -> Option<String> {
+        overlay_ip(&self.cidr, host)
+    }
+
+    /// The host number `ip` was leased from in this network. See [`overlay_host`].
+    pub fn host_of_ip(&self, ip: &str) -> Option<u32> {
+        overlay_host(&self.cidr, ip)
+    }
+}
+
+/// `base_cidr` + host number → dotted overlay IP. e.g.
+/// `("100.64.0.0/10", 7) → "100.64.0.7"`. No `ipnet` needed — the host
+/// number is added to the network base address as a `u32`.
+///
+/// The PREFIX IS DISCARDED: the host is added to whatever address is written
+/// on the left of the `/`, not to the masked network address. [`overlay_host`]
+/// inverts this by parsing the same way, and the round-trip test in this module
+/// pins the pair together — do not "fix" one to mask without the other.
+pub fn overlay_ip(cidr: &str, host: u32) -> Option<String> {
+    let (base, _prefix) = cidr.split_once('/')?;
+    let base: std::net::Ipv4Addr = base.parse().ok()?;
+    let addr = std::net::Ipv4Addr::from(u32::from(base).checked_add(host)?);
+    Some(addr.to_string())
+}
+
+/// Exact inverse of [`overlay_ip`] — recover the host number a dotted overlay
+/// address was leased from, so a removed device's number can be returned to the
+/// network's free pool.
+///
+/// `None` when `cidr`/`ip` are malformed, or when `ip` sorts BELOW the base:
+/// that is how a row leased under a DIFFERENT, since-changed CIDR is rejected
+/// instead of poisoning the pool with a bogus host number.
+pub fn overlay_host(cidr: &str, ip: &str) -> Option<u32> {
+    let (base, _prefix) = cidr.split_once('/')?;
+    let base: std::net::Ipv4Addr = base.parse().ok()?;
+    let addr: std::net::Ipv4Addr = ip.parse().ok()?;
+    u32::from(addr).checked_sub(u32::from(base))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overlay_ip_adds_host_to_cgnat_base() {
+        let cidr = OverlayNetwork::DEFAULT_CIDR;
+        assert_eq!(overlay_ip(cidr, 1).as_deref(), Some("100.64.0.1"));
+        assert_eq!(overlay_ip(cidr, 7).as_deref(), Some("100.64.0.7"));
+        assert_eq!(overlay_ip(cidr, 256).as_deref(), Some("100.64.1.0"));
+        assert_eq!(overlay_ip("not-a-cidr", 1), None);
+    }
+
+    #[test]
+    fn overlay_host_inverts_overlay_ip() {
+        let cidr = OverlayNetwork::DEFAULT_CIDR;
+        assert_eq!(overlay_host(cidr, "100.64.0.7"), Some(7));
+        assert_eq!(overlay_host(cidr, "100.64.1.0"), Some(256));
+        assert_eq!(overlay_host("10.0.0.0/8", "10.0.0.1"), Some(1));
+    }
+
+    /// The contract that keeps the free pool honest: whatever `overlay_ip`
+    /// hands out, `overlay_host` must recover exactly. If someone later masks
+    /// `overlay_ip` to the network address without fixing the inverse, released
+    /// host numbers would be off and the pool would hand out wrong addresses.
+    #[test]
+    fn overlay_host_round_trips_for_every_host() {
+        let cidr = OverlayNetwork::DEFAULT_CIDR;
+        for host in [1u32, 2, 255, 256, 65_535, 1_000_000, 4_194_302] {
+            let ip = overlay_ip(cidr, host).expect("forward");
+            assert_eq!(overlay_host(cidr, &ip), Some(host), "round-trip for {host}");
+        }
+    }
+
+    /// Both directions ignore the prefix identically, so a non-canonical CIDR
+    /// (base not masked to the prefix) still round-trips.
+    #[test]
+    fn overlay_host_ignores_the_prefix_like_overlay_ip_does() {
+        let cidr = "100.64.0.5/10";
+        assert_eq!(overlay_ip(cidr, 2).as_deref(), Some("100.64.0.7"));
+        assert_eq!(overlay_host(cidr, "100.64.0.7"), Some(2));
+    }
+
+    #[test]
+    fn overlay_host_rejects_out_of_range_and_malformed() {
+        let cidr = OverlayNetwork::DEFAULT_CIDR;
+        // Below the base — a lease from a different, since-changed CIDR.
+        assert_eq!(overlay_host(cidr, "10.0.0.1"), None);
+        assert_eq!(overlay_host("not-a-cidr", "1.2.3.4"), None);
+        assert_eq!(overlay_host(cidr, "nope"), None);
+    }
 }

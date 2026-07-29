@@ -15,11 +15,26 @@ export interface OverlayNode {
   // P5 — node advertised 0.0.0.0/0, so it's eligible to be toggled on.
   can_be_exit_node: boolean
   online: boolean
+  // The backing device is still enrolled, so evicting this node from the mesh
+  // does NOT keep it out — it rejoins on its next connect with a NEW overlay
+  // address. `false` means the device is gone and the eviction is permanent.
+  will_rejoin: boolean
   last_seen_at: string
 }
 
 interface OverlayNodeListResponse {
   items: OverlayNode[]
+}
+
+// Matches `overlay_route.rs::EvictOverlayNodeResponse`.
+export interface EvictedNode {
+  released: boolean
+  node_id: string
+  name: string
+  overlay_ip: string
+  // `false` when the address could not be returned to the pool (it still left
+  // the mesh — the address just isn't reused).
+  host_recycled: boolean
 }
 
 // A node's *derived* overlay IPv6: its overlay v4 embedded in the low 32 bits
@@ -97,6 +112,19 @@ export const useOverlayRoutesStore = defineStore('overlayRoutes', () => {
     return updated
   }
 
+  // Evict a node from the overlay mesh. The server fans an
+  // OverlayNetmapDelta{removes:[id]} to every peer BEFORE responding, and
+  // returns the node's overlay address to the tenant's pool — so it may later
+  // be assigned to a DIFFERENT machine. A node whose backing device is still
+  // enrolled (`will_rejoin`) comes back on its next connect with a new address.
+  async function evictNode(tenantId: string, nodeId: string): Promise<EvictedNode> {
+    const res = await api.delete<EvictedNode>(
+      `/tenant/${tenantId}/overlay-node/${nodeId}`,
+    )
+    nodes.value = nodes.value.filter((n) => n.id !== nodeId)
+    return res
+  }
+
   async function fetchMagicDns(tenantId: string): Promise<MagicDnsSettings> {
     return await api.get<MagicDnsSettings>(`/tenant/${tenantId}/magic-dns`)
   }
@@ -118,6 +146,7 @@ export const useOverlayRoutesStore = defineStore('overlayRoutes', () => {
     fetchNodes,
     setApprovedRoutes,
     setExitNode,
+    evictNode,
     fetchMagicDns,
     saveMagicDns,
   }

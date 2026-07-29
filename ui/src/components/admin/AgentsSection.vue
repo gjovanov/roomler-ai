@@ -453,19 +453,38 @@
   </v-dialog>
 
   <!-- Delete confirmation -->
-  <v-dialog v-model="deleteDialogOpen" max-width="440">
+  <v-dialog v-model="deleteDialogOpen" max-width="540">
     <v-card>
-      <v-card-title>Delete agent?</v-card-title>
+      <v-card-title>Remove this device from the tenant?</v-card-title>
       <v-card-text>
-        This will revoke the agent's token and remove it from the list. Any active
-        remote-control sessions on this agent will be terminated. This cannot be undone.
-        <p class="mt-2 font-weight-medium">{{ deleteTarget?.name }}</p>
+        <p class="font-weight-medium mb-3">{{ deleteTarget?.name }}</p>
+        <ul class="text-body-2 mb-3 ps-4">
+          <li>
+            It is evicted from the overlay mesh immediately — peers drop its
+            routes, and any live remote-control or tunnel session to it ends.
+          </li>
+          <li>
+            Its overlay address is released back to this tenant's pool and may
+            later be assigned to a <strong>different</strong> machine.
+          </li>
+          <li>
+            The agent stays installed on the host. It can be enrolled again with
+            a new enrollment token, but it comes back with a
+            <strong>new overlay address and a new name</strong>.
+          </li>
+        </ul>
+        <v-alert type="warning" variant="tonal" density="compact" class="mb-0">
+          Anything pinned to the old identity stops working — scripts using this
+          agent id, tunnel forwards targeting it, firewall rules on its old
+          overlay address, and any client configured with
+          <code>overlay_exit_node = "{{ deleteTarget?.name }}"</code>.
+        </v-alert>
       </v-card-text>
       <v-card-actions>
         <v-spacer />
         <v-btn variant="text" @click="deleteDialogOpen = false">Cancel</v-btn>
         <v-btn color="error" variant="flat" @click="performDelete" :loading="deleting">
-          Delete
+          Remove device
         </v-btn>
       </v-card-actions>
     </v-card>
