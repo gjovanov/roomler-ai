@@ -43,6 +43,9 @@
       <v-table v-else density="compact">
         <thead>
           <tr>
+            <!-- Actions leftmost: a right-hand actions column falls off narrow
+                 viewports (same fix as AgentsSection). -->
+            <th class="text-center" style="width: 56px"></th>
             <th>Machine</th>
             <th>Overlay address</th>
             <th>Kind</th>
@@ -52,6 +55,16 @@
         </thead>
         <tbody>
           <tr v-for="n in store.nodes" :key="n.id">
+            <td class="text-center">
+              <v-btn
+                icon="mdi-lan-disconnect"
+                color="error"
+                size="small"
+                variant="text"
+                :aria-label="`Remove ${n.name} from the mesh`"
+                @click="confirmEvict(n)"
+              />
+            </td>
             <td>
               <div class="d-flex align-center">
                 <v-icon size="10" :color="n.online ? 'success' : 'grey'" class="mr-2">mdi-circle</v-icon>
@@ -86,15 +99,91 @@
         </tbody>
       </v-table>
     </v-card-text>
+
+    <v-dialog v-model="evictDialogOpen" max-width="540">
+      <v-card>
+        <v-card-title>
+          {{ evictTarget?.will_rejoin
+            ? `Force a new overlay address for “${evictTarget?.name}”?`
+            : `Remove “${evictTarget?.name}” from the mesh?` }}
+        </v-card-title>
+        <v-card-text>
+          <ul class="text-body-2 mb-3 ps-4">
+            <li>
+              It leaves the mesh immediately — every peer drops its routes, and
+              traffic to
+              <span class="text-mono">{{ evictTarget?.overlay_ip }}</span>
+              stops.
+            </li>
+            <li>
+              That address is released back to this tenant's pool and may later
+              be assigned to a <strong>different</strong> machine.
+            </li>
+            <li v-if="evictTarget?.will_rejoin">
+              <strong>{{ evictTarget?.name }}</strong> is still enrolled, so it
+              rejoins automatically on its next connect — with a
+              <strong>different</strong> overlay address. This does not revoke
+              access; to remove the device for good, delete the agent or tunnel
+              client.
+            </li>
+            <li v-else>
+              Its backing device is no longer enrolled, so it will not come back.
+            </li>
+          </ul>
+          <v-alert type="warning" variant="tonal" density="compact" class="mb-0">
+            Anything pinned to the old address stops working — firewall rules,
+            scripts, and any client configured with
+            <code>overlay_exit_node = "{{ evictTarget?.name }}"</code>.
+          </v-alert>
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" @click="evictDialogOpen = false">Cancel</v-btn>
+          <v-btn color="error" variant="flat" :loading="evicting" @click="performEvict">
+            {{ evictTarget?.will_rejoin ? 'Evict and reassign' : 'Remove from mesh' }}
+          </v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
   </v-card>
 </template>
 
 <script setup lang="ts">
-import { onMounted } from 'vue'
-import { useOverlayRoutesStore, deriveOverlayV6 } from '@/stores/overlayRoutes'
+import { onMounted, ref } from 'vue'
+import { useOverlayRoutesStore, deriveOverlayV6, type OverlayNode } from '@/stores/overlayRoutes'
+import { useSnackbar } from '@/composables/useSnackbar'
 
 const props = defineProps<{ tenantId: string }>()
 const store = useOverlayRoutesStore()
+const { showSuccess } = useSnackbar()
+
+const evictDialogOpen = ref(false)
+const evictTarget = ref<OverlayNode | null>(null)
+const evicting = ref(false)
+
+function confirmEvict(n: OverlayNode) {
+  evictTarget.value = n
+  evictDialogOpen.value = true
+}
+
+async function performEvict() {
+  const target = evictTarget.value
+  if (!target) return
+  evicting.value = true
+  try {
+    const res = await store.evictNode(props.tenantId, target.id)
+    showSuccess(
+      res.host_recycled
+        ? `${res.name} left the mesh — ${res.overlay_ip} is back in the pool.`
+        : `${res.name} left the mesh.`,
+    )
+    evictDialogOpen.value = false
+  } catch (e) {
+    store.error = (e as Error).message
+  } finally {
+    evicting.value = false
+  }
+}
 
 function formatLastSeen(iso: string): string {
   if (!iso) return '—'
