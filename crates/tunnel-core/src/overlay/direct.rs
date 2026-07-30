@@ -125,6 +125,101 @@ pub fn force_egress_interface(sock: &tokio::net::UdpSocket, ifindex: u32) {
 #[cfg(not(all(windows, feature = "overlay-l3")))]
 pub fn force_egress_interface(_sock: &tokio::net::UdpSocket, _ifindex: u32) {}
 
+/// Gate for **bind-to-interface-by-route** LAN-carrier egress selection
+/// (`ROOMLER_NODE_OVERLAY_BIND_BY_ROUTE`; legacy `ROOMLER_AGENT_…` alias
+/// honoured). **Default OFF** until field-proven, mirroring the QUIC /
+/// `public_direct` arc. When on, a LAN direct carrier's egress interface is
+/// chosen per-destination from the OS route table (the connect()-trick,
+/// [`os_src_ip_for`]) + [`classify_egress`], and the socket is re-pinned to
+/// the CURRENT ifindex — instead of relying on the same-subnet heuristic and a
+/// pin computed once at startup. This is Tailscale's `bindToInterfaceByRoute`
+/// (net/netns) adapted to roomler: an on-link `/24` beats a full-tunnel VPN's
+/// `/1` default, so a genuine same-LAN peer stays on the physical NIC even
+/// under a corporate VPN, and a peer the OS routes elsewhere (VPN-captured)
+/// falls to relay honestly instead of flapping a one-way "direct".
+pub fn bind_by_route_enabled() -> bool {
+    match crate::env::node_env("OVERLAY_BIND_BY_ROUTE") {
+        Some(v) => {
+            let t = v.trim();
+            t.eq_ignore_ascii_case("1")
+                || t.eq_ignore_ascii_case("true")
+                || t.eq_ignore_ascii_case("yes")
+                || t.eq_ignore_ascii_case("on")
+        }
+        None => false,
+    }
+}
+
+/// The OS's chosen egress for a LAN direct destination, classified against the
+/// interfaces we hold a bound socket on. Pure output of [`classify_egress`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Egress {
+    /// The OS routes `dst` via an interface we hold a socket on (its source
+    /// IP). Use that socket, re-pinned to its current ifindex.
+    Use(Ipv4Addr),
+    /// The OS routes `dst` back into the overlay's own CGNAT range (our TUN) —
+    /// binding there would loop. Skip direct (the loop-guard).
+    Loop,
+    /// The OS routes `dst` via an interface we do NOT hold a LAN socket on
+    /// (e.g. a full-tunnel VPN captured this destination). The same-subnet LAN
+    /// carrier would be one-way → skip direct, fall to relay honestly.
+    Foreign,
+    /// The route query failed / gave no answer → caller keeps the pre-existing
+    /// same-subnet behaviour (never worse than today).
+    Unknown,
+}
+
+/// Classify the OS's chosen source IP for a LAN destination against the set of
+/// interface IPs we hold a bound direct socket on. Pure (no I/O) so the
+/// decision is unit-tested on synthetic data, exactly like
+/// [`pick_same_subnet_endpoint`]. The loop-guard is [`is_cgnat`]: the overlay's
+/// own TUN carries a `100.64.0.0/10` address, so an OS source-IP in that range
+/// means the route resolves back into the overlay itself.
+///
+/// - `None` (query failed) → [`Egress::Unknown`].
+/// - CGNAT source → [`Egress::Loop`].
+/// - source ∈ `our_socket_ips` → [`Egress::Use`].
+/// - any other source → [`Egress::Foreign`].
+pub fn classify_egress(src_ip: Option<Ipv4Addr>, our_socket_ips: &[Ipv4Addr]) -> Egress {
+    match src_ip {
+        None => Egress::Unknown,
+        Some(ip) if is_cgnat(ip) => Egress::Loop,
+        Some(ip) if our_socket_ips.contains(&ip) => Egress::Use(ip),
+        Some(_) => Egress::Foreign,
+    }
+}
+
+/// The OS's chosen SOURCE IPv4 for reaching `dst` — the portable "which
+/// interface would this packet leave from?" query (Tailscale's `connect()`
+/// trick, `net/netns`): bind a throwaway UDP socket to `0.0.0.0:0`,
+/// `connect(dst)` (which sends **no** packet — on a UDP socket it only sets the
+/// default peer and makes the kernel resolve the route + assign a local
+/// address), then read `local_addr()`. The kernel honours the full routing
+/// table, so an on-link `/24` wins over a VPN's `/1` split-default and a genuine
+/// same-LAN `dst` resolves to the physical NIC even under a full-tunnel VPN.
+/// Works on every platform (including Windows, where it complements
+/// `IP_UNICAST_IF`). `None` on any error → caller falls back to the same-subnet
+/// heuristic.
+pub async fn os_src_ip_for(dst: SocketAddr) -> Option<Ipv4Addr> {
+    let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await.ok()?;
+    sock.connect(dst).await.ok()?;
+    match sock.local_addr().ok()? {
+        SocketAddr::V4(a) if !a.ip().is_unspecified() => Some(*a.ip()),
+        _ => None,
+    }
+}
+
+/// The CURRENT OS interface index for one of our LAN interface IPs, re-read
+/// from [`gather_lan_interfaces`] at call time so the egress pin reflects the
+/// live interface table (a VPN connect can add interfaces / renumber). `None`
+/// if the IP is no longer present or `if-addrs` supplies no index.
+pub fn ifindex_for(ip: Ipv4Addr) -> Option<u32> {
+    gather_lan_interfaces()
+        .into_iter()
+        .find(|(i, _)| *i == ip)
+        .and_then(|(_, ix)| ix)
+}
+
 /// True for an IPv4 that can serve as a same-LAN endpoint: not loopback, not
 /// link-local (169.254), not unspecified/broadcast, and not in the overlay
 /// CGNAT range `100.64.0.0/10` (which collides with both the overlay itself
@@ -663,6 +758,79 @@ mod tests {
                 None => std::env::remove_var(a),
             }
         }
+    }
+
+    /// bind-to-interface-by-route is DEFAULT-OFF opt-in (positive truthy only),
+    /// mirroring `public_direct_enabled`. (Serialises env mutation.)
+    #[test]
+    fn bind_by_route_defaults_off_with_opt_in() {
+        let n = "ROOMLER_NODE_OVERLAY_BIND_BY_ROUTE";
+        let a = "ROOMLER_AGENT_OVERLAY_BIND_BY_ROUTE";
+        let (rn, ra) = (std::env::var(n).ok(), std::env::var(a).ok());
+        unsafe {
+            std::env::remove_var(n);
+            std::env::remove_var(a);
+        }
+        assert!(!bind_by_route_enabled(), "unset → default OFF");
+        for v in ["1", "true", "On", "yes"] {
+            unsafe { std::env::set_var(n, v) };
+            assert!(bind_by_route_enabled(), "{v:?} → opt-in ON");
+        }
+        for v in ["0", "false", "off", "", "  ", "anything"] {
+            unsafe { std::env::set_var(n, v) };
+            assert!(!bind_by_route_enabled(), "{v:?} → stays OFF");
+        }
+        unsafe {
+            match rn {
+                Some(v) => std::env::set_var(n, v),
+                None => std::env::remove_var(n),
+            }
+            match ra {
+                Some(v) => std::env::set_var(a, v),
+                None => std::env::remove_var(a),
+            }
+        }
+    }
+
+    /// The pure egress classifier: the OS-chosen source IP mapped against the
+    /// interfaces we hold a socket on, with the CGNAT loop-guard.
+    #[test]
+    fn classify_egress_cases() {
+        let wifi: Ipv4Addr = "192.168.68.106".parse().unwrap();
+        let eth: Ipv4Addr = "172.30.224.45".parse().unwrap();
+        let ours = [wifi, eth]; // a multi-homed host's real LAN sockets
+        // On-link /24 wins over the VPN default → the OS sources from the WiFi
+        // NIC → Use it (the CORPLAP-1-through-VPN happy path).
+        assert_eq!(classify_egress(Some(wifi), &ours), Egress::Use(wifi));
+        // Multi-homed: whichever real interface the OS picks is used verbatim.
+        assert_eq!(classify_egress(Some(eth), &ours), Egress::Use(eth));
+        // The OS routes the dst via an interface we don't hold a LAN socket on
+        // (a full-tunnel VPN captured it) → Foreign → skip direct → relay.
+        let vpn: Ipv4Addr = "10.66.24.53".parse().unwrap();
+        assert_eq!(classify_egress(Some(vpn), &ours), Egress::Foreign);
+        // The route resolves back into the overlay's own CGNAT TUN → Loop.
+        assert_eq!(
+            classify_egress(Some("100.64.0.2".parse().unwrap()), &ours),
+            Egress::Loop
+        );
+        // Query failed → Unknown → caller keeps the same-subnet behaviour.
+        assert_eq!(classify_egress(None, &ours), Egress::Unknown);
+        // Empty socket set (relay-only host) → any real source is Foreign.
+        assert_eq!(classify_egress(Some(wifi), &[]), Egress::Foreign);
+    }
+
+    /// The connect()-trick resolves a plausible source IP for a routable dst on
+    /// any platform (no packet is sent; we only read the bound local address).
+    #[tokio::test]
+    async fn os_src_ip_for_returns_a_source_on_a_routable_dst() {
+        // 8.8.8.8 resolves via the default route on any host with networking;
+        // loopback is the fallback that always works in a sandbox.
+        let via_loopback = os_src_ip_for("127.0.0.1:9".parse().unwrap()).await;
+        assert_eq!(
+            via_loopback,
+            Some(Ipv4Addr::LOCALHOST),
+            "a loopback dst sources from loopback"
+        );
     }
 
     #[test]
