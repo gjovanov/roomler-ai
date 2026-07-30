@@ -326,6 +326,7 @@ mod tests {
             online: true,
             connection: ConnectionType::Direct,
             upgrading: false,
+            stalled: false,
             rtt_ms: None,
             last_seen_ms: None,
             agent_id: None,
