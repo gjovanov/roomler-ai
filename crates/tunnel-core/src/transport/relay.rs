@@ -295,11 +295,22 @@ pub async fn allocate_turn_relay(
 
     // The underlay socket the TURN *client* uses to reach coturn. quinn
     // never sees this — it sends/receives through the relayed conn.
-    let underlay = Arc::new(
-        tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
-            .await
-            .context("bind TURN client underlay socket")?,
-    );
+    let underlay_sock = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+        .await
+        .context("bind TURN client underlay socket")?;
+    // VPN-bypass: pin the coturn underlay's egress to the physical uplink so
+    // TURN traffic leaves the real NIC instead of a full-tunnel corp VPN's
+    // captured default — pinned HERE, the only moment before the socket is
+    // moved into (and hidden by) the `turn` client. `overlay-l3`-gated so the
+    // non-overlay tunnel-core build (which lacks `crate::overlay`) still
+    // compiles; `force_egress_interface` is itself a no-op off Windows / the
+    // gate is off unless `OVERLAY_VPN_BYPASS` + an uplink ifindex are set.
+    #[cfg(feature = "overlay-l3")]
+    if let Some(ix) = crate::overlay::direct::vpn_bypass_ifindex() {
+        crate::overlay::direct::force_egress_interface(&underlay_sock, ix);
+        tracing::info!(ifindex = ix, %turn_server, "overlay: VPN-bypass — coturn underlay egress pinned to the physical uplink");
+    }
+    let underlay = Arc::new(underlay_sock);
 
     let client = Client::new(ClientConfig {
         stun_serv_addr: String::new(),
