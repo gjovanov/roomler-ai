@@ -150,6 +150,53 @@ pub fn bind_by_route_enabled() -> bool {
     }
 }
 
+/// Gate for **VPN-bypass** carrier egress (`ROOMLER_NODE_OVERLAY_VPN_BYPASS`;
+/// legacy `ROOMLER_AGENT_…` alias honoured). **Default OFF** opt-in. When on
+/// (and an uplink ifindex is resolved), EVERY overlay underlay carrier socket
+/// — the `public_sock`, the single-relay dialer, and the coturn TURN underlay —
+/// has its egress pinned (`IP_UNICAST_IF`) to the host's real PHYSICAL uplink,
+/// forcing the overlay's own transport out the physical NIC instead of a
+/// full-tunnel corporate VPN's captured default route. Confirmed on ÖBB
+/// CORPLAP-1 (2026-07-30): a Check Point full-tunnel VPN captured ALL egress
+/// (`Find-NetRoute` → every dst via `172.30.x/Ethernet`), so its carriers rode
+/// the VPN one-way; pinning to the physical Wi-Fi bypasses it. This is
+/// Tailscale's `net/netns` "bind to the physical interface, not another VPN's
+/// tunnel" applied to the whole underlay. Mirrors the `public_direct` opt-in
+/// arc; flips default-ON after the CORPLAP-1 field-proof.
+pub fn vpn_bypass_enabled() -> bool {
+    match crate::env::node_env("OVERLAY_VPN_BYPASS") {
+        Some(v) => {
+            let t = v.trim();
+            t.eq_ignore_ascii_case("1")
+                || t.eq_ignore_ascii_case("true")
+                || t.eq_ignore_ascii_case("yes")
+                || t.eq_ignore_ascii_case("on")
+        }
+        None => false,
+    }
+}
+
+/// Operator-pinned physical-uplink OS interface index for [`vpn_bypass_enabled`]
+/// (`ROOMLER_NODE_OVERLAY_UPLINK_IF` = a numeric ifindex, e.g. the Wi-Fi
+/// adapter's index from `Get-NetIPInterface`). This explicit override
+/// field-proves the bypass mechanism before auto-discovery of the physical
+/// uplink beneath a captured VPN is built. `None` when unset/unparseable.
+pub fn uplink_ifindex_override() -> Option<u32> {
+    crate::env::node_env("OVERLAY_UPLINK_IF").and_then(|v| v.trim().parse::<u32>().ok())
+}
+
+/// The physical-uplink ifindex a carrier underlay socket should pin its egress
+/// to, or `None` to leave egress on the OS default route (today's behaviour).
+/// `Some` only when VPN-bypass is enabled AND an uplink ifindex is resolved
+/// (currently the explicit [`uplink_ifindex_override`]; auto-discovery later).
+pub fn vpn_bypass_ifindex() -> Option<u32> {
+    if vpn_bypass_enabled() {
+        uplink_ifindex_override()
+    } else {
+        None
+    }
+}
+
 /// The OS's chosen egress for a LAN direct destination, classified against the
 /// interfaces we hold a bound socket on. Pure output of [`classify_egress`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -788,6 +835,56 @@ mod tests {
             match ra {
                 Some(v) => std::env::set_var(a, v),
                 None => std::env::remove_var(a),
+            }
+        }
+    }
+
+    /// VPN-bypass is DEFAULT-OFF opt-in; `vpn_bypass_ifindex` resolves only when
+    /// the gate is ON **and** an uplink ifindex override is set. (Serialises
+    /// env mutation; the overlay-l3 suite runs `--test-threads=1`.)
+    #[test]
+    fn vpn_bypass_gate_and_ifindex_override() {
+        let g = "ROOMLER_NODE_OVERLAY_VPN_BYPASS";
+        let ga = "ROOMLER_AGENT_OVERLAY_VPN_BYPASS";
+        let u = "ROOMLER_NODE_OVERLAY_UPLINK_IF";
+        let ua = "ROOMLER_AGENT_OVERLAY_UPLINK_IF";
+        let save = [g, ga, u, ua].map(|k| (k, std::env::var(k).ok()));
+        unsafe {
+            for k in [g, ga, u, ua] {
+                std::env::remove_var(k);
+            }
+        }
+        assert!(!vpn_bypass_enabled(), "unset → OFF");
+        assert_eq!(uplink_ifindex_override(), None);
+        assert_eq!(vpn_bypass_ifindex(), None);
+
+        // Uplink set but gate off → no pin.
+        unsafe { std::env::set_var(u, "25") };
+        assert_eq!(uplink_ifindex_override(), Some(25));
+        assert_eq!(
+            vpn_bypass_ifindex(),
+            None,
+            "gate off → no pin even with uplink"
+        );
+
+        // Gate on + uplink set → pin to the uplink ifindex.
+        unsafe { std::env::set_var(g, "1") };
+        assert!(vpn_bypass_enabled());
+        assert_eq!(vpn_bypass_ifindex(), Some(25), "gate on + uplink → pin");
+
+        // Gate on but no/garbage uplink → None (nothing to pin to yet).
+        unsafe {
+            std::env::remove_var(u);
+            std::env::set_var(u, "notanumber");
+        }
+        assert_eq!(vpn_bypass_ifindex(), None, "unparseable uplink → None");
+
+        unsafe {
+            for (k, v) in save {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
             }
         }
     }
