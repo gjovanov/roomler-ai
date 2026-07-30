@@ -38,7 +38,9 @@ use super::netmap::{PeerConfig, peer_config_from_netmap};
 use super::relay_link::{ReadyLink, RelayCoordinator, RelayKind};
 use super::tun::TunIo;
 use super::wg::{Carrier, QUIC_BUILD_TIMEOUT, WG_OVERHEAD, WgDevice, overlay_quic_enabled};
-use crate::localapi::{ConnectionType, DnsStatus, ExitNodeStatus, OverlayView, PeerInfo};
+use crate::localapi::{
+    ConnectionType, DnsStatus, ExitNodeStatus, OverlayView, PeerCarrierDebug, PeerInfo,
+};
 use crate::transport::derp::DerpMux;
 use roomler_ai_remote_control::signaling::{ClientMsg, IceServer, NetmapPeer, OverlayNetworkInfo};
 
@@ -470,6 +472,30 @@ struct Installed {
     /// cooldown (CC1) and the off-link handshake deadline. `Relay` for a coturn
     /// carrier, `Lan`/`Public`/`Srflx` for the three direct tiers.
     tier: DirectTier,
+    /// rc.276 diagnostics — did WE initiate this carrier's flow (outbound dial /
+    /// our own allocation), or was it adopted from an authenticated INBOUND
+    /// dial (accept re-point / accepted-probe promote)? The CORPLAP-1 corp-VPN
+    /// case turns on exactly this split: outbound-initiated flows are policy-
+    /// dropped while inbound-accepted ones pass — and pre-rc.276 the
+    /// `initiate` bit was discarded at install, so the peers view couldn't
+    /// distinguish them.
+    initiated: bool,
+    /// rc.276 diagnostics — the sweep's latest `peer_handshake_done` read
+    /// (set-once WG session latch, either role). Stamped each tick next to
+    /// `stalled`; `false` until the first sweep after install.
+    hs_done: bool,
+    /// rc.276 diagnostics — the carrier socket's LOCAL address (for a relay
+    /// carrier: the allocation's relayed address). Which socket each
+    /// direction rides is the exact question the CORPLAP-1 field captures need
+    /// answered.
+    carrier_local: Option<std::net::SocketAddr>,
+    /// rc.276 diagnostics — the carrier's send destination (direct: the dial
+    /// dst or the accepted peer's observed src; relay: the peer's relayed
+    /// address).
+    carrier_dst: Option<std::net::SocketAddr>,
+    /// rc.276 diagnostics — relay flavor label for the peers view (`"turn"` /
+    /// `"derp"`). `None` for direct carriers.
+    relay_kind_dbg: Option<&'static str>,
 }
 
 /// rc.208 — an in-flight make-before-break upgrade probe. The candidate direct
@@ -490,6 +516,13 @@ struct UpgradeProbe {
     tier: DirectTier,
     /// When the probe was started — for the tier handshake deadline.
     since: Instant,
+    /// rc.276 diagnostics — `true` for an outbound MBB upgrade probe (we
+    /// dialed), `false` for an accepted inbound dial held as a probe. Carried
+    /// into `Installed.initiated` on promote.
+    initiated: bool,
+    /// rc.276 diagnostics — the probe socket's local address, carried into
+    /// `Installed.carrier_local` on promote.
+    local: Option<std::net::SocketAddr>,
 }
 
 /// After a direct carrier fails, don't retry direct for this peer for this
@@ -1081,6 +1114,24 @@ fn build_overlay_view(
                 // shows each end's coturn worker; same IP on both = same-worker.
                 relay_local: inst.and_then(|i| i.relay_local).map(|a| a.to_string()),
                 relay_dst: inst.and_then(|i| i.relay_dst).map(|a| a.to_string()),
+                // rc.276 diagnostics — the carrier forensic snapshot (JSON-only).
+                debug: inst.map(|i| PeerCarrierDebug {
+                    tier: match i.tier {
+                        DirectTier::Lan => "lan",
+                        DirectTier::Public => "public",
+                        DirectTier::Srflx => "srflx",
+                        DirectTier::Relay => "relay",
+                    }
+                    .to_string(),
+                    initiated: i.initiated,
+                    hs_done: i.hs_done,
+                    local: i.carrier_local.map(|a| a.to_string()),
+                    dst: i.carrier_dst.map(|a| a.to_string()),
+                    tx: i.last_traffic.0,
+                    rx: i.last_traffic.1,
+                    last_rx_age_s: now.saturating_duration_since(i.last_rx_at).as_secs(),
+                    relay_kind: i.relay_kind_dbg.map(str::to_string),
+                }),
             }
         })
         .collect();
@@ -1484,7 +1535,11 @@ impl OverlayRuntime {
             // Phase D — advertise the single-relay capability (our OVERLAY_RELAY_SINGLE
             // flag) so the server only lets a peer pick single-relay when BOTH ends
             // opted in; a mixed pair stays on the both-allocate relay.
-            supports_relay_single: crate::overlay::direct::relay_single_enabled(),
+            // rc.276 — forced-TLS vetoes single-relay: the raw-UDP DIALER
+            // role is the exact flow shape the affected hosts can't send,
+            // and advertising the veto keeps both ends' strategy symmetric.
+            supports_relay_single: crate::overlay::direct::relay_single_enabled()
+                && !crate::overlay::direct::relay_tls_forced(),
             // Phase D (DERP) — advertise the DERP capability (our OVERLAY_DERP
             // flag) so a both-UDP-blocked pair only picks DERP when BOTH ends
             // opted in. Default-OFF until field-proven.
@@ -2605,6 +2660,8 @@ impl OverlayRuntime {
             // reap decisions stay with `carrier_tick` below.
             e.stalled =
                 super::lifecycle::carrier_stalled(e.since.elapsed(), handshake_done, v.bad_sweeps);
+            // rc.276 diagnostics — mirror the latch for the peers debug view.
+            e.hs_done = handshake_done;
             if v.clear_tier_strikes {
                 // Clear the count on the carrier's OWN tier (CC1 — never
                 // cross-clear) so old failures don't accumulate across a long
@@ -3423,6 +3480,8 @@ impl OverlayRuntime {
         self.shadow(|s| s.mon.on_probe_started(&node_id, tier, now));
         wg.ensure_direct_demux(sock.clone());
         // Outbound upgrade: WE dial the peer, so initiate the handshake.
+        // rc.276 diagnostics — capture before `sock` moves into the device.
+        let probe_local = sock.local_addr().ok();
         wg.start_direct_probe(sock, cfg.public_key, cfg.overlay_ip, dst, true)
             .await;
         upgrade_probes.insert(
@@ -3433,6 +3492,8 @@ impl OverlayRuntime {
                 dst,
                 tier,
                 since: now,
+                initiated: true,
+                local: probe_local,
             },
         );
         info!(
@@ -3518,6 +3579,11 @@ impl OverlayRuntime {
                             last_traffic: (0, 0),
                             bad_sweeps: 0,
                             stalled: false,
+                            initiated: p.initiated,
+                            hs_done: true, // promote fires on the latched handshake
+                            carrier_local: p.local,
+                            carrier_dst: Some(p.dst),
+                            relay_kind_dbg: None,
                             last_rx_at: now,
                             relay_local: None,
                             relay_dst: None,
@@ -3636,6 +3702,11 @@ impl OverlayRuntime {
                 last_traffic: (0, 0),
                 bad_sweeps: 0,
                 stalled: false,
+                initiated: true,
+                hs_done: false,
+                carrier_local: sock.local_addr().ok(),
+                carrier_dst: Some(dst),
+                relay_kind_dbg: None,
                 last_rx_at: Instant::now(),
                 relay_local: None,
                 relay_dst: None,
@@ -3682,6 +3753,8 @@ impl OverlayRuntime {
                 .on_installed(&node_id, DirectTier::Public, Instant::now())
         });
         wg.ensure_direct_demux(sock.clone());
+        // rc.276 diagnostics — capture before `sock` moves into the device.
+        let carrier_local = sock.local_addr().ok();
         wg.add_direct_peer(sock, cfg.public_key, cfg.overlay_ip, dst, true)
             .await;
         by_node.insert(
@@ -3694,6 +3767,11 @@ impl OverlayRuntime {
                 last_traffic: (0, 0),
                 bad_sweeps: 0,
                 stalled: false,
+                initiated: true,
+                hs_done: false,
+                carrier_local,
+                carrier_dst: Some(dst),
+                relay_kind_dbg: None,
                 last_rx_at: Instant::now(),
                 relay_local: None,
                 relay_dst: None,
@@ -3741,6 +3819,8 @@ impl OverlayRuntime {
                 .on_installed(&node_id, DirectTier::Srflx, Instant::now())
         });
         wg.ensure_direct_demux(sock.clone());
+        // rc.276 diagnostics — capture before `sock` moves into the device.
+        let carrier_local = sock.local_addr().ok();
         wg.add_direct_peer(sock, cfg.public_key, cfg.overlay_ip, dst, true)
             .await;
         by_node.insert(
@@ -3753,6 +3833,11 @@ impl OverlayRuntime {
                 last_traffic: (0, 0),
                 bad_sweeps: 0,
                 stalled: false,
+                initiated: true,
+                hs_done: false,
+                carrier_local,
+                carrier_dst: Some(dst),
+                relay_kind_dbg: None,
                 last_rx_at: Instant::now(),
                 relay_local: None,
                 relay_dst: None,
@@ -3924,6 +4009,10 @@ impl OverlayRuntime {
                         dst: inb.src,
                         tier,
                         since: now,
+                        // rc.276 — an ACCEPTED inbound dial held as a probe:
+                        // the peer initiated the flow.
+                        initiated: false,
+                        local: inb.sock.local_addr().ok(),
                     },
                 );
                 info!(
@@ -3970,6 +4059,14 @@ impl OverlayRuntime {
                 last_traffic: (0, 0),
                 bad_sweeps: 0,
                 stalled: false,
+                // rc.276 — adopted from an authenticated INBOUND dial: the
+                // flow was initiated by the peer (the CORPLAP-1-class rescue
+                // path a stateful corp firewall permits).
+                initiated: false,
+                hs_done: true, // authenticate_init proved the session
+                carrier_local: inb.sock.local_addr().ok(),
+                carrier_dst: Some(inb.src),
+                relay_kind_dbg: None,
                 last_rx_at: Instant::now(),
                 relay_local: None,
                 relay_dst: None,
@@ -4163,6 +4260,16 @@ impl OverlayRuntime {
                 last_traffic: (0, 0),
                 bad_sweeps: 0,
                 stalled: false,
+                // rc.276 — every install_ready carrier is a flow WE built
+                // (our allocation / dialer socket / DERP WS / loopback).
+                initiated: true,
+                hs_done: false,
+                carrier_local: relay_local,
+                carrier_dst: relay_dst,
+                relay_kind_dbg: (!is_direct).then_some(match link.relay_kind {
+                    super::relay_link::RelayKind::Turn => "turn",
+                    super::relay_link::RelayKind::Derp => "derp",
+                }),
                 last_rx_at: Instant::now(),
                 relay_local,
                 relay_dst,
@@ -4735,6 +4842,11 @@ mod tests {
                     last_traffic: (0, 0),
                     bad_sweeps: 0,
                     stalled: false,
+                    initiated: false,
+                    hs_done: false,
+                    carrier_local: None,
+                    carrier_dst: None,
+                    relay_kind_dbg: None,
                     last_rx_at: Instant::now(),
                     relay_local: None,
                     relay_dst: None,
@@ -4982,6 +5094,11 @@ mod tests {
                 last_traffic: (0, 0),
                 bad_sweeps: 0,
                 stalled: false,
+                initiated: false,
+                hs_done: false,
+                carrier_local: None,
+                carrier_dst: None,
+                relay_kind_dbg: None,
                 last_rx_at: Instant::now(),
                 relay_local: None,
                 relay_dst: None,
@@ -5085,6 +5202,11 @@ mod tests {
                 last_traffic: (0, 0),
                 bad_sweeps: 0,
                 stalled: false,
+                initiated: false,
+                hs_done: false,
+                carrier_local: None,
+                carrier_dst: None,
+                relay_kind_dbg: None,
                 last_rx_at: Instant::now(),
                 relay_local: None,
                 relay_dst: None,
@@ -5181,6 +5303,11 @@ mod tests {
             last_traffic: (0, 0),
             bad_sweeps: 0,
             stalled: false,
+            initiated: false,
+            hs_done: false,
+            carrier_local: None,
+            carrier_dst: None,
+            relay_kind_dbg: None,
             last_rx_at: Instant::now(),
             relay_local: None,
             relay_dst: None,
@@ -5377,6 +5504,11 @@ mod tests {
                 last_traffic: (0, 0),
                 bad_sweeps: 0,
                 stalled: false,
+                initiated: false,
+                hs_done: false,
+                carrier_local: None,
+                carrier_dst: None,
+                relay_kind_dbg: None,
                 last_rx_at: Instant::now(),
                 relay_local: None,
                 relay_dst: None,
@@ -5393,6 +5525,8 @@ mod tests {
                 dst: dead,
                 tier,
                 since: probe_since,
+                initiated: true,
+                local: None,
             },
         );
         (rt, wg, tun_mock, by_node, upgrade_probes, nid, pk)
@@ -5577,6 +5711,11 @@ mod tests {
             last_traffic: (0, 0),
             bad_sweeps: 0,
             stalled: false,
+            initiated: false,
+            hs_done: false,
+            carrier_local: None,
+            carrier_dst: None,
+            relay_kind_dbg: None,
             last_rx_at: Instant::now(),
             relay_local: None,
             relay_dst: None,
@@ -5721,6 +5860,11 @@ mod tests {
                 last_traffic: snap,
                 bad_sweeps: 0,
                 stalled: false,
+                initiated: false,
+                hs_done: false,
+                carrier_local: None,
+                carrier_dst: None,
+                relay_kind_dbg: None,
                 last_rx_at: stale,
                 relay_local: None,
                 relay_dst: None,
@@ -5813,6 +5957,11 @@ mod tests {
                 last_traffic: snap,
                 bad_sweeps: 0,
                 stalled: false,
+                initiated: false,
+                hs_done: false,
+                carrier_local: None,
+                carrier_dst: None,
+                relay_kind_dbg: None,
                 last_rx_at: old,
                 relay_local: None,
                 relay_dst: None,
@@ -6300,6 +6449,11 @@ mod tests {
                 last_traffic: (0, 0),
                 bad_sweeps: 0,
                 stalled: false,
+                initiated: false,
+                hs_done: false,
+                carrier_local: None,
+                carrier_dst: None,
+                relay_kind_dbg: None,
                 last_rx_at,
                 relay_local: relay.map(|(l, _)| l),
                 relay_dst: relay.map(|(_, d)| d),
@@ -6357,6 +6511,8 @@ mod tests {
             dst: "192.168.68.1:51820".parse().unwrap(),
             tier: DirectTier::Lan,
             since: now,
+            initiated: true,
+            local: None,
         };
         probes.insert(r, dummy_probe());
         probes.insert(d, dummy_probe());
@@ -6408,6 +6564,17 @@ mod tests {
         assert!(view.peers[0].relay_local.is_none() && view.peers[0].relay_dst.is_none());
         assert!(view.peers[2].relay_dst.is_none());
         assert!(view.peers[3].relay_dst.is_none());
+        // rc.276 — the carrier debug snapshot: present for installed peers
+        // (tier + rx-age mapped through), absent for carrier-less ones.
+        let d0 = view.peers[0].debug.as_ref().expect("direct peer has debug");
+        assert_eq!(d0.tier, "lan");
+        assert_eq!(d0.last_rx_age_s, 10);
+        assert!(!d0.initiated && !d0.hs_done, "fixture defaults map through");
+        assert!(d0.relay_kind.is_none());
+        let d1 = view.peers[1].debug.as_ref().expect("relay peer has debug");
+        assert_eq!(d1.tier, "relay");
+        assert_eq!(d1.last_rx_age_s, 0);
+        assert!(view.peers[2].debug.is_none() && view.peers[3].debug.is_none());
     }
 
     struct MockTun {
@@ -6906,6 +7073,11 @@ mod tests {
                 last_traffic: (0, 0),
                 bad_sweeps: 0,
                 stalled: false,
+                initiated: false,
+                hs_done: false,
+                carrier_local: None,
+                carrier_dst: None,
+                relay_kind_dbg: None,
                 last_rx_at: Instant::now(),
                 relay_local: relay.map(|(l, _)| l),
                 relay_dst: relay.map(|(_, d)| d),
@@ -6967,6 +7139,11 @@ mod tests {
                 last_traffic: (0, 0),
                 bad_sweeps: 0,
                 stalled: false,
+                initiated: false,
+                hs_done: false,
+                carrier_local: None,
+                carrier_dst: None,
+                relay_kind_dbg: None,
                 last_rx_at: Instant::now(),
                 relay_local: None,
                 relay_dst: None,
@@ -7054,6 +7231,11 @@ mod tests {
                 last_traffic: (0, 0),
                 bad_sweeps: 0,
                 stalled: false,
+                initiated: false,
+                hs_done: false,
+                carrier_local: None,
+                carrier_dst: None,
+                relay_kind_dbg: None,
                 last_rx_at: Instant::now(),
                 relay_local: None,
                 relay_dst: None,

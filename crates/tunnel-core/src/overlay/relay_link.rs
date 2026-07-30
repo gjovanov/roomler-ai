@@ -44,7 +44,7 @@ use tracing::{debug, info, warn};
 use super::netmap::PeerConfig;
 use super::wg::Carrier;
 use crate::transport::derp::DerpMux;
-use crate::transport::relay::{RelayConn, allocate_relay_from_ice};
+use crate::transport::relay::RelayConn;
 use roomler_ai_remote_control::signaling::{ClientMsg, IceServer};
 
 /// Which relay carrier a [`ReadyLink`] rides. `install_ready` gates the
@@ -233,7 +233,11 @@ impl RelayCoordinator {
             advertised: HashMap::new(),
             lan_endpoints,
             my_public_key,
-            single_relay: super::direct::relay_single_enabled(),
+            // rc.276 — forced-TLS vetoes single-relay locally too (paired
+            // with the join-time `supports_relay_single` veto so both ends'
+            // strategy matrices stay symmetric).
+            single_relay: super::direct::relay_single_enabled()
+                && !super::direct::relay_tls_forced(),
             my_udp_relay_ok,
             dialing: HashMap::new(),
             derping: HashMap::new(),
@@ -588,8 +592,13 @@ impl RelayCoordinator {
     /// can run it without touching coordinator state.
     async fn allocate_pinned(ice: &[IceServer], pin: Option<IpAddr>) -> Option<Arc<dyn RelayConn>> {
         let (urls, user, cred) = turn_creds(ice)?;
+        // rc.276 (B-probe) — `OVERLAY_RELAY_TLS=1` forces every allocation
+        // onto the TURNS/TCP tier (the WebRTC-proven corp transport). The
+        // UDP worker-pin prepend is skipped too (it's a Tier-2 URL; the
+        // TURNS tier stays worker-pinned via the server's `&pin=`).
+        let tls_only = super::direct::relay_tls_forced();
         let urls = match pin {
-            Some(ip) => {
+            Some(ip) if !tls_only => {
                 let h = if ip.is_ipv6() {
                     format!("[{ip}]")
                 } else {
@@ -605,12 +614,14 @@ impl RelayCoordinator {
                 pinned.extend(urls);
                 pinned
             }
-            None => urls,
+            _ => urls,
         };
-        match allocate_relay_from_ice(&urls, &user, &cred).await {
+        match crate::transport::relay::allocate_relay_from_ice_tiered(&urls, &user, &cred, tls_only)
+            .await
+        {
             Ok(c) => Some(Arc::new(c) as Arc<dyn RelayConn>),
             Err(e) => {
-                warn!(%e, pinned = pin.is_some(), "overlay relay: allocate failed");
+                warn!(%e, pinned = pin.is_some(), tls_only, "overlay relay: allocate failed");
                 None
             }
         }

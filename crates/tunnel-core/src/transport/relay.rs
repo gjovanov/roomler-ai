@@ -503,31 +503,55 @@ pub async fn allocate_relay_from_ice(
     username: &str,
     credential: &str,
 ) -> anyhow::Result<TurnRelayConn> {
+    allocate_relay_from_ice_tiered(urls, username, credential, false).await
+}
+
+/// [`allocate_relay_from_ice`] with an explicit tier policy. `tls_only = true`
+/// skips Tier 2 entirely and drives the TURNS/TCP candidates directly —
+/// rc.276 (B-probe): on corp-endpoint-VPN hosts the UDP allocate *succeeds*
+/// and then runs silently one-way, so falling through to Tier 3 never
+/// happens on its own; the overlay's `OVERLAY_RELAY_TLS` force-knob and the
+/// planned strike-driven demotion both land here. Every attempt outcome logs
+/// at INFO with its tier label so a field grep answers "which tier did this
+/// host actually allocate on" in one shot.
+pub async fn allocate_relay_from_ice_tiered(
+    urls: &[String],
+    username: &str,
+    credential: &str,
+    tls_only: bool,
+) -> anyhow::Result<TurnRelayConn> {
     // Tier 2: each UDP relay candidate (bounded; some corp nets drop
     // UDP/3478 but pass UDP/443).
-    for server in turn_udp_servers(urls) {
-        let Some(resolved) = tokio::net::lookup_host(&server)
+    if tls_only {
+        tracing::info!("TURN allocate: tier2-udp SKIPPED (TLS-first forced)");
+    } else {
+        for server in turn_udp_servers(urls) {
+            let Some(resolved) = tokio::net::lookup_host(&server)
+                .await
+                .ok()
+                .and_then(|mut a| a.next())
+            else {
+                tracing::warn!(%server, "UDP TURN server unresolvable; trying next");
+                continue;
+            };
+            match tokio::time::timeout(
+                UDP_ALLOC_TIMEOUT,
+                allocate_turn_relay(
+                    resolved,
+                    username.to_string(),
+                    credential.to_string(),
+                    DEFAULT_TURN_REALM.to_string(),
+                ),
+            )
             .await
-            .ok()
-            .and_then(|mut a| a.next())
-        else {
-            tracing::warn!(%server, "UDP TURN server unresolvable; trying next");
-            continue;
-        };
-        match tokio::time::timeout(
-            UDP_ALLOC_TIMEOUT,
-            allocate_turn_relay(
-                resolved,
-                username.to_string(),
-                credential.to_string(),
-                DEFAULT_TURN_REALM.to_string(),
-            ),
-        )
-        .await
-        {
-            Ok(Ok(relay)) => return Ok(relay),
-            Ok(Err(e)) => tracing::warn!(%server, %e, "UDP TURN allocate failed; trying next"),
-            Err(_) => tracing::warn!(%server, "UDP TURN allocate timed out; trying next"),
+            {
+                Ok(Ok(relay)) => {
+                    tracing::info!(%server, "TURN relay allocated (tier2-udp)");
+                    return Ok(relay);
+                }
+                Ok(Err(e)) => tracing::warn!(%server, %e, "UDP TURN allocate failed; trying next"),
+                Err(_) => tracing::warn!(%server, "UDP TURN allocate timed out; trying next"),
+            }
         }
     }
 
@@ -543,7 +567,10 @@ pub async fn allocate_relay_from_ice(
         )
         .await
         {
-            Ok(relay) => return Ok(relay),
+            Ok(relay) => {
+                tracing::info!(%host, port, ?pin, "TURN relay allocated (tier3-tls)");
+                return Ok(relay);
+            }
             Err(e) => {
                 // `{:#}` surfaces the full anyhow chain incl. the underlying
                 // rustls error (e.g. "invalid peer certificate: NotValidForName"
@@ -555,7 +582,7 @@ pub async fn allocate_relay_from_ice(
     }
 
     anyhow::bail!(
-        "no TURN relay could be allocated from {urls:?} (all UDP + TURNS/TCP candidates failed)"
+        "no TURN relay could be allocated from {urls:?} (tls_only={tls_only}; all attempted candidates failed)"
     )
 }
 

@@ -1250,13 +1250,14 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     // "1"/"0" strings every read-site parser already accepts.
     {
         let mut fallbacks = std::collections::HashMap::new();
-        let pairs: [(&str, Option<bool>); 11] = [
+        let pairs: [(&str, Option<bool>); 12] = [
             ("OVERLAY_QUIC", cfg.overlay_quic),
             ("OVERLAY_DIRECT", cfg.overlay_direct),
             ("OVERLAY_DERP", cfg.overlay_derp),
             ("OVERLAY_MBB", cfg.overlay_mbb),
             ("OVERLAY_LAN_IFACE_FILTER", cfg.overlay_lan_iface_filter),
             ("OVERLAY_ROUTE_EVENTS", cfg.overlay_route_events),
+            ("OVERLAY_RELAY_TLS", cfg.overlay_relay_tls),
             ("LOCAL_TURN", cfg.local_turn),
             ("DNS_AAAA", cfg.dns_aaaa),
             ("AUTO_UPDATE", cfg.auto_update),
