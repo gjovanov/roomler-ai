@@ -107,6 +107,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "Event-driven route guard (OS route-table change subscription; the 2 s tick stays as backstop). Built-in default: on.",
     ),
     (
+        "overlay_relay_tls",
+        "tribool",
+        "Force overlay coturn allocations onto the TURNS/TCP (TLS) tier — corp-VPN probe. Built-in default: off.",
+    ),
+    (
         "local_turn",
         "tribool",
         "Loopback-TURN relay for controllers on the same corporate network. Built-in default: on.",
@@ -230,6 +235,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "overlay_lan_iface_filter" => cfg.overlay_lan_iface_filter.map(fmt_bool),
         "overlay_pathmon" => cfg.overlay_pathmon.clone(),
         "overlay_route_events" => cfg.overlay_route_events.map(fmt_bool),
+        "overlay_relay_tls" => cfg.overlay_relay_tls.map(fmt_bool),
         "local_turn" => cfg.local_turn.map(fmt_bool),
         "dns_aaaa" => cfg.dns_aaaa.map(fmt_bool),
         "auto_update" => cfg.auto_update.map(fmt_bool),
@@ -315,6 +321,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
             }
         }
         "overlay_route_events" => cfg.overlay_route_events = parse_tribool(value)?,
+        "overlay_relay_tls" => cfg.overlay_relay_tls = parse_tribool(value)?,
         "local_turn" => cfg.local_turn = parse_tribool(value)?,
         "dns_aaaa" => cfg.dns_aaaa = parse_tribool(value)?,
         "auto_update" => cfg.auto_update = parse_tribool(value)?,
@@ -475,6 +482,27 @@ mod tests {
         apply(&mut cfg, "overlay_quic", None).unwrap();
         assert_eq!(cfg.overlay_quic, None);
         assert!(apply(&mut cfg, "overlay_quic", Some("maybe")).is_err());
+    }
+
+    /// rc.276 — the forced-TLS-relay probe key set/echo/clear (per the
+    /// every-new-env-gets-a-config-key rule).
+    #[test]
+    fn overlay_relay_tls_set_echo_clear() {
+        let mut cfg = crate::config::test_fixture();
+        apply(&mut cfg, "overlay_relay_tls", Some("on")).unwrap();
+        assert_eq!(cfg.overlay_relay_tls, Some(true));
+        assert_eq!(
+            entry_for(&cfg, "overlay_relay_tls")
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("true")
+        );
+        apply(&mut cfg, "overlay_relay_tls", Some("0")).unwrap();
+        assert_eq!(cfg.overlay_relay_tls, Some(false));
+        apply(&mut cfg, "overlay_relay_tls", None).unwrap();
+        assert_eq!(cfg.overlay_relay_tls, None);
+        assert!(apply(&mut cfg, "overlay_relay_tls", Some("maybe")).is_err());
     }
 
     /// rc.275 — the LAN-gather virtual-interface filter key set/echo/clear
