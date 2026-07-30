@@ -189,6 +189,13 @@ jobs:
           # rehearsals, which execute on master) save — seeding the cache
           # every subsequent tag build restores.
           save-if: ${{ github.ref_type != 'tag' }}
+          # cache-on-failure: a seed rehearsal that compiles everything but
+          # dies in a LATER step must still save its caches — 2026-07-28 a
+          # dispatched rehearsal built 20 min of agent+tunnel and then hit
+          # LGHT0368 in a mid-day wxs state; the failed job saved nothing
+          # and every release until 07-30 ran fully cold (+~14 min each).
+          # Tag runs are unaffected (save-if above already gates them off).
+          cache-on-failure: true
 
       - name: Install cargo-deb
         run: cargo install cargo-deb --locked
@@ -518,6 +525,13 @@ jobs:
           # non-tag runs (workflow_dispatch rehearsals on master) save —
           # seeding the cache every subsequent tag build restores.
           save-if: ${{ github.ref_type != 'tag' }}
+          # cache-on-failure: a seed rehearsal that compiles everything but
+          # dies in a LATER step must still save its caches — 2026-07-28 a
+          # dispatched rehearsal built 20 min of agent+tunnel and then hit
+          # LGHT0368 in a mid-day wxs state; the failed job saved nothing
+          # and every release until 07-30 ran fully cold (+~14 min each).
+          # Tag runs are unaffected (save-if above already gates them off).
+          cache-on-failure: true
 
       - name: Install WiX Toolset v3
         shell: pwsh
@@ -896,6 +910,13 @@ jobs:
           workspaces: '. -> target'
           shared-key: installer-smoke-windows
           save-if: ${{ github.ref_type != 'tag' }}
+          # cache-on-failure: a seed rehearsal that compiles everything but
+          # dies in a LATER step must still save its caches — 2026-07-28 a
+          # dispatched rehearsal built 20 min of agent+tunnel and then hit
+          # LGHT0368 in a mid-day wxs state; the failed job saved nothing
+          # and every release until 07-30 ran fully cold (+~14 min each).
+          # Tag runs are unaffected (save-if above already gates them off).
+          cache-on-failure: true
 
       # rc.18: the Tauri tray companion. Tray's Cargo.toml uses
       # `frontendDist: "../src/front"` pointing at static HTML/CSS/JS —
@@ -1029,6 +1050,13 @@ jobs:
           # non-tag runs (workflow_dispatch rehearsals on master) save —
           # seeding the cache every subsequent tag build restores.
           save-if: ${{ github.ref_type != 'tag' }}
+          # cache-on-failure: a seed rehearsal that compiles everything but
+          # dies in a LATER step must still save its caches — 2026-07-28 a
+          # dispatched rehearsal built 20 min of agent+tunnel and then hit
+          # LGHT0368 in a mid-day wxs state; the failed job saved nothing
+          # and every release until 07-30 ran fully cold (+~14 min each).
+          # Tag runs are unaffected (save-if above already gates them off).
+          cache-on-failure: true
 
       - name: Install system deps
         # libvpx for the `vp9-444` feature; pkg-config for the
@@ -1301,3 +1329,40 @@ jobs:
           prerelease: false
           generate_release_notes: true
           files: release/*
+
+  # ---------------------------------------------------------------------------
+  # 5. Seed-failure alert — fires ONLY for non-release runs (the weekly
+  #    cron + seed-release-caches.yml dispatches). A failed seed rehearsal
+  #    used to be doubly silent: nobody watches artifacts-only runs, and
+  #    the failed job saved no caches, so the release lane quietly went
+  #    cold until someone noticed the slow builds. Exactly that happened
+  #    2026-07-28→30: the dispatcher fired on a release-agent.yml change,
+  #    its rehearsal died on LGHT0368 (broken mid-day wxs state), the wxs
+  #    FIX commit touched only wix/ so nothing re-dispatched, and
+  #    rc.266→277 all built cold (~23 min vs ~9). cache-on-failure above
+  #    fixes the wasted-compile half; this job fixes the nobody-noticed
+  #    half. Tag-run failures stay out — those are already loud.
+  # ---------------------------------------------------------------------------
+  seed-failure-alert:
+    name: Alert on failed seed rehearsal
+    if: >-
+      always() &&
+      needs.validate-version.outputs.is_release == 'false' &&
+      (needs.build-linux.result == 'failure' ||
+       needs.build-windows.result == 'failure' ||
+       needs.build-windows-companions.result == 'failure' ||
+       needs.build-macos.result == 'failure')
+    needs: [validate-version, build-linux, build-windows, build-windows-companions, build-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: File an issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          gh issue create --repo "${{ github.repository }}" \
+            --title "Seed rehearsal failed — release-lane caches NOT refreshed ($(date -u +%F))" \
+            --body "$(printf 'The artifacts-only release-agent rehearsal (weekly cron or seed-release-caches.yml dispatch) failed: %s\n\nUntil a rehearsal succeeds on master, agent tag builds run with cold cargo caches (~+14 min on the Windows MSI job). cache-on-failure means partial seeds may still have been saved, but the failure itself needs fixing.\n\nRe-run after fixing:\n\n    gh workflow run release-agent.yml --ref master -f version=<workspace version> -f publish_release=false\n' "$run_url")"
