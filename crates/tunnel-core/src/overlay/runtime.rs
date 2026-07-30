@@ -428,6 +428,16 @@ struct Installed {
     /// Consecutive sweeps where we sent but received nothing (tx grew, rx
     /// flat). A few in a row ⇒ the direct carrier is one-way / dead.
     bad_sweeps: u32,
+    /// rc.275 honesty — the health sweep's verdict that this carrier is
+    /// SILENTLY ONE-WAY: installed past the warm-up grace with either no
+    /// completed WG handshake ever (the pre-handshake zombie whose tx/rx
+    /// counters stay flat — CORPLAP-1 behind its corp VPN: every tier
+    /// "installed", zero handshakes, `roomler peers` said `direct`/`relay`
+    /// while 100% of pings died) or the rc.137 one-way strike counter
+    /// accumulating. Surfaced through the LocalAPI peer view so the CLI can
+    /// render `stalled` instead of a healthy-looking tier label. Verdict
+    /// only — every kill/refresh decision stays in `lifecycle::carrier_tick`.
+    stalled: bool,
     /// Monotonic instant we last HEARD from this peer — a real "last seen"
     /// (P3b-3). Seeded to `since` at install; advanced by `sweep_carrier_health`
     /// whenever the keepalive-inclusive `rx_any` liveness counter climbed since
@@ -1059,6 +1069,8 @@ fn build_overlay_view(
                 // flight renders as `upgrading` in the CLI, so a snapshot
                 // taken mid-transition reads as what it is.
                 upgrading: connection == ConnectionType::Relay && probing.contains_key(&np.node_id),
+                // rc.275 honesty — the sweep's silently-one-way verdict.
+                stalled: inst.is_some_and(|i| i.stalled),
                 rtt_ms: None,
                 last_seen_ms,
                 // P3b-3 — carry the backing agent id (hex) so the daemon can join
@@ -2588,6 +2600,10 @@ impl OverlayRuntime {
                 });
             }
             e.bad_sweeps = v.bad_sweeps;
+            // rc.275 honesty — stamp the display verdict (CLI `stalled`);
+            // reap decisions stay with `carrier_tick` below.
+            e.stalled =
+                super::lifecycle::carrier_stalled(e.since.elapsed(), handshake_done, v.bad_sweeps);
             if v.clear_tier_strikes {
                 // Clear the count on the carrier's OWN tier (CC1 — never
                 // cross-clear) so old failures don't accumulate across a long
@@ -3500,6 +3516,7 @@ impl OverlayRuntime {
                             since: now,
                             last_traffic: (0, 0),
                             bad_sweeps: 0,
+                            stalled: false,
                             last_rx_at: now,
                             relay_local: None,
                             relay_dst: None,
@@ -3617,6 +3634,7 @@ impl OverlayRuntime {
                 since: Instant::now(),
                 last_traffic: (0, 0),
                 bad_sweeps: 0,
+                stalled: false,
                 last_rx_at: Instant::now(),
                 relay_local: None,
                 relay_dst: None,
@@ -3674,6 +3692,7 @@ impl OverlayRuntime {
                 since: Instant::now(),
                 last_traffic: (0, 0),
                 bad_sweeps: 0,
+                stalled: false,
                 last_rx_at: Instant::now(),
                 relay_local: None,
                 relay_dst: None,
@@ -3732,6 +3751,7 @@ impl OverlayRuntime {
                 since: Instant::now(),
                 last_traffic: (0, 0),
                 bad_sweeps: 0,
+                stalled: false,
                 last_rx_at: Instant::now(),
                 relay_local: None,
                 relay_dst: None,
@@ -3948,6 +3968,7 @@ impl OverlayRuntime {
                 since: Instant::now(),
                 last_traffic: (0, 0),
                 bad_sweeps: 0,
+                stalled: false,
                 last_rx_at: Instant::now(),
                 relay_local: None,
                 relay_dst: None,
@@ -4140,6 +4161,7 @@ impl OverlayRuntime {
                 since: Instant::now(),
                 last_traffic: (0, 0),
                 bad_sweeps: 0,
+                stalled: false,
                 last_rx_at: Instant::now(),
                 relay_local,
                 relay_dst,
@@ -4711,6 +4733,7 @@ mod tests {
                     since: Instant::now(),
                     last_traffic: (0, 0),
                     bad_sweeps: 0,
+                    stalled: false,
                     last_rx_at: Instant::now(),
                     relay_local: None,
                     relay_dst: None,
@@ -4957,6 +4980,7 @@ mod tests {
                     .unwrap(),
                 last_traffic: (0, 0),
                 bad_sweeps: 0,
+                stalled: false,
                 last_rx_at: Instant::now(),
                 relay_local: None,
                 relay_dst: None,
@@ -5059,6 +5083,7 @@ mod tests {
                     .unwrap(),
                 last_traffic: (0, 0),
                 bad_sweeps: 0,
+                stalled: false,
                 last_rx_at: Instant::now(),
                 relay_local: None,
                 relay_dst: None,
@@ -5154,6 +5179,7 @@ mod tests {
             since: Instant::now(),
             last_traffic: (0, 0),
             bad_sweeps: 0,
+            stalled: false,
             last_rx_at: Instant::now(),
             relay_local: None,
             relay_dst: None,
@@ -5349,6 +5375,7 @@ mod tests {
                 since: Instant::now(),
                 last_traffic: (0, 0),
                 bad_sweeps: 0,
+                stalled: false,
                 last_rx_at: Instant::now(),
                 relay_local: None,
                 relay_dst: None,
@@ -5548,6 +5575,7 @@ mod tests {
             since: Instant::now(),
             last_traffic: (0, 0),
             bad_sweeps: 0,
+            stalled: false,
             last_rx_at: Instant::now(),
             relay_local: None,
             relay_dst: None,
@@ -5691,6 +5719,7 @@ mod tests {
                 since: stale,
                 last_traffic: snap,
                 bad_sweeps: 0,
+                stalled: false,
                 last_rx_at: stale,
                 relay_local: None,
                 relay_dst: None,
@@ -5782,6 +5811,7 @@ mod tests {
                 since: old,
                 last_traffic: snap,
                 bad_sweeps: 0,
+                stalled: false,
                 last_rx_at: old,
                 relay_local: None,
                 relay_dst: None,
@@ -6268,6 +6298,7 @@ mod tests {
                 since: Instant::now(),
                 last_traffic: (0, 0),
                 bad_sweeps: 0,
+                stalled: false,
                 last_rx_at,
                 relay_local: relay.map(|(l, _)| l),
                 relay_dst: relay.map(|(_, d)| d),
@@ -6873,6 +6904,7 @@ mod tests {
                 since: Instant::now(),
                 last_traffic: (0, 0),
                 bad_sweeps: 0,
+                stalled: false,
                 last_rx_at: Instant::now(),
                 relay_local: relay.map(|(l, _)| l),
                 relay_dst: relay.map(|(_, d)| d),
@@ -6933,6 +6965,7 @@ mod tests {
                 since: Instant::now(),
                 last_traffic: (0, 0),
                 bad_sweeps: 0,
+                stalled: false,
                 last_rx_at: Instant::now(),
                 relay_local: None,
                 relay_dst: None,
@@ -7019,6 +7052,7 @@ mod tests {
                 since: Instant::now(),
                 last_traffic: (0, 0),
                 bad_sweeps: 0,
+                stalled: false,
                 last_rx_at: Instant::now(),
                 relay_local: None,
                 relay_dst: None,
