@@ -362,9 +362,57 @@ pub(crate) fn probe_tick(handshake_done: bool, since: Duration, tier: DirectTier
     }
 }
 
+/// rc.275 honesty — is this installed carrier SILENTLY ONE-WAY right now?
+/// Display verdict only (stored in `Installed.stalled`, surfaced as `stalled`
+/// in the LocalAPI peer view) — it kills nothing; every reap decision stays
+/// in [`carrier_tick`].
+///
+/// Two evidence sources, matching the two ways a one-way carrier hides:
+/// * **no completed WG handshake ever** — the pre-handshake zombie. Its
+///   `tx`/`rx` counters stay flat (handshake packets touch neither), so the
+///   rx-flat heuristic can't see it; only the handshake latch can. Field:
+///   CORPLAP-1 behind its corp VPN — every tier "installed", `roomler peers`
+///   said `direct`/`relay` with fresh LAST SEEN (inbound worked!) while 100 %
+///   of its own pings died for hours. This fn is what makes that visible.
+/// * **the rc.137 one-way strike counter** (`bad_sweeps`) — an established
+///   session that sends but no longer receives.
+///
+/// The warm-up grace mirrors [`carrier_tick`]'s: no judgment while the
+/// handshake + first packets are still expected to be in flight.
+pub(crate) fn carrier_stalled(
+    since_install: Duration,
+    handshake_done: bool,
+    bad_sweeps: u32,
+) -> bool {
+    since_install >= DIRECT_GRACE && (!handshake_done || bad_sweeps >= 2)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// rc.275 honesty — the stalled display verdict: pre-handshake zombies and
+    /// one-way strike accumulation read as stalled once past the grace; a
+    /// healthy or still-warming carrier never does.
+    #[test]
+    fn carrier_stalled_matrix() {
+        let grace = DIRECT_GRACE;
+        let young = grace / 2;
+        let old = grace * 3;
+        // Warm-up: never stalled, whatever the evidence.
+        assert!(!carrier_stalled(young, false, 0));
+        assert!(!carrier_stalled(young, false, 9));
+        // The CORPLAP-1 shape: installed for ages, handshake never completed.
+        assert!(carrier_stalled(old, false, 0));
+        // Established + healthy: not stalled.
+        assert!(!carrier_stalled(old, true, 0));
+        assert!(!carrier_stalled(old, true, 1), "one strike is a blip");
+        // Established but one-way strikes accumulating: stalled.
+        assert!(carrier_stalled(old, true, 2));
+        // Boundary: judgment starts exactly at the grace edge.
+        assert!(carrier_stalled(grace, false, 0));
+        assert!(!carrier_stalled(grace - Duration::from_millis(1), false, 0));
+    }
 
     /// Baseline healthy-established inputs; tests override the field under
     /// test.

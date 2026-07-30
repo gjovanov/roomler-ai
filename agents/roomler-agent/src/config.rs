@@ -93,6 +93,11 @@ pub struct AgentConfig {
     /// Built-in default: on.
     #[serde(default)]
     pub overlay_mbb: Option<bool>,
+    /// LAN-gather virtual-interface filter — drop WSL/Hyper-V/other-VPN
+    /// adapters from advertised LAN endpoints
+    /// (`ROOMLER_NODE_OVERLAY_LAN_IFACE_FILTER`). Built-in default: on.
+    #[serde(default)]
+    pub overlay_lan_iface_filter: Option<bool>,
     /// Loopback-TURN corp-relay for co-located controllers
     /// (`ROOMLER_AGENT_LOCAL_TURN`). Built-in default: on.
     #[serde(default)]
@@ -689,6 +694,7 @@ mod tests {
             overlay_direct: None,
             overlay_derp: None,
             overlay_mbb: None,
+            overlay_lan_iface_filter: None,
             local_turn: None,
             dns_aaaa: None,
             auto_update: None,
