@@ -97,6 +97,16 @@ const KEYS: &[(&str, &str, &str)] = &[
         "LAN-gather virtual-interface filter (skip WSL/Hyper-V/other-VPN adapters). Built-in default: on.",
     ),
     (
+        "overlay_pathmon",
+        "string",
+        "Overlay PathMonitor mode: on (authoritative — built-in default) | shadow (compare-only revert rail) | off. Env: ROOMLER_NODE_OVERLAY_PATHMON.",
+    ),
+    (
+        "overlay_route_events",
+        "tribool",
+        "Event-driven route guard (OS route-table change subscription; the 2 s tick stays as backstop). Built-in default: on.",
+    ),
+    (
         "local_turn",
         "tribool",
         "Loopback-TURN relay for controllers on the same corporate network. Built-in default: on.",
@@ -218,6 +228,8 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "overlay_derp" => cfg.overlay_derp.map(fmt_bool),
         "overlay_mbb" => cfg.overlay_mbb.map(fmt_bool),
         "overlay_lan_iface_filter" => cfg.overlay_lan_iface_filter.map(fmt_bool),
+        "overlay_pathmon" => cfg.overlay_pathmon.clone(),
+        "overlay_route_events" => cfg.overlay_route_events.map(fmt_bool),
         "local_turn" => cfg.local_turn.map(fmt_bool),
         "dns_aaaa" => cfg.dns_aaaa.map(fmt_bool),
         "auto_update" => cfg.auto_update.map(fmt_bool),
@@ -290,6 +302,19 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "overlay_derp" => cfg.overlay_derp = parse_tribool(value)?,
         "overlay_mbb" => cfg.overlay_mbb = parse_tribool(value)?,
         "overlay_lan_iface_filter" => cfg.overlay_lan_iface_filter = parse_tribool(value)?,
+        "overlay_pathmon" => {
+            cfg.overlay_pathmon = match value.map(str::trim).filter(|s| !s.is_empty()) {
+                None => None,
+                Some(v) => {
+                    let mode = v.to_ascii_lowercase();
+                    if !matches!(mode.as_str(), "on" | "shadow" | "off") {
+                        return Err("overlay_pathmon must be on | shadow | off".to_string());
+                    }
+                    Some(mode)
+                }
+            }
+        }
+        "overlay_route_events" => cfg.overlay_route_events = parse_tribool(value)?,
         "local_turn" => cfg.local_turn = parse_tribool(value)?,
         "dns_aaaa" => cfg.dns_aaaa = parse_tribool(value)?,
         "auto_update" => cfg.auto_update = parse_tribool(value)?,
@@ -471,6 +496,43 @@ mod tests {
         apply(&mut cfg, "overlay_lan_iface_filter", None).unwrap();
         assert_eq!(cfg.overlay_lan_iface_filter, None);
         assert!(apply(&mut cfg, "overlay_lan_iface_filter", Some("maybe")).is_err());
+    }
+
+    /// PR-D — the PathMonitor mode key: multi-state (on|shadow|off), so a
+    /// validated string, not a tribool (per the every-new-env rule's
+    /// enum-not-tribool clause). Case-normalized; empty/None clears.
+    #[test]
+    fn overlay_pathmon_set_echo_clear_and_validate() {
+        let mut cfg = crate::config::test_fixture();
+        apply(&mut cfg, "overlay_pathmon", Some("shadow")).unwrap();
+        assert_eq!(cfg.overlay_pathmon.as_deref(), Some("shadow"));
+        assert_eq!(
+            entry_for(&cfg, "overlay_pathmon").unwrap().value.as_deref(),
+            Some("shadow")
+        );
+        apply(&mut cfg, "overlay_pathmon", Some("ON")).unwrap();
+        assert_eq!(cfg.overlay_pathmon.as_deref(), Some("on"));
+        apply(&mut cfg, "overlay_pathmon", None).unwrap();
+        assert_eq!(cfg.overlay_pathmon, None);
+        assert!(apply(&mut cfg, "overlay_pathmon", Some("sideways")).is_err());
+    }
+
+    /// P4/PR-D — the event-driven route-guard key set/echo/clear.
+    #[test]
+    fn overlay_route_events_set_echo_clear() {
+        let mut cfg = crate::config::test_fixture();
+        apply(&mut cfg, "overlay_route_events", Some("off")).unwrap();
+        assert_eq!(cfg.overlay_route_events, Some(false));
+        assert_eq!(
+            entry_for(&cfg, "overlay_route_events")
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("false")
+        );
+        apply(&mut cfg, "overlay_route_events", None).unwrap();
+        assert_eq!(cfg.overlay_route_events, None);
+        assert!(apply(&mut cfg, "overlay_route_events", Some("maybe")).is_err());
     }
 
     #[test]
