@@ -410,14 +410,23 @@ fn fmt_peer_row(p: &PeerInfo, now_ms: u64) -> String {
     } else {
         p.name.clone()
     };
+    // rc.275 honesty — a carrier the health sweep judged SILENTLY ONE-WAY
+    // renders as `stalled`, not as a healthy-looking `direct`/`relay` (the
+    // dishonest label cost a multi-session field hunt on CORPLAP-1: every tier
+    // "installed", zero completed handshakes, 100 % ping loss — and the table
+    // still said direct). Takes precedence over `upgrading`; the tier itself
+    // stays visible in `peers --json` (`connection` + `stalled`).
     // P8-cosmetics — a relay peer with a make-before-break direct probe in
     // flight renders as `upgrading`: a snapshot taken mid-transition reads as
     // what it is instead of contradicting the latency the user just measured.
-    let conn = if p.upgrading && matches!(p.connection, ConnectionType::Relay) {
-        "upgrading".to_string()
-    } else {
-        connection_label(p.connection).to_string()
-    };
+    let conn =
+        if p.stalled && matches!(p.connection, ConnectionType::Direct | ConnectionType::Relay) {
+            "stalled".to_string()
+        } else if p.upgrading && matches!(p.connection, ConnectionType::Relay) {
+            "upgrading".to_string()
+        } else {
+            connection_label(p.connection).to_string()
+        };
     format!(
         "{} {:<20} {:<16} {:<26} {:<9} {:>7} {}",
         up_glyph(p.online),
@@ -690,6 +699,7 @@ mod tests {
             online: true,
             connection: ConnectionType::Tunnel,
             upgrading: false,
+            stalled: false,
             rtt_ms: Some(52),
             last_seen_ms: Some(now - 3_000),
             agent_id: None,
@@ -713,6 +723,7 @@ mod tests {
             online: false,
             connection: ConnectionType::Offline,
             upgrading: false,
+            stalled: false,
             rtt_ms: None,
             last_seen_ms: None,
             agent_id: None,
@@ -736,6 +747,7 @@ mod tests {
             online: true,
             connection: ConnectionType::Direct,
             upgrading: false,
+            stalled: false,
             rtt_ms: None,
             last_seen_ms: None,
             agent_id: None,
@@ -745,6 +757,42 @@ mod tests {
         let row = fmt_peer_row(&p, now);
         assert!(row.contains("0123456789ab…"), "row was: {row}");
         assert!(row.contains("100.64.0.7"));
+    }
+
+    /// rc.275 honesty — a silently-one-way carrier renders `stalled`, never a
+    /// healthy-looking tier label; it also beats `upgrading`. A stalled
+    /// TUNNEL/OFFLINE peer keeps its own label (the flag describes overlay
+    /// carriers only).
+    #[test]
+    fn peer_row_stalled_beats_tier_and_upgrading() {
+        let now = 1_000_000u64;
+        let mut p = PeerInfo {
+            node_id: "n4".into(),
+            name: "CORPLAP-1".into(),
+            overlay_ip: Some("100.64.0.1".into()),
+            overlay_ip6: None,
+            online: true,
+            connection: ConnectionType::Direct,
+            upgrading: false,
+            stalled: true,
+            rtt_ms: None,
+            last_seen_ms: Some(now - 4_000),
+            agent_id: None,
+            relay_local: None,
+            relay_dst: None,
+        };
+        assert!(fmt_peer_row(&p, now).contains("stalled"));
+        p.connection = ConnectionType::Relay;
+        p.upgrading = true;
+        let row = fmt_peer_row(&p, now);
+        assert!(row.contains("stalled"), "stalled beats upgrading: {row}");
+        assert!(!row.contains("upgrading"));
+        // Not an overlay carrier ⇒ the flag is ignored.
+        p.connection = ConnectionType::Tunnel;
+        assert!(fmt_peer_row(&p, now).contains("tunnel"));
+        p.stalled = false;
+        p.connection = ConnectionType::Relay;
+        assert!(fmt_peer_row(&p, now).contains("upgrading"));
     }
 
     #[test]
